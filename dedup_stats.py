@@ -45,11 +45,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── 数据库配置 ────────────────────────────────────────────────────────────────
-DB_HOST = os.getenv("DB_HOST", "pgm-2zevls2414y7mw6d8o.pg.rds.aliyuncs.com")
+DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = int(os.getenv("DB_PORT", "5432"))
 DB_NAME = os.getenv("DB_NAME", "nft_data")
-DB_USER = os.getenv("DB_USER", "user1")
-DB_PASS = os.getenv("DB_PASS", "_JC!y7XWygm$94f")
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASS = os.getenv("DB_PASS", "123456")
 
 # ── SQL：Step 1 — 创建规范化函数 ──────────────────────────────────────────────
 SQL_NORMALIZE_FUNC = """
