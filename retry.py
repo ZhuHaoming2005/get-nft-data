@@ -1,29 +1,27 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 NFT image_uri 重试脚本：对 image_uri 为空的记录重新拉取 metadata 并更新。
-
-支持可选链：默认 base，可通过 --chain 指定（如 --chain eth）。
-表名：nft_assets_{chain}，与 nft_collector 一致。
+支持可选链：默认 base，可通过 --chain 指定，如 --chain eth。
+表名：nft_assets_{chain}，与 nft_collector 保持一致。
 """
 
 import argparse
+import asyncio
 import logging
 import re
 import sys
+import time
 from typing import Dict, List, Optional
 
+import aiohttp
 import psycopg2
 import psycopg2.extras
-import requests
-import time
 
-# ─── 日志配置 ─────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        # logging.FileHandler("retry.log", encoding="utf-8"),
     ],
 )
 logger = logging.getLogger(__name__)
@@ -35,14 +33,12 @@ DB_NAME = "nft_data"
 DB_USER = "postgres" # "user1"
 DB_PASS = "123456" # "_JC!y7XWygm$94f"
 
-# 链名称，对应表 nft_assets_{chain}
 CHAIN_NAME = "polygon"
 
-# metadata 请求超时（秒）
 METADATA_TIMEOUT = 15
 METADATA_CONNECT_TIMEOUT = 15
+CONCURRENT_REQUESTS = 20
 
-# IPFS 网关列表（轮询重试顺序）
 IPFS_GATEWAYS: List[str] = [
     "https://gateway.pinata.cloud/ipfs",
     "https://dweb.link/ipfs",
@@ -50,37 +46,22 @@ IPFS_GATEWAYS: List[str] = [
     # "https://pink-official-shrimp-252.mypinata.cloud/ipfs",
 ]
 
-# pink-official-shrimp 网关专用请求头
 IPFS_GATEWAY_HEADERS: Dict[str, Dict[str, str]] = {
     "https://pink-official-shrimp-252.mypinata.cloud/ipfs": {
         "x-pinata-gateway-token": "P2Z1YGDiTOuEjgDKJdhn41CmcbGe9HNn0BMYTZFSWe8J-9NwPEpyPauxPaSlI_i0",
     },
 }
 
-# Arweave 网关
 ARWEAVE_GATEWAY = "https://arweave.net"
-
-# 每批处理多少条 image_uri 为空的记录
 BATCH_SIZE = 500
 
 
 def _nft_table_name(chain_name: str) -> str:
-    """根据 chain_name 生成表名，仅允许 [a-z0-9_] 防止注入。"""
     safe = re.sub(r"[^a-z0-9_]", "", chain_name.lower())
     return f"nft_assets_{safe}" if safe else "nft_assets_default"
 
 
-# ────────────────────────────────────────────────────────────────────────────────
-# metadata & image_uri 解析
-# ────────────────────────────────────────────────────────────────────────────────
-
 def _metadata_url(token_uri: str, ipfs_gateway: Optional[str] = None) -> str:
-    """
-    将 token_uri 转为可 HTTP GET 的 URL。
-    - ipfs://...  通过指定的 IPFS 网关转发
-    - ar://...    通过 ARWEAVE_GATEWAY 转发
-    - 其他        原样返回
-    """
     s = token_uri.strip()
     if s.startswith("ipfs://ipfs/"):
         gw = (ipfs_gateway or IPFS_GATEWAYS[0]).rstrip("/")
@@ -94,42 +75,45 @@ def _metadata_url(token_uri: str, ipfs_gateway: Optional[str] = None) -> str:
     return s
 
 
-def fetch_image_uri_for_token_uri(token_uri: str) -> Optional[str]:
-    """
-    对单个 token_uri 重新拉取 metadata，并从 JSON 中解析 image/image_url 字段。
-    - 对 ipfs:// 链接按 IPFS_GATEWAYS 列表顺序轮询重试；
-    - 对其他协议仅尝试一次（直连）。
-    """
+def _candidate_gateways(token_uri: str) -> List[Optional[str]]:
+    if token_uri.strip().startswith("ipfs://"):
+        return IPFS_GATEWAYS
+    return [None]
+
+
+def _request_headers(gateway: Optional[str], url: str) -> Dict[str, str]:
+    if not gateway:
+        return {}
+    gateway_base = gateway.rstrip("/")
+    if gateway_base in IPFS_GATEWAY_HEADERS and url.startswith(gateway_base):
+        return dict(IPFS_GATEWAY_HEADERS[gateway_base])
+    return {}
+
+
+async def _fetch_json(session: aiohttp.ClientSession, url: str, headers: Dict[str, str]):
+    async with session.get(url, headers=headers or None, allow_redirects=True) as response:
+        response.raise_for_status()
+        return await response.json(content_type=None)
+
+
+async def fetch_image_uri_for_token_uri_async(
+    token_uri: str,
+    session: aiohttp.ClientSession,
+) -> Optional[str]:
     if not token_uri or token_uri.startswith("data:application/"):
         return None
 
-    s = token_uri.strip()
-    if s.startswith("ipfs://"):
-        gateways: List[Optional[str]] = IPFS_GATEWAYS
-    else:
-        gateways = [None]
-
     last_exc: Optional[Exception] = None
-    for idx, gw in enumerate(gateways):
-        url = _metadata_url(token_uri, gw)
+    gateways = _candidate_gateways(token_uri)
+
+    for idx, gateway in enumerate(gateways):
+        url = _metadata_url(token_uri, gateway)
         if not url.startswith("http"):
             continue
 
-        headers: Dict[str, str] = {}
-        if gw:
-            gw_base = gw.rstrip("/")
-            if gw_base in IPFS_GATEWAY_HEADERS and url.startswith(gw_base):
-                headers.update(IPFS_GATEWAY_HEADERS[gw_base])
-
+        headers = _request_headers(gateway, url)
         try:
-            resp = requests.get(
-                url,
-                headers=headers or None,
-                timeout=(METADATA_CONNECT_TIMEOUT, METADATA_TIMEOUT),
-                allow_redirects=True,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+            data = await _fetch_json(session, url, headers)
         except Exception as exc:
             last_exc = exc
             logger.info(
@@ -137,11 +121,10 @@ def fetch_image_uri_for_token_uri(token_uri: str) -> Optional[str]:
                 token_uri[:80],
                 url,
                 idx,
-                (gw or "<direct>"),
+                gateway or "<direct>",
                 type(exc).__name__,
                 str(exc) or repr(exc),
             )
-            # 失败时尝试下一个网关
             continue
 
         if not isinstance(data, dict):
@@ -149,9 +132,8 @@ def fetch_image_uri_for_token_uri(token_uri: str) -> Optional[str]:
                 "[retry image_uri=NULL] token_uri=%s gateway[%d]=%s 原因: metadata 不是 JSON 对象",
                 token_uri[:80],
                 idx,
-                (gw or "<direct>"),
+                gateway or "<direct>",
             )
-            # 换网关意义不大，但实现上继续尝试
             continue
 
         image = data.get("image") or data.get("image_url")
@@ -160,16 +142,15 @@ def fetch_image_uri_for_token_uri(token_uri: str) -> Optional[str]:
                 "[retry image_uri=NULL] token_uri=%s gateway[%d]=%s 原因: JSON 中缺少 image/image_url",
                 token_uri[:100],
                 idx,
-                (gw or "<direct>"),
+                gateway or "<direct>",
             )
             return None
 
-        image = image.strip()
-        return image
+        return image.strip()
 
     if last_exc is not None:
         logger.debug(
-            "metadata 重试最终失败 token_uri=%s，最后错误: [%s] %s",
+            "metadata 重试最终失败 token_uri=%s，最后错误 [%s] %s",
             token_uri[:80],
             type(last_exc).__name__,
             str(last_exc) or repr(last_exc),
@@ -177,12 +158,38 @@ def fetch_image_uri_for_token_uri(token_uri: str) -> Optional[str]:
     return None
 
 
-# ────────────────────────────────────────────────────────────────────────────────
-# 数据库处理
-# ────────────────────────────────────────────────────────────────────────────────
+async def fetch_image_uris_for_token_uris(
+    token_uris: List[str],
+    concurrency: int = CONCURRENT_REQUESTS,
+) -> Dict[str, Optional[str]]:
+    if not token_uris:
+        return {}
+
+    timeout = aiohttp.ClientTimeout(
+        total=METADATA_CONNECT_TIMEOUT + METADATA_TIMEOUT,
+        connect=METADATA_CONNECT_TIMEOUT,
+        sock_connect=METADATA_CONNECT_TIMEOUT,
+        sock_read=METADATA_TIMEOUT,
+    )
+    connector = aiohttp.TCPConnector(limit=max(1, concurrency))
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        async def fetch_one(token_uri: str):
+            async with semaphore:
+                image_uri = await fetch_image_uri_for_token_uri_async(token_uri, session)
+                return token_uri, image_uri
+
+        pairs = await asyncio.gather(*(fetch_one(token_uri) for token_uri in token_uris))
+
+    return {token_uri: image_uri for token_uri, image_uri in pairs}
+
+
+def fetch_image_uri_for_token_uri(token_uri: str) -> Optional[str]:
+    return asyncio.run(fetch_image_uris_for_token_uris([token_uri], concurrency=1)).get(token_uri)
+
 
 def ensure_retry_checked_column(conn, chain_name: str) -> None:
-    """确保表存在 retry_checked_at 列，用于轮询时优先选择最久未重试的记录。"""
     tbl = _nft_table_name(chain_name)
     with conn.cursor() as cur:
         cur.execute(
@@ -209,11 +216,6 @@ def get_conn() -> psycopg2.extensions.connection:
 def fetch_missing_image_rows(
     cur: psycopg2.extensions.cursor, chain_name: str, limit: int
 ) -> list:
-    """
-    拉取一批 image_uri 为空、且 token_uri 非空的记录。
-    按 retry_checked_at 升序（NULL 优先），优先选择最久未重试的 token_uri。
-    token_uri 重复时只取一个，返回 [(token_uri,), ...]。
-    """
     tbl = _nft_table_name(chain_name)
     cur.execute(
         f"""
@@ -244,10 +246,6 @@ def mark_retry_checked(
     chain_name: str,
     token_uris: list,
 ) -> None:
-    """
-    将本批选中的 token_uri 的 retry_checked_at 更新为 NOW()，
-    避免下次 SELECT 仍优先选中这些（可能不可达）的记录。
-    """
     if not token_uris:
         return
     tbl = _nft_table_name(chain_name)
@@ -267,12 +265,8 @@ def update_image_uri_by_token_uri(
     cur: psycopg2.extensions.cursor,
     token_uri: str,
     image_uri: str,
-    conn: psycopg2.extensions.connection,
     chain_name: str,
 ) -> int:
-    """
-    按 token_uri 更新所有匹配行的 image_uri，返回实际更新的行数。
-    """
     tbl = _nft_table_name(chain_name)
     cur.execute(
         f"""
@@ -283,7 +277,6 @@ def update_image_uri_by_token_uri(
         """,
         (image_uri, token_uri),
     )
-    conn.commit()
     return cur.rowcount
 
 
@@ -292,19 +285,30 @@ def main() -> None:
     parser.add_argument(
         "--chain",
         default=CHAIN_NAME,
-        help="链名称，对应表 nft_assets_{chain} (默认: %(default)s)",
+        help="链名，对应表 nft_assets_{chain} (默认: %(default)s)",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=CONCURRENT_REQUESTS,
+        help="并发抓取 metadata 的请求数 (默认: %(default)s)",
     )
     args = parser.parse_args()
     chain_name = args.chain
+    concurrency = max(1, args.concurrency)
 
-    logger.info("═══ NFT image_uri 重试脚本启动 ═══  链: %s | 表: %s", chain_name, _nft_table_name(chain_name))
+    logger.info(
+        "开始执行 NFT image_uri 重试脚本 | 链: %s | 表: %s | 并发: %s",
+        chain_name,
+        _nft_table_name(chain_name),
+        concurrency,
+    )
 
     conn = get_conn()
     ensure_retry_checked_column(conn, chain_name)
     conn.close()
 
     while True:
-
         conn = get_conn()
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
@@ -313,10 +317,7 @@ def main() -> None:
 
         try:
             while True:
-
                 time.sleep(10)
-
-                fail_count = 0
 
                 rows = fetch_missing_image_rows(cur, chain_name, BATCH_SIZE)
                 if not rows:
@@ -325,48 +326,44 @@ def main() -> None:
 
                 mark_retry_checked(cur, conn, chain_name, rows)
 
+                token_uris = [row["token_uri"] for row in rows]
                 logger.info(
-                    "本批待重试 token_uri 数: %d（累计处理 %d 个，已更新 %d 条记录）",
-                    len(rows),
+                    "取到待补 image_uri 的 token_uri 数量: %d，累计处理: %d，累计更新: %d",
+                    len(token_uris),
                     total_processed,
                     total_updated,
                 )
 
+                image_uris = asyncio.run(
+                    fetch_image_uris_for_token_uris(token_uris, concurrency=concurrency)
+                )
+
                 batch_updated = 0
-
-                for row in rows:
-                    token_uri = row["token_uri"]
-
+                for token_uri in token_uris:
                     total_processed += 1
-
-                    image_uri = fetch_image_uri_for_token_uri(token_uri)
+                    image_uri = image_uris.get(token_uri)
                     if not image_uri:
-                        fail_count += 1
-
-                        # if fail_count >= 5:
-                        #     logger.warning(
-                        #         "连续 %d 个 token_uri 重试失败，暂停 10 分钟后继续",
-                        #         fail_count,
-                        #     )
-                        #     time.sleep(600)
-                        #     fail_count = 0
-
                         continue
 
-                    updated_count = update_image_uri_by_token_uri(cur, token_uri, image_uri, conn, chain_name)
-                    fail_count = 0
+                    updated_count = update_image_uri_by_token_uri(
+                        cur,
+                        token_uri,
+                        image_uri,
+                        chain_name,
+                    )
                     batch_updated += updated_count
                     total_updated += updated_count
 
                     logger.info(
-                        "更新成功 token_uri=%s 共 %d 条 image_uri=%s",
+                        "更新成功 token_uri=%s 更新行数=%d image_uri=%s",
                         token_uri[:80],
                         updated_count,
                         image_uri[:80],
                     )
 
+                conn.commit()
                 logger.info(
-                    "本批处理完成：成功更新 %d 条，累计更新 %d 条",
+                    "本批处理完成，新增更新 %d 条，累计更新 %d 条",
                     batch_updated,
                     total_updated,
                 )
@@ -378,4 +375,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
