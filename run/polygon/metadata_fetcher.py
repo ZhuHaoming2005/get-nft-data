@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""
+脚本二：Metadata 获取器
+
+持续从临时表（temp_{chain}）读取扫描阶段原始记录，通过 Alchemy API 批量获取元数据：
+  - 获取成功（token_uri 非空且合法）→ 写入主表 nft_assets_{chain}
+  - 获取失败（Alchemy 空 + 链上合约也为空）→ 不写主表
+  - 无论结果如何，处理完的记录全部从临时表删除
+  - 临时表记录不足 100 条时等待 FETCH_IDLE_WAIT 秒后重试
+
+全程使用异步加速网络 IO（Alchemy 批量 + RPC 并发）。
+"""
+
+import asyncio
+import sys
+from typing import List, Optional, Set, Tuple
+
+import aiohttp
+from web3 import AsyncWeb3
+from web3.providers import AsyncHTTPProvider
+
+from common import (
+    CHAIN_NAME,
+    RPC_URL,
+    ALCHEMY_BATCH_SIZE,
+    CONCURRENT_ALCHEMY,
+    CONCURRENT_RPC,
+    FETCH_IDLE_WAIT,
+    logger,
+    get_conn,
+    init_db,
+    load_pending_nfts,
+    batch_insert_main,
+    delete_temp_nfts,
+    delete_contract_nfts,
+    append_blacklist_env,
+    fetch_alchemy_batch,
+    fetch_token_uri,
+    _decode_inline_image,
+    replace_token_id_placeholder,
+    fix_token_id_placeholders,
+)
+
+
+# tokenUri 黑名单前缀：匹配则视为无效，不写入主表
+_INVALID_URI_PREFIXES = ("api.tierlock.com/uri/",)
+
+
+async def _process_batch(
+    w3: AsyncWeb3,
+    pending: List[Tuple],
+) -> Tuple[List[Tuple], List[int], Set[str]]:
+    """
+    对一批临时表记录执行元数据获取，返回 (inserts, all_ids, onchain_image_contracts)：
+      inserts:               写入主表的有效记录列表
+      all_ids:               全部从临时表删除的 id 列表
+      onchain_image_contracts: 链上存储图像的合约地址集合（DeFi 合约）：
+                               - Alchemy 返回的 image_url 以 'data:image' 开头，或
+                               - token_uri 为 data:application/ 解码后 image 仍以 'data:image' 开头
+                               此类合约整体加入黑名单并清库
+    """
+    # pending 每项：(id, contract_address, token_id, token_standard, first_seen_block)
+    tokens  = [(addr, tid, std) for _, addr, tid, std, _ in pending]
+    all_ids = [row[0] for row in pending]
+
+    # ── 步骤1：并发批量调 Alchemy API ──────────────────────────────────────────
+    alchemy_sem = asyncio.Semaphore(CONCURRENT_ALCHEMY)
+    chunks = [
+        tokens[i: i + ALCHEMY_BATCH_SIZE]
+        for i in range(0, len(tokens), ALCHEMY_BATCH_SIZE)
+    ]
+    async with aiohttp.ClientSession(trust_env=True) as session:
+        chunk_results = list(await asyncio.gather(*[
+            fetch_alchemy_batch(session, alchemy_sem, chunk)
+            for chunk in chunks
+        ])) if chunks else []
+
+    alchemy_results: List[Tuple[Optional[str], Optional[str]]] = [
+        item for chunk in chunk_results for item in chunk
+    ]
+
+    # ── 步骤2：tokenUri 为空时 fallback 到链上合约（异步并发）──────────────────
+    fallback_indices = [i for i, (uri, _) in enumerate(alchemy_results) if not uri]
+    if fallback_indices:
+        uri_sem = asyncio.Semaphore(CONCURRENT_RPC)
+        fallback_uris: List[Optional[str]] = list(await asyncio.gather(*[
+            fetch_token_uri(
+                w3, uri_sem,
+                tokens[i][0], tokens[i][1], tokens[i][2],
+            )
+            for i in fallback_indices
+        ]))
+        for idx, chain_uri in zip(fallback_indices, fallback_uris):
+            _, img = alchemy_results[idx]
+            alchemy_results[idx] = (chain_uri, img)
+
+    # ── 步骤2.5：解码链上内嵌 data URI，提取 image_url ──────────────────────────
+    # token_uri 为 data:application/... 格式时（链上存储的 JSON 元数据），
+    # base64 解码后提取 image 字段写回 alchemy_results，
+    # 供后续步骤3统一检测 data:image 链上图像并加入黑名单。
+    for i, (token_uri, image_url) in enumerate(alchemy_results):
+        if token_uri and token_uri.startswith("data:application/") and image_url is None:
+            decoded_img = _decode_inline_image(token_uri)
+            if decoded_img:
+                alchemy_results[i] = (token_uri, decoded_img)
+
+    # ── 步骤3：检测链上存储图像（data:image）的 DeFi 合约 ───────────────────────
+    # 若某合约任意 token 的 image_url 以 'data:image' 开头（无论来自 Alchemy
+    # 直接返回，还是步骤2.5从链上 JSON 元数据解码所得），均说明该合约将图像
+    # 直接编码在链上，属于 DeFi/功能性合约，整体加入黑名单。
+    onchain_image_contracts: Set[str] = set()
+    for (_, addr, _, _, _), (_, image_url) in zip(pending, alchemy_results):
+        if image_url and image_url.startswith("data:image"):
+            onchain_image_contracts.add(addr)
+
+    # ── 步骤4：有效记录组装为主表 insert 列表 ───────────────────────────────────
+    inserts: List[Tuple] = []
+
+    for (_, addr, tid, std, first_seen_block), (token_uri, image_url) in zip(
+        pending, alchemy_results
+    ):
+        # 跳过链上存储图像的合约（整个合约列入黑名单）
+        if addr in onchain_image_contracts:
+            continue
+
+        if not token_uri or any(token_uri.startswith(p) for p in _INVALID_URI_PREFIXES):
+            continue  # 无效，不写主表（但仍从临时表删除）
+
+        # ERC-1155 {id} 占位符展开：替换为 64 位零填充小写十六进制 token ID
+        token_uri = replace_token_id_placeholder(token_uri, tid)
+
+        inserts.append((addr, str(tid), token_uri, image_url, std, first_seen_block))
+
+    return inserts, all_ids, onchain_image_contracts
+
+
+async def main() -> None:
+    logger.info("═══ Metadata 获取器启动 ═══  链: %s | RPC: %s", CHAIN_NAME, RPC_URL)
+
+    # ── 连接节点（用于链上合约 fallback）────────────────────────────────────────
+    w3 = AsyncWeb3(AsyncHTTPProvider(RPC_URL, request_kwargs={"timeout": 30}))
+    if not await w3.is_connected():
+        logger.error("无法连接 RPC 节点，请检查 RPC_URL")
+        sys.exit(1)
+    logger.info("RPC 节点连接成功")
+
+    # ── 连接数据库 ────────────────────────────────────────────────────────────
+    conn = get_conn()
+    init_db(conn, CHAIN_NAME)
+
+    # 一次性修复：将主表中历史写入但未展开 {id} 的 ERC-1155 token URI 补全
+    fixed = fix_token_id_placeholders(conn, CHAIN_NAME)
+    if fixed:
+        logger.info("历史记录 {id} 占位符修复完成，共更新 %d 条", fixed)
+
+    total_inserted = total_deleted = 0
+
+    # ── 主循环：持续消费临时表 ────────────────────────────────────────────────
+    while True:
+        pending = load_pending_nfts(conn, CHAIN_NAME)
+
+        if len(pending) < 100:
+            logger.info(
+                "临时表记录 %d 条（< 100），等待 %d 秒后重新拉取...",
+                len(pending), FETCH_IDLE_WAIT,
+            )
+            await asyncio.sleep(FETCH_IDLE_WAIT)
+            continue
+
+        logger.info("► 处理临时表 %d 条记录", len(pending))
+        inserts, all_ids, onchain_image_contracts = await _process_batch(w3, pending)
+
+        # ── 处理链上存储图像合约（data:image）────────────────────────────────
+        if onchain_image_contracts:
+            logger.info(
+                "  检测到 %d 个链上存储图像合约（image_uri 以 data:image 开头），"
+                "加入黑名单: %s",
+                len(onchain_image_contracts), sorted(onchain_image_contracts),
+            )
+            # 1. 更新 .env 黑名单（持久化，重启后生效）
+            append_blacklist_env(onchain_image_contracts)
+            # 2. 清除数据库中该合约的所有历史记录（主表 + 临时表）
+            main_del, temp_del = delete_contract_nfts(conn, CHAIN_NAME, onchain_image_contracts)
+            logger.info(
+                "  黑名单清库完成: 主表删除 %d 条，临时表删除 %d 条",
+                main_del, temp_del,
+            )
+            # 重新过滤 all_ids（临时表中属于黑名单合约的记录已在上一步按地址删除）
+            blacklisted_set = onchain_image_contracts
+            all_ids = [
+                rid for rid, row in zip(all_ids, pending)
+                if row[1] not in blacklisted_set
+            ]
+
+        # 有效记录写主表
+        inserted = batch_insert_main(conn, CHAIN_NAME, inserts)
+        # 全部处理过的记录从临时表删除
+        deleted  = delete_temp_nfts(conn, CHAIN_NAME, all_ids)
+
+        total_inserted += inserted
+        total_deleted  += deleted
+        logger.info(
+            "  本批: 写入主表 %d，从临时表删除 %d（无效丢弃 %d，黑名单合约 %d 个）"
+            " | 累计写入 %d，累计删除 %d",
+            inserted, deleted,
+            len(pending) - len(inserts) - len(onchain_image_contracts),
+            len(onchain_image_contracts),
+            total_inserted, total_deleted,
+        )
+
+
+if __name__ == "__main__":
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    asyncio.run(main())
