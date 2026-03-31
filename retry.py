@@ -317,7 +317,6 @@ def main() -> None:
 
         try:
             while True:
-                time.sleep(10)
 
                 rows = fetch_missing_image_rows(cur, chain_name, BATCH_SIZE)
                 if not rows:
