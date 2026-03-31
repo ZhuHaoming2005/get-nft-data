@@ -53,7 +53,7 @@ IPFS_GATEWAY_HEADERS: Dict[str, Dict[str, str]] = {
 }
 
 ARWEAVE_GATEWAY = "https://arweave.net"
-BATCH_SIZE = 500
+BATCH_SIZE = 1000
 
 
 def _nft_table_name(chain_name: str) -> str:
