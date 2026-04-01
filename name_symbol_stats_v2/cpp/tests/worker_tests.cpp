@@ -102,6 +102,21 @@ void testTrigramCountGateSkipsImpossibleNonSubstringCandidate() {
     require(stats.candidatePairs == 0, "impossible non-substring pairs should be rejected before sharedCounts growth");
 }
 
+void testTrigramBucketQuerySkipsOutOfRangePostingVisits() {
+    name_worker::Settings settings;
+    settings.thresholds = {0.0};
+    settings.trigramCutoff = 0.80;
+    settings.maxLenDelta = 64;
+
+    std::vector<name_worker::Atom> atoms;
+    atoms.push_back(makeAtom(1, "ethereum", "abcmnopqrst"));
+    atoms.push_back(makeAtom(2, "base", "abcp"));
+
+    const name_worker::EmitStats stats = name_worker::emitEdgesWithStats(atoms, settings, [](const name_worker::Edge&) {});
+    require(stats.postingVisits == 0, "out-of-range trigram-count buckets should not be scanned");
+    require(stats.candidatePairs == 0, "out-of-range trigram-count buckets should not create candidates");
+}
+
 }  // namespace
 
 int main() {
@@ -110,6 +125,8 @@ int main() {
     testShortNameMatchesPriorLongName();
     testLengthBucketsSkipOutOfRangePostingVisits();
     testTrigramCountGateSkipsImpossibleNonSubstringCandidate();
+    testTrigramBucketQuerySkipsOutOfRangePostingVisits();
     std::cout << "name_worker_tests passed" << std::endl;
     return 0;
 }
+

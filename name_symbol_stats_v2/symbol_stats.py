@@ -26,84 +26,92 @@ def _load_chain_totals(conn, run_label: str, chains: Sequence[str]) -> dict[str,
     return {chain: rows.get(chain, (0, 0)) for chain in chains}
 
 
+def _rebuild_symbol_rollup(conn, run_label: str, chains: Sequence[str]) -> int:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM nsv2_symbol_rollup
+            WHERE run_label = %s AND chain = ANY(%s)
+            """,
+            (run_label, list(chains)),
+        )
+        cur.execute(
+            """
+            INSERT INTO nsv2_symbol_rollup (
+                run_label, chain, symbol_norm, contract_count, nft_count
+            )
+            SELECT run_label,
+                   chain,
+                   symbol_norm,
+                   count(*)::bigint AS contract_count,
+                   coalesce(sum(nft_count), 0)::bigint AS nft_count
+            FROM nsv2_contract_identity
+            WHERE run_label = %s
+              AND chain = ANY(%s)
+              AND symbol_norm <> ''
+            GROUP BY run_label, chain, symbol_norm
+            """,
+            (run_label, list(chains)),
+        )
+        inserted = cur.rowcount
+    conn.commit()
+    return inserted
+
+
 def _fetch_groups(conn, run_label: str, *, scope: str, primary_chain: str, secondary_chain: str = '') -> list[DuplicateGroupStats]:
     if scope == 'intra_chain':
         sql = """
-            WITH grouped AS (
-                SELECT symbol_norm,
-                       count(*)::bigint AS contract_count,
-                       coalesce(sum(nft_count), 0)::bigint AS nft_count
-                FROM nsv2_contract_identity
-                WHERE run_label = %s AND chain = %s AND symbol_norm <> ''
-                GROUP BY symbol_norm
-                HAVING count(*) >= 2
-            )
-            SELECT symbol_norm, contract_count, nft_count, contract_count, nft_count
-            FROM grouped
+            SELECT symbol_norm,
+                   contract_count,
+                   nft_count,
+                   contract_count,
+                   nft_count
+            FROM nsv2_symbol_rollup
+            WHERE run_label = %s
+              AND chain = %s
+              AND contract_count >= 2
             ORDER BY nft_count DESC, symbol_norm
         """
         params = (run_label, primary_chain)
     elif scope == 'cross_chain_summary':
         sql = """
             WITH matching_keys AS (
-                SELECT DISTINCT left_side.symbol_norm
-                FROM nsv2_contract_identity AS left_side
-                JOIN nsv2_contract_identity AS right_side
-                  ON left_side.run_label = right_side.run_label
-                 AND left_side.symbol_norm = right_side.symbol_norm
-                 AND right_side.chain <> left_side.chain
-                WHERE left_side.run_label = %s
-                  AND left_side.chain = %s
-                  AND left_side.symbol_norm <> ''
-            ),
-            grouped AS (
-                SELECT symbol_norm,
-                       count(*) FILTER (WHERE chain = %s)::bigint AS primary_contract_count,
-                       coalesce(sum(nft_count) FILTER (WHERE chain = %s), 0)::bigint AS primary_nft_count,
-                       count(*)::bigint AS total_contract_count,
-                       coalesce(sum(nft_count), 0)::bigint AS total_nft_count
-                FROM nsv2_contract_identity
+                SELECT symbol_norm
+                FROM nsv2_symbol_rollup
                 WHERE run_label = %s
-                  AND symbol_norm IN (SELECT symbol_norm FROM matching_keys)
                 GROUP BY symbol_norm
-                HAVING count(*) FILTER (WHERE chain = %s) > 0
+                HAVING count(DISTINCT chain) >= 2
+                   AND bool_or(chain = %s)
             )
-            SELECT symbol_norm, primary_contract_count, primary_nft_count, total_contract_count, total_nft_count
-            FROM grouped
+            SELECT symbol_norm,
+                   coalesce(sum(contract_count) FILTER (WHERE chain = %s), 0)::bigint AS primary_contract_count,
+                   coalesce(sum(nft_count) FILTER (WHERE chain = %s), 0)::bigint AS primary_nft_count,
+                   coalesce(sum(contract_count), 0)::bigint AS total_contract_count,
+                   coalesce(sum(nft_count), 0)::bigint AS total_nft_count
+            FROM nsv2_symbol_rollup
+            WHERE run_label = %s
+              AND symbol_norm IN (SELECT symbol_norm FROM matching_keys)
+            GROUP BY symbol_norm
+            HAVING coalesce(sum(contract_count) FILTER (WHERE chain = %s), 0) > 0
             ORDER BY primary_nft_count DESC, symbol_norm
         """
         params = (run_label, primary_chain, primary_chain, primary_chain, run_label, primary_chain)
     else:
         sql = """
-            WITH matching_keys AS (
-                SELECT DISTINCT left_side.symbol_norm
-                FROM nsv2_contract_identity AS left_side
-                JOIN nsv2_contract_identity AS right_side
-                  ON left_side.run_label = right_side.run_label
-                 AND left_side.symbol_norm = right_side.symbol_norm
-                 AND right_side.chain = %s
-                WHERE left_side.run_label = %s
-                  AND left_side.chain = %s
-                  AND left_side.symbol_norm <> ''
-            ),
-            grouped AS (
-                SELECT symbol_norm,
-                       count(*) FILTER (WHERE chain = %s)::bigint AS primary_contract_count,
-                       coalesce(sum(nft_count) FILTER (WHERE chain = %s), 0)::bigint AS primary_nft_count,
-                       count(*)::bigint AS total_contract_count,
-                       coalesce(sum(nft_count), 0)::bigint AS total_nft_count
-                FROM nsv2_contract_identity
-                WHERE run_label = %s
-                  AND chain = ANY(%s)
-                  AND symbol_norm IN (SELECT symbol_norm FROM matching_keys)
-                GROUP BY symbol_norm
-                HAVING count(*) FILTER (WHERE chain = %s) > 0
-            )
-            SELECT symbol_norm, primary_contract_count, primary_nft_count, total_contract_count, total_nft_count
-            FROM grouped
+            SELECT symbol_norm,
+                   coalesce(sum(contract_count) FILTER (WHERE chain = %s), 0)::bigint AS primary_contract_count,
+                   coalesce(sum(nft_count) FILTER (WHERE chain = %s), 0)::bigint AS primary_nft_count,
+                   coalesce(sum(contract_count), 0)::bigint AS total_contract_count,
+                   coalesce(sum(nft_count), 0)::bigint AS total_nft_count
+            FROM nsv2_symbol_rollup
+            WHERE run_label = %s
+              AND chain = ANY(%s)
+            GROUP BY symbol_norm
+            HAVING coalesce(sum(contract_count) FILTER (WHERE chain = %s), 0) > 0
+               AND coalesce(sum(contract_count) FILTER (WHERE chain = %s), 0) > 0
             ORDER BY primary_nft_count DESC, symbol_norm
         """
-        params = (secondary_chain, run_label, primary_chain, primary_chain, primary_chain, run_label, [primary_chain, secondary_chain], primary_chain)
+        params = (primary_chain, primary_chain, run_label, [primary_chain, secondary_chain], primary_chain, secondary_chain)
 
     with conn.cursor() as cur:
         cur.execute(sql, params)
@@ -218,10 +226,12 @@ def _insert_summary_rows(conn, rows: Sequence[SummaryRow]) -> None:
 def run_symbol_stats(conn, run_label: str, chains: Sequence[str]) -> list[SummaryRow]:
     _delete_outputs(conn, run_label, chains)
     chain_totals = _load_chain_totals(conn, run_label, chains)
+    rollup_rows = _rebuild_symbol_rollup(conn, run_label, chains)
     summary_rows: list[SummaryRow] = []
-    total_steps = len(chains) * (len(chains) + 1)
+    total_steps = len(chains) * (len(chains) + 1) + 1
     tracker = ProgressPrinter('symbol-stats', total_steps, 'steps', logger)
-    completed_steps = 0
+    completed_steps = 1
+    tracker.update(completed_steps, extra=f'rollup_rows={rollup_rows}')
 
     for primary_chain in chains:
         total_contracts, total_nfts = chain_totals[primary_chain]
@@ -285,6 +295,6 @@ def run_symbol_stats(conn, run_label: str, chains: Sequence[str]) -> list[Summar
 
     _insert_summary_rows(conn, summary_rows)
     conn.commit()
-    tracker.close(extra=f'summary_rows={len(summary_rows)}')
+    tracker.close(extra=f'rollup_rows={rollup_rows} summary_rows={len(summary_rows)}')
     logger.info('wrote %d symbol summary rows for run %s', len(summary_rows), run_label)
     return summary_rows

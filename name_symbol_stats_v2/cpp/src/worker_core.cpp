@@ -18,8 +18,7 @@ constexpr int kTrigramBucketSize = 4;
 using TrigramPostingMap = std::unordered_map<std::string, std::vector<int>>;
 using TrigramBucketMap = std::unordered_map<int, TrigramPostingMap>;
 using LengthBucketMap = std::unordered_map<int, TrigramBucketMap>;
-using ChainShardMap = std::unordered_map<std::string, LengthBucketMap>;
-using ShortIndexMap = std::unordered_map<std::string, std::unordered_map<std::string, std::vector<int>>>;
+using ShortIndexMap = std::unordered_map<std::string, std::vector<int>>;
 
 int lengthBucketFor(int length) {
     if (length <= 0) {
@@ -41,6 +40,24 @@ std::vector<int> collectLengthBucketsForRange(int nameLength, int maxLenDelta) {
     std::vector<int> buckets;
     buckets.reserve(static_cast<std::size_t>((maxLength - minLength) / kLengthBucketSize + 2));
     for (int bucket = lengthBucketFor(minLength); bucket <= lengthBucketFor(maxLength); bucket += kLengthBucketSize) {
+        buckets.push_back(bucket);
+    }
+    return buckets;
+}
+
+std::vector<int> collectTrigramBucketsForRange(int trigramCount, double trigramCutoff) {
+    if (trigramCount <= 0 || trigramCutoff <= 0.0) {
+        return {};
+    }
+    constexpr double epsilon = 1e-9;
+    const int minCount = std::max(0, static_cast<int>(std::ceil(static_cast<double>(trigramCount) * trigramCutoff - epsilon)));
+    const int maxCount = std::max(0, static_cast<int>(std::floor(static_cast<double>(trigramCount) / trigramCutoff + epsilon)));
+    if (maxCount < minCount) {
+        return {};
+    }
+    std::vector<int> buckets;
+    buckets.reserve(static_cast<std::size_t>((trigramCountBucketFor(maxCount) - trigramCountBucketFor(minCount)) / kTrigramBucketSize + 1));
+    for (int bucket = trigramCountBucketFor(minCount); bucket <= trigramCountBucketFor(maxCount); bucket += kTrigramBucketSize) {
         buckets.push_back(bucket);
     }
     return buckets;
@@ -93,6 +110,43 @@ bool passesCandidateBounds(
         return true;
     }
     return maxPossibleJaccard(leftTrigramCount, rightTrigramCount) >= settings.trigramCutoff;
+}
+
+void visitPostingMap(
+    const TrigramPostingMap& postingMap,
+    const std::vector<std::string>& queryTrigrams,
+    const std::vector<Atom>& atoms,
+    const std::vector<int>& nameLengths,
+    const std::vector<int>& trigramCounts,
+    const Atom& left,
+    int leftNameLength,
+    int leftTrigramCount,
+    const Settings& settings,
+    std::unordered_map<int, int>& sharedCounts,
+    EmitStats& stats
+) {
+    for (const auto& trigram : queryTrigrams) {
+        const auto postingIt = postingMap.find(trigram);
+        if (postingIt == postingMap.end()) {
+            continue;
+        }
+        stats.postingVisits += postingIt->second.size();
+        for (int j : postingIt->second) {
+            auto sharedIt = sharedCounts.find(j);
+            if (sharedIt != sharedCounts.end()) {
+                sharedIt->second += 1;
+                continue;
+            }
+            const Atom& right = atoms[static_cast<std::size_t>(j)];
+            const int rightNameLength = nameLengths[static_cast<std::size_t>(j)];
+            const int rightTrigramCount = trigramCounts[static_cast<std::size_t>(j)];
+            if (!passesCandidateBounds(left, right, leftNameLength, rightNameLength, leftTrigramCount, rightTrigramCount, settings)) {
+                continue;
+            }
+            sharedCounts.emplace(j, 1);
+            ++stats.candidatePairs;
+        }
+    }
 }
 
 }  // namespace
@@ -210,7 +264,6 @@ EmitStats emitEdgesWithStats(const std::vector<Atom>& atoms, const Settings& set
     nameLengthBuckets.reserve(atoms.size());
     trigramCountBuckets.reserve(atoms.size());
 
-    std::size_t totalTrigramCount = 0;
     for (const auto& atom : atoms) {
         const int nameLength = static_cast<int>(atom.name.size());
         const int trigramCount = static_cast<int>(atom.trigrams.size());
@@ -218,67 +271,74 @@ EmitStats emitEdgesWithStats(const std::vector<Atom>& atoms, const Settings& set
         trigramCounts.push_back(trigramCount);
         nameLengthBuckets.push_back(lengthBucketFor(nameLength));
         trigramCountBuckets.push_back(trigramCountBucketFor(trigramCount));
-        totalTrigramCount += atom.trigrams.size();
     }
 
     const double minThreshold = *std::min_element(settings.thresholds.begin(), settings.thresholds.end());
-    ChainShardMap chainShards;
-    chainShards.reserve(atoms.size());
-    ShortIndexMap shortNamesByChain;
-    ShortIndexMap shortSubstringIndexByChain;
+    LengthBucketMap postingIndex;
+    postingIndex.reserve(atoms.size());
+    ShortIndexMap shortNames;
+    ShortIndexMap shortSubstringIndex;
 
     EmitStats stats;
     for (int i = 0; i < static_cast<int>(atoms.size()); ++i) {
-        const Atom& left = atoms[i];
+        const Atom& left = atoms[static_cast<std::size_t>(i)];
         const int leftNameLength = nameLengths[static_cast<std::size_t>(i)];
         const int leftTrigramCount = trigramCounts[static_cast<std::size_t>(i)];
         const std::vector<int> candidateLengthBuckets = collectLengthBucketsForRange(leftNameLength, settings.maxLenDelta);
+        const std::vector<int> candidateTrigramBuckets = collectTrigramBucketsForRange(leftTrigramCount, settings.trigramCutoff);
         const auto shortTokens = leftNameLength >= 3 ? collectShortSubstrings(left.name) : std::vector<std::string>{};
 
         std::unordered_map<int, int> sharedCounts;
         sharedCounts.reserve(left.trigrams.size() * 4 + shortTokens.size() * 4 + 8);
 
-        for (const auto& chainEntry : chainShards) {
-            const auto& lengthMap = chainEntry.second;
-            for (int candidateLengthBucket : candidateLengthBuckets) {
-                const auto lengthIt = lengthMap.find(candidateLengthBucket);
-                if (lengthIt == lengthMap.end()) {
+        for (int candidateLengthBucket : candidateLengthBuckets) {
+            const auto lengthIt = postingIndex.find(candidateLengthBucket);
+            if (lengthIt == postingIndex.end()) {
+                continue;
+            }
+            const auto& trigramBuckets = lengthIt->second;
+            if (candidateTrigramBuckets.empty()) {
+                for (const auto& trigramBucketEntry : trigramBuckets) {
+                    visitPostingMap(
+                        trigramBucketEntry.second,
+                        left.trigrams,
+                        atoms,
+                        nameLengths,
+                        trigramCounts,
+                        left,
+                        leftNameLength,
+                        leftTrigramCount,
+                        settings,
+                        sharedCounts,
+                        stats
+                    );
+                }
+                continue;
+            }
+            for (int candidateTrigramBucket : candidateTrigramBuckets) {
+                const auto trigramBucketIt = trigramBuckets.find(candidateTrigramBucket);
+                if (trigramBucketIt == trigramBuckets.end()) {
                     continue;
                 }
-                for (const auto& trigramBucketEntry : lengthIt->second) {
-                    const auto& postingMap = trigramBucketEntry.second;
-                    for (const auto& trigram : left.trigrams) {
-                        const auto postingIt = postingMap.find(trigram);
-                        if (postingIt == postingMap.end()) {
-                            continue;
-                        }
-                        stats.postingVisits += postingIt->second.size();
-                        for (int j : postingIt->second) {
-                            auto sharedIt = sharedCounts.find(j);
-                            if (sharedIt != sharedCounts.end()) {
-                                sharedIt->second += 1;
-                                continue;
-                            }
-                            const Atom& right = atoms[static_cast<std::size_t>(j)];
-                            const int rightNameLength = nameLengths[static_cast<std::size_t>(j)];
-                            const int rightTrigramCount = trigramCounts[static_cast<std::size_t>(j)];
-                            if (!passesCandidateBounds(left, right, leftNameLength, rightNameLength, leftTrigramCount, rightTrigramCount, settings)) {
-                                continue;
-                            }
-                            sharedCounts.emplace(j, 1);
-                            ++stats.candidatePairs;
-                        }
-                    }
-                }
+                visitPostingMap(
+                    trigramBucketIt->second,
+                    left.trigrams,
+                    atoms,
+                    nameLengths,
+                    trigramCounts,
+                    left,
+                    leftNameLength,
+                    leftTrigramCount,
+                    settings,
+                    sharedCounts,
+                    stats
+                );
             }
         }
 
         if (leftNameLength < 3) {
-            for (const auto& chainEntry : shortSubstringIndexByChain) {
-                const auto substringIt = chainEntry.second.find(left.name);
-                if (substringIt == chainEntry.second.end()) {
-                    continue;
-                }
+            const auto substringIt = shortSubstringIndex.find(left.name);
+            if (substringIt != shortSubstringIndex.end()) {
                 for (int j : substringIt->second) {
                     if (sharedCounts.find(j) != sharedCounts.end()) {
                         continue;
@@ -292,23 +352,21 @@ EmitStats emitEdgesWithStats(const std::vector<Atom>& atoms, const Settings& set
                 }
             }
         } else {
-            for (const auto& chainEntry : shortNamesByChain) {
-                for (const auto& token : shortTokens) {
-                    const auto shortIt = chainEntry.second.find(token);
-                    if (shortIt == chainEntry.second.end()) {
+            for (const auto& token : shortTokens) {
+                const auto shortIt = shortNames.find(token);
+                if (shortIt == shortNames.end()) {
+                    continue;
+                }
+                for (int j : shortIt->second) {
+                    if (sharedCounts.find(j) != sharedCounts.end()) {
                         continue;
                     }
-                    for (int j : shortIt->second) {
-                        if (sharedCounts.find(j) != sharedCounts.end()) {
-                            continue;
-                        }
-                        const Atom& right = atoms[static_cast<std::size_t>(j)];
-                        if (!passesCandidateBounds(left, right, leftNameLength, nameLengths[static_cast<std::size_t>(j)], leftTrigramCount, trigramCounts[static_cast<std::size_t>(j)], settings)) {
-                            continue;
-                        }
-                        sharedCounts.emplace(j, 0);
-                        ++stats.candidatePairs;
+                    const Atom& right = atoms[static_cast<std::size_t>(j)];
+                    if (!passesCandidateBounds(left, right, leftNameLength, nameLengths[static_cast<std::size_t>(j)], leftTrigramCount, trigramCounts[static_cast<std::size_t>(j)], settings)) {
+                        continue;
                     }
+                    sharedCounts.emplace(j, 0);
+                    ++stats.candidatePairs;
                 }
             }
         }
@@ -332,16 +390,16 @@ EmitStats emitEdgesWithStats(const std::vector<Atom>& atoms, const Settings& set
             ++stats.emittedEdges;
         }
 
-        auto& postingMap = chainShards[left.chain][nameLengthBuckets[static_cast<std::size_t>(i)]][trigramCountBuckets[static_cast<std::size_t>(i)]];
+        auto& postingMap = postingIndex[nameLengthBuckets[static_cast<std::size_t>(i)]][trigramCountBuckets[static_cast<std::size_t>(i)]];
         postingMap.reserve(std::max<std::size_t>(postingMap.size(), left.trigrams.size()));
         for (const auto& trigram : left.trigrams) {
             postingMap[trigram].push_back(i);
         }
         if (leftNameLength < 3) {
-            shortNamesByChain[left.chain][left.name].push_back(i);
+            shortNames[left.name].push_back(i);
         } else {
             for (const auto& token : shortTokens) {
-                shortSubstringIndexByChain[left.chain][token].push_back(i);
+                shortSubstringIndex[token].push_back(i);
             }
         }
     }
@@ -354,3 +412,5 @@ std::size_t emitEdges(const std::vector<Atom>& atoms, const Settings& settings, 
 }
 
 }  // namespace name_worker
+
+

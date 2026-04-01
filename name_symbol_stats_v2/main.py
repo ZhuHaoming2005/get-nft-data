@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import logging
@@ -34,6 +34,7 @@ def symbol_stats_command(args: argparse.Namespace) -> None:
     run_label = normalize_run_label(args.run_label)
     chains = _parse_chains(args.chains)
     with connect() as conn:
+        ensure_schema(conn)
         rows = run_symbol_stats(conn, run_label, chains)
     logger.info('wrote %d symbol summary rows', len(rows))
 

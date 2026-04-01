@@ -29,6 +29,19 @@ CREATE INDEX IF NOT EXISTS idx_nsv2_identity_run_block
 CREATE INDEX IF NOT EXISTS idx_nsv2_identity_name_trgm
     ON nsv2_contract_identity USING gin (name_norm gin_trgm_ops);
 
+CREATE TABLE IF NOT EXISTS nsv2_symbol_rollup (
+    run_label      TEXT        NOT NULL,
+    chain          TEXT        NOT NULL,
+    symbol_norm    TEXT        NOT NULL,
+    contract_count BIGINT      NOT NULL,
+    nft_count      BIGINT      NOT NULL,
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (run_label, chain, symbol_norm)
+);
+
+CREATE INDEX IF NOT EXISTS idx_nsv2_symbol_rollup_lookup
+    ON nsv2_symbol_rollup (run_label, symbol_norm, chain);
+
 CREATE TABLE IF NOT EXISTS nsv2_name_atoms (
     atom_id                 BIGSERIAL   PRIMARY KEY,
     run_label               TEXT        NOT NULL,
