@@ -7,3 +7,4 @@ classification&status
 build
 build-**
 dist
+.worktrees
