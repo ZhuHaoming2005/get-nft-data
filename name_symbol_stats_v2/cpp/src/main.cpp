@@ -1,82 +1,32 @@
-﻿#include <algorithm>
-#include <cmath>
 #include <cstdlib>
 #include <iostream>
-#include <limits>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include <libpq-fe.h>
 
-struct Settings {
-    std::string runLabel;
-    std::string workerId = "worker-1";
-    double trigramCutoff = 0.35;
-    int maxLenDelta = 12;
-    std::vector<double> thresholds;
-};
+#include "worker_core.hpp"
 
-struct Task {
-    long long id = 0;
-    std::string taskKey;
-    std::string chainsCsv;
-    std::string blockKey;
-    std::string signaturePrefix;
-    bool valid = false;
-};
+namespace nw = name_worker;
 
-struct Atom {
-    long long atomId = 0;
-    std::string chain;
-    std::string name;
-    long long contractCount = 0;
-    long long nftCount = 0;
-    std::vector<std::string> trigrams;
-};
+namespace {
 
-struct Edge {
-    long long leftAtomId = 0;
-    long long rightAtomId = 0;
-    double similarity = 0.0;
-};
+using ConnPtr = std::unique_ptr<PGconn, decltype(&PQfinish)>;
+using ResultPtr = std::unique_ptr<PGresult, decltype(&PQclear)>;
 
-static std::string envOr(const char* key, const char* fallback) {
+std::string envOr(const char* key, const char* fallback) {
     const char* value = std::getenv(key);
     return value ? value : fallback;
 }
 
-static std::vector<std::string> split(const std::string& value, char sep) {
-    std::vector<std::string> parts;
-    std::stringstream stream(value);
-    std::string item;
-    while (std::getline(stream, item, sep)) {
-        if (!item.empty()) {
-            parts.push_back(item);
-        }
-    }
-    return parts;
-}
-
-static std::vector<double> parseThresholds(const std::string& value) {
-    std::vector<double> out;
-    for (const auto& part : split(value, ',')) {
-        out.push_back(std::stod(part));
-    }
-    if (out.empty()) {
-        throw std::runtime_error("thresholds cannot be empty");
-    }
-    return out;
-}
-
-static Settings parseArgs(int argc, char** argv) {
-    Settings settings;
-    settings.thresholds = {85.0, 90.0, 95.0};
+nw::Settings parseArgs(int argc, char** argv) {
+    nw::Settings settings;
     for (int index = 1; index < argc; ++index) {
-        std::string arg = argv[index];
+        const std::string arg = argv[index];
         if (arg == "--run-label" && index + 1 < argc) {
             settings.runLabel = argv[++index];
         } else if (arg == "--worker-id" && index + 1 < argc) {
@@ -86,147 +36,115 @@ static Settings parseArgs(int argc, char** argv) {
         } else if (arg == "--max-len-delta" && index + 1 < argc) {
             settings.maxLenDelta = std::stoi(argv[++index]);
         } else if (arg == "--thresholds" && index + 1 < argc) {
-            settings.thresholds = parseThresholds(argv[++index]);
+            settings.thresholds = nw::parseThresholds(argv[++index]);
+        } else if (arg == "--task-lease-seconds" && index + 1 < argc) {
+            settings.taskLeaseSeconds = std::stoi(argv[++index]);
+        } else if (arg == "--insert-batch-size" && index + 1 < argc) {
+            settings.insertBatchSize = static_cast<std::size_t>(std::stoull(argv[++index]));
         }
     }
     if (settings.runLabel.empty()) {
         throw std::runtime_error("--run-label is required");
     }
+    if (settings.thresholds.empty()) {
+        throw std::runtime_error("thresholds cannot be empty");
+    }
+    if (settings.taskLeaseSeconds <= 0) {
+        throw std::runtime_error("task lease must be positive");
+    }
+    if (settings.insertBatchSize == 0) {
+        throw std::runtime_error("insert batch size must be positive");
+    }
     return settings;
 }
 
-static void ensureOk(PGresult* result, ExecStatusType expected, PGconn* conn) {
-    if (PQresultStatus(result) != expected) {
-        std::string error = PQerrorMessage(conn);
-        PQclear(result);
-        throw std::runtime_error(error);
+ResultPtr wrapResult(PGresult* raw, PGconn* conn) {
+    if (raw == nullptr) {
+        throw std::runtime_error(PQerrorMessage(conn));
+    }
+    return ResultPtr(raw, &PQclear);
+}
+
+void ensureOk(const ResultPtr& result, ExecStatusType expected, PGconn* conn) {
+    if (PQresultStatus(result.get()) != expected) {
+        throw std::runtime_error(PQerrorMessage(conn));
     }
 }
 
-static PGconn* connectDb() {
+ResultPtr exec(PGconn* conn, const char* sql) {
+    return wrapResult(PQexec(conn, sql), conn);
+}
+
+ResultPtr execParams(PGconn* conn, const std::string& sql, int paramCount, const char* const* values) {
+    return wrapResult(PQexecParams(conn, sql.c_str(), paramCount, nullptr, values, nullptr, nullptr, 0), conn);
+}
+
+void execCommand(PGconn* conn, const char* sql) {
+    auto result = exec(conn, sql);
+    ensureOk(result, PGRES_COMMAND_OK, conn);
+}
+
+void rollbackQuietly(PGconn* conn) {
+    if (conn == nullptr) {
+        return;
+    }
+    const auto txStatus = PQtransactionStatus(conn);
+    if (txStatus != PQTRANS_INTRANS && txStatus != PQTRANS_INERROR) {
+        return;
+    }
+    try {
+        execCommand(conn, "ROLLBACK");
+    } catch (...) {
+    }
+}
+
+ConnPtr connectDb() {
     std::ostringstream dsn;
     dsn << "host=" << envOr("DB_HOST", "localhost")
         << " port=" << envOr("DB_PORT", "5432")
         << " dbname=" << envOr("DB_NAME", "nft_data")
         << " user=" << envOr("DB_USER", "postgres")
         << " password=" << envOr("DB_PASS", "123456");
-    PGconn* conn = PQconnectdb(dsn.str().c_str());
-    if (PQstatus(conn) != CONNECTION_OK) {
-        std::string error = PQerrorMessage(conn);
-        PQfinish(conn);
-        throw std::runtime_error(error);
+    ConnPtr conn(PQconnectdb(dsn.str().c_str()), &PQfinish);
+    if (conn == nullptr || PQstatus(conn.get()) != CONNECTION_OK) {
+        throw std::runtime_error(conn ? PQerrorMessage(conn.get()) : "PQconnectdb returned null");
     }
     return conn;
 }
 
-static std::vector<std::string> buildTrigrams(const std::string& value) {
-    std::vector<std::string> out;
-    if (value.empty()) {
-        return out;
-    }
-    if (value.size() < 3) {
-        out.push_back(value);
-        return out;
-    }
-    out.reserve(value.size() - 2);
-    for (size_t index = 0; index + 2 < value.size(); ++index) {
-        out.push_back(value.substr(index, 3));
-    }
-    std::sort(out.begin(), out.end());
-    out.erase(std::unique(out.begin(), out.end()), out.end());
-    return out;
-}
+nw::Task claimTask(PGconn* conn, const nw::Settings& settings) {
+    execCommand(conn, "BEGIN");
 
-static double levenshteinRatio(const std::string& left, const std::string& right) {
-    if (left == right) {
-        return 100.0;
-    }
-    if (left.empty() || right.empty()) {
-        return 0.0;
-    }
-    std::vector<int> prev(right.size() + 1);
-    std::vector<int> curr(right.size() + 1);
-    for (size_t j = 0; j <= right.size(); ++j) {
-        prev[j] = static_cast<int>(j);
-    }
-    for (size_t i = 0; i < left.size(); ++i) {
-        curr[0] = static_cast<int>(i + 1);
-        for (size_t j = 0; j < right.size(); ++j) {
-            int cost = left[i] == right[j] ? 0 : 1;
-            curr[j + 1] = std::min({
-                prev[j + 1] + 1,
-                curr[j] + 1,
-                prev[j] + cost,
-            });
+    try {
+        const std::string leaseSeconds = std::to_string(settings.taskLeaseSeconds);
+        const char* values[3] = {
+            settings.runLabel.c_str(),
+            settings.workerId.c_str(),
+            leaseSeconds.c_str(),
+        };
+        auto result = execParams(conn, nw::buildClaimTaskSql(), 3, values);
+        ensureOk(result, PGRES_TUPLES_OK, conn);
+
+        nw::Task task;
+        if (PQntuples(result.get()) > 0) {
+            task.id = std::stoll(PQgetvalue(result.get(), 0, 0));
+            task.taskKey = PQgetvalue(result.get(), 0, 1);
+            task.chainsCsv = PQgetvalue(result.get(), 0, 2);
+            task.blockKey = PQgetvalue(result.get(), 0, 3);
+            task.signaturePrefix = PQgetvalue(result.get(), 0, 4);
+            task.valid = true;
         }
-        std::swap(prev, curr);
+
+        execCommand(conn, task.valid ? "COMMIT" : "ROLLBACK");
+        return task;
+    } catch (...) {
+        rollbackQuietly(conn);
+        throw;
     }
-    int distance = prev[right.size()];
-    int maxLen = static_cast<int>(std::max(left.size(), right.size()));
-    return 100.0 * (1.0 - static_cast<double>(distance) / static_cast<double>(maxLen));
 }
 
-static double trigramJaccard(const Atom& left, const Atom& right, int shared) {
-    int unionSize = static_cast<int>(left.trigrams.size() + right.trigrams.size() - shared);
-    if (unionSize <= 0) {
-        return 0.0;
-    }
-    return static_cast<double>(shared) / static_cast<double>(unionSize);
-}
-
-static Task claimTask(PGconn* conn, const Settings& settings) {
-    PGresult* begin = PQexec(conn, "BEGIN");
-    ensureOk(begin, PGRES_COMMAND_OK, conn);
-    PQclear(begin);
-
-    const char* values[2] = {settings.runLabel.c_str(), settings.workerId.c_str()};
-    PGresult* result = PQexecParams(
-        conn,
-        "WITH candidate AS ("
-        "  SELECT id"
-        "  FROM nsv2_name_work_items"
-        "  WHERE run_label = $1 AND status = 'pending'"
-        "  ORDER BY atom_count DESC, id"
-        "  LIMIT 1"
-        "  FOR UPDATE SKIP LOCKED"
-        ")"
-        "UPDATE nsv2_name_work_items AS w"
-        " SET status = 'running', worker_id = $2, started_at = NOW(), attempt_count = attempt_count + 1, error_message = ''"
-        " WHERE w.id IN (SELECT id FROM candidate)"
-        " RETURNING w.id, w.task_key, w.chains_csv, w.name_block_key, w.signature_prefix",
-        2,
-        nullptr,
-        values,
-        nullptr,
-        nullptr,
-        0
-    );
-    if (PQresultStatus(result) != PGRES_TUPLES_OK) {
-        std::string error = PQerrorMessage(conn);
-        PQclear(result);
-        PQexec(conn, "ROLLBACK");
-        throw std::runtime_error(error);
-    }
-
-    Task task;
-    if (PQntuples(result) > 0) {
-        task.id = std::stoll(PQgetvalue(result, 0, 0));
-        task.taskKey = PQgetvalue(result, 0, 1);
-        task.chainsCsv = PQgetvalue(result, 0, 2);
-        task.blockKey = PQgetvalue(result, 0, 3);
-        task.signaturePrefix = PQgetvalue(result, 0, 4);
-        task.valid = true;
-    }
-    PQclear(result);
-
-    PGresult* end = PQexec(conn, task.valid ? "COMMIT" : "ROLLBACK");
-    ensureOk(end, PGRES_COMMAND_OK, conn);
-    PQclear(end);
-    return task;
-}
-
-static std::vector<Atom> loadAtoms(PGconn* conn, const Settings& settings, const Task& task) {
-    std::string prefixLen = std::to_string(task.signaturePrefix.size());
+std::vector<nw::Atom> loadAtoms(PGconn* conn, const nw::Settings& settings, const nw::Task& task) {
+    const std::string prefixLen = std::to_string(task.signaturePrefix.size());
     const char* values[5] = {
         settings.runLabel.c_str(),
         task.chainsCsv.c_str(),
@@ -234,7 +152,7 @@ static std::vector<Atom> loadAtoms(PGconn* conn, const Settings& settings, const
         prefixLen.c_str(),
         task.signaturePrefix.c_str(),
     };
-    PGresult* result = PQexecParams(
+    auto result = execParams(
         conn,
         "SELECT atom_id, chain, name_norm, contract_count, nft_count "
         "FROM nsv2_name_atoms "
@@ -244,172 +162,184 @@ static std::vector<Atom> loadAtoms(PGconn* conn, const Settings& settings, const
         "  AND ($5 = '' OR left(name_signature_hash, $4::int) = $5) "
         "ORDER BY atom_id",
         5,
-        nullptr,
-        values,
-        nullptr,
-        nullptr,
-        0
+        values
     );
-    if (PQresultStatus(result) != PGRES_TUPLES_OK) {
-        std::string error = PQerrorMessage(conn);
-        PQclear(result);
-        throw std::runtime_error(error);
-    }
-    std::vector<Atom> atoms;
-    atoms.reserve(PQntuples(result));
-    for (int row = 0; row < PQntuples(result); ++row) {
-        Atom atom;
-        atom.atomId = std::stoll(PQgetvalue(result, row, 0));
-        atom.chain = PQgetvalue(result, row, 1);
-        atom.name = PQgetvalue(result, row, 2);
-        atom.contractCount = std::stoll(PQgetvalue(result, row, 3));
-        atom.nftCount = std::stoll(PQgetvalue(result, row, 4));
-        atom.trigrams = buildTrigrams(atom.name);
+    ensureOk(result, PGRES_TUPLES_OK, conn);
+
+    std::vector<nw::Atom> atoms;
+    atoms.reserve(static_cast<std::size_t>(PQntuples(result.get())));
+    for (int row = 0; row < PQntuples(result.get()); ++row) {
+        nw::Atom atom;
+        atom.atomId = std::stoll(PQgetvalue(result.get(), row, 0));
+        atom.chain = PQgetvalue(result.get(), row, 1);
+        atom.name = PQgetvalue(result.get(), row, 2);
+        atom.contractCount = std::stoll(PQgetvalue(result.get(), row, 3));
+        atom.nftCount = std::stoll(PQgetvalue(result.get(), row, 4));
+        atom.trigrams = nw::buildTrigrams(atom.name);
         atoms.push_back(std::move(atom));
     }
-    PQclear(result);
     return atoms;
 }
 
-static std::vector<Edge> computeEdges(const std::vector<Atom>& atoms, const Settings& settings) {
-    std::vector<Edge> edges;
-    double minThreshold = *std::min_element(settings.thresholds.begin(), settings.thresholds.end());
-    std::unordered_map<std::string, std::vector<int>> inverted;
-
-    for (int i = 0; i < static_cast<int>(atoms.size()); ++i) {
-        const Atom& left = atoms[i];
-        std::unordered_map<int, int> sharedCounts;
-        for (const auto& trigram : left.trigrams) {
-            auto it = inverted.find(trigram);
-            if (it == inverted.end()) {
-                continue;
-            }
-            for (int j : it->second) {
-                sharedCounts[j] += 1;
-            }
+std::string buildInsertEdgesSql(std::size_t rowCount) {
+    std::ostringstream sql;
+    sql << "INSERT INTO nsv2_name_match_edges (run_label, task_id, left_atom_id, right_atom_id, similarity_score) VALUES ";
+    int paramIndex = 3;
+    for (std::size_t row = 0; row < rowCount; ++row) {
+        if (row != 0) {
+            sql << ',';
         }
-
-        for (const auto& entry : sharedCounts) {
-            int j = entry.first;
-            const Atom& right = atoms[j];
-            if (std::abs(static_cast<int>(left.name.size()) - static_cast<int>(right.name.size())) > settings.maxLenDelta) {
-                continue;
-            }
-            int shared = entry.second;
-            double jaccard = trigramJaccard(left, right, shared);
-            bool substringHit = left.name.find(right.name) != std::string::npos || right.name.find(left.name) != std::string::npos;
-            if (!substringHit && jaccard < settings.trigramCutoff) {
-                continue;
-            }
-            double similarity = levenshteinRatio(left.name, right.name);
-            if (similarity < minThreshold) {
-                continue;
-            }
-            edges.push_back(Edge{right.atomId, left.atomId, similarity});
-        }
-
-        for (const auto& trigram : left.trigrams) {
-            inverted[trigram].push_back(i);
-        }
+        sql << "($1, $2::bigint, $" << paramIndex++ << "::bigint, $" << paramIndex++ << "::bigint, $" << paramIndex++ << "::double precision)";
     }
-    return edges;
+    sql << " ON CONFLICT (run_label, task_id, left_atom_id, right_atom_id) DO NOTHING";
+    return sql.str();
 }
 
-static std::string escapeLiteral(PGconn* conn, const std::string& value) {
-    char* escaped = PQescapeLiteral(conn, value.c_str(), value.size());
-    if (escaped == nullptr) {
-        throw std::runtime_error(PQerrorMessage(conn));
-    }
-    std::string out(escaped);
-    PQfreemem(escaped);
-    return out;
-}
-
-static void insertEdges(PGconn* conn, const Settings& settings, const Task& task, const std::vector<Edge>& edges) {
-    if (edges.empty()) {
+void insertEdgeBatch(PGconn* conn, const nw::Settings& settings, const nw::Task& task, const std::vector<nw::Edge>& batch) {
+    if (batch.empty()) {
         return;
     }
-    std::string runLiteral = escapeLiteral(conn, settings.runLabel);
-    const size_t batchSize = 500;
-    for (size_t start = 0; start < edges.size(); start += batchSize) {
-        size_t end = std::min(start + batchSize, edges.size());
-        std::ostringstream sql;
-        sql << "INSERT INTO nsv2_name_match_edges (run_label, task_id, left_atom_id, right_atom_id, similarity_score) VALUES ";
-        bool first = true;
-        for (size_t index = start; index < end; ++index) {
-            const Edge& edge = edges[index];
-            if (!first) {
-                sql << ',';
-            }
-            first = false;
-            sql << '(' << runLiteral << ',' << task.id << ',' << edge.leftAtomId << ',' << edge.rightAtomId << ',' << edge.similarity << ')';
-        }
-        sql << " ON CONFLICT (run_label, task_id, left_atom_id, right_atom_id) DO NOTHING";
-        PGresult* result = PQexec(conn, sql.str().c_str());
-        ensureOk(result, PGRES_COMMAND_OK, conn);
-        PQclear(result);
+
+    std::vector<std::string> storage;
+    storage.reserve(2 + batch.size() * 3);
+    storage.push_back(settings.runLabel);
+    storage.push_back(std::to_string(task.id));
+    for (const auto& edge : batch) {
+        storage.push_back(std::to_string(edge.leftAtomId));
+        storage.push_back(std::to_string(edge.rightAtomId));
+        storage.push_back(std::to_string(edge.similarity));
     }
+
+    std::vector<const char*> values;
+    values.reserve(storage.size());
+    for (const auto& item : storage) {
+        values.push_back(item.c_str());
+    }
+
+    auto result = execParams(conn, buildInsertEdgesSql(batch.size()), static_cast<int>(values.size()), values.data());
+    ensureOk(result, PGRES_COMMAND_OK, conn);
 }
 
-static void finishTask(PGconn* conn, const Task& task, long long edgeCount) {
-    std::string taskId = std::to_string(task.id);
-    std::string edgeCountStr = std::to_string(edgeCount);
-    const char* values[2] = {edgeCountStr.c_str(), taskId.c_str()};
-    PGresult* result = PQexecParams(
+class EdgeBatchInserter {
+public:
+    EdgeBatchInserter(PGconn* conn, const nw::Settings& settings, const nw::Task& task)
+        : conn_(conn), settings_(settings), task_(task), batchSize_(std::max<std::size_t>(1, settings.insertBatchSize)) {
+        batch_.reserve(batchSize_);
+    }
+
+    void push(const nw::Edge& edge) {
+        batch_.push_back(edge);
+        if (batch_.size() >= batchSize_) {
+            flush();
+        }
+    }
+
+    void flush() {
+        insertEdgeBatch(conn_, settings_, task_, batch_);
+        batch_.clear();
+    }
+
+private:
+    PGconn* conn_;
+    const nw::Settings& settings_;
+    const nw::Task& task_;
+    std::size_t batchSize_;
+    std::vector<nw::Edge> batch_;
+};
+
+void cleanupTaskEdges(PGconn* conn, const nw::Settings& settings, const nw::Task& task) {
+    const std::string taskId = std::to_string(task.id);
+    const char* values[2] = {settings.runLabel.c_str(), taskId.c_str()};
+    auto result = execParams(
         conn,
-        "UPDATE nsv2_name_work_items SET status = 'done', edge_count = $1::bigint, finished_at = NOW() WHERE id = $2::bigint",
+        "DELETE FROM nsv2_name_match_edges WHERE run_label = $1 AND task_id = $2::bigint",
         2,
-        nullptr,
-        values,
-        nullptr,
-        nullptr,
-        0
+        values
     );
     ensureOk(result, PGRES_COMMAND_OK, conn);
-    PQclear(result);
 }
 
-static void failTask(PGconn* conn, const Task& task, const std::string& error) {
-    std::string taskId = std::to_string(task.id);
-    const char* values[2] = {error.c_str(), taskId.c_str()};
-    PGresult* result = PQexecParams(
+void finishTask(PGconn* conn, const nw::Task& task, long long edgeCount) {
+    const std::string taskId = std::to_string(task.id);
+    const std::string edgeCountStr = std::to_string(edgeCount);
+    const char* values[2] = {edgeCountStr.c_str(), taskId.c_str()};
+    auto result = execParams(
         conn,
-        "UPDATE nsv2_name_work_items SET status = 'failed', error_message = $1, finished_at = NOW() WHERE id = $2::bigint",
+        "UPDATE nsv2_name_work_items "
+        "SET status = 'done', edge_count = $1::bigint, finished_at = NOW() "
+        "WHERE id = $2::bigint",
         2,
-        nullptr,
-        values,
-        nullptr,
-        nullptr,
-        0
+        values
     );
-    if (PQresultStatus(result) == PGRES_COMMAND_OK) {
-        PQclear(result);
-        return;
-    }
-    PQclear(result);
+    ensureOk(result, PGRES_COMMAND_OK, conn);
 }
+
+void failTask(PGconn* conn, const nw::Task& task, const std::string& error) {
+    const std::string taskId = std::to_string(task.id);
+    const char* values[2] = {error.c_str(), taskId.c_str()};
+    auto result = execParams(
+        conn,
+        "UPDATE nsv2_name_work_items "
+        "SET status = 'failed', error_message = $1, finished_at = NOW() "
+        "WHERE id = $2::bigint",
+        2,
+        values
+    );
+    ensureOk(result, PGRES_COMMAND_OK, conn);
+}
+
+void cleanupAndFailTask(PGconn* conn, const nw::Settings& settings, const nw::Task& task, const std::string& error) {
+    rollbackQuietly(conn);
+    execCommand(conn, "BEGIN");
+    try {
+        cleanupTaskEdges(conn, settings, task);
+        failTask(conn, task, error);
+        execCommand(conn, "COMMIT");
+    } catch (...) {
+        rollbackQuietly(conn);
+        throw;
+    }
+}
+
+}  // namespace
 
 int main(int argc, char** argv) {
     try {
-        Settings settings = parseArgs(argc, argv);
-        PGconn* conn = connectDb();
+        const nw::Settings settings = parseArgs(argc, argv);
+        auto conn = connectDb();
         while (true) {
-            Task task = claimTask(conn, settings);
+            const nw::Task task = claimTask(conn.get(), settings);
             if (!task.valid) {
                 break;
             }
             try {
-                std::vector<Atom> atoms = loadAtoms(conn, settings, task);
-                std::vector<Edge> edges = computeEdges(atoms, settings);
-                insertEdges(conn, settings, task, edges);
-                finishTask(conn, task, static_cast<long long>(edges.size()));
-                std::cout << settings.workerId << " finished task " << task.taskKey << " edges=" << edges.size() << std::endl;
+                cleanupTaskEdges(conn.get(), settings, task);
+                const std::vector<nw::Atom> atoms = loadAtoms(conn.get(), settings, task);
+                EdgeBatchInserter inserter(conn.get(), settings, task);
+                const nw::EmitStats stats = nw::emitEdgesWithStats(atoms, settings, [&](const nw::Edge& edge) {
+                    inserter.push(edge);
+                });
+                inserter.flush();
+                finishTask(conn.get(), task, static_cast<long long>(stats.emittedEdges));
+                std::cout
+                    << settings.workerId
+                    << " finished task " << task.taskKey
+                    << " atoms=" << atoms.size()
+                    << " edges=" << stats.emittedEdges
+                    << " posting_visits=" << stats.postingVisits
+                    << " candidates=" << stats.candidatePairs
+                    << " scored=" << stats.scoredPairs
+                    << std::endl;
             } catch (const std::exception& ex) {
-                failTask(conn, task, ex.what());
+                try {
+                    cleanupAndFailTask(conn.get(), settings, task, ex.what());
+                } catch (const std::exception& failEx) {
+                    std::cerr << settings.workerId << " failed to clean up task " << task.taskKey << ": " << failEx.what() << std::endl;
+                    throw;
+                }
                 std::cerr << settings.workerId << " failed task " << task.taskKey << ": " << ex.what() << std::endl;
             }
         }
-        PQfinish(conn);
         return 0;
     } catch (const std::exception& ex) {
         std::cerr << ex.what() << std::endl;

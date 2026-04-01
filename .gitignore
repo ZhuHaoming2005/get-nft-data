@@ -4,7 +4,6 @@ __pycache__
 *.pyc
 classification&status
 .env
-**.txt
 build
-build-mingw
+build-**
 dist
