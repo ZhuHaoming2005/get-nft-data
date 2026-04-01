@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import time
+from pathlib import Path
 from typing import Sequence
 
 from psycopg2.extras import execute_values
@@ -18,6 +20,30 @@ from .normalize import (
 from .progress import ProgressPrinter
 
 logger = logging.getLogger(__name__)
+_TIMING_LOG_NAME = f'{__name__}.timing'
+_TIMING_LOG_FILENAME = 'build_contract_identity_timing.log'
+
+
+def _format_timing_extra(elapsed_seconds: float, **fields: object) -> str:
+    parts = [f'elapsed={elapsed_seconds:.3f}s']
+    for key, value in fields.items():
+        parts.append(f'{key}={value}')
+    return ' '.join(parts)
+
+
+def _get_timing_logger(log_path: str | Path | None = None) -> logging.Logger:
+    resolved_path = Path(log_path or _TIMING_LOG_FILENAME).resolve()
+    timing_logger = logging.getLogger(_TIMING_LOG_NAME)
+    timing_logger.setLevel(logging.INFO)
+    timing_logger.propagate = False
+    for handler in timing_logger.handlers:
+        if isinstance(handler, logging.FileHandler) and Path(handler.baseFilename).resolve() == resolved_path:
+            return timing_logger
+    file_handler = logging.FileHandler(resolved_path, encoding='utf-8')
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+    timing_logger.addHandler(file_handler)
+    return timing_logger
 
 
 def _table_has_column(conn, table_name: str, column_name: str) -> bool:
@@ -152,6 +178,8 @@ def _insert_identity_batch(conn, rows: Sequence[tuple[object, ...]]) -> None:
 
 
 def _rebuild_name_atoms(conn, run_label: str, chains: Sequence[str]) -> int:
+    started_at = time.perf_counter()
+    timing_logger = _get_timing_logger()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -191,10 +219,13 @@ def _rebuild_name_atoms(conn, run_label: str, chains: Sequence[str]) -> int:
         )
         inserted = cur.rowcount
     conn.commit()
+    timing_logger.info('rebuilt %d name atoms (%s)', inserted, _format_timing_extra(time.perf_counter() - started_at, run_label=run_label))
     return inserted
 
 
 def build_contract_identity(conn, run_label: str, chains: Sequence[str], *, batch_size: int = 5000) -> dict[str, int]:
+    started_at = time.perf_counter()
+    timing_logger = _get_timing_logger()
     ensure_schema(conn)
     table_names = {chain: chain_to_table(chain) for chain in chains}
     totals = {chain: _contract_total(conn, table_name) for chain, table_name in table_names.items()}
@@ -203,6 +234,7 @@ def build_contract_identity(conn, run_label: str, chains: Sequence[str], *, batc
     counts: dict[str, int] = {}
     completed = 0
     for chain in chains:
+        chain_started_at = time.perf_counter()
         table_name = table_names[chain]
         sql = _rollup_sql(
             table_name,
@@ -245,9 +277,17 @@ def build_contract_identity(conn, run_label: str, chains: Sequence[str], *, batc
             tracker.update(completed, extra=f'chain={chain}')
             conn.commit()
         counts[chain] = inserted
-        logger.info('%s contract identity rows ready: %d', chain, inserted)
+        timing_logger.info(
+            '%s contract identity rows ready: %d (%s)',
+            chain,
+            inserted,
+            _format_timing_extra(time.perf_counter() - chain_started_at, chain=chain),
+        )
 
     atom_count = _rebuild_name_atoms(conn, run_label, chains)
     tracker.close(extra=f'name_atoms={atom_count}')
-    logger.info('rebuilt %d name atoms for run %s', atom_count, run_label)
+    timing_logger.info(
+        'build-contract-identity complete (%s)',
+        _format_timing_extra(time.perf_counter() - started_at, run_label=run_label, name_atoms=atom_count),
+    )
     return counts
