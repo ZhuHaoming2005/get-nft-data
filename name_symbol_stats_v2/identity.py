@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import logging
 from typing import Sequence
@@ -15,6 +15,7 @@ from .normalize import (
     normalize_name,
     normalize_symbol,
 )
+from .progress import ProgressPrinter
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,22 @@ def _rollup_sql(table_name: str, *, has_name: bool, has_symbol: bool) -> str:
         WHERE ranked.rn = 1
         ORDER BY ranked.contract_address
     """
+
+
+def _contract_total(conn, table_name: str) -> int:
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT count(*)::int
+            FROM (
+                SELECT lower(trim(contract_address)) AS contract_address
+                FROM {table_name}
+                WHERE contract_address IS NOT NULL AND trim(contract_address) <> ''
+                GROUP BY 1
+            ) contracts
+            """
+        )
+        return int(cur.fetchone()[0])
 
 
 def _identity_row(run_label: str, chain: str, contract_address: str, nft_count: int, raw_name: str, raw_symbol: str, name_variant_count: int, symbol_variant_count: int) -> tuple[object, ...]:
@@ -176,9 +193,14 @@ def _rebuild_name_atoms(conn, run_label: str, chains: Sequence[str]) -> int:
 
 def build_contract_identity(conn, run_label: str, chains: Sequence[str], *, batch_size: int = 5000) -> dict[str, int]:
     ensure_schema(conn)
+    table_names = {chain: chain_to_table(chain) for chain in chains}
+    totals = {chain: _contract_total(conn, table_name) for chain, table_name in table_names.items()}
+    tracker = ProgressPrinter('build-contract-identity', sum(totals.values()), 'contracts', logger)
+
     counts: dict[str, int] = {}
+    completed = 0
     for chain in chains:
-        table_name = chain_to_table(chain)
+        table_name = table_names[chain]
         sql = _rollup_sql(
             table_name,
             has_name=_table_has_column(conn, table_name, 'name'),
@@ -202,19 +224,27 @@ def build_contract_identity(conn, run_label: str, chains: Sequence[str], *, batc
                     for row in rows:
                         buffer.append(_identity_row(run_label, chain, *row))
                     if len(buffer) >= batch_size:
+                        batch_count = len(buffer)
                         _insert_identity_batch(conn, buffer)
-                        inserted += len(buffer)
+                        inserted += batch_count
+                        completed += batch_count
+                        tracker.update(completed, extra=f'chain={chain}')
                         buffer.clear()
                         conn.commit()
         finally:
             read_conn.close()
 
         if buffer:
+            batch_count = len(buffer)
             _insert_identity_batch(conn, buffer)
-            inserted += len(buffer)
+            inserted += batch_count
+            completed += batch_count
+            tracker.update(completed, extra=f'chain={chain}')
             conn.commit()
         counts[chain] = inserted
+        logger.info('%s contract identity rows ready: %d', chain, inserted)
 
     atom_count = _rebuild_name_atoms(conn, run_label, chains)
+    tracker.close(extra=f'name_atoms={atom_count}')
     logger.info('rebuilt %d name atoms for run %s', atom_count, run_label)
     return counts

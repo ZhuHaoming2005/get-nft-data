@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import hashlib
 import logging
@@ -8,6 +8,7 @@ from typing import Iterable, Sequence
 
 from psycopg2.extras import execute_values
 
+from .progress import ProgressPrinter
 from .report import DuplicateGroupStats, SummaryRow, summarize_groups
 
 logger = logging.getLogger(__name__)
@@ -289,10 +290,14 @@ def finalize_name_stats(conn, run_label: str, chains: Sequence[str], thresholds:
         )
     conn.commit()
 
+    task_rows = _task_rows(conn, run_label)
+    tracker = ProgressPrinter('finalize-name-stats', len(task_rows), 'tasks', logger)
     chain_totals = _load_chain_totals(conn, run_label, chains)
     aggregate_groups: dict[tuple[str, str, str, float], list[DuplicateGroupStats]] = defaultdict(list)
+    processed_tasks = 0
+    inserted_group_count = 0
 
-    for task_id, task_key, block_key, signature_prefix in _task_rows(conn, run_label):
+    for task_id, task_key, block_key, signature_prefix in task_rows:
         atoms = _load_atoms_for_task(conn, run_label, block_key, signature_prefix)
         edges = _load_edges_for_task(conn, run_label, task_id)
 
@@ -300,10 +305,12 @@ def finalize_name_stats(conn, run_label: str, chains: Sequence[str], thresholds:
             for primary_chain in chains:
                 groups = _groups_for_scope(atoms, edges, scope='intra_chain', primary_chain=primary_chain, secondary_chain='', threshold=threshold)
                 aggregate_groups[('intra_chain', primary_chain, '', threshold)].extend(groups)
+                inserted_group_count += len(groups)
                 _insert_groups(conn, run_label, 'intra_chain', primary_chain, '', threshold, task_key, groups)
 
                 groups = _groups_for_scope(atoms, edges, scope='cross_chain_summary', primary_chain=primary_chain, secondary_chain='', threshold=threshold)
                 aggregate_groups[('cross_chain_summary', primary_chain, '', threshold)].extend(groups)
+                inserted_group_count += len(groups)
                 _insert_groups(conn, run_label, 'cross_chain_summary', primary_chain, '', threshold, task_key, groups)
 
                 for secondary_chain in chains:
@@ -311,8 +318,11 @@ def finalize_name_stats(conn, run_label: str, chains: Sequence[str], thresholds:
                         continue
                     groups = _groups_for_scope(atoms, edges, scope='chain_matrix', primary_chain=primary_chain, secondary_chain=secondary_chain, threshold=threshold)
                     aggregate_groups[('chain_matrix', primary_chain, secondary_chain, threshold)].extend(groups)
+                    inserted_group_count += len(groups)
                     _insert_groups(conn, run_label, 'chain_matrix', primary_chain, secondary_chain, threshold, task_key, groups)
         conn.commit()
+        processed_tasks += 1
+        tracker.update(processed_tasks, extra=f'task={task_key} groups={inserted_group_count}')
 
     summary_rows: list[SummaryRow] = []
     for (scope, primary_chain, secondary_chain, threshold), groups in aggregate_groups.items():
@@ -333,5 +343,6 @@ def finalize_name_stats(conn, run_label: str, chains: Sequence[str], thresholds:
 
     _insert_summary_rows(conn, summary_rows)
     conn.commit()
+    tracker.close(extra=f'groups={inserted_group_count} summary_rows={len(summary_rows)}')
     logger.info('wrote %d name summary rows for run %s', len(summary_rows), run_label)
     return summary_rows

@@ -1,10 +1,12 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
 from typing import Sequence
 
 from psycopg2.extras import execute_values
+
+from .progress import ProgressPrinter
 
 logger = logging.getLogger(__name__)
 
@@ -84,10 +86,20 @@ def build_work_items(conn, run_label: str, chains: Sequence[str], *, max_atoms_p
     _delete_outputs(conn, run_label, chains)
     chains_csv = ','.join(chains)
     work_items: list[WorkItem] = []
+    block_sizes = _fetch_block_sizes(conn, run_label, chains)
+    tracker = ProgressPrinter('prepare-name-tasks', len(block_sizes), 'blocks', logger)
+    processed_blocks = 0
+    processed_atoms = 0
 
-    for block_key, atom_count in _fetch_block_sizes(conn, run_label, chains):
+    for block_key, atom_count in block_sizes:
+        processed_atoms += atom_count
         if atom_count <= max_atoms_per_task:
             work_items.append(WorkItem(run_label, chains_csv, block_key, '', atom_count))
+            processed_blocks += 1
+            tracker.update(
+                processed_blocks,
+                extra=f'work_items={len(work_items)} atoms={processed_atoms}',
+            )
             continue
 
         prefix_len = 4
@@ -98,6 +110,11 @@ def build_work_items(conn, run_label: str, chains: Sequence[str], *, max_atoms_p
 
         for signature_prefix, split_count in splits:
             work_items.append(WorkItem(run_label, chains_csv, block_key, signature_prefix, split_count))
+        processed_blocks += 1
+        tracker.update(
+            processed_blocks,
+            extra=f'work_items={len(work_items)} atoms={processed_atoms}',
+        )
 
     if work_items:
         with conn.cursor() as cur:
@@ -124,5 +141,6 @@ def build_work_items(conn, run_label: str, chains: Sequence[str], *, max_atoms_p
             )
         conn.commit()
 
+    tracker.close(extra=f'work_items={len(work_items)} atoms={processed_atoms}')
     logger.info('created %d name work items for run %s', len(work_items), run_label)
     return work_items

@@ -46,24 +46,26 @@ endif()
 get_filename_component(POSTGRESQL_ROOT_DIR "${POSTGRESQL_LIBDIR}" DIRECTORY)
 set(POSTGRESQL_BINDIR "${POSTGRESQL_ROOT_DIR}/bin")
 
-if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    find_file(PostgreSQL_LIBRARY NAMES libpq.a PATHS "${POSTGRESQL_LIBDIR}" NO_DEFAULT_PATH)
-else()
-    find_library(PostgreSQL_LIBRARY NAMES libpq pq PATHS "${POSTGRESQL_LIBDIR}" NO_DEFAULT_PATH)
-endif()
+find_library(
+    PostgreSQL_LIBRARY
+    NAMES pq libpq libpq.dll.a libpq.a
+    PATHS "${POSTGRESQL_LIBDIR}"
+    NO_DEFAULT_PATH
+)
 
 if (NOT PostgreSQL_LIBRARY)
     message(FATAL_ERROR "libpq library not found under ${POSTGRESQL_LIBDIR}")
 endif()
 
-file(GLOB POSTGRESQL_RUNTIME_DLLS "${POSTGRESQL_BINDIR}/*.dll")
-
 add_executable(name_worker src/main.cpp)
 target_include_directories(name_worker PRIVATE src "${POSTGRESQL_INCLUDEDIR}")
 target_link_libraries(name_worker PRIVATE name_worker_core "${PostgreSQL_LIBRARY}")
-foreach(runtime_dll IN LISTS POSTGRESQL_RUNTIME_DLLS)
-    add_custom_command(
-        TARGET name_worker POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${runtime_dll}" "$<TARGET_FILE_DIR:name_worker>"
-    )
-endforeach()
+if (WIN32 AND EXISTS "${POSTGRESQL_BINDIR}")
+    file(GLOB POSTGRESQL_RUNTIME_DLLS "${POSTGRESQL_BINDIR}/*.dll")
+    foreach(runtime_dll IN LISTS POSTGRESQL_RUNTIME_DLLS)
+        add_custom_command(
+            TARGET name_worker POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${runtime_dll}" "$<TARGET_FILE_DIR:name_worker>"
+        )
+    endforeach()
+endif()

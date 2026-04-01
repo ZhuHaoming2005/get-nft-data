@@ -1,10 +1,11 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import logging
 from typing import Sequence
 
 from psycopg2.extras import execute_values
 
+from .progress import ProgressPrinter
 from .report import DuplicateGroupStats, SummaryRow, summarize_groups
 
 logger = logging.getLogger(__name__)
@@ -218,6 +219,9 @@ def run_symbol_stats(conn, run_label: str, chains: Sequence[str]) -> list[Summar
     _delete_outputs(conn, run_label, chains)
     chain_totals = _load_chain_totals(conn, run_label, chains)
     summary_rows: list[SummaryRow] = []
+    total_steps = len(chains) * (len(chains) + 1)
+    tracker = ProgressPrinter('symbol-stats', total_steps, 'steps', logger)
+    completed_steps = 0
 
     for primary_chain in chains:
         total_contracts, total_nfts = chain_totals[primary_chain]
@@ -237,6 +241,8 @@ def run_symbol_stats(conn, run_label: str, chains: Sequence[str]) -> list[Summar
                 groups=groups,
             )
         )
+        completed_steps += 1
+        tracker.update(completed_steps, extra=f'{primary_chain} intra groups={len(groups)}')
 
         groups = _fetch_groups(conn, run_label, scope='cross_chain_summary', primary_chain=primary_chain)
         _insert_group_rows(conn, run_label, 'symbol', 'cross_chain_summary', primary_chain, '', None, groups)
@@ -253,6 +259,8 @@ def run_symbol_stats(conn, run_label: str, chains: Sequence[str]) -> list[Summar
                 groups=groups,
             )
         )
+        completed_steps += 1
+        tracker.update(completed_steps, extra=f'{primary_chain} cross groups={len(groups)}')
 
         for secondary_chain in chains:
             if secondary_chain == primary_chain:
@@ -272,8 +280,11 @@ def run_symbol_stats(conn, run_label: str, chains: Sequence[str]) -> list[Summar
                     groups=groups,
                 )
             )
+            completed_steps += 1
+            tracker.update(completed_steps, extra=f'{primary_chain}->{secondary_chain} groups={len(groups)}')
 
     _insert_summary_rows(conn, summary_rows)
     conn.commit()
+    tracker.close(extra=f'summary_rows={len(summary_rows)}')
     logger.info('wrote %d symbol summary rows for run %s', len(summary_rows), run_label)
     return summary_rows
