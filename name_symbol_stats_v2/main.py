@@ -44,7 +44,13 @@ def prepare_name_tasks_command(args: argparse.Namespace) -> None:
     chains = _parse_chains(args.chains)
     with connect() as conn:
         ensure_schema(conn)
-        work_items = build_work_items(conn, run_label, chains, max_atoms_per_task=args.max_atoms_per_task)
+        work_items = build_work_items(
+            conn,
+            run_label,
+            chains,
+            blocking_strategy=args.blocking_strategy,
+            max_atoms_per_task=args.max_atoms_per_task,
+        )
     logger.info('prepared %d name work items', len(work_items))
 
 
@@ -133,6 +139,7 @@ def build_parser() -> argparse.ArgumentParser:
     work_parser = subparsers.add_parser('prepare-name-tasks')
     work_parser.add_argument('--run-label', default='default')
     work_parser.add_argument('--chains', nargs='*', default=list(DEFAULT_CHAINS))
+    work_parser.add_argument('--blocking-strategy', choices=['legacy', 'adaptive_v1'], default='legacy')
     work_parser.add_argument('--max-atoms-per-task', type=int, default=50000)
     work_parser.set_defaults(func=prepare_name_tasks_command)
 
