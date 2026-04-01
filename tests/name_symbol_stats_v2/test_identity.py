@@ -1,4 +1,6 @@
 import unittest
+import re
+from pathlib import Path
 
 from name_symbol_stats_v2.identity import _rebuild_name_atoms
 
@@ -37,6 +39,12 @@ class _FakeConnection:
 
 
 class IdentityTests(unittest.TestCase):
+    def test_schema_includes_upgrade_statements_for_name_atoms(self):
+        schema_path = Path(__file__).resolve().parents[2] / 'name_symbol_stats_v2' / 'sql' / '01_schema.sql'
+        schema_sql = schema_path.read_text()
+
+        self.assertIn("ALTER TABLE nsv2_name_atoms\n    ADD COLUMN IF NOT EXISTS name_collapsed TEXT NOT NULL DEFAULT '';", schema_sql)
+        self.assertIn("ALTER TABLE nsv2_name_atoms\n    ADD COLUMN IF NOT EXISTS name_collapsed_len INTEGER NOT NULL DEFAULT 0;", schema_sql)
     def test_rebuild_name_atoms_uses_matching_sql_parameters(self):
         conn = _FakeConnection()
 
@@ -45,7 +53,12 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(inserted, 7)
         self.assertEqual(conn.commits, 1)
         self.assertEqual(len(conn.cursor_obj.statements), 2)
-        _, insert_params = conn.cursor_obj.statements[1]
+        insert_sql, insert_params = conn.cursor_obj.statements[1]
+        match = re.search(r'INSERT INTO nsv2_name_atoms\s*\((.*?)\)\s*SELECT', insert_sql, re.S)
+        self.assertIsNotNone(match)
+        column_list = [column.strip() for column in match.group(1).split(',')]
+        self.assertIn('name_collapsed', column_list)
+        self.assertIn('name_collapsed_len', column_list)
         self.assertEqual(insert_params, ('apr01', ['ethereum', 'base']))
 
 

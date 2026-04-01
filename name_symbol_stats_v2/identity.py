@@ -164,7 +164,8 @@ def _rebuild_name_atoms(conn, run_label: str, chains: Sequence[str]) -> int:
             """
             INSERT INTO nsv2_name_atoms (
                 run_label, chain, name_norm, sample_contract_address, contract_count, nft_count,
-                name_len, name_len_bucket, name_block_key, name_signature, name_signature_hash
+                name_len, name_len_bucket, name_block_key, name_signature, name_signature_hash,
+                name_collapsed, name_collapsed_len
             )
             SELECT run_label,
                    chain,
@@ -176,7 +177,9 @@ def _rebuild_name_atoms(conn, run_label: str, chains: Sequence[str]) -> int:
                    min(name_len_bucket)::int AS name_len_bucket,
                    min(name_block_key) AS name_block_key,
                    min(name_signature) AS name_signature,
-                   min(name_signature_hash) AS name_signature_hash
+                   min(name_signature_hash) AS name_signature_hash,
+                   regexp_replace(name_norm, '[^0-9a-z]+', '', 'g') AS name_collapsed,
+                   char_length(regexp_replace(name_norm, '[^0-9a-z]+', '', 'g'))::int AS name_collapsed_len
             FROM nsv2_contract_identity
             WHERE run_label = %s
               AND chain = ANY(%s)
