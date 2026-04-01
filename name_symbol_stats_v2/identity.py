@@ -167,7 +167,7 @@ def _rebuild_name_atoms(conn, run_label: str, chains: Sequence[str]) -> int:
               AND name_block_key <> ''
             GROUP BY run_label, chain, name_norm
             """,
-            (run_label, list(chains), run_label, list(chains)),
+            (run_label, list(chains)),
         )
         inserted = cur.rowcount
     conn.commit()

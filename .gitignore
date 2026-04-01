@@ -6,4 +6,5 @@ classification&status
 .env
 **.txt
 build
+build-mingw
 dist
