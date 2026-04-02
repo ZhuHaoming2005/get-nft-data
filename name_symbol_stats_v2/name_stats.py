@@ -139,6 +139,30 @@ def _component_groups(atoms: dict[int, Atom], edges: Sequence[Edge], *, threshol
     return union_find.groups()
 
 
+def _component_groups_by_thresholds(
+    atoms: dict[int, Atom],
+    edges: Sequence[Edge],
+    thresholds: Sequence[float],
+) -> dict[float, list[list[int]]]:
+    unique_thresholds = sorted(set(thresholds), reverse=True)
+    if not unique_thresholds:
+        return {}
+
+    sorted_edges = sorted(edges, key=lambda edge: edge.similarity_score, reverse=True)
+    union_find = UnionFind(atoms.keys())
+    edge_index = 0
+    groups_by_threshold: dict[float, list[list[int]]] = {}
+
+    for threshold in unique_thresholds:
+        while edge_index < len(sorted_edges) and sorted_edges[edge_index].similarity_score >= threshold:
+            edge = sorted_edges[edge_index]
+            union_find.union(edge.left_atom_id, edge.right_atom_id)
+            edge_index += 1
+        groups_by_threshold[threshold] = union_find.groups()
+
+    return groups_by_threshold
+
+
 def _build_group(group_nodes: Sequence[int], atoms: dict[int, Atom], primary_chain: str) -> DuplicateGroupStats | None:
     group_atoms = [atoms[node_id] for node_id in group_nodes]
     primary_atoms = [atom for atom in group_atoms if atom.chain == primary_chain]
@@ -160,7 +184,28 @@ def _build_group(group_nodes: Sequence[int], atoms: dict[int, Atom], primary_cha
     )
 
 
-def _groups_for_scope(atoms: dict[int, Atom], edges: Sequence[Edge], *, scope: str, primary_chain: str, secondary_chain: str, threshold: float) -> list[DuplicateGroupStats]:
+def _scope_cache_key(scope: str, primary_chain: str, secondary_chain: str) -> tuple[str, str, str]:
+    if scope == 'chain_matrix':
+        left, right = sorted((primary_chain, secondary_chain))
+        return scope, left, right
+    if scope == 'cross_chain_summary':
+        return scope, '', ''
+    return scope, primary_chain, ''
+
+
+def _resolve_scope_graph(
+    atoms: dict[int, Atom],
+    edges: Sequence[Edge],
+    *,
+    scope: str,
+    primary_chain: str,
+    secondary_chain: str,
+    scope_data_cache: dict[tuple[str, str, str], tuple[dict[int, Atom], list[Edge]]] | None = None,
+) -> tuple[dict[int, Atom], list[Edge]]:
+    cache_key = _scope_cache_key(scope, primary_chain, secondary_chain)
+    if scope_data_cache is not None and cache_key in scope_data_cache:
+        return scope_data_cache[cache_key]
+
     if scope == 'intra_chain':
         scoped_atoms = {atom_id: atom for atom_id, atom in atoms.items() if atom.chain == primary_chain}
         scoped_edges = [edge for edge in edges if atoms[edge.left_atom_id].chain == primary_chain and atoms[edge.right_atom_id].chain == primary_chain]
@@ -176,11 +221,47 @@ def _groups_for_scope(atoms: dict[int, Atom], edges: Sequence[Edge], *, scope: s
         node_ids = {edge.left_atom_id for edge in scoped_edges} | {edge.right_atom_id for edge in scoped_edges}
         scoped_atoms = {atom_id: atoms[atom_id] for atom_id in node_ids}
 
+    if scope_data_cache is not None:
+        scope_data_cache[cache_key] = (scoped_atoms, scoped_edges)
+    return scoped_atoms, scoped_edges
+
+
+def _groups_for_scope(
+    atoms: dict[int, Atom],
+    edges: Sequence[Edge],
+    *,
+    scope: str,
+    primary_chain: str,
+    secondary_chain: str,
+    threshold: float,
+    all_thresholds: Sequence[float] | None = None,
+    scope_data_cache: dict[tuple[str, str, str], tuple[dict[int, Atom], list[Edge]]] | None = None,
+    components_cache: dict[tuple[str, str, str], dict[float, list[list[int]]]] | None = None,
+) -> list[DuplicateGroupStats]:
+    scoped_atoms, scoped_edges = _resolve_scope_graph(
+        atoms,
+        edges,
+        scope=scope,
+        primary_chain=primary_chain,
+        secondary_chain=secondary_chain,
+        scope_data_cache=scope_data_cache,
+    )
+
     if not scoped_atoms:
         return []
 
+    component_cache_key = _scope_cache_key(scope, primary_chain, secondary_chain)
+    if components_cache is not None and component_cache_key in components_cache:
+        components_by_threshold = components_cache[component_cache_key]
+    else:
+        thresholds_to_compute = list(all_thresholds or [threshold])
+        components_by_threshold = _component_groups_by_thresholds(scoped_atoms, scoped_edges, thresholds_to_compute)
+        if components_cache is not None:
+            components_cache[component_cache_key] = components_by_threshold
+
+    components = components_by_threshold[threshold]
     groups: list[DuplicateGroupStats] = []
-    for component in _component_groups(scoped_atoms, scoped_edges, threshold=threshold):
+    for component in components:
         group = _build_group(component, scoped_atoms, primary_chain)
         if group is None:
             continue
@@ -196,8 +277,38 @@ def _groups_for_scope(atoms: dict[int, Atom], edges: Sequence[Edge], *, scope: s
     return groups
 
 
-def _insert_groups(conn, run_label: str, scope: str, primary_chain: str, secondary_chain: str, threshold: float, task_key: str, groups: Sequence[DuplicateGroupStats]) -> None:
-    if not groups:
+def _group_insert_rows(
+    run_label: str,
+    scope: str,
+    primary_chain: str,
+    secondary_chain: str,
+    threshold: float,
+    task_key: str,
+    groups: Sequence[DuplicateGroupStats],
+) -> list[tuple[object, ...]]:
+    return [
+        (
+            run_label,
+            'name',
+            scope,
+            primary_chain,
+            secondary_chain,
+            threshold,
+            task_key,
+            group.group_key,
+            group.sample_value,
+            group.primary_contract_count,
+            group.primary_nft_count,
+            group.total_contract_count,
+            group.total_nft_count,
+            group.node_count,
+        )
+        for group in groups
+    ]
+
+
+def _insert_group_rows(conn, rows: Sequence[tuple[object, ...]]) -> None:
+    if not rows:
         return
     with conn.cursor() as cur:
         execute_values(
@@ -209,25 +320,7 @@ def _insert_groups(conn, run_label: str, scope: str, primary_chain: str, seconda
                 total_contract_count, total_nft_count, node_count
             ) VALUES %s
             """,
-            [
-                (
-                    run_label,
-                    'name',
-                    scope,
-                    primary_chain,
-                    secondary_chain,
-                    threshold,
-                    task_key,
-                    group.group_key,
-                    group.sample_value,
-                    group.primary_contract_count,
-                    group.primary_nft_count,
-                    group.total_contract_count,
-                    group.total_nft_count,
-                    group.node_count,
-                )
-                for group in groups
-            ],
+            list(rows),
             page_size=1000,
         )
 
@@ -300,27 +393,60 @@ def finalize_name_stats(conn, run_label: str, chains: Sequence[str], thresholds:
     for task_id, task_key, block_key, signature_prefix in task_rows:
         atoms = _load_atoms_for_task(conn, run_label, block_key, signature_prefix)
         edges = _load_edges_for_task(conn, run_label, task_id)
+        task_group_rows: list[tuple[object, ...]] = []
+        scope_data_cache: dict[tuple[str, str, str], tuple[dict[int, Atom], list[Edge]]] = {}
+        components_cache: dict[tuple[str, str, str], dict[float, list[list[int]]]] = {}
 
         for threshold in thresholds:
             for primary_chain in chains:
-                groups = _groups_for_scope(atoms, edges, scope='intra_chain', primary_chain=primary_chain, secondary_chain='', threshold=threshold)
+                groups = _groups_for_scope(
+                    atoms,
+                    edges,
+                    scope='intra_chain',
+                    primary_chain=primary_chain,
+                    secondary_chain='',
+                    threshold=threshold,
+                    all_thresholds=thresholds,
+                    scope_data_cache=scope_data_cache,
+                    components_cache=components_cache,
+                )
                 aggregate_groups[('intra_chain', primary_chain, '', threshold)].extend(groups)
                 inserted_group_count += len(groups)
-                _insert_groups(conn, run_label, 'intra_chain', primary_chain, '', threshold, task_key, groups)
+                task_group_rows.extend(_group_insert_rows(run_label, 'intra_chain', primary_chain, '', threshold, task_key, groups))
 
-                groups = _groups_for_scope(atoms, edges, scope='cross_chain_summary', primary_chain=primary_chain, secondary_chain='', threshold=threshold)
+                groups = _groups_for_scope(
+                    atoms,
+                    edges,
+                    scope='cross_chain_summary',
+                    primary_chain=primary_chain,
+                    secondary_chain='',
+                    threshold=threshold,
+                    all_thresholds=thresholds,
+                    scope_data_cache=scope_data_cache,
+                    components_cache=components_cache,
+                )
                 aggregate_groups[('cross_chain_summary', primary_chain, '', threshold)].extend(groups)
                 inserted_group_count += len(groups)
-                _insert_groups(conn, run_label, 'cross_chain_summary', primary_chain, '', threshold, task_key, groups)
+                task_group_rows.extend(_group_insert_rows(run_label, 'cross_chain_summary', primary_chain, '', threshold, task_key, groups))
 
                 for secondary_chain in chains:
                     if secondary_chain == primary_chain:
                         continue
-                    groups = _groups_for_scope(atoms, edges, scope='chain_matrix', primary_chain=primary_chain, secondary_chain=secondary_chain, threshold=threshold)
+                    groups = _groups_for_scope(
+                        atoms,
+                        edges,
+                        scope='chain_matrix',
+                        primary_chain=primary_chain,
+                        secondary_chain=secondary_chain,
+                        threshold=threshold,
+                    all_thresholds=thresholds,
+                    scope_data_cache=scope_data_cache,
+                        components_cache=components_cache,
+                    )
                     aggregate_groups[('chain_matrix', primary_chain, secondary_chain, threshold)].extend(groups)
                     inserted_group_count += len(groups)
-                    _insert_groups(conn, run_label, 'chain_matrix', primary_chain, secondary_chain, threshold, task_key, groups)
-        conn.commit()
+                    task_group_rows.extend(_group_insert_rows(run_label, 'chain_matrix', primary_chain, secondary_chain, threshold, task_key, groups))
+        _insert_group_rows(conn, task_group_rows)
         processed_tasks += 1
         tracker.update(processed_tasks, extra=f'task={task_key} groups={inserted_group_count}')
 
@@ -346,3 +472,9 @@ def finalize_name_stats(conn, run_label: str, chains: Sequence[str], thresholds:
     tracker.close(extra=f'groups={inserted_group_count} summary_rows={len(summary_rows)}')
     logger.info('wrote %d name summary rows for run %s', len(summary_rows), run_label)
     return summary_rows
+
+
+
+
+
+
