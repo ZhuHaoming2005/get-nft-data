@@ -51,6 +51,12 @@ def normalize_name(raw: str | None) -> str:
     return _normalize_spaces(value)
 
 
+def collapse_name_for_blocking(name_norm: str) -> str:
+    if not name_norm:
+        return ""
+    return "".join(_TOKEN_RE.findall(name_norm))
+
+
 def normalize_symbol(raw: str | None) -> str:
     value = unicodedata.normalize("NFKC", (raw or "").strip()).casefold()
     value = re.sub(r"\s+", "", value)
@@ -72,11 +78,15 @@ def build_name_signature(name_norm: str, *, limit: int = 4) -> str:
     return "+".join(tokens[:limit])
 
 
-def build_name_block_key(name_norm: str) -> str:
+def build_legacy_name_block_key(name_norm: str) -> str:
     tokens = tokenize_name(name_norm)
     if not tokens:
         return ""
     return f"{tokens[0]}|{name_length_bucket(len(name_norm))}"
+
+
+def build_name_block_key(name_norm: str) -> str:
+    return build_legacy_name_block_key(name_norm)
 
 
 def build_name_signature_hash(name_norm: str) -> str:

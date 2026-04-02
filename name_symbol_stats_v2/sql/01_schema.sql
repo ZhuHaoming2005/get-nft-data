@@ -55,12 +55,23 @@ CREATE TABLE IF NOT EXISTS nsv2_name_atoms (
     name_block_key          TEXT        NOT NULL DEFAULT '',
     name_signature          TEXT        NOT NULL DEFAULT '',
     name_signature_hash     TEXT        NOT NULL DEFAULT '',
+    name_collapsed          TEXT        NOT NULL DEFAULT '',
+    name_collapsed_len      INTEGER     NOT NULL DEFAULT 0,
     created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (run_label, chain, name_norm)
 );
 
+ALTER TABLE nsv2_name_atoms
+    ADD COLUMN IF NOT EXISTS name_collapsed TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE nsv2_name_atoms
+    ADD COLUMN IF NOT EXISTS name_collapsed_len INTEGER NOT NULL DEFAULT 0;
+
 CREATE INDEX IF NOT EXISTS idx_nsv2_atoms_run_block
     ON nsv2_name_atoms (run_label, name_block_key, name_signature_hash);
+
+CREATE INDEX IF NOT EXISTS idx_nsv2_atoms_run_collapsed
+    ON nsv2_name_atoms (run_label, name_collapsed, name_collapsed_len);
 
 CREATE TABLE IF NOT EXISTS nsv2_name_work_items (
     id               BIGSERIAL   PRIMARY KEY,
