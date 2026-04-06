@@ -1,64 +1,59 @@
 from __future__ import annotations
 
+import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
 
-DEFAULT_CHAINS: tuple[str, ...] = ("ethereum", "base", "polygon", "solana")
-DEFAULT_THRESHOLDS: tuple[float, ...] = (85.0, 90.0, 95.0)
-DEFAULT_WORKERS = 4
-DEFAULT_MAX_BLOCK_SIZE = 2_000
-DEFAULT_TRIGRAM_CUTOFF = 0.35
-DEFAULT_MAX_LEN_DELTA = 12
-
-
-def _unique_ordered(values: Iterable[str]) -> tuple[str, ...]:
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for value in values:
-        key = value.strip().lower()
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        ordered.append(key)
-    return tuple(ordered)
-
-
-def parse_thresholds(values: Sequence[float] | None) -> tuple[float, ...]:
-    if not values:
-        return DEFAULT_THRESHOLDS
-    uniq = sorted({float(value) for value in values})
-    return tuple(uniq)
+DEFAULT_CHAINS = ('ethereum', 'base', 'polygon', 'solana')
+DEFAULT_THRESHOLDS = (85.0, 90.0, 95.0)
+DEFAULT_RUN_LABEL = 'default'
 
 
 @dataclass(frozen=True)
-class StatsConfig:
-    chains: tuple[str, ...] = DEFAULT_CHAINS
-    thresholds: tuple[float, ...] = DEFAULT_THRESHOLDS
-    workers: int = DEFAULT_WORKERS
-    max_block_size: int = DEFAULT_MAX_BLOCK_SIZE
-    trigram_cutoff: float = DEFAULT_TRIGRAM_CUTOFF
-    max_len_delta: int = DEFAULT_MAX_LEN_DELTA
-    export_dir: Path = Path("name_symbol_stats_output")
+class DbConfig:
+    host: str
+    port: int
+    dbname: str
+    user: str
+    password: str
+    connect_timeout: int = 10
 
-    @classmethod
-    def from_args(
-        cls,
-        *,
-        chains: Sequence[str] | None = None,
-        thresholds: Sequence[float] | None = None,
-        workers: int = DEFAULT_WORKERS,
-        max_block_size: int = DEFAULT_MAX_BLOCK_SIZE,
-        trigram_cutoff: float = DEFAULT_TRIGRAM_CUTOFF,
-        max_len_delta: int = DEFAULT_MAX_LEN_DELTA,
-        export_dir: str | Path = "name_symbol_stats_output",
-    ) -> "StatsConfig":
-        return cls(
-            chains=_unique_ordered(chains or DEFAULT_CHAINS),
-            thresholds=parse_thresholds(thresholds),
-            workers=max(1, int(workers)),
-            max_block_size=max(2, int(max_block_size)),
-            trigram_cutoff=float(trigram_cutoff),
-            max_len_delta=max(0, int(max_len_delta)),
-            export_dir=Path(export_dir),
-        )
+
+@dataclass(frozen=True)
+class Settings:
+    db: DbConfig
+    root_dir: Path
+    sql_dir: Path
+    default_run_label: str = DEFAULT_RUN_LABEL
+
+
+def load_settings() -> Settings:
+    root_dir = Path(__file__).resolve().parent
+    return Settings(
+        db=DbConfig(
+            host=os.getenv('DB_HOST', 'localhost'),
+            port=int(os.getenv('DB_PORT', '5432')),
+            dbname=os.getenv('DB_NAME', 'nft_data'),
+            user=os.getenv('DB_USER', 'postgres'),
+            password=os.getenv('DB_PASS', '123456'),
+            connect_timeout=int(os.getenv('DB_CONNECT_TIMEOUT', '10')),
+        ),
+        root_dir=root_dir,
+        sql_dir=root_dir / 'sql',
+    )
+
+
+def normalize_run_label(run_label: str | None) -> str:
+    value = (run_label or DEFAULT_RUN_LABEL).strip()
+    if not value:
+        return DEFAULT_RUN_LABEL
+    safe = re.sub(r'[^0-9A-Za-z_.-]+', '-', value)
+    return safe[:120]
+
+
+def chain_to_table(chain: str) -> str:
+    safe = re.sub(r'[^a-z0-9_]', '', chain.lower().strip())
+    if not safe:
+        raise ValueError(f'invalid chain: {chain!r}')
+    return f'nft_assets_{safe}'

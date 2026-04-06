@@ -8,7 +8,7 @@ from typing import Iterable, Sequence
 
 try:
     import polars as pl
-except ImportError:  # pragma: no cover - optional dependency
+except ImportError:  # pragma: no cover
     pl = None
 
 
@@ -17,13 +17,15 @@ class DuplicateGroupStats:
     group_key: str
     primary_contract_count: int
     primary_nft_count: int
-    total_member_count: int
-    total_member_nft_count: int | None = None
+    total_contract_count: int
+    total_nft_count: int
+    node_count: int
     sample_value: str = ""
 
 
 @dataclass(frozen=True)
 class SummaryRow:
+    run_label: str
     field_name: str
     scope: str
     primary_chain: str
@@ -46,6 +48,7 @@ def _pct(part: int, total: int) -> float:
 
 def summarize_groups(
     *,
+    run_label: str,
     field_name: str,
     scope: str,
     primary_chain: str,
@@ -58,9 +61,10 @@ def summarize_groups(
     group_count = len(groups)
     duplicate_contract_count = sum(group.primary_contract_count for group in groups)
     duplicate_nft_count = sum(group.primary_nft_count for group in groups)
-    group_size_ge_2_count = sum(1 for group in groups if group.total_member_count >= 2)
-    group_size_gt_2_count = sum(1 for group in groups if group.total_member_count > 2)
+    group_size_ge_2_count = sum(1 for group in groups if group.total_contract_count >= 2)
+    group_size_gt_2_count = sum(1 for group in groups if group.total_contract_count > 2)
     return SummaryRow(
+        run_label=run_label,
         field_name=field_name,
         scope=scope,
         primary_chain=primary_chain,
@@ -85,9 +89,9 @@ def summary_rows_to_dicts(rows: Iterable[SummaryRow]) -> list[dict[str, object]]
 def write_csv(rows: Sequence[dict[str, object]], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
-        path.write_text("", encoding="utf-8")
+        path.write_text("", encoding='utf-8')
         return
-    with path.open("w", encoding="utf-8", newline="") as handle:
+    with path.open('w', encoding='utf-8', newline='') as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
@@ -101,39 +105,35 @@ def write_parquet(rows: Sequence[dict[str, object]], path: Path) -> bool:
     return True
 
 
-def render_text_summary(rows: Sequence[SummaryRow]) -> str:
-    lines = [
-        "Name/Symbol Duplicate Summary",
-        "=" * 32,
-    ]
-    for row in rows:
-        threshold_label = f"{row.threshold:.1f}" if row.threshold is not None else "exact"
-        pair_label = row.primary_chain.upper()
-        if row.secondary_chain:
-            pair_label = f"{pair_label} -> {row.secondary_chain.upper()}"
-        lines.extend(
-            [
-                f"{row.field_name} | {row.scope} | {pair_label} | threshold={threshold_label}",
-                (
-                    f"  groups={row.group_count}  duplicate_contracts={row.duplicate_contract_count}"
-                    f" ({row.duplicate_contract_ratio:.2f}%)  duplicate_nfts={row.duplicate_nft_count}"
-                    f" ({row.duplicate_nft_ratio:.2f}%)"
-                ),
-                (
-                    f"  group_size>=2={row.group_size_ge_2_count}"
-                    f"  group_size>2={row.group_size_gt_2_count}"
-                ),
-            ]
-        )
-    return "\n".join(lines) + "\n"
-
-
 def write_text(text: str, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    path.write_text(text, encoding='utf-8')
 
 
 def write_group_samples(groups: Sequence[DuplicateGroupStats], path: Path) -> None:
-    serializable = [asdict(group) for group in groups]
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(serializable, ensure_ascii=False, indent=2), encoding="utf-8")
+    path.write_text(json.dumps([asdict(group) for group in groups], ensure_ascii=False, indent=2), encoding='utf-8')
+
+
+def render_text_summary(rows: Sequence[SummaryRow]) -> str:
+    lines = [
+        "Name/Symbol Duplicate Summary V2",
+        "=" * 35,
+    ]
+    for row in rows:
+        threshold_label = f"{row.threshold:.1f}" if row.threshold is not None else "exact"
+        pair = row.primary_chain.upper()
+        if row.secondary_chain:
+            pair = f"{pair} -> {row.secondary_chain.upper()}"
+        lines.extend(
+            [
+                f"{row.run_label} | {row.field_name} | {row.scope} | {pair} | threshold={threshold_label}",
+                (
+                    f"  groups={row.group_count} duplicate_contracts={row.duplicate_contract_count}"
+                    f" ({row.duplicate_contract_ratio:.2f}%) duplicate_nfts={row.duplicate_nft_count}"
+                    f" ({row.duplicate_nft_ratio:.2f}%)"
+                ),
+                f"  group_size>=2={row.group_size_ge_2_count} group_size>2={row.group_size_gt_2_count}",
+            ]
+        )
+    return "\n".join(lines) + "\n"

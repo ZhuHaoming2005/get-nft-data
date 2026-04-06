@@ -1,315 +1,184 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import logging
-from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
 from psycopg2.extras import execute_values
 
-from dedup_stats import chain_to_table, get_conn
-
-from .normalize import build_name_block_key, name_length_bucket, normalize_name, normalize_symbol
+from .progress import ProgressPrinter
 from .report import DuplicateGroupStats, SummaryRow, summarize_groups
 
 logger = logging.getLogger(__name__)
-SQL_DIR = Path(__file__).resolve().parent / 'sql'
 
 
-def _load_sql(filename: str) -> str:
-    return (SQL_DIR / filename).read_text(encoding='utf-8')
-
-
-def ensure_symbol_schema(conn) -> None:
-    with conn.cursor() as cur:
-        for filename in ('01_contract_identity.sql', '02_symbol_stats.sql', '04_result_tables.sql'):
-            cur.execute(_load_sql(filename))
-    conn.commit()
-
-
-def _table_has_column(conn, table_name: str, column_name: str) -> bool:
+def _load_chain_totals(conn, run_label: str, chains: Sequence[str]) -> dict[str, tuple[int, int]]:
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT 1
-            FROM information_schema.columns
-            WHERE table_schema = 'public'
-              AND table_name = %s
-              AND column_name = %s
-            """,
-            (table_name, column_name),
-        )
-        return cur.fetchone() is not None
-
-
-def _rollup_sql(table_name: str, *, has_name: bool, has_symbol: bool) -> str:
-    name_expr = "coalesce(name, '')" if has_name else "''"
-    symbol_expr = "coalesce(symbol, '')" if has_symbol else "''"
-    name_present = "name IS NOT NULL AND trim(name) <> ''" if has_name else 'FALSE'
-    symbol_present = "symbol IS NOT NULL AND trim(symbol) <> ''" if has_symbol else 'FALSE'
-    name_variant = (
-        "count(DISTINCT lower(trim(name))) FILTER (WHERE name IS NOT NULL AND trim(name) <> '')::int"
-        if has_name else '0::int'
-    )
-    symbol_variant = (
-        "count(DISTINCT lower(trim(symbol))) FILTER (WHERE symbol IS NOT NULL AND trim(symbol) <> '')::int"
-        if has_symbol else '0::int'
-    )
-    return f"""
-        WITH contract_rollup AS (
-            SELECT lower(trim(contract_address)) AS contract_address,
-                   count(*)::bigint AS nft_count,
-                   {name_variant} AS name_variant_count,
-                   {symbol_variant} AS symbol_variant_count
-            FROM {table_name}
-            WHERE contract_address IS NOT NULL AND trim(contract_address) <> ''
-            GROUP BY 1
-        ),
-        ranked AS (
-            SELECT lower(trim(contract_address)) AS contract_address,
-                   {name_expr} AS raw_name,
-                   {symbol_expr} AS raw_symbol,
-                   row_number() OVER (
-                       PARTITION BY lower(trim(contract_address))
-                       ORDER BY CASE WHEN {name_present} THEN 0 ELSE 1 END,
-                                CASE WHEN {symbol_present} THEN 0 ELSE 1 END,
-                                id DESC
-                   ) AS rn
-            FROM {table_name}
-            WHERE contract_address IS NOT NULL AND trim(contract_address) <> ''
-        )
-        SELECT ranked.contract_address, contract_rollup.nft_count, ranked.raw_name, ranked.raw_symbol,
-               contract_rollup.name_variant_count, contract_rollup.symbol_variant_count
-        FROM ranked
-        JOIN contract_rollup USING (contract_address)
-        WHERE ranked.rn = 1
-        ORDER BY ranked.contract_address
-    """
-
-
-def _identity_row(chain: str, contract_address: str, nft_count: int, raw_name: str, raw_symbol: str, name_variant_count: int, symbol_variant_count: int) -> tuple[object, ...]:
-    name_norm = normalize_name(raw_name)
-    symbol_norm = normalize_symbol(raw_symbol)
-    name_len = len(name_norm)
-    return (
-        chain,
-        contract_address,
-        int(nft_count),
-        raw_name or '',
-        raw_symbol or '',
-        name_norm,
-        symbol_norm,
-        name_len,
-        name_length_bucket(name_len),
-        build_name_block_key(name_norm),
-        int(name_variant_count),
-        int(symbol_variant_count),
-    )
-
-
-def _insert_identity_batch(conn, rows: Sequence[tuple[object, ...]]) -> None:
-    if not rows:
-        return
-    with conn.cursor() as cur:
-        execute_values(
-            cur,
-            """
-            INSERT INTO analysis_contract_identity (
-                chain, contract_address, nft_count, raw_name, raw_symbol, name_norm, symbol_norm,
-                name_len, name_len_bucket, name_block_key, name_variant_count, symbol_variant_count
-            ) VALUES %s
-            ON CONFLICT (chain, contract_address) DO UPDATE SET
-                nft_count = EXCLUDED.nft_count,
-                raw_name = EXCLUDED.raw_name,
-                raw_symbol = EXCLUDED.raw_symbol,
-                name_norm = EXCLUDED.name_norm,
-                symbol_norm = EXCLUDED.symbol_norm,
-                name_len = EXCLUDED.name_len,
-                name_len_bucket = EXCLUDED.name_len_bucket,
-                name_block_key = EXCLUDED.name_block_key,
-                name_variant_count = EXCLUDED.name_variant_count,
-                symbol_variant_count = EXCLUDED.symbol_variant_count,
-                updated_at = NOW()
-            """,
-            rows,
-            page_size=1000,
-        )
-
-
-def build_contract_identity(conn, chains: Sequence[str], *, batch_size: int = 5000) -> dict[str, int]:
-    ensure_symbol_schema(conn)
-    counts: dict[str, int] = {}
-    for chain in chains:
-        table_name = chain_to_table(chain)
-        sql = _rollup_sql(
-            table_name,
-            has_name=_table_has_column(conn, table_name, 'name'),
-            has_symbol=_table_has_column(conn, table_name, 'symbol'),
-        )
-        with conn.cursor() as cur:
-            cur.execute('DELETE FROM analysis_contract_identity WHERE chain = %s', (chain,))
-        conn.commit()
-
-        inserted = 0
-        buffer: list[tuple[object, ...]] = []
-        read_conn = get_conn()
-        try:
-            with read_conn.cursor(name=f'identity_{chain}') as cur:
-                cur.itersize = batch_size
-                cur.execute(sql)
-                while True:
-                    rows = cur.fetchmany(batch_size)
-                    if not rows:
-                        break
-                    for row in rows:
-                        buffer.append(_identity_row(chain, *row))
-                    if len(buffer) >= batch_size:
-                        _insert_identity_batch(conn, buffer)
-                        inserted += len(buffer)
-                        buffer.clear()
-                        conn.commit()
-        finally:
-            read_conn.close()
-
-        if buffer:
-            _insert_identity_batch(conn, buffer)
-            inserted += len(buffer)
-            conn.commit()
-        counts[chain] = inserted
-    return counts
-
-
-def _load_chain_totals(conn, chains: Sequence[str]) -> dict[str, tuple[int, int]]:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT chain, count(*)::int AS contract_count, coalesce(sum(nft_count), 0)::bigint AS nft_count
-            FROM analysis_contract_identity
-            WHERE chain = ANY(%s)
+            SELECT chain, count(*)::int, coalesce(sum(nft_count), 0)::bigint
+            FROM nsv2_contract_identity
+            WHERE run_label = %s AND chain = ANY(%s)
             GROUP BY chain
             """,
-            (list(chains),),
+            (run_label, list(chains)),
         )
         rows = {chain: (contract_count, nft_count) for chain, contract_count, nft_count in cur.fetchall()}
     return {chain: rows.get(chain, (0, 0)) for chain in chains}
 
 
-def _fetch_symbol_groups(conn, *, scope: str, primary_chain: str, secondary_chain: str = '') -> list[DuplicateGroupStats]:
+def _rebuild_symbol_rollup(conn, run_label: str, chains: Sequence[str]) -> int:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM nsv2_symbol_rollup
+            WHERE run_label = %s AND chain = ANY(%s)
+            """,
+            (run_label, list(chains)),
+        )
+        cur.execute(
+            """
+            INSERT INTO nsv2_symbol_rollup (
+                run_label, chain, symbol_norm, contract_count, nft_count
+            )
+            SELECT run_label,
+                   chain,
+                   symbol_norm,
+                   count(*)::bigint AS contract_count,
+                   coalesce(sum(nft_count), 0)::bigint AS nft_count
+            FROM nsv2_contract_identity
+            WHERE run_label = %s
+              AND chain = ANY(%s)
+              AND symbol_norm <> ''
+            GROUP BY run_label, chain, symbol_norm
+            """,
+            (run_label, list(chains)),
+        )
+        inserted = cur.rowcount
+    conn.commit()
+    return inserted
+
+
+def _fetch_groups(conn, run_label: str, *, scope: str, primary_chain: str, secondary_chain: str = '') -> list[DuplicateGroupStats]:
     if scope == 'intra_chain':
         sql = """
-            WITH shared_keys AS (
-                SELECT symbol_norm
-                FROM analysis_contract_identity
-                WHERE chain = %s AND symbol_norm <> ''
-                GROUP BY symbol_norm
-                HAVING count(*) >= 2
-            )
             SELECT symbol_norm,
-                   count(*)::int,
-                   coalesce(sum(nft_count), 0)::bigint,
-                   count(*)::int,
-                   coalesce(sum(nft_count), 0)::bigint
-            FROM analysis_contract_identity
-            WHERE chain = %s AND symbol_norm IN (SELECT symbol_norm FROM shared_keys)
-            GROUP BY symbol_norm
-            ORDER BY 3 DESC, 1
+                   contract_count,
+                   nft_count,
+                   contract_count,
+                   nft_count
+            FROM nsv2_symbol_rollup
+            WHERE run_label = %s
+              AND chain = %s
+              AND contract_count >= 2
+            ORDER BY nft_count DESC, symbol_norm
         """
-        params = (primary_chain, primary_chain)
+        params = (run_label, primary_chain)
     elif scope == 'cross_chain_summary':
         sql = """
-            WITH shared_keys AS (
-                SELECT DISTINCT target.symbol_norm
-                FROM analysis_contract_identity AS target
-                JOIN analysis_contract_identity AS other
-                  ON target.symbol_norm = other.symbol_norm
-                 AND other.chain <> target.chain
-                WHERE target.chain = %s AND target.symbol_norm <> ''
+            WITH matching_keys AS (
+                SELECT symbol_norm
+                FROM nsv2_symbol_rollup
+                WHERE run_label = %s
+                GROUP BY symbol_norm
+                HAVING count(DISTINCT chain) >= 2
+                   AND bool_or(chain = %s)
             )
             SELECT symbol_norm,
-                   count(*) FILTER (WHERE chain = %s)::int,
-                   coalesce(sum(nft_count) FILTER (WHERE chain = %s), 0)::bigint,
-                   count(*)::int,
-                   coalesce(sum(nft_count), 0)::bigint
-            FROM analysis_contract_identity
-            WHERE symbol_norm IN (SELECT symbol_norm FROM shared_keys)
+                   coalesce(sum(contract_count) FILTER (WHERE chain = %s), 0)::bigint AS primary_contract_count,
+                   coalesce(sum(nft_count) FILTER (WHERE chain = %s), 0)::bigint AS primary_nft_count,
+                   coalesce(sum(contract_count), 0)::bigint AS total_contract_count,
+                   coalesce(sum(nft_count), 0)::bigint AS total_nft_count
+            FROM nsv2_symbol_rollup
+            WHERE run_label = %s
+              AND symbol_norm IN (SELECT symbol_norm FROM matching_keys)
             GROUP BY symbol_norm
-            HAVING count(*) FILTER (WHERE chain = %s) > 0
-            ORDER BY 3 DESC, 1
+            HAVING coalesce(sum(contract_count) FILTER (WHERE chain = %s), 0) > 0
+            ORDER BY primary_nft_count DESC, symbol_norm
         """
-        params = (primary_chain, primary_chain, primary_chain, primary_chain)
+        params = (run_label, primary_chain, primary_chain, primary_chain, run_label, primary_chain)
     else:
         sql = """
-            WITH shared_keys AS (
-                SELECT DISTINCT left_side.symbol_norm
-                FROM analysis_contract_identity AS left_side
-                JOIN analysis_contract_identity AS right_side
-                  ON left_side.symbol_norm = right_side.symbol_norm
-                 AND right_side.chain = %s
-                WHERE left_side.chain = %s AND left_side.symbol_norm <> ''
-            )
             SELECT symbol_norm,
-                   count(*) FILTER (WHERE chain = %s)::int,
-                   coalesce(sum(nft_count) FILTER (WHERE chain = %s), 0)::bigint,
-                   count(*)::int,
-                   coalesce(sum(nft_count), 0)::bigint
-            FROM analysis_contract_identity
-            WHERE chain = ANY(%s) AND symbol_norm IN (SELECT symbol_norm FROM shared_keys)
+                   coalesce(sum(contract_count) FILTER (WHERE chain = %s), 0)::bigint AS primary_contract_count,
+                   coalesce(sum(nft_count) FILTER (WHERE chain = %s), 0)::bigint AS primary_nft_count,
+                   coalesce(sum(contract_count), 0)::bigint AS total_contract_count,
+                   coalesce(sum(nft_count), 0)::bigint AS total_nft_count
+            FROM nsv2_symbol_rollup
+            WHERE run_label = %s
+              AND chain = ANY(%s)
             GROUP BY symbol_norm
-            HAVING count(*) FILTER (WHERE chain = %s) > 0
-            ORDER BY 3 DESC, 1
+            HAVING coalesce(sum(contract_count) FILTER (WHERE chain = %s), 0) > 0
+               AND coalesce(sum(contract_count) FILTER (WHERE chain = %s), 0) > 0
+            ORDER BY primary_nft_count DESC, symbol_norm
         """
-        params = (secondary_chain, primary_chain, primary_chain, primary_chain, [primary_chain, secondary_chain], primary_chain)
+        params = (primary_chain, primary_chain, run_label, [primary_chain, secondary_chain], primary_chain, secondary_chain)
+
     with conn.cursor() as cur:
         cur.execute(sql, params)
         return [
             DuplicateGroupStats(
-                group_key=group_key,
-                primary_contract_count=primary_contract_count,
-                primary_nft_count=primary_nft_count,
-                total_member_count=total_member_count,
-                total_member_nft_count=total_member_nft_count,
-                sample_value=group_key,
+                group_key=symbol_norm,
+                primary_contract_count=int(primary_contract_count),
+                primary_nft_count=int(primary_nft_count),
+                total_contract_count=int(total_contract_count),
+                total_nft_count=int(total_nft_count),
+                node_count=int(total_contract_count),
+                sample_value=symbol_norm,
             )
-            for group_key, primary_contract_count, primary_nft_count, total_member_count, total_member_nft_count in cur.fetchall()
+            for symbol_norm, primary_contract_count, primary_nft_count, total_contract_count, total_nft_count in cur.fetchall()
         ]
 
 
-def _delete_symbol_outputs(conn, chains: Sequence[str]) -> None:
+def _delete_outputs(conn, run_label: str, chains: Sequence[str]) -> None:
     with conn.cursor() as cur:
-        cur.execute('DELETE FROM analysis_symbol_duplicate_groups WHERE primary_chain = ANY(%s) OR secondary_chain = ANY(%s)', (list(chains), list(chains)))
         cur.execute(
             """
-            DELETE FROM analysis_duplicate_summary
-            WHERE field_name = 'symbol'
+            DELETE FROM nsv2_symbol_duplicate_groups
+            WHERE run_label = %s
               AND (primary_chain = ANY(%s) OR secondary_chain = ANY(%s))
             """,
-            (list(chains), list(chains)),
+            (run_label, list(chains), list(chains)),
+        )
+        cur.execute(
+            """
+            DELETE FROM nsv2_duplicate_summary
+            WHERE run_label = %s
+              AND field_name = 'symbol'
+              AND (primary_chain = ANY(%s) OR secondary_chain = ANY(%s))
+            """,
+            (run_label, list(chains), list(chains)),
         )
     conn.commit()
 
 
-def _insert_symbol_groups(conn, *, scope: str, primary_chain: str, secondary_chain: str, groups: Sequence[DuplicateGroupStats]) -> None:
+def _insert_group_rows(conn, run_label: str, field_name: str, scope: str, primary_chain: str, secondary_chain: str, threshold: float | None, groups: Sequence[DuplicateGroupStats]) -> None:
     if not groups:
         return
     with conn.cursor() as cur:
         execute_values(
             cur,
             """
-            INSERT INTO analysis_symbol_duplicate_groups (
-                scope, primary_chain, secondary_chain, match_key, primary_contract_count,
-                primary_nft_count, total_member_count, total_member_nft_count, sample_value
+            INSERT INTO nsv2_symbol_duplicate_groups (
+                run_label, field_name, scope, primary_chain, secondary_chain, threshold,
+                group_key, sample_value, primary_contract_count, primary_nft_count,
+                total_contract_count, total_nft_count, node_count
             ) VALUES %s
             """,
             [
                 (
+                    run_label,
+                    field_name,
                     scope,
                     primary_chain,
                     secondary_chain,
+                    -1.0 if threshold is None else threshold,
                     group.group_key,
+                    group.sample_value,
                     group.primary_contract_count,
                     group.primary_nft_count,
-                    group.total_member_count,
-                    group.total_member_nft_count or group.primary_nft_count,
-                    group.sample_value,
+                    group.total_contract_count,
+                    group.total_nft_count,
+                    group.node_count,
                 )
                 for group in groups
             ],
@@ -317,82 +186,115 @@ def _insert_symbol_groups(conn, *, scope: str, primary_chain: str, secondary_cha
         )
 
 
-def _insert_summary_rows(conn, rows: Iterable[SummaryRow]) -> None:
-    values = [
-        (
-            row.field_name,
-            row.scope,
-            row.primary_chain,
-            row.secondary_chain,
-            -1.0 if row.threshold is None else row.threshold,
-            row.total_contracts,
-            row.total_nfts,
-            row.group_count,
-            row.duplicate_contract_count,
-            row.duplicate_nft_count,
-            row.duplicate_contract_ratio,
-            row.duplicate_nft_ratio,
-            row.group_size_ge_2_count,
-            row.group_size_gt_2_count,
-        )
-        for row in rows
-    ]
-    if not values:
+def _insert_summary_rows(conn, rows: Sequence[SummaryRow]) -> None:
+    if not rows:
         return
     with conn.cursor() as cur:
         execute_values(
             cur,
             """
-            INSERT INTO analysis_duplicate_summary (
-                field_name, scope, primary_chain, secondary_chain, threshold, total_contracts, total_nfts,
-                group_count, duplicate_contract_count, duplicate_nft_count, duplicate_contract_ratio,
-                duplicate_nft_ratio, group_size_ge_2_count, group_size_gt_2_count
+            INSERT INTO nsv2_duplicate_summary (
+                run_label, field_name, scope, primary_chain, secondary_chain, threshold,
+                total_contracts, total_nfts, group_count, duplicate_contract_count, duplicate_nft_count,
+                duplicate_contract_ratio, duplicate_nft_ratio, group_size_ge_2_count, group_size_gt_2_count
             ) VALUES %s
             """,
-            values,
+            [
+                (
+                    row.run_label,
+                    row.field_name,
+                    row.scope,
+                    row.primary_chain,
+                    row.secondary_chain,
+                    -1.0 if row.threshold is None else row.threshold,
+                    row.total_contracts,
+                    row.total_nfts,
+                    row.group_count,
+                    row.duplicate_contract_count,
+                    row.duplicate_nft_count,
+                    row.duplicate_contract_ratio,
+                    row.duplicate_nft_ratio,
+                    row.group_size_ge_2_count,
+                    row.group_size_gt_2_count,
+                )
+                for row in rows
+            ],
             page_size=1000,
         )
 
 
-def run_symbol_stats(conn, chains: Sequence[str]) -> list[SummaryRow]:
-    ensure_symbol_schema(conn)
-    _delete_symbol_outputs(conn, chains)
-    totals = _load_chain_totals(conn, chains)
+def run_symbol_stats(conn, run_label: str, chains: Sequence[str]) -> list[SummaryRow]:
+    _delete_outputs(conn, run_label, chains)
+    chain_totals = _load_chain_totals(conn, run_label, chains)
+    rollup_rows = _rebuild_symbol_rollup(conn, run_label, chains)
     summary_rows: list[SummaryRow] = []
-    for chain in chains:
-        total_contracts, total_nfts = totals[chain]
-        for scope, secondary_chain in (('intra_chain', ''), ('cross_chain_summary', '')):
-            groups = _fetch_symbol_groups(conn, scope=scope, primary_chain=chain, secondary_chain=secondary_chain)
-            _insert_symbol_groups(conn, scope=scope, primary_chain=chain, secondary_chain=secondary_chain, groups=groups)
-            summary_rows.append(
-                summarize_groups(
-                    field_name='symbol',
-                    scope=scope,
-                    primary_chain=chain,
-                    secondary_chain=secondary_chain or None,
-                    threshold=None,
-                    total_contracts=total_contracts,
-                    total_nfts=total_nfts,
-                    groups=groups,
-                )
+    total_steps = len(chains) * (len(chains) + 1) + 1
+    tracker = ProgressPrinter('symbol-stats', total_steps, 'steps', logger)
+    completed_steps = 1
+    tracker.update(completed_steps, extra=f'rollup_rows={rollup_rows}')
+
+    for primary_chain in chains:
+        total_contracts, total_nfts = chain_totals[primary_chain]
+
+        groups = _fetch_groups(conn, run_label, scope='intra_chain', primary_chain=primary_chain)
+        _insert_group_rows(conn, run_label, 'symbol', 'intra_chain', primary_chain, '', None, groups)
+        summary_rows.append(
+            summarize_groups(
+                run_label=run_label,
+                field_name='symbol',
+                scope='intra_chain',
+                primary_chain=primary_chain,
+                secondary_chain='',
+                threshold=None,
+                total_contracts=total_contracts,
+                total_nfts=total_nfts,
+                groups=groups,
             )
-        for other_chain in chains:
-            if other_chain == chain:
+        )
+        completed_steps += 1
+        tracker.update(completed_steps, extra=f'{primary_chain} intra groups={len(groups)}')
+
+        groups = _fetch_groups(conn, run_label, scope='cross_chain_summary', primary_chain=primary_chain)
+        _insert_group_rows(conn, run_label, 'symbol', 'cross_chain_summary', primary_chain, '', None, groups)
+        summary_rows.append(
+            summarize_groups(
+                run_label=run_label,
+                field_name='symbol',
+                scope='cross_chain_summary',
+                primary_chain=primary_chain,
+                secondary_chain='',
+                threshold=None,
+                total_contracts=total_contracts,
+                total_nfts=total_nfts,
+                groups=groups,
+            )
+        )
+        completed_steps += 1
+        tracker.update(completed_steps, extra=f'{primary_chain} cross groups={len(groups)}')
+
+        for secondary_chain in chains:
+            if secondary_chain == primary_chain:
                 continue
-            groups = _fetch_symbol_groups(conn, scope='chain_matrix', primary_chain=chain, secondary_chain=other_chain)
-            _insert_symbol_groups(conn, scope='chain_matrix', primary_chain=chain, secondary_chain=other_chain, groups=groups)
+            groups = _fetch_groups(conn, run_label, scope='chain_matrix', primary_chain=primary_chain, secondary_chain=secondary_chain)
+            _insert_group_rows(conn, run_label, 'symbol', 'chain_matrix', primary_chain, secondary_chain, None, groups)
             summary_rows.append(
                 summarize_groups(
+                    run_label=run_label,
                     field_name='symbol',
                     scope='chain_matrix',
-                    primary_chain=chain,
-                    secondary_chain=other_chain,
+                    primary_chain=primary_chain,
+                    secondary_chain=secondary_chain,
                     threshold=None,
                     total_contracts=total_contracts,
                     total_nfts=total_nfts,
                     groups=groups,
                 )
             )
+            completed_steps += 1
+            tracker.update(completed_steps, extra=f'{primary_chain}->{secondary_chain} groups={len(groups)}')
+
     _insert_summary_rows(conn, summary_rows)
     conn.commit()
+    tracker.close(extra=f'rollup_rows={rollup_rows} summary_rows={len(summary_rows)}')
+    logger.info('wrote %d symbol summary rows for run %s', len(summary_rows), run_label)
     return summary_rows

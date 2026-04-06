@@ -1,27 +1,33 @@
-# name_symbol_stats
+# Name/Symbol Stats V2
 
-按合约地址聚合 NFT 的 `name` / `symbol`，只做重复情况统计，不改原始业务表。
+独立于现有脚本的第二版 NFT 名称与 `symbol` 重复统计流水线。
 
-## CLI
+目标：
 
-```bash
-python -m name_symbol_stats.main build-contract-identity
-python -m name_symbol_stats.main symbol-stats
-python -m name_symbol_stats.main name-stats --thresholds 85 90 95
-python -m name_symbol_stats.main export-report
+- 保持“按合约聚合、按 NFT 数统计比例”的统计口径
+- 把 `symbol` 统计完全下推到 PostgreSQL
+- 把 `name` 模糊统计改成“唯一规范名原子 + 分片任务 + C++ worker”
+- 控制内存占用，避免在 Python 中生成或持久化海量候选对
+
+主要表：
+
+- `nsv2_contract_identity`
+- `nsv2_name_atoms`
+- `nsv2_name_work_items`
+- `nsv2_name_match_edges`
+- `nsv2_name_duplicate_groups`
+- `nsv2_symbol_duplicate_groups`
+- `nsv2_duplicate_summary`
+
+执行流程：
+
+```powershell
+python -m name_symbol_stats_v2.main build-contract-identity --run-label apr01 --chains ethereum base polygon solana
+python -m name_symbol_stats_v2.main symbol-stats --run-label apr01 --chains ethereum base polygon solana
+python -m name_symbol_stats_v2.main prepare-name-tasks --run-label apr01 --chains ethereum base polygon solana --blocking-strategy adaptive_v1 --max-atoms-per-task 30000
+cmake -S name_symbol_stats_v2/cpp -B name_symbol_stats_v2/cpp/build
+cmake --build name_symbol_stats_v2/cpp/build --config Release
+python -m name_symbol_stats_v2.main run-name-worker --run-label apr01 --worker-exe name_symbol_stats_v2/cpp/build/Release/name_worker.exe --thresholds 85 90 95 --parallel-workers 12 
+python -m name_symbol_stats_v2.main finalize-name-stats --run-label apr01 --chains ethereum base polygon solana --thresholds 85 90 95
+python -m name_symbol_stats_v2.main export-report --run-label apr01 --output-dir name_symbol_stats_v2_output
 ```
-
-## 设计约束
-
-- 统计单位是合约，不是单条 NFT
-- 比例按命中重复组的 NFT 总数计算
-- `symbol` 走精确匹配
-- `name` 先做 blocking，再做相似度精排和聚类
-- 默认输出单链、跨链汇总、链对链矩阵三类结果
-
-## 依赖
-
-- 必需：`psycopg2`
-- 推荐：`rapidfuzz`、`polars`
-
-未安装 `rapidfuzz` 时会退回 `difflib`，未安装 `polars` 时会继续导出文本和 CSV，并跳过 Parquet。
