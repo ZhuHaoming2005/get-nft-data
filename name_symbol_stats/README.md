@@ -22,12 +22,12 @@
 执行流程：
 
 ```powershell
-python -m name_symbol_stats_v2.main build-contract-identity --run-label apr01 --chains ethereum base polygon solana
-python -m name_symbol_stats_v2.main symbol-stats --run-label apr01 --chains ethereum base polygon solana
-python -m name_symbol_stats_v2.main prepare-name-tasks --run-label apr01 --chains ethereum base polygon solana --blocking-strategy adaptive_v1 --max-atoms-per-task 30000
-cmake -S name_symbol_stats_v2/cpp -B name_symbol_stats_v2/cpp/build
-cmake --build name_symbol_stats_v2/cpp/build --config Release
-python -m name_symbol_stats_v2.main run-name-worker --run-label apr01 --worker-exe name_symbol_stats_v2/cpp/build/Release/name_worker.exe --thresholds 85 90 95 --parallel-workers 12 
-python -m name_symbol_stats_v2.main finalize-name-stats --run-label apr01 --chains ethereum base polygon solana --thresholds 85 90 95
-python -m name_symbol_stats_v2.main export-report --run-label apr01 --output-dir name_symbol_stats_v2_output
+python -m name_symbol_stats.main build-contract-identity --run-label apr01 --chains ethereum base polygon solana
+python -m name_symbol_stats.main symbol-stats --run-label apr01 --chains ethereum base polygon solana
+python -m name_symbol_stats.main prepare-name-tasks --run-label apr01 --chains ethereum base polygon solana --blocking-strategy adaptive_v1 --max-atoms-per-task 30000
+cmake -S name_symbol_stats/cpp -B name_symbol_stats/cpp/build
+cmake --build name_symbol_stats/cpp/build --config Release
+python -m name_symbol_stats.main run-name-worker --run-label apr01 --worker-exe name_symbol_stats/cpp/build/Release/name_worker.exe --thresholds 85 90 95 --parallel-workers 12 
+python -m name_symbol_stats.main finalize-name-stats --run-label apr01 --chains ethereum base polygon solana --thresholds 85 90 95
+python -m name_symbol_stats.main export-report --run-label apr01 --output-dir name_symbol_stats_output
 ```
