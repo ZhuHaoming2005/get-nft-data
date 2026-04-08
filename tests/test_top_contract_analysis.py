@@ -1,4 +1,7 @@
+import os
 import unittest
+import uuid
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -526,10 +529,93 @@ class HumanReadableReportTests(unittest.TestCase):
         self.assertIn('高置信疑似侵权合约数: 1', text)
         self.assertIn('## 高置信疑似侵权合约', text)
         self.assertIn('0xdup', text)
+        self.assertIn('归为官方参与型重复的合约数: 1', text)
+        self.assertIn('## 被算法归为官方参与型重复的合约', text)
+        self.assertIn('该分组仅表示 mint 接收地址与官方地址集合存在交集', text)
         self.assertIn('## 地址行为信号', text)
         self.assertIn('快速扩散: 是', text)
         self.assertIn('## 受害者信号', text)
         self.assertIn('套牢地址数: 5', text)
+        self.assertNotIn('## 合法重复合约', text)
+        self.assertNotIn('合法重复合约数', text)
+
+
+class OutputNamingTests(unittest.TestCase):
+    def test_default_output_basename_uses_seed_collection_name(self):
+        payload = {
+            'seed_contract': {
+                'name': 'Bored Ape Yacht Club',
+                'contract_address': '0xseed',
+            }
+        }
+
+        basename = mod.default_output_basename(payload)
+
+        self.assertEqual(basename, 'top_contract_analysis__bored_ape_yacht_club')
+
+    def test_main_writes_default_json_and_markdown_outputs(self):
+        payload = {
+            'seed_contract': {
+                'chain': 'ethereum',
+                'contract_address': '0xseed',
+                'token_type': 'ERC721',
+                'contract_deployer': '0xcreator',
+                'deployed_block_number': 123,
+                'name': 'Bored Ape Yacht Club',
+                'symbol': 'BAYC',
+            },
+            'seed_collection_stats': {
+                'seed_nft_count': 1,
+                'unique_token_uri_count': 1,
+                'unique_image_uri_count': 1,
+                'unique_name_count': 1,
+                'unique_symbol_count': 1,
+            },
+            'duplicate_candidates': [],
+            'legit_duplicates': [],
+            'suspected_infringing_duplicates_high_confidence': [],
+            'suspected_infringing_duplicates_low_confidence': [],
+            'contract_level_summary': {},
+            'address_signals': {},
+            'victim_signals': {},
+            'report_summary': {
+                'open_license_detected': False,
+                'candidate_contract_count': 0,
+                'high_confidence_contract_count': 0,
+                'low_confidence_contract_count': 0,
+                'legit_duplicate_contract_count': 0,
+            },
+        }
+        tmpdir = Path('D:/code/solidity/get-nft-data/output/test-top-contract-analysis') / str(uuid.uuid4())
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        cwd = Path.cwd()
+        try:
+            with patch.object(mod, 'analyze_seed_contract', return_value=payload):
+                with patch('sys.argv', [
+                    'top_contract_analysis',
+                    '--chain', 'ethereum',
+                    '--seed-contract-address', '0xseed',
+                    '--alchemy-api-key', 'alchemy',
+                ]):
+                    os.chdir(tmpdir)
+                    result = mod.main()
+
+            self.assertEqual(result, 0)
+            json_path = tmpdir / 'result' / 'top_contract_analysis__bored_ape_yacht_club.json'
+            md_path = tmpdir / 'result' / 'top_contract_analysis__bored_ape_yacht_club.md'
+            self.assertTrue(json_path.exists())
+            self.assertTrue(md_path.exists())
+            self.assertIn('Bored Ape Yacht Club', json_path.read_text(encoding='utf-8'))
+            self.assertIn('# Top NFT 合约重复样本分析报告', md_path.read_text(encoding='utf-8'))
+        finally:
+            os.chdir(cwd)
+            for path in sorted(tmpdir.glob('**/*'), reverse=True):
+                if path.is_file():
+                    path.unlink()
+                elif path.is_dir():
+                    path.rmdir()
+            if tmpdir.exists():
+                tmpdir.rmdir()
 
 
 if __name__ == '__main__':

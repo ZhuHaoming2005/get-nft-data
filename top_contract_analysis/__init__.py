@@ -5,8 +5,7 @@ from __future__ import annotations
 #     --chain ethereum ^
 #     --seed-contract-address 0xbd3531da5cf5857e7cfaa92426877b022e612cf8 ^
 #     --alchemy-api-key your_alchemy_api_key ^
-#     --etherscan-api-key your_etherscan_api_key ^
-#     --output top_contract_analysis.json
+#     --etherscan-api-key your_etherscan_api_key
 
 import argparse
 import json
@@ -1104,10 +1103,35 @@ def analyze_seed_contract(
 
 def dump_results(payload: Dict[str, Any], output_path: Optional[str]) -> None:
     text = json.dumps(payload, ensure_ascii=False, indent=2)
+    Path(output_path).write_text(text, encoding='utf-8')
+
+
+def _slugify_filename_part(value: str) -> str:
+    text = unicodedata.normalize('NFKC', value or '').strip().casefold()
+    text = re.sub(r'[^0-9a-zA-Z\u4e00-\u9fff]+', '_', text)
+    text = text.strip('_')
+    return text or 'unknown_collection'
+
+
+def default_output_basename(payload: Dict[str, Any]) -> str:
+    seed = payload.get('seed_contract') or {}
+    name = str(seed.get('name') or '').strip()
+    if not name:
+        name = str(seed.get('contract_address') or 'unknown_collection')
+    return f'top_contract_analysis__{_slugify_filename_part(name)}'
+
+
+def write_default_outputs(payload: Dict[str, Any], output_path: str = '') -> tuple[Path, Path]:
     if output_path:
-        Path(output_path).write_text(text, encoding='utf-8')
+        json_path = Path(output_path)
     else:
-        print(text)
+        result_dir = Path.cwd() / 'result'
+        result_dir.mkdir(parents=True, exist_ok=True)
+        json_path = result_dir / f'{default_output_basename(payload)}.json'
+    md_path = json_path.with_suffix('.md')
+    dump_results(payload, str(json_path))
+    md_path.write_text(render_human_readable_report(payload), encoding='utf-8')
+    return json_path, md_path
 
 
 def _format_ratio(value: Any) -> str:
@@ -1150,7 +1174,7 @@ def render_human_readable_report(payload: Dict[str, Any]) -> str:
         f"- 重复候选合约数: {summary.get('candidate_contract_count', 0)}",
         f"- 高置信疑似侵权合约数: {summary.get('high_confidence_contract_count', 0)}",
         f"- 低置信疑似侵权合约数: {summary.get('low_confidence_contract_count', 0)}",
-        f"- 合法重复合约数: {summary.get('legit_duplicate_contract_count', 0)}",
+        f"- 归为官方参与型重复的合约数: {summary.get('legit_duplicate_contract_count', 0)}",
         '',
         '## 高置信疑似侵权合约',
     ]
@@ -1174,13 +1198,17 @@ def render_human_readable_report(payload: Dict[str, Any]) -> str:
     else:
         lines.append('- 无')
 
-    lines.extend(['', '## 合法重复合约'])
+    lines.extend([
+        '',
+        '## 被算法归为官方参与型重复的合约',
+        '- 说明: 该分组仅表示 mint 接收地址与官方地址集合存在交集。',
+    ])
     if legit:
         for item in legit:
             recipients = ', '.join(item.get('mint_recipients') or [])
             lines.append(
                 f"- {item.get('contract_address', '')}: {item.get('candidate_count', 0)} 个重复 NFT "
-                f"| mint 接收地址={recipients}"
+                f"| mint 接收地址(命中官方地址规则)={recipients}"
             )
     else:
         lines.append('- 无')
@@ -1226,7 +1254,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--etherscan-api-key', default=os.getenv('ETHERSCAN_API_KEY', ''))
     parser.add_argument('--name-threshold', type=float, default=DEFAULT_NAME_THRESHOLD)
     parser.add_argument('--timeout', type=int, default=DEFAULT_TIMEOUT)
-    parser.add_argument('--output', default='top_contract_analysis.json')
+    parser.add_argument('--output', default='')
     return parser
 
 
@@ -1241,5 +1269,5 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         name_threshold=args.name_threshold,
         timeout=args.timeout,
     )
-    dump_results(payload, args.output)
+    write_default_outputs(payload, args.output)
     return 0
