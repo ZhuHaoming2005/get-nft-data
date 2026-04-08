@@ -18,6 +18,7 @@ import sys
 import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -346,6 +347,45 @@ def _alchemy_post_json(
     if last_exc is not None:
         raise last_exc
     raise RuntimeError('alchemy POST failed without exception')
+
+
+def _parse_alchemy_block_timestamp(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip()
+    if not text:
+        return 0
+    if text.isdigit():
+        return int(text)
+    if text.startswith('0x'):
+        return int(text, 16)
+    try:
+        return int(datetime.fromisoformat(text.replace('Z', '+00:00')).timestamp())
+    except ValueError:
+        return 0
+
+
+def _fetch_block_timestamp(
+    *,
+    api_key: str,
+    network: str,
+    block_num: str,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> int:
+    body = _alchemy_post_json(
+        url=_alchemy_rpc_base(network, api_key),
+        payload={
+            'jsonrpc': '2.0',
+            'id': 1,
+            'method': 'eth_getBlockByNumber',
+            'params': [block_num, False],
+        },
+        timeout=timeout,
+    )
+    result = body.get('result') or {}
+    return _parse_alchemy_block_timestamp(result.get('timestamp'))
 
 
 def _extract_seed_nfts(payload: Dict[str, Any], *, chain: str, contract_address: str) -> Tuple[List[SeedNFT], str]:
@@ -693,6 +733,7 @@ def fetch_alchemy_contract_transfers(
     }
     transfers: List[TransferRecord] = []
     page_key = None
+    block_time_cache: Dict[str, int] = {}
     while True:
         if page_key:
             params['pageKey'] = page_key
@@ -708,6 +749,18 @@ def fetch_alchemy_contract_transfers(
         result = body.get('result') or {}
         for item in result.get('transfers') or []:
             block_num = str(item.get('blockNum') or '0')
+            block_time = _parse_alchemy_block_timestamp(item.get('metadata', {}).get('blockTimestamp'))
+            if not block_time and block_num not in {'', '0'}:
+                cached = block_time_cache.get(block_num)
+                if cached is None:
+                    cached = _fetch_block_timestamp(
+                        api_key=api_key,
+                        network=network,
+                        block_num=block_num,
+                        timeout=timeout,
+                    )
+                    block_time_cache[block_num] = cached
+                block_time = cached
             transfers.append(
                 TransferRecord(
                     contract_address=str(item.get('rawContract', {}).get('address') or contract_address).lower(),
@@ -715,7 +768,7 @@ def fetch_alchemy_contract_transfers(
                     tx_hash=str(item.get('hash') or ''),
                     log_index=int(item.get('logIndex') or 0),
                     block_number=int(block_num, 16) if block_num.startswith('0x') else int(block_num or 0),
-                    block_time=int(item.get('metadata', {}).get('blockTimestampUnix') or 0),
+                    block_time=block_time,
                     from_address=str(item.get('from') or '').lower(),
                     to_address=str(item.get('to') or '').lower(),
                     event_type=str(item.get('category') or ''),

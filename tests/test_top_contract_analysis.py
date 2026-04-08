@@ -126,6 +126,77 @@ class LicenseDetectionTests(unittest.TestCase):
 
 
 class TransferFallbackTests(unittest.TestCase):
+    def test_fetch_alchemy_contract_transfers_uses_metadata_block_timestamp(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            'result': {
+                'transfers': [
+                    {
+                        'rawContract': {'address': '0xdup'},
+                        'erc721TokenId': '0x1',
+                        'hash': '0xabc',
+                        'logIndex': 0,
+                        'blockNum': '0x10',
+                        'metadata': {'blockTimestamp': '2024-01-01T00:00:00.000Z'},
+                        'from': mod.ZERO_ADDRESS,
+                        'to': '0xbuyer',
+                        'category': 'erc721',
+                    }
+                ]
+            }
+        }
+        fake_requests = SimpleNamespace(post=Mock(return_value=response))
+
+        with patch.object(mod, 'requests', fake_requests):
+            rows = mod.fetch_alchemy_contract_transfers(
+                api_key='alchemy',
+                network='eth-mainnet',
+                contract_address='0xdup',
+            )
+
+        self.assertEqual(len(rows), 1)
+        self.assertGreater(rows[0].block_time, 0)
+
+    def test_fetch_alchemy_contract_transfers_falls_back_to_block_lookup_for_timestamp(self):
+        transfer_response = Mock()
+        transfer_response.raise_for_status.return_value = None
+        transfer_response.json.return_value = {
+            'result': {
+                'transfers': [
+                    {
+                        'rawContract': {'address': '0xdup'},
+                        'erc721TokenId': '0x1',
+                        'hash': '0xabc',
+                        'logIndex': 0,
+                        'blockNum': '0x10',
+                        'metadata': {},
+                        'from': mod.ZERO_ADDRESS,
+                        'to': '0xbuyer',
+                        'category': 'erc721',
+                    }
+                ]
+            }
+        }
+        block_response = Mock()
+        block_response.raise_for_status.return_value = None
+        block_response.json.return_value = {
+            'result': {
+                'timestamp': '0x65920080',
+            }
+        }
+        fake_requests = SimpleNamespace(post=Mock(side_effect=[transfer_response, block_response]))
+
+        with patch.object(mod, 'requests', fake_requests):
+            rows = mod.fetch_alchemy_contract_transfers(
+                api_key='alchemy',
+                network='eth-mainnet',
+                contract_address='0xdup',
+            )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].block_time, int('65920080', 16))
+
     def test_fetch_alchemy_contract_transfers_retries_before_succeeding(self):
         first_response = Mock()
         first_response.raise_for_status.side_effect = mod.REQUESTS_REQUEST_ERROR('ssl eof')
@@ -140,7 +211,7 @@ class TransferFallbackTests(unittest.TestCase):
                         'hash': '0xabc',
                         'logIndex': 0,
                         'blockNum': '0x10',
-                        'metadata': {'blockTimestampUnix': 100},
+                        'metadata': {'blockTimestamp': '2024-01-01T00:00:00.000Z'},
                         'from': mod.ZERO_ADDRESS,
                         'to': '0xbuyer',
                         'category': 'erc721',
@@ -334,6 +405,39 @@ class EndToEndAnalysisTests(unittest.TestCase):
         self.assertEqual(result['report_summary']['high_confidence_contract_count'], 1)
         self.assertFalse(result['report_summary']['open_license_detected'])
         self.assertEqual(result['address_signals']['0xdup']['mint_address_count'], 1)
+
+    def test_analyze_contract_transfers_computes_non_zero_first_transfer_delay(self):
+        transfers = [
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='1',
+                tx_hash='0xmint',
+                log_index=0,
+                block_number=10,
+                block_time=100,
+                from_address=mod.ZERO_ADDRESS,
+                to_address='0xminted',
+                event_type='erc721',
+                source='alchemy',
+            ),
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='1',
+                tx_hash='0xsale',
+                log_index=1,
+                block_number=11,
+                block_time=460,
+                from_address='0xminted',
+                to_address='0xbuyer',
+                event_type='erc721',
+                source='alchemy',
+            ),
+        ]
+
+        result = mod.analyze_contract_transfers(transfers)
+
+        self.assertEqual(result['mint_to_first_transfer_seconds'], 360)
+        self.assertTrue(result['fast_spread'])
 
 
 class ParserNetworkDefaultTests(unittest.TestCase):
