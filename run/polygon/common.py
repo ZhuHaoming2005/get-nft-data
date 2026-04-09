@@ -122,6 +122,26 @@ def _temp_table_name(chain_name: str) -> str:
     return f"temp_{safe}"
 
 
+def _load_varchar_limits(conn, table_name: str, columns: List[str]) -> dict[str, int]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT column_name, character_maximum_length
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = %s
+              AND column_name = ANY(%s)
+              AND data_type IN ('character varying', 'character')
+            """,
+            (table_name, columns),
+        )
+        return {
+            row[0]: int(row[1])
+            for row in cur.fetchall()
+            if row[1] is not None
+        }
+
+
 def load_blacklist() -> Set[str]:
     out: Set[str] = set()
     for part in DEFI_BLACKLIST_ENV.split(","):
@@ -306,6 +326,12 @@ def batch_insert_main(conn, chain_name: str, records: List[Tuple]) -> int:
     if not records:
         return 0
     tbl = _nft_table_name(chain_name)
+    varchar_limits = _load_varchar_limits(
+        conn,
+        tbl,
+        ["contract_address", "token_id", "token_uri", "image_uri", "name", "symbol", "token_standard"],
+    )
+    conn.commit()
 
     def _clean(v):
         return v.replace("\x00", "") if isinstance(v, str) else v
@@ -315,7 +341,22 @@ def batch_insert_main(conn, chain_name: str, records: List[Tuple]) -> int:
         metadata = cleaned[6]
         if metadata is not None and not isinstance(metadata, str):
             metadata = _json.dumps(metadata, ensure_ascii=False)
-        return cleaned[:6] + (metadata,) + cleaned[7:]
+        values = list(cleaned[:6] + (metadata,) + cleaned[7:])
+        column_positions = {
+            "contract_address": 0,
+            "token_id": 1,
+            "token_uri": 2,
+            "image_uri": 3,
+            "name": 4,
+            "symbol": 5,
+            "token_standard": 7,
+        }
+        for column, pos in column_positions.items():
+            limit = varchar_limits.get(column)
+            value = values[pos]
+            if limit and isinstance(value, str) and len(value) > limit:
+                values[pos] = value[:limit]
+        return tuple(values)
 
     records = [_normalize(rec) for rec in records]
     sql = f"""
