@@ -163,6 +163,59 @@ class _FakeClientSession:
         return _FakePostContext(url, json)
 
 
+class _FakeAlchemyPostContext:
+    def __init__(self, payload):
+        self.payload = payload
+
+    async def __aenter__(self):
+        return _FakeHttpResponse(200, self.payload)
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FakeAlchemySession:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def post(self, url, json=None, timeout=None):
+        return _FakeAlchemyPostContext(self.payload)
+
+
+class _RecordingCursor:
+    def __init__(self, fetchall_result=None):
+        self.fetchall_result = fetchall_result or []
+        self.executed = []
+        self.rowcount = 0
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+
+    def executemany(self, sql, params_seq):
+        self.executed.append((sql, list(params_seq)))
+
+    def fetchall(self):
+        return list(self.fetchall_result)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class _RecordingConn:
+    def __init__(self, fetchall_result=None):
+        self.cursor_obj = _RecordingCursor(fetchall_result)
+        self.commit_count = 0
+
+    def cursor(self):
+        return self.cursor_obj
+
+    def commit(self):
+        self.commit_count += 1
+
+
 class PolygonCommonBatchRpcTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls):
@@ -206,6 +259,97 @@ class PolygonCommonBatchRpcTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(_BatchRpcHandler.request_count, 1)
         self.assertLess(elapsed, 0.5)
+
+    async def test_fetch_alchemy_batch_returns_contract_fields_and_raw_metadata(self):
+        payload = [
+            {
+                "contract": {"name": "Collection A", "symbol": "COLA"},
+                "raw": {
+                    "tokenUri": "ipfs://token/1",
+                    "metadata": {"name": "NFT #1", "attributes": [{"trait_type": "bg", "value": "red"}]},
+                },
+            }
+        ]
+
+        result = await self.common.fetch_alchemy_batch(
+            _FakeAlchemySession(payload),
+            asyncio.Semaphore(1),
+            [("0xabc", 1, "ERC-721")],
+        )
+
+        self.assertEqual(
+            result,
+            [
+                (
+                    "ipfs://token/1",
+                    None,
+                    "Collection A",
+                    "COLA",
+                    {"name": "NFT #1", "attributes": [{"trait_type": "bg", "value": "red"}]},
+                )
+            ],
+        )
+
+
+class PolygonCommonDbSchemaTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.common = _load_polygon_common()
+
+    def test_init_db_ensures_name_symbol_metadata_columns_exist(self):
+        conn = _RecordingConn()
+
+        self.common.init_db(conn, "polygon")
+
+        executed_sql = "\n".join(sql for sql, _ in conn.cursor_obj.executed)
+        self.assertIn("name             TEXT", executed_sql)
+        self.assertIn("symbol           TEXT", executed_sql)
+        self.assertIn("metadata         JSONB", executed_sql)
+        self.assertIn("ADD COLUMN IF NOT EXISTS name", executed_sql)
+        self.assertIn("ADD COLUMN IF NOT EXISTS symbol", executed_sql)
+        self.assertIn("ADD COLUMN IF NOT EXISTS metadata", executed_sql)
+
+    def test_batch_insert_main_includes_name_symbol_and_metadata(self):
+        conn = _RecordingConn()
+        calls = []
+
+        def _fake_execute_values(cur, sql, page, template=None, page_size=None):
+            calls.append((sql, list(page), template, page_size))
+            cur.rowcount = len(page)
+
+        original = self.common.execute_values
+        self.common.execute_values = _fake_execute_values
+        try:
+            inserted = self.common.batch_insert_main(
+                conn,
+                "polygon",
+                [
+                    (
+                        "0xabc",
+                        "1",
+                        "ipfs://token/1",
+                        "ipfs://image/1",
+                        "Collection A",
+                        "COLA",
+                        {"name": "NFT #1"},
+                        "ERC-721",
+                        123,
+                    )
+                ],
+            )
+        finally:
+            self.common.execute_values = original
+
+        self.assertEqual(inserted, 1)
+        self.assertEqual(len(calls), 1)
+        sql, page, template, page_size = calls[0]
+        self.assertIn("contract_address, token_id, token_uri, image_uri,", sql)
+        self.assertIn("name, symbol, metadata, token_standard, first_seen_block", sql)
+        self.assertEqual(page[0][4], "Collection A")
+        self.assertEqual(page[0][5], "COLA")
+        self.assertEqual(page[0][6], "{\"name\": \"NFT #1\"}")
+        self.assertIn("jsonb", template.lower())
+        self.assertEqual(page_size, 1)
 
 
 if __name__ == "__main__":

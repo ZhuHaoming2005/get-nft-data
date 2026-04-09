@@ -78,12 +78,14 @@ async def _process_batch(
         for chunk in chunks
     ]) if chunks else []
 
-    alchemy_results: List[Tuple[Optional[str], Optional[str]]] = [
+    alchemy_results: List[
+        Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[object]]
+    ] = [
         item for chunk in chunk_results for item in chunk
     ]
 
     # ── 步骤2：tokenUri 为空时 fallback 到链上合约（异步并发）──────────────────
-    fallback_indices = [i for i, (uri, _) in enumerate(alchemy_results) if not uri]
+    fallback_indices = [i for i, (uri, _, _, _, _) in enumerate(alchemy_results) if not uri]
     if fallback_indices:
         fallback_tokens = [tokens[i] for i in fallback_indices]
         rpc_chunks = [
@@ -112,32 +114,38 @@ async def _process_batch(
                 fallback_uris[pos] = uri
 
         for idx, chain_uri in zip(fallback_indices, fallback_uris):
-            _, img = alchemy_results[idx]
-            alchemy_results[idx] = (chain_uri, img)
+            _, img, name, symbol, metadata = alchemy_results[idx]
+            alchemy_results[idx] = (chain_uri, img, name, symbol, metadata)
 
     # ── 步骤2.5：解码链上内嵌 data URI，提取 image_url ──────────────────────────
     # token_uri 为 data:application/... 格式时（链上存储的 JSON 元数据），
     # base64 解码后提取 image 字段写回 alchemy_results，
     # 供后续步骤3统一检测 data:image 链上图像并加入黑名单。
-    for i, (token_uri, image_url) in enumerate(alchemy_results):
+    for i, (token_uri, image_url, name, symbol, metadata) in enumerate(alchemy_results):
         if token_uri and token_uri.startswith("data:application/") and image_url is None:
             decoded_img = _decode_inline_image(token_uri)
             if decoded_img:
-                alchemy_results[i] = (token_uri, decoded_img)
+                alchemy_results[i] = (token_uri, decoded_img, name, symbol, metadata)
 
     # ── 步骤3：检测链上存储图像（data:image）的 DeFi 合约 ───────────────────────
     # 若某合约任意 token 的 image_url 以 'data:image' 开头（无论来自 Alchemy
     # 直接返回，还是步骤2.5从链上 JSON 元数据解码所得），均说明该合约将图像
     # 直接编码在链上，属于 DeFi/功能性合约，整体加入黑名单。
     onchain_image_contracts: Set[str] = set()
-    for (_, addr, _, _, _), (_, image_url) in zip(pending, alchemy_results):
+    for (_, addr, _, _, _), (_, image_url, _, _, _) in zip(pending, alchemy_results):
         if image_url and image_url.startswith("data:image"):
             onchain_image_contracts.add(addr)
 
     # ── 步骤4：有效记录组装为主表 insert 列表 ───────────────────────────────────
     inserts: List[Tuple] = []
 
-    for (_, addr, tid, std, first_seen_block), (token_uri, image_url) in zip(
+    for (_, addr, tid, std, first_seen_block), (
+        token_uri,
+        image_url,
+        contract_name,
+        contract_symbol,
+        raw_metadata,
+    ) in zip(
         pending, alchemy_results
     ):
         # 跳过链上存储图像的合约（整个合约列入黑名单）
@@ -150,7 +158,19 @@ async def _process_batch(
         # ERC-1155 {id} 占位符展开：替换为 64 位零填充小写十六进制 token ID
         token_uri = replace_token_id_placeholder(token_uri, tid)
 
-        inserts.append((addr, str(tid), token_uri, image_url, std, first_seen_block))
+        inserts.append(
+            (
+                addr,
+                str(tid),
+                token_uri,
+                image_url,
+                contract_name,
+                contract_symbol,
+                raw_metadata,
+                std,
+                first_seen_block,
+            )
+        )
 
     return inserts, all_ids, onchain_image_contracts
 
