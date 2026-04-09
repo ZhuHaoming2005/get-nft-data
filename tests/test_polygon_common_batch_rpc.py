@@ -215,6 +215,49 @@ class _RecordingConn:
     def commit(self):
         self.commit_count += 1
 
+    def rollback(self):
+        pass
+
+
+class _UndefinedColumnCursor:
+    def __init__(self):
+        self.executed = []
+        self.rowcount = 0
+        self._failed = False
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+        if "WITH candidates AS" in sql and not self._failed:
+            self._failed = True
+            exc = RuntimeError('column "claimed_at" does not exist')
+            exc.pgcode = "42703"
+            raise exc
+
+    def fetchall(self):
+        return [(11, "0xdef", 2, "ERC-1155", 456)]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class _UndefinedColumnConn:
+    def __init__(self):
+        self.cursor_obj = _UndefinedColumnCursor()
+        self.commit_count = 0
+        self.rollback_count = 0
+
+    def cursor(self):
+        return self.cursor_obj
+
+    def commit(self):
+        self.commit_count += 1
+
+    def rollback(self):
+        self.rollback_count += 1
+
 
 class PolygonCommonBatchRpcTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
@@ -308,6 +351,10 @@ class PolygonCommonDbSchemaTests(unittest.TestCase):
         self.assertIn("ADD COLUMN IF NOT EXISTS name", executed_sql)
         self.assertIn("ADD COLUMN IF NOT EXISTS symbol", executed_sql)
         self.assertIn("ADD COLUMN IF NOT EXISTS metadata", executed_sql)
+        self.assertIn("claimed_at       TIMESTAMPTZ", executed_sql)
+        self.assertIn("claimed_by       TEXT", executed_sql)
+        self.assertIn("ADD COLUMN IF NOT EXISTS claimed_at", executed_sql)
+        self.assertIn("ADD COLUMN IF NOT EXISTS claimed_by", executed_sql)
 
     def test_batch_insert_main_includes_name_symbol_and_metadata(self):
         conn = _RecordingConn()
@@ -350,6 +397,74 @@ class PolygonCommonDbSchemaTests(unittest.TestCase):
         self.assertEqual(page[0][6], "{\"name\": \"NFT #1\"}")
         self.assertIn("jsonb", template.lower())
         self.assertEqual(page_size, 1)
+
+    def test_claim_pending_nfts_uses_skip_locked_and_marks_worker(self):
+        conn = _RecordingConn(
+            [
+                (
+                    10,
+                    "0xabc",
+                    1,
+                    "ERC-721",
+                    123,
+                )
+            ]
+        )
+
+        claimed = self.common.claim_pending_nfts(
+            conn,
+            "polygon",
+            worker_id="worker-1",
+            batch_size=250,
+            reclaim_after_seconds=900,
+        )
+
+        executed_sql, params = conn.cursor_obj.executed[0]
+        self.assertEqual(
+            claimed,
+            [
+                (
+                    10,
+                    "0xabc",
+                    1,
+                    "ERC-721",
+                    123,
+                )
+            ],
+        )
+        self.assertIn("FOR UPDATE SKIP LOCKED", executed_sql)
+        self.assertIn("SET claimed_at = NOW(), claimed_by = %s", executed_sql)
+        self.assertIn("claimed_at IS NULL", executed_sql)
+        self.assertEqual(params, ("900 seconds", 250, "worker-1"))
+        self.assertEqual(conn.commit_count, 1)
+
+    def test_claim_pending_nfts_recovers_after_missing_claim_columns(self):
+        conn = _UndefinedColumnConn()
+
+        claimed = self.common.claim_pending_nfts(
+            conn,
+            "polygon",
+            worker_id="worker-2",
+            batch_size=100,
+            reclaim_after_seconds=600,
+        )
+
+        executed_sql = "\n".join(sql for sql, _ in conn.cursor_obj.executed)
+        self.assertEqual(
+            claimed,
+            [
+                (
+                    11,
+                    "0xdef",
+                    2,
+                    "ERC-1155",
+                    456,
+                )
+            ],
+        )
+        self.assertIn("ALTER TABLE temp_polygon ADD COLUMN IF NOT EXISTS claimed_at", executed_sql)
+        self.assertIn("ALTER TABLE temp_polygon ADD COLUMN IF NOT EXISTS claimed_by", executed_sql)
+        self.assertGreaterEqual(conn.rollback_count, 1)
 
 
 if __name__ == "__main__":

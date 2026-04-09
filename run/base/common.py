@@ -94,6 +94,8 @@ DEFI_BLACKLIST_ENV = os.getenv("DEFI_BLACKLIST", "")
 
 CONCURRENT_ALCHEMY = int(os.getenv("CONCURRENT_ALCHEMY", "5"))
 CONCURRENT_RPC     = int(os.getenv("CONCURRENT_RPC", "10"))
+FETCH_CLAIM_BATCH_SIZE = int(os.getenv("FETCH_CLAIM_BATCH_SIZE", "5000"))
+CLAIM_RETRY_AFTER_SECONDS = int(os.getenv("CLAIM_RETRY_AFTER_SECONDS", "1800"))
 
 # log_scanner 滑动窗口宽度：同时在途的 eth_getLogs 批次数
 SCAN_WINDOW = int(os.getenv("SCAN_WINDOW", "3"))
@@ -198,6 +200,8 @@ def init_db(conn, chain_name: str) -> None:
                 token_id         NUMERIC      NOT NULL,
                 token_standard   VARCHAR(10),
                 first_seen_block BIGINT,
+                claimed_at       TIMESTAMPTZ,
+                claimed_by       TEXT,
                 created_at       TIMESTAMPTZ  DEFAULT NOW(),
                 UNIQUE (contract_address, token_id)
             )
@@ -206,6 +210,7 @@ def init_db(conn, chain_name: str) -> None:
             f"CREATE INDEX IF NOT EXISTS idx_temp_contract ON {tmp} (contract_address)"
         )
     ensure_main_table_columns(conn, chain_name)
+    ensure_temp_table_claim_columns(conn, chain_name)
     conn.commit()
     logger.info("数据库表初始化完成: 主表=%s  临时表=%s", tbl, tmp)
 
@@ -219,6 +224,26 @@ def ensure_main_table_columns(conn, chain_name: str) -> None:
         cur.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS metadata JSONB")
     conn.commit()
     logger.info("主表扩展列检查完成: %s (name, symbol, metadata)", tbl)
+
+
+def ensure_temp_table_claim_columns(conn, chain_name: str) -> None:
+    """确保临时表认领列存在；供 metadata_fetcher 多实例安全消费。"""
+    tmp = _temp_table_name(chain_name)
+    with conn.cursor() as cur:
+        cur.execute(f"ALTER TABLE {tmp} ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ")
+        cur.execute(f"ALTER TABLE {tmp} ADD COLUMN IF NOT EXISTS claimed_by TEXT")
+        cur.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_temp_claimed_at ON {tmp} (claimed_at, id)"
+        )
+    conn.commit()
+    logger.info("临时表认领列检查完成: %s (claimed_at, claimed_by)", tmp)
+
+
+def _is_missing_claim_column_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    if getattr(exc, "pgcode", None) != "42703" and "does not exist" not in message:
+        return False
+    return "claimed_at" in message or "claimed_by" in message
 
 
 def load_seen_nfts(conn, chain_name: str) -> Set[Tuple[str, int]]:
@@ -312,6 +337,58 @@ def load_pending_nfts(conn, chain_name: str) -> List[Tuple]:
     return result
 
 
+def claim_pending_nfts(
+    conn,
+    chain_name: str,
+    worker_id: str,
+    batch_size: int = FETCH_CLAIM_BATCH_SIZE,
+    reclaim_after_seconds: int = CLAIM_RETRY_AFTER_SECONDS,
+) -> List[Tuple]:
+    """
+    metadata_fetcher 专用：原子认领一批临时表记录，供多实例安全并行消费。
+    返回 [(id, contract_address, token_id, token_standard, first_seen_block), ...]
+    """
+    tmp = _temp_table_name(chain_name)
+    params = (f"{reclaim_after_seconds} seconds", batch_size, worker_id)
+
+    def _claim_once() -> List[Tuple]:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                WITH candidates AS (
+                    SELECT id
+                    FROM {tmp}
+                    WHERE claimed_at IS NULL
+                       OR claimed_at < NOW() - %s::interval
+                    ORDER BY id
+                    LIMIT %s
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE {tmp} AS t
+                SET claimed_at = NOW(), claimed_by = %s
+                FROM candidates
+                WHERE t.id = candidates.id
+                RETURNING t.id, t.contract_address, t.token_id, t.token_standard, t.first_seen_block
+                """,
+                params,
+            )
+            return [(row[0], row[1], int(row[2]), row[3], row[4]) for row in cur.fetchall()]
+
+    try:
+        result = _claim_once()
+    except Exception as exc:
+        if not _is_missing_claim_column_error(exc):
+            raise
+        if hasattr(conn, "rollback"):
+            conn.rollback()
+        logger.warning("临时表缺少认领列，自动补列后重试: %s", tmp)
+        ensure_temp_table_claim_columns(conn, chain_name)
+        result = _claim_once()
+
+    conn.commit()
+    return result
+
+
 def batch_insert_main(conn, chain_name: str, records: List[Tuple]) -> int:
     """
     metadata_fetcher 专用：将有效 NFT 记录批量写入主表。
@@ -395,6 +472,25 @@ def delete_temp_nfts(conn, chain_name: str, ids: List[int]) -> int:
         deleted = cur.rowcount
     conn.commit()
     return deleted
+
+
+def release_temp_claims(conn, chain_name: str, ids: List[int], worker_id: str) -> int:
+    """metadata_fetcher 专用：释放当前 worker 尚未处理完成的认领，便于快速重试。"""
+    if not ids:
+        return 0
+    tmp = _temp_table_name(chain_name)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            UPDATE {tmp}
+            SET claimed_at = NULL, claimed_by = NULL
+            WHERE id = ANY(%s) AND claimed_by = %s
+            """,
+            (ids, worker_id),
+        )
+        released = cur.rowcount
+    conn.commit()
+    return released
 
 
 def delete_contract_nfts(

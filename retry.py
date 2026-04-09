@@ -7,12 +7,11 @@ NFT image_uri 重试脚本：对 image_uri 为空的记录重新拉取 metadata 
 
 import argparse
 import asyncio
-import json
 import logging
 import re
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import aiohttp
 import psycopg2
@@ -41,10 +40,10 @@ METADATA_CONNECT_TIMEOUT = 15
 CONCURRENT_REQUESTS = 20
 
 IPFS_GATEWAYS: List[str] = [
-    "https://pink-official-shrimp-252.mypinata.cloud/ipfs",
     "https://gateway.pinata.cloud/ipfs",
     "https://dweb.link/ipfs",
     "https://ipfs.io/ipfs",
+    # "https://pink-official-shrimp-252.mypinata.cloud/ipfs",
 ]
 
 IPFS_GATEWAY_HEADERS: Dict[str, Dict[str, str]] = {
@@ -97,10 +96,10 @@ async def _fetch_json(session: aiohttp.ClientSession, url: str, headers: Dict[st
         return await response.json(content_type=None)
 
 
-async def fetch_metadata_for_token_uri_async(
+async def fetch_image_uri_for_token_uri_async(
     token_uri: str,
     session: aiohttp.ClientSession,
-) -> Optional[Dict[str, Any]]:
+) -> Optional[str]:
     if not token_uri or token_uri.startswith("data:application/"):
         return None
 
@@ -137,7 +136,17 @@ async def fetch_metadata_for_token_uri_async(
             )
             continue
 
-        return data
+        image = data.get("image") or data.get("image_url")
+        if not image or not isinstance(image, str):
+            logger.info(
+                "[retry image_uri=NULL] token_uri=%s gateway[%d]=%s 原因: JSON 中缺少 image/image_url",
+                token_uri[:100],
+                idx,
+                gateway or "<direct>",
+            )
+            return None
+
+        return image.strip()
 
     if last_exc is not None:
         logger.debug(
@@ -149,28 +158,10 @@ async def fetch_metadata_for_token_uri_async(
     return None
 
 
-async def fetch_image_uri_for_token_uri_async(
-    token_uri: str,
-    session: aiohttp.ClientSession,
-) -> Optional[str]:
-    metadata = await fetch_metadata_for_token_uri_async(token_uri, session)
-    if not metadata:
-        return None
-
-    image = metadata.get("image") or metadata.get("image_url")
-    if not image or not isinstance(image, str):
-        logger.info(
-            "[retry image_uri=NULL] token_uri=%s 原因: JSON 中缺少 image/image_url",
-            token_uri[:100],
-        )
-        return None
-    return image.strip()
-
-
-async def fetch_metadata_records_for_token_uris(
+async def fetch_image_uris_for_token_uris(
     token_uris: List[str],
     concurrency: int = CONCURRENT_REQUESTS,
-) -> Dict[str, Optional[Dict[str, Any]]]:
+) -> Dict[str, Optional[str]]:
     if not token_uris:
         return {}
 
@@ -186,31 +177,12 @@ async def fetch_metadata_records_for_token_uris(
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         async def fetch_one(token_uri: str):
             async with semaphore:
-                metadata = await fetch_metadata_for_token_uri_async(token_uri, session)
-                return token_uri, metadata
+                image_uri = await fetch_image_uri_for_token_uri_async(token_uri, session)
+                return token_uri, image_uri
 
         pairs = await asyncio.gather(*(fetch_one(token_uri) for token_uri in token_uris))
 
-    return {token_uri: metadata for token_uri, metadata in pairs}
-
-
-async def fetch_image_uris_for_token_uris(
-    token_uris: List[str],
-    concurrency: int = CONCURRENT_REQUESTS,
-) -> Dict[str, Optional[str]]:
-    metadata_records = await fetch_metadata_records_for_token_uris(
-        token_uris,
-        concurrency=concurrency,
-    )
-    image_uris: Dict[str, Optional[str]] = {}
-    for token_uri, metadata in metadata_records.items():
-        image = None
-        if isinstance(metadata, dict):
-            candidate = metadata.get("image") or metadata.get("image_url")
-            if isinstance(candidate, str):
-                image = candidate.strip()
-        image_uris[token_uri] = image
-    return image_uris
+    return {token_uri: image_uri for token_uri, image_uri in pairs}
 
 
 def fetch_image_uri_for_token_uri(token_uri: str) -> Optional[str]:
@@ -226,18 +198,12 @@ def ensure_retry_checked_column(conn, chain_name: str) -> None:
             ADD COLUMN IF NOT EXISTS retry_checked_at TIMESTAMPTZ
             """
         )
-        cur.execute(
-            f"""
-            ALTER TABLE {tbl}
-            ADD COLUMN IF NOT EXISTS metadata JSONB
-            """
-        )
     conn.commit()
-    logger.info("已确保 %s.retry_checked_at / metadata 列存在", tbl)
+    logger.info("已确保 %s.retry_checked_at 列存在", tbl)
 
 
 def get_conn() -> psycopg2.extensions.connection:
-    conn = psycopg2.connect(
+    return psycopg2.connect(
         host=DB_HOST,
         port=DB_PORT,
         dbname=DB_NAME,
@@ -245,8 +211,6 @@ def get_conn() -> psycopg2.extensions.connection:
         password=DB_PASS,
         connect_timeout=10,
     )
-    conn.autocommit = True
-    return conn
 
 
 def fetch_missing_image_rows(
@@ -297,24 +261,21 @@ def mark_retry_checked(
     conn.commit()
 
 
-def update_metadata_by_token_uri(
+def update_image_uri_by_token_uri(
     cur: psycopg2.extensions.cursor,
     token_uri: str,
-    metadata: Dict[str, Any],
+    image_uri: str,
     chain_name: str,
 ) -> int:
     tbl = _nft_table_name(chain_name)
-    image_uri = metadata.get("image") or metadata.get("image_url")
-    image_uri = image_uri.strip() if isinstance(image_uri, str) else None
     cur.execute(
         f"""
         UPDATE {tbl}
-        SET image_uri = %s,
-            metadata = %s::jsonb
-        WHERE token_uri = %s
-          AND (image_uri IS NULL OR metadata IS NULL)
+        SET image_uri = %s
+        WHERE image_uri IS NULL
+          AND token_uri = %s
         """,
-        (image_uri, json.dumps(metadata, ensure_ascii=False), token_uri),
+        (image_uri, token_uri),
     )
     return cur.rowcount
 
@@ -347,77 +308,68 @@ def main() -> None:
     ensure_retry_checked_column(conn, chain_name)
     conn.close()
 
-    total_processed = 0
-    total_updated = 0
-
     while True:
         conn = get_conn()
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+
+        total_processed = 0
+        total_updated = 0
+
         try:
-            rows = fetch_missing_image_rows(cur, chain_name, BATCH_SIZE)
-            if rows:
-                mark_retry_checked(cur, conn, chain_name, rows)
-        finally:
-            cur.close()
-            conn.close()
+            while True:
 
-        if not rows:
-            logger.info("暂无待重试记录，关闭数据库连接后休眠 600 秒")
-            time.sleep(600)
-            continue
-
-        token_uris = [row["token_uri"] for row in rows]
-        logger.info(
-            "取到待补 image_uri 的 token_uri 数量: %d，累计处理: %d，累计更新: %d",
-            len(token_uris),
-            total_processed,
-            total_updated,
-        )
-
-        metadata_records = asyncio.run(
-            fetch_metadata_records_for_token_uris(
-                token_uris,
-                concurrency=concurrency,
-            )
-        )
-
-        batch_updated = 0
-        conn = get_conn()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        try:
-            for token_uri in token_uris:
-                total_processed += 1
-                metadata = metadata_records.get(token_uri)
-                if not metadata:
+                rows = fetch_missing_image_rows(cur, chain_name, BATCH_SIZE)
+                if not rows:
+                    time.sleep(600)
                     continue
 
-                updated_count = update_metadata_by_token_uri(
-                    cur,
-                    token_uri,
-                    metadata,
-                    chain_name,
-                )
-                batch_updated += updated_count
-                total_updated += updated_count
-                image_uri = metadata.get("image") or metadata.get("image_url") or ""
+                mark_retry_checked(cur, conn, chain_name, rows)
 
+                token_uris = [row["token_uri"] for row in rows]
                 logger.info(
-                    "更新成功 token_uri=%s 更新行数=%d image_uri=%s metadata_keys=%s",
-                    token_uri[:80],
-                    updated_count,
-                    image_uri[:80],
-                    sorted(metadata.keys())[:10],
+                    "取到待补 image_uri 的 token_uri 数量: %d，累计处理: %d，累计更新: %d",
+                    len(token_uris),
+                    total_processed,
+                    total_updated,
+                )
+
+                image_uris = asyncio.run(
+                    fetch_image_uris_for_token_uris(token_uris, concurrency=concurrency)
+                )
+
+                batch_updated = 0
+                for token_uri in token_uris:
+                    total_processed += 1
+                    image_uri = image_uris.get(token_uri)
+                    if not image_uri:
+                        continue
+
+                    updated_count = update_image_uri_by_token_uri(
+                        cur,
+                        token_uri,
+                        image_uri,
+                        chain_name,
+                    )
+                    batch_updated += updated_count
+                    total_updated += updated_count
+
+                    logger.info(
+                        "更新成功 token_uri=%s 更新行数=%d image_uri=%s",
+                        token_uri[:80],
+                        updated_count,
+                        image_uri[:80],
+                    )
+
+                conn.commit()
+                logger.info(
+                    "本批处理完成，新增更新 %d 条，累计更新 %d 条",
+                    batch_updated,
+                    total_updated,
                 )
         finally:
             cur.close()
             conn.close()
             logger.info("数据库连接已关闭")
-
-        logger.info(
-            "本批处理完成，新增更新 %d 条，累计更新 %d 条",
-            batch_updated,
-            total_updated,
-        )
 
 
 if __name__ == "__main__":

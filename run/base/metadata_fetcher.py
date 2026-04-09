@@ -12,6 +12,9 @@
 """
 
 import asyncio
+import multiprocessing
+import os
+import socket
 import sys
 from typing import List, Optional, Set, Tuple
 
@@ -27,12 +30,16 @@ from common import (
     CONCURRENT_RPC,
     RPC_BATCH_SIZE,
     FETCH_IDLE_WAIT,
+    FETCH_CLAIM_BATCH_SIZE,
+    CLAIM_RETRY_AFTER_SECONDS,
     logger,
     get_conn,
     init_db,
-    load_pending_nfts,
+    ensure_temp_table_claim_columns,
+    claim_pending_nfts,
     batch_insert_main,
     delete_temp_nfts,
+    release_temp_claims,
     delete_contract_nfts,
     append_blacklist_env,
     fetch_alchemy_batch,
@@ -46,6 +53,7 @@ from common import (
 
 # tokenUri 黑名单前缀：匹配则视为无效，不写入主表
 _INVALID_URI_PREFIXES = ("api.tierlock.com/uri/",)
+FETCHER_WORKERS = max(int(os.getenv("FETCHER_WORKERS", "1")), 1)
 
 
 async def _process_batch(
@@ -175,8 +183,20 @@ async def _process_batch(
     return inserts, all_ids, onchain_image_contracts
 
 
-async def main() -> None:
-    logger.info("═══ Metadata 获取器启动 ═══  链: %s | RPC: %s", CHAIN_NAME, RPC_URL)
+def _build_worker_id(worker_index: int) -> str:
+    return f"{socket.gethostname()}:{os.getpid()}:worker-{worker_index}"
+
+
+async def _worker_main(worker_index: int) -> None:
+    worker_id = _build_worker_id(worker_index)
+    logger.info(
+        "═══ Metadata 获取器启动 ═══  链: %s | worker=%s | RPC: %s | claim_batch=%d | reclaim_after=%ds",
+        CHAIN_NAME,
+        worker_id,
+        RPC_URL,
+        FETCH_CLAIM_BATCH_SIZE,
+        CLAIM_RETRY_AFTER_SECONDS,
+    )
 
     # ── 连接节点（用于链上合约 fallback）────────────────────────────────────────
     w3 = AsyncWeb3(AsyncHTTPProvider(RPC_URL, request_kwargs={"timeout": 30}))
@@ -188,6 +208,7 @@ async def main() -> None:
     # ── 连接数据库 ────────────────────────────────────────────────────────────
     conn = get_conn()
     init_db(conn, CHAIN_NAME)
+    ensure_temp_table_claim_columns(conn, CHAIN_NAME)
 
     # 一次性修复：将主表中历史写入但未展开 {id} 的 ERC-1155 token URI 补全
     fixed = fix_token_id_placeholders(conn, CHAIN_NAME)
@@ -206,24 +227,46 @@ async def main() -> None:
         connector_owner=True,
     ) as session:
         while True:
-            pending = load_pending_nfts(conn, CHAIN_NAME)
+            pending = claim_pending_nfts(
+                conn,
+                CHAIN_NAME,
+                worker_id=worker_id,
+                batch_size=FETCH_CLAIM_BATCH_SIZE,
+                reclaim_after_seconds=CLAIM_RETRY_AFTER_SECONDS,
+            )
 
-            if len(pending) < 100:
+            if not pending:
                 logger.info(
-                    "临时表记录 %d 条（< 100），等待 %d 秒后重新拉取...",
-                    len(pending), FETCH_IDLE_WAIT,
+                    "worker=%s 未认领到记录，等待 %d 秒后重试...",
+                    worker_id,
+                    FETCH_IDLE_WAIT,
                 )
                 await asyncio.sleep(FETCH_IDLE_WAIT)
                 continue
 
-            logger.info("► 处理临时表 %d 条记录", len(pending))
-            inserts, all_ids, onchain_image_contracts = await _process_batch(
-                session,
-                w3,
-                alchemy_sem,
-                uri_sem,
-                pending,
-            )
+            logger.info("► worker=%s 认领并处理临时表 %d 条记录", worker_id, len(pending))
+            try:
+                inserts, all_ids, onchain_image_contracts = await _process_batch(
+                    session,
+                    w3,
+                    alchemy_sem,
+                    uri_sem,
+                    pending,
+                )
+            except Exception:
+                released = release_temp_claims(
+                    conn,
+                    CHAIN_NAME,
+                    [row[0] for row in pending],
+                    worker_id,
+                )
+                logger.exception(
+                    "worker=%s 批次处理失败，已释放 %d 条认领记录等待重试",
+                    worker_id,
+                    released,
+                )
+                await asyncio.sleep(1)
+                continue
             blacklisted_rows = sum(
                 1 for _, addr, _, _, _ in pending if addr in onchain_image_contracts
             )
@@ -261,8 +304,9 @@ async def main() -> None:
             total_inserted += inserted
             total_deleted += deleted
             logger.info(
-                "  本批: 写入主表 %d，从临时表删除 %d（无效丢弃 %d，黑名单合约 %d 个）"
+                "  worker=%s 本批: 写入主表 %d，从临时表删除 %d（无效丢弃 %d，黑名单合约 %d 个）"
                 " | 累计写入 %d，累计删除 %d",
+                worker_id,
                 inserted, deleted,
                 discarded,
                 len(onchain_image_contracts),
@@ -270,7 +314,45 @@ async def main() -> None:
             )
 
 
-if __name__ == "__main__":
+def _run_worker_process(worker_index: int) -> None:
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    asyncio.run(main())
+    asyncio.run(_worker_main(worker_index))
+
+
+def main() -> None:
+    if FETCHER_WORKERS <= 1:
+        _run_worker_process(1)
+        return
+
+    logger.info(
+        "启动 %d 个 metadata worker 进程；每进程并发: Alchemy=%d, RPC=%d",
+        FETCHER_WORKERS,
+        CONCURRENT_ALCHEMY,
+        CONCURRENT_RPC,
+    )
+    workers = [
+        multiprocessing.Process(
+            target=_run_worker_process,
+            args=(index,),
+            name=f"{CHAIN_NAME}-metadata-{index}",
+        )
+        for index in range(1, FETCHER_WORKERS + 1)
+    ]
+    for proc in workers:
+        proc.start()
+
+    try:
+        for proc in workers:
+            proc.join()
+    except KeyboardInterrupt:
+        logger.info("收到中断信号，准备停止所有 metadata worker...")
+        for proc in workers:
+            if proc.is_alive():
+                proc.terminate()
+        for proc in workers:
+            proc.join(timeout=5)
+
+
+if __name__ == "__main__":
+    main()
