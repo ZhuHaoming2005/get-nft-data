@@ -16,6 +16,7 @@ from urllib.parse import unquote
 
 import aiohttp
 import psycopg2
+from psycopg2.extras import execute_values
 from dotenv import load_dotenv
 from web3 import AsyncWeb3
 from web3.providers import AsyncHTTPProvider
@@ -87,6 +88,7 @@ METADATA_CONNECT_TIMEOUT = int(os.getenv("METADATA_CONNECT_TIMEOUT", "15"))
 ALCHEMY_API_KEY    = os.getenv("ALCHEMY_API_KEY", "")
 ALCHEMY_NETWORK    = os.getenv("ALCHEMY_NETWORK", "polygon-mainnet")
 ALCHEMY_BATCH_SIZE = int(os.getenv("ALCHEMY_BATCH_SIZE", "100"))
+RPC_BATCH_SIZE     = int(os.getenv("RPC_BATCH_SIZE", "100"))
 
 DEFI_BLACKLIST_ENV = os.getenv("DEFI_BLACKLIST", "")
 
@@ -99,6 +101,9 @@ SCAN_WINDOW = int(os.getenv("SCAN_WINDOW", "3"))
 # metadata_fetcher 专用
 # 无待处理记录时等待的秒数
 FETCH_IDLE_WAIT  = int(os.getenv("FETCH_IDLE_WAIT", "30"))
+_ERC721_TOKEN_URI_SELECTOR = "c87b56dd"
+_ERC1155_URI_SELECTOR = "0e89341c"
+DB_INSERT_PAGE_SIZE = int(os.getenv("DB_INSERT_PAGE_SIZE", "1000"))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -261,6 +266,7 @@ def load_pending_nfts(conn, chain_name: str) -> List[Tuple]:
             SELECT id, contract_address, token_id, token_standard, first_seen_block
             FROM {tmp}
             ORDER BY id
+            LIMIT 5000
             """,
         )
         result = [(row[0], row[1], int(row[2]), row[3], row[4]) for row in cur.fetchall()]
@@ -284,19 +290,25 @@ def batch_insert_main(conn, chain_name: str, records: List[Tuple]) -> int:
         return v.replace("\x00", "") if isinstance(v, str) else v
 
     records = [tuple(_clean(v) for v in rec) for rec in records]
+    sql = f"""
+        INSERT INTO {tbl}
+            (contract_address, token_id, token_uri, image_uri, token_standard, first_seen_block)
+        VALUES %s
+        ON CONFLICT (contract_address, token_id) DO NOTHING
+    """
+
+    inserted = 0
     with conn.cursor() as cur:
-        placeholders = ", ".join(["(%s, %s, %s, %s, %s, %s)"] * len(records))
-        flat = [item for rec in records for item in rec]
-        cur.execute(
-            f"""
-            INSERT INTO {tbl}
-                (contract_address, token_id, token_uri, image_uri, token_standard, first_seen_block)
-            VALUES {placeholders}
-            ON CONFLICT (contract_address, token_id) DO NOTHING
-            """,
-            flat,
-        )
-        inserted = cur.rowcount
+        for start in range(0, len(records), DB_INSERT_PAGE_SIZE):
+            page = records[start: start + DB_INSERT_PAGE_SIZE]
+            execute_values(
+                cur,
+                sql,
+                page,
+                template="(%s, %s, %s, %s, %s, %s)",
+                page_size=len(page),
+            )
+            inserted += max(cur.rowcount, 0)
     conn.commit()
     return inserted
 
@@ -558,6 +570,111 @@ async def fetch_token_uri(
             return uri
         except Exception:
             return None
+
+
+def _build_token_uri_call_data(token_id: int, standard: str) -> str:
+    selector = (
+        _ERC721_TOKEN_URI_SELECTOR if standard == "ERC-721" else _ERC1155_URI_SELECTOR
+    )
+    return "0x" + selector + format(token_id, "064x")
+
+
+def _decode_abi_string_result(result: object) -> Optional[str]:
+    if not isinstance(result, str) or not result.startswith("0x"):
+        return None
+    try:
+        raw = bytes.fromhex(result[2:])
+    except ValueError:
+        return None
+    if len(raw) < 64:
+        return None
+
+    offset = int.from_bytes(raw[:32], "big")
+    if offset + 32 > len(raw):
+        return None
+
+    strlen = int.from_bytes(raw[offset: offset + 32], "big")
+    start = offset + 32
+    end = start + strlen
+    if end > len(raw):
+        return None
+
+    try:
+        return raw[start:end].decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+async def fetch_token_uri_batch(
+    session: aiohttp.ClientSession,
+    rpc_url: str,
+    sem: asyncio.Semaphore,
+    tokens: List[Tuple[str, int, str]],
+) -> List[Optional[str]]:
+    """通过单次 JSON-RPC batch eth_call 批量获取 tokenURI/uri。"""
+    if not tokens:
+        return []
+
+    payload = [
+        {
+            "jsonrpc": "2.0",
+            "id": idx,
+            "method": "eth_call",
+            "params": [
+                {
+                    "to": contract_address,
+                    "data": _build_token_uri_call_data(token_id, standard),
+                },
+                "latest",
+            ],
+        }
+        for idx, (contract_address, token_id, standard) in enumerate(tokens)
+    ]
+    timeout = aiohttp.ClientTimeout(
+        total=METADATA_TIMEOUT, connect=METADATA_CONNECT_TIMEOUT
+    )
+
+    max_retries = 3
+    async with sem:
+        data = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                async with session.post(rpc_url, json=payload, timeout=timeout) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json(content_type=None)
+                if not isinstance(data, list):
+                    raise ValueError("RPC batch response is not a list")
+                break
+            except Exception as exc:
+                if attempt < max_retries:
+                    wait = 2 ** (attempt - 1)
+                    logger.warning(
+                        "RPC batch 第 %d/%d 次失败 %d tokens: [%s] %s，%.0fs 后重试",
+                        attempt, max_retries, len(tokens), type(exc).__name__, exc, wait,
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    logger.info(
+                        "RPC batch 全部重试失败（%d 次）%d tokens: [%s] %s",
+                        max_retries, len(tokens), type(exc).__name__, exc,
+                    )
+                    return [None] * len(tokens)
+
+    results: List[Optional[str]] = [None] * len(tokens)
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        idx = item.get("id")
+        if not isinstance(idx, int) or idx < 0 or idx >= len(tokens):
+            continue
+        if item.get("error"):
+            continue
+
+        uri = _decode_abi_string_result(item.get("result"))
+        if uri and "{id}" in uri:
+            uri = uri.replace("{id}", str(tokens[idx][1]))
+        results[idx] = uri
+    return results
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -25,6 +25,7 @@ from common import (
     ALCHEMY_BATCH_SIZE,
     CONCURRENT_ALCHEMY,
     CONCURRENT_RPC,
+    RPC_BATCH_SIZE,
     FETCH_IDLE_WAIT,
     logger,
     get_conn,
@@ -35,6 +36,7 @@ from common import (
     delete_contract_nfts,
     append_blacklist_env,
     fetch_alchemy_batch,
+    fetch_token_uri_batch,
     fetch_token_uri,
     _decode_inline_image,
     replace_token_id_placeholder,
@@ -47,7 +49,10 @@ _INVALID_URI_PREFIXES = ("api.tierlock.com/uri/",)
 
 
 async def _process_batch(
+    session: aiohttp.ClientSession,
     w3: AsyncWeb3,
+    alchemy_sem: asyncio.Semaphore,
+    uri_sem: asyncio.Semaphore,
     pending: List[Tuple],
 ) -> Tuple[List[Tuple], List[int], Set[str]]:
     """
@@ -64,16 +69,14 @@ async def _process_batch(
     all_ids = [row[0] for row in pending]
 
     # ── 步骤1：并发批量调 Alchemy API ──────────────────────────────────────────
-    alchemy_sem = asyncio.Semaphore(CONCURRENT_ALCHEMY)
     chunks = [
         tokens[i: i + ALCHEMY_BATCH_SIZE]
         for i in range(0, len(tokens), ALCHEMY_BATCH_SIZE)
     ]
-    async with aiohttp.ClientSession(trust_env=True) as session:
-        chunk_results = list(await asyncio.gather(*[
-            fetch_alchemy_batch(session, alchemy_sem, chunk)
-            for chunk in chunks
-        ])) if chunks else []
+    chunk_results = await asyncio.gather(*[
+        fetch_alchemy_batch(session, alchemy_sem, chunk)
+        for chunk in chunks
+    ]) if chunks else []
 
     alchemy_results: List[Tuple[Optional[str], Optional[str]]] = [
         item for chunk in chunk_results for item in chunk
@@ -82,14 +85,32 @@ async def _process_batch(
     # ── 步骤2：tokenUri 为空时 fallback 到链上合约（异步并发）──────────────────
     fallback_indices = [i for i, (uri, _) in enumerate(alchemy_results) if not uri]
     if fallback_indices:
-        uri_sem = asyncio.Semaphore(CONCURRENT_RPC)
-        fallback_uris: List[Optional[str]] = list(await asyncio.gather(*[
-            fetch_token_uri(
-                w3, uri_sem,
-                tokens[i][0], tokens[i][1], tokens[i][2],
-            )
-            for i in fallback_indices
-        ]))
+        fallback_tokens = [tokens[i] for i in fallback_indices]
+        rpc_chunks = [
+            fallback_tokens[i: i + RPC_BATCH_SIZE]
+            for i in range(0, len(fallback_tokens), RPC_BATCH_SIZE)
+        ]
+        chunk_uris = await asyncio.gather(*[
+            fetch_token_uri_batch(session, RPC_URL, uri_sem, chunk)
+            for chunk in rpc_chunks
+        ])
+        fallback_uris = [uri for chunk in chunk_uris for uri in chunk]
+
+        missing_positions = [pos for pos, uri in enumerate(fallback_uris) if not uri]
+        if missing_positions:
+            legacy_uris: List[Optional[str]] = list(await asyncio.gather(*[
+                fetch_token_uri(
+                    w3,
+                    uri_sem,
+                    fallback_tokens[pos][0],
+                    fallback_tokens[pos][1],
+                    fallback_tokens[pos][2],
+                )
+                for pos in missing_positions
+            ]))
+            for pos, uri in zip(missing_positions, legacy_uris):
+                fallback_uris[pos] = uri
+
         for idx, chain_uri in zip(fallback_indices, fallback_uris):
             _, img = alchemy_results[idx]
             alchemy_results[idx] = (chain_uri, img)
@@ -154,59 +175,79 @@ async def main() -> None:
         logger.info("历史记录 {id} 占位符修复完成，共更新 %d 条", fixed)
 
     total_inserted = total_deleted = 0
+    alchemy_sem = asyncio.Semaphore(CONCURRENT_ALCHEMY)
+    uri_sem = asyncio.Semaphore(CONCURRENT_RPC)
+    connector = aiohttp.TCPConnector(limit=max(CONCURRENT_ALCHEMY * 2, 20), ttl_dns_cache=300)
 
     # ── 主循环：持续消费临时表 ────────────────────────────────────────────────
-    while True:
-        pending = load_pending_nfts(conn, CHAIN_NAME)
+    async with aiohttp.ClientSession(
+        trust_env=True,
+        connector=connector,
+        connector_owner=True,
+    ) as session:
+        while True:
+            pending = load_pending_nfts(conn, CHAIN_NAME)
 
-        if len(pending) < 100:
-            logger.info(
-                "临时表记录 %d 条（< 100），等待 %d 秒后重新拉取...",
-                len(pending), FETCH_IDLE_WAIT,
+            if len(pending) < 100:
+                logger.info(
+                    "临时表记录 %d 条（< 100），等待 %d 秒后重新拉取...",
+                    len(pending), FETCH_IDLE_WAIT,
+                )
+                await asyncio.sleep(FETCH_IDLE_WAIT)
+                continue
+
+            logger.info("► 处理临时表 %d 条记录", len(pending))
+            inserts, all_ids, onchain_image_contracts = await _process_batch(
+                session,
+                w3,
+                alchemy_sem,
+                uri_sem,
+                pending,
             )
-            await asyncio.sleep(FETCH_IDLE_WAIT)
-            continue
-
-        logger.info("► 处理临时表 %d 条记录", len(pending))
-        inserts, all_ids, onchain_image_contracts = await _process_batch(w3, pending)
-
-        # ── 处理链上存储图像合约（data:image）────────────────────────────────
-        if onchain_image_contracts:
-            logger.info(
-                "  检测到 %d 个链上存储图像合约（image_uri 以 data:image 开头），"
-                "加入黑名单: %s",
-                len(onchain_image_contracts), sorted(onchain_image_contracts),
+            blacklisted_rows = sum(
+                1 for _, addr, _, _, _ in pending if addr in onchain_image_contracts
             )
-            # 1. 更新 .env 黑名单（持久化，重启后生效）
-            append_blacklist_env(onchain_image_contracts)
-            # 2. 清除数据库中该合约的所有历史记录（主表 + 临时表）
-            main_del, temp_del = delete_contract_nfts(conn, CHAIN_NAME, onchain_image_contracts)
+
+            # ── 处理链上存储图像合约（data:image）────────────────────────────
+            if onchain_image_contracts:
+                logger.info(
+                    "  检测到 %d 个链上存储图像合约（image_uri 以 data:image 开头），"
+                    "加入黑名单: %s",
+                    len(onchain_image_contracts), sorted(onchain_image_contracts),
+                )
+                # 1. 更新 .env 黑名单（持久化，重启后生效）
+                append_blacklist_env(onchain_image_contracts)
+                # 2. 清除数据库中该合约的所有历史记录（主表 + 临时表）
+                main_del, temp_del = delete_contract_nfts(
+                    conn, CHAIN_NAME, onchain_image_contracts
+                )
+                logger.info(
+                    "  黑名单清库完成: 主表删除 %d 条，临时表删除 %d 条",
+                    main_del, temp_del,
+                )
+                # 重新过滤 all_ids（临时表中属于黑名单合约的记录已在上一步按地址删除）
+                blacklisted_set = onchain_image_contracts
+                all_ids = [
+                    rid for rid, row in zip(all_ids, pending)
+                    if row[1] not in blacklisted_set
+                ]
+
+            # 有效记录写主表
+            inserted = batch_insert_main(conn, CHAIN_NAME, inserts)
+            # 全部处理过的记录从临时表删除
+            deleted = delete_temp_nfts(conn, CHAIN_NAME, all_ids)
+            discarded = len(pending) - len(inserts) - blacklisted_rows
+
+            total_inserted += inserted
+            total_deleted += deleted
             logger.info(
-                "  黑名单清库完成: 主表删除 %d 条，临时表删除 %d 条",
-                main_del, temp_del,
+                "  本批: 写入主表 %d，从临时表删除 %d（无效丢弃 %d，黑名单合约 %d 个）"
+                " | 累计写入 %d，累计删除 %d",
+                inserted, deleted,
+                discarded,
+                len(onchain_image_contracts),
+                total_inserted, total_deleted,
             )
-            # 重新过滤 all_ids（临时表中属于黑名单合约的记录已在上一步按地址删除）
-            blacklisted_set = onchain_image_contracts
-            all_ids = [
-                rid for rid, row in zip(all_ids, pending)
-                if row[1] not in blacklisted_set
-            ]
-
-        # 有效记录写主表
-        inserted = batch_insert_main(conn, CHAIN_NAME, inserts)
-        # 全部处理过的记录从临时表删除
-        deleted  = delete_temp_nfts(conn, CHAIN_NAME, all_ids)
-
-        total_inserted += inserted
-        total_deleted  += deleted
-        logger.info(
-            "  本批: 写入主表 %d，从临时表删除 %d（无效丢弃 %d，黑名单合约 %d 个）"
-            " | 累计写入 %d，累计删除 %d",
-            inserted, deleted,
-            len(pending) - len(inserts) - len(onchain_image_contracts),
-            len(onchain_image_contracts),
-            total_inserted, total_deleted,
-        )
 
 
 if __name__ == "__main__":
