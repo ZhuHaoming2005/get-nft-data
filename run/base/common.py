@@ -11,11 +11,12 @@ import logging
 import os
 import re
 import sys
-from typing import List, Optional, Set, Tuple
+from typing import Any, List, Optional, Set, Tuple
 from urllib.parse import unquote
 
 import aiohttp
 import psycopg2
+from psycopg2.extras import execute_values
 from dotenv import load_dotenv
 from web3 import AsyncWeb3
 from web3.providers import AsyncHTTPProvider
@@ -87,6 +88,7 @@ METADATA_CONNECT_TIMEOUT = int(os.getenv("METADATA_CONNECT_TIMEOUT", "15"))
 ALCHEMY_API_KEY    = os.getenv("ALCHEMY_API_KEY", "")
 ALCHEMY_NETWORK    = os.getenv("ALCHEMY_NETWORK", "polygon-mainnet")
 ALCHEMY_BATCH_SIZE = int(os.getenv("ALCHEMY_BATCH_SIZE", "100"))
+RPC_BATCH_SIZE     = int(os.getenv("RPC_BATCH_SIZE", "100"))
 
 DEFI_BLACKLIST_ENV = os.getenv("DEFI_BLACKLIST", "")
 
@@ -99,6 +101,9 @@ SCAN_WINDOW = int(os.getenv("SCAN_WINDOW", "3"))
 # metadata_fetcher 专用
 # 无待处理记录时等待的秒数
 FETCH_IDLE_WAIT  = int(os.getenv("FETCH_IDLE_WAIT", "30"))
+_ERC721_TOKEN_URI_SELECTOR = "c87b56dd"
+_ERC1155_URI_SELECTOR = "0e89341c"
+DB_INSERT_PAGE_SIZE = int(os.getenv("DB_INSERT_PAGE_SIZE", "1000"))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -153,6 +158,9 @@ def init_db(conn, chain_name: str) -> None:
                 token_id         NUMERIC      NOT NULL,
                 token_uri        TEXT,
                 image_uri        TEXT,
+                name             TEXT,
+                symbol           TEXT,
+                metadata         JSONB,
                 token_standard   VARCHAR(10),
                 first_seen_block BIGINT,
                 created_at       TIMESTAMPTZ  DEFAULT NOW(),
@@ -177,8 +185,20 @@ def init_db(conn, chain_name: str) -> None:
         cur.execute(
             f"CREATE INDEX IF NOT EXISTS idx_temp_contract ON {tmp} (contract_address)"
         )
+    ensure_main_table_columns(conn, chain_name)
     conn.commit()
     logger.info("数据库表初始化完成: 主表=%s  临时表=%s", tbl, tmp)
+
+
+def ensure_main_table_columns(conn, chain_name: str) -> None:
+    """确保主表扩展列存在；供 metadata_fetcher 启动时显式补列。"""
+    tbl = _nft_table_name(chain_name)
+    with conn.cursor() as cur:
+        cur.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS name TEXT")
+        cur.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS symbol TEXT")
+        cur.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS metadata JSONB")
+    conn.commit()
+    logger.info("主表扩展列检查完成: %s (name, symbol, metadata)", tbl)
 
 
 def load_seen_nfts(conn, chain_name: str) -> Set[Tuple[str, int]]:
@@ -275,7 +295,13 @@ def load_pending_nfts(conn, chain_name: str) -> List[Tuple]:
 def batch_insert_main(conn, chain_name: str, records: List[Tuple]) -> int:
     """
     metadata_fetcher 专用：将有效 NFT 记录批量写入主表。
-    records: [(contract_address, token_id, token_uri, image_uri, token_standard, first_seen_block), ...]
+    records: [
+        (
+            contract_address, token_id, token_uri, image_uri,
+            name, symbol, metadata, token_standard, first_seen_block,
+        ),
+        ...
+    ]
     """
     if not records:
         return 0
@@ -284,20 +310,36 @@ def batch_insert_main(conn, chain_name: str, records: List[Tuple]) -> int:
     def _clean(v):
         return v.replace("\x00", "") if isinstance(v, str) else v
 
-    records = [tuple(_clean(v) for v in rec) for rec in records]
+    def _normalize(rec: Tuple[Any, ...]) -> Tuple[Any, ...]:
+        cleaned = tuple(_clean(v) for v in rec)
+        metadata = cleaned[6]
+        if metadata is not None and not isinstance(metadata, str):
+            metadata = _json.dumps(metadata, ensure_ascii=False)
+        return cleaned[:6] + (metadata,) + cleaned[7:]
+
+    records = [_normalize(rec) for rec in records]
+    sql = f"""
+        INSERT INTO {tbl}
+            (
+                contract_address, token_id, token_uri, image_uri,
+                name, symbol, metadata, token_standard, first_seen_block
+            )
+        VALUES %s
+        ON CONFLICT (contract_address, token_id) DO NOTHING
+    """
+
+    inserted = 0
     with conn.cursor() as cur:
-        placeholders = ", ".join(["(%s, %s, %s, %s, %s, %s)"] * len(records))
-        flat = [item for rec in records for item in rec]
-        cur.execute(
-            f"""
-            INSERT INTO {tbl}
-                (contract_address, token_id, token_uri, image_uri, token_standard, first_seen_block)
-            VALUES {placeholders}
-            ON CONFLICT (contract_address, token_id) DO NOTHING
-            """,
-            flat,
-        )
-        inserted = cur.rowcount
+        for start in range(0, len(records), DB_INSERT_PAGE_SIZE):
+            page = records[start: start + DB_INSERT_PAGE_SIZE]
+            execute_values(
+                cur,
+                sql,
+                page,
+                template="(%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)",
+                page_size=len(page),
+            )
+            inserted += max(cur.rowcount, 0)
     conn.commit()
     return inserted
 
@@ -465,11 +507,13 @@ async def fetch_alchemy_batch(
     session: aiohttp.ClientSession,
     sem: asyncio.Semaphore,
     tokens: List[Tuple[str, int, str]],
-) -> List[Tuple[Optional[str], Optional[str]]]:
+) -> List[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[Any]]]:
     """
     调用 Alchemy getNFTMetadataBatch，批量获取 NFT 元数据。
     tokens: [(contract_address, token_id, standard), ...]
-    返回与 tokens 同序的 [(token_uri, image_url), ...]，失败条目为 (None, None)。
+    返回与 tokens 同序的
+    [(token_uri, image_url, contract_name, contract_symbol, metadata), ...]，
+    失败条目为 (None, None, None, None, None)。
     """
     def _to_alchemy_type(std: str) -> str:
         return std.replace("-", "")
@@ -516,24 +560,32 @@ async def fetch_alchemy_batch(
                         "Alchemy batch 全部重试失败（%d 次）%d tokens: [%s] %s",
                         max_retries, len(tokens), type(exc).__name__, exc,
                     )
-                    return [(None, None)] * len(tokens)
+                    return [(None, None, None, None, None)] * len(tokens)
 
     nft_list = data if isinstance(data, list) else data.get("nfts", [])
-    results: List[Tuple[Optional[str], Optional[str]]] = []
+    results: List[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[Any]]] = []
     for nft in nft_list:
         raw = nft.get("raw") or {}
         if raw.get("error"):
-            results.append((None, None))
+            results.append((None, None, None, None, None))
             continue
         token_uri: Optional[str] = raw.get("tokenUri") or None
         image_url: Optional[str] = None
+        contract_name: Optional[str] = None
+        contract_symbol: Optional[str] = None
+        metadata: Optional[Any] = None
         raw_meta = raw.get("metadata")
         if isinstance(raw_meta, dict):
             image_url = raw_meta.get("image") or None
-        results.append((token_uri, image_url))
+            metadata = raw_meta
+        contract = nft.get("contract")
+        if isinstance(contract, dict):
+            contract_name = contract.get("name") or None
+            contract_symbol = contract.get("symbol") or None
+        results.append((token_uri, image_url, contract_name, contract_symbol, metadata))
 
     while len(results) < len(tokens):
-        results.append((None, None))
+        results.append((None, None, None, None, None))
     return results
 
 
@@ -559,6 +611,111 @@ async def fetch_token_uri(
             return uri
         except Exception:
             return None
+
+
+def _build_token_uri_call_data(token_id: int, standard: str) -> str:
+    selector = (
+        _ERC721_TOKEN_URI_SELECTOR if standard == "ERC-721" else _ERC1155_URI_SELECTOR
+    )
+    return "0x" + selector + format(token_id, "064x")
+
+
+def _decode_abi_string_result(result: object) -> Optional[str]:
+    if not isinstance(result, str) or not result.startswith("0x"):
+        return None
+    try:
+        raw = bytes.fromhex(result[2:])
+    except ValueError:
+        return None
+    if len(raw) < 64:
+        return None
+
+    offset = int.from_bytes(raw[:32], "big")
+    if offset + 32 > len(raw):
+        return None
+
+    strlen = int.from_bytes(raw[offset: offset + 32], "big")
+    start = offset + 32
+    end = start + strlen
+    if end > len(raw):
+        return None
+
+    try:
+        return raw[start:end].decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+async def fetch_token_uri_batch(
+    session: aiohttp.ClientSession,
+    rpc_url: str,
+    sem: asyncio.Semaphore,
+    tokens: List[Tuple[str, int, str]],
+) -> List[Optional[str]]:
+    """通过单次 JSON-RPC batch eth_call 批量获取 tokenURI/uri。"""
+    if not tokens:
+        return []
+
+    payload = [
+        {
+            "jsonrpc": "2.0",
+            "id": idx,
+            "method": "eth_call",
+            "params": [
+                {
+                    "to": contract_address,
+                    "data": _build_token_uri_call_data(token_id, standard),
+                },
+                "latest",
+            ],
+        }
+        for idx, (contract_address, token_id, standard) in enumerate(tokens)
+    ]
+    timeout = aiohttp.ClientTimeout(
+        total=METADATA_TIMEOUT, connect=METADATA_CONNECT_TIMEOUT
+    )
+
+    max_retries = 3
+    async with sem:
+        data = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                async with session.post(rpc_url, json=payload, timeout=timeout) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json(content_type=None)
+                if not isinstance(data, list):
+                    raise ValueError("RPC batch response is not a list")
+                break
+            except Exception as exc:
+                if attempt < max_retries:
+                    wait = 2 ** (attempt - 1)
+                    logger.warning(
+                        "RPC batch 第 %d/%d 次失败 %d tokens: [%s] %s，%.0fs 后重试",
+                        attempt, max_retries, len(tokens), type(exc).__name__, exc, wait,
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    logger.info(
+                        "RPC batch 全部重试失败（%d 次）%d tokens: [%s] %s",
+                        max_retries, len(tokens), type(exc).__name__, exc,
+                    )
+                    return [None] * len(tokens)
+
+    results: List[Optional[str]] = [None] * len(tokens)
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        idx = item.get("id")
+        if not isinstance(idx, int) or idx < 0 or idx >= len(tokens):
+            continue
+        if item.get("error"):
+            continue
+
+        uri = _decode_abi_string_result(item.get("result"))
+        if uri and "{id}" in uri:
+            uri = uri.replace("{id}", str(tokens[idx][1]))
+        results[idx] = uri
+    return results
 
 
 # ══════════════════════════════════════════════════════════════════════════════
