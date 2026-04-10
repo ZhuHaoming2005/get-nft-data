@@ -713,7 +713,7 @@ async def fetch_alchemy_batch(
         metadata: Optional[Any] = None
         raw_meta = raw.get("metadata")
         if isinstance(raw_meta, dict):
-            image_url = raw_meta.get("image") or None
+            image_url = raw_meta.get("image") or raw_meta.get("image_url") or nft.get("image").get("originalUrl") or None
             metadata = raw_meta
         contract = nft.get("contract")
         if isinstance(contract, dict):
