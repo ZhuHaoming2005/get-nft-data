@@ -34,7 +34,7 @@ import logging
 import os
 import re
 import sys
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import aiohttp
 import psycopg2
@@ -66,6 +66,11 @@ METADATA_BACKFILL_MODE = os.getenv("METADATA_BACKFILL_MODE", "alchemy").strip().
 METADATA_BACKFILL_SEGMENT_SIZE = int(os.getenv("METADATA_BACKFILL_SEGMENT_SIZE", "1000"))
 METADATA_BACKFILL_BATCH_SIZE = int(os.getenv("METADATA_BACKFILL_BATCH_SIZE", "100"))
 METADATA_BACKFILL_WORKERS = int(os.getenv("METADATA_BACKFILL_WORKERS", "5"))
+METADATA_BACKFILL_RETRY_MAX_ATTEMPTS = max(1, int(os.getenv("METADATA_BACKFILL_RETRY_MAX_ATTEMPTS", "3")))
+METADATA_BACKFILL_RETRY_BASE_DELAY_SECONDS = max(
+    0.0,
+    float(os.getenv("METADATA_BACKFILL_RETRY_BASE_DELAY_SECONDS", "1")),
+)
 METADATA_TIMEOUT = int(os.getenv("METADATA_TIMEOUT", "15"))
 METADATA_CONNECT_TIMEOUT = int(os.getenv("METADATA_CONNECT_TIMEOUT", "15"))
 
@@ -104,6 +109,17 @@ def _conn():
         password=DB_PASS,
         connect_timeout=10,
     )
+
+
+def _safe_close(conn) -> None:
+    if conn is None:
+        return
+    close = getattr(conn, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
 
 
 def _alchemy_network(chain: str) -> str:
@@ -218,6 +234,48 @@ def _extract_image_from_metadata(nft: Dict, metadata: Optional[Dict]) -> Optiona
     return None
 
 
+async def _retry_async(
+    action,
+    *,
+    operation_name: str,
+    chain: str,
+    swallow_exception: bool,
+    fallback: Any = None,
+):
+    last_error: Exception | None = None
+    for attempt in range(1, METADATA_BACKFILL_RETRY_MAX_ATTEMPTS + 1):
+        try:
+            return await action()
+        except Exception as exc:
+            last_error = exc
+            if attempt >= METADATA_BACKFILL_RETRY_MAX_ATTEMPTS:
+                logger.exception(
+                    "链 %s %s 失败，重试 %d 次后仍未恢复",
+                    chain,
+                    operation_name,
+                    METADATA_BACKFILL_RETRY_MAX_ATTEMPTS,
+                )
+                if swallow_exception:
+                    return fallback
+                raise
+
+            delay = METADATA_BACKFILL_RETRY_BASE_DELAY_SECONDS * attempt
+            logger.warning(
+                "链 %s %s 失败，将在 %.1f 秒后进行第 %d/%d 次重试: %s",
+                chain,
+                operation_name,
+                delay,
+                attempt + 1,
+                METADATA_BACKFILL_RETRY_MAX_ATTEMPTS,
+                exc,
+            )
+            await asyncio.sleep(delay)
+
+    if swallow_exception:
+        return fallback
+    raise last_error if last_error is not None else RuntimeError(f"{operation_name} failed")
+
+
 async def fetch_alchemy_batch(
     session: aiohttp.ClientSession,
     chain: str,
@@ -257,6 +315,24 @@ async def fetch_alchemy_batch(
         metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else None
         results.append((row_id, metadata, _extract_image_from_metadata(nft, metadata)))
     return results
+
+
+async def _fetch_alchemy_batch_with_retry(
+    session: aiohttp.ClientSession,
+    chain: str,
+    sem: asyncio.Semaphore,
+    rows: List[Tuple[int, str, int, Optional[str]]],
+    *,
+    batch_index: int,
+    total_batches: int,
+) -> List[Tuple[int, Optional[Dict], Optional[str]]]:
+    return await _retry_async(
+        lambda: fetch_alchemy_batch(session, chain, sem, rows),
+        operation_name=f"Alchemy 批次请求 {batch_index}/{total_batches}",
+        chain=chain,
+        swallow_exception=True,
+        fallback=[],
+    )
 
 
 def _metadata_url(token_uri: str, ipfs_gateway: Optional[str] = None) -> str:
@@ -325,6 +401,24 @@ async def fetch_token_uri_metadata_batch(
     )
 
 
+async def _fetch_token_uri_metadata_batch_with_retry(
+    session: aiohttp.ClientSession,
+    chain: str,
+    sem: asyncio.Semaphore,
+    rows: List[Tuple[int, str]],
+    *,
+    batch_index: int,
+    total_batches: int,
+) -> List[Tuple[int, Optional[Dict], Optional[str]]]:
+    return await _retry_async(
+        lambda: fetch_token_uri_metadata_batch(session, sem, rows),
+        operation_name=f"token_uri 批次请求 {batch_index}/{total_batches}",
+        chain=chain,
+        swallow_exception=True,
+        fallback=[],
+    )
+
+
 async def _process_chain(chain: str) -> int:
     conn = _conn()
     try:
@@ -357,15 +451,35 @@ async def _process_chain(chain: str) -> int:
                 if METADATA_BACKFILL_MODE == "alchemy":
                     payload_rows = [(row[0], row[1], row[2], row[3]) for row in rows]
                     batches = _split_batches(payload_rows, METADATA_BACKFILL_BATCH_SIZE)
-                    parts = await asyncio.gather(
-                        *[fetch_alchemy_batch(session, chain, sem, batch) for batch in batches]
-                    )
+                    parts = []
+                    total_batches = len(batches)
+                    for batch_index, batch in enumerate(batches, start=1):
+                        parts.append(
+                            await _fetch_alchemy_batch_with_retry(
+                                session,
+                                chain,
+                                sem,
+                                batch,
+                                batch_index=batch_index,
+                                total_batches=total_batches,
+                            )
+                        )
                 elif METADATA_BACKFILL_MODE == "token_uri":
                     payload_rows = [(row[0], row[4]) for row in rows if row[4]]
                     batches = _split_batches(payload_rows, METADATA_BACKFILL_BATCH_SIZE)
-                    parts = await asyncio.gather(
-                        *[fetch_token_uri_metadata_batch(session, sem, batch) for batch in batches]
-                    ) if batches else []
+                    parts = []
+                    total_batches = len(batches)
+                    for batch_index, batch in enumerate(batches, start=1):
+                        parts.append(
+                            await _fetch_token_uri_metadata_batch_with_retry(
+                                session,
+                                chain,
+                                sem,
+                                batch,
+                                batch_index=batch_index,
+                                total_batches=total_batches,
+                            )
+                        )
                 else:
                     raise ValueError(f"不支持的 METADATA_BACKFILL_MODE: {METADATA_BACKFILL_MODE}")
 
@@ -382,13 +496,16 @@ async def _process_chain(chain: str) -> int:
         logger.info("链 %s metadata 回填完成，共更新 %d 条", chain, total_updated)
         return total_updated
     finally:
-        conn.close()
+        _safe_close(conn)
 
 
 async def _amain() -> None:
     grand_total = 0
     for chain in METADATA_BACKFILL_CHAINS:
-        grand_total += await _process_chain(chain)
+        try:
+            grand_total += await _process_chain(chain)
+        except Exception:
+            logger.exception("链 %s metadata 回填失败，已跳过并继续下一条链", chain)
     logger.info("全部 metadata 回填完成，共更新 %d 条", grand_total)
 
 
