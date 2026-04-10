@@ -41,7 +41,7 @@ DB_NAME = os.getenv("DB_NAME", "nft_data")
 DB_USER = os.getenv("DB_USER", "postgres")
 DB_PASS = os.getenv("DB_PASS", "")
 
-DEFAULT_CHAINS = os.getenv("CHAIN_NAMES", "ethereum,base,polygon").split(",")
+DEFAULT_CHAINS = os.getenv("CHAIN_NAME", "ethereum,base,polygon").split(",")
 DEFAULT_BATCH_SIZE = 1000
 
 for _stream in (sys.stdout, sys.stderr):
