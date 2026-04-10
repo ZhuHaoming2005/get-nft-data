@@ -22,6 +22,7 @@ import logging
 import os
 import re
 import sys
+import time
 from typing import Any, Iterable, Iterator
 
 import psycopg2
@@ -43,6 +44,8 @@ DB_PASS = os.getenv("DB_PASS", "")
 
 DEFAULT_CHAINS = os.getenv("CHAIN_NAME", "ethereum,base,polygon").split(",")
 DEFAULT_BATCH_SIZE = 1000
+RETRY_MAX_ATTEMPTS = max(1, int(os.getenv("BACKFILL_RETRY_MAX_ATTEMPTS", "3")))
+RETRY_BASE_DELAY_SECONDS = max(0.0, float(os.getenv("BACKFILL_RETRY_BASE_DELAY_SECONDS", "1")))
 
 for _stream in (sys.stdout, sys.stderr):
     reconfigure = getattr(_stream, "reconfigure", None)
@@ -113,6 +116,79 @@ def _conn():
         user=DB_USER,
         password=DB_PASS,
         connect_timeout=10,
+    )
+
+
+def _safe_rollback(conn) -> None:
+    rollback = getattr(conn, "rollback", None)
+    if callable(rollback):
+        try:
+            rollback()
+        except Exception:
+            pass
+
+
+def _safe_close(conn) -> None:
+    if conn is None:
+        return
+    close = getattr(conn, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
+
+
+def _retry_call(
+    action,
+    *,
+    operation_name: str,
+    chain: str,
+    swallow_exception: bool,
+    fallback: Any = None,
+    conn=None,
+):
+    last_error: Exception | None = None
+    for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
+        try:
+            return action()
+        except Exception as exc:
+            last_error = exc
+            _safe_rollback(conn)
+            if attempt >= RETRY_MAX_ATTEMPTS:
+                log.exception(
+                    "链 %s %s 失败，重试 %d 次后仍未恢复",
+                    chain,
+                    operation_name,
+                    RETRY_MAX_ATTEMPTS,
+                )
+                if swallow_exception:
+                    return fallback
+                raise
+
+            delay = RETRY_BASE_DELAY_SECONDS * attempt
+            log.warning(
+                "链 %s %s 失败，将在 %.1f 秒后进行第 %d/%d 次重试: %s",
+                chain,
+                operation_name,
+                delay,
+                attempt + 1,
+                RETRY_MAX_ATTEMPTS,
+                exc,
+            )
+            time.sleep(delay)
+
+    if swallow_exception:
+        return fallback
+    raise last_error if last_error is not None else RuntimeError(f"{operation_name} failed")
+
+
+def _connect_with_retry(chain: str):
+    return _retry_call(
+        _conn,
+        operation_name="建立数据库连接",
+        chain=chain,
+        swallow_exception=False,
     )
 
 
@@ -269,6 +345,30 @@ def _fetch_batch(
         return cur.fetchall()
 
 
+def _fetch_batch_with_retry(
+    conn,
+    table: str,
+    *,
+    chain: str,
+    last_id: int,
+    batch_size: int,
+    remaining: int | None,
+) -> list[tuple[int, str, Any]]:
+    return _retry_call(
+        lambda: _fetch_batch(
+            conn,
+            table,
+            last_id=last_id,
+            batch_size=batch_size,
+            remaining=remaining,
+        ),
+        operation_name=f"读取批次(last_id={last_id})",
+        chain=chain,
+        swallow_exception=False,
+        conn=conn,
+    )
+
+
 def _bulk_update(conn, table: str, rows: list[tuple[int, str]]) -> int:
     if not rows:
         return 0
@@ -291,6 +391,23 @@ def _bulk_update(conn, table: str, rows: list[tuple[int, str]]) -> int:
     return updated
 
 
+def _bulk_update_with_retry(
+    conn,
+    table: str,
+    rows: list[tuple[int, str]],
+    *,
+    chain: str,
+    last_id: int,
+) -> int:
+    return _retry_call(
+        lambda: _bulk_update(conn, table, rows),
+        operation_name=f"写回批次(last_id={last_id})",
+        chain=chain,
+        swallow_exception=False,
+        conn=conn,
+    )
+
+
 def _process_chain(
     conn,
     chain: str,
@@ -301,7 +418,15 @@ def _process_chain(
 ) -> tuple[int, int, int]:
     table = _table(chain)
     required_columns = ("id", "metadata", "image_uri")
-    if not _has_columns(conn, table, required_columns):
+    has_columns = _retry_call(
+        lambda: _has_columns(conn, table, required_columns),
+        operation_name="检查表结构",
+        chain=chain,
+        swallow_exception=True,
+        fallback=False,
+        conn=conn,
+    )
+    if not has_columns:
         log.warning("链 %s 跳过：表 %s 缺少必要列 %s", chain, table, ",".join(required_columns))
         return 0, 0, 0
 
@@ -310,13 +435,18 @@ def _process_chain(
     remaining = limit
 
     while True:
-        rows = _fetch_batch(
-            conn,
-            table,
-            last_id=last_id,
-            batch_size=batch_size,
-            remaining=remaining,
-        )
+        try:
+            rows = _fetch_batch_with_retry(
+                conn,
+                table,
+                chain=chain,
+                last_id=last_id,
+                batch_size=batch_size,
+                remaining=remaining,
+            )
+        except Exception:
+            log.exception("链 %s 读取批次失败，停止当前链并继续下一条链", chain)
+            break
         if not rows:
             break
 
@@ -346,7 +476,17 @@ def _process_chain(
                     sample_key or "N/A",
                 )
         else:
-            updated += _bulk_update(conn, table, patch_rows)
+            try:
+                updated += _bulk_update_with_retry(
+                    conn,
+                    table,
+                    patch_rows,
+                    chain=chain,
+                    last_id=last_id,
+                )
+            except Exception:
+                log.exception("链 %s 写回批次失败，已跳过当前批次并继续后续批次", chain)
+                continue
 
         log.info(
             "链 %s 进度：已扫描 %d 条，提取到 image_uri %d 条，%s %d 条",
@@ -392,10 +532,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    conn = _conn()
-    try:
-        grand_scanned = grand_extracted = grand_updated = 0
-        for chain in args.chains:
+    grand_scanned = grand_extracted = grand_updated = 0
+    for chain in args.chains:
+        conn = None
+        try:
             log.info(
                 "开始处理链 %s | batch_size=%d | limit=%s | dry_run=%s",
                 chain,
@@ -403,6 +543,7 @@ def main() -> None:
                 args.limit if args.limit is not None else "ALL",
                 args.dry_run,
             )
+            conn = _connect_with_retry(chain)
             scanned, extracted, updated = _process_chain(
                 conn,
                 chain,
@@ -421,16 +562,18 @@ def main() -> None:
                 "预计更新" if args.dry_run else "已更新",
                 extracted if args.dry_run else updated,
             )
+        except Exception:
+            log.exception("链 %s 处理失败，已跳过并继续下一条链", chain)
+        finally:
+            _safe_close(conn)
 
-        log.info(
-            "全部完成：扫描 %d 条，提取 %d 条，%s %d 条",
-            grand_scanned,
-            grand_extracted,
-            "预计更新" if args.dry_run else "已更新",
-            grand_extracted if args.dry_run else grand_updated,
-        )
-    finally:
-        conn.close()
+    log.info(
+        "全部完成：扫描 %d 条，提取 %d 条，%s %d 条",
+        grand_scanned,
+        grand_extracted,
+        "预计更新" if args.dry_run else "已更新",
+        grand_extracted if args.dry_run else grand_updated,
+    )
 
 
 if __name__ == "__main__":
