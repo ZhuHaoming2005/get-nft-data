@@ -1091,6 +1091,85 @@ class BatchEntryTests(unittest.TestCase):
             if tmpdir.exists():
                 tmpdir.rmdir()
 
+    def test_batch_main_skips_cached_seed_outputs(self):
+        tmpdir = Path('D:/code/solidity/get-nft-data/output/test-top-contract-analysis-batch-cache')
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        seeds_path = tmpdir / 'seeds.txt'
+        seeds_path.write_text('0xseed1\n0xseed2\n', encoding='utf-8')
+        output_dir = tmpdir / 'results'
+        cached_payload = {
+            'seed_contract': {
+                'chain': 'ethereum',
+                'contract_address': '0xseed1',
+                'token_type': 'ERC721',
+                'contract_deployer': '0xcreator',
+                'deployed_block_number': 1,
+                'name': 'Azuki',
+                'symbol': 'AZUKI',
+            },
+            'seed_collection_stats': {
+                'seed_nft_count': 1,
+                'unique_token_uri_count': 1,
+                'unique_image_uri_count': 1,
+                'unique_name_count': 1,
+                'unique_symbol_count': 1,
+            },
+            'duplicate_candidates': [],
+            'legit_duplicates': [],
+            'suspected_infringing_duplicates_high_confidence': [],
+            'suspected_infringing_duplicates_low_confidence': [],
+            'contract_level_summary': {},
+            'address_signals': {},
+            'victim_signals': {},
+            'report_summary': {
+                'open_license_detected': False,
+                'candidate_contract_count': 0,
+                'high_confidence_contract_count': 0,
+                'low_confidence_contract_count': 0,
+                'legit_duplicate_contract_count': 0,
+            },
+        }
+        fresh_payload = {
+            **cached_payload,
+            'seed_contract': {
+                **cached_payload['seed_contract'],
+                'contract_address': '0xseed2',
+                'name': 'BEANZ',
+                'symbol': 'BEANZ',
+            },
+        }
+        try:
+            mod.write_outputs_to_directory(cached_payload, output_dir)
+
+            with patch.object(batch_mod, 'analyze_seed_contract', return_value=fresh_payload) as analyze_mock:
+                code = batch_mod.main(
+                    [
+                        '--chain', 'ethereum',
+                        '--seed-file', str(seeds_path),
+                        '--alchemy-api-key', 'alchemy',
+                        '--output-dir', str(output_dir),
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(analyze_mock.call_count, 1)
+            self.assertEqual(analyze_mock.call_args.kwargs['seed_contract_address'], '0xseed2')
+
+            summary_payload = json.loads((output_dir / 'top_contract_analysis__summary.json').read_text(encoding='utf-8'))
+            self.assertEqual(summary_payload['batch_summary']['seed_report_count'], 2)
+            self.assertEqual(
+                [item['seed_contract']['contract_address'] for item in summary_payload['seed_reports']],
+                ['0xseed1', '0xseed2'],
+            )
+        finally:
+            for path in sorted(tmpdir.glob('**/*'), reverse=True):
+                if path.is_file():
+                    path.unlink()
+                elif path.is_dir():
+                    path.rmdir()
+            if tmpdir.exists():
+                tmpdir.rmdir()
+
     def test_batch_main_reuses_feature_store_loaded_from_parquet(self):
         tmpdir = Path('D:/code/solidity/get-nft-data/output/test-top-contract-analysis-batch-feature-store')
         tmpdir.mkdir(parents=True, exist_ok=True)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional, Sequence
@@ -19,6 +20,32 @@ def _read_seed_addresses(seed_file: str) -> list[str]:
             continue
         seeds.append(value.lower())
     return seeds
+
+
+def _load_cached_seed_entries(output_dir: str | Path, *, chain: str) -> dict[str, dict]:
+    target_dir = Path(output_dir)
+    if not target_dir.exists():
+        return {}
+
+    cached: dict[str, dict] = {}
+    for path in sorted(target_dir.glob('top_contract_analysis__*.json')):
+        if path.name == 'top_contract_analysis__summary.json':
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding='utf-8'))
+        except Exception:
+            continue
+        seed = payload.get('seed_contract') or {}
+        contract_address = str(seed.get('contract_address') or '').strip().lower()
+        payload_chain = str(seed.get('chain') or '').strip().lower()
+        if not contract_address or payload_chain != chain.lower():
+            continue
+        cached[contract_address] = {
+            'seed_contract': seed,
+            'report_summary': payload.get('report_summary') or {},
+            'output_files': {'json': path.name, 'markdown': path.with_suffix('.md').name},
+        }
+    return cached
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -83,36 +110,45 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     seed_addresses = _read_seed_addresses(args.seed_file)
     feature_store: DuckDBFeatureStore | None = None
     signal_cache = ContractSignalCache(database_path=args.signal_cache_db)
-    summary_entries: list[dict] = []
+    cached_entries = _load_cached_seed_entries(args.output_dir, chain=args.chain)
     if args.feature_parquet:
         feature_store = DuckDBFeatureStore(database_path=args.feature_db)
         feature_store.load_parquet_dataset(args.chain, args.feature_parquet, strict=args.strict_parquet)
     elif args.feature_db != ':memory:' and Path(args.feature_db).exists():
         feature_store = DuckDBFeatureStore(database_path=args.feature_db)
     try:
+        pending_seeds = [seed for seed in seed_addresses if seed not in cached_entries]
+        fresh_entries: dict[str, dict] = {}
+
         if args.workers <= 1:
-            for seed_address in seed_addresses:
+            for seed_address in pending_seeds:
                 payload = _analyze_one_seed(seed_address, args, feature_store=feature_store, signal_cache=signal_cache)
                 json_path, md_path = write_outputs_to_directory(payload, args.output_dir)
-                summary_entries.append({
+                fresh_entries[seed_address] = {
                     'seed_contract': payload.get('seed_contract') or {},
                     'report_summary': payload.get('report_summary') or {},
                     'output_files': {'json': json_path.name, 'markdown': md_path.name},
-                })
-            write_batch_summary_outputs(summary_entries, args.output_dir)
-            return 0
+                }
+        else:
+            with ThreadPoolExecutor(max_workers=args.workers) as executor:
+                for seed_address, payload in zip(
+                    pending_seeds,
+                    executor.map(
+                        lambda seed: _analyze_one_seed(seed, args, feature_store=feature_store, signal_cache=signal_cache),
+                        pending_seeds,
+                    ),
+                ):
+                    json_path, md_path = write_outputs_to_directory(payload, args.output_dir)
+                    fresh_entries[seed_address] = {
+                        'seed_contract': payload.get('seed_contract') or {},
+                        'report_summary': payload.get('report_summary') or {},
+                        'output_files': {'json': json_path.name, 'markdown': md_path.name},
+                    }
 
-        with ThreadPoolExecutor(max_workers=args.workers) as executor:
-            for payload in executor.map(
-                lambda seed: _analyze_one_seed(seed, args, feature_store=feature_store, signal_cache=signal_cache),
-                seed_addresses,
-            ):
-                json_path, md_path = write_outputs_to_directory(payload, args.output_dir)
-                summary_entries.append({
-                    'seed_contract': payload.get('seed_contract') or {},
-                    'report_summary': payload.get('report_summary') or {},
-                    'output_files': {'json': json_path.name, 'markdown': md_path.name},
-                })
+        summary_entries = [
+            cached_entries.get(seed_address) or fresh_entries[seed_address]
+            for seed_address in seed_addresses
+        ]
         write_batch_summary_outputs(summary_entries, args.output_dir)
     finally:
         if feature_store is not None:

@@ -5,3 +5,4 @@ web3
 duckdb
 base58
 pyarrow
+numpy
