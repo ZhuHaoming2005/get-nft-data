@@ -8,6 +8,7 @@ from __future__ import annotations
 #     --etherscan-api-key your_etherscan_api_key
 
 import argparse
+import contextlib
 import json
 import logging
 import math
@@ -15,7 +16,8 @@ import os
 import re
 import sys
 import unicodedata
-from collections import Counter, defaultdict
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
@@ -95,6 +97,8 @@ class SeedNFT:
     symbol: str
     token_uri: str
     image_uri: str
+    metadata_json: str = ''
+    metadata_doc: str = ''
 
 
 @dataclass(frozen=True)
@@ -105,6 +109,8 @@ class DatabaseNFTRecord:
     image_uri: str
     name: str
     symbol: str
+    metadata_json: str = ''
+    metadata_doc: str = ''
 
 
 @dataclass(frozen=True)
@@ -259,6 +265,28 @@ def normalize_url(url: Optional[str]) -> Optional[str]:
     return lowered.rstrip('/')
 
 
+def build_nft_metadata_json(raw_nft: Dict[str, Any], *, token_uri: str = '', image_uri: str = '') -> str:
+    payload: Dict[str, Any] = {}
+    raw_meta = raw_nft.get('rawMetadata') or raw_nft.get('metadata') or {}
+    if isinstance(raw_meta, dict):
+        payload.update(raw_meta)
+    for source_key, target_key in (
+        ('title', 'name'),
+        ('name', 'name'),
+        ('description', 'description'),
+    ):
+        value = raw_nft.get(source_key)
+        if value and target_key not in payload:
+            payload[target_key] = value
+    if token_uri and 'token_uri' not in payload:
+        payload['token_uri'] = token_uri
+    if image_uri and 'image' not in payload:
+        payload['image'] = image_uri
+    if not payload:
+        return ''
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
 def similarity_score(left: str, right: str) -> float:
     return SequenceMatcher(None, left, right).ratio() * 100.0
 
@@ -288,6 +316,19 @@ def _require_requests() -> None:
         raise RuntimeError('requests is required for API access')
 
 
+def _build_requests_session():
+    _require_requests()
+    session = requests.Session()
+    try:
+        from requests.adapters import HTTPAdapter
+    except Exception:  # pragma: no cover
+        return session
+    adapter = HTTPAdapter(pool_connections=32, pool_maxsize=32)
+    session.mount('https://', adapter)
+    session.mount('http://', adapter)
+    return session
+
+
 def _alchemy_nft_base(network: str) -> str:
     return f'https://{network}.g.alchemy.com'
 
@@ -308,11 +349,13 @@ def _alchemy_get_json(
     url: str,
     timeout: int,
     retries: int = DEFAULT_ALCHEMY_RETRIES,
+    session=None,
 ) -> Dict[str, Any]:
     last_exc: Exception | None = None
+    client = session or requests
     for attempt in range(1, retries + 1):
         try:
-            response = requests.get(url, timeout=timeout)
+            response = client.get(url, timeout=timeout)
             response.raise_for_status()
             return response.json()
         except Exception as exc:
@@ -331,11 +374,13 @@ def _alchemy_post_json(
     payload: Dict[str, Any],
     timeout: int,
     retries: int = DEFAULT_ALCHEMY_RETRIES,
+    session=None,
 ) -> Dict[str, Any]:
     last_exc: Exception | None = None
+    client = session or requests
     for attempt in range(1, retries + 1):
         try:
-            response = requests.post(url, json=payload, timeout=timeout)
+            response = client.post(url, json=payload, timeout=timeout)
             response.raise_for_status()
             return response.json()
         except Exception as exc:
@@ -372,6 +417,7 @@ def _fetch_block_timestamp(
     network: str,
     block_num: str,
     timeout: int = DEFAULT_TIMEOUT,
+    session=None,
 ) -> int:
     body = _alchemy_post_json(
         url=_alchemy_rpc_base(network, api_key),
@@ -382,12 +428,15 @@ def _fetch_block_timestamp(
             'params': [block_num, False],
         },
         timeout=timeout,
+        session=session,
     )
     result = body.get('result') or {}
     return _parse_alchemy_block_timestamp(result.get('timestamp'))
 
 
 def _extract_seed_nfts(payload: Dict[str, Any], *, chain: str, contract_address: str) -> Tuple[List[SeedNFT], str]:
+    from .rust_bridge import metadata_document_from_json
+
     raw_items = payload.get('nfts')
     if not isinstance(raw_items, list):
         return [], ''
@@ -413,6 +462,7 @@ def _extract_seed_nfts(payload: Dict[str, Any], *, chain: str, contract_address:
             )
         else:
             image_uri = str(raw_image or raw.get('image_url') or '')
+        metadata_json = build_nft_metadata_json(raw, token_uri=token_uri, image_uri=image_uri)
         rows.append(
             SeedNFT(
                 chain=chain,
@@ -422,6 +472,8 @@ def _extract_seed_nfts(payload: Dict[str, Any], *, chain: str, contract_address:
                 symbol=str((raw.get('contractMetadata') or {}).get('symbol') or ''),
                 token_uri=token_uri,
                 image_uri=image_uri,
+                metadata_json=metadata_json,
+                metadata_doc=metadata_document_from_json(metadata_json),
             )
         )
     return rows, str(payload.get('pageKey') or '')
@@ -434,6 +486,7 @@ def fetch_seed_contract_nfts(
     chain: str,
     contract_address: str,
     timeout: int = DEFAULT_TIMEOUT,
+    session=None,
 ) -> List[SeedNFT]:
     _require_requests()
     endpoint = f'{_alchemy_nft_base(network)}/nft/v3/{api_key}/getNFTsForContract'
@@ -447,7 +500,7 @@ def fetch_seed_contract_nfts(
         if page_key:
             params['pageKey'] = page_key
         url = f'{endpoint}?{urlencode(params)}'
-        payload = _alchemy_get_json(url=url, timeout=timeout)
+        payload = _alchemy_get_json(url=url, timeout=timeout, session=session)
         batch, page_key = _extract_seed_nfts(payload, chain=chain, contract_address=contract_address)
         rows.extend(batch)
         if not page_key:
@@ -462,6 +515,7 @@ def fetch_nft_metadata(
     contract_address: str,
     token_id: str,
     timeout: int = DEFAULT_TIMEOUT,
+    session=None,
 ) -> Dict[str, Any]:
     _require_requests()
     params = {
@@ -470,7 +524,7 @@ def fetch_nft_metadata(
         'refreshCache': 'false',
     }
     url = f'{_alchemy_nft_base(network)}/nft/v3/{api_key}/getNFTMetadata?{urlencode(params)}'
-    return _alchemy_get_json(url=url, timeout=timeout)
+    return _alchemy_get_json(url=url, timeout=timeout, session=session)
 
 
 def fetch_license_sample(
@@ -480,6 +534,7 @@ def fetch_license_sample(
     chain: str,
     seed_nfts: Sequence[SeedNFT],
     timeout: int = DEFAULT_TIMEOUT,
+    session=None,
 ) -> Dict[str, Any]:
     for nft in seed_nfts:
         if nft.token_id:
@@ -489,6 +544,7 @@ def fetch_license_sample(
                 contract_address=nft.contract_address,
                 token_id=nft.token_id,
                 timeout=timeout,
+                session=session,
             )
     return {}
 
@@ -525,11 +581,12 @@ def fetch_contract_metadata(
     chain: str,
     contract_address: str,
     timeout: int = DEFAULT_TIMEOUT,
+    session=None,
 ) -> ContractMetadata:
     _require_requests()
     params = {'contractAddress': contract_address}
     url = f'{_alchemy_nft_base(network)}/nft/v2/{api_key}/getContractMetadata?{urlencode(params)}'
-    payload = _alchemy_get_json(url=url, timeout=timeout)
+    payload = _alchemy_get_json(url=url, timeout=timeout, session=session)
     meta = payload.get('contractMetadata') or {}
     return ContractMetadata(
         chain=chain,
@@ -611,6 +668,7 @@ def load_database_snapshot(
                             image_uri=image_uri,
                             name=name,
                             symbol=symbol,
+                            metadata_json='',
                         )
                     )
     conn.commit()
@@ -654,7 +712,10 @@ def find_duplicate_candidates(
     snapshot: DatabaseSnapshot,
     *,
     name_threshold: float = DEFAULT_NAME_THRESHOLD,
+    metadata_threshold: float = 0.55,
 ) -> List[DuplicateCandidate]:
+    from .rust_bridge import metadata_document_from_json, metadata_keywords, score_metadata_pairs, score_name_pairs
+
     seed_index = build_seed_index(seed_nfts)
     token_uri_keys = seed_index['token_uri_keys']
     image_uri_keys = seed_index['image_uri_keys']
@@ -663,14 +724,66 @@ def find_duplicate_candidates(
     seed_contracts = seed_index['seed_contracts']
     name_index: _LenIndex = seed_index['name_index']
 
+    filtered_rows = [row for row in snapshot.nft_rows if row.contract_address not in seed_contracts]
+
+    name_pair_indices: List[int] = []
+    name_left: List[str] = []
+    name_right: List[str] = []
+    for idx, row in enumerate(filtered_rows):
+        name_norm = normalize_name(row.name)
+        if not name_norm:
+            continue
+        for candidate in name_index.candidates(name_norm, name_threshold):
+            if candidate in seed_name_norms:
+                name_pair_indices.append(idx)
+                name_left.append(name_norm)
+                name_right.append(candidate)
+
+    name_matches: set[int] = set()
+    for idx, score in zip(name_pair_indices, score_name_pairs(name_left, name_right)):
+        if score >= name_threshold:
+            name_matches.add(idx)
+
+    seed_metadata_docs: List[str] = []
+    seed_metadata_keyword_sets: List[set[str]] = []
+    seed_metadata_keyword_union: set[str] = set()
+    for item in seed_nfts:
+        seed_doc = item.metadata_doc or metadata_document_from_json(item.metadata_json)
+        if not seed_doc:
+            continue
+        seed_keywords = set(metadata_keywords(seed_doc, limit=12))
+        seed_metadata_docs.append(seed_doc)
+        seed_metadata_keyword_sets.append(seed_keywords)
+        seed_metadata_keyword_union.update(seed_keywords)
+    metadata_pair_indices: List[int] = []
+    metadata_left: List[str] = []
+    metadata_right: List[str] = []
+    for idx, row in enumerate(filtered_rows):
+        row_doc = row.metadata_doc or metadata_document_from_json(row.metadata_json)
+        if not row_doc:
+            continue
+        row_keywords = set(metadata_keywords(row_doc, limit=12))
+        if seed_metadata_keyword_union and not (row_keywords & seed_metadata_keyword_union):
+            continue
+        for seed_doc, seed_keywords in zip(seed_metadata_docs, seed_metadata_keyword_sets):
+            if row_keywords and seed_keywords and not (row_keywords & seed_keywords):
+                continue
+            metadata_pair_indices.append(idx)
+            metadata_left.append(seed_doc)
+            metadata_right.append(row_doc)
+
+    metadata_matches: set[int] = set()
+    for idx, score in zip(metadata_pair_indices, score_metadata_pairs(metadata_left, metadata_right)):
+        if score >= metadata_threshold:
+            metadata_matches.add(idx)
+
     candidates: Dict[Tuple[str, str], DuplicateCandidate] = {}
-    for row in snapshot.nft_rows:
+    for idx, row in enumerate(filtered_rows):
         if row.contract_address in seed_contracts:
             continue
         reasons: List[str] = []
         token_key = normalize_url(row.token_uri)
         image_key = normalize_url(row.image_uri)
-        name_norm = normalize_name(row.name)
         symbol_norm = normalize_symbol(row.symbol)
         if token_key and token_key in token_uri_keys:
             reasons.append('token_uri_match')
@@ -678,16 +791,19 @@ def find_duplicate_candidates(
             reasons.append('image_uri_match')
         if symbol_norm and symbol_norm in seed_symbol_norms:
             reasons.append('symbol_match')
-        if name_norm:
-            for candidate in name_index.candidates(name_norm, name_threshold):
-                if candidate in seed_name_norms and similarity_score(name_norm, candidate) >= name_threshold:
-                    reasons.append('name_match')
-                    break
+        if idx in name_matches:
+            reasons.append('name_match')
+        if idx in metadata_matches:
+            reasons.append('metadata_match')
         if not reasons:
             continue
         unique_reasons = tuple(sorted(set(reasons)))
         confidence = 'low'
-        if 'token_uri_match' in unique_reasons or 'image_uri_match' in unique_reasons:
+        if (
+            'token_uri_match' in unique_reasons
+            or 'image_uri_match' in unique_reasons
+            or 'metadata_match' in unique_reasons
+        ):
             confidence = 'high'
         elif 'name_match' in unique_reasons and 'symbol_match' in unique_reasons:
             confidence = 'high'
@@ -717,6 +833,7 @@ def fetch_alchemy_contract_transfers(
     network: str,
     contract_address: str,
     timeout: int = DEFAULT_TIMEOUT,
+    session=None,
 ) -> List[TransferRecord]:
     _require_requests()
     url = _alchemy_rpc_base(network, api_key)
@@ -742,7 +859,7 @@ def fetch_alchemy_contract_transfers(
             'method': 'alchemy_getAssetTransfers',
             'params': [params],
         }
-        body = _alchemy_post_json(url=url, payload=payload, timeout=timeout)
+        body = _alchemy_post_json(url=url, payload=payload, timeout=timeout, session=session)
         if body.get('error'):
             raise RuntimeError(body['error'])
         result = body.get('result') or {}
@@ -757,6 +874,7 @@ def fetch_alchemy_contract_transfers(
                         network=network,
                         block_num=block_num,
                         timeout=timeout,
+                        session=session,
                     )
                     block_time_cache[block_num] = cached
                 block_time = cached
@@ -787,6 +905,7 @@ def fetch_etherscan_contract_transfers(
     contract_address: str,
     token_type: str,
     timeout: int = DEFAULT_TIMEOUT,
+    session=None,
 ) -> List[TransferRecord]:
     _require_requests()
     chain_id = ETHERSCAN_CHAIN_IDS.get(chain.lower())
@@ -796,6 +915,7 @@ def fetch_etherscan_contract_transfers(
     base_url = 'https://api.etherscan.io/v2/api'
     page = 1
     transfers: List[TransferRecord] = []
+    client = session or requests
     while True:
         params = {
             'chainid': chain_id,
@@ -810,7 +930,7 @@ def fetch_etherscan_contract_transfers(
             'apikey': api_key,
         }
         url = f'{base_url}?{urlencode(params)}'
-        response = requests.get(url, timeout=timeout)
+        response = client.get(url, timeout=timeout)
         response.raise_for_status()
         body = response.json()
         items = body.get('result') or []
@@ -846,6 +966,7 @@ def fetch_contract_transfers(
     contract_address: str,
     token_type: str,
     timeout: int = DEFAULT_TIMEOUT,
+    session=None,
 ) -> List[TransferRecord]:
     try:
         return fetch_alchemy_contract_transfers(
@@ -853,6 +974,7 @@ def fetch_contract_transfers(
             network=alchemy_network,
             contract_address=contract_address,
             timeout=timeout,
+            session=session,
         )
     except Exception as exc:
         logger.warning('alchemy transfer fetch failed for %s: %s', contract_address, exc)
@@ -862,6 +984,7 @@ def fetch_contract_transfers(
             contract_address=contract_address,
             token_type=token_type,
             timeout=timeout,
+            session=session,
         )
 
 
@@ -871,6 +994,7 @@ def fetch_contract_owners(
     network: str,
     contract_address: str,
     timeout: int = DEFAULT_TIMEOUT,
+    session=None,
 ) -> List[OwnerBalance]:
     _require_requests()
     endpoint = f'{_alchemy_nft_base(network)}/nft/v3/{api_key}/getOwnersForContract'
@@ -884,7 +1008,7 @@ def fetch_contract_owners(
         if page_key:
             params['pageKey'] = page_key
         url = f'{endpoint}?{urlencode(params)}'
-        payload = _alchemy_get_json(url=url, timeout=timeout)
+        payload = _alchemy_get_json(url=url, timeout=timeout, session=session)
         for row in payload.get('owners') or []:
             balances: Dict[str, int] = {}
             for balance in row.get('tokenBalances') or []:
@@ -901,72 +1025,108 @@ def fetch_contract_owners(
     return owners
 
 
-def _calculate_cycle_edge_count(transfers: Sequence[TransferRecord]) -> int:
-    seen_pairs = set()
-    cycle_pairs = set()
-    for transfer in transfers:
-        if transfer.from_address == ZERO_ADDRESS or transfer.to_address == ZERO_ADDRESS:
-            continue
-        pair = (transfer.from_address, transfer.to_address)
-        reverse = (transfer.to_address, transfer.from_address)
-        if reverse in seen_pairs:
-            cycle_pairs.add(tuple(sorted(pair)))
-        seen_pairs.add(pair)
-    return len(cycle_pairs)
-
-
-def _calculate_star_distributors(transfers: Sequence[TransferRecord]) -> int:
-    outgoing: Dict[str, set[str]] = defaultdict(set)
-    incoming: Counter[str] = Counter()
-    for transfer in transfers:
-        if transfer.from_address == ZERO_ADDRESS or transfer.to_address == ZERO_ADDRESS:
-            continue
-        outgoing[transfer.from_address].add(transfer.to_address)
-        incoming[transfer.to_address] += 1
-    count = 0
-    for sender, recipients in outgoing.items():
-        if len(recipients) >= 3 and incoming.get(sender, 0) <= 1:
-            count += 1
-    return count
-
-
 def analyze_contract_transfers(transfers: Sequence[TransferRecord]) -> Dict[str, Any]:
-    mint_transfers = [row for row in transfers if row.from_address == ZERO_ADDRESS]
-    non_mint = [row for row in transfers if row.from_address != ZERO_ADDRESS]
-    receivers = {row.to_address for row in transfers if row.to_address and row.to_address != ZERO_ADDRESS}
-    first_mint_time = min((row.block_time for row in mint_transfers), default=0)
-    first_non_mint_time = min((row.block_time for row in non_mint), default=0)
-    first_transfer_delay = 0
-    if first_mint_time and first_non_mint_time and first_non_mint_time >= first_mint_time:
-        first_transfer_delay = first_non_mint_time - first_mint_time
-    return {
-        'mint_address_count': len({row.to_address for row in mint_transfers if row.to_address}),
-        'mint_count': len(mint_transfers),
-        'unique_receiver_count': len(receivers),
-        'cycle_edge_count': _calculate_cycle_edge_count(transfers),
-        'star_distributor_count': _calculate_star_distributors(transfers),
-        'mint_to_first_transfer_seconds': first_transfer_delay,
-        'fast_spread': bool(first_transfer_delay and first_transfer_delay <= 24 * 3600),
-    }
+    from .rust_bridge import analyze_transfer_signals
+
+    return analyze_transfer_signals(transfers)
 
 
 def analyze_contract_victims(
     transfers: Sequence[TransferRecord],
     owners: Sequence[OwnerBalance],
 ) -> Dict[str, Any]:
-    active_sellers = {
-        row.from_address for row in transfers
-        if row.from_address and row.from_address != ZERO_ADDRESS
+    from .rust_bridge import analyze_victim_signals
+
+    return analyze_victim_signals(transfers, owners)
+
+
+def _analyze_high_confidence_contract(
+    *,
+    chain: str,
+    network: str,
+    alchemy_api_key: str,
+    etherscan_api_key: str,
+    contract_address: str,
+    contract_candidates: Sequence[DuplicateCandidate],
+    token_type: str,
+    official_addresses: set[str],
+    timeout: int,
+    signal_cache,
+    session=None,
+) -> Dict[str, Any]:
+    cached = None
+    if signal_cache is not None:
+        cached = signal_cache.get(chain=chain, contract_address=contract_address, token_type=token_type)
+    if cached is not None:
+        mint_recipients = set(cached.get('mint_recipients') or [])
+        active_sellers = cached.get('active_sellers') or []
+        cached_address_signals = cached.get('address_signals') or {}
+        cached_victim_signals = cached.get('victim_signals')
+        transfers: List[TransferRecord] = []
+        owners: List[OwnerBalance] = []
+    else:
+        transfers = fetch_contract_transfers(
+            alchemy_api_key=alchemy_api_key,
+            alchemy_network=network,
+            etherscan_api_key=etherscan_api_key,
+            chain=chain,
+            contract_address=contract_address,
+            token_type=token_type,
+            timeout=timeout,
+            session=session,
+        )
+        owners = []
+        mint_recipients = {row.to_address for row in transfers if row.from_address == ZERO_ADDRESS}
+        active_sellers = [
+            row.from_address
+            for row in transfers
+            if row.from_address and row.from_address != ZERO_ADDRESS
+        ]
+        cached_address_signals = analyze_contract_transfers(transfers)
+        cached_victim_signals = None
+
+    result = {
+        'contract_address': contract_address,
+        'candidate_count': len(contract_candidates),
+        'match_reasons': sorted({reason for item in contract_candidates for reason in item.match_reasons}),
     }
-    owners_with_balance = [owner for owner in owners if any(balance > 0 for balance in owner.token_balances.values())]
-    stuck = [owner.owner_address for owner in owners_with_balance if owner.owner_address not in active_sellers]
-    owner_count = len(owners_with_balance)
-    return {
-        'owner_count': owner_count,
-        'stuck_holder_count': len(stuck),
-        'stuck_holder_ratio': (len(stuck) / owner_count) if owner_count else 0.0,
-        'victim_wallet_count': len(stuck),
-    }
+    if mint_recipients & official_addresses:
+        if signal_cache is not None and cached is None:
+            signal_cache.put(
+                chain=chain,
+                contract_address=contract_address,
+                token_type=token_type,
+                transfers=transfers,
+                owners=owners,
+            )
+        result['status'] = 'legit'
+        result['mint_recipients'] = sorted(mint_recipients)
+        return result
+
+    if cached_victim_signals is None:
+        owners = fetch_contract_owners(
+            api_key=alchemy_api_key,
+            network=network,
+            contract_address=contract_address,
+            timeout=timeout,
+            session=session,
+        )
+        from .rust_bridge import analyze_victim_signals_from_active_sellers
+
+        cached_victim_signals = analyze_victim_signals_from_active_sellers(active_sellers, owners)
+        if signal_cache is not None:
+            signal_cache.put(
+                chain=chain,
+                contract_address=contract_address,
+                token_type=token_type,
+                transfers=transfers,
+                owners=owners,
+            )
+
+    result['status'] = 'high'
+    result['address_signals'] = cached_address_signals
+    result['victim_signals'] = cached_victim_signals
+    return result
 
 
 def analyze_seed_contract(
@@ -977,125 +1137,149 @@ def analyze_seed_contract(
     alchemy_network: str | None = None,
     etherscan_api_key: str = '',
     conn=None,
+    feature_store=None,
+    signal_cache=None,
     name_threshold: float = DEFAULT_NAME_THRESHOLD,
+    metadata_threshold: float = 0.55,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> Dict[str, Any]:
     network = normalize_network(chain, alchemy_network)
     own_conn = False
-    if conn is None:
+    if feature_store is None and conn is None:
         conn = get_conn()
         own_conn = True
     try:
-        contract_meta = fetch_contract_metadata(
-            api_key=alchemy_api_key,
-            network=network,
-            chain=chain,
-            contract_address=seed_contract_address,
-            timeout=timeout,
-        )
-        seed_nfts = fetch_seed_contract_nfts(
-            api_key=alchemy_api_key,
-            network=network,
-            chain=chain,
-            contract_address=seed_contract_address,
-            timeout=timeout,
-        )
-        license_payload = fetch_license_sample(
-            api_key=alchemy_api_key,
-            network=network,
-            chain=chain,
-            seed_nfts=seed_nfts,
-            timeout=timeout,
-        )
-        open_license = is_open_license_payload(license_payload)
-        snapshot = load_database_snapshot(conn, chain, seed_nfts=seed_nfts)
-        candidates = find_duplicate_candidates(seed_nfts, snapshot, name_threshold=name_threshold)
-        grouped = group_candidates_by_contract(candidates)
-
-        official_addresses = {addr for addr in [contract_meta.contract_deployer, contract_meta.contract_address] if addr}
-        legit_duplicates: List[Dict[str, Any]] = []
-        high_confidence: List[Dict[str, Any]] = []
-        low_confidence: List[Dict[str, Any]] = []
-        address_signals: Dict[str, Any] = {}
-        victim_signals: Dict[str, Any] = {}
-
-        for contract_address, contract_candidates in grouped.items():
-            contract_confidence = 'high' if any(item.confidence == 'high' for item in contract_candidates) else 'low'
-            if open_license:
-                continue
-            if contract_confidence != 'high':
-                low_confidence.append({
-                    'contract_address': contract_address,
-                    'candidate_count': len(contract_candidates),
-                    'match_reasons': sorted({reason for item in contract_candidates for reason in item.match_reasons}),
-                })
-                continue
-            transfers = fetch_contract_transfers(
-                alchemy_api_key=alchemy_api_key,
-                alchemy_network=network,
-                etherscan_api_key=etherscan_api_key,
-                chain=chain,
-                contract_address=contract_address,
-                token_type=contract_meta.token_type or 'ERC721',
-                timeout=timeout,
-            )
-            mint_recipients = {row.to_address for row in transfers if row.from_address == ZERO_ADDRESS}
-            if mint_recipients & official_addresses:
-                legit_duplicates.append({
-                    'contract_address': contract_address,
-                    'candidate_count': len(contract_candidates),
-                    'mint_recipients': sorted(mint_recipients),
-                })
-                continue
-            owners = fetch_contract_owners(
+        session_context = contextlib.closing(_build_requests_session()) if requests is not None else contextlib.nullcontext(None)
+        with session_context as session:
+            contract_meta = fetch_contract_metadata(
                 api_key=alchemy_api_key,
                 network=network,
-                contract_address=contract_address,
+                chain=chain,
+                contract_address=seed_contract_address,
                 timeout=timeout,
+                session=session,
             )
-            high_confidence.append({
-                'contract_address': contract_address,
-                'candidate_count': len(contract_candidates),
-                'match_reasons': sorted({reason for item in contract_candidates for reason in item.match_reasons}),
-            })
-            address_signals[contract_address] = analyze_contract_transfers(transfers)
-            victim_signals[contract_address] = analyze_contract_victims(transfers, owners)
+            seed_nfts = fetch_seed_contract_nfts(
+                api_key=alchemy_api_key,
+                network=network,
+                chain=chain,
+                contract_address=seed_contract_address,
+                timeout=timeout,
+                session=session,
+            )
+            license_payload = fetch_license_sample(
+                api_key=alchemy_api_key,
+                network=network,
+                chain=chain,
+                seed_nfts=seed_nfts,
+                timeout=timeout,
+                session=session,
+            )
+            open_license = is_open_license_payload(license_payload)
+            if feature_store is not None:
+                snapshot = feature_store.load_snapshot(chain, seed_nfts=seed_nfts)
+            else:
+                snapshot = load_database_snapshot(conn, chain, seed_nfts=seed_nfts)
+            candidates = find_duplicate_candidates(
+                seed_nfts,
+                snapshot,
+                name_threshold=name_threshold,
+                metadata_threshold=metadata_threshold,
+            )
+            grouped = group_candidates_by_contract(candidates)
 
-        if open_license:
-            high_confidence = []
-            low_confidence = []
+            official_addresses = {addr for addr in [contract_meta.contract_deployer, contract_meta.contract_address] if addr}
+            legit_duplicates: List[Dict[str, Any]] = []
+            high_confidence: List[Dict[str, Any]] = []
+            low_confidence: List[Dict[str, Any]] = []
+            address_signals: Dict[str, Any] = {}
+            victim_signals: Dict[str, Any] = {}
+            token_type = contract_meta.token_type or 'ERC721'
+            high_confidence_items: List[Tuple[str, Sequence[DuplicateCandidate]]] = []
 
-        return {
-            'seed_contract': asdict(contract_meta),
-            'seed_collection_stats': {
-                'seed_nft_count': len(seed_nfts),
-                'unique_token_uri_count': len({normalize_url(item.token_uri) for item in seed_nfts if normalize_url(item.token_uri)}),
-                'unique_image_uri_count': len({normalize_url(item.image_uri) for item in seed_nfts if normalize_url(item.image_uri)}),
-                'unique_name_count': len({normalize_name(item.name) for item in seed_nfts if normalize_name(item.name)}),
-                'unique_symbol_count': len({normalize_symbol(item.symbol) for item in seed_nfts if normalize_symbol(item.symbol)}),
-            },
-            'duplicate_candidates': [asdict(item) for item in candidates],
-            'legit_duplicates': legit_duplicates,
-            'suspected_infringing_duplicates_high_confidence': high_confidence,
-            'suspected_infringing_duplicates_low_confidence': low_confidence,
-            'contract_level_summary': {
-                contract_address: {
-                    'candidate_count': len(items),
-                    'high_confidence_token_count': sum(1 for item in items if item.confidence == 'high'),
-                    'low_confidence_token_count': sum(1 for item in items if item.confidence == 'low'),
-                }
-                for contract_address, items in grouped.items()
-            },
-            'address_signals': address_signals,
-            'victim_signals': victim_signals,
-            'report_summary': {
-                'open_license_detected': open_license,
-                'candidate_contract_count': len(grouped),
-                'high_confidence_contract_count': len(high_confidence),
-                'low_confidence_contract_count': len(low_confidence),
-                'legit_duplicate_contract_count': len(legit_duplicates),
-            },
-        }
+            for contract_address, contract_candidates in grouped.items():
+                contract_confidence = 'high' if any(item.confidence == 'high' for item in contract_candidates) else 'low'
+                if open_license:
+                    continue
+                if contract_confidence != 'high':
+                    low_confidence.append({
+                        'contract_address': contract_address,
+                        'candidate_count': len(contract_candidates),
+                        'match_reasons': sorted({reason for item in contract_candidates for reason in item.match_reasons}),
+                    })
+                    continue
+                high_confidence_items.append((contract_address, contract_candidates))
+
+            if not open_license and high_confidence_items:
+                max_workers = max(1, min(8, len(high_confidence_items)))
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    for result in executor.map(
+                        lambda item: _analyze_high_confidence_contract(
+                            chain=chain,
+                            network=network,
+                            alchemy_api_key=alchemy_api_key,
+                            etherscan_api_key=etherscan_api_key,
+                            contract_address=item[0],
+                            contract_candidates=item[1],
+                            token_type=token_type,
+                            official_addresses=official_addresses,
+                            timeout=timeout,
+                            signal_cache=signal_cache,
+                            session=session,
+                        ),
+                        high_confidence_items,
+                    ):
+                        contract_address = result['contract_address']
+                        if result['status'] == 'legit':
+                            legit_duplicates.append({
+                                'contract_address': contract_address,
+                                'candidate_count': result['candidate_count'],
+                                'mint_recipients': result['mint_recipients'],
+                            })
+                            continue
+                        high_confidence.append({
+                            'contract_address': contract_address,
+                            'candidate_count': result['candidate_count'],
+                            'match_reasons': result['match_reasons'],
+                        })
+                        address_signals[contract_address] = result['address_signals']
+                        victim_signals[contract_address] = result['victim_signals']
+
+            if open_license:
+                high_confidence = []
+                low_confidence = []
+
+            return {
+                'seed_contract': asdict(contract_meta),
+                'seed_collection_stats': {
+                    'seed_nft_count': len(seed_nfts),
+                    'unique_token_uri_count': len({normalize_url(item.token_uri) for item in seed_nfts if normalize_url(item.token_uri)}),
+                    'unique_image_uri_count': len({normalize_url(item.image_uri) for item in seed_nfts if normalize_url(item.image_uri)}),
+                    'unique_name_count': len({normalize_name(item.name) for item in seed_nfts if normalize_name(item.name)}),
+                    'unique_symbol_count': len({normalize_symbol(item.symbol) for item in seed_nfts if normalize_symbol(item.symbol)}),
+                },
+                'duplicate_candidates': [asdict(item) for item in candidates],
+                'legit_duplicates': legit_duplicates,
+                'suspected_infringing_duplicates_high_confidence': high_confidence,
+                'suspected_infringing_duplicates_low_confidence': low_confidence,
+                'contract_level_summary': {
+                    contract_address: {
+                        'candidate_count': len(items),
+                        'high_confidence_token_count': sum(1 for item in items if item.confidence == 'high'),
+                        'low_confidence_token_count': sum(1 for item in items if item.confidence == 'low'),
+                    }
+                    for contract_address, items in grouped.items()
+                },
+                'address_signals': address_signals,
+                'victim_signals': victim_signals,
+                'report_summary': {
+                    'open_license_detected': open_license,
+                    'candidate_contract_count': len(grouped),
+                    'high_confidence_contract_count': len(high_confidence),
+                    'low_confidence_contract_count': len(low_confidence),
+                    'legit_duplicate_contract_count': len(legit_duplicates),
+                },
+            }
     finally:
         if own_conn and conn is not None:
             conn.close()
@@ -1131,6 +1315,122 @@ def write_default_outputs(payload: Dict[str, Any], output_path: str = '') -> tup
     md_path = json_path.with_suffix('.md')
     dump_results(payload, str(json_path))
     md_path.write_text(render_human_readable_report(payload), encoding='utf-8')
+    return json_path, md_path
+
+
+def write_outputs_to_directory(payload: Dict[str, Any], output_dir: str | Path) -> tuple[Path, Path]:
+    target_dir = Path(output_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    json_path = target_dir / f'{default_output_basename(payload)}.json'
+    md_path = json_path.with_suffix('.md')
+    dump_results(payload, str(json_path))
+    md_path.write_text(render_human_readable_report(payload), encoding='utf-8')
+    return json_path, md_path
+
+
+def build_batch_summary_payload(
+    payloads: Sequence[Dict[str, Any]],
+    output_index: Optional[Sequence[Dict[str, str]]] = None,
+) -> Dict[str, Any]:
+    reports: list[Dict[str, Any]] = []
+    total_candidates = 0
+    total_high = 0
+    total_low = 0
+    total_legit = 0
+    open_license_count = 0
+    chains: list[str] = []
+    output_index = output_index or []
+
+    for index, payload in enumerate(payloads):
+        seed = payload.get('seed_contract') or {}
+        summary = payload.get('report_summary') or {}
+        if summary.get('open_license_detected'):
+            open_license_count += 1
+        total_candidates += int(summary.get('candidate_contract_count') or 0)
+        total_high += int(summary.get('high_confidence_contract_count') or 0)
+        total_low += int(summary.get('low_confidence_contract_count') or 0)
+        total_legit += int(summary.get('legit_duplicate_contract_count') or 0)
+        chain = str(seed.get('chain') or '').strip()
+        if chain:
+            chains.append(chain)
+
+        report_entry: Dict[str, Any] = {
+            'seed_contract': seed,
+            'report_summary': summary,
+        }
+        if index < len(output_index):
+            report_entry['output_files'] = output_index[index]
+        elif payload.get('output_files'):
+            report_entry['output_files'] = payload['output_files']
+        reports.append(report_entry)
+
+    distinct_chains = sorted(set(chains))
+    return {
+        'batch_summary': {
+            'seed_report_count': len(payloads),
+            'chain': distinct_chains[0] if len(distinct_chains) == 1 else '',
+            'chains': distinct_chains,
+            'open_license_detected_count': open_license_count,
+            'candidate_contract_count_total': total_candidates,
+            'high_confidence_contract_count_total': total_high,
+            'low_confidence_contract_count_total': total_low,
+            'legit_duplicate_contract_count_total': total_legit,
+            'generated_at': datetime.now(timezone.utc).isoformat(),
+        },
+        'seed_reports': reports,
+    }
+
+
+def render_batch_human_readable_report(payload: Dict[str, Any]) -> str:
+    summary = payload.get('batch_summary') or {}
+    seed_reports = payload.get('seed_reports') or []
+    lines = [
+        '# Top NFT 合约批量分析总报告',
+        '',
+        '## 汇总',
+        f"- 种子合约报告数: {summary.get('seed_report_count', 0)}",
+        f"- 链: {summary.get('chain') or ', '.join(summary.get('chains') or []) or 'unknown'}",
+        f"- 检测到开放许可的 seed 数: {summary.get('open_license_detected_count', 0)}",
+        f"- 重复候选合约总数: {summary.get('candidate_contract_count_total', 0)}",
+        f"- 高置信疑似侵权合约总数: {summary.get('high_confidence_contract_count_total', 0)}",
+        f"- 低置信疑似侵权合约总数: {summary.get('low_confidence_contract_count_total', 0)}",
+        f"- 官方参与型重复合约总数: {summary.get('legit_duplicate_contract_count_total', 0)}",
+        f"- 生成时间(UTC): {summary.get('generated_at', '')}",
+        '',
+        '## Seed 报告索引',
+    ]
+
+    if not seed_reports:
+        lines.append('- 无')
+    else:
+        for item in seed_reports:
+            seed = item.get('seed_contract') or {}
+            report_summary = item.get('report_summary') or {}
+            output_files = item.get('output_files') or {}
+            seed_name = seed.get('name') or seed.get('contract_address') or 'unknown'
+            lines.append(
+                f"- {seed_name} ({seed.get('contract_address', '')}) | "
+                f"高置信={report_summary.get('high_confidence_contract_count', 0)} | "
+                f"低置信={report_summary.get('low_confidence_contract_count', 0)} | "
+                f"官方参与={report_summary.get('legit_duplicate_contract_count', 0)} | "
+                f"JSON={output_files.get('json', '')} | MD={output_files.get('markdown', '')}"
+            )
+
+    return '\n'.join(lines) + '\n'
+
+
+def write_batch_summary_outputs(
+    payloads: Sequence[Dict[str, Any]],
+    output_dir: str | Path,
+    output_index: Optional[Sequence[Dict[str, str]]] = None,
+) -> tuple[Path, Path]:
+    summary_payload = build_batch_summary_payload(payloads, output_index=output_index)
+    target_dir = Path(output_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    json_path = target_dir / 'top_contract_analysis__summary.json'
+    md_path = target_dir / 'top_contract_analysis__summary.md'
+    dump_results(summary_payload, str(json_path))
+    md_path.write_text(render_batch_human_readable_report(summary_payload), encoding='utf-8')
     return json_path, md_path
 
 
@@ -1253,21 +1553,43 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--alchemy-network', default='')
     parser.add_argument('--etherscan-api-key', default=os.getenv('ETHERSCAN_API_KEY', ''))
     parser.add_argument('--name-threshold', type=float, default=DEFAULT_NAME_THRESHOLD)
+    parser.add_argument('--metadata-threshold', type=float, default=0.55)
     parser.add_argument('--timeout', type=int, default=DEFAULT_TIMEOUT)
     parser.add_argument('--output', default='')
+    parser.add_argument('--feature-parquet', default='', help='optional parquet snapshot path to preload into DuckDB')
+    parser.add_argument('--feature-db', default=':memory:', help='duckdb database path for the feature store')
+    parser.add_argument('--signal-cache-db', default=':memory:', help='duckdb database path for cached chain signals')
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    from .duckdb_store import DuckDBFeatureStore
+    from .signal_cache import ContractSignalCache
+
     args = build_parser().parse_args(argv)
-    payload = analyze_seed_contract(
-        chain=args.chain,
-        seed_contract_address=args.seed_contract_address.lower(),
-        alchemy_api_key=args.alchemy_api_key,
-        alchemy_network=args.alchemy_network or None,
-        etherscan_api_key=args.etherscan_api_key,
-        name_threshold=args.name_threshold,
-        timeout=args.timeout,
-    )
-    write_default_outputs(payload, args.output)
+    feature_store = None
+    signal_cache = ContractSignalCache(database_path=args.signal_cache_db)
+    if args.feature_parquet:
+        feature_store = DuckDBFeatureStore(database_path=args.feature_db)
+        feature_store.load_parquet_dataset(args.chain, args.feature_parquet)
+    elif args.feature_db != ':memory:' and Path(args.feature_db).exists():
+        feature_store = DuckDBFeatureStore(database_path=args.feature_db)
+    try:
+        payload = analyze_seed_contract(
+            chain=args.chain,
+            seed_contract_address=args.seed_contract_address.lower(),
+            alchemy_api_key=args.alchemy_api_key,
+            alchemy_network=args.alchemy_network or None,
+            etherscan_api_key=args.etherscan_api_key,
+            feature_store=feature_store,
+            signal_cache=signal_cache,
+            name_threshold=args.name_threshold,
+            metadata_threshold=args.metadata_threshold,
+            timeout=args.timeout,
+        )
+        write_default_outputs(payload, args.output)
+    finally:
+        if feature_store is not None:
+            feature_store.close()
+        signal_cache.close()
     return 0
