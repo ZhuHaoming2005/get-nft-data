@@ -136,11 +136,33 @@ def _split_batches(items: Sequence[Tuple], batch_size: int) -> List[List[Tuple]]
 
 def ensure_columns(conn, chain: str) -> None:
     tbl = _table(chain)
+    required_columns = ("metadata", "retry_checked_at")
     with conn.cursor() as cur:
-        cur.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS metadata JSONB")
-        cur.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS retry_checked_at TIMESTAMPTZ")
-    conn.commit()
-    logger.info("已检查列 metadata/retry_checked_at：%s", tbl)
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = ANY(current_schemas(false))
+              AND table_name = %s
+              AND column_name IN ('metadata', 'retry_checked_at')
+            """,
+            (tbl,),
+        )
+        existing = {row[0] for row in cur.fetchall()}
+
+        altered = False
+        if "metadata" not in existing:
+            cur.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS metadata JSONB")
+            altered = True
+        if "retry_checked_at" not in existing:
+            cur.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS retry_checked_at TIMESTAMPTZ")
+            altered = True
+
+    if altered:
+        conn.commit()
+        logger.info("已补齐列 metadata/retry_checked_at：%s", tbl)
+    else:
+        logger.info("列 metadata/retry_checked_at 已存在，跳过 DDL：%s", tbl)
 
 
 def fetch_segment(conn, chain: str, *, limit: int, mode: str) -> List[Tuple]:

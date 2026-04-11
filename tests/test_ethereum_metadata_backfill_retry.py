@@ -66,6 +66,39 @@ def _load_backfill():
 backfill = _load_backfill()
 
 
+class _RecordingCursor:
+    def __init__(self, fetchall_result=None):
+        self.fetchall_result = fetchall_result or []
+        self.executed = []
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+
+    def fetchall(self):
+        return list(self.fetchall_result)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class _RecordingConn:
+    def __init__(self, fetchall_result=None):
+        self.cursor_obj = _RecordingCursor(fetchall_result)
+        self.commit_count = 0
+
+    def cursor(self):
+        return self.cursor_obj
+
+    def commit(self):
+        self.commit_count += 1
+
+    def close(self):
+        return None
+
+
 class RetryAsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_retry_async_retries_before_success(self):
         attempts = []
@@ -90,11 +123,17 @@ class RetryAsyncTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ProcessChainRetryTests(unittest.IsolatedAsyncioTestCase):
-    async def test_process_chain_skips_failed_batch_and_continues(self):
-        class _FakeConn:
-            def close(self):
-                return None
+    def test_ensure_columns_skips_alter_when_columns_already_exist(self):
+        conn = _RecordingConn([("metadata",), ("retry_checked_at",)])
 
+        backfill.ensure_columns(conn, "ethereum")
+
+        sqls = [sql for sql, _ in conn.cursor_obj.executed]
+        self.assertEqual(len(sqls), 1)
+        self.assertIn("information_schema.columns", sqls[0])
+        self.assertEqual(conn.commit_count, 0)
+
+    async def test_process_chain_skips_failed_batch_and_continues(self):
         class _FakeSession:
             async def __aenter__(self):
                 return self
@@ -113,7 +152,7 @@ class ProcessChainRetryTests(unittest.IsolatedAsyncioTestCase):
         try:
             backfill.METADATA_BACKFILL_MODE = "alchemy"
             backfill.METADATA_BACKFILL_BATCH_SIZE = 1
-            with patch.object(backfill, "_conn", return_value=_FakeConn()), \
+            with patch.object(backfill, "_conn", return_value=_RecordingConn()), \
                  patch.object(backfill, "ensure_columns"), \
                  patch.object(backfill, "fetch_segment", side_effect=[rows, []]), \
                  patch.object(backfill, "mark_rows_checked"), \
@@ -139,10 +178,6 @@ class ProcessChainRetryTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_process_chain_runs_alchemy_batches_concurrently(self):
-        class _FakeConn:
-            def close(self):
-                return None
-
         class _FakeSession:
             async def __aenter__(self):
                 return self
@@ -179,7 +214,7 @@ class ProcessChainRetryTests(unittest.IsolatedAsyncioTestCase):
             backfill.METADATA_BACKFILL_MODE = "alchemy"
             backfill.METADATA_BACKFILL_BATCH_SIZE = 1
             backfill.METADATA_BACKFILL_WORKERS = 3
-            with patch.object(backfill, "_conn", return_value=_FakeConn()), \
+            with patch.object(backfill, "_conn", return_value=_RecordingConn()), \
                  patch.object(backfill, "ensure_columns"), \
                  patch.object(backfill, "fetch_segment", side_effect=[rows, []]), \
                  patch.object(backfill, "mark_rows_checked"), \
@@ -196,10 +231,6 @@ class ProcessChainRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(state["max"], 2)
 
     async def test_process_chain_marks_only_failed_rows_checked(self):
-        class _FakeConn:
-            def close(self):
-                return None
-
         class _FakeSession:
             async def __aenter__(self):
                 return self
@@ -218,7 +249,7 @@ class ProcessChainRetryTests(unittest.IsolatedAsyncioTestCase):
         try:
             backfill.METADATA_BACKFILL_MODE = "alchemy"
             backfill.METADATA_BACKFILL_BATCH_SIZE = 1
-            with patch.object(backfill, "_conn", return_value=_FakeConn()), \
+            with patch.object(backfill, "_conn", return_value=_RecordingConn()), \
                  patch.object(backfill, "ensure_columns"), \
                  patch.object(backfill, "fetch_segment", side_effect=[rows, []]), \
                  patch.object(backfill, "mark_rows_checked") as mark_rows_checked, \
