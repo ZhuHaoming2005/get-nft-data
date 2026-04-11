@@ -25,6 +25,7 @@ from common import (
     END_BLOCK,
     BLOCK_BATCH_SIZE,
     SCAN_WINDOW,
+    REQUEST_STARTUP_STAGGER_SECONDS,
     logger,
     get_conn,
     init_db,
@@ -133,16 +134,32 @@ async def main() -> None:
 
     # Task 队列：每项为 (asyncio.Task, from_block, to_block)
     window: Deque[Tuple[asyncio.Task, int, int]] = deque()
+    enqueued_batches = 0
 
     def _enqueue() -> bool:
         """尝试向窗口追加一个新 fetch 任务，返回是否成功追加。"""
+        nonlocal enqueued_batches
         rng = _next_range()
         if rng is None:
             return False
         from_b, to_b = rng
+        startup_delay_seconds = (
+            REQUEST_STARTUP_STAGGER_SECONDS * enqueued_batches
+            if enqueued_batches < SCAN_WINDOW
+            else 0.0
+        )
+        enqueued_batches += 1
         logger.info("► 预取区块 [%d - %d] ↓", to_b, from_b)
         window.append((
-            asyncio.create_task(fetch_logs_http(rpc_session, RPC_URL, from_b, to_b)),
+            asyncio.create_task(
+                fetch_logs_http(
+                    rpc_session,
+                    RPC_URL,
+                    from_b,
+                    to_b,
+                    startup_delay_seconds=startup_delay_seconds,
+                )
+            ),
             from_b, to_b,
         ))
         return True

@@ -75,6 +75,10 @@ START_BLOCK      = int(os.getenv("START_BLOCK", "0"))
 END_BLOCK        = int(os.getenv("END_BLOCK", "0"))
 BLOCK_BATCH_SIZE = int(os.getenv("BLOCK_BATCH_SIZE", "2000"))
 REQUEST_DELAY    = float(os.getenv("REQUEST_DELAY", "0.1"))
+REQUEST_STARTUP_STAGGER_SECONDS = max(
+    0.0,
+    float(os.getenv("REQUEST_STARTUP_STAGGER_SECONDS", "0")),
+)
 
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = int(os.getenv("DB_PORT", "5432"))
@@ -726,6 +730,8 @@ async def fetch_alchemy_batch(
     session: aiohttp.ClientSession,
     sem: asyncio.Semaphore,
     tokens: List[Tuple[str, int, str]],
+    *,
+    startup_delay_seconds: float = 0.0,
 ) -> List[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[Any]]]:
     """
     调用 Alchemy getNFTMetadataBatch，批量获取 NFT 元数据。
@@ -759,6 +765,8 @@ async def fetch_alchemy_batch(
 
     max_retries = 3
     data = None
+    if startup_delay_seconds > 0:
+        await asyncio.sleep(startup_delay_seconds)
     for attempt in range(1, max_retries + 1):
         try:
             async with sem:
@@ -877,6 +885,8 @@ async def fetch_token_uri_batch(
     rpc_url: str,
     sem: asyncio.Semaphore,
     tokens: List[Tuple[str, int, str]],
+    *,
+    startup_delay_seconds: float = 0.0,
 ) -> List[Optional[str]]:
     """通过单次 JSON-RPC batch eth_call 批量获取 tokenURI/uri。"""
     if not tokens:
@@ -903,6 +913,8 @@ async def fetch_token_uri_batch(
 
     max_retries = 3
     data = None
+    if startup_delay_seconds > 0:
+        await asyncio.sleep(startup_delay_seconds)
     for attempt in range(1, max_retries + 1):
         try:
             async with sem:
@@ -1079,12 +1091,16 @@ async def fetch_logs_http(
     rpc_url: str,
     from_block: int,
     to_block: int,
+    *,
+    startup_delay_seconds: float = 0.0,
 ) -> list:
     """
     直接通过 aiohttp 并发请求三种 topic 的 eth_getLogs。
     与 fetch_logs（依赖 web3.py AsyncHTTPProvider）相比，
     此函数中每个 topic 请求独占连接池中的一条连接，HTTP 层真正并发。
     """
+    if startup_delay_seconds > 0:
+        await asyncio.sleep(startup_delay_seconds)
     results = await asyncio.gather(*[
         _fetch_logs_one_topic_http(
             session, rpc_url, from_block, to_block, topic, _TOPIC_LABEL[topic]

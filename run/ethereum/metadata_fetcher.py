@@ -32,6 +32,7 @@ from common import (
     FETCH_IDLE_WAIT,
     FETCH_CLAIM_BATCH_SIZE,
     CLAIM_RETRY_AFTER_SECONDS,
+    REQUEST_STARTUP_STAGGER_SECONDS,
     logger,
     get_conn,
     init_db,
@@ -54,6 +55,10 @@ from common import (
 # tokenUri 黑名单前缀：匹配则视为无效，不写入主表
 _INVALID_URI_PREFIXES = ("api.tierlock.com/uri/",)
 FETCHER_WORKERS = max(int(os.getenv("FETCHER_WORKERS", "1")), 1)
+WORKER_STARTUP_DELAY_SECONDS = max(
+    0.0,
+    float(os.getenv("WORKER_STARTUP_DELAY_SECONDS", "0")),
+)
 
 
 def _cleanup_blacklisted_pending(
@@ -89,6 +94,19 @@ def _cleanup_blacklisted_pending(
     return remaining_ids, blacklisted_ids, main_deleted, temp_deleted
 
 
+async def _maybe_wait_worker_startup(worker_index: int) -> None:
+    delay = WORKER_STARTUP_DELAY_SECONDS * max(worker_index - 1, 0)
+    if delay > 0:
+        logger.info("worker-%d 启动延迟 %.2f 秒，避免冷启动洪流", worker_index, delay)
+        await asyncio.sleep(delay)
+
+
+def _batch_startup_delay(batch_index: int) -> float:
+    if REQUEST_STARTUP_STAGGER_SECONDS <= 0:
+        return 0.0
+    return REQUEST_STARTUP_STAGGER_SECONDS * max(batch_index - 1, 0)
+
+
 async def _process_batch(
     session: aiohttp.ClientSession,
     w3: AsyncWeb3,
@@ -115,8 +133,13 @@ async def _process_batch(
         for i in range(0, len(tokens), ALCHEMY_BATCH_SIZE)
     ]
     chunk_results = await asyncio.gather(*[
-        fetch_alchemy_batch(session, alchemy_sem, chunk)
-        for chunk in chunks
+        fetch_alchemy_batch(
+            session,
+            alchemy_sem,
+            chunk,
+            startup_delay_seconds=_batch_startup_delay(batch_index),
+        )
+        for batch_index, chunk in enumerate(chunks, start=1)
     ]) if chunks else []
 
     alchemy_results: List[
@@ -134,8 +157,14 @@ async def _process_batch(
             for i in range(0, len(fallback_tokens), RPC_BATCH_SIZE)
         ]
         chunk_uris = await asyncio.gather(*[
-            fetch_token_uri_batch(session, RPC_URL, uri_sem, chunk)
-            for chunk in rpc_chunks
+            fetch_token_uri_batch(
+                session,
+                RPC_URL,
+                uri_sem,
+                chunk,
+                startup_delay_seconds=_batch_startup_delay(batch_index),
+            )
+            for batch_index, chunk in enumerate(rpc_chunks, start=1)
         ])
         fallback_uris = [uri for chunk in chunk_uris for uri in chunk]
 
@@ -224,6 +253,7 @@ def _build_worker_id(worker_index: int) -> str:
 
 
 async def _worker_main(worker_index: int) -> None:
+    await _maybe_wait_worker_startup(worker_index)
     worker_id = _build_worker_id(worker_index)
     logger.info(
         "═══ Metadata 获取器启动 ═══  链: %s | worker=%s | RPC: %s | claim_batch=%d | reclaim_after=%ds",

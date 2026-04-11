@@ -70,6 +70,10 @@ METADATA_BACKFILL_CHAIN_CONCURRENCY = max(
     1,
     int(os.getenv("METADATA_BACKFILL_CHAIN_CONCURRENCY", "2")),
 )
+REQUEST_STARTUP_STAGGER_SECONDS = max(
+    0.0,
+    float(os.getenv("REQUEST_STARTUP_STAGGER_SECONDS", "0")),
+)
 METADATA_BACKFILL_RETRY_MAX_ATTEMPTS = max(1, int(os.getenv("METADATA_BACKFILL_RETRY_MAX_ATTEMPTS", "3")))
 METADATA_BACKFILL_RETRY_BASE_DELAY_SECONDS = max(
     0.0,
@@ -307,6 +311,8 @@ async def fetch_alchemy_batch(
     chain: str,
     sem: asyncio.Semaphore,
     rows: List[Tuple[int, str, int, Optional[str]]],
+    *,
+    startup_delay_seconds: float = 0.0,
 ) -> List[Tuple[int, Optional[Dict], Optional[str]]]:
     url = (
         f"https://{_alchemy_network(chain)}.g.alchemy.com"
@@ -328,6 +334,8 @@ async def fetch_alchemy_batch(
         total=METADATA_TIMEOUT,
         connect=METADATA_CONNECT_TIMEOUT,
     )
+    if startup_delay_seconds > 0:
+        await asyncio.sleep(startup_delay_seconds)
     async with sem:
         async with session.post(url, json=payload, timeout=timeout) as resp:
             resp.raise_for_status()
@@ -349,11 +357,18 @@ async def _fetch_alchemy_batch_with_retry(
     sem: asyncio.Semaphore,
     rows: List[Tuple[int, str, int, Optional[str]]],
     *,
+    startup_delay_seconds: float = 0.0,
     batch_index: int,
     total_batches: int,
 ) -> List[Tuple[int, Optional[Dict], Optional[str]]]:
     return await _retry_async(
-        lambda: fetch_alchemy_batch(session, chain, sem, rows),
+        lambda: fetch_alchemy_batch(
+            session,
+            chain,
+            sem,
+            rows,
+            startup_delay_seconds=startup_delay_seconds,
+        ),
         operation_name=f"Alchemy 批次请求 {batch_index}/{total_batches}",
         chain=chain,
         swallow_exception=True,
@@ -416,7 +431,11 @@ async def fetch_token_uri_metadata_batch(
     session: aiohttp.ClientSession,
     sem: asyncio.Semaphore,
     rows: List[Tuple[int, str]],
+    *,
+    startup_delay_seconds: float = 0.0,
 ) -> List[Tuple[int, Optional[Dict], Optional[str]]]:
+    if startup_delay_seconds > 0:
+        await asyncio.sleep(startup_delay_seconds)
     return list(
         await asyncio.gather(
             *[
@@ -433,11 +452,17 @@ async def _fetch_token_uri_metadata_batch_with_retry(
     sem: asyncio.Semaphore,
     rows: List[Tuple[int, str]],
     *,
+    startup_delay_seconds: float = 0.0,
     batch_index: int,
     total_batches: int,
 ) -> List[Tuple[int, Optional[Dict], Optional[str]]]:
     return await _retry_async(
-        lambda: fetch_token_uri_metadata_batch(session, sem, rows),
+        lambda: fetch_token_uri_metadata_batch(
+            session,
+            sem,
+            rows,
+            startup_delay_seconds=startup_delay_seconds,
+        ),
         operation_name=f"token_uri 批次请求 {batch_index}/{total_batches}",
         chain=chain,
         swallow_exception=True,
@@ -482,6 +507,7 @@ async def _process_chain(chain: str) -> int:
                             chain,
                             sem,
                             batch,
+                            startup_delay_seconds=REQUEST_STARTUP_STAGGER_SECONDS * max(batch_index - 1, 0),
                             batch_index=batch_index,
                             total_batches=total_batches,
                         )
@@ -497,6 +523,7 @@ async def _process_chain(chain: str) -> int:
                             chain,
                             sem,
                             batch,
+                            startup_delay_seconds=REQUEST_STARTUP_STAGGER_SECONDS * max(batch_index - 1, 0),
                             batch_index=batch_index,
                             total_batches=total_batches,
                         )
