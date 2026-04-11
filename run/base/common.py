@@ -411,7 +411,15 @@ def batch_insert_main(conn, chain_name: str, records: List[Tuple]) -> int:
     conn.commit()
 
     def _clean(v):
-        return v.replace("\x00", "") if isinstance(v, str) else v
+        if isinstance(v, str):
+            return v.replace("\x00", "")
+        if isinstance(v, dict):
+            return {_clean(k): _clean(val) for k, val in v.items()}
+        if isinstance(v, list):
+            return [_clean(item) for item in v]
+        if isinstance(v, tuple):
+            return tuple(_clean(item) for item in v)
+        return v
 
     def _normalize(rec: Tuple[Any, ...]) -> Tuple[Any, ...]:
         cleaned = tuple(_clean(v) for v in rec)

@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 import types
 import unittest
@@ -151,6 +152,58 @@ class BaseCommonTruncationTests(unittest.TestCase):
         self.assertEqual(page[0][4], "N" * 200)
         self.assertEqual(page[0][5], "S" * 20)
         self.assertEqual(page[0][7], "ERC-721-TO")
+
+    def test_batch_insert_main_removes_null_bytes_from_nested_metadata_strings(self):
+        conn = _RecordingConn(
+            fetchall_results=[
+                [("name", 200), ("symbol", 20), ("token_standard", 10)],
+            ]
+        )
+        calls = []
+
+        def _fake_execute_values(cur, sql, page, template=None, page_size=None):
+            calls.append(list(page))
+            cur.rowcount = len(page)
+
+        original = self.common.execute_values
+        self.common.execute_values = _fake_execute_values
+        try:
+            inserted = self.common.batch_insert_main(
+                conn,
+                "ethereum",
+                [
+                    (
+                        "0xabc",
+                        "1",
+                        "ipfs://token/1",
+                        "ipfs://image/1",
+                        "NFT\x00 Name",
+                        "SYM\x00",
+                        {
+                            "name": "ABU\x00NDANCE",
+                            "description": "t{zg%pzeuq\x00tail",
+                            "attributes": [
+                                {"trait_type": "rarity\x00", "value": "legendary\x00"},
+                            ],
+                        },
+                        "ERC-721",
+                        123,
+                    )
+                ],
+            )
+        finally:
+            self.common.execute_values = original
+
+        self.assertEqual(inserted, 1)
+        page = calls[0]
+        self.assertEqual(page[0][4], "NFT Name")
+        self.assertEqual(page[0][5], "SYM")
+        metadata = json.loads(page[0][6])
+        self.assertEqual(metadata["name"], "ABUNDANCE")
+        self.assertEqual(metadata["description"], "t{zg%pzeuqtail")
+        self.assertEqual(metadata["attributes"][0]["trait_type"], "rarity")
+        self.assertEqual(metadata["attributes"][0]["value"], "legendary")
+        self.assertNotIn("\\u0000", page[0][6])
 
 
 if __name__ == "__main__":
