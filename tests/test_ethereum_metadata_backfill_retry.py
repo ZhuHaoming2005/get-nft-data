@@ -1,6 +1,7 @@
 import asyncio
 import importlib.util
 import sys
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -324,6 +325,50 @@ class ProcessChainRetryTests(unittest.IsolatedAsyncioTestCase):
         )
         mark_rows_checked.assert_called_once_with(unittest.mock.ANY, "ethereum", [1])
 
+    async def test_process_chain_stops_before_fetching_next_segment_when_stop_requested(self):
+        class _FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        rows = [
+            (1, "0xabc", 10, "ERC-721", "https://example/10", None),
+        ]
+        stop_event = threading.Event()
+        fetch_segment_calls = []
+
+        def _fake_fetch_segment(conn, chain, *, limit, mode):
+            fetch_segment_calls.append((chain, limit, mode))
+            return rows if len(fetch_segment_calls) == 1 else [
+                (2, "0xdef", 11, "ERC-721", "https://example/11", None),
+            ]
+
+        async def _fake_fetch(*args, **kwargs):
+            stop_event.set()
+            return [(1, {"name": "NFT 1"}, "https://cdn.example/1.png")]
+
+        original_mode = backfill.METADATA_BACKFILL_MODE
+        original_batch = backfill.METADATA_BACKFILL_BATCH_SIZE
+        try:
+            backfill.METADATA_BACKFILL_MODE = "alchemy"
+            backfill.METADATA_BACKFILL_BATCH_SIZE = 1
+            with patch.object(backfill, "_conn", return_value=_RecordingConn()), \
+                 patch.object(backfill, "ensure_columns"), \
+                 patch.object(backfill, "fetch_segment", side_effect=_fake_fetch_segment), \
+                 patch.object(backfill, "mark_rows_checked"), \
+                 patch.object(backfill.aiohttp, "ClientSession", return_value=_FakeSession()), \
+                 patch.object(backfill, "_fetch_alchemy_batch_with_retry", side_effect=_fake_fetch), \
+                 patch.object(backfill, "bulk_update_rows", side_effect=lambda conn, chain, batch: len(batch)):
+                updated = await backfill._process_chain("ethereum", stop_event=stop_event)
+        finally:
+            backfill.METADATA_BACKFILL_MODE = original_mode
+            backfill.METADATA_BACKFILL_BATCH_SIZE = original_batch
+
+        self.assertEqual(updated, 1)
+        self.assertEqual(len(fetch_segment_calls), 1)
+
 
 class MainRetryTests(unittest.IsolatedAsyncioTestCase):
     async def test_amain_continues_to_next_chain_after_chain_failure(self):
@@ -340,7 +385,7 @@ class MainRetryTests(unittest.IsolatedAsyncioTestCase):
         original_chain_concurrency = backfill.METADATA_BACKFILL_CHAIN_CONCURRENCY
         state = {"current": 0, "max": 0}
 
-        async def _fake_process_chain(chain):
+        async def _fake_process_chain(chain, stop_event=None):
             state["current"] += 1
             state["max"] = max(state["max"], state["current"])
             await asyncio.sleep(0.01)

@@ -1,5 +1,7 @@
+import asyncio
 import importlib.util
 import sys
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -175,6 +177,54 @@ class MetadataFetcherStartupJitterTests(unittest.IsolatedAsyncioTestCase):
             fetcher.WORKER_STARTUP_DELAY_SECONDS = original_delay
 
         sleep_mock.assert_not_awaited()
+
+
+class MetadataFetcherShutdownTests(unittest.IsolatedAsyncioTestCase):
+    async def test_worker_releases_claimed_rows_when_interrupted_mid_batch(self):
+        class _FakeAsyncWeb3:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def is_connected(self):
+                return True
+
+        class _FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class _FakeConn:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        conn = _FakeConn()
+        released = []
+        pending = [(1, "0xabc", 1, "ERC-721", 100)]
+
+        async def _boom(*args, **kwargs):
+            raise KeyboardInterrupt()
+
+        with patch.object(fetcher, "_maybe_wait_worker_startup"), \
+             patch.object(fetcher, "AsyncWeb3", _FakeAsyncWeb3), \
+             patch.object(fetcher, "AsyncHTTPProvider", lambda *args, **kwargs: object()), \
+             patch.object(fetcher, "get_conn", return_value=conn), \
+             patch.object(fetcher, "fix_token_id_placeholders", return_value=0), \
+             patch.object(fetcher, "claim_pending_nfts", side_effect=[pending]), \
+             patch.object(fetcher.aiohttp, "ClientSession", return_value=_FakeSession()), \
+             patch.object(fetcher, "_process_batch", side_effect=_boom), \
+             patch.object(fetcher, "release_temp_claims", side_effect=lambda _conn, _chain, ids, worker_id: released.append((list(ids), worker_id)) or len(ids)):
+            with self.assertRaises(KeyboardInterrupt):
+                await fetcher._worker_main(1, stop_event=threading.Event())
+
+        self.assertEqual(len(released), 1)
+        self.assertEqual(released[0][0], [1])
+        self.assertIn("worker-1", released[0][1])
+        self.assertTrue(conn.closed)
 
 
 if __name__ == "__main__":

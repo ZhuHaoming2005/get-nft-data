@@ -14,8 +14,12 @@
 import asyncio
 import multiprocessing
 import os
+import signal
 import socket
 import sys
+import threading
+import time
+from contextlib import contextmanager
 from typing import List, Optional, Set, Tuple
 
 import aiohttp
@@ -59,6 +63,52 @@ WORKER_STARTUP_DELAY_SECONDS = max(
     0.0,
     float(os.getenv("WORKER_STARTUP_DELAY_SECONDS", "0")),
 )
+WORKER_SHUTDOWN_GRACE_SECONDS = max(
+    1.0,
+    float(os.getenv("WORKER_SHUTDOWN_GRACE_SECONDS", "5")),
+)
+
+
+def _is_stop_requested(stop_event) -> bool:
+    return bool(stop_event is not None and stop_event.is_set())
+
+
+@contextmanager
+def _install_stop_signal_handlers(stop_event):
+    handlers = {}
+
+    def _handle_stop(signum, frame):
+        if not _is_stop_requested(stop_event):
+            logger.info("收到停止信号，停止认领新记录，等待当前批次和善后完成...")
+        stop_event.set()
+
+    for sig in (signal.SIGINT, getattr(signal, "SIGTERM", None)):
+        if sig is None:
+            continue
+        try:
+            handlers[sig] = signal.getsignal(sig)
+            signal.signal(sig, _handle_stop)
+        except (OSError, RuntimeError, ValueError):
+            continue
+    try:
+        yield
+    finally:
+        for sig, previous in handlers.items():
+            try:
+                signal.signal(sig, previous)
+            except (OSError, RuntimeError, ValueError):
+                continue
+
+
+async def _sleep_interruptibly(delay: float, stop_event=None, *, interval: float = 0.5) -> bool:
+    remaining = max(0.0, delay)
+    while remaining > 0:
+        if _is_stop_requested(stop_event):
+            return True
+        step = min(interval, remaining)
+        await asyncio.sleep(step)
+        remaining -= step
+    return _is_stop_requested(stop_event)
 
 
 def _cleanup_blacklisted_pending(
@@ -94,11 +144,14 @@ def _cleanup_blacklisted_pending(
     return remaining_ids, blacklisted_ids, main_deleted, temp_deleted
 
 
-async def _maybe_wait_worker_startup(worker_index: int) -> None:
+async def _maybe_wait_worker_startup(worker_index: int, stop_event=None) -> None:
     delay = WORKER_STARTUP_DELAY_SECONDS * max(worker_index - 1, 0)
     if delay > 0:
         logger.info("worker-%d 启动延迟 %.2f 秒，避免冷启动洪流", worker_index, delay)
-        await asyncio.sleep(delay)
+        if stop_event is None:
+            await asyncio.sleep(delay)
+        else:
+            await _sleep_interruptibly(delay, stop_event)
 
 
 def _batch_startup_delay(batch_index: int) -> float:
@@ -252,8 +305,9 @@ def _build_worker_id(worker_index: int) -> str:
     return f"{socket.gethostname()}:{os.getpid()}:worker-{worker_index}"
 
 
-async def _worker_main(worker_index: int) -> None:
-    await _maybe_wait_worker_startup(worker_index)
+async def _worker_main(worker_index: int, stop_event=None) -> None:
+    stop_event = stop_event or threading.Event()
+    await _maybe_wait_worker_startup(worker_index, stop_event)
     worker_id = _build_worker_id(worker_index)
     logger.info(
         "═══ Metadata 获取器启动 ═══  链: %s | worker=%s | RPC: %s | claim_batch=%d | reclaim_after=%ds",
@@ -264,175 +318,212 @@ async def _worker_main(worker_index: int) -> None:
         CLAIM_RETRY_AFTER_SECONDS,
     )
 
-    # ── 连接节点（用于链上合约 fallback）────────────────────────────────────────
-    w3 = AsyncWeb3(AsyncHTTPProvider(RPC_URL, request_kwargs={"timeout": 30}))
-    if not await w3.is_connected():
-        logger.error("无法连接 RPC 节点，请检查 RPC_URL")
-        sys.exit(1)
-    logger.info("RPC 节点连接成功")
+    conn = None
+    pending_ids: List[int] = []
+    try:
+        w3 = AsyncWeb3(AsyncHTTPProvider(RPC_URL, request_kwargs={"timeout": 30}))
+        if not await w3.is_connected():
+            logger.error("无法连接 RPC 节点，请检查 RPC_URL")
+            sys.exit(1)
+        logger.info("RPC 节点连接成功")
 
-    # ── 连接数据库 ────────────────────────────────────────────────────────────
-    conn = get_conn()
+        conn = get_conn()
 
-    # 一次性修复：将主表中历史写入但未展开 {id} 的 ERC-1155 token URI 补全
-    fixed = fix_token_id_placeholders(conn, CHAIN_NAME)
-    if fixed:
-        logger.info("历史记录 {id} 占位符修复完成，共更新 %d 条", fixed)
+        fixed = fix_token_id_placeholders(conn, CHAIN_NAME)
+        if fixed:
+            logger.info("历史记录 {id} 占位符修复完成，共更新 %d 条", fixed)
 
-    total_inserted = total_deleted = 0
-    alchemy_sem = asyncio.Semaphore(CONCURRENT_ALCHEMY)
-    uri_sem = asyncio.Semaphore(CONCURRENT_RPC)
-    connector = aiohttp.TCPConnector(limit=max(CONCURRENT_ALCHEMY * 2, 20), ttl_dns_cache=300)
+        total_inserted = total_deleted = 0
+        alchemy_sem = asyncio.Semaphore(CONCURRENT_ALCHEMY)
+        uri_sem = asyncio.Semaphore(CONCURRENT_RPC)
+        connector = aiohttp.TCPConnector(limit=max(CONCURRENT_ALCHEMY * 2, 20), ttl_dns_cache=300)
 
-    # ── 主循环：持续消费临时表 ────────────────────────────────────────────────
-    async with aiohttp.ClientSession(
-        trust_env=True,
-        connector=connector,
-        connector_owner=True,
-    ) as session:
-        while True:
-            pending = claim_pending_nfts(
-                conn,
-                CHAIN_NAME,
-                worker_id=worker_id,
-                batch_size=FETCH_CLAIM_BATCH_SIZE,
-                reclaim_after_seconds=CLAIM_RETRY_AFTER_SECONDS,
-            )
-
-            if not pending:
-                logger.info(
-                    "worker=%s 未认领到记录，等待 %d 秒后重试...",
-                    worker_id,
-                    FETCH_IDLE_WAIT,
-                )
-                await asyncio.sleep(FETCH_IDLE_WAIT)
-                continue
-
-            logger.info("► worker=%s 认领并处理临时表 %d 条记录", worker_id, len(pending))
-            try:
-                inserts, all_ids, onchain_image_contracts = await _process_batch(
-                    session,
-                    w3,
-                    alchemy_sem,
-                    uri_sem,
-                    pending,
-                )
-            except Exception:
-                released = release_temp_claims(
+        async with aiohttp.ClientSession(
+            trust_env=True,
+            connector=connector,
+            connector_owner=True,
+        ) as session:
+            while not _is_stop_requested(stop_event):
+                pending = claim_pending_nfts(
                     conn,
                     CHAIN_NAME,
-                    [row[0] for row in pending],
-                    worker_id,
+                    worker_id=worker_id,
+                    batch_size=FETCH_CLAIM_BATCH_SIZE,
+                    reclaim_after_seconds=CLAIM_RETRY_AFTER_SECONDS,
                 )
-                logger.exception(
-                    "worker=%s 批次处理失败，已释放 %d 条认领记录等待重试",
-                    worker_id,
-                    released,
-                )
-                await asyncio.sleep(1)
-                continue
-            newly_blacklisted_contracts = {addr.lower() for addr in onchain_image_contracts}
+                pending_ids = [row[0] for row in pending]
 
-            # ── 处理链上存储图像合约（data:image）────────────────────────────
-            if newly_blacklisted_contracts:
-                logger.info(
-                    "  检测到 %d 个链上存储图像合约（image_uri 以 data:image 开头），"
-                    "加入黑名单: %s",
-                    len(newly_blacklisted_contracts), sorted(newly_blacklisted_contracts),
-                )
-                # 1. 更新 .env 黑名单（持久化，重启后生效）
-                append_blacklist_env(newly_blacklisted_contracts)
+                if _is_stop_requested(stop_event):
+                    break
 
-            effective_blacklist = {
-                addr.lower() for addr in load_blacklist()
-            } | newly_blacklisted_contracts
-            inserts = [
-                record for record in inserts
-                if record[0] not in effective_blacklist
-            ]
-
-            blacklisted_main_del = blacklisted_temp_sweep_del = 0
-            blacklisted_ids: List[int] = []
-            if effective_blacklist:
-                all_ids, blacklisted_ids, blacklisted_main_del, blacklisted_temp_sweep_del = (
-                    _cleanup_blacklisted_pending(
-                        conn,
-                        pending,
-                        all_ids,
-                        effective_blacklist,
-                        newly_blacklisted_contracts,
+                if not pending:
+                    logger.info(
+                        "worker=%s 未认领到记录，等待 %d 秒后重试...",
+                        worker_id,
+                        FETCH_IDLE_WAIT,
                     )
-                )
+                    if await _sleep_interruptibly(FETCH_IDLE_WAIT, stop_event):
+                        break
+                    continue
+
+                logger.info("► worker=%s 认领并处理临时表 %d 条记录", worker_id, len(pending))
+                try:
+                    inserts, all_ids, onchain_image_contracts = await _process_batch(
+                        session,
+                        w3,
+                        alchemy_sem,
+                        uri_sem,
+                        pending,
+                    )
+                except Exception:
+                    released = release_temp_claims(
+                        conn,
+                        CHAIN_NAME,
+                        pending_ids,
+                        worker_id,
+                    )
+                    pending_ids = []
+                    logger.exception(
+                        "worker=%s 批次处理失败，已释放 %d 条认领记录等待重试",
+                        worker_id,
+                        released,
+                    )
+                    if await _sleep_interruptibly(1, stop_event):
+                        break
+                    continue
+                newly_blacklisted_contracts = {addr.lower() for addr in onchain_image_contracts}
+
+                if newly_blacklisted_contracts:
+                    logger.info(
+                        "  检测到 %d 个链上存储图像合约（image_uri 以 data:image 开头），"
+                        "加入黑名单: %s",
+                        len(newly_blacklisted_contracts), sorted(newly_blacklisted_contracts),
+                    )
+                    append_blacklist_env(newly_blacklisted_contracts)
+
+                effective_blacklist = {
+                    addr.lower() for addr in load_blacklist()
+                } | newly_blacklisted_contracts
+                inserts = [
+                    record for record in inserts
+                    if record[0] not in effective_blacklist
+                ]
+
+                blacklisted_main_del = blacklisted_temp_sweep_del = 0
+                blacklisted_ids: List[int] = []
+                if effective_blacklist:
+                    all_ids, blacklisted_ids, blacklisted_main_del, blacklisted_temp_sweep_del = (
+                        _cleanup_blacklisted_pending(
+                            conn,
+                            pending,
+                            all_ids,
+                            effective_blacklist,
+                            newly_blacklisted_contracts,
+                        )
+                    )
+                    logger.info(
+                        "  黑名单清理完成: 当前批次按 id 删除 %d 条，主表删除 %d 条，"
+                        "临时表补偿删除 %d 条",
+                        len(blacklisted_ids),
+                        blacklisted_main_del,
+                        blacklisted_temp_sweep_del,
+                    )
+                blacklisted_rows = len(blacklisted_ids)
+
+                inserted = batch_insert_main(conn, CHAIN_NAME, inserts)
+                deleted = delete_temp_nfts(conn, CHAIN_NAME, all_ids)
+                pending_ids = []
+                discarded = len(pending) - len(inserts) - blacklisted_rows
+
+                total_inserted += inserted
+                total_deleted += deleted + blacklisted_rows + blacklisted_temp_sweep_del
                 logger.info(
-                    "  黑名单清理完成: 当前批次按 id 删除 %d 条，主表删除 %d 条，"
-                    "临时表补偿删除 %d 条",
-                    len(blacklisted_ids),
-                    blacklisted_main_del,
-                    blacklisted_temp_sweep_del,
+                    "  worker=%s 本批: 写入主表 %d，从临时表删除 %d（无效丢弃 %d，黑名单合约 %d 个）"
+                    " | 累计写入 %d，累计删除 %d",
+                    worker_id,
+                    inserted, deleted + blacklisted_rows + blacklisted_temp_sweep_del,
+                    discarded,
+                    len(newly_blacklisted_contracts),
+                    total_inserted, total_deleted,
                 )
-            blacklisted_rows = len(blacklisted_ids)
 
-            # 有效记录写主表
-            inserted = batch_insert_main(conn, CHAIN_NAME, inserts)
-            # 全部处理过的记录从临时表删除
-            deleted = delete_temp_nfts(conn, CHAIN_NAME, all_ids)
-            discarded = len(pending) - len(inserts) - blacklisted_rows
-
-            total_inserted += inserted
-            total_deleted += deleted + blacklisted_rows + blacklisted_temp_sweep_del
-            logger.info(
-                "  worker=%s 本批: 写入主表 %d，从临时表删除 %d（无效丢弃 %d，黑名单合约 %d 个）"
-                " | 累计写入 %d，累计删除 %d",
-                worker_id,
-                inserted, deleted + blacklisted_rows + blacklisted_temp_sweep_del,
-                discarded,
-                len(newly_blacklisted_contracts),
-                total_inserted, total_deleted,
-            )
+        if _is_stop_requested(stop_event):
+            logger.info("worker=%s 已停止认领新记录，当前批次和善后已完成", worker_id)
+    finally:
+        if pending_ids and conn is not None:
+            try:
+                released = release_temp_claims(conn, CHAIN_NAME, pending_ids, worker_id)
+                logger.info("worker=%s 退出前释放 %d 条未完成认领记录", worker_id, released)
+            except Exception:
+                logger.exception("worker=%s 退出释放认领记录失败", worker_id)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
-def _run_worker_process(worker_index: int) -> None:
+def _run_worker_process(worker_index: int, stop_event=None) -> None:
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    asyncio.run(_worker_main(worker_index))
+    local_stop_event = stop_event or threading.Event()
+    with _install_stop_signal_handlers(local_stop_event):
+        asyncio.run(_worker_main(worker_index, stop_event=local_stop_event))
+
+
+def _wait_for_workers(workers: List[multiprocessing.Process], stop_event) -> None:
+    deadline: Optional[float] = None
+    while any(proc.is_alive() for proc in workers):
+        for proc in workers:
+            proc.join(timeout=0.2)
+        if _is_stop_requested(stop_event):
+            if deadline is None:
+                deadline = time.monotonic() + WORKER_SHUTDOWN_GRACE_SECONDS
+            elif time.monotonic() >= deadline:
+                break
+
+    lingering = [proc for proc in workers if proc.is_alive()]
+    if lingering:
+        logger.info("仍有 %d 个 metadata worker 未在宽限期内退出，执行强制停止", len(lingering))
+        for proc in lingering:
+            proc.terminate()
+        for proc in lingering:
+            proc.join(timeout=1)
 
 
 def main() -> None:
     conn = get_conn()
     init_db(conn, CHAIN_NAME)
     conn.close()
+    stop_event = multiprocessing.Event()
 
-    if FETCHER_WORKERS <= 1:
-        _run_worker_process(1)
-        return
+    with _install_stop_signal_handlers(stop_event):
+        if FETCHER_WORKERS <= 1:
+            _run_worker_process(1, stop_event)
+            return
 
-    logger.info(
-        "启动 %d 个 metadata worker 进程；每进程并发: Alchemy=%d, RPC=%d",
-        FETCHER_WORKERS,
-        CONCURRENT_ALCHEMY,
-        CONCURRENT_RPC,
-    )
-    workers = [
-        multiprocessing.Process(
-            target=_run_worker_process,
-            args=(index,),
-            name=f"{CHAIN_NAME}-metadata-{index}",
+        logger.info(
+            "启动 %d 个 metadata worker 进程；每进程并发: Alchemy=%d, RPC=%d",
+            FETCHER_WORKERS,
+            CONCURRENT_ALCHEMY,
+            CONCURRENT_RPC,
         )
-        for index in range(1, FETCHER_WORKERS + 1)
-    ]
-    for proc in workers:
-        proc.start()
+        workers = [
+            multiprocessing.Process(
+                target=_run_worker_process,
+                args=(index, stop_event),
+                name=f"{CHAIN_NAME}-metadata-{index}",
+            )
+            for index in range(1, FETCHER_WORKERS + 1)
+        ]
+        for proc in workers:
+            proc.start()
 
-    try:
-        for proc in workers:
-            proc.join()
-    except KeyboardInterrupt:
-        logger.info("收到中断信号，准备停止所有 metadata worker...")
-        for proc in workers:
-            if proc.is_alive():
-                proc.terminate()
-        for proc in workers:
-            proc.join(timeout=5)
+        try:
+            _wait_for_workers(workers, stop_event)
+        except KeyboardInterrupt:
+            stop_event.set()
+            _wait_for_workers(workers, stop_event)
 
 
 if __name__ == "__main__":

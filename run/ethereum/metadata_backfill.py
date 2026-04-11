@@ -33,7 +33,10 @@ import json
 import logging
 import os
 import re
+import signal
 import sys
+import threading
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import aiohttp
@@ -128,6 +131,37 @@ def _safe_close(conn) -> None:
             close()
         except Exception:
             pass
+
+
+def _is_stop_requested(stop_event) -> bool:
+    return bool(stop_event is not None and stop_event.is_set())
+
+
+@contextmanager
+def _install_stop_signal_handlers(stop_event):
+    handlers = {}
+
+    def _handle_stop(signum, frame):
+        if not _is_stop_requested(stop_event):
+            logger.info("收到停止信号，停止拉取新批次，等待当前 metadata 回填完成...")
+        stop_event.set()
+
+    for sig in (signal.SIGINT, getattr(signal, "SIGTERM", None)):
+        if sig is None:
+            continue
+        try:
+            handlers[sig] = signal.getsignal(sig)
+            signal.signal(sig, _handle_stop)
+        except (OSError, RuntimeError, ValueError):
+            continue
+    try:
+        yield
+    finally:
+        for sig, previous in handlers.items():
+            try:
+                signal.signal(sig, previous)
+            except (OSError, RuntimeError, ValueError):
+                continue
 
 
 def _alchemy_network(chain: str) -> str:
@@ -470,7 +504,7 @@ async def _fetch_token_uri_metadata_batch_with_retry(
     )
 
 
-async def _process_chain(chain: str) -> int:
+async def _process_chain(chain: str, stop_event=None) -> int:
     conn = _conn()
     try:
         ensure_columns(conn, chain)
@@ -485,7 +519,7 @@ async def _process_chain(chain: str) -> int:
         total_updated = 0
 
         async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-            while True:
+            while not _is_stop_requested(stop_event):
                 rows = fetch_segment(
                     conn,
                     chain,
@@ -545,17 +579,20 @@ async def _process_chain(chain: str) -> int:
                     updated,
                     total_updated,
                 )
-        logger.info("链 %s metadata 回填完成，共更新 %d 条", chain, total_updated)
+        if _is_stop_requested(stop_event):
+            logger.info("链 %s 收到停止信号，当前批次已完成，累计更新 %d 条", chain, total_updated)
+        else:
+            logger.info("链 %s metadata 回填完成，共更新 %d 条", chain, total_updated)
         return total_updated
     finally:
         _safe_close(conn)
 
 
-async def _amain() -> None:
+async def _amain(stop_event=None) -> None:
     async def _run_chain(chain: str, sem: asyncio.Semaphore) -> int:
         async with sem:
             try:
-                return await _process_chain(chain)
+                return await _process_chain(chain, stop_event=stop_event)
             except Exception:
                 logger.exception("链 %s metadata 回填失败，已跳过并继续下一条链", chain)
                 return 0
@@ -568,11 +605,16 @@ async def _amain() -> None:
         for chain in METADATA_BACKFILL_CHAINS
     ])
     grand_total = sum(results)
-    logger.info("全部 metadata 回填完成，共更新 %d 条", grand_total)
+    if _is_stop_requested(stop_event):
+        logger.info("metadata 回填已停止拉取新批次，当前在途任务已收尾，共更新 %d 条", grand_total)
+    else:
+        logger.info("全部 metadata 回填完成，共更新 %d 条", grand_total)
 
 
 def main() -> None:
-    asyncio.run(_amain())
+    stop_event = threading.Event()
+    with _install_stop_signal_handlers(stop_event):
+        asyncio.run(_amain(stop_event=stop_event))
 
 
 if __name__ == "__main__":
