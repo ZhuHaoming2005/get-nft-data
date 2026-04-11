@@ -66,6 +66,10 @@ METADATA_BACKFILL_MODE = os.getenv("METADATA_BACKFILL_MODE", "alchemy").strip().
 METADATA_BACKFILL_SEGMENT_SIZE = int(os.getenv("METADATA_BACKFILL_SEGMENT_SIZE", "1000"))
 METADATA_BACKFILL_BATCH_SIZE = int(os.getenv("METADATA_BACKFILL_BATCH_SIZE", "100"))
 METADATA_BACKFILL_WORKERS = int(os.getenv("METADATA_BACKFILL_WORKERS", "5"))
+METADATA_BACKFILL_CHAIN_CONCURRENCY = max(
+    1,
+    int(os.getenv("METADATA_BACKFILL_CHAIN_CONCURRENCY", "2")),
+)
 METADATA_BACKFILL_RETRY_MAX_ATTEMPTS = max(1, int(os.getenv("METADATA_BACKFILL_RETRY_MAX_ATTEMPTS", "3")))
 METADATA_BACKFILL_RETRY_BASE_DELAY_SECONDS = max(
     0.0,
@@ -521,12 +525,22 @@ async def _process_chain(chain: str) -> int:
 
 
 async def _amain() -> None:
-    grand_total = 0
-    for chain in METADATA_BACKFILL_CHAINS:
-        try:
-            grand_total += await _process_chain(chain)
-        except Exception:
-            logger.exception("链 %s metadata 回填失败，已跳过并继续下一条链", chain)
+    async def _run_chain(chain: str, sem: asyncio.Semaphore) -> int:
+        async with sem:
+            try:
+                return await _process_chain(chain)
+            except Exception:
+                logger.exception("链 %s metadata 回填失败，已跳过并继续下一条链", chain)
+                return 0
+
+    sem = asyncio.Semaphore(
+        max(1, min(METADATA_BACKFILL_CHAIN_CONCURRENCY, len(METADATA_BACKFILL_CHAINS) or 1))
+    )
+    results = await asyncio.gather(*[
+        _run_chain(chain, sem)
+        for chain in METADATA_BACKFILL_CHAINS
+    ])
+    grand_total = sum(results)
     logger.info("全部 metadata 回填完成，共更新 %d 条", grand_total)
 
 

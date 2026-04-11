@@ -120,6 +120,11 @@ async def main() -> None:
                 records.append((addr, str(tid), std, block_num))
         return records, dup_skip, blacklist_skip
 
+    def _persist_batch(records: List[Tuple], from_block: int) -> int:
+        inserted = batch_insert_temp(write_conn, CHAIN_NAME, records)
+        save_progress(write_conn, CHAIN_NAME, from_block)
+        return inserted
+
     # ── 滑动窗口扫描（W 个批次同时在途）──────────────────────────────────────────
     #
     # 时间线（SCAN_WINDOW=3 示例）：
@@ -161,10 +166,7 @@ async def main() -> None:
 
         # DB 写操作放到线程池执行：事件循环不阻塞，
         # 窗口内其余 fetch 任务的 HTTP 响应可在此期间被处理
-        inserted = await asyncio.to_thread(
-            batch_insert_temp, write_conn, CHAIN_NAME, records
-        )
-        await asyncio.to_thread(save_progress, write_conn, CHAIN_NAME, from_block)
+        inserted = await asyncio.to_thread(_persist_batch, records, from_block)
 
         total_new += inserted
         logger.info(

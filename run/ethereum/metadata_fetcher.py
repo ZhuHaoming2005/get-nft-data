@@ -41,6 +41,7 @@ from common import (
     release_temp_claims,
     delete_contract_nfts,
     append_blacklist_env,
+    load_blacklist,
     fetch_alchemy_batch,
     fetch_token_uri_batch,
     fetch_token_uri,
@@ -53,6 +54,39 @@ from common import (
 # tokenUri 黑名单前缀：匹配则视为无效，不写入主表
 _INVALID_URI_PREFIXES = ("api.tierlock.com/uri/",)
 FETCHER_WORKERS = max(int(os.getenv("FETCHER_WORKERS", "1")), 1)
+
+
+def _cleanup_blacklisted_pending(
+    conn,
+    pending: List[Tuple],
+    all_ids: List[int],
+    blacklisted_contracts: Set[str],
+    newly_blacklisted_contracts: Set[str],
+) -> Tuple[List[int], List[int], int, int]:
+    blacklisted_contracts = {addr.lower() for addr in blacklisted_contracts}
+    newly_blacklisted_contracts = {addr.lower() for addr in newly_blacklisted_contracts}
+    blacklisted_ids = sorted(
+        row[0]
+        for row in pending
+        if row[1] in blacklisted_contracts
+    )
+    if blacklisted_ids:
+        delete_temp_nfts(conn, CHAIN_NAME, blacklisted_ids)
+
+    main_deleted = temp_deleted = 0
+    if newly_blacklisted_contracts:
+        main_deleted, temp_deleted = delete_contract_nfts(
+            conn,
+            CHAIN_NAME,
+            newly_blacklisted_contracts,
+            skip_temp_ids=blacklisted_ids,
+        )
+
+    remaining_ids = [
+        rid for rid, row in zip(all_ids, pending)
+        if row[1] not in blacklisted_contracts
+    ]
+    return remaining_ids, blacklisted_ids, main_deleted, temp_deleted
 
 
 async def _process_batch(
@@ -267,33 +301,46 @@ async def _worker_main(worker_index: int) -> None:
                 )
                 await asyncio.sleep(1)
                 continue
-            blacklisted_rows = sum(
-                1 for _, addr, _, _, _ in pending if addr in onchain_image_contracts
-            )
+            newly_blacklisted_contracts = {addr.lower() for addr in onchain_image_contracts}
 
             # ── 处理链上存储图像合约（data:image）────────────────────────────
-            if onchain_image_contracts:
+            if newly_blacklisted_contracts:
                 logger.info(
                     "  检测到 %d 个链上存储图像合约（image_uri 以 data:image 开头），"
                     "加入黑名单: %s",
-                    len(onchain_image_contracts), sorted(onchain_image_contracts),
+                    len(newly_blacklisted_contracts), sorted(newly_blacklisted_contracts),
                 )
                 # 1. 更新 .env 黑名单（持久化，重启后生效）
-                append_blacklist_env(onchain_image_contracts)
-                # 2. 清除数据库中该合约的所有历史记录（主表 + 临时表）
-                main_del, temp_del = delete_contract_nfts(
-                    conn, CHAIN_NAME, onchain_image_contracts
+                append_blacklist_env(newly_blacklisted_contracts)
+
+            effective_blacklist = {
+                addr.lower() for addr in load_blacklist()
+            } | newly_blacklisted_contracts
+            inserts = [
+                record for record in inserts
+                if record[0] not in effective_blacklist
+            ]
+
+            blacklisted_main_del = blacklisted_temp_sweep_del = 0
+            blacklisted_ids: List[int] = []
+            if effective_blacklist:
+                all_ids, blacklisted_ids, blacklisted_main_del, blacklisted_temp_sweep_del = (
+                    _cleanup_blacklisted_pending(
+                        conn,
+                        pending,
+                        all_ids,
+                        effective_blacklist,
+                        newly_blacklisted_contracts,
+                    )
                 )
                 logger.info(
-                    "  黑名单清库完成: 主表删除 %d 条，临时表删除 %d 条",
-                    main_del, temp_del,
+                    "  黑名单清理完成: 当前批次按 id 删除 %d 条，主表删除 %d 条，"
+                    "临时表补偿删除 %d 条",
+                    len(blacklisted_ids),
+                    blacklisted_main_del,
+                    blacklisted_temp_sweep_del,
                 )
-                # 重新过滤 all_ids（临时表中属于黑名单合约的记录已在上一步按地址删除）
-                blacklisted_set = onchain_image_contracts
-                all_ids = [
-                    rid for rid, row in zip(all_ids, pending)
-                    if row[1] not in blacklisted_set
-                ]
+            blacklisted_rows = len(blacklisted_ids)
 
             # 有效记录写主表
             inserted = batch_insert_main(conn, CHAIN_NAME, inserts)
@@ -302,14 +349,14 @@ async def _worker_main(worker_index: int) -> None:
             discarded = len(pending) - len(inserts) - blacklisted_rows
 
             total_inserted += inserted
-            total_deleted += deleted
+            total_deleted += deleted + blacklisted_rows + blacklisted_temp_sweep_del
             logger.info(
                 "  worker=%s 本批: 写入主表 %d，从临时表删除 %d（无效丢弃 %d，黑名单合约 %d 个）"
                 " | 累计写入 %d，累计删除 %d",
                 worker_id,
-                inserted, deleted,
+                inserted, deleted + blacklisted_rows + blacklisted_temp_sweep_del,
                 discarded,
-                len(onchain_image_contracts),
+                len(newly_blacklisted_contracts),
                 total_inserted, total_deleted,
             )
 
