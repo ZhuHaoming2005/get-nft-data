@@ -130,6 +130,9 @@ async def _process_batch(
     # base64 解码后提取 image 字段写回 alchemy_results，
     # 供后续步骤3统一检测 data:image 链上图像并加入黑名单。
     for i, (token_uri, image_url, name, symbol, metadata) in enumerate(alchemy_results):
+        if image_url is not None and not isinstance(image_url, str):
+            image_url = None
+            alchemy_results[i] = (token_uri, image_url, name, symbol, metadata)
         if token_uri and token_uri.startswith("data:application/") and image_url is None:
             decoded_img = _decode_inline_image(token_uri)
             if decoded_img:
@@ -141,7 +144,7 @@ async def _process_batch(
     # 直接编码在链上，属于 DeFi/功能性合约，整体加入黑名单。
     onchain_image_contracts: Set[str] = set()
     for (_, addr, _, _, _), (_, image_url, _, _, _) in zip(pending, alchemy_results):
-        if image_url and image_url.startswith("data:image"):
+        if isinstance(image_url, str) and image_url.startswith("data:image"):
             onchain_image_contracts.add(addr)
 
     # ── 步骤4：有效记录组装为主表 insert 列表 ───────────────────────────────────

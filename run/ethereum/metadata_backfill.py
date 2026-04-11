@@ -446,45 +446,44 @@ async def _process_chain(chain: str) -> int:
 
                 logger.info("On fetching %d metadatas", len(rows))
 
-                mark_rows_checked(conn, chain, [row[0] for row in rows])
-
                 if METADATA_BACKFILL_MODE == "alchemy":
                     payload_rows = [(row[0], row[1], row[2], row[3]) for row in rows]
                     batches = _split_batches(payload_rows, METADATA_BACKFILL_BATCH_SIZE)
-                    parts = []
                     total_batches = len(batches)
-                    for batch_index, batch in enumerate(batches, start=1):
-                        parts.append(
-                            await _fetch_alchemy_batch_with_retry(
-                                session,
-                                chain,
-                                sem,
-                                batch,
-                                batch_index=batch_index,
-                                total_batches=total_batches,
-                            )
+                    parts = await asyncio.gather(*[
+                        _fetch_alchemy_batch_with_retry(
+                            session,
+                            chain,
+                            sem,
+                            batch,
+                            batch_index=batch_index,
+                            total_batches=total_batches,
                         )
+                        for batch_index, batch in enumerate(batches, start=1)
+                    ])
                 elif METADATA_BACKFILL_MODE == "token_uri":
                     payload_rows = [(row[0], row[4]) for row in rows if row[4]]
                     batches = _split_batches(payload_rows, METADATA_BACKFILL_BATCH_SIZE)
-                    parts = []
                     total_batches = len(batches)
-                    for batch_index, batch in enumerate(batches, start=1):
-                        parts.append(
-                            await _fetch_token_uri_metadata_batch_with_retry(
-                                session,
-                                chain,
-                                sem,
-                                batch,
-                                batch_index=batch_index,
-                                total_batches=total_batches,
-                            )
+                    parts = await asyncio.gather(*[
+                        _fetch_token_uri_metadata_batch_with_retry(
+                            session,
+                            chain,
+                            sem,
+                            batch,
+                            batch_index=batch_index,
+                            total_batches=total_batches,
                         )
+                        for batch_index, batch in enumerate(batches, start=1)
+                    ])
                 else:
                     raise ValueError(f"不支持的 METADATA_BACKFILL_MODE: {METADATA_BACKFILL_MODE}")
 
                 flat = [item for part in parts for item in part if item[1] is not None]
                 updated = bulk_update_rows(conn, chain, flat)
+                updated_ids = {row_id for row_id, _, _ in flat}
+                unresolved_ids = [row[0] for row in rows if row[0] not in updated_ids]
+                mark_rows_checked(conn, chain, unresolved_ids)
                 total_updated += updated
                 logger.info(
                     "链 %s 本轮读取 %d 条，成功回填 %d 条 metadata（累计 %d）",

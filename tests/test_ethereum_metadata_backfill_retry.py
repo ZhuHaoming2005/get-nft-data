@@ -138,6 +138,112 @@ class ProcessChainRetryTests(unittest.IsolatedAsyncioTestCase):
             [[(2, {"name": "NFT 2", "image": "https://cdn.example/2.png"}, "https://cdn.example/2.png")]],
         )
 
+    async def test_process_chain_runs_alchemy_batches_concurrently(self):
+        class _FakeConn:
+            def close(self):
+                return None
+
+        class _FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        rows = [
+            (1, "0xabc", 10, "ERC-721", "https://example/10", None),
+            (2, "0xdef", 11, "ERC-721", "https://example/11", None),
+            (3, "0xghi", 12, "ERC-721", "https://example/12", None),
+        ]
+        state = {"current": 0, "max": 0}
+
+        async def _fake_fetch(*args, **kwargs):
+            batch = args[3]
+            state["current"] += 1
+            state["max"] = max(state["max"], state["current"])
+            await asyncio.sleep(0.01)
+            state["current"] -= 1
+            row_id = batch[0][0]
+            return [
+                (
+                    row_id,
+                    {"name": f"NFT {row_id}", "image": f"https://cdn.example/{row_id}.png"},
+                    f"https://cdn.example/{row_id}.png",
+                )
+            ]
+
+        original_mode = backfill.METADATA_BACKFILL_MODE
+        original_batch = backfill.METADATA_BACKFILL_BATCH_SIZE
+        original_workers = backfill.METADATA_BACKFILL_WORKERS
+        try:
+            backfill.METADATA_BACKFILL_MODE = "alchemy"
+            backfill.METADATA_BACKFILL_BATCH_SIZE = 1
+            backfill.METADATA_BACKFILL_WORKERS = 3
+            with patch.object(backfill, "_conn", return_value=_FakeConn()), \
+                 patch.object(backfill, "ensure_columns"), \
+                 patch.object(backfill, "fetch_segment", side_effect=[rows, []]), \
+                 patch.object(backfill, "mark_rows_checked"), \
+                 patch.object(backfill.aiohttp, "ClientSession", return_value=_FakeSession()), \
+                 patch.object(backfill, "_fetch_alchemy_batch_with_retry", side_effect=_fake_fetch), \
+                 patch.object(backfill, "bulk_update_rows", side_effect=lambda conn, chain, batch: len(batch)):
+                updated = await backfill._process_chain("ethereum")
+        finally:
+            backfill.METADATA_BACKFILL_MODE = original_mode
+            backfill.METADATA_BACKFILL_BATCH_SIZE = original_batch
+            backfill.METADATA_BACKFILL_WORKERS = original_workers
+
+        self.assertEqual(updated, 3)
+        self.assertGreaterEqual(state["max"], 2)
+
+    async def test_process_chain_marks_only_failed_rows_checked(self):
+        class _FakeConn:
+            def close(self):
+                return None
+
+        class _FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        rows = [
+            (1, "0xabc", 10, "ERC-721", "https://example/10", None),
+            (2, "0xdef", 11, "ERC-721", "https://example/11", None),
+        ]
+        update_calls = []
+
+        original_mode = backfill.METADATA_BACKFILL_MODE
+        original_batch = backfill.METADATA_BACKFILL_BATCH_SIZE
+        try:
+            backfill.METADATA_BACKFILL_MODE = "alchemy"
+            backfill.METADATA_BACKFILL_BATCH_SIZE = 1
+            with patch.object(backfill, "_conn", return_value=_FakeConn()), \
+                 patch.object(backfill, "ensure_columns"), \
+                 patch.object(backfill, "fetch_segment", side_effect=[rows, []]), \
+                 patch.object(backfill, "mark_rows_checked") as mark_rows_checked, \
+                 patch.object(backfill.aiohttp, "ClientSession", return_value=_FakeSession()), \
+                 patch.object(
+                     backfill,
+                     "_fetch_alchemy_batch_with_retry",
+                     side_effect=[
+                         [],
+                         [(2, {"name": "NFT 2", "image": "https://cdn.example/2.png"}, "https://cdn.example/2.png")],
+                     ],
+                 ), \
+                 patch.object(backfill, "bulk_update_rows", side_effect=lambda conn, chain, batch: update_calls.append(list(batch)) or len(batch)):
+                updated = await backfill._process_chain("ethereum")
+        finally:
+            backfill.METADATA_BACKFILL_MODE = original_mode
+            backfill.METADATA_BACKFILL_BATCH_SIZE = original_batch
+
+        self.assertEqual(updated, 1)
+        self.assertEqual(
+            update_calls,
+            [[(2, {"name": "NFT 2", "image": "https://cdn.example/2.png"}, "https://cdn.example/2.png")]],
+        )
+        mark_rows_checked.assert_called_once_with(unittest.mock.ANY, "ethereum", [1])
+
 
 class MainRetryTests(unittest.IsolatedAsyncioTestCase):
     async def test_amain_continues_to_next_chain_after_chain_failure(self):

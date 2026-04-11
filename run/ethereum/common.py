@@ -640,6 +640,38 @@ def _decode_inline_image(uri: str) -> Optional[str]:
     return image.strip() if image and isinstance(image, str) else None
 
 
+def _normalize_image_url(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    if isinstance(value, dict):
+        for key in (
+            "originalUrl",
+            "original_url",
+            "cachedUrl",
+            "cached_url",
+            "gateway",
+            "url",
+            "uri",
+            "href",
+            "src",
+            "pngUrl",
+            "png_url",
+            "thumbnailUrl",
+            "thumbnail_url",
+        ):
+            candidate = value.get(key)
+            if isinstance(candidate, str):
+                text = candidate.strip()
+                if text:
+                    return text
+        for key in ("image", "image_url", "imageUrl", "image_uri", "imageUri"):
+            candidate = _normalize_image_url(value.get(key))
+            if candidate:
+                return candidate
+    return None
+
+
 async def fetch_alchemy_batch(
     session: aiohttp.ClientSession,
     sem: asyncio.Semaphore,
@@ -713,7 +745,14 @@ async def fetch_alchemy_batch(
         metadata: Optional[Any] = None
         raw_meta = raw.get("metadata")
         if isinstance(raw_meta, dict):
-            image_url = raw_meta.get("image") or raw_meta.get("image_url") or nft.get("image").get("originalUrl") or None
+            image_url = (
+                _normalize_image_url(raw_meta.get("image"))
+                or _normalize_image_url(raw_meta.get("image_url"))
+                or _normalize_image_url(raw_meta.get("imageUrl"))
+                or _normalize_image_url(raw_meta.get("image_uri"))
+                or _normalize_image_url(raw_meta.get("imageUri"))
+                or _normalize_image_url(nft.get("image"))
+            )
             metadata = raw_meta
         contract = nft.get("contract")
         if isinstance(contract, dict):
