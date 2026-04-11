@@ -11,6 +11,7 @@ import pyarrow.parquet as pq
 
 from . import (
     ContractNameRecord,
+    ContractSignal,
     DatabaseNFTRecord,
     DatabaseSnapshot,
     SeedNFT,
@@ -111,7 +112,8 @@ class DuckDBFeatureStore:
     def load_parquet_dataset(self, chain: str, parquet_path: str, *, strict: bool = False) -> None:
         column_names = set(pq.read_schema(parquet_path).names)
 
-        _PRECOMPUTED = ('token_uri_norm', 'image_uri_norm', 'name_norm', 'symbol_norm', 'metadata_doc')
+        _PRECOMPUTED = ('token_uri_norm', 'image_uri_norm', 'name_norm', 'symbol_norm', 'metadata_doc',
+                        'metadata_keywords_arr')
         missing = [c for c in _PRECOMPUTED if c not in column_names]
         if missing and strict:
             raise ValueError(
@@ -200,6 +202,7 @@ class DuckDBFeatureStore:
         *,
         seed_nfts: Sequence[SeedNFT],
         max_tokens_per_contract: int = 500,
+        max_recall_rows: int = 0,
     ) -> DatabaseSnapshot:
         seed_index = build_seed_index(seed_nfts)
         excluded_contracts = sorted(seed_index['seed_contracts'])
@@ -207,75 +210,112 @@ class DuckDBFeatureStore:
         exact_image_keys = sorted(seed_index['image_uri_keys'])
         exact_symbols = sorted(seed_index['symbol_norms'])
         name_prefixes = sorted({normalize_name(item.name)[:8] for item in seed_nfts if normalize_name(item.name)})
-        metadata_terms = sorted(
-            {
-                keyword
-                for item in seed_nfts
-                for keyword in metadata_keywords(metadata_document_from_json(item.metadata_json))
-            }
+        metadata_recall_terms = list(
+            sorted(
+                {
+                    keyword
+                    for item in seed_nfts
+                    for keyword in metadata_keywords(metadata_document_from_json(item.metadata_json))
+                }
+            )[:8]
         )
-
-        query = [
-            '''
-            SELECT contract_address, token_id, token_uri, image_uri, name, symbol, metadata_json
-                   , metadata_doc
+        select_clause = '''
+            SELECT contract_address, token_id, token_uri, image_uri, name, symbol, metadata_json,
+                   metadata_doc, token_uri_norm, image_uri_norm, symbol_norm, name_norm, metadata_keywords_arr
             FROM nft_features
             WHERE chain = ?
-            '''
-        ]
-        params: list[object] = [chain]
+        '''
+        base_query = [select_clause]
+        base_params: list[object] = [chain]
         if excluded_contracts:
-            params.append(excluded_contracts)
-            query.append('AND NOT list_contains(?, contract_address)')
+            base_params.append(excluded_contracts)
+            base_query.append('AND NOT list_contains(?, contract_address)')
 
         recall_conditions: list[str] = []
         if exact_token_keys:
-            params.append(exact_token_keys)
+            base_params.append(exact_token_keys)
             recall_conditions.append('list_contains(?, token_uri_norm)')
         if exact_image_keys:
-            params.append(exact_image_keys)
+            base_params.append(exact_image_keys)
             recall_conditions.append('list_contains(?, image_uri_norm)')
         if exact_symbols:
-            params.append(exact_symbols)
+            base_params.append(exact_symbols)
             recall_conditions.append('list_contains(?, symbol_norm)')
         if name_prefixes:
-            params.append(name_prefixes)
+            base_params.append(name_prefixes)
             recall_conditions.append('list_contains(?, substr(name_norm, 1, 8))')
-        if metadata_terms:
+        if metadata_recall_terms:
             # Use pre-computed keyword arrays when available; each row only needs one
             # shared keyword with the seed set — a single list_has_any replaces 8× LIKE scans.
-            params.append(list(metadata_terms[:8]))
+            base_params.append(metadata_recall_terms)
             recall_conditions.append('list_has_any(metadata_keywords_arr, ?)')
 
         if recall_conditions:
-            query.append(f"AND ({' OR '.join(recall_conditions)})")
+            base_query.append(f"AND ({' OR '.join(recall_conditions)})")
 
-        # Per-contract token cap: prevents a single high-match contract from flooding the
-        # candidate set with tens of thousands of tokens.  The goal is to confirm a contract
-        # is infringing, not to enumerate every duplicate token — so a bounded sample suffices.
+        # Per-contract token cap: applied via a two-step query to work around a DuckDB 1.5.x
+        # bug where QUALIFY + multiple list_contains(?) OR conditions triggers an internal error.
+        # Step 1 finds matching contract_addresses; step 2 applies the row cap per contract.
         if max_tokens_per_contract > 0:
-            query.append(
-                'QUALIFY row_number() OVER (PARTITION BY contract_address ORDER BY token_id) <= ?'
+            # Build step-1 query: same filters, returns only DISTINCT contract_address.
+            step1_query = base_query[:]
+            step1_query[0] = step1_query[0].replace(
+                'SELECT contract_address, token_id, token_uri, image_uri, name, symbol, metadata_json,\n                   metadata_doc, token_uri_norm, image_uri_norm, symbol_norm, name_norm, metadata_keywords_arr',
+                'SELECT DISTINCT contract_address'
             )
-            params.append(max_tokens_per_contract)
+            step1_str = '\n'.join(step1_query)
+            step1_params = base_params[:]
 
-        query_str = '\n'.join(query)
+            # Step-2 query fetches token details with per-contract cap, filtering by the
+            # contract set returned in step 1 (passed as a list parameter).
+            step2_parts = [
+                '''
+                SELECT contract_address, token_id, token_uri, image_uri, name, symbol, metadata_json,
+                       metadata_doc, token_uri_norm, image_uri_norm, symbol_norm, name_norm, metadata_keywords_arr
+                FROM nft_features
+                WHERE chain = ?
+                  AND list_contains(?, contract_address)
+                QUALIFY row_number() OVER (PARTITION BY contract_address ORDER BY token_id) <= ?
+                ORDER BY contract_address, token_id
+                '''
+            ]
+            if max_recall_rows > 0:
+                step2_parts.append('LIMIT ?')
+            step2_str = '\n'.join(step2_parts)
+            use_two_step = True
+        else:
+            use_two_step = False
+            selected_rows_parts = base_query[:]
+            selected_rows_parts.append('ORDER BY contract_address, token_id')
+            if max_recall_rows > 0:
+                selected_rows_parts.append('LIMIT ?')
+            query_str = '\n'.join(selected_rows_parts)
+            query_params = base_params[:] + ([max_recall_rows] if max_recall_rows > 0 else [])
 
         # For file-based databases, open a dedicated read-only connection so that
         # multiple batch workers can execute queries in parallel without contending
         # on the write-connection lock.
+        def _run(conn_obj: duckdb.DuckDBPyConnection):
+            if use_two_step:
+                contract_addrs = [row[0] for row in conn_obj.execute(step1_str, step1_params).fetchall()]
+                step2_params_: list[object] = [chain, contract_addrs, max_tokens_per_contract]
+                if max_recall_rows > 0:
+                    step2_params_.append(max_recall_rows)
+                return conn_obj.execute(step2_str, step2_params_).to_arrow_table()
+            return conn_obj.execute(query_str, query_params).to_arrow_table()
+
         if self._database_path != ':memory:':
             rconn = duckdb.connect(database=self._database_path, read_only=True)
             try:
-                arrow_result = rconn.execute(query_str, params).fetch_arrow_table()
+                arrow_result = _run(rconn)
             finally:
                 rconn.close()
         else:
             with self._lock:
-                arrow_result = self._conn.execute(query_str, params).fetch_arrow_table()
+                arrow_result = _run(self._conn)
 
         # Batch-convert Arrow columns to Python lists in one vectorised call per column.
-        # This replaces N×8 individual [i].as_py() calls with 8 to_pylist() calls.
+        # This replaces N×individual [i].as_py() calls with a small set of to_pylist() calls.
         col_addr = arrow_result['contract_address'].to_pylist()
         col_tid = arrow_result['token_id'].to_pylist()
         col_turi = arrow_result['token_uri'].to_pylist()
@@ -284,6 +324,11 @@ class DuckDBFeatureStore:
         col_sym = arrow_result['symbol'].to_pylist()
         col_mj = arrow_result['metadata_json'].to_pylist()
         col_md = arrow_result['metadata_doc'].to_pylist()
+        col_turi_norm = arrow_result['token_uri_norm'].to_pylist()
+        col_iuri_norm = arrow_result['image_uri_norm'].to_pylist()
+        col_sym_norm = arrow_result['symbol_norm'].to_pylist()
+        col_name_norm = arrow_result['name_norm'].to_pylist()
+        col_keywords = arrow_result['metadata_keywords_arr'].to_pylist()
         nft_rows = [
             DatabaseNFTRecord(
                 contract_address=a or '',
@@ -300,18 +345,73 @@ class DuckDBFeatureStore:
             )
         ]
 
+        exact_token_set = set(exact_token_keys)
+        exact_image_set = set(exact_image_keys)
+        exact_symbol_set = set(exact_symbols)
+        name_prefix_set = set(name_prefixes)
+        metadata_term_set = set(metadata_recall_terms)
+
+        seen_contract_name_pairs: set[tuple[str, str]] = set()
         contract_names: list[ContractNameRecord] = []
-        symbol_contracts: dict[str, set[str]] = defaultdict(set)
-        for row in nft_rows:
-            name_norm = normalize_name(row.name)
-            if name_norm:
-                contract_names.append(ContractNameRecord(contract_address=row.contract_address, name_norm=name_norm))
-            symbol_norm = normalize_symbol(row.symbol)
+        symbol_contracts_raw: dict[str, set[str]] = defaultdict(set)
+        contract_signal_counts: dict[str, dict[str, object]] = {}
+        for addr, token_uri_norm, image_uri_norm, sym_norm, name_norm, keywords in zip(
+            col_addr, col_turi_norm, col_iuri_norm, col_sym_norm, col_name_norm, col_keywords
+        ):
+            contract_address = addr or ''
+            symbol_norm = sym_norm or ''
+            normalized_name = name_norm or ''
+            keyword_values = set(keywords or [])
+
+            if normalized_name:
+                key = (contract_address, normalized_name)
+                if key not in seen_contract_name_pairs:
+                    contract_names.append(ContractNameRecord(contract_address=contract_address, name_norm=normalized_name))
+                    seen_contract_name_pairs.add(key)
             if symbol_norm:
-                symbol_contracts[symbol_norm].add(row.contract_address)
+                symbol_contracts_raw[symbol_norm].add(contract_address)
+
+            signal = contract_signal_counts.setdefault(
+                contract_address,
+                {
+                    'token_count': 0,
+                    'uri_match_count': 0,
+                    'image_match_count': 0,
+                    'symbol_match': False,
+                    'name_prefix_match': False,
+                    'keyword_match': False,
+                },
+            )
+            signal['token_count'] += 1
+            if (token_uri_norm or '') in exact_token_set:
+                signal['uri_match_count'] += 1
+            if (image_uri_norm or '') in exact_image_set:
+                signal['image_match_count'] += 1
+            if symbol_norm in exact_symbol_set:
+                signal['symbol_match'] = True
+            if normalized_name[:8] in name_prefix_set:
+                signal['name_prefix_match'] = True
+            if metadata_term_set and keyword_values & metadata_term_set:
+                signal['keyword_match'] = True
+
+        symbol_contracts = dict(symbol_contracts_raw)
+
+        contract_signals: dict[str, ContractSignal] = {
+            contract_address: ContractSignal(
+                contract_address=contract_address,
+                token_count=int(signal['token_count']),
+                uri_match_count=int(signal['uri_match_count']),
+                image_match_count=int(signal['image_match_count']),
+                symbol_match=bool(signal['symbol_match']),
+                name_prefix_match=bool(signal['name_prefix_match']),
+                keyword_match=bool(signal['keyword_match']),
+            )
+            for contract_address, signal in contract_signal_counts.items()
+        }
 
         return DatabaseSnapshot(
             nft_rows=nft_rows,
             contract_names=contract_names,
-            symbol_contracts=dict(symbol_contracts),
+            symbol_contracts=symbol_contracts,
+            contract_signals=contract_signals,
         )

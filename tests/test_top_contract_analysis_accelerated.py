@@ -260,6 +260,111 @@ class DuckDBSnapshotTests(unittest.TestCase):
         self.assertIn('metadata_match', by_contract['0xdup-meta'].match_reasons)
         self.assertEqual(by_contract['0xdup-meta'].confidence, 'high')
 
+    def test_duckdb_feature_store_two_step_query_keeps_chain_filter(self):
+        seed_nfts = [
+            mod.SeedNFT(
+                chain='ethereum',
+                contract_address='0xseed',
+                token_id='1',
+                name='Azuki #1',
+                symbol='AZUKI',
+                token_uri='ipfs://seed/meta-1',
+                image_uri='',
+                metadata_json='',
+            )
+        ]
+        store = DuckDBFeatureStore()
+        store.replace_chain_rows(
+            'ethereum',
+            [
+                mod.DatabaseNFTRecord(
+                    contract_address='0xdup',
+                    token_id='1',
+                    token_uri='ipfs://seed/meta-1',
+                    image_uri='',
+                    name='Eth Clone #1',
+                    symbol='AZUKI',
+                    metadata_json='',
+                ),
+            ],
+        )
+        store.replace_chain_rows(
+            'base',
+            [
+                mod.DatabaseNFTRecord(
+                    contract_address='0xdup',
+                    token_id='999',
+                    token_uri='ipfs://base/meta-999',
+                    image_uri='',
+                    name='Base Clone #999',
+                    symbol='BASE',
+                    metadata_json='',
+                ),
+            ],
+        )
+
+        snapshot = store.load_snapshot(
+            'ethereum',
+            seed_nfts=seed_nfts,
+            max_tokens_per_contract=500,
+        )
+
+        self.assertEqual(
+            [(row.contract_address, row.token_id, row.name) for row in snapshot.nft_rows],
+            [('0xdup', '1', 'Eth Clone #1')],
+        )
+        self.assertEqual(snapshot.contract_signals['0xdup'].token_count, 1)
+        self.assertTrue(snapshot.contract_signals['0xdup'].symbol_match)
+
+    def test_duckdb_feature_store_contract_signals_follow_max_recall_rows_window(self):
+        seed_nfts = [
+            mod.SeedNFT(
+                chain='ethereum',
+                contract_address='0xseed',
+                token_id='1',
+                name='Azuki #1',
+                symbol='AZUKI',
+                token_uri='ipfs://seed/meta-1',
+                image_uri='',
+                metadata_json='',
+            )
+        ]
+        store = DuckDBFeatureStore()
+        store.replace_chain_rows(
+            'ethereum',
+            [
+                mod.DatabaseNFTRecord(
+                    contract_address='0xa',
+                    token_id='1',
+                    token_uri='ipfs://seed/meta-1',
+                    image_uri='',
+                    name='Clone A #1',
+                    symbol='AZUKI',
+                    metadata_json='',
+                ),
+                mod.DatabaseNFTRecord(
+                    contract_address='0xb',
+                    token_id='1',
+                    token_uri='ipfs://seed/meta-1',
+                    image_uri='',
+                    name='Clone B #1',
+                    symbol='AZUKI',
+                    metadata_json='',
+                ),
+            ],
+        )
+
+        snapshot = store.load_snapshot(
+            'ethereum',
+            seed_nfts=seed_nfts,
+            max_tokens_per_contract=500,
+            max_recall_rows=1,
+        )
+
+        self.assertEqual([(row.contract_address, row.token_id) for row in snapshot.nft_rows], [('0xa', '1')])
+        self.assertEqual(sorted(snapshot.contract_signals), ['0xa'])
+        self.assertEqual(snapshot.contract_signals['0xa'].token_count, 1)
+
     def test_duckdb_feature_store_loads_rows_from_parquet(self):
         tmpdir = Path('D:/code/solidity/get-nft-data/output/test-top-contract-analysis-parquet')
         tmpdir.mkdir(parents=True, exist_ok=True)
@@ -926,6 +1031,66 @@ class BatchEntryTests(unittest.TestCase):
             if tmpdir.exists():
                 tmpdir.rmdir()
 
+    def test_batch_main_forwards_max_tokens_per_contract(self):
+        tmpdir = Path('D:/code/solidity/get-nft-data/output/test-top-contract-analysis-batch-max-tokens')
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        seeds_path = tmpdir / 'seeds.txt'
+        seeds_path.write_text('0xseed1\n', encoding='utf-8')
+        payload = {
+            'seed_contract': {
+                'chain': 'ethereum',
+                'contract_address': '0xseed1',
+                'token_type': 'ERC721',
+                'contract_deployer': '0xcreator',
+                'deployed_block_number': 1,
+                'name': 'Azuki',
+                'symbol': 'AZUKI',
+            },
+            'seed_collection_stats': {
+                'seed_nft_count': 1,
+                'unique_token_uri_count': 1,
+                'unique_image_uri_count': 1,
+                'unique_name_count': 1,
+                'unique_symbol_count': 1,
+            },
+            'duplicate_candidates': [],
+            'legit_duplicates': [],
+            'suspected_infringing_duplicates_high_confidence': [],
+            'suspected_infringing_duplicates_low_confidence': [],
+            'contract_level_summary': {},
+            'address_signals': {},
+            'victim_signals': {},
+            'report_summary': {
+                'open_license_detected': False,
+                'candidate_contract_count': 0,
+                'high_confidence_contract_count': 0,
+                'low_confidence_contract_count': 0,
+                'legit_duplicate_contract_count': 0,
+            },
+        }
+        try:
+            with patch.object(batch_mod, 'analyze_seed_contract', return_value=payload) as analyze_mock:
+                code = batch_mod.main(
+                    [
+                        '--chain', 'ethereum',
+                        '--seed-file', str(seeds_path),
+                        '--alchemy-api-key', 'alchemy',
+                        '--output-dir', str(tmpdir / 'results'),
+                        '--max-tokens-per-contract', '123',
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(analyze_mock.call_args.kwargs['max_tokens_per_contract'], 123)
+        finally:
+            for path in sorted(tmpdir.glob('**/*'), reverse=True):
+                if path.is_file():
+                    path.unlink()
+                elif path.is_dir():
+                    path.rmdir()
+            if tmpdir.exists():
+                tmpdir.rmdir()
+
     def test_batch_main_reuses_feature_store_loaded_from_parquet(self):
         tmpdir = Path('D:/code/solidity/get-nft-data/output/test-top-contract-analysis-batch-feature-store')
         tmpdir.mkdir(parents=True, exist_ok=True)
@@ -1073,6 +1238,7 @@ class SnapshotExportTests(unittest.TestCase):
                 [
                     'chain', 'contract_address', 'token_id', 'token_uri', 'image_uri', 'name', 'symbol',
                     'token_uri_norm', 'image_uri_norm', 'name_norm', 'symbol_norm', 'metadata_doc',
+                    'metadata_keywords_arr',
                 ],
             )
             self.assertEqual(table.num_rows, 2)

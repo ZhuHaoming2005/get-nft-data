@@ -47,6 +47,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_RECALL_ROWS,
         help='safety cap on token-level recall per seed; set 0 to disable (default: %(default)s)',
     )
+    parser.add_argument(
+        '--max-tokens-per-contract',
+        type=int,
+        default=500,
+        help='per-contract token cap in DuckDB recall query (default: %(default)s)',
+    )
     return parser
 
 
@@ -68,6 +74,7 @@ def _analyze_one_seed(
         metadata_threshold=args.metadata_threshold,
         timeout=args.timeout,
         max_recall_rows=args.max_recall_rows,
+        max_tokens_per_contract=args.max_tokens_per_contract,
     )
 
 
