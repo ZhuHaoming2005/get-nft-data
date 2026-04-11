@@ -53,6 +53,9 @@ ZERO_ADDRESS = '0x0000000000000000000000000000000000000000'
 DEFAULT_TIMEOUT = 30
 DEFAULT_NAME_THRESHOLD = 95.0
 DEFAULT_ALCHEMY_RETRIES = 3
+# Safety cap: if a single seed recall exceeds this many token rows, we emit a warning
+# and truncate before passing to find_duplicate_candidates.  Set to 0 to disable.
+DEFAULT_MAX_RECALL_ROWS = 50_000
 
 DEFAULT_NETWORKS = {
     'ethereum': 'eth-mainnet',
@@ -620,7 +623,28 @@ def load_database_snapshot(
     *,
     seed_nfts: Optional[Sequence[SeedNFT]] = None,
     fetch_size: int = 10000,
+    max_rows: Optional[int] = None,
 ) -> DatabaseSnapshot:
+    """Load a matching snapshot from PostgreSQL.
+
+    .. warning::
+        This is the PostgreSQL fallback path intended for debugging and small-scale
+        use only.  At 50M+ rows, token_uri / image_uri normalization and name fuzzy
+        matching still run in Python after the server-side pre-filter, making this
+        path unsuitable for production batch jobs.  Use
+        ``export_snapshot.export_chain_snapshot_to_parquet`` + ``DuckDBFeatureStore``
+        for production scale.
+
+    Args:
+        max_rows: Safety cap on how many candidate rows to process in Python.
+                  Rows beyond this limit are silently dropped.  ``None`` means
+                  unlimited (original behaviour; not recommended at scale).
+    """
+    logger.warning(
+        'load_database_snapshot (PostgreSQL fallback) is not suitable for large-scale '
+        'production use — token_uri/image_uri normalisation and name fuzzy matching run '
+        'in Python. For 50M+ rows, use DuckDBFeatureStore with a pre-exported Parquet snapshot.'
+    )
     table = chain_to_table(chain)
     seed_index = build_seed_index(seed_nfts or [])
     token_uri_keys = seed_index['token_uri_keys']
@@ -630,6 +654,34 @@ def load_database_snapshot(
     seed_contracts = seed_index['seed_contracts']
     name_index: _LenIndex = seed_index['name_index']
 
+    # Build a server-side pre-filter: push symbol and 8-char name prefix matching
+    # down to PostgreSQL so the cursor returns a much smaller candidate set.
+    # token_uri / image_uri normalization (IPFS CID extraction etc.) can't be
+    # replicated in SQL without custom functions, so those still run in Python.
+    excluded = list(seed_contracts) or ['__no_match__']
+    symbol_list = list(symbol_norms) if symbol_norms else None
+    name_prefix_list = sorted({n[:8] for n in seed_name_norms if n}) if seed_name_norms else None
+
+    where_parts = ['lower(contract_address) <> ALL(%s)']
+    query_args: list = [excluded]
+
+    server_recall: list[str] = []
+    if symbol_list:
+        server_recall.append('lower(symbol) = ANY(%s)')
+        query_args.append(symbol_list)
+    if name_prefix_list:
+        server_recall.append('left(lower(name), 8) = ANY(%s)')
+        query_args.append(name_prefix_list)
+    # token_uri and image_uri: include unconditionally when seed keys exist so
+    # Python-level normalization can still catch IPFS/Arweave matches.
+    if token_uri_keys or image_uri_keys:
+        server_recall.append('token_uri IS NOT NULL')
+
+    if server_recall:
+        where_parts.append(f"AND ({' OR '.join(server_recall)})")
+
+    where_clause = '\n'.join(where_parts)
+
     nft_rows: List[DatabaseNFTRecord] = []
     with conn.cursor(name=f'nft_rows_{chain}') as cur:
         cur.itersize = fetch_size
@@ -638,7 +690,9 @@ def load_database_snapshot(
             SELECT lower(contract_address), token_id, coalesce(token_uri, ''), coalesce(image_uri, ''),
                    coalesce(name, ''), coalesce(symbol, '')
             FROM {table}
-            '''
+            WHERE {where_clause}
+            ''',
+            query_args,
         )
         while True:
             rows = cur.fetchmany(fetch_size)
@@ -671,11 +725,20 @@ def load_database_snapshot(
                             metadata_json='',
                         )
                     )
+                    if max_rows is not None and len(nft_rows) >= max_rows:
+                        logger.warning(
+                            'load_database_snapshot hit max_rows=%d for chain %s — stopping early. '
+                            'Results may be incomplete.',
+                            max_rows, chain,
+                        )
+                        break
+            else:
+                continue
+            break
     conn.commit()
 
     contract_names: List[ContractNameRecord] = []
     symbol_contracts: Dict[str, set[str]] = defaultdict(set)
-    excluded = list(seed_contracts) or ['']
     with conn.cursor(name=f'contract_snapshot_{chain}') as cur:
         cur.itersize = fetch_size
         cur.execute(
@@ -1142,6 +1205,7 @@ def analyze_seed_contract(
     name_threshold: float = DEFAULT_NAME_THRESHOLD,
     metadata_threshold: float = 0.55,
     timeout: int = DEFAULT_TIMEOUT,
+    max_recall_rows: int = DEFAULT_MAX_RECALL_ROWS,
 ) -> Dict[str, Any]:
     network = normalize_network(chain, alchemy_network)
     own_conn = False
@@ -1180,6 +1244,26 @@ def analyze_seed_contract(
                 snapshot = feature_store.load_snapshot(chain, seed_nfts=seed_nfts)
             else:
                 snapshot = load_database_snapshot(conn, chain, seed_nfts=seed_nfts)
+
+            # Recall telemetry: log size of every snapshot so runaway seeds are visible.
+            recall_token_count = len(snapshot.nft_rows)
+            recall_contract_count = len({r.contract_address for r in snapshot.nft_rows})
+            logger.info(
+                'seed %s recall: %d tokens across %d candidate contracts',
+                seed_contract_address, recall_token_count, recall_contract_count,
+            )
+            if max_recall_rows > 0 and recall_token_count > max_recall_rows:
+                logger.warning(
+                    'seed %s recall %d tokens exceeds max_recall_rows=%d — truncating. '
+                    'Increase max_recall_rows or tighten the seed set if results are incomplete.',
+                    seed_contract_address, recall_token_count, max_recall_rows,
+                )
+                snapshot = DatabaseSnapshot(
+                    nft_rows=snapshot.nft_rows[:max_recall_rows],
+                    contract_names=snapshot.contract_names,
+                    symbol_contracts=snapshot.symbol_contracts,
+                )
+
             candidates = find_duplicate_candidates(
                 seed_nfts,
                 snapshot,

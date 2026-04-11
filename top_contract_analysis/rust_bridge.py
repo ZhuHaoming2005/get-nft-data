@@ -105,12 +105,18 @@ def _flatten_metadata(value: Any, out: list[str]) -> None:
             out.append(stripped)
 
 
-@lru_cache(maxsize=200_000)
 def metadata_document_from_json(raw: str) -> str:
     if not raw:
         return ''
     if _rust_metadata_document_from_json is not None:
+        # Rust path: fast enough that a Python-level LRU cache adds more overhead
+        # (string hashing + dict lookup) than it saves at 50M+ unique token scale.
         return str(_rust_metadata_document_from_json(raw))
+    return _metadata_document_from_json_python(raw)
+
+
+@lru_cache(maxsize=200_000)
+def _metadata_document_from_json_python(raw: str) -> str:
     try:
         payload = json.loads(raw)
     except Exception:

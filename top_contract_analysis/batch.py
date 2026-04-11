@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional, Sequence
 
-from . import analyze_seed_contract, write_batch_summary_outputs, write_outputs_to_directory
+from . import analyze_seed_contract, write_batch_summary_outputs, write_outputs_to_directory, DEFAULT_MAX_RECALL_ROWS
 from .duckdb_store import DuckDBFeatureStore
 from .signal_cache import ContractSignalCache
 
@@ -36,6 +36,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--feature-parquet', default='', help='optional parquet snapshot path to preload into DuckDB')
     parser.add_argument('--feature-db', default=':memory:', help='duckdb database path for the feature store')
     parser.add_argument('--signal-cache-db', default=':memory:', help='duckdb database path for cached chain signals')
+    parser.add_argument(
+        '--strict-parquet',
+        action='store_true',
+        help='fail fast if the parquet snapshot is missing pre-computed feature columns instead of falling back to slow Python UDFs',
+    )
+    parser.add_argument(
+        '--max-recall-rows',
+        type=int,
+        default=DEFAULT_MAX_RECALL_ROWS,
+        help='safety cap on token-level recall per seed; set 0 to disable (default: %(default)s)',
+    )
     return parser
 
 
@@ -56,6 +67,7 @@ def _analyze_one_seed(
         name_threshold=args.name_threshold,
         metadata_threshold=args.metadata_threshold,
         timeout=args.timeout,
+        max_recall_rows=args.max_recall_rows,
     )
 
 
@@ -67,7 +79,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     summary_entries: list[dict] = []
     if args.feature_parquet:
         feature_store = DuckDBFeatureStore(database_path=args.feature_db)
-        feature_store.load_parquet_dataset(args.chain, args.feature_parquet)
+        feature_store.load_parquet_dataset(args.chain, args.feature_parquet, strict=args.strict_parquet)
     elif args.feature_db != ':memory:' and Path(args.feature_db).exists():
         feature_store = DuckDBFeatureStore(database_path=args.feature_db)
     try:

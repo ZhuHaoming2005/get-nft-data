@@ -8,7 +8,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from . import chain_to_table, get_conn, normalize_name, normalize_symbol, normalize_url
-from .rust_bridge import metadata_document_from_json
+from .rust_bridge import metadata_document_from_json, metadata_keywords
 
 
 _METADATA_COLUMN_CANDIDATES = ('metadata_json', 'raw_metadata', 'metadata', 'raw_json', 'json_metadata')
@@ -41,6 +41,7 @@ def export_chain_snapshot_to_parquet(
     output_path: str | Path,
     fetch_size: int = 100_000,
     keep_metadata_json: bool = False,
+    row_group_size: int = 200_000,
 ) -> Path:
     table = chain_to_table(chain)
     metadata_column = _detect_metadata_column(conn, table)
@@ -66,6 +67,7 @@ def export_chain_snapshot_to_parquet(
             ('name_norm', pa.string()),
             ('symbol_norm', pa.string()),
             ('metadata_doc', pa.string()),
+            ('metadata_keywords_arr', pa.list_(pa.string())),
         ]
     )
     schema = pa.schema(schema_fields)
@@ -89,6 +91,7 @@ def export_chain_snapshot_to_parquet(
             name_values = list(arrays[4])
             symbol_values = list(arrays[5])
             metadata_json_values = list(arrays[6])
+            metadata_docs = [metadata_document_from_json(value) for value in metadata_json_values]
             batch_payload = {
                 'chain': pa.array([chain] * len(rows), type=pa.string()),
                 'contract_address': pa.array(arrays[0], type=pa.string()),
@@ -101,19 +104,20 @@ def export_chain_snapshot_to_parquet(
                 'image_uri_norm': pa.array([normalize_url(value) or '' for value in image_uri_values], type=pa.string()),
                 'name_norm': pa.array([normalize_name(value) for value in name_values], type=pa.string()),
                 'symbol_norm': pa.array([normalize_symbol(value) for value in symbol_values], type=pa.string()),
-                'metadata_doc': pa.array(
-                    [metadata_document_from_json(value) for value in metadata_json_values],
-                    type=pa.string(),
+                'metadata_doc': pa.array(metadata_docs, type=pa.string()),
+                'metadata_keywords_arr': pa.array(
+                    [metadata_keywords(doc, limit=8) for doc in metadata_docs],
+                    type=pa.list_(pa.string()),
                 ),
             }
             if keep_metadata_json:
                 batch_payload['metadata_json'] = pa.array(metadata_json_values, type=pa.string())
             batch = pa.table(batch_payload, schema=schema)
             if writer is None:
-                writer = pq.ParquetWriter(target, schema=schema)
-            writer.write_table(batch)
+                writer = pq.ParquetWriter(target, schema=schema, compression='zstd')
+            writer.write_table(batch, row_group_size=row_group_size)
     if writer is None:
-        writer = pq.ParquetWriter(target, schema=schema)
+        writer = pq.ParquetWriter(target, schema=schema, compression='zstd')
     writer.close()
     return target
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from threading import RLock
 from typing import Any, Sequence
 
@@ -15,10 +14,10 @@ def _expected_columns() -> list[str]:
         'chain',
         'contract_address',
         'token_type',
-        'mint_recipients_json',
-        'active_sellers_json',
-        'address_signals_json',
-        'victim_signals_json',
+        'mint_recipients',
+        'active_sellers',
+        'address_signals',
+        'victim_signals',
     ]
 
 
@@ -43,10 +42,23 @@ class ContractSignalCache:
                     chain VARCHAR NOT NULL,
                     contract_address VARCHAR NOT NULL,
                     token_type VARCHAR NOT NULL,
-                    mint_recipients_json VARCHAR NOT NULL,
-                    active_sellers_json VARCHAR NOT NULL,
-                    address_signals_json VARCHAR NOT NULL,
-                    victim_signals_json VARCHAR NOT NULL,
+                    mint_recipients VARCHAR[] NOT NULL,
+                    active_sellers VARCHAR[] NOT NULL,
+                    address_signals STRUCT(
+                        mint_address_count INTEGER,
+                        mint_count INTEGER,
+                        unique_receiver_count INTEGER,
+                        cycle_edge_count INTEGER,
+                        star_distributor_count INTEGER,
+                        mint_to_first_transfer_seconds INTEGER,
+                        fast_spread BOOLEAN
+                    ) NOT NULL,
+                    victim_signals STRUCT(
+                        owner_count INTEGER,
+                        stuck_holder_count INTEGER,
+                        stuck_holder_ratio DOUBLE,
+                        victim_wallet_count INTEGER
+                    ),
                     PRIMARY KEY (chain, contract_address, token_type)
                 )
                 '''
@@ -60,7 +72,7 @@ class ContractSignalCache:
         with self._lock:
             row = self._conn.execute(
                 '''
-                SELECT mint_recipients_json, active_sellers_json, address_signals_json, victim_signals_json
+                SELECT mint_recipients, active_sellers, address_signals, victim_signals
                 FROM contract_signal_cache
                 WHERE chain = ? AND contract_address = ? AND token_type = ?
                 ''',
@@ -68,12 +80,12 @@ class ContractSignalCache:
             ).fetchone()
         if row is None:
             return None
-        mint_recipients_json, active_sellers_json, address_signals_json, victim_signals_json = row
+        mint_recipients, active_sellers, address_signals, victim_signals = row
         return {
-            'mint_recipients': json.loads(mint_recipients_json or '[]'),
-            'active_sellers': json.loads(active_sellers_json or '[]'),
-            'address_signals': json.loads(address_signals_json or '{}'),
-            'victim_signals': json.loads(victim_signals_json) if victim_signals_json else None,
+            'mint_recipients': list(mint_recipients) if mint_recipients else [],
+            'active_sellers': list(active_sellers) if active_sellers else [],
+            'address_signals': dict(address_signals) if address_signals else {},
+            'victim_signals': dict(victim_signals) if victim_signals else None,
         }
 
     def put(
@@ -105,17 +117,17 @@ class ContractSignalCache:
             self._conn.execute(
                 '''
                 INSERT OR REPLACE INTO contract_signal_cache (
-                    chain, contract_address, token_type, mint_recipients_json, active_sellers_json,
-                    address_signals_json, victim_signals_json
+                    chain, contract_address, token_type, mint_recipients, active_sellers,
+                    address_signals, victim_signals
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 ''',
                 [
                     chain,
                     contract_address.lower(),
                     token_type,
-                    json.dumps(mint_recipients, ensure_ascii=False),
-                    json.dumps(active_sellers, ensure_ascii=False),
-                    json.dumps(address_signals, ensure_ascii=False),
-                    json.dumps(victim_signals, ensure_ascii=False) if victim_signals is not None else '',
+                    mint_recipients,
+                    active_sellers,
+                    address_signals,
+                    victim_signals,
                 ],
             )
