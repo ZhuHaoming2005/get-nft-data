@@ -10,22 +10,6 @@ EVM 历史 metadata 回填脚本。
 所有参数通过环境变量读取。
 """
 
-# # ── metadata_backfill 专用 ────────────────────────────────────────
-# # 回填链列表（逗号分隔）
-# METADATA_BACKFILL_CHAINS=ethereum,base,polygon
-
-# # 回填模式：alchemy 或 token_uri（二选一）
-# METADATA_BACKFILL_MODE=alchemy
-
-# # 每轮从主表读取的缺失 metadata 记录数
-# METADATA_BACKFILL_SEGMENT_SIZE=1000
-
-# # 单次网络批量请求携带的 token 数
-# METADATA_BACKFILL_BATCH_SIZE=100
-
-# # 网络并发数（Alchemy 批次数或 token_uri HTTP 并发）
-# METADATA_BACKFILL_WORKERS=5
-
 from __future__ import annotations
 
 import asyncio
@@ -69,9 +53,21 @@ METADATA_BACKFILL_MODE = os.getenv("METADATA_BACKFILL_MODE", "alchemy").strip().
 METADATA_BACKFILL_SEGMENT_SIZE = int(os.getenv("METADATA_BACKFILL_SEGMENT_SIZE", "1000"))
 METADATA_BACKFILL_BATCH_SIZE = int(os.getenv("METADATA_BACKFILL_BATCH_SIZE", "100"))
 METADATA_BACKFILL_WORKERS = int(os.getenv("METADATA_BACKFILL_WORKERS", "5"))
+METADATA_BACKFILL_CHAIN_WORKERS = max(
+    1,
+    int(os.getenv("METADATA_BACKFILL_CHAIN_WORKERS", "1")),
+)
+METADATA_BACKFILL_CLAIM_TTL_SECONDS = max(
+    1,
+    int(os.getenv("METADATA_BACKFILL_CLAIM_TTL_SECONDS", "600")),
+)
 METADATA_BACKFILL_CHAIN_CONCURRENCY = max(
     1,
     int(os.getenv("METADATA_BACKFILL_CHAIN_CONCURRENCY", "2")),
+)
+METADATA_BACKFILL_WORKER_STARTUP_DELAY_SECONDS = max(
+    0.0,
+    float(os.getenv("METADATA_BACKFILL_WORKER_STARTUP_DELAY_SECONDS", "0")),
 )
 REQUEST_STARTUP_STAGGER_SECONDS = max(
     0.0,
@@ -229,6 +225,56 @@ def fetch_segment(conn, chain: str, *, limit: int, mode: str) -> List[Tuple]:
         ]
 
 
+def claim_segment(conn, chain: str, *, limit: int, mode: str) -> List[Tuple]:
+    tbl = _table(chain)
+    token_uri_filter = "AND token_uri IS NOT NULL" if mode == "token_uri" else ""
+    lease_interval = f"INTERVAL '{METADATA_BACKFILL_CLAIM_TTL_SECONDS} seconds'"
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            WITH claimed AS (
+                SELECT id,
+                       ROW_NUMBER() OVER (ORDER BY retry_checked_at ASC NULLS FIRST, id ASC) AS claim_order
+                FROM (
+                    SELECT id, retry_checked_at
+                    FROM {tbl}
+                    WHERE contract_address IS NOT NULL
+                      AND (metadata IS NULL OR metadata = '{{}}'::jsonb)
+                      AND (retry_checked_at IS NULL OR retry_checked_at <= NOW())
+                      {token_uri_filter}
+                    ORDER BY retry_checked_at ASC NULLS FIRST, id ASC
+                    LIMIT %s
+                    FOR UPDATE SKIP LOCKED
+                ) queued
+            )
+            UPDATE {tbl} AS t
+            SET retry_checked_at = NOW() + {lease_interval}
+            FROM claimed
+            WHERE t.id = claimed.id
+            RETURNING claimed.claim_order,
+                      claimed.id,
+                      lower(t.contract_address),
+                      t.token_id,
+                      t.token_standard,
+                      t.token_uri,
+                      t.image_uri
+            """,
+            (limit,),
+        )
+        claimed_rows = []
+        for index, row in enumerate(cur.fetchall(), start=1):
+            if len(row) == 7:
+                claim_order = row[0]
+                payload = (row[1], row[2], int(row[3]), row[4], row[5], row[6])
+            else:
+                claim_order = index
+                payload = (row[0], row[1], int(row[2]), row[3], row[4], row[5])
+            claimed_rows.append((claim_order, payload))
+    conn.commit()
+    claimed_rows.sort(key=lambda item: item[0])
+    return [row for _, row in claimed_rows]
+
+
 def mark_rows_checked(conn, chain: str, ids: List[int]) -> None:
     if not ids:
         return
@@ -296,6 +342,15 @@ def _extract_image_from_metadata(nft: Dict, metadata: Optional[Dict]) -> Optiona
             if isinstance(value, str) and value.strip():
                 return value.strip()
     return None
+
+
+def _normalize_fetched_rows(
+    items: List[Tuple[int, Optional[Dict], Optional[str]]],
+) -> List[Tuple[int, Dict, Optional[str]]]:
+    normalized: List[Tuple[int, Dict, Optional[str]]] = []
+    for row_id, metadata, image_uri in items:
+        normalized.append((row_id, metadata if isinstance(metadata, dict) else {}, image_uri))
+    return normalized
 
 
 async def _retry_async(
@@ -504,23 +559,48 @@ async def _fetch_token_uri_metadata_batch_with_retry(
     )
 
 
-async def _process_chain(chain: str, stop_event=None) -> int:
+async def _sleep_interruptibly(delay: float, stop_event=None, *, interval: float = 0.5) -> bool:
+    remaining = max(0.0, delay)
+    while remaining > 0:
+        if _is_stop_requested(stop_event):
+            return True
+        step = min(interval, remaining)
+        await asyncio.sleep(step)
+        remaining -= step
+    return _is_stop_requested(stop_event)
+
+
+async def _maybe_wait_worker_startup(worker_index: int, stop_event=None) -> None:
+    delay = METADATA_BACKFILL_WORKER_STARTUP_DELAY_SECONDS * max(worker_index - 1, 0)
+    if delay <= 0:
+        return
+    logger.info("链 worker-%d 启动延迟 %.2f 秒，避免启动尖峰", worker_index, delay)
+    if stop_event is None:
+        await asyncio.sleep(delay)
+    else:
+        await _sleep_interruptibly(delay, stop_event)
+
+
+async def _worker_main(chain: str, worker_index: int, stop_event=None) -> int:
     conn = _conn()
     try:
-        ensure_columns(conn, chain)
+        await _maybe_wait_worker_startup(worker_index, stop_event)
         timeout = aiohttp.ClientTimeout(
             total=METADATA_CONNECT_TIMEOUT + METADATA_TIMEOUT,
             connect=METADATA_CONNECT_TIMEOUT,
             sock_connect=METADATA_CONNECT_TIMEOUT,
             sock_read=METADATA_TIMEOUT,
         )
-        connector = aiohttp.TCPConnector(limit=max(1, METADATA_BACKFILL_WORKERS))
+        connector = aiohttp.TCPConnector(
+            limit=max(1, METADATA_BACKFILL_WORKERS),
+            ttl_dns_cache=300,
+        )
         sem = asyncio.Semaphore(max(1, METADATA_BACKFILL_WORKERS))
         total_updated = 0
 
         async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
             while not _is_stop_requested(stop_event):
-                rows = fetch_segment(
+                rows = claim_segment(
                     conn,
                     chain,
                     limit=METADATA_BACKFILL_SEGMENT_SIZE,
@@ -529,7 +609,7 @@ async def _process_chain(chain: str, stop_event=None) -> int:
                 if not rows:
                     break
 
-                logger.info("On fetching %d metadatas", len(rows))
+                logger.info("链 %s worker-%d 认领 %d 条待回填 metadata", chain, worker_index, len(rows))
 
                 if METADATA_BACKFILL_MODE == "alchemy":
                     payload_rows = [(row[0], row[1], row[2], row[3]) for row in rows]
@@ -566,26 +646,56 @@ async def _process_chain(chain: str, stop_event=None) -> int:
                 else:
                     raise ValueError(f"不支持的 METADATA_BACKFILL_MODE: {METADATA_BACKFILL_MODE}")
 
-                flat = [item for part in parts for item in part if item[1] is not None]
+                flat = _normalize_fetched_rows([item for part in parts for item in part])
                 updated = bulk_update_rows(conn, chain, flat)
-                updated_ids = {row_id for row_id, _, _ in flat}
-                unresolved_ids = [row[0] for row in rows if row[0] not in updated_ids]
-                mark_rows_checked(conn, chain, unresolved_ids)
                 total_updated += updated
                 logger.info(
-                    "链 %s 本轮读取 %d 条，成功回填 %d 条 metadata（累计 %d）",
+                    "链 %s worker-%d 本轮认领 %d 条，成功回填 %d 条 metadata（累计 %d）",
                     chain,
+                    worker_index,
                     len(rows),
                     updated,
                     total_updated,
                 )
         if _is_stop_requested(stop_event):
-            logger.info("链 %s 收到停止信号，当前批次已完成，累计更新 %d 条", chain, total_updated)
+            logger.info(
+                "链 %s worker-%d 收到停止信号，当前批次已完成，累计更新 %d 条",
+                chain,
+                worker_index,
+                total_updated,
+            )
         else:
-            logger.info("链 %s metadata 回填完成，共更新 %d 条", chain, total_updated)
+            logger.info("链 %s worker-%d 回填完成，共更新 %d 条", chain, worker_index, total_updated)
         return total_updated
     finally:
         _safe_close(conn)
+
+
+async def _process_chain(chain: str, stop_event=None) -> int:
+    conn = _conn()
+    try:
+        ensure_columns(conn, chain)
+    finally:
+        _safe_close(conn)
+
+    async def _run_worker(worker_index: int) -> int:
+        try:
+            return await _worker_main(chain, worker_index, stop_event=stop_event)
+        except Exception:
+            logger.exception("链 %s worker-%d metadata 回填失败，已跳过该 worker", chain, worker_index)
+            return 0
+
+    worker_count = max(1, METADATA_BACKFILL_CHAIN_WORKERS)
+    results = await asyncio.gather(*[
+        _run_worker(worker_index)
+        for worker_index in range(1, worker_count + 1)
+    ])
+    total_updated = sum(results)
+    if _is_stop_requested(stop_event):
+        logger.info("链 %s 已停止拉取新批次，当前在途 worker 已收尾，共更新 %d 条", chain, total_updated)
+    else:
+        logger.info("链 %s metadata 回填完成，共更新 %d 条", chain, total_updated)
+    return total_updated
 
 
 async def _amain(stop_event=None) -> None:

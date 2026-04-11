@@ -71,6 +71,7 @@ class _RecordingCursor:
     def __init__(self, fetchall_result=None):
         self.fetchall_result = fetchall_result or []
         self.executed = []
+        self.rowcount = 0
 
     def execute(self, sql, params=None):
         self.executed.append((sql, params))
@@ -134,6 +135,31 @@ class ProcessChainRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("information_schema.columns", sqls[0])
         self.assertEqual(conn.commit_count, 0)
 
+    def test_claim_segment_marks_rows_in_single_skip_locked_query(self):
+        conn = _RecordingConn(
+            [
+                (1, "0xabc", 10, "ERC-721", "https://example/10", None),
+            ]
+        )
+
+        rows = backfill.claim_segment(conn, "ethereum", limit=25, mode="token_uri")
+
+        sql, params = conn.cursor_obj.executed[0]
+        self.assertEqual(
+            rows,
+            [
+                (1, "0xabc", 10, "ERC-721", "https://example/10", None),
+            ],
+        )
+        self.assertIn("FOR UPDATE SKIP LOCKED", sql)
+        self.assertIn("UPDATE nft_assets_ethereum", sql)
+        self.assertIn("RETURNING claimed.claim_order", sql)
+        self.assertIn("claimed.id", sql)
+        self.assertIn("token_uri IS NOT NULL", sql)
+        self.assertIn("retry_checked_at IS NULL OR retry_checked_at <= NOW()", sql)
+        self.assertEqual(params, (25,))
+        self.assertEqual(conn.commit_count, 1)
+
     async def test_process_chain_skips_failed_batch_and_continues(self):
         class _FakeSession:
             async def __aenter__(self):
@@ -153,10 +179,9 @@ class ProcessChainRetryTests(unittest.IsolatedAsyncioTestCase):
         try:
             backfill.METADATA_BACKFILL_MODE = "alchemy"
             backfill.METADATA_BACKFILL_BATCH_SIZE = 1
-            with patch.object(backfill, "_conn", return_value=_RecordingConn()), \
+            with patch.object(backfill, "_conn", side_effect=lambda: _RecordingConn()), \
                  patch.object(backfill, "ensure_columns"), \
-                 patch.object(backfill, "fetch_segment", side_effect=[rows, []]), \
-                 patch.object(backfill, "mark_rows_checked"), \
+                 patch.object(backfill, "claim_segment", side_effect=[rows, []]), \
                  patch.object(backfill.aiohttp, "ClientSession", return_value=_FakeSession()), \
                  patch.object(
                      backfill,
@@ -215,10 +240,9 @@ class ProcessChainRetryTests(unittest.IsolatedAsyncioTestCase):
             backfill.METADATA_BACKFILL_MODE = "alchemy"
             backfill.METADATA_BACKFILL_BATCH_SIZE = 1
             backfill.METADATA_BACKFILL_WORKERS = 3
-            with patch.object(backfill, "_conn", return_value=_RecordingConn()), \
+            with patch.object(backfill, "_conn", side_effect=lambda: _RecordingConn()), \
                  patch.object(backfill, "ensure_columns"), \
-                 patch.object(backfill, "fetch_segment", side_effect=[rows, []]), \
-                 patch.object(backfill, "mark_rows_checked"), \
+                 patch.object(backfill, "claim_segment", side_effect=[rows, []]), \
                  patch.object(backfill.aiohttp, "ClientSession", return_value=_FakeSession()), \
                  patch.object(backfill, "_fetch_alchemy_batch_with_retry", side_effect=_fake_fetch), \
                  patch.object(backfill, "bulk_update_rows", side_effect=lambda conn, chain, batch: len(batch)):
@@ -229,6 +253,29 @@ class ProcessChainRetryTests(unittest.IsolatedAsyncioTestCase):
             backfill.METADATA_BACKFILL_WORKERS = original_workers
 
         self.assertEqual(updated, 3)
+        self.assertGreaterEqual(state["max"], 2)
+
+    async def test_process_chain_runs_multiple_segment_workers_per_chain(self):
+        state = {"current": 0, "max": 0}
+
+        async def _fake_worker(chain, worker_index, stop_event=None):
+            state["current"] += 1
+            state["max"] = max(state["max"], state["current"])
+            await asyncio.sleep(0.01)
+            state["current"] -= 1
+            return worker_index
+
+        original_workers = getattr(backfill, "METADATA_BACKFILL_CHAIN_WORKERS", 1)
+        try:
+            backfill.METADATA_BACKFILL_CHAIN_WORKERS = 3
+            with patch.object(backfill, "_conn", side_effect=lambda: _RecordingConn()), \
+                 patch.object(backfill, "ensure_columns"), \
+                 patch.object(backfill, "_worker_main", side_effect=_fake_worker):
+                updated = await backfill._process_chain("ethereum")
+        finally:
+            backfill.METADATA_BACKFILL_CHAIN_WORKERS = original_workers
+
+        self.assertEqual(updated, 6)
         self.assertGreaterEqual(state["max"], 2)
 
     async def test_process_chain_passes_startup_stagger_to_batches(self):
@@ -264,10 +311,9 @@ class ProcessChainRetryTests(unittest.IsolatedAsyncioTestCase):
             backfill.METADATA_BACKFILL_MODE = "alchemy"
             backfill.METADATA_BACKFILL_BATCH_SIZE = 1
             backfill.REQUEST_STARTUP_STAGGER_SECONDS = 0.5
-            with patch.object(backfill, "_conn", return_value=_RecordingConn()), \
+            with patch.object(backfill, "_conn", side_effect=lambda: _RecordingConn()), \
                  patch.object(backfill, "ensure_columns"), \
-                 patch.object(backfill, "fetch_segment", side_effect=[rows, []]), \
-                 patch.object(backfill, "mark_rows_checked"), \
+                 patch.object(backfill, "claim_segment", side_effect=[rows, []]), \
                  patch.object(backfill.aiohttp, "ClientSession", return_value=_FakeSession()), \
                  patch.object(backfill, "_fetch_alchemy_batch_with_retry", side_effect=_fake_fetch), \
                  patch.object(backfill, "bulk_update_rows", side_effect=lambda conn, chain, batch: len(batch)):
@@ -280,7 +326,7 @@ class ProcessChainRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(updated, 2)
         self.assertEqual(delays, [0.0, 0.5])
 
-    async def test_process_chain_marks_only_failed_rows_checked(self):
+    async def test_process_chain_updates_only_successful_rows(self):
         class _FakeSession:
             async def __aenter__(self):
                 return self
@@ -299,10 +345,9 @@ class ProcessChainRetryTests(unittest.IsolatedAsyncioTestCase):
         try:
             backfill.METADATA_BACKFILL_MODE = "alchemy"
             backfill.METADATA_BACKFILL_BATCH_SIZE = 1
-            with patch.object(backfill, "_conn", return_value=_RecordingConn()), \
+            with patch.object(backfill, "_conn", side_effect=lambda: _RecordingConn()), \
                  patch.object(backfill, "ensure_columns"), \
-                 patch.object(backfill, "fetch_segment", side_effect=[rows, []]), \
-                 patch.object(backfill, "mark_rows_checked") as mark_rows_checked, \
+                 patch.object(backfill, "claim_segment", side_effect=[rows, []]), \
                  patch.object(backfill.aiohttp, "ClientSession", return_value=_FakeSession()), \
                  patch.object(
                      backfill,
@@ -323,7 +368,42 @@ class ProcessChainRetryTests(unittest.IsolatedAsyncioTestCase):
             update_calls,
             [[(2, {"name": "NFT 2", "image": "https://cdn.example/2.png"}, "https://cdn.example/2.png")]],
         )
-        mark_rows_checked.assert_called_once_with(unittest.mock.ANY, "ethereum", [1])
+
+    async def test_process_chain_writes_empty_object_placeholder_when_metadata_missing(self):
+        class _FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        rows = [
+            (1, "0xabc", 10, "ERC-721", "https://example/10", None),
+        ]
+        update_calls = []
+
+        original_mode = backfill.METADATA_BACKFILL_MODE
+        original_batch = backfill.METADATA_BACKFILL_BATCH_SIZE
+        try:
+            backfill.METADATA_BACKFILL_MODE = "alchemy"
+            backfill.METADATA_BACKFILL_BATCH_SIZE = 1
+            with patch.object(backfill, "_conn", side_effect=lambda: _RecordingConn()), \
+                 patch.object(backfill, "ensure_columns"), \
+                 patch.object(backfill, "claim_segment", side_effect=[rows, []]), \
+                 patch.object(backfill.aiohttp, "ClientSession", return_value=_FakeSession()), \
+                 patch.object(
+                     backfill,
+                     "_fetch_alchemy_batch_with_retry",
+                     return_value=[(1, None, None)],
+                 ), \
+                 patch.object(backfill, "bulk_update_rows", side_effect=lambda conn, chain, batch: update_calls.append(list(batch)) or len(batch)):
+                updated = await backfill._process_chain("ethereum")
+        finally:
+            backfill.METADATA_BACKFILL_MODE = original_mode
+            backfill.METADATA_BACKFILL_BATCH_SIZE = original_batch
+
+        self.assertEqual(updated, 1)
+        self.assertEqual(update_calls, [[(1, {}, None)]])
 
     async def test_process_chain_stops_before_fetching_next_segment_when_stop_requested(self):
         class _FakeSession:
@@ -339,7 +419,7 @@ class ProcessChainRetryTests(unittest.IsolatedAsyncioTestCase):
         stop_event = threading.Event()
         fetch_segment_calls = []
 
-        def _fake_fetch_segment(conn, chain, *, limit, mode):
+        def _fake_claim_segment(conn, chain, *, limit, mode):
             fetch_segment_calls.append((chain, limit, mode))
             return rows if len(fetch_segment_calls) == 1 else [
                 (2, "0xdef", 11, "ERC-721", "https://example/11", None),
@@ -354,10 +434,9 @@ class ProcessChainRetryTests(unittest.IsolatedAsyncioTestCase):
         try:
             backfill.METADATA_BACKFILL_MODE = "alchemy"
             backfill.METADATA_BACKFILL_BATCH_SIZE = 1
-            with patch.object(backfill, "_conn", return_value=_RecordingConn()), \
+            with patch.object(backfill, "_conn", side_effect=lambda: _RecordingConn()), \
                  patch.object(backfill, "ensure_columns"), \
-                 patch.object(backfill, "fetch_segment", side_effect=_fake_fetch_segment), \
-                 patch.object(backfill, "mark_rows_checked"), \
+                 patch.object(backfill, "claim_segment", side_effect=_fake_claim_segment), \
                  patch.object(backfill.aiohttp, "ClientSession", return_value=_FakeSession()), \
                  patch.object(backfill, "_fetch_alchemy_batch_with_retry", side_effect=_fake_fetch), \
                  patch.object(backfill, "bulk_update_rows", side_effect=lambda conn, chain, batch: len(batch)):
