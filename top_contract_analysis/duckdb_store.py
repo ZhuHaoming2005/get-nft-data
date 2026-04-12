@@ -284,9 +284,10 @@ class DuckDBFeatureStore:
             query_str = '\n'.join(selected_rows_parts)
             query_params = base_params[:] + ([max_recall_rows] if max_recall_rows > 0 else [])
 
-        # For file-based databases, open a dedicated read-only connection so that
-        # multiple batch workers can execute queries in parallel without contending
-        # on the write-connection lock.
+        # For file-based databases, open a dedicated connection so that multiple
+        # batch workers can execute queries in parallel without contending on the
+        # writer connection's Python-side lock. DuckDB requires concurrent handles
+        # for the same database file to use matching connection configuration.
         def _run(conn_obj: duckdb.DuckDBPyConnection):
             if use_two_step:
                 contract_addrs = [row[0] for row in conn_obj.execute(step1_str, step1_params).fetchall()]
@@ -297,7 +298,7 @@ class DuckDBFeatureStore:
             return conn_obj.execute(query_str, query_params).to_arrow_table()
 
         if self._database_path != ':memory:':
-            rconn = duckdb.connect(database=self._database_path, read_only=True)
+            rconn = duckdb.connect(database=self._database_path)
             try:
                 arrow_result = _run(rconn)
             finally:
