@@ -164,7 +164,12 @@ def find_duplicate_candidates(
     name_threshold: float = DEFAULT_NAME_THRESHOLD,
     metadata_threshold: float = 0.55,
 ) -> List[DuplicateCandidate]:
-    from .rust_bridge import metadata_document_from_json, metadata_keywords, score_metadata_pairs, score_name_pairs
+    from .rust_bridge import (
+        metadata_document_from_json,
+        metadata_keywords,
+        score_metadata_documents,
+        score_name_pairs,
+    )
 
     seed_index = build_seed_index(seed_nfts)
     token_uri_keys = seed_index['token_uri_keys']
@@ -223,7 +228,7 @@ def find_duplicate_candidates(
             metadata_right.append(row_doc)
 
     metadata_matches: set[int] = set()
-    for idx, score in zip(metadata_pair_indices, score_metadata_pairs(metadata_left, metadata_right)):
+    for idx, score in zip(metadata_pair_indices, score_metadata_documents(metadata_left, metadata_right)):
         if score >= metadata_threshold:
             metadata_matches.add(idx)
 

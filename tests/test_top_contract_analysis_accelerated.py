@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 import time
 import unittest
@@ -89,6 +90,61 @@ class RustBridgeTests(unittest.TestCase):
 
         self.assertEqual(len(scores), 1)
         self.assertGreaterEqual(scores[0], 0.55)
+
+    def test_score_metadata_documents_detects_close_precomputed_docs(self):
+        scores = rust_bridge.score_metadata_documents(
+            ['red hooded anime portrait off white d maroon kimono'],
+            ['anime portrait maroon kimono on an off white background'],
+        )
+
+        self.assertEqual(len(scores), 1)
+        self.assertGreaterEqual(scores[0], 0.55)
+
+    def test_analyze_transfer_signals_releases_gil_for_parallel_calls(self):
+        if rust_bridge._rust_analyze_transfer_signals is None:
+            self.skipTest('rust extension not available')
+        if (os.cpu_count() or 1) < 2:
+            self.skipTest('parallel speedup check requires at least 2 CPUs')
+
+        fn = rust_bridge._rust_analyze_transfer_signals
+        base_transfers = [
+            (mod.ZERO_ADDRESS, '0xminted', 100),
+            ('0xminted', '0xbuyer', 200),
+            ('0xa', '0xb', 300),
+            ('0xb', '0xa', 400),
+            ('0xstar', '0x1', 500),
+            ('0xstar', '0x2', 501),
+            ('0xstar', '0x3', 502),
+        ]
+        transfers = base_transfers * 120_000
+
+        fn(transfers[:1_000])
+
+        started = time.perf_counter()
+        fn(transfers)
+        fn(transfers)
+        sequential = time.perf_counter() - started
+
+        barrier = threading.Barrier(3)
+        durations = []
+
+        def worker():
+            barrier.wait()
+            worker_started = time.perf_counter()
+            fn(transfers)
+            durations.append(time.perf_counter() - worker_started)
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        started = time.perf_counter()
+        for thread in threads:
+            thread.join()
+        concurrent = time.perf_counter() - started
+
+        self.assertEqual(len(durations), 2)
+        self.assertLess(concurrent, sequential * 0.85)
 
     def test_analyze_transfer_signals_computes_expected_metrics(self):
         transfers = [
@@ -814,7 +870,7 @@ class DuckDBSnapshotTests(unittest.TestCase):
             ]
         )
 
-        with patch.object(rust_bridge, 'score_metadata_pairs', return_value=[0.8]) as score_mock:
+        with patch.object(rust_bridge, 'score_metadata_documents', return_value=[0.8]) as score_mock:
             candidates = mod.find_duplicate_candidates(
                 seed_nfts,
                 snapshot,

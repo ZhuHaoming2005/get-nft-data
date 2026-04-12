@@ -21,6 +21,7 @@ try:
     from top_contract_analysis_rust import analyze_victim_signals as _rust_analyze_victim_signals
     from top_contract_analysis_rust import metadata_document_from_json as _rust_metadata_document_from_json
     from top_contract_analysis_rust import metadata_keywords as _rust_metadata_keywords
+    from top_contract_analysis_rust import score_metadata_documents as _rust_score_metadata_documents
     from top_contract_analysis_rust import score_metadata_pairs as _rust_score_metadata_pairs
     from top_contract_analysis_rust import score_name_pairs as _rust_score_name_pairs
 
@@ -30,6 +31,7 @@ except ImportError:  # pragma: no cover
     _rust_analyze_victim_signals = None
     _rust_metadata_document_from_json = None
     _rust_metadata_keywords = None
+    _rust_score_metadata_documents = None
     _rust_score_metadata_pairs = None
     _rust_score_name_pairs = None
     MATCHING_BACKEND = 'python'
@@ -159,10 +161,16 @@ def _tokenize(document: str) -> set[str]:
 
 
 def _score_metadata_pairs_python(left: Sequence[str], right: Sequence[str]) -> list[float]:
+    left_docs = [metadata_document_from_json(item) for item in left]
+    right_docs = [metadata_document_from_json(item) for item in right]
+    return _score_metadata_documents_python(left_docs, right_docs)
+
+
+def _score_metadata_documents_python(left: Sequence[str], right: Sequence[str]) -> list[float]:
     scores: list[float] = []
     for left_item, right_item in zip(left, right):
-        left_doc = metadata_document_from_json(left_item)
-        right_doc = metadata_document_from_json(right_item)
+        left_doc = _normalize_text(left_item)
+        right_doc = _normalize_text(right_item)
         if not left_doc or not right_doc:
             scores.append(0.0)
             continue
@@ -197,6 +205,15 @@ def score_metadata_pairs(left: Sequence[str], right: Sequence[str]) -> list[floa
     if _rust_score_metadata_pairs is not None:
         return list(_rust_score_metadata_pairs(list(left), list(right)))
     return _score_metadata_pairs_python(left, right)
+
+
+def score_metadata_documents(left: Sequence[str], right: Sequence[str]) -> list[float]:
+    _validate_parallel_inputs(left, right)
+    if not left:
+        return []
+    if _rust_score_metadata_documents is not None:
+        return list(_rust_score_metadata_documents(list(left), list(right)))
+    return _score_metadata_documents_python(left, right)
 
 
 def _calculate_cycle_edge_count(transfers: Sequence['TransferRecord']) -> int:

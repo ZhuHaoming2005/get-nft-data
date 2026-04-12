@@ -9,6 +9,8 @@ use std::collections::{HashMap, HashSet};
 use strsim::{jaro_winkler, normalized_levenshtein};
 use unicode_normalization::UnicodeNormalization;
 
+const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
+
 static TRAILING_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
         Regex::new(r"\s*#\s*[0-9a-fA-FxX]+\s*$").unwrap(),
@@ -156,6 +158,12 @@ fn name_score(left: &str, right: &str) -> f64 {
 fn metadata_score(left: &str, right: &str) -> f64 {
     let left_doc = metadata_document(left);
     let right_doc = metadata_document(right);
+    metadata_score_from_documents(&left_doc, &right_doc)
+}
+
+fn metadata_score_from_documents(left: &str, right: &str) -> f64 {
+    let left_doc = normalize_text(left);
+    let right_doc = normalize_text(right);
     if left_doc.is_empty() || right_doc.is_empty() {
         return 0.0;
     }
@@ -181,48 +189,67 @@ fn canonical_pair(left: &str, right: &str) -> (String, String) {
 }
 
 #[pyfunction]
-fn score_name_pairs(left: Vec<String>, right: Vec<String>) -> PyResult<Vec<f64>> {
+fn score_name_pairs(py: Python<'_>, left: Vec<String>, right: Vec<String>) -> PyResult<Vec<f64>> {
     if left.len() != right.len() {
         return Err(PyValueError::new_err(
             "left and right sequences must have identical lengths",
         ));
     }
-    Ok(left
-        .par_iter()
-        .zip(right.par_iter())
-        .map(|(l, r)| name_score(l, r))
-        .collect())
+    Ok(py.allow_threads(|| {
+        left.par_iter()
+            .zip(right.par_iter())
+            .map(|(l, r)| name_score(l, r))
+            .collect()
+    }))
 }
 
 #[pyfunction]
-fn score_metadata_pairs(left: Vec<String>, right: Vec<String>) -> PyResult<Vec<f64>> {
+fn score_metadata_pairs(py: Python<'_>, left: Vec<String>, right: Vec<String>) -> PyResult<Vec<f64>> {
     if left.len() != right.len() {
         return Err(PyValueError::new_err(
             "left and right sequences must have identical lengths",
         ));
     }
-    Ok(left
-        .par_iter()
-        .zip(right.par_iter())
-        .map(|(l, r)| metadata_score(l, r))
-        .collect())
+    Ok(py.allow_threads(|| {
+        left.par_iter()
+            .zip(right.par_iter())
+            .map(|(l, r)| metadata_score(l, r))
+            .collect()
+    }))
 }
 
 #[pyfunction]
-fn metadata_document_from_json(raw: String) -> PyResult<String> {
-    Ok(metadata_document(&raw))
+fn score_metadata_documents(
+    py: Python<'_>,
+    left: Vec<String>,
+    right: Vec<String>,
+) -> PyResult<Vec<f64>> {
+    if left.len() != right.len() {
+        return Err(PyValueError::new_err(
+            "left and right sequences must have identical lengths",
+        ));
+    }
+    Ok(py.allow_threads(|| {
+        left.par_iter()
+            .zip(right.par_iter())
+            .map(|(l, r)| metadata_score_from_documents(l, r))
+            .collect()
+    }))
+}
+
+#[pyfunction]
+fn metadata_document_from_json(py: Python<'_>, raw: String) -> PyResult<String> {
+    Ok(py.allow_threads(|| metadata_document(&raw)))
 }
 
 #[pyfunction(signature = (document, limit=8))]
-fn metadata_keywords(document: String, limit: usize) -> PyResult<Vec<String>> {
-    Ok(metadata_keywords_internal(&document, limit))
+fn metadata_keywords(py: Python<'_>, document: String, limit: usize) -> PyResult<Vec<String>> {
+    Ok(py.allow_threads(|| metadata_keywords_internal(&document, limit)))
 }
 
-#[pyfunction]
-fn analyze_transfer_signals(
-    py: Python<'_>,
+fn analyze_transfer_signals_internal(
     transfers: Vec<(String, String, i64)>,
-) -> PyResult<PyObject> {
+) -> (usize, usize, usize, usize, usize, i64, bool) {
     let mut mint_recipients: HashSet<String> = HashSet::new();
     let mut receiver_addresses: HashSet<String> = HashSet::new();
     let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
@@ -234,10 +261,10 @@ fn analyze_transfer_signals(
     let mut first_non_mint_time: i64 = 0;
 
     for (from_address, to_address, block_time) in transfers.iter() {
-        if !to_address.is_empty() && to_address != "0x0000000000000000000000000000000000000000" {
+        if !to_address.is_empty() && to_address != ZERO_ADDRESS {
             receiver_addresses.insert(to_address.clone());
         }
-        if from_address == "0x0000000000000000000000000000000000000000" {
+        if from_address == ZERO_ADDRESS {
             mint_count += 1;
             if !to_address.is_empty() {
                 mint_recipients.insert(to_address.clone());
@@ -251,7 +278,7 @@ fn analyze_transfer_signals(
         if *block_time > 0 && (first_non_mint_time == 0 || *block_time < first_non_mint_time) {
             first_non_mint_time = *block_time;
         }
-        if to_address != "0x0000000000000000000000000000000000000000" {
+        if to_address != ZERO_ADDRESS {
             outgoing
                 .entry(from_address.clone())
                 .or_default()
@@ -274,31 +301,27 @@ fn analyze_transfer_signals(
     if first_mint_time > 0 && first_non_mint_time >= first_mint_time {
         first_transfer_delay = first_non_mint_time - first_mint_time;
     }
+    let fast_spread = first_transfer_delay > 0 && first_transfer_delay <= 24 * 3600;
 
-    let result = PyDict::new_bound(py);
-    result.set_item("mint_address_count", mint_recipients.len())?;
-    result.set_item("mint_count", mint_count)?;
-    result.set_item("unique_receiver_count", receiver_addresses.len())?;
-    result.set_item("cycle_edge_count", cycle_pairs.len())?;
-    result.set_item("star_distributor_count", star_distributor_count)?;
-    result.set_item("mint_to_first_transfer_seconds", first_transfer_delay)?;
-    result.set_item(
-        "fast_spread",
-        first_transfer_delay > 0 && first_transfer_delay <= 24 * 3600,
-    )?;
-    Ok(result.into_any().unbind())
+    (
+        mint_recipients.len(),
+        mint_count,
+        receiver_addresses.len(),
+        cycle_pairs.len(),
+        star_distributor_count,
+        first_transfer_delay,
+        fast_spread,
+    )
 }
 
-#[pyfunction]
-fn analyze_victim_signals(
-    py: Python<'_>,
+fn analyze_victim_signals_internal(
     transfers: Vec<(String, String, i64)>,
     owners: Vec<(String, bool)>,
-) -> PyResult<PyObject> {
+) -> (usize, usize, f64, usize) {
     let active_sellers: HashSet<String> = transfers
         .into_iter()
         .filter_map(|(from_address, _to_address, _block_time)| {
-            if !from_address.is_empty() && from_address != "0x0000000000000000000000000000000000000000" {
+            if !from_address.is_empty() && from_address != ZERO_ADDRESS {
                 Some(from_address)
             } else {
                 None
@@ -323,11 +346,54 @@ fn analyze_victim_signals(
         stuck_holder_count as f64 / owner_count as f64
     };
 
+    (
+        owner_count,
+        stuck_holder_count,
+        stuck_holder_ratio,
+        stuck_holder_count,
+    )
+}
+
+#[pyfunction]
+fn analyze_transfer_signals(
+    py: Python<'_>,
+    transfers: Vec<(String, String, i64)>,
+) -> PyResult<PyObject> {
+    let (
+        mint_address_count,
+        mint_count,
+        unique_receiver_count,
+        cycle_edge_count,
+        star_distributor_count,
+        first_transfer_delay,
+        fast_spread,
+    ) = py.allow_threads(|| analyze_transfer_signals_internal(transfers));
+
+    let result = PyDict::new_bound(py);
+    result.set_item("mint_address_count", mint_address_count)?;
+    result.set_item("mint_count", mint_count)?;
+    result.set_item("unique_receiver_count", unique_receiver_count)?;
+    result.set_item("cycle_edge_count", cycle_edge_count)?;
+    result.set_item("star_distributor_count", star_distributor_count)?;
+    result.set_item("mint_to_first_transfer_seconds", first_transfer_delay)?;
+    result.set_item("fast_spread", fast_spread)?;
+    Ok(result.into_any().unbind())
+}
+
+#[pyfunction]
+fn analyze_victim_signals(
+    py: Python<'_>,
+    transfers: Vec<(String, String, i64)>,
+    owners: Vec<(String, bool)>,
+) -> PyResult<PyObject> {
+    let (owner_count, stuck_holder_count, stuck_holder_ratio, victim_wallet_count) =
+        py.allow_threads(|| analyze_victim_signals_internal(transfers, owners));
+
     let result = PyDict::new_bound(py);
     result.set_item("owner_count", owner_count)?;
     result.set_item("stuck_holder_count", stuck_holder_count)?;
     result.set_item("stuck_holder_ratio", stuck_holder_ratio)?;
-    result.set_item("victim_wallet_count", stuck_holder_count)?;
+    result.set_item("victim_wallet_count", victim_wallet_count)?;
     Ok(result.into_any().unbind())
 }
 
@@ -335,6 +401,7 @@ fn analyze_victim_signals(
 fn top_contract_analysis_rust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(score_name_pairs, m)?)?;
     m.add_function(wrap_pyfunction!(score_metadata_pairs, m)?)?;
+    m.add_function(wrap_pyfunction!(score_metadata_documents, m)?)?;
     m.add_function(wrap_pyfunction!(metadata_document_from_json, m)?)?;
     m.add_function(wrap_pyfunction!(metadata_keywords, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_transfer_signals, m)?)?;
