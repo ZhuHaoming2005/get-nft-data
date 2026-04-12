@@ -485,6 +485,57 @@ class DuckDBSnapshotTests(unittest.TestCase):
             if tmpdir.exists():
                 tmpdir.rmdir()
 
+    def test_duckdb_feature_store_load_snapshot_uses_open_file_backed_connection(self):
+        seed_nfts = [
+            mod.SeedNFT(
+                chain='ethereum',
+                contract_address='0xseed',
+                token_id='1',
+                name='Azuki #1',
+                symbol='AZUKI',
+                token_uri='ipfs://seed/meta-1',
+                image_uri='ipfs://seed/image-1.png',
+                metadata_json='',
+            )
+        ]
+        tmpdir = Path('D:/code/solidity/get-nft-data/output/test-top-contract-analysis-open-file-snapshot')
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        db_path = tmpdir / 'features.duckdb'
+        store = None
+        try:
+            store = DuckDBFeatureStore(database_path=str(db_path))
+            store.replace_chain_rows(
+                'ethereum',
+                [
+                    mod.DatabaseNFTRecord(
+                        contract_address='0xdup',
+                        token_id='1',
+                        token_uri='ipfs://seed/meta-1',
+                        image_uri='ipfs://dup/image.png',
+                        name='Azuki Mirror #1',
+                        symbol='AZUKI',
+                        metadata_json='',
+                    )
+                ],
+            )
+
+            snapshot = store.load_snapshot('ethereum', seed_nfts=seed_nfts)
+
+            self.assertEqual(
+                [(row.contract_address, row.token_id, row.name) for row in snapshot.nft_rows],
+                [('0xdup', '1', 'Azuki Mirror #1')],
+            )
+        finally:
+            if store is not None:
+                store.close()
+            for path in sorted(tmpdir.glob('**/*'), reverse=True):
+                if path.is_file():
+                    path.unlink()
+                elif path.is_dir():
+                    path.rmdir()
+            if tmpdir.exists():
+                tmpdir.rmdir()
+
     def test_analyze_seed_contract_uses_feature_store_snapshot(self):
         seed_meta = mod.ContractMetadata(
             chain='ethereum',
