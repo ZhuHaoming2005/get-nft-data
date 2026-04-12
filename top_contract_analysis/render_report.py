@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 from typing import Optional, Sequence
 
-from . import render_human_readable_report
+from .reporting import render_human_readable_report
 
 
 def build_parser() -> argparse.ArgumentParser:

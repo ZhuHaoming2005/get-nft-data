@@ -6,7 +6,7 @@ from typing import Any, Sequence
 
 import duckdb
 
-from . import OwnerBalance, TransferRecord
+from .models import OwnerBalance, TransferRecord
 from .rust_bridge import analyze_transfer_signals, analyze_victim_signals_from_active_sellers
 
 

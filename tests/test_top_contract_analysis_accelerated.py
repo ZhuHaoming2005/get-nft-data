@@ -10,6 +10,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 import top_contract_analysis as mod
+import top_contract_analysis.analysis as analysis_mod
+import top_contract_analysis.cli as cli_mod
 import top_contract_analysis.batch as batch_mod
 import top_contract_analysis.build_rust_ext as build_rust_mod
 import top_contract_analysis.export_snapshot as export_mod
@@ -536,11 +538,11 @@ class DuckDBSnapshotTests(unittest.TestCase):
         ]
         owners = [mod.OwnerBalance(owner_address='0xsybil', token_balances={'1': 1})]
 
-        with patch.object(mod, 'fetch_contract_metadata', return_value=seed_meta), \
-             patch.object(mod, 'fetch_seed_contract_nfts', return_value=seed_nfts), \
-             patch.object(mod, 'fetch_license_sample', return_value={'raw': {'metadata': {'license': 'All rights reserved'}}}), \
-             patch.object(mod, 'fetch_contract_transfers', return_value=transfers), \
-             patch.object(mod, 'fetch_contract_owners', return_value=owners):
+        with patch.object(analysis_mod, 'fetch_contract_metadata', return_value=seed_meta), \
+             patch.object(analysis_mod, 'fetch_seed_contract_nfts', return_value=seed_nfts), \
+             patch.object(analysis_mod, 'fetch_license_sample', return_value={'raw': {'metadata': {'license': 'All rights reserved'}}}), \
+             patch.object(analysis_mod, 'fetch_contract_transfers', return_value=transfers), \
+             patch.object(analysis_mod, 'fetch_contract_owners', return_value=owners):
             result = mod.analyze_seed_contract(
                 chain='ethereum',
                 seed_contract_address='0xseed',
@@ -579,12 +581,12 @@ class DuckDBSnapshotTests(unittest.TestCase):
         store = DuckDBFeatureStore()
         store.replace_chain_rows('ethereum', [])
 
-        with patch.object(mod, 'get_conn', side_effect=AssertionError('unexpected pg connection')), \
-             patch.object(mod, 'fetch_contract_metadata', return_value=seed_meta), \
-             patch.object(mod, 'fetch_seed_contract_nfts', return_value=seed_nfts), \
-             patch.object(mod, 'fetch_license_sample', return_value={}), \
-             patch.object(mod, 'fetch_contract_transfers', return_value=[]), \
-             patch.object(mod, 'fetch_contract_owners', return_value=[]):
+        with patch.object(analysis_mod, 'get_conn', side_effect=AssertionError('unexpected pg connection')), \
+             patch.object(analysis_mod, 'fetch_contract_metadata', return_value=seed_meta), \
+             patch.object(analysis_mod, 'fetch_seed_contract_nfts', return_value=seed_nfts), \
+             patch.object(analysis_mod, 'fetch_license_sample', return_value={}), \
+             patch.object(analysis_mod, 'fetch_contract_transfers', return_value=[]), \
+             patch.object(analysis_mod, 'fetch_contract_owners', return_value=[]):
             result = mod.analyze_seed_contract(
                 chain='ethereum',
                 seed_contract_address='0xseed',
@@ -698,11 +700,11 @@ class DuckDBSnapshotTests(unittest.TestCase):
             time.sleep(0.15)
             return owners
 
-        with patch.object(mod, 'fetch_contract_metadata', side_effect=fake_contract_metadata), \
-             patch.object(mod, 'fetch_seed_contract_nfts', side_effect=fake_seed_nfts), \
-             patch.object(mod, 'fetch_license_sample', side_effect=fake_license), \
-             patch.object(mod, 'fetch_contract_transfers', side_effect=fake_transfers), \
-             patch.object(mod, 'fetch_contract_owners', side_effect=fake_owners):
+        with patch.object(analysis_mod, 'fetch_contract_metadata', side_effect=fake_contract_metadata), \
+             patch.object(analysis_mod, 'fetch_seed_contract_nfts', side_effect=fake_seed_nfts), \
+             patch.object(analysis_mod, 'fetch_license_sample', side_effect=fake_license), \
+             patch.object(analysis_mod, 'fetch_contract_transfers', side_effect=fake_transfers), \
+             patch.object(analysis_mod, 'fetch_contract_owners', side_effect=fake_owners):
             started = time.perf_counter()
             result = mod.analyze_seed_contract(
                 chain='ethereum',
@@ -828,11 +830,11 @@ class DuckDBSnapshotTests(unittest.TestCase):
         owners = [mod.OwnerBalance(owner_address='0xbuyer', token_balances={'1': 1})]
         cache = ContractSignalCache()
 
-        with patch.object(mod, 'fetch_contract_metadata', return_value=seed_meta), \
-             patch.object(mod, 'fetch_seed_contract_nfts', return_value=seed_nfts), \
-             patch.object(mod, 'fetch_license_sample', return_value={'raw': {'metadata': {'license': 'All rights reserved'}}}), \
-             patch.object(mod, 'fetch_contract_transfers', return_value=transfers) as transfer_mock, \
-             patch.object(mod, 'fetch_contract_owners', return_value=owners) as owners_mock:
+        with patch.object(analysis_mod, 'fetch_contract_metadata', return_value=seed_meta), \
+             patch.object(analysis_mod, 'fetch_seed_contract_nfts', return_value=seed_nfts), \
+             patch.object(analysis_mod, 'fetch_license_sample', return_value={'raw': {'metadata': {'license': 'All rights reserved'}}}), \
+             patch.object(analysis_mod, 'fetch_contract_transfers', return_value=transfers) as transfer_mock, \
+             patch.object(analysis_mod, 'fetch_contract_owners', return_value=owners) as owners_mock:
             mod.analyze_seed_contract(
                 chain='ethereum',
                 seed_contract_address='0xseed',
@@ -920,11 +922,11 @@ class DuckDBSnapshotTests(unittest.TestCase):
         owners = [mod.OwnerBalance(owner_address='0xbuyer', token_balances={'1': 1})]
         cache = ContractSignalCache()
 
-        with patch.object(mod, 'fetch_contract_metadata', side_effect=[seed_meta_legit, seed_meta_non_legit]), \
-             patch.object(mod, 'fetch_seed_contract_nfts', return_value=seed_nfts), \
-             patch.object(mod, 'fetch_license_sample', return_value={'raw': {'metadata': {'license': 'All rights reserved'}}}), \
-             patch.object(mod, 'fetch_contract_transfers', return_value=transfers) as transfer_mock, \
-             patch.object(mod, 'fetch_contract_owners', return_value=owners) as owners_mock:
+        with patch.object(analysis_mod, 'fetch_contract_metadata', side_effect=[seed_meta_legit, seed_meta_non_legit]), \
+             patch.object(analysis_mod, 'fetch_seed_contract_nfts', return_value=seed_nfts), \
+             patch.object(analysis_mod, 'fetch_license_sample', return_value={'raw': {'metadata': {'license': 'All rights reserved'}}}), \
+             patch.object(analysis_mod, 'fetch_contract_transfers', return_value=transfers) as transfer_mock, \
+             patch.object(analysis_mod, 'fetch_contract_owners', return_value=owners) as owners_mock:
             legit_result = mod.analyze_seed_contract(
                 chain='ethereum',
                 seed_contract_address='0xseed',
@@ -1515,7 +1517,7 @@ class SingleEntryOfflineTests(unittest.TestCase):
         }
         output_path = tmpdir / 'result.json'
         try:
-            with patch.object(mod, 'analyze_seed_contract', return_value=payload) as analyze_mock:
+            with patch.object(cli_mod, 'analyze_seed_contract', return_value=payload) as analyze_mock:
                 code = mod.main(
                     [
                         '--chain', 'ethereum',

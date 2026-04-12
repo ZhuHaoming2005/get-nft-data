@@ -7,31 +7,9 @@ from typing import Optional, Sequence
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from . import chain_to_table, get_conn, normalize_name, normalize_symbol, normalize_url
+from .db import chain_to_table, get_conn
+from .normalize import normalize_name, normalize_symbol, normalize_url
 from .rust_bridge import metadata_document_from_json, metadata_keywords
-
-
-_METADATA_COLUMN_CANDIDATES = ('metadata_json', 'raw_metadata', 'metadata', 'raw_json', 'json_metadata')
-
-
-def _detect_metadata_column(conn, table: str) -> str | None:
-    candidates = ', '.join(f"'{value}'" for value in _METADATA_COLUMN_CANDIDATES)
-    with conn.cursor() as cur:
-        cur.execute(
-            f'''
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_schema = current_schema()
-              AND table_name = '{table}'
-              AND column_name IN ({candidates})
-            ORDER BY array_position(ARRAY[{candidates}], column_name)
-            LIMIT 1
-            '''
-        )
-        row = cur.fetchone()
-    if row is None:
-        return None
-    return str(row[0])
 
 
 def export_chain_snapshot_to_parquet(
@@ -44,8 +22,6 @@ def export_chain_snapshot_to_parquet(
     row_group_size: int = 200_000,
 ) -> Path:
     table = chain_to_table(chain)
-    metadata_column = _detect_metadata_column(conn, table)
-    metadata_sql = f'coalesce({metadata_column}::text, \'\')' if metadata_column else '\'\''
     target = Path(output_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     writer: pq.ParquetWriter | None = None
@@ -76,7 +52,7 @@ def export_chain_snapshot_to_parquet(
         cur.execute(
             f'''
             SELECT lower(contract_address), token_id::text, coalesce(token_uri, ''), coalesce(image_uri, ''),
-                   coalesce(name, ''), coalesce(symbol, ''), {metadata_sql}
+                   coalesce(name, ''), coalesce(symbol, ''), coalesce(metadata::text, '')
             FROM {table}
             ORDER BY id
             '''

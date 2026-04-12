@@ -6,6 +6,11 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import top_contract_analysis as mod
+import top_contract_analysis.alchemy_api as alchemy_mod
+import top_contract_analysis.analysis as analysis_mod
+import top_contract_analysis.cli as cli_mod
+import top_contract_analysis.constants as constants_mod
+import top_contract_analysis.sales as sales_mod
 
 
 class FetchSeedContractNFTsTests(unittest.TestCase):
@@ -47,7 +52,7 @@ class FetchSeedContractNFTsTests(unittest.TestCase):
         }
         fake_requests = SimpleNamespace(get=Mock(side_effect=[first_response, second_response]))
 
-        with patch.object(mod, 'requests', fake_requests):
+        with patch.object(constants_mod, 'requests', fake_requests):
             rows = mod.fetch_seed_contract_nfts(
                 api_key='key',
                 network='eth-mainnet',
@@ -79,7 +84,7 @@ class FetchSeedContractNFTsTests(unittest.TestCase):
         }
         fake_requests = SimpleNamespace(get=Mock(return_value=response))
 
-        with patch.object(mod, 'requests', fake_requests):
+        with patch.object(constants_mod, 'requests', fake_requests):
             rows = mod.fetch_seed_contract_nfts(
                 api_key='key',
                 network='eth-mainnet',
@@ -115,7 +120,7 @@ class LicenseDetectionTests(unittest.TestCase):
             ),
         ]
 
-        with patch.object(mod, 'fetch_nft_metadata', return_value={'raw': {'metadata': {'license': 'CC0-1.0'}}}) as mocked:
+        with patch.object(alchemy_mod, 'fetch_nft_metadata', return_value={'raw': {'metadata': {'license': 'CC0-1.0'}}}) as mocked:
             payload = mod.fetch_license_sample(
                 api_key='key',
                 network='eth-mainnet',
@@ -151,7 +156,7 @@ class TransferFallbackTests(unittest.TestCase):
         }
         fake_requests = SimpleNamespace(post=Mock(return_value=response))
 
-        with patch.object(mod, 'requests', fake_requests):
+        with patch.object(constants_mod, 'requests', fake_requests):
             rows = mod.fetch_alchemy_contract_transfers(
                 api_key='alchemy',
                 network='eth-mainnet',
@@ -190,7 +195,7 @@ class TransferFallbackTests(unittest.TestCase):
         }
         fake_requests = SimpleNamespace(post=Mock(side_effect=[transfer_response, block_response]))
 
-        with patch.object(mod, 'requests', fake_requests):
+        with patch.object(constants_mod, 'requests', fake_requests):
             rows = mod.fetch_alchemy_contract_transfers(
                 api_key='alchemy',
                 network='eth-mainnet',
@@ -202,7 +207,7 @@ class TransferFallbackTests(unittest.TestCase):
 
     def test_fetch_alchemy_contract_transfers_retries_before_succeeding(self):
         first_response = Mock()
-        first_response.raise_for_status.side_effect = mod.REQUESTS_REQUEST_ERROR('ssl eof')
+        first_response.raise_for_status.side_effect = constants_mod.REQUESTS_REQUEST_ERROR('ssl eof')
         second_response = Mock()
         second_response.raise_for_status.return_value = None
         second_response.json.return_value = {
@@ -224,7 +229,7 @@ class TransferFallbackTests(unittest.TestCase):
         }
         fake_requests = SimpleNamespace(post=Mock(side_effect=[first_response, second_response]))
 
-        with patch.object(mod, 'requests', fake_requests):
+        with patch.object(constants_mod, 'requests', fake_requests):
             rows = mod.fetch_alchemy_contract_transfers(
                 api_key='alchemy',
                 network='eth-mainnet',
@@ -235,8 +240,8 @@ class TransferFallbackTests(unittest.TestCase):
         self.assertEqual(fake_requests.post.call_count, 2)
 
     def test_fetch_contract_transfers_falls_back_to_etherscan_for_erc721(self):
-        with patch.object(mod, 'fetch_alchemy_contract_transfers', side_effect=RuntimeError('rate limited')) as alchemy_mock:
-            with patch.object(mod, 'fetch_etherscan_contract_transfers', return_value=[mod.TransferRecord(
+        with patch.object(alchemy_mod, 'fetch_alchemy_contract_transfers', side_effect=RuntimeError('rate limited')) as alchemy_mock:
+            with patch.object(alchemy_mod, 'fetch_etherscan_contract_transfers', return_value=[mod.TransferRecord(
                 contract_address='0xdup',
                 token_id='1',
                 tx_hash='0xabc',
@@ -303,7 +308,7 @@ class SalesAnalysisTests(unittest.TestCase):
         }
         fake_requests = SimpleNamespace(get=Mock(return_value=response))
 
-        with patch.object(mod, 'requests', fake_requests):
+        with patch.object(constants_mod, 'requests', fake_requests):
             rows = mod.fetch_alchemy_nft_sales(
                 api_key='alchemy',
                 network='eth-mainnet',
@@ -315,7 +320,7 @@ class SalesAnalysisTests(unittest.TestCase):
         self.assertAlmostEqual(rows[0].price_eth, 2.3)
         self.assertEqual(rows[0].payment_token_symbol, 'ETH')
         self.assertFalse(rows[1].is_native_eth)
-        self.assertIsNone(rows[1].price_eth)
+        self.assertAlmostEqual(rows[1].price_eth, 1.5)
         self.assertEqual(rows[1].payment_token_symbol, 'WETH')
 
     def test_fetch_contract_sales_falls_back_to_opensea(self):
@@ -340,8 +345,8 @@ class SalesAnalysisTests(unittest.TestCase):
             is_native_eth=True,
         )
 
-        with patch.object(mod, 'fetch_alchemy_nft_sales', return_value=[]), \
-             patch.object(mod, 'fetch_opensea_nft_events', return_value=[opensea_sale]):
+        with patch.object(sales_mod, 'fetch_alchemy_nft_sales', return_value=[]), \
+             patch.object(sales_mod, 'fetch_opensea_nft_events', return_value=[opensea_sale]):
             rows = mod.fetch_contract_sales(
                 alchemy_api_key='alchemy',
                 alchemy_network='eth-mainnet',
@@ -494,6 +499,260 @@ class SalesAnalysisTests(unittest.TestCase):
         self.assertAlmostEqual(metrics['buy_total_eth_out'], 2.0)
         self.assertAlmostEqual(metrics['buy_asset_ratio_with_gas'], 0.5)
 
+    def test_build_victim_address_records_tracks_last_stuck_purchase_amount_only(self):
+        sales = [
+            mod.NFTSaleRecord(
+                contract_address='0xdup',
+                token_id='1',
+                tx_hash='0xfirst-buy',
+                block_number=11,
+                log_index=1,
+                bundle_index=0,
+                buyer_address='0xbuyer',
+                seller_address='0xsybil',
+                marketplace='seaport',
+                taker='BUYER',
+                payment_token_symbol='ETH',
+                payment_token_address='',
+                price_eth=1.0,
+                seller_fee_eth=1.0,
+                protocol_fee_eth=0.0,
+                royalty_fee_eth=0.0,
+                source='alchemy',
+                is_native_eth=True,
+            ),
+            mod.NFTSaleRecord(
+                contract_address='0xdup',
+                token_id='2',
+                tx_hash='0xlast-buy',
+                block_number=12,
+                log_index=1,
+                bundle_index=0,
+                buyer_address='0xbuyer',
+                seller_address='0xsybil',
+                marketplace='blur',
+                taker='BUYER',
+                payment_token_symbol='WETH',
+                payment_token_address='0xweth',
+                price_eth=3.0,
+                seller_fee_eth=3.0,
+                protocol_fee_eth=0.0,
+                royalty_fee_eth=0.0,
+                source='alchemy',
+                is_native_eth=False,
+            ),
+        ]
+        transfers = [
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='1',
+                tx_hash='0xresale',
+                log_index=2,
+                block_number=13,
+                block_time=130,
+                from_address='0xbuyer',
+                to_address='0xother',
+                event_type='erc721',
+                source='alchemy',
+            ),
+        ]
+        owners = [mod.OwnerBalance(owner_address='0xbuyer', token_balances={'2': 1})]
+        sale_metrics_by_tx = {
+            '0xfirst-buy': {
+                'buy_before_eth_balance': 4.0,
+                'buy_asset_ratio': 0.25,
+                'buy_asset_ratio_with_gas': 0.2501,
+                'ratio_status': 'ok',
+            },
+            '0xlast-buy': {
+                'buy_before_eth_balance': None,
+                'buy_asset_ratio': None,
+                'buy_asset_ratio_with_gas': None,
+                'ratio_status': 'unavailable',
+            },
+        }
+
+        victim_addresses = analysis_mod.build_victim_address_records(
+            contract_address='0xdup',
+            sales=sales,
+            transfers=transfers,
+            owners=owners,
+            sale_metrics_by_tx=sale_metrics_by_tx,
+        )
+
+        self.assertEqual(len(victim_addresses), 1)
+        self.assertAlmostEqual(victim_addresses[0]['buy_amount_eth'], 4.0)
+        self.assertTrue(victim_addresses[0]['is_stuck'])
+        self.assertEqual(victim_addresses[0]['last_buy_tx_hash'], '0xlast-buy')
+        self.assertAlmostEqual(victim_addresses[0]['last_buy_amount_eth'], 3.0)
+
+    def test_build_fraud_trade_stats_counts_weth_and_only_last_stuck_buy(self):
+        sales = [
+            mod.NFTSaleRecord(
+                contract_address='0xdup',
+                token_id='1',
+                tx_hash='0xeth-buy',
+                block_number=11,
+                log_index=1,
+                bundle_index=0,
+                buyer_address='0xbuyer1',
+                seller_address='0xsybil',
+                marketplace='seaport',
+                taker='BUYER',
+                payment_token_symbol='ETH',
+                payment_token_address='',
+                price_eth=2.0,
+                seller_fee_eth=2.0,
+                protocol_fee_eth=0.0,
+                royalty_fee_eth=0.0,
+                source='alchemy',
+                is_native_eth=True,
+            ),
+            mod.NFTSaleRecord(
+                contract_address='0xdup',
+                token_id='2',
+                tx_hash='0xweth-buy',
+                block_number=12,
+                log_index=1,
+                bundle_index=0,
+                buyer_address='0xbuyer2',
+                seller_address='0xsybil',
+                marketplace='blur',
+                taker='BUYER',
+                payment_token_symbol='WETH',
+                payment_token_address='0xweth',
+                price_eth=1.5,
+                seller_fee_eth=1.5,
+                protocol_fee_eth=0.0,
+                royalty_fee_eth=0.0,
+                source='alchemy',
+                is_native_eth=False,
+            ),
+            mod.NFTSaleRecord(
+                contract_address='0xdup',
+                token_id='3',
+                tx_hash='0xusdc-buy',
+                block_number=13,
+                log_index=1,
+                bundle_index=0,
+                buyer_address='0xbuyer3',
+                seller_address='0xsybil',
+                marketplace='opensea',
+                taker='BUYER',
+                payment_token_symbol='USDC',
+                payment_token_address='0xusdc',
+                price_eth=None,
+                seller_fee_eth=0.0,
+                protocol_fee_eth=0.0,
+                royalty_fee_eth=0.0,
+                source='opensea',
+                is_native_eth=False,
+            ),
+        ]
+        victim_addresses = [
+            {
+                'address': '0xbuyer1',
+                'buy_amount_eth': 5.0,
+                'last_buy_amount_eth': 2.0,
+                'is_stuck': True,
+            },
+            {
+                'address': '0xbuyer2',
+                'buy_amount_eth': 1.5,
+                'last_buy_amount_eth': 1.5,
+                'is_stuck': False,
+            },
+        ]
+
+        stats = analysis_mod.build_fraud_trade_stats(
+            contract_address='0xdup',
+            sales=sales,
+            victim_addresses=victim_addresses,
+        )['0xdup']
+
+        self.assertEqual(stats['unique_buyers'], 3)
+        self.assertEqual(stats['eth_priced_sale_count'], 2)
+        self.assertAlmostEqual(stats['eth_priced_volume'], 3.5)
+        self.assertEqual(stats['stuck_wallet_count'], 1)
+        self.assertAlmostEqual(stats['stuck_cost_eth'], 2.0)
+
+    def test_build_honest_address_records_tracks_corrupted_addresses_and_hold_times(self):
+        transfers = [
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='1',
+                tx_hash='0xmint',
+                log_index=0,
+                block_number=10,
+                block_time=100,
+                from_address=mod.ZERO_ADDRESS,
+                to_address='0xsybil',
+                event_type='erc721',
+                source='alchemy',
+            ),
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='1',
+                tx_hash='0xvictim-a',
+                log_index=1,
+                block_number=11,
+                block_time=150,
+                from_address='0xsybil',
+                to_address='0xhonest1',
+                event_type='erc721',
+                source='alchemy',
+            ),
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='1',
+                tx_hash='0xvictim-b',
+                log_index=2,
+                block_number=12,
+                block_time=200,
+                from_address='0xhonest1',
+                to_address='0xhonest2',
+                event_type='erc721',
+                source='alchemy',
+            ),
+        ]
+        owners = [mod.OwnerBalance(owner_address='0xhonest2', token_balances={'1': 1})]
+        infringing_tokens = [
+            {
+                'contract_address': '0xdup',
+                'token_id': '1',
+            }
+        ]
+        malicious_addresses = [
+            {
+                'address': '0xsybil',
+            }
+        ]
+
+        honest_addresses = analysis_mod.build_honest_address_records(
+            contract_address='0xdup',
+            transfers=transfers,
+            sales=[],
+            owners=owners,
+            infringing_tokens=infringing_tokens,
+            malicious_addresses=malicious_addresses,
+            analysis_timestamp=300,
+        )
+        honest_stats = analysis_mod.build_honest_address_stats(
+            contract_address='0xdup',
+            honest_addresses=honest_addresses,
+        )['0xdup']
+
+        self.assertEqual([item['address'] for item in honest_addresses], ['0xhonest1', '0xhonest2'])
+        self.assertTrue(honest_addresses[0]['is_corrupted_address'])
+        self.assertFalse(honest_addresses[1]['is_corrupted_address'])
+        self.assertEqual(honest_addresses[0]['hold_duration_median_seconds'], 50)
+        self.assertEqual(honest_addresses[1]['hold_duration_median_seconds'], 100)
+        self.assertEqual(honest_stats['honest_address_count'], 2)
+        self.assertEqual(honest_stats['corrupted_address_count'], 1)
+        self.assertEqual(honest_stats['honest_to_honest_transfer_count'], 1)
+        self.assertEqual(honest_stats['median_holding_seconds'], 75.0)
+        self.assertEqual(honest_stats['avg_seconds_to_honest_holder'], 50.0)
+
 
 class DuplicateAnalysisTests(unittest.TestCase):
     def test_find_duplicate_candidates_marks_high_and_low_confidence(self):
@@ -621,12 +880,12 @@ class EndToEndAnalysisTests(unittest.TestCase):
             mod.OwnerBalance(owner_address='0xbuyer', token_balances={'1': 1}),
         ]
 
-        with patch.object(mod, 'fetch_contract_metadata', return_value=seed_meta), \
-             patch.object(mod, 'fetch_seed_contract_nfts', return_value=seed_nfts), \
-             patch.object(mod, 'fetch_license_sample', return_value={'raw': {'metadata': {'license': 'All rights reserved'}}}), \
-             patch.object(mod, 'load_database_snapshot', return_value=snapshot), \
-             patch.object(mod, 'fetch_contract_transfers', return_value=transfers), \
-             patch.object(mod, 'fetch_contract_owners', return_value=owners):
+        with patch.object(analysis_mod, 'fetch_contract_metadata', return_value=seed_meta), \
+             patch.object(analysis_mod, 'fetch_seed_contract_nfts', return_value=seed_nfts), \
+             patch.object(analysis_mod, 'fetch_license_sample', return_value={'raw': {'metadata': {'license': 'All rights reserved'}}}), \
+             patch.object(analysis_mod, 'load_database_snapshot', return_value=snapshot), \
+             patch.object(analysis_mod, 'fetch_contract_transfers', return_value=transfers), \
+             patch.object(analysis_mod, 'fetch_contract_owners', return_value=owners):
             result = mod.analyze_seed_contract(
                 chain='ethereum',
                 seed_contract_address='0xseed',
@@ -736,16 +995,16 @@ class EndToEndAnalysisTests(unittest.TestCase):
             effective_gas_price_wei=10_000_000_000,
         )
 
-        with patch.object(mod, 'fetch_contract_metadata', return_value=seed_meta), \
-             patch.object(mod, 'fetch_seed_contract_nfts', return_value=seed_nfts), \
-             patch.object(mod, 'fetch_license_sample', return_value={'raw': {'metadata': {'license': 'All rights reserved'}}}), \
-             patch.object(mod, 'load_database_snapshot', return_value=snapshot), \
-             patch.object(mod, 'fetch_contract_transfers', return_value=transfers), \
-             patch.object(mod, 'fetch_contract_owners', return_value=owners), \
-             patch.object(mod, 'fetch_contract_sales', return_value=sales), \
-             patch.object(mod, 'fetch_transaction_receipt', return_value=purchase_receipt), \
-             patch.object(mod, 'fetch_eth_balance', return_value=4.0), \
-             patch.object(mod, 'fetch_same_block_eth_transfers_for_address', return_value=[]):
+        with patch.object(analysis_mod, 'fetch_contract_metadata', return_value=seed_meta), \
+             patch.object(analysis_mod, 'fetch_seed_contract_nfts', return_value=seed_nfts), \
+             patch.object(analysis_mod, 'fetch_license_sample', return_value={'raw': {'metadata': {'license': 'All rights reserved'}}}), \
+             patch.object(analysis_mod, 'load_database_snapshot', return_value=snapshot), \
+             patch.object(analysis_mod, 'fetch_contract_transfers', return_value=transfers), \
+             patch.object(analysis_mod, 'fetch_contract_owners', return_value=owners), \
+             patch.object(analysis_mod, 'fetch_contract_sales', return_value=sales), \
+             patch.object(analysis_mod, 'fetch_transaction_receipt', return_value=purchase_receipt), \
+             patch.object(analysis_mod, 'fetch_eth_balance', return_value=4.0), \
+             patch.object(analysis_mod, 'fetch_same_block_eth_transfers_for_address', return_value=[]):
             result = mod.analyze_seed_contract(
                 chain='ethereum',
                 seed_contract_address='0xseed',
@@ -765,6 +1024,144 @@ class EndToEndAnalysisTests(unittest.TestCase):
         self.assertAlmostEqual(result['victim_addresses'][0]['buy_asset_ratio'], 0.5)
         self.assertEqual(result['fraud_trade_stats']['0xdup']['native_eth_sale_count'], 1)
         self.assertAlmostEqual(result['fraud_trade_stats']['0xdup']['stuck_cost_eth'], 2.0)
+
+    def test_analyze_seed_contract_emits_honest_address_stats_and_candidate_license_counts(self):
+        seed_meta = mod.ContractMetadata(
+            chain='ethereum',
+            contract_address='0xseed',
+            token_type='ERC721',
+            contract_deployer='0xcreator',
+            deployed_block_number=123,
+            name='Azuki',
+            symbol='AZUKI',
+        )
+        seed_nfts = [
+            mod.SeedNFT(
+                chain='ethereum',
+                contract_address='0xseed',
+                token_id='1',
+                name='Azuki #1',
+                symbol='AZUKI',
+                token_uri='ipfs://seed/meta-1',
+                image_uri='ipfs://seed/image-1.png',
+            )
+        ]
+        snapshot = mod.DatabaseSnapshot(
+            nft_rows=[
+                mod.DatabaseNFTRecord(
+                    contract_address='0xdup',
+                    token_id='1',
+                    token_uri='ipfs://seed/meta-1',
+                    image_uri='ipfs://dup/image.png',
+                    name='Azuki Mirror #1',
+                    symbol='AZUKI',
+                    metadata_json='{"license":"CC0-1.0"}',
+                    metadata_doc='license cc0-1.0',
+                )
+            ],
+            contract_names=[mod.ContractNameRecord(contract_address='0xdup', name_norm='azuki mirror')],
+            symbol_contracts={'azuki': {'0xdup'}},
+        )
+        transfers = [
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='1',
+                tx_hash='0xmint',
+                log_index=0,
+                block_number=10,
+                block_time=100,
+                from_address=mod.ZERO_ADDRESS,
+                to_address='0xsybil',
+                event_type='erc721',
+                source='alchemy',
+            ),
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='1',
+                tx_hash='0xvictim-a',
+                log_index=1,
+                block_number=11,
+                block_time=150,
+                from_address='0xsybil',
+                to_address='0xhonest1',
+                event_type='erc721',
+                source='alchemy',
+            ),
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='1',
+                tx_hash='0xvictim-b',
+                log_index=2,
+                block_number=12,
+                block_time=200,
+                from_address='0xhonest1',
+                to_address='0xhonest2',
+                event_type='erc721',
+                source='alchemy',
+            ),
+        ]
+        owners = [
+            mod.OwnerBalance(owner_address='0xhonest2', token_balances={'1': 1}),
+        ]
+        sales = [
+            mod.NFTSaleRecord(
+                contract_address='0xdup',
+                token_id='1',
+                tx_hash='0xvictim-a',
+                block_number=11,
+                log_index=1,
+                bundle_index=0,
+                buyer_address='0xhonest1',
+                seller_address='0xsybil',
+                marketplace='seaport',
+                taker='BUYER',
+                payment_token_symbol='ETH',
+                payment_token_address='',
+                price_eth=2.0,
+                seller_fee_eth=1.7,
+                protocol_fee_eth=0.1,
+                royalty_fee_eth=0.2,
+                source='alchemy',
+                is_native_eth=True,
+            )
+        ]
+        purchase_receipt = mod.TransactionReceiptRecord(
+            tx_hash='0xvictim-a',
+            block_number=11,
+            transaction_index=3,
+            from_address='0xhonest1',
+            gas_used=21_000,
+            effective_gas_price_wei=10_000_000_000,
+        )
+
+        with patch.object(analysis_mod, 'fetch_contract_metadata', return_value=seed_meta), \
+             patch.object(analysis_mod, 'fetch_seed_contract_nfts', return_value=seed_nfts), \
+             patch.object(analysis_mod, 'fetch_license_sample', return_value={'raw': {'metadata': {'license': 'All rights reserved'}}}), \
+             patch.object(analysis_mod, 'load_database_snapshot', return_value=snapshot), \
+             patch.object(analysis_mod, 'fetch_contract_transfers', return_value=transfers), \
+             patch.object(analysis_mod, 'fetch_contract_owners', return_value=owners), \
+             patch.object(analysis_mod, 'fetch_contract_sales', return_value=sales), \
+             patch.object(analysis_mod, 'fetch_transaction_receipt', return_value=purchase_receipt), \
+             patch.object(analysis_mod, 'fetch_eth_balance', return_value=4.0), \
+             patch.object(analysis_mod, 'fetch_same_block_eth_transfers_for_address', return_value=[]), \
+             patch.object(analysis_mod.time, 'time', return_value=300):
+            result = mod.analyze_seed_contract(
+                chain='ethereum',
+                seed_contract_address='0xseed',
+                alchemy_api_key='fake-alchemy-key-123456',
+                alchemy_network='eth-mainnet',
+                etherscan_api_key='etherscan',
+                conn=object(),
+            )
+
+        self.assertEqual(result['infringing_tokens'][0]['candidate_open_license'], True)
+        self.assertEqual(result['report_summary']['candidate_open_license_token_count'], 1)
+        self.assertEqual(result['report_summary']['candidate_open_license_contract_count'], 1)
+        self.assertEqual(result['honest_address_stats']['0xdup']['honest_address_count'], 2)
+        self.assertEqual(result['honest_address_stats']['0xdup']['corrupted_address_count'], 1)
+        self.assertEqual(result['honest_address_stats']['0xdup']['honest_to_honest_transfer_count'], 1)
+        self.assertAlmostEqual(result['honest_address_stats']['0xdup']['avg_seconds_to_honest_holder'], 50.0)
+        self.assertTrue(result['honest_addresses'][0]['is_corrupted_address'])
 
     def test_analyze_contract_transfers_computes_non_zero_first_transfer_delay(self):
         transfers = [
@@ -809,10 +1206,46 @@ class ParserNetworkDefaultTests(unittest.TestCase):
         self.assertEqual(args.alchemy_network, '')
 
     def test_public_api_is_reexported_from_split_modules(self):
-        self.assertEqual(mod.fetch_contract_sales.__module__, 'top_contract_analysis.api')
+        self.assertEqual(mod.fetch_seed_contract_nfts.__module__, 'top_contract_analysis.alchemy_api')
+        self.assertEqual(mod.fetch_contract_sales.__module__, 'top_contract_analysis.sales')
         self.assertEqual(mod.analyze_seed_contract.__module__, 'top_contract_analysis.analysis')
         self.assertEqual(mod.render_human_readable_report.__module__, 'top_contract_analysis.reporting')
         self.assertEqual(mod.build_parser.__module__, 'top_contract_analysis.cli')
+        self.assertFalse(hasattr(mod, '_require_requests'))
+        self.assertFalse(hasattr(mod, '_alchemy_get_json'))
+        self.assertFalse(hasattr(mod, '_transfer_sort_key'))
+        self.assertFalse(hasattr(mod, 'requests'))
+
+    def test_internal_scripts_import_split_modules_directly(self):
+        package_dir = Path(mod.__file__).resolve().parent
+        targets = [
+            'duckdb_store.py',
+            'export_snapshot.py',
+            'signal_cache.py',
+            'batch.py',
+            'render_report.py',
+        ]
+        for filename in targets:
+            text = (package_dir / filename).read_text(encoding='utf-8')
+            self.assertNotIn('from . import ', text, filename)
+
+    def test_sales_implementation_is_not_defined_in_alchemy_api(self):
+        package_dir = Path(mod.__file__).resolve().parent
+        text = (package_dir / 'alchemy_api.py').read_text(encoding='utf-8')
+        for marker in [
+            'def _decode_fee_eth(',
+            'def _looks_like_real_api_key(',
+            'def fetch_alchemy_nft_sales(',
+            'def fetch_opensea_nft_events(',
+            'def fetch_contract_sales(',
+        ]:
+            self.assertNotIn(marker, text, marker)
+
+    def test_analysis_cli_and_sales_do_not_use_package_importlib_routing(self):
+        package_dir = Path(mod.__file__).resolve().parent
+        for filename in ['analysis.py', 'cli.py', 'sales.py', 'alchemy_api.py']:
+            text = (package_dir / filename).read_text(encoding='utf-8')
+            self.assertNotIn('importlib', text, filename)
 
 
 class HumanReadableReportTests(unittest.TestCase):
@@ -840,6 +1273,8 @@ class HumanReadableReportTests(unittest.TestCase):
                 'high_confidence_contract_count': 1,
                 'low_confidence_contract_count': 1,
                 'legit_duplicate_contract_count': 1,
+                'candidate_open_license_token_count': 1,
+                'candidate_open_license_contract_count': 1,
             },
             'suspected_infringing_duplicates_high_confidence': [
                 {
@@ -888,11 +1323,42 @@ class HumanReadableReportTests(unittest.TestCase):
                     'mint_tx_hash': '0xmint',
                     'mint_block': 10,
                     'minter_address': '0xsybil',
+                    'candidate_open_license': True,
                     'first_transfer_time': 100,
                     'history_window': 'full',
                     'match_reasons': ['token_uri_match'],
                     'official_or_legit_reissue': False,
                 }
+            ],
+            'honest_address_stats': {
+                '0xdup': {
+                    'honest_address_count': 2,
+                    'corrupted_address_count': 1,
+                    'honest_to_honest_transfer_count': 1,
+                    'median_holding_seconds': 75.0,
+                    'avg_seconds_to_honest_holder': 50.0,
+                    'corrupted_addresses': ['0xhonest1'],
+                }
+            },
+            'honest_addresses': [
+                {
+                    'address': '0xhonest1',
+                    'interacted_token_count': 1,
+                    'currently_holding_token_count': 0,
+                    'hold_duration_median_seconds': 50,
+                    'hold_duration_count': 1,
+                    'is_corrupted_address': True,
+                    'honest_sale_to_honest_count': 1,
+                },
+                {
+                    'address': '0xhonest2',
+                    'interacted_token_count': 1,
+                    'currently_holding_token_count': 1,
+                    'hold_duration_median_seconds': 100,
+                    'hold_duration_count': 1,
+                    'is_corrupted_address': False,
+                    'honest_sale_to_honest_count': 0,
+                },
             ],
             'malicious_addresses': [
                 {
@@ -909,6 +1375,7 @@ class HumanReadableReportTests(unittest.TestCase):
                     'address': '0xbuyer',
                     'buy_tx_hashes': ['0xsale'],
                     'buy_amount_eth': 2.0,
+                    'last_buy_amount_eth': 2.0,
                     'buy_before_eth_balance': 4.0,
                     'buy_asset_ratio': 0.5,
                     'buy_asset_ratio_with_gas': 0.5000525,
@@ -922,6 +1389,8 @@ class HumanReadableReportTests(unittest.TestCase):
                     'unique_buyers': 1,
                     'native_eth_sale_count': 1,
                     'native_eth_volume': 2.0,
+                    'eth_priced_sale_count': 1,
+                    'eth_priced_volume': 2.0,
                     'stuck_wallet_count': 1,
                     'stuck_cost_eth': 2.0,
                 }
@@ -935,6 +1404,7 @@ class HumanReadableReportTests(unittest.TestCase):
         self.assertIn('Azuki', text)
         self.assertIn('## 摘要', text)
         self.assertIn('高置信疑似侵权合约数: 1', text)
+        self.assertIn('候选侧开放许可 token 数: 1', text)
         self.assertIn('## 高置信疑似侵权合约', text)
         self.assertIn('0xdup', text)
         self.assertIn('归为官方参与型重复的合约数: 1', text)
@@ -946,9 +1416,14 @@ class HumanReadableReportTests(unittest.TestCase):
         self.assertIn('套牢地址数: 5', text)
         self.assertIn('## 侵权 NFT 历史记录', text)
         self.assertIn('## 恶意地址画像', text)
+        self.assertIn('## 诚实地址画像', text)
+        self.assertIn('被腐化地址数: 1', text)
+        self.assertIn('Mint 到诚实地址平均时间: 50.0 秒', text)
         self.assertIn('## 被骗地址画像', text)
         self.assertIn('## 被骗交易与套牢资金', text)
         self.assertIn('买入前 ETH 余额: 4.0', text)
+        self.assertIn('最后一次买入金额(ETH/WETH)=2.0', text)
+        self.assertIn('eth_priced_sale_count=1', text)
         self.assertNotIn('## 合法重复合约', text)
         self.assertNotIn('合法重复合约数', text)
 
@@ -1003,7 +1478,7 @@ class OutputNamingTests(unittest.TestCase):
         tmpdir.mkdir(parents=True, exist_ok=True)
         cwd = Path.cwd()
         try:
-            with patch.object(mod, 'analyze_seed_contract', return_value=payload):
+            with patch.object(cli_mod, 'analyze_seed_contract', return_value=payload):
                 with patch('sys.argv', [
                     'top_contract_analysis',
                     '--chain', 'ethereum',

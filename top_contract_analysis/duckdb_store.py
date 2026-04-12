@@ -9,17 +9,9 @@ from duckdb import sqltypes
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from . import (
-    ContractNameRecord,
-    ContractSignal,
-    DatabaseNFTRecord,
-    DatabaseSnapshot,
-    SeedNFT,
-    build_seed_index,
-    normalize_name,
-    normalize_symbol,
-    normalize_url,
-)
+from .models import ContractNameRecord, ContractSignal, DatabaseNFTRecord, DatabaseSnapshot, SeedNFT
+from .normalize import normalize_name, normalize_symbol, normalize_url
+from .snapshot import build_seed_index
 from .rust_bridge import metadata_document_from_json, metadata_keywords
 
 
