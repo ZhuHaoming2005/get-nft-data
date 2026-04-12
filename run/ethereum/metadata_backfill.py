@@ -53,6 +53,10 @@ METADATA_BACKFILL_MODE = os.getenv("METADATA_BACKFILL_MODE", "alchemy").strip().
 METADATA_BACKFILL_SEGMENT_SIZE = int(os.getenv("METADATA_BACKFILL_SEGMENT_SIZE", "1000"))
 METADATA_BACKFILL_BATCH_SIZE = int(os.getenv("METADATA_BACKFILL_BATCH_SIZE", "100"))
 METADATA_BACKFILL_WORKERS = int(os.getenv("METADATA_BACKFILL_WORKERS", "5"))
+METADATA_BACKFILL_API_CONCURRENCY = max(
+    1,
+    int(os.getenv("METADATA_BACKFILL_API_CONCURRENCY", str(METADATA_BACKFILL_WORKERS))),
+)
 METADATA_BACKFILL_CHAIN_WORKERS = max(
     1,
     int(os.getenv("METADATA_BACKFILL_CHAIN_WORKERS", "1")),
@@ -435,14 +439,10 @@ async def fetch_alchemy_batch(
         "tokenUriTimeoutInMs": 5000,
         "refreshCache": False,
     }
-    timeout = aiohttp.ClientTimeout(
-        total=METADATA_TIMEOUT,
-        connect=METADATA_CONNECT_TIMEOUT,
-    )
     if startup_delay_seconds > 0:
         await asyncio.sleep(startup_delay_seconds)
     async with sem:
-        async with session.post(url, json=payload, timeout=timeout) as resp:
+        async with session.post(url, json=payload) as resp:
             resp.raise_for_status()
             data = await resp.json(content_type=None)
     nft_list = data if isinstance(data, list) else data.get("nfts", [])
@@ -611,7 +611,7 @@ async def _worker_main(chain: str, worker_index: int, stop_event=None) -> int:
             limit=max(1, METADATA_BACKFILL_WORKERS),
             ttl_dns_cache=300,
         )
-        sem = asyncio.Semaphore(max(1, METADATA_BACKFILL_WORKERS))
+        sem = asyncio.Semaphore(max(1, METADATA_BACKFILL_API_CONCURRENCY))
         total_updated = 0
 
         async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:

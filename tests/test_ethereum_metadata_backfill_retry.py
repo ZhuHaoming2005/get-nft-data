@@ -123,6 +123,40 @@ class RetryAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attempts, [1, 2, 3])
         self.assertEqual(sleep_mock.await_count, 2)
 
+    async def test_fetch_alchemy_batch_uses_session_level_timeout(self):
+        captured = {}
+
+        class _FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            async def json(self, content_type=None):
+                return {"nfts": [{"raw": {"metadata": {"name": "NFT 1"}}}]}
+
+        class _PostContext:
+            async def __aenter__(self):
+                return _FakeResponse()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class _FakeSession:
+            def post(self, url, json=None, timeout=None):
+                captured["url"] = url
+                captured["json"] = json
+                captured["timeout"] = timeout
+                return _PostContext()
+
+        result = await backfill.fetch_alchemy_batch(
+            _FakeSession(),
+            "ethereum",
+            asyncio.Semaphore(1),
+            [(101, "0xabc", 1, "ERC-721")],
+        )
+
+        self.assertEqual(captured["timeout"], None)
+        self.assertEqual(result, [(101, {"name": "NFT 1"}, None)])
+
 
 class ProcessChainRetryTests(unittest.IsolatedAsyncioTestCase):
     def test_ensure_columns_skips_alter_when_columns_already_exist(self):
