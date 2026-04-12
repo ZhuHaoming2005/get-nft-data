@@ -20,7 +20,11 @@ if _LOCAL_EXTENSION_DIR.exists() and str(_LOCAL_EXTENSION_DIR) not in sys.path:
 try:
     from top_contract_analysis_rust import analyze_transfer_signals as _rust_analyze_transfer_signals
     from top_contract_analysis_rust import analyze_victim_signals as _rust_analyze_victim_signals
+    from top_contract_analysis_rust import build_database_snapshot as _rust_build_database_snapshot
+    from top_contract_analysis_rust import build_duplicate_candidates as _rust_build_duplicate_candidates
     from top_contract_analysis_rust import build_honest_address_records as _rust_build_honest_address_records
+    from top_contract_analysis_rust import build_infringing_token_records as _rust_build_infringing_token_records
+    from top_contract_analysis_rust import build_malicious_address_records as _rust_build_malicious_address_records
     from top_contract_analysis_rust import build_victim_address_records as _rust_build_victim_address_records
     from top_contract_analysis_rust import metadata_document_from_json as _rust_metadata_document_from_json
     from top_contract_analysis_rust import metadata_keywords as _rust_metadata_keywords
@@ -32,7 +36,11 @@ try:
 except ImportError:  # pragma: no cover
     _rust_analyze_transfer_signals = None
     _rust_analyze_victim_signals = None
+    _rust_build_database_snapshot = None
+    _rust_build_duplicate_candidates = None
     _rust_build_honest_address_records = None
+    _rust_build_infringing_token_records = None
+    _rust_build_malicious_address_records = None
     _rust_build_victim_address_records = None
     _rust_metadata_document_from_json = None
     _rust_metadata_keywords = None
@@ -392,6 +400,182 @@ def build_victim_address_records(
     return list(_rust_build_victim_address_records(packed_sales, packed_transfers, packed_owners))
 
 
+def build_malicious_address_records(
+    *,
+    contract_address: str,
+    transfers: Sequence['TransferRecord'],
+    infringing_tokens: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if _rust_build_malicious_address_records is None:
+        from .analysis import _build_malicious_address_records_python
+
+        return _build_malicious_address_records_python(
+            contract_address=contract_address,
+            transfers=transfers,
+            infringing_tokens=infringing_tokens,
+        )
+
+    packed_transfers = [
+        (
+            transfer.token_id,
+            transfer.tx_hash,
+            int(transfer.block_number or 0),
+            int(transfer.log_index or 0),
+            int(transfer.block_time or 0),
+            transfer.from_address,
+            transfer.to_address,
+        )
+        for transfer in transfers
+    ]
+    packed_infringing_tokens = [
+        (
+            str(item.get('token_id') or ''),
+            str(item.get('minter_address') or ''),
+        )
+        for item in infringing_tokens
+        if item.get('token_id')
+    ]
+    return list(
+        _rust_build_malicious_address_records(
+            contract_address,
+            packed_transfers,
+            packed_infringing_tokens,
+        )
+    )
+
+
+def build_infringing_token_records(
+    *,
+    contract_address: str,
+    contract_candidates: Sequence['DuplicateCandidate'],
+    transfers: Sequence['TransferRecord'],
+    official_addresses: set[str],
+    candidate_open_license_by_token: dict[tuple[str, str], bool] | None = None,
+) -> list[dict[str, Any]]:
+    if _rust_build_infringing_token_records is None:
+        from .analysis import _build_infringing_token_records_python
+
+        return _build_infringing_token_records_python(
+            contract_address=contract_address,
+            contract_candidates=contract_candidates,
+            transfers=transfers,
+            official_addresses=official_addresses,
+            candidate_open_license_by_token=candidate_open_license_by_token,
+        )
+
+    packed_candidates = [
+        (
+            candidate.token_id,
+            list(candidate.match_reasons),
+        )
+        for candidate in contract_candidates
+    ]
+    packed_transfers = [
+        (
+            transfer.token_id,
+            transfer.tx_hash,
+            int(transfer.block_number or 0),
+            int(transfer.log_index or 0),
+            int(transfer.block_time or 0),
+            transfer.from_address,
+            transfer.to_address,
+        )
+        for transfer in transfers
+    ]
+    packed_official_addresses = sorted(address for address in official_addresses if address)
+    packed_open_license = [
+        (token_id, bool(flag))
+        for (candidate_contract, token_id), flag in (candidate_open_license_by_token or {}).items()
+        if candidate_contract == contract_address and token_id
+    ]
+    return list(
+        _rust_build_infringing_token_records(
+            contract_address,
+            packed_candidates,
+            packed_transfers,
+            packed_official_addresses,
+            packed_open_license,
+        )
+    )
+
+
+def build_duplicate_candidates(
+    *,
+    seed_nfts: Sequence['SeedNFT'],
+    snapshot_rows: Sequence['DatabaseNFTRecord'],
+    name_threshold: float,
+    metadata_threshold: float,
+) -> list['DuplicateCandidate']:
+    if _rust_build_duplicate_candidates is None:
+        from .snapshot import _find_duplicate_candidates_python
+
+        from .models import DatabaseSnapshot
+
+        return _find_duplicate_candidates_python(
+            seed_nfts,
+            DatabaseSnapshot(nft_rows=list(snapshot_rows)),
+            name_threshold=name_threshold,
+            metadata_threshold=metadata_threshold,
+        )
+
+    from . import DuplicateCandidate
+
+    packed_seed_nfts = [
+        (
+            nft.contract_address,
+            nft.token_id,
+            nft.name,
+            nft.symbol,
+            nft.token_uri,
+            nft.image_uri,
+            nft.metadata_json,
+            nft.metadata_doc,
+        )
+        for nft in seed_nfts
+    ]
+    packed_snapshot_rows = [
+        (
+            row.contract_address,
+            row.token_id,
+            row.name,
+            row.symbol,
+            row.token_uri,
+            row.image_uri,
+            row.metadata_json,
+            row.metadata_doc,
+        )
+        for row in snapshot_rows
+    ]
+    packed = _rust_build_duplicate_candidates(
+        packed_seed_nfts,
+        packed_snapshot_rows,
+        float(name_threshold),
+        float(metadata_threshold),
+    )
+    return [
+        DuplicateCandidate(
+            contract_address=contract_address,
+            token_id=token_id,
+            match_reasons=tuple(match_reasons),
+            confidence=confidence,
+            token_uri=token_uri,
+            image_uri=image_uri,
+            name=name,
+            symbol=symbol,
+        )
+        for (
+            contract_address,
+            token_id,
+            match_reasons,
+            confidence,
+            token_uri,
+            image_uri,
+            name,
+            symbol,
+        ) in packed
+    ]
+
+
 def build_honest_address_records(
     *,
     contract_address: str,
@@ -454,4 +638,50 @@ def build_honest_address_records(
             packed_malicious_addresses,
             int(analysis_timestamp or time.time()),
         )
+    )
+
+
+def build_database_snapshot(
+    *,
+    contract_addresses: Sequence[str],
+    token_ids: Sequence[str],
+    token_uris: Sequence[str],
+    image_uris: Sequence[str],
+    names: Sequence[str],
+    symbols: Sequence[str],
+    metadata_jsons: Sequence[str],
+    metadata_docs: Sequence[str],
+    token_uri_norms: Sequence[str],
+    image_uri_norms: Sequence[str],
+    symbol_norms: Sequence[str],
+    name_norms: Sequence[str],
+    metadata_keywords_arr: Sequence[Sequence[str]],
+    exact_token_keys: Sequence[str],
+    exact_image_keys: Sequence[str],
+    exact_symbols: Sequence[str],
+    name_prefixes: Sequence[str],
+    metadata_recall_terms: Sequence[str],
+):
+    if _rust_build_database_snapshot is None:
+        raise RuntimeError('rust snapshot builder unavailable')
+
+    return _rust_build_database_snapshot(
+        list(contract_addresses),
+        list(token_ids),
+        list(token_uris),
+        list(image_uris),
+        list(names),
+        list(symbols),
+        list(metadata_jsons),
+        list(metadata_docs),
+        list(token_uri_norms),
+        list(image_uri_norms),
+        list(symbol_norms),
+        list(name_norms),
+        [list(items) for items in metadata_keywords_arr],
+        list(exact_token_keys),
+        list(exact_image_keys),
+        list(exact_symbols),
+        list(name_prefixes),
+        list(metadata_recall_terms),
     )

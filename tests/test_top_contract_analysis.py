@@ -815,6 +815,123 @@ class DuplicateAnalysisTests(unittest.TestCase):
 
 
 class EndToEndAnalysisTests(unittest.TestCase):
+    def test_analyze_seed_contract_logs_stage_timings(self):
+        seed_meta = mod.ContractMetadata(
+            chain='ethereum',
+            contract_address='0xseed',
+            token_type='ERC721',
+            contract_deployer='0xcreator',
+            deployed_block_number=123,
+            name='Azuki',
+            symbol='AZUKI',
+        )
+        seed_nfts = [
+            mod.SeedNFT(
+                chain='ethereum',
+                contract_address='0xseed',
+                token_id='1',
+                name='Azuki #1',
+                symbol='AZUKI',
+                token_uri='ipfs://seed/meta-1',
+                image_uri='ipfs://seed/image-1.png',
+            )
+        ]
+        snapshot = mod.DatabaseSnapshot(
+            nft_rows=[
+                mod.DatabaseNFTRecord(
+                    contract_address='0xdup',
+                    token_id='1',
+                    token_uri='ipfs://seed/meta-1',
+                    image_uri='ipfs://dup/image.png',
+                    name='Azuki Mirror #1',
+                    symbol='AZUKI',
+                )
+            ],
+            contract_names=[mod.ContractNameRecord(contract_address='0xdup', name_norm='azuki mirror')],
+            symbol_contracts={'azuki': {'0xdup'}},
+        )
+        transfers = [
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='1',
+                tx_hash='0xmint',
+                log_index=0,
+                block_number=10,
+                block_time=100,
+                from_address=mod.ZERO_ADDRESS,
+                to_address='0xsybil',
+                event_type='erc721',
+                source='alchemy',
+            ),
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='1',
+                tx_hash='0xvictim-a',
+                log_index=1,
+                block_number=11,
+                block_time=150,
+                from_address='0xsybil',
+                to_address='0xhonest1',
+                event_type='erc721',
+                source='alchemy',
+            ),
+        ]
+        owners = [mod.OwnerBalance(owner_address='0xhonest1', token_balances={'1': 1})]
+        sales = [
+            mod.NFTSaleRecord(
+                contract_address='0xdup',
+                token_id='1',
+                tx_hash='0xvictim-a',
+                block_number=11,
+                log_index=1,
+                bundle_index=0,
+                buyer_address='0xhonest1',
+                seller_address='0xsybil',
+                marketplace='seaport',
+                taker='BUYER',
+                payment_token_symbol='ETH',
+                payment_token_address='',
+                price_eth=1.0,
+                seller_fee_eth=1.0,
+                protocol_fee_eth=0.0,
+                royalty_fee_eth=0.0,
+                source='alchemy',
+                is_native_eth=True,
+            )
+        ]
+        purchase_receipt = mod.TransactionReceiptRecord(
+            tx_hash='0xvictim-a',
+            block_number=11,
+            transaction_index=3,
+            from_address='0xhonest1',
+            gas_used=21_000,
+            effective_gas_price_wei=10_000_000_000,
+        )
+
+        with patch.object(analysis_mod, 'fetch_contract_metadata', return_value=seed_meta), \
+             patch.object(analysis_mod, 'fetch_seed_contract_nfts', return_value=seed_nfts), \
+             patch.object(analysis_mod, 'fetch_license_sample', return_value={'raw': {'metadata': {'license': 'All rights reserved'}}}), \
+             patch.object(analysis_mod, 'load_database_snapshot', return_value=snapshot), \
+             patch.object(analysis_mod, 'fetch_contract_transfers', return_value=transfers), \
+             patch.object(analysis_mod, 'fetch_contract_owners', return_value=owners), \
+             patch.object(analysis_mod, 'fetch_contract_sales', return_value=sales), \
+             patch.object(analysis_mod, 'fetch_transaction_receipt', return_value=purchase_receipt), \
+             patch.object(analysis_mod, 'fetch_eth_balance', return_value=4.0), \
+             patch.object(analysis_mod, 'fetch_same_block_eth_transfers_for_address', return_value=[]), \
+             patch.object(analysis_mod.logger, 'info') as logger_info:
+            mod.analyze_seed_contract(
+                chain='ethereum',
+                seed_contract_address='0xseed',
+                alchemy_api_key='fake-alchemy-key-123456',
+                alchemy_network='eth-mainnet',
+                etherscan_api_key='etherscan',
+                conn=object(),
+            )
+
+        info_messages = [call.args[0] for call in logger_info.call_args_list if call.args]
+        self.assertTrue(any('seed timing' in message for message in info_messages))
+        self.assertTrue(any('contract timing' in message for message in info_messages))
+
     def test_analyze_seed_contract_runs_without_opensea(self):
         seed_meta = mod.ContractMetadata(
             chain='ethereum',

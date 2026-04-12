@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Sequence, Tuple
 from urllib.parse import urlencode
+import requests
 
 from . import constants as package_constants
 from .constants import (

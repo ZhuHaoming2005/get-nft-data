@@ -115,6 +115,11 @@ def _median_or_none(values: Sequence[float | int]) -> float | None:
     return float(median(cleaned))
 
 
+def _format_timing_breakdown(stages: Dict[str, float]) -> str:
+    ordered = sorted(stages.items(), key=lambda item: item[1], reverse=True)
+    return ', '.join(f'{name}={duration:.3f}s' for name, duration in ordered if duration > 0)
+
+
 def _is_candidate_open_license(*, metadata_json: str = '', metadata_doc: str = '') -> bool:
     payload: Dict[str, Any] = {}
     if metadata_json:
@@ -130,7 +135,7 @@ def _is_candidate_open_license(*, metadata_json: str = '', metadata_doc: str = '
     return bool(payload) and is_open_license_payload(payload)
 
 
-def build_infringing_token_records(
+def _build_infringing_token_records_python(
     *,
     contract_address: str,
     contract_candidates: Sequence[DuplicateCandidate],
@@ -181,7 +186,26 @@ def build_infringing_token_records(
     return rows
 
 
-def build_malicious_address_records(
+def build_infringing_token_records(
+    *,
+    contract_address: str,
+    contract_candidates: Sequence[DuplicateCandidate],
+    transfers: Sequence[TransferRecord],
+    official_addresses: set[str],
+    candidate_open_license_by_token: Dict[tuple[str, str], bool] | None = None,
+) -> List[Dict[str, Any]]:
+    from .rust_bridge import build_infringing_token_records as build_infringing_rows
+
+    return build_infringing_rows(
+        contract_address=contract_address,
+        contract_candidates=contract_candidates,
+        transfers=transfers,
+        official_addresses=official_addresses,
+        candidate_open_license_by_token=candidate_open_license_by_token,
+    )
+
+
+def _build_malicious_address_records_python(
     *,
     contract_address: str,
     transfers: Sequence[TransferRecord],
@@ -245,6 +269,21 @@ def build_malicious_address_records(
             }
         )
     return rows
+
+
+def build_malicious_address_records(
+    *,
+    contract_address: str,
+    transfers: Sequence[TransferRecord],
+    infringing_tokens: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    from .rust_bridge import build_malicious_address_records as build_malicious_rows
+
+    return build_malicious_rows(
+        contract_address=contract_address,
+        transfers=transfers,
+        infringing_tokens=infringing_tokens,
+    )
 
 
 def _build_victim_address_records_python(
@@ -529,6 +568,8 @@ def _analyze_high_confidence_contract(
     signal_cache,
     session=None,
 ) -> Dict[str, Any]:
+    stage_times: Dict[str, float] = {}
+    contract_started = time.perf_counter()
     cached = None
     if signal_cache is not None:
         cached = signal_cache.get(chain=chain, contract_address=contract_address, token_type=token_type)
@@ -540,6 +581,7 @@ def _analyze_high_confidence_contract(
         transfers = cached.get('transfers') or []
         owners = cached.get('owners') or []
     else:
+        started = time.perf_counter()
         transfers = fetch_contract_transfers(
             alchemy_api_key=alchemy_api_key,
             alchemy_network=network,
@@ -550,6 +592,7 @@ def _analyze_high_confidence_contract(
             timeout=timeout,
             session=session,
         )
+        stage_times['fetch_transfers'] = time.perf_counter() - started
         owners = []
         mint_recipients = {row.to_address for row in transfers if row.from_address == ZERO_ADDRESS}
         active_sellers = [
@@ -557,9 +600,12 @@ def _analyze_high_confidence_contract(
             for row in transfers
             if row.from_address and row.from_address != ZERO_ADDRESS
         ]
+        started = time.perf_counter()
         cached_address_signals = analyze_contract_transfers(transfers)
+        stage_times['analyze_transfer_signals'] = time.perf_counter() - started
         cached_victim_signals = None
 
+    started = time.perf_counter()
     infringing_tokens = build_infringing_token_records(
         contract_address=contract_address,
         contract_candidates=contract_candidates,
@@ -567,6 +613,7 @@ def _analyze_high_confidence_contract(
         official_addresses=official_addresses,
         candidate_open_license_by_token=candidate_open_license_by_token,
     )
+    stage_times['build_infringing_tokens'] = time.perf_counter() - started
 
     result = {
         'contract_address': contract_address,
@@ -583,11 +630,19 @@ def _analyze_high_confidence_contract(
                 transfers=transfers,
                 owners=owners,
             )
+        stage_times['contract_total'] = time.perf_counter() - contract_started
+        logger.info(
+            'contract timing seed=%s contract=%s %s',
+            chain,
+            contract_address,
+            _format_timing_breakdown(stage_times),
+        )
         result['status'] = 'legit'
         result['mint_recipients'] = sorted(mint_recipients)
         return result
 
     if cached_victim_signals is None or not owners:
+        started = time.perf_counter()
         owners = fetch_contract_owners(
             api_key=alchemy_api_key,
             network=network,
@@ -595,9 +650,12 @@ def _analyze_high_confidence_contract(
             timeout=timeout,
             session=session,
         )
+        stage_times['fetch_owners'] = time.perf_counter() - started
         from .rust_bridge import analyze_victim_signals_from_active_sellers
 
+        started = time.perf_counter()
         cached_victim_signals = analyze_victim_signals_from_active_sellers(active_sellers, owners)
+        stage_times['analyze_victim_signals'] = time.perf_counter() - started
         if signal_cache is not None:
             signal_cache.put(
                 chain=chain,
@@ -610,6 +668,7 @@ def _analyze_high_confidence_contract(
     sales: List[NFTSaleRecord] = []
     if _looks_like_real_api_key(alchemy_api_key) or opensea_api_key:
         try:
+            started = time.perf_counter()
             sales = fetch_contract_sales(
                 alchemy_api_key=alchemy_api_key,
                 alchemy_network=network,
@@ -618,10 +677,12 @@ def _analyze_high_confidence_contract(
                 timeout=timeout,
                 session=session,
             )
+            stage_times['fetch_sales'] = time.perf_counter() - started
         except Exception as exc:
             logger.warning('contract sales fetch failed for %s: %s', contract_address, exc)
     sale_metrics_by_tx: Dict[str, Dict[str, Any]] = {}
     receipts_by_block: Dict[int, Dict[str, TransactionReceiptRecord]] = {}
+    started = time.perf_counter()
     for sale in sales:
         if not sale.is_native_eth or sale.price_eth is None:
             sale_metrics_by_tx[sale.tx_hash] = {
@@ -688,12 +749,16 @@ def _analyze_high_confidence_contract(
                 'gas_not_attributed': False,
                 'ratio_status': 'unavailable',
             }
+    stage_times['sale_metrics'] = time.perf_counter() - started
 
+    started = time.perf_counter()
     malicious_addresses = build_malicious_address_records(
         contract_address=contract_address,
         transfers=transfers,
         infringing_tokens=infringing_tokens,
     )
+    stage_times['build_malicious_addresses'] = time.perf_counter() - started
+    started = time.perf_counter()
     victim_addresses = build_victim_address_records(
         contract_address=contract_address,
         sales=sales,
@@ -701,6 +766,8 @@ def _analyze_high_confidence_contract(
         owners=owners,
         sale_metrics_by_tx=sale_metrics_by_tx,
     )
+    stage_times['build_victim_addresses'] = time.perf_counter() - started
+    started = time.perf_counter()
     honest_addresses = build_honest_address_records(
         contract_address=contract_address,
         transfers=transfers,
@@ -710,15 +777,21 @@ def _analyze_high_confidence_contract(
         malicious_addresses=malicious_addresses,
         analysis_timestamp=int(time.time()),
     )
+    stage_times['build_honest_addresses'] = time.perf_counter() - started
+    started = time.perf_counter()
     honest_address_stats = build_honest_address_stats(
         contract_address=contract_address,
         honest_addresses=honest_addresses,
     )
+    stage_times['build_honest_stats'] = time.perf_counter() - started
+    started = time.perf_counter()
     fraud_trade_stats = build_fraud_trade_stats(
         contract_address=contract_address,
         sales=sales,
         victim_addresses=victim_addresses,
     )
+    stage_times['build_fraud_stats'] = time.perf_counter() - started
+    stage_times['contract_total'] = time.perf_counter() - contract_started
 
     result['status'] = 'high'
     result['address_signals'] = cached_address_signals
@@ -728,6 +801,12 @@ def _analyze_high_confidence_contract(
     result['honest_address_stats'] = honest_address_stats
     result['victim_addresses'] = victim_addresses
     result['fraud_trade_stats'] = fraud_trade_stats
+    logger.info(
+        'contract timing seed=%s contract=%s %s',
+        chain,
+        contract_address,
+        _format_timing_breakdown(stage_times),
+    )
     return result
 
 
@@ -748,6 +827,8 @@ def analyze_seed_contract(
     max_recall_rows: int = DEFAULT_MAX_RECALL_ROWS,
     max_tokens_per_contract: int = 500,
 ) -> Dict[str, Any]:
+    stage_times: Dict[str, float] = {}
+    seed_started = time.perf_counter()
     network = normalize_network(chain, alchemy_network)
     own_conn = False
     if feature_store is None and conn is None:
@@ -758,6 +839,7 @@ def analyze_seed_contract(
 
         session_context = contextlib.closing(_build_requests_session()) if package_constants.requests is not None else contextlib.nullcontext(None)
         with session_context as session:
+            started = time.perf_counter()
             contract_meta = fetch_contract_metadata(
                 api_key=alchemy_api_key,
                 network=network,
@@ -766,6 +848,8 @@ def analyze_seed_contract(
                 timeout=timeout,
                 session=session,
             )
+            stage_times['fetch_contract_metadata'] = time.perf_counter() - started
+            started = time.perf_counter()
             seed_nfts = fetch_seed_contract_nfts(
                 api_key=alchemy_api_key,
                 network=network,
@@ -774,6 +858,8 @@ def analyze_seed_contract(
                 timeout=timeout,
                 session=session,
             )
+            stage_times['fetch_seed_nfts'] = time.perf_counter() - started
+            started = time.perf_counter()
             license_payload = fetch_license_sample(
                 api_key=alchemy_api_key,
                 network=network,
@@ -782,16 +868,21 @@ def analyze_seed_contract(
                 timeout=timeout,
                 session=session,
             )
+            stage_times['fetch_license_sample'] = time.perf_counter() - started
             open_license = is_open_license_payload(license_payload)
             if feature_store is not None:
+                started = time.perf_counter()
                 snapshot = feature_store.load_snapshot(
                     chain,
                     seed_nfts=seed_nfts,
                     max_tokens_per_contract=max_tokens_per_contract,
                     max_recall_rows=max_recall_rows,
                 )
+                stage_times['load_snapshot'] = time.perf_counter() - started
             else:
+                started = time.perf_counter()
                 snapshot = load_database_snapshot(conn, chain, seed_nfts=seed_nfts)
+                stage_times['load_snapshot'] = time.perf_counter() - started
 
             recall_token_count = len(snapshot.nft_rows)
             recall_contract_count = len({r.contract_address for r in snapshot.nft_rows})
@@ -811,12 +902,15 @@ def analyze_seed_contract(
                     symbol_contracts=snapshot.symbol_contracts,
                 )
 
+            started = time.perf_counter()
             candidates = find_duplicate_candidates(
                 seed_nfts,
                 snapshot,
                 name_threshold=name_threshold,
                 metadata_threshold=metadata_threshold,
             )
+            stage_times['find_duplicate_candidates'] = time.perf_counter() - started
+            started = time.perf_counter()
             grouped = group_candidates_by_contract(candidates)
             snapshot_rows_by_key = {
                 (row.contract_address, row.token_id): row
@@ -833,6 +927,7 @@ def analyze_seed_contract(
                 )
                 for candidate in candidates
             }
+            stage_times['postprocess_candidates'] = time.perf_counter() - started
 
             official_addresses = {addr for addr in [contract_meta.contract_deployer, contract_meta.contract_address] if addr}
             legit_duplicates: List[Dict[str, Any]] = []
@@ -864,6 +959,7 @@ def analyze_seed_contract(
 
             if not open_license and high_confidence_items:
                 max_workers = max(1, min(8, len(high_confidence_items)))
+                started = time.perf_counter()
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     for result in executor.map(
                         lambda item: _analyze_high_confidence_contract(
@@ -904,6 +1000,7 @@ def analyze_seed_contract(
                         honest_address_stats.update(result.get('honest_address_stats') or {})
                         victim_addresses.extend(result.get('victim_addresses') or [])
                         fraud_trade_stats.update(result.get('fraud_trade_stats') or {})
+                stage_times['analyze_high_confidence_contracts'] = time.perf_counter() - started
 
             if open_license:
                 high_confidence = []
@@ -918,6 +1015,12 @@ def analyze_seed_contract(
                 for item in candidate_open_license_tokens
                 if item.get('contract_address')
             }
+            stage_times['seed_total'] = time.perf_counter() - seed_started
+            logger.info(
+                'seed timing seed=%s %s',
+                seed_contract_address,
+                _format_timing_breakdown(stage_times),
+            )
 
             return {
                 'seed_contract': asdict(contract_meta),

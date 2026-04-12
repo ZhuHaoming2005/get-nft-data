@@ -12,7 +12,7 @@ import pyarrow.parquet as pq
 from .models import ContractNameRecord, ContractSignal, DatabaseNFTRecord, DatabaseSnapshot, SeedNFT
 from .normalize import normalize_name, normalize_symbol, normalize_url
 from .snapshot import build_seed_index
-from .rust_bridge import metadata_document_from_json, metadata_keywords
+from .rust_bridge import build_database_snapshot, metadata_document_from_json, metadata_keywords
 
 
 class DuckDBFeatureStore:
@@ -322,6 +322,35 @@ class DuckDBFeatureStore:
         col_sym_norm = arrow_result['symbol_norm'].to_pylist()
         col_name_norm = arrow_result['name_norm'].to_pylist()
         col_keywords = arrow_result['metadata_keywords_arr'].to_pylist()
+        exact_token_set = set(exact_token_keys)
+        exact_image_set = set(exact_image_keys)
+        exact_symbol_set = set(exact_symbols)
+        name_prefix_set = set(name_prefixes)
+        metadata_term_set = set(metadata_recall_terms)
+        try:
+            return build_database_snapshot(
+                contract_addresses=col_addr,
+                token_ids=col_tid,
+                token_uris=col_turi,
+                image_uris=col_iuri,
+                names=col_name,
+                symbols=col_sym,
+                metadata_jsons=col_mj,
+                metadata_docs=col_md,
+                token_uri_norms=col_turi_norm,
+                image_uri_norms=col_iuri_norm,
+                symbol_norms=col_sym_norm,
+                name_norms=col_name_norm,
+                metadata_keywords_arr=[list(items or []) for items in col_keywords],
+                exact_token_keys=sorted(exact_token_set),
+                exact_image_keys=sorted(exact_image_set),
+                exact_symbols=sorted(exact_symbol_set),
+                name_prefixes=sorted(name_prefix_set),
+                metadata_recall_terms=sorted(metadata_term_set),
+            )
+        except RuntimeError:
+            pass
+
         nft_rows = [
             DatabaseNFTRecord(
                 contract_address=a or '',
@@ -337,13 +366,6 @@ class DuckDBFeatureStore:
                 col_addr, col_tid, col_turi, col_iuri, col_name, col_sym, col_mj, col_md
             )
         ]
-
-        exact_token_set = set(exact_token_keys)
-        exact_image_set = set(exact_image_keys)
-        exact_symbol_set = set(exact_symbols)
-        name_prefix_set = set(name_prefixes)
-        metadata_term_set = set(metadata_recall_terms)
-
         seen_contract_name_pairs: set[tuple[str, str]] = set()
         contract_names: list[ContractNameRecord] = []
         symbol_contracts_raw: dict[str, set[str]] = defaultdict(set)

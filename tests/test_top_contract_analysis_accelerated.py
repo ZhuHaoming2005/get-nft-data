@@ -430,6 +430,224 @@ class RustBridgeTests(unittest.TestCase):
         self.assertEqual(rows[0]['mint_to_honest_seconds_samples'], [50])
         self.assertEqual(rows[1]['mint_to_honest_seconds_samples'], [])
 
+    def test_build_malicious_address_records_marks_mint_cycles_and_rapid_spread(self):
+        transfers = [
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='1',
+                tx_hash='0xmint',
+                log_index=0,
+                block_number=10,
+                block_time=100,
+                from_address=mod.ZERO_ADDRESS,
+                to_address='0xminter',
+                event_type='erc721',
+                source='alchemy',
+            ),
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='1',
+                tx_hash='0xspread-a',
+                log_index=1,
+                block_number=11,
+                block_time=120,
+                from_address='0xminter',
+                to_address='0xa',
+                event_type='erc721',
+                source='alchemy',
+            ),
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='2',
+                tx_hash='0xmint-2',
+                log_index=2,
+                block_number=12,
+                block_time=200,
+                from_address=mod.ZERO_ADDRESS,
+                to_address='0xcycle-a',
+                event_type='erc721',
+                source='alchemy',
+            ),
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='2',
+                tx_hash='0xcycle-forward',
+                log_index=3,
+                block_number=13,
+                block_time=210,
+                from_address='0xcycle-a',
+                to_address='0xcycle-b',
+                event_type='erc721',
+                source='alchemy',
+            ),
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='3',
+                tx_hash='0xmint-3',
+                log_index=4,
+                block_number=14,
+                block_time=300,
+                from_address=mod.ZERO_ADDRESS,
+                to_address='0xstar',
+                event_type='erc721',
+                source='alchemy',
+            ),
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='3',
+                tx_hash='0xstar-a',
+                log_index=5,
+                block_number=15,
+                block_time=310,
+                from_address='0xstar',
+                to_address='0xr1',
+                event_type='erc721',
+                source='alchemy',
+            ),
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='4',
+                tx_hash='0xmint-4',
+                log_index=6,
+                block_number=16,
+                block_time=320,
+                from_address=mod.ZERO_ADDRESS,
+                to_address='0xstar',
+                event_type='erc721',
+                source='alchemy',
+            ),
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='4',
+                tx_hash='0xstar-b',
+                log_index=7,
+                block_number=17,
+                block_time=330,
+                from_address='0xstar',
+                to_address='0xr2',
+                event_type='erc721',
+                source='alchemy',
+            ),
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='5',
+                tx_hash='0xmint-5',
+                log_index=8,
+                block_number=18,
+                block_time=340,
+                from_address=mod.ZERO_ADDRESS,
+                to_address='0xstar',
+                event_type='erc721',
+                source='alchemy',
+            ),
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='5',
+                tx_hash='0xstar-c',
+                log_index=9,
+                block_number=19,
+                block_time=350,
+                from_address='0xstar',
+                to_address='0xr3',
+                event_type='erc721',
+                source='alchemy',
+            ),
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='6',
+                tx_hash='0xcycle-reverse',
+                log_index=10,
+                block_number=20,
+                block_time=360,
+                from_address='0xcycle-b',
+                to_address='0xcycle-a',
+                event_type='erc721',
+                source='alchemy',
+            ),
+        ]
+        infringing_tokens = [
+            {'contract_address': '0xdup', 'token_id': token_id, 'minter_address': minter}
+            for token_id, minter in [
+                ('1', '0xminter'),
+                ('2', '0xcycle-a'),
+                ('3', '0xstar'),
+                ('4', '0xstar'),
+                ('5', '0xstar'),
+                ('6', '0xcycle-b'),
+            ]
+        ]
+
+        rows = analysis_mod.build_malicious_address_records(
+            contract_address='0xdup',
+            transfers=transfers,
+            infringing_tokens=infringing_tokens,
+        )
+
+        by_address = {row['address']: row for row in rows}
+        self.assertEqual(sorted(by_address), ['0xcycle-a', '0xcycle-b', '0xminter', '0xstar'])
+        self.assertTrue(by_address['0xminter']['mint_role'])
+        self.assertEqual(by_address['0xminter']['rapid_spread_contracts'], ['0xdup'])
+        self.assertEqual(by_address['0xcycle-a']['wash_cycle_count'], 1)
+        self.assertEqual(by_address['0xcycle-b']['wash_cycle_count'], 1)
+        self.assertEqual(by_address['0xstar']['star_out_degree'], 3)
+        self.assertEqual(by_address['0xstar']['rapid_spread_contracts'], ['0xdup'])
+
+    def test_build_infringing_token_records_prefers_mint_transfer_when_present(self):
+        candidates = [
+            mod.DuplicateCandidate(
+                contract_address='0xdup',
+                token_id='1',
+                match_reasons=('metadata_match', 'token_uri_match'),
+                confidence='high',
+                token_uri='ipfs://seed/meta-1',
+                image_uri='ipfs://dup/image-1.png',
+                name='Azuki Clone #1',
+                symbol='AZUKI',
+            )
+        ]
+        transfers = [
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='1',
+                tx_hash='0xfirst',
+                log_index=1,
+                block_number=10,
+                block_time=100,
+                from_address='0xother',
+                to_address='0xbuyer',
+                event_type='erc721',
+                source='alchemy',
+            ),
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='1',
+                tx_hash='0xmint',
+                log_index=0,
+                block_number=9,
+                block_time=90,
+                from_address=mod.ZERO_ADDRESS,
+                to_address='0xminter',
+                event_type='erc721',
+                source='alchemy',
+            ),
+        ]
+
+        rows = analysis_mod.build_infringing_token_records(
+            contract_address='0xdup',
+            contract_candidates=candidates,
+            transfers=transfers,
+            official_addresses={'0xminter'},
+            candidate_open_license_by_token={('0xdup', '1'): True},
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['minter_address'], '0xminter')
+        self.assertEqual(rows[0]['mint_tx_hash'], '0xmint')
+        self.assertEqual(rows[0]['mint_block'], 9)
+        self.assertEqual(rows[0]['first_transfer_time'], 90)
+        self.assertTrue(rows[0]['candidate_open_license'])
+        self.assertTrue(rows[0]['official_or_legit_reissue'])
+
 
 class DuckDBSnapshotTests(unittest.TestCase):
     def test_duckdb_feature_store_loads_candidate_rows_with_metadata(self):
@@ -605,6 +823,59 @@ class DuckDBSnapshotTests(unittest.TestCase):
         self.assertEqual([(row.contract_address, row.token_id) for row in snapshot.nft_rows], [('0xa', '1')])
         self.assertEqual(sorted(snapshot.contract_signals), ['0xa'])
         self.assertEqual(snapshot.contract_signals['0xa'].token_count, 1)
+
+    def test_duckdb_feature_store_preserves_unique_contract_names_and_keyword_match(self):
+        seed_nfts = [
+            mod.SeedNFT(
+                chain='ethereum',
+                contract_address='0xseed',
+                token_id='1',
+                name='Azuki #1',
+                symbol='AZUKI',
+                token_uri='ipfs://seed/meta-1',
+                image_uri='',
+                metadata_json='{"description":"red hooded anime portrait maroon kimono"}',
+                metadata_doc='red hooded anime portrait maroon kimono',
+            )
+        ]
+        store = DuckDBFeatureStore()
+        store.replace_chain_rows(
+            'ethereum',
+            [
+                mod.DatabaseNFTRecord(
+                    contract_address='0xdup',
+                    token_id='1',
+                    token_uri='ipfs://seed/meta-1',
+                    image_uri='',
+                    name='Azuki Mirror #1',
+                    symbol='OTHER',
+                    metadata_json='',
+                    metadata_doc='anime portrait maroon kimono',
+                ),
+                mod.DatabaseNFTRecord(
+                    contract_address='0xdup',
+                    token_id='2',
+                    token_uri='ipfs://seed/meta-1',
+                    image_uri='',
+                    name='Azuki Mirror #2',
+                    symbol='OTHER',
+                    metadata_json='',
+                    metadata_doc='anime portrait maroon kimono variant',
+                ),
+            ],
+        )
+
+        snapshot = store.load_snapshot(
+            'ethereum',
+            seed_nfts=seed_nfts,
+            max_tokens_per_contract=500,
+        )
+
+        self.assertEqual(
+            [(item.contract_address, item.name_norm) for item in snapshot.contract_names],
+            [('0xdup', 'azuki mirror')],
+        )
+        self.assertTrue(snapshot.contract_signals['0xdup'].keyword_match)
 
     def test_duckdb_feature_store_loads_rows_from_parquet(self):
         tmpdir = Path('D:/code/solidity/get-nft-data/output/test-top-contract-analysis-parquet')
@@ -1053,17 +1324,12 @@ class DuckDBSnapshotTests(unittest.TestCase):
             ]
         )
 
-        with patch.object(rust_bridge, 'score_metadata_documents', return_value=[0.8]) as score_mock:
-            candidates = mod.find_duplicate_candidates(
-                seed_nfts,
-                snapshot,
-                metadata_threshold=0.55,
-            )
+        candidates = mod.find_duplicate_candidates(
+            seed_nfts,
+            snapshot,
+            metadata_threshold=0.55,
+        )
 
-        self.assertEqual(score_mock.call_count, 1)
-        left_docs, right_docs = score_mock.call_args.args
-        self.assertEqual(len(left_docs), 1)
-        self.assertEqual(right_docs, ['anime portrait maroon kimono copy'])
         self.assertEqual([item.contract_address for item in candidates], ['0xsimilar'])
 
     def test_analyze_seed_contract_reuses_signal_cache_across_runs(self):

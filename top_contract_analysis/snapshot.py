@@ -157,7 +157,7 @@ def load_database_snapshot(
     )
 
 
-def find_duplicate_candidates(
+def _find_duplicate_candidates_python(
     seed_nfts: Sequence[SeedNFT],
     snapshot: DatabaseSnapshot,
     *,
@@ -273,6 +273,23 @@ def find_duplicate_candidates(
             symbol=row.symbol,
         )
     return list(candidates.values())
+
+
+def find_duplicate_candidates(
+    seed_nfts: Sequence[SeedNFT],
+    snapshot: DatabaseSnapshot,
+    *,
+    name_threshold: float = DEFAULT_NAME_THRESHOLD,
+    metadata_threshold: float = 0.55,
+) -> List[DuplicateCandidate]:
+    from .rust_bridge import build_duplicate_candidates
+
+    return build_duplicate_candidates(
+        seed_nfts=seed_nfts,
+        snapshot_rows=snapshot.nft_rows,
+        name_threshold=name_threshold,
+        metadata_threshold=metadata_threshold,
+    )
 
 
 def group_candidates_by_contract(candidates: Sequence[DuplicateCandidate]) -> Dict[str, List[DuplicateCandidate]]:

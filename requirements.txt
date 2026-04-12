@@ -6,3 +6,4 @@ duckdb
 base58
 pyarrow
 numpy
+maturin
