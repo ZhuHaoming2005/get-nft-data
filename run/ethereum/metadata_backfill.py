@@ -203,6 +203,21 @@ def ensure_columns(conn, chain: str) -> None:
         logger.info("列 metadata/retry_checked_at 已存在，跳过 DDL：%s", tbl)
 
 
+def ensure_backfill_indexes(conn, chain: str) -> None:
+    tbl = _table(chain)
+    index_name = f"idx_{tbl}_metadata_backfill_queue"
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS {index_name}
+            ON {tbl} (retry_checked_at, id)
+            WHERE metadata IS NULL
+            """
+        )
+    conn.commit()
+    logger.info("已确保 metadata 回填索引存在：%s", index_name)
+
+
 def fetch_segment(conn, chain: str, *, limit: int, mode: str) -> List[Tuple]:
     tbl = _table(chain)
     token_uri_filter = "AND token_uri IS NOT NULL" if mode == "token_uri" else ""
@@ -212,7 +227,7 @@ def fetch_segment(conn, chain: str, *, limit: int, mode: str) -> List[Tuple]:
             SELECT id, lower(contract_address), token_id, token_standard, token_uri, image_uri
             FROM {tbl}
             WHERE contract_address IS NOT NULL
-              AND (metadata IS NULL OR metadata = '{{}}'::jsonb)
+              AND metadata IS NULL
               {token_uri_filter}
             ORDER BY retry_checked_at ASC NULLS FIRST, id ASC
             LIMIT %s
@@ -239,7 +254,7 @@ def claim_segment(conn, chain: str, *, limit: int, mode: str) -> List[Tuple]:
                     SELECT id, retry_checked_at
                     FROM {tbl}
                     WHERE contract_address IS NOT NULL
-                      AND (metadata IS NULL OR metadata = '{{}}'::jsonb)
+                      AND metadata IS NULL
                       AND (retry_checked_at IS NULL OR retry_checked_at <= NOW())
                       {token_uri_filter}
                     ORDER BY retry_checked_at ASC NULLS FIRST, id ASC
@@ -349,7 +364,8 @@ def _normalize_fetched_rows(
 ) -> List[Tuple[int, Dict, Optional[str]]]:
     normalized: List[Tuple[int, Dict, Optional[str]]] = []
     for row_id, metadata, image_uri in items:
-        normalized.append((row_id, metadata if isinstance(metadata, dict) else {}, image_uri))
+        if isinstance(metadata, dict):
+            normalized.append((row_id, metadata, image_uri))
     return normalized
 
 
@@ -647,14 +663,18 @@ async def _worker_main(chain: str, worker_index: int, stop_event=None) -> int:
                     raise ValueError(f"不支持的 METADATA_BACKFILL_MODE: {METADATA_BACKFILL_MODE}")
 
                 flat = _normalize_fetched_rows([item for part in parts for item in part])
-                updated = bulk_update_rows(conn, chain, flat)
+                fetched_ids = {row_id for row_id, _, _ in flat}
+                missing_ids = [row[0] for row in rows if row[0] not in fetched_ids]
+                updated = bulk_update_rows(conn, chain, flat) if flat else 0
+                mark_rows_checked(conn, chain, missing_ids)
                 total_updated += updated
                 logger.info(
-                    "链 %s worker-%d 本轮认领 %d 条，成功回填 %d 条 metadata（累计 %d）",
+                    "链 %s worker-%d 本轮认领 %d 条，成功回填 %d 条 metadata，延后重试 %d 条（累计 %d）",
                     chain,
                     worker_index,
                     len(rows),
                     updated,
+                    len(missing_ids),
                     total_updated,
                 )
         if _is_stop_requested(stop_event):
@@ -675,6 +695,7 @@ async def _process_chain(chain: str, stop_event=None) -> int:
     conn = _conn()
     try:
         ensure_columns(conn, chain)
+        ensure_backfill_indexes(conn, chain)
     finally:
         _safe_close(conn)
 
