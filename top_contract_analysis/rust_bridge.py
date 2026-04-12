@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import time
 import unicodedata
 from difflib import SequenceMatcher
 from functools import lru_cache
@@ -10,7 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
 
 if TYPE_CHECKING:
-    from . import OwnerBalance, TransferRecord
+    from . import NFTSaleRecord, OwnerBalance, TransferRecord
 
 _LOCAL_EXTENSION_DIR = Path(__file__).resolve().parent.parent / '.runtime' / 'pydeps'
 if _LOCAL_EXTENSION_DIR.exists() and str(_LOCAL_EXTENSION_DIR) not in sys.path:
@@ -19,6 +20,8 @@ if _LOCAL_EXTENSION_DIR.exists() and str(_LOCAL_EXTENSION_DIR) not in sys.path:
 try:
     from top_contract_analysis_rust import analyze_transfer_signals as _rust_analyze_transfer_signals
     from top_contract_analysis_rust import analyze_victim_signals as _rust_analyze_victim_signals
+    from top_contract_analysis_rust import build_honest_address_records as _rust_build_honest_address_records
+    from top_contract_analysis_rust import build_victim_address_records as _rust_build_victim_address_records
     from top_contract_analysis_rust import metadata_document_from_json as _rust_metadata_document_from_json
     from top_contract_analysis_rust import metadata_keywords as _rust_metadata_keywords
     from top_contract_analysis_rust import score_metadata_documents as _rust_score_metadata_documents
@@ -29,6 +32,8 @@ try:
 except ImportError:  # pragma: no cover
     _rust_analyze_transfer_signals = None
     _rust_analyze_victim_signals = None
+    _rust_build_honest_address_records = None
+    _rust_build_victim_address_records = None
     _rust_metadata_document_from_json = None
     _rust_metadata_keywords = None
     _rust_score_metadata_documents = None
@@ -325,3 +330,128 @@ def analyze_victim_signals_from_active_sellers(
         'stuck_holder_ratio': (stuck_holder_count / owner_count) if owner_count else 0.0,
         'victim_wallet_count': stuck_holder_count,
     }
+
+
+def build_victim_address_records(
+    sales: Sequence['NFTSaleRecord'],
+    transfers: Sequence['TransferRecord'],
+    owners: Sequence['OwnerBalance'],
+    sale_metrics_by_tx: dict[str, dict[str, Any]],
+    *,
+    contract_address: str = '',
+) -> list[dict[str, Any]]:
+    del contract_address
+
+    if _rust_build_victim_address_records is None:
+        from .analysis import _build_victim_address_records_python
+
+        return _build_victim_address_records_python(
+            contract_address='',
+            sales=sales,
+            transfers=transfers,
+            owners=owners,
+            sale_metrics_by_tx=sale_metrics_by_tx,
+        )
+
+    from .sales import ETH_PRICED_SYMBOLS
+
+    packed_sales = [
+        (
+            sale.token_id,
+            sale.tx_hash,
+            int(sale.block_number or 0),
+            int(sale.log_index or 0),
+            int(sale.bundle_index or 0),
+            sale.buyer_address,
+            bool(sale.price_eth is not None and sale.payment_token_symbol in ETH_PRICED_SYMBOLS),
+            sale.price_eth,
+            sale_metrics_by_tx.get(sale.tx_hash, {}).get('buy_before_eth_balance'),
+            sale_metrics_by_tx.get(sale.tx_hash, {}).get('buy_asset_ratio'),
+            sale_metrics_by_tx.get(sale.tx_hash, {}).get('buy_asset_ratio_with_gas'),
+            str(sale_metrics_by_tx.get(sale.tx_hash, {}).get('ratio_status', 'unavailable')),
+        )
+        for sale in sales
+    ]
+    packed_transfers = [
+        (
+            transfer.token_id,
+            transfer.tx_hash,
+            int(transfer.block_number or 0),
+            int(transfer.log_index or 0),
+            transfer.from_address,
+        )
+        for transfer in transfers
+    ]
+    packed_owners = [
+        (
+            owner.owner_address,
+            [token_id for token_id, balance in owner.token_balances.items() if balance > 0],
+        )
+        for owner in owners
+    ]
+    return list(_rust_build_victim_address_records(packed_sales, packed_transfers, packed_owners))
+
+
+def build_honest_address_records(
+    *,
+    contract_address: str,
+    transfers: Sequence['TransferRecord'],
+    sales: Sequence['NFTSaleRecord'],
+    owners: Sequence['OwnerBalance'],
+    infringing_tokens: Sequence[dict[str, Any]],
+    malicious_addresses: Sequence[dict[str, Any]],
+    analysis_timestamp: int | None = None,
+) -> list[dict[str, Any]]:
+    if _rust_build_honest_address_records is None:
+        from .analysis import _build_honest_address_records_python
+
+        return _build_honest_address_records_python(
+            contract_address=contract_address,
+            transfers=transfers,
+            sales=sales,
+            owners=owners,
+            infringing_tokens=infringing_tokens,
+            malicious_addresses=malicious_addresses,
+            analysis_timestamp=analysis_timestamp,
+        )
+
+    packed_transfers = [
+        (
+            transfer.token_id,
+            transfer.tx_hash,
+            int(transfer.block_number or 0),
+            int(transfer.log_index or 0),
+            int(transfer.block_time or 0),
+            transfer.from_address,
+            transfer.to_address,
+        )
+        for transfer in transfers
+    ]
+    packed_sales = [
+        (
+            sale.token_id,
+            sale.buyer_address,
+            sale.seller_address,
+        )
+        for sale in sales
+    ]
+    packed_owners = [
+        (
+            owner.owner_address,
+            [token_id for token_id, balance in owner.token_balances.items() if balance > 0],
+        )
+        for owner in owners
+    ]
+    packed_infringing_tokens = [str(item.get('token_id') or '') for item in infringing_tokens if item.get('token_id')]
+    packed_malicious_addresses = [str(item.get('address') or '') for item in malicious_addresses if item.get('address')]
+    return list(
+        _rust_build_honest_address_records(
+            contract_address,
+            packed_transfers,
+            packed_sales,
+            packed_owners,
+            packed_infringing_tokens,
+            packed_malicious_addresses,
+            int(analysis_timestamp or time.time()),
+        )
+    )

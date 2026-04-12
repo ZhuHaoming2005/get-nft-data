@@ -354,6 +354,409 @@ fn analyze_victim_signals_internal(
     )
 }
 
+#[derive(Default)]
+struct VictimAddressRow {
+    address: String,
+    buy_tx_hashes: Vec<String>,
+    buy_amount_eth: f64,
+    last_buy_amount_eth: Option<f64>,
+    buy_before_eth_balance: Option<f64>,
+    buy_asset_ratio: Option<f64>,
+    buy_asset_ratio_with_gas: Option<f64>,
+    is_stuck: bool,
+    last_buy_tx_hash: String,
+    ratio_status: String,
+}
+
+#[derive(Clone)]
+struct VictimSaleInput {
+    token_id: String,
+    tx_hash: String,
+    block_number: i64,
+    log_index: i64,
+    bundle_index: i64,
+    buyer_address: String,
+    is_eth_priced: bool,
+    price_eth: Option<f64>,
+    buy_before_eth_balance: Option<f64>,
+    buy_asset_ratio: Option<f64>,
+    buy_asset_ratio_with_gas: Option<f64>,
+    ratio_status: String,
+}
+
+#[derive(Clone)]
+struct HonestTransferInput {
+    token_id: String,
+    tx_hash: String,
+    block_number: i64,
+    log_index: i64,
+    block_time: i64,
+    from_address: String,
+    to_address: String,
+}
+
+#[derive(Default)]
+struct HonestAddressRow {
+    contract_address: String,
+    address: String,
+    interacted_token_count: usize,
+    currently_holding_token_count: usize,
+    hold_duration_median_seconds: Option<f64>,
+    hold_duration_count: usize,
+    is_corrupted_address: bool,
+    honest_sale_to_honest_count: usize,
+    mint_to_honest_seconds_samples: Vec<i64>,
+}
+
+#[derive(Default)]
+struct TokenHonestStats {
+    token_id: String,
+    interacted_addresses: HashSet<String>,
+    durations_by_address: HashMap<String, Vec<i64>>,
+    mint_to_honest_samples_by_address: HashMap<String, Vec<i64>>,
+    honest_to_honest_count: HashMap<String, usize>,
+    corrupted_addresses: HashSet<String>,
+}
+
+fn median_i64(values: &[i64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let mid = sorted.len() / 2;
+    if sorted.len() % 2 == 1 {
+        Some(sorted[mid] as f64)
+    } else {
+        Some((sorted[mid - 1] as f64 + sorted[mid] as f64) / 2.0)
+    }
+}
+
+fn build_victim_address_records_internal(
+    sales: Vec<VictimSaleInput>,
+    transfers: Vec<(String, String, i64, i64, String)>,
+    owners: Vec<(String, Vec<String>)>,
+) -> Vec<VictimAddressRow> {
+    let mut owner_token_map: HashMap<String, HashSet<String>> = HashMap::new();
+    for (owner_address, held_tokens) in owners.into_iter() {
+        if held_tokens.is_empty() {
+            continue;
+        }
+        owner_token_map.insert(owner_address, held_tokens.into_iter().collect());
+    }
+
+    let mut latest_outgoing: HashMap<(String, String), (i64, i64, String)> = HashMap::new();
+    for (token_id, tx_hash, block_number, log_index, from_address) in transfers.into_iter() {
+        if from_address.is_empty() || from_address == ZERO_ADDRESS {
+            continue;
+        }
+        let key = (from_address, token_id);
+        let transfer_key = (block_number, log_index, tx_hash);
+        match latest_outgoing.get(&key) {
+            Some(current) if current >= &transfer_key => {}
+            _ => {
+                latest_outgoing.insert(key, transfer_key);
+            }
+        }
+    }
+
+    let mut sorted_sales = sales;
+    sorted_sales.sort_by(|left, right| {
+        (
+            left.block_number,
+            left.log_index,
+            left.bundle_index,
+            &left.tx_hash,
+        )
+            .cmp(&(
+                right.block_number,
+                right.log_index,
+                right.bundle_index,
+                &right.tx_hash,
+            ))
+    });
+
+    let mut grouped: HashMap<String, VictimAddressRow> = HashMap::new();
+    let mut last_buy_key: HashMap<String, (i64, i64, i64, String)> = HashMap::new();
+
+    for sale in sorted_sales.into_iter() {
+        if sale.buyer_address.is_empty() {
+            continue;
+        }
+
+        let later_transfer_out = latest_outgoing
+            .get(&(sale.buyer_address.clone(), sale.token_id.clone()))
+            .map(|transfer_key| {
+                transfer_key
+                    > &(sale.block_number, sale.log_index, sale.tx_hash.clone())
+            })
+            .unwrap_or(false);
+
+        let is_stuck = owner_token_map
+            .get(&sale.buyer_address)
+            .map(|held_tokens| held_tokens.contains(&sale.token_id))
+            .unwrap_or(false)
+            && !later_transfer_out;
+
+        let entry = grouped
+            .entry(sale.buyer_address.clone())
+            .or_insert_with(|| VictimAddressRow {
+                address: sale.buyer_address.clone(),
+                ratio_status: "unavailable".to_string(),
+                ..VictimAddressRow::default()
+            });
+        entry.buy_tx_hashes.push(sale.tx_hash.clone());
+        if sale.is_eth_priced {
+            entry.buy_amount_eth += sale.price_eth.unwrap_or(0.0);
+        }
+
+        let current_key = (
+            sale.block_number,
+            sale.log_index,
+            sale.bundle_index,
+            sale.tx_hash.clone(),
+        );
+        let should_update_last = last_buy_key
+            .get(&sale.buyer_address)
+            .map(|existing| &current_key >= existing)
+            .unwrap_or(true);
+        if should_update_last {
+            last_buy_key.insert(sale.buyer_address.clone(), current_key);
+            entry.last_buy_tx_hash = sale.tx_hash.clone();
+            entry.last_buy_amount_eth = if sale.is_eth_priced {
+                sale.price_eth
+            } else {
+                None
+            };
+            entry.buy_before_eth_balance = sale.buy_before_eth_balance;
+            entry.buy_asset_ratio = sale.buy_asset_ratio;
+            entry.buy_asset_ratio_with_gas = sale.buy_asset_ratio_with_gas;
+            entry.ratio_status = sale.ratio_status.clone();
+        }
+        entry.is_stuck = entry.is_stuck || is_stuck;
+    }
+
+    let mut rows: Vec<VictimAddressRow> = grouped.into_values().collect();
+    rows.sort_by(|left, right| left.address.cmp(&right.address));
+    rows
+}
+
+fn build_honest_address_records_internal(
+    contract_address: String,
+    transfers: Vec<HonestTransferInput>,
+    sales: Vec<(String, String, String)>,
+    owners: Vec<(String, Vec<String>)>,
+    infringing_token_ids: Vec<String>,
+    malicious_addresses: Vec<String>,
+    analysis_timestamp: i64,
+) -> Vec<HonestAddressRow> {
+    let cutoff_time = if analysis_timestamp > 0 {
+        analysis_timestamp
+    } else {
+        0
+    };
+    let relevant_token_ids: HashSet<String> = infringing_token_ids
+        .into_iter()
+        .filter(|token_id| !token_id.is_empty())
+        .collect();
+    let malicious_set: HashSet<String> = malicious_addresses
+        .into_iter()
+        .filter(|address| !address.is_empty())
+        .collect();
+
+    let mut owner_token_map: HashMap<String, HashSet<String>> = HashMap::new();
+    for (owner_address, held_tokens) in owners.into_iter() {
+        let filtered: HashSet<String> = held_tokens
+            .into_iter()
+            .filter(|token_id| relevant_token_ids.is_empty() || relevant_token_ids.contains(token_id))
+            .collect();
+        if !filtered.is_empty() {
+            owner_token_map.insert(owner_address, filtered);
+        }
+    }
+
+    let mut relevant_transfers: Vec<HonestTransferInput> = transfers
+        .into_iter()
+        .filter(|transfer| relevant_token_ids.is_empty() || relevant_token_ids.contains(&transfer.token_id))
+        .collect();
+    relevant_transfers.sort_by(|left, right| {
+        (
+            left.block_number,
+            left.log_index,
+            &left.tx_hash,
+        )
+            .cmp(&(
+                right.block_number,
+                right.log_index,
+                &right.tx_hash,
+            ))
+    });
+
+    let relevant_sales: Vec<(String, String, String)> = sales
+        .into_iter()
+        .filter(|(token_id, _buyer_address, _seller_address)| {
+            relevant_token_ids.is_empty() || relevant_token_ids.contains(token_id)
+        })
+        .collect();
+
+    let mut all_addresses: HashSet<String> = HashSet::new();
+    for transfer in relevant_transfers.iter() {
+        if !transfer.from_address.is_empty() && transfer.from_address != ZERO_ADDRESS {
+            all_addresses.insert(transfer.from_address.clone());
+        }
+        if !transfer.to_address.is_empty() && transfer.to_address != ZERO_ADDRESS {
+            all_addresses.insert(transfer.to_address.clone());
+        }
+    }
+    for (_token_id, buyer_address, seller_address) in relevant_sales.iter() {
+        if !buyer_address.is_empty() {
+            all_addresses.insert(buyer_address.clone());
+        }
+        if !seller_address.is_empty() {
+            all_addresses.insert(seller_address.clone());
+        }
+    }
+    for address in owner_token_map.keys() {
+        all_addresses.insert(address.clone());
+    }
+
+    let mut honest_addresses: Vec<String> = all_addresses
+        .into_iter()
+        .filter(|address| !address.is_empty() && !malicious_set.contains(address))
+        .collect();
+    honest_addresses.sort();
+    let honest_set: HashSet<String> = honest_addresses.iter().cloned().collect();
+
+    let mut transfers_by_token: HashMap<String, Vec<HonestTransferInput>> = HashMap::new();
+    for transfer in relevant_transfers.into_iter() {
+        transfers_by_token
+            .entry(transfer.token_id.clone())
+            .or_default()
+            .push(transfer);
+    }
+
+    let mut token_interactions_by_address: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut durations_by_address: HashMap<String, Vec<i64>> = HashMap::new();
+    let mut mint_to_honest_samples_by_address: HashMap<String, Vec<i64>> = HashMap::new();
+    let mut honest_to_honest_count: HashMap<String, usize> = HashMap::new();
+    let mut corrupted_addresses: HashSet<String> = HashSet::new();
+
+    for (token_id, token_transfers) in transfers_by_token.into_iter() {
+        let mut mint_time = 0_i64;
+        let mut first_honest_recorded = false;
+        let mut open_holds: HashMap<String, i64> = HashMap::new();
+        let mut token_stats = TokenHonestStats {
+            token_id: token_id.clone(),
+            ..TokenHonestStats::default()
+        };
+
+        for transfer in token_transfers.iter() {
+            if transfer.from_address == ZERO_ADDRESS && transfer.block_time > 0 {
+                mint_time = transfer.block_time;
+            }
+            if honest_set.contains(&transfer.from_address) {
+                token_stats.interacted_addresses.insert(transfer.from_address.clone());
+                if let Some(start_time) = open_holds.remove(&transfer.from_address) {
+                    if transfer.block_time >= start_time {
+                        token_stats
+                            .durations_by_address
+                            .entry(transfer.from_address.clone())
+                            .or_default()
+                            .push(transfer.block_time - start_time);
+                    }
+                }
+            }
+            if honest_set.contains(&transfer.from_address) && honest_set.contains(&transfer.to_address) {
+                token_stats.corrupted_addresses.insert(transfer.from_address.clone());
+                *token_stats
+                    .honest_to_honest_count
+                    .entry(transfer.from_address.clone())
+                    .or_insert(0) += 1;
+            }
+            if honest_set.contains(&transfer.to_address) {
+                token_stats.interacted_addresses.insert(transfer.to_address.clone());
+                if transfer.block_time > 0 {
+                    open_holds.insert(transfer.to_address.clone(), transfer.block_time);
+                    if mint_time > 0 && !first_honest_recorded {
+                        token_stats
+                            .mint_to_honest_samples_by_address
+                            .entry(transfer.to_address.clone())
+                            .or_default()
+                            .push(std::cmp::max(0_i64, transfer.block_time - mint_time));
+                        first_honest_recorded = true;
+                    }
+                }
+            }
+        }
+
+        for (address, start_time) in open_holds.into_iter() {
+            if !owner_token_map
+                .get(&address)
+                .map(|held_tokens| held_tokens.contains(&token_id))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if cutoff_time >= start_time {
+                token_stats
+                    .durations_by_address
+                    .entry(address)
+                    .or_default()
+                    .push(cutoff_time - start_time);
+            }
+        }
+
+        for address in token_stats.interacted_addresses.into_iter() {
+            token_interactions_by_address
+                .entry(address)
+                .or_default()
+                .insert(token_stats.token_id.clone());
+        }
+        for (address, durations) in token_stats.durations_by_address.into_iter() {
+            durations_by_address.entry(address).or_default().extend(durations);
+        }
+        for (address, samples) in token_stats.mint_to_honest_samples_by_address.into_iter() {
+            mint_to_honest_samples_by_address
+                .entry(address)
+                .or_default()
+                .extend(samples);
+        }
+        for (address, count) in token_stats.honest_to_honest_count.into_iter() {
+            *honest_to_honest_count.entry(address).or_insert(0) += count;
+        }
+        corrupted_addresses.extend(token_stats.corrupted_addresses.into_iter());
+    }
+
+    honest_addresses
+        .into_iter()
+        .map(|address| {
+            let current_tokens = owner_token_map.get(&address).cloned().unwrap_or_default();
+            let interacted_tokens = token_interactions_by_address
+                .get(&address)
+                .cloned()
+                .unwrap_or_default();
+            let mut union_tokens = interacted_tokens;
+            union_tokens.extend(current_tokens.iter().cloned());
+            let hold_durations = durations_by_address.get(&address).cloned().unwrap_or_default();
+
+            HonestAddressRow {
+                contract_address: contract_address.clone(),
+                address: address.clone(),
+                interacted_token_count: union_tokens.len(),
+                currently_holding_token_count: current_tokens.len(),
+                hold_duration_median_seconds: median_i64(&hold_durations),
+                hold_duration_count: hold_durations.len(),
+                is_corrupted_address: corrupted_addresses.contains(&address),
+                honest_sale_to_honest_count: *honest_to_honest_count.get(&address).unwrap_or(&0),
+                mint_to_honest_seconds_samples: mint_to_honest_samples_by_address
+                    .get(&address)
+                    .cloned()
+                    .unwrap_or_default(),
+            }
+        })
+        .collect()
+}
+
 #[pyfunction]
 fn analyze_transfer_signals(
     py: Python<'_>,
@@ -397,6 +800,144 @@ fn analyze_victim_signals(
     Ok(result.into_any().unbind())
 }
 
+#[pyfunction]
+fn build_victim_address_records(
+    py: Python<'_>,
+    sales: Vec<(
+        String,
+        String,
+        i64,
+        i64,
+        i64,
+        String,
+        bool,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        String,
+    )>,
+    transfers: Vec<(String, String, i64, i64, String)>,
+    owners: Vec<(String, Vec<String>)>,
+) -> PyResult<Vec<PyObject>> {
+    let sales: Vec<VictimSaleInput> = sales
+        .into_iter()
+        .map(
+            |(
+                token_id,
+                tx_hash,
+                block_number,
+                log_index,
+                bundle_index,
+                buyer_address,
+                is_eth_priced,
+                price_eth,
+                buy_before_eth_balance,
+                buy_asset_ratio,
+                buy_asset_ratio_with_gas,
+                ratio_status,
+            )| VictimSaleInput {
+                token_id,
+                tx_hash,
+                block_number,
+                log_index,
+                bundle_index,
+                buyer_address,
+                is_eth_priced,
+                price_eth,
+                buy_before_eth_balance,
+                buy_asset_ratio,
+                buy_asset_ratio_with_gas,
+                ratio_status,
+            },
+        )
+        .collect();
+
+    let rows = py.allow_threads(|| build_victim_address_records_internal(sales, transfers, owners));
+    let mut output = Vec::with_capacity(rows.len());
+    for row in rows.into_iter() {
+        let result = PyDict::new_bound(py);
+        result.set_item("address", row.address)?;
+        result.set_item("buy_tx_hashes", row.buy_tx_hashes)?;
+        result.set_item("buy_amount_eth", row.buy_amount_eth)?;
+        result.set_item("last_buy_amount_eth", row.last_buy_amount_eth)?;
+        result.set_item("buy_before_eth_balance", row.buy_before_eth_balance)?;
+        result.set_item("buy_asset_ratio", row.buy_asset_ratio)?;
+        result.set_item("buy_asset_ratio_with_gas", row.buy_asset_ratio_with_gas)?;
+        result.set_item("is_stuck", row.is_stuck)?;
+        result.set_item("last_buy_tx_hash", row.last_buy_tx_hash)?;
+        result.set_item("ratio_status", row.ratio_status)?;
+        output.push(result.into_any().unbind());
+    }
+    Ok(output)
+}
+
+#[pyfunction]
+fn build_honest_address_records(
+    py: Python<'_>,
+    contract_address: String,
+    transfers: Vec<(String, String, i64, i64, i64, String, String)>,
+    sales: Vec<(String, String, String)>,
+    owners: Vec<(String, Vec<String>)>,
+    infringing_token_ids: Vec<String>,
+    malicious_addresses: Vec<String>,
+    analysis_timestamp: i64,
+) -> PyResult<Vec<PyObject>> {
+    let transfers: Vec<HonestTransferInput> = transfers
+        .into_iter()
+        .map(
+            |(
+                token_id,
+                tx_hash,
+                block_number,
+                log_index,
+                block_time,
+                from_address,
+                to_address,
+            )| HonestTransferInput {
+                token_id,
+                tx_hash,
+                block_number,
+                log_index,
+                block_time,
+                from_address,
+                to_address,
+            },
+        )
+        .collect();
+
+    let rows = py.allow_threads(|| {
+        build_honest_address_records_internal(
+            contract_address,
+            transfers,
+            sales,
+            owners,
+            infringing_token_ids,
+            malicious_addresses,
+            analysis_timestamp,
+        )
+    });
+
+    let mut output = Vec::with_capacity(rows.len());
+    for row in rows.into_iter() {
+        let result = PyDict::new_bound(py);
+        result.set_item("contract_address", row.contract_address)?;
+        result.set_item("address", row.address)?;
+        result.set_item("interacted_token_count", row.interacted_token_count)?;
+        result.set_item("currently_holding_token_count", row.currently_holding_token_count)?;
+        result.set_item("hold_duration_median_seconds", row.hold_duration_median_seconds)?;
+        result.set_item("hold_duration_count", row.hold_duration_count)?;
+        result.set_item("is_corrupted_address", row.is_corrupted_address)?;
+        result.set_item("honest_sale_to_honest_count", row.honest_sale_to_honest_count)?;
+        result.set_item(
+            "mint_to_honest_seconds_samples",
+            row.mint_to_honest_seconds_samples,
+        )?;
+        output.push(result.into_any().unbind());
+    }
+    Ok(output)
+}
+
 #[pymodule]
 fn top_contract_analysis_rust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(score_name_pairs, m)?)?;
@@ -406,5 +947,7 @@ fn top_contract_analysis_rust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyRes
     m.add_function(wrap_pyfunction!(metadata_keywords, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_transfer_signals, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_victim_signals, m)?)?;
+    m.add_function(wrap_pyfunction!(build_victim_address_records, m)?)?;
+    m.add_function(wrap_pyfunction!(build_honest_address_records, m)?)?;
     Ok(())
 }

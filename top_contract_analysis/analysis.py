@@ -247,7 +247,7 @@ def build_malicious_address_records(
     return rows
 
 
-def build_victim_address_records(
+def _build_victim_address_records_python(
     *,
     contract_address: str,
     sales: Sequence[NFTSaleRecord],
@@ -309,7 +309,26 @@ def build_victim_address_records(
     return sorted(grouped.values(), key=lambda item: item['address'])
 
 
-def build_honest_address_records(
+def build_victim_address_records(
+    *,
+    contract_address: str,
+    sales: Sequence[NFTSaleRecord],
+    transfers: Sequence[TransferRecord],
+    owners: Sequence[OwnerBalance],
+    sale_metrics_by_tx: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    from .rust_bridge import build_victim_address_records as build_victim_rows
+
+    return build_victim_rows(
+        sales=sales,
+        transfers=transfers,
+        owners=owners,
+        sale_metrics_by_tx=sale_metrics_by_tx,
+        contract_address=contract_address,
+    )
+
+
+def _build_honest_address_records_python(
     *,
     contract_address: str,
     transfers: Sequence[TransferRecord],
@@ -416,6 +435,29 @@ def build_honest_address_records(
             }
         )
     return rows
+
+
+def build_honest_address_records(
+    *,
+    contract_address: str,
+    transfers: Sequence[TransferRecord],
+    sales: Sequence[NFTSaleRecord],
+    owners: Sequence[OwnerBalance],
+    infringing_tokens: Sequence[Dict[str, Any]],
+    malicious_addresses: Sequence[Dict[str, Any]],
+    analysis_timestamp: int | None = None,
+) -> List[Dict[str, Any]]:
+    from .rust_bridge import build_honest_address_records as build_honest_rows
+
+    return build_honest_rows(
+        contract_address=contract_address,
+        transfers=transfers,
+        sales=sales,
+        owners=owners,
+        infringing_tokens=infringing_tokens,
+        malicious_addresses=malicious_addresses,
+        analysis_timestamp=analysis_timestamp,
+    )
 
 
 def build_honest_address_stats(

@@ -247,6 +247,189 @@ class RustBridgeTests(unittest.TestCase):
         self.assertEqual(result['victim_wallet_count'], 1)
         self.assertEqual(result['stuck_holder_ratio'], 0.5)
 
+    def test_build_victim_address_records_uses_later_transfer_ordering(self):
+        sales = [
+            mod.NFTSaleRecord(
+                contract_address='0xdup',
+                token_id='1',
+                tx_hash='0xbuy-a',
+                block_number=10,
+                log_index=1,
+                bundle_index=0,
+                buyer_address='0xbuyer',
+                seller_address='0xseller',
+                marketplace='seaport',
+                taker='BUYER',
+                payment_token_symbol='ETH',
+                payment_token_address='',
+                price_eth=1.5,
+                seller_fee_eth=1.5,
+                protocol_fee_eth=0.0,
+                royalty_fee_eth=0.0,
+                source='alchemy',
+                is_native_eth=True,
+            ),
+            mod.NFTSaleRecord(
+                contract_address='0xdup',
+                token_id='2',
+                tx_hash='0xbuy-b',
+                block_number=11,
+                log_index=1,
+                bundle_index=0,
+                buyer_address='0xbuyer',
+                seller_address='0xseller',
+                marketplace='blur',
+                taker='BUYER',
+                payment_token_symbol='WETH',
+                payment_token_address='0xweth',
+                price_eth=2.5,
+                seller_fee_eth=2.5,
+                protocol_fee_eth=0.0,
+                royalty_fee_eth=0.0,
+                source='alchemy',
+                is_native_eth=False,
+            ),
+        ]
+        transfers = [
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='1',
+                tx_hash='0xbuy-a',
+                log_index=1,
+                block_number=10,
+                block_time=100,
+                from_address='0xseller',
+                to_address='0xbuyer',
+                event_type='erc721',
+                source='alchemy',
+            ),
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='1',
+                tx_hash='0xzz-transfer',
+                log_index=1,
+                block_number=10,
+                block_time=101,
+                from_address='0xbuyer',
+                to_address='0xnext',
+                event_type='erc721',
+                source='alchemy',
+            ),
+        ]
+        owners = [mod.OwnerBalance(owner_address='0xbuyer', token_balances={'1': 1, '2': 1})]
+        sale_metrics_by_tx = {
+            '0xbuy-a': {
+                'buy_before_eth_balance': 3.0,
+                'buy_asset_ratio': 0.5,
+                'buy_asset_ratio_with_gas': 0.5001,
+                'ratio_status': 'ok',
+            },
+            '0xbuy-b': {
+                'buy_before_eth_balance': None,
+                'buy_asset_ratio': None,
+                'buy_asset_ratio_with_gas': None,
+                'ratio_status': 'unavailable',
+            },
+        }
+
+        rows = rust_bridge.build_victim_address_records(
+            sales,
+            transfers,
+            owners,
+            sale_metrics_by_tx,
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['address'], '0xbuyer')
+        self.assertEqual(rows[0]['buy_tx_hashes'], ['0xbuy-a', '0xbuy-b'])
+        self.assertAlmostEqual(rows[0]['buy_amount_eth'], 4.0)
+        self.assertTrue(rows[0]['is_stuck'])
+        self.assertEqual(rows[0]['last_buy_tx_hash'], '0xbuy-b')
+        self.assertAlmostEqual(rows[0]['last_buy_amount_eth'], 2.5)
+        self.assertEqual(rows[0]['ratio_status'], 'unavailable')
+
+    def test_build_honest_address_records_tracks_hold_times_and_corruption(self):
+        transfers = [
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='1',
+                tx_hash='0xmint',
+                log_index=0,
+                block_number=10,
+                block_time=100,
+                from_address=mod.ZERO_ADDRESS,
+                to_address='0xsybil',
+                event_type='erc721',
+                source='alchemy',
+            ),
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='1',
+                tx_hash='0xvictim-a',
+                log_index=1,
+                block_number=11,
+                block_time=150,
+                from_address='0xsybil',
+                to_address='0xhonest1',
+                event_type='erc721',
+                source='alchemy',
+            ),
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='1',
+                tx_hash='0xvictim-b',
+                log_index=2,
+                block_number=12,
+                block_time=200,
+                from_address='0xhonest1',
+                to_address='0xhonest2',
+                event_type='erc721',
+                source='alchemy',
+            ),
+        ]
+        sales = [
+            mod.NFTSaleRecord(
+                contract_address='0xdup',
+                token_id='1',
+                tx_hash='0xvictim-a',
+                block_number=11,
+                log_index=1,
+                bundle_index=0,
+                buyer_address='0xhonest1',
+                seller_address='0xsybil',
+                marketplace='seaport',
+                taker='BUYER',
+                payment_token_symbol='ETH',
+                price_eth=1.0,
+                seller_fee_eth=1.0,
+                protocol_fee_eth=0.0,
+                royalty_fee_eth=0.0,
+                source='alchemy',
+                is_native_eth=True,
+            )
+        ]
+        owners = [mod.OwnerBalance(owner_address='0xhonest2', token_balances={'1': 1})]
+        infringing_tokens = [{'contract_address': '0xdup', 'token_id': '1'}]
+        malicious_addresses = [{'address': '0xsybil'}]
+
+        rows = rust_bridge.build_honest_address_records(
+            contract_address='0xdup',
+            transfers=transfers,
+            sales=sales,
+            owners=owners,
+            infringing_tokens=infringing_tokens,
+            malicious_addresses=malicious_addresses,
+            analysis_timestamp=300,
+        )
+
+        self.assertEqual([row['address'] for row in rows], ['0xhonest1', '0xhonest2'])
+        self.assertTrue(rows[0]['is_corrupted_address'])
+        self.assertFalse(rows[1]['is_corrupted_address'])
+        self.assertEqual(rows[0]['hold_duration_median_seconds'], 50.0)
+        self.assertEqual(rows[1]['hold_duration_median_seconds'], 100.0)
+        self.assertEqual(rows[0]['mint_to_honest_seconds_samples'], [50])
+        self.assertEqual(rows[1]['mint_to_honest_seconds_samples'], [])
+
 
 class DuckDBSnapshotTests(unittest.TestCase):
     def test_duckdb_feature_store_loads_candidate_rows_with_metadata(self):
