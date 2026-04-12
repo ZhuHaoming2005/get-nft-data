@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from threading import RLock
 from typing import Any, Sequence
 
@@ -18,6 +19,8 @@ def _expected_columns() -> list[str]:
         'active_sellers',
         'address_signals',
         'victim_signals',
+        'transfers_json',
+        'owners_json',
     ]
 
 
@@ -59,6 +62,8 @@ class ContractSignalCache:
                         stuck_holder_ratio DOUBLE,
                         victim_wallet_count INTEGER
                     ),
+                    transfers_json VARCHAR NOT NULL,
+                    owners_json VARCHAR NOT NULL,
                     PRIMARY KEY (chain, contract_address, token_type)
                 )
                 '''
@@ -72,7 +77,7 @@ class ContractSignalCache:
         with self._lock:
             row = self._conn.execute(
                 '''
-                SELECT mint_recipients, active_sellers, address_signals, victim_signals
+                SELECT mint_recipients, active_sellers, address_signals, victim_signals, transfers_json, owners_json
                 FROM contract_signal_cache
                 WHERE chain = ? AND contract_address = ? AND token_type = ?
                 ''',
@@ -80,12 +85,20 @@ class ContractSignalCache:
             ).fetchone()
         if row is None:
             return None
-        mint_recipients, active_sellers, address_signals, victim_signals = row
+        mint_recipients, active_sellers, address_signals, victim_signals, transfers_json, owners_json = row
         return {
             'mint_recipients': list(mint_recipients) if mint_recipients else [],
             'active_sellers': list(active_sellers) if active_sellers else [],
             'address_signals': dict(address_signals) if address_signals else {},
             'victim_signals': dict(victim_signals) if victim_signals else None,
+            'transfers': [
+                TransferRecord(**item)
+                for item in json.loads(transfers_json or '[]')
+            ],
+            'owners': [
+                OwnerBalance(owner_address=item.get('owner_address', ''), token_balances=dict(item.get('token_balances') or {}))
+                for item in json.loads(owners_json or '[]')
+            ],
         }
 
     def put(
@@ -113,13 +126,39 @@ class ContractSignalCache:
         )
         address_signals = analyze_transfer_signals(transfers)
         victim_signals = analyze_victim_signals_from_active_sellers(active_sellers, owners) if owners else None
+        transfers_json = json.dumps(
+            [
+                {
+                    'contract_address': item.contract_address,
+                    'token_id': item.token_id,
+                    'tx_hash': item.tx_hash,
+                    'log_index': item.log_index,
+                    'block_number': item.block_number,
+                    'block_time': item.block_time,
+                    'from_address': item.from_address,
+                    'to_address': item.to_address,
+                    'event_type': item.event_type,
+                    'source': item.source,
+                }
+                for item in transfers
+            ]
+        )
+        owners_json = json.dumps(
+            [
+                {
+                    'owner_address': item.owner_address,
+                    'token_balances': item.token_balances,
+                }
+                for item in owners
+            ]
+        )
         with self._lock:
             self._conn.execute(
                 '''
                 INSERT OR REPLACE INTO contract_signal_cache (
                     chain, contract_address, token_type, mint_recipients, active_sellers,
-                    address_signals, victim_signals
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    address_signals, victim_signals, transfers_json, owners_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''',
                 [
                     chain,
@@ -129,5 +168,7 @@ class ContractSignalCache:
                     active_sellers,
                     address_signals,
                     victim_signals,
+                    transfers_json,
+                    owners_json,
                 ],
             )

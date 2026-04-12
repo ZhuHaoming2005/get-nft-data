@@ -171,6 +171,48 @@ class TransferRecord:
 
 
 @dataclass(frozen=True)
+class NFTSaleRecord:
+    contract_address: str
+    token_id: str
+    tx_hash: str
+    block_number: int
+    log_index: int
+    bundle_index: int
+    buyer_address: str
+    seller_address: str
+    marketplace: str
+    taker: str
+    payment_token_symbol: str
+    payment_token_address: str = ''
+    price_eth: Optional[float] = None
+    seller_fee_eth: float = 0.0
+    protocol_fee_eth: float = 0.0
+    royalty_fee_eth: float = 0.0
+    source: str = 'alchemy'
+    is_native_eth: bool = False
+
+
+@dataclass(frozen=True)
+class TransactionReceiptRecord:
+    tx_hash: str
+    block_number: int
+    transaction_index: int
+    from_address: str
+    gas_used: int
+    effective_gas_price_wei: int
+
+
+@dataclass(frozen=True)
+class EthTransferRecord:
+    tx_hash: str
+    block_number: int
+    from_address: str
+    to_address: str
+    value_eth: float
+    category: str
+
+
+@dataclass(frozen=True)
 class OwnerBalance:
     owner_address: str
     token_balances: Dict[str, int]
@@ -1101,6 +1143,431 @@ def fetch_contract_owners(
     return owners
 
 
+def _decode_fee_eth(payload: Dict[str, Any]) -> tuple[float, str, str]:
+    amount_raw = str(payload.get('amount') or '0').strip()
+    symbol = str(payload.get('symbol') or '').strip().upper()
+    token_address = str(payload.get('contractAddress') or payload.get('tokenAddress') or '').lower()
+    try:
+        decimals = int(payload.get('decimals') or 18)
+    except (TypeError, ValueError):
+        decimals = 18
+    try:
+        amount = int(amount_raw or '0')
+    except ValueError:
+        amount = 0
+    return amount / float(10 ** max(decimals, 0)), symbol, token_address
+
+
+def _alchemy_sales_base(network: str, api_key: str) -> str:
+    return f'https://{network}.g.alchemy.com/nft/v2/{api_key}/getNFTSales'
+
+
+def _looks_like_real_api_key(value: str) -> bool:
+    text = (value or '').strip()
+    if len(text) < 12:
+        return False
+    return text.casefold() not in {'alchemy', 'etherscan', 'opensea', 'key'}
+
+
+def fetch_alchemy_nft_sales(
+    *,
+    api_key: str,
+    network: str,
+    contract_address: str,
+    token_id: str = '',
+    timeout: int = DEFAULT_TIMEOUT,
+    session=None,
+) -> List[NFTSaleRecord]:
+    _require_requests()
+    endpoint = _alchemy_sales_base(network, api_key)
+    page_key = ''
+    rows: List[NFTSaleRecord] = []
+    while True:
+        params = {
+            'fromBlock': '0',
+            'toBlock': 'latest',
+            'order': 'asc',
+            'contractAddress': contract_address,
+        }
+        if token_id:
+            params['tokenId'] = token_id
+        if page_key:
+            params['pageKey'] = page_key
+        url = f'{endpoint}?{urlencode(params)}'
+        payload = _alchemy_get_json(url=url, timeout=timeout, session=session)
+        for item in payload.get('nftSales') or []:
+            seller_fee_eth, fee_symbol, fee_token_address = _decode_fee_eth(item.get('sellerFee') or {})
+            protocol_fee_eth, protocol_symbol, protocol_token_address = _decode_fee_eth(item.get('protocolFee') or {})
+            royalty_fee_eth, royalty_symbol, royalty_token_address = _decode_fee_eth(item.get('royaltyFee') or {})
+            symbols = {value for value in [fee_symbol, protocol_symbol, royalty_symbol] if value}
+            native_eth = bool(symbols) and symbols == {'ETH'}
+            payment_symbol = fee_symbol or protocol_symbol or royalty_symbol
+            payment_token_address = fee_token_address or protocol_token_address or royalty_token_address
+            rows.append(
+                NFTSaleRecord(
+                    contract_address=str(item.get('contractAddress') or contract_address).lower(),
+                    token_id=_normalize_token_id(item.get('tokenId') or ''),
+                    tx_hash=str(item.get('transactionHash') or '').lower(),
+                    block_number=int(item.get('blockNumber') or 0),
+                    log_index=int(item.get('logIndex') or 0),
+                    bundle_index=int(item.get('bundleIndex') or 0),
+                    buyer_address=str(item.get('buyerAddress') or '').lower(),
+                    seller_address=str(item.get('sellerAddress') or '').lower(),
+                    marketplace=str(item.get('marketplace') or ''),
+                    taker=str(item.get('taker') or ''),
+                    payment_token_symbol=payment_symbol,
+                    payment_token_address=payment_token_address,
+                    price_eth=(seller_fee_eth + protocol_fee_eth + royalty_fee_eth) if native_eth else None,
+                    seller_fee_eth=seller_fee_eth,
+                    protocol_fee_eth=protocol_fee_eth,
+                    royalty_fee_eth=royalty_fee_eth,
+                    source='alchemy',
+                    is_native_eth=native_eth,
+                )
+            )
+        page_key = str(payload.get('pageKey') or '')
+        if not page_key:
+            break
+    return rows
+
+
+def fetch_opensea_nft_events(
+    *,
+    contract_address: str,
+    token_id: str = '',
+    opensea_api_key: str,
+    timeout: int = DEFAULT_TIMEOUT,
+    session=None,
+) -> List[NFTSaleRecord]:
+    _require_requests()
+    client = session or requests
+    headers = {'accept': 'application/json', 'x-api-key': opensea_api_key}
+    params = {'event_type': 'sale'}
+    if token_id:
+        url = f'https://api.opensea.io/api/v2/events/chain/ethereum/contract/{contract_address}/nfts/{token_id}'
+    else:
+        url = 'https://api.opensea.io/api/v2/events'
+        params['asset_contract_address'] = contract_address
+        params['chain'] = 'ethereum'
+    response = client.get(url, params=params, headers=headers, timeout=timeout)
+    response.raise_for_status()
+    payload = response.json()
+    events = payload.get('asset_events') or payload.get('events') or []
+    rows: List[NFTSaleRecord] = []
+    for item in events:
+        event_type = str(item.get('event_type') or item.get('eventType') or '').casefold()
+        if event_type and event_type != 'sale':
+            continue
+        nft = item.get('nft') or item.get('asset') or {}
+        payment = item.get('payment') or item.get('payment_token') or {}
+        payment_symbol = str(payment.get('symbol') or item.get('payment_token_symbol') or '').upper()
+        payment_token_address = str(payment.get('address') or payment.get('token_address') or '').lower()
+        value_eth = None
+        if payment_symbol == 'ETH':
+            raw_value = item.get('payment_quantity') or item.get('price') or item.get('total_price') or '0'
+            try:
+                value_eth = int(str(raw_value), 10) / float(10 ** 18)
+            except ValueError:
+                try:
+                    value_eth = float(raw_value)
+                except (TypeError, ValueError):
+                    value_eth = None
+        rows.append(
+            NFTSaleRecord(
+                contract_address=str(
+                    nft.get('contract')
+                    or nft.get('contract_address')
+                    or item.get('asset_contract_address')
+                    or contract_address
+                ).lower(),
+                token_id=_normalize_token_id(nft.get('identifier') or nft.get('token_id') or token_id),
+                tx_hash=str(item.get('transaction') or item.get('transaction_hash') or item.get('order_hash') or '').lower(),
+                block_number=int(item.get('block_number') or 0),
+                log_index=int(item.get('event_index') or item.get('log_index') or 0),
+                bundle_index=int(item.get('bundle_index') or 0),
+                buyer_address=str(item.get('to_account', {}).get('address') or item.get('winner_account', {}).get('address') or '').lower(),
+                seller_address=str(item.get('from_account', {}).get('address') or item.get('seller', {}).get('address') or '').lower(),
+                marketplace='opensea',
+                taker=str(item.get('taker') or ''),
+                payment_token_symbol=payment_symbol,
+                payment_token_address=payment_token_address,
+                price_eth=value_eth if payment_symbol == 'ETH' else None,
+                seller_fee_eth=value_eth or 0.0 if payment_symbol == 'ETH' else 0.0,
+                protocol_fee_eth=0.0,
+                royalty_fee_eth=0.0,
+                source='opensea',
+                is_native_eth=(payment_symbol == 'ETH'),
+            )
+        )
+    return rows
+
+
+def fetch_contract_sales(
+    *,
+    alchemy_api_key: str,
+    alchemy_network: str,
+    contract_address: str,
+    opensea_api_key: str = '',
+    timeout: int = DEFAULT_TIMEOUT,
+    session=None,
+) -> List[NFTSaleRecord]:
+    sales = fetch_alchemy_nft_sales(
+        api_key=alchemy_api_key,
+        network=alchemy_network,
+        contract_address=contract_address,
+        timeout=timeout,
+        session=session,
+    )
+    if sales or not opensea_api_key:
+        return sales
+    return fetch_opensea_nft_events(
+        contract_address=contract_address,
+        opensea_api_key=opensea_api_key,
+        timeout=timeout,
+        session=session,
+    )
+
+
+def fetch_transaction_receipt(
+    *,
+    api_key: str,
+    network: str,
+    tx_hash: str,
+    timeout: int = DEFAULT_TIMEOUT,
+    session=None,
+) -> TransactionReceiptRecord:
+    body = _alchemy_post_json(
+        url=_alchemy_rpc_base(network, api_key),
+        payload={
+            'jsonrpc': '2.0',
+            'id': 1,
+            'method': 'eth_getTransactionReceipt',
+            'params': [tx_hash],
+        },
+        timeout=timeout,
+        session=session,
+    )
+    result = body.get('result') or {}
+    return TransactionReceiptRecord(
+        tx_hash=str(result.get('transactionHash') or tx_hash).lower(),
+        block_number=int(str(result.get('blockNumber') or '0'), 16) if str(result.get('blockNumber') or '').startswith('0x') else int(result.get('blockNumber') or 0),
+        transaction_index=int(str(result.get('transactionIndex') or '0'), 16) if str(result.get('transactionIndex') or '').startswith('0x') else int(result.get('transactionIndex') or 0),
+        from_address=str(result.get('from') or '').lower(),
+        gas_used=int(str(result.get('gasUsed') or '0'), 16) if str(result.get('gasUsed') or '').startswith('0x') else int(result.get('gasUsed') or 0),
+        effective_gas_price_wei=int(str(result.get('effectiveGasPrice') or '0'), 16) if str(result.get('effectiveGasPrice') or '').startswith('0x') else int(result.get('effectiveGasPrice') or 0),
+    )
+
+
+def fetch_transaction_receipts_for_block(
+    *,
+    api_key: str,
+    network: str,
+    block_number: int,
+    timeout: int = DEFAULT_TIMEOUT,
+    session=None,
+) -> Dict[str, TransactionReceiptRecord]:
+    body = _alchemy_post_json(
+        url=_alchemy_rpc_base(network, api_key),
+        payload={
+            'jsonrpc': '2.0',
+            'id': 1,
+            'method': 'alchemy_getTransactionReceipts',
+            'params': [{'blockNumber': hex(block_number)}],
+        },
+        timeout=timeout,
+        session=session,
+    )
+    result = body.get('result') or {}
+    rows: Dict[str, TransactionReceiptRecord] = {}
+    for item in result.get('receipts') or []:
+        tx_hash = str(item.get('transactionHash') or '').lower()
+        if not tx_hash:
+            continue
+        rows[tx_hash] = TransactionReceiptRecord(
+            tx_hash=tx_hash,
+            block_number=block_number,
+            transaction_index=int(str(item.get('transactionIndex') or '0'), 16) if str(item.get('transactionIndex') or '').startswith('0x') else int(item.get('transactionIndex') or 0),
+            from_address=str(item.get('from') or '').lower(),
+            gas_used=int(str(item.get('gasUsed') or '0'), 16) if str(item.get('gasUsed') or '').startswith('0x') else int(item.get('gasUsed') or 0),
+            effective_gas_price_wei=int(str(item.get('effectiveGasPrice') or '0'), 16) if str(item.get('effectiveGasPrice') or '').startswith('0x') else int(item.get('effectiveGasPrice') or 0),
+        )
+    return rows
+
+
+def fetch_eth_balance(
+    *,
+    api_key: str,
+    network: str,
+    address: str,
+    block_number: int,
+    timeout: int = DEFAULT_TIMEOUT,
+    session=None,
+) -> float:
+    if block_number < 0:
+        return 0.0
+    body = _alchemy_post_json(
+        url=_alchemy_rpc_base(network, api_key),
+        payload={
+            'jsonrpc': '2.0',
+            'id': 1,
+            'method': 'eth_getBalance',
+            'params': [address, hex(block_number)],
+        },
+        timeout=timeout,
+        session=session,
+    )
+    value = str(body.get('result') or '0x0')
+    return int(value, 16) / float(10 ** 18)
+
+
+def _fetch_address_eth_transfers(
+    *,
+    api_key: str,
+    network: str,
+    block_number: int,
+    address: str,
+    direction: str,
+    timeout: int = DEFAULT_TIMEOUT,
+    session=None,
+) -> List[EthTransferRecord]:
+    params: Dict[str, Any] = {
+        'fromBlock': hex(block_number),
+        'toBlock': hex(block_number),
+        'category': ['external', 'internal'],
+        'withMetadata': False,
+        'excludeZeroValue': True,
+        'maxCount': '0x3e8',
+        'order': 'asc',
+    }
+    if direction == 'from':
+        params['fromAddress'] = address
+    else:
+        params['toAddress'] = address
+
+    body = _alchemy_post_json(
+        url=_alchemy_rpc_base(network, api_key),
+        payload={
+            'jsonrpc': '2.0',
+            'id': 1,
+            'method': 'alchemy_getAssetTransfers',
+            'params': [params],
+        },
+        timeout=timeout,
+        session=session,
+    )
+    result = body.get('result') or {}
+    rows: List[EthTransferRecord] = []
+    for item in result.get('transfers') or []:
+        value_raw = item.get('value')
+        if value_raw is None:
+            value_raw = (item.get('rawContract') or {}).get('value')
+        if isinstance(value_raw, str) and value_raw.startswith('0x'):
+            value_eth = int(value_raw, 16) / float(10 ** 18)
+        else:
+            try:
+                value_eth = float(value_raw or 0)
+            except (TypeError, ValueError):
+                value_eth = 0.0
+        rows.append(
+            EthTransferRecord(
+                tx_hash=str(item.get('hash') or '').lower(),
+                block_number=block_number,
+                from_address=str(item.get('from') or '').lower(),
+                to_address=str(item.get('to') or '').lower(),
+                value_eth=value_eth,
+                category=str(item.get('category') or ''),
+            )
+        )
+    return rows
+
+
+def fetch_same_block_eth_transfers_for_address(
+    *,
+    api_key: str,
+    network: str,
+    block_number: int,
+    address: str,
+    timeout: int = DEFAULT_TIMEOUT,
+    session=None,
+) -> List[EthTransferRecord]:
+    rows = _fetch_address_eth_transfers(
+        api_key=api_key,
+        network=network,
+        block_number=block_number,
+        address=address,
+        direction='from',
+        timeout=timeout,
+        session=session,
+    )
+    rows.extend(
+        _fetch_address_eth_transfers(
+            api_key=api_key,
+            network=network,
+            block_number=block_number,
+            address=address,
+            direction='to',
+            timeout=timeout,
+            session=session,
+        )
+    )
+    deduped: Dict[tuple[str, str, str, float], EthTransferRecord] = {}
+    for row in rows:
+        key = (row.tx_hash, row.from_address, row.to_address, row.value_eth)
+        deduped[key] = row
+    return list(deduped.values())
+
+
+def calculate_sale_eth_metrics(
+    *,
+    sale: NFTSaleRecord,
+    purchase_receipt: TransactionReceiptRecord,
+    base_balance_eth: float,
+    same_block_transfers: Sequence[EthTransferRecord],
+    receipts_by_hash: Dict[str, TransactionReceiptRecord],
+) -> Dict[str, Any]:
+    metrics = {
+        'buy_before_eth_balance': None,
+        'buy_amount_eth': sale.price_eth,
+        'buy_total_eth_out': sale.price_eth,
+        'buy_asset_ratio': None,
+        'buy_asset_ratio_with_gas': None,
+        'gas_not_attributed': False,
+        'ratio_status': 'unavailable',
+    }
+    if not sale.is_native_eth or sale.price_eth is None:
+        return metrics
+
+    same_block_delta = 0.0
+    for transfer in same_block_transfers:
+        receipt = receipts_by_hash.get(transfer.tx_hash)
+        if receipt is None:
+            return metrics
+        if receipt.transaction_index >= purchase_receipt.transaction_index:
+            continue
+        if transfer.to_address == sale.buyer_address:
+            same_block_delta += transfer.value_eth
+        if transfer.from_address == sale.buyer_address:
+            same_block_delta -= transfer.value_eth
+
+    buy_before_eth_balance = base_balance_eth + same_block_delta
+    buy_total_eth_out = sale.price_eth
+    gas_not_attributed = purchase_receipt.from_address != sale.buyer_address
+    if not gas_not_attributed:
+        buy_total_eth_out += (purchase_receipt.gas_used * purchase_receipt.effective_gas_price_wei) / float(10 ** 18)
+    metrics.update(
+        {
+            'buy_before_eth_balance': buy_before_eth_balance,
+            'buy_total_eth_out': buy_total_eth_out,
+            'gas_not_attributed': gas_not_attributed,
+        }
+    )
+    if buy_before_eth_balance > 0:
+        metrics['buy_asset_ratio'] = sale.price_eth / buy_before_eth_balance
+        metrics['buy_asset_ratio_with_gas'] = buy_total_eth_out / buy_before_eth_balance
+        metrics['ratio_status'] = 'ok'
+    return metrics
+
+
 def analyze_contract_transfers(transfers: Sequence[TransferRecord]) -> Dict[str, Any]:
     from .rust_bridge import analyze_transfer_signals
 
@@ -1116,12 +1583,209 @@ def analyze_contract_victims(
     return analyze_victim_signals(transfers, owners)
 
 
+def _transfer_sort_key(transfer: TransferRecord) -> tuple[int, int, str]:
+    return (int(transfer.block_number or 0), int(transfer.log_index or 0), transfer.tx_hash)
+
+
+def _sale_sort_key(sale: NFTSaleRecord) -> tuple[int, int, int, str]:
+    return (int(sale.block_number or 0), int(sale.log_index or 0), int(sale.bundle_index or 0), sale.tx_hash)
+
+
+def build_infringing_token_records(
+    *,
+    contract_address: str,
+    contract_candidates: Sequence[DuplicateCandidate],
+    transfers: Sequence[TransferRecord],
+    official_addresses: set[str],
+) -> List[Dict[str, Any]]:
+    transfers_by_token: Dict[str, List[TransferRecord]] = defaultdict(list)
+    for transfer in transfers:
+        if transfer.token_id:
+            transfers_by_token[transfer.token_id].append(transfer)
+
+    rows: List[Dict[str, Any]] = []
+    for candidate in sorted(contract_candidates, key=lambda item: (item.token_id, item.contract_address)):
+        token_transfers = sorted(transfers_by_token.get(candidate.token_id, []), key=_transfer_sort_key)
+        mint_transfer = next((row for row in token_transfers if row.from_address == ZERO_ADDRESS), None)
+        first_transfer = token_transfers[0] if token_transfers else None
+        minter_address = ''
+        mint_tx_hash = ''
+        mint_block = 0
+        first_transfer_time = 0
+        if mint_transfer is not None:
+            minter_address = mint_transfer.to_address
+            mint_tx_hash = mint_transfer.tx_hash
+            mint_block = mint_transfer.block_number
+            first_transfer_time = mint_transfer.block_time
+        elif first_transfer is not None:
+            minter_address = first_transfer.to_address
+            mint_tx_hash = first_transfer.tx_hash
+            mint_block = first_transfer.block_number
+            first_transfer_time = first_transfer.block_time
+        rows.append(
+            {
+                'contract_address': contract_address,
+                'token_id': candidate.token_id,
+                'mint_tx_hash': mint_tx_hash,
+                'mint_block': mint_block,
+                'minter_address': minter_address,
+                'first_transfer_time': first_transfer_time,
+                'history_window': 'full',
+                'match_reasons': list(candidate.match_reasons),
+                'official_or_legit_reissue': bool(minter_address and minter_address in official_addresses),
+            }
+        )
+    return rows
+
+
+def build_malicious_address_records(
+    *,
+    contract_address: str,
+    transfers: Sequence[TransferRecord],
+    infringing_tokens: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    relevant_token_ids = {str(item.get('token_id') or '') for item in infringing_tokens if item.get('token_id')}
+    mint_addresses = {str(item.get('minter_address') or '') for item in infringing_tokens if item.get('minter_address')}
+    outgoing: Dict[str, set[str]] = defaultdict(set)
+    cycle_counts: Dict[str, int] = defaultdict(int)
+    seen_pairs: set[tuple[str, str]] = set()
+    rapid_addresses: set[str] = set()
+    mint_times: Dict[str, int] = {}
+
+    for transfer in sorted(transfers, key=_transfer_sort_key):
+        if relevant_token_ids and transfer.token_id not in relevant_token_ids:
+            continue
+        if transfer.from_address == ZERO_ADDRESS:
+            if transfer.to_address:
+                mint_times[transfer.token_id] = transfer.block_time
+            continue
+        if transfer.from_address and transfer.to_address:
+            outgoing[transfer.from_address].add(transfer.to_address)
+            pair = (transfer.from_address, transfer.to_address)
+            reverse = (transfer.to_address, transfer.from_address)
+            if reverse in seen_pairs:
+                cycle_counts[transfer.from_address] += 1
+                cycle_counts[transfer.to_address] += 1
+            seen_pairs.add(pair)
+        mint_time = mint_times.get(transfer.token_id, 0)
+        if mint_time and transfer.block_time and transfer.block_time - mint_time <= 24 * 3600:
+            if transfer.from_address:
+                rapid_addresses.add(transfer.from_address)
+            if transfer.to_address:
+                rapid_addresses.add(transfer.to_address)
+
+    candidate_addresses = sorted(
+        {
+            *mint_addresses,
+            *outgoing.keys(),
+            *(transfer.to_address for transfer in transfers if transfer.to_address and transfer.token_id in relevant_token_ids),
+        }
+    )
+    rows: List[Dict[str, Any]] = []
+    for address in candidate_addresses:
+        if not address:
+            continue
+        mint_role = address in mint_addresses
+        wash_cycle_count = cycle_counts.get(address, 0)
+        star_out_degree = len(outgoing.get(address, set()))
+        if not mint_role and not wash_cycle_count and not star_out_degree and address not in rapid_addresses:
+            continue
+        rows.append(
+            {
+                'address': address,
+                'mint_role': mint_role,
+                'wash_cycle_count': wash_cycle_count,
+                'star_out_degree': star_out_degree,
+                'rapid_spread_contracts': [contract_address] if address in rapid_addresses else [],
+                'evidence_contracts': [contract_address],
+            }
+        )
+    return rows
+
+
+def build_victim_address_records(
+    *,
+    contract_address: str,
+    sales: Sequence[NFTSaleRecord],
+    transfers: Sequence[TransferRecord],
+    owners: Sequence[OwnerBalance],
+    sale_metrics_by_tx: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    owner_token_map: Dict[str, set[str]] = {}
+    for owner in owners:
+        held_tokens = {token_id for token_id, balance in owner.token_balances.items() if balance > 0}
+        if held_tokens:
+            owner_token_map[owner.owner_address] = held_tokens
+
+    grouped: Dict[str, Dict[str, Any]] = {}
+    last_buy_key: Dict[str, tuple[int, int, int, str]] = {}
+    sorted_transfers = sorted(transfers, key=_transfer_sort_key)
+    for sale in sorted(sales, key=_sale_sort_key):
+        buyer = sale.buyer_address
+        if not buyer:
+            continue
+        metrics = sale_metrics_by_tx.get(sale.tx_hash, {})
+        later_transfer_out = any(
+            transfer.token_id == sale.token_id
+            and transfer.from_address == buyer
+            and _transfer_sort_key(transfer) > (sale.block_number, sale.log_index, sale.tx_hash)
+            for transfer in sorted_transfers
+        )
+        is_stuck = sale.token_id in owner_token_map.get(buyer, set()) and not later_transfer_out
+        entry = grouped.setdefault(
+            buyer,
+            {
+                'address': buyer,
+                'buy_tx_hashes': [],
+                'buy_amount_eth': 0.0,
+                'buy_before_eth_balance': None,
+                'buy_asset_ratio': None,
+                'buy_asset_ratio_with_gas': None,
+                'is_stuck': False,
+                'last_buy_tx_hash': '',
+                'ratio_status': 'unavailable',
+            },
+        )
+        entry['buy_tx_hashes'].append(sale.tx_hash)
+        if sale.is_native_eth and sale.price_eth is not None:
+            entry['buy_amount_eth'] += sale.price_eth
+        current_key = _sale_sort_key(sale)
+        if buyer not in last_buy_key or current_key >= last_buy_key[buyer]:
+            last_buy_key[buyer] = current_key
+            entry['last_buy_tx_hash'] = sale.tx_hash
+            entry['buy_before_eth_balance'] = metrics.get('buy_before_eth_balance')
+            entry['buy_asset_ratio'] = metrics.get('buy_asset_ratio')
+            entry['buy_asset_ratio_with_gas'] = metrics.get('buy_asset_ratio_with_gas')
+            entry['ratio_status'] = metrics.get('ratio_status', 'unavailable')
+        entry['is_stuck'] = bool(entry['is_stuck'] or is_stuck)
+    return sorted(grouped.values(), key=lambda item: item['address'])
+
+
+def build_fraud_trade_stats(
+    *,
+    contract_address: str,
+    sales: Sequence[NFTSaleRecord],
+    victim_addresses: Sequence[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    native_sales = [sale for sale in sales if sale.is_native_eth and sale.price_eth is not None]
+    return {
+        contract_address: {
+            'unique_buyers': len({sale.buyer_address for sale in sales if sale.buyer_address}),
+            'native_eth_sale_count': len(native_sales),
+            'native_eth_volume': sum(sale.price_eth or 0.0 for sale in native_sales),
+            'stuck_wallet_count': sum(1 for item in victim_addresses if item.get('is_stuck')),
+            'stuck_cost_eth': sum(float(item.get('buy_amount_eth') or 0.0) for item in victim_addresses if item.get('is_stuck')),
+        }
+    }
+
+
 def _analyze_high_confidence_contract(
     *,
     chain: str,
     network: str,
     alchemy_api_key: str,
     etherscan_api_key: str,
+    opensea_api_key: str,
     contract_address: str,
     contract_candidates: Sequence[DuplicateCandidate],
     token_type: str,
@@ -1138,8 +1802,8 @@ def _analyze_high_confidence_contract(
         active_sellers = cached.get('active_sellers') or []
         cached_address_signals = cached.get('address_signals') or {}
         cached_victim_signals = cached.get('victim_signals')
-        transfers: List[TransferRecord] = []
-        owners: List[OwnerBalance] = []
+        transfers = cached.get('transfers') or []
+        owners = cached.get('owners') or []
     else:
         transfers = fetch_contract_transfers(
             alchemy_api_key=alchemy_api_key,
@@ -1161,12 +1825,20 @@ def _analyze_high_confidence_contract(
         cached_address_signals = analyze_contract_transfers(transfers)
         cached_victim_signals = None
 
+    infringing_tokens = build_infringing_token_records(
+        contract_address=contract_address,
+        contract_candidates=contract_candidates,
+        transfers=transfers,
+        official_addresses=official_addresses,
+    )
+
     result = {
         'contract_address': contract_address,
         'candidate_count': len(contract_candidates),
         'match_reasons': sorted({reason for item in contract_candidates for reason in item.match_reasons}),
+        'infringing_tokens': infringing_tokens,
     }
-    if mint_recipients & official_addresses:
+    if infringing_tokens and all(item.get('official_or_legit_reissue') for item in infringing_tokens):
         if signal_cache is not None and cached is None:
             signal_cache.put(
                 chain=chain,
@@ -1179,7 +1851,7 @@ def _analyze_high_confidence_contract(
         result['mint_recipients'] = sorted(mint_recipients)
         return result
 
-    if cached_victim_signals is None:
+    if cached_victim_signals is None or not owners:
         owners = fetch_contract_owners(
             api_key=alchemy_api_key,
             network=network,
@@ -1199,9 +1871,112 @@ def _analyze_high_confidence_contract(
                 owners=owners,
             )
 
+    sales: List[NFTSaleRecord] = []
+    if _looks_like_real_api_key(alchemy_api_key) or opensea_api_key:
+        try:
+            sales = fetch_contract_sales(
+                alchemy_api_key=alchemy_api_key,
+                alchemy_network=network,
+                contract_address=contract_address,
+                opensea_api_key=opensea_api_key,
+                timeout=timeout,
+                session=session,
+            )
+        except Exception as exc:
+            logger.warning('contract sales fetch failed for %s: %s', contract_address, exc)
+    sale_metrics_by_tx: Dict[str, Dict[str, Any]] = {}
+    receipts_by_block: Dict[int, Dict[str, TransactionReceiptRecord]] = {}
+    for sale in sales:
+        if not sale.is_native_eth or sale.price_eth is None:
+            sale_metrics_by_tx[sale.tx_hash] = {
+                'buy_before_eth_balance': None,
+                'buy_amount_eth': None,
+                'buy_total_eth_out': None,
+                'buy_asset_ratio': None,
+                'buy_asset_ratio_with_gas': None,
+                'gas_not_attributed': False,
+                'ratio_status': 'unavailable',
+            }
+            continue
+        try:
+            purchase_receipt = fetch_transaction_receipt(
+                api_key=alchemy_api_key,
+                network=network,
+                tx_hash=sale.tx_hash,
+                timeout=timeout,
+                session=session,
+            )
+            base_balance_eth = fetch_eth_balance(
+                api_key=alchemy_api_key,
+                network=network,
+                address=sale.buyer_address,
+                block_number=sale.block_number - 1,
+                timeout=timeout,
+                session=session,
+            )
+            same_block_transfers = fetch_same_block_eth_transfers_for_address(
+                api_key=alchemy_api_key,
+                network=network,
+                block_number=sale.block_number,
+                address=sale.buyer_address,
+                timeout=timeout,
+                session=session,
+            )
+            block_receipts: Dict[str, TransactionReceiptRecord] = {}
+            if same_block_transfers:
+                block_receipts = receipts_by_block.get(sale.block_number) or {}
+                if not block_receipts:
+                    block_receipts = fetch_transaction_receipts_for_block(
+                        api_key=alchemy_api_key,
+                        network=network,
+                        block_number=sale.block_number,
+                        timeout=timeout,
+                        session=session,
+                    )
+                    receipts_by_block[sale.block_number] = block_receipts
+            sale_metrics_by_tx[sale.tx_hash] = calculate_sale_eth_metrics(
+                sale=sale,
+                purchase_receipt=purchase_receipt,
+                base_balance_eth=base_balance_eth,
+                same_block_transfers=same_block_transfers,
+                receipts_by_hash=block_receipts,
+            )
+        except Exception as exc:
+            logger.warning('sale ETH metric computation failed for %s %s: %s', contract_address, sale.tx_hash, exc)
+            sale_metrics_by_tx[sale.tx_hash] = {
+                'buy_before_eth_balance': None,
+                'buy_amount_eth': sale.price_eth,
+                'buy_total_eth_out': sale.price_eth,
+                'buy_asset_ratio': None,
+                'buy_asset_ratio_with_gas': None,
+                'gas_not_attributed': False,
+                'ratio_status': 'unavailable',
+            }
+
+    malicious_addresses = build_malicious_address_records(
+        contract_address=contract_address,
+        transfers=transfers,
+        infringing_tokens=infringing_tokens,
+    )
+    victim_addresses = build_victim_address_records(
+        contract_address=contract_address,
+        sales=sales,
+        transfers=transfers,
+        owners=owners,
+        sale_metrics_by_tx=sale_metrics_by_tx,
+    )
+    fraud_trade_stats = build_fraud_trade_stats(
+        contract_address=contract_address,
+        sales=sales,
+        victim_addresses=victim_addresses,
+    )
+
     result['status'] = 'high'
     result['address_signals'] = cached_address_signals
     result['victim_signals'] = cached_victim_signals
+    result['malicious_addresses'] = malicious_addresses
+    result['victim_addresses'] = victim_addresses
+    result['fraud_trade_stats'] = fraud_trade_stats
     return result
 
 
@@ -1212,6 +1987,7 @@ def analyze_seed_contract(
     alchemy_api_key: str,
     alchemy_network: str | None = None,
     etherscan_api_key: str = '',
+    opensea_api_key: str = '',
     conn=None,
     feature_store=None,
     signal_cache=None,
@@ -1297,6 +2073,10 @@ def analyze_seed_contract(
             low_confidence: List[Dict[str, Any]] = []
             address_signals: Dict[str, Any] = {}
             victim_signals: Dict[str, Any] = {}
+            infringing_tokens: List[Dict[str, Any]] = []
+            malicious_addresses: List[Dict[str, Any]] = []
+            victim_addresses: List[Dict[str, Any]] = []
+            fraud_trade_stats: Dict[str, Dict[str, Any]] = {}
             token_type = contract_meta.token_type or 'ERC721'
             high_confidence_items: List[Tuple[str, Sequence[DuplicateCandidate]]] = []
 
@@ -1322,6 +2102,7 @@ def analyze_seed_contract(
                             network=network,
                             alchemy_api_key=alchemy_api_key,
                             etherscan_api_key=etherscan_api_key,
+                            opensea_api_key=opensea_api_key,
                             contract_address=item[0],
                             contract_candidates=item[1],
                             token_type=token_type,
@@ -1347,6 +2128,10 @@ def analyze_seed_contract(
                         })
                         address_signals[contract_address] = result['address_signals']
                         victim_signals[contract_address] = result['victim_signals']
+                        infringing_tokens.extend(result.get('infringing_tokens') or [])
+                        malicious_addresses.extend(result.get('malicious_addresses') or [])
+                        victim_addresses.extend(result.get('victim_addresses') or [])
+                        fraud_trade_stats.update(result.get('fraud_trade_stats') or {})
 
             if open_license:
                 high_confidence = []
@@ -1375,6 +2160,10 @@ def analyze_seed_contract(
                 },
                 'address_signals': address_signals,
                 'victim_signals': victim_signals,
+                'infringing_tokens': infringing_tokens,
+                'malicious_addresses': malicious_addresses,
+                'victim_addresses': victim_addresses,
+                'fraud_trade_stats': fraud_trade_stats,
                 'report_summary': {
                     'open_license_detected': open_license,
                     'candidate_contract_count': len(grouped),
@@ -1552,6 +2341,10 @@ def render_human_readable_report(payload: Dict[str, Any]) -> str:
     legit = payload.get('legit_duplicates') or []
     address_signals = payload.get('address_signals') or {}
     victim_signals = payload.get('victim_signals') or {}
+    infringing_tokens = payload.get('infringing_tokens') or []
+    malicious_addresses = payload.get('malicious_addresses') or []
+    victim_addresses = payload.get('victim_addresses') or []
+    fraud_trade_stats = payload.get('fraud_trade_stats') or {}
 
     lines = [
         '# Top NFT 合约重复样本分析报告',
@@ -1616,6 +2409,19 @@ def render_human_readable_report(payload: Dict[str, Any]) -> str:
     else:
         lines.append('- 无')
 
+    lines.extend(['', '## 侵权 NFT 历史记录'])
+    if infringing_tokens:
+        for item in infringing_tokens:
+            lines.append(
+                f"- {item.get('contract_address', '')}#{item.get('token_id', '')}: "
+                f"mint_tx={item.get('mint_tx_hash', '') or 'n/a'} | "
+                f"mint_block={item.get('mint_block', 0)} | "
+                f"minter={item.get('minter_address', '') or 'unknown'} | "
+                f"match_reasons={', '.join(item.get('match_reasons') or [])}"
+            )
+    else:
+        lines.append('- 无')
+
     lines.extend(['', '## 地址行为信号'])
     if address_signals:
         for contract, signal in address_signals.items():
@@ -1632,6 +2438,18 @@ def render_human_readable_report(payload: Dict[str, Any]) -> str:
     else:
         lines.append('- 无')
 
+    lines.extend(['', '## 恶意地址画像'])
+    if malicious_addresses:
+        for item in malicious_addresses:
+            lines.append(
+                f"- {item.get('address', '')}: mint_role={'是' if item.get('mint_role') else '否'} | "
+                f"wash_cycle_count={item.get('wash_cycle_count', 0)} | "
+                f"star_out_degree={item.get('star_out_degree', 0)} | "
+                f"evidence_contracts={', '.join(item.get('evidence_contracts') or [])}"
+            )
+    else:
+        lines.append('- 无')
+
     lines.extend(['', '## 受害者信号'])
     if victim_signals:
         for contract, signal in victim_signals.items():
@@ -1645,6 +2463,33 @@ def render_human_readable_report(payload: Dict[str, Any]) -> str:
     else:
         lines.append('- 无')
 
+    lines.extend(['', '## 被骗地址画像'])
+    if victim_addresses:
+        for item in victim_addresses:
+            lines.append(
+                f"- {item.get('address', '')}: buy_tx_count={len(item.get('buy_tx_hashes') or [])} | "
+                f"买入金额(ETH)={item.get('buy_amount_eth', 0)} | "
+                f"买入前 ETH 余额: {item.get('buy_before_eth_balance')} | "
+                f"买入占比={_format_ratio(item.get('buy_asset_ratio'))} | "
+                f"套牢={'是' if item.get('is_stuck') else '否'} | "
+                f"last_buy_tx={item.get('last_buy_tx_hash', '') or 'n/a'}"
+            )
+    else:
+        lines.append('- 无')
+
+    lines.extend(['', '## 被骗交易与套牢资金'])
+    if fraud_trade_stats:
+        for contract, stats in fraud_trade_stats.items():
+            lines.append(
+                f"- {contract}: unique_buyers={stats.get('unique_buyers', 0)} | "
+                f"native_eth_sale_count={stats.get('native_eth_sale_count', 0)} | "
+                f"native_eth_volume={stats.get('native_eth_volume', 0)} | "
+                f"stuck_wallet_count={stats.get('stuck_wallet_count', 0)} | "
+                f"stuck_cost_eth={stats.get('stuck_cost_eth', 0)}"
+            )
+    else:
+        lines.append('- 无')
+
     return '\n'.join(lines) + '\n'
 
 
@@ -1655,6 +2500,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--alchemy-api-key', default=os.getenv('ALCHEMY_API_KEY', ''))
     parser.add_argument('--alchemy-network', default='')
     parser.add_argument('--etherscan-api-key', default=os.getenv('ETHERSCAN_API_KEY', ''))
+    parser.add_argument('--opensea-api-key', default=os.getenv('OPENSEA_API_KEY', ''))
     parser.add_argument('--name-threshold', type=float, default=DEFAULT_NAME_THRESHOLD)
     parser.add_argument('--metadata-threshold', type=float, default=0.55)
     parser.add_argument('--timeout', type=int, default=DEFAULT_TIMEOUT)
@@ -1688,6 +2534,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             alchemy_api_key=args.alchemy_api_key,
             alchemy_network=args.alchemy_network or None,
             etherscan_api_key=args.etherscan_api_key,
+            opensea_api_key=args.opensea_api_key,
             feature_store=feature_store,
             signal_cache=signal_cache,
             name_threshold=args.name_threshold,

@@ -263,6 +263,238 @@ class TransferFallbackTests(unittest.TestCase):
         self.assertEqual(etherscan_mock.call_count, 1)
 
 
+class SalesAnalysisTests(unittest.TestCase):
+    def test_fetch_alchemy_nft_sales_parses_native_eth_and_non_native_sales(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            'nftSales': [
+                {
+                    'marketplace': 'seaport',
+                    'contractAddress': '0xdup',
+                    'tokenId': '1',
+                    'buyerAddress': '0xbuyer',
+                    'sellerAddress': '0xseller',
+                    'taker': 'BUYER',
+                    'sellerFee': {'amount': '2000000000000000000', 'symbol': 'ETH', 'decimals': 18},
+                    'protocolFee': {'amount': '100000000000000000', 'symbol': 'ETH', 'decimals': 18},
+                    'royaltyFee': {'amount': '200000000000000000', 'symbol': 'ETH', 'decimals': 18},
+                    'blockNumber': 11,
+                    'logIndex': 7,
+                    'bundleIndex': 0,
+                    'transactionHash': '0xsale-eth',
+                },
+                {
+                    'marketplace': 'blur',
+                    'contractAddress': '0xdup',
+                    'tokenId': '2',
+                    'buyerAddress': '0xbuyer2',
+                    'sellerAddress': '0xseller2',
+                    'taker': 'BUYER',
+                    'sellerFee': {'amount': '1500000000000000000', 'symbol': 'WETH', 'decimals': 18},
+                    'protocolFee': {'amount': '0', 'symbol': 'WETH', 'decimals': 18},
+                    'royaltyFee': {'amount': '0', 'symbol': 'WETH', 'decimals': 18},
+                    'blockNumber': 12,
+                    'logIndex': 8,
+                    'bundleIndex': 0,
+                    'transactionHash': '0xsale-weth',
+                },
+            ],
+        }
+        fake_requests = SimpleNamespace(get=Mock(return_value=response))
+
+        with patch.object(mod, 'requests', fake_requests):
+            rows = mod.fetch_alchemy_nft_sales(
+                api_key='alchemy',
+                network='eth-mainnet',
+                contract_address='0xdup',
+            )
+
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(rows[0].is_native_eth)
+        self.assertAlmostEqual(rows[0].price_eth, 2.3)
+        self.assertEqual(rows[0].payment_token_symbol, 'ETH')
+        self.assertFalse(rows[1].is_native_eth)
+        self.assertIsNone(rows[1].price_eth)
+        self.assertEqual(rows[1].payment_token_symbol, 'WETH')
+
+    def test_fetch_contract_sales_falls_back_to_opensea(self):
+        opensea_sale = mod.NFTSaleRecord(
+            contract_address='0xdup',
+            token_id='1',
+            tx_hash='0xopensea',
+            block_number=11,
+            log_index=1,
+            bundle_index=0,
+            buyer_address='0xbuyer',
+            seller_address='0xseller',
+            marketplace='opensea',
+            taker='BUYER',
+            payment_token_symbol='ETH',
+            payment_token_address='',
+            price_eth=1.25,
+            seller_fee_eth=1.0,
+            protocol_fee_eth=0.1,
+            royalty_fee_eth=0.15,
+            source='opensea',
+            is_native_eth=True,
+        )
+
+        with patch.object(mod, 'fetch_alchemy_nft_sales', return_value=[]), \
+             patch.object(mod, 'fetch_opensea_nft_events', return_value=[opensea_sale]):
+            rows = mod.fetch_contract_sales(
+                alchemy_api_key='alchemy',
+                alchemy_network='eth-mainnet',
+                contract_address='0xdup',
+                opensea_api_key='opensea',
+            )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].source, 'opensea')
+        self.assertTrue(rows[0].is_native_eth)
+
+    def test_calculate_sale_eth_metrics_uses_buyer_pre_balance_and_gas(self):
+        sale = mod.NFTSaleRecord(
+            contract_address='0xdup',
+            token_id='1',
+            tx_hash='0xsale',
+            block_number=11,
+            log_index=7,
+            bundle_index=0,
+            buyer_address='0xbuyer',
+            seller_address='0xseller',
+            marketplace='seaport',
+            taker='BUYER',
+            payment_token_symbol='ETH',
+            payment_token_address='',
+            price_eth=2.0,
+            seller_fee_eth=1.7,
+            protocol_fee_eth=0.1,
+            royalty_fee_eth=0.2,
+            source='alchemy',
+            is_native_eth=True,
+        )
+        purchase_receipt = mod.TransactionReceiptRecord(
+            tx_hash='0xsale',
+            block_number=11,
+            transaction_index=3,
+            from_address='0xbuyer',
+            gas_used=21_000,
+            effective_gas_price_wei=10_000_000_000,
+        )
+        same_block_transfers = [
+            mod.EthTransferRecord(
+                tx_hash='0xin',
+                block_number=11,
+                from_address='0xother',
+                to_address='0xbuyer',
+                value_eth=1.0,
+                category='external',
+            ),
+            mod.EthTransferRecord(
+                tx_hash='0xout',
+                block_number=11,
+                from_address='0xbuyer',
+                to_address='0xelse',
+                value_eth=0.5,
+                category='external',
+            ),
+            mod.EthTransferRecord(
+                tx_hash='0xafter',
+                block_number=11,
+                from_address='0xother2',
+                to_address='0xbuyer',
+                value_eth=9.0,
+                category='external',
+            ),
+        ]
+        receipts_by_hash = {
+            '0xin': mod.TransactionReceiptRecord(
+                tx_hash='0xin',
+                block_number=11,
+                transaction_index=1,
+                from_address='0xother',
+                gas_used=0,
+                effective_gas_price_wei=0,
+            ),
+            '0xout': mod.TransactionReceiptRecord(
+                tx_hash='0xout',
+                block_number=11,
+                transaction_index=2,
+                from_address='0xbuyer',
+                gas_used=0,
+                effective_gas_price_wei=0,
+            ),
+            '0xafter': mod.TransactionReceiptRecord(
+                tx_hash='0xafter',
+                block_number=11,
+                transaction_index=5,
+                from_address='0xother2',
+                gas_used=0,
+                effective_gas_price_wei=0,
+            ),
+        }
+
+        metrics = mod.calculate_sale_eth_metrics(
+            sale=sale,
+            purchase_receipt=purchase_receipt,
+            base_balance_eth=3.0,
+            same_block_transfers=same_block_transfers,
+            receipts_by_hash=receipts_by_hash,
+        )
+
+        self.assertEqual(metrics['ratio_status'], 'ok')
+        self.assertAlmostEqual(metrics['buy_before_eth_balance'], 3.5)
+        self.assertAlmostEqual(metrics['buy_amount_eth'], 2.0)
+        self.assertAlmostEqual(metrics['buy_total_eth_out'], 2.00021)
+        self.assertAlmostEqual(metrics['buy_asset_ratio'], 2.0 / 3.5)
+        self.assertAlmostEqual(metrics['buy_asset_ratio_with_gas'], 2.00021 / 3.5)
+        self.assertFalse(metrics['gas_not_attributed'])
+
+    def test_calculate_sale_eth_metrics_skips_gas_when_buyer_is_not_tx_sender(self):
+        sale = mod.NFTSaleRecord(
+            contract_address='0xdup',
+            token_id='1',
+            tx_hash='0xsale',
+            block_number=11,
+            log_index=7,
+            bundle_index=0,
+            buyer_address='0xbuyer',
+            seller_address='0xseller',
+            marketplace='seaport',
+            taker='BUYER',
+            payment_token_symbol='ETH',
+            payment_token_address='',
+            price_eth=2.0,
+            seller_fee_eth=1.7,
+            protocol_fee_eth=0.1,
+            royalty_fee_eth=0.2,
+            source='alchemy',
+            is_native_eth=True,
+        )
+        purchase_receipt = mod.TransactionReceiptRecord(
+            tx_hash='0xsale',
+            block_number=11,
+            transaction_index=3,
+            from_address='0xaggregator',
+            gas_used=21_000,
+            effective_gas_price_wei=10_000_000_000,
+        )
+
+        metrics = mod.calculate_sale_eth_metrics(
+            sale=sale,
+            purchase_receipt=purchase_receipt,
+            base_balance_eth=4.0,
+            same_block_transfers=[],
+            receipts_by_hash={},
+        )
+
+        self.assertEqual(metrics['ratio_status'], 'ok')
+        self.assertTrue(metrics['gas_not_attributed'])
+        self.assertAlmostEqual(metrics['buy_total_eth_out'], 2.0)
+        self.assertAlmostEqual(metrics['buy_asset_ratio_with_gas'], 0.5)
+
+
 class DuplicateAnalysisTests(unittest.TestCase):
     def test_find_duplicate_candidates_marks_high_and_low_confidence(self):
         seed_nfts = [
@@ -398,7 +630,7 @@ class EndToEndAnalysisTests(unittest.TestCase):
             result = mod.analyze_seed_contract(
                 chain='ethereum',
                 seed_contract_address='0xseed',
-                alchemy_api_key='alchemy',
+                alchemy_api_key='fake-alchemy-key-123456',
                 alchemy_network='eth-mainnet',
                 etherscan_api_key='etherscan',
                 conn=object(),
@@ -408,6 +640,131 @@ class EndToEndAnalysisTests(unittest.TestCase):
         self.assertEqual(result['report_summary']['high_confidence_contract_count'], 1)
         self.assertFalse(result['report_summary']['open_license_detected'])
         self.assertEqual(result['address_signals']['0xdup']['mint_address_count'], 1)
+
+    def test_analyze_seed_contract_emits_infringing_tokens_victims_and_fraud_stats(self):
+        seed_meta = mod.ContractMetadata(
+            chain='ethereum',
+            contract_address='0xseed',
+            token_type='ERC721',
+            contract_deployer='0xcreator',
+            deployed_block_number=123,
+            name='Azuki',
+            symbol='AZUKI',
+        )
+        seed_nfts = [
+            mod.SeedNFT(
+                chain='ethereum',
+                contract_address='0xseed',
+                token_id='1',
+                name='Azuki #1',
+                symbol='AZUKI',
+                token_uri='ipfs://seed/meta-1',
+                image_uri='ipfs://seed/image-1.png',
+            )
+        ]
+        snapshot = mod.DatabaseSnapshot(
+            nft_rows=[
+                mod.DatabaseNFTRecord(
+                    contract_address='0xdup',
+                    token_id='1',
+                    token_uri='ipfs://seed/meta-1',
+                    image_uri='ipfs://dup/image.png',
+                    name='Azuki Mirror #1',
+                    symbol='AZUKI',
+                )
+            ],
+            contract_names=[mod.ContractNameRecord(contract_address='0xdup', name_norm='azuki mirror')],
+            symbol_contracts={'azuki': {'0xdup'}},
+        )
+        transfers = [
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='1',
+                tx_hash='0xmint',
+                log_index=0,
+                block_number=10,
+                block_time=100,
+                from_address=mod.ZERO_ADDRESS,
+                to_address='0xsybil',
+                event_type='erc721',
+                source='alchemy',
+            ),
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='1',
+                tx_hash='0xsale',
+                log_index=1,
+                block_number=11,
+                block_time=110,
+                from_address='0xsybil',
+                to_address='0xbuyer',
+                event_type='erc721',
+                source='alchemy',
+            ),
+        ]
+        owners = [
+            mod.OwnerBalance(owner_address='0xbuyer', token_balances={'1': 1}),
+        ]
+        sales = [
+            mod.NFTSaleRecord(
+                contract_address='0xdup',
+                token_id='1',
+                tx_hash='0xsale',
+                block_number=11,
+                log_index=1,
+                bundle_index=0,
+                buyer_address='0xbuyer',
+                seller_address='0xsybil',
+                marketplace='seaport',
+                taker='BUYER',
+                payment_token_symbol='ETH',
+                payment_token_address='',
+                price_eth=2.0,
+                seller_fee_eth=1.7,
+                protocol_fee_eth=0.1,
+                royalty_fee_eth=0.2,
+                source='alchemy',
+                is_native_eth=True,
+            )
+        ]
+        purchase_receipt = mod.TransactionReceiptRecord(
+            tx_hash='0xsale',
+            block_number=11,
+            transaction_index=3,
+            from_address='0xbuyer',
+            gas_used=21_000,
+            effective_gas_price_wei=10_000_000_000,
+        )
+
+        with patch.object(mod, 'fetch_contract_metadata', return_value=seed_meta), \
+             patch.object(mod, 'fetch_seed_contract_nfts', return_value=seed_nfts), \
+             patch.object(mod, 'fetch_license_sample', return_value={'raw': {'metadata': {'license': 'All rights reserved'}}}), \
+             patch.object(mod, 'load_database_snapshot', return_value=snapshot), \
+             patch.object(mod, 'fetch_contract_transfers', return_value=transfers), \
+             patch.object(mod, 'fetch_contract_owners', return_value=owners), \
+             patch.object(mod, 'fetch_contract_sales', return_value=sales), \
+             patch.object(mod, 'fetch_transaction_receipt', return_value=purchase_receipt), \
+             patch.object(mod, 'fetch_eth_balance', return_value=4.0), \
+             patch.object(mod, 'fetch_same_block_eth_transfers_for_address', return_value=[]):
+            result = mod.analyze_seed_contract(
+                chain='ethereum',
+                seed_contract_address='0xseed',
+                alchemy_api_key='fake-alchemy-key-123456',
+                alchemy_network='eth-mainnet',
+                etherscan_api_key='etherscan',
+                conn=object(),
+            )
+
+        self.assertIn('infringing_tokens', result)
+        self.assertIn('malicious_addresses', result)
+        self.assertIn('victim_addresses', result)
+        self.assertIn('fraud_trade_stats', result)
+        self.assertEqual(result['infringing_tokens'][0]['minter_address'], '0xsybil')
+        self.assertEqual(result['victim_addresses'][0]['address'], '0xbuyer')
+        self.assertTrue(result['victim_addresses'][0]['is_stuck'])
+        self.assertAlmostEqual(result['victim_addresses'][0]['buy_asset_ratio'], 0.5)
+        self.assertEqual(result['fraud_trade_stats']['0xdup']['native_eth_sale_count'], 1)
+        self.assertAlmostEqual(result['fraud_trade_stats']['0xdup']['stuck_cost_eth'], 2.0)
 
     def test_analyze_contract_transfers_computes_non_zero_first_transfer_delay(self):
         transfers = [
@@ -450,6 +807,12 @@ class ParserNetworkDefaultTests(unittest.TestCase):
             args = parser.parse_args(['--chain', 'ethereum', '--seed-contract-address', '0xseed'])
 
         self.assertEqual(args.alchemy_network, '')
+
+    def test_public_api_is_reexported_from_split_modules(self):
+        self.assertEqual(mod.fetch_contract_sales.__module__, 'top_contract_analysis.api')
+        self.assertEqual(mod.analyze_seed_contract.__module__, 'top_contract_analysis.analysis')
+        self.assertEqual(mod.render_human_readable_report.__module__, 'top_contract_analysis.reporting')
+        self.assertEqual(mod.build_parser.__module__, 'top_contract_analysis.cli')
 
 
 class HumanReadableReportTests(unittest.TestCase):
@@ -518,6 +881,51 @@ class HumanReadableReportTests(unittest.TestCase):
                     'victim_wallet_count': 5,
                 }
             },
+            'infringing_tokens': [
+                {
+                    'contract_address': '0xdup',
+                    'token_id': '1',
+                    'mint_tx_hash': '0xmint',
+                    'mint_block': 10,
+                    'minter_address': '0xsybil',
+                    'first_transfer_time': 100,
+                    'history_window': 'full',
+                    'match_reasons': ['token_uri_match'],
+                    'official_or_legit_reissue': False,
+                }
+            ],
+            'malicious_addresses': [
+                {
+                    'address': '0xsybil',
+                    'mint_role': True,
+                    'wash_cycle_count': 1,
+                    'star_out_degree': 1,
+                    'rapid_spread_contracts': ['0xdup'],
+                    'evidence_contracts': ['0xdup'],
+                }
+            ],
+            'victim_addresses': [
+                {
+                    'address': '0xbuyer',
+                    'buy_tx_hashes': ['0xsale'],
+                    'buy_amount_eth': 2.0,
+                    'buy_before_eth_balance': 4.0,
+                    'buy_asset_ratio': 0.5,
+                    'buy_asset_ratio_with_gas': 0.5000525,
+                    'is_stuck': True,
+                    'last_buy_tx_hash': '0xsale',
+                    'ratio_status': 'ok',
+                }
+            ],
+            'fraud_trade_stats': {
+                '0xdup': {
+                    'unique_buyers': 1,
+                    'native_eth_sale_count': 1,
+                    'native_eth_volume': 2.0,
+                    'stuck_wallet_count': 1,
+                    'stuck_cost_eth': 2.0,
+                }
+            },
         }
 
         text = mod.render_human_readable_report(payload)
@@ -536,6 +944,11 @@ class HumanReadableReportTests(unittest.TestCase):
         self.assertIn('快速扩散: 是', text)
         self.assertIn('## 受害者信号', text)
         self.assertIn('套牢地址数: 5', text)
+        self.assertIn('## 侵权 NFT 历史记录', text)
+        self.assertIn('## 恶意地址画像', text)
+        self.assertIn('## 被骗地址画像', text)
+        self.assertIn('## 被骗交易与套牢资金', text)
+        self.assertIn('买入前 ETH 余额: 4.0', text)
         self.assertNotIn('## 合法重复合约', text)
         self.assertNotIn('合法重复合约数', text)
 

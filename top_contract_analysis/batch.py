@@ -55,6 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--alchemy-api-key', default='')
     parser.add_argument('--alchemy-network', default='')
     parser.add_argument('--etherscan-api-key', default='')
+    parser.add_argument('--opensea-api-key', default='')
     parser.add_argument('--name-threshold', type=float, default=95.0)
     parser.add_argument('--metadata-threshold', type=float, default=0.55)
     parser.add_argument('--timeout', type=int, default=30)
@@ -95,6 +96,7 @@ def _analyze_one_seed(
         alchemy_api_key=args.alchemy_api_key,
         alchemy_network=args.alchemy_network or None,
         etherscan_api_key=args.etherscan_api_key,
+        opensea_api_key=args.opensea_api_key,
         feature_store=feature_store,
         signal_cache=signal_cache,
         name_threshold=args.name_threshold,
