@@ -5,7 +5,14 @@ import os
 from pathlib import Path
 from typing import Optional, Sequence
 
-from .constants import DEFAULT_MAX_RECALL_ROWS, DEFAULT_NAME_THRESHOLD, DEFAULT_TIMEOUT
+from .constants import (
+    DEFAULT_API_MAX_CONCURRENCY,
+    DEFAULT_CONTRACT_MAX_CONCURRENCY,
+    DEFAULT_MAX_RECALL_ROWS,
+    DEFAULT_NAME_THRESHOLD,
+    DEFAULT_SALE_METRIC_MAX_CONCURRENCY,
+    DEFAULT_TIMEOUT,
+)
 from .analysis import analyze_seed_contract
 from .reporting import write_default_outputs
 
@@ -33,6 +40,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_RECALL_ROWS,
         help='safety cap on total recall token rows (0 = unlimited)',
     )
+    parser.add_argument('--api-max-concurrency', type=int, default=DEFAULT_API_MAX_CONCURRENCY)
+    parser.add_argument('--contract-max-concurrency', type=int, default=DEFAULT_CONTRACT_MAX_CONCURRENCY)
+    parser.add_argument('--sale-metric-max-concurrency', type=int, default=DEFAULT_SALE_METRIC_MAX_CONCURRENCY)
     parser.add_argument('--output', default='')
     parser.add_argument('--feature-parquet', default='', help='optional parquet snapshot path to preload into DuckDB')
     parser.add_argument('--feature-db', default=':memory:', help='duckdb database path for the feature store')
@@ -67,6 +77,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             timeout=args.timeout,
             max_tokens_per_contract=args.max_tokens_per_contract,
             max_recall_rows=args.max_recall_rows,
+            api_max_concurrency=args.api_max_concurrency,
+            contract_max_concurrency=args.contract_max_concurrency,
+            sale_metric_max_concurrency=args.sale_metric_max_concurrency,
         )
         write_default_outputs(payload, args.output)
     finally:

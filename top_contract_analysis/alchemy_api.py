@@ -5,6 +5,7 @@ from urllib.parse import urlencode
 import requests
 
 from . import constants as package_constants
+from .async_http import AsyncApiClient
 from .constants import (
     DEFAULT_ALCHEMY_RETRIES,
     DEFAULT_TIMEOUT,
@@ -93,6 +94,22 @@ def _alchemy_post_json(*, url: str, payload: Dict[str, Any], timeout: int = DEFA
     raise RuntimeError(last_exc or 'alchemy POST failed')
 
 
+async def _alchemy_get_json_async(*, client: AsyncApiClient, url: str, timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any]:
+    del timeout
+    return await client.get_json(url)
+
+
+async def _alchemy_post_json_async(
+    *,
+    client: AsyncApiClient,
+    url: str,
+    payload: Dict[str, Any],
+    timeout: int = DEFAULT_TIMEOUT,
+) -> Dict[str, Any]:
+    del timeout
+    return await client.post_json(url, payload)
+
+
 def _parse_alchemy_block_timestamp(value: Any) -> int:
     if value is None:
         return 0
@@ -131,6 +148,29 @@ def _fetch_block_timestamp(
         },
         timeout=timeout,
         session=session,
+    )
+    result = body.get('result') or {}
+    return _parse_alchemy_block_timestamp(result.get('timestamp'))
+
+
+async def _fetch_block_timestamp_async(
+    *,
+    client: AsyncApiClient,
+    api_key: str,
+    network: str,
+    block_num: str,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> int:
+    body = await _alchemy_post_json_async(
+        client=client,
+        url=_alchemy_rpc_base(network, api_key),
+        payload={
+            'jsonrpc': '2.0',
+            'id': 1,
+            'method': 'eth_getBlockByNumber',
+            'params': [block_num, False],
+        },
+        timeout=timeout,
     )
     result = body.get('result') or {}
     return _parse_alchemy_block_timestamp(result.get('timestamp'))
@@ -199,11 +239,49 @@ def fetch_seed_contract_nfts(*, api_key: str, network: str, chain: str, contract
     return rows
 
 
+async def fetch_seed_contract_nfts_async(
+    *,
+    client: AsyncApiClient,
+    api_key: str,
+    network: str,
+    chain: str,
+    contract_address: str,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> List[SeedNFT]:
+    endpoint = f'{_alchemy_nft_base(network)}/nft/v3/{api_key}/getNFTsForContract'
+    rows: List[SeedNFT] = []
+    page_key = ''
+    while True:
+        params = {'contractAddress': contract_address, 'withMetadata': 'true'}
+        if page_key:
+            params['pageKey'] = page_key
+        url = f'{endpoint}?{urlencode(params)}'
+        payload = await _alchemy_get_json_async(client=client, url=url, timeout=timeout)
+        batch, page_key = _extract_seed_nfts(payload, chain=chain, contract_address=contract_address)
+        rows.extend(batch)
+        if not page_key:
+            return rows
+
+
 def fetch_nft_metadata(*, api_key: str, network: str, contract_address: str, token_id: str, timeout: int = DEFAULT_TIMEOUT, session=None) -> Dict[str, Any]:
     _require_requests()
     params = {'contractAddress': contract_address, 'tokenId': token_id, 'refreshCache': 'false'}
     url = f'{_alchemy_nft_base(network)}/nft/v3/{api_key}/getNFTMetadata?{urlencode(params)}'
     return _alchemy_get_json(url=url, timeout=timeout, session=session)
+
+
+async def fetch_nft_metadata_async(
+    *,
+    client: AsyncApiClient,
+    api_key: str,
+    network: str,
+    contract_address: str,
+    token_id: str,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> Dict[str, Any]:
+    params = {'contractAddress': contract_address, 'tokenId': token_id, 'refreshCache': 'false'}
+    url = f'{_alchemy_nft_base(network)}/nft/v3/{api_key}/getNFTMetadata?{urlencode(params)}'
+    return await _alchemy_get_json_async(client=client, url=url, timeout=timeout)
 
 
 def fetch_license_sample(*, api_key: str, network: str, chain: str, seed_nfts: Sequence[SeedNFT], timeout: int = DEFAULT_TIMEOUT, session=None) -> Dict[str, Any]:
@@ -216,6 +294,29 @@ def fetch_license_sample(*, api_key: str, network: str, chain: str, seed_nfts: S
                 token_id=nft.token_id,
                 timeout=timeout,
                 session=session,
+            )
+    return {}
+
+
+async def fetch_license_sample_async(
+    *,
+    client: AsyncApiClient,
+    api_key: str,
+    network: str,
+    chain: str,
+    seed_nfts: Sequence[SeedNFT],
+    timeout: int = DEFAULT_TIMEOUT,
+) -> Dict[str, Any]:
+    del chain
+    for nft in seed_nfts:
+        if nft.token_id:
+            return await fetch_nft_metadata_async(
+                client=client,
+                api_key=api_key,
+                network=network,
+                contract_address=nft.contract_address,
+                token_id=nft.token_id,
+                timeout=timeout,
             )
     return {}
 
@@ -246,6 +347,32 @@ def fetch_contract_metadata(*, api_key: str, network: str, chain: str, contract_
     params = {'contractAddress': contract_address}
     url = f'{_alchemy_nft_base(network)}/nft/v2/{api_key}/getContractMetadata?{urlencode(params)}'
     payload = _alchemy_get_json(url=url, timeout=timeout, session=session)
+    meta = payload.get('contractMetadata') or {}
+    return ContractMetadata(
+        chain=chain,
+        contract_address=str(payload.get('address') or contract_address).lower(),
+        token_type=str(meta.get('tokenType') or ''),
+        contract_deployer=str(meta.get('contractDeployer') or '').lower(),
+        deployed_block_number=int(meta.get('deployedBlockNumber') or 0),
+        name=str(meta.get('name') or ''),
+        symbol=str(meta.get('symbol') or ''),
+    )
+
+
+async def fetch_contract_metadata_async(
+    *,
+    client: AsyncApiClient,
+    api_key: str,
+    network: str,
+    chain: str,
+    contract_address: str,
+    timeout: int = DEFAULT_TIMEOUT,
+):
+    from .models import ContractMetadata
+
+    params = {'contractAddress': contract_address}
+    url = f'{_alchemy_nft_base(network)}/nft/v2/{api_key}/getContractMetadata?{urlencode(params)}'
+    payload = await _alchemy_get_json_async(client=client, url=url, timeout=timeout)
     meta = payload.get('contractMetadata') or {}
     return ContractMetadata(
         chain=chain,
@@ -311,6 +438,70 @@ def fetch_alchemy_contract_transfers(*, api_key: str, network: str, contract_add
     return transfers
 
 
+async def fetch_alchemy_contract_transfers_async(
+    *,
+    client: AsyncApiClient,
+    api_key: str,
+    network: str,
+    contract_address: str,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> List[TransferRecord]:
+    url = _alchemy_rpc_base(network, api_key)
+    params: Dict[str, Any] = {
+        'fromBlock': '0x0',
+        'toBlock': 'latest',
+        'category': ['erc721', 'erc1155'],
+        'contractAddresses': [contract_address],
+        'withMetadata': True,
+        'excludeZeroValue': False,
+        'maxCount': '0x3e8',
+        'order': 'asc',
+    }
+    transfers: List[TransferRecord] = []
+    page_key = None
+    block_time_cache: Dict[str, int] = {}
+    while True:
+        if page_key:
+            params['pageKey'] = page_key
+        payload = {'jsonrpc': '2.0', 'id': 1, 'method': 'alchemy_getAssetTransfers', 'params': [params]}
+        body = await _alchemy_post_json_async(client=client, url=url, payload=payload, timeout=timeout)
+        if body.get('error'):
+            raise RuntimeError(body['error'])
+        result = body.get('result') or {}
+        for item in result.get('transfers') or []:
+            block_num = str(item.get('blockNum') or '0')
+            block_time = _parse_alchemy_block_timestamp(item.get('metadata', {}).get('blockTimestamp'))
+            if not block_time and block_num not in {'', '0'}:
+                cached = block_time_cache.get(block_num)
+                if cached is None:
+                    cached = await _fetch_block_timestamp_async(
+                        client=client,
+                        api_key=api_key,
+                        network=network,
+                        block_num=block_num,
+                        timeout=timeout,
+                    )
+                    block_time_cache[block_num] = cached
+                block_time = cached
+            transfers.append(
+                TransferRecord(
+                    contract_address=str(item.get('rawContract', {}).get('address') or contract_address).lower(),
+                    token_id=_normalize_token_id(item.get('erc721TokenId') or item.get('tokenId') or ''),
+                    tx_hash=str(item.get('hash') or ''),
+                    log_index=int(item.get('logIndex') or 0),
+                    block_number=int(block_num, 16) if block_num.startswith('0x') else int(block_num or 0),
+                    block_time=block_time,
+                    from_address=str(item.get('from') or '').lower(),
+                    to_address=str(item.get('to') or '').lower(),
+                    event_type=str(item.get('category') or ''),
+                    source='alchemy',
+                )
+            )
+        page_key = result.get('pageKey')
+        if not page_key:
+            return transfers
+
+
 def fetch_etherscan_contract_transfers(*, api_key: str, chain: str, contract_address: str, token_type: str, timeout: int = DEFAULT_TIMEOUT, session=None) -> List[TransferRecord]:
     _require_requests()
     chain_id = ETHERSCAN_CHAIN_IDS.get(chain.lower())
@@ -362,6 +553,60 @@ def fetch_etherscan_contract_transfers(*, api_key: str, chain: str, contract_add
     return transfers
 
 
+async def fetch_etherscan_contract_transfers_async(
+    *,
+    client: AsyncApiClient,
+    api_key: str,
+    chain: str,
+    contract_address: str,
+    token_type: str,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> List[TransferRecord]:
+    chain_id = ETHERSCAN_CHAIN_IDS.get(chain.lower())
+    if not chain_id:
+        raise ValueError(f'unsupported chain for etherscan fallback: {chain}')
+    action = 'token1155tx' if token_type.upper() == 'ERC1155' else 'tokennfttx'
+    base_url = 'https://api.etherscan.io/v2/api'
+    page = 1
+    transfers: List[TransferRecord] = []
+    while True:
+        params = {
+            'chainid': chain_id,
+            'module': 'account',
+            'action': action,
+            'contractaddress': contract_address,
+            'page': page,
+            'offset': 1000,
+            'startblock': 0,
+            'endblock': 9999999999,
+            'sort': 'asc',
+            'apikey': api_key,
+        }
+        url = f'{base_url}?{urlencode(params)}'
+        body = await client.get_json(url)
+        items = body.get('result') or []
+        if not isinstance(items, list):
+            return transfers
+        for item in items:
+            transfers.append(
+                TransferRecord(
+                    contract_address=str(item.get('contractAddress') or contract_address).lower(),
+                    token_id=_normalize_token_id(item.get('tokenID') or ''),
+                    tx_hash=str(item.get('hash') or ''),
+                    log_index=int(item.get('transactionIndex') or 0),
+                    block_number=int(item.get('blockNumber') or 0),
+                    block_time=int(item.get('timeStamp') or 0),
+                    from_address=str(item.get('from') or '').lower(),
+                    to_address=str(item.get('to') or '').lower(),
+                    event_type='erc1155' if action == 'token1155tx' else 'erc721',
+                    source='etherscan',
+                )
+            )
+        if len(items) < 1000:
+            return transfers
+        page += 1
+
+
 def fetch_contract_transfers(*, alchemy_api_key: str, alchemy_network: str, etherscan_api_key: str, chain: str, contract_address: str, token_type: str, timeout: int = DEFAULT_TIMEOUT, session=None) -> List[TransferRecord]:
     try:
         return fetch_alchemy_contract_transfers(
@@ -380,6 +625,37 @@ def fetch_contract_transfers(*, alchemy_api_key: str, alchemy_network: str, ethe
             token_type=token_type,
             timeout=timeout,
             session=session,
+        )
+
+
+async def fetch_contract_transfers_async(
+    *,
+    client: AsyncApiClient,
+    alchemy_api_key: str,
+    alchemy_network: str,
+    etherscan_api_key: str,
+    chain: str,
+    contract_address: str,
+    token_type: str,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> List[TransferRecord]:
+    try:
+        return await fetch_alchemy_contract_transfers_async(
+            client=client,
+            api_key=alchemy_api_key,
+            network=alchemy_network,
+            contract_address=contract_address,
+            timeout=timeout,
+        )
+    except Exception as exc:
+        logger.warning('alchemy transfer fetch failed for %s: %s', contract_address, exc)
+        return await fetch_etherscan_contract_transfers_async(
+            client=client,
+            api_key=etherscan_api_key,
+            chain=chain,
+            contract_address=contract_address,
+            token_type=token_type,
+            timeout=timeout,
         )
 
 
@@ -408,12 +684,67 @@ def fetch_contract_owners(*, api_key: str, network: str, contract_address: str, 
     return owners
 
 
+async def fetch_contract_owners_async(
+    *,
+    client: AsyncApiClient,
+    api_key: str,
+    network: str,
+    contract_address: str,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> List[OwnerBalance]:
+    endpoint = f'{_alchemy_nft_base(network)}/nft/v3/{api_key}/getOwnersForContract'
+    page_key = ''
+    owners: List[OwnerBalance] = []
+    while True:
+        params = {'contractAddress': contract_address, 'withTokenBalances': 'true'}
+        if page_key:
+            params['pageKey'] = page_key
+        url = f'{endpoint}?{urlencode(params)}'
+        payload = await _alchemy_get_json_async(client=client, url=url, timeout=timeout)
+        for row in payload.get('owners') or []:
+            owner_address = str(row.get('ownerAddress') or '').lower()
+            if not owner_address or owner_address == ZERO_ADDRESS:
+                continue
+            balances: Dict[str, int] = {}
+            for balance in row.get('tokenBalances') or []:
+                balances[_normalize_token_id(balance.get('tokenId'))] = int(balance.get('balance') or 0)
+            owners.append(OwnerBalance(owner_address=owner_address, token_balances=balances))
+        page_key = str(payload.get('pageKey') or '')
+        if not page_key:
+            return owners
+
+
 def fetch_transaction_receipt(*, api_key: str, network: str, tx_hash: str, timeout: int = DEFAULT_TIMEOUT, session=None) -> TransactionReceiptRecord:
     body = _alchemy_post_json(
         url=_alchemy_rpc_base(network, api_key),
         payload={'jsonrpc': '2.0', 'id': 1, 'method': 'eth_getTransactionReceipt', 'params': [tx_hash]},
         timeout=timeout,
         session=session,
+    )
+    result = body.get('result') or {}
+    return TransactionReceiptRecord(
+        tx_hash=str(result.get('transactionHash') or tx_hash).lower(),
+        block_number=int(str(result.get('blockNumber') or '0'), 16) if str(result.get('blockNumber') or '').startswith('0x') else int(result.get('blockNumber') or 0),
+        transaction_index=int(str(result.get('transactionIndex') or '0'), 16) if str(result.get('transactionIndex') or '').startswith('0x') else int(result.get('transactionIndex') or 0),
+        from_address=str(result.get('from') or '').lower(),
+        gas_used=int(str(result.get('gasUsed') or '0'), 16) if str(result.get('gasUsed') or '').startswith('0x') else int(result.get('gasUsed') or 0),
+        effective_gas_price_wei=int(str(result.get('effectiveGasPrice') or '0'), 16) if str(result.get('effectiveGasPrice') or '').startswith('0x') else int(result.get('effectiveGasPrice') or 0),
+    )
+
+
+async def fetch_transaction_receipt_async(
+    *,
+    client: AsyncApiClient,
+    api_key: str,
+    network: str,
+    tx_hash: str,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> TransactionReceiptRecord:
+    body = await _alchemy_post_json_async(
+        client=client,
+        url=_alchemy_rpc_base(network, api_key),
+        payload={'jsonrpc': '2.0', 'id': 1, 'method': 'eth_getTransactionReceipt', 'params': [tx_hash]},
+        timeout=timeout,
     )
     result = body.get('result') or {}
     return TransactionReceiptRecord(
@@ -450,6 +781,37 @@ def fetch_transaction_receipts_for_block(*, api_key: str, network: str, block_nu
     return rows
 
 
+async def fetch_transaction_receipts_for_block_async(
+    *,
+    client: AsyncApiClient,
+    api_key: str,
+    network: str,
+    block_number: int,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> Dict[str, TransactionReceiptRecord]:
+    body = await _alchemy_post_json_async(
+        client=client,
+        url=_alchemy_rpc_base(network, api_key),
+        payload={'jsonrpc': '2.0', 'id': 1, 'method': 'alchemy_getTransactionReceipts', 'params': [{'blockNumber': hex(block_number)}]},
+        timeout=timeout,
+    )
+    result = body.get('result') or {}
+    rows: Dict[str, TransactionReceiptRecord] = {}
+    for item in result.get('receipts') or []:
+        tx_hash = str(item.get('transactionHash') or '').lower()
+        if not tx_hash:
+            continue
+        rows[tx_hash] = TransactionReceiptRecord(
+            tx_hash=tx_hash,
+            block_number=block_number,
+            transaction_index=int(str(item.get('transactionIndex') or '0'), 16) if str(item.get('transactionIndex') or '').startswith('0x') else int(item.get('transactionIndex') or 0),
+            from_address=str(item.get('from') or '').lower(),
+            gas_used=int(str(item.get('gasUsed') or '0'), 16) if str(item.get('gasUsed') or '').startswith('0x') else int(item.get('gasUsed') or 0),
+            effective_gas_price_wei=int(str(item.get('effectiveGasPrice') or '0'), 16) if str(item.get('effectiveGasPrice') or '').startswith('0x') else int(item.get('effectiveGasPrice') or 0),
+        )
+    return rows
+
+
 def fetch_eth_balance(*, api_key: str, network: str, address: str, block_number: int, timeout: int = DEFAULT_TIMEOUT, session=None) -> float:
     if block_number < 0:
         return 0.0
@@ -458,6 +820,27 @@ def fetch_eth_balance(*, api_key: str, network: str, address: str, block_number:
         payload={'jsonrpc': '2.0', 'id': 1, 'method': 'eth_getBalance', 'params': [address, hex(block_number)]},
         timeout=timeout,
         session=session,
+    )
+    value = str(body.get('result') or '0x0')
+    return int(value, 16) / float(10 ** 18)
+
+
+async def fetch_eth_balance_async(
+    *,
+    client: AsyncApiClient,
+    api_key: str,
+    network: str,
+    address: str,
+    block_number: int,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> float:
+    if block_number < 0:
+        return 0.0
+    body = await _alchemy_post_json_async(
+        client=client,
+        url=_alchemy_rpc_base(network, api_key),
+        payload={'jsonrpc': '2.0', 'id': 1, 'method': 'eth_getBalance', 'params': [address, hex(block_number)]},
+        timeout=timeout,
     )
     value = str(body.get('result') or '0x0')
     return int(value, 16) / float(10 ** 18)
@@ -509,9 +892,99 @@ def _fetch_address_eth_transfers(*, api_key: str, network: str, block_number: in
     return rows
 
 
+async def _fetch_address_eth_transfers_async(
+    *,
+    client: AsyncApiClient,
+    api_key: str,
+    network: str,
+    block_number: int,
+    address: str,
+    direction: str,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> List[EthTransferRecord]:
+    params: Dict[str, Any] = {
+        'fromBlock': hex(block_number),
+        'toBlock': hex(block_number),
+        'category': ['external', 'internal'],
+        'withMetadata': False,
+        'excludeZeroValue': True,
+        'maxCount': '0x3e8',
+        'order': 'asc',
+    }
+    if direction == 'from':
+        params['fromAddress'] = address
+    else:
+        params['toAddress'] = address
+    body = await _alchemy_post_json_async(
+        client=client,
+        url=_alchemy_rpc_base(network, api_key),
+        payload={'jsonrpc': '2.0', 'id': 1, 'method': 'alchemy_getAssetTransfers', 'params': [params]},
+        timeout=timeout,
+    )
+    result = body.get('result') or {}
+    rows: List[EthTransferRecord] = []
+    for item in result.get('transfers') or []:
+        value_raw = item.get('value')
+        if value_raw is None:
+            value_raw = (item.get('rawContract') or {}).get('value')
+        if isinstance(value_raw, str) and value_raw.startswith('0x'):
+            value_eth = int(value_raw, 16) / float(10 ** 18)
+        else:
+            try:
+                value_eth = float(value_raw or 0)
+            except (TypeError, ValueError):
+                value_eth = 0.0
+        rows.append(
+            EthTransferRecord(
+                tx_hash=str(item.get('hash') or '').lower(),
+                block_number=block_number,
+                from_address=str(item.get('from') or '').lower(),
+                to_address=str(item.get('to') or '').lower(),
+                value_eth=value_eth,
+                category=str(item.get('category') or ''),
+            )
+        )
+    return rows
+
+
 def fetch_same_block_eth_transfers_for_address(*, api_key: str, network: str, block_number: int, address: str, timeout: int = DEFAULT_TIMEOUT, session=None) -> List[EthTransferRecord]:
     rows = _fetch_address_eth_transfers(api_key=api_key, network=network, block_number=block_number, address=address, direction='from', timeout=timeout, session=session)
     rows.extend(_fetch_address_eth_transfers(api_key=api_key, network=network, block_number=block_number, address=address, direction='to', timeout=timeout, session=session))
+    deduped: Dict[tuple[str, str, str, float], EthTransferRecord] = {}
+    for row in rows:
+        deduped[(row.tx_hash, row.from_address, row.to_address, row.value_eth)] = row
+    return list(deduped.values())
+
+
+async def fetch_same_block_eth_transfers_for_address_async(
+    *,
+    client: AsyncApiClient,
+    api_key: str,
+    network: str,
+    block_number: int,
+    address: str,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> List[EthTransferRecord]:
+    rows = await _fetch_address_eth_transfers_async(
+        client=client,
+        api_key=api_key,
+        network=network,
+        block_number=block_number,
+        address=address,
+        direction='from',
+        timeout=timeout,
+    )
+    rows.extend(
+        await _fetch_address_eth_transfers_async(
+            client=client,
+            api_key=api_key,
+            network=network,
+            block_number=block_number,
+            address=address,
+            direction='to',
+            timeout=timeout,
+        )
+    )
     deduped: Dict[tuple[str, str, str, float], EthTransferRecord] = {}
     for row in rows:
         deduped[(row.tx_hash, row.from_address, row.to_address, row.value_eth)] = row

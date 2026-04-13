@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import threading
@@ -9,9 +10,11 @@ from unittest.mock import patch
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from aiohttp import web
 
 import top_contract_analysis as mod
 import top_contract_analysis.analysis as analysis_mod
+import top_contract_analysis.async_http as async_http_mod
 import top_contract_analysis.cli as cli_mod
 import top_contract_analysis.batch as batch_mod
 import top_contract_analysis.build_rust_ext as build_rust_mod
@@ -20,6 +23,83 @@ import top_contract_analysis.rust_bridge as rust_bridge
 from top_contract_analysis.duckdb_store import DuckDBFeatureStore
 from top_contract_analysis.rust_bridge import score_metadata_pairs, score_name_pairs
 from top_contract_analysis.signal_cache import ContractSignalCache
+
+
+class AsyncHttpClientTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self._runner = None
+
+    async def asyncTearDown(self):
+        if self._runner is not None:
+            await self._runner.cleanup()
+
+    async def _start_json_server(self, handler):
+        app = web.Application()
+        app.router.add_get('/ping', handler)
+        self._runner = web.AppRunner(app)
+        await self._runner.setup()
+        site = web.TCPSite(self._runner, '127.0.0.1', 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        return f'http://127.0.0.1:{port}/ping'
+
+    async def test_async_api_client_limits_global_concurrency(self):
+        active = 0
+        peak = 0
+        lock = asyncio.Lock()
+
+        async def handler(request):
+            nonlocal active, peak
+            async with lock:
+                active += 1
+                peak = max(peak, active)
+            await asyncio.sleep(0.05)
+            async with lock:
+                active -= 1
+            return web.json_response({'ok': True})
+
+        url = await self._start_json_server(handler)
+        client = async_http_mod.AsyncApiClient(
+            timeout=1,
+            max_concurrency=2,
+            contract_max_concurrency=2,
+            sale_metric_max_concurrency=2,
+        )
+        try:
+            responses = await asyncio.gather(*[
+                client.get_json(url)
+                for _ in range(6)
+            ])
+        finally:
+            await client.close()
+
+        self.assertEqual(responses, [{'ok': True}] * 6)
+        self.assertEqual(peak, 2)
+
+    async def test_async_api_client_retries_transient_failures(self):
+        calls = 0
+
+        async def handler(request):
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                return web.Response(status=500, text='fail')
+            return web.json_response({'ok': True})
+
+        url = await self._start_json_server(handler)
+        client = async_http_mod.AsyncApiClient(
+            timeout=1,
+            max_concurrency=2,
+            contract_max_concurrency=2,
+            sale_metric_max_concurrency=2,
+        )
+        try:
+            response = await client.get_json(url)
+        finally:
+            await client.close()
+
+        self.assertEqual(response, {'ok': True})
+        self.assertEqual(calls, 3)
 
 
 class RustBridgeTests(unittest.TestCase):

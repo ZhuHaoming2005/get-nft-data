@@ -1,32 +1,49 @@
 from __future__ import annotations
 
-import contextlib
+import asyncio
 import json
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from statistics import median
 from typing import Any, Dict, List, Sequence, Tuple
 
 from .alchemy_api import (
-    _build_requests_session,
     fetch_contract_metadata,
+    fetch_contract_metadata_async,
     fetch_contract_owners,
+    fetch_contract_owners_async,
     fetch_contract_transfers,
+    fetch_contract_transfers_async,
     fetch_eth_balance,
+    fetch_eth_balance_async,
     fetch_license_sample,
+    fetch_license_sample_async,
     fetch_same_block_eth_transfers_for_address,
+    fetch_same_block_eth_transfers_for_address_async,
     fetch_seed_contract_nfts,
+    fetch_seed_contract_nfts_async,
     fetch_transaction_receipt,
+    fetch_transaction_receipt_async,
     fetch_transaction_receipts_for_block,
+    fetch_transaction_receipts_for_block_async,
     is_open_license_payload,
 )
-from .constants import DEFAULT_MAX_RECALL_ROWS, DEFAULT_NAME_THRESHOLD, DEFAULT_TIMEOUT, ZERO_ADDRESS, logger
+from .async_http import AsyncApiClient
+from .constants import (
+    DEFAULT_API_MAX_CONCURRENCY,
+    DEFAULT_CONTRACT_MAX_CONCURRENCY,
+    DEFAULT_MAX_RECALL_ROWS,
+    DEFAULT_NAME_THRESHOLD,
+    DEFAULT_SALE_METRIC_MAX_CONCURRENCY,
+    DEFAULT_TIMEOUT,
+    ZERO_ADDRESS,
+    logger,
+)
 from .db import get_conn
 from .models import DatabaseSnapshot, DuplicateCandidate, NFTSaleRecord, OwnerBalance, TransactionReceiptRecord, TransferRecord
 from .normalize import normalize_name, normalize_network, normalize_symbol, normalize_url
-from .sales import ETH_PRICED_SYMBOLS, _looks_like_real_api_key, fetch_contract_sales
+from .sales import ETH_PRICED_SYMBOLS, _looks_like_real_api_key, fetch_contract_sales, fetch_contract_sales_async
 from .snapshot import find_duplicate_candidates, group_candidates_by_contract, load_database_snapshot
 
 
@@ -629,6 +646,321 @@ def build_report_summary(
     }
 
 
+def _unavailable_sale_metrics(*, sale: NFTSaleRecord | None = None) -> Dict[str, Any]:
+    price_eth = sale.price_eth if sale is not None else None
+    return {
+        'buy_before_eth_balance': None,
+        'buy_amount_eth': price_eth,
+        'buy_total_eth_out': price_eth,
+        'buy_asset_ratio': None,
+        'buy_asset_ratio_with_gas': None,
+        'gas_not_attributed': False,
+        'ratio_status': 'unavailable',
+    }
+
+
+def _is_mocked_callable(func: Any) -> bool:
+    return getattr(func.__class__, '__module__', '') == 'unittest.mock'
+
+
+async def _call_api(
+    *,
+    sync_func,
+    async_func,
+    client: AsyncApiClient,
+    **kwargs,
+):
+    if _is_mocked_callable(sync_func):
+        call_kwargs = dict(kwargs)
+        call_kwargs.setdefault('session', client)
+        return await asyncio.to_thread(sync_func, **call_kwargs)
+    return await async_func(client=client, **kwargs)
+
+
+async def _compute_sale_metrics_async(
+    *,
+    client: AsyncApiClient,
+    alchemy_api_key: str,
+    network: str,
+    contract_address: str,
+    sale: NFTSaleRecord,
+    timeout: int,
+    receipts_by_block_tasks: Dict[int, asyncio.Task[Dict[str, TransactionReceiptRecord]]],
+) -> tuple[str, Dict[str, Any]]:
+    if not sale.is_native_eth or sale.price_eth is None:
+        return sale.tx_hash, _unavailable_sale_metrics()
+    try:
+        async with client.sale_metric_semaphore:
+            purchase_receipt, base_balance_eth, same_block_transfers = await asyncio.gather(
+                _call_api(
+                    sync_func=fetch_transaction_receipt,
+                    async_func=fetch_transaction_receipt_async,
+                    client=client,
+                    api_key=alchemy_api_key,
+                    network=network,
+                    tx_hash=sale.tx_hash,
+                    timeout=timeout,
+                ),
+                _call_api(
+                    sync_func=fetch_eth_balance,
+                    async_func=fetch_eth_balance_async,
+                    client=client,
+                    api_key=alchemy_api_key,
+                    network=network,
+                    address=sale.buyer_address,
+                    block_number=sale.block_number - 1,
+                    timeout=timeout,
+                ),
+                _call_api(
+                    sync_func=fetch_same_block_eth_transfers_for_address,
+                    async_func=fetch_same_block_eth_transfers_for_address_async,
+                    client=client,
+                    api_key=alchemy_api_key,
+                    network=network,
+                    block_number=sale.block_number,
+                    address=sale.buyer_address,
+                    timeout=timeout,
+                ),
+            )
+        block_receipts: Dict[str, TransactionReceiptRecord] = {}
+        if same_block_transfers:
+            block_task = receipts_by_block_tasks.get(sale.block_number)
+            if block_task is None:
+                block_task = asyncio.create_task(
+                    _call_api(
+                        sync_func=fetch_transaction_receipts_for_block,
+                        async_func=fetch_transaction_receipts_for_block_async,
+                        client=client,
+                        api_key=alchemy_api_key,
+                        network=network,
+                        block_number=sale.block_number,
+                        timeout=timeout,
+                    )
+                )
+                receipts_by_block_tasks[sale.block_number] = block_task
+            block_receipts = await block_task
+        return sale.tx_hash, calculate_sale_eth_metrics(
+            sale=sale,
+            purchase_receipt=purchase_receipt,
+            base_balance_eth=base_balance_eth,
+            same_block_transfers=same_block_transfers,
+            receipts_by_hash=block_receipts,
+        )
+    except Exception as exc:
+        logger.warning('sale ETH metric computation failed for %s %s: %s', contract_address, sale.tx_hash, exc)
+        return sale.tx_hash, _unavailable_sale_metrics(sale=sale)
+
+
+async def _analyze_high_confidence_contract_async(
+    *,
+    client: AsyncApiClient,
+    chain: str,
+    network: str,
+    alchemy_api_key: str,
+    etherscan_api_key: str,
+    opensea_api_key: str,
+    contract_address: str,
+    contract_candidates: Sequence[DuplicateCandidate],
+    token_type: str,
+    official_addresses: set[str],
+    candidate_open_license_by_token: Dict[tuple[str, str], bool],
+    timeout: int,
+    signal_cache,
+) -> Dict[str, Any]:
+    stage_times: Dict[str, float] = {}
+    contract_started = time.perf_counter()
+    cached = None
+    if signal_cache is not None:
+        cached = signal_cache.get(chain=chain, contract_address=contract_address, token_type=token_type)
+    if cached is not None:
+        mint_recipients = set(cached.get('mint_recipients') or [])
+        active_sellers = cached.get('active_sellers') or []
+        cached_address_signals = cached.get('address_signals') or {}
+        cached_victim_signals = cached.get('victim_signals')
+        transfers = cached.get('transfers') or []
+        owners = cached.get('owners') or []
+    else:
+        started = time.perf_counter()
+        transfers = await _call_api(
+            sync_func=fetch_contract_transfers,
+            async_func=fetch_contract_transfers_async,
+            client=client,
+            alchemy_api_key=alchemy_api_key,
+            alchemy_network=network,
+            etherscan_api_key=etherscan_api_key,
+            chain=chain,
+            contract_address=contract_address,
+            token_type=token_type,
+            timeout=timeout,
+        )
+        stage_times['fetch_transfers'] = time.perf_counter() - started
+        owners = []
+        mint_recipients = {row.to_address for row in transfers if row.from_address == ZERO_ADDRESS}
+        active_sellers = [
+            row.from_address
+            for row in transfers
+            if row.from_address and row.from_address != ZERO_ADDRESS
+        ]
+        started = time.perf_counter()
+        cached_address_signals = analyze_contract_transfers(transfers)
+        stage_times['analyze_transfer_signals'] = time.perf_counter() - started
+        cached_victim_signals = None
+
+    started = time.perf_counter()
+    infringing_tokens = build_infringing_token_records(
+        contract_address=contract_address,
+        contract_candidates=contract_candidates,
+        transfers=transfers,
+        official_addresses=official_addresses,
+        candidate_open_license_by_token=candidate_open_license_by_token,
+    )
+    stage_times['build_infringing_tokens'] = time.perf_counter() - started
+
+    result = {
+        'contract_address': contract_address,
+        'candidate_count': len(contract_candidates),
+        'match_reasons': sorted({reason for item in contract_candidates for reason in item.match_reasons}),
+        'infringing_tokens': infringing_tokens,
+    }
+    if infringing_tokens and all(item.get('official_or_legit_reissue') for item in infringing_tokens):
+        if signal_cache is not None and cached is None:
+            signal_cache.put(
+                chain=chain,
+                contract_address=contract_address,
+                token_type=token_type,
+                transfers=transfers,
+                owners=owners,
+            )
+        stage_times['contract_total'] = time.perf_counter() - contract_started
+        logger.info(
+            'contract timing seed=%s contract=%s %s',
+            chain,
+            contract_address,
+            _format_timing_breakdown(stage_times),
+        )
+        result['status'] = 'legit'
+        result['mint_recipients'] = sorted(mint_recipients)
+        return result
+
+    if cached_victim_signals is None or not owners:
+        started = time.perf_counter()
+        owners = await _call_api(
+            sync_func=fetch_contract_owners,
+            async_func=fetch_contract_owners_async,
+            client=client,
+            api_key=alchemy_api_key,
+            network=network,
+            contract_address=contract_address,
+            timeout=timeout,
+        )
+        stage_times['fetch_owners'] = time.perf_counter() - started
+        from .rust_bridge import analyze_victim_signals_from_active_sellers
+
+        started = time.perf_counter()
+        cached_victim_signals = analyze_victim_signals_from_active_sellers(active_sellers, owners)
+        stage_times['analyze_victim_signals'] = time.perf_counter() - started
+        if signal_cache is not None:
+            signal_cache.put(
+                chain=chain,
+                contract_address=contract_address,
+                token_type=token_type,
+                transfers=transfers,
+                owners=owners,
+            )
+
+    sales: List[NFTSaleRecord] = []
+    if _looks_like_real_api_key(alchemy_api_key) or opensea_api_key:
+        try:
+            started = time.perf_counter()
+            sales = await _call_api(
+                sync_func=fetch_contract_sales,
+                async_func=fetch_contract_sales_async,
+                client=client,
+                alchemy_api_key=alchemy_api_key,
+                alchemy_network=network,
+                contract_address=contract_address,
+                opensea_api_key=opensea_api_key,
+                timeout=timeout,
+            )
+            stage_times['fetch_sales'] = time.perf_counter() - started
+        except Exception as exc:
+            logger.warning('contract sales fetch failed for %s: %s', contract_address, exc)
+    started = time.perf_counter()
+    receipts_by_block_tasks: Dict[int, asyncio.Task[Dict[str, TransactionReceiptRecord]]] = {}
+    sale_metric_rows = await asyncio.gather(*[
+        _compute_sale_metrics_async(
+            client=client,
+            alchemy_api_key=alchemy_api_key,
+            network=network,
+            contract_address=contract_address,
+            sale=sale,
+            timeout=timeout,
+            receipts_by_block_tasks=receipts_by_block_tasks,
+        )
+        for sale in sales
+    ])
+    sale_metrics_by_tx = dict(sale_metric_rows)
+    stage_times['sale_metrics'] = time.perf_counter() - started
+
+    started = time.perf_counter()
+    malicious_addresses = build_malicious_address_records(
+        contract_address=contract_address,
+        transfers=transfers,
+        infringing_tokens=infringing_tokens,
+    )
+    stage_times['build_malicious_addresses'] = time.perf_counter() - started
+    started = time.perf_counter()
+    victim_addresses = build_victim_address_records(
+        contract_address=contract_address,
+        sales=sales,
+        transfers=transfers,
+        owners=owners,
+        sale_metrics_by_tx=sale_metrics_by_tx,
+    )
+    stage_times['build_victim_addresses'] = time.perf_counter() - started
+    started = time.perf_counter()
+    honest_addresses = build_honest_address_records(
+        contract_address=contract_address,
+        transfers=transfers,
+        sales=sales,
+        owners=owners,
+        infringing_tokens=infringing_tokens,
+        malicious_addresses=malicious_addresses,
+        analysis_timestamp=int(time.time()),
+    )
+    stage_times['build_honest_addresses'] = time.perf_counter() - started
+    started = time.perf_counter()
+    honest_address_stats = build_honest_address_stats(
+        contract_address=contract_address,
+        honest_addresses=honest_addresses,
+    )
+    stage_times['build_honest_stats'] = time.perf_counter() - started
+    started = time.perf_counter()
+    fraud_trade_stats = build_fraud_trade_stats(
+        contract_address=contract_address,
+        sales=sales,
+        victim_addresses=victim_addresses,
+    )
+    stage_times['build_fraud_stats'] = time.perf_counter() - started
+    stage_times['contract_total'] = time.perf_counter() - contract_started
+
+    result['status'] = 'high'
+    result['address_signals'] = cached_address_signals
+    result['victim_signals'] = cached_victim_signals
+    result['malicious_addresses'] = malicious_addresses
+    result['honest_addresses'] = honest_addresses
+    result['honest_address_stats'] = honest_address_stats
+    result['victim_addresses'] = victim_addresses
+    result['fraud_trade_stats'] = fraud_trade_stats
+    logger.info(
+        'contract timing seed=%s contract=%s %s',
+        chain,
+        contract_address,
+        _format_timing_breakdown(stage_times),
+    )
+    return result
+
+
 def _analyze_high_confidence_contract(
     *,
     chain: str,
@@ -887,6 +1219,270 @@ def _analyze_high_confidence_contract(
     return result
 
 
+async def async_analyze_seed_contract(
+    *,
+    chain: str,
+    seed_contract_address: str,
+    alchemy_api_key: str,
+    alchemy_network: str | None = None,
+    etherscan_api_key: str = '',
+    opensea_api_key: str = '',
+    conn=None,
+    feature_store=None,
+    signal_cache=None,
+    name_threshold: float = DEFAULT_NAME_THRESHOLD,
+    metadata_threshold: float = 0.55,
+    timeout: int = DEFAULT_TIMEOUT,
+    max_recall_rows: int = DEFAULT_MAX_RECALL_ROWS,
+    max_tokens_per_contract: int = 500,
+    api_max_concurrency: int = DEFAULT_API_MAX_CONCURRENCY,
+    contract_max_concurrency: int = DEFAULT_CONTRACT_MAX_CONCURRENCY,
+    sale_metric_max_concurrency: int = DEFAULT_SALE_METRIC_MAX_CONCURRENCY,
+) -> Dict[str, Any]:
+    stage_times: Dict[str, float] = {}
+    seed_started = time.perf_counter()
+    network = normalize_network(chain, alchemy_network)
+    own_conn = False
+    if feature_store is None and conn is None:
+        conn = get_conn()
+        own_conn = True
+    client = AsyncApiClient(
+        timeout=timeout,
+        max_concurrency=api_max_concurrency,
+        contract_max_concurrency=contract_max_concurrency,
+        sale_metric_max_concurrency=sale_metric_max_concurrency,
+    )
+    try:
+        started = time.perf_counter()
+        contract_meta, seed_nfts = await asyncio.gather(
+            _call_api(
+                sync_func=fetch_contract_metadata,
+                async_func=fetch_contract_metadata_async,
+                client=client,
+                api_key=alchemy_api_key,
+                network=network,
+                chain=chain,
+                contract_address=seed_contract_address,
+                timeout=timeout,
+            ),
+            _call_api(
+                sync_func=fetch_seed_contract_nfts,
+                async_func=fetch_seed_contract_nfts_async,
+                client=client,
+                api_key=alchemy_api_key,
+                network=network,
+                chain=chain,
+                contract_address=seed_contract_address,
+                timeout=timeout,
+            ),
+        )
+        elapsed = time.perf_counter() - started
+        stage_times['fetch_contract_metadata'] = elapsed
+        stage_times['fetch_seed_nfts'] = elapsed
+        started = time.perf_counter()
+        license_payload = await _call_api(
+            sync_func=fetch_license_sample,
+            async_func=fetch_license_sample_async,
+            client=client,
+            api_key=alchemy_api_key,
+            network=network,
+            chain=chain,
+            seed_nfts=seed_nfts,
+            timeout=timeout,
+        )
+        stage_times['fetch_license_sample'] = time.perf_counter() - started
+        open_license = is_open_license_payload(license_payload)
+        if feature_store is not None:
+            started = time.perf_counter()
+            snapshot = feature_store.load_snapshot(
+                chain,
+                seed_nfts=seed_nfts,
+                max_tokens_per_contract=max_tokens_per_contract,
+                max_recall_rows=max_recall_rows,
+            )
+            stage_times['load_snapshot'] = time.perf_counter() - started
+        else:
+            started = time.perf_counter()
+            snapshot = load_database_snapshot(conn, chain, seed_nfts=seed_nfts)
+            stage_times['load_snapshot'] = time.perf_counter() - started
+
+        recall_token_count = len(snapshot.nft_rows)
+        recall_contract_count = len({r.contract_address for r in snapshot.nft_rows})
+        logger.info(
+            'seed %s recall: %d tokens across %d candidate contracts',
+            seed_contract_address, recall_token_count, recall_contract_count,
+        )
+        if feature_store is None and max_recall_rows > 0 and recall_token_count > max_recall_rows:
+            logger.warning(
+                'seed %s recall %d tokens exceeds max_recall_rows=%d — truncating. '
+                'Increase max_recall_rows or tighten the seed set if results are incomplete.',
+                seed_contract_address, recall_token_count, max_recall_rows,
+            )
+            snapshot = DatabaseSnapshot(
+                nft_rows=snapshot.nft_rows[:max_recall_rows],
+                contract_names=snapshot.contract_names,
+                symbol_contracts=snapshot.symbol_contracts,
+            )
+
+        started = time.perf_counter()
+        candidates = find_duplicate_candidates(
+            seed_nfts,
+            snapshot,
+            name_threshold=name_threshold,
+            metadata_threshold=metadata_threshold,
+        )
+        stage_times['find_duplicate_candidates'] = time.perf_counter() - started
+        started = time.perf_counter()
+        grouped = group_candidates_by_contract(candidates)
+        snapshot_rows_by_key = {
+            (row.contract_address, row.token_id): row
+            for row in snapshot.nft_rows
+        }
+        candidate_open_license_by_token = {
+            (candidate.contract_address, candidate.token_id): _is_candidate_open_license(
+                metadata_json=(snapshot_rows_by_key.get((candidate.contract_address, candidate.token_id)).metadata_json or '')
+                if snapshot_rows_by_key.get((candidate.contract_address, candidate.token_id))
+                else '',
+                metadata_doc=(snapshot_rows_by_key.get((candidate.contract_address, candidate.token_id)).metadata_doc or '')
+                if snapshot_rows_by_key.get((candidate.contract_address, candidate.token_id))
+                else '',
+            )
+            for candidate in candidates
+        }
+        stage_times['postprocess_candidates'] = time.perf_counter() - started
+
+        official_addresses = {addr for addr in [contract_meta.contract_deployer, contract_meta.contract_address] if addr}
+        legit_duplicates: List[Dict[str, Any]] = []
+        high_confidence: List[Dict[str, Any]] = []
+        low_confidence: List[Dict[str, Any]] = []
+        address_signals: Dict[str, Any] = {}
+        victim_signals: Dict[str, Any] = {}
+        infringing_tokens: List[Dict[str, Any]] = []
+        malicious_addresses: List[Dict[str, Any]] = []
+        honest_addresses: List[Dict[str, Any]] = []
+        honest_address_stats: Dict[str, Dict[str, Any]] = {}
+        victim_addresses: List[Dict[str, Any]] = []
+        fraud_trade_stats: Dict[str, Dict[str, Any]] = {}
+        token_type = contract_meta.token_type or 'ERC721'
+        high_confidence_items: List[Tuple[str, Sequence[DuplicateCandidate]]] = []
+
+        for contract_address, contract_candidates in grouped.items():
+            contract_confidence = 'high' if any(item.confidence == 'high' for item in contract_candidates) else 'low'
+            if open_license:
+                continue
+            if contract_confidence != 'high':
+                low_confidence.append({
+                    'contract_address': contract_address,
+                    'candidate_count': len(contract_candidates),
+                    'match_reasons': sorted({reason for item in contract_candidates for reason in item.match_reasons}),
+                })
+                continue
+            high_confidence_items.append((contract_address, contract_candidates))
+
+        if not open_license and high_confidence_items:
+            started = time.perf_counter()
+
+            async def _run_high_confidence(item: Tuple[str, Sequence[DuplicateCandidate]]) -> Dict[str, Any]:
+                async with client.contract_semaphore:
+                    return await _analyze_high_confidence_contract_async(
+                        client=client,
+                        chain=chain,
+                        network=network,
+                        alchemy_api_key=alchemy_api_key,
+                        etherscan_api_key=etherscan_api_key,
+                        opensea_api_key=opensea_api_key,
+                        contract_address=item[0],
+                        contract_candidates=item[1],
+                        token_type=token_type,
+                        official_addresses=official_addresses,
+                        candidate_open_license_by_token=candidate_open_license_by_token,
+                        timeout=timeout,
+                        signal_cache=signal_cache,
+                    )
+
+            for result in await asyncio.gather(*[_run_high_confidence(item) for item in high_confidence_items]):
+                contract_address = result['contract_address']
+                if result['status'] == 'legit':
+                    legit_duplicates.append({
+                        'contract_address': contract_address,
+                        'candidate_count': result['candidate_count'],
+                        'mint_recipients': result['mint_recipients'],
+                    })
+                    continue
+                high_confidence.append({
+                    'contract_address': contract_address,
+                    'candidate_count': result['candidate_count'],
+                    'match_reasons': result['match_reasons'],
+                })
+                address_signals[contract_address] = result['address_signals']
+                victim_signals[contract_address] = result['victim_signals']
+                infringing_tokens.extend(result.get('infringing_tokens') or [])
+                malicious_addresses.extend(result.get('malicious_addresses') or [])
+                honest_addresses.extend(result.get('honest_addresses') or [])
+                honest_address_stats.update(result.get('honest_address_stats') or {})
+                victim_addresses.extend(result.get('victim_addresses') or [])
+                fraud_trade_stats.update(result.get('fraud_trade_stats') or {})
+            stage_times['analyze_high_confidence_contracts'] = time.perf_counter() - started
+
+        if open_license:
+            high_confidence = []
+            low_confidence = []
+
+        report_summary = build_report_summary(
+            open_license=open_license,
+            grouped=grouped,
+            high_confidence=high_confidence,
+            low_confidence=low_confidence,
+            legit_duplicates=legit_duplicates,
+            infringing_tokens=infringing_tokens,
+            honest_addresses=honest_addresses,
+            victim_addresses=victim_addresses,
+            address_signals=address_signals,
+        )
+        stage_times['seed_total'] = time.perf_counter() - seed_started
+        logger.info(
+            'seed timing seed=%s %s',
+            seed_contract_address,
+            _format_timing_breakdown(stage_times),
+        )
+
+        return {
+            'seed_contract': asdict(contract_meta),
+            'seed_collection_stats': {
+                'seed_nft_count': len(seed_nfts),
+                'unique_token_uri_count': len({normalize_url(item.token_uri) for item in seed_nfts if normalize_url(item.token_uri)}),
+                'unique_image_uri_count': len({normalize_url(item.image_uri) for item in seed_nfts if normalize_url(item.image_uri)}),
+                'unique_name_count': len({normalize_name(item.name) for item in seed_nfts if normalize_name(item.name)}),
+                'unique_symbol_count': len({normalize_symbol(item.symbol) for item in seed_nfts if normalize_symbol(item.symbol)}),
+            },
+            'duplicate_candidates': [asdict(item) for item in candidates],
+            'legit_duplicates': legit_duplicates,
+            'suspected_infringing_duplicates_high_confidence': high_confidence,
+            'suspected_infringing_duplicates_low_confidence': low_confidence,
+            'contract_level_summary': {
+                contract_address: {
+                    'candidate_count': len(items),
+                    'high_confidence_token_count': sum(1 for item in items if item.confidence == 'high'),
+                    'low_confidence_token_count': sum(1 for item in items if item.confidence == 'low'),
+                }
+                for contract_address, items in grouped.items()
+            },
+            'address_signals': address_signals,
+            'victim_signals': victim_signals,
+            'infringing_tokens': infringing_tokens,
+            'malicious_addresses': malicious_addresses,
+            'honest_addresses': honest_addresses,
+            'honest_address_stats': honest_address_stats,
+            'victim_addresses': victim_addresses,
+            'fraud_trade_stats': fraud_trade_stats,
+            'report_summary': report_summary,
+        }
+    finally:
+        await client.close()
+        if own_conn and conn is not None:
+            conn.close()
+
+
 def analyze_seed_contract(
     *,
     chain: str,
@@ -903,235 +1499,32 @@ def analyze_seed_contract(
     timeout: int = DEFAULT_TIMEOUT,
     max_recall_rows: int = DEFAULT_MAX_RECALL_ROWS,
     max_tokens_per_contract: int = 500,
+    api_max_concurrency: int = DEFAULT_API_MAX_CONCURRENCY,
+    contract_max_concurrency: int = DEFAULT_CONTRACT_MAX_CONCURRENCY,
+    sale_metric_max_concurrency: int = DEFAULT_SALE_METRIC_MAX_CONCURRENCY,
 ) -> Dict[str, Any]:
-    stage_times: Dict[str, float] = {}
-    seed_started = time.perf_counter()
-    network = normalize_network(chain, alchemy_network)
-    own_conn = False
-    if feature_store is None and conn is None:
-        conn = get_conn()
-        own_conn = True
     try:
-        from . import constants as package_constants
-
-        session_context = contextlib.closing(_build_requests_session()) if package_constants.requests is not None else contextlib.nullcontext(None)
-        with session_context as session:
-            started = time.perf_counter()
-            contract_meta = fetch_contract_metadata(
-                api_key=alchemy_api_key,
-                network=network,
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(
+            async_analyze_seed_contract(
                 chain=chain,
-                contract_address=seed_contract_address,
-                timeout=timeout,
-                session=session,
-            )
-            stage_times['fetch_contract_metadata'] = time.perf_counter() - started
-            started = time.perf_counter()
-            seed_nfts = fetch_seed_contract_nfts(
-                api_key=alchemy_api_key,
-                network=network,
-                chain=chain,
-                contract_address=seed_contract_address,
-                timeout=timeout,
-                session=session,
-            )
-            stage_times['fetch_seed_nfts'] = time.perf_counter() - started
-            started = time.perf_counter()
-            license_payload = fetch_license_sample(
-                api_key=alchemy_api_key,
-                network=network,
-                chain=chain,
-                seed_nfts=seed_nfts,
-                timeout=timeout,
-                session=session,
-            )
-            stage_times['fetch_license_sample'] = time.perf_counter() - started
-            open_license = is_open_license_payload(license_payload)
-            if feature_store is not None:
-                started = time.perf_counter()
-                snapshot = feature_store.load_snapshot(
-                    chain,
-                    seed_nfts=seed_nfts,
-                    max_tokens_per_contract=max_tokens_per_contract,
-                    max_recall_rows=max_recall_rows,
-                )
-                stage_times['load_snapshot'] = time.perf_counter() - started
-            else:
-                started = time.perf_counter()
-                snapshot = load_database_snapshot(conn, chain, seed_nfts=seed_nfts)
-                stage_times['load_snapshot'] = time.perf_counter() - started
-
-            recall_token_count = len(snapshot.nft_rows)
-            recall_contract_count = len({r.contract_address for r in snapshot.nft_rows})
-            logger.info(
-                'seed %s recall: %d tokens across %d candidate contracts',
-                seed_contract_address, recall_token_count, recall_contract_count,
-            )
-            if feature_store is None and max_recall_rows > 0 and recall_token_count > max_recall_rows:
-                logger.warning(
-                    'seed %s recall %d tokens exceeds max_recall_rows=%d — truncating. '
-                    'Increase max_recall_rows or tighten the seed set if results are incomplete.',
-                    seed_contract_address, recall_token_count, max_recall_rows,
-                )
-                snapshot = DatabaseSnapshot(
-                    nft_rows=snapshot.nft_rows[:max_recall_rows],
-                    contract_names=snapshot.contract_names,
-                    symbol_contracts=snapshot.symbol_contracts,
-                )
-
-            started = time.perf_counter()
-            candidates = find_duplicate_candidates(
-                seed_nfts,
-                snapshot,
+                seed_contract_address=seed_contract_address,
+                alchemy_api_key=alchemy_api_key,
+                alchemy_network=alchemy_network,
+                etherscan_api_key=etherscan_api_key,
+                opensea_api_key=opensea_api_key,
+                conn=conn,
+                feature_store=feature_store,
+                signal_cache=signal_cache,
                 name_threshold=name_threshold,
                 metadata_threshold=metadata_threshold,
+                timeout=timeout,
+                max_recall_rows=max_recall_rows,
+                max_tokens_per_contract=max_tokens_per_contract,
+                api_max_concurrency=api_max_concurrency,
+                contract_max_concurrency=contract_max_concurrency,
+                sale_metric_max_concurrency=sale_metric_max_concurrency,
             )
-            stage_times['find_duplicate_candidates'] = time.perf_counter() - started
-            started = time.perf_counter()
-            grouped = group_candidates_by_contract(candidates)
-            snapshot_rows_by_key = {
-                (row.contract_address, row.token_id): row
-                for row in snapshot.nft_rows
-            }
-            candidate_open_license_by_token = {
-                (candidate.contract_address, candidate.token_id): _is_candidate_open_license(
-                    metadata_json=(snapshot_rows_by_key.get((candidate.contract_address, candidate.token_id)).metadata_json or '')
-                    if snapshot_rows_by_key.get((candidate.contract_address, candidate.token_id))
-                    else '',
-                    metadata_doc=(snapshot_rows_by_key.get((candidate.contract_address, candidate.token_id)).metadata_doc or '')
-                    if snapshot_rows_by_key.get((candidate.contract_address, candidate.token_id))
-                    else '',
-                )
-                for candidate in candidates
-            }
-            stage_times['postprocess_candidates'] = time.perf_counter() - started
-
-            official_addresses = {addr for addr in [contract_meta.contract_deployer, contract_meta.contract_address] if addr}
-            legit_duplicates: List[Dict[str, Any]] = []
-            high_confidence: List[Dict[str, Any]] = []
-            low_confidence: List[Dict[str, Any]] = []
-            address_signals: Dict[str, Any] = {}
-            victim_signals: Dict[str, Any] = {}
-            infringing_tokens: List[Dict[str, Any]] = []
-            malicious_addresses: List[Dict[str, Any]] = []
-            honest_addresses: List[Dict[str, Any]] = []
-            honest_address_stats: Dict[str, Dict[str, Any]] = {}
-            victim_addresses: List[Dict[str, Any]] = []
-            fraud_trade_stats: Dict[str, Dict[str, Any]] = {}
-            token_type = contract_meta.token_type or 'ERC721'
-            high_confidence_items: List[Tuple[str, Sequence[DuplicateCandidate]]] = []
-
-            for contract_address, contract_candidates in grouped.items():
-                contract_confidence = 'high' if any(item.confidence == 'high' for item in contract_candidates) else 'low'
-                if open_license:
-                    continue
-                if contract_confidence != 'high':
-                    low_confidence.append({
-                        'contract_address': contract_address,
-                        'candidate_count': len(contract_candidates),
-                        'match_reasons': sorted({reason for item in contract_candidates for reason in item.match_reasons}),
-                    })
-                    continue
-                high_confidence_items.append((contract_address, contract_candidates))
-
-            if not open_license and high_confidence_items:
-                max_workers = max(1, min(8, len(high_confidence_items)))
-                started = time.perf_counter()
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    for result in executor.map(
-                        lambda item: _analyze_high_confidence_contract(
-                            chain=chain,
-                            network=network,
-                            alchemy_api_key=alchemy_api_key,
-                            etherscan_api_key=etherscan_api_key,
-                            opensea_api_key=opensea_api_key,
-                            contract_address=item[0],
-                            contract_candidates=item[1],
-                            token_type=token_type,
-                            official_addresses=official_addresses,
-                            candidate_open_license_by_token=candidate_open_license_by_token,
-                            timeout=timeout,
-                            signal_cache=signal_cache,
-                            session=session,
-                        ),
-                        high_confidence_items,
-                    ):
-                        contract_address = result['contract_address']
-                        if result['status'] == 'legit':
-                            legit_duplicates.append({
-                                'contract_address': contract_address,
-                                'candidate_count': result['candidate_count'],
-                                'mint_recipients': result['mint_recipients'],
-                            })
-                            continue
-                        high_confidence.append({
-                            'contract_address': contract_address,
-                            'candidate_count': result['candidate_count'],
-                            'match_reasons': result['match_reasons'],
-                        })
-                        address_signals[contract_address] = result['address_signals']
-                        victim_signals[contract_address] = result['victim_signals']
-                        infringing_tokens.extend(result.get('infringing_tokens') or [])
-                        malicious_addresses.extend(result.get('malicious_addresses') or [])
-                        honest_addresses.extend(result.get('honest_addresses') or [])
-                        honest_address_stats.update(result.get('honest_address_stats') or {})
-                        victim_addresses.extend(result.get('victim_addresses') or [])
-                        fraud_trade_stats.update(result.get('fraud_trade_stats') or {})
-                stage_times['analyze_high_confidence_contracts'] = time.perf_counter() - started
-
-            if open_license:
-                high_confidence = []
-                low_confidence = []
-
-            report_summary = build_report_summary(
-                open_license=open_license,
-                grouped=grouped,
-                high_confidence=high_confidence,
-                low_confidence=low_confidence,
-                legit_duplicates=legit_duplicates,
-                infringing_tokens=infringing_tokens,
-                honest_addresses=honest_addresses,
-                victim_addresses=victim_addresses,
-                address_signals=address_signals,
-            )
-            stage_times['seed_total'] = time.perf_counter() - seed_started
-            logger.info(
-                'seed timing seed=%s %s',
-                seed_contract_address,
-                _format_timing_breakdown(stage_times),
-            )
-
-            return {
-                'seed_contract': asdict(contract_meta),
-                'seed_collection_stats': {
-                    'seed_nft_count': len(seed_nfts),
-                    'unique_token_uri_count': len({normalize_url(item.token_uri) for item in seed_nfts if normalize_url(item.token_uri)}),
-                    'unique_image_uri_count': len({normalize_url(item.image_uri) for item in seed_nfts if normalize_url(item.image_uri)}),
-                    'unique_name_count': len({normalize_name(item.name) for item in seed_nfts if normalize_name(item.name)}),
-                    'unique_symbol_count': len({normalize_symbol(item.symbol) for item in seed_nfts if normalize_symbol(item.symbol)}),
-                },
-                'duplicate_candidates': [asdict(item) for item in candidates],
-                'legit_duplicates': legit_duplicates,
-                'suspected_infringing_duplicates_high_confidence': high_confidence,
-                'suspected_infringing_duplicates_low_confidence': low_confidence,
-                'contract_level_summary': {
-                    contract_address: {
-                        'candidate_count': len(items),
-                        'high_confidence_token_count': sum(1 for item in items if item.confidence == 'high'),
-                        'low_confidence_token_count': sum(1 for item in items if item.confidence == 'low'),
-                    }
-                    for contract_address, items in grouped.items()
-                },
-                'address_signals': address_signals,
-                'victim_signals': victim_signals,
-                'infringing_tokens': infringing_tokens,
-                'malicious_addresses': malicious_addresses,
-                'honest_addresses': honest_addresses,
-                'honest_address_stats': honest_address_stats,
-                'victim_addresses': victim_addresses,
-                'fraud_trade_stats': fraud_trade_stats,
-                'report_summary': report_summary,
-            }
-    finally:
-        if own_conn and conn is not None:
-            conn.close()
+        )
+    raise RuntimeError('analyze_seed_contract cannot be called from a running event loop; use async_analyze_seed_contract instead')

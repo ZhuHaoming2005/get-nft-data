@@ -1396,6 +1396,14 @@ class ParserNetworkDefaultTests(unittest.TestCase):
 
         self.assertEqual(args.alchemy_network, '')
 
+    def test_parser_exposes_async_concurrency_limits(self):
+        parser = mod.build_parser()
+        args = parser.parse_args(['--chain', 'ethereum', '--seed-contract-address', '0xseed'])
+
+        self.assertEqual(args.api_max_concurrency, constants_mod.DEFAULT_API_MAX_CONCURRENCY)
+        self.assertEqual(args.contract_max_concurrency, constants_mod.DEFAULT_CONTRACT_MAX_CONCURRENCY)
+        self.assertEqual(args.sale_metric_max_concurrency, constants_mod.DEFAULT_SALE_METRIC_MAX_CONCURRENCY)
+
     def test_public_api_is_reexported_from_split_modules(self):
         self.assertEqual(mod.fetch_seed_contract_nfts.__module__, 'top_contract_analysis.alchemy_api')
         self.assertEqual(mod.fetch_contract_sales.__module__, 'top_contract_analysis.sales')
@@ -1437,6 +1445,40 @@ class ParserNetworkDefaultTests(unittest.TestCase):
         for filename in ['analysis.py', 'cli.py', 'sales.py', 'alchemy_api.py']:
             text = (package_dir / filename).read_text(encoding='utf-8')
             self.assertNotIn('importlib', text, filename)
+
+
+class AsyncApiExportsTests(unittest.TestCase):
+    def test_public_api_reexports_async_entrypoints(self):
+        self.assertTrue(hasattr(mod, 'fetch_contract_metadata_async'))
+        self.assertTrue(hasattr(mod, 'fetch_contract_sales_async'))
+        self.assertTrue(hasattr(mod, 'fetch_contract_transfers_async'))
+        self.assertTrue(hasattr(mod, 'fetch_contract_owners_async'))
+        self.assertTrue(hasattr(mod, 'async_analyze_seed_contract'))
+
+
+class SyncWrapperTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_fetch_contract_transfers_uses_async_client(self):
+        class FakeClient:
+            async def post_json(self, url, payload):
+                self.last_url = url
+                self.last_payload = payload
+                return {'result': {'transfers': []}}
+
+        client = FakeClient()
+        rows = await mod.fetch_contract_transfers_async(
+            client=client,
+            alchemy_api_key='alchemy',
+            alchemy_network='eth-mainnet',
+            etherscan_api_key='etherscan',
+            chain='ethereum',
+            contract_address='0xdup',
+            token_type='ERC721',
+            timeout=1,
+        )
+
+        self.assertEqual(rows, [])
+        self.assertIn('eth-mainnet.g.alchemy.com', client.last_url)
+        self.assertEqual(client.last_payload['method'], 'alchemy_getAssetTransfers')
 
 
 class HumanReadableReportTests(unittest.TestCase):
@@ -1839,6 +1881,27 @@ class OutputNamingTests(unittest.TestCase):
                     path.rmdir()
             if tmpdir.exists():
                 tmpdir.rmdir()
+
+    def test_main_passes_async_concurrency_args(self):
+        payload = {'seed_contract': {'name': 'Bored Ape Yacht Club', 'contract_address': '0xseed'}}
+
+        with patch.object(cli_mod, 'analyze_seed_contract', return_value=payload) as mocked:
+            with patch.object(cli_mod, 'write_default_outputs'):
+                with patch('sys.argv', [
+                    'top_contract_analysis',
+                    '--chain', 'ethereum',
+                    '--seed-contract-address', '0xseed',
+                    '--alchemy-api-key', 'alchemy',
+                    '--api-max-concurrency', '21',
+                    '--contract-max-concurrency', '5',
+                    '--sale-metric-max-concurrency', '7',
+                ]):
+                    result = mod.main()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(mocked.call_args.kwargs['api_max_concurrency'], 21)
+        self.assertEqual(mocked.call_args.kwargs['contract_max_concurrency'], 5)
+        self.assertEqual(mocked.call_args.kwargs['sale_metric_max_concurrency'], 7)
 
 
 if __name__ == '__main__':

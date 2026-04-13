@@ -25,6 +25,22 @@ def export_chain_snapshot_to_parquet(
     target = Path(output_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     writer: pq.ParquetWriter | None = None
+    metadata_column = 'metadata'
+    with conn.cursor() as schema_cur:
+        schema_cur.execute(
+            '''
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = %s
+              AND column_name IN ('raw_metadata', 'metadata')
+            ORDER BY CASE WHEN column_name = 'raw_metadata' THEN 0 ELSE 1 END
+            LIMIT 1
+            ''',
+            (table,),
+        )
+        row = schema_cur.fetchone()
+        if row and row[0]:
+            metadata_column = str(row[0])
     schema_fields = [
         ('chain', pa.string()),
         ('contract_address', pa.string()),
@@ -52,7 +68,7 @@ def export_chain_snapshot_to_parquet(
         cur.execute(
             f'''
             SELECT lower(contract_address), token_id::text, coalesce(token_uri, ''), coalesce(image_uri, ''),
-                   coalesce(name, ''), coalesce(symbol, ''), coalesce(metadata::text, '')
+                   coalesce(name, ''), coalesce(symbol, ''), coalesce({metadata_column}::text, '')
             FROM {table}
             ORDER BY id
             '''
