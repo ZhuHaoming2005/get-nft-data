@@ -214,6 +214,117 @@ class AsyncSeedAnalysisTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload['report_summary']['high_confidence_contract_count'], 3)
         self.assertEqual(peak, 2)
 
+    async def test_async_analyze_seed_contract_reports_progress_stages_and_contract_completion(self):
+        seed_meta = mod.ContractMetadata(
+            chain='ethereum',
+            contract_address='0xseed',
+            token_type='ERC721',
+            contract_deployer='0xcreator',
+            deployed_block_number=123,
+            name='Azuki',
+            symbol='AZUKI',
+        )
+        seed_nfts = [
+            mod.SeedNFT(
+                chain='ethereum',
+                contract_address='0xseed',
+                token_id='1',
+                name='Azuki #1',
+                symbol='AZUKI',
+                token_uri='ipfs://seed/1',
+                image_uri='ipfs://seed/1.png',
+            )
+        ]
+        candidates = [
+            mod.DuplicateCandidate(
+                contract_address='0xdup1',
+                token_id='1',
+                match_reasons=('token_uri_match',),
+                confidence='high',
+                token_uri='ipfs://seed/1',
+                image_uri='',
+                name='Azuki Mirror #1',
+                symbol='AZUKI',
+            ),
+            mod.DuplicateCandidate(
+                contract_address='0xdup2',
+                token_id='2',
+                match_reasons=('token_uri_match',),
+                confidence='high',
+                token_uri='ipfs://seed/2',
+                image_uri='',
+                name='Azuki Mirror #2',
+                symbol='AZUKI',
+            ),
+        ]
+        feature_store = SimpleNamespace(load_snapshot=lambda *args, **kwargs: mod.DatabaseSnapshot())
+
+        class StubProgressReporter:
+            def __init__(self):
+                self.events = []
+
+            def on_seed_stage(self, stage, **kwargs):
+                self.events.append(('stage', stage, kwargs))
+
+            def on_high_confidence_contracts_started(self, *, total):
+                self.events.append(('contracts_started', total))
+
+            def on_high_confidence_contract_completed(self, *, contract_address, completed, total):
+                self.events.append(('contract_completed', contract_address, completed, total))
+
+            def on_seed_completed(self, **kwargs):
+                self.events.append(('seed_completed', kwargs))
+
+        reporter = StubProgressReporter()
+
+        async def fake_contract_metadata_async(**kwargs):
+            del kwargs
+            return seed_meta
+
+        async def fake_seed_nfts_async(**kwargs):
+            del kwargs
+            return seed_nfts
+
+        async def fake_license_sample_async(**kwargs):
+            del kwargs
+            return {}
+
+        async def fake_high_confidence_async(**kwargs):
+            return {
+                'contract_address': kwargs['contract_address'],
+                'status': 'high',
+                'candidate_count': len(kwargs['contract_candidates']),
+                'match_reasons': ['token_uri_match'],
+                'address_signals': {},
+                'victim_signals': {},
+                'infringing_tokens': [],
+                'malicious_addresses': [],
+                'honest_addresses': [],
+                'honest_address_stats': {},
+                'victim_addresses': [],
+                'fraud_trade_stats': {},
+            }
+
+        with patch.object(analysis_mod, 'fetch_contract_metadata_async', side_effect=fake_contract_metadata_async), \
+             patch.object(analysis_mod, 'fetch_seed_contract_nfts_async', side_effect=fake_seed_nfts_async), \
+             patch.object(analysis_mod, 'fetch_license_sample_async', side_effect=fake_license_sample_async), \
+             patch.object(analysis_mod, 'find_duplicate_candidates', return_value=candidates), \
+             patch.object(analysis_mod, '_analyze_high_confidence_contract_async', side_effect=fake_high_confidence_async):
+            payload = await analysis_mod.async_analyze_seed_contract(
+                chain='ethereum',
+                seed_contract_address='0xseed',
+                alchemy_api_key='realistic-api-key-123',
+                feature_store=feature_store,
+                progress_reporter=reporter,
+            )
+
+        self.assertEqual(payload['report_summary']['high_confidence_contract_count'], 2)
+        self.assertIn(('contracts_started', 2), reporter.events)
+        self.assertIn(('contract_completed', '0xdup1', 1, 2), reporter.events)
+        self.assertIn(('contract_completed', '0xdup2', 2, 2), reporter.events)
+        self.assertTrue(any(event[0] == 'stage' and event[1] == 'load_snapshot' for event in reporter.events))
+        self.assertTrue(any(event[0] == 'seed_completed' for event in reporter.events))
+
 
 class AsyncSaleMetricTests(unittest.IsolatedAsyncioTestCase):
     async def test_high_confidence_contract_limits_sale_metric_concurrency(self):
@@ -2049,6 +2160,96 @@ class BatchEntryTests(unittest.TestCase):
             if tmpdir.exists():
                 tmpdir.rmdir()
 
+    def test_batch_main_passes_progress_reporter_to_seed_analysis(self):
+        tmpdir = Path('D:/code/solidity/get-nft-data/output/test-top-contract-analysis-batch-progress')
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        seeds_path = tmpdir / 'seeds.txt'
+        seeds_path.write_text('0xseed1\n', encoding='utf-8')
+        payload = {
+            'seed_contract': {
+                'chain': 'ethereum',
+                'contract_address': '0xseed1',
+                'token_type': 'ERC721',
+                'contract_deployer': '0xcreator',
+                'deployed_block_number': 1,
+                'name': 'Azuki',
+                'symbol': 'AZUKI',
+            },
+            'seed_collection_stats': {
+                'seed_nft_count': 1,
+                'unique_token_uri_count': 1,
+                'unique_image_uri_count': 1,
+                'unique_name_count': 1,
+                'unique_symbol_count': 1,
+            },
+            'duplicate_candidates': [],
+            'legit_duplicates': [],
+            'suspected_infringing_duplicates_high_confidence': [],
+            'suspected_infringing_duplicates_low_confidence': [],
+            'contract_level_summary': {},
+            'address_signals': {},
+            'victim_signals': {},
+            'report_summary': {
+                'open_license_detected': False,
+                'candidate_contract_count': 0,
+                'high_confidence_contract_count': 0,
+                'low_confidence_contract_count': 0,
+                'legit_duplicate_contract_count': 0,
+            },
+        }
+
+        class StubBatchReporter:
+            def __init__(self):
+                self.started = []
+                self.finished = []
+                self.seed_reporters = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def on_seed_started(self, seed_address):
+                self.started.append(seed_address)
+
+            def on_seed_finished(self, seed_address):
+                self.finished.append(seed_address)
+
+            def on_seed_failed(self, seed_address, exc):
+                raise AssertionError(f'unexpected failure for {seed_address}: {exc}')
+
+            def create_seed_reporter(self, seed_address):
+                reporter = object()
+                self.seed_reporters[seed_address] = reporter
+                return reporter
+
+        reporter = StubBatchReporter()
+        try:
+            with patch.object(batch_mod, 'analyze_seed_contract', return_value=payload) as analyze_mock, \
+                 patch.object(batch_mod, 'create_batch_progress_reporter', return_value=reporter):
+                code = batch_mod.main(
+                    [
+                        '--chain', 'ethereum',
+                        '--seed-file', str(seeds_path),
+                        '--alchemy-api-key', 'alchemy',
+                        '--output-dir', str(tmpdir / 'results'),
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(reporter.started, ['0xseed1'])
+            self.assertEqual(reporter.finished, ['0xseed1'])
+            self.assertIs(analyze_mock.call_args.kwargs['progress_reporter'], reporter.seed_reporters['0xseed1'])
+        finally:
+            for path in sorted(tmpdir.glob('**/*'), reverse=True):
+                if path.is_file():
+                    path.unlink()
+                elif path.is_dir():
+                    path.rmdir()
+            if tmpdir.exists():
+                tmpdir.rmdir()
+
     def test_batch_main_reuses_feature_store_loaded_from_parquet(self):
         tmpdir = Path('D:/code/solidity/get-nft-data/output/test-top-contract-analysis-batch-feature-store')
         tmpdir.mkdir(parents=True, exist_ok=True)
@@ -2411,6 +2612,74 @@ class SingleEntryOfflineTests(unittest.TestCase):
             self.assertIsNotNone(analyze_mock.call_args.kwargs['feature_store'])
             self.assertIsNotNone(analyze_mock.call_args.kwargs['signal_cache'])
             self.assertTrue(output_path.exists())
+        finally:
+            for path in sorted(tmpdir.glob('**/*'), reverse=True):
+                if path.is_file():
+                    path.unlink()
+                elif path.is_dir():
+                    path.rmdir()
+            if tmpdir.exists():
+                tmpdir.rmdir()
+
+    def test_main_passes_progress_reporter_to_analyze_seed_contract(self):
+        tmpdir = Path('D:/code/solidity/get-nft-data/output/test-top-contract-analysis-single-entry-progress')
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        output_path = tmpdir / 'result.json'
+        payload = {
+            'seed_contract': {
+                'chain': 'ethereum',
+                'contract_address': '0xseed',
+                'token_type': 'ERC721',
+                'contract_deployer': '0xcreator',
+                'deployed_block_number': 1,
+                'name': 'Azuki',
+                'symbol': 'AZUKI',
+            },
+            'seed_collection_stats': {
+                'seed_nft_count': 1,
+                'unique_token_uri_count': 1,
+                'unique_image_uri_count': 1,
+                'unique_name_count': 1,
+                'unique_symbol_count': 1,
+            },
+            'duplicate_candidates': [],
+            'legit_duplicates': [],
+            'suspected_infringing_duplicates_high_confidence': [],
+            'suspected_infringing_duplicates_low_confidence': [],
+            'contract_level_summary': {},
+            'address_signals': {},
+            'victim_signals': {},
+            'report_summary': {
+                'open_license_detected': False,
+                'candidate_contract_count': 0,
+                'high_confidence_contract_count': 0,
+                'low_confidence_contract_count': 0,
+                'legit_duplicate_contract_count': 0,
+            },
+        }
+
+        class StubSingleReporter:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        reporter = StubSingleReporter()
+        try:
+            with patch.object(cli_mod, 'analyze_seed_contract', return_value=payload) as analyze_mock, \
+                 patch.object(cli_mod, 'create_single_seed_progress_reporter', return_value=reporter):
+                code = cli_mod.main(
+                    [
+                        '--chain', 'ethereum',
+                        '--seed-contract-address', '0xseed',
+                        '--alchemy-api-key', 'alchemy',
+                        '--output', str(output_path),
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertIs(analyze_mock.call_args.kwargs['progress_reporter'], reporter)
         finally:
             for path in sorted(tmpdir.glob('**/*'), reverse=True):
                 if path.is_file():

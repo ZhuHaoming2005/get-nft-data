@@ -10,6 +10,7 @@ from .analysis import analyze_seed_contract
 from .constants import DEFAULT_MAX_RECALL_ROWS
 from .reporting import write_batch_summary_outputs, write_outputs_to_directory
 from .duckdb_store import DuckDBFeatureStore
+from .progress import create_batch_progress_reporter
 from .signal_cache import ContractSignalCache
 
 
@@ -91,6 +92,7 @@ def _analyze_one_seed(
     args: argparse.Namespace,
     feature_store: DuckDBFeatureStore | None = None,
     signal_cache: ContractSignalCache | None = None,
+    progress_reporter=None,
 ) -> dict:
     return analyze_seed_contract(
         chain=args.chain,
@@ -106,6 +108,7 @@ def _analyze_one_seed(
         timeout=args.timeout,
         max_recall_rows=args.max_recall_rows,
         max_tokens_per_contract=args.max_tokens_per_contract,
+        progress_reporter=progress_reporter,
     )
 
 
@@ -123,31 +126,60 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         pending_seeds = [seed for seed in seed_addresses if seed not in cached_entries]
         fresh_entries: dict[str, dict] = {}
-
-        if args.workers <= 1:
-            for seed_address in pending_seeds:
-                payload = _analyze_one_seed(seed_address, args, feature_store=feature_store, signal_cache=signal_cache)
-                json_path, md_path = write_outputs_to_directory(payload, args.output_dir)
-                fresh_entries[seed_address] = {
-                    'seed_contract': payload.get('seed_contract') or {},
-                    'report_summary': payload.get('report_summary') or {},
-                    'output_files': {'json': json_path.name, 'markdown': md_path.name},
-                }
-        else:
-            with ThreadPoolExecutor(max_workers=args.workers) as executor:
-                for seed_address, payload in zip(
-                    pending_seeds,
-                    executor.map(
-                        lambda seed: _analyze_one_seed(seed, args, feature_store=feature_store, signal_cache=signal_cache),
-                        pending_seeds,
-                    ),
-                ):
+        with create_batch_progress_reporter(
+            seed_addresses=seed_addresses,
+            workers=args.workers,
+            initial_completed=len(cached_entries),
+        ) as progress_reporter:
+            if args.workers <= 1:
+                for seed_address in pending_seeds:
+                    progress_reporter.on_seed_started(seed_address)
+                    try:
+                        payload = _analyze_one_seed(
+                            seed_address,
+                            args,
+                            feature_store=feature_store,
+                            signal_cache=signal_cache,
+                            progress_reporter=progress_reporter.create_seed_reporter(seed_address),
+                        )
+                    except Exception as exc:
+                        progress_reporter.on_seed_failed(seed_address, exc)
+                        raise
+                    progress_reporter.on_seed_finished(seed_address)
                     json_path, md_path = write_outputs_to_directory(payload, args.output_dir)
                     fresh_entries[seed_address] = {
                         'seed_contract': payload.get('seed_contract') or {},
                         'report_summary': payload.get('report_summary') or {},
                         'output_files': {'json': json_path.name, 'markdown': md_path.name},
                     }
+            else:
+                def _run(seed: str):
+                    progress_reporter.on_seed_started(seed)
+                    try:
+                        payload = _analyze_one_seed(
+                            seed,
+                            args,
+                            feature_store=feature_store,
+                            signal_cache=signal_cache,
+                            progress_reporter=progress_reporter.create_seed_reporter(seed),
+                        )
+                    except Exception as exc:
+                        progress_reporter.on_seed_failed(seed, exc)
+                        raise
+                    progress_reporter.on_seed_finished(seed)
+                    return payload
+
+                with ThreadPoolExecutor(max_workers=args.workers) as executor:
+                    for seed_address, payload in zip(
+                        pending_seeds,
+                        executor.map(_run, pending_seeds),
+                    ):
+                        json_path, md_path = write_outputs_to_directory(payload, args.output_dir)
+                        fresh_entries[seed_address] = {
+                            'seed_contract': payload.get('seed_contract') or {},
+                            'report_summary': payload.get('report_summary') or {},
+                            'output_files': {'json': json_path.name, 'markdown': md_path.name},
+                        }
 
         summary_entries = [
             cached_entries.get(seed_address) or fresh_entries[seed_address]

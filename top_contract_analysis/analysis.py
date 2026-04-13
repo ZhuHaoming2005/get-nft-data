@@ -47,6 +47,18 @@ from .sales import ETH_PRICED_SYMBOLS, _looks_like_real_api_key, fetch_contract_
 from .snapshot import find_duplicate_candidates, group_candidates_by_contract, load_database_snapshot
 
 
+def _notify_progress(progress_reporter, method_name: str, *args, **kwargs) -> None:
+    if progress_reporter is None:
+        return
+    method = getattr(progress_reporter, method_name, None)
+    if method is None:
+        return
+    try:
+        method(*args, **kwargs)
+    except Exception:
+        logger.debug('progress reporter method failed: %s', method_name, exc_info=True)
+
+
 def _is_eth_priced_sale(sale: NFTSaleRecord) -> bool:
     return sale.price_eth is not None and sale.payment_token_symbol in ETH_PRICED_SYMBOLS
 
@@ -1238,6 +1250,7 @@ async def async_analyze_seed_contract(
     api_max_concurrency: int = DEFAULT_API_MAX_CONCURRENCY,
     contract_max_concurrency: int = DEFAULT_CONTRACT_MAX_CONCURRENCY,
     sale_metric_max_concurrency: int = DEFAULT_SALE_METRIC_MAX_CONCURRENCY,
+    progress_reporter=None,
 ) -> Dict[str, Any]:
     stage_times: Dict[str, float] = {}
     seed_started = time.perf_counter()
@@ -1253,6 +1266,7 @@ async def async_analyze_seed_contract(
         sale_metric_max_concurrency=sale_metric_max_concurrency,
     )
     try:
+        _notify_progress(progress_reporter, 'on_seed_stage', 'fetch_seed_context', seed_contract_address=seed_contract_address)
         started = time.perf_counter()
         contract_meta, seed_nfts = await asyncio.gather(
             _call_api(
@@ -1280,6 +1294,7 @@ async def async_analyze_seed_contract(
         stage_times['fetch_contract_metadata'] = elapsed
         stage_times['fetch_seed_nfts'] = elapsed
         started = time.perf_counter()
+        _notify_progress(progress_reporter, 'on_seed_stage', 'fetch_license_sample', seed_contract_address=seed_contract_address)
         license_payload = await _call_api(
             sync_func=fetch_license_sample,
             async_func=fetch_license_sample_async,
@@ -1294,6 +1309,7 @@ async def async_analyze_seed_contract(
         open_license = is_open_license_payload(license_payload)
         if feature_store is not None:
             started = time.perf_counter()
+            _notify_progress(progress_reporter, 'on_seed_stage', 'load_snapshot', seed_contract_address=seed_contract_address)
             snapshot = feature_store.load_snapshot(
                 chain,
                 seed_nfts=seed_nfts,
@@ -1303,6 +1319,7 @@ async def async_analyze_seed_contract(
             stage_times['load_snapshot'] = time.perf_counter() - started
         else:
             started = time.perf_counter()
+            _notify_progress(progress_reporter, 'on_seed_stage', 'load_snapshot', seed_contract_address=seed_contract_address)
             snapshot = load_database_snapshot(conn, chain, seed_nfts=seed_nfts)
             stage_times['load_snapshot'] = time.perf_counter() - started
 
@@ -1325,6 +1342,7 @@ async def async_analyze_seed_contract(
             )
 
         started = time.perf_counter()
+        _notify_progress(progress_reporter, 'on_seed_stage', 'find_duplicate_candidates', seed_contract_address=seed_contract_address)
         candidates = find_duplicate_candidates(
             seed_nfts,
             snapshot,
@@ -1333,6 +1351,7 @@ async def async_analyze_seed_contract(
         )
         stage_times['find_duplicate_candidates'] = time.perf_counter() - started
         started = time.perf_counter()
+        _notify_progress(progress_reporter, 'on_seed_stage', 'postprocess_candidates', seed_contract_address=seed_contract_address)
         grouped = group_candidates_by_contract(candidates)
         snapshot_rows_by_key = {
             (row.contract_address, row.token_id): row
@@ -1381,6 +1400,13 @@ async def async_analyze_seed_contract(
 
         if not open_license and high_confidence_items:
             started = time.perf_counter()
+            _notify_progress(
+                progress_reporter,
+                'on_seed_stage',
+                'analyze_high_confidence_contracts',
+                seed_contract_address=seed_contract_address,
+            )
+            _notify_progress(progress_reporter, 'on_high_confidence_contracts_started', total=len(high_confidence_items))
 
             async def _run_high_confidence(item: Tuple[str, Sequence[DuplicateCandidate]]) -> Dict[str, Any]:
                 async with client.contract_semaphore:
@@ -1400,8 +1426,17 @@ async def async_analyze_seed_contract(
                         signal_cache=signal_cache,
                     )
 
+            completed_contracts = 0
             for result in await asyncio.gather(*[_run_high_confidence(item) for item in high_confidence_items]):
+                completed_contracts += 1
                 contract_address = result['contract_address']
+                _notify_progress(
+                    progress_reporter,
+                    'on_high_confidence_contract_completed',
+                    contract_address=contract_address,
+                    completed=completed_contracts,
+                    total=len(high_confidence_items),
+                )
                 if result['status'] == 'legit':
                     legit_duplicates.append({
                         'contract_address': contract_address,
@@ -1423,11 +1458,14 @@ async def async_analyze_seed_contract(
                 victim_addresses.extend(result.get('victim_addresses') or [])
                 fraud_trade_stats.update(result.get('fraud_trade_stats') or {})
             stage_times['analyze_high_confidence_contracts'] = time.perf_counter() - started
+        else:
+            _notify_progress(progress_reporter, 'on_high_confidence_contracts_started', total=0)
 
         if open_license:
             high_confidence = []
             low_confidence = []
 
+        _notify_progress(progress_reporter, 'on_seed_stage', 'finalize_report', seed_contract_address=seed_contract_address)
         report_summary = build_report_summary(
             open_license=open_license,
             grouped=grouped,
@@ -1444,6 +1482,12 @@ async def async_analyze_seed_contract(
             'seed timing seed=%s %s',
             seed_contract_address,
             _format_timing_breakdown(stage_times),
+        )
+        _notify_progress(
+            progress_reporter,
+            'on_seed_completed',
+            seed_contract_address=seed_contract_address,
+            report_summary=report_summary,
         )
 
         return {
@@ -1502,6 +1546,7 @@ def analyze_seed_contract(
     api_max_concurrency: int = DEFAULT_API_MAX_CONCURRENCY,
     contract_max_concurrency: int = DEFAULT_CONTRACT_MAX_CONCURRENCY,
     sale_metric_max_concurrency: int = DEFAULT_SALE_METRIC_MAX_CONCURRENCY,
+    progress_reporter=None,
 ) -> Dict[str, Any]:
     try:
         asyncio.get_running_loop()
@@ -1525,6 +1570,7 @@ def analyze_seed_contract(
                 api_max_concurrency=api_max_concurrency,
                 contract_max_concurrency=contract_max_concurrency,
                 sale_metric_max_concurrency=sale_metric_max_concurrency,
+                progress_reporter=progress_reporter,
             )
         )
     raise RuntimeError('analyze_seed_contract cannot be called from a running event loop; use async_analyze_seed_contract instead')

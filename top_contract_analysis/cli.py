@@ -14,6 +14,7 @@ from .constants import (
     DEFAULT_TIMEOUT,
 )
 from .analysis import analyze_seed_contract
+from .progress import create_single_seed_progress_reporter
 from .reporting import write_default_outputs
 
 
@@ -63,24 +64,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     elif args.feature_db != ':memory:' and Path(args.feature_db).exists():
         feature_store = DuckDBFeatureStore(database_path=args.feature_db)
     try:
-        payload = analyze_seed_contract(
-            chain=args.chain,
-            seed_contract_address=args.seed_contract_address.lower(),
-            alchemy_api_key=args.alchemy_api_key,
-            alchemy_network=args.alchemy_network or None,
-            etherscan_api_key=args.etherscan_api_key,
-            opensea_api_key=args.opensea_api_key,
-            feature_store=feature_store,
-            signal_cache=signal_cache,
-            name_threshold=args.name_threshold,
-            metadata_threshold=args.metadata_threshold,
-            timeout=args.timeout,
-            max_tokens_per_contract=args.max_tokens_per_contract,
-            max_recall_rows=args.max_recall_rows,
-            api_max_concurrency=args.api_max_concurrency,
-            contract_max_concurrency=args.contract_max_concurrency,
-            sale_metric_max_concurrency=args.sale_metric_max_concurrency,
-        )
+        with create_single_seed_progress_reporter(seed_address=args.seed_contract_address.lower()) as progress_reporter:
+            payload = analyze_seed_contract(
+                chain=args.chain,
+                seed_contract_address=args.seed_contract_address.lower(),
+                alchemy_api_key=args.alchemy_api_key,
+                alchemy_network=args.alchemy_network or None,
+                etherscan_api_key=args.etherscan_api_key,
+                opensea_api_key=args.opensea_api_key,
+                feature_store=feature_store,
+                signal_cache=signal_cache,
+                name_threshold=args.name_threshold,
+                metadata_threshold=args.metadata_threshold,
+                timeout=args.timeout,
+                max_tokens_per_contract=args.max_tokens_per_contract,
+                max_recall_rows=args.max_recall_rows,
+                api_max_concurrency=args.api_max_concurrency,
+                contract_max_concurrency=args.contract_max_concurrency,
+                sale_metric_max_concurrency=args.sale_metric_max_concurrency,
+                progress_reporter=progress_reporter,
+            )
         write_default_outputs(payload, args.output)
     finally:
         if feature_store is not None:
