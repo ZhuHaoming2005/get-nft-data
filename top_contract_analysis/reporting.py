@@ -172,8 +172,6 @@ def render_human_readable_report(payload: Dict[str, Any]) -> str:
     legit = payload.get('legit_duplicates') or []
     address_signals = payload.get('address_signals') or {}
     victim_signals = payload.get('victim_signals') or {}
-    infringing_tokens = payload.get('infringing_tokens') or []
-    malicious_addresses = payload.get('malicious_addresses') or []
     honest_addresses = payload.get('honest_addresses') or []
     honest_address_stats = payload.get('honest_address_stats') or {}
     victim_addresses = payload.get('victim_addresses') or []
@@ -244,20 +242,6 @@ def render_human_readable_report(payload: Dict[str, Any]) -> str:
     else:
         lines.append('- 无')
 
-    lines.extend(['', '## 侵权 NFT 历史记录'])
-    if infringing_tokens:
-        for item in infringing_tokens:
-            lines.append(
-                f"- {item.get('contract_address', '')}#{item.get('token_id', '')}: "
-                f"mint_tx={item.get('mint_tx_hash', '') or 'n/a'} | "
-                f"mint_block={item.get('mint_block', 0)} | "
-                f"minter={item.get('minter_address', '') or 'unknown'} | "
-                f"candidate_open_license={'是' if item.get('candidate_open_license') else '否'} | "
-                f"match_reasons={', '.join(item.get('match_reasons') or [])}"
-            )
-    else:
-        lines.append('- 无')
-
     lines.extend(['', '## 地址行为信号'])
     if address_signals:
         for contract, signal in address_signals.items():
@@ -271,18 +255,6 @@ def render_human_readable_report(payload: Dict[str, Any]) -> str:
                 f"- Mint 到首次转手时间: {signal.get('mint_to_first_transfer_seconds', 0)} 秒",
                 f"- 快速扩散: {'是' if signal.get('fast_spread') else '否'}",
             ])
-    else:
-        lines.append('- 无')
-
-    lines.extend(['', '## 恶意地址画像'])
-    if malicious_addresses:
-        for item in malicious_addresses:
-            lines.append(
-                f"- {item.get('address', '')}: mint_role={'是' if item.get('mint_role') else '否'} | "
-                f"wash_cycle_count={item.get('wash_cycle_count', 0)} | "
-                f"star_out_degree={item.get('star_out_degree', 0)} | "
-                f"evidence_contracts={', '.join(item.get('evidence_contracts') or [])}"
-            )
     else:
         lines.append('- 无')
 
