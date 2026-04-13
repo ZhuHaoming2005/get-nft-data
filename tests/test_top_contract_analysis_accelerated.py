@@ -102,6 +102,247 @@ class AsyncHttpClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, 3)
 
 
+class AsyncSeedAnalysisTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_analyze_seed_contract_limits_high_confidence_contract_concurrency(self):
+        active = 0
+        peak = 0
+        lock = asyncio.Lock()
+
+        seed_meta = mod.ContractMetadata(
+            chain='ethereum',
+            contract_address='0xseed',
+            token_type='ERC721',
+            contract_deployer='0xcreator',
+            deployed_block_number=123,
+            name='Azuki',
+            symbol='AZUKI',
+        )
+        seed_nfts = [
+            mod.SeedNFT(
+                chain='ethereum',
+                contract_address='0xseed',
+                token_id='1',
+                name='Azuki #1',
+                symbol='AZUKI',
+                token_uri='ipfs://seed/1',
+                image_uri='ipfs://seed/1.png',
+            )
+        ]
+        candidates = [
+            mod.DuplicateCandidate(
+                contract_address='0xdup1',
+                token_id='1',
+                match_reasons=('token_uri_match',),
+                confidence='high',
+                token_uri='ipfs://seed/1',
+                image_uri='',
+                name='Azuki Mirror #1',
+                symbol='AZUKI',
+            ),
+            mod.DuplicateCandidate(
+                contract_address='0xdup2',
+                token_id='2',
+                match_reasons=('token_uri_match',),
+                confidence='high',
+                token_uri='ipfs://seed/2',
+                image_uri='',
+                name='Azuki Mirror #2',
+                symbol='AZUKI',
+            ),
+            mod.DuplicateCandidate(
+                contract_address='0xdup3',
+                token_id='3',
+                match_reasons=('token_uri_match',),
+                confidence='high',
+                token_uri='ipfs://seed/3',
+                image_uri='',
+                name='Azuki Mirror #3',
+                symbol='AZUKI',
+            ),
+        ]
+        feature_store = SimpleNamespace(load_snapshot=lambda *args, **kwargs: mod.DatabaseSnapshot())
+
+        async def fake_contract_metadata_async(**kwargs):
+            del kwargs
+            return seed_meta
+
+        async def fake_seed_nfts_async(**kwargs):
+            del kwargs
+            return seed_nfts
+
+        async def fake_license_sample_async(**kwargs):
+            del kwargs
+            return {}
+
+        async def fake_high_confidence_async(**kwargs):
+            nonlocal active, peak
+            async with lock:
+                active += 1
+                peak = max(peak, active)
+            await asyncio.sleep(0.05)
+            async with lock:
+                active -= 1
+            return {
+                'contract_address': kwargs['contract_address'],
+                'status': 'high',
+                'candidate_count': len(kwargs['contract_candidates']),
+                'match_reasons': ['token_uri_match'],
+                'address_signals': {},
+                'victim_signals': {},
+                'infringing_tokens': [],
+                'malicious_addresses': [],
+                'honest_addresses': [],
+                'honest_address_stats': {},
+                'victim_addresses': [],
+                'fraud_trade_stats': {},
+            }
+
+        with patch.object(analysis_mod, 'fetch_contract_metadata_async', side_effect=fake_contract_metadata_async), \
+             patch.object(analysis_mod, 'fetch_seed_contract_nfts_async', side_effect=fake_seed_nfts_async), \
+             patch.object(analysis_mod, 'fetch_license_sample_async', side_effect=fake_license_sample_async), \
+             patch.object(analysis_mod, 'find_duplicate_candidates', return_value=candidates), \
+             patch.object(analysis_mod, '_analyze_high_confidence_contract_async', side_effect=fake_high_confidence_async):
+            payload = await analysis_mod.async_analyze_seed_contract(
+                chain='ethereum',
+                seed_contract_address='0xseed',
+                alchemy_api_key='realistic-api-key-123',
+                alchemy_network='eth-mainnet',
+                feature_store=feature_store,
+                contract_max_concurrency=2,
+            )
+
+        self.assertEqual(payload['report_summary']['high_confidence_contract_count'], 3)
+        self.assertEqual(peak, 2)
+
+
+class AsyncSaleMetricTests(unittest.IsolatedAsyncioTestCase):
+    async def test_high_confidence_contract_limits_sale_metric_concurrency(self):
+        active = 0
+        peak = 0
+        lock = asyncio.Lock()
+        sales = [
+            mod.NFTSaleRecord(
+                contract_address='0xdup',
+                token_id=str(index),
+                tx_hash=f'0xsale-{index}',
+                block_number=10 + index,
+                log_index=1,
+                bundle_index=0,
+                buyer_address=f'0xbuyer-{index}',
+                seller_address='0xseller',
+                marketplace='seaport',
+                taker='BUYER',
+                payment_token_symbol='ETH',
+                payment_token_address='',
+                price_eth=1.0,
+                seller_fee_eth=1.0,
+                protocol_fee_eth=0.0,
+                royalty_fee_eth=0.0,
+                source='alchemy',
+                is_native_eth=True,
+            )
+            for index in range(4)
+        ]
+
+        async def fake_transfers_async(**kwargs):
+            del kwargs
+            return []
+
+        async def fake_owners_async(**kwargs):
+            del kwargs
+            return [mod.OwnerBalance(owner_address='0xbuyer-0', token_balances={})]
+
+        async def fake_sales_async(**kwargs):
+            del kwargs
+            return sales
+
+        async def fake_receipt_async(**kwargs):
+            nonlocal active, peak
+            async with lock:
+                active += 1
+                peak = max(peak, active)
+            await asyncio.sleep(0.05)
+            async with lock:
+                active -= 1
+            return mod.TransactionReceiptRecord(
+                tx_hash=kwargs['tx_hash'],
+                block_number=10,
+                transaction_index=1,
+                from_address='0xbuyer',
+                gas_used=21_000,
+                effective_gas_price_wei=1,
+            )
+
+        async def fake_balance_async(**kwargs):
+            del kwargs
+            await asyncio.sleep(0.05)
+            return 5.0
+
+        async def fake_same_block_async(**kwargs):
+            del kwargs
+            await asyncio.sleep(0.05)
+            return []
+
+        client = async_http_mod.AsyncApiClient(
+            timeout=1,
+            max_concurrency=12,
+            contract_max_concurrency=4,
+            sale_metric_max_concurrency=2,
+        )
+        try:
+            with patch.object(analysis_mod, 'fetch_contract_transfers_async', side_effect=fake_transfers_async), \
+                 patch.object(analysis_mod, 'fetch_contract_owners_async', side_effect=fake_owners_async), \
+                 patch.object(analysis_mod, 'fetch_contract_sales_async', side_effect=fake_sales_async), \
+                 patch.object(analysis_mod, 'fetch_transaction_receipt_async', side_effect=fake_receipt_async), \
+                 patch.object(analysis_mod, 'fetch_eth_balance_async', side_effect=fake_balance_async), \
+                 patch.object(analysis_mod, 'fetch_same_block_eth_transfers_for_address_async', side_effect=fake_same_block_async), \
+                 patch.object(analysis_mod, 'analyze_contract_transfers', return_value={}), \
+                 patch.object(rust_bridge, 'analyze_victim_signals_from_active_sellers', return_value={}), \
+                 patch.object(analysis_mod, 'build_infringing_token_records', return_value=[{
+                     'contract_address': '0xdup',
+                     'token_id': '1',
+                     'official_or_legit_reissue': False,
+                     'candidate_open_license': False,
+                     'match_reasons': ['token_uri_match'],
+                 }]), \
+                 patch.object(analysis_mod, 'build_malicious_address_records', return_value=[]), \
+                 patch.object(analysis_mod, 'build_victim_address_records', return_value=[]), \
+                 patch.object(analysis_mod, 'build_honest_address_records', return_value=[]), \
+                 patch.object(analysis_mod, 'build_honest_address_stats', return_value={}), \
+                 patch.object(analysis_mod, 'build_fraud_trade_stats', return_value={}):
+                result = await analysis_mod._analyze_high_confidence_contract_async(
+                    client=client,
+                    chain='ethereum',
+                    network='eth-mainnet',
+                    alchemy_api_key='realistic-api-key-123',
+                    etherscan_api_key='etherscan',
+                    opensea_api_key='',
+                    contract_address='0xdup',
+                    contract_candidates=[
+                        mod.DuplicateCandidate(
+                            contract_address='0xdup',
+                            token_id='1',
+                            match_reasons=('token_uri_match',),
+                            confidence='high',
+                            token_uri='ipfs://seed/1',
+                            image_uri='',
+                            name='Azuki Mirror #1',
+                            symbol='AZUKI',
+                        )
+                    ],
+                    token_type='ERC721',
+                    official_addresses={'0xcreator'},
+                    candidate_open_license_by_token={},
+                    timeout=1,
+                    signal_cache=None,
+                )
+        finally:
+            await client.close()
+
+        self.assertEqual(result['status'], 'high')
+        self.assertEqual(peak, 2)
+
+
 class RustBridgeTests(unittest.TestCase):
     def test_metadata_document_from_json_flattens_selected_fields(self):
         document = rust_bridge.metadata_document_from_json(
