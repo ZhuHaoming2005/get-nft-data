@@ -293,7 +293,13 @@ def _analyze_victim_signals_python(
         row.from_address for row in transfers
         if row.from_address and row.from_address != _ZERO_ADDRESS
     }
-    owners_with_balance = [owner for owner in owners if any(balance > 0 for balance in owner.token_balances.values())]
+    owners_with_balance = [
+        owner
+        for owner in owners
+        if owner.owner_address
+        and owner.owner_address != _ZERO_ADDRESS
+        and any(balance > 0 for balance in owner.token_balances.values())
+    ]
     stuck = [owner.owner_address for owner in owners_with_balance if owner.owner_address not in active_sellers]
     owner_count = len(owners_with_balance)
     return {
@@ -311,8 +317,12 @@ def analyze_victim_signals(
     if _rust_analyze_victim_signals is not None:
         packed_transfers = [(row.from_address, row.to_address, int(row.block_time or 0)) for row in transfers]
         packed_owners = [
-            (owner.owner_address, any(balance > 0 for balance in owner.token_balances.values()))
+            (
+                owner.owner_address,
+                any(balance > 0 for balance in owner.token_balances.values()),
+            )
             for owner in owners
+            if owner.owner_address and owner.owner_address != _ZERO_ADDRESS
         ]
         return dict(_rust_analyze_victim_signals(packed_transfers, packed_owners))
     return _analyze_victim_signals_python(transfers, owners)
@@ -326,6 +336,8 @@ def analyze_victim_signals_from_active_sellers(
     owner_count = 0
     stuck_holder_count = 0
     for owner in owners:
+        if not owner.owner_address or owner.owner_address == _ZERO_ADDRESS:
+            continue
         has_positive_balance = any(balance > 0 for balance in owner.token_balances.values())
         if not has_positive_balance:
             continue
@@ -396,6 +408,7 @@ def build_victim_address_records(
             [token_id for token_id, balance in owner.token_balances.items() if balance > 0],
         )
         for owner in owners
+        if owner.owner_address and owner.owner_address != _ZERO_ADDRESS
     ]
     return list(_rust_build_victim_address_records(packed_sales, packed_transfers, packed_owners))
 
@@ -625,6 +638,7 @@ def build_honest_address_records(
             [token_id for token_id, balance in owner.token_balances.items() if balance > 0],
         )
         for owner in owners
+        if owner.owner_address and owner.owner_address != _ZERO_ADDRESS
     ]
     packed_infringing_tokens = [str(item.get('token_id') or '') for item in infringing_tokens if item.get('token_id')]
     packed_malicious_addresses = [str(item.get('address') or '') for item in malicious_addresses if item.get('address')]

@@ -61,6 +61,14 @@ def build_batch_summary_payload(
     total_low = 0
     total_legit = 0
     open_license_count = 0
+    total_honest_purchase_eth = 0.0
+    total_ratio_known = 0
+    total_ratio_over_60 = 0
+    total_ratio_over_80 = 0
+    total_stuck_honest = 0
+    mean_honest_holder_values: list[float] = []
+    mean_first_transfer_values: list[float] = []
+    mean_unique_receiver_values: list[float] = []
     chains: list[str] = []
     output_index = output_index or []
 
@@ -73,6 +81,17 @@ def build_batch_summary_payload(
         total_high += int(summary.get('high_confidence_contract_count') or 0)
         total_low += int(summary.get('low_confidence_contract_count') or 0)
         total_legit += int(summary.get('legit_duplicate_contract_count') or 0)
+        total_honest_purchase_eth += float(summary.get('honest_purchase_total_eth') or 0.0)
+        total_ratio_known += int(summary.get('buy_asset_ratio_known_address_count') or 0)
+        total_ratio_over_60 += int(summary.get('ratio_over_60_address_count') or 0)
+        total_ratio_over_80 += int(summary.get('ratio_over_80_address_count') or 0)
+        total_stuck_honest += int(summary.get('stuck_honest_address_count') or 0)
+        if isinstance(summary.get('avg_seconds_to_honest_holder'), (int, float)):
+            mean_honest_holder_values.append(float(summary['avg_seconds_to_honest_holder']))
+        if isinstance(summary.get('avg_mint_to_first_transfer_seconds'), (int, float)):
+            mean_first_transfer_values.append(float(summary['avg_mint_to_first_transfer_seconds']))
+        if isinstance(summary.get('avg_unique_receiver_count'), (int, float)):
+            mean_unique_receiver_values.append(float(summary['avg_unique_receiver_count']))
         chain = str(seed.get('chain') or '').strip()
         if chain:
             chains.append(chain)
@@ -98,6 +117,23 @@ def build_batch_summary_payload(
             'high_confidence_contract_count_total': total_high,
             'low_confidence_contract_count_total': total_low,
             'legit_duplicate_contract_count_total': total_legit,
+            'honest_purchase_total_eth_total': total_honest_purchase_eth,
+            'buy_asset_ratio_known_address_count_total': total_ratio_known,
+            'ratio_over_60_address_count_total': total_ratio_over_60,
+            'ratio_over_60_address_ratio_overall': (total_ratio_over_60 / total_ratio_known) if total_ratio_known else None,
+            'ratio_over_80_address_count_total': total_ratio_over_80,
+            'ratio_over_80_address_ratio_overall': (total_ratio_over_80 / total_ratio_known) if total_ratio_known else None,
+            'stuck_honest_address_count_total': total_stuck_honest,
+            'stuck_honest_address_ratio_overall': (total_stuck_honest / total_ratio_known) if total_ratio_known else None,
+            'avg_seconds_to_honest_holder_mean': (
+                sum(mean_honest_holder_values) / len(mean_honest_holder_values) if mean_honest_holder_values else None
+            ),
+            'avg_mint_to_first_transfer_seconds_mean': (
+                sum(mean_first_transfer_values) / len(mean_first_transfer_values) if mean_first_transfer_values else None
+            ),
+            'avg_unique_receiver_count_mean': (
+                sum(mean_unique_receiver_values) / len(mean_unique_receiver_values) if mean_unique_receiver_values else None
+            ),
             'generated_at': datetime.now(timezone.utc).isoformat(),
         },
         'seed_reports': reports,
@@ -118,6 +154,14 @@ def render_batch_human_readable_report(payload: Dict[str, Any]) -> str:
         f"- 高置信疑似侵权合约总数: {summary.get('high_confidence_contract_count_total', 0)}",
         f"- 低置信疑似侵权合约总数: {summary.get('low_confidence_contract_count_total', 0)}",
         f"- 官方参与型重复合约总数: {summary.get('legit_duplicate_contract_count_total', 0)}",
+        f"- 诚实地址购买总金额(ETH/WETH)汇总: {summary.get('honest_purchase_total_eth_total', 0.0)}",
+        f"- 可计算买入占比的诚实地址总数: {summary.get('buy_asset_ratio_known_address_count_total', 0)}",
+        f"- 买入金额占钱包总额 >60% 的地址数/总体占比: {summary.get('ratio_over_60_address_count_total', 0)} / {_format_ratio(summary.get('ratio_over_60_address_ratio_overall'))}",
+        f"- 买入金额占钱包总额 >80% 的地址数/总体占比: {summary.get('ratio_over_80_address_count_total', 0)} / {_format_ratio(summary.get('ratio_over_80_address_ratio_overall'))}",
+        f"- 购买后无法再次售出的诚实节点数/总体占比: {summary.get('stuck_honest_address_count_total', 0)} / {_format_ratio(summary.get('stuck_honest_address_ratio_overall'))}",
+        f"- Mint 到被诚实节点购买平均时间(跨 seed 均值): {_format_scalar(summary.get('avg_seconds_to_honest_holder_mean'))} 秒",
+        f"- Mint 到首次转手平均时间(跨 seed 均值): {_format_scalar(summary.get('avg_mint_to_first_transfer_seconds_mean'))} 秒",
+        f"- 候选合约平均唯一接收钱包数(跨 seed 均值): {_format_scalar(summary.get('avg_unique_receiver_count_mean'))}",
         f"- 生成时间(UTC): {summary.get('generated_at', '')}",
         '',
         '## Seed 报告索引',
@@ -136,6 +180,10 @@ def render_batch_human_readable_report(payload: Dict[str, Any]) -> str:
                 f"高置信={report_summary.get('high_confidence_contract_count', 0)} | "
                 f"低置信={report_summary.get('low_confidence_contract_count', 0)} | "
                 f"官方参与={report_summary.get('legit_duplicate_contract_count', 0)} | "
+                f"诚实购买额={report_summary.get('honest_purchase_total_eth', 0.0)} | "
+                f">60%={report_summary.get('ratio_over_60_address_count', 0)}/{_format_ratio(report_summary.get('ratio_over_60_address_ratio'))} | "
+                f"套牢={report_summary.get('stuck_honest_address_count', 0)}/{_format_ratio(report_summary.get('stuck_honest_address_ratio'))} | "
+                f"诚实购买时长={_format_scalar(report_summary.get('avg_seconds_to_honest_holder'))}秒 | "
                 f"JSON={output_files.get('json', '')} | MD={output_files.get('markdown', '')}"
             )
 
@@ -161,6 +209,12 @@ def _format_ratio(value: Any) -> str:
     if isinstance(value, (int, float)):
         return f'{value:.2%}'
     return 'n/a'
+
+
+def _format_scalar(value: Any) -> str:
+    if value is None:
+        return 'n/a'
+    return str(value)
 
 
 def render_human_readable_report(payload: Dict[str, Any]) -> str:
@@ -189,13 +243,6 @@ def render_human_readable_report(payload: Dict[str, Any]) -> str:
         f"- 合约部署者: {seed.get('contract_deployer', '') or 'unknown'}",
         f"- 部署区块: {seed.get('deployed_block_number', 0)}",
         '',
-        '## 种子集合统计',
-        f"- 拉取到的种子 NFT 数: {seed_stats.get('seed_nft_count', 0)}",
-        f"- 唯一 token URI 数: {seed_stats.get('unique_token_uri_count', 0)}",
-        f"- 唯一 image URI 数: {seed_stats.get('unique_image_uri_count', 0)}",
-        f"- 唯一规范化名称数: {seed_stats.get('unique_name_count', 0)}",
-        f"- 唯一规范化符号数: {seed_stats.get('unique_symbol_count', 0)}",
-        '',
         '## 摘要',
         f"- 检测到开放许可: {'是' if summary.get('open_license_detected') else '否'}",
         f"- 重复候选合约数: {summary.get('candidate_contract_count', 0)}",
@@ -204,6 +251,21 @@ def render_human_readable_report(payload: Dict[str, Any]) -> str:
         f"- 归为官方参与型重复的合约数: {summary.get('legit_duplicate_contract_count', 0)}",
         f"- 候选侧开放许可 token 数: {summary.get('candidate_open_license_token_count', 0)}",
         f"- 候选侧开放许可合约数: {summary.get('candidate_open_license_contract_count', 0)}",
+        f"- 诚实地址购买总金额(ETH/WETH): {summary.get('honest_purchase_total_eth', 0.0)}",
+        f"- 可计算买入占比的诚实地址数: {summary.get('buy_asset_ratio_known_address_count', 0)}",
+        f"- 买入金额占钱包总额 >60% 的地址数/占比: {summary.get('ratio_over_60_address_count', 0)} / {_format_ratio(summary.get('ratio_over_60_address_ratio'))}",
+        f"- 买入金额占钱包总额 >80% 的地址数/占比: {summary.get('ratio_over_80_address_count', 0)} / {_format_ratio(summary.get('ratio_over_80_address_ratio'))}",
+        f"- 购买后无法再次售出的诚实节点数/占比: {summary.get('stuck_honest_address_count', 0)} / {_format_ratio(summary.get('stuck_honest_address_ratio'))}",
+        f"- Mint 到被诚实节点购买平均时间: {_format_scalar(summary.get('avg_seconds_to_honest_holder'))} 秒",
+        f"- Mint 到首次转手平均时间: {_format_scalar(summary.get('avg_mint_to_first_transfer_seconds'))} 秒",
+        f"- 候选合约平均唯一接收钱包数: {_format_scalar(summary.get('avg_unique_receiver_count'))}",
+        '',
+        '## 种子集合统计',
+        f"- 拉取到的种子 NFT 数: {seed_stats.get('seed_nft_count', 0)}",
+        f"- 唯一 token URI 数: {seed_stats.get('unique_token_uri_count', 0)}",
+        f"- 唯一 image URI 数: {seed_stats.get('unique_image_uri_count', 0)}",
+        f"- 唯一规范化名称数: {seed_stats.get('unique_name_count', 0)}",
+        f"- 唯一规范化符号数: {seed_stats.get('unique_symbol_count', 0)}",
         '',
         '## 高置信疑似侵权合约',
     ]

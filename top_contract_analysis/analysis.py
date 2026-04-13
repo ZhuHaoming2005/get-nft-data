@@ -115,6 +115,13 @@ def _median_or_none(values: Sequence[float | int]) -> float | None:
     return float(median(cleaned))
 
 
+def _mean_or_none(values: Sequence[float | int]) -> float | None:
+    cleaned = [float(value) for value in values if value is not None]
+    if not cleaned:
+        return None
+    return sum(cleaned) / len(cleaned)
+
+
 def _format_timing_breakdown(stages: Dict[str, float]) -> str:
     ordered = sorted(stages.items(), key=lambda item: item[1], reverse=True)
     return ', '.join(f'{name}={duration:.3f}s' for name, duration in ordered if duration > 0)
@@ -383,6 +390,8 @@ def _build_honest_address_records_python(
 
     owner_token_map: Dict[str, set[str]] = {}
     for owner in owners:
+        if not owner.owner_address or owner.owner_address == ZERO_ADDRESS:
+            continue
         held_tokens = {
             token_id
             for token_id, balance in owner.token_balances.items()
@@ -549,6 +558,74 @@ def build_fraud_trade_stats(
             'stuck_wallet_count': sum(1 for item in victim_addresses if item.get('is_stuck')),
             'stuck_cost_eth': sum(float(item.get('last_buy_amount_eth') or 0.0) for item in victim_addresses if item.get('is_stuck')),
         }
+    }
+
+
+def build_report_summary(
+    *,
+    open_license: bool,
+    grouped: Dict[str, Sequence[DuplicateCandidate]],
+    high_confidence: Sequence[Dict[str, Any]],
+    low_confidence: Sequence[Dict[str, Any]],
+    legit_duplicates: Sequence[Dict[str, Any]],
+    infringing_tokens: Sequence[Dict[str, Any]],
+    honest_addresses: Sequence[Dict[str, Any]],
+    victim_addresses: Sequence[Dict[str, Any]],
+    address_signals: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    candidate_open_license_tokens = [
+        item for item in infringing_tokens
+        if item.get('candidate_open_license')
+    ]
+    candidate_open_license_contracts = {
+        item.get('contract_address')
+        for item in candidate_open_license_tokens
+        if item.get('contract_address')
+    }
+    buy_ratio_values = [
+        float(item.get('buy_asset_ratio'))
+        for item in victim_addresses
+        if item.get('buy_asset_ratio') is not None
+    ]
+    ratio_known_count = len(buy_ratio_values)
+    ratio_over_60_count = sum(1 for value in buy_ratio_values if value > 0.6)
+    ratio_over_80_count = sum(1 for value in buy_ratio_values if value > 0.8)
+    stuck_honest_address_count = sum(1 for item in victim_addresses if item.get('is_stuck'))
+    victim_address_count = len(victim_addresses)
+    mint_to_honest_samples = [
+        float(sample)
+        for item in honest_addresses
+        for sample in (item.get('mint_to_honest_seconds_samples') or [])
+    ]
+    mint_to_first_transfer_values = [
+        float(signal.get('mint_to_first_transfer_seconds'))
+        for signal in address_signals.values()
+        if signal.get('mint_to_first_transfer_seconds') is not None
+    ]
+    unique_receiver_values = [
+        float(signal.get('unique_receiver_count'))
+        for signal in address_signals.values()
+        if signal.get('unique_receiver_count') is not None
+    ]
+    return {
+        'open_license_detected': open_license,
+        'candidate_contract_count': len(grouped),
+        'high_confidence_contract_count': len(high_confidence),
+        'low_confidence_contract_count': len(low_confidence),
+        'legit_duplicate_contract_count': len(legit_duplicates),
+        'candidate_open_license_token_count': len(candidate_open_license_tokens),
+        'candidate_open_license_contract_count': len(candidate_open_license_contracts),
+        'honest_purchase_total_eth': sum(float(item.get('buy_amount_eth') or 0.0) for item in victim_addresses),
+        'buy_asset_ratio_known_address_count': ratio_known_count,
+        'ratio_over_60_address_count': ratio_over_60_count,
+        'ratio_over_60_address_ratio': (ratio_over_60_count / ratio_known_count) if ratio_known_count else None,
+        'ratio_over_80_address_count': ratio_over_80_count,
+        'ratio_over_80_address_ratio': (ratio_over_80_count / ratio_known_count) if ratio_known_count else None,
+        'stuck_honest_address_count': stuck_honest_address_count,
+        'stuck_honest_address_ratio': (stuck_honest_address_count / victim_address_count) if victim_address_count else None,
+        'avg_seconds_to_honest_holder': _mean_or_none(mint_to_honest_samples),
+        'avg_mint_to_first_transfer_seconds': _mean_or_none(mint_to_first_transfer_values),
+        'avg_unique_receiver_count': _mean_or_none(unique_receiver_values),
     }
 
 
@@ -1006,15 +1083,17 @@ def analyze_seed_contract(
                 high_confidence = []
                 low_confidence = []
 
-            candidate_open_license_tokens = [
-                item for item in infringing_tokens
-                if item.get('candidate_open_license')
-            ]
-            candidate_open_license_contracts = {
-                item.get('contract_address')
-                for item in candidate_open_license_tokens
-                if item.get('contract_address')
-            }
+            report_summary = build_report_summary(
+                open_license=open_license,
+                grouped=grouped,
+                high_confidence=high_confidence,
+                low_confidence=low_confidence,
+                legit_duplicates=legit_duplicates,
+                infringing_tokens=infringing_tokens,
+                honest_addresses=honest_addresses,
+                victim_addresses=victim_addresses,
+                address_signals=address_signals,
+            )
             stage_times['seed_total'] = time.perf_counter() - seed_started
             logger.info(
                 'seed timing seed=%s %s',
@@ -1051,15 +1130,7 @@ def analyze_seed_contract(
                 'honest_address_stats': honest_address_stats,
                 'victim_addresses': victim_addresses,
                 'fraud_trade_stats': fraud_trade_stats,
-                'report_summary': {
-                    'open_license_detected': open_license,
-                    'candidate_contract_count': len(grouped),
-                    'high_confidence_contract_count': len(high_confidence),
-                    'low_confidence_contract_count': len(low_confidence),
-                    'legit_duplicate_contract_count': len(legit_duplicates),
-                    'candidate_open_license_token_count': len(candidate_open_license_tokens),
-                    'candidate_open_license_contract_count': len(candidate_open_license_contracts),
-                },
+                'report_summary': report_summary,
             }
     finally:
         if own_conn and conn is not None:

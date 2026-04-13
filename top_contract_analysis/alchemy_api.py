@@ -395,10 +395,13 @@ def fetch_contract_owners(*, api_key: str, network: str, contract_address: str, 
         url = f'{endpoint}?{urlencode(params)}'
         payload = _alchemy_get_json(url=url, timeout=timeout, session=session)
         for row in payload.get('owners') or []:
+            owner_address = str(row.get('ownerAddress') or '').lower()
+            if not owner_address or owner_address == ZERO_ADDRESS:
+                continue
             balances: Dict[str, int] = {}
             for balance in row.get('tokenBalances') or []:
                 balances[_normalize_token_id(balance.get('tokenId'))] = int(balance.get('balance') or 0)
-            owners.append(OwnerBalance(owner_address=str(row.get('ownerAddress') or '').lower(), token_balances=balances))
+            owners.append(OwnerBalance(owner_address=owner_address, token_balances=balances))
         page_key = str(payload.get('pageKey') or '')
         if not page_key:
             break

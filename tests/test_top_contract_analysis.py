@@ -97,6 +97,40 @@ class FetchSeedContractNFTsTests(unittest.TestCase):
         self.assertEqual(rows[0].image_uri, 'ipfs://image/1.png')
 
 
+class FetchContractOwnersTests(unittest.TestCase):
+    def test_fetch_contract_owners_skips_zero_address_rows(self):
+        response = Mock()
+        response.status_code = 200
+        response.reason = 'OK'
+        response.text = ''
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            'owners': [
+                {
+                    'ownerAddress': mod.ZERO_ADDRESS,
+                    'tokenBalances': [{'tokenId': '0x1', 'balance': '1'}],
+                },
+                {
+                    'ownerAddress': '0xholder',
+                    'tokenBalances': [{'tokenId': '0x2', 'balance': '1'}],
+                },
+            ],
+        }
+        fake_requests = SimpleNamespace(get=Mock(return_value=response))
+
+        with patch.object(constants_mod, 'requests', fake_requests):
+            rows = mod.fetch_contract_owners(
+                api_key='key',
+                network='eth-mainnet',
+                contract_address='0xdup',
+            )
+
+        self.assertEqual(
+            rows,
+            [mod.OwnerBalance(owner_address='0xholder', token_balances={'2': 1})],
+        )
+
+
 class LicenseDetectionTests(unittest.TestCase):
     def test_pick_license_metadata_calls_api_once(self):
         seed_nfts = [
@@ -715,7 +749,10 @@ class SalesAnalysisTests(unittest.TestCase):
                 source='alchemy',
             ),
         ]
-        owners = [mod.OwnerBalance(owner_address='0xhonest2', token_balances={'1': 1})]
+        owners = [
+            mod.OwnerBalance(owner_address='0xhonest2', token_balances={'1': 1}),
+            mod.OwnerBalance(owner_address=mod.ZERO_ADDRESS, token_balances={'1': 1}),
+        ]
         infringing_tokens = [
             {
                 'contract_address': '0xdup',
@@ -752,6 +789,32 @@ class SalesAnalysisTests(unittest.TestCase):
         self.assertEqual(honest_stats['honest_to_honest_transfer_count'], 1)
         self.assertEqual(honest_stats['median_holding_seconds'], 75.0)
         self.assertEqual(honest_stats['avg_seconds_to_honest_holder'], 50.0)
+
+    def test_analyze_contract_victims_skips_zero_address_owner_balances(self):
+        transfers = [
+            mod.TransferRecord(
+                contract_address='0xdup',
+                token_id='1',
+                tx_hash='0xmint',
+                log_index=0,
+                block_number=10,
+                block_time=100,
+                from_address=mod.ZERO_ADDRESS,
+                to_address='0xbuyer',
+                event_type='erc721',
+                source='alchemy',
+            ),
+        ]
+        owners = [
+            mod.OwnerBalance(owner_address='0xbuyer', token_balances={'1': 1}),
+            mod.OwnerBalance(owner_address=mod.ZERO_ADDRESS, token_balances={'2': 1}),
+        ]
+
+        signals = analysis_mod.analyze_contract_victims(transfers, owners)
+
+        self.assertEqual(signals['owner_count'], 1)
+        self.assertEqual(signals['stuck_holder_count'], 1)
+        self.assertEqual(signals['victim_wallet_count'], 1)
 
 
 class DuplicateAnalysisTests(unittest.TestCase):
@@ -1274,6 +1337,17 @@ class EndToEndAnalysisTests(unittest.TestCase):
         self.assertEqual(result['infringing_tokens'][0]['candidate_open_license'], True)
         self.assertEqual(result['report_summary']['candidate_open_license_token_count'], 1)
         self.assertEqual(result['report_summary']['candidate_open_license_contract_count'], 1)
+        self.assertAlmostEqual(result['report_summary']['honest_purchase_total_eth'], 2.0)
+        self.assertEqual(result['report_summary']['buy_asset_ratio_known_address_count'], 1)
+        self.assertEqual(result['report_summary']['ratio_over_60_address_count'], 0)
+        self.assertEqual(result['report_summary']['ratio_over_80_address_count'], 0)
+        self.assertEqual(result['report_summary']['ratio_over_60_address_ratio'], 0.0)
+        self.assertEqual(result['report_summary']['ratio_over_80_address_ratio'], 0.0)
+        self.assertEqual(result['report_summary']['stuck_honest_address_count'], 0)
+        self.assertEqual(result['report_summary']['stuck_honest_address_ratio'], 0.0)
+        self.assertAlmostEqual(result['report_summary']['avg_seconds_to_honest_holder'], 50.0)
+        self.assertAlmostEqual(result['report_summary']['avg_mint_to_first_transfer_seconds'], 50.0)
+        self.assertAlmostEqual(result['report_summary']['avg_unique_receiver_count'], 3.0)
         self.assertEqual(result['honest_address_stats']['0xdup']['honest_address_count'], 2)
         self.assertEqual(result['honest_address_stats']['0xdup']['corrupted_address_count'], 1)
         self.assertEqual(result['honest_address_stats']['0xdup']['honest_to_honest_transfer_count'], 1)
@@ -1392,6 +1466,17 @@ class HumanReadableReportTests(unittest.TestCase):
                 'legit_duplicate_contract_count': 1,
                 'candidate_open_license_token_count': 1,
                 'candidate_open_license_contract_count': 1,
+                'honest_purchase_total_eth': 2.0,
+                'buy_asset_ratio_known_address_count': 1,
+                'ratio_over_60_address_count': 0,
+                'ratio_over_60_address_ratio': 0.0,
+                'ratio_over_80_address_count': 0,
+                'ratio_over_80_address_ratio': 0.0,
+                'stuck_honest_address_count': 0,
+                'stuck_honest_address_ratio': 0.0,
+                'avg_seconds_to_honest_holder': 50.0,
+                'avg_mint_to_first_transfer_seconds': 600.0,
+                'avg_unique_receiver_count': 8.0,
             },
             'suspected_infringing_duplicates_high_confidence': [
                 {
@@ -1522,6 +1607,14 @@ class HumanReadableReportTests(unittest.TestCase):
         self.assertIn('## 摘要', text)
         self.assertIn('高置信疑似侵权合约数: 1', text)
         self.assertIn('候选侧开放许可 token 数: 1', text)
+        self.assertIn('诚实地址购买总金额(ETH/WETH): 2.0', text)
+        self.assertIn('可计算买入占比的诚实地址数: 1', text)
+        self.assertIn('买入金额占钱包总额 >60% 的地址数/占比: 0 / 0.00%', text)
+        self.assertIn('买入金额占钱包总额 >80% 的地址数/占比: 0 / 0.00%', text)
+        self.assertIn('购买后无法再次售出的诚实节点数/占比: 0 / 0.00%', text)
+        self.assertIn('Mint 到被诚实节点购买平均时间: 50.0 秒', text)
+        self.assertIn('Mint 到首次转手平均时间: 600.0 秒', text)
+        self.assertIn('候选合约平均唯一接收钱包数: 8.0', text)
         self.assertIn('## 高置信疑似侵权合约', text)
         self.assertIn('0xdup', text)
         self.assertIn('归为官方参与型重复的合约数: 1', text)
@@ -1543,6 +1636,131 @@ class HumanReadableReportTests(unittest.TestCase):
         self.assertIn('eth_priced_sale_count=1', text)
         self.assertNotIn('## 合法重复合约', text)
         self.assertNotIn('合法重复合约数', text)
+
+
+class BatchSummaryReportTests(unittest.TestCase):
+    def test_build_batch_summary_payload_aggregates_extended_summary_metrics(self):
+        payloads = [
+            {
+                'seed_contract': {'chain': 'ethereum', 'contract_address': '0xseed1', 'name': 'Alpha'},
+                'report_summary': {
+                    'open_license_detected': False,
+                    'candidate_contract_count': 3,
+                    'high_confidence_contract_count': 2,
+                    'low_confidence_contract_count': 1,
+                    'legit_duplicate_contract_count': 0,
+                    'honest_purchase_total_eth': 2.5,
+                    'buy_asset_ratio_known_address_count': 2,
+                    'ratio_over_60_address_count': 1,
+                    'ratio_over_60_address_ratio': 0.5,
+                    'ratio_over_80_address_count': 0,
+                    'ratio_over_80_address_ratio': 0.0,
+                    'stuck_honest_address_count': 1,
+                    'stuck_honest_address_ratio': 0.5,
+                    'avg_seconds_to_honest_holder': 100.0,
+                    'avg_mint_to_first_transfer_seconds': 200.0,
+                    'avg_unique_receiver_count': 5.0,
+                },
+            },
+            {
+                'seed_contract': {'chain': 'ethereum', 'contract_address': '0xseed2', 'name': 'Beta'},
+                'report_summary': {
+                    'open_license_detected': True,
+                    'candidate_contract_count': 4,
+                    'high_confidence_contract_count': 1,
+                    'low_confidence_contract_count': 2,
+                    'legit_duplicate_contract_count': 1,
+                    'honest_purchase_total_eth': 1.5,
+                    'buy_asset_ratio_known_address_count': 1,
+                    'ratio_over_60_address_count': 1,
+                    'ratio_over_60_address_ratio': 1.0,
+                    'ratio_over_80_address_count': 1,
+                    'ratio_over_80_address_ratio': 1.0,
+                    'stuck_honest_address_count': 1,
+                    'stuck_honest_address_ratio': 1.0,
+                    'avg_seconds_to_honest_holder': 300.0,
+                    'avg_mint_to_first_transfer_seconds': 600.0,
+                    'avg_unique_receiver_count': 7.0,
+                },
+            },
+        ]
+
+        batch_payload = mod.build_batch_summary_payload(payloads)
+        summary = batch_payload['batch_summary']
+
+        self.assertEqual(summary['seed_report_count'], 2)
+        self.assertEqual(summary['open_license_detected_count'], 1)
+        self.assertEqual(summary['candidate_contract_count_total'], 7)
+        self.assertAlmostEqual(summary['honest_purchase_total_eth_total'], 4.0)
+        self.assertEqual(summary['buy_asset_ratio_known_address_count_total'], 3)
+        self.assertEqual(summary['ratio_over_60_address_count_total'], 2)
+        self.assertAlmostEqual(summary['ratio_over_60_address_ratio_overall'], 2 / 3)
+        self.assertEqual(summary['ratio_over_80_address_count_total'], 1)
+        self.assertAlmostEqual(summary['ratio_over_80_address_ratio_overall'], 1 / 3)
+        self.assertEqual(summary['stuck_honest_address_count_total'], 2)
+        self.assertAlmostEqual(summary['stuck_honest_address_ratio_overall'], 2 / 3)
+        self.assertAlmostEqual(summary['avg_seconds_to_honest_holder_mean'], 200.0)
+        self.assertAlmostEqual(summary['avg_mint_to_first_transfer_seconds_mean'], 400.0)
+        self.assertAlmostEqual(summary['avg_unique_receiver_count_mean'], 6.0)
+
+    def test_render_batch_human_readable_report_includes_extended_summary_metrics(self):
+        payload = {
+            'batch_summary': {
+                'seed_report_count': 2,
+                'chain': 'ethereum',
+                'chains': ['ethereum'],
+                'open_license_detected_count': 1,
+                'candidate_contract_count_total': 7,
+                'high_confidence_contract_count_total': 3,
+                'low_confidence_contract_count_total': 3,
+                'legit_duplicate_contract_count_total': 1,
+                'honest_purchase_total_eth_total': 4.0,
+                'buy_asset_ratio_known_address_count_total': 3,
+                'ratio_over_60_address_count_total': 2,
+                'ratio_over_60_address_ratio_overall': 2 / 3,
+                'ratio_over_80_address_count_total': 1,
+                'ratio_over_80_address_ratio_overall': 1 / 3,
+                'stuck_honest_address_count_total': 2,
+                'stuck_honest_address_ratio_overall': 2 / 3,
+                'avg_seconds_to_honest_holder_mean': 200.0,
+                'avg_mint_to_first_transfer_seconds_mean': 400.0,
+                'avg_unique_receiver_count_mean': 6.0,
+                'generated_at': '2026-04-13T00:00:00+00:00',
+            },
+            'seed_reports': [
+                {
+                    'seed_contract': {'name': 'Alpha', 'contract_address': '0xseed1'},
+                    'report_summary': {
+                        'high_confidence_contract_count': 2,
+                        'low_confidence_contract_count': 1,
+                        'legit_duplicate_contract_count': 0,
+                        'honest_purchase_total_eth': 2.5,
+                        'ratio_over_60_address_count': 1,
+                        'ratio_over_60_address_ratio': 0.5,
+                        'stuck_honest_address_count': 1,
+                        'stuck_honest_address_ratio': 0.5,
+                        'avg_seconds_to_honest_holder': 100.0,
+                    },
+                    'output_files': {'json': 'alpha.json', 'markdown': 'alpha.md'},
+                }
+            ],
+        }
+
+        text = mod.render_batch_human_readable_report(payload)
+
+        self.assertIn('诚实地址购买总金额(ETH/WETH)汇总: 4.0', text)
+        self.assertIn('可计算买入占比的诚实地址总数: 3', text)
+        self.assertIn('买入金额占钱包总额 >60% 的地址数/总体占比: 2 / 66.67%', text)
+        self.assertIn('买入金额占钱包总额 >80% 的地址数/总体占比: 1 / 33.33%', text)
+        self.assertIn('购买后无法再次售出的诚实节点数/总体占比: 2 / 66.67%', text)
+        self.assertIn('Mint 到被诚实节点购买平均时间(跨 seed 均值): 200.0 秒', text)
+        self.assertIn('Mint 到首次转手平均时间(跨 seed 均值): 400.0 秒', text)
+        self.assertIn('候选合约平均唯一接收钱包数(跨 seed 均值): 6.0', text)
+        self.assertIn('Alpha (0xseed1)', text)
+        self.assertIn('诚实购买额=2.5', text)
+        self.assertIn('>60%=1/50.00%', text)
+        self.assertIn('套牢=1/50.00%', text)
+        self.assertIn('诚实购买时长=100.0秒', text)
 
 
 class OutputNamingTests(unittest.TestCase):
