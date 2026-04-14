@@ -116,7 +116,7 @@ class _RichSingleSeedProgressReporter(_NoOpSingleSeedProgressReporter):
         'load_snapshot': 'Loading recall snapshot',
         'find_duplicate_candidates': 'Finding duplicate candidates',
         'postprocess_candidates': 'Post-processing candidates',
-        'analyze_high_confidence_contracts': 'Analyzing high-confidence contracts',
+        'analyze_high_confidence_contracts': 'Analyzing suspected contracts',
         'finalize_report': 'Finalizing report',
     }
     _STAGE_PROGRESS = {
@@ -172,7 +172,7 @@ class _RichSingleSeedProgressReporter(_NoOpSingleSeedProgressReporter):
             self._progress.update(
                 self._task_id,
                 completed=self._ANALYZE_END,
-                description=self._build_description('No high-confidence contracts'),
+                description=self._build_description('No suspected contracts'),
             )
             return
         self._progress.update(
@@ -224,9 +224,9 @@ class _BatchSeedProgressReporter(_NoOpSingleSeedProgressReporter):
         del kwargs
 
     def on_high_confidence_contracts_started(self, *, total: int):
-        label = 'Analyzing high-confidence contracts'
+        label = 'Analyzing suspected contracts'
         if total == 0:
-            label = 'No high-confidence contracts'
+            label = 'No suspected contracts'
         self._owner._update_seed_state(
             self._seed_address,
             stage_label=label,

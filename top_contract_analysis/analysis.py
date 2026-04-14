@@ -616,6 +616,11 @@ def build_report_summary(
         for item in malicious_addresses
         if str(item.get('address') or '').strip()
     }
+    honest_address_set = {
+        str(item.get('address') or '').strip()
+        for item in honest_addresses
+        if str(item.get('address') or '').strip()
+    }
     minter_infringing_contracts: Dict[str, set[str]] = defaultdict(set)
     for item in infringing_tokens:
         minter = str(item.get('minter_address') or '')
@@ -644,6 +649,8 @@ def build_report_summary(
     ratio_over_80_count = sum(1 for value in buy_ratio_values if value > 0.8)
     stuck_honest_address_count = sum(1 for item in victim_addresses if item.get('is_stuck'))
     victim_address_count = len(victim_addresses)
+    honest_purchase_total_eth = sum(float(item.get('buy_amount_eth') or 0.0) for item in victim_addresses)
+    stuck_cost_eth = sum(float(item.get('last_buy_amount_eth') or 0.0) for item in victim_addresses if item.get('is_stuck'))
     mint_to_honest_samples = [
         float(sample)
         for item in honest_addresses
@@ -666,11 +673,14 @@ def build_report_summary(
         'low_confidence_contract_count': len(low_confidence),
         'infringing_nft_count': len(infringing_nft_keys),
         'malicious_address_count': len(malicious_address_set),
+        'honest_address_count': len(honest_address_set),
         'repeat_infringing_address_count': repeat_infringing_address_count,
         'legit_duplicate_contract_count': len(legit_duplicates),
         'candidate_open_license_token_count': len(candidate_open_license_tokens),
         'candidate_open_license_contract_count': len(candidate_open_license_contracts),
-        'honest_purchase_total_eth': sum(float(item.get('buy_amount_eth') or 0.0) for item in victim_addresses),
+        'honest_purchase_total_eth': honest_purchase_total_eth,
+        'stuck_cost_eth': stuck_cost_eth,
+        'stuck_cost_ratio': (stuck_cost_eth / honest_purchase_total_eth) if honest_purchase_total_eth else None,
         'buy_asset_ratio_known_address_count': ratio_known_count,
         'ratio_over_60_address_count': ratio_over_60_count,
         'ratio_over_60_address_ratio': (ratio_over_60_count / ratio_known_count) if ratio_known_count else None,
@@ -679,7 +689,9 @@ def build_report_summary(
         'stuck_honest_address_count': stuck_honest_address_count,
         'stuck_honest_address_ratio': (stuck_honest_address_count / victim_address_count) if victim_address_count else None,
         'avg_seconds_to_honest_holder': _mean_or_none(mint_to_honest_samples),
+        'median_seconds_to_honest_holder': _median_or_none(mint_to_honest_samples),
         'avg_mint_to_first_transfer_seconds': _mean_or_none(mint_to_first_transfer_values),
+        'median_mint_to_first_transfer_seconds': _median_or_none(mint_to_first_transfer_values),
         'avg_unique_receiver_count': _mean_or_none(unique_receiver_values),
     }
 
@@ -802,6 +814,7 @@ async def _analyze_high_confidence_contract_async(
     token_type: str,
     official_addresses: set[str],
     candidate_open_license_by_token: Dict[tuple[str, str], bool],
+    contract_confidence: str = 'high',
     timeout: int,
     signal_cache,
 ) -> Dict[str, Any]:
@@ -982,7 +995,7 @@ async def _analyze_high_confidence_contract_async(
     stage_times['build_fraud_stats'] = time.perf_counter() - started
     stage_times['contract_total'] = time.perf_counter() - contract_started
 
-    result['status'] = 'high'
+    result['status'] = contract_confidence
     result['address_signals'] = cached_address_signals
     result['victim_signals'] = cached_victim_signals
     result['malicious_addresses'] = malicious_addresses
@@ -1011,6 +1024,7 @@ def _analyze_high_confidence_contract(
     token_type: str,
     official_addresses: set[str],
     candidate_open_license_by_token: Dict[tuple[str, str], bool],
+    contract_confidence: str = 'high',
     timeout: int,
     signal_cache,
     session=None,
@@ -1240,7 +1254,7 @@ def _analyze_high_confidence_contract(
     stage_times['build_fraud_stats'] = time.perf_counter() - started
     stage_times['contract_total'] = time.perf_counter() - contract_started
 
-    result['status'] = 'high'
+    result['status'] = contract_confidence
     result['address_signals'] = cached_address_signals
     result['victim_signals'] = cached_victim_signals
     result['malicious_addresses'] = malicious_addresses
@@ -1409,22 +1423,15 @@ async def async_analyze_seed_contract(
         victim_addresses: List[Dict[str, Any]] = []
         fraud_trade_stats: Dict[str, Dict[str, Any]] = {}
         token_type = contract_meta.token_type or 'ERC721'
-        high_confidence_items: List[Tuple[str, Sequence[DuplicateCandidate]]] = []
+        contracts_to_analyze: List[Tuple[str, Sequence[DuplicateCandidate], str]] = []
 
         for contract_address, contract_candidates in grouped.items():
             contract_confidence = 'high' if any(item.confidence == 'high' for item in contract_candidates) else 'low'
             if open_license:
                 continue
-            if contract_confidence != 'high':
-                low_confidence.append({
-                    'contract_address': contract_address,
-                    'candidate_count': len(contract_candidates),
-                    'match_reasons': sorted({reason for item in contract_candidates for reason in item.match_reasons}),
-                })
-                continue
-            high_confidence_items.append((contract_address, contract_candidates))
+            contracts_to_analyze.append((contract_address, contract_candidates, contract_confidence))
 
-        if not open_license and high_confidence_items:
+        if not open_license and contracts_to_analyze:
             started = time.perf_counter()
             _notify_progress(
                 progress_reporter,
@@ -1432,9 +1439,9 @@ async def async_analyze_seed_contract(
                 'analyze_high_confidence_contracts',
                 seed_contract_address=seed_contract_address,
             )
-            _notify_progress(progress_reporter, 'on_high_confidence_contracts_started', total=len(high_confidence_items))
+            _notify_progress(progress_reporter, 'on_high_confidence_contracts_started', total=len(contracts_to_analyze))
 
-            async def _run_high_confidence(item: Tuple[str, Sequence[DuplicateCandidate]]) -> Dict[str, Any]:
+            async def _run_high_confidence(item: Tuple[str, Sequence[DuplicateCandidate], str]) -> Dict[str, Any]:
                 async with client.contract_semaphore:
                     return await _analyze_high_confidence_contract_async(
                         client=client,
@@ -1445,6 +1452,7 @@ async def async_analyze_seed_contract(
                         opensea_api_key=opensea_api_key,
                         contract_address=item[0],
                         contract_candidates=item[1],
+                        contract_confidence=item[2],
                         token_type=token_type,
                         official_addresses=official_addresses,
                         candidate_open_license_by_token=candidate_open_license_by_token,
@@ -1453,7 +1461,7 @@ async def async_analyze_seed_contract(
                     )
 
             completed_contracts = 0
-            for result in await asyncio.gather(*[_run_high_confidence(item) for item in high_confidence_items]):
+            for result in await asyncio.gather(*[_run_high_confidence(item) for item in contracts_to_analyze]):
                 completed_contracts += 1
                 contract_address = result['contract_address']
                 _notify_progress(
@@ -1461,7 +1469,7 @@ async def async_analyze_seed_contract(
                     'on_high_confidence_contract_completed',
                     contract_address=contract_address,
                     completed=completed_contracts,
-                    total=len(high_confidence_items),
+                    total=len(contracts_to_analyze),
                 )
                 if result['status'] == 'legit':
                     legit_duplicates.append({
@@ -1470,7 +1478,8 @@ async def async_analyze_seed_contract(
                         'mint_recipients': result['mint_recipients'],
                     })
                     continue
-                high_confidence.append({
+                target_bucket = high_confidence if result['status'] == 'high' else low_confidence
+                target_bucket.append({
                     'contract_address': contract_address,
                     'candidate_count': result['candidate_count'],
                     'match_reasons': result['match_reasons'],
