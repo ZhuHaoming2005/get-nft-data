@@ -8,6 +8,16 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
 
 
+def _count_unique_malicious_addresses(payload: Dict[str, Any]) -> int:
+    keys: set[str] = set()
+    for item in payload.get('malicious_addresses') or []:
+        address = str(item.get('address') or '').strip()
+        if not address:
+            continue
+        keys.add(address)
+    return len(keys)
+
+
 def dump_results(payload: Dict[str, Any], output_path: Optional[str]) -> None:
     text = json.dumps(payload, ensure_ascii=False, indent=2)
     Path(output_path).write_text(text, encoding='utf-8')
@@ -59,6 +69,9 @@ def build_batch_summary_payload(
     total_candidates = 0
     total_high = 0
     total_low = 0
+    total_infringing_nfts = 0
+    total_malicious_addresses = 0
+    total_repeat_infringing_addresses = 0
     total_legit = 0
     open_license_count = 0
     total_honest_purchase_eth = 0.0
@@ -71,6 +84,8 @@ def build_batch_summary_payload(
     mean_unique_receiver_values: list[float] = []
     chains: list[str] = []
     output_index = output_index or []
+    malicious_address_global_set: set[str] = set()
+    minter_infringing_contracts: Dict[str, set[str]] = {}
 
     for index, payload in enumerate(payloads):
         seed = payload.get('seed_contract') or {}
@@ -80,6 +95,23 @@ def build_batch_summary_payload(
         total_candidates += int(summary.get('candidate_contract_count') or 0)
         total_high += int(summary.get('high_confidence_contract_count') or 0)
         total_low += int(summary.get('low_confidence_contract_count') or 0)
+        payload_infringing_tokens = payload.get('infringing_tokens') or []
+        payload_malicious_address_count = _count_unique_malicious_addresses(payload)
+        payload_minter_contracts: Dict[str, set[str]] = {}
+        for token in payload_infringing_tokens:
+            minter = str(token.get('minter_address') or '').strip()
+            contract = str(token.get('contract_address') or '').strip()
+            if minter and contract:
+                payload_minter_contracts.setdefault(minter, set()).add(contract)
+        payload_repeat_infringing_count = sum(
+            1 for contracts in payload_minter_contracts.values() if len(contracts) > 1
+        )
+        summary_infringing_nft_count = int(summary.get('infringing_nft_count') or len(payload_infringing_tokens))
+        summary_malicious_address_count = int(summary.get('malicious_address_count') or payload_malicious_address_count)
+        summary_repeat_infringing_count = int(summary.get('repeat_infringing_address_count') or payload_repeat_infringing_count)
+
+        total_infringing_nfts += summary_infringing_nft_count
+        total_repeat_infringing_addresses += summary_repeat_infringing_count
         total_legit += int(summary.get('legit_duplicate_contract_count') or 0)
         total_honest_purchase_eth += float(summary.get('honest_purchase_total_eth') or 0.0)
         total_ratio_known += int(summary.get('buy_asset_ratio_known_address_count') or 0)
@@ -95,10 +127,23 @@ def build_batch_summary_payload(
         chain = str(seed.get('chain') or '').strip()
         if chain:
             chains.append(chain)
+        for token in payload_infringing_tokens:
+            minter = str(token.get('minter_address') or '').strip()
+            contract = str(token.get('contract_address') or '').strip()
+            if minter and contract:
+                minter_infringing_contracts.setdefault(minter, set()).add(contract)
+        for item in payload.get('malicious_addresses') or []:
+            address = str(item.get('address') or '').strip()
+            if address:
+                malicious_address_global_set.add(address)
 
+        report_summary = dict(summary)
+        report_summary['infringing_nft_count'] = summary_infringing_nft_count
+        report_summary['malicious_address_count'] = summary_malicious_address_count
+        report_summary['repeat_infringing_address_count'] = summary_repeat_infringing_count
         report_entry: Dict[str, Any] = {
             'seed_contract': seed,
-            'report_summary': summary,
+            'report_summary': report_summary,
         }
         if index < len(output_index):
             report_entry['output_files'] = output_index[index]
@@ -107,6 +152,10 @@ def build_batch_summary_payload(
         reports.append(report_entry)
 
     distinct_chains = sorted(set(chains))
+    repeat_infringing_address_count_global = sum(
+        1 for contracts in minter_infringing_contracts.values() if len(contracts) > 1
+    )
+    total_malicious_addresses = len(malicious_address_global_set)
     return {
         'batch_summary': {
             'seed_report_count': len(payloads),
@@ -116,6 +165,10 @@ def build_batch_summary_payload(
             'candidate_contract_count_total': total_candidates,
             'high_confidence_contract_count_total': total_high,
             'low_confidence_contract_count_total': total_low,
+            'infringing_nft_count_total': total_infringing_nfts,
+            'malicious_address_count_total': total_malicious_addresses,
+            'repeat_infringing_address_count_total': total_repeat_infringing_addresses,
+            'repeat_infringing_address_count_global': repeat_infringing_address_count_global,
             'legit_duplicate_contract_count_total': total_legit,
             'honest_purchase_total_eth_total': total_honest_purchase_eth,
             'buy_asset_ratio_known_address_count_total': total_ratio_known,
@@ -153,6 +206,10 @@ def render_batch_human_readable_report(payload: Dict[str, Any]) -> str:
         f"- 重复候选合约总数: {summary.get('candidate_contract_count_total', 0)}",
         f"- 高置信疑似侵权合约总数: {summary.get('high_confidence_contract_count_total', 0)}",
         f"- 低置信疑似侵权合约总数: {summary.get('low_confidence_contract_count_total', 0)}",
+        f"- 疑似侵权 NFT 总数: {summary.get('infringing_nft_count_total', 0)}",
+        f"- 恶意地址总数: {summary.get('malicious_address_count_total', 0)}",
+        f"- 多次侵权地址总数(按 seed 求和): {summary.get('repeat_infringing_address_count_total', 0)}",
+        f"- 多次侵权地址总数(跨批次全局去重): {summary.get('repeat_infringing_address_count_global', 0)}",
         f"- 官方参与型重复合约总数: {summary.get('legit_duplicate_contract_count_total', 0)}",
         f"- 诚实地址购买总金额(ETH/WETH)汇总: {summary.get('honest_purchase_total_eth_total', 0.0)}",
         f"- 可计算买入占比的诚实地址总数: {summary.get('buy_asset_ratio_known_address_count_total', 0)}",
@@ -179,6 +236,9 @@ def render_batch_human_readable_report(payload: Dict[str, Any]) -> str:
                 f"- {seed_name} ({seed.get('contract_address', '')}) | "
                 f"高置信={report_summary.get('high_confidence_contract_count', 0)} | "
                 f"低置信={report_summary.get('low_confidence_contract_count', 0)} | "
+                f"侵权NFT={report_summary.get('infringing_nft_count', 0)} | "
+                f"恶意地址={report_summary.get('malicious_address_count', _count_unique_malicious_addresses(item))} | "
+                f"多次侵权地址={report_summary.get('repeat_infringing_address_count', 0)} | "
                 f"官方参与={report_summary.get('legit_duplicate_contract_count', 0)} | "
                 f"诚实购买额={report_summary.get('honest_purchase_total_eth', 0.0)} | "
                 f">60%={report_summary.get('ratio_over_60_address_count', 0)}/{_format_ratio(report_summary.get('ratio_over_60_address_ratio'))} | "
@@ -230,6 +290,16 @@ def render_human_readable_report(payload: Dict[str, Any]) -> str:
     honest_address_stats = payload.get('honest_address_stats') or {}
     victim_addresses = payload.get('victim_addresses') or []
     fraud_trade_stats = payload.get('fraud_trade_stats') or {}
+    infringing_tokens = payload.get('infringing_tokens') or []
+    repeat_minter_contracts: Dict[str, set[str]] = {}
+    for item in infringing_tokens:
+        minter = str(item.get('minter_address') or '').strip()
+        contract = str(item.get('contract_address') or '').strip()
+        if minter and contract:
+            repeat_minter_contracts.setdefault(minter, set()).add(contract)
+    repeat_infringing_address_count = sum(
+        1 for contracts in repeat_minter_contracts.values() if len(contracts) > 1
+    )
 
     lines = [
         '# Top NFT 合约重复样本分析报告',
@@ -248,6 +318,9 @@ def render_human_readable_report(payload: Dict[str, Any]) -> str:
         f"- 重复候选合约数: {summary.get('candidate_contract_count', 0)}",
         f"- 高置信疑似侵权合约数: {summary.get('high_confidence_contract_count', 0)}",
         f"- 低置信疑似侵权合约数: {summary.get('low_confidence_contract_count', 0)}",
+        f"- 疑似侵权 NFT 总数: {summary.get('infringing_nft_count', len(infringing_tokens))}",
+        f"- 恶意地址数: {summary.get('malicious_address_count', _count_unique_malicious_addresses(payload))}",
+        f"- 多次侵权地址数: {summary.get('repeat_infringing_address_count', repeat_infringing_address_count)}",
         f"- 归为官方参与型重复的合约数: {summary.get('legit_duplicate_contract_count', 0)}",
         f"- 候选侧开放许可 token 数: {summary.get('candidate_open_license_token_count', 0)}",
         f"- 候选侧开放许可合约数: {summary.get('candidate_open_license_contract_count', 0)}",

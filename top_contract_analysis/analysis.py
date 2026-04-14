@@ -598,10 +598,33 @@ def build_report_summary(
     low_confidence: Sequence[Dict[str, Any]],
     legit_duplicates: Sequence[Dict[str, Any]],
     infringing_tokens: Sequence[Dict[str, Any]],
+    malicious_addresses: Sequence[Dict[str, Any]],
     honest_addresses: Sequence[Dict[str, Any]],
     victim_addresses: Sequence[Dict[str, Any]],
     address_signals: Dict[str, Dict[str, Any]],
 ) -> Dict[str, Any]:
+    infringing_nft_keys = {
+        (
+            str(item.get('contract_address') or ''),
+            str(item.get('token_id') or ''),
+        )
+        for item in infringing_tokens
+        if item.get('token_id')
+    }
+    malicious_address_set = {
+        str(item.get('address') or '').strip()
+        for item in malicious_addresses
+        if str(item.get('address') or '').strip()
+    }
+    minter_infringing_contracts: Dict[str, set[str]] = defaultdict(set)
+    for item in infringing_tokens:
+        minter = str(item.get('minter_address') or '')
+        contract = str(item.get('contract_address') or '')
+        if minter and contract:
+            minter_infringing_contracts[minter].add(contract)
+    repeat_infringing_address_count = sum(
+        1 for contracts in minter_infringing_contracts.values() if len(contracts) > 1
+    )
     candidate_open_license_tokens = [
         item for item in infringing_tokens
         if item.get('candidate_open_license')
@@ -641,6 +664,9 @@ def build_report_summary(
         'candidate_contract_count': len(grouped),
         'high_confidence_contract_count': len(high_confidence),
         'low_confidence_contract_count': len(low_confidence),
+        'infringing_nft_count': len(infringing_nft_keys),
+        'malicious_address_count': len(malicious_address_set),
+        'repeat_infringing_address_count': repeat_infringing_address_count,
         'legit_duplicate_contract_count': len(legit_duplicates),
         'candidate_open_license_token_count': len(candidate_open_license_tokens),
         'candidate_open_license_contract_count': len(candidate_open_license_contracts),
@@ -1473,6 +1499,7 @@ async def async_analyze_seed_contract(
             low_confidence=low_confidence,
             legit_duplicates=legit_duplicates,
             infringing_tokens=infringing_tokens,
+            malicious_addresses=malicious_addresses,
             honest_addresses=honest_addresses,
             victim_addresses=victim_addresses,
             address_signals=address_signals,

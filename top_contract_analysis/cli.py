@@ -32,8 +32,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--max-tokens-per-contract',
         type=int,
-        default=500,
-        help='per-contract token cap in DuckDB recall query (default: 500)',
+        default=0,
+        help='per-contract token cap in DuckDB recall query (default: no limit)',
     )
     parser.add_argument(
         '--max-recall-rows',
