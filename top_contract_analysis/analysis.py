@@ -620,6 +620,7 @@ def build_report_summary(
     ratio_over_60_count = sum(1 for value in buy_ratio_values if value > 0.6)
     ratio_over_80_count = sum(1 for value in buy_ratio_values if value > 0.8)
     stuck_honest_address_count = sum(1 for item in victim_addresses if item.get('is_stuck'))
+    corrupted_honest_address_count = sum(1 for item in honest_addresses if item.get('is_corrupted_address'))
     victim_address_count = len(victim_addresses)
     mint_to_honest_samples = [
         float(sample)
@@ -652,6 +653,7 @@ def build_report_summary(
         'ratio_over_80_address_ratio': (ratio_over_80_count / ratio_known_count) if ratio_known_count else None,
         'stuck_honest_address_count': stuck_honest_address_count,
         'stuck_honest_address_ratio': (stuck_honest_address_count / victim_address_count) if victim_address_count else None,
+        'corrupted_honest_address_count': corrupted_honest_address_count,
         'avg_seconds_to_honest_holder': _mean_or_none(mint_to_honest_samples),
         'avg_mint_to_first_transfer_seconds': _mean_or_none(mint_to_first_transfer_values),
         'avg_unique_receiver_count': _mean_or_none(unique_receiver_values),

@@ -1345,6 +1345,7 @@ class EndToEndAnalysisTests(unittest.TestCase):
         self.assertEqual(result['report_summary']['ratio_over_80_address_ratio'], 0.0)
         self.assertEqual(result['report_summary']['stuck_honest_address_count'], 0)
         self.assertEqual(result['report_summary']['stuck_honest_address_ratio'], 0.0)
+        self.assertEqual(result['report_summary']['corrupted_honest_address_count'], 1)
         self.assertAlmostEqual(result['report_summary']['avg_seconds_to_honest_holder'], 50.0)
         self.assertAlmostEqual(result['report_summary']['avg_mint_to_first_transfer_seconds'], 50.0)
         self.assertAlmostEqual(result['report_summary']['avg_unique_receiver_count'], 3.0)
@@ -1516,6 +1517,7 @@ class HumanReadableReportTests(unittest.TestCase):
                 'ratio_over_80_address_ratio': 0.0,
                 'stuck_honest_address_count': 0,
                 'stuck_honest_address_ratio': 0.0,
+                'corrupted_honest_address_count': 1,
                 'avg_seconds_to_honest_holder': 50.0,
                 'avg_mint_to_first_transfer_seconds': 600.0,
                 'avg_unique_receiver_count': 8.0,
@@ -1654,6 +1656,7 @@ class HumanReadableReportTests(unittest.TestCase):
         self.assertIn('买入金额占钱包总额 >60% 的地址数/占比: 0 / 0.00%', text)
         self.assertIn('买入金额占钱包总额 >80% 的地址数/占比: 0 / 0.00%', text)
         self.assertIn('购买后无法再次售出的诚实节点数/占比: 0 / 0.00%', text)
+        self.assertIn('被腐化的地址数: 1', text)
         self.assertIn('Mint 到被诚实节点购买平均时间: 50.0 秒', text)
         self.assertIn('Mint 到首次转手平均时间: 600.0 秒', text)
         self.assertIn('候选合约平均唯一接收钱包数: 8.0', text)
@@ -1699,6 +1702,7 @@ class BatchSummaryReportTests(unittest.TestCase):
                     'ratio_over_80_address_ratio': 0.0,
                     'stuck_honest_address_count': 1,
                     'stuck_honest_address_ratio': 0.5,
+                    'corrupted_honest_address_count': 1,
                     'avg_seconds_to_honest_holder': 100.0,
                     'avg_mint_to_first_transfer_seconds': 200.0,
                     'avg_unique_receiver_count': 5.0,
@@ -1720,6 +1724,7 @@ class BatchSummaryReportTests(unittest.TestCase):
                     'ratio_over_80_address_ratio': 1.0,
                     'stuck_honest_address_count': 1,
                     'stuck_honest_address_ratio': 1.0,
+                    'corrupted_honest_address_count': 0,
                     'avg_seconds_to_honest_holder': 300.0,
                     'avg_mint_to_first_transfer_seconds': 600.0,
                     'avg_unique_receiver_count': 7.0,
@@ -1741,6 +1746,7 @@ class BatchSummaryReportTests(unittest.TestCase):
         self.assertAlmostEqual(summary['ratio_over_80_address_ratio_overall'], 1 / 3)
         self.assertEqual(summary['stuck_honest_address_count_total'], 2)
         self.assertAlmostEqual(summary['stuck_honest_address_ratio_overall'], 2 / 3)
+        self.assertEqual(summary['corrupted_honest_address_count_total'], 1)
         self.assertAlmostEqual(summary['avg_seconds_to_honest_holder_mean'], 200.0)
         self.assertAlmostEqual(summary['avg_mint_to_first_transfer_seconds_mean'], 400.0)
         self.assertAlmostEqual(summary['avg_unique_receiver_count_mean'], 6.0)
@@ -1764,6 +1770,7 @@ class BatchSummaryReportTests(unittest.TestCase):
                 'ratio_over_80_address_ratio_overall': 1 / 3,
                 'stuck_honest_address_count_total': 2,
                 'stuck_honest_address_ratio_overall': 2 / 3,
+                'corrupted_honest_address_count_total': 1,
                 'avg_seconds_to_honest_holder_mean': 200.0,
                 'avg_mint_to_first_transfer_seconds_mean': 400.0,
                 'avg_unique_receiver_count_mean': 6.0,
@@ -1781,6 +1788,7 @@ class BatchSummaryReportTests(unittest.TestCase):
                         'ratio_over_60_address_ratio': 0.5,
                         'stuck_honest_address_count': 1,
                         'stuck_honest_address_ratio': 0.5,
+                        'corrupted_honest_address_count': 1,
                         'avg_seconds_to_honest_holder': 100.0,
                     },
                     'output_files': {'json': 'alpha.json', 'markdown': 'alpha.md'},
@@ -1795,6 +1803,7 @@ class BatchSummaryReportTests(unittest.TestCase):
         self.assertIn('买入金额占钱包总额 >60% 的地址数/总体占比: 2 / 66.67%', text)
         self.assertIn('买入金额占钱包总额 >80% 的地址数/总体占比: 1 / 33.33%', text)
         self.assertIn('购买后无法再次售出的诚实节点数/总体占比: 2 / 66.67%', text)
+        self.assertIn('被腐化的诚实地址总数: 1', text)
         self.assertIn('Mint 到被诚实节点购买平均时间(跨 seed 均值): 200.0 秒', text)
         self.assertIn('Mint 到首次转手平均时间(跨 seed 均值): 400.0 秒', text)
         self.assertIn('候选合约平均唯一接收钱包数(跨 seed 均值): 6.0', text)
@@ -1802,6 +1811,7 @@ class BatchSummaryReportTests(unittest.TestCase):
         self.assertIn('诚实购买额=2.5', text)
         self.assertIn('>60%=1/50.00%', text)
         self.assertIn('套牢=1/50.00%', text)
+        self.assertIn('被腐化=1', text)
         self.assertIn('诚实购买时长=100.0秒', text)
 
 

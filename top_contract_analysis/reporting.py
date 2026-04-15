@@ -66,6 +66,7 @@ def build_batch_summary_payload(
     total_ratio_over_60 = 0
     total_ratio_over_80 = 0
     total_stuck_honest = 0
+    total_corrupted_honest = 0
     mean_honest_holder_values: list[float] = []
     mean_first_transfer_values: list[float] = []
     mean_unique_receiver_values: list[float] = []
@@ -86,6 +87,7 @@ def build_batch_summary_payload(
         total_ratio_over_60 += int(summary.get('ratio_over_60_address_count') or 0)
         total_ratio_over_80 += int(summary.get('ratio_over_80_address_count') or 0)
         total_stuck_honest += int(summary.get('stuck_honest_address_count') or 0)
+        total_corrupted_honest += int(summary.get('corrupted_honest_address_count') or 0)
         if isinstance(summary.get('avg_seconds_to_honest_holder'), (int, float)):
             mean_honest_holder_values.append(float(summary['avg_seconds_to_honest_holder']))
         if isinstance(summary.get('avg_mint_to_first_transfer_seconds'), (int, float)):
@@ -125,6 +127,7 @@ def build_batch_summary_payload(
             'ratio_over_80_address_ratio_overall': (total_ratio_over_80 / total_ratio_known) if total_ratio_known else None,
             'stuck_honest_address_count_total': total_stuck_honest,
             'stuck_honest_address_ratio_overall': (total_stuck_honest / total_ratio_known) if total_ratio_known else None,
+            'corrupted_honest_address_count_total': total_corrupted_honest,
             'avg_seconds_to_honest_holder_mean': (
                 sum(mean_honest_holder_values) / len(mean_honest_holder_values) if mean_honest_holder_values else None
             ),
@@ -159,6 +162,7 @@ def render_batch_human_readable_report(payload: Dict[str, Any]) -> str:
         f"- 买入金额占钱包总额 >60% 的地址数/总体占比: {summary.get('ratio_over_60_address_count_total', 0)} / {_format_ratio(summary.get('ratio_over_60_address_ratio_overall'))}",
         f"- 买入金额占钱包总额 >80% 的地址数/总体占比: {summary.get('ratio_over_80_address_count_total', 0)} / {_format_ratio(summary.get('ratio_over_80_address_ratio_overall'))}",
         f"- 购买后无法再次售出的诚实节点数/总体占比: {summary.get('stuck_honest_address_count_total', 0)} / {_format_ratio(summary.get('stuck_honest_address_ratio_overall'))}",
+        f"- 被腐化的诚实地址总数: {summary.get('corrupted_honest_address_count_total', 0)}",
         f"- Mint 到被诚实节点购买平均时间(跨 seed 均值): {_format_scalar(summary.get('avg_seconds_to_honest_holder_mean'))} 秒",
         f"- Mint 到首次转手平均时间(跨 seed 均值): {_format_scalar(summary.get('avg_mint_to_first_transfer_seconds_mean'))} 秒",
         f"- 候选合约平均唯一接收钱包数(跨 seed 均值): {_format_scalar(summary.get('avg_unique_receiver_count_mean'))}",
@@ -183,6 +187,7 @@ def render_batch_human_readable_report(payload: Dict[str, Any]) -> str:
                 f"诚实购买额={report_summary.get('honest_purchase_total_eth', 0.0)} | "
                 f">60%={report_summary.get('ratio_over_60_address_count', 0)}/{_format_ratio(report_summary.get('ratio_over_60_address_ratio'))} | "
                 f"套牢={report_summary.get('stuck_honest_address_count', 0)}/{_format_ratio(report_summary.get('stuck_honest_address_ratio'))} | "
+                f"被腐化={report_summary.get('corrupted_honest_address_count', 0)} | "
                 f"诚实购买时长={_format_scalar(report_summary.get('avg_seconds_to_honest_holder'))}秒 | "
                 f"JSON={output_files.get('json', '')} | MD={output_files.get('markdown', '')}"
             )
@@ -256,6 +261,7 @@ def render_human_readable_report(payload: Dict[str, Any]) -> str:
         f"- 买入金额占钱包总额 >60% 的地址数/占比: {summary.get('ratio_over_60_address_count', 0)} / {_format_ratio(summary.get('ratio_over_60_address_ratio'))}",
         f"- 买入金额占钱包总额 >80% 的地址数/占比: {summary.get('ratio_over_80_address_count', 0)} / {_format_ratio(summary.get('ratio_over_80_address_ratio'))}",
         f"- 购买后无法再次售出的诚实节点数/占比: {summary.get('stuck_honest_address_count', 0)} / {_format_ratio(summary.get('stuck_honest_address_ratio'))}",
+        f"- 被腐化的地址数: {summary.get('corrupted_honest_address_count', 0)}",
         f"- Mint 到被诚实节点购买平均时间: {_format_scalar(summary.get('avg_seconds_to_honest_holder'))} 秒",
         f"- Mint 到首次转手平均时间: {_format_scalar(summary.get('avg_mint_to_first_transfer_seconds'))} 秒",
         f"- 候选合约平均唯一接收钱包数: {_format_scalar(summary.get('avg_unique_receiver_count'))}",
