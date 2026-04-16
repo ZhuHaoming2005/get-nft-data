@@ -234,10 +234,14 @@ pub struct VictimAddressPayload {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct FraudTradeStatsPayload {
     pub unique_buyers: i64,
-    pub eth_priced_sale_count: i64,
-    pub eth_priced_volume: f64,
-    pub native_eth_sale_count: i64,
-    pub native_eth_volume: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eth_priced_sale_count: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eth_priced_volume: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_eth_sale_count: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_eth_volume: Option<f64>,
     pub stuck_wallet_count: i64,
     pub stuck_cost_eth: f64,
 }

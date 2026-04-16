@@ -85,8 +85,8 @@ fn single_report_payload_serializes_current_python_top_level_shape() {
         fraud_trade_stats: BTreeMap::from([(
             "0xdup".into(),
             FraudTradeStatsPayload {
-                native_eth_sale_count: 4,
-                native_eth_volume: 6.25,
+                native_eth_sale_count: Some(4),
+                native_eth_volume: Some(6.25),
                 ..Default::default()
             },
         )]),
@@ -257,10 +257,10 @@ fn single_report_markdown_preserves_reference_sections_and_summary_lines() {
             "0xhigh".into(),
             FraudTradeStatsPayload {
                 unique_buyers: 2,
-                eth_priced_sale_count: 2,
-                eth_priced_volume: 5.5,
-                native_eth_sale_count: 2,
-                native_eth_volume: 5.5,
+                eth_priced_sale_count: Some(2),
+                eth_priced_volume: Some(5.5),
+                native_eth_sale_count: Some(2),
+                native_eth_volume: Some(5.5),
                 stuck_wallet_count: 1,
                 stuck_cost_eth: 2.0,
             },
@@ -361,8 +361,8 @@ fn single_report_fraud_trade_stats_fall_back_to_native_eth_fields() {
             "0xdup".into(),
             FraudTradeStatsPayload {
                 unique_buyers: 3,
-                native_eth_sale_count: 4,
-                native_eth_volume: 6.25,
+                native_eth_sale_count: Some(4),
+                native_eth_volume: Some(6.25),
                 stuck_wallet_count: 2,
                 stuck_cost_eth: 1.5,
                 ..Default::default()
@@ -375,5 +375,30 @@ fn single_report_fraud_trade_stats_fall_back_to_native_eth_fields() {
 
     assert!(markdown.contains(
         "- 0xdup: unique_buyers=3 | eth_priced_sale_count=4 | eth_priced_volume=6.25 | stuck_wallet_count=2 | stuck_cost_eth=1.5"
+    ));
+}
+
+#[test]
+fn single_report_fraud_trade_stats_preserve_explicit_zero_eth_priced_values() {
+    let payload = SingleReportPayload {
+        fraud_trade_stats: BTreeMap::from([(
+            "0xdup".into(),
+            FraudTradeStatsPayload {
+                unique_buyers: 3,
+                eth_priced_sale_count: Some(0),
+                eth_priced_volume: Some(0.0),
+                native_eth_sale_count: Some(4),
+                native_eth_volume: Some(6.25),
+                stuck_wallet_count: 2,
+                stuck_cost_eth: 1.5,
+            },
+        )]),
+        ..Default::default()
+    };
+
+    let markdown = render_human_readable_report(&payload);
+
+    assert!(markdown.contains(
+        "- 0xdup: unique_buyers=3 | eth_priced_sale_count=0 | eth_priced_volume=0 | stuck_wallet_count=2 | stuck_cost_eth=1.5"
     ));
 }
