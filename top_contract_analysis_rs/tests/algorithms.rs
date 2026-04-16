@@ -6,13 +6,61 @@ use strsim::{jaro_winkler, normalized_levenshtein};
 use top_contract_analysis_rs::analysis::scoring::{
     metadata_document_from_json, score_metadata_documents, score_name_pairs, ScoringError,
 };
-use top_contract_analysis_rs::normalize::{normalize_name, normalize_symbol, normalize_text, normalize_url};
+use top_contract_analysis_rs::normalize::{normalize_name, normalize_symbol, normalize_url};
+use unicode_normalization::UnicodeNormalization;
 
 static TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\p{L}\p{N}_]+").unwrap());
+static TRAILING_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"\s*#\s*[0-9a-fA-FxX]+\s*$").unwrap(),
+        Regex::new(r"\s*#\s*\d+\s*$").unwrap(),
+        Regex::new(r"\s*-\s*\d+\s*$").unwrap(),
+        Regex::new(r"\s*:\s*\d+\s*$").unwrap(),
+        Regex::new(r"\s*\(\s*\d+\s*\)\s*$").unwrap(),
+        Regex::new(r"\s*\[\s*\d+\s*\]\s*$").unwrap(),
+        Regex::new(r"\s*/\s*\d+\s*$").unwrap(),
+        Regex::new(r"\s+No\.?\s*\d+\s*$").unwrap(),
+        Regex::new(r"\s+nr\.?\s*\d+\s*$").unwrap(),
+        Regex::new(r"\s+\d{1,12}\s*$").unwrap(),
+    ]
+});
+static WHITESPACE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
+
+fn reference_normalize_nfkc(raw: &str) -> String {
+    raw.nfkc().collect::<String>()
+}
+
+fn reference_strip_trailing_number_suffix(raw: &str) -> String {
+    let mut text = reference_normalize_nfkc(raw).trim().to_string();
+    let mut changed = true;
+    let mut guard = 0;
+    while changed && guard < 20 {
+        changed = false;
+        guard += 1;
+        for pattern in TRAILING_PATTERNS.iter() {
+            let updated = pattern.replace(&text, "").trim().to_string();
+            if updated != text {
+                text = updated;
+                changed = true;
+                break;
+            }
+        }
+    }
+    WHITESPACE_RE.replace_all(&text, " ").trim().to_string()
+}
+
+fn reference_normalize_name(raw: &str) -> String {
+    reference_strip_trailing_number_suffix(raw).to_lowercase()
+}
+
+fn reference_normalize_text(raw: &str) -> String {
+    let text = reference_normalize_nfkc(raw).to_lowercase();
+    WHITESPACE_RE.replace_all(text.trim(), " ").to_string()
+}
 
 fn reference_name_score(left: &str, right: &str) -> f64 {
-    let left_norm = normalize_name(left);
-    let right_norm = normalize_name(right);
+    let left_norm = reference_normalize_name(left);
+    let right_norm = reference_normalize_name(right);
     if left_norm.is_empty() || right_norm.is_empty() {
         return 0.0;
     }
@@ -25,8 +73,8 @@ fn reference_name_score(left: &str, right: &str) -> f64 {
 }
 
 fn reference_metadata_document_score(left: &str, right: &str) -> f64 {
-    let left_doc = normalize_text(left);
-    let right_doc = normalize_text(right);
+    let left_doc = reference_normalize_text(left);
+    let right_doc = reference_normalize_text(right);
     if left_doc.is_empty() || right_doc.is_empty() {
         return 0.0;
     }
