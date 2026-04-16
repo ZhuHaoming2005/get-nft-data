@@ -21,28 +21,27 @@ fn candidate_length_bounds(length: usize, threshold: f64) -> (usize, usize) {
 }
 
 fn metadata_keywords(document: &str, limit: usize) -> Vec<String> {
-    let mut scored: Vec<(String, usize, f64)> = TOKEN_RE
-        .find_iter(document)
-        .map(|m| m.as_str().to_lowercase())
-        .filter(|token| token.len() >= 2)
-        .fold(HashMap::<String, usize>::new(), |mut acc, token| {
-            *acc.entry(token).or_insert(0) += 1;
-            acc
-        })
-        .into_iter()
-        .map(|(token, count)| {
-            let weight = (token.len() as f64 * 0.35) + (count as f64 * 0.65);
-            (token, count, weight)
-        })
-        .collect();
-    scored.sort_by(|left, right| {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for token in TOKEN_RE.find_iter(document) {
+        let normalized = token.as_str().to_lowercase();
+        if normalized.len() < 4 {
+            continue;
+        }
+        *counts.entry(normalized).or_insert(0) += 1;
+    }
+    let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();
+    ranked.sort_by(|left, right| {
         right
-            .2
-            .partial_cmp(&left.2)
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .1
+            .cmp(&left.1)
+            .then_with(|| right.0.len().cmp(&left.0.len()))
             .then_with(|| left.0.cmp(&right.0))
     });
-    scored.into_iter().take(limit).map(|(token, _, _)| token).collect()
+    ranked
+        .into_iter()
+        .take(limit)
+        .map(|(token, _)| token)
+        .collect()
 }
 
 fn has_name_match(

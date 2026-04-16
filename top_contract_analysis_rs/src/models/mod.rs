@@ -97,7 +97,7 @@ pub struct AddressSignals {
     pub unique_receiver_count: usize,
     pub cycle_edge_count: usize,
     pub star_distributor_count: usize,
-    pub mint_to_first_transfer_seconds: Option<i64>,
+    pub mint_to_first_transfer_seconds: i64,
     pub fast_spread: bool,
 }
 

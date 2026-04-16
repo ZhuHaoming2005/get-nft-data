@@ -9,7 +9,7 @@ pub fn build_infringing_token_records(
 ) -> Vec<InfringingTokenRecord> {
     let mut transfers_by_token: HashMap<String, Vec<&TransferRecord>> = HashMap::new();
     for transfer in transfers {
-        if transfer.token_id.is_empty() {
+        if transfer.contract_address != contract_address || transfer.token_id.is_empty() {
             continue;
         }
         transfers_by_token

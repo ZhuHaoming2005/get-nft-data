@@ -214,14 +214,52 @@ fn duplicate_candidates_use_token_uri_and_name_reason_flags() {
 }
 
 #[test]
+fn duplicate_candidates_ignore_short_metadata_keywords_for_gating() {
+    let seed_nfts = vec![SeedNft {
+        metadata_doc: "cat".into(),
+        ..Default::default()
+    }];
+    let snapshot_rows = vec![DatabaseNftRecord {
+        contract_address: "0xdup".into(),
+        token_id: "1".into(),
+        metadata_doc: "cat".into(),
+        ..Default::default()
+    }];
+
+    let rows = build_duplicate_candidates(&seed_nfts, &snapshot_rows, 95.0, 0.55);
+
+    assert!(rows.is_empty());
+}
+
+#[test]
 fn transfer_signals_calculate_fast_spread() {
     let signals = analyze_transfer_signals(&[
         TransferRecord::mint("0xdup", "1", 100, "0xholder1"),
         TransferRecord::transfer("0xdup", "1", 120, "0xholder1", "0xholder2"),
     ]);
 
-    assert_eq!(signals.mint_to_first_transfer_seconds, Some(20));
+    assert_eq!(signals.mint_to_first_transfer_seconds, 20);
     assert!(signals.fast_spread);
+}
+
+#[test]
+fn transfer_signals_return_zero_when_delay_is_zero_or_invalid() {
+    let zero_delay = analyze_transfer_signals(&[
+        TransferRecord::mint("0xdup", "1", 100, "0xholder1"),
+        TransferRecord::transfer("0xdup", "1", 100, "0xholder1", "0xholder2"),
+    ]);
+    assert_eq!(zero_delay.mint_to_first_transfer_seconds, 0);
+    assert!(!zero_delay.fast_spread);
+
+    let no_mint = analyze_transfer_signals(&[TransferRecord::transfer(
+        "0xdup",
+        "1",
+        120,
+        "0xholder1",
+        "0xholder2",
+    )]);
+    assert_eq!(no_mint.mint_to_first_transfer_seconds, 0);
+    assert!(!no_mint.fast_spread);
 }
 
 #[test]
@@ -247,4 +285,81 @@ fn infringing_token_records_capture_mint_context_and_match_reasons() {
         rows[0].match_reasons,
         vec!["token_uri_match".to_string(), "name_match".to_string()]
     );
+    assert!(!rows[0].candidate_open_license);
+    assert!(!rows[0].official_or_legit_reissue);
+}
+
+#[test]
+fn infringing_token_records_fall_back_to_first_transfer_without_mint() {
+    let candidates = vec![DuplicateCandidate {
+        contract_address: "0xdup".into(),
+        token_id: "1".into(),
+        match_reasons: vec!["name_match".into()],
+        ..Default::default()
+    }];
+    let transfers = vec![TransferRecord {
+        contract_address: "0xdup".into(),
+        token_id: "1".into(),
+        tx_hash: "0xfallback".into(),
+        block_number: 7,
+        log_index: 3,
+        block_time: 120,
+        from_address: "0xholder1".into(),
+        to_address: "0xholder2".into(),
+        event_type: "transfer".into(),
+        source: "test".into(),
+    }];
+
+    let rows = build_infringing_token_records("0xdup", &candidates, &transfers);
+
+    assert_eq!(rows[0].mint_tx_hash, "0xfallback");
+    assert_eq!(rows[0].mint_block, 7);
+    assert_eq!(rows[0].minter_address, "0xholder2");
+    assert_eq!(rows[0].first_transfer_time, 120);
+    assert!(!rows[0].candidate_open_license);
+    assert!(!rows[0].official_or_legit_reissue);
+}
+
+#[test]
+fn infringing_token_records_ignore_other_contracts_with_same_token_id() {
+    let candidates = vec![DuplicateCandidate {
+        contract_address: "0xdup".into(),
+        token_id: "1".into(),
+        match_reasons: vec!["name_match".into()],
+        ..Default::default()
+    }];
+    let transfers = vec![
+        TransferRecord {
+            contract_address: "0xother".into(),
+            token_id: "1".into(),
+            tx_hash: "0xothermint".into(),
+            block_number: 1,
+            log_index: 0,
+            block_time: 100,
+            from_address: "0x0000000000000000000000000000000000000000".into(),
+            to_address: "0xwrongminter".into(),
+            event_type: "mint".into(),
+            source: "test".into(),
+        },
+        TransferRecord {
+            contract_address: "0xdup".into(),
+            token_id: "1".into(),
+            tx_hash: "0xrighttransfer".into(),
+            block_number: 2,
+            log_index: 0,
+            block_time: 200,
+            from_address: "0xholder1".into(),
+            to_address: "0xholder2".into(),
+            event_type: "transfer".into(),
+            source: "test".into(),
+        },
+    ];
+
+    let rows = build_infringing_token_records("0xdup", &candidates, &transfers);
+
+    assert_eq!(rows[0].mint_tx_hash, "0xrighttransfer");
+    assert_eq!(rows[0].minter_address, "0xholder2");
+    assert_eq!(rows[0].first_transfer_time, 200);
+    assert!(!rows[0].candidate_open_license);
+    assert!(!rows[0].official_or_legit_reissue);
 }
