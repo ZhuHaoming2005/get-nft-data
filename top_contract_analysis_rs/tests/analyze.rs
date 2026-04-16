@@ -1,10 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use top_contract_analysis_rs::models::{
     AddressSignalPayload, DuplicateContractPayload, FraudTradeStatsPayload,
-    HonestAddressPayload, HonestAddressStatsPayload, ReportSummary,
-    SeedCollectionStatsPayload, SeedContractPayload, SingleReportPayload,
-    VictimAddressPayload, VictimSignalPayload,
+    HonestAddressPayload, HonestAddressStatsPayload, MaliciousAddressPayload,
+    ReportSummary, SeedCollectionStatsPayload, SeedContractPayload,
+    SingleReportPayload, VictimAddressPayload, VictimSignalPayload,
 };
 use top_contract_analysis_rs::reporting::{
     default_output_basename, render_human_readable_report,
@@ -36,6 +36,81 @@ fn default_output_basename_casefolds_non_ascii_more_like_python() {
     };
 
     assert_eq!(default_output_basename(&payload), "top_contract_analysis__strasse");
+}
+
+#[test]
+fn single_report_payload_serializes_current_python_top_level_shape() {
+    let payload = SingleReportPayload {
+        seed_contract: SeedContractPayload {
+            contract_address: "0xseed".into(),
+            ..Default::default()
+        },
+        seed_collection_stats: SeedCollectionStatsPayload {
+            seed_nft_count: 1,
+            unique_token_uri_count: 1,
+            unique_image_uri_count: 1,
+            unique_name_count: 1,
+            unique_symbol_count: 1,
+        },
+        duplicate_candidates: vec![top_contract_analysis_rs::models::DuplicateCandidate {
+            contract_address: "0xdup".into(),
+            token_id: "1".into(),
+            confidence: "high".into(),
+            ..Default::default()
+        }],
+        contract_level_summary: BTreeMap::from([(
+            "0xdup".into(),
+            top_contract_analysis_rs::models::ContractLevelSummaryPayload {
+                candidate_count: 1,
+                high_confidence_token_count: 1,
+                low_confidence_token_count: 0,
+            },
+        )]),
+        infringing_tokens: vec![top_contract_analysis_rs::models::InfringingTokenRecord {
+            contract_address: "0xdup".into(),
+            token_id: "1".into(),
+            minter_address: "0xminter".into(),
+            ..Default::default()
+        }],
+        malicious_addresses: vec![MaliciousAddressPayload {
+            address: "0xsybil".into(),
+        }],
+        ..Default::default()
+    };
+
+    let serialized = serde_json::to_value(&payload).unwrap();
+    let object = serialized.as_object().unwrap();
+    let keys: BTreeSet<_> = object.keys().map(String::as_str).collect();
+
+    assert_eq!(
+        keys,
+        BTreeSet::from([
+            "seed_contract",
+            "seed_collection_stats",
+            "duplicate_candidates",
+            "legit_duplicates",
+            "suspected_infringing_duplicates_high_confidence",
+            "suspected_infringing_duplicates_low_confidence",
+            "contract_level_summary",
+            "address_signals",
+            "victim_signals",
+            "infringing_tokens",
+            "malicious_addresses",
+            "honest_addresses",
+            "honest_address_stats",
+            "victim_addresses",
+            "fraud_trade_stats",
+            "report_summary",
+        ])
+    );
+    assert!(!object.contains_key("output_files"));
+    assert_eq!(serialized["duplicate_candidates"][0]["contract_address"], "0xdup");
+    assert_eq!(
+        serialized["contract_level_summary"]["0xdup"]["high_confidence_token_count"],
+        1
+    );
+    assert_eq!(serialized["infringing_tokens"][0]["minter_address"], "0xminter");
+    assert_eq!(serialized["malicious_addresses"][0]["address"], "0xsybil");
 }
 
 #[test]

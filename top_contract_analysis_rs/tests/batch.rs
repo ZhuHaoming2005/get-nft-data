@@ -1,8 +1,50 @@
+use std::collections::BTreeSet;
+
 use top_contract_analysis_rs::models::{
     BatchReportSummary, BatchSeedReportPayload, BatchSummaryPayload, OutputFilesPayload,
     ReportSummary, SeedContractPayload,
 };
 use top_contract_analysis_rs::reporting::render_batch_human_readable_report;
+
+#[test]
+fn batch_seed_reports_serialize_narrow_index_shape() {
+    let payload = BatchSummaryPayload {
+        seed_reports: vec![BatchSeedReportPayload {
+            seed_contract: SeedContractPayload {
+                contract_address: "0xseed".into(),
+                ..Default::default()
+            },
+            report_summary: ReportSummary {
+                high_confidence_contract_count: 2,
+                ..Default::default()
+            },
+            output_files: Some(OutputFilesPayload {
+                json: "result/top_contract_analysis__seed.json".into(),
+                markdown: "result/top_contract_analysis__seed.md".into(),
+            }),
+        }],
+        ..Default::default()
+    };
+
+    let serialized = serde_json::to_value(&payload).unwrap();
+    let seed_report = serialized["seed_reports"][0].as_object().unwrap();
+    let keys: BTreeSet<_> = seed_report.keys().map(String::as_str).collect();
+
+    assert_eq!(
+        keys,
+        BTreeSet::from(["seed_contract", "report_summary", "output_files"])
+    );
+    assert!(!seed_report.contains_key("duplicate_candidates"));
+    assert!(!seed_report.contains_key("malicious_addresses"));
+    assert_eq!(
+        serialized["seed_reports"][0]["output_files"]["json"],
+        "result/top_contract_analysis__seed.json"
+    );
+    assert_eq!(
+        serialized["seed_reports"][0]["report_summary"]["high_confidence_contract_count"],
+        2
+    );
+}
 
 #[test]
 fn batch_markdown_preserves_reference_summary_and_output_index_lines() {

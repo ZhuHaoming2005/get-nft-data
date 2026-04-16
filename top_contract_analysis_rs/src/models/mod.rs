@@ -244,21 +244,36 @@ pub struct OutputFilesPayload {
     pub markdown: String,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContractLevelSummaryPayload {
+    pub candidate_count: i64,
+    pub high_confidence_token_count: i64,
+    pub low_confidence_token_count: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MaliciousAddressPayload {
+    pub address: String,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct SingleReportPayload {
     pub seed_contract: SeedContractPayload,
     pub seed_collection_stats: SeedCollectionStatsPayload,
+    pub duplicate_candidates: Vec<DuplicateCandidate>,
+    pub contract_level_summary: BTreeMap<String, ContractLevelSummaryPayload>,
     pub report_summary: ReportSummary,
     pub suspected_infringing_duplicates_high_confidence: Vec<DuplicateContractPayload>,
     pub suspected_infringing_duplicates_low_confidence: Vec<DuplicateContractPayload>,
     pub legit_duplicates: Vec<DuplicateContractPayload>,
     pub address_signals: BTreeMap<String, AddressSignalPayload>,
     pub victim_signals: BTreeMap<String, VictimSignalPayload>,
+    pub infringing_tokens: Vec<InfringingTokenRecord>,
+    pub malicious_addresses: Vec<MaliciousAddressPayload>,
     pub honest_addresses: Vec<HonestAddressPayload>,
     pub honest_address_stats: BTreeMap<String, HonestAddressStatsPayload>,
     pub victim_addresses: Vec<VictimAddressPayload>,
     pub fraud_trade_stats: BTreeMap<String, FraudTradeStatsPayload>,
-    pub output_files: OutputFilesPayload,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -299,6 +314,7 @@ pub struct BatchReportSummary {
 pub struct BatchSeedReportPayload {
     pub seed_contract: SeedContractPayload,
     pub report_summary: ReportSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_files: Option<OutputFilesPayload>,
 }
 
