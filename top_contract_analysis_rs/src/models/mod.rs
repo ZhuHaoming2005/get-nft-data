@@ -213,8 +213,10 @@ pub struct HonestAddressPayload {
     pub interacted_token_count: i64,
     pub currently_holding_token_count: i64,
     pub hold_duration_median_seconds: Option<f64>,
+    pub hold_duration_count: i64,
     pub is_corrupted_address: bool,
     pub honest_sale_to_honest_count: i64,
+    pub mint_to_honest_seconds_samples: Vec<i64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -234,6 +236,8 @@ pub struct FraudTradeStatsPayload {
     pub unique_buyers: i64,
     pub eth_priced_sale_count: i64,
     pub eth_priced_volume: f64,
+    pub native_eth_sale_count: i64,
+    pub native_eth_volume: f64,
     pub stuck_wallet_count: i64,
     pub stuck_cost_eth: f64,
 }

@@ -334,12 +334,22 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
         lines.push("- 无".to_string());
     } else {
         for (contract, stats) in &payload.fraud_trade_stats {
+            let sale_count = if stats.eth_priced_sale_count != 0 {
+                stats.eth_priced_sale_count
+            } else {
+                stats.native_eth_sale_count
+            };
+            let sale_volume = if stats.eth_priced_volume != 0.0 {
+                stats.eth_priced_volume
+            } else {
+                stats.native_eth_volume
+            };
             lines.push(format!(
                 "- {}: unique_buyers={} | eth_priced_sale_count={} | eth_priced_volume={} | stuck_wallet_count={} | stuck_cost_eth={}",
                 contract,
                 stats.unique_buyers,
-                stats.eth_priced_sale_count,
-                stats.eth_priced_volume,
+                sale_count,
+                sale_volume,
                 stats.stuck_wallet_count,
                 stats.stuck_cost_eth
             ));

@@ -75,6 +75,21 @@ fn single_report_payload_serializes_current_python_top_level_shape() {
         malicious_addresses: vec![MaliciousAddressPayload {
             address: "0xsybil".into(),
         }],
+        honest_addresses: vec![HonestAddressPayload {
+            contract_address: "0xdup".into(),
+            address: "0xholder".into(),
+            hold_duration_count: 2,
+            mint_to_honest_seconds_samples: vec![15, 30],
+            ..Default::default()
+        }],
+        fraud_trade_stats: BTreeMap::from([(
+            "0xdup".into(),
+            FraudTradeStatsPayload {
+                native_eth_sale_count: 4,
+                native_eth_volume: 6.25,
+                ..Default::default()
+            },
+        )]),
         ..Default::default()
     };
 
@@ -111,6 +126,13 @@ fn single_report_payload_serializes_current_python_top_level_shape() {
     );
     assert_eq!(serialized["infringing_tokens"][0]["minter_address"], "0xminter");
     assert_eq!(serialized["malicious_addresses"][0]["address"], "0xsybil");
+    assert_eq!(serialized["honest_addresses"][0]["hold_duration_count"], 2);
+    assert_eq!(
+        serialized["honest_addresses"][0]["mint_to_honest_seconds_samples"],
+        serde_json::json!([15, 30])
+    );
+    assert_eq!(serialized["fraud_trade_stats"]["0xdup"]["native_eth_sale_count"], 4);
+    assert_eq!(serialized["fraud_trade_stats"]["0xdup"]["native_eth_volume"], 6.25);
 }
 
 #[test]
@@ -216,8 +238,10 @@ fn single_report_markdown_preserves_reference_sections_and_summary_lines() {
             interacted_token_count: 2,
             currently_holding_token_count: 1,
             hold_duration_median_seconds: Some(44.0),
+            hold_duration_count: 2,
             is_corrupted_address: true,
             honest_sale_to_honest_count: 1,
+            mint_to_honest_seconds_samples: vec![12, 13],
         }],
         victim_addresses: vec![VictimAddressPayload {
             address: "0xvictim".into(),
@@ -235,6 +259,8 @@ fn single_report_markdown_preserves_reference_sections_and_summary_lines() {
                 unique_buyers: 2,
                 eth_priced_sale_count: 2,
                 eth_priced_volume: 5.5,
+                native_eth_sale_count: 2,
+                native_eth_volume: 5.5,
                 stuck_wallet_count: 1,
                 stuck_cost_eth: 2.0,
             },
@@ -298,8 +324,10 @@ fn single_report_detailed_sections_keep_python_none_rendering_for_missing_leaf_v
             interacted_token_count: 1,
             currently_holding_token_count: 0,
             hold_duration_median_seconds: None,
+            hold_duration_count: 0,
             is_corrupted_address: false,
             honest_sale_to_honest_count: 0,
+            mint_to_honest_seconds_samples: vec![],
         }],
         victim_addresses: vec![VictimAddressPayload {
             address: "0xvictim".into(),
@@ -323,5 +351,29 @@ fn single_report_detailed_sections_keep_python_none_rendering_for_missing_leaf_v
     ));
     assert!(markdown.contains(
         "- 0xvictim: buy_tx_count=1 | 买入金额(ETH/WETH)=1 | 最后一次买入金额(ETH/WETH)=None | 买入前 ETH 余额: None | 买入占比=n/a | 套牢=否 | last_buy_tx=n/a"
+    ));
+}
+
+#[test]
+fn single_report_fraud_trade_stats_fall_back_to_native_eth_fields() {
+    let payload = SingleReportPayload {
+        fraud_trade_stats: BTreeMap::from([(
+            "0xdup".into(),
+            FraudTradeStatsPayload {
+                unique_buyers: 3,
+                native_eth_sale_count: 4,
+                native_eth_volume: 6.25,
+                stuck_wallet_count: 2,
+                stuck_cost_eth: 1.5,
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+
+    let markdown = render_human_readable_report(&payload);
+
+    assert!(markdown.contains(
+        "- 0xdup: unique_buyers=3 | eth_priced_sale_count=4 | eth_priced_volume=6.25 | stuck_wallet_count=2 | stuck_cost_eth=1.5"
     ));
 }
