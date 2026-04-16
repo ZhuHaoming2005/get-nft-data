@@ -296,7 +296,14 @@ pub struct BatchReportSummary {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct BatchSeedReportPayload {
+    pub seed_contract: SeedContractPayload,
+    pub report_summary: ReportSummary,
+    pub output_files: Option<OutputFilesPayload>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct BatchSummaryPayload {
     pub batch_summary: BatchReportSummary,
-    pub seed_reports: Vec<SingleReportPayload>,
+    pub seed_reports: Vec<BatchSeedReportPayload>,
 }

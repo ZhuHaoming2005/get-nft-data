@@ -1,6 +1,6 @@
 use top_contract_analysis_rs::models::{
-    BatchReportSummary, BatchSummaryPayload, OutputFilesPayload, ReportSummary,
-    SeedContractPayload, SingleReportPayload,
+    BatchReportSummary, BatchSeedReportPayload, BatchSummaryPayload, OutputFilesPayload,
+    ReportSummary, SeedContractPayload,
 };
 use top_contract_analysis_rs::reporting::render_batch_human_readable_report;
 
@@ -39,7 +39,7 @@ fn batch_markdown_preserves_reference_summary_and_output_index_lines() {
             avg_unique_receiver_count_mean: Some(4.0),
             generated_at: "2026-04-17T00:00:00+00:00".into(),
         },
-        seed_reports: vec![SingleReportPayload {
+        seed_reports: vec![BatchSeedReportPayload {
             seed_contract: SeedContractPayload {
                 name: "Azuki".into(),
                 contract_address: "0xseed".into(),
@@ -66,11 +66,10 @@ fn batch_markdown_preserves_reference_summary_and_output_index_lines() {
                 median_mint_to_first_transfer_seconds: Some(8.0),
                 ..Default::default()
             },
-            output_files: OutputFilesPayload {
+            output_files: Some(OutputFilesPayload {
                 json: "result/top_contract_analysis__azuki.json".into(),
                 markdown: "result/top_contract_analysis__azuki.md".into(),
-            },
-            ..Default::default()
+            }),
         }],
     };
 

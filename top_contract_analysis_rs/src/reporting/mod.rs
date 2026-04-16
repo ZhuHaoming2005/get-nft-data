@@ -9,7 +9,10 @@ static SLUG_RE: Lazy<Regex> =
 
 fn slugify(value: &str) -> String {
     let normalized = value.nfkc().collect::<String>();
-    let lowered = normalized.trim().to_lowercase();
+    let lowered = normalized
+        .trim()
+        .to_lowercase()
+        .replace('ß', "ss");
     let slug = SLUG_RE.replace_all(&lowered, "_");
     let slug = slug.trim_matches('_');
     if slug.is_empty() {
@@ -29,6 +32,12 @@ fn format_scalar(value: Option<f64>) -> String {
     value
         .map(|number| number.to_string())
         .unwrap_or_else(|| "n/a".into())
+}
+
+fn format_python_optional_scalar(value: Option<f64>) -> String {
+    value
+        .map(|number| number.to_string())
+        .unwrap_or_else(|| "None".into())
 }
 
 pub fn default_output_basename(payload: &SingleReportPayload) -> String {
@@ -275,11 +284,11 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
                 ),
                 format!(
                     "- 持有时长中位数: {} 秒",
-                    format_scalar(stats.median_holding_seconds)
+                    format_python_optional_scalar(stats.median_holding_seconds)
                 ),
                 format!(
                     "- Mint 到诚实地址平均时间: {} 秒",
-                    format_scalar(stats.avg_seconds_to_honest_holder)
+                    format_python_optional_scalar(stats.avg_seconds_to_honest_holder)
                 ),
             ]);
         }
@@ -290,7 +299,7 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
                 item.address,
                 item.interacted_token_count,
                 item.currently_holding_token_count,
-                format_scalar(item.hold_duration_median_seconds),
+                format_python_optional_scalar(item.hold_duration_median_seconds),
                 if item.is_corrupted_address { "是" } else { "否" },
                 item.honest_sale_to_honest_count
             ));
@@ -307,8 +316,8 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
                 item.address,
                 item.buy_tx_hashes.len(),
                 item.buy_amount_eth,
-                format_scalar(item.last_buy_amount_eth),
-                format_scalar(item.buy_before_eth_balance),
+                format_python_optional_scalar(item.last_buy_amount_eth),
+                format_python_optional_scalar(item.buy_before_eth_balance),
                 format_ratio(item.buy_asset_ratio),
                 if item.is_stuck { "是" } else { "否" },
                 if item.last_buy_tx_hash.is_empty() {
@@ -451,7 +460,7 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
         for item in &payload.seed_reports {
             let seed = &item.seed_contract;
             let report_summary = &item.report_summary;
-            let output_files = &item.output_files;
+            let output_files = item.output_files.as_ref();
             let seed_name = if seed.name.is_empty() {
                 if seed.contract_address.is_empty() {
                     "unknown"
@@ -484,8 +493,10 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
                 format_scalar(report_summary.avg_seconds_to_honest_holder),
                 format_scalar(report_summary.median_seconds_to_honest_holder),
                 format_scalar(report_summary.median_mint_to_first_transfer_seconds),
-                output_files.json,
-                output_files.markdown
+                output_files.map(|files| files.json.as_str()).unwrap_or(""),
+                output_files
+                    .map(|files| files.markdown.as_str())
+                    .unwrap_or("")
             ));
         }
     }

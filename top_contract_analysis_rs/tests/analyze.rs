@@ -25,6 +25,20 @@ fn default_output_basename_matches_existing_prefix() {
 }
 
 #[test]
+fn default_output_basename_casefolds_non_ascii_more_like_python() {
+    let payload = SingleReportPayload {
+        seed_contract: SeedContractPayload {
+            name: "Straße".into(),
+            contract_address: "0xseed".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    assert_eq!(default_output_basename(&payload), "top_contract_analysis__strasse");
+}
+
+#[test]
 fn single_report_markdown_preserves_reference_sections_and_summary_lines() {
     let payload = SingleReportPayload {
         seed_contract: SeedContractPayload {
@@ -187,5 +201,52 @@ fn single_report_markdown_preserves_reference_sections_and_summary_lines() {
     assert!(markdown.contains("## 被骗交易与套牢资金"));
     assert!(markdown.contains(
         "- 0xhigh: unique_buyers=2 | eth_priced_sale_count=2 | eth_priced_volume=5.5 | stuck_wallet_count=1 | stuck_cost_eth=2"
+    ));
+}
+
+#[test]
+fn single_report_detailed_sections_keep_python_none_rendering_for_missing_leaf_values() {
+    let payload = SingleReportPayload {
+        honest_address_stats: BTreeMap::from([(
+            "0xdup".into(),
+            HonestAddressStatsPayload {
+                honest_address_count: 1,
+                corrupted_address_count: 0,
+                honest_to_honest_transfer_count: 0,
+                median_holding_seconds: None,
+                avg_seconds_to_honest_holder: None,
+            },
+        )]),
+        honest_addresses: vec![HonestAddressPayload {
+            contract_address: "0xdup".into(),
+            address: "0xhonest".into(),
+            interacted_token_count: 1,
+            currently_holding_token_count: 0,
+            hold_duration_median_seconds: None,
+            is_corrupted_address: false,
+            honest_sale_to_honest_count: 0,
+        }],
+        victim_addresses: vec![VictimAddressPayload {
+            address: "0xvictim".into(),
+            buy_tx_hashes: vec!["0xbuy".into()],
+            buy_amount_eth: 1.0,
+            last_buy_amount_eth: None,
+            buy_before_eth_balance: None,
+            buy_asset_ratio: None,
+            is_stuck: false,
+            last_buy_tx_hash: String::new(),
+        }],
+        ..Default::default()
+    };
+
+    let markdown = render_human_readable_report(&payload);
+
+    assert!(markdown.contains("- 持有时长中位数: None 秒"));
+    assert!(markdown.contains("- Mint 到诚实地址平均时间: None 秒"));
+    assert!(markdown.contains(
+        "- 0xdup:0xhonest: interacted_token_count=1 | currently_holding_token_count=0 | hold_duration_median_seconds=None | 被腐化=否 | honest_sale_to_honest_count=0"
+    ));
+    assert!(markdown.contains(
+        "- 0xvictim: buy_tx_count=1 | 买入金额(ETH/WETH)=1 | 最后一次买入金额(ETH/WETH)=None | 买入前 ETH 余额: None | 买入占比=n/a | 套牢=否 | last_buy_tx=n/a"
     ));
 }
