@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -124,34 +126,176 @@ pub struct SeedContractPayload {
     pub name: String,
     pub symbol: String,
     pub token_type: String,
+    pub contract_deployer: String,
+    pub deployed_block_number: i64,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ReportSummary {
+    pub open_license_detected: bool,
     pub candidate_contract_count: i64,
     pub high_confidence_contract_count: i64,
     pub low_confidence_contract_count: i64,
     pub infringing_nft_count: i64,
+    pub malicious_address_count: i64,
+    pub honest_address_count: i64,
+    pub repeat_infringing_address_count: i64,
+    pub legit_duplicate_contract_count: i64,
+    pub candidate_open_license_token_count: i64,
+    pub candidate_open_license_contract_count: i64,
+    pub honest_purchase_total_eth: f64,
+    pub stuck_cost_eth: f64,
+    pub stuck_cost_ratio: Option<f64>,
+    pub buy_asset_ratio_known_address_count: i64,
+    pub ratio_over_60_address_count: i64,
+    pub ratio_over_60_address_ratio: Option<f64>,
+    pub ratio_over_80_address_count: i64,
+    pub ratio_over_80_address_ratio: Option<f64>,
+    pub stuck_honest_address_count: i64,
+    pub stuck_honest_address_ratio: Option<f64>,
+    pub corrupted_honest_address_count: i64,
+    pub avg_seconds_to_honest_holder: Option<f64>,
+    pub median_seconds_to_honest_holder: Option<f64>,
+    pub avg_mint_to_first_transfer_seconds: Option<f64>,
+    pub median_mint_to_first_transfer_seconds: Option<f64>,
+    pub avg_unique_receiver_count: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SeedCollectionStatsPayload {
+    pub seed_nft_count: i64,
+    pub unique_token_uri_count: i64,
+    pub unique_image_uri_count: i64,
+    pub unique_name_count: i64,
+    pub unique_symbol_count: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DuplicateContractPayload {
+    pub contract_address: String,
+    pub candidate_count: i64,
+    pub match_reasons: Vec<String>,
+    pub mint_recipients: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AddressSignalPayload {
+    pub mint_address_count: i64,
+    pub mint_count: i64,
+    pub unique_receiver_count: i64,
+    pub cycle_edge_count: i64,
+    pub star_distributor_count: i64,
+    pub mint_to_first_transfer_seconds: i64,
+    pub fast_spread: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct VictimSignalPayload {
+    pub owner_count: i64,
+    pub stuck_holder_count: i64,
+    pub stuck_holder_ratio: Option<f64>,
+    pub victim_wallet_count: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct HonestAddressStatsPayload {
+    pub honest_address_count: i64,
+    pub corrupted_address_count: i64,
+    pub honest_to_honest_transfer_count: i64,
+    pub median_holding_seconds: Option<f64>,
+    pub avg_seconds_to_honest_holder: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct HonestAddressPayload {
+    pub contract_address: String,
+    pub address: String,
+    pub interacted_token_count: i64,
+    pub currently_holding_token_count: i64,
+    pub hold_duration_median_seconds: Option<f64>,
+    pub is_corrupted_address: bool,
+    pub honest_sale_to_honest_count: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct VictimAddressPayload {
+    pub address: String,
+    pub buy_tx_hashes: Vec<String>,
+    pub buy_amount_eth: f64,
+    pub last_buy_amount_eth: Option<f64>,
+    pub buy_before_eth_balance: Option<f64>,
+    pub buy_asset_ratio: Option<f64>,
+    pub is_stuck: bool,
+    pub last_buy_tx_hash: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct FraudTradeStatsPayload {
+    pub unique_buyers: i64,
+    pub eth_priced_sale_count: i64,
+    pub eth_priced_volume: f64,
+    pub stuck_wallet_count: i64,
+    pub stuck_cost_eth: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OutputFilesPayload {
+    pub json: String,
+    pub markdown: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct SingleReportPayload {
     pub seed_contract: SeedContractPayload,
+    pub seed_collection_stats: SeedCollectionStatsPayload,
     pub report_summary: ReportSummary,
+    pub suspected_infringing_duplicates_high_confidence: Vec<DuplicateContractPayload>,
+    pub suspected_infringing_duplicates_low_confidence: Vec<DuplicateContractPayload>,
+    pub legit_duplicates: Vec<DuplicateContractPayload>,
+    pub address_signals: BTreeMap<String, AddressSignalPayload>,
+    pub victim_signals: BTreeMap<String, VictimSignalPayload>,
+    pub honest_addresses: Vec<HonestAddressPayload>,
+    pub honest_address_stats: BTreeMap<String, HonestAddressStatsPayload>,
+    pub victim_addresses: Vec<VictimAddressPayload>,
+    pub fraud_trade_stats: BTreeMap<String, FraudTradeStatsPayload>,
+    pub output_files: OutputFilesPayload,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct BatchReportSummary {
     pub seed_report_count: i64,
     pub chain: String,
     pub chains: Vec<String>,
+    pub open_license_detected_count: i64,
     pub candidate_contract_count_total: i64,
     pub high_confidence_contract_count_total: i64,
     pub low_confidence_contract_count_total: i64,
     pub infringing_nft_count_total: i64,
+    pub malicious_address_count_total: i64,
+    pub honest_address_count_total: i64,
+    pub repeat_infringing_address_count_total: i64,
+    pub repeat_infringing_address_count_global: i64,
+    pub legit_duplicate_contract_count_total: i64,
+    pub honest_purchase_total_eth_total: f64,
+    pub stuck_cost_eth_total: f64,
+    pub stuck_cost_ratio_overall: Option<f64>,
+    pub buy_asset_ratio_known_address_count_total: i64,
+    pub ratio_over_60_address_count_total: i64,
+    pub ratio_over_60_address_ratio_overall: Option<f64>,
+    pub ratio_over_80_address_count_total: i64,
+    pub ratio_over_80_address_ratio_overall: Option<f64>,
+    pub stuck_honest_address_count_total: i64,
+    pub stuck_honest_address_ratio_overall: Option<f64>,
+    pub corrupted_honest_address_count_total: i64,
+    pub avg_seconds_to_honest_holder_mean: Option<f64>,
+    pub median_seconds_to_honest_holder_median: Option<f64>,
+    pub avg_mint_to_first_transfer_seconds_mean: Option<f64>,
+    pub median_mint_to_first_transfer_seconds_median: Option<f64>,
+    pub avg_unique_receiver_count_mean: Option<f64>,
+    pub generated_at: String,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct BatchSummaryPayload {
     pub batch_summary: BatchReportSummary,
     pub seed_reports: Vec<SingleReportPayload>,
