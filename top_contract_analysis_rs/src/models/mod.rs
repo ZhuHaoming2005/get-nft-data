@@ -116,3 +116,43 @@ pub struct InfringingTokenRecord {
 }
 
 pub const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SeedContractPayload {
+    pub chain: String,
+    pub contract_address: String,
+    pub name: String,
+    pub symbol: String,
+    pub token_type: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReportSummary {
+    pub candidate_contract_count: i64,
+    pub high_confidence_contract_count: i64,
+    pub low_confidence_contract_count: i64,
+    pub infringing_nft_count: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SingleReportPayload {
+    pub seed_contract: SeedContractPayload,
+    pub report_summary: ReportSummary,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BatchReportSummary {
+    pub seed_report_count: i64,
+    pub chain: String,
+    pub chains: Vec<String>,
+    pub candidate_contract_count_total: i64,
+    pub high_confidence_contract_count_total: i64,
+    pub low_confidence_contract_count_total: i64,
+    pub infringing_nft_count_total: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BatchSummaryPayload {
+    pub batch_summary: BatchReportSummary,
+    pub seed_reports: Vec<SingleReportPayload>,
+}
