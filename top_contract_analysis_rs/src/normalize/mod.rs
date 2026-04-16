@@ -29,7 +29,7 @@ fn normalize_nfkc(raw: &str) -> String {
     raw.nfkc().collect::<String>()
 }
 
-pub fn strip_trailing_number_suffix(raw: &str) -> String {
+fn strip_trailing_number_suffix(raw: &str) -> String {
     let mut text = normalize_nfkc(raw).trim().to_string();
     let mut changed = true;
     let mut guard = 0;

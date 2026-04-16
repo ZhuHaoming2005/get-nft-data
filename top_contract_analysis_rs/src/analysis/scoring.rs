@@ -4,10 +4,17 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::Value;
 use strsim::{jaro_winkler, normalized_levenshtein};
+use thiserror::Error;
 
 use crate::normalize::{normalize_name, normalize_text};
 
 static TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\p{L}\p{N}_]+").unwrap());
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ScoringError {
+    #[error("left and right sequences must have identical lengths")]
+    MismatchedInputLengths,
+}
 
 fn flatten_metadata(value: &Value, parts: &mut Vec<String>) {
     match value {
@@ -97,9 +104,9 @@ pub fn metadata_document_from_json(raw: &str) -> String {
     metadata_document(raw)
 }
 
-pub fn score_name_pairs(left: &[String], right: &[String]) -> Result<Vec<f64>, String> {
+pub fn score_name_pairs(left: &[String], right: &[String]) -> Result<Vec<f64>, ScoringError> {
     if left.len() != right.len() {
-        return Err("left and right sequences must have identical lengths".into());
+        return Err(ScoringError::MismatchedInputLengths);
     }
     Ok(left
         .iter()
@@ -120,9 +127,12 @@ pub fn score_name_pairs(left: &[String], right: &[String]) -> Result<Vec<f64>, S
         .collect())
 }
 
-pub fn score_metadata_documents(left: &[String], right: &[String]) -> Result<Vec<f64>, String> {
+pub fn score_metadata_documents(
+    left: &[String],
+    right: &[String],
+) -> Result<Vec<f64>, ScoringError> {
     if left.len() != right.len() {
-        return Err("left and right sequences must have identical lengths".into());
+        return Err(ScoringError::MismatchedInputLengths);
     }
     Ok(left
         .iter()
