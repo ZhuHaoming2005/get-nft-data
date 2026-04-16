@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +25,37 @@ pub struct DatabaseNftRecord {
     pub symbol: String,
     pub metadata_json: String,
     pub metadata_doc: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContractNameRecord {
+    pub contract_address: String,
+    pub name_norm: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContractSignal {
+    pub contract_address: String,
+    pub token_count: usize,
+    pub uri_match_count: usize,
+    pub image_match_count: usize,
+    pub symbol_match: bool,
+    pub name_prefix_match: bool,
+    pub keyword_match: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OwnerBalance {
+    pub owner_address: String,
+    pub token_balances: BTreeMap<String, i64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DatabaseSnapshot {
+    pub nft_rows: Vec<DatabaseNftRecord>,
+    pub contract_names: Vec<ContractNameRecord>,
+    pub symbol_contracts: BTreeMap<String, BTreeSet<String>>,
+    pub contract_signals: BTreeMap<String, ContractSignal>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
