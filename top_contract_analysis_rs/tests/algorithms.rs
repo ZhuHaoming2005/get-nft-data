@@ -3,10 +3,16 @@ use std::collections::HashSet;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use strsim::{jaro_winkler, normalized_levenshtein};
+use top_contract_analysis_rs::analysis::address_records::build_infringing_token_records;
+use top_contract_analysis_rs::analysis::duplicate::build_duplicate_candidates;
 use top_contract_analysis_rs::analysis::scoring::{
     metadata_document_from_json, score_metadata_documents, score_name_pairs, ScoringError,
 };
+use top_contract_analysis_rs::analysis::signals::analyze_transfer_signals;
 use top_contract_analysis_rs::normalize::{normalize_name, normalize_symbol, normalize_url};
+use top_contract_analysis_rs::models::{
+    DatabaseNftRecord, DuplicateCandidate, SeedNft, TransferRecord,
+};
 use unicode_normalization::UnicodeNormalization;
 
 static TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\p{L}\p{N}_]+").unwrap());
@@ -183,4 +189,62 @@ fn score_name_pairs_rejects_mismatched_input_lengths() {
 fn score_metadata_documents_rejects_mismatched_input_lengths() {
     let err = score_metadata_documents(&["gold dragon rare".into()], &[]).unwrap_err();
     assert_eq!(err, ScoringError::MismatchedInputLengths);
+}
+
+#[test]
+fn duplicate_candidates_use_token_uri_and_name_reason_flags() {
+    let seed_nfts = vec![SeedNft {
+        token_uri: "ipfs://seed/1".into(),
+        name: "Azuki #1".into(),
+        ..Default::default()
+    }];
+    let snapshot_rows = vec![DatabaseNftRecord {
+        contract_address: "0xdup".into(),
+        token_id: "1".into(),
+        token_uri: "ipfs://seed/1".into(),
+        name: "Azuki Mirror #1".into(),
+        symbol: "AZUKI".into(),
+        ..Default::default()
+    }];
+
+    let rows = build_duplicate_candidates(&seed_nfts, &snapshot_rows, 95.0, 0.55);
+
+    assert_eq!(rows[0].contract_address, "0xdup");
+    assert!(rows[0].match_reasons.contains(&"token_uri_match".into()));
+}
+
+#[test]
+fn transfer_signals_calculate_fast_spread() {
+    let signals = analyze_transfer_signals(&[
+        TransferRecord::mint("0xdup", "1", 100, "0xholder1"),
+        TransferRecord::transfer("0xdup", "1", 120, "0xholder1", "0xholder2"),
+    ]);
+
+    assert_eq!(signals.mint_to_first_transfer_seconds, Some(20));
+    assert!(signals.fast_spread);
+}
+
+#[test]
+fn infringing_token_records_capture_mint_context_and_match_reasons() {
+    let candidates = vec![DuplicateCandidate {
+        contract_address: "0xdup".into(),
+        token_id: "1".into(),
+        match_reasons: vec!["token_uri_match".into(), "name_match".into()],
+        ..Default::default()
+    }];
+    let transfers = vec![
+        TransferRecord::mint("0xdup", "1", 100, "0xminter"),
+        TransferRecord::transfer("0xdup", "1", 120, "0xminter", "0xholder"),
+    ];
+
+    let rows = build_infringing_token_records("0xdup", &candidates, &transfers);
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].token_id, "1");
+    assert_eq!(rows[0].minter_address, "0xminter");
+    assert_eq!(rows[0].first_transfer_time, 100);
+    assert_eq!(
+        rows[0].match_reasons,
+        vec!["token_uri_match".to_string(), "name_match".to_string()]
+    );
 }
