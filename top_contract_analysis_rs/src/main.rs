@@ -7,7 +7,7 @@ fn main() -> Result<(), error::AppError> {
     let command = cli::TopContractAnalysisCli::parse();
     match command.command {
         cli::Command::Analyze(args) => Err(error::AppError::NotImplemented(format!(
-            "analyze {:?} --feature-db",
+            "analyze {:?}",
             args.seed_contract_address
         ))),
         cli::Command::Batch(args) => Err(error::AppError::NotImplemented(format!(
@@ -15,7 +15,7 @@ fn main() -> Result<(), error::AppError> {
             args.seed_file
         ))),
         cli::Command::ExportSnapshot(args) => Err(error::AppError::NotImplemented(format!(
-            "export {:?} --output",
+            "export-snapshot {:?}",
             args.output
         ))),
     }
