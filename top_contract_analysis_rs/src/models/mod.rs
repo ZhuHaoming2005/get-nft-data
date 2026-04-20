@@ -63,9 +63,21 @@ pub struct DuplicateCandidate {
     pub contract_address: String,
     pub token_id: String,
     pub match_reasons: Vec<String>,
+    #[serde(skip_serializing, skip_deserializing, default)]
     pub confidence: String,
     pub token_uri: String,
     pub image_uri: String,
+    pub name: String,
+    pub symbol: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContractMetadata {
+    pub chain: String,
+    pub contract_address: String,
+    pub token_type: String,
+    pub contract_deployer: String,
+    pub deployed_block_number: i64,
     pub name: String,
     pub symbol: String,
 }
@@ -82,6 +94,48 @@ pub struct TransferRecord {
     pub to_address: String,
     pub event_type: String,
     pub source: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct NftSaleRecord {
+    pub contract_address: String,
+    pub token_id: String,
+    pub tx_hash: String,
+    pub block_number: i64,
+    pub log_index: i64,
+    pub bundle_index: i64,
+    pub buyer_address: String,
+    pub seller_address: String,
+    pub marketplace: String,
+    pub taker: String,
+    pub payment_token_symbol: String,
+    pub payment_token_address: String,
+    pub price_eth: Option<f64>,
+    pub seller_fee_eth: f64,
+    pub protocol_fee_eth: f64,
+    pub royalty_fee_eth: f64,
+    pub source: String,
+    pub is_native_eth: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransactionReceiptRecord {
+    pub tx_hash: String,
+    pub block_number: i64,
+    pub transaction_index: i64,
+    pub from_address: String,
+    pub gas_used: i64,
+    pub effective_gas_price_wei: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct EthTransferRecord {
+    pub tx_hash: String,
+    pub block_number: i64,
+    pub from_address: String,
+    pub to_address: String,
+    pub value_eth: f64,
+    pub category: String,
 }
 
 impl TransferRecord {
@@ -165,8 +219,6 @@ pub struct SeedContractPayload {
 pub struct ReportSummary {
     pub open_license_detected: bool,
     pub candidate_contract_count: i64,
-    pub high_confidence_contract_count: i64,
-    pub low_confidence_contract_count: i64,
     pub infringing_nft_count: i64,
     pub malicious_address_count: i64,
     pub honest_address_count: i64,
@@ -235,6 +287,8 @@ pub struct HonestAddressStatsPayload {
     pub honest_to_honest_transfer_count: i64,
     pub median_holding_seconds: Option<f64>,
     pub avg_seconds_to_honest_holder: Option<f64>,
+    #[serde(default)]
+    pub corrupted_addresses: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -258,8 +312,15 @@ pub struct VictimAddressPayload {
     pub last_buy_amount_eth: Option<f64>,
     pub buy_before_eth_balance: Option<f64>,
     pub buy_asset_ratio: Option<f64>,
+    pub buy_asset_ratio_with_gas: Option<f64>,
     pub is_stuck: bool,
     pub last_buy_tx_hash: String,
+    #[serde(default = "default_ratio_status")]
+    pub ratio_status: String,
+}
+
+fn default_ratio_status() -> String {
+    "unavailable".into()
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -286,13 +347,16 @@ pub struct OutputFilesPayload {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContractLevelSummaryPayload {
     pub candidate_count: i64,
-    pub high_confidence_token_count: i64,
-    pub low_confidence_token_count: i64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MaliciousAddressPayload {
     pub address: String,
+    pub mint_role: bool,
+    pub wash_cycle_count: i64,
+    pub star_out_degree: i64,
+    pub rapid_spread_contracts: Vec<String>,
+    pub evidence_contracts: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -302,8 +366,7 @@ pub struct SingleReportPayload {
     pub duplicate_candidates: Vec<DuplicateCandidate>,
     pub contract_level_summary: BTreeMap<String, ContractLevelSummaryPayload>,
     pub report_summary: ReportSummary,
-    pub suspected_infringing_duplicates_high_confidence: Vec<DuplicateContractPayload>,
-    pub suspected_infringing_duplicates_low_confidence: Vec<DuplicateContractPayload>,
+    pub duplicate_contracts: Vec<DuplicateContractPayload>,
     pub legit_duplicates: Vec<DuplicateContractPayload>,
     pub address_signals: BTreeMap<String, AddressSignalPayload>,
     pub victim_signals: BTreeMap<String, VictimSignalPayload>,
@@ -322,8 +385,6 @@ pub struct BatchReportSummary {
     pub chains: Vec<String>,
     pub open_license_detected_count: i64,
     pub candidate_contract_count_total: i64,
-    pub high_confidence_contract_count_total: i64,
-    pub low_confidence_contract_count_total: i64,
     pub infringing_nft_count_total: i64,
     pub malicious_address_count_total: i64,
     pub honest_address_count_total: i64,

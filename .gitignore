@@ -16,3 +16,4 @@ dist
 CLAUDE.md
 output
 *tmp*
+*.db

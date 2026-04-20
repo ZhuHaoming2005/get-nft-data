@@ -104,6 +104,20 @@ pub fn metadata_document_from_json(raw: &str) -> String {
     metadata_document(raw)
 }
 
+pub fn score_name_pair(left: &str, right: &str) -> f64 {
+    let left_norm = normalize_name(left);
+    let right_norm = normalize_name(right);
+    if left_norm.is_empty() || right_norm.is_empty() {
+        0.0
+    } else if left_norm == right_norm {
+        100.0
+    } else {
+        ((jaro_winkler(&left_norm, &right_norm) * 0.65)
+            + (normalized_levenshtein(&left_norm, &right_norm) * 0.35))
+            * 100.0
+    }
+}
+
 pub fn score_name_pairs(left: &[String], right: &[String]) -> Result<Vec<f64>, ScoringError> {
     if left.len() != right.len() {
         return Err(ScoringError::MismatchedInputLengths);
@@ -111,20 +125,12 @@ pub fn score_name_pairs(left: &[String], right: &[String]) -> Result<Vec<f64>, S
     Ok(left
         .iter()
         .zip(right.iter())
-        .map(|(l, r)| {
-            let left_norm = normalize_name(l);
-            let right_norm = normalize_name(r);
-            if left_norm.is_empty() || right_norm.is_empty() {
-                0.0
-            } else if left_norm == right_norm {
-                100.0
-            } else {
-                ((jaro_winkler(&left_norm, &right_norm) * 0.65)
-                    + (normalized_levenshtein(&left_norm, &right_norm) * 0.35))
-                    * 100.0
-            }
-        })
+        .map(|(l, r)| score_name_pair(l, r))
         .collect())
+}
+
+pub fn score_metadata_document_pair(left: &str, right: &str) -> f64 {
+    metadata_score_from_documents(left, right)
 }
 
 pub fn score_metadata_documents(
@@ -137,6 +143,6 @@ pub fn score_metadata_documents(
     Ok(left
         .iter()
         .zip(right.iter())
-        .map(|(l, r)| metadata_score_from_documents(l, r))
+        .map(|(l, r)| score_metadata_document_pair(l, r))
         .collect())
 }

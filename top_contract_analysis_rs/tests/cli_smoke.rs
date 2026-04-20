@@ -19,17 +19,37 @@ fn analyze_subcommand_accepts_existing_flag_names() {
         ])
         .assert()
         .failure()
-        .stderr(contains("NotImplemented").and(contains("analyze")));
+        .stderr(
+            contains("unexpected argument")
+                .not()
+                .and(contains("required arguments were not provided").not()),
+        );
 }
 
 #[test]
 fn batch_subcommand_is_exposed() {
     Command::cargo_bin("top_contract_analysis_rs")
         .unwrap()
-        .args(["batch", "--seed-file", "seeds.json"])
+        .args([
+            "batch",
+            "--seed-file",
+            "seeds.txt",
+            "--chain",
+            "ethereum",
+            "--feature-db",
+            "batch.db",
+            "--signal-cache-db",
+            "signals.db",
+            "--output-dir",
+            "result",
+        ])
         .assert()
         .failure()
-        .stderr(contains("NotImplemented").and(contains("batch")));
+        .stderr(
+            contains("NotImplemented")
+                .not()
+                .and(contains("required arguments were not provided").not()),
+        );
 }
 
 #[test]
@@ -39,5 +59,9 @@ fn export_snapshot_subcommand_is_exposed() {
         .args(["export-snapshot", "--output", "snapshot.json"])
         .assert()
         .failure()
-        .stderr(contains("NotImplemented").and(contains("export-snapshot")));
+        .stderr(
+            contains("NotImplemented")
+                .not()
+                .and(contains("required arguments were not provided").not()),
+        );
 }

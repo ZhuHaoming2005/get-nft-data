@@ -1,5 +1,6 @@
 use once_cell::sync::Lazy;
 use regex::Regex;
+use serde_json::{Map, Value};
 use unicode_normalization::UnicodeNormalization;
 
 static TRAILING_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
@@ -151,4 +152,42 @@ pub fn normalize_url(raw: &str) -> Option<String> {
         };
     }
     Some(lowered.trim_end_matches('/').to_string())
+}
+
+pub fn build_nft_metadata_json(
+    raw_nft: &Value,
+    token_uri: &str,
+    image_uri: &str,
+) -> Result<String, serde_json::Error> {
+    let mut payload = Map::<String, Value>::new();
+    let raw_meta = raw_nft
+        .get("rawMetadata")
+        .or_else(|| raw_nft.get("metadata"))
+        .and_then(Value::as_object);
+    if let Some(meta) = raw_meta {
+        for (key, value) in meta {
+            payload.insert(key.clone(), value.clone());
+        }
+    }
+    for (source_key, target_key) in [
+        ("title", "name"),
+        ("name", "name"),
+        ("description", "description"),
+    ] {
+        if !payload.contains_key(target_key) {
+            if let Some(value) = raw_nft.get(source_key).filter(|value| !value.is_null()) {
+                payload.insert(target_key.to_string(), value.clone());
+            }
+        }
+    }
+    if !token_uri.is_empty() && !payload.contains_key("token_uri") {
+        payload.insert("token_uri".to_string(), Value::String(token_uri.to_string()));
+    }
+    if !image_uri.is_empty() && !payload.contains_key("image") {
+        payload.insert("image".to_string(), Value::String(image_uri.to_string()));
+    }
+    if payload.is_empty() {
+        return Ok(String::new());
+    }
+    serde_json::to_string(&Value::Object(payload))
 }

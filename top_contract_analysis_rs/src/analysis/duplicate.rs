@@ -3,7 +3,9 @@ use std::collections::{HashMap, HashSet};
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-use crate::analysis::scoring::{metadata_document_from_json, score_metadata_documents, score_name_pairs};
+use crate::analysis::scoring::{
+    metadata_document_from_json, score_metadata_document_pair, score_name_pair,
+};
 use crate::models::{DatabaseNftRecord, DuplicateCandidate, SeedNft};
 use crate::normalize::{normalize_name, normalize_symbol, normalize_text, normalize_url};
 
@@ -63,11 +65,9 @@ fn has_name_match(
             break;
         }
         if let Some(candidates) = seed_names_by_length.get(&length) {
-            let left = vec![row_name_norm.to_string(); candidates.len()];
-            let right = candidates.clone();
-            if score_name_pairs(&left, &right)
-                .map(|scores| scores.into_iter().any(|score| score >= name_threshold))
-                .unwrap_or(false)
+            if candidates
+                .iter()
+                .any(|candidate| score_name_pair(row_name_norm, candidate) >= name_threshold)
             {
                 return true;
             }
@@ -198,9 +198,7 @@ pub fn build_duplicate_candidates(
                 {
                     return false;
                 }
-                score_metadata_documents(&[seed_doc.clone()], &[row_doc.clone()])
-                    .map(|scores| scores[0] >= metadata_threshold)
-                    .unwrap_or(false)
+                score_metadata_document_pair(seed_doc, &row_doc) >= metadata_threshold
             })
         {
             reasons.push("metadata_match".to_string());

@@ -1,7 +1,10 @@
+use std::path::{Path, PathBuf};
+
 use once_cell::sync::Lazy;
 use regex::Regex;
 use unicode_normalization::UnicodeNormalization;
 
+use crate::error::AppError;
 use crate::models::{BatchSummaryPayload, SingleReportPayload};
 
 static SLUG_RE: Lazy<Regex> =
@@ -55,6 +58,58 @@ pub fn default_output_basename(payload: &SingleReportPayload) -> String {
     format!("top_contract_analysis__{}", slugify(seed_name))
 }
 
+pub fn dump_results(payload: &SingleReportPayload, output_path: &Path) -> Result<(), AppError> {
+    let text = serde_json::to_string_pretty(payload)?;
+    std::fs::write(output_path, text)?;
+    Ok(())
+}
+
+pub fn write_default_outputs(
+    payload: &SingleReportPayload,
+    output_path: &str,
+) -> Result<(PathBuf, PathBuf), AppError> {
+    if output_path.trim().is_empty() {
+        let result_dir = std::env::current_dir()?.join("result");
+        write_outputs_to_directory(payload, &result_dir)
+    } else {
+        let json_path = PathBuf::from(output_path);
+        if let Some(parent) = json_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let md_path = json_path.with_extension("md");
+        dump_results(payload, &json_path)?;
+        std::fs::write(&md_path, render_human_readable_report(payload))?;
+        Ok((json_path, md_path))
+    }
+}
+
+pub fn write_outputs_to_directory(
+    payload: &SingleReportPayload,
+    output_dir: &Path,
+) -> Result<(PathBuf, PathBuf), AppError> {
+    std::fs::create_dir_all(output_dir)?;
+    let json_path = output_dir.join(format!("{}.json", default_output_basename(payload)));
+    let md_path = json_path.with_extension("md");
+    dump_results(payload, &json_path)?;
+    std::fs::write(&md_path, render_human_readable_report(payload))?;
+    Ok((json_path, md_path))
+}
+
+pub fn write_batch_summary_outputs(
+    payload: &BatchSummaryPayload,
+    output_dir: &Path,
+) -> Result<(PathBuf, PathBuf), AppError> {
+    std::fs::create_dir_all(output_dir)?;
+    let json_path = output_dir.join("top_contract_analysis__summary.json");
+    let md_path = output_dir.join("top_contract_analysis__summary.md");
+    let text = serde_json::to_string_pretty(payload)?;
+    std::fs::write(&json_path, text)?;
+    std::fs::write(&md_path, render_batch_human_readable_report(payload))?;
+    Ok((json_path, md_path))
+}
+
 pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
     let seed = &payload.seed_contract;
     let seed_stats = &payload.seed_collection_stats;
@@ -89,14 +144,6 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
             }
         ),
         format!("- 重复候选合约数: {}", summary.candidate_contract_count),
-        format!(
-            "- 高置信疑似侵权合约数: {}",
-            summary.high_confidence_contract_count
-        ),
-        format!(
-            "- 低置信疑似侵权合约数: {}",
-            summary.low_confidence_contract_count
-        ),
         format!("- 疑似侵权 NFT 总数: {}", summary.infringing_nft_count),
         format!("- 恶意地址数: {}", summary.malicious_address_count),
         format!("- 诚实地址数: {}", summary.honest_address_count),
@@ -176,30 +223,13 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
         format!("- 唯一规范化名称数: {}", seed_stats.unique_name_count),
         format!("- 唯一规范化符号数: {}", seed_stats.unique_symbol_count),
         String::new(),
-        "## 高置信疑似侵权合约".to_string(),
+        "## 重复 NFT 合约".to_string(),
     ];
 
-    if payload
-        .suspected_infringing_duplicates_high_confidence
-        .is_empty()
-    {
+    if payload.duplicate_contracts.is_empty() {
         lines.push("- 无".to_string());
     } else {
-        for item in &payload.suspected_infringing_duplicates_high_confidence {
-            lines.push(format!(
-                "- {}: {} 个重复 NFT | 命中原因={}",
-                item.contract_address,
-                item.candidate_count,
-                item.match_reasons.join(", ")
-            ));
-        }
-    }
-
-    lines.extend([String::new(), "## 低置信疑似侵权合约".to_string()]);
-    if payload.suspected_infringing_duplicates_low_confidence.is_empty() {
-        lines.push("- 无".to_string());
-    } else {
-        for item in &payload.suspected_infringing_duplicates_low_confidence {
+        for item in &payload.duplicate_contracts {
             lines.push(format!(
                 "- {}: {} 个重复 NFT | 命中原因={}",
                 item.contract_address,
@@ -382,14 +412,6 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
             "- 重复候选合约总数: {}",
             summary.candidate_contract_count_total
         ),
-        format!(
-            "- 高置信疑似侵权合约总数: {}",
-            summary.high_confidence_contract_count_total
-        ),
-        format!(
-            "- 低置信疑似侵权合约总数: {}",
-            summary.low_confidence_contract_count_total
-        ),
         format!("- 疑似侵权 NFT 总数: {}", summary.infringing_nft_count_total),
         format!("- 恶意地址总数: {}", summary.malicious_address_count_total),
         format!("- 诚实地址总数: {}", summary.honest_address_count_total),
@@ -480,11 +502,10 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
             };
 
             lines.push(format!(
-                "- {} ({}) | 高置信={} | 低置信={} | 侵权NFT={} | 恶意地址={} | 诚实地址={} | 多次侵权地址={} | 官方参与={} | 诚实购买额={} | 套牢资金={}/{} | >60%={}/{} | 套牢={}/{} | 被腐化={} | 诚实购买时长={}秒 | 传播中位数={}秒 | 首次转手中位数={}秒 | JSON={} | MD={}",
+                "- {} ({}) | 重复合约={} | 侵权NFT={} | 恶意地址={} | 诚实地址={} | 多次侵权地址={} | 官方参与={} | 诚实购买额={} | 套牢资金={}/{} | >60%={}/{} | 套牢={}/{} | 被腐化={} | 诚实购买时长={}秒 | 传播中位数={}秒 | 首次转手中位数={}秒 | JSON={} | MD={}",
                 seed_name,
                 seed.contract_address,
-                report_summary.high_confidence_contract_count,
-                report_summary.low_confidence_contract_count,
+                report_summary.candidate_contract_count,
                 report_summary.infringing_nft_count,
                 report_summary.malicious_address_count,
                 report_summary.honest_address_count,

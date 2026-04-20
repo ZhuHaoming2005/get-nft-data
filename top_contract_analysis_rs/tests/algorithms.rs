@@ -1,9 +1,11 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use once_cell::sync::Lazy;
 use regex::Regex;
 use strsim::{jaro_winkler, normalized_levenshtein};
-use top_contract_analysis_rs::analysis::address_records::build_infringing_token_records;
+use top_contract_analysis_rs::analysis::address_records::{
+    build_infringing_token_records, build_infringing_token_records_with_context,
+};
 use top_contract_analysis_rs::analysis::duplicate::build_duplicate_candidates;
 use top_contract_analysis_rs::analysis::scoring::{
     metadata_document_from_json, score_metadata_documents, score_name_pairs, ScoringError,
@@ -362,4 +364,31 @@ fn infringing_token_records_ignore_other_contracts_with_same_token_id() {
     assert_eq!(rows[0].first_transfer_time, 200);
     assert!(!rows[0].candidate_open_license);
     assert!(!rows[0].official_or_legit_reissue);
+}
+
+#[test]
+fn infringing_token_records_use_token_open_license_and_official_reissue_flags() {
+    let candidates = vec![DuplicateCandidate {
+        contract_address: "0xdup".into(),
+        token_id: "1".into(),
+        match_reasons: vec!["name_match".into()],
+        ..Default::default()
+    }];
+    let transfers = vec![TransferRecord::mint("0xdup", "1", 100, "0xofficial")];
+    let official_addresses = HashSet::from(["0xofficial".to_string()]);
+    let candidate_open_license_by_token = HashMap::from([(
+        ("0xdup".to_string(), "1".to_string()),
+        true,
+    )]);
+
+    let rows = build_infringing_token_records_with_context(
+        "0xdup",
+        &candidates,
+        &transfers,
+        &official_addresses,
+        &candidate_open_license_by_token,
+    );
+
+    assert!(rows[0].candidate_open_license);
+    assert!(rows[0].official_or_legit_reissue);
 }

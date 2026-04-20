@@ -2,6 +2,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum AppError {
+    #[error("http error: {0}")]
+    Http(String),
     #[error("duckdb error: {0}")]
     DuckDb(String),
     #[error("postgres error: {0}")]
@@ -37,5 +39,11 @@ impl From<std::io::Error> for AppError {
 impl From<serde_json::Error> for AppError {
     fn from(value: serde_json::Error) -> Self {
         Self::Json(value.to_string())
+    }
+}
+
+impl From<reqwest::Error> for AppError {
+    fn from(value: reqwest::Error) -> Self {
+        Self::Http(value.to_string())
     }
 }
