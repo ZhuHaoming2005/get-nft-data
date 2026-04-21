@@ -1,11 +1,15 @@
+use std::collections::HashSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use duckdb::{params, Connection};
 use serde::Serialize;
+use sysinfo::System;
 use top_contract_analysis_rs::analysis::scoring::metadata_document_from_json;
 
 use crate::algorithms::{derive_name_norm, parse_keywords};
 use crate::error::BenchError;
+use crate::sample::BenchmarkSample;
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -26,7 +30,6 @@ pub struct FeatureRow {
     pub token_id: String,
     pub name: String,
     pub name_norm: String,
-    pub metadata_json: String,
     pub metadata_doc: String,
     pub metadata_keywords: Vec<String>,
 }
@@ -34,6 +37,13 @@ pub struct FeatureRow {
 pub struct FeatureStore {
     feature_db: PathBuf,
     feature_parquet: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResourceConfig {
+    memory_limit_mb: u64,
+    threads: usize,
+    temp_directory: PathBuf,
 }
 
 impl FeatureStore {
@@ -44,29 +54,25 @@ impl FeatureStore {
         }
     }
 
-    pub fn load_rows(&self, chain: &str) -> Result<(SourceInfo, Vec<FeatureRow>), BenchError> {
-        let feature_db_literal = self.feature_db.to_string_lossy();
-        if feature_db_literal == ":memory:" || self.feature_db.exists() {
-            let conn = if feature_db_literal == ":memory:" {
-                Connection::open_in_memory()?
-            } else {
-                Connection::open(&self.feature_db)?
-            };
-            if table_exists(&conn, "nft_features")? {
-                let count: i64 = conn.query_row(
-                    "SELECT count(*) FROM nft_features WHERE lower(chain) = lower(?)",
-                    params![chain],
-                    |row| row.get(0),
-                )?;
-                if count > 0 {
-                    return Ok((
-                        SourceInfo {
-                            kind: SourceKind::DuckdbTable,
-                            location: self.feature_db.display().to_string(),
-                        },
-                        read_rows_from_table(&conn, chain)?,
-                    ));
-                }
+    pub fn load_recall_rows(
+        &self,
+        sample: &BenchmarkSample,
+    ) -> Result<(SourceInfo, Vec<FeatureRow>), BenchError> {
+        let conn = open_feature_connection(&self.feature_db)?;
+        if table_exists(&conn, "nft_features")? {
+            let count: i64 = conn.query_row(
+                "SELECT count(*) FROM nft_features WHERE lower(chain) = lower(?)",
+                params![sample.chain.as_str()],
+                |row| row.get(0),
+            )?;
+            if count > 0 {
+                return Ok((
+                    SourceInfo {
+                        kind: SourceKind::DuckdbTable,
+                        location: self.feature_db.display().to_string(),
+                    },
+                    read_rows_from_table(&conn, sample)?,
+                ));
             }
         }
 
@@ -82,15 +88,93 @@ impl FeatureStore {
                 parquet.display()
             )));
         }
-        let conn = Connection::open_in_memory()?;
         Ok((
             SourceInfo {
                 kind: SourceKind::ParquetFile,
-                location: parquet.display().to_string(),
+                location: if self.feature_db.to_string_lossy() == ":memory:" {
+                    parquet.display().to_string()
+                } else {
+                    format!(
+                        "{} (duckdb={})",
+                        parquet.display(),
+                        self.feature_db.display()
+                    )
+                },
             },
-            read_rows_from_parquet(&conn, chain, parquet)?,
+            read_rows_from_parquet(&conn, sample, parquet)?,
         ))
     }
+}
+
+fn open_feature_connection(feature_db: &Path) -> Result<Connection, BenchError> {
+    let db_literal = feature_db.to_string_lossy();
+    let use_memory = db_literal == ":memory:";
+    if !use_memory {
+        if let Some(parent) = feature_db.parent() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let conn = if use_memory {
+        Connection::open_in_memory()?
+    } else {
+        Connection::open(feature_db)?
+    };
+    let config = detect_resource_config(feature_db, use_memory);
+    apply_resource_config(&conn, &config)?;
+    Ok(conn)
+}
+
+fn detect_resource_config(feature_db: &Path, use_memory: bool) -> ResourceConfig {
+    let mut system = System::new();
+    system.refresh_memory();
+    let total_memory_bytes = system.total_memory();
+    let gib = 1024_u64 * 1024 * 1024;
+    let min_limit = 512_u64 * 1024 * 1024;
+    let soft_cap = 8_u64 * gib;
+    let reserved = if total_memory_bytes >= 8 * gib {
+        gib
+    } else {
+        512_u64 * 1024 * 1024
+    };
+    let proportional = total_memory_bytes.saturating_mul(35) / 100;
+    let available_target = total_memory_bytes.saturating_sub(reserved);
+    let selected = proportional.min(available_target).max(min_limit).min(soft_cap);
+    let memory_limit_mb = (selected / (1024 * 1024)).max(512);
+    let threads = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .clamp(1, 8);
+    let temp_directory = if use_memory {
+        std::env::temp_dir().join("dedup_bench_rs_duckdb_tmp")
+    } else {
+        feature_db
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(".duckdb_tmp")
+    };
+    ResourceConfig {
+        memory_limit_mb,
+        threads,
+        temp_directory,
+    }
+}
+
+fn apply_resource_config(conn: &Connection, config: &ResourceConfig) -> Result<(), BenchError> {
+    fs::create_dir_all(&config.temp_directory)?;
+    let temp_dir = config
+        .temp_directory
+        .to_string_lossy()
+        .replace('\\', "/")
+        .replace('\'', "''");
+    conn.execute_batch(&format!(
+        "
+        SET memory_limit='{}MB';
+        SET temp_directory='{}';
+        SET threads={};
+        ",
+        config.memory_limit_mb, temp_dir, config.threads
+    ))?;
+    Ok(())
 }
 
 fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, BenchError> {
@@ -128,7 +212,10 @@ fn parquet_columns(conn: &Connection, parquet_path: &Path) -> Result<Vec<String>
     Ok(columns)
 }
 
-fn read_rows_from_table(conn: &Connection, chain: &str) -> Result<Vec<FeatureRow>, BenchError> {
+fn read_rows_from_table(
+    conn: &Connection,
+    sample: &BenchmarkSample,
+) -> Result<Vec<FeatureRow>, BenchError> {
     let columns = table_columns(conn, "nft_features")?;
     let metadata_json_expr = if columns.iter().any(|column| column == "metadata_json") {
         "coalesce(cast(metadata_json as varchar), '')"
@@ -162,15 +249,14 @@ fn read_rows_from_table(conn: &Connection, chain: &str) -> Result<Vec<FeatureRow
             {keywords_expr} AS metadata_keywords_raw
         FROM nft_features
         WHERE lower(chain) = lower(?)
-        ORDER BY contract_address, token_id
         "
     );
-    read_rows_from_query(conn, &query, params![chain])
+    collect_recall_rows_from_query(conn, &query, params![sample.chain.as_str()], sample)
 }
 
 fn read_rows_from_parquet(
     conn: &Connection,
-    chain: &str,
+    sample: &BenchmarkSample,
     parquet_path: &Path,
 ) -> Result<Vec<FeatureRow>, BenchError> {
     let columns = parquet_columns(conn, parquet_path)?;
@@ -212,24 +298,30 @@ fn read_rows_from_parquet(
             {keywords_expr} AS metadata_keywords_raw
         FROM read_parquet('{path_literal}')
         {where_clause}
-        ORDER BY contract_address, token_id
         "
     );
     if where_clause.is_empty() {
-        read_rows_from_query(conn, &query, params![])
+        collect_recall_rows_from_query(conn, &query, params![], sample)
     } else {
-        read_rows_from_query(conn, &query, params![chain])
+        collect_recall_rows_from_query(conn, &query, params![sample.chain.as_str()], sample)
     }
 }
 
-fn read_rows_from_query<P>(
+fn collect_recall_rows_from_query<P>(
     conn: &Connection,
     query: &str,
     params: P,
+    sample: &BenchmarkSample,
 ) -> Result<Vec<FeatureRow>, BenchError>
 where
     P: duckdb::Params,
 {
+    let sample_name_prefix = sample.name_prefix();
+    let sample_keyword_set: HashSet<&str> =
+        sample.metadata_keywords.iter().map(String::as_str).collect();
+    let sample_has_identity =
+        !sample.contract_address.is_empty() && !sample.token_id.is_empty();
+
     let mut stmt = conn.prepare(query)?;
     let rows = stmt.query_map(params, |row| {
         Ok((
@@ -244,25 +336,69 @@ where
     })?;
     let mut output = Vec::new();
     for row in rows {
-        let (contract_address, token_id, name, metadata_json, metadata_doc, name_norm, keywords_raw) =
-            row?;
-        let metadata_doc = if metadata_doc.trim().is_empty() {
-            metadata_document_from_json(&metadata_json)
+        let (
+            contract_address,
+            token_id,
+            name,
+            metadata_json,
+            raw_metadata_doc,
+            raw_name_norm,
+            keywords_raw,
+        ) = row?;
+
+        if sample_has_identity
+            && sample.contract_address.eq_ignore_ascii_case(&contract_address)
+            && sample.token_id == token_id
+        {
+            continue;
+        }
+
+        let mut name_norm = raw_name_norm;
+        let name_match = if let Some(prefix) = sample_name_prefix.as_ref() {
+            if name_norm.trim().is_empty() {
+                name_norm = derive_name_norm(&name);
+            }
+            !name_norm.is_empty() && name_norm.starts_with(prefix)
         } else {
-            metadata_doc
+            false
         };
+
+        let mut metadata_doc = raw_metadata_doc;
+        let mut metadata_keywords = None;
+        let metadata_match = if sample_keyword_set.is_empty() {
+            false
+        } else {
+            if metadata_doc.trim().is_empty() && keywords_raw.trim().is_empty() {
+                metadata_doc = metadata_document_from_json(&metadata_json);
+            }
+            let keywords = parse_keywords(&keywords_raw, &metadata_doc);
+            let matched = keywords
+                .iter()
+                .any(|keyword| sample_keyword_set.contains(keyword.as_str()));
+            metadata_keywords = Some(keywords);
+            matched
+        };
+
+        if !name_match && !metadata_match {
+            continue;
+        }
+
+        if metadata_doc.trim().is_empty() {
+            metadata_doc = metadata_document_from_json(&metadata_json);
+        }
+        let metadata_keywords =
+            metadata_keywords.unwrap_or_else(|| parse_keywords(&keywords_raw, &metadata_doc));
+        if name_norm.trim().is_empty() {
+            name_norm = derive_name_norm(&name);
+        }
+
         output.push(FeatureRow {
             contract_address,
             token_id,
-            name: name.clone(),
-            name_norm: if name_norm.trim().is_empty() {
-                derive_name_norm(&name)
-            } else {
-                name_norm
-            },
-            metadata_json,
-            metadata_doc: metadata_doc.clone(),
-            metadata_keywords: parse_keywords(&keywords_raw, &metadata_doc),
+            name,
+            name_norm,
+            metadata_doc,
+            metadata_keywords,
         });
     }
     Ok(output)
@@ -307,8 +443,61 @@ mod tests {
         drop(conn);
 
         let store = FeatureStore::new(db_path, None);
-        let (_, rows) = store.load_rows("ethereum").unwrap();
+        let sample = BenchmarkSample {
+            chain: "ethereum".into(),
+            contract_address: String::new(),
+            token_id: String::new(),
+            name: "Azuki #1".into(),
+            name_norm: derive_name_norm("Azuki #1"),
+            metadata_json: "{\"description\":\"rare dragon gold\"}".into(),
+            metadata_doc: "rare dragon gold".into(),
+            metadata_keywords: vec!["rare".into(), "dragon".into(), "gold".into()],
+        };
+        let (_, rows) = store.load_recall_rows(&sample).unwrap();
         assert_eq!(rows[0].metadata_doc, "rare dragon gold");
         assert!(rows[0].metadata_keywords.contains(&"dragon".to_string()));
+    }
+
+    #[test]
+    fn parquet_fallback_creates_disk_duckdb_file_when_path_is_missing() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("feature_store.duckdb");
+        let parquet_path = dir.path().join("snapshot.parquet");
+        let conn = Connection::open_in_memory().unwrap();
+        let path = parquet_path.to_string_lossy().replace('\\', "/");
+        conn.execute_batch(&format!(
+            "COPY (
+                SELECT
+                    'ethereum' AS chain,
+                    '0xdup' AS contract_address,
+                    '1' AS token_id,
+                    'Azuki Mirror #1' AS name,
+                    '{{\"description\":\"rare dragon gold\"}}' AS metadata_json
+            ) TO '{path}' (FORMAT PARQUET)"
+        ))
+        .unwrap();
+
+        let store = FeatureStore::new(db_path.clone(), Some(parquet_path));
+        let sample = BenchmarkSample {
+            chain: "ethereum".into(),
+            contract_address: String::new(),
+            token_id: String::new(),
+            name: "Azuki #1".into(),
+            name_norm: derive_name_norm("Azuki #1"),
+            metadata_json: "{\"description\":\"rare dragon gold\"}".into(),
+            metadata_doc: "rare dragon gold".into(),
+            metadata_keywords: vec!["rare".into(), "dragon".into(), "gold".into()],
+        };
+        let (_, rows) = store.load_recall_rows(&sample).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(db_path.exists());
+    }
+
+    #[test]
+    fn detect_resource_config_reserves_headroom() {
+        let config = detect_resource_config(Path::new("feature_store.duckdb"), false);
+        assert!(config.memory_limit_mb >= 512);
+        assert!((1..=8).contains(&config.threads));
+        assert!(config.temp_directory.ends_with(".duckdb_tmp"));
     }
 }

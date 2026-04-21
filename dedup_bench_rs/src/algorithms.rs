@@ -446,7 +446,6 @@ mod tests {
             token_id: "1".into(),
             name: "Azuki".into(),
             name_norm: normalize_name("Azuki"),
-            metadata_json: String::new(),
             metadata_doc: "rare dragon gold".into(),
             metadata_keywords: vec!["dragon".into(), "gold".into(), "rare".into()],
         }

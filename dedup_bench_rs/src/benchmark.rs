@@ -9,7 +9,7 @@ use crate::algorithms::{
 use crate::error::BenchError;
 use crate::report::BenchmarkReport;
 use crate::sample::BenchmarkSample;
-use crate::store::{FeatureRow, FeatureStore};
+use crate::store::FeatureStore;
 
 #[derive(Clone, Debug)]
 pub struct BenchmarkConfig {
@@ -25,28 +25,6 @@ pub struct BenchmarkConfig {
     pub repeat: usize,
 }
 
-fn is_recall_match(sample: &BenchmarkSample, row: &FeatureRow) -> bool {
-    if !sample.contract_address.is_empty()
-        && !sample.token_id.is_empty()
-        && sample.contract_address.eq_ignore_ascii_case(&row.contract_address)
-        && sample.token_id == row.token_id
-    {
-        return false;
-    }
-
-    let name_match = sample
-        .name_prefix()
-        .map(|prefix| !row.name_norm.is_empty() && row.name_norm.starts_with(&prefix))
-        .unwrap_or(false);
-    let metadata_match = !sample.metadata_keywords.is_empty()
-        && !row.metadata_keywords.is_empty()
-        && row
-            .metadata_keywords
-            .iter()
-            .any(|keyword| sample.metadata_keywords.contains(keyword));
-    name_match || metadata_match
-}
-
 pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchError> {
     let sample = BenchmarkSample::load(
         &config.chain,
@@ -56,32 +34,26 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
         &config.metadata_file,
     )?;
     let store = FeatureStore::new(config.feature_db.clone(), config.feature_parquet.clone());
-    let (source, rows) = store.load_rows(&config.chain)?;
-
     let recall_started = Instant::now();
-    let recall_rows: Vec<FeatureRow> = rows
-        .into_iter()
-        .filter(|row| is_recall_match(&sample, row))
-        .collect();
+    let (source, recall_rows) = store.load_recall_rows(&sample)?;
     let recall_elapsed_ms = recall_started.elapsed().as_secs_f64() * 1000.0;
 
     let repeat = config.repeat.max(1);
     let mut algorithm_reports = Vec::new();
     for algorithm in all_algorithms() {
         let mut runs_ms = Vec::new();
-        let mut final_scores = Vec::new();
+        let mut last_result = None;
         for _ in 0..repeat {
             let started = Instant::now();
             let scores: Vec<f64> = recall_rows
                 .iter()
                 .map(|row| (algorithm.scorer)(&sample, row))
                 .collect();
-            let _ = sort_algorithm_candidates(&recall_rows, &scores, config.top_k);
+            let result = sort_algorithm_candidates(&recall_rows, &scores, config.top_k);
             runs_ms.push(started.elapsed().as_secs_f64() * 1000.0);
-            final_scores = scores;
+            last_result = Some(result);
         }
-        let (candidate_count, top_candidates) =
-            sort_algorithm_candidates(&recall_rows, &final_scores, config.top_k);
+        let (candidate_count, top_candidates) = last_result.unwrap_or((0, Vec::new()));
         algorithm_reports.push(AlgorithmReport {
             algorithm_id: algorithm.id.to_string(),
             field: algorithm.field,
@@ -94,16 +66,15 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
     }
 
     let mut reference_runs_ms = Vec::new();
-    let mut reference_top_candidates = Vec::new();
-    let mut reference_candidate_count = 0;
+    let mut reference_result = None;
     for _ in 0..repeat {
         let started = Instant::now();
-        let (candidate_count, top_candidates) =
-            build_reference_candidates(&sample, &recall_rows, config.top_k);
+        let result = build_reference_candidates(&sample, &recall_rows, config.top_k);
         reference_runs_ms.push(started.elapsed().as_secs_f64() * 1000.0);
-        reference_candidate_count = candidate_count;
-        reference_top_candidates = top_candidates;
+        reference_result = Some(result);
     }
+    let (reference_candidate_count, reference_top_candidates) =
+        reference_result.unwrap_or((0, Vec::new()));
 
     let report = BenchmarkReport {
         chain: config.chain.clone(),
