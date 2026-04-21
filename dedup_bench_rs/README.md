@@ -6,7 +6,7 @@
 
 - 输入 1 个样例 NFT
 - 只基于 `name` 和 `metadata` 做召回与打分
-- 对比多种字符串算法的候选结果和耗时
+- 对比多种字符串算法的重复判定结果和耗时
 - 复用现有 DuckDB / Parquet 特征数据，不访问 PostgreSQL
 
 当前实现明确**不使用**这些字段：
@@ -31,6 +31,8 @@
 - 输出：
   - 一份 JSON 详细报告
   - 一份 Markdown 摘要报告
+  - 正式报告只输出被各算法判定为重复的 `duplicates`
+  - 每个算法的判重规则集中定义在 `src/decision_rules.rs`
 - 计时口径：
   - 算法层并行线程数默认是 `30`，可通过参数自定义
   - 每个算法和 reference 都会先对同一批 `recall_rows` 预热一次，再进入正式计时
@@ -51,7 +53,6 @@ cargo run -- run \
   --feature-db ../output/top_contract_analysis/features.duckdb \
   --feature-parquet ../output/top_contract_analysis/ethereum.parquet \
   --output ./result/result.json \
-  --top-k 50 \
   --repeat 5 \
   --algorithm-threads 30
 ```
@@ -74,8 +75,6 @@ cargo run -- run \
   可选。DuckDB 中没有该链数据时的 Parquet 导入源路径
 - `--output`
   JSON 输出路径；同名 `.md` 会自动生成
-- `--top-k`
-  每个算法保留的候选数量
 - `--repeat`
   每个算法重复执行次数，用于统计平均耗时和最小耗时
 - `--algorithm-threads`
@@ -178,12 +177,13 @@ cargo run -- run \
 
 - `algorithm_id`
 - `field`
+- `decision_rule`
 - `repeat`
 - `runs_ms`
 - `avg_ms`
 - `min_ms`
-- `candidate_count`
-- `top_candidates`
+- `duplicate_count`
+- `duplicates`
 
 ### Markdown 报告
 
@@ -192,7 +192,7 @@ cargo run -- run \
 - 样例信息
 - 召回数量和耗时
 - 当前参考结果
-- 各算法的 Top-K 候选
+- 各算法判定为重复的结果
 
 ## 数据要求
 

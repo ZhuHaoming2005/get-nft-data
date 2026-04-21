@@ -5,9 +5,10 @@ use std::time::Instant;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
 use crate::algorithms::{
-    build_reference_candidates_raw, score_rows_parallel_raw, sort_algorithm_candidates_raw,
-    timing_algorithms, AlgorithmReport, CandidateScore, ReferenceReport,
+    build_algorithm_duplicates_raw_from_scores, build_reference_duplicates_raw,
+    score_rows_parallel_raw, timing_algorithms, AlgorithmReport, CandidateScore, ReferenceReport,
 };
+use crate::decision_rules::{duplicate_score_rule, reference_duplicate_rule};
 use crate::error::BenchError;
 use crate::report::BenchmarkReport;
 use crate::sample::BenchmarkSample;
@@ -23,7 +24,6 @@ pub struct BenchmarkConfig {
     pub feature_db: PathBuf,
     pub feature_parquet: Option<PathBuf>,
     pub output: PathBuf,
-    pub top_k: usize,
     pub repeat: usize,
     pub algorithm_threads: usize,
 }
@@ -45,13 +45,15 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
     let repeat = config.repeat.max(1);
     let algorithms = timing_algorithms();
     for algorithm in &algorithms {
-        algorithm_thread_pool.install(|| {
+        algorithm_thread_pool.install(|| -> Result<(), BenchError> {
             let scores = score_rows_parallel_raw(&sample, &recall_rows, algorithm.scorer);
-            let _ = sort_algorithm_candidates_raw(&recall_rows, &scores, config.top_k);
-        });
+            let _ = build_algorithm_duplicates_raw_from_scores(algorithm.id, &recall_rows, &scores)
+                .map_err(BenchError::InvalidData)?;
+            Ok(())
+        })?;
     }
     algorithm_thread_pool.install(|| {
-        let _ = build_reference_candidates_raw(&sample, &recall_rows, config.top_k);
+        let _ = build_reference_duplicates_raw(&sample, &recall_rows);
     });
 
     let mut algorithm_runs_ms: Vec<Vec<f64>> = (0..algorithms.len())
@@ -71,15 +73,16 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
                 let result = algorithm_thread_pool.install(|| {
                     let scores =
                         score_rows_parallel_raw(&sample, &recall_rows, algorithm.scorer);
-                    sort_algorithm_candidates_raw(&recall_rows, &scores, config.top_k)
-                });
+                    build_algorithm_duplicates_raw_from_scores(algorithm.id, &recall_rows, &scores)
+                        .map_err(BenchError::InvalidData)
+                })?;
                 algorithm_runs_ms[timed_unit_index]
                     .push(started.elapsed().as_secs_f64() * 1000.0);
                 algorithm_results[timed_unit_index] = Some(result);
             } else {
                 let started = Instant::now();
                 let result = algorithm_thread_pool
-                    .install(|| build_reference_candidates_raw(&sample, &recall_rows, config.top_k));
+                    .install(|| build_reference_duplicates_raw(&sample, &recall_rows));
                 reference_runs_ms.push(started.elapsed().as_secs_f64() * 1000.0);
                 reference_result = Some(result);
             }
@@ -90,21 +93,24 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
         .enumerate()
         .map(|(index, algorithm)| {
             let runs_ms = std::mem::take(&mut algorithm_runs_ms[index]);
-            let (candidate_count, top_candidates) =
+            let (duplicate_count, duplicates) =
                 algorithm_results[index].take().unwrap_or((0, Vec::new()));
             AlgorithmReport {
-            algorithm_id: algorithm.id.to_string(),
-            field: algorithm.field,
-            repeat,
-            runs_ms: runs_ms.clone(),
-            avg_ms: runs_ms.iter().sum::<f64>() / runs_ms.len() as f64,
-            min_ms: runs_ms.iter().copied().fold(f64::INFINITY, f64::min),
-            candidate_count,
-            top_candidates,
+                algorithm_id: algorithm.id.to_string(),
+                field: algorithm.field,
+                decision_rule: duplicate_score_rule(algorithm.id)
+                    .map(|rule| rule.description.to_string())
+                    .unwrap_or_else(|_| "missing duplicate rule".to_string()),
+                repeat,
+                runs_ms: runs_ms.clone(),
+                avg_ms: runs_ms.iter().sum::<f64>() / runs_ms.len() as f64,
+                min_ms: runs_ms.iter().copied().fold(f64::INFINITY, f64::min),
+                duplicate_count,
+                duplicates,
             }
         })
         .collect();
-    let (reference_candidate_count, reference_top_candidates) =
+    let (reference_duplicate_count, reference_duplicates) =
         reference_result.unwrap_or((0, Vec::new()));
 
     let report = BenchmarkReport {
@@ -116,6 +122,7 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
         reference: ReferenceReport {
             algorithm_id: "current_name_metadata_reference".to_string(),
             field: crate::algorithms::AlgorithmField::Reference,
+            decision_rule: reference_duplicate_rule().description.to_string(),
             repeat,
             runs_ms: reference_runs_ms.clone(),
             avg_ms: reference_runs_ms.iter().sum::<f64>() / reference_runs_ms.len() as f64,
@@ -123,8 +130,8 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
                 .iter()
                 .copied()
                 .fold(f64::INFINITY, f64::min),
-            candidate_count: reference_candidate_count,
-            top_candidates: reference_top_candidates,
+            duplicate_count: reference_duplicate_count,
+            duplicates: reference_duplicates,
         },
         algorithms: algorithm_reports,
     };
@@ -218,7 +225,6 @@ mod tests {
             feature_db: db_path,
             feature_parquet: None,
             output: output_path,
-            top_k: 10,
             repeat: 1,
             algorithm_threads: 30,
         })
@@ -228,7 +234,7 @@ mod tests {
         assert!(
             report
                 .reference
-                .top_candidates
+                .duplicates
                 .iter()
                 .all(|candidate| candidate.contract_address != "0xby_uri_only")
         );
@@ -280,7 +286,6 @@ mod tests {
             feature_db: db_path.clone(),
             feature_parquet: Some(parquet_path),
             output: output_path,
-            top_k: 10,
             repeat: 1,
             algorithm_threads: 30,
         })
@@ -288,7 +293,7 @@ mod tests {
 
         assert_eq!(report.source.kind, crate::store::SourceKind::DuckdbTable);
         assert_eq!(report.recall_candidate_count, 1);
-        assert_eq!(report.reference.top_candidates[0].contract_address, "0xparquet");
+        assert_eq!(report.reference.duplicates[0].contract_address, "0xparquet");
 
         let second_output_path = dir.path().join("report-second.json");
         let second_report = run_benchmark(&BenchmarkConfig {
@@ -300,7 +305,6 @@ mod tests {
             feature_db: db_path,
             feature_parquet: None,
             output: second_output_path,
-            top_k: 10,
             repeat: 1,
             algorithm_threads: 30,
         })
@@ -309,7 +313,7 @@ mod tests {
         assert_eq!(second_report.source.kind, crate::store::SourceKind::DuckdbTable);
         assert_eq!(second_report.recall_candidate_count, 1);
         assert_eq!(
-            second_report.reference.top_candidates[0].contract_address,
+            second_report.reference.duplicates[0].contract_address,
             "0xparquet"
         );
     }
@@ -331,7 +335,6 @@ mod tests {
             feature_db: db_path.clone(),
             feature_parquet: None,
             output: output_path.clone(),
-            top_k: 10,
             repeat: 1,
             algorithm_threads: 30,
         })
@@ -345,7 +348,6 @@ mod tests {
             feature_db: db_path,
             feature_parquet: None,
             output: output_path,
-            top_k: 10,
             repeat: 3,
             algorithm_threads: 30,
         })
@@ -353,25 +355,25 @@ mod tests {
 
         let single_reference: Vec<(String, String)> = single
             .reference
-            .top_candidates
+            .duplicates
             .iter()
             .map(|candidate| (candidate.contract_address.clone(), candidate.token_id.clone()))
             .collect();
         let repeated_reference: Vec<(String, String)> = repeated
             .reference
-            .top_candidates
+            .duplicates
             .iter()
             .map(|candidate| (candidate.contract_address.clone(), candidate.token_id.clone()))
             .collect();
         assert_eq!(single_reference, repeated_reference);
 
         let single_name: Vec<(String, String)> = single.algorithms[0]
-            .top_candidates
+            .duplicates
             .iter()
             .map(|candidate| (candidate.contract_address.clone(), candidate.token_id.clone()))
             .collect();
         let repeated_name: Vec<(String, String)> = repeated.algorithms[0]
-            .top_candidates
+            .duplicates
             .iter()
             .map(|candidate| (candidate.contract_address.clone(), candidate.token_id.clone()))
             .collect();
@@ -395,12 +397,38 @@ mod tests {
             feature_db: db_path,
             feature_parquet: None,
             output: output_path,
-            top_k: 10,
             repeat: 1,
             algorithm_threads: 0,
         })
         .unwrap_err();
 
         assert!(err.to_string().contains("algorithm_threads"));
+    }
+
+    #[test]
+    fn markdown_report_mentions_duplicate_counts() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("feature_store.duckdb");
+        create_duckdb(&db_path);
+        let metadata_path = write_sample_inputs(dir.path());
+        let output_path = dir.path().join("report.json");
+
+        let report = run_benchmark(&BenchmarkConfig {
+            chain: "ethereum".into(),
+            contract_address: "0xseed".into(),
+            token_id: "1".into(),
+            name: "Azuki #1".into(),
+            metadata_file: metadata_path,
+            feature_db: db_path,
+            feature_parquet: None,
+            output: output_path,
+            repeat: 1,
+            algorithm_threads: 30,
+        })
+        .unwrap();
+
+        let markdown = report.to_markdown();
+        assert!(markdown.contains("duplicate_count"));
+        assert!(!markdown.contains("top_candidates"));
     }
 }

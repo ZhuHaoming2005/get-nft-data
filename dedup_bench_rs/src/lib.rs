@@ -1,9 +1,10 @@
-pub mod algorithms;
-pub mod benchmark;
-pub mod error;
-pub mod report;
-pub mod sample;
-pub mod store;
+mod algorithms;
+mod benchmark;
+mod decision_rules;
+mod error;
+mod report;
+mod sample;
+mod store;
 
 pub use benchmark::{run_benchmark, BenchmarkConfig};
 

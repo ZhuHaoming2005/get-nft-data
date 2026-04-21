@@ -50,8 +50,6 @@ fn cli_writes_json_and_markdown_outputs() {
             &db_path.to_string_lossy(),
             "--output",
             &output_path.to_string_lossy(),
-            "--top-k",
-            "5",
             "--repeat",
             "1",
         ])
@@ -61,6 +59,8 @@ fn cli_writes_json_and_markdown_outputs() {
     let json_output = fs::read_to_string(&output_path).unwrap();
     let markdown_output = fs::read_to_string(output_path.with_extension("md")).unwrap();
     assert!(json_output.contains("\"current_name_metadata_reference\""));
+    assert!(json_output.contains("\"duplicate_count\""));
     assert!(markdown_output.contains("# NFT Name/Metadata Dedup Benchmark"));
+    assert!(markdown_output.contains("duplicate_count"));
     assert!(markdown_output.contains("Azuki Mirror #1"));
 }

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -9,6 +11,7 @@ use strsim::{jaro_winkler, normalized_levenshtein};
 use top_contract_analysis_rs::analysis::scoring::{score_metadata_document_pair, score_name_pair};
 use top_contract_analysis_rs::normalize::{normalize_name, normalize_text};
 
+use crate::decision_rules::{duplicate_score_rule, reference_duplicate_rule};
 use crate::sample::BenchmarkSample;
 use crate::store::FeatureRow;
 
@@ -50,24 +53,26 @@ pub struct ReferenceCandidateScore {
 pub struct AlgorithmReport {
     pub algorithm_id: String,
     pub field: AlgorithmField,
+    pub decision_rule: String,
     pub repeat: usize,
     pub runs_ms: Vec<f64>,
     pub avg_ms: f64,
     pub min_ms: f64,
-    pub candidate_count: usize,
-    pub top_candidates: Vec<CandidateScore>,
+    pub duplicate_count: usize,
+    pub duplicates: Vec<CandidateScore>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct ReferenceReport {
     pub algorithm_id: String,
     pub field: AlgorithmField,
+    pub decision_rule: String,
     pub repeat: usize,
     pub runs_ms: Vec<f64>,
     pub avg_ms: f64,
     pub min_ms: f64,
-    pub candidate_count: usize,
-    pub top_candidates: Vec<ReferenceCandidateScore>,
+    pub duplicate_count: usize,
+    pub duplicates: Vec<ReferenceCandidateScore>,
 }
 
 #[derive(Clone, Copy)]
@@ -592,6 +597,81 @@ pub fn sort_algorithm_candidates_raw(
     (total, top_candidates)
 }
 
+pub fn build_algorithm_duplicates_from_scores(
+    algorithm_id: &str,
+    rows: &[PreparedFeatureRow],
+    scored: &[f64],
+) -> Result<(usize, Vec<CandidateScore>), String> {
+    debug_assert_eq!(rows.len(), scored.len());
+    let rule = duplicate_score_rule(algorithm_id)?;
+    let mut duplicates: Vec<(usize, f64)> = scored
+        .iter()
+        .enumerate()
+        .filter_map(|(index, score)| (*score >= rule.threshold).then_some((index, *score)))
+        .collect();
+    duplicates.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| {
+                rows[left.0]
+                    .raw
+                    .contract_address
+                    .cmp(&rows[right.0].raw.contract_address)
+            })
+            .then_with(|| rows[left.0].raw.token_id.cmp(&rows[right.0].raw.token_id))
+    });
+    let total = duplicates.len();
+    let duplicates = duplicates
+        .into_iter()
+        .enumerate()
+        .map(|(rank, (index, score))| CandidateScore {
+            rank: rank + 1,
+            contract_address: rows[index].raw.contract_address.clone(),
+            token_id: rows[index].raw.token_id.clone(),
+            name: rows[index].raw.name.clone(),
+            score,
+        })
+        .collect();
+    Ok((total, duplicates))
+}
+
+pub fn build_algorithm_duplicates_raw_from_scores(
+    algorithm_id: &str,
+    rows: &[FeatureRow],
+    scored: &[f64],
+) -> Result<(usize, Vec<CandidateScore>), String> {
+    debug_assert_eq!(rows.len(), scored.len());
+    let rule = duplicate_score_rule(algorithm_id)?;
+    let mut duplicates: Vec<(usize, f64)> = scored
+        .iter()
+        .enumerate()
+        .filter_map(|(index, score)| (*score >= rule.threshold).then_some((index, *score)))
+        .collect();
+    duplicates.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| rows[left.0].contract_address.cmp(&rows[right.0].contract_address))
+            .then_with(|| rows[left.0].token_id.cmp(&rows[right.0].token_id))
+    });
+    let total = duplicates.len();
+    let duplicates = duplicates
+        .into_iter()
+        .enumerate()
+        .map(|(rank, (index, score))| CandidateScore {
+            rank: rank + 1,
+            contract_address: rows[index].contract_address.clone(),
+            token_id: rows[index].token_id.clone(),
+            name: rows[index].name.clone(),
+            score,
+        })
+        .collect();
+    Ok((total, duplicates))
+}
+
 pub fn score_rows_parallel(
     sample: &PreparedSample,
     rows: &[PreparedFeatureRow],
@@ -614,18 +694,28 @@ pub fn build_reference_candidates_from_scores(
     metadata_scores: &[f64],
     top_k: usize,
 ) -> (usize, Vec<ReferenceCandidateScore>) {
+    let _ = top_k;
+    build_reference_duplicates_from_scores(rows, name_scores, metadata_scores)
+}
+
+pub fn build_reference_duplicates_from_scores(
+    rows: &[PreparedFeatureRow],
+    name_scores: &[f64],
+    metadata_scores: &[f64],
+) -> (usize, Vec<ReferenceCandidateScore>) {
     debug_assert_eq!(rows.len(), name_scores.len());
     debug_assert_eq!(rows.len(), metadata_scores.len());
+    let rule = reference_duplicate_rule();
     let mut candidates: Vec<(&PreparedFeatureRow, f64, f64, f64, Vec<String>)> = rows
         .iter()
         .zip(name_scores.iter().copied())
         .zip(metadata_scores.iter().copied())
         .filter_map(|((row, name_score), metadata_score)| {
             let mut reasons = Vec::new();
-            if name_score >= DEFAULT_NAME_THRESHOLD {
+            if name_score >= rule.name_threshold {
                 reasons.push("name_match".to_string());
             }
-            if metadata_score >= DEFAULT_METADATA_THRESHOLD {
+            if metadata_score >= rule.metadata_threshold {
                 reasons.push("metadata_match".to_string());
             }
             if reasons.is_empty() {
@@ -644,9 +734,8 @@ pub fn build_reference_candidates_from_scores(
             .then_with(|| left.0.raw.token_id.cmp(&right.0.raw.token_id))
     });
     let total = candidates.len();
-    let top_candidates = candidates
+    let duplicates = candidates
         .into_iter()
-        .take(top_k)
         .enumerate()
         .map(
             |(rank, (row, combined_score, name_score, metadata_score, match_reasons))| {
@@ -663,7 +752,7 @@ pub fn build_reference_candidates_from_scores(
             },
         )
         .collect();
-    (total, top_candidates)
+    (total, duplicates)
 }
 
 pub fn build_reference_candidates_raw_from_scores(
@@ -672,18 +761,28 @@ pub fn build_reference_candidates_raw_from_scores(
     metadata_scores: &[f64],
     top_k: usize,
 ) -> (usize, Vec<ReferenceCandidateScore>) {
+    let _ = top_k;
+    build_reference_duplicates_raw_from_scores(rows, name_scores, metadata_scores)
+}
+
+pub fn build_reference_duplicates_raw_from_scores(
+    rows: &[FeatureRow],
+    name_scores: &[f64],
+    metadata_scores: &[f64],
+) -> (usize, Vec<ReferenceCandidateScore>) {
     debug_assert_eq!(rows.len(), name_scores.len());
     debug_assert_eq!(rows.len(), metadata_scores.len());
+    let rule = reference_duplicate_rule();
     let mut candidates: Vec<(&FeatureRow, f64, f64, f64, Vec<String>)> = rows
         .iter()
         .zip(name_scores.iter().copied())
         .zip(metadata_scores.iter().copied())
         .filter_map(|((row, name_score), metadata_score)| {
             let mut reasons = Vec::new();
-            if name_score >= DEFAULT_NAME_THRESHOLD {
+            if name_score >= rule.name_threshold {
                 reasons.push("name_match".to_string());
             }
-            if metadata_score >= DEFAULT_METADATA_THRESHOLD {
+            if metadata_score >= rule.metadata_threshold {
                 reasons.push("metadata_match".to_string());
             }
             if reasons.is_empty() {
@@ -702,9 +801,8 @@ pub fn build_reference_candidates_raw_from_scores(
             .then_with(|| left.0.token_id.cmp(&right.0.token_id))
     });
     let total = candidates.len();
-    let top_candidates = candidates
+    let duplicates = candidates
         .into_iter()
-        .take(top_k)
         .enumerate()
         .map(
             |(rank, (row, combined_score, name_score, metadata_score, match_reasons))| {
@@ -721,7 +819,7 @@ pub fn build_reference_candidates_raw_from_scores(
             },
         )
         .collect();
-    (total, top_candidates)
+    (total, duplicates)
 }
 
 pub fn build_reference_candidates(
@@ -729,9 +827,17 @@ pub fn build_reference_candidates(
     rows: &[PreparedFeatureRow],
     top_k: usize,
 ) -> (usize, Vec<ReferenceCandidateScore>) {
+    let _ = top_k;
+    build_reference_duplicates(sample, rows)
+}
+
+pub fn build_reference_duplicates(
+    sample: &PreparedSample,
+    rows: &[PreparedFeatureRow],
+) -> (usize, Vec<ReferenceCandidateScore>) {
     let name_scores = score_rows_parallel(sample, rows, score_name_current_hybrid);
     let metadata_scores = score_rows_parallel(sample, rows, score_metadata_current_hybrid);
-    build_reference_candidates_from_scores(rows, &name_scores, &metadata_scores, top_k)
+    build_reference_duplicates_from_scores(rows, &name_scores, &metadata_scores)
 }
 
 pub fn build_reference_candidates_raw(
@@ -739,9 +845,17 @@ pub fn build_reference_candidates_raw(
     rows: &[FeatureRow],
     top_k: usize,
 ) -> (usize, Vec<ReferenceCandidateScore>) {
+    let _ = top_k;
+    build_reference_duplicates_raw(sample, rows)
+}
+
+pub fn build_reference_duplicates_raw(
+    sample: &BenchmarkSample,
+    rows: &[FeatureRow],
+) -> (usize, Vec<ReferenceCandidateScore>) {
     let name_scores = score_rows_parallel_raw(sample, rows, score_name_current_hybrid_raw);
     let metadata_scores = score_rows_parallel_raw(sample, rows, score_metadata_current_hybrid_raw);
-    build_reference_candidates_raw_from_scores(rows, &name_scores, &metadata_scores, top_k)
+    build_reference_duplicates_raw_from_scores(rows, &name_scores, &metadata_scores)
 }
 
 pub fn derive_name_norm(name: &str) -> String {
@@ -823,6 +937,21 @@ mod tests {
         prepare_rows(vec![second_row_raw()]).pop().unwrap()
     }
 
+    fn third_row_raw() -> FeatureRow {
+        FeatureRow {
+            contract_address: "0xdup3".into(),
+            token_id: "3".into(),
+            name: "Azuki Variant #3".into(),
+            name_norm: normalize_name("Azuki Variant #3"),
+            metadata_doc: "gold dragon ultra rare".into(),
+            metadata_keywords: vec!["dragon".into(), "gold".into(), "rare".into()],
+        }
+    }
+
+    fn third_row() -> PreparedFeatureRow {
+        prepare_rows(vec![third_row_raw()]).pop().unwrap()
+    }
+
     #[test]
     fn current_name_hybrid_matches_existing_logic() {
         let sample = sample();
@@ -874,20 +1003,58 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_duplicate_filtering_respects_per_algorithm_threshold() {
+        let rows = vec![row(), second_row()];
+        let scores = vec![95.0, 94.99];
+
+        let (duplicate_count, duplicates) =
+            build_algorithm_duplicates_from_scores("name_jaro_winkler", &rows, &scores).unwrap();
+
+        assert_eq!(duplicate_count, 1);
+        assert_eq!(duplicates.len(), 1);
+        assert_eq!(duplicates[0].contract_address, "0xdup");
+        assert_eq!(duplicates[0].score, 95.0);
+    }
+
+    #[test]
+    fn ordinary_duplicates_are_not_top_k_truncated() {
+        let rows = vec![row(), second_row(), third_row()];
+        let scores = vec![100.0, 99.0, 98.0];
+
+        let (duplicate_count, duplicates) = build_algorithm_duplicates_from_scores(
+            "name_normalized_levenshtein",
+            &rows,
+            &scores,
+        )
+        .unwrap();
+
+        assert_eq!(duplicate_count, 3);
+        assert_eq!(duplicates.len(), 3);
+        assert_eq!(
+            duplicates
+                .iter()
+                .map(|candidate| candidate.contract_address.as_str())
+                .collect::<Vec<_>>(),
+            vec!["0xdup", "0xdup2", "0xdup3"]
+        );
+    }
+
+    #[test]
     fn parallel_reference_candidates_keep_same_ranking_rules() {
         let sample = sample();
         let rows = vec![row(), second_row()];
         let actual = build_reference_candidates(&sample, &rows, 10);
+        let rule = reference_duplicate_rule();
 
         let mut expected_candidates = Vec::new();
         for row in &rows {
             let name_score = score_name_current_hybrid(&sample, row);
             let metadata_score = score_metadata_current_hybrid(&sample, row);
             let mut reasons = Vec::new();
-            if name_score >= DEFAULT_NAME_THRESHOLD {
+            if name_score >= rule.name_threshold {
                 reasons.push("name_match".to_string());
             }
-            if metadata_score >= DEFAULT_METADATA_THRESHOLD {
+            if metadata_score >= rule.metadata_threshold {
                 reasons.push("metadata_match".to_string());
             }
             if reasons.is_empty() {
@@ -955,20 +1122,20 @@ mod tests {
     }
 
     #[test]
-    fn reference_candidates_from_precomputed_scores_match_direct_build() {
+    fn reference_duplicates_from_precomputed_scores_match_direct_build() {
         let sample = sample();
         let rows = vec![row(), second_row()];
         let name_scores = score_rows_parallel(&sample, &rows, score_name_current_hybrid);
         let metadata_scores = score_rows_parallel(&sample, &rows, score_metadata_current_hybrid);
 
         assert_eq!(
-            build_reference_candidates(&sample, &rows, 10),
-            build_reference_candidates_from_scores(&rows, &name_scores, &metadata_scores, 10)
+            build_reference_duplicates(&sample, &rows),
+            build_reference_duplicates_from_scores(&rows, &name_scores, &metadata_scores)
         );
     }
 
     #[test]
-    fn raw_reference_candidates_from_precomputed_scores_match_direct_build() {
+    fn raw_reference_duplicates_from_precomputed_scores_match_direct_build() {
         let sample = sample_raw();
         let rows = vec![row_raw(), second_row_raw()];
         let name_scores = score_rows_parallel_raw(&sample, &rows, score_name_current_hybrid_raw);
@@ -976,8 +1143,21 @@ mod tests {
             score_rows_parallel_raw(&sample, &rows, score_metadata_current_hybrid_raw);
 
         assert_eq!(
-            build_reference_candidates_raw(&sample, &rows, 10),
-            build_reference_candidates_raw_from_scores(&rows, &name_scores, &metadata_scores, 10)
+            build_reference_duplicates_raw(&sample, &rows),
+            build_reference_duplicates_raw_from_scores(&rows, &name_scores, &metadata_scores)
         );
+    }
+
+    #[test]
+    fn reference_non_matches_are_excluded() {
+        let rows = vec![row(), second_row()];
+        let name_scores = vec![94.99, 10.0];
+        let metadata_scores = vec![0.54, 0.10];
+
+        let (duplicate_count, duplicates) =
+            build_reference_duplicates_from_scores(&rows, &name_scores, &metadata_scores);
+
+        assert_eq!(duplicate_count, 0);
+        assert!(duplicates.is_empty());
     }
 }

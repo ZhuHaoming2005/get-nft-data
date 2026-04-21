@@ -31,8 +31,6 @@ enum Command {
         feature_parquet: Option<PathBuf>,
         #[arg(long)]
         output: PathBuf,
-        #[arg(long, default_value_t = 50)]
-        top_k: usize,
         #[arg(long, default_value_t = 5)]
         repeat: usize,
         #[arg(long, default_value_t = 30)]
@@ -52,7 +50,6 @@ fn main() {
             feature_db,
             feature_parquet,
             output,
-            top_k,
             repeat,
             algorithm_threads,
         } => run_benchmark(&BenchmarkConfig {
@@ -64,7 +61,6 @@ fn main() {
             feature_db,
             feature_parquet,
             output,
-            top_k,
             repeat,
             algorithm_threads,
         }),
