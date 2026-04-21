@@ -1,0 +1,66 @@
+use std::fs;
+
+use assert_cmd::Command;
+use duckdb::Connection;
+use tempfile::tempdir;
+
+#[test]
+fn cli_writes_json_and_markdown_outputs() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("feature_store.duckdb");
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "
+        CREATE TABLE nft_features (
+            chain VARCHAR,
+            contract_address VARCHAR,
+            token_id VARCHAR,
+            name VARCHAR,
+            metadata_json VARCHAR,
+            metadata_doc VARCHAR,
+            name_norm VARCHAR,
+            metadata_keywords_arr VARCHAR
+        );
+        INSERT INTO nft_features VALUES
+        ('ethereum', '0xdup', '1', 'Azuki Mirror #1', '{\"description\":\"rare dragon gold\"}', 'rare dragon gold', 'azuki mirror', '[\"rare\",\"dragon\",\"gold\"]');
+        ",
+    )
+    .unwrap();
+    drop(conn);
+
+    let metadata_path = dir.path().join("metadata.json");
+    let output_path = dir.path().join("report.json");
+    fs::write(&metadata_path, r#"{"description":"rare dragon gold"}"#).unwrap();
+
+    Command::cargo_bin("dedup_bench_rs")
+        .unwrap()
+        .args([
+            "run",
+            "--chain",
+            "ethereum",
+            "--contract-address",
+            "0xseed",
+            "--token-id",
+            "1",
+            "--name",
+            "Azuki #1",
+            "--metadata-file",
+            &metadata_path.to_string_lossy(),
+            "--feature-db",
+            &db_path.to_string_lossy(),
+            "--output",
+            &output_path.to_string_lossy(),
+            "--top-k",
+            "5",
+            "--repeat",
+            "1",
+        ])
+        .assert()
+        .success();
+
+    let json_output = fs::read_to_string(&output_path).unwrap();
+    let markdown_output = fs::read_to_string(output_path.with_extension("md")).unwrap();
+    assert!(json_output.contains("\"current_name_metadata_reference\""));
+    assert!(markdown_output.contains("# NFT Name/Metadata Dedup Benchmark"));
+    assert!(markdown_output.contains("Azuki Mirror #1"));
+}

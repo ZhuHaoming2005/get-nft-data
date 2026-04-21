@@ -65,7 +65,7 @@ Get-Content .env | ForEach-Object {
 ```powershell
 cargo run --release -- export-snapshot `
   --chain ethereum `
-  --output .\data\ethereum_snapshot.parquet
+  --output ../output/top_contract_analysis/ethereum.parquet
 ```
 
 可选参数：
@@ -91,9 +91,9 @@ cargo run --release -- analyze `
   --alchemy-api-key $env:ALCHEMY_API_KEY `
   --etherscan-api-key $env:ETHERSCAN_API_KEY `
   --opensea-api-key $env:OPENSEA_API_KEY `
-  --feature-parquet .\data\ethereum_snapshot.parquet `
-  --feature-db .\data\feature_store.duckdb `
-  --signal-cache-db .\data\signal_cache.duckdb
+  --feature-parquet ../output/top_contract_analysis/ethereum.parquet `
+  --feature-db ../output/top_contract_analysis/features.duckdb `
+  --signal-cache-db ../output/top_contract_analysis/signals.duckdb
 ```
 
 常用参数：
@@ -127,10 +127,10 @@ cargo run --release -- batch `
   --alchemy-api-key $env:ALCHEMY_API_KEY `
   --etherscan-api-key $env:ETHERSCAN_API_KEY `
   --opensea-api-key $env:OPENSEA_API_KEY `
-  --feature-parquet .\data\ethereum_snapshot.parquet `
-  --feature-db .\data\feature_store.duckdb `
-  --signal-cache-db .\data\signal_cache.duckdb `
-  --output-dir .\result `
+  --feature-parquet ../output/top_contract_analysis/ethereum.parquet `
+  --feature-db ../output/top_contract_analysis/features.duckdb `
+  --signal-cache-db ../output/top_contract_analysis/signals.duckdb `
+  --output-dir ../result `
   --workers 4
 ```
 

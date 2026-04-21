@@ -73,7 +73,7 @@ pub struct BatchArgs {
     pub metadata_threshold: f64,
     #[arg(long, default_value_t = 60)]
     pub timeout: u64,
-    #[arg(long, default_value = "result")]
+    #[arg(long, default_value = "../result")]
     pub output_dir: String,
     #[arg(long, default_value_t = 1)]
     pub workers: usize,
