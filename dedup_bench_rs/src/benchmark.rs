@@ -50,24 +50,39 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
             let _ = sort_algorithm_candidates_raw(&recall_rows, &scores, config.top_k);
         });
     }
+    algorithm_thread_pool.install(|| {
+        let _ = build_reference_candidates_raw(&sample, &recall_rows, config.top_k);
+    });
 
     let mut algorithm_runs_ms: Vec<Vec<f64>> = (0..algorithms.len())
         .map(|_| Vec::with_capacity(repeat))
         .collect();
     let mut algorithm_results: Vec<Option<(usize, Vec<CandidateScore>)>> =
         (0..algorithms.len()).map(|_| None).collect();
+    let mut reference_runs_ms = Vec::with_capacity(repeat);
+    let mut reference_result = None;
+    let total_timed_units = algorithms.len() + 1;
     for repeat_index in 0..repeat {
-        for offset in 0..algorithms.len() {
-            let algorithm_index = (repeat_index + offset) % algorithms.len();
-            let algorithm = algorithms[algorithm_index];
-            let started = Instant::now();
-            let result = algorithm_thread_pool.install(|| {
-                let scores = score_rows_parallel_raw(&sample, &recall_rows, algorithm.scorer);
-                sort_algorithm_candidates_raw(&recall_rows, &scores, config.top_k)
-            });
-            algorithm_runs_ms[algorithm_index]
-                .push(started.elapsed().as_secs_f64() * 1000.0);
-            algorithm_results[algorithm_index] = Some(result);
+        for offset in 0..total_timed_units {
+            let timed_unit_index = (repeat_index + offset) % total_timed_units;
+            if timed_unit_index < algorithms.len() {
+                let algorithm = algorithms[timed_unit_index];
+                let started = Instant::now();
+                let result = algorithm_thread_pool.install(|| {
+                    let scores =
+                        score_rows_parallel_raw(&sample, &recall_rows, algorithm.scorer);
+                    sort_algorithm_candidates_raw(&recall_rows, &scores, config.top_k)
+                });
+                algorithm_runs_ms[timed_unit_index]
+                    .push(started.elapsed().as_secs_f64() * 1000.0);
+                algorithm_results[timed_unit_index] = Some(result);
+            } else {
+                let started = Instant::now();
+                let result = algorithm_thread_pool
+                    .install(|| build_reference_candidates_raw(&sample, &recall_rows, config.top_k));
+                reference_runs_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+                reference_result = Some(result);
+            }
         }
     }
     let algorithm_reports = algorithms
@@ -89,19 +104,6 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
             }
         })
         .collect();
-
-    algorithm_thread_pool.install(|| {
-        let _ = build_reference_candidates_raw(&sample, &recall_rows, config.top_k);
-    });
-    let mut reference_runs_ms = Vec::new();
-    let mut reference_result = None;
-    for _ in 0..repeat {
-        let started = Instant::now();
-        let result =
-            algorithm_thread_pool.install(|| build_reference_candidates_raw(&sample, &recall_rows, config.top_k));
-        reference_runs_ms.push(started.elapsed().as_secs_f64() * 1000.0);
-        reference_result = Some(result);
-    }
     let (reference_candidate_count, reference_top_candidates) =
         reference_result.unwrap_or((0, Vec::new()));
 
