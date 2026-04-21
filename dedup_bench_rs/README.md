@@ -31,6 +31,9 @@
 - 输出：
   - 一份 JSON 详细报告
   - 一份 Markdown 摘要报告
+- 计时口径：
+  - 算法层并行线程数默认是 `30`，可通过参数自定义
+  - 每个算法和 reference 都会先对同一批 `recall_rows` 预热一次，再进入正式计时
 
 ## 运行方式
 
@@ -47,7 +50,8 @@ cargo run -- run \
   --feature-parquet ../output/top_contract_analysis/ethereum.parquet \
   --output ./result/result.json \
   --top-k 50 \
-  --repeat 5
+  --repeat 5 \
+  --algorithm-threads 30
 ```
 
 参数说明：
@@ -72,6 +76,8 @@ cargo run -- run \
   每个算法保留的候选数量
 - `--repeat`
   每个算法重复执行次数，用于统计平均耗时和最小耗时
+- `--algorithm-threads`
+  算法层并行线程数，默认 `30`
 
 ## 输入文件格式
 

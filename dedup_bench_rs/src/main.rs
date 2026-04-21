@@ -35,6 +35,8 @@ enum Command {
         top_k: usize,
         #[arg(long, default_value_t = 5)]
         repeat: usize,
+        #[arg(long, default_value_t = 30)]
+        algorithm_threads: usize,
     },
 }
 
@@ -52,6 +54,7 @@ fn main() {
             output,
             top_k,
             repeat,
+            algorithm_threads,
         } => run_benchmark(&BenchmarkConfig {
             chain,
             contract_address,
@@ -63,6 +66,7 @@ fn main() {
             output,
             top_k,
             repeat,
+            algorithm_threads,
         }),
     };
 

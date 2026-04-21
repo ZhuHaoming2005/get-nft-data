@@ -2,6 +2,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use rayon::{ThreadPool, ThreadPoolBuilder};
+
 use crate::algorithms::{
     all_algorithms, build_reference_candidates, score_rows_parallel, sort_algorithm_candidates,
     AlgorithmReport, ReferenceReport,
@@ -23,6 +25,7 @@ pub struct BenchmarkConfig {
     pub output: PathBuf,
     pub top_k: usize,
     pub repeat: usize,
+    pub algorithm_threads: usize,
 }
 
 pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchError> {
@@ -37,16 +40,23 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
     let recall_started = Instant::now();
     let (source, recall_rows) = store.load_recall_rows(&sample)?;
     let recall_elapsed_ms = recall_started.elapsed().as_secs_f64() * 1000.0;
+    let algorithm_thread_pool = algorithm_thread_pool(config.algorithm_threads)?;
 
     let repeat = config.repeat.max(1);
     let mut algorithm_reports = Vec::new();
     for algorithm in all_algorithms() {
+        algorithm_thread_pool.install(|| {
+            let scores = score_rows_parallel(&sample, &recall_rows, algorithm.scorer);
+            let _ = sort_algorithm_candidates(&recall_rows, &scores, config.top_k);
+        });
         let mut runs_ms = Vec::new();
         let mut last_result = None;
         for _ in 0..repeat {
             let started = Instant::now();
-            let scores = score_rows_parallel(&sample, &recall_rows, algorithm.scorer);
-            let result = sort_algorithm_candidates(&recall_rows, &scores, config.top_k);
+            let result = algorithm_thread_pool.install(|| {
+                let scores = score_rows_parallel(&sample, &recall_rows, algorithm.scorer);
+                sort_algorithm_candidates(&recall_rows, &scores, config.top_k)
+            });
             runs_ms.push(started.elapsed().as_secs_f64() * 1000.0);
             last_result = Some(result);
         }
@@ -62,11 +72,15 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
         });
     }
 
+    algorithm_thread_pool.install(|| {
+        let _ = build_reference_candidates(&sample, &recall_rows, config.top_k);
+    });
     let mut reference_runs_ms = Vec::new();
     let mut reference_result = None;
     for _ in 0..repeat {
         let started = Instant::now();
-        let result = build_reference_candidates(&sample, &recall_rows, config.top_k);
+        let result =
+            algorithm_thread_pool.install(|| build_reference_candidates(&sample, &recall_rows, config.top_k));
         reference_runs_ms.push(started.elapsed().as_secs_f64() * 1000.0);
         reference_result = Some(result);
     }
@@ -95,6 +109,20 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
     };
     write_report_outputs(&report, &config.output)?;
     Ok(report)
+}
+
+fn algorithm_thread_pool(threads: usize) -> Result<ThreadPool, BenchError> {
+    if threads == 0 {
+        return Err(BenchError::InvalidData(
+            "algorithm_threads must be greater than 0".to_string(),
+        ));
+    }
+    ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .map_err(|error| {
+            BenchError::InvalidData(format!("failed to create rayon thread pool: {error}"))
+        })
 }
 
 fn write_report_outputs(report: &BenchmarkReport, output_path: &PathBuf) -> Result<(), BenchError> {
@@ -171,6 +199,7 @@ mod tests {
             output: output_path,
             top_k: 10,
             repeat: 1,
+            algorithm_threads: 30,
         })
         .unwrap();
 
@@ -232,6 +261,7 @@ mod tests {
             output: output_path,
             top_k: 10,
             repeat: 1,
+            algorithm_threads: 30,
         })
         .unwrap();
 
@@ -251,6 +281,7 @@ mod tests {
             output: second_output_path,
             top_k: 10,
             repeat: 1,
+            algorithm_threads: 30,
         })
         .unwrap();
 
@@ -281,6 +312,7 @@ mod tests {
             output: output_path.clone(),
             top_k: 10,
             repeat: 1,
+            algorithm_threads: 30,
         })
         .unwrap();
         let repeated = run_benchmark(&BenchmarkConfig {
@@ -294,6 +326,7 @@ mod tests {
             output: output_path,
             top_k: 10,
             repeat: 3,
+            algorithm_threads: 30,
         })
         .unwrap();
 
@@ -322,5 +355,31 @@ mod tests {
             .map(|candidate| (candidate.contract_address.clone(), candidate.token_id.clone()))
             .collect();
         assert_eq!(single_name, repeated_name);
+    }
+
+    #[test]
+    fn zero_algorithm_threads_is_rejected() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("feature_store.duckdb");
+        create_duckdb(&db_path);
+        let metadata_path = write_sample_inputs(dir.path());
+        let output_path = dir.path().join("report.json");
+
+        let err = run_benchmark(&BenchmarkConfig {
+            chain: "ethereum".into(),
+            contract_address: "0xseed".into(),
+            token_id: "1".into(),
+            name: "Azuki #1".into(),
+            metadata_file: metadata_path,
+            feature_db: db_path,
+            feature_parquet: None,
+            output: output_path,
+            top_k: 10,
+            repeat: 1,
+            algorithm_threads: 0,
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains("algorithm_threads"));
     }
 }
