@@ -666,38 +666,33 @@ pub fn build_reference_candidates_from_scores(
     (total, top_candidates)
 }
 
-pub fn build_reference_candidates(
-    sample: &PreparedSample,
-    rows: &[PreparedFeatureRow],
-    top_k: usize,
-) -> (usize, Vec<ReferenceCandidateScore>) {
-    let name_scores = score_rows_parallel(sample, rows, score_name_current_hybrid);
-    let metadata_scores = score_rows_parallel(sample, rows, score_metadata_current_hybrid);
-    build_reference_candidates_from_scores(rows, &name_scores, &metadata_scores, top_k)
-}
-
-pub fn build_reference_candidates_raw(
-    sample: &BenchmarkSample,
+pub fn build_reference_candidates_raw_from_scores(
     rows: &[FeatureRow],
+    name_scores: &[f64],
+    metadata_scores: &[f64],
     top_k: usize,
 ) -> (usize, Vec<ReferenceCandidateScore>) {
-    let mut candidates = Vec::new();
-    for row in rows {
-        let name_score = score_name_current_hybrid_raw(sample, row);
-        let metadata_score = score_metadata_current_hybrid_raw(sample, row);
-        let mut reasons = Vec::new();
-        if name_score >= DEFAULT_NAME_THRESHOLD {
-            reasons.push("name_match".to_string());
-        }
-        if metadata_score >= DEFAULT_METADATA_THRESHOLD {
-            reasons.push("metadata_match".to_string());
-        }
-        if reasons.is_empty() {
-            continue;
-        }
-        let combined_score = (name_score / 100.0).max(metadata_score);
-        candidates.push((row, combined_score, name_score, metadata_score, reasons));
-    }
+    debug_assert_eq!(rows.len(), name_scores.len());
+    debug_assert_eq!(rows.len(), metadata_scores.len());
+    let mut candidates: Vec<(&FeatureRow, f64, f64, f64, Vec<String>)> = rows
+        .iter()
+        .zip(name_scores.iter().copied())
+        .zip(metadata_scores.iter().copied())
+        .filter_map(|((row, name_score), metadata_score)| {
+            let mut reasons = Vec::new();
+            if name_score >= DEFAULT_NAME_THRESHOLD {
+                reasons.push("name_match".to_string());
+            }
+            if metadata_score >= DEFAULT_METADATA_THRESHOLD {
+                reasons.push("metadata_match".to_string());
+            }
+            if reasons.is_empty() {
+                return None;
+            }
+            let combined_score = (name_score / 100.0).max(metadata_score);
+            Some((row, combined_score, name_score, metadata_score, reasons))
+        })
+        .collect();
     candidates.sort_by(|left, right| {
         right
             .1
@@ -727,6 +722,26 @@ pub fn build_reference_candidates_raw(
         )
         .collect();
     (total, top_candidates)
+}
+
+pub fn build_reference_candidates(
+    sample: &PreparedSample,
+    rows: &[PreparedFeatureRow],
+    top_k: usize,
+) -> (usize, Vec<ReferenceCandidateScore>) {
+    let name_scores = score_rows_parallel(sample, rows, score_name_current_hybrid);
+    let metadata_scores = score_rows_parallel(sample, rows, score_metadata_current_hybrid);
+    build_reference_candidates_from_scores(rows, &name_scores, &metadata_scores, top_k)
+}
+
+pub fn build_reference_candidates_raw(
+    sample: &BenchmarkSample,
+    rows: &[FeatureRow],
+    top_k: usize,
+) -> (usize, Vec<ReferenceCandidateScore>) {
+    let name_scores = score_rows_parallel_raw(sample, rows, score_name_current_hybrid_raw);
+    let metadata_scores = score_rows_parallel_raw(sample, rows, score_metadata_current_hybrid_raw);
+    build_reference_candidates_raw_from_scores(rows, &name_scores, &metadata_scores, top_k)
 }
 
 pub fn derive_name_norm(name: &str) -> String {
@@ -949,6 +964,20 @@ mod tests {
         assert_eq!(
             build_reference_candidates(&sample, &rows, 10),
             build_reference_candidates_from_scores(&rows, &name_scores, &metadata_scores, 10)
+        );
+    }
+
+    #[test]
+    fn raw_reference_candidates_from_precomputed_scores_match_direct_build() {
+        let sample = sample_raw();
+        let rows = vec![row_raw(), second_row_raw()];
+        let name_scores = score_rows_parallel_raw(&sample, &rows, score_name_current_hybrid_raw);
+        let metadata_scores =
+            score_rows_parallel_raw(&sample, &rows, score_metadata_current_hybrid_raw);
+
+        assert_eq!(
+            build_reference_candidates_raw(&sample, &rows, 10),
+            build_reference_candidates_raw_from_scores(&rows, &name_scores, &metadata_scores, 10)
         );
     }
 }
