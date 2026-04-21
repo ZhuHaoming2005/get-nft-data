@@ -59,6 +59,7 @@ impl FeatureStore {
         sample: &BenchmarkSample,
     ) -> Result<(SourceInfo, Vec<FeatureRow>), BenchError> {
         let conn = open_feature_connection(&self.feature_db)?;
+        ensure_feature_table(&conn)?;
         if table_exists(&conn, "nft_features")? {
             let count: i64 = conn.query_row(
                 "SELECT count(*) FROM nft_features WHERE lower(chain) = lower(?)",
@@ -88,20 +89,13 @@ impl FeatureStore {
                 parquet.display()
             )));
         }
+        import_parquet_chain(&conn, sample.chain.as_str(), parquet)?;
         Ok((
             SourceInfo {
-                kind: SourceKind::ParquetFile,
-                location: if self.feature_db.to_string_lossy() == ":memory:" {
-                    parquet.display().to_string()
-                } else {
-                    format!(
-                        "{} (duckdb={})",
-                        parquet.display(),
-                        self.feature_db.display()
-                    )
-                },
+                kind: SourceKind::DuckdbTable,
+                location: self.feature_db.display().to_string(),
             },
-            read_rows_from_parquet(&conn, sample, parquet)?,
+            read_rows_from_table(&conn, sample)?,
         ))
     }
 }
@@ -186,6 +180,40 @@ fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, BenchError>
     Ok(count > 0)
 }
 
+fn ensure_feature_table(conn: &Connection) -> Result<(), BenchError> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS nft_features (
+            chain VARCHAR,
+            contract_address VARCHAR,
+            token_id VARCHAR,
+            token_uri VARCHAR,
+            image_uri VARCHAR,
+            name VARCHAR,
+            symbol VARCHAR,
+            metadata_json VARCHAR,
+            token_uri_norm VARCHAR,
+            image_uri_norm VARCHAR,
+            name_norm VARCHAR,
+            symbol_norm VARCHAR,
+            metadata_doc VARCHAR,
+            metadata_keywords_arr VARCHAR
+        );
+        ALTER TABLE nft_features ADD COLUMN IF NOT EXISTS token_uri VARCHAR;
+        ALTER TABLE nft_features ADD COLUMN IF NOT EXISTS image_uri VARCHAR;
+        ALTER TABLE nft_features ADD COLUMN IF NOT EXISTS symbol VARCHAR;
+        ALTER TABLE nft_features ADD COLUMN IF NOT EXISTS metadata_json VARCHAR;
+        ALTER TABLE nft_features ADD COLUMN IF NOT EXISTS token_uri_norm VARCHAR;
+        ALTER TABLE nft_features ADD COLUMN IF NOT EXISTS image_uri_norm VARCHAR;
+        ALTER TABLE nft_features ADD COLUMN IF NOT EXISTS name_norm VARCHAR;
+        ALTER TABLE nft_features ADD COLUMN IF NOT EXISTS symbol_norm VARCHAR;
+        ALTER TABLE nft_features ADD COLUMN IF NOT EXISTS metadata_doc VARCHAR;
+        ALTER TABLE nft_features ADD COLUMN IF NOT EXISTS metadata_keywords_arr VARCHAR;
+        ",
+    )?;
+    Ok(())
+}
+
 fn table_columns(conn: &Connection, table_name: &str) -> Result<Vec<String>, BenchError> {
     let mut stmt = conn.prepare(
         "SELECT column_name FROM information_schema.columns WHERE table_name = ? ORDER BY ordinal_position",
@@ -210,6 +238,104 @@ fn parquet_columns(conn: &Connection, parquet_path: &Path) -> Result<Vec<String>
         columns.push(row?);
     }
     Ok(columns)
+}
+
+fn import_parquet_chain(
+    conn: &Connection,
+    chain: &str,
+    parquet_path: &Path,
+) -> Result<(), BenchError> {
+    let columns = parquet_columns(conn, parquet_path)?;
+    let path_literal = parquet_path.to_string_lossy().replace('\\', "/");
+    let chain_literal = chain.replace('\'', "''");
+    let token_uri_expr = if columns.iter().any(|column| column == "token_uri") {
+        "coalesce(cast(token_uri as varchar), '')"
+    } else {
+        "''"
+    };
+    let image_uri_expr = if columns.iter().any(|column| column == "image_uri") {
+        "coalesce(cast(image_uri as varchar), '')"
+    } else {
+        "''"
+    };
+    let symbol_expr = if columns.iter().any(|column| column == "symbol") {
+        "coalesce(cast(symbol as varchar), '')"
+    } else {
+        "''"
+    };
+    let metadata_json_expr = if columns.iter().any(|column| column == "metadata_json") {
+        "coalesce(cast(metadata_json as varchar), '')"
+    } else {
+        "''"
+    };
+    let token_uri_norm_expr = if columns.iter().any(|column| column == "token_uri_norm") {
+        "coalesce(cast(token_uri_norm as varchar), '')"
+    } else {
+        "''"
+    };
+    let image_uri_norm_expr = if columns.iter().any(|column| column == "image_uri_norm") {
+        "coalesce(cast(image_uri_norm as varchar), '')"
+    } else {
+        "''"
+    };
+    let name_norm_expr = if columns.iter().any(|column| column == "name_norm") {
+        "coalesce(cast(name_norm as varchar), '')"
+    } else {
+        "''"
+    };
+    let symbol_norm_expr = if columns.iter().any(|column| column == "symbol_norm") {
+        "coalesce(cast(symbol_norm as varchar), '')"
+    } else {
+        "''"
+    };
+    let metadata_doc_expr = if columns.iter().any(|column| column == "metadata_doc") {
+        "coalesce(cast(metadata_doc as varchar), '')"
+    } else {
+        "''"
+    };
+    let metadata_keywords_expr = if columns.iter().any(|column| column == "metadata_keywords_arr") {
+        "coalesce(cast(metadata_keywords_arr as varchar), '')"
+    } else {
+        "''"
+    };
+    let source_chain_expr = if columns.iter().any(|column| column == "chain") {
+        "lower(cast(chain as varchar))"
+    } else {
+        &format!("'{chain_literal}'")
+    };
+    let where_clause = if columns.iter().any(|column| column == "chain") {
+        format!("WHERE lower(cast(chain as varchar)) = '{chain_literal}'")
+    } else {
+        String::new()
+    };
+    conn.execute("DELETE FROM nft_features WHERE lower(chain) = lower(?)", params![chain])?;
+    let insert_sql = format!(
+        "
+        INSERT INTO nft_features (
+            chain, contract_address, token_id, token_uri, image_uri, name, symbol, metadata_json,
+            token_uri_norm, image_uri_norm, name_norm, symbol_norm, metadata_doc, metadata_keywords_arr
+        )
+        SELECT
+            {source_chain_expr} AS chain,
+            lower(cast(contract_address as varchar)) AS contract_address,
+            cast(token_id as varchar) AS token_id,
+            {token_uri_expr} AS token_uri,
+            {image_uri_expr} AS image_uri,
+            coalesce(cast(name as varchar), '') AS name,
+            {symbol_expr} AS symbol,
+            {metadata_json_expr} AS metadata_json,
+            {token_uri_norm_expr} AS token_uri_norm,
+            {image_uri_norm_expr} AS image_uri_norm,
+            {name_norm_expr} AS name_norm,
+            {symbol_norm_expr} AS symbol_norm,
+            {metadata_doc_expr} AS metadata_doc,
+            {metadata_keywords_expr} AS metadata_keywords_arr
+        FROM read_parquet('{path_literal}')
+        {where_clause}
+        "
+    );
+    conn.execute_batch(&insert_sql)?;
+    Ok(())
 }
 
 fn read_rows_from_table(
@@ -252,59 +378,6 @@ fn read_rows_from_table(
         "
     );
     collect_recall_rows_from_query(conn, &query, params![sample.chain.as_str()], sample)
-}
-
-fn read_rows_from_parquet(
-    conn: &Connection,
-    sample: &BenchmarkSample,
-    parquet_path: &Path,
-) -> Result<Vec<FeatureRow>, BenchError> {
-    let columns = parquet_columns(conn, parquet_path)?;
-    let path_literal = parquet_path.to_string_lossy().replace('\\', "/");
-    let metadata_json_expr = if columns.iter().any(|column| column == "metadata_json") {
-        "coalesce(cast(metadata_json as varchar), '')"
-    } else {
-        "''"
-    };
-    let metadata_doc_expr = if columns.iter().any(|column| column == "metadata_doc") {
-        "coalesce(cast(metadata_doc as varchar), '')"
-    } else {
-        "''"
-    };
-    let name_norm_expr = if columns.iter().any(|column| column == "name_norm") {
-        "coalesce(cast(name_norm as varchar), '')"
-    } else {
-        "''"
-    };
-    let keywords_expr = if columns.iter().any(|column| column == "metadata_keywords_arr") {
-        "coalesce(cast(metadata_keywords_arr as varchar), '')"
-    } else {
-        "''"
-    };
-    let where_clause = if columns.iter().any(|column| column == "chain") {
-        "WHERE lower(cast(chain as varchar)) = lower(?)"
-    } else {
-        ""
-    };
-    let query = format!(
-        "
-        SELECT
-            lower(cast(contract_address as varchar)) AS contract_address,
-            cast(token_id as varchar) AS token_id,
-            coalesce(cast(name as varchar), '') AS name,
-            {metadata_json_expr} AS metadata_json,
-            {metadata_doc_expr} AS metadata_doc,
-            {name_norm_expr} AS name_norm,
-            {keywords_expr} AS metadata_keywords_raw
-        FROM read_parquet('{path_literal}')
-        {where_clause}
-        "
-    );
-    if where_clause.is_empty() {
-        collect_recall_rows_from_query(conn, &query, params![], sample)
-    } else {
-        collect_recall_rows_from_query(conn, &query, params![sample.chain.as_str()], sample)
-    }
 }
 
 fn collect_recall_rows_from_query<P>(
@@ -491,6 +564,16 @@ mod tests {
         let (_, rows) = store.load_recall_rows(&sample).unwrap();
         assert_eq!(rows.len(), 1);
         assert!(db_path.exists());
+
+        let persisted = Connection::open(&db_path).unwrap();
+        let persisted_count: i64 = persisted
+            .query_row(
+                "SELECT count(*) FROM nft_features WHERE lower(chain) = 'ethereum'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted_count, 1);
     }
 
     #[test]

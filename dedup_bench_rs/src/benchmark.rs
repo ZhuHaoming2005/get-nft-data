@@ -229,8 +229,8 @@ mod tests {
             contract_address: "0xseed".into(),
             token_id: "1".into(),
             name: "Azuki #1".into(),
-            metadata_file: metadata_path,
-            feature_db: db_path,
+            metadata_file: metadata_path.clone(),
+            feature_db: db_path.clone(),
             feature_parquet: Some(parquet_path),
             output: output_path,
             top_k: 10,
@@ -238,9 +238,31 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(report.source.kind, crate::store::SourceKind::ParquetFile);
+        assert_eq!(report.source.kind, crate::store::SourceKind::DuckdbTable);
         assert_eq!(report.recall_candidate_count, 1);
         assert_eq!(report.reference.top_candidates[0].contract_address, "0xparquet");
+
+        let second_output_path = dir.path().join("report-second.json");
+        let second_report = run_benchmark(&BenchmarkConfig {
+            chain: "ethereum".into(),
+            contract_address: "0xseed".into(),
+            token_id: "1".into(),
+            name: "Azuki #1".into(),
+            metadata_file: metadata_path,
+            feature_db: db_path,
+            feature_parquet: None,
+            output: second_output_path,
+            top_k: 10,
+            repeat: 1,
+        })
+        .unwrap();
+
+        assert_eq!(second_report.source.kind, crate::store::SourceKind::DuckdbTable);
+        assert_eq!(second_report.recall_candidate_count, 1);
+        assert_eq!(
+            second_report.reference.top_candidates[0].contract_address,
+            "0xparquet"
+        );
     }
 
     #[test]

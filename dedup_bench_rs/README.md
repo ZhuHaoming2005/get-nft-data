@@ -24,7 +24,7 @@
   - `metadata-file`：样例 metadata JSON
 - 数据源优先级：
   - 先读 `feature-db` 里的 `nft_features`
-  - 若该链无数据，则回退到 `feature-parquet`
+  - 若该链无数据，则从 `feature-parquet` 导入到 `feature-db`，再读 `nft_features`
 - 共享召回只使用：
   - `name_norm` 前 8 字符前缀
   - `metadata_keywords_arr` 关键词
@@ -63,9 +63,9 @@ cargo run -- run \
 - `--metadata-file`
   样例 metadata JSON 文件
 - `--feature-db`
-  已存在的 DuckDB 文件路径
+  DuckDB 文件路径。文件不存在时会自动创建；Parquet 回退导入结果也会持久化到这里
 - `--feature-parquet`
-  可选。DuckDB 中没有该链数据时的 Parquet 回退路径
+  可选。DuckDB 中没有该链数据时的 Parquet 导入源路径
 - `--output`
   JSON 输出路径；同名 `.md` 会自动生成
 - `--top-k`
@@ -223,7 +223,7 @@ cargo clippy --all-targets -- -D warnings
 ## 已验证点
 
 - DuckDB 直接读取
-- DuckDB 无链数据时回退到 Parquet
+- DuckDB 无链数据时会从 Parquet 导入并持久化到 `feature-db`
 - 召回阶段不会因为 `token_uri / image_uri / symbol` 命中
 - `repeat=1` 与 `repeat>1` 候选集合一致
 - CLI 会同时输出 JSON 和 Markdown
