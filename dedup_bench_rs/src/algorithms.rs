@@ -51,6 +51,7 @@ pub struct AlgorithmReport {
     pub algorithm_id: String,
     pub field: AlgorithmField,
     pub repeat: usize,
+    pub runs_ms: Vec<f64>,
     pub avg_ms: f64,
     pub min_ms: f64,
     pub candidate_count: usize,
@@ -62,6 +63,7 @@ pub struct ReferenceReport {
     pub algorithm_id: String,
     pub field: AlgorithmField,
     pub repeat: usize,
+    pub runs_ms: Vec<f64>,
     pub avg_ms: f64,
     pub min_ms: f64,
     pub candidate_count: usize,
@@ -72,7 +74,37 @@ pub struct ReferenceReport {
 pub struct AlgorithmDefinition {
     pub id: &'static str,
     pub field: AlgorithmField,
+    pub scorer: fn(&PreparedSample, &PreparedFeatureRow) -> f64,
+}
+
+#[derive(Clone, Copy)]
+pub struct TimingAlgorithmDefinition {
+    pub id: &'static str,
+    pub field: AlgorithmField,
     pub scorer: fn(&BenchmarkSample, &FeatureRow) -> f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedText {
+    pub normalized: String,
+    pub trigram_set: BTreeSet<String>,
+    pub token_set: HashSet<String>,
+    pub token_counts: BTreeMap<String, f64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedSample {
+    pub raw: BenchmarkSample,
+    pub name_prefix: Option<String>,
+    pub name_text: PreparedText,
+    pub metadata_text: PreparedText,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedFeatureRow {
+    pub raw: FeatureRow,
+    pub name_text: PreparedText,
+    pub metadata_text: PreparedText,
 }
 
 pub fn name_algorithms() -> Vec<AlgorithmDefinition> {
@@ -141,6 +173,61 @@ pub fn all_algorithms() -> Vec<AlgorithmDefinition> {
     algorithms
 }
 
+pub fn timing_algorithms() -> Vec<TimingAlgorithmDefinition> {
+    vec![
+        TimingAlgorithmDefinition {
+            id: "name_exact_normalized",
+            field: AlgorithmField::Name,
+            scorer: score_name_exact_normalized_raw,
+        },
+        TimingAlgorithmDefinition {
+            id: "name_jaro_winkler",
+            field: AlgorithmField::Name,
+            scorer: score_name_jaro_winkler_raw,
+        },
+        TimingAlgorithmDefinition {
+            id: "name_normalized_levenshtein",
+            field: AlgorithmField::Name,
+            scorer: score_name_normalized_levenshtein_raw,
+        },
+        TimingAlgorithmDefinition {
+            id: "name_trigram_jaccard",
+            field: AlgorithmField::Name,
+            scorer: score_name_trigram_jaccard_raw,
+        },
+        TimingAlgorithmDefinition {
+            id: "name_current_hybrid",
+            field: AlgorithmField::Name,
+            scorer: score_name_current_hybrid_raw,
+        },
+        TimingAlgorithmDefinition {
+            id: "metadata_token_jaccard",
+            field: AlgorithmField::Metadata,
+            scorer: score_metadata_token_jaccard_raw,
+        },
+        TimingAlgorithmDefinition {
+            id: "metadata_jaro_winkler_doc",
+            field: AlgorithmField::Metadata,
+            scorer: score_metadata_jaro_winkler_doc_raw,
+        },
+        TimingAlgorithmDefinition {
+            id: "metadata_trigram_jaccard_doc",
+            field: AlgorithmField::Metadata,
+            scorer: score_metadata_trigram_jaccard_doc_raw,
+        },
+        TimingAlgorithmDefinition {
+            id: "metadata_token_cosine",
+            field: AlgorithmField::Metadata,
+            scorer: score_metadata_token_cosine_raw,
+        },
+        TimingAlgorithmDefinition {
+            id: "metadata_current_hybrid",
+            field: AlgorithmField::Metadata,
+            scorer: score_metadata_current_hybrid_raw,
+        },
+    ]
+}
+
 pub fn metadata_keywords(document: &str, limit: usize) -> Vec<String> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for token in TOKEN_RE.find_iter(document) {
@@ -195,8 +282,12 @@ fn trigram_jaccard(left: &str, right: &str) -> f64 {
     }
     let left_set = trigram_set(&left);
     let right_set = trigram_set(&right);
-    let union = left_set.union(&right_set).count();
-    let overlap = left_set.intersection(&right_set).count();
+    trigram_jaccard_from_sets(&left_set, &right_set)
+}
+
+fn trigram_jaccard_from_sets(left: &BTreeSet<String>, right: &BTreeSet<String>) -> f64 {
+    let union = left.union(right).count();
+    let overlap = left.intersection(right).count();
     if union == 0 {
         0.0
     } else {
@@ -207,11 +298,15 @@ fn trigram_jaccard(left: &str, right: &str) -> f64 {
 fn token_jaccard(left: &str, right: &str) -> f64 {
     let left_tokens: HashSet<String> = tokenize(&normalize_text(left)).into_iter().collect();
     let right_tokens: HashSet<String> = tokenize(&normalize_text(right)).into_iter().collect();
-    if left_tokens.is_empty() || right_tokens.is_empty() {
+    token_jaccard_from_sets(&left_tokens, &right_tokens)
+}
+
+fn token_jaccard_from_sets(left: &HashSet<String>, right: &HashSet<String>) -> f64 {
+    if left.is_empty() || right.is_empty() {
         return 0.0;
     }
-    let union = left_tokens.union(&right_tokens).count();
-    let overlap = left_tokens.intersection(&right_tokens).count();
+    let union = left.union(right).count();
+    let overlap = left.intersection(right).count();
     if union == 0 {
         0.0
     } else {
@@ -231,17 +326,19 @@ fn token_cosine(left: &str, right: &str) -> f64 {
     if left_counts.is_empty() || right_counts.is_empty() {
         return 0.0;
     }
+    token_cosine_from_counts(&left_counts, &right_counts)
+}
 
-    let dot = left_counts
+fn token_cosine_from_counts(left: &BTreeMap<String, f64>, right: &BTreeMap<String, f64>) -> f64 {
+    if left.is_empty() || right.is_empty() {
+        return 0.0;
+    }
+    let dot = left
         .iter()
-        .map(|(token, left_value)| left_value * right_counts.get(token).unwrap_or(&0.0))
+        .map(|(token, left_value)| left_value * right.get(token).unwrap_or(&0.0))
         .sum::<f64>();
-    let left_norm = left_counts.values().map(|value| value * value).sum::<f64>().sqrt();
-    let right_norm = right_counts
-        .values()
-        .map(|value| value * value)
-        .sum::<f64>()
-        .sqrt();
+    let left_norm = left.values().map(|value| value * value).sum::<f64>().sqrt();
+    let right_norm = right.values().map(|value| value * value).sum::<f64>().sqrt();
     if left_norm == 0.0 || right_norm == 0.0 {
         0.0
     } else {
@@ -249,7 +346,57 @@ fn token_cosine(left: &str, right: &str) -> f64 {
     }
 }
 
-pub fn score_name_exact_normalized(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
+fn token_counts(document: &str) -> BTreeMap<String, f64> {
+    let mut counts = BTreeMap::<String, f64>::new();
+    for token in tokenize(document) {
+        *counts.entry(token).or_insert(0.0) += 1.0;
+    }
+    counts
+}
+
+fn prepare_text(normalized: String) -> PreparedText {
+    PreparedText {
+        trigram_set: trigram_set(&normalized),
+        token_set: tokenize(&normalized).into_iter().collect(),
+        token_counts: token_counts(&normalized),
+        normalized,
+    }
+}
+
+pub fn prepare_sample(sample: BenchmarkSample) -> PreparedSample {
+    PreparedSample {
+        name_prefix: if sample.name_norm.is_empty() {
+            None
+        } else {
+            Some(sample.name_norm.chars().take(8).collect())
+        },
+        name_text: prepare_text(sample.name_norm.clone()),
+        metadata_text: prepare_text(normalize_text(&sample.metadata_doc)),
+        raw: sample,
+    }
+}
+
+pub fn prepare_rows(rows: Vec<FeatureRow>) -> Vec<PreparedFeatureRow> {
+    rows.into_iter()
+        .map(|row| PreparedFeatureRow {
+            name_text: prepare_text(row.name_norm.clone()),
+            metadata_text: prepare_text(normalize_text(&row.metadata_doc)),
+            raw: row,
+        })
+        .collect()
+}
+
+pub fn score_name_exact_normalized(sample: &PreparedSample, row: &PreparedFeatureRow) -> f64 {
+    if sample.raw.name_norm.is_empty() || row.raw.name_norm.is_empty() {
+        0.0
+    } else if sample.raw.name_norm == row.raw.name_norm {
+        100.0
+    } else {
+        0.0
+    }
+}
+
+pub fn score_name_exact_normalized_raw(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
     if sample.name_norm.is_empty() || row.name_norm.is_empty() {
         0.0
     } else if sample.name_norm == row.name_norm {
@@ -259,7 +406,15 @@ pub fn score_name_exact_normalized(sample: &BenchmarkSample, row: &FeatureRow) -
     }
 }
 
-pub fn score_name_jaro_winkler(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
+pub fn score_name_jaro_winkler(sample: &PreparedSample, row: &PreparedFeatureRow) -> f64 {
+    if sample.name_text.normalized.is_empty() || row.name_text.normalized.is_empty() {
+        0.0
+    } else {
+        jaro_winkler(&sample.name_text.normalized, &row.name_text.normalized) * 100.0
+    }
+}
+
+pub fn score_name_jaro_winkler_raw(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
     if sample.name_norm.is_empty() || row.name_norm.is_empty() {
         0.0
     } else {
@@ -267,7 +422,18 @@ pub fn score_name_jaro_winkler(sample: &BenchmarkSample, row: &FeatureRow) -> f6
     }
 }
 
-pub fn score_name_normalized_levenshtein(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
+pub fn score_name_normalized_levenshtein(
+    sample: &PreparedSample,
+    row: &PreparedFeatureRow,
+) -> f64 {
+    if sample.name_text.normalized.is_empty() || row.name_text.normalized.is_empty() {
+        0.0
+    } else {
+        normalized_levenshtein(&sample.name_text.normalized, &row.name_text.normalized) * 100.0
+    }
+}
+
+pub fn score_name_normalized_levenshtein_raw(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
     if sample.name_norm.is_empty() || row.name_norm.is_empty() {
         0.0
     } else {
@@ -275,19 +441,42 @@ pub fn score_name_normalized_levenshtein(sample: &BenchmarkSample, row: &Feature
     }
 }
 
-pub fn score_name_trigram_jaccard(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
+pub fn score_name_trigram_jaccard(sample: &PreparedSample, row: &PreparedFeatureRow) -> f64 {
+    trigram_jaccard_from_sets(&sample.name_text.trigram_set, &row.name_text.trigram_set) * 100.0
+}
+
+pub fn score_name_trigram_jaccard_raw(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
     trigram_jaccard(&sample.name_norm, &row.name_norm) * 100.0
 }
 
-pub fn score_name_current_hybrid(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
+pub fn score_name_current_hybrid(sample: &PreparedSample, row: &PreparedFeatureRow) -> f64 {
+    score_name_pair(&sample.raw.name, &row.raw.name)
+}
+
+pub fn score_name_current_hybrid_raw(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
     score_name_pair(&sample.name, &row.name)
 }
 
-pub fn score_metadata_token_jaccard(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
+pub fn score_metadata_token_jaccard(sample: &PreparedSample, row: &PreparedFeatureRow) -> f64 {
+    token_jaccard_from_sets(&sample.metadata_text.token_set, &row.metadata_text.token_set)
+}
+
+pub fn score_metadata_token_jaccard_raw(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
     token_jaccard(&sample.metadata_doc, &row.metadata_doc)
 }
 
-pub fn score_metadata_jaro_winkler_doc(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
+pub fn score_metadata_jaro_winkler_doc(
+    sample: &PreparedSample,
+    row: &PreparedFeatureRow,
+) -> f64 {
+    if sample.metadata_text.normalized.is_empty() || row.metadata_text.normalized.is_empty() {
+        0.0
+    } else {
+        jaro_winkler(&sample.metadata_text.normalized, &row.metadata_text.normalized)
+    }
+}
+
+pub fn score_metadata_jaro_winkler_doc_raw(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
     let left = normalize_text(&sample.metadata_doc);
     let right = normalize_text(&row.metadata_doc);
     if left.is_empty() || right.is_empty() {
@@ -297,19 +486,79 @@ pub fn score_metadata_jaro_winkler_doc(sample: &BenchmarkSample, row: &FeatureRo
     }
 }
 
-pub fn score_metadata_trigram_jaccard_doc(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
+pub fn score_metadata_trigram_jaccard_doc(
+    sample: &PreparedSample,
+    row: &PreparedFeatureRow,
+) -> f64 {
+    trigram_jaccard_from_sets(
+        &sample.metadata_text.trigram_set,
+        &row.metadata_text.trigram_set,
+    )
+}
+
+pub fn score_metadata_trigram_jaccard_doc_raw(
+    sample: &BenchmarkSample,
+    row: &FeatureRow,
+) -> f64 {
     trigram_jaccard(&sample.metadata_doc, &row.metadata_doc)
 }
 
-pub fn score_metadata_token_cosine(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
+pub fn score_metadata_token_cosine(sample: &PreparedSample, row: &PreparedFeatureRow) -> f64 {
+    token_cosine_from_counts(&sample.metadata_text.token_counts, &row.metadata_text.token_counts)
+}
+
+pub fn score_metadata_token_cosine_raw(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
     token_cosine(&sample.metadata_doc, &row.metadata_doc)
 }
 
-pub fn score_metadata_current_hybrid(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
+pub fn score_metadata_current_hybrid(sample: &PreparedSample, row: &PreparedFeatureRow) -> f64 {
+    score_metadata_document_pair(&sample.raw.metadata_doc, &row.raw.metadata_doc)
+}
+
+pub fn score_metadata_current_hybrid_raw(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
     score_metadata_document_pair(&sample.metadata_doc, &row.metadata_doc)
 }
 
 pub fn sort_algorithm_candidates(
+    rows: &[PreparedFeatureRow],
+    scored: &[f64],
+    top_k: usize,
+) -> (usize, Vec<CandidateScore>) {
+    let mut candidates: Vec<(usize, f64)> = scored
+        .iter()
+        .enumerate()
+        .filter_map(|(index, score)| (*score > 0.0).then_some((index, *score)))
+        .collect();
+    candidates.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| {
+                rows[left.0]
+                    .raw
+                    .contract_address
+                    .cmp(&rows[right.0].raw.contract_address)
+            })
+            .then_with(|| rows[left.0].raw.token_id.cmp(&rows[right.0].raw.token_id))
+    });
+    let total = candidates.len();
+    let top_candidates = candidates
+        .into_iter()
+        .take(top_k)
+        .enumerate()
+        .map(|(rank, (index, score))| CandidateScore {
+            rank: rank + 1,
+            contract_address: rows[index].raw.contract_address.clone(),
+            token_id: rows[index].raw.token_id.clone(),
+            name: rows[index].raw.name.clone(),
+            score,
+        })
+        .collect();
+    (total, top_candidates)
+}
+
+pub fn sort_algorithm_candidates_raw(
     rows: &[FeatureRow],
     scored: &[f64],
     top_k: usize,
@@ -344,6 +593,14 @@ pub fn sort_algorithm_candidates(
 }
 
 pub fn score_rows_parallel(
+    sample: &PreparedSample,
+    rows: &[PreparedFeatureRow],
+    scorer: fn(&PreparedSample, &PreparedFeatureRow) -> f64,
+) -> Vec<f64> {
+    rows.par_iter().map(|row| scorer(sample, row)).collect()
+}
+
+pub fn score_rows_parallel_raw(
     sample: &BenchmarkSample,
     rows: &[FeatureRow],
     scorer: fn(&BenchmarkSample, &FeatureRow) -> f64,
@@ -351,16 +608,19 @@ pub fn score_rows_parallel(
     rows.par_iter().map(|row| scorer(sample, row)).collect()
 }
 
-pub fn build_reference_candidates(
-    sample: &BenchmarkSample,
-    rows: &[FeatureRow],
+pub fn build_reference_candidates_from_scores(
+    rows: &[PreparedFeatureRow],
+    name_scores: &[f64],
+    metadata_scores: &[f64],
     top_k: usize,
 ) -> (usize, Vec<ReferenceCandidateScore>) {
-    let mut candidates: Vec<(&FeatureRow, f64, f64, f64, Vec<String>)> = rows
-        .par_iter()
-        .filter_map(|row| {
-            let name_score = score_name_current_hybrid(sample, row);
-            let metadata_score = score_metadata_current_hybrid(sample, row);
+    debug_assert_eq!(rows.len(), name_scores.len());
+    debug_assert_eq!(rows.len(), metadata_scores.len());
+    let mut candidates: Vec<(&PreparedFeatureRow, f64, f64, f64, Vec<String>)> = rows
+        .iter()
+        .zip(name_scores.iter().copied())
+        .zip(metadata_scores.iter().copied())
+        .filter_map(|((row, name_score), metadata_score)| {
             let mut reasons = Vec::new();
             if name_score >= DEFAULT_NAME_THRESHOLD {
                 reasons.push("name_match".to_string());
@@ -375,6 +635,69 @@ pub fn build_reference_candidates(
             Some((row, combined_score, name_score, metadata_score, reasons))
         })
         .collect();
+    candidates.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| left.0.raw.contract_address.cmp(&right.0.raw.contract_address))
+            .then_with(|| left.0.raw.token_id.cmp(&right.0.raw.token_id))
+    });
+    let total = candidates.len();
+    let top_candidates = candidates
+        .into_iter()
+        .take(top_k)
+        .enumerate()
+        .map(
+            |(rank, (row, combined_score, name_score, metadata_score, match_reasons))| {
+                ReferenceCandidateScore {
+                    rank: rank + 1,
+                    contract_address: row.raw.contract_address.clone(),
+                    token_id: row.raw.token_id.clone(),
+                    name: row.raw.name.clone(),
+                    combined_score,
+                    name_score,
+                    metadata_score,
+                    match_reasons,
+                }
+            },
+        )
+        .collect();
+    (total, top_candidates)
+}
+
+pub fn build_reference_candidates(
+    sample: &PreparedSample,
+    rows: &[PreparedFeatureRow],
+    top_k: usize,
+) -> (usize, Vec<ReferenceCandidateScore>) {
+    let name_scores = score_rows_parallel(sample, rows, score_name_current_hybrid);
+    let metadata_scores = score_rows_parallel(sample, rows, score_metadata_current_hybrid);
+    build_reference_candidates_from_scores(rows, &name_scores, &metadata_scores, top_k)
+}
+
+pub fn build_reference_candidates_raw(
+    sample: &BenchmarkSample,
+    rows: &[FeatureRow],
+    top_k: usize,
+) -> (usize, Vec<ReferenceCandidateScore>) {
+    let mut candidates = Vec::new();
+    for row in rows {
+        let name_score = score_name_current_hybrid_raw(sample, row);
+        let metadata_score = score_metadata_current_hybrid_raw(sample, row);
+        let mut reasons = Vec::new();
+        if name_score >= DEFAULT_NAME_THRESHOLD {
+            reasons.push("name_match".to_string());
+        }
+        if metadata_score >= DEFAULT_METADATA_THRESHOLD {
+            reasons.push("metadata_match".to_string());
+        }
+        if reasons.is_empty() {
+            continue;
+        }
+        let combined_score = (name_score / 100.0).max(metadata_score);
+        candidates.push((row, combined_score, name_score, metadata_score, reasons));
+    }
     candidates.sort_by(|left, right| {
         right
             .1
@@ -438,7 +761,7 @@ mod tests {
     use super::*;
     use crate::store::FeatureRow;
 
-    fn sample() -> BenchmarkSample {
+    fn sample_raw() -> BenchmarkSample {
         BenchmarkSample {
             chain: "ethereum".into(),
             contract_address: String::new(),
@@ -451,7 +774,11 @@ mod tests {
         }
     }
 
-    fn row() -> FeatureRow {
+    fn sample() -> PreparedSample {
+        prepare_sample(sample_raw())
+    }
+
+    fn row_raw() -> FeatureRow {
         FeatureRow {
             contract_address: "0xdup".into(),
             token_id: "1".into(),
@@ -462,7 +789,11 @@ mod tests {
         }
     }
 
-    fn second_row() -> FeatureRow {
+    fn row() -> PreparedFeatureRow {
+        prepare_rows(vec![row_raw()]).pop().unwrap()
+    }
+
+    fn second_row_raw() -> FeatureRow {
         FeatureRow {
             contract_address: "0xdup2".into(),
             token_id: "2".into(),
@@ -473,13 +804,17 @@ mod tests {
         }
     }
 
+    fn second_row() -> PreparedFeatureRow {
+        prepare_rows(vec![second_row_raw()]).pop().unwrap()
+    }
+
     #[test]
     fn current_name_hybrid_matches_existing_logic() {
         let sample = sample();
         let row = row();
         assert_eq!(
             score_name_current_hybrid(&sample, &row),
-            score_name_pair(&sample.name, &row.name)
+            score_name_pair(&sample.raw.name, &row.raw.name)
         );
     }
 
@@ -489,7 +824,7 @@ mod tests {
         let row = row();
         assert_eq!(
             score_metadata_current_hybrid(&sample, &row),
-            score_metadata_document_pair(&sample.metadata_doc, &row.metadata_doc)
+            score_metadata_document_pair(&sample.raw.metadata_doc, &row.raw.metadata_doc)
         );
     }
 
@@ -551,8 +886,8 @@ mod tests {
                 .1
                 .partial_cmp(&left.1)
                 .unwrap_or(Ordering::Equal)
-                .then_with(|| left.0.contract_address.cmp(&right.0.contract_address))
-                .then_with(|| left.0.token_id.cmp(&right.0.token_id))
+                .then_with(|| left.0.raw.contract_address.cmp(&right.0.raw.contract_address))
+                .then_with(|| left.0.raw.token_id.cmp(&right.0.raw.token_id))
         });
         let expected = (
             expected_candidates.len(),
@@ -563,9 +898,9 @@ mod tests {
                     |(rank, (row, combined_score, name_score, metadata_score, match_reasons))| {
                         ReferenceCandidateScore {
                             rank: rank + 1,
-                            contract_address: row.contract_address.clone(),
-                            token_id: row.token_id.clone(),
-                            name: row.name.clone(),
+                            contract_address: row.raw.contract_address.clone(),
+                            token_id: row.raw.token_id.clone(),
+                            name: row.raw.name.clone(),
                             combined_score,
                             name_score,
                             metadata_score,
@@ -577,5 +912,43 @@ mod tests {
         );
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn prepared_scoring_matches_unprepared_scoring() {
+        let sample_raw = sample_raw();
+        let row_raw = row_raw();
+        let sample = prepare_sample(sample_raw.clone());
+        let row = prepare_rows(vec![row_raw.clone()]).pop().unwrap();
+
+        assert_eq!(
+            score_name_jaro_winkler(&sample, &row),
+            jaro_winkler(&sample_raw.name_norm, &row_raw.name_norm) * 100.0
+        );
+        assert_eq!(
+            score_name_normalized_levenshtein(&sample, &row),
+            normalized_levenshtein(&sample_raw.name_norm, &row_raw.name_norm) * 100.0
+        );
+        assert_eq!(
+            score_metadata_token_jaccard(&sample, &row),
+            token_jaccard(&sample_raw.metadata_doc, &row_raw.metadata_doc)
+        );
+        assert_eq!(
+            score_metadata_token_cosine(&sample, &row),
+            token_cosine(&sample_raw.metadata_doc, &row_raw.metadata_doc)
+        );
+    }
+
+    #[test]
+    fn reference_candidates_from_precomputed_scores_match_direct_build() {
+        let sample = sample();
+        let rows = vec![row(), second_row()];
+        let name_scores = score_rows_parallel(&sample, &rows, score_name_current_hybrid);
+        let metadata_scores = score_rows_parallel(&sample, &rows, score_metadata_current_hybrid);
+
+        assert_eq!(
+            build_reference_candidates(&sample, &rows, 10),
+            build_reference_candidates_from_scores(&rows, &name_scores, &metadata_scores, 10)
+        );
     }
 }

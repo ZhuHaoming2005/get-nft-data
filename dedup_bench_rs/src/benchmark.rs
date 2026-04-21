@@ -5,8 +5,8 @@ use std::time::Instant;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
 use crate::algorithms::{
-    all_algorithms, build_reference_candidates, score_rows_parallel, sort_algorithm_candidates,
-    AlgorithmReport, ReferenceReport,
+    build_reference_candidates_raw, score_rows_parallel_raw, sort_algorithm_candidates_raw,
+    timing_algorithms, AlgorithmReport, CandidateScore, ReferenceReport,
 };
 use crate::error::BenchError;
 use crate::report::BenchmarkReport;
@@ -43,44 +43,62 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
     let algorithm_thread_pool = algorithm_thread_pool(config.algorithm_threads)?;
 
     let repeat = config.repeat.max(1);
-    let mut algorithm_reports = Vec::new();
-    for algorithm in all_algorithms() {
+    let algorithms = timing_algorithms();
+    for algorithm in &algorithms {
         algorithm_thread_pool.install(|| {
-            let scores = score_rows_parallel(&sample, &recall_rows, algorithm.scorer);
-            let _ = sort_algorithm_candidates(&recall_rows, &scores, config.top_k);
+            let scores = score_rows_parallel_raw(&sample, &recall_rows, algorithm.scorer);
+            let _ = sort_algorithm_candidates_raw(&recall_rows, &scores, config.top_k);
         });
-        let mut runs_ms = Vec::new();
-        let mut last_result = None;
-        for _ in 0..repeat {
+    }
+
+    let mut algorithm_runs_ms: Vec<Vec<f64>> = (0..algorithms.len())
+        .map(|_| Vec::with_capacity(repeat))
+        .collect();
+    let mut algorithm_results: Vec<Option<(usize, Vec<CandidateScore>)>> =
+        (0..algorithms.len()).map(|_| None).collect();
+    for repeat_index in 0..repeat {
+        for offset in 0..algorithms.len() {
+            let algorithm_index = (repeat_index + offset) % algorithms.len();
+            let algorithm = algorithms[algorithm_index];
             let started = Instant::now();
             let result = algorithm_thread_pool.install(|| {
-                let scores = score_rows_parallel(&sample, &recall_rows, algorithm.scorer);
-                sort_algorithm_candidates(&recall_rows, &scores, config.top_k)
+                let scores = score_rows_parallel_raw(&sample, &recall_rows, algorithm.scorer);
+                sort_algorithm_candidates_raw(&recall_rows, &scores, config.top_k)
             });
-            runs_ms.push(started.elapsed().as_secs_f64() * 1000.0);
-            last_result = Some(result);
+            algorithm_runs_ms[algorithm_index]
+                .push(started.elapsed().as_secs_f64() * 1000.0);
+            algorithm_results[algorithm_index] = Some(result);
         }
-        let (candidate_count, top_candidates) = last_result.unwrap_or((0, Vec::new()));
-        algorithm_reports.push(AlgorithmReport {
+    }
+    let algorithm_reports = algorithms
+        .iter()
+        .enumerate()
+        .map(|(index, algorithm)| {
+            let runs_ms = std::mem::take(&mut algorithm_runs_ms[index]);
+            let (candidate_count, top_candidates) =
+                algorithm_results[index].take().unwrap_or((0, Vec::new()));
+            AlgorithmReport {
             algorithm_id: algorithm.id.to_string(),
             field: algorithm.field,
             repeat,
+            runs_ms: runs_ms.clone(),
             avg_ms: runs_ms.iter().sum::<f64>() / runs_ms.len() as f64,
             min_ms: runs_ms.iter().copied().fold(f64::INFINITY, f64::min),
             candidate_count,
             top_candidates,
-        });
-    }
+            }
+        })
+        .collect();
 
     algorithm_thread_pool.install(|| {
-        let _ = build_reference_candidates(&sample, &recall_rows, config.top_k);
+        let _ = build_reference_candidates_raw(&sample, &recall_rows, config.top_k);
     });
     let mut reference_runs_ms = Vec::new();
     let mut reference_result = None;
     for _ in 0..repeat {
         let started = Instant::now();
         let result =
-            algorithm_thread_pool.install(|| build_reference_candidates(&sample, &recall_rows, config.top_k));
+            algorithm_thread_pool.install(|| build_reference_candidates_raw(&sample, &recall_rows, config.top_k));
         reference_runs_ms.push(started.elapsed().as_secs_f64() * 1000.0);
         reference_result = Some(result);
     }
@@ -97,6 +115,7 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
             algorithm_id: "current_name_metadata_reference".to_string(),
             field: crate::algorithms::AlgorithmField::Reference,
             repeat,
+            runs_ms: reference_runs_ms.clone(),
             avg_ms: reference_runs_ms.iter().sum::<f64>() / reference_runs_ms.len() as f64,
             min_ms: reference_runs_ms
                 .iter()

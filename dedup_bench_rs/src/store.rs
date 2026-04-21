@@ -226,6 +226,72 @@ fn table_columns(conn: &Connection, table_name: &str) -> Result<Vec<String>, Ben
     Ok(columns)
 }
 
+fn sql_string_literal(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+fn build_table_recall_predicate(sample: &BenchmarkSample, columns: &[String]) -> Option<String> {
+    let has_column = |name: &str| columns.iter().any(|column| column == name);
+    let mut clauses = Vec::new();
+
+    if let Some(prefix) = sample.name_prefix() {
+        if has_column("name_norm") {
+            let escaped_prefix = sql_string_literal(&prefix.to_lowercase());
+            clauses.push(format!(
+                "coalesce(lower(cast(name_norm as varchar)), '') LIKE '{escaped_prefix}%'"
+            ));
+            if has_column("name") {
+                clauses.push(
+                    "(coalesce(cast(name_norm as varchar), '') = '' AND coalesce(cast(name as varchar), '') <> '')"
+                        .to_string(),
+                );
+            }
+        } else if has_column("name") {
+            clauses.push("coalesce(cast(name as varchar), '') <> ''".to_string());
+        }
+    }
+
+    if !sample.metadata_keywords.is_empty() {
+        if has_column("metadata_doc") {
+            let keyword_predicate = sample
+                .metadata_keywords
+                .iter()
+                .map(|keyword| {
+                    let escaped_keyword = sql_string_literal(&keyword.to_lowercase());
+                    format!(
+                        "regexp_matches(lower(cast(metadata_doc as varchar)), '(^|[^[:alnum:]_]){escaped_keyword}([^[:alnum:]_]|$)')"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            if !keyword_predicate.is_empty() {
+                clauses.push(format!("({keyword_predicate})"));
+            }
+        }
+        if has_column("metadata_json") {
+            let missing_doc = if has_column("metadata_doc") {
+                "coalesce(cast(metadata_doc as varchar), '') = ''"
+            } else {
+                "TRUE"
+            };
+            let missing_keywords = if has_column("metadata_keywords_arr") {
+                "coalesce(cast(metadata_keywords_arr as varchar), '') = ''"
+            } else {
+                "TRUE"
+            };
+            clauses.push(format!(
+                "(({missing_doc}) OR ({missing_keywords})) AND coalesce(cast(metadata_json as varchar), '') <> ''"
+            ));
+        }
+    }
+
+    if clauses.is_empty() {
+        None
+    } else {
+        Some(format!("({})", clauses.join(" OR ")))
+    }
+}
+
 fn parquet_columns(conn: &Connection, parquet_path: &Path) -> Result<Vec<String>, BenchError> {
     let query = format!(
         "DESCRIBE SELECT * FROM read_parquet('{}')",
@@ -363,6 +429,9 @@ fn read_rows_from_table(
     } else {
         "''"
     };
+    let recall_predicate = build_table_recall_predicate(sample, &columns)
+        .map(|predicate| format!(" AND {predicate}"))
+        .unwrap_or_default();
     let query = format!(
         "
         SELECT
@@ -375,6 +444,7 @@ fn read_rows_from_table(
             {keywords_expr} AS metadata_keywords_raw
         FROM nft_features
         WHERE lower(chain) = lower(?)
+        {recall_predicate}
         "
     );
     collect_recall_rows_from_query(conn, &query, params![sample.chain.as_str()], sample)
@@ -582,5 +652,33 @@ mod tests {
         assert!(config.memory_limit_mb >= 512);
         assert!((1..=8).contains(&config.threads));
         assert!(config.temp_directory.ends_with(".duckdb_tmp"));
+    }
+
+    #[test]
+    fn table_recall_predicate_pushes_down_name_and_metadata_filters() {
+        let sample = BenchmarkSample {
+            chain: "ethereum".into(),
+            contract_address: String::new(),
+            token_id: String::new(),
+            name: "Azuki #1".into(),
+            name_norm: derive_name_norm("Azuki #1"),
+            metadata_json: "{\"description\":\"rare dragon gold\"}".into(),
+            metadata_doc: "rare dragon gold".into(),
+            metadata_keywords: vec!["rare".into(), "dragon".into(), "gold".into()],
+        };
+        let columns = vec![
+            "chain".to_string(),
+            "name".to_string(),
+            "name_norm".to_string(),
+            "metadata_json".to_string(),
+            "metadata_doc".to_string(),
+            "metadata_keywords_arr".to_string(),
+        ];
+
+        let predicate = build_table_recall_predicate(&sample, &columns).unwrap();
+
+        assert!(predicate.contains("name_norm"));
+        assert!(predicate.contains("regexp_matches"));
+        assert!(predicate.contains("metadata_json"));
     }
 }

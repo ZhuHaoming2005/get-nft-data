@@ -34,6 +34,8 @@
 - 计时口径：
   - 算法层并行线程数默认是 `30`，可通过参数自定义
   - 每个算法和 reference 都会先对同一批 `recall_rows` 预热一次，再进入正式计时
+  - reference 独立计时，不复用其他算法的 hybrid 分数
+  - 正式计时时会轮转算法执行顺序，降低固定顺序带来的缓存偏差
 
 ## 运行方式
 
@@ -177,6 +179,7 @@ cargo run -- run \
 - `algorithm_id`
 - `field`
 - `repeat`
+- `runs_ms`
 - `avg_ms`
 - `min_ms`
 - `candidate_count`

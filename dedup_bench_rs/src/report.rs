@@ -38,8 +38,11 @@ impl BenchmarkReport {
 
         out.push_str("## Current Name/Metadata Reference\n\n");
         out.push_str(&format!(
-            "- candidate_count: `{}`\n- avg_ms: `{:.3}`\n- min_ms: `{:.3}`\n\n",
-            self.reference.candidate_count, self.reference.avg_ms, self.reference.min_ms
+            "- candidate_count: `{}`\n- avg_ms: `{:.3}`\n- min_ms: `{:.3}`\n- runs_ms: `{:?}`\n\n",
+            self.reference.candidate_count,
+            self.reference.avg_ms,
+            self.reference.min_ms,
+            self.reference.runs_ms
         ));
         for candidate in &self.reference.top_candidates {
             out.push_str(&format!(
@@ -57,12 +60,13 @@ impl BenchmarkReport {
         out.push_str("## Algorithms\n\n");
         for algorithm in &self.algorithms {
             out.push_str(&format!(
-                "### {}\n\n- field: `{:?}`\n- candidate_count: `{}`\n- avg_ms: `{:.3}`\n- min_ms: `{:.3}`\n\n",
+                "### {}\n\n- field: `{:?}`\n- candidate_count: `{}`\n- avg_ms: `{:.3}`\n- min_ms: `{:.3}`\n- runs_ms: `{:?}`\n\n",
                 algorithm.algorithm_id,
                 algorithm.field,
                 algorithm.candidate_count,
                 algorithm.avg_ms,
-                algorithm.min_ms
+                algorithm.min_ms,
+                algorithm.runs_ms
             ));
             for candidate in &algorithm.top_candidates {
                 out.push_str(&format!(
