@@ -45,7 +45,7 @@ cargo run -- run `
   --metadata-file .\examples\metadata.json `
   --feature-db ../output/top_contract_analysis/features.duckdb `
   --feature-parquet ../output/top_contract_analysis/ethereum.parquet `
-  --output .\result\azuki_bench.json `
+  --output .\result\result.json `
   --top-k 50 `
   --repeat 5
 ```
