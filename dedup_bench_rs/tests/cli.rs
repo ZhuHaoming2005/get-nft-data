@@ -22,7 +22,9 @@ fn cli_writes_json_and_markdown_outputs() {
             metadata_keywords_arr VARCHAR
         );
         INSERT INTO nft_features VALUES
-        ('ethereum', '0xdup', '1', 'Azuki Mirror #1', '{\"description\":\"rare dragon gold\"}', 'rare dragon gold', 'azuki mirror', '[\"rare\",\"dragon\",\"gold\"]');
+        ('ethereum', '0xseed', '9', 'Excluded Seed #9', '{\"description\":\"rare dragon gold\"}', 'rare dragon gold', 'azuki', '[\"rare\",\"dragon\",\"gold\"]'),
+        ('ethereum', '0xname', '1', 'Azuki #2', '{\"description\":\"nothing here\"}', 'nothing here', 'azuki', '[\"nothing\"]'),
+        ('ethereum', '0xmeta', '2', 'Totally Different', '{\"description\":\"rare dragon gold\"}', 'rare dragon gold', 'totally different', '[\"rare\",\"dragon\",\"gold\"]');
         ",
     )
     .unwrap();
@@ -59,8 +61,16 @@ fn cli_writes_json_and_markdown_outputs() {
     let json_output = fs::read_to_string(&output_path).unwrap();
     let markdown_output = fs::read_to_string(output_path.with_extension("md")).unwrap();
     assert!(json_output.contains("\"current_name_metadata_reference\""));
+    assert!(json_output.contains("\"name_algorithms\""));
+    assert!(json_output.contains("\"metadata_algorithms\""));
     assert!(json_output.contains("\"duplicate_count\""));
+    assert!(json_output.contains("\"metadata_doc\": \"rare dragon gold\""));
+    assert!(!json_output.contains("Excluded Seed #9"));
     assert!(markdown_output.contains("# NFT Name/Metadata Dedup Benchmark"));
+    assert!(markdown_output.contains("## Name Algorithms"));
+    assert!(markdown_output.contains("## Metadata Algorithms"));
     assert!(markdown_output.contains("duplicate_count"));
-    assert!(markdown_output.contains("Azuki Mirror #1"));
+    assert!(markdown_output.contains("Azuki #2"));
+    assert!(markdown_output.contains("metadata_doc=`rare dragon gold`"));
+    assert!(!markdown_output.contains("Excluded Seed #9"));
 }

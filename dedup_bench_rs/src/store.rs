@@ -462,8 +462,7 @@ where
     let sample_name_prefix = sample.name_prefix();
     let sample_keyword_set: HashSet<&str> =
         sample.metadata_keywords.iter().map(String::as_str).collect();
-    let sample_has_identity =
-        !sample.contract_address.is_empty() && !sample.token_id.is_empty();
+    let sample_has_contract = !sample.contract_address.is_empty();
 
     let mut stmt = conn.prepare(query)?;
     let rows = stmt.query_map(params, |row| {
@@ -489,9 +488,8 @@ where
             keywords_raw,
         ) = row?;
 
-        if sample_has_identity
+        if sample_has_contract
             && sample.contract_address.eq_ignore_ascii_case(&contract_address)
-            && sample.token_id == token_id
         {
             continue;
         }
@@ -680,5 +678,48 @@ mod tests {
         assert!(predicate.contains("name_norm"));
         assert!(predicate.contains("regexp_matches"));
         assert!(predicate.contains("metadata_json"));
+    }
+
+    #[test]
+    fn excludes_all_rows_from_sample_contract() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("bench.duckdb");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE nft_features (
+                chain VARCHAR,
+                contract_address VARCHAR,
+                token_id VARCHAR,
+                name VARCHAR,
+                metadata_json VARCHAR,
+                metadata_doc VARCHAR,
+                name_norm VARCHAR,
+                metadata_keywords_arr VARCHAR
+            );
+            INSERT INTO nft_features VALUES
+            ('ethereum', '0xseed', '2', 'Azuki #2', '{\"description\":\"rare dragon gold\"}', 'rare dragon gold', 'azuki', '[\"rare\",\"dragon\",\"gold\"]'),
+            ('ethereum', '0xdup', '3', 'Azuki #3', '{\"description\":\"rare dragon gold\"}', 'rare dragon gold', 'azuki', '[\"rare\",\"dragon\",\"gold\"]');
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = FeatureStore::new(db_path, None);
+        let sample = BenchmarkSample {
+            chain: "ethereum".into(),
+            contract_address: "0xseed".into(),
+            token_id: "1".into(),
+            name: "Azuki #1".into(),
+            name_norm: derive_name_norm("Azuki #1"),
+            metadata_json: "{\"description\":\"rare dragon gold\"}".into(),
+            metadata_doc: "rare dragon gold".into(),
+            metadata_keywords: vec!["rare".into(), "dragon".into(), "gold".into()],
+        };
+
+        let (_, rows) = store.load_recall_rows(&sample).unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].contract_address, "0xdup");
     }
 }

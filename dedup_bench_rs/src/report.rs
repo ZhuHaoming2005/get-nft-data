@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::algorithms::{AlgorithmReport, ReferenceReport};
+use crate::algorithms::{MetadataAlgorithmReport, NameAlgorithmReport, ReferenceReport};
 use crate::sample::BenchmarkSample;
 use crate::store::SourceInfo;
 
@@ -12,7 +12,8 @@ pub struct BenchmarkReport {
     pub recall_elapsed_ms: f64,
     pub recall_candidate_count: usize,
     pub reference: ReferenceReport,
-    pub algorithms: Vec<AlgorithmReport>,
+    pub name_algorithms: Vec<NameAlgorithmReport>,
+    pub metadata_algorithms: Vec<MetadataAlgorithmReport>,
 }
 
 impl BenchmarkReport {
@@ -58,8 +59,8 @@ impl BenchmarkReport {
         }
         out.push('\n');
 
-        out.push_str("## Algorithms\n\n");
-        for algorithm in &self.algorithms {
+        out.push_str("## Name Algorithms\n\n");
+        for algorithm in &self.name_algorithms {
             out.push_str(&format!(
                 "### {}\n\n- field: `{:?}`\n- decision_rule: `{}`\n- duplicate_count: `{}`\n- avg_ms: `{:.3}`\n- min_ms: `{:.3}`\n- runs_ms: `{:?}`\n\n",
                 algorithm.algorithm_id,
@@ -72,8 +73,38 @@ impl BenchmarkReport {
             ));
             for candidate in &algorithm.duplicates {
                 out.push_str(&format!(
-                    "1. `{}` / `{}` score=`{:.4}` name=`{}`\n",
-                    candidate.contract_address, candidate.token_id, candidate.score, candidate.name
+                    "1. contract=`{}` max_score=`{:.4}` duplicate_token_count=`{}`\n",
+                    candidate.contract_address, candidate.max_score, candidate.duplicate_token_count
+                ));
+                for token in &candidate.tokens {
+                    out.push_str(&format!(
+                        "   - token_id=`{}` score=`{:.4}` name=`{}`\n",
+                        token.token_id, token.score, token.name
+                    ));
+                }
+            }
+            out.push('\n');
+        }
+
+        out.push_str("## Metadata Algorithms\n\n");
+        for algorithm in &self.metadata_algorithms {
+            out.push_str(&format!(
+                "### {}\n\n- field: `{:?}`\n- decision_rule: `{}`\n- duplicate_count: `{}`\n- avg_ms: `{:.3}`\n- min_ms: `{:.3}`\n- runs_ms: `{:?}`\n\n",
+                algorithm.algorithm_id,
+                algorithm.field,
+                algorithm.decision_rule,
+                algorithm.duplicate_count,
+                algorithm.avg_ms,
+                algorithm.min_ms,
+                algorithm.runs_ms
+            ));
+            for candidate in &algorithm.duplicates {
+                out.push_str(&format!(
+                    "1. `{}` / `{}` score=`{:.4}` metadata_doc=`{}`\n",
+                    candidate.contract_address,
+                    candidate.token_id,
+                    candidate.score,
+                    candidate.metadata_doc
                 ));
             }
             out.push('\n');

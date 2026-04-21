@@ -38,6 +38,29 @@ pub struct CandidateScore {
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct NameDuplicateToken {
+    pub token_id: String,
+    pub name: String,
+    pub score: f64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct NameContractDuplicate {
+    pub contract_address: String,
+    pub max_score: f64,
+    pub duplicate_token_count: usize,
+    pub tokens: Vec<NameDuplicateToken>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct MetadataDuplicate {
+    pub contract_address: String,
+    pub token_id: String,
+    pub metadata_doc: String,
+    pub score: f64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct ReferenceCandidateScore {
     pub rank: usize,
     pub contract_address: String,
@@ -60,6 +83,32 @@ pub struct AlgorithmReport {
     pub min_ms: f64,
     pub duplicate_count: usize,
     pub duplicates: Vec<CandidateScore>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct NameAlgorithmReport {
+    pub algorithm_id: String,
+    pub field: AlgorithmField,
+    pub decision_rule: String,
+    pub repeat: usize,
+    pub runs_ms: Vec<f64>,
+    pub avg_ms: f64,
+    pub min_ms: f64,
+    pub duplicate_count: usize,
+    pub duplicates: Vec<NameContractDuplicate>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct MetadataAlgorithmReport {
+    pub algorithm_id: String,
+    pub field: AlgorithmField,
+    pub decision_rule: String,
+    pub repeat: usize,
+    pub runs_ms: Vec<f64>,
+    pub avg_ms: f64,
+    pub min_ms: f64,
+    pub duplicate_count: usize,
+    pub duplicates: Vec<MetadataDuplicate>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -672,6 +721,83 @@ pub fn build_algorithm_duplicates_raw_from_scores(
     Ok((total, duplicates))
 }
 
+pub fn group_name_duplicates_by_contract(
+    duplicates: Vec<CandidateScore>,
+) -> Vec<NameContractDuplicate> {
+    let mut grouped = BTreeMap::<String, Vec<CandidateScore>>::new();
+    for duplicate in duplicates {
+        grouped
+            .entry(duplicate.contract_address.clone())
+            .or_default()
+            .push(duplicate);
+    }
+
+    let mut contracts: Vec<NameContractDuplicate> = grouped
+        .into_iter()
+        .map(|(contract_address, mut matches)| {
+            matches.sort_by(|left, right| {
+                right
+                    .score
+                    .partial_cmp(&left.score)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| left.token_id.cmp(&right.token_id))
+            });
+            let max_score = matches.first().map(|candidate| candidate.score).unwrap_or(0.0);
+            let duplicate_token_count = matches.len();
+            let tokens = matches
+                .into_iter()
+                .map(|candidate| NameDuplicateToken {
+                    token_id: candidate.token_id,
+                    name: candidate.name,
+                    score: candidate.score,
+                })
+                .collect();
+            NameContractDuplicate {
+                contract_address,
+                max_score,
+                duplicate_token_count,
+                tokens,
+            }
+        })
+        .collect();
+
+    contracts.sort_by(|left, right| {
+        right
+            .max_score
+            .partial_cmp(&left.max_score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| left.contract_address.cmp(&right.contract_address))
+    });
+    contracts
+}
+
+pub fn metadata_duplicates_from_candidates(
+    rows: &[FeatureRow],
+    duplicates: Vec<CandidateScore>,
+) -> Vec<MetadataDuplicate> {
+    let row_lookup: BTreeMap<(String, String), &FeatureRow> = rows
+        .iter()
+        .map(|row| ((row.contract_address.clone(), row.token_id.clone()), row))
+        .collect();
+
+    duplicates
+        .into_iter()
+        .filter_map(|candidate| {
+            let contract_address = candidate.contract_address;
+            let token_id = candidate.token_id;
+            let score = candidate.score;
+            row_lookup
+                .get(&(contract_address.clone(), token_id.clone()))
+                .map(|row| MetadataDuplicate {
+                    contract_address,
+                    token_id,
+                    metadata_doc: row.metadata_doc.clone(),
+                    score,
+                })
+        })
+        .collect()
+}
+
 pub fn score_rows_parallel(
     sample: &PreparedSample,
     rows: &[PreparedFeatureRow],
@@ -1159,5 +1285,64 @@ mod tests {
 
         assert_eq!(duplicate_count, 0);
         assert!(duplicates.is_empty());
+    }
+
+    #[test]
+    fn name_duplicates_are_grouped_by_contract() {
+        let duplicates = vec![
+            CandidateScore {
+                rank: 1,
+                contract_address: "0xdup".into(),
+                token_id: "2".into(),
+                name: "Azuki #2".into(),
+                score: 100.0,
+            },
+            CandidateScore {
+                rank: 2,
+                contract_address: "0xdup".into(),
+                token_id: "4".into(),
+                name: "Azuki #4".into(),
+                score: 99.0,
+            },
+            CandidateScore {
+                rank: 3,
+                contract_address: "0xother".into(),
+                token_id: "1".into(),
+                name: "Azuki Alt #1".into(),
+                score: 98.0,
+            },
+        ];
+
+        let grouped = group_name_duplicates_by_contract(duplicates);
+
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[0].contract_address, "0xdup");
+        assert_eq!(grouped[0].max_score, 100.0);
+        assert_eq!(grouped[0].duplicate_token_count, 2);
+        assert_eq!(
+            grouped[0]
+                .tokens
+                .iter()
+                .map(|token| token.token_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["2", "4"]
+        );
+    }
+
+    #[test]
+    fn metadata_duplicates_use_metadata_doc_in_output() {
+        let rows = vec![row_raw()];
+        let duplicates = vec![CandidateScore {
+            rank: 1,
+            contract_address: "0xdup".into(),
+            token_id: "1".into(),
+            name: "Azuki".into(),
+            score: 0.9,
+        }];
+
+        let metadata_duplicates = metadata_duplicates_from_candidates(&rows, duplicates);
+
+        assert_eq!(metadata_duplicates.len(), 1);
+        assert_eq!(metadata_duplicates[0].metadata_doc, "rare dragon gold");
     }
 }

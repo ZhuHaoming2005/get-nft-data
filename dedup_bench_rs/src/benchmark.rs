@@ -6,13 +6,20 @@ use rayon::{ThreadPool, ThreadPoolBuilder};
 
 use crate::algorithms::{
     build_algorithm_duplicates_raw_from_scores, build_reference_duplicates_raw,
-    score_rows_parallel_raw, timing_algorithms, AlgorithmReport, CandidateScore, ReferenceReport,
+    group_name_duplicates_by_contract, metadata_duplicates_from_candidates,
+    score_rows_parallel_raw, timing_algorithms, AlgorithmField,
+    MetadataAlgorithmReport, NameAlgorithmReport, ReferenceReport,
 };
 use crate::decision_rules::{duplicate_score_rule, reference_duplicate_rule};
 use crate::error::BenchError;
 use crate::report::BenchmarkReport;
 use crate::sample::BenchmarkSample;
 use crate::store::FeatureStore;
+
+enum TimedAlgorithmResult {
+    Name(usize, Vec<crate::algorithms::NameContractDuplicate>),
+    Metadata(usize, Vec<crate::algorithms::MetadataDuplicate>),
+}
 
 #[derive(Clone, Debug)]
 pub struct BenchmarkConfig {
@@ -59,7 +66,7 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
     let mut algorithm_runs_ms: Vec<Vec<f64>> = (0..algorithms.len())
         .map(|_| Vec::with_capacity(repeat))
         .collect();
-    let mut algorithm_results: Vec<Option<(usize, Vec<CandidateScore>)>> =
+    let mut algorithm_results: Vec<Option<TimedAlgorithmResult>> =
         (0..algorithms.len()).map(|_| None).collect();
     let mut reference_runs_ms = Vec::with_capacity(repeat);
     let mut reference_result = None;
@@ -70,11 +77,27 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
             if timed_unit_index < algorithms.len() {
                 let algorithm = algorithms[timed_unit_index];
                 let started = Instant::now();
-                let result = algorithm_thread_pool.install(|| {
+                let result = algorithm_thread_pool.install(|| -> Result<TimedAlgorithmResult, BenchError> {
                     let scores =
                         score_rows_parallel_raw(&sample, &recall_rows, algorithm.scorer);
-                    build_algorithm_duplicates_raw_from_scores(algorithm.id, &recall_rows, &scores)
-                        .map_err(BenchError::InvalidData)
+                    let (_, duplicates) = build_algorithm_duplicates_raw_from_scores(
+                        algorithm.id,
+                        &recall_rows,
+                        &scores,
+                    )
+                    .map_err(BenchError::InvalidData)?;
+                    Ok(match algorithm.field {
+                        AlgorithmField::Name => {
+                            let duplicates = group_name_duplicates_by_contract(duplicates);
+                            TimedAlgorithmResult::Name(duplicates.len(), duplicates)
+                        }
+                        AlgorithmField::Metadata => {
+                            let duplicates =
+                                metadata_duplicates_from_candidates(&recall_rows, duplicates);
+                            TimedAlgorithmResult::Metadata(duplicates.len(), duplicates)
+                        }
+                        AlgorithmField::Reference => unreachable!(),
+                    })
                 })?;
                 algorithm_runs_ms[timed_unit_index]
                     .push(started.elapsed().as_secs_f64() * 1000.0);
@@ -88,28 +111,50 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
             }
         }
     }
-    let algorithm_reports = algorithms
-        .iter()
-        .enumerate()
-        .map(|(index, algorithm)| {
-            let runs_ms = std::mem::take(&mut algorithm_runs_ms[index]);
-            let (duplicate_count, duplicates) =
-                algorithm_results[index].take().unwrap_or((0, Vec::new()));
-            AlgorithmReport {
-                algorithm_id: algorithm.id.to_string(),
-                field: algorithm.field,
-                decision_rule: duplicate_score_rule(algorithm.id)
-                    .map(|rule| rule.description.to_string())
-                    .unwrap_or_else(|_| "missing duplicate rule".to_string()),
-                repeat,
-                runs_ms: runs_ms.clone(),
-                avg_ms: runs_ms.iter().sum::<f64>() / runs_ms.len() as f64,
-                min_ms: runs_ms.iter().copied().fold(f64::INFINITY, f64::min),
-                duplicate_count,
-                duplicates,
+    let mut name_algorithm_reports = Vec::new();
+    let mut metadata_algorithm_reports = Vec::new();
+    for (index, algorithm) in algorithms.iter().enumerate() {
+        let runs_ms = std::mem::take(&mut algorithm_runs_ms[index]);
+        let avg_ms = runs_ms.iter().sum::<f64>() / runs_ms.len() as f64;
+        let min_ms = runs_ms.iter().copied().fold(f64::INFINITY, f64::min);
+        let decision_rule = duplicate_score_rule(algorithm.id)
+            .map(|rule| rule.description.to_string())
+            .unwrap_or_else(|_| "missing duplicate rule".to_string());
+        match algorithm_results[index]
+            .take()
+            .unwrap_or_else(|| match algorithm.field {
+                AlgorithmField::Name => TimedAlgorithmResult::Name(0, Vec::new()),
+                AlgorithmField::Metadata => TimedAlgorithmResult::Metadata(0, Vec::new()),
+                AlgorithmField::Reference => unreachable!(),
+            }) {
+            TimedAlgorithmResult::Name(duplicate_count, duplicates) => {
+                name_algorithm_reports.push(NameAlgorithmReport {
+                    algorithm_id: algorithm.id.to_string(),
+                    field: algorithm.field,
+                    decision_rule,
+                    repeat,
+                    runs_ms,
+                    avg_ms,
+                    min_ms,
+                    duplicate_count,
+                    duplicates,
+                });
             }
-        })
-        .collect();
+            TimedAlgorithmResult::Metadata(duplicate_count, duplicates) => {
+                metadata_algorithm_reports.push(MetadataAlgorithmReport {
+                    algorithm_id: algorithm.id.to_string(),
+                    field: algorithm.field,
+                    decision_rule,
+                    repeat,
+                    runs_ms,
+                    avg_ms,
+                    min_ms,
+                    duplicate_count,
+                    duplicates,
+                });
+            }
+        }
+    }
     let (reference_duplicate_count, reference_duplicates) =
         reference_result.unwrap_or((0, Vec::new()));
 
@@ -133,7 +178,8 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
             duplicate_count: reference_duplicate_count,
             duplicates: reference_duplicates,
         },
-        algorithms: algorithm_reports,
+        name_algorithms: name_algorithm_reports,
+        metadata_algorithms: metadata_algorithm_reports,
     };
     write_report_outputs(&report, &config.output)?;
     Ok(report)
@@ -194,7 +240,9 @@ mod tests {
             );
             INSERT INTO nft_features VALUES
             ('ethereum', '0xby_uri_only', '1', 'ipfs://seed/meta-1', '', 'Completely Different', 'AZUKI', '{\"description\":\"nothing here\"}', 'nothing here', 'completely different', '[\"nothing\"]'),
-            ('ethereum', '0xby_name', '2', '', '', 'Azuki Mirror #1', 'MIRROR', '{\"description\":\"nothing here\"}', 'nothing here', 'azuki mirror', '[\"nothing\"]'),
+            ('ethereum', '0xseed', '9', '', '', 'Excluded Seed #9', 'SEED', '{\"description\":\"rare dragon gold\"}', 'rare dragon gold', 'azuki', '[\"rare\",\"dragon\",\"gold\"]'),
+            ('ethereum', '0xby_name', '2', '', '', 'Azuki #2', 'MIRROR', '{\"description\":\"nothing here\"}', 'nothing here', 'azuki', '[\"nothing\"]'),
+            ('ethereum', '0xby_name', '4', '', '', 'Azuki #4', 'MIRROR', '{\"description\":\"nothing here\"}', 'nothing here', 'azuki', '[\"nothing\"]'),
             ('ethereum', '0xby_metadata', '3', '', '', 'Totally Different', 'OTHER', '{\"description\":\"rare dragon gold\"}', 'rare dragon gold', 'totally different', '[\"rare\",\"dragon\",\"gold\"]');
             ",
         )
@@ -230,13 +278,20 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(report.recall_candidate_count, 2);
+        assert_eq!(report.recall_candidate_count, 3);
         assert!(
             report
                 .reference
                 .duplicates
                 .iter()
                 .all(|candidate| candidate.contract_address != "0xby_uri_only")
+        );
+        assert!(
+            report
+                .reference
+                .duplicates
+                .iter()
+                .all(|candidate| candidate.contract_address != "0xseed")
         );
     }
 
@@ -367,15 +422,15 @@ mod tests {
             .collect();
         assert_eq!(single_reference, repeated_reference);
 
-        let single_name: Vec<(String, String)> = single.algorithms[0]
+        let single_name: Vec<String> = single.name_algorithms[0]
             .duplicates
             .iter()
-            .map(|candidate| (candidate.contract_address.clone(), candidate.token_id.clone()))
+            .map(|candidate| candidate.contract_address.clone())
             .collect();
-        let repeated_name: Vec<(String, String)> = repeated.algorithms[0]
+        let repeated_name: Vec<String> = repeated.name_algorithms[0]
             .duplicates
             .iter()
-            .map(|candidate| (candidate.contract_address.clone(), candidate.token_id.clone()))
+            .map(|candidate| candidate.contract_address.clone())
             .collect();
         assert_eq!(single_name, repeated_name);
     }
@@ -430,5 +485,56 @@ mod tests {
         let markdown = report.to_markdown();
         assert!(markdown.contains("duplicate_count"));
         assert!(!markdown.contains("top_candidates"));
+        assert!(markdown.contains("## Name Algorithms"));
+        assert!(markdown.contains("## Metadata Algorithms"));
+    }
+
+    #[test]
+    fn benchmark_splits_name_and_metadata_reports() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("feature_store.duckdb");
+        create_duckdb(&db_path);
+        let metadata_path = write_sample_inputs(dir.path());
+        let output_path = dir.path().join("report.json");
+
+        let report = run_benchmark(&BenchmarkConfig {
+            chain: "ethereum".into(),
+            contract_address: "0xseed".into(),
+            token_id: "1".into(),
+            name: "Azuki #1".into(),
+            metadata_file: metadata_path,
+            feature_db: db_path,
+            feature_parquet: None,
+            output: output_path,
+            repeat: 1,
+            algorithm_threads: 30,
+        })
+        .unwrap();
+
+        let name_report = report
+            .name_algorithms
+            .iter()
+            .find(|algorithm| algorithm.algorithm_id == "name_exact_normalized")
+            .unwrap();
+        assert_eq!(name_report.duplicate_count, 1);
+        assert_eq!(name_report.duplicates[0].contract_address, "0xby_name");
+        assert_eq!(name_report.duplicates[0].duplicate_token_count, 2);
+        assert_eq!(
+            name_report.duplicates[0]
+                .tokens
+                .iter()
+                .map(|token| token.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Azuki #2", "Azuki #4"]
+        );
+
+        let metadata_report = report
+            .metadata_algorithms
+            .iter()
+            .find(|algorithm| algorithm.algorithm_id == "metadata_current_hybrid")
+            .unwrap();
+        assert_eq!(metadata_report.duplicate_count, 1);
+        assert_eq!(metadata_report.duplicates[0].contract_address, "0xby_metadata");
+        assert_eq!(metadata_report.duplicates[0].metadata_doc, "rare dragon gold");
     }
 }
