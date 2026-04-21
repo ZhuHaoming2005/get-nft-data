@@ -71,7 +71,7 @@ pub struct BatchArgs {
     pub name_threshold: f64,
     #[arg(long, default_value_t = 0.55)]
     pub metadata_threshold: f64,
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = 60)]
     pub timeout: u64,
     #[arg(long, default_value = "result")]
     pub output_dir: String,
@@ -85,9 +85,9 @@ pub struct BatchArgs {
     pub signal_cache_db: String,
     #[arg(long, default_value_t = false)]
     pub strict_parquet: bool,
-    #[arg(long, default_value_t = 100_000)]
+    #[arg(long, default_value_t = 0)]
     pub max_recall_rows: usize,
-    #[arg(long, default_value_t = 500)]
+    #[arg(long, default_value_t = 0)]
     pub max_tokens_per_contract: usize,
 }
 
