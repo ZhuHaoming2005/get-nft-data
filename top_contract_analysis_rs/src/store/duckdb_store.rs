@@ -79,6 +79,15 @@ impl DuckDbFeatureStore {
         Ok(Self { conn })
     }
 
+    pub fn has_chain_rows(&self, chain: &str) -> Result<bool, AppError> {
+        let exists = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM nft_features WHERE chain = ? LIMIT 1)",
+            params![chain],
+            |row| row.get::<_, bool>(0),
+        )?;
+        Ok(exists)
+    }
+
     pub fn replace_chain_rows(
         &self,
         chain: &str,
@@ -196,6 +205,19 @@ impl DuckDbFeatureStore {
         }
         self.replace_chain_rows(chain, &collected)?;
         Ok(())
+    }
+
+    pub fn load_parquet_dataset_if_chain_missing(
+        &self,
+        chain: &str,
+        parquet_path: &str,
+        strict: bool,
+    ) -> Result<bool, AppError> {
+        if self.has_chain_rows(chain)? {
+            return Ok(false);
+        }
+        self.load_parquet_dataset(chain, parquet_path, strict)?;
+        Ok(true)
     }
 
     pub fn load_snapshot(

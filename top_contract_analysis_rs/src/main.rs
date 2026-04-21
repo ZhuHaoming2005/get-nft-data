@@ -37,7 +37,11 @@ async fn main() -> Result<(), AppError> {
         Command::Analyze(args) => {
             let feature_store = DuckDbFeatureStore::new(&args.feature_db)?;
             if !args.feature_parquet.trim().is_empty() {
-                feature_store.load_parquet_dataset(&args.chain, &args.feature_parquet, false)?;
+                feature_store.load_parquet_dataset_if_chain_missing(
+                    &args.chain,
+                    &args.feature_parquet,
+                    false,
+                )?;
             }
             let api = RealApi::new(
                 args.timeout,
@@ -83,7 +87,11 @@ async fn main() -> Result<(), AppError> {
             let seed_addresses = read_seed_addresses(std::path::Path::new(&args.seed_file))?;
             let feature_store = DuckDbFeatureStore::new(&args.feature_db)?;
             if !args.feature_parquet.trim().is_empty() {
-                feature_store.load_parquet_dataset(&args.chain, &args.feature_parquet, args.strict_parquet)?;
+                feature_store.load_parquet_dataset_if_chain_missing(
+                    &args.chain,
+                    &args.feature_parquet,
+                    args.strict_parquet,
+                )?;
             }
             let api = RealApi::new(args.timeout, 8, 4, 4)?;
             let deps = AnalysisDeps {

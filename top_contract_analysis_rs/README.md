@@ -157,4 +157,5 @@ cargo run --release -- batch \
 - `--feature-db` 默认是 `:memory:`。如果你希望 DuckDB 状态跨进程保留，请传文件路径。
 - `--signal-cache-db` 默认是 `:memory:`。如果你希望 transfers / owners 的 signal cache 跨运行保留，请传文件路径。
 - 如果不传 `--feature-parquet`，程序会假设 DuckDB 特征库里已经有可用数据集。
+- 如果同时传了 `--feature-db` 和 `--feature-parquet`，且 `feature-db` 中该链已经有数据，则会优先使用 `feature-db`，不会再从 Parquet 覆盖导入该链数据。
 - `batch` 当前内部构造 API client 时使用固定的请求并发默认值；批量运行时 CLI 暴露出来的主要吞吐控制参数是 `--workers`。

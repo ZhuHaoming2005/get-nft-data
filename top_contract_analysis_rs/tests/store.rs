@@ -46,6 +46,139 @@ fn strict_parquet_rejects_missing_precomputed_columns() {
 }
 
 #[test]
+fn existing_feature_db_chain_rows_take_priority_over_parquet() {
+    let dir = tempdir().unwrap();
+    let parquet_path = dir.path().join("snapshot.parquet");
+    write_parquet(
+        "
+        SELECT
+            'ethereum' AS chain,
+            '0xparquet' AS contract_address,
+            '1' AS token_id,
+            'ipfs://seed/meta-1' AS token_uri,
+            '' AS image_uri,
+            'Parquet Clone #1' AS name,
+            'AZUKI' AS symbol,
+            '' AS metadata_json,
+            'ipfs:seed/meta-1' AS token_uri_norm,
+            '' AS image_uri_norm,
+            'parquet clone' AS name_norm,
+            'azuki' AS symbol_norm,
+            '' AS metadata_doc
+        ",
+        &parquet_path,
+    );
+
+    let store = DuckDbFeatureStore::new(":memory:").unwrap();
+    store
+        .replace_chain_rows(
+            "ethereum",
+            &[DatabaseNftRecord {
+                contract_address: "0xdb".into(),
+                token_id: "1".into(),
+                token_uri: "ipfs://seed/meta-1".into(),
+                image_uri: "".into(),
+                name: "Db Clone #1".into(),
+                symbol: "AZUKI".into(),
+                metadata_json: "".into(),
+                metadata_doc: "".into(),
+            }],
+        )
+        .unwrap();
+
+    let loaded = store
+        .load_parquet_dataset_if_chain_missing("ethereum", &parquet_path.to_string_lossy(), false)
+        .unwrap();
+
+    assert!(!loaded);
+
+    let snapshot = store
+        .load_snapshot(
+            "ethereum",
+            &[SeedNft {
+                chain: "ethereum".into(),
+                contract_address: "0xseed".into(),
+                token_id: "1".into(),
+                name: "Azuki #1".into(),
+                symbol: "AZUKI".into(),
+                token_uri: "ipfs://seed/meta-1".into(),
+                image_uri: "".into(),
+                metadata_json: "".into(),
+                metadata_doc: "".into(),
+            }],
+            0,
+            0,
+        )
+        .unwrap();
+
+    let contracts: Vec<&str> = snapshot
+        .nft_rows
+        .iter()
+        .map(|row| row.contract_address.as_str())
+        .collect();
+    assert_eq!(contracts, vec!["0xdb"]);
+}
+
+#[test]
+fn parquet_loads_when_feature_db_has_no_chain_rows() {
+    let dir = tempdir().unwrap();
+    let parquet_path = dir.path().join("snapshot.parquet");
+    write_parquet(
+        "
+        SELECT
+            'ethereum' AS chain,
+            '0xparquet' AS contract_address,
+            '1' AS token_id,
+            'ipfs://seed/meta-1' AS token_uri,
+            '' AS image_uri,
+            'Parquet Clone #1' AS name,
+            'AZUKI' AS symbol,
+            '' AS metadata_json,
+            'ipfs:seed/meta-1' AS token_uri_norm,
+            '' AS image_uri_norm,
+            'parquet clone' AS name_norm,
+            'azuki' AS symbol_norm,
+            '' AS metadata_doc
+        ",
+        &parquet_path,
+    );
+
+    let store = DuckDbFeatureStore::new(":memory:").unwrap();
+
+    let loaded = store
+        .load_parquet_dataset_if_chain_missing("ethereum", &parquet_path.to_string_lossy(), false)
+        .unwrap();
+
+    assert!(loaded);
+
+    let snapshot = store
+        .load_snapshot(
+            "ethereum",
+            &[SeedNft {
+                chain: "ethereum".into(),
+                contract_address: "0xseed".into(),
+                token_id: "1".into(),
+                name: "Azuki #1".into(),
+                symbol: "AZUKI".into(),
+                token_uri: "ipfs://seed/meta-1".into(),
+                image_uri: "".into(),
+                metadata_json: "".into(),
+                metadata_doc: "".into(),
+            }],
+            0,
+            0,
+        )
+        .unwrap();
+
+    let contracts: Vec<&str> = snapshot
+        .nft_rows
+        .iter()
+        .map(|row| row.contract_address.as_str())
+        .collect();
+    assert_eq!(contracts, vec!["0xparquet"]);
+}
+
+#[test]
 fn feature_store_applies_per_contract_token_cap() {
     let store = DuckDbFeatureStore::new(":memory:").unwrap();
     store
