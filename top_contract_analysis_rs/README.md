@@ -26,7 +26,7 @@
 
 在 [top_contract_analysis_rs](../top_contract_analysis_rs) 目录下执行：
 
-```powershell
+```bash
 cargo build
 cargo test
 ```
@@ -35,14 +35,12 @@ cargo test
 
 先复制 [.env.example](./.env.example)，再按实际环境填写。
 
-注意：程序本身**不会自动加载** `.env` 文件。你需要先把变量导入当前 shell。PowerShell 示例：
+注意：程序本身**不会自动加载** `.env` 文件。你需要先把变量导入当前 shell。Bash 示例：
 
-```powershell
-Get-Content .env | ForEach-Object {
-  if ($_ -match '^\s*#' -or $_ -match '^\s*$') { return }
-  $name, $value = $_ -split '=', 2
-  Set-Item -Path "Env:$name" -Value $value
-}
+```bash
+set -a
+source .env
+set +a
 ```
 
 其中：
@@ -62,9 +60,9 @@ Get-Content .env | ForEach-Object {
 
 把 PostgreSQL 中的 NFT 特征快照导出为 Parquet 文件。
 
-```powershell
-cargo run --release -- export-snapshot `
-  --chain ethereum `
+```bash
+cargo run --release -- export-snapshot \
+  --chain ethereum \
   --output ../output/top_contract_analysis/ethereum.parquet
 ```
 
@@ -84,15 +82,15 @@ cargo run --release -- export-snapshot `
 
 示例：
 
-```powershell
-cargo run --release -- analyze `
-  --chain ethereum `
-  --seed-contract-address 0xed5af388653567af2f388e6224dc7c4b3241c544 `
-  --alchemy-api-key $env:ALCHEMY_API_KEY `
-  --etherscan-api-key $env:ETHERSCAN_API_KEY `
-  --opensea-api-key $env:OPENSEA_API_KEY `
-  --feature-parquet ../output/top_contract_analysis/ethereum.parquet `
-  --feature-db ../output/top_contract_analysis/features.duckdb `
+```bash
+cargo run --release -- analyze \
+  --chain ethereum \
+  --seed-contract-address 0xed5af388653567af2f388e6224dc7c4b3241c544 \
+  --alchemy-api-key "$ALCHEMY_API_KEY" \
+  --etherscan-api-key "$ETHERSCAN_API_KEY" \
+  --opensea-api-key "$OPENSEA_API_KEY" \
+  --feature-parquet ../output/top_contract_analysis/ethereum.parquet \
+  --feature-db ../output/top_contract_analysis/features.duckdb \
   --signal-cache-db ../output/top_contract_analysis/signals.duckdb
 ```
 
@@ -107,7 +105,7 @@ cargo run --release -- analyze `
 - `--api-max-concurrency 8`
 - `--contract-max-concurrency 4`
 - `--sale-metric-max-concurrency 4`
-- `--output .\result\azuki.json`
+- `--output ./result/azuki.json`
 
 ### 3. 批量分析 Seed 合约
 
@@ -120,17 +118,17 @@ cargo run --release -- analyze `
 
 运行示例：
 
-```powershell
-cargo run --release -- batch `
-  --chain ethereum `
-  --seed-file .\seeds.txt `
-  --alchemy-api-key $env:ALCHEMY_API_KEY `
-  --etherscan-api-key $env:ETHERSCAN_API_KEY `
-  --opensea-api-key $env:OPENSEA_API_KEY `
-  --feature-parquet ../output/top_contract_analysis/ethereum.parquet `
-  --feature-db ../output/top_contract_analysis/features.duckdb `
-  --signal-cache-db ../output/top_contract_analysis/signals.duckdb `
-  --output-dir ../result `
+```bash
+cargo run --release -- batch \
+  --chain ethereum \
+  --seed-file ./seeds.txt \
+  --alchemy-api-key "$ALCHEMY_API_KEY" \
+  --etherscan-api-key "$ETHERSCAN_API_KEY" \
+  --opensea-api-key "$OPENSEA_API_KEY" \
+  --feature-parquet ../output/top_contract_analysis/ethereum.parquet \
+  --feature-db ../output/top_contract_analysis/features.duckdb \
+  --signal-cache-db ../output/top_contract_analysis/signals.duckdb \
+  --output-dir ../result \
   --workers 4
 ```
 

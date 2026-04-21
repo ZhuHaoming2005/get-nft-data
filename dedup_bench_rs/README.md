@@ -36,17 +36,17 @@
 
 在 [dedup_bench_rs](..\dedup_bench_rs) 目录下执行：
 
-```powershell
-cargo run -- run `
-  --chain ethereum `
-  --contract-address 0xseed `
-  --token-id 1 `
-  --name "Azuki #1" `
-  --metadata-file .\examples\metadata.json `
-  --feature-db ../output/top_contract_analysis/features.duckdb `
-  --feature-parquet ../output/top_contract_analysis/ethereum.parquet `
-  --output .\result\result.json `
-  --top-k 50 `
+```bash
+cargo run -- run \
+  --chain ethereum \
+  --contract-address 0xseed \
+  --token-id 1 \
+  --name "Azuki #1" \
+  --metadata-file ./examples/metadata.json \
+  --feature-db ../output/top_contract_analysis/features.duckdb \
+  --feature-parquet ../output/top_contract_analysis/ethereum.parquet \
+  --output ./result/result.json \
+  --top-k 50 \
   --repeat 5
 ```
 
@@ -210,13 +210,13 @@ DuckDB / Parquet 至少需要包含这些业务字段：
 
 运行测试：
 
-```powershell
+```bash
 cargo test
 ```
 
 静态检查：
 
-```powershell
+```bash
 cargo clippy --all-targets -- -D warnings
 ```
 
