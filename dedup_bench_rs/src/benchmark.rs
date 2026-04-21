@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::algorithms::{
-    all_algorithms, build_reference_candidates, sort_algorithm_candidates, AlgorithmReport,
-    ReferenceReport,
+    all_algorithms, build_reference_candidates, score_rows_parallel, sort_algorithm_candidates,
+    AlgorithmReport, ReferenceReport,
 };
 use crate::error::BenchError;
 use crate::report::BenchmarkReport;
@@ -45,10 +45,7 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
         let mut last_result = None;
         for _ in 0..repeat {
             let started = Instant::now();
-            let scores: Vec<f64> = recall_rows
-                .iter()
-                .map(|row| (algorithm.scorer)(&sample, row))
-                .collect();
+            let scores = score_rows_parallel(&sample, &recall_rows, algorithm.scorer);
             let result = sort_algorithm_candidates(&recall_rows, &scores, config.top_k);
             runs_ms.push(started.elapsed().as_secs_f64() * 1000.0);
             last_result = Some(result);

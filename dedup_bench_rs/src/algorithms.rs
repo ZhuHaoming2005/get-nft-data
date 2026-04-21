@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use once_cell::sync::Lazy;
+use rayon::prelude::*;
 use regex::Regex;
 use serde::Serialize;
 use strsim::{jaro_winkler, normalized_levenshtein};
@@ -342,28 +343,38 @@ pub fn sort_algorithm_candidates(
     (total, top_candidates)
 }
 
+pub fn score_rows_parallel(
+    sample: &BenchmarkSample,
+    rows: &[FeatureRow],
+    scorer: fn(&BenchmarkSample, &FeatureRow) -> f64,
+) -> Vec<f64> {
+    rows.par_iter().map(|row| scorer(sample, row)).collect()
+}
+
 pub fn build_reference_candidates(
     sample: &BenchmarkSample,
     rows: &[FeatureRow],
     top_k: usize,
 ) -> (usize, Vec<ReferenceCandidateScore>) {
-    let mut candidates = Vec::new();
-    for row in rows {
-        let name_score = score_name_current_hybrid(sample, row);
-        let metadata_score = score_metadata_current_hybrid(sample, row);
-        let mut reasons = Vec::new();
-        if name_score >= DEFAULT_NAME_THRESHOLD {
-            reasons.push("name_match".to_string());
-        }
-        if metadata_score >= DEFAULT_METADATA_THRESHOLD {
-            reasons.push("metadata_match".to_string());
-        }
-        if reasons.is_empty() {
-            continue;
-        }
-        let combined_score = (name_score / 100.0).max(metadata_score);
-        candidates.push((row, combined_score, name_score, metadata_score, reasons));
-    }
+    let mut candidates: Vec<(&FeatureRow, f64, f64, f64, Vec<String>)> = rows
+        .par_iter()
+        .filter_map(|row| {
+            let name_score = score_name_current_hybrid(sample, row);
+            let metadata_score = score_metadata_current_hybrid(sample, row);
+            let mut reasons = Vec::new();
+            if name_score >= DEFAULT_NAME_THRESHOLD {
+                reasons.push("name_match".to_string());
+            }
+            if metadata_score >= DEFAULT_METADATA_THRESHOLD {
+                reasons.push("metadata_match".to_string());
+            }
+            if reasons.is_empty() {
+                return None;
+            }
+            let combined_score = (name_score / 100.0).max(metadata_score);
+            Some((row, combined_score, name_score, metadata_score, reasons))
+        })
+        .collect();
     candidates.sort_by(|left, right| {
         right
             .1
@@ -451,6 +462,17 @@ mod tests {
         }
     }
 
+    fn second_row() -> FeatureRow {
+        FeatureRow {
+            contract_address: "0xdup2".into(),
+            token_id: "2".into(),
+            name: "Azuki Mirror #2".into(),
+            name_norm: normalize_name("Azuki Mirror #2"),
+            metadata_doc: "rare dragon silver".into(),
+            metadata_keywords: vec!["dragon".into(), "rare".into(), "silver".into()],
+        }
+    }
+
     #[test]
     fn current_name_hybrid_matches_existing_logic() {
         let sample = sample();
@@ -482,5 +504,78 @@ mod tests {
         let score = token_cosine("gold gold dragon", "gold dragon");
         assert!(score > 0.9);
         assert!(score <= 1.0);
+    }
+
+    #[test]
+    fn parallel_row_scoring_matches_sequential_scoring() {
+        let sample = sample();
+        let rows = vec![row(), second_row()];
+        let sequential: Vec<f64> = rows
+            .iter()
+            .map(|row| score_name_current_hybrid(&sample, row))
+            .collect();
+        let parallel = score_rows_parallel(&sample, &rows, score_name_current_hybrid);
+
+        assert_eq!(parallel, sequential);
+        assert_eq!(
+            sort_algorithm_candidates(&rows, &parallel, 10),
+            sort_algorithm_candidates(&rows, &sequential, 10)
+        );
+    }
+
+    #[test]
+    fn parallel_reference_candidates_keep_same_ranking_rules() {
+        let sample = sample();
+        let rows = vec![row(), second_row()];
+        let actual = build_reference_candidates(&sample, &rows, 10);
+
+        let mut expected_candidates = Vec::new();
+        for row in &rows {
+            let name_score = score_name_current_hybrid(&sample, row);
+            let metadata_score = score_metadata_current_hybrid(&sample, row);
+            let mut reasons = Vec::new();
+            if name_score >= DEFAULT_NAME_THRESHOLD {
+                reasons.push("name_match".to_string());
+            }
+            if metadata_score >= DEFAULT_METADATA_THRESHOLD {
+                reasons.push("metadata_match".to_string());
+            }
+            if reasons.is_empty() {
+                continue;
+            }
+            let combined_score = (name_score / 100.0).max(metadata_score);
+            expected_candidates.push((row, combined_score, name_score, metadata_score, reasons));
+        }
+        expected_candidates.sort_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left.0.contract_address.cmp(&right.0.contract_address))
+                .then_with(|| left.0.token_id.cmp(&right.0.token_id))
+        });
+        let expected = (
+            expected_candidates.len(),
+            expected_candidates
+                .into_iter()
+                .enumerate()
+                .map(
+                    |(rank, (row, combined_score, name_score, metadata_score, match_reasons))| {
+                        ReferenceCandidateScore {
+                            rank: rank + 1,
+                            contract_address: row.contract_address.clone(),
+                            token_id: row.token_id.clone(),
+                            name: row.name.clone(),
+                            combined_score,
+                            name_score,
+                            metadata_score,
+                            match_reasons,
+                        }
+                    },
+                )
+                .collect(),
+        );
+
+        assert_eq!(actual, expected);
     }
 }
