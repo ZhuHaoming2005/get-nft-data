@@ -24,7 +24,7 @@
 
 ## 构建与测试
 
-在 [top_contract_analysis_rs](D:/code/solidity/get-nft-data/top_contract_analysis_rs) 目录下执行：
+在 [top_contract_analysis_rs](../top_contract_analysis_rs) 目录下执行：
 
 ```powershell
 cargo build
