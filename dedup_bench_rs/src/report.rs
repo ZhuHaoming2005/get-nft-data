@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::algorithms::{MetadataAlgorithmReport, NameAlgorithmReport, ReferenceReport};
+use crate::algorithms::{MetadataAlgorithmReport, NameAlgorithmReport};
 use crate::sample::BenchmarkSample;
 use crate::store::SourceInfo;
 
@@ -11,7 +11,6 @@ pub struct BenchmarkReport {
     pub sample: BenchmarkSample,
     pub recall_elapsed_ms: f64,
     pub recall_candidate_count: usize,
-    pub reference: ReferenceReport,
     pub name_algorithms: Vec<NameAlgorithmReport>,
     pub metadata_algorithms: Vec<MetadataAlgorithmReport>,
 }
@@ -37,28 +36,6 @@ impl BenchmarkReport {
             self.sample.metadata_doc
         ));
 
-        out.push_str("## Current Name/Metadata Reference\n\n");
-        out.push_str(&format!(
-            "- decision_rule: `{}`\n- duplicate_count: `{}`\n- avg_ms: `{:.3}`\n- min_ms: `{:.3}`\n- runs_ms: `{:?}`\n\n",
-            self.reference.decision_rule,
-            self.reference.duplicate_count,
-            self.reference.avg_ms,
-            self.reference.min_ms,
-            self.reference.runs_ms
-        ));
-        for candidate in &self.reference.duplicates {
-            out.push_str(&format!(
-                "1. `{}` / `{}` score=`{:.4}` name_score=`{:.2}` metadata_score=`{:.4}` reasons=`{}`\n",
-                candidate.contract_address,
-                candidate.token_id,
-                candidate.combined_score,
-                candidate.name_score,
-                candidate.metadata_score,
-                candidate.match_reasons.join(",")
-            ));
-        }
-        out.push('\n');
-
         out.push_str("## Name Algorithms\n\n");
         for algorithm in &self.name_algorithms {
             out.push_str(&format!(
@@ -76,12 +53,6 @@ impl BenchmarkReport {
                     "1. contract=`{}` max_score=`{:.4}` duplicate_token_count=`{}`\n",
                     candidate.contract_address, candidate.max_score, candidate.duplicate_token_count
                 ));
-                for token in &candidate.tokens {
-                    out.push_str(&format!(
-                        "   - token_id=`{}` score=`{:.4}` name=`{}`\n",
-                        token.token_id, token.score, token.name
-                    ));
-                }
             }
             out.push('\n');
         }

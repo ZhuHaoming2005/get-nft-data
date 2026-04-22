@@ -35,9 +35,8 @@
   - 每个算法的判重规则集中定义在 `src/decision_rules.rs`
 - 计时口径：
   - 算法层并行线程数默认是 `30`，可通过参数自定义
-  - 每个算法和 reference 都会先对同一批 `recall_rows` 预热一次，再进入正式计时
-  - reference 独立计时，不复用其他算法的 hybrid 分数
-  - 正式计时时会轮转算法和 reference 的执行顺序，降低固定顺序带来的缓存偏差
+  - 每个算法都会先对同一批 `recall_rows` 预热一次，再进入正式计时
+  - 正式计时时会轮转各算法的执行顺序，降低固定顺序带来的缓存偏差
 
 ## 运行方式
 
@@ -64,9 +63,9 @@ cargo run -- run \
 - `--name`
   样例 NFT 的名称，直接从命令行输入
 - `--contract-address`
-  可选。样例合约地址，用于排除自己命中自己
+  可选。样例合约地址；提供后会在召回阶段排除该合约下的全部记录
 - `--token-id`
-  可选。样例 token id，用于排除自己命中自己
+  可选。样例 token id，仅作为样例标识保留
 - `--metadata-file`
   样例 metadata JSON 文件
 - `--feature-db`
@@ -144,16 +143,6 @@ cargo run -- run \
 0.45 * token Jaccard + 0.55 * Jaro-Winkler
 ```
 
-### Reference
-
-- `current_name_metadata_reference`
-
-含义：
-
-- 仍使用当前 name / metadata 基线公式
-- 但完全去掉 `uri / symbol` 相关规则
-- 只有 `name_match` 和 `metadata_match`
-
 ## 输出说明
 
 ### JSON 报告
@@ -165,13 +154,13 @@ cargo run -- run \
 - `sample`
 - `recall_elapsed_ms`
 - `recall_candidate_count`
-- `reference`
-- `algorithms`
+- `name_algorithms`
+- `metadata_algorithms`
 
 其中：
 
-- `reference` 是当前 `name + metadata` 基线结果
-- `algorithms` 是所有对比算法的独立结果
+- `name_algorithms` 包含所有 `name` 类算法结果
+- `metadata_algorithms` 包含所有 `metadata` 类算法结果
 
 每个算法包含：
 
@@ -185,14 +174,26 @@ cargo run -- run \
 - `duplicate_count`
 - `duplicates`
 
+其中：
+
+- `name_algorithms[*].duplicates` 为合约级结果，包含：
+  - `contract_address`
+  - `max_score`
+  - `duplicate_token_count`
+- `metadata_algorithms[*].duplicates` 为 token 级结果，包含：
+  - `contract_address`
+  - `token_id`
+  - `metadata_doc`
+  - `score`
+
 ### Markdown 报告
 
 用于快速人工查看：
 
 - 样例信息
 - 召回数量和耗时
-- 当前参考结果
-- 各算法判定为重复的结果
+- `Name Algorithms` 合约级重复结果
+- `Metadata Algorithms` token 级重复结果
 
 ## 数据要求
 

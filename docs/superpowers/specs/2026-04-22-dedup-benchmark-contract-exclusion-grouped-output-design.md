@@ -6,15 +6,15 @@
 
 1. 默认排除样本自己的 `contract_address`
 2. 正式报告将 `name` 与 `metadata` 结果分开输出
-3. `name` 结果按合约地址聚合，`metadata` 结果保持 token 级输出
+3. `name` 结果按合约地址聚合，且不再展示单个 NFT 明细；`metadata` 结果保持 token 级输出
 
 ## Current State
 
 - `FeatureStore::load_recall_rows()` 会召回同链候选，并在 `collect_recall_rows_from_query()` 中排除“同合约且同 token”的样本自身记录。
 - 正式报告当前结构为：
-  - `reference`
-  - `algorithms`
-- 普通算法的 `duplicates` 结果仍然按 token 级平铺输出。
+  - `name_algorithms`
+  - `metadata_algorithms`
+- `name` 算法的 `duplicates` 结果已经按合约聚类展示。
 
 ## Desired State
 
@@ -31,12 +31,11 @@
 
 `BenchmarkReport` 从：
 
-- `reference`
-- `algorithms`
+- `name_algorithms`
+- `metadata_algorithms`
 
 改为：
 
-- `reference`
 - `name_algorithms`
 - `metadata_algorithms`
 
@@ -49,13 +48,6 @@
   - `contract_address`
   - `max_score`
   - `duplicate_token_count`
-  - `tokens`
-
-其中 `tokens` 保留每个命中的：
-
-- `token_id`
-- `name`
-- `score`
 
 排序只用于输出稳定性，不作为业务语义。
 
@@ -90,10 +82,11 @@
 
 修改 `dedup_bench_rs/src/report.rs` 和 `dedup_bench_rs/src/benchmark.rs`：
 
-- `AlgorithmReport` 不再直接作为一个统一列表塞进 `BenchmarkReport.algorithms`
-- benchmark 组装时，按 `AlgorithmField` 分为：
+- benchmark 正式报告不再包含单独 `reference`
+- 所有算法结果统一按 `AlgorithmField` 分为：
   - `name_algorithms`
   - `metadata_algorithms`
+- `name_current_hybrid` 和 `metadata_current_hybrid` 作为普通算法分别保留在两类结果中
 
 ### 3. Add Name Contract Aggregation Model
 
@@ -101,7 +94,6 @@
 
 新增结构：
 
-- `NameDuplicateToken`
 - `NameContractDuplicate`
 - `NameAlgorithmReport`
 - `MetadataAlgorithmReport`
@@ -127,20 +119,18 @@
 - 再按 `contract_address` 聚合
 - 每个合约下：
   - `max_score` 取该合约命中 token 中最高值
-  - `duplicate_token_count = tokens.len()`
-  - `tokens` 保留全部命中 token 明细
+  - `duplicate_token_count` 表示该合约下命中的 token 数
 
 ### 5. Markdown Rendering
 
-`report.rs` 中的 Markdown 渲染改为三块：
+`report.rs` 中的 Markdown 渲染改为两块：
 
-- `Reference`
 - `Name Algorithms`
 - `Metadata Algorithms`
 
 其中：
 
-- `Name Algorithms` 下每个算法按合约输出，token 明细里展示 `name`
+- `Name Algorithms` 下每个算法按合约输出，只展示合约级聚类信息
 - `Metadata Algorithms` 下每个算法按 token 输出，展示 `metadata_doc`
 
 ## Testing Strategy
@@ -164,7 +154,7 @@
 
 - `BenchmarkReport` 正确拆分为 `name_algorithms` / `metadata_algorithms`
 - Markdown 里有分块标题
-- 原合约记录不会出现在 `reference`、`name`、`metadata` 输出中
+- 原合约记录不会出现在 `name`、`metadata` 输出中
 
 ## Non-Goals
 

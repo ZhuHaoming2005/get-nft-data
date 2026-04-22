@@ -1,5 +1,12 @@
 # Dedup Benchmark Duplicates-Only Design
 
+> Note
+>
+> 这份设计记录了最初的 duplicates-only 方向。后续实现已进一步收缩正式报告形态：
+> - 不再保留单独的 `reference` 报告块
+> - 正式报告只保留 `name_algorithms` 和 `metadata_algorithms`
+> - `name` 结果按合约聚类输出
+
 ## Goal
 
 将 `dedup_bench_rs` 从“输出各算法 top_k 候选”改为“只输出各算法判定为重复的结果”。每个算法必须有独立、可配置、可解释的判重标准，所有标准集中在单独文件中维护。

@@ -5,12 +5,11 @@ use std::time::Instant;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
 use crate::algorithms::{
-    build_algorithm_duplicates_raw_from_scores, build_reference_duplicates_raw,
-    group_name_duplicates_by_contract, metadata_duplicates_from_candidates,
-    score_rows_parallel_raw, timing_algorithms, AlgorithmField,
-    MetadataAlgorithmReport, NameAlgorithmReport, ReferenceReport,
+    build_algorithm_duplicates_raw_from_scores, group_name_duplicates_by_contract,
+    metadata_duplicates_from_candidates, score_rows_parallel_raw, timing_algorithms,
+    AlgorithmField, MetadataAlgorithmReport, NameAlgorithmReport,
 };
-use crate::decision_rules::{duplicate_score_rule, reference_duplicate_rule};
+use crate::decision_rules::duplicate_score_rule;
 use crate::error::BenchError;
 use crate::report::BenchmarkReport;
 use crate::sample::BenchmarkSample;
@@ -59,56 +58,43 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
             Ok(())
         })?;
     }
-    algorithm_thread_pool.install(|| {
-        let _ = build_reference_duplicates_raw(&sample, &recall_rows);
-    });
 
     let mut algorithm_runs_ms: Vec<Vec<f64>> = (0..algorithms.len())
         .map(|_| Vec::with_capacity(repeat))
         .collect();
     let mut algorithm_results: Vec<Option<TimedAlgorithmResult>> =
         (0..algorithms.len()).map(|_| None).collect();
-    let mut reference_runs_ms = Vec::with_capacity(repeat);
-    let mut reference_result = None;
-    let total_timed_units = algorithms.len() + 1;
+    let total_timed_units = algorithms.len();
     for repeat_index in 0..repeat {
         for offset in 0..total_timed_units {
             let timed_unit_index = (repeat_index + offset) % total_timed_units;
-            if timed_unit_index < algorithms.len() {
-                let algorithm = algorithms[timed_unit_index];
-                let started = Instant::now();
-                let result = algorithm_thread_pool.install(|| -> Result<TimedAlgorithmResult, BenchError> {
-                    let scores =
-                        score_rows_parallel_raw(&sample, &recall_rows, algorithm.scorer);
-                    let (_, duplicates) = build_algorithm_duplicates_raw_from_scores(
-                        algorithm.id,
-                        &recall_rows,
-                        &scores,
-                    )
-                    .map_err(BenchError::InvalidData)?;
-                    Ok(match algorithm.field {
-                        AlgorithmField::Name => {
-                            let duplicates = group_name_duplicates_by_contract(duplicates);
-                            TimedAlgorithmResult::Name(duplicates.len(), duplicates)
-                        }
-                        AlgorithmField::Metadata => {
-                            let duplicates =
-                                metadata_duplicates_from_candidates(&recall_rows, duplicates);
-                            TimedAlgorithmResult::Metadata(duplicates.len(), duplicates)
-                        }
-                        AlgorithmField::Reference => unreachable!(),
-                    })
-                })?;
-                algorithm_runs_ms[timed_unit_index]
-                    .push(started.elapsed().as_secs_f64() * 1000.0);
-                algorithm_results[timed_unit_index] = Some(result);
-            } else {
-                let started = Instant::now();
-                let result = algorithm_thread_pool
-                    .install(|| build_reference_duplicates_raw(&sample, &recall_rows));
-                reference_runs_ms.push(started.elapsed().as_secs_f64() * 1000.0);
-                reference_result = Some(result);
-            }
+            let algorithm = algorithms[timed_unit_index];
+            let started = Instant::now();
+            let result = algorithm_thread_pool.install(|| -> Result<TimedAlgorithmResult, BenchError> {
+                let scores =
+                    score_rows_parallel_raw(&sample, &recall_rows, algorithm.scorer);
+                let (_, duplicates) = build_algorithm_duplicates_raw_from_scores(
+                    algorithm.id,
+                    &recall_rows,
+                    &scores,
+                )
+                .map_err(BenchError::InvalidData)?;
+                Ok(match algorithm.field {
+                    AlgorithmField::Name => {
+                        let duplicates = group_name_duplicates_by_contract(duplicates);
+                        TimedAlgorithmResult::Name(duplicates.len(), duplicates)
+                    }
+                    AlgorithmField::Metadata => {
+                        let duplicates =
+                            metadata_duplicates_from_candidates(&recall_rows, duplicates);
+                        TimedAlgorithmResult::Metadata(duplicates.len(), duplicates)
+                    }
+                    AlgorithmField::Reference => unreachable!(),
+                })
+            })?;
+            algorithm_runs_ms[timed_unit_index]
+                .push(started.elapsed().as_secs_f64() * 1000.0);
+            algorithm_results[timed_unit_index] = Some(result);
         }
     }
     let mut name_algorithm_reports = Vec::new();
@@ -155,29 +141,12 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
             }
         }
     }
-    let (reference_duplicate_count, reference_duplicates) =
-        reference_result.unwrap_or((0, Vec::new()));
-
     let report = BenchmarkReport {
         chain: config.chain.clone(),
         source,
         sample,
         recall_elapsed_ms,
         recall_candidate_count: recall_rows.len(),
-        reference: ReferenceReport {
-            algorithm_id: "current_name_metadata_reference".to_string(),
-            field: crate::algorithms::AlgorithmField::Reference,
-            decision_rule: reference_duplicate_rule().description.to_string(),
-            repeat,
-            runs_ms: reference_runs_ms.clone(),
-            avg_ms: reference_runs_ms.iter().sum::<f64>() / reference_runs_ms.len() as f64,
-            min_ms: reference_runs_ms
-                .iter()
-                .copied()
-                .fold(f64::INFINITY, f64::min),
-            duplicate_count: reference_duplicate_count,
-            duplicates: reference_duplicates,
-        },
         name_algorithms: name_algorithm_reports,
         metadata_algorithms: metadata_algorithm_reports,
     };
@@ -281,16 +250,16 @@ mod tests {
         assert_eq!(report.recall_candidate_count, 3);
         assert!(
             report
-                .reference
-                .duplicates
+                .metadata_algorithms
                 .iter()
+                .flat_map(|algorithm| algorithm.duplicates.iter())
                 .all(|candidate| candidate.contract_address != "0xby_uri_only")
         );
         assert!(
             report
-                .reference
-                .duplicates
+                .metadata_algorithms
                 .iter()
+                .flat_map(|algorithm| algorithm.duplicates.iter())
                 .all(|candidate| candidate.contract_address != "0xseed")
         );
     }
@@ -348,7 +317,10 @@ mod tests {
 
         assert_eq!(report.source.kind, crate::store::SourceKind::DuckdbTable);
         assert_eq!(report.recall_candidate_count, 1);
-        assert_eq!(report.reference.duplicates[0].contract_address, "0xparquet");
+        assert_eq!(
+            report.metadata_algorithms[0].duplicates[0].contract_address,
+            "0xparquet"
+        );
 
         let second_output_path = dir.path().join("report-second.json");
         let second_report = run_benchmark(&BenchmarkConfig {
@@ -368,7 +340,7 @@ mod tests {
         assert_eq!(second_report.source.kind, crate::store::SourceKind::DuckdbTable);
         assert_eq!(second_report.recall_candidate_count, 1);
         assert_eq!(
-            second_report.reference.duplicates[0].contract_address,
+            second_report.metadata_algorithms[0].duplicates[0].contract_address,
             "0xparquet"
         );
     }
@@ -407,20 +379,6 @@ mod tests {
             algorithm_threads: 30,
         })
         .unwrap();
-
-        let single_reference: Vec<(String, String)> = single
-            .reference
-            .duplicates
-            .iter()
-            .map(|candidate| (candidate.contract_address.clone(), candidate.token_id.clone()))
-            .collect();
-        let repeated_reference: Vec<(String, String)> = repeated
-            .reference
-            .duplicates
-            .iter()
-            .map(|candidate| (candidate.contract_address.clone(), candidate.token_id.clone()))
-            .collect();
-        assert_eq!(single_reference, repeated_reference);
 
         let single_name: Vec<String> = single.name_algorithms[0]
             .duplicates
@@ -519,14 +477,6 @@ mod tests {
         assert_eq!(name_report.duplicate_count, 1);
         assert_eq!(name_report.duplicates[0].contract_address, "0xby_name");
         assert_eq!(name_report.duplicates[0].duplicate_token_count, 2);
-        assert_eq!(
-            name_report.duplicates[0]
-                .tokens
-                .iter()
-                .map(|token| token.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["Azuki #2", "Azuki #4"]
-        );
 
         let metadata_report = report
             .metadata_algorithms

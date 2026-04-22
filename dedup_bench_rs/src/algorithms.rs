@@ -38,18 +38,10 @@ pub struct CandidateScore {
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
-pub struct NameDuplicateToken {
-    pub token_id: String,
-    pub name: String,
-    pub score: f64,
-}
-
-#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct NameContractDuplicate {
     pub contract_address: String,
     pub max_score: f64,
     pub duplicate_token_count: usize,
-    pub tokens: Vec<NameDuplicateToken>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -744,19 +736,10 @@ pub fn group_name_duplicates_by_contract(
             });
             let max_score = matches.first().map(|candidate| candidate.score).unwrap_or(0.0);
             let duplicate_token_count = matches.len();
-            let tokens = matches
-                .into_iter()
-                .map(|candidate| NameDuplicateToken {
-                    token_id: candidate.token_id,
-                    name: candidate.name,
-                    score: candidate.score,
-                })
-                .collect();
             NameContractDuplicate {
                 contract_address,
                 max_score,
                 duplicate_token_count,
-                tokens,
             }
         })
         .collect();
@@ -1319,14 +1302,6 @@ mod tests {
         assert_eq!(grouped[0].contract_address, "0xdup");
         assert_eq!(grouped[0].max_score, 100.0);
         assert_eq!(grouped[0].duplicate_token_count, 2);
-        assert_eq!(
-            grouped[0]
-                .tokens
-                .iter()
-                .map(|token| token.token_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["2", "4"]
-        );
     }
 
     #[test]
