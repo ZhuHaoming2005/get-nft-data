@@ -64,13 +64,14 @@ fn cli_writes_json_and_markdown_outputs() {
     assert!(json_output.contains("\"metadata_algorithms\""));
     assert!(json_output.contains("\"duplicate_count\""));
     assert!(json_output.contains("\"metadata_doc\": \"rare dragon gold\""));
+    assert!(json_output.contains("\"name\": \"Azuki #2\""));
     assert!(!json_output.contains("\"reference\""));
     assert!(!json_output.contains("Excluded Seed #9"));
     assert!(markdown_output.contains("# NFT Name/Metadata Dedup Benchmark"));
     assert!(markdown_output.contains("## Name Algorithms"));
     assert!(markdown_output.contains("## Metadata Algorithms"));
     assert!(markdown_output.contains("duplicate_count"));
-    assert!(markdown_output.contains("contract=`0xname`"));
+    assert!(markdown_output.contains("contract=`0xname` name=`Azuki #2`"));
     assert!(markdown_output.contains("metadata_doc=`rare dragon gold`"));
     assert!(!markdown_output.contains("## Current Name/Metadata Reference"));
     assert!(!markdown_output.contains("Excluded Seed #9"));

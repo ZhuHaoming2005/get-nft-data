@@ -483,6 +483,7 @@ mod tests {
             .unwrap();
         assert_eq!(name_report.duplicate_count, 1);
         assert_eq!(name_report.duplicates[0].contract_address, "0xby_name");
+        assert_eq!(name_report.duplicates[0].name, "Azuki #2");
         assert_eq!(name_report.duplicates[0].duplicate_token_count, 2);
 
         let metadata_report = report

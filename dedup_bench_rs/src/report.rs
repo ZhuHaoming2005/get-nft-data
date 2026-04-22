@@ -50,8 +50,11 @@ impl BenchmarkReport {
             ));
             for candidate in &algorithm.duplicates {
                 out.push_str(&format!(
-                    "1. contract=`{}` max_score=`{:.4}` duplicate_token_count=`{}`\n",
-                    candidate.contract_address, candidate.max_score, candidate.duplicate_token_count
+                    "1. contract=`{}` name=`{}` max_score=`{:.4}` duplicate_token_count=`{}`\n",
+                    candidate.contract_address,
+                    candidate.name,
+                    candidate.max_score,
+                    candidate.duplicate_token_count
                 ));
             }
             out.push('\n');

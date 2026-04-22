@@ -40,6 +40,7 @@ pub struct CandidateScore {
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct NameContractDuplicate {
     pub contract_address: String,
+    pub name: String,
     pub max_score: f64,
     pub duplicate_token_count: usize,
 }
@@ -771,6 +772,7 @@ pub fn name_duplicates_from_candidates(
                 .get(&candidate.contract_address)
                 .map(|row| NameContractDuplicate {
                     contract_address: candidate.contract_address,
+                    name: row.name.clone(),
                     max_score: candidate.score,
                     duplicate_token_count: row.token_count,
                 })
@@ -1371,6 +1373,7 @@ mod tests {
 
         assert_eq!(grouped.len(), 2);
         assert_eq!(grouped[0].contract_address, "0xdup");
+        assert_eq!(grouped[0].name, "Azuki");
         assert_eq!(grouped[0].max_score, 100.0);
         assert_eq!(grouped[0].duplicate_token_count, 2);
     }
