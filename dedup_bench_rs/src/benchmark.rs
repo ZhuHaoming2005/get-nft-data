@@ -5,10 +5,10 @@ use std::time::Instant;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
 use crate::algorithms::{
-    build_algorithm_duplicates_raw_from_scores, metadata_duplicate_doc_scorer,
-    metadata_duplicates_from_candidates, name_duplicates_from_candidates,
-    score_rows_parallel_raw, timing_algorithms, AlgorithmField, CandidateScore,
-    MetadataAlgorithmReport, NameAlgorithmReport,
+    build_algorithm_duplicates_raw_from_scores, metadata_duplicates_from_candidates,
+    name_duplicates_from_candidates, score_metadata_bm25_all_rows_raw, score_rows_parallel_raw,
+    timing_algorithms, AlgorithmField, CandidateScore, MetadataAlgorithmReport,
+    NameAlgorithmReport,
 };
 use crate::decision_rules::duplicate_score_rule;
 use crate::error::BenchError;
@@ -53,7 +53,7 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
     let algorithms = timing_algorithms();
     for algorithm in &algorithms {
         algorithm_thread_pool.install(|| -> Result<(), BenchError> {
-            let scores = score_rows_parallel_raw(&sample, &recall_rows, algorithm.scorer);
+            let scores = score_algorithm_rows_raw(&sample, &recall_rows, *algorithm);
             let _ = build_algorithm_duplicates_raw_from_scores(algorithm.id, &recall_rows, &scores)
                 .map_err(BenchError::InvalidData)?;
             Ok(())
@@ -72,8 +72,7 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
             let algorithm = algorithms[timed_unit_index];
             let started = Instant::now();
             let result = algorithm_thread_pool.install(|| -> Result<TimedAlgorithmResult, BenchError> {
-                let scores =
-                    score_rows_parallel_raw(&sample, &recall_rows, algorithm.scorer);
+                let scores = score_algorithm_rows_raw(&sample, &recall_rows, algorithm);
                 let (_, duplicates) = build_algorithm_duplicates_raw_from_scores(
                     algorithm.id,
                     &recall_rows,
@@ -88,7 +87,6 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
                     AlgorithmField::Metadata => {
                         TimedAlgorithmResult::Metadata(duplicates.len(), duplicates)
                     }
-                    AlgorithmField::Reference => unreachable!(),
                 })
             })?;
             algorithm_runs_ms[timed_unit_index]
@@ -110,7 +108,6 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
             .unwrap_or_else(|| match algorithm.field {
                 AlgorithmField::Name => TimedAlgorithmResult::Name(0, Vec::new()),
                 AlgorithmField::Metadata => TimedAlgorithmResult::Metadata(0, Vec::new()),
-                AlgorithmField::Reference => unreachable!(),
             }) {
             TimedAlgorithmResult::Name(duplicate_count, duplicates) => {
                 name_algorithm_reports.push(NameAlgorithmReport {
@@ -126,13 +123,11 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
                 });
             }
             TimedAlgorithmResult::Metadata(duplicate_count, duplicates) => {
-                let per_doc = metadata_duplicate_doc_scorer(algorithm.id)
-                    .map_err(BenchError::InvalidData)?;
                 let duplicates = metadata_duplicates_from_candidates(
                     &sample,
                     &recall_rows,
                     duplicates,
-                    per_doc,
+                    algorithm.id,
                 );
                 metadata_algorithm_reports.push(MetadataAlgorithmReport {
                     algorithm_id: algorithm.id.to_string(),
@@ -159,6 +154,18 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
     };
     write_report_outputs(&report, &config.output)?;
     Ok(report)
+}
+
+fn score_algorithm_rows_raw(
+    sample: &BenchmarkSample,
+    rows: &[crate::store::FeatureRow],
+    algorithm: crate::algorithms::TimingAlgorithmDefinition,
+) -> Vec<f64> {
+    if algorithm.id == "metadata_bm25" {
+        score_metadata_bm25_all_rows_raw(sample, rows)
+    } else {
+        score_rows_parallel_raw(sample, rows, algorithm.scorer)
+    }
 }
 
 fn algorithm_thread_pool(threads: usize) -> Result<ThreadPool, BenchError> {
@@ -489,7 +496,7 @@ mod tests {
         let metadata_report = report
             .metadata_algorithms
             .iter()
-            .find(|algorithm| algorithm.algorithm_id == "metadata_current_hybrid")
+            .find(|algorithm| algorithm.algorithm_id == "metadata_bm25")
             .unwrap();
         assert_eq!(metadata_report.duplicate_count, 1);
         assert_eq!(metadata_report.duplicates[0].contract_address, "0xby_metadata");

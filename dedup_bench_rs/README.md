@@ -34,7 +34,7 @@
   - 正式报告只输出被各算法判定为重复的 `duplicates`
   - 每个算法的判重规则集中定义在 `src/decision_rules.rs`
 - 计时口径：
-  - 算法层并行线程数默认是 `30`，可通过参数自定义
+  - 算法层并行线程数默认是 `32`，可通过参数自定义
   - 每个算法都会先对同一批 `recall_rows` 预热一次，再进入正式计时
   - 正式计时时会轮转各算法的执行顺序，降低固定顺序带来的缓存偏差
 
@@ -119,29 +119,15 @@ cargo run -- run \
 
 - `name_exact_normalized`
 - `name_jaro_winkler`
-- `name_normalized_levenshtein`
-- `name_trigram_jaccard`
-- `name_current_hybrid`
-
-当前基线公式：
-
-```text
-0.65 * Jaro-Winkler + 0.35 * normalized Levenshtein
-```
+- `name_damerau_levenshtein`
+- `name_monge_elkan`
 
 ### Metadata
 
-- `metadata_token_jaccard`
-- `metadata_jaro_winkler_doc`
-- `metadata_trigram_jaccard_doc`
+- `metadata_bm25`
 - `metadata_token_cosine`
-- `metadata_current_hybrid`
-
-当前基线公式：
-
-```text
-0.45 * token Jaccard + 0.55 * Jaro-Winkler
-```
+- `metadata_soft_tfidf`
+- `metadata_weighted_jaccard`
 
 ## 输出说明
 
@@ -178,11 +164,11 @@ cargo run -- run \
 
 - `name_algorithms[*].duplicates` 为合约级结果，包含：
   - `contract_address`
+  - `name`
   - `max_score`
   - `duplicate_token_count`
-- `metadata_algorithms[*].duplicates` 为 token 级结果，包含：
+- `metadata_algorithms[*].duplicates` 为合约级结果，包含：
   - `contract_address`
-  - `token_id`
   - `metadata_doc`
   - `score`
 
@@ -193,7 +179,7 @@ cargo run -- run \
 - 样例信息
 - 召回数量和耗时
 - `Name Algorithms` 合约级重复结果
-- `Metadata Algorithms` token 级重复结果
+- `Metadata Algorithms` 合约级重复结果
 
 ## 数据要求
 

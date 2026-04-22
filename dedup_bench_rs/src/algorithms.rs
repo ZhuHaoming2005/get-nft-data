@@ -1,31 +1,24 @@
-#![allow(dead_code)]
-
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 use once_cell::sync::Lazy;
 use rayon::prelude::*;
 use regex::Regex;
 use serde::Serialize;
-use strsim::{jaro_winkler, normalized_levenshtein};
-use top_contract_analysis_rs::analysis::scoring::{score_metadata_document_pair, score_name_pair};
+use strsim::{damerau_levenshtein, jaro_winkler};
 use top_contract_analysis_rs::normalize::{normalize_name, normalize_text};
 
-use crate::decision_rules::{duplicate_score_rule, reference_duplicate_rule};
+use crate::decision_rules::duplicate_score_rule;
 use crate::sample::BenchmarkSample;
 use crate::store::FeatureRow;
 
 static TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\p{L}\p{N}_]+").unwrap());
-
-pub const DEFAULT_NAME_THRESHOLD: f64 = 95.0;
-pub const DEFAULT_METADATA_THRESHOLD: f64 = 0.55;
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AlgorithmField {
     Name,
     Metadata,
-    Reference,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -50,31 +43,6 @@ pub struct MetadataDuplicate {
     pub contract_address: String,
     pub metadata_doc: String,
     pub score: f64,
-}
-
-#[derive(Clone, Debug, Serialize, PartialEq)]
-pub struct ReferenceCandidateScore {
-    pub rank: usize,
-    pub contract_address: String,
-    pub token_id: String,
-    pub name: String,
-    pub combined_score: f64,
-    pub name_score: f64,
-    pub metadata_score: f64,
-    pub match_reasons: Vec<String>,
-}
-
-#[derive(Clone, Debug, Serialize, PartialEq)]
-pub struct AlgorithmReport {
-    pub algorithm_id: String,
-    pub field: AlgorithmField,
-    pub decision_rule: String,
-    pub repeat: usize,
-    pub runs_ms: Vec<f64>,
-    pub avg_ms: f64,
-    pub min_ms: f64,
-    pub duplicate_count: usize,
-    pub duplicates: Vec<CandidateScore>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -103,26 +71,6 @@ pub struct MetadataAlgorithmReport {
     pub duplicates: Vec<MetadataDuplicate>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
-pub struct ReferenceReport {
-    pub algorithm_id: String,
-    pub field: AlgorithmField,
-    pub decision_rule: String,
-    pub repeat: usize,
-    pub runs_ms: Vec<f64>,
-    pub avg_ms: f64,
-    pub min_ms: f64,
-    pub duplicate_count: usize,
-    pub duplicates: Vec<ReferenceCandidateScore>,
-}
-
-#[derive(Clone, Copy)]
-pub struct AlgorithmDefinition {
-    pub id: &'static str,
-    pub field: AlgorithmField,
-    pub scorer: fn(&PreparedSample, &PreparedFeatureRow) -> f64,
-}
-
 #[derive(Clone, Copy)]
 pub struct TimingAlgorithmDefinition {
     pub id: &'static str,
@@ -132,102 +80,12 @@ pub struct TimingAlgorithmDefinition {
 
 pub fn metadata_duplicate_doc_scorer(algorithm_id: &str) -> Result<fn(&str, &str) -> f64, String> {
     match algorithm_id {
-        "metadata_token_jaccard" => Ok(token_jaccard),
-        "metadata_jaro_winkler_doc" => Ok(score_metadata_jaro_winkler_pair),
-        "metadata_trigram_jaccard_doc" => Ok(trigram_jaccard),
         "metadata_token_cosine" => Ok(token_cosine),
-        "metadata_current_hybrid" => Ok(score_metadata_document_pair),
+        "metadata_soft_tfidf" => Ok(soft_tfidf),
+        "metadata_weighted_jaccard" => Ok(weighted_jaccard),
+        "metadata_bm25" => Err("metadata_bm25 requires corpus-aware scoring".to_string()),
         _ => Err(format!("unknown metadata algorithm id: {algorithm_id}")),
     }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct PreparedText {
-    pub normalized: String,
-    pub trigram_set: BTreeSet<String>,
-    pub token_set: HashSet<String>,
-    pub token_counts: BTreeMap<String, f64>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct PreparedSample {
-    pub raw: BenchmarkSample,
-    pub name_prefix: Option<String>,
-    pub name_text: PreparedText,
-    pub metadata_text: PreparedText,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct PreparedFeatureRow {
-    pub raw: FeatureRow,
-    pub name_text: PreparedText,
-    pub metadata_texts: Vec<PreparedText>,
-}
-
-pub fn name_algorithms() -> Vec<AlgorithmDefinition> {
-    vec![
-        AlgorithmDefinition {
-            id: "name_exact_normalized",
-            field: AlgorithmField::Name,
-            scorer: score_name_exact_normalized,
-        },
-        AlgorithmDefinition {
-            id: "name_jaro_winkler",
-            field: AlgorithmField::Name,
-            scorer: score_name_jaro_winkler,
-        },
-        AlgorithmDefinition {
-            id: "name_normalized_levenshtein",
-            field: AlgorithmField::Name,
-            scorer: score_name_normalized_levenshtein,
-        },
-        AlgorithmDefinition {
-            id: "name_trigram_jaccard",
-            field: AlgorithmField::Name,
-            scorer: score_name_trigram_jaccard,
-        },
-        AlgorithmDefinition {
-            id: "name_current_hybrid",
-            field: AlgorithmField::Name,
-            scorer: score_name_current_hybrid,
-        },
-    ]
-}
-
-pub fn metadata_algorithms() -> Vec<AlgorithmDefinition> {
-    vec![
-        AlgorithmDefinition {
-            id: "metadata_token_jaccard",
-            field: AlgorithmField::Metadata,
-            scorer: score_metadata_token_jaccard,
-        },
-        AlgorithmDefinition {
-            id: "metadata_jaro_winkler_doc",
-            field: AlgorithmField::Metadata,
-            scorer: score_metadata_jaro_winkler_doc,
-        },
-        AlgorithmDefinition {
-            id: "metadata_trigram_jaccard_doc",
-            field: AlgorithmField::Metadata,
-            scorer: score_metadata_trigram_jaccard_doc,
-        },
-        AlgorithmDefinition {
-            id: "metadata_token_cosine",
-            field: AlgorithmField::Metadata,
-            scorer: score_metadata_token_cosine,
-        },
-        AlgorithmDefinition {
-            id: "metadata_current_hybrid",
-            field: AlgorithmField::Metadata,
-            scorer: score_metadata_current_hybrid,
-        },
-    ]
-}
-
-pub fn all_algorithms() -> Vec<AlgorithmDefinition> {
-    let mut algorithms = name_algorithms();
-    algorithms.extend(metadata_algorithms());
-    algorithms
 }
 
 pub fn timing_algorithms() -> Vec<TimingAlgorithmDefinition> {
@@ -243,34 +101,19 @@ pub fn timing_algorithms() -> Vec<TimingAlgorithmDefinition> {
             scorer: score_name_jaro_winkler_raw,
         },
         TimingAlgorithmDefinition {
-            id: "name_normalized_levenshtein",
+            id: "name_damerau_levenshtein",
             field: AlgorithmField::Name,
-            scorer: score_name_normalized_levenshtein_raw,
+            scorer: score_name_damerau_levenshtein_raw,
         },
         TimingAlgorithmDefinition {
-            id: "name_trigram_jaccard",
+            id: "name_monge_elkan",
             field: AlgorithmField::Name,
-            scorer: score_name_trigram_jaccard_raw,
+            scorer: score_name_monge_elkan_raw,
         },
         TimingAlgorithmDefinition {
-            id: "name_current_hybrid",
-            field: AlgorithmField::Name,
-            scorer: score_name_current_hybrid_raw,
-        },
-        TimingAlgorithmDefinition {
-            id: "metadata_token_jaccard",
+            id: "metadata_bm25",
             field: AlgorithmField::Metadata,
-            scorer: score_metadata_token_jaccard_raw,
-        },
-        TimingAlgorithmDefinition {
-            id: "metadata_jaro_winkler_doc",
-            field: AlgorithmField::Metadata,
-            scorer: score_metadata_jaro_winkler_doc_raw,
-        },
-        TimingAlgorithmDefinition {
-            id: "metadata_trigram_jaccard_doc",
-            field: AlgorithmField::Metadata,
-            scorer: score_metadata_trigram_jaccard_doc_raw,
+            scorer: score_metadata_bm25_raw,
         },
         TimingAlgorithmDefinition {
             id: "metadata_token_cosine",
@@ -278,9 +121,14 @@ pub fn timing_algorithms() -> Vec<TimingAlgorithmDefinition> {
             scorer: score_metadata_token_cosine_raw,
         },
         TimingAlgorithmDefinition {
-            id: "metadata_current_hybrid",
+            id: "metadata_soft_tfidf",
             field: AlgorithmField::Metadata,
-            scorer: score_metadata_current_hybrid_raw,
+            scorer: score_metadata_soft_tfidf_raw,
+        },
+        TimingAlgorithmDefinition {
+            id: "metadata_weighted_jaccard",
+            field: AlgorithmField::Metadata,
+            scorer: score_metadata_weighted_jaccard_raw,
         },
     ]
 }
@@ -317,47 +165,14 @@ pub fn tokenize(document: &str) -> Vec<String> {
         .collect()
 }
 
-fn trigram_set(document: &str) -> BTreeSet<String> {
-    let chars: Vec<char> = document.chars().collect();
-    if chars.is_empty() {
-        return BTreeSet::new();
-    }
-    if chars.len() < 3 {
-        return BTreeSet::from([document.to_string()]);
-    }
-    chars
-        .windows(3)
-        .map(|window| window.iter().collect::<String>())
-        .collect()
-}
-
-fn trigram_jaccard(left: &str, right: &str) -> f64 {
-    let left = normalize_text(left);
-    let right = normalize_text(right);
-    if left.is_empty() || right.is_empty() {
-        return 0.0;
-    }
-    let left_set = trigram_set(&left);
-    let right_set = trigram_set(&right);
-    trigram_jaccard_from_sets(&left_set, &right_set)
-}
-
-fn trigram_jaccard_from_sets(left: &BTreeSet<String>, right: &BTreeSet<String>) -> f64 {
-    let union = left.union(right).count();
-    let overlap = left.intersection(right).count();
-    if union == 0 {
-        0.0
-    } else {
-        overlap as f64 / union as f64
-    }
-}
-
+#[cfg(test)]
 fn token_jaccard(left: &str, right: &str) -> f64 {
     let left_tokens: HashSet<String> = tokenize(&normalize_text(left)).into_iter().collect();
     let right_tokens: HashSet<String> = tokenize(&normalize_text(right)).into_iter().collect();
     token_jaccard_from_sets(&left_tokens, &right_tokens)
 }
 
+#[cfg(test)]
 fn token_jaccard_from_sets(left: &HashSet<String>, right: &HashSet<String>) -> f64 {
     if left.is_empty() || right.is_empty() {
         return 0.0;
@@ -403,58 +218,138 @@ fn token_cosine_from_counts(left: &BTreeMap<String, f64>, right: &BTreeMap<Strin
     }
 }
 
+fn tokenize_name(document: &str) -> Vec<String> {
+    tokenize(document)
+        .into_iter()
+        .filter(|token| !token.chars().all(|ch| ch.is_ascii_digit()))
+        .collect()
+}
+
+fn monge_elkan(left: &str, right: &str) -> f64 {
+    let left_tokens = tokenize_name(&normalize_text(left));
+    let right_tokens = tokenize_name(&normalize_text(right));
+    if left_tokens.is_empty() || right_tokens.is_empty() {
+        return 0.0;
+    }
+
+    let left_to_right = monge_elkan_direction(&left_tokens, &right_tokens);
+    let right_to_left = monge_elkan_direction(&right_tokens, &left_tokens);
+    (left_to_right + right_to_left) / 2.0
+}
+
+fn monge_elkan_direction(left_tokens: &[String], right_tokens: &[String]) -> f64 {
+    let sum = left_tokens
+        .iter()
+        .map(|left| {
+            right_tokens
+                .iter()
+                .map(|right| jaro_winkler(left, right))
+                .fold(0.0, f64::max)
+        })
+        .sum::<f64>();
+    sum / left_tokens.len() as f64
+}
+
 fn token_counts(document: &str) -> BTreeMap<String, f64> {
     let mut counts = BTreeMap::<String, f64>::new();
-    for token in tokenize(document) {
+    for token in tokenize(&normalize_text(document)) {
         *counts.entry(token).or_insert(0.0) += 1.0;
     }
     counts
 }
 
-fn prepare_text(normalized: String) -> PreparedText {
-    PreparedText {
-        trigram_set: trigram_set(&normalized),
-        token_set: tokenize(&normalized).into_iter().collect(),
-        token_counts: token_counts(&normalized),
-        normalized,
+fn inverse_document_frequencies(left: &BTreeMap<String, f64>, right: &BTreeMap<String, f64>) -> BTreeMap<String, f64> {
+    let mut doc_freqs = BTreeMap::<String, f64>::new();
+    for token in left.keys() {
+        *doc_freqs.entry(token.clone()).or_insert(0.0) += 1.0;
     }
-}
-
-pub fn prepare_sample(sample: BenchmarkSample) -> PreparedSample {
-    PreparedSample {
-        name_prefix: if sample.name_norm.is_empty() {
-            None
-        } else {
-            Some(sample.name_norm.chars().take(8).collect())
-        },
-        name_text: prepare_text(sample.name_norm.clone()),
-        metadata_text: prepare_text(normalize_text(&sample.metadata_doc)),
-        raw: sample,
+    for token in right.keys() {
+        *doc_freqs.entry(token.clone()).or_insert(0.0) += 1.0;
     }
-}
 
-pub fn prepare_rows(rows: Vec<FeatureRow>) -> Vec<PreparedFeatureRow> {
-    rows.into_iter()
-        .map(|row| PreparedFeatureRow {
-            name_text: prepare_text(row.name_norm.clone()),
-            metadata_texts: row
-                .metadata_docs
-                .iter()
-                .map(|doc| prepare_text(normalize_text(doc)))
-                .collect(),
-            raw: row,
+    doc_freqs
+        .into_iter()
+        .map(|(token, df)| {
+            let idf = ((2.0 - df + 0.5) / (df + 0.5) + 1.0).ln().max(0.1);
+            (token, idf)
         })
         .collect()
 }
 
-pub fn score_name_exact_normalized(sample: &PreparedSample, row: &PreparedFeatureRow) -> f64 {
-    if sample.raw.name_norm.is_empty() || row.raw.name_norm.is_empty() {
-        0.0
-    } else if sample.raw.name_norm == row.raw.name_norm {
-        100.0
-    } else {
-        0.0
+fn weighted_jaccard(left: &str, right: &str) -> f64 {
+    let left_counts = token_counts(left);
+    let right_counts = token_counts(right);
+    if left_counts.is_empty() || right_counts.is_empty() {
+        return 0.0;
     }
+
+    let weights = inverse_document_frequencies(&left_counts, &right_counts);
+    let mut all_tokens: HashSet<String> = HashSet::new();
+    all_tokens.extend(left_counts.keys().cloned());
+    all_tokens.extend(right_counts.keys().cloned());
+
+    let mut numerator = 0.0;
+    let mut denominator = 0.0;
+    for token in all_tokens {
+        let left_value = *left_counts.get(&token).unwrap_or(&0.0);
+        let right_value = *right_counts.get(&token).unwrap_or(&0.0);
+        let weight = *weights.get(&token).unwrap_or(&1.0);
+        numerator += left_value.min(right_value) * weight;
+        denominator += left_value.max(right_value) * weight;
+    }
+
+    if denominator == 0.0 {
+        0.0
+    } else {
+        numerator / denominator
+    }
+}
+
+fn soft_tfidf(left: &str, right: &str) -> f64 {
+    let left_counts = token_counts(left);
+    let right_counts = token_counts(right);
+    if left_counts.is_empty() || right_counts.is_empty() {
+        return 0.0;
+    }
+
+    let weights = inverse_document_frequencies(&left_counts, &right_counts);
+    let left_vector = tfidf_vector(&left_counts, &weights);
+    let right_vector = tfidf_vector(&right_counts, &weights);
+
+    let mut dot = 0.0;
+    for (left_token, left_weight) in &left_vector {
+        let best = right_vector
+            .iter()
+            .map(|(right_token, right_weight)| {
+                let similarity = if left_token == right_token {
+                    1.0
+                } else {
+                    jaro_winkler(left_token, right_token)
+                };
+                if similarity >= 0.9 {
+                    left_weight * right_weight * similarity
+                } else {
+                    0.0
+                }
+            })
+            .fold(0.0, f64::max);
+        dot += best;
+    }
+
+    let left_norm = left_vector.values().map(|value| value * value).sum::<f64>().sqrt();
+    let right_norm = right_vector.values().map(|value| value * value).sum::<f64>().sqrt();
+    if left_norm == 0.0 || right_norm == 0.0 {
+        0.0
+    } else {
+        (dot / (left_norm * right_norm)).clamp(0.0, 1.0)
+    }
+}
+
+fn tfidf_vector(counts: &BTreeMap<String, f64>, weights: &BTreeMap<String, f64>) -> BTreeMap<String, f64> {
+    counts
+        .iter()
+        .map(|(token, tf)| (token.clone(), tf * weights.get(token).copied().unwrap_or(1.0)))
+        .collect()
 }
 
 pub fn score_name_exact_normalized_raw(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
@@ -467,14 +362,6 @@ pub fn score_name_exact_normalized_raw(sample: &BenchmarkSample, row: &FeatureRo
     }
 }
 
-pub fn score_name_jaro_winkler(sample: &PreparedSample, row: &PreparedFeatureRow) -> f64 {
-    if sample.name_text.normalized.is_empty() || row.name_text.normalized.is_empty() {
-        0.0
-    } else {
-        jaro_winkler(&sample.name_text.normalized, &row.name_text.normalized) * 100.0
-    }
-}
-
 pub fn score_name_jaro_winkler_raw(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
     if sample.name_norm.is_empty() || row.name_norm.is_empty() {
         0.0
@@ -483,242 +370,151 @@ pub fn score_name_jaro_winkler_raw(sample: &BenchmarkSample, row: &FeatureRow) -
     }
 }
 
-pub fn score_name_normalized_levenshtein(
-    sample: &PreparedSample,
-    row: &PreparedFeatureRow,
-) -> f64 {
-    if sample.name_text.normalized.is_empty() || row.name_text.normalized.is_empty() {
-        0.0
-    } else {
-        normalized_levenshtein(&sample.name_text.normalized, &row.name_text.normalized) * 100.0
-    }
-}
-
-pub fn score_name_normalized_levenshtein_raw(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
+pub fn score_name_damerau_levenshtein_raw(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
     if sample.name_norm.is_empty() || row.name_norm.is_empty() {
         0.0
     } else {
-        normalized_levenshtein(&sample.name_norm, &row.name_norm) * 100.0
+        normalized_damerau_levenshtein(&sample.name_norm, &row.name_norm) * 100.0
     }
 }
 
-pub fn score_name_trigram_jaccard(sample: &PreparedSample, row: &PreparedFeatureRow) -> f64 {
-    trigram_jaccard_from_sets(&sample.name_text.trigram_set, &row.name_text.trigram_set) * 100.0
-}
-
-pub fn score_name_trigram_jaccard_raw(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
-    trigram_jaccard(&sample.name_norm, &row.name_norm) * 100.0
-}
-
-pub fn score_name_current_hybrid(sample: &PreparedSample, row: &PreparedFeatureRow) -> f64 {
-    score_name_pair(&sample.raw.name, &row.raw.name)
-}
-
-pub fn score_name_current_hybrid_raw(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
-    score_name_pair(&sample.name, &row.name)
-}
-
-pub fn score_metadata_token_jaccard(sample: &PreparedSample, row: &PreparedFeatureRow) -> f64 {
-    row.metadata_texts
-        .iter()
-        .map(|metadata_text| {
-            token_jaccard_from_sets(&sample.metadata_text.token_set, &metadata_text.token_set)
-        })
-        .fold(0.0, f64::max)
-}
-
-pub fn score_metadata_token_jaccard_raw(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
-    best_metadata_doc_score_raw(sample, row, token_jaccard)
-}
-
-pub fn score_metadata_jaro_winkler_doc(
-    sample: &PreparedSample,
-    row: &PreparedFeatureRow,
-) -> f64 {
-    row.metadata_texts
-        .iter()
-        .map(|metadata_text| {
-            if sample.metadata_text.normalized.is_empty() || metadata_text.normalized.is_empty() {
-                0.0
-            } else {
-                jaro_winkler(&sample.metadata_text.normalized, &metadata_text.normalized)
-            }
-        })
-        .fold(0.0, f64::max)
-}
-
-pub fn score_metadata_jaro_winkler_doc_raw(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
-    best_metadata_doc_score_raw(sample, row, score_metadata_jaro_winkler_pair)
-}
-
-pub fn score_metadata_trigram_jaccard_doc(
-    sample: &PreparedSample,
-    row: &PreparedFeatureRow,
-) -> f64 {
-    row.metadata_texts
-        .iter()
-        .map(|metadata_text| {
-            trigram_jaccard_from_sets(
-                &sample.metadata_text.trigram_set,
-                &metadata_text.trigram_set,
-            )
-        })
-        .fold(0.0, f64::max)
-}
-
-pub fn score_metadata_trigram_jaccard_doc_raw(
-    sample: &BenchmarkSample,
-    row: &FeatureRow,
-) -> f64 {
-    best_metadata_doc_score_raw(sample, row, trigram_jaccard)
-}
-
-pub fn score_metadata_token_cosine(sample: &PreparedSample, row: &PreparedFeatureRow) -> f64 {
-    row.metadata_texts
-        .iter()
-        .map(|metadata_text| {
-            token_cosine_from_counts(&sample.metadata_text.token_counts, &metadata_text.token_counts)
-        })
-        .fold(0.0, f64::max)
+pub fn score_name_monge_elkan_raw(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
+    if sample.name_norm.is_empty() || row.name_norm.is_empty() {
+        0.0
+    } else {
+        monge_elkan(&sample.name_norm, &row.name_norm) * 100.0
+    }
 }
 
 pub fn score_metadata_token_cosine_raw(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
     best_metadata_doc_score_raw(sample, row, token_cosine)
 }
 
-pub fn score_metadata_current_hybrid(sample: &PreparedSample, row: &PreparedFeatureRow) -> f64 {
-    row.raw
-        .metadata_docs
-        .iter()
-        .map(|metadata_doc| score_metadata_document_pair(&sample.raw.metadata_doc, metadata_doc))
-        .fold(0.0, f64::max)
+pub fn score_metadata_soft_tfidf_raw(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
+    best_metadata_doc_score_raw(sample, row, soft_tfidf)
 }
 
-pub fn score_metadata_current_hybrid_raw(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
-    best_metadata_doc_score_raw(sample, row, score_metadata_document_pair)
+pub fn score_metadata_weighted_jaccard_raw(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
+    best_metadata_doc_score_raw(sample, row, weighted_jaccard)
 }
 
-fn score_metadata_jaro_winkler_pair(left: &str, right: &str) -> f64 {
-    let left = normalize_text(left);
-    let right = normalize_text(right);
-    if left.is_empty() || right.is_empty() {
-        0.0
+pub fn score_metadata_bm25_raw(_sample: &BenchmarkSample, _row: &FeatureRow) -> f64 {
+    unreachable!("metadata_bm25 requires corpus-aware scoring")
+}
+
+fn normalized_damerau_levenshtein(left: &str, right: &str) -> f64 {
+    let left_chars = left.chars().count();
+    let right_chars = right.chars().count();
+    let max_len = left_chars.max(right_chars);
+    if max_len == 0 {
+        1.0
     } else {
-        jaro_winkler(&left, &right)
+        let distance = damerau_levenshtein(left, right) as f64;
+        (1.0 - distance / max_len as f64).clamp(0.0, 1.0)
     }
 }
 
-pub fn sort_algorithm_candidates(
-    rows: &[PreparedFeatureRow],
-    scored: &[f64],
-    top_k: usize,
-) -> (usize, Vec<CandidateScore>) {
-    let mut candidates: Vec<(usize, f64)> = scored
-        .iter()
-        .enumerate()
-        .filter_map(|(index, score)| (*score > 0.0).then_some((index, *score)))
-        .collect();
-    candidates.sort_by(|left, right| {
-        right
-            .1
-            .partial_cmp(&left.1)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| {
-                rows[left.0]
-                    .raw
-                    .contract_address
-                    .cmp(&rows[right.0].raw.contract_address)
-            })
-            .then_with(|| rows[left.0].raw.token_id.cmp(&rows[right.0].raw.token_id))
-    });
-    let total = candidates.len();
-    let top_candidates = candidates
-        .into_iter()
-        .take(top_k)
-        .enumerate()
-        .map(|(rank, (index, score))| CandidateScore {
-            rank: rank + 1,
-            contract_address: rows[index].raw.contract_address.clone(),
-            token_id: rows[index].raw.token_id.clone(),
-            name: rows[index].raw.name.clone(),
-            score,
-        })
-        .collect();
-    (total, top_candidates)
+struct Bm25CorpusStats {
+    total_docs: usize,
+    avg_doc_len: f64,
+    doc_freqs: BTreeMap<String, usize>,
 }
 
-pub fn sort_algorithm_candidates_raw(
+fn bm25_corpus_stats(rows: &[FeatureRow]) -> Bm25CorpusStats {
+    let mut total_docs = 0usize;
+    let mut total_terms = 0usize;
+    let mut doc_freqs = BTreeMap::<String, usize>::new();
+
+    for row in rows {
+        for metadata_doc in &row.metadata_docs {
+            let tokens = tokenize(&normalize_text(metadata_doc));
+            if tokens.is_empty() {
+                continue;
+            }
+            total_docs += 1;
+            total_terms += tokens.len();
+            let unique_tokens: HashSet<String> = tokens.into_iter().collect();
+            for token in unique_tokens {
+                *doc_freqs.entry(token).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let avg_doc_len = if total_docs == 0 {
+        0.0
+    } else {
+        total_terms as f64 / total_docs as f64
+    };
+
+    Bm25CorpusStats {
+        total_docs,
+        avg_doc_len,
+        doc_freqs,
+    }
+}
+
+fn bm25_score_tokens(
+    query_tokens: &[String],
+    doc_tokens: &[String],
+    stats: &Bm25CorpusStats,
+) -> f64 {
+    if query_tokens.is_empty()
+        || doc_tokens.is_empty()
+        || stats.total_docs == 0
+        || stats.avg_doc_len <= 0.0
+    {
+        return 0.0;
+    }
+
+    let mut term_freqs = BTreeMap::<String, usize>::new();
+    for token in doc_tokens {
+        *term_freqs.entry(token.clone()).or_insert(0) += 1;
+    }
+
+    let k1 = 1.2;
+    let b = 0.75;
+    let doc_len = doc_tokens.len() as f64;
+    let norm = k1 * (1.0 - b + b * doc_len / stats.avg_doc_len);
+
+    query_tokens
+        .iter()
+        .map(|token| {
+            let tf = *term_freqs.get(token).unwrap_or(&0) as f64;
+            if tf == 0.0 {
+                return 0.0;
+            }
+            let df = *stats.doc_freqs.get(token).unwrap_or(&0) as f64;
+            let idf = ((stats.total_docs as f64 - df + 0.5) / (df + 0.5) + 1.0).ln();
+            idf * (tf * (k1 + 1.0)) / (tf + norm)
+        })
+        .sum()
+}
+
+fn bm25_self_score(query_tokens: &[String], stats: &Bm25CorpusStats) -> f64 {
+    bm25_score_tokens(query_tokens, query_tokens, stats)
+}
+
+pub fn score_metadata_bm25_all_rows_raw(
+    sample: &BenchmarkSample,
     rows: &[FeatureRow],
-    scored: &[f64],
-    top_k: usize,
-) -> (usize, Vec<CandidateScore>) {
-    let mut candidates: Vec<(usize, f64)> = scored
-        .iter()
-        .enumerate()
-        .filter_map(|(index, score)| (*score > 0.0).then_some((index, *score)))
-        .collect();
-    candidates.sort_by(|left, right| {
-        right
-            .1
-            .partial_cmp(&left.1)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| rows[left.0].contract_address.cmp(&rows[right.0].contract_address))
-            .then_with(|| rows[left.0].token_id.cmp(&rows[right.0].token_id))
-    });
-    let total = candidates.len();
-    let top_candidates = candidates
-        .into_iter()
-        .take(top_k)
-        .enumerate()
-        .map(|(rank, (index, score))| CandidateScore {
-            rank: rank + 1,
-            contract_address: rows[index].contract_address.clone(),
-            token_id: rows[index].token_id.clone(),
-            name: rows[index].name.clone(),
-            score,
-        })
-        .collect();
-    (total, top_candidates)
-}
+) -> Vec<f64> {
+    let stats = bm25_corpus_stats(rows);
+    let query_tokens = tokenize(&normalize_text(&sample.metadata_doc));
+    let self_score = bm25_self_score(&query_tokens, &stats);
+    let denominator = if self_score > 0.0 { self_score } else { 1.0 };
 
-pub fn build_algorithm_duplicates_from_scores(
-    algorithm_id: &str,
-    rows: &[PreparedFeatureRow],
-    scored: &[f64],
-) -> Result<(usize, Vec<CandidateScore>), String> {
-    debug_assert_eq!(rows.len(), scored.len());
-    let rule = duplicate_score_rule(algorithm_id)?;
-    let mut duplicates: Vec<(usize, f64)> = scored
-        .iter()
-        .enumerate()
-        .filter_map(|(index, score)| (*score >= rule.threshold).then_some((index, *score)))
-        .collect();
-    duplicates.sort_by(|left, right| {
-        right
-            .1
-            .partial_cmp(&left.1)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| {
-                rows[left.0]
-                    .raw
-                    .contract_address
-                    .cmp(&rows[right.0].raw.contract_address)
-            })
-            .then_with(|| rows[left.0].raw.token_id.cmp(&rows[right.0].raw.token_id))
-    });
-    let total = duplicates.len();
-    let duplicates = duplicates
-        .into_iter()
-        .enumerate()
-        .map(|(rank, (index, score))| CandidateScore {
-            rank: rank + 1,
-            contract_address: rows[index].raw.contract_address.clone(),
-            token_id: rows[index].raw.token_id.clone(),
-            name: rows[index].raw.name.clone(),
-            score,
+    rows.iter()
+        .map(|row| {
+            row.metadata_docs
+                .iter()
+                .map(|metadata_doc| {
+                    let tokens = tokenize(&normalize_text(metadata_doc));
+                    bm25_score_tokens(&query_tokens, &tokens, &stats) / denominator
+                })
+                .fold(0.0, f64::max)
+                .clamp(0.0, 1.0)
         })
-        .collect();
-    Ok((total, duplicates))
+        .collect()
 }
 
 pub fn build_algorithm_duplicates_raw_from_scores(
@@ -805,16 +601,38 @@ fn best_metadata_doc_for_row(
     })
 }
 
+fn best_metadata_doc_for_row_bm25(
+    sample: &BenchmarkSample,
+    row: &FeatureRow,
+    stats: &Bm25CorpusStats,
+) -> Option<(String, f64)> {
+    let query_tokens = tokenize(&normalize_text(&sample.metadata_doc));
+    let self_score = bm25_self_score(&query_tokens, stats);
+    let denominator = if self_score > 0.0 { self_score } else { 1.0 };
+
+    row.metadata_docs.iter().fold(None, |best, metadata_doc| {
+        let doc_tokens = tokenize(&normalize_text(metadata_doc));
+        let score = (bm25_score_tokens(&query_tokens, &doc_tokens, stats) / denominator)
+            .clamp(0.0, 1.0);
+        match best {
+            Some((_, best_score)) if best_score >= score => best,
+            _ => Some((metadata_doc.clone(), score)),
+        }
+    })
+}
+
 pub fn metadata_duplicates_from_candidates(
     sample: &BenchmarkSample,
     rows: &[FeatureRow],
     duplicates: Vec<CandidateScore>,
-    per_doc: fn(&str, &str) -> f64,
+    algorithm_id: &str,
 ) -> Vec<MetadataDuplicate> {
     let row_lookup: BTreeMap<String, &FeatureRow> = rows
         .iter()
         .map(|row| (row.contract_address.clone(), row))
         .collect();
+    let bm25_stats = (algorithm_id == "metadata_bm25").then(|| bm25_corpus_stats(rows));
+    let per_doc = metadata_duplicate_doc_scorer(algorithm_id).ok();
 
     duplicates
         .into_iter()
@@ -822,7 +640,13 @@ pub fn metadata_duplicates_from_candidates(
             let contract_address = candidate.contract_address;
             row_lookup
                 .get(&contract_address)
-                .and_then(|row| best_metadata_doc_for_row(sample, row, per_doc))
+                .and_then(|row| {
+                    if let Some(stats) = bm25_stats.as_ref() {
+                        best_metadata_doc_for_row_bm25(sample, row, stats)
+                    } else {
+                        per_doc.and_then(|scorer| best_metadata_doc_for_row(sample, row, scorer))
+                    }
+                })
                 .map(|(metadata_doc, score)| MetadataDuplicate {
                     contract_address,
                     metadata_doc,
@@ -832,190 +656,12 @@ pub fn metadata_duplicates_from_candidates(
         .collect()
 }
 
-pub fn score_rows_parallel(
-    sample: &PreparedSample,
-    rows: &[PreparedFeatureRow],
-    scorer: fn(&PreparedSample, &PreparedFeatureRow) -> f64,
-) -> Vec<f64> {
-    rows.par_iter().map(|row| scorer(sample, row)).collect()
-}
-
 pub fn score_rows_parallel_raw(
     sample: &BenchmarkSample,
     rows: &[FeatureRow],
     scorer: fn(&BenchmarkSample, &FeatureRow) -> f64,
 ) -> Vec<f64> {
     rows.par_iter().map(|row| scorer(sample, row)).collect()
-}
-
-pub fn build_reference_candidates_from_scores(
-    rows: &[PreparedFeatureRow],
-    name_scores: &[f64],
-    metadata_scores: &[f64],
-    top_k: usize,
-) -> (usize, Vec<ReferenceCandidateScore>) {
-    let _ = top_k;
-    build_reference_duplicates_from_scores(rows, name_scores, metadata_scores)
-}
-
-pub fn build_reference_duplicates_from_scores(
-    rows: &[PreparedFeatureRow],
-    name_scores: &[f64],
-    metadata_scores: &[f64],
-) -> (usize, Vec<ReferenceCandidateScore>) {
-    debug_assert_eq!(rows.len(), name_scores.len());
-    debug_assert_eq!(rows.len(), metadata_scores.len());
-    let rule = reference_duplicate_rule();
-    let mut candidates: Vec<(&PreparedFeatureRow, f64, f64, f64, Vec<String>)> = rows
-        .iter()
-        .zip(name_scores.iter().copied())
-        .zip(metadata_scores.iter().copied())
-        .filter_map(|((row, name_score), metadata_score)| {
-            let mut reasons = Vec::new();
-            if name_score >= rule.name_threshold {
-                reasons.push("name_match".to_string());
-            }
-            if metadata_score >= rule.metadata_threshold {
-                reasons.push("metadata_match".to_string());
-            }
-            if reasons.is_empty() {
-                return None;
-            }
-            let combined_score = (name_score / 100.0).max(metadata_score);
-            Some((row, combined_score, name_score, metadata_score, reasons))
-        })
-        .collect();
-    candidates.sort_by(|left, right| {
-        right
-            .1
-            .partial_cmp(&left.1)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| left.0.raw.contract_address.cmp(&right.0.raw.contract_address))
-            .then_with(|| left.0.raw.token_id.cmp(&right.0.raw.token_id))
-    });
-    let total = candidates.len();
-    let duplicates = candidates
-        .into_iter()
-        .enumerate()
-        .map(
-            |(rank, (row, combined_score, name_score, metadata_score, match_reasons))| {
-                ReferenceCandidateScore {
-                    rank: rank + 1,
-                    contract_address: row.raw.contract_address.clone(),
-                    token_id: row.raw.token_id.clone(),
-                    name: row.raw.name.clone(),
-                    combined_score,
-                    name_score,
-                    metadata_score,
-                    match_reasons,
-                }
-            },
-        )
-        .collect();
-    (total, duplicates)
-}
-
-pub fn build_reference_candidates_raw_from_scores(
-    rows: &[FeatureRow],
-    name_scores: &[f64],
-    metadata_scores: &[f64],
-    top_k: usize,
-) -> (usize, Vec<ReferenceCandidateScore>) {
-    let _ = top_k;
-    build_reference_duplicates_raw_from_scores(rows, name_scores, metadata_scores)
-}
-
-pub fn build_reference_duplicates_raw_from_scores(
-    rows: &[FeatureRow],
-    name_scores: &[f64],
-    metadata_scores: &[f64],
-) -> (usize, Vec<ReferenceCandidateScore>) {
-    debug_assert_eq!(rows.len(), name_scores.len());
-    debug_assert_eq!(rows.len(), metadata_scores.len());
-    let rule = reference_duplicate_rule();
-    let mut candidates: Vec<(&FeatureRow, f64, f64, f64, Vec<String>)> = rows
-        .iter()
-        .zip(name_scores.iter().copied())
-        .zip(metadata_scores.iter().copied())
-        .filter_map(|((row, name_score), metadata_score)| {
-            let mut reasons = Vec::new();
-            if name_score >= rule.name_threshold {
-                reasons.push("name_match".to_string());
-            }
-            if metadata_score >= rule.metadata_threshold {
-                reasons.push("metadata_match".to_string());
-            }
-            if reasons.is_empty() {
-                return None;
-            }
-            let combined_score = (name_score / 100.0).max(metadata_score);
-            Some((row, combined_score, name_score, metadata_score, reasons))
-        })
-        .collect();
-    candidates.sort_by(|left, right| {
-        right
-            .1
-            .partial_cmp(&left.1)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| left.0.contract_address.cmp(&right.0.contract_address))
-            .then_with(|| left.0.token_id.cmp(&right.0.token_id))
-    });
-    let total = candidates.len();
-    let duplicates = candidates
-        .into_iter()
-        .enumerate()
-        .map(
-            |(rank, (row, combined_score, name_score, metadata_score, match_reasons))| {
-                ReferenceCandidateScore {
-                    rank: rank + 1,
-                    contract_address: row.contract_address.clone(),
-                    token_id: row.token_id.clone(),
-                    name: row.name.clone(),
-                    combined_score,
-                    name_score,
-                    metadata_score,
-                    match_reasons,
-                }
-            },
-        )
-        .collect();
-    (total, duplicates)
-}
-
-pub fn build_reference_candidates(
-    sample: &PreparedSample,
-    rows: &[PreparedFeatureRow],
-    top_k: usize,
-) -> (usize, Vec<ReferenceCandidateScore>) {
-    let _ = top_k;
-    build_reference_duplicates(sample, rows)
-}
-
-pub fn build_reference_duplicates(
-    sample: &PreparedSample,
-    rows: &[PreparedFeatureRow],
-) -> (usize, Vec<ReferenceCandidateScore>) {
-    let name_scores = score_rows_parallel(sample, rows, score_name_current_hybrid);
-    let metadata_scores = score_rows_parallel(sample, rows, score_metadata_current_hybrid);
-    build_reference_duplicates_from_scores(rows, &name_scores, &metadata_scores)
-}
-
-pub fn build_reference_candidates_raw(
-    sample: &BenchmarkSample,
-    rows: &[FeatureRow],
-    top_k: usize,
-) -> (usize, Vec<ReferenceCandidateScore>) {
-    let _ = top_k;
-    build_reference_duplicates_raw(sample, rows)
-}
-
-pub fn build_reference_duplicates_raw(
-    sample: &BenchmarkSample,
-    rows: &[FeatureRow],
-) -> (usize, Vec<ReferenceCandidateScore>) {
-    let name_scores = score_rows_parallel_raw(sample, rows, score_name_current_hybrid_raw);
-    let metadata_scores = score_rows_parallel_raw(sample, rows, score_metadata_current_hybrid_raw);
-    build_reference_duplicates_raw_from_scores(rows, &name_scores, &metadata_scores)
 }
 
 pub fn derive_name_norm(name: &str) -> String {
@@ -1063,10 +709,6 @@ mod tests {
         }
     }
 
-    fn sample() -> PreparedSample {
-        prepare_sample(sample_raw())
-    }
-
     fn row_raw() -> FeatureRow {
         FeatureRow {
             contract_address: "0xdup".into(),
@@ -1078,10 +720,6 @@ mod tests {
             metadata_keywords: vec!["dragon".into(), "gold".into(), "rare".into()],
             token_count: 1,
         }
-    }
-
-    fn row() -> PreparedFeatureRow {
-        prepare_rows(vec![row_raw()]).pop().unwrap()
     }
 
     fn second_row_raw() -> FeatureRow {
@@ -1097,10 +735,6 @@ mod tests {
         }
     }
 
-    fn second_row() -> PreparedFeatureRow {
-        prepare_rows(vec![second_row_raw()]).pop().unwrap()
-    }
-
     fn third_row_raw() -> FeatureRow {
         FeatureRow {
             contract_address: "0xdup3".into(),
@@ -1114,34 +748,32 @@ mod tests {
         }
     }
 
-    fn third_row() -> PreparedFeatureRow {
-        prepare_rows(vec![third_row_raw()]).pop().unwrap()
+    #[test]
+    fn damerau_name_score_is_high_for_close_names() {
+        assert!(score_name_damerau_levenshtein_raw(&sample_raw(), &row_raw()) > 80.0);
     }
 
     #[test]
-    fn current_name_hybrid_matches_existing_logic() {
-        let sample = sample();
-        let row = row();
-        assert_eq!(
-            score_name_current_hybrid(&sample, &row),
-            score_name_pair(&sample.raw.name, &row.raw.name)
-        );
+    fn bm25_metadata_score_is_high_for_identical_doc() {
+        let scores = score_metadata_bm25_all_rows_raw(&sample_raw(), &[row_raw()]);
+        assert_eq!(scores.len(), 1);
+        assert!(scores[0] > 0.7);
     }
 
     #[test]
-    fn current_metadata_hybrid_matches_existing_logic() {
-        let sample = sample();
-        let row = row();
-        assert_eq!(
-            score_metadata_current_hybrid(&sample, &row),
-            score_metadata_document_pair(&sample.raw.metadata_doc, &row.raw.metadata_doc)
-        );
-    }
+    fn monge_elkan_name_score_is_high_for_tokenwise_close_names() {
+        let sample = BenchmarkSample {
+            name: "Azuki Dragon".into(),
+            name_norm: normalize_name("Azuki Dragon"),
+            ..sample_raw()
+        };
+        let row = FeatureRow {
+            name: "Azuki Dragons".into(),
+            name_norm: normalize_name("Azuki Dragons"),
+            ..row_raw()
+        };
 
-    #[test]
-    fn trigram_jaccard_is_stable_for_identical_and_disjoint_inputs() {
-        assert_eq!(trigram_jaccard("abc", "abc"), 1.0);
-        assert_eq!(trigram_jaccard("abc", "xyz"), 0.0);
+        assert!(score_name_monge_elkan_raw(&sample, &row) >= 85.0);
     }
 
     #[test]
@@ -1152,29 +784,43 @@ mod tests {
     }
 
     #[test]
-    fn parallel_row_scoring_matches_sequential_scoring() {
-        let sample = sample();
-        let rows = vec![row(), second_row()];
+    fn weighted_jaccard_rewards_rare_overlap_more_than_plain_jaccard() {
+        let left = "gold dragon ultra";
+        let right = "gold dragon";
+
+        let weighted = weighted_jaccard(left, right);
+        let plain = token_jaccard(left, right);
+        assert!(weighted > 0.0);
+        assert!(weighted != plain);
+    }
+
+    #[test]
+    fn soft_tfidf_gives_credit_for_similar_tokens() {
+        let score = soft_tfidf("gold dragon", "golden dragon");
+        assert!(score >= 0.75);
+    }
+
+    #[test]
+    fn parallel_raw_row_scoring_matches_sequential_scoring() {
+        let sample = sample_raw();
+        let rows = vec![row_raw(), second_row_raw()];
         let sequential: Vec<f64> = rows
             .iter()
-            .map(|row| score_name_current_hybrid(&sample, row))
+            .map(|row| score_name_damerau_levenshtein_raw(&sample, row))
             .collect();
-        let parallel = score_rows_parallel(&sample, &rows, score_name_current_hybrid);
+        let parallel = score_rows_parallel_raw(&sample, &rows, score_name_damerau_levenshtein_raw);
 
         assert_eq!(parallel, sequential);
-        assert_eq!(
-            sort_algorithm_candidates(&rows, &parallel, 10),
-            sort_algorithm_candidates(&rows, &sequential, 10)
-        );
     }
 
     #[test]
     fn ordinary_duplicate_filtering_respects_per_algorithm_threshold() {
-        let rows = vec![row(), second_row()];
+        let rows = vec![row_raw(), second_row_raw()];
         let scores = vec![95.0, 94.99];
 
         let (duplicate_count, duplicates) =
-            build_algorithm_duplicates_from_scores("name_jaro_winkler", &rows, &scores).unwrap();
+            build_algorithm_duplicates_raw_from_scores("name_jaro_winkler", &rows, &scores)
+                .unwrap();
 
         assert_eq!(duplicate_count, 1);
         assert_eq!(duplicates.len(), 1);
@@ -1184,11 +830,11 @@ mod tests {
 
     #[test]
     fn ordinary_duplicates_are_not_top_k_truncated() {
-        let rows = vec![row(), second_row(), third_row()];
+        let rows = vec![row_raw(), second_row_raw(), third_row_raw()];
         let scores = vec![100.0, 99.0, 98.0];
 
-        let (duplicate_count, duplicates) = build_algorithm_duplicates_from_scores(
-            "name_normalized_levenshtein",
+        let (duplicate_count, duplicates) = build_algorithm_duplicates_raw_from_scores(
+            "name_damerau_levenshtein",
             &rows,
             &scores,
         )
@@ -1203,128 +849,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["0xdup", "0xdup2", "0xdup3"]
         );
-    }
-
-    #[test]
-    fn parallel_reference_candidates_keep_same_ranking_rules() {
-        let sample = sample();
-        let rows = vec![row(), second_row()];
-        let actual = build_reference_candidates(&sample, &rows, 10);
-        let rule = reference_duplicate_rule();
-
-        let mut expected_candidates = Vec::new();
-        for row in &rows {
-            let name_score = score_name_current_hybrid(&sample, row);
-            let metadata_score = score_metadata_current_hybrid(&sample, row);
-            let mut reasons = Vec::new();
-            if name_score >= rule.name_threshold {
-                reasons.push("name_match".to_string());
-            }
-            if metadata_score >= rule.metadata_threshold {
-                reasons.push("metadata_match".to_string());
-            }
-            if reasons.is_empty() {
-                continue;
-            }
-            let combined_score = (name_score / 100.0).max(metadata_score);
-            expected_candidates.push((row, combined_score, name_score, metadata_score, reasons));
-        }
-        expected_candidates.sort_by(|left, right| {
-            right
-                .1
-                .partial_cmp(&left.1)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| left.0.raw.contract_address.cmp(&right.0.raw.contract_address))
-                .then_with(|| left.0.raw.token_id.cmp(&right.0.raw.token_id))
-        });
-        let expected = (
-            expected_candidates.len(),
-            expected_candidates
-                .into_iter()
-                .enumerate()
-                .map(
-                    |(rank, (row, combined_score, name_score, metadata_score, match_reasons))| {
-                        ReferenceCandidateScore {
-                            rank: rank + 1,
-                            contract_address: row.raw.contract_address.clone(),
-                            token_id: row.raw.token_id.clone(),
-                            name: row.raw.name.clone(),
-                            combined_score,
-                            name_score,
-                            metadata_score,
-                            match_reasons,
-                        }
-                    },
-                )
-                .collect(),
-        );
-
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn prepared_scoring_matches_unprepared_scoring() {
-        let sample_raw = sample_raw();
-        let row_raw = row_raw();
-        let sample = prepare_sample(sample_raw.clone());
-        let row = prepare_rows(vec![row_raw.clone()]).pop().unwrap();
-
-        assert_eq!(
-            score_name_jaro_winkler(&sample, &row),
-            jaro_winkler(&sample_raw.name_norm, &row_raw.name_norm) * 100.0
-        );
-        assert_eq!(
-            score_name_normalized_levenshtein(&sample, &row),
-            normalized_levenshtein(&sample_raw.name_norm, &row_raw.name_norm) * 100.0
-        );
-        assert_eq!(
-            score_metadata_token_jaccard(&sample, &row),
-            token_jaccard(&sample_raw.metadata_doc, &row_raw.metadata_doc)
-        );
-        assert_eq!(
-            score_metadata_token_cosine(&sample, &row),
-            token_cosine(&sample_raw.metadata_doc, &row_raw.metadata_doc)
-        );
-    }
-
-    #[test]
-    fn reference_duplicates_from_precomputed_scores_match_direct_build() {
-        let sample = sample();
-        let rows = vec![row(), second_row()];
-        let name_scores = score_rows_parallel(&sample, &rows, score_name_current_hybrid);
-        let metadata_scores = score_rows_parallel(&sample, &rows, score_metadata_current_hybrid);
-
-        assert_eq!(
-            build_reference_duplicates(&sample, &rows),
-            build_reference_duplicates_from_scores(&rows, &name_scores, &metadata_scores)
-        );
-    }
-
-    #[test]
-    fn raw_reference_duplicates_from_precomputed_scores_match_direct_build() {
-        let sample = sample_raw();
-        let rows = vec![row_raw(), second_row_raw()];
-        let name_scores = score_rows_parallel_raw(&sample, &rows, score_name_current_hybrid_raw);
-        let metadata_scores =
-            score_rows_parallel_raw(&sample, &rows, score_metadata_current_hybrid_raw);
-
-        assert_eq!(
-            build_reference_duplicates_raw(&sample, &rows),
-            build_reference_duplicates_raw_from_scores(&rows, &name_scores, &metadata_scores)
-        );
-    }
-
-    #[test]
-    fn reference_non_matches_are_excluded() {
-        let rows = vec![row(), second_row()];
-        let name_scores = vec![94.99, 10.0];
-        let metadata_scores = vec![0.54, 0.10];
-
-        let (duplicate_count, duplicates) =
-            build_reference_duplicates_from_scores(&rows, &name_scores, &metadata_scores);
-
-        assert_eq!(duplicate_count, 0);
-        assert!(duplicates.is_empty());
     }
 
     #[test]
@@ -1393,7 +917,7 @@ mod tests {
             &sample_raw(),
             &rows,
             duplicates,
-            score_metadata_document_pair,
+            "metadata_token_cosine",
         );
 
         assert_eq!(metadata_duplicates.len(), 1);
