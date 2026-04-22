@@ -581,7 +581,7 @@ fn merge_recall_rows_by_contract(rows: Vec<FeatureRow>) -> Vec<FeatureRow> {
         .filter_map(|(_, aggregate)| {
             aggregate.representative.map(|mut row| {
                 row.metadata_docs = aggregate.metadata_docs.into_iter().collect::<Vec<_>>();
-                row.metadata_doc = row.metadata_docs.join("\n");
+                row.metadata_doc = row.metadata_docs.first().cloned().unwrap_or_default();
                 row.metadata_keywords = aggregate.metadata_keywords.into_iter().collect();
                 row.token_count = aggregate.token_count;
                 row
@@ -817,7 +817,6 @@ mod tests {
             rows[0].metadata_docs,
             vec!["blue tiger".to_string(), "rare dragon gold".to_string()]
         );
-        assert!(rows[0].metadata_doc.contains("rare dragon gold"));
-        assert!(rows[0].metadata_doc.contains("blue tiger"));
+        assert_eq!(rows[0].metadata_doc, "blue tiger");
     }
 }

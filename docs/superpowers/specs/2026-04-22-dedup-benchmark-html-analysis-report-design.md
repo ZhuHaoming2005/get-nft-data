@@ -2,7 +2,7 @@
 
 ## Goal
 
-新增一个可复用的 Python 分析工具，读取 `dedup_bench_rs` 输出的 benchmark `result.json`，生成单文件 `HTML` 可视化报告，重点回答 3 个问题：
+新增一个仅面向当前 `dedup_bench_rs/results/result.json` 结果格式的 Python 分析工具，生成单文件 `HTML` 可视化报告，重点回答 3 个问题：
 
 1. `name` / `metadata` 查重的时间成本差异
 2. `name` / `metadata` 查重的效果差异
@@ -24,7 +24,7 @@
   - `metadata_doc`
   - `score`
 - 当前仓库中没有针对该 benchmark JSON 的专用可视化分析工具。
-- 本次分析使用的是上一版脚本结果，因此报告只需要兼容当前这一版 JSON 结构，不要求兼容未来未定义的新字段；但工具本身应支持后续对同结构结果文件重复运行。
+- 本次分析使用的是上一版脚本结果，因此工具只围绕当前这份 `result.json` 的实际字段实现，不为后续 JSON 结构变化做兼容。
 
 ## Required Analysis Semantics
 
@@ -55,7 +55,7 @@
 
 ## Desired State
 
-新增一个 Python CLI 工具，输入任意同结构的 benchmark JSON，输出一个单文件 `HTML` 报告。该报告应：
+新增一个 Python CLI 工具，默认面向当前 `dedup_bench_rs/results/result.json`，输出一个单文件 `HTML` 报告。该报告应：
 
 - 直接展示样本和输入文件概况
 - 对所有 `name` / `metadata` 算法展示耗时对比
@@ -67,26 +67,26 @@
 
 ## Architecture
 
-工具建议作为独立 Python 包放在仓库根目录，不修改 `dedup_bench_rs` Rust 逻辑。
+工具建议放在 `dedup_bench_rs/py_report` 子目录下，不修改 `dedup_bench_rs` Rust 逻辑。
 
 ### Module Layout
 
-- `dedup_bench_report/__init__.py`
+- `dedup_bench_rs/py_report/dedup_bench_report/__init__.py`
   - 包初始化与版本占位
-- `dedup_bench_report/models.py`
+- `dedup_bench_rs/py_report/dedup_bench_report/models.py`
   - 定义输入结果结构、标准化算法指标、覆盖分析结果、结论数据结构
-- `dedup_bench_report/analyzer.py`
-  - 负责读取 JSON、折叠 `metadata` 到合约级、构建指标和覆盖矩阵
-- `dedup_bench_report/render_html.py`
+- `dedup_bench_rs/py_report/dedup_bench_report/analyzer.py`
+  - 负责按当前 `result.json` 的字段直接读取 JSON、折叠 `metadata` 到合约级、构建指标和覆盖矩阵
+- `dedup_bench_rs/py_report/dedup_bench_report/render_html.py`
   - 负责生成单文件 `HTML`，内嵌 Plotly 图表和摘要文本
-- `dedup_bench_report/cli.py`
+- `dedup_bench_rs/py_report/dedup_bench_report/cli.py`
   - 命令行入口，串联读取、分析、渲染和写文件
 
 ## Input Model
 
 ### Expected Top-Level Fields
 
-工具至少读取这些顶层字段：
+工具直接依赖当前 `result.json` 中这些顶层字段：
 
 - `chain`
 - `source`
@@ -118,6 +118,8 @@
 
 - `name` 的 `contract_hits` 直接来自原始 `duplicates[].contract_address`
 - `metadata` 的 `contract_hits` 来自 token 级 `duplicates` 去重后的 `contract_address` 集合
+
+不为字段缺失、字段改名、结果版本升级引入兼容层；若当前 JSON 结构变化，直接修改工具实现。
 
 ## Metrics
 
@@ -291,9 +293,10 @@
 示例：
 
 ```bash
+cd dedup_bench_rs\py_report
 C:\Users\z1766\.conda\envs\codex\python.exe -m dedup_bench_report.cli ^
-  --input dedup_bench_rs\results\result.json ^
-  --output dedup_bench_rs\results\result_analysis.html
+  --input ..\results\result.json ^
+  --output ..\results\result_analysis.html
 ```
 
 ## Testing Strategy
@@ -338,3 +341,4 @@ C:\Users\z1766\.conda\envs\codex\python.exe -m dedup_bench_report.cli ^
 - 不分析 `reference` 的覆盖率
 - 不深入到 NFT/token 级效果评估作为主结论
 - 不支持未来未知格式的 benchmark JSON 变体
+- 不把当前工具抽象成通用 benchmark viewer

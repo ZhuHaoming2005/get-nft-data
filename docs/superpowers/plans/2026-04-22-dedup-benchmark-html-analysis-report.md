@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a reusable Python CLI that reads `dedup_bench_rs` benchmark JSON and writes a single-file HTML analysis report focused on time cost, contract-level dedup effectiveness, and pairwise `name`-vs-`metadata` coverage.
+**Goal:** Build a Python CLI specialized to the current `dedup_bench_rs/results/result.json` shape and write a single-file HTML analysis report focused on time cost, contract-level dedup effectiveness, and pairwise `name`-vs-`metadata` coverage.
 
-**Architecture:** Keep the Rust benchmark output unchanged and add a dedicated Python workspace under `dedup_bench_rs/py_report`. That subtree will contain the package, tests, fixtures, and dependency file, while the CLI reads `dedup_bench_rs/results/result.json` and writes a self-contained Plotly-backed HTML report back into `dedup_bench_rs/results/`.
+**Architecture:** Keep the Rust benchmark output unchanged and add a dedicated Python workspace under `dedup_bench_rs/py_report`. That subtree will contain the package, tests, fixtures, and dependency file, while the CLI reads the current `dedup_bench_rs/results/result.json` by direct field access, with no forward-compatibility layer, and writes a self-contained Plotly-backed HTML report back into `dedup_bench_rs/results/`.
 
 **Tech Stack:** Python 3, dataclasses, pathlib, json, pandas, plotly, pytest
 

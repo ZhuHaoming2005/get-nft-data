@@ -7,8 +7,8 @@ use rayon::{ThreadPool, ThreadPoolBuilder};
 use crate::algorithms::{
     build_algorithm_duplicates_raw_from_scores, metadata_duplicate_doc_scorer,
     metadata_duplicates_from_candidates, name_duplicates_from_candidates,
-    score_rows_parallel_raw, timing_algorithms, AlgorithmField, MetadataAlgorithmReport,
-    NameAlgorithmReport,
+    score_rows_parallel_raw, timing_algorithms, AlgorithmField, CandidateScore,
+    MetadataAlgorithmReport, NameAlgorithmReport,
 };
 use crate::decision_rules::duplicate_score_rule;
 use crate::error::BenchError;
@@ -18,7 +18,7 @@ use crate::store::FeatureStore;
 
 enum TimedAlgorithmResult {
     Name(usize, Vec<crate::algorithms::NameContractDuplicate>),
-    Metadata(usize, Vec<crate::algorithms::MetadataDuplicate>),
+    Metadata(usize, Vec<CandidateScore>),
 }
 
 #[derive(Clone, Debug)]
@@ -86,14 +86,6 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
                         TimedAlgorithmResult::Name(duplicates.len(), duplicates)
                     }
                     AlgorithmField::Metadata => {
-                        let per_doc = metadata_duplicate_doc_scorer(algorithm.id)
-                            .map_err(BenchError::InvalidData)?;
-                        let duplicates = metadata_duplicates_from_candidates(
-                            &sample,
-                            &recall_rows,
-                            duplicates,
-                            per_doc,
-                        );
                         TimedAlgorithmResult::Metadata(duplicates.len(), duplicates)
                     }
                     AlgorithmField::Reference => unreachable!(),
@@ -134,6 +126,14 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
                 });
             }
             TimedAlgorithmResult::Metadata(duplicate_count, duplicates) => {
+                let per_doc = metadata_duplicate_doc_scorer(algorithm.id)
+                    .map_err(BenchError::InvalidData)?;
+                let duplicates = metadata_duplicates_from_candidates(
+                    &sample,
+                    &recall_rows,
+                    duplicates,
+                    per_doc,
+                );
                 metadata_algorithm_reports.push(MetadataAlgorithmReport {
                     algorithm_id: algorithm.id.to_string(),
                     field: algorithm.field,
