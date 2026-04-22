@@ -31,9 +31,9 @@ enum Command {
         feature_parquet: Option<PathBuf>,
         #[arg(long)]
         output: PathBuf,
-        #[arg(long, default_value_t = 5)]
+        #[arg(long, default_value_t = 3)]
         repeat: usize,
-        #[arg(long, default_value_t = 30)]
+        #[arg(long, default_value_t = 32)]
         algorithm_threads: usize,
     },
 }
