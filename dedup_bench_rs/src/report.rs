@@ -71,9 +71,8 @@ impl BenchmarkReport {
             ));
             for candidate in &algorithm.duplicates {
                 out.push_str(&format!(
-                    "1. `{}` / `{}` score=`{:.4}` metadata_doc=`{}`\n",
+                    "1. `{}` score=`{:.4}` metadata_doc=`{}`\n",
                     candidate.contract_address,
-                    candidate.token_id,
                     candidate.score,
                     candidate.metadata_doc
                 ));

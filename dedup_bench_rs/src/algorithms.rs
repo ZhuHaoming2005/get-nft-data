@@ -47,7 +47,6 @@ pub struct NameContractDuplicate {
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct MetadataDuplicate {
     pub contract_address: String,
-    pub token_id: String,
     pub metadata_doc: String,
     pub score: f64,
 }
@@ -130,6 +129,17 @@ pub struct TimingAlgorithmDefinition {
     pub scorer: fn(&BenchmarkSample, &FeatureRow) -> f64,
 }
 
+pub fn metadata_duplicate_doc_scorer(algorithm_id: &str) -> Result<fn(&str, &str) -> f64, String> {
+    match algorithm_id {
+        "metadata_token_jaccard" => Ok(token_jaccard),
+        "metadata_jaro_winkler_doc" => Ok(score_metadata_jaro_winkler_pair),
+        "metadata_trigram_jaccard_doc" => Ok(trigram_jaccard),
+        "metadata_token_cosine" => Ok(token_cosine),
+        "metadata_current_hybrid" => Ok(score_metadata_document_pair),
+        _ => Err(format!("unknown metadata algorithm id: {algorithm_id}")),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreparedText {
     pub normalized: String,
@@ -150,7 +160,7 @@ pub struct PreparedSample {
 pub struct PreparedFeatureRow {
     pub raw: FeatureRow,
     pub name_text: PreparedText,
-    pub metadata_text: PreparedText,
+    pub metadata_texts: Vec<PreparedText>,
 }
 
 pub fn name_algorithms() -> Vec<AlgorithmDefinition> {
@@ -426,7 +436,11 @@ pub fn prepare_rows(rows: Vec<FeatureRow>) -> Vec<PreparedFeatureRow> {
     rows.into_iter()
         .map(|row| PreparedFeatureRow {
             name_text: prepare_text(row.name_norm.clone()),
-            metadata_text: prepare_text(normalize_text(&row.metadata_doc)),
+            metadata_texts: row
+                .metadata_docs
+                .iter()
+                .map(|doc| prepare_text(normalize_text(doc)))
+                .collect(),
             raw: row,
         })
         .collect()
@@ -504,65 +518,93 @@ pub fn score_name_current_hybrid_raw(sample: &BenchmarkSample, row: &FeatureRow)
 }
 
 pub fn score_metadata_token_jaccard(sample: &PreparedSample, row: &PreparedFeatureRow) -> f64 {
-    token_jaccard_from_sets(&sample.metadata_text.token_set, &row.metadata_text.token_set)
+    row.metadata_texts
+        .iter()
+        .map(|metadata_text| {
+            token_jaccard_from_sets(&sample.metadata_text.token_set, &metadata_text.token_set)
+        })
+        .fold(0.0, f64::max)
 }
 
 pub fn score_metadata_token_jaccard_raw(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
-    token_jaccard(&sample.metadata_doc, &row.metadata_doc)
+    best_metadata_doc_score_raw(sample, row, token_jaccard)
 }
 
 pub fn score_metadata_jaro_winkler_doc(
     sample: &PreparedSample,
     row: &PreparedFeatureRow,
 ) -> f64 {
-    if sample.metadata_text.normalized.is_empty() || row.metadata_text.normalized.is_empty() {
-        0.0
-    } else {
-        jaro_winkler(&sample.metadata_text.normalized, &row.metadata_text.normalized)
-    }
+    row.metadata_texts
+        .iter()
+        .map(|metadata_text| {
+            if sample.metadata_text.normalized.is_empty() || metadata_text.normalized.is_empty() {
+                0.0
+            } else {
+                jaro_winkler(&sample.metadata_text.normalized, &metadata_text.normalized)
+            }
+        })
+        .fold(0.0, f64::max)
 }
 
 pub fn score_metadata_jaro_winkler_doc_raw(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
-    let left = normalize_text(&sample.metadata_doc);
-    let right = normalize_text(&row.metadata_doc);
-    if left.is_empty() || right.is_empty() {
-        0.0
-    } else {
-        jaro_winkler(&left, &right)
-    }
+    best_metadata_doc_score_raw(sample, row, score_metadata_jaro_winkler_pair)
 }
 
 pub fn score_metadata_trigram_jaccard_doc(
     sample: &PreparedSample,
     row: &PreparedFeatureRow,
 ) -> f64 {
-    trigram_jaccard_from_sets(
-        &sample.metadata_text.trigram_set,
-        &row.metadata_text.trigram_set,
-    )
+    row.metadata_texts
+        .iter()
+        .map(|metadata_text| {
+            trigram_jaccard_from_sets(
+                &sample.metadata_text.trigram_set,
+                &metadata_text.trigram_set,
+            )
+        })
+        .fold(0.0, f64::max)
 }
 
 pub fn score_metadata_trigram_jaccard_doc_raw(
     sample: &BenchmarkSample,
     row: &FeatureRow,
 ) -> f64 {
-    trigram_jaccard(&sample.metadata_doc, &row.metadata_doc)
+    best_metadata_doc_score_raw(sample, row, trigram_jaccard)
 }
 
 pub fn score_metadata_token_cosine(sample: &PreparedSample, row: &PreparedFeatureRow) -> f64 {
-    token_cosine_from_counts(&sample.metadata_text.token_counts, &row.metadata_text.token_counts)
+    row.metadata_texts
+        .iter()
+        .map(|metadata_text| {
+            token_cosine_from_counts(&sample.metadata_text.token_counts, &metadata_text.token_counts)
+        })
+        .fold(0.0, f64::max)
 }
 
 pub fn score_metadata_token_cosine_raw(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
-    token_cosine(&sample.metadata_doc, &row.metadata_doc)
+    best_metadata_doc_score_raw(sample, row, token_cosine)
 }
 
 pub fn score_metadata_current_hybrid(sample: &PreparedSample, row: &PreparedFeatureRow) -> f64 {
-    score_metadata_document_pair(&sample.raw.metadata_doc, &row.raw.metadata_doc)
+    row.raw
+        .metadata_docs
+        .iter()
+        .map(|metadata_doc| score_metadata_document_pair(&sample.raw.metadata_doc, metadata_doc))
+        .fold(0.0, f64::max)
 }
 
 pub fn score_metadata_current_hybrid_raw(sample: &BenchmarkSample, row: &FeatureRow) -> f64 {
-    score_metadata_document_pair(&sample.metadata_doc, &row.metadata_doc)
+    best_metadata_doc_score_raw(sample, row, score_metadata_document_pair)
+}
+
+fn score_metadata_jaro_winkler_pair(left: &str, right: &str) -> f64 {
+    let left = normalize_text(left);
+    let right = normalize_text(right);
+    if left.is_empty() || right.is_empty() {
+        0.0
+    } else {
+        jaro_winkler(&left, &right)
+    }
 }
 
 pub fn sort_algorithm_candidates(
@@ -713,68 +755,75 @@ pub fn build_algorithm_duplicates_raw_from_scores(
     Ok((total, duplicates))
 }
 
-pub fn group_name_duplicates_by_contract(
+pub fn name_duplicates_from_candidates(
+    rows: &[FeatureRow],
     duplicates: Vec<CandidateScore>,
 ) -> Vec<NameContractDuplicate> {
-    let mut grouped = BTreeMap::<String, Vec<CandidateScore>>::new();
-    for duplicate in duplicates {
-        grouped
-            .entry(duplicate.contract_address.clone())
-            .or_default()
-            .push(duplicate);
-    }
-
-    let mut contracts: Vec<NameContractDuplicate> = grouped
-        .into_iter()
-        .map(|(contract_address, mut matches)| {
-            matches.sort_by(|left, right| {
-                right
-                    .score
-                    .partial_cmp(&left.score)
-                    .unwrap_or(Ordering::Equal)
-                    .then_with(|| left.token_id.cmp(&right.token_id))
-            });
-            let max_score = matches.first().map(|candidate| candidate.score).unwrap_or(0.0);
-            let duplicate_token_count = matches.len();
-            NameContractDuplicate {
-                contract_address,
-                max_score,
-                duplicate_token_count,
-            }
-        })
+    let row_lookup: BTreeMap<String, &FeatureRow> = rows
+        .iter()
+        .map(|row| (row.contract_address.clone(), row))
         .collect();
 
-    contracts.sort_by(|left, right| {
-        right
-            .max_score
-            .partial_cmp(&left.max_score)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| left.contract_address.cmp(&right.contract_address))
-    });
-    contracts
+    duplicates
+        .into_iter()
+        .filter_map(|candidate| {
+            row_lookup
+                .get(&candidate.contract_address)
+                .map(|row| NameContractDuplicate {
+                    contract_address: candidate.contract_address,
+                    max_score: candidate.score,
+                    duplicate_token_count: row.token_count,
+                })
+        })
+        .collect()
+}
+
+fn best_metadata_doc_score_raw(
+    sample: &BenchmarkSample,
+    row: &FeatureRow,
+    per_doc: fn(&str, &str) -> f64,
+) -> f64 {
+    row.metadata_docs
+        .iter()
+        .map(|metadata_doc| per_doc(&sample.metadata_doc, metadata_doc))
+        .fold(0.0, f64::max)
+}
+
+fn best_metadata_doc_for_row(
+    sample: &BenchmarkSample,
+    row: &FeatureRow,
+    per_doc: fn(&str, &str) -> f64,
+) -> Option<(String, f64)> {
+    row.metadata_docs.iter().fold(None, |best, metadata_doc| {
+        let score = per_doc(&sample.metadata_doc, metadata_doc);
+        match best {
+            Some((_, best_score)) if best_score >= score => best,
+            _ => Some((metadata_doc.clone(), score)),
+        }
+    })
 }
 
 pub fn metadata_duplicates_from_candidates(
+    sample: &BenchmarkSample,
     rows: &[FeatureRow],
     duplicates: Vec<CandidateScore>,
+    per_doc: fn(&str, &str) -> f64,
 ) -> Vec<MetadataDuplicate> {
-    let row_lookup: BTreeMap<(String, String), &FeatureRow> = rows
+    let row_lookup: BTreeMap<String, &FeatureRow> = rows
         .iter()
-        .map(|row| ((row.contract_address.clone(), row.token_id.clone()), row))
+        .map(|row| (row.contract_address.clone(), row))
         .collect();
 
     duplicates
         .into_iter()
         .filter_map(|candidate| {
             let contract_address = candidate.contract_address;
-            let token_id = candidate.token_id;
-            let score = candidate.score;
             row_lookup
-                .get(&(contract_address.clone(), token_id.clone()))
-                .map(|row| MetadataDuplicate {
+                .get(&contract_address)
+                .and_then(|row| best_metadata_doc_for_row(sample, row, per_doc))
+                .map(|(metadata_doc, score)| MetadataDuplicate {
                     contract_address,
-                    token_id,
-                    metadata_doc: row.metadata_doc.clone(),
+                    metadata_doc,
                     score,
                 })
         })
@@ -1023,7 +1072,9 @@ mod tests {
             name: "Azuki".into(),
             name_norm: normalize_name("Azuki"),
             metadata_doc: "rare dragon gold".into(),
+            metadata_docs: vec!["rare dragon gold".into()],
             metadata_keywords: vec!["dragon".into(), "gold".into(), "rare".into()],
+            token_count: 1,
         }
     }
 
@@ -1038,7 +1089,9 @@ mod tests {
             name: "Azuki Mirror #2".into(),
             name_norm: normalize_name("Azuki Mirror #2"),
             metadata_doc: "rare dragon silver".into(),
+            metadata_docs: vec!["rare dragon silver".into()],
             metadata_keywords: vec!["dragon".into(), "rare".into(), "silver".into()],
+            token_count: 1,
         }
     }
 
@@ -1053,7 +1106,9 @@ mod tests {
             name: "Azuki Variant #3".into(),
             name_norm: normalize_name("Azuki Variant #3"),
             metadata_doc: "gold dragon ultra rare".into(),
+            metadata_docs: vec!["gold dragon ultra rare".into()],
             metadata_keywords: vec!["dragon".into(), "gold".into(), "rare".into()],
+            token_count: 1,
         }
     }
 
@@ -1276,27 +1331,43 @@ mod tests {
             CandidateScore {
                 rank: 1,
                 contract_address: "0xdup".into(),
-                token_id: "2".into(),
-                name: "Azuki #2".into(),
+                token_id: "1".into(),
+                name: "Azuki".into(),
                 score: 100.0,
             },
             CandidateScore {
                 rank: 2,
-                contract_address: "0xdup".into(),
-                token_id: "4".into(),
-                name: "Azuki #4".into(),
-                score: 99.0,
-            },
-            CandidateScore {
-                rank: 3,
                 contract_address: "0xother".into(),
                 token_id: "1".into(),
-                name: "Azuki Alt #1".into(),
+                name: "Azuki Alt".into(),
                 score: 98.0,
             },
         ];
 
-        let grouped = group_name_duplicates_by_contract(duplicates);
+        let rows = vec![
+            FeatureRow {
+                contract_address: "0xdup".into(),
+                token_id: "1".into(),
+                name: "Azuki".into(),
+                name_norm: normalize_name("Azuki"),
+                metadata_doc: "rare dragon gold".into(),
+                metadata_docs: vec!["rare dragon gold".into(), "blue tiger".into()],
+                metadata_keywords: vec!["dragon".into()],
+                token_count: 2,
+            },
+            FeatureRow {
+                contract_address: "0xother".into(),
+                token_id: "1".into(),
+                name: "Azuki Alt".into(),
+                name_norm: normalize_name("Azuki Alt"),
+                metadata_doc: "rare dragon gold".into(),
+                metadata_docs: vec!["rare dragon gold".into()],
+                metadata_keywords: vec!["dragon".into()],
+                token_count: 1,
+            },
+        ];
+
+        let grouped = name_duplicates_from_candidates(&rows, duplicates);
 
         assert_eq!(grouped.len(), 2);
         assert_eq!(grouped[0].contract_address, "0xdup");
@@ -1315,7 +1386,12 @@ mod tests {
             score: 0.9,
         }];
 
-        let metadata_duplicates = metadata_duplicates_from_candidates(&rows, duplicates);
+        let metadata_duplicates = metadata_duplicates_from_candidates(
+            &sample_raw(),
+            &rows,
+            duplicates,
+            score_metadata_document_pair,
+        );
 
         assert_eq!(metadata_duplicates.len(), 1);
         assert_eq!(metadata_duplicates[0].metadata_doc, "rare dragon gold");

@@ -5,9 +5,10 @@ use std::time::Instant;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
 use crate::algorithms::{
-    build_algorithm_duplicates_raw_from_scores, group_name_duplicates_by_contract,
-    metadata_duplicates_from_candidates, score_rows_parallel_raw, timing_algorithms,
-    AlgorithmField, MetadataAlgorithmReport, NameAlgorithmReport,
+    build_algorithm_duplicates_raw_from_scores, metadata_duplicate_doc_scorer,
+    metadata_duplicates_from_candidates, name_duplicates_from_candidates,
+    score_rows_parallel_raw, timing_algorithms, AlgorithmField, MetadataAlgorithmReport,
+    NameAlgorithmReport,
 };
 use crate::decision_rules::duplicate_score_rule;
 use crate::error::BenchError;
@@ -81,12 +82,18 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
                 .map_err(BenchError::InvalidData)?;
                 Ok(match algorithm.field {
                     AlgorithmField::Name => {
-                        let duplicates = group_name_duplicates_by_contract(duplicates);
+                        let duplicates = name_duplicates_from_candidates(&recall_rows, duplicates);
                         TimedAlgorithmResult::Name(duplicates.len(), duplicates)
                     }
                     AlgorithmField::Metadata => {
-                        let duplicates =
-                            metadata_duplicates_from_candidates(&recall_rows, duplicates);
+                        let per_doc = metadata_duplicate_doc_scorer(algorithm.id)
+                            .map_err(BenchError::InvalidData)?;
+                        let duplicates = metadata_duplicates_from_candidates(
+                            &sample,
+                            &recall_rows,
+                            duplicates,
+                            per_doc,
+                        );
                         TimedAlgorithmResult::Metadata(duplicates.len(), duplicates)
                     }
                     AlgorithmField::Reference => unreachable!(),
@@ -247,7 +254,7 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(report.recall_candidate_count, 3);
+        assert_eq!(report.recall_candidate_count, 2);
         assert!(
             report
                 .metadata_algorithms

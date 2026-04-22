@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -31,7 +31,9 @@ pub struct FeatureRow {
     pub name: String,
     pub name_norm: String,
     pub metadata_doc: String,
+    pub metadata_docs: Vec<String>,
     pub metadata_keywords: Vec<String>,
+    pub token_count: usize,
 }
 
 pub struct FeatureStore {
@@ -539,10 +541,53 @@ where
             name,
             name_norm,
             metadata_doc,
+            metadata_docs: Vec::new(),
             metadata_keywords,
+            token_count: 1,
         });
     }
-    Ok(output)
+    Ok(merge_recall_rows_by_contract(output))
+}
+
+fn merge_recall_rows_by_contract(rows: Vec<FeatureRow>) -> Vec<FeatureRow> {
+    #[derive(Default)]
+    struct ContractAggregate {
+        representative: Option<FeatureRow>,
+        metadata_docs: BTreeSet<String>,
+        metadata_keywords: BTreeSet<String>,
+        token_count: usize,
+    }
+
+    let mut aggregates = BTreeMap::<String, ContractAggregate>::new();
+    for row in rows {
+        let entry = aggregates
+            .entry(row.contract_address.clone())
+            .or_default();
+        entry.token_count += 1;
+        if !row.metadata_doc.trim().is_empty() {
+            entry.metadata_docs.insert(row.metadata_doc.clone());
+        }
+        for keyword in &row.metadata_keywords {
+            entry.metadata_keywords.insert(keyword.clone());
+        }
+        match entry.representative.as_ref() {
+            Some(current) if current.token_id <= row.token_id => {}
+            _ => entry.representative = Some(row),
+        }
+    }
+
+    aggregates
+        .into_iter()
+        .filter_map(|(_, aggregate)| {
+            aggregate.representative.map(|mut row| {
+                row.metadata_docs = aggregate.metadata_docs.into_iter().collect::<Vec<_>>();
+                row.metadata_doc = row.metadata_docs.join("\n");
+                row.metadata_keywords = aggregate.metadata_keywords.into_iter().collect();
+                row.token_count = aggregate.token_count;
+                row
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -596,7 +641,9 @@ mod tests {
         };
         let (_, rows) = store.load_recall_rows(&sample).unwrap();
         assert_eq!(rows[0].metadata_doc, "rare dragon gold");
+        assert_eq!(rows[0].metadata_docs, vec!["rare dragon gold".to_string()]);
         assert!(rows[0].metadata_keywords.contains(&"dragon".to_string()));
+        assert_eq!(rows[0].token_count, 1);
     }
 
     #[test]
@@ -721,5 +768,56 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].contract_address, "0xdup");
+    }
+
+    #[test]
+    fn merges_recall_rows_by_contract() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("bench.duckdb");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE nft_features (
+                chain VARCHAR,
+                contract_address VARCHAR,
+                token_id VARCHAR,
+                name VARCHAR,
+                metadata_json VARCHAR,
+                metadata_doc VARCHAR,
+                name_norm VARCHAR,
+                metadata_keywords_arr VARCHAR
+            );
+            INSERT INTO nft_features VALUES
+            ('ethereum', '0xdup', '2', 'Azuki #2', '{\"description\":\"rare dragon gold\"}', 'rare dragon gold', 'azuki', '[\"rare\",\"dragon\",\"gold\"]'),
+            ('ethereum', '0xdup', '1', 'Azuki #1', '{\"description\":\"blue tiger\"}', 'blue tiger', 'azuki', '[\"blue\",\"tiger\"]');
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = FeatureStore::new(db_path, None);
+        let sample = BenchmarkSample {
+            chain: "ethereum".into(),
+            contract_address: String::new(),
+            token_id: String::new(),
+            name: "Azuki #0".into(),
+            name_norm: derive_name_norm("Azuki #0"),
+            metadata_json: "{\"description\":\"rare dragon gold\"}".into(),
+            metadata_doc: "rare dragon gold".into(),
+            metadata_keywords: vec!["rare".into(), "dragon".into(), "gold".into()],
+        };
+
+        let (_, rows) = store.load_recall_rows(&sample).unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].contract_address, "0xdup");
+        assert_eq!(rows[0].token_id, "1");
+        assert_eq!(rows[0].token_count, 2);
+        assert_eq!(
+            rows[0].metadata_docs,
+            vec!["blue tiger".to_string(), "rare dragon gold".to_string()]
+        );
+        assert!(rows[0].metadata_doc.contains("rare dragon gold"));
+        assert!(rows[0].metadata_doc.contains("blue tiger"));
     }
 }
