@@ -503,7 +503,7 @@ pub fn score_metadata_bm25_all_rows_raw(
     let self_score = bm25_self_score(&query_tokens, &stats);
     let denominator = if self_score > 0.0 { self_score } else { 1.0 };
 
-    rows.iter()
+    rows.par_iter()
         .map(|row| {
             row.metadata_docs
                 .iter()
@@ -758,6 +758,33 @@ mod tests {
         let scores = score_metadata_bm25_all_rows_raw(&sample_raw(), &[row_raw()]);
         assert_eq!(scores.len(), 1);
         assert!(scores[0] > 0.7);
+    }
+
+    #[test]
+    fn bm25_parallel_row_scoring_matches_sequential_scoring() {
+        let sample = sample_raw();
+        let rows = vec![row_raw(), second_row_raw(), third_row_raw()];
+        let stats = bm25_corpus_stats(&rows);
+        let query_tokens = tokenize(&normalize_text(&sample.metadata_doc));
+        let self_score = bm25_self_score(&query_tokens, &stats);
+        let denominator = if self_score > 0.0 { self_score } else { 1.0 };
+
+        let sequential: Vec<f64> = rows
+            .iter()
+            .map(|row| {
+                row.metadata_docs
+                    .iter()
+                    .map(|metadata_doc| {
+                        let tokens = tokenize(&normalize_text(metadata_doc));
+                        bm25_score_tokens(&query_tokens, &tokens, &stats) / denominator
+                    })
+                    .fold(0.0, f64::max)
+                    .clamp(0.0, 1.0)
+            })
+            .collect();
+
+        let parallel = score_metadata_bm25_all_rows_raw(&sample, &rows);
+        assert_eq!(parallel, sequential);
     }
 
     #[test]
