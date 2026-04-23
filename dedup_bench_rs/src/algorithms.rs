@@ -34,6 +34,7 @@ pub struct CandidateScore {
 pub struct NameContractDuplicate {
     pub contract_address: String,
     pub name: String,
+    pub metadata_doc: String,
     pub max_score: f64,
     pub duplicate_token_count: usize,
 }
@@ -569,6 +570,7 @@ pub fn name_duplicates_from_candidates(
                 .map(|row| NameContractDuplicate {
                     contract_address: candidate.contract_address,
                     name: row.name.clone(),
+                    metadata_doc: row.metadata_display_doc.clone(),
                     max_score: candidate.score,
                     duplicate_token_count: row.token_count,
                 })
@@ -707,6 +709,8 @@ mod tests {
             chain: "ethereum".into(),
             contract_address: String::new(),
             token_id: String::new(),
+            token_uri: String::new(),
+            image_uri: String::new(),
             name: "Azuki #1".into(),
             name_norm: normalize_name("Azuki #1"),
             metadata_json: "{\"description\":\"gold dragon rare\"}".into(),
@@ -720,12 +724,16 @@ mod tests {
         FeatureRow {
             contract_address: "0xdup".into(),
             token_id: "1".into(),
+            token_uri: String::new(),
+            image_uri: String::new(),
             name: "Azuki".into(),
             name_norm: normalize_name("Azuki"),
             metadata_doc: "rare dragon gold".into(),
             metadata_display_doc: "rare dragon gold".into(),
             metadata_docs: vec!["rare dragon gold".into()],
             metadata_display_docs: vec!["rare dragon gold".into()],
+            token_uris: Vec::new(),
+            image_uris: Vec::new(),
             metadata_keywords: vec!["dragon".into(), "gold".into(), "rare".into()],
             token_count: 1,
         }
@@ -735,12 +743,16 @@ mod tests {
         FeatureRow {
             contract_address: "0xdup2".into(),
             token_id: "2".into(),
+            token_uri: String::new(),
+            image_uri: String::new(),
             name: "Azuki Mirror #2".into(),
             name_norm: normalize_name("Azuki Mirror #2"),
             metadata_doc: "rare dragon silver".into(),
             metadata_display_doc: "rare dragon silver".into(),
             metadata_docs: vec!["rare dragon silver".into()],
             metadata_display_docs: vec!["rare dragon silver".into()],
+            token_uris: Vec::new(),
+            image_uris: Vec::new(),
             metadata_keywords: vec!["dragon".into(), "rare".into(), "silver".into()],
             token_count: 1,
         }
@@ -750,12 +762,16 @@ mod tests {
         FeatureRow {
             contract_address: "0xdup3".into(),
             token_id: "3".into(),
+            token_uri: String::new(),
+            image_uri: String::new(),
             name: "Azuki Variant #3".into(),
             name_norm: normalize_name("Azuki Variant #3"),
             metadata_doc: "gold dragon ultra rare".into(),
             metadata_display_doc: "gold dragon ultra rare".into(),
             metadata_docs: vec!["gold dragon ultra rare".into()],
             metadata_display_docs: vec!["gold dragon ultra rare".into()],
+            token_uris: Vec::new(),
+            image_uris: Vec::new(),
             metadata_keywords: vec!["dragon".into(), "gold".into(), "rare".into()],
             token_count: 1,
         }
@@ -914,24 +930,32 @@ mod tests {
             FeatureRow {
                 contract_address: "0xdup".into(),
                 token_id: "1".into(),
+                token_uri: String::new(),
+                image_uri: String::new(),
                 name: "Azuki".into(),
                 name_norm: normalize_name("Azuki"),
                 metadata_doc: "rare dragon gold".into(),
                 metadata_display_doc: "rare dragon gold".into(),
                 metadata_docs: vec!["rare dragon gold".into(), "blue tiger".into()],
                 metadata_display_docs: vec!["rare dragon gold".into(), "blue tiger".into()],
+                token_uris: Vec::new(),
+                image_uris: Vec::new(),
                 metadata_keywords: vec!["dragon".into()],
                 token_count: 2,
             },
             FeatureRow {
                 contract_address: "0xother".into(),
                 token_id: "1".into(),
+                token_uri: String::new(),
+                image_uri: String::new(),
                 name: "Azuki Alt".into(),
                 name_norm: normalize_name("Azuki Alt"),
                 metadata_doc: "rare dragon gold".into(),
                 metadata_display_doc: "rare dragon gold".into(),
                 metadata_docs: vec!["rare dragon gold".into()],
                 metadata_display_docs: vec!["rare dragon gold".into()],
+                token_uris: Vec::new(),
+                image_uris: Vec::new(),
                 metadata_keywords: vec!["dragon".into()],
                 token_count: 1,
             },
@@ -942,6 +966,7 @@ mod tests {
         assert_eq!(grouped.len(), 2);
         assert_eq!(grouped[0].contract_address, "0xdup");
         assert_eq!(grouped[0].name, "Azuki");
+        assert_eq!(grouped[0].metadata_doc, "rare dragon gold");
         assert_eq!(grouped[0].max_score, 100.0);
         assert_eq!(grouped[0].duplicate_token_count, 2);
     }

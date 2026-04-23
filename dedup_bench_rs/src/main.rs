@@ -21,6 +21,10 @@ enum Command {
         contract_address: String,
         #[arg(long, default_value = "")]
         token_id: String,
+        #[arg(long, default_value = "")]
+        token_uri: String,
+        #[arg(long, default_value = "")]
+        image_uri: String,
         #[arg(long)]
         name: String,
         #[arg(long)]
@@ -45,6 +49,8 @@ fn main() {
             chain,
             contract_address,
             token_id,
+            token_uri,
+            image_uri,
             name,
             metadata_file,
             feature_db,
@@ -56,6 +62,8 @@ fn main() {
             chain,
             contract_address,
             token_id,
+            token_uri,
+            image_uri,
             name,
             metadata_file,
             feature_db,

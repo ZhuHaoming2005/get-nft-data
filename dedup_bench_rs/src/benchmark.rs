@@ -1,4 +1,5 @@
 use std::fs;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -26,6 +27,8 @@ pub struct BenchmarkConfig {
     pub chain: String,
     pub contract_address: String,
     pub token_id: String,
+    pub token_uri: String,
+    pub image_uri: String,
     pub name: String,
     pub metadata_file: PathBuf,
     pub feature_db: PathBuf,
@@ -40,6 +43,8 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
         &config.chain,
         &config.contract_address,
         &config.token_id,
+        &config.token_uri,
+        &config.image_uri,
         &config.name,
         &config.metadata_file,
     )?;
@@ -47,6 +52,7 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
     let recall_started = Instant::now();
     let (source, recall_rows) = store.load_recall_rows(&sample)?;
     let recall_elapsed_ms = recall_started.elapsed().as_secs_f64() * 1000.0;
+    let uri_matched_contracts = uri_matched_contracts(&sample, &recall_rows);
     let algorithm_thread_pool = algorithm_thread_pool(config.algorithm_threads)?;
 
     let repeat = config.repeat.max(1);
@@ -109,7 +115,8 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
                 AlgorithmField::Name => TimedAlgorithmResult::Name(0, Vec::new()),
                 AlgorithmField::Metadata => TimedAlgorithmResult::Metadata(0, Vec::new()),
             }) {
-            TimedAlgorithmResult::Name(duplicate_count, duplicates) => {
+            TimedAlgorithmResult::Name(_duplicate_count, duplicates) => {
+                let duplicates = filter_name_duplicates(duplicates, &uri_matched_contracts);
                 name_algorithm_reports.push(NameAlgorithmReport {
                     algorithm_id: algorithm.id.to_string(),
                     field: algorithm.field,
@@ -118,17 +125,18 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
                     runs_ms,
                     avg_ms,
                     min_ms,
-                    duplicate_count,
+                    duplicate_count: duplicates.len(),
                     duplicates,
                 });
             }
-            TimedAlgorithmResult::Metadata(duplicate_count, duplicates) => {
+            TimedAlgorithmResult::Metadata(_duplicate_count, duplicates) => {
                 let duplicates = metadata_duplicates_from_candidates(
                     &sample,
                     &recall_rows,
                     duplicates,
                     algorithm.id,
                 );
+                let duplicates = filter_metadata_duplicates(duplicates, &uri_matched_contracts);
                 metadata_algorithm_reports.push(MetadataAlgorithmReport {
                     algorithm_id: algorithm.id.to_string(),
                     field: algorithm.field,
@@ -137,7 +145,7 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
                     runs_ms,
                     avg_ms,
                     min_ms,
-                    duplicate_count,
+                    duplicate_count: duplicates.len(),
                     duplicates,
                 });
             }
@@ -154,6 +162,42 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
     };
     write_report_outputs(&report, &config.output)?;
     Ok(report)
+}
+
+fn uri_matched_contracts(
+    sample: &BenchmarkSample,
+    rows: &[crate::store::FeatureRow],
+) -> HashSet<String> {
+    rows.iter()
+        .filter(|row| {
+            let token_uri_match = !sample.token_uri.is_empty()
+                && row.token_uris.iter().any(|uri| uri == &sample.token_uri);
+            let image_uri_match = !sample.image_uri.is_empty()
+                && row.image_uris.iter().any(|uri| uri == &sample.image_uri);
+            token_uri_match || image_uri_match
+        })
+        .map(|row| row.contract_address.clone())
+        .collect()
+}
+
+fn filter_name_duplicates(
+    duplicates: Vec<crate::algorithms::NameContractDuplicate>,
+    uri_matched_contracts: &HashSet<String>,
+) -> Vec<crate::algorithms::NameContractDuplicate> {
+    duplicates
+        .into_iter()
+        .filter(|candidate| !uri_matched_contracts.contains(&candidate.contract_address))
+        .collect()
+}
+
+fn filter_metadata_duplicates(
+    duplicates: Vec<crate::algorithms::MetadataDuplicate>,
+    uri_matched_contracts: &HashSet<String>,
+) -> Vec<crate::algorithms::MetadataDuplicate> {
+    duplicates
+        .into_iter()
+        .filter(|candidate| !uri_matched_contracts.contains(&candidate.contract_address))
+        .collect()
 }
 
 fn score_algorithm_rows_raw(
@@ -251,6 +295,8 @@ mod tests {
             chain: "ethereum".into(),
             contract_address: "0xseed".into(),
             token_id: "1".into(),
+            token_uri: String::new(),
+            image_uri: String::new(),
             name: "Azuki #1".into(),
             metadata_file: metadata_path,
             feature_db: db_path,
@@ -319,6 +365,8 @@ mod tests {
             chain: "ethereum".into(),
             contract_address: "0xseed".into(),
             token_id: "1".into(),
+            token_uri: String::new(),
+            image_uri: String::new(),
             name: "Azuki #1".into(),
             metadata_file: metadata_path.clone(),
             feature_db: db_path.clone(),
@@ -341,6 +389,8 @@ mod tests {
             chain: "ethereum".into(),
             contract_address: "0xseed".into(),
             token_id: "1".into(),
+            token_uri: String::new(),
+            image_uri: String::new(),
             name: "Azuki #1".into(),
             metadata_file: metadata_path,
             feature_db: db_path,
@@ -371,6 +421,8 @@ mod tests {
             chain: "ethereum".into(),
             contract_address: "0xseed".into(),
             token_id: "1".into(),
+            token_uri: String::new(),
+            image_uri: String::new(),
             name: "Azuki #1".into(),
             metadata_file: metadata_path.clone(),
             feature_db: db_path.clone(),
@@ -384,6 +436,8 @@ mod tests {
             chain: "ethereum".into(),
             contract_address: "0xseed".into(),
             token_id: "1".into(),
+            token_uri: String::new(),
+            image_uri: String::new(),
             name: "Azuki #1".into(),
             metadata_file: metadata_path,
             feature_db: db_path,
@@ -419,6 +473,8 @@ mod tests {
             chain: "ethereum".into(),
             contract_address: "0xseed".into(),
             token_id: "1".into(),
+            token_uri: String::new(),
+            image_uri: String::new(),
             name: "Azuki #1".into(),
             metadata_file: metadata_path,
             feature_db: db_path,
@@ -444,6 +500,8 @@ mod tests {
             chain: "ethereum".into(),
             contract_address: "0xseed".into(),
             token_id: "1".into(),
+            token_uri: String::new(),
+            image_uri: String::new(),
             name: "Azuki #1".into(),
             metadata_file: metadata_path,
             feature_db: db_path,
@@ -473,6 +531,8 @@ mod tests {
             chain: "ethereum".into(),
             contract_address: "0xseed".into(),
             token_id: "1".into(),
+            token_uri: String::new(),
+            image_uri: String::new(),
             name: "Azuki #1".into(),
             metadata_file: metadata_path,
             feature_db: db_path,
@@ -501,5 +561,82 @@ mod tests {
         assert_eq!(metadata_report.duplicate_count, 1);
         assert_eq!(metadata_report.duplicates[0].contract_address, "0xby_metadata");
         assert_eq!(metadata_report.duplicates[0].metadata_doc, "rare dragon gold");
+    }
+
+    #[test]
+    fn benchmark_exports_only_uri_novel_name_and_metadata_duplicates() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("feature_store.duckdb");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE nft_features (
+                chain VARCHAR,
+                contract_address VARCHAR,
+                token_id VARCHAR,
+                token_uri VARCHAR,
+                image_uri VARCHAR,
+                name VARCHAR,
+                symbol VARCHAR,
+                metadata_json VARCHAR,
+                metadata_doc VARCHAR,
+                name_norm VARCHAR,
+                metadata_keywords_arr VARCHAR
+            );
+            INSERT INTO nft_features VALUES
+            ('ethereum', '0xuri', '1', 'ipfs://Seed/1', 'ipfs://Images/1.PNG', 'Azuki #2', 'MIRROR', '{\"description\":\"rare dragon gold\"}', 'rare dragon gold', 'azuki', '[\"rare\",\"dragon\",\"gold\"]'),
+            ('ethereum', '0xnovel', '2', 'ipfs://Other/2', 'ipfs://OtherImage/2.PNG', 'Azuki #3', 'MIRROR', '{\"description\":\"rare dragon gold\"}', 'rare dragon gold', 'azuki', '[\"rare\",\"dragon\",\"gold\"]');
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let metadata_path = write_sample_inputs(dir.path());
+        let output_path = dir.path().join("report.json");
+
+        let report = run_benchmark(&BenchmarkConfig {
+            chain: "ethereum".into(),
+            contract_address: "0xseed".into(),
+            token_id: "1".into(),
+            token_uri: "ipfs://Seed/1".into(),
+            image_uri: "ipfs://Images/1.PNG".into(),
+            name: "Azuki #1".into(),
+            metadata_file: metadata_path,
+            feature_db: db_path,
+            feature_parquet: None,
+            output: output_path,
+            repeat: 1,
+            algorithm_threads: 30,
+        })
+        .unwrap();
+
+        assert!(report
+            .name_algorithms
+            .iter()
+            .all(|algorithm| algorithm
+                .duplicates
+                .iter()
+                .all(|candidate| candidate.contract_address != "0xuri")));
+        assert!(report
+            .metadata_algorithms
+            .iter()
+            .all(|algorithm| algorithm
+                .duplicates
+                .iter()
+                .all(|candidate| candidate.contract_address != "0xuri")));
+        assert!(report
+            .name_algorithms
+            .iter()
+            .any(|algorithm| algorithm
+                .duplicates
+                .iter()
+                .any(|candidate| candidate.contract_address == "0xnovel")));
+        assert!(report
+            .metadata_algorithms
+            .iter()
+            .any(|algorithm| algorithm
+                .duplicates
+                .iter()
+                .any(|candidate| candidate.contract_address == "0xnovel")));
     }
 }

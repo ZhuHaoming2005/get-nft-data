@@ -44,6 +44,10 @@ fn cli_writes_json_and_markdown_outputs() {
             "0xseed",
             "--token-id",
             "1",
+            "--token-uri",
+            "ipfs://Seed/1",
+            "--image-uri",
+            "ipfs://Images/1.PNG",
             "--name",
             "Azuki #1",
             "--metadata-file",
@@ -72,6 +76,8 @@ fn cli_writes_json_and_markdown_outputs() {
     assert!(markdown_output.contains("## Metadata Algorithms"));
     assert!(markdown_output.contains("duplicate_count"));
     assert!(markdown_output.contains("contract=`0xname` name=`Azuki #2`"));
+    assert!(json_output.contains("\"metadata_doc\": \"nothing here\""));
+    assert!(markdown_output.contains("metadata_doc=`nothing here`"));
     assert!(markdown_output.contains("metadata_doc=`rare dragon gold`"));
     assert!(!markdown_output.contains("## Current Name/Metadata Reference"));
     assert!(!markdown_output.contains("Excluded Seed #9"));

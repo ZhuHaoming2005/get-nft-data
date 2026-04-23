@@ -28,12 +28,16 @@ pub struct SourceInfo {
 pub struct FeatureRow {
     pub contract_address: String,
     pub token_id: String,
+    pub token_uri: String,
+    pub image_uri: String,
     pub name: String,
     pub name_norm: String,
     pub metadata_doc: String,
     pub metadata_display_doc: String,
     pub metadata_docs: Vec<String>,
     pub metadata_display_docs: Vec<String>,
+    pub token_uris: Vec<String>,
+    pub image_uris: Vec<String>,
     pub metadata_keywords: Vec<String>,
     pub token_count: usize,
 }
@@ -318,16 +322,6 @@ fn import_parquet_chain(
     let columns = parquet_columns(conn, parquet_path)?;
     let path_literal = parquet_path.to_string_lossy().replace('\\', "/");
     let chain_literal = chain.replace('\'', "''");
-    let token_uri_expr = if columns.iter().any(|column| column == "token_uri") {
-        "coalesce(cast(token_uri as varchar), '')"
-    } else {
-        "''"
-    };
-    let image_uri_expr = if columns.iter().any(|column| column == "image_uri") {
-        "coalesce(cast(image_uri as varchar), '')"
-    } else {
-        "''"
-    };
     let symbol_expr = if columns.iter().any(|column| column == "symbol") {
         "coalesce(cast(symbol as varchar), '')"
     } else {
@@ -335,6 +329,16 @@ fn import_parquet_chain(
     };
     let metadata_json_expr = if columns.iter().any(|column| column == "metadata_json") {
         "coalesce(cast(metadata_json as varchar), '')"
+    } else {
+        "''"
+    };
+    let token_uri_expr = if columns.iter().any(|column| column == "token_uri") {
+        "coalesce(cast(token_uri as varchar), '')"
+    } else {
+        "''"
+    };
+    let image_uri_expr = if columns.iter().any(|column| column == "image_uri") {
+        "coalesce(cast(image_uri as varchar), '')"
     } else {
         "''"
     };
@@ -418,6 +422,16 @@ fn read_rows_from_table(
     } else {
         "''"
     };
+    let token_uri_expr = if columns.iter().any(|column| column == "token_uri") {
+        "coalesce(cast(token_uri as varchar), '')"
+    } else {
+        "''"
+    };
+    let image_uri_expr = if columns.iter().any(|column| column == "image_uri") {
+        "coalesce(cast(image_uri as varchar), '')"
+    } else {
+        "''"
+    };
     let metadata_doc_expr = if columns.iter().any(|column| column == "metadata_doc") {
         "coalesce(cast(metadata_doc as varchar), '')"
     } else {
@@ -441,6 +455,8 @@ fn read_rows_from_table(
         SELECT
             lower(cast(contract_address as varchar)) AS contract_address,
             cast(token_id as varchar) AS token_id,
+            {token_uri_expr} AS token_uri,
+            {image_uri_expr} AS image_uri,
             coalesce(cast(name as varchar), '') AS name,
             {metadata_json_expr} AS metadata_json,
             {metadata_doc_expr} AS metadata_doc,
@@ -478,6 +494,8 @@ where
             row.get::<_, String>(4)?,
             row.get::<_, String>(5)?,
             row.get::<_, String>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?,
         ))
     })?;
     let mut output = Vec::new();
@@ -485,6 +503,8 @@ where
         let (
             contract_address,
             token_id,
+            token_uri,
+            image_uri,
             name,
             metadata_json,
             raw_metadata_doc,
@@ -547,12 +567,16 @@ where
         output.push(FeatureRow {
             contract_address,
             token_id,
+            token_uri,
+            image_uri,
             name,
             name_norm,
             metadata_doc,
             metadata_display_doc,
             metadata_docs: Vec::new(),
             metadata_display_docs: Vec::new(),
+            token_uris: Vec::new(),
+            image_uris: Vec::new(),
             metadata_keywords,
             token_count: 1,
         });
@@ -565,6 +589,8 @@ fn merge_recall_rows_by_contract(rows: Vec<FeatureRow>) -> Vec<FeatureRow> {
     struct ContractAggregate {
         representative: Option<FeatureRow>,
         metadata_docs: BTreeMap<String, String>,
+        token_uris: BTreeSet<String>,
+        image_uris: BTreeSet<String>,
         metadata_keywords: BTreeSet<String>,
         token_count: usize,
     }
@@ -580,6 +606,12 @@ fn merge_recall_rows_by_contract(rows: Vec<FeatureRow>) -> Vec<FeatureRow> {
                 .metadata_docs
                 .entry(row.metadata_doc.clone())
                 .or_insert_with(|| row.metadata_display_doc.clone());
+        }
+        if !row.token_uri.trim().is_empty() {
+            entry.token_uris.insert(row.token_uri.clone());
+        }
+        if !row.image_uri.trim().is_empty() {
+            entry.image_uris.insert(row.image_uri.clone());
         }
         for keyword in &row.metadata_keywords {
             entry.metadata_keywords.insert(keyword.clone());
@@ -606,6 +638,8 @@ fn merge_recall_rows_by_contract(rows: Vec<FeatureRow>) -> Vec<FeatureRow> {
                     .first()
                     .cloned()
                     .unwrap_or_else(|| row.metadata_doc.clone());
+                row.token_uris = aggregate.token_uris.into_iter().collect();
+                row.image_uris = aggregate.image_uris.into_iter().collect();
                 row.metadata_keywords = aggregate.metadata_keywords.into_iter().collect();
                 row.token_count = aggregate.token_count;
                 row
@@ -657,6 +691,8 @@ mod tests {
             chain: "ethereum".into(),
             contract_address: String::new(),
             token_id: String::new(),
+            token_uri: String::new(),
+            image_uri: String::new(),
             name: "Azuki #1".into(),
             name_norm: derive_name_norm("Azuki #1"),
             metadata_json: "{\"description\":\"rare dragon gold\"}".into(),
@@ -695,6 +731,8 @@ mod tests {
             chain: "ethereum".into(),
             contract_address: String::new(),
             token_id: String::new(),
+            token_uri: String::new(),
+            image_uri: String::new(),
             name: "Azuki #1".into(),
             name_norm: derive_name_norm("Azuki #1"),
             metadata_json: "{\"description\":\"rare dragon gold\"}".into(),
@@ -731,6 +769,8 @@ mod tests {
             chain: "ethereum".into(),
             contract_address: String::new(),
             token_id: String::new(),
+            token_uri: String::new(),
+            image_uri: String::new(),
             name: "Azuki #1".into(),
             name_norm: derive_name_norm("Azuki #1"),
             metadata_json: "{\"description\":\"rare dragon gold\"}".into(),
@@ -784,6 +824,8 @@ mod tests {
             chain: "ethereum".into(),
             contract_address: "0xseed".into(),
             token_id: "1".into(),
+            token_uri: String::new(),
+            image_uri: String::new(),
             name: "Azuki #1".into(),
             name_norm: derive_name_norm("Azuki #1"),
             metadata_json: "{\"description\":\"rare dragon gold\"}".into(),
@@ -828,6 +870,8 @@ mod tests {
             chain: "ethereum".into(),
             contract_address: String::new(),
             token_id: String::new(),
+            token_uri: String::new(),
+            image_uri: String::new(),
             name: "Azuki #0".into(),
             name_norm: derive_name_norm("Azuki #0"),
             metadata_json: "{\"description\":\"rare dragon gold\"}".into(),
