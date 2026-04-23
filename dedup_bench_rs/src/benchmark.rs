@@ -174,12 +174,12 @@ fn uri_matched_contracts(
                 && row
                     .token_uris
                     .iter()
-                    .any(|uri| uri.starts_with(&sample.token_uri));
+                    .any(|uri| uri.contains(&sample.token_uri));
             let image_uri_match = !sample.image_uri.is_empty()
                 && row
                     .image_uris
                     .iter()
-                    .any(|uri| uri.starts_with(&sample.image_uri));
+                    .any(|uri| uri.contains(&sample.image_uri));
             token_uri_match || image_uri_match
         })
         .map(|row| row.contract_address.clone())
@@ -662,13 +662,13 @@ mod tests {
     }
 
     #[test]
-    fn uri_prefix_matching_filters_all_children_under_prefix() {
+    fn uri_contains_matching_filters_gateway_variants_and_children() {
         let sample = BenchmarkSample {
             chain: "ethereum".into(),
             contract_address: String::new(),
             token_id: "1".into(),
-            token_uri: "ipfs://Seed/".into(),
-            image_uri: "ipfs://Images/".into(),
+            token_uri: "Seed/".into(),
+            image_uri: "Images/".into(),
             name: "Azuki #1".into(),
             name_norm: crate::algorithms::derive_name_norm("Azuki #1"),
             metadata_json: "{}".into(),
@@ -680,16 +680,16 @@ mod tests {
             crate::store::FeatureRow {
                 contract_address: "0xuri".into(),
                 token_id: "2".into(),
-                token_uri: "ipfs://Seed/2".into(),
-                image_uri: "ipfs://Images/image_002.PNG".into(),
+                token_uri: "https://ipfs.io/ipfs/Seed/2".into(),
+                image_uri: "https://gw.example/ipfs/Images/image_002.PNG".into(),
                 name: String::new(),
                 name_norm: String::new(),
                 metadata_doc: String::new(),
                 metadata_display_doc: String::new(),
                 metadata_docs: Vec::new(),
                 metadata_display_docs: Vec::new(),
-                token_uris: vec!["ipfs://Seed/2".into()],
-                image_uris: vec!["ipfs://Images/image_002.PNG".into()],
+                token_uris: vec!["https://ipfs.io/ipfs/Seed/2".into()],
+                image_uris: vec!["https://gw.example/ipfs/Images/image_002.PNG".into()],
                 metadata_keywords: Vec::new(),
                 token_count: 1,
             },
