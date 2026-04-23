@@ -22,9 +22,9 @@ fn cli_writes_json_and_markdown_outputs() {
             metadata_keywords_arr VARCHAR
         );
         INSERT INTO nft_features VALUES
-        ('ethereum', '0xseed', '9', 'Excluded Seed #9', '{\"description\":\"rare dragon gold\"}', 'rare dragon gold', 'azuki', '[\"rare\",\"dragon\",\"gold\"]'),
-        ('ethereum', '0xname', '1', 'Azuki #2', '{\"description\":\"nothing here\"}', 'nothing here', 'azuki', '[\"nothing\"]'),
-        ('ethereum', '0xmeta', '2', 'Totally Different', '{\"description\":\"rare dragon gold\"}', 'rare dragon gold', 'totally different', '[\"rare\",\"dragon\",\"gold\"]');
+        ('ethereum', '0xseed', '9', 'Excluded Seed #9', '{\"description\":\"Rare Dragon GOLD\"}', 'rare dragon gold', 'azuki', '[\"rare\",\"dragon\",\"gold\"]'),
+        ('ethereum', '0xname', '1', 'Azuki #2', '{\"description\":\"Nothing HERE\"}', 'nothing here', 'azuki', '[\"nothing\"]'),
+        ('ethereum', '0xmeta', '2', 'Totally Different', '{\"description\":\"Rare Dragon GOLD\"}', 'rare dragon gold', 'totally different', '[\"rare\",\"dragon\",\"gold\"]');
         ",
     )
     .unwrap();
@@ -34,7 +34,7 @@ fn cli_writes_json_and_markdown_outputs() {
     let output_path = dir.path().join("report.json");
     fs::write(
         &metadata_path,
-        r#"{"description":"rare dragon gold","image":"https://ipfs.io/ipfs/Seed/1.PNG"}"#,
+        r#"{"description":"Rare Dragon GOLD","image":"https://ipfs.io/ipfs/Seed/1.PNG"}"#,
     )
     .unwrap();
 
@@ -71,7 +71,8 @@ fn cli_writes_json_and_markdown_outputs() {
     assert!(json_output.contains("\"name_algorithms\""));
     assert!(json_output.contains("\"metadata_algorithms\""));
     assert!(json_output.contains("\"duplicate_count\""));
-    assert!(json_output.contains("\"metadata_doc\": \"rare dragon gold https://ipfs.io/ipfs/Seed/1.PNG\""));
+    assert!(json_output
+        .contains("\"metadata_doc\": \"Rare Dragon GOLD https://ipfs.io/ipfs/Seed/1.PNG\""));
     assert!(json_output.contains("https://ipfs.io/ipfs/Seed/1.PNG"));
     assert!(!json_output.contains("\"metadata_display_doc\""));
     assert!(json_output.contains("\"name\": \"Azuki #2\""));
@@ -83,9 +84,10 @@ fn cli_writes_json_and_markdown_outputs() {
     assert!(markdown_output.contains("duplicate_count"));
     assert!(markdown_output.contains("contract=`0xname` name=`Azuki #2`"));
     assert!(markdown_output.contains("https://ipfs.io/ipfs/Seed/1.PNG"));
-    assert!(json_output.contains("\"metadata_doc\": \"nothing here\""));
-    assert!(markdown_output.contains("metadata_doc=`nothing here`"));
-    assert!(markdown_output.contains("https://ipfs.io/ipfs/Seed/1.PNG"));
+    assert!(json_output.contains("\"metadata_doc\": \"Nothing HERE\""));
+    assert!(markdown_output.contains("metadata_doc=`Nothing HERE`"));
+    assert!(markdown_output
+        .contains("metadata_doc: `Rare Dragon GOLD https://ipfs.io/ipfs/Seed/1.PNG`"));
     assert!(!markdown_output.contains("## Current Name/Metadata Reference"));
     assert!(!markdown_output.contains("Excluded Seed #9"));
 }

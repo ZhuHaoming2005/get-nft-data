@@ -67,7 +67,7 @@ impl BenchmarkSample {
 pub fn metadata_display_document_from_json_str(metadata_json: &str) -> String {
     serde_json::from_str::<serde_json::Value>(metadata_json)
         .map(|value| metadata_display_document(&value))
-        .unwrap_or_default()
+        .unwrap_or_else(|_| metadata_json.trim().to_string())
 }
 
 fn metadata_display_document(value: &serde_json::Value) -> String {
@@ -96,5 +96,17 @@ fn collect_display_parts(value: &serde_json::Value, parts: &mut Vec<String>) {
                 collect_display_parts(value, parts);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_document_falls_back_to_raw_metadata_with_original_case() {
+        let display_doc = metadata_display_document_from_json_str("Not JSON Rare Dragon GOLD");
+
+        assert_eq!(display_doc, "Not JSON Rare Dragon GOLD");
     }
 }
