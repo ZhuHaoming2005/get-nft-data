@@ -18,7 +18,9 @@ pub struct BenchmarkSample {
     pub name: String,
     pub name_norm: String,
     pub metadata_json: String,
+    #[serde(skip_serializing)]
     pub metadata_doc: String,
+    #[serde(rename = "metadata_doc")]
     pub metadata_display_doc: String,
     pub metadata_keywords: Vec<String>,
 }

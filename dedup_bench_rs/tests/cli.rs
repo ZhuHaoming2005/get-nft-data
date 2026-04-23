@@ -32,7 +32,11 @@ fn cli_writes_json_and_markdown_outputs() {
 
     let metadata_path = dir.path().join("metadata.json");
     let output_path = dir.path().join("report.json");
-    fs::write(&metadata_path, r#"{"description":"rare dragon gold"}"#).unwrap();
+    fs::write(
+        &metadata_path,
+        r#"{"description":"rare dragon gold","image":"https://ipfs.io/ipfs/Seed/1.PNG"}"#,
+    )
+    .unwrap();
 
     Command::cargo_bin("dedup_bench_rs")
         .unwrap()
@@ -67,7 +71,9 @@ fn cli_writes_json_and_markdown_outputs() {
     assert!(json_output.contains("\"name_algorithms\""));
     assert!(json_output.contains("\"metadata_algorithms\""));
     assert!(json_output.contains("\"duplicate_count\""));
-    assert!(json_output.contains("\"metadata_doc\": \"rare dragon gold\""));
+    assert!(json_output.contains("\"metadata_doc\": \"rare dragon gold https://ipfs.io/ipfs/Seed/1.PNG\""));
+    assert!(json_output.contains("https://ipfs.io/ipfs/Seed/1.PNG"));
+    assert!(!json_output.contains("\"metadata_display_doc\""));
     assert!(json_output.contains("\"name\": \"Azuki #2\""));
     assert!(!json_output.contains("\"reference\""));
     assert!(!json_output.contains("Excluded Seed #9"));
@@ -76,9 +82,10 @@ fn cli_writes_json_and_markdown_outputs() {
     assert!(markdown_output.contains("## Metadata Algorithms"));
     assert!(markdown_output.contains("duplicate_count"));
     assert!(markdown_output.contains("contract=`0xname` name=`Azuki #2`"));
+    assert!(markdown_output.contains("https://ipfs.io/ipfs/Seed/1.PNG"));
     assert!(json_output.contains("\"metadata_doc\": \"nothing here\""));
     assert!(markdown_output.contains("metadata_doc=`nothing here`"));
-    assert!(markdown_output.contains("metadata_doc=`rare dragon gold`"));
+    assert!(markdown_output.contains("https://ipfs.io/ipfs/Seed/1.PNG"));
     assert!(!markdown_output.contains("## Current Name/Metadata Reference"));
     assert!(!markdown_output.contains("Excluded Seed #9"));
 }
