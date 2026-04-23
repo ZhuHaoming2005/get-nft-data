@@ -9,7 +9,7 @@ use top_contract_analysis_rs::analysis::scoring::metadata_document_from_json;
 
 use crate::algorithms::{derive_name_norm, parse_keywords};
 use crate::error::BenchError;
-use crate::sample::BenchmarkSample;
+use crate::sample::{metadata_display_document_from_json_str, BenchmarkSample};
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -31,7 +31,9 @@ pub struct FeatureRow {
     pub name: String,
     pub name_norm: String,
     pub metadata_doc: String,
+    pub metadata_display_doc: String,
     pub metadata_docs: Vec<String>,
+    pub metadata_display_docs: Vec<String>,
     pub metadata_keywords: Vec<String>,
     pub token_count: usize,
 }
@@ -507,12 +509,16 @@ where
         };
 
         let mut metadata_doc = raw_metadata_doc;
+        let mut metadata_display_doc = metadata_display_document_from_json_str(&metadata_json);
         let mut metadata_keywords = None;
         let metadata_match = if sample_keyword_set.is_empty() {
             false
         } else {
             if metadata_doc.trim().is_empty() && keywords_raw.trim().is_empty() {
                 metadata_doc = metadata_document_from_json(&metadata_json);
+            }
+            if metadata_display_doc.trim().is_empty() {
+                metadata_display_doc = metadata_doc.clone();
             }
             let keywords = parse_keywords(&keywords_raw, &metadata_doc);
             let matched = keywords
@@ -529,6 +535,9 @@ where
         if metadata_doc.trim().is_empty() {
             metadata_doc = metadata_document_from_json(&metadata_json);
         }
+        if metadata_display_doc.trim().is_empty() {
+            metadata_display_doc = metadata_doc.clone();
+        }
         let metadata_keywords =
             metadata_keywords.unwrap_or_else(|| parse_keywords(&keywords_raw, &metadata_doc));
         if name_norm.trim().is_empty() {
@@ -541,7 +550,9 @@ where
             name,
             name_norm,
             metadata_doc,
+            metadata_display_doc,
             metadata_docs: Vec::new(),
+            metadata_display_docs: Vec::new(),
             metadata_keywords,
             token_count: 1,
         });
@@ -553,7 +564,7 @@ fn merge_recall_rows_by_contract(rows: Vec<FeatureRow>) -> Vec<FeatureRow> {
     #[derive(Default)]
     struct ContractAggregate {
         representative: Option<FeatureRow>,
-        metadata_docs: BTreeSet<String>,
+        metadata_docs: BTreeMap<String, String>,
         metadata_keywords: BTreeSet<String>,
         token_count: usize,
     }
@@ -565,7 +576,10 @@ fn merge_recall_rows_by_contract(rows: Vec<FeatureRow>) -> Vec<FeatureRow> {
             .or_default();
         entry.token_count += 1;
         if !row.metadata_doc.trim().is_empty() {
-            entry.metadata_docs.insert(row.metadata_doc.clone());
+            entry
+                .metadata_docs
+                .entry(row.metadata_doc.clone())
+                .or_insert_with(|| row.metadata_display_doc.clone());
         }
         for keyword in &row.metadata_keywords {
             entry.metadata_keywords.insert(keyword.clone());
@@ -580,8 +594,18 @@ fn merge_recall_rows_by_contract(rows: Vec<FeatureRow>) -> Vec<FeatureRow> {
         .into_iter()
         .filter_map(|(_, aggregate)| {
             aggregate.representative.map(|mut row| {
-                row.metadata_docs = aggregate.metadata_docs.into_iter().collect::<Vec<_>>();
+                let metadata_pairs = aggregate.metadata_docs.into_iter().collect::<Vec<_>>();
+                row.metadata_docs = metadata_pairs.iter().map(|(doc, _)| doc.clone()).collect();
+                row.metadata_display_docs = metadata_pairs
+                    .iter()
+                    .map(|(_, display_doc)| display_doc.clone())
+                    .collect();
                 row.metadata_doc = row.metadata_docs.first().cloned().unwrap_or_default();
+                row.metadata_display_doc = row
+                    .metadata_display_docs
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| row.metadata_doc.clone());
                 row.metadata_keywords = aggregate.metadata_keywords.into_iter().collect();
                 row.token_count = aggregate.token_count;
                 row
@@ -637,6 +661,7 @@ mod tests {
             name_norm: derive_name_norm("Azuki #1"),
             metadata_json: "{\"description\":\"rare dragon gold\"}".into(),
             metadata_doc: "rare dragon gold".into(),
+            metadata_display_doc: "rare dragon gold".into(),
             metadata_keywords: vec!["rare".into(), "dragon".into(), "gold".into()],
         };
         let (_, rows) = store.load_recall_rows(&sample).unwrap();
@@ -674,6 +699,7 @@ mod tests {
             name_norm: derive_name_norm("Azuki #1"),
             metadata_json: "{\"description\":\"rare dragon gold\"}".into(),
             metadata_doc: "rare dragon gold".into(),
+            metadata_display_doc: "rare dragon gold".into(),
             metadata_keywords: vec!["rare".into(), "dragon".into(), "gold".into()],
         };
         let (_, rows) = store.load_recall_rows(&sample).unwrap();
@@ -709,6 +735,7 @@ mod tests {
             name_norm: derive_name_norm("Azuki #1"),
             metadata_json: "{\"description\":\"rare dragon gold\"}".into(),
             metadata_doc: "rare dragon gold".into(),
+            metadata_display_doc: "rare dragon gold".into(),
             metadata_keywords: vec!["rare".into(), "dragon".into(), "gold".into()],
         };
         let columns = vec![
@@ -761,6 +788,7 @@ mod tests {
             name_norm: derive_name_norm("Azuki #1"),
             metadata_json: "{\"description\":\"rare dragon gold\"}".into(),
             metadata_doc: "rare dragon gold".into(),
+            metadata_display_doc: "rare dragon gold".into(),
             metadata_keywords: vec!["rare".into(), "dragon".into(), "gold".into()],
         };
 
@@ -804,6 +832,7 @@ mod tests {
             name_norm: derive_name_norm("Azuki #0"),
             metadata_json: "{\"description\":\"rare dragon gold\"}".into(),
             metadata_doc: "rare dragon gold".into(),
+            metadata_display_doc: "rare dragon gold".into(),
             metadata_keywords: vec!["rare".into(), "dragon".into(), "gold".into()],
         };
 

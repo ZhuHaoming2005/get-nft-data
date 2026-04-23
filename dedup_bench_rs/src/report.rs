@@ -33,7 +33,7 @@ impl BenchmarkReport {
             self.sample.contract_address,
             self.sample.token_id,
             self.sample.name,
-            self.sample.metadata_doc
+            self.sample.metadata_display_doc
         ));
 
         out.push_str("## Name Algorithms\n\n");

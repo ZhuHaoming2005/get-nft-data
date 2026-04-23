@@ -17,6 +17,7 @@ pub struct BenchmarkSample {
     pub name_norm: String,
     pub metadata_json: String,
     pub metadata_doc: String,
+    pub metadata_display_doc: String,
     pub metadata_keywords: Vec<String>,
 }
 
@@ -32,6 +33,7 @@ impl BenchmarkSample {
             serde_json::from_str(&fs::read_to_string(metadata_file)?)?;
         let metadata_json = serde_json::to_string(&metadata_value)?;
         let metadata_doc = metadata_document_from_json(&metadata_json);
+        let metadata_display_doc = metadata_display_document(&metadata_value);
         Ok(Self {
             chain: chain.to_string(),
             contract_address: contract_address.to_string(),
@@ -40,6 +42,7 @@ impl BenchmarkSample {
             name: name.to_string(),
             metadata_keywords: metadata_keywords(&metadata_doc, 8),
             metadata_doc,
+            metadata_display_doc,
             metadata_json,
         })
     }
@@ -49,6 +52,41 @@ impl BenchmarkSample {
             None
         } else {
             Some(self.name_norm.chars().take(8).collect())
+        }
+    }
+}
+
+pub fn metadata_display_document_from_json_str(metadata_json: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(metadata_json)
+        .map(|value| metadata_display_document(&value))
+        .unwrap_or_default()
+}
+
+fn metadata_display_document(value: &serde_json::Value) -> String {
+    let mut parts = Vec::new();
+    collect_display_parts(value, &mut parts);
+    parts.join(" ")
+}
+
+fn collect_display_parts(value: &serde_json::Value, parts: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Null => {}
+        serde_json::Value::Bool(boolean) => parts.push(boolean.to_string()),
+        serde_json::Value::Number(number) => parts.push(number.to_string()),
+        serde_json::Value::String(string) => {
+            if !string.trim().is_empty() {
+                parts.push(string.trim().to_string());
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_display_parts(item, parts);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for value in map.values() {
+                collect_display_parts(value, parts);
+            }
         }
     }
 }

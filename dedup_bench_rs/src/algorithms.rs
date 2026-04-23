@@ -592,11 +592,14 @@ fn best_metadata_doc_for_row(
     row: &FeatureRow,
     per_doc: fn(&str, &str) -> f64,
 ) -> Option<(String, f64)> {
-    row.metadata_docs.iter().fold(None, |best, metadata_doc| {
+    row.metadata_docs
+        .iter()
+        .zip(row.metadata_display_docs.iter())
+        .fold(None, |best, (metadata_doc, metadata_display_doc)| {
         let score = per_doc(&sample.metadata_doc, metadata_doc);
         match best {
             Some((_, best_score)) if best_score >= score => best,
-            _ => Some((metadata_doc.clone(), score)),
+            _ => Some((metadata_display_doc.clone(), score)),
         }
     })
 }
@@ -610,13 +613,16 @@ fn best_metadata_doc_for_row_bm25(
     let self_score = bm25_self_score(&query_tokens, stats);
     let denominator = if self_score > 0.0 { self_score } else { 1.0 };
 
-    row.metadata_docs.iter().fold(None, |best, metadata_doc| {
+    row.metadata_docs
+        .iter()
+        .zip(row.metadata_display_docs.iter())
+        .fold(None, |best, (metadata_doc, metadata_display_doc)| {
         let doc_tokens = tokenize(&normalize_text(metadata_doc));
         let score = (bm25_score_tokens(&query_tokens, &doc_tokens, stats) / denominator)
             .clamp(0.0, 1.0);
         match best {
             Some((_, best_score)) if best_score >= score => best,
-            _ => Some((metadata_doc.clone(), score)),
+            _ => Some((metadata_display_doc.clone(), score)),
         }
     })
 }
@@ -705,6 +711,7 @@ mod tests {
             name_norm: normalize_name("Azuki #1"),
             metadata_json: "{\"description\":\"gold dragon rare\"}".into(),
             metadata_doc: "gold dragon rare".into(),
+            metadata_display_doc: "gold dragon rare".into(),
             metadata_keywords: vec!["dragon".into(), "gold".into(), "rare".into()],
         }
     }
@@ -716,7 +723,9 @@ mod tests {
             name: "Azuki".into(),
             name_norm: normalize_name("Azuki"),
             metadata_doc: "rare dragon gold".into(),
+            metadata_display_doc: "rare dragon gold".into(),
             metadata_docs: vec!["rare dragon gold".into()],
+            metadata_display_docs: vec!["rare dragon gold".into()],
             metadata_keywords: vec!["dragon".into(), "gold".into(), "rare".into()],
             token_count: 1,
         }
@@ -729,7 +738,9 @@ mod tests {
             name: "Azuki Mirror #2".into(),
             name_norm: normalize_name("Azuki Mirror #2"),
             metadata_doc: "rare dragon silver".into(),
+            metadata_display_doc: "rare dragon silver".into(),
             metadata_docs: vec!["rare dragon silver".into()],
+            metadata_display_docs: vec!["rare dragon silver".into()],
             metadata_keywords: vec!["dragon".into(), "rare".into(), "silver".into()],
             token_count: 1,
         }
@@ -742,7 +753,9 @@ mod tests {
             name: "Azuki Variant #3".into(),
             name_norm: normalize_name("Azuki Variant #3"),
             metadata_doc: "gold dragon ultra rare".into(),
+            metadata_display_doc: "gold dragon ultra rare".into(),
             metadata_docs: vec!["gold dragon ultra rare".into()],
+            metadata_display_docs: vec!["gold dragon ultra rare".into()],
             metadata_keywords: vec!["dragon".into(), "gold".into(), "rare".into()],
             token_count: 1,
         }
@@ -904,7 +917,9 @@ mod tests {
                 name: "Azuki".into(),
                 name_norm: normalize_name("Azuki"),
                 metadata_doc: "rare dragon gold".into(),
+                metadata_display_doc: "rare dragon gold".into(),
                 metadata_docs: vec!["rare dragon gold".into(), "blue tiger".into()],
+                metadata_display_docs: vec!["rare dragon gold".into(), "blue tiger".into()],
                 metadata_keywords: vec!["dragon".into()],
                 token_count: 2,
             },
@@ -914,7 +929,9 @@ mod tests {
                 name: "Azuki Alt".into(),
                 name_norm: normalize_name("Azuki Alt"),
                 metadata_doc: "rare dragon gold".into(),
+                metadata_display_doc: "rare dragon gold".into(),
                 metadata_docs: vec!["rare dragon gold".into()],
+                metadata_display_docs: vec!["rare dragon gold".into()],
                 metadata_keywords: vec!["dragon".into()],
                 token_count: 1,
             },
