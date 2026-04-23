@@ -171,9 +171,15 @@ fn uri_matched_contracts(
     rows.iter()
         .filter(|row| {
             let token_uri_match = !sample.token_uri.is_empty()
-                && row.token_uris.iter().any(|uri| uri == &sample.token_uri);
+                && row
+                    .token_uris
+                    .iter()
+                    .any(|uri| uri.starts_with(&sample.token_uri));
             let image_uri_match = !sample.image_uri.is_empty()
-                && row.image_uris.iter().any(|uri| uri == &sample.image_uri);
+                && row
+                    .image_uris
+                    .iter()
+                    .any(|uri| uri.starts_with(&sample.image_uri));
             token_uri_match || image_uri_match
         })
         .map(|row| row.contract_address.clone())
@@ -585,6 +591,7 @@ mod tests {
             );
             INSERT INTO nft_features VALUES
             ('ethereum', '0xuri', '1', 'ipfs://Seed/1', 'ipfs://Images/1.PNG', 'Azuki #2', 'MIRROR', '{\"description\":\"rare dragon gold\"}', 'rare dragon gold', 'azuki', '[\"rare\",\"dragon\",\"gold\"]'),
+            ('ethereum', '0xuri2', '3', 'ipfs://Seed/2', 'ipfs://Images/2.PNG', 'Azuki #4', 'MIRROR', '{\"description\":\"rare dragon gold\"}', 'rare dragon gold', 'azuki', '[\"rare\",\"dragon\",\"gold\"]'),
             ('ethereum', '0xnovel', '2', 'ipfs://Other/2', 'ipfs://OtherImage/2.PNG', 'Azuki #3', 'MIRROR', '{\"description\":\"rare dragon gold\"}', 'rare dragon gold', 'azuki', '[\"rare\",\"dragon\",\"gold\"]');
             ",
         )
@@ -598,8 +605,8 @@ mod tests {
             chain: "ethereum".into(),
             contract_address: "0xseed".into(),
             token_id: "1".into(),
-            token_uri: "ipfs://Seed/1".into(),
-            image_uri: "ipfs://Images/1.PNG".into(),
+            token_uri: "ipfs://Seed/".into(),
+            image_uri: "ipfs://Images/".into(),
             name: "Azuki #1".into(),
             metadata_file: metadata_path,
             feature_db: db_path,
@@ -618,12 +625,26 @@ mod tests {
                 .iter()
                 .all(|candidate| candidate.contract_address != "0xuri")));
         assert!(report
+            .name_algorithms
+            .iter()
+            .all(|algorithm| algorithm
+                .duplicates
+                .iter()
+                .all(|candidate| candidate.contract_address != "0xuri2")));
+        assert!(report
             .metadata_algorithms
             .iter()
             .all(|algorithm| algorithm
                 .duplicates
                 .iter()
                 .all(|candidate| candidate.contract_address != "0xuri")));
+        assert!(report
+            .metadata_algorithms
+            .iter()
+            .all(|algorithm| algorithm
+                .duplicates
+                .iter()
+                .all(|candidate| candidate.contract_address != "0xuri2")));
         assert!(report
             .name_algorithms
             .iter()
@@ -638,5 +659,43 @@ mod tests {
                 .duplicates
                 .iter()
                 .any(|candidate| candidate.contract_address == "0xnovel")));
+    }
+
+    #[test]
+    fn uri_prefix_matching_filters_all_children_under_prefix() {
+        let sample = BenchmarkSample {
+            chain: "ethereum".into(),
+            contract_address: String::new(),
+            token_id: "1".into(),
+            token_uri: "ipfs://Seed/".into(),
+            image_uri: "ipfs://Images/".into(),
+            name: "Azuki #1".into(),
+            name_norm: crate::algorithms::derive_name_norm("Azuki #1"),
+            metadata_json: "{}".into(),
+            metadata_doc: String::new(),
+            metadata_display_doc: String::new(),
+            metadata_keywords: Vec::new(),
+        };
+        let rows = vec![
+            crate::store::FeatureRow {
+                contract_address: "0xuri".into(),
+                token_id: "2".into(),
+                token_uri: "ipfs://Seed/2".into(),
+                image_uri: "ipfs://Images/image_002.PNG".into(),
+                name: String::new(),
+                name_norm: String::new(),
+                metadata_doc: String::new(),
+                metadata_display_doc: String::new(),
+                metadata_docs: Vec::new(),
+                metadata_display_docs: Vec::new(),
+                token_uris: vec!["ipfs://Seed/2".into()],
+                image_uris: vec!["ipfs://Images/image_002.PNG".into()],
+                metadata_keywords: Vec::new(),
+                token_count: 1,
+            },
+        ];
+
+        let matched = uri_matched_contracts(&sample, &rows);
+        assert!(matched.contains("0xuri"));
     }
 }
