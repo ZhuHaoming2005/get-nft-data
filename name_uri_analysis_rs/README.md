@@ -19,11 +19,11 @@ Rust + DuckDB 一体分析脚本，读取 `top_contract_analysis_rs export-snaps
 ```bash
 cargo run --release -- \
   --parquet ../output/top_contract_analysis/ethereum.parquet \
-  --database ./analysis.duckdb \
-  --output-dir ./name_uri_analysis_output \
+  --database ./data/analysis.duckdb \
+  --output-dir ./output \
   --threads 32 \
   --memory-limit 60GB \
-  --temp-directory /mnt/data/duckdb-temp
+  --temp-directory ./data/duckdb-temp
 ```
 
 输出：
