@@ -211,7 +211,11 @@ fn token_cosine_from_counts(left: &BTreeMap<String, f64>, right: &BTreeMap<Strin
         .map(|(token, left_value)| left_value * right.get(token).unwrap_or(&0.0))
         .sum::<f64>();
     let left_norm = left.values().map(|value| value * value).sum::<f64>().sqrt();
-    let right_norm = right.values().map(|value| value * value).sum::<f64>().sqrt();
+    let right_norm = right
+        .values()
+        .map(|value| value * value)
+        .sum::<f64>()
+        .sqrt();
     if left_norm == 0.0 || right_norm == 0.0 {
         0.0
     } else {
@@ -259,7 +263,10 @@ fn token_counts(document: &str) -> BTreeMap<String, f64> {
     counts
 }
 
-fn inverse_document_frequencies(left: &BTreeMap<String, f64>, right: &BTreeMap<String, f64>) -> BTreeMap<String, f64> {
+fn inverse_document_frequencies(
+    left: &BTreeMap<String, f64>,
+    right: &BTreeMap<String, f64>,
+) -> BTreeMap<String, f64> {
     let mut doc_freqs = BTreeMap::<String, f64>::new();
     for token in left.keys() {
         *doc_freqs.entry(token.clone()).or_insert(0.0) += 1.0;
@@ -337,8 +344,16 @@ fn soft_tfidf(left: &str, right: &str) -> f64 {
         dot += best;
     }
 
-    let left_norm = left_vector.values().map(|value| value * value).sum::<f64>().sqrt();
-    let right_norm = right_vector.values().map(|value| value * value).sum::<f64>().sqrt();
+    let left_norm = left_vector
+        .values()
+        .map(|value| value * value)
+        .sum::<f64>()
+        .sqrt();
+    let right_norm = right_vector
+        .values()
+        .map(|value| value * value)
+        .sum::<f64>()
+        .sqrt();
     if left_norm == 0.0 || right_norm == 0.0 {
         0.0
     } else {
@@ -346,10 +361,18 @@ fn soft_tfidf(left: &str, right: &str) -> f64 {
     }
 }
 
-fn tfidf_vector(counts: &BTreeMap<String, f64>, weights: &BTreeMap<String, f64>) -> BTreeMap<String, f64> {
+fn tfidf_vector(
+    counts: &BTreeMap<String, f64>,
+    weights: &BTreeMap<String, f64>,
+) -> BTreeMap<String, f64> {
     counts
         .iter()
-        .map(|(token, tf)| (token.clone(), tf * weights.get(token).copied().unwrap_or(1.0)))
+        .map(|(token, tf)| {
+            (
+                token.clone(),
+                tf * weights.get(token).copied().unwrap_or(1.0),
+            )
+        })
         .collect()
 }
 
@@ -495,10 +518,7 @@ fn bm25_self_score(query_tokens: &[String], stats: &Bm25CorpusStats) -> f64 {
     bm25_score_tokens(query_tokens, query_tokens, stats)
 }
 
-pub fn score_metadata_bm25_all_rows_raw(
-    sample: &BenchmarkSample,
-    rows: &[FeatureRow],
-) -> Vec<f64> {
+pub fn score_metadata_bm25_all_rows_raw(sample: &BenchmarkSample, rows: &[FeatureRow]) -> Vec<f64> {
     let stats = bm25_corpus_stats(rows);
     let query_tokens = tokenize(&normalize_text(&sample.metadata_doc));
     let self_score = bm25_self_score(&query_tokens, &stats);
@@ -535,7 +555,11 @@ pub fn build_algorithm_duplicates_raw_from_scores(
             .1
             .partial_cmp(&left.1)
             .unwrap_or(Ordering::Equal)
-            .then_with(|| rows[left.0].contract_address.cmp(&rows[right.0].contract_address))
+            .then_with(|| {
+                rows[left.0]
+                    .contract_address
+                    .cmp(&rows[right.0].contract_address)
+            })
             .then_with(|| rows[left.0].token_id.cmp(&rows[right.0].token_id))
     });
     let total = duplicates.len();
@@ -598,12 +622,12 @@ fn best_metadata_doc_for_row(
         .iter()
         .zip(row.metadata_display_docs.iter())
         .fold(None, |best, (metadata_doc, metadata_display_doc)| {
-        let score = per_doc(&sample.metadata_doc, metadata_doc);
-        match best {
-            Some((_, best_score)) if best_score >= score => best,
-            _ => Some((metadata_display_doc.clone(), score)),
-        }
-    })
+            let score = per_doc(&sample.metadata_doc, metadata_doc);
+            match best {
+                Some((_, best_score)) if best_score >= score => best,
+                _ => Some((metadata_display_doc.clone(), score)),
+            }
+        })
 }
 
 fn best_metadata_doc_for_row_bm25(
@@ -619,14 +643,14 @@ fn best_metadata_doc_for_row_bm25(
         .iter()
         .zip(row.metadata_display_docs.iter())
         .fold(None, |best, (metadata_doc, metadata_display_doc)| {
-        let doc_tokens = tokenize(&normalize_text(metadata_doc));
-        let score = (bm25_score_tokens(&query_tokens, &doc_tokens, stats) / denominator)
-            .clamp(0.0, 1.0);
-        match best {
-            Some((_, best_score)) if best_score >= score => best,
-            _ => Some((metadata_display_doc.clone(), score)),
-        }
-    })
+            let doc_tokens = tokenize(&normalize_text(metadata_doc));
+            let score = (bm25_score_tokens(&query_tokens, &doc_tokens, stats) / denominator)
+                .clamp(0.0, 1.0);
+            match best {
+                Some((_, best_score)) if best_score >= score => best,
+                _ => Some((metadata_display_doc.clone(), score)),
+            }
+        })
 }
 
 pub fn metadata_duplicates_from_candidates(
@@ -889,12 +913,9 @@ mod tests {
         let rows = vec![row_raw(), second_row_raw(), third_row_raw()];
         let scores = vec![100.0, 99.0, 98.0];
 
-        let (duplicate_count, duplicates) = build_algorithm_duplicates_raw_from_scores(
-            "name_damerau_levenshtein",
-            &rows,
-            &scores,
-        )
-        .unwrap();
+        let (duplicate_count, duplicates) =
+            build_algorithm_duplicates_raw_from_scores("name_damerau_levenshtein", &rows, &scores)
+                .unwrap();
 
         assert_eq!(duplicate_count, 3);
         assert_eq!(duplicates.len(), 3);

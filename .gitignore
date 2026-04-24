@@ -8,7 +8,7 @@ classification&status
 build
 build-**
 .runtime
-target
+*target*
 dist
 .worktrees
 **.log

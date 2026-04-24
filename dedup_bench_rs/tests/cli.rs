@@ -15,6 +15,8 @@ fn cli_writes_json_and_markdown_outputs() {
             chain VARCHAR,
             contract_address VARCHAR,
             token_id VARCHAR,
+            token_uri VARCHAR,
+            image_uri VARCHAR,
             name VARCHAR,
             metadata_json VARCHAR,
             metadata_doc VARCHAR,
@@ -22,9 +24,9 @@ fn cli_writes_json_and_markdown_outputs() {
             metadata_keywords_arr VARCHAR
         );
         INSERT INTO nft_features VALUES
-        ('ethereum', '0xseed', '9', 'Excluded Seed #9', '{\"description\":\"Rare Dragon GOLD\"}', 'rare dragon gold', 'azuki', '[\"rare\",\"dragon\",\"gold\"]'),
-        ('ethereum', '0xname', '1', 'Azuki #2', '{\"description\":\"Nothing HERE\"}', 'nothing here', 'azuki', '[\"nothing\"]'),
-        ('ethereum', '0xmeta', '2', 'Totally Different', '{\"description\":\"Rare Dragon GOLD\"}', 'rare dragon gold', 'totally different', '[\"rare\",\"dragon\",\"gold\"]');
+        ('ethereum', '0xseed', '9', '', '', 'Excluded Seed #9', '{\"description\":\"Rare Dragon GOLD\"}', 'rare dragon gold', 'azuki', '[\"rare\",\"dragon\",\"gold\"]'),
+        ('ethereum', '0xname', '1', '', 'ipfs://QmCandidateCID/Token.PNG', 'Azuki #2', '', 'nothing here ipfs://qmcandidatecid/token.png', 'azuki', '[\"nothing\"]'),
+        ('ethereum', '0xmeta', '2', '', '', 'Totally Different', '{\"description\":\"Rare Dragon GOLD\"}', 'rare dragon gold', 'totally different', '[\"rare\",\"dragon\",\"gold\"]');
         ",
     )
     .unwrap();
@@ -84,10 +86,16 @@ fn cli_writes_json_and_markdown_outputs() {
     assert!(markdown_output.contains("duplicate_count"));
     assert!(markdown_output.contains("contract=`0xname` name=`Azuki #2`"));
     assert!(markdown_output.contains("https://ipfs.io/ipfs/Seed/1.PNG"));
-    assert!(json_output.contains("\"metadata_doc\": \"Nothing HERE\""));
-    assert!(markdown_output.contains("metadata_doc=`Nothing HERE`"));
+    assert!(
+        json_output.contains("\"metadata_doc\": \"nothing here ipfs://QmCandidateCID/Token.PNG\"")
+    );
     assert!(markdown_output
         .contains("metadata_doc: `Rare Dragon GOLD https://ipfs.io/ipfs/Seed/1.PNG`"));
+    assert!(json_output.contains("ipfs://QmCandidateCID/Token.PNG"));
+    assert!(markdown_output.contains("metadata_doc=`nothing here ipfs://QmCandidateCID/Token.PNG`"));
+    assert!(
+        !markdown_output.contains("metadata_doc=`nothing here ipfs://qmcandidatecid/token.png`")
+    );
     assert!(!markdown_output.contains("## Current Name/Metadata Reference"));
     assert!(!markdown_output.contains("Excluded Seed #9"));
 }

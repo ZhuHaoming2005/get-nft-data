@@ -1,5 +1,5 @@
-use std::fs;
 use std::collections::HashSet;
+use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -77,26 +77,27 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
             let timed_unit_index = (repeat_index + offset) % total_timed_units;
             let algorithm = algorithms[timed_unit_index];
             let started = Instant::now();
-            let result = algorithm_thread_pool.install(|| -> Result<TimedAlgorithmResult, BenchError> {
-                let scores = score_algorithm_rows_raw(&sample, &recall_rows, algorithm);
-                let (_, duplicates) = build_algorithm_duplicates_raw_from_scores(
-                    algorithm.id,
-                    &recall_rows,
-                    &scores,
-                )
-                .map_err(BenchError::InvalidData)?;
-                Ok(match algorithm.field {
-                    AlgorithmField::Name => {
-                        let duplicates = name_duplicates_from_candidates(&recall_rows, duplicates);
-                        TimedAlgorithmResult::Name(duplicates.len(), duplicates)
-                    }
-                    AlgorithmField::Metadata => {
-                        TimedAlgorithmResult::Metadata(duplicates.len(), duplicates)
-                    }
-                })
-            })?;
-            algorithm_runs_ms[timed_unit_index]
-                .push(started.elapsed().as_secs_f64() * 1000.0);
+            let result =
+                algorithm_thread_pool.install(|| -> Result<TimedAlgorithmResult, BenchError> {
+                    let scores = score_algorithm_rows_raw(&sample, &recall_rows, algorithm);
+                    let (_, duplicates) = build_algorithm_duplicates_raw_from_scores(
+                        algorithm.id,
+                        &recall_rows,
+                        &scores,
+                    )
+                    .map_err(BenchError::InvalidData)?;
+                    Ok(match algorithm.field {
+                        AlgorithmField::Name => {
+                            let duplicates =
+                                name_duplicates_from_candidates(&recall_rows, duplicates);
+                            TimedAlgorithmResult::Name(duplicates.len(), duplicates)
+                        }
+                        AlgorithmField::Metadata => {
+                            TimedAlgorithmResult::Metadata(duplicates.len(), duplicates)
+                        }
+                    })
+                })?;
+            algorithm_runs_ms[timed_unit_index].push(started.elapsed().as_secs_f64() * 1000.0);
             algorithm_results[timed_unit_index] = Some(result);
         }
     }
@@ -314,20 +315,16 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.recall_candidate_count, 2);
-        assert!(
-            report
-                .metadata_algorithms
-                .iter()
-                .flat_map(|algorithm| algorithm.duplicates.iter())
-                .all(|candidate| candidate.contract_address != "0xby_uri_only")
-        );
-        assert!(
-            report
-                .metadata_algorithms
-                .iter()
-                .flat_map(|algorithm| algorithm.duplicates.iter())
-                .all(|candidate| candidate.contract_address != "0xseed")
-        );
+        assert!(report
+            .metadata_algorithms
+            .iter()
+            .flat_map(|algorithm| algorithm.duplicates.iter())
+            .all(|candidate| candidate.contract_address != "0xby_uri_only"));
+        assert!(report
+            .metadata_algorithms
+            .iter()
+            .flat_map(|algorithm| algorithm.duplicates.iter())
+            .all(|candidate| candidate.contract_address != "0xseed"));
     }
 
     #[test]
@@ -407,7 +404,10 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(second_report.source.kind, crate::store::SourceKind::DuckdbTable);
+        assert_eq!(
+            second_report.source.kind,
+            crate::store::SourceKind::DuckdbTable
+        );
         assert_eq!(second_report.recall_candidate_count, 1);
         assert_eq!(
             second_report.metadata_algorithms[0].duplicates[0].contract_address,
@@ -565,8 +565,14 @@ mod tests {
             .find(|algorithm| algorithm.algorithm_id == "metadata_bm25")
             .unwrap();
         assert_eq!(metadata_report.duplicate_count, 1);
-        assert_eq!(metadata_report.duplicates[0].contract_address, "0xby_metadata");
-        assert_eq!(metadata_report.duplicates[0].metadata_doc, "rare dragon gold");
+        assert_eq!(
+            metadata_report.duplicates[0].contract_address,
+            "0xby_metadata"
+        );
+        assert_eq!(
+            metadata_report.duplicates[0].metadata_doc,
+            "rare dragon gold"
+        );
     }
 
     #[test]
@@ -617,48 +623,30 @@ mod tests {
         })
         .unwrap();
 
-        assert!(report
-            .name_algorithms
+        assert!(report.name_algorithms.iter().all(|algorithm| algorithm
+            .duplicates
             .iter()
-            .all(|algorithm| algorithm
-                .duplicates
-                .iter()
-                .all(|candidate| candidate.contract_address != "0xuri")));
-        assert!(report
-            .name_algorithms
+            .all(|candidate| candidate.contract_address != "0xuri")));
+        assert!(report.name_algorithms.iter().all(|algorithm| algorithm
+            .duplicates
             .iter()
-            .all(|algorithm| algorithm
-                .duplicates
-                .iter()
-                .all(|candidate| candidate.contract_address != "0xuri2")));
-        assert!(report
-            .metadata_algorithms
+            .all(|candidate| candidate.contract_address != "0xuri2")));
+        assert!(report.metadata_algorithms.iter().all(|algorithm| algorithm
+            .duplicates
             .iter()
-            .all(|algorithm| algorithm
-                .duplicates
-                .iter()
-                .all(|candidate| candidate.contract_address != "0xuri")));
-        assert!(report
-            .metadata_algorithms
+            .all(|candidate| candidate.contract_address != "0xuri")));
+        assert!(report.metadata_algorithms.iter().all(|algorithm| algorithm
+            .duplicates
             .iter()
-            .all(|algorithm| algorithm
-                .duplicates
-                .iter()
-                .all(|candidate| candidate.contract_address != "0xuri2")));
-        assert!(report
-            .name_algorithms
+            .all(|candidate| candidate.contract_address != "0xuri2")));
+        assert!(report.name_algorithms.iter().any(|algorithm| algorithm
+            .duplicates
             .iter()
-            .any(|algorithm| algorithm
-                .duplicates
-                .iter()
-                .any(|candidate| candidate.contract_address == "0xnovel")));
-        assert!(report
-            .metadata_algorithms
+            .any(|candidate| candidate.contract_address == "0xnovel")));
+        assert!(report.metadata_algorithms.iter().any(|algorithm| algorithm
+            .duplicates
             .iter()
-            .any(|algorithm| algorithm
-                .duplicates
-                .iter()
-                .any(|candidate| candidate.contract_address == "0xnovel")));
+            .any(|candidate| candidate.contract_address == "0xnovel")));
     }
 
     #[test]
@@ -676,24 +664,22 @@ mod tests {
             metadata_display_doc: String::new(),
             metadata_keywords: Vec::new(),
         };
-        let rows = vec![
-            crate::store::FeatureRow {
-                contract_address: "0xuri".into(),
-                token_id: "2".into(),
-                token_uri: "https://ipfs.io/ipfs/Seed/2".into(),
-                image_uri: "https://gw.example/ipfs/Images/image_002.PNG".into(),
-                name: String::new(),
-                name_norm: String::new(),
-                metadata_doc: String::new(),
-                metadata_display_doc: String::new(),
-                metadata_docs: Vec::new(),
-                metadata_display_docs: Vec::new(),
-                token_uris: vec!["https://ipfs.io/ipfs/Seed/2".into()],
-                image_uris: vec!["https://gw.example/ipfs/Images/image_002.PNG".into()],
-                metadata_keywords: Vec::new(),
-                token_count: 1,
-            },
-        ];
+        let rows = vec![crate::store::FeatureRow {
+            contract_address: "0xuri".into(),
+            token_id: "2".into(),
+            token_uri: "https://ipfs.io/ipfs/Seed/2".into(),
+            image_uri: "https://gw.example/ipfs/Images/image_002.PNG".into(),
+            name: String::new(),
+            name_norm: String::new(),
+            metadata_doc: String::new(),
+            metadata_display_doc: String::new(),
+            metadata_docs: Vec::new(),
+            metadata_display_docs: Vec::new(),
+            token_uris: vec!["https://ipfs.io/ipfs/Seed/2".into()],
+            image_uris: vec!["https://gw.example/ipfs/Images/image_002.PNG".into()],
+            metadata_keywords: Vec::new(),
+            token_count: 1,
+        }];
 
         let matched = uri_matched_contracts(&sample, &rows);
         assert!(matched.contains("0xuri"));

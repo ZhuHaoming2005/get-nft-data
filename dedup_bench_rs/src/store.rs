@@ -558,6 +558,8 @@ where
         if metadata_display_doc.trim().is_empty() {
             metadata_display_doc = metadata_doc.clone();
         }
+        metadata_display_doc =
+            restore_display_uri_case(&metadata_display_doc, [&token_uri, &image_uri]);
         let metadata_keywords =
             metadata_keywords.unwrap_or_else(|| parse_keywords(&keywords_raw, &metadata_doc));
         if name_norm.trim().is_empty() {
@@ -582,6 +584,41 @@ where
         });
     }
     Ok(merge_recall_rows_by_contract(output))
+}
+
+fn restore_display_uri_case<'a>(
+    metadata_display_doc: &str,
+    uris: impl IntoIterator<Item = &'a String>,
+) -> String {
+    let mut restored = metadata_display_doc.to_string();
+    for uri in uris {
+        let uri = uri.trim();
+        if uri.is_empty() {
+            continue;
+        }
+        restored = replace_ascii_case_insensitive(&restored, uri);
+    }
+    restored
+}
+
+fn replace_ascii_case_insensitive(text: &str, replacement: &str) -> String {
+    let needle = replacement.to_ascii_lowercase();
+    if needle.is_empty() {
+        return text.to_string();
+    }
+
+    let haystack = text.to_ascii_lowercase();
+    let mut output = String::with_capacity(text.len());
+    let mut search_start = 0;
+    while let Some(relative_match_start) = haystack[search_start..].find(&needle) {
+        let match_start = search_start + relative_match_start;
+        let match_end = match_start + needle.len();
+        output.push_str(&text[search_start..match_start]);
+        output.push_str(replacement);
+        search_start = match_end;
+    }
+    output.push_str(&text[search_start..]);
+    output
 }
 
 fn merge_recall_rows_by_contract(rows: Vec<FeatureRow>) -> Vec<FeatureRow> {
