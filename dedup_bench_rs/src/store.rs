@@ -140,7 +140,10 @@ fn detect_resource_config(feature_db: &Path, use_memory: bool) -> ResourceConfig
     };
     let proportional = total_memory_bytes.saturating_mul(35) / 100;
     let available_target = total_memory_bytes.saturating_sub(reserved);
-    let selected = proportional.min(available_target).max(min_limit).min(soft_cap);
+    let selected = proportional
+        .min(available_target)
+        .max(min_limit)
+        .min(soft_cap);
     let memory_limit_mb = (selected / (1024 * 1024)).max(512);
     let threads = std::thread::available_parallelism()
         .map(usize::from)
@@ -367,7 +370,10 @@ fn import_parquet_chain(
     } else {
         "''"
     };
-    let metadata_keywords_expr = if columns.iter().any(|column| column == "metadata_keywords_arr") {
+    let metadata_keywords_expr = if columns
+        .iter()
+        .any(|column| column == "metadata_keywords_arr")
+    {
         "coalesce(cast(metadata_keywords_arr as varchar), '')"
     } else {
         "''"
@@ -382,7 +388,10 @@ fn import_parquet_chain(
     } else {
         String::new()
     };
-    conn.execute("DELETE FROM nft_features WHERE lower(chain) = lower(?)", params![chain])?;
+    conn.execute(
+        "DELETE FROM nft_features WHERE lower(chain) = lower(?)",
+        params![chain],
+    )?;
     let insert_sql = format!(
         "
         INSERT INTO nft_features (
@@ -442,7 +451,10 @@ fn read_rows_from_table(
     } else {
         "''"
     };
-    let keywords_expr = if columns.iter().any(|column| column == "metadata_keywords_arr") {
+    let keywords_expr = if columns
+        .iter()
+        .any(|column| column == "metadata_keywords_arr")
+    {
         "coalesce(cast(metadata_keywords_arr as varchar), '')"
     } else {
         "''"
@@ -480,8 +492,11 @@ where
     P: duckdb::Params,
 {
     let sample_name_prefix = sample.name_prefix();
-    let sample_keyword_set: HashSet<&str> =
-        sample.metadata_keywords.iter().map(String::as_str).collect();
+    let sample_keyword_set: HashSet<&str> = sample
+        .metadata_keywords
+        .iter()
+        .map(String::as_str)
+        .collect();
     let sample_has_contract = !sample.contract_address.is_empty();
 
     let mut stmt = conn.prepare(query)?;
@@ -498,7 +513,7 @@ where
             row.get::<_, String>(8)?,
         ))
     })?;
-    let mut output = Vec::new();
+    let mut aggregates = BTreeMap::<String, ContractAggregate>::new();
     for row in rows {
         let (
             contract_address,
@@ -513,7 +528,9 @@ where
         ) = row?;
 
         if sample_has_contract
-            && sample.contract_address.eq_ignore_ascii_case(&contract_address)
+            && sample
+                .contract_address
+                .eq_ignore_ascii_case(&contract_address)
         {
             continue;
         }
@@ -566,24 +583,27 @@ where
             name_norm = derive_name_norm(&name);
         }
 
-        output.push(FeatureRow {
-            contract_address,
-            token_id,
-            token_uri,
-            image_uri,
-            name,
-            name_norm,
-            metadata_doc,
-            metadata_display_doc,
-            metadata_docs: Vec::new(),
-            metadata_display_docs: Vec::new(),
-            token_uris: Vec::new(),
-            image_uris: Vec::new(),
-            metadata_keywords,
-            token_count: 1,
-        });
+        push_recall_row(
+            &mut aggregates,
+            FeatureRow {
+                contract_address,
+                token_id,
+                token_uri,
+                image_uri,
+                name,
+                name_norm,
+                metadata_doc,
+                metadata_display_doc,
+                metadata_docs: Vec::new(),
+                metadata_display_docs: Vec::new(),
+                token_uris: Vec::new(),
+                image_uris: Vec::new(),
+                metadata_keywords,
+                token_count: 1,
+            },
+        );
     }
-    Ok(merge_recall_rows_by_contract(output))
+    Ok(finish_recall_rows(aggregates))
 }
 
 fn restore_display_uri_case<'a>(
@@ -621,44 +641,41 @@ fn replace_ascii_case_insensitive(text: &str, replacement: &str) -> String {
     output
 }
 
-fn merge_recall_rows_by_contract(rows: Vec<FeatureRow>) -> Vec<FeatureRow> {
-    #[derive(Default)]
-    struct ContractAggregate {
-        representative: Option<FeatureRow>,
-        metadata_docs: BTreeMap<String, String>,
-        token_uris: BTreeSet<String>,
-        image_uris: BTreeSet<String>,
-        metadata_keywords: BTreeSet<String>,
-        token_count: usize,
-    }
+#[derive(Default)]
+struct ContractAggregate {
+    representative: Option<FeatureRow>,
+    metadata_docs: BTreeMap<String, String>,
+    token_uris: BTreeSet<String>,
+    image_uris: BTreeSet<String>,
+    metadata_keywords: BTreeSet<String>,
+    token_count: usize,
+}
 
-    let mut aggregates = BTreeMap::<String, ContractAggregate>::new();
-    for row in rows {
-        let entry = aggregates
-            .entry(row.contract_address.clone())
-            .or_default();
-        entry.token_count += 1;
-        if !row.metadata_doc.trim().is_empty() {
-            entry
-                .metadata_docs
-                .entry(row.metadata_doc.clone())
-                .or_insert_with(|| row.metadata_display_doc.clone());
-        }
-        if !row.token_uri.trim().is_empty() {
-            entry.token_uris.insert(row.token_uri.clone());
-        }
-        if !row.image_uri.trim().is_empty() {
-            entry.image_uris.insert(row.image_uri.clone());
-        }
-        for keyword in &row.metadata_keywords {
-            entry.metadata_keywords.insert(keyword.clone());
-        }
-        match entry.representative.as_ref() {
-            Some(current) if current.token_id <= row.token_id => {}
-            _ => entry.representative = Some(row),
-        }
+fn push_recall_row(aggregates: &mut BTreeMap<String, ContractAggregate>, row: FeatureRow) {
+    let entry = aggregates.entry(row.contract_address.clone()).or_default();
+    entry.token_count += 1;
+    if !row.metadata_doc.trim().is_empty() {
+        entry
+            .metadata_docs
+            .entry(row.metadata_doc.clone())
+            .or_insert_with(|| row.metadata_display_doc.clone());
     }
+    if !row.token_uri.trim().is_empty() {
+        entry.token_uris.insert(row.token_uri.clone());
+    }
+    if !row.image_uri.trim().is_empty() {
+        entry.image_uris.insert(row.image_uri.clone());
+    }
+    for keyword in &row.metadata_keywords {
+        entry.metadata_keywords.insert(keyword.clone());
+    }
+    match entry.representative.as_ref() {
+        Some(current) if current.token_id <= row.token_id => {}
+        _ => entry.representative = Some(row),
+    }
+}
 
+fn finish_recall_rows(aggregates: BTreeMap<String, ContractAggregate>) -> Vec<FeatureRow> {
     aggregates
         .into_iter()
         .filter_map(|(_, aggregate)| {

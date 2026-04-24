@@ -6,10 +6,9 @@ use std::time::Instant;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
 use crate::algorithms::{
-    build_algorithm_duplicates_raw_from_scores, metadata_duplicates_from_candidates,
-    name_duplicates_from_candidates, score_metadata_bm25_all_rows_raw, score_rows_parallel_raw,
-    timing_algorithms, AlgorithmField, CandidateScore, MetadataAlgorithmReport,
-    NameAlgorithmReport,
+    build_duplicate_rows_with_scorer, build_metadata_bm25_duplicate_rows,
+    metadata_duplicates_from_row_candidates, name_duplicates_from_row_candidates,
+    timing_algorithms, AlgorithmField, DuplicateRow, MetadataAlgorithmReport, NameAlgorithmReport,
 };
 use crate::decision_rules::duplicate_score_rule;
 use crate::error::BenchError;
@@ -18,8 +17,7 @@ use crate::sample::BenchmarkSample;
 use crate::store::FeatureStore;
 
 enum TimedAlgorithmResult {
-    Name(usize, Vec<crate::algorithms::NameContractDuplicate>),
-    Metadata(usize, Vec<CandidateScore>),
+    Rows(usize, Vec<DuplicateRow>),
 }
 
 #[derive(Clone, Debug)]
@@ -59,8 +57,7 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
     let algorithms = timing_algorithms();
     for algorithm in &algorithms {
         algorithm_thread_pool.install(|| -> Result<(), BenchError> {
-            let scores = score_algorithm_rows_raw(&sample, &recall_rows, *algorithm);
-            let _ = build_algorithm_duplicates_raw_from_scores(algorithm.id, &recall_rows, &scores)
+            let _ = build_algorithm_duplicate_rows_raw(&sample, &recall_rows, *algorithm)
                 .map_err(BenchError::InvalidData)?;
             Ok(())
         })?;
@@ -79,23 +76,10 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
             let started = Instant::now();
             let result =
                 algorithm_thread_pool.install(|| -> Result<TimedAlgorithmResult, BenchError> {
-                    let scores = score_algorithm_rows_raw(&sample, &recall_rows, algorithm);
-                    let (_, duplicates) = build_algorithm_duplicates_raw_from_scores(
-                        algorithm.id,
-                        &recall_rows,
-                        &scores,
-                    )
-                    .map_err(BenchError::InvalidData)?;
-                    Ok(match algorithm.field {
-                        AlgorithmField::Name => {
-                            let duplicates =
-                                name_duplicates_from_candidates(&recall_rows, duplicates);
-                            TimedAlgorithmResult::Name(duplicates.len(), duplicates)
-                        }
-                        AlgorithmField::Metadata => {
-                            TimedAlgorithmResult::Metadata(duplicates.len(), duplicates)
-                        }
-                    })
+                    let (duplicate_count, duplicates) =
+                        build_algorithm_duplicate_rows_raw(&sample, &recall_rows, algorithm)
+                            .map_err(BenchError::InvalidData)?;
+                    Ok(TimedAlgorithmResult::Rows(duplicate_count, duplicates))
                 })?;
             algorithm_runs_ms[timed_unit_index].push(started.elapsed().as_secs_f64() * 1000.0);
             algorithm_results[timed_unit_index] = Some(result);
@@ -112,44 +96,47 @@ pub fn run_benchmark(config: &BenchmarkConfig) -> Result<BenchmarkReport, BenchE
             .unwrap_or_else(|_| "missing duplicate rule".to_string());
         match algorithm_results[index]
             .take()
-            .unwrap_or_else(|| match algorithm.field {
-                AlgorithmField::Name => TimedAlgorithmResult::Name(0, Vec::new()),
-                AlgorithmField::Metadata => TimedAlgorithmResult::Metadata(0, Vec::new()),
-            }) {
-            TimedAlgorithmResult::Name(_duplicate_count, duplicates) => {
-                let duplicates = filter_name_duplicates(duplicates, &uri_matched_contracts);
-                name_algorithm_reports.push(NameAlgorithmReport {
-                    algorithm_id: algorithm.id.to_string(),
-                    field: algorithm.field,
-                    decision_rule,
-                    repeat,
-                    runs_ms,
-                    avg_ms,
-                    min_ms,
-                    duplicate_count: duplicates.len(),
-                    duplicates,
-                });
-            }
-            TimedAlgorithmResult::Metadata(_duplicate_count, duplicates) => {
-                let duplicates = metadata_duplicates_from_candidates(
-                    &sample,
-                    &recall_rows,
-                    duplicates,
-                    algorithm.id,
-                );
-                let duplicates = filter_metadata_duplicates(duplicates, &uri_matched_contracts);
-                metadata_algorithm_reports.push(MetadataAlgorithmReport {
-                    algorithm_id: algorithm.id.to_string(),
-                    field: algorithm.field,
-                    decision_rule,
-                    repeat,
-                    runs_ms,
-                    avg_ms,
-                    min_ms,
-                    duplicate_count: duplicates.len(),
-                    duplicates,
-                });
-            }
+            .unwrap_or_else(|| TimedAlgorithmResult::Rows(0, Vec::new()))
+        {
+            TimedAlgorithmResult::Rows(_duplicate_count, duplicates) => match algorithm.field {
+                AlgorithmField::Name => {
+                    let duplicates =
+                        filter_duplicate_rows(duplicates, &recall_rows, &uri_matched_contracts);
+                    let duplicates = name_duplicates_from_row_candidates(&recall_rows, duplicates);
+                    name_algorithm_reports.push(NameAlgorithmReport {
+                        algorithm_id: algorithm.id.to_string(),
+                        field: algorithm.field,
+                        decision_rule,
+                        repeat,
+                        runs_ms,
+                        avg_ms,
+                        min_ms,
+                        duplicate_count: duplicates.len(),
+                        duplicates,
+                    });
+                }
+                AlgorithmField::Metadata => {
+                    let duplicates =
+                        filter_duplicate_rows(duplicates, &recall_rows, &uri_matched_contracts);
+                    let duplicates = metadata_duplicates_from_row_candidates(
+                        &sample,
+                        &recall_rows,
+                        duplicates,
+                        algorithm.id,
+                    );
+                    metadata_algorithm_reports.push(MetadataAlgorithmReport {
+                        algorithm_id: algorithm.id.to_string(),
+                        field: algorithm.field,
+                        decision_rule,
+                        repeat,
+                        runs_ms,
+                        avg_ms,
+                        min_ms,
+                        duplicate_count: duplicates.len(),
+                        duplicates,
+                    });
+                }
+            },
         }
     }
     let report = BenchmarkReport {
@@ -187,35 +174,30 @@ fn uri_matched_contracts(
         .collect()
 }
 
-fn filter_name_duplicates(
-    duplicates: Vec<crate::algorithms::NameContractDuplicate>,
+fn filter_duplicate_rows(
+    duplicates: Vec<DuplicateRow>,
+    rows: &[crate::store::FeatureRow],
     uri_matched_contracts: &HashSet<String>,
-) -> Vec<crate::algorithms::NameContractDuplicate> {
+) -> Vec<DuplicateRow> {
     duplicates
         .into_iter()
-        .filter(|candidate| !uri_matched_contracts.contains(&candidate.contract_address))
+        .filter(|candidate| {
+            rows.get(candidate.row_index)
+                .map(|row| !uri_matched_contracts.contains(&row.contract_address))
+                .unwrap_or(false)
+        })
         .collect()
 }
 
-fn filter_metadata_duplicates(
-    duplicates: Vec<crate::algorithms::MetadataDuplicate>,
-    uri_matched_contracts: &HashSet<String>,
-) -> Vec<crate::algorithms::MetadataDuplicate> {
-    duplicates
-        .into_iter()
-        .filter(|candidate| !uri_matched_contracts.contains(&candidate.contract_address))
-        .collect()
-}
-
-fn score_algorithm_rows_raw(
+fn build_algorithm_duplicate_rows_raw(
     sample: &BenchmarkSample,
     rows: &[crate::store::FeatureRow],
     algorithm: crate::algorithms::TimingAlgorithmDefinition,
-) -> Vec<f64> {
+) -> Result<(usize, Vec<DuplicateRow>), String> {
     if algorithm.id == "metadata_bm25" {
-        score_metadata_bm25_all_rows_raw(sample, rows)
+        build_metadata_bm25_duplicate_rows(sample, rows)
     } else {
-        score_rows_parallel_raw(sample, rows, algorithm.scorer)
+        build_duplicate_rows_with_scorer(algorithm.id, sample, rows, algorithm.scorer)
     }
 }
 

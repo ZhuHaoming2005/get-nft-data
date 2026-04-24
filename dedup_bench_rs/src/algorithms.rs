@@ -21,12 +21,10 @@ pub enum AlgorithmField {
     Metadata,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
-pub struct CandidateScore {
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DuplicateRow {
     pub rank: usize,
-    pub contract_address: String,
-    pub token_id: String,
-    pub name: String,
+    pub row_index: usize,
     pub score: f64,
 }
 
@@ -518,38 +516,56 @@ fn bm25_self_score(query_tokens: &[String], stats: &Bm25CorpusStats) -> f64 {
     bm25_score_tokens(query_tokens, query_tokens, stats)
 }
 
-pub fn score_metadata_bm25_all_rows_raw(sample: &BenchmarkSample, rows: &[FeatureRow]) -> Vec<f64> {
+pub(crate) fn build_duplicate_rows_with_scorer(
+    algorithm_id: &str,
+    sample: &BenchmarkSample,
+    rows: &[FeatureRow],
+    scorer: fn(&BenchmarkSample, &FeatureRow) -> f64,
+) -> Result<(usize, Vec<DuplicateRow>), String> {
+    let rule = duplicate_score_rule(algorithm_id)?;
+    let mut duplicates: Vec<(usize, f64)> = rows
+        .par_iter()
+        .enumerate()
+        .filter_map(|(index, row)| {
+            let score = scorer(sample, row);
+            (score >= rule.threshold).then_some((index, score))
+        })
+        .collect();
+    Ok(finalize_duplicate_rows(rows, &mut duplicates))
+}
+
+pub(crate) fn build_metadata_bm25_duplicate_rows(
+    sample: &BenchmarkSample,
+    rows: &[FeatureRow],
+) -> Result<(usize, Vec<DuplicateRow>), String> {
+    let rule = duplicate_score_rule("metadata_bm25")?;
     let stats = bm25_corpus_stats(rows);
     let query_tokens = tokenize(&normalize_text(&sample.metadata_doc));
     let self_score = bm25_self_score(&query_tokens, &stats);
     let denominator = if self_score > 0.0 { self_score } else { 1.0 };
-
-    rows.par_iter()
-        .map(|row| {
-            row.metadata_docs
+    let mut duplicates: Vec<(usize, f64)> = rows
+        .par_iter()
+        .enumerate()
+        .filter_map(|(index, row)| {
+            let score = row
+                .metadata_docs
                 .iter()
                 .map(|metadata_doc| {
                     let tokens = tokenize(&normalize_text(metadata_doc));
                     bm25_score_tokens(&query_tokens, &tokens, &stats) / denominator
                 })
                 .fold(0.0, f64::max)
-                .clamp(0.0, 1.0)
+                .clamp(0.0, 1.0);
+            (score >= rule.threshold).then_some((index, score))
         })
-        .collect()
+        .collect();
+    Ok(finalize_duplicate_rows(rows, &mut duplicates))
 }
 
-pub fn build_algorithm_duplicates_raw_from_scores(
-    algorithm_id: &str,
+fn finalize_duplicate_rows(
     rows: &[FeatureRow],
-    scored: &[f64],
-) -> Result<(usize, Vec<CandidateScore>), String> {
-    debug_assert_eq!(rows.len(), scored.len());
-    let rule = duplicate_score_rule(algorithm_id)?;
-    let mut duplicates: Vec<(usize, f64)> = scored
-        .iter()
-        .enumerate()
-        .filter_map(|(index, score)| (*score >= rule.threshold).then_some((index, *score)))
-        .collect();
+    duplicates: &mut Vec<(usize, f64)>,
+) -> (usize, Vec<DuplicateRow>) {
     duplicates.sort_by(|left, right| {
         right
             .1
@@ -564,35 +580,27 @@ pub fn build_algorithm_duplicates_raw_from_scores(
     });
     let total = duplicates.len();
     let duplicates = duplicates
-        .into_iter()
+        .drain(..)
         .enumerate()
-        .map(|(rank, (index, score))| CandidateScore {
+        .map(|(rank, (index, score))| DuplicateRow {
             rank: rank + 1,
-            contract_address: rows[index].contract_address.clone(),
-            token_id: rows[index].token_id.clone(),
-            name: rows[index].name.clone(),
+            row_index: index,
             score,
         })
         .collect();
-    Ok((total, duplicates))
+    (total, duplicates)
 }
 
-pub fn name_duplicates_from_candidates(
+pub(crate) fn name_duplicates_from_row_candidates(
     rows: &[FeatureRow],
-    duplicates: Vec<CandidateScore>,
+    duplicates: Vec<DuplicateRow>,
 ) -> Vec<NameContractDuplicate> {
-    let row_lookup: BTreeMap<String, &FeatureRow> = rows
-        .iter()
-        .map(|row| (row.contract_address.clone(), row))
-        .collect();
-
     duplicates
         .into_iter()
         .filter_map(|candidate| {
-            row_lookup
-                .get(&candidate.contract_address)
+            rows.get(candidate.row_index)
                 .map(|row| NameContractDuplicate {
-                    contract_address: candidate.contract_address,
+                    contract_address: row.contract_address.clone(),
                     name: row.name.clone(),
                     metadata_doc: row.metadata_display_doc.clone(),
                     max_score: candidate.score,
@@ -653,47 +661,32 @@ fn best_metadata_doc_for_row_bm25(
         })
 }
 
-pub fn metadata_duplicates_from_candidates(
+pub(crate) fn metadata_duplicates_from_row_candidates(
     sample: &BenchmarkSample,
     rows: &[FeatureRow],
-    duplicates: Vec<CandidateScore>,
+    duplicates: Vec<DuplicateRow>,
     algorithm_id: &str,
 ) -> Vec<MetadataDuplicate> {
-    let row_lookup: BTreeMap<String, &FeatureRow> = rows
-        .iter()
-        .map(|row| (row.contract_address.clone(), row))
-        .collect();
     let bm25_stats = (algorithm_id == "metadata_bm25").then(|| bm25_corpus_stats(rows));
     let per_doc = metadata_duplicate_doc_scorer(algorithm_id).ok();
 
     duplicates
         .into_iter()
         .filter_map(|candidate| {
-            let contract_address = candidate.contract_address;
-            row_lookup
-                .get(&contract_address)
-                .and_then(|row| {
-                    if let Some(stats) = bm25_stats.as_ref() {
-                        best_metadata_doc_for_row_bm25(sample, row, stats)
-                    } else {
-                        per_doc.and_then(|scorer| best_metadata_doc_for_row(sample, row, scorer))
-                    }
-                })
+            rows.get(candidate.row_index).and_then(|row| {
+                if let Some(stats) = bm25_stats.as_ref() {
+                    best_metadata_doc_for_row_bm25(sample, row, stats)
+                } else {
+                    per_doc.and_then(|scorer| best_metadata_doc_for_row(sample, row, scorer))
+                }
                 .map(|(metadata_doc, score)| MetadataDuplicate {
-                    contract_address,
+                    contract_address: row.contract_address.clone(),
                     metadata_doc,
                     score,
                 })
+            })
         })
         .collect()
-}
-
-pub fn score_rows_parallel_raw(
-    sample: &BenchmarkSample,
-    rows: &[FeatureRow],
-    scorer: fn(&BenchmarkSample, &FeatureRow) -> f64,
-) -> Vec<f64> {
-    rows.par_iter().map(|row| scorer(sample, row)).collect()
 }
 
 pub fn derive_name_norm(name: &str) -> String {
@@ -808,36 +801,11 @@ mod tests {
 
     #[test]
     fn bm25_metadata_score_is_high_for_identical_doc() {
-        let scores = score_metadata_bm25_all_rows_raw(&sample_raw(), &[row_raw()]);
-        assert_eq!(scores.len(), 1);
-        assert!(scores[0] > 0.7);
-    }
+        let (_, duplicates) =
+            build_metadata_bm25_duplicate_rows(&sample_raw(), &[row_raw()]).unwrap();
 
-    #[test]
-    fn bm25_parallel_row_scoring_matches_sequential_scoring() {
-        let sample = sample_raw();
-        let rows = vec![row_raw(), second_row_raw(), third_row_raw()];
-        let stats = bm25_corpus_stats(&rows);
-        let query_tokens = tokenize(&normalize_text(&sample.metadata_doc));
-        let self_score = bm25_self_score(&query_tokens, &stats);
-        let denominator = if self_score > 0.0 { self_score } else { 1.0 };
-
-        let sequential: Vec<f64> = rows
-            .iter()
-            .map(|row| {
-                row.metadata_docs
-                    .iter()
-                    .map(|metadata_doc| {
-                        let tokens = tokenize(&normalize_text(metadata_doc));
-                        bm25_score_tokens(&query_tokens, &tokens, &stats) / denominator
-                    })
-                    .fold(0.0, f64::max)
-                    .clamp(0.0, 1.0)
-            })
-            .collect();
-
-        let parallel = score_metadata_bm25_all_rows_raw(&sample, &rows);
-        assert_eq!(parallel, sequential);
+        assert_eq!(duplicates.len(), 1);
+        assert!(duplicates[0].score > 0.7);
     }
 
     #[test]
@@ -881,68 +849,116 @@ mod tests {
     }
 
     #[test]
-    fn parallel_raw_row_scoring_matches_sequential_scoring() {
-        let sample = sample_raw();
-        let rows = vec![row_raw(), second_row_raw()];
-        let sequential: Vec<f64> = rows
-            .iter()
-            .map(|row| score_name_damerau_levenshtein_raw(&sample, row))
-            .collect();
-        let parallel = score_rows_parallel_raw(&sample, &rows, score_name_damerau_levenshtein_raw);
-
-        assert_eq!(parallel, sequential);
-    }
-
-    #[test]
     fn ordinary_duplicate_filtering_respects_per_algorithm_threshold() {
-        let rows = vec![row_raw(), second_row_raw()];
-        let scores = vec![95.0, 94.99];
+        let sample = BenchmarkSample {
+            name: "Azuki".into(),
+            name_norm: normalize_name("Azuki"),
+            ..sample_raw()
+        };
+        let rows = vec![
+            row_raw(),
+            FeatureRow {
+                name: "Completely Different".into(),
+                name_norm: normalize_name("Completely Different"),
+                ..second_row_raw()
+            },
+        ];
 
-        let (duplicate_count, duplicates) =
-            build_algorithm_duplicates_raw_from_scores("name_jaro_winkler", &rows, &scores)
-                .unwrap();
+        let (duplicate_count, duplicates) = build_duplicate_rows_with_scorer(
+            "name_exact_normalized",
+            &sample,
+            &rows,
+            score_name_exact_normalized_raw,
+        )
+        .unwrap();
 
         assert_eq!(duplicate_count, 1);
         assert_eq!(duplicates.len(), 1);
-        assert_eq!(duplicates[0].contract_address, "0xdup");
-        assert_eq!(duplicates[0].score, 95.0);
+        assert_eq!(rows[duplicates[0].row_index].contract_address, "0xdup");
+        assert_eq!(duplicates[0].score, 100.0);
     }
 
     #[test]
     fn ordinary_duplicates_are_not_top_k_truncated() {
-        let rows = vec![row_raw(), second_row_raw(), third_row_raw()];
-        let scores = vec![100.0, 99.0, 98.0];
+        let sample = BenchmarkSample {
+            name: "Azuki".into(),
+            name_norm: normalize_name("Azuki"),
+            ..sample_raw()
+        };
+        let rows = vec![
+            row_raw(),
+            FeatureRow {
+                name: "Azuki".into(),
+                name_norm: normalize_name("Azuki"),
+                ..second_row_raw()
+            },
+            FeatureRow {
+                name: "Azuki".into(),
+                name_norm: normalize_name("Azuki"),
+                ..third_row_raw()
+            },
+        ];
 
-        let (duplicate_count, duplicates) =
-            build_algorithm_duplicates_raw_from_scores("name_damerau_levenshtein", &rows, &scores)
-                .unwrap();
+        let (duplicate_count, duplicates) = build_duplicate_rows_with_scorer(
+            "name_exact_normalized",
+            &sample,
+            &rows,
+            score_name_exact_normalized_raw,
+        )
+        .unwrap();
 
         assert_eq!(duplicate_count, 3);
         assert_eq!(duplicates.len(), 3);
         assert_eq!(
             duplicates
                 .iter()
-                .map(|candidate| candidate.contract_address.as_str())
+                .map(|candidate| rows[candidate.row_index].contract_address.as_str())
                 .collect::<Vec<_>>(),
             vec!["0xdup", "0xdup2", "0xdup3"]
         );
     }
 
     #[test]
+    fn streaming_duplicate_filtering_keeps_ranked_duplicates() {
+        let sample = sample_raw();
+        let rows = vec![row_raw(), second_row_raw(), third_row_raw()];
+        let (_, streaming) = build_duplicate_rows_with_scorer(
+            "name_jaro_winkler",
+            &sample,
+            &rows,
+            score_name_jaro_winkler_raw,
+        )
+        .unwrap();
+
+        assert!(!streaming.is_empty());
+        assert!(streaming
+            .windows(2)
+            .all(|pair| pair[0].score >= pair[1].score));
+    }
+
+    #[test]
+    fn bm25_streaming_duplicate_filtering_keeps_ranked_duplicates() {
+        let sample = sample_raw();
+        let rows = vec![row_raw(), second_row_raw(), third_row_raw()];
+        let (_, streaming) = build_metadata_bm25_duplicate_rows(&sample, &rows).unwrap();
+
+        assert!(!streaming.is_empty());
+        assert!(streaming
+            .windows(2)
+            .all(|pair| pair[0].score >= pair[1].score));
+    }
+
+    #[test]
     fn name_duplicates_are_grouped_by_contract() {
         let duplicates = vec![
-            CandidateScore {
+            DuplicateRow {
                 rank: 1,
-                contract_address: "0xdup".into(),
-                token_id: "1".into(),
-                name: "Azuki".into(),
+                row_index: 0,
                 score: 100.0,
             },
-            CandidateScore {
+            DuplicateRow {
                 rank: 2,
-                contract_address: "0xother".into(),
-                token_id: "1".into(),
-                name: "Azuki Alt".into(),
+                row_index: 1,
                 score: 98.0,
             },
         ];
@@ -982,7 +998,7 @@ mod tests {
             },
         ];
 
-        let grouped = name_duplicates_from_candidates(&rows, duplicates);
+        let grouped = name_duplicates_from_row_candidates(&rows, duplicates);
 
         assert_eq!(grouped.len(), 2);
         assert_eq!(grouped[0].contract_address, "0xdup");
@@ -995,15 +1011,13 @@ mod tests {
     #[test]
     fn metadata_duplicates_use_metadata_doc_in_output() {
         let rows = vec![row_raw()];
-        let duplicates = vec![CandidateScore {
+        let duplicates = vec![DuplicateRow {
             rank: 1,
-            contract_address: "0xdup".into(),
-            token_id: "1".into(),
-            name: "Azuki".into(),
+            row_index: 0,
             score: 0.9,
         }];
 
-        let metadata_duplicates = metadata_duplicates_from_candidates(
+        let metadata_duplicates = metadata_duplicates_from_row_candidates(
             &sample_raw(),
             &rows,
             duplicates,
