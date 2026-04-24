@@ -35,8 +35,9 @@ cargo run --release -- \
 
 - `--database` 放到空间充足的 SSD。
 - `--temp-directory` 指向空间充足的本地磁盘。
-- `--memory-limit` 按总预算处理，DuckDB 和 Rust name 分析共享该预算；程序会预留系统/allocator/字符串/HashMap 开销，并在 DuckDB 建表阶段就避免使用完整预算。
-- 如需指定 Rust name 分析预算，可传 `--analysis-memory-limit 16GB`；该值会从 `--memory-limit` 总预算中扣除，不会额外叠加到 DuckDB 限额。传 `auto` 时按设备当前可用内存估算。
-- 程序会按内存预算和运行时 RSS 自动把 name 阈值分批：内存足够时一次 Jaro-Winkler 打分服务多个阈值，提高速度；接近预算高水位时根据剩余 headroom 自动退回小批/单阈值，降低峰值。
+- `--memory-limit` 按总预算处理，DuckDB 建表阶段可使用该总预算；进入 Rust name 分析前会按已加载数据、threshold state 估算和运行时 RSS 重新平衡 DuckDB/Rust 分配。
+- 通常不需要传 `--analysis-memory-limit`；如需手动指定 Rust name 分析预算，可传 `--analysis-memory-limit 16GB`，该值仍包含在 `--memory-limit` 总预算内。传 `auto` 等同默认自动平衡。
+- CLI 默认显示进度条；批处理、日志重定向或作为库嵌入时可用 `--no-progress` 关闭。
+- 程序会按总预算、当前 RSS 和每个 threshold state 的实际估算自动把 name 阈值分批：headroom 足够时一次 Jaro-Winkler 打分服务多个阈值；headroom 不足时自动退回小批/单阈值。
 - name 第一版不做 blocking，会对传入 Parquet 中的唯一规范名做全量两两 Jaro-Winkler；结果优先准确性，运行时间按唯一 name 数量平方增长。
-- `chain_matrix` 按链对逐个计算，并只为命中的 name pair 建稀疏 union-find；不会为所有链对常驻完整节点数组。
+- `chain_matrix` 会优先在内存预算允许时复用全局跨链 name 打分结果；预算不足时回退到按链对逐个计算，并只为命中的 name pair 建稀疏 union-find。

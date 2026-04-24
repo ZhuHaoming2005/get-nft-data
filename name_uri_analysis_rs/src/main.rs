@@ -30,12 +30,15 @@ struct Args {
 
     #[arg(
         long,
-        help = "Reserve part of --memory-limit for Rust name analysis; accepts sizes like 16GB or auto"
+        help = "Optional Rust name-analysis budget inside --memory-limit; omit or use auto for balanced allocation"
     )]
     analysis_memory_limit: Option<String>,
 
     #[arg(long)]
     temp_directory: Option<PathBuf>,
+
+    #[arg(long, help = "Disable terminal progress bars")]
+    no_progress: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -49,6 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         memory_limit: args.memory_limit,
         analysis_memory_limit: args.analysis_memory_limit,
         temp_directory: args.temp_directory,
+        progress: !args.no_progress,
     })?;
     println!(
         "wrote {} summary rows to {}",

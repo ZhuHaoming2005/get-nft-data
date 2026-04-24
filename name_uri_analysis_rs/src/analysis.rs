@@ -37,6 +37,7 @@ pub struct AnalysisOptions {
     pub memory_limit: String,
     pub analysis_memory_limit: Option<String>,
     pub temp_directory: Option<PathBuf>,
+    pub progress: bool,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -73,15 +74,7 @@ struct NameAtom {
 }
 
 const RIGHT_SCORE_CHUNK_SIZE: usize = 8192;
-const ANALYSIS_STATE_MEMORY_PERCENT: usize = 50;
-const DEFAULT_SYSTEM_RESERVE_PERCENT: usize = 10;
-const MIN_DUCKDB_MEMORY_PERCENT: usize = 20;
-const MIN_ANALYSIS_MEMORY_PERCENT: usize = 10;
 const SPARSE_UNION_NODE_BYTES: usize = 96;
-const HASHMAP_OVERHEAD_PERCENT: usize = 50;
-const RUST_ALLOCATOR_OVERHEAD_PERCENT: usize = 25;
-const MEMORY_PRESSURE_HIGH_PERCENT: usize = 90;
-const MEMORY_PRESSURE_MEDIUM_PERCENT: usize = 80;
 const PROGRESS_FLUSH_CHUNKS: u64 = 128;
 
 #[derive(Clone, Copy)]
@@ -155,6 +148,11 @@ struct MatrixUnionState {
     union_find: SparseUnionFind,
 }
 
+struct ChainMatrixReusePlan {
+    per_threshold_bytes: usize,
+    pair_count: usize,
+}
+
 #[derive(Clone, Copy, Default)]
 struct PairComponentAccumulator {
     left_contract_count: i64,
@@ -211,14 +209,20 @@ impl MemoryGuard {
     }
 }
 
-struct ProgressTracker {
-    _multi: MultiProgress,
-    overall: ProgressBar,
-    detail: ProgressBar,
+enum ProgressTracker {
+    Enabled {
+        _multi: MultiProgress,
+        overall: ProgressBar,
+        detail: ProgressBar,
+    },
+    Disabled,
 }
 
 impl ProgressTracker {
-    fn new(total_phases: u64) -> Self {
+    fn new(total_phases: u64, enabled: bool) -> Self {
+        if !enabled {
+            return Self::Disabled;
+        }
         let multi = MultiProgress::new();
         let overall = multi.add(ProgressBar::new(total_phases));
         overall.set_style(
@@ -236,7 +240,7 @@ impl ProgressTracker {
             .unwrap()
             .progress_chars("#>-"),
         );
-        Self {
+        Self::Enabled {
             _multi: multi,
             overall,
             detail,
@@ -244,43 +248,66 @@ impl ProgressTracker {
     }
 
     fn start_phase(&self, message: impl Into<String>, work_units: u64) {
+        let Self::Enabled {
+            overall, detail, ..
+        } = self
+        else {
+            return;
+        };
         let message = message.into();
-        self.overall.set_message(message.clone());
-        self.detail.reset();
-        self.detail.set_length(work_units);
-        self.detail.set_position(0);
-        self.detail.set_message(message);
+        overall.set_message(message.clone());
+        detail.reset();
+        detail.set_length(work_units);
+        detail.set_position(0);
+        detail.set_message(message);
     }
 
     fn add_work(&self, units: u64) {
-        self.detail.inc_length(units);
+        if let Self::Enabled { detail, .. } = self {
+            detail.inc_length(units);
+        }
     }
 
     fn step(&self, message: impl Into<String>) {
-        self.detail.set_message(message.into());
-        self.detail.inc(1);
+        if let Self::Enabled { detail, .. } = self {
+            detail.set_message(message.into());
+            detail.inc(1);
+        }
     }
 
     fn inc(&self, units: u64) {
-        self.detail.inc(units);
+        if let Self::Enabled { detail, .. } = self {
+            detail.inc(units);
+        }
     }
 
     fn set_message(&self, message: impl Into<String>) {
-        self.detail.set_message(message.into());
+        if let Self::Enabled { detail, .. } = self {
+            detail.set_message(message.into());
+        }
     }
 
     fn finish_phase(&self, message: impl Into<String>) {
+        let Self::Enabled {
+            overall, detail, ..
+        } = self
+        else {
+            return;
+        };
         let message = message.into();
-        self.detail.finish_with_message(message.clone());
-        self.overall.inc(1);
-        self.overall.set_message(message);
+        detail.finish_with_message(message.clone());
+        overall.inc(1);
+        overall.set_message(message);
     }
 
     fn finish(&self) {
-        self.detail
-            .finish_with_message("analysis complete; writing outputs finished");
-        self.overall
-            .finish_with_message("analysis complete; writing outputs finished");
+        if let Self::Enabled {
+            overall, detail, ..
+        } = self
+        {
+            detail.finish_with_message("analysis complete; writing outputs finished");
+            overall.finish_with_message("analysis complete; writing outputs finished");
+        }
     }
 }
 
@@ -327,6 +354,7 @@ struct ThresholdUnionState {
     threshold: f64,
     intra: UnionFind,
     cross: Option<SparseUnionFind>,
+    chain_matrix: Option<Vec<SparseUnionFind>>,
 }
 
 #[derive(Default)]
@@ -409,7 +437,7 @@ pub fn run_analysis(options: AnalysisOptions) -> Result<AnalysisReport, Analysis
     }
     fs::create_dir_all(&options.output_dir)?;
 
-    let progress = ProgressTracker::new(5);
+    let progress = ProgressTracker::new(5, options.progress);
     progress.start_phase("configuring DuckDB", 1);
     let conn = Connection::open(&options.database_path)?;
     configure_duckdb(&conn, &options)?;
@@ -490,14 +518,15 @@ fn prepare_base_tables(
     progress: &ProgressTracker,
 ) -> Result<Vec<String>, AnalysisError> {
     let inputs = parquet_input_sql(&options.parquet_inputs);
-    progress.start_phase("preparing DuckDB tables", 11);
+    progress.start_phase("preparing DuckDB tables", 12);
     execute_progress_batch(
         conn,
         "
         DROP TABLE IF EXISTS selected_chains;
-        DROP TABLE IF EXISTS uri_rows;
+        DROP TABLE IF EXISTS uri_key_contracts;
         DROP TABLE IF EXISTS uri_key_stats;
         DROP TABLE IF EXISTS uri_key_chain_counts;
+        DROP TABLE IF EXISTS uri_contract_flags;
         DROP TABLE IF EXISTS contract_names;
         DROP TABLE IF EXISTS name_atoms;
         ",
@@ -519,34 +548,8 @@ fn prepare_base_tables(
         progress,
         "loaded selected chains",
     )?;
-    execute_progress_batch(
-        conn,
-        &format!(
-            "
-            CREATE TABLE uri_rows AS
-            SELECT
-                lower(trim(CAST(chain AS VARCHAR))) AS chain,
-                lower(trim(CAST(contract_address AS VARCHAR))) AS contract_address,
-                trim(coalesce(CAST(token_uri AS VARCHAR), '')) AS token_uri,
-                trim(coalesce(CAST(image_uri AS VARCHAR), '')) AS image_uri,
-                coalesce(CAST(token_uri_norm AS VARCHAR), '') AS token_uri_norm,
-                coalesce(CAST(image_uri_norm AS VARCHAR), '') AS image_uri_norm
-            FROM read_parquet({inputs})
-            WHERE contract_address IS NOT NULL
-              AND trim(CAST(contract_address AS VARCHAR)) <> ''
-              AND (
-                  trim(coalesce(CAST(token_uri AS VARCHAR), '')) <> ''
-                  OR trim(coalesce(CAST(image_uri AS VARCHAR), '')) <> ''
-                  OR coalesce(CAST(token_uri_norm AS VARCHAR), '') <> ''
-                  OR coalesce(CAST(image_uri_norm AS VARCHAR), '') <> ''
-              );
-            ",
-            inputs = inputs,
-        ),
-        progress,
-        "materialized URI rows",
-    )?;
-    build_uri_key_stats(conn, progress)?;
+    build_uri_key_stats(conn, &inputs, progress)?;
+    build_uri_contract_flags(conn, &inputs, progress)?;
     execute_progress_batch(
         conn,
         &format!(
@@ -618,30 +621,62 @@ fn execute_progress_batch(
     Ok(())
 }
 
-fn build_uri_key_stats(conn: &Connection, progress: &ProgressTracker) -> Result<(), AnalysisError> {
+fn build_uri_key_stats(
+    conn: &Connection,
+    inputs: &str,
+    progress: &ProgressTracker,
+) -> Result<(), AnalysisError> {
     execute_progress_batch(
         conn,
         "
-            CREATE TABLE uri_key_stats (
+            CREATE TABLE uri_key_contracts (
                 chain VARCHAR,
                 key_kind VARCHAR,
                 key_value VARCHAR,
-                nft_count BIGINT,
-                contract_count BIGINT
+                contract_address VARCHAR,
+                nft_count BIGINT
             );
         ",
         progress,
-        "created URI key stats table",
+        "created URI key contract table",
     )?;
 
-    for (key_kind, column_name) in [
-        ("strict_token", "token_uri"),
-        ("strict_image", "image_uri"),
-        ("norm_token", "token_uri_norm"),
-        ("norm_image", "image_uri_norm"),
+    for (key_kind, column_expr) in [
+        (
+            "strict_token",
+            "trim(coalesce(CAST(token_uri AS VARCHAR), ''))",
+        ),
+        (
+            "strict_image",
+            "trim(coalesce(CAST(image_uri AS VARCHAR), ''))",
+        ),
+        (
+            "norm_token",
+            "coalesce(CAST(token_uri_norm AS VARCHAR), '')",
+        ),
+        (
+            "norm_image",
+            "coalesce(CAST(image_uri_norm AS VARCHAR), '')",
+        ),
     ] {
-        insert_uri_key_stats(conn, progress, key_kind, column_name)?;
+        insert_uri_key_contracts(conn, inputs, progress, key_kind, column_expr)?;
     }
+
+    execute_progress_batch(
+        conn,
+        "
+            CREATE TABLE uri_key_stats AS
+            SELECT chain,
+                   key_kind,
+                   key_value,
+                   coalesce(sum(nft_count), 0)::BIGINT AS nft_count,
+                   count(*)::BIGINT AS contract_count
+            FROM uri_key_contracts
+            GROUP BY chain, key_kind, key_value;
+        ",
+        progress,
+        "built URI key stats",
+    )?;
     execute_progress_batch(
         conn,
         "
@@ -658,37 +693,182 @@ fn build_uri_key_stats(conn: &Connection, progress: &ProgressTracker) -> Result<
     Ok(())
 }
 
-fn insert_uri_key_stats(
+fn insert_uri_key_contracts(
     conn: &Connection,
+    inputs: &str,
     progress: &ProgressTracker,
     key_kind: &str,
-    column_name: &str,
+    column_expr: &str,
 ) -> Result<(), AnalysisError> {
     execute_progress_batch(
         conn,
         &format!(
             "
-            INSERT INTO uri_key_stats
-            SELECT chain,
+            INSERT INTO uri_key_contracts
+            SELECT lower(trim(CAST(chain AS VARCHAR))) AS chain,
                    '{key_kind}' AS key_kind,
-                   key_value,
-                   coalesce(sum(nft_count), 0)::BIGINT AS nft_count,
-                   count(*)::BIGINT AS contract_count
-            FROM (
-                SELECT chain,
-                       {column_name} AS key_value,
-                       contract_address,
-                       count(*)::BIGINT AS nft_count
-                FROM uri_rows
-                WHERE {column_name} <> ''
-                GROUP BY chain, {column_name}, contract_address
-            ) per_contract
-            GROUP BY chain, key_value;
+                   {column_expr} AS key_value,
+                   lower(trim(CAST(contract_address AS VARCHAR))) AS contract_address,
+                   count(*)::BIGINT AS nft_count
+            FROM read_parquet({inputs})
+            WHERE chain IS NOT NULL
+              AND trim(CAST(chain AS VARCHAR)) <> ''
+              AND contract_address IS NOT NULL
+              AND trim(CAST(contract_address AS VARCHAR)) <> ''
+              AND {column_expr} <> ''
+            GROUP BY
+                lower(trim(CAST(chain AS VARCHAR))),
+                {column_expr},
+                lower(trim(CAST(contract_address AS VARCHAR)));
             ",
         ),
         progress,
-        &format!("built URI key stats {key_kind}"),
+        &format!("built URI key contracts {key_kind}"),
     )
+}
+
+fn build_uri_contract_flags(
+    conn: &Connection,
+    inputs: &str,
+    progress: &ProgressTracker,
+) -> Result<(), AnalysisError> {
+    execute_progress_batch(
+        conn,
+        &format!(
+            "
+            CREATE TABLE uri_contract_flags AS
+            WITH rows AS (
+                SELECT
+                    lower(trim(CAST(chain AS VARCHAR))) AS chain,
+                    lower(trim(CAST(contract_address AS VARCHAR))) AS contract_address,
+                    trim(coalesce(CAST(token_uri AS VARCHAR), '')) AS token_uri,
+                    trim(coalesce(CAST(image_uri AS VARCHAR), '')) AS image_uri,
+                    coalesce(CAST(token_uri_norm AS VARCHAR), '') AS token_uri_norm,
+                    coalesce(CAST(image_uri_norm AS VARCHAR), '') AS image_uri_norm
+                FROM read_parquet({inputs})
+                WHERE chain IS NOT NULL
+                  AND trim(CAST(chain AS VARCHAR)) <> ''
+                  AND contract_address IS NOT NULL
+                  AND trim(CAST(contract_address AS VARCHAR)) <> ''
+                  AND (
+                      trim(coalesce(CAST(token_uri AS VARCHAR), '')) <> ''
+                      OR trim(coalesce(CAST(image_uri AS VARCHAR), '')) <> ''
+                      OR coalesce(CAST(token_uri_norm AS VARCHAR), '') <> ''
+                      OR coalesce(CAST(image_uri_norm AS VARCHAR), '') <> ''
+                  )
+            ),
+            keyed AS (
+                SELECT r.chain,
+                       r.contract_address,
+                       coalesce(st.nft_count >= 2, false) AS strict_token_any,
+                       coalesce(si.nft_count >= 2, false) AS strict_image_any,
+                       coalesce(st.contract_count >= 2, false) AS strict_token_contract,
+                       coalesce(si.contract_count >= 2, false) AS strict_image_contract,
+                       coalesce(stc.chain_count >= 2, false) AS strict_token_chain,
+                       coalesce(sic.chain_count >= 2, false) AS strict_image_chain,
+                       coalesce(nt.nft_count >= 2, false) AS norm_token_any,
+                       coalesce(ni.nft_count >= 2, false) AS norm_image_any,
+                       coalesce(nt.contract_count >= 2, false) AS norm_token_contract,
+                       coalesce(ni.contract_count >= 2, false) AS norm_image_contract,
+                       coalesce(ntc.chain_count >= 2, false) AS norm_token_chain,
+                       coalesce(nic.chain_count >= 2, false) AS norm_image_chain
+                FROM rows r
+                LEFT JOIN uri_key_stats st
+                  ON st.chain = r.chain
+                 AND st.key_kind = 'strict_token'
+                 AND st.key_value = r.token_uri
+                LEFT JOIN uri_key_stats si
+                  ON si.chain = r.chain
+                 AND si.key_kind = 'strict_image'
+                 AND si.key_value = r.image_uri
+                LEFT JOIN uri_key_chain_counts stc
+                  ON stc.key_kind = 'strict_token'
+                 AND stc.key_value = r.token_uri
+                LEFT JOIN uri_key_chain_counts sic
+                  ON sic.key_kind = 'strict_image'
+                 AND sic.key_value = r.image_uri
+                LEFT JOIN uri_key_stats nt
+                  ON nt.chain = r.chain
+                 AND nt.key_kind = 'norm_token'
+                 AND nt.key_value = r.token_uri_norm
+                LEFT JOIN uri_key_stats ni
+                  ON ni.chain = r.chain
+                 AND ni.key_kind = 'norm_image'
+                 AND ni.key_value = r.image_uri_norm
+                LEFT JOIN uri_key_chain_counts ntc
+                  ON ntc.key_kind = 'norm_token'
+                 AND ntc.key_value = r.token_uri_norm
+                LEFT JOIN uri_key_chain_counts nic
+                  ON nic.key_kind = 'norm_image'
+                 AND nic.key_value = r.image_uri_norm
+            )
+            SELECT chain,
+                   contract_address,
+                   count(*)::BIGINT AS total_nfts,
+                   {contract_columns}
+            FROM keyed
+            GROUP BY chain, contract_address;
+            ",
+            inputs = inputs,
+            contract_columns = uri_contract_metric_columns(),
+        ),
+        progress,
+        "built compact URI contract flags",
+    )
+}
+
+fn uri_contract_metric_columns() -> String {
+    [
+        uri_contract_metric_sql("strict_any", "strict_token_any", "strict_image_any"),
+        uri_contract_metric_sql(
+            "strict_contract",
+            "strict_token_contract",
+            "strict_image_contract",
+        ),
+        uri_contract_metric_sql("strict_chain", "strict_token_chain", "strict_image_chain"),
+        uri_contract_metric_sql("norm_any", "norm_token_any", "norm_image_any"),
+        uri_contract_metric_sql(
+            "norm_contract",
+            "norm_token_contract",
+            "norm_image_contract",
+        ),
+        uri_contract_metric_sql("norm_chain", "norm_token_chain", "norm_image_chain"),
+    ]
+    .join(",\n                   ")
+}
+
+fn uri_contract_metric_sql(prefix: &str, token_flag: &str, image_flag: &str) -> String {
+    format!(
+        "coalesce(sum(CASE WHEN {token_flag} THEN 1 ELSE 0 END), 0)::BIGINT AS {prefix}_v1_nfts,
+                   max(CASE WHEN {token_flag} THEN 1 ELSE 0 END)::BIGINT AS {prefix}_v1_contracts,
+                   coalesce(sum(CASE WHEN NOT {token_flag} AND {image_flag} THEN 1 ELSE 0 END), 0)::BIGINT AS {prefix}_v2_nfts,
+                   max(CASE WHEN NOT {token_flag} AND {image_flag} THEN 1 ELSE 0 END)::BIGINT AS {prefix}_v2_contracts,
+                   coalesce(sum(CASE WHEN {token_flag} OR {image_flag} THEN 1 ELSE 0 END), 0)::BIGINT AS {prefix}_v3_nfts,
+                   max(CASE WHEN {token_flag} OR {image_flag} THEN 1 ELSE 0 END)::BIGINT AS {prefix}_v3_contracts"
+    )
+}
+
+fn uri_counts_from_contract_flags(
+    conn: &Connection,
+    chain: &str,
+    prefix: &str,
+) -> Result<UriCounts, AnalysisError> {
+    let sql = format!(
+        "
+        SELECT coalesce(sum(total_nfts), 0)::BIGINT,
+               count(*)::BIGINT,
+               coalesce(sum({prefix}_v1_nfts), 0)::BIGINT,
+               coalesce(sum({prefix}_v1_contracts), 0)::BIGINT,
+               coalesce(sum({prefix}_v2_nfts), 0)::BIGINT,
+               coalesce(sum({prefix}_v2_contracts), 0)::BIGINT,
+               coalesce(sum({prefix}_v3_nfts), 0)::BIGINT,
+               coalesce(sum({prefix}_v3_contracts), 0)::BIGINT
+        FROM uri_contract_flags
+        WHERE chain = ?
+        "
+    );
+    conn.query_row(&sql, params![chain], uri_counts_from_row)
+        .map_err(AnalysisError::from)
 }
 
 fn load_selected_chains(conn: &Connection) -> Result<Vec<String>, AnalysisError> {
@@ -717,11 +897,8 @@ fn run_uri_analysis(
         .saturating_mul(if chains.len() > 1 { 4 } else { 2 });
     progress.start_phase("analyzing URI duplicates", uri_steps as u64);
     for chain in chains {
-        for (match_prefix, token_kind, image_kind) in [
-            ("strict", "strict_token", "strict_image"),
-            ("norm", "norm_token", "norm_image"),
-        ] {
-            let counts = query_uri_intra_counts(conn, chain, token_kind, image_kind)?;
+        for match_prefix in ["strict", "norm"] {
+            let counts = query_uri_intra_counts(conn, chain, match_prefix)?;
             push_uri_rows(
                 &mut rows,
                 "intra_chain",
@@ -742,11 +919,8 @@ fn run_uri_analysis(
         }
 
         if chains.len() > 1 {
-            for (match_mode, token_kind, image_kind) in [
-                ("strict", "strict_token", "strict_image"),
-                ("norm", "norm_token", "norm_image"),
-            ] {
-                let counts = query_uri_cross_counts(conn, chain, token_kind, image_kind)?;
+            for match_mode in ["strict", "norm"] {
+                let counts = query_uri_cross_counts(conn, chain, match_mode)?;
                 push_uri_rows(
                     &mut rows,
                     "cross_chain_summary",
@@ -766,158 +940,24 @@ fn run_uri_analysis(
 fn query_uri_intra_counts(
     conn: &Connection,
     chain: &str,
-    token_kind: &str,
-    image_kind: &str,
+    match_prefix: &str,
 ) -> Result<UriIntraCounts, AnalysisError> {
-    let token_expr = if token_kind == "strict_token" {
-        "r.token_uri"
-    } else {
-        "r.token_uri_norm"
-    };
-    let image_expr = if image_kind == "strict_image" {
-        "r.image_uri"
-    } else {
-        "r.image_uri_norm"
-    };
-    let sql = format!(
-        "
-        WITH keyed AS (
-            SELECT r.contract_address,
-                   coalesce(t.nft_count >= 2, false) AS token_any_hit,
-                   coalesce(i.nft_count >= 2, false) AS image_any_hit,
-                   coalesce(t.contract_count >= 2, false) AS token_cross_hit,
-                   coalesce(i.contract_count >= 2, false) AS image_cross_hit
-            FROM uri_rows r
-            LEFT JOIN uri_key_stats t
-              ON t.chain = r.chain
-             AND t.key_kind = '{token_kind}'
-             AND t.key_value = {token_expr}
-            LEFT JOIN uri_key_stats i
-              ON i.chain = r.chain
-             AND i.key_kind = '{image_kind}'
-             AND i.key_value = {image_expr}
-            WHERE r.chain = ?
-        ),
-        per_contract AS (
-            SELECT contract_address,
-                   count(*)::BIGINT AS nft_count,
-                   coalesce(sum(CASE WHEN token_any_hit THEN 1 ELSE 0 END), 0)::BIGINT AS token_any_nfts,
-                   max(CASE WHEN token_any_hit THEN 1 ELSE 0 END)::BIGINT AS token_any_contract,
-                   coalesce(sum(CASE WHEN NOT token_any_hit AND image_any_hit THEN 1 ELSE 0 END), 0)::BIGINT AS image_any_nfts,
-                   max(CASE WHEN NOT token_any_hit AND image_any_hit THEN 1 ELSE 0 END)::BIGINT AS image_any_contract,
-                   coalesce(sum(CASE WHEN token_any_hit OR image_any_hit THEN 1 ELSE 0 END), 0)::BIGINT AS either_any_nfts,
-                   max(CASE WHEN token_any_hit OR image_any_hit THEN 1 ELSE 0 END)::BIGINT AS either_any_contract,
-                   coalesce(sum(CASE WHEN token_cross_hit THEN 1 ELSE 0 END), 0)::BIGINT AS token_cross_nfts,
-                   max(CASE WHEN token_cross_hit THEN 1 ELSE 0 END)::BIGINT AS token_cross_contract,
-                   coalesce(sum(CASE WHEN NOT token_cross_hit AND image_cross_hit THEN 1 ELSE 0 END), 0)::BIGINT AS image_cross_nfts,
-                   max(CASE WHEN NOT token_cross_hit AND image_cross_hit THEN 1 ELSE 0 END)::BIGINT AS image_cross_contract,
-                   coalesce(sum(CASE WHEN token_cross_hit OR image_cross_hit THEN 1 ELSE 0 END), 0)::BIGINT AS either_cross_nfts,
-                   max(CASE WHEN token_cross_hit OR image_cross_hit THEN 1 ELSE 0 END)::BIGINT AS either_cross_contract
-            FROM keyed
-            GROUP BY contract_address
-        )
-        SELECT coalesce(sum(nft_count), 0)::BIGINT,
-               count(*)::BIGINT,
-               coalesce(sum(token_any_nfts), 0)::BIGINT,
-               coalesce(sum(token_any_contract), 0)::BIGINT,
-               coalesce(sum(image_any_nfts), 0)::BIGINT,
-               coalesce(sum(image_any_contract), 0)::BIGINT,
-               coalesce(sum(either_any_nfts), 0)::BIGINT,
-               coalesce(sum(either_any_contract), 0)::BIGINT,
-               coalesce(sum(token_cross_nfts), 0)::BIGINT,
-               coalesce(sum(token_cross_contract), 0)::BIGINT,
-               coalesce(sum(image_cross_nfts), 0)::BIGINT,
-               coalesce(sum(image_cross_contract), 0)::BIGINT,
-               coalesce(sum(either_cross_nfts), 0)::BIGINT,
-               coalesce(sum(either_cross_contract), 0)::BIGINT
-        FROM per_contract
-        "
-    );
-    conn.query_row(&sql, params![chain], |row| {
-        let total_nfts = row.get(0)?;
-        let total_contracts = row.get(1)?;
-        Ok(UriIntraCounts {
-            any: UriCounts {
-                total_nfts,
-                total_contracts,
-                v1_nfts: row.get(2)?,
-                v1_contracts: row.get(3)?,
-                v2_nfts: row.get(4)?,
-                v2_contracts: row.get(5)?,
-                v3_nfts: row.get(6)?,
-                v3_contracts: row.get(7)?,
-            },
-            cross_contract: UriCounts {
-                total_nfts,
-                total_contracts,
-                v1_nfts: row.get(8)?,
-                v1_contracts: row.get(9)?,
-                v2_nfts: row.get(10)?,
-                v2_contracts: row.get(11)?,
-                v3_nfts: row.get(12)?,
-                v3_contracts: row.get(13)?,
-            },
-        })
+    Ok(UriIntraCounts {
+        any: uri_counts_from_contract_flags(conn, chain, &format!("{match_prefix}_any"))?,
+        cross_contract: uri_counts_from_contract_flags(
+            conn,
+            chain,
+            &format!("{match_prefix}_contract"),
+        )?,
     })
-    .map_err(AnalysisError::from)
 }
 
 fn query_uri_cross_counts(
     conn: &Connection,
     chain: &str,
-    token_kind: &str,
-    image_kind: &str,
+    match_prefix: &str,
 ) -> Result<UriCounts, AnalysisError> {
-    let token_expr = if token_kind == "strict_token" {
-        "r.token_uri"
-    } else {
-        "r.token_uri_norm"
-    };
-    let image_expr = if image_kind == "strict_image" {
-        "r.image_uri"
-    } else {
-        "r.image_uri_norm"
-    };
-    let sql = format!(
-        "
-        WITH keyed AS (
-            SELECT r.contract_address,
-                   coalesce(t.chain_count >= 2, false) AS token_hit,
-                   coalesce(i.chain_count >= 2, false) AS image_hit
-            FROM uri_rows r
-            LEFT JOIN uri_key_chain_counts t
-              ON t.key_kind = '{token_kind}'
-             AND t.key_value = {token_expr}
-            LEFT JOIN uri_key_chain_counts i
-              ON i.key_kind = '{image_kind}'
-             AND i.key_value = {image_expr}
-            WHERE r.chain = ?
-        ),
-        per_contract AS (
-            SELECT contract_address,
-                   count(*)::BIGINT AS nft_count,
-                   coalesce(sum(CASE WHEN token_hit THEN 1 ELSE 0 END), 0)::BIGINT AS token_nfts,
-                   max(CASE WHEN token_hit THEN 1 ELSE 0 END)::BIGINT AS token_contract,
-                   coalesce(sum(CASE WHEN NOT token_hit AND image_hit THEN 1 ELSE 0 END), 0)::BIGINT AS image_nfts,
-                   max(CASE WHEN NOT token_hit AND image_hit THEN 1 ELSE 0 END)::BIGINT AS image_contract,
-                   coalesce(sum(CASE WHEN token_hit OR image_hit THEN 1 ELSE 0 END), 0)::BIGINT AS either_nfts,
-                   max(CASE WHEN token_hit OR image_hit THEN 1 ELSE 0 END)::BIGINT AS either_contract
-            FROM keyed
-            GROUP BY contract_address
-        )
-        SELECT coalesce(sum(nft_count), 0)::BIGINT,
-               count(*)::BIGINT,
-               coalesce(sum(token_nfts), 0)::BIGINT,
-               coalesce(sum(token_contract), 0)::BIGINT,
-               coalesce(sum(image_nfts), 0)::BIGINT,
-               coalesce(sum(image_contract), 0)::BIGINT,
-               coalesce(sum(either_nfts), 0)::BIGINT,
-               coalesce(sum(either_contract), 0)::BIGINT
-        FROM per_contract
-        "
-    );
-    conn.query_row(&sql, params![chain], uri_counts_from_row)
-        .map_err(AnalysisError::from)
+    uri_counts_from_contract_flags(conn, chain, &format!("{match_prefix}_chain"))
 }
 
 fn uri_counts_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<UriCounts> {
@@ -1006,30 +1046,41 @@ fn run_name_analysis(
     ));
     let thresholds = unique_thresholds(thresholds);
     let analysis_work_budget = memory_plan.analysis_bytes.saturating_sub(atom_bytes);
-    let threshold_budget_capacity = threshold_batch_capacity(
+    let per_threshold_bytes = threshold_state_bytes(atoms.len(), chains.len());
+    let chain_matrix_reuse =
+        chain_matrix_reuse_plan(&atoms_by_chain, analysis_work_budget, per_threshold_bytes);
+    let scoring_per_threshold_bytes = per_threshold_bytes.saturating_add(
+        chain_matrix_reuse
+            .as_ref()
+            .map_or(0, |plan| plan.per_threshold_bytes),
+    );
+    let threshold_budget_capacity = threshold_batch_capacity_for_state_bytes(
         thresholds.len(),
-        atoms.len(),
-        chains.len(),
+        scoring_per_threshold_bytes.max(1),
         analysis_work_budget,
     );
-    let per_threshold_bytes = threshold_state_bytes(atoms.len(), chains.len());
     let mut memory_guard = MemoryGuard::new(total_memory_budget);
     let mut threshold_start = 0;
     while threshold_start < thresholds.len() {
         let batch_size = memory_guard.next_threshold_batch_size(
             thresholds.len() - threshold_start,
             threshold_budget_capacity,
-            per_threshold_bytes,
+            scoring_per_threshold_bytes,
         );
         let threshold_batch = thresholds[threshold_start..threshold_start + batch_size].to_vec();
         threshold_start += batch_size;
         progress.set_message(format!(
-            "name threshold batch {} threshold(s), RSS {}",
+            "name threshold batch {} threshold(s), RSS {}, chain_matrix {}",
             threshold_batch.len(),
             memory_guard
                 .current_rss_bytes()
                 .map(format_byte_size)
-                .unwrap_or_else(|| "unknown".to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            if chain_matrix_reuse.is_some() {
+                "reuse"
+            } else {
+                "fallback"
+            }
         ));
         progress.add_work(full_name_chunk_count(atoms.len()));
         let mut states = threshold_batch
@@ -1039,18 +1090,30 @@ fn run_name_analysis(
                 threshold,
                 intra: UnionFind::new(atoms.len()),
                 cross: (chains.len() > 1).then(SparseUnionFind::default),
+                chain_matrix: chain_matrix_reuse
+                    .as_ref()
+                    .map(|plan| new_chain_matrix_reuse_states(plan.pair_count)),
             })
             .collect::<Vec<_>>();
         sort_threshold_states_for_apply(&mut states);
-        pool.install(|| union_full_name_pairs(&atoms, &mut states, progress));
+        pool.install(|| union_full_name_pairs(&atoms, &mut states, chains.len(), progress));
 
-        progress.add_work(states.len() as u64 * chains.len() as u64);
+        let chain_matrix_summary_work = if chain_matrix_reuse.is_some() {
+            states.len() as u64 * chain_pair_count(chains.len()) as u64 * 2
+        } else {
+            0
+        };
+        progress.add_work(states.len() as u64 * chains.len() as u64 + chain_matrix_summary_work);
         for state in &mut states {
             push_name_summary_rows(&mut rows, &atoms, &atoms_by_chain, chains, &totals, state);
             progress.inc(chains.len() as u64);
+            if chain_matrix_reuse.is_some() {
+                push_reused_chain_matrix_rows(&mut rows, &atoms, chains, &totals, state);
+                progress.inc(chain_pair_count(chains.len()) as u64 * 2);
+            }
         }
     }
-    if chains.len() > 1 {
+    if chains.len() > 1 && chain_matrix_reuse.is_none() {
         rows.extend(run_chain_matrix_analysis(
             &atoms,
             &atoms_by_chain,
@@ -1205,6 +1268,64 @@ fn sort_matrix_states_for_apply(states: &mut [MatrixUnionState]) {
     });
 }
 
+fn chain_matrix_reuse_plan(
+    atoms_by_chain: &[Vec<usize>],
+    analysis_work_budget: usize,
+    global_per_threshold_bytes: usize,
+) -> Option<ChainMatrixReusePlan> {
+    let pair_count = chain_pair_count(atoms_by_chain.len());
+    if pair_count == 0 {
+        return None;
+    }
+    let per_threshold_bytes = chain_matrix_reuse_state_bytes(atoms_by_chain);
+    if per_threshold_bytes == 0 {
+        return None;
+    }
+    let combined_threshold_bytes = global_per_threshold_bytes.saturating_add(per_threshold_bytes);
+    (combined_threshold_bytes <= analysis_work_budget).then_some(ChainMatrixReusePlan {
+        per_threshold_bytes,
+        pair_count,
+    })
+}
+
+fn chain_matrix_reuse_state_bytes(atoms_by_chain: &[Vec<usize>]) -> usize {
+    let mut bytes = 0usize;
+    for left in 0..atoms_by_chain.len() {
+        for right in left + 1..atoms_by_chain.len() {
+            bytes = bytes.saturating_add(sparse_union_find_bytes(
+                atoms_by_chain[left].len() + atoms_by_chain[right].len(),
+            ));
+        }
+    }
+    bytes
+}
+
+fn new_chain_matrix_reuse_states(pair_count: usize) -> Vec<SparseUnionFind> {
+    std::iter::repeat_with(SparseUnionFind::default)
+        .take(pair_count)
+        .collect()
+}
+
+fn chain_pair_count(chain_count: usize) -> usize {
+    chain_count.saturating_mul(chain_count.saturating_sub(1)) / 2
+}
+
+fn chain_pair_index(left: usize, right: usize, chain_count: usize) -> usize {
+    debug_assert!(left < right);
+    left * (2 * chain_count - left - 1) / 2 + (right - left - 1)
+}
+
+fn chain_pair_from_index(mut index: usize, chain_count: usize) -> (usize, usize) {
+    for left in 0..chain_count {
+        let row_width = chain_count - left - 1;
+        if index < row_width {
+            return (left, left + index + 1);
+        }
+        index -= row_width;
+    }
+    unreachable!("chain pair index out of range")
+}
+
 #[cfg(test)]
 fn threshold_batches(
     thresholds: &[f64],
@@ -1218,6 +1339,7 @@ fn threshold_batches(
     thresholds.chunks(batch_size).map(<[f64]>::to_vec).collect()
 }
 
+#[cfg(test)]
 fn threshold_batch_capacity(
     threshold_count: usize,
     atom_count: usize,
@@ -1242,10 +1364,7 @@ fn threshold_batch_capacity_for_state_bytes(
     state_bytes: usize,
     analysis_budget: usize,
 ) -> usize {
-    let state_budget = analysis_budget
-        .saturating_mul(ANALYSIS_STATE_MEMORY_PERCENT)
-        .saturating_div(100);
-    (state_budget / state_bytes)
+    (analysis_budget / state_bytes)
         .max(1)
         .min(threshold_count.max(1))
 }
@@ -1262,24 +1381,15 @@ fn adaptive_threshold_batch_size(
         return capacity;
     }
 
-    let high_water = percent_of(total_budget, MEMORY_PRESSURE_HIGH_PERCENT);
     let headroom_capacity = if per_threshold_bytes == 0 {
         capacity
     } else {
-        high_water
+        total_budget
             .saturating_sub(current_rss)
             .saturating_div(per_threshold_bytes)
             .max(1)
     };
-    let capacity = capacity.min(headroom_capacity);
-
-    if current_rss >= percent_of(total_budget, MEMORY_PRESSURE_HIGH_PERCENT) {
-        1
-    } else if current_rss >= percent_of(total_budget, MEMORY_PRESSURE_MEDIUM_PERCENT) {
-        capacity.div_ceil(2).max(1)
-    } else {
-        capacity
-    }
+    capacity.min(headroom_capacity)
 }
 
 fn full_name_chunk_count(atom_count: usize) -> u64 {
@@ -1312,26 +1422,19 @@ fn chain_pair_chunk_count(left_count: usize, right_count: usize) -> u64 {
 
 fn threshold_state_bytes(atom_count: usize, chain_count: usize) -> usize {
     let dense = dense_union_find_bytes(atom_count);
-    let bytes = if chain_count > 1 {
+    if chain_count > 1 {
         dense.saturating_add(sparse_union_find_bytes(atom_count))
     } else {
         dense
-    };
-    add_overhead(bytes, HASHMAP_OVERHEAD_PERCENT)
+    }
 }
 
 fn dense_union_find_bytes(atom_count: usize) -> usize {
-    add_overhead(
-        atom_count.saturating_mul(std::mem::size_of::<usize>() + std::mem::size_of::<u8>()),
-        RUST_ALLOCATOR_OVERHEAD_PERCENT,
-    )
+    atom_count.saturating_mul(std::mem::size_of::<usize>() + std::mem::size_of::<u8>())
 }
 
 fn sparse_union_find_bytes(atom_count: usize) -> usize {
-    add_overhead(
-        atom_count.saturating_mul(SPARSE_UNION_NODE_BYTES),
-        HASHMAP_OVERHEAD_PERCENT,
-    )
+    atom_count.saturating_mul(SPARSE_UNION_NODE_BYTES)
 }
 
 fn name_atoms_memory_bytes(atoms: &[NameAtom]) -> usize {
@@ -1340,14 +1443,7 @@ fn name_atoms_memory_bytes(atoms: &[NameAtom]) -> usize {
         .iter()
         .map(|atom| atom.name_norm.capacity().max(atom.name_norm.len()))
         .sum::<usize>();
-    add_overhead(
-        struct_bytes.saturating_add(string_bytes),
-        RUST_ALLOCATOR_OVERHEAD_PERCENT,
-    )
-}
-
-fn add_overhead(bytes: usize, percent: usize) -> usize {
-    bytes.saturating_add(percent_of(bytes, percent))
+    struct_bytes.saturating_add(string_bytes)
 }
 
 fn initial_duckdb_memory_limit(memory_limit: &str) -> Result<String, AnalysisError> {
@@ -1357,16 +1453,13 @@ fn initial_duckdb_memory_limit(memory_limit: &str) -> Result<String, AnalysisErr
 }
 
 fn initial_duckdb_memory_bytes(total_budget: usize) -> usize {
-    let reserve = percent_of(total_budget, DEFAULT_SYSTEM_RESERVE_PERCENT);
-    let analysis_floor = percent_of(total_budget, MIN_ANALYSIS_MEMORY_PERCENT);
-    let min_duckdb = percent_of(total_budget, MIN_DUCKDB_MEMORY_PERCENT);
     total_budget
-        .saturating_sub(reserve)
-        .saturating_sub(analysis_floor)
-        .max(min_duckdb)
 }
 
 fn set_duckdb_memory_limit(conn: &Connection, bytes: usize) -> Result<(), AnalysisError> {
+    if bytes == 0 {
+        return Ok(());
+    }
     conn.execute(
         &format!(
             "PRAGMA memory_limit='{}'",
@@ -1421,21 +1514,18 @@ fn explicit_analysis_memory_plan(
     analysis_bytes: usize,
     resident_analysis_bytes: usize,
 ) -> Result<MemoryPlan, AnalysisError> {
-    let reserve = percent_of(total_budget, DEFAULT_SYSTEM_RESERVE_PERCENT);
-    let min_duckdb = percent_of(total_budget, MIN_DUCKDB_MEMORY_PERCENT);
-    let available = total_budget.saturating_sub(reserve);
-    let reserved_analysis = analysis_bytes.max(resident_analysis_bytes);
-    if reserved_analysis > available.saturating_sub(min_duckdb) {
+    let requested_analysis = analysis_bytes.max(resident_analysis_bytes);
+    if requested_analysis > total_budget {
         return Err(AnalysisError::InvalidData(format!(
-            "--analysis-memory-limit {} exceeds total --memory-limit {} after reserve and DuckDB minimum",
+            "--analysis-memory-limit {} exceeds total --memory-limit {}",
             format_byte_size(analysis_bytes),
             format_byte_size(total_budget)
         )));
     }
 
     Ok(MemoryPlan {
-        duckdb_bytes: available.saturating_sub(reserved_analysis).max(min_duckdb),
-        analysis_bytes: reserved_analysis,
+        duckdb_bytes: total_budget.saturating_sub(requested_analysis),
+        analysis_bytes: requested_analysis,
     })
 }
 
@@ -1446,12 +1536,7 @@ fn auto_balanced_memory_plan(
     chain_count: usize,
     resident_analysis_bytes: usize,
 ) -> Result<MemoryPlan, AnalysisError> {
-    let reserve = percent_of(total_budget, DEFAULT_SYSTEM_RESERVE_PERCENT);
-    let min_duckdb = percent_of(total_budget, MIN_DUCKDB_MEMORY_PERCENT);
-    let min_analysis = percent_of(total_budget, MIN_ANALYSIS_MEMORY_PERCENT);
-    let available = total_budget.saturating_sub(reserve);
-    let max_analysis = available.saturating_sub(min_duckdb).max(min_analysis);
-    if resident_analysis_bytes > max_analysis {
+    if resident_analysis_bytes > total_budget {
         return Err(AnalysisError::InvalidData(format!(
             "loaded name atoms need about {}, exceeding available Rust budget under --memory-limit {}",
             format_byte_size(resident_analysis_bytes),
@@ -1464,8 +1549,8 @@ fn auto_balanced_memory_plan(
         chain_count,
         resident_analysis_bytes,
     );
-    let analysis_bytes = desired_analysis.clamp(min_analysis, max_analysis);
-    let duckdb_bytes = available.saturating_sub(analysis_bytes).max(min_duckdb);
+    let analysis_bytes = desired_analysis.min(total_budget);
+    let duckdb_bytes = total_budget.saturating_sub(analysis_bytes);
 
     Ok(MemoryPlan {
         duckdb_bytes,
@@ -1480,16 +1565,8 @@ fn desired_analysis_budget(
     resident_analysis_bytes: usize,
 ) -> usize {
     let thresholds = threshold_count.max(1);
-    resident_analysis_bytes.saturating_add(
-        threshold_state_bytes(atom_count, chain_count)
-            .saturating_mul(thresholds)
-            .saturating_mul(100)
-            .saturating_div(ANALYSIS_STATE_MEMORY_PERCENT),
-    )
-}
-
-fn percent_of(value: usize, percent: usize) -> usize {
-    value.saturating_mul(percent).saturating_div(100)
+    resident_analysis_bytes
+        .saturating_add(threshold_state_bytes(atom_count, chain_count).saturating_mul(thresholds))
 }
 
 fn total_memory_budget_bytes(value: &str) -> Result<usize, AnalysisError> {
@@ -1504,17 +1581,16 @@ fn total_memory_budget_bytes(value: &str) -> Result<usize, AnalysisError> {
 fn auto_memory_budget_bytes() -> usize {
     let mut system = System::new();
     system.refresh_memory();
-    let available = system.available_memory() as usize;
-    let mib = 1024usize * 1024;
-    available
-        .saturating_mul(80)
-        .saturating_div(100)
-        .max(512 * mib)
+    system.available_memory() as usize
 }
 
 fn format_byte_size(bytes: usize) -> String {
     let mib = 1024usize * 1024;
-    format!("{}MB", (bytes / mib).max(1))
+    if bytes >= mib {
+        format!("{}MB", bytes / mib)
+    } else {
+        format!("{bytes}B")
+    }
 }
 
 fn parse_byte_size(value: &str) -> Result<usize, AnalysisError> {
@@ -1550,6 +1626,7 @@ fn parse_byte_size(value: &str) -> Result<usize, AnalysisError> {
 fn union_full_name_pairs(
     atoms: &[NameAtom],
     states: &mut [ThresholdUnionState],
+    chain_count: usize,
     progress: &ProgressTracker,
 ) {
     if atoms.len() < 2 || states.is_empty() {
@@ -1566,7 +1643,7 @@ fn union_full_name_pairs(
             let chunk_end = (chunk_start + RIGHT_SCORE_CHUNK_SIZE).min(atoms.len());
             let matching_rights =
                 score_name_pairs_for_left_chunk(atoms, left, chunk_start, chunk_end, min_threshold);
-            apply_matching_name_pairs(atoms, states, left, &matching_rights);
+            apply_matching_name_pairs(atoms, states, left, &matching_rights, chain_count);
             pending_progress += 1;
             flush_chunk_progress(progress, &mut pending_progress);
         }
@@ -1605,6 +1682,7 @@ fn apply_matching_name_pairs(
     states: &mut [ThresholdUnionState],
     left: usize,
     matching_rights: &[ScoredRight],
+    chain_count: usize,
 ) {
     let left_chain = atoms[left].chain_index;
     for hit in matching_rights {
@@ -1615,8 +1693,19 @@ fn apply_matching_name_pairs(
             }
             if left_chain == right_chain {
                 state.intra.union(left, hit.right);
-            } else if let Some(cross) = &mut state.cross {
-                cross.union(left, hit.right);
+            } else {
+                if let Some(cross) = &mut state.cross {
+                    cross.union(left, hit.right);
+                }
+                if let Some(matrix) = &mut state.chain_matrix {
+                    let (primary_chain, secondary_chain) = if left_chain < right_chain {
+                        (left_chain, right_chain)
+                    } else {
+                        (right_chain, left_chain)
+                    };
+                    let pair_index = chain_pair_index(primary_chain, secondary_chain, chain_count);
+                    matrix[pair_index].union(left, hit.right);
+                }
             }
         }
     }
@@ -1767,6 +1856,33 @@ fn flush_remaining_progress(progress: &ProgressTracker, pending: &mut u64) {
     if *pending > 0 {
         progress.inc(*pending);
         *pending = 0;
+    }
+}
+
+fn push_reused_chain_matrix_rows(
+    rows: &mut Vec<SummaryRow>,
+    atoms: &[NameAtom],
+    chains: &[String],
+    totals: &HashMap<String, NameTotals>,
+    state: &mut ThresholdUnionState,
+) {
+    let Some(matrix) = &mut state.chain_matrix else {
+        return;
+    };
+    for (pair_index, union_find) in matrix.iter_mut().enumerate() {
+        let (primary_index, secondary_index) = chain_pair_from_index(pair_index, chains.len());
+        push_chain_matrix_rows(
+            rows,
+            atoms,
+            ChainMatrixRowSpec {
+                chains,
+                totals,
+                primary_index,
+                secondary_index,
+                threshold: state.threshold,
+            },
+            union_find,
+        );
     }
 }
 
@@ -2120,6 +2236,29 @@ mod tests {
     }
 
     #[test]
+    fn threshold_batches_use_available_analysis_budget_aggressively() {
+        let state_bytes = threshold_state_bytes(10_000, 2);
+        let analysis_budget = state_bytes.saturating_mul(3);
+
+        let batches = threshold_batches(&[90.0, 95.0, 98.0], 10_000, 2, analysis_budget);
+
+        assert_eq!(batches, vec![vec![98.0, 95.0, 90.0]]);
+    }
+
+    #[test]
+    fn auto_memory_plan_prefers_name_analysis_when_many_thresholds_can_fit() {
+        let state_bytes = threshold_state_bytes(50_000, 2);
+        let total_budget = state_bytes.saturating_mul(6);
+        let memory_limit = format_byte_size(total_budget);
+
+        let plan =
+            name_analysis_memory_plan(&[90.0, 95.0, 98.0], 50_000, 2, &memory_limit, None, 0)
+                .unwrap();
+
+        assert!(plan.analysis_bytes >= state_bytes.saturating_mul(3));
+    }
+
+    #[test]
     fn default_memory_budget_is_auto_balanced_between_duckdb_and_rust() {
         let small =
             name_analysis_memory_plan(&[90.0, 95.0, 98.0], 1_000, 1, "10GB", None, 0).unwrap();
@@ -2144,7 +2283,7 @@ mod tests {
     #[test]
     fn explicit_analysis_memory_limit_rejects_over_budget_value() {
         let error =
-            name_analysis_memory_plan(&[90.0], 1_000, 2, "1GB", Some("900MB"), 0).unwrap_err();
+            name_analysis_memory_plan(&[90.0], 1_000, 2, "1GB", Some("2GB"), 0).unwrap_err();
 
         assert!(error.to_string().contains("exceeds total --memory-limit"));
     }
@@ -2179,16 +2318,13 @@ mod tests {
     fn adaptive_threshold_batch_size_uses_remaining_headroom() {
         let batch_size = adaptive_threshold_batch_size(5, 5, 2_000, 10_000, 6_000);
 
-        assert_eq!(batch_size, 1);
+        assert_eq!(batch_size, 2);
     }
 
     #[test]
     fn chain_matrix_capacity_uses_sparse_state_estimate() {
         let atom_count = 1_000;
-        let budget = sparse_union_find_bytes(atom_count)
-            .saturating_mul(3)
-            .saturating_mul(100)
-            .saturating_div(ANALYSIS_STATE_MEMORY_PERCENT);
+        let budget = sparse_union_find_bytes(atom_count).saturating_mul(3);
 
         let global_capacity = threshold_batch_capacity(5, atom_count, 2, budget);
         let matrix_capacity = matrix_threshold_batch_capacity(5, atom_count, budget);
@@ -2197,9 +2333,60 @@ mod tests {
     }
 
     #[test]
+    fn chain_pair_indexes_round_trip() {
+        let chain_count = 5;
+        let mut seen = Vec::new();
+
+        for left in 0..chain_count {
+            for right in left + 1..chain_count {
+                let index = chain_pair_index(left, right, chain_count);
+                seen.push(index);
+                assert_eq!(chain_pair_from_index(index, chain_count), (left, right));
+            }
+        }
+
+        seen.sort_unstable();
+        assert_eq!(seen, (0..chain_pair_count(chain_count)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn chain_matrix_reuse_plan_requires_combined_state_budget() {
+        let atoms_by_chain = vec![vec![0; 10], vec![0; 20], vec![0; 30]];
+        let matrix_bytes = chain_matrix_reuse_state_bytes(&atoms_by_chain);
+        let global_bytes = threshold_state_bytes(60, 3);
+
+        assert!(chain_matrix_reuse_plan(
+            &atoms_by_chain,
+            global_bytes + matrix_bytes - 1,
+            global_bytes,
+        )
+        .is_none());
+        assert!(chain_matrix_reuse_plan(
+            &atoms_by_chain,
+            global_bytes + matrix_bytes,
+            global_bytes,
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn disabled_progress_tracker_is_noop() {
+        let progress = ProgressTracker::new(1, false);
+
+        progress.start_phase("phase", 1);
+        progress.add_work(1);
+        progress.step("step");
+        progress.inc(1);
+        progress.set_message("message");
+        progress.finish_phase("done");
+        progress.finish();
+    }
+
+    #[test]
     fn auto_memory_plan_rejects_resident_atoms_over_budget() {
-        let error = name_analysis_memory_plan(&[90.0], 1_000, 2, "1GB", None, 900 * 1024 * 1024)
-            .unwrap_err();
+        let error =
+            name_analysis_memory_plan(&[90.0], 1_000, 2, "1GB", None, 2 * 1024 * 1024 * 1024)
+                .unwrap_err();
 
         assert!(error.to_string().contains("loaded name atoms need"));
     }

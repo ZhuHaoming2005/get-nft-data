@@ -58,6 +58,7 @@ fn analyzes_uri_and_name_without_symbol_rows() {
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
         temp_directory: None,
+        progress: false,
     })
     .unwrap();
 
@@ -116,6 +117,7 @@ fn analyzes_uri_rows_when_only_one_uri_field_is_present() {
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
         temp_directory: None,
+        progress: false,
     })
     .unwrap();
 
@@ -162,6 +164,7 @@ fn uri_any_and_cross_contract_counts_stay_distinct() {
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
         temp_directory: None,
+        progress: false,
     })
     .unwrap();
 
@@ -208,6 +211,7 @@ fn cross_chain_uri_counts_use_selected_chain_key_coverage() {
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
         temp_directory: None,
+        progress: false,
     })
     .unwrap();
 
@@ -253,6 +257,7 @@ fn compares_names_across_former_block_boundaries() {
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
         temp_directory: None,
+        progress: false,
     })
     .unwrap();
 
@@ -287,6 +292,7 @@ fn only_parquet_chains_are_analyzed_and_single_chain_skips_cross_chain() {
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
         temp_directory: None,
+        progress: false,
     })
     .unwrap();
 
@@ -323,6 +329,7 @@ fn chain_matrix_is_computed_per_chain_pair_without_third_chain_contamination() {
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
         temp_directory: None,
+        progress: false,
     })
     .unwrap();
 
@@ -373,6 +380,7 @@ fn batched_thresholds_match_single_threshold_results() {
         memory_limit: "512MB".into(),
         analysis_memory_limit: Some("128MB".into()),
         temp_directory: None,
+        progress: false,
     })
     .unwrap();
 
@@ -385,6 +393,7 @@ fn batched_thresholds_match_single_threshold_results() {
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("1KB".into()),
         temp_directory: None,
+        progress: false,
     })
     .unwrap();
 
