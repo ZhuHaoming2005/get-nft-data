@@ -278,8 +278,8 @@ fn batched_thresholds_match_single_threshold_results() {
         output_dir: temp.path().join("batched_out"),
         thresholds: vec![90.0, 95.0, 98.0],
         threads: 2,
-        memory_limit: "256MB".into(),
-        analysis_memory_limit: Some("256MB".into()),
+        memory_limit: "512MB".into(),
+        analysis_memory_limit: Some("128MB".into()),
         temp_directory: None,
     })
     .unwrap();

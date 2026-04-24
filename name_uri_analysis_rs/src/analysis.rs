@@ -8,7 +8,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use serde::Serialize;
 use strsim::jaro_winkler;
-use sysinfo::System;
+use sysinfo::{get_current_pid, Pid, ProcessesToUpdate, System};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -78,6 +78,10 @@ const DEFAULT_SYSTEM_RESERVE_PERCENT: usize = 10;
 const MIN_DUCKDB_MEMORY_PERCENT: usize = 20;
 const MIN_ANALYSIS_MEMORY_PERCENT: usize = 10;
 const SPARSE_UNION_NODE_BYTES: usize = 96;
+const HASHMAP_OVERHEAD_PERCENT: usize = 50;
+const RUST_ALLOCATOR_OVERHEAD_PERCENT: usize = 25;
+const MEMORY_PRESSURE_HIGH_PERCENT: usize = 90;
+const MEMORY_PRESSURE_MEDIUM_PERCENT: usize = 80;
 
 #[derive(Clone, Copy)]
 struct ScoredRight {
@@ -132,14 +136,63 @@ struct ChainMatrixRowSpec<'a> {
     threshold: f64,
 }
 
+struct ChainMatrixAnalysisSpec<'a> {
+    thresholds: &'a [f64],
+    analysis_budget: usize,
+    total_memory_budget: usize,
+    totals: &'a HashMap<String, NameTotals>,
+}
+
 struct MatrixUnionState {
     threshold: f64,
     union_find: SparseUnionFind,
 }
 
+#[derive(Debug)]
 struct MemoryPlan {
     duckdb_bytes: usize,
     analysis_bytes: usize,
+}
+
+struct MemoryGuard {
+    total_budget: usize,
+    pid: Option<Pid>,
+    system: System,
+}
+
+impl MemoryGuard {
+    fn new(total_budget: usize) -> Self {
+        Self {
+            total_budget,
+            pid: get_current_pid().ok(),
+            system: System::new(),
+        }
+    }
+
+    fn current_rss_bytes(&mut self) -> Option<usize> {
+        let pid = self.pid?;
+        self.system
+            .refresh_processes(ProcessesToUpdate::Some(&[pid]), false);
+        self.system
+            .process(pid)
+            .map(|process| process.memory() as usize)
+    }
+
+    fn next_threshold_batch_size(
+        &mut self,
+        remaining_thresholds: usize,
+        budget_capacity: usize,
+        per_threshold_bytes: usize,
+    ) -> usize {
+        let current_rss = self.current_rss_bytes().unwrap_or(0);
+        adaptive_threshold_batch_size(
+            remaining_thresholds,
+            budget_capacity,
+            per_threshold_bytes,
+            self.total_budget,
+            current_rss,
+        )
+    }
 }
 
 struct ProgressTracker {
@@ -803,12 +856,15 @@ fn run_name_analysis(
         .map_err(|err| AnalysisError::InvalidData(err.to_string()))?;
 
     let mut rows = Vec::new();
+    let atom_bytes = name_atoms_memory_bytes(&atoms);
+    let total_memory_budget = total_memory_budget_bytes(memory_limit)?;
     let memory_plan = name_analysis_memory_plan(
         thresholds,
         atoms.len(),
         chains.len(),
         memory_limit,
         analysis_memory_limit,
+        atom_bytes,
     )?;
     set_duckdb_memory_limit(conn, memory_plan.duckdb_bytes)?;
     progress.step(format!(
@@ -816,13 +872,33 @@ fn run_name_analysis(
         format_byte_size(memory_plan.duckdb_bytes),
         format_byte_size(memory_plan.analysis_bytes)
     ));
-    let threshold_batches = threshold_batches(
-        thresholds,
+    let thresholds = unique_thresholds(thresholds);
+    let analysis_work_budget = memory_plan.analysis_bytes.saturating_sub(atom_bytes);
+    let threshold_budget_capacity = threshold_batch_capacity(
+        thresholds.len(),
         atoms.len(),
         chains.len(),
-        memory_plan.analysis_bytes,
+        analysis_work_budget,
     );
-    for threshold_batch in &threshold_batches {
+    let per_threshold_bytes = threshold_state_bytes(atoms.len(), chains.len());
+    let mut memory_guard = MemoryGuard::new(total_memory_budget);
+    let mut threshold_start = 0;
+    while threshold_start < thresholds.len() {
+        let batch_size = memory_guard.next_threshold_batch_size(
+            thresholds.len() - threshold_start,
+            threshold_budget_capacity,
+            per_threshold_bytes,
+        );
+        let threshold_batch = thresholds[threshold_start..threshold_start + batch_size].to_vec();
+        threshold_start += batch_size;
+        progress.set_message(format!(
+            "name threshold batch {} threshold(s), RSS {}",
+            threshold_batch.len(),
+            memory_guard
+                .current_rss_bytes()
+                .map(format_byte_size)
+                .unwrap_or_else(|| "unknown".to_string())
+        ));
         progress.add_work(full_name_chunk_count(atoms.len()));
         let mut states = threshold_batch
             .iter()
@@ -845,11 +921,15 @@ fn run_name_analysis(
         rows.extend(run_chain_matrix_analysis(
             &atoms,
             chains,
-            &threshold_batches,
-            &totals,
+            ChainMatrixAnalysisSpec {
+                thresholds: &thresholds,
+                analysis_budget: analysis_work_budget,
+                total_memory_budget,
+                totals: &totals,
+            },
             &pool,
             progress,
-        ));
+        )?);
     }
     progress.finish_phase("name analysis complete");
     Ok(rows)
@@ -973,6 +1053,7 @@ fn unique_thresholds(thresholds: &[f64]) -> Vec<f64> {
     unique
 }
 
+#[cfg(test)]
 fn threshold_batches(
     thresholds: &[f64],
     atom_count: usize,
@@ -980,14 +1061,73 @@ fn threshold_batches(
     analysis_budget: usize,
 ) -> Vec<Vec<f64>> {
     let thresholds = unique_thresholds(thresholds);
+    let batch_size =
+        threshold_batch_capacity(thresholds.len(), atom_count, chain_count, analysis_budget);
+    thresholds.chunks(batch_size).map(<[f64]>::to_vec).collect()
+}
+
+fn threshold_batch_capacity(
+    threshold_count: usize,
+    atom_count: usize,
+    chain_count: usize,
+    analysis_budget: usize,
+) -> usize {
     let state_bytes = threshold_state_bytes(atom_count, chain_count).max(1);
+    threshold_batch_capacity_for_state_bytes(threshold_count, state_bytes, analysis_budget)
+}
+
+fn matrix_threshold_batch_capacity(
+    threshold_count: usize,
+    atom_count: usize,
+    analysis_budget: usize,
+) -> usize {
+    let state_bytes = sparse_union_find_bytes(atom_count).max(1);
+    threshold_batch_capacity_for_state_bytes(threshold_count, state_bytes, analysis_budget)
+}
+
+fn threshold_batch_capacity_for_state_bytes(
+    threshold_count: usize,
+    state_bytes: usize,
+    analysis_budget: usize,
+) -> usize {
     let state_budget = analysis_budget
         .saturating_mul(ANALYSIS_STATE_MEMORY_PERCENT)
         .saturating_div(100);
-    let batch_size = (state_budget / state_bytes)
+    (state_budget / state_bytes)
         .max(1)
-        .min(thresholds.len().max(1));
-    thresholds.chunks(batch_size).map(<[f64]>::to_vec).collect()
+        .min(threshold_count.max(1))
+}
+
+fn adaptive_threshold_batch_size(
+    remaining_thresholds: usize,
+    budget_capacity: usize,
+    per_threshold_bytes: usize,
+    total_budget: usize,
+    current_rss: usize,
+) -> usize {
+    let capacity = remaining_thresholds.max(1).min(budget_capacity.max(1));
+    if current_rss == 0 || total_budget == 0 {
+        return capacity;
+    }
+
+    let high_water = percent_of(total_budget, MEMORY_PRESSURE_HIGH_PERCENT);
+    let headroom_capacity = if per_threshold_bytes == 0 {
+        capacity
+    } else {
+        high_water
+            .saturating_sub(current_rss)
+            .saturating_div(per_threshold_bytes)
+            .max(1)
+    };
+    let capacity = capacity.min(headroom_capacity);
+
+    if current_rss >= percent_of(total_budget, MEMORY_PRESSURE_HIGH_PERCENT) {
+        1
+    } else if current_rss >= percent_of(total_budget, MEMORY_PRESSURE_MEDIUM_PERCENT) {
+        capacity.div_ceil(2).max(1)
+    } else {
+        capacity
+    }
 }
 
 fn full_name_chunk_count(atom_count: usize) -> u64 {
@@ -1020,23 +1160,58 @@ fn chain_pair_chunk_count(left_count: usize, right_count: usize) -> u64 {
 
 fn threshold_state_bytes(atom_count: usize, chain_count: usize) -> usize {
     let dense = dense_union_find_bytes(atom_count);
-    if chain_count > 1 {
+    let bytes = if chain_count > 1 {
         dense.saturating_add(sparse_union_find_bytes(atom_count))
     } else {
         dense
-    }
+    };
+    add_overhead(bytes, HASHMAP_OVERHEAD_PERCENT)
 }
 
 fn dense_union_find_bytes(atom_count: usize) -> usize {
-    atom_count.saturating_mul(std::mem::size_of::<usize>() + std::mem::size_of::<u8>())
+    add_overhead(
+        atom_count.saturating_mul(std::mem::size_of::<usize>() + std::mem::size_of::<u8>()),
+        RUST_ALLOCATOR_OVERHEAD_PERCENT,
+    )
 }
 
 fn sparse_union_find_bytes(atom_count: usize) -> usize {
-    atom_count.saturating_mul(SPARSE_UNION_NODE_BYTES)
+    add_overhead(
+        atom_count.saturating_mul(SPARSE_UNION_NODE_BYTES),
+        HASHMAP_OVERHEAD_PERCENT,
+    )
+}
+
+fn name_atoms_memory_bytes(atoms: &[NameAtom]) -> usize {
+    let struct_bytes = atoms.len().saturating_mul(std::mem::size_of::<NameAtom>());
+    let string_bytes = atoms
+        .iter()
+        .map(|atom| atom.name_norm.capacity().max(atom.name_norm.len()))
+        .sum::<usize>();
+    add_overhead(
+        struct_bytes.saturating_add(string_bytes),
+        RUST_ALLOCATOR_OVERHEAD_PERCENT,
+    )
+}
+
+fn add_overhead(bytes: usize, percent: usize) -> usize {
+    bytes.saturating_add(percent_of(bytes, percent))
 }
 
 fn initial_duckdb_memory_limit(memory_limit: &str) -> Result<String, AnalysisError> {
-    Ok(format_byte_size(total_memory_budget_bytes(memory_limit)?))
+    Ok(format_byte_size(initial_duckdb_memory_bytes(
+        total_memory_budget_bytes(memory_limit)?,
+    )))
+}
+
+fn initial_duckdb_memory_bytes(total_budget: usize) -> usize {
+    let reserve = percent_of(total_budget, DEFAULT_SYSTEM_RESERVE_PERCENT);
+    let analysis_floor = percent_of(total_budget, MIN_ANALYSIS_MEMORY_PERCENT);
+    let min_duckdb = percent_of(total_budget, MIN_DUCKDB_MEMORY_PERCENT);
+    total_budget
+        .saturating_sub(reserve)
+        .saturating_sub(analysis_floor)
+        .max(min_duckdb)
 }
 
 fn set_duckdb_memory_limit(conn: &Connection, bytes: usize) -> Result<(), AnalysisError> {
@@ -1056,29 +1231,60 @@ fn name_analysis_memory_plan(
     chain_count: usize,
     memory_limit: &str,
     analysis_memory_limit: Option<&str>,
+    resident_analysis_bytes: usize,
 ) -> Result<MemoryPlan, AnalysisError> {
     let total_budget = total_memory_budget_bytes(memory_limit)?;
     if let Some(value) = analysis_memory_limit
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        let analysis_bytes = if value.eq_ignore_ascii_case("auto") {
-            Ok(auto_analysis_memory_budget_bytes())
-        } else {
-            parse_byte_size(value)
-        }?;
-        return Ok(MemoryPlan {
-            duckdb_bytes: total_budget,
+        if value.eq_ignore_ascii_case("auto") {
+            return auto_balanced_memory_plan(
+                total_budget,
+                thresholds.len(),
+                atom_count,
+                chain_count,
+                resident_analysis_bytes,
+            );
+        }
+        let analysis_bytes = parse_byte_size(value)?;
+        return explicit_analysis_memory_plan(
+            total_budget,
             analysis_bytes,
-        });
+            resident_analysis_bytes,
+        );
     }
 
-    Ok(auto_balanced_memory_plan(
+    auto_balanced_memory_plan(
         total_budget,
         thresholds.len(),
         atom_count,
         chain_count,
-    ))
+        resident_analysis_bytes,
+    )
+}
+
+fn explicit_analysis_memory_plan(
+    total_budget: usize,
+    analysis_bytes: usize,
+    resident_analysis_bytes: usize,
+) -> Result<MemoryPlan, AnalysisError> {
+    let reserve = percent_of(total_budget, DEFAULT_SYSTEM_RESERVE_PERCENT);
+    let min_duckdb = percent_of(total_budget, MIN_DUCKDB_MEMORY_PERCENT);
+    let available = total_budget.saturating_sub(reserve);
+    let reserved_analysis = analysis_bytes.max(resident_analysis_bytes);
+    if reserved_analysis > available.saturating_sub(min_duckdb) {
+        return Err(AnalysisError::InvalidData(format!(
+            "--analysis-memory-limit {} exceeds total --memory-limit {} after reserve and DuckDB minimum",
+            format_byte_size(analysis_bytes),
+            format_byte_size(total_budget)
+        )));
+    }
+
+    Ok(MemoryPlan {
+        duckdb_bytes: available.saturating_sub(reserved_analysis).max(min_duckdb),
+        analysis_bytes: reserved_analysis,
+    })
 }
 
 fn auto_balanced_memory_plan(
@@ -1086,28 +1292,48 @@ fn auto_balanced_memory_plan(
     threshold_count: usize,
     atom_count: usize,
     chain_count: usize,
-) -> MemoryPlan {
+    resident_analysis_bytes: usize,
+) -> Result<MemoryPlan, AnalysisError> {
     let reserve = percent_of(total_budget, DEFAULT_SYSTEM_RESERVE_PERCENT);
     let min_duckdb = percent_of(total_budget, MIN_DUCKDB_MEMORY_PERCENT);
     let min_analysis = percent_of(total_budget, MIN_ANALYSIS_MEMORY_PERCENT);
     let available = total_budget.saturating_sub(reserve);
     let max_analysis = available.saturating_sub(min_duckdb).max(min_analysis);
-    let desired_analysis = desired_analysis_budget(threshold_count, atom_count, chain_count);
+    if resident_analysis_bytes > max_analysis {
+        return Err(AnalysisError::InvalidData(format!(
+            "loaded name atoms need about {}, exceeding available Rust budget under --memory-limit {}",
+            format_byte_size(resident_analysis_bytes),
+            format_byte_size(total_budget)
+        )));
+    }
+    let desired_analysis = desired_analysis_budget(
+        threshold_count,
+        atom_count,
+        chain_count,
+        resident_analysis_bytes,
+    );
     let analysis_bytes = desired_analysis.clamp(min_analysis, max_analysis);
     let duckdb_bytes = available.saturating_sub(analysis_bytes).max(min_duckdb);
 
-    MemoryPlan {
+    Ok(MemoryPlan {
         duckdb_bytes,
         analysis_bytes,
-    }
+    })
 }
 
-fn desired_analysis_budget(threshold_count: usize, atom_count: usize, chain_count: usize) -> usize {
+fn desired_analysis_budget(
+    threshold_count: usize,
+    atom_count: usize,
+    chain_count: usize,
+    resident_analysis_bytes: usize,
+) -> usize {
     let thresholds = threshold_count.max(1);
-    threshold_state_bytes(atom_count, chain_count)
-        .saturating_mul(thresholds)
-        .saturating_mul(100)
-        .saturating_div(ANALYSIS_STATE_MEMORY_PERCENT)
+    resident_analysis_bytes.saturating_add(
+        threshold_state_bytes(atom_count, chain_count)
+            .saturating_mul(thresholds)
+            .saturating_mul(100)
+            .saturating_div(ANALYSIS_STATE_MEMORY_PERCENT),
+    )
 }
 
 fn percent_of(value: usize, percent: usize) -> usize {
@@ -1121,10 +1347,6 @@ fn total_memory_budget_bytes(value: &str) -> Result<usize, AnalysisError> {
     } else {
         parse_byte_size(value)
     }
-}
-
-fn auto_analysis_memory_budget_bytes() -> usize {
-    percent_of(auto_memory_budget_bytes(), MIN_ANALYSIS_MEMORY_PERCENT)
 }
 
 fn auto_memory_budget_bytes() -> usize {
@@ -1248,17 +1470,44 @@ fn apply_matching_name_pairs(
 fn run_chain_matrix_analysis(
     atoms: &[NameAtom],
     chains: &[String],
-    threshold_batches: &[Vec<f64>],
-    totals: &HashMap<String, NameTotals>,
+    spec: ChainMatrixAnalysisSpec<'_>,
     pool: &rayon::ThreadPool,
     progress: &ProgressTracker,
-) -> Vec<SummaryRow> {
+) -> Result<Vec<SummaryRow>, AnalysisError> {
     let atoms_by_chain = atoms_by_chain(atoms, chains.len());
+    let mut memory_guard = MemoryGuard::new(spec.total_memory_budget);
     let mut rows = Vec::new();
 
     for left_chain in 0..chains.len() {
         for right_chain in left_chain + 1..chains.len() {
-            for threshold_batch in threshold_batches {
+            let pair_atom_count =
+                atoms_by_chain[left_chain].len() + atoms_by_chain[right_chain].len();
+            let per_threshold_bytes = sparse_union_find_bytes(pair_atom_count);
+            let pair_capacity = matrix_threshold_batch_capacity(
+                spec.thresholds.len(),
+                pair_atom_count,
+                spec.analysis_budget,
+            );
+            let mut threshold_start = 0;
+            while threshold_start < spec.thresholds.len() {
+                let batch_size = memory_guard.next_threshold_batch_size(
+                    spec.thresholds.len() - threshold_start,
+                    pair_capacity,
+                    per_threshold_bytes,
+                );
+                let threshold_batch =
+                    spec.thresholds[threshold_start..threshold_start + batch_size].to_vec();
+                threshold_start += batch_size;
+                progress.set_message(format!(
+                    "chain matrix {}-{} batch {} threshold(s), RSS {}",
+                    chains[left_chain],
+                    chains[right_chain],
+                    threshold_batch.len(),
+                    memory_guard
+                        .current_rss_bytes()
+                        .map(format_byte_size)
+                        .unwrap_or_else(|| "unknown".to_string())
+                ));
                 progress.add_work(chain_pair_chunk_count(
                     atoms_by_chain[left_chain].len(),
                     atoms_by_chain[right_chain].len(),
@@ -1287,7 +1536,7 @@ fn run_chain_matrix_analysis(
                         atoms,
                         ChainMatrixRowSpec {
                             chains,
-                            totals,
+                            totals: spec.totals,
                             primary_index: left_chain,
                             secondary_index: right_chain,
                             threshold: state.threshold,
@@ -1300,7 +1549,7 @@ fn run_chain_matrix_analysis(
                         atoms,
                         ChainMatrixRowSpec {
                             chains,
-                            totals,
+                            totals: spec.totals,
                             primary_index: right_chain,
                             secondary_index: left_chain,
                             threshold: state.threshold,
@@ -1313,7 +1562,7 @@ fn run_chain_matrix_analysis(
         }
     }
 
-    rows
+    Ok(rows)
 }
 
 fn atoms_by_chain(atoms: &[NameAtom], chain_count: usize) -> Vec<Vec<usize>> {
@@ -1503,7 +1752,8 @@ fn summary_row(spec: SummarySpec<'_>, groups: GroupSummary) -> SummaryRow {
 
 fn write_outputs(report: &AnalysisReport, output_dir: &Path) -> Result<(), AnalysisError> {
     let json_path = output_dir.join("summary.json");
-    fs::write(&json_path, serde_json::to_string_pretty(report)?)?;
+    let json_file = fs::File::create(&json_path)?;
+    serde_json::to_writer_pretty(json_file, report)?;
 
     let csv_path = output_dir.join("summary.csv");
     let mut file = fs::File::create(csv_path)?;
@@ -1615,7 +1865,8 @@ mod tests {
 
     #[test]
     fn threshold_batches_reuse_memory_limit_by_default() {
-        let plan = name_analysis_memory_plan(&[90.0, 95.0, 98.0], 1_000, 1, "1MB", None).unwrap();
+        let plan =
+            name_analysis_memory_plan(&[90.0, 95.0, 98.0], 1_000, 1, "1MB", None, 0).unwrap();
         let batches = threshold_batches(&[90.0, 95.0, 98.0], 1_000, 1, plan.analysis_bytes);
 
         assert_eq!(batches, vec![vec![98.0, 95.0, 90.0]]);
@@ -1623,8 +1874,8 @@ mod tests {
 
     #[test]
     fn threshold_batches_honor_analysis_memory_override() {
-        let plan =
-            name_analysis_memory_plan(&[90.0, 95.0, 98.0], 1_000, 2, "1GB", Some("16KB")).unwrap();
+        let plan = name_analysis_memory_plan(&[90.0, 95.0, 98.0], 1_000, 2, "1GB", Some("16KB"), 0)
+            .unwrap();
         let batches = threshold_batches(&[90.0, 95.0, 98.0], 1_000, 2, plan.analysis_bytes);
 
         assert_eq!(batches, vec![vec![98.0], vec![95.0], vec![90.0]]);
@@ -1632,9 +1883,10 @@ mod tests {
 
     #[test]
     fn default_memory_budget_is_auto_balanced_between_duckdb_and_rust() {
-        let small = name_analysis_memory_plan(&[90.0, 95.0, 98.0], 1_000, 1, "10GB", None).unwrap();
+        let small =
+            name_analysis_memory_plan(&[90.0, 95.0, 98.0], 1_000, 1, "10GB", None, 0).unwrap();
         let large =
-            name_analysis_memory_plan(&[90.0, 95.0, 98.0], 20_000_000, 2, "10GB", None).unwrap();
+            name_analysis_memory_plan(&[90.0, 95.0, 98.0], 20_000_000, 2, "10GB", None, 0).unwrap();
 
         assert!(small.duckdb_bytes > small.analysis_bytes);
         assert!(large.analysis_bytes > small.analysis_bytes);
@@ -1642,12 +1894,76 @@ mod tests {
     }
 
     #[test]
-    fn explicit_analysis_memory_limit_disables_auto_split() {
+    fn explicit_analysis_memory_limit_stays_inside_total_budget() {
         let plan =
-            name_analysis_memory_plan(&[90.0, 95.0, 98.0], 1_000, 2, "10GB", Some("16KB")).unwrap();
+            name_analysis_memory_plan(&[90.0, 95.0, 98.0], 1_000, 2, "10GB", Some("16KB"), 0)
+                .unwrap();
 
-        assert_eq!(plan.duckdb_bytes, 10 * 1024 * 1024 * 1024);
+        assert!(plan.duckdb_bytes < 10 * 1024 * 1024 * 1024);
         assert_eq!(plan.analysis_bytes, 16 * 1024);
+    }
+
+    #[test]
+    fn explicit_analysis_memory_limit_rejects_over_budget_value() {
+        let error =
+            name_analysis_memory_plan(&[90.0], 1_000, 2, "1GB", Some("900MB"), 0).unwrap_err();
+
+        assert!(error.to_string().contains("exceeds total --memory-limit"));
+    }
+
+    #[test]
+    fn analysis_memory_auto_uses_total_budget_auto_balance() {
+        let default_plan =
+            name_analysis_memory_plan(&[90.0, 95.0, 98.0], 10_000, 2, "4GB", None, 0).unwrap();
+        let auto_plan =
+            name_analysis_memory_plan(&[90.0, 95.0, 98.0], 10_000, 2, "4GB", Some("auto"), 0)
+                .unwrap();
+
+        assert_eq!(auto_plan.duckdb_bytes, default_plan.duckdb_bytes);
+        assert_eq!(auto_plan.analysis_bytes, default_plan.analysis_bytes);
+    }
+
+    #[test]
+    fn adaptive_threshold_batch_size_shrinks_when_rss_is_high() {
+        let batch_size = adaptive_threshold_batch_size(3, 3, 1_000, 10_000, 9_200);
+
+        assert_eq!(batch_size, 1);
+    }
+
+    #[test]
+    fn adaptive_threshold_batch_size_keeps_capacity_when_rss_is_low() {
+        let batch_size = adaptive_threshold_batch_size(3, 3, 1_000, 10_000, 4_000);
+
+        assert_eq!(batch_size, 3);
+    }
+
+    #[test]
+    fn adaptive_threshold_batch_size_uses_remaining_headroom() {
+        let batch_size = adaptive_threshold_batch_size(5, 5, 2_000, 10_000, 6_000);
+
+        assert_eq!(batch_size, 1);
+    }
+
+    #[test]
+    fn chain_matrix_capacity_uses_sparse_state_estimate() {
+        let atom_count = 1_000;
+        let budget = sparse_union_find_bytes(atom_count)
+            .saturating_mul(3)
+            .saturating_mul(100)
+            .saturating_div(ANALYSIS_STATE_MEMORY_PERCENT);
+
+        let global_capacity = threshold_batch_capacity(5, atom_count, 2, budget);
+        let matrix_capacity = matrix_threshold_batch_capacity(5, atom_count, budget);
+
+        assert!(matrix_capacity > global_capacity);
+    }
+
+    #[test]
+    fn auto_memory_plan_rejects_resident_atoms_over_budget() {
+        let error = name_analysis_memory_plan(&[90.0], 1_000, 2, "1GB", None, 900 * 1024 * 1024)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("loaded name atoms need"));
     }
 
     #[test]

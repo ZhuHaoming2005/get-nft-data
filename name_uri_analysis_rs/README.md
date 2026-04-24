@@ -35,8 +35,8 @@ cargo run --release -- \
 
 - `--database` 放到空间充足的 SSD。
 - `--temp-directory` 指向空间充足的本地磁盘。
-- 默认把 `--memory-limit` 视为进程总预算，并按唯一 name 数、链数和阈值数自动平衡 DuckDB 与 Rust name 分析的预算；剩余部分留给字符串、结果、系统和文件缓存。
-- 如需单独控制 Rust name 分析内存，可传 `--analysis-memory-limit 16GB`；此时 `--memory-limit` 只作为 DuckDB 限额。传 `auto` 时按设备当前可用内存估算。
-- 程序会按内存预算自动把 name 阈值分批：内存足够时一次 Jaro-Winkler 打分服务多个阈值，提高速度；内存紧张时退回小批/单阈值，降低峰值。
+- `--memory-limit` 按总预算处理，DuckDB 和 Rust name 分析共享该预算；程序会预留系统/allocator/字符串/HashMap 开销，并在 DuckDB 建表阶段就避免使用完整预算。
+- 如需指定 Rust name 分析预算，可传 `--analysis-memory-limit 16GB`；该值会从 `--memory-limit` 总预算中扣除，不会额外叠加到 DuckDB 限额。传 `auto` 时按设备当前可用内存估算。
+- 程序会按内存预算和运行时 RSS 自动把 name 阈值分批：内存足够时一次 Jaro-Winkler 打分服务多个阈值，提高速度；接近预算高水位时根据剩余 headroom 自动退回小批/单阈值，降低峰值。
 - name 第一版不做 blocking，会对传入 Parquet 中的唯一规范名做全量两两 Jaro-Winkler；结果优先准确性，运行时间按唯一 name 数量平方增长。
 - `chain_matrix` 按链对逐个计算，并只为命中的 name pair 建稀疏 union-find；不会为所有链对常驻完整节点数组。

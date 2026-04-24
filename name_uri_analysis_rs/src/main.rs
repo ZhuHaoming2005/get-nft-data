@@ -24,13 +24,13 @@ struct Args {
     #[arg(
         long,
         default_value = "8GB",
-        help = "Default total memory budget; auto-balanced between DuckDB and Rust analysis unless --analysis-memory-limit is set"
+        help = "Total memory budget; DuckDB and Rust analysis share this budget"
     )]
     memory_limit: String,
 
     #[arg(
         long,
-        help = "Override Rust name-analysis memory budget; accepts sizes like 16GB or auto"
+        help = "Reserve part of --memory-limit for Rust name analysis; accepts sizes like 16GB or auto"
     )]
     analysis_memory_limit: Option<String>,
 
