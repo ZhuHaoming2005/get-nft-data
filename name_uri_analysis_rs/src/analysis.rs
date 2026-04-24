@@ -518,10 +518,11 @@ fn prepare_base_tables(
     progress: &ProgressTracker,
 ) -> Result<Vec<String>, AnalysisError> {
     let inputs = parquet_input_sql(&options.parquet_inputs);
-    progress.start_phase("preparing DuckDB tables", 12);
+    progress.start_phase("preparing DuckDB tables", 10);
     execute_progress_batch(
         conn,
         "
+        DROP TABLE IF EXISTS analysis_rows;
         DROP TABLE IF EXISTS selected_chains;
         DROP TABLE IF EXISTS uri_key_contracts;
         DROP TABLE IF EXISTS uri_key_stats;
@@ -537,8 +538,16 @@ fn prepare_base_tables(
         conn,
         &format!(
             "
-            CREATE TABLE selected_chains AS
-            SELECT DISTINCT lower(trim(CAST(chain AS VARCHAR))) AS chain
+            CREATE TEMP TABLE analysis_rows AS
+            SELECT lower(trim(CAST(chain AS VARCHAR))) AS chain,
+                   lower(trim(CAST(contract_address AS VARCHAR))) AS contract_address,
+                   coalesce(CAST(token_id AS VARCHAR), '') AS token_id,
+                   trim(coalesce(CAST(token_uri AS VARCHAR), '')) AS token_uri,
+                   trim(coalesce(CAST(image_uri AS VARCHAR), '')) AS image_uri,
+                   coalesce(CAST(token_uri_norm AS VARCHAR), '') AS token_uri_norm,
+                   coalesce(CAST(image_uri_norm AS VARCHAR), '') AS image_uri_norm,
+                   coalesce(CAST(name AS VARCHAR), '') AS name,
+                   trim(coalesce(CAST(name_norm AS VARCHAR), '')) AS name_norm
             FROM read_parquet({inputs})
             WHERE chain IS NOT NULL
               AND trim(CAST(chain AS VARCHAR)) <> '';
@@ -546,48 +555,53 @@ fn prepare_base_tables(
             inputs = inputs,
         ),
         progress,
-        "loaded selected chains",
+        "materialized DuckDB working projection",
     )?;
-    build_uri_key_stats(conn, &inputs, progress)?;
-    build_uri_contract_flags(conn, &inputs, progress)?;
     execute_progress_batch(
         conn,
-        &format!(
-            "
-            CREATE TABLE contract_names AS
+        "
+            CREATE TEMP TABLE selected_chains AS
+            SELECT DISTINCT lower(trim(CAST(chain AS VARCHAR))) AS chain
+            FROM analysis_rows
+            WHERE chain <> '';
+            ",
+        progress,
+        "loaded selected chains",
+    )?;
+    build_uri_key_stats(conn, progress)?;
+    build_uri_contract_flags(conn, progress)?;
+    execute_progress_batch(
+        conn,
+        "
+            CREATE TEMP TABLE contract_names AS
             WITH ranked AS (
-                SELECT lower(trim(CAST(chain AS VARCHAR))) AS chain,
-                       lower(trim(CAST(contract_address AS VARCHAR))) AS contract_address,
-                       coalesce(CAST(name AS VARCHAR), '') AS name,
-                       trim(coalesce(CAST(name_norm AS VARCHAR), '')) AS name_norm,
+                SELECT chain,
+                       contract_address,
+                       name,
+                       name_norm,
                        count(*) OVER (
-                           PARTITION BY lower(trim(CAST(chain AS VARCHAR))),
-                                        lower(trim(CAST(contract_address AS VARCHAR)))
+                           PARTITION BY chain, contract_address
                        )::BIGINT AS nft_count,
                        row_number() OVER (
-                           PARTITION BY lower(trim(CAST(chain AS VARCHAR))),
-                                        lower(trim(CAST(contract_address AS VARCHAR)))
-                           ORDER BY CASE WHEN trim(coalesce(CAST(name_norm AS VARCHAR), '')) <> '' THEN 0 ELSE 1 END,
-                                    coalesce(CAST(token_id AS VARCHAR), '') DESC
+                           PARTITION BY chain, contract_address
+                           ORDER BY CASE WHEN name_norm <> '' THEN 0 ELSE 1 END,
+                                    token_id DESC
                        ) AS rn
-                FROM read_parquet({inputs})
-                WHERE contract_address IS NOT NULL
-                  AND trim(CAST(contract_address AS VARCHAR)) <> ''
+                FROM analysis_rows
+                WHERE contract_address <> ''
             )
             SELECT chain, contract_address, nft_count, name, name_norm
             FROM ranked
             WHERE rn = 1
               AND name_norm <> '';
             ",
-            inputs = inputs,
-        ),
         progress,
         "materialized contract names",
     )?;
     execute_progress_batch(
         conn,
         "
-            CREATE TABLE name_atoms AS
+            CREATE TEMP TABLE name_atoms AS
             WITH atoms AS (
                 SELECT chain,
                        name_norm,
@@ -621,51 +635,36 @@ fn execute_progress_batch(
     Ok(())
 }
 
-fn build_uri_key_stats(
-    conn: &Connection,
-    inputs: &str,
-    progress: &ProgressTracker,
-) -> Result<(), AnalysisError> {
+fn build_uri_key_stats(conn: &Connection, progress: &ProgressTracker) -> Result<(), AnalysisError> {
     execute_progress_batch(
         conn,
         "
-            CREATE TABLE uri_key_contracts (
-                chain VARCHAR,
-                key_kind VARCHAR,
-                key_value VARCHAR,
-                contract_address VARCHAR,
-                nft_count BIGINT
-            );
+            CREATE TEMP TABLE uri_key_contracts AS
+            SELECT chain,
+                   key_kind,
+                   key_value,
+                   contract_address,
+                   count(*)::BIGINT AS nft_count
+            FROM analysis_rows
+            CROSS JOIN LATERAL (
+                VALUES
+                    ('strict_token', token_uri),
+                    ('strict_image', image_uri),
+                    ('norm_token', token_uri_norm),
+                    ('norm_image', image_uri_norm)
+            ) AS keys(key_kind, key_value)
+            WHERE contract_address <> ''
+              AND key_value <> ''
+            GROUP BY chain, key_kind, key_value, contract_address;
         ",
         progress,
-        "created URI key contract table",
+        "built URI key contracts",
     )?;
-
-    for (key_kind, column_expr) in [
-        (
-            "strict_token",
-            "trim(coalesce(CAST(token_uri AS VARCHAR), ''))",
-        ),
-        (
-            "strict_image",
-            "trim(coalesce(CAST(image_uri AS VARCHAR), ''))",
-        ),
-        (
-            "norm_token",
-            "coalesce(CAST(token_uri_norm AS VARCHAR), '')",
-        ),
-        (
-            "norm_image",
-            "coalesce(CAST(image_uri_norm AS VARCHAR), '')",
-        ),
-    ] {
-        insert_uri_key_contracts(conn, inputs, progress, key_kind, column_expr)?;
-    }
 
     execute_progress_batch(
         conn,
         "
-            CREATE TABLE uri_key_stats AS
+            CREATE TEMP TABLE uri_key_stats AS
             SELECT chain,
                    key_kind,
                    key_value,
@@ -680,7 +679,7 @@ fn build_uri_key_stats(
     execute_progress_batch(
         conn,
         "
-            CREATE TABLE uri_key_chain_counts AS
+            CREATE TEMP TABLE uri_key_chain_counts AS
             SELECT key_kind,
                    key_value,
                    count(*)::BIGINT AS chain_count
@@ -693,68 +692,29 @@ fn build_uri_key_stats(
     Ok(())
 }
 
-fn insert_uri_key_contracts(
-    conn: &Connection,
-    inputs: &str,
-    progress: &ProgressTracker,
-    key_kind: &str,
-    column_expr: &str,
-) -> Result<(), AnalysisError> {
-    execute_progress_batch(
-        conn,
-        &format!(
-            "
-            INSERT INTO uri_key_contracts
-            SELECT lower(trim(CAST(chain AS VARCHAR))) AS chain,
-                   '{key_kind}' AS key_kind,
-                   {column_expr} AS key_value,
-                   lower(trim(CAST(contract_address AS VARCHAR))) AS contract_address,
-                   count(*)::BIGINT AS nft_count
-            FROM read_parquet({inputs})
-            WHERE chain IS NOT NULL
-              AND trim(CAST(chain AS VARCHAR)) <> ''
-              AND contract_address IS NOT NULL
-              AND trim(CAST(contract_address AS VARCHAR)) <> ''
-              AND {column_expr} <> ''
-            GROUP BY
-                lower(trim(CAST(chain AS VARCHAR))),
-                {column_expr},
-                lower(trim(CAST(contract_address AS VARCHAR)));
-            ",
-        ),
-        progress,
-        &format!("built URI key contracts {key_kind}"),
-    )
-}
-
 fn build_uri_contract_flags(
     conn: &Connection,
-    inputs: &str,
     progress: &ProgressTracker,
 ) -> Result<(), AnalysisError> {
     execute_progress_batch(
         conn,
         &format!(
             "
-            CREATE TABLE uri_contract_flags AS
+            CREATE TEMP TABLE uri_contract_flags AS
             WITH rows AS (
-                SELECT
-                    lower(trim(CAST(chain AS VARCHAR))) AS chain,
-                    lower(trim(CAST(contract_address AS VARCHAR))) AS contract_address,
-                    trim(coalesce(CAST(token_uri AS VARCHAR), '')) AS token_uri,
-                    trim(coalesce(CAST(image_uri AS VARCHAR), '')) AS image_uri,
-                    coalesce(CAST(token_uri_norm AS VARCHAR), '') AS token_uri_norm,
-                    coalesce(CAST(image_uri_norm AS VARCHAR), '') AS image_uri_norm
-                FROM read_parquet({inputs})
-                WHERE chain IS NOT NULL
-                  AND trim(CAST(chain AS VARCHAR)) <> ''
-                  AND contract_address IS NOT NULL
-                  AND trim(CAST(contract_address AS VARCHAR)) <> ''
+                SELECT chain,
+                       contract_address,
+                       token_uri,
+                       image_uri,
+                       token_uri_norm,
+                       image_uri_norm
+                FROM analysis_rows
+                WHERE contract_address <> ''
                   AND (
-                      trim(coalesce(CAST(token_uri AS VARCHAR), '')) <> ''
-                      OR trim(coalesce(CAST(image_uri AS VARCHAR), '')) <> ''
-                      OR coalesce(CAST(token_uri_norm AS VARCHAR), '') <> ''
-                      OR coalesce(CAST(image_uri_norm AS VARCHAR), '') <> ''
+                      token_uri <> ''
+                      OR image_uri <> ''
+                      OR token_uri_norm <> ''
+                      OR image_uri_norm <> ''
                   )
             ),
             keyed AS (
@@ -809,7 +769,6 @@ fn build_uri_contract_flags(
             FROM keyed
             GROUP BY chain, contract_address;
             ",
-            inputs = inputs,
             contract_columns = uri_contract_metric_columns(),
         ),
         progress,
@@ -1029,6 +988,7 @@ fn run_name_analysis(
     let mut rows = Vec::new();
     let atom_bytes = name_atoms_memory_bytes(&atoms);
     let atoms_by_chain = atoms_by_chain(&atoms, chains.len());
+    let chain_matrix_state_bytes = chain_matrix_reuse_state_bytes(&atoms_by_chain);
     let total_memory_budget = total_memory_budget_bytes(memory_limit)?;
     let memory_plan = name_analysis_memory_plan(
         thresholds,
@@ -1037,6 +997,7 @@ fn run_name_analysis(
         memory_limit,
         analysis_memory_limit,
         atom_bytes,
+        chain_matrix_state_bytes,
     )?;
     set_duckdb_memory_limit(conn, memory_plan.duckdb_bytes)?;
     progress.step(format!(
@@ -1477,6 +1438,7 @@ fn name_analysis_memory_plan(
     memory_limit: &str,
     analysis_memory_limit: Option<&str>,
     resident_analysis_bytes: usize,
+    chain_matrix_reuse_bytes: usize,
 ) -> Result<MemoryPlan, AnalysisError> {
     let total_budget = total_memory_budget_bytes(memory_limit)?;
     if let Some(value) = analysis_memory_limit
@@ -1490,6 +1452,7 @@ fn name_analysis_memory_plan(
                 atom_count,
                 chain_count,
                 resident_analysis_bytes,
+                chain_matrix_reuse_bytes,
             );
         }
         let analysis_bytes = parse_byte_size(value)?;
@@ -1506,6 +1469,7 @@ fn name_analysis_memory_plan(
         atom_count,
         chain_count,
         resident_analysis_bytes,
+        chain_matrix_reuse_bytes,
     )
 }
 
@@ -1535,6 +1499,7 @@ fn auto_balanced_memory_plan(
     atom_count: usize,
     chain_count: usize,
     resident_analysis_bytes: usize,
+    chain_matrix_reuse_bytes: usize,
 ) -> Result<MemoryPlan, AnalysisError> {
     if resident_analysis_bytes > total_budget {
         return Err(AnalysisError::InvalidData(format!(
@@ -1548,13 +1513,13 @@ fn auto_balanced_memory_plan(
         atom_count,
         chain_count,
         resident_analysis_bytes,
+        chain_matrix_reuse_bytes,
     );
-    let analysis_bytes = desired_analysis.min(total_budget);
-    let duckdb_bytes = total_budget.saturating_sub(analysis_bytes);
+    let duckdb_bytes = total_budget.saturating_sub(desired_analysis.min(total_budget));
 
     Ok(MemoryPlan {
         duckdb_bytes,
-        analysis_bytes,
+        analysis_bytes: total_budget,
     })
 }
 
@@ -1563,10 +1528,12 @@ fn desired_analysis_budget(
     atom_count: usize,
     chain_count: usize,
     resident_analysis_bytes: usize,
+    chain_matrix_reuse_bytes: usize,
 ) -> usize {
     let thresholds = threshold_count.max(1);
-    resident_analysis_bytes
-        .saturating_add(threshold_state_bytes(atom_count, chain_count).saturating_mul(thresholds))
+    let per_threshold_bytes =
+        threshold_state_bytes(atom_count, chain_count).saturating_add(chain_matrix_reuse_bytes);
+    resident_analysis_bytes.saturating_add(per_threshold_bytes.saturating_mul(thresholds))
 }
 
 fn total_memory_budget_bytes(value: &str) -> Result<usize, AnalysisError> {
@@ -2220,7 +2187,7 @@ mod tests {
     #[test]
     fn threshold_batches_reuse_memory_limit_by_default() {
         let plan =
-            name_analysis_memory_plan(&[90.0, 95.0, 98.0], 1_000, 1, "1MB", None, 0).unwrap();
+            name_analysis_memory_plan(&[90.0, 95.0, 98.0], 1_000, 1, "1MB", None, 0, 0).unwrap();
         let batches = threshold_batches(&[90.0, 95.0, 98.0], 1_000, 1, plan.analysis_bytes);
 
         assert_eq!(batches, vec![vec![98.0, 95.0, 90.0]]);
@@ -2228,8 +2195,9 @@ mod tests {
 
     #[test]
     fn threshold_batches_honor_analysis_memory_override() {
-        let plan = name_analysis_memory_plan(&[90.0, 95.0, 98.0], 1_000, 2, "1GB", Some("16KB"), 0)
-            .unwrap();
+        let plan =
+            name_analysis_memory_plan(&[90.0, 95.0, 98.0], 1_000, 2, "1GB", Some("16KB"), 0, 0)
+                .unwrap();
         let batches = threshold_batches(&[90.0, 95.0, 98.0], 1_000, 2, plan.analysis_bytes);
 
         assert_eq!(batches, vec![vec![98.0], vec![95.0], vec![90.0]]);
@@ -2252,28 +2220,63 @@ mod tests {
         let memory_limit = format_byte_size(total_budget);
 
         let plan =
-            name_analysis_memory_plan(&[90.0, 95.0, 98.0], 50_000, 2, &memory_limit, None, 0)
+            name_analysis_memory_plan(&[90.0, 95.0, 98.0], 50_000, 2, &memory_limit, None, 0, 0)
                 .unwrap();
 
         assert!(plan.analysis_bytes >= state_bytes.saturating_mul(3));
     }
 
     #[test]
+    fn auto_memory_plan_exposes_full_total_budget_to_rust_batching() {
+        let total_budget = 512 * 1024 * 1024;
+        let plan =
+            name_analysis_memory_plan(&[90.0, 95.0, 98.0], 10_000, 2, "512MB", None, 0, 0).unwrap();
+
+        assert_eq!(plan.analysis_bytes, total_budget);
+    }
+
+    #[test]
+    fn auto_memory_plan_reserves_duckdb_only_after_chain_matrix_reuse_need() {
+        let atoms_by_chain = vec![vec![0; 10_000], vec![0; 10_000], vec![0; 10_000]];
+        let atom_count = atoms_by_chain.iter().map(Vec::len).sum();
+        let threshold_count = 3;
+        let global_bytes = threshold_state_bytes(atom_count, atoms_by_chain.len());
+        let matrix_bytes = chain_matrix_reuse_state_bytes(&atoms_by_chain);
+        let state_need = global_bytes.saturating_add(matrix_bytes);
+        let total_budget = state_need.saturating_mul(threshold_count).saturating_mul(2);
+        let memory_limit = format_byte_size(total_budget);
+
+        let plan = name_analysis_memory_plan(
+            &[90.0, 95.0, 98.0],
+            atom_count,
+            atoms_by_chain.len(),
+            &memory_limit,
+            None,
+            0,
+            matrix_bytes,
+        )
+        .unwrap();
+
+        assert!(plan.duckdb_bytes <= total_budget.saturating_sub(state_need * threshold_count));
+    }
+
+    #[test]
     fn default_memory_budget_is_auto_balanced_between_duckdb_and_rust() {
         let small =
-            name_analysis_memory_plan(&[90.0, 95.0, 98.0], 1_000, 1, "10GB", None, 0).unwrap();
+            name_analysis_memory_plan(&[90.0, 95.0, 98.0], 1_000, 1, "10GB", None, 0, 0).unwrap();
         let large =
-            name_analysis_memory_plan(&[90.0, 95.0, 98.0], 20_000_000, 2, "10GB", None, 0).unwrap();
+            name_analysis_memory_plan(&[90.0, 95.0, 98.0], 20_000_000, 2, "10GB", None, 0, 0)
+                .unwrap();
 
-        assert!(small.duckdb_bytes > small.analysis_bytes);
-        assert!(large.analysis_bytes > small.analysis_bytes);
+        assert_eq!(small.analysis_bytes, 10 * 1024 * 1024 * 1024);
+        assert_eq!(large.analysis_bytes, 10 * 1024 * 1024 * 1024);
         assert!(large.duckdb_bytes < small.duckdb_bytes);
     }
 
     #[test]
     fn explicit_analysis_memory_limit_stays_inside_total_budget() {
         let plan =
-            name_analysis_memory_plan(&[90.0, 95.0, 98.0], 1_000, 2, "10GB", Some("16KB"), 0)
+            name_analysis_memory_plan(&[90.0, 95.0, 98.0], 1_000, 2, "10GB", Some("16KB"), 0, 0)
                 .unwrap();
 
         assert!(plan.duckdb_bytes < 10 * 1024 * 1024 * 1024);
@@ -2283,7 +2286,7 @@ mod tests {
     #[test]
     fn explicit_analysis_memory_limit_rejects_over_budget_value() {
         let error =
-            name_analysis_memory_plan(&[90.0], 1_000, 2, "1GB", Some("2GB"), 0).unwrap_err();
+            name_analysis_memory_plan(&[90.0], 1_000, 2, "1GB", Some("2GB"), 0, 0).unwrap_err();
 
         assert!(error.to_string().contains("exceeds total --memory-limit"));
     }
@@ -2291,9 +2294,9 @@ mod tests {
     #[test]
     fn analysis_memory_auto_uses_total_budget_auto_balance() {
         let default_plan =
-            name_analysis_memory_plan(&[90.0, 95.0, 98.0], 10_000, 2, "4GB", None, 0).unwrap();
+            name_analysis_memory_plan(&[90.0, 95.0, 98.0], 10_000, 2, "4GB", None, 0, 0).unwrap();
         let auto_plan =
-            name_analysis_memory_plan(&[90.0, 95.0, 98.0], 10_000, 2, "4GB", Some("auto"), 0)
+            name_analysis_memory_plan(&[90.0, 95.0, 98.0], 10_000, 2, "4GB", Some("auto"), 0, 0)
                 .unwrap();
 
         assert_eq!(auto_plan.duckdb_bytes, default_plan.duckdb_bytes);
@@ -2385,7 +2388,7 @@ mod tests {
     #[test]
     fn auto_memory_plan_rejects_resident_atoms_over_budget() {
         let error =
-            name_analysis_memory_plan(&[90.0], 1_000, 2, "1GB", None, 2 * 1024 * 1024 * 1024)
+            name_analysis_memory_plan(&[90.0], 1_000, 2, "1GB", None, 2 * 1024 * 1024 * 1024, 0)
                 .unwrap_err();
 
         assert!(error.to_string().contains("loaded name atoms need"));
