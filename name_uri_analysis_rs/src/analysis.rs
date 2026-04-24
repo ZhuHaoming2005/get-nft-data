@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use duckdb::{params, Connection};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use serde::Serialize;
 use strsim::jaro_winkler;
@@ -143,41 +143,74 @@ struct MemoryPlan {
 }
 
 struct ProgressTracker {
-    bar: ProgressBar,
+    _multi: MultiProgress,
+    overall: ProgressBar,
+    detail: ProgressBar,
 }
 
 impl ProgressTracker {
-    fn new() -> Self {
-        let bar = ProgressBar::new(0);
-        bar.set_style(
+    fn new(total_phases: u64) -> Self {
+        let multi = MultiProgress::new();
+        let overall = multi.add(ProgressBar::new(total_phases));
+        overall.set_style(
             ProgressStyle::with_template(
-                "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} {percent}% {msg}",
+                "{spinner:.green} overall [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} {msg}",
             )
             .unwrap()
             .progress_chars("#>-"),
         );
-        Self { bar }
+        let detail = multi.add(ProgressBar::new(0));
+        detail.set_style(
+            ProgressStyle::with_template(
+                "  {spinner:.blue} current [{elapsed_precise}] [{wide_bar:.magenta/blue}] {pos}/{len} {percent}% {msg}",
+            )
+            .unwrap()
+            .progress_chars("#>-"),
+        );
+        Self {
+            _multi: multi,
+            overall,
+            detail,
+        }
+    }
+
+    fn start_phase(&self, message: impl Into<String>, work_units: u64) {
+        let message = message.into();
+        self.overall.set_message(message.clone());
+        self.detail.reset();
+        self.detail.set_length(work_units);
+        self.detail.set_position(0);
+        self.detail.set_message(message);
     }
 
     fn add_work(&self, units: u64) {
-        self.bar.inc_length(units);
+        self.detail.inc_length(units);
     }
 
     fn step(&self, message: impl Into<String>) {
-        self.bar.set_message(message.into());
-        self.bar.inc(1);
+        self.detail.set_message(message.into());
+        self.detail.inc(1);
     }
 
     fn inc(&self, units: u64) {
-        self.bar.inc(units);
+        self.detail.inc(units);
     }
 
     fn set_message(&self, message: impl Into<String>) {
-        self.bar.set_message(message.into());
+        self.detail.set_message(message.into());
+    }
+
+    fn finish_phase(&self, message: impl Into<String>) {
+        let message = message.into();
+        self.detail.finish_with_message(message.clone());
+        self.overall.inc(1);
+        self.overall.set_message(message);
     }
 
     fn finish(&self) {
-        self.bar
+        self.detail
+            .finish_with_message("analysis complete; writing outputs finished");
+        self.overall
             .finish_with_message("analysis complete; writing outputs finished");
     }
 }
@@ -307,11 +340,12 @@ pub fn run_analysis(options: AnalysisOptions) -> Result<AnalysisReport, Analysis
     }
     fs::create_dir_all(&options.output_dir)?;
 
-    let progress = ProgressTracker::new();
-    progress.add_work(2);
+    let progress = ProgressTracker::new(5);
+    progress.start_phase("configuring DuckDB", 1);
     let conn = Connection::open(&options.database_path)?;
     configure_duckdb(&conn, &options)?;
     progress.step("DuckDB configured");
+    progress.finish_phase("DuckDB configured");
     let selected_chains = prepare_base_tables(&conn, &options, &progress)?;
 
     let mut summary_rows = Vec::new();
@@ -348,8 +382,10 @@ pub fn run_analysis(options: AnalysisOptions) -> Result<AnalysisReport, Analysis
     });
 
     let report = AnalysisReport { summary_rows };
+    progress.start_phase("writing outputs", 1);
     write_outputs(&report, &options.output_dir)?;
     progress.step("outputs written");
+    progress.finish_phase("outputs written");
     progress.finish();
     Ok(report)
 }
@@ -385,7 +421,7 @@ fn prepare_base_tables(
     progress: &ProgressTracker,
 ) -> Result<Vec<String>, AnalysisError> {
     let inputs = parquet_input_sql(&options.parquet_inputs);
-    progress.add_work(6);
+    progress.start_phase("preparing DuckDB tables", 6);
     execute_progress_batch(
         conn,
         "
@@ -519,7 +555,9 @@ fn prepare_base_tables(
         progress,
         "built name atoms",
     )?;
-    load_selected_chains(conn)
+    let chains = load_selected_chains(conn)?;
+    progress.finish_phase("DuckDB tables ready");
+    Ok(chains)
 }
 
 fn execute_progress_batch(
@@ -558,7 +596,7 @@ fn run_uri_analysis(
     let uri_steps = chains
         .len()
         .saturating_mul(if chains.len() > 1 { 6 } else { 4 });
-    progress.add_work(uri_steps as u64);
+    progress.start_phase("analyzing URI duplicates", uri_steps as u64);
     for chain in chains {
         for (match_mode, token_kind, image_kind, min_contracts) in [
             ("strict_any", "strict_token", "strict_image", false),
@@ -599,6 +637,7 @@ fn run_uri_analysis(
             }
         }
     }
+    progress.finish_phase("URI analysis complete");
     Ok(rows)
 }
 
@@ -753,7 +792,7 @@ fn run_name_analysis(
     analysis_memory_limit: Option<&str>,
     progress: &ProgressTracker,
 ) -> Result<Vec<SummaryRow>, AnalysisError> {
-    progress.add_work(3);
+    progress.start_phase("analyzing name duplicates", 3);
     let totals = load_name_totals(conn, chains)?;
     progress.step("loaded name totals");
     let atoms = load_all_name_atoms(conn, chains)?;
@@ -812,6 +851,7 @@ fn run_name_analysis(
             progress,
         ));
     }
+    progress.finish_phase("name analysis complete");
     Ok(rows)
 }
 
