@@ -1,91 +1,49 @@
 # dedup_bench_rs
 
-单 NFT `name / metadata` 查重 benchmark 工具。
+单 NFT `name / metadata` 查重 benchmark 工具。输入 1 个样例 NFT，从 DuckDB / Parquet 特征数据中召回候选，比较多种字符串算法的重复判定结果和耗时。
 
-目标：
+## 运行
 
-- 输入 1 个样例 NFT
-- 只基于 `name` 和 `metadata` 做召回与打分
-- 对比多种字符串算法的重复判定结果和耗时
-- 复用现有 DuckDB / Parquet 特征数据，不访问 PostgreSQL
-
-当前实现明确**不使用**这些字段：
-
-- `token_uri`
-- `image_uri`
-- `symbol`
-
-## 功能范围
-
-- 样例输入来自命令行参数和一个 metadata 文件：
-  - `name`：通过命令行直接传入
-  - `contract-address`：可选
-  - `token-id`：可选
-  - `metadata-file`：样例 metadata JSON
-- 数据源优先级：
-  - 先读 `feature-db` 里的 `nft_features`
-  - 若该链无数据，则从 `feature-parquet` 导入到 `feature-db`，再读 `nft_features`
-- 共享召回只使用：
-  - `name_norm` 前 8 字符前缀
-  - `metadata_keywords_arr` 关键词
-- 输出：
-  - 一份 JSON 详细报告
-  - 一份 Markdown 摘要报告
-  - 正式报告只输出被各算法判定为重复的 `duplicates`
-  - 每个算法的判重规则集中定义在 `src/decision_rules.rs`
-- 计时口径：
-  - 算法层并行线程数默认是 `32`，可通过参数自定义
-  - 每个算法都会先对同一批 `recall_rows` 预热一次，再进入正式计时
-  - 正式计时时会轮转各算法的执行顺序，降低固定顺序带来的缓存偏差
-
-## 运行方式
-
-在 [dedup_bench_rs](..\dedup_bench_rs) 目录下执行：
+在本目录执行：
 
 ```bash
 cargo run -- run \
   --chain ethereum \
   --contract-address 0xseed \
   --token-id 1 \
+  --token-uri "Seed/" \
+  --image-uri "Seed/" \
   --name "Azuki #1" \
   --metadata-file ./examples/metadata.json \
   --feature-db ../output/top_contract_analysis/features.duckdb \
   --feature-parquet ../output/top_contract_analysis/ethereum.parquet \
   --output ./result/result.json \
   --repeat 5 \
-  --algorithm-threads 30
+  --algorithm-threads 32
 ```
 
-参数说明：
+## 参数
 
-- `--chain`
-  目标链名，例如 `ethereum`
-- `--name`
-  样例 NFT 的名称，直接从命令行输入
-- `--contract-address`
-  可选。样例合约地址；提供后会在召回阶段排除该合约下的全部记录
-- `--token-id`
-  可选。样例 token id，仅作为样例标识保留
-- `--metadata-file`
-  样例 metadata JSON 文件
-- `--feature-db`
-  DuckDB 文件路径。文件不存在时会自动创建；Parquet 回退导入结果也会持久化到这里
-- `--feature-parquet`
-  可选。DuckDB 中没有该链数据时的 Parquet 导入源路径
-- `--output`
-  JSON 输出路径；同名 `.md` 会自动生成
-- `--repeat`
-  每个算法重复执行次数，用于统计平均耗时和最小耗时
-- `--algorithm-threads`
-  算法层并行线程数，默认 `30`
+| 参数 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `--chain` | 是 | - | 目标链名，例如 `ethereum` |
+| `--name` | 是 | - | 样例 NFT 名称 |
+| `--metadata-file` | 是 | - | 样例 metadata JSON 文件 |
+| `--feature-db` | 是 | - | DuckDB 特征库；无文件时自动创建 |
+| `--output` | 是 | - | JSON 输出路径；同名 `.md` 会自动生成 |
+| `--contract-address` | 否 | 空字符串 | 样例合约地址；非空时召回阶段排除同合约记录 |
+| `--token-id` | 否 | 空字符串 | 样例 token id，仅写入报告样例信息 |
+| `--token-uri` | 否 | 空字符串 | URI baseline 过滤片段；非空时排除 `token_uri` 包含该片段的合约 |
+| `--image-uri` | 否 | 空字符串 | URI baseline 过滤片段；非空时排除 `image_uri` 包含该片段的合约 |
+| `--feature-parquet` | 否 | - | `feature-db` 中无该链数据时的 Parquet 导入源 |
+| `--repeat` | 否 | `3` | 每个算法正式计时重复次数；代码会按至少 `1` 次执行 |
+| `--algorithm-threads` | 否 | `32` | 算法层并行线程数；必须大于 `0` |
 
-## 输入文件格式
+`--token-uri` / `--image-uri` 不参与 name 或 metadata 算法评分，只作为隐藏 URI baseline：已经能被 URI 片段命中的合约不会出现在最终 `duplicates` 中。
 
-### metadata-file
+## 输入
 
-直接传原始 metadata JSON。
-
-对象示例：
+`--metadata-file` 直接传原始 metadata JSON，对象或数组都可以：
 
 ```json
 {
@@ -97,129 +55,67 @@ cargo run -- run \
 }
 ```
 
-数组示例也支持：
+程序会从 metadata 生成 `metadata_doc` 和 `metadata_keywords`，用于 metadata 召回与评分。
 
-```json
-[
-  { "trait_type": "Mood", "value": "Calm" },
-  { "trait_type": "Type", "value": "Dragon" }
-]
-```
+## 数据源
 
-程序会：
+读取优先级：
 
-1. 读取 JSON
-2. 序列化成 `metadata_json`
-3. 使用现有逻辑生成 `metadata_doc`
-4. 提取 `metadata_keywords`
+1. 读取 `feature-db` 中的 `nft_features`。
+2. 如果该链无数据，并且提供了 `feature-parquet`，则导入 Parquet 到 `feature-db` 后再读取。
 
-## 算法列表
+推荐字段：
 
-### Name
+| 字段 | 用途 |
+| --- | --- |
+| `contract_address` / `token_id` / `name` | 基础身份和 name scoring |
+| `token_uri` / `image_uri` | URI baseline 过滤 |
+| `name_norm` | name 前缀召回；缺失时运行时计算 |
+| `metadata_json` / `metadata_doc` | metadata 展示与评分；缺失 `metadata_doc` 时从 JSON 生成 |
+| `metadata_keywords_arr` | metadata 关键词召回；缺失时运行时提取 |
 
-- `name_exact_normalized`
-- `name_jaro_winkler`
-- `name_damerau_levenshtein`
-- `name_monge_elkan`
+召回只使用 `name_norm` 前 8 字符前缀和 `metadata_keywords_arr` 关键词；正式报告只保留阈值命中的 `duplicates`。
 
-### Metadata
+## 判重规则
 
-- `metadata_bm25`
-- `metadata_token_cosine`
-- `metadata_soft_tfidf`
-- `metadata_weighted_jaccard`
+规则集中在 `src/decision_rules.rs`。当前阈值是本 benchmark 的默认经验规则，不是跨数据集通用推荐阈值；不同算法分数量纲不同，不应套用统一阈值。
 
-## 输出说明
+| 算法 | 分数范围 | 当前阈值 |
+| --- | --- | ---: |
+| `name_exact_normalized` | `0..100` | `100.0` |
+| `name_jaro_winkler` | `0..100` | `95.0` |
+| `name_damerau_levenshtein` | `0..100` | `80.0` |
+| `name_monge_elkan` | `0..100` | `85.0` |
+| `metadata_bm25` | `0..1` | `0.60` |
+| `metadata_token_cosine` | `0..1` | `0.80` |
+| `metadata_soft_tfidf` | `0..1` | `0.75` |
+| `metadata_weighted_jaccard` | `0..1` | `0.70` |
 
-### JSON 报告
+补充参数：
 
-主字段：
+- `metadata_bm25` 使用 `k1 = 1.2`、`b = 0.75`，并用样例 metadata 对自身的 BM25 分数归一化到 `0..1`。
+- `metadata_soft_tfidf` 内部 token 匹配阈值为 Jaro-Winkler `0.9`。
 
-- `chain`
-- `source`
-- `sample`
-- `recall_elapsed_ms`
-- `recall_candidate_count`
-- `name_algorithms`
-- `metadata_algorithms`
+严格比较算法优劣时，应使用人工标注样本或阈值扫描，把各算法校准到相同目标，例如相同 precision / PPV，再比较 recall 和耗时。
 
-其中：
+## 输出
 
-- `name_algorithms` 包含所有 `name` 类算法结果
-- `metadata_algorithms` 包含所有 `metadata` 类算法结果
+输出包含：
 
-每个算法包含：
+- `result.json`：完整结构化报告
+- `result.md`：同名 Markdown 摘要
 
-- `algorithm_id`
-- `field`
-- `decision_rule`
-- `repeat`
-- `runs_ms`
-- `avg_ms`
-- `min_ms`
-- `duplicate_count`
-- `duplicates`
+核心字段：
 
-其中：
+- `sample`：样例输入
+- `recall_elapsed_ms` / `recall_candidate_count`：召回耗时和候选数
+- `name_algorithms` / `metadata_algorithms`：各算法的 `decision_rule`、`runs_ms`、`avg_ms`、`min_ms`、`duplicate_count`、`duplicates`
 
-- `name_algorithms[*].duplicates` 为合约级结果，包含：
-  - `contract_address`
-  - `name`
-  - `max_score`
-  - `duplicate_token_count`
-- `metadata_algorithms[*].duplicates` 为合约级结果，包含：
-  - `contract_address`
-  - `metadata_doc`
-  - `score`
+`name` duplicates 为合约级结果，包含 `contract_address`、`name`、`metadata_doc`、`max_score`、`duplicate_token_count`。`metadata` duplicates 包含 `contract_address`、`metadata_doc`、`score`。
 
-### Markdown 报告
-
-用于快速人工查看：
-
-- 样例信息
-- 召回数量和耗时
-- `Name Algorithms` 合约级重复结果
-- `Metadata Algorithms` 合约级重复结果
-
-## 数据要求
-
-DuckDB / Parquet 至少需要包含这些业务字段：
-
-- `contract_address`
-- `token_id`
-- `name`
-
-建议包含这些预计算列：
-
-- `name_norm`
-- `metadata_json`
-- `metadata_doc`
-- `metadata_keywords_arr`
-
-如果缺少这些预计算列：
-
-- `name_norm` 会回退为运行时计算
-- `metadata_doc` 会回退为运行时从 `metadata_json` 生成
-- `metadata_keywords_arr` 会回退为运行时提取
-
-## 测试
-
-运行测试：
+## 验证
 
 ```bash
 cargo test
-```
-
-静态检查：
-
-```bash
 cargo clippy --all-targets -- -D warnings
 ```
-
-## 已验证点
-
-- DuckDB 直接读取
-- DuckDB 无链数据时会从 Parquet 导入并持久化到 `feature-db`
-- 召回阶段不会因为 `token_uri / image_uri / symbol` 命中
-- `repeat=1` 与 `repeat>1` 候选集合一致
-- CLI 会同时输出 JSON 和 Markdown
