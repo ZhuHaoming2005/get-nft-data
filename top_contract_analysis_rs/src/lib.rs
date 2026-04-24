@@ -1,6 +1,8 @@
 pub mod analysis;
 pub mod api;
 pub mod cli;
+pub mod config;
+pub mod constants;
 pub mod error;
 pub mod models;
 pub mod normalize;

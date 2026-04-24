@@ -7,6 +7,7 @@ use top_contract_analysis_rs::analysis::{
     BatchRequest, RealApi,
 };
 use top_contract_analysis_rs::cli::{Command, TopContractAnalysisCli};
+use top_contract_analysis_rs::config::postgres_connection_config;
 use top_contract_analysis_rs::error::AppError;
 use top_contract_analysis_rs::progress::{
     create_batch_progress_reporter, create_single_seed_progress_reporter,
@@ -17,16 +18,8 @@ use top_contract_analysis_rs::store::{
     export_chain_snapshot_to_parquet, ContractSignalCache, DuckDbFeatureStore,
 };
 
-fn connect_postgres_from_env() -> Result<Client, AppError> {
-    let host = std::env::var("DB_HOST").unwrap_or_else(|_| "localhost".into());
-    let port = std::env::var("DB_PORT").unwrap_or_else(|_| "5432".into());
-    let dbname = std::env::var("DB_NAME").unwrap_or_else(|_| "nft_data".into());
-    let user = std::env::var("DB_USER").unwrap_or_else(|_| "postgres".into());
-    let password = std::env::var("DB_PASS").unwrap_or_default();
-    let connect_timeout = std::env::var("DB_CONNECT_TIMEOUT").unwrap_or_else(|_| "10".into());
-    let config = format!(
-        "host={host} port={port} dbname={dbname} user={user} password={password} connect_timeout={connect_timeout}"
-    );
+fn connect_postgres_from_constants() -> Result<Client, AppError> {
+    let config = postgres_connection_config();
     Client::connect(&config, NoTls).map_err(AppError::from)
 }
 
@@ -130,7 +123,7 @@ async fn main() -> Result<(), AppError> {
             Ok(())
         }
         Command::ExportSnapshot(args) => {
-            let mut conn = connect_postgres_from_env()?;
+            let mut conn = connect_postgres_from_constants()?;
             export_chain_snapshot_to_parquet(
                 &mut conn,
                 &args.chain,

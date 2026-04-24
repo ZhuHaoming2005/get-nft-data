@@ -17,6 +17,7 @@
 ## 目录结构
 
 - `src/main.rs`：CLI 入口
+- `src/constants.rs`：`export-snapshot` 的 PostgreSQL 连接常量
 - `src/analysis`：重复合约分析逻辑
 - `src/reporting`：JSON / Markdown 报告渲染
 - `src/store`：DuckDB 特征库、Postgres 快照导出、signal cache
@@ -31,11 +32,11 @@ cargo build
 cargo test
 ```
 
-## 环境变量
+## 配置变量
 
 先复制 [.env.example](./.env.example)，再按实际环境填写。
 
-注意：程序本身**不会自动加载** `.env` 文件。你需要先把变量导入当前 shell。Bash 示例：
+注意：程序本身**不会自动加载** `.env` 文件。`analyze` / `batch` 不直接读 API key 环境变量，而是通过 CLI 参数传入。`.env.example` 里的 `ALCHEMY_API_KEY` 等变量主要用于命令行插值。Bash 示例：
 
 ```bash
 set -a
@@ -43,16 +44,7 @@ source .env
 set +a
 ```
 
-其中：
-
-- `export-snapshot` 会直接读取以下环境变量：
-  - `DB_HOST`
-  - `DB_PORT`
-  - `DB_NAME`
-  - `DB_USER`
-  - `DB_PASS`
-  - `DB_CONNECT_TIMEOUT`
-- `analyze` / `batch` 不直接读 API key 环境变量，而是通过 CLI 参数传入。`.env.example` 里的 `ALCHEMY_API_KEY` 等变量主要用于命令行插值。
+`export-snapshot` 不再读取 `DB_*` 环境变量。PostgreSQL 连接参数集中在 [src/constants.rs](./src/constants.rs)，运行前直接修改该文件中的 `DB_HOST`、`DB_PORT`、`DB_NAME`、`DB_USER`、`DB_PASS`、`DB_CONNECT_TIMEOUT` 常量。
 
 ## 命令说明
 
