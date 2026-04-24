@@ -140,6 +140,98 @@ fn analyzes_uri_rows_when_only_one_uri_field_is_present() {
 }
 
 #[test]
+fn uri_any_and_cross_contract_counts_stay_distinct() {
+    let temp = tempfile::tempdir().unwrap();
+    let parquet = temp.path().join("sample.parquet");
+    write_parquet(
+        &parquet,
+        r#"
+            VALUES
+            ('ethereum', '0xaaa', '1', 'ipfs://same-contract', 'img-a1', 'A', 'a'),
+            ('ethereum', '0xaaa', '2', 'ipfs://same-contract', 'img-a2', 'A', 'a'),
+            ('ethereum', '0xbbb', '1', 'ipfs://unique-b', 'img-b1', 'B', 'b')
+        "#,
+    );
+
+    let report = run_analysis(AnalysisOptions {
+        database_path: temp.path().join("analysis.duckdb"),
+        parquet_inputs: vec![parquet],
+        output_dir: temp.path().join("out"),
+        thresholds: vec![90.0],
+        threads: 2,
+        memory_limit: "256MB".into(),
+        analysis_memory_limit: Some("64MB".into()),
+        temp_directory: None,
+    })
+    .unwrap();
+
+    assert!(report.summary_rows.iter().any(|row| {
+        row.field_name == "uri"
+            && row.scope == "intra_chain"
+            && row.primary_chain == "ethereum"
+            && row.match_mode == "strict_any"
+            && row.metric == "v1"
+            && row.duplicate_nft_count == 2
+            && row.duplicate_contract_count == 1
+    }));
+    assert!(report.summary_rows.iter().any(|row| {
+        row.field_name == "uri"
+            && row.scope == "intra_chain"
+            && row.primary_chain == "ethereum"
+            && row.match_mode == "strict_cross"
+            && row.metric == "v1"
+            && row.duplicate_nft_count == 0
+            && row.duplicate_contract_count == 0
+    }));
+}
+
+#[test]
+fn cross_chain_uri_counts_use_selected_chain_key_coverage() {
+    let temp = tempfile::tempdir().unwrap();
+    let parquet = temp.path().join("sample.parquet");
+    write_parquet(
+        &parquet,
+        r#"
+            VALUES
+            ('ethereum', '0xaaa', '1', 'ipfs://shared-cross', 'img-eth', 'A', 'a'),
+            ('base', '0xbbb', '1', 'ipfs://shared-cross', 'img-base', 'B', 'b'),
+            ('polygon', '0xccc', '1', 'ipfs://polygon-only', 'img-poly', 'C', 'c')
+        "#,
+    );
+
+    let report = run_analysis(AnalysisOptions {
+        database_path: temp.path().join("analysis.duckdb"),
+        parquet_inputs: vec![parquet],
+        output_dir: temp.path().join("out"),
+        thresholds: vec![90.0],
+        threads: 2,
+        memory_limit: "256MB".into(),
+        analysis_memory_limit: Some("64MB".into()),
+        temp_directory: None,
+    })
+    .unwrap();
+
+    assert!(report.summary_rows.iter().any(|row| {
+        row.field_name == "uri"
+            && row.scope == "cross_chain_summary"
+            && row.primary_chain == "ethereum"
+            && row.match_mode == "strict"
+            && row.metric == "v1"
+            && row.duplicate_nft_count == 1
+            && row.duplicate_contract_count == 1
+    }));
+    assert!(report.summary_rows.iter().any(|row| {
+        row.field_name == "uri"
+            && row.scope == "cross_chain_summary"
+            && row.primary_chain == "polygon"
+            && row.match_mode == "strict"
+            && row.metric == "v1"
+            && row.duplicate_nft_count == 0
+            && row.duplicate_contract_count == 0
+    }));
+}
+
+#[test]
 fn compares_names_across_former_block_boundaries() {
     let temp = tempfile::tempdir().unwrap();
     let parquet = temp.path().join("sample.parquet");
