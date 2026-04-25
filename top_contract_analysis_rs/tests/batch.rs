@@ -67,6 +67,7 @@ impl AnalyzeApi for FakeBatchApi {
         chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
+        _opensea_api_key: &str,
         contract_address: &str,
     ) -> Result<ContractMetadata, AppError> {
         Ok(ContractMetadata {
@@ -702,6 +703,7 @@ impl AnalyzeApi for SlowBatchApi {
         chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
+        _opensea_api_key: &str,
         contract_address: &str,
     ) -> Result<ContractMetadata, AppError> {
         let current = self.current.fetch_add(1, Ordering::SeqCst) + 1;

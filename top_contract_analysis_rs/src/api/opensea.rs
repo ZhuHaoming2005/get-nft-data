@@ -3,9 +3,10 @@ use reqwest::Url;
 use serde_json::Value;
 use std::collections::BTreeSet;
 
+use crate::analysis::scoring::metadata_document_from_json;
 use crate::api::{ApiEndpoints, AsyncApiClient};
 use crate::error::AppError;
-use crate::models::NftSaleRecord;
+use crate::models::{ContractMetadata, NftSaleRecord, SeedNft};
 
 const ETH_PRICED_SYMBOLS: &[&str] = &["ETH", "WETH"];
 
@@ -28,6 +29,39 @@ fn normalize_token_id(raw: Option<&Value>) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn opensea_chain(chain: &str) -> &str {
+    match chain.trim().to_lowercase().as_str() {
+        "polygon" => "matic",
+        "ethereum" => "ethereum",
+        "base" => "base",
+        "arbitrum" => "arbitrum",
+        "optimism" => "optimism",
+        "avalanche" => "avalanche",
+        "zora" => "zora",
+        "blast" => "blast",
+        _ => "ethereum",
+    }
+}
+
+fn string_field<'a>(value: &'a Value, names: &[&str]) -> &'a str {
+    names
+        .iter()
+        .find_map(|name| value.get(*name).and_then(Value::as_str))
+        .unwrap_or("")
+}
+
+fn int_field(value: &Value, names: &[&str]) -> i64 {
+    names
+        .iter()
+        .find_map(|name| {
+            value.get(*name).and_then(|raw| {
+                raw.as_i64()
+                    .or_else(|| raw.as_str().and_then(|text| text.parse::<i64>().ok()))
+            })
+        })
+        .unwrap_or(0)
 }
 
 fn decode_fee_eth(payload: Option<&Value>) -> (f64, String, String) {
@@ -318,6 +352,166 @@ pub async fn fetch_opensea_nft_events(
         });
     }
     Ok(rows)
+}
+
+pub async fn fetch_opensea_contract_metadata(
+    client: &AsyncApiClient,
+    base_url: &str,
+    chain: &str,
+    contract_address: &str,
+    opensea_api_key: &str,
+) -> Result<ContractMetadata, AppError> {
+    if opensea_api_key.trim().is_empty() {
+        return Err(AppError::Http(
+            "OpenSea API key is required for contract metadata".to_string(),
+        ));
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert(
+        "x-api-key",
+        HeaderValue::from_str(opensea_api_key).map_err(|err| AppError::Http(err.to_string()))?,
+    );
+
+    let url = format!(
+        "{base_url}/api/v2/chain/{}/contract/{contract_address}",
+        opensea_chain(chain)
+    );
+    let payload: Value = client.get_json_with_headers(&url, headers).await?;
+    let collection = payload.get("collection").unwrap_or(&Value::Null);
+    let token_type =
+        string_field(&payload, &["contract_standard", "token_type", "tokenType"]).to_uppercase();
+    Ok(ContractMetadata {
+        chain: chain.to_string(),
+        contract_address: string_field(&payload, &["address", "contract_address"])
+            .trim()
+            .to_lowercase()
+            .if_empty_then(contract_address.to_lowercase()),
+        token_type,
+        contract_deployer: string_field(&payload, &["contract_deployer", "deployer"])
+            .trim()
+            .to_lowercase(),
+        deployed_block_number: int_field(
+            &payload,
+            &["deployed_block_number", "deployedBlockNumber"],
+        ),
+        name: string_field(&payload, &["name", "contract_name"])
+            .to_string()
+            .if_empty_then(string_field(collection, &["name", "collection_name"]).to_string()),
+        symbol: string_field(&payload, &["symbol"]).to_string(),
+    })
+}
+
+trait EmptyStringExt {
+    fn if_empty_then(self, fallback: String) -> String;
+}
+
+impl EmptyStringExt for String {
+    fn if_empty_then(self, fallback: String) -> String {
+        if self.is_empty() {
+            fallback
+        } else {
+            self
+        }
+    }
+}
+
+pub async fn fetch_opensea_contract_nfts(
+    client: &AsyncApiClient,
+    base_url: &str,
+    chain: &str,
+    contract_address: &str,
+    opensea_api_key: &str,
+) -> Result<Vec<SeedNft>, AppError> {
+    if opensea_api_key.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert(
+        "x-api-key",
+        HeaderValue::from_str(opensea_api_key).map_err(|err| AppError::Http(err.to_string()))?,
+    );
+
+    let mut rows = Vec::new();
+    let mut next: Option<String> = None;
+    let mut seen_cursors = BTreeSet::new();
+    loop {
+        let mut url = Url::parse(&format!(
+            "{base_url}/api/v2/chain/{}/contract/{contract_address}/nfts",
+            opensea_chain(chain)
+        ))
+        .map_err(|err| AppError::Http(err.to_string()))?;
+        url.query_pairs_mut().append_pair("limit", "200");
+        if let Some(next) = next.as_deref() {
+            url.query_pairs_mut().append_pair("next", next);
+        }
+
+        let payload: Value = client
+            .get_json_with_headers(url.as_str(), headers.clone())
+            .await?;
+        for raw in payload
+            .get("nfts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let token_id = normalize_token_id(
+                raw.get("identifier")
+                    .or_else(|| raw.get("token_id"))
+                    .or_else(|| raw.get("tokenId")),
+            );
+            if token_id.is_empty() {
+                continue;
+            }
+            let image_uri = string_field(
+                raw,
+                &[
+                    "image_url",
+                    "display_image_url",
+                    "display_animation_url",
+                    "animation_url",
+                ],
+            )
+            .to_string();
+            let token_uri =
+                string_field(raw, &["metadata_url", "token_uri", "tokenUri"]).to_string();
+            let metadata_json = raw
+                .get("metadata")
+                .or_else(|| raw.get("metadata_json"))
+                .map(Value::to_string)
+                .unwrap_or_default();
+            rows.push(SeedNft {
+                chain: chain.to_string(),
+                contract_address: raw
+                    .get("contract")
+                    .or_else(|| raw.get("contract_address"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(contract_address)
+                    .to_lowercase(),
+                token_id,
+                name: string_field(raw, &["name", "title"]).to_string(),
+                symbol: String::new(),
+                token_uri,
+                image_uri,
+                metadata_doc: metadata_document_from_json(&metadata_json),
+                metadata_json,
+            });
+        }
+
+        let next_cursor = payload.get("next").and_then(Value::as_str).unwrap_or("");
+        if next_cursor.is_empty() {
+            return Ok(rows);
+        }
+        if !seen_cursors.insert(next_cursor.to_string()) {
+            return Err(AppError::Http(format!(
+                "opensea pagination stalled on repeated next cursor: {next_cursor}"
+            )));
+        }
+        next = Some(next_cursor.to_string());
+    }
 }
 
 pub async fn fetch_contract_sales(

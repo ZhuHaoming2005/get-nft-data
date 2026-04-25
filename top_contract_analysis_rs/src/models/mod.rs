@@ -365,6 +365,7 @@ pub struct MaliciousAddressPayload {
 pub struct SingleReportPayload {
     pub seed_contract: SeedContractPayload,
     pub seed_collection_stats: SeedCollectionStatsPayload,
+    #[serde(skip_serializing, skip_deserializing, default)]
     pub duplicate_candidates: Vec<DuplicateCandidate>,
     pub contract_level_summary: BTreeMap<String, ContractLevelSummaryPayload>,
     pub report_summary: ReportSummary,

@@ -3,7 +3,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use top_contract_analysis_rs::api::{
     fetch_contract_metadata, fetch_contract_sales, fetch_contract_transfers, fetch_eth_balance,
-    fetch_license_sample, fetch_same_block_eth_transfers_for_address, fetch_seed_contract_nfts,
+    fetch_license_sample, fetch_opensea_contract_metadata, fetch_opensea_contract_nfts,
+    fetch_same_block_eth_transfers_for_address, fetch_seed_contract_nfts,
     fetch_transaction_receipt, fetch_transaction_receipts_for_block, is_open_license_payload,
     ApiEndpoints, AsyncApiClient,
 };
@@ -69,6 +70,89 @@ async fn spawn_sequential_json_server(
         }
     });
     (format!("http://{address}"), handle)
+}
+
+#[tokio::test]
+async fn fetch_opensea_contract_metadata_parses_contract_fields() {
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET)
+                .path("/api/v2/chain/ethereum/contract/0xseed")
+                .header("x-api-key", "opensea");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "address": "0xSeed",
+                "contract_standard": "erc721",
+                "contract_deployer": "0xCreator",
+                "deployed_block_number": "123",
+                "collection": {"name": "OpenSea Azuki"},
+                "symbol": "AZ"
+            }));
+        })
+        .await;
+
+    let client = test_client();
+    let meta = fetch_opensea_contract_metadata(
+        &client,
+        &server.base_url(),
+        "ethereum",
+        "0xseed",
+        "opensea",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(meta.contract_address, "0xseed");
+    assert_eq!(meta.token_type, "ERC721");
+    assert_eq!(meta.contract_deployer, "0xcreator");
+    assert_eq!(meta.deployed_block_number, 123);
+    assert_eq!(meta.name, "OpenSea Azuki");
+    assert_eq!(meta.symbol, "AZ");
+}
+
+#[tokio::test]
+async fn fetch_opensea_contract_nfts_paginates_contract_tokens() {
+    let (base_url, server) = spawn_sequential_json_server(vec![
+        (
+            "/api/v2/chain/ethereum/contract/0xdup/nfts?limit=200".to_string(),
+            serde_json::json!({
+                "nfts": [{
+                    "identifier": "1",
+                    "contract": "0xdup",
+                    "name": "Mirror #1",
+                    "metadata_url": "ipfs://candidate/1",
+                    "image_url": "ipfs://candidate/1.png",
+                    "metadata": {"description": "gold dragon"}
+                }],
+                "next": "cursor"
+            }),
+        ),
+        (
+            "/api/v2/chain/ethereum/contract/0xdup/nfts?limit=200&next=cursor".to_string(),
+            serde_json::json!({
+                "nfts": [{
+                    "identifier": "0x2",
+                    "contract": "0xdup",
+                    "name": "Mirror #2",
+                    "display_image_url": "ipfs://candidate/2.png"
+                }]
+            }),
+        ),
+    ])
+    .await;
+
+    let client = test_client();
+    let rows = fetch_opensea_contract_nfts(&client, &base_url, "ethereum", "0xdup", "opensea")
+        .await
+        .unwrap();
+    server.await.unwrap();
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].contract_address, "0xdup");
+    assert_eq!(rows[0].token_id, "1");
+    assert_eq!(rows[0].metadata_doc, "gold dragon");
+    assert_eq!(rows[1].token_id, "2");
+    assert_eq!(rows[1].image_uri, "ipfs://candidate/2.png");
 }
 
 #[tokio::test]

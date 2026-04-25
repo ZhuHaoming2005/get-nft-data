@@ -134,4 +134,6 @@ pub use alchemy::{
     fetch_license_sample, fetch_same_block_eth_transfers_for_address, fetch_seed_contract_nfts,
     fetch_transaction_receipt, fetch_transaction_receipts_for_block, is_open_license_payload,
 };
-pub use opensea::fetch_contract_sales;
+pub use opensea::{
+    fetch_contract_sales, fetch_opensea_contract_metadata, fetch_opensea_contract_nfts,
+};

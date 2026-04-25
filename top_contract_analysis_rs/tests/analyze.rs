@@ -50,6 +50,7 @@ impl AnalyzeApi for FakeApi {
         chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
+        _opensea_api_key: &str,
         contract_address: &str,
     ) -> Result<ContractMetadata, AppError> {
         Ok(ContractMetadata {
@@ -162,6 +163,7 @@ impl AnalyzeApi for FakeTwoTokenOwnersApi {
         chain: &str,
         alchemy_api_key: &str,
         alchemy_network: Option<&str>,
+        _opensea_api_key: &str,
         contract_address: &str,
     ) -> Result<ContractMetadata, AppError> {
         AnalyzeApi::fetch_contract_metadata(
@@ -169,6 +171,7 @@ impl AnalyzeApi for FakeTwoTokenOwnersApi {
             chain,
             alchemy_api_key,
             alchemy_network,
+            _opensea_api_key,
             contract_address,
         )
         .await
@@ -196,6 +199,7 @@ impl AnalyzeApi for FakeTwoTokenOwnersApi {
         chain: &str,
         alchemy_api_key: &str,
         alchemy_network: Option<&str>,
+        _opensea_api_key: &str,
         contract_address: &str,
     ) -> Result<Vec<SeedNft>, AppError> {
         if contract_address != "0xdup" {
@@ -347,6 +351,175 @@ impl AnalyzeApi for FakeTwoTokenOwnersApi {
 
 struct FakeOpenLicenseApi;
 
+struct FakeEmptyContractNftsApi;
+
+#[async_trait]
+impl AnalyzeApi for FakeEmptyContractNftsApi {
+    async fn fetch_contract_metadata(
+        &self,
+        chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        _opensea_api_key: &str,
+        contract_address: &str,
+    ) -> Result<ContractMetadata, AppError> {
+        AnalyzeApi::fetch_contract_metadata(
+            &FakeTwoTokenOwnersApi,
+            chain,
+            alchemy_api_key,
+            alchemy_network,
+            _opensea_api_key,
+            contract_address,
+        )
+        .await
+    }
+
+    async fn fetch_seed_contract_nfts(
+        &self,
+        chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        contract_address: &str,
+    ) -> Result<Vec<SeedNft>, AppError> {
+        AnalyzeApi::fetch_seed_contract_nfts(
+            &FakeTwoTokenOwnersApi,
+            chain,
+            alchemy_api_key,
+            alchemy_network,
+            contract_address,
+        )
+        .await
+    }
+
+    async fn fetch_contract_nfts(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _opensea_api_key: &str,
+        _contract_address: &str,
+    ) -> Result<Vec<SeedNft>, AppError> {
+        Ok(vec![])
+    }
+
+    async fn fetch_contract_transfers(
+        &self,
+        chain: &str,
+        etherscan_api_key: &str,
+        alchemy_network: Option<&str>,
+        alchemy_api_key: &str,
+        contract_address: &str,
+        token_type: &str,
+    ) -> Result<Vec<TransferRecord>, AppError> {
+        AnalyzeApi::fetch_contract_transfers(
+            &FakeTwoTokenOwnersApi,
+            chain,
+            etherscan_api_key,
+            alchemy_network,
+            alchemy_api_key,
+            contract_address,
+            token_type,
+        )
+        .await
+    }
+
+    async fn fetch_contract_owners(
+        &self,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        contract_address: &str,
+    ) -> Result<Vec<OwnerBalance>, AppError> {
+        AnalyzeApi::fetch_contract_owners(
+            &FakeTwoTokenOwnersApi,
+            alchemy_api_key,
+            alchemy_network,
+            contract_address,
+        )
+        .await
+    }
+
+    async fn fetch_contract_sales(
+        &self,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        contract_address: &str,
+        opensea_api_key: &str,
+    ) -> Result<Vec<NftSaleRecord>, AppError> {
+        AnalyzeApi::fetch_contract_sales(
+            &FakeTwoTokenOwnersApi,
+            alchemy_api_key,
+            alchemy_network,
+            contract_address,
+            opensea_api_key,
+        )
+        .await
+    }
+
+    async fn fetch_transaction_receipt(
+        &self,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        tx_hash: &str,
+    ) -> Result<TransactionReceiptRecord, AppError> {
+        AnalyzeApi::fetch_transaction_receipt(
+            &FakeTwoTokenOwnersApi,
+            alchemy_api_key,
+            alchemy_network,
+            tx_hash,
+        )
+        .await
+    }
+
+    async fn fetch_transaction_receipts_for_block(
+        &self,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        block_number: i64,
+    ) -> Result<BTreeMap<String, TransactionReceiptRecord>, AppError> {
+        AnalyzeApi::fetch_transaction_receipts_for_block(
+            &FakeTwoTokenOwnersApi,
+            alchemy_api_key,
+            alchemy_network,
+            block_number,
+        )
+        .await
+    }
+
+    async fn fetch_eth_balance(
+        &self,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        address: &str,
+        block_number: i64,
+    ) -> Result<f64, AppError> {
+        AnalyzeApi::fetch_eth_balance(
+            &FakeTwoTokenOwnersApi,
+            alchemy_api_key,
+            alchemy_network,
+            address,
+            block_number,
+        )
+        .await
+    }
+
+    async fn fetch_same_block_eth_transfers_for_address(
+        &self,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        block_number: i64,
+        address: &str,
+    ) -> Result<Vec<EthTransferRecord>, AppError> {
+        AnalyzeApi::fetch_same_block_eth_transfers_for_address(
+            &FakeTwoTokenOwnersApi,
+            alchemy_api_key,
+            alchemy_network,
+            block_number,
+            address,
+        )
+        .await
+    }
+}
+
 #[async_trait]
 impl AnalyzeApi for FakeOpenLicenseApi {
     async fn fetch_contract_metadata(
@@ -354,6 +527,7 @@ impl AnalyzeApi for FakeOpenLicenseApi {
         chain: &str,
         alchemy_api_key: &str,
         alchemy_network: Option<&str>,
+        _opensea_api_key: &str,
         contract_address: &str,
     ) -> Result<ContractMetadata, AppError> {
         AnalyzeApi::fetch_contract_metadata(
@@ -361,6 +535,7 @@ impl AnalyzeApi for FakeOpenLicenseApi {
             chain,
             alchemy_api_key,
             alchemy_network,
+            _opensea_api_key,
             contract_address,
         )
         .await
@@ -515,6 +690,7 @@ impl AnalyzeApi for FakeEnrichedApi {
         chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
+        _opensea_api_key: &str,
         contract_address: &str,
     ) -> Result<ContractMetadata, AppError> {
         Ok(ContractMetadata {
@@ -674,6 +850,7 @@ impl AnalyzeApi for FakeLegitApi {
         chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
+        _opensea_api_key: &str,
         contract_address: &str,
     ) -> Result<ContractMetadata, AppError> {
         Ok(ContractMetadata {
@@ -843,6 +1020,7 @@ impl AnalyzeApi for CountingApi {
         chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
+        _opensea_api_key: &str,
         contract_address: &str,
     ) -> Result<ContractMetadata, AppError> {
         Ok(ContractMetadata {
@@ -1016,6 +1194,7 @@ impl AnalyzeApi for FakeSaleMetricApi {
         chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
+        _opensea_api_key: &str,
         contract_address: &str,
     ) -> Result<ContractMetadata, AppError> {
         Ok(ContractMetadata {
@@ -1211,6 +1390,7 @@ impl AnalyzeApi for ConcurrentContractApi {
         chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
+        _opensea_api_key: &str,
         contract_address: &str,
     ) -> Result<ContractMetadata, AppError> {
         Ok(ContractMetadata {
@@ -1373,6 +1553,7 @@ impl AnalyzeApi for ConcurrentSingleContractFetchApi {
         chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
+        _opensea_api_key: &str,
         contract_address: &str,
     ) -> Result<ContractMetadata, AppError> {
         Ok(ContractMetadata {
@@ -1516,6 +1697,7 @@ impl AnalyzeApi for ConcurrentSaleMetricApi {
         chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
+        _opensea_api_key: &str,
         contract_address: &str,
     ) -> Result<ContractMetadata, AppError> {
         Ok(ContractMetadata {
@@ -1845,7 +2027,6 @@ fn single_report_payload_serializes_current_python_top_level_shape() {
         BTreeSet::from([
             "seed_contract",
             "seed_collection_stats",
-            "duplicate_candidates",
             "legit_duplicates",
             "duplicate_contracts",
             "contract_level_summary",
@@ -1861,10 +2042,7 @@ fn single_report_payload_serializes_current_python_top_level_shape() {
         ])
     );
     assert!(!object.contains_key("output_files"));
-    assert_eq!(
-        serialized["duplicate_candidates"][0]["contract_address"],
-        "0xdup"
-    );
+    assert!(!object.contains_key("duplicate_candidates"));
     assert_eq!(
         serialized["contract_level_summary"]["0xdup"]["candidate_count"],
         1
@@ -2443,6 +2621,59 @@ async fn analyze_expands_matched_contracts_to_all_tokens_for_report_analysis() {
             .collect::<BTreeSet<_>>(),
         BTreeSet::from(["0xholder1", "0xholder2"])
     );
+}
+
+#[tokio::test]
+async fn analyze_falls_back_to_local_snapshot_when_provider_expansion_is_empty() {
+    let deps = AnalysisDeps {
+        api: Arc::new(FakeEmptyContractNftsApi),
+        feature_store: Box::new(FakeFeatureStore {
+            snapshot: DatabaseSnapshot {
+                nft_rows: vec![
+                    DatabaseNftRecord {
+                        contract_address: "0xdup".into(),
+                        token_id: "1".into(),
+                        token_uri: "ipfs://seed/1".into(),
+                        image_uri: "ipfs://image/1.png".into(),
+                        name: "Azuki Mirror #1".into(),
+                        metadata_json: r#"{"description":"gold dragon"}"#.into(),
+                        metadata_doc: "gold dragon".into(),
+                        ..DatabaseNftRecord::default()
+                    },
+                    DatabaseNftRecord {
+                        contract_address: "0xdup".into(),
+                        token_id: "2".into(),
+                        token_uri: "ipfs://candidate/2".into(),
+                        image_uri: "ipfs://candidate/2.png".into(),
+                        name: "Azuki Mirror #2".into(),
+                        metadata_json: r#"{"description":"different trait"}"#.into(),
+                        metadata_doc: "different trait".into(),
+                        ..DatabaseNftRecord::default()
+                    },
+                ],
+                ..DatabaseSnapshot::default()
+            },
+        }),
+        signal_cache: None,
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    let payload = analyze_seed_contract(
+        AnalyzeRequest {
+            chain: "ethereum".into(),
+            seed_contract_address: "0xseed".into(),
+            alchemy_api_key: "key".into(),
+            ..AnalyzeRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(payload.duplicate_contracts[0].candidate_count, 2);
+    assert_eq!(payload.contract_level_summary["0xdup"].candidate_count, 2);
+    assert_eq!(payload.report_summary.infringing_nft_count, 2);
 }
 
 #[tokio::test]

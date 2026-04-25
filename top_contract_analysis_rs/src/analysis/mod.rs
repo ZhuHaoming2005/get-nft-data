@@ -7,7 +7,8 @@ use futures::stream::{self, StreamExt};
 
 use crate::api::{
     fetch_contract_metadata, fetch_contract_owners, fetch_contract_sales, fetch_contract_transfers,
-    fetch_eth_balance, fetch_license_sample, fetch_same_block_eth_transfers_for_address,
+    fetch_eth_balance, fetch_license_sample, fetch_opensea_contract_metadata,
+    fetch_opensea_contract_nfts, fetch_same_block_eth_transfers_for_address,
     fetch_seed_contract_nfts, fetch_transaction_receipt, fetch_transaction_receipts_for_block,
     is_open_license_payload, ApiEndpoints, AsyncApiClient,
 };
@@ -81,6 +82,7 @@ pub trait AnalyzeApi: Send + Sync {
         chain: &str,
         alchemy_api_key: &str,
         alchemy_network: Option<&str>,
+        opensea_api_key: &str,
         contract_address: &str,
     ) -> Result<ContractMetadata, AppError>;
 
@@ -97,8 +99,10 @@ pub trait AnalyzeApi: Send + Sync {
         chain: &str,
         alchemy_api_key: &str,
         alchemy_network: Option<&str>,
+        opensea_api_key: &str,
         contract_address: &str,
     ) -> Result<Vec<SeedNft>, AppError> {
+        let _ = opensea_api_key;
         self.fetch_seed_contract_nfts(chain, alchemy_api_key, alchemy_network, contract_address)
             .await
     }
@@ -307,9 +311,28 @@ impl AnalyzeApi for RealApi {
         chain: &str,
         alchemy_api_key: &str,
         alchemy_network: Option<&str>,
+        opensea_api_key: &str,
         contract_address: &str,
     ) -> Result<ContractMetadata, AppError> {
         let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
+        if !opensea_api_key.trim().is_empty() {
+            match fetch_opensea_contract_metadata(
+                &self.client,
+                &endpoints.opensea_base,
+                chain,
+                contract_address,
+                opensea_api_key,
+            )
+            .await
+            {
+                Ok(metadata) => return Ok(metadata),
+                Err(err) => {
+                    eprintln!(
+                        "warning: OpenSea contract metadata failed for {contract_address}: {err}; falling back to Alchemy"
+                    );
+                }
+            }
+        }
         fetch_contract_metadata(&self.client, &endpoints, chain, contract_address).await
     }
 
@@ -322,6 +345,51 @@ impl AnalyzeApi for RealApi {
     ) -> Result<Vec<SeedNft>, AppError> {
         let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
         fetch_seed_contract_nfts(&self.client, &endpoints, chain, contract_address).await
+    }
+
+    async fn fetch_contract_nfts(
+        &self,
+        chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        opensea_api_key: &str,
+        contract_address: &str,
+    ) -> Result<Vec<SeedNft>, AppError> {
+        let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
+        let alchemy_result =
+            fetch_seed_contract_nfts(&self.client, &endpoints, chain, contract_address).await;
+        match alchemy_result {
+            Ok(rows) if !rows.is_empty() => Ok(rows),
+            Ok(_) if opensea_api_key.trim().is_empty() => Ok(Vec::new()),
+            Ok(_) => {
+                fetch_opensea_contract_nfts(
+                    &self.client,
+                    &endpoints.opensea_base,
+                    chain,
+                    contract_address,
+                    opensea_api_key,
+                )
+                .await
+            }
+            Err(alchemy_err) if opensea_api_key.trim().is_empty() => Err(alchemy_err),
+            Err(alchemy_err) => match fetch_opensea_contract_nfts(
+                &self.client,
+                &endpoints.opensea_base,
+                chain,
+                contract_address,
+                opensea_api_key,
+            )
+            .await
+            {
+                Ok(rows) if !rows.is_empty() => Ok(rows),
+                Ok(_) => Err(AppError::Http(format!(
+                    "Alchemy NFT expansion failed ({alchemy_err}); OpenSea returned no NFTs for {contract_address}"
+                ))),
+                Err(opensea_err) => Err(AppError::Http(format!(
+                    "Alchemy NFT expansion failed ({alchemy_err}); OpenSea NFT expansion failed ({opensea_err})"
+                ))),
+            },
+        }
     }
 
     async fn fetch_license_sample(
@@ -481,6 +549,7 @@ pub async fn analyze_seed_contract_with_progress(
             &request.chain,
             &request.alchemy_api_key,
             request.alchemy_network.as_deref(),
+            &request.opensea_api_key,
             &request.seed_contract_address,
         )
         .await?;
@@ -530,6 +599,7 @@ pub async fn analyze_seed_contract_with_progress(
             &request,
             deps,
             &contracts_to_analyze,
+            &snapshot.nft_rows,
             contract_concurrency,
         )
         .await?;
@@ -1333,6 +1403,7 @@ async fn fetch_contract_nfts_for_matched_contracts(
     request: &AnalyzeRequest,
     deps: &AnalysisDeps,
     contract_addresses: &[String],
+    snapshot_rows: &[crate::models::DatabaseNftRecord],
     concurrency: usize,
 ) -> Result<Vec<SeedNft>, AppError> {
     let mut rows = Vec::new();
@@ -1340,24 +1411,78 @@ async fn fetch_contract_nfts_for_matched_contracts(
         contract_addresses
             .iter()
             .map(|contract_address| async move {
-                let tokens = deps
+                let provider_tokens = deps
                     .api
                     .fetch_contract_nfts(
                         &request.chain,
                         &request.alchemy_api_key,
                         request.alchemy_network.as_deref(),
+                        &request.opensea_api_key,
                         contract_address,
                     )
-                    .await?;
-                Ok::<_, AppError>(tokens)
+                    .await;
+                (contract_address.clone(), provider_tokens)
             }),
     )
     .buffer_unordered(concurrency.max(1));
 
-    while let Some(tokens) = fetches.next().await {
-        rows.extend(tokens?);
+    while let Some((contract_address, provider_tokens)) = fetches.next().await {
+        match provider_tokens {
+            Ok(tokens) => {
+                let contract_key = contract_address.to_lowercase();
+                let matching_tokens: Vec<SeedNft> = tokens
+                    .into_iter()
+                    .filter(|row| row.contract_address.to_lowercase() == contract_key)
+                    .collect();
+                if matching_tokens.is_empty() {
+                    eprintln!(
+                        "warning: provider NFT expansion returned no tokens for {contract_address}; falling back to local snapshot rows"
+                    );
+                    rows.extend(local_snapshot_tokens_for_contract(
+                        &request.chain,
+                        &contract_address,
+                        snapshot_rows,
+                    ));
+                } else {
+                    rows.extend(matching_tokens);
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: provider NFT expansion failed for {contract_address}: {err}; falling back to local snapshot rows"
+                );
+                rows.extend(local_snapshot_tokens_for_contract(
+                    &request.chain,
+                    &contract_address,
+                    snapshot_rows,
+                ));
+            }
+        }
     }
     Ok(rows)
+}
+
+fn local_snapshot_tokens_for_contract(
+    chain: &str,
+    contract_address: &str,
+    snapshot_rows: &[crate::models::DatabaseNftRecord],
+) -> Vec<SeedNft> {
+    let contract_key = contract_address.to_lowercase();
+    snapshot_rows
+        .iter()
+        .filter(|row| row.contract_address.to_lowercase() == contract_key)
+        .map(|row| SeedNft {
+            chain: chain.to_string(),
+            contract_address: row.contract_address.clone(),
+            token_id: row.token_id.clone(),
+            name: row.name.clone(),
+            symbol: row.symbol.clone(),
+            token_uri: row.token_uri.clone(),
+            image_uri: row.image_uri.clone(),
+            metadata_json: row.metadata_json.clone(),
+            metadata_doc: row.metadata_doc.clone(),
+        })
+        .collect()
 }
 
 fn expand_candidates_to_contract_tokens(
@@ -1408,12 +1533,6 @@ fn expand_candidates_to_contract_tokens(
                 })
                 .collect();
 
-            if expanded.is_empty() {
-                expanded = candidate_indexes
-                    .iter()
-                    .filter_map(|index| candidates.get(*index).cloned())
-                    .collect();
-            }
             expanded.sort_by(|left, right| left.token_id.cmp(&right.token_id));
             (contract_address.clone(), expanded)
         })
