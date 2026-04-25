@@ -130,7 +130,7 @@ cargo run --release -- batch \
   --api-max-concurrency 24 \
   --contract-max-concurrency 12 \
   --sale-metric-max-concurrency 10 \
-  --duckdb-memory-limit 80GB
+  --duckdb-memory-limit 50GB
 ```
 
 批量输出包括：
