@@ -12,7 +12,7 @@ Rust + DuckDB 一体分析脚本，读取 `top_contract_analysis_rs export-snaps
   - `v3`: 任一 URI 命中
   - 单链内支持严格串、规范化串，以及 EVM 旧口径中的任意重复 / 跨合约重复。
   - 跨链统计只判断 URI 是否出现在其它链。
-- DuckDB 使用磁盘数据库，不支持 `:memory:`；准备阶段会先生成临时工作投影，尽量用 `--memory-limit` 内的缓存和临时空间减少 Parquet 重复扫描。
+- DuckDB 使用磁盘数据库，不支持 `:memory:`；准备阶段会先生成临时工作投影，尽量用 `--memory-limit` 内的缓存和临时空间减少 Parquet 重复扫描，URI key 会按字段分批聚合以压低单次 hash 聚合峰值。
 
 运行示例：
 
@@ -36,6 +36,7 @@ cargo run --release -- \
 - `--database` 放到空间充足的 SSD。
 - `--temp-directory` 指向空间充足的本地磁盘。
 - `--memory-limit` 按总预算处理；DuckDB 准备阶段可使用该总预算加速临时表构建，进入 Rust name 分析前会按已加载数据、threshold state、`chain_matrix` 复用状态估算和运行时 RSS 重新平衡 DuckDB/Rust 分配。
+- 每个 DuckDB 重 SQL 执行前都会按当前进程 RSS 重新收紧 DuckDB `memory_limit`，避免 DuckDB 自身缓存、临时表和 Rust 常驻数据叠加后超过总预算。
 - 通常不需要传 `--analysis-memory-limit`；如需手动指定 Rust name 分析预算，可传 `--analysis-memory-limit 16GB`，该值仍包含在 `--memory-limit` 总预算内。传 `auto` 等同默认自动平衡。
 - CLI 默认显示进度条；批处理、日志重定向或作为库嵌入时可用 `--no-progress` 关闭。
 - 程序会按总预算、当前 RSS 和每个 threshold state 的实际估算自动把 name 阈值分批：headroom 足够时一次 Jaro-Winkler 打分服务多个阈值；headroom 不足时自动退回小批/单阈值。

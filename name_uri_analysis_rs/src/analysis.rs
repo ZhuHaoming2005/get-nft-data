@@ -494,11 +494,9 @@ fn configure_duckdb(conn: &Connection, options: &AnalysisOptions) -> Result<(), 
         ",
     )?;
     conn.execute(&format!("PRAGMA threads={}", options.threads.max(1)), [])?;
-    let duckdb_memory_limit = initial_duckdb_memory_limit(&options.memory_limit)?;
-    conn.execute(
-        &format!("PRAGMA memory_limit='{}'", sql_string(&duckdb_memory_limit)),
-        [],
-    )?;
+    let total_budget = total_memory_budget_bytes(&options.memory_limit)?;
+    let mut memory_guard = MemoryGuard::new(total_budget);
+    set_duckdb_memory_limit_for_process_budget(conn, &mut memory_guard, total_budget)?;
     if let Some(temp_directory) = &options.temp_directory {
         fs::create_dir_all(temp_directory)?;
         conn.execute(
@@ -518,8 +516,10 @@ fn prepare_base_tables(
     progress: &ProgressTracker,
 ) -> Result<Vec<String>, AnalysisError> {
     let inputs = parquet_input_sql(&options.parquet_inputs);
+    let total_budget = total_memory_budget_bytes(&options.memory_limit)?;
+    let mut memory_guard = MemoryGuard::new(total_budget);
     progress.start_phase("preparing DuckDB tables", 10);
-    execute_progress_batch(
+    execute_duckdb_progress_batch(
         conn,
         "
         DROP TABLE IF EXISTS analysis_rows;
@@ -533,8 +533,10 @@ fn prepare_base_tables(
         ",
         progress,
         "dropped stale DuckDB tables",
+        &mut memory_guard,
+        total_budget,
     )?;
-    execute_progress_batch(
+    execute_duckdb_progress_batch(
         conn,
         &format!(
             "
@@ -556,21 +558,25 @@ fn prepare_base_tables(
         ),
         progress,
         "materialized DuckDB working projection",
+        &mut memory_guard,
+        total_budget,
     )?;
-    execute_progress_batch(
+    execute_duckdb_progress_batch(
         conn,
         "
             CREATE TEMP TABLE selected_chains AS
             SELECT DISTINCT lower(trim(CAST(chain AS VARCHAR))) AS chain
             FROM analysis_rows
             WHERE chain <> '';
-            ",
+        ",
         progress,
         "loaded selected chains",
+        &mut memory_guard,
+        total_budget,
     )?;
-    build_uri_key_stats(conn, progress)?;
-    build_uri_contract_flags(conn, progress)?;
-    execute_progress_batch(
+    build_uri_key_stats(conn, progress, &mut memory_guard, total_budget)?;
+    build_uri_contract_flags(conn, progress, &mut memory_guard, total_budget)?;
+    execute_duckdb_progress_batch(
         conn,
         "
             CREATE TEMP TABLE contract_names AS
@@ -594,11 +600,13 @@ fn prepare_base_tables(
             FROM ranked
             WHERE rn = 1
               AND name_norm <> '';
-            ",
+        ",
         progress,
         "materialized contract names",
+        &mut memory_guard,
+        total_budget,
     )?;
-    execute_progress_batch(
+    execute_duckdb_progress_batch(
         conn,
         "
             CREATE TEMP TABLE name_atoms AS
@@ -617,6 +625,8 @@ fn prepare_base_tables(
         ",
         progress,
         "built name atoms",
+        &mut memory_guard,
+        total_budget,
     )?;
     let chains = load_selected_chains(conn)?;
     progress.finish_phase("DuckDB tables ready");
@@ -635,33 +645,58 @@ fn execute_progress_batch(
     Ok(())
 }
 
-fn build_uri_key_stats(conn: &Connection, progress: &ProgressTracker) -> Result<(), AnalysisError> {
-    execute_progress_batch(
+fn execute_duckdb_progress_batch(
+    conn: &Connection,
+    sql: &str,
+    progress: &ProgressTracker,
+    message: &str,
+    memory_guard: &mut MemoryGuard,
+    desired_duckdb_bytes: usize,
+) -> Result<(), AnalysisError> {
+    set_duckdb_memory_limit_for_process_budget(conn, memory_guard, desired_duckdb_bytes)?;
+    execute_progress_batch(conn, sql, progress, message)
+}
+
+fn build_uri_key_stats(
+    conn: &Connection,
+    progress: &ProgressTracker,
+    memory_guard: &mut MemoryGuard,
+    desired_duckdb_bytes: usize,
+) -> Result<(), AnalysisError> {
+    execute_duckdb_progress_batch(
         conn,
         "
-            CREATE TEMP TABLE uri_key_contracts AS
-            SELECT chain,
-                   key_kind,
-                   key_value,
-                   contract_address,
-                   count(*)::BIGINT AS nft_count
-            FROM analysis_rows
-            CROSS JOIN LATERAL (
-                VALUES
-                    ('strict_token', token_uri),
-                    ('strict_image', image_uri),
-                    ('norm_token', token_uri_norm),
-                    ('norm_image', image_uri_norm)
-            ) AS keys(key_kind, key_value)
-            WHERE contract_address <> ''
-              AND key_value <> ''
-            GROUP BY chain, key_kind, key_value, contract_address;
+            CREATE TEMP TABLE uri_key_contracts (
+                chain VARCHAR,
+                key_kind VARCHAR,
+                key_value VARCHAR,
+                contract_address VARCHAR,
+                nft_count BIGINT
+            );
         ",
         progress,
-        "built URI key contracts",
+        "created URI key contract table",
+        memory_guard,
+        desired_duckdb_bytes,
     )?;
 
-    execute_progress_batch(
+    for (key_kind, column_name) in [
+        ("strict_token", "token_uri"),
+        ("strict_image", "image_uri"),
+        ("norm_token", "token_uri_norm"),
+        ("norm_image", "image_uri_norm"),
+    ] {
+        insert_uri_key_contracts(
+            conn,
+            progress,
+            memory_guard,
+            desired_duckdb_bytes,
+            key_kind,
+            column_name,
+        )?;
+    }
+
+    execute_duckdb_progress_batch(
         conn,
         "
             CREATE TEMP TABLE uri_key_stats AS
@@ -675,8 +710,10 @@ fn build_uri_key_stats(conn: &Connection, progress: &ProgressTracker) -> Result<
         ",
         progress,
         "built URI key stats",
+        memory_guard,
+        desired_duckdb_bytes,
     )?;
-    execute_progress_batch(
+    execute_duckdb_progress_batch(
         conn,
         "
             CREATE TEMP TABLE uri_key_chain_counts AS
@@ -688,15 +725,50 @@ fn build_uri_key_stats(conn: &Connection, progress: &ProgressTracker) -> Result<
         ",
         progress,
         "built URI cross-chain key stats",
+        memory_guard,
+        desired_duckdb_bytes,
     )?;
     Ok(())
+}
+
+fn insert_uri_key_contracts(
+    conn: &Connection,
+    progress: &ProgressTracker,
+    memory_guard: &mut MemoryGuard,
+    desired_duckdb_bytes: usize,
+    key_kind: &str,
+    column_name: &str,
+) -> Result<(), AnalysisError> {
+    execute_duckdb_progress_batch(
+        conn,
+        &format!(
+            "
+            INSERT INTO uri_key_contracts
+            SELECT chain,
+                   '{key_kind}' AS key_kind,
+                   {column_name} AS key_value,
+                   contract_address,
+                   count(*)::BIGINT AS nft_count
+            FROM analysis_rows
+            WHERE contract_address <> ''
+              AND {column_name} <> ''
+            GROUP BY chain, {column_name}, contract_address;
+            "
+        ),
+        progress,
+        &format!("built URI key contracts {key_kind}"),
+        memory_guard,
+        desired_duckdb_bytes,
+    )
 }
 
 fn build_uri_contract_flags(
     conn: &Connection,
     progress: &ProgressTracker,
+    memory_guard: &mut MemoryGuard,
+    desired_duckdb_bytes: usize,
 ) -> Result<(), AnalysisError> {
-    execute_progress_batch(
+    execute_duckdb_progress_batch(
         conn,
         &format!(
             "
@@ -773,6 +845,8 @@ fn build_uri_contract_flags(
         ),
         progress,
         "built compact URI contract flags",
+        memory_guard,
+        desired_duckdb_bytes,
     )
 }
 
@@ -1407,16 +1481,6 @@ fn name_atoms_memory_bytes(atoms: &[NameAtom]) -> usize {
     struct_bytes.saturating_add(string_bytes)
 }
 
-fn initial_duckdb_memory_limit(memory_limit: &str) -> Result<String, AnalysisError> {
-    Ok(format_byte_size(initial_duckdb_memory_bytes(
-        total_memory_budget_bytes(memory_limit)?,
-    )))
-}
-
-fn initial_duckdb_memory_bytes(total_budget: usize) -> usize {
-    total_budget
-}
-
 fn set_duckdb_memory_limit(conn: &Connection, bytes: usize) -> Result<(), AnalysisError> {
     if bytes == 0 {
         return Ok(());
@@ -1429,6 +1493,35 @@ fn set_duckdb_memory_limit(conn: &Connection, bytes: usize) -> Result<(), Analys
         [],
     )?;
     Ok(())
+}
+
+fn set_duckdb_memory_limit_for_process_budget(
+    conn: &Connection,
+    memory_guard: &mut MemoryGuard,
+    desired_duckdb_bytes: usize,
+) -> Result<(), AnalysisError> {
+    let current_rss = memory_guard.current_rss_bytes().unwrap_or(0);
+    let bytes = duckdb_memory_limit_from_process_budget(
+        memory_guard.total_budget,
+        current_rss,
+        desired_duckdb_bytes,
+    )?;
+    set_duckdb_memory_limit(conn, bytes)
+}
+
+fn duckdb_memory_limit_from_process_budget(
+    total_budget: usize,
+    current_rss: usize,
+    desired_duckdb_bytes: usize,
+) -> Result<usize, AnalysisError> {
+    if total_budget <= current_rss {
+        return Err(AnalysisError::InvalidData(format!(
+            "process RSS {} already reached --memory-limit {}; cannot safely start another DuckDB batch",
+            format_byte_size(current_rss),
+            format_byte_size(total_budget)
+        )));
+    }
+    Ok(desired_duckdb_bytes.min(total_budget - current_rss))
 }
 
 fn name_analysis_memory_plan(
@@ -2322,6 +2415,20 @@ mod tests {
         let batch_size = adaptive_threshold_batch_size(5, 5, 2_000, 10_000, 6_000);
 
         assert_eq!(batch_size, 2);
+    }
+
+    #[test]
+    fn duckdb_limit_is_capped_by_process_headroom() {
+        let limit = duckdb_memory_limit_from_process_budget(10_000, 4_000, 9_000).unwrap();
+
+        assert_eq!(limit, 6_000);
+    }
+
+    #[test]
+    fn duckdb_limit_rejects_exhausted_process_budget() {
+        let error = duckdb_memory_limit_from_process_budget(10_000, 10_000, 9_000).unwrap_err();
+
+        assert!(error.to_string().contains("process RSS"));
     }
 
     #[test]
