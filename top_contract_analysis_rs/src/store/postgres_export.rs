@@ -5,6 +5,8 @@ use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use once_cell::sync::Lazy;
 use parquet::arrow::ArrowWriter;
+use parquet::basic::Compression;
+use parquet::file::properties::WriterProperties;
 use postgres::fallible_iterator::FallibleIterator;
 use postgres::types::ToSql;
 use postgres::Client;
@@ -162,7 +164,10 @@ fn open_snapshot_writer(
         std::fs::create_dir_all(parent)?;
     }
     let file = std::fs::File::create(output_path)?;
-    ArrowWriter::try_new(file, snapshot_schema(keep_metadata_json), None)
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(Default::default()))
+        .build();
+    ArrowWriter::try_new(file, snapshot_schema(keep_metadata_json), Some(props))
         .map_err(|err| AppError::InvalidData(err.to_string()))
 }
 

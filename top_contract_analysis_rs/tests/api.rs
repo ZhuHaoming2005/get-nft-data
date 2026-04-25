@@ -202,6 +202,46 @@ async fn fetch_seed_contract_nfts_paginates_until_page_key_is_empty() {
 }
 
 #[tokio::test]
+async fn fetch_seed_contract_nfts_reads_current_v3_top_level_token_id() {
+    let (base_url, server) = spawn_sequential_json_server(vec![(
+        "/nft/v3/key/getNFTsForContract?contractAddress=0xseed&withMetadata=true".to_string(),
+        serde_json::json!({
+            "nfts": [
+                {
+                    "contract": {"address": "0xseed"},
+                    "tokenId": "44",
+                    "name": "Azuki #44",
+                    "contractMetadata": {"symbol": "AZUKI"},
+                    "raw": {"tokenUri": "ipfs://seed/44"},
+                    "image": {"originalUrl": "ipfs://image/44.png"}
+                },
+                {
+                    "contract": {"address": "0xseed"},
+                    "tokenId": "0x2d",
+                    "name": "Azuki #45",
+                    "contractMetadata": {"symbol": "AZUKI"},
+                    "tokenUri": "ipfs://seed/45",
+                    "image": {"originalUrl": "ipfs://image/45.png"}
+                }
+            ]
+        }),
+    )])
+    .await;
+
+    let client = test_client();
+    let endpoints = test_endpoints(&base_url);
+    let rows = fetch_seed_contract_nfts(&client, &endpoints, "ethereum", "0xseed")
+        .await
+        .unwrap();
+    server.await.unwrap();
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].token_id, "44");
+    assert_eq!(rows[0].token_uri, "ipfs://seed/44");
+    assert_eq!(rows[1].token_id, "45");
+}
+
+#[tokio::test]
 async fn fetch_seed_contract_nfts_errors_when_page_key_repeats() {
     let (base_url, server) = spawn_sequential_json_server(vec![
         (

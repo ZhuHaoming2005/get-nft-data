@@ -128,6 +128,11 @@ pub async fn fetch_seed_contract_nfts(
                         .or(Some(value))
                 })
                 .and_then(Value::as_str)
+                .or_else(|| {
+                    raw.get("raw")
+                        .and_then(|value| value.get("tokenUri"))
+                        .and_then(Value::as_str)
+                })
                 .unwrap_or("")
                 .to_string();
             let image_uri = raw
@@ -152,7 +157,10 @@ pub async fn fetch_seed_contract_nfts(
                     .and_then(Value::as_str)
                     .unwrap_or(contract_address)
                     .to_lowercase(),
-                token_id: normalize_token_id(raw.get("id").and_then(|value| value.get("tokenId"))),
+                token_id: normalize_token_id(
+                    raw.get("tokenId")
+                        .or_else(|| raw.get("id").and_then(|value| value.get("tokenId"))),
+                ),
                 name: raw
                     .get("title")
                     .or_else(|| raw.get("name"))

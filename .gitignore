@@ -18,3 +18,5 @@ output
 *tmp*
 *.db
 */examples
+top_contract_analysis
+rust_ext
