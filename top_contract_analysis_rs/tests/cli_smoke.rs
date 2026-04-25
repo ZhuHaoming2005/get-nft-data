@@ -62,6 +62,7 @@ fn export_snapshot_subcommand_is_exposed() {
         .stderr(
             contains("NotImplemented")
                 .not()
-                .and(contains("required arguments were not provided").not()),
+                .and(contains("required arguments were not provided").not())
+                .and(contains("Cannot start a runtime").not()),
         );
 }

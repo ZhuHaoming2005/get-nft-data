@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use postgres::{Client, NoTls};
+use tokio::runtime::Runtime;
 use top_contract_analysis_rs::analysis::{
     analyze_seed_contract, read_seed_addresses, run_batch, AnalysisDeps, AnalyzeRequest,
     BatchRequest, RealApi,
@@ -23,11 +24,10 @@ fn connect_postgres_from_constants() -> Result<Client, AppError> {
     Client::connect(&config, NoTls).map_err(AppError::from)
 }
 
-#[tokio::main]
-async fn main() -> Result<(), AppError> {
+fn main() -> Result<(), AppError> {
     let command = TopContractAnalysisCli::parse();
     match command.command {
-        Command::Analyze(args) => {
+        Command::Analyze(args) => Runtime::new()?.block_on(async move {
             let feature_store = DuckDbFeatureStore::new(&args.feature_db)?;
             if !args.feature_parquet.trim().is_empty() {
                 feature_store
@@ -72,8 +72,8 @@ async fn main() -> Result<(), AppError> {
             .await?;
             write_default_outputs(&payload, &args.output)?;
             Ok(())
-        }
-        Command::Batch(args) => {
+        }),
+        Command::Batch(args) => Runtime::new()?.block_on(async move {
             let seed_addresses = read_seed_addresses(std::path::Path::new(&args.seed_file))?;
             let feature_store = DuckDbFeatureStore::new(&args.feature_db)?;
             if !args.feature_parquet.trim().is_empty() {
@@ -115,7 +115,7 @@ async fn main() -> Result<(), AppError> {
             .await?;
             write_batch_summary_outputs(&payload, &output_dir)?;
             Ok(())
-        }
+        }),
         Command::ExportSnapshot(args) => {
             let mut conn = connect_postgres_from_constants()?;
             export_chain_snapshot_to_parquet(

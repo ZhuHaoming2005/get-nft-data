@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::analysis::scoring::{
-    metadata_bm25_tokens, metadata_document_from_json, score_metadata_document_pair_with_corpus,
-    score_name_pair, MetadataBm25Corpus,
+    metadata_document_from_json, score_metadata_indexed_pair_with_corpus, score_name_pair,
+    MetadataBm25Corpus, MetadataBm25Document,
 };
 use crate::models::{DatabaseNftRecord, DuplicateCandidate, SeedNft};
 use crate::normalize::{normalize_name, normalize_symbol, normalize_text, normalize_url};
@@ -26,20 +26,29 @@ fn record_metadata_doc(metadata_doc: &str, metadata_json: &str) -> String {
 
 struct MetadataBm25Index {
     corpus: MetadataBm25Corpus,
-    candidate_docs_by_key: HashMap<(String, String), String>,
+    docs: Vec<MetadataBm25Document>,
+    candidate_doc_index_by_key: HashMap<(String, String), usize>,
+}
+
+impl MetadataBm25Index {
+    fn candidate_doc(&self, key: &(String, String)) -> Option<&MetadataBm25Document> {
+        self.candidate_doc_index_by_key
+            .get(key)
+            .and_then(|index| self.docs.get(*index))
+    }
 }
 
 fn build_metadata_bm25_index(
-    seed_metadata_docs: &[String],
+    seed_metadata_docs: &[MetadataBm25Document],
     snapshot_rows: &[DatabaseNftRecord],
     seed_contracts: &HashSet<String>,
 ) -> MetadataBm25Index {
     let query_tokens: HashSet<String> = seed_metadata_docs
         .iter()
-        .flat_map(|doc| metadata_bm25_tokens(doc))
+        .flat_map(|doc| doc.tokens().iter().cloned())
         .collect();
-    let mut corpus_docs = Vec::new();
-    let mut candidate_docs_by_key = HashMap::new();
+    let mut docs = Vec::new();
+    let mut candidate_doc_index_by_key = HashMap::new();
 
     for row in snapshot_rows {
         if seed_contracts.contains(&row.contract_address.to_lowercase()) {
@@ -51,20 +60,29 @@ fn build_metadata_bm25_index(
             continue;
         }
 
-        let tokens = metadata_bm25_tokens(&doc);
-        if tokens.is_empty() {
+        let Some(indexed_doc) = MetadataBm25Document::from_text(&doc) else {
             continue;
-        }
+        };
 
-        corpus_docs.push(doc.clone());
-        if !query_tokens.is_empty() && tokens.iter().any(|token| query_tokens.contains(token)) {
-            candidate_docs_by_key.insert((row.contract_address.clone(), row.token_id.clone()), doc);
+        let doc_index = docs.len();
+        if !query_tokens.is_empty()
+            && indexed_doc
+                .tokens()
+                .iter()
+                .any(|token| query_tokens.contains(token))
+        {
+            candidate_doc_index_by_key.insert(
+                (row.contract_address.clone(), row.token_id.clone()),
+                doc_index,
+            );
         }
+        docs.push(indexed_doc);
     }
 
     MetadataBm25Index {
-        corpus: MetadataBm25Corpus::from_documents(&corpus_docs),
-        candidate_docs_by_key,
+        corpus: MetadataBm25Corpus::from_indexed_documents(&docs),
+        docs,
+        candidate_doc_index_by_key,
     }
 }
 
@@ -98,15 +116,11 @@ pub fn build_duplicate_candidates(
         .filter(|name| !name.is_empty())
         .collect();
 
-    let seed_metadata_docs: Vec<String> = seed_nfts
+    let seed_metadata_docs: Vec<MetadataBm25Document> = seed_nfts
         .iter()
         .filter_map(|item| {
             let seed_doc = record_metadata_doc(&item.metadata_doc, &item.metadata_json);
-            if seed_doc.is_empty() {
-                None
-            } else {
-                Some(seed_doc)
-            }
+            MetadataBm25Document::from_text(&seed_doc)
         })
         .collect();
 
@@ -146,9 +160,9 @@ pub fn build_duplicate_candidates(
             reasons.push("name_match".to_string());
         }
         let metadata_key = (row.contract_address.clone(), row.token_id.clone());
-        if let Some(row_doc) = metadata_index.candidate_docs_by_key.get(&metadata_key) {
+        if let Some(row_doc) = metadata_index.candidate_doc(&metadata_key) {
             if seed_metadata_docs.iter().any(|seed_doc| {
-                score_metadata_document_pair_with_corpus(seed_doc, row_doc, &metadata_index.corpus)
+                score_metadata_indexed_pair_with_corpus(seed_doc, row_doc, &metadata_index.corpus)
                     >= metadata_threshold
             }) {
                 reasons.push("metadata_match".to_string());
@@ -198,7 +212,7 @@ mod tests {
 
     #[test]
     fn metadata_bm25_index_keeps_only_query_token_candidates() {
-        let seed_docs = vec!["gold ai dragon".to_string()];
+        let seed_docs = vec![MetadataBm25Document::from_text("gold ai dragon").unwrap()];
         let seed_contracts = HashSet::from(["0xseed".to_string()]);
         let snapshot_rows = vec![
             DatabaseNftRecord {
@@ -230,16 +244,14 @@ mod tests {
         let index = build_metadata_bm25_index(&seed_docs, &snapshot_rows, &seed_contracts);
 
         assert!(index
-            .candidate_docs_by_key
-            .contains_key(&("0xgold".into(), "1".into())));
+            .candidate_doc(&("0xgold".into(), "1".into()))
+            .is_some());
+        assert!(index.candidate_doc(&("0xai".into(), "1".into())).is_some());
         assert!(index
-            .candidate_docs_by_key
-            .contains_key(&("0xai".into(), "1".into())));
-        assert!(!index
-            .candidate_docs_by_key
-            .contains_key(&("0xseed".into(), "1".into())));
-        assert!(!index
-            .candidate_docs_by_key
-            .contains_key(&("0xmiss".into(), "1".into())));
+            .candidate_doc(&("0xseed".into(), "1".into()))
+            .is_none());
+        assert!(index
+            .candidate_doc(&("0xmiss".into(), "1".into()))
+            .is_none());
     }
 }

@@ -29,7 +29,7 @@ pub struct AnalyzeArgs {
     pub opensea_api_key: String,
     #[arg(long, default_value_t = 95.0)]
     pub name_threshold: f64,
-    #[arg(long, default_value_t = 0.55)]
+    #[arg(long, default_value_t = 0.6)]
     pub metadata_threshold: f64,
     #[arg(long, default_value_t = 60)]
     pub timeout: u64,
@@ -37,7 +37,7 @@ pub struct AnalyzeArgs {
     pub max_tokens_per_contract: usize,
     #[arg(long, default_value_t = 0)]
     pub max_recall_rows: usize,
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 12)]
     pub api_max_concurrency: usize,
     #[arg(long, default_value_t = 4)]
     pub contract_max_concurrency: usize,
@@ -69,7 +69,7 @@ pub struct BatchArgs {
     pub opensea_api_key: String,
     #[arg(long, default_value_t = 95.0)]
     pub name_threshold: f64,
-    #[arg(long, default_value_t = 0.55)]
+    #[arg(long, default_value_t = 0.6)]
     pub metadata_threshold: f64,
     #[arg(long, default_value_t = 60)]
     pub timeout: u64,
