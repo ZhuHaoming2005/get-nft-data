@@ -12,7 +12,7 @@
 - 运行 `analyze` / `batch` 时，需要能访问 Alchemy、Etherscan、OpenSea
 - 运行 `export-snapshot` 时，需要能访问 PostgreSQL
 
-项目使用了 bundled DuckDB，不需要单独安装 DuckDB。
+项目使用了 bundled DuckDB，不需要单独安装 DuckDB。`analyze` / `batch` 默认会让 DuckDB 使用当前可用线程数、`80GB` 内存预算，并显式关闭 insertion-order 保留以提升导入和 SQL recall 吞吐；如需调整，可通过 CLI 参数覆盖。
 
 ## 目录结构
 
@@ -36,7 +36,7 @@ cargo test
 
 先复制 [.env.example](./.env.example)，再按实际环境填写。
 
-注意：程序本身**不会自动加载** `.env` 文件。`analyze` / `batch` 不直接读 API key 环境变量，而是通过 CLI 参数传入。`.env.example` 里的 `ALCHEMY_API_KEY` 等变量主要用于命令行插值。Bash 示例：
+注意：程序本身**不会自动加载** `.env` 文件。`analyze` / `batch` 不直接读 API key 环境变量，而是通过 CLI 参数传入。Alchemy REST/RPC URL 会在内部按 `/nft/v2/<key>`、`/nft/v3/<key>`、`/v2/<key>` 拼接 API key，不需要把 key 放到 header。`.env.example` 里的 `ALCHEMY_API_KEY` 等变量主要用于命令行插值。Bash 示例：
 
 ```bash
 set -a
@@ -83,20 +83,24 @@ cargo run --release -- analyze \
   --opensea-api-key "2d17a25e68714720883ac996f5459b17" \
   --feature-parquet ../output/top_contract_analysis/ethereum.parquet \
   --feature-db ../output/top_contract_analysis/features.duckdb \
-  --signal-cache-db ../output/top_contract_analysis/signals.duckdb
+  --signal-cache-db ../output/top_contract_analysis/signals.duckdb \
+  --duckdb-memory-limit 80GB \
+  --duckdb-threads 0
 ```
 
 常用参数：
 
 - `--alchemy-network eth-mainnet`
 - `--name-threshold 95`
-- `--metadata-threshold 0.55`
+- `--metadata-threshold 0.6`
 - `--timeout 60`
 - `--max-tokens-per-contract 500`
 - `--max-recall-rows 100000`
-- `--api-max-concurrency 8`
+- `--api-max-concurrency 12`
 - `--contract-max-concurrency 4`
 - `--sale-metric-max-concurrency 4`
+- `--duckdb-threads 0`：`0` 表示使用当前可用线程数
+- `--duckdb-memory-limit 80GB`
 - `--output ./result/azuki.json`
 
 ### 3. 批量分析 Seed 合约
@@ -121,7 +125,11 @@ cargo run --release -- batch \
   --feature-db ../output/top_contract_analysis/features.duckdb \
   --signal-cache-db ../output/top_contract_analysis/signals.duckdb \
   --output-dir ../result \
-  --workers 4
+  --workers 4 \
+  --api-max-concurrency 24 \
+  --contract-max-concurrency 12 \
+  --sale-metric-max-concurrency 10 \
+  --duckdb-memory-limit 80GB
 ```
 
 批量输出包括：
@@ -134,6 +142,11 @@ cargo run --release -- batch \
 
 - `--timeout 30`
 - `--workers 4`
+- `--api-max-concurrency 8`
+- `--contract-max-concurrency 4`
+- `--sale-metric-max-concurrency 4`
+- `--duckdb-threads 0`
+- `--duckdb-memory-limit 80GB`
 - `--max-recall-rows 100000`
 - `--max-tokens-per-contract 500`
 
@@ -149,4 +162,6 @@ cargo run --release -- batch \
 - `--signal-cache-db` 默认是 `:memory:`。如果你希望 transfers / owners 的 signal cache 跨运行保留，请传文件路径。
 - 如果不传 `--feature-parquet`，程序会假设 DuckDB 特征库里已经有可用数据集。
 - 如果同时传了 `--feature-db` 和 `--feature-parquet`，且 `feature-db` 中该链已经有当前版本数据，则会复用 `feature-db`；如果没有该链数据，才从 Parquet 导入。旧版本 `feature-db` / 旧快照缺少预计算列会直接报错，需要重新运行 `export-snapshot`。
-- `batch` 当前内部构造 API client 时使用固定的请求并发默认值；批量运行时 CLI 暴露出来的主要吞吐控制参数是 `--workers`。
+- 当前快照 schema 强制包含 `token_uri_norm`、`image_uri_norm`、`name_norm`、`symbol_norm`、`metadata_doc`、`metadata_keywords_arr`。SQL recall 会先用这些预计算列下推筛选，Rust 复核会复用 `metadata_keywords_arr`，不会再从 `metadata_doc` 重复分词。
+- duplicate scoring 使用 Rayon 按 snapshot row 并行评分；BM25 metadata scoring 会复用缓存的 token、term frequency 和文档长度，用内存换 CPU。
+- `batch` 的吞吐由 `--workers` 和 API 并发参数共同决定：`--workers` 控制同时分析多少个 seed，`--api-max-concurrency` 控制全局请求并发，`--contract-max-concurrency` 控制合约信号并发，`--sale-metric-max-concurrency` 控制 sale metric 并发。
