@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use rayon::prelude::*;
 
@@ -86,7 +86,7 @@ fn aggregate_contract_rows(
     seed_symbol_norms: &HashSet<String>,
     snapshot_rows: &[DatabaseNftRecord],
 ) -> Vec<ContractDuplicateRow> {
-    let mut rows_by_contract = BTreeMap::<String, ContractDuplicateRow>::new();
+    let mut rows_by_contract = HashMap::<String, ContractDuplicateRow>::new();
     for row in snapshot_rows {
         let contract_key = row.contract_address.to_lowercase();
         if seed_contracts.contains(&contract_key) {
@@ -113,20 +113,24 @@ fn aggregate_contract_rows(
 
         entry.metadata_recall_checked |= row.metadata_recall_checked;
         entry.metadata_recall_match |= row.metadata_recall_match;
+        let should_update_metadata_doc = entry.metadata_doc.is_empty()
+            || (row.metadata_recall_match && !entry.representative.metadata_recall_match);
+        if !should_update_metadata_doc {
+            continue;
+        }
+
         let metadata_doc = record_metadata_doc(&row.metadata_doc, &row.metadata_json);
         if metadata_doc.is_empty() {
             continue;
         }
-        if entry.metadata_doc.is_empty()
-            || (row.metadata_recall_match && !entry.representative.metadata_recall_match)
-        {
-            entry.metadata_doc = metadata_doc;
-            if row.metadata_recall_match {
-                entry.representative = row.clone();
-            }
+        entry.metadata_doc = metadata_doc;
+        if row.metadata_recall_match {
+            entry.representative = row.clone();
         }
     }
-    rows_by_contract.into_values().collect()
+    let mut rows: Vec<_> = rows_by_contract.into_values().collect();
+    rows.sort_by(|left, right| left.contract_address.cmp(&right.contract_address));
+    rows
 }
 
 fn build_metadata_bm25_index(
@@ -157,6 +161,9 @@ fn build_metadata_bm25_index(
 
         let tokens = metadata_bm25_tokens(&row.metadata_doc);
         corpus_builder.add_tokens(&tokens);
+
+        // Keep corpus statistics over every scoreable representative document, but only
+        // cache documents that can actually match the seed metadata query.
         if !tokens.iter().any(|token| query_tokens.contains(token)) {
             continue;
         }
@@ -300,7 +307,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn metadata_bm25_index_keeps_only_query_token_candidates() {
+    fn metadata_bm25_index_keeps_full_corpus_stats_while_caching_only_query_token_candidates() {
         let seed_docs = vec![MetadataBm25Document::from_text("gold ai dragon").unwrap()];
         let seed_contracts = HashSet::from(["0xseed".to_string()]);
         let snapshot_rows = vec![

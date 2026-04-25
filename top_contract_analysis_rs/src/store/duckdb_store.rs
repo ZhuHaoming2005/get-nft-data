@@ -179,18 +179,6 @@ fn validate_duckdb_memory_limit(value: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-fn parse_metadata_keywords_arr(raw: &str) -> Result<HashSet<String>, AppError> {
-    if raw.trim().is_empty() {
-        return Ok(HashSet::new());
-    }
-    let values: Vec<String> = serde_json::from_str(raw)?;
-    Ok(values
-        .into_iter()
-        .map(|value| value.to_lowercase())
-        .filter(|value| !value.is_empty())
-        .collect())
-}
-
 fn seed_metadata_recall_terms(seed_nfts: &[SeedNft]) -> HashSet<String> {
     seed_nfts
         .iter()
@@ -534,9 +522,15 @@ impl DuckDbFeatureStore {
         if let Some(predicate) = Self::sql_in_predicate("substr(name_norm, 1, 8)", &name_prefixes) {
             predicates.push(format!("({predicate})"));
         }
-        if let Some(predicate) = Self::sql_metadata_keyword_predicate(&metadata_recall_terms) {
-            predicates.push(predicate);
+        let metadata_recall_predicate =
+            Self::sql_metadata_keyword_predicate(&metadata_recall_terms);
+        if let Some(predicate) = metadata_recall_predicate.as_ref() {
+            predicates.push(predicate.clone());
         }
+        let metadata_recall_expr = metadata_recall_predicate
+            .as_deref()
+            .unwrap_or("FALSE")
+            .to_string();
         let recall_predicate = if predicates.len() == 1 {
             "FALSE".to_string()
         } else {
@@ -567,10 +561,11 @@ impl DuckDbFeatureStore {
         let select_sql = format!(
             "
             SELECT contract_address, token_id, token_uri, image_uri, name, symbol, metadata_json, metadata_doc,
-                   token_uri_norm, image_uri_norm, name_norm, symbol_norm, metadata_keywords_arr
+                   token_uri_norm, image_uri_norm, name_norm, symbol_norm, metadata_recall_match
             FROM (
                 SELECT contract_address, token_id, token_uri, image_uri, name, symbol, metadata_json, metadata_doc,
-                       token_uri_norm, image_uri_norm, name_norm, symbol_norm, metadata_keywords_arr,
+                       token_uri_norm, image_uri_norm, name_norm, symbol_norm,
+                       {metadata_recall_expr} AS metadata_recall_match,
                        row_number() OVER (PARTITION BY contract_address ORDER BY token_id) AS rn
                 FROM nft_features
                 WHERE chain = ?{seed_contract_filter}
@@ -602,12 +597,12 @@ impl DuckDbFeatureStore {
                 row.get::<_, String>(9)?,
                 row.get::<_, String>(10)?,
                 row.get::<_, String>(11)?,
-                row.get::<_, String>(12)?,
+                row.get::<_, bool>(12)?,
             ))
         })?;
 
         let mut selected_rows = Vec::new();
-        let mut per_contract_counts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut per_contract_counts: HashMap<String, usize> = HashMap::new();
         for row in rows {
             let (
                 mut record,
@@ -615,17 +610,13 @@ impl DuckDbFeatureStore {
                 image_uri_norm,
                 name_norm,
                 symbol_norm,
-                metadata_keywords_arr,
+                metadata_recall_match,
             ) = row?;
             if seed_contracts.contains(&record.contract_address) {
                 continue;
             }
 
-            let row_keywords = parse_metadata_keywords_arr(&metadata_keywords_arr)?;
             let name_prefix = name_norm.chars().take(8).collect::<String>();
-            let metadata_recall_match = !metadata_recall_terms.is_empty()
-                && !row_keywords.is_empty()
-                && !row_keywords.is_disjoint(&metadata_recall_terms);
             let matches = exact_token_keys.contains(&token_uri_norm)
                 || exact_image_keys.contains(&image_uri_norm)
                 || exact_symbols.contains(&symbol_norm)
@@ -651,7 +642,7 @@ impl DuckDbFeatureStore {
                 image_uri_norm,
                 name_norm,
                 symbol_norm,
-                row_keywords,
+                metadata_recall_match,
             ));
             if max_recall_rows > 0 && selected_rows.len() >= max_recall_rows {
                 break;
@@ -663,8 +654,14 @@ impl DuckDbFeatureStore {
         let mut contract_names = Vec::new();
         let mut symbol_contracts: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut contract_signals_raw: BTreeMap<String, ContractSignal> = BTreeMap::new();
-        for (record, token_uri_norm, image_uri_norm, name_norm, symbol_norm, row_keywords) in
-            selected_rows
+        for (
+            record,
+            token_uri_norm,
+            image_uri_norm,
+            name_norm,
+            symbol_norm,
+            metadata_recall_match,
+        ) in selected_rows
         {
             if !name_norm.is_empty()
                 && seen_contract_name_pairs
@@ -702,10 +699,7 @@ impl DuckDbFeatureStore {
             if !name_prefix.is_empty() && name_prefixes.contains(&name_prefix) {
                 signal.name_prefix_match = true;
             }
-            if !metadata_recall_terms.is_empty()
-                && !row_keywords.is_empty()
-                && !row_keywords.is_disjoint(&metadata_recall_terms)
-            {
+            if metadata_recall_match {
                 signal.keyword_match = true;
             }
 

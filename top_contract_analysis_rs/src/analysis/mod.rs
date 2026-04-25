@@ -92,6 +92,17 @@ pub trait AnalyzeApi: Send + Sync {
         contract_address: &str,
     ) -> Result<Vec<SeedNft>, AppError>;
 
+    async fn fetch_contract_nfts(
+        &self,
+        chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        contract_address: &str,
+    ) -> Result<Vec<SeedNft>, AppError> {
+        self.fetch_seed_contract_nfts(chain, alchemy_api_key, alchemy_network, contract_address)
+            .await
+    }
+
     async fn fetch_license_sample(
         &self,
         _chain: &str,
@@ -510,8 +521,23 @@ pub async fn analyze_seed_contract_with_progress(
     );
     let grouped = group_candidates_by_contract(&candidates);
 
-    let mut duplicate_contracts = build_duplicate_contract_payloads(&grouped, &candidates);
     let contracts_to_analyze: Vec<String> = grouped.keys().cloned().collect();
+    let contract_concurrency = request.contract_max_concurrency.max(1);
+    let expanded_candidates_by_contract = if open_license || contracts_to_analyze.is_empty() {
+        BTreeMap::new()
+    } else {
+        let expanded_contract_tokens = fetch_contract_nfts_for_matched_contracts(
+            &request,
+            deps,
+            &contracts_to_analyze,
+            contract_concurrency,
+        )
+        .await?;
+        expand_candidates_to_contract_tokens(&grouped, &candidates, &expanded_contract_tokens)
+    };
+
+    let mut duplicate_contracts =
+        build_duplicate_contract_payloads(&expanded_candidates_by_contract);
     let snapshot_rows_by_key: HashMap<(String, String), _> = snapshot
         .nft_rows
         .iter()
@@ -550,7 +576,6 @@ pub async fn analyze_seed_contract_with_progress(
     let mut fraud_trade_stats = BTreeMap::<String, FraudTradeStatsPayload>::new();
     let analysis_timestamp = chrono::Utc::now().timestamp();
     let token_type = payload_token_type(&seed_contract);
-    let contract_concurrency = request.contract_max_concurrency.max(1);
     if !open_license {
         progress
             .on_duplicate_contracts_started(contracts_to_analyze.len())
@@ -560,20 +585,22 @@ pub async fn analyze_seed_contract_with_progress(
         let request_ref = &request;
         let deps_ref = deps;
         let token_type_ref = token_type.as_str();
-        let candidates_ref = &candidates;
+        let expanded_candidates_by_contract_ref = &expanded_candidates_by_contract;
         let official_addresses_ref = &official_addresses;
         let candidate_open_license_by_token_ref = &candidate_open_license_by_token;
         let mut contract_analyses = stream::iter(contracts_to_analyze.iter().enumerate().map(
             |(index, contract_address)| {
-                let candidate_indexes = grouped.get(contract_address).cloned().unwrap_or_default();
+                let contract_candidates = expanded_candidates_by_contract_ref
+                    .get(contract_address)
+                    .cloned()
+                    .unwrap_or_default();
                 async move {
                     let result = analyze_duplicate_contract(
                         request_ref,
                         deps_ref,
                         token_type_ref,
                         contract_address,
-                        &candidate_indexes,
-                        candidates_ref,
+                        &contract_candidates,
                         official_addresses_ref,
                         candidate_open_license_by_token_ref,
                         analysis_timestamp,
@@ -636,7 +663,7 @@ pub async fn analyze_seed_contract_with_progress(
         },
         seed_collection_stats: build_seed_collection_stats(&seed_nfts),
         duplicate_candidates: candidates,
-        contract_level_summary: build_contract_level_summary(&grouped),
+        contract_level_summary: build_contract_level_summary(&expanded_candidates_by_contract),
         report_summary: build_report_summary(
             open_license,
             &grouped,
@@ -676,16 +703,12 @@ async fn analyze_duplicate_contract(
     deps: &AnalysisDeps,
     token_type: &str,
     contract_address: &str,
-    candidate_indexes: &[usize],
-    candidates: &[DuplicateCandidate],
+    contract_candidates: &[DuplicateCandidate],
     official_addresses: &HashSet<String>,
     candidate_open_license_by_token: &HashMap<(String, String), bool>,
     analysis_timestamp: i64,
 ) -> Result<ContractAnalysisResult, AppError> {
-    let contract_candidates: Vec<&DuplicateCandidate> = candidate_indexes
-        .iter()
-        .filter_map(|index| candidates.get(*index))
-        .collect();
+    let contract_candidate_refs: Vec<&DuplicateCandidate> = contract_candidates.iter().collect();
     let cached_signals = if let Some(cache) = deps.signal_cache.as_ref() {
         cache.get(&request.chain, contract_address, token_type)?
     } else {
@@ -753,7 +776,7 @@ async fn analyze_duplicate_contract(
 
     let contract_infringing = address_records::build_infringing_token_records_with_context_refs(
         contract_address,
-        &contract_candidates,
+        &contract_candidate_refs,
         &transfers,
         official_addresses,
         candidate_open_license_by_token,
@@ -1306,38 +1329,121 @@ pub fn group_candidates_by_contract(
     grouped
 }
 
-fn build_contract_payload(
-    candidate_indexes: &[usize],
+async fn fetch_contract_nfts_for_matched_contracts(
+    request: &AnalyzeRequest,
+    deps: &AnalysisDeps,
+    contract_addresses: &[String],
+    concurrency: usize,
+) -> Result<Vec<SeedNft>, AppError> {
+    let mut rows = Vec::new();
+    let mut fetches = stream::iter(
+        contract_addresses
+            .iter()
+            .map(|contract_address| async move {
+                let tokens = deps
+                    .api
+                    .fetch_contract_nfts(
+                        &request.chain,
+                        &request.alchemy_api_key,
+                        request.alchemy_network.as_deref(),
+                        contract_address,
+                    )
+                    .await?;
+                Ok::<_, AppError>(tokens)
+            }),
+    )
+    .buffer_unordered(concurrency.max(1));
+
+    while let Some(tokens) = fetches.next().await {
+        rows.extend(tokens?);
+    }
+    Ok(rows)
+}
+
+fn expand_candidates_to_contract_tokens(
+    grouped: &BTreeMap<String, Vec<usize>>,
     candidates: &[DuplicateCandidate],
-) -> DuplicateContractPayload {
-    let contract_address = candidate_indexes
-        .first()
-        .and_then(|index| candidates.get(*index))
-        .map(|item| item.contract_address.clone())
-        .unwrap_or_default();
-    let mut match_reasons: BTreeSet<String> = BTreeSet::new();
-    for index in candidate_indexes {
-        if let Some(item) = candidates.get(*index) {
-            for reason in &item.match_reasons {
-                match_reasons.insert(reason.clone());
+    contract_tokens: &[SeedNft],
+) -> BTreeMap<String, Vec<DuplicateCandidate>> {
+    let tokens_by_contract =
+        contract_tokens
+            .iter()
+            .fold(BTreeMap::<String, Vec<&SeedNft>>::new(), |mut acc, row| {
+                acc.entry(row.contract_address.clone())
+                    .or_default()
+                    .push(row);
+                acc
+            });
+
+    grouped
+        .iter()
+        .map(|(contract_address, candidate_indexes)| {
+            let template = candidate_indexes
+                .iter()
+                .find_map(|index| candidates.get(*index))
+                .cloned()
+                .unwrap_or_else(|| DuplicateCandidate {
+                    contract_address: contract_address.clone(),
+                    ..DuplicateCandidate::default()
+                });
+            let mut seen_tokens = BTreeSet::new();
+            let mut expanded: Vec<DuplicateCandidate> = tokens_by_contract
+                .get(contract_address)
+                .into_iter()
+                .flat_map(|rows| rows.iter().copied())
+                .filter_map(|row| {
+                    if !seen_tokens.insert(row.token_id.clone()) {
+                        return None;
+                    }
+                    Some(DuplicateCandidate {
+                        contract_address: row.contract_address.clone(),
+                        token_id: row.token_id.clone(),
+                        match_reasons: template.match_reasons.clone(),
+                        confidence: template.confidence.clone(),
+                        token_uri: row.token_uri.clone(),
+                        image_uri: row.image_uri.clone(),
+                        name: row.name.clone(),
+                        symbol: row.symbol.clone(),
+                    })
+                })
+                .collect();
+
+            if expanded.is_empty() {
+                expanded = candidate_indexes
+                    .iter()
+                    .filter_map(|index| candidates.get(*index).cloned())
+                    .collect();
             }
+            expanded.sort_by(|left, right| left.token_id.cmp(&right.token_id));
+            (contract_address.clone(), expanded)
+        })
+        .collect()
+}
+
+fn build_contract_payload(
+    contract_address: &str,
+    contract_candidates: &[DuplicateCandidate],
+) -> DuplicateContractPayload {
+    let mut match_reasons: BTreeSet<String> = BTreeSet::new();
+    for item in contract_candidates {
+        for reason in &item.match_reasons {
+            match_reasons.insert(reason.clone());
         }
     }
     DuplicateContractPayload {
-        contract_address,
-        candidate_count: candidate_indexes.len() as i64,
+        contract_address: contract_address.to_string(),
+        candidate_count: contract_candidates.len() as i64,
         match_reasons: match_reasons.into_iter().collect(),
         mint_recipients: vec![],
     }
 }
 
 fn build_duplicate_contract_payloads(
-    grouped: &BTreeMap<String, Vec<usize>>,
-    candidates: &[DuplicateCandidate],
+    expanded_candidates_by_contract: &BTreeMap<String, Vec<DuplicateCandidate>>,
 ) -> Vec<DuplicateContractPayload> {
-    grouped
-        .values()
-        .map(|items| build_contract_payload(items, candidates))
+    expanded_candidates_by_contract
+        .iter()
+        .map(|(contract_address, items)| build_contract_payload(contract_address, items))
         .collect()
 }
 
@@ -1375,9 +1481,9 @@ fn build_seed_collection_stats(seed_nfts: &[SeedNft]) -> SeedCollectionStatsPayl
 }
 
 fn build_contract_level_summary(
-    grouped: &BTreeMap<String, Vec<usize>>,
+    expanded_candidates_by_contract: &BTreeMap<String, Vec<DuplicateCandidate>>,
 ) -> BTreeMap<String, ContractLevelSummaryPayload> {
-    grouped
+    expanded_candidates_by_contract
         .iter()
         .map(|(contract_address, items)| {
             (
