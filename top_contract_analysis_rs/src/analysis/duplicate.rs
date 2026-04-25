@@ -1,79 +1,71 @@
 use std::collections::{HashMap, HashSet};
 
-use once_cell::sync::Lazy;
-use regex::Regex;
-
 use crate::analysis::scoring::{
-    metadata_document_from_json, score_metadata_document_pair, score_name_pair,
+    metadata_bm25_tokens, metadata_document_from_json, score_metadata_document_pair_with_corpus,
+    score_name_pair, MetadataBm25Corpus,
 };
 use crate::models::{DatabaseNftRecord, DuplicateCandidate, SeedNft};
 use crate::normalize::{normalize_name, normalize_symbol, normalize_text, normalize_url};
 
-static TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\p{L}\p{N}_]+").unwrap());
-
-fn candidate_length_bounds(length: usize, threshold: f64) -> (usize, usize) {
-    if length == 0 {
-        return (1, 0);
-    }
-    let safe_threshold = if threshold <= 0.0 { 1.0 } else { threshold };
-    let factor = (200.0 - safe_threshold) / safe_threshold;
-    let min_length = std::cmp::max(1, ((length as f64) / factor).ceil() as usize);
-    let max_length = ((length as f64) * factor) as usize;
-    (min_length, max_length)
-}
-
-fn metadata_keywords(document: &str, limit: usize) -> Vec<String> {
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for token in TOKEN_RE.find_iter(document) {
-        let normalized = token.as_str().to_lowercase();
-        if normalized.len() < 4 {
-            continue;
-        }
-        *counts.entry(normalized).or_insert(0) += 1;
-    }
-    let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();
-    ranked.sort_by(|left, right| {
-        right
-            .1
-            .cmp(&left.1)
-            .then_with(|| right.0.len().cmp(&left.0.len()))
-            .then_with(|| left.0.cmp(&right.0))
-    });
-    ranked
-        .into_iter()
-        .take(limit)
-        .map(|(token, _)| token)
-        .collect()
-}
-
-fn has_name_match(
-    row_name_norm: &str,
-    name_threshold: f64,
-    seed_names_by_length: &HashMap<usize, Vec<String>>,
-    sorted_seed_name_lengths: &[usize],
-) -> bool {
+fn has_name_match(row_name_norm: &str, name_threshold: f64, seed_name_norms: &[String]) -> bool {
     if row_name_norm.is_empty() {
         return false;
     }
-    let (min_length, max_length) =
-        candidate_length_bounds(row_name_norm.chars().count(), name_threshold);
-    for length in sorted_seed_name_lengths.iter().copied() {
-        if length < min_length {
+    seed_name_norms
+        .iter()
+        .any(|candidate| score_name_pair(row_name_norm, candidate) >= name_threshold)
+}
+
+fn record_metadata_doc(metadata_doc: &str, metadata_json: &str) -> String {
+    if !metadata_doc.is_empty() {
+        normalize_text(metadata_doc)
+    } else {
+        metadata_document_from_json(metadata_json)
+    }
+}
+
+struct MetadataBm25Index {
+    corpus: MetadataBm25Corpus,
+    candidate_docs_by_key: HashMap<(String, String), String>,
+}
+
+fn build_metadata_bm25_index(
+    seed_metadata_docs: &[String],
+    snapshot_rows: &[DatabaseNftRecord],
+    seed_contracts: &HashSet<String>,
+) -> MetadataBm25Index {
+    let query_tokens: HashSet<String> = seed_metadata_docs
+        .iter()
+        .flat_map(|doc| metadata_bm25_tokens(doc))
+        .collect();
+    let mut corpus_docs = Vec::new();
+    let mut candidate_docs_by_key = HashMap::new();
+
+    for row in snapshot_rows {
+        if seed_contracts.contains(&row.contract_address.to_lowercase()) {
             continue;
         }
-        if length > max_length {
-            break;
+
+        let doc = record_metadata_doc(&row.metadata_doc, &row.metadata_json);
+        if doc.is_empty() {
+            continue;
         }
-        if let Some(candidates) = seed_names_by_length.get(&length) {
-            if candidates
-                .iter()
-                .any(|candidate| score_name_pair(row_name_norm, candidate) >= name_threshold)
-            {
-                return true;
-            }
+
+        let tokens = metadata_bm25_tokens(&doc);
+        if tokens.is_empty() {
+            continue;
+        }
+
+        corpus_docs.push(doc.clone());
+        if !query_tokens.is_empty() && tokens.iter().any(|token| query_tokens.contains(token)) {
+            candidate_docs_by_key.insert((row.contract_address.clone(), row.token_id.clone()), doc);
         }
     }
-    false
+
+    MetadataBm25Index {
+        corpus: MetadataBm25Corpus::from_documents(&corpus_docs),
+        candidate_docs_by_key,
+    }
 }
 
 pub fn build_duplicate_candidates(
@@ -100,45 +92,26 @@ pub fn build_duplicate_candidates(
         .filter(|symbol| !symbol.is_empty())
         .collect();
 
-    let mut seed_names_by_length: HashMap<usize, Vec<String>> = HashMap::new();
-    let mut sorted_seed_name_lengths = Vec::new();
-    for item in seed_nfts {
-        let name_norm = normalize_name(&item.name);
-        if name_norm.is_empty() {
-            continue;
-        }
-        let len = name_norm.chars().count();
-        let bucket = seed_names_by_length.entry(len).or_default();
-        if bucket.is_empty() {
-            sorted_seed_name_lengths.push(len);
-        }
-        bucket.push(name_norm);
-    }
-    sorted_seed_name_lengths.sort_unstable();
-    sorted_seed_name_lengths.dedup();
+    let seed_name_norms: Vec<String> = seed_nfts
+        .iter()
+        .map(|item| normalize_name(&item.name))
+        .filter(|name| !name.is_empty())
+        .collect();
 
-    let seed_metadata_docs_and_keywords: Vec<(String, HashSet<String>)> = seed_nfts
+    let seed_metadata_docs: Vec<String> = seed_nfts
         .iter()
         .filter_map(|item| {
-            let seed_doc = if !item.metadata_doc.is_empty() {
-                normalize_text(&item.metadata_doc)
-            } else {
-                metadata_document_from_json(&item.metadata_json)
-            };
+            let seed_doc = record_metadata_doc(&item.metadata_doc, &item.metadata_json);
             if seed_doc.is_empty() {
                 None
             } else {
-                Some((
-                    seed_doc.clone(),
-                    metadata_keywords(&seed_doc, 12).into_iter().collect(),
-                ))
+                Some(seed_doc)
             }
         })
         .collect();
-    let seed_metadata_keyword_union: HashSet<String> = seed_metadata_docs_and_keywords
-        .iter()
-        .flat_map(|(_, keywords)| keywords.iter().cloned())
-        .collect();
+
+    let metadata_index =
+        build_metadata_bm25_index(&seed_metadata_docs, snapshot_rows, &seed_contracts);
 
     let mut rows = Vec::new();
     for row in snapshot_rows {
@@ -150,16 +123,6 @@ pub fn build_duplicate_candidates(
         let image_key = normalize_url(&row.image_uri);
         let symbol_norm = normalize_symbol(&row.symbol);
         let row_name_norm = normalize_name(&row.name);
-        let row_doc = if !row.metadata_doc.is_empty() {
-            normalize_text(&row.metadata_doc)
-        } else {
-            metadata_document_from_json(&row.metadata_json)
-        };
-        let row_keywords: HashSet<String> = if row_doc.is_empty() {
-            HashSet::new()
-        } else {
-            metadata_keywords(&row_doc, 12).into_iter().collect()
-        };
 
         let mut reasons = Vec::new();
         if token_key
@@ -179,29 +142,17 @@ pub fn build_duplicate_candidates(
         if !symbol_norm.is_empty() && seed_symbol_norms.contains(&symbol_norm) {
             reasons.push("symbol_match".to_string());
         }
-        if has_name_match(
-            &row_name_norm,
-            name_threshold,
-            &seed_names_by_length,
-            &sorted_seed_name_lengths,
-        ) {
+        if has_name_match(&row_name_norm, name_threshold, &seed_name_norms) {
             reasons.push("name_match".to_string());
         }
-        if !row_doc.is_empty()
-            && (!seed_metadata_keyword_union.is_empty()
-                && !row_keywords.is_empty()
-                && !row_keywords.is_disjoint(&seed_metadata_keyword_union))
-            && seed_metadata_docs_and_keywords.iter().any(|(seed_doc, seed_keywords)| {
-                if !row_keywords.is_empty()
-                    && !seed_keywords.is_empty()
-                    && row_keywords.is_disjoint(seed_keywords)
-                {
-                    return false;
-                }
-                score_metadata_document_pair(seed_doc, &row_doc) >= metadata_threshold
-            })
-        {
-            reasons.push("metadata_match".to_string());
+        let metadata_key = (row.contract_address.clone(), row.token_id.clone());
+        if let Some(row_doc) = metadata_index.candidate_docs_by_key.get(&metadata_key) {
+            if seed_metadata_docs.iter().any(|seed_doc| {
+                score_metadata_document_pair_with_corpus(seed_doc, row_doc, &metadata_index.corpus)
+                    >= metadata_threshold
+            }) {
+                reasons.push("metadata_match".to_string());
+            }
         }
 
         if reasons.is_empty() {
@@ -215,9 +166,8 @@ pub fn build_duplicate_candidates(
                 "token_uri_match" | "image_uri_match" | "metadata_match"
             )
         });
-        let has_name_and_symbol =
-            reasons.iter().any(|reason| reason == "name_match")
-                && reasons.iter().any(|reason| reason == "symbol_match");
+        let has_name_and_symbol = reasons.iter().any(|reason| reason == "name_match")
+            && reasons.iter().any(|reason| reason == "symbol_match");
         let confidence = if has_high_reason || has_name_and_symbol {
             "high"
         } else {
@@ -240,4 +190,56 @@ pub fn build_duplicate_candidates(
         (&left.contract_address, &left.token_id).cmp(&(&right.contract_address, &right.token_id))
     });
     rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_bm25_index_keeps_only_query_token_candidates() {
+        let seed_docs = vec!["gold ai dragon".to_string()];
+        let seed_contracts = HashSet::from(["0xseed".to_string()]);
+        let snapshot_rows = vec![
+            DatabaseNftRecord {
+                contract_address: "0xseed".into(),
+                token_id: "1".into(),
+                metadata_doc: "gold ai dragon".into(),
+                ..Default::default()
+            },
+            DatabaseNftRecord {
+                contract_address: "0xgold".into(),
+                token_id: "1".into(),
+                metadata_doc: "gold rare".into(),
+                ..Default::default()
+            },
+            DatabaseNftRecord {
+                contract_address: "0xai".into(),
+                token_id: "1".into(),
+                metadata_doc: "ai generated".into(),
+                ..Default::default()
+            },
+            DatabaseNftRecord {
+                contract_address: "0xmiss".into(),
+                token_id: "1".into(),
+                metadata_doc: "silver cat".into(),
+                ..Default::default()
+            },
+        ];
+
+        let index = build_metadata_bm25_index(&seed_docs, &snapshot_rows, &seed_contracts);
+
+        assert!(index
+            .candidate_docs_by_key
+            .contains_key(&("0xgold".into(), "1".into())));
+        assert!(index
+            .candidate_docs_by_key
+            .contains_key(&("0xai".into(), "1".into())));
+        assert!(!index
+            .candidate_docs_by_key
+            .contains_key(&("0xseed".into(), "1".into())));
+        assert!(!index
+            .candidate_docs_by_key
+            .contains_key(&("0xmiss".into(), "1".into())));
+    }
 }

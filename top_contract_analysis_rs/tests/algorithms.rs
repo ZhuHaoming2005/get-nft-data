@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use once_cell::sync::Lazy;
 use regex::Regex;
-use strsim::{jaro_winkler, normalized_levenshtein};
+use strsim::jaro_winkler;
 use top_contract_analysis_rs::analysis::address_records::{
     build_infringing_token_records, build_infringing_token_records_with_context,
 };
@@ -11,10 +11,10 @@ use top_contract_analysis_rs::analysis::scoring::{
     metadata_document_from_json, score_metadata_documents, score_name_pairs, ScoringError,
 };
 use top_contract_analysis_rs::analysis::signals::analyze_transfer_signals;
-use top_contract_analysis_rs::normalize::{normalize_name, normalize_symbol, normalize_url};
 use top_contract_analysis_rs::models::{
     DatabaseNftRecord, DuplicateCandidate, SeedNft, TransferRecord,
 };
+use top_contract_analysis_rs::normalize::{normalize_name, normalize_symbol, normalize_url};
 use unicode_normalization::UnicodeNormalization;
 
 static TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\p{L}\p{N}_]+").unwrap());
@@ -75,12 +75,95 @@ fn reference_name_score(left: &str, right: &str) -> f64 {
     if left_norm == right_norm {
         return 100.0;
     }
-    ((jaro_winkler(&left_norm, &right_norm) * 0.65)
-        + (normalized_levenshtein(&left_norm, &right_norm) * 0.35))
-        * 100.0
+    jaro_winkler(&left_norm, &right_norm) * 100.0
 }
 
-fn reference_metadata_document_score(left: &str, right: &str) -> f64 {
+fn reference_metadata_tokens(raw: &str) -> Vec<String> {
+    TOKEN_RE
+        .find_iter(&reference_normalize_text(raw))
+        .map(|m| m.as_str().to_lowercase())
+        .filter(|token| token.len() >= 2)
+        .collect()
+}
+
+fn reference_bm25_corpus_stats(docs: &[String]) -> (f64, HashMap<String, usize>) {
+    let mut total_terms = 0usize;
+    let mut doc_freqs = HashMap::new();
+
+    for doc in docs {
+        let tokens = reference_metadata_tokens(doc);
+        total_terms += tokens.len();
+        for token in tokens.into_iter().collect::<HashSet<_>>() {
+            *doc_freqs.entry(token).or_insert(0) += 1;
+        }
+    }
+
+    let avg_doc_len = if docs.is_empty() {
+        0.0
+    } else {
+        total_terms as f64 / docs.len() as f64
+    };
+    (avg_doc_len, doc_freqs)
+}
+
+fn reference_bm25_score_tokens(
+    query_tokens: &[String],
+    doc_tokens: &[String],
+    total_docs: usize,
+    avg_doc_len: f64,
+    doc_freqs: &HashMap<String, usize>,
+) -> f64 {
+    if query_tokens.is_empty() || doc_tokens.is_empty() || total_docs == 0 || avg_doc_len <= 0.0 {
+        return 0.0;
+    }
+
+    let mut term_freqs = HashMap::new();
+    for token in doc_tokens {
+        *term_freqs.entry(token).or_insert(0usize) += 1;
+    }
+
+    let k1 = 1.2;
+    let b = 0.75;
+    let doc_len = doc_tokens.len() as f64;
+    let norm = k1 * (1.0 - b + b * doc_len / avg_doc_len);
+
+    query_tokens
+        .iter()
+        .map(|token| {
+            let tf = *term_freqs.get(token).unwrap_or(&0) as f64;
+            if tf == 0.0 {
+                return 0.0;
+            }
+            let df = *doc_freqs.get(token).unwrap_or(&0) as f64;
+            let idf = ((total_docs as f64 - df + 0.5) / (df + 0.5) + 1.0).ln();
+            idf * (tf * (k1 + 1.0)) / (tf + norm)
+        })
+        .sum()
+}
+
+fn reference_metadata_document_score(left: &str, right: &str, corpus_docs: &[String]) -> f64 {
+    let query_tokens = reference_metadata_tokens(left);
+    let doc_tokens = reference_metadata_tokens(right);
+    let (avg_doc_len, doc_freqs) = reference_bm25_corpus_stats(corpus_docs);
+    let self_score = reference_bm25_score_tokens(
+        &query_tokens,
+        &query_tokens,
+        corpus_docs.len(),
+        avg_doc_len,
+        &doc_freqs,
+    );
+    let denominator = if self_score > 0.0 { self_score } else { 1.0 };
+    (reference_bm25_score_tokens(
+        &query_tokens,
+        &doc_tokens,
+        corpus_docs.len(),
+        avg_doc_len,
+        &doc_freqs,
+    ) / denominator)
+        .clamp(0.0, 1.0)
+}
+
+fn reference_metadata_document_score_old(left: &str, right: &str) -> f64 {
     let left_doc = reference_normalize_text(left);
     let right_doc = reference_normalize_text(right);
     if left_doc.is_empty() || right_doc.is_empty() {
@@ -162,22 +245,33 @@ fn score_name_pairs_matches_existing_threshold_behavior() {
 }
 
 #[test]
-fn score_name_pairs_matches_reference_weighting_for_non_identical_names() {
+fn score_name_pairs_matches_jaro_winkler_for_non_identical_names() {
     let scores = score_name_pairs(&["Moonbirds".into()], &["Moonbird".into()]).unwrap();
     assert_eq!(scores.len(), 1);
     assert!((scores[0] - reference_name_score("Moonbirds", "Moonbird")).abs() < 1e-12);
 }
 
 #[test]
-fn score_metadata_documents_matches_reference_formula_for_reordered_keywords() {
+fn score_metadata_documents_uses_normalized_bm25_for_reordered_keywords() {
     let scores =
         score_metadata_documents(&["gold dragon rare".into()], &["rare dragon gold".into()])
             .unwrap();
     assert_eq!(scores.len(), 1);
+    let corpus_docs = vec!["rare dragon gold".to_string()];
     assert!(
-        (scores[0] - reference_metadata_document_score("gold dragon rare", "rare dragon gold"))
-            .abs()
+        (scores[0]
+            - reference_metadata_document_score(
+                "gold dragon rare",
+                "rare dragon gold",
+                &corpus_docs
+            ))
+        .abs()
             < 1e-12
+    );
+    assert!(
+        (scores[0] - reference_metadata_document_score_old("gold dragon rare", "rare dragon gold"))
+            .abs()
+            > 1e-6
     );
 }
 
@@ -216,7 +310,27 @@ fn duplicate_candidates_use_token_uri_and_name_reason_flags() {
 }
 
 #[test]
-fn duplicate_candidates_ignore_short_metadata_keywords_for_gating() {
+fn duplicate_candidates_compare_seed_names_without_length_prefilter() {
+    let seed_nfts = vec![SeedNft {
+        name: "Moonbird".into(),
+        ..Default::default()
+    }];
+    let snapshot_rows = vec![DatabaseNftRecord {
+        contract_address: "0xdup".into(),
+        token_id: "1".into(),
+        name: "Moonbirds".into(),
+        ..Default::default()
+    }];
+
+    let rows = build_duplicate_candidates(&seed_nfts, &snapshot_rows, 95.0, 0.55);
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].contract_address, "0xdup");
+    assert_eq!(rows[0].match_reasons, vec!["name_match".to_string()]);
+}
+
+#[test]
+fn duplicate_candidates_score_short_metadata_tokens_with_bm25() {
     let seed_nfts = vec![SeedNft {
         metadata_doc: "cat".into(),
         ..Default::default()
@@ -230,7 +344,9 @@ fn duplicate_candidates_ignore_short_metadata_keywords_for_gating() {
 
     let rows = build_duplicate_candidates(&seed_nfts, &snapshot_rows, 95.0, 0.55);
 
-    assert!(rows.is_empty());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].contract_address, "0xdup");
+    assert_eq!(rows[0].match_reasons, vec!["metadata_match".to_string()]);
 }
 
 #[test]
@@ -376,10 +492,8 @@ fn infringing_token_records_use_token_open_license_and_official_reissue_flags() 
     }];
     let transfers = vec![TransferRecord::mint("0xdup", "1", 100, "0xofficial")];
     let official_addresses = HashSet::from(["0xofficial".to_string()]);
-    let candidate_open_license_by_token = HashMap::from([(
-        ("0xdup".to_string(), "1".to_string()),
-        true,
-    )]);
+    let candidate_open_license_by_token =
+        HashMap::from([(("0xdup".to_string(), "1".to_string()), true)]);
 
     let rows = build_infringing_token_records_with_context(
         "0xdup",
