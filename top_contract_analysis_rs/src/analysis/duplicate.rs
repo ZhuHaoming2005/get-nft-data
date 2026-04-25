@@ -7,7 +7,7 @@ use crate::analysis::scoring::{
     score_name_pair, MetadataBm25Corpus, MetadataBm25CorpusBuilder, MetadataBm25Document,
 };
 use crate::models::{DatabaseNftRecord, DuplicateCandidate, SeedNft};
-use crate::normalize::{normalize_name, normalize_symbol, normalize_url};
+use crate::normalize::{normalize_name, normalize_url};
 
 fn has_name_match(row_name_norm: &str, name_threshold: f64, seed_name_norms: &[String]) -> bool {
     if row_name_norm.is_empty() {
@@ -52,7 +52,6 @@ struct ContractDuplicateRow {
     representative: DatabaseNftRecord,
     token_uri_match: bool,
     image_uri_match: bool,
-    symbol_match: bool,
     name_norms: HashSet<String>,
     metadata_doc: String,
     metadata_recall_checked: bool,
@@ -66,7 +65,6 @@ impl ContractDuplicateRow {
             representative: row.clone(),
             token_uri_match: false,
             image_uri_match: false,
-            symbol_match: false,
             name_norms: HashSet::new(),
             metadata_doc: String::new(),
             metadata_recall_checked: false,
@@ -83,7 +81,6 @@ fn aggregate_contract_rows(
     seed_contracts: &HashSet<String>,
     seed_token_uri_keys: &HashSet<String>,
     seed_image_uri_keys: &HashSet<String>,
-    seed_symbol_norms: &HashSet<String>,
     snapshot_rows: &[DatabaseNftRecord],
 ) -> Vec<ContractDuplicateRow> {
     let mut rows_by_contract = HashMap::<String, ContractDuplicateRow>::new();
@@ -101,10 +98,6 @@ fn aggregate_contract_rows(
         }
         if let Some(image_key) = normalize_url(&row.image_uri) {
             entry.image_uri_match |= seed_image_uri_keys.contains(&image_key);
-        }
-        let symbol_norm = normalize_symbol(&row.symbol);
-        if !symbol_norm.is_empty() {
-            entry.symbol_match |= seed_symbol_norms.contains(&symbol_norm);
         }
         let row_name_norm = normalize_name(&row.name);
         if !row_name_norm.is_empty() {
@@ -201,11 +194,6 @@ pub fn build_duplicate_candidates(
         .iter()
         .filter_map(|item| normalize_url(&item.image_uri))
         .collect();
-    let seed_symbol_norms: HashSet<String> = seed_nfts
-        .iter()
-        .map(|item| normalize_symbol(&item.symbol))
-        .filter(|symbol| !symbol.is_empty())
-        .collect();
 
     let seed_name_norms: Vec<String> = seed_nfts
         .iter()
@@ -220,7 +208,6 @@ pub fn build_duplicate_candidates(
         &seed_contracts,
         &seed_token_uri_keys,
         &seed_image_uri_keys,
-        &seed_symbol_norms,
         snapshot_rows,
     );
     let has_metadata_recall_flags = contract_rows.iter().any(|row| row.metadata_recall_checked);
@@ -239,9 +226,6 @@ pub fn build_duplicate_candidates(
             }
             if row.image_uri_match {
                 reasons.push("image_uri_match".to_string());
-            }
-            if row.symbol_match {
-                reasons.push("symbol_match".to_string());
             }
             if row
                 .name_norms
@@ -275,13 +259,7 @@ pub fn build_duplicate_candidates(
                     "token_uri_match" | "image_uri_match" | "metadata_match"
                 )
             });
-            let has_name_and_symbol = reasons.iter().any(|reason| reason == "name_match")
-                && reasons.iter().any(|reason| reason == "symbol_match");
-            let confidence = if has_high_reason || has_name_and_symbol {
-                "high"
-            } else {
-                "low"
-            };
+            let confidence = if has_high_reason { "high" } else { "low" };
 
             Some(DuplicateCandidate {
                 contract_address: row.contract_address.clone(),
@@ -339,7 +317,7 @@ mod tests {
 
         let empty = HashSet::new();
         let contract_rows =
-            aggregate_contract_rows(&seed_contracts, &empty, &empty, &empty, &snapshot_rows);
+            aggregate_contract_rows(&seed_contracts, &empty, &empty, &snapshot_rows);
         let index = build_metadata_bm25_index(&seed_docs, &contract_rows, false);
 
         assert!(index.candidate_doc("0xgold").is_some());

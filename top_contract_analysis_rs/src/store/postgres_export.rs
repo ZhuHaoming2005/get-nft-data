@@ -12,7 +12,7 @@ use regex::Regex;
 
 use crate::analysis::scoring::metadata_document_from_json;
 use crate::error::AppError;
-use crate::normalize::{normalize_name, normalize_symbol, normalize_url};
+use crate::normalize::{normalize_name, normalize_url};
 
 static TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\p{L}\p{N}_]+").unwrap());
 
@@ -83,7 +83,6 @@ fn snapshot_schema(keep_metadata_json: bool) -> Arc<Schema> {
         Field::new("token_uri_norm", DataType::Utf8, false),
         Field::new("image_uri_norm", DataType::Utf8, false),
         Field::new("name_norm", DataType::Utf8, false),
-        Field::new("symbol_norm", DataType::Utf8, false),
         Field::new("metadata_doc", DataType::Utf8, false),
         Field::new("metadata_keywords_arr", DataType::Utf8, false),
     ]);
@@ -146,12 +145,6 @@ fn snapshot_batch(
             name_values
                 .iter()
                 .map(|value| normalize_name(value))
-                .collect::<Vec<_>>(),
-        )) as ArrayRef,
-        Arc::new(StringArray::from(
-            symbol_values
-                .iter()
-                .map(|value| normalize_symbol(value))
                 .collect::<Vec<_>>(),
         )) as ArrayRef,
         Arc::new(StringArray::from(metadata_doc_values)) as ArrayRef,

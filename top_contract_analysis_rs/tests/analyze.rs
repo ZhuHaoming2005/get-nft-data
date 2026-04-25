@@ -1945,7 +1945,7 @@ fn single_report_markdown_preserves_reference_sections_and_summary_lines() {
             DuplicateContractPayload {
                 contract_address: "0xlow".into(),
                 candidate_count: 1,
-                match_reasons: vec!["symbol_match".into()],
+                match_reasons: vec!["image_uri_match".into()],
                 ..Default::default()
             },
         ],
@@ -2041,7 +2041,7 @@ fn single_report_markdown_preserves_reference_sections_and_summary_lines() {
     assert!(markdown.contains("- 拉取到的种子 NFT 数: 10"));
     assert!(markdown.contains("## 重复 NFT 合约"));
     assert!(markdown.contains("- 0xhigh: 2 个重复 NFT | 命中原因=token_uri_match, name_match"));
-    assert!(markdown.contains("- 0xlow: 1 个重复 NFT | 命中原因=symbol_match"));
+    assert!(markdown.contains("- 0xlow: 1 个重复 NFT | 命中原因=image_uri_match"));
     assert!(markdown.contains("## 被算法归为官方参与型重复的合约"));
     assert!(
         markdown.contains("- 0xlegit: 1 个重复 NFT | mint 接收地址(命中官方地址规则)=0xofficial")
@@ -2446,7 +2446,7 @@ async fn analyze_expands_matched_contracts_to_all_tokens_for_report_analysis() {
 }
 
 #[tokio::test]
-async fn analyze_enriches_symbol_only_duplicate_contracts_with_signals_and_infringing_tokens() {
+async fn analyze_ignores_symbol_only_candidate_contracts() {
     let deps = AnalysisDeps {
         api: Arc::new(FakeEnrichedApi),
         feature_store: Box::new(FakeFeatureStore {
@@ -2483,13 +2483,12 @@ async fn analyze_enriches_symbol_only_duplicate_contracts_with_signals_and_infri
     .await
     .unwrap();
 
-    assert_eq!(payload.duplicate_contracts.len(), 1);
-    assert_eq!(payload.infringing_tokens.len(), 1);
-    assert_eq!(payload.infringing_tokens[0].contract_address, "0xdup");
-    assert_eq!(payload.address_signals["0xdup"].mint_address_count, 1);
-    assert_eq!(payload.victim_signals["0xdup"].owner_count, 1);
-    assert_eq!(payload.report_summary.candidate_contract_count, 1);
-    assert_eq!(payload.report_summary.infringing_nft_count, 1);
+    assert!(payload.duplicate_contracts.is_empty());
+    assert!(payload.infringing_tokens.is_empty());
+    assert!(payload.address_signals.is_empty());
+    assert!(payload.victim_signals.is_empty());
+    assert_eq!(payload.report_summary.candidate_contract_count, 0);
+    assert_eq!(payload.report_summary.infringing_nft_count, 0);
 }
 
 #[tokio::test]

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -43,7 +43,6 @@ pub struct ContractSignal {
     pub token_count: usize,
     pub uri_match_count: usize,
     pub image_match_count: usize,
-    pub symbol_match: bool,
     pub name_prefix_match: bool,
     pub keyword_match: bool,
 }
@@ -58,7 +57,6 @@ pub struct OwnerBalance {
 pub struct DatabaseSnapshot {
     pub nft_rows: Vec<DatabaseNftRecord>,
     pub contract_names: Vec<ContractNameRecord>,
-    pub symbol_contracts: BTreeMap<String, BTreeSet<String>>,
     pub contract_signals: BTreeMap<String, ContractSignal>,
 }
 

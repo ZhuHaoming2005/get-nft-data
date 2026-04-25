@@ -10,15 +10,14 @@ use crate::error::AppError;
 use crate::models::{
     ContractNameRecord, ContractSignal, DatabaseNftRecord, DatabaseSnapshot, SeedNft,
 };
-use crate::normalize::{normalize_name, normalize_symbol, normalize_url};
+use crate::normalize::{normalize_name, normalize_url};
 
 static TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\p{L}\p{N}_]+").unwrap());
 
-const PRECOMPUTED_COLUMNS: [&str; 6] = [
+const PRECOMPUTED_COLUMNS: [&str; 5] = [
     "token_uri_norm",
     "image_uri_norm",
     "name_norm",
-    "symbol_norm",
     "metadata_doc",
     "metadata_keywords_arr",
 ];
@@ -121,9 +120,9 @@ mod tests {
                         ..Default::default()
                     },
                     DatabaseNftRecord {
-                        contract_address: "0xsymbol".into(),
+                        contract_address: "0ximage".into(),
                         token_id: "1".into(),
-                        symbol: "SEED".into(),
+                        image_uri: "ipfs://seed-image.png".into(),
                         metadata_doc: "silver cat".into(),
                         ..Default::default()
                     },
@@ -133,7 +132,7 @@ mod tests {
         let seed_nfts = vec![SeedNft {
             contract_address: "0xseed".into(),
             token_id: "1".into(),
-            symbol: "SEED".into(),
+            image_uri: "ipfs://seed-image.png".into(),
             metadata_doc: "gold dragon".into(),
             ..Default::default()
         }];
@@ -147,8 +146,8 @@ mod tests {
 
         assert!(by_contract["0xmetadata"].metadata_recall_checked);
         assert!(by_contract["0xmetadata"].metadata_recall_match);
-        assert!(by_contract["0xsymbol"].metadata_recall_checked);
-        assert!(!by_contract["0xsymbol"].metadata_recall_match);
+        assert!(by_contract["0ximage"].metadata_recall_checked);
+        assert!(!by_contract["0ximage"].metadata_recall_match);
     }
 }
 
@@ -230,7 +229,6 @@ impl DuckDbFeatureStore {
                 token_uri_norm VARCHAR,
                 image_uri_norm VARCHAR,
                 name_norm VARCHAR,
-                symbol_norm VARCHAR,
                 metadata_doc VARCHAR,
                 metadata_keywords_arr VARCHAR
             );
@@ -317,8 +315,8 @@ impl DuckDbFeatureStore {
             "
             INSERT INTO nft_features (
                 chain, contract_address, token_id, token_uri, image_uri, name, symbol, metadata_json,
-                token_uri_norm, image_uri_norm, name_norm, symbol_norm, metadata_doc, metadata_keywords_arr
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                token_uri_norm, image_uri_norm, name_norm, metadata_doc, metadata_keywords_arr
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ",
         )?;
 
@@ -342,7 +340,6 @@ impl DuckDbFeatureStore {
                 normalize_url(&row.token_uri).unwrap_or_default(),
                 normalize_url(&row.image_uri).unwrap_or_default(),
                 normalize_name(&row.name),
-                normalize_symbol(&row.symbol),
                 metadata_doc,
                 metadata_keywords_arr,
             ])?;
@@ -367,7 +364,7 @@ impl DuckDbFeatureStore {
             "
             INSERT INTO nft_features (
                 chain, contract_address, token_id, token_uri, image_uri, name, symbol, metadata_json,
-                token_uri_norm, image_uri_norm, name_norm, symbol_norm, metadata_doc, metadata_keywords_arr
+                token_uri_norm, image_uri_norm, name_norm, metadata_doc, metadata_keywords_arr
             )
             SELECT
                 ? AS chain,
@@ -381,7 +378,6 @@ impl DuckDbFeatureStore {
                 coalesce(CAST(token_uri_norm AS VARCHAR), '') AS token_uri_norm,
                 coalesce(CAST(image_uri_norm AS VARCHAR), '') AS image_uri_norm,
                 coalesce(CAST(name_norm AS VARCHAR), '') AS name_norm,
-                coalesce(CAST(symbol_norm AS VARCHAR), '') AS symbol_norm,
                 coalesce(CAST(metadata_doc AS VARCHAR), '') AS metadata_doc,
                 coalesce(CAST(metadata_keywords_arr AS VARCHAR), '[]') AS metadata_keywords_arr
             FROM read_parquet({path})
@@ -495,11 +491,6 @@ impl DuckDbFeatureStore {
             .iter()
             .filter_map(|item| normalize_url(&item.image_uri))
             .collect();
-        let exact_symbols: HashSet<String> = seed_nfts
-            .iter()
-            .map(|item| normalize_symbol(&item.symbol))
-            .filter(|value| !value.is_empty())
-            .collect();
         let name_prefixes: HashSet<String> = seed_nfts
             .iter()
             .map(|item| normalize_name(&item.name))
@@ -514,9 +505,6 @@ impl DuckDbFeatureStore {
             predicates.push(format!("({predicate})"));
         }
         if let Some(predicate) = Self::sql_in_predicate("image_uri_norm", &exact_image_keys) {
-            predicates.push(format!("({predicate})"));
-        }
-        if let Some(predicate) = Self::sql_in_predicate("symbol_norm", &exact_symbols) {
             predicates.push(format!("({predicate})"));
         }
         if let Some(predicate) = Self::sql_in_predicate("substr(name_norm, 1, 8)", &name_prefixes) {
@@ -561,10 +549,10 @@ impl DuckDbFeatureStore {
         let select_sql = format!(
             "
             SELECT contract_address, token_id, token_uri, image_uri, name, symbol, metadata_json, metadata_doc,
-                   token_uri_norm, image_uri_norm, name_norm, symbol_norm, metadata_recall_match
+                   token_uri_norm, image_uri_norm, name_norm, metadata_recall_match
             FROM (
                 SELECT contract_address, token_id, token_uri, image_uri, name, symbol, metadata_json, metadata_doc,
-                       token_uri_norm, image_uri_norm, name_norm, symbol_norm,
+                       token_uri_norm, image_uri_norm, name_norm,
                        {metadata_recall_expr} AS metadata_recall_match,
                        row_number() OVER (PARTITION BY contract_address ORDER BY token_id) AS rn
                 FROM nft_features
@@ -596,22 +584,15 @@ impl DuckDbFeatureStore {
                 row.get::<_, String>(8)?,
                 row.get::<_, String>(9)?,
                 row.get::<_, String>(10)?,
-                row.get::<_, String>(11)?,
-                row.get::<_, bool>(12)?,
+                row.get::<_, bool>(11)?,
             ))
         })?;
 
         let mut selected_rows = Vec::new();
         let mut per_contract_counts: HashMap<String, usize> = HashMap::new();
         for row in rows {
-            let (
-                mut record,
-                token_uri_norm,
-                image_uri_norm,
-                name_norm,
-                symbol_norm,
-                metadata_recall_match,
-            ) = row?;
+            let (mut record, token_uri_norm, image_uri_norm, name_norm, metadata_recall_match) =
+                row?;
             if seed_contracts.contains(&record.contract_address) {
                 continue;
             }
@@ -619,7 +600,6 @@ impl DuckDbFeatureStore {
             let name_prefix = name_norm.chars().take(8).collect::<String>();
             let matches = exact_token_keys.contains(&token_uri_norm)
                 || exact_image_keys.contains(&image_uri_norm)
-                || exact_symbols.contains(&symbol_norm)
                 || (!name_prefix.is_empty() && name_prefixes.contains(&name_prefix))
                 || metadata_recall_match;
 
@@ -641,7 +621,6 @@ impl DuckDbFeatureStore {
                 token_uri_norm,
                 image_uri_norm,
                 name_norm,
-                symbol_norm,
                 metadata_recall_match,
             ));
             if max_recall_rows > 0 && selected_rows.len() >= max_recall_rows {
@@ -652,16 +631,9 @@ impl DuckDbFeatureStore {
         let mut nft_rows = Vec::new();
         let mut seen_contract_name_pairs: BTreeSet<(String, String)> = BTreeSet::new();
         let mut contract_names = Vec::new();
-        let mut symbol_contracts: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut contract_signals_raw: BTreeMap<String, ContractSignal> = BTreeMap::new();
-        for (
-            record,
-            token_uri_norm,
-            image_uri_norm,
-            name_norm,
-            symbol_norm,
-            metadata_recall_match,
-        ) in selected_rows
+        for (record, token_uri_norm, image_uri_norm, name_norm, metadata_recall_match) in
+            selected_rows
         {
             if !name_norm.is_empty()
                 && seen_contract_name_pairs
@@ -671,12 +643,6 @@ impl DuckDbFeatureStore {
                     contract_address: record.contract_address.clone(),
                     name_norm: name_norm.clone(),
                 });
-            }
-            if !symbol_norm.is_empty() {
-                symbol_contracts
-                    .entry(symbol_norm.clone())
-                    .or_default()
-                    .insert(record.contract_address.clone());
             }
 
             let signal = contract_signals_raw
@@ -692,9 +658,6 @@ impl DuckDbFeatureStore {
             if exact_image_keys.contains(&image_uri_norm) {
                 signal.image_match_count += 1;
             }
-            if exact_symbols.contains(&symbol_norm) {
-                signal.symbol_match = true;
-            }
             let name_prefix = name_norm.chars().take(8).collect::<String>();
             if !name_prefix.is_empty() && name_prefixes.contains(&name_prefix) {
                 signal.name_prefix_match = true;
@@ -709,7 +672,6 @@ impl DuckDbFeatureStore {
         Ok(DatabaseSnapshot {
             nft_rows,
             contract_names,
-            symbol_contracts,
             contract_signals: contract_signals_raw,
         })
     }

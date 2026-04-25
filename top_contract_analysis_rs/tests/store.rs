@@ -64,7 +64,6 @@ fn existing_current_feature_db_chain_rows_take_priority_over_parquet() {
             'ipfs:seed/meta-1' AS token_uri_norm,
             '' AS image_uri_norm,
             'parquet clone' AS name_norm,
-            'azuki' AS symbol_norm,
             '' AS metadata_doc,
             '[]' AS metadata_keywords_arr
         ",
@@ -140,7 +139,6 @@ fn parquet_loads_when_feature_db_has_no_chain_rows() {
             'ipfs:seed/meta-1' AS token_uri_norm,
             '' AS image_uri_norm,
             'parquet clone' AS name_norm,
-            'azuki' AS symbol_norm,
             '' AS metadata_doc,
             '[]' AS metadata_keywords_arr
         ",
@@ -201,7 +199,6 @@ fn old_feature_db_schema_is_rejected() {
                 token_uri_norm VARCHAR,
                 image_uri_norm VARCHAR,
                 name_norm VARCHAR,
-                symbol_norm VARCHAR,
                 metadata_doc VARCHAR
             );
             ",
@@ -325,7 +322,6 @@ fn feature_store_reuses_precomputed_metadata_keywords_for_recall_verification() 
             '' AS token_uri_norm,
             '' AS image_uri_norm,
             '' AS name_norm,
-            '' AS symbol_norm,
             'dog' AS metadata_doc,
             '[\"cat\"]' AS metadata_keywords_arr
         ",
@@ -414,19 +410,19 @@ fn feature_store_applies_total_recall_limit_after_sql_recall() {
                 DatabaseNftRecord {
                     contract_address: "0xone".into(),
                     token_id: "1".into(),
-                    symbol: "AZUKI".into(),
+                    metadata_doc: "gold dragon".into(),
                     ..Default::default()
                 },
                 DatabaseNftRecord {
                     contract_address: "0xtwo".into(),
                     token_id: "1".into(),
-                    symbol: "AZUKI".into(),
+                    metadata_doc: "gold dragon".into(),
                     ..Default::default()
                 },
                 DatabaseNftRecord {
                     contract_address: "0xthree".into(),
                     token_id: "1".into(),
-                    symbol: "OTHER".into(),
+                    metadata_doc: "silver cat".into(),
                     ..Default::default()
                 },
             ],
@@ -440,7 +436,7 @@ fn feature_store_applies_total_recall_limit_after_sql_recall() {
                 chain: "ethereum".into(),
                 contract_address: "0xseed".into(),
                 token_id: "1".into(),
-                symbol: "AZUKI".into(),
+                metadata_doc: "gold dragon".into(),
                 ..Default::default()
             }],
             0,
