@@ -84,7 +84,7 @@ cargo run --release -- analyze \
   --feature-parquet ../output/top_contract_analysis/ethereum.parquet \
   --feature-db ../output/top_contract_analysis/features.duckdb \
   --signal-cache-db ../output/top_contract_analysis/signals.duckdb \
-  --max-recall-rows 500000 \
+  --max-recall-rows 1000000 \
   --duckdb-memory-limit 50GB \
   --duckdb-threads 32
 ```
@@ -126,7 +126,8 @@ cargo run --release -- batch \
   --feature-db ../output/top_contract_analysis/features.duckdb \
   --signal-cache-db ../output/top_contract_analysis/signals.duckdb \
   --output-dir ../result \
-  --workers 4 \
+  --workers 3 \
+  --max-recall-rows 1000000 \
   --api-max-concurrency 24 \
   --contract-max-concurrency 12 \
   --sale-metric-max-concurrency 10 \
