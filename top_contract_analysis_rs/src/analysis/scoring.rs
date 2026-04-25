@@ -95,7 +95,7 @@ impl MetadataBm25Document {
         Self::from_tokens(metadata_bm25_tokens(document))
     }
 
-    fn from_tokens(tokens: Vec<String>) -> Option<Self> {
+    pub(crate) fn from_tokens(tokens: Vec<String>) -> Option<Self> {
         if tokens.is_empty() {
             return None;
         }
@@ -157,6 +157,40 @@ pub struct MetadataBm25Corpus {
     doc_freqs: HashMap<String, usize>,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct MetadataBm25CorpusBuilder {
+    total_docs: usize,
+    total_terms: usize,
+    doc_freqs: HashMap<String, usize>,
+}
+
+impl MetadataBm25CorpusBuilder {
+    pub(crate) fn add_tokens(&mut self, tokens: &[String]) {
+        if tokens.is_empty() {
+            return;
+        }
+        self.total_docs += 1;
+        self.total_terms += tokens.len();
+        for token in tokens.iter().collect::<HashSet<_>>() {
+            *self.doc_freqs.entry((*token).clone()).or_insert(0) += 1;
+        }
+    }
+
+    pub(crate) fn finish(self) -> MetadataBm25Corpus {
+        let avg_doc_len = if self.total_docs == 0 {
+            0.0
+        } else {
+            self.total_terms as f64 / self.total_docs as f64
+        };
+
+        MetadataBm25Corpus {
+            total_docs: self.total_docs,
+            avg_doc_len,
+            doc_freqs: self.doc_freqs,
+        }
+    }
+}
+
 impl MetadataBm25Corpus {
     pub fn from_documents(documents: &[String]) -> Self {
         let indexed_documents: Vec<_> = documents
@@ -167,29 +201,16 @@ impl MetadataBm25Corpus {
     }
 
     pub fn from_indexed_documents(documents: &[MetadataBm25Document]) -> Self {
-        let mut total_docs = 0usize;
-        let mut total_terms = 0usize;
-        let mut doc_freqs = HashMap::new();
-
+        let mut builder = MetadataBm25CorpusBuilder::default();
         for document in documents {
-            total_docs += 1;
-            total_terms += document.len();
-            for token in document.tokens().iter().collect::<HashSet<_>>() {
-                *doc_freqs.entry((*token).clone()).or_insert(0) += 1;
-            }
+            builder.add_tokens(document.tokens());
         }
+        builder.finish()
+    }
 
-        let avg_doc_len = if total_docs == 0 {
-            0.0
-        } else {
-            total_terms as f64 / total_docs as f64
-        };
-
-        Self {
-            total_docs,
-            avg_doc_len,
-            doc_freqs,
-        }
+    #[cfg(test)]
+    pub(crate) fn total_docs(&self) -> usize {
+        self.total_docs
     }
 }
 

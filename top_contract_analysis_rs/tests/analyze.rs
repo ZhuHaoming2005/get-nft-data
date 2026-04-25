@@ -3,19 +3,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use tokio::time::{sleep, Duration};
-use top_contract_analysis_rs::models::{
-    AddressSignalPayload, DuplicateContractPayload, FraudTradeStatsPayload,
-    HonestAddressPayload, HonestAddressStatsPayload, MaliciousAddressPayload,
-    ReportSummary, SeedCollectionStatsPayload, SeedContractPayload,
-    SingleReportPayload, VictimAddressPayload, VictimSignalPayload,
-};
 use tempfile::tempdir;
+use tokio::time::{sleep, Duration};
 use top_contract_analysis_rs::analysis::{
     analyze_seed_contract, AnalysisDeps, AnalyzeApi, AnalyzeRequest, FeatureStoreReader,
     SignalCacheStore,
 };
 use top_contract_analysis_rs::error::AppError;
+use top_contract_analysis_rs::models::{
+    AddressSignalPayload, DuplicateContractPayload, FraudTradeStatsPayload, HonestAddressPayload,
+    HonestAddressStatsPayload, MaliciousAddressPayload, ReportSummary, SeedCollectionStatsPayload,
+    SeedContractPayload, SingleReportPayload, VictimAddressPayload, VictimSignalPayload,
+};
 use top_contract_analysis_rs::models::{
     ContractMetadata, DatabaseNftRecord, DatabaseSnapshot, EthTransferRecord, NftSaleRecord,
     OwnerBalance, SeedNft, TransactionReceiptRecord, TransferRecord,
@@ -229,8 +228,13 @@ impl AnalyzeApi for FakeOpenLicenseApi {
         alchemy_network: Option<&str>,
         contract_address: &str,
     ) -> Result<Vec<OwnerBalance>, AppError> {
-        AnalyzeApi::fetch_contract_owners(&FakeApi, alchemy_api_key, alchemy_network, contract_address)
-            .await
+        AnalyzeApi::fetch_contract_owners(
+            &FakeApi,
+            alchemy_api_key,
+            alchemy_network,
+            contract_address,
+        )
+        .await
     }
 
     async fn fetch_contract_sales(
@@ -256,7 +260,8 @@ impl AnalyzeApi for FakeOpenLicenseApi {
         alchemy_network: Option<&str>,
         tx_hash: &str,
     ) -> Result<TransactionReceiptRecord, AppError> {
-        AnalyzeApi::fetch_transaction_receipt(&FakeApi, alchemy_api_key, alchemy_network, tx_hash).await
+        AnalyzeApi::fetch_transaction_receipt(&FakeApi, alchemy_api_key, alchemy_network, tx_hash)
+            .await
     }
 
     async fn fetch_transaction_receipts_for_block(
@@ -281,8 +286,14 @@ impl AnalyzeApi for FakeOpenLicenseApi {
         address: &str,
         block_number: i64,
     ) -> Result<f64, AppError> {
-        AnalyzeApi::fetch_eth_balance(&FakeApi, alchemy_api_key, alchemy_network, address, block_number)
-            .await
+        AnalyzeApi::fetch_eth_balance(
+            &FakeApi,
+            alchemy_api_key,
+            alchemy_network,
+            address,
+            block_number,
+        )
+        .await
     }
 
     async fn fetch_same_block_eth_transfers_for_address(
@@ -1051,7 +1062,8 @@ impl AnalyzeApi for ConcurrentContractApi {
         _token_type: &str,
     ) -> Result<Vec<TransferRecord>, AppError> {
         let active = self.active_transfer_fetches.fetch_add(1, Ordering::SeqCst) + 1;
-        self.max_transfer_fetches.fetch_max(active, Ordering::SeqCst);
+        self.max_transfer_fetches
+            .fetch_max(active, Ordering::SeqCst);
         sleep(Duration::from_millis(40)).await;
         self.active_transfer_fetches.fetch_sub(1, Ordering::SeqCst);
 
@@ -1557,7 +1569,10 @@ fn default_output_basename_matches_existing_prefix() {
         ..Default::default()
     };
 
-    assert_eq!(default_output_basename(&payload), "top_contract_analysis__azuki");
+    assert_eq!(
+        default_output_basename(&payload),
+        "top_contract_analysis__azuki"
+    );
 }
 
 #[test]
@@ -1571,7 +1586,10 @@ fn default_output_basename_casefolds_non_ascii_more_like_python() {
         ..Default::default()
     };
 
-    assert_eq!(default_output_basename(&payload), "top_contract_analysis__strasse");
+    assert_eq!(
+        default_output_basename(&payload),
+        "top_contract_analysis__strasse"
+    );
 }
 
 #[test]
@@ -1596,9 +1614,7 @@ fn single_report_payload_serializes_current_python_top_level_shape() {
         }],
         contract_level_summary: BTreeMap::from([(
             "0xdup".into(),
-            top_contract_analysis_rs::models::ContractLevelSummaryPayload {
-                candidate_count: 1,
-            },
+            top_contract_analysis_rs::models::ContractLevelSummaryPayload { candidate_count: 1 },
         )]),
         infringing_tokens: vec![top_contract_analysis_rs::models::InfringingTokenRecord {
             contract_address: "0xdup".into(),
@@ -1653,17 +1669,32 @@ fn single_report_payload_serializes_current_python_top_level_shape() {
         ])
     );
     assert!(!object.contains_key("output_files"));
-    assert_eq!(serialized["duplicate_candidates"][0]["contract_address"], "0xdup");
-    assert_eq!(serialized["contract_level_summary"]["0xdup"]["candidate_count"], 1);
-    assert_eq!(serialized["infringing_tokens"][0]["minter_address"], "0xminter");
+    assert_eq!(
+        serialized["duplicate_candidates"][0]["contract_address"],
+        "0xdup"
+    );
+    assert_eq!(
+        serialized["contract_level_summary"]["0xdup"]["candidate_count"],
+        1
+    );
+    assert_eq!(
+        serialized["infringing_tokens"][0]["minter_address"],
+        "0xminter"
+    );
     assert_eq!(serialized["malicious_addresses"][0]["address"], "0xsybil");
     assert_eq!(serialized["honest_addresses"][0]["hold_duration_count"], 2);
     assert_eq!(
         serialized["honest_addresses"][0]["mint_to_honest_seconds_samples"],
         serde_json::json!([15, 30])
     );
-    assert_eq!(serialized["fraud_trade_stats"]["0xdup"]["native_eth_sale_count"], 4);
-    assert_eq!(serialized["fraud_trade_stats"]["0xdup"]["native_eth_volume"], 6.25);
+    assert_eq!(
+        serialized["fraud_trade_stats"]["0xdup"]["native_eth_sale_count"],
+        4
+    );
+    assert_eq!(
+        serialized["fraud_trade_stats"]["0xdup"]["native_eth_volume"],
+        6.25
+    );
 }
 
 #[test]
@@ -1820,7 +1851,9 @@ fn single_report_markdown_preserves_reference_sections_and_summary_lines() {
     assert!(markdown.contains("- 0xhigh: 2 个重复 NFT | 命中原因=token_uri_match, name_match"));
     assert!(markdown.contains("- 0xlow: 1 个重复 NFT | 命中原因=symbol_match"));
     assert!(markdown.contains("## 被算法归为官方参与型重复的合约"));
-    assert!(markdown.contains("- 0xlegit: 1 个重复 NFT | mint 接收地址(命中官方地址规则)=0xofficial"));
+    assert!(
+        markdown.contains("- 0xlegit: 1 个重复 NFT | mint 接收地址(命中官方地址规则)=0xofficial")
+    );
     assert!(markdown.contains("## 地址行为信号"));
     assert!(markdown.contains("### 0xhigh"));
     assert!(markdown.contains("- 快速扩散: 是"));
@@ -1981,7 +2014,10 @@ async fn analyze_moves_official_reissues_into_legit_duplicates() {
     assert!(payload.infringing_tokens.is_empty());
     assert_eq!(payload.legit_duplicates.len(), 1);
     assert_eq!(payload.legit_duplicates[0].contract_address, "0xdup");
-    assert_eq!(payload.legit_duplicates[0].mint_recipients, vec!["0xminter"]);
+    assert_eq!(
+        payload.legit_duplicates[0].mint_recipients,
+        vec!["0xminter"]
+    );
     assert_eq!(payload.report_summary.legit_duplicate_contract_count, 1);
 }
 
@@ -2095,7 +2131,11 @@ async fn analyze_writes_default_json_and_markdown_files() {
 
     let (json_path, md_path) = write_outputs_to_directory(&payload, dir.path()).unwrap();
 
-    assert!(json_path.file_name().unwrap().to_string_lossy().starts_with("top_contract_analysis__"));
+    assert!(json_path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("top_contract_analysis__"));
     assert!(md_path.exists());
 }
 
@@ -2233,8 +2273,14 @@ async fn analyze_builds_address_profiles_and_trade_stats_for_duplicate_contracts
     assert_eq!(payload.victim_addresses[0].address, "0xvictim");
     assert_eq!(payload.victim_addresses[0].buy_amount_eth, 1.5);
     assert!(!payload.victim_addresses[0].is_stuck);
-    assert_eq!(payload.honest_address_stats["0xdup"].honest_address_count, 2);
-    assert_eq!(payload.honest_address_stats["0xdup"].corrupted_address_count, 1);
+    assert_eq!(
+        payload.honest_address_stats["0xdup"].honest_address_count,
+        2
+    );
+    assert_eq!(
+        payload.honest_address_stats["0xdup"].corrupted_address_count,
+        1
+    );
     assert_eq!(
         payload.honest_address_stats["0xdup"].honest_to_honest_transfer_count,
         1
@@ -2244,8 +2290,14 @@ async fn analyze_builds_address_profiles_and_trade_stats_for_duplicate_contracts
         Some(10.0)
     );
     assert_eq!(payload.fraud_trade_stats["0xdup"].unique_buyers, 1);
-    assert_eq!(payload.fraud_trade_stats["0xdup"].eth_priced_sale_count, Some(1));
-    assert_eq!(payload.fraud_trade_stats["0xdup"].eth_priced_volume, Some(1.5));
+    assert_eq!(
+        payload.fraud_trade_stats["0xdup"].eth_priced_sale_count,
+        Some(1)
+    );
+    assert_eq!(
+        payload.fraud_trade_stats["0xdup"].eth_priced_volume,
+        Some(1.5)
+    );
     assert_eq!(payload.fraud_trade_stats["0xdup"].stuck_wallet_count, 0);
     assert_eq!(payload.report_summary.malicious_address_count, 1);
     assert_eq!(payload.report_summary.honest_address_count, 2);
@@ -2289,8 +2341,14 @@ async fn analyze_reuses_signal_cache_for_transfers_and_owners() {
 
     assert_eq!(api.transfer_fetch_count.load(Ordering::SeqCst), 1);
     assert_eq!(api.owner_fetch_count.load(Ordering::SeqCst), 1);
-    assert_eq!(first.address_signals["0xdup"], second.address_signals["0xdup"]);
-    assert_eq!(first.victim_signals["0xdup"], second.victim_signals["0xdup"]);
+    assert_eq!(
+        first.address_signals["0xdup"],
+        second.address_signals["0xdup"]
+    );
+    assert_eq!(
+        first.victim_signals["0xdup"],
+        second.victim_signals["0xdup"]
+    );
 }
 
 #[tokio::test]
@@ -2331,14 +2389,22 @@ async fn analyze_computes_native_eth_sale_metrics_for_victim_addresses() {
 
     assert_eq!(payload.victim_addresses.len(), 1);
     assert_eq!(payload.victim_addresses[0].address, "0xvictim");
-    assert_eq!(payload.victim_addresses[0].buy_before_eth_balance, Some(3.0));
+    assert_eq!(
+        payload.victim_addresses[0].buy_before_eth_balance,
+        Some(3.0)
+    );
     assert_eq!(payload.victim_addresses[0].buy_asset_ratio, Some(0.5));
-    assert!(payload.victim_addresses[0]
-        .buy_asset_ratio_with_gas
-        .unwrap()
-        > 0.5);
+    assert!(
+        payload.victim_addresses[0]
+            .buy_asset_ratio_with_gas
+            .unwrap()
+            > 0.5
+    );
     assert_eq!(payload.victim_addresses[0].ratio_status, "ok");
-    assert_eq!(payload.report_summary.buy_asset_ratio_known_address_count, 1);
+    assert_eq!(
+        payload.report_summary.buy_asset_ratio_known_address_count,
+        1
+    );
     assert_eq!(payload.report_summary.ratio_over_60_address_count, 0);
 }
 

@@ -15,9 +15,12 @@ fn normalize_token_id(raw: Option<&Value>) -> String {
         .unwrap_or_else(|| raw.to_string());
     let trimmed = text.trim();
     if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
-        i128::from_str_radix(trimmed.trim_start_matches("0x").trim_start_matches("0X"), 16)
-            .map(|value| value.to_string())
-            .unwrap_or_else(|_| trimmed.to_string())
+        i128::from_str_radix(
+            trimmed.trim_start_matches("0x").trim_start_matches("0X"),
+            16,
+        )
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| trimmed.to_string())
     } else {
         trimmed.to_string()
     }
@@ -40,8 +43,9 @@ pub async fn fetch_etherscan_contract_transfers(
     contract_address: &str,
     token_type: &str,
 ) -> Result<Vec<TransferRecord>, AppError> {
-    let chain_id = etherscan_chain_id(chain)
-        .ok_or_else(|| AppError::InvalidData(format!("unsupported chain for etherscan fallback: {chain}")))?;
+    let chain_id = etherscan_chain_id(chain).ok_or_else(|| {
+        AppError::InvalidData(format!("unsupported chain for etherscan fallback: {chain}"))
+    })?;
     let action = if token_type.eq_ignore_ascii_case("ERC1155") {
         "token1155tx"
     } else {
@@ -74,7 +78,11 @@ pub async fn fetch_etherscan_contract_transfers(
                     .unwrap_or(contract_address)
                     .to_lowercase(),
                 token_id: normalize_token_id(item.get("tokenID")),
-                tx_hash: item.get("hash").and_then(Value::as_str).unwrap_or("").to_string(),
+                tx_hash: item
+                    .get("hash")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
                 log_index: item
                     .get("transactionIndex")
                     .and_then(Value::as_str)

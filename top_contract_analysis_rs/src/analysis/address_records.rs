@@ -22,7 +22,11 @@ pub(crate) struct PreparedContractActivity<'a> {
 }
 
 fn transfer_sort_key(transfer: &TransferRecord) -> (i64, i64, &str) {
-    (transfer.block_number, transfer.log_index, transfer.tx_hash.as_str())
+    (
+        transfer.block_number,
+        transfer.log_index,
+        transfer.tx_hash.as_str(),
+    )
 }
 
 fn sale_sort_key(sale: &NftSaleRecord) -> (i64, i64, i64, &str) {
@@ -177,7 +181,8 @@ pub fn build_infringing_token_records_with_context_refs(
             .push(transfer);
     }
     for token_transfers in transfers_by_token.values_mut() {
-        token_transfers.sort_by(|left, right| transfer_sort_key(left).cmp(&transfer_sort_key(right)));
+        token_transfers
+            .sort_by(|left, right| transfer_sort_key(left).cmp(&transfer_sort_key(right)));
     }
 
     let mut rows: Vec<InfringingTokenRecord> = contract_candidates
@@ -241,11 +246,8 @@ pub fn build_malicious_address_records(
     transfers: &[TransferRecord],
     infringing_tokens: &[InfringingTokenRecord],
 ) -> Vec<MaliciousAddressPayload> {
-    let activity = prepare_contract_activity(
-        transfers,
-        &[] as &[NftSaleRecord],
-        &[] as &[OwnerBalance],
-    );
+    let activity =
+        prepare_contract_activity(transfers, &[] as &[NftSaleRecord], &[] as &[OwnerBalance]);
     build_malicious_address_records_from_activity(contract_address, &activity, infringing_tokens)
 }
 
@@ -291,13 +293,16 @@ pub(crate) fn build_malicious_address_records_from_activity(
             let pair = (transfer.from_address.clone(), transfer.to_address.clone());
             let reverse = (transfer.to_address.clone(), transfer.from_address.clone());
             if seen_pairs.contains(&reverse) {
-                *cycle_counts.entry(transfer.from_address.clone()).or_insert(0) += 1;
+                *cycle_counts
+                    .entry(transfer.from_address.clone())
+                    .or_insert(0) += 1;
                 *cycle_counts.entry(transfer.to_address.clone()).or_insert(0) += 1;
             }
             seen_pairs.insert(pair);
         }
         let mint_time = *mint_times.get(&transfer.token_id).unwrap_or(&0);
-        if mint_time > 0 && transfer.block_time > 0 && transfer.block_time - mint_time <= 24 * 3600 {
+        if mint_time > 0 && transfer.block_time > 0 && transfer.block_time - mint_time <= 24 * 3600
+        {
             if !transfer.from_address.is_empty() {
                 rapid_addresses.insert(transfer.from_address.clone());
             }
@@ -359,7 +364,6 @@ pub(crate) fn build_victim_address_records_from_activity(
     activity: &PreparedContractActivity<'_>,
     sale_metrics_by_tx: &BTreeMap<String, SaleMetricRecord>,
 ) -> Vec<VictimAddressPayload> {
-
     let mut grouped: BTreeMap<String, VictimAddressPayload> = BTreeMap::new();
     let mut last_buy_key: HashMap<String, (i64, i64, i64, String)> = HashMap::new();
 
@@ -367,13 +371,15 @@ pub(crate) fn build_victim_address_records_from_activity(
         if sale.buyer_address.is_empty() {
             continue;
         }
-        let metrics = sale_metrics_by_tx.get(&sale.tx_hash).cloned().unwrap_or_default();
+        let metrics = sale_metrics_by_tx
+            .get(&sale.tx_hash)
+            .cloned()
+            .unwrap_or_default();
         let later_transfer_out = activity
             .latest_outgoing
             .get(&(sale.buyer_address.clone(), sale.token_id.clone()))
             .map(|transfer_key| {
-                transfer_key
-                    > &(sale.block_number, sale.log_index, sale.tx_hash.clone())
+                transfer_key > &(sale.block_number, sale.log_index, sale.tx_hash.clone())
             })
             .unwrap_or(false);
         let is_stuck = activity
@@ -391,7 +397,11 @@ pub(crate) fn build_victim_address_records_from_activity(
                 ..VictimAddressPayload::default()
             });
         entry.buy_tx_hashes.push(sale.tx_hash.clone());
-        if sale.price_eth.is_some() && (sale.is_native_eth || sale.payment_token_symbol.eq_ignore_ascii_case("ETH") || sale.payment_token_symbol.eq_ignore_ascii_case("WETH")) {
+        if sale.price_eth.is_some()
+            && (sale.is_native_eth
+                || sale.payment_token_symbol.eq_ignore_ascii_case("ETH")
+                || sale.payment_token_symbol.eq_ignore_ascii_case("WETH"))
+        {
             entry.buy_amount_eth += sale.price_eth.unwrap_or(0.0);
         }
         let current_key = (
@@ -555,7 +565,9 @@ pub(crate) fn build_honest_address_records_from_activity(
                     }
                 }
             }
-            if honest_set.contains(&transfer.from_address) && honest_set.contains(&transfer.to_address) {
+            if honest_set.contains(&transfer.from_address)
+                && honest_set.contains(&transfer.to_address)
+            {
                 corrupted_addresses.insert(transfer.from_address.clone());
                 *honest_to_honest_count
                     .entry(transfer.from_address.clone())
@@ -606,7 +618,10 @@ pub(crate) fn build_honest_address_records_from_activity(
                 .unwrap_or_default();
             let mut union_tokens = interacted_tokens;
             union_tokens.extend(current_tokens.iter().cloned());
-            let hold_durations = durations_by_address.get(&address).cloned().unwrap_or_default();
+            let hold_durations = durations_by_address
+                .get(&address)
+                .cloned()
+                .unwrap_or_default();
 
             HonestAddressPayload {
                 contract_address: contract_address.to_string(),
@@ -641,7 +656,11 @@ pub fn build_honest_address_stats(
         .collect();
     let mint_to_honest_samples: Vec<f64> = honest_addresses
         .iter()
-        .flat_map(|item| item.mint_to_honest_seconds_samples.iter().map(|sample| *sample as f64))
+        .flat_map(|item| {
+            item.mint_to_honest_seconds_samples
+                .iter()
+                .map(|sample| *sample as f64)
+        })
         .collect();
 
     BTreeMap::from([(
@@ -684,7 +703,9 @@ pub fn build_fraud_trade_stats(
         FraudTradeStatsPayload {
             unique_buyers: sales
                 .iter()
-                .filter_map(|sale| (!sale.buyer_address.is_empty()).then(|| sale.buyer_address.clone()))
+                .filter_map(|sale| {
+                    (!sale.buyer_address.is_empty()).then(|| sale.buyer_address.clone())
+                })
                 .collect::<BTreeSet<_>>()
                 .len() as i64,
             native_eth_sale_count: Some(native_sales.len() as i64),

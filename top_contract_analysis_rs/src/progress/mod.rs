@@ -206,7 +206,13 @@ impl TerminalBatchProgressReporter {
                 .values()
                 .filter(|entry| entry.status == SeedStatus::Running)
                 .count();
-            (state.completed, state.total, running, state.workers, message)
+            (
+                state.completed,
+                state.total,
+                running,
+                state.workers,
+                message,
+            )
         };
         let mut stderr = std::io::stderr().lock();
         let _ = writeln!(
@@ -319,7 +325,13 @@ impl BatchSeedProgressReporter {
                 .values()
                 .filter(|entry| entry.status == SeedStatus::Running)
                 .count();
-            (state.completed, state.total, running, state.workers, changed)
+            (
+                state.completed,
+                state.total,
+                running,
+                state.workers,
+                changed,
+            )
         };
         if !changed {
             return;

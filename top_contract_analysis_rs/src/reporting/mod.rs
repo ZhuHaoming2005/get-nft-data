@@ -7,15 +7,11 @@ use unicode_normalization::UnicodeNormalization;
 use crate::error::AppError;
 use crate::models::{BatchSummaryPayload, SingleReportPayload};
 
-static SLUG_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"[^0-9a-zA-Z\u{4e00}-\u{9fff}]+").unwrap());
+static SLUG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[^0-9a-zA-Z\u{4e00}-\u{9fff}]+").unwrap());
 
 fn slugify(value: &str) -> String {
     let normalized = value.nfkc().collect::<String>();
-    let lowered = normalized
-        .trim()
-        .to_lowercase()
-        .replace('ß', "ss");
+    let lowered = normalized.trim().to_lowercase().replace('ß', "ss");
     let slug = SLUG_RE.replace_all(&lowered, "_");
     let slug = slug.trim_matches('_');
     if slug.is_empty() {
@@ -412,7 +408,10 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
             "- 重复候选合约总数: {}",
             summary.candidate_contract_count_total
         ),
-        format!("- 疑似侵权 NFT 总数: {}", summary.infringing_nft_count_total),
+        format!(
+            "- 疑似侵权 NFT 总数: {}",
+            summary.infringing_nft_count_total
+        ),
         format!("- 恶意地址总数: {}", summary.malicious_address_count_total),
         format!("- 诚实地址总数: {}", summary.honest_address_count_total),
         format!(

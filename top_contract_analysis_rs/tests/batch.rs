@@ -291,11 +291,7 @@ fn batch_markdown_preserves_reference_summary_and_output_index_lines() {
 #[tokio::test]
 async fn batch_skips_cached_seed_reports_in_output_directory() {
     let dir = tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("seeds.txt"),
-        "0xseed1\n0xseed2\n",
-    )
-    .unwrap();
+    std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n").unwrap();
     std::fs::write(
         dir.path().join("top_contract_analysis__cached.json"),
         serde_json::json!({
@@ -339,24 +335,24 @@ async fn batch_skips_cached_seed_reports_in_output_directory() {
 
     assert_eq!(summary.batch_summary.seed_report_count, 2);
     assert_eq!(summary.seed_reports.len(), 2);
-    assert_eq!(summary.seed_reports[0].seed_contract.contract_address, "0xseed1");
-    assert_eq!(summary.seed_reports[1].seed_contract.contract_address, "0xseed2");
     assert_eq!(
-        summary.seed_reports[0]
-            .output_files
-            .as_ref()
-            .unwrap()
-            .json,
+        summary.seed_reports[0].seed_contract.contract_address,
+        "0xseed1"
+    );
+    assert_eq!(
+        summary.seed_reports[1].seed_contract.contract_address,
+        "0xseed2"
+    );
+    assert_eq!(
+        summary.seed_reports[0].output_files.as_ref().unwrap().json,
         "top_contract_analysis__cached.json"
     );
-    assert!(
-        summary.seed_reports[1]
-            .output_files
-            .as_ref()
-            .unwrap()
-            .json
-            .starts_with("top_contract_analysis__")
-    );
+    assert!(summary.seed_reports[1]
+        .output_files
+        .as_ref()
+        .unwrap()
+        .json
+        .starts_with("top_contract_analysis__"));
 }
 
 #[tokio::test]
@@ -552,37 +548,81 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
     assert_eq!(summary.batch_summary.infringing_nft_count_total, 3);
     assert_eq!(summary.batch_summary.malicious_address_count_total, 3);
     assert_eq!(summary.batch_summary.honest_address_count_total, 2);
-    assert_eq!(summary.batch_summary.repeat_infringing_address_count_total, 1);
-    assert_eq!(summary.batch_summary.repeat_infringing_address_count_global, 1);
+    assert_eq!(
+        summary.batch_summary.repeat_infringing_address_count_total,
+        1
+    );
+    assert_eq!(
+        summary.batch_summary.repeat_infringing_address_count_global,
+        1
+    );
     assert_eq!(summary.batch_summary.honest_purchase_total_eth_total, 15.0);
     assert_eq!(summary.batch_summary.stuck_cost_eth_total, 3.0);
     assert_eq!(summary.batch_summary.stuck_cost_ratio_overall, Some(0.2));
-    assert_eq!(summary.batch_summary.buy_asset_ratio_known_address_count_total, 5);
+    assert_eq!(
+        summary
+            .batch_summary
+            .buy_asset_ratio_known_address_count_total,
+        5
+    );
     assert_eq!(summary.batch_summary.ratio_over_60_address_count_total, 3);
-    assert_eq!(summary.batch_summary.ratio_over_60_address_ratio_overall, Some(0.6));
+    assert_eq!(
+        summary.batch_summary.ratio_over_60_address_ratio_overall,
+        Some(0.6)
+    );
     assert_eq!(summary.batch_summary.ratio_over_80_address_count_total, 1);
-    assert_eq!(summary.batch_summary.ratio_over_80_address_ratio_overall, Some(0.2));
+    assert_eq!(
+        summary.batch_summary.ratio_over_80_address_ratio_overall,
+        Some(0.2)
+    );
     assert_eq!(summary.batch_summary.stuck_honest_address_count_total, 2);
-    assert_eq!(summary.batch_summary.stuck_honest_address_ratio_overall, Some(0.4));
-    assert_eq!(summary.batch_summary.corrupted_honest_address_count_total, 1);
-    assert_eq!(summary.batch_summary.avg_seconds_to_honest_holder_mean, Some(15.0));
+    assert_eq!(
+        summary.batch_summary.stuck_honest_address_ratio_overall,
+        Some(0.4)
+    );
+    assert_eq!(
+        summary.batch_summary.corrupted_honest_address_count_total,
+        1
+    );
+    assert_eq!(
+        summary.batch_summary.avg_seconds_to_honest_holder_mean,
+        Some(15.0)
+    );
     assert_eq!(
         summary.batch_summary.median_seconds_to_honest_holder_median,
         Some(15.0)
     );
     assert_eq!(
-        summary.batch_summary.avg_mint_to_first_transfer_seconds_mean,
+        summary
+            .batch_summary
+            .avg_mint_to_first_transfer_seconds_mean,
         Some(11.0)
     );
     assert_eq!(
-        summary.batch_summary.median_mint_to_first_transfer_seconds_median,
+        summary
+            .batch_summary
+            .median_mint_to_first_transfer_seconds_median,
         Some(13.5)
     );
-    assert_eq!(summary.batch_summary.avg_unique_receiver_count_mean, Some(3.0));
+    assert_eq!(
+        summary.batch_summary.avg_unique_receiver_count_mean,
+        Some(3.0)
+    );
 
-    assert_eq!(summary.seed_reports[0].report_summary.infringing_nft_count, 2);
-    assert_eq!(summary.seed_reports[0].report_summary.malicious_address_count, 2);
-    assert_eq!(summary.seed_reports[0].report_summary.honest_address_count, 1);
+    assert_eq!(
+        summary.seed_reports[0].report_summary.infringing_nft_count,
+        2
+    );
+    assert_eq!(
+        summary.seed_reports[0]
+            .report_summary
+            .malicious_address_count,
+        2
+    );
+    assert_eq!(
+        summary.seed_reports[0].report_summary.honest_address_count,
+        1
+    );
     assert_eq!(
         summary.seed_reports[0]
             .report_summary
@@ -590,7 +630,10 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
         1
     );
     assert_eq!(summary.seed_reports[0].report_summary.stuck_cost_eth, 2.0);
-    assert_eq!(summary.seed_reports[0].report_summary.stuck_cost_ratio, Some(0.2));
+    assert_eq!(
+        summary.seed_reports[0].report_summary.stuck_cost_ratio,
+        Some(0.2)
+    );
     assert_eq!(
         summary.seed_reports[0]
             .report_summary
@@ -628,8 +671,14 @@ async fn batch_writes_summary_files_with_existing_names() {
 
     let (json_path, md_path) = write_batch_summary_outputs(&payload, dir.path()).unwrap();
 
-    assert_eq!(json_path.file_name().unwrap().to_string_lossy(), "top_contract_analysis__summary.json");
-    assert_eq!(md_path.file_name().unwrap().to_string_lossy(), "top_contract_analysis__summary.md");
+    assert_eq!(
+        json_path.file_name().unwrap().to_string_lossy(),
+        "top_contract_analysis__summary.json"
+    );
+    assert_eq!(
+        md_path.file_name().unwrap().to_string_lossy(),
+        "top_contract_analysis__summary.md"
+    );
 }
 
 struct SlowBatchApi {
@@ -877,8 +926,14 @@ async fn batch_progress_reporter_receives_seed_lifecycle_events() {
     .await
     .unwrap();
 
-    assert_eq!(batch_progress.started.lock().unwrap().as_slice(), ["0xseed1"]);
-    assert_eq!(batch_progress.finished.lock().unwrap().as_slice(), ["0xseed1"]);
+    assert_eq!(
+        batch_progress.started.lock().unwrap().as_slice(),
+        ["0xseed1"]
+    );
+    assert_eq!(
+        batch_progress.finished.lock().unwrap().as_slice(),
+        ["0xseed1"]
+    );
     assert!(batch_progress.cached.lock().unwrap().is_empty());
     assert!(batch_progress.failed.lock().unwrap().is_empty());
     assert_eq!(
@@ -934,8 +989,17 @@ async fn batch_progress_reporter_counts_cached_seed_reports() {
     .await
     .unwrap();
 
-    assert_eq!(batch_progress.cached.lock().unwrap().as_slice(), ["0xseed1"]);
-    assert_eq!(batch_progress.started.lock().unwrap().as_slice(), ["0xseed2"]);
-    assert_eq!(batch_progress.finished.lock().unwrap().as_slice(), ["0xseed2"]);
+    assert_eq!(
+        batch_progress.cached.lock().unwrap().as_slice(),
+        ["0xseed1"]
+    );
+    assert_eq!(
+        batch_progress.started.lock().unwrap().as_slice(),
+        ["0xseed2"]
+    );
+    assert_eq!(
+        batch_progress.finished.lock().unwrap().as_slice(),
+        ["0xseed2"]
+    );
     assert!(batch_progress.failed.lock().unwrap().is_empty());
 }

@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use rayon::prelude::*;
 
 use crate::analysis::scoring::{
-    metadata_document_from_json, score_metadata_indexed_pair_with_corpus, score_name_pair,
-    MetadataBm25Corpus, MetadataBm25Document,
+    metadata_bm25_tokens, metadata_document_from_json, score_metadata_indexed_pair_with_corpus,
+    score_name_pair, MetadataBm25Corpus, MetadataBm25CorpusBuilder, MetadataBm25Document,
 };
 use crate::models::{DatabaseNftRecord, DuplicateCandidate, SeedNft};
 use crate::normalize::{normalize_name, normalize_symbol, normalize_text, normalize_url};
@@ -49,8 +49,17 @@ fn build_metadata_bm25_index(
         .iter()
         .flat_map(|doc| doc.tokens().iter().cloned())
         .collect();
+    if query_tokens.is_empty() {
+        return MetadataBm25Index {
+            corpus: MetadataBm25Corpus::from_indexed_documents(&[]),
+            docs: Vec::new(),
+            candidate_doc_index_by_key: HashMap::new(),
+        };
+    }
+
     let mut docs = Vec::new();
     let mut candidate_doc_index_by_key = HashMap::new();
+    let mut corpus_builder = MetadataBm25CorpusBuilder::default();
 
     for row in snapshot_rows {
         if seed_contracts.contains(&row.contract_address.to_lowercase()) {
@@ -62,27 +71,25 @@ fn build_metadata_bm25_index(
             continue;
         }
 
-        let Some(indexed_doc) = MetadataBm25Document::from_text(&doc) else {
+        let tokens = metadata_bm25_tokens(&doc);
+        corpus_builder.add_tokens(&tokens);
+        if !tokens.iter().any(|token| query_tokens.contains(token)) {
+            continue;
+        }
+
+        let Some(indexed_doc) = MetadataBm25Document::from_tokens(tokens) else {
             continue;
         };
-
         let doc_index = docs.len();
-        if !query_tokens.is_empty()
-            && indexed_doc
-                .tokens()
-                .iter()
-                .any(|token| query_tokens.contains(token))
-        {
-            candidate_doc_index_by_key.insert(
-                (row.contract_address.clone(), row.token_id.clone()),
-                doc_index,
-            );
-        }
+        candidate_doc_index_by_key.insert(
+            (row.contract_address.clone(), row.token_id.clone()),
+            doc_index,
+        );
         docs.push(indexed_doc);
     }
 
     MetadataBm25Index {
-        corpus: MetadataBm25Corpus::from_indexed_documents(&docs),
+        corpus: corpus_builder.finish(),
         docs,
         candidate_doc_index_by_key,
     }
@@ -260,5 +267,7 @@ mod tests {
         assert!(index
             .candidate_doc(&("0xmiss".into(), "1".into()))
             .is_none());
+        assert_eq!(index.docs.len(), 2);
+        assert_eq!(index.corpus.total_docs(), 3);
     }
 }

@@ -15,12 +15,11 @@ use crate::error::AppError;
 use crate::models::{
     AddressSignalPayload, BatchReportSummary, BatchSeedReportPayload, BatchSummaryPayload,
     ContractLevelSummaryPayload, ContractMetadata, DatabaseSnapshot, DuplicateCandidate,
-    DuplicateContractPayload, FraudTradeStatsPayload, NftSaleRecord, OutputFilesPayload,
-    HonestAddressPayload, HonestAddressStatsPayload, InfringingTokenRecord,
-    MaliciousAddressPayload, OwnerBalance,
-    ReportSummary, SeedCollectionStatsPayload, SeedContractPayload, SeedNft, SingleReportPayload,
-    TransactionReceiptRecord, TransferRecord, VictimAddressPayload, VictimSignalPayload,
-    EthTransferRecord,
+    DuplicateContractPayload, EthTransferRecord, FraudTradeStatsPayload, HonestAddressPayload,
+    HonestAddressStatsPayload, InfringingTokenRecord, MaliciousAddressPayload, NftSaleRecord,
+    OutputFilesPayload, OwnerBalance, ReportSummary, SeedCollectionStatsPayload,
+    SeedContractPayload, SeedNft, SingleReportPayload, TransactionReceiptRecord, TransferRecord,
+    VictimAddressPayload, VictimSignalPayload,
 };
 use crate::normalize::{normalize_name, normalize_symbol, normalize_url};
 use crate::progress::{BatchProgressReporter, SeedProgressReporter};
@@ -280,7 +279,12 @@ impl RealApi {
         })
     }
 
-    fn endpoints(&self, chain: &str, explicit_network: Option<&str>, api_key: &str) -> ApiEndpoints {
+    fn endpoints(
+        &self,
+        chain: &str,
+        explicit_network: Option<&str>,
+        api_key: &str,
+    ) -> ApiEndpoints {
         ApiEndpoints::for_alchemy(&normalize_network(chain, explicit_network), api_key)
     }
 }
@@ -516,7 +520,10 @@ pub async fn analyze_seed_contract_with_progress(
     let candidate_open_license_by_token: HashMap<(String, String), bool> = candidates
         .iter()
         .map(|candidate| {
-            let key = (candidate.contract_address.clone(), candidate.token_id.clone());
+            let key = (
+                candidate.contract_address.clone(),
+                candidate.token_id.clone(),
+            );
             let is_open = snapshot_rows_by_key
                 .get(&key)
                 .map(|row| is_candidate_open_license(&row.metadata_json, &row.metadata_doc))
@@ -556,29 +563,26 @@ pub async fn analyze_seed_contract_with_progress(
         let candidates_ref = &candidates;
         let official_addresses_ref = &official_addresses;
         let candidate_open_license_by_token_ref = &candidate_open_license_by_token;
-        let mut contract_analyses = stream::iter(
-            contracts_to_analyze
-                .iter()
-                .enumerate()
-                .map(|(index, contract_address)| {
-                    let candidate_indexes = grouped.get(contract_address).cloned().unwrap_or_default();
-                    async move {
-                        let result = analyze_duplicate_contract(
-                            request_ref,
-                            deps_ref,
-                            token_type_ref,
-                            contract_address,
-                            &candidate_indexes,
-                            candidates_ref,
-                            official_addresses_ref,
-                            candidate_open_license_by_token_ref,
-                            analysis_timestamp,
-                        )
-                        .await;
-                        (index, contract_address.clone(), result)
-                    }
-                }),
-        )
+        let mut contract_analyses = stream::iter(contracts_to_analyze.iter().enumerate().map(
+            |(index, contract_address)| {
+                let candidate_indexes = grouped.get(contract_address).cloned().unwrap_or_default();
+                async move {
+                    let result = analyze_duplicate_contract(
+                        request_ref,
+                        deps_ref,
+                        token_type_ref,
+                        contract_address,
+                        &candidate_indexes,
+                        candidates_ref,
+                        official_addresses_ref,
+                        candidate_open_license_by_token_ref,
+                        analysis_timestamp,
+                    )
+                    .await;
+                    (index, contract_address.clone(), result)
+                }
+            },
+        ))
         .buffer_unordered(contract_concurrency);
 
         let mut contract_results = Vec::new();
@@ -733,7 +737,13 @@ async fn analyze_duplicate_contract(
             let owners = owners?;
             let sales = sales?;
             if let Some(cache) = deps.signal_cache.as_ref() {
-                cache.put(&request.chain, contract_address, token_type, &transfers, &owners)?;
+                cache.put(
+                    &request.chain,
+                    contract_address,
+                    token_type,
+                    &transfers,
+                    &owners,
+                )?;
             }
             let transfer_signals = signals::analyze_transfer_signals(&transfers);
             let victim_signal = analyze_victim_signals_from_active_sellers(&transfers, &owners);
@@ -779,8 +789,7 @@ async fn analyze_duplicate_contract(
         });
     }
 
-    let contract_activity =
-        address_records::prepare_contract_activity(&transfers, &sales, &owners);
+    let contract_activity = address_records::prepare_contract_activity(&transfers, &sales, &owners);
     let contract_malicious = address_records::build_malicious_address_records_from_activity(
         contract_address,
         &contract_activity,
@@ -930,21 +939,22 @@ async fn compute_sale_metrics_for_contract(
         prefetched_by_tx.insert(row.tx_hash.clone(), row);
     }
 
-    let block_receipt_rows = stream::iter(blocks_to_fetch.into_iter().map(|block_number| async move {
-        let receipts = deps
-            .api
-            .fetch_transaction_receipts_for_block(
-                &request.alchemy_api_key,
-                request.alchemy_network.as_deref(),
-                block_number,
-            )
-            .await
-            .unwrap_or_default();
-        (block_number, receipts)
-    }))
-    .buffer_unordered(request.sale_metric_max_concurrency.max(1))
-    .collect::<Vec<_>>()
-    .await;
+    let block_receipt_rows =
+        stream::iter(blocks_to_fetch.into_iter().map(|block_number| async move {
+            let receipts = deps
+                .api
+                .fetch_transaction_receipts_for_block(
+                    &request.alchemy_api_key,
+                    request.alchemy_network.as_deref(),
+                    block_number,
+                )
+                .await
+                .unwrap_or_default();
+            (block_number, receipts)
+        }))
+        .buffer_unordered(request.sale_metric_max_concurrency.max(1))
+        .collect::<Vec<_>>()
+        .await;
     let receipts_by_block: BTreeMap<i64, BTreeMap<String, TransactionReceiptRecord>> =
         block_receipt_rows.into_iter().collect();
 
@@ -1084,9 +1094,9 @@ fn calculate_sale_eth_metrics(
     let buy_before_eth_balance = base_balance_eth + same_block_delta;
     let mut buy_total_eth_out = sale.price_eth.unwrap_or(0.0);
     if purchase_receipt.from_address == sale.buyer_address {
-        buy_total_eth_out +=
-            (purchase_receipt.gas_used as f64 * purchase_receipt.effective_gas_price_wei as f64)
-                / 1_000_000_000_000_000_000_f64;
+        buy_total_eth_out += (purchase_receipt.gas_used as f64
+            * purchase_receipt.effective_gas_price_wei as f64)
+            / 1_000_000_000_000_000_000_f64;
     }
     address_records::SaleMetricRecord {
         buy_before_eth_balance: Some(buy_before_eth_balance),
@@ -1127,8 +1137,8 @@ pub async fn run_batch(
     }
 
     let worker_count = request.workers.max(1);
-    let fresh_entries: Vec<Result<BatchSeedAggregate, AppError>> = stream::iter(
-        pending_seeds.into_iter().map(|seed_address| {
+    let fresh_entries: Vec<Result<BatchSeedAggregate, AppError>> =
+        stream::iter(pending_seeds.into_iter().map(|seed_address| {
             let per_seed_request = AnalyzeRequest {
                 chain: request.chain.clone(),
                 seed_contract_address: seed_address.clone(),
@@ -1150,24 +1160,27 @@ pub async fn run_batch(
             async move {
                 batch_progress.on_seed_started(&seed_address);
                 let seed_progress = batch_progress.create_seed_reporter(&seed_address);
-                let result = analyze_seed_contract_with_progress(per_seed_request, deps, seed_progress).await;
+                let result =
+                    analyze_seed_contract_with_progress(per_seed_request, deps, seed_progress)
+                        .await;
                 match result {
                     Ok(payload) => {
                         batch_progress.on_seed_finished(&seed_address);
-                        let (json_path, md_path) = write_outputs_to_directory(&payload, &output_dir)?;
+                        let (json_path, md_path) =
+                            write_outputs_to_directory(&payload, &output_dir)?;
                         let mut aggregate = build_batch_seed_aggregate(payload);
                         aggregate.report.output_files = Some(OutputFilesPayload {
-                                json: json_path
-                                    .file_name()
-                                    .unwrap_or_default()
-                                    .to_string_lossy()
-                                    .into_owned(),
-                                markdown: md_path
-                                    .file_name()
-                                    .unwrap_or_default()
-                                    .to_string_lossy()
-                                    .into_owned(),
-                            });
+                            json: json_path
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .into_owned(),
+                            markdown: md_path
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .into_owned(),
+                        });
                         Ok(aggregate)
                     }
                     Err(err) => {
@@ -1176,11 +1189,10 @@ pub async fn run_batch(
                     }
                 }
             }
-        }),
-    )
-    .buffer_unordered(worker_count)
-    .collect()
-    .await;
+        }))
+        .buffer_unordered(worker_count)
+        .collect()
+        .await;
 
     for entry in fresh_entries {
         let aggregate = entry?;
@@ -1235,7 +1247,10 @@ fn load_cached_seed_entries(
         if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
             continue;
         }
-        let file_name = path.file_name().and_then(|value| value.to_str()).unwrap_or("");
+        let file_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
         if !file_name.starts_with("top_contract_analysis__")
             || file_name == "top_contract_analysis__summary.json"
         {
@@ -1246,11 +1261,12 @@ fn load_cached_seed_entries(
             Ok(payload) => payload,
             Err(_) => continue,
         };
-        let mut aggregate = if let Ok(payload) = serde_json::from_value::<SingleReportPayload>(raw.clone()) {
-            build_batch_seed_aggregate(payload)
-        } else {
-            build_minimal_cached_batch_seed_aggregate(&raw)
-        };
+        let mut aggregate =
+            if let Ok(payload) = serde_json::from_value::<SingleReportPayload>(raw.clone()) {
+                build_batch_seed_aggregate(payload)
+            } else {
+                build_minimal_cached_batch_seed_aggregate(&raw)
+            };
         if aggregate.report.seed_contract.chain.to_lowercase() != chain.to_lowercase() {
             continue;
         }
@@ -1303,8 +1319,8 @@ fn build_contract_payload(
     for index in candidate_indexes {
         if let Some(item) = candidates.get(*index) {
             for reason in &item.match_reasons {
-            match_reasons.insert(reason.clone());
-        }
+                match_reasons.insert(reason.clone());
+            }
         }
     }
     DuplicateContractPayload {
@@ -1404,12 +1420,15 @@ fn build_report_summary(
     let repeat_infringing_address_count = infringing_tokens
         .iter()
         .filter(|item| !item.minter_address.is_empty() && !item.contract_address.is_empty())
-        .fold(BTreeMap::<String, BTreeSet<String>>::new(), |mut acc, item| {
-            acc.entry(item.minter_address.clone())
-                .or_default()
-                .insert(item.contract_address.clone());
-            acc
-        })
+        .fold(
+            BTreeMap::<String, BTreeSet<String>>::new(),
+            |mut acc, item| {
+                acc.entry(item.minter_address.clone())
+                    .or_default()
+                    .insert(item.contract_address.clone());
+                acc
+            },
+        )
         .values()
         .filter(|contracts| contracts.len() > 1)
         .count() as i64;
@@ -1436,16 +1455,27 @@ fn build_report_summary(
         .filter_map(|item| item.buy_asset_ratio)
         .collect();
     let ratio_known_count = buy_ratio_values.len() as i64;
-    let ratio_over_60_count = buy_ratio_values.iter().filter(|value| **value > 0.6).count() as i64;
-    let ratio_over_80_count = buy_ratio_values.iter().filter(|value| **value > 0.8).count() as i64;
-    let stuck_honest_address_count = victim_addresses.iter().filter(|item| item.is_stuck).count() as i64;
+    let ratio_over_60_count = buy_ratio_values
+        .iter()
+        .filter(|value| **value > 0.6)
+        .count() as i64;
+    let ratio_over_80_count = buy_ratio_values
+        .iter()
+        .filter(|value| **value > 0.8)
+        .count() as i64;
+    let stuck_honest_address_count =
+        victim_addresses.iter().filter(|item| item.is_stuck).count() as i64;
     let corrupted_honest_address_count = honest_addresses
         .iter()
         .filter(|item| item.is_corrupted_address)
         .count() as i64;
     let mint_to_honest_samples: Vec<f64> = honest_addresses
         .iter()
-        .flat_map(|item| item.mint_to_honest_seconds_samples.iter().map(|sample| *sample as f64))
+        .flat_map(|item| {
+            item.mint_to_honest_seconds_samples
+                .iter()
+                .map(|sample| *sample as f64)
+        })
         .collect();
     let mint_to_first_transfer_values: Vec<f64> = address_signals
         .values()
@@ -1557,7 +1587,11 @@ fn build_batch_report_summary(seed_reports: &[BatchSeedAggregate]) -> BatchRepor
         .sum();
     let buy_asset_ratio_known_address_count_total: i64 = seed_reports
         .iter()
-        .map(|item| item.report.report_summary.buy_asset_ratio_known_address_count)
+        .map(|item| {
+            item.report
+                .report_summary
+                .buy_asset_ratio_known_address_count
+        })
         .sum();
     let ratio_over_60_address_count_total: i64 = seed_reports
         .iter()
@@ -1581,11 +1615,19 @@ fn build_batch_report_summary(seed_reports: &[BatchSeedAggregate]) -> BatchRepor
         .collect();
     let mean_first_transfer_values: Vec<f64> = seed_reports
         .iter()
-        .filter_map(|item| item.report.report_summary.avg_mint_to_first_transfer_seconds)
+        .filter_map(|item| {
+            item.report
+                .report_summary
+                .avg_mint_to_first_transfer_seconds
+        })
         .collect();
     let median_first_transfer_values: Vec<f64> = seed_reports
         .iter()
-        .filter_map(|item| item.report.report_summary.median_mint_to_first_transfer_seconds)
+        .filter_map(|item| {
+            item.report
+                .report_summary
+                .median_mint_to_first_transfer_seconds
+        })
         .collect();
     let mean_unique_receiver_values: Vec<f64> = seed_reports
         .iter()
@@ -1635,19 +1677,28 @@ fn build_batch_report_summary(seed_reports: &[BatchSeedAggregate]) -> BatchRepor
         buy_asset_ratio_known_address_count_total,
         ratio_over_60_address_count_total,
         ratio_over_60_address_ratio_overall: if buy_asset_ratio_known_address_count_total > 0 {
-            Some(ratio_over_60_address_count_total as f64 / buy_asset_ratio_known_address_count_total as f64)
+            Some(
+                ratio_over_60_address_count_total as f64
+                    / buy_asset_ratio_known_address_count_total as f64,
+            )
         } else {
             None
         },
         ratio_over_80_address_count_total,
         ratio_over_80_address_ratio_overall: if buy_asset_ratio_known_address_count_total > 0 {
-            Some(ratio_over_80_address_count_total as f64 / buy_asset_ratio_known_address_count_total as f64)
+            Some(
+                ratio_over_80_address_count_total as f64
+                    / buy_asset_ratio_known_address_count_total as f64,
+            )
         } else {
             None
         },
         stuck_honest_address_count_total,
         stuck_honest_address_ratio_overall: if buy_asset_ratio_known_address_count_total > 0 {
-            Some(stuck_honest_address_count_total as f64 / buy_asset_ratio_known_address_count_total as f64)
+            Some(
+                stuck_honest_address_count_total as f64
+                    / buy_asset_ratio_known_address_count_total as f64,
+            )
         } else {
             None
         },
@@ -1712,7 +1763,10 @@ fn build_batch_seed_aggregate(payload: SingleReportPayload) -> BatchSeedAggregat
         report_summary.median_seconds_to_honest_holder =
             payload_median_seconds_to_honest_holder(&payload);
     }
-    if report_summary.median_mint_to_first_transfer_seconds.is_none() {
+    if report_summary
+        .median_mint_to_first_transfer_seconds
+        .is_none()
+    {
         report_summary.median_mint_to_first_transfer_seconds =
             payload_median_mint_to_first_transfer_seconds(&payload);
     }
@@ -1731,7 +1785,9 @@ fn build_batch_seed_aggregate(payload: SingleReportPayload) -> BatchSeedAggregat
 
 fn build_minimal_cached_batch_seed_aggregate(raw: &serde_json::Value) -> BatchSeedAggregate {
     let seed_contract_raw = raw.get("seed_contract").and_then(|value| value.as_object());
-    let report_summary_raw = raw.get("report_summary").and_then(|value| value.as_object());
+    let report_summary_raw = raw
+        .get("report_summary")
+        .and_then(|value| value.as_object());
     BatchSeedAggregate {
         report: BatchSeedReportPayload {
             seed_contract: SeedContractPayload {

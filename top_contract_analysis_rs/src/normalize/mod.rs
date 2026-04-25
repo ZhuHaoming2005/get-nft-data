@@ -22,8 +22,7 @@ static WHITESPACE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
 static IPFS_HTTP_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)^https?://[^/]+/ipfs/([A-Za-z0-9][^?#\s]*)").unwrap());
 static ARWEAVE_HTTP_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)^https?://(?:[^/]+\.)?arweave\.net/([A-Za-z0-9_-]{43}(?:/[^?#\s]*)?)")
-        .unwrap()
+    Regex::new(r"(?i)^https?://(?:[^/]+\.)?arweave\.net/([A-Za-z0-9_-]{43}(?:/[^?#\s]*)?)").unwrap()
 });
 
 fn normalize_nfkc(raw: &str) -> String {
@@ -181,7 +180,10 @@ pub fn build_nft_metadata_json(
         }
     }
     if !token_uri.is_empty() && !payload.contains_key("token_uri") {
-        payload.insert("token_uri".to_string(), Value::String(token_uri.to_string()));
+        payload.insert(
+            "token_uri".to_string(),
+            Value::String(token_uri.to_string()),
+        );
     }
     if !image_uri.is_empty() && !payload.contains_key("image") {
         payload.insert("image".to_string(), Value::String(image_uri.to_string()));

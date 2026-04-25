@@ -1,14 +1,14 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use once_cell::sync::Lazy;
-use postgres::fallible_iterator::FallibleIterator;
-use postgres::Client;
-use postgres::types::ToSql;
-use regex::Regex;
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use once_cell::sync::Lazy;
 use parquet::arrow::ArrowWriter;
+use postgres::fallible_iterator::FallibleIterator;
+use postgres::types::ToSql;
+use postgres::Client;
+use regex::Regex;
 
 use crate::analysis::scoring::metadata_document_from_json;
 use crate::error::AppError;
