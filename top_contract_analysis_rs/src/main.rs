@@ -17,6 +17,7 @@ use top_contract_analysis_rs::progress::{
 use top_contract_analysis_rs::reporting::{write_batch_summary_outputs, write_default_outputs};
 use top_contract_analysis_rs::store::{
     export_chain_snapshot_to_parquet, ContractSignalCache, DuckDbFeatureStore,
+    DuckDbResourceOptions,
 };
 
 fn connect_postgres_from_constants() -> Result<Client, AppError> {
@@ -28,7 +29,10 @@ fn main() -> Result<(), AppError> {
     let command = TopContractAnalysisCli::parse();
     match command.command {
         Command::Analyze(args) => Runtime::new()?.block_on(async move {
-            let feature_store = DuckDbFeatureStore::new(&args.feature_db)?;
+            let duckdb_options =
+                DuckDbResourceOptions::from_cli(args.duckdb_threads, &args.duckdb_memory_limit)?;
+            let feature_store =
+                DuckDbFeatureStore::new_with_options(&args.feature_db, duckdb_options)?;
             if !args.feature_parquet.trim().is_empty() {
                 feature_store
                     .load_parquet_dataset_if_chain_missing(&args.chain, &args.feature_parquet)?;
@@ -75,12 +79,20 @@ fn main() -> Result<(), AppError> {
         }),
         Command::Batch(args) => Runtime::new()?.block_on(async move {
             let seed_addresses = read_seed_addresses(std::path::Path::new(&args.seed_file))?;
-            let feature_store = DuckDbFeatureStore::new(&args.feature_db)?;
+            let duckdb_options =
+                DuckDbResourceOptions::from_cli(args.duckdb_threads, &args.duckdb_memory_limit)?;
+            let feature_store =
+                DuckDbFeatureStore::new_with_options(&args.feature_db, duckdb_options)?;
             if !args.feature_parquet.trim().is_empty() {
                 feature_store
                     .load_parquet_dataset_if_chain_missing(&args.chain, &args.feature_parquet)?;
             }
-            let api = RealApi::new(args.timeout, 8, 4, 4)?;
+            let api = RealApi::new(
+                args.timeout,
+                args.api_max_concurrency,
+                args.contract_max_concurrency,
+                args.sale_metric_max_concurrency,
+            )?;
             let deps = AnalysisDeps {
                 api: Arc::new(api),
                 feature_store: Box::new(feature_store),
@@ -105,6 +117,9 @@ fn main() -> Result<(), AppError> {
                     name_threshold: args.name_threshold,
                     metadata_threshold: args.metadata_threshold,
                     timeout_seconds: args.timeout,
+                    api_max_concurrency: args.api_max_concurrency,
+                    contract_max_concurrency: args.contract_max_concurrency,
+                    sale_metric_max_concurrency: args.sale_metric_max_concurrency,
                     max_tokens_per_contract: args.max_tokens_per_contract,
                     max_recall_rows: args.max_recall_rows,
                     workers: args.workers,

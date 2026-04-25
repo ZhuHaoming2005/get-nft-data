@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use rayon::prelude::*;
+
 use crate::analysis::scoring::{
     metadata_document_from_json, score_metadata_indexed_pair_with_corpus, score_name_pair,
     MetadataBm25Corpus, MetadataBm25Document,
@@ -127,78 +129,83 @@ pub fn build_duplicate_candidates(
     let metadata_index =
         build_metadata_bm25_index(&seed_metadata_docs, snapshot_rows, &seed_contracts);
 
-    let mut rows = Vec::new();
-    for row in snapshot_rows {
-        if seed_contracts.contains(&row.contract_address.to_lowercase()) {
-            continue;
-        }
-
-        let token_key = normalize_url(&row.token_uri);
-        let image_key = normalize_url(&row.image_uri);
-        let symbol_norm = normalize_symbol(&row.symbol);
-        let row_name_norm = normalize_name(&row.name);
-
-        let mut reasons = Vec::new();
-        if token_key
-            .as_ref()
-            .map(|value| seed_token_uri_keys.contains(value))
-            .unwrap_or(false)
-        {
-            reasons.push("token_uri_match".to_string());
-        }
-        if image_key
-            .as_ref()
-            .map(|value| seed_image_uri_keys.contains(value))
-            .unwrap_or(false)
-        {
-            reasons.push("image_uri_match".to_string());
-        }
-        if !symbol_norm.is_empty() && seed_symbol_norms.contains(&symbol_norm) {
-            reasons.push("symbol_match".to_string());
-        }
-        if has_name_match(&row_name_norm, name_threshold, &seed_name_norms) {
-            reasons.push("name_match".to_string());
-        }
-        let metadata_key = (row.contract_address.clone(), row.token_id.clone());
-        if let Some(row_doc) = metadata_index.candidate_doc(&metadata_key) {
-            if seed_metadata_docs.iter().any(|seed_doc| {
-                score_metadata_indexed_pair_with_corpus(seed_doc, row_doc, &metadata_index.corpus)
-                    >= metadata_threshold
-            }) {
-                reasons.push("metadata_match".to_string());
+    let mut rows: Vec<DuplicateCandidate> = snapshot_rows
+        .par_iter()
+        .filter_map(|row| {
+            if seed_contracts.contains(&row.contract_address.to_lowercase()) {
+                return None;
             }
-        }
 
-        if reasons.is_empty() {
-            continue;
-        }
-        reasons.sort();
-        reasons.dedup();
-        let has_high_reason = reasons.iter().any(|reason| {
-            matches!(
-                reason.as_str(),
-                "token_uri_match" | "image_uri_match" | "metadata_match"
-            )
-        });
-        let has_name_and_symbol = reasons.iter().any(|reason| reason == "name_match")
-            && reasons.iter().any(|reason| reason == "symbol_match");
-        let confidence = if has_high_reason || has_name_and_symbol {
-            "high"
-        } else {
-            "low"
-        };
+            let token_key = normalize_url(&row.token_uri);
+            let image_key = normalize_url(&row.image_uri);
+            let symbol_norm = normalize_symbol(&row.symbol);
+            let row_name_norm = normalize_name(&row.name);
 
-        rows.push(DuplicateCandidate {
-            contract_address: row.contract_address.clone(),
-            token_id: row.token_id.clone(),
-            match_reasons: reasons,
-            confidence: confidence.to_string(),
-            token_uri: row.token_uri.clone(),
-            image_uri: row.image_uri.clone(),
-            name: row.name.clone(),
-            symbol: row.symbol.clone(),
-        });
-    }
+            let mut reasons = Vec::new();
+            if token_key
+                .as_ref()
+                .map(|value| seed_token_uri_keys.contains(value))
+                .unwrap_or(false)
+            {
+                reasons.push("token_uri_match".to_string());
+            }
+            if image_key
+                .as_ref()
+                .map(|value| seed_image_uri_keys.contains(value))
+                .unwrap_or(false)
+            {
+                reasons.push("image_uri_match".to_string());
+            }
+            if !symbol_norm.is_empty() && seed_symbol_norms.contains(&symbol_norm) {
+                reasons.push("symbol_match".to_string());
+            }
+            if has_name_match(&row_name_norm, name_threshold, &seed_name_norms) {
+                reasons.push("name_match".to_string());
+            }
+            let metadata_key = (row.contract_address.clone(), row.token_id.clone());
+            if let Some(row_doc) = metadata_index.candidate_doc(&metadata_key) {
+                if seed_metadata_docs.iter().any(|seed_doc| {
+                    score_metadata_indexed_pair_with_corpus(
+                        seed_doc,
+                        row_doc,
+                        &metadata_index.corpus,
+                    ) >= metadata_threshold
+                }) {
+                    reasons.push("metadata_match".to_string());
+                }
+            }
+
+            if reasons.is_empty() {
+                return None;
+            }
+            reasons.sort();
+            reasons.dedup();
+            let has_high_reason = reasons.iter().any(|reason| {
+                matches!(
+                    reason.as_str(),
+                    "token_uri_match" | "image_uri_match" | "metadata_match"
+                )
+            });
+            let has_name_and_symbol = reasons.iter().any(|reason| reason == "name_match")
+                && reasons.iter().any(|reason| reason == "symbol_match");
+            let confidence = if has_high_reason || has_name_and_symbol {
+                "high"
+            } else {
+                "low"
+            };
+
+            Some(DuplicateCandidate {
+                contract_address: row.contract_address.clone(),
+                token_id: row.token_id.clone(),
+                match_reasons: reasons,
+                confidence: confidence.to_string(),
+                token_uri: row.token_uri.clone(),
+                image_uri: row.image_uri.clone(),
+                name: row.name.clone(),
+                symbol: row.symbol.clone(),
+            })
+        })
+        .collect();
 
     rows.sort_by(|left, right| {
         (&left.contract_address, &left.token_id).cmp(&(&right.contract_address, &right.token_id))

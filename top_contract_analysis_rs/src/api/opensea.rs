@@ -19,9 +19,12 @@ fn normalize_token_id(raw: Option<&Value>) -> String {
         .unwrap_or_else(|| raw.to_string());
     let trimmed = text.trim();
     if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
-        i128::from_str_radix(trimmed.trim_start_matches("0x").trim_start_matches("0X"), 16)
-            .map(|value| value.to_string())
-            .unwrap_or_else(|_| trimmed.to_string())
+        i128::from_str_radix(
+            trimmed.trim_start_matches("0x").trim_start_matches("0X"),
+            16,
+        )
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| trimmed.to_string())
     } else {
         trimmed.to_string()
     }
@@ -65,11 +68,8 @@ pub async fn fetch_alchemy_nft_sales(
     let mut seen_page_keys = BTreeSet::new();
     let mut rows = Vec::new();
     loop {
-        let mut url = Url::parse(&format!(
-            "{}/nft/v2/key/getNFTSales",
-            endpoints.alchemy_nft_base
-        ))
-        .map_err(|err| AppError::Http(err.to_string()))?;
+        let mut url = Url::parse(&format!("{}/getNFTSales", endpoints.alchemy_nft_v2_base))
+            .map_err(|err| AppError::Http(err.to_string()))?;
         url.query_pairs_mut()
             .append_pair("fromBlock", "0")
             .append_pair("toBlock", "latest")
@@ -192,8 +192,7 @@ pub async fn fetch_opensea_nft_events(
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
     headers.insert(
         "x-api-key",
-        HeaderValue::from_str(opensea_api_key)
-            .map_err(|err| AppError::Http(err.to_string()))?,
+        HeaderValue::from_str(opensea_api_key).map_err(|err| AppError::Http(err.to_string()))?,
     );
     let url = if let Some(token_id) = token_id.filter(|value| !value.is_empty()) {
         format!("{base_url}/api/v2/events/chain/ethereum/contract/{contract_address}/nfts/{token_id}?event_type=sale")
@@ -218,7 +217,10 @@ pub async fn fetch_opensea_nft_events(
         if !event_type.is_empty() && event_type != "sale" {
             continue;
         }
-        let nft = item.get("nft").or_else(|| item.get("asset")).unwrap_or(&Value::Null);
+        let nft = item
+            .get("nft")
+            .or_else(|| item.get("asset"))
+            .unwrap_or(&Value::Null);
         let payment = item
             .get("payment")
             .or_else(|| item.get("payment_token"))
@@ -264,17 +266,26 @@ pub async fn fetch_opensea_nft_events(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_lowercase(),
-            block_number: item.get("block_number").and_then(Value::as_i64).unwrap_or(0),
+            block_number: item
+                .get("block_number")
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
             log_index: item
                 .get("event_index")
                 .or_else(|| item.get("log_index"))
                 .and_then(Value::as_i64)
                 .unwrap_or(0),
-            bundle_index: item.get("bundle_index").and_then(Value::as_i64).unwrap_or(0),
+            bundle_index: item
+                .get("bundle_index")
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
             buyer_address: item
                 .get("to_account")
                 .and_then(|value| value.get("address"))
-                .or_else(|| item.get("winner_account").and_then(|value| value.get("address")))
+                .or_else(|| {
+                    item.get("winner_account")
+                        .and_then(|value| value.get("address"))
+                })
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_lowercase(),

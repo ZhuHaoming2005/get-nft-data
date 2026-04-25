@@ -13,6 +13,34 @@ fn test_client() -> AsyncApiClient {
     AsyncApiClient::new(5, 4, 2, 2).unwrap()
 }
 
+fn test_endpoints(base_url: &str) -> ApiEndpoints {
+    ApiEndpoints {
+        alchemy_nft_v2_base: format!("{base_url}/nft/v2/key"),
+        alchemy_nft_v3_base: format!("{base_url}/nft/v3/key"),
+        alchemy_rpc_base: format!("{base_url}/v2/key"),
+        etherscan_base: base_url.to_string(),
+        opensea_base: base_url.to_string(),
+    }
+}
+
+#[test]
+fn alchemy_endpoints_embed_api_key_in_rest_and_rpc_urls() {
+    let endpoints = ApiEndpoints::for_alchemy("eth-mainnet", "live-key");
+
+    assert_eq!(
+        endpoints.alchemy_nft_v2_base,
+        "https://eth-mainnet.g.alchemy.com/nft/v2/live-key"
+    );
+    assert_eq!(
+        endpoints.alchemy_nft_v3_base,
+        "https://eth-mainnet.g.alchemy.com/nft/v3/live-key"
+    );
+    assert_eq!(
+        endpoints.alchemy_rpc_base,
+        "https://eth-mainnet.g.alchemy.com/v2/live-key"
+    );
+}
+
 async fn spawn_sequential_json_server(
     expected_requests: Vec<(String, serde_json::Value)>,
 ) -> (String, tokio::task::JoinHandle<()>) {
@@ -77,12 +105,7 @@ async fn fetch_seed_contract_nfts_paginates_until_page_key_is_empty() {
     .await;
 
     let client = test_client();
-    let endpoints = ApiEndpoints {
-        alchemy_nft_base: base_url.clone(),
-        alchemy_rpc_base: base_url.clone(),
-        etherscan_base: base_url.clone(),
-        opensea_base: base_url,
-    };
+    let endpoints = test_endpoints(&base_url);
     let rows = fetch_seed_contract_nfts(&client, &endpoints, "ethereum", "0xseed")
         .await
         .unwrap();
@@ -115,12 +138,7 @@ async fn fetch_seed_contract_nfts_errors_when_page_key_repeats() {
     .await;
 
     let client = test_client();
-    let endpoints = ApiEndpoints {
-        alchemy_nft_base: base_url.clone(),
-        alchemy_rpc_base: base_url.clone(),
-        etherscan_base: base_url.clone(),
-        opensea_base: base_url,
-    };
+    let endpoints = test_endpoints(&base_url);
     let err = fetch_seed_contract_nfts(&client, &endpoints, "ethereum", "0xseed")
         .await
         .unwrap_err();
@@ -151,12 +169,7 @@ async fn fetch_contract_metadata_parses_contract_metadata_fields() {
         .await;
 
     let client = test_client();
-    let endpoints = ApiEndpoints {
-        alchemy_nft_base: server.base_url(),
-        alchemy_rpc_base: server.base_url(),
-        etherscan_base: server.base_url(),
-        opensea_base: server.base_url(),
-    };
+    let endpoints = test_endpoints(&server.base_url());
     let meta = fetch_contract_metadata(&client, &endpoints, "ethereum", "0xseed")
         .await
         .unwrap();
@@ -184,12 +197,7 @@ async fn fetch_license_sample_reads_first_seed_token_metadata() {
     .await;
 
     let client = test_client();
-    let endpoints = ApiEndpoints {
-        alchemy_nft_base: base_url.clone(),
-        alchemy_rpc_base: base_url.clone(),
-        etherscan_base: base_url.clone(),
-        opensea_base: base_url,
-    };
+    let endpoints = test_endpoints(&base_url);
     let payload = fetch_license_sample(
         &client,
         &endpoints,
@@ -241,7 +249,8 @@ async fn contract_transfers_fall_back_to_etherscan_for_erc721() {
 
     let client = test_client();
     let endpoints = ApiEndpoints {
-        alchemy_nft_base: alchemy_server.base_url(),
+        alchemy_nft_v2_base: format!("{}/nft/v2/key", alchemy_server.base_url()),
+        alchemy_nft_v3_base: format!("{}/nft/v3/key", alchemy_server.base_url()),
         alchemy_rpc_base: format!("{}/v2/key", alchemy_server.base_url()),
         etherscan_base: etherscan_server.base_url(),
         opensea_base: alchemy_server.base_url(),
@@ -268,7 +277,8 @@ async fn contract_sales_fall_back_to_opensea() {
     alchemy_server
         .mock_async(|when, then| {
             when.method(GET).path("/nft/v2/key/getNFTSales");
-            then.status(200).json_body_obj(&serde_json::json!({"nftSales": []}));
+            then.status(200)
+                .json_body_obj(&serde_json::json!({"nftSales": []}));
         })
         .await;
     let opensea_server = MockServer::start_async().await;
@@ -300,8 +310,9 @@ async fn contract_sales_fall_back_to_opensea() {
 
     let client = test_client();
     let endpoints = ApiEndpoints {
-        alchemy_nft_base: alchemy_server.base_url(),
-        alchemy_rpc_base: alchemy_server.base_url(),
+        alchemy_nft_v2_base: format!("{}/nft/v2/key", alchemy_server.base_url()),
+        alchemy_nft_v3_base: format!("{}/nft/v3/key", alchemy_server.base_url()),
+        alchemy_rpc_base: format!("{}/v2/key", alchemy_server.base_url()),
         etherscan_base: alchemy_server.base_url(),
         opensea_base: opensea_server.base_url(),
     };
@@ -337,12 +348,7 @@ async fn fetch_transaction_receipt_parses_hex_receipt_fields() {
         .await;
 
     let client = test_client();
-    let endpoints = ApiEndpoints {
-        alchemy_nft_base: server.base_url(),
-        alchemy_rpc_base: format!("{}/v2/key", server.base_url()),
-        etherscan_base: server.base_url(),
-        opensea_base: server.base_url(),
-    };
+    let endpoints = test_endpoints(&server.base_url());
     let receipt = fetch_transaction_receipt(&client, &endpoints, "0xsale")
         .await
         .unwrap();
@@ -378,12 +384,7 @@ async fn fetch_transaction_receipts_for_block_parses_receipt_map() {
         .await;
 
     let client = test_client();
-    let endpoints = ApiEndpoints {
-        alchemy_nft_base: server.base_url(),
-        alchemy_rpc_base: format!("{}/v2/key", server.base_url()),
-        etherscan_base: server.base_url(),
-        opensea_base: server.base_url(),
-    };
+    let endpoints = test_endpoints(&server.base_url());
     let rows = fetch_transaction_receipts_for_block(&client, &endpoints, 2)
         .await
         .unwrap();
@@ -445,12 +446,7 @@ async fn fetch_eth_balance_and_same_block_transfers_parse_rpc_payloads() {
         .await;
 
     let client = test_client();
-    let endpoints = ApiEndpoints {
-        alchemy_nft_base: server.base_url(),
-        alchemy_rpc_base: format!("{}/v2/key", server.base_url()),
-        etherscan_base: server.base_url(),
-        opensea_base: server.base_url(),
-    };
+    let endpoints = test_endpoints(&server.base_url());
     let balance = fetch_eth_balance(&client, &endpoints, "0xbuyer", 1)
         .await
         .unwrap();

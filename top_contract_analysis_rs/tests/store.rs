@@ -4,7 +4,8 @@ use duckdb::Connection;
 use tempfile::tempdir;
 use top_contract_analysis_rs::models::{DatabaseNftRecord, OwnerBalance, SeedNft, TransferRecord};
 use top_contract_analysis_rs::store::{
-    write_snapshot_rows_to_parquet, ContractSignalCache, DuckDbFeatureStore, SnapshotExportRow,
+    write_snapshot_rows_to_parquet, ContractSignalCache, DuckDbFeatureStore, DuckDbResourceOptions,
+    SnapshotExportRow,
 };
 
 fn parquet_path_literal(path: &std::path::Path) -> String {
@@ -217,6 +218,17 @@ fn old_feature_db_schema_is_rejected() {
 }
 
 #[test]
+fn feature_store_applies_duckdb_resource_options() {
+    let options = DuckDbResourceOptions {
+        threads: 2,
+        memory_limit: "2GB".into(),
+    };
+    let store = DuckDbFeatureStore::new_with_options(":memory:", options.clone()).unwrap();
+
+    assert_eq!(store.resource_options(), &options);
+}
+
+#[test]
 fn feature_store_applies_per_contract_token_cap() {
     let store = DuckDbFeatureStore::new(":memory:").unwrap();
     store
@@ -285,6 +297,56 @@ fn feature_store_applies_per_contract_token_cap() {
         1
     );
     assert_eq!(snapshot.contract_signals["0xdup"].token_count, 1);
+}
+
+#[test]
+fn feature_store_reuses_precomputed_metadata_keywords_for_recall_verification() {
+    let dir = tempdir().unwrap();
+    let parquet_path = dir.path().join("snapshot.parquet");
+    write_parquet(
+        "
+        SELECT
+            'ethereum' AS chain,
+            '0xkeyword' AS contract_address,
+            '1' AS token_id,
+            '' AS token_uri,
+            '' AS image_uri,
+            '' AS name,
+            '' AS symbol,
+            '' AS metadata_json,
+            '' AS token_uri_norm,
+            '' AS image_uri_norm,
+            '' AS name_norm,
+            '' AS symbol_norm,
+            'dog' AS metadata_doc,
+            '[\"cat\"]' AS metadata_keywords_arr
+        ",
+        &parquet_path,
+    );
+
+    let store = DuckDbFeatureStore::new(":memory:").unwrap();
+    store
+        .load_parquet_dataset("ethereum", &parquet_path.to_string_lossy())
+        .unwrap();
+
+    let snapshot = store
+        .load_snapshot(
+            "ethereum",
+            &[SeedNft {
+                chain: "ethereum".into(),
+                contract_address: "0xseed".into(),
+                token_id: "1".into(),
+                metadata_doc: "cat".into(),
+                ..Default::default()
+            }],
+            0,
+            0,
+        )
+        .unwrap();
+
+    assert_eq!(snapshot.nft_rows.len(), 1);
+    assert_eq!(snapshot.nft_rows[0].contract_address, "0xkeyword");
+    assert!(snapshot.contract_signals["0xkeyword"].keyword_match);
 }
 
 #[test]

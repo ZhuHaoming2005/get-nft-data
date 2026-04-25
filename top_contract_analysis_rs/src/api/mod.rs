@@ -17,7 +17,8 @@ pub const DEFAULT_ALCHEMY_RETRIES: usize = 3;
 
 #[derive(Clone, Debug)]
 pub struct ApiEndpoints {
-    pub alchemy_nft_base: String,
+    pub alchemy_nft_v2_base: String,
+    pub alchemy_nft_v3_base: String,
     pub alchemy_rpc_base: String,
     pub etherscan_base: String,
     pub opensea_base: String,
@@ -26,7 +27,8 @@ pub struct ApiEndpoints {
 impl ApiEndpoints {
     pub fn for_alchemy(network: &str, api_key: &str) -> Self {
         Self {
-            alchemy_nft_base: format!("https://{network}.g.alchemy.com"),
+            alchemy_nft_v2_base: format!("https://{network}.g.alchemy.com/nft/v2/{api_key}"),
+            alchemy_nft_v3_base: format!("https://{network}.g.alchemy.com/nft/v3/{api_key}"),
             alchemy_rpc_base: format!("https://{network}.g.alchemy.com/v2/{api_key}"),
             etherscan_base: "https://api.etherscan.io/v2/api".to_string(),
             opensea_base: "https://api.opensea.io".to_string(),
@@ -113,13 +115,8 @@ impl AsyncApiClient {
         url: &str,
         headers: HeaderMap,
     ) -> Result<T, AppError> {
-        self.request_json::<T, serde_json::Value>(
-            reqwest::Method::GET,
-            url,
-            None,
-            Some(headers),
-        )
-        .await
+        self.request_json::<T, serde_json::Value>(reqwest::Method::GET, url, None, Some(headers))
+            .await
     }
 
     pub async fn post_json<T: DeserializeOwned, B: Serialize + ?Sized>(
@@ -135,7 +132,6 @@ impl AsyncApiClient {
 pub use alchemy::{
     fetch_contract_metadata, fetch_contract_owners, fetch_contract_transfers, fetch_eth_balance,
     fetch_license_sample, fetch_same_block_eth_transfers_for_address, fetch_seed_contract_nfts,
-    fetch_transaction_receipt, fetch_transaction_receipts_for_block,
-    is_open_license_payload,
+    fetch_transaction_receipt, fetch_transaction_receipts_for_block, is_open_license_payload,
 };
 pub use opensea::fetch_contract_sales;

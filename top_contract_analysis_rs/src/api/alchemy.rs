@@ -23,9 +23,12 @@ fn normalize_token_id(raw: Option<&Value>) -> String {
         .unwrap_or_else(|| raw.to_string());
     let trimmed = text.trim();
     if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
-        i128::from_str_radix(trimmed.trim_start_matches("0x").trim_start_matches("0X"), 16)
-            .map(|value| value.to_string())
-            .unwrap_or_else(|_| trimmed.to_string())
+        i128::from_str_radix(
+            trimmed.trim_start_matches("0x").trim_start_matches("0X"),
+            16,
+        )
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| trimmed.to_string())
     } else {
         trimmed.to_string()
     }
@@ -65,7 +68,9 @@ async fn fetch_block_timestamp(
         "method": "eth_getBlockByNumber",
         "params": [block_num, false]
     });
-    let body: Value = client.post_json(&endpoints.alchemy_rpc_base, &payload).await?;
+    let body: Value = client
+        .post_json(&endpoints.alchemy_rpc_base, &payload)
+        .await?;
     Ok(parse_block_timestamp(
         body.get("result").and_then(|value| value.get("timestamp")),
     ))
@@ -97,8 +102,8 @@ pub async fn fetch_seed_contract_nfts(
     let mut seen_page_keys = BTreeSet::new();
     loop {
         let mut url = Url::parse(&format!(
-            "{}/nft/v3/key/getNFTsForContract",
-            endpoints.alchemy_nft_base
+            "{}/getNFTsForContract",
+            endpoints.alchemy_nft_v3_base
         ))
         .map_err(|err| AppError::Http(err.to_string()))?;
         url.query_pairs_mut()
@@ -185,11 +190,8 @@ pub async fn fetch_license_sample(
         return Ok(Value::Object(serde_json::Map::new()));
     };
 
-    let mut url = Url::parse(&format!(
-        "{}/nft/v3/key/getNFTMetadata",
-        endpoints.alchemy_nft_base
-    ))
-    .map_err(|err| AppError::Http(err.to_string()))?;
+    let mut url = Url::parse(&format!("{}/getNFTMetadata", endpoints.alchemy_nft_v3_base))
+        .map_err(|err| AppError::Http(err.to_string()))?;
     url.query_pairs_mut()
         .append_pair("contractAddress", &sample.contract_address)
         .append_pair("tokenId", &sample.token_id)
@@ -236,8 +238,8 @@ pub async fn fetch_contract_metadata(
     contract_address: &str,
 ) -> Result<ContractMetadata, AppError> {
     let mut url = Url::parse(&format!(
-        "{}/nft/v2/key/getContractMetadata",
-        endpoints.alchemy_nft_base
+        "{}/getContractMetadata",
+        endpoints.alchemy_nft_v2_base
     ))
     .map_err(|err| AppError::Http(err.to_string()))?;
     url.query_pairs_mut()
@@ -307,11 +309,11 @@ pub async fn fetch_alchemy_contract_transfers(
             "method": "alchemy_getAssetTransfers",
             "params": [params]
         });
-        let body: Value = client.post_json(&endpoints.alchemy_rpc_base, &payload).await?;
+        let body: Value = client
+            .post_json(&endpoints.alchemy_rpc_base, &payload)
+            .await?;
         if body.get("error").is_some() {
-            return Err(AppError::Http(
-                body.get("error").unwrap().to_string(),
-            ));
+            return Err(AppError::Http(body.get("error").unwrap().to_string()));
         }
         let result = body.get("result").unwrap_or(&Value::Null);
         for item in result
@@ -321,8 +323,10 @@ pub async fn fetch_alchemy_contract_transfers(
             .flatten()
         {
             let block_num = item.get("blockNum").and_then(Value::as_str).unwrap_or("0");
-            let mut block_time =
-                parse_block_timestamp(item.get("metadata").and_then(|value| value.get("blockTimestamp")));
+            let mut block_time = parse_block_timestamp(
+                item.get("metadata")
+                    .and_then(|value| value.get("blockTimestamp")),
+            );
             if block_time == 0 && block_num != "0" && !block_num.is_empty() {
                 let cached = if let Some(cached) = block_time_cache.get(block_num) {
                     *cached
@@ -343,7 +347,11 @@ pub async fn fetch_alchemy_contract_transfers(
                 token_id: normalize_token_id(
                     item.get("erc721TokenId").or_else(|| item.get("tokenId")),
                 ),
-                tx_hash: item.get("hash").and_then(Value::as_str).unwrap_or("").to_string(),
+                tx_hash: item
+                    .get("hash")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
                 log_index: item.get("logIndex").and_then(Value::as_i64).unwrap_or(0),
                 block_number: if let Some(text) = item.get("blockNum").and_then(Value::as_str) {
                     if text.starts_with("0x") || text.starts_with("0X") {
@@ -421,8 +429,8 @@ pub async fn fetch_contract_owners(
     let mut seen_page_keys = BTreeSet::new();
     loop {
         let mut url = Url::parse(&format!(
-            "{}/nft/v3/key/getOwnersForContract",
-            endpoints.alchemy_nft_base
+            "{}/getOwnersForContract",
+            endpoints.alchemy_nft_v3_base
         ))
         .map_err(|err| AppError::Http(err.to_string()))?;
         url.query_pairs_mut()
@@ -488,7 +496,9 @@ pub async fn fetch_transaction_receipt(
         "method": "eth_getTransactionReceipt",
         "params": [tx_hash]
     });
-    let body: Value = client.post_json(&endpoints.alchemy_rpc_base, &payload).await?;
+    let body: Value = client
+        .post_json(&endpoints.alchemy_rpc_base, &payload)
+        .await?;
     let result = body.get("result").unwrap_or(&Value::Null);
     Ok(TransactionReceiptRecord {
         tx_hash: result
@@ -519,7 +529,9 @@ pub async fn fetch_transaction_receipts_for_block(
         "method": "alchemy_getTransactionReceipts",
         "params": [{ "blockNumber": format!("0x{:x}", block_number.max(0)) }]
     });
-    let body: Value = client.post_json(&endpoints.alchemy_rpc_base, &payload).await?;
+    let body: Value = client
+        .post_json(&endpoints.alchemy_rpc_base, &payload)
+        .await?;
     let mut rows = BTreeMap::new();
     for item in body
         .get("result")
@@ -570,7 +582,9 @@ pub async fn fetch_eth_balance(
         "method": "eth_getBalance",
         "params": [address, format!("0x{:x}", block_number)]
     });
-    let body: Value = client.post_json(&endpoints.alchemy_rpc_base, &payload).await?;
+    let body: Value = client
+        .post_json(&endpoints.alchemy_rpc_base, &payload)
+        .await?;
     let wei = body
         .get("result")
         .and_then(Value::as_str)
@@ -606,7 +620,9 @@ async fn fetch_address_eth_transfers(
         "method": "alchemy_getAssetTransfers",
         "params": [params]
     });
-    let body: Value = client.post_json(&endpoints.alchemy_rpc_base, &payload).await?;
+    let body: Value = client
+        .post_json(&endpoints.alchemy_rpc_base, &payload)
+        .await?;
     let mut rows = Vec::new();
     for item in body
         .get("result")
@@ -683,8 +699,7 @@ fn parse_hex_or_decimal_i64(value: Option<&Value>) -> i64 {
         return 0;
     }
     if text.starts_with("0x") || text.starts_with("0X") {
-        i64::from_str_radix(text.trim_start_matches("0x").trim_start_matches("0X"), 16)
-            .unwrap_or(0)
+        i64::from_str_radix(text.trim_start_matches("0x").trim_start_matches("0X"), 16).unwrap_or(0)
     } else {
         text.parse::<i64>().unwrap_or(0)
     }

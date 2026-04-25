@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use duckdb::{params, Connection};
 use once_cell::sync::Lazy;
@@ -48,15 +49,83 @@ fn metadata_keywords(document: &str, limit: usize) -> Vec<String> {
 
 pub struct DuckDbFeatureStore {
     conn: Connection,
+    resource_options: DuckDbResourceOptions,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DuckDbResourceOptions {
+    pub threads: usize,
+    pub memory_limit: String,
+}
+
+impl Default for DuckDbResourceOptions {
+    fn default() -> Self {
+        Self {
+            threads: std::thread::available_parallelism()
+                .map(|threads| threads.get())
+                .unwrap_or(1),
+            memory_limit: "80GB".to_string(),
+        }
+    }
+}
+
+impl DuckDbResourceOptions {
+    pub fn from_cli(threads: usize, memory_limit: &str) -> Result<Self, AppError> {
+        let mut options = Self::default();
+        if threads > 0 {
+            options.threads = threads;
+        }
+        if !memory_limit.trim().is_empty() {
+            options.memory_limit = memory_limit.trim().to_string();
+        }
+        validate_duckdb_memory_limit(&options.memory_limit)?;
+        Ok(options)
+    }
+}
+
+fn validate_duckdb_memory_limit(value: &str) -> Result<(), AppError> {
+    if value.is_empty()
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_'))
+    {
+        return Err(AppError::InvalidData(format!(
+            "invalid DuckDB memory limit {value:?}; expected a value like 80GB or 512MB"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_metadata_keywords_arr(raw: &str) -> Result<HashSet<String>, AppError> {
+    if raw.trim().is_empty() {
+        return Ok(HashSet::new());
+    }
+    let values: Vec<String> = serde_json::from_str(raw)?;
+    Ok(values
+        .into_iter()
+        .map(|value| value.to_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect())
 }
 
 impl DuckDbFeatureStore {
     pub fn new(database_path: &str) -> Result<Self, AppError> {
+        Self::new_with_options(database_path, DuckDbResourceOptions::default())
+    }
+
+    pub fn new_with_options(
+        database_path: &str,
+        resource_options: DuckDbResourceOptions,
+    ) -> Result<Self, AppError> {
+        validate_duckdb_memory_limit(&resource_options.memory_limit)?;
         let conn = if database_path == ":memory:" {
             Connection::open_in_memory()?
         } else {
             Connection::open(database_path)?
         };
+        let temp_directory = Self::default_temp_directory(database_path);
+        std::fs::create_dir_all(&temp_directory)?;
+        Self::apply_resource_options(&conn, &resource_options, &temp_directory)?;
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS nft_features (
@@ -78,7 +147,43 @@ impl DuckDbFeatureStore {
             ",
         )?;
         Self::validate_schema(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            resource_options,
+        })
+    }
+
+    pub fn resource_options(&self) -> &DuckDbResourceOptions {
+        &self.resource_options
+    }
+
+    fn apply_resource_options(
+        conn: &Connection,
+        options: &DuckDbResourceOptions,
+        temp_directory: &Path,
+    ) -> Result<(), AppError> {
+        let memory_limit = options.memory_limit.replace('\'', "''");
+        let temp_directory = temp_directory.to_string_lossy().replace('\'', "''");
+        conn.execute_batch(&format!(
+            "
+            PRAGMA threads={};
+            PRAGMA memory_limit='{}';
+            PRAGMA temp_directory='{}';
+            PRAGMA preserve_insertion_order=false;
+            ",
+            options.threads.max(1),
+            memory_limit,
+            temp_directory
+        ))?;
+        Ok(())
+    }
+
+    fn default_temp_directory(database_path: &str) -> PathBuf {
+        if database_path == ":memory:" {
+            std::env::temp_dir().join("top_contract_analysis_rs_duckdb")
+        } else {
+            Path::new(database_path).with_extension("duckdb.tmp")
+        }
     }
 
     fn validate_schema(conn: &Connection) -> Result<(), AppError> {
@@ -370,10 +475,10 @@ impl DuckDbFeatureStore {
         let select_sql = format!(
             "
             SELECT contract_address, token_id, token_uri, image_uri, name, symbol, metadata_json, metadata_doc,
-                   token_uri_norm, image_uri_norm, name_norm, symbol_norm
+                   token_uri_norm, image_uri_norm, name_norm, symbol_norm, metadata_keywords_arr
             FROM (
                 SELECT contract_address, token_id, token_uri, image_uri, name, symbol, metadata_json, metadata_doc,
-                       token_uri_norm, image_uri_norm, name_norm, symbol_norm,
+                       token_uri_norm, image_uri_norm, name_norm, symbol_norm, metadata_keywords_arr,
                        row_number() OVER (PARTITION BY contract_address ORDER BY token_id) AS rn
                 FROM nft_features
                 WHERE chain = ?{seed_contract_filter}
@@ -403,24 +508,26 @@ impl DuckDbFeatureStore {
                 row.get::<_, String>(9)?,
                 row.get::<_, String>(10)?,
                 row.get::<_, String>(11)?,
+                row.get::<_, String>(12)?,
             ))
         })?;
 
         let mut selected_rows = Vec::new();
         let mut per_contract_counts: BTreeMap<String, usize> = BTreeMap::new();
         for row in rows {
-            let (record, token_uri_norm, image_uri_norm, name_norm, symbol_norm) = row?;
+            let (
+                record,
+                token_uri_norm,
+                image_uri_norm,
+                name_norm,
+                symbol_norm,
+                metadata_keywords_arr,
+            ) = row?;
             if seed_contracts.contains(&record.contract_address) {
                 continue;
             }
 
-            let metadata_doc = if record.metadata_doc.trim().is_empty() {
-                metadata_document_from_json(&record.metadata_json)
-            } else {
-                record.metadata_doc.clone()
-            };
-            let row_keywords: HashSet<String> =
-                metadata_keywords(&metadata_doc, 8).into_iter().collect();
+            let row_keywords = parse_metadata_keywords_arr(&metadata_keywords_arr)?;
             let name_prefix = name_norm.chars().take(8).collect::<String>();
             let matches = exact_token_keys.contains(&token_uri_norm)
                 || exact_image_keys.contains(&image_uri_norm)

@@ -42,6 +42,12 @@ fn batch_subcommand_is_exposed() {
             "signals.db",
             "--output-dir",
             "result",
+            "--api-max-concurrency",
+            "24",
+            "--contract-max-concurrency",
+            "12",
+            "--sale-metric-max-concurrency",
+            "10",
         ])
         .assert()
         .failure()

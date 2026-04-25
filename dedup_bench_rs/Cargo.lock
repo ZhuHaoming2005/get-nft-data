@@ -2838,6 +2838,7 @@ dependencies = [
  "once_cell",
  "parquet",
  "postgres",
+ "rayon",
  "regex",
  "reqwest",
  "serde",
