@@ -83,8 +83,6 @@ pub struct BatchArgs {
     pub feature_db: String,
     #[arg(long, default_value = ":memory:")]
     pub signal_cache_db: String,
-    #[arg(long, default_value_t = false)]
-    pub strict_parquet: bool,
     #[arg(long, default_value_t = 0)]
     pub max_recall_rows: usize,
     #[arg(long, default_value_t = 0)]

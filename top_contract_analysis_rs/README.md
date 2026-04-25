@@ -77,10 +77,10 @@ cargo run --release -- export-snapshot \
 ```bash
 cargo run --release -- analyze \
   --chain ethereum \
-  --seed-contract-address 0xed5af388653567af2f388e6224dc7c4b3241c544 \
-  --alchemy-api-key "$ALCHEMY_API_KEY" \
-  --etherscan-api-key "$ETHERSCAN_API_KEY" \
-  --opensea-api-key "$OPENSEA_API_KEY" \
+  --seed-contract-address 0xBd3531dA5CF5857e7CfAA92426877b022e612cf8 \
+  --alchemy-api-key "O6O-K8fkagLHjOa-LLM3_" \
+  --etherscan-api-key "5S6SMJYGF2H28RZWVV97YXQMQHTWFG7N3M" \
+  --opensea-api-key "2d17a25e68714720883ac996f5459b17" \
   --feature-parquet ../output/top_contract_analysis/ethereum.parquet \
   --feature-db ../output/top_contract_analysis/features.duckdb \
   --signal-cache-db ../output/top_contract_analysis/signals.duckdb
@@ -114,9 +114,9 @@ cargo run --release -- analyze \
 cargo run --release -- batch \
   --chain ethereum \
   --seed-file ./seeds.txt \
-  --alchemy-api-key "$ALCHEMY_API_KEY" \
-  --etherscan-api-key "$ETHERSCAN_API_KEY" \
-  --opensea-api-key "$OPENSEA_API_KEY" \
+  --alchemy-api-key "O6O-K8fkagLHjOa-LLM3_" \
+  --etherscan-api-key "5S6SMJYGF2H28RZWVV97YXQMQHTWFG7N3M" \
+  --opensea-api-key "2d17a25e68714720883ac996f5459b17" \
   --feature-parquet ../output/top_contract_analysis/ethereum.parquet \
   --feature-db ../output/top_contract_analysis/features.duckdb \
   --signal-cache-db ../output/top_contract_analysis/signals.duckdb \
@@ -134,7 +134,6 @@ cargo run --release -- batch \
 
 - `--timeout 30`
 - `--workers 4`
-- `--strict-parquet`
 - `--max-recall-rows 100000`
 - `--max-tokens-per-contract 500`
 
@@ -149,5 +148,5 @@ cargo run --release -- batch \
 - `--feature-db` 默认是 `:memory:`。如果你希望 DuckDB 状态跨进程保留，请传文件路径。
 - `--signal-cache-db` 默认是 `:memory:`。如果你希望 transfers / owners 的 signal cache 跨运行保留，请传文件路径。
 - 如果不传 `--feature-parquet`，程序会假设 DuckDB 特征库里已经有可用数据集。
-- 如果同时传了 `--feature-db` 和 `--feature-parquet`，且 `feature-db` 中该链已经有数据，则会优先使用 `feature-db`，不会再从 Parquet 覆盖导入该链数据。
+- 如果同时传了 `--feature-db` 和 `--feature-parquet`，且 `feature-db` 中该链已经有当前版本数据，则会复用 `feature-db`；如果没有该链数据，才从 Parquet 导入。旧版本 `feature-db` / 旧快照缺少预计算列会直接报错，需要重新运行 `export-snapshot`。
 - `batch` 当前内部构造 API client 时使用固定的请求并发默认值；批量运行时 CLI 暴露出来的主要吞吐控制参数是 `--workers`。

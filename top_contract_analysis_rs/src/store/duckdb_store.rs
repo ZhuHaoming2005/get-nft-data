@@ -26,7 +26,7 @@ fn metadata_keywords(document: &str, limit: usize) -> Vec<String> {
     let mut counts: HashMap<String, usize> = HashMap::new();
     for token in TOKEN_RE.find_iter(document) {
         let normalized = token.as_str().to_lowercase();
-        if normalized.len() < 4 {
+        if normalized.len() < 2 {
             continue;
         }
         *counts.entry(normalized).or_insert(0) += 1;
@@ -72,11 +72,33 @@ impl DuckDbFeatureStore {
                 image_uri_norm VARCHAR,
                 name_norm VARCHAR,
                 symbol_norm VARCHAR,
-                metadata_doc VARCHAR
+                metadata_doc VARCHAR,
+                metadata_keywords_arr VARCHAR
             );
             ",
         )?;
+        Self::validate_schema(&conn)?;
         Ok(Self { conn })
+    }
+
+    fn validate_schema(conn: &Connection) -> Result<(), AppError> {
+        let mut stmt = conn.prepare("DESCRIBE nft_features")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut columns = HashSet::new();
+        for row in rows {
+            columns.insert(row?);
+        }
+        let missing: Vec<&str> = PRECOMPUTED_COLUMNS
+            .iter()
+            .copied()
+            .filter(|column| !columns.contains(*column))
+            .collect();
+        if !missing.is_empty() {
+            return Err(AppError::InvalidData(format!(
+                "feature DB nft_features table is missing current pre-computed columns {missing:?}. Rebuild it from a current export-snapshot Parquet file."
+            )));
+        }
+        Ok(())
     }
 
     pub fn has_chain_rows(&self, chain: &str) -> Result<bool, AppError> {
@@ -100,8 +122,8 @@ impl DuckDbFeatureStore {
             "
             INSERT INTO nft_features (
                 chain, contract_address, token_id, token_uri, image_uri, name, symbol, metadata_json,
-                token_uri_norm, image_uri_norm, name_norm, symbol_norm, metadata_doc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                token_uri_norm, image_uri_norm, name_norm, symbol_norm, metadata_doc, metadata_keywords_arr
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ",
         )?;
 
@@ -111,6 +133,8 @@ impl DuckDbFeatureStore {
             } else {
                 row.metadata_doc.clone()
             };
+            let metadata_keywords_arr =
+                serde_json::to_string(&metadata_keywords(&metadata_doc, 8))?;
             stmt.execute(params![
                 chain,
                 row.contract_address.to_lowercase(),
@@ -125,22 +149,58 @@ impl DuckDbFeatureStore {
                 normalize_name(&row.name),
                 normalize_symbol(&row.symbol),
                 metadata_doc,
+                metadata_keywords_arr,
             ])?;
         }
 
         Ok(())
     }
 
-    pub fn load_parquet_dataset(
+    fn load_parquet_dataset_via_duckdb(
         &self,
         chain: &str,
         parquet_path: &str,
-        strict: bool,
+        column_names: &HashSet<String>,
     ) -> Result<(), AppError> {
-        let probe_sql = format!(
-            "DESCRIBE SELECT * FROM read_parquet('{}')",
-            parquet_path.replace('\\', "/")
+        let path = Self::sql_string_literal(&parquet_path.replace('\\', "/"));
+        let metadata_json_expr = if column_names.contains("metadata_json") {
+            "coalesce(CAST(metadata_json AS VARCHAR), '')"
+        } else {
+            "''"
+        };
+        let insert_sql = format!(
+            "
+            INSERT INTO nft_features (
+                chain, contract_address, token_id, token_uri, image_uri, name, symbol, metadata_json,
+                token_uri_norm, image_uri_norm, name_norm, symbol_norm, metadata_doc, metadata_keywords_arr
+            )
+            SELECT
+                ? AS chain,
+                lower(CAST(contract_address AS VARCHAR)) AS contract_address,
+                CAST(token_id AS VARCHAR) AS token_id,
+                coalesce(CAST(token_uri AS VARCHAR), '') AS token_uri,
+                coalesce(CAST(image_uri AS VARCHAR), '') AS image_uri,
+                coalesce(CAST(name AS VARCHAR), '') AS name,
+                coalesce(CAST(symbol AS VARCHAR), '') AS symbol,
+                {metadata_json_expr} AS metadata_json,
+                coalesce(CAST(token_uri_norm AS VARCHAR), '') AS token_uri_norm,
+                coalesce(CAST(image_uri_norm AS VARCHAR), '') AS image_uri_norm,
+                coalesce(CAST(name_norm AS VARCHAR), '') AS name_norm,
+                coalesce(CAST(symbol_norm AS VARCHAR), '') AS symbol_norm,
+                coalesce(CAST(metadata_doc AS VARCHAR), '') AS metadata_doc,
+                coalesce(CAST(metadata_keywords_arr AS VARCHAR), '[]') AS metadata_keywords_arr
+            FROM read_parquet({path})
+            ",
         );
+        self.conn
+            .execute("DELETE FROM nft_features WHERE chain = ?", params![chain])?;
+        self.conn.execute(&insert_sql, params![chain])?;
+        Ok(())
+    }
+
+    pub fn load_parquet_dataset(&self, chain: &str, parquet_path: &str) -> Result<(), AppError> {
+        let parquet_path_literal = Self::sql_string_literal(&parquet_path.replace('\\', "/"));
+        let probe_sql = format!("DESCRIBE SELECT * FROM read_parquet({parquet_path_literal})");
         let mut stmt = self.conn.prepare(&probe_sql)?;
         let describe_rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         let mut column_names: HashSet<String> = HashSet::new();
@@ -153,71 +213,72 @@ impl DuckDbFeatureStore {
             .copied()
             .filter(|column| !column_names.contains(*column))
             .collect();
-        if strict && !missing.is_empty() {
+        if !missing.is_empty() {
             return Err(AppError::InvalidData(format!(
-                "Parquet file {parquet_path:?} is missing pre-computed columns {missing:?}. Re-export the snapshot with export_snapshot.py or disable strict mode."
+                "Parquet file {parquet_path:?} is missing pre-computed columns {missing:?}. Re-export the snapshot with the current export-snapshot command."
             )));
         }
 
-        let metadata_json_expr = if column_names.contains("metadata_json") {
-            "coalesce(CAST(metadata_json AS VARCHAR), '')"
-        } else {
-            "''"
-        };
-        let metadata_doc_expr = if column_names.contains("metadata_doc") {
-            "coalesce(CAST(metadata_doc AS VARCHAR), '')"
-        } else {
-            "''"
-        };
-        let select_sql = format!(
-            "
-            SELECT
-                lower(CAST(contract_address AS VARCHAR)) AS contract_address,
-                CAST(token_id AS VARCHAR) AS token_id,
-                coalesce(CAST(token_uri AS VARCHAR), '') AS token_uri,
-                coalesce(CAST(image_uri AS VARCHAR), '') AS image_uri,
-                coalesce(CAST(name AS VARCHAR), '') AS name,
-                coalesce(CAST(symbol AS VARCHAR), '') AS symbol,
-                {metadata_json_expr} AS metadata_json,
-                {metadata_doc_expr} AS metadata_doc
-            FROM read_parquet('{}')
-            ",
-            parquet_path.replace('\\', "/")
-        );
-
-        let mut query = self.conn.prepare(&select_sql)?;
-        let rows = query.query_map([], |row| {
-            Ok(DatabaseNftRecord {
-                contract_address: row.get::<_, String>(0)?,
-                token_id: row.get::<_, String>(1)?,
-                token_uri: row.get::<_, String>(2)?,
-                image_uri: row.get::<_, String>(3)?,
-                name: row.get::<_, String>(4)?,
-                symbol: row.get::<_, String>(5)?,
-                metadata_json: row.get::<_, String>(6)?,
-                metadata_doc: row.get::<_, String>(7)?,
-            })
-        })?;
-
-        let mut collected = Vec::new();
-        for row in rows {
-            collected.push(row?);
-        }
-        self.replace_chain_rows(chain, &collected)?;
-        Ok(())
+        self.load_parquet_dataset_via_duckdb(chain, parquet_path, &column_names)
     }
 
     pub fn load_parquet_dataset_if_chain_missing(
         &self,
         chain: &str,
         parquet_path: &str,
-        strict: bool,
     ) -> Result<bool, AppError> {
         if self.has_chain_rows(chain)? {
             return Ok(false);
         }
-        self.load_parquet_dataset(chain, parquet_path, strict)?;
+        self.load_parquet_dataset(chain, parquet_path)?;
         Ok(true)
+    }
+
+    fn sql_string_literal(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "''"))
+    }
+
+    fn sql_in_predicate(column: &str, values: &HashSet<String>) -> Option<String> {
+        if values.is_empty() {
+            return None;
+        }
+        let values = values
+            .iter()
+            .filter(|value| !value.is_empty())
+            .map(|value| Self::sql_string_literal(value))
+            .collect::<BTreeSet<_>>();
+        if values.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "{column} IN ({})",
+                values.into_iter().collect::<Vec<_>>().join(", ")
+            ))
+        }
+    }
+
+    fn sql_metadata_keyword_predicate(values: &HashSet<String>) -> Option<String> {
+        if values.is_empty() {
+            return None;
+        }
+        let clauses = values
+            .iter()
+            .filter_map(|value| serde_json::to_string(value).ok())
+            .map(|json_string| {
+                format!(
+                    "instr(coalesce(metadata_keywords_arr, '[]'), {}) > 0",
+                    Self::sql_string_literal(&json_string),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        if clauses.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "({})",
+                clauses.into_iter().collect::<Vec<_>>().join(" OR ")
+            ))
+        }
     }
 
     pub fn load_snapshot(
@@ -262,15 +323,69 @@ impl DuckDbFeatureStore {
             })
             .collect();
 
-        let mut stmt = self.conn.prepare(
+        let mut predicates = Vec::new();
+        predicates.push("chain = ?".to_string());
+        if let Some(predicate) = Self::sql_in_predicate("token_uri_norm", &exact_token_keys) {
+            predicates.push(format!("({predicate})"));
+        }
+        if let Some(predicate) = Self::sql_in_predicate("image_uri_norm", &exact_image_keys) {
+            predicates.push(format!("({predicate})"));
+        }
+        if let Some(predicate) = Self::sql_in_predicate("symbol_norm", &exact_symbols) {
+            predicates.push(format!("({predicate})"));
+        }
+        if let Some(predicate) = Self::sql_in_predicate("substr(name_norm, 1, 8)", &name_prefixes) {
+            predicates.push(format!("({predicate})"));
+        }
+        if let Some(predicate) = Self::sql_metadata_keyword_predicate(&metadata_recall_terms) {
+            predicates.push(predicate);
+        }
+        let recall_predicate = if predicates.len() == 1 {
+            "FALSE".to_string()
+        } else {
+            format!("({})", predicates[1..].join(" OR "))
+        };
+        let seed_contract_filter = if seed_contracts.is_empty() {
+            String::new()
+        } else {
+            let values = seed_contracts
+                .iter()
+                .map(|value| Self::sql_string_literal(value))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(" AND contract_address NOT IN ({values})")
+        };
+        let per_contract_filter = if max_tokens_per_contract > 0 {
+            format!("WHERE rn <= {max_tokens_per_contract}")
+        } else {
+            String::new()
+        };
+        let total_limit = if max_recall_rows > 0 {
+            format!("LIMIT {max_recall_rows}")
+        } else {
+            String::new()
+        };
+        let select_sql = format!(
             "
             SELECT contract_address, token_id, token_uri, image_uri, name, symbol, metadata_json, metadata_doc,
                    token_uri_norm, image_uri_norm, name_norm, symbol_norm
-            FROM nft_features
-            WHERE chain = ?
+            FROM (
+                SELECT contract_address, token_id, token_uri, image_uri, name, symbol, metadata_json, metadata_doc,
+                       token_uri_norm, image_uri_norm, name_norm, symbol_norm,
+                       row_number() OVER (PARTITION BY contract_address ORDER BY token_id) AS rn
+                FROM nft_features
+                WHERE chain = ?{seed_contract_filter}
+                  AND {recall_predicate}
+            )
+            {per_contract_filter}
             ORDER BY contract_address, token_id
-            ",
-        )?;
+            {total_limit}
+            "
+        );
+
+        let mut stmt = self.conn.prepare(&select_sql)?;
 
         let rows = stmt.query_map(params![chain], |row| {
             Ok((
@@ -304,7 +419,8 @@ impl DuckDbFeatureStore {
             } else {
                 record.metadata_doc.clone()
             };
-            let row_keywords: HashSet<String> = metadata_keywords(&metadata_doc, 8).into_iter().collect();
+            let row_keywords: HashSet<String> =
+                metadata_keywords(&metadata_doc, 8).into_iter().collect();
             let name_prefix = name_norm.chars().take(8).collect::<String>();
             let matches = exact_token_keys.contains(&token_uri_norm)
                 || exact_image_keys.contains(&image_uri_norm)
@@ -318,12 +434,21 @@ impl DuckDbFeatureStore {
                 continue;
             }
 
-            let entry = per_contract_counts.entry(record.contract_address.clone()).or_default();
+            let entry = per_contract_counts
+                .entry(record.contract_address.clone())
+                .or_default();
             if max_tokens_per_contract > 0 && *entry >= max_tokens_per_contract {
                 continue;
             }
             *entry += 1;
-            selected_rows.push((record, token_uri_norm, image_uri_norm, name_norm, symbol_norm, row_keywords));
+            selected_rows.push((
+                record,
+                token_uri_norm,
+                image_uri_norm,
+                name_norm,
+                symbol_norm,
+                row_keywords,
+            ));
             if max_recall_rows > 0 && selected_rows.len() >= max_recall_rows {
                 break;
             }

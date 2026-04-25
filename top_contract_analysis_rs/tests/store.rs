@@ -19,7 +19,7 @@ fn write_parquet(sql: &str, path: &std::path::Path) {
 }
 
 #[test]
-fn strict_parquet_rejects_missing_precomputed_columns() {
+fn parquet_rejects_missing_precomputed_columns() {
     let dir = tempdir().unwrap();
     let parquet_path = dir.path().join("missing_columns.parquet");
     write_parquet(
@@ -39,14 +39,14 @@ fn strict_parquet_rejects_missing_precomputed_columns() {
 
     let store = DuckDbFeatureStore::new(":memory:").unwrap();
     let err = store
-        .load_parquet_dataset("ethereum", &parquet_path.to_string_lossy(), true)
+        .load_parquet_dataset("ethereum", &parquet_path.to_string_lossy())
         .unwrap_err();
 
     assert!(err.to_string().contains("missing pre-computed columns"));
 }
 
 #[test]
-fn existing_feature_db_chain_rows_take_priority_over_parquet() {
+fn existing_current_feature_db_chain_rows_take_priority_over_parquet() {
     let dir = tempdir().unwrap();
     let parquet_path = dir.path().join("snapshot.parquet");
     write_parquet(
@@ -64,7 +64,8 @@ fn existing_feature_db_chain_rows_take_priority_over_parquet() {
             '' AS image_uri_norm,
             'parquet clone' AS name_norm,
             'azuki' AS symbol_norm,
-            '' AS metadata_doc
+            '' AS metadata_doc,
+            '[]' AS metadata_keywords_arr
         ",
         &parquet_path,
     );
@@ -87,9 +88,8 @@ fn existing_feature_db_chain_rows_take_priority_over_parquet() {
         .unwrap();
 
     let loaded = store
-        .load_parquet_dataset_if_chain_missing("ethereum", &parquet_path.to_string_lossy(), false)
+        .load_parquet_dataset_if_chain_missing("ethereum", &parquet_path.to_string_lossy())
         .unwrap();
-
     assert!(!loaded);
 
     let snapshot = store
@@ -138,7 +138,8 @@ fn parquet_loads_when_feature_db_has_no_chain_rows() {
             '' AS image_uri_norm,
             'parquet clone' AS name_norm,
             'azuki' AS symbol_norm,
-            '' AS metadata_doc
+            '' AS metadata_doc,
+            '[]' AS metadata_keywords_arr
         ",
         &parquet_path,
     );
@@ -146,9 +147,8 @@ fn parquet_loads_when_feature_db_has_no_chain_rows() {
     let store = DuckDbFeatureStore::new(":memory:").unwrap();
 
     let loaded = store
-        .load_parquet_dataset_if_chain_missing("ethereum", &parquet_path.to_string_lossy(), false)
+        .load_parquet_dataset_if_chain_missing("ethereum", &parquet_path.to_string_lossy())
         .unwrap();
-
     assert!(loaded);
 
     let snapshot = store
@@ -176,6 +176,44 @@ fn parquet_loads_when_feature_db_has_no_chain_rows() {
         .map(|row| row.contract_address.as_str())
         .collect();
     assert_eq!(contracts, vec!["0xparquet"]);
+}
+
+#[test]
+fn old_feature_db_schema_is_rejected() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("old.duckdb");
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE nft_features (
+                chain VARCHAR NOT NULL,
+                contract_address VARCHAR NOT NULL,
+                token_id VARCHAR NOT NULL,
+                token_uri VARCHAR,
+                image_uri VARCHAR,
+                name VARCHAR,
+                symbol VARCHAR,
+                metadata_json VARCHAR,
+                token_uri_norm VARCHAR,
+                image_uri_norm VARCHAR,
+                name_norm VARCHAR,
+                symbol_norm VARCHAR,
+                metadata_doc VARCHAR
+            );
+            ",
+        )
+        .unwrap();
+    }
+
+    let err = match DuckDbFeatureStore::new(&db_path.to_string_lossy()) {
+        Ok(_) => panic!("old feature DB schema should be rejected"),
+        Err(err) => err,
+    };
+
+    assert!(err
+        .to_string()
+        .contains("missing current pre-computed columns"));
 }
 
 #[test]
@@ -247,6 +285,101 @@ fn feature_store_applies_per_contract_token_cap() {
         1
     );
     assert_eq!(snapshot.contract_signals["0xdup"].token_count, 1);
+}
+
+#[test]
+fn feature_store_recalls_short_metadata_terms() {
+    let store = DuckDbFeatureStore::new(":memory:").unwrap();
+    store
+        .replace_chain_rows(
+            "ethereum",
+            &[
+                DatabaseNftRecord {
+                    contract_address: "0xshort".into(),
+                    token_id: "1".into(),
+                    metadata_doc: "ai cat".into(),
+                    ..Default::default()
+                },
+                DatabaseNftRecord {
+                    contract_address: "0xmiss".into(),
+                    token_id: "1".into(),
+                    metadata_doc: "dog".into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+
+    let snapshot = store
+        .load_snapshot(
+            "ethereum",
+            &[SeedNft {
+                chain: "ethereum".into(),
+                contract_address: "0xseed".into(),
+                token_id: "1".into(),
+                metadata_doc: "ai cat".into(),
+                ..Default::default()
+            }],
+            0,
+            0,
+        )
+        .unwrap();
+
+    let contracts: Vec<&str> = snapshot
+        .nft_rows
+        .iter()
+        .map(|row| row.contract_address.as_str())
+        .collect();
+    assert_eq!(contracts, vec!["0xshort"]);
+    assert!(snapshot.contract_signals["0xshort"].keyword_match);
+}
+
+#[test]
+fn feature_store_applies_total_recall_limit_after_sql_recall() {
+    let store = DuckDbFeatureStore::new(":memory:").unwrap();
+    store
+        .replace_chain_rows(
+            "ethereum",
+            &[
+                DatabaseNftRecord {
+                    contract_address: "0xone".into(),
+                    token_id: "1".into(),
+                    symbol: "AZUKI".into(),
+                    ..Default::default()
+                },
+                DatabaseNftRecord {
+                    contract_address: "0xtwo".into(),
+                    token_id: "1".into(),
+                    symbol: "AZUKI".into(),
+                    ..Default::default()
+                },
+                DatabaseNftRecord {
+                    contract_address: "0xthree".into(),
+                    token_id: "1".into(),
+                    symbol: "OTHER".into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+
+    let snapshot = store
+        .load_snapshot(
+            "ethereum",
+            &[SeedNft {
+                chain: "ethereum".into(),
+                contract_address: "0xseed".into(),
+                token_id: "1".into(),
+                symbol: "AZUKI".into(),
+                ..Default::default()
+            }],
+            0,
+            1,
+        )
+        .unwrap();
+
+    assert_eq!(snapshot.nft_rows.len(), 1);
+    assert_eq!(snapshot.nft_rows[0].contract_address, "0xone");
 }
 
 #[test]
