@@ -1989,6 +1989,8 @@ async fn analyze_moves_official_reissues_into_legit_duplicates() {
                     symbol: "AZUKI".into(),
                     metadata_json: r#"{"description":"Creative Commons Zero license: CC0"}"#.into(),
                     metadata_doc: "creative commons zero public domain".into(),
+                    metadata_recall_checked: false,
+                    metadata_recall_match: false,
                 }],
                 ..DatabaseSnapshot::default()
             },
@@ -2036,6 +2038,8 @@ async fn analyze_builds_expected_summary_counts() {
                     symbol: "AZUKI".into(),
                     metadata_json: r#"{"description":"gold dragon"}"#.into(),
                     metadata_doc: "gold dragon".into(),
+                    metadata_recall_checked: false,
+                    metadata_recall_match: false,
                 }],
                 ..DatabaseSnapshot::default()
             },
@@ -2079,6 +2083,8 @@ async fn analyze_marks_seed_open_license_and_skips_suspected_contracts() {
                     symbol: "AZUKI".into(),
                     metadata_json: r#"{"description":"gold dragon"}"#.into(),
                     metadata_doc: "gold dragon".into(),
+                    metadata_recall_checked: false,
+                    metadata_recall_match: false,
                 }],
                 ..DatabaseSnapshot::default()
             },
@@ -2154,6 +2160,8 @@ async fn analyze_enriches_duplicate_contracts_with_signals_and_infringing_tokens
                     symbol: "AZUKI".into(),
                     metadata_json: r#"{"description":"gold dragon"}"#.into(),
                     metadata_doc: "gold dragon".into(),
+                    metadata_recall_checked: false,
+                    metadata_recall_match: false,
                 }],
                 ..DatabaseSnapshot::default()
             },
@@ -2200,6 +2208,8 @@ async fn analyze_enriches_symbol_only_duplicate_contracts_with_signals_and_infri
                     symbol: "AZUKI".into(),
                     metadata_json: r#"{"description":"unrelated"}"#.into(),
                     metadata_doc: "unrelated".into(),
+                    metadata_recall_checked: false,
+                    metadata_recall_match: false,
                 }],
                 ..DatabaseSnapshot::default()
             },
@@ -2245,6 +2255,8 @@ async fn analyze_builds_address_profiles_and_trade_stats_for_duplicate_contracts
                     symbol: "AZUKI".into(),
                     metadata_json: r#"{"description":"gold dragon"}"#.into(),
                     metadata_doc: "gold dragon".into(),
+                    metadata_recall_checked: false,
+                    metadata_recall_match: false,
                 }],
                 ..DatabaseSnapshot::default()
             },
@@ -2321,6 +2333,8 @@ async fn analyze_reuses_signal_cache_for_transfers_and_owners() {
                     symbol: "AZUKI".into(),
                     metadata_json: r#"{"description":"gold dragon"}"#.into(),
                     metadata_doc: "gold dragon".into(),
+                    metadata_recall_checked: false,
+                    metadata_recall_match: false,
                 }],
                 ..DatabaseSnapshot::default()
             },
@@ -2366,6 +2380,8 @@ async fn analyze_computes_native_eth_sale_metrics_for_victim_addresses() {
                     symbol: "AZUKI".into(),
                     metadata_json: r#"{"description":"gold dragon"}"#.into(),
                     metadata_doc: "gold dragon".into(),
+                    metadata_recall_checked: false,
+                    metadata_recall_match: false,
                 }],
                 ..DatabaseSnapshot::default()
             },
@@ -2425,6 +2441,8 @@ async fn analyze_processes_duplicate_contracts_within_a_seed_concurrently() {
                         symbol: "AZUKI".into(),
                         metadata_json: r#"{"description":"gold dragon"}"#.into(),
                         metadata_doc: "gold dragon".into(),
+                        metadata_recall_checked: false,
+                        metadata_recall_match: false,
                     },
                     DatabaseNftRecord {
                         contract_address: "0xdup2".into(),
@@ -2435,6 +2453,8 @@ async fn analyze_processes_duplicate_contracts_within_a_seed_concurrently() {
                         symbol: "AZUKI".into(),
                         metadata_json: r#"{"description":"gold dragon"}"#.into(),
                         metadata_doc: "gold dragon".into(),
+                        metadata_recall_checked: false,
+                        metadata_recall_match: false,
                     },
                 ],
                 ..DatabaseSnapshot::default()
@@ -2481,6 +2501,8 @@ async fn analyze_computes_sale_metrics_concurrently_within_a_contract() {
                     symbol: "AZUKI".into(),
                     metadata_json: r#"{"description":"gold dragon"}"#.into(),
                     metadata_doc: "gold dragon".into(),
+                    metadata_recall_checked: false,
+                    metadata_recall_match: false,
                 }],
                 ..DatabaseSnapshot::default()
             },
@@ -2526,6 +2548,8 @@ async fn analyze_fetches_contract_inputs_concurrently_within_one_contract() {
                     symbol: "AZUKI".into(),
                     metadata_json: r#"{"description":"gold dragon"}"#.into(),
                     metadata_doc: "gold dragon".into(),
+                    metadata_recall_checked: false,
+                    metadata_recall_match: false,
                 }],
                 ..DatabaseSnapshot::default()
             },

@@ -106,6 +106,50 @@ mod tests {
 
         assert!(snapshot.nft_rows.is_empty());
     }
+
+    #[test]
+    fn load_snapshot_marks_rows_that_were_recalled_by_metadata() {
+        let store = DuckDbFeatureStore::new(":memory:").unwrap();
+        store
+            .replace_chain_rows(
+                "ethereum",
+                &[
+                    DatabaseNftRecord {
+                        contract_address: "0xmetadata".into(),
+                        token_id: "1".into(),
+                        metadata_doc: "gold dragon".into(),
+                        ..Default::default()
+                    },
+                    DatabaseNftRecord {
+                        contract_address: "0xsymbol".into(),
+                        token_id: "1".into(),
+                        symbol: "SEED".into(),
+                        metadata_doc: "silver cat".into(),
+                        ..Default::default()
+                    },
+                ],
+            )
+            .unwrap();
+        let seed_nfts = vec![SeedNft {
+            contract_address: "0xseed".into(),
+            token_id: "1".into(),
+            symbol: "SEED".into(),
+            metadata_doc: "gold dragon".into(),
+            ..Default::default()
+        }];
+
+        let snapshot = store.load_snapshot("ethereum", &seed_nfts, 0, 0).unwrap();
+        let by_contract: BTreeMap<_, _> = snapshot
+            .nft_rows
+            .iter()
+            .map(|row| (row.contract_address.as_str(), row))
+            .collect();
+
+        assert!(by_contract["0xmetadata"].metadata_recall_checked);
+        assert!(by_contract["0xmetadata"].metadata_recall_match);
+        assert!(by_contract["0xsymbol"].metadata_recall_checked);
+        assert!(!by_contract["0xsymbol"].metadata_recall_match);
+    }
 }
 
 impl DuckDbResourceOptions {
@@ -551,6 +595,8 @@ impl DuckDbFeatureStore {
                     symbol: row.get::<_, String>(5)?,
                     metadata_json: row.get::<_, String>(6)?,
                     metadata_doc: row.get::<_, String>(7)?,
+                    metadata_recall_checked: false,
+                    metadata_recall_match: false,
                 },
                 row.get::<_, String>(8)?,
                 row.get::<_, String>(9)?,
@@ -564,7 +610,7 @@ impl DuckDbFeatureStore {
         let mut per_contract_counts: BTreeMap<String, usize> = BTreeMap::new();
         for row in rows {
             let (
-                record,
+                mut record,
                 token_uri_norm,
                 image_uri_norm,
                 name_norm,
@@ -577,17 +623,20 @@ impl DuckDbFeatureStore {
 
             let row_keywords = parse_metadata_keywords_arr(&metadata_keywords_arr)?;
             let name_prefix = name_norm.chars().take(8).collect::<String>();
+            let metadata_recall_match = !metadata_recall_terms.is_empty()
+                && !row_keywords.is_empty()
+                && !row_keywords.is_disjoint(&metadata_recall_terms);
             let matches = exact_token_keys.contains(&token_uri_norm)
                 || exact_image_keys.contains(&image_uri_norm)
                 || exact_symbols.contains(&symbol_norm)
                 || (!name_prefix.is_empty() && name_prefixes.contains(&name_prefix))
-                || (!metadata_recall_terms.is_empty()
-                    && !row_keywords.is_empty()
-                    && !row_keywords.is_disjoint(&metadata_recall_terms));
+                || metadata_recall_match;
 
             if !matches {
                 continue;
             }
+            record.metadata_recall_checked = true;
+            record.metadata_recall_match = metadata_recall_match;
 
             let entry = per_contract_counts
                 .entry(record.contract_address.clone())

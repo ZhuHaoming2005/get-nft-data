@@ -25,6 +25,10 @@ pub struct DatabaseNftRecord {
     pub symbol: String,
     pub metadata_json: String,
     pub metadata_doc: String,
+    #[serde(skip_serializing, skip_deserializing, default)]
+    pub metadata_recall_checked: bool,
+    #[serde(skip_serializing, skip_deserializing, default)]
+    pub metadata_recall_match: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]

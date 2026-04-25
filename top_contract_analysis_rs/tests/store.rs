@@ -84,6 +84,8 @@ fn existing_current_feature_db_chain_rows_take_priority_over_parquet() {
                 symbol: "AZUKI".into(),
                 metadata_json: "".into(),
                 metadata_doc: "".into(),
+                metadata_recall_checked: false,
+                metadata_recall_match: false,
             }],
         )
         .unwrap();
@@ -244,6 +246,8 @@ fn feature_store_applies_per_contract_token_cap() {
                     symbol: "AZUKI".into(),
                     metadata_json: "".into(),
                     metadata_doc: "".into(),
+                    metadata_recall_checked: false,
+                    metadata_recall_match: false,
                 },
                 DatabaseNftRecord {
                     contract_address: "0xdup".into(),
@@ -254,6 +258,8 @@ fn feature_store_applies_per_contract_token_cap() {
                     symbol: "AZUKI".into(),
                     metadata_json: "".into(),
                     metadata_doc: "".into(),
+                    metadata_recall_checked: false,
+                    metadata_recall_match: false,
                 },
                 DatabaseNftRecord {
                     contract_address: "0xother".into(),
@@ -264,6 +270,8 @@ fn feature_store_applies_per_contract_token_cap() {
                     symbol: "AZUKI".into(),
                     metadata_json: "".into(),
                     metadata_doc: "".into(),
+                    metadata_recall_checked: false,
+                    metadata_recall_match: false,
                 },
             ],
         )
