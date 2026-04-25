@@ -4,6 +4,7 @@ use duckdb::Connection;
 use name_uri_analysis_rs::analysis::{run_analysis, AnalysisOptions};
 
 fn write_parquet(path: &Path, values_sql: &str) {
+    let _ = std::fs::remove_file(path);
     let conn = Connection::open_in_memory().unwrap();
     let sql = format!(
         r#"
@@ -28,6 +29,235 @@ fn write_parquet(path: &Path, values_sql: &str) {
         values_sql = values_sql
     );
     conn.execute_batch(&sql).unwrap();
+}
+
+#[test]
+fn persists_prepared_tables_when_requested() {
+    let temp = tempfile::tempdir().unwrap();
+    let parquet = temp.path().join("sample.parquet");
+    let db = temp.path().join("analysis.duckdb");
+    write_parquet(
+        &parquet,
+        r#"
+            VALUES
+            ('ethereum', '0xaaa', '1', 'shared', 'img1', 'Azuki', 'azuki'),
+            ('ethereum', '0xbbb', '1', 'shared', 'img2', 'Azuki', 'azuki')
+        "#,
+    );
+
+    run_analysis(AnalysisOptions {
+        database_path: db.clone(),
+        parquet_inputs: vec![parquet],
+        output_dir: temp.path().join("out"),
+        thresholds: vec![90.0],
+        threads: 2,
+        memory_limit: "256MB".into(),
+        analysis_memory_limit: Some("64MB".into()),
+        temp_directory: None,
+        progress: false,
+        persist_prepared: true,
+        reuse_prepared: false,
+    })
+    .unwrap();
+
+    let conn = Connection::open(db).unwrap();
+    for table in [
+        "analysis_rows",
+        "selected_chains",
+        "uri_key_contracts",
+        "uri_duplicate_key_stats",
+        "uri_contract_flags",
+        "contract_names",
+        "name_atoms",
+        "analysis_prepared_metadata",
+    ] {
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*)::BIGINT FROM information_schema.tables WHERE table_name = ?",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "missing persisted table {table}");
+    }
+}
+
+#[test]
+fn reuse_prepared_uses_persisted_tables_when_metadata_matches() {
+    let temp = tempfile::tempdir().unwrap();
+    let parquet = temp.path().join("sample.parquet");
+    let db = temp.path().join("analysis.duckdb");
+    write_parquet(
+        &parquet,
+        r#"
+            VALUES
+            ('ethereum', '0xaaa', '1', 'shared', 'img1', 'Azuki', 'azuki'),
+            ('ethereum', '0xbbb', '1', 'shared', 'img2', 'Azuki', 'azuki')
+        "#,
+    );
+
+    run_analysis(AnalysisOptions {
+        database_path: db.clone(),
+        parquet_inputs: vec![parquet.clone()],
+        output_dir: temp.path().join("out_first"),
+        thresholds: vec![90.0],
+        threads: 2,
+        memory_limit: "256MB".into(),
+        analysis_memory_limit: Some("64MB".into()),
+        temp_directory: None,
+        progress: false,
+        persist_prepared: true,
+        reuse_prepared: false,
+    })
+    .unwrap();
+
+    {
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "UPDATE name_atoms SET contract_count = 10, nft_count = 10 WHERE name_norm = 'azuki'",
+            [],
+        )
+        .unwrap();
+    }
+
+    let report = run_analysis(AnalysisOptions {
+        database_path: db,
+        parquet_inputs: vec![parquet],
+        output_dir: temp.path().join("out_reuse"),
+        thresholds: vec![90.0],
+        threads: 2,
+        memory_limit: "256MB".into(),
+        analysis_memory_limit: Some("64MB".into()),
+        temp_directory: None,
+        progress: false,
+        persist_prepared: false,
+        reuse_prepared: true,
+    })
+    .unwrap();
+
+    assert!(report.summary_rows.iter().any(|row| {
+        row.field_name == "name"
+            && row.scope == "intra_chain"
+            && row.primary_chain == "ethereum"
+            && row.threshold == Some(90.0)
+            && row.duplicate_contract_count == 10
+            && row.duplicate_nft_count == 10
+    }));
+}
+
+#[test]
+fn reuse_prepared_rebuilds_when_cross_chain_cache_table_is_missing() {
+    let temp = tempfile::tempdir().unwrap();
+    let parquet = temp.path().join("sample.parquet");
+    let db = temp.path().join("analysis.duckdb");
+    write_parquet(
+        &parquet,
+        r#"
+            VALUES
+            ('ethereum', '0xaaa', '1', 'shared', 'img1', 'Azuki', 'azuki'),
+            ('polygon', '0xbbb', '1', 'shared', 'img2', 'Azuki', 'azuki')
+        "#,
+    );
+
+    run_analysis(AnalysisOptions {
+        database_path: db.clone(),
+        parquet_inputs: vec![parquet.clone()],
+        output_dir: temp.path().join("out_first"),
+        thresholds: vec![90.0],
+        threads: 2,
+        memory_limit: "256MB".into(),
+        analysis_memory_limit: Some("64MB".into()),
+        temp_directory: None,
+        progress: false,
+        persist_prepared: true,
+        reuse_prepared: false,
+    })
+    .unwrap();
+
+    {
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("DROP TABLE uri_duplicate_key_chain_counts", [])
+            .unwrap();
+    }
+
+    run_analysis(AnalysisOptions {
+        database_path: db.clone(),
+        parquet_inputs: vec![parquet],
+        output_dir: temp.path().join("out_rebuilt"),
+        thresholds: vec![90.0],
+        threads: 2,
+        memory_limit: "256MB".into(),
+        analysis_memory_limit: Some("64MB".into()),
+        temp_directory: None,
+        progress: false,
+        persist_prepared: false,
+        reuse_prepared: true,
+    })
+    .unwrap();
+
+    let conn = Connection::open(db).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT count(*)::BIGINT FROM information_schema.tables WHERE table_name = 'uri_duplicate_key_chain_counts'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn non_persistent_run_does_not_delete_persisted_tables() {
+    let temp = tempfile::tempdir().unwrap();
+    let parquet = temp.path().join("sample.parquet");
+    let db = temp.path().join("analysis.duckdb");
+    write_parquet(
+        &parquet,
+        r#"
+            VALUES
+            ('ethereum', '0xaaa', '1', 'shared', 'img1', 'Azuki', 'azuki'),
+            ('ethereum', '0xbbb', '1', 'shared', 'img2', 'Azuki', 'azuki')
+        "#,
+    );
+
+    run_analysis(AnalysisOptions {
+        database_path: db.clone(),
+        parquet_inputs: vec![parquet.clone()],
+        output_dir: temp.path().join("out_persist"),
+        thresholds: vec![90.0],
+        threads: 2,
+        memory_limit: "256MB".into(),
+        analysis_memory_limit: Some("64MB".into()),
+        temp_directory: None,
+        progress: false,
+        persist_prepared: true,
+        reuse_prepared: false,
+    })
+    .unwrap();
+    run_analysis(AnalysisOptions {
+        database_path: db.clone(),
+        parquet_inputs: vec![parquet],
+        output_dir: temp.path().join("out_temp"),
+        thresholds: vec![90.0],
+        threads: 2,
+        memory_limit: "256MB".into(),
+        analysis_memory_limit: Some("64MB".into()),
+        temp_directory: None,
+        progress: false,
+        persist_prepared: false,
+        reuse_prepared: false,
+    })
+    .unwrap();
+
+    let conn = Connection::open(db).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT count(*)::BIGINT FROM information_schema.tables WHERE table_name = 'analysis_prepared_metadata'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
 }
 
 #[test]
@@ -59,6 +289,8 @@ fn analyzes_uri_and_name_without_symbol_rows() {
         analysis_memory_limit: Some("64MB".into()),
         temp_directory: None,
         progress: false,
+        persist_prepared: false,
+        reuse_prepared: false,
     })
     .unwrap();
 
@@ -118,6 +350,8 @@ fn analyzes_uri_rows_when_only_one_uri_field_is_present() {
         analysis_memory_limit: Some("64MB".into()),
         temp_directory: None,
         progress: false,
+        persist_prepared: false,
+        reuse_prepared: false,
     })
     .unwrap();
 
@@ -165,6 +399,8 @@ fn uri_any_and_cross_contract_counts_stay_distinct() {
         analysis_memory_limit: Some("64MB".into()),
         temp_directory: None,
         progress: false,
+        persist_prepared: false,
+        reuse_prepared: false,
     })
     .unwrap();
 
@@ -212,6 +448,8 @@ fn cross_chain_uri_counts_use_selected_chain_key_coverage() {
         analysis_memory_limit: Some("64MB".into()),
         temp_directory: None,
         progress: false,
+        persist_prepared: false,
+        reuse_prepared: false,
     })
     .unwrap();
 
@@ -258,6 +496,8 @@ fn compares_names_across_former_block_boundaries() {
         analysis_memory_limit: Some("64MB".into()),
         temp_directory: None,
         progress: false,
+        persist_prepared: false,
+        reuse_prepared: false,
     })
     .unwrap();
 
@@ -295,6 +535,8 @@ fn repeated_nfts_in_one_contract_count_as_one_name_contract() {
         analysis_memory_limit: Some("64MB".into()),
         temp_directory: None,
         progress: false,
+        persist_prepared: false,
+        reuse_prepared: false,
     })
     .unwrap();
 
@@ -339,6 +581,8 @@ fn contract_name_aggregation_keeps_empty_name_nfts_in_totals() {
         analysis_memory_limit: Some("64MB".into()),
         temp_directory: None,
         progress: false,
+        persist_prepared: false,
+        reuse_prepared: false,
     })
     .unwrap();
 
@@ -382,6 +626,8 @@ fn only_parquet_chains_are_analyzed_and_single_chain_skips_cross_chain() {
         analysis_memory_limit: Some("64MB".into()),
         temp_directory: None,
         progress: false,
+        persist_prepared: false,
+        reuse_prepared: false,
     })
     .unwrap();
 
@@ -419,6 +665,8 @@ fn chain_matrix_is_computed_per_chain_pair_without_third_chain_contamination() {
         analysis_memory_limit: Some("64MB".into()),
         temp_directory: None,
         progress: false,
+        persist_prepared: false,
+        reuse_prepared: false,
     })
     .unwrap();
 
@@ -470,6 +718,8 @@ fn batched_thresholds_match_single_threshold_results() {
         analysis_memory_limit: Some("128MB".into()),
         temp_directory: None,
         progress: false,
+        persist_prepared: false,
+        reuse_prepared: false,
     })
     .unwrap();
 
@@ -483,6 +733,8 @@ fn batched_thresholds_match_single_threshold_results() {
         analysis_memory_limit: Some("1KB".into()),
         temp_directory: None,
         progress: false,
+        persist_prepared: false,
+        reuse_prepared: false,
     })
     .unwrap();
 

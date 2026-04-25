@@ -177,9 +177,11 @@ fn load_all_name_atoms(
     for row in rows {
         let (chain, name_norm, contract_count, nft_count) = row?;
         if let Some(chain_index) = chain_indexes.get(chain.as_str()).copied() {
+            let char_len = name_norm.chars().count();
             atoms.push(NameAtom {
                 chain_index,
                 name_norm,
+                char_len,
                 contract_count,
                 nft_count,
             });
@@ -196,13 +198,18 @@ fn push_name_summary_rows(
     totals: &HashMap<String, NameTotals>,
     state: &mut ThresholdUnionState,
 ) {
+    let mut dense_scratch = DenseComponentScratch::new(atoms.len());
     for (chain_index, primary) in chains.iter().enumerate() {
         let total = totals.get(primary).copied().unwrap_or(NameTotals {
             contracts: 0,
             nfts: 0,
         });
-        let intra =
-            summarize_components_for_primary(atoms, &atoms_by_chain[chain_index], &mut state.intra);
+        let intra = summarize_components_for_primary_with_scratch(
+            atoms,
+            &atoms_by_chain[chain_index],
+            &mut state.intra,
+            &mut dense_scratch,
+        );
         rows.push(summary_row(
             SummarySpec {
                 field_name: "name",
@@ -438,4 +445,3 @@ fn name_atoms_memory_bytes(atoms: &[NameAtom]) -> usize {
         .sum::<usize>();
     struct_bytes.saturating_add(string_bytes)
 }
-

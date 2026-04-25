@@ -25,6 +25,8 @@ pub struct AnalysisOptions {
     pub analysis_memory_limit: Option<String>,
     pub temp_directory: Option<PathBuf>,
     pub progress: bool,
+    pub persist_prepared: bool,
+    pub reuse_prepared: bool,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -56,6 +58,7 @@ pub struct AnalysisReport {
 struct NameAtom {
     chain_index: usize,
     name_norm: String,
+    char_len: usize,
     contract_count: i64,
     nft_count: i64,
 }
@@ -94,7 +97,7 @@ struct UriIntraCounts {
     cross_contract: UriCounts,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct GroupSummary {
     group_count: i64,
     duplicate_contract_count: i64,
@@ -256,4 +259,3 @@ impl SparseUnionFind {
         self.atoms[local_index]
     }
 }
-

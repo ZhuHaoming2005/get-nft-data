@@ -114,11 +114,15 @@ fn union_chain_pair_name_pairs(
                 .par_iter()
                 .copied()
                 .filter_map(|right| {
-                    let left_name = atoms[left].name_norm.as_str();
-                    let right_name = atoms[right].name_norm.as_str();
-                    if !name_pair_can_reach_threshold(left_name, right_name, min_threshold) {
+                    if !name_pair_lengths_can_reach_threshold(
+                        atoms[left].char_len,
+                        atoms[right].char_len,
+                        min_threshold,
+                    ) {
                         return None;
                     }
+                    let left_name = atoms[left].name_norm.as_str();
+                    let right_name = atoms[right].name_norm.as_str();
                     let score = name_pair_score_from_names(left_name, right_name);
                     (score >= min_threshold).then_some(ScoredRight { right, score })
                 })

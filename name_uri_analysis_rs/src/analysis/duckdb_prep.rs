@@ -27,23 +27,22 @@ fn prepare_base_tables(
     progress: &ProgressTracker,
 ) -> Result<Vec<String>, AnalysisError> {
     let inputs = parquet_input_sql(&options.parquet_inputs);
+    let persist_prepared = options.persist_prepared || options.reuse_prepared;
+    let parquet_fingerprint = parquet_inputs_fingerprint(&options.parquet_inputs)?;
     let total_budget = total_memory_budget_bytes(&options.memory_limit)?;
     let mut memory_guard = MemoryGuard::new(total_budget);
     progress.start_phase("preparing DuckDB tables", 10);
+    if options.reuse_prepared
+        && prepared_tables_can_be_reused(conn, &parquet_fingerprint, persist_prepared)?
+    {
+        let chains = load_selected_chains(conn)?;
+        progress.step("reused persisted DuckDB tables");
+        progress.finish_phase("DuckDB tables ready");
+        return Ok(chains);
+    }
     execute_duckdb_progress_batch(
         conn,
-        "
-        DROP TABLE IF EXISTS analysis_rows;
-        DROP TABLE IF EXISTS selected_chains;
-        DROP TABLE IF EXISTS uri_key_contracts;
-        DROP TABLE IF EXISTS uri_key_stats;
-        DROP TABLE IF EXISTS uri_duplicate_key_stats;
-        DROP TABLE IF EXISTS uri_key_chain_counts;
-        DROP TABLE IF EXISTS uri_duplicate_key_chain_counts;
-        DROP TABLE IF EXISTS uri_contract_flags;
-        DROP TABLE IF EXISTS contract_names;
-        DROP TABLE IF EXISTS name_atoms;
-        ",
+        &drop_prepared_tables_sql(persist_prepared),
         progress,
         "dropped stale DuckDB tables",
         &mut memory_guard,
@@ -53,7 +52,7 @@ fn prepare_base_tables(
         conn,
         &format!(
             "
-            CREATE TEMP TABLE analysis_rows AS
+            CREATE {table_scope}TABLE analysis_rows AS
             SELECT lower(trim(CAST(chain AS VARCHAR))) AS chain,
                    lower(trim(CAST(contract_address AS VARCHAR))) AS contract_address,
                    trim(coalesce(CAST(token_uri AS VARCHAR), '')) AS token_uri,
@@ -66,6 +65,7 @@ fn prepare_base_tables(
               AND trim(CAST(chain AS VARCHAR)) <> '';
             ",
             inputs = inputs,
+            table_scope = prepared_table_scope(persist_prepared),
         ),
         progress,
         "materialized DuckDB working projection",
@@ -74,12 +74,15 @@ fn prepare_base_tables(
     )?;
     execute_duckdb_progress_batch(
         conn,
-        "
-            CREATE TEMP TABLE selected_chains AS
+        &format!(
+            "
+            CREATE {table_scope}TABLE selected_chains AS
             SELECT DISTINCT lower(trim(CAST(chain AS VARCHAR))) AS chain
             FROM analysis_rows
             WHERE chain <> '';
         ",
+            table_scope = prepared_table_scope(persist_prepared),
+        ),
         progress,
         "loaded selected chains",
         &mut memory_guard,
@@ -93,6 +96,7 @@ fn prepare_base_tables(
         &mut memory_guard,
         total_budget,
         include_cross_chain,
+        persist_prepared,
     )?;
     build_uri_contract_flags(
         conn,
@@ -100,11 +104,13 @@ fn prepare_base_tables(
         &mut memory_guard,
         total_budget,
         include_cross_chain,
+        persist_prepared,
     )?;
     execute_duckdb_progress_batch(
         conn,
-        "
-            CREATE TEMP TABLE contract_names AS
+        &format!(
+            "
+            CREATE {table_scope}TABLE contract_names AS
             SELECT chain,
                    contract_address,
                    count(*)::BIGINT AS nft_count,
@@ -114,6 +120,8 @@ fn prepare_base_tables(
             GROUP BY chain, contract_address
             HAVING min(nullif(name_norm, '')) IS NOT NULL;
         ",
+            table_scope = prepared_table_scope(persist_prepared),
+        ),
         progress,
         "materialized contract names",
         &mut memory_guard,
@@ -121,8 +129,9 @@ fn prepare_base_tables(
     )?;
     execute_duckdb_progress_batch(
         conn,
-        "
-            CREATE TEMP TABLE name_atoms AS
+        &format!(
+            "
+            CREATE {table_scope}TABLE name_atoms AS
             WITH atoms AS (
                 SELECT chain,
                        name_norm,
@@ -135,11 +144,17 @@ fn prepare_base_tables(
             FROM atoms
             WHERE name_norm <> '';
         ",
+            table_scope = prepared_table_scope(persist_prepared),
+        ),
         progress,
         "built name atoms",
         &mut memory_guard,
         total_budget,
     )?;
+    if persist_prepared {
+        write_prepared_metadata(conn, &parquet_fingerprint)?;
+        progress.step("wrote prepared table metadata");
+    }
     progress.finish_phase("DuckDB tables ready");
     Ok(chains)
 }
@@ -168,89 +183,175 @@ fn execute_duckdb_progress_batch(
     execute_progress_batch(conn, sql, progress, message)
 }
 
+const PREPARED_SCHEMA_VERSION: &str = "name-uri-analysis-prepare-v2";
+const PREPARED_METADATA_TABLE: &str = "analysis_prepared_metadata";
+
+fn prepared_table_scope(persist_prepared: bool) -> &'static str {
+    if persist_prepared {
+        ""
+    } else {
+        "TEMP "
+    }
+}
+
+fn drop_prepared_tables_sql(persist_prepared: bool) -> String {
+    if !persist_prepared {
+        return String::new();
+    }
+    let mut sql = "
+        DROP TABLE IF EXISTS analysis_rows;
+        DROP TABLE IF EXISTS selected_chains;
+        DROP TABLE IF EXISTS uri_key_contracts;
+        DROP TABLE IF EXISTS uri_key_stats;
+        DROP TABLE IF EXISTS uri_duplicate_key_stats;
+        DROP TABLE IF EXISTS uri_key_chain_counts;
+        DROP TABLE IF EXISTS uri_duplicate_key_chain_counts;
+        DROP TABLE IF EXISTS uri_contract_flags;
+        DROP TABLE IF EXISTS contract_names;
+        DROP TABLE IF EXISTS name_atoms;
+        "
+    .to_string();
+    sql.push_str("DROP TABLE IF EXISTS analysis_prepared_metadata;");
+    sql
+}
+
+fn prepared_tables_can_be_reused(
+    conn: &Connection,
+    parquet_fingerprint: &str,
+    persist_prepared: bool,
+) -> Result<bool, AnalysisError> {
+    if !persist_prepared {
+        return Ok(false);
+    }
+    if prepared_metadata_value(conn, "schema_version")?.as_deref() != Some(PREPARED_SCHEMA_VERSION)
+    {
+        return Ok(false);
+    }
+    if prepared_metadata_value(conn, "parquet_fingerprint")?.as_deref() != Some(parquet_fingerprint)
+    {
+        return Ok(false);
+    }
+    for table in [
+        "analysis_rows",
+        "selected_chains",
+        "uri_key_contracts",
+        "uri_duplicate_key_stats",
+        "uri_contract_flags",
+        "contract_names",
+        "name_atoms",
+    ] {
+        if !table_exists(conn, table)? {
+            return Ok(false);
+        }
+    }
+    let chain_count = selected_chain_count(conn)?;
+    if chain_count == 0 {
+        return Ok(false);
+    }
+    if chain_count > 1 && !table_exists(conn, "uri_duplicate_key_chain_counts")? {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn prepared_metadata_value(conn: &Connection, key: &str) -> Result<Option<String>, AnalysisError> {
+    if !table_exists(conn, PREPARED_METADATA_TABLE)? {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT value FROM analysis_prepared_metadata WHERE key = ? LIMIT 1",
+    )?;
+    let mut rows = stmt.query(params![key])?;
+    if let Some(row) = rows.next()? {
+        Ok(Some(row.get(0)?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, AnalysisError> {
+    let count: i64 = conn.query_row(
+        "SELECT count(*)::BIGINT FROM information_schema.tables WHERE table_name = ?",
+        params![table_name],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+fn selected_chain_count(conn: &Connection) -> Result<i64, AnalysisError> {
+    let count: i64 = conn.query_row(
+        "SELECT count(*)::BIGINT FROM selected_chains",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
+fn write_prepared_metadata(
+    conn: &Connection,
+    parquet_fingerprint: &str,
+) -> Result<(), AnalysisError> {
+    conn.execute_batch(
+        "
+        DROP TABLE IF EXISTS analysis_prepared_metadata;
+        CREATE TABLE analysis_prepared_metadata (
+            key VARCHAR PRIMARY KEY,
+            value VARCHAR
+        );
+        ",
+    )?;
+    conn.execute(
+        "INSERT INTO analysis_prepared_metadata VALUES (?, ?), (?, ?)",
+        params![
+            "schema_version",
+            PREPARED_SCHEMA_VERSION,
+            "parquet_fingerprint",
+            parquet_fingerprint
+        ],
+    )?;
+    Ok(())
+}
+
+fn parquet_inputs_fingerprint(paths: &[PathBuf]) -> Result<String, AnalysisError> {
+    let mut parts = Vec::with_capacity(paths.len());
+    for path in paths {
+        let metadata = fs::metadata(path)?;
+        let modified = metadata
+            .modified()?
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| AnalysisError::InvalidData(err.to_string()))?;
+        let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        parts.push(format!(
+            "{}|{}|{}|{}",
+            canonical.display().to_string().replace('\\', "/"),
+            metadata.len(),
+            modified.as_secs(),
+            modified.subsec_nanos()
+        ));
+    }
+    Ok(parts.join("\n"))
+}
+
 fn build_uri_key_stats(
     conn: &Connection,
     progress: &ProgressTracker,
     memory_guard: &mut MemoryGuard,
     desired_duckdb_bytes: usize,
     include_cross_chain: bool,
+    persist_prepared: bool,
 ) -> Result<(), AnalysisError> {
     execute_duckdb_progress_batch(
         conn,
-        "
-            CREATE TEMP TABLE uri_key_contracts (
-                chain VARCHAR,
-                key_kind VARCHAR,
-                key_value VARCHAR,
-                contract_address VARCHAR,
-                nft_count BIGINT
-            );
-        ",
+        &build_uri_key_contracts_sql(persist_prepared),
         progress,
-        "created URI key contract table",
+        "built URI key contracts",
         memory_guard,
         desired_duckdb_bytes,
     )?;
 
-    for (key_kind, column_name) in [
-        ("strict_token", "token_uri"),
-        ("strict_image", "image_uri"),
-        ("norm_token", "token_uri_norm"),
-        ("norm_image", "image_uri_norm"),
-    ] {
-        insert_uri_key_contracts(
-            conn,
-            progress,
-            memory_guard,
-            desired_duckdb_bytes,
-            key_kind,
-            column_name,
-        )?;
-    }
-
     execute_duckdb_progress_batch(
         conn,
-        "
-            CREATE TEMP TABLE uri_key_stats AS
-            SELECT chain,
-                   key_kind,
-                   key_value,
-                   coalesce(sum(nft_count), 0)::BIGINT AS nft_count,
-                   count(*)::BIGINT AS contract_count
-            FROM uri_key_contracts
-            GROUP BY chain, key_kind, key_value;
-        ",
-        progress,
-        "built URI key stats",
-        memory_guard,
-        desired_duckdb_bytes,
-    )?;
-    if include_cross_chain {
-        execute_duckdb_progress_batch(
-            conn,
-            "
-                CREATE TEMP TABLE uri_key_chain_counts AS
-                SELECT key_kind,
-                       key_value,
-                       count(*)::BIGINT AS chain_count
-                FROM uri_key_stats
-                GROUP BY key_kind, key_value;
-            ",
-            progress,
-            "built URI cross-chain key stats",
-            memory_guard,
-            desired_duckdb_bytes,
-        )?;
-    }
-    execute_duckdb_progress_batch(
-        conn,
-        "
-            CREATE TEMP TABLE uri_duplicate_key_stats AS
-            SELECT *
-            FROM uri_key_stats
-            WHERE nft_count >= 2
-               OR contract_count >= 2;
-        ",
+        &build_uri_duplicate_key_stats_sql(persist_prepared),
         progress,
         "built duplicate-only URI key stats",
         memory_guard,
@@ -259,12 +360,7 @@ fn build_uri_key_stats(
     if include_cross_chain {
         execute_duckdb_progress_batch(
             conn,
-            "
-                CREATE TEMP TABLE uri_duplicate_key_chain_counts AS
-                SELECT *
-                FROM uri_key_chain_counts
-                WHERE chain_count >= 2;
-            ",
+            &build_uri_duplicate_key_chain_counts_sql(persist_prepared),
             progress,
             "built duplicate-only URI cross-chain key stats",
             memory_guard,
@@ -274,34 +370,61 @@ fn build_uri_key_stats(
     Ok(())
 }
 
-fn insert_uri_key_contracts(
-    conn: &Connection,
-    progress: &ProgressTracker,
-    memory_guard: &mut MemoryGuard,
-    desired_duckdb_bytes: usize,
-    key_kind: &str,
-    column_name: &str,
-) -> Result<(), AnalysisError> {
-    execute_duckdb_progress_batch(
-        conn,
-        &format!(
-            "
-            INSERT INTO uri_key_contracts
-            SELECT chain,
-                   '{key_kind}' AS key_kind,
-                   {column_name} AS key_value,
-                   contract_address,
-                   count(*)::BIGINT AS nft_count
-            FROM analysis_rows
-            WHERE contract_address <> ''
-              AND {column_name} <> ''
-            GROUP BY chain, {column_name}, contract_address;
-            "
-        ),
-        progress,
-        &format!("built URI key contracts {key_kind}"),
-        memory_guard,
-        desired_duckdb_bytes,
+fn build_uri_key_contracts_sql(persist_prepared: bool) -> String {
+    format!(
+        "
+        CREATE {table_scope}TABLE uri_key_contracts AS
+        SELECT r.chain,
+               keys.key_kind,
+               keys.key_value,
+               r.contract_address,
+               count(*)::BIGINT AS nft_count
+        FROM analysis_rows r
+        CROSS JOIN LATERAL (
+            VALUES
+                ('strict_token', r.token_uri),
+                ('strict_image', r.image_uri),
+                ('norm_token', r.token_uri_norm),
+                ('norm_image', r.image_uri_norm)
+        ) AS keys(key_kind, key_value)
+        WHERE r.contract_address <> ''
+          AND keys.key_value <> ''
+        GROUP BY r.chain, keys.key_kind, keys.key_value, r.contract_address;
+    ",
+        table_scope = prepared_table_scope(persist_prepared),
+    )
+}
+
+fn build_uri_duplicate_key_stats_sql(persist_prepared: bool) -> String {
+    format!(
+        "
+        CREATE {table_scope}TABLE uri_duplicate_key_stats AS
+        SELECT chain,
+               key_kind,
+               key_value,
+               coalesce(sum(nft_count), 0)::BIGINT AS nft_count,
+               count(*)::BIGINT AS contract_count
+        FROM uri_key_contracts
+        GROUP BY chain, key_kind, key_value
+        HAVING coalesce(sum(nft_count), 0) >= 2
+            OR count(*) >= 2;
+    ",
+        table_scope = prepared_table_scope(persist_prepared),
+    )
+}
+
+fn build_uri_duplicate_key_chain_counts_sql(persist_prepared: bool) -> String {
+    format!(
+        "
+        CREATE {table_scope}TABLE uri_duplicate_key_chain_counts AS
+        SELECT key_kind,
+               key_value,
+               count(DISTINCT chain)::BIGINT AS chain_count
+        FROM uri_key_contracts
+        GROUP BY key_kind, key_value
+        HAVING count(DISTINCT chain) >= 2;
+    ",
+        table_scope = prepared_table_scope(persist_prepared),
     )
 }
 
@@ -311,10 +434,11 @@ fn build_uri_contract_flags(
     memory_guard: &mut MemoryGuard,
     desired_duckdb_bytes: usize,
     include_cross_chain: bool,
+    persist_prepared: bool,
 ) -> Result<(), AnalysisError> {
     execute_duckdb_progress_batch(
         conn,
-        &build_uri_contract_flags_sql(include_cross_chain),
+        &build_uri_contract_flags_sql(include_cross_chain, persist_prepared),
         progress,
         "built compact URI contract flags",
         memory_guard,
@@ -322,7 +446,7 @@ fn build_uri_contract_flags(
     )
 }
 
-fn build_uri_contract_flags_sql(include_cross_chain: bool) -> String {
+fn build_uri_contract_flags_sql(include_cross_chain: bool, persist_prepared: bool) -> String {
     let cross_select_columns = if include_cross_chain {
         ",
                        coalesce(stc.chain_count >= 2, false) AS strict_token_chain,
@@ -352,7 +476,7 @@ fn build_uri_contract_flags_sql(include_cross_chain: bool) -> String {
 
     format!(
         "
-            CREATE TEMP TABLE uri_contract_flags AS
+            CREATE {table_scope}TABLE uri_contract_flags AS
             WITH rows AS (
                 SELECT chain,
                        contract_address,
@@ -406,6 +530,7 @@ fn build_uri_contract_flags_sql(include_cross_chain: bool) -> String {
             GROUP BY chain, contract_address;
             ",
         contract_columns = uri_contract_metric_columns(include_cross_chain),
+        table_scope = prepared_table_scope(persist_prepared),
     )
 }
 

@@ -8,23 +8,49 @@ struct ComponentAccumulator {
     has_secondary: bool,
 }
 
-fn summarize_components_for_primary(
+struct DenseComponentScratch {
+    components: Vec<ComponentAccumulator>,
+    touched_roots: Vec<usize>,
+}
+
+impl DenseComponentScratch {
+    fn new(size: usize) -> Self {
+        let mut components = Vec::with_capacity(size);
+        components.resize_with(size, ComponentAccumulator::default);
+        Self {
+            components,
+            touched_roots: Vec::new(),
+        }
+    }
+
+    fn clear_touched(&mut self) {
+        for root in self.touched_roots.drain(..) {
+            self.components[root] = ComponentAccumulator::default();
+        }
+    }
+}
+
+fn summarize_components_for_primary_with_scratch(
     atoms: &[NameAtom],
     primary_atoms: &[usize],
     union_find: &mut UnionFind,
+    scratch: &mut DenseComponentScratch,
 ) -> GroupSummary {
-    let mut components: HashMap<usize, ComponentAccumulator> = HashMap::new();
     for &index in primary_atoms {
         let atom = &atoms[index];
         let root = union_find.find(index);
-        let component = components.entry(root).or_default();
+        let component = &mut scratch.components[root];
+        if component.total_contract_count == 0 && component.primary_contract_count == 0 {
+            scratch.touched_roots.push(root);
+        }
         component.total_contract_count += atom.contract_count;
         component.primary_contract_count += atom.contract_count;
         component.primary_nft_count += atom.nft_count;
     }
 
     let mut summary = GroupSummary::default();
-    for component in components.values() {
+    for &root in &scratch.touched_roots {
+        let component = &scratch.components[root];
         if component.primary_contract_count == 0 || component.total_contract_count < 2 {
             continue;
         }
@@ -34,6 +60,7 @@ fn summarize_components_for_primary(
         summary.group_size_ge_2_count += i64::from(component.total_contract_count >= 2);
         summary.group_size_gt_2_count += i64::from(component.total_contract_count > 2);
     }
+    scratch.clear_touched();
     summary
 }
 
@@ -138,4 +165,3 @@ fn summarize_sparse_components_for_primary(
     }
     summary
 }
-

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use duckdb::{params, Connection};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};

@@ -36,11 +36,15 @@ fn score_name_pairs_for_left_chunk(
     (chunk_start..chunk_end)
         .into_par_iter()
         .filter_map(|right| {
-            let left_name = atoms[left].name_norm.as_str();
-            let right_name = atoms[right].name_norm.as_str();
-            if !name_pair_can_reach_threshold(left_name, right_name, threshold) {
+            if !name_pair_lengths_can_reach_threshold(
+                atoms[left].char_len,
+                atoms[right].char_len,
+                threshold,
+            ) {
                 return None;
             }
+            let left_name = atoms[left].name_norm.as_str();
+            let right_name = atoms[right].name_norm.as_str();
             let score = name_pair_score_from_names(left_name, right_name);
             (score >= threshold).then_some(ScoredRight { right, score })
         })
@@ -55,13 +59,30 @@ fn name_pair_score_from_names(left_name: &str, right_name: &str) -> f64 {
     }
 }
 
+#[cfg(test)]
 fn name_pair_can_reach_threshold(left_name: &str, right_name: &str, threshold: f64) -> bool {
-    left_name == right_name || jaro_winkler_upper_bound(left_name, right_name) >= threshold
+    left_name == right_name
+        || name_pair_lengths_can_reach_threshold(
+            left_name.chars().count(),
+            right_name.chars().count(),
+            threshold,
+        )
 }
 
+#[cfg(test)]
 fn jaro_winkler_upper_bound(left_name: &str, right_name: &str) -> f64 {
-    let left_len = left_name.chars().count();
-    let right_len = right_name.chars().count();
+    jaro_winkler_upper_bound_from_lengths(left_name.chars().count(), right_name.chars().count())
+}
+
+fn name_pair_lengths_can_reach_threshold(
+    left_len: usize,
+    right_len: usize,
+    threshold: f64,
+) -> bool {
+    jaro_winkler_upper_bound_from_lengths(left_len, right_len) >= threshold
+}
+
+fn jaro_winkler_upper_bound_from_lengths(left_len: usize, right_len: usize) -> f64 {
     if left_len == 0 || right_len == 0 {
         return if left_len == right_len { 100.0 } else { 0.0 };
     }

@@ -23,7 +23,8 @@ cargo run --release -- \
   --output-dir ./output \
   --threads 32 \
   --memory-limit 60GB \
-  --temp-directory ./data/duckdb-temp
+  --temp-directory ./data/duckdb-temp \
+  --persist-prepared
 ```
 
 输出：
@@ -35,6 +36,8 @@ cargo run --release -- \
 
 - `--database` 放到空间充足的 SSD。
 - `--temp-directory` 指向空间充足的本地磁盘。
+- `--persist-prepared` 将 DuckDB 准备阶段表持久化到 `--database`，适合后续重复调阈值或只重跑 Rust 分析。
+- `--reuse-prepared` 在 Parquet 路径、文件大小、mtime 和 schema version 匹配时复用已持久化表；不匹配会自动重建，并隐含 `--persist-prepared`。
 - `--memory-limit` 按总预算处理；DuckDB 准备阶段可使用该总预算加速临时表构建，进入 Rust name 分析前会按已加载数据、threshold state、`chain_matrix` 复用状态估算和运行时 RSS 重新平衡 DuckDB/Rust 分配。
 - 每个 DuckDB 重 SQL 执行前都会按当前进程 RSS 重新收紧 DuckDB `memory_limit`，避免 DuckDB 自身缓存、临时表和 Rust 常驻数据叠加后超过总预算。
 - 通常不需要传 `--analysis-memory-limit`；如需手动指定 Rust name 分析预算，可传 `--analysis-memory-limit 16GB`，该值仍包含在 `--memory-limit` 总预算内。传 `auto` 等同默认自动平衡。

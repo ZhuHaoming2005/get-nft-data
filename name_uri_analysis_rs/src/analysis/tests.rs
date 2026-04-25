@@ -8,18 +8,21 @@ mod tests {
             NameAtom {
                 chain_index: 0,
                 name_norm: "azuki".into(),
+                char_len: 5,
                 contract_count: 1,
                 nft_count: 1,
             },
             NameAtom {
                 chain_index: 1,
                 name_norm: "azuki".into(),
+                char_len: 5,
                 contract_count: 1,
                 nft_count: 1,
             },
             NameAtom {
                 chain_index: 1,
                 name_norm: "moonbirds".into(),
+                char_len: 9,
                 contract_count: 1,
                 nft_count: 1,
             },
@@ -204,12 +207,80 @@ mod tests {
     }
 
     #[test]
+    fn cached_lengths_drive_jaro_winkler_upper_bound() {
+        let upper_bound = jaro_winkler_upper_bound_from_lengths(5, 26);
+
+        assert_eq!(upper_bound, jaro_winkler_upper_bound("azuki", "a-very-long-unrelated-name"));
+        assert!(name_pair_lengths_can_reach_threshold(5, 6, 90.0));
+    }
+
+    #[test]
+    fn uri_duplicate_sql_skips_full_stats_tables() {
+        let duplicate_sql = build_uri_duplicate_key_stats_sql(false);
+        let cross_sql = build_uri_duplicate_key_chain_counts_sql(false);
+
+        assert!(!duplicate_sql.contains("uri_key_stats"));
+        assert!(!cross_sql.contains("uri_key_chain_counts"));
+        assert!(duplicate_sql.contains("HAVING"));
+        assert!(cross_sql.contains("HAVING"));
+    }
+
+    #[test]
+    fn uri_key_contract_sql_expands_keys_in_one_scan() {
+        let sql = build_uri_key_contracts_sql(false);
+
+        assert_eq!(sql.matches("analysis_rows").count(), 1);
+        assert!(sql.contains("CROSS JOIN LATERAL"));
+    }
+
+    #[test]
     fn single_chain_uri_flags_skip_cross_chain_key_tables() {
-        let sql = build_uri_contract_flags_sql(false);
+        let sql = build_uri_contract_flags_sql(false, false);
 
         assert!(!sql.contains("uri_key_chain_counts"));
         assert!(!sql.contains("uri_duplicate_key_chain_counts"));
         assert!(!sql.contains("_chain"));
+    }
+
+    #[test]
+    fn dense_summary_scratch_can_be_reused() {
+        let atoms = vec![
+            NameAtom {
+                chain_index: 0,
+                name_norm: "azuki".into(),
+                char_len: 5,
+                contract_count: 1,
+                nft_count: 2,
+            },
+            NameAtom {
+                chain_index: 0,
+                name_norm: "azukis".into(),
+                char_len: 6,
+                contract_count: 1,
+                nft_count: 3,
+            },
+        ];
+        let primary_atoms = vec![0, 1];
+        let mut union_find = UnionFind::new(atoms.len());
+        union_find.union(0, 1);
+        let mut scratch = DenseComponentScratch::new(atoms.len());
+
+        let first = summarize_components_for_primary_with_scratch(
+            &atoms,
+            &primary_atoms,
+            &mut union_find,
+            &mut scratch,
+        );
+        let second = summarize_components_for_primary_with_scratch(
+            &atoms,
+            &primary_atoms,
+            &mut union_find,
+            &mut scratch,
+        );
+
+        assert_eq!(first.duplicate_contract_count, 2);
+        assert_eq!(first.duplicate_nft_count, 5);
+        assert_eq!(first, second);
     }
 
     #[test]

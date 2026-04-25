@@ -37,6 +37,15 @@ struct Args {
     #[arg(long)]
     temp_directory: Option<PathBuf>,
 
+    #[arg(long, help = "Persist prepared DuckDB tables for later reuse")]
+    persist_prepared: bool,
+
+    #[arg(
+        long,
+        help = "Reuse persisted prepared DuckDB tables when parquet metadata matches; implies --persist-prepared"
+    )]
+    reuse_prepared: bool,
+
     #[arg(long, help = "Disable terminal progress bars")]
     no_progress: bool,
 }
@@ -53,6 +62,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         analysis_memory_limit: args.analysis_memory_limit,
         temp_directory: args.temp_directory,
         progress: !args.no_progress,
+        persist_prepared: args.persist_prepared,
+        reuse_prepared: args.reuse_prepared,
     })?;
     println!(
         "wrote {} summary rows to {}",
