@@ -84,8 +84,9 @@ cargo run --release -- analyze \
   --feature-parquet ../output/top_contract_analysis/ethereum.parquet \
   --feature-db ../output/top_contract_analysis/features.duckdb \
   --signal-cache-db ../output/top_contract_analysis/signals.duckdb \
-  --duckdb-memory-limit 80GB \
-  --duckdb-threads 0
+  --max-recall-rows 500000 \
+  --duckdb-memory-limit 50GB \
+  --duckdb-threads 32
 ```
 
 常用参数：
