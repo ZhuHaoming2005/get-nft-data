@@ -271,6 +271,95 @@ fn compares_names_across_former_block_boundaries() {
 }
 
 #[test]
+fn repeated_nfts_in_one_contract_count_as_one_name_contract() {
+    let temp = tempfile::tempdir().unwrap();
+    let parquet = temp.path().join("sample.parquet");
+    write_parquet(
+        &parquet,
+        r#"
+            VALUES
+            ('ethereum', '0xaaa', '1', 'u1', 'i1', 'Azuki', 'azuki'),
+            ('ethereum', '0xaaa', '2', 'u2', 'i2', 'Azuki', 'azuki'),
+            ('ethereum', '0xaaa', '3', 'u3', 'i3', 'Azuki', 'azuki'),
+            ('ethereum', '0xbbb', '1', 'u4', 'i4', 'Azuki', 'azuki')
+        "#,
+    );
+
+    let report = run_analysis(AnalysisOptions {
+        database_path: temp.path().join("analysis.duckdb"),
+        parquet_inputs: vec![parquet],
+        output_dir: temp.path().join("out"),
+        thresholds: vec![90.0],
+        threads: 2,
+        memory_limit: "256MB".into(),
+        analysis_memory_limit: Some("64MB".into()),
+        temp_directory: None,
+        progress: false,
+    })
+    .unwrap();
+
+    let row = report
+        .summary_rows
+        .iter()
+        .find(|row| {
+            row.field_name == "name"
+                && row.scope == "intra_chain"
+                && row.primary_chain == "ethereum"
+                && row.threshold == Some(90.0)
+        })
+        .unwrap();
+
+    assert_eq!(row.total_contracts, 2);
+    assert_eq!(row.total_nfts, 4);
+    assert_eq!(row.duplicate_contract_count, 2);
+    assert_eq!(row.duplicate_nft_count, 4);
+}
+
+#[test]
+fn contract_name_aggregation_keeps_empty_name_nfts_in_totals() {
+    let temp = tempfile::tempdir().unwrap();
+    let parquet = temp.path().join("sample.parquet");
+    write_parquet(
+        &parquet,
+        r#"
+            VALUES
+            ('ethereum', '0xaaa', '1', 'u1', 'i1', '', ''),
+            ('ethereum', '0xaaa', '2', 'u2', 'i2', 'Azuki', 'azuki'),
+            ('ethereum', '0xbbb', '1', 'u3', 'i3', 'Azuki', 'azuki')
+        "#,
+    );
+
+    let report = run_analysis(AnalysisOptions {
+        database_path: temp.path().join("analysis.duckdb"),
+        parquet_inputs: vec![parquet],
+        output_dir: temp.path().join("out"),
+        thresholds: vec![90.0],
+        threads: 2,
+        memory_limit: "256MB".into(),
+        analysis_memory_limit: Some("64MB".into()),
+        temp_directory: None,
+        progress: false,
+    })
+    .unwrap();
+
+    let row = report
+        .summary_rows
+        .iter()
+        .find(|row| {
+            row.field_name == "name"
+                && row.scope == "intra_chain"
+                && row.primary_chain == "ethereum"
+                && row.threshold == Some(90.0)
+        })
+        .unwrap();
+
+    assert_eq!(row.total_contracts, 2);
+    assert_eq!(row.total_nfts, 3);
+    assert_eq!(row.duplicate_contract_count, 2);
+    assert_eq!(row.duplicate_nft_count, 3);
+}
+
+#[test]
 fn only_parquet_chains_are_analyzed_and_single_chain_skips_cross_chain() {
     let temp = tempfile::tempdir().unwrap();
     let ethereum = temp.path().join("ethereum.parquet");

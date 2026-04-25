@@ -4,6 +4,8 @@ struct MemoryPlan {
     analysis_bytes: usize,
 }
 
+const DUCKDB_MIN_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+
 struct MemoryGuard {
     total_budget: usize,
     pid: Option<Pid>,
@@ -46,9 +48,7 @@ impl MemoryGuard {
 }
 
 fn set_duckdb_memory_limit(conn: &Connection, bytes: usize) -> Result<(), AnalysisError> {
-    if bytes == 0 {
-        return Ok(());
-    }
+    let bytes = duckdb_effective_memory_limit_bytes(bytes);
     conn.execute(
         &format!(
             "PRAGMA memory_limit='{}'",
@@ -57,6 +57,14 @@ fn set_duckdb_memory_limit(conn: &Connection, bytes: usize) -> Result<(), Analys
         [],
     )?;
     Ok(())
+}
+
+fn duckdb_effective_memory_limit_bytes(bytes: usize) -> usize {
+    if bytes == 0 {
+        DUCKDB_MIN_MEMORY_LIMIT_BYTES
+    } else {
+        bytes
+    }
 }
 
 fn set_duckdb_memory_limit_for_process_budget(
@@ -246,4 +254,3 @@ fn parse_byte_size(value: &str) -> Result<usize, AnalysisError> {
     };
     Ok((number * multiplier) as usize)
 }
-

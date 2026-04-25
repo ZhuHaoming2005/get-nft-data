@@ -187,6 +187,32 @@ mod tests {
     }
 
     #[test]
+    fn duckdb_effective_limit_keeps_zero_from_becoming_noop() {
+        assert_eq!(
+            duckdb_effective_memory_limit_bytes(0),
+            DUCKDB_MIN_MEMORY_LIMIT_BYTES
+        );
+        assert_eq!(duckdb_effective_memory_limit_bytes(1), 1);
+    }
+
+    #[test]
+    fn jaro_winkler_upper_bound_filters_impossible_thresholds() {
+        let upper_bound = jaro_winkler_upper_bound("azuki", "a-very-long-unrelated-name");
+
+        assert!(upper_bound < 90.0);
+        assert!(name_pair_can_reach_threshold("azuki", "azukii", 90.0));
+    }
+
+    #[test]
+    fn single_chain_uri_flags_skip_cross_chain_key_tables() {
+        let sql = build_uri_contract_flags_sql(false);
+
+        assert!(!sql.contains("uri_key_chain_counts"));
+        assert!(!sql.contains("uri_duplicate_key_chain_counts"));
+        assert!(!sql.contains("_chain"));
+    }
+
+    #[test]
     fn chain_matrix_capacity_uses_sparse_state_estimate() {
         let atom_count = 1_000;
         let budget = sparse_union_find_bytes(atom_count).saturating_mul(3);

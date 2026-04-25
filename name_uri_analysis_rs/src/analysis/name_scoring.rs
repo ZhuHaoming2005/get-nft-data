@@ -36,20 +36,42 @@ fn score_name_pairs_for_left_chunk(
     (chunk_start..chunk_end)
         .into_par_iter()
         .filter_map(|right| {
-            let score = name_pair_score(atoms, left, right);
+            let left_name = atoms[left].name_norm.as_str();
+            let right_name = atoms[right].name_norm.as_str();
+            if !name_pair_can_reach_threshold(left_name, right_name, threshold) {
+                return None;
+            }
+            let score = name_pair_score_from_names(left_name, right_name);
             (score >= threshold).then_some(ScoredRight { right, score })
         })
         .collect()
 }
 
-fn name_pair_score(atoms: &[NameAtom], left: usize, right: usize) -> f64 {
-    let left_name = atoms[left].name_norm.as_str();
-    let right_name = atoms[right].name_norm.as_str();
+fn name_pair_score_from_names(left_name: &str, right_name: &str) -> f64 {
     if left_name == right_name {
         100.0
     } else {
         jaro_winkler(left_name, right_name) * 100.0
     }
+}
+
+fn name_pair_can_reach_threshold(left_name: &str, right_name: &str, threshold: f64) -> bool {
+    left_name == right_name || jaro_winkler_upper_bound(left_name, right_name) >= threshold
+}
+
+fn jaro_winkler_upper_bound(left_name: &str, right_name: &str) -> f64 {
+    let left_len = left_name.chars().count();
+    let right_len = right_name.chars().count();
+    if left_len == 0 || right_len == 0 {
+        return if left_len == right_len { 100.0 } else { 0.0 };
+    }
+
+    let shorter = left_len.min(right_len) as f64;
+    let longer = left_len.max(right_len) as f64;
+    let max_jaro = (1.0 + shorter / longer + 1.0) / 3.0;
+    let max_prefix = left_len.min(right_len).min(4) as f64;
+    let max_winkler = max_jaro + 0.1 * max_prefix * (1.0 - max_jaro);
+    max_winkler.min(1.0) * 100.0
 }
 
 fn apply_matching_name_pairs(
@@ -85,4 +107,3 @@ fn apply_matching_name_pairs(
         }
     }
 }
-

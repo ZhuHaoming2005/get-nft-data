@@ -37,7 +37,9 @@ fn prepare_base_tables(
         DROP TABLE IF EXISTS selected_chains;
         DROP TABLE IF EXISTS uri_key_contracts;
         DROP TABLE IF EXISTS uri_key_stats;
+        DROP TABLE IF EXISTS uri_duplicate_key_stats;
         DROP TABLE IF EXISTS uri_key_chain_counts;
+        DROP TABLE IF EXISTS uri_duplicate_key_chain_counts;
         DROP TABLE IF EXISTS uri_contract_flags;
         DROP TABLE IF EXISTS contract_names;
         DROP TABLE IF EXISTS name_atoms;
@@ -54,12 +56,10 @@ fn prepare_base_tables(
             CREATE TEMP TABLE analysis_rows AS
             SELECT lower(trim(CAST(chain AS VARCHAR))) AS chain,
                    lower(trim(CAST(contract_address AS VARCHAR))) AS contract_address,
-                   coalesce(CAST(token_id AS VARCHAR), '') AS token_id,
                    trim(coalesce(CAST(token_uri AS VARCHAR), '')) AS token_uri,
                    trim(coalesce(CAST(image_uri AS VARCHAR), '')) AS image_uri,
                    coalesce(CAST(token_uri_norm AS VARCHAR), '') AS token_uri_norm,
                    coalesce(CAST(image_uri_norm AS VARCHAR), '') AS image_uri_norm,
-                   coalesce(CAST(name AS VARCHAR), '') AS name,
                    trim(coalesce(CAST(name_norm AS VARCHAR), '')) AS name_norm
             FROM read_parquet({inputs})
             WHERE chain IS NOT NULL
@@ -85,32 +85,34 @@ fn prepare_base_tables(
         &mut memory_guard,
         total_budget,
     )?;
-    build_uri_key_stats(conn, progress, &mut memory_guard, total_budget)?;
-    build_uri_contract_flags(conn, progress, &mut memory_guard, total_budget)?;
+    let chains = load_selected_chains(conn)?;
+    let include_cross_chain = chains.len() > 1;
+    build_uri_key_stats(
+        conn,
+        progress,
+        &mut memory_guard,
+        total_budget,
+        include_cross_chain,
+    )?;
+    build_uri_contract_flags(
+        conn,
+        progress,
+        &mut memory_guard,
+        total_budget,
+        include_cross_chain,
+    )?;
     execute_duckdb_progress_batch(
         conn,
         "
             CREATE TEMP TABLE contract_names AS
-            WITH ranked AS (
-                SELECT chain,
-                       contract_address,
-                       name,
-                       name_norm,
-                       count(*) OVER (
-                           PARTITION BY chain, contract_address
-                       )::BIGINT AS nft_count,
-                       row_number() OVER (
-                           PARTITION BY chain, contract_address
-                           ORDER BY CASE WHEN name_norm <> '' THEN 0 ELSE 1 END,
-                                    token_id DESC
-                       ) AS rn
-                FROM analysis_rows
-                WHERE contract_address <> ''
-            )
-            SELECT chain, contract_address, nft_count, name, name_norm
-            FROM ranked
-            WHERE rn = 1
-              AND name_norm <> '';
+            SELECT chain,
+                   contract_address,
+                   count(*)::BIGINT AS nft_count,
+                   min(nullif(name_norm, '')) AS name_norm
+            FROM analysis_rows
+            WHERE contract_address <> ''
+            GROUP BY chain, contract_address
+            HAVING min(nullif(name_norm, '')) IS NOT NULL;
         ",
         progress,
         "materialized contract names",
@@ -124,7 +126,6 @@ fn prepare_base_tables(
             WITH atoms AS (
                 SELECT chain,
                        name_norm,
-                       min(name) AS sample_name,
                        count(*)::BIGINT AS contract_count,
                        coalesce(sum(nft_count), 0)::BIGINT AS nft_count
                 FROM contract_names
@@ -139,7 +140,6 @@ fn prepare_base_tables(
         &mut memory_guard,
         total_budget,
     )?;
-    let chains = load_selected_chains(conn)?;
     progress.finish_phase("DuckDB tables ready");
     Ok(chains)
 }
@@ -173,6 +173,7 @@ fn build_uri_key_stats(
     progress: &ProgressTracker,
     memory_guard: &mut MemoryGuard,
     desired_duckdb_bytes: usize,
+    include_cross_chain: bool,
 ) -> Result<(), AnalysisError> {
     execute_duckdb_progress_batch(
         conn,
@@ -224,21 +225,52 @@ fn build_uri_key_stats(
         memory_guard,
         desired_duckdb_bytes,
     )?;
+    if include_cross_chain {
+        execute_duckdb_progress_batch(
+            conn,
+            "
+                CREATE TEMP TABLE uri_key_chain_counts AS
+                SELECT key_kind,
+                       key_value,
+                       count(*)::BIGINT AS chain_count
+                FROM uri_key_stats
+                GROUP BY key_kind, key_value;
+            ",
+            progress,
+            "built URI cross-chain key stats",
+            memory_guard,
+            desired_duckdb_bytes,
+        )?;
+    }
     execute_duckdb_progress_batch(
         conn,
         "
-            CREATE TEMP TABLE uri_key_chain_counts AS
-            SELECT key_kind,
-                   key_value,
-                   count(*)::BIGINT AS chain_count
+            CREATE TEMP TABLE uri_duplicate_key_stats AS
+            SELECT *
             FROM uri_key_stats
-            GROUP BY key_kind, key_value;
+            WHERE nft_count >= 2
+               OR contract_count >= 2;
         ",
         progress,
-        "built URI cross-chain key stats",
+        "built duplicate-only URI key stats",
         memory_guard,
         desired_duckdb_bytes,
     )?;
+    if include_cross_chain {
+        execute_duckdb_progress_batch(
+            conn,
+            "
+                CREATE TEMP TABLE uri_duplicate_key_chain_counts AS
+                SELECT *
+                FROM uri_key_chain_counts
+                WHERE chain_count >= 2;
+            ",
+            progress,
+            "built duplicate-only URI cross-chain key stats",
+            memory_guard,
+            desired_duckdb_bytes,
+        )?;
+    }
     Ok(())
 }
 
@@ -278,11 +310,48 @@ fn build_uri_contract_flags(
     progress: &ProgressTracker,
     memory_guard: &mut MemoryGuard,
     desired_duckdb_bytes: usize,
+    include_cross_chain: bool,
 ) -> Result<(), AnalysisError> {
     execute_duckdb_progress_batch(
         conn,
-        &format!(
-            "
+        &build_uri_contract_flags_sql(include_cross_chain),
+        progress,
+        "built compact URI contract flags",
+        memory_guard,
+        desired_duckdb_bytes,
+    )
+}
+
+fn build_uri_contract_flags_sql(include_cross_chain: bool) -> String {
+    let cross_select_columns = if include_cross_chain {
+        ",
+                       coalesce(stc.chain_count >= 2, false) AS strict_token_chain,
+                       coalesce(sic.chain_count >= 2, false) AS strict_image_chain,
+                       coalesce(ntc.chain_count >= 2, false) AS norm_token_chain,
+                       coalesce(nic.chain_count >= 2, false) AS norm_image_chain"
+    } else {
+        ""
+    };
+    let cross_joins = if include_cross_chain {
+        "
+                LEFT JOIN uri_duplicate_key_chain_counts stc
+                  ON stc.key_kind = 'strict_token'
+                 AND stc.key_value = r.token_uri
+                LEFT JOIN uri_duplicate_key_chain_counts sic
+                  ON sic.key_kind = 'strict_image'
+                 AND sic.key_value = r.image_uri
+                LEFT JOIN uri_duplicate_key_chain_counts ntc
+                  ON ntc.key_kind = 'norm_token'
+                 AND ntc.key_value = r.token_uri_norm
+                LEFT JOIN uri_duplicate_key_chain_counts nic
+                  ON nic.key_kind = 'norm_image'
+                 AND nic.key_value = r.image_uri_norm"
+    } else {
+        ""
+    };
+
+    format!(
+        "
             CREATE TEMP TABLE uri_contract_flags AS
             WITH rows AS (
                 SELECT chain,
@@ -307,43 +376,27 @@ fn build_uri_contract_flags(
                        coalesce(si.nft_count >= 2, false) AS strict_image_any,
                        coalesce(st.contract_count >= 2, false) AS strict_token_contract,
                        coalesce(si.contract_count >= 2, false) AS strict_image_contract,
-                       coalesce(stc.chain_count >= 2, false) AS strict_token_chain,
-                       coalesce(sic.chain_count >= 2, false) AS strict_image_chain,
                        coalesce(nt.nft_count >= 2, false) AS norm_token_any,
                        coalesce(ni.nft_count >= 2, false) AS norm_image_any,
                        coalesce(nt.contract_count >= 2, false) AS norm_token_contract,
-                       coalesce(ni.contract_count >= 2, false) AS norm_image_contract,
-                       coalesce(ntc.chain_count >= 2, false) AS norm_token_chain,
-                       coalesce(nic.chain_count >= 2, false) AS norm_image_chain
+                       coalesce(ni.contract_count >= 2, false) AS norm_image_contract{cross_select_columns}
                 FROM rows r
-                LEFT JOIN uri_key_stats st
+                LEFT JOIN uri_duplicate_key_stats st
                   ON st.chain = r.chain
                  AND st.key_kind = 'strict_token'
                  AND st.key_value = r.token_uri
-                LEFT JOIN uri_key_stats si
+                LEFT JOIN uri_duplicate_key_stats si
                   ON si.chain = r.chain
                  AND si.key_kind = 'strict_image'
                  AND si.key_value = r.image_uri
-                LEFT JOIN uri_key_chain_counts stc
-                  ON stc.key_kind = 'strict_token'
-                 AND stc.key_value = r.token_uri
-                LEFT JOIN uri_key_chain_counts sic
-                  ON sic.key_kind = 'strict_image'
-                 AND sic.key_value = r.image_uri
-                LEFT JOIN uri_key_stats nt
+                LEFT JOIN uri_duplicate_key_stats nt
                   ON nt.chain = r.chain
                  AND nt.key_kind = 'norm_token'
                  AND nt.key_value = r.token_uri_norm
-                LEFT JOIN uri_key_stats ni
+                LEFT JOIN uri_duplicate_key_stats ni
                   ON ni.chain = r.chain
                  AND ni.key_kind = 'norm_image'
-                 AND ni.key_value = r.image_uri_norm
-                LEFT JOIN uri_key_chain_counts ntc
-                  ON ntc.key_kind = 'norm_token'
-                 AND ntc.key_value = r.token_uri_norm
-                LEFT JOIN uri_key_chain_counts nic
-                  ON nic.key_kind = 'norm_image'
-                 AND nic.key_value = r.image_uri_norm
+                 AND ni.key_value = r.image_uri_norm{cross_joins}
             )
             SELECT chain,
                    contract_address,
@@ -352,33 +405,32 @@ fn build_uri_contract_flags(
             FROM keyed
             GROUP BY chain, contract_address;
             ",
-            contract_columns = uri_contract_metric_columns(),
-        ),
-        progress,
-        "built compact URI contract flags",
-        memory_guard,
-        desired_duckdb_bytes,
+        contract_columns = uri_contract_metric_columns(include_cross_chain),
     )
 }
 
-fn uri_contract_metric_columns() -> String {
-    [
+fn uri_contract_metric_columns(include_cross_chain: bool) -> String {
+    let mut columns = vec![
         uri_contract_metric_sql("strict_any", "strict_token_any", "strict_image_any"),
         uri_contract_metric_sql(
             "strict_contract",
             "strict_token_contract",
             "strict_image_contract",
         ),
-        uri_contract_metric_sql("strict_chain", "strict_token_chain", "strict_image_chain"),
         uri_contract_metric_sql("norm_any", "norm_token_any", "norm_image_any"),
         uri_contract_metric_sql(
             "norm_contract",
             "norm_token_contract",
             "norm_image_contract",
         ),
-        uri_contract_metric_sql("norm_chain", "norm_token_chain", "norm_image_chain"),
-    ]
-    .join(",\n                   ")
+    ];
+    if include_cross_chain {
+        columns.extend([
+            uri_contract_metric_sql("strict_chain", "strict_token_chain", "strict_image_chain"),
+            uri_contract_metric_sql("norm_chain", "norm_token_chain", "norm_image_chain"),
+        ]);
+    }
+    columns.join(",\n                   ")
 }
 
 fn uri_contract_metric_sql(prefix: &str, token_flag: &str, image_flag: &str) -> String {
@@ -429,4 +481,3 @@ fn load_selected_chains(conn: &Connection) -> Result<Vec<String>, AnalysisError>
     }
     Ok(chains)
 }
-
