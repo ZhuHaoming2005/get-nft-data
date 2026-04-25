@@ -26,6 +26,13 @@ fn record_metadata_doc(metadata_doc: &str, metadata_json: &str) -> String {
     }
 }
 
+fn seed_metadata_example_doc(seed_nfts: &[SeedNft]) -> Option<MetadataBm25Document> {
+    seed_nfts.iter().find_map(|item| {
+        let seed_doc = record_metadata_doc(&item.metadata_doc, &item.metadata_json);
+        MetadataBm25Document::from_text(&seed_doc)
+    })
+}
+
 struct MetadataBm25Index {
     corpus: MetadataBm25Corpus,
     docs: Vec<MetadataBm25Document>,
@@ -125,13 +132,8 @@ pub fn build_duplicate_candidates(
         .filter(|name| !name.is_empty())
         .collect();
 
-    let seed_metadata_docs: Vec<MetadataBm25Document> = seed_nfts
-        .iter()
-        .filter_map(|item| {
-            let seed_doc = record_metadata_doc(&item.metadata_doc, &item.metadata_json);
-            MetadataBm25Document::from_text(&seed_doc)
-        })
-        .collect();
+    let seed_metadata_docs: Vec<MetadataBm25Document> =
+        seed_metadata_example_doc(seed_nfts).into_iter().collect();
 
     let metadata_index =
         build_metadata_bm25_index(&seed_metadata_docs, snapshot_rows, &seed_contracts);
@@ -269,5 +271,33 @@ mod tests {
             .is_none());
         assert_eq!(index.docs.len(), 2);
         assert_eq!(index.corpus.total_docs(), 3);
+    }
+
+    #[test]
+    fn duplicate_candidates_use_only_one_seed_metadata_example() {
+        let seed_nfts = vec![
+            SeedNft {
+                contract_address: "0xseed".into(),
+                token_id: "1".into(),
+                metadata_doc: "gold dragon".into(),
+                ..Default::default()
+            },
+            SeedNft {
+                contract_address: "0xseed".into(),
+                token_id: "2".into(),
+                metadata_doc: "silver cat".into(),
+                ..Default::default()
+            },
+        ];
+        let snapshot_rows = vec![DatabaseNftRecord {
+            contract_address: "0xcandidate".into(),
+            token_id: "1".into(),
+            metadata_doc: "silver cat".into(),
+            ..Default::default()
+        }];
+
+        let candidates = build_duplicate_candidates(&seed_nfts, &snapshot_rows, 95.0, 0.55);
+
+        assert!(candidates.is_empty());
     }
 }

@@ -69,6 +69,45 @@ impl Default for DuckDbResourceOptions {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_snapshot_recalls_metadata_from_only_one_seed_example() {
+        let store = DuckDbFeatureStore::new(":memory:").unwrap();
+        store
+            .replace_chain_rows(
+                "ethereum",
+                &[DatabaseNftRecord {
+                    contract_address: "0xcandidate".into(),
+                    token_id: "1".into(),
+                    metadata_doc: "silver cat".into(),
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+        let seed_nfts = vec![
+            SeedNft {
+                contract_address: "0xseed".into(),
+                token_id: "1".into(),
+                metadata_doc: "gold dragon".into(),
+                ..Default::default()
+            },
+            SeedNft {
+                contract_address: "0xseed".into(),
+                token_id: "2".into(),
+                metadata_doc: "silver cat".into(),
+                ..Default::default()
+            },
+        ];
+
+        let snapshot = store.load_snapshot("ethereum", &seed_nfts, 0, 0).unwrap();
+
+        assert!(snapshot.nft_rows.is_empty());
+    }
+}
+
 impl DuckDbResourceOptions {
     pub fn from_cli(threads: usize, memory_limit: &str) -> Result<Self, AppError> {
         let mut options = Self::default();
@@ -106,6 +145,25 @@ fn parse_metadata_keywords_arr(raw: &str) -> Result<HashSet<String>, AppError> {
         .map(|value| value.to_lowercase())
         .filter(|value| !value.is_empty())
         .collect())
+}
+
+fn seed_metadata_recall_terms(seed_nfts: &[SeedNft]) -> HashSet<String> {
+    seed_nfts
+        .iter()
+        .find_map(|item| {
+            let doc = if item.metadata_doc.trim().is_empty() {
+                metadata_document_from_json(&item.metadata_json)
+            } else {
+                item.metadata_doc.clone()
+            };
+            let keywords = metadata_keywords(&doc, 8);
+            if keywords.is_empty() {
+                None
+            } else {
+                Some(keywords.into_iter().collect())
+            }
+        })
+        .unwrap_or_default()
 }
 
 impl DuckDbFeatureStore {
@@ -416,17 +474,7 @@ impl DuckDbFeatureStore {
             .filter(|value| !value.is_empty())
             .map(|value| value.chars().take(8).collect::<String>())
             .collect();
-        let metadata_recall_terms: HashSet<String> = seed_nfts
-            .iter()
-            .flat_map(|item| {
-                let doc = if item.metadata_doc.trim().is_empty() {
-                    metadata_document_from_json(&item.metadata_json)
-                } else {
-                    item.metadata_doc.clone()
-                };
-                metadata_keywords(&doc, 8)
-            })
-            .collect();
+        let metadata_recall_terms = seed_metadata_recall_terms(seed_nfts);
 
         let mut predicates = Vec::new();
         predicates.push("chain = ?".to_string());
