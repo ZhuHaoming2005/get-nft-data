@@ -7,6 +7,7 @@ pub mod currency;
 pub mod error;
 pub mod models;
 pub mod normalize;
+pub mod platform_infrastructure;
 pub mod progress;
 pub mod reporting;
 pub mod store;

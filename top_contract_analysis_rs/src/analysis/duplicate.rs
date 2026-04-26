@@ -8,6 +8,7 @@ use crate::analysis::scoring::{
 };
 use crate::models::{DatabaseNftRecord, DuplicateCandidate, SeedNft};
 use crate::normalize::{normalize_name, normalize_url};
+use crate::platform_infrastructure::is_platform_infrastructure_contract_blacklisted;
 
 fn has_name_match(row_name_norm: &str, name_threshold: f64, seed_name_norms: &[String]) -> bool {
     if row_name_norm.is_empty() {
@@ -78,6 +79,7 @@ impl ContractDuplicateRow {
 }
 
 fn aggregate_contract_rows(
+    chain: &str,
     seed_contracts: &HashSet<String>,
     seed_token_uri_keys: &HashSet<String>,
     seed_image_uri_keys: &HashSet<String>,
@@ -87,6 +89,9 @@ fn aggregate_contract_rows(
     for row in snapshot_rows {
         let contract_key = row.contract_address.to_lowercase();
         if seed_contracts.contains(&contract_key) {
+            continue;
+        }
+        if is_platform_infrastructure_contract_blacklisted(chain, &row.contract_address) {
             continue;
         }
 
@@ -177,6 +182,7 @@ fn build_metadata_bm25_index(
 }
 
 pub fn build_duplicate_candidates(
+    chain: &str,
     seed_nfts: &[SeedNft],
     snapshot_rows: &[DatabaseNftRecord],
     name_threshold: f64,
@@ -205,6 +211,7 @@ pub fn build_duplicate_candidates(
         seed_metadata_example_doc(seed_nfts).into_iter().collect();
 
     let contract_rows = aggregate_contract_rows(
+        chain,
         &seed_contracts,
         &seed_token_uri_keys,
         &seed_image_uri_keys,
@@ -317,7 +324,7 @@ mod tests {
 
         let empty = HashSet::new();
         let contract_rows =
-            aggregate_contract_rows(&seed_contracts, &empty, &empty, &snapshot_rows);
+            aggregate_contract_rows("ethereum", &seed_contracts, &empty, &empty, &snapshot_rows);
         let index = build_metadata_bm25_index(&seed_docs, &contract_rows, false);
 
         assert!(index.candidate_doc("0xgold").is_some());
@@ -351,7 +358,8 @@ mod tests {
             ..Default::default()
         }];
 
-        let candidates = build_duplicate_candidates(&seed_nfts, &snapshot_rows, 95.0, 0.55);
+        let candidates =
+            build_duplicate_candidates("ethereum", &seed_nfts, &snapshot_rows, 95.0, 0.55);
 
         assert!(candidates.is_empty());
     }
@@ -373,7 +381,8 @@ mod tests {
             ..Default::default()
         }];
 
-        let candidates = build_duplicate_candidates(&seed_nfts, &snapshot_rows, 95.0, 0.55);
+        let candidates =
+            build_duplicate_candidates("ethereum", &seed_nfts, &snapshot_rows, 95.0, 0.55);
 
         assert!(candidates.is_empty());
     }
@@ -405,11 +414,73 @@ mod tests {
             },
         ];
 
-        let candidates = build_duplicate_candidates(&seed_nfts, &snapshot_rows, 95.0, 0.55);
+        let candidates =
+            build_duplicate_candidates("ethereum", &seed_nfts, &snapshot_rows, 95.0, 0.55);
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].contract_address, "0xcandidate");
         assert_eq!(candidates[0].match_reasons, vec!["metadata_match"]);
+    }
+
+    #[test]
+    fn duplicate_candidates_exclude_known_platform_infrastructure_contract_addresses_only() {
+        let seed_nfts = vec![SeedNft {
+            contract_address: "0xseed".into(),
+            token_id: "1".into(),
+            metadata_doc: "gold dragon".into(),
+            ..Default::default()
+        }];
+        let snapshot_rows = vec![
+            DatabaseNftRecord {
+                contract_address: "0x7C770595a2Be9A87CF49B35eA9bC534f1a59552D".into(),
+                token_id: "1".into(),
+                metadata_doc: "gold dragon".into(),
+                metadata_recall_checked: true,
+                metadata_recall_match: true,
+                ..Default::default()
+            },
+            DatabaseNftRecord {
+                contract_address: "0xfactorynameonly".into(),
+                token_id: "1".into(),
+                name: "NFT Factory Test".into(),
+                metadata_doc: "gold dragon".into(),
+                metadata_recall_checked: true,
+                metadata_recall_match: true,
+                ..Default::default()
+            },
+        ];
+
+        let candidates =
+            build_duplicate_candidates("ethereum", &seed_nfts, &snapshot_rows, 95.0, 0.55);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].contract_address, "0xfactorynameonly");
+    }
+
+    #[test]
+    fn duplicate_candidates_apply_platform_infrastructure_blacklist_by_chain() {
+        let seed_nfts = vec![SeedNft {
+            contract_address: "0xseed".into(),
+            token_id: "1".into(),
+            metadata_doc: "gold dragon".into(),
+            ..Default::default()
+        }];
+        let snapshot_rows = vec![DatabaseNftRecord {
+            contract_address: "0x7C770595a2Be9A87CF49B35eA9bC534f1a59552D".into(),
+            token_id: "1".into(),
+            metadata_doc: "gold dragon".into(),
+            metadata_recall_checked: true,
+            metadata_recall_match: true,
+            ..Default::default()
+        }];
+
+        let ethereum_candidates =
+            build_duplicate_candidates("ethereum", &seed_nfts, &snapshot_rows, 95.0, 0.55);
+        let polygon_candidates =
+            build_duplicate_candidates("polygon", &seed_nfts, &snapshot_rows, 95.0, 0.55);
+
+        assert!(ethereum_candidates.is_empty());
+        assert_eq!(polygon_candidates.len(), 1);
     }
 
     #[test]
@@ -439,7 +510,8 @@ mod tests {
             },
         ];
 
-        let candidates = build_duplicate_candidates(&seed_nfts, &snapshot_rows, 95.0, 0.55);
+        let candidates =
+            build_duplicate_candidates("ethereum", &seed_nfts, &snapshot_rows, 95.0, 0.55);
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].token_id, "2");

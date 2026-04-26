@@ -303,7 +303,7 @@ fn duplicate_candidates_use_token_uri_and_name_reason_flags() {
         ..Default::default()
     }];
 
-    let rows = build_duplicate_candidates(&seed_nfts, &snapshot_rows, 95.0, 0.55);
+    let rows = build_duplicate_candidates("ethereum", &seed_nfts, &snapshot_rows, 95.0, 0.55);
 
     assert_eq!(rows[0].contract_address, "0xdup");
     assert!(rows[0].match_reasons.contains(&"token_uri_match".into()));
@@ -322,7 +322,7 @@ fn duplicate_candidates_compare_seed_names_without_length_prefilter() {
         ..Default::default()
     }];
 
-    let rows = build_duplicate_candidates(&seed_nfts, &snapshot_rows, 95.0, 0.55);
+    let rows = build_duplicate_candidates("ethereum", &seed_nfts, &snapshot_rows, 95.0, 0.55);
 
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].contract_address, "0xdup");
@@ -342,7 +342,7 @@ fn duplicate_candidates_score_short_metadata_tokens_with_bm25() {
         ..Default::default()
     }];
 
-    let rows = build_duplicate_candidates(&seed_nfts, &snapshot_rows, 95.0, 0.55);
+    let rows = build_duplicate_candidates("ethereum", &seed_nfts, &snapshot_rows, 95.0, 0.55);
 
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].contract_address, "0xdup");

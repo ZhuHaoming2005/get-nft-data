@@ -728,6 +728,7 @@ pub async fn analyze_seed_contract_with_progress(
 
     progress.on_seed_stage("find_duplicate_candidates").await;
     let candidates = duplicate::build_duplicate_candidates(
+        &request.chain,
         &seed_nfts,
         &snapshot.nft_rows,
         request.name_threshold,
