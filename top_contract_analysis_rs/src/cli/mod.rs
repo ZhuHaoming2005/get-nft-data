@@ -37,7 +37,7 @@ pub struct AnalyzeArgs {
     pub max_tokens_per_contract: usize,
     #[arg(long, default_value_t = 0)]
     pub max_recall_rows: usize,
-    #[arg(long, default_value_t = 12)]
+    #[arg(long, default_value_t = 8)]
     pub api_max_concurrency: usize,
     #[arg(long, default_value_t = 4)]
     pub contract_max_concurrency: usize,
