@@ -98,6 +98,7 @@ impl AnalyzeApi for FakeApi {
 
     async fn fetch_contract_owners(
         &self,
+        _chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
         _contract_address: &str,
@@ -107,6 +108,7 @@ impl AnalyzeApi for FakeApi {
 
     async fn fetch_contract_sales(
         &self,
+        _chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
         _contract_address: &str,
@@ -256,6 +258,7 @@ impl AnalyzeApi for FakeTwoTokenOwnersApi {
 
     async fn fetch_contract_owners(
         &self,
+        _chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
         _contract_address: &str,
@@ -274,6 +277,7 @@ impl AnalyzeApi for FakeTwoTokenOwnersApi {
 
     async fn fetch_contract_sales(
         &self,
+        chain: &str,
         alchemy_api_key: &str,
         alchemy_network: Option<&str>,
         contract_address: &str,
@@ -281,6 +285,7 @@ impl AnalyzeApi for FakeTwoTokenOwnersApi {
     ) -> Result<Vec<NftSaleRecord>, AppError> {
         AnalyzeApi::fetch_contract_sales(
             &FakeApi,
+            chain,
             alchemy_api_key,
             alchemy_network,
             contract_address,
@@ -425,12 +430,14 @@ impl AnalyzeApi for FakeEmptyContractNftsApi {
 
     async fn fetch_contract_owners(
         &self,
+        chain: &str,
         alchemy_api_key: &str,
         alchemy_network: Option<&str>,
         contract_address: &str,
     ) -> Result<Vec<OwnerBalance>, AppError> {
         AnalyzeApi::fetch_contract_owners(
             &FakeTwoTokenOwnersApi,
+            chain,
             alchemy_api_key,
             alchemy_network,
             contract_address,
@@ -440,6 +447,7 @@ impl AnalyzeApi for FakeEmptyContractNftsApi {
 
     async fn fetch_contract_sales(
         &self,
+        chain: &str,
         alchemy_api_key: &str,
         alchemy_network: Option<&str>,
         contract_address: &str,
@@ -447,6 +455,7 @@ impl AnalyzeApi for FakeEmptyContractNftsApi {
     ) -> Result<Vec<NftSaleRecord>, AppError> {
         AnalyzeApi::fetch_contract_sales(
             &FakeTwoTokenOwnersApi,
+            chain,
             alchemy_api_key,
             alchemy_network,
             contract_address,
@@ -591,12 +600,14 @@ impl AnalyzeApi for FakeOpenLicenseApi {
 
     async fn fetch_contract_owners(
         &self,
+        chain: &str,
         alchemy_api_key: &str,
         alchemy_network: Option<&str>,
         contract_address: &str,
     ) -> Result<Vec<OwnerBalance>, AppError> {
         AnalyzeApi::fetch_contract_owners(
             &FakeApi,
+            chain,
             alchemy_api_key,
             alchemy_network,
             contract_address,
@@ -606,6 +617,7 @@ impl AnalyzeApi for FakeOpenLicenseApi {
 
     async fn fetch_contract_sales(
         &self,
+        chain: &str,
         alchemy_api_key: &str,
         alchemy_network: Option<&str>,
         contract_address: &str,
@@ -613,6 +625,7 @@ impl AnalyzeApi for FakeOpenLicenseApi {
     ) -> Result<Vec<NftSaleRecord>, AppError> {
         AnalyzeApi::fetch_contract_sales(
             &FakeApi,
+            chain,
             alchemy_api_key,
             alchemy_network,
             contract_address,
@@ -763,6 +776,7 @@ impl AnalyzeApi for FakeEnrichedApi {
 
     async fn fetch_contract_owners(
         &self,
+        _chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
         _contract_address: &str,
@@ -775,6 +789,7 @@ impl AnalyzeApi for FakeEnrichedApi {
 
     async fn fetch_contract_sales(
         &self,
+        _chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
         contract_address: &str,
@@ -794,9 +809,13 @@ impl AnalyzeApi for FakeEnrichedApi {
             payment_token_symbol: "ETH".into(),
             payment_token_address: "0x0000000000000000000000000000000000000000".into(),
             price_eth: Some(1.5),
+            price_usd: Some(1.5),
             seller_fee_eth: 0.0,
+            seller_fee_usd: 0.0,
             protocol_fee_eth: 0.0,
+            protocol_fee_usd: 0.0,
             royalty_fee_eth: 0.0,
+            royalty_fee_usd: 0.0,
             source: "opensea".into(),
             is_native_eth: true,
         }])
@@ -904,12 +923,14 @@ impl AnalyzeApi for FakeLegitApi {
 
     async fn fetch_contract_owners(
         &self,
+        chain: &str,
         alchemy_api_key: &str,
         alchemy_network: Option<&str>,
         contract_address: &str,
     ) -> Result<Vec<OwnerBalance>, AppError> {
         AnalyzeApi::fetch_contract_owners(
             &FakeEnrichedApi,
+            chain,
             alchemy_api_key,
             alchemy_network,
             contract_address,
@@ -919,6 +940,7 @@ impl AnalyzeApi for FakeLegitApi {
 
     async fn fetch_contract_sales(
         &self,
+        chain: &str,
         alchemy_api_key: &str,
         alchemy_network: Option<&str>,
         contract_address: &str,
@@ -926,6 +948,7 @@ impl AnalyzeApi for FakeLegitApi {
     ) -> Result<Vec<NftSaleRecord>, AppError> {
         AnalyzeApi::fetch_contract_sales(
             &FakeEnrichedApi,
+            chain,
             alchemy_api_key,
             alchemy_network,
             contract_address,
@@ -1106,6 +1129,7 @@ impl AnalyzeApi for CountingApi {
 
     async fn fetch_contract_owners(
         &self,
+        _chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
         _contract_address: &str,
@@ -1119,6 +1143,7 @@ impl AnalyzeApi for CountingApi {
 
     async fn fetch_contract_sales(
         &self,
+        _chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
         contract_address: &str,
@@ -1138,9 +1163,13 @@ impl AnalyzeApi for CountingApi {
             payment_token_symbol: "ETH".into(),
             payment_token_address: "0x0000000000000000000000000000000000000000".into(),
             price_eth: Some(1.5),
+            price_usd: Some(1.5),
             seller_fee_eth: 0.0,
+            seller_fee_usd: 0.0,
             protocol_fee_eth: 0.0,
+            protocol_fee_usd: 0.0,
             royalty_fee_eth: 0.0,
+            royalty_fee_usd: 0.0,
             source: "opensea".into(),
             is_native_eth: true,
         }])
@@ -1267,6 +1296,7 @@ impl AnalyzeApi for FakeSaleMetricApi {
 
     async fn fetch_contract_owners(
         &self,
+        _chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
         _contract_address: &str,
@@ -1279,6 +1309,7 @@ impl AnalyzeApi for FakeSaleMetricApi {
 
     async fn fetch_contract_sales(
         &self,
+        _chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
         contract_address: &str,
@@ -1298,9 +1329,13 @@ impl AnalyzeApi for FakeSaleMetricApi {
             payment_token_symbol: "ETH".into(),
             payment_token_address: "0x0000000000000000000000000000000000000000".into(),
             price_eth: Some(1.5),
+            price_usd: Some(1.5),
             seller_fee_eth: 0.0,
+            seller_fee_usd: 0.0,
             protocol_fee_eth: 0.0,
+            protocol_fee_usd: 0.0,
             royalty_fee_eth: 0.0,
+            royalty_fee_usd: 0.0,
             source: "opensea".into(),
             is_native_eth: true,
         }])
@@ -1455,6 +1490,7 @@ impl AnalyzeApi for ConcurrentContractApi {
 
     async fn fetch_contract_owners(
         &self,
+        _chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
         _contract_address: &str,
@@ -1464,6 +1500,7 @@ impl AnalyzeApi for ConcurrentContractApi {
 
     async fn fetch_contract_sales(
         &self,
+        _chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
         _contract_address: &str,
@@ -1613,6 +1650,7 @@ impl AnalyzeApi for ConcurrentSingleContractFetchApi {
 
     async fn fetch_contract_owners(
         &self,
+        _chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
         _contract_address: &str,
@@ -1623,6 +1661,7 @@ impl AnalyzeApi for ConcurrentSingleContractFetchApi {
 
     async fn fetch_contract_sales(
         &self,
+        _chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
         contract_address: &str,
@@ -1643,9 +1682,13 @@ impl AnalyzeApi for ConcurrentSingleContractFetchApi {
             payment_token_symbol: "ETH".into(),
             payment_token_address: "0x0000000000000000000000000000000000000000".into(),
             price_eth: Some(1.0),
+            price_usd: Some(1.0),
             seller_fee_eth: 0.0,
+            seller_fee_usd: 0.0,
             protocol_fee_eth: 0.0,
+            protocol_fee_usd: 0.0,
             royalty_fee_eth: 0.0,
+            royalty_fee_usd: 0.0,
             source: "opensea".into(),
             is_native_eth: false,
         }])
@@ -1756,6 +1799,7 @@ impl AnalyzeApi for ConcurrentSaleMetricApi {
 
     async fn fetch_contract_owners(
         &self,
+        _chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
         _contract_address: &str,
@@ -1774,6 +1818,7 @@ impl AnalyzeApi for ConcurrentSaleMetricApi {
 
     async fn fetch_contract_sales(
         &self,
+        _chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
         contract_address: &str,
@@ -1794,9 +1839,13 @@ impl AnalyzeApi for ConcurrentSaleMetricApi {
                 payment_token_symbol: "ETH".into(),
                 payment_token_address: "0x0000000000000000000000000000000000000000".into(),
                 price_eth: Some(1.0),
+                price_usd: Some(1.0),
                 seller_fee_eth: 0.0,
+                seller_fee_usd: 0.0,
                 protocol_fee_eth: 0.0,
+                protocol_fee_usd: 0.0,
                 royalty_fee_eth: 0.0,
+                royalty_fee_usd: 0.0,
                 source: "opensea".into(),
                 is_native_eth: true,
             },
@@ -1814,9 +1863,13 @@ impl AnalyzeApi for ConcurrentSaleMetricApi {
                 payment_token_symbol: "ETH".into(),
                 payment_token_address: "0x0000000000000000000000000000000000000000".into(),
                 price_eth: Some(2.0),
+                price_usd: Some(2.0),
                 seller_fee_eth: 0.0,
+                seller_fee_usd: 0.0,
                 protocol_fee_eth: 0.0,
+                protocol_fee_usd: 0.0,
                 royalty_fee_eth: 0.0,
+                royalty_fee_usd: 0.0,
                 source: "opensea".into(),
                 is_native_eth: true,
             },
@@ -2097,7 +2150,9 @@ fn single_report_markdown_preserves_reference_sections_and_summary_lines() {
             candidate_open_license_token_count: 6,
             candidate_open_license_contract_count: 2,
             honest_purchase_total_eth: 10.0,
+            honest_purchase_total_usd: 10.0,
             stuck_cost_eth: 6.5,
+            stuck_cost_usd: 6.5,
             stuck_cost_ratio: Some(0.65),
             buy_asset_ratio_known_address_count: 5,
             ratio_over_60_address_count: 3,
@@ -2180,8 +2235,11 @@ fn single_report_markdown_preserves_reference_sections_and_summary_lines() {
             address: "0xvictim".into(),
             buy_tx_hashes: vec!["0xbuy1".into(), "0xbuy2".into()],
             buy_amount_eth: 3.5,
+            buy_amount_usd: 3.5,
             last_buy_amount_eth: Some(2.0),
+            last_buy_amount_usd: Some(2.0),
             buy_before_eth_balance: Some(4.0),
+            buy_before_usd_balance: Some(4.0),
             buy_asset_ratio: Some(0.5),
             buy_asset_ratio_with_gas: Some(0.55),
             is_stuck: true,
@@ -2193,11 +2251,14 @@ fn single_report_markdown_preserves_reference_sections_and_summary_lines() {
             FraudTradeStatsPayload {
                 unique_buyers: 2,
                 eth_priced_sale_count: Some(2),
+                usd_priced_sale_count: Some(2),
                 eth_priced_volume: Some(5.5),
+                usd_priced_volume: Some(5.5),
                 native_eth_sale_count: Some(2),
                 native_eth_volume: Some(5.5),
                 stuck_wallet_count: 1,
                 stuck_cost_eth: 2.0,
+                stuck_cost_usd: 2.0,
             },
         )]),
         ..Default::default()
@@ -2213,7 +2274,7 @@ fn single_report_markdown_preserves_reference_sections_and_summary_lines() {
     assert!(markdown.contains("- 检测到开放许可: 是"));
     assert!(markdown.contains("- 恶意地址数: 4"));
     assert!(markdown.contains("- 候选侧开放许可 token 数: 6"));
-    assert!(markdown.contains("- 套牢资金(ETH/WETH): 6.5 / 65.00%"));
+    assert!(markdown.contains("- 套牢资金(USD): 6.5 / 65.00%"));
     assert!(markdown.contains("- 买入金额占钱包总额 >60% 的地址数/占比: 3 / 60.00%"));
     assert!(markdown.contains("## 种子集合统计"));
     assert!(markdown.contains("- 拉取到的种子 NFT 数: 10"));
@@ -2235,11 +2296,11 @@ fn single_report_markdown_preserves_reference_sections_and_summary_lines() {
     ));
     assert!(markdown.contains("## 被骗地址画像"));
     assert!(markdown.contains(
-        "- 0xvictim: buy_tx_count=2 | 买入金额(ETH/WETH)=3.5 | 最后一次买入金额(ETH/WETH)=2 | 买入前 ETH 余额: 4 | 买入占比=50.00% | 套牢=是 | last_buy_tx=0xbuy2"
+        "- 0xvictim: buy_tx_count=2 | 买入金额(USD)=3.5 | 最后一次买入金额(USD)=2 | 买入前钱包余额(USD): 4 | 买入占比=50.00% | 套牢=是 | last_buy_tx=0xbuy2"
     ));
     assert!(markdown.contains("## 被骗交易与套牢资金"));
     assert!(markdown.contains(
-        "- 0xhigh: unique_buyers=2 | eth_priced_sale_count=2 | eth_priced_volume=5.5 | stuck_wallet_count=1 | stuck_cost_eth=2"
+        "- 0xhigh: unique_buyers=2 | usd_priced_sale_count=2 | usd_priced_volume=5.5 | stuck_wallet_count=1 | stuck_cost_usd=2"
     ));
 }
 
@@ -2272,8 +2333,11 @@ fn single_report_detailed_sections_keep_python_none_rendering_for_missing_leaf_v
             address: "0xvictim".into(),
             buy_tx_hashes: vec!["0xbuy".into()],
             buy_amount_eth: 1.0,
+            buy_amount_usd: 1.0,
             last_buy_amount_eth: None,
+            last_buy_amount_usd: None,
             buy_before_eth_balance: None,
+            buy_before_usd_balance: None,
             buy_asset_ratio: None,
             buy_asset_ratio_with_gas: None,
             is_stuck: false,
@@ -2291,7 +2355,7 @@ fn single_report_detailed_sections_keep_python_none_rendering_for_missing_leaf_v
         "- 0xdup:0xhonest: interacted_token_count=1 | currently_holding_token_count=0 | hold_duration_median_seconds=None | 被腐化=否 | honest_sale_to_honest_count=0"
     ));
     assert!(markdown.contains(
-        "- 0xvictim: buy_tx_count=1 | 买入金额(ETH/WETH)=1 | 最后一次买入金额(ETH/WETH)=None | 买入前 ETH 余额: None | 买入占比=n/a | 套牢=否 | last_buy_tx=n/a"
+        "- 0xvictim: buy_tx_count=1 | 买入金额(USD)=1 | 最后一次买入金额(USD)=None | 买入前钱包余额(USD): None | 买入占比=n/a | 套牢=否 | last_buy_tx=n/a"
     ));
 }
 
@@ -2306,6 +2370,7 @@ fn single_report_fraud_trade_stats_fall_back_to_native_eth_fields() {
                 native_eth_volume: Some(6.25),
                 stuck_wallet_count: 2,
                 stuck_cost_eth: 1.5,
+                stuck_cost_usd: 1.5,
                 ..Default::default()
             },
         )]),
@@ -2315,7 +2380,7 @@ fn single_report_fraud_trade_stats_fall_back_to_native_eth_fields() {
     let markdown = render_human_readable_report(&payload);
 
     assert!(markdown.contains(
-        "- 0xdup: unique_buyers=3 | eth_priced_sale_count=4 | eth_priced_volume=6.25 | stuck_wallet_count=2 | stuck_cost_eth=1.5"
+        "- 0xdup: unique_buyers=3 | usd_priced_sale_count=4 | usd_priced_volume=6.25 | stuck_wallet_count=2 | stuck_cost_usd=1.5"
     ));
 }
 
@@ -2327,11 +2392,14 @@ fn single_report_fraud_trade_stats_preserve_explicit_zero_eth_priced_values() {
             FraudTradeStatsPayload {
                 unique_buyers: 3,
                 eth_priced_sale_count: Some(0),
+                usd_priced_sale_count: Some(0),
                 eth_priced_volume: Some(0.0),
+                usd_priced_volume: Some(0.0),
                 native_eth_sale_count: Some(4),
                 native_eth_volume: Some(6.25),
                 stuck_wallet_count: 2,
                 stuck_cost_eth: 1.5,
+                stuck_cost_usd: 1.5,
             },
         )]),
         ..Default::default()
@@ -2340,7 +2408,7 @@ fn single_report_fraud_trade_stats_preserve_explicit_zero_eth_priced_values() {
     let markdown = render_human_readable_report(&payload);
 
     assert!(markdown.contains(
-        "- 0xdup: unique_buyers=3 | eth_priced_sale_count=0 | eth_priced_volume=0 | stuck_wallet_count=2 | stuck_cost_eth=1.5"
+        "- 0xdup: unique_buyers=3 | usd_priced_sale_count=0 | usd_priced_volume=0 | stuck_wallet_count=2 | stuck_cost_usd=1.5"
     ));
 }
 

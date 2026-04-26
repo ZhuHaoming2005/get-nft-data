@@ -129,6 +129,7 @@ pub trait AnalyzeApi: Send + Sync {
 
     async fn fetch_contract_owners(
         &self,
+        chain: &str,
         alchemy_api_key: &str,
         alchemy_network: Option<&str>,
         contract_address: &str,
@@ -136,6 +137,7 @@ pub trait AnalyzeApi: Send + Sync {
 
     async fn fetch_contract_sales(
         &self,
+        chain: &str,
         alchemy_api_key: &str,
         alchemy_network: Option<&str>,
         contract_address: &str,
@@ -356,23 +358,8 @@ impl AnalyzeApi for RealApi {
         contract_address: &str,
     ) -> Result<Vec<SeedNft>, AppError> {
         let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
-        let alchemy_result =
-            fetch_seed_contract_nfts(&self.client, &endpoints, chain, contract_address).await;
-        match alchemy_result {
-            Ok(rows) if !rows.is_empty() => Ok(rows),
-            Ok(_) if opensea_api_key.trim().is_empty() => Ok(Vec::new()),
-            Ok(_) => {
-                fetch_opensea_contract_nfts(
-                    &self.client,
-                    &endpoints.opensea_base,
-                    chain,
-                    contract_address,
-                    opensea_api_key,
-                )
-                .await
-            }
-            Err(alchemy_err) if opensea_api_key.trim().is_empty() => Err(alchemy_err),
-            Err(alchemy_err) => match fetch_opensea_contract_nfts(
+        if !opensea_api_key.trim().is_empty() {
+            match fetch_opensea_contract_nfts(
                 &self.client,
                 &endpoints.opensea_base,
                 chain,
@@ -381,14 +368,39 @@ impl AnalyzeApi for RealApi {
             )
             .await
             {
-                Ok(rows) if !rows.is_empty() => Ok(rows),
-                Ok(_) => Err(AppError::Http(format!(
-                    "Alchemy NFT expansion failed ({alchemy_err}); OpenSea returned no NFTs for {contract_address}"
-                ))),
-                Err(opensea_err) => Err(AppError::Http(format!(
-                    "Alchemy NFT expansion failed ({alchemy_err}); OpenSea NFT expansion failed ({opensea_err})"
-                ))),
-            },
+                Ok(rows) if !rows.is_empty() => return Ok(rows),
+                Ok(_) => {}
+                Err(err) => {
+                    eprintln!(
+                        "warning: OpenSea NFT expansion failed for {contract_address}: {err}; falling back to Alchemy"
+                    );
+                }
+            }
+        }
+        let alchemy_result =
+            fetch_seed_contract_nfts(&self.client, &endpoints, chain, contract_address).await;
+        match alchemy_result {
+            Ok(rows) => Ok(rows),
+            Err(alchemy_err) if opensea_api_key.trim().is_empty() => Err(alchemy_err),
+            Err(alchemy_err) => {
+                match fetch_opensea_contract_nfts(
+                    &self.client,
+                    &endpoints.opensea_base,
+                    chain,
+                    contract_address,
+                    opensea_api_key,
+                )
+                .await
+                {
+                    Ok(rows) if !rows.is_empty() => Ok(rows),
+                    Ok(_) => Err(AppError::Http(format!(
+                        "OpenSea returned no NFTs; Alchemy NFT expansion failed ({alchemy_err}) for {contract_address}"
+                    ))),
+                    Err(opensea_err) => Err(AppError::Http(format!(
+                        "OpenSea NFT expansion failed ({opensea_err}); Alchemy NFT expansion failed ({alchemy_err})"
+                    ))),
+                }
+            }
         }
     }
 
@@ -427,23 +439,42 @@ impl AnalyzeApi for RealApi {
 
     async fn fetch_contract_owners(
         &self,
+        chain: &str,
         alchemy_api_key: &str,
         alchemy_network: Option<&str>,
         contract_address: &str,
     ) -> Result<Vec<OwnerBalance>, AppError> {
-        let endpoints = self.endpoints("ethereum", alchemy_network, alchemy_api_key);
+        let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
         fetch_contract_owners(&self.client, &endpoints, contract_address).await
     }
 
     async fn fetch_contract_sales(
         &self,
+        chain: &str,
         alchemy_api_key: &str,
         alchemy_network: Option<&str>,
         contract_address: &str,
         opensea_api_key: &str,
     ) -> Result<Vec<NftSaleRecord>, AppError> {
-        let endpoints = self.endpoints("ethereum", alchemy_network, alchemy_api_key);
-        fetch_contract_sales(&self.client, &endpoints, contract_address, opensea_api_key).await
+        let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
+        let eth_usd_rate = match crate::currency::fetch_current_eth_usd_rate(&self.client).await {
+            Ok(rate) => Some(rate),
+            Err(err) => {
+                eprintln!(
+                    "warning: failed to fetch current ETH/USD rate for {contract_address}: {err}; ETH/WETH sales will not be USD-normalized"
+                );
+                None
+            }
+        };
+        fetch_contract_sales(
+            &self.client,
+            &endpoints,
+            chain,
+            contract_address,
+            opensea_api_key,
+            eth_usd_rate,
+        )
+        .await
     }
 
     async fn fetch_transaction_receipt(
@@ -789,6 +820,7 @@ async fn analyze_duplicate_contract(
             let sales = deps
                 .api
                 .fetch_contract_sales(
+                    &request.chain,
                     &request.alchemy_api_key,
                     request.alchemy_network.as_deref(),
                     contract_address,
@@ -815,11 +847,13 @@ async fn analyze_duplicate_contract(
                     token_type,
                 ),
                 deps.api.fetch_contract_owners(
+                    &request.chain,
                     &request.alchemy_api_key,
                     request.alchemy_network.as_deref(),
                     contract_address,
                 ),
                 deps.api.fetch_contract_sales(
+                    &request.chain,
                     &request.alchemy_api_key,
                     request.alchemy_network.as_deref(),
                     contract_address,
@@ -1186,18 +1220,41 @@ fn calculate_sale_eth_metrics(
     }
     let buy_before_eth_balance = base_balance_eth + same_block_delta;
     let mut buy_total_eth_out = sale.price_eth.unwrap_or(0.0);
+    let eth_usd_rate = sale.price_eth.and_then(|price_eth| {
+        sale.price_usd
+            .filter(|price_usd| price_eth > 0.0 && *price_usd > 0.0)
+            .map(|price_usd| price_usd / price_eth)
+    });
+    let buy_before_usd_balance = eth_usd_rate.map(|rate| buy_before_eth_balance * rate);
+    let mut buy_total_usd_out = sale.price_usd;
     if purchase_receipt.from_address == sale.buyer_address {
-        buy_total_eth_out += (purchase_receipt.gas_used as f64
+        let gas_eth = (purchase_receipt.gas_used as f64
             * purchase_receipt.effective_gas_price_wei as f64)
             / 1_000_000_000_000_000_000_f64;
+        buy_total_eth_out += gas_eth;
+        if let (Some(total_usd), Some(rate)) = (buy_total_usd_out, eth_usd_rate) {
+            buy_total_usd_out = Some(total_usd + gas_eth * rate);
+        }
     }
+    let (ratio_denominator, ratio_numerator, ratio_with_gas_numerator) =
+        if let (Some(before_usd), Some(price_usd), Some(total_usd)) =
+            (buy_before_usd_balance, sale.price_usd, buy_total_usd_out)
+        {
+            (before_usd, price_usd, total_usd)
+        } else {
+            (
+                buy_before_eth_balance,
+                sale.price_eth.unwrap_or(0.0),
+                buy_total_eth_out,
+            )
+        };
     address_records::SaleMetricRecord {
         buy_before_eth_balance: Some(buy_before_eth_balance),
-        buy_asset_ratio: (buy_before_eth_balance > 0.0)
-            .then(|| sale.price_eth.unwrap_or(0.0) / buy_before_eth_balance),
-        buy_asset_ratio_with_gas: (buy_before_eth_balance > 0.0)
-            .then(|| buy_total_eth_out / buy_before_eth_balance),
-        ratio_status: if buy_before_eth_balance > 0.0 {
+        buy_before_usd_balance,
+        buy_asset_ratio: (ratio_denominator > 0.0).then(|| ratio_numerator / ratio_denominator),
+        buy_asset_ratio_with_gas: (ratio_denominator > 0.0)
+            .then(|| ratio_with_gas_numerator / ratio_denominator),
+        ratio_status: if ratio_denominator > 0.0 {
             "ok".into()
         } else {
             "unavailable".into()
@@ -1670,10 +1727,19 @@ fn build_report_summary(
         .iter()
         .map(|item| item.buy_amount_eth)
         .sum::<f64>();
+    let honest_purchase_total_usd = victim_addresses
+        .iter()
+        .map(|item| item.buy_amount_usd)
+        .sum::<f64>();
     let stuck_cost_eth = victim_addresses
         .iter()
         .filter(|item| item.is_stuck)
         .map(|item| item.last_buy_amount_eth.unwrap_or(0.0))
+        .sum::<f64>();
+    let stuck_cost_usd = victim_addresses
+        .iter()
+        .filter(|item| item.is_stuck)
+        .map(|item| item.last_buy_amount_usd.unwrap_or(0.0))
         .sum::<f64>();
     let buy_ratio_values: Vec<f64> = victim_addresses
         .iter()
@@ -1722,8 +1788,12 @@ fn build_report_summary(
         candidate_open_license_token_count: candidate_open_license_tokens.len() as i64,
         candidate_open_license_contract_count,
         honest_purchase_total_eth,
+        honest_purchase_total_usd,
         stuck_cost_eth,
-        stuck_cost_ratio: if honest_purchase_total_eth > 0.0 {
+        stuck_cost_usd,
+        stuck_cost_ratio: if honest_purchase_total_usd > 0.0 {
+            Some(stuck_cost_usd / honest_purchase_total_usd)
+        } else if honest_purchase_total_eth > 0.0 {
             Some(stuck_cost_eth / honest_purchase_total_eth)
         } else {
             None
@@ -1806,9 +1876,17 @@ fn build_batch_report_summary(seed_reports: &[BatchSeedAggregate]) -> BatchRepor
         .iter()
         .map(|item| item.report.report_summary.honest_purchase_total_eth)
         .sum();
+    let honest_purchase_total_usd_total: f64 = seed_reports
+        .iter()
+        .map(|item| item.report.report_summary.honest_purchase_total_usd)
+        .sum();
     let stuck_cost_eth_total: f64 = seed_reports
         .iter()
         .map(|item| item.report.report_summary.stuck_cost_eth)
+        .sum();
+    let stuck_cost_usd_total: f64 = seed_reports
+        .iter()
+        .map(|item| item.report.report_summary.stuck_cost_usd)
         .sum();
     let buy_asset_ratio_known_address_count_total: i64 = seed_reports
         .iter()
@@ -1893,8 +1971,12 @@ fn build_batch_report_summary(seed_reports: &[BatchSeedAggregate]) -> BatchRepor
             .map(|item| item.report.report_summary.legit_duplicate_contract_count)
             .sum(),
         honest_purchase_total_eth_total,
+        honest_purchase_total_usd_total,
         stuck_cost_eth_total,
-        stuck_cost_ratio_overall: if honest_purchase_total_eth_total > 0.0 {
+        stuck_cost_usd_total,
+        stuck_cost_ratio_overall: if honest_purchase_total_usd_total > 0.0 {
+            Some(stuck_cost_usd_total / honest_purchase_total_usd_total)
+        } else if honest_purchase_total_eth_total > 0.0 {
             Some(stuck_cost_eth_total / honest_purchase_total_eth_total)
         } else {
             None
@@ -1960,6 +2042,17 @@ fn build_batch_seed_aggregate(payload: SingleReportPayload) -> BatchSeedAggregat
         .filter(|item| item.is_stuck)
         .map(|item| item.last_buy_amount_eth.unwrap_or(0.0))
         .sum::<f64>();
+    let payload_stuck_cost_usd = payload
+        .victim_addresses
+        .iter()
+        .filter(|item| item.is_stuck)
+        .map(|item| item.last_buy_amount_usd.unwrap_or(0.0))
+        .sum::<f64>();
+    let payload_honest_purchase_total_usd = payload
+        .victim_addresses
+        .iter()
+        .map(|item| item.buy_amount_usd)
+        .sum::<f64>();
     let mut report_summary = payload.report_summary.clone();
     if report_summary.infringing_nft_count == 0 {
         report_summary.infringing_nft_count = payload.infringing_tokens.len() as i64;
@@ -1979,7 +2072,15 @@ fn build_batch_seed_aggregate(payload: SingleReportPayload) -> BatchSeedAggregat
     if report_summary.stuck_cost_eth == 0.0 {
         report_summary.stuck_cost_eth = payload_stuck_cost_eth;
     }
-    report_summary.stuck_cost_ratio = if report_summary.honest_purchase_total_eth > 0.0 {
+    if report_summary.honest_purchase_total_usd == 0.0 {
+        report_summary.honest_purchase_total_usd = payload_honest_purchase_total_usd;
+    }
+    if report_summary.stuck_cost_usd == 0.0 {
+        report_summary.stuck_cost_usd = payload_stuck_cost_usd;
+    }
+    report_summary.stuck_cost_ratio = if report_summary.honest_purchase_total_usd > 0.0 {
+        Some(report_summary.stuck_cost_usd / report_summary.honest_purchase_total_usd)
+    } else if report_summary.honest_purchase_total_eth > 0.0 {
         Some(report_summary.stuck_cost_eth / report_summary.honest_purchase_total_eth)
     } else {
         None
@@ -2092,8 +2193,16 @@ fn build_minimal_cached_batch_seed_aggregate(raw: &serde_json::Value) -> BatchSe
                     .and_then(|value| value.get("honest_purchase_total_eth"))
                     .and_then(|value| value.as_f64())
                     .unwrap_or_default(),
+                honest_purchase_total_usd: report_summary_raw
+                    .and_then(|value| value.get("honest_purchase_total_usd"))
+                    .and_then(|value| value.as_f64())
+                    .unwrap_or_default(),
                 stuck_cost_eth: report_summary_raw
                     .and_then(|value| value.get("stuck_cost_eth"))
+                    .and_then(|value| value.as_f64())
+                    .unwrap_or_default(),
+                stuck_cost_usd: report_summary_raw
+                    .and_then(|value| value.get("stuck_cost_usd"))
                     .and_then(|value| value.as_f64())
                     .unwrap_or_default(),
                 stuck_cost_ratio: report_summary_raw

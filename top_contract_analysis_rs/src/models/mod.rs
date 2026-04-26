@@ -113,9 +113,17 @@ pub struct NftSaleRecord {
     pub payment_token_symbol: String,
     pub payment_token_address: String,
     pub price_eth: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_usd: Option<f64>,
     pub seller_fee_eth: f64,
+    #[serde(default)]
+    pub seller_fee_usd: f64,
     pub protocol_fee_eth: f64,
+    #[serde(default)]
+    pub protocol_fee_usd: f64,
     pub royalty_fee_eth: f64,
+    #[serde(default)]
+    pub royalty_fee_usd: f64,
     pub source: String,
     pub is_native_eth: bool,
 }
@@ -229,7 +237,11 @@ pub struct ReportSummary {
     pub candidate_open_license_token_count: i64,
     pub candidate_open_license_contract_count: i64,
     pub honest_purchase_total_eth: f64,
+    #[serde(default)]
+    pub honest_purchase_total_usd: f64,
     pub stuck_cost_eth: f64,
+    #[serde(default)]
+    pub stuck_cost_usd: f64,
     pub stuck_cost_ratio: Option<f64>,
     pub buy_asset_ratio_known_address_count: i64,
     pub ratio_over_60_address_count: i64,
@@ -311,8 +323,14 @@ pub struct VictimAddressPayload {
     pub address: String,
     pub buy_tx_hashes: Vec<String>,
     pub buy_amount_eth: f64,
+    #[serde(default)]
+    pub buy_amount_usd: f64,
     pub last_buy_amount_eth: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_buy_amount_usd: Option<f64>,
     pub buy_before_eth_balance: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buy_before_usd_balance: Option<f64>,
     pub buy_asset_ratio: Option<f64>,
     pub buy_asset_ratio_with_gas: Option<f64>,
     pub is_stuck: bool,
@@ -329,6 +347,10 @@ fn default_ratio_status() -> String {
 pub struct FraudTradeStatsPayload {
     pub unique_buyers: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usd_priced_sale_count: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usd_priced_volume: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eth_priced_sale_count: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eth_priced_volume: Option<f64>,
@@ -338,6 +360,8 @@ pub struct FraudTradeStatsPayload {
     pub native_eth_volume: Option<f64>,
     pub stuck_wallet_count: i64,
     pub stuck_cost_eth: f64,
+    #[serde(default)]
+    pub stuck_cost_usd: f64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -395,7 +419,11 @@ pub struct BatchReportSummary {
     pub repeat_infringing_address_count_global: i64,
     pub legit_duplicate_contract_count_total: i64,
     pub honest_purchase_total_eth_total: f64,
+    #[serde(default)]
+    pub honest_purchase_total_usd_total: f64,
     pub stuck_cost_eth_total: f64,
+    #[serde(default)]
+    pub stuck_cost_usd_total: f64,
     pub stuck_cost_ratio_overall: Option<f64>,
     pub buy_asset_ratio_known_address_count_total: i64,
     pub ratio_over_60_address_count_total: i64,

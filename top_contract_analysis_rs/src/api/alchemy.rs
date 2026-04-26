@@ -34,6 +34,24 @@ fn normalize_token_id(raw: Option<&Value>) -> String {
     }
 }
 
+fn transfer_token_ids(item: &Value) -> Vec<String> {
+    let mut token_ids = Vec::new();
+    if let Some(metadata) = item.get("erc1155Metadata").and_then(Value::as_array) {
+        for token in metadata {
+            let token_id = normalize_token_id(token.get("tokenId"));
+            if !token_id.is_empty() {
+                token_ids.push(token_id);
+            }
+        }
+    }
+    if token_ids.is_empty() {
+        token_ids.push(normalize_token_id(
+            item.get("erc721TokenId").or_else(|| item.get("tokenId")),
+        ));
+    }
+    token_ids
+}
+
 fn parse_block_timestamp(value: Option<&Value>) -> i64 {
     let Some(value) = value else {
         return 0;
@@ -110,7 +128,7 @@ pub async fn fetch_seed_contract_nfts(
             .append_pair("contractAddress", contract_address)
             .append_pair("withMetadata", "true");
         if let Some(page_key) = page_key.as_deref() {
-            url.query_pairs_mut().append_pair("pageKey", page_key);
+            url.query_pairs_mut().append_pair("startToken", page_key);
         }
         let payload: Value = client.get_json(url.as_str()).await?;
         for raw in payload
@@ -345,53 +363,48 @@ pub async fn fetch_alchemy_contract_transfers(
                 };
                 block_time = cached;
             }
-            transfers.push(TransferRecord {
-                contract_address: item
-                    .get("rawContract")
-                    .and_then(|value| value.get("address"))
-                    .and_then(Value::as_str)
-                    .unwrap_or(contract_address)
-                    .to_lowercase(),
-                token_id: normalize_token_id(
-                    item.get("erc721TokenId").or_else(|| item.get("tokenId")),
-                ),
-                tx_hash: item
-                    .get("hash")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                log_index: item.get("logIndex").and_then(Value::as_i64).unwrap_or(0),
-                block_number: if let Some(text) = item.get("blockNum").and_then(Value::as_str) {
-                    if text.starts_with("0x") || text.starts_with("0X") {
-                        i64::from_str_radix(
-                            text.trim_start_matches("0x").trim_start_matches("0X"),
-                            16,
-                        )
-                        .unwrap_or(0)
-                    } else {
-                        text.parse::<i64>().unwrap_or(0)
-                    }
-                } else {
-                    0
-                },
-                block_time,
-                from_address: item
-                    .get("from")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_lowercase(),
-                to_address: item
-                    .get("to")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_lowercase(),
-                event_type: item
-                    .get("category")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                source: "alchemy".to_string(),
-            });
+            let contract_address = item
+                .get("rawContract")
+                .and_then(|value| value.get("address"))
+                .and_then(Value::as_str)
+                .unwrap_or(contract_address)
+                .to_lowercase();
+            let tx_hash = item
+                .get("hash")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let log_index = parse_hex_or_decimal_i64(item.get("logIndex"));
+            let block_number = parse_hex_or_decimal_i64(item.get("blockNum"));
+            let from_address = item
+                .get("from")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_lowercase();
+            let to_address = item
+                .get("to")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_lowercase();
+            let event_type = item
+                .get("category")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            for token_id in transfer_token_ids(item) {
+                transfers.push(TransferRecord {
+                    contract_address: contract_address.clone(),
+                    token_id,
+                    tx_hash: tx_hash.clone(),
+                    log_index,
+                    block_number,
+                    block_time,
+                    from_address: from_address.clone(),
+                    to_address: to_address.clone(),
+                    event_type: event_type.clone(),
+                    source: "alchemy".to_string(),
+                });
+            }
         }
         page_key = advance_page_key(
             &mut seen_page_keys,
@@ -471,11 +484,7 @@ pub async fn fetch_contract_owners(
             {
                 token_balances.insert(
                     normalize_token_id(balance.get("tokenId")),
-                    balance
-                        .get("balance")
-                        .and_then(Value::as_str)
-                        .and_then(|value| value.parse::<i64>().ok())
-                        .unwrap_or(0),
+                    parse_hex_or_decimal_i64(balance.get("balance")),
                 );
             }
             owners.push(OwnerBalance {

@@ -96,7 +96,7 @@ cargo run --release -- analyze \
 - `--metadata-threshold 0.6`
 - `--timeout 60`
 - `--max-tokens-per-contract 500`
-- `--max-recall-rows 100000`
+- `--max-recall-rows 100000`：单批 SQL recall 读取行数；`0` 表示单次读取全部。非 `0` 时会分批读取完整 recall 结果。
 - `--api-max-concurrency 12`
 - `--contract-max-concurrency 4`
 - `--sale-metric-max-concurrency 4`
@@ -149,7 +149,7 @@ cargo run --release -- batch \
 - `--sale-metric-max-concurrency 4`
 - `--duckdb-threads 0`
 - `--duckdb-memory-limit 80GB`
-- `--max-recall-rows 100000`
+- `--max-recall-rows 100000`：单批 SQL recall 读取行数；`0` 表示单次读取全部。非 `0` 时会分批读取完整 recall 结果，不作为总量截断。
 - `--max-tokens-per-contract 500`
 
 ## 典型使用流程

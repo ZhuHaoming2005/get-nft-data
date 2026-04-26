@@ -401,7 +401,7 @@ fn feature_store_recalls_short_metadata_terms() {
 }
 
 #[test]
-fn feature_store_applies_total_recall_limit_after_sql_recall() {
+fn feature_store_uses_max_recall_rows_as_batch_size_after_sql_recall() {
     let store = DuckDbFeatureStore::new(":memory:").unwrap();
     store
         .replace_chain_rows(
@@ -444,8 +444,12 @@ fn feature_store_applies_total_recall_limit_after_sql_recall() {
         )
         .unwrap();
 
-    assert_eq!(snapshot.nft_rows.len(), 1);
-    assert_eq!(snapshot.nft_rows[0].contract_address, "0xone");
+    let contracts: Vec<_> = snapshot
+        .nft_rows
+        .iter()
+        .map(|row| row.contract_address.as_str())
+        .collect();
+    assert_eq!(contracts, vec!["0xone", "0xtwo"]);
 }
 
 #[test]

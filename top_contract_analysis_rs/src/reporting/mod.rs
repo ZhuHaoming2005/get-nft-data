@@ -39,6 +39,14 @@ fn format_python_optional_scalar(value: Option<f64>) -> String {
         .unwrap_or_else(|| "None".into())
 }
 
+fn usd_or_legacy(usd: f64, legacy_eth: f64) -> f64 {
+    if usd > 0.0 {
+        usd
+    } else {
+        legacy_eth
+    }
+}
+
 pub fn default_output_basename(payload: &SingleReportPayload) -> String {
     let seed_name = if payload.seed_contract.name.trim().is_empty() {
         let contract_address = payload.seed_contract.contract_address.trim();
@@ -160,12 +168,15 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
             summary.candidate_open_license_contract_count
         ),
         format!(
-            "- 诚实地址购买总金额(ETH/WETH): {}",
-            summary.honest_purchase_total_eth
+            "- 诚实地址购买总金额(USD): {}",
+            usd_or_legacy(
+                summary.honest_purchase_total_usd,
+                summary.honest_purchase_total_eth
+            )
         ),
         format!(
-            "- 套牢资金(ETH/WETH): {} / {}",
-            summary.stuck_cost_eth,
+            "- 套牢资金(USD): {} / {}",
+            usd_or_legacy(summary.stuck_cost_usd, summary.stuck_cost_eth),
             format_ratio(summary.stuck_cost_ratio)
         ),
         format!(
@@ -338,12 +349,12 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
     } else {
         for item in &payload.victim_addresses {
             lines.push(format!(
-                "- {}: buy_tx_count={} | 买入金额(ETH/WETH)={} | 最后一次买入金额(ETH/WETH)={} | 买入前 ETH 余额: {} | 买入占比={} | 套牢={} | last_buy_tx={}",
+                "- {}: buy_tx_count={} | 买入金额(USD)={} | 最后一次买入金额(USD)={} | 买入前钱包余额(USD): {} | 买入占比={} | 套牢={} | last_buy_tx={}",
                 item.address,
                 item.buy_tx_hashes.len(),
-                item.buy_amount_eth,
-                format_python_optional_scalar(item.last_buy_amount_eth),
-                format_python_optional_scalar(item.buy_before_eth_balance),
+                usd_or_legacy(item.buy_amount_usd, item.buy_amount_eth),
+                format_python_optional_scalar(item.last_buy_amount_usd.or(item.last_buy_amount_eth)),
+                format_python_optional_scalar(item.buy_before_usd_balance.or(item.buy_before_eth_balance)),
                 format_ratio(item.buy_asset_ratio),
                 if item.is_stuck { "是" } else { "否" },
                 if item.last_buy_tx_hash.is_empty() {
@@ -361,21 +372,23 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
     } else {
         for (contract, stats) in &payload.fraud_trade_stats {
             let sale_count = stats
-                .eth_priced_sale_count
+                .usd_priced_sale_count
+                .or(stats.eth_priced_sale_count)
                 .or(stats.native_eth_sale_count)
                 .unwrap_or_default();
             let sale_volume = stats
-                .eth_priced_volume
+                .usd_priced_volume
+                .or(stats.eth_priced_volume)
                 .or(stats.native_eth_volume)
                 .unwrap_or_default();
             lines.push(format!(
-                "- {}: unique_buyers={} | eth_priced_sale_count={} | eth_priced_volume={} | stuck_wallet_count={} | stuck_cost_eth={}",
+                "- {}: unique_buyers={} | usd_priced_sale_count={} | usd_priced_volume={} | stuck_wallet_count={} | stuck_cost_usd={}",
                 contract,
                 stats.unique_buyers,
                 sale_count,
                 sale_volume,
                 stats.stuck_wallet_count,
-                stats.stuck_cost_eth
+                usd_or_legacy(stats.stuck_cost_usd, stats.stuck_cost_eth)
             ));
         }
     }
@@ -427,12 +440,15 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
             summary.legit_duplicate_contract_count_total
         ),
         format!(
-            "- 诚实地址购买总金额(ETH/WETH)汇总: {}",
-            summary.honest_purchase_total_eth_total
+            "- 诚实地址购买总金额(USD)汇总: {}",
+            usd_or_legacy(
+                summary.honest_purchase_total_usd_total,
+                summary.honest_purchase_total_eth_total
+            )
         ),
         format!(
-            "- 套牢资金(ETH/WETH)汇总: {} / {}",
-            summary.stuck_cost_eth_total,
+            "- 套牢资金(USD)汇总: {} / {}",
+            usd_or_legacy(summary.stuck_cost_usd_total, summary.stuck_cost_eth_total),
             format_ratio(summary.stuck_cost_ratio_overall)
         ),
         format!(
@@ -501,7 +517,7 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
             };
 
             lines.push(format!(
-                "- {} ({}) | 重复合约={} | 侵权NFT={} | 恶意地址={} | 诚实地址={} | 多次侵权地址={} | 官方参与={} | 诚实购买额={} | 套牢资金={}/{} | >60%={}/{} | 套牢={}/{} | 被腐化={} | 诚实购买时长={}秒 | 传播中位数={}秒 | 首次转手中位数={}秒 | JSON={} | MD={}",
+                "- {} ({}) | 重复合约={} | 侵权NFT={} | 恶意地址={} | 诚实地址={} | 多次侵权地址={} | 官方参与={} | 诚实购买额(USD)={} | 套牢资金(USD)={}/{} | >60%={}/{} | 套牢={}/{} | 被腐化={} | 诚实购买时长={}秒 | 传播中位数={}秒 | 首次转手中位数={}秒 | JSON={} | MD={}",
                 seed_name,
                 seed.contract_address,
                 report_summary.candidate_contract_count,
@@ -510,8 +526,11 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
                 report_summary.honest_address_count,
                 report_summary.repeat_infringing_address_count,
                 report_summary.legit_duplicate_contract_count,
-                report_summary.honest_purchase_total_eth,
-                report_summary.stuck_cost_eth,
+                usd_or_legacy(
+                    report_summary.honest_purchase_total_usd,
+                    report_summary.honest_purchase_total_eth
+                ),
+                usd_or_legacy(report_summary.stuck_cost_usd, report_summary.stuck_cost_eth),
                 format_ratio(report_summary.stuck_cost_ratio),
                 report_summary.ratio_over_60_address_count,
                 format_ratio(report_summary.ratio_over_60_address_ratio),

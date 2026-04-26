@@ -112,6 +112,7 @@ impl AnalyzeApi for FakeBatchApi {
 
     async fn fetch_contract_owners(
         &self,
+        _chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
         _contract_address: &str,
@@ -121,6 +122,7 @@ impl AnalyzeApi for FakeBatchApi {
 
     async fn fetch_contract_sales(
         &self,
+        _chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
         _contract_address: &str,
@@ -224,7 +226,9 @@ fn batch_markdown_preserves_reference_summary_and_output_index_lines() {
             repeat_infringing_address_count_global: 2,
             legit_duplicate_contract_count_total: 1,
             honest_purchase_total_eth_total: 12.5,
+            honest_purchase_total_usd_total: 12.5,
             stuck_cost_eth_total: 5.0,
+            stuck_cost_usd_total: 5.0,
             stuck_cost_ratio_overall: Some(0.4),
             buy_asset_ratio_known_address_count_total: 8,
             ratio_over_60_address_count_total: 3,
@@ -255,7 +259,9 @@ fn batch_markdown_preserves_reference_summary_and_output_index_lines() {
                 repeat_infringing_address_count: 1,
                 legit_duplicate_contract_count: 1,
                 honest_purchase_total_eth: 7.5,
+                honest_purchase_total_usd: 7.5,
                 stuck_cost_eth: 2.5,
+                stuck_cost_usd: 2.5,
                 stuck_cost_ratio: Some(1.0 / 3.0),
                 ratio_over_60_address_count: 2,
                 ratio_over_60_address_ratio: Some(0.5),
@@ -279,13 +285,13 @@ fn batch_markdown_preserves_reference_summary_and_output_index_lines() {
     assert!(markdown.contains("# Top NFT 合约批量分析总报告"));
     assert!(markdown.contains("- 检测到开放许可的 seed 数: 1"));
     assert!(markdown.contains("- 恶意地址总数: 7"));
-    assert!(markdown.contains("- 诚实地址购买总金额(ETH/WETH)汇总: 12.5"));
-    assert!(markdown.contains("- 套牢资金(ETH/WETH)汇总: 5 / 40.00%"));
+    assert!(markdown.contains("- 诚实地址购买总金额(USD)汇总: 12.5"));
+    assert!(markdown.contains("- 套牢资金(USD)汇总: 5 / 40.00%"));
     assert!(markdown.contains("- 买入金额占钱包总额 >60% 的地址数/总体占比: 3 / 37.50%"));
     assert!(markdown.contains("- 生成时间(UTC): 2026-04-17T00:00:00+00:00"));
     assert!(markdown.contains("## Seed 报告索引"));
     assert!(markdown.contains(
-        "- Azuki (0xseed) | 重复合约=5 | 侵权NFT=4 | 恶意地址=5 | 诚实地址=6 | 多次侵权地址=1 | 官方参与=1 | 诚实购买额=7.5 | 套牢资金=2.5/33.33% | >60%=2/50.00% | 套牢=1/25.00% | 被腐化=1 | 诚实购买时长=10秒 | 传播中位数=9秒 | 首次转手中位数=8秒 | JSON=result/top_contract_analysis__azuki.json | MD=result/top_contract_analysis__azuki.md"
+        "- Azuki (0xseed) | 重复合约=5 | 侵权NFT=4 | 恶意地址=5 | 诚实地址=6 | 多次侵权地址=1 | 官方参与=1 | 诚实购买额(USD)=7.5 | 套牢资金(USD)=2.5/33.33% | >60%=2/50.00% | 套牢=1/25.00% | 被腐化=1 | 诚实购买时长=10秒 | 传播中位数=9秒 | 首次转手中位数=8秒 | JSON=result/top_contract_analysis__azuki.json | MD=result/top_contract_analysis__azuki.md"
     ));
 }
 
@@ -371,6 +377,7 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
         ReportSummary {
             candidate_contract_count: 2,
             honest_purchase_total_eth: 10.0,
+            honest_purchase_total_usd: 10.0,
             buy_asset_ratio_known_address_count: 2,
             ratio_over_60_address_count: 1,
             ratio_over_80_address_count: 0,
@@ -414,12 +421,14 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
             VictimAddressPayload {
                 address: "0xv1".into(),
                 last_buy_amount_eth: Some(2.0),
+                last_buy_amount_usd: Some(2.0),
                 is_stuck: true,
                 ..VictimAddressPayload::default()
             },
             VictimAddressPayload {
                 address: "0xv2".into(),
                 last_buy_amount_eth: Some(4.0),
+                last_buy_amount_usd: Some(4.0),
                 is_stuck: false,
                 ..VictimAddressPayload::default()
             },
@@ -462,6 +471,7 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
         ReportSummary {
             candidate_contract_count: 3,
             honest_purchase_total_eth: 5.0,
+            honest_purchase_total_usd: 5.0,
             buy_asset_ratio_known_address_count: 3,
             ratio_over_60_address_count: 2,
             ratio_over_80_address_count: 1,
@@ -501,6 +511,7 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
         vec![VictimAddressPayload {
             address: "0xv3".into(),
             last_buy_amount_eth: Some(1.0),
+            last_buy_amount_usd: Some(1.0),
             is_stuck: true,
             ..VictimAddressPayload::default()
         }],
@@ -764,6 +775,7 @@ impl AnalyzeApi for SlowBatchApi {
 
     async fn fetch_contract_owners(
         &self,
+        _chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
         _contract_address: &str,
@@ -773,6 +785,7 @@ impl AnalyzeApi for SlowBatchApi {
 
     async fn fetch_contract_sales(
         &self,
+        _chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
         _contract_address: &str,

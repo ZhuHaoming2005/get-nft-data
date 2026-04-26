@@ -149,6 +149,45 @@ mod tests {
         assert!(by_contract["0ximage"].metadata_recall_checked);
         assert!(!by_contract["0ximage"].metadata_recall_match);
     }
+
+    #[test]
+    fn load_snapshot_uses_max_recall_rows_as_batch_size_not_total_limit() {
+        let store = DuckDbFeatureStore::new(":memory:").unwrap();
+        store
+            .replace_chain_rows(
+                "ethereum",
+                &[
+                    DatabaseNftRecord {
+                        contract_address: "0xcandidate_a".into(),
+                        token_id: "1".into(),
+                        token_uri: "ipfs://shared/1".into(),
+                        ..Default::default()
+                    },
+                    DatabaseNftRecord {
+                        contract_address: "0xcandidate_b".into(),
+                        token_id: "1".into(),
+                        token_uri: "ipfs://shared/1".into(),
+                        ..Default::default()
+                    },
+                ],
+            )
+            .unwrap();
+        let seed_nfts = vec![SeedNft {
+            contract_address: "0xseed".into(),
+            token_id: "1".into(),
+            token_uri: "ipfs://shared/1".into(),
+            ..Default::default()
+        }];
+
+        let snapshot = store.load_snapshot("ethereum", &seed_nfts, 0, 1).unwrap();
+        let contracts: Vec<_> = snapshot
+            .nft_rows
+            .iter()
+            .map(|row| row.contract_address.as_str())
+            .collect();
+
+        assert_eq!(contracts, vec!["0xcandidate_a", "0xcandidate_b"]);
+    }
 }
 
 impl DuckDbResourceOptions {
@@ -541,12 +580,7 @@ impl DuckDbFeatureStore {
         } else {
             String::new()
         };
-        let total_limit = if max_recall_rows > 0 {
-            format!("LIMIT {max_recall_rows}")
-        } else {
-            String::new()
-        };
-        let select_sql = format!(
+        let base_select_sql = format!(
             "
             SELECT contract_address, token_id, token_uri, image_uri, name, symbol, metadata_json, metadata_doc,
                    token_uri_norm, image_uri_norm, name_norm, metadata_recall_match
@@ -561,112 +595,111 @@ impl DuckDbFeatureStore {
             )
             {per_contract_filter}
             ORDER BY contract_address, token_id
-            {total_limit}
             "
         );
 
-        let mut stmt = self.conn.prepare(&select_sql)?;
-
-        let rows = stmt.query_map(params![chain], |row| {
-            Ok((
-                DatabaseNftRecord {
-                    contract_address: row.get::<_, String>(0)?,
-                    token_id: row.get::<_, String>(1)?,
-                    token_uri: row.get::<_, String>(2)?,
-                    image_uri: row.get::<_, String>(3)?,
-                    name: row.get::<_, String>(4)?,
-                    symbol: row.get::<_, String>(5)?,
-                    metadata_json: row.get::<_, String>(6)?,
-                    metadata_doc: row.get::<_, String>(7)?,
-                    metadata_recall_checked: false,
-                    metadata_recall_match: false,
-                },
-                row.get::<_, String>(8)?,
-                row.get::<_, String>(9)?,
-                row.get::<_, String>(10)?,
-                row.get::<_, bool>(11)?,
-            ))
-        })?;
-
-        let mut selected_rows = Vec::new();
         let mut per_contract_counts: HashMap<String, usize> = HashMap::new();
-        for row in rows {
-            let (mut record, token_uri_norm, image_uri_norm, name_norm, metadata_recall_match) =
-                row?;
-            if seed_contracts.contains(&record.contract_address) {
-                continue;
-            }
-
-            let name_prefix = name_norm.chars().take(8).collect::<String>();
-            let matches = exact_token_keys.contains(&token_uri_norm)
-                || exact_image_keys.contains(&image_uri_norm)
-                || (!name_prefix.is_empty() && name_prefixes.contains(&name_prefix))
-                || metadata_recall_match;
-
-            if !matches {
-                continue;
-            }
-            record.metadata_recall_checked = true;
-            record.metadata_recall_match = metadata_recall_match;
-
-            let entry = per_contract_counts
-                .entry(record.contract_address.clone())
-                .or_default();
-            if max_tokens_per_contract > 0 && *entry >= max_tokens_per_contract {
-                continue;
-            }
-            *entry += 1;
-            selected_rows.push((
-                record,
-                token_uri_norm,
-                image_uri_norm,
-                name_norm,
-                metadata_recall_match,
-            ));
-            if max_recall_rows > 0 && selected_rows.len() >= max_recall_rows {
-                break;
-            }
-        }
-
         let mut nft_rows = Vec::new();
         let mut seen_contract_name_pairs: BTreeSet<(String, String)> = BTreeSet::new();
         let mut contract_names = Vec::new();
         let mut contract_signals_raw: BTreeMap<String, ContractSignal> = BTreeMap::new();
-        for (record, token_uri_norm, image_uri_norm, name_norm, metadata_recall_match) in
-            selected_rows
-        {
-            if !name_norm.is_empty()
-                && seen_contract_name_pairs
-                    .insert((record.contract_address.clone(), name_norm.clone()))
-            {
-                contract_names.push(ContractNameRecord {
-                    contract_address: record.contract_address.clone(),
-                    name_norm: name_norm.clone(),
-                });
+        let recall_batch_size = max_recall_rows;
+        let mut offset = 0usize;
+        loop {
+            let select_sql = if recall_batch_size > 0 {
+                format!("{base_select_sql}\nLIMIT {recall_batch_size} OFFSET {offset}")
+            } else {
+                base_select_sql.clone()
+            };
+            let mut stmt = self.conn.prepare(&select_sql)?;
+            let rows = stmt.query_map(params![chain], |row| {
+                Ok((
+                    DatabaseNftRecord {
+                        contract_address: row.get::<_, String>(0)?,
+                        token_id: row.get::<_, String>(1)?,
+                        token_uri: row.get::<_, String>(2)?,
+                        image_uri: row.get::<_, String>(3)?,
+                        name: row.get::<_, String>(4)?,
+                        symbol: row.get::<_, String>(5)?,
+                        metadata_json: row.get::<_, String>(6)?,
+                        metadata_doc: row.get::<_, String>(7)?,
+                        metadata_recall_checked: false,
+                        metadata_recall_match: false,
+                    },
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, bool>(11)?,
+                ))
+            })?;
+
+            let mut fetched_rows = 0usize;
+            for row in rows {
+                fetched_rows += 1;
+                let (mut record, token_uri_norm, image_uri_norm, name_norm, metadata_recall_match) =
+                    row?;
+                if seed_contracts.contains(&record.contract_address) {
+                    continue;
+                }
+
+                let name_prefix = name_norm.chars().take(8).collect::<String>();
+                let matches = exact_token_keys.contains(&token_uri_norm)
+                    || exact_image_keys.contains(&image_uri_norm)
+                    || (!name_prefix.is_empty() && name_prefixes.contains(&name_prefix))
+                    || metadata_recall_match;
+
+                if !matches {
+                    continue;
+                }
+                record.metadata_recall_checked = true;
+                record.metadata_recall_match = metadata_recall_match;
+
+                let entry = per_contract_counts
+                    .entry(record.contract_address.clone())
+                    .or_default();
+                if max_tokens_per_contract > 0 && *entry >= max_tokens_per_contract {
+                    continue;
+                }
+                *entry += 1;
+
+                if !name_norm.is_empty()
+                    && seen_contract_name_pairs
+                        .insert((record.contract_address.clone(), name_norm.clone()))
+                {
+                    contract_names.push(ContractNameRecord {
+                        contract_address: record.contract_address.clone(),
+                        name_norm: name_norm.clone(),
+                    });
+                }
+
+                let signal = contract_signals_raw
+                    .entry(record.contract_address.clone())
+                    .or_insert_with(|| ContractSignal {
+                        contract_address: record.contract_address.clone(),
+                        ..ContractSignal::default()
+                    });
+                signal.token_count += 1;
+                if exact_token_keys.contains(&token_uri_norm) {
+                    signal.uri_match_count += 1;
+                }
+                if exact_image_keys.contains(&image_uri_norm) {
+                    signal.image_match_count += 1;
+                }
+                let name_prefix = name_norm.chars().take(8).collect::<String>();
+                if !name_prefix.is_empty() && name_prefixes.contains(&name_prefix) {
+                    signal.name_prefix_match = true;
+                }
+                if metadata_recall_match {
+                    signal.keyword_match = true;
+                }
+
+                nft_rows.push(record);
             }
 
-            let signal = contract_signals_raw
-                .entry(record.contract_address.clone())
-                .or_insert_with(|| ContractSignal {
-                    contract_address: record.contract_address.clone(),
-                    ..ContractSignal::default()
-                });
-            signal.token_count += 1;
-            if exact_token_keys.contains(&token_uri_norm) {
-                signal.uri_match_count += 1;
+            if recall_batch_size == 0 || fetched_rows < recall_batch_size {
+                break;
             }
-            if exact_image_keys.contains(&image_uri_norm) {
-                signal.image_match_count += 1;
-            }
-            let name_prefix = name_norm.chars().take(8).collect::<String>();
-            if !name_prefix.is_empty() && name_prefixes.contains(&name_prefix) {
-                signal.name_prefix_match = true;
-            }
-            if metadata_recall_match {
-                signal.keyword_match = true;
-            }
-
-            nft_rows.push(record);
+            offset += recall_batch_size;
         }
 
         Ok(DatabaseSnapshot {

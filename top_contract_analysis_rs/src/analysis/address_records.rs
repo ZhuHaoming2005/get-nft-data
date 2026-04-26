@@ -9,6 +9,7 @@ use crate::models::{
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SaleMetricRecord {
     pub buy_before_eth_balance: Option<f64>,
+    pub buy_before_usd_balance: Option<f64>,
     pub buy_asset_ratio: Option<f64>,
     pub buy_asset_ratio_with_gas: Option<f64>,
     pub ratio_status: String,
@@ -72,6 +73,10 @@ fn mean_f64(values: &[f64]) -> Option<f64> {
     } else {
         Some(values.iter().sum::<f64>() / values.len() as f64)
     }
+}
+
+fn sale_usd_value(sale: &NftSaleRecord) -> Option<f64> {
+    sale.price_usd.or(sale.price_eth)
 }
 
 fn build_owner_token_map(owners: &[OwnerBalance]) -> HashMap<String, HashSet<String>> {
@@ -397,12 +402,11 @@ pub(crate) fn build_victim_address_records_from_activity(
                 ..VictimAddressPayload::default()
             });
         entry.buy_tx_hashes.push(sale.tx_hash.clone());
-        if sale.price_eth.is_some()
-            && (sale.is_native_eth
-                || sale.payment_token_symbol.eq_ignore_ascii_case("ETH")
-                || sale.payment_token_symbol.eq_ignore_ascii_case("WETH"))
-        {
+        if sale.price_eth.is_some() {
             entry.buy_amount_eth += sale.price_eth.unwrap_or(0.0);
+        }
+        if let Some(amount_usd) = sale_usd_value(sale) {
+            entry.buy_amount_usd += amount_usd;
         }
         let current_key = (
             sale.block_number,
@@ -418,7 +422,9 @@ pub(crate) fn build_victim_address_records_from_activity(
             last_buy_key.insert(sale.buyer_address.clone(), current_key);
             entry.last_buy_tx_hash = sale.tx_hash.clone();
             entry.last_buy_amount_eth = sale.price_eth;
+            entry.last_buy_amount_usd = sale_usd_value(sale);
             entry.buy_before_eth_balance = metrics.buy_before_eth_balance;
+            entry.buy_before_usd_balance = metrics.buy_before_usd_balance;
             entry.buy_asset_ratio = metrics.buy_asset_ratio;
             entry.buy_asset_ratio_with_gas = metrics.buy_asset_ratio_with_gas;
             entry.ratio_status = if metrics.ratio_status.is_empty() {
@@ -690,12 +696,11 @@ pub fn build_fraud_trade_stats(
         .collect();
     let eth_priced_sales: Vec<&NftSaleRecord> = sales
         .iter()
-        .filter(|sale| {
-            sale.price_eth.is_some()
-                && (sale.is_native_eth
-                    || sale.payment_token_symbol.eq_ignore_ascii_case("ETH")
-                    || sale.payment_token_symbol.eq_ignore_ascii_case("WETH"))
-        })
+        .filter(|sale| sale.price_eth.is_some())
+        .collect();
+    let usd_priced_sales: Vec<&NftSaleRecord> = sales
+        .iter()
+        .filter(|sale| sale_usd_value(sale).is_some())
         .collect();
 
     BTreeMap::from([(
@@ -715,6 +720,13 @@ pub fn build_fraud_trade_stats(
                     .map(|sale| sale.price_eth.unwrap_or(0.0))
                     .sum(),
             ),
+            usd_priced_sale_count: Some(usd_priced_sales.len() as i64),
+            usd_priced_volume: Some(
+                usd_priced_sales
+                    .iter()
+                    .map(|sale| sale_usd_value(sale).unwrap_or(0.0))
+                    .sum(),
+            ),
             eth_priced_sale_count: Some(eth_priced_sales.len() as i64),
             eth_priced_volume: Some(
                 eth_priced_sales
@@ -728,6 +740,67 @@ pub fn build_fraud_trade_stats(
                 .filter(|item| item.is_stuck)
                 .map(|item| item.last_buy_amount_eth.unwrap_or(0.0))
                 .sum(),
+            stuck_cost_usd: victim_addresses
+                .iter()
+                .filter(|item| item.is_stuck)
+                .map(|item| item.last_buy_amount_usd.unwrap_or(0.0))
+                .sum(),
         },
     )])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sale(symbol: &str, amount_eth_equivalent: f64) -> NftSaleRecord {
+        NftSaleRecord {
+            contract_address: "0xdup".into(),
+            token_id: "1".into(),
+            tx_hash: format!("0x{symbol}"),
+            block_number: 10,
+            log_index: 1,
+            buyer_address: format!("0xbuyer{symbol}"),
+            seller_address: "0xseller".into(),
+            payment_token_symbol: symbol.into(),
+            price_eth: Some(amount_eth_equivalent),
+            price_usd: Some(amount_eth_equivalent),
+            is_native_eth: symbol == "ETH",
+            ..NftSaleRecord::default()
+        }
+    }
+
+    #[test]
+    fn fraud_trade_stats_include_weth_and_stablecoin_eth_equivalent_amounts() {
+        let sales = vec![sale("ETH", 1.0), sale("WETH", 2.0), sale("USDC", 0.05)];
+
+        let stats = build_fraud_trade_stats("0xdup", &sales, &[] as &[VictimAddressPayload]);
+        let stats = &stats["0xdup"];
+
+        assert_eq!(stats.native_eth_sale_count, Some(1));
+        assert_eq!(stats.native_eth_volume, Some(1.0));
+        assert_eq!(stats.eth_priced_sale_count, Some(3));
+        assert_eq!(stats.eth_priced_volume, Some(3.05));
+        assert_eq!(stats.usd_priced_sale_count, Some(3));
+        assert_eq!(stats.usd_priced_volume, Some(3.05));
+    }
+
+    #[test]
+    fn victim_records_include_stablecoin_eth_equivalent_amounts() {
+        let sales = vec![sale("USDT", 0.1)];
+        let owners = vec![OwnerBalance {
+            owner_address: "0xbuyerUSDT".into(),
+            token_balances: BTreeMap::from([("1".into(), 1)]),
+        }];
+        let activity = prepare_contract_activity(&[], &sales, &owners);
+
+        let victims = build_victim_address_records_from_activity(&activity, &BTreeMap::new());
+
+        assert_eq!(victims.len(), 1);
+        assert_eq!(victims[0].buy_amount_eth, 0.1);
+        assert_eq!(victims[0].buy_amount_usd, 0.1);
+        assert_eq!(victims[0].last_buy_amount_eth, Some(0.1));
+        assert_eq!(victims[0].last_buy_amount_usd, Some(0.1));
+        assert!(victims[0].is_stuck);
+    }
 }

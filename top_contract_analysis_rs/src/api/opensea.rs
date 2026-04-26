@@ -5,10 +5,9 @@ use std::collections::BTreeSet;
 
 use crate::analysis::scoring::metadata_document_from_json;
 use crate::api::{ApiEndpoints, AsyncApiClient};
+use crate::currency::{is_native_eth_symbol, is_supported_priced_symbol, to_normalized_amount};
 use crate::error::AppError;
 use crate::models::{ContractMetadata, NftSaleRecord, SeedNft};
-
-const ETH_PRICED_SYMBOLS: &[&str] = &["ETH", "WETH"];
 
 fn normalize_token_id(raw: Option<&Value>) -> String {
     let Some(raw) = raw else {
@@ -52,6 +51,65 @@ fn string_field<'a>(value: &'a Value, names: &[&str]) -> &'a str {
         .unwrap_or("")
 }
 
+fn string_or_nested_field<'a>(value: &'a Value, names: &[&str]) -> &'a str {
+    for name in names {
+        if let Some(raw) = value.get(*name) {
+            if let Some(text) = raw.as_str() {
+                return text;
+            }
+            if let Some(text) = raw.get("address").and_then(Value::as_str) {
+                return text;
+            }
+            if let Some(text) = raw.get("hash").and_then(Value::as_str) {
+                return text;
+            }
+        }
+    }
+    ""
+}
+
+fn parse_numeric_text(text: &str) -> Option<f64> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        trimmed.parse::<f64>().ok()
+    }
+}
+
+fn numeric_value(value: Option<&Value>) -> Option<f64> {
+    let value = value?;
+    value
+        .as_f64()
+        .or_else(|| value.as_i64().map(|number| number as f64))
+        .or_else(|| value.as_u64().map(|number| number as f64))
+        .or_else(|| value.as_str().and_then(parse_numeric_text))
+}
+
+fn integer_field(value: &Value, names: &[&str]) -> i64 {
+    names
+        .iter()
+        .find_map(|name| {
+            value.get(*name).and_then(|raw| {
+                raw.as_i64().or_else(|| {
+                    raw.as_str().and_then(|text| {
+                        let trimmed = text.trim();
+                        if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
+                            i64::from_str_radix(
+                                trimmed.trim_start_matches("0x").trim_start_matches("0X"),
+                                16,
+                            )
+                            .ok()
+                        } else {
+                            trimmed.parse::<i64>().ok()
+                        }
+                    })
+                })
+            })
+        })
+        .unwrap_or(0)
+}
+
 fn int_field(value: &Value, names: &[&str]) -> i64 {
     names
         .iter()
@@ -64,7 +122,10 @@ fn int_field(value: &Value, names: &[&str]) -> i64 {
         .unwrap_or(0)
 }
 
-fn decode_fee_eth(payload: Option<&Value>) -> (f64, String, String) {
+fn decode_fee_eth(
+    payload: Option<&Value>,
+    eth_usd_rate: Option<f64>,
+) -> (Option<f64>, Option<f64>, String, String) {
     let payload = payload.unwrap_or(&Value::Null);
     let amount_raw = payload
         .get("amount")
@@ -86,10 +147,31 @@ fn decode_fee_eth(payload: Option<&Value>) -> (f64, String, String) {
     let decimals = payload
         .get("decimals")
         .and_then(Value::as_i64)
+        .or_else(|| {
+            payload
+                .get("decimals")
+                .and_then(Value::as_str)
+                .and_then(|text| text.parse::<i64>().ok())
+        })
         .unwrap_or(18)
         .max(0) as u32;
-    let amount = amount_raw.parse::<f64>().unwrap_or(0.0);
-    (amount / 10f64.powi(decimals as i32), symbol, token_address)
+    let amount = numeric_value(payload.get("amount")).unwrap_or_else(|| {
+        if amount_raw.is_empty() {
+            0.0
+        } else {
+            amount_raw.parse::<f64>().unwrap_or(0.0)
+        }
+    });
+    let token_amount = amount / 10f64.powi(decimals as i32);
+    let normalized = if token_amount == 0.0 && symbol.is_empty() {
+        crate::currency::NormalizedCurrencyAmount {
+            eth: Some(0.0),
+            usd: Some(0.0),
+        }
+    } else {
+        to_normalized_amount(token_amount, &symbol, eth_usd_rate)
+    };
+    (normalized.eth, normalized.usd, symbol, token_address)
 }
 
 pub async fn fetch_alchemy_nft_sales(
@@ -97,6 +179,7 @@ pub async fn fetch_alchemy_nft_sales(
     endpoints: &ApiEndpoints,
     contract_address: &str,
     token_id: Option<&str>,
+    eth_usd_rate: Option<f64>,
 ) -> Result<Vec<NftSaleRecord>, AppError> {
     let mut page_key: Option<String> = None;
     let mut seen_page_keys = BTreeSet::new();
@@ -122,12 +205,12 @@ pub async fn fetch_alchemy_nft_sales(
             .into_iter()
             .flatten()
         {
-            let (seller_fee_eth, fee_symbol, fee_token_address) =
-                decode_fee_eth(item.get("sellerFee"));
-            let (protocol_fee_eth, protocol_symbol, protocol_token_address) =
-                decode_fee_eth(item.get("protocolFee"));
-            let (royalty_fee_eth, royalty_symbol, royalty_token_address) =
-                decode_fee_eth(item.get("royaltyFee"));
+            let (seller_fee_eth, seller_fee_usd, fee_symbol, fee_token_address) =
+                decode_fee_eth(item.get("sellerFee"), eth_usd_rate);
+            let (protocol_fee_eth, protocol_fee_usd, protocol_symbol, protocol_token_address) =
+                decode_fee_eth(item.get("protocolFee"), eth_usd_rate);
+            let (royalty_fee_eth, royalty_fee_usd, royalty_symbol, royalty_token_address) =
+                decode_fee_eth(item.get("royaltyFee"), eth_usd_rate);
             let symbols: std::collections::BTreeSet<String> = [
                 fee_symbol.clone(),
                 protocol_symbol.clone(),
@@ -136,11 +219,30 @@ pub async fn fetch_alchemy_nft_sales(
             .into_iter()
             .filter(|value| !value.is_empty())
             .collect();
-            let native_eth = !symbols.is_empty() && symbols.iter().all(|value| value == "ETH");
+            let native_eth = !symbols.is_empty()
+                && symbols
+                    .iter()
+                    .all(|value| is_native_eth_symbol(value.as_str()));
             let eth_priced = !symbols.is_empty()
                 && symbols
                     .iter()
-                    .all(|value| ETH_PRICED_SYMBOLS.contains(&value.as_str()));
+                    .all(|value| is_supported_priced_symbol(value.as_str()));
+            let price_eth = if eth_priced {
+                seller_fee_eth
+                    .zip(protocol_fee_eth)
+                    .zip(royalty_fee_eth)
+                    .map(|((seller, protocol), royalty)| seller + protocol + royalty)
+            } else {
+                None
+            };
+            let price_usd = if eth_priced {
+                seller_fee_usd
+                    .zip(protocol_fee_usd)
+                    .zip(royalty_fee_usd)
+                    .map(|((seller, protocol), royalty)| seller + protocol + royalty)
+            } else {
+                None
+            };
             rows.push(NftSaleRecord {
                 contract_address: item
                     .get("contractAddress")
@@ -153,18 +255,12 @@ pub async fn fetch_alchemy_nft_sales(
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_lowercase(),
-                block_number: item.get("blockNumber").and_then(Value::as_i64).unwrap_or(0),
-                log_index: item.get("logIndex").and_then(Value::as_i64).unwrap_or(0),
-                bundle_index: item.get("bundleIndex").and_then(Value::as_i64).unwrap_or(0),
-                buyer_address: item
-                    .get("buyerAddress")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
+                block_number: integer_field(item, &["blockNumber", "block_number"]),
+                log_index: integer_field(item, &["logIndex", "log_index"]),
+                bundle_index: integer_field(item, &["bundleIndex", "bundle_index"]),
+                buyer_address: string_or_nested_field(item, &["buyerAddress", "buyer_address"])
                     .to_lowercase(),
-                seller_address: item
-                    .get("sellerAddress")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
+                seller_address: string_or_nested_field(item, &["sellerAddress", "seller_address"])
                     .to_lowercase(),
                 marketplace: item
                     .get("marketplace")
@@ -190,14 +286,14 @@ pub async fn fetch_alchemy_nft_sales(
                 } else {
                     royalty_token_address
                 },
-                price_eth: if eth_priced {
-                    Some(seller_fee_eth + protocol_fee_eth + royalty_fee_eth)
-                } else {
-                    None
-                },
-                seller_fee_eth,
-                protocol_fee_eth,
-                royalty_fee_eth,
+                price_eth,
+                price_usd,
+                seller_fee_eth: seller_fee_eth.unwrap_or(0.0),
+                seller_fee_usd: seller_fee_usd.unwrap_or(0.0),
+                protocol_fee_eth: protocol_fee_eth.unwrap_or(0.0),
+                protocol_fee_usd: protocol_fee_usd.unwrap_or(0.0),
+                royalty_fee_eth: royalty_fee_eth.unwrap_or(0.0),
+                royalty_fee_usd: royalty_fee_usd.unwrap_or(0.0),
                 source: "alchemy".to_string(),
                 is_native_eth: native_eth,
             });
@@ -218,9 +314,11 @@ pub async fn fetch_alchemy_nft_sales(
 pub async fn fetch_opensea_nft_events(
     client: &AsyncApiClient,
     base_url: &str,
+    chain: &str,
     contract_address: &str,
     token_id: Option<&str>,
     opensea_api_key: &str,
+    eth_usd_rate: Option<f64>,
 ) -> Result<Vec<NftSaleRecord>, AppError> {
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
@@ -228,10 +326,11 @@ pub async fn fetch_opensea_nft_events(
         "x-api-key",
         HeaderValue::from_str(opensea_api_key).map_err(|err| AppError::Http(err.to_string()))?,
     );
+    let chain = opensea_chain(chain);
     let url = if let Some(token_id) = token_id.filter(|value| !value.is_empty()) {
-        format!("{base_url}/api/v2/events/chain/ethereum/contract/{contract_address}/nfts/{token_id}?event_type=sale")
+        format!("{base_url}/api/v2/events/chain/{chain}/contract/{contract_address}/nfts/{token_id}?event_type=sale")
     } else {
-        format!("{base_url}/api/v2/events?event_type=sale&asset_contract_address={contract_address}&chain=ethereum")
+        format!("{base_url}/api/v2/events?event_type=sale&asset_contract_address={contract_address}&chain={chain}")
     };
     let payload: Value = client.get_json_with_headers(&url, headers).await?;
     let events = payload
@@ -265,25 +364,34 @@ pub async fn fetch_opensea_nft_events(
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_uppercase();
-        let raw_value = item
-            .get("payment_quantity")
-            .or_else(|| item.get("price"))
-            .or_else(|| item.get("total_price"))
-            .and_then(Value::as_str)
-            .unwrap_or("0");
+        let raw_value = numeric_value(
+            item.get("payment_quantity")
+                .or_else(|| payment.get("quantity"))
+                .or_else(|| item.get("price"))
+                .or_else(|| item.get("total_price")),
+        )
+        .unwrap_or(0.0);
+        let payment_decimals = payment
+            .get("decimals")
+            .and_then(Value::as_i64)
+            .or_else(|| {
+                payment
+                    .get("decimals")
+                    .and_then(Value::as_str)
+                    .and_then(|text| text.parse::<i64>().ok())
+            })
+            .unwrap_or(18)
+            .max(0) as i32;
         let token_id_value = nft
             .get("identifier")
             .or_else(|| nft.get("token_id"))
             .and_then(Value::as_str)
             .unwrap_or_else(|| token_id.unwrap_or(""));
-        let value_eth = if ETH_PRICED_SYMBOLS.contains(&payment_symbol.as_str()) {
-            raw_value
-                .parse::<f64>()
-                .ok()
-                .map(|value| value / 10f64.powi(18))
-        } else {
-            None
-        };
+        let normalized = to_normalized_amount(
+            raw_value / 10f64.powi(payment_decimals),
+            &payment_symbol,
+            eth_usd_rate,
+        );
         rows.push(NftSaleRecord {
             contract_address: nft
                 .get("contract")
@@ -297,39 +405,39 @@ pub async fn fetch_opensea_nft_events(
                 .get("transaction")
                 .or_else(|| item.get("transaction_hash"))
                 .or_else(|| item.get("order_hash"))
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_lowercase(),
-            block_number: item
-                .get("block_number")
-                .and_then(Value::as_i64)
-                .unwrap_or(0),
-            log_index: item
-                .get("event_index")
-                .or_else(|| item.get("log_index"))
-                .and_then(Value::as_i64)
-                .unwrap_or(0),
-            bundle_index: item
-                .get("bundle_index")
-                .and_then(Value::as_i64)
-                .unwrap_or(0),
-            buyer_address: item
-                .get("to_account")
-                .and_then(|value| value.get("address"))
-                .or_else(|| {
-                    item.get("winner_account")
-                        .and_then(|value| value.get("address"))
+                .and_then(|value| {
+                    value
+                        .as_str()
+                        .or_else(|| value.get("hash").and_then(Value::as_str))
                 })
-                .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_lowercase(),
-            seller_address: item
-                .get("from_account")
-                .and_then(|value| value.get("address"))
-                .or_else(|| item.get("seller").and_then(|value| value.get("address")))
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_lowercase(),
+            block_number: integer_field(&item, &["block_number", "blockNumber"]),
+            log_index: integer_field(&item, &["event_index", "log_index", "logIndex"]),
+            bundle_index: integer_field(&item, &["bundle_index", "bundleIndex"]),
+            buyer_address: string_or_nested_field(
+                &item,
+                &[
+                    "to_account",
+                    "winner_account",
+                    "buyer",
+                    "buyer_address",
+                    "buyerAddress",
+                    "taker",
+                ],
+            )
+            .to_lowercase(),
+            seller_address: string_or_nested_field(
+                &item,
+                &[
+                    "from_account",
+                    "seller",
+                    "seller_address",
+                    "sellerAddress",
+                    "maker",
+                ],
+            )
+            .to_lowercase(),
             marketplace: "opensea".to_string(),
             taker: item
                 .get("taker")
@@ -340,15 +448,20 @@ pub async fn fetch_opensea_nft_events(
             payment_token_address: payment
                 .get("address")
                 .or_else(|| payment.get("token_address"))
+                .or_else(|| payment.get("tokenAddress"))
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_lowercase(),
-            price_eth: value_eth,
-            seller_fee_eth: value_eth.unwrap_or(0.0),
+            price_eth: normalized.eth,
+            price_usd: normalized.usd,
+            seller_fee_eth: normalized.eth.unwrap_or(0.0),
+            seller_fee_usd: normalized.usd.unwrap_or(0.0),
             protocol_fee_eth: 0.0,
+            protocol_fee_usd: 0.0,
             royalty_fee_eth: 0.0,
+            royalty_fee_usd: 0.0,
             source: "opensea".to_string(),
-            is_native_eth: payment_symbol == "ETH",
+            is_native_eth: is_native_eth_symbol(&payment_symbol),
         });
     }
     Ok(rows)
@@ -517,20 +630,31 @@ pub async fn fetch_opensea_contract_nfts(
 pub async fn fetch_contract_sales(
     client: &AsyncApiClient,
     endpoints: &ApiEndpoints,
+    chain: &str,
     contract_address: &str,
     opensea_api_key: &str,
+    eth_usd_rate: Option<f64>,
 ) -> Result<Vec<NftSaleRecord>, AppError> {
-    let sales = fetch_alchemy_nft_sales(client, endpoints, contract_address, None).await?;
-    if !sales.is_empty() || opensea_api_key.is_empty() {
-        Ok(sales)
-    } else {
-        fetch_opensea_nft_events(
+    if !opensea_api_key.trim().is_empty() {
+        match fetch_opensea_nft_events(
             client,
             &endpoints.opensea_base,
+            chain,
             contract_address,
             None,
             opensea_api_key,
+            eth_usd_rate,
         )
         .await
+        {
+            Ok(rows) if !rows.is_empty() => return Ok(rows),
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!(
+                    "warning: OpenSea contract sales failed for {contract_address}: {err}; falling back to Alchemy"
+                );
+            }
+        }
     }
+    fetch_alchemy_nft_sales(client, endpoints, contract_address, None, eth_usd_rate).await
 }
