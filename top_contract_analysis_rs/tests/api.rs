@@ -528,8 +528,7 @@ async fn contract_sales_paginates_opensea_events_with_next_cursor() {
     alchemy_server
         .mock_async(|when, then| {
             when.method(GET).path("/nft/v2/key/getNFTSales");
-            then.status(200)
-                .json_body_obj(&serde_json::json!({"nftSales": []}));
+            then.status(500).body("alchemy unavailable");
         })
         .await;
     let (opensea_base_url, server) = spawn_sequential_json_server(vec![
@@ -607,8 +606,7 @@ async fn contract_sales_parse_opensea_fallback_sale_event_shape() {
     alchemy_server
         .mock_async(|when, then| {
             when.method(GET).path("/nft/v2/key/getNFTSales");
-            then.status(200)
-                .json_body_obj(&serde_json::json!({"nftSales": []}));
+            then.status(500).body("alchemy unavailable");
         })
         .await;
     let opensea_server = MockServer::start_async().await;
@@ -682,8 +680,7 @@ async fn contract_sales_do_not_treat_opensea_maker_taker_as_buyer_seller() {
     alchemy_server
         .mock_async(|when, then| {
             when.method(GET).path("/nft/v2/key/getNFTSales");
-            then.status(200)
-                .json_body_obj(&serde_json::json!({"nftSales": []}));
+            then.status(500).body("alchemy unavailable");
         })
         .await;
     let opensea_server = MockServer::start_async().await;
@@ -737,8 +734,7 @@ async fn contract_sales_opensea_fallback_uses_requested_chain() {
     alchemy_server
         .mock_async(|when, then| {
             when.method(GET).path("/nft/v2/key/getNFTSales");
-            then.status(200)
-                .json_body_obj(&serde_json::json!({"nftSales": []}));
+            then.status(500).body("alchemy unavailable");
         })
         .await;
     let opensea_server = MockServer::start_async().await;
@@ -821,6 +817,43 @@ async fn contract_sales_fall_back_to_alchemy_when_opensea_fails() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].source, "alchemy");
     assert_eq!(rows[0].price_eth, Some(1.0));
+}
+
+#[tokio::test]
+async fn contract_sales_return_empty_when_alchemy_and_opensea_fail() {
+    let alchemy_server = MockServer::start_async().await;
+    alchemy_server
+        .mock_async(|when, then| {
+            when.method(GET).path("/nft/v2/key/getNFTSales");
+            then.status(500).body("alchemy unavailable");
+        })
+        .await;
+    let opensea_server = MockServer::start_async().await;
+    opensea_server
+        .mock_async(|when, then| {
+            when.method(GET)
+                .path("/api/v2/events")
+                .query_param("event_type", "sale")
+                .query_param("asset_contract_address", "0xdup")
+                .query_param("chain", "ethereum")
+                .header("x-api-key", "opensea");
+            then.status(500).body("opensea unavailable");
+        })
+        .await;
+    let client = test_client();
+    let endpoints = ApiEndpoints {
+        alchemy_nft_v2_base: format!("{}/nft/v2/key", alchemy_server.base_url()),
+        alchemy_nft_v3_base: alchemy_server.base_url(),
+        alchemy_rpc_base: alchemy_server.base_url(),
+        etherscan_base: alchemy_server.base_url(),
+        opensea_base: opensea_server.base_url(),
+    };
+
+    let rows = fetch_contract_sales(&client, &endpoints, "ethereum", "0xdup", "opensea", None)
+        .await
+        .unwrap();
+
+    assert!(rows.is_empty());
 }
 
 #[tokio::test]
@@ -921,6 +954,12 @@ async fn contract_sales_convert_alchemy_stablecoin_amounts_to_usd_primary_amount
 #[tokio::test]
 async fn contract_sales_convert_opensea_stablecoin_amounts_to_usd_primary_amount() {
     let alchemy_server = MockServer::start_async().await;
+    alchemy_server
+        .mock_async(|when, then| {
+            when.method(GET).path("/nft/v2/key/getNFTSales");
+            then.status(500).body("alchemy unavailable");
+        })
+        .await;
     let opensea_server = MockServer::start_async().await;
     opensea_server
         .mock_async(|when, then| {

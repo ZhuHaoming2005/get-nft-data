@@ -201,6 +201,7 @@ impl AnalyzeApi for FakeTwoTokenOwnersApi {
         chain: &str,
         alchemy_api_key: &str,
         alchemy_network: Option<&str>,
+        _etherscan_api_key: &str,
         _opensea_api_key: &str,
         contract_address: &str,
     ) -> Result<Vec<SeedNft>, AppError> {
@@ -401,6 +402,7 @@ impl AnalyzeApi for FakeEmptyContractNftsApi {
         _chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
+        _etherscan_api_key: &str,
         _opensea_api_key: &str,
         _contract_address: &str,
     ) -> Result<Vec<SeedNft>, AppError> {

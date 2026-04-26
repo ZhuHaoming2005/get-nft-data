@@ -673,9 +673,13 @@ pub async fn fetch_contract_sales(
             .await
             .map(|rows| filter_sales_for_contract(rows, contract_address));
     match alchemy_result {
-        Ok(rows) if !rows.is_empty() => return Ok(rows),
-        Ok(_) => {}
-        Err(err) if opensea_api_key.trim().is_empty() => return Err(err),
+        Ok(rows) => return Ok(rows),
+        Err(err) if opensea_api_key.trim().is_empty() => {
+            eprintln!(
+                "warning: Alchemy contract sales failed for {contract_address}: {err}; continuing without contract sales"
+            );
+            return Ok(Vec::new());
+        }
         Err(err) => {
             eprintln!(
                 "warning: Alchemy contract sales failed for {contract_address}: {err}; falling back to OpenSea"
@@ -683,11 +687,7 @@ pub async fn fetch_contract_sales(
         }
     }
 
-    if opensea_api_key.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-
-    fetch_opensea_nft_events(
+    match fetch_opensea_nft_events(
         client,
         &endpoints.opensea_base,
         chain,
@@ -697,7 +697,15 @@ pub async fn fetch_contract_sales(
         eth_usd_rate,
     )
     .await
-    .map(|rows| filter_sales_for_contract(rows, contract_address))
+    {
+        Ok(rows) => Ok(filter_sales_for_contract(rows, contract_address)),
+        Err(err) => {
+            eprintln!(
+                "warning: OpenSea contract sales failed for {contract_address}: {err}; continuing without contract sales"
+            );
+            Ok(Vec::new())
+        }
+    }
 }
 
 fn filter_sales_for_contract(

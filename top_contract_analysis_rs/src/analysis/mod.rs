@@ -8,10 +8,11 @@ use futures::stream::{self, StreamExt};
 
 use crate::api::{
     fetch_contract_metadata, fetch_contract_owners, fetch_contract_sales, fetch_contract_transfers,
-    fetch_eth_balance, fetch_license_sample, fetch_opensea_contract_metadata,
-    fetch_opensea_contract_nfts, fetch_same_block_eth_transfers_for_address,
-    fetch_seed_contract_nfts, fetch_transaction_receipt, fetch_transaction_receipts_for_block,
-    is_open_license_payload, ApiEndpoints, AsyncApiClient,
+    fetch_eth_balance, fetch_etherscan_contract_transfers, fetch_license_sample,
+    fetch_opensea_contract_metadata, fetch_opensea_contract_nfts,
+    fetch_same_block_eth_transfers_for_address, fetch_seed_contract_nfts,
+    fetch_transaction_receipt, fetch_transaction_receipts_for_block, is_open_license_payload,
+    ApiEndpoints, AsyncApiClient,
 };
 use crate::error::AppError;
 use crate::models::{
@@ -100,9 +101,11 @@ pub trait AnalyzeApi: Send + Sync {
         chain: &str,
         alchemy_api_key: &str,
         alchemy_network: Option<&str>,
+        etherscan_api_key: &str,
         opensea_api_key: &str,
         contract_address: &str,
     ) -> Result<Vec<SeedNft>, AppError> {
+        let _ = etherscan_api_key;
         let _ = opensea_api_key;
         self.fetch_seed_contract_nfts(chain, alchemy_api_key, alchemy_network, contract_address)
             .await
@@ -416,6 +419,7 @@ impl AnalyzeApi for RealApi {
         chain: &str,
         alchemy_api_key: &str,
         alchemy_network: Option<&str>,
+        etherscan_api_key: &str,
         opensea_api_key: &str,
         contract_address: &str,
     ) -> Result<Vec<SeedNft>, AppError> {
@@ -443,25 +447,34 @@ impl AnalyzeApi for RealApi {
             fetch_seed_contract_nfts(&self.client, &endpoints, chain, contract_address).await;
         match alchemy_result {
             Ok(rows) => Ok(rows),
-            Err(alchemy_err) if opensea_api_key.trim().is_empty() => Err(alchemy_err),
+            Err(alchemy_err) if etherscan_api_key.trim().is_empty() => Err(alchemy_err),
             Err(alchemy_err) => {
-                match fetch_opensea_contract_nfts(
+                eprintln!(
+                    "warning: Alchemy NFT expansion failed for {contract_address}: {alchemy_err}; falling back to Etherscan transfers"
+                );
+                let transfers = fetch_etherscan_contract_transfers(
                     &self.client,
-                    &endpoints.opensea_base,
+                    &endpoints.etherscan_base,
+                    etherscan_api_key,
                     chain,
                     contract_address,
-                    opensea_api_key,
+                    "ERC721",
                 )
-                .await
-                {
-                    Ok(rows) if !rows.is_empty() => Ok(rows),
-                    Ok(_) => Err(AppError::Http(format!(
-                        "OpenSea returned no NFTs; Alchemy NFT expansion failed ({alchemy_err}) for {contract_address}"
-                    ))),
-                    Err(opensea_err) => Err(AppError::Http(format!(
-                        "OpenSea NFT expansion failed ({opensea_err}); Alchemy NFT expansion failed ({alchemy_err})"
-                    ))),
+                .await?;
+                let mut seen = BTreeSet::new();
+                let mut rows = Vec::new();
+                for transfer in transfers {
+                    if transfer.token_id.is_empty() || !seen.insert(transfer.token_id.clone()) {
+                        continue;
+                    }
+                    rows.push(SeedNft {
+                        chain: chain.to_string(),
+                        contract_address: contract_address.to_lowercase(),
+                        token_id: transfer.token_id,
+                        ..SeedNft::default()
+                    });
                 }
+                Ok(rows)
             }
         }
     }
@@ -1594,6 +1607,7 @@ async fn fetch_contract_nfts_for_matched_contracts(
                         &request.chain,
                         &request.alchemy_api_key,
                         request.alchemy_network.as_deref(),
+                        &request.etherscan_api_key,
                         &request.opensea_api_key,
                         contract_address,
                     )
