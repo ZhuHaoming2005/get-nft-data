@@ -54,18 +54,27 @@ fn string_field<'a>(value: &'a Value, names: &[&str]) -> &'a str {
 fn string_or_nested_field<'a>(value: &'a Value, names: &[&str]) -> &'a str {
     for name in names {
         if let Some(raw) = value.get(*name) {
-            if let Some(text) = raw.as_str() {
-                return text;
-            }
-            if let Some(text) = raw.get("address").and_then(Value::as_str) {
-                return text;
-            }
-            if let Some(text) = raw.get("hash").and_then(Value::as_str) {
+            if let Some(text) = address_like_field(raw) {
                 return text;
             }
         }
     }
     ""
+}
+
+fn address_like_field(value: &Value) -> Option<&str> {
+    value.as_str().or_else(|| {
+        [
+            "address",
+            "hash",
+            "wallet_address",
+            "account_address",
+            "user",
+            "token",
+        ]
+        .iter()
+        .find_map(|name| value.get(*name).and_then(address_like_field))
+    })
 }
 
 fn parse_numeric_text(text: &str) -> Option<f64> {
@@ -406,8 +415,9 @@ pub async fn fetch_opensea_nft_events(
                 contract_address: nft
                     .get("contract")
                     .or_else(|| nft.get("contract_address"))
+                    .or_else(|| nft.get("asset_contract"))
                     .or_else(|| item.get("asset_contract_address"))
-                    .and_then(Value::as_str)
+                    .and_then(address_like_field)
                     .unwrap_or(contract_address)
                     .to_lowercase(),
                 token_id: normalize_token_id(Some(&Value::String(token_id_value.to_string()))),
@@ -433,7 +443,7 @@ pub async fn fetch_opensea_nft_events(
                         "buyer",
                         "buyer_address",
                         "buyerAddress",
-                        "taker",
+                        "to_address",
                     ],
                 )
                 .to_lowercase(),
@@ -444,14 +454,14 @@ pub async fn fetch_opensea_nft_events(
                         "seller",
                         "seller_address",
                         "sellerAddress",
-                        "maker",
+                        "from_address",
                     ],
                 )
                 .to_lowercase(),
                 marketplace: "opensea".to_string(),
                 taker: item
                     .get("taker")
-                    .and_then(Value::as_str)
+                    .and_then(address_like_field)
                     .unwrap_or("")
                     .to_string(),
                 payment_token_symbol: payment_symbol.clone(),
@@ -459,7 +469,9 @@ pub async fn fetch_opensea_nft_events(
                     .get("address")
                     .or_else(|| payment.get("token_address"))
                     .or_else(|| payment.get("tokenAddress"))
-                    .and_then(Value::as_str)
+                    .or_else(|| payment.get("token"))
+                    .or_else(|| payment.get("contract"))
+                    .and_then(address_like_field)
                     .unwrap_or("")
                     .to_lowercase(),
                 price_eth: normalized.eth,
@@ -656,34 +668,36 @@ pub async fn fetch_contract_sales(
     opensea_api_key: &str,
     eth_usd_rate: Option<f64>,
 ) -> Result<Vec<NftSaleRecord>, AppError> {
-    if !opensea_api_key.trim().is_empty() {
-        match fetch_opensea_nft_events(
-            client,
-            &endpoints.opensea_base,
-            chain,
-            contract_address,
-            None,
-            opensea_api_key,
-            eth_usd_rate,
-        )
-        .await
-        {
-            Ok(rows) => {
-                let rows = filter_sales_for_contract(rows, contract_address);
-                if !rows.is_empty() {
-                    return Ok(rows);
-                }
-            }
-            Err(err) => {
-                eprintln!(
-                    "warning: OpenSea contract sales failed for {contract_address}: {err}; falling back to Alchemy"
-                );
-            }
+    let alchemy_result =
+        fetch_alchemy_nft_sales(client, endpoints, contract_address, None, eth_usd_rate)
+            .await
+            .map(|rows| filter_sales_for_contract(rows, contract_address));
+    match alchemy_result {
+        Ok(rows) if !rows.is_empty() => return Ok(rows),
+        Ok(_) => {}
+        Err(err) if opensea_api_key.trim().is_empty() => return Err(err),
+        Err(err) => {
+            eprintln!(
+                "warning: Alchemy contract sales failed for {contract_address}: {err}; falling back to OpenSea"
+            );
         }
     }
-    fetch_alchemy_nft_sales(client, endpoints, contract_address, None, eth_usd_rate)
-        .await
-        .map(|rows| filter_sales_for_contract(rows, contract_address))
+
+    if opensea_api_key.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    fetch_opensea_nft_events(
+        client,
+        &endpoints.opensea_base,
+        chain,
+        contract_address,
+        None,
+        opensea_api_key,
+        eth_usd_rate,
+    )
+    .await
+    .map(|rows| filter_sales_for_contract(rows, contract_address))
 }
 
 fn filter_sales_for_contract(

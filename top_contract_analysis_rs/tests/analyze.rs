@@ -2404,7 +2404,7 @@ fn single_report_aggregates_victim_addresses_by_address() {
 }
 
 #[test]
-fn single_report_fraud_trade_stats_fall_back_to_native_eth_fields() {
+fn single_report_fraud_trade_stats_do_not_fall_back_to_native_eth_fields_for_usd_output() {
     let payload = SingleReportPayload {
         fraud_trade_stats: BTreeMap::from([(
             "0xdup".into(),
@@ -2414,7 +2414,7 @@ fn single_report_fraud_trade_stats_fall_back_to_native_eth_fields() {
                 native_eth_volume: Some(6.25),
                 stuck_wallet_count: 2,
                 stuck_cost_eth: 1.5,
-                stuck_cost_usd: 1.5,
+                stuck_cost_usd: 0.0,
                 ..Default::default()
             },
         )]),
@@ -2424,7 +2424,7 @@ fn single_report_fraud_trade_stats_fall_back_to_native_eth_fields() {
     let markdown = render_human_readable_report(&payload);
 
     assert!(markdown.contains(
-        "- 0xdup: unique_buyers=3 | usd_priced_sale_count=4 | usd_priced_volume=6.25 | stuck_wallet_count=2 | stuck_cost_usd=1.5"
+        "- 0xdup: unique_buyers=3 | usd_priced_sale_count=0 | usd_priced_volume=0 | stuck_wallet_count=2 | stuck_cost_usd=0"
     ));
 }
 
@@ -2453,6 +2453,47 @@ fn single_report_fraud_trade_stats_preserve_explicit_zero_eth_priced_values() {
 
     assert!(markdown.contains(
         "- 0xdup: unique_buyers=3 | usd_priced_sale_count=0 | usd_priced_volume=0 | stuck_wallet_count=2 | stuck_cost_usd=1.5"
+    ));
+}
+
+#[test]
+fn single_report_does_not_display_eth_values_in_usd_fields() {
+    let payload = SingleReportPayload {
+        victim_addresses: vec![VictimAddressPayload {
+            address: "0xvictim".into(),
+            buy_tx_hashes: vec!["0xbuy".into()],
+            buy_amount_eth: 1.25,
+            buy_amount_usd: 0.0,
+            last_buy_amount_eth: Some(1.25),
+            last_buy_amount_usd: None,
+            is_stuck: true,
+            last_buy_tx_hash: "0xbuy".into(),
+            ratio_status: "unavailable".into(),
+            ..Default::default()
+        }],
+        fraud_trade_stats: BTreeMap::from([(
+            "0xdup".into(),
+            FraudTradeStatsPayload {
+                unique_buyers: 1,
+                eth_priced_sale_count: Some(1),
+                eth_priced_volume: Some(1.25),
+                usd_priced_sale_count: Some(0),
+                usd_priced_volume: Some(0.0),
+                stuck_wallet_count: 1,
+                stuck_cost_eth: 1.25,
+                stuck_cost_usd: 0.0,
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+
+    let markdown = render_human_readable_report(&payload);
+
+    assert!(markdown
+        .contains("- 0xvictim: buy_tx_count=1 | 买入金额(USD)=0 | 最后一次买入金额(USD)=None"));
+    assert!(markdown.contains(
+        "- 0xdup: unique_buyers=1 | usd_priced_sale_count=0 | usd_priced_volume=0 | stuck_wallet_count=1 | stuck_cost_usd=0"
     ));
 }
 

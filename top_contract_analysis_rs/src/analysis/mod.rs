@@ -174,6 +174,57 @@ pub trait AnalyzeApi: Send + Sync {
         block_number: i64,
         address: &str,
     ) -> Result<Vec<EthTransferRecord>, AppError>;
+
+    async fn fetch_transaction_receipt_on_chain(
+        &self,
+        _chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        tx_hash: &str,
+    ) -> Result<TransactionReceiptRecord, AppError> {
+        self.fetch_transaction_receipt(alchemy_api_key, alchemy_network, tx_hash)
+            .await
+    }
+
+    async fn fetch_transaction_receipts_for_block_on_chain(
+        &self,
+        _chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        block_number: i64,
+    ) -> Result<BTreeMap<String, TransactionReceiptRecord>, AppError> {
+        self.fetch_transaction_receipts_for_block(alchemy_api_key, alchemy_network, block_number)
+            .await
+    }
+
+    async fn fetch_eth_balance_on_chain(
+        &self,
+        _chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        address: &str,
+        block_number: i64,
+    ) -> Result<f64, AppError> {
+        self.fetch_eth_balance(alchemy_api_key, alchemy_network, address, block_number)
+            .await
+    }
+
+    async fn fetch_same_block_eth_transfers_for_address_on_chain(
+        &self,
+        _chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        block_number: i64,
+        address: &str,
+    ) -> Result<Vec<EthTransferRecord>, AppError> {
+        self.fetch_same_block_eth_transfers_for_address(
+            alchemy_api_key,
+            alchemy_network,
+            block_number,
+            address,
+        )
+        .await
+    }
 }
 
 pub trait FeatureStoreReader: Send {
@@ -532,6 +583,53 @@ impl AnalyzeApi for RealApi {
         address: &str,
     ) -> Result<Vec<EthTransferRecord>, AppError> {
         let endpoints = self.endpoints("ethereum", alchemy_network, alchemy_api_key);
+        fetch_same_block_eth_transfers_for_address(&self.client, &endpoints, block_number, address)
+            .await
+    }
+
+    async fn fetch_transaction_receipt_on_chain(
+        &self,
+        chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        tx_hash: &str,
+    ) -> Result<TransactionReceiptRecord, AppError> {
+        let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
+        fetch_transaction_receipt(&self.client, &endpoints, tx_hash).await
+    }
+
+    async fn fetch_transaction_receipts_for_block_on_chain(
+        &self,
+        chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        block_number: i64,
+    ) -> Result<BTreeMap<String, TransactionReceiptRecord>, AppError> {
+        let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
+        fetch_transaction_receipts_for_block(&self.client, &endpoints, block_number).await
+    }
+
+    async fn fetch_eth_balance_on_chain(
+        &self,
+        chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        address: &str,
+        block_number: i64,
+    ) -> Result<f64, AppError> {
+        let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
+        fetch_eth_balance(&self.client, &endpoints, address, block_number).await
+    }
+
+    async fn fetch_same_block_eth_transfers_for_address_on_chain(
+        &self,
+        chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        block_number: i64,
+        address: &str,
+    ) -> Result<Vec<EthTransferRecord>, AppError> {
+        let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
         fetch_same_block_eth_transfers_for_address(&self.client, &endpoints, block_number, address)
             .await
     }
@@ -1086,7 +1184,8 @@ async fn compute_sale_metrics_for_contract(
         stream::iter(blocks_to_fetch.into_iter().map(|block_number| async move {
             let receipts = deps
                 .api
-                .fetch_transaction_receipts_for_block(
+                .fetch_transaction_receipts_for_block_on_chain(
+                    &request.chain,
                     &request.alchemy_api_key,
                     request.alchemy_network.as_deref(),
                     block_number,
@@ -1144,23 +1243,27 @@ async fn prefetch_sale_metric_inputs(
     }
 
     let (purchase_receipt, base_balance_eth, same_block_transfers) = tokio::join!(
-        deps.api.fetch_transaction_receipt(
+        deps.api.fetch_transaction_receipt_on_chain(
+            &request.chain,
             &request.alchemy_api_key,
             request.alchemy_network.as_deref(),
             &sale.tx_hash,
         ),
-        deps.api.fetch_eth_balance(
+        deps.api.fetch_eth_balance_on_chain(
+            &request.chain,
             &request.alchemy_api_key,
             request.alchemy_network.as_deref(),
             &sale.buyer_address,
             sale.block_number - 1,
         ),
-        deps.api.fetch_same_block_eth_transfers_for_address(
-            &request.alchemy_api_key,
-            request.alchemy_network.as_deref(),
-            sale.block_number,
-            &sale.buyer_address,
-        )
+        deps.api
+            .fetch_same_block_eth_transfers_for_address_on_chain(
+                &request.chain,
+                &request.alchemy_api_key,
+                request.alchemy_network.as_deref(),
+                sale.block_number,
+                &sale.buyer_address,
+            )
     );
     let purchase_receipt = match purchase_receipt {
         Ok(row) => row,

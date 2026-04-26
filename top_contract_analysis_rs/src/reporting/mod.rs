@@ -40,14 +40,6 @@ fn format_python_optional_scalar(value: Option<f64>) -> String {
         .unwrap_or_else(|| "None".into())
 }
 
-fn usd_or_legacy(usd: f64, legacy_eth: f64) -> f64 {
-    if usd > 0.0 {
-        usd
-    } else {
-        legacy_eth
-    }
-}
-
 #[derive(Default)]
 struct VictimAddressReportRow {
     address: String,
@@ -233,14 +225,11 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
         ),
         format!(
             "- 诚实地址购买总金额(USD): {}",
-            usd_or_legacy(
-                summary.honest_purchase_total_usd,
-                summary.honest_purchase_total_eth
-            )
+            summary.honest_purchase_total_usd
         ),
         format!(
             "- 套牢资金(USD): {} / {}",
-            usd_or_legacy(summary.stuck_cost_usd, summary.stuck_cost_eth),
+            summary.stuck_cost_usd,
             format_ratio(summary.stuck_cost_ratio)
         ),
         format!(
@@ -416,9 +405,9 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
                 "- {}: buy_tx_count={} | 买入金额(USD)={} | 最后一次买入金额(USD)={} | 买入前钱包余额(USD): {} | 买入占比={} | 套牢={} | last_buy_tx={}",
                 item.address,
                 item.buy_tx_hashes.len(),
-                usd_or_legacy(item.buy_amount_usd, item.buy_amount_eth),
-                format_python_optional_scalar(item.last_buy_amount_usd.or(item.last_buy_amount_eth)),
-                format_python_optional_scalar(item.buy_before_usd_balance.or(item.buy_before_eth_balance)),
+                item.buy_amount_usd,
+                format_python_optional_scalar(item.last_buy_amount_usd),
+                format_python_optional_scalar(item.buy_before_usd_balance),
                 format_ratio(item.buy_asset_ratio),
                 if item.is_stuck { "是" } else { "否" },
                 if item.last_buy_tx_hash.is_empty() {
@@ -435,16 +424,8 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
         lines.push("- 无".to_string());
     } else {
         for (contract, stats) in &payload.fraud_trade_stats {
-            let sale_count = stats
-                .usd_priced_sale_count
-                .or(stats.eth_priced_sale_count)
-                .or(stats.native_eth_sale_count)
-                .unwrap_or_default();
-            let sale_volume = stats
-                .usd_priced_volume
-                .or(stats.eth_priced_volume)
-                .or(stats.native_eth_volume)
-                .unwrap_or_default();
+            let sale_count = stats.usd_priced_sale_count.unwrap_or_default();
+            let sale_volume = stats.usd_priced_volume.unwrap_or_default();
             lines.push(format!(
                 "- {}: unique_buyers={} | usd_priced_sale_count={} | usd_priced_volume={} | stuck_wallet_count={} | stuck_cost_usd={}",
                 contract,
@@ -452,7 +433,7 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
                 sale_count,
                 sale_volume,
                 stats.stuck_wallet_count,
-                usd_or_legacy(stats.stuck_cost_usd, stats.stuck_cost_eth)
+                stats.stuck_cost_usd
             ));
         }
     }
@@ -505,14 +486,11 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
         ),
         format!(
             "- 诚实地址购买总金额(USD)汇总: {}",
-            usd_or_legacy(
-                summary.honest_purchase_total_usd_total,
-                summary.honest_purchase_total_eth_total
-            )
+            summary.honest_purchase_total_usd_total
         ),
         format!(
             "- 套牢资金(USD)汇总: {} / {}",
-            usd_or_legacy(summary.stuck_cost_usd_total, summary.stuck_cost_eth_total),
+            summary.stuck_cost_usd_total,
             format_ratio(summary.stuck_cost_ratio_overall)
         ),
         format!(
@@ -590,11 +568,8 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
                 report_summary.honest_address_count,
                 report_summary.repeat_infringing_address_count,
                 report_summary.legit_duplicate_contract_count,
-                usd_or_legacy(
-                    report_summary.honest_purchase_total_usd,
-                    report_summary.honest_purchase_total_eth
-                ),
-                usd_or_legacy(report_summary.stuck_cost_usd, report_summary.stuck_cost_eth),
+                report_summary.honest_purchase_total_usd,
+                report_summary.stuck_cost_usd,
                 format_ratio(report_summary.stuck_cost_ratio),
                 report_summary.ratio_over_60_address_count,
                 format_ratio(report_summary.ratio_over_60_address_ratio),

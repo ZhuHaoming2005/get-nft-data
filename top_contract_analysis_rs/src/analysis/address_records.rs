@@ -76,7 +76,7 @@ fn mean_f64(values: &[f64]) -> Option<f64> {
 }
 
 fn sale_usd_value(sale: &NftSaleRecord) -> Option<f64> {
-    sale.price_usd.or(sale.price_eth)
+    sale.price_usd
 }
 
 fn build_owner_token_map(owners: &[OwnerBalance]) -> HashMap<String, HashSet<String>> {
@@ -813,6 +813,40 @@ mod tests {
         assert_eq!(stats.unique_buyers, 1);
         assert_eq!(stats.usd_priced_sale_count, Some(1));
         assert_eq!(stats.usd_priced_volume, Some(5.0));
+    }
+
+    #[test]
+    fn fraud_trade_stats_do_not_count_eth_amounts_as_usd_when_rate_is_missing() {
+        let mut eth_sale = sale("ETH", 1.25);
+        eth_sale.price_usd = None;
+
+        let stats = build_fraud_trade_stats("0xdup", &[eth_sale], &[]);
+        let stats = &stats["0xdup"];
+
+        assert_eq!(stats.eth_priced_sale_count, Some(1));
+        assert_eq!(stats.eth_priced_volume, Some(1.25));
+        assert_eq!(stats.usd_priced_sale_count, Some(0));
+        assert_eq!(stats.usd_priced_volume, Some(0.0));
+    }
+
+    #[test]
+    fn victim_records_do_not_count_eth_amounts_as_usd_when_rate_is_missing() {
+        let mut eth_sale = sale("ETH", 1.25);
+        eth_sale.price_usd = None;
+        let owners = vec![OwnerBalance {
+            owner_address: "0xbuyerETH".into(),
+            token_balances: BTreeMap::from([("1".into(), 1)]),
+        }];
+        let sales = vec![eth_sale];
+        let activity = prepare_contract_activity(&[], &sales, &owners);
+
+        let victims = build_victim_address_records_from_activity(&activity, &BTreeMap::new());
+
+        assert_eq!(victims.len(), 1);
+        assert_eq!(victims[0].buy_amount_eth, 1.25);
+        assert_eq!(victims[0].buy_amount_usd, 0.0);
+        assert_eq!(victims[0].last_buy_amount_eth, Some(1.25));
+        assert_eq!(victims[0].last_buy_amount_usd, None);
     }
 
     #[test]

@@ -469,12 +469,27 @@ async fn contract_transfers_fall_back_to_etherscan_for_erc721() {
 }
 
 #[tokio::test]
-async fn contract_sales_use_opensea_before_alchemy_when_available() {
+async fn contract_sales_use_alchemy_before_opensea_when_available() {
     let alchemy_server = MockServer::start_async().await;
     alchemy_server
         .mock_async(|when, then| {
             when.method(GET).path("/nft/v2/key/getNFTSales");
-            then.status(500).body("alchemy should not be called first");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "nftSales": [{
+                    "marketplace": "seaport",
+                    "contractAddress": "0xdup",
+                    "tokenId": "1",
+                    "buyerAddress": "0xbuyer",
+                    "sellerAddress": "0xseller",
+                    "sellerFee": {"amount": "1250000000000000000", "symbol": "ETH", "decimals": 18},
+                    "protocolFee": {"amount": "0", "symbol": "ETH", "decimals": 18},
+                    "royaltyFee": {"amount": "0", "symbol": "ETH", "decimals": 18},
+                    "transactionHash": "0xalchemy",
+                    "blockNumber": 11,
+                    "logIndex": 1,
+                    "bundleIndex": 0
+                }]
+            }));
         })
         .await;
     let opensea_server = MockServer::start_async().await;
@@ -486,21 +501,7 @@ async fn contract_sales_use_opensea_before_alchemy_when_available() {
                 .query_param("asset_contract_address", "0xdup")
                 .query_param("chain", "ethereum")
                 .header("x-api-key", "opensea");
-            then.status(200).json_body_obj(&serde_json::json!({
-                "events": [{
-                    "event_type": "sale",
-                    "asset_contract_address": "0xdup",
-                    "nft": {"identifier": "1"},
-                    "payment": {"symbol": "ETH"},
-                    "payment_quantity": "1250000000000000000",
-                    "transaction_hash": "0xopensea",
-                    "block_number": 11,
-                    "event_index": 1,
-                    "bundle_index": 0,
-                    "to_account": {"address": "0xbuyer"},
-                    "from_account": {"address": "0xseller"}
-                }]
-            }));
+            then.status(500).body("opensea should not be called first");
         })
         .await;
 
@@ -517,13 +518,21 @@ async fn contract_sales_use_opensea_before_alchemy_when_available() {
         .unwrap();
 
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].source, "opensea");
+    assert_eq!(rows[0].source, "alchemy");
     assert!(rows[0].is_native_eth);
 }
 
 #[tokio::test]
 async fn contract_sales_paginates_opensea_events_with_next_cursor() {
-    let (base_url, server) = spawn_sequential_json_server(vec![
+    let alchemy_server = MockServer::start_async().await;
+    alchemy_server
+        .mock_async(|when, then| {
+            when.method(GET).path("/nft/v2/key/getNFTSales");
+            then.status(200)
+                .json_body_obj(&serde_json::json!({"nftSales": []}));
+        })
+        .await;
+    let (opensea_base_url, server) = spawn_sequential_json_server(vec![
         (
             "/api/v2/events?event_type=sale&asset_contract_address=0xdup&chain=ethereum"
                 .to_string(),
@@ -565,7 +574,13 @@ async fn contract_sales_paginates_opensea_events_with_next_cursor() {
     ])
     .await;
     let client = test_client();
-    let endpoints = test_endpoints(&base_url);
+    let endpoints = ApiEndpoints {
+        alchemy_nft_v2_base: format!("{}/nft/v2/key", alchemy_server.base_url()),
+        alchemy_nft_v3_base: format!("{}/nft/v3/key", alchemy_server.base_url()),
+        alchemy_rpc_base: format!("{}/v2/key", alchemy_server.base_url()),
+        etherscan_base: alchemy_server.base_url(),
+        opensea_base: opensea_base_url,
+    };
 
     let rows = fetch_contract_sales(&client, &endpoints, "ethereum", "0xdup", "opensea", None)
         .await
@@ -584,6 +599,136 @@ async fn contract_sales_paginates_opensea_events_with_next_cursor() {
     assert_eq!(rows[1].tx_hash, "0xpage2");
     assert_eq!(rows[0].price_usd, Some(5.0));
     assert_eq!(rows[1].price_usd, Some(7.0));
+}
+
+#[tokio::test]
+async fn contract_sales_parse_opensea_fallback_sale_event_shape() {
+    let alchemy_server = MockServer::start_async().await;
+    alchemy_server
+        .mock_async(|when, then| {
+            when.method(GET).path("/nft/v2/key/getNFTSales");
+            then.status(200)
+                .json_body_obj(&serde_json::json!({"nftSales": []}));
+        })
+        .await;
+    let opensea_server = MockServer::start_async().await;
+    opensea_server
+        .mock_async(|when, then| {
+            when.method(GET)
+                .path("/api/v2/events")
+                .query_param("event_type", "sale")
+                .query_param("asset_contract_address", "0xdup")
+                .query_param("chain", "ethereum")
+                .header("x-api-key", "opensea");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "asset_events": [{
+                    "event_type": "sale",
+                    "nft": {
+                        "identifier": "42",
+                        "contract": {"address": "0xDup"}
+                    },
+                    "payment": {
+                        "symbol": "USDC",
+                        "decimals": "6",
+                        "quantity": "12340000",
+                        "token": {"address": "0xA0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"}
+                    },
+                    "transaction": {"hash": "0xopensea"},
+                    "block_number": "0x10",
+                    "event_index": "0x2",
+                    "bundle_index": "0x0",
+                    "to_address": "0xbuyer",
+                    "from_address": "0xseller",
+                    "taker": {"account_address": "0xtaker"},
+                    "maker": {"wallet_address": "0xmaker"}
+                }],
+                "next": ""
+            }));
+        })
+        .await;
+    let client = test_client();
+    let endpoints = ApiEndpoints {
+        alchemy_nft_v2_base: format!("{}/nft/v2/key", alchemy_server.base_url()),
+        alchemy_nft_v3_base: format!("{}/nft/v3/key", alchemy_server.base_url()),
+        alchemy_rpc_base: format!("{}/v2/key", alchemy_server.base_url()),
+        etherscan_base: alchemy_server.base_url(),
+        opensea_base: opensea_server.base_url(),
+    };
+
+    let rows = fetch_contract_sales(&client, &endpoints, "ethereum", "0xdup", "opensea", None)
+        .await
+        .unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].contract_address, "0xdup");
+    assert_eq!(rows[0].token_id, "42");
+    assert_eq!(rows[0].tx_hash, "0xopensea");
+    assert_eq!(rows[0].block_number, 16);
+    assert_eq!(rows[0].log_index, 2);
+    assert_eq!(rows[0].buyer_address, "0xbuyer");
+    assert_eq!(rows[0].seller_address, "0xseller");
+    assert_eq!(rows[0].taker, "0xtaker");
+    assert_eq!(rows[0].payment_token_symbol, "USDC");
+    assert_eq!(
+        rows[0].payment_token_address,
+        "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+    );
+    assert_eq!(rows[0].price_usd, Some(12.34));
+}
+
+#[tokio::test]
+async fn contract_sales_do_not_treat_opensea_maker_taker_as_buyer_seller() {
+    let alchemy_server = MockServer::start_async().await;
+    alchemy_server
+        .mock_async(|when, then| {
+            when.method(GET).path("/nft/v2/key/getNFTSales");
+            then.status(200)
+                .json_body_obj(&serde_json::json!({"nftSales": []}));
+        })
+        .await;
+    let opensea_server = MockServer::start_async().await;
+    opensea_server
+        .mock_async(|when, then| {
+            when.method(GET)
+                .path("/api/v2/events")
+                .query_param("event_type", "sale")
+                .query_param("asset_contract_address", "0xdup")
+                .query_param("chain", "ethereum")
+                .header("x-api-key", "opensea");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "asset_events": [{
+                    "event_type": "sale",
+                    "nft": {"identifier": "7", "contract": "0xdup"},
+                    "payment": {
+                        "symbol": "ETH",
+                        "decimals": 18,
+                        "quantity": "1000000000000000000"
+                    },
+                    "transaction": "0xopensea",
+                    "maker": "0xmaker",
+                    "taker": "0xtaker"
+                }],
+                "next": ""
+            }));
+        })
+        .await;
+    let client = test_client();
+    let endpoints = ApiEndpoints {
+        alchemy_nft_v2_base: format!("{}/nft/v2/key", alchemy_server.base_url()),
+        alchemy_nft_v3_base: format!("{}/nft/v3/key", alchemy_server.base_url()),
+        alchemy_rpc_base: format!("{}/v2/key", alchemy_server.base_url()),
+        etherscan_base: alchemy_server.base_url(),
+        opensea_base: opensea_server.base_url(),
+    };
+
+    let rows = fetch_contract_sales(&client, &endpoints, "ethereum", "0xdup", "opensea", None)
+        .await
+        .unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].buyer_address, "");
+    assert_eq!(rows[0].seller_address, "");
+    assert_eq!(rows[0].taker, "0xtaker");
 }
 
 #[tokio::test]
