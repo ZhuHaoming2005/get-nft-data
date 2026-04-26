@@ -199,6 +199,11 @@ pub fn build_infringing_token_records_with_context_refs(
                     .find(|row| row.from_address == ZERO_ADDRESS)
                     .copied()
             });
+            let first_non_mint_transfer = token_transfers.and_then(|rows| {
+                rows.iter()
+                    .find(|row| row.from_address != ZERO_ADDRESS)
+                    .copied()
+            });
             let first_transfer = token_transfers.and_then(|rows| rows.first().copied());
             let (minter_address, mint_tx_hash, mint_block, first_transfer_time) =
                 if let Some(mint_transfer) = mint_transfer {
@@ -206,7 +211,9 @@ pub fn build_infringing_token_records_with_context_refs(
                         mint_transfer.to_address.clone(),
                         mint_transfer.tx_hash.clone(),
                         mint_transfer.block_number,
-                        mint_transfer.block_time,
+                        first_non_mint_transfer
+                            .map(|transfer| transfer.block_time)
+                            .unwrap_or(0),
                     )
                 } else if let Some(first_transfer) = first_transfer {
                     (
@@ -690,16 +697,23 @@ pub fn build_fraud_trade_stats(
     sales: &[NftSaleRecord],
     victim_addresses: &[VictimAddressPayload],
 ) -> BTreeMap<String, FraudTradeStatsPayload> {
-    let native_sales: Vec<&NftSaleRecord> = sales
+    let contract_sales: Vec<&NftSaleRecord> = sales
         .iter()
+        .filter(|sale| sale.contract_address.eq_ignore_ascii_case(contract_address))
+        .collect();
+    let native_sales: Vec<&NftSaleRecord> = contract_sales
+        .iter()
+        .copied()
         .filter(|sale| sale.is_native_eth && sale.price_eth.is_some())
         .collect();
-    let eth_priced_sales: Vec<&NftSaleRecord> = sales
+    let eth_priced_sales: Vec<&NftSaleRecord> = contract_sales
         .iter()
+        .copied()
         .filter(|sale| sale.price_eth.is_some())
         .collect();
-    let usd_priced_sales: Vec<&NftSaleRecord> = sales
+    let usd_priced_sales: Vec<&NftSaleRecord> = contract_sales
         .iter()
+        .copied()
         .filter(|sale| sale_usd_value(sale).is_some())
         .collect();
 
@@ -708,6 +722,7 @@ pub fn build_fraud_trade_stats(
         FraudTradeStatsPayload {
             unique_buyers: sales
                 .iter()
+                .filter(|sale| sale.contract_address.eq_ignore_ascii_case(contract_address))
                 .filter_map(|sale| {
                     (!sale.buyer_address.is_empty()).then(|| sale.buyer_address.clone())
                 })
@@ -783,6 +798,21 @@ mod tests {
         assert_eq!(stats.eth_priced_volume, Some(3.05));
         assert_eq!(stats.usd_priced_sale_count, Some(3));
         assert_eq!(stats.usd_priced_volume, Some(3.05));
+    }
+
+    #[test]
+    fn fraud_trade_stats_ignore_sales_from_other_contracts() {
+        let mut matching = sale("USDC", 5.0);
+        matching.contract_address = "0xdup".into();
+        let mut unrelated = sale("USDC", 7.0);
+        unrelated.contract_address = "0xother".into();
+
+        let stats = build_fraud_trade_stats("0xdup", &[matching, unrelated], &[]);
+        let stats = &stats["0xdup"];
+
+        assert_eq!(stats.unique_buyers, 1);
+        assert_eq!(stats.usd_priced_sale_count, Some(1));
+        assert_eq!(stats.usd_priced_volume, Some(5.0));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -277,6 +278,8 @@ impl Default for BatchRequest {
 
 pub struct RealApi {
     client: AsyncApiClient,
+    eth_usd_rate: crate::currency::EthUsdRateCache,
+    eth_usd_rate_warning_emitted: AtomicBool,
 }
 
 impl RealApi {
@@ -293,6 +296,8 @@ impl RealApi {
                 contract_max_concurrency,
                 sale_metric_max_concurrency,
             )?,
+            eth_usd_rate: crate::currency::EthUsdRateCache::default(),
+            eth_usd_rate_warning_emitted: AtomicBool::new(false),
         })
     }
 
@@ -303,6 +308,12 @@ impl RealApi {
         api_key: &str,
     ) -> ApiEndpoints {
         ApiEndpoints::for_alchemy(&normalize_network(chain, explicit_network), api_key)
+    }
+
+    async fn current_eth_usd_rate(&self) -> Result<f64, AppError> {
+        self.eth_usd_rate
+            .get_or_try_init(|| crate::currency::fetch_current_eth_usd_rate(&self.client))
+            .await
     }
 }
 
@@ -457,12 +468,17 @@ impl AnalyzeApi for RealApi {
         opensea_api_key: &str,
     ) -> Result<Vec<NftSaleRecord>, AppError> {
         let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
-        let eth_usd_rate = match crate::currency::fetch_current_eth_usd_rate(&self.client).await {
+        let eth_usd_rate = match self.current_eth_usd_rate().await {
             Ok(rate) => Some(rate),
             Err(err) => {
-                eprintln!(
-                    "warning: failed to fetch current ETH/USD rate for {contract_address}: {err}; ETH/WETH sales will not be USD-normalized"
-                );
+                if !self
+                    .eth_usd_rate_warning_emitted
+                    .swap(true, Ordering::Relaxed)
+                {
+                    eprintln!(
+                        "warning: failed to fetch current ETH/USD rate for {contract_address}: {err}; ETH/WETH sales will not be USD-normalized"
+                    );
+                }
                 None
             }
         };
@@ -1770,7 +1786,7 @@ fn build_report_summary(
         .collect();
     let mint_to_first_transfer_values: Vec<f64> = address_signals
         .values()
-        .map(|signal| signal.mint_to_first_transfer_seconds as f64)
+        .filter_map(|signal| positive_seconds(signal.mint_to_first_transfer_seconds))
         .collect();
     let unique_receiver_values: Vec<f64> = address_signals
         .values()
@@ -1923,6 +1939,7 @@ fn build_batch_report_summary(seed_reports: &[BatchSeedAggregate]) -> BatchRepor
                 .report_summary
                 .avg_mint_to_first_transfer_seconds
         })
+        .filter(|value| *value > 0.0)
         .collect();
     let median_first_transfer_values: Vec<f64> = seed_reports
         .iter()
@@ -1931,6 +1948,7 @@ fn build_batch_report_summary(seed_reports: &[BatchSeedAggregate]) -> BatchRepor
                 .report_summary
                 .median_mint_to_first_transfer_seconds
         })
+        .filter(|value| *value > 0.0)
         .collect();
     let mean_unique_receiver_values: Vec<f64> = seed_reports
         .iter()
@@ -2290,9 +2308,13 @@ fn payload_median_mint_to_first_transfer_seconds(payload: &SingleReportPayload) 
     let values: Vec<f64> = payload
         .address_signals
         .values()
-        .map(|signal| signal.mint_to_first_transfer_seconds as f64)
+        .filter_map(|signal| positive_seconds(signal.mint_to_first_transfer_seconds))
         .collect();
     median_f64(&values)
+}
+
+fn positive_seconds(value: i64) -> Option<f64> {
+    (value > 0).then_some(value as f64)
 }
 
 fn mean(values: &[f64]) -> Option<f64> {
@@ -2312,5 +2334,79 @@ fn normalize_network(chain: &str, explicit_network: Option<&str>) -> String {
         "base" => "base-mainnet".into(),
         "polygon" => "polygon-mainnet".into(),
         other => format!("{other}-mainnet"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn report_summary_ignores_zero_mint_to_first_transfer_samples() {
+        let address_signals = BTreeMap::from([
+            (
+                "0xmintonly".into(),
+                AddressSignalPayload {
+                    mint_to_first_transfer_seconds: 0,
+                    ..AddressSignalPayload::default()
+                },
+            ),
+            (
+                "0xfast".into(),
+                AddressSignalPayload {
+                    mint_to_first_transfer_seconds: 8,
+                    ..AddressSignalPayload::default()
+                },
+            ),
+            (
+                "0xslow".into(),
+                AddressSignalPayload {
+                    mint_to_first_transfer_seconds: 20,
+                    ..AddressSignalPayload::default()
+                },
+            ),
+        ]);
+
+        let summary = build_report_summary(
+            false,
+            &BTreeMap::new(),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &address_signals,
+        );
+
+        assert_eq!(summary.avg_mint_to_first_transfer_seconds, Some(14.0));
+        assert_eq!(summary.median_mint_to_first_transfer_seconds, Some(14.0));
+    }
+
+    #[test]
+    fn cached_payload_median_ignores_zero_mint_to_first_transfer_samples() {
+        let payload = SingleReportPayload {
+            address_signals: BTreeMap::from([
+                (
+                    "0xmintonly".into(),
+                    AddressSignalPayload {
+                        mint_to_first_transfer_seconds: 0,
+                        ..AddressSignalPayload::default()
+                    },
+                ),
+                (
+                    "0xtransfer".into(),
+                    AddressSignalPayload {
+                        mint_to_first_transfer_seconds: 12,
+                        ..AddressSignalPayload::default()
+                    },
+                ),
+            ]),
+            ..SingleReportPayload::default()
+        };
+
+        assert_eq!(
+            payload_median_mint_to_first_transfer_seconds(&payload),
+            Some(12.0)
+        );
     }
 }

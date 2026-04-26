@@ -327,144 +327,165 @@ pub async fn fetch_opensea_nft_events(
         HeaderValue::from_str(opensea_api_key).map_err(|err| AppError::Http(err.to_string()))?,
     );
     let chain = opensea_chain(chain);
-    let url = if let Some(token_id) = token_id.filter(|value| !value.is_empty()) {
+    let base_events_url = if let Some(token_id) = token_id.filter(|value| !value.is_empty()) {
         format!("{base_url}/api/v2/events/chain/{chain}/contract/{contract_address}/nfts/{token_id}?event_type=sale")
     } else {
         format!("{base_url}/api/v2/events?event_type=sale&asset_contract_address={contract_address}&chain={chain}")
     };
-    let payload: Value = client.get_json_with_headers(&url, headers).await?;
-    let events = payload
-        .get("asset_events")
-        .or_else(|| payload.get("events"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
     let mut rows = Vec::new();
-    for item in events {
-        let event_type = item
-            .get("event_type")
-            .or_else(|| item.get("eventType"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_lowercase();
-        if !event_type.is_empty() && event_type != "sale" {
-            continue;
+    let mut next: Option<String> = None;
+    let mut seen_cursors = BTreeSet::new();
+    loop {
+        let mut url =
+            Url::parse(&base_events_url).map_err(|err| AppError::Http(err.to_string()))?;
+        if let Some(cursor) = next.as_deref() {
+            url.query_pairs_mut().append_pair("next", cursor);
         }
-        let nft = item
-            .get("nft")
-            .or_else(|| item.get("asset"))
-            .unwrap_or(&Value::Null);
-        let payment = item
-            .get("payment")
-            .or_else(|| item.get("payment_token"))
-            .unwrap_or(&Value::Null);
-        let payment_symbol = payment
-            .get("symbol")
-            .or_else(|| item.get("payment_token_symbol"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_uppercase();
-        let raw_value = numeric_value(
-            item.get("payment_quantity")
-                .or_else(|| payment.get("quantity"))
-                .or_else(|| item.get("price"))
-                .or_else(|| item.get("total_price")),
-        )
-        .unwrap_or(0.0);
-        let payment_decimals = payment
-            .get("decimals")
-            .and_then(Value::as_i64)
-            .or_else(|| {
-                payment
-                    .get("decimals")
-                    .and_then(Value::as_str)
-                    .and_then(|text| text.parse::<i64>().ok())
-            })
-            .unwrap_or(18)
-            .max(0) as i32;
-        let token_id_value = nft
-            .get("identifier")
-            .or_else(|| nft.get("token_id"))
-            .and_then(Value::as_str)
-            .unwrap_or_else(|| token_id.unwrap_or(""));
-        let normalized = to_normalized_amount(
-            raw_value / 10f64.powi(payment_decimals),
-            &payment_symbol,
-            eth_usd_rate,
-        );
-        rows.push(NftSaleRecord {
-            contract_address: nft
-                .get("contract")
-                .or_else(|| nft.get("contract_address"))
-                .or_else(|| item.get("asset_contract_address"))
+        let payload: Value = client
+            .get_json_with_headers(url.as_str(), headers.clone())
+            .await?;
+        let events = payload
+            .get("asset_events")
+            .or_else(|| payload.get("events"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for item in events {
+            let event_type = item
+                .get("event_type")
+                .or_else(|| item.get("eventType"))
                 .and_then(Value::as_str)
-                .unwrap_or(contract_address)
-                .to_lowercase(),
-            token_id: normalize_token_id(Some(&Value::String(token_id_value.to_string()))),
-            tx_hash: item
-                .get("transaction")
-                .or_else(|| item.get("transaction_hash"))
-                .or_else(|| item.get("order_hash"))
-                .and_then(|value| {
-                    value
-                        .as_str()
-                        .or_else(|| value.get("hash").and_then(Value::as_str))
+                .unwrap_or("")
+                .to_lowercase();
+            if !event_type.is_empty() && event_type != "sale" {
+                continue;
+            }
+            let nft = item
+                .get("nft")
+                .or_else(|| item.get("asset"))
+                .unwrap_or(&Value::Null);
+            let payment = item
+                .get("payment")
+                .or_else(|| item.get("payment_token"))
+                .unwrap_or(&Value::Null);
+            let payment_symbol = payment
+                .get("symbol")
+                .or_else(|| item.get("payment_token_symbol"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_uppercase();
+            let raw_value = numeric_value(
+                item.get("payment_quantity")
+                    .or_else(|| payment.get("quantity"))
+                    .or_else(|| item.get("price"))
+                    .or_else(|| item.get("total_price")),
+            )
+            .unwrap_or(0.0);
+            let payment_decimals = payment
+                .get("decimals")
+                .and_then(Value::as_i64)
+                .or_else(|| {
+                    payment
+                        .get("decimals")
+                        .and_then(Value::as_str)
+                        .and_then(|text| text.parse::<i64>().ok())
                 })
-                .unwrap_or("")
-                .to_lowercase(),
-            block_number: integer_field(&item, &["block_number", "blockNumber"]),
-            log_index: integer_field(&item, &["event_index", "log_index", "logIndex"]),
-            bundle_index: integer_field(&item, &["bundle_index", "bundleIndex"]),
-            buyer_address: string_or_nested_field(
-                &item,
-                &[
-                    "to_account",
-                    "winner_account",
-                    "buyer",
-                    "buyer_address",
-                    "buyerAddress",
-                    "taker",
-                ],
-            )
-            .to_lowercase(),
-            seller_address: string_or_nested_field(
-                &item,
-                &[
-                    "from_account",
-                    "seller",
-                    "seller_address",
-                    "sellerAddress",
-                    "maker",
-                ],
-            )
-            .to_lowercase(),
-            marketplace: "opensea".to_string(),
-            taker: item
-                .get("taker")
+                .unwrap_or(18)
+                .max(0) as i32;
+            let token_id_value = nft
+                .get("identifier")
+                .or_else(|| nft.get("token_id"))
                 .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            payment_token_symbol: payment_symbol.clone(),
-            payment_token_address: payment
-                .get("address")
-                .or_else(|| payment.get("token_address"))
-                .or_else(|| payment.get("tokenAddress"))
-                .and_then(Value::as_str)
-                .unwrap_or("")
+                .unwrap_or_else(|| token_id.unwrap_or(""));
+            let normalized = to_normalized_amount(
+                raw_value / 10f64.powi(payment_decimals),
+                &payment_symbol,
+                eth_usd_rate,
+            );
+            rows.push(NftSaleRecord {
+                contract_address: nft
+                    .get("contract")
+                    .or_else(|| nft.get("contract_address"))
+                    .or_else(|| item.get("asset_contract_address"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(contract_address)
+                    .to_lowercase(),
+                token_id: normalize_token_id(Some(&Value::String(token_id_value.to_string()))),
+                tx_hash: item
+                    .get("transaction")
+                    .or_else(|| item.get("transaction_hash"))
+                    .or_else(|| item.get("order_hash"))
+                    .and_then(|value| {
+                        value
+                            .as_str()
+                            .or_else(|| value.get("hash").and_then(Value::as_str))
+                    })
+                    .unwrap_or("")
+                    .to_lowercase(),
+                block_number: integer_field(&item, &["block_number", "blockNumber"]),
+                log_index: integer_field(&item, &["event_index", "log_index", "logIndex"]),
+                bundle_index: integer_field(&item, &["bundle_index", "bundleIndex"]),
+                buyer_address: string_or_nested_field(
+                    &item,
+                    &[
+                        "to_account",
+                        "winner_account",
+                        "buyer",
+                        "buyer_address",
+                        "buyerAddress",
+                        "taker",
+                    ],
+                )
                 .to_lowercase(),
-            price_eth: normalized.eth,
-            price_usd: normalized.usd,
-            seller_fee_eth: normalized.eth.unwrap_or(0.0),
-            seller_fee_usd: normalized.usd.unwrap_or(0.0),
-            protocol_fee_eth: 0.0,
-            protocol_fee_usd: 0.0,
-            royalty_fee_eth: 0.0,
-            royalty_fee_usd: 0.0,
-            source: "opensea".to_string(),
-            is_native_eth: is_native_eth_symbol(&payment_symbol),
-        });
+                seller_address: string_or_nested_field(
+                    &item,
+                    &[
+                        "from_account",
+                        "seller",
+                        "seller_address",
+                        "sellerAddress",
+                        "maker",
+                    ],
+                )
+                .to_lowercase(),
+                marketplace: "opensea".to_string(),
+                taker: item
+                    .get("taker")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                payment_token_symbol: payment_symbol.clone(),
+                payment_token_address: payment
+                    .get("address")
+                    .or_else(|| payment.get("token_address"))
+                    .or_else(|| payment.get("tokenAddress"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_lowercase(),
+                price_eth: normalized.eth,
+                price_usd: normalized.usd,
+                seller_fee_eth: normalized.eth.unwrap_or(0.0),
+                seller_fee_usd: normalized.usd.unwrap_or(0.0),
+                protocol_fee_eth: 0.0,
+                protocol_fee_usd: 0.0,
+                royalty_fee_eth: 0.0,
+                royalty_fee_usd: 0.0,
+                source: "opensea".to_string(),
+                is_native_eth: is_native_eth_symbol(&payment_symbol),
+            });
+        }
+
+        let next_cursor = payload.get("next").and_then(Value::as_str).unwrap_or("");
+        if next_cursor.is_empty() {
+            return Ok(rows);
+        }
+        if !seen_cursors.insert(next_cursor.to_string()) {
+            return Err(AppError::Http(format!(
+                "opensea events pagination stalled on repeated next cursor: {next_cursor}"
+            )));
+        }
+        next = Some(next_cursor.to_string());
     }
-    Ok(rows)
 }
 
 pub async fn fetch_opensea_contract_metadata(
@@ -647,8 +668,12 @@ pub async fn fetch_contract_sales(
         )
         .await
         {
-            Ok(rows) if !rows.is_empty() => return Ok(rows),
-            Ok(_) => {}
+            Ok(rows) => {
+                let rows = filter_sales_for_contract(rows, contract_address);
+                if !rows.is_empty() {
+                    return Ok(rows);
+                }
+            }
             Err(err) => {
                 eprintln!(
                     "warning: OpenSea contract sales failed for {contract_address}: {err}; falling back to Alchemy"
@@ -656,5 +681,16 @@ pub async fn fetch_contract_sales(
             }
         }
     }
-    fetch_alchemy_nft_sales(client, endpoints, contract_address, None, eth_usd_rate).await
+    fetch_alchemy_nft_sales(client, endpoints, contract_address, None, eth_usd_rate)
+        .await
+        .map(|rows| filter_sales_for_contract(rows, contract_address))
+}
+
+fn filter_sales_for_contract(
+    rows: Vec<NftSaleRecord>,
+    contract_address: &str,
+) -> Vec<NftSaleRecord> {
+    rows.into_iter()
+        .filter(|sale| sale.contract_address.eq_ignore_ascii_case(contract_address))
+        .collect()
 }

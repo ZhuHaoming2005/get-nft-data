@@ -522,6 +522,71 @@ async fn contract_sales_use_opensea_before_alchemy_when_available() {
 }
 
 #[tokio::test]
+async fn contract_sales_paginates_opensea_events_with_next_cursor() {
+    let (base_url, server) = spawn_sequential_json_server(vec![
+        (
+            "/api/v2/events?event_type=sale&asset_contract_address=0xdup&chain=ethereum"
+                .to_string(),
+            serde_json::json!({
+                "events": [{
+                    "event_type": "sale",
+                    "asset_contract_address": "0xdup",
+                    "nft": {"identifier": "1"},
+                    "payment": {"symbol": "USDC", "decimals": 6},
+                    "payment_quantity": "5000000",
+                    "transaction_hash": "0xpage1",
+                    "block_number": 11,
+                    "event_index": 1,
+                    "to_account": {"address": "0xbuyer1"},
+                    "from_account": {"address": "0xseller1"}
+                }],
+                "next": "cursor-2"
+            }),
+        ),
+        (
+            "/api/v2/events?event_type=sale&asset_contract_address=0xdup&chain=ethereum&next=cursor-2"
+                .to_string(),
+            serde_json::json!({
+                "events": [{
+                    "event_type": "sale",
+                    "asset_contract_address": "0xdup",
+                    "nft": {"identifier": "2"},
+                    "payment": {"symbol": "USDC", "decimals": 6},
+                    "payment_quantity": "7000000",
+                    "transaction_hash": "0xpage2",
+                    "block_number": 12,
+                    "event_index": 2,
+                    "to_account": {"address": "0xbuyer2"},
+                    "from_account": {"address": "0xseller2"}
+                }],
+                "next": ""
+            }),
+        ),
+    ])
+    .await;
+    let client = test_client();
+    let endpoints = test_endpoints(&base_url);
+
+    let rows = fetch_contract_sales(&client, &endpoints, "ethereum", "0xdup", "opensea", None)
+        .await
+        .unwrap();
+    if rows.len() == 2 {
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    } else {
+        server.abort();
+    }
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].tx_hash, "0xpage1");
+    assert_eq!(rows[1].tx_hash, "0xpage2");
+    assert_eq!(rows[0].price_usd, Some(5.0));
+    assert_eq!(rows[1].price_usd, Some(7.0));
+}
+
+#[tokio::test]
 async fn contract_sales_opensea_fallback_uses_requested_chain() {
     let alchemy_server = MockServer::start_async().await;
     alchemy_server

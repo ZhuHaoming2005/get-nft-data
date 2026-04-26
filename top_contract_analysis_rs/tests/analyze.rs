@@ -2360,6 +2360,50 @@ fn single_report_detailed_sections_keep_python_none_rendering_for_missing_leaf_v
 }
 
 #[test]
+fn single_report_aggregates_victim_addresses_by_address() {
+    let payload = SingleReportPayload {
+        victim_addresses: vec![
+            VictimAddressPayload {
+                address: "0xvictim".into(),
+                buy_tx_hashes: vec!["0xbuy1".into()],
+                buy_amount_eth: 0.0,
+                buy_amount_usd: 5.0,
+                last_buy_amount_eth: Some(0.0),
+                last_buy_amount_usd: Some(5.0),
+                buy_before_usd_balance: Some(20.0),
+                buy_asset_ratio: Some(0.25),
+                is_stuck: false,
+                last_buy_tx_hash: "0xbuy1".into(),
+                ratio_status: "ok".into(),
+                ..Default::default()
+            },
+            VictimAddressPayload {
+                address: "0xvictim".into(),
+                buy_tx_hashes: vec!["0xbuy2".into()],
+                buy_amount_eth: 0.0,
+                buy_amount_usd: 7.0,
+                last_buy_amount_eth: Some(0.0),
+                last_buy_amount_usd: Some(7.0),
+                buy_before_usd_balance: Some(30.0),
+                buy_asset_ratio: Some(7.0 / 30.0),
+                is_stuck: true,
+                last_buy_tx_hash: "0xbuy2".into(),
+                ratio_status: "ok".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let markdown = render_human_readable_report(&payload);
+
+    assert_eq!(markdown.matches("- 0xvictim:").count(), 1);
+    assert!(markdown.contains(
+        "- 0xvictim: buy_tx_count=2 | 买入金额(USD)=12 | 最后一次买入金额(USD)=7 | 买入前钱包余额(USD): 30 | 买入占比=23.33% | 套牢=是 | last_buy_tx=0xbuy2"
+    ));
+}
+
+#[test]
 fn single_report_fraud_trade_stats_fall_back_to_native_eth_fields() {
     let payload = SingleReportPayload {
         fraud_trade_stats: BTreeMap::from([(

@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use once_cell::sync::Lazy;
@@ -5,7 +6,7 @@ use regex::Regex;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::error::AppError;
-use crate::models::{BatchSummaryPayload, SingleReportPayload};
+use crate::models::{BatchSummaryPayload, SingleReportPayload, VictimAddressPayload};
 
 static SLUG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[^0-9a-zA-Z\u{4e00}-\u{9fff}]+").unwrap());
 
@@ -45,6 +46,69 @@ fn usd_or_legacy(usd: f64, legacy_eth: f64) -> f64 {
     } else {
         legacy_eth
     }
+}
+
+#[derive(Default)]
+struct VictimAddressReportRow {
+    address: String,
+    buy_tx_hashes: BTreeSet<String>,
+    buy_amount_eth: f64,
+    buy_amount_usd: f64,
+    last_buy_amount_eth: Option<f64>,
+    last_buy_amount_usd: Option<f64>,
+    buy_before_eth_balance: Option<f64>,
+    buy_before_usd_balance: Option<f64>,
+    buy_asset_ratio: Option<f64>,
+    is_stuck: bool,
+    last_buy_tx_hash: String,
+}
+
+impl VictimAddressReportRow {
+    fn absorb(&mut self, item: &VictimAddressPayload) {
+        if self.address.is_empty() {
+            self.address = item.address.clone();
+        }
+        let mut contributed_new_tx = item.buy_tx_hashes.is_empty();
+        for tx_hash in &item.buy_tx_hashes {
+            if self.buy_tx_hashes.insert(tx_hash.clone()) {
+                contributed_new_tx = true;
+            }
+        }
+        if contributed_new_tx {
+            self.buy_amount_eth += item.buy_amount_eth;
+            self.buy_amount_usd += item.buy_amount_usd;
+        }
+        self.is_stuck |= item.is_stuck;
+        if item.last_buy_amount_eth.is_some() {
+            self.last_buy_amount_eth = item.last_buy_amount_eth;
+        }
+        if item.last_buy_amount_usd.is_some() {
+            self.last_buy_amount_usd = item.last_buy_amount_usd;
+        }
+        if item.buy_before_eth_balance.is_some() {
+            self.buy_before_eth_balance = item.buy_before_eth_balance;
+        }
+        if item.buy_before_usd_balance.is_some() {
+            self.buy_before_usd_balance = item.buy_before_usd_balance;
+        }
+        if item.buy_asset_ratio.is_some() {
+            self.buy_asset_ratio = item.buy_asset_ratio;
+        }
+        if !item.last_buy_tx_hash.is_empty() {
+            self.last_buy_tx_hash = item.last_buy_tx_hash.clone();
+        }
+    }
+}
+
+fn aggregate_victim_addresses(rows: &[VictimAddressPayload]) -> Vec<VictimAddressReportRow> {
+    let mut by_address = BTreeMap::<String, VictimAddressReportRow>::new();
+    for item in rows {
+        by_address
+            .entry(item.address.clone())
+            .or_default()
+            .absorb(item);
+    }
+    by_address.into_values().collect()
 }
 
 pub fn default_output_basename(payload: &SingleReportPayload) -> String {
@@ -347,7 +411,7 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
     if payload.victim_addresses.is_empty() {
         lines.push("- 无".to_string());
     } else {
-        for item in &payload.victim_addresses {
+        for item in aggregate_victim_addresses(&payload.victim_addresses) {
             lines.push(format!(
                 "- {}: buy_tx_count={} | 买入金额(USD)={} | 最后一次买入金额(USD)={} | 买入前钱包余额(USD): {} | 买入占比={} | 套牢={} | last_buy_tx={}",
                 item.address,

@@ -398,13 +398,31 @@ fn infringing_token_records_capture_mint_context_and_match_reasons() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].token_id, "1");
     assert_eq!(rows[0].minter_address, "0xminter");
-    assert_eq!(rows[0].first_transfer_time, 100);
+    assert_eq!(rows[0].first_transfer_time, 120);
     assert_eq!(
         rows[0].match_reasons,
         vec!["token_uri_match".to_string(), "name_match".to_string()]
     );
     assert!(!rows[0].candidate_open_license);
     assert!(!rows[0].official_or_legit_reissue);
+}
+
+#[test]
+fn infringing_token_records_do_not_treat_mint_as_first_transfer() {
+    let candidates = vec![DuplicateCandidate {
+        contract_address: "0xdup".into(),
+        token_id: "1".into(),
+        match_reasons: vec!["name_match".into()],
+        ..Default::default()
+    }];
+    let transfers = vec![TransferRecord::mint("0xdup", "1", 100, "0xminter")];
+
+    let rows = build_infringing_token_records("0xdup", &candidates, &transfers);
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].minter_address, "0xminter");
+    assert_eq!(rows[0].mint_tx_hash, "");
+    assert_eq!(rows[0].first_transfer_time, 0);
 }
 
 #[test]
