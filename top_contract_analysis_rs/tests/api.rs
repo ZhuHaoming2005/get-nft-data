@@ -13,7 +13,7 @@ use top_contract_analysis_rs::api::{
 use top_contract_analysis_rs::models::SeedNft;
 
 fn test_client() -> AsyncApiClient {
-    AsyncApiClient::new(5, 4, 2, 2).unwrap()
+    AsyncApiClient::new(5, 4).unwrap()
 }
 
 fn test_endpoints(base_url: &str) -> ApiEndpoints {

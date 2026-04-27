@@ -1604,6 +1604,174 @@ impl ConcurrentContractApi {
     }
 }
 
+struct StaggeredExpansionApi {
+    slow_expansion_done: AtomicUsize,
+    transfer_before_slow_expansion_done: AtomicUsize,
+}
+
+impl StaggeredExpansionApi {
+    fn new() -> Self {
+        Self {
+            slow_expansion_done: AtomicUsize::new(0),
+            transfer_before_slow_expansion_done: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl AnalyzeApi for StaggeredExpansionApi {
+    async fn fetch_contract_metadata(
+        &self,
+        chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _opensea_api_key: &str,
+        contract_address: &str,
+    ) -> Result<ContractMetadata, AppError> {
+        Ok(ContractMetadata {
+            chain: chain.to_string(),
+            contract_address: contract_address.to_string(),
+            token_type: "ERC721".into(),
+            contract_deployer: "0xcreator".into(),
+            deployed_block_number: 123,
+            name: "Azuki".into(),
+            symbol: "AZUKI".into(),
+        })
+    }
+
+    async fn fetch_seed_contract_nfts(
+        &self,
+        chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        contract_address: &str,
+    ) -> Result<Vec<SeedNft>, AppError> {
+        Ok(vec![SeedNft {
+            chain: chain.to_string(),
+            contract_address: contract_address.to_string(),
+            token_id: "1".into(),
+            name: "Azuki #1".into(),
+            symbol: "AZUKI".into(),
+            token_uri: "ipfs://seed/1".into(),
+            image_uri: "ipfs://image/1.png".into(),
+            metadata_json: r#"{"name":"Azuki #1","description":"gold dragon"}"#.into(),
+            metadata_doc: "gold dragon".into(),
+        }])
+    }
+
+    async fn fetch_contract_nfts(
+        &self,
+        chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _etherscan_api_key: &str,
+        _opensea_api_key: &str,
+        contract_address: &str,
+    ) -> Result<Vec<SeedNft>, AppError> {
+        if contract_address == "0xdup2" {
+            sleep(Duration::from_millis(120)).await;
+            self.slow_expansion_done.store(1, Ordering::SeqCst);
+        }
+        Ok(vec![SeedNft {
+            chain: chain.to_string(),
+            contract_address: contract_address.to_string(),
+            token_id: "1".into(),
+            name: format!("Azuki Mirror {}", &contract_address[5..]),
+            symbol: "AZUKI".into(),
+            token_uri: "ipfs://seed/1".into(),
+            image_uri: "ipfs://image/1.png".into(),
+            metadata_json: r#"{"description":"gold dragon"}"#.into(),
+            metadata_doc: "gold dragon".into(),
+        }])
+    }
+
+    async fn fetch_contract_transfers(
+        &self,
+        _chain: &str,
+        _etherscan_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _alchemy_api_key: &str,
+        contract_address: &str,
+        _token_type: &str,
+    ) -> Result<Vec<TransferRecord>, AppError> {
+        if contract_address == "0xdup1" && self.slow_expansion_done.load(Ordering::SeqCst) == 0 {
+            self.transfer_before_slow_expansion_done
+                .store(1, Ordering::SeqCst);
+        }
+        Ok(vec![TransferRecord {
+            contract_address: contract_address.to_string(),
+            token_id: "1".into(),
+            tx_hash: format!("0xmint-{contract_address}"),
+            log_index: 0,
+            block_number: 1,
+            block_time: 100,
+            from_address: "0x0000000000000000000000000000000000000000".into(),
+            to_address: "0xminter".into(),
+            event_type: "erc721".into(),
+            source: "alchemy".into(),
+        }])
+    }
+
+    async fn fetch_contract_owners(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _contract_address: &str,
+    ) -> Result<Vec<OwnerBalance>, AppError> {
+        Ok(vec![])
+    }
+
+    async fn fetch_contract_sales(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _contract_address: &str,
+        _opensea_api_key: &str,
+    ) -> Result<Vec<NftSaleRecord>, AppError> {
+        Ok(vec![])
+    }
+
+    async fn fetch_transaction_receipt(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _tx_hash: &str,
+    ) -> Result<TransactionReceiptRecord, AppError> {
+        Ok(TransactionReceiptRecord::default())
+    }
+
+    async fn fetch_transaction_receipts_for_block(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _block_number: i64,
+    ) -> Result<BTreeMap<String, TransactionReceiptRecord>, AppError> {
+        Ok(BTreeMap::new())
+    }
+
+    async fn fetch_eth_balance(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _address: &str,
+        _block_number: i64,
+    ) -> Result<f64, AppError> {
+        Ok(0.0)
+    }
+
+    async fn fetch_same_block_eth_transfers_for_address(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _block_number: i64,
+        _address: &str,
+    ) -> Result<Vec<EthTransferRecord>, AppError> {
+        Ok(vec![])
+    }
+}
+
 #[async_trait]
 impl AnalyzeApi for ConcurrentContractApi {
     async fn fetch_contract_metadata(
@@ -3439,6 +3607,69 @@ async fn analyze_processes_duplicate_contracts_within_a_seed_concurrently() {
     assert!(
         api.max_transfer_fetches.load(Ordering::SeqCst) >= 2,
         "expected duplicate contract analysis to overlap within one seed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn analyze_starts_contract_analysis_before_all_provider_expansions_finish() {
+    let api = Arc::new(StaggeredExpansionApi::new());
+    let deps = AnalysisDeps {
+        api: api.clone(),
+        feature_store: Arc::new(FakeFeatureStore {
+            snapshot: DatabaseSnapshot {
+                nft_rows: vec![
+                    DatabaseNftRecord {
+                        contract_address: "0xdup1".into(),
+                        token_id: "1".into(),
+                        token_uri: "ipfs://seed/1".into(),
+                        image_uri: "ipfs://image/1.png".into(),
+                        name: "Azuki Mirror #1".into(),
+                        symbol: "AZUKI".into(),
+                        metadata_json: r#"{"description":"gold dragon"}"#.into(),
+                        metadata_doc: "gold dragon".into(),
+                        metadata_recall_checked: false,
+                        metadata_recall_match: false,
+                    },
+                    DatabaseNftRecord {
+                        contract_address: "0xdup2".into(),
+                        token_id: "1".into(),
+                        token_uri: "ipfs://seed/1".into(),
+                        image_uri: "ipfs://image/1.png".into(),
+                        name: "Azuki Mirror #2".into(),
+                        symbol: "AZUKI".into(),
+                        metadata_json: r#"{"description":"gold dragon"}"#.into(),
+                        metadata_doc: "gold dragon".into(),
+                        metadata_recall_checked: false,
+                        metadata_recall_match: false,
+                    },
+                ],
+                ..DatabaseSnapshot::default()
+            },
+        }),
+        signal_cache: None,
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    let payload = analyze_seed_contract(
+        AnalyzeRequest {
+            chain: "ethereum".into(),
+            seed_contract_address: "0xseed".into(),
+            alchemy_api_key: "key".into(),
+            contract_max_concurrency: 2,
+            ..AnalyzeRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(payload.duplicate_contracts.len(), 2);
+    assert_eq!(
+        api.transfer_before_slow_expansion_done
+            .load(Ordering::SeqCst),
+        1,
+        "expected fast contract analysis to start before slow provider expansion finished"
     );
 }
 

@@ -41,26 +41,17 @@ impl ApiEndpoints {
 pub struct AsyncApiClient {
     pub http: reqwest::Client,
     pub request_limit: Arc<Semaphore>,
-    pub contract_limit: Arc<Semaphore>,
-    pub sale_metric_limit: Arc<Semaphore>,
     retries: usize,
 }
 
 impl AsyncApiClient {
-    pub fn new(
-        timeout_seconds: u64,
-        max_concurrency: usize,
-        contract_max_concurrency: usize,
-        sale_metric_max_concurrency: usize,
-    ) -> Result<Self, AppError> {
+    pub fn new(timeout_seconds: u64, max_concurrency: usize) -> Result<Self, AppError> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_seconds))
             .build()?;
         Ok(Self {
             http,
             request_limit: Arc::new(Semaphore::new(max_concurrency.max(1))),
-            contract_limit: Arc::new(Semaphore::new(contract_max_concurrency.max(1))),
-            sale_metric_limit: Arc::new(Semaphore::new(sale_metric_max_concurrency.max(1))),
             retries: DEFAULT_ALCHEMY_RETRIES,
         })
     }

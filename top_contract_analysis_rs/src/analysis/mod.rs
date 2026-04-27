@@ -396,19 +396,9 @@ pub struct RealApi {
 }
 
 impl RealApi {
-    pub fn new(
-        timeout_seconds: u64,
-        api_max_concurrency: usize,
-        contract_max_concurrency: usize,
-        sale_metric_max_concurrency: usize,
-    ) -> Result<Self, AppError> {
+    pub fn new(timeout_seconds: u64, api_max_concurrency: usize) -> Result<Self, AppError> {
         Ok(Self {
-            client: AsyncApiClient::new(
-                timeout_seconds,
-                api_max_concurrency,
-                contract_max_concurrency,
-                sale_metric_max_concurrency,
-            )?,
+            client: AsyncApiClient::new(timeout_seconds, api_max_concurrency)?,
             eth_usd_rate: crate::currency::EthUsdRateCache::default(),
             eth_usd_rate_warning_emitted: AtomicBool::new(false),
         })
@@ -937,23 +927,6 @@ async fn analyze_seed_contract_with_limits(
     let grouped = group_candidates_by_contract(&candidates);
 
     let contracts_to_analyze: Vec<String> = grouped.keys().cloned().collect();
-    let expanded_candidates_by_contract = if open_license || contracts_to_analyze.is_empty() {
-        BTreeMap::new()
-    } else {
-        let expanded_contract_tokens = fetch_contract_nfts_for_matched_contracts(
-            &request,
-            deps,
-            &contracts_to_analyze,
-            &snapshot.nft_rows,
-            contract_concurrency,
-            &runtime_limits,
-        )
-        .await?;
-        expand_candidates_to_contract_tokens(&grouped, &candidates, &expanded_contract_tokens)
-    };
-
-    let mut duplicate_contracts =
-        build_duplicate_contract_payloads(&expanded_candidates_by_contract);
     let snapshot_rows_by_key: HashMap<(String, String), _> = snapshot
         .nft_rows
         .iter()
@@ -990,6 +963,7 @@ async fn analyze_seed_contract_with_limits(
     let mut honest_address_stats = BTreeMap::new();
     let mut victim_addresses = Vec::new();
     let mut fraud_trade_stats = BTreeMap::<String, FraudTradeStatsPayload>::new();
+    let mut expanded_candidates_by_contract = BTreeMap::new();
     let analysis_timestamp = chrono::Utc::now().timestamp();
     let token_type = payload_token_type(&seed_contract);
     if !open_license {
@@ -998,40 +972,48 @@ async fn analyze_seed_contract_with_limits(
             .await;
 
         let mut completed_contracts = 0;
+        let snapshot_token_index = SnapshotTokenIndex::new(&snapshot.nft_rows);
         let request_ref = &request;
         let deps_ref = deps;
         let token_type_ref = token_type.as_str();
-        let expanded_candidates_by_contract_ref = &expanded_candidates_by_contract;
+        let grouped_ref = &grouped;
+        let candidates_ref = &candidates;
+        let snapshot_token_index_ref = &snapshot_token_index;
         let official_addresses_ref = &official_addresses;
         let candidate_open_license_by_token_ref = &candidate_open_license_by_token;
         let runtime_limits_ref = &runtime_limits;
         let mut contract_analyses = stream::iter(contracts_to_analyze.iter().enumerate().map(
-            |(index, contract_address)| {
-                let contract_candidates = expanded_candidates_by_contract_ref
-                    .get(contract_address)
-                    .cloned()
-                    .unwrap_or_default();
-                async move {
-                    let result = analyze_duplicate_contract(
-                        request_ref,
-                        deps_ref,
-                        token_type_ref,
-                        contract_address,
-                        &contract_candidates,
-                        official_addresses_ref,
-                        candidate_open_license_by_token_ref,
-                        analysis_timestamp,
-                        runtime_limits_ref,
-                    )
-                    .await;
-                    (index, contract_address.clone(), result)
-                }
+            |(index, contract_address)| async move {
+                let contract_candidates = fetch_and_expand_contract_candidates(
+                    request_ref,
+                    deps_ref,
+                    contract_address,
+                    grouped_ref,
+                    candidates_ref,
+                    snapshot_token_index_ref,
+                    runtime_limits_ref,
+                )
+                .await?;
+                let result = analyze_duplicate_contract(
+                    request_ref,
+                    deps_ref,
+                    token_type_ref,
+                    contract_address,
+                    &contract_candidates,
+                    official_addresses_ref,
+                    candidate_open_license_by_token_ref,
+                    analysis_timestamp,
+                    runtime_limits_ref,
+                )
+                .await?;
+                Ok::<_, AppError>((index, contract_address.clone(), contract_candidates, result))
             },
         ))
         .buffer_unordered(contract_concurrency);
 
         let mut contract_results = Vec::new();
-        while let Some((index, contract_address, result)) = contract_analyses.next().await {
+        while let Some(result) = contract_analyses.next().await {
+            let (index, contract_address, contract_candidates, result) = result?;
             completed_contracts += 1;
             progress
                 .on_duplicate_contract_completed(
@@ -1040,11 +1022,12 @@ async fn analyze_seed_contract_with_limits(
                     contracts_to_analyze.len(),
                 )
                 .await;
-            contract_results.push((index, result?));
+            contract_results.push((index, contract_address, contract_candidates, result));
         }
 
-        contract_results.sort_by_key(|(index, _)| *index);
-        for (_, result) in contract_results {
+        contract_results.sort_by_key(|(index, _, _, _)| *index);
+        for (_, contract_address, contract_candidates, result) in contract_results {
+            expanded_candidates_by_contract.insert(contract_address, contract_candidates);
             if let Some(legit_duplicate) = result.legit_duplicate {
                 legit_contract_addresses.insert(result.contract_address.clone());
                 legit_duplicates.push(legit_duplicate);
@@ -1064,6 +1047,8 @@ async fn analyze_seed_contract_with_limits(
             victim_addresses.extend(result.victim_addresses);
         }
     }
+    let mut duplicate_contracts =
+        build_duplicate_contract_payloads(&expanded_candidates_by_contract);
     duplicate_contracts.retain(|item| !legit_contract_addresses.contains(&item.contract_address));
     if open_license {
         duplicate_contracts.clear();
@@ -1127,17 +1112,18 @@ async fn analyze_duplicate_contract(
     analysis_timestamp: i64,
     runtime_limits: &RuntimeLimits,
 ) -> Result<ContractAnalysisResult, AppError> {
-    let _contract_permit = acquire_optional_limit(&runtime_limits.contract_limit).await?;
     let contract_candidate_refs: Vec<&DuplicateCandidate> = contract_candidates.iter().collect();
     let cached_signals = if let Some(cache) = deps.signal_cache.as_ref() {
         cache.get(&request.chain, contract_address, token_type)?
     } else {
         None
     };
-    let (transfers, owners, transfer_signals, victim_signal, sales) =
-        if let Some(cached) = cached_signals {
-            let sales = deps
-                .api
+    let (transfers, owners, transfer_signals, victim_signal, sales) = if let Some(cached) =
+        cached_signals
+    {
+        let sales = {
+            let _contract_permit = acquire_optional_limit(&runtime_limits.contract_limit).await?;
+            deps.api
                 .fetch_contract_sales(
                     &request.chain,
                     &request.alchemy_api_key,
@@ -1145,18 +1131,21 @@ async fn analyze_duplicate_contract(
                     contract_address,
                     &request.opensea_api_key,
                 )
-                .await?;
-            (
-                cached.transfers,
-                cached.owners,
-                cached.address_signals,
-                cached
-                    .victim_signals
-                    .unwrap_or_else(|| analyze_victim_signals_from_active_sellers(&[], &[])),
-                sales,
-            )
-        } else {
-            let (transfers, owners, sales) = tokio::join!(
+                .await?
+        };
+        (
+            cached.transfers,
+            cached.owners,
+            cached.address_signals,
+            cached
+                .victim_signals
+                .unwrap_or_else(|| analyze_victim_signals_from_active_sellers(&[], &[])),
+            sales,
+        )
+    } else {
+        let (transfers, owners, sales) = {
+            let _contract_permit = acquire_optional_limit(&runtime_limits.contract_limit).await?;
+            tokio::join!(
                 deps.api.fetch_contract_transfers(
                     &request.chain,
                     &request.etherscan_api_key,
@@ -1178,23 +1167,24 @@ async fn analyze_duplicate_contract(
                     contract_address,
                     &request.opensea_api_key,
                 )
-            );
-            let transfers = transfers?;
-            let owners = owners?;
-            let sales = sales?;
-            if let Some(cache) = deps.signal_cache.as_ref() {
-                cache.put(
-                    &request.chain,
-                    contract_address,
-                    token_type,
-                    &transfers,
-                    &owners,
-                )?;
-            }
-            let transfer_signals = signals::analyze_transfer_signals(&transfers);
-            let victim_signal = analyze_victim_signals_from_active_sellers(&transfers, &owners);
-            (transfers, owners, transfer_signals, victim_signal, sales)
+            )
         };
+        let transfers = transfers?;
+        let owners = owners?;
+        let sales = sales?;
+        if let Some(cache) = deps.signal_cache.as_ref() {
+            cache.put(
+                &request.chain,
+                contract_address,
+                token_type,
+                &transfers,
+                &owners,
+            )?;
+        }
+        let transfer_signals = signals::analyze_transfer_signals(&transfers);
+        let victim_signal = analyze_victim_signals_from_active_sellers(&transfers, &owners);
+        (transfers, owners, transfer_signals, victim_signal, sales)
+    };
     let sale_metrics_by_tx =
         compute_sale_metrics_for_contract(request, deps, &sales, runtime_limits).await?;
 
@@ -1961,153 +1951,136 @@ fn candidate_has_wrapper_or_vault_semantics(
             .any(|token| matches!(token, "vault" | "vaulted"))
 }
 
-async fn fetch_contract_nfts_for_matched_contracts(
+struct SnapshotTokenIndex<'a> {
+    rows_by_contract: HashMap<String, Vec<&'a crate::models::DatabaseNftRecord>>,
+}
+
+impl<'a> SnapshotTokenIndex<'a> {
+    fn new(snapshot_rows: &'a [crate::models::DatabaseNftRecord]) -> Self {
+        let mut rows_by_contract =
+            HashMap::<String, Vec<&'a crate::models::DatabaseNftRecord>>::new();
+        for row in snapshot_rows {
+            rows_by_contract
+                .entry(row.contract_address.to_lowercase())
+                .or_default()
+                .push(row);
+        }
+        Self { rows_by_contract }
+    }
+
+    fn tokens_for_contract(&self, chain: &str, contract_address: &str) -> Vec<SeedNft> {
+        self.rows_by_contract
+            .get(&contract_address.to_lowercase())
+            .into_iter()
+            .flat_map(|rows| rows.iter().copied())
+            .map(|row| SeedNft {
+                chain: chain.to_string(),
+                contract_address: row.contract_address.clone(),
+                token_id: row.token_id.clone(),
+                name: row.name.clone(),
+                symbol: row.symbol.clone(),
+                token_uri: row.token_uri.clone(),
+                image_uri: row.image_uri.clone(),
+                metadata_json: row.metadata_json.clone(),
+                metadata_doc: row.metadata_doc.clone(),
+            })
+            .collect()
+    }
+}
+
+async fn fetch_and_expand_contract_candidates(
     request: &AnalyzeRequest,
     deps: &AnalysisDeps,
-    contract_addresses: &[String],
-    snapshot_rows: &[crate::models::DatabaseNftRecord],
-    concurrency: usize,
-    runtime_limits: &RuntimeLimits,
-) -> Result<Vec<SeedNft>, AppError> {
-    let mut rows = Vec::new();
-    let mut fetches = stream::iter(
-        contract_addresses
-            .iter()
-            .map(|contract_address| async move {
-                let _permit = acquire_optional_limit(&runtime_limits.contract_limit).await;
-                let _permit = match _permit {
-                    Ok(permit) => permit,
-                    Err(err) => {
-                        return (contract_address.clone(), Err(err));
-                    }
-                };
-                let provider_tokens = deps
-                    .api
-                    .fetch_contract_nfts(
-                        &request.chain,
-                        &request.alchemy_api_key,
-                        request.alchemy_network.as_deref(),
-                        &request.etherscan_api_key,
-                        &request.opensea_api_key,
-                        contract_address,
-                    )
-                    .await;
-                (contract_address.clone(), provider_tokens)
-            }),
-    )
-    .buffer_unordered(concurrency.max(1));
-
-    while let Some((contract_address, provider_tokens)) = fetches.next().await {
-        match provider_tokens {
-            Ok(tokens) => {
-                let contract_key = contract_address.to_lowercase();
-                let matching_tokens: Vec<SeedNft> = tokens
-                    .into_iter()
-                    .filter(|row| row.contract_address.to_lowercase() == contract_key)
-                    .collect();
-                if matching_tokens.is_empty() {
-                    eprintln!(
-                        "warning: provider NFT expansion returned no tokens for {contract_address}; falling back to local snapshot rows"
-                    );
-                    rows.extend(local_snapshot_tokens_for_contract(
-                        &request.chain,
-                        &contract_address,
-                        snapshot_rows,
-                    ));
-                } else {
-                    rows.extend(matching_tokens);
-                }
-            }
-            Err(err) => {
-                eprintln!(
-                    "warning: provider NFT expansion failed for {contract_address}: {err}; falling back to local snapshot rows"
-                );
-                rows.extend(local_snapshot_tokens_for_contract(
-                    &request.chain,
-                    &contract_address,
-                    snapshot_rows,
-                ));
-            }
-        }
-    }
-    Ok(rows)
-}
-
-fn local_snapshot_tokens_for_contract(
-    chain: &str,
     contract_address: &str,
-    snapshot_rows: &[crate::models::DatabaseNftRecord],
-) -> Vec<SeedNft> {
-    let contract_key = contract_address.to_lowercase();
-    snapshot_rows
-        .iter()
-        .filter(|row| row.contract_address.to_lowercase() == contract_key)
-        .map(|row| SeedNft {
-            chain: chain.to_string(),
-            contract_address: row.contract_address.clone(),
-            token_id: row.token_id.clone(),
-            name: row.name.clone(),
-            symbol: row.symbol.clone(),
-            token_uri: row.token_uri.clone(),
-            image_uri: row.image_uri.clone(),
-            metadata_json: row.metadata_json.clone(),
-            metadata_doc: row.metadata_doc.clone(),
-        })
-        .collect()
-}
-
-fn expand_candidates_to_contract_tokens(
     grouped: &BTreeMap<String, Vec<usize>>,
     candidates: &[DuplicateCandidate],
-    contract_tokens: &[SeedNft],
-) -> BTreeMap<String, Vec<DuplicateCandidate>> {
-    let tokens_by_contract =
-        contract_tokens
-            .iter()
-            .fold(BTreeMap::<String, Vec<&SeedNft>>::new(), |mut acc, row| {
-                acc.entry(row.contract_address.clone())
-                    .or_default()
-                    .push(row);
-                acc
-            });
-
-    grouped
-        .iter()
-        .map(|(contract_address, candidate_indexes)| {
-            let template = candidate_indexes
-                .iter()
-                .find_map(|index| candidates.get(*index))
-                .cloned()
-                .unwrap_or_else(|| DuplicateCandidate {
-                    contract_address: contract_address.clone(),
-                    ..DuplicateCandidate::default()
-                });
-            let mut seen_tokens = BTreeSet::new();
-            let mut expanded: Vec<DuplicateCandidate> = tokens_by_contract
-                .get(contract_address)
+    snapshot_token_index: &SnapshotTokenIndex<'_>,
+    runtime_limits: &RuntimeLimits,
+) -> Result<Vec<DuplicateCandidate>, AppError> {
+    let contract_key = contract_address.to_lowercase();
+    let provider_tokens = {
+        let _permit = acquire_optional_limit(&runtime_limits.contract_limit).await?;
+        deps.api
+            .fetch_contract_nfts(
+                &request.chain,
+                &request.alchemy_api_key,
+                request.alchemy_network.as_deref(),
+                &request.etherscan_api_key,
+                &request.opensea_api_key,
+                contract_address,
+            )
+            .await
+    };
+    let contract_tokens = match provider_tokens {
+        Ok(tokens) => {
+            let matching_tokens: Vec<SeedNft> = tokens
                 .into_iter()
-                .flat_map(|rows| rows.iter().copied())
-                .filter_map(|row| {
-                    if !seen_tokens.insert(row.token_id.clone()) {
-                        return None;
-                    }
-                    Some(DuplicateCandidate {
-                        contract_address: row.contract_address.clone(),
-                        token_id: row.token_id.clone(),
-                        match_reasons: template.match_reasons.clone(),
-                        confidence: template.confidence.clone(),
-                        token_uri: row.token_uri.clone(),
-                        image_uri: row.image_uri.clone(),
-                        name: row.name.clone(),
-                        symbol: row.symbol.clone(),
-                    })
-                })
+                .filter(|row| row.contract_address.to_lowercase() == contract_key)
                 .collect();
+            if matching_tokens.is_empty() {
+                eprintln!(
+                    "warning: provider NFT expansion returned no tokens for {contract_address}; falling back to local snapshot rows"
+                );
+                snapshot_token_index.tokens_for_contract(&request.chain, contract_address)
+            } else {
+                matching_tokens
+            }
+        }
+        Err(err) => {
+            eprintln!(
+                "warning: provider NFT expansion failed for {contract_address}: {err}; falling back to local snapshot rows"
+            );
+            snapshot_token_index.tokens_for_contract(&request.chain, contract_address)
+        }
+    };
+    Ok(expand_candidate_indexes_to_contract_tokens(
+        contract_address,
+        grouped
+            .get(contract_address)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+        candidates,
+        &contract_tokens,
+    ))
+}
 
-            expanded.sort_by(|left, right| left.token_id.cmp(&right.token_id));
-            (contract_address.clone(), expanded)
+fn expand_candidate_indexes_to_contract_tokens(
+    contract_address: &str,
+    candidate_indexes: &[usize],
+    candidates: &[DuplicateCandidate],
+    contract_tokens: &[SeedNft],
+) -> Vec<DuplicateCandidate> {
+    let template = candidate_indexes
+        .iter()
+        .find_map(|index| candidates.get(*index))
+        .cloned()
+        .unwrap_or_else(|| DuplicateCandidate {
+            contract_address: contract_address.to_string(),
+            ..DuplicateCandidate::default()
+        });
+    let contract_key = contract_address.to_lowercase();
+    let mut seen_tokens = BTreeSet::new();
+    let mut expanded: Vec<DuplicateCandidate> = contract_tokens
+        .iter()
+        .filter(|row| row.contract_address.to_lowercase() == contract_key)
+        .filter_map(|row| {
+            if !seen_tokens.insert(row.token_id.clone()) {
+                return None;
+            }
+            Some(DuplicateCandidate {
+                contract_address: row.contract_address.clone(),
+                token_id: row.token_id.clone(),
+                match_reasons: template.match_reasons.clone(),
+                confidence: template.confidence.clone(),
+                token_uri: row.token_uri.clone(),
+                image_uri: row.image_uri.clone(),
+                name: row.name.clone(),
+                symbol: row.symbol.clone(),
+            })
         })
-        .collect()
+        .collect();
+    expanded.sort_by(|left, right| left.token_id.cmp(&right.token_id));
+    expanded
 }
 
 fn build_contract_payload(

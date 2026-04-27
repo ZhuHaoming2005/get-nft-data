@@ -49,6 +49,11 @@ struct BatchPipelineProbe {
     holder_max_seen: AtomicUsize,
     expansion_current: AtomicUsize,
     expansion_max_seen: AtomicUsize,
+    sale_metric_active: AtomicBool,
+    sale_metric_finished: AtomicBool,
+    sale_metric_receipt_calls: AtomicUsize,
+    holder_started_before_sale_metric_finished: AtomicBool,
+    expansion_observed_sale_metric_active: AtomicBool,
     metadata_calls: AtomicUsize,
     snapshot_calls: AtomicUsize,
 }
@@ -73,6 +78,7 @@ impl BatchPipelineProbe {
 struct InstrumentedFeatureStore {
     probe: Arc<BatchPipelineProbe>,
     sleep_ms: u64,
+    wait_for_transfer_before_seed_two_snapshot: bool,
 }
 
 impl FeatureStoreReader for InstrumentedFeatureStore {
@@ -95,6 +101,13 @@ impl FeatureStoreReader for InstrumentedFeatureStore {
             self.probe
                 .seed_one_snapshot_active
                 .store(true, Ordering::SeqCst);
+        }
+        if self.wait_for_transfer_before_seed_two_snapshot && seed_address == "0xseed2" {
+            let mut waited = 0;
+            while self.probe.transfer_current.load(Ordering::SeqCst) == 0 && waited < 1000 {
+                std::thread::sleep(Duration::from_millis(1));
+                waited += 1;
+            }
         }
         if self.sleep_ms > 0 {
             std::thread::sleep(Duration::from_millis(self.sleep_ms));
@@ -129,6 +142,7 @@ impl FeatureStoreReader for InstrumentedFeatureStore {
 struct InstrumentedBatchApi {
     probe: Arc<BatchPipelineProbe>,
     transfer_sleep_ms: u64,
+    emit_native_sale: bool,
 }
 
 #[async_trait]
@@ -152,6 +166,13 @@ impl AnalyzeApi for InstrumentedBatchApi {
                 self.probe
                     .seed_two_context_overlapped_snapshot
                     .store(true, Ordering::SeqCst);
+            }
+        }
+        if self.emit_native_sale && contract_address == "0xseed2" {
+            let mut waited = 0;
+            while self.probe.transfer_current.load(Ordering::SeqCst) == 0 && waited < 500 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                waited += 1;
             }
         }
         Ok(ContractMetadata {
@@ -213,7 +234,7 @@ impl AnalyzeApi for InstrumentedBatchApi {
         candidate_contract_address: &str,
         _seed_collection_slug: Option<&str>,
     ) -> Result<Option<bool>, AppError> {
-        if candidate_contract_address.contains("seed2") {
+        if !self.emit_native_sale && candidate_contract_address.contains("seed2") {
             let mut waited = 0;
             while self.probe.holder_current.load(Ordering::SeqCst) == 0 && waited < 100 {
                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -221,8 +242,16 @@ impl AnalyzeApi for InstrumentedBatchApi {
             }
         }
         let current = self.probe.holder_current.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.emit_native_sale
+            && candidate_contract_address.contains("seed2")
+            && !self.probe.sale_metric_finished.load(Ordering::SeqCst)
+        {
+            self.probe
+                .holder_started_before_sale_metric_finished
+                .store(true, Ordering::SeqCst);
+        }
         BatchPipelineProbe::record_max(&self.probe.holder_max_seen, current);
-        if self.transfer_sleep_ms > 0 {
+        if self.transfer_sleep_ms > 0 && !self.emit_native_sale {
             tokio::time::sleep(Duration::from_millis(self.transfer_sleep_ms)).await;
         }
         self.probe.holder_current.fetch_sub(1, Ordering::SeqCst);
@@ -238,7 +267,14 @@ impl AnalyzeApi for InstrumentedBatchApi {
         _opensea_api_key: &str,
         contract_address: &str,
     ) -> Result<Vec<SeedNft>, AppError> {
-        if contract_address.contains("seed2") {
+        if self.emit_native_sale && contract_address.contains("seed2") {
+            if self.probe.sale_metric_active.load(Ordering::SeqCst) {
+                self.probe
+                    .expansion_observed_sale_metric_active
+                    .store(true, Ordering::SeqCst);
+            }
+        }
+        if !self.emit_native_sale && contract_address.contains("seed2") {
             let mut waited = 0;
             while self.probe.expansion_current.load(Ordering::SeqCst) == 0 && waited < 100 {
                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -247,7 +283,7 @@ impl AnalyzeApi for InstrumentedBatchApi {
         }
         let current = self.probe.expansion_current.fetch_add(1, Ordering::SeqCst) + 1;
         BatchPipelineProbe::record_max(&self.probe.expansion_max_seen, current);
-        if self.transfer_sleep_ms > 0 {
+        if self.transfer_sleep_ms > 0 && !self.emit_native_sale {
             tokio::time::sleep(Duration::from_millis(self.transfer_sleep_ms)).await;
         }
         self.probe.expansion_current.fetch_sub(1, Ordering::SeqCst);
@@ -282,6 +318,32 @@ impl AnalyzeApi for InstrumentedBatchApi {
         _contract_address: &str,
         _opensea_api_key: &str,
     ) -> Result<Vec<NftSaleRecord>, AppError> {
+        if self.emit_native_sale && _contract_address.contains("seed1") {
+            return Ok(vec![NftSaleRecord {
+                contract_address: _contract_address.to_string(),
+                token_id: "1".into(),
+                tx_hash: "0xsale-seed1".into(),
+                block_number: 2,
+                log_index: 0,
+                bundle_index: 0,
+                buyer_address: "0xvictim".into(),
+                seller_address: "0xminter".into(),
+                marketplace: "opensea".into(),
+                taker: "buyer".into(),
+                payment_token_symbol: "ETH".into(),
+                payment_token_address: "0x0000000000000000000000000000000000000000".into(),
+                price_eth: Some(1.0),
+                price_usd: Some(1.0),
+                seller_fee_eth: 0.0,
+                seller_fee_usd: 0.0,
+                protocol_fee_eth: 0.0,
+                protocol_fee_usd: 0.0,
+                royalty_fee_eth: 0.0,
+                royalty_fee_usd: 0.0,
+                source: "opensea".into(),
+                is_native_eth: true,
+            }]);
+        }
         Ok(vec![])
     }
 
@@ -291,6 +353,26 @@ impl AnalyzeApi for InstrumentedBatchApi {
         _alchemy_network: Option<&str>,
         _tx_hash: &str,
     ) -> Result<TransactionReceiptRecord, AppError> {
+        if self.emit_native_sale {
+            self.probe
+                .sale_metric_receipt_calls
+                .fetch_add(1, Ordering::SeqCst);
+            self.probe.sale_metric_active.store(true, Ordering::SeqCst);
+            let mut waited = 0;
+            while !self
+                .probe
+                .holder_started_before_sale_metric_finished
+                .load(Ordering::SeqCst)
+                && waited < 1000
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                waited += 1;
+            }
+            self.probe.sale_metric_active.store(false, Ordering::SeqCst);
+            self.probe
+                .sale_metric_finished
+                .store(true, Ordering::SeqCst);
+        }
         Ok(TransactionReceiptRecord::default())
     }
 
@@ -1210,10 +1292,12 @@ async fn batch_prefetches_seed_context_while_another_seed_is_in_cpu_stage() {
         api: Arc::new(InstrumentedBatchApi {
             probe: probe.clone(),
             transfer_sleep_ms: 0,
+            emit_native_sale: false,
         }),
         feature_store: Arc::new(InstrumentedFeatureStore {
             probe: probe.clone(),
             sleep_ms: 80,
+            wait_for_transfer_before_seed_two_snapshot: false,
         }),
         signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
@@ -1249,10 +1333,12 @@ async fn batch_limits_cpu_stage_globally() {
         api: Arc::new(InstrumentedBatchApi {
             probe: probe.clone(),
             transfer_sleep_ms: 0,
+            emit_native_sale: false,
         }),
         feature_store: Arc::new(InstrumentedFeatureStore {
             probe: probe.clone(),
             sleep_ms: 60,
+            wait_for_transfer_before_seed_two_snapshot: false,
         }),
         signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
@@ -1287,10 +1373,12 @@ async fn batch_limits_contract_analysis_globally_across_seeds() {
         api: Arc::new(InstrumentedBatchApi {
             probe: probe.clone(),
             transfer_sleep_ms: 80,
+            emit_native_sale: false,
         }),
         feature_store: Arc::new(InstrumentedFeatureStore {
             probe: probe.clone(),
             sleep_ms: 80,
+            wait_for_transfer_before_seed_two_snapshot: false,
         }),
         signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
@@ -1317,6 +1405,56 @@ async fn batch_limits_contract_analysis_globally_across_seeds() {
     assert_eq!(probe.holder_max_seen.load(Ordering::SeqCst), 1);
     assert_eq!(probe.expansion_max_seen.load(Ordering::SeqCst), 1);
     assert_eq!(probe.metadata_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_allows_contract_expansion_while_another_seed_computes_sale_metrics() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n").unwrap();
+    let probe = Arc::new(BatchPipelineProbe::default());
+    let deps = AnalysisDeps {
+        api: Arc::new(InstrumentedBatchApi {
+            probe: probe.clone(),
+            transfer_sleep_ms: 300,
+            emit_native_sale: true,
+        }),
+        feature_store: Arc::new(InstrumentedFeatureStore {
+            probe: probe.clone(),
+            sleep_ms: 0,
+            wait_for_transfer_before_seed_two_snapshot: true,
+        }),
+        signal_cache: None,
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    let _summary = run_batch(
+        BatchRequest {
+            chain: "ethereum".into(),
+            seed_file: dir.path().join("seeds.txt"),
+            output_dir: dir.path().to_path_buf(),
+            alchemy_api_key: "key".into(),
+            workers: 2,
+            cpu_max_concurrency: 2,
+            contract_max_concurrency: 1,
+            sale_metric_max_concurrency: 1,
+            ..BatchRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        probe.sale_metric_receipt_calls.load(Ordering::SeqCst) > 0,
+        "expected seed1 native sale metrics to run"
+    );
+    assert!(
+        probe
+            .holder_started_before_sale_metric_finished
+            .load(Ordering::SeqCst),
+        "expected seed2 contract IO to start before seed1 sale metrics finished"
+    );
 }
 
 #[tokio::test]

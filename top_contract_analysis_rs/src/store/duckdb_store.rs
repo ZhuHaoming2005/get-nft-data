@@ -616,16 +616,47 @@ impl DuckDbFeatureStore {
         let mut contract_names = Vec::new();
         let mut contract_signals_raw: BTreeMap<String, ContractSignal> = BTreeMap::new();
         let recall_batch_size = max_recall_rows;
-        let mut offset = 0usize;
+        let temp_table = "__top_contract_analysis_recall_snapshot";
+        let conn = self.conn()?;
+        conn.execute_batch(&format!("DROP TABLE IF EXISTS {temp_table}"))?;
+        conn.execute(
+            &format!(
+                "
+                CREATE TEMP TABLE {temp_table} AS
+                SELECT row_number() OVER (ORDER BY contract_address, token_id) AS recall_row_id,
+                       *
+                FROM ({base_select_sql})
+                "
+            ),
+            params![chain],
+        )?;
+        let mut last_recall_row_id = 0_i64;
         loop {
             let select_sql = if recall_batch_size > 0 {
-                format!("{base_select_sql}\nLIMIT {recall_batch_size} OFFSET {offset}")
+                format!(
+                    "
+                    SELECT contract_address, token_id, token_uri, image_uri, name, symbol,
+                           metadata_json, metadata_doc, token_uri_norm, image_uri_norm,
+                           name_norm, metadata_recall_match, recall_row_id
+                    FROM {temp_table}
+                    WHERE recall_row_id > {last_recall_row_id}
+                    ORDER BY recall_row_id
+                    LIMIT {recall_batch_size}
+                    "
+                )
             } else {
-                base_select_sql.clone()
+                format!(
+                    "
+                    SELECT contract_address, token_id, token_uri, image_uri, name, symbol,
+                           metadata_json, metadata_doc, token_uri_norm, image_uri_norm,
+                           name_norm, metadata_recall_match, recall_row_id
+                    FROM {temp_table}
+                    ORDER BY recall_row_id
+                    "
+                )
             };
-            let conn = self.conn()?;
             let mut stmt = conn.prepare(&select_sql)?;
-            let rows = stmt.query_map(params![chain], |row| {
+            let rows = stmt.query_map([], |row| {
                 Ok((
                     DatabaseNftRecord {
                         contract_address: row.get::<_, String>(0)?,
@@ -643,14 +674,23 @@ impl DuckDbFeatureStore {
                     row.get::<_, String>(9)?,
                     row.get::<_, String>(10)?,
                     row.get::<_, bool>(11)?,
+                    row.get::<_, i64>(12)?,
                 ))
             })?;
 
             let mut fetched_rows = 0usize;
+            let mut last_seen_recall_row_id = last_recall_row_id;
             for row in rows {
                 fetched_rows += 1;
-                let (mut record, token_uri_norm, image_uri_norm, name_norm, metadata_recall_match) =
-                    row?;
+                let (
+                    mut record,
+                    token_uri_norm,
+                    image_uri_norm,
+                    name_norm,
+                    metadata_recall_match,
+                    recall_row_id,
+                ) = row?;
+                last_seen_recall_row_id = recall_row_id;
                 if seed_contracts.contains(&record.contract_address) {
                     continue;
                 }
@@ -709,13 +749,13 @@ impl DuckDbFeatureStore {
                 nft_rows.push(record);
             }
             drop(stmt);
-            drop(conn);
 
             if recall_batch_size == 0 || fetched_rows < recall_batch_size {
                 break;
             }
-            offset += recall_batch_size;
+            last_recall_row_id = last_seen_recall_row_id;
         }
+        conn.execute_batch(&format!("DROP TABLE IF EXISTS {temp_table}"))?;
 
         Ok(DatabaseSnapshot {
             nft_rows,

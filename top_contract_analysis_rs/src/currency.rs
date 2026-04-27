@@ -289,7 +289,7 @@ mod tests {
             })
             .await;
 
-        let client = AsyncApiClient::new(5, 4, 1, 1).unwrap();
+        let client = AsyncApiClient::new(5, 4).unwrap();
         let rate = fetch_current_eth_usd_rate_from_urls(
             &client,
             &[
@@ -335,7 +335,7 @@ mod tests {
         responses.push((200, serde_json::json!({"ethereum": {"usd": 3456.0}})));
         let (base_url, handle) = spawn_sequential_status_server(responses).await;
 
-        let client = AsyncApiClient::new(5, 4, 1, 1).unwrap();
+        let client = AsyncApiClient::new(5, 4).unwrap();
         let rate = fetch_current_eth_usd_rate_from_urls_with_retries(
             &client,
             &[EthUsdPriceSource::coin_gecko(&base_url)],

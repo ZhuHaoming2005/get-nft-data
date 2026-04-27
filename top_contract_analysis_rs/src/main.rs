@@ -37,12 +37,7 @@ fn main() -> Result<(), AppError> {
                 feature_store
                     .load_parquet_dataset_if_chain_missing(&args.chain, &args.feature_parquet)?;
             }
-            let api = RealApi::new(
-                args.timeout,
-                args.api_max_concurrency,
-                args.contract_max_concurrency,
-                args.sale_metric_max_concurrency,
-            )?;
+            let api = RealApi::new(args.timeout, args.api_max_concurrency)?;
             let deps = AnalysisDeps {
                 api: Arc::new(api),
                 feature_store: Arc::new(feature_store),
@@ -87,12 +82,7 @@ fn main() -> Result<(), AppError> {
                 feature_store
                     .load_parquet_dataset_if_chain_missing(&args.chain, &args.feature_parquet)?;
             }
-            let api = RealApi::new(
-                args.timeout,
-                args.api_max_concurrency,
-                args.contract_max_concurrency,
-                args.sale_metric_max_concurrency,
-            )?;
+            let api = RealApi::new(args.timeout, args.api_max_concurrency)?;
             let deps = AnalysisDeps {
                 api: Arc::new(api),
                 feature_store: Arc::new(feature_store),
