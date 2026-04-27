@@ -502,6 +502,27 @@ pub async fn fetch_contract_owners(
     }
 }
 
+pub async fn fetch_is_holder_of_contract(
+    client: &AsyncApiClient,
+    endpoints: &ApiEndpoints,
+    wallet_address: &str,
+    contract_address: &str,
+) -> Result<bool, AppError> {
+    let mut url = Url::parse(&format!(
+        "{}/isHolderOfContract",
+        endpoints.alchemy_nft_v3_base
+    ))
+    .map_err(|err| AppError::Http(err.to_string()))?;
+    url.query_pairs_mut()
+        .append_pair("wallet", wallet_address)
+        .append_pair("contractAddress", contract_address);
+    let payload: Value = client.get_json(url.as_str()).await?;
+    Ok(payload
+        .get("isHolderOfContract")
+        .and_then(Value::as_bool)
+        .unwrap_or(false))
+}
+
 pub async fn fetch_transaction_receipt(
     client: &AsyncApiClient,
     endpoints: &ApiEndpoints,

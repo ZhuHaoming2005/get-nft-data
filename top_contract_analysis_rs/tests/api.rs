@@ -3,11 +3,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use top_contract_analysis_rs::api::{
     fetch_contract_metadata, fetch_contract_metadata_with_opensea_fallback, fetch_contract_owners,
-    fetch_contract_sales, fetch_contract_transfers, fetch_eth_balance, fetch_license_sample,
-    fetch_opensea_contract_metadata, fetch_opensea_contract_nfts,
-    fetch_same_block_eth_transfers_for_address, fetch_seed_contract_nfts,
-    fetch_transaction_receipt, fetch_transaction_receipts_for_block, is_open_license_payload,
-    ApiEndpoints, AsyncApiClient,
+    fetch_contract_sales, fetch_contract_transfers, fetch_eth_balance, fetch_is_holder_of_contract,
+    fetch_license_sample, fetch_opensea_account_holds_contract_nft,
+    fetch_opensea_contract_collection_slug, fetch_opensea_contract_metadata,
+    fetch_opensea_contract_nfts, fetch_same_block_eth_transfers_for_address,
+    fetch_seed_contract_nfts, fetch_transaction_receipt, fetch_transaction_receipts_for_block,
+    is_open_license_payload, ApiEndpoints, AsyncApiClient,
 };
 use top_contract_analysis_rs::models::SeedNft;
 
@@ -112,6 +113,35 @@ async fn fetch_opensea_contract_metadata_parses_contract_fields() {
 }
 
 #[tokio::test]
+async fn fetch_opensea_contract_collection_slug_reads_seed_collection() {
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET)
+                .path("/api/v2/chain/ethereum/contract/0xseed")
+                .header("x-api-key", "opensea");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "address": "0xSeed",
+                "collection": {"slug": "pudgy-penguins", "name": "Pudgy Penguins"}
+            }));
+        })
+        .await;
+
+    let client = test_client();
+    let slug = fetch_opensea_contract_collection_slug(
+        &client,
+        &server.base_url(),
+        "ethereum",
+        "0xseed",
+        "opensea",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(slug.as_deref(), Some("pudgy-penguins"));
+}
+
+#[tokio::test]
 async fn fetch_opensea_contract_nfts_paginates_contract_tokens() {
     let (base_url, server) = spawn_sequential_json_server(vec![
         (
@@ -154,6 +184,62 @@ async fn fetch_opensea_contract_nfts_paginates_contract_tokens() {
     assert_eq!(rows[0].metadata_doc, "gold dragon");
     assert_eq!(rows[1].token_id, "2");
     assert_eq!(rows[1].image_uri, "ipfs://candidate/2.png");
+}
+
+#[tokio::test]
+async fn fetch_opensea_account_holds_contract_nft_checks_contract_without_token_overlap() {
+    let (base_url, server) = spawn_sequential_json_server(vec![(
+        "/api/v2/chain/ethereum/account/0xwrapped/nfts?limit=200&collection=pudgy-penguins"
+            .to_string(),
+        serde_json::json!({
+            "nfts": [{
+                "identifier": "8888",
+                "contract": "0xSeed",
+                "name": "Seed #8888"
+            }]
+        }),
+    )])
+    .await;
+
+    let client = test_client();
+    let holds_seed_nft = fetch_opensea_account_holds_contract_nft(
+        &client,
+        &base_url,
+        "ethereum",
+        "0xwrapped",
+        "0xseed",
+        "opensea",
+        Some("pudgy-penguins"),
+    )
+    .await
+    .unwrap();
+    server.await.unwrap();
+
+    assert!(holds_seed_nft);
+}
+
+#[tokio::test]
+async fn fetch_is_holder_of_contract_calls_alchemy_lightweight_holder_endpoint() {
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET)
+                .path("/nft/v3/key/isHolderOfContract")
+                .query_param("wallet", "0xwrapped")
+                .query_param("contractAddress", "0xseed");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "isHolderOfContract": true
+            }));
+        })
+        .await;
+
+    let client = test_client();
+    let endpoints = test_endpoints(&server.base_url());
+    let is_holder = fetch_is_holder_of_contract(&client, &endpoints, "0xwrapped", "0xseed")
+        .await
+        .unwrap();
+
+    assert!(is_holder);
 }
 
 #[tokio::test]

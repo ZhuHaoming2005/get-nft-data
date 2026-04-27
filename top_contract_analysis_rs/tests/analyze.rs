@@ -16,8 +16,8 @@ use top_contract_analysis_rs::models::{
     SeedContractPayload, SingleReportPayload, VictimAddressPayload, VictimSignalPayload,
 };
 use top_contract_analysis_rs::models::{
-    ContractMetadata, DatabaseNftRecord, DatabaseSnapshot, EthTransferRecord, NftSaleRecord,
-    OwnerBalance, SeedNft, TransactionReceiptRecord, TransferRecord,
+    ContractMetadata, ContractNameRecord, DatabaseNftRecord, DatabaseSnapshot, EthTransferRecord,
+    NftSaleRecord, OwnerBalance, SeedNft, TransactionReceiptRecord, TransferRecord,
 };
 use top_contract_analysis_rs::progress::{NoopBatchProgressReporter, NoopProgressReporter};
 use top_contract_analysis_rs::reporting::{
@@ -153,6 +153,177 @@ impl AnalyzeApi for FakeApi {
         _address: &str,
     ) -> Result<Vec<EthTransferRecord>, AppError> {
         Ok(vec![])
+    }
+}
+
+struct FakeSeedOwnerApi;
+
+#[async_trait]
+impl AnalyzeApi for FakeSeedOwnerApi {
+    async fn fetch_contract_metadata(
+        &self,
+        chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        opensea_api_key: &str,
+        contract_address: &str,
+    ) -> Result<ContractMetadata, AppError> {
+        AnalyzeApi::fetch_contract_metadata(
+            &FakeApi,
+            chain,
+            alchemy_api_key,
+            alchemy_network,
+            opensea_api_key,
+            contract_address,
+        )
+        .await
+    }
+
+    async fn fetch_seed_contract_nfts(
+        &self,
+        chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        contract_address: &str,
+    ) -> Result<Vec<SeedNft>, AppError> {
+        AnalyzeApi::fetch_seed_contract_nfts(
+            &FakeApi,
+            chain,
+            alchemy_api_key,
+            alchemy_network,
+            contract_address,
+        )
+        .await
+    }
+
+    async fn fetch_contract_transfers(
+        &self,
+        chain: &str,
+        etherscan_api_key: &str,
+        alchemy_network: Option<&str>,
+        alchemy_api_key: &str,
+        contract_address: &str,
+        token_type: &str,
+    ) -> Result<Vec<TransferRecord>, AppError> {
+        AnalyzeApi::fetch_contract_transfers(
+            &FakeApi,
+            chain,
+            etherscan_api_key,
+            alchemy_network,
+            alchemy_api_key,
+            contract_address,
+            token_type,
+        )
+        .await
+    }
+
+    async fn fetch_contract_owners(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        contract_address: &str,
+    ) -> Result<Vec<OwnerBalance>, AppError> {
+        if contract_address.eq_ignore_ascii_case("0xseed") {
+            return Ok(vec![OwnerBalance {
+                owner_address: "0xwrapped".into(),
+                token_balances: BTreeMap::from([("1".into(), 1)]),
+            }]);
+        }
+        Ok(vec![])
+    }
+
+    async fn candidate_currently_holds_seed_nft(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _opensea_api_key: &str,
+        _seed_contract_address: &str,
+        candidate_contract_address: &str,
+        _seed_collection_slug: Option<&str>,
+    ) -> Result<Option<bool>, AppError> {
+        Ok(Some(
+            candidate_contract_address.eq_ignore_ascii_case("0xwrapped"),
+        ))
+    }
+
+    async fn fetch_contract_sales(
+        &self,
+        chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        contract_address: &str,
+        opensea_api_key: &str,
+    ) -> Result<Vec<NftSaleRecord>, AppError> {
+        AnalyzeApi::fetch_contract_sales(
+            &FakeApi,
+            chain,
+            alchemy_api_key,
+            alchemy_network,
+            contract_address,
+            opensea_api_key,
+        )
+        .await
+    }
+
+    async fn fetch_transaction_receipt(
+        &self,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        tx_hash: &str,
+    ) -> Result<TransactionReceiptRecord, AppError> {
+        AnalyzeApi::fetch_transaction_receipt(&FakeApi, alchemy_api_key, alchemy_network, tx_hash)
+            .await
+    }
+
+    async fn fetch_transaction_receipts_for_block(
+        &self,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        block_number: i64,
+    ) -> Result<BTreeMap<String, TransactionReceiptRecord>, AppError> {
+        AnalyzeApi::fetch_transaction_receipts_for_block(
+            &FakeApi,
+            alchemy_api_key,
+            alchemy_network,
+            block_number,
+        )
+        .await
+    }
+
+    async fn fetch_eth_balance(
+        &self,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        address: &str,
+        block_number: i64,
+    ) -> Result<f64, AppError> {
+        AnalyzeApi::fetch_eth_balance(
+            &FakeApi,
+            alchemy_api_key,
+            alchemy_network,
+            address,
+            block_number,
+        )
+        .await
+    }
+
+    async fn fetch_same_block_eth_transfers_for_address(
+        &self,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        block_number: i64,
+        address: &str,
+    ) -> Result<Vec<EthTransferRecord>, AppError> {
+        AnalyzeApi::fetch_same_block_eth_transfers_for_address(
+            &FakeApi,
+            alchemy_api_key,
+            alchemy_network,
+            block_number,
+            address,
+        )
+        .await
     }
 }
 
@@ -1141,6 +1312,19 @@ impl AnalyzeApi for CountingApi {
             owner_address: "0xhonest".into(),
             token_balances: BTreeMap::from([("1".into(), 1)]),
         }])
+    }
+
+    async fn candidate_currently_holds_seed_nft(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _opensea_api_key: &str,
+        _seed_contract_address: &str,
+        _candidate_contract_address: &str,
+        _seed_collection_slug: Option<&str>,
+    ) -> Result<Option<bool>, AppError> {
+        Ok(Some(false))
     }
 
     async fn fetch_contract_sales(
@@ -2591,6 +2775,142 @@ async fn analyze_builds_expected_summary_counts() {
     assert_eq!(payload.duplicate_candidates.len(), 1);
     assert_eq!(payload.duplicate_contracts.len(), 1);
     assert_eq!(payload.contract_level_summary["0xdup"].candidate_count, 1);
+}
+
+#[tokio::test]
+async fn analyze_excludes_candidate_contract_that_currently_holds_seed_nft() {
+    let deps = AnalysisDeps {
+        api: Arc::new(FakeSeedOwnerApi),
+        feature_store: Box::new(FakeFeatureStore {
+            snapshot: DatabaseSnapshot {
+                nft_rows: vec![DatabaseNftRecord {
+                    contract_address: "0xwrapped".into(),
+                    token_id: "1".into(),
+                    token_uri: "ipfs://seed/1".into(),
+                    image_uri: "ipfs://image/1.png".into(),
+                    name: "Azuki Mirror #1".into(),
+                    symbol: "AZUKI".into(),
+                    metadata_json: r#"{"description":"gold dragon"}"#.into(),
+                    metadata_doc: "gold dragon".into(),
+                    metadata_recall_checked: false,
+                    metadata_recall_match: false,
+                }],
+                ..DatabaseSnapshot::default()
+            },
+        }),
+        signal_cache: None,
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    let payload = analyze_seed_contract(
+        AnalyzeRequest {
+            chain: "ethereum".into(),
+            seed_contract_address: "0xseed".into(),
+            alchemy_api_key: "key".into(),
+            ..AnalyzeRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(payload.report_summary.candidate_contract_count, 0);
+    assert!(payload.duplicate_candidates.is_empty());
+    assert!(payload.duplicate_contracts.is_empty());
+    assert!(payload.contract_level_summary.is_empty());
+}
+
+#[tokio::test]
+async fn analyze_excludes_candidate_contract_with_wrapper_or_vault_semantics() {
+    let deps = AnalysisDeps {
+        api: Arc::new(FakeApi),
+        feature_store: Box::new(FakeFeatureStore {
+            snapshot: DatabaseSnapshot {
+                nft_rows: vec![DatabaseNftRecord {
+                    contract_address: "0xwrapped".into(),
+                    token_id: "1".into(),
+                    token_uri: "ipfs://seed/1".into(),
+                    image_uri: "ipfs://image/1.png".into(),
+                    name: "Wrapped Azuki #1".into(),
+                    symbol: "WAZUKI".into(),
+                    metadata_json: r#"{"description":"gold dragon"}"#.into(),
+                    metadata_doc: "gold dragon".into(),
+                    metadata_recall_checked: false,
+                    metadata_recall_match: false,
+                }],
+                ..DatabaseSnapshot::default()
+            },
+        }),
+        signal_cache: None,
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    let payload = analyze_seed_contract(
+        AnalyzeRequest {
+            chain: "ethereum".into(),
+            seed_contract_address: "0xseed".into(),
+            alchemy_api_key: "key".into(),
+            ..AnalyzeRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(payload.report_summary.candidate_contract_count, 0);
+    assert!(payload.duplicate_candidates.is_empty());
+    assert!(payload.duplicate_contracts.is_empty());
+    assert!(payload.contract_level_summary.is_empty());
+}
+
+#[tokio::test]
+async fn analyze_excludes_candidate_contract_with_wrapper_semantics_from_local_contract_name() {
+    let deps = AnalysisDeps {
+        api: Arc::new(FakeApi),
+        feature_store: Box::new(FakeFeatureStore {
+            snapshot: DatabaseSnapshot {
+                nft_rows: vec![DatabaseNftRecord {
+                    contract_address: "0xwrapped".into(),
+                    token_id: "1".into(),
+                    token_uri: "ipfs://seed/1".into(),
+                    image_uri: "ipfs://image/1.png".into(),
+                    name: "Azuki Mirror #1".into(),
+                    symbol: "AZUKI".into(),
+                    metadata_json: r#"{"description":"gold dragon"}"#.into(),
+                    metadata_doc: "gold dragon".into(),
+                    metadata_recall_checked: false,
+                    metadata_recall_match: false,
+                }],
+                contract_names: vec![ContractNameRecord {
+                    contract_address: "0xwrapped".into(),
+                    name_norm: "wrapped azuki".into(),
+                }],
+                ..DatabaseSnapshot::default()
+            },
+        }),
+        signal_cache: None,
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    let payload = analyze_seed_contract(
+        AnalyzeRequest {
+            chain: "ethereum".into(),
+            seed_contract_address: "0xseed".into(),
+            alchemy_api_key: "key".into(),
+            ..AnalyzeRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(payload.report_summary.candidate_contract_count, 0);
+    assert!(payload.duplicate_candidates.is_empty());
+    assert!(payload.duplicate_contracts.is_empty());
+    assert!(payload.contract_level_summary.is_empty());
 }
 
 #[tokio::test]

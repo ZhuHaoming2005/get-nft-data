@@ -9,9 +9,11 @@ use futures::stream::{self, StreamExt};
 use crate::api::{
     fetch_contract_metadata_with_opensea_fallback, fetch_contract_owners, fetch_contract_sales,
     fetch_contract_transfers, fetch_eth_balance, fetch_etherscan_contract_transfers,
-    fetch_license_sample, fetch_opensea_contract_nfts, fetch_same_block_eth_transfers_for_address,
-    fetch_seed_contract_nfts, fetch_transaction_receipt, fetch_transaction_receipts_for_block,
-    is_open_license_payload, ApiEndpoints, AsyncApiClient,
+    fetch_is_holder_of_contract, fetch_license_sample, fetch_opensea_account_holds_contract_nft,
+    fetch_opensea_contract_collection_slug, fetch_opensea_contract_nfts,
+    fetch_same_block_eth_transfers_for_address, fetch_seed_contract_nfts,
+    fetch_transaction_receipt, fetch_transaction_receipts_for_block, is_open_license_payload,
+    ApiEndpoints, AsyncApiClient,
 };
 use crate::error::AppError;
 use crate::models::{
@@ -137,6 +139,30 @@ pub trait AnalyzeApi: Send + Sync {
         alchemy_network: Option<&str>,
         contract_address: &str,
     ) -> Result<Vec<OwnerBalance>, AppError>;
+
+    async fn candidate_currently_holds_seed_nft(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _opensea_api_key: &str,
+        _seed_contract_address: &str,
+        _candidate_contract_address: &str,
+        _seed_collection_slug: Option<&str>,
+    ) -> Result<Option<bool>, AppError> {
+        Ok(None)
+    }
+
+    async fn fetch_seed_collection_slug(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _opensea_api_key: &str,
+        _seed_contract_address: &str,
+    ) -> Result<Option<String>, AppError> {
+        Ok(None)
+    }
 
     async fn fetch_contract_sales(
         &self,
@@ -511,6 +537,72 @@ impl AnalyzeApi for RealApi {
         fetch_contract_owners(&self.client, &endpoints, contract_address).await
     }
 
+    async fn candidate_currently_holds_seed_nft(
+        &self,
+        chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        opensea_api_key: &str,
+        seed_contract_address: &str,
+        candidate_contract_address: &str,
+        seed_collection_slug: Option<&str>,
+    ) -> Result<Option<bool>, AppError> {
+        let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
+        if !opensea_api_key.trim().is_empty() {
+            if let Some(seed_collection_slug) = seed_collection_slug {
+                match fetch_opensea_account_holds_contract_nft(
+                    &self.client,
+                    &endpoints.opensea_base,
+                    chain,
+                    candidate_contract_address,
+                    seed_contract_address,
+                    opensea_api_key,
+                    Some(seed_collection_slug),
+                )
+                .await
+                {
+                    Ok(holds_seed_nft) => return Ok(Some(holds_seed_nft)),
+                    Err(err) => {
+                        eprintln!(
+                            "warning: OpenSea account NFT lookup failed for {candidate_contract_address}: {err}; falling back to Alchemy isHolderOfContract"
+                        );
+                    }
+                }
+            }
+        }
+
+        fetch_is_holder_of_contract(
+            &self.client,
+            &endpoints,
+            candidate_contract_address,
+            seed_contract_address,
+        )
+        .await
+        .map(Some)
+    }
+
+    async fn fetch_seed_collection_slug(
+        &self,
+        chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        opensea_api_key: &str,
+        seed_contract_address: &str,
+    ) -> Result<Option<String>, AppError> {
+        if opensea_api_key.trim().is_empty() {
+            return Ok(None);
+        }
+        let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
+        fetch_opensea_contract_collection_slug(
+            &self.client,
+            &endpoints.opensea_base,
+            chain,
+            seed_contract_address,
+            opensea_api_key,
+        )
+        .await
+    }
+
     async fn fetch_contract_sales(
         &self,
         chain: &str,
@@ -735,10 +827,18 @@ pub async fn analyze_seed_contract_with_progress(
         request.name_threshold,
         request.metadata_threshold,
     );
+    let contract_concurrency = request.contract_max_concurrency.max(1);
+    let candidates = filter_seed_related_candidate_contracts(
+        &request,
+        deps,
+        &snapshot,
+        candidates,
+        contract_concurrency,
+    )
+    .await;
     let grouped = group_candidates_by_contract(&candidates);
 
     let contracts_to_analyze: Vec<String> = grouped.keys().cloned().collect();
-    let contract_concurrency = request.contract_max_concurrency.max(1);
     let expanded_candidates_by_contract = if open_license || contracts_to_analyze.is_empty() {
         BTreeMap::new()
     } else {
@@ -1575,6 +1675,147 @@ pub fn group_candidates_by_contract(
             .push(index);
     }
     grouped
+}
+
+async fn filter_seed_related_candidate_contracts(
+    request: &AnalyzeRequest,
+    deps: &AnalysisDeps,
+    snapshot: &DatabaseSnapshot,
+    candidates: Vec<DuplicateCandidate>,
+    concurrency: usize,
+) -> Vec<DuplicateCandidate> {
+    if candidates.is_empty() {
+        return candidates;
+    }
+
+    let mut excluded_contracts = BTreeSet::new();
+    let local_contract_names = local_contract_names_by_address(snapshot);
+    for candidate in &candidates {
+        if candidate_has_wrapper_or_vault_semantics(
+            candidate,
+            local_contract_names
+                .get(&candidate.contract_address.to_lowercase())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+        ) {
+            excluded_contracts.insert(candidate.contract_address.to_lowercase());
+        }
+    }
+
+    let candidate_contracts: Vec<String> = candidates
+        .iter()
+        .map(|candidate| candidate.contract_address.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|contract_address| !excluded_contracts.contains(&contract_address.to_lowercase()))
+        .collect();
+
+    let mut unresolved_contracts: BTreeSet<String> = candidate_contracts
+        .iter()
+        .map(|contract_address| contract_address.to_lowercase())
+        .collect();
+
+    let seed_collection_slug = if unresolved_contracts.is_empty() {
+        None
+    } else {
+        match deps
+            .api
+            .fetch_seed_collection_slug(
+                &request.chain,
+                &request.alchemy_api_key,
+                request.alchemy_network.as_deref(),
+                &request.opensea_api_key,
+                &request.seed_contract_address,
+            )
+            .await
+        {
+            Ok(collection_slug) => collection_slug,
+            Err(err) => {
+                eprintln!(
+                    "warning: OpenSea seed collection lookup failed for {}: {err}; falling back to Alchemy isHolderOfContract",
+                    request.seed_contract_address
+                );
+                None
+            }
+        }
+    };
+
+    let mut holder_checks = stream::iter(candidate_contracts.into_iter().map(|contract_address| {
+        let seed_collection_slug = seed_collection_slug.clone();
+        async move {
+            let holds_seed_nft = deps
+                .api
+                .candidate_currently_holds_seed_nft(
+                    &request.chain,
+                    &request.alchemy_api_key,
+                    request.alchemy_network.as_deref(),
+                    &request.opensea_api_key,
+                    &request.seed_contract_address,
+                    &contract_address,
+                    seed_collection_slug.as_deref(),
+                )
+                .await;
+            (contract_address, holds_seed_nft)
+        }
+    }))
+    .buffer_unordered(concurrency.max(1));
+
+    while let Some((contract_address, holds_seed_nft)) = holder_checks.next().await {
+        let contract_key = contract_address.to_lowercase();
+        match holds_seed_nft {
+            Ok(Some(true)) => {
+                unresolved_contracts.remove(&contract_key);
+                excluded_contracts.insert(contract_key);
+            }
+            Ok(Some(false)) => {
+                unresolved_contracts.remove(&contract_key);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!(
+                    "warning: current seed NFT holder check failed for {contract_address}: {err}; continuing without holder-based candidate exclusion"
+                );
+            }
+        }
+    }
+
+    candidates
+        .into_iter()
+        .filter(|candidate| {
+            !excluded_contracts.contains(&candidate.contract_address.to_lowercase())
+        })
+        .collect()
+}
+
+fn local_contract_names_by_address(snapshot: &DatabaseSnapshot) -> HashMap<String, Vec<String>> {
+    let mut names = HashMap::<String, Vec<String>>::new();
+    for row in &snapshot.contract_names {
+        if row.contract_address.trim().is_empty() || row.name_norm.trim().is_empty() {
+            continue;
+        }
+        names
+            .entry(row.contract_address.trim().to_lowercase())
+            .or_default()
+            .push(row.name_norm.clone());
+    }
+    names
+}
+
+fn candidate_has_wrapper_or_vault_semantics(
+    candidate: &DuplicateCandidate,
+    local_contract_names: &[String],
+) -> bool {
+    let text = format!(
+        "{} {} {}",
+        candidate.name.to_lowercase(),
+        candidate.symbol.to_lowercase(),
+        local_contract_names.join(" ").to_lowercase()
+    );
+    text.contains("wrapped")
+        || text.contains("wrapper")
+        || text
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .any(|token| matches!(token, "vault" | "vaulted"))
 }
 
 async fn fetch_contract_nfts_for_matched_contracts(

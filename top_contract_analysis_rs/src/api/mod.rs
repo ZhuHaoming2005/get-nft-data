@@ -132,12 +132,15 @@ impl AsyncApiClient {
 
 pub use alchemy::{
     fetch_contract_metadata, fetch_contract_owners, fetch_contract_transfers, fetch_eth_balance,
-    fetch_license_sample, fetch_same_block_eth_transfers_for_address, fetch_seed_contract_nfts,
-    fetch_transaction_receipt, fetch_transaction_receipts_for_block, is_open_license_payload,
+    fetch_is_holder_of_contract, fetch_license_sample, fetch_same_block_eth_transfers_for_address,
+    fetch_seed_contract_nfts, fetch_transaction_receipt, fetch_transaction_receipts_for_block,
+    is_open_license_payload,
 };
 pub use etherscan::fetch_etherscan_contract_transfers;
 pub use opensea::{
-    fetch_contract_sales, fetch_opensea_contract_metadata, fetch_opensea_contract_nfts,
+    fetch_contract_sales, fetch_opensea_account_holds_contract_nft,
+    fetch_opensea_contract_collection_slug, fetch_opensea_contract_metadata,
+    fetch_opensea_contract_nfts,
 };
 
 pub async fn fetch_contract_metadata_with_opensea_fallback(

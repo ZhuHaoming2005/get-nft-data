@@ -549,6 +549,40 @@ pub async fn fetch_opensea_contract_metadata(
     })
 }
 
+pub async fn fetch_opensea_contract_collection_slug(
+    client: &AsyncApiClient,
+    base_url: &str,
+    chain: &str,
+    contract_address: &str,
+    opensea_api_key: &str,
+) -> Result<Option<String>, AppError> {
+    if opensea_api_key.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert(
+        "x-api-key",
+        HeaderValue::from_str(opensea_api_key).map_err(|err| AppError::Http(err.to_string()))?,
+    );
+
+    let url = format!(
+        "{base_url}/api/v2/chain/{}/contract/{contract_address}",
+        opensea_chain(chain)
+    );
+    let payload: Value = client.get_json_with_headers(&url, headers).await?;
+    let collection = payload.get("collection").unwrap_or(&Value::Null);
+    let slug = string_field(collection, &["slug", "collection_slug"])
+        .trim()
+        .to_string();
+    if slug.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(slug))
+    }
+}
+
 trait EmptyStringExt {
     fn if_empty_then(self, fallback: String) -> String;
 }
@@ -650,6 +684,82 @@ pub async fn fetch_opensea_contract_nfts(
         let next_cursor = payload.get("next").and_then(Value::as_str).unwrap_or("");
         if next_cursor.is_empty() {
             return Ok(rows);
+        }
+        if !seen_cursors.insert(next_cursor.to_string()) {
+            return Err(AppError::Http(format!(
+                "opensea pagination stalled on repeated next cursor: {next_cursor}"
+            )));
+        }
+        next = Some(next_cursor.to_string());
+    }
+}
+
+pub async fn fetch_opensea_account_holds_contract_nft(
+    client: &AsyncApiClient,
+    base_url: &str,
+    chain: &str,
+    account_address: &str,
+    contract_address: &str,
+    opensea_api_key: &str,
+    collection_slug: Option<&str>,
+) -> Result<bool, AppError> {
+    if opensea_api_key.trim().is_empty() {
+        return Ok(false);
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert(
+        "x-api-key",
+        HeaderValue::from_str(opensea_api_key).map_err(|err| AppError::Http(err.to_string()))?,
+    );
+
+    let contract_key = contract_address.trim().to_lowercase();
+    let mut next: Option<String> = None;
+    let mut seen_cursors = BTreeSet::new();
+    loop {
+        let mut url = Url::parse(&format!(
+            "{base_url}/api/v2/chain/{}/account/{account_address}/nfts",
+            opensea_chain(chain)
+        ))
+        .map_err(|err| AppError::Http(err.to_string()))?;
+        url.query_pairs_mut().append_pair("limit", "200");
+        if let Some(collection_slug) = collection_slug
+            .map(str::trim)
+            .filter(|slug| !slug.is_empty())
+        {
+            url.query_pairs_mut()
+                .append_pair("collection", collection_slug);
+        }
+        if let Some(next) = next.as_deref() {
+            url.query_pairs_mut().append_pair("next", next);
+        }
+
+        let payload: Value = client
+            .get_json_with_headers(url.as_str(), headers.clone())
+            .await?;
+        for raw in payload
+            .get("nfts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let nft_contract = raw
+                .get("contract")
+                .or_else(|| raw.get("contract_address"))
+                .or_else(|| raw.get("asset_contract"))
+                .and_then(address_like_field)
+                .unwrap_or("")
+                .trim()
+                .to_lowercase();
+            if !nft_contract.is_empty() && nft_contract == contract_key {
+                return Ok(true);
+            }
+        }
+
+        let next_cursor = payload.get("next").and_then(Value::as_str).unwrap_or("");
+        if next_cursor.is_empty() {
+            return Ok(false);
         }
         if !seen_cursors.insert(next_cursor.to_string()) {
             return Err(AppError::Http(format!(
