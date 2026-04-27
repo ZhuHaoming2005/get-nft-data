@@ -2,11 +2,12 @@ use httpmock::prelude::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use top_contract_analysis_rs::api::{
-    fetch_contract_metadata, fetch_contract_owners, fetch_contract_sales, fetch_contract_transfers,
-    fetch_eth_balance, fetch_license_sample, fetch_opensea_contract_metadata,
-    fetch_opensea_contract_nfts, fetch_same_block_eth_transfers_for_address,
-    fetch_seed_contract_nfts, fetch_transaction_receipt, fetch_transaction_receipts_for_block,
-    is_open_license_payload, ApiEndpoints, AsyncApiClient,
+    fetch_contract_metadata, fetch_contract_metadata_with_opensea_fallback, fetch_contract_owners,
+    fetch_contract_sales, fetch_contract_transfers, fetch_eth_balance, fetch_license_sample,
+    fetch_opensea_contract_metadata, fetch_opensea_contract_nfts,
+    fetch_same_block_eth_transfers_for_address, fetch_seed_contract_nfts,
+    fetch_transaction_receipt, fetch_transaction_receipts_for_block, is_open_license_payload,
+    ApiEndpoints, AsyncApiClient,
 };
 use top_contract_analysis_rs::models::SeedNft;
 
@@ -302,6 +303,107 @@ async fn fetch_contract_metadata_parses_contract_metadata_fields() {
     assert_eq!(meta.token_type, "ERC721");
     assert_eq!(meta.contract_deployer, "0xcreator");
     assert_eq!(meta.deployed_block_number, 123);
+}
+
+#[tokio::test]
+async fn contract_info_uses_alchemy_before_opensea_when_available() {
+    let alchemy_server = MockServer::start_async().await;
+    alchemy_server
+        .mock_async(|when, then| {
+            when.method(GET)
+                .path("/nft/v2/key/getContractMetadata")
+                .query_param("contractAddress", "0xseed");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "address": "0xseed",
+                "contractMetadata": {
+                    "tokenType": "ERC721",
+                    "contractDeployer": "0xAlchemyCreator",
+                    "deployedBlockNumber": 456,
+                    "name": "Alchemy Contract",
+                    "symbol": "ALC"
+                }
+            }));
+        })
+        .await;
+    let opensea_server = MockServer::start_async().await;
+    opensea_server
+        .mock_async(|when, then| {
+            when.method(GET)
+                .path("/api/v2/chain/ethereum/contract/0xseed")
+                .header("x-api-key", "opensea");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "address": "0xseed",
+                "contract_standard": "erc721",
+                "collection": {"name": "OpenSea Contract"}
+            }));
+        })
+        .await;
+
+    let client = test_client();
+    let endpoints = ApiEndpoints {
+        alchemy_nft_v2_base: format!("{}/nft/v2/key", alchemy_server.base_url()),
+        alchemy_nft_v3_base: alchemy_server.base_url(),
+        alchemy_rpc_base: alchemy_server.base_url(),
+        etherscan_base: alchemy_server.base_url(),
+        opensea_base: opensea_server.base_url(),
+    };
+    let meta = fetch_contract_metadata_with_opensea_fallback(
+        &client, &endpoints, "ethereum", "0xseed", "opensea",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(meta.contract_deployer, "0xalchemycreator");
+    assert_eq!(meta.deployed_block_number, 456);
+    assert_eq!(meta.name, "Alchemy Contract");
+}
+
+#[tokio::test]
+async fn contract_info_falls_back_to_opensea_when_alchemy_fails() {
+    let alchemy_server = MockServer::start_async().await;
+    alchemy_server
+        .mock_async(|when, then| {
+            when.method(GET)
+                .path("/nft/v2/key/getContractMetadata")
+                .query_param("contractAddress", "0xseed");
+            then.status(500).body("alchemy unavailable");
+        })
+        .await;
+    let opensea_server = MockServer::start_async().await;
+    opensea_server
+        .mock_async(|when, then| {
+            when.method(GET)
+                .path("/api/v2/chain/ethereum/contract/0xseed")
+                .header("x-api-key", "opensea");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "address": "0xSeed",
+                "contract_standard": "erc721",
+                "collection": {"name": "OpenSea Contract"},
+                "symbol": "OS"
+            }));
+        })
+        .await;
+
+    let client = test_client();
+    let endpoints = ApiEndpoints {
+        alchemy_nft_v2_base: format!("{}/nft/v2/key", alchemy_server.base_url()),
+        alchemy_nft_v3_base: alchemy_server.base_url(),
+        alchemy_rpc_base: alchemy_server.base_url(),
+        etherscan_base: alchemy_server.base_url(),
+        opensea_base: opensea_server.base_url(),
+    };
+    let meta = fetch_contract_metadata_with_opensea_fallback(
+        &client, &endpoints, "ethereum", "0xseed", "opensea",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(meta.contract_address, "0xseed");
+    assert_eq!(meta.token_type, "ERC721");
+    assert_eq!(meta.contract_deployer, "");
+    assert_eq!(meta.deployed_block_number, 0);
+    assert_eq!(meta.name, "OpenSea Contract");
+    assert_eq!(meta.symbol, "OS");
 }
 
 #[tokio::test]

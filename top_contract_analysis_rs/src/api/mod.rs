@@ -7,6 +7,7 @@ use serde::Serialize;
 use tokio::sync::Semaphore;
 
 use crate::error::AppError;
+use crate::models::ContractMetadata;
 
 pub mod alchemy;
 pub mod etherscan;
@@ -138,3 +139,29 @@ pub use etherscan::fetch_etherscan_contract_transfers;
 pub use opensea::{
     fetch_contract_sales, fetch_opensea_contract_metadata, fetch_opensea_contract_nfts,
 };
+
+pub async fn fetch_contract_metadata_with_opensea_fallback(
+    client: &AsyncApiClient,
+    endpoints: &ApiEndpoints,
+    chain: &str,
+    contract_address: &str,
+    opensea_api_key: &str,
+) -> Result<ContractMetadata, AppError> {
+    match fetch_contract_metadata(client, endpoints, chain, contract_address).await {
+        Ok(metadata) => Ok(metadata),
+        Err(err) if opensea_api_key.trim().is_empty() => Err(err),
+        Err(err) => {
+            eprintln!(
+                "warning: Alchemy contract info failed for {contract_address}: {err}; falling back to OpenSea"
+            );
+            fetch_opensea_contract_metadata(
+                client,
+                &endpoints.opensea_base,
+                chain,
+                contract_address,
+                opensea_api_key,
+            )
+            .await
+        }
+    }
+}

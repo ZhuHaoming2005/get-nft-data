@@ -7,12 +7,11 @@ use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
 
 use crate::api::{
-    fetch_contract_metadata, fetch_contract_owners, fetch_contract_sales, fetch_contract_transfers,
-    fetch_eth_balance, fetch_etherscan_contract_transfers, fetch_license_sample,
-    fetch_opensea_contract_metadata, fetch_opensea_contract_nfts,
-    fetch_same_block_eth_transfers_for_address, fetch_seed_contract_nfts,
-    fetch_transaction_receipt, fetch_transaction_receipts_for_block, is_open_license_payload,
-    ApiEndpoints, AsyncApiClient,
+    fetch_contract_metadata_with_opensea_fallback, fetch_contract_owners, fetch_contract_sales,
+    fetch_contract_transfers, fetch_eth_balance, fetch_etherscan_contract_transfers,
+    fetch_license_sample, fetch_opensea_contract_nfts, fetch_same_block_eth_transfers_for_address,
+    fetch_seed_contract_nfts, fetch_transaction_receipt, fetch_transaction_receipts_for_block,
+    is_open_license_payload, ApiEndpoints, AsyncApiClient,
 };
 use crate::error::AppError;
 use crate::models::{
@@ -382,25 +381,14 @@ impl AnalyzeApi for RealApi {
         contract_address: &str,
     ) -> Result<ContractMetadata, AppError> {
         let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
-        if !opensea_api_key.trim().is_empty() {
-            match fetch_opensea_contract_metadata(
-                &self.client,
-                &endpoints.opensea_base,
-                chain,
-                contract_address,
-                opensea_api_key,
-            )
-            .await
-            {
-                Ok(metadata) => return Ok(metadata),
-                Err(err) => {
-                    eprintln!(
-                        "warning: OpenSea contract metadata failed for {contract_address}: {err}; falling back to Alchemy"
-                    );
-                }
-            }
-        }
-        fetch_contract_metadata(&self.client, &endpoints, chain, contract_address).await
+        fetch_contract_metadata_with_opensea_fallback(
+            &self.client,
+            &endpoints,
+            chain,
+            contract_address,
+            opensea_api_key,
+        )
+        .await
     }
 
     async fn fetch_seed_contract_nfts(
