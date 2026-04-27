@@ -1905,6 +1905,10 @@ impl AnalyzeApi for ConcurrentContractApi {
 struct ConcurrentSaleMetricApi {
     active_receipts: AtomicUsize,
     max_receipts: AtomicUsize,
+    duplicate_sale_tx: bool,
+    receipt_calls: AtomicUsize,
+    balance_calls: AtomicUsize,
+    same_block_transfer_calls: AtomicUsize,
 }
 
 impl ConcurrentSaleMetricApi {
@@ -1912,6 +1916,17 @@ impl ConcurrentSaleMetricApi {
         Self {
             active_receipts: AtomicUsize::new(0),
             max_receipts: AtomicUsize::new(0),
+            duplicate_sale_tx: false,
+            receipt_calls: AtomicUsize::new(0),
+            balance_calls: AtomicUsize::new(0),
+            same_block_transfer_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn with_duplicate_sale_tx() -> Self {
+        Self {
+            duplicate_sale_tx: true,
+            ..Self::new()
         }
     }
 }
@@ -2178,6 +2193,11 @@ impl AnalyzeApi for ConcurrentSaleMetricApi {
         contract_address: &str,
         _opensea_api_key: &str,
     ) -> Result<Vec<NftSaleRecord>, AppError> {
+        let second_tx_hash = if self.duplicate_sale_tx {
+            "0xsale1"
+        } else {
+            "0xsale2"
+        };
         Ok(vec![
             NftSaleRecord {
                 contract_address: contract_address.to_string(),
@@ -2206,7 +2226,7 @@ impl AnalyzeApi for ConcurrentSaleMetricApi {
             NftSaleRecord {
                 contract_address: contract_address.to_string(),
                 token_id: "1".into(),
-                tx_hash: "0xsale2".into(),
+                tx_hash: second_tx_hash.into(),
                 block_number: 3,
                 log_index: 0,
                 bundle_index: 0,
@@ -2236,6 +2256,7 @@ impl AnalyzeApi for ConcurrentSaleMetricApi {
         _alchemy_network: Option<&str>,
         tx_hash: &str,
     ) -> Result<TransactionReceiptRecord, AppError> {
+        self.receipt_calls.fetch_add(1, Ordering::SeqCst);
         let active = self.active_receipts.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_receipts.fetch_max(active, Ordering::SeqCst);
         sleep(Duration::from_millis(40)).await;
@@ -2267,6 +2288,7 @@ impl AnalyzeApi for ConcurrentSaleMetricApi {
         _address: &str,
         _block_number: i64,
     ) -> Result<f64, AppError> {
+        self.balance_calls.fetch_add(1, Ordering::SeqCst);
         Ok(5.0)
     }
 
@@ -2277,6 +2299,8 @@ impl AnalyzeApi for ConcurrentSaleMetricApi {
         _block_number: i64,
         _address: &str,
     ) -> Result<Vec<EthTransferRecord>, AppError> {
+        self.same_block_transfer_calls
+            .fetch_add(1, Ordering::SeqCst);
         Ok(vec![])
     }
 }
@@ -3718,6 +3742,52 @@ async fn analyze_computes_sale_metrics_concurrently_within_a_contract() {
         api.max_receipts.load(Ordering::SeqCst) >= 2,
         "expected sale metric receipt fetches to overlap within one contract"
     );
+}
+
+#[tokio::test]
+async fn analyze_deduplicates_sale_metric_prefetch_by_transaction_hash() {
+    let api = Arc::new(ConcurrentSaleMetricApi::with_duplicate_sale_tx());
+    let deps = AnalysisDeps {
+        api: api.clone(),
+        feature_store: Arc::new(FakeFeatureStore {
+            snapshot: DatabaseSnapshot {
+                nft_rows: vec![DatabaseNftRecord {
+                    contract_address: "0xdup".into(),
+                    token_id: "1".into(),
+                    token_uri: "ipfs://seed/1".into(),
+                    image_uri: "ipfs://image/1.png".into(),
+                    name: "Azuki Mirror #1".into(),
+                    symbol: "AZUKI".into(),
+                    metadata_json: r#"{"description":"gold dragon"}"#.into(),
+                    metadata_doc: "gold dragon".into(),
+                    metadata_recall_checked: false,
+                    metadata_recall_match: false,
+                }],
+                ..DatabaseSnapshot::default()
+            },
+        }),
+        signal_cache: None,
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    let payload = analyze_seed_contract(
+        AnalyzeRequest {
+            chain: "ethereum".into(),
+            seed_contract_address: "0xseed".into(),
+            alchemy_api_key: "key".into(),
+            sale_metric_max_concurrency: 2,
+            ..AnalyzeRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(payload.victim_addresses.len(), 2);
+    assert_eq!(api.receipt_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(api.balance_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(api.same_block_transfer_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

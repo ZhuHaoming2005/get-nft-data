@@ -128,11 +128,11 @@ cargo run --release -- batch \
   --output-dir ../result \
   --workers 3 \
   --max-recall-rows 1000000 \
-  --api-max-concurrency 24 \
-  --contract-max-concurrency 12 \
+  --api-max-concurrency 8 \
+  --contract-max-concurrency 16 \
   --sale-metric-max-concurrency 10 \
   --cpu-max-concurrency 1 \
-  --duckdb-memory-limit 50GB
+  --duckdb-memory-limit 30GB
 ```
 
 批量输出包括：

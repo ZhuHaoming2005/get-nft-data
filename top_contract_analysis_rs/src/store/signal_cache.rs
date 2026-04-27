@@ -123,6 +123,7 @@ impl ContractSignalCache {
                 },
             )
             .optional()?;
+        drop(conn);
 
         let Some((
             mint_recipients_json,

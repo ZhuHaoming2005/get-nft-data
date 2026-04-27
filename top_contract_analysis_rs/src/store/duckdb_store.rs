@@ -594,10 +594,10 @@ impl DuckDbFeatureStore {
         };
         let base_select_sql = format!(
             "
-            SELECT contract_address, token_id, token_uri, image_uri, name, symbol, metadata_json, metadata_doc,
+            SELECT feature_rowid, contract_address, token_id,
                    token_uri_norm, image_uri_norm, name_norm, metadata_recall_match
             FROM (
-                SELECT contract_address, token_id, token_uri, image_uri, name, symbol, metadata_json, metadata_doc,
+                SELECT rowid AS feature_rowid, contract_address, token_id,
                        token_uri_norm, image_uri_norm, name_norm,
                        {metadata_recall_expr} AS metadata_recall_match,
                        row_number() OVER (PARTITION BY contract_address ORDER BY token_id) AS rn
@@ -624,7 +624,8 @@ impl DuckDbFeatureStore {
                 "
                 CREATE TEMP TABLE {temp_table} AS
                 SELECT row_number() OVER (ORDER BY contract_address, token_id) AS recall_row_id,
-                       *
+                       feature_rowid, contract_address, token_id, token_uri_norm, image_uri_norm,
+                       name_norm, metadata_recall_match
                 FROM ({base_select_sql})
                 "
             ),
@@ -635,23 +636,29 @@ impl DuckDbFeatureStore {
             let select_sql = if recall_batch_size > 0 {
                 format!(
                     "
-                    SELECT contract_address, token_id, token_uri, image_uri, name, symbol,
-                           metadata_json, metadata_doc, token_uri_norm, image_uri_norm,
-                           name_norm, metadata_recall_match, recall_row_id
-                    FROM {temp_table}
-                    WHERE recall_row_id > {last_recall_row_id}
-                    ORDER BY recall_row_id
+                    SELECT f.contract_address, f.token_id, coalesce(f.token_uri, ''),
+                           coalesce(f.image_uri, ''), coalesce(f.name, ''), coalesce(f.symbol, ''),
+                           coalesce(f.metadata_json, ''), coalesce(f.metadata_doc, ''),
+                           t.token_uri_norm, t.image_uri_norm, t.name_norm,
+                           t.metadata_recall_match, t.recall_row_id
+                    FROM {temp_table} t
+                    JOIN nft_features f ON f.rowid = t.feature_rowid
+                    WHERE t.recall_row_id > {last_recall_row_id}
+                    ORDER BY t.recall_row_id
                     LIMIT {recall_batch_size}
                     "
                 )
             } else {
                 format!(
                     "
-                    SELECT contract_address, token_id, token_uri, image_uri, name, symbol,
-                           metadata_json, metadata_doc, token_uri_norm, image_uri_norm,
-                           name_norm, metadata_recall_match, recall_row_id
-                    FROM {temp_table}
-                    ORDER BY recall_row_id
+                    SELECT f.contract_address, f.token_id, coalesce(f.token_uri, ''),
+                           coalesce(f.image_uri, ''), coalesce(f.name, ''), coalesce(f.symbol, ''),
+                           coalesce(f.metadata_json, ''), coalesce(f.metadata_doc, ''),
+                           t.token_uri_norm, t.image_uri_norm, t.name_norm,
+                           t.metadata_recall_match, t.recall_row_id
+                    FROM {temp_table} t
+                    JOIN nft_features f ON f.rowid = t.feature_rowid
+                    ORDER BY t.recall_row_id
                     "
                 )
             };
