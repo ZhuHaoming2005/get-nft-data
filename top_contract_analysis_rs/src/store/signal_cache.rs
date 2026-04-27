@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashSet};
+use std::sync::{Mutex, MutexGuard};
 
 use duckdb::{params, Connection, OptionalExt};
 
@@ -19,7 +20,7 @@ pub struct CachedSignals {
 }
 
 pub struct ContractSignalCache {
-    conn: Connection,
+    conn: Mutex<Connection>,
 }
 
 fn analyze_victim_signals_from_active_sellers(
@@ -83,7 +84,15 @@ impl ContractSignalCache {
             );
             ",
         )?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    fn conn(&self) -> Result<MutexGuard<'_, Connection>, AppError> {
+        self.conn
+            .lock()
+            .map_err(|err| AppError::DuckDb(format!("signal cache lock poisoned: {err}")))
     }
 
     pub fn get(
@@ -92,8 +101,8 @@ impl ContractSignalCache {
         contract_address: &str,
         token_type: &str,
     ) -> Result<Option<CachedSignals>, AppError> {
-        let row = self
-            .conn
+        let conn = self.conn()?;
+        let row = conn
             .query_row(
                 "
                 SELECT mint_recipients_json, active_sellers_json, address_signals_json,
@@ -172,7 +181,8 @@ impl ContractSignalCache {
             ))
         };
 
-        self.conn.execute(
+        let conn = self.conn()?;
+        conn.execute(
             "
             INSERT OR REPLACE INTO contract_signal_cache (
                 chain, contract_address, token_type, mint_recipients_json, active_sellers_json,

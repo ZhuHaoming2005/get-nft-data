@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 use duckdb::{params, Connection};
 use once_cell::sync::Lazy;
@@ -47,7 +48,7 @@ fn metadata_keywords(document: &str, limit: usize) -> Vec<String> {
 }
 
 pub struct DuckDbFeatureStore {
-    conn: Connection,
+    conn: Mutex<Connection>,
     resource_options: DuckDbResourceOptions,
 }
 
@@ -275,13 +276,19 @@ impl DuckDbFeatureStore {
         )?;
         Self::validate_schema(&conn)?;
         Ok(Self {
-            conn,
+            conn: Mutex::new(conn),
             resource_options,
         })
     }
 
     pub fn resource_options(&self) -> &DuckDbResourceOptions {
         &self.resource_options
+    }
+
+    fn conn(&self) -> Result<MutexGuard<'_, Connection>, AppError> {
+        self.conn
+            .lock()
+            .map_err(|err| AppError::DuckDb(format!("DuckDB connection lock poisoned: {err}")))
     }
 
     fn apply_resource_options(
@@ -334,7 +341,8 @@ impl DuckDbFeatureStore {
     }
 
     pub fn has_chain_rows(&self, chain: &str) -> Result<bool, AppError> {
-        let exists = self.conn.query_row(
+        let conn = self.conn()?;
+        let exists = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM nft_features WHERE chain = ? LIMIT 1)",
             params![chain],
             |row| row.get::<_, bool>(0),
@@ -347,10 +355,10 @@ impl DuckDbFeatureStore {
         chain: &str,
         rows: &[DatabaseNftRecord],
     ) -> Result<(), AppError> {
-        self.conn
-            .execute("DELETE FROM nft_features WHERE chain = ?", params![chain])?;
+        let conn = self.conn()?;
+        conn.execute("DELETE FROM nft_features WHERE chain = ?", params![chain])?;
 
-        let mut stmt = self.conn.prepare(
+        let mut stmt = conn.prepare(
             "
             INSERT INTO nft_features (
                 chain, contract_address, token_id, token_uri, image_uri, name, symbol, metadata_json,
@@ -422,21 +430,25 @@ impl DuckDbFeatureStore {
             FROM read_parquet({path})
             ",
         );
-        self.conn
-            .execute("DELETE FROM nft_features WHERE chain = ?", params![chain])?;
-        self.conn.execute(&insert_sql, params![chain])?;
+        let conn = self.conn()?;
+        conn.execute("DELETE FROM nft_features WHERE chain = ?", params![chain])?;
+        conn.execute(&insert_sql, params![chain])?;
         Ok(())
     }
 
     pub fn load_parquet_dataset(&self, chain: &str, parquet_path: &str) -> Result<(), AppError> {
         let parquet_path_literal = Self::sql_string_literal(&parquet_path.replace('\\', "/"));
         let probe_sql = format!("DESCRIBE SELECT * FROM read_parquet({parquet_path_literal})");
-        let mut stmt = self.conn.prepare(&probe_sql)?;
-        let describe_rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        let mut column_names: HashSet<String> = HashSet::new();
-        for row in describe_rows {
-            column_names.insert(row?);
-        }
+        let column_names: HashSet<String> = {
+            let conn = self.conn()?;
+            let mut stmt = conn.prepare(&probe_sql)?;
+            let describe_rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            let mut column_names = HashSet::new();
+            for row in describe_rows {
+                column_names.insert(row?);
+            }
+            column_names
+        };
 
         let missing: Vec<&str> = PRECOMPUTED_COLUMNS
             .iter()
@@ -611,7 +623,8 @@ impl DuckDbFeatureStore {
             } else {
                 base_select_sql.clone()
             };
-            let mut stmt = self.conn.prepare(&select_sql)?;
+            let conn = self.conn()?;
+            let mut stmt = conn.prepare(&select_sql)?;
             let rows = stmt.query_map(params![chain], |row| {
                 Ok((
                     DatabaseNftRecord {
@@ -695,6 +708,8 @@ impl DuckDbFeatureStore {
 
                 nft_rows.push(record);
             }
+            drop(stmt);
+            drop(conn);
 
             if recall_batch_size == 0 || fetched_rows < recall_batch_size {
                 break;

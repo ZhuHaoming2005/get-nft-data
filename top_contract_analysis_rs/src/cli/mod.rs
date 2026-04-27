@@ -87,6 +87,8 @@ pub struct BatchArgs {
     pub contract_max_concurrency: usize,
     #[arg(long, default_value_t = 4)]
     pub sale_metric_max_concurrency: usize,
+    #[arg(long, default_value_t = 1)]
+    pub cpu_max_concurrency: usize,
     #[arg(long, default_value_t = 0)]
     pub duckdb_threads: usize,
     #[arg(long, default_value = "80GB")]

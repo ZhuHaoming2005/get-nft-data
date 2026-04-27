@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::api::{
     fetch_contract_metadata_with_opensea_fallback, fetch_contract_owners, fetch_contract_sales,
@@ -255,7 +256,7 @@ pub trait AnalyzeApi: Send + Sync {
     }
 }
 
-pub trait FeatureStoreReader: Send {
+pub trait FeatureStoreReader: Send + Sync {
     fn load_snapshot(
         &self,
         chain: &str,
@@ -265,7 +266,7 @@ pub trait FeatureStoreReader: Send {
     ) -> Result<DatabaseSnapshot, AppError>;
 }
 
-pub trait SignalCacheStore: Send {
+pub trait SignalCacheStore: Send + Sync {
     fn get(
         &self,
         chain: &str,
@@ -285,10 +286,41 @@ pub trait SignalCacheStore: Send {
 
 pub struct AnalysisDeps {
     pub api: Arc<dyn AnalyzeApi>,
-    pub feature_store: Box<dyn FeatureStoreReader>,
-    pub signal_cache: Option<Box<dyn SignalCacheStore>>,
+    pub feature_store: Arc<dyn FeatureStoreReader>,
+    pub signal_cache: Option<Arc<dyn SignalCacheStore>>,
     pub progress: Arc<dyn SeedProgressReporter>,
     pub batch_progress: Arc<dyn BatchProgressReporter>,
+}
+
+#[derive(Clone, Default)]
+struct RuntimeLimits {
+    contract_limit: Option<Arc<Semaphore>>,
+    sale_metric_limit: Option<Arc<Semaphore>>,
+}
+
+struct SeedContext {
+    seed_contract: ContractMetadata,
+    seed_nfts: Vec<SeedNft>,
+    open_license: bool,
+}
+
+struct CandidatePlan {
+    snapshot: DatabaseSnapshot,
+    candidates: Vec<DuplicateCandidate>,
+}
+
+async fn acquire_optional_limit(
+    limit: &Option<Arc<Semaphore>>,
+) -> Result<Option<OwnedSemaphorePermit>, AppError> {
+    match limit {
+        Some(limit) => limit
+            .clone()
+            .acquire_owned()
+            .await
+            .map(Some)
+            .map_err(|err| AppError::InvalidData(format!("batch limit closed: {err}"))),
+        None => Ok(None),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -329,6 +361,7 @@ pub struct BatchRequest {
     pub sale_metric_max_concurrency: usize,
     pub max_tokens_per_contract: usize,
     pub max_recall_rows: usize,
+    pub cpu_max_concurrency: usize,
     pub workers: usize,
 }
 
@@ -350,6 +383,7 @@ impl Default for BatchRequest {
             sale_metric_max_concurrency: 4,
             max_tokens_per_contract: 0,
             max_recall_rows: 0,
+            cpu_max_concurrency: 1,
             workers: 1,
         }
     }
@@ -775,31 +809,28 @@ pub async fn analyze_seed_contract(
     analyze_seed_contract_with_progress(request, deps, deps.progress.clone()).await
 }
 
-pub async fn analyze_seed_contract_with_progress(
-    request: AnalyzeRequest,
+async fn fetch_seed_context(
+    request: &AnalyzeRequest,
     deps: &AnalysisDeps,
     progress: Arc<dyn SeedProgressReporter>,
-) -> Result<SingleReportPayload, AppError> {
+) -> Result<SeedContext, AppError> {
     progress.on_seed_stage("fetch_seed_context").await;
-    let seed_contract = deps
-        .api
-        .fetch_contract_metadata(
+    let (seed_contract, seed_nfts) = tokio::try_join!(
+        deps.api.fetch_contract_metadata(
             &request.chain,
             &request.alchemy_api_key,
             request.alchemy_network.as_deref(),
             &request.opensea_api_key,
             &request.seed_contract_address,
-        )
-        .await?;
-    let seed_nfts = deps
-        .api
-        .fetch_seed_contract_nfts(
+        ),
+        deps.api.fetch_seed_contract_nfts(
             &request.chain,
             &request.alchemy_api_key,
             request.alchemy_network.as_deref(),
             &request.seed_contract_address,
         )
-        .await?;
+    )?;
+
     progress.on_seed_stage("fetch_license_sample").await;
     let open_license = deps
         .api
@@ -811,22 +842,84 @@ pub async fn analyze_seed_contract_with_progress(
         )
         .await?;
 
-    progress.on_seed_stage("load_snapshot").await;
-    let snapshot = deps.feature_store.load_snapshot(
-        &request.chain,
-        &seed_nfts,
-        request.max_tokens_per_contract,
-        request.max_recall_rows,
-    )?;
+    Ok(SeedContext {
+        seed_contract,
+        seed_nfts,
+        open_license,
+    })
+}
 
+async fn build_candidate_plan_for_seed(
+    request: AnalyzeRequest,
+    feature_store: Arc<dyn FeatureStoreReader>,
+    context: SeedContext,
+    cpu_limit: Option<Arc<Semaphore>>,
+    progress: Arc<dyn SeedProgressReporter>,
+) -> Result<(SeedContext, CandidatePlan), AppError> {
+    progress.on_seed_stage("load_snapshot").await;
+    let permit = acquire_optional_limit(&cpu_limit).await?;
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let snapshot = feature_store.load_snapshot(
+            &request.chain,
+            &context.seed_nfts,
+            request.max_tokens_per_contract,
+            request.max_recall_rows,
+        )?;
+        let candidates = duplicate::build_duplicate_candidates(
+            &request.chain,
+            &context.seed_nfts,
+            &snapshot.nft_rows,
+            request.name_threshold,
+            request.metadata_threshold,
+        );
+        Ok::<_, AppError>((
+            context,
+            CandidatePlan {
+                snapshot,
+                candidates,
+            },
+        ))
+    })
+    .await
+    .map_err(|err| AppError::InvalidData(format!("candidate CPU task failed: {err}")))?;
     progress.on_seed_stage("find_duplicate_candidates").await;
-    let candidates = duplicate::build_duplicate_candidates(
-        &request.chain,
-        &seed_nfts,
-        &snapshot.nft_rows,
-        request.name_threshold,
-        request.metadata_threshold,
-    );
+    result
+}
+
+pub async fn analyze_seed_contract_with_progress(
+    request: AnalyzeRequest,
+    deps: &AnalysisDeps,
+    progress: Arc<dyn SeedProgressReporter>,
+) -> Result<SingleReportPayload, AppError> {
+    analyze_seed_contract_with_limits(request, deps, progress, None, RuntimeLimits::default()).await
+}
+
+async fn analyze_seed_contract_with_limits(
+    request: AnalyzeRequest,
+    deps: &AnalysisDeps,
+    progress: Arc<dyn SeedProgressReporter>,
+    cpu_limit: Option<Arc<Semaphore>>,
+    runtime_limits: RuntimeLimits,
+) -> Result<SingleReportPayload, AppError> {
+    let context = fetch_seed_context(&request, deps, progress.clone()).await?;
+    let (context, plan) = build_candidate_plan_for_seed(
+        request.clone(),
+        deps.feature_store.clone(),
+        context,
+        cpu_limit,
+        progress.clone(),
+    )
+    .await?;
+    let SeedContext {
+        seed_contract,
+        seed_nfts,
+        open_license,
+    } = context;
+    let CandidatePlan {
+        snapshot,
+        candidates,
+    } = plan;
     let contract_concurrency = request.contract_max_concurrency.max(1);
     let candidates = filter_seed_related_candidate_contracts(
         &request,
@@ -905,6 +998,7 @@ pub async fn analyze_seed_contract_with_progress(
         let expanded_candidates_by_contract_ref = &expanded_candidates_by_contract;
         let official_addresses_ref = &official_addresses;
         let candidate_open_license_by_token_ref = &candidate_open_license_by_token;
+        let runtime_limits_ref = &runtime_limits;
         let mut contract_analyses = stream::iter(contracts_to_analyze.iter().enumerate().map(
             |(index, contract_address)| {
                 let contract_candidates = expanded_candidates_by_contract_ref
@@ -921,6 +1015,7 @@ pub async fn analyze_seed_contract_with_progress(
                         official_addresses_ref,
                         candidate_open_license_by_token_ref,
                         analysis_timestamp,
+                        runtime_limits_ref,
                     )
                     .await;
                     (index, contract_address.clone(), result)
@@ -1024,7 +1119,9 @@ async fn analyze_duplicate_contract(
     official_addresses: &HashSet<String>,
     candidate_open_license_by_token: &HashMap<(String, String), bool>,
     analysis_timestamp: i64,
+    runtime_limits: &RuntimeLimits,
 ) -> Result<ContractAnalysisResult, AppError> {
+    let _contract_permit = acquire_optional_limit(&runtime_limits.contract_limit).await?;
     let contract_candidate_refs: Vec<&DuplicateCandidate> = contract_candidates.iter().collect();
     let cached_signals = if let Some(cache) = deps.signal_cache.as_ref() {
         cache.get(&request.chain, contract_address, token_type)?
@@ -1092,7 +1189,8 @@ async fn analyze_duplicate_contract(
             let victim_signal = analyze_victim_signals_from_active_sellers(&transfers, &owners);
             (transfers, owners, transfer_signals, victim_signal, sales)
         };
-    let sale_metrics_by_tx = compute_sale_metrics_for_contract(request, deps, &sales).await?;
+    let sale_metrics_by_tx =
+        compute_sale_metrics_for_contract(request, deps, &sales, runtime_limits).await?;
 
     let contract_infringing = address_records::build_infringing_token_records_with_context_refs(
         contract_address,
@@ -1264,9 +1362,15 @@ async fn compute_sale_metrics_for_contract(
     request: &AnalyzeRequest,
     deps: &AnalysisDeps,
     sales: &[NftSaleRecord],
+    runtime_limits: &RuntimeLimits,
 ) -> Result<BTreeMap<String, address_records::SaleMetricRecord>, AppError> {
-    let prefetched = stream::iter(sales.iter().map(|sale| async move {
-        Ok::<_, AppError>(prefetch_sale_metric_inputs(request, deps, sale).await)
+    let sale_metric_limit = runtime_limits.sale_metric_limit.clone();
+    let prefetched = stream::iter(sales.iter().map(|sale| {
+        let sale_metric_limit = sale_metric_limit.clone();
+        async move {
+            let _permit = acquire_optional_limit(&sale_metric_limit).await?;
+            Ok::<_, AppError>(prefetch_sale_metric_inputs(request, deps, sale).await)
+        }
     }))
     .buffer_unordered(request.sale_metric_max_concurrency.max(1))
     .collect::<Vec<_>>()
@@ -1282,8 +1386,14 @@ async fn compute_sale_metrics_for_contract(
         prefetched_by_tx.insert(row.tx_hash.clone(), row);
     }
 
-    let block_receipt_rows =
-        stream::iter(blocks_to_fetch.into_iter().map(|block_number| async move {
+    let sale_metric_limit = runtime_limits.sale_metric_limit.clone();
+    let block_receipt_rows = stream::iter(blocks_to_fetch.into_iter().map(|block_number| {
+        let sale_metric_limit = sale_metric_limit.clone();
+        async move {
+            let _permit = match acquire_optional_limit(&sale_metric_limit).await {
+                Ok(permit) => permit,
+                Err(_) => return (block_number, BTreeMap::new()),
+            };
             let receipts = deps
                 .api
                 .fetch_transaction_receipts_for_block_on_chain(
@@ -1295,10 +1405,11 @@ async fn compute_sale_metrics_for_contract(
                 .await
                 .unwrap_or_default();
             (block_number, receipts)
-        }))
-        .buffer_unordered(request.sale_metric_max_concurrency.max(1))
-        .collect::<Vec<_>>()
-        .await;
+        }
+    }))
+    .buffer_unordered(request.sale_metric_max_concurrency.max(1))
+    .collect::<Vec<_>>()
+    .await;
     let receipts_by_block: BTreeMap<i64, BTreeMap<String, TransactionReceiptRecord>> =
         block_receipt_rows.into_iter().collect();
 
@@ -1508,6 +1619,15 @@ pub async fn run_batch(
     }
 
     let worker_count = request.workers.max(1);
+    let cpu_limit = Arc::new(Semaphore::new(request.cpu_max_concurrency.max(1)));
+    let runtime_limits = RuntimeLimits {
+        contract_limit: Some(Arc::new(Semaphore::new(
+            request.contract_max_concurrency.max(1),
+        ))),
+        sale_metric_limit: Some(Arc::new(Semaphore::new(
+            request.sale_metric_max_concurrency.max(1),
+        ))),
+    };
     let fresh_entries: Vec<Result<BatchSeedAggregate, AppError>> =
         stream::iter(pending_seeds.into_iter().map(|seed_address| {
             let per_seed_request = AnalyzeRequest {
@@ -1528,12 +1648,19 @@ pub async fn run_batch(
             };
             let output_dir = request.output_dir.clone();
             let batch_progress = deps.batch_progress.clone();
+            let cpu_limit = cpu_limit.clone();
+            let runtime_limits = runtime_limits.clone();
             async move {
                 batch_progress.on_seed_started(&seed_address);
                 let seed_progress = batch_progress.create_seed_reporter(&seed_address);
-                let result =
-                    analyze_seed_contract_with_progress(per_seed_request, deps, seed_progress)
-                        .await;
+                let result = analyze_seed_contract_with_limits(
+                    per_seed_request,
+                    deps,
+                    seed_progress,
+                    Some(cpu_limit),
+                    runtime_limits,
+                )
+                .await;
                 match result {
                     Ok(payload) => {
                         batch_progress.on_seed_finished(&seed_address);

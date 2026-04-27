@@ -2687,7 +2687,7 @@ fn single_report_does_not_display_eth_values_in_usd_fields() {
 async fn analyze_moves_official_reissues_into_legit_duplicates() {
     let deps = AnalysisDeps {
         api: Arc::new(FakeLegitApi),
-        feature_store: Box::new(FakeFeatureStore {
+        feature_store: Arc::new(FakeFeatureStore {
             snapshot: DatabaseSnapshot {
                 nft_rows: vec![DatabaseNftRecord {
                     contract_address: "0xdup".into(),
@@ -2736,7 +2736,7 @@ async fn analyze_moves_official_reissues_into_legit_duplicates() {
 async fn analyze_builds_expected_summary_counts() {
     let deps = AnalysisDeps {
         api: Arc::new(FakeApi),
-        feature_store: Box::new(FakeFeatureStore {
+        feature_store: Arc::new(FakeFeatureStore {
             snapshot: DatabaseSnapshot {
                 nft_rows: vec![DatabaseNftRecord {
                     contract_address: "0xdup".into(),
@@ -2781,7 +2781,7 @@ async fn analyze_builds_expected_summary_counts() {
 async fn analyze_excludes_candidate_contract_that_currently_holds_seed_nft() {
     let deps = AnalysisDeps {
         api: Arc::new(FakeSeedOwnerApi),
-        feature_store: Box::new(FakeFeatureStore {
+        feature_store: Arc::new(FakeFeatureStore {
             snapshot: DatabaseSnapshot {
                 nft_rows: vec![DatabaseNftRecord {
                     contract_address: "0xwrapped".into(),
@@ -2825,7 +2825,7 @@ async fn analyze_excludes_candidate_contract_that_currently_holds_seed_nft() {
 async fn analyze_excludes_candidate_contract_with_wrapper_or_vault_semantics() {
     let deps = AnalysisDeps {
         api: Arc::new(FakeApi),
-        feature_store: Box::new(FakeFeatureStore {
+        feature_store: Arc::new(FakeFeatureStore {
             snapshot: DatabaseSnapshot {
                 nft_rows: vec![DatabaseNftRecord {
                     contract_address: "0xwrapped".into(),
@@ -2869,7 +2869,7 @@ async fn analyze_excludes_candidate_contract_with_wrapper_or_vault_semantics() {
 async fn analyze_excludes_candidate_contract_with_wrapper_semantics_from_local_contract_name() {
     let deps = AnalysisDeps {
         api: Arc::new(FakeApi),
-        feature_store: Box::new(FakeFeatureStore {
+        feature_store: Arc::new(FakeFeatureStore {
             snapshot: DatabaseSnapshot {
                 nft_rows: vec![DatabaseNftRecord {
                     contract_address: "0xwrapped".into(),
@@ -2917,7 +2917,7 @@ async fn analyze_excludes_candidate_contract_with_wrapper_semantics_from_local_c
 async fn analyze_marks_seed_open_license_and_skips_suspected_contracts() {
     let deps = AnalysisDeps {
         api: Arc::new(FakeOpenLicenseApi),
-        feature_store: Box::new(FakeFeatureStore {
+        feature_store: Arc::new(FakeFeatureStore {
             snapshot: DatabaseSnapshot {
                 nft_rows: vec![DatabaseNftRecord {
                     contract_address: "0xdup".into(),
@@ -2960,7 +2960,7 @@ async fn analyze_marks_seed_open_license_and_skips_suspected_contracts() {
 async fn analyze_writes_default_json_and_markdown_files() {
     let deps = AnalysisDeps {
         api: Arc::new(FakeApi),
-        feature_store: Box::new(FakeFeatureStore {
+        feature_store: Arc::new(FakeFeatureStore {
             snapshot: DatabaseSnapshot::default(),
         }),
         signal_cache: None,
@@ -2994,7 +2994,7 @@ async fn analyze_writes_default_json_and_markdown_files() {
 async fn analyze_enriches_duplicate_contracts_with_signals_and_infringing_tokens() {
     let deps = AnalysisDeps {
         api: Arc::new(FakeEnrichedApi),
-        feature_store: Box::new(FakeFeatureStore {
+        feature_store: Arc::new(FakeFeatureStore {
             snapshot: DatabaseSnapshot {
                 nft_rows: vec![DatabaseNftRecord {
                     contract_address: "0xdup".into(),
@@ -3042,7 +3042,7 @@ async fn analyze_enriches_duplicate_contracts_with_signals_and_infringing_tokens
 async fn analyze_expands_matched_contracts_to_all_tokens_for_report_analysis() {
     let deps = AnalysisDeps {
         api: Arc::new(FakeTwoTokenOwnersApi),
-        feature_store: Box::new(FakeFeatureStore {
+        feature_store: Arc::new(FakeFeatureStore {
             snapshot: DatabaseSnapshot {
                 nft_rows: vec![DatabaseNftRecord {
                     contract_address: "0xdup".into(),
@@ -3102,7 +3102,7 @@ async fn analyze_expands_matched_contracts_to_all_tokens_for_report_analysis() {
 async fn analyze_falls_back_to_local_snapshot_when_provider_expansion_is_empty() {
     let deps = AnalysisDeps {
         api: Arc::new(FakeEmptyContractNftsApi),
-        feature_store: Box::new(FakeFeatureStore {
+        feature_store: Arc::new(FakeFeatureStore {
             snapshot: DatabaseSnapshot {
                 nft_rows: vec![
                     DatabaseNftRecord {
@@ -3155,7 +3155,7 @@ async fn analyze_falls_back_to_local_snapshot_when_provider_expansion_is_empty()
 async fn analyze_ignores_symbol_only_candidate_contracts() {
     let deps = AnalysisDeps {
         api: Arc::new(FakeEnrichedApi),
-        feature_store: Box::new(FakeFeatureStore {
+        feature_store: Arc::new(FakeFeatureStore {
             snapshot: DatabaseSnapshot {
                 nft_rows: vec![DatabaseNftRecord {
                     contract_address: "0xdup".into(),
@@ -3201,7 +3201,7 @@ async fn analyze_ignores_symbol_only_candidate_contracts() {
 async fn analyze_builds_address_profiles_and_trade_stats_for_duplicate_contracts() {
     let deps = AnalysisDeps {
         api: Arc::new(CountingApi::new()),
-        feature_store: Box::new(FakeFeatureStore {
+        feature_store: Arc::new(FakeFeatureStore {
             snapshot: DatabaseSnapshot {
                 nft_rows: vec![DatabaseNftRecord {
                     contract_address: "0xdup".into(),
@@ -3279,7 +3279,7 @@ async fn analyze_reuses_signal_cache_for_transfers_and_owners() {
     let api = Arc::new(CountingApi::new());
     let deps = AnalysisDeps {
         api: api.clone(),
-        feature_store: Box::new(FakeFeatureStore {
+        feature_store: Arc::new(FakeFeatureStore {
             snapshot: DatabaseSnapshot {
                 nft_rows: vec![DatabaseNftRecord {
                     contract_address: "0xdup".into(),
@@ -3296,7 +3296,7 @@ async fn analyze_reuses_signal_cache_for_transfers_and_owners() {
                 ..DatabaseSnapshot::default()
             },
         }),
-        signal_cache: Some(Box::new(FakeSignalCache::default())),
+        signal_cache: Some(Arc::new(FakeSignalCache::default())),
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -3326,7 +3326,7 @@ async fn analyze_reuses_signal_cache_for_transfers_and_owners() {
 async fn analyze_computes_native_eth_sale_metrics_for_victim_addresses() {
     let deps = AnalysisDeps {
         api: Arc::new(FakeSaleMetricApi),
-        feature_store: Box::new(FakeFeatureStore {
+        feature_store: Arc::new(FakeFeatureStore {
             snapshot: DatabaseSnapshot {
                 nft_rows: vec![DatabaseNftRecord {
                     contract_address: "0xdup".into(),
@@ -3386,7 +3386,7 @@ async fn analyze_processes_duplicate_contracts_within_a_seed_concurrently() {
     let api = Arc::new(ConcurrentContractApi::new());
     let deps = AnalysisDeps {
         api: api.clone(),
-        feature_store: Box::new(FakeFeatureStore {
+        feature_store: Arc::new(FakeFeatureStore {
             snapshot: DatabaseSnapshot {
                 nft_rows: vec![
                     DatabaseNftRecord {
@@ -3447,7 +3447,7 @@ async fn analyze_computes_sale_metrics_concurrently_within_a_contract() {
     let api = Arc::new(ConcurrentSaleMetricApi::new());
     let deps = AnalysisDeps {
         api: api.clone(),
-        feature_store: Box::new(FakeFeatureStore {
+        feature_store: Arc::new(FakeFeatureStore {
             snapshot: DatabaseSnapshot {
                 nft_rows: vec![DatabaseNftRecord {
                     contract_address: "0xdup".into(),
@@ -3494,7 +3494,7 @@ async fn analyze_fetches_contract_inputs_concurrently_within_one_contract() {
     let api = Arc::new(ConcurrentSingleContractFetchApi::new());
     let deps = AnalysisDeps {
         api: api.clone(),
-        feature_store: Box::new(FakeFeatureStore {
+        feature_store: Arc::new(FakeFeatureStore {
             snapshot: DatabaseSnapshot {
                 nft_rows: vec![DatabaseNftRecord {
                     contract_address: "0xdup".into(),

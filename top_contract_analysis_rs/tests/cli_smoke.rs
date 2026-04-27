@@ -48,6 +48,8 @@ fn batch_subcommand_is_exposed() {
             "12",
             "--sale-metric-max-concurrency",
             "10",
+            "--cpu-max-concurrency",
+            "2",
         ])
         .assert()
         .failure()

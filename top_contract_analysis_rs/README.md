@@ -131,6 +131,7 @@ cargo run --release -- batch \
   --api-max-concurrency 24 \
   --contract-max-concurrency 12 \
   --sale-metric-max-concurrency 10 \
+  --cpu-max-concurrency 1 \
   --duckdb-memory-limit 50GB
 ```
 
@@ -147,6 +148,7 @@ cargo run --release -- batch \
 - `--api-max-concurrency 8`
 - `--contract-max-concurrency 4`
 - `--sale-metric-max-concurrency 4`
+- `--cpu-max-concurrency 1`
 - `--duckdb-threads 0`
 - `--duckdb-memory-limit 80GB`
 - `--max-recall-rows 100000`：单批 SQL recall 读取行数；`0` 表示单次读取全部。非 `0` 时会分批读取完整 recall 结果，不作为总量截断。
@@ -166,4 +168,6 @@ cargo run --release -- batch \
 - 如果同时传了 `--feature-db` 和 `--feature-parquet`，且 `feature-db` 中该链已经有当前版本数据，则会复用 `feature-db`；如果没有该链数据，才从 Parquet 导入。旧版本 `feature-db` / 旧快照缺少预计算列会直接报错，需要重新运行 `export-snapshot`。
 - 当前快照 schema 强制包含 `token_uri_norm`、`image_uri_norm`、`name_norm`、`metadata_doc`、`metadata_keywords_arr`。SQL recall 会先用这些预计算列下推筛选，并把 metadata recall 结果作为布尔标记交给 Rust 复核。
 - duplicate scoring 使用合约级聚合：查重阶段每个候选合约只用代表 token 评分，BM25 metadata scoring 会复用缓存的 token、term frequency 和文档长度；合约命中后，分析阶段会通过 Alchemy `getNFTsForContract` 拉取该合约下全量 NFT，用于 NFT 级报告、地址和交易统计。
-- `batch` 的吞吐由 `--workers` 和 API 并发参数共同决定：`--workers` 控制同时分析多少个 seed，`--api-max-concurrency` 控制全局请求并发，`--contract-max-concurrency` 控制合约信号并发，`--sale-metric-max-concurrency` 控制 sale metric 并发。
+- `batch` 使用 seed 级流水线调度：一个 seed 在 DuckDB recall / duplicate scoring 时，其他 seed 可以继续下载 seed context 或分析已命中的候选合约，尽量错开 CPU 密集阶段和网络 IO 阶段。
+- `batch` 的资源在整个进程内全局复用：API client、HTTP semaphore、DuckDB feature store、signal cache 不按 worker 复制，避免多 worker 重复占用内存。
+- `batch` 的并发参数都是全局限制，不是单 worker 限制：`--workers` 控制同时进入流水线的 seed 数，`--api-max-concurrency` 控制全局 HTTP 请求并发，`--contract-max-concurrency` 控制全局候选合约分析并发，`--sale-metric-max-concurrency` 控制全局 sale metric 并发，`--cpu-max-concurrency` 控制同时执行 DuckDB recall / duplicate scoring 的 seed 数。默认 `--cpu-max-concurrency 1`，避免多个 seed 同时打满 DuckDB / Rayon CPU。

@@ -45,8 +45,8 @@ fn main() -> Result<(), AppError> {
             )?;
             let deps = AnalysisDeps {
                 api: Arc::new(api),
-                feature_store: Box::new(feature_store),
-                signal_cache: Some(Box::new(ContractSignalCache::new(&args.signal_cache_db)?)),
+                feature_store: Arc::new(feature_store),
+                signal_cache: Some(Arc::new(ContractSignalCache::new(&args.signal_cache_db)?)),
                 progress: create_single_seed_progress_reporter(&args.seed_contract_address),
                 batch_progress: Arc::new(NoopBatchProgressReporter),
             };
@@ -95,8 +95,8 @@ fn main() -> Result<(), AppError> {
             )?;
             let deps = AnalysisDeps {
                 api: Arc::new(api),
-                feature_store: Box::new(feature_store),
-                signal_cache: Some(Box::new(ContractSignalCache::new(&args.signal_cache_db)?)),
+                feature_store: Arc::new(feature_store),
+                signal_cache: Some(Arc::new(ContractSignalCache::new(&args.signal_cache_db)?)),
                 progress: Arc::new(NoopProgressReporter),
                 batch_progress: create_batch_progress_reporter(&seed_addresses, args.workers),
             };
@@ -120,6 +120,7 @@ fn main() -> Result<(), AppError> {
                     api_max_concurrency: args.api_max_concurrency,
                     contract_max_concurrency: args.contract_max_concurrency,
                     sale_metric_max_concurrency: args.sale_metric_max_concurrency,
+                    cpu_max_concurrency: args.cpu_max_concurrency,
                     max_tokens_per_contract: args.max_tokens_per_contract,
                     max_recall_rows: args.max_recall_rows,
                     workers: args.workers,
