@@ -857,15 +857,21 @@ async fn build_candidate_plan_for_seed(
     progress: Arc<dyn SeedProgressReporter>,
 ) -> Result<(SeedContext, CandidatePlan), AppError> {
     progress.on_seed_stage("load_snapshot").await;
-    let permit = acquire_optional_limit(&cpu_limit).await?;
-    let result = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
+    let _permit = acquire_optional_limit(&cpu_limit).await?;
+    let (request, context, snapshot) = tokio::task::spawn_blocking(move || {
         let snapshot = feature_store.load_snapshot(
             &request.chain,
             &context.seed_nfts,
             request.max_tokens_per_contract,
             request.max_recall_rows,
         )?;
+        Ok::<_, AppError>((request, context, snapshot))
+    })
+    .await
+    .map_err(|err| AppError::InvalidData(format!("snapshot CPU task failed: {err}")))??;
+
+    progress.on_seed_stage("find_duplicate_candidates").await;
+    tokio::task::spawn_blocking(move || {
         let candidates = duplicate::build_duplicate_candidates(
             &request.chain,
             &context.seed_nfts,
@@ -882,9 +888,7 @@ async fn build_candidate_plan_for_seed(
         ))
     })
     .await
-    .map_err(|err| AppError::InvalidData(format!("candidate CPU task failed: {err}")))?;
-    progress.on_seed_stage("find_duplicate_candidates").await;
-    result
+    .map_err(|err| AppError::InvalidData(format!("candidate CPU task failed: {err}")))?
 }
 
 pub async fn analyze_seed_contract_with_progress(
@@ -927,6 +931,7 @@ async fn analyze_seed_contract_with_limits(
         &snapshot,
         candidates,
         contract_concurrency,
+        &runtime_limits,
     )
     .await;
     let grouped = group_candidates_by_contract(&candidates);
@@ -941,6 +946,7 @@ async fn analyze_seed_contract_with_limits(
             &contracts_to_analyze,
             &snapshot.nft_rows,
             contract_concurrency,
+            &runtime_limits,
         )
         .await?;
         expand_candidates_to_contract_tokens(&grouped, &candidates, &expanded_contract_tokens)
@@ -1810,6 +1816,7 @@ async fn filter_seed_related_candidate_contracts(
     snapshot: &DatabaseSnapshot,
     candidates: Vec<DuplicateCandidate>,
     concurrency: usize,
+    runtime_limits: &RuntimeLimits,
 ) -> Vec<DuplicateCandidate> {
     if candidates.is_empty() {
         return candidates;
@@ -1870,6 +1877,15 @@ async fn filter_seed_related_candidate_contracts(
     let mut holder_checks = stream::iter(candidate_contracts.into_iter().map(|contract_address| {
         let seed_collection_slug = seed_collection_slug.clone();
         async move {
+            let _permit = match acquire_optional_limit(&runtime_limits.contract_limit).await {
+                Ok(permit) => permit,
+                Err(err) => {
+                    eprintln!(
+                        "warning: contract concurrency limit failed for {contract_address}: {err}; continuing without holder-based candidate exclusion"
+                    );
+                    return (contract_address, Ok(None));
+                }
+            };
             let holds_seed_nft = deps
                 .api
                 .candidate_currently_holds_seed_nft(
@@ -1951,12 +1967,20 @@ async fn fetch_contract_nfts_for_matched_contracts(
     contract_addresses: &[String],
     snapshot_rows: &[crate::models::DatabaseNftRecord],
     concurrency: usize,
+    runtime_limits: &RuntimeLimits,
 ) -> Result<Vec<SeedNft>, AppError> {
     let mut rows = Vec::new();
     let mut fetches = stream::iter(
         contract_addresses
             .iter()
             .map(|contract_address| async move {
+                let _permit = acquire_optional_limit(&runtime_limits.contract_limit).await;
+                let _permit = match _permit {
+                    Ok(permit) => permit,
+                    Err(err) => {
+                        return (contract_address.clone(), Err(err));
+                    }
+                };
                 let provider_tokens = deps
                     .api
                     .fetch_contract_nfts(

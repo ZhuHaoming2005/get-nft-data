@@ -45,6 +45,10 @@ struct BatchPipelineProbe {
     cpu_max_seen: AtomicUsize,
     transfer_current: AtomicUsize,
     transfer_max_seen: AtomicUsize,
+    holder_current: AtomicUsize,
+    holder_max_seen: AtomicUsize,
+    expansion_current: AtomicUsize,
+    expansion_max_seen: AtomicUsize,
     metadata_calls: AtomicUsize,
     snapshot_calls: AtomicUsize,
 }
@@ -197,6 +201,67 @@ impl AnalyzeApi for InstrumentedBatchApi {
         }
         self.probe.transfer_current.fetch_sub(1, Ordering::SeqCst);
         Ok(vec![])
+    }
+
+    async fn candidate_currently_holds_seed_nft(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _opensea_api_key: &str,
+        _seed_contract_address: &str,
+        candidate_contract_address: &str,
+        _seed_collection_slug: Option<&str>,
+    ) -> Result<Option<bool>, AppError> {
+        if candidate_contract_address.contains("seed2") {
+            let mut waited = 0;
+            while self.probe.holder_current.load(Ordering::SeqCst) == 0 && waited < 100 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                waited += 1;
+            }
+        }
+        let current = self.probe.holder_current.fetch_add(1, Ordering::SeqCst) + 1;
+        BatchPipelineProbe::record_max(&self.probe.holder_max_seen, current);
+        if self.transfer_sleep_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(self.transfer_sleep_ms)).await;
+        }
+        self.probe.holder_current.fetch_sub(1, Ordering::SeqCst);
+        Ok(Some(false))
+    }
+
+    async fn fetch_contract_nfts(
+        &self,
+        chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _etherscan_api_key: &str,
+        _opensea_api_key: &str,
+        contract_address: &str,
+    ) -> Result<Vec<SeedNft>, AppError> {
+        if contract_address.contains("seed2") {
+            let mut waited = 0;
+            while self.probe.expansion_current.load(Ordering::SeqCst) == 0 && waited < 100 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                waited += 1;
+            }
+        }
+        let current = self.probe.expansion_current.fetch_add(1, Ordering::SeqCst) + 1;
+        BatchPipelineProbe::record_max(&self.probe.expansion_max_seen, current);
+        if self.transfer_sleep_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(self.transfer_sleep_ms)).await;
+        }
+        self.probe.expansion_current.fetch_sub(1, Ordering::SeqCst);
+        Ok(vec![SeedNft {
+            chain: chain.to_string(),
+            contract_address: contract_address.to_string(),
+            token_id: "1".into(),
+            name: "Expanded #1".into(),
+            symbol: "EXP".into(),
+            token_uri: String::new(),
+            image_uri: String::new(),
+            metadata_json: String::new(),
+            metadata_doc: String::new(),
+        }])
     }
 
     async fn fetch_contract_owners(
@@ -1225,7 +1290,7 @@ async fn batch_limits_contract_analysis_globally_across_seeds() {
         }),
         feature_store: Arc::new(InstrumentedFeatureStore {
             probe: probe.clone(),
-            sleep_ms: 0,
+            sleep_ms: 80,
         }),
         signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
@@ -1249,6 +1314,8 @@ async fn batch_limits_contract_analysis_globally_across_seeds() {
     .unwrap();
 
     assert_eq!(probe.transfer_max_seen.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.holder_max_seen.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.expansion_max_seen.load(Ordering::SeqCst), 1);
     assert_eq!(probe.metadata_calls.load(Ordering::SeqCst), 2);
 }
 
