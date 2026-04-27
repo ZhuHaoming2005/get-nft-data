@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, FuturesUnordered, StreamExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::api::{
@@ -1011,7 +1011,8 @@ async fn analyze_seed_contract_with_limits(
         ))
         .buffer_unordered(contract_concurrency);
 
-        let mut contract_results = Vec::new();
+        let mut pending_contract_results = BTreeMap::new();
+        let mut next_contract_index_to_merge = 0usize;
         while let Some(result) = contract_analyses.next().await {
             let (index, contract_address, contract_candidates, result) = result?;
             completed_contracts += 1;
@@ -1022,29 +1023,25 @@ async fn analyze_seed_contract_with_limits(
                     contracts_to_analyze.len(),
                 )
                 .await;
-            contract_results.push((index, contract_address, contract_candidates, result));
-        }
-
-        contract_results.sort_by_key(|(index, _, _, _)| *index);
-        for (_, contract_address, contract_candidates, result) in contract_results {
             expanded_candidates_by_contract.insert(contract_address, contract_candidates);
-            if let Some(legit_duplicate) = result.legit_duplicate {
-                legit_contract_addresses.insert(result.contract_address.clone());
-                legit_duplicates.push(legit_duplicate);
-                continue;
+            pending_contract_results.insert(index, result);
+            while let Some(result) = pending_contract_results.remove(&next_contract_index_to_merge)
+            {
+                merge_contract_analysis_result(
+                    result,
+                    &mut legit_contract_addresses,
+                    &mut legit_duplicates,
+                    &mut address_signals,
+                    &mut victim_signals,
+                    &mut honest_address_stats,
+                    &mut fraud_trade_stats,
+                    &mut infringing_tokens,
+                    &mut malicious_addresses,
+                    &mut honest_addresses,
+                    &mut victim_addresses,
+                );
+                next_contract_index_to_merge += 1;
             }
-            if let Some(address_signal) = result.address_signal {
-                address_signals.insert(result.contract_address.clone(), address_signal);
-            }
-            if let Some(victim_signal) = result.victim_signal {
-                victim_signals.insert(result.contract_address.clone(), victim_signal);
-            }
-            honest_address_stats.extend(result.honest_address_stats);
-            fraud_trade_stats.extend(result.fraud_trade_stats);
-            infringing_tokens.extend(result.infringing_tokens);
-            malicious_addresses.extend(result.malicious_addresses);
-            honest_addresses.extend(result.honest_addresses);
-            victim_addresses.extend(result.victim_addresses);
         }
     }
     let mut duplicate_contracts =
@@ -1091,6 +1088,38 @@ async fn analyze_seed_contract_with_limits(
     progress.on_seed_stage("finalize_report").await;
     progress.on_seed_completed().await;
     Ok(payload)
+}
+
+fn merge_contract_analysis_result(
+    result: ContractAnalysisResult,
+    legit_contract_addresses: &mut BTreeSet<String>,
+    legit_duplicates: &mut Vec<DuplicateContractPayload>,
+    address_signals: &mut BTreeMap<String, AddressSignalPayload>,
+    victim_signals: &mut BTreeMap<String, VictimSignalPayload>,
+    honest_address_stats: &mut BTreeMap<String, HonestAddressStatsPayload>,
+    fraud_trade_stats: &mut BTreeMap<String, FraudTradeStatsPayload>,
+    infringing_tokens: &mut Vec<InfringingTokenRecord>,
+    malicious_addresses: &mut Vec<MaliciousAddressPayload>,
+    honest_addresses: &mut Vec<HonestAddressPayload>,
+    victim_addresses: &mut Vec<VictimAddressPayload>,
+) {
+    if let Some(legit_duplicate) = result.legit_duplicate {
+        legit_contract_addresses.insert(result.contract_address.clone());
+        legit_duplicates.push(legit_duplicate);
+        return;
+    }
+    if let Some(address_signal) = result.address_signal {
+        address_signals.insert(result.contract_address.clone(), address_signal);
+    }
+    if let Some(victim_signal) = result.victim_signal {
+        victim_signals.insert(result.contract_address.clone(), victim_signal);
+    }
+    honest_address_stats.extend(result.honest_address_stats);
+    fraud_trade_stats.extend(result.fraud_trade_stats);
+    infringing_tokens.extend(result.infringing_tokens);
+    malicious_addresses.extend(result.malicious_addresses);
+    honest_addresses.extend(result.honest_addresses);
+    victim_addresses.extend(result.victim_addresses);
 }
 
 fn payload_token_type(seed_contract: &ContractMetadata) -> String {
@@ -1360,63 +1389,80 @@ async fn compute_sale_metrics_for_contract(
     sales: &[NftSaleRecord],
     runtime_limits: &RuntimeLimits,
 ) -> Result<BTreeMap<String, address_records::SaleMetricRecord>, AppError> {
-    let sale_metric_limit = runtime_limits.sale_metric_limit.clone();
-    let prefetched = stream::iter(sales.iter().map(|sale| {
-        let sale_metric_limit = sale_metric_limit.clone();
-        async move {
-            let _permit = acquire_optional_limit(&sale_metric_limit).await?;
-            Ok::<_, AppError>(prefetch_sale_metric_inputs(request, deps, sale).await)
-        }
-    }))
-    .buffer_unordered(request.sale_metric_max_concurrency.max(1))
-    .collect::<Vec<_>>()
-    .await;
-
-    let mut prefetched_by_tx = BTreeMap::new();
-    let mut blocks_to_fetch = BTreeSet::new();
-    for row in prefetched {
-        let row = row?;
-        if !row.same_block_transfers.is_empty() {
-            blocks_to_fetch.insert(row.block_number);
-        }
-        prefetched_by_tx.insert(row.tx_hash.clone(), row);
+    let sale_metric_limit = runtime_limits.sale_metric_limit.clone().or_else(|| {
+        Some(Arc::new(Semaphore::new(
+            request.sale_metric_max_concurrency.max(1),
+        )))
+    });
+    let mut unique_sales_by_tx = BTreeMap::new();
+    for sale in sales {
+        unique_sales_by_tx
+            .entry(sale.tx_hash.clone())
+            .or_insert(sale);
     }
 
-    let sale_metric_limit = runtime_limits.sale_metric_limit.clone();
-    let block_receipt_rows = stream::iter(blocks_to_fetch.into_iter().map(|block_number| {
+    let mut prefetches = FuturesUnordered::new();
+    for sale in unique_sales_by_tx.into_values() {
         let sale_metric_limit = sale_metric_limit.clone();
-        async move {
-            let _permit = match acquire_optional_limit(&sale_metric_limit).await {
-                Ok(permit) => permit,
-                Err(_) => return (block_number, BTreeMap::new()),
-            };
-            let receipts = deps
-                .api
-                .fetch_transaction_receipts_for_block_on_chain(
-                    &request.chain,
-                    &request.alchemy_api_key,
-                    request.alchemy_network.as_deref(),
-                    block_number,
-                )
-                .await
-                .unwrap_or_default();
-            (block_number, receipts)
+        prefetches.push(async move {
+            let _permit = acquire_optional_limit(&sale_metric_limit).await?;
+            Ok::<_, AppError>(prefetch_sale_metric_inputs(request, deps, sale).await)
+        });
+    }
+
+    let mut prefetched_by_tx = BTreeMap::new();
+    let mut queued_blocks = BTreeSet::new();
+    let mut block_receipts = FuturesUnordered::new();
+    let mut receipts_by_block = BTreeMap::new();
+    loop {
+        tokio::select! {
+            Some(row) = prefetches.next(), if !prefetches.is_empty() => {
+                let row = row?;
+                if !row.same_block_transfers.is_empty() && queued_blocks.insert(row.block_number) {
+                    let sale_metric_limit = sale_metric_limit.clone();
+                    let block_number = row.block_number;
+                    block_receipts.push(async move {
+                        let _permit = match acquire_optional_limit(&sale_metric_limit).await {
+                            Ok(permit) => permit,
+                            Err(_) => return (block_number, BTreeMap::new()),
+                        };
+                        let receipts = deps
+                            .api
+                            .fetch_transaction_receipts_for_block_on_chain(
+                                &request.chain,
+                                &request.alchemy_api_key,
+                                request.alchemy_network.as_deref(),
+                                block_number,
+                            )
+                            .await
+                            .unwrap_or_default();
+                        (block_number, receipts)
+                    });
+                }
+                prefetched_by_tx.insert(row.tx_hash.clone(), row);
+            }
+            Some((block_number, receipts)) = block_receipts.next(), if !block_receipts.is_empty() => {
+                receipts_by_block.insert(block_number, receipts);
+            }
+            else => break,
         }
-    }))
-    .buffer_unordered(request.sale_metric_max_concurrency.max(1))
-    .collect::<Vec<_>>()
-    .await;
-    let receipts_by_block: BTreeMap<i64, BTreeMap<String, TransactionReceiptRecord>> =
-        block_receipt_rows.into_iter().collect();
+    }
 
     let mut rows = BTreeMap::new();
     for sale in sales {
-        let prefetched = prefetched_by_tx
-            .remove(&sale.tx_hash)
-            .unwrap_or_else(|| SaleMetricPrefetch::unavailable(sale));
+        if rows.contains_key(&sale.tx_hash) {
+            continue;
+        }
+        let unavailable;
+        let prefetched = if let Some(prefetched) = prefetched_by_tx.get(&sale.tx_hash) {
+            prefetched
+        } else {
+            unavailable = SaleMetricPrefetch::unavailable(sale);
+            &unavailable
+        };
         rows.insert(
             sale.tx_hash.clone(),
-            compute_sale_metrics_for_sale(sale, &prefetched, &receipts_by_block),
+            compute_sale_metrics_for_sale(sale, prefetched, &receipts_by_block),
         );
     }
     Ok(rows)
@@ -1968,23 +2014,23 @@ impl<'a> SnapshotTokenIndex<'a> {
         Self { rows_by_contract }
     }
 
-    fn tokens_for_contract(&self, chain: &str, contract_address: &str) -> Vec<SeedNft> {
-        self.rows_by_contract
+    fn expand_candidates_for_contract(
+        &self,
+        contract_address: &str,
+        candidate_indexes: &[usize],
+        candidates: &[DuplicateCandidate],
+    ) -> Vec<DuplicateCandidate> {
+        let rows = self
+            .rows_by_contract
             .get(&contract_address.to_lowercase())
             .into_iter()
-            .flat_map(|rows| rows.iter().copied())
-            .map(|row| SeedNft {
-                chain: chain.to_string(),
-                contract_address: row.contract_address.clone(),
-                token_id: row.token_id.clone(),
-                name: row.name.clone(),
-                symbol: row.symbol.clone(),
-                token_uri: row.token_uri.clone(),
-                image_uri: row.image_uri.clone(),
-                metadata_json: row.metadata_json.clone(),
-                metadata_doc: row.metadata_doc.clone(),
-            })
-            .collect()
+            .flat_map(|rows| rows.iter().copied());
+        expand_candidate_indexes_to_contract_tokens(
+            contract_address,
+            candidate_indexes,
+            candidates,
+            rows,
+        )
     }
 }
 
@@ -1997,7 +2043,10 @@ async fn fetch_and_expand_contract_candidates(
     snapshot_token_index: &SnapshotTokenIndex<'_>,
     runtime_limits: &RuntimeLimits,
 ) -> Result<Vec<DuplicateCandidate>, AppError> {
-    let contract_key = contract_address.to_lowercase();
+    let candidate_indexes = grouped
+        .get(contract_address)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
     let provider_tokens = {
         let _permit = acquire_optional_limit(&runtime_limits.contract_limit).await?;
         deps.api
@@ -2011,45 +2060,112 @@ async fn fetch_and_expand_contract_candidates(
             )
             .await
     };
-    let contract_tokens = match provider_tokens {
+    let expanded = match provider_tokens {
         Ok(tokens) => {
-            let matching_tokens: Vec<SeedNft> = tokens
-                .into_iter()
-                .filter(|row| row.contract_address.to_lowercase() == contract_key)
-                .collect();
-            if matching_tokens.is_empty() {
+            let expanded = expand_candidate_indexes_to_contract_tokens(
+                contract_address,
+                candidate_indexes,
+                candidates,
+                tokens,
+            );
+            if expanded.is_empty() {
                 eprintln!(
                     "warning: provider NFT expansion returned no tokens for {contract_address}; falling back to local snapshot rows"
                 );
-                snapshot_token_index.tokens_for_contract(&request.chain, contract_address)
+                snapshot_token_index.expand_candidates_for_contract(
+                    contract_address,
+                    candidate_indexes,
+                    candidates,
+                )
             } else {
-                matching_tokens
+                expanded
             }
         }
         Err(err) => {
             eprintln!(
                 "warning: provider NFT expansion failed for {contract_address}: {err}; falling back to local snapshot rows"
             );
-            snapshot_token_index.tokens_for_contract(&request.chain, contract_address)
+            snapshot_token_index.expand_candidates_for_contract(
+                contract_address,
+                candidate_indexes,
+                candidates,
+            )
         }
     };
-    Ok(expand_candidate_indexes_to_contract_tokens(
-        contract_address,
-        grouped
-            .get(contract_address)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]),
-        candidates,
-        &contract_tokens,
-    ))
+    Ok(expanded)
 }
 
-fn expand_candidate_indexes_to_contract_tokens(
+trait ContractTokenFields {
+    fn contract_address(&self) -> &str;
+    fn token_id(&self) -> &str;
+    fn token_uri(&self) -> &str;
+    fn image_uri(&self) -> &str;
+    fn name(&self) -> &str;
+    fn symbol(&self) -> &str;
+}
+
+impl ContractTokenFields for SeedNft {
+    fn contract_address(&self) -> &str {
+        &self.contract_address
+    }
+
+    fn token_id(&self) -> &str {
+        &self.token_id
+    }
+
+    fn token_uri(&self) -> &str {
+        &self.token_uri
+    }
+
+    fn image_uri(&self) -> &str {
+        &self.image_uri
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn symbol(&self) -> &str {
+        &self.symbol
+    }
+}
+
+impl ContractTokenFields for &crate::models::DatabaseNftRecord {
+    fn contract_address(&self) -> &str {
+        &self.contract_address
+    }
+
+    fn token_id(&self) -> &str {
+        &self.token_id
+    }
+
+    fn token_uri(&self) -> &str {
+        &self.token_uri
+    }
+
+    fn image_uri(&self) -> &str {
+        &self.image_uri
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn symbol(&self) -> &str {
+        &self.symbol
+    }
+}
+
+fn expand_candidate_indexes_to_contract_tokens<I, T>(
     contract_address: &str,
     candidate_indexes: &[usize],
     candidates: &[DuplicateCandidate],
-    contract_tokens: &[SeedNft],
-) -> Vec<DuplicateCandidate> {
+    contract_tokens: I,
+) -> Vec<DuplicateCandidate>
+where
+    I: IntoIterator<Item = T>,
+    T: ContractTokenFields,
+{
     let template = candidate_indexes
         .iter()
         .find_map(|index| candidates.get(*index))
@@ -2061,21 +2177,21 @@ fn expand_candidate_indexes_to_contract_tokens(
     let contract_key = contract_address.to_lowercase();
     let mut seen_tokens = BTreeSet::new();
     let mut expanded: Vec<DuplicateCandidate> = contract_tokens
-        .iter()
-        .filter(|row| row.contract_address.to_lowercase() == contract_key)
+        .into_iter()
+        .filter(|row| row.contract_address().to_lowercase() == contract_key)
         .filter_map(|row| {
-            if !seen_tokens.insert(row.token_id.clone()) {
+            if !seen_tokens.insert(row.token_id().to_string()) {
                 return None;
             }
             Some(DuplicateCandidate {
-                contract_address: row.contract_address.clone(),
-                token_id: row.token_id.clone(),
+                contract_address: row.contract_address().to_string(),
+                token_id: row.token_id().to_string(),
                 match_reasons: template.match_reasons.clone(),
                 confidence: template.confidence.clone(),
-                token_uri: row.token_uri.clone(),
-                image_uri: row.image_uri.clone(),
-                name: row.name.clone(),
-                symbol: row.symbol.clone(),
+                token_uri: row.token_uri().to_string(),
+                image_uri: row.image_uri().to_string(),
+                name: row.name().to_string(),
+                symbol: row.symbol().to_string(),
             })
         })
         .collect();
