@@ -21,10 +21,10 @@ use crate::models::{
     AddressSignalPayload, BatchReportSummary, BatchSeedReportPayload, BatchSummaryPayload,
     ContractLevelSummaryPayload, ContractMetadata, DatabaseSnapshot, DuplicateCandidate,
     DuplicateContractPayload, EthTransferRecord, FraudTradeStatsPayload, HonestAddressPayload,
-    HonestAddressStatsPayload, InfringingTokenRecord, MaliciousAddressPayload, NftSaleRecord,
-    OutputFilesPayload, OwnerBalance, ReportSummary, SeedCollectionStatsPayload,
-    SeedContractPayload, SeedNft, SingleReportPayload, TransactionReceiptRecord, TransferRecord,
-    VictimAddressPayload, VictimSignalPayload,
+    HonestAddressStatsPayload, InfringingTokenRecord, MaliciousAddressPayload,
+    NftPropagationPathPayload, NftSaleRecord, OutputFilesPayload, OwnerBalance, ReportSummary,
+    SeedCollectionStatsPayload, SeedContractPayload, SeedNft, SingleReportPayload,
+    TransactionReceiptRecord, TransferRecord, VictimAddressPayload, VictimSignalPayload,
 };
 use crate::normalize::{normalize_name, normalize_symbol, normalize_url};
 use crate::progress::{BatchProgressReporter, SeedProgressReporter};
@@ -33,6 +33,7 @@ use crate::store::{CachedSignals, ContractSignalCache, DuckDbFeatureStore};
 
 pub mod address_records;
 pub mod duplicate;
+pub mod propagation;
 pub mod scoring;
 pub mod signals;
 
@@ -342,6 +343,7 @@ struct ContractAnalysisResult {
     honest_address_stats: BTreeMap<String, HonestAddressStatsPayload>,
     victim_addresses: Vec<VictimAddressPayload>,
     fraud_trade_stats: BTreeMap<String, FraudTradeStatsPayload>,
+    nft_propagation_path: Option<NftPropagationPathPayload>,
 }
 
 #[derive(Clone, Debug)]
@@ -963,6 +965,7 @@ async fn analyze_seed_contract_with_limits(
     let mut honest_address_stats = BTreeMap::new();
     let mut victim_addresses = Vec::new();
     let mut fraud_trade_stats = BTreeMap::<String, FraudTradeStatsPayload>::new();
+    let mut nft_propagation_paths = BTreeMap::<String, NftPropagationPathPayload>::new();
     let mut expanded_candidates_by_contract = BTreeMap::new();
     let analysis_timestamp = chrono::Utc::now().timestamp();
     let token_type = payload_token_type(&seed_contract);
@@ -1039,6 +1042,7 @@ async fn analyze_seed_contract_with_limits(
                     &mut malicious_addresses,
                     &mut honest_addresses,
                     &mut victim_addresses,
+                    &mut nft_propagation_paths,
                 );
                 next_contract_index_to_merge += 1;
             }
@@ -1084,6 +1088,7 @@ async fn analyze_seed_contract_with_limits(
         honest_address_stats,
         victim_addresses,
         fraud_trade_stats,
+        nft_propagation_paths,
     };
     progress.on_seed_stage("finalize_report").await;
     progress.on_seed_completed().await;
@@ -1102,6 +1107,7 @@ fn merge_contract_analysis_result(
     malicious_addresses: &mut Vec<MaliciousAddressPayload>,
     honest_addresses: &mut Vec<HonestAddressPayload>,
     victim_addresses: &mut Vec<VictimAddressPayload>,
+    nft_propagation_paths: &mut BTreeMap<String, NftPropagationPathPayload>,
 ) {
     if let Some(legit_duplicate) = result.legit_duplicate {
         legit_contract_addresses.insert(result.contract_address.clone());
@@ -1120,6 +1126,9 @@ fn merge_contract_analysis_result(
     malicious_addresses.extend(result.malicious_addresses);
     honest_addresses.extend(result.honest_addresses);
     victim_addresses.extend(result.victim_addresses);
+    if let Some(path) = result.nft_propagation_path {
+        nft_propagation_paths.insert(result.contract_address, path);
+    }
 }
 
 fn payload_token_type(seed_contract: &ContractMetadata) -> String {
@@ -1252,6 +1261,7 @@ async fn analyze_duplicate_contract(
             honest_address_stats: BTreeMap::new(),
             victim_addresses: vec![],
             fraud_trade_stats: BTreeMap::new(),
+            nft_propagation_path: None,
         });
     }
 
@@ -1272,6 +1282,16 @@ async fn analyze_duplicate_contract(
         &contract_malicious,
         analysis_timestamp,
     );
+    let nft_propagation_path = propagation::build_nft_propagation_path(
+        contract_address,
+        &transfers,
+        &sales,
+        &owners,
+        &contract_infringing,
+        &contract_malicious,
+        &contract_honest,
+        &contract_victims,
+    );
 
     Ok(ContractAnalysisResult {
         contract_address: contract_address.to_string(),
@@ -1291,6 +1311,7 @@ async fn analyze_duplicate_contract(
         malicious_addresses: contract_malicious,
         honest_addresses: contract_honest,
         victim_addresses: contract_victims,
+        nft_propagation_path: Some(nft_propagation_path),
     })
 }
 

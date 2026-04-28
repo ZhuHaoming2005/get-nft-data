@@ -385,6 +385,86 @@ pub struct MaliciousAddressPayload {
     pub evidence_contracts: Vec<String>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NftPropagationSummaryPayload {
+    pub token_count: i64,
+    pub node_count: i64,
+    pub edge_count: i64,
+    pub mint_edge_count: i64,
+    pub transfer_edge_count: i64,
+    pub sale_edge_count: i64,
+    pub malicious_node_count: i64,
+    pub victim_node_count: i64,
+    pub honest_node_count: i64,
+    pub stuck_victim_node_count: i64,
+    pub first_block_number: i64,
+    pub last_block_number: i64,
+    pub first_block_time: i64,
+    pub last_block_time: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct NftPropagationNodePayload {
+    pub address: String,
+    pub roles: Vec<String>,
+    pub minted_token_count: i64,
+    pub bought_token_count: i64,
+    pub sold_token_count: i64,
+    pub received_transfer_count: i64,
+    pub sent_transfer_count: i64,
+    pub current_holding_token_count: i64,
+    pub total_buy_eth: f64,
+    pub total_buy_usd: f64,
+    pub is_stuck_victim: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct NftPropagationEdgePayload {
+    pub edge_id: String,
+    pub contract_address: String,
+    pub token_id: String,
+    pub from_address: String,
+    pub to_address: String,
+    pub tx_hash: String,
+    pub block_number: i64,
+    pub block_time: i64,
+    pub log_index: i64,
+    pub event_type: String,
+    pub channel: String,
+    pub marketplace: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_eth: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seconds_since_mint: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NftTokenPropagationPayload {
+    pub token_id: String,
+    pub match_reasons: Vec<String>,
+    pub minter_address: String,
+    pub mint_tx_hash: String,
+    pub mint_block: i64,
+    pub mint_time: i64,
+    pub first_transfer_time: i64,
+    pub current_holder_addresses: Vec<String>,
+    pub buyer_addresses: Vec<String>,
+    pub seller_addresses: Vec<String>,
+    pub edge_count: i64,
+    pub sale_count: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct NftPropagationPathPayload {
+    pub contract_address: String,
+    pub summary: NftPropagationSummaryPayload,
+    pub nodes: BTreeMap<String, NftPropagationNodePayload>,
+    pub edges: Vec<NftPropagationEdgePayload>,
+    pub token_paths: Vec<NftTokenPropagationPayload>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct SingleReportPayload {
     pub seed_contract: SeedContractPayload,
@@ -403,6 +483,8 @@ pub struct SingleReportPayload {
     pub honest_address_stats: BTreeMap<String, HonestAddressStatsPayload>,
     pub victim_addresses: Vec<VictimAddressPayload>,
     pub fraud_trade_stats: BTreeMap<String, FraudTradeStatsPayload>,
+    #[serde(default)]
+    pub nft_propagation_paths: BTreeMap<String, NftPropagationPathPayload>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]

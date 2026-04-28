@@ -1,0 +1,992 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFT 传播路径可视化</title>
+  <script src="https://cdn.jsdelivr.net/npm/cytoscape/dist/cytoscape.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/echarts/dist/echarts.min.js"></script>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --ink: #17202a;
+      --muted: #667085;
+      --line: #d7dde7;
+      --mint: #15803d;
+      --transfer: #2563eb;
+      --sale: #c2410c;
+      --malicious: #b42318;
+      --victim: #7c3aed;
+      --honest: #047857;
+      --shadow: 0 12px 32px rgba(15, 23, 42, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.45;
+    }
+
+    header {
+      display: grid;
+      grid-template-columns: minmax(220px, 1fr) auto;
+      gap: 16px;
+      align-items: end;
+      padding: 20px 24px 16px;
+      border-bottom: 1px solid var(--line);
+      background: #fff;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+
+    h1 {
+      margin: 0 0 4px;
+      font-size: 22px;
+      line-height: 1.2;
+      font-weight: 750;
+    }
+
+    .subtitle {
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      justify-content: flex-end;
+      align-items: center;
+    }
+
+    input[type="file"],
+    select,
+    button {
+      min-height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--ink);
+      font: inherit;
+      font-size: 13px;
+    }
+
+    input[type="file"] {
+      max-width: 260px;
+      padding: 6px;
+    }
+
+    select {
+      min-width: 240px;
+      padding: 0 10px;
+    }
+
+    button {
+      padding: 0 12px;
+      cursor: pointer;
+    }
+
+    button.active {
+      border-color: #111827;
+      background: #111827;
+      color: #fff;
+    }
+
+    main {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 360px;
+      gap: 16px;
+      padding: 16px 24px 24px;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+    }
+
+    .graph-panel {
+      min-width: 0;
+      overflow: hidden;
+    }
+
+    .graph-header {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .graph-title {
+      font-weight: 700;
+      word-break: break-all;
+    }
+
+    .filters {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .filters label {
+      display: inline-flex;
+      gap: 5px;
+      align-items: center;
+      white-space: nowrap;
+    }
+
+    #graph {
+      width: 100%;
+      height: 620px;
+      background: linear-gradient(#fff, #fbfcfe);
+    }
+
+    #roleChart {
+      width: 100%;
+      height: 220px;
+    }
+
+    .side {
+      display: grid;
+      gap: 16px;
+      align-content: start;
+    }
+
+    .section {
+      padding: 14px 16px;
+    }
+
+    .section h2 {
+      margin: 0 0 10px;
+      font-size: 14px;
+      line-height: 1.25;
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 9px 10px;
+      min-width: 0;
+    }
+
+    .metric .value {
+      display: block;
+      font-size: 18px;
+      font-weight: 760;
+    }
+
+    .metric .label {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 12px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .legend span {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+
+    .list {
+      display: grid;
+      gap: 8px;
+      max-height: 230px;
+      overflow: auto;
+    }
+
+    .item {
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 8px 10px;
+      font-size: 12px;
+    }
+
+    .item strong {
+      display: block;
+      margin-bottom: 3px;
+      font-size: 12px;
+      word-break: break-all;
+    }
+
+    .item span {
+      color: var(--muted);
+      word-break: break-word;
+    }
+
+    .empty {
+      padding: 40px 24px;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    .node-label {
+      fill: #111827;
+      font-size: 11px;
+      paint-order: stroke;
+      stroke: #fff;
+      stroke-width: 4px;
+      stroke-linejoin: round;
+    }
+
+    .edge-label {
+      fill: #475467;
+      font-size: 10px;
+      paint-order: stroke;
+      stroke: #fff;
+      stroke-width: 3px;
+      stroke-linejoin: round;
+    }
+
+    .node {
+      cursor: pointer;
+      stroke: #fff;
+      stroke-width: 2;
+    }
+
+    .edge {
+      fill: none;
+      stroke-width: 2.2;
+      opacity: 0.74;
+      cursor: pointer;
+    }
+
+    .edge:hover,
+    .node:hover {
+      opacity: 1;
+      stroke-width: 3.2;
+    }
+
+    .axis {
+      stroke: #edf0f5;
+      stroke-width: 1;
+    }
+
+    .lane-label {
+      fill: #98a2b3;
+      font-size: 11px;
+    }
+
+    @media (max-width: 980px) {
+      header {
+        grid-template-columns: 1fr;
+      }
+
+      .toolbar {
+        justify-content: flex-start;
+      }
+
+      main {
+        grid-template-columns: 1fr;
+        padding: 12px;
+      }
+
+      #graph {
+        height: 520px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>NFT 传播路径可视化</h1>
+      <p class="subtitle">读取 Rust 导出的 nft_propagation_paths，按合约查看 mint、转移、成交和地址角色。</p>
+    </div>
+    <div class="toolbar">
+      <input id="fileInput" type="file" accept=".json,application/json">
+      <select id="contractSelect" disabled>
+        <option>请选择 JSON</option>
+      </select>
+      <select id="tokenSelect" disabled>
+        <option value="">全部 Token</option>
+      </select>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel graph-panel">
+      <div class="graph-header">
+        <div class="graph-title" id="graphTitle">尚未加载报告</div>
+        <div class="filters">
+          <label><input type="checkbox" data-channel="mint" checked> mint</label>
+          <label><input type="checkbox" data-channel="transfer" checked> transfer</label>
+          <label><input type="checkbox" data-channel="sale" checked> sale</label>
+        </div>
+      </div>
+      <div id="graph" role="img" aria-label="NFT propagation graph"></div>
+    </section>
+
+    <aside class="side">
+      <section class="panel section">
+        <h2>合约指标</h2>
+        <div class="metrics" id="metrics"></div>
+      </section>
+      <section class="panel section">
+        <h2>图例</h2>
+        <div class="legend">
+          <span style="color: var(--mint)"><i class="dot"></i>Mint</span>
+          <span style="color: var(--transfer)"><i class="dot"></i>转移</span>
+          <span style="color: var(--sale)"><i class="dot"></i>成交</span>
+          <span style="color: var(--malicious)"><i class="dot"></i>恶意/铸造</span>
+          <span style="color: var(--victim)"><i class="dot"></i>受害买家</span>
+          <span style="color: var(--honest)"><i class="dot"></i>诚实持有者</span>
+        </div>
+      </section>
+      <section class="panel section">
+        <h2>角色和边类型分布</h2>
+        <div id="roleChart"></div>
+      </section>
+      <section class="panel section">
+        <h2>选中详情</h2>
+        <div id="details" class="item"><span>点击节点或边查看证据字段。</span></div>
+      </section>
+      <section class="panel section">
+        <h2>Token 路径样本</h2>
+        <div class="list" id="tokenList"></div>
+      </section>
+      <section class="panel section">
+        <h2>高风险地址</h2>
+        <div class="list" id="riskList"></div>
+      </section>
+    </aside>
+  </main>
+
+  <script>
+    const state = {
+      report: null,
+      paths: {},
+      selectedContract: "",
+      selectedToken: "",
+      channels: new Set(["mint", "transfer", "sale"]),
+    };
+
+    const fileInput = document.getElementById("fileInput");
+    const contractSelect = document.getElementById("contractSelect");
+    const tokenSelect = document.getElementById("tokenSelect");
+    const graphTitle = document.getElementById("graphTitle");
+    const graph = document.getElementById("graph");
+    const metrics = document.getElementById("metrics");
+    const details = document.getElementById("details");
+    const tokenList = document.getElementById("tokenList");
+    const riskList = document.getElementById("riskList");
+    const roleChart = document.getElementById("roleChart");
+    let cy = null;
+    let roleChartInstance = null;
+
+    function shortAddress(value) {
+      if (!value) return "unknown";
+      if (value.length <= 16) return value;
+      return `${value.slice(0, 8)}…${value.slice(-6)}`;
+    }
+
+    function clearElement(element) {
+      while (element.firstChild) element.removeChild(element.firstChild);
+    }
+
+    function showEmpty(message) {
+      if (cy) {
+        cy.destroy();
+        cy = null;
+        window.cy = null;
+      }
+      graph.innerHTML = `<div class="empty">${message}</div>`;
+    }
+
+    function metric(label, value) {
+      const node = document.createElement("div");
+      node.className = "metric";
+      node.innerHTML = `<span class="value">${value}</span><span class="label">${label}</span>`;
+      return node;
+    }
+
+    function roleColor(node) {
+      const roles = new Set(node.roles || []);
+      if (roles.has("malicious") || roles.has("minter")) return "#b42318";
+      if (roles.has("victim_buyer")) return "#7c3aed";
+      if (roles.has("honest_holder")) return "#047857";
+      if (roles.has("mint_source")) return "#475467";
+      return "#344054";
+    }
+
+    function edgeColor(edge) {
+      if (edge.channel === "mint") return "#15803d";
+      if (edge.channel === "sale") return "#c2410c";
+      return "#2563eb";
+    }
+
+    function roleLane(node) {
+      const roles = new Set(node.roles || []);
+      if (roles.has("mint_source")) return 0;
+      if (roles.has("malicious") || roles.has("minter")) return 1;
+      if (roles.has("victim_buyer")) return 2;
+      if (roles.has("honest_holder")) return 3;
+      if (roles.has("current_holder")) return 4;
+      return 5;
+    }
+
+    function setDetails(title, rows) {
+      details.innerHTML = `<strong>${title}</strong>${rows.map(([key, value]) => {
+        const safeValue = value === undefined || value === null || value === "" ? "n/a" : value;
+        return `<span>${key}: ${safeValue}</span>`;
+      }).join("<br>")}`;
+    }
+
+    function loadReport(report, fileName) {
+      state.report = report;
+      state.paths = report.nft_propagation_paths || {};
+      const contracts = Object.keys(state.paths).sort();
+      clearElement(contractSelect);
+      clearElement(tokenSelect);
+
+      if (contracts.length === 0) {
+        contractSelect.disabled = true;
+        tokenSelect.disabled = true;
+        contractSelect.innerHTML = "<option>未找到传播路径</option>";
+        tokenSelect.innerHTML = "<option>全部 Token</option>";
+        graphTitle.textContent = fileName || "报告缺少 nft_propagation_paths";
+        metrics.innerHTML = "";
+        tokenList.innerHTML = "";
+        riskList.innerHTML = "";
+        showEmpty("当前 JSON 没有 nft_propagation_paths。请重新运行 Rust 分析导出新字段。");
+        return;
+      }
+
+      contractSelect.disabled = false;
+      tokenSelect.disabled = false;
+      for (const contract of contracts) {
+        const option = document.createElement("option");
+        option.value = contract;
+        const summary = state.paths[contract].summary || {};
+        option.textContent = `${shortAddress(contract)} · tokens ${summary.token_count || 0} · sales ${summary.sale_edge_count || 0}`;
+        contractSelect.appendChild(option);
+      }
+      state.selectedContract = contracts[0];
+      contractSelect.value = state.selectedContract;
+      updateTokenOptions();
+      render();
+    }
+
+    function updateTokenOptions() {
+      const path = state.paths[state.selectedContract];
+      clearElement(tokenSelect);
+      const all = document.createElement("option");
+      all.value = "";
+      all.textContent = "全部 Token";
+      tokenSelect.appendChild(all);
+      for (const token of (path?.token_paths || [])) {
+        const option = document.createElement("option");
+        option.value = token.token_id;
+        option.textContent = `Token ${token.token_id} · edges ${token.edge_count || 0}`;
+        tokenSelect.appendChild(option);
+      }
+      state.selectedToken = "";
+      tokenSelect.value = "";
+    }
+
+    function renderMetrics(path) {
+      const summary = path.summary || {};
+      clearElement(metrics);
+      metrics.append(
+        metric("Token", summary.token_count || 0),
+        metric("节点", summary.node_count || 0),
+        metric("边", summary.edge_count || 0),
+        metric("成交边", summary.sale_edge_count || 0),
+        metric("恶意节点", summary.malicious_node_count || 0),
+        metric("受害节点", summary.victim_node_count || 0),
+        metric("诚实节点", summary.honest_node_count || 0),
+        metric("套牢节点", summary.stuck_victim_node_count || 0),
+      );
+    }
+
+    function renderTokenList(path, edges) {
+      clearElement(tokenList);
+      const visibleTokens = new Set(edges.map((edge) => edge.token_id));
+      const tokens = (path.token_paths || [])
+        .filter((token) => !state.selectedToken || token.token_id === state.selectedToken)
+        .filter((token) => visibleTokens.has(token.token_id))
+        .slice(0, 40);
+      if (tokens.length === 0) {
+        tokenList.innerHTML = '<div class="item"><span>没有符合当前过滤条件的 Token。</span></div>';
+        return;
+      }
+      for (const token of tokens) {
+        const item = document.createElement("div");
+        item.className = "item";
+        item.innerHTML = `
+          <strong>Token ${token.token_id}</strong>
+          <span>minter=${shortAddress(token.minter_address)} · sales=${token.sale_count || 0} · holders=${(token.current_holder_addresses || []).map(shortAddress).join(", ") || "n/a"}</span><br>
+          <span>reasons=${(token.match_reasons || []).join(", ") || "n/a"}</span>
+        `;
+        tokenList.appendChild(item);
+      }
+    }
+
+    function renderRiskList(path) {
+      clearElement(riskList);
+      const risky = Object.values(path.nodes || {})
+        .filter((node) => {
+          const roles = new Set(node.roles || []);
+          return roles.has("malicious") || roles.has("victim_buyer") || roles.has("corrupted_honest");
+        })
+        .sort((a, b) => {
+          const aScore = (a.total_buy_usd || 0) + (a.bought_token_count || 0);
+          const bScore = (b.total_buy_usd || 0) + (b.bought_token_count || 0);
+          return bScore - aScore;
+        })
+        .slice(0, 30);
+      if (risky.length === 0) {
+        riskList.innerHTML = '<div class="item"><span>没有高风险地址。</span></div>';
+        return;
+      }
+      for (const node of risky) {
+        const item = document.createElement("div");
+        item.className = "item";
+        item.innerHTML = `
+          <strong>${shortAddress(node.address)}</strong>
+          <span>${(node.roles || []).join(", ")} · buy_usd=${Number(node.total_buy_usd || 0).toFixed(2)} · holding=${node.current_holding_token_count || 0}</span>
+        `;
+        riskList.appendChild(item);
+      }
+    }
+
+    function renderRoleChart(path, edges) {
+      if (!window.echarts) {
+        roleChart.innerHTML = '<div class="empty">ECharts 未加载。</div>';
+        return;
+      }
+      if (!roleChartInstance) roleChartInstance = echarts.init(roleChart);
+      const nodes = Object.values(path.nodes || {});
+      const roleCounts = [
+        ["恶意/铸造", nodes.filter((node) => (node.roles || []).some((role) => role === "malicious" || role === "minter")).length],
+        ["受害买家", nodes.filter((node) => (node.roles || []).includes("victim_buyer")).length],
+        ["诚实持有者", nodes.filter((node) => (node.roles || []).includes("honest_holder")).length],
+        ["当前持有者", nodes.filter((node) => (node.roles || []).includes("current_holder")).length],
+      ];
+      const edgeCounts = ["mint", "transfer", "sale"].map((channel) => ({
+        name: channel,
+        value: edges.filter((edge) => edge.channel === channel).length,
+      }));
+      roleChartInstance.setOption({
+        animation: false,
+        color: ["#b42318", "#7c3aed", "#047857", "#475467", "#15803d", "#2563eb", "#c2410c"],
+        grid: { left: 0, right: 0, top: 0, bottom: 0 },
+        tooltip: { trigger: "item" },
+        series: [
+          {
+            type: "pie",
+            radius: ["45%", "72%"],
+            center: ["28%", "50%"],
+            data: roleCounts.map(([name, value]) => ({ name, value })),
+            label: { fontSize: 11 },
+          },
+          {
+            type: "pie",
+            radius: ["45%", "72%"],
+            center: ["74%", "50%"],
+            data: edgeCounts,
+            label: { fontSize: 11 },
+          },
+        ],
+      });
+    }
+
+    function nodeClass(node) {
+      const roles = new Set(node.roles || []);
+      if (roles.has("mint_source")) return "mint-source";
+      if (roles.has("malicious") || roles.has("minter")) return "malicious";
+      if (roles.has("victim_buyer")) return "victim";
+      if (roles.has("honest_holder")) return "honest";
+      if (roles.has("current_holder")) return "holder";
+      return "other";
+    }
+
+    function renderCytoscapeGraph(path, edges) {
+      if (!window.cytoscape) {
+        showEmpty("Cytoscape.js 未加载。请检查网络或改用本地库文件。");
+        return;
+      }
+      if (cy) {
+        cy.destroy();
+        cy = null;
+        window.cy = null;
+      }
+      graph.innerHTML = "";
+      if (edges.length === 0) {
+        showEmpty("当前过滤条件下没有边。");
+        return;
+      }
+
+      const touched = new Set();
+      for (const edge of edges) {
+        if (edge.from_address) touched.add(edge.from_address);
+        if (edge.to_address) touched.add(edge.to_address);
+      }
+      const elements = [];
+      for (const [address, node] of Object.entries(path.nodes || {})) {
+        if (!touched.has(address)) continue;
+        elements.push({
+          group: "nodes",
+          data: {
+            id: address,
+            label: shortAddress(address),
+            address,
+            roles: (node.roles || []).join(", "),
+            buyUsd: Number(node.total_buy_usd || 0).toFixed(2),
+            holding: node.current_holding_token_count || 0,
+            weight: Math.max(18, Math.min(44, 18 + (node.roles || []).length * 3 + Math.sqrt(node.bought_token_count || 0) * 2)),
+          },
+          classes: nodeClass(node),
+        });
+      }
+      for (const edge of edges) {
+        if (!touched.has(edge.from_address) || !touched.has(edge.to_address)) continue;
+        elements.push({
+          group: "edges",
+          data: {
+            id: edge.edge_id,
+            source: edge.from_address,
+            target: edge.to_address,
+            label: edge.channel === "sale" && edge.price_usd ? `$${Number(edge.price_usd).toFixed(1)}` : edge.channel,
+            channel: edge.channel,
+            token: edge.token_id,
+            tx: edge.tx_hash,
+            block: edge.block_number,
+            marketplace: edge.marketplace,
+            priceEth: edge.price_eth,
+            priceUsd: edge.price_usd,
+            secondsSinceMint: edge.seconds_since_mint,
+          },
+          classes: edge.channel,
+        });
+      }
+
+      cy = cytoscape({
+        container: graph,
+        elements,
+        wheelSensitivity: 0.18,
+        layout: {
+          name: "breadthfirst",
+          directed: true,
+          spacingFactor: 1.25,
+          avoidOverlap: true,
+          roots: elements
+            .filter((item) => item.group === "nodes" && item.data.id === "0x0000000000000000000000000000000000000000")
+            .map((item) => item.data.id),
+        },
+        style: [
+          {
+            selector: "node",
+            style: {
+              "background-color": "#344054",
+              "border-color": "#ffffff",
+              "border-width": 2,
+              width: "data(weight)",
+              height: "data(weight)",
+              label: "data(label)",
+              "font-size": 10,
+              color: "#111827",
+              "text-outline-color": "#ffffff",
+              "text-outline-width": 3,
+              "text-valign": "bottom",
+              "text-margin-y": 7,
+            },
+          },
+          { selector: "node.malicious", style: { "background-color": "#b42318" } },
+          { selector: "node.victim", style: { "background-color": "#7c3aed" } },
+          { selector: "node.honest", style: { "background-color": "#047857" } },
+          { selector: "node.holder", style: { "background-color": "#475467" } },
+          { selector: "node.mint-source", style: { "background-color": "#98a2b3", shape: "round-rectangle" } },
+          {
+            selector: "edge",
+            style: {
+              width: 2,
+              "curve-style": "bezier",
+              "target-arrow-shape": "triangle",
+              "line-color": "#2563eb",
+              "target-arrow-color": "#2563eb",
+              label: "data(label)",
+              "font-size": 9,
+              color: "#475467",
+              "text-background-color": "#ffffff",
+              "text-background-opacity": 0.85,
+              "text-background-padding": 2,
+            },
+          },
+          { selector: "edge.mint", style: { "line-color": "#15803d", "target-arrow-color": "#15803d" } },
+          { selector: "edge.sale", style: { "line-color": "#c2410c", "target-arrow-color": "#c2410c", width: 3 } },
+          { selector: ":selected", style: { "border-width": 4, "border-color": "#111827", "line-color": "#111827", "target-arrow-color": "#111827" } },
+        ],
+      });
+      window.cy = cy;
+
+      cy.on("tap", "node", (event) => {
+        const node = event.target.data();
+        setDetails("节点", [
+          ["address", node.address],
+          ["roles", node.roles],
+          ["buy_usd", node.buyUsd],
+          ["holding", node.holding],
+        ]);
+      });
+      cy.on("tap", "edge", (event) => {
+        const edge = event.target.data();
+        setDetails("边", [
+          ["channel", edge.channel],
+          ["token", edge.token],
+          ["from", edge.source],
+          ["to", edge.target],
+          ["tx", edge.tx],
+          ["block", edge.block],
+          ["marketplace", edge.marketplace],
+          ["price_eth", edge.priceEth],
+          ["price_usd", edge.priceUsd],
+          ["seconds_since_mint", edge.secondsSinceMint],
+        ]);
+      });
+      cy.fit(undefined, 36);
+    }
+
+    function renderGraph(path, edges) {
+      renderCytoscapeGraph(path, edges);
+      return;
+
+      clearElement(graph);
+      if (edges.length === 0) {
+        showEmpty("当前过滤条件下没有边。");
+        return;
+      }
+
+      const width = Math.max(graph.clientWidth || 900, 820);
+      const height = graph.clientHeight || 620;
+      graph.setAttribute("viewBox", `0 0 ${width} ${height}`);
+
+      const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
+      const marker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
+      marker.setAttribute("id", "arrow");
+      marker.setAttribute("viewBox", "0 0 10 10");
+      marker.setAttribute("refX", "9");
+      marker.setAttribute("refY", "5");
+      marker.setAttribute("markerWidth", "6");
+      marker.setAttribute("markerHeight", "6");
+      marker.setAttribute("orient", "auto-start-reverse");
+      const markerPath = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      markerPath.setAttribute("d", "M 0 0 L 10 5 L 0 10 z");
+      markerPath.setAttribute("fill", "#667085");
+      marker.appendChild(markerPath);
+      defs.appendChild(marker);
+      graph.appendChild(defs);
+
+      const laneNames = ["mint source", "minter / malicious", "victim buyers", "honest holders", "current holders", "other"];
+      const laneTop = 74;
+      const laneGap = Math.max(72, (height - 140) / laneNames.length);
+      for (let i = 0; i < laneNames.length; i += 1) {
+        const y = laneTop + i * laneGap;
+        const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+        line.setAttribute("x1", "24");
+        line.setAttribute("x2", width - 24);
+        line.setAttribute("y1", y);
+        line.setAttribute("y2", y);
+        line.setAttribute("class", "axis");
+        graph.appendChild(line);
+        const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+        label.setAttribute("x", "30");
+        label.setAttribute("y", y - 10);
+        label.setAttribute("class", "lane-label");
+        label.textContent = laneNames[i];
+        graph.appendChild(label);
+      }
+
+      const blockValues = edges.map((edge) => edge.block_number || 0).filter(Boolean);
+      const minBlock = Math.min(...blockValues);
+      const maxBlock = Math.max(...blockValues);
+      const span = Math.max(1, maxBlock - minBlock);
+      const nodeTimes = new Map();
+      const touched = new Set();
+      for (const edge of edges) {
+        touched.add(edge.from_address);
+        touched.add(edge.to_address);
+        const xValue = edge.block_number || minBlock;
+        for (const address of [edge.from_address, edge.to_address]) {
+          const current = nodeTimes.get(address);
+          nodeTimes.set(address, current === undefined ? xValue : Math.min(current, xValue));
+        }
+      }
+
+      const nodes = Object.fromEntries(Object.entries(path.nodes || {}).filter(([address]) => touched.has(address)));
+      const laneCounts = new Map();
+      const positions = new Map();
+      for (const [address, node] of Object.entries(nodes)) {
+        const lane = roleLane(node);
+        const laneIndex = laneCounts.get(lane) || 0;
+        laneCounts.set(lane, laneIndex + 1);
+        const xBase = 90 + ((nodeTimes.get(address) || minBlock) - minBlock) / span * (width - 180);
+        const yBase = laneTop + lane * laneGap;
+        const y = yBase + ((laneIndex % 5) - 2) * 12;
+        positions.set(address, { x: Math.max(72, Math.min(width - 72, xBase)), y });
+      }
+
+      for (const edge of edges) {
+        const from = positions.get(edge.from_address);
+        const to = positions.get(edge.to_address);
+        if (!from || !to) continue;
+        const pathElement = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        const midX = (from.x + to.x) / 2;
+        const bend = edge.channel === "sale" ? -22 : 18;
+        pathElement.setAttribute("d", `M ${from.x} ${from.y} C ${midX} ${from.y + bend}, ${midX} ${to.y - bend}, ${to.x} ${to.y}`);
+        pathElement.setAttribute("class", "edge");
+        pathElement.setAttribute("stroke", edgeColor(edge));
+        pathElement.setAttribute("marker-end", "url(#arrow)");
+        pathElement.addEventListener("click", () => setDetails("边", [
+          ["channel", edge.channel],
+          ["token", edge.token_id],
+          ["from", edge.from_address],
+          ["to", edge.to_address],
+          ["tx", edge.tx_hash],
+          ["block", edge.block_number],
+          ["marketplace", edge.marketplace],
+          ["price_eth", edge.price_eth],
+          ["price_usd", edge.price_usd],
+          ["seconds_since_mint", edge.seconds_since_mint],
+        ]));
+        graph.appendChild(pathElement);
+
+        if (edge.channel === "sale") {
+          const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+          label.setAttribute("x", midX);
+          label.setAttribute("y", (from.y + to.y) / 2 - 8);
+          label.setAttribute("text-anchor", "middle");
+          label.setAttribute("class", "edge-label");
+          label.textContent = edge.price_usd ? `$${Number(edge.price_usd).toFixed(1)}` : "sale";
+          graph.appendChild(label);
+        }
+      }
+
+      for (const [address, node] of Object.entries(nodes)) {
+        const pos = positions.get(address);
+        if (!pos) continue;
+        const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+        const radius = Math.min(18, 8 + (node.roles || []).length * 1.8 + Math.sqrt(node.bought_token_count || 0));
+        circle.setAttribute("cx", pos.x);
+        circle.setAttribute("cy", pos.y);
+        circle.setAttribute("r", radius);
+        circle.setAttribute("class", "node");
+        circle.setAttribute("fill", roleColor(node));
+        circle.addEventListener("click", () => setDetails("节点", [
+          ["address", node.address],
+          ["roles", (node.roles || []).join(", ")],
+          ["minted", node.minted_token_count],
+          ["bought", node.bought_token_count],
+          ["sold", node.sold_token_count],
+          ["holding", node.current_holding_token_count],
+          ["buy_eth", Number(node.total_buy_eth || 0).toFixed(4)],
+          ["buy_usd", Number(node.total_buy_usd || 0).toFixed(2)],
+          ["stuck", node.is_stuck_victim],
+        ]));
+        graph.appendChild(circle);
+
+        const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+        label.setAttribute("x", pos.x);
+        label.setAttribute("y", pos.y + radius + 13);
+        label.setAttribute("text-anchor", "middle");
+        label.setAttribute("class", "node-label");
+        label.textContent = shortAddress(address);
+        graph.appendChild(label);
+      }
+    }
+
+    function render() {
+      const path = state.paths[state.selectedContract];
+      if (!path) {
+        showEmpty("请选择合约。");
+        return;
+      }
+      graphTitle.textContent = `${shortAddress(state.selectedContract)} · ${state.report?.seed_contract?.name || "seed report"}`;
+      const edges = (path.edges || [])
+        .filter((edge) => state.channels.has(edge.channel))
+        .filter((edge) => !state.selectedToken || edge.token_id === state.selectedToken);
+      renderMetrics(path);
+      renderRoleChart(path, edges);
+      renderTokenList(path, edges);
+      renderRiskList(path);
+      renderGraph(path, edges);
+    }
+
+    fileInput.addEventListener("change", async (event) => {
+      const file = event.target.files?.[0];
+      if (!file) return;
+      const text = await file.text();
+      try {
+        loadReport(JSON.parse(text), file.name);
+      } catch (error) {
+        showEmpty(`JSON 解析失败: ${error.message}`);
+      }
+    });
+
+    contractSelect.addEventListener("change", () => {
+      state.selectedContract = contractSelect.value;
+      updateTokenOptions();
+      render();
+    });
+
+    tokenSelect.addEventListener("change", () => {
+      state.selectedToken = tokenSelect.value;
+      render();
+    });
+
+    document.querySelectorAll("[data-channel]").forEach((input) => {
+      input.addEventListener("change", () => {
+        const channel = input.dataset.channel;
+        if (input.checked) state.channels.add(channel);
+        else state.channels.delete(channel);
+        render();
+      });
+    });
+
+    window.addEventListener("resize", () => {
+      if (roleChartInstance) roleChartInstance.resize();
+      render();
+    });
+    showEmpty("请选择 top_contract_analysis__*.json 文件。");
+  </script>
+</body>
+</html>

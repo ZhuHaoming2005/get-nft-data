@@ -2469,6 +2469,7 @@ fn single_report_payload_serializes_current_python_top_level_shape() {
             "honest_address_stats",
             "victim_addresses",
             "fraud_trade_stats",
+            "nft_propagation_paths",
             "report_summary",
         ])
     );
@@ -3464,6 +3465,28 @@ async fn analyze_builds_address_profiles_and_trade_stats_for_duplicate_contracts
     assert_eq!(payload.report_summary.honest_address_count, 2);
     assert_eq!(payload.report_summary.honest_purchase_total_eth, 1.5);
     assert_eq!(payload.report_summary.corrupted_honest_address_count, 1);
+
+    let propagation = &payload.nft_propagation_paths["0xdup"];
+    assert_eq!(propagation.summary.token_count, 1);
+    assert_eq!(propagation.summary.mint_edge_count, 1);
+    assert_eq!(propagation.summary.sale_edge_count, 1);
+    assert_eq!(propagation.summary.malicious_node_count, 1);
+    assert_eq!(propagation.summary.victim_node_count, 1);
+    assert!(propagation.edges.iter().any(|edge| {
+        edge.channel == "mint" && edge.to_address == "0xminter" && edge.token_id == "1"
+    }));
+    assert!(propagation.edges.iter().any(|edge| {
+        edge.channel == "sale"
+            && edge.from_address == "0xminter"
+            && edge.to_address == "0xvictim"
+            && edge.price_eth == Some(1.5)
+    }));
+    assert!(propagation.nodes["0xminter"]
+        .roles
+        .contains(&"malicious".to_string()));
+    assert!(propagation.nodes["0xvictim"]
+        .roles
+        .contains(&"victim_buyer".to_string()));
 }
 
 #[tokio::test]
