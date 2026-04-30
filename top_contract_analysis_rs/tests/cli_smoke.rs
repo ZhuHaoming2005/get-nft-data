@@ -44,6 +44,8 @@ fn batch_subcommand_is_exposed() {
             "result",
             "--api-max-concurrency",
             "24",
+            "--seed-metadata-max-concurrency",
+            "1",
             "--contract-max-concurrency",
             "12",
             "--sale-metric-max-concurrency",

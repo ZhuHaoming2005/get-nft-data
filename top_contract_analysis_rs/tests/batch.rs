@@ -55,6 +55,8 @@ struct BatchPipelineProbe {
     holder_started_before_sale_metric_finished: AtomicBool,
     expansion_observed_sale_metric_active: AtomicBool,
     metadata_calls: AtomicUsize,
+    metadata_current: AtomicUsize,
+    metadata_max_seen: AtomicUsize,
     snapshot_calls: AtomicUsize,
 }
 
@@ -156,6 +158,8 @@ impl AnalyzeApi for InstrumentedBatchApi {
         contract_address: &str,
     ) -> Result<ContractMetadata, AppError> {
         self.probe.metadata_calls.fetch_add(1, Ordering::SeqCst);
+        let current = self.probe.metadata_current.fetch_add(1, Ordering::SeqCst) + 1;
+        BatchPipelineProbe::record_max(&self.probe.metadata_max_seen, current);
         if contract_address == "0xseed2" {
             let mut waited = 0;
             while !self.probe.seed_one_snapshot_active.load(Ordering::SeqCst) && waited < 100 {
@@ -175,6 +179,8 @@ impl AnalyzeApi for InstrumentedBatchApi {
                 waited += 1;
             }
         }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        self.probe.metadata_current.fetch_sub(1, Ordering::SeqCst);
         Ok(ContractMetadata {
             chain: chain.to_string(),
             contract_address: contract_address.to_string(),
@@ -1273,6 +1279,7 @@ async fn batch_uses_worker_concurrency_for_uncached_seeds() {
             output_dir: dir.path().to_path_buf(),
             alchemy_api_key: "key".into(),
             workers: 2,
+            seed_metadata_max_concurrency: 2,
             ..BatchRequest::default()
         },
         &deps,
@@ -1362,6 +1369,46 @@ async fn batch_limits_cpu_stage_globally() {
 
     assert_eq!(probe.cpu_max_seen.load(Ordering::SeqCst), 1);
     assert_eq!(probe.snapshot_calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_limits_seed_metadata_fetches_globally() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n0xseed3\n").unwrap();
+    let probe = Arc::new(BatchPipelineProbe::default());
+    let deps = AnalysisDeps {
+        api: Arc::new(InstrumentedBatchApi {
+            probe: probe.clone(),
+            transfer_sleep_ms: 0,
+            emit_native_sale: false,
+        }),
+        feature_store: Arc::new(InstrumentedFeatureStore {
+            probe: probe.clone(),
+            sleep_ms: 0,
+            wait_for_transfer_before_seed_two_snapshot: false,
+        }),
+        signal_cache: None,
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    let _summary = run_batch(
+        BatchRequest {
+            chain: "ethereum".into(),
+            seed_file: dir.path().join("seeds.txt"),
+            output_dir: dir.path().to_path_buf(),
+            alchemy_api_key: "key".into(),
+            workers: 3,
+            seed_metadata_max_concurrency: 1,
+            ..BatchRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(probe.metadata_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(probe.metadata_max_seen.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -108,6 +108,7 @@ fn main() -> Result<(), AppError> {
                     metadata_threshold: args.metadata_threshold,
                     timeout_seconds: args.timeout,
                     api_max_concurrency: args.api_max_concurrency,
+                    seed_metadata_max_concurrency: args.seed_metadata_max_concurrency,
                     contract_max_concurrency: args.contract_max_concurrency,
                     sale_metric_max_concurrency: args.sale_metric_max_concurrency,
                     cpu_max_concurrency: args.cpu_max_concurrency,
