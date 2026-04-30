@@ -1033,7 +1033,10 @@ impl AnalyzeApi for FakeEnrichedApi {
     }
 }
 
-struct FakeLegitApi;
+#[derive(Default)]
+struct FakeLegitApi {
+    sales_calls: AtomicUsize,
+}
 
 #[async_trait]
 impl AnalyzeApi for FakeLegitApi {
@@ -1119,6 +1122,7 @@ impl AnalyzeApi for FakeLegitApi {
         contract_address: &str,
         opensea_api_key: &str,
     ) -> Result<Vec<NftSaleRecord>, AppError> {
+        self.sales_calls.fetch_add(1, Ordering::SeqCst);
         AnalyzeApi::fetch_contract_sales(
             &FakeEnrichedApi,
             chain,
@@ -1906,6 +1910,7 @@ struct ConcurrentSaleMetricApi {
     active_receipts: AtomicUsize,
     max_receipts: AtomicUsize,
     duplicate_sale_tx: bool,
+    same_buyer_history: bool,
     receipt_calls: AtomicUsize,
     balance_calls: AtomicUsize,
     same_block_transfer_calls: AtomicUsize,
@@ -1917,6 +1922,7 @@ impl ConcurrentSaleMetricApi {
             active_receipts: AtomicUsize::new(0),
             max_receipts: AtomicUsize::new(0),
             duplicate_sale_tx: false,
+            same_buyer_history: false,
             receipt_calls: AtomicUsize::new(0),
             balance_calls: AtomicUsize::new(0),
             same_block_transfer_calls: AtomicUsize::new(0),
@@ -1926,6 +1932,13 @@ impl ConcurrentSaleMetricApi {
     fn with_duplicate_sale_tx() -> Self {
         Self {
             duplicate_sale_tx: true,
+            ..Self::new()
+        }
+    }
+
+    fn with_same_buyer_history() -> Self {
+        Self {
+            same_buyer_history: true,
             ..Self::new()
         }
     }
@@ -2198,6 +2211,11 @@ impl AnalyzeApi for ConcurrentSaleMetricApi {
         } else {
             "0xsale2"
         };
+        let second_buyer = if self.same_buyer_history {
+            "0xvictim1"
+        } else {
+            "0xvictim2"
+        };
         Ok(vec![
             NftSaleRecord {
                 contract_address: contract_address.to_string(),
@@ -2230,7 +2248,7 @@ impl AnalyzeApi for ConcurrentSaleMetricApi {
                 block_number: 3,
                 log_index: 0,
                 bundle_index: 0,
-                buyer_address: "0xvictim2".into(),
+                buyer_address: second_buyer.into(),
                 seller_address: "0xminter".into(),
                 marketplace: "opensea".into(),
                 taker: "buyer".into(),
@@ -2878,8 +2896,9 @@ fn single_report_does_not_display_eth_values_in_usd_fields() {
 
 #[tokio::test]
 async fn analyze_moves_official_reissues_into_legit_duplicates() {
+    let api = Arc::new(FakeLegitApi::default());
     let deps = AnalysisDeps {
-        api: Arc::new(FakeLegitApi),
+        api: api.clone(),
         feature_store: Arc::new(FakeFeatureStore {
             snapshot: DatabaseSnapshot {
                 nft_rows: vec![DatabaseNftRecord {
@@ -2923,6 +2942,11 @@ async fn analyze_moves_official_reissues_into_legit_duplicates() {
         vec!["0xminter"]
     );
     assert_eq!(payload.report_summary.legit_duplicate_contract_count, 1);
+    assert_eq!(
+        api.sales_calls.load(Ordering::SeqCst),
+        0,
+        "official reissues should not fetch sale history"
+    );
 }
 
 #[tokio::test]
@@ -3808,6 +3832,52 @@ async fn analyze_deduplicates_sale_metric_prefetch_by_transaction_hash() {
     .unwrap();
 
     assert_eq!(payload.victim_addresses.len(), 2);
+    assert_eq!(api.receipt_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(api.balance_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(api.same_block_transfer_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn analyze_prefetches_sale_metrics_only_for_latest_buyer_purchase() {
+    let api = Arc::new(ConcurrentSaleMetricApi::with_same_buyer_history());
+    let deps = AnalysisDeps {
+        api: api.clone(),
+        feature_store: Arc::new(FakeFeatureStore {
+            snapshot: DatabaseSnapshot {
+                nft_rows: vec![DatabaseNftRecord {
+                    contract_address: "0xdup".into(),
+                    token_id: "1".into(),
+                    token_uri: "ipfs://seed/1".into(),
+                    image_uri: "ipfs://image/1.png".into(),
+                    name: "Azuki Mirror #1".into(),
+                    symbol: "AZUKI".into(),
+                    metadata_json: r#"{"description":"gold dragon"}"#.into(),
+                    metadata_doc: "gold dragon".into(),
+                    metadata_recall_checked: false,
+                    metadata_recall_match: false,
+                }],
+                ..DatabaseSnapshot::default()
+            },
+        }),
+        signal_cache: None,
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    let payload = analyze_seed_contract(
+        AnalyzeRequest {
+            chain: "ethereum".into(),
+            seed_contract_address: "0xseed".into(),
+            alchemy_api_key: "key".into(),
+            sale_metric_max_concurrency: 2,
+            ..AnalyzeRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(payload.victim_addresses.len(), 1);
     assert_eq!(api.receipt_calls.load(Ordering::SeqCst), 1);
     assert_eq!(api.balance_calls.load(Ordering::SeqCst), 1);
     assert_eq!(api.same_block_transfer_calls.load(Ordering::SeqCst), 1);

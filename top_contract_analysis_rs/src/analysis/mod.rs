@@ -1166,21 +1166,8 @@ async fn analyze_duplicate_contract(
     } else {
         None
     };
-    let (transfers, owners, transfer_signals, victim_signal, sales) = if let Some(cached) =
-        cached_signals
+    let (transfers, owners, transfer_signals, victim_signal) = if let Some(cached) = cached_signals
     {
-        let sales = {
-            let _contract_permit = acquire_optional_limit(&runtime_limits.contract_limit).await?;
-            deps.api
-                .fetch_contract_sales(
-                    &request.chain,
-                    &request.alchemy_api_key,
-                    request.alchemy_network.as_deref(),
-                    contract_address,
-                    &request.opensea_api_key,
-                )
-                .await?
-        };
         (
             cached.transfers,
             cached.owners,
@@ -1188,10 +1175,9 @@ async fn analyze_duplicate_contract(
             cached
                 .victim_signals
                 .unwrap_or_else(|| analyze_victim_signals_from_active_sellers(&[], &[])),
-            sales,
         )
     } else {
-        let (transfers, owners, sales) = {
+        let (transfers, owners) = {
             let _contract_permit = acquire_optional_limit(&runtime_limits.contract_limit).await?;
             tokio::join!(
                 deps.api.fetch_contract_transfers(
@@ -1207,19 +1193,11 @@ async fn analyze_duplicate_contract(
                     &request.alchemy_api_key,
                     request.alchemy_network.as_deref(),
                     contract_address,
-                ),
-                deps.api.fetch_contract_sales(
-                    &request.chain,
-                    &request.alchemy_api_key,
-                    request.alchemy_network.as_deref(),
-                    contract_address,
-                    &request.opensea_api_key,
                 )
             )
         };
         let transfers = transfers?;
         let owners = owners?;
-        let sales = sales?;
         if let Some(cache) = deps.signal_cache.as_ref() {
             cache.put(
                 &request.chain,
@@ -1231,10 +1209,8 @@ async fn analyze_duplicate_contract(
         }
         let transfer_signals = signals::analyze_transfer_signals(&transfers);
         let victim_signal = analyze_victim_signals_from_active_sellers(&transfers, &owners);
-        (transfers, owners, transfer_signals, victim_signal, sales)
+        (transfers, owners, transfer_signals, victim_signal)
     };
-    let sale_metrics_by_tx =
-        compute_sale_metrics_for_contract(request, deps, &sales, runtime_limits).await?;
 
     let contract_infringing = address_records::build_infringing_token_records_with_context_refs(
         contract_address,
@@ -1274,6 +1250,21 @@ async fn analyze_duplicate_contract(
             nft_propagation_path: None,
         });
     }
+
+    let sales = {
+        let _contract_permit = acquire_optional_limit(&runtime_limits.contract_limit).await?;
+        deps.api
+            .fetch_contract_sales(
+                &request.chain,
+                &request.alchemy_api_key,
+                request.alchemy_network.as_deref(),
+                contract_address,
+                &request.opensea_api_key,
+            )
+            .await?
+    };
+    let sale_metrics_by_tx =
+        compute_sale_metrics_for_contract(request, deps, &sales, runtime_limits).await?;
 
     let contract_activity = address_records::prepare_contract_activity(&transfers, &sales, &owners);
     let contract_malicious = address_records::build_malicious_address_records_from_activity(
@@ -1425,8 +1416,23 @@ async fn compute_sale_metrics_for_contract(
             request.sale_metric_max_concurrency.max(1),
         )))
     });
-    let mut unique_sales_by_tx = BTreeMap::new();
+    let mut latest_sale_by_buyer = BTreeMap::<String, &NftSaleRecord>::new();
     for sale in sales {
+        if sale.buyer_address.is_empty() {
+            continue;
+        }
+        latest_sale_by_buyer
+            .entry(sale.buyer_address.clone())
+            .and_modify(|existing| {
+                if sale_sort_key_for_metrics(sale) >= sale_sort_key_for_metrics(existing) {
+                    *existing = sale;
+                }
+            })
+            .or_insert(sale);
+    }
+
+    let mut unique_sales_by_tx = BTreeMap::new();
+    for sale in latest_sale_by_buyer.into_values() {
         unique_sales_by_tx
             .entry(sale.tx_hash.clone())
             .or_insert(sale);
@@ -1497,6 +1503,15 @@ async fn compute_sale_metrics_for_contract(
         );
     }
     Ok(rows)
+}
+
+fn sale_sort_key_for_metrics(sale: &NftSaleRecord) -> (i64, i64, i64, &str) {
+    (
+        sale.block_number,
+        sale.log_index,
+        sale.bundle_index,
+        sale.tx_hash.as_str(),
+    )
 }
 
 struct SaleMetricPrefetch {
