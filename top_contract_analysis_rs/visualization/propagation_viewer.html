@@ -33,6 +33,7 @@
       color: var(--ink);
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       line-height: 1.45;
+      overflow: hidden;
     }
 
     header {
@@ -107,6 +108,8 @@
       grid-template-columns: minmax(0, 1fr) 360px;
       gap: 16px;
       padding: 16px 24px 24px;
+      height: calc(100vh - 74px);
+      overflow: hidden;
     }
 
     .panel {
@@ -119,6 +122,9 @@
     .graph-panel {
       min-width: 0;
       overflow: hidden;
+      height: 100%;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
     }
 
     .graph-header {
@@ -153,7 +159,8 @@
 
     #graph {
       width: 100%;
-      height: 620px;
+      height: 100%;
+      min-height: 0;
       background: linear-gradient(#fff, #fbfcfe);
     }
 
@@ -166,6 +173,11 @@
       display: grid;
       gap: 16px;
       align-content: start;
+      height: 100%;
+      min-height: 0;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      padding-right: 4px;
     }
 
     .section {
@@ -237,20 +249,123 @@
     .item {
       border: 1px solid var(--line);
       border-radius: 7px;
-      padding: 8px 10px;
+      padding: 10px 11px;
       font-size: 12px;
+      background: #fff;
     }
 
     .item strong {
       display: block;
-      margin-bottom: 3px;
-      font-size: 12px;
+      margin-bottom: 7px;
+      font-size: 13px;
+      line-height: 1.25;
       word-break: break-all;
     }
 
     .item span {
       color: var(--muted);
       word-break: break-word;
+    }
+
+    .kv {
+      display: grid;
+      grid-template-columns: 94px minmax(0, 1fr);
+      gap: 5px 8px;
+      align-items: start;
+      margin-top: 6px;
+    }
+
+    .kv dt {
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .kv dd {
+      margin: 0;
+      color: #1d2939;
+      font-size: 12px;
+      word-break: break-word;
+    }
+
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      font-size: 11px;
+    }
+
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      margin: 5px 0 7px;
+    }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      max-width: 100%;
+      min-height: 20px;
+      padding: 2px 7px;
+      border-radius: 999px;
+      background: #eef2f7;
+      color: #344054;
+      font-size: 11px;
+      line-height: 1.2;
+      overflow-wrap: anywhere;
+    }
+
+    .chip.malicious,
+    .chip.minter,
+    .chip.mint_role,
+    .chip.wash_cycle,
+    .chip.star_distributor,
+    .chip.rapid_spreader {
+      background: #fee4e2;
+      color: #912018;
+    }
+
+    .chip.victim_buyer,
+    .chip.stuck_victim {
+      background: #ede9fe;
+      color: #5b21b6;
+    }
+
+    .chip.honest_holder,
+    .chip.current_holder {
+      background: #dcfae6;
+      color: #05603a;
+    }
+
+    .summary-row {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 6px;
+      margin: 6px 0;
+    }
+
+    .summary-row .mini {
+      border: 1px solid #edf0f5;
+      border-radius: 6px;
+      padding: 5px 6px;
+      min-width: 0;
+    }
+
+    .summary-row .mini b {
+      display: block;
+      color: #111827;
+      font-size: 13px;
+      line-height: 1.1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .summary-row .mini em {
+      display: block;
+      color: var(--muted);
+      font-size: 10px;
+      font-style: normal;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
     .empty {
@@ -318,10 +433,15 @@
       main {
         grid-template-columns: 1fr;
         padding: 12px;
+        height: calc(100vh - 132px);
       }
 
       #graph {
-        height: 520px;
+        min-height: 360px;
+      }
+
+      .side {
+        max-height: 42vh;
       }
     }
   </style>
@@ -351,6 +471,7 @@
           <label><input type="checkbox" data-channel="mint" checked> mint</label>
           <label><input type="checkbox" data-channel="transfer" checked> transfer</label>
           <label><input type="checkbox" data-channel="sale" checked> sale</label>
+          <label><input id="victimOnlyInput" type="checkbox"> 仅受害者相关</label>
         </div>
       </div>
       <div id="graph" role="img" aria-label="NFT propagation graph"></div>
@@ -398,11 +519,13 @@
       selectedContract: "",
       selectedToken: "",
       channels: new Set(["mint", "transfer", "sale"]),
+      victimOnly: false,
     };
 
     const fileInput = document.getElementById("fileInput");
     const contractSelect = document.getElementById("contractSelect");
     const tokenSelect = document.getElementById("tokenSelect");
+    const victimOnlyInput = document.getElementById("victimOnlyInput");
     const graphTitle = document.getElementById("graphTitle");
     const graph = document.getElementById("graph");
     const metrics = document.getElementById("metrics");
@@ -417,6 +540,62 @@
       if (!value) return "unknown";
       if (value.length <= 16) return value;
       return `${value.slice(0, 8)}…${value.slice(-6)}`;
+    }
+
+    function isZeroAddress(value) {
+      return /^0x0{40}$/i.test(String(value || ""));
+    }
+
+    function displayAddress(value) {
+      if (!value) return "n/a";
+      if (isZeroAddress(value)) return "mint source (0x0000000000000000000000000000000000000000)";
+      return value;
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    function displayValue(value) {
+      if (value === undefined || value === null || value === "") return "n/a";
+      if (typeof value === "number") {
+        if (!Number.isFinite(value)) return "n/a";
+        return Number.isInteger(value) ? value.toLocaleString() : value.toLocaleString(undefined, { maximumFractionDigits: 4 });
+      }
+      return String(value);
+    }
+
+    function formatUsd(value) {
+      const number = Number(value || 0);
+      return `$${number.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+    }
+
+    function formatEth(value) {
+      const number = Number(value || 0);
+      return `${number.toLocaleString(undefined, { maximumFractionDigits: 4 })} ETH`;
+    }
+
+    function roleChips(roles) {
+      const list = roles || [];
+      if (list.length === 0) return '<div class="chips"><span class="chip">无角色标签</span></div>';
+      return `<div class="chips">${list.map((role) => `<span class="chip ${escapeHtml(role)}">${escapeHtml(role)}</span>`).join("")}</div>`;
+    }
+
+    function kvRows(rows) {
+      return `<dl class="kv">${rows.map(([key, value, className = ""]) => (
+        `<dt>${escapeHtml(key)}</dt><dd class="${className}">${escapeHtml(displayValue(value))}</dd>`
+      )).join("")}</dl>`;
+    }
+
+    function miniStats(items) {
+      return `<div class="summary-row">${items.map(([label, value]) => (
+        `<div class="mini"><b>${escapeHtml(displayValue(value))}</b><em>${escapeHtml(label)}</em></div>`
+      )).join("")}</div>`;
     }
 
     function clearElement(element) {
@@ -454,6 +633,175 @@
       return "#2563eb";
     }
 
+    function saleTransferKey(edge) {
+      return [
+        edge.contract_address || "",
+        edge.token_id || "",
+        edge.tx_hash || "",
+        edge.from_address || "",
+        edge.to_address || "",
+      ].join("|");
+    }
+
+    function saleTransferTxKey(edge) {
+      return [
+        edge.contract_address || "",
+        edge.token_id || "",
+        edge.tx_hash || "",
+      ].join("|");
+    }
+
+    function mergeSaleAndTransferEdges(edges) {
+      const saleByKey = new Map();
+      const uniqueSaleByTx = new Map();
+      for (const edge of edges) {
+        if (edge.channel === "sale") {
+          saleByKey.set(saleTransferKey(edge), edge);
+          const txKey = saleTransferTxKey(edge);
+          uniqueSaleByTx.set(txKey, uniqueSaleByTx.has(txKey) ? null : edge);
+        }
+      }
+      const merged = [];
+      for (const edge of edges) {
+        if (edge.channel !== "transfer") {
+          merged.push(edge);
+          continue;
+        }
+        const sale = saleByKey.get(saleTransferKey(edge)) || uniqueSaleByTx.get(saleTransferTxKey(edge));
+        if (!sale) {
+          merged.push(edge);
+          continue;
+        }
+        sale.merged_transfer_count = (sale.merged_transfer_count || 0) + 1;
+        sale.merged_transfer_tx_hashes = sale.merged_transfer_tx_hashes || [];
+        if (edge.tx_hash && !sale.merged_transfer_tx_hashes.includes(edge.tx_hash)) {
+          sale.merged_transfer_tx_hashes.push(edge.tx_hash);
+        }
+        if (!sale.block_time && edge.block_time) sale.block_time = edge.block_time;
+        if (!sale.seconds_since_mint && edge.seconds_since_mint) {
+          sale.seconds_since_mint = edge.seconds_since_mint;
+        }
+      }
+      return merged;
+    }
+
+    function aggregateEdgesForRender(edges) {
+      edges = mergeSaleAndTransferEdges(edges.map((edge) => ({ ...edge })));
+      const grouped = new Map();
+      const rendered = [];
+      for (const edge of edges) {
+        if (edge.channel !== "mint" && edge.channel !== "transfer") {
+          rendered.push({
+            ...edge,
+            aggregate_count: 1,
+            token_ids: edge.token_id ? [edge.token_id] : [],
+            tx_hashes: edge.tx_hash ? [edge.tx_hash] : [],
+            merged_transfer_count: edge.merged_transfer_count || 0,
+            merged_transfer_tx_hashes: edge.merged_transfer_tx_hashes || [],
+          });
+          continue;
+        }
+
+        const key = [
+          edge.contract_address || "",
+          edge.channel || "",
+          edge.from_address || "",
+          edge.to_address || "",
+        ].join("|");
+        let aggregate = grouped.get(key);
+        if (!aggregate) {
+          aggregate = {
+            ...edge,
+            edge_id: `aggregate:${edge.channel}:${key}`,
+            aggregate_count: 0,
+            token_ids: [],
+            tx_hashes: [],
+            first_block_number: edge.block_number || 0,
+            last_block_number: edge.block_number || 0,
+            first_block_time: edge.block_time || 0,
+            last_block_time: edge.block_time || 0,
+          };
+          grouped.set(key, aggregate);
+          rendered.push(aggregate);
+        }
+        aggregate.aggregate_count += 1;
+        if (edge.token_id && !aggregate.token_ids.includes(edge.token_id)) {
+          aggregate.token_ids.push(edge.token_id);
+        }
+        if (edge.tx_hash && !aggregate.tx_hashes.includes(edge.tx_hash)) {
+          aggregate.tx_hashes.push(edge.tx_hash);
+        }
+        if (edge.block_number > 0) {
+          aggregate.first_block_number = aggregate.first_block_number > 0
+            ? Math.min(aggregate.first_block_number, edge.block_number)
+            : edge.block_number;
+          aggregate.last_block_number = Math.max(aggregate.last_block_number || 0, edge.block_number);
+        }
+        if (edge.block_time > 0) {
+          aggregate.first_block_time = aggregate.first_block_time > 0
+            ? Math.min(aggregate.first_block_time, edge.block_time)
+            : edge.block_time;
+          aggregate.last_block_time = Math.max(aggregate.last_block_time || 0, edge.block_time);
+        }
+      }
+      return rendered;
+    }
+
+    function tokenIdsFromEdges(edges) {
+      const tokenIds = new Set();
+      for (const edge of edges) {
+        for (const tokenId of edge.token_ids || []) {
+          tokenIds.add(tokenId);
+        }
+        if (edge.token_id) tokenIds.add(edge.token_id);
+      }
+      return tokenIds;
+    }
+
+    function compactList(values, limit = 8) {
+      const list = (values || []).filter(Boolean);
+      if (list.length <= limit) return list.join(", ");
+      return `${list.slice(0, limit).join(", ")} ... +${list.length - limit}`;
+    }
+
+    function victimAddressSet(path) {
+      const victims = new Set();
+      for (const [address, node] of Object.entries(path.nodes || {})) {
+        const roles = new Set(node.roles || []);
+        if (roles.has("victim_buyer") || roles.has("stuck_victim") || node.is_stuck_victim) {
+          victims.add(node.address || address);
+        }
+      }
+      return victims;
+    }
+
+    function visibleNodeAddressesFromEdges(edges) {
+      const addresses = new Set();
+      for (const edge of edges) {
+        if (edge.from_address) addresses.add(edge.from_address);
+        if (edge.to_address) addresses.add(edge.to_address);
+      }
+      return addresses;
+    }
+
+    function filterVictimRelatedEdges(path, edges) {
+      const victims = victimAddressSet(path);
+      if (victims.size === 0) return [];
+
+      const victimTokenIds = new Set();
+      for (const edge of edges) {
+        if (victims.has(edge.from_address) || victims.has(edge.to_address)) {
+          if (edge.token_id) victimTokenIds.add(edge.token_id);
+        }
+      }
+
+      return edges.filter((edge) => (
+        victims.has(edge.from_address)
+        || victims.has(edge.to_address)
+        || (edge.token_id && victimTokenIds.has(edge.token_id))
+      ));
+    }
+
     function roleLane(node) {
       const roles = new Set(node.roles || []);
       if (roles.has("mint_source")) return 0;
@@ -465,10 +813,7 @@
     }
 
     function setDetails(title, rows) {
-      details.innerHTML = `<strong>${title}</strong>${rows.map(([key, value]) => {
-        const safeValue = value === undefined || value === null || value === "" ? "n/a" : value;
-        return `<span>${key}: ${safeValue}</span>`;
-      }).join("<br>")}`;
+      details.innerHTML = `<strong>${escapeHtml(title)}</strong>${kvRows(rows)}`;
     }
 
     function loadReport(report, fileName) {
@@ -540,7 +885,7 @@
 
     function renderTokenList(path, edges) {
       clearElement(tokenList);
-      const visibleTokens = new Set(edges.map((edge) => edge.token_id));
+      const visibleTokens = tokenIdsFromEdges(edges);
       const tokens = (path.token_paths || [])
         .filter((token) => !state.selectedToken || token.token_id === state.selectedToken)
         .filter((token) => visibleTokens.has(token.token_id))
@@ -552,18 +897,33 @@
       for (const token of tokens) {
         const item = document.createElement("div");
         item.className = "item";
+        const reasons = token.match_reasons || [];
         item.innerHTML = `
-          <strong>Token ${token.token_id}</strong>
-          <span>minter=${shortAddress(token.minter_address)} · sales=${token.sale_count || 0} · holders=${(token.current_holder_addresses || []).map(shortAddress).join(", ") || "n/a"}</span><br>
-          <span>reasons=${(token.match_reasons || []).join(", ") || "n/a"}</span>
+          <strong>Token ${escapeHtml(token.token_id)}</strong>
+          ${roleChips(reasons)}
+          ${miniStats([
+            ["边", token.edge_count || 0],
+            ["成交", token.sale_count || 0],
+            ["持有者", (token.current_holder_addresses || []).length],
+          ])}
+          ${kvRows([
+            ["contract", path.contract_address || state.selectedContract || "n/a", "mono"],
+            ["minter", token.minter_address || "n/a", "mono"],
+            ["mint tx", token.mint_tx_hash || "n/a", "mono"],
+            ["mint block", token.mint_block || 0],
+            ["first transfer", token.first_transfer_time || 0],
+            ["buyers", (token.buyer_addresses || []).map(shortAddress).join(", ") || "n/a"],
+            ["holders", (token.current_holder_addresses || []).map(shortAddress).join(", ") || "n/a"],
+          ])}
         `;
         tokenList.appendChild(item);
       }
     }
 
-    function renderRiskList(path) {
+    function renderRiskList(path, visibleNodeAddresses = null) {
       clearElement(riskList);
       const risky = Object.values(path.nodes || {})
+        .filter((node) => !visibleNodeAddresses || visibleNodeAddresses.has(node.address))
         .filter((node) => {
           const roles = new Set(node.roles || []);
           return roles.has("malicious") || roles.has("victim_buyer") || roles.has("corrupted_honest");
@@ -582,20 +942,35 @@
         const item = document.createElement("div");
         item.className = "item";
         item.innerHTML = `
-          <strong>${shortAddress(node.address)}</strong>
-          <span>${(node.roles || []).join(", ")} · buy_usd=${Number(node.total_buy_usd || 0).toFixed(2)} · holding=${node.current_holding_token_count || 0}</span>
+          <strong class="mono">${escapeHtml(shortAddress(node.address))}</strong>
+          ${roleChips(node.roles || [])}
+          ${miniStats([
+            ["买入", node.bought_token_count || 0],
+            ["售出", node.sold_token_count || 0],
+            ["持有", node.current_holding_token_count || 0],
+          ])}
+          ${kvRows([
+            ["address", node.address || "n/a", "mono"],
+            ["buy USD", formatUsd(node.total_buy_usd)],
+            ["buy ETH", formatEth(node.total_buy_eth)],
+            ["minted", node.minted_token_count || 0],
+            ["received", node.received_transfer_count || 0],
+            ["sent", node.sent_transfer_count || 0],
+            ["stuck", node.is_stuck_victim ? "yes" : "no"],
+          ])}
         `;
         riskList.appendChild(item);
       }
     }
 
-    function renderRoleChart(path, edges) {
+    function renderRoleChart(path, edges, visibleNodeAddresses = null) {
       if (!window.echarts) {
         roleChart.innerHTML = '<div class="empty">ECharts 未加载。</div>';
         return;
       }
       if (!roleChartInstance) roleChartInstance = echarts.init(roleChart);
-      const nodes = Object.values(path.nodes || {});
+      const nodes = Object.values(path.nodes || {})
+        .filter((node) => !visibleNodeAddresses || visibleNodeAddresses.has(node.address));
       const roleCounts = [
         ["恶意/铸造", nodes.filter((node) => (node.roles || []).some((role) => role === "malicious" || role === "minter")).length],
         ["受害买家", nodes.filter((node) => (node.roles || []).includes("victim_buyer")).length],
@@ -604,7 +979,9 @@
       ];
       const edgeCounts = ["mint", "transfer", "sale"].map((channel) => ({
         name: channel,
-        value: edges.filter((edge) => edge.channel === channel).length,
+        value: edges
+          .filter((edge) => edge.channel === channel)
+          .reduce((sum, edge) => sum + (edge.aggregate_count || 1), 0),
       }));
       roleChartInstance.setOption({
         animation: false,
@@ -686,15 +1063,28 @@
             id: edge.edge_id,
             source: edge.from_address,
             target: edge.to_address,
-            label: edge.channel === "sale" && edge.price_usd ? `$${Number(edge.price_usd).toFixed(1)}` : edge.channel,
+            label: edge.aggregate_count > 1
+              ? `${edge.channel} x${edge.aggregate_count}`
+              : edge.channel === "sale" && edge.price_usd
+                ? `$${Number(edge.price_usd).toFixed(1)}`
+                : edge.channel,
             channel: edge.channel,
-            token: edge.token_id,
+            contract: edge.contract_address,
+            token: edge.aggregate_count > 1 ? `${edge.aggregate_count} tokens` : edge.token_id,
+            tokenIds: edge.token_ids || (edge.token_id ? [edge.token_id] : []),
             tx: edge.tx_hash,
+            txHashes: edge.tx_hashes || (edge.tx_hash ? [edge.tx_hash] : []),
             block: edge.block_number,
+            firstBlock: edge.first_block_number || edge.block_number,
+            lastBlock: edge.last_block_number || edge.block_number,
+            count: edge.aggregate_count || 1,
             marketplace: edge.marketplace,
             priceEth: edge.price_eth,
             priceUsd: edge.price_usd,
+            mergedTransferCount: edge.merged_transfer_count || 0,
+            mergedTransferTxHashes: edge.merged_transfer_tx_hashes || [],
             secondsSinceMint: edge.seconds_since_mint,
+            width: Math.min(8, 2 + Math.log2((edge.aggregate_count || 1) + 1)),
           },
           classes: edge.channel,
         });
@@ -745,6 +1135,7 @@
               "line-color": "#2563eb",
               "target-arrow-color": "#2563eb",
               label: "data(label)",
+              width: "data(width)",
               "font-size": 9,
               color: "#475467",
               "text-background-color": "#ffffff",
@@ -772,14 +1163,20 @@
         const edge = event.target.data();
         setDetails("边", [
           ["channel", edge.channel],
+          ["contract", edge.contract, "mono"],
+          ["count", edge.count],
           ["token", edge.token],
-          ["from", edge.source],
-          ["to", edge.target],
+          ["token_samples", compactList(edge.tokenIds)],
+          ["from", displayAddress(edge.source), "mono"],
+          ["to", displayAddress(edge.target), "mono"],
           ["tx", edge.tx],
-          ["block", edge.block],
+          ["tx_samples", compactList(edge.txHashes, 5)],
+          ["block", edge.count > 1 ? `${edge.firstBlock} - ${edge.lastBlock}` : edge.block],
           ["marketplace", edge.marketplace],
           ["price_eth", edge.priceEth],
           ["price_usd", edge.priceUsd],
+          ["merged_transfer_count", edge.mergedTransferCount],
+          ["merged_transfer_tx_samples", compactList(edge.mergedTransferTxHashes, 5)],
           ["seconds_since_mint", edge.secondsSinceMint],
         ]);
       });
@@ -878,14 +1275,17 @@
         pathElement.setAttribute("marker-end", "url(#arrow)");
         pathElement.addEventListener("click", () => setDetails("边", [
           ["channel", edge.channel],
+          ["contract", edge.contract_address, "mono"],
           ["token", edge.token_id],
-          ["from", edge.from_address],
-          ["to", edge.to_address],
+          ["from", displayAddress(edge.from_address), "mono"],
+          ["to", displayAddress(edge.to_address), "mono"],
           ["tx", edge.tx_hash],
           ["block", edge.block_number],
           ["marketplace", edge.marketplace],
           ["price_eth", edge.price_eth],
           ["price_usd", edge.price_usd],
+          ["merged_transfer_count", edge.merged_transfer_count],
+          ["merged_transfer_tx_samples", compactList(edge.merged_transfer_tx_hashes, 5)],
           ["seconds_since_mint", edge.seconds_since_mint],
         ]));
         graph.appendChild(pathElement);
@@ -940,14 +1340,19 @@
         showEmpty("请选择合约。");
         return;
       }
-      graphTitle.textContent = `${shortAddress(state.selectedContract)} · ${state.report?.seed_contract?.name || "seed report"}`;
-      const edges = (path.edges || [])
+      graphTitle.textContent = `${shortAddress(state.selectedContract)} · ${state.report?.seed_contract?.name || "seed report"}${state.victimOnly ? " · 仅受害者相关" : ""}`;
+      let rawEdges = (path.edges || [])
         .filter((edge) => state.channels.has(edge.channel))
         .filter((edge) => !state.selectedToken || edge.token_id === state.selectedToken);
+      if (state.victimOnly) {
+        rawEdges = filterVictimRelatedEdges(path, rawEdges);
+      }
+      const edges = aggregateEdgesForRender(rawEdges);
+      const visibleNodeAddresses = state.victimOnly ? visibleNodeAddressesFromEdges(edges) : null;
       renderMetrics(path);
-      renderRoleChart(path, edges);
+      renderRoleChart(path, edges, visibleNodeAddresses);
       renderTokenList(path, edges);
-      renderRiskList(path);
+      renderRiskList(path, visibleNodeAddresses);
       renderGraph(path, edges);
     }
 
@@ -970,6 +1375,11 @@
 
     tokenSelect.addEventListener("change", () => {
       state.selectedToken = tokenSelect.value;
+      render();
+    });
+
+    victimOnlyInput.addEventListener("change", () => {
+      state.victimOnly = victimOnlyInput.checked;
       render();
     });
 
