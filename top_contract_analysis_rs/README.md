@@ -125,9 +125,9 @@ cargo run --release -- batch \
   --feature-parquet ../output/top_contract_analysis/ethereum.parquet \
   --feature-db ../output/top_contract_analysis/features.duckdb \
   --signal-cache-db ../output/top_contract_analysis/signals.duckdb \
-  --output-dir ../result \
+  --output-dir ./result \
   --workers 3 \
-  --max-recall-rows 1000000 \
+  --max-recall-rows 5000000 \
   --api-max-concurrency 8 \
   --contract-max-concurrency 16 \
   --sale-metric-max-concurrency 10 \
