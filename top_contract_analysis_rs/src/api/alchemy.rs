@@ -265,13 +265,13 @@ pub async fn fetch_contract_metadata(
 ) -> Result<ContractMetadata, AppError> {
     let mut url = Url::parse(&format!(
         "{}/getContractMetadata",
-        endpoints.alchemy_nft_v2_base
+        endpoints.alchemy_nft_v3_base
     ))
     .map_err(|err| AppError::Http(err.to_string()))?;
     url.query_pairs_mut()
         .append_pair("contractAddress", contract_address);
     let payload: Value = client.get_json(url.as_str()).await?;
-    let meta = payload.get("contractMetadata").unwrap_or(&Value::Null);
+    let meta = payload.get("contractMetadata").unwrap_or(&payload);
     Ok(ContractMetadata {
         chain: chain.to_string(),
         contract_address: payload
@@ -293,6 +293,21 @@ pub async fn fetch_contract_metadata(
             .get("deployedBlockNumber")
             .and_then(Value::as_i64)
             .unwrap_or(0),
+        owner_address: contract_metadata_lower_field(
+            &payload,
+            meta,
+            &["ownerAddress", "owner", "contractOwner"],
+        ),
+        admin_address: contract_metadata_lower_field(
+            &payload,
+            meta,
+            &["adminAddress", "admin", "contractAdmin"],
+        ),
+        proxy_admin_address: contract_metadata_lower_field(
+            &payload,
+            meta,
+            &["proxyAdminAddress", "proxyAdmin", "proxy_admin"],
+        ),
         name: meta
             .get("name")
             .and_then(Value::as_str)
@@ -304,6 +319,22 @@ pub async fn fetch_contract_metadata(
             .unwrap_or("")
             .to_string(),
     })
+}
+
+fn contract_metadata_lower_field(payload: &Value, meta: &Value, fields: &[&str]) -> String {
+    for source in [meta, payload] {
+        for field in fields {
+            let value = source
+                .get(*field)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if !value.is_empty() {
+                return value.to_lowercase();
+            }
+        }
+    }
+    String::new()
 }
 
 pub async fn fetch_alchemy_contract_transfers(

@@ -1,18 +1,26 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use once_cell::sync::Lazy;
 use regex::Regex;
 use strsim::jaro_winkler;
 use top_contract_analysis_rs::analysis::address_records::{
-    build_infringing_token_records, build_infringing_token_records_with_context,
+    build_address_attribution_records, build_infringing_token_records,
+    build_infringing_token_records_with_context, build_malicious_address_records,
 };
 use top_contract_analysis_rs::analysis::duplicate::build_duplicate_candidates;
+use top_contract_analysis_rs::analysis::lifecycle::{
+    build_lifecycle_model_outputs, LifecycleModelInput,
+};
+use top_contract_analysis_rs::analysis::propagation::build_nft_propagation_path;
 use top_contract_analysis_rs::analysis::scoring::{
     metadata_document_from_json, score_metadata_documents, score_name_pairs, ScoringError,
 };
 use top_contract_analysis_rs::analysis::signals::analyze_transfer_signals;
 use top_contract_analysis_rs::models::{
-    DatabaseNftRecord, DuplicateCandidate, SeedNft, TransferRecord,
+    DatabaseNftRecord, DuplicateCandidate, DuplicateContractPayload, HonestAddressPayload,
+    InfringingTokenRecord, NftMarketEventRecord, NftPropagationPathPayload, NftSaleRecord,
+    OwnerBalance, SeedContractPayload, SeedNft, TransferRecord, ValueFlowEdgePayload,
+    VictimAddressPayload, ZERO_ADDRESS,
 };
 use top_contract_analysis_rs::normalize::{normalize_name, normalize_symbol, normalize_url};
 use unicode_normalization::UnicodeNormalization;
@@ -523,4 +531,1200 @@ fn infringing_token_records_use_token_open_license_and_official_reissue_flags() 
 
     assert!(rows[0].candidate_open_license);
     assert!(rows[0].official_or_legit_reissue);
+}
+
+#[test]
+fn mint_only_recipient_is_not_marked_malicious_without_other_behavior() {
+    let transfers = vec![TransferRecord {
+        contract_address: "0xdup".into(),
+        token_id: "1".into(),
+        tx_hash: "0xmint".into(),
+        block_number: 1,
+        block_time: 100,
+        from_address: ZERO_ADDRESS.into(),
+        to_address: "0xpaidminter".into(),
+        event_type: "erc721".into(),
+        source: "test".into(),
+        ..TransferRecord::default()
+    }];
+    let infringing_tokens = vec![InfringingTokenRecord {
+        contract_address: "0xdup".into(),
+        token_id: "1".into(),
+        minter_address: "0xpaidminter".into(),
+        ..InfringingTokenRecord::default()
+    }];
+
+    let rows = build_malicious_address_records("0xdup", &transfers, &infringing_tokens);
+
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn address_attribution_records_emit_multiscore_labels() {
+    let infringing_tokens = vec![InfringingTokenRecord {
+        contract_address: "0xdup".into(),
+        token_id: "1".into(),
+        minter_address: "0xseller".into(),
+        mint_tx_hash: "0xmint".into(),
+        ..InfringingTokenRecord::default()
+    }];
+    let sales = vec![NftSaleRecord {
+        contract_address: "0xdup".into(),
+        token_id: "1".into(),
+        tx_hash: "0xsale".into(),
+        block_number: 2,
+        buyer_address: "0xbuyer".into(),
+        seller_address: "0xseller".into(),
+        price_eth: Some(1.0),
+        price_usd: Some(3000.0),
+        is_native_eth: true,
+        ..NftSaleRecord::default()
+    }];
+    let victims = vec![VictimAddressPayload {
+        address: "0xbuyer".into(),
+        last_buy_tx_hash: "0xsale".into(),
+        is_stuck: true,
+        buy_asset_ratio: Some(0.72),
+        ..VictimAddressPayload::default()
+    }];
+    let honest = vec![HonestAddressPayload {
+        contract_address: "0xdup".into(),
+        address: "0xbuyer".into(),
+        interacted_token_count: 1,
+        currently_holding_token_count: 1,
+        ..HonestAddressPayload::default()
+    }];
+
+    let rows = build_address_attribution_records(
+        "0xdup",
+        &infringing_tokens,
+        &sales,
+        &[],
+        &[],
+        &honest,
+        &victims,
+    );
+
+    let seller = rows
+        .iter()
+        .find(|row| row.address == "0xseller")
+        .expect("seller attribution");
+    assert_eq!(seller.attribution_label, "neutral_participant");
+    assert!(seller.neutral_score > seller.operator_score);
+    assert!(seller.observed_roles.iter().any(|role| role == "seller"));
+
+    let buyer = rows
+        .iter()
+        .find(|row| row.address == "0xbuyer")
+        .expect("buyer attribution");
+    assert_eq!(buyer.attribution_label, "likely_victim");
+    assert!(buyer.victim_score > buyer.operator_score);
+    assert!(buyer.neutral_score > 0.0);
+}
+
+#[test]
+fn paid_mint_payment_marks_minter_as_victim_without_operator_evidence() {
+    let infringing_tokens = vec![InfringingTokenRecord {
+        contract_address: "0xdup".into(),
+        token_id: "1".into(),
+        minter_address: "0xpaidminter".into(),
+        mint_tx_hash: "0xmint".into(),
+        mint_block: 10,
+        ..InfringingTokenRecord::default()
+    }];
+    let mint_payment_edges = vec![ValueFlowEdgePayload {
+        edge_id: "value:mint_payment:0xmint:0xpaidminter:0xdup".into(),
+        contract_address: "0xdup".into(),
+        from_address: "0xpaidminter".into(),
+        to_address: "0xdup".into(),
+        tx_hash: "0xmint".into(),
+        block_number: 10,
+        block_time: 100,
+        token_id: "1".into(),
+        value_eth: Some(0.2),
+        payment_token_symbol: "ETH".into(),
+        payment_token_address: ZERO_ADDRESS.into(),
+        channel: "mint_payment".into(),
+        from_role: "paid_minter".into(),
+        to_role: "mint_contract".into(),
+        recipient_known: true,
+        evidence_flags: vec!["paid_mint".into()],
+        ..ValueFlowEdgePayload::default()
+    }];
+
+    let rows = build_address_attribution_records(
+        "0xdup",
+        &infringing_tokens,
+        &[],
+        &mint_payment_edges,
+        &[],
+        &[],
+        &[],
+    );
+
+    let minter = rows
+        .iter()
+        .find(|row| row.address == "0xpaidminter")
+        .expect("paid minter attribution");
+    assert_eq!(minter.attribution_label, "likely_victim");
+    assert!(minter.victim_score > minter.operator_score);
+    assert!(minter
+        .evidence
+        .iter()
+        .any(|evidence| evidence.evidence_type == "paid_mint_payment"));
+}
+
+#[test]
+fn propagation_edges_merge_sale_transfer_and_aggregate_mints() {
+    let transfers = vec![
+        TransferRecord {
+            contract_address: "0xdup".into(),
+            token_id: "1".into(),
+            tx_hash: "0xmint1".into(),
+            block_number: 1,
+            block_time: 100,
+            from_address: ZERO_ADDRESS.into(),
+            to_address: "0xseller".into(),
+            event_type: "erc721".into(),
+            source: "test".into(),
+            ..TransferRecord::default()
+        },
+        TransferRecord {
+            contract_address: "0xdup".into(),
+            token_id: "2".into(),
+            tx_hash: "0xmint2".into(),
+            block_number: 1,
+            block_time: 101,
+            from_address: ZERO_ADDRESS.into(),
+            to_address: "0xseller".into(),
+            event_type: "erc721".into(),
+            source: "test".into(),
+            ..TransferRecord::default()
+        },
+        TransferRecord {
+            contract_address: "0xdup".into(),
+            token_id: "1".into(),
+            tx_hash: "0xsale".into(),
+            block_number: 2,
+            block_time: 200,
+            from_address: "0xseller".into(),
+            to_address: "0xbuyer".into(),
+            event_type: "erc721".into(),
+            source: "test".into(),
+            ..TransferRecord::default()
+        },
+        TransferRecord {
+            contract_address: "0xdup".into(),
+            token_id: "2".into(),
+            tx_hash: "0xmove".into(),
+            block_number: 3,
+            block_time: 300,
+            from_address: "0xseller".into(),
+            to_address: "0xholder".into(),
+            event_type: "erc721".into(),
+            source: "test".into(),
+            ..TransferRecord::default()
+        },
+    ];
+    let sales = vec![NftSaleRecord {
+        contract_address: "0xdup".into(),
+        token_id: "1".into(),
+        tx_hash: "0xsale".into(),
+        block_number: 2,
+        log_index: 7,
+        buyer_address: "0xbuyer".into(),
+        seller_address: "0xseller".into(),
+        marketplace: "opensea".into(),
+        price_eth: Some(1.0),
+        source: "test".into(),
+        ..NftSaleRecord::default()
+    }];
+    let infringing_tokens = vec![
+        InfringingTokenRecord {
+            contract_address: "0xdup".into(),
+            token_id: "1".into(),
+            minter_address: "0xseller".into(),
+            ..InfringingTokenRecord::default()
+        },
+        InfringingTokenRecord {
+            contract_address: "0xdup".into(),
+            token_id: "2".into(),
+            minter_address: "0xseller".into(),
+            ..InfringingTokenRecord::default()
+        },
+    ];
+
+    let path = build_nft_propagation_path(
+        "0xdup",
+        &transfers,
+        &sales,
+        &[] as &[OwnerBalance],
+        &infringing_tokens,
+        &[],
+        &[],
+        &[],
+    );
+
+    let mint_edge = path
+        .edges
+        .iter()
+        .find(|edge| edge.channel == "mint")
+        .unwrap();
+    assert_eq!(mint_edge.aggregate_count, 2);
+    assert_eq!(
+        mint_edge
+            .token_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["1", "2"]
+    );
+    let sale_edge = path
+        .edges
+        .iter()
+        .find(|edge| edge.channel == "sale")
+        .unwrap();
+    assert!(sale_edge.merged_transfer);
+    assert_eq!(sale_edge.underlying_channels, vec!["sale", "transfer"]);
+    assert!(!path
+        .edges
+        .iter()
+        .any(|edge| edge.channel == "transfer" && edge.tx_hash == "0xsale"));
+    assert_eq!(path.summary.transfer_edge_count, 1);
+}
+
+#[test]
+fn lifecycle_model_outputs_expose_research_graph_payloads() {
+    let seed_contract = SeedContractPayload {
+        chain: "ethereum".into(),
+        contract_address: "0xseed".into(),
+        name: "Seed".into(),
+        symbol: "SEED".into(),
+        token_type: "ERC721".into(),
+        contract_deployer: "0xdeployer".into(),
+        deployed_block_number: 1,
+    };
+    let candidates = vec![DuplicateCandidate {
+        contract_address: "0xdup".into(),
+        token_id: "1".into(),
+        match_reasons: vec!["token_uri_match".into(), "name_match".into()],
+        confidence: "high".into(),
+        ..DuplicateCandidate::default()
+    }];
+    let duplicate_contracts = vec![DuplicateContractPayload {
+        contract_address: "0xdup".into(),
+        candidate_count: 1,
+        match_reasons: vec!["token_uri_match".into()],
+        mint_recipients: vec!["0xseller".into()],
+        ..DuplicateContractPayload::default()
+    }];
+    let transfers = vec![
+        TransferRecord {
+            contract_address: "0xdup".into(),
+            token_id: "1".into(),
+            tx_hash: "0xmint".into(),
+            block_number: 10,
+            block_time: 100,
+            from_address: ZERO_ADDRESS.into(),
+            to_address: "0xseller".into(),
+            event_type: "erc721".into(),
+            source: "test".into(),
+            ..TransferRecord::default()
+        },
+        TransferRecord {
+            contract_address: "0xdup".into(),
+            token_id: "1".into(),
+            tx_hash: "0xsale".into(),
+            block_number: 12,
+            block_time: 180,
+            from_address: "0xseller".into(),
+            to_address: "0xbuyer".into(),
+            event_type: "erc721".into(),
+            source: "test".into(),
+            ..TransferRecord::default()
+        },
+    ];
+    let sales = vec![NftSaleRecord {
+        contract_address: "0xdup".into(),
+        token_id: "1".into(),
+        tx_hash: "0xsale".into(),
+        block_number: 12,
+        log_index: 4,
+        buyer_address: "0xbuyer".into(),
+        seller_address: "0xseller".into(),
+        marketplace: "opensea".into(),
+        payment_token_symbol: "ETH".into(),
+        price_eth: Some(1.5),
+        price_usd: Some(4500.0),
+        seller_fee_eth: 1.2,
+        seller_fee_usd: 3600.0,
+        protocol_fee_eth: 0.1,
+        protocol_fee_usd: 300.0,
+        royalty_fee_eth: 0.2,
+        royalty_fee_usd: 600.0,
+        royalty_recipient_address: "0xroyalty".into(),
+        is_native_eth: true,
+        ..NftSaleRecord::default()
+    }];
+    let infringing_tokens = vec![InfringingTokenRecord {
+        contract_address: "0xdup".into(),
+        token_id: "1".into(),
+        minter_address: "0xseller".into(),
+        mint_tx_hash: "0xmint".into(),
+        mint_block: 10,
+        first_transfer_time: 180,
+        match_reasons: vec!["token_uri_match".into()],
+        ..InfringingTokenRecord::default()
+    }];
+    let victims = vec![VictimAddressPayload {
+        address: "0xbuyer".into(),
+        buy_tx_hashes: vec!["0xsale".into()],
+        buy_amount_eth: 1.5,
+        buy_amount_usd: 4500.0,
+        last_buy_tx_hash: "0xsale".into(),
+        is_stuck: true,
+        ..VictimAddressPayload::default()
+    }];
+    let attributions = build_address_attribution_records(
+        "0xdup",
+        &infringing_tokens,
+        &sales,
+        &[],
+        &[],
+        &[],
+        &victims,
+    );
+    let path = build_nft_propagation_path(
+        "0xdup",
+        &transfers,
+        &sales,
+        &[] as &[OwnerBalance],
+        &infringing_tokens,
+        &[],
+        &[],
+        &victims,
+    );
+    let propagation_paths = BTreeMap::from([("0xdup".to_string(), path)]);
+    let market_events = vec![
+        NftMarketEventRecord {
+            contract_address: "0xdup".into(),
+            token_id: "1".into(),
+            event_type: "order".into(),
+            order_type: "listing".into(),
+            order_hash: "0xorder".into(),
+            event_timestamp: 120,
+            actor_address: "0xseller".into(),
+            maker_address: "0xseller".into(),
+            price_eth: Some(2.0),
+            price_usd: Some(6000.0),
+            marketplace: "opensea".into(),
+            source: "opensea".into(),
+            ..NftMarketEventRecord::default()
+        },
+        NftMarketEventRecord {
+            contract_address: "0xdup".into(),
+            token_id: "1".into(),
+            event_type: "cancel".into(),
+            order_type: "listing".into(),
+            order_hash: "0xorder".into(),
+            event_timestamp: 220,
+            actor_address: "0xseller".into(),
+            maker_address: "0xseller".into(),
+            marketplace: "opensea".into(),
+            source: "opensea".into(),
+            ..NftMarketEventRecord::default()
+        },
+    ];
+    let mint_payment_edges = vec![
+        ValueFlowEdgePayload {
+            edge_id: "value:mint_payment:0xmint:0xseller:0xdup".into(),
+            contract_address: "0xdup".into(),
+            from_address: "0xseller".into(),
+            to_address: "0xdup".into(),
+            tx_hash: "0xmint".into(),
+            block_number: 10,
+            block_time: 100,
+            token_id: "1".into(),
+            value_eth: Some(0.08),
+            value_usd: None,
+            payment_token_symbol: "ETH".into(),
+            payment_token_address: ZERO_ADDRESS.into(),
+            channel: "mint_payment".into(),
+            marketplace: String::new(),
+            evidence_type: "same_tx_eth_transfer".into(),
+            from_role: "paid_minter".into(),
+            to_role: "mint_contract".into(),
+            recipient_known: true,
+            evidence_flags: vec!["paid_mint".into(), "same_tx_eth_transfer".into()],
+        },
+        ValueFlowEdgePayload {
+            edge_id: "value:funding:0xmint:0xcreator:0xseller".into(),
+            contract_address: "0xdup".into(),
+            from_address: "0xcreator".into(),
+            to_address: "0xseller".into(),
+            tx_hash: "0xmint".into(),
+            block_number: 10,
+            block_time: 100,
+            token_id: "1".into(),
+            value_eth: Some(0.08),
+            value_usd: None,
+            payment_token_symbol: "ETH".into(),
+            payment_token_address: ZERO_ADDRESS.into(),
+            channel: "funding".into(),
+            marketplace: String::new(),
+            evidence_type: "same_tx_eth_transfer:external".into(),
+            from_role: "external_funder".into(),
+            to_role: "paid_minter".into(),
+            recipient_known: true,
+            evidence_flags: vec!["same_tx_mint_funding".into()],
+        },
+        ValueFlowEdgePayload {
+            edge_id: "value:withdrawal:0xmint:0xdup:0xcreator".into(),
+            contract_address: "0xdup".into(),
+            from_address: "0xdup".into(),
+            to_address: "0xcreator".into(),
+            tx_hash: "0xmint".into(),
+            block_number: 10,
+            block_time: 100,
+            token_id: "1".into(),
+            value_eth: Some(0.4),
+            value_usd: None,
+            payment_token_symbol: "ETH".into(),
+            payment_token_address: ZERO_ADDRESS.into(),
+            channel: "withdrawal".into(),
+            marketplace: String::new(),
+            evidence_type: "same_tx_contract_outflow:external".into(),
+            from_role: "mint_contract".into(),
+            to_role: "contract_deployer".into(),
+            recipient_known: true,
+            evidence_flags: vec!["same_tx_contract_withdrawal".into()],
+        },
+    ];
+
+    let outputs = build_lifecycle_model_outputs(LifecycleModelInput {
+        seed_contract: &seed_contract,
+        duplicate_candidates: &candidates,
+        duplicate_contracts: &duplicate_contracts,
+        address_attributions: &attributions,
+        nft_propagation_paths: &propagation_paths,
+        mint_payment_edges: &mint_payment_edges,
+        market_events: &market_events,
+    });
+
+    assert!(outputs
+        .contract_lifecycle_events
+        .iter()
+        .any(|event| event.lifecycle_stage == "replica_mint"));
+    assert!(outputs
+        .contract_lifecycle_events
+        .iter()
+        .any(|event| event.lifecycle_stage == "monetization"));
+    assert!(outputs
+        .contract_lifecycle_events
+        .iter()
+        .any(|event| event.lifecycle_stage == "market_exposure"));
+    assert!(outputs.contract_lifecycle_events.iter().any(|event| {
+        event.lifecycle_stage == "primary_monetization"
+            && event.event_type == "mint_payment"
+            && event.tx_hash == "0xmint"
+            && event.value_eth == Some(0.08)
+    }));
+    assert!(outputs.contract_lifecycle_events.iter().any(|event| {
+        event.lifecycle_stage == "copy_preparation"
+            && event.event_type == "funding"
+            && event.tx_hash == "0xmint"
+    }));
+    assert!(outputs.contract_lifecycle_events.iter().any(|event| {
+        event.lifecycle_stage == "exit_or_cleanup"
+            && event.event_type == "withdrawal"
+            && event.tx_hash == "0xmint"
+    }));
+    assert!(outputs
+        .contract_lifecycle_events
+        .iter()
+        .any(|event| event.lifecycle_stage == "exit_or_cleanup"));
+    let value_edge = outputs
+        .value_flow_edges
+        .iter()
+        .find(|edge| edge.tx_hash == "0xsale" && edge.channel == "sale_payment")
+        .expect("sale value flow edge");
+    assert_eq!(value_edge.from_address, "0xbuyer");
+    assert_eq!(value_edge.to_address, "0xseller");
+    assert_eq!(value_edge.value_usd, Some(3600.0));
+    assert_eq!(value_edge.payment_token_symbol, "ETH");
+    let royalty_edge = outputs
+        .value_flow_edges
+        .iter()
+        .find(|edge| edge.tx_hash == "0xsale" && edge.channel == "royalty_fee")
+        .expect("royalty value flow edge");
+    assert_eq!(royalty_edge.from_address, "0xbuyer");
+    assert_eq!(royalty_edge.to_address, "0xroyalty");
+    assert!(royalty_edge.recipient_known);
+    assert_eq!(royalty_edge.value_usd, Some(600.0));
+    assert_eq!(royalty_edge.evidence_type, "marketplace_royalty_fee");
+    let protocol_edge = outputs
+        .value_flow_edges
+        .iter()
+        .find(|edge| edge.tx_hash == "0xsale" && edge.channel == "protocol_fee")
+        .expect("protocol fee value flow edge");
+    assert_eq!(protocol_edge.value_usd, Some(300.0));
+    let mint_payment_edge = outputs
+        .value_flow_edges
+        .iter()
+        .find(|edge| edge.channel == "mint_payment")
+        .expect("mint payment value flow edge");
+    assert_eq!(mint_payment_edge.from_address, "0xseller");
+    assert_eq!(mint_payment_edge.to_address, "0xdup");
+    assert_eq!(mint_payment_edge.value_eth, Some(0.08));
+    assert_eq!(outputs.content_similarity_edges.len(), 1);
+    let transition = outputs
+        .contract_lifecycle_events
+        .iter()
+        .find(|event| {
+            event.lifecycle_stage == "stage_transition"
+                && event.event_type == "copy_preparation_to_replica_mint"
+        })
+        .expect("copy to mint transition event");
+    assert!(transition.detail.contains("evidence_flags"));
+    assert!(!outputs.campaign_clusters[0]
+        .suspected_operator_addresses
+        .contains(&"0xseller".to_string()));
+    assert!(outputs.campaign_clusters[0]
+        .victim_addresses
+        .contains(&"0xbuyer".to_string()));
+    assert!(outputs.campaign_clusters[0]
+        .contract_addresses
+        .contains(&"0xdup".to_string()));
+    assert!(!outputs.campaign_clusters[0]
+        .contract_addresses
+        .contains(&"0xseed".to_string()));
+    assert!(!outputs.campaign_clusters[0]
+        .lifecycle_stages
+        .contains(&"reference_deployment".to_string()));
+    assert_eq!(outputs.campaign_clusters[0].first_block_number, 10);
+    assert!(outputs
+        .lifecycle_metrics
+        .iter()
+        .all(|metric| metric.contract_address != "0xseed"));
+    let metric = outputs
+        .lifecycle_metrics
+        .iter()
+        .find(|metric| metric.contract_address == "0xdup")
+        .expect("contract lifecycle metric");
+    assert_eq!(metric.time_to_first_listing_seconds, Some(20));
+    assert_eq!(metric.time_to_first_sale_seconds, Some(80));
+    assert_eq!(metric.market_event_count, 2);
+    assert!((metric.gross_revenue_eth - 1.58).abs() < 1e-9);
+    assert!((metric.operator_revenue_eth - 0.08).abs() < 1e-9);
+    assert_eq!(metric.marketplace_fee_eth, 0.1);
+    assert_eq!(metric.funding_edge_count, 1);
+    assert_eq!(metric.withdrawal_edge_count, 1);
+    assert_eq!(metric.revenue_backflow_edge_count, 1);
+    assert_eq!(metric.top_value_recipient_address, "0xdup");
+    assert!((metric.top_value_recipient_eth - 0.08).abs() < 1e-9);
+    assert!((metric.withdrawal_amount_eth - 0.4).abs() < 1e-9);
+    assert!(metric.early_detection_positive);
+    assert!(metric.pre_sale_signal_count >= 4);
+    assert!(outputs.weak_supervision_labels.iter().any(|label| {
+        label.entity_type == "contract"
+            && label.contract_address == "0xdup"
+            && label.label == "probable_infringement_campaign"
+    }));
+    assert!(outputs.early_detection_features.iter().any(|row| {
+        row.contract_address == "0xdup"
+            && row.observation_window_seconds == 60
+            && row.pre_sale_signal_count >= 4
+            && row.weak_label == "positive_future_sale_or_victimization"
+    }));
+}
+
+#[test]
+fn lifecycle_metrics_handle_proxy_admin_and_usd_only_top_recipient() {
+    let seed_contract = SeedContractPayload {
+        chain: "ethereum".into(),
+        contract_address: "0xseed".into(),
+        token_type: "ERC721".into(),
+        ..SeedContractPayload::default()
+    };
+    let duplicate_contracts = vec![DuplicateContractPayload {
+        contract_address: "0xdup".into(),
+        candidate_count: 1,
+        match_reasons: vec!["metadata_match".into()],
+        proxy_admin_address: "0xproxy".into(),
+        ..DuplicateContractPayload::default()
+    }];
+    let candidates = vec![DuplicateCandidate {
+        contract_address: "0xdup".into(),
+        token_id: "1".into(),
+        match_reasons: vec!["metadata_match".into()],
+        confidence: "high".into(),
+        ..DuplicateCandidate::default()
+    }];
+    let propagation_paths = BTreeMap::from([(
+        "0xdup".to_string(),
+        NftPropagationPathPayload {
+            contract_address: "0xdup".into(),
+            summary: Default::default(),
+            ..NftPropagationPathPayload::default()
+        },
+    )]);
+    let value_edges = vec![
+        ValueFlowEdgePayload {
+            edge_id: "value:mint_payment:0xmint:0xvictim:0xproxy".into(),
+            contract_address: "0xdup".into(),
+            from_address: "0xvictim".into(),
+            to_address: "0xproxy".into(),
+            tx_hash: "0xmint".into(),
+            block_number: 10,
+            block_time: 100,
+            token_id: "1".into(),
+            value_usd: Some(100.0),
+            payment_token_symbol: "USDC".into(),
+            channel: "mint_payment".into(),
+            from_role: "paid_minter".into(),
+            to_role: "proxy_admin".into(),
+            recipient_known: true,
+            evidence_flags: vec!["paid_mint".into()],
+            ..ValueFlowEdgePayload::default()
+        },
+        ValueFlowEdgePayload {
+            edge_id: "value:withdrawal:0xwithdraw:0xdup:0xproxy".into(),
+            contract_address: "0xdup".into(),
+            from_address: "0xdup".into(),
+            to_address: "0xproxy".into(),
+            tx_hash: "0xwithdraw".into(),
+            block_number: 11,
+            block_time: 120,
+            value_usd: Some(100.0),
+            payment_token_symbol: "USDC".into(),
+            channel: "withdrawal".into(),
+            from_role: "mint_contract".into(),
+            to_role: "proxy_admin".into(),
+            recipient_known: true,
+            ..ValueFlowEdgePayload::default()
+        },
+    ];
+
+    let outputs = build_lifecycle_model_outputs(LifecycleModelInput {
+        seed_contract: &seed_contract,
+        duplicate_candidates: &candidates,
+        duplicate_contracts: &duplicate_contracts,
+        address_attributions: &[],
+        nft_propagation_paths: &propagation_paths,
+        mint_payment_edges: &value_edges,
+        market_events: &[],
+    });
+
+    let metric = outputs
+        .lifecycle_metrics
+        .iter()
+        .find(|metric| metric.contract_address == "0xdup")
+        .expect("contract lifecycle metric");
+    assert_eq!(metric.operator_revenue_usd, 100.0);
+    assert_eq!(metric.gross_revenue_usd, 100.0);
+    assert_eq!(metric.top_value_recipient_address, "0xproxy");
+    assert_eq!(metric.top_value_recipient_usd, 100.0);
+    assert_eq!(metric.withdrawal_amount_usd, 100.0);
+}
+
+#[test]
+fn early_detection_features_do_not_treat_undated_sales_as_window_observed() {
+    let seed_contract = SeedContractPayload {
+        chain: "ethereum".into(),
+        contract_address: "0xseed".into(),
+        token_type: "ERC721".into(),
+        ..SeedContractPayload::default()
+    };
+    let duplicate_contracts = vec![DuplicateContractPayload {
+        contract_address: "0xdup".into(),
+        candidate_count: 1,
+        match_reasons: vec!["token_uri_match".into()],
+        ..DuplicateContractPayload::default()
+    }];
+    let candidates = vec![DuplicateCandidate {
+        contract_address: "0xdup".into(),
+        token_id: "1".into(),
+        match_reasons: vec!["token_uri_match".into()],
+        confidence: "high".into(),
+        ..DuplicateCandidate::default()
+    }];
+    let path = build_nft_propagation_path(
+        "0xdup",
+        &[TransferRecord {
+            contract_address: "0xdup".into(),
+            token_id: "1".into(),
+            tx_hash: "0xmint".into(),
+            block_number: 10,
+            block_time: 100,
+            from_address: ZERO_ADDRESS.into(),
+            to_address: "0xseller".into(),
+            ..TransferRecord::default()
+        }],
+        &[NftSaleRecord {
+            contract_address: "0xdup".into(),
+            token_id: "1".into(),
+            tx_hash: "0xsale_without_transfer_time".into(),
+            block_number: 12,
+            buyer_address: "0xbuyer".into(),
+            seller_address: "0xseller".into(),
+            price_eth: Some(1.0),
+            ..NftSaleRecord::default()
+        }],
+        &[] as &[OwnerBalance],
+        &[InfringingTokenRecord {
+            contract_address: "0xdup".into(),
+            token_id: "1".into(),
+            minter_address: "0xseller".into(),
+            mint_tx_hash: "0xmint".into(),
+            mint_block: 10,
+            ..InfringingTokenRecord::default()
+        }],
+        &[],
+        &[],
+        &[],
+    );
+
+    let unknown_time_value_edges = vec![ValueFlowEdgePayload {
+        edge_id: "value:funding:0xunknown".into(),
+        contract_address: "0xdup".into(),
+        from_address: "0xfunder".into(),
+        to_address: "0xseller".into(),
+        tx_hash: "0xunknown".into(),
+        block_number: 12,
+        block_time: 0,
+        token_id: "1".into(),
+        value_eth: Some(0.5),
+        channel: "funding".into(),
+        recipient_known: true,
+        ..ValueFlowEdgePayload::default()
+    }];
+
+    let outputs = build_lifecycle_model_outputs(LifecycleModelInput {
+        seed_contract: &seed_contract,
+        duplicate_candidates: &candidates,
+        duplicate_contracts: &duplicate_contracts,
+        address_attributions: &[],
+        nft_propagation_paths: &BTreeMap::from([("0xdup".to_string(), path)]),
+        mint_payment_edges: &unknown_time_value_edges,
+        market_events: &[],
+    });
+
+    let metric = outputs
+        .lifecycle_metrics
+        .iter()
+        .find(|metric| metric.contract_address == "0xdup")
+        .expect("contract lifecycle metric");
+    assert_eq!(metric.first_sale_time, 0);
+    assert_eq!(metric.sale_count, 1);
+    assert!(!metric.early_detection_positive);
+    assert!(!outputs.weak_supervision_labels.iter().any(|label| {
+        label.contract_address == "0xdup" && label.label == "early_detection_positive"
+    }));
+    assert!(outputs.early_detection_features.iter().all(|row| {
+        row.contract_address != "0xdup"
+            || row.weak_label != "positive_observed_sale_or_victimization"
+    }));
+    let first_window = outputs
+        .early_detection_features
+        .iter()
+        .find(|row| row.contract_address == "0xdup" && row.observation_window_seconds == 60)
+        .expect("first early detection window");
+    assert_eq!(first_window.sale_event_count, 0);
+    assert_eq!(first_window.value_flow_count, 0);
+    assert_eq!(first_window.funding_edge_count, 0);
+}
+
+#[test]
+fn campaign_clusters_use_funding_source_not_paid_minter_as_shared_evidence() {
+    let seed_contract = SeedContractPayload {
+        chain: "ethereum".into(),
+        contract_address: "0xseed".into(),
+        token_type: "ERC721".into(),
+        ..SeedContractPayload::default()
+    };
+    let duplicate_contracts = vec![
+        DuplicateContractPayload {
+            contract_address: "0xdup1".into(),
+            candidate_count: 1,
+            ..DuplicateContractPayload::default()
+        },
+        DuplicateContractPayload {
+            contract_address: "0xdup2".into(),
+            candidate_count: 1,
+            ..DuplicateContractPayload::default()
+        },
+    ];
+    let candidates = vec![
+        DuplicateCandidate {
+            contract_address: "0xdup1".into(),
+            token_id: "1".into(),
+            match_reasons: vec!["token_uri_match".into()],
+            confidence: "high".into(),
+            ..DuplicateCandidate::default()
+        },
+        DuplicateCandidate {
+            contract_address: "0xdup2".into(),
+            token_id: "1".into(),
+            match_reasons: vec!["token_uri_match".into()],
+            confidence: "high".into(),
+            ..DuplicateCandidate::default()
+        },
+    ];
+    let same_minter_edges = vec![
+        ValueFlowEdgePayload {
+            edge_id: "value:funding:0x1:0xfunder1:0xsharedminter".into(),
+            contract_address: "0xdup1".into(),
+            from_address: "0xfunder1".into(),
+            to_address: "0xsharedminter".into(),
+            channel: "funding".into(),
+            recipient_known: true,
+            ..ValueFlowEdgePayload::default()
+        },
+        ValueFlowEdgePayload {
+            edge_id: "value:funding:0x2:0xfunder2:0xsharedminter".into(),
+            contract_address: "0xdup2".into(),
+            from_address: "0xfunder2".into(),
+            to_address: "0xsharedminter".into(),
+            channel: "funding".into(),
+            recipient_known: true,
+            ..ValueFlowEdgePayload::default()
+        },
+    ];
+    let shared_funder_edges = vec![
+        ValueFlowEdgePayload {
+            edge_id: "value:funding:0x3:0xsharedfunder:0xminter1".into(),
+            contract_address: "0xdup1".into(),
+            from_address: "0xsharedfunder".into(),
+            to_address: "0xminter1".into(),
+            channel: "funding".into(),
+            recipient_known: true,
+            ..ValueFlowEdgePayload::default()
+        },
+        ValueFlowEdgePayload {
+            edge_id: "value:funding:0x4:0xsharedfunder:0xminter2".into(),
+            contract_address: "0xdup2".into(),
+            from_address: "0xsharedfunder".into(),
+            to_address: "0xminter2".into(),
+            channel: "funding".into(),
+            recipient_known: true,
+            ..ValueFlowEdgePayload::default()
+        },
+    ];
+
+    let same_minter_outputs = build_lifecycle_model_outputs(LifecycleModelInput {
+        seed_contract: &seed_contract,
+        duplicate_candidates: &candidates,
+        duplicate_contracts: &duplicate_contracts,
+        address_attributions: &[],
+        nft_propagation_paths: &BTreeMap::new(),
+        mint_payment_edges: &same_minter_edges,
+        market_events: &[],
+    });
+    assert_eq!(same_minter_outputs.campaign_clusters.len(), 2);
+
+    let shared_funder_outputs = build_lifecycle_model_outputs(LifecycleModelInput {
+        seed_contract: &seed_contract,
+        duplicate_candidates: &candidates,
+        duplicate_contracts: &duplicate_contracts,
+        address_attributions: &[],
+        nft_propagation_paths: &BTreeMap::new(),
+        mint_payment_edges: &shared_funder_edges,
+        market_events: &[],
+    });
+    assert_eq!(shared_funder_outputs.campaign_clusters.len(), 1);
+    assert!(shared_funder_outputs.campaign_clusters[0]
+        .shared_evidence
+        .iter()
+        .any(|item| item == "shared_funding_source:0xsharedfunder"));
+}
+
+#[test]
+fn campaign_clusters_do_not_merge_unrelated_contracts_without_shared_evidence() {
+    let seed_contract = SeedContractPayload {
+        chain: "ethereum".into(),
+        contract_address: "0xseed".into(),
+        name: "Seed".into(),
+        symbol: "SEED".into(),
+        token_type: "ERC721".into(),
+        contract_deployer: "0xseeddeployer".into(),
+        deployed_block_number: 1,
+    };
+    let duplicate_contracts = vec![
+        DuplicateContractPayload {
+            contract_address: "0xdup1".into(),
+            contract_deployer: "0xdeployer1".into(),
+            deployed_block_number: 10,
+            candidate_count: 1,
+            ..DuplicateContractPayload::default()
+        },
+        DuplicateContractPayload {
+            contract_address: "0xdup2".into(),
+            contract_deployer: "0xdeployer2".into(),
+            deployed_block_number: 20,
+            candidate_count: 1,
+            ..DuplicateContractPayload::default()
+        },
+    ];
+    let candidates = vec![
+        DuplicateCandidate {
+            contract_address: "0xdup1".into(),
+            token_id: "1".into(),
+            match_reasons: vec!["token_uri_match".into()],
+            confidence: "high".into(),
+            ..DuplicateCandidate::default()
+        },
+        DuplicateCandidate {
+            contract_address: "0xdup2".into(),
+            token_id: "1".into(),
+            match_reasons: vec!["name_match".into()],
+            confidence: "medium".into(),
+            ..DuplicateCandidate::default()
+        },
+    ];
+
+    let outputs = build_lifecycle_model_outputs(LifecycleModelInput {
+        seed_contract: &seed_contract,
+        duplicate_candidates: &candidates,
+        duplicate_contracts: &duplicate_contracts,
+        address_attributions: &[],
+        nft_propagation_paths: &BTreeMap::new(),
+        mint_payment_edges: &[],
+        market_events: &[],
+    });
+
+    assert_eq!(outputs.campaign_clusters.len(), 2);
+    assert!(!outputs.campaign_clusters.iter().any(|cluster| {
+        cluster.contract_addresses.contains(&"0xdup1".to_string())
+            && cluster.contract_addresses.contains(&"0xdup2".to_string())
+    }));
+}
+
+#[test]
+fn campaign_clusters_do_not_merge_contracts_only_because_they_share_sale_seller() {
+    let seed_contract = SeedContractPayload {
+        chain: "ethereum".into(),
+        contract_address: "0xseed".into(),
+        name: "Seed".into(),
+        symbol: "SEED".into(),
+        token_type: "ERC721".into(),
+        contract_deployer: "0xseeddeployer".into(),
+        deployed_block_number: 1,
+    };
+    let duplicate_contracts = vec![
+        DuplicateContractPayload {
+            contract_address: "0xdup1".into(),
+            contract_deployer: "0xdeployer1".into(),
+            deployed_block_number: 10,
+            candidate_count: 1,
+            ..DuplicateContractPayload::default()
+        },
+        DuplicateContractPayload {
+            contract_address: "0xdup2".into(),
+            contract_deployer: "0xdeployer2".into(),
+            deployed_block_number: 20,
+            candidate_count: 1,
+            ..DuplicateContractPayload::default()
+        },
+    ];
+    let candidates = vec![
+        DuplicateCandidate {
+            contract_address: "0xdup1".into(),
+            token_id: "1".into(),
+            match_reasons: vec!["token_uri_match".into()],
+            confidence: "high".into(),
+            ..DuplicateCandidate::default()
+        },
+        DuplicateCandidate {
+            contract_address: "0xdup2".into(),
+            token_id: "1".into(),
+            match_reasons: vec!["token_uri_match".into()],
+            confidence: "high".into(),
+            ..DuplicateCandidate::default()
+        },
+    ];
+    let mut propagation_paths = BTreeMap::new();
+    let mut attributions = Vec::new();
+    for (contract, buyer, block) in [
+        ("0xdup1", "0xbuyer1", 10_i64),
+        ("0xdup2", "0xbuyer2", 20_i64),
+    ] {
+        let transfers = vec![
+            TransferRecord {
+                contract_address: contract.into(),
+                token_id: "1".into(),
+                tx_hash: format!("0xmint{contract}"),
+                block_number: block,
+                block_time: block * 10,
+                from_address: ZERO_ADDRESS.into(),
+                to_address: "0xsharedseller".into(),
+                event_type: "erc721".into(),
+                source: "test".into(),
+                ..TransferRecord::default()
+            },
+            TransferRecord {
+                contract_address: contract.into(),
+                token_id: "1".into(),
+                tx_hash: format!("0xsale{contract}"),
+                block_number: block + 1,
+                block_time: block * 10 + 5,
+                from_address: "0xsharedseller".into(),
+                to_address: buyer.into(),
+                event_type: "erc721".into(),
+                source: "test".into(),
+                ..TransferRecord::default()
+            },
+        ];
+        let sales = vec![NftSaleRecord {
+            contract_address: contract.into(),
+            token_id: "1".into(),
+            tx_hash: format!("0xsale{contract}"),
+            block_number: block + 1,
+            buyer_address: buyer.into(),
+            seller_address: "0xsharedseller".into(),
+            price_eth: Some(1.0),
+            seller_fee_eth: 1.0,
+            is_native_eth: true,
+            ..NftSaleRecord::default()
+        }];
+        let tokens = vec![InfringingTokenRecord {
+            contract_address: contract.into(),
+            token_id: "1".into(),
+            minter_address: "0xsharedseller".into(),
+            mint_tx_hash: format!("0xmint{contract}"),
+            mint_block: block,
+            match_reasons: vec!["token_uri_match".into()],
+            ..InfringingTokenRecord::default()
+        }];
+        let victims = vec![VictimAddressPayload {
+            address: buyer.into(),
+            buy_tx_hashes: vec![format!("0xsale{contract}")],
+            buy_amount_eth: 1.0,
+            last_buy_tx_hash: format!("0xsale{contract}"),
+            is_stuck: true,
+            ..VictimAddressPayload::default()
+        }];
+        attributions.extend(build_address_attribution_records(
+            contract,
+            &tokens,
+            &sales,
+            &[],
+            &[],
+            &[],
+            &victims,
+        ));
+        propagation_paths.insert(
+            contract.to_string(),
+            build_nft_propagation_path(
+                contract,
+                &transfers,
+                &sales,
+                &[] as &[OwnerBalance],
+                &tokens,
+                &[],
+                &[],
+                &victims,
+            ),
+        );
+    }
+
+    let outputs = build_lifecycle_model_outputs(LifecycleModelInput {
+        seed_contract: &seed_contract,
+        duplicate_candidates: &candidates,
+        duplicate_contracts: &duplicate_contracts,
+        address_attributions: &attributions,
+        nft_propagation_paths: &propagation_paths,
+        mint_payment_edges: &[],
+        market_events: &[],
+    });
+
+    assert_eq!(outputs.campaign_clusters.len(), 2);
+}
+
+#[test]
+fn lifecycle_stage_transitions_do_not_move_backward_in_time() {
+    let seed_contract = SeedContractPayload {
+        chain: "ethereum".into(),
+        contract_address: "0xseed".into(),
+        name: "Seed".into(),
+        symbol: "SEED".into(),
+        token_type: "ERC721".into(),
+        contract_deployer: "0xseeddeployer".into(),
+        deployed_block_number: 1,
+    };
+    let candidates = vec![DuplicateCandidate {
+        contract_address: "0xdup".into(),
+        token_id: "1".into(),
+        match_reasons: vec!["token_uri_match".into()],
+        confidence: "high".into(),
+        ..DuplicateCandidate::default()
+    }];
+    let duplicate_contracts = vec![DuplicateContractPayload {
+        contract_address: "0xdup".into(),
+        contract_deployer: "0xdeployer".into(),
+        deployed_block_number: 5,
+        candidate_count: 1,
+        ..DuplicateContractPayload::default()
+    }];
+    let transfers = vec![TransferRecord {
+        contract_address: "0xdup".into(),
+        token_id: "1".into(),
+        tx_hash: "0xmint".into(),
+        block_number: 20,
+        block_time: 200,
+        from_address: ZERO_ADDRESS.into(),
+        to_address: "0xminter".into(),
+        event_type: "erc721".into(),
+        source: "test".into(),
+        ..TransferRecord::default()
+    }];
+    let tokens = vec![InfringingTokenRecord {
+        contract_address: "0xdup".into(),
+        token_id: "1".into(),
+        minter_address: "0xminter".into(),
+        mint_tx_hash: "0xmint".into(),
+        mint_block: 20,
+        match_reasons: vec!["token_uri_match".into()],
+        ..InfringingTokenRecord::default()
+    }];
+    let propagation_paths = BTreeMap::from([(
+        "0xdup".to_string(),
+        build_nft_propagation_path(
+            "0xdup",
+            &transfers,
+            &[],
+            &[] as &[OwnerBalance],
+            &tokens,
+            &[],
+            &[],
+            &[],
+        ),
+    )]);
+    let market_events = vec![NftMarketEventRecord {
+        contract_address: "0xdup".into(),
+        token_id: "1".into(),
+        event_type: "order".into(),
+        order_type: "listing".into(),
+        event_timestamp: 100,
+        block_number: 10,
+        block_time: 100,
+        actor_address: "0xminter".into(),
+        marketplace: "opensea".into(),
+        source: "opensea".into(),
+        ..NftMarketEventRecord::default()
+    }];
+
+    let outputs = build_lifecycle_model_outputs(LifecycleModelInput {
+        seed_contract: &seed_contract,
+        duplicate_candidates: &candidates,
+        duplicate_contracts: &duplicate_contracts,
+        address_attributions: &[],
+        nft_propagation_paths: &propagation_paths,
+        mint_payment_edges: &[],
+        market_events: &market_events,
+    });
+
+    assert!(!outputs.contract_lifecycle_events.iter().any(|event| {
+        event.lifecycle_stage == "stage_transition"
+            && event.event_type == "replica_mint_to_market_exposure"
+    }));
 }

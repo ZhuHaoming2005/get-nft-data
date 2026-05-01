@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use once_cell::sync::Lazy;
@@ -6,7 +6,7 @@ use regex::Regex;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::error::AppError;
-use crate::models::{BatchSummaryPayload, SingleReportPayload, VictimAddressPayload};
+use crate::models::{BatchSummaryPayload, SingleReportPayload};
 
 static SLUG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[^0-9a-zA-Z\u{4e00}-\u{9fff}]+").unwrap());
 
@@ -34,73 +34,16 @@ fn format_scalar(value: Option<f64>) -> String {
         .unwrap_or_else(|| "n/a".into())
 }
 
-fn format_python_optional_scalar(value: Option<f64>) -> String {
-    value
-        .map(|number| number.to_string())
-        .unwrap_or_else(|| "None".into())
-}
-
-#[derive(Default)]
-struct VictimAddressReportRow {
-    address: String,
-    buy_tx_hashes: BTreeSet<String>,
-    buy_amount_eth: f64,
-    buy_amount_usd: f64,
-    last_buy_amount_eth: Option<f64>,
-    last_buy_amount_usd: Option<f64>,
-    buy_before_eth_balance: Option<f64>,
-    buy_before_usd_balance: Option<f64>,
-    buy_asset_ratio: Option<f64>,
-    is_stuck: bool,
-    last_buy_tx_hash: String,
-}
-
-impl VictimAddressReportRow {
-    fn absorb(&mut self, item: &VictimAddressPayload) {
-        if self.address.is_empty() {
-            self.address = item.address.clone();
-        }
-        let mut contributed_new_tx = item.buy_tx_hashes.is_empty();
-        for tx_hash in &item.buy_tx_hashes {
-            if self.buy_tx_hashes.insert(tx_hash.clone()) {
-                contributed_new_tx = true;
-            }
-        }
-        if contributed_new_tx {
-            self.buy_amount_eth += item.buy_amount_eth;
-            self.buy_amount_usd += item.buy_amount_usd;
-        }
-        self.is_stuck |= item.is_stuck;
-        if item.last_buy_amount_eth.is_some() {
-            self.last_buy_amount_eth = item.last_buy_amount_eth;
-        }
-        if item.last_buy_amount_usd.is_some() {
-            self.last_buy_amount_usd = item.last_buy_amount_usd;
-        }
-        if item.buy_before_eth_balance.is_some() {
-            self.buy_before_eth_balance = item.buy_before_eth_balance;
-        }
-        if item.buy_before_usd_balance.is_some() {
-            self.buy_before_usd_balance = item.buy_before_usd_balance;
-        }
-        if item.buy_asset_ratio.is_some() {
-            self.buy_asset_ratio = item.buy_asset_ratio;
-        }
-        if !item.last_buy_tx_hash.is_empty() {
-            self.last_buy_tx_hash = item.last_buy_tx_hash.clone();
-        }
+fn format_reason_counts(reasons: BTreeMap<String, i64>) -> String {
+    if reasons.is_empty() {
+        "无".into()
+    } else {
+        reasons
+            .into_iter()
+            .map(|(reason, count)| format!("{reason}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
-}
-
-fn aggregate_victim_addresses(rows: &[VictimAddressPayload]) -> Vec<VictimAddressReportRow> {
-    let mut by_address = BTreeMap::<String, VictimAddressReportRow>::new();
-    for item in rows {
-        by_address
-            .entry(item.address.clone())
-            .or_default()
-            .absorb(item);
-    }
-    by_address.into_values().collect()
 }
 
 pub fn default_output_basename(payload: &SingleReportPayload) -> String {
@@ -282,161 +225,74 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
         format!("- 唯一 image URI 数: {}", seed_stats.unique_image_uri_count),
         format!("- 唯一规范化名称数: {}", seed_stats.unique_name_count),
         format!("- 唯一规范化符号数: {}", seed_stats.unique_symbol_count),
-        String::new(),
-        "## 重复 NFT 合约".to_string(),
     ];
 
-    if payload.duplicate_contracts.is_empty() {
-        lines.push("- 无".to_string());
-    } else {
-        for item in &payload.duplicate_contracts {
-            lines.push(format!(
-                "- {}: {} 个重复 NFT | 命中原因={}",
-                item.contract_address,
-                item.candidate_count,
-                item.match_reasons.join(", ")
-            ));
+    let duplicate_candidate_total = payload
+        .duplicate_contracts
+        .iter()
+        .map(|item| item.candidate_count)
+        .sum::<i64>();
+    let legit_candidate_total = payload
+        .legit_duplicates
+        .iter()
+        .map(|item| item.candidate_count)
+        .sum::<i64>();
+    let mut match_reason_counts = BTreeMap::<String, i64>::new();
+    for item in &payload.duplicate_contracts {
+        for reason in &item.match_reasons {
+            *match_reason_counts.entry(reason.clone()).or_default() += 1;
         }
     }
+    let mut official_reason_counts = BTreeMap::<String, i64>::new();
+    for item in &payload.legit_duplicates {
+        if !item.mint_recipients.is_empty() {
+            *official_reason_counts
+                .entry("mint 接收地址命中官方地址规则".into())
+                .or_default() += 1;
+        }
+        for reason in &item.exclusion_reasons {
+            *official_reason_counts.entry(reason.clone()).or_default() += 1;
+        }
+    }
+    let total_usd_priced_sale_count = payload
+        .fraud_trade_stats
+        .values()
+        .map(|stats| stats.usd_priced_sale_count.unwrap_or_default())
+        .sum::<i64>();
+    let total_usd_priced_volume = payload
+        .fraud_trade_stats
+        .values()
+        .map(|stats| stats.usd_priced_volume.unwrap_or_default())
+        .sum::<f64>();
+    let total_unique_buyers = payload
+        .fraud_trade_stats
+        .values()
+        .map(|stats| stats.unique_buyers)
+        .sum::<i64>();
 
     lines.extend([
         String::new(),
-        "## 被算法归为官方参与型重复的合约".to_string(),
-        "- 说明: 该分组仅表示 mint 接收地址与官方地址集合存在交集。".to_string(),
+        "## 合约分类摘要".to_string(),
+        format!("- 疑似重复合约数: {}", payload.duplicate_contracts.len()),
+        format!("- 疑似重复 NFT 数: {}", duplicate_candidate_total),
+        format!(
+            "- 命中原因分布: {}",
+            format_reason_counts(match_reason_counts)
+        ),
+        format!("- 官方参与型重复合约数: {}", payload.legit_duplicates.len()),
+        format!("- 官方参与型重复 NFT 数: {}", legit_candidate_total),
+        format!(
+            "- 官方参与型判定原因分布: {}",
+            format_reason_counts(official_reason_counts)
+        ),
+        String::new(),
+        "## 资金与交易摘要".to_string(),
+        format!("- 有定价销售记录数: {}", total_usd_priced_sale_count),
+        format!("- 有定价销售额(USD): {}", total_usd_priced_volume),
+        format!("- 唯一买家计数合计: {}", total_unique_buyers),
+        format!("- 套牢钱包数: {}", summary.stuck_honest_address_count),
+        format!("- 套牢资金(USD): {}", summary.stuck_cost_usd),
     ]);
-    if payload.legit_duplicates.is_empty() {
-        lines.push("- 无".to_string());
-    } else {
-        for item in &payload.legit_duplicates {
-            lines.push(format!(
-                "- {}: {} 个重复 NFT | mint 接收地址(命中官方地址规则)={}",
-                item.contract_address,
-                item.candidate_count,
-                item.mint_recipients.join(", ")
-            ));
-        }
-    }
-
-    lines.extend([String::new(), "## 地址行为信号".to_string()]);
-    if payload.address_signals.is_empty() {
-        lines.push("- 无".to_string());
-    } else {
-        for (contract, signal) in &payload.address_signals {
-            lines.extend([
-                format!("### {contract}"),
-                format!("- Mint 地址数: {}", signal.mint_address_count),
-                format!("- Mint 交易数: {}", signal.mint_count),
-                format!("- 唯一接收地址数: {}", signal.unique_receiver_count),
-                format!("- 循环交易边数: {}", signal.cycle_edge_count),
-                format!("- 星状扩散中心数: {}", signal.star_distributor_count),
-                format!(
-                    "- Mint 到首次转手时间: {} 秒",
-                    signal.mint_to_first_transfer_seconds
-                ),
-                format!(
-                    "- 快速扩散: {}",
-                    if signal.fast_spread { "是" } else { "否" }
-                ),
-            ]);
-        }
-    }
-
-    lines.extend([String::new(), "## 受害者信号".to_string()]);
-    if payload.victim_signals.is_empty() {
-        lines.push("- 无".to_string());
-    } else {
-        for (contract, signal) in &payload.victim_signals {
-            lines.extend([
-                format!("### {contract}"),
-                format!("- 当前持有地址数: {}", signal.owner_count),
-                format!("- 套牢地址数: {}", signal.stuck_holder_count),
-                format!(
-                    "- 套牢地址占比: {}",
-                    format_ratio(signal.stuck_holder_ratio)
-                ),
-                format!("- 疑似受害地址数: {}", signal.victim_wallet_count),
-            ]);
-        }
-    }
-
-    lines.extend([String::new(), "## 诚实地址画像".to_string()]);
-    if payload.honest_address_stats.is_empty() {
-        lines.push("- 无".to_string());
-    } else {
-        for (contract, stats) in &payload.honest_address_stats {
-            lines.extend([
-                format!("### {contract}"),
-                format!("- 诚实地址数: {}", stats.honest_address_count),
-                format!("- 被腐化地址数: {}", stats.corrupted_address_count),
-                format!(
-                    "- 诚实地址之间转售次数: {}",
-                    stats.honest_to_honest_transfer_count
-                ),
-                format!(
-                    "- 持有时长中位数: {} 秒",
-                    format_python_optional_scalar(stats.median_holding_seconds)
-                ),
-                format!(
-                    "- Mint 到诚实地址平均时间: {} 秒",
-                    format_python_optional_scalar(stats.avg_seconds_to_honest_holder)
-                ),
-            ]);
-        }
-        for item in &payload.honest_addresses {
-            lines.push(format!(
-                "- {}:{}: interacted_token_count={} | currently_holding_token_count={} | hold_duration_median_seconds={} | 被腐化={} | honest_sale_to_honest_count={}",
-                item.contract_address,
-                item.address,
-                item.interacted_token_count,
-                item.currently_holding_token_count,
-                format_python_optional_scalar(item.hold_duration_median_seconds),
-                if item.is_corrupted_address { "是" } else { "否" },
-                item.honest_sale_to_honest_count
-            ));
-        }
-    }
-
-    lines.extend([String::new(), "## 被骗地址画像".to_string()]);
-    if payload.victim_addresses.is_empty() {
-        lines.push("- 无".to_string());
-    } else {
-        for item in aggregate_victim_addresses(&payload.victim_addresses) {
-            lines.push(format!(
-                "- {}: buy_tx_count={} | 买入金额(USD)={} | 最后一次买入金额(USD)={} | 买入前钱包余额(USD): {} | 买入占比={} | 套牢={} | last_buy_tx={}",
-                item.address,
-                item.buy_tx_hashes.len(),
-                item.buy_amount_usd,
-                format_python_optional_scalar(item.last_buy_amount_usd),
-                format_python_optional_scalar(item.buy_before_usd_balance),
-                format_ratio(item.buy_asset_ratio),
-                if item.is_stuck { "是" } else { "否" },
-                if item.last_buy_tx_hash.is_empty() {
-                    "n/a".to_string()
-                } else {
-                    item.last_buy_tx_hash.clone()
-                }
-            ));
-        }
-    }
-
-    lines.extend([String::new(), "## 被骗交易与套牢资金".to_string()]);
-    if payload.fraud_trade_stats.is_empty() {
-        lines.push("- 无".to_string());
-    } else {
-        for (contract, stats) in &payload.fraud_trade_stats {
-            let sale_count = stats.usd_priced_sale_count.unwrap_or_default();
-            let sale_volume = stats.usd_priced_volume.unwrap_or_default();
-            lines.push(format!(
-                "- {}: unique_buyers={} | usd_priced_sale_count={} | usd_priced_volume={} | stuck_wallet_count={} | stuck_cost_usd={}",
-                contract,
-                stats.unique_buyers,
-                sale_count,
-                sale_volume,
-                stats.stuck_wallet_count,
-                stats.stuck_cost_usd
-            ));
-        }
-    }
 
     lines.join("\n") + "\n"
 }

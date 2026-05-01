@@ -11,20 +11,21 @@ use crate::api::{
     fetch_contract_metadata_with_opensea_fallback, fetch_contract_owners, fetch_contract_sales,
     fetch_contract_transfers, fetch_eth_balance, fetch_etherscan_contract_transfers,
     fetch_is_holder_of_contract, fetch_license_sample, fetch_opensea_account_holds_contract_nft,
-    fetch_opensea_contract_collection_slug, fetch_opensea_contract_nfts,
-    fetch_same_block_eth_transfers_for_address, fetch_seed_contract_nfts,
-    fetch_transaction_receipt, fetch_transaction_receipts_for_block, is_open_license_payload,
-    ApiEndpoints, AsyncApiClient,
+    fetch_opensea_contract_collection_slug, fetch_opensea_contract_market_events,
+    fetch_opensea_contract_nfts, fetch_same_block_eth_transfers_for_address,
+    fetch_seed_contract_nfts, fetch_transaction_receipt, fetch_transaction_receipts_for_block,
+    is_open_license_payload, ApiEndpoints, AsyncApiClient,
 };
 use crate::error::AppError;
 use crate::models::{
-    AddressSignalPayload, BatchReportSummary, BatchSeedReportPayload, BatchSummaryPayload,
-    ContractLevelSummaryPayload, ContractMetadata, DatabaseSnapshot, DuplicateCandidate,
-    DuplicateContractPayload, EthTransferRecord, FraudTradeStatsPayload, HonestAddressPayload,
-    HonestAddressStatsPayload, InfringingTokenRecord, MaliciousAddressPayload,
-    NftPropagationPathPayload, NftSaleRecord, OutputFilesPayload, OwnerBalance, ReportSummary,
-    SeedCollectionStatsPayload, SeedContractPayload, SeedNft, SingleReportPayload,
-    TransactionReceiptRecord, TransferRecord, VictimAddressPayload, VictimSignalPayload,
+    AddressAttributionPayload, AddressSignalPayload, BatchReportSummary, BatchSeedReportPayload,
+    BatchSummaryPayload, ContractLevelSummaryPayload, ContractMetadata, DatabaseSnapshot,
+    DuplicateCandidate, DuplicateContractPayload, EthTransferRecord, FraudTradeStatsPayload,
+    HonestAddressPayload, HonestAddressStatsPayload, InfringingTokenRecord,
+    MaliciousAddressPayload, NftMarketEventRecord, NftPropagationPathPayload, NftSaleRecord,
+    OutputFilesPayload, OwnerBalance, ReportSummary, SeedCollectionStatsPayload,
+    SeedContractPayload, SeedNft, SingleReportPayload, TransactionReceiptRecord, TransferRecord,
+    ValueFlowEdgePayload, VictimAddressPayload, VictimSignalPayload, ZERO_ADDRESS,
 };
 use crate::normalize::{normalize_name, normalize_symbol, normalize_url};
 use crate::progress::{BatchProgressReporter, SeedProgressReporter};
@@ -33,6 +34,7 @@ use crate::store::{CachedSignals, ContractSignalCache, DuckDbFeatureStore};
 
 pub mod address_records;
 pub mod duplicate;
+pub mod lifecycle;
 pub mod propagation;
 pub mod scoring;
 pub mod signals;
@@ -175,6 +177,17 @@ pub trait AnalyzeApi: Send + Sync {
         opensea_api_key: &str,
     ) -> Result<Vec<NftSaleRecord>, AppError>;
 
+    async fn fetch_contract_market_events(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _contract_address: &str,
+        _opensea_api_key: &str,
+    ) -> Result<Vec<NftMarketEventRecord>, AppError> {
+        Ok(Vec::new())
+    }
+
     async fn fetch_transaction_receipt(
         &self,
         alchemy_api_key: &str,
@@ -255,6 +268,17 @@ pub trait AnalyzeApi: Send + Sync {
         )
         .await
     }
+
+    async fn fetch_mint_payment_eth_transfers_on_chain(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _block_number: i64,
+        _address: &str,
+    ) -> Result<Vec<EthTransferRecord>, AppError> {
+        Ok(Vec::new())
+    }
 }
 
 pub trait FeatureStoreReader: Send + Sync {
@@ -311,6 +335,11 @@ struct CandidatePlan {
     candidates: Vec<DuplicateCandidate>,
 }
 
+struct CandidateContractFilterResult {
+    candidates: Vec<DuplicateCandidate>,
+    seed_related_legit_duplicates: Vec<DuplicateContractPayload>,
+}
+
 async fn acquire_optional_limit(
     limit: &Option<Arc<Semaphore>>,
 ) -> Result<Option<OwnedSemaphorePermit>, AppError> {
@@ -335,6 +364,7 @@ struct BatchSeedAggregate {
 
 struct ContractAnalysisResult {
     contract_address: String,
+    contract_metadata: Option<ContractMetadata>,
     legit_duplicate: Option<DuplicateContractPayload>,
     address_signal: Option<AddressSignalPayload>,
     victim_signal: Option<VictimSignalPayload>,
@@ -343,6 +373,9 @@ struct ContractAnalysisResult {
     honest_addresses: Vec<HonestAddressPayload>,
     honest_address_stats: BTreeMap<String, HonestAddressStatsPayload>,
     victim_addresses: Vec<VictimAddressPayload>,
+    address_attributions: Vec<AddressAttributionPayload>,
+    market_events: Vec<NftMarketEventRecord>,
+    mint_payment_edges: Vec<ValueFlowEdgePayload>,
     fraud_trade_stats: BTreeMap<String, FraudTradeStatsPayload>,
     nft_propagation_path: Option<NftPropagationPathPayload>,
 }
@@ -666,6 +699,52 @@ impl AnalyzeApi for RealApi {
         .await
     }
 
+    async fn fetch_contract_market_events(
+        &self,
+        chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        contract_address: &str,
+        opensea_api_key: &str,
+    ) -> Result<Vec<NftMarketEventRecord>, AppError> {
+        if opensea_api_key.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
+        let eth_usd_rate = match self.current_eth_usd_rate().await {
+            Ok(rate) => Some(rate),
+            Err(err) => {
+                if !self
+                    .eth_usd_rate_warning_emitted
+                    .swap(true, Ordering::Relaxed)
+                {
+                    eprintln!(
+                        "warning: failed to fetch current ETH/USD rate for {contract_address}: {err}; market events will not be USD-normalized"
+                    );
+                }
+                None
+            }
+        };
+        match fetch_opensea_contract_market_events(
+            &self.client,
+            &endpoints.opensea_base,
+            chain,
+            contract_address,
+            opensea_api_key,
+            eth_usd_rate,
+        )
+        .await
+        {
+            Ok(rows) => Ok(rows),
+            Err(err) => {
+                eprintln!(
+                    "warning: OpenSea market events failed for {contract_address}: {err}; continuing without market events"
+                );
+                Ok(Vec::new())
+            }
+        }
+    }
+
     async fn fetch_transaction_receipt(
         &self,
         alchemy_api_key: &str,
@@ -754,6 +833,24 @@ impl AnalyzeApi for RealApi {
         let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
         fetch_same_block_eth_transfers_for_address(&self.client, &endpoints, block_number, address)
             .await
+    }
+
+    async fn fetch_mint_payment_eth_transfers_on_chain(
+        &self,
+        chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        block_number: i64,
+        address: &str,
+    ) -> Result<Vec<EthTransferRecord>, AppError> {
+        self.fetch_same_block_eth_transfers_for_address_on_chain(
+            chain,
+            alchemy_api_key,
+            alchemy_network,
+            block_number,
+            address,
+        )
+        .await
     }
 }
 
@@ -927,11 +1024,15 @@ async fn analyze_seed_contract_with_limits(
         candidates,
     } = plan;
     let contract_concurrency = request.contract_max_concurrency.max(1);
-    let candidates = filter_seed_related_candidate_contracts(
+    let token_type = payload_token_type(&seed_contract);
+    let CandidateContractFilterResult {
+        candidates,
+        seed_related_legit_duplicates,
+    } = filter_seed_related_candidate_contracts(
         &request,
         deps,
-        &snapshot,
         candidates,
+        token_type.as_str(),
         contract_concurrency,
         &runtime_limits,
     )
@@ -968,17 +1069,23 @@ async fn analyze_seed_contract_with_limits(
     let mut address_signals = BTreeMap::new();
     let mut victim_signals = BTreeMap::new();
     let mut infringing_tokens = Vec::new();
-    let mut legit_duplicates = Vec::new();
-    let mut legit_contract_addresses = BTreeSet::new();
+    let mut legit_duplicates = seed_related_legit_duplicates;
+    let mut legit_contract_addresses = legit_duplicates
+        .iter()
+        .map(|item| item.contract_address.clone())
+        .collect::<BTreeSet<_>>();
     let mut malicious_addresses = Vec::new();
     let mut honest_addresses = Vec::new();
     let mut honest_address_stats = BTreeMap::new();
     let mut victim_addresses = Vec::new();
+    let mut address_attributions = Vec::new();
+    let mut market_events = Vec::new();
+    let mut mint_payment_edges = Vec::new();
     let mut fraud_trade_stats = BTreeMap::<String, FraudTradeStatsPayload>::new();
     let mut nft_propagation_paths = BTreeMap::<String, NftPropagationPathPayload>::new();
     let mut expanded_candidates_by_contract = BTreeMap::new();
+    let mut candidate_contract_metadata = BTreeMap::new();
     let analysis_timestamp = chrono::Utc::now().timestamp();
-    let token_type = payload_token_type(&seed_contract);
     if !open_license {
         progress
             .on_duplicate_contracts_started(contracts_to_analyze.len())
@@ -1052,29 +1159,60 @@ async fn analyze_seed_contract_with_limits(
                     &mut malicious_addresses,
                     &mut honest_addresses,
                     &mut victim_addresses,
+                    &mut address_attributions,
+                    &mut market_events,
+                    &mut mint_payment_edges,
                     &mut nft_propagation_paths,
+                    &mut candidate_contract_metadata,
                 );
                 next_contract_index_to_merge += 1;
             }
         }
     }
-    let mut duplicate_contracts =
-        build_duplicate_contract_payloads(&expanded_candidates_by_contract);
+    let mut duplicate_contracts = build_duplicate_contract_payloads(
+        &expanded_candidates_by_contract,
+        &candidate_contract_metadata,
+    );
     duplicate_contracts.retain(|item| !legit_contract_addresses.contains(&item.contract_address));
     if open_license {
         duplicate_contracts.clear();
     }
 
+    let seed_contract_payload = SeedContractPayload {
+        chain: seed_contract.chain,
+        contract_address: seed_contract.contract_address,
+        name: seed_contract.name,
+        symbol: seed_contract.symbol,
+        token_type: seed_contract.token_type,
+        contract_deployer: seed_contract.contract_deployer,
+        deployed_block_number: seed_contract.deployed_block_number,
+    };
+    let lifecycle_contract_addresses: BTreeSet<String> = duplicate_contracts
+        .iter()
+        .map(|item| item.contract_address.clone())
+        .collect();
+    let lifecycle_candidates: Vec<DuplicateCandidate> = if open_license {
+        Vec::new()
+    } else {
+        candidates
+            .iter()
+            .filter(|candidate| lifecycle_contract_addresses.contains(&candidate.contract_address))
+            .cloned()
+            .collect()
+    };
+    let lifecycle_outputs =
+        lifecycle::build_lifecycle_model_outputs(lifecycle::LifecycleModelInput {
+            seed_contract: &seed_contract_payload,
+            duplicate_candidates: &lifecycle_candidates,
+            duplicate_contracts: &duplicate_contracts,
+            address_attributions: &address_attributions,
+            nft_propagation_paths: &nft_propagation_paths,
+            mint_payment_edges: &mint_payment_edges,
+            market_events: &market_events,
+        });
+
     let payload = SingleReportPayload {
-        seed_contract: SeedContractPayload {
-            chain: seed_contract.chain,
-            contract_address: seed_contract.contract_address,
-            name: seed_contract.name,
-            symbol: seed_contract.symbol,
-            token_type: seed_contract.token_type,
-            contract_deployer: seed_contract.contract_deployer,
-            deployed_block_number: seed_contract.deployed_block_number,
-        },
+        seed_contract: seed_contract_payload,
         seed_collection_stats: build_seed_collection_stats(&seed_nfts),
         duplicate_candidates: candidates,
         contract_level_summary: build_contract_level_summary(&expanded_candidates_by_contract),
@@ -1097,6 +1235,16 @@ async fn analyze_seed_contract_with_limits(
         honest_addresses,
         honest_address_stats,
         victim_addresses,
+        address_attributions,
+        contract_lifecycle_events: lifecycle_outputs.contract_lifecycle_events,
+        address_evidence_features: lifecycle_outputs.address_evidence_features,
+        value_flow_edges: lifecycle_outputs.value_flow_edges,
+        content_similarity_edges: lifecycle_outputs.content_similarity_edges,
+        campaign_clusters: lifecycle_outputs.campaign_clusters,
+        lifecycle_metrics: lifecycle_outputs.lifecycle_metrics,
+        weak_supervision_labels: lifecycle_outputs.weak_supervision_labels,
+        early_detection_features: lifecycle_outputs.early_detection_features,
+        market_events,
         fraud_trade_stats,
         nft_propagation_paths,
     };
@@ -1117,8 +1265,15 @@ fn merge_contract_analysis_result(
     malicious_addresses: &mut Vec<MaliciousAddressPayload>,
     honest_addresses: &mut Vec<HonestAddressPayload>,
     victim_addresses: &mut Vec<VictimAddressPayload>,
+    address_attributions: &mut Vec<AddressAttributionPayload>,
+    market_events: &mut Vec<NftMarketEventRecord>,
+    mint_payment_edges: &mut Vec<ValueFlowEdgePayload>,
     nft_propagation_paths: &mut BTreeMap<String, NftPropagationPathPayload>,
+    candidate_contract_metadata: &mut BTreeMap<String, ContractMetadata>,
 ) {
+    if let Some(metadata) = result.contract_metadata {
+        candidate_contract_metadata.insert(result.contract_address.clone(), metadata);
+    }
     if let Some(legit_duplicate) = result.legit_duplicate {
         legit_contract_addresses.insert(result.contract_address.clone());
         legit_duplicates.push(legit_duplicate);
@@ -1136,6 +1291,9 @@ fn merge_contract_analysis_result(
     malicious_addresses.extend(result.malicious_addresses);
     honest_addresses.extend(result.honest_addresses);
     victim_addresses.extend(result.victim_addresses);
+    address_attributions.extend(result.address_attributions);
+    market_events.extend(result.market_events);
+    mint_payment_edges.extend(result.mint_payment_edges);
     if let Some(path) = result.nft_propagation_path {
         nft_propagation_paths.insert(result.contract_address, path);
     }
@@ -1146,6 +1304,51 @@ fn payload_token_type(seed_contract: &ContractMetadata) -> String {
         "ERC721".into()
     } else {
         seed_contract.token_type.clone()
+    }
+}
+
+fn enrich_duplicate_contract_payload_with_metadata(
+    mut payload: DuplicateContractPayload,
+    metadata: Option<&ContractMetadata>,
+) -> DuplicateContractPayload {
+    if let Some(metadata) = metadata {
+        payload.contract_deployer = metadata.contract_deployer.clone();
+        payload.deployed_block_number = metadata.deployed_block_number;
+        payload.token_type = metadata.token_type.clone();
+        payload.owner_address = metadata.owner_address.clone();
+        payload.admin_address = metadata.admin_address.clone();
+        payload.proxy_admin_address = metadata.proxy_admin_address.clone();
+        payload.name = metadata.name.clone();
+        payload.symbol = metadata.symbol.clone();
+    }
+    payload
+}
+
+async fn fetch_candidate_contract_metadata(
+    request: &AnalyzeRequest,
+    deps: &AnalysisDeps,
+    contract_address: &str,
+    runtime_limits: &RuntimeLimits,
+) -> Result<Option<ContractMetadata>, AppError> {
+    let _contract_permit = acquire_optional_limit(&runtime_limits.contract_limit).await?;
+    match deps
+        .api
+        .fetch_contract_metadata(
+            &request.chain,
+            &request.alchemy_api_key,
+            request.alchemy_network.as_deref(),
+            &request.opensea_api_key,
+            contract_address,
+        )
+        .await
+    {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(err) => {
+            eprintln!(
+                "warning: contract metadata lookup failed for {contract_address}: {err}; continuing without deployment metadata"
+            );
+            Ok(None)
+        }
     }
 }
 
@@ -1161,6 +1364,8 @@ async fn analyze_duplicate_contract(
     runtime_limits: &RuntimeLimits,
 ) -> Result<ContractAnalysisResult, AppError> {
     let contract_candidate_refs: Vec<&DuplicateCandidate> = contract_candidates.iter().collect();
+    let contract_metadata =
+        fetch_candidate_contract_metadata(request, deps, contract_address, runtime_limits).await?;
     let cached_signals = if let Some(cache) = deps.signal_cache.as_ref() {
         cache.get(&request.chain, contract_address, token_type)?
     } else {
@@ -1226,19 +1431,23 @@ async fn analyze_duplicate_contract(
     {
         return Ok(ContractAnalysisResult {
             contract_address: contract_address.to_string(),
-            legit_duplicate: Some(DuplicateContractPayload {
-                contract_address: contract_address.to_string(),
-                candidate_count: contract_candidates.len() as i64,
-                mint_recipients: contract_infringing
-                    .iter()
-                    .filter_map(|item| {
-                        (!item.minter_address.is_empty()).then(|| item.minter_address.clone())
-                    })
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect(),
-                ..DuplicateContractPayload::default()
-            }),
+            contract_metadata: contract_metadata.clone(),
+            legit_duplicate: Some(enrich_duplicate_contract_payload_with_metadata(
+                DuplicateContractPayload {
+                    contract_address: contract_address.to_string(),
+                    candidate_count: contract_candidates.len() as i64,
+                    mint_recipients: contract_infringing
+                        .iter()
+                        .filter_map(|item| {
+                            (!item.minter_address.is_empty()).then(|| item.minter_address.clone())
+                        })
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect(),
+                    ..DuplicateContractPayload::default()
+                },
+                contract_metadata.as_ref(),
+            )),
             address_signal: None,
             victim_signal: None,
             infringing_tokens: vec![],
@@ -1246,6 +1455,9 @@ async fn analyze_duplicate_contract(
             honest_addresses: vec![],
             honest_address_stats: BTreeMap::new(),
             victim_addresses: vec![],
+            address_attributions: vec![],
+            market_events: vec![],
+            mint_payment_edges: vec![],
             fraud_trade_stats: BTreeMap::new(),
             nft_propagation_path: None,
         });
@@ -1263,6 +1475,28 @@ async fn analyze_duplicate_contract(
             )
             .await?
     };
+    let market_events = {
+        let _contract_permit = acquire_optional_limit(&runtime_limits.contract_limit).await?;
+        deps.api
+            .fetch_contract_market_events(
+                &request.chain,
+                &request.alchemy_api_key,
+                request.alchemy_network.as_deref(),
+                contract_address,
+                &request.opensea_api_key,
+            )
+            .await?
+    };
+    let mint_payment_edges = compute_mint_payment_edges_for_contract(
+        request,
+        deps,
+        contract_address,
+        &contract_infringing,
+        &transfers,
+        contract_metadata.as_ref(),
+        runtime_limits,
+    )
+    .await?;
     let sale_metrics_by_tx =
         compute_sale_metrics_for_contract(request, deps, &sales, runtime_limits).await?;
 
@@ -1283,6 +1517,15 @@ async fn analyze_duplicate_contract(
         &contract_malicious,
         analysis_timestamp,
     );
+    let address_attributions = address_records::build_address_attribution_records(
+        contract_address,
+        &contract_infringing,
+        &sales,
+        &mint_payment_edges,
+        &contract_malicious,
+        &contract_honest,
+        &contract_victims,
+    );
     let nft_propagation_path = propagation::build_nft_propagation_path(
         contract_address,
         &transfers,
@@ -1296,6 +1539,7 @@ async fn analyze_duplicate_contract(
 
     Ok(ContractAnalysisResult {
         contract_address: contract_address.to_string(),
+        contract_metadata,
         legit_duplicate: None,
         address_signal: Some(map_address_signals(&transfer_signals)),
         victim_signal: Some(victim_signal),
@@ -1312,8 +1556,317 @@ async fn analyze_duplicate_contract(
         malicious_addresses: contract_malicious,
         honest_addresses: contract_honest,
         victim_addresses: contract_victims,
+        address_attributions,
+        market_events,
+        mint_payment_edges,
         nft_propagation_path: Some(nft_propagation_path),
     })
+}
+
+#[derive(Clone, Debug)]
+struct MintPaymentLookup {
+    tx_hash: String,
+    block_number: i64,
+    block_time: i64,
+    minter_address: String,
+    token_ids: Vec<String>,
+}
+
+async fn compute_mint_payment_edges_for_contract(
+    request: &AnalyzeRequest,
+    deps: &AnalysisDeps,
+    contract_address: &str,
+    infringing_tokens: &[InfringingTokenRecord],
+    transfers: &[TransferRecord],
+    contract_metadata: Option<&ContractMetadata>,
+    runtime_limits: &RuntimeLimits,
+) -> Result<Vec<ValueFlowEdgePayload>, AppError> {
+    let lookups = build_mint_payment_lookups(contract_address, infringing_tokens, transfers);
+    if lookups.is_empty() {
+        return Ok(vec![]);
+    }
+    let payment_limit = runtime_limits.sale_metric_limit.clone().or_else(|| {
+        Some(Arc::new(Semaphore::new(
+            request.sale_metric_max_concurrency.max(1),
+        )))
+    });
+    let contract_deployer = contract_metadata
+        .map(|metadata| metadata.contract_deployer.clone())
+        .unwrap_or_default();
+
+    let mut fetched = stream::iter(lookups.into_iter().map(|lookup| {
+        let payment_limit = payment_limit.clone();
+        let contract_deployer = contract_deployer.clone();
+        async move {
+            let _permit = acquire_optional_limit(&payment_limit).await?;
+            let mut lookup_addresses = BTreeSet::from([
+                lookup.minter_address.clone(),
+                contract_address.to_string(),
+            ]);
+            if !contract_deployer.is_empty() {
+                lookup_addresses.insert(contract_deployer.clone());
+            }
+            let mut transfers = Vec::new();
+            for address in lookup_addresses {
+                match deps
+                    .api
+                    .fetch_mint_payment_eth_transfers_on_chain(
+                        &request.chain,
+                        &request.alchemy_api_key,
+                        request.alchemy_network.as_deref(),
+                        lookup.block_number,
+                        &address,
+                    )
+                    .await
+                {
+                    Ok(rows) => transfers.extend(rows),
+                    Err(err) => {
+                        eprintln!(
+                            "warning: mint value-flow transfer lookup failed for {address} in {}: {err}; continuing without this value-flow evidence",
+                            lookup.tx_hash
+                        );
+                    }
+                }
+            }
+            Ok::<_, AppError>((lookup, transfers))
+        }
+    }))
+    .buffer_unordered(request.sale_metric_max_concurrency.max(1));
+
+    let mut rows = BTreeMap::<String, ValueFlowEdgePayload>::new();
+    while let Some(result) = fetched.next().await {
+        let (lookup, eth_transfers) = result?;
+        for transfer in eth_transfers {
+            if transfer.tx_hash != lookup.tx_hash || transfer.value_eth <= 0.0 {
+                continue;
+            }
+            let Some((channel, from_role, to_role, evidence_type, evidence_flags)) =
+                classify_mint_value_flow_transfer(
+                    &transfer,
+                    &lookup,
+                    contract_address,
+                    contract_metadata,
+                )
+            else {
+                continue;
+            };
+            let edge_id = format!(
+                "value:{}:{}:{}:{}",
+                channel, transfer.tx_hash, transfer.from_address, transfer.to_address
+            );
+            rows.entry(edge_id.clone()).or_insert(ValueFlowEdgePayload {
+                edge_id,
+                contract_address: contract_address.to_string(),
+                from_address: transfer.from_address,
+                to_address: transfer.to_address,
+                tx_hash: lookup.tx_hash.clone(),
+                block_number: lookup.block_number,
+                block_time: lookup.block_time,
+                token_id: lookup.token_ids.join(","),
+                value_eth: Some(transfer.value_eth),
+                value_usd: None,
+                payment_token_symbol: "ETH".into(),
+                payment_token_address: ZERO_ADDRESS.into(),
+                channel,
+                marketplace: String::new(),
+                evidence_type,
+                from_role,
+                to_role,
+                recipient_known: true,
+                evidence_flags,
+            });
+        }
+    }
+
+    Ok(rows.into_values().collect())
+}
+
+fn classify_mint_value_flow_transfer(
+    transfer: &EthTransferRecord,
+    lookup: &MintPaymentLookup,
+    contract_address: &str,
+    contract_metadata: Option<&ContractMetadata>,
+) -> Option<(String, String, String, String, Vec<String>)> {
+    let contract_deployer = contract_metadata
+        .map(|metadata| metadata.contract_deployer.as_str())
+        .unwrap_or("");
+    if is_matching_mint_payment_transfer(
+        transfer,
+        lookup,
+        contract_address,
+        contract_deployer,
+        contract_metadata,
+    ) {
+        let to_role =
+            contract_control_role(&transfer.to_address, contract_address, contract_metadata)
+                .unwrap_or("operator_wallet")
+                .to_string();
+        return Some((
+            "mint_payment".into(),
+            "paid_minter".into(),
+            to_role,
+            format!("same_tx_eth_transfer:{}", transfer.category),
+            vec![
+                "paid_mint".into(),
+                "same_tx_eth_transfer".into(),
+                transfer.category.clone(),
+            ],
+        ));
+    }
+    if transfer
+        .to_address
+        .eq_ignore_ascii_case(&lookup.minter_address)
+        && !transfer
+            .from_address
+            .eq_ignore_ascii_case(&lookup.minter_address)
+        && !transfer.from_address.eq_ignore_ascii_case(ZERO_ADDRESS)
+    {
+        return Some((
+            "funding".into(),
+            "external_funder".into(),
+            "paid_minter".into(),
+            format!("same_tx_mint_funding:{}", transfer.category),
+            vec![
+                "same_tx_mint_funding".into(),
+                "pre_mint_capital_source".into(),
+                transfer.category.clone(),
+            ],
+        ));
+    }
+    if transfer.from_address.eq_ignore_ascii_case(contract_address)
+        && !transfer
+            .to_address
+            .eq_ignore_ascii_case(&lookup.minter_address)
+        && !transfer.to_address.eq_ignore_ascii_case(ZERO_ADDRESS)
+    {
+        let to_role =
+            contract_control_role(&transfer.to_address, contract_address, contract_metadata)
+                .unwrap_or("external_wallet")
+                .to_string();
+        return Some((
+            "withdrawal".into(),
+            "mint_contract".into(),
+            to_role,
+            format!("same_tx_contract_outflow:{}", transfer.category),
+            vec![
+                "same_tx_contract_withdrawal".into(),
+                "post_mint_value_extraction".into(),
+                transfer.category.clone(),
+            ],
+        ));
+    }
+    None
+}
+
+fn contract_control_role<'a>(
+    address: &str,
+    contract_address: &str,
+    metadata: Option<&'a ContractMetadata>,
+) -> Option<&'a str> {
+    if address.eq_ignore_ascii_case(contract_address) {
+        return Some("mint_contract");
+    }
+    let metadata = metadata?;
+    if !metadata.contract_deployer.is_empty()
+        && address.eq_ignore_ascii_case(&metadata.contract_deployer)
+    {
+        return Some("contract_deployer");
+    }
+    if !metadata.owner_address.is_empty() && address.eq_ignore_ascii_case(&metadata.owner_address) {
+        return Some("contract_owner");
+    }
+    if !metadata.admin_address.is_empty() && address.eq_ignore_ascii_case(&metadata.admin_address) {
+        return Some("contract_admin");
+    }
+    if !metadata.proxy_admin_address.is_empty()
+        && address.eq_ignore_ascii_case(&metadata.proxy_admin_address)
+    {
+        return Some("proxy_admin");
+    }
+    None
+}
+
+fn is_matching_mint_payment_transfer(
+    transfer: &EthTransferRecord,
+    lookup: &MintPaymentLookup,
+    contract_address: &str,
+    contract_deployer: &str,
+    contract_metadata: Option<&ContractMetadata>,
+) -> bool {
+    transfer.tx_hash == lookup.tx_hash
+        && transfer.value_eth > 0.0
+        && transfer
+            .from_address
+            .eq_ignore_ascii_case(&lookup.minter_address)
+        && (transfer.to_address.eq_ignore_ascii_case(contract_address)
+            || (!contract_deployer.is_empty()
+                && transfer.to_address.eq_ignore_ascii_case(contract_deployer))
+            || contract_metadata
+                .map(|metadata| {
+                    (!metadata.owner_address.is_empty()
+                        && transfer
+                            .to_address
+                            .eq_ignore_ascii_case(&metadata.owner_address))
+                        || (!metadata.admin_address.is_empty()
+                            && transfer
+                                .to_address
+                                .eq_ignore_ascii_case(&metadata.admin_address))
+                        || (!metadata.proxy_admin_address.is_empty()
+                            && transfer
+                                .to_address
+                                .eq_ignore_ascii_case(&metadata.proxy_admin_address))
+                })
+                .unwrap_or(false))
+}
+
+fn build_mint_payment_lookups(
+    contract_address: &str,
+    infringing_tokens: &[InfringingTokenRecord],
+    transfers: &[TransferRecord],
+) -> Vec<MintPaymentLookup> {
+    let mut block_time_by_tx = BTreeMap::<String, i64>::new();
+    for transfer in transfers {
+        if transfer.contract_address == contract_address
+            && !transfer.tx_hash.is_empty()
+            && transfer.block_time > 0
+        {
+            block_time_by_tx
+                .entry(transfer.tx_hash.clone())
+                .or_insert(transfer.block_time);
+        }
+    }
+
+    let mut grouped = BTreeMap::<(String, i64, String), BTreeSet<String>>::new();
+    for token in infringing_tokens {
+        if token.mint_tx_hash.is_empty()
+            || token.mint_block <= 0
+            || token.minter_address.is_empty()
+            || token.minter_address == ZERO_ADDRESS
+        {
+            continue;
+        }
+        grouped
+            .entry((
+                token.mint_tx_hash.clone(),
+                token.mint_block,
+                token.minter_address.clone(),
+            ))
+            .or_default()
+            .insert(token.token_id.clone());
+    }
+
+    grouped
+        .into_iter()
+        .map(
+            |((tx_hash, block_number, minter_address), token_ids)| MintPaymentLookup {
+                block_time: block_time_by_tx.get(&tx_hash).copied().unwrap_or_default(),
+                tx_hash,
+                block_number,
+                minter_address,
+                token_ids: token_ids.into_iter().collect(),
+            },
+        )
+        .collect()
 }
 
 fn is_candidate_open_license(metadata_json: &str, metadata_doc: &str) -> bool {
@@ -1431,15 +1984,18 @@ async fn compute_sale_metrics_for_contract(
             .or_insert(sale);
     }
 
-    let mut unique_sales_by_tx = BTreeMap::new();
+    let mut unique_sales_by_purchase = BTreeMap::new();
     for sale in latest_sale_by_buyer.into_values() {
-        unique_sales_by_tx
-            .entry(sale.tx_hash.clone())
+        unique_sales_by_purchase
+            .entry(address_records::sale_metric_key(
+                &sale.tx_hash,
+                &sale.buyer_address,
+            ))
             .or_insert(sale);
     }
 
     let mut prefetches = FuturesUnordered::new();
-    for sale in unique_sales_by_tx.into_values() {
+    for sale in unique_sales_by_purchase.into_values() {
         let sale_metric_limit = sale_metric_limit.clone();
         prefetches.push(async move {
             let _permit = acquire_optional_limit(&sale_metric_limit).await?;
@@ -1447,7 +2003,7 @@ async fn compute_sale_metrics_for_contract(
         });
     }
 
-    let mut prefetched_by_tx = BTreeMap::new();
+    let mut prefetched_by_purchase = BTreeMap::new();
     let mut queued_blocks = BTreeSet::new();
     let mut block_receipts = FuturesUnordered::new();
     let mut receipts_by_block = BTreeMap::new();
@@ -1476,7 +2032,7 @@ async fn compute_sale_metrics_for_contract(
                         (block_number, receipts)
                     });
                 }
-                prefetched_by_tx.insert(row.tx_hash.clone(), row);
+                prefetched_by_purchase.insert(row.metric_key.clone(), row);
             }
             Some((block_number, receipts)) = block_receipts.next(), if !block_receipts.is_empty() => {
                 receipts_by_block.insert(block_number, receipts);
@@ -1487,18 +2043,19 @@ async fn compute_sale_metrics_for_contract(
 
     let mut rows = BTreeMap::new();
     for sale in sales {
-        if rows.contains_key(&sale.tx_hash) {
+        let metric_key = address_records::sale_metric_key(&sale.tx_hash, &sale.buyer_address);
+        if rows.contains_key(&metric_key) {
             continue;
         }
         let unavailable;
-        let prefetched = if let Some(prefetched) = prefetched_by_tx.get(&sale.tx_hash) {
+        let prefetched = if let Some(prefetched) = prefetched_by_purchase.get(&metric_key) {
             prefetched
         } else {
             unavailable = SaleMetricPrefetch::unavailable(sale);
             &unavailable
         };
         rows.insert(
-            sale.tx_hash.clone(),
+            metric_key,
             compute_sale_metrics_for_sale(sale, prefetched, &receipts_by_block),
         );
     }
@@ -1515,7 +2072,7 @@ fn sale_sort_key_for_metrics(sale: &NftSaleRecord) -> (i64, i64, i64, &str) {
 }
 
 struct SaleMetricPrefetch {
-    tx_hash: String,
+    metric_key: String,
     block_number: i64,
     purchase_receipt: Option<TransactionReceiptRecord>,
     base_balance_eth: Option<f64>,
@@ -1525,7 +2082,7 @@ struct SaleMetricPrefetch {
 impl SaleMetricPrefetch {
     fn unavailable(sale: &NftSaleRecord) -> Self {
         Self {
-            tx_hash: sale.tx_hash.clone(),
+            metric_key: address_records::sale_metric_key(&sale.tx_hash, &sale.buyer_address),
             block_number: sale.block_number,
             purchase_receipt: None,
             base_balance_eth: None,
@@ -1580,7 +2137,7 @@ async fn prefetch_sale_metric_inputs(
     };
 
     SaleMetricPrefetch {
-        tx_hash: sale.tx_hash.clone(),
+        metric_key: address_records::sale_metric_key(&sale.tx_hash, &sale.buyer_address),
         block_number: sale.block_number,
         purchase_receipt: Some(purchase_receipt),
         base_balance_eth: Some(base_balance_eth),
@@ -1898,43 +2455,33 @@ pub fn group_candidates_by_contract(
 async fn filter_seed_related_candidate_contracts(
     request: &AnalyzeRequest,
     deps: &AnalysisDeps,
-    snapshot: &DatabaseSnapshot,
     candidates: Vec<DuplicateCandidate>,
+    seed_token_type: &str,
     concurrency: usize,
     runtime_limits: &RuntimeLimits,
-) -> Vec<DuplicateCandidate> {
+) -> CandidateContractFilterResult {
     if candidates.is_empty() {
-        return candidates;
+        return CandidateContractFilterResult {
+            candidates,
+            seed_related_legit_duplicates: vec![],
+        };
     }
 
-    let mut excluded_contracts = BTreeSet::new();
-    let local_contract_names = local_contract_names_by_address(snapshot);
-    for candidate in &candidates {
-        if candidate_has_wrapper_or_vault_semantics(
-            candidate,
-            local_contract_names
-                .get(&candidate.contract_address.to_lowercase())
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
-        ) {
-            excluded_contracts.insert(candidate.contract_address.to_lowercase());
-        }
-    }
-
-    let candidate_contracts: Vec<String> = candidates
+    let candidate_contracts: BTreeMap<String, String> = candidates
         .iter()
-        .map(|candidate| candidate.contract_address.clone())
+        .map(|candidate| {
+            (
+                candidate.contract_address.to_lowercase(),
+                candidate.contract_address.clone(),
+            )
+        })
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .filter(|contract_address| !excluded_contracts.contains(&contract_address.to_lowercase()))
         .collect();
 
-    let mut unresolved_contracts: BTreeSet<String> = candidate_contracts
-        .iter()
-        .map(|contract_address| contract_address.to_lowercase())
-        .collect();
+    let mut exclusion_reasons_by_contract = BTreeMap::<String, BTreeSet<String>>::new();
 
-    let seed_collection_slug = if unresolved_contracts.is_empty() {
+    let seed_collection_slug = if candidate_contracts.is_empty() {
         None
     } else {
         match deps
@@ -1959,7 +2506,7 @@ async fn filter_seed_related_candidate_contracts(
         }
     };
 
-    let mut holder_checks = stream::iter(candidate_contracts.into_iter().map(|contract_address| {
+    let mut holder_checks = stream::iter(candidate_contracts.values().cloned().map(|contract_address| {
         let seed_collection_slug = seed_collection_slug.clone();
         async move {
             let _permit = match acquire_optional_limit(&runtime_limits.contract_limit).await {
@@ -1992,12 +2539,12 @@ async fn filter_seed_related_candidate_contracts(
         let contract_key = contract_address.to_lowercase();
         match holds_seed_nft {
             Ok(Some(true)) => {
-                unresolved_contracts.remove(&contract_key);
-                excluded_contracts.insert(contract_key);
+                exclusion_reasons_by_contract
+                    .entry(contract_key)
+                    .or_default()
+                    .insert("当前持有 seed 合约 NFT".to_string());
             }
-            Ok(Some(false)) => {
-                unresolved_contracts.remove(&contract_key);
-            }
+            Ok(Some(false)) => {}
             Ok(None) => {}
             Err(err) => {
                 eprintln!(
@@ -2007,43 +2554,93 @@ async fn filter_seed_related_candidate_contracts(
         }
     }
 
-    candidates
+    let remaining_contracts: BTreeSet<String> = candidate_contracts
+        .keys()
+        .filter(|contract_key| !exclusion_reasons_by_contract.contains_key(*contract_key))
+        .cloned()
+        .collect();
+    if !remaining_contracts.is_empty() {
+        match deps
+            .api
+            .fetch_contract_transfers(
+                &request.chain,
+                &request.etherscan_api_key,
+                request.alchemy_network.as_deref(),
+                &request.alchemy_api_key,
+                &request.seed_contract_address,
+                seed_token_type,
+            )
+            .await
+        {
+            Ok(seed_transfers) => {
+                for transfer in seed_transfers {
+                    let to_address = transfer.to_address.to_lowercase();
+                    if remaining_contracts.contains(&to_address) {
+                        exclusion_reasons_by_contract
+                            .entry(to_address)
+                            .or_default()
+                            .insert("链上历史 Transfer 显示接收过 seed 合约 NFT".to_string());
+                    }
+                    let from_address = transfer.from_address.to_lowercase();
+                    if remaining_contracts.contains(&from_address) {
+                        exclusion_reasons_by_contract
+                            .entry(from_address)
+                            .or_default()
+                            .insert("链上历史 Transfer 显示转出过 seed 合约 NFT".to_string());
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: seed NFT transfer history lookup failed for {}: {err}; continuing without historical holder-based candidate exclusion",
+                    request.seed_contract_address
+                );
+            }
+        }
+    }
+
+    let seed_related_legit_duplicates =
+        build_seed_related_legit_duplicate_payloads(&candidates, &exclusion_reasons_by_contract);
+    let candidates = candidates
         .into_iter()
         .filter(|candidate| {
-            !excluded_contracts.contains(&candidate.contract_address.to_lowercase())
+            !exclusion_reasons_by_contract.contains_key(&candidate.contract_address.to_lowercase())
+        })
+        .collect();
+
+    CandidateContractFilterResult {
+        candidates,
+        seed_related_legit_duplicates,
+    }
+}
+
+fn build_seed_related_legit_duplicate_payloads(
+    candidates: &[DuplicateCandidate],
+    exclusion_reasons_by_contract: &BTreeMap<String, BTreeSet<String>>,
+) -> Vec<DuplicateContractPayload> {
+    exclusion_reasons_by_contract
+        .iter()
+        .filter_map(|(contract_key, reasons)| {
+            let contract_candidates: Vec<&DuplicateCandidate> = candidates
+                .iter()
+                .filter(|candidate| candidate.contract_address.to_lowercase() == *contract_key)
+                .collect();
+            if contract_candidates.is_empty() {
+                return None;
+            }
+            let mut match_reasons = BTreeSet::new();
+            for candidate in &contract_candidates {
+                match_reasons.extend(candidate.match_reasons.iter().cloned());
+            }
+            Some(DuplicateContractPayload {
+                contract_address: contract_candidates[0].contract_address.clone(),
+                candidate_count: contract_candidates.len() as i64,
+                match_reasons: match_reasons.into_iter().collect(),
+                exclusion_reasons: reasons.iter().cloned().collect(),
+                ..DuplicateContractPayload::default()
+            })
         })
         .collect()
-}
-
-fn local_contract_names_by_address(snapshot: &DatabaseSnapshot) -> HashMap<String, Vec<String>> {
-    let mut names = HashMap::<String, Vec<String>>::new();
-    for row in &snapshot.contract_names {
-        if row.contract_address.trim().is_empty() || row.name_norm.trim().is_empty() {
-            continue;
-        }
-        names
-            .entry(row.contract_address.trim().to_lowercase())
-            .or_default()
-            .push(row.name_norm.clone());
-    }
-    names
-}
-
-fn candidate_has_wrapper_or_vault_semantics(
-    candidate: &DuplicateCandidate,
-    local_contract_names: &[String],
-) -> bool {
-    let text = format!(
-        "{} {} {}",
-        candidate.name.to_lowercase(),
-        candidate.symbol.to_lowercase(),
-        local_contract_names.join(" ").to_lowercase()
-    );
-    text.contains("wrapped")
-        || text.contains("wrapper")
-        || text
-            .split(|character: char| !character.is_ascii_alphanumeric())
-            .any(|token| matches!(token, "vault" | "vaulted"))
 }
 
 struct SnapshotTokenIndex<'a> {
@@ -2251,6 +2848,7 @@ where
 fn build_contract_payload(
     contract_address: &str,
     contract_candidates: &[DuplicateCandidate],
+    metadata: Option<&ContractMetadata>,
 ) -> DuplicateContractPayload {
     let mut match_reasons: BTreeSet<String> = BTreeSet::new();
     for item in contract_candidates {
@@ -2258,20 +2856,31 @@ fn build_contract_payload(
             match_reasons.insert(reason.clone());
         }
     }
-    DuplicateContractPayload {
-        contract_address: contract_address.to_string(),
-        candidate_count: contract_candidates.len() as i64,
-        match_reasons: match_reasons.into_iter().collect(),
-        mint_recipients: vec![],
-    }
+    enrich_duplicate_contract_payload_with_metadata(
+        DuplicateContractPayload {
+            contract_address: contract_address.to_string(),
+            candidate_count: contract_candidates.len() as i64,
+            match_reasons: match_reasons.into_iter().collect(),
+            mint_recipients: vec![],
+            ..DuplicateContractPayload::default()
+        },
+        metadata,
+    )
 }
 
 fn build_duplicate_contract_payloads(
     expanded_candidates_by_contract: &BTreeMap<String, Vec<DuplicateCandidate>>,
+    candidate_contract_metadata: &BTreeMap<String, ContractMetadata>,
 ) -> Vec<DuplicateContractPayload> {
     expanded_candidates_by_contract
         .iter()
-        .map(|(contract_address, items)| build_contract_payload(contract_address, items))
+        .map(|(contract_address, items)| {
+            build_contract_payload(
+                contract_address,
+                items,
+                candidate_contract_metadata.get(contract_address),
+            )
+        })
         .collect()
 }
 

@@ -21,6 +21,75 @@ struct NodeAccumulator {
     is_stuck_victim: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct EdgeAggregationKey {
+    contract_address: String,
+    channel: String,
+    from_address: String,
+    to_address: String,
+    event_type: String,
+    marketplace: String,
+}
+
+struct EdgeAccumulator {
+    edge: NftPropagationEdgePayload,
+    token_ids: BTreeSet<String>,
+    tx_hashes: BTreeSet<String>,
+}
+
+impl EdgeAccumulator {
+    fn new(mut edge: NftPropagationEdgePayload) -> Self {
+        edge.aggregate_count = 1;
+        let mut token_ids = BTreeSet::new();
+        if !edge.token_id.is_empty() {
+            token_ids.insert(edge.token_id.clone());
+        }
+        let mut tx_hashes = BTreeSet::new();
+        if !edge.tx_hash.is_empty() {
+            tx_hashes.insert(edge.tx_hash.clone());
+        }
+        Self {
+            edge,
+            token_ids,
+            tx_hashes,
+        }
+    }
+
+    fn absorb(&mut self, edge: &NftPropagationEdgePayload) {
+        self.edge.aggregate_count += 1;
+        if !edge.token_id.is_empty() {
+            self.token_ids.insert(edge.token_id.clone());
+        }
+        if !edge.tx_hash.is_empty() {
+            self.tx_hashes.insert(edge.tx_hash.clone());
+        }
+        if edge.block_number > self.edge.block_number {
+            self.edge.last_block_number = Some(edge.block_number);
+        }
+        if edge.block_time > self.edge.block_time {
+            self.edge.last_block_time = Some(edge.block_time);
+        }
+        if self.edge.seconds_since_mint.is_none() {
+            self.edge.seconds_since_mint = edge.seconds_since_mint;
+        }
+    }
+
+    fn finish(mut self, key: &EdgeAggregationKey) -> NftPropagationEdgePayload {
+        if self.edge.aggregate_count > 1 {
+            self.edge.edge_id = format!(
+                "aggregate:{}:{}:{}:{}:{}",
+                key.channel, key.contract_address, key.from_address, key.to_address, key.event_type
+            );
+            self.edge.token_ids = self.token_ids.into_iter().collect();
+            self.edge.tx_hashes = self.tx_hashes.into_iter().take(50).collect();
+            self.edge.last_block_number =
+                self.edge.last_block_number.or(Some(self.edge.block_number));
+            self.edge.last_block_time = self.edge.last_block_time.or(Some(self.edge.block_time));
+        }
+        self.edge
+    }
+}
+
 fn transfer_sort_key(transfer: &TransferRecord) -> (i64, i64, &str) {
     (
         transfer.block_number,
@@ -73,6 +142,10 @@ fn seconds_since_mint(
     (mint_time > 0 && block_time >= mint_time).then_some(block_time - mint_time)
 }
 
+fn positive_amount(value: f64) -> Option<f64> {
+    (value > 0.0).then_some(value)
+}
+
 fn edge_block_time_from_transfer(
     transfer_time_by_tx_token: &HashMap<(String, String), i64>,
     sale: &NftSaleRecord,
@@ -81,6 +154,67 @@ fn edge_block_time_from_transfer(
         .get(&(sale.tx_hash.clone(), sale.token_id.clone()))
         .copied()
         .unwrap_or_default()
+}
+
+fn sale_transfer_key(
+    tx_hash: &str,
+    token_id: &str,
+    from_address: &str,
+    to_address: &str,
+) -> Option<(String, String, String, String)> {
+    let tx_hash = tx_hash.trim().to_lowercase();
+    let token_id = token_id.trim().to_string();
+    let from_address = canonical_address(from_address);
+    let to_address = canonical_address(to_address);
+    if tx_hash.is_empty() || token_id.is_empty() || from_address.is_empty() || to_address.is_empty()
+    {
+        None
+    } else {
+        Some((tx_hash, token_id, from_address, to_address))
+    }
+}
+
+fn edge_aggregation_key(edge: &NftPropagationEdgePayload) -> Option<EdgeAggregationKey> {
+    if !matches!(edge.channel.as_str(), "mint" | "transfer") {
+        return None;
+    }
+    Some(EdgeAggregationKey {
+        contract_address: edge.contract_address.clone(),
+        channel: edge.channel.clone(),
+        from_address: edge.from_address.clone(),
+        to_address: edge.to_address.clone(),
+        event_type: edge.event_type.clone(),
+        marketplace: edge.marketplace.clone(),
+    })
+}
+
+fn aggregate_transfer_like_edges(
+    edges: Vec<NftPropagationEdgePayload>,
+) -> Vec<NftPropagationEdgePayload> {
+    let mut grouped = BTreeMap::<EdgeAggregationKey, EdgeAccumulator>::new();
+    let mut passthrough = Vec::new();
+
+    for edge in edges {
+        if let Some(key) = edge_aggregation_key(&edge) {
+            grouped
+                .entry(key)
+                .and_modify(|accumulator| accumulator.absorb(&edge))
+                .or_insert_with(|| EdgeAccumulator::new(edge));
+        } else {
+            passthrough.push(edge);
+        }
+    }
+
+    passthrough.extend(
+        grouped
+            .into_iter()
+            .map(|(key, accumulator)| accumulator.finish(&key)),
+    );
+    passthrough
+}
+
+fn edge_contains_token(edge: &NftPropagationEdgePayload, token_id: &str) -> bool {
+    edge.token_id == token_id || edge.token_ids.iter().any(|item| item == token_id)
 }
 
 fn current_holders_by_token(
@@ -165,7 +299,8 @@ pub fn build_nft_propagation_path(
         .filter_map(|item| (!item.token_id.is_empty()).then(|| item.token_id.clone()))
         .collect();
     let mut nodes = BTreeMap::<String, NodeAccumulator>::new();
-    let mut edges = Vec::new();
+    let mut transfer_edges = Vec::new();
+    let mut sale_edges = Vec::new();
     let holders_by_token = current_holders_by_token(owners, &relevant_token_ids);
 
     for token in infringing_tokens {
@@ -268,7 +403,7 @@ pub fn build_nft_propagation_path(
                 node.minted_token_count += 1;
             }
         }
-        edges.push(NftPropagationEdgePayload {
+        transfer_edges.push(NftPropagationEdgePayload {
             edge_id: format!(
                 "{}:{}:{}:{}:{}",
                 channel, transfer.tx_hash, transfer.log_index, transfer.token_id, index
@@ -284,13 +419,29 @@ pub fn build_nft_propagation_path(
             event_type: transfer.event_type.clone(),
             channel: channel.to_string(),
             marketplace: String::new(),
+            payment_token_symbol: String::new(),
+            payment_token_address: String::new(),
             price_eth: None,
             price_usd: None,
+            seller_fee_eth: None,
+            seller_fee_usd: None,
+            protocol_fee_eth: None,
+            protocol_fee_usd: None,
+            royalty_fee_eth: None,
+            royalty_fee_usd: None,
+            royalty_recipient_address: String::new(),
             seconds_since_mint: seconds_since_mint(
                 &mint_time_by_token,
                 &transfer.token_id,
                 transfer.block_time,
             ),
+            aggregate_count: 1,
+            token_ids: vec![],
+            tx_hashes: vec![],
+            last_block_number: None,
+            last_block_time: None,
+            merged_transfer: false,
+            underlying_channels: vec![channel.to_string()],
         });
     }
 
@@ -302,6 +453,19 @@ pub fn build_nft_propagation_path(
         })
         .collect();
     sorted_sales.sort_by(|left, right| sale_sort_key(left).cmp(&sale_sort_key(right)));
+
+    let transfer_keys: HashSet<(String, String, String, String)> = transfer_edges
+        .iter()
+        .filter_map(|edge| {
+            sale_transfer_key(
+                &edge.tx_hash,
+                &edge.token_id,
+                &edge.from_address,
+                &edge.to_address,
+            )
+        })
+        .collect();
+    let mut merged_transfer_keys = HashSet::<(String, String, String, String)>::new();
 
     for (index, sale) in sorted_sales.iter().enumerate() {
         let from_address = canonical_address(&sale.seller_address);
@@ -317,7 +481,16 @@ pub fn build_nft_propagation_path(
             node.total_buy_usd += sale.price_usd.unwrap_or(0.0);
         }
         let block_time = edge_block_time_from_transfer(&transfer_time_by_tx_token, sale);
-        edges.push(NftPropagationEdgePayload {
+        let transfer_key =
+            sale_transfer_key(&sale.tx_hash, &sale.token_id, &from_address, &to_address);
+        let merged_transfer = transfer_key
+            .as_ref()
+            .map(|key| transfer_keys.contains(key))
+            .unwrap_or(false);
+        if let Some(key) = transfer_key.filter(|_| merged_transfer) {
+            merged_transfer_keys.insert(key);
+        }
+        sale_edges.push(NftPropagationEdgePayload {
             edge_id: format!(
                 "sale:{}:{}:{}:{}",
                 sale.tx_hash, sale.log_index, sale.bundle_index, index
@@ -333,11 +506,47 @@ pub fn build_nft_propagation_path(
             event_type: "sale".into(),
             channel: "sale".into(),
             marketplace: sale.marketplace.clone(),
+            payment_token_symbol: sale.payment_token_symbol.clone(),
+            payment_token_address: sale.payment_token_address.clone(),
             price_eth: sale.price_eth,
             price_usd: sale.price_usd,
+            seller_fee_eth: positive_amount(sale.seller_fee_eth),
+            seller_fee_usd: positive_amount(sale.seller_fee_usd),
+            protocol_fee_eth: positive_amount(sale.protocol_fee_eth),
+            protocol_fee_usd: positive_amount(sale.protocol_fee_usd),
+            royalty_fee_eth: positive_amount(sale.royalty_fee_eth),
+            royalty_fee_usd: positive_amount(sale.royalty_fee_usd),
+            royalty_recipient_address: canonical_address(&sale.royalty_recipient_address),
             seconds_since_mint: seconds_since_mint(&mint_time_by_token, &sale.token_id, block_time),
+            aggregate_count: 1,
+            token_ids: vec![],
+            tx_hashes: vec![],
+            last_block_number: None,
+            last_block_time: None,
+            merged_transfer,
+            underlying_channels: if merged_transfer {
+                vec!["sale".into(), "transfer".into()]
+            } else {
+                vec!["sale".into()]
+            },
         });
     }
+
+    let mut edges: Vec<NftPropagationEdgePayload> = transfer_edges
+        .into_iter()
+        .filter(|edge| {
+            sale_transfer_key(
+                &edge.tx_hash,
+                &edge.token_id,
+                &edge.from_address,
+                &edge.to_address,
+            )
+            .map(|key| !merged_transfer_keys.contains(&key))
+            .unwrap_or(true)
+        })
+        .collect();
+    edges.extend(sale_edges);
+    edges = aggregate_transfer_like_edges(edges);
 
     edges.sort_by(|left, right| {
         (
@@ -422,7 +631,7 @@ pub fn build_nft_propagation_path(
             seller_addresses,
             edge_count: edges
                 .iter()
-                .filter(|edge| edge.token_id == token.token_id)
+                .filter(|edge| edge_contains_token(edge, &token.token_id))
                 .count() as i64,
             sale_count: sorted_sales
                 .iter()

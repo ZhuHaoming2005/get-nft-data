@@ -2,6 +2,30 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+fn default_aggregate_count() -> i64 {
+    1
+}
+
+fn is_one_i64(value: &i64) -> bool {
+    *value == 1
+}
+
+fn is_zero_i64(value: &i64) -> bool {
+    *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SeedNft {
     pub chain: String,
@@ -80,6 +104,12 @@ pub struct ContractMetadata {
     pub token_type: String,
     pub contract_deployer: String,
     pub deployed_block_number: i64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub owner_address: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub admin_address: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub proxy_admin_address: String,
     pub name: String,
     pub symbol: String,
 }
@@ -124,6 +154,8 @@ pub struct NftSaleRecord {
     pub royalty_fee_eth: f64,
     #[serde(default)]
     pub royalty_fee_usd: f64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub royalty_recipient_address: String,
     pub source: String,
     pub is_native_eth: bool,
 }
@@ -146,6 +178,32 @@ pub struct EthTransferRecord {
     pub to_address: String,
     pub value_eth: f64,
     pub category: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct NftMarketEventRecord {
+    pub contract_address: String,
+    pub token_id: String,
+    pub event_type: String,
+    pub order_type: String,
+    pub tx_hash: String,
+    pub order_hash: String,
+    pub block_number: i64,
+    pub block_time: i64,
+    pub event_timestamp: i64,
+    pub actor_address: String,
+    pub from_address: String,
+    pub to_address: String,
+    pub maker_address: String,
+    pub taker_address: String,
+    pub marketplace: String,
+    pub payment_token_symbol: String,
+    pub payment_token_address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_eth: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_usd: Option<f64>,
+    pub source: String,
 }
 
 impl TransferRecord {
@@ -273,6 +331,24 @@ pub struct DuplicateContractPayload {
     pub candidate_count: i64,
     pub match_reasons: Vec<String>,
     pub mint_recipients: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclusion_reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub contract_deployer: String,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub deployed_block_number: i64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub token_type: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub owner_address: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub admin_address: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub proxy_admin_address: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub symbol: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -341,6 +417,254 @@ pub struct VictimAddressPayload {
 
 fn default_ratio_status() -> String {
     "unavailable".into()
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct AddressEvidencePayload {
+    pub evidence_type: String,
+    pub contract_address: String,
+    pub token_id: String,
+    pub tx_hash: String,
+    pub weight: f64,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct AddressAttributionPayload {
+    pub contract_address: String,
+    pub address: String,
+    pub observed_roles: Vec<String>,
+    #[serde(default)]
+    pub attribution_label: String,
+    #[serde(default)]
+    pub operator_score: f64,
+    #[serde(default)]
+    pub colluder_score: f64,
+    pub attacker_score: f64,
+    pub victim_score: f64,
+    #[serde(default)]
+    pub corruption_score: f64,
+    #[serde(default)]
+    pub neutral_score: f64,
+    pub confidence: String,
+    pub evidence: Vec<AddressEvidencePayload>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct AddressEvidenceFeaturePayload {
+    pub contract_address: String,
+    pub address: String,
+    pub observed_roles: Vec<String>,
+    pub attribution_label: String,
+    pub operator_score: f64,
+    pub colluder_score: f64,
+    pub victim_score: f64,
+    pub corruption_score: f64,
+    pub neutral_score: f64,
+    pub confidence: String,
+    pub evidence_count: i64,
+    pub related_token_count: i64,
+    pub related_tx_count: i64,
+    pub evidence: Vec<AddressEvidencePayload>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ContractLifecycleEventPayload {
+    pub event_id: String,
+    pub contract_address: String,
+    pub lifecycle_stage: String,
+    pub event_type: String,
+    pub block_number: i64,
+    pub block_time: i64,
+    pub tx_hash: String,
+    pub actor_address: String,
+    pub counterparty_address: String,
+    pub token_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_eth: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_usd: Option<f64>,
+    pub evidence_type: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_flags: Vec<String>,
+    pub confidence: String,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ValueFlowEdgePayload {
+    pub edge_id: String,
+    pub contract_address: String,
+    pub from_address: String,
+    pub to_address: String,
+    pub tx_hash: String,
+    pub block_number: i64,
+    pub block_time: i64,
+    pub token_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_eth: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_usd: Option<f64>,
+    pub payment_token_symbol: String,
+    pub payment_token_address: String,
+    pub channel: String,
+    pub marketplace: String,
+    pub evidence_type: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub from_role: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub to_role: String,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub recipient_known: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_flags: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContentSimilarityEdgePayload {
+    pub edge_id: String,
+    pub seed_contract_address: String,
+    pub candidate_contract_address: String,
+    pub token_id: String,
+    pub match_reasons: Vec<String>,
+    pub confidence: String,
+    pub evidence_type: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct CampaignClusterPayload {
+    pub cluster_id: String,
+    pub seed_contract_address: String,
+    pub contract_addresses: Vec<String>,
+    pub suspected_operator_addresses: Vec<String>,
+    pub suspected_colluder_addresses: Vec<String>,
+    pub victim_addresses: Vec<String>,
+    pub corrupted_victim_addresses: Vec<String>,
+    pub lifecycle_stages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_evidence: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub value_flow_channels: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cluster_confidence: String,
+    pub token_count: i64,
+    pub sale_count: i64,
+    pub value_flow_count: i64,
+    pub gross_revenue_eth: f64,
+    pub gross_revenue_usd: f64,
+    #[serde(default)]
+    pub operator_revenue_eth: f64,
+    #[serde(default)]
+    pub operator_revenue_usd: f64,
+    #[serde(default)]
+    pub marketplace_fee_eth: f64,
+    #[serde(default)]
+    pub marketplace_fee_usd: f64,
+    #[serde(default)]
+    pub funding_amount_eth: f64,
+    #[serde(default)]
+    pub funding_amount_usd: f64,
+    #[serde(default)]
+    pub withdrawal_amount_eth: f64,
+    #[serde(default)]
+    pub withdrawal_amount_usd: f64,
+    #[serde(default)]
+    pub funding_edge_count: i64,
+    #[serde(default)]
+    pub withdrawal_edge_count: i64,
+    #[serde(default)]
+    pub revenue_backflow_edge_count: i64,
+    pub first_block_number: i64,
+    pub last_block_number: i64,
+    pub first_block_time: i64,
+    pub last_block_time: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ContractLifecycleMetricPayload {
+    pub contract_address: String,
+    pub first_mint_time: i64,
+    pub first_listing_time: i64,
+    pub first_sale_time: i64,
+    pub first_victim_time: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_to_first_listing_seconds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_to_first_sale_seconds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_to_first_victim_seconds: Option<i64>,
+    pub cascade_node_count: i64,
+    pub cascade_edge_count: i64,
+    pub victim_count: i64,
+    pub sale_count: i64,
+    pub market_event_count: i64,
+    pub gross_revenue_eth: f64,
+    pub gross_revenue_usd: f64,
+    #[serde(default)]
+    pub operator_revenue_eth: f64,
+    #[serde(default)]
+    pub operator_revenue_usd: f64,
+    #[serde(default)]
+    pub marketplace_fee_eth: f64,
+    #[serde(default)]
+    pub marketplace_fee_usd: f64,
+    #[serde(default)]
+    pub funding_amount_eth: f64,
+    #[serde(default)]
+    pub funding_amount_usd: f64,
+    #[serde(default)]
+    pub withdrawal_amount_eth: f64,
+    #[serde(default)]
+    pub withdrawal_amount_usd: f64,
+    #[serde(default)]
+    pub funding_edge_count: i64,
+    #[serde(default)]
+    pub withdrawal_edge_count: i64,
+    #[serde(default)]
+    pub revenue_backflow_edge_count: i64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub top_value_recipient_address: String,
+    #[serde(default)]
+    pub top_value_recipient_eth: f64,
+    #[serde(default)]
+    pub top_value_recipient_usd: f64,
+    #[serde(default)]
+    pub top_value_recipient_share: Option<f64>,
+    #[serde(default)]
+    pub pre_sale_signal_count: i64,
+    #[serde(default)]
+    pub early_detection_positive: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WeakSupervisionLabelPayload {
+    pub entity_type: String,
+    pub contract_address: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub address: String,
+    pub label: String,
+    pub confidence: String,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_flags: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EarlyDetectionFeaturePayload {
+    pub contract_address: String,
+    pub observation_window_seconds: i64,
+    pub window_start_time: i64,
+    pub window_end_time: i64,
+    pub content_similarity_count: i64,
+    pub mint_event_count: i64,
+    pub market_event_count: i64,
+    pub value_flow_count: i64,
+    pub funding_edge_count: i64,
+    pub withdrawal_edge_count: i64,
+    pub sale_event_count: i64,
+    pub victim_signal_count: i64,
+    pub pre_sale_signal_count: i64,
+    pub weak_label: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -432,12 +756,47 @@ pub struct NftPropagationEdgePayload {
     pub event_type: String,
     pub channel: String,
     pub marketplace: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub payment_token_symbol: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub payment_token_address: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price_eth: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price_usd: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seller_fee_eth: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seller_fee_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_fee_eth: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_fee_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub royalty_fee_eth: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub royalty_fee_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub royalty_recipient_address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seconds_since_mint: Option<i64>,
+    #[serde(
+        default = "default_aggregate_count",
+        skip_serializing_if = "is_one_i64"
+    )]
+    pub aggregate_count: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub token_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tx_hashes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_block_number: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_block_time: Option<i64>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub merged_transfer: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub underlying_channels: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -482,6 +841,26 @@ pub struct SingleReportPayload {
     pub honest_addresses: Vec<HonestAddressPayload>,
     pub honest_address_stats: BTreeMap<String, HonestAddressStatsPayload>,
     pub victim_addresses: Vec<VictimAddressPayload>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub address_attributions: Vec<AddressAttributionPayload>,
+    #[serde(default)]
+    pub contract_lifecycle_events: Vec<ContractLifecycleEventPayload>,
+    #[serde(default)]
+    pub address_evidence_features: Vec<AddressEvidenceFeaturePayload>,
+    #[serde(default)]
+    pub value_flow_edges: Vec<ValueFlowEdgePayload>,
+    #[serde(default)]
+    pub content_similarity_edges: Vec<ContentSimilarityEdgePayload>,
+    #[serde(default)]
+    pub campaign_clusters: Vec<CampaignClusterPayload>,
+    #[serde(default)]
+    pub lifecycle_metrics: Vec<ContractLifecycleMetricPayload>,
+    #[serde(default)]
+    pub weak_supervision_labels: Vec<WeakSupervisionLabelPayload>,
+    #[serde(default)]
+    pub early_detection_features: Vec<EarlyDetectionFeaturePayload>,
+    #[serde(default)]
+    pub market_events: Vec<NftMarketEventRecord>,
     pub fraud_trade_stats: BTreeMap<String, FraudTradeStatsPayload>,
     #[serde(default)]
     pub nft_propagation_paths: BTreeMap<String, NftPropagationPathPayload>,

@@ -57,6 +57,9 @@ struct BatchPipelineProbe {
     metadata_calls: AtomicUsize,
     metadata_current: AtomicUsize,
     metadata_max_seen: AtomicUsize,
+    candidate_metadata_calls: AtomicUsize,
+    candidate_metadata_current: AtomicUsize,
+    candidate_metadata_max_seen: AtomicUsize,
     snapshot_calls: AtomicUsize,
 }
 
@@ -157,10 +160,23 @@ impl AnalyzeApi for InstrumentedBatchApi {
         _opensea_api_key: &str,
         contract_address: &str,
     ) -> Result<ContractMetadata, AppError> {
-        self.probe.metadata_calls.fetch_add(1, Ordering::SeqCst);
-        let current = self.probe.metadata_current.fetch_add(1, Ordering::SeqCst) + 1;
-        BatchPipelineProbe::record_max(&self.probe.metadata_max_seen, current);
-        if contract_address == "0xseed2" {
+        let is_seed_contract = contract_address.starts_with("0xseed");
+        if is_seed_contract {
+            self.probe.metadata_calls.fetch_add(1, Ordering::SeqCst);
+            let current = self.probe.metadata_current.fetch_add(1, Ordering::SeqCst) + 1;
+            BatchPipelineProbe::record_max(&self.probe.metadata_max_seen, current);
+        } else {
+            self.probe
+                .candidate_metadata_calls
+                .fetch_add(1, Ordering::SeqCst);
+            let current = self
+                .probe
+                .candidate_metadata_current
+                .fetch_add(1, Ordering::SeqCst)
+                + 1;
+            BatchPipelineProbe::record_max(&self.probe.candidate_metadata_max_seen, current);
+        }
+        if is_seed_contract && contract_address == "0xseed2" {
             let mut waited = 0;
             while !self.probe.seed_one_snapshot_active.load(Ordering::SeqCst) && waited < 100 {
                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -172,7 +188,7 @@ impl AnalyzeApi for InstrumentedBatchApi {
                     .store(true, Ordering::SeqCst);
             }
         }
-        if self.emit_native_sale && contract_address == "0xseed2" {
+        if is_seed_contract && self.emit_native_sale && contract_address == "0xseed2" {
             let mut waited = 0;
             while self.probe.transfer_current.load(Ordering::SeqCst) == 0 && waited < 500 {
                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -180,13 +196,22 @@ impl AnalyzeApi for InstrumentedBatchApi {
             }
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
-        self.probe.metadata_current.fetch_sub(1, Ordering::SeqCst);
+        if is_seed_contract {
+            self.probe.metadata_current.fetch_sub(1, Ordering::SeqCst);
+        } else {
+            self.probe
+                .candidate_metadata_current
+                .fetch_sub(1, Ordering::SeqCst);
+        }
         Ok(ContractMetadata {
             chain: chain.to_string(),
             contract_address: contract_address.to_string(),
             token_type: "ERC721".into(),
             contract_deployer: "0xcreator".into(),
             deployed_block_number: 1,
+            owner_address: String::new(),
+            admin_address: String::new(),
+            proxy_admin_address: String::new(),
             name: format!("Seed {}", contract_address.trim_start_matches("0x")),
             symbol: "SEED".into(),
         })
@@ -346,6 +371,7 @@ impl AnalyzeApi for InstrumentedBatchApi {
                 protocol_fee_usd: 0.0,
                 royalty_fee_eth: 0.0,
                 royalty_fee_usd: 0.0,
+                royalty_recipient_address: String::new(),
                 source: "opensea".into(),
                 is_native_eth: true,
             }]);
@@ -451,6 +477,9 @@ impl AnalyzeApi for FakeBatchApi {
             token_type: "ERC721".into(),
             contract_deployer: "0xcreator".into(),
             deployed_block_number: 1,
+            owner_address: String::new(),
+            admin_address: String::new(),
+            proxy_admin_address: String::new(),
             name: format!("Seed {}", &contract_address[2..]),
             symbol: "SEED".into(),
         })
@@ -1114,6 +1143,9 @@ impl AnalyzeApi for SlowBatchApi {
             token_type: "ERC721".into(),
             contract_deployer: "0xcreator".into(),
             deployed_block_number: 1,
+            owner_address: String::new(),
+            admin_address: String::new(),
+            proxy_admin_address: String::new(),
             name: format!("Seed {}", &contract_address[2..]),
             symbol: "SEED".into(),
         })
@@ -1409,6 +1441,7 @@ async fn batch_limits_seed_metadata_fetches_globally() {
 
     assert_eq!(probe.metadata_calls.load(Ordering::SeqCst), 3);
     assert_eq!(probe.metadata_max_seen.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.candidate_metadata_calls.load(Ordering::SeqCst), 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1452,6 +1485,8 @@ async fn batch_limits_contract_analysis_globally_across_seeds() {
     assert_eq!(probe.holder_max_seen.load(Ordering::SeqCst), 1);
     assert_eq!(probe.expansion_max_seen.load(Ordering::SeqCst), 1);
     assert_eq!(probe.metadata_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(probe.candidate_metadata_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(probe.candidate_metadata_max_seen.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

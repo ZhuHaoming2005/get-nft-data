@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::models::{
-    DuplicateCandidate, FraudTradeStatsPayload, HonestAddressPayload, HonestAddressStatsPayload,
-    InfringingTokenRecord, MaliciousAddressPayload, NftSaleRecord, OwnerBalance, TransferRecord,
+    AddressAttributionPayload, AddressEvidencePayload, DuplicateCandidate, FraudTradeStatsPayload,
+    HonestAddressPayload, HonestAddressStatsPayload, InfringingTokenRecord,
+    MaliciousAddressPayload, NftSaleRecord, OwnerBalance, TransferRecord, ValueFlowEdgePayload,
     VictimAddressPayload, ZERO_ADDRESS,
 };
 
@@ -13,6 +14,14 @@ pub struct SaleMetricRecord {
     pub buy_asset_ratio: Option<f64>,
     pub buy_asset_ratio_with_gas: Option<f64>,
     pub ratio_status: String,
+}
+
+pub(crate) fn sale_metric_key(tx_hash: &str, buyer_address: &str) -> String {
+    format!(
+        "{}|{}",
+        tx_hash.trim().to_lowercase(),
+        buyer_address.trim().to_lowercase()
+    )
 }
 
 pub(crate) struct PreparedContractActivity<'a> {
@@ -279,6 +288,7 @@ pub(crate) fn build_malicious_address_records_from_activity(
 
     let mut outgoing: HashMap<String, HashSet<String>> = HashMap::new();
     let mut cycle_counts: HashMap<String, i64> = HashMap::new();
+    let mut sale_seller_counts: HashMap<String, i64> = HashMap::new();
     let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
     let mut rapid_addresses: HashSet<String> = HashSet::new();
     let mut mint_times: HashMap<String, i64> = HashMap::new();
@@ -324,10 +334,25 @@ pub(crate) fn build_malicious_address_records_from_activity(
         }
     }
 
+    for sale in &activity.sorted_sales {
+        if !relevant_token_ids.is_empty() && !relevant_token_ids.contains(&sale.token_id) {
+            continue;
+        }
+        if !sale.seller_address.is_empty() {
+            *sale_seller_counts
+                .entry(sale.seller_address.clone())
+                .or_insert(0) += 1;
+        }
+        if !sale.buyer_address.is_empty() {
+            receiver_candidates.insert(sale.buyer_address.clone());
+        }
+    }
+
     let mut candidate_addresses: Vec<String> = mint_addresses
         .iter()
         .cloned()
         .chain(outgoing.keys().cloned())
+        .chain(sale_seller_counts.keys().cloned())
         .chain(receiver_candidates)
         .collect::<HashSet<_>>()
         .into_iter()
@@ -343,7 +368,16 @@ pub(crate) fn build_malicious_address_records_from_activity(
         let wash_cycle_count = *cycle_counts.get(&address).unwrap_or(&0);
         let star_out_degree = outgoing.get(&address).map(|value| value.len()).unwrap_or(0) as i64;
         let is_star_distributor = star_out_degree >= 3;
-        if !mint_role && wash_cycle_count == 0 && !is_star_distributor {
+        let sale_seller_count = *sale_seller_counts.get(&address).unwrap_or(&0);
+        let rapid_spread = rapid_addresses.contains(&address);
+        let attacker_like_seller =
+            sale_seller_count > 0 && (mint_role || is_star_distributor || rapid_spread);
+        let high_volume_seller = sale_seller_count >= 3;
+        if wash_cycle_count == 0
+            && !is_star_distributor
+            && !attacker_like_seller
+            && !high_volume_seller
+        {
             continue;
         }
         rows.push(MaliciousAddressPayload {
@@ -351,7 +385,7 @@ pub(crate) fn build_malicious_address_records_from_activity(
             mint_role,
             wash_cycle_count,
             star_out_degree,
-            rapid_spread_contracts: if rapid_addresses.contains(&address) {
+            rapid_spread_contracts: if rapid_spread {
                 vec![contract_address.to_string()]
             } else {
                 vec![]
@@ -360,6 +394,465 @@ pub(crate) fn build_malicious_address_records_from_activity(
         });
     }
     rows
+}
+
+#[derive(Default)]
+struct AttributionAccumulator {
+    roles: BTreeSet<String>,
+    attacker_score: f64,
+    operator_score: f64,
+    colluder_score: f64,
+    victim_score: f64,
+    corruption_score: f64,
+    neutral_score: f64,
+    evidence: Vec<AddressEvidencePayload>,
+}
+
+fn attribution_entry<'a>(
+    rows: &'a mut BTreeMap<String, AttributionAccumulator>,
+    address: &str,
+) -> Option<&'a mut AttributionAccumulator> {
+    let address = address.trim().to_lowercase();
+    if address.is_empty() || address == ZERO_ADDRESS {
+        return None;
+    }
+    Some(rows.entry(address).or_default())
+}
+
+#[derive(Clone, Copy)]
+enum EvidenceBucket {
+    Operator,
+    Colluder,
+    Victim,
+    Corruption,
+    Neutral,
+}
+
+struct EvidenceInput<'a> {
+    contract_address: &'a str,
+    address: &'a str,
+    role: &'a str,
+    evidence_type: &'a str,
+    token_id: &'a str,
+    tx_hash: &'a str,
+    weight: f64,
+    detail: &'a str,
+    bucket: EvidenceBucket,
+}
+
+fn add_attribution_evidence(
+    rows: &mut BTreeMap<String, AttributionAccumulator>,
+    input: EvidenceInput<'_>,
+) {
+    let Some(entry) = attribution_entry(rows, input.address) else {
+        return;
+    };
+    entry.roles.insert(input.role.to_string());
+    match input.bucket {
+        EvidenceBucket::Operator => {
+            entry.operator_score += input.weight;
+            entry.attacker_score += input.weight;
+        }
+        EvidenceBucket::Colluder => {
+            entry.colluder_score += input.weight;
+            entry.attacker_score += input.weight;
+        }
+        EvidenceBucket::Victim => {
+            entry.victim_score += input.weight;
+        }
+        EvidenceBucket::Corruption => {
+            entry.corruption_score += input.weight;
+        }
+        EvidenceBucket::Neutral => {
+            entry.neutral_score += input.weight;
+        }
+    }
+    entry.evidence.push(AddressEvidencePayload {
+        evidence_type: input.evidence_type.to_string(),
+        contract_address: input.contract_address.to_string(),
+        token_id: input.token_id.to_string(),
+        tx_hash: input.tx_hash.to_string(),
+        weight: input.weight,
+        detail: input.detail.to_string(),
+    });
+}
+
+fn attribution_confidence(
+    operator_score: f64,
+    colluder_score: f64,
+    victim_score: f64,
+    corruption_score: f64,
+) -> String {
+    let best = operator_score
+        .max(colluder_score)
+        .max(victim_score)
+        .max(corruption_score);
+    let second = [
+        operator_score,
+        colluder_score,
+        victim_score,
+        corruption_score,
+    ]
+    .into_iter()
+    .filter(|value| *value < best)
+    .max_by(|left, right| left.total_cmp(right))
+    .unwrap_or(0.0);
+    let margin = best - second;
+    if best >= 0.75 && margin >= 0.25 {
+        "high".into()
+    } else if best >= 0.45 {
+        "medium".into()
+    } else {
+        "low".into()
+    }
+}
+
+fn attribution_label(
+    operator_score: f64,
+    colluder_score: f64,
+    victim_score: f64,
+    corruption_score: f64,
+    neutral_score: f64,
+) -> String {
+    if corruption_score >= 0.40 && victim_score >= 0.20 {
+        return "corrupted_victim".into();
+    }
+    if operator_score >= 0.25 && operator_score >= victim_score && operator_score >= colluder_score
+    {
+        return "suspected_operator".into();
+    }
+    if colluder_score >= 0.25 && colluder_score >= victim_score {
+        return "suspected_colluder".into();
+    }
+    if victim_score >= 0.45 && victim_score >= operator_score && victim_score >= colluder_score {
+        return "likely_victim".into();
+    }
+    if neutral_score >= 0.20 {
+        return "neutral_participant".into();
+    }
+    "neutral_participant".into()
+}
+
+pub fn build_address_attribution_records(
+    contract_address: &str,
+    infringing_tokens: &[InfringingTokenRecord],
+    sales: &[NftSaleRecord],
+    mint_payment_edges: &[ValueFlowEdgePayload],
+    malicious_addresses: &[MaliciousAddressPayload],
+    honest_addresses: &[HonestAddressPayload],
+    victim_addresses: &[VictimAddressPayload],
+) -> Vec<AddressAttributionPayload> {
+    let relevant_token_ids: HashSet<String> = infringing_tokens
+        .iter()
+        .filter_map(|item| (!item.token_id.is_empty()).then(|| item.token_id.clone()))
+        .collect();
+    let mut rows = BTreeMap::<String, AttributionAccumulator>::new();
+
+    for token in infringing_tokens {
+        add_attribution_evidence(
+            &mut rows,
+            EvidenceInput {
+                contract_address,
+                address: &token.minter_address,
+                role: "mint_recipient",
+                evidence_type: "mint_recipient",
+                token_id: &token.token_id,
+                tx_hash: &token.mint_tx_hash,
+                weight: 0.10,
+                detail: "mint recipient is weak evidence only; paid mints may be victims",
+                bucket: EvidenceBucket::Neutral,
+            },
+        );
+        if token.official_or_legit_reissue {
+            if let Some(entry) = attribution_entry(&mut rows, &token.minter_address) {
+                entry.roles.insert("official_reissue".into());
+            }
+        }
+    }
+
+    for edge in mint_payment_edges {
+        if edge.channel != "mint_payment"
+            || !edge.contract_address.eq_ignore_ascii_case(contract_address)
+            || edge.from_address.is_empty()
+            || (edge.value_eth.unwrap_or(0.0) <= 0.0 && edge.value_usd.unwrap_or(0.0) <= 0.0)
+        {
+            continue;
+        }
+        let paid_to_controlled_recipient =
+            matches!(
+                edge.to_role.as_str(),
+                "mint_contract"
+                    | "contract_deployer"
+                    | "contract_owner"
+                    | "contract_admin"
+                    | "proxy_admin"
+                    | "operator_wallet"
+            ) || edge.to_address.eq_ignore_ascii_case(contract_address);
+        if !paid_to_controlled_recipient {
+            continue;
+        }
+        add_attribution_evidence(
+            &mut rows,
+            EvidenceInput {
+                contract_address,
+                address: &edge.from_address,
+                role: "paid_minter",
+                evidence_type: "paid_mint_payment",
+                token_id: &edge.token_id,
+                tx_hash: &edge.tx_hash,
+                weight: 0.45,
+                detail: "address paid native or priced value to mint a copied NFT without independent operator evidence",
+                bucket: EvidenceBucket::Victim,
+            },
+        );
+    }
+
+    for item in malicious_addresses {
+        if item.mint_role {
+            add_attribution_evidence(
+                &mut rows,
+                EvidenceInput {
+                    contract_address,
+                    address: &item.address,
+                    role: "suspicious_mint_actor",
+                    evidence_type: "mint_role_with_behavior",
+                    token_id: "",
+                    tx_hash: "",
+                    weight: 0.15,
+                    detail: "mint role combined with other suspicious propagation behavior",
+                    bucket: EvidenceBucket::Operator,
+                },
+            );
+        }
+        if item.wash_cycle_count > 0 {
+            add_attribution_evidence(
+                &mut rows,
+                EvidenceInput {
+                    contract_address,
+                    address: &item.address,
+                    role: "wash_cycle",
+                    evidence_type: "wash_cycle",
+                    token_id: "",
+                    tx_hash: "",
+                    weight: 0.35,
+                    detail: "address participates in reciprocal transfer cycles",
+                    bucket: EvidenceBucket::Operator,
+                },
+            );
+        }
+        if item.star_out_degree >= 3 {
+            add_attribution_evidence(
+                &mut rows,
+                EvidenceInput {
+                    contract_address,
+                    address: &item.address,
+                    role: "star_distributor",
+                    evidence_type: "star_distribution",
+                    token_id: "",
+                    tx_hash: "",
+                    weight: 0.30,
+                    detail: "address distributes copied NFTs to many unique receivers",
+                    bucket: EvidenceBucket::Operator,
+                },
+            );
+        }
+        if !item.rapid_spread_contracts.is_empty() {
+            add_attribution_evidence(
+                &mut rows,
+                EvidenceInput {
+                    contract_address,
+                    address: &item.address,
+                    role: "rapid_spreader",
+                    evidence_type: "rapid_spread",
+                    token_id: "",
+                    tx_hash: "",
+                    weight: 0.20,
+                    detail: "address appears in propagation within 24 hours of mint",
+                    bucket: EvidenceBucket::Colluder,
+                },
+            );
+        }
+    }
+
+    for sale in sales {
+        if !sale.contract_address.eq_ignore_ascii_case(contract_address) {
+            continue;
+        }
+        if !relevant_token_ids.is_empty() && !relevant_token_ids.contains(&sale.token_id) {
+            continue;
+        }
+        let seller_key = sale.seller_address.trim().to_lowercase();
+        let seller_context = rows.get(&seller_key).map(|entry| {
+            if entry.operator_score > 0.0 {
+                Some(EvidenceBucket::Operator)
+            } else if entry.colluder_score > 0.0 {
+                Some(EvidenceBucket::Colluder)
+            } else {
+                None
+            }
+        });
+        let (seller_bucket, seller_weight, seller_detail) =
+            if let Some(Some(bucket)) = seller_context {
+                (
+                bucket,
+                0.10,
+                "address sold copied NFT and already has independent operator or colluder evidence",
+            )
+            } else {
+                (
+                EvidenceBucket::Neutral,
+                0.10,
+                "sale alone is weak evidence; ordinary paid minters or resellers may be victims",
+            )
+            };
+        add_attribution_evidence(
+            &mut rows,
+            EvidenceInput {
+                contract_address,
+                address: &sale.seller_address,
+                role: "seller",
+                evidence_type: "infringing_sale_seller",
+                token_id: &sale.token_id,
+                tx_hash: &sale.tx_hash,
+                weight: seller_weight,
+                detail: seller_detail,
+                bucket: seller_bucket,
+            },
+        );
+        add_attribution_evidence(
+            &mut rows,
+            EvidenceInput {
+                contract_address,
+                address: &sale.buyer_address,
+                role: "buyer",
+                evidence_type: "marketplace_purchase",
+                token_id: &sale.token_id,
+                tx_hash: &sale.tx_hash,
+                weight: if sale.price_eth.unwrap_or(0.0) > 0.0
+                    || sale.price_usd.unwrap_or(0.0) > 0.0
+                {
+                    0.50
+                } else {
+                    0.30
+                },
+                detail: "address bought the copied NFT through a sale event",
+                bucket: EvidenceBucket::Victim,
+            },
+        );
+    }
+
+    for item in victim_addresses {
+        add_attribution_evidence(
+            &mut rows,
+            EvidenceInput {
+                contract_address,
+                address: &item.address,
+                role: "victim_candidate",
+                evidence_type: "victim_purchase_profile",
+                token_id: "",
+                tx_hash: &item.last_buy_tx_hash,
+                weight: 0.20,
+                detail: "address has a purchase profile in the victim candidate set",
+                bucket: EvidenceBucket::Victim,
+            },
+        );
+        if item.is_stuck {
+            add_attribution_evidence(
+                &mut rows,
+                EvidenceInput {
+                    contract_address,
+                    address: &item.address,
+                    role: "stuck_victim",
+                    evidence_type: "stuck_holder",
+                    token_id: "",
+                    tx_hash: &item.last_buy_tx_hash,
+                    weight: 0.25,
+                    detail: "address still holds the copied NFT after purchase with no later outgoing transfer",
+                    bucket: EvidenceBucket::Victim,
+                },
+            );
+        }
+        if item
+            .buy_asset_ratio
+            .map(|ratio| ratio >= 0.60)
+            .unwrap_or(false)
+        {
+            add_attribution_evidence(
+                &mut rows,
+                EvidenceInput {
+                    contract_address,
+                    address: &item.address,
+                    role: "high_exposure_buyer",
+                    evidence_type: "high_purchase_balance_ratio",
+                    token_id: "",
+                    tx_hash: &item.last_buy_tx_hash,
+                    weight: 0.15,
+                    detail: "purchase consumed a high share of the observed wallet balance",
+                    bucket: EvidenceBucket::Victim,
+                },
+            );
+        }
+    }
+
+    for item in honest_addresses {
+        if let Some(entry) = attribution_entry(&mut rows, &item.address) {
+            entry.roles.insert("honest_holder".into());
+            entry.neutral_score += 0.20;
+        }
+        if item.is_corrupted_address {
+            add_attribution_evidence(
+                &mut rows,
+                EvidenceInput {
+                    contract_address,
+                    address: &item.address,
+                    role: "corrupted_honest",
+                    evidence_type: "corrupted_honest_resale",
+                    token_id: "",
+                    tx_hash: "",
+                    weight: 0.45,
+                    detail:
+                        "address otherwise looks like a participant but also propagates copied NFTs",
+                    bucket: EvidenceBucket::Corruption,
+                },
+            );
+        }
+    }
+
+    rows.into_iter()
+        .map(|(address, row)| {
+            let operator_score = row.operator_score.clamp(0.0, 1.0);
+            let colluder_score = row.colluder_score.clamp(0.0, 1.0);
+            let attacker_score = row.attacker_score.clamp(0.0, 1.0);
+            let victim_score = row.victim_score.clamp(0.0, 1.0);
+            let corruption_score = row.corruption_score.clamp(0.0, 1.0);
+            let neutral_score = row.neutral_score.clamp(0.0, 1.0);
+            AddressAttributionPayload {
+                contract_address: contract_address.to_string(),
+                address,
+                observed_roles: row.roles.into_iter().collect(),
+                attribution_label: attribution_label(
+                    operator_score,
+                    colluder_score,
+                    victim_score,
+                    corruption_score,
+                    neutral_score,
+                ),
+                operator_score,
+                colluder_score,
+                attacker_score,
+                victim_score,
+                corruption_score,
+                neutral_score,
+                confidence: attribution_confidence(
+                    operator_score,
+                    colluder_score,
+                    victim_score,
+                    corruption_score,
+                ),
+                evidence: row.evidence,
+            }
+        })
+        .collect()
 }
 
 pub fn build_victim_address_records(
@@ -383,8 +876,10 @@ pub(crate) fn build_victim_address_records_from_activity(
         if sale.buyer_address.is_empty() {
             continue;
         }
+        let metric_key = sale_metric_key(&sale.tx_hash, &sale.buyer_address);
         let metrics = sale_metrics_by_tx
-            .get(&sale.tx_hash)
+            .get(&metric_key)
+            .or_else(|| sale_metrics_by_tx.get(&sale.tx_hash))
             .cloned()
             .unwrap_or_default();
         let later_transfer_out = activity
@@ -514,20 +1009,28 @@ pub(crate) fn build_honest_address_records_from_activity(
         .collect();
 
     let mut all_addresses: HashSet<String> = HashSet::new();
+    let mut non_mint_transfer_participants: HashSet<String> = HashSet::new();
+    let mut sale_participants: HashSet<String> = HashSet::new();
     for transfer in &relevant_transfers {
         if !transfer.from_address.is_empty() && transfer.from_address != ZERO_ADDRESS {
             all_addresses.insert(transfer.from_address.clone());
+            non_mint_transfer_participants.insert(transfer.from_address.clone());
         }
         if !transfer.to_address.is_empty() && transfer.to_address != ZERO_ADDRESS {
             all_addresses.insert(transfer.to_address.clone());
+            if transfer.from_address != ZERO_ADDRESS {
+                non_mint_transfer_participants.insert(transfer.to_address.clone());
+            }
         }
     }
     for sale in &relevant_sales {
         if !sale.buyer_address.is_empty() {
             all_addresses.insert(sale.buyer_address.clone());
+            sale_participants.insert(sale.buyer_address.clone());
         }
         if !sale.seller_address.is_empty() {
             all_addresses.insert(sale.seller_address.clone());
+            sale_participants.insert(sale.seller_address.clone());
         }
     }
     for address in owner_token_map.keys() {
@@ -536,7 +1039,13 @@ pub(crate) fn build_honest_address_records_from_activity(
 
     let mut honest_addresses: Vec<String> = all_addresses
         .into_iter()
-        .filter(|address| !address.is_empty() && !malicious_set.contains(address))
+        .filter(|address| {
+            !address.is_empty()
+                && !malicious_set.contains(address)
+                && (owner_token_map.contains_key(address)
+                    || non_mint_transfer_participants.contains(address)
+                    || sale_participants.contains(address))
+        })
         .collect();
     honest_addresses.sort();
     let honest_set: HashSet<String> = honest_addresses.iter().cloned().collect();
