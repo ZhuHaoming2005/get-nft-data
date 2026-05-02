@@ -3063,6 +3063,12 @@ fn single_report_markdown_preserves_summary_sections_only() {
             stuck_cost_eth: 6.5,
             stuck_cost_usd: 6.5,
             stuck_cost_ratio: Some(0.65),
+            secondary_sale_victim_purchase_total_usd: 10.0,
+            secondary_sale_stuck_cost_usd: 6.5,
+            secondary_sale_stuck_cost_ratio: Some(0.65),
+            victim_acquisition_total_usd: 10.0,
+            victim_acquisition_stuck_cost_usd: 6.5,
+            victim_acquisition_stuck_cost_ratio: Some(0.65),
             buy_asset_ratio_known_address_count: 5,
             ratio_over_60_address_count: 3,
             ratio_over_60_address_ratio: Some(0.6),
@@ -3076,6 +3082,7 @@ fn single_report_markdown_preserves_summary_sections_only() {
             avg_mint_to_first_transfer_seconds: Some(8.0),
             median_mint_to_first_transfer_seconds: Some(7.0),
             avg_unique_receiver_count: Some(4.0),
+            ..ReportSummary::default()
         },
         duplicate_contracts: vec![
             DuplicateContractPayload {
@@ -3183,7 +3190,8 @@ fn single_report_markdown_preserves_summary_sections_only() {
     assert!(markdown.contains("- 检测到开放许可: 是"));
     assert!(markdown.contains("- 恶意地址数: 4"));
     assert!(markdown.contains("- 候选侧开放许可 token 数: 6"));
-    assert!(markdown.contains("- 套牢资金(USD): 6.5 / 65.00%"));
+    assert!(markdown.contains("- 受害者套牢成本合计(USD): 6.5 / 65.00%"));
+    assert!(markdown.contains("- 二级市场受害者购买额(USD): 10"));
     assert!(markdown.contains("- 买入金额占钱包总额 >60% 的地址数/占比: 3 / 60.00%"));
     assert!(markdown.contains("## 种子集合统计"));
     assert!(markdown.contains("- 拉取到的种子 NFT 数: 10"));

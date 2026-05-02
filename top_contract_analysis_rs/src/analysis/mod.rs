@@ -1270,6 +1270,9 @@ async fn analyze_seed_contract_with_limits(
             &honest_addresses,
             &victim_addresses,
             &address_signals,
+            &address_attributions,
+            &lifecycle_outputs.value_flow_edges,
+            &nft_propagation_paths,
         ),
         duplicate_contracts,
         legit_duplicates,
@@ -1775,6 +1778,7 @@ fn classify_mint_value_flow_transfer(
             .from_address
             .eq_ignore_ascii_case(&lookup.minter_address)
         && !transfer.from_address.eq_ignore_ascii_case(ZERO_ADDRESS)
+        && transfer.category != "erc20"
     {
         return Some((
             "funding".into(),
@@ -2992,6 +2996,151 @@ fn build_contract_level_summary(
         .collect()
 }
 
+#[derive(Clone, Debug, Default)]
+struct AcquisitionCostStats {
+    paid_mint_victim_cost_eth: f64,
+    paid_mint_victim_cost_usd: f64,
+    paid_mint_victim_edge_count: i64,
+    paid_mint_victim_address_count: i64,
+    paid_mint_stuck_cost_eth: f64,
+    paid_mint_stuck_cost_usd: f64,
+    paid_mint_stuck_edge_count: i64,
+    paid_mint_stuck_token_count: i64,
+    stablecoin_erc20_value_usd: f64,
+    stablecoin_erc20_edge_count: i64,
+    value_flow_priced_edge_count: i64,
+    value_flow_unpriced_edge_count: i64,
+}
+
+fn build_acquisition_cost_stats(
+    address_attributions: &[AddressAttributionPayload],
+    value_flow_edges: &[ValueFlowEdgePayload],
+    propagation_paths: &BTreeMap<String, NftPropagationPathPayload>,
+) -> AcquisitionCostStats {
+    let paid_mint_victim_addresses = paid_mint_victim_address_set(address_attributions);
+    let mut stats = AcquisitionCostStats {
+        paid_mint_victim_address_count: paid_mint_victim_addresses.len() as i64,
+        ..AcquisitionCostStats::default()
+    };
+
+    for edge in value_flow_edges {
+        if edge.value_usd.unwrap_or_default() > 0.0 {
+            stats.value_flow_priced_edge_count += 1;
+        } else if edge.value_eth.unwrap_or_default() > 0.0 {
+            stats.value_flow_unpriced_edge_count += 1;
+        }
+        if is_stablecoin_symbol(&edge.payment_token_symbol)
+            && edge.value_usd.unwrap_or_default() > 0.0
+        {
+            stats.stablecoin_erc20_edge_count += 1;
+            stats.stablecoin_erc20_value_usd += edge.value_usd.unwrap_or_default();
+        }
+        if edge.channel != "mint_payment" {
+            continue;
+        }
+        let payer = normalized_address(&edge.from_address);
+        if payer.is_empty() || !paid_mint_victim_addresses.contains(&payer) {
+            continue;
+        }
+        stats.paid_mint_victim_edge_count += 1;
+        stats.paid_mint_victim_cost_eth += edge.value_eth.unwrap_or_default();
+        stats.paid_mint_victim_cost_usd += edge.value_usd.unwrap_or_default();
+
+        let (stuck_token_count, total_token_count) =
+            paid_mint_stuck_token_counts(edge, propagation_paths);
+        if stuck_token_count > 0 && total_token_count > 0 {
+            let stuck_fraction = stuck_token_count as f64 / total_token_count as f64;
+            stats.paid_mint_stuck_edge_count += 1;
+            stats.paid_mint_stuck_token_count += stuck_token_count as i64;
+            stats.paid_mint_stuck_cost_eth += edge.value_eth.unwrap_or_default() * stuck_fraction;
+            stats.paid_mint_stuck_cost_usd += edge.value_usd.unwrap_or_default() * stuck_fraction;
+        }
+    }
+
+    stats
+}
+
+fn paid_mint_victim_address_set(
+    address_attributions: &[AddressAttributionPayload],
+) -> BTreeSet<String> {
+    address_attributions
+        .iter()
+        .filter(|item| is_victim_attribution_label(&item.attribution_label))
+        .filter(|item| {
+            item.evidence
+                .iter()
+                .any(|evidence| evidence.evidence_type == "paid_mint_payment")
+        })
+        .map(|item| normalized_address(&item.address))
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn is_victim_attribution_label(label: &str) -> bool {
+    matches!(label, "likely_victim" | "corrupted_victim")
+}
+
+fn normalized_address(address: &str) -> String {
+    address.trim().to_lowercase()
+}
+
+fn paid_mint_stuck_token_counts(
+    edge: &ValueFlowEdgePayload,
+    propagation_paths: &BTreeMap<String, NftPropagationPathPayload>,
+) -> (usize, usize) {
+    let token_ids = value_flow_token_ids(edge);
+    if token_ids.is_empty() {
+        return (0, 0);
+    }
+    let Some(path) = propagation_paths.get(&edge.contract_address).or_else(|| {
+        propagation_paths.values().find(|path| {
+            path.contract_address
+                .eq_ignore_ascii_case(&edge.contract_address)
+        })
+    }) else {
+        return (0, token_ids.len());
+    };
+    let payer = normalized_address(&edge.from_address);
+    let mut stuck_count = 0usize;
+    for token_id in &token_ids {
+        if path
+            .token_paths
+            .iter()
+            .find(|token_path| token_path.token_id == *token_id)
+            .map(|token_path| {
+                token_path
+                    .current_holder_addresses
+                    .iter()
+                    .any(|holder| normalized_address(holder) == payer)
+            })
+            .unwrap_or(false)
+        {
+            stuck_count += 1;
+        }
+    }
+    (stuck_count, token_ids.len())
+}
+
+fn value_flow_token_ids(edge: &ValueFlowEdgePayload) -> Vec<String> {
+    let mut token_ids = Vec::new();
+    for token_id in edge.token_id.split(',') {
+        let token_id = token_id.trim();
+        if !token_id.is_empty() {
+            token_ids.push(token_id.to_string());
+        }
+    }
+    token_ids.sort();
+    token_ids.dedup();
+    token_ids
+}
+
+fn is_stablecoin_symbol(symbol: &str) -> bool {
+    matches!(
+        symbol.trim().to_ascii_uppercase().as_str(),
+        "USDC" | "USDT" | "DAI" | "USDS" | "PYUSD" | "FRAX" | "LUSD" | "TUSD"
+    )
+}
+
 fn build_report_summary(
     open_license: bool,
     grouped: &BTreeMap<String, Vec<usize>>,
@@ -3001,6 +3150,9 @@ fn build_report_summary(
     honest_addresses: &[HonestAddressPayload],
     victim_addresses: &[VictimAddressPayload],
     address_signals: &BTreeMap<String, AddressSignalPayload>,
+    address_attributions: &[AddressAttributionPayload],
+    value_flow_edges: &[ValueFlowEdgePayload],
+    propagation_paths: &BTreeMap<String, NftPropagationPathPayload>,
 ) -> ReportSummary {
     let infringing_nft_count = infringing_tokens
         .iter()
@@ -3096,6 +3248,34 @@ fn build_report_summary(
         .values()
         .map(|signal| signal.unique_receiver_count as f64)
         .collect();
+    let acquisition_stats =
+        build_acquisition_cost_stats(address_attributions, value_flow_edges, propagation_paths);
+    let secondary_sale_victim_purchase_total_eth = honest_purchase_total_eth;
+    let secondary_sale_victim_purchase_total_usd = honest_purchase_total_usd;
+    let secondary_sale_stuck_cost_eth = stuck_cost_eth;
+    let secondary_sale_stuck_cost_usd = stuck_cost_usd;
+    let secondary_sale_stuck_cost_ratio = if secondary_sale_victim_purchase_total_usd > 0.0 {
+        Some(secondary_sale_stuck_cost_usd / secondary_sale_victim_purchase_total_usd)
+    } else if secondary_sale_victim_purchase_total_eth > 0.0 {
+        Some(secondary_sale_stuck_cost_eth / secondary_sale_victim_purchase_total_eth)
+    } else {
+        None
+    };
+    let victim_acquisition_total_eth =
+        secondary_sale_victim_purchase_total_eth + acquisition_stats.paid_mint_victim_cost_eth;
+    let victim_acquisition_total_usd =
+        secondary_sale_victim_purchase_total_usd + acquisition_stats.paid_mint_victim_cost_usd;
+    let victim_acquisition_stuck_cost_eth =
+        secondary_sale_stuck_cost_eth + acquisition_stats.paid_mint_stuck_cost_eth;
+    let victim_acquisition_stuck_cost_usd =
+        secondary_sale_stuck_cost_usd + acquisition_stats.paid_mint_stuck_cost_usd;
+    let victim_acquisition_stuck_cost_ratio = if victim_acquisition_total_usd > 0.0 {
+        Some(victim_acquisition_stuck_cost_usd / victim_acquisition_total_usd)
+    } else if victim_acquisition_total_eth > 0.0 {
+        Some(victim_acquisition_stuck_cost_eth / victim_acquisition_total_eth)
+    } else {
+        None
+    };
 
     ReportSummary {
         open_license_detected: open_license,
@@ -3118,6 +3298,28 @@ fn build_report_summary(
         } else {
             None
         },
+        secondary_sale_victim_purchase_total_eth,
+        secondary_sale_victim_purchase_total_usd,
+        secondary_sale_stuck_cost_eth,
+        secondary_sale_stuck_cost_usd,
+        secondary_sale_stuck_cost_ratio,
+        paid_mint_victim_cost_eth: acquisition_stats.paid_mint_victim_cost_eth,
+        paid_mint_victim_cost_usd: acquisition_stats.paid_mint_victim_cost_usd,
+        paid_mint_victim_edge_count: acquisition_stats.paid_mint_victim_edge_count,
+        paid_mint_victim_address_count: acquisition_stats.paid_mint_victim_address_count,
+        paid_mint_stuck_cost_eth: acquisition_stats.paid_mint_stuck_cost_eth,
+        paid_mint_stuck_cost_usd: acquisition_stats.paid_mint_stuck_cost_usd,
+        paid_mint_stuck_edge_count: acquisition_stats.paid_mint_stuck_edge_count,
+        paid_mint_stuck_token_count: acquisition_stats.paid_mint_stuck_token_count,
+        victim_acquisition_total_eth,
+        victim_acquisition_total_usd,
+        victim_acquisition_stuck_cost_eth,
+        victim_acquisition_stuck_cost_usd,
+        victim_acquisition_stuck_cost_ratio,
+        stablecoin_erc20_value_usd: acquisition_stats.stablecoin_erc20_value_usd,
+        stablecoin_erc20_edge_count: acquisition_stats.stablecoin_erc20_edge_count,
+        value_flow_priced_edge_count: acquisition_stats.value_flow_priced_edge_count,
+        value_flow_unpriced_edge_count: acquisition_stats.value_flow_unpriced_edge_count,
         buy_asset_ratio_known_address_count: ratio_known_count,
         ratio_over_60_address_count: ratio_over_60_count,
         ratio_over_60_address_ratio: if ratio_known_count > 0 {
@@ -3207,6 +3409,94 @@ fn build_batch_report_summary(seed_reports: &[BatchSeedAggregate]) -> BatchRepor
     let stuck_cost_usd_total: f64 = seed_reports
         .iter()
         .map(|item| item.report.report_summary.stuck_cost_usd)
+        .sum();
+    let secondary_sale_victim_purchase_total_eth_total: f64 = seed_reports
+        .iter()
+        .map(|item| {
+            item.report
+                .report_summary
+                .secondary_sale_victim_purchase_total_eth
+        })
+        .sum();
+    let secondary_sale_victim_purchase_total_usd_total: f64 = seed_reports
+        .iter()
+        .map(|item| {
+            item.report
+                .report_summary
+                .secondary_sale_victim_purchase_total_usd
+        })
+        .sum();
+    let secondary_sale_stuck_cost_eth_total: f64 = seed_reports
+        .iter()
+        .map(|item| item.report.report_summary.secondary_sale_stuck_cost_eth)
+        .sum();
+    let secondary_sale_stuck_cost_usd_total: f64 = seed_reports
+        .iter()
+        .map(|item| item.report.report_summary.secondary_sale_stuck_cost_usd)
+        .sum();
+    let paid_mint_victim_cost_eth_total: f64 = seed_reports
+        .iter()
+        .map(|item| item.report.report_summary.paid_mint_victim_cost_eth)
+        .sum();
+    let paid_mint_victim_cost_usd_total: f64 = seed_reports
+        .iter()
+        .map(|item| item.report.report_summary.paid_mint_victim_cost_usd)
+        .sum();
+    let paid_mint_victim_edge_count_total: i64 = seed_reports
+        .iter()
+        .map(|item| item.report.report_summary.paid_mint_victim_edge_count)
+        .sum();
+    let paid_mint_victim_address_count_total: i64 = seed_reports
+        .iter()
+        .map(|item| item.report.report_summary.paid_mint_victim_address_count)
+        .sum();
+    let paid_mint_stuck_cost_eth_total: f64 = seed_reports
+        .iter()
+        .map(|item| item.report.report_summary.paid_mint_stuck_cost_eth)
+        .sum();
+    let paid_mint_stuck_cost_usd_total: f64 = seed_reports
+        .iter()
+        .map(|item| item.report.report_summary.paid_mint_stuck_cost_usd)
+        .sum();
+    let paid_mint_stuck_edge_count_total: i64 = seed_reports
+        .iter()
+        .map(|item| item.report.report_summary.paid_mint_stuck_edge_count)
+        .sum();
+    let paid_mint_stuck_token_count_total: i64 = seed_reports
+        .iter()
+        .map(|item| item.report.report_summary.paid_mint_stuck_token_count)
+        .sum();
+    let victim_acquisition_total_eth_total: f64 = seed_reports
+        .iter()
+        .map(|item| item.report.report_summary.victim_acquisition_total_eth)
+        .sum();
+    let victim_acquisition_total_usd_total: f64 = seed_reports
+        .iter()
+        .map(|item| item.report.report_summary.victim_acquisition_total_usd)
+        .sum();
+    let victim_acquisition_stuck_cost_eth_total: f64 = seed_reports
+        .iter()
+        .map(|item| item.report.report_summary.victim_acquisition_stuck_cost_eth)
+        .sum();
+    let victim_acquisition_stuck_cost_usd_total: f64 = seed_reports
+        .iter()
+        .map(|item| item.report.report_summary.victim_acquisition_stuck_cost_usd)
+        .sum();
+    let stablecoin_erc20_value_usd_total: f64 = seed_reports
+        .iter()
+        .map(|item| item.report.report_summary.stablecoin_erc20_value_usd)
+        .sum();
+    let stablecoin_erc20_edge_count_total: i64 = seed_reports
+        .iter()
+        .map(|item| item.report.report_summary.stablecoin_erc20_edge_count)
+        .sum();
+    let value_flow_priced_edge_count_total: i64 = seed_reports
+        .iter()
+        .map(|item| item.report.report_summary.value_flow_priced_edge_count)
+        .sum();
+    let value_flow_unpriced_edge_count_total: i64 = seed_reports
+        .iter()
+        .map(|item| item.report.report_summary.value_flow_unpriced_edge_count)
         .sum();
     let buy_asset_ratio_known_address_count_total: i64 = seed_reports
         .iter()
@@ -3303,6 +3593,48 @@ fn build_batch_report_summary(seed_reports: &[BatchSeedAggregate]) -> BatchRepor
         } else {
             None
         },
+        secondary_sale_victim_purchase_total_eth_total,
+        secondary_sale_victim_purchase_total_usd_total,
+        secondary_sale_stuck_cost_eth_total,
+        secondary_sale_stuck_cost_usd_total,
+        secondary_sale_stuck_cost_ratio_overall: if secondary_sale_victim_purchase_total_usd_total
+            > 0.0
+        {
+            Some(
+                secondary_sale_stuck_cost_usd_total
+                    / secondary_sale_victim_purchase_total_usd_total,
+            )
+        } else if secondary_sale_victim_purchase_total_eth_total > 0.0 {
+            Some(
+                secondary_sale_stuck_cost_eth_total
+                    / secondary_sale_victim_purchase_total_eth_total,
+            )
+        } else {
+            None
+        },
+        paid_mint_victim_cost_eth_total,
+        paid_mint_victim_cost_usd_total,
+        paid_mint_victim_edge_count_total,
+        paid_mint_victim_address_count_total,
+        paid_mint_stuck_cost_eth_total,
+        paid_mint_stuck_cost_usd_total,
+        paid_mint_stuck_edge_count_total,
+        paid_mint_stuck_token_count_total,
+        victim_acquisition_total_eth_total,
+        victim_acquisition_total_usd_total,
+        victim_acquisition_stuck_cost_eth_total,
+        victim_acquisition_stuck_cost_usd_total,
+        victim_acquisition_stuck_cost_ratio_overall: if victim_acquisition_total_usd_total > 0.0 {
+            Some(victim_acquisition_stuck_cost_usd_total / victim_acquisition_total_usd_total)
+        } else if victim_acquisition_total_eth_total > 0.0 {
+            Some(victim_acquisition_stuck_cost_eth_total / victim_acquisition_total_eth_total)
+        } else {
+            None
+        },
+        stablecoin_erc20_value_usd_total,
+        stablecoin_erc20_edge_count_total,
+        value_flow_priced_edge_count_total,
+        value_flow_unpriced_edge_count_total,
         buy_asset_ratio_known_address_count_total,
         ratio_over_60_address_count_total,
         ratio_over_60_address_ratio_overall: if buy_asset_ratio_known_address_count_total > 0 {
@@ -3407,6 +3739,7 @@ fn build_batch_seed_aggregate(payload: SingleReportPayload) -> BatchSeedAggregat
     } else {
         None
     };
+    enrich_report_summary_acquisition_fields(&mut report_summary, &payload);
     if report_summary.median_seconds_to_honest_holder.is_none() {
         report_summary.median_seconds_to_honest_holder =
             payload_median_seconds_to_honest_holder(&payload);
@@ -3431,12 +3764,100 @@ fn build_batch_seed_aggregate(payload: SingleReportPayload) -> BatchSeedAggregat
     }
 }
 
+fn enrich_report_summary_acquisition_fields(
+    report_summary: &mut ReportSummary,
+    payload: &SingleReportPayload,
+) {
+    enrich_legacy_report_summary_fields(report_summary);
+    let acquisition_stats = build_acquisition_cost_stats(
+        &payload.address_attributions,
+        &payload.value_flow_edges,
+        &payload.nft_propagation_paths,
+    );
+    if acquisition_stats.paid_mint_victim_edge_count > 0 {
+        report_summary.paid_mint_victim_cost_eth = acquisition_stats.paid_mint_victim_cost_eth;
+        report_summary.paid_mint_victim_cost_usd = acquisition_stats.paid_mint_victim_cost_usd;
+        report_summary.paid_mint_victim_edge_count = acquisition_stats.paid_mint_victim_edge_count;
+        report_summary.paid_mint_victim_address_count =
+            acquisition_stats.paid_mint_victim_address_count;
+        report_summary.paid_mint_stuck_cost_eth = acquisition_stats.paid_mint_stuck_cost_eth;
+        report_summary.paid_mint_stuck_cost_usd = acquisition_stats.paid_mint_stuck_cost_usd;
+        report_summary.paid_mint_stuck_edge_count = acquisition_stats.paid_mint_stuck_edge_count;
+        report_summary.paid_mint_stuck_token_count = acquisition_stats.paid_mint_stuck_token_count;
+    }
+    report_summary.stablecoin_erc20_value_usd = acquisition_stats.stablecoin_erc20_value_usd;
+    report_summary.stablecoin_erc20_edge_count = acquisition_stats.stablecoin_erc20_edge_count;
+    report_summary.value_flow_priced_edge_count = acquisition_stats.value_flow_priced_edge_count;
+    report_summary.value_flow_unpriced_edge_count =
+        acquisition_stats.value_flow_unpriced_edge_count;
+    update_victim_acquisition_totals(report_summary);
+}
+
+fn enrich_legacy_report_summary_fields(report_summary: &mut ReportSummary) {
+    if report_summary.secondary_sale_victim_purchase_total_eth == 0.0 {
+        report_summary.secondary_sale_victim_purchase_total_eth =
+            report_summary.honest_purchase_total_eth;
+    }
+    if report_summary.secondary_sale_victim_purchase_total_usd == 0.0 {
+        report_summary.secondary_sale_victim_purchase_total_usd =
+            report_summary.honest_purchase_total_usd;
+    }
+    if report_summary.secondary_sale_stuck_cost_eth == 0.0 {
+        report_summary.secondary_sale_stuck_cost_eth = report_summary.stuck_cost_eth;
+    }
+    if report_summary.secondary_sale_stuck_cost_usd == 0.0 {
+        report_summary.secondary_sale_stuck_cost_usd = report_summary.stuck_cost_usd;
+    }
+    report_summary.secondary_sale_stuck_cost_ratio =
+        if report_summary.secondary_sale_victim_purchase_total_usd > 0.0 {
+            Some(
+                report_summary.secondary_sale_stuck_cost_usd
+                    / report_summary.secondary_sale_victim_purchase_total_usd,
+            )
+        } else if report_summary.secondary_sale_victim_purchase_total_eth > 0.0 {
+            Some(
+                report_summary.secondary_sale_stuck_cost_eth
+                    / report_summary.secondary_sale_victim_purchase_total_eth,
+            )
+        } else {
+            None
+        };
+    update_victim_acquisition_totals(report_summary);
+}
+
+fn update_victim_acquisition_totals(report_summary: &mut ReportSummary) {
+    report_summary.victim_acquisition_total_eth = report_summary
+        .secondary_sale_victim_purchase_total_eth
+        + report_summary.paid_mint_victim_cost_eth;
+    report_summary.victim_acquisition_total_usd = report_summary
+        .secondary_sale_victim_purchase_total_usd
+        + report_summary.paid_mint_victim_cost_usd;
+    report_summary.victim_acquisition_stuck_cost_eth =
+        report_summary.secondary_sale_stuck_cost_eth + report_summary.paid_mint_stuck_cost_eth;
+    report_summary.victim_acquisition_stuck_cost_usd =
+        report_summary.secondary_sale_stuck_cost_usd + report_summary.paid_mint_stuck_cost_usd;
+    report_summary.victim_acquisition_stuck_cost_ratio =
+        if report_summary.victim_acquisition_total_usd > 0.0 {
+            Some(
+                report_summary.victim_acquisition_stuck_cost_usd
+                    / report_summary.victim_acquisition_total_usd,
+            )
+        } else if report_summary.victim_acquisition_total_eth > 0.0 {
+            Some(
+                report_summary.victim_acquisition_stuck_cost_eth
+                    / report_summary.victim_acquisition_total_eth,
+            )
+        } else {
+            None
+        };
+}
+
 fn build_minimal_cached_batch_seed_aggregate(raw: &serde_json::Value) -> BatchSeedAggregate {
     let seed_contract_raw = raw.get("seed_contract").and_then(|value| value.as_object());
     let report_summary_raw = raw
         .get("report_summary")
         .and_then(|value| value.as_object());
-    BatchSeedAggregate {
+    let mut aggregate = BatchSeedAggregate {
         report: BatchSeedReportPayload {
             seed_contract: SeedContractPayload {
                 chain: seed_contract_raw
@@ -3574,13 +3995,16 @@ fn build_minimal_cached_batch_seed_aggregate(raw: &serde_json::Value) -> BatchSe
                 avg_unique_receiver_count: report_summary_raw
                     .and_then(|value| value.get("avg_unique_receiver_count"))
                     .and_then(|value| value.as_f64()),
+                ..ReportSummary::default()
             },
             output_files: None,
         },
         malicious_addresses: BTreeSet::new(),
         honest_addresses: BTreeSet::new(),
         minter_infringing_contracts: BTreeMap::new(),
-    }
+    };
+    enrich_legacy_report_summary_fields(&mut aggregate.report.report_summary);
+    aggregate
 }
 
 fn payload_minter_contracts(
@@ -3644,6 +4068,7 @@ fn normalize_network(chain: &str, explicit_network: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{AddressEvidencePayload, NftTokenPropagationPayload};
 
     #[test]
     fn report_summary_ignores_zero_mint_to_first_transfer_samples() {
@@ -3680,6 +4105,9 @@ mod tests {
             &[],
             &[],
             &address_signals,
+            &[],
+            &[],
+            &BTreeMap::new(),
         );
 
         assert_eq!(summary.avg_mint_to_first_transfer_seconds, Some(14.0));
@@ -3713,6 +4141,9 @@ mod tests {
             &[],
             &[],
             &honest_addresses,
+            &[],
+            &BTreeMap::new(),
+            &[],
             &[],
             &BTreeMap::new(),
         );
@@ -3769,5 +4200,125 @@ mod tests {
             payload_median_seconds_to_honest_holder(&payload),
             Some(16.0)
         );
+    }
+
+    #[test]
+    fn report_summary_separates_secondary_sale_and_paid_mint_victim_costs() {
+        let victim_addresses = vec![VictimAddressPayload {
+            address: "0xsalevictim".into(),
+            buy_amount_eth: 0.5,
+            buy_amount_usd: 1_000.0,
+            last_buy_amount_eth: Some(0.25),
+            last_buy_amount_usd: Some(500.0),
+            is_stuck: true,
+            ..VictimAddressPayload::default()
+        }];
+        let address_attributions = vec![AddressAttributionPayload {
+            contract_address: "0xdup".into(),
+            address: "0xpaidvictim".into(),
+            attribution_label: "likely_victim".into(),
+            victim_score: 0.45,
+            evidence: vec![AddressEvidencePayload {
+                evidence_type: "paid_mint_payment".into(),
+                contract_address: "0xdup".into(),
+                token_id: "1,2".into(),
+                tx_hash: "0xmint".into(),
+                weight: 0.45,
+                detail: "paid mint victim evidence".into(),
+            }],
+            ..AddressAttributionPayload::default()
+        }];
+        let value_flow_edges = vec![ValueFlowEdgePayload {
+            edge_id: "value:mint_payment:0xmint".into(),
+            contract_address: "0xdup".into(),
+            from_address: "0xpaidvictim".into(),
+            to_address: "0xdup".into(),
+            tx_hash: "0xmint".into(),
+            token_id: "1,2".into(),
+            value_eth: Some(2.0),
+            value_usd: Some(4_000.0),
+            payment_token_symbol: "ETH".into(),
+            channel: "mint_payment".into(),
+            to_role: "mint_contract".into(),
+            ..ValueFlowEdgePayload::default()
+        }];
+        let propagation_paths = BTreeMap::from([(
+            "0xdup".into(),
+            NftPropagationPathPayload {
+                contract_address: "0xdup".into(),
+                token_paths: vec![
+                    NftTokenPropagationPayload {
+                        token_id: "1".into(),
+                        current_holder_addresses: vec!["0xpaidvictim".into()],
+                        ..NftTokenPropagationPayload::default()
+                    },
+                    NftTokenPropagationPayload {
+                        token_id: "2".into(),
+                        current_holder_addresses: vec!["0xother".into()],
+                        ..NftTokenPropagationPayload::default()
+                    },
+                ],
+                ..NftPropagationPathPayload::default()
+            },
+        )]);
+
+        let summary = build_report_summary(
+            false,
+            &BTreeMap::new(),
+            &[],
+            &[],
+            &[],
+            &[],
+            &victim_addresses,
+            &BTreeMap::new(),
+            &address_attributions,
+            &value_flow_edges,
+            &propagation_paths,
+        );
+
+        assert_eq!(summary.honest_purchase_total_eth, 0.5);
+        assert_eq!(summary.secondary_sale_victim_purchase_total_eth, 0.5);
+        assert_eq!(summary.secondary_sale_stuck_cost_eth, 0.25);
+        assert_eq!(summary.paid_mint_victim_cost_eth, 2.0);
+        assert_eq!(summary.paid_mint_victim_cost_usd, 4_000.0);
+        assert_eq!(summary.paid_mint_stuck_cost_eth, 1.0);
+        assert_eq!(summary.paid_mint_stuck_cost_usd, 2_000.0);
+        assert_eq!(summary.victim_acquisition_total_eth, 2.5);
+        assert_eq!(summary.victim_acquisition_stuck_cost_eth, 1.25);
+    }
+
+    #[test]
+    fn mint_value_flow_does_not_classify_erc20_same_tx_transfers_to_minter_as_funding() {
+        let lookup = MintPaymentLookup {
+            tx_hash: "0xmint".into(),
+            block_number: 100,
+            block_time: 1_700_000_000,
+            minter_address: "0xpaidvictim".into(),
+            token_ids: vec!["1".into()],
+        };
+        let erc20_transfer = EthTransferRecord {
+            tx_hash: "0xmint".into(),
+            block_number: 100,
+            from_address: "0xrouter".into(),
+            to_address: "0xpaidvictim".into(),
+            value_eth: 134.0,
+            value_usd: Some(300_000.0),
+            payment_token_symbol: "WETH".into(),
+            category: "erc20".into(),
+            ..EthTransferRecord::default()
+        };
+        let native_transfer = EthTransferRecord {
+            category: "external".into(),
+            value_eth: 0.5,
+            value_usd: Some(1_000.0),
+            ..erc20_transfer.clone()
+        };
+
+        assert!(
+            classify_mint_value_flow_transfer(&erc20_transfer, &lookup, "0xdup", None).is_none()
+        );
+        let classified =
+            classify_mint_value_flow_transfer(&native_transfer, &lookup, "0xdup", None).unwrap();
+        assert_eq!(classified.0, "funding");
     }
 }

@@ -167,13 +167,40 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
             summary.candidate_open_license_contract_count
         ),
         format!(
-            "- 诚实地址购买总金额(USD): {}",
-            summary.honest_purchase_total_usd
+            "- 受害者获取成本合计(USD): {}",
+            summary.victim_acquisition_total_usd
         ),
         format!(
-            "- 套牢资金(USD): {} / {}",
-            summary.stuck_cost_usd,
-            format_ratio(summary.stuck_cost_ratio)
+            "- 受害者套牢成本合计(USD): {} / {}",
+            summary.victim_acquisition_stuck_cost_usd,
+            format_ratio(summary.victim_acquisition_stuck_cost_ratio)
+        ),
+        format!(
+            "- 二级市场受害者购买额(USD): {}",
+            summary.secondary_sale_victim_purchase_total_usd
+        ),
+        format!(
+            "- 二级市场套牢资金(USD): {} / {}",
+            summary.secondary_sale_stuck_cost_usd,
+            format_ratio(summary.secondary_sale_stuck_cost_ratio)
+        ),
+        format!(
+            "- 付费 mint 受害者成本(USD): {}",
+            summary.paid_mint_victim_cost_usd
+        ),
+        format!(
+            "- 付费 mint 套牢成本(USD): {} / edges={} / tokens={}",
+            summary.paid_mint_stuck_cost_usd,
+            summary.paid_mint_stuck_edge_count,
+            summary.paid_mint_stuck_token_count
+        ),
+        format!(
+            "- ERC20 稳定币有价资金流(USD): {} / edges={}",
+            summary.stablecoin_erc20_value_usd, summary.stablecoin_erc20_edge_count
+        ),
+        format!(
+            "- 有 USD 定价/仅 ETH 定价资金流边: {} / {}",
+            summary.value_flow_priced_edge_count, summary.value_flow_unpriced_edge_count
         ),
         format!(
             "- 可计算买入占比的诚实地址数: {}",
@@ -289,9 +316,34 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
         "## 资金与交易摘要".to_string(),
         format!("- 有定价销售记录数: {}", total_usd_priced_sale_count),
         format!("- 有定价销售额(USD): {}", total_usd_priced_volume),
+        format!(
+            "- 受害者获取成本合计(USD): {}",
+            summary.victim_acquisition_total_usd
+        ),
+        format!(
+            "- 二级市场受害者购买额(USD): {}",
+            summary.secondary_sale_victim_purchase_total_usd
+        ),
+        format!(
+            "- 付费 mint 受害者成本(USD): {} / edges={} / addresses={}",
+            summary.paid_mint_victim_cost_usd,
+            summary.paid_mint_victim_edge_count,
+            summary.paid_mint_victim_address_count
+        ),
         format!("- 唯一买家计数合计: {}", total_unique_buyers),
-        format!("- 套牢钱包数: {}", summary.stuck_honest_address_count),
-        format!("- 套牢资金(USD): {}", summary.stuck_cost_usd),
+        format!(
+            "- 二级市场套牢钱包数: {}",
+            summary.stuck_honest_address_count
+        ),
+        format!(
+            "- 二级市场套牢资金(USD): {}",
+            summary.secondary_sale_stuck_cost_usd
+        ),
+        format!(
+            "- 总套牢成本(USD): {} / {}",
+            summary.victim_acquisition_stuck_cost_usd,
+            format_ratio(summary.victim_acquisition_stuck_cost_ratio)
+        ),
     ]);
 
     lines.join("\n") + "\n"
@@ -341,13 +393,25 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
             summary.legit_duplicate_contract_count_total
         ),
         format!(
-            "- 诚实地址购买总金额(USD)汇总: {}",
-            summary.honest_purchase_total_usd_total
+            "- 受害者获取成本(USD)汇总: {}",
+            summary.victim_acquisition_total_usd_total
         ),
         format!(
-            "- 套牢资金(USD)汇总: {} / {}",
-            summary.stuck_cost_usd_total,
-            format_ratio(summary.stuck_cost_ratio_overall)
+            "- 总套牢成本(USD)汇总: {} / {}",
+            summary.victim_acquisition_stuck_cost_usd_total,
+            format_ratio(summary.victim_acquisition_stuck_cost_ratio_overall)
+        ),
+        format!(
+            "- 二级市场受害者购买额(USD)汇总: {}",
+            summary.secondary_sale_victim_purchase_total_usd_total
+        ),
+        format!(
+            "- 付费 mint 受害者成本(USD)汇总: {} / edges={}",
+            summary.paid_mint_victim_cost_usd_total, summary.paid_mint_victim_edge_count_total
+        ),
+        format!(
+            "- ERC20 稳定币有价资金流(USD)汇总: {} / edges={}",
+            summary.stablecoin_erc20_value_usd_total, summary.stablecoin_erc20_edge_count_total
         ),
         format!(
             "- 可计算买入占比的诚实地址总数: {}",
@@ -415,7 +479,7 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
             };
 
             lines.push(format!(
-                "- {} ({}) | 重复合约={} | 侵权NFT={} | 恶意地址={} | 诚实地址={} | 多次侵权地址={} | 官方参与={} | 诚实购买额(USD)={} | 套牢资金(USD)={}/{} | >60%={}/{} | 套牢={}/{} | 被腐化={} | 诚实购买时长={}秒 | 传播中位数={}秒 | 首次转手中位数={}秒 | JSON={} | MD={}",
+                "- {} ({}) | 重复合约={} | 侵权NFT={} | 恶意地址={} | 诚实地址={} | 多次侵权地址={} | 官方参与={} | 受害者获取成本(USD)={} | 二级购买(USD)={} | 付费mint(USD)={} | 总套牢(USD)={}/{} | >60%={}/{} | 套牢节点={}/{} | 被腐化={} | 诚实购买时长={}秒 | 传播中位数={}秒 | 首次转手中位数={}秒 | JSON={} | MD={}",
                 seed_name,
                 seed.contract_address,
                 report_summary.candidate_contract_count,
@@ -424,9 +488,11 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
                 report_summary.honest_address_count,
                 report_summary.repeat_infringing_address_count,
                 report_summary.legit_duplicate_contract_count,
-                report_summary.honest_purchase_total_usd,
-                report_summary.stuck_cost_usd,
-                format_ratio(report_summary.stuck_cost_ratio),
+                report_summary.victim_acquisition_total_usd,
+                report_summary.secondary_sale_victim_purchase_total_usd,
+                report_summary.paid_mint_victim_cost_usd,
+                report_summary.victim_acquisition_stuck_cost_usd,
+                format_ratio(report_summary.victim_acquisition_stuck_cost_ratio),
                 report_summary.ratio_over_60_address_count,
                 format_ratio(report_summary.ratio_over_60_address_ratio),
                 report_summary.stuck_honest_address_count,

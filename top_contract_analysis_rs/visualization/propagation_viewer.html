@@ -1118,6 +1118,59 @@
       };
     }
 
+    function summaryNumber(summary, key) {
+      const value = Number(summary?.[key]);
+      return Number.isFinite(value) ? value : null;
+    }
+
+    function inferredAcquisitionSummary(flows) {
+      const paidVictimAddresses = new Set();
+      for (const feature of reportArray("address_evidence_features")) {
+        const label = feature.attribution_label || "";
+        const hasPaidMint = (feature.evidence || []).some((item) => item.evidence_type === "paid_mint_payment");
+        if ((label === "likely_victim" || label === "corrupted_victim") && hasPaidMint) {
+          paidVictimAddresses.add(normalizeAddress(feature.address));
+        }
+      }
+      let paidMintEth = 0;
+      let paidMintUsd = 0;
+      let paidMintEdges = 0;
+      let paidMintStuckEth = 0;
+      let paidMintStuckUsd = 0;
+      let paidMintStuckTokens = 0;
+      const paths = Object.values(state.paths || {});
+
+      for (const flow of flows) {
+        if (flow.channel !== "mint_payment") continue;
+        const payer = normalizeAddress(flow.from_address);
+        if (!paidVictimAddresses.has(payer)) continue;
+        paidMintEdges += 1;
+        paidMintEth += Number(flow.value_eth || 0);
+        paidMintUsd += Number(flow.value_usd || 0);
+        const tokenIds = String(flow.token_id || "")
+          .split(",")
+          .map((tokenId) => tokenId.trim())
+          .filter(Boolean);
+        const path = paths.find((item) => sameContract(item, flow.contract_address));
+        if (!path || tokenIds.length === 0) continue;
+        let stuck = 0;
+        for (const tokenId of tokenIds) {
+          const tokenPath = (path.token_paths || []).find((item) => item.token_id === tokenId);
+          if ((tokenPath?.current_holder_addresses || []).some((holder) => normalizeAddress(holder) === payer)) {
+            stuck += 1;
+          }
+        }
+        if (stuck > 0) {
+          const fraction = stuck / tokenIds.length;
+          paidMintStuckTokens += stuck;
+          paidMintStuckEth += Number(flow.value_eth || 0) * fraction;
+          paidMintStuckUsd += Number(flow.value_usd || 0) * fraction;
+        }
+      }
+
+      return { paidMintEth, paidMintUsd, paidMintEdges, paidMintStuckEth, paidMintStuckUsd, paidMintStuckTokens };
+    }
+
     function lifecycleMetricFor(contract = state.selectedContract) {
       return reportArray("lifecycle_metrics").find((item) => sameContract(item, contract)) || null;
     }
@@ -1364,6 +1417,14 @@
       const flowCounts = countBy(valueFlows, (edge) => edge.channel);
       const royaltyEdges = valueFlows.filter((edge) => edge.channel === "royalty_fee");
       const knownRoyalty = royaltyEdges.filter((edge) => edge.recipient_known).length;
+      const inferredCosts = inferredAcquisitionSummary(valueFlows);
+      const secondarySaleUsd = summaryNumber(summary, "secondary_sale_victim_purchase_total_usd") ?? Number(summary.honest_purchase_total_usd || 0);
+      const secondaryStuckUsd = summaryNumber(summary, "secondary_sale_stuck_cost_usd") ?? Number(summary.stuck_cost_usd || 0);
+      const paidMintUsd = summaryNumber(summary, "paid_mint_victim_cost_usd") ?? inferredCosts.paidMintUsd;
+      const paidMintStuckUsd = summaryNumber(summary, "paid_mint_stuck_cost_usd") ?? inferredCosts.paidMintStuckUsd;
+      const victimTotalUsd = summaryNumber(summary, "victim_acquisition_total_usd") ?? (secondarySaleUsd + paidMintUsd);
+      const victimStuckUsd = summaryNumber(summary, "victim_acquisition_stuck_cost_usd") ?? (secondaryStuckUsd + paidMintStuckUsd);
+      const victimStuckRatio = summaryNumber(summary, "victim_acquisition_stuck_cost_ratio") ?? (victimTotalUsd > 0 ? victimStuckUsd / victimTotalUsd : 0);
 
       const wrapper = document.createElement("div");
       wrapper.innerHTML = `
@@ -1374,13 +1435,19 @@
         ])}
         ${miniStats([
           ["传播中位数", secondsText(summary.median_seconds_to_honest_holder)],
-          ["套牢成本", formatUsd(summary.stuck_cost_usd)],
-          ["套牢比例", percentText(summary.stuck_cost_ratio)],
+          ["受害获取", formatUsd(victimTotalUsd)],
+          ["总套牢", formatUsd(victimStuckUsd)],
+          ["套牢比例", percentText(victimStuckRatio)],
+        ])}
+        ${miniStats([
+          ["二级购买", formatUsd(secondarySaleUsd)],
+          ["付费mint", formatUsd(paidMintUsd)],
+          ["mint套牢", formatUsd(paidMintStuckUsd)],
         ])}
         ${miniStats([
           ["USD覆盖ETH", formatEth(coverage.pricedEth)],
           ["未定价ETH", formatEth(coverage.unpricedEth)],
-          ["稳定币USD", formatUsd(coverage.stablecoinUsd)],
+          ["稳定币USD", formatUsd(summary.stablecoin_erc20_value_usd ?? coverage.stablecoinUsd)],
         ])}
         <div class="flow-list">
           ${flowCounts.slice(0, 6).map(([channel, count]) => {
@@ -1396,6 +1463,7 @@
         <div class="note">生命周期阶段：${stageCounts.slice(0, 6).map(([stage, count]) => `${labelName(stage)} ${count}`).join(" · ") || "无"}</div>
         <div class="note">弱监督标签：${labelCounts.slice(0, 5).map(([label, count]) => `${labelName(label)} ${count}`).join(" · ") || "无"}</div>
         <div class="note">早期检测样本：${earlyCounts.slice(0, 5).map(([label, count]) => `${labelName(label)} ${count}`).join(" · ") || "无"}</div>
+        <div class="note">成本口径：二级购买来自 sale buyer；付费 mint 来自 Rust 归因为 likely/corrupted victim 的 mint_payment 边；mint 套牢按仍由付款地址持有的 token 比例估算。</div>
         ${royaltyEdges.length > 0 && knownRoyalty < royaltyEdges.length ? `
           <div class="warning">版税接收者已作为资金流展示，但当前可解析比例为 ${knownRoyalty}/${royaltyEdges.length}；这部分更适合作为覆盖缺口，而不是强归因证据。</div>
         ` : ""}

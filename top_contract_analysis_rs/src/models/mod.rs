@@ -320,6 +320,50 @@ pub struct ReportSummary {
     #[serde(default)]
     pub stuck_cost_usd: f64,
     pub stuck_cost_ratio: Option<f64>,
+    #[serde(default)]
+    pub secondary_sale_victim_purchase_total_eth: f64,
+    #[serde(default)]
+    pub secondary_sale_victim_purchase_total_usd: f64,
+    #[serde(default)]
+    pub secondary_sale_stuck_cost_eth: f64,
+    #[serde(default)]
+    pub secondary_sale_stuck_cost_usd: f64,
+    #[serde(default)]
+    pub secondary_sale_stuck_cost_ratio: Option<f64>,
+    #[serde(default)]
+    pub paid_mint_victim_cost_eth: f64,
+    #[serde(default)]
+    pub paid_mint_victim_cost_usd: f64,
+    #[serde(default)]
+    pub paid_mint_victim_edge_count: i64,
+    #[serde(default)]
+    pub paid_mint_victim_address_count: i64,
+    #[serde(default)]
+    pub paid_mint_stuck_cost_eth: f64,
+    #[serde(default)]
+    pub paid_mint_stuck_cost_usd: f64,
+    #[serde(default)]
+    pub paid_mint_stuck_edge_count: i64,
+    #[serde(default)]
+    pub paid_mint_stuck_token_count: i64,
+    #[serde(default)]
+    pub victim_acquisition_total_eth: f64,
+    #[serde(default)]
+    pub victim_acquisition_total_usd: f64,
+    #[serde(default)]
+    pub victim_acquisition_stuck_cost_eth: f64,
+    #[serde(default)]
+    pub victim_acquisition_stuck_cost_usd: f64,
+    #[serde(default)]
+    pub victim_acquisition_stuck_cost_ratio: Option<f64>,
+    #[serde(default)]
+    pub stablecoin_erc20_value_usd: f64,
+    #[serde(default)]
+    pub stablecoin_erc20_edge_count: i64,
+    #[serde(default)]
+    pub value_flow_priced_edge_count: i64,
+    #[serde(default)]
+    pub value_flow_unpriced_edge_count: i64,
     pub buy_asset_ratio_known_address_count: i64,
     pub ratio_over_60_address_count: i64,
     pub ratio_over_60_address_ratio: Option<f64>,
@@ -913,6 +957,50 @@ pub struct BatchReportSummary {
     #[serde(default)]
     pub stuck_cost_usd_total: f64,
     pub stuck_cost_ratio_overall: Option<f64>,
+    #[serde(default)]
+    pub secondary_sale_victim_purchase_total_eth_total: f64,
+    #[serde(default)]
+    pub secondary_sale_victim_purchase_total_usd_total: f64,
+    #[serde(default)]
+    pub secondary_sale_stuck_cost_eth_total: f64,
+    #[serde(default)]
+    pub secondary_sale_stuck_cost_usd_total: f64,
+    #[serde(default)]
+    pub secondary_sale_stuck_cost_ratio_overall: Option<f64>,
+    #[serde(default)]
+    pub paid_mint_victim_cost_eth_total: f64,
+    #[serde(default)]
+    pub paid_mint_victim_cost_usd_total: f64,
+    #[serde(default)]
+    pub paid_mint_victim_edge_count_total: i64,
+    #[serde(default)]
+    pub paid_mint_victim_address_count_total: i64,
+    #[serde(default)]
+    pub paid_mint_stuck_cost_eth_total: f64,
+    #[serde(default)]
+    pub paid_mint_stuck_cost_usd_total: f64,
+    #[serde(default)]
+    pub paid_mint_stuck_edge_count_total: i64,
+    #[serde(default)]
+    pub paid_mint_stuck_token_count_total: i64,
+    #[serde(default)]
+    pub victim_acquisition_total_eth_total: f64,
+    #[serde(default)]
+    pub victim_acquisition_total_usd_total: f64,
+    #[serde(default)]
+    pub victim_acquisition_stuck_cost_eth_total: f64,
+    #[serde(default)]
+    pub victim_acquisition_stuck_cost_usd_total: f64,
+    #[serde(default)]
+    pub victim_acquisition_stuck_cost_ratio_overall: Option<f64>,
+    #[serde(default)]
+    pub stablecoin_erc20_value_usd_total: f64,
+    #[serde(default)]
+    pub stablecoin_erc20_edge_count_total: i64,
+    #[serde(default)]
+    pub value_flow_priced_edge_count_total: i64,
+    #[serde(default)]
+    pub value_flow_unpriced_edge_count_total: i64,
     pub buy_asset_ratio_known_address_count_total: i64,
     pub ratio_over_60_address_count_total: i64,
     pub ratio_over_60_address_ratio_overall: Option<f64>,

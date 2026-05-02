@@ -634,6 +634,12 @@ fn batch_markdown_preserves_reference_summary_and_output_index_lines() {
             stuck_cost_eth_total: 5.0,
             stuck_cost_usd_total: 5.0,
             stuck_cost_ratio_overall: Some(0.4),
+            secondary_sale_victim_purchase_total_usd_total: 12.5,
+            secondary_sale_stuck_cost_usd_total: 5.0,
+            secondary_sale_stuck_cost_ratio_overall: Some(0.4),
+            victim_acquisition_total_usd_total: 12.5,
+            victim_acquisition_stuck_cost_usd_total: 5.0,
+            victim_acquisition_stuck_cost_ratio_overall: Some(0.4),
             buy_asset_ratio_known_address_count_total: 8,
             ratio_over_60_address_count_total: 3,
             ratio_over_60_address_ratio_overall: Some(0.375),
@@ -648,6 +654,7 @@ fn batch_markdown_preserves_reference_summary_and_output_index_lines() {
             median_mint_to_first_transfer_seconds_median: Some(7.0),
             avg_unique_receiver_count_mean: Some(4.0),
             generated_at: "2026-04-17T00:00:00+00:00".into(),
+            ..BatchReportSummary::default()
         },
         seed_reports: vec![BatchSeedReportPayload {
             seed_contract: SeedContractPayload {
@@ -667,6 +674,12 @@ fn batch_markdown_preserves_reference_summary_and_output_index_lines() {
                 stuck_cost_eth: 2.5,
                 stuck_cost_usd: 2.5,
                 stuck_cost_ratio: Some(1.0 / 3.0),
+                secondary_sale_victim_purchase_total_usd: 7.5,
+                secondary_sale_stuck_cost_usd: 2.5,
+                secondary_sale_stuck_cost_ratio: Some(1.0 / 3.0),
+                victim_acquisition_total_usd: 7.5,
+                victim_acquisition_stuck_cost_usd: 2.5,
+                victim_acquisition_stuck_cost_ratio: Some(1.0 / 3.0),
                 ratio_over_60_address_count: 2,
                 ratio_over_60_address_ratio: Some(0.5),
                 stuck_honest_address_count: 1,
@@ -689,13 +702,15 @@ fn batch_markdown_preserves_reference_summary_and_output_index_lines() {
     assert!(markdown.contains("# Top NFT 合约批量分析总报告"));
     assert!(markdown.contains("- 检测到开放许可的 seed 数: 1"));
     assert!(markdown.contains("- 恶意地址总数: 7"));
-    assert!(markdown.contains("- 诚实地址购买总金额(USD)汇总: 12.5"));
-    assert!(markdown.contains("- 套牢资金(USD)汇总: 5 / 40.00%"));
+    assert!(markdown.contains("- 受害者获取成本(USD)汇总: 12.5"));
+    assert!(markdown.contains("- 总套牢成本(USD)汇总: 5 / 40.00%"));
+    assert!(markdown.contains("- 二级市场受害者购买额(USD)汇总: 12.5"));
+    assert!(markdown.contains("- 付费 mint 受害者成本(USD)汇总: 0 / edges=0"));
     assert!(markdown.contains("- 买入金额占钱包总额 >60% 的地址数/总体占比: 3 / 37.50%"));
     assert!(markdown.contains("- 生成时间(UTC): 2026-04-17T00:00:00+00:00"));
     assert!(markdown.contains("## Seed 报告索引"));
     assert!(markdown.contains(
-        "- Azuki (0xseed) | 重复合约=5 | 侵权NFT=4 | 恶意地址=5 | 诚实地址=6 | 多次侵权地址=1 | 官方参与=1 | 诚实购买额(USD)=7.5 | 套牢资金(USD)=2.5/33.33% | >60%=2/50.00% | 套牢=1/25.00% | 被腐化=1 | 诚实购买时长=10秒 | 传播中位数=9秒 | 首次转手中位数=8秒 | JSON=result/top_contract_analysis__azuki.json | MD=result/top_contract_analysis__azuki.md"
+        "- Azuki (0xseed) | 重复合约=5 | 侵权NFT=4 | 恶意地址=5 | 诚实地址=6 | 多次侵权地址=1 | 官方参与=1 | 受害者获取成本(USD)=7.5 | 二级购买(USD)=7.5 | 付费mint(USD)=0 | 总套牢(USD)=2.5/33.33% | >60%=2/50.00% | 套牢节点=1/25.00% | 被腐化=1 | 诚实购买时长=10秒 | 传播中位数=9秒 | 首次转手中位数=8秒 | JSON=result/top_contract_analysis__azuki.json | MD=result/top_contract_analysis__azuki.md"
     ));
 }
 
