@@ -9,7 +9,8 @@ use regex::Regex;
 use crate::analysis::scoring::metadata_document_from_json;
 use crate::error::AppError;
 use crate::models::{
-    ContractNameRecord, ContractSignal, DatabaseNftRecord, DatabaseSnapshot, SeedNft,
+    ContractDuplicateRecord, ContractNameRecord, ContractSignal, DatabaseNftRecord,
+    DatabaseSnapshot, SeedNft,
 };
 use crate::normalize::{normalize_name, normalize_url};
 
@@ -235,6 +236,45 @@ fn seed_metadata_recall_terms(seed_nfts: &[SeedNft]) -> HashSet<String> {
             }
         })
         .unwrap_or_default()
+}
+
+fn update_duplicate_contract_row(
+    rows_by_contract: &mut HashMap<String, ContractDuplicateRecord>,
+    record: &DatabaseNftRecord,
+    token_uri_match: bool,
+    image_uri_match: bool,
+    name_norm: &str,
+    metadata_recall_match: bool,
+) {
+    let entry = rows_by_contract
+        .entry(record.contract_address.clone())
+        .or_insert_with(|| ContractDuplicateRecord {
+            contract_address: record.contract_address.clone(),
+            representative: record.clone(),
+            ..ContractDuplicateRecord::default()
+        });
+
+    entry.token_uri_match |= token_uri_match;
+    entry.image_uri_match |= image_uri_match;
+    if !name_norm.is_empty() && !entry.name_norms.iter().any(|value| value == name_norm) {
+        entry.name_norms.push(name_norm.to_string());
+    }
+
+    entry.metadata_recall_checked = true;
+    entry.metadata_recall_match |= metadata_recall_match;
+    let should_update_metadata_doc = entry.metadata_doc.is_empty()
+        || (metadata_recall_match && !entry.representative.metadata_recall_match);
+    if !should_update_metadata_doc {
+        return;
+    }
+
+    if record.metadata_doc.is_empty() {
+        return;
+    }
+    entry.metadata_doc = record.metadata_doc.clone();
+    if metadata_recall_match {
+        entry.representative = record.clone();
+    }
 }
 
 impl DuckDbFeatureStore {
@@ -612,6 +652,7 @@ impl DuckDbFeatureStore {
 
         let mut per_contract_counts: HashMap<String, usize> = HashMap::new();
         let mut nft_rows = Vec::new();
+        let mut duplicate_rows_by_contract = HashMap::<String, ContractDuplicateRecord>::new();
         let mut seen_contract_name_pairs: BTreeSet<(String, String)> = BTreeSet::new();
         let mut contract_names = Vec::new();
         let mut contract_signals_raw: BTreeMap<String, ContractSignal> = BTreeMap::new();
@@ -722,6 +763,8 @@ impl DuckDbFeatureStore {
                 }
                 *entry += 1;
 
+                let token_uri_match = exact_token_keys.contains(&token_uri_norm);
+                let image_uri_match = exact_image_keys.contains(&image_uri_norm);
                 if !name_norm.is_empty()
                     && seen_contract_name_pairs
                         .insert((record.contract_address.clone(), name_norm.clone()))
@@ -739,10 +782,10 @@ impl DuckDbFeatureStore {
                         ..ContractSignal::default()
                     });
                 signal.token_count += 1;
-                if exact_token_keys.contains(&token_uri_norm) {
+                if token_uri_match {
                     signal.uri_match_count += 1;
                 }
-                if exact_image_keys.contains(&image_uri_norm) {
+                if image_uri_match {
                     signal.image_match_count += 1;
                 }
                 let name_prefix = name_norm.chars().take(8).collect::<String>();
@@ -753,6 +796,14 @@ impl DuckDbFeatureStore {
                     signal.keyword_match = true;
                 }
 
+                update_duplicate_contract_row(
+                    &mut duplicate_rows_by_contract,
+                    &record,
+                    token_uri_match,
+                    image_uri_match,
+                    &name_norm,
+                    metadata_recall_match,
+                );
                 nft_rows.push(record);
             }
             drop(stmt);
@@ -763,9 +814,14 @@ impl DuckDbFeatureStore {
             last_recall_row_id = last_seen_recall_row_id;
         }
         conn.execute_batch(&format!("DROP TABLE IF EXISTS {temp_table}"))?;
+        let mut duplicate_contract_rows: Vec<_> =
+            duplicate_rows_by_contract.into_values().collect();
+        duplicate_contract_rows
+            .sort_by(|left, right| left.contract_address.cmp(&right.contract_address));
 
         Ok(DatabaseSnapshot {
             nft_rows,
+            duplicate_contract_rows,
             contract_names,
             contract_signals: contract_signals_raw,
         })

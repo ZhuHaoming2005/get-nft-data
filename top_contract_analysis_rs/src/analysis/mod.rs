@@ -971,13 +971,24 @@ async fn build_candidate_plan_for_seed(
 
     progress.on_seed_stage("find_duplicate_candidates").await;
     tokio::task::spawn_blocking(move || {
-        let candidates = duplicate::build_duplicate_candidates(
-            &request.chain,
-            &context.seed_nfts,
-            &snapshot.nft_rows,
-            request.name_threshold,
-            request.metadata_threshold,
-        );
+        let candidates =
+            if snapshot.duplicate_contract_rows.is_empty() && !snapshot.nft_rows.is_empty() {
+                duplicate::build_duplicate_candidates(
+                    &request.chain,
+                    &context.seed_nfts,
+                    &snapshot.nft_rows,
+                    request.name_threshold,
+                    request.metadata_threshold,
+                )
+            } else {
+                duplicate::build_duplicate_candidates_from_contract_rows(
+                    &request.chain,
+                    &context.seed_nfts,
+                    &snapshot.duplicate_contract_rows,
+                    request.name_threshold,
+                    request.metadata_threshold,
+                )
+            };
         Ok::<_, AppError>((
             context,
             CandidatePlan {

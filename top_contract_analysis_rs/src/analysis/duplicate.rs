@@ -6,7 +6,7 @@ use crate::analysis::scoring::{
     metadata_bm25_tokens, metadata_document_from_json, score_metadata_indexed_pair_with_corpus,
     score_name_pair, MetadataBm25Corpus, MetadataBm25CorpusBuilder, MetadataBm25Document,
 };
-use crate::models::{DatabaseNftRecord, DuplicateCandidate, SeedNft};
+use crate::models::{ContractDuplicateRecord, DatabaseNftRecord, DuplicateCandidate, SeedNft};
 use crate::normalize::{normalize_name, normalize_url};
 use crate::platform_infrastructure::is_platform_infrastructure_contract_blacklisted;
 
@@ -48,33 +48,15 @@ impl MetadataBm25Index {
     }
 }
 
-struct ContractDuplicateRow {
-    contract_address: String,
-    representative: DatabaseNftRecord,
-    token_uri_match: bool,
-    image_uri_match: bool,
-    name_norms: HashSet<String>,
-    metadata_doc: String,
-    metadata_recall_checked: bool,
-    metadata_recall_match: bool,
+fn should_score_metadata(row: &ContractDuplicateRecord, has_metadata_recall_flags: bool) -> bool {
+    !has_metadata_recall_flags || row.metadata_recall_match
 }
 
-impl ContractDuplicateRow {
-    fn new(row: &DatabaseNftRecord) -> Self {
-        Self {
-            contract_address: row.contract_address.clone(),
-            representative: row.clone(),
-            token_uri_match: false,
-            image_uri_match: false,
-            name_norms: HashSet::new(),
-            metadata_doc: String::new(),
-            metadata_recall_checked: false,
-            metadata_recall_match: false,
-        }
-    }
-
-    fn should_score_metadata(&self, has_metadata_recall_flags: bool) -> bool {
-        !has_metadata_recall_flags || self.metadata_recall_match
+fn new_contract_duplicate_record(row: &DatabaseNftRecord) -> ContractDuplicateRecord {
+    ContractDuplicateRecord {
+        contract_address: row.contract_address.clone(),
+        representative: row.clone(),
+        ..ContractDuplicateRecord::default()
     }
 }
 
@@ -84,8 +66,8 @@ fn aggregate_contract_rows(
     seed_token_uri_keys: &HashSet<String>,
     seed_image_uri_keys: &HashSet<String>,
     snapshot_rows: &[DatabaseNftRecord],
-) -> Vec<ContractDuplicateRow> {
-    let mut rows_by_contract = HashMap::<String, ContractDuplicateRow>::new();
+) -> Vec<ContractDuplicateRecord> {
+    let mut rows_by_contract = HashMap::<String, ContractDuplicateRecord>::new();
     for row in snapshot_rows {
         let contract_key = row.contract_address.to_lowercase();
         if seed_contracts.contains(&contract_key) {
@@ -97,7 +79,7 @@ fn aggregate_contract_rows(
 
         let entry = rows_by_contract
             .entry(row.contract_address.clone())
-            .or_insert_with(|| ContractDuplicateRow::new(row));
+            .or_insert_with(|| new_contract_duplicate_record(row));
         if let Some(token_key) = normalize_url(&row.token_uri) {
             entry.token_uri_match |= seed_token_uri_keys.contains(&token_key);
         }
@@ -105,8 +87,8 @@ fn aggregate_contract_rows(
             entry.image_uri_match |= seed_image_uri_keys.contains(&image_key);
         }
         let row_name_norm = normalize_name(&row.name);
-        if !row_name_norm.is_empty() {
-            entry.name_norms.insert(row_name_norm);
+        if !row_name_norm.is_empty() && !entry.name_norms.contains(&row_name_norm) {
+            entry.name_norms.push(row_name_norm);
         }
 
         entry.metadata_recall_checked |= row.metadata_recall_checked;
@@ -133,7 +115,7 @@ fn aggregate_contract_rows(
 
 fn build_metadata_bm25_index(
     seed_metadata_docs: &[MetadataBm25Document],
-    contract_rows: &[ContractDuplicateRow],
+    contract_rows: &[&ContractDuplicateRecord],
     has_metadata_recall_flags: bool,
 ) -> MetadataBm25Index {
     let query_tokens: HashSet<String> = seed_metadata_docs
@@ -153,7 +135,8 @@ fn build_metadata_bm25_index(
     let mut corpus_builder = MetadataBm25CorpusBuilder::default();
 
     for row in contract_rows {
-        if !row.should_score_metadata(has_metadata_recall_flags) || row.metadata_doc.is_empty() {
+        let row = *row;
+        if !should_score_metadata(row, has_metadata_recall_flags) || row.metadata_doc.is_empty() {
             continue;
         }
 
@@ -201,6 +184,42 @@ pub fn build_duplicate_candidates(
         .filter_map(|item| normalize_url(&item.image_uri))
         .collect();
 
+    let contract_rows = aggregate_contract_rows(
+        chain,
+        &seed_contracts,
+        &seed_token_uri_keys,
+        &seed_image_uri_keys,
+        snapshot_rows,
+    );
+    build_duplicate_candidates_from_contract_rows(
+        chain,
+        seed_nfts,
+        &contract_rows,
+        name_threshold,
+        metadata_threshold,
+    )
+}
+
+pub fn build_duplicate_candidates_from_contract_rows(
+    chain: &str,
+    seed_nfts: &[SeedNft],
+    contract_rows: &[ContractDuplicateRecord],
+    name_threshold: f64,
+    metadata_threshold: f64,
+) -> Vec<DuplicateCandidate> {
+    let seed_contracts: HashSet<String> = seed_nfts
+        .iter()
+        .map(|item| item.contract_address.to_lowercase())
+        .collect();
+    let contract_rows: Vec<&ContractDuplicateRecord> = contract_rows
+        .iter()
+        .filter(|row| {
+            let contract_key = row.contract_address.to_lowercase();
+            !seed_contracts.contains(&contract_key)
+                && !is_platform_infrastructure_contract_blacklisted(chain, &row.contract_address)
+        })
+        .collect();
+
     let seed_name_norms: Vec<String> = seed_nfts
         .iter()
         .map(|item| normalize_name(&item.name))
@@ -210,13 +229,6 @@ pub fn build_duplicate_candidates(
     let seed_metadata_docs: Vec<MetadataBm25Document> =
         seed_metadata_example_doc(seed_nfts).into_iter().collect();
 
-    let contract_rows = aggregate_contract_rows(
-        chain,
-        &seed_contracts,
-        &seed_token_uri_keys,
-        &seed_image_uri_keys,
-        snapshot_rows,
-    );
     let has_metadata_recall_flags = contract_rows.iter().any(|row| row.metadata_recall_checked);
     let metadata_index = build_metadata_bm25_index(
         &seed_metadata_docs,
@@ -227,6 +239,7 @@ pub fn build_duplicate_candidates(
     let mut rows: Vec<DuplicateCandidate> = contract_rows
         .par_iter()
         .filter_map(|row| {
+            let row = *row;
             let mut reasons = Vec::new();
             if row.token_uri_match {
                 reasons.push("token_uri_match".to_string());
@@ -241,7 +254,7 @@ pub fn build_duplicate_candidates(
             {
                 reasons.push("name_match".to_string());
             }
-            if row.should_score_metadata(has_metadata_recall_flags) {
+            if should_score_metadata(row, has_metadata_recall_flags) {
                 if let Some(row_doc) = metadata_index.candidate_doc(&row.contract_address) {
                     if seed_metadata_docs.iter().any(|seed_doc| {
                         score_metadata_indexed_pair_with_corpus(
@@ -325,7 +338,8 @@ mod tests {
         let empty = HashSet::new();
         let contract_rows =
             aggregate_contract_rows("ethereum", &seed_contracts, &empty, &empty, &snapshot_rows);
-        let index = build_metadata_bm25_index(&seed_docs, &contract_rows, false);
+        let contract_row_refs: Vec<_> = contract_rows.iter().collect();
+        let index = build_metadata_bm25_index(&seed_docs, &contract_row_refs, false);
 
         assert!(index.candidate_doc("0xgold").is_some());
         assert!(index.candidate_doc("0xai").is_some());

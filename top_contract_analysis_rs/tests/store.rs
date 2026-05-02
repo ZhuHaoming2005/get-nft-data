@@ -2,6 +2,9 @@ use std::collections::BTreeMap;
 
 use duckdb::Connection;
 use tempfile::tempdir;
+use top_contract_analysis_rs::analysis::duplicate::{
+    build_duplicate_candidates, build_duplicate_candidates_from_contract_rows,
+};
 use top_contract_analysis_rs::models::{DatabaseNftRecord, OwnerBalance, SeedNft, TransferRecord};
 use top_contract_analysis_rs::store::{
     write_snapshot_rows_to_parquet, ContractSignalCache, DuckDbFeatureStore, DuckDbResourceOptions,
@@ -17,6 +20,69 @@ fn write_parquet(sql: &str, path: &std::path::Path) {
     let path = parquet_path_literal(path);
     conn.execute_batch(&format!("COPY ({sql}) TO '{path}' (FORMAT PARQUET)"))
         .unwrap();
+}
+
+#[test]
+fn feature_store_builds_contract_duplicate_rows_from_normalized_recall_columns() {
+    let store = DuckDbFeatureStore::new(":memory:").unwrap();
+    store
+        .replace_chain_rows(
+            "ethereum",
+            &[
+                DatabaseNftRecord {
+                    contract_address: "0xdup".into(),
+                    token_id: "2".into(),
+                    token_uri: "https://gateway.example/ipfs/seed/meta-1?cache=1".into(),
+                    image_uri: "ipfs://dup/image-2.png".into(),
+                    name: "Azuki Mirror #2".into(),
+                    metadata_doc: "silver cat".into(),
+                    ..Default::default()
+                },
+                DatabaseNftRecord {
+                    contract_address: "0xdup".into(),
+                    token_id: "1".into(),
+                    token_uri: "ipfs://other/meta-1".into(),
+                    image_uri: "https://cdn.example/ipfs/seed/image-1.png".into(),
+                    name: "Azuki Mirror #1".into(),
+                    metadata_doc: "gold dragon".into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+
+    let seed_nfts = vec![SeedNft {
+        chain: "ethereum".into(),
+        contract_address: "0xseed".into(),
+        token_id: "1".into(),
+        token_uri: "ipfs://seed/meta-1".into(),
+        image_uri: "ipfs://seed/image-1.png".into(),
+        name: "Azuki #1".into(),
+        metadata_doc: "gold dragon".into(),
+        ..Default::default()
+    }];
+
+    let snapshot = store.load_snapshot("ethereum", &seed_nfts, 0, 0).unwrap();
+
+    assert_eq!(snapshot.duplicate_contract_rows.len(), 1);
+    let row = &snapshot.duplicate_contract_rows[0];
+    assert_eq!(row.contract_address, "0xdup");
+    assert!(row.token_uri_match);
+    assert!(row.image_uri_match);
+    assert!(row.name_norms.contains(&"azuki mirror".to_string()));
+    assert_eq!(row.metadata_doc, "gold dragon");
+    assert_eq!(row.representative.token_id, "1");
+
+    let old_path =
+        build_duplicate_candidates("ethereum", &seed_nfts, &snapshot.nft_rows, 95.0, 0.6);
+    let new_path = build_duplicate_candidates_from_contract_rows(
+        "ethereum",
+        &seed_nfts,
+        &snapshot.duplicate_contract_rows,
+        95.0,
+        0.6,
+    );
+    assert_eq!(new_path, old_path);
 }
 
 #[test]

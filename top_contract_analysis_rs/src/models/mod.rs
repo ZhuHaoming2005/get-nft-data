@@ -72,6 +72,18 @@ pub struct ContractSignal {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContractDuplicateRecord {
+    pub contract_address: String,
+    pub representative: DatabaseNftRecord,
+    pub token_uri_match: bool,
+    pub image_uri_match: bool,
+    pub name_norms: Vec<String>,
+    pub metadata_doc: String,
+    pub metadata_recall_checked: bool,
+    pub metadata_recall_match: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OwnerBalance {
     pub owner_address: String,
     pub token_balances: BTreeMap<String, i64>,
@@ -80,6 +92,7 @@ pub struct OwnerBalance {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DatabaseSnapshot {
     pub nft_rows: Vec<DatabaseNftRecord>,
+    pub duplicate_contract_rows: Vec<ContractDuplicateRecord>,
     pub contract_names: Vec<ContractNameRecord>,
     pub contract_signals: BTreeMap<String, ContractSignal>,
 }
