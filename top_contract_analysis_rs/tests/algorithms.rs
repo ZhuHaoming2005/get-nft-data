@@ -1120,7 +1120,10 @@ fn lifecycle_model_outputs_expose_research_graph_payloads() {
     assert_eq!(metric.funding_edge_count, 1);
     assert_eq!(metric.withdrawal_edge_count, 1);
     assert_eq!(metric.revenue_backflow_edge_count, 1);
-    assert_eq!(metric.value_flow_coverage_scope, "same_tx_native_eth_only");
+    assert_eq!(
+        metric.value_flow_coverage_scope,
+        "same_tx_native_eth_and_stablecoin_erc20"
+    );
     assert!(metric
         .value_flow_coverage_gaps
         .contains(&"later_withdrawals_not_traced".to_string()));

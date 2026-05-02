@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::analysis::scoring::metadata_document_from_json;
 use crate::api::{ApiEndpoints, AsyncApiClient};
+use crate::currency::{is_supported_priced_symbol, to_normalized_amount};
 use crate::error::AppError;
 use crate::models::{
     ContractMetadata, EthTransferRecord, OwnerBalance, SeedNft, TransactionReceiptRecord,
@@ -668,11 +669,12 @@ async fn fetch_address_eth_transfers(
     block_number: i64,
     address: &str,
     direction: &str,
+    eth_usd_rate: Option<f64>,
 ) -> Result<Vec<EthTransferRecord>, AppError> {
     let mut params = json!({
         "fromBlock": format!("0x{:x}", block_number.max(0)),
         "toBlock": format!("0x{:x}", block_number.max(0)),
-        "category": ["external", "internal"],
+        "category": ["external", "internal", "erc20"],
         "withMetadata": false,
         "excludeZeroValue": true,
         "maxCount": "0x3e8",
@@ -700,7 +702,14 @@ async fn fetch_address_eth_transfers(
         .into_iter()
         .flatten()
     {
-        let value_eth = parse_transfer_value_eth(item);
+        let symbol = transfer_asset_symbol(item);
+        let token_address = transfer_token_address(item);
+        let amount = parse_transfer_amount(item);
+        let normalized = if is_supported_priced_symbol(&symbol) {
+            to_normalized_amount(amount, &symbol, eth_usd_rate)
+        } else {
+            Default::default()
+        };
         rows.push(EthTransferRecord {
             tx_hash: item
                 .get("hash")
@@ -718,7 +727,10 @@ async fn fetch_address_eth_transfers(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_lowercase(),
-            value_eth,
+            value_eth: normalized.eth.unwrap_or(0.0),
+            value_usd: normalized.usd,
+            payment_token_symbol: symbol,
+            payment_token_address: token_address,
             category: item
                 .get("category")
                 .and_then(Value::as_str)
@@ -735,9 +747,27 @@ pub async fn fetch_same_block_eth_transfers_for_address(
     block_number: i64,
     address: &str,
 ) -> Result<Vec<EthTransferRecord>, AppError> {
+    fetch_same_block_value_transfers_for_address(client, endpoints, block_number, address, None)
+        .await
+}
+
+pub async fn fetch_same_block_value_transfers_for_address(
+    client: &AsyncApiClient,
+    endpoints: &ApiEndpoints,
+    block_number: i64,
+    address: &str,
+    eth_usd_rate: Option<f64>,
+) -> Result<Vec<EthTransferRecord>, AppError> {
     let (from_rows, to_rows) = tokio::join!(
-        fetch_address_eth_transfers(client, endpoints, block_number, address, "from"),
-        fetch_address_eth_transfers(client, endpoints, block_number, address, "to")
+        fetch_address_eth_transfers(
+            client,
+            endpoints,
+            block_number,
+            address,
+            "from",
+            eth_usd_rate
+        ),
+        fetch_address_eth_transfers(client, endpoints, block_number, address, "to", eth_usd_rate)
     );
     let mut rows = from_rows?;
     rows.extend(to_rows?);
@@ -749,6 +779,11 @@ pub async fn fetch_same_block_eth_transfers_for_address(
                 row.from_address.clone(),
                 row.to_address.clone(),
                 format!("{:.18}", row.value_eth),
+                row.value_usd
+                    .map(|value| format!("{value:.6}"))
+                    .unwrap_or_default(),
+                row.payment_token_symbol.clone(),
+                row.payment_token_address.clone(),
             ),
             row,
         );
@@ -774,18 +809,61 @@ fn parse_hex_or_decimal_i64(value: Option<&Value>) -> i64 {
     }
 }
 
-fn parse_transfer_value_eth(item: &Value) -> f64 {
-    let raw_value = item
-        .get("value")
-        .or_else(|| item.get("rawContract").and_then(|value| value.get("value")));
-    match raw_value {
-        Some(Value::String(text)) if text.starts_with("0x") || text.starts_with("0X") => {
-            u128::from_str_radix(text.trim_start_matches("0x").trim_start_matches("0X"), 16)
-                .map(|value| value as f64 / 1_000_000_000_000_000_000_f64)
-                .unwrap_or(0.0)
+fn transfer_asset_symbol(item: &Value) -> String {
+    item.get("asset")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            item.get("metadata")
+                .and_then(|value| value.get("symbol"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("ETH")
+        .trim()
+        .to_uppercase()
+}
+
+fn transfer_token_address(item: &Value) -> String {
+    item.get("rawContract")
+        .and_then(|value| value.get("address"))
+        .and_then(Value::as_str)
+        .unwrap_or(ZERO_ADDRESS)
+        .to_lowercase()
+}
+
+fn parse_transfer_amount(item: &Value) -> f64 {
+    if let Some(value) = item.get("value") {
+        match value {
+            Value::String(text) if text.starts_with("0x") || text.starts_with("0X") => {
+                return parse_raw_amount_with_decimals(item, text);
+            }
+            Value::String(text) => return text.parse::<f64>().unwrap_or(0.0),
+            Value::Number(number) => return number.as_f64().unwrap_or(0.0),
+            _ => {}
         }
-        Some(Value::String(text)) => text.parse::<f64>().unwrap_or(0.0),
-        Some(Value::Number(number)) => number.as_f64().unwrap_or(0.0),
-        _ => 0.0,
     }
+    item.get("rawContract")
+        .and_then(|value| value.get("value"))
+        .and_then(Value::as_str)
+        .map(|text| parse_raw_amount_with_decimals(item, text))
+        .unwrap_or(0.0)
+}
+
+fn parse_raw_amount_with_decimals(item: &Value, text: &str) -> f64 {
+    let raw = if text.starts_with("0x") || text.starts_with("0X") {
+        u128::from_str_radix(text.trim_start_matches("0x").trim_start_matches("0X"), 16).ok()
+    } else {
+        text.parse::<u128>().ok()
+    }
+    .unwrap_or(0);
+    let decimals = item
+        .get("rawContract")
+        .and_then(|value| value.get("decimal"))
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_str()?.parse::<i64>().ok())
+        })
+        .unwrap_or(18)
+        .clamp(0, 36) as i32;
+    raw as f64 / 10_f64.powi(decimals)
 }

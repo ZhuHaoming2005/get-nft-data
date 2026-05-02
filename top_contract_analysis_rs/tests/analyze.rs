@@ -17,7 +17,7 @@ use top_contract_analysis_rs::models::{
 };
 use top_contract_analysis_rs::models::{
     ContractMetadata, ContractNameRecord, DatabaseNftRecord, DatabaseSnapshot, EthTransferRecord,
-    NftSaleRecord, OwnerBalance, SeedNft, TransactionReceiptRecord, TransferRecord,
+    NftSaleRecord, OwnerBalance, SeedNft, TransactionReceiptRecord, TransferRecord, ZERO_ADDRESS,
 };
 use top_contract_analysis_rs::progress::{NoopBatchProgressReporter, NoopProgressReporter};
 use top_contract_analysis_rs::reporting::{
@@ -1246,7 +1246,11 @@ impl AnalyzeApi for FakeEnrichedApi {
                     from_address: "0xfunder".into(),
                     to_address: "0xminter".into(),
                     value_eth: 0.08,
+                    value_usd: Some(184.0),
+                    payment_token_symbol: "ETH".into(),
+                    payment_token_address: ZERO_ADDRESS.into(),
                     category: "external".into(),
+                    ..EthTransferRecord::default()
                 },
                 EthTransferRecord {
                     tx_hash: "0xmint".into(),
@@ -1254,7 +1258,11 @@ impl AnalyzeApi for FakeEnrichedApi {
                     from_address: "0xminter".into(),
                     to_address: "0xcreator".into(),
                     value_eth: 0.08,
+                    value_usd: Some(184.0),
+                    payment_token_symbol: "ETH".into(),
+                    payment_token_address: ZERO_ADDRESS.into(),
                     category: "external".into(),
+                    ..EthTransferRecord::default()
                 },
             ]);
         }
@@ -1265,7 +1273,11 @@ impl AnalyzeApi for FakeEnrichedApi {
                 from_address: "0xdup".into(),
                 to_address: "0xfunder".into(),
                 value_eth: 0.04,
+                value_usd: Some(92.0),
+                payment_token_symbol: "ETH".into(),
+                payment_token_address: ZERO_ADDRESS.into(),
                 category: "internal".into(),
+                ..EthTransferRecord::default()
             }]);
         }
         Ok(vec![])
@@ -1843,6 +1855,7 @@ impl AnalyzeApi for FakeSaleMetricApi {
             to_address: "0xvictim".into(),
             value_eth: 2.0,
             category: "external".into(),
+            ..EthTransferRecord::default()
         }])
     }
 }
@@ -3848,6 +3861,7 @@ async fn analyze_enriches_duplicate_contracts_with_signals_and_infringing_tokens
     assert_eq!(mint_payment_edge.from_address, "0xminter");
     assert_eq!(mint_payment_edge.to_address, "0xcreator");
     assert_eq!(mint_payment_edge.value_eth, Some(0.08));
+    assert_eq!(mint_payment_edge.value_usd, Some(184.0));
     let funding_edge = payload
         .value_flow_edges
         .iter()

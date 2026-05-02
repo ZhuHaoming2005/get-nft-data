@@ -1181,7 +1181,7 @@ pub fn build_honest_address_stats(
         .flat_map(|item| {
             item.mint_to_honest_seconds_samples
                 .iter()
-                .map(|sample| *sample as f64)
+                .filter_map(|sample| positive_seconds(*sample))
         })
         .collect();
 
@@ -1199,6 +1199,10 @@ pub fn build_honest_address_stats(
             corrupted_addresses,
         },
     )])
+}
+
+fn positive_seconds(value: i64) -> Option<f64> {
+    (value > 0).then_some(value as f64)
 }
 
 pub fn build_fraud_trade_stats(

@@ -13,8 +13,9 @@ use crate::api::{
     fetch_is_holder_of_contract, fetch_license_sample, fetch_opensea_account_holds_contract_nft,
     fetch_opensea_contract_collection_slug, fetch_opensea_contract_market_events,
     fetch_opensea_contract_nfts, fetch_same_block_eth_transfers_for_address,
-    fetch_seed_contract_nfts, fetch_transaction_receipt, fetch_transaction_receipts_for_block,
-    is_open_license_payload, ApiEndpoints, AsyncApiClient,
+    fetch_same_block_value_transfers_for_address, fetch_seed_contract_nfts,
+    fetch_transaction_receipt, fetch_transaction_receipts_for_block, is_open_license_payload,
+    ApiEndpoints, AsyncApiClient,
 };
 use crate::error::AppError;
 use crate::models::{
@@ -861,12 +862,27 @@ impl AnalyzeApi for RealApi {
         block_number: i64,
         address: &str,
     ) -> Result<Vec<EthTransferRecord>, AppError> {
-        self.fetch_same_block_eth_transfers_for_address_on_chain(
-            chain,
-            alchemy_api_key,
-            alchemy_network,
+        let eth_usd_rate = match self.current_eth_usd_rate().await {
+            Ok(rate) => Some(rate),
+            Err(err) => {
+                if !self
+                    .eth_usd_rate_warning_emitted
+                    .swap(true, Ordering::Relaxed)
+                {
+                    eprintln!(
+                        "warning: failed to fetch current ETH/USD rate for mint value-flow at {address}: {err}; ETH/WETH mint payments will not be USD-normalized"
+                    );
+                }
+                None
+            }
+        };
+        let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
+        fetch_same_block_value_transfers_for_address(
+            &self.client,
+            &endpoints,
             block_number,
             address,
+            eth_usd_rate,
         )
         .await
     }
@@ -1666,7 +1682,9 @@ async fn compute_mint_payment_edges_for_contract(
     while let Some(result) = fetched.next().await {
         let (lookup, eth_transfers) = result?;
         for transfer in eth_transfers {
-            if transfer.tx_hash != lookup.tx_hash || transfer.value_eth <= 0.0 {
+            if transfer.tx_hash != lookup.tx_hash
+                || (transfer.value_eth <= 0.0 && transfer.value_usd.unwrap_or(0.0) <= 0.0)
+            {
                 continue;
             }
             let Some((channel, from_role, to_role, evidence_type, evidence_flags)) =
@@ -1692,10 +1710,18 @@ async fn compute_mint_payment_edges_for_contract(
                 block_number: lookup.block_number,
                 block_time: lookup.block_time,
                 token_id: lookup.token_ids.join(","),
-                value_eth: Some(transfer.value_eth),
-                value_usd: None,
-                payment_token_symbol: "ETH".into(),
-                payment_token_address: ZERO_ADDRESS.into(),
+                value_eth: (transfer.value_eth > 0.0).then_some(transfer.value_eth),
+                value_usd: transfer.value_usd.filter(|value| *value > 0.0),
+                payment_token_symbol: if transfer.payment_token_symbol.is_empty() {
+                    "ETH".into()
+                } else {
+                    transfer.payment_token_symbol
+                },
+                payment_token_address: if transfer.payment_token_address.is_empty() {
+                    ZERO_ADDRESS.into()
+                } else {
+                    transfer.payment_token_address
+                },
                 channel,
                 marketplace: String::new(),
                 evidence_type,
@@ -1823,7 +1849,7 @@ fn is_matching_mint_payment_transfer(
     contract_metadata: Option<&ContractMetadata>,
 ) -> bool {
     transfer.tx_hash == lookup.tx_hash
-        && transfer.value_eth > 0.0
+        && transfer_value_positive(transfer)
         && transfer
             .from_address
             .eq_ignore_ascii_case(&lookup.minter_address)
@@ -1846,6 +1872,10 @@ fn is_matching_mint_payment_transfer(
                                 .eq_ignore_ascii_case(&metadata.proxy_admin_address))
                 })
                 .unwrap_or(false))
+}
+
+fn transfer_value_positive(transfer: &EthTransferRecord) -> bool {
+    transfer.value_eth > 0.0 || transfer.value_usd.unwrap_or(0.0) > 0.0
 }
 
 fn build_mint_payment_lookups(
@@ -3055,7 +3085,7 @@ fn build_report_summary(
         .flat_map(|item| {
             item.mint_to_honest_seconds_samples
                 .iter()
-                .map(|sample| *sample as f64)
+                .filter_map(|sample| positive_seconds(*sample))
         })
         .collect();
     let mint_to_first_transfer_values: Vec<f64> = address_signals
@@ -3573,7 +3603,7 @@ fn payload_median_seconds_to_honest_holder(payload: &SingleReportPayload) -> Opt
         .honest_addresses
         .iter()
         .flat_map(|item| item.mint_to_honest_seconds_samples.iter().copied())
-        .map(|value| value as f64)
+        .filter_map(positive_seconds)
         .collect();
     median_f64(&values)
 }
@@ -3657,6 +3687,41 @@ mod tests {
     }
 
     #[test]
+    fn report_summary_ignores_zero_mint_to_honest_holder_samples() {
+        let honest_addresses = vec![
+            HonestAddressPayload {
+                address: "0xmintvictim".into(),
+                mint_to_honest_seconds_samples: vec![0],
+                ..HonestAddressPayload::default()
+            },
+            HonestAddressPayload {
+                address: "0xpropagated1".into(),
+                mint_to_honest_seconds_samples: vec![12],
+                ..HonestAddressPayload::default()
+            },
+            HonestAddressPayload {
+                address: "0xpropagated2".into(),
+                mint_to_honest_seconds_samples: vec![20],
+                ..HonestAddressPayload::default()
+            },
+        ];
+
+        let summary = build_report_summary(
+            false,
+            &BTreeMap::new(),
+            &[],
+            &[],
+            &[],
+            &honest_addresses,
+            &[],
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(summary.avg_seconds_to_honest_holder, Some(16.0));
+        assert_eq!(summary.median_seconds_to_honest_holder, Some(16.0));
+    }
+
+    #[test]
     fn cached_payload_median_ignores_zero_mint_to_first_transfer_samples() {
         let payload = SingleReportPayload {
             address_signals: BTreeMap::from([
@@ -3681,6 +3746,28 @@ mod tests {
         assert_eq!(
             payload_median_mint_to_first_transfer_seconds(&payload),
             Some(12.0)
+        );
+    }
+
+    #[test]
+    fn cached_payload_median_ignores_zero_mint_to_honest_holder_samples() {
+        let payload = SingleReportPayload {
+            honest_addresses: vec![
+                HonestAddressPayload {
+                    mint_to_honest_seconds_samples: vec![0],
+                    ..HonestAddressPayload::default()
+                },
+                HonestAddressPayload {
+                    mint_to_honest_seconds_samples: vec![12, 20],
+                    ..HonestAddressPayload::default()
+                },
+            ],
+            ..SingleReportPayload::default()
+        };
+
+        assert_eq!(
+            payload_median_seconds_to_honest_holder(&payload),
+            Some(16.0)
         );
     }
 }

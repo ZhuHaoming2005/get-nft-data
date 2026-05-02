@@ -190,6 +190,12 @@ pub struct EthTransferRecord {
     pub from_address: String,
     pub to_address: String,
     pub value_eth: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub payment_token_symbol: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub payment_token_address: String,
     pub category: String,
 }
 

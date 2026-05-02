@@ -8,10 +8,9 @@ use crate::models::{
     SeedContractPayload, ValueFlowEdgePayload, WeakSupervisionLabelPayload,
 };
 
-const VALUE_FLOW_COVERAGE_SCOPE: &str = "same_tx_native_eth_only";
-const VALUE_FLOW_COVERAGE_GAPS: [&str; 4] = [
+const VALUE_FLOW_COVERAGE_SCOPE: &str = "same_tx_native_eth_and_stablecoin_erc20";
+const VALUE_FLOW_COVERAGE_GAPS: [&str; 3] = [
     "later_withdrawals_not_traced",
-    "erc20_flows_not_traced",
     "multi_hop_cashout_not_traced",
     "cex_bridge_mixer_not_classified",
 ];

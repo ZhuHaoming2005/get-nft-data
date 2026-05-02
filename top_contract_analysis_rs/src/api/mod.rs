@@ -152,8 +152,8 @@ fn response_body_excerpt(body: &str) -> String {
 pub use alchemy::{
     fetch_contract_metadata, fetch_contract_owners, fetch_contract_transfers, fetch_eth_balance,
     fetch_is_holder_of_contract, fetch_license_sample, fetch_same_block_eth_transfers_for_address,
-    fetch_seed_contract_nfts, fetch_transaction_receipt, fetch_transaction_receipts_for_block,
-    is_open_license_payload,
+    fetch_same_block_value_transfers_for_address, fetch_seed_contract_nfts,
+    fetch_transaction_receipt, fetch_transaction_receipts_for_block, is_open_license_payload,
 };
 pub use etherscan::fetch_etherscan_contract_transfers;
 pub use opensea::{
