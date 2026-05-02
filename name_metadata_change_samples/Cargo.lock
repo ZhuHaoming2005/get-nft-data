@@ -1584,7 +1584,6 @@ dependencies = [
  "clap",
  "duckdb",
  "indicatif",
- "rayon",
  "serde",
  "tempfile",
  "thiserror",

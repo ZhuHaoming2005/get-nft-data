@@ -1,10 +1,8 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use duckdb::{params, AccessMode, Config, Connection};
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use top_contract_analysis_rs::analysis::duplicate::build_duplicate_candidates;
@@ -23,7 +21,6 @@ pub struct SampleCollectionConfig {
     pub max_tokens_per_contract: usize,
     pub max_recall_rows: usize,
     pub max_seed_tokens: usize,
-    pub workers: usize,
     pub duckdb_threads: usize,
     pub duckdb_memory_limit: String,
 }
@@ -63,12 +60,23 @@ pub struct CandidateSampleReport {
     pub sample: ContractSample,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SeedProgress {
-    pub completed: usize,
-    pub total: usize,
-    pub contract_address: String,
-    pub candidate_count: usize,
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SampleProgressStage {
+    ReadSeedRows,
+    LoadRecallRows,
+    ScoreCandidates,
+    LoadCandidateSamples,
+    FinishedSeed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SampleProgress {
+    pub seed_index: usize,
+    pub total_seeds: usize,
+    pub stage: SampleProgressStage,
+    pub stage_index: usize,
+    pub stage_count: usize,
+    pub candidate_count: Option<usize>,
 }
 
 #[derive(Debug, Error)]
@@ -83,8 +91,6 @@ pub enum SampleCollectionError {
     EmptyInput,
     #[error("feature DB does not exist: {0}")]
     MissingFeatureDb(String),
-    #[error("parallel worker error: {0}")]
-    Parallel(String),
 }
 
 pub fn collect_samples(
@@ -95,52 +101,27 @@ pub fn collect_samples(
 
 pub fn collect_samples_with_progress<F>(
     config: SampleCollectionConfig,
-    progress: F,
+    mut progress: F,
 ) -> Result<SampleReport, SampleCollectionError>
 where
-    F: Fn(SeedProgress) + Sync,
+    F: FnMut(SampleProgress),
 {
     ensure_feature_db_exists(&config.feature_db)?;
     let seed_contracts = read_seed_contracts(&config.input)?;
     let total = seed_contracts.len();
-    let completed = AtomicUsize::new(0);
     let resource_options =
         DuckDbResourceOptions::from_cli(config.duckdb_threads, &config.duckdb_memory_limit)?;
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(config.workers.max(1))
-        .build()
-        .map_err(|err| SampleCollectionError::Parallel(err.to_string()))?;
-
-    let mut indexed_seed_reports = pool.install(|| {
-        seed_contracts
-            .par_iter()
-            .enumerate()
-            .map_init(
-                || SampleWorker::new(&config, &resource_options).map_err(|err| err.to_string()),
-                |worker, (index, seed_contract)| match worker {
-                    Ok(worker) => {
-                        let result = worker.process_seed_contract(&config, index, seed_contract);
-                        if let Ok((_, seed_report)) = result.as_ref() {
-                            let completed = completed.fetch_add(1, Ordering::SeqCst) + 1;
-                            progress(SeedProgress {
-                                completed,
-                                total,
-                                contract_address: seed_report.contract_address.clone(),
-                                candidate_count: seed_report.candidate_reports.len(),
-                            });
-                        }
-                        result
-                    }
-                    Err(err) => Err(SampleCollectionError::Parallel(err.clone())),
-                },
-            )
-            .collect::<Result<Vec<_>, SampleCollectionError>>()
-    })?;
-    indexed_seed_reports.sort_by_key(|(index, _)| *index);
-    let seed_reports = indexed_seed_reports
-        .into_iter()
-        .map(|(_, seed_report)| seed_report)
-        .collect();
+    let mut worker = SampleWorker::new(&config, &resource_options)?;
+    let mut seed_reports = Vec::with_capacity(seed_contracts.len());
+    for (index, seed_contract) in seed_contracts.iter().enumerate() {
+        seed_reports.push(worker.process_seed_contract(
+            &config,
+            seed_contract,
+            index + 1,
+            total,
+            &mut progress,
+        )?);
+    }
 
     let report = SampleReport {
         chain: config.chain.clone(),
@@ -164,22 +145,33 @@ impl SampleWorker {
             &config.feature_db.to_string_lossy(),
             resource_options.clone(),
         )?;
-        let sample_conn = open_read_only_connection(&config.feature_db)?;
+        let sample_conn =
+            open_read_only_connection_with_options(&config.feature_db, resource_options)?;
         Ok(Self { store, sample_conn })
     }
 
     fn process_seed_contract(
         &mut self,
         config: &SampleCollectionConfig,
-        index: usize,
         seed_contract: &str,
-    ) -> Result<(usize, SeedSampleReport), SampleCollectionError> {
+        seed_index: usize,
+        total_seeds: usize,
+        progress: &mut impl FnMut(SampleProgress),
+    ) -> Result<SeedSampleReport, SampleCollectionError> {
         let seed_rows = read_contract_rows_with_conn(
             &self.sample_conn,
             &config.chain,
             seed_contract,
             config.max_seed_tokens,
         )?;
+        emit_progress(
+            progress,
+            seed_index,
+            total_seeds,
+            SampleProgressStage::ReadSeedRows,
+            1,
+            None,
+        );
         let seed_nfts = seed_rows
             .iter()
             .map(|row| seed_nft_from_database_row(&config.chain, row))
@@ -194,6 +186,14 @@ impl SampleWorker {
                 config.max_recall_rows,
             )?
         };
+        emit_progress(
+            progress,
+            seed_index,
+            total_seeds,
+            SampleProgressStage::LoadRecallRows,
+            2,
+            None,
+        );
         let candidates = build_duplicate_candidates(
             &config.chain,
             &seed_nfts,
@@ -204,21 +204,61 @@ impl SampleWorker {
         .into_iter()
         .filter(is_name_or_metadata_candidate)
         .collect::<Vec<_>>();
+        emit_progress(
+            progress,
+            seed_index,
+            total_seeds,
+            SampleProgressStage::ScoreCandidates,
+            3,
+            Some(candidates.len()),
+        );
         let recalled_row_count = snapshot.nft_rows.len();
         let candidate_reports =
             candidate_reports_with_conn(&self.sample_conn, &config.chain, &candidates)?;
+        emit_progress(
+            progress,
+            seed_index,
+            total_seeds,
+            SampleProgressStage::LoadCandidateSamples,
+            4,
+            Some(candidate_reports.len()),
+        );
 
-        Ok((
-            index,
-            SeedSampleReport {
-                seed_sample: contract_sample_from_rows(seed_contract, &seed_rows),
-                contract_address: seed_contract.to_string(),
-                seed_row_count: seed_rows.len(),
-                recalled_row_count,
-                candidate_reports,
-            },
-        ))
+        let seed_report = SeedSampleReport {
+            seed_sample: contract_sample_from_rows(seed_contract, &seed_rows),
+            contract_address: seed_contract.to_string(),
+            seed_row_count: seed_rows.len(),
+            recalled_row_count,
+            candidate_reports,
+        };
+        emit_progress(
+            progress,
+            seed_index,
+            total_seeds,
+            SampleProgressStage::FinishedSeed,
+            5,
+            Some(seed_report.candidate_reports.len()),
+        );
+        Ok(seed_report)
     }
+}
+
+fn emit_progress(
+    progress: &mut impl FnMut(SampleProgress),
+    seed_index: usize,
+    total_seeds: usize,
+    stage: SampleProgressStage,
+    stage_index: usize,
+    candidate_count: Option<usize>,
+) {
+    progress(SampleProgress {
+        seed_index,
+        total_seeds,
+        stage,
+        stage_index,
+        stage_count: 5,
+        candidate_count,
+    });
 }
 
 fn ensure_feature_db_exists(path: &Path) -> Result<(), SampleCollectionError> {
@@ -392,6 +432,24 @@ fn open_read_only_connection(path: &Path) -> Result<Connection, duckdb::Error> {
     } else {
         Connection::open_with_flags(path, Config::default().access_mode(AccessMode::ReadOnly)?)
     }
+}
+
+fn open_read_only_connection_with_options(
+    path: &Path,
+    options: &DuckDbResourceOptions,
+) -> Result<Connection, duckdb::Error> {
+    let conn = open_read_only_connection(path)?;
+    let memory_limit = options.memory_limit.replace('\'', "''");
+    conn.execute_batch(&format!(
+        "
+        PRAGMA threads={};
+        PRAGMA memory_limit='{}';
+        PRAGMA preserve_insertion_order=false;
+        ",
+        options.threads.max(1),
+        memory_limit
+    ))?;
+    Ok(conn)
 }
 
 fn seed_nft_from_database_row(chain: &str, row: &DatabaseNftRecord) -> SeedNft {

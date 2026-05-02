@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use indicatif::{ProgressBar, ProgressStyle};
-use name_metadata_change_samples::{collect_samples_with_progress, SampleCollectionConfig};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use name_metadata_change_samples::{
+    collect_samples_with_progress, SampleCollectionConfig, SampleProgressStage,
+};
 
 #[derive(Debug, Parser)]
 #[command(about = "Collect local name/metadata duplicate samples for seed contracts")]
@@ -25,8 +27,6 @@ struct Args {
     max_recall_rows: usize,
     #[arg(long, default_value_t = 0)]
     max_seed_tokens: usize,
-    #[arg(long, default_value_t = 1)]
-    workers: usize,
     #[arg(long, default_value_t = 0)]
     duckdb_threads: usize,
     #[arg(long, default_value = "80GB")]
@@ -36,10 +36,18 @@ struct Args {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let output = args.output.clone();
-    let progress = ProgressBar::new(0);
-    progress.set_style(
+    let multi = MultiProgress::new();
+    let total_progress = multi.add(ProgressBar::new(0));
+    total_progress.set_style(
         ProgressStyle::with_template(
-            "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} {msg}",
+            "{spinner:.green} [{elapsed_precise}] seeds [{wide_bar:.cyan/blue}] {pos}/{len} {msg}",
+        )?
+        .progress_chars("=>-"),
+    );
+    let seed_progress = multi.add(ProgressBar::new(0));
+    seed_progress.set_style(
+        ProgressStyle::with_template(
+            "  current seed [{wide_bar:.magenta/blue}] {pos}/{len} {msg}",
         )?
         .progress_chars("=>-"),
     );
@@ -55,17 +63,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_tokens_per_contract: args.max_tokens_per_contract,
             max_recall_rows: args.max_recall_rows,
             max_seed_tokens: args.max_seed_tokens,
-            workers: args.workers,
             duckdb_threads: args.duckdb_threads,
             duckdb_memory_limit: args.duckdb_memory_limit,
         },
         |event| {
-            progress.set_length(event.total as u64);
-            progress.set_position(event.completed as u64);
-            progress.set_message(format!(
-                "{} candidates={}",
-                event.contract_address, event.candidate_count
-            ));
+            total_progress.set_length(event.total_seeds as u64);
+            let finished_seeds = if event.stage == SampleProgressStage::FinishedSeed {
+                event.seed_index
+            } else {
+                event.seed_index.saturating_sub(1)
+            };
+            total_progress.set_position(finished_seeds as u64);
+            total_progress.set_message(format!("seed {}/{}", event.seed_index, event.total_seeds));
+
+            seed_progress.set_length(event.stage_count as u64);
+            seed_progress.set_position(event.stage_index as u64);
+            seed_progress.set_message(progress_message(event.stage, event.candidate_count));
         },
     )?;
 
@@ -74,7 +87,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .map(|seed| seed.candidate_reports.len())
         .sum();
-    progress.finish_with_message("done");
+    seed_progress.finish_and_clear();
+    total_progress.finish_with_message("done");
     println!(
         "wrote {} seed reports and {} name/metadata candidate groups to {}",
         report.seed_reports.len(),
@@ -82,4 +96,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         output.display()
     );
     Ok(())
+}
+
+fn progress_message(stage: SampleProgressStage, candidate_count: Option<usize>) -> String {
+    let label = match stage {
+        SampleProgressStage::ReadSeedRows => "read seed rows",
+        SampleProgressStage::LoadRecallRows => "load recall rows",
+        SampleProgressStage::ScoreCandidates => "score candidates",
+        SampleProgressStage::LoadCandidateSamples => "load candidate samples",
+        SampleProgressStage::FinishedSeed => "finish seed",
+    };
+    match candidate_count {
+        Some(count) => format!("{label} candidates={count}"),
+        None => label.to_string(),
+    }
 }

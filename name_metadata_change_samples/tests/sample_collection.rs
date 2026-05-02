@@ -1,10 +1,8 @@
-use std::fs;
-use std::sync::{Arc, Mutex};
-
 use name_metadata_change_samples::{
     collect_contract_samples, collect_samples, collect_samples_with_progress,
-    SampleCollectionConfig,
+    SampleCollectionConfig, SampleProgressStage,
 };
+use std::fs;
 use tempfile::tempdir;
 use top_contract_analysis_rs::models::DatabaseNftRecord;
 use top_contract_analysis_rs::store::DuckDbFeatureStore;
@@ -82,7 +80,6 @@ fn collect_samples_outputs_only_name_metadata_candidates() {
         max_tokens_per_contract: 0,
         max_recall_rows: 0,
         max_seed_tokens: 0,
-        workers: 1,
         duckdb_threads: 1,
         duckdb_memory_limit: "1GB".into(),
     })
@@ -162,7 +159,6 @@ fn collect_samples_preserves_visible_name_and_metadata_text() {
         max_tokens_per_contract: 0,
         max_recall_rows: 0,
         max_seed_tokens: 0,
-        workers: 1,
         duckdb_threads: 1,
         duckdb_memory_limit: "1GB".into(),
     })
@@ -236,7 +232,7 @@ fn collect_contract_samples_reads_many_contracts_in_one_call() {
 }
 
 #[test]
-fn collect_samples_can_process_multiple_seeds_with_workers() {
+fn collect_samples_processes_multiple_seeds_serially() {
     let temp = tempdir().unwrap();
     let db_path = temp.path().join("features.duckdb");
     let input_path = temp.path().join("contracts.txt");
@@ -292,7 +288,6 @@ fn collect_samples_can_process_multiple_seeds_with_workers() {
         max_tokens_per_contract: 0,
         max_recall_rows: 0,
         max_seed_tokens: 0,
-        workers: 2,
         duckdb_threads: 1,
         duckdb_memory_limit: "1GB".into(),
     })
@@ -306,7 +301,7 @@ fn collect_samples_can_process_multiple_seeds_with_workers() {
 }
 
 #[test]
-fn collect_samples_reports_progress_after_each_seed() {
+fn collect_samples_reports_serial_in_contract_progress_without_addresses() {
     let temp = tempdir().unwrap();
     let db_path = temp.path().join("features.duckdb");
     let input_path = temp.path().join("contracts.txt");
@@ -352,8 +347,7 @@ fn collect_samples_reports_progress_after_each_seed() {
 
     fs::write(&input_path, "0xseed1\n0xseed2\n").unwrap();
 
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let events_for_callback = Arc::clone(&events);
+    let mut events = Vec::new();
     collect_samples_with_progress(
         SampleCollectionConfig {
             chain: "ethereum".into(),
@@ -365,26 +359,34 @@ fn collect_samples_reports_progress_after_each_seed() {
             max_tokens_per_contract: 0,
             max_recall_rows: 0,
             max_seed_tokens: 0,
-            workers: 2,
             duckdb_threads: 1,
             duckdb_memory_limit: "1GB".into(),
         },
         |event| {
-            events_for_callback.lock().unwrap().push((
-                event.completed,
-                event.total,
-                event.contract_address.clone(),
+            events.push((
+                event.seed_index,
+                event.total_seeds,
+                event.stage,
+                event.stage_index,
+                event.stage_count,
                 event.candidate_count,
             ));
         },
     )
     .unwrap();
 
-    let mut events = events.lock().unwrap().clone();
-    events.sort_by_key(|event| event.0);
-    assert_eq!(events.len(), 2);
-    assert_eq!(events[0].0, 1);
-    assert_eq!(events[1].0, 2);
+    assert_eq!(events.len(), 10);
     assert!(events.iter().all(|event| event.1 == 2));
-    assert!(events.iter().all(|event| event.3 == 1));
+    assert!(events.iter().all(|event| event.4 == 5));
+    assert_eq!(events[0].0, 1);
+    assert_eq!(events[0].2, SampleProgressStage::ReadSeedRows);
+    assert_eq!(events[0].3, 1);
+    assert_eq!(events[4].0, 1);
+    assert_eq!(events[4].2, SampleProgressStage::FinishedSeed);
+    assert_eq!(events[4].3, 5);
+    assert_eq!(events[4].5, Some(1));
+    assert_eq!(events[5].0, 2);
+    assert_eq!(events[5].2, SampleProgressStage::ReadSeedRows);
+    assert_eq!(events[9].0, 2);
+    assert_eq!(events[9].2, SampleProgressStage::FinishedSeed);
 }
