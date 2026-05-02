@@ -15,7 +15,7 @@
 ## 运行
 
 ```powershell
-cargo run --release -- `
+cargo run --release -- \
   --feature-db ../output/top_contract_analysis/features.duckdb \
   --input ./seeds.txt \
   --output ./result.md
