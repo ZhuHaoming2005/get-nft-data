@@ -1,6 +1,10 @@
 use std::fs;
+use std::sync::{Arc, Mutex};
 
-use name_metadata_change_samples::{collect_samples, SampleCollectionConfig};
+use name_metadata_change_samples::{
+    collect_contract_samples, collect_samples, collect_samples_with_progress,
+    SampleCollectionConfig,
+};
 use tempfile::tempdir;
 use top_contract_analysis_rs::models::DatabaseNftRecord;
 use top_contract_analysis_rs::store::DuckDbFeatureStore;
@@ -78,6 +82,7 @@ fn collect_samples_outputs_only_name_metadata_candidates() {
         max_tokens_per_contract: 0,
         max_recall_rows: 0,
         max_seed_tokens: 0,
+        workers: 1,
         duckdb_threads: 1,
         duckdb_memory_limit: "1GB".into(),
     })
@@ -157,6 +162,7 @@ fn collect_samples_preserves_visible_name_and_metadata_text() {
         max_tokens_per_contract: 0,
         max_recall_rows: 0,
         max_seed_tokens: 0,
+        workers: 1,
         duckdb_threads: 1,
         duckdb_memory_limit: "1GB".into(),
     })
@@ -167,4 +173,218 @@ fn collect_samples_preserves_visible_name_and_metadata_text() {
     assert!(output.contains("Bored Ape Copy #42"));
     assert!(output.contains("Blue Fur Laser Eyes"));
     assert!(output.contains(r#""trait_type":"Fur""#));
+}
+
+#[test]
+fn collect_contract_samples_reads_many_contracts_in_one_call() {
+    let temp = tempdir().unwrap();
+    let db_path = temp.path().join("features.duckdb");
+
+    let store = DuckDbFeatureStore::new(db_path.to_str().unwrap()).unwrap();
+    store
+        .replace_chain_rows(
+            "ethereum",
+            &[
+                DatabaseNftRecord {
+                    contract_address: "0xfirst".into(),
+                    token_id: "1".into(),
+                    name: "".into(),
+                    symbol: "".into(),
+                    metadata_doc: "".into(),
+                    metadata_json: "".into(),
+                    ..Default::default()
+                },
+                DatabaseNftRecord {
+                    contract_address: "0xfirst".into(),
+                    token_id: "2".into(),
+                    name: "First Contract".into(),
+                    symbol: "FIRST".into(),
+                    metadata_doc: "first usable metadata".into(),
+                    metadata_json: r#"{"description":"first usable metadata"}"#.into(),
+                    ..Default::default()
+                },
+                DatabaseNftRecord {
+                    contract_address: "0xsecond".into(),
+                    token_id: "4".into(),
+                    name: "Second Contract".into(),
+                    symbol: "SECOND".into(),
+                    metadata_doc: "second metadata".into(),
+                    metadata_json: r#"{"description":"second metadata"}"#.into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+    drop(store);
+
+    let samples = collect_contract_samples(
+        &db_path,
+        "ethereum",
+        &["0xsecond".to_string(), "0xfirst".to_string()],
+    )
+    .unwrap();
+
+    assert_eq!(samples.len(), 2);
+    assert_eq!(samples[0].contract_address, "0xsecond");
+    assert_eq!(samples[0].name, "Second Contract");
+    assert_eq!(samples[0].metadata_source_token_id, "4");
+    assert_eq!(samples[0].row_count, 1);
+    assert_eq!(samples[1].contract_address, "0xfirst");
+    assert_eq!(samples[1].name, "First Contract");
+    assert_eq!(samples[1].metadata_source_token_id, "2");
+    assert_eq!(samples[1].row_count, 2);
+}
+
+#[test]
+fn collect_samples_can_process_multiple_seeds_with_workers() {
+    let temp = tempdir().unwrap();
+    let db_path = temp.path().join("features.duckdb");
+    let input_path = temp.path().join("contracts.txt");
+    let output_path = temp.path().join("samples.md");
+
+    let store = DuckDbFeatureStore::new(db_path.to_str().unwrap()).unwrap();
+    store
+        .replace_chain_rows(
+            "ethereum",
+            &[
+                DatabaseNftRecord {
+                    contract_address: "0xseed1".into(),
+                    token_id: "1".into(),
+                    name: "Seed One".into(),
+                    metadata_doc: "shared one".into(),
+                    ..Default::default()
+                },
+                DatabaseNftRecord {
+                    contract_address: "0xcopy1".into(),
+                    token_id: "1".into(),
+                    name: "Seed One".into(),
+                    metadata_doc: "changed".into(),
+                    ..Default::default()
+                },
+                DatabaseNftRecord {
+                    contract_address: "0xseed2".into(),
+                    token_id: "1".into(),
+                    name: "Seed Two".into(),
+                    metadata_doc: "shared two".into(),
+                    ..Default::default()
+                },
+                DatabaseNftRecord {
+                    contract_address: "0xcopy2".into(),
+                    token_id: "1".into(),
+                    name: "Different".into(),
+                    metadata_doc: "shared two".into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+    drop(store);
+
+    fs::write(&input_path, "0xseed1\n0xseed2\n").unwrap();
+
+    let report = collect_samples(SampleCollectionConfig {
+        chain: "ethereum".into(),
+        feature_db: db_path,
+        input: input_path,
+        output: output_path,
+        name_threshold: 95.0,
+        metadata_threshold: 0.6,
+        max_tokens_per_contract: 0,
+        max_recall_rows: 0,
+        max_seed_tokens: 0,
+        workers: 2,
+        duckdb_threads: 1,
+        duckdb_memory_limit: "1GB".into(),
+    })
+    .unwrap();
+
+    assert_eq!(report.seed_reports.len(), 2);
+    assert_eq!(report.seed_reports[0].contract_address, "0xseed1");
+    assert_eq!(report.seed_reports[1].contract_address, "0xseed2");
+    assert_eq!(report.seed_reports[0].candidate_reports.len(), 1);
+    assert_eq!(report.seed_reports[1].candidate_reports.len(), 1);
+}
+
+#[test]
+fn collect_samples_reports_progress_after_each_seed() {
+    let temp = tempdir().unwrap();
+    let db_path = temp.path().join("features.duckdb");
+    let input_path = temp.path().join("contracts.txt");
+    let output_path = temp.path().join("samples.md");
+
+    let store = DuckDbFeatureStore::new(db_path.to_str().unwrap()).unwrap();
+    store
+        .replace_chain_rows(
+            "ethereum",
+            &[
+                DatabaseNftRecord {
+                    contract_address: "0xseed1".into(),
+                    token_id: "1".into(),
+                    name: "Seed One".into(),
+                    metadata_doc: "shared one".into(),
+                    ..Default::default()
+                },
+                DatabaseNftRecord {
+                    contract_address: "0xcopy1".into(),
+                    token_id: "1".into(),
+                    name: "Seed One".into(),
+                    metadata_doc: "changed".into(),
+                    ..Default::default()
+                },
+                DatabaseNftRecord {
+                    contract_address: "0xseed2".into(),
+                    token_id: "1".into(),
+                    name: "Seed Two".into(),
+                    metadata_doc: "shared two".into(),
+                    ..Default::default()
+                },
+                DatabaseNftRecord {
+                    contract_address: "0xcopy2".into(),
+                    token_id: "1".into(),
+                    name: "Different".into(),
+                    metadata_doc: "shared two".into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+    drop(store);
+
+    fs::write(&input_path, "0xseed1\n0xseed2\n").unwrap();
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let events_for_callback = Arc::clone(&events);
+    collect_samples_with_progress(
+        SampleCollectionConfig {
+            chain: "ethereum".into(),
+            feature_db: db_path,
+            input: input_path,
+            output: output_path,
+            name_threshold: 95.0,
+            metadata_threshold: 0.6,
+            max_tokens_per_contract: 0,
+            max_recall_rows: 0,
+            max_seed_tokens: 0,
+            workers: 2,
+            duckdb_threads: 1,
+            duckdb_memory_limit: "1GB".into(),
+        },
+        |event| {
+            events_for_callback.lock().unwrap().push((
+                event.completed,
+                event.total,
+                event.contract_address.clone(),
+                event.candidate_count,
+            ));
+        },
+    )
+    .unwrap();
+
+    let mut events = events.lock().unwrap().clone();
+    events.sort_by_key(|event| event.0);
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].0, 1);
+    assert_eq!(events[1].0, 2);
+    assert!(events.iter().all(|event| event.1 == 2));
+    assert!(events.iter().all(|event| event.3 == 1));
 }

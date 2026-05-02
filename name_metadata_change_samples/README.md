@@ -18,6 +18,7 @@
 cargo run --release -- \
   --feature-db ../output/top_contract_analysis/features.duckdb \
   --input ./seeds.txt \
+  --workers 3 \
   --output ./result.md
 ```
 
@@ -27,6 +28,7 @@ cargo run --release -- \
 - `--name-threshold`：默认 `95.0`
 - `--metadata-threshold`：默认 `0.6`
 - `--max-tokens-per-contract`：传给 `top_contract_analysis_rs` 的每候选合约召回上限，默认 `0` 表示不限制
+- `--workers`：并行处理 seed 合约的 worker 数，默认 `1`
 - `--duckdb-threads` / `--duckdb-memory-limit`：与 `top_contract_analysis_rs` 的 DuckDB 资源参数一致
 
 ## 输出口径

@@ -1,7 +1,10 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use duckdb::{params, Connection};
+use duckdb::{params, AccessMode, Config, Connection};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use top_contract_analysis_rs::analysis::duplicate::build_duplicate_candidates;
@@ -20,6 +23,7 @@ pub struct SampleCollectionConfig {
     pub max_tokens_per_contract: usize,
     pub max_recall_rows: usize,
     pub max_seed_tokens: usize,
+    pub workers: usize,
     pub duckdb_threads: usize,
     pub duckdb_memory_limit: String,
 }
@@ -59,6 +63,14 @@ pub struct CandidateSampleReport {
     pub sample: ContractSample,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SeedProgress {
+    pub completed: usize,
+    pub total: usize,
+    pub contract_address: String,
+    pub candidate_count: usize,
+}
+
 #[derive(Debug, Error)]
 pub enum SampleCollectionError {
     #[error("io error: {0}")]
@@ -71,71 +83,64 @@ pub enum SampleCollectionError {
     EmptyInput,
     #[error("feature DB does not exist: {0}")]
     MissingFeatureDb(String),
+    #[error("parallel worker error: {0}")]
+    Parallel(String),
 }
 
 pub fn collect_samples(
     config: SampleCollectionConfig,
 ) -> Result<SampleReport, SampleCollectionError> {
+    collect_samples_with_progress(config, |_| {})
+}
+
+pub fn collect_samples_with_progress<F>(
+    config: SampleCollectionConfig,
+    progress: F,
+) -> Result<SampleReport, SampleCollectionError>
+where
+    F: Fn(SeedProgress) + Sync,
+{
     ensure_feature_db_exists(&config.feature_db)?;
     let seed_contracts = read_seed_contracts(&config.input)?;
-
-    let mut seed_inputs = Vec::new();
-    for seed_contract in seed_contracts {
-        let seed_rows = read_contract_rows(
-            &config.feature_db,
-            &config.chain,
-            &seed_contract,
-            config.max_seed_tokens,
-        )?;
-        seed_inputs.push((seed_contract, seed_rows));
-    }
-
+    let total = seed_contracts.len();
+    let completed = AtomicUsize::new(0);
     let resource_options =
         DuckDbResourceOptions::from_cli(config.duckdb_threads, &config.duckdb_memory_limit)?;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(config.workers.max(1))
+        .build()
+        .map_err(|err| SampleCollectionError::Parallel(err.to_string()))?;
 
-    let mut seed_reports = Vec::new();
-    for (seed_contract, seed_rows) in seed_inputs {
-        let seed_nfts = seed_rows
-            .iter()
-            .map(|row| seed_nft_from_database_row(&config.chain, row))
-            .collect::<Vec<_>>();
-        let (recalled_row_count, candidates) = {
-            let store = DuckDbFeatureStore::new_with_options(
-                &config.feature_db.to_string_lossy(),
-                resource_options.clone(),
-            )?;
-            let snapshot = if seed_nfts.is_empty() {
-                Default::default()
-            } else {
-                store.load_snapshot(
-                    &config.chain,
-                    &seed_nfts,
-                    config.max_tokens_per_contract,
-                    config.max_recall_rows,
-                )?
-            };
-            let candidates = build_duplicate_candidates(
-                &config.chain,
-                &seed_nfts,
-                &snapshot.nft_rows,
-                config.name_threshold,
-                config.metadata_threshold,
+    let mut indexed_seed_reports = pool.install(|| {
+        seed_contracts
+            .par_iter()
+            .enumerate()
+            .map_init(
+                || SampleWorker::new(&config, &resource_options).map_err(|err| err.to_string()),
+                |worker, (index, seed_contract)| match worker {
+                    Ok(worker) => {
+                        let result = worker.process_seed_contract(&config, index, seed_contract);
+                        if let Ok((_, seed_report)) = result.as_ref() {
+                            let completed = completed.fetch_add(1, Ordering::SeqCst) + 1;
+                            progress(SeedProgress {
+                                completed,
+                                total,
+                                contract_address: seed_report.contract_address.clone(),
+                                candidate_count: seed_report.candidate_reports.len(),
+                            });
+                        }
+                        result
+                    }
+                    Err(err) => Err(SampleCollectionError::Parallel(err.clone())),
+                },
             )
-            .into_iter()
-            .filter(is_name_or_metadata_candidate)
-            .collect::<Vec<_>>();
-            (snapshot.nft_rows.len(), candidates)
-        };
-        let candidate_reports = candidate_reports(&config.feature_db, &config.chain, &candidates)?;
-
-        seed_reports.push(SeedSampleReport {
-            seed_sample: contract_sample_from_rows(&seed_contract, &seed_rows),
-            contract_address: seed_contract,
-            seed_row_count: seed_rows.len(),
-            recalled_row_count,
-            candidate_reports,
-        });
-    }
+            .collect::<Result<Vec<_>, SampleCollectionError>>()
+    })?;
+    indexed_seed_reports.sort_by_key(|(index, _)| *index);
+    let seed_reports = indexed_seed_reports
+        .into_iter()
+        .map(|(_, seed_report)| seed_report)
+        .collect();
 
     let report = SampleReport {
         chain: config.chain.clone(),
@@ -143,6 +148,77 @@ pub fn collect_samples(
     };
     write_markdown_report(&config.output, &report)?;
     Ok(report)
+}
+
+struct SampleWorker {
+    store: DuckDbFeatureStore,
+    sample_conn: Connection,
+}
+
+impl SampleWorker {
+    fn new(
+        config: &SampleCollectionConfig,
+        resource_options: &DuckDbResourceOptions,
+    ) -> Result<Self, SampleCollectionError> {
+        let store = DuckDbFeatureStore::open_read_only_with_options(
+            &config.feature_db.to_string_lossy(),
+            resource_options.clone(),
+        )?;
+        let sample_conn = open_read_only_connection(&config.feature_db)?;
+        Ok(Self { store, sample_conn })
+    }
+
+    fn process_seed_contract(
+        &mut self,
+        config: &SampleCollectionConfig,
+        index: usize,
+        seed_contract: &str,
+    ) -> Result<(usize, SeedSampleReport), SampleCollectionError> {
+        let seed_rows = read_contract_rows_with_conn(
+            &self.sample_conn,
+            &config.chain,
+            seed_contract,
+            config.max_seed_tokens,
+        )?;
+        let seed_nfts = seed_rows
+            .iter()
+            .map(|row| seed_nft_from_database_row(&config.chain, row))
+            .collect::<Vec<_>>();
+        let snapshot = if seed_nfts.is_empty() {
+            Default::default()
+        } else {
+            self.store.load_snapshot(
+                &config.chain,
+                &seed_nfts,
+                config.max_tokens_per_contract,
+                config.max_recall_rows,
+            )?
+        };
+        let candidates = build_duplicate_candidates(
+            &config.chain,
+            &seed_nfts,
+            &snapshot.nft_rows,
+            config.name_threshold,
+            config.metadata_threshold,
+        )
+        .into_iter()
+        .filter(is_name_or_metadata_candidate)
+        .collect::<Vec<_>>();
+        let recalled_row_count = snapshot.nft_rows.len();
+        let candidate_reports =
+            candidate_reports_with_conn(&self.sample_conn, &config.chain, &candidates)?;
+
+        Ok((
+            index,
+            SeedSampleReport {
+                seed_sample: contract_sample_from_rows(seed_contract, &seed_rows),
+                contract_address: seed_contract.to_string(),
+                seed_row_count: seed_rows.len(),
+                recalled_row_count,
+                candidate_reports,
+            },
+        ))
+    }
 }
 
 fn ensure_feature_db_exists(path: &Path) -> Result<(), SampleCollectionError> {
@@ -170,13 +246,12 @@ fn read_seed_contracts(path: &Path) -> Result<Vec<String>, SampleCollectionError
     }
 }
 
-fn read_contract_rows(
-    feature_db: &Path,
+fn read_contract_rows_with_conn(
+    conn: &Connection,
     chain: &str,
     contract_address: &str,
     limit: usize,
 ) -> Result<Vec<DatabaseNftRecord>, duckdb::Error> {
-    let conn = Connection::open(feature_db)?;
     let limit_sql = if limit > 0 {
         format!(" LIMIT {limit}")
     } else {
@@ -212,6 +287,113 @@ fn read_contract_rows(
     rows.collect()
 }
 
+pub fn collect_contract_samples(
+    feature_db: &Path,
+    chain: &str,
+    contract_addresses: &[String],
+) -> Result<Vec<ContractSample>, SampleCollectionError> {
+    let conn = open_read_only_connection(feature_db)?;
+    collect_contract_samples_with_conn(&conn, chain, contract_addresses)
+}
+
+fn collect_contract_samples_with_conn(
+    conn: &Connection,
+    chain: &str,
+    contract_addresses: &[String],
+) -> Result<Vec<ContractSample>, SampleCollectionError> {
+    if contract_addresses.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut requested_addresses = Vec::new();
+    for address in contract_addresses {
+        let normalized = address.to_lowercase();
+        if !requested_addresses.contains(&normalized) {
+            requested_addresses.push(normalized);
+        }
+    }
+    let address_values = requested_addresses
+        .iter()
+        .map(|address| sql_string_literal(address))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let sql = format!(
+        "
+        WITH selected AS (
+            SELECT lower(contract_address) AS contract_address,
+                   CAST(token_id AS VARCHAR) AS token_id,
+                   coalesce(CAST(name AS VARCHAR), '') AS name,
+                   coalesce(CAST(symbol AS VARCHAR), '') AS symbol,
+                   coalesce(CAST(metadata_doc AS VARCHAR), '') AS metadata_doc,
+                   coalesce(CAST(metadata_json AS VARCHAR), '') AS metadata_json
+            FROM nft_features
+            WHERE chain = ? AND lower(contract_address) IN ({address_values})
+        ),
+        ranked AS (
+            SELECT contract_address, token_id, name, symbol, metadata_doc, metadata_json,
+                   count(*) OVER (PARTITION BY contract_address) AS row_count,
+                   row_number() OVER (
+                       PARTITION BY contract_address
+                       ORDER BY CASE WHEN name <> '' THEN 0 ELSE 1 END, token_id
+                   ) AS name_rank,
+                   row_number() OVER (
+                       PARTITION BY contract_address
+                       ORDER BY CASE WHEN symbol <> '' THEN 0 ELSE 1 END, token_id
+                   ) AS symbol_rank,
+                   row_number() OVER (
+                       PARTITION BY contract_address
+                       ORDER BY CASE WHEN metadata_doc <> '' OR metadata_json <> '' THEN 0 ELSE 1 END, token_id
+                   ) AS metadata_rank
+            FROM selected
+        )
+        SELECT contract_address,
+               max(CASE WHEN name_rank = 1 THEN name ELSE NULL END) AS name,
+               max(CASE WHEN symbol_rank = 1 THEN symbol ELSE NULL END) AS symbol,
+               max(CASE WHEN metadata_rank = 1 THEN token_id ELSE NULL END) AS metadata_source_token_id,
+               max(CASE WHEN metadata_rank = 1 THEN metadata_doc ELSE NULL END) AS metadata_doc,
+               max(CASE WHEN metadata_rank = 1 THEN metadata_json ELSE NULL END) AS metadata_json,
+               max(row_count) AS row_count
+        FROM ranked
+        GROUP BY contract_address
+        "
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![chain], |row| {
+        Ok(ContractSample {
+            contract_address: row.get::<_, String>(0)?,
+            name: row.get::<_, String>(1)?,
+            symbol: row.get::<_, String>(2)?,
+            metadata_source_token_id: row.get::<_, String>(3)?,
+            metadata_doc: row.get::<_, String>(4)?,
+            metadata_json: row.get::<_, String>(5)?,
+            row_count: row.get::<_, i64>(6)? as usize,
+        })
+    })?;
+    let mut samples_by_contract = HashMap::new();
+    for row in rows {
+        let sample = row?;
+        samples_by_contract.insert(sample.contract_address.clone(), sample);
+    }
+
+    Ok(requested_addresses
+        .into_iter()
+        .filter_map(|address| samples_by_contract.remove(&address))
+        .collect())
+}
+
+fn sql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn open_read_only_connection(path: &Path) -> Result<Connection, duckdb::Error> {
+    if path == Path::new(":memory:") {
+        Connection::open_in_memory()
+    } else {
+        Connection::open_with_flags(path, Config::default().access_mode(AccessMode::ReadOnly)?)
+    }
+}
+
 fn seed_nft_from_database_row(chain: &str, row: &DatabaseNftRecord) -> SeedNft {
     SeedNft {
         chain: chain.to_string(),
@@ -233,27 +415,37 @@ fn is_name_or_metadata_candidate(candidate: &DuplicateCandidate) -> bool {
         .any(|reason| matches!(reason.as_str(), "name_match" | "metadata_match"))
 }
 
-fn candidate_reports(
-    feature_db: &Path,
+fn candidate_reports_with_conn(
+    conn: &Connection,
     chain: &str,
     candidates: &[DuplicateCandidate],
 ) -> Result<Vec<CandidateSampleReport>, SampleCollectionError> {
+    let contract_addresses = candidates
+        .iter()
+        .map(|candidate| candidate.contract_address.clone())
+        .collect::<Vec<_>>();
+    let mut samples_by_contract =
+        collect_contract_samples_with_conn(conn, chain, &contract_addresses)?
+            .into_iter()
+            .map(|sample| (sample.contract_address.clone(), sample))
+            .collect::<HashMap<_, _>>();
+
     candidates
         .iter()
         .map(
             |candidate| -> Result<CandidateSampleReport, SampleCollectionError> {
-                let rows = read_contract_rows(feature_db, chain, &candidate.contract_address, 0)?;
-                let recalled_row_count = rows.len();
+                let sample = samples_by_contract
+                    .remove(&candidate.contract_address.to_lowercase())
+                    .unwrap_or_else(|| ContractSample {
+                        contract_address: candidate.contract_address.clone(),
+                        ..ContractSample::default()
+                    });
                 Ok(CandidateSampleReport {
                     contract_address: candidate.contract_address.clone(),
                     match_reasons: candidate.match_reasons.clone(),
                     confidence: candidate.confidence.clone(),
-                    recalled_row_count,
-                    sample: contract_sample_from_rows(&candidate.contract_address, &rows)
-                        .unwrap_or_else(|| ContractSample {
-                            contract_address: candidate.contract_address.clone(),
-                            ..ContractSample::default()
-                        }),
+                    recalled_row_count: sample.row_count,
+                    sample,
                 })
             },
         )
