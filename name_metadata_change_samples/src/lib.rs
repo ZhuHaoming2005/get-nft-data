@@ -1,14 +1,37 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use duckdb::{params, AccessMode, Config, Connection};
+use once_cell::sync::Lazy;
+use rayon::prelude::*;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
-use top_contract_analysis_rs::analysis::duplicate::build_duplicate_candidates;
-use top_contract_analysis_rs::error::AppError;
-use top_contract_analysis_rs::models::{DatabaseNftRecord, DuplicateCandidate, SeedNft};
-use top_contract_analysis_rs::store::{DuckDbFeatureStore, DuckDbResourceOptions};
+use unicode_normalization::UnicodeNormalization;
+
+type TokenId = u32;
+
+static TRAILING_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"\s*#\s*[0-9a-fA-FxX]+\s*$").unwrap(),
+        Regex::new(r"\s*#\s*\d+\s*$").unwrap(),
+        Regex::new(r"\s*-\s*\d+\s*$").unwrap(),
+        Regex::new(r"\s*:\s*\d+\s*$").unwrap(),
+        Regex::new(r"\s*\(\s*\d+\s*\)\s*$").unwrap(),
+        Regex::new(r"\s*\[\s*\d+\s*\]\s*$").unwrap(),
+        Regex::new(r"\s*/\s*\d+\s*$").unwrap(),
+        Regex::new(r"\s+No\.?\s*\d+\s*$").unwrap(),
+        Regex::new(r"\s+nr\.?\s*\d+\s*$").unwrap(),
+        Regex::new(r"\s+\d{1,12}\s*$").unwrap(),
+    ]
+});
+static WHITESPACE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
+static TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\p{L}\p{N}_]+").unwrap());
+
+const METADATA_BM25_K1: f64 = 1.2;
+const METADATA_BM25_B: f64 = 0.75;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SampleCollectionConfig {
@@ -18,7 +41,6 @@ pub struct SampleCollectionConfig {
     pub output: PathBuf,
     pub name_threshold: f64,
     pub metadata_threshold: f64,
-    pub max_tokens_per_contract: usize,
     pub max_recall_rows: usize,
     pub max_seed_tokens: usize,
     pub duckdb_threads: usize,
@@ -33,39 +55,23 @@ pub struct SampleReport {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SeedSampleReport {
-    pub contract_address: String,
-    pub seed_sample: Option<ContractSample>,
-    pub seed_row_count: usize,
-    pub recalled_row_count: usize,
-    pub candidate_reports: Vec<CandidateSampleReport>,
+    pub name: TextComparison,
+    pub metadata: TextComparison,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ContractSample {
-    pub contract_address: String,
-    pub name: String,
-    pub symbol: String,
-    pub metadata_source_token_id: String,
-    pub metadata_doc: String,
-    pub metadata_json: String,
-    pub row_count: usize,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CandidateSampleReport {
-    pub contract_address: String,
-    pub match_reasons: Vec<String>,
-    pub confidence: String,
-    pub recalled_row_count: usize,
-    pub sample: ContractSample,
+pub struct TextComparison {
+    pub seed: String,
+    pub matches: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SampleProgressStage {
     ReadSeedRows,
-    LoadRecallRows,
-    ScoreCandidates,
-    LoadCandidateSamples,
+    LoadNameCandidates,
+    ScoreNameCandidates,
+    LoadMetadataCandidates,
+    ScoreMetadataCandidates,
     FinishedSeed,
 }
 
@@ -85,12 +91,104 @@ pub enum SampleCollectionError {
     Io(#[from] std::io::Error),
     #[error("duckdb error: {0}")]
     DuckDb(#[from] duckdb::Error),
-    #[error("analysis error: {0}")]
-    Analysis(#[from] AppError),
     #[error("input file did not contain any contract addresses")]
     EmptyInput,
     #[error("feature DB does not exist: {0}")]
     MissingFeatureDb(String),
+}
+
+#[derive(Clone, Debug, Default)]
+struct NftTextRow {
+    name: String,
+    metadata_doc: String,
+    metadata_json: String,
+}
+
+#[derive(Clone, Debug)]
+struct NameCandidate {
+    contract_address: String,
+    display_name: String,
+    normalized_names: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct MetadataCandidate {
+    contract_address: String,
+    text: String,
+    doc: MetadataDocument,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TextIndex {
+    names: Vec<NameCandidate>,
+    name_indices_by_normalized: Vec<NormalizedNameEntry>,
+    metadata: Vec<MetadataCandidate>,
+    metadata_token_ids: HashMap<String, TokenId>,
+    metadata_corpus: MetadataCorpus,
+    metadata_indices_by_token: HashMap<TokenId, Vec<usize>>,
+    metadata_indices_by_contract: HashMap<String, Vec<usize>>,
+}
+
+#[derive(Clone, Debug)]
+struct NormalizedNameEntry {
+    normalized: String,
+    candidate_indices: Vec<usize>,
+}
+
+#[derive(Default)]
+struct NameCandidateBuilder {
+    display_name: Option<String>,
+    normalized_names: BTreeSet<String>,
+}
+
+#[derive(Default)]
+struct SampleScratch {
+    metadata_seen_epochs: Vec<u32>,
+    metadata_epoch: u32,
+}
+
+#[derive(Clone, Copy)]
+struct SeedPosition {
+    index: usize,
+    total: usize,
+}
+
+impl SampleScratch {
+    fn new(metadata_len: usize) -> Self {
+        Self {
+            metadata_seen_epochs: vec![0; metadata_len],
+            metadata_epoch: 0,
+        }
+    }
+
+    fn next_metadata_epoch(&mut self) -> u32 {
+        self.metadata_epoch = self.metadata_epoch.wrapping_add(1);
+        if self.metadata_epoch == 0 {
+            self.metadata_seen_epochs.fill(0);
+            self.metadata_epoch = 1;
+        }
+        self.metadata_epoch
+    }
+}
+
+#[derive(Default)]
+struct TokenInterner {
+    ids: HashMap<String, TokenId>,
+}
+
+impl TokenInterner {
+    fn intern(&mut self, token: String) -> TokenId {
+        if let Some(token_id) = self.ids.get(&token) {
+            return *token_id;
+        }
+        let token_id = self.ids.len() as TokenId;
+        self.ids.insert(token, token_id);
+        token_id
+    }
+
+    fn into_ids(self) -> HashMap<String, TokenId> {
+        self.ids
+    }
 }
 
 pub fn collect_samples(
@@ -109,16 +207,22 @@ where
     ensure_feature_db_exists(&config.feature_db)?;
     let seed_contracts = read_seed_contracts(&config.input)?;
     let total = seed_contracts.len();
-    let resource_options =
-        DuckDbResourceOptions::from_cli(config.duckdb_threads, &config.duckdb_memory_limit)?;
-    let mut worker = SampleWorker::new(&config, &resource_options)?;
+    let conn = open_read_only_connection_with_options(&config.feature_db, &config)?;
+    let text_index = load_text_index(&conn, &config.chain)?;
+    let mut scratch = SampleScratch::new(text_index.metadata.len());
     let mut seed_reports = Vec::with_capacity(seed_contracts.len());
+
     for (index, seed_contract) in seed_contracts.iter().enumerate() {
-        seed_reports.push(worker.process_seed_contract(
+        seed_reports.push(process_seed_contract(
+            &conn,
+            &text_index,
+            &mut scratch,
             &config,
             seed_contract,
-            index + 1,
-            total,
+            SeedPosition {
+                index: index + 1,
+                total,
+            },
             &mut progress,
         )?);
     }
@@ -131,116 +235,97 @@ where
     Ok(report)
 }
 
-struct SampleWorker {
-    store: DuckDbFeatureStore,
-    sample_conn: Connection,
-}
+fn process_seed_contract(
+    conn: &Connection,
+    text_index: &TextIndex,
+    scratch: &mut SampleScratch,
+    config: &SampleCollectionConfig,
+    seed_contract: &str,
+    position: SeedPosition,
+    progress: &mut impl FnMut(SampleProgress),
+) -> Result<SeedSampleReport, SampleCollectionError> {
+    let seed_rows = read_seed_rows(conn, &config.chain, seed_contract, config.max_seed_tokens)?;
+    emit_progress(
+        progress,
+        position.index,
+        position.total,
+        SampleProgressStage::ReadSeedRows,
+        1,
+        None,
+    );
 
-impl SampleWorker {
-    fn new(
-        config: &SampleCollectionConfig,
-        resource_options: &DuckDbResourceOptions,
-    ) -> Result<Self, SampleCollectionError> {
-        let store = DuckDbFeatureStore::open_read_only_with_options(
-            &config.feature_db.to_string_lossy(),
-            resource_options.clone(),
-        )?;
-        let sample_conn =
-            open_read_only_connection_with_options(&config.feature_db, resource_options)?;
-        Ok(Self { store, sample_conn })
-    }
+    emit_progress(
+        progress,
+        position.index,
+        position.total,
+        SampleProgressStage::LoadNameCandidates,
+        2,
+        Some(text_index.names.len()),
+    );
+    let seed_name = first_seed_name(&seed_rows);
+    let seed_name_norms = seed_name_norms(&seed_rows);
+    let name_matches = match_names(
+        &seed_name_norms,
+        text_index,
+        seed_contract,
+        config.name_threshold,
+        config.max_recall_rows,
+    );
+    emit_progress(
+        progress,
+        position.index,
+        position.total,
+        SampleProgressStage::ScoreNameCandidates,
+        3,
+        Some(name_matches.len()),
+    );
 
-    fn process_seed_contract(
-        &mut self,
-        config: &SampleCollectionConfig,
-        seed_contract: &str,
-        seed_index: usize,
-        total_seeds: usize,
-        progress: &mut impl FnMut(SampleProgress),
-    ) -> Result<SeedSampleReport, SampleCollectionError> {
-        let seed_rows = read_contract_rows_with_conn(
-            &self.sample_conn,
-            &config.chain,
-            seed_contract,
-            config.max_seed_tokens,
-        )?;
-        emit_progress(
-            progress,
-            seed_index,
-            total_seeds,
-            SampleProgressStage::ReadSeedRows,
-            1,
-            None,
-        );
-        let seed_nfts = seed_rows
-            .iter()
-            .map(|row| seed_nft_from_database_row(&config.chain, row))
-            .collect::<Vec<_>>();
-        let snapshot = if seed_nfts.is_empty() {
-            Default::default()
-        } else {
-            self.store.load_snapshot(
-                &config.chain,
-                &seed_nfts,
-                config.max_tokens_per_contract,
-                config.max_recall_rows,
-            )?
-        };
-        emit_progress(
-            progress,
-            seed_index,
-            total_seeds,
-            SampleProgressStage::LoadRecallRows,
-            2,
-            None,
-        );
-        let candidates = build_duplicate_candidates(
-            &config.chain,
-            &seed_nfts,
-            &snapshot.nft_rows,
-            config.name_threshold,
-            config.metadata_threshold,
-        )
-        .into_iter()
-        .filter(is_name_or_metadata_candidate)
-        .collect::<Vec<_>>();
-        emit_progress(
-            progress,
-            seed_index,
-            total_seeds,
-            SampleProgressStage::ScoreCandidates,
-            3,
-            Some(candidates.len()),
-        );
-        let recalled_row_count = snapshot.nft_rows.len();
-        let candidate_reports =
-            candidate_reports_with_conn(&self.sample_conn, &config.chain, &candidates)?;
-        emit_progress(
-            progress,
-            seed_index,
-            total_seeds,
-            SampleProgressStage::LoadCandidateSamples,
-            4,
-            Some(candidate_reports.len()),
-        );
+    emit_progress(
+        progress,
+        position.index,
+        position.total,
+        SampleProgressStage::LoadMetadataCandidates,
+        4,
+        Some(text_index.metadata.len()),
+    );
+    let seed_metadata = first_seed_metadata(&seed_rows);
+    let metadata_matches = match_metadata(
+        &seed_metadata,
+        text_index,
+        scratch,
+        seed_contract,
+        config.metadata_threshold,
+        config.max_recall_rows,
+    );
+    emit_progress(
+        progress,
+        position.index,
+        position.total,
+        SampleProgressStage::ScoreMetadataCandidates,
+        5,
+        Some(metadata_matches.len()),
+    );
 
-        let seed_report = SeedSampleReport {
-            seed_sample: contract_sample_from_rows(seed_contract, &seed_rows),
-            contract_address: seed_contract.to_string(),
-            seed_row_count: seed_rows.len(),
-            recalled_row_count,
-            candidate_reports,
-        };
-        emit_progress(
-            progress,
-            seed_index,
-            total_seeds,
-            SampleProgressStage::FinishedSeed,
-            5,
-            Some(seed_report.candidate_reports.len()),
-        );
-        Ok(seed_report)
-    }
+    let report = SeedSampleReport {
+        name: TextComparison {
+            seed: seed_name,
+            matches: name_matches,
+        },
+        metadata: TextComparison {
+            seed: seed_metadata,
+            matches: metadata_matches,
+        },
+    };
+    let match_count = report.name.matches.len() + report.metadata.matches.len();
+    emit_progress(
+        progress,
+        position.index,
+        position.total,
+        SampleProgressStage::FinishedSeed,
+        6,
+        Some(match_count),
+    );
+    Ok(report)
 }
 
 fn emit_progress(
@@ -256,7 +341,7 @@ fn emit_progress(
         total_seeds,
         stage,
         stage_index,
-        stage_count: 5,
+        stage_count: 6,
         candidate_count,
     });
 }
@@ -286,12 +371,12 @@ fn read_seed_contracts(path: &Path) -> Result<Vec<String>, SampleCollectionError
     }
 }
 
-fn read_contract_rows_with_conn(
+fn read_seed_rows(
     conn: &Connection,
     chain: &str,
     contract_address: &str,
     limit: usize,
-) -> Result<Vec<DatabaseNftRecord>, duckdb::Error> {
+) -> Result<Vec<NftTextRow>, duckdb::Error> {
     let limit_sql = if limit > 0 {
         format!(" LIMIT {limit}")
     } else {
@@ -299,9 +384,9 @@ fn read_contract_rows_with_conn(
     };
     let sql = format!(
         "
-        SELECT contract_address, token_id, coalesce(token_uri, ''), coalesce(image_uri, ''),
-               coalesce(name, ''), coalesce(symbol, ''), coalesce(metadata_json, ''),
-               coalesce(metadata_doc, '')
+        SELECT coalesce(CAST(name AS VARCHAR), ''),
+               coalesce(CAST(metadata_doc AS VARCHAR), ''),
+               coalesce(CAST(metadata_json AS VARCHAR), '')
         FROM nft_features
         WHERE chain = ? AND lower(contract_address) = ?
         ORDER BY token_id
@@ -310,239 +395,663 @@ fn read_contract_rows_with_conn(
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![chain, contract_address.to_lowercase()], |row| {
-        Ok(DatabaseNftRecord {
-            contract_address: row.get::<_, String>(0)?,
-            token_id: row.get::<_, String>(1)?,
-            token_uri: row.get::<_, String>(2)?,
-            image_uri: row.get::<_, String>(3)?,
-            name: row.get::<_, String>(4)?,
-            symbol: row.get::<_, String>(5)?,
-            metadata_json: row.get::<_, String>(6)?,
-            metadata_doc: row.get::<_, String>(7)?,
-            metadata_recall_checked: false,
-            metadata_recall_match: false,
+        Ok(NftTextRow {
+            name: row.get::<_, String>(0)?,
+            metadata_doc: row.get::<_, String>(1)?,
+            metadata_json: row.get::<_, String>(2)?,
         })
     })?;
-
     rows.collect()
 }
 
-pub fn collect_contract_samples(
-    feature_db: &Path,
-    chain: &str,
-    contract_addresses: &[String],
-) -> Result<Vec<ContractSample>, SampleCollectionError> {
-    let conn = open_read_only_connection(feature_db)?;
-    collect_contract_samples_with_conn(&conn, chain, contract_addresses)
+fn load_text_index(conn: &Connection, chain: &str) -> Result<TextIndex, duckdb::Error> {
+    let names = load_name_index(conn, chain)?;
+    let name_indices_by_normalized = build_name_indices_by_normalized(&names);
+    let mut metadata_token_interner = TokenInterner::default();
+    let metadata = load_metadata_index(conn, chain, &mut metadata_token_interner)?;
+    let metadata_token_ids = metadata_token_interner.into_ids();
+    let metadata_corpus = MetadataCorpus::from_documents(metadata.iter().map(|item| &item.doc));
+    let metadata_indices_by_token = build_metadata_indices_by_token(&metadata);
+    let metadata_indices_by_contract = build_metadata_indices_by_contract(&metadata);
+    Ok(TextIndex {
+        names,
+        name_indices_by_normalized,
+        metadata,
+        metadata_token_ids,
+        metadata_corpus,
+        metadata_indices_by_token,
+        metadata_indices_by_contract,
+    })
 }
 
-fn collect_contract_samples_with_conn(
-    conn: &Connection,
-    chain: &str,
-    contract_addresses: &[String],
-) -> Result<Vec<ContractSample>, SampleCollectionError> {
-    if contract_addresses.is_empty() {
-        return Ok(Vec::new());
+fn load_name_index(conn: &Connection, chain: &str) -> Result<Vec<NameCandidate>, duckdb::Error> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT lower(contract_address) AS contract_address,
+               coalesce(CAST(name AS VARCHAR), '') AS name,
+               min(CAST(token_id AS VARCHAR)) AS first_token_id
+        FROM nft_features
+        WHERE chain = ? AND trim(coalesce(CAST(name AS VARCHAR), '')) <> ''
+        GROUP BY contract_address, name
+        ORDER BY contract_address, first_token_id
+        ",
+    )?;
+    let rows = stmt.query_map(params![chain], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+
+    let mut by_contract = HashMap::<String, NameCandidateBuilder>::new();
+    for row in rows {
+        let (contract_address, name) = row?;
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let normalized = normalize_name(trimmed);
+        if normalized.is_empty() {
+            continue;
+        }
+        let builder = by_contract.entry(contract_address).or_default();
+        if builder.display_name.is_none() {
+            builder.display_name = Some(trimmed.to_string());
+        }
+        builder.normalized_names.insert(normalized);
     }
 
-    let mut requested_addresses = Vec::new();
-    for address in contract_addresses {
-        let normalized = address.to_lowercase();
-        if !requested_addresses.contains(&normalized) {
-            requested_addresses.push(normalized);
+    let mut candidates = by_contract
+        .into_iter()
+        .filter_map(|(contract_address, builder)| {
+            let display_name = builder.display_name?;
+            let normalized_names = builder.normalized_names.into_iter().collect::<Vec<_>>();
+            (!normalized_names.is_empty()).then_some(NameCandidate {
+                contract_address,
+                display_name,
+                normalized_names,
+            })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        (&left.display_name, &left.contract_address)
+            .cmp(&(&right.display_name, &right.contract_address))
+    });
+    Ok(candidates)
+}
+
+fn build_name_indices_by_normalized(names: &[NameCandidate]) -> Vec<NormalizedNameEntry> {
+    let mut by_normalized = HashMap::<String, Vec<usize>>::new();
+    for (candidate_index, candidate) in names.iter().enumerate() {
+        for normalized in &candidate.normalized_names {
+            by_normalized
+                .entry(normalized.clone())
+                .or_default()
+                .push(candidate_index);
         }
     }
-    let address_values = requested_addresses
-        .iter()
-        .map(|address| sql_string_literal(address))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let mut entries = by_normalized
+        .into_iter()
+        .map(|(normalized, candidate_indices)| NormalizedNameEntry {
+            normalized,
+            candidate_indices,
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.normalized.cmp(&right.normalized));
+    entries
+}
 
-    let sql = format!(
+fn load_metadata_index(
+    conn: &Connection,
+    chain: &str,
+    token_interner: &mut TokenInterner,
+) -> Result<Vec<MetadataCandidate>, duckdb::Error> {
+    let mut stmt = conn.prepare(
         "
         WITH selected AS (
             SELECT lower(contract_address) AS contract_address,
                    CAST(token_id AS VARCHAR) AS token_id,
-                   coalesce(CAST(name AS VARCHAR), '') AS name,
-                   coalesce(CAST(symbol AS VARCHAR), '') AS symbol,
                    coalesce(CAST(metadata_doc AS VARCHAR), '') AS metadata_doc,
                    coalesce(CAST(metadata_json AS VARCHAR), '') AS metadata_json
             FROM nft_features
-            WHERE chain = ? AND lower(contract_address) IN ({address_values})
+            WHERE chain = ?
         ),
         ranked AS (
-            SELECT contract_address, token_id, name, symbol, metadata_doc, metadata_json,
-                   count(*) OVER (PARTITION BY contract_address) AS row_count,
+            SELECT contract_address, metadata_doc, metadata_json,
                    row_number() OVER (
                        PARTITION BY contract_address
-                       ORDER BY CASE WHEN name <> '' THEN 0 ELSE 1 END, token_id
-                   ) AS name_rank,
-                   row_number() OVER (
-                       PARTITION BY contract_address
-                       ORDER BY CASE WHEN symbol <> '' THEN 0 ELSE 1 END, token_id
-                   ) AS symbol_rank,
-                   row_number() OVER (
-                       PARTITION BY contract_address
-                       ORDER BY CASE WHEN metadata_doc <> '' OR metadata_json <> '' THEN 0 ELSE 1 END, token_id
+                       ORDER BY CASE
+                           WHEN trim(metadata_doc) <> '' OR trim(metadata_json) <> '' THEN 0
+                           ELSE 1
+                       END, token_id
                    ) AS metadata_rank
             FROM selected
         )
-        SELECT contract_address,
-               max(CASE WHEN name_rank = 1 THEN name ELSE NULL END) AS name,
-               max(CASE WHEN symbol_rank = 1 THEN symbol ELSE NULL END) AS symbol,
-               max(CASE WHEN metadata_rank = 1 THEN token_id ELSE NULL END) AS metadata_source_token_id,
-               max(CASE WHEN metadata_rank = 1 THEN metadata_doc ELSE NULL END) AS metadata_doc,
-               max(CASE WHEN metadata_rank = 1 THEN metadata_json ELSE NULL END) AS metadata_json,
-               max(row_count) AS row_count
+        SELECT contract_address, metadata_doc, metadata_json
         FROM ranked
-        GROUP BY contract_address
-        "
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![chain], |row| {
-        Ok(ContractSample {
-            contract_address: row.get::<_, String>(0)?,
-            name: row.get::<_, String>(1)?,
-            symbol: row.get::<_, String>(2)?,
-            metadata_source_token_id: row.get::<_, String>(3)?,
-            metadata_doc: row.get::<_, String>(4)?,
-            metadata_json: row.get::<_, String>(5)?,
-            row_count: row.get::<_, i64>(6)? as usize,
-        })
-    })?;
-    let mut samples_by_contract = HashMap::new();
-    for row in rows {
-        let sample = row?;
-        samples_by_contract.insert(sample.contract_address.clone(), sample);
-    }
-
-    Ok(requested_addresses
-        .into_iter()
-        .filter_map(|address| samples_by_contract.remove(&address))
-        .collect())
-}
-
-fn sql_string_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-fn open_read_only_connection(path: &Path) -> Result<Connection, duckdb::Error> {
-    if path == Path::new(":memory:") {
-        Connection::open_in_memory()
-    } else {
-        Connection::open_with_flags(path, Config::default().access_mode(AccessMode::ReadOnly)?)
-    }
-}
-
-fn open_read_only_connection_with_options(
-    path: &Path,
-    options: &DuckDbResourceOptions,
-) -> Result<Connection, duckdb::Error> {
-    let conn = open_read_only_connection(path)?;
-    let memory_limit = options.memory_limit.replace('\'', "''");
-    conn.execute_batch(&format!(
-        "
-        PRAGMA threads={};
-        PRAGMA memory_limit='{}';
-        PRAGMA preserve_insertion_order=false;
+        WHERE metadata_rank = 1
+          AND (trim(metadata_doc) <> '' OR trim(metadata_json) <> '')
+        ORDER BY contract_address
         ",
-        options.threads.max(1),
-        memory_limit
-    ))?;
-    Ok(conn)
-}
+    )?;
+    let rows = stmt.query_map(params![chain], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
 
-fn seed_nft_from_database_row(chain: &str, row: &DatabaseNftRecord) -> SeedNft {
-    SeedNft {
-        chain: chain.to_string(),
-        contract_address: row.contract_address.clone(),
-        token_id: row.token_id.clone(),
-        name: row.name.clone(),
-        symbol: row.symbol.clone(),
-        token_uri: row.token_uri.clone(),
-        image_uri: row.image_uri.clone(),
-        metadata_json: row.metadata_json.clone(),
-        metadata_doc: row.metadata_doc.clone(),
+    let mut candidates = Vec::new();
+    for row in rows {
+        let (contract_address, metadata_doc, metadata_json) = row?;
+        let text = record_metadata_doc(&metadata_doc, &metadata_json);
+        let Some(doc) = MetadataDocument::from_text_with_interner(&text, token_interner) else {
+            continue;
+        };
+        candidates.push(MetadataCandidate {
+            contract_address,
+            text,
+            doc,
+        });
     }
+    Ok(candidates)
 }
 
-fn is_name_or_metadata_candidate(candidate: &DuplicateCandidate) -> bool {
-    candidate
-        .match_reasons
-        .iter()
-        .any(|reason| matches!(reason.as_str(), "name_match" | "metadata_match"))
+fn build_metadata_indices_by_token(metadata: &[MetadataCandidate]) -> HashMap<TokenId, Vec<usize>> {
+    let mut index = HashMap::<TokenId, Vec<usize>>::new();
+    for (doc_index, candidate) in metadata.iter().enumerate() {
+        for token in &candidate.doc.unique_tokens {
+            index.entry(*token).or_default().push(doc_index);
+        }
+    }
+    index
 }
 
-fn candidate_reports_with_conn(
-    conn: &Connection,
-    chain: &str,
-    candidates: &[DuplicateCandidate],
-) -> Result<Vec<CandidateSampleReport>, SampleCollectionError> {
-    let contract_addresses = candidates
-        .iter()
-        .map(|candidate| candidate.contract_address.clone())
-        .collect::<Vec<_>>();
-    let mut samples_by_contract =
-        collect_contract_samples_with_conn(conn, chain, &contract_addresses)?
-            .into_iter()
-            .map(|sample| (sample.contract_address.clone(), sample))
-            .collect::<HashMap<_, _>>();
+fn build_metadata_indices_by_contract(
+    metadata: &[MetadataCandidate],
+) -> HashMap<String, Vec<usize>> {
+    let mut index = HashMap::<String, Vec<usize>>::new();
+    for (doc_index, candidate) in metadata.iter().enumerate() {
+        index
+            .entry(candidate.contract_address.clone())
+            .or_default()
+            .push(doc_index);
+    }
+    index
+}
 
-    candidates
-        .iter()
-        .map(
-            |candidate| -> Result<CandidateSampleReport, SampleCollectionError> {
-                let sample = samples_by_contract
-                    .remove(&candidate.contract_address.to_lowercase())
-                    .unwrap_or_else(|| ContractSample {
-                        contract_address: candidate.contract_address.clone(),
-                        ..ContractSample::default()
-                    });
-                Ok(CandidateSampleReport {
-                    contract_address: candidate.contract_address.clone(),
-                    match_reasons: candidate.match_reasons.clone(),
-                    confidence: candidate.confidence.clone(),
-                    recalled_row_count: sample.row_count,
-                    sample,
-                })
-            },
-        )
+fn first_seed_name(rows: &[NftTextRow]) -> String {
+    rows.iter()
+        .find_map(|row| non_empty(&row.name))
+        .unwrap_or_default()
+}
+
+fn seed_name_norms(rows: &[NftTextRow]) -> Vec<String> {
+    rows.iter()
+        .map(|row| normalize_name(&row.name))
+        .filter(|name| !name.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect()
 }
 
-fn contract_sample_from_rows(
-    contract_address: &str,
-    rows: &[DatabaseNftRecord],
-) -> Option<ContractSample> {
-    if rows.is_empty() {
-        return None;
+fn first_seed_metadata(rows: &[NftTextRow]) -> String {
+    rows.iter()
+        .find_map(|row| non_empty(&record_metadata_doc(&row.metadata_doc, &row.metadata_json)))
+        .unwrap_or_default()
+}
+
+fn match_names(
+    seed_name_norms: &[String],
+    text_index: &TextIndex,
+    seed_contract: &str,
+    threshold: f64,
+    limit: usize,
+) -> Vec<String> {
+    if seed_name_norms.is_empty() {
+        return Vec::new();
+    }
+    if threshold > 100.0 {
+        return Vec::new();
+    }
+    let seed_contract = seed_contract.to_lowercase();
+    let mut matched_candidate_indices = if threshold >= 100.0 {
+        exact_name_candidate_indices(seed_name_norms, text_index, &seed_contract)
+    } else {
+        text_index
+            .name_indices_by_normalized
+            .par_iter()
+            .filter_map(|entry| {
+                if !seed_name_norms.iter().any(|seed_name| {
+                    score_normalized_name_pair(&entry.normalized, seed_name) >= threshold
+                }) {
+                    return None;
+                }
+                Some(
+                    entry
+                        .candidate_indices
+                        .iter()
+                        .copied()
+                        .filter(|index| text_index.names[*index].contract_address != seed_contract)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .flatten()
+            .collect::<Vec<_>>()
+    };
+    matched_candidate_indices.sort_unstable();
+    matched_candidate_indices.dedup();
+    materialize_name_matches(text_index, matched_candidate_indices, limit)
+}
+
+fn exact_name_candidate_indices(
+    seed_name_norms: &[String],
+    text_index: &TextIndex,
+    seed_contract: &str,
+) -> Vec<usize> {
+    let mut indices = Vec::new();
+    for seed_name in seed_name_norms {
+        if let Ok(entry_index) = text_index
+            .name_indices_by_normalized
+            .binary_search_by(|entry| entry.normalized.as_str().cmp(seed_name.as_str()))
+        {
+            indices.extend(
+                text_index.name_indices_by_normalized[entry_index]
+                    .candidate_indices
+                    .iter()
+                    .copied()
+                    .filter(|index| text_index.names[*index].contract_address != seed_contract),
+            );
+        }
+    }
+    indices
+}
+
+fn match_metadata(
+    seed_metadata: &str,
+    text_index: &TextIndex,
+    scratch: &mut SampleScratch,
+    seed_contract: &str,
+    threshold: f64,
+    limit: usize,
+) -> Vec<String> {
+    let Some(seed_doc) =
+        MetadataDocument::from_text_with_vocab(seed_metadata, &text_index.metadata_token_ids)
+    else {
+        return Vec::new();
+    };
+    let seed_contract = seed_contract.to_lowercase();
+    let excluded_indices = text_index
+        .metadata_indices_by_contract
+        .get(&seed_contract)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let corpus = MetadataCorpusView::new(
+        &text_index.metadata_corpus,
+        &text_index.metadata,
+        excluded_indices,
+    );
+    if corpus.total_docs == 0 {
+        return Vec::new();
     }
 
-    let mut sorted_rows = rows.to_vec();
-    sorted_rows.sort_by(|left, right| left.token_id.cmp(&right.token_id));
+    let epoch = scratch.next_metadata_epoch();
+    let mut candidate_indices = Vec::new();
+    for token in &seed_doc.unique_tokens {
+        let Some(indices) = text_index.metadata_indices_by_token.get(token) else {
+            continue;
+        };
+        for index in indices {
+            if text_index.metadata[*index].contract_address == seed_contract {
+                continue;
+            }
+            if scratch.metadata_seen_epochs[*index] == epoch {
+                continue;
+            }
+            scratch.metadata_seen_epochs[*index] = epoch;
+            candidate_indices.push(*index);
+        }
+    }
 
-    let name = sorted_rows
-        .iter()
-        .find_map(|row| non_empty(&row.name))
-        .unwrap_or_default();
-    let symbol = sorted_rows
-        .iter()
-        .find_map(|row| non_empty(&row.symbol))
-        .unwrap_or_default();
-    let metadata_row = sorted_rows
-        .iter()
-        .find(|row| !row.metadata_doc.trim().is_empty() || !row.metadata_json.trim().is_empty())
-        .unwrap_or(&sorted_rows[0]);
+    let matched_indices = candidate_indices
+        .par_iter()
+        .filter_map(|index| {
+            let candidate = &text_index.metadata[*index];
+            (score_metadata_pair(&seed_doc, &candidate.doc, &corpus) >= threshold).then_some(*index)
+        })
+        .collect::<Vec<_>>();
+    materialize_metadata_matches(text_index, matched_indices, limit)
+}
 
-    Some(ContractSample {
-        contract_address: contract_address.to_string(),
-        name,
-        symbol,
-        metadata_source_token_id: metadata_row.token_id.clone(),
-        metadata_doc: metadata_row.metadata_doc.clone(),
-        metadata_json: metadata_row.metadata_json.clone(),
-        row_count: sorted_rows.len(),
-    })
+fn materialize_name_matches(
+    text_index: &TextIndex,
+    indices: Vec<usize>,
+    limit: usize,
+) -> Vec<String> {
+    take_recall_limit(
+        indices
+            .into_iter()
+            .map(|index| text_index.names[index].display_name.trim().to_string())
+            .collect(),
+        limit,
+    )
+}
+
+fn materialize_metadata_matches(
+    text_index: &TextIndex,
+    indices: Vec<usize>,
+    limit: usize,
+) -> Vec<String> {
+    take_recall_limit(
+        indices
+            .into_iter()
+            .map(|index| text_index.metadata[index].text.trim().to_string())
+            .collect(),
+        limit,
+    )
+}
+
+fn take_recall_limit(values: BTreeSet<String>, limit: usize) -> Vec<String> {
+    let iter = values.into_iter();
+    if limit > 0 {
+        iter.take(limit).collect()
+    } else {
+        iter.collect()
+    }
+}
+
+fn normalize_nfkc(raw: &str) -> String {
+    raw.nfkc().collect::<String>()
+}
+
+fn strip_trailing_number_suffix(raw: &str) -> String {
+    let mut text = normalize_nfkc(raw).trim().to_string();
+    let mut changed = true;
+    let mut guard = 0;
+    while changed && guard < 20 {
+        changed = false;
+        guard += 1;
+        for pattern in TRAILING_PATTERNS.iter() {
+            let updated = pattern.replace(&text, "").trim().to_string();
+            if updated != text {
+                text = updated;
+                changed = true;
+                break;
+            }
+        }
+    }
+    WHITESPACE_RE.replace_all(&text, " ").trim().to_string()
+}
+
+fn normalize_name(raw: &str) -> String {
+    strip_trailing_number_suffix(raw).to_lowercase()
+}
+
+fn normalize_text(raw: &str) -> String {
+    let text = normalize_nfkc(raw).to_lowercase();
+    WHITESPACE_RE.replace_all(text.trim(), " ").to_string()
+}
+
+fn flatten_metadata(value: &Value, parts: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, item) in map {
+                let key = key.to_lowercase();
+                if matches!(
+                    key.as_str(),
+                    "description"
+                        | "trait_type"
+                        | "value"
+                        | "display_type"
+                        | "image"
+                        | "image_url"
+                        | "animation_url"
+                        | "external_url"
+                        | "attributes"
+                        | "metadata"
+                        | "rawmetadata"
+                        | "raw"
+                ) {
+                    flatten_metadata(item, parts);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                flatten_metadata(item, parts);
+            }
+        }
+        Value::String(text) if !text.trim().is_empty() => {
+            parts.push(text.trim().to_string());
+        }
+        _ => {}
+    }
+}
+
+fn metadata_document_from_json(raw: &str) -> String {
+    if raw.trim().is_empty() {
+        return String::new();
+    }
+    match serde_json::from_str::<Value>(raw) {
+        Ok(value) => {
+            let mut parts = Vec::new();
+            flatten_metadata(&value, &mut parts);
+            normalize_text(&parts.join(" "))
+        }
+        Err(_) => normalize_text(raw),
+    }
+}
+
+fn record_metadata_doc(metadata_doc: &str, metadata_json: &str) -> String {
+    if !metadata_doc.trim().is_empty() {
+        metadata_doc.to_string()
+    } else {
+        metadata_document_from_json(metadata_json)
+    }
+}
+
+fn metadata_tokens(value: &str) -> Vec<String> {
+    TOKEN_RE
+        .find_iter(&normalize_text(value))
+        .map(|m| m.as_str().to_string())
+        .filter(|token| token.len() >= 2)
+        .collect()
+}
+
+fn score_normalized_name_pair(left_norm: &str, right_norm: &str) -> f64 {
+    if left_norm.is_empty() || right_norm.is_empty() {
+        0.0
+    } else if left_norm == right_norm {
+        100.0
+    } else {
+        strsim::jaro_winkler(left_norm, right_norm) * 100.0
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MetadataDocument {
+    tokens: Vec<TokenId>,
+    unique_tokens: Vec<TokenId>,
+    term_freqs: Vec<(TokenId, usize)>,
+}
+
+impl MetadataDocument {
+    fn from_text_with_interner(value: &str, interner: &mut TokenInterner) -> Option<Self> {
+        let tokens = metadata_tokens(value)
+            .into_iter()
+            .map(|token| interner.intern(token))
+            .collect();
+        Self::from_tokens(tokens)
+    }
+
+    fn from_text_with_vocab(value: &str, vocab: &HashMap<String, TokenId>) -> Option<Self> {
+        let mut unknown_ids = HashMap::<String, TokenId>::new();
+        let mut next_unknown_id = vocab.len() as TokenId;
+        let tokens = metadata_tokens(value)
+            .into_iter()
+            .map(|token| {
+                if let Some(token_id) = vocab.get(&token) {
+                    *token_id
+                } else if let Some(token_id) = unknown_ids.get(&token) {
+                    *token_id
+                } else {
+                    let token_id = next_unknown_id;
+                    next_unknown_id += 1;
+                    unknown_ids.insert(token, token_id);
+                    token_id
+                }
+            })
+            .collect();
+        Self::from_tokens(tokens)
+    }
+
+    fn from_tokens(tokens: Vec<TokenId>) -> Option<Self> {
+        if tokens.is_empty() {
+            return None;
+        }
+        let mut term_freqs = HashMap::<TokenId, usize>::new();
+        for token in &tokens {
+            *term_freqs.entry(*token).or_insert(0) += 1;
+        }
+        let unique_tokens = tokens
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let mut term_freqs = term_freqs.into_iter().collect::<Vec<_>>();
+        term_freqs.sort_by_key(|(token, _)| *token);
+        Some(Self {
+            tokens,
+            unique_tokens,
+            term_freqs,
+        })
+    }
+
+    fn term_frequency(&self, token: TokenId) -> usize {
+        self.term_freqs
+            .binary_search_by_key(&token, |(candidate_token, _)| *candidate_token)
+            .map(|index| self.term_freqs[index].1)
+            .unwrap_or(0)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct MetadataCorpus {
+    total_docs: usize,
+    total_terms: usize,
+    doc_freqs: HashMap<TokenId, usize>,
+}
+
+impl MetadataCorpus {
+    fn from_documents<'a>(documents: impl Iterator<Item = &'a MetadataDocument>) -> Self {
+        let mut corpus = Self::default();
+        for document in documents {
+            corpus.total_docs += 1;
+            corpus.total_terms += document.tokens.len();
+            for token in &document.unique_tokens {
+                *corpus.doc_freqs.entry(*token).or_insert(0) += 1;
+            }
+        }
+        corpus
+    }
+}
+
+struct MetadataCorpusView<'a> {
+    base: &'a MetadataCorpus,
+    excluded_doc_freqs: HashMap<TokenId, usize>,
+    total_docs: usize,
+    avg_doc_len: f64,
+}
+
+impl<'a> MetadataCorpusView<'a> {
+    fn new(
+        base: &'a MetadataCorpus,
+        documents: &'a [MetadataCandidate],
+        excluded_indices: &'a [usize],
+    ) -> Self {
+        let mut excluded_doc_freqs = HashMap::new();
+        let mut excluded_terms = 0usize;
+        for index in excluded_indices {
+            let document = &documents[*index].doc;
+            excluded_terms += document.tokens.len();
+            for token in &document.unique_tokens {
+                *excluded_doc_freqs.entry(*token).or_insert(0) += 1;
+            }
+        }
+        let total_docs = base.total_docs.saturating_sub(excluded_indices.len());
+        let total_terms = base.total_terms.saturating_sub(excluded_terms);
+        let avg_doc_len = if total_docs == 0 {
+            0.0
+        } else {
+            total_terms as f64 / total_docs as f64
+        };
+        Self {
+            base,
+            excluded_doc_freqs,
+            total_docs,
+            avg_doc_len,
+        }
+    }
+
+    fn document_frequency(&self, token: TokenId) -> usize {
+        let excluded_frequency = self.excluded_doc_freqs.get(&token).copied().unwrap_or(0);
+        self.base
+            .doc_freqs
+            .get(&token)
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(excluded_frequency)
+    }
+}
+
+fn score_metadata_pair(
+    left: &MetadataDocument,
+    right: &MetadataDocument,
+    corpus: &MetadataCorpusView<'_>,
+) -> f64 {
+    let query_terms = query_terms_from_tokens(&left.tokens);
+    let self_score = bm25_score_terms(&query_terms, left, corpus);
+    let denominator = if self_score > 0.0 { self_score } else { 1.0 };
+    (bm25_score_terms(&query_terms, right, corpus) / denominator).clamp(0.0, 1.0)
+}
+
+fn query_terms_from_tokens(query_tokens: &[TokenId]) -> Vec<(TokenId, usize)> {
+    let mut query_terms = HashMap::<TokenId, usize>::new();
+    for token in query_tokens {
+        *query_terms.entry(*token).or_insert(0) += 1;
+    }
+    let mut query_terms = query_terms.into_iter().collect::<Vec<_>>();
+    query_terms.sort_by_key(|(token, _)| *token);
+    query_terms
+}
+
+fn bm25_score_terms(
+    query_terms: &[(TokenId, usize)],
+    document: &MetadataDocument,
+    corpus: &MetadataCorpusView<'_>,
+) -> f64 {
+    if query_terms.is_empty()
+        || document.tokens.is_empty()
+        || corpus.total_docs == 0
+        || corpus.avg_doc_len <= 0.0
+    {
+        return 0.0;
+    }
+    let doc_len = document.tokens.len() as f64;
+    let norm =
+        METADATA_BM25_K1 * (1.0 - METADATA_BM25_B + METADATA_BM25_B * doc_len / corpus.avg_doc_len);
+    query_terms
+        .iter()
+        .map(|(token, query_tf)| {
+            let tf = document.term_frequency(*token) as f64;
+            if tf == 0.0 {
+                return 0.0;
+            }
+            let df = corpus.document_frequency(*token) as f64;
+            let total_docs = corpus.total_docs as f64;
+            let idf = ((total_docs - df + 0.5) / (df + 0.5) + 1.0).ln();
+            *query_tf as f64 * idf * (tf * (METADATA_BM25_K1 + 1.0)) / (tf + norm)
+        })
+        .sum()
 }
 
 fn non_empty(value: &str) -> Option<String> {
@@ -551,6 +1060,38 @@ fn non_empty(value: &str) -> Option<String> {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+fn open_read_only_connection_with_options(
+    path: &Path,
+    config: &SampleCollectionConfig,
+) -> Result<Connection, duckdb::Error> {
+    let conn = if path == Path::new(":memory:") {
+        Connection::open_in_memory()?
+    } else {
+        Connection::open_with_flags(path, Config::default().access_mode(AccessMode::ReadOnly)?)?
+    };
+    let memory_limit = config.duckdb_memory_limit.replace('\'', "''");
+    conn.execute_batch(&format!(
+        "
+        PRAGMA threads={};
+        PRAGMA memory_limit='{}';
+        PRAGMA preserve_insertion_order=false;
+        ",
+        effective_duckdb_threads(config.duckdb_threads),
+        memory_limit
+    ))?;
+    Ok(conn)
+}
+
+fn effective_duckdb_threads(requested: usize) -> usize {
+    if requested > 0 {
+        requested
+    } else {
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
     }
 }
 
@@ -572,64 +1113,25 @@ fn render_markdown_report(report: &SampleReport) -> String {
         report.seed_reports.len()
     ));
 
+    out.push_str("## Name Matches\n\n");
     for seed in &report.seed_reports {
-        out.push_str(&format!("## Seed Contract `{}`\n\n", seed.contract_address));
-        out.push_str(&format!("- local seed rows: {}\n", seed.seed_row_count));
-        out.push_str(&format!(
-            "- recalled local rows: {}\n",
-            seed.recalled_row_count
-        ));
-        out.push_str(&format!(
-            "- name/metadata candidates: {}\n\n",
-            seed.candidate_reports.len()
-        ));
+        out.push_str(&format!("- seed: {}\n", inline_or_empty(&seed.name.seed)));
+        for value in &seed.name.matches {
+            out.push_str(&format!("  - {}\n", inline_or_empty(value)));
+        }
+    }
 
-        out.push_str("### Seed Name/Metadata\n\n");
-        render_optional_contract_sample(&mut out, seed.seed_sample.as_ref());
-
-        for candidate in &seed.candidate_reports {
-            out.push_str(&format!(
-                "### Candidate Contract `{}`\n\n",
-                candidate.contract_address
-            ));
-            out.push_str(&format!(
-                "- match reasons: {}\n",
-                candidate.match_reasons.join(", ")
-            ));
-            out.push_str(&format!("- confidence: {}\n", candidate.confidence));
-            out.push_str(&format!(
-                "- recalled rows in local DB: {}\n\n",
-                candidate.recalled_row_count
-            ));
-            render_contract_sample(&mut out, &candidate.sample);
+    out.push_str("\n## Metadata Matches\n\n");
+    for seed in &report.seed_reports {
+        out.push_str("- seed:\n\n");
+        push_fenced(&mut out, &seed.metadata.seed);
+        for value in &seed.metadata.matches {
+            out.push_str("- match:\n\n");
+            push_fenced(&mut out, value);
         }
     }
 
     out
-}
-
-fn render_optional_contract_sample(out: &mut String, sample: Option<&ContractSample>) {
-    if let Some(sample) = sample {
-        render_contract_sample(out, sample);
-    } else {
-        out.push_str("_No local rows found._\n\n");
-    }
-}
-
-fn render_contract_sample(out: &mut String, sample: &ContractSample) {
-    out.push_str(&format!("- contract: `{}`\n", sample.contract_address));
-    out.push_str(&format!("- name: {}\n", inline_or_empty(&sample.name)));
-    out.push_str(&format!("- symbol: {}\n", inline_or_empty(&sample.symbol)));
-    out.push_str(&format!(
-        "- metadata source token: `{}`\n",
-        sample.metadata_source_token_id
-    ));
-    out.push_str(&format!("- local row count: {}\n", sample.row_count));
-    out.push_str("\nmetadata_doc:\n\n");
-    push_fenced(out, "text", &sample.metadata_doc);
-    out.push_str("\nmetadata_json:\n\n");
-    push_fenced(out, "json", &sample.metadata_json);
-    out.push('\n');
 }
 
 fn inline_or_empty(value: &str) -> String {
@@ -640,10 +1142,41 @@ fn inline_or_empty(value: &str) -> String {
     }
 }
 
-fn push_fenced(out: &mut String, language: &str, value: &str) {
+fn push_fenced(out: &mut String, value: &str) {
     if value.trim().is_empty() {
-        out.push_str("_empty_\n");
+        out.push_str("_empty_\n\n");
         return;
     }
-    out.push_str(&format!("````{language}\n{value}\n````\n"));
+    out.push_str(&format!("````text\n{value}\n````\n\n"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_normalization_matches_top_contract_analysis_style() {
+        assert_eq!(normalize_name("Azuki #123"), "azuki");
+        assert_eq!(normalize_name("Ａｚｕｋｉ #123"), "azuki");
+    }
+
+    #[test]
+    fn metadata_json_fallback_extracts_relevant_fields() {
+        let json = r#"{"description":"Gold Dragon","ignored":"noise","attributes":[{"trait_type":"Background","value":"Red"}]}"#;
+        assert_eq!(
+            metadata_document_from_json(json),
+            "background red gold dragon"
+        );
+    }
+
+    #[test]
+    fn metadata_bm25_uses_expected_constants() {
+        assert_eq!(METADATA_BM25_K1, 1.2);
+        assert_eq!(METADATA_BM25_B, 0.75);
+    }
+
+    #[test]
+    fn query_terms_preserve_duplicate_token_frequency() {
+        assert_eq!(query_terms_from_tokens(&[7, 7, 9]), vec![(7, 2), (9, 1)]);
+    }
 }

@@ -1,7 +1,6 @@
 # Name/Metadata Change Samples
 
-从本地 `nft_features` DuckDB 中读取 seed 合约，按 `top_contract_analysis_rs`
-当前 name/metadata 查重逻辑召回候选，并输出 Markdown 样例，方便人工观察复制合约改动了哪些 name/metadata 字段。
+从本地 `nft_features` DuckDB 中读取 seed 合约，独立比较 `name` 和 `metadata` 文本相似性，并输出 Markdown 样例，方便人工观察复制合约改动了哪些 name/metadata 字段。
 
 ## 输入
 
@@ -26,14 +25,20 @@ cargo run --release -- \
 - `--chain`：默认 `ethereum`
 - `--name-threshold`：默认 `95.0`
 - `--metadata-threshold`：默认 `0.6`
-- `--max-tokens-per-contract`：传给 `top_contract_analysis_rs` 的每候选合约召回上限，默认 `0` 表示不限制
-- `--duckdb-threads` / `--duckdb-memory-limit`：与 `top_contract_analysis_rs` 的 DuckDB 资源参数一致
+- `--max-recall-rows`：name 或 metadata 命中文本输出上限，默认 `0` 表示不限制
+- `--max-seed-tokens`：读取 seed 合约 token 行上限，默认 `0` 表示不限制
+- `--duckdb-threads` / `--duckdb-memory-limit`：DuckDB 资源参数；`--duckdb-threads 0` 表示使用本机可用并行度
 
-进度显示分两层：总进度按 seed 合约推进，当前 seed 内的小进度按读取 seed、召回、查重评分、读取候选样例和完成阶段推进。seed 合约之间串行处理；合约内召回 SQL 使用 DuckDB 线程，name/metadata 查重评分继续复用 `top_contract_analysis_rs` 内部并行实现。
+进度显示分两层：总进度按 seed 合约推进，当前 seed 内的小进度按读取 seed、加载 name 候选、评分 name、加载 metadata 候选、评分 metadata 和完成阶段推进。seed 合约之间串行处理；启动时会一次性从 DuckDB 加载本地 name/metadata 文本索引，name 候选按合约聚合，metadata token 会 intern 成整数 id，合约内 name/metadata 候选评分使用 Rayon 并行。
 
 ## 输出口径
 
-工具只保留 `name_match` 或 `metadata_match` 命中的候选合约；纯 URI/image URI 命中不会写入样例报告。输出保留本地库中的原始 `name`、`symbol`、`metadata_doc` 和 `metadata_json`，不把展示文本小写化。
+工具只输出两个部分：
+
+- `Name Matches`：每个 seed 的 name，以及查到重复的合约级代表 name 文本。
+- `Metadata Matches`：每个 seed 的 metadata，以及查到重复的 metadata 文本。
+
+工具不进行 URI/image URI 查重，不输出合约地址、symbol、match reason、confidence、row count 等辅助数据。name 使用 NFKC、去尾部 token 编号、小写化后的 Jaro-Winkler 比较；metadata 使用 JSON 字段抽取、Unicode tokenization 和 full-corpus BM25 相对分比较，并用 query-token index 跳过 BM25 必为 0 的候选。
 
 ## seeds
 

@@ -22,8 +22,6 @@ struct Args {
     #[arg(long, default_value_t = 0.6)]
     metadata_threshold: f64,
     #[arg(long, default_value_t = 0)]
-    max_tokens_per_contract: usize,
-    #[arg(long, default_value_t = 0)]
     max_recall_rows: usize,
     #[arg(long, default_value_t = 0)]
     max_seed_tokens: usize,
@@ -60,7 +58,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             output: args.output,
             name_threshold: args.name_threshold,
             metadata_threshold: args.metadata_threshold,
-            max_tokens_per_contract: args.max_tokens_per_contract,
             max_recall_rows: args.max_recall_rows,
             max_seed_tokens: args.max_seed_tokens,
             duckdb_threads: args.duckdb_threads,
@@ -85,7 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let candidate_count: usize = report
         .seed_reports
         .iter()
-        .map(|seed| seed.candidate_reports.len())
+        .map(|seed| seed.name.matches.len() + seed.metadata.matches.len())
         .sum();
     seed_progress.finish_and_clear();
     total_progress.finish_with_message("done");
@@ -101,9 +98,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn progress_message(stage: SampleProgressStage, candidate_count: Option<usize>) -> String {
     let label = match stage {
         SampleProgressStage::ReadSeedRows => "read seed rows",
-        SampleProgressStage::LoadRecallRows => "load recall rows",
-        SampleProgressStage::ScoreCandidates => "score candidates",
-        SampleProgressStage::LoadCandidateSamples => "load candidate samples",
+        SampleProgressStage::LoadNameCandidates => "load name candidates",
+        SampleProgressStage::ScoreNameCandidates => "score name candidates",
+        SampleProgressStage::LoadMetadataCandidates => "load metadata candidates",
+        SampleProgressStage::ScoreMetadataCandidates => "score metadata candidates",
         SampleProgressStage::FinishedSeed => "finish seed",
     };
     match candidate_count {
