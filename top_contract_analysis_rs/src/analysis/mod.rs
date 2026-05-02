@@ -725,11 +725,29 @@ impl AnalyzeApi for RealApi {
                 None
             }
         };
+        let collection_slug = match fetch_opensea_contract_collection_slug(
+            &self.client,
+            &endpoints.opensea_base,
+            chain,
+            contract_address,
+            opensea_api_key,
+        )
+        .await
+        {
+            Ok(collection_slug) => collection_slug,
+            Err(err) => {
+                eprintln!(
+                    "warning: OpenSea market events collection lookup failed for {contract_address}: {err}; continuing without market events"
+                );
+                None
+            }
+        };
         match fetch_opensea_contract_market_events(
             &self.client,
             &endpoints.opensea_base,
             chain,
             contract_address,
+            collection_slug.as_deref(),
             opensea_api_key,
             eth_usd_rate,
         )

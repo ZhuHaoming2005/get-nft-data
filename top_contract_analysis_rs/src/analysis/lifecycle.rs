@@ -8,6 +8,14 @@ use crate::models::{
     SeedContractPayload, ValueFlowEdgePayload, WeakSupervisionLabelPayload,
 };
 
+const VALUE_FLOW_COVERAGE_SCOPE: &str = "same_tx_native_eth_only";
+const VALUE_FLOW_COVERAGE_GAPS: [&str; 4] = [
+    "later_withdrawals_not_traced",
+    "erc20_flows_not_traced",
+    "multi_hop_cashout_not_traced",
+    "cex_bridge_mixer_not_classified",
+];
+
 pub struct LifecycleModelInput<'a> {
     pub seed_contract: &'a SeedContractPayload,
     pub duplicate_candidates: &'a [DuplicateCandidate],
@@ -832,6 +840,8 @@ fn build_lifecycle_metrics(
                 funding_edge_count: revenue.funding_edge_count,
                 withdrawal_edge_count: revenue.withdrawal_edge_count,
                 revenue_backflow_edge_count: revenue.revenue_backflow_edge_count,
+                value_flow_coverage_scope: VALUE_FLOW_COVERAGE_SCOPE.into(),
+                value_flow_coverage_gaps: value_flow_coverage_gaps(),
                 top_value_recipient_address: revenue.top_value_recipient_address,
                 top_value_recipient_eth: revenue.top_value_recipient_eth,
                 top_value_recipient_usd: revenue.top_value_recipient_usd,
@@ -1631,6 +1641,8 @@ fn build_campaign_clusters(
             funding_edge_count: revenue.funding_edge_count,
             withdrawal_edge_count: revenue.withdrawal_edge_count,
             revenue_backflow_edge_count: revenue.revenue_backflow_edge_count,
+            value_flow_coverage_scope: VALUE_FLOW_COVERAGE_SCOPE.into(),
+            value_flow_coverage_gaps: value_flow_coverage_gaps(),
             first_block_number: blocks.iter().min().copied().unwrap_or_default(),
             last_block_number: blocks.iter().max().copied().unwrap_or_default(),
             first_block_time: times.iter().min().copied().unwrap_or_default(),
@@ -1775,6 +1787,13 @@ fn campaign_cluster_confidence(shared_evidence: &[String]) -> &'static str {
     } else {
         "low"
     }
+}
+
+fn value_flow_coverage_gaps() -> Vec<String> {
+    VALUE_FLOW_COVERAGE_GAPS
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect()
 }
 
 #[cfg(test)]

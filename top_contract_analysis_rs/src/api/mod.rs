@@ -67,7 +67,7 @@ impl AsyncApiClient {
         T: DeserializeOwned,
         B: Serialize + ?Sized,
     {
-        let mut last_error: Option<reqwest::Error> = None;
+        let mut last_error: Option<String> = None;
         for _ in 0..self.retries {
             let _permit = self
                 .request_limit
@@ -83,17 +83,31 @@ impl AsyncApiClient {
                 builder = builder.json(payload);
             }
             match builder.send().await {
-                Ok(response) => match response.error_for_status() {
-                    Ok(ok) => return Ok(ok.json::<T>().await?),
-                    Err(err) => last_error = Some(err),
-                },
-                Err(err) => last_error = Some(err),
+                Ok(response) => {
+                    let status = response.status();
+                    if status.is_success() {
+                        return Ok(response.json::<T>().await?);
+                    }
+                    let body = response.text().await.unwrap_or_else(|err| {
+                        format!("<failed to read error response body: {err}>")
+                    });
+                    let status_kind = if status.is_client_error() {
+                        "client error"
+                    } else if status.is_server_error() {
+                        "server error"
+                    } else {
+                        "unexpected status"
+                    };
+                    last_error = Some(format!(
+                        "HTTP status {status_kind} ({status}) for url ({url}); response body: {}",
+                        response_body_excerpt(&body)
+                    ));
+                }
+                Err(err) => last_error = Some(err.to_string()),
             }
         }
         Err(AppError::Http(
-            last_error
-                .map(|err| err.to_string())
-                .unwrap_or_else(|| "request failed".to_string()),
+            last_error.unwrap_or_else(|| "request failed".to_string()),
         ))
     }
 
@@ -118,6 +132,20 @@ impl AsyncApiClient {
     ) -> Result<T, AppError> {
         self.request_json(reqwest::Method::POST, url, Some(body), None)
             .await
+    }
+}
+
+fn response_body_excerpt(body: &str) -> String {
+    const MAX_RESPONSE_BODY_CHARS: usize = 1024;
+    let compact = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= MAX_RESPONSE_BODY_CHARS {
+        compact
+    } else {
+        let truncated = compact
+            .chars()
+            .take(MAX_RESPONSE_BODY_CHARS)
+            .collect::<String>();
+        format!("{truncated}...")
     }
 }
 

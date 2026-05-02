@@ -27,6 +27,32 @@ fn test_endpoints(base_url: &str) -> ApiEndpoints {
     }
 }
 
+#[tokio::test]
+async fn api_client_error_includes_status_and_response_body() {
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/bad-request");
+            then.status(400)
+                .header("content-type", "application/json")
+                .body(r#"{"errors":["asset_contract_address is not supported"]}"#);
+        })
+        .await;
+
+    let client = test_client();
+    let err = client
+        .get_json::<serde_json::Value>(&format!("{}/bad-request", server.base_url()))
+        .await
+        .expect_err("bad request should include response body");
+    let message = err.to_string();
+
+    assert!(message.contains("400 Bad Request"), "{message}");
+    assert!(
+        message.contains("asset_contract_address is not supported"),
+        "{message}"
+    );
+}
+
 #[test]
 fn alchemy_endpoints_embed_api_key_in_rest_and_rpc_urls() {
     let endpoints = ApiEndpoints::for_alchemy("eth-mainnet", "live-key");
@@ -691,10 +717,7 @@ async fn contract_sales_use_alchemy_before_opensea_when_available() {
     opensea_server
         .mock_async(|when, then| {
             when.method(GET)
-                .path("/api/v2/events")
-                .query_param("event_type", "sale")
-                .query_param("asset_contract_address", "0xdup")
-                .query_param("chain", "ethereum")
+                .path("/api/v2/chain/ethereum/contract/0xdup")
                 .header("x-api-key", "opensea");
             then.status(500).body("opensea should not be called first");
         })
@@ -794,8 +817,13 @@ async fn contract_sales_paginates_opensea_events_with_next_cursor() {
         .await;
     let (opensea_base_url, server) = spawn_sequential_json_server(vec![
         (
-            "/api/v2/events?event_type=sale&asset_contract_address=0xdup&chain=ethereum"
-                .to_string(),
+            "/api/v2/chain/ethereum/contract/0xdup".to_string(),
+            serde_json::json!({
+                "collection": {"slug": "dup-collection"}
+            }),
+        ),
+        (
+            "/api/v2/events/collection/dup-collection?event_type=sale&limit=200".to_string(),
             serde_json::json!({
                 "events": [{
                     "event_type": "sale",
@@ -813,7 +841,7 @@ async fn contract_sales_paginates_opensea_events_with_next_cursor() {
             }),
         ),
         (
-            "/api/v2/events?event_type=sale&asset_contract_address=0xdup&chain=ethereum&next=cursor-2"
+            "/api/v2/events/collection/dup-collection?event_type=sale&limit=200&next=cursor-2"
                 .to_string(),
             serde_json::json!({
                 "events": [{
@@ -864,7 +892,7 @@ async fn contract_sales_paginates_opensea_events_with_next_cursor() {
 #[tokio::test]
 async fn opensea_market_events_parse_order_cancel_and_transfer_events() {
     let (opensea_base_url, server) = spawn_sequential_json_server(vec![(
-        "/api/v2/events?asset_contract_address=0xdup&chain=ethereum&limit=200&event_type=order&event_type=cancel&event_type=transfer"
+        "/api/v2/events/collection/dup-collection?limit=200&event_type=order&event_type=cancel&event_type=transfer"
             .to_string(),
         serde_json::json!({
             "events": [
@@ -898,6 +926,13 @@ async fn opensea_market_events_parse_order_cancel_and_transfer_events() {
                     "nft": {"identifier": "2", "contract": "0xDup"},
                     "from_account": {"address": "0xfrom"},
                     "to_account": {"address": "0xto"}
+                },
+                {
+                    "event_type": "order",
+                    "order_type": "listing",
+                    "event_timestamp": 1710000300,
+                    "nft": {"identifier": "99", "contract": "0xOther"},
+                    "maker": {"address": "0xother"}
                 }
             ],
             "next": ""
@@ -911,6 +946,7 @@ async fn opensea_market_events_parse_order_cancel_and_transfer_events() {
         &opensea_base_url,
         "ethereum",
         "0xdup",
+        Some("dup-collection"),
         "opensea",
         Some(3000.0),
     )
@@ -946,10 +982,19 @@ async fn contract_sales_parse_opensea_fallback_sale_event_shape() {
     opensea_server
         .mock_async(|when, then| {
             when.method(GET)
-                .path("/api/v2/events")
+                .path("/api/v2/chain/ethereum/contract/0xdup")
+                .header("x-api-key", "opensea");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "collection": {"slug": "dup-collection"}
+            }));
+        })
+        .await;
+    opensea_server
+        .mock_async(|when, then| {
+            when.method(GET)
+                .path("/api/v2/events/collection/dup-collection")
                 .query_param("event_type", "sale")
-                .query_param("asset_contract_address", "0xdup")
-                .query_param("chain", "ethereum")
+                .query_param("limit", "200")
                 .header("x-api-key", "opensea");
             then.status(200).json_body_obj(&serde_json::json!({
                 "asset_events": [{
@@ -1020,10 +1065,19 @@ async fn contract_sales_do_not_treat_opensea_maker_taker_as_buyer_seller() {
     opensea_server
         .mock_async(|when, then| {
             when.method(GET)
-                .path("/api/v2/events")
+                .path("/api/v2/chain/ethereum/contract/0xdup")
+                .header("x-api-key", "opensea");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "collection": {"slug": "dup-collection"}
+            }));
+        })
+        .await;
+    opensea_server
+        .mock_async(|when, then| {
+            when.method(GET)
+                .path("/api/v2/events/collection/dup-collection")
                 .query_param("event_type", "sale")
-                .query_param("asset_contract_address", "0xdup")
-                .query_param("chain", "ethereum")
+                .query_param("limit", "200")
                 .header("x-api-key", "opensea");
             then.status(200).json_body_obj(&serde_json::json!({
                 "asset_events": [{
@@ -1074,10 +1128,19 @@ async fn contract_sales_opensea_fallback_uses_requested_chain() {
     opensea_server
         .mock_async(|when, then| {
             when.method(GET)
-                .path("/api/v2/events")
+                .path("/api/v2/chain/matic/contract/0xdup")
+                .header("x-api-key", "opensea");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "collection": {"slug": "dup-collection"}
+            }));
+        })
+        .await;
+    opensea_server
+        .mock_async(|when, then| {
+            when.method(GET)
+                .path("/api/v2/events/collection/dup-collection")
                 .query_param("event_type", "sale")
-                .query_param("asset_contract_address", "0xdup")
-                .query_param("chain", "matic")
+                .query_param("limit", "200")
                 .header("x-api-key", "opensea");
             then.status(200).json_body_obj(&serde_json::json!({
                 "events": []
@@ -1106,10 +1169,7 @@ async fn contract_sales_fall_back_to_alchemy_when_opensea_fails() {
     opensea_server
         .mock_async(|when, then| {
             when.method(GET)
-                .path("/api/v2/events")
-                .query_param("event_type", "sale")
-                .query_param("asset_contract_address", "0xdup")
-                .query_param("chain", "ethereum")
+                .path("/api/v2/chain/ethereum/contract/0xdup")
                 .header("x-api-key", "opensea");
             then.status(500).body("opensea unavailable");
         })
@@ -1165,10 +1225,7 @@ async fn contract_sales_return_empty_when_alchemy_and_opensea_fail() {
     opensea_server
         .mock_async(|when, then| {
             when.method(GET)
-                .path("/api/v2/events")
-                .query_param("event_type", "sale")
-                .query_param("asset_contract_address", "0xdup")
-                .query_param("chain", "ethereum")
+                .path("/api/v2/chain/ethereum/contract/0xdup")
                 .header("x-api-key", "opensea");
             then.status(500).body("opensea unavailable");
         })
@@ -1299,10 +1356,19 @@ async fn contract_sales_convert_opensea_stablecoin_amounts_to_usd_primary_amount
     opensea_server
         .mock_async(|when, then| {
             when.method(GET)
-                .path("/api/v2/events")
+                .path("/api/v2/chain/ethereum/contract/0xdup")
+                .header("x-api-key", "opensea");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "collection": {"slug": "dup-collection"}
+            }));
+        })
+        .await;
+    opensea_server
+        .mock_async(|when, then| {
+            when.method(GET)
+                .path("/api/v2/events/collection/dup-collection")
                 .query_param("event_type", "sale")
-                .query_param("asset_contract_address", "0xdup")
-                .query_param("chain", "ethereum")
+                .query_param("limit", "200")
                 .header("x-api-key", "opensea");
             then.status(200).json_body_obj(&serde_json::json!({
                 "events": [{

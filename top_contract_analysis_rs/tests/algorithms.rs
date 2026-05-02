@@ -1120,6 +1120,10 @@ fn lifecycle_model_outputs_expose_research_graph_payloads() {
     assert_eq!(metric.funding_edge_count, 1);
     assert_eq!(metric.withdrawal_edge_count, 1);
     assert_eq!(metric.revenue_backflow_edge_count, 1);
+    assert_eq!(metric.value_flow_coverage_scope, "same_tx_native_eth_only");
+    assert!(metric
+        .value_flow_coverage_gaps
+        .contains(&"later_withdrawals_not_traced".to_string()));
     assert_eq!(metric.top_value_recipient_address, "0xdup");
     assert!((metric.top_value_recipient_eth - 0.08).abs() < 1e-9);
     assert!((metric.withdrawal_amount_eth - 0.4).abs() < 1e-9);

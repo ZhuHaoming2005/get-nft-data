@@ -453,18 +453,39 @@ pub async fn fetch_opensea_nft_events(
         "x-api-key",
         HeaderValue::from_str(opensea_api_key).map_err(|err| AppError::Http(err.to_string()))?,
     );
+    let requested_chain = chain;
     let chain = opensea_chain(chain);
-    let base_events_url = if let Some(token_id) = token_id.filter(|value| !value.is_empty()) {
-        format!("{base_url}/api/v2/events/chain/{chain}/contract/{contract_address}/nfts/{token_id}?event_type=sale")
+    let mut base_events_url = if let Some(token_id) = token_id.filter(|value| !value.is_empty()) {
+        Url::parse(&format!(
+            "{base_url}/api/v2/events/chain/{chain}/contract/{contract_address}/nfts/{token_id}"
+        ))
+        .map_err(|err| AppError::Http(err.to_string()))?
     } else {
-        format!("{base_url}/api/v2/events?event_type=sale&asset_contract_address={contract_address}&chain={chain}")
+        let Some(collection_slug) = fetch_opensea_contract_collection_slug(
+            client,
+            base_url,
+            requested_chain,
+            contract_address,
+            opensea_api_key,
+        )
+        .await?
+        else {
+            return Ok(Vec::new());
+        };
+        Url::parse(&format!(
+            "{base_url}/api/v2/events/collection/{collection_slug}"
+        ))
+        .map_err(|err| AppError::Http(err.to_string()))?
     };
+    base_events_url
+        .query_pairs_mut()
+        .append_pair("event_type", "sale")
+        .append_pair("limit", "200");
     let mut rows = Vec::new();
     let mut next: Option<String> = None;
     let mut seen_cursors = BTreeSet::new();
     loop {
-        let mut url =
-            Url::parse(&base_events_url).map_err(|err| AppError::Http(err.to_string()))?;
+        let mut url = base_events_url.clone();
         if let Some(cursor) = next.as_deref() {
             url.query_pairs_mut().append_pair("next", cursor);
         }
@@ -529,15 +550,25 @@ pub async fn fetch_opensea_nft_events(
                 &payment_symbol,
                 eth_usd_rate,
             );
+            let parsed_contract_address = nft
+                .get("contract")
+                .or_else(|| nft.get("contract_address"))
+                .or_else(|| nft.get("asset_contract"))
+                .or_else(|| item.get("asset_contract_address"))
+                .and_then(address_like_field)
+                .unwrap_or("")
+                .to_lowercase();
+            if !parsed_contract_address.is_empty()
+                && !parsed_contract_address.eq_ignore_ascii_case(contract_address)
+            {
+                continue;
+            }
             rows.push(NftSaleRecord {
-                contract_address: nft
-                    .get("contract")
-                    .or_else(|| nft.get("contract_address"))
-                    .or_else(|| nft.get("asset_contract"))
-                    .or_else(|| item.get("asset_contract_address"))
-                    .and_then(address_like_field)
-                    .unwrap_or(contract_address)
-                    .to_lowercase(),
+                contract_address: if parsed_contract_address.is_empty() {
+                    contract_address.to_lowercase()
+                } else {
+                    parsed_contract_address
+                },
                 token_id: normalize_token_id(Some(&Value::String(token_id_value.to_string()))),
                 tx_hash: item
                     .get("transaction")
@@ -622,14 +653,21 @@ pub async fn fetch_opensea_nft_events(
 pub async fn fetch_opensea_contract_market_events(
     client: &AsyncApiClient,
     base_url: &str,
-    chain: &str,
+    _chain: &str,
     contract_address: &str,
+    collection_slug: Option<&str>,
     opensea_api_key: &str,
     eth_usd_rate: Option<f64>,
 ) -> Result<Vec<NftMarketEventRecord>, AppError> {
     if opensea_api_key.trim().is_empty() {
         return Ok(Vec::new());
     }
+    let Some(collection_slug) = collection_slug
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(Vec::new());
+    };
 
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
@@ -642,11 +680,11 @@ pub async fn fetch_opensea_contract_market_events(
     let mut next: Option<String> = None;
     let mut seen_cursors = BTreeSet::new();
     loop {
-        let mut url = Url::parse(&format!("{base_url}/api/v2/events"))
-            .map_err(|err| AppError::Http(err.to_string()))?;
+        let mut url = Url::parse(&format!(
+            "{base_url}/api/v2/events/collection/{collection_slug}"
+        ))
+        .map_err(|err| AppError::Http(err.to_string()))?;
         url.query_pairs_mut()
-            .append_pair("asset_contract_address", contract_address)
-            .append_pair("chain", opensea_chain(chain))
             .append_pair("limit", "200")
             .append_pair("event_type", "order")
             .append_pair("event_type", "cancel")
@@ -707,14 +745,24 @@ pub async fn fetch_opensea_contract_market_events(
             };
             let (price_eth, price_usd, payment_symbol, payment_token_address) =
                 decode_event_payment(&item, eth_usd_rate);
+            let parsed_contract_address = nft
+                .get("contract")
+                .or_else(|| nft.get("contract_address"))
+                .or_else(|| item.get("asset_contract_address"))
+                .and_then(address_like_field)
+                .unwrap_or("")
+                .to_lowercase();
+            if !parsed_contract_address.is_empty()
+                && !parsed_contract_address.eq_ignore_ascii_case(contract_address)
+            {
+                continue;
+            }
             rows.push(NftMarketEventRecord {
-                contract_address: nft
-                    .get("contract")
-                    .or_else(|| nft.get("contract_address"))
-                    .or_else(|| item.get("asset_contract_address"))
-                    .and_then(address_like_field)
-                    .unwrap_or(contract_address)
-                    .to_lowercase(),
+                contract_address: if parsed_contract_address.is_empty() {
+                    contract_address.to_lowercase()
+                } else {
+                    parsed_contract_address
+                },
                 token_id,
                 event_type,
                 order_type: item

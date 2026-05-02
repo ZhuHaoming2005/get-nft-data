@@ -587,6 +587,10 @@ pub struct CampaignClusterPayload {
     pub withdrawal_edge_count: i64,
     #[serde(default)]
     pub revenue_backflow_edge_count: i64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub value_flow_coverage_scope: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub value_flow_coverage_gaps: Vec<String>,
     pub first_block_number: i64,
     pub last_block_number: i64,
     pub first_block_time: i64,
@@ -635,6 +639,10 @@ pub struct ContractLifecycleMetricPayload {
     pub withdrawal_edge_count: i64,
     #[serde(default)]
     pub revenue_backflow_edge_count: i64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub value_flow_coverage_scope: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub value_flow_coverage_gaps: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub top_value_recipient_address: String,
     #[serde(default)]
