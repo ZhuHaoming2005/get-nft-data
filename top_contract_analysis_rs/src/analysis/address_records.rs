@@ -290,16 +290,23 @@ pub fn build_malicious_address_records(
     contract_address: &str,
     transfers: &[TransferRecord],
     infringing_tokens: &[InfringingTokenRecord],
+    mint_payment_edges: &[ValueFlowEdgePayload],
 ) -> Vec<MaliciousAddressPayload> {
     let activity =
         prepare_contract_activity(transfers, &[] as &[NftSaleRecord], &[] as &[OwnerBalance]);
-    build_malicious_address_records_from_activity(contract_address, &activity, infringing_tokens)
+    build_malicious_address_records_from_activity(
+        contract_address,
+        &activity,
+        infringing_tokens,
+        mint_payment_edges,
+    )
 }
 
 pub(crate) fn build_malicious_address_records_from_activity(
     contract_address: &str,
     activity: &PreparedContractActivity<'_>,
     infringing_tokens: &[InfringingTokenRecord],
+    mint_payment_edges: &[ValueFlowEdgePayload],
 ) -> Vec<MaliciousAddressPayload> {
     let relevant_token_ids: HashSet<String> = infringing_tokens
         .iter()
@@ -317,6 +324,18 @@ pub(crate) fn build_malicious_address_records_from_activity(
     let mut rapid_addresses: HashSet<String> = HashSet::new();
     let mut mint_times: HashMap<String, i64> = HashMap::new();
     let mut receiver_candidates: HashSet<String> = HashSet::new();
+    let paid_mint_payers: HashSet<String> = mint_payment_edges
+        .iter()
+        .filter(|edge| {
+            edge.channel == "mint_payment"
+                && edge.contract_address.eq_ignore_ascii_case(contract_address)
+                && value_flow_has_positive_value(edge)
+        })
+        .map(|edge| edge.from_address.clone())
+        .filter(|address| !address.is_empty())
+        .collect();
+    let mut secondary_market_resellers: HashSet<String> = HashSet::new();
+    let mut prior_paid_buyers_by_token: HashMap<String, HashSet<String>> = HashMap::new();
 
     for transfer in &activity.sorted_transfers {
         if !relevant_token_ids.is_empty() && !relevant_token_ids.contains(&transfer.token_id) {
@@ -362,6 +381,17 @@ pub(crate) fn build_malicious_address_records_from_activity(
         if !relevant_token_ids.is_empty() && !relevant_token_ids.contains(&sale.token_id) {
             continue;
         }
+        if sale_has_positive_value(sale) {
+            let prior_paid_buyers = prior_paid_buyers_by_token
+                .entry(sale.token_id.clone())
+                .or_default();
+            if prior_paid_buyers.contains(&sale.seller_address) {
+                secondary_market_resellers.insert(sale.seller_address.clone());
+            }
+            if !sale.buyer_address.is_empty() {
+                prior_paid_buyers.insert(sale.buyer_address.clone());
+            }
+        }
         if !sale.seller_address.is_empty() {
             *sale_seller_counts
                 .entry(sale.seller_address.clone())
@@ -394,8 +424,14 @@ pub(crate) fn build_malicious_address_records_from_activity(
         let is_star_distributor = star_out_degree >= 3;
         let sale_seller_count = *sale_seller_counts.get(&address).unwrap_or(&0);
         let rapid_spread = rapid_addresses.contains(&address);
-        let attacker_like_seller =
-            sale_seller_count > 0 && (mint_role || is_star_distributor || rapid_spread);
+        let acquired_victim_like = (paid_mint_payers.contains(&address)
+            || secondary_market_resellers.contains(&address))
+            && wash_cycle_count == 0
+            && !is_star_distributor
+            && sale_seller_count < 3;
+        let attacker_like_seller = sale_seller_count > 0
+            && (mint_role || is_star_distributor || rapid_spread)
+            && !acquired_victim_like;
         let high_volume_seller = sale_seller_count >= 3;
         if wash_cycle_count == 0
             && !is_star_distributor
@@ -1404,10 +1440,14 @@ mod tests {
     }
 
     fn infringing_token() -> InfringingTokenRecord {
+        infringing_token_minted_by("0xoperator")
+    }
+
+    fn infringing_token_minted_by(minter_address: &str) -> InfringingTokenRecord {
         InfringingTokenRecord {
             contract_address: "0xdup".into(),
             token_id: "1".into(),
-            minter_address: "0xoperator".into(),
+            minter_address: minter_address.into(),
             ..InfringingTokenRecord::default()
         }
     }
@@ -1662,6 +1702,119 @@ mod tests {
 
         assert!(victim.is_corrupted_address);
         assert_eq!(victim.victim_resale_count, 1);
+    }
+
+    #[test]
+    fn paid_mint_reseller_is_not_malicious_when_only_weak_mint_sale_behavior() {
+        let transfers = vec![
+            transfer("0xmint", 100, ZERO_ADDRESS, "0xvictim"),
+            transfer("0xresale", 140, "0xvictim", "0xrecipient"),
+        ];
+        let sales = vec![sale_between(
+            "0xresale",
+            140,
+            "0xvictim",
+            "0xrecipient",
+            0.4,
+        )];
+        let owners = vec![OwnerBalance {
+            owner_address: "0xrecipient".into(),
+            token_balances: BTreeMap::from([("1".into(), 1)]),
+        }];
+        let mint_payment_edges = vec![mint_payment_edge("0xvictim")];
+        let infringing_tokens = vec![infringing_token_minted_by("0xvictim")];
+        let activity = prepare_contract_activity(&transfers, &sales, &owners);
+
+        let malicious = build_malicious_address_records_from_activity(
+            "0xdup",
+            &activity,
+            &infringing_tokens,
+            &mint_payment_edges,
+        );
+
+        assert!(malicious.iter().all(|row| row.address != "0xvictim"));
+        let honest = build_honest_address_records_from_activity(
+            "0xdup",
+            &activity,
+            &infringing_tokens,
+            &malicious,
+            &mint_payment_edges,
+            200,
+        );
+        let victim = honest
+            .iter()
+            .find(|row| row.address == "0xvictim")
+            .expect("paid mint reseller remains honest");
+        assert!(victim.is_corrupted_address);
+    }
+
+    #[test]
+    fn secondary_market_reseller_is_not_malicious_when_only_weak_rapid_sale_behavior() {
+        let transfers = vec![
+            transfer("0xmint", 100, ZERO_ADDRESS, "0xoperator"),
+            transfer("0xbuy", 110, "0xoperator", "0xvictim"),
+            transfer("0xresale", 120, "0xvictim", "0xrecipient"),
+        ];
+        let sales = vec![
+            sale_between("0xbuy", 110, "0xoperator", "0xvictim", 1.0),
+            sale_between("0xresale", 120, "0xvictim", "0xrecipient", 0.4),
+        ];
+        let owners = vec![OwnerBalance {
+            owner_address: "0xrecipient".into(),
+            token_balances: BTreeMap::from([("1".into(), 1)]),
+        }];
+        let infringing_tokens = vec![infringing_token()];
+        let activity = prepare_contract_activity(&transfers, &sales, &owners);
+
+        let malicious = build_malicious_address_records_from_activity(
+            "0xdup",
+            &activity,
+            &infringing_tokens,
+            &[],
+        );
+
+        assert!(malicious.iter().all(|row| row.address != "0xvictim"));
+        let honest = build_honest_address_records_from_activity(
+            "0xdup",
+            &activity,
+            &infringing_tokens,
+            &malicious,
+            &[],
+            200,
+        );
+        let victim = honest
+            .iter()
+            .find(|row| row.address == "0xvictim")
+            .expect("secondary market reseller remains honest");
+        assert!(victim.is_corrupted_address);
+    }
+
+    #[test]
+    fn paid_mint_high_volume_reseller_remains_malicious() {
+        let transfers = vec![
+            transfer("0xmint1", 100, ZERO_ADDRESS, "0xoperator"),
+            transfer("0xresale1", 120, "0xoperator", "0xrecipient1"),
+            transfer("0xresale2", 130, "0xoperator", "0xrecipient2"),
+            transfer("0xresale3", 140, "0xoperator", "0xrecipient3"),
+        ];
+        let sales = vec![
+            sale_between("0xresale1", 120, "0xoperator", "0xrecipient1", 0.4),
+            sale_between("0xresale2", 130, "0xoperator", "0xrecipient2", 0.4),
+            sale_between("0xresale3", 140, "0xoperator", "0xrecipient3", 0.4),
+        ];
+        let owners = Vec::<OwnerBalance>::new();
+        let mint_payment_edges = vec![mint_payment_edge("0xoperator")];
+        let infringing_tokens = vec![infringing_token_minted_by("0xoperator")];
+        let activity = prepare_contract_activity(&transfers, &sales, &owners);
+
+        let malicious = build_malicious_address_records_from_activity(
+            "0xdup",
+            &activity,
+            &infringing_tokens,
+            &mint_payment_edges,
+        );
+
+        assert!(malicious.iter().any(|row| row.address == "0xoperator"));
     }
 
     #[test]

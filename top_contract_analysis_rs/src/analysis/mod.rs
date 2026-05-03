@@ -1562,6 +1562,7 @@ async fn analyze_duplicate_contract(
         contract_address,
         &contract_activity,
         &contract_infringing,
+        &mint_payment_edges,
     );
     let contract_secondary_sale_victims =
         address_records::build_secondary_sale_victim_address_records_from_activity(

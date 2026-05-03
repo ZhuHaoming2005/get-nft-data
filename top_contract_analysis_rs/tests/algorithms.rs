@@ -554,7 +554,7 @@ fn mint_only_recipient_is_not_marked_malicious_without_other_behavior() {
         ..InfringingTokenRecord::default()
     }];
 
-    let rows = build_malicious_address_records("0xdup", &transfers, &infringing_tokens);
+    let rows = build_malicious_address_records("0xdup", &transfers, &infringing_tokens, &[]);
 
     assert!(rows.is_empty());
 }
