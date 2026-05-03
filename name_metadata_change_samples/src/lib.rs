@@ -1349,7 +1349,11 @@ fn push_modification_summary(out: &mut String, report: &SampleReport) {
     push_counts_with_ratios(
         out,
         modification_summary(
-            report.seed_reports.iter().map(|seed| &seed.name),
+            report
+                .seed_reports
+                .iter()
+                .filter(|seed| is_usable_seed_name(&seed.name.seed))
+                .map(|seed| &seed.name),
             classify_name_modifications,
         ),
     );
@@ -1377,7 +1381,7 @@ fn push_counts_with_ratios(out: &mut String, summary: (usize, BTreeMap<String, u
         } else {
             0.0
         };
-        out.push_str(&format!("- {label}: {count}/{total} ({ratio:.1}%)\n"));
+        out.push_str(&format!("- {label}: {count} ({ratio:.1}%)\n"));
     }
 }
 
@@ -1435,6 +1439,17 @@ fn is_unavailable_display_text(value: &str) -> bool {
         && trimmed
             .chars()
             .all(|ch| ch == '?' || ch == '\u{fffd}' || ch.is_whitespace())
+}
+
+fn is_usable_seed_name(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || is_unavailable_display_text(trimmed) {
+        return false;
+    }
+    !matches!(
+        normalize_nfkc(trimmed).to_lowercase().as_str(),
+        "none" | "null" | "undefined" | "n/a" | "na" | "_empty_" | "_unavailable_"
+    )
 }
 
 fn should_render_as_codepoint(ch: char) -> bool {
@@ -1514,13 +1529,57 @@ mod tests {
 
         assert!(output.contains("## Modification Summary"));
         assert!(output.contains("- total matches: 2"));
-        assert!(output.contains("- token_number_suffix: 1/2 (50.0%)"));
-        assert!(output.contains("- unicode_compatibility: 1/2 (50.0%)"));
-        assert!(output.contains("- other: 1/2 (50.0%)"));
+        assert!(output.contains("- token_number_suffix: 1 (50.0%)"));
+        assert!(output.contains("- unicode_compatibility: 1 (50.0%)"));
+        assert!(output.contains("- other: 1 (50.0%)"));
         assert!(output.contains("- total matches: 1"));
-        assert!(output.contains("- exact_metadata_clone: 1/1 (100.0%)"));
-        assert!(output.contains("- asset_pointer_reuse: 1/1 (100.0%)"));
-        assert!(output.contains("- trait_schema_reuse: 1/1 (100.0%)"));
+        assert!(output.contains("- exact_metadata_clone: 1 (100.0%)"));
+        assert!(output.contains("- asset_pointer_reuse: 1 (100.0%)"));
+        assert!(output.contains("- trait_schema_reuse: 1 (100.0%)"));
+        assert!(!output.contains("1/2"));
+        assert!(!output.contains("1/1"));
+    }
+
+    #[test]
+    fn name_summary_ignores_unusable_seed_names() {
+        let report = SampleReport {
+            chain: "ethereum".into(),
+            seed_reports: vec![
+                SeedSampleReport {
+                    name: TextComparison {
+                        seed: String::new(),
+                        matches: vec!["Empty Clone".into()],
+                        labeled_matches: Vec::new(),
+                    },
+                    metadata: TextComparison::default(),
+                },
+                SeedSampleReport {
+                    name: TextComparison {
+                        seed: "None".into(),
+                        matches: vec!["None".into()],
+                        labeled_matches: Vec::new(),
+                    },
+                    metadata: TextComparison::default(),
+                },
+                SeedSampleReport {
+                    name: TextComparison {
+                        seed: "Real Seed".into(),
+                        matches: vec!["Real Seed".into()],
+                        labeled_matches: Vec::new(),
+                    },
+                    metadata: TextComparison::default(),
+                },
+            ],
+        };
+
+        let output = render_markdown_report(&report);
+        let name_summary = output
+            .split("### Metadata")
+            .next()
+            .expect("name summary section");
+
+        assert!(name_summary.contains("- total matches: 1"));
+        assert!(name_summary.contains("- exact_clone: 1 (100.0%)"));
     }
 
     #[test]
