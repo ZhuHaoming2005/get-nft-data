@@ -1154,13 +1154,7 @@ fn classify_name_modifications(seed: &str, value: &str) -> Vec<String> {
     if seed_trimmed == value_trimmed && !seed_trimmed.is_empty() {
         return vec!["exact_clone".to_string()];
     }
-    if seed_norm == value_norm
-        && seed_trimmed != value_trimmed
-        && (has_trailing_number_suffix(seed_trimmed) || has_trailing_number_suffix(value_trimmed))
-    {
-        labels.push("suffix_augmentation");
-    }
-    if has_derivative_suffix(value_trimmed) {
+    if has_suffix_augmentation(seed_trimmed, value_trimmed, &seed_norm, &value_norm) {
         labels.push("suffix_augmentation");
     }
     if has_name_format_perturbation(seed_trimmed, value_trimmed) {
@@ -1313,6 +1307,39 @@ fn has_derivative_suffix(value: &str) -> bool {
     DERIVATIVE_SUFFIX_PATTERNS
         .iter()
         .any(|pattern| pattern.is_match(&value))
+}
+
+fn has_suffix_augmentation(seed: &str, value: &str, seed_norm: &str, value_norm: &str) -> bool {
+    if has_derivative_suffix(value) {
+        return true;
+    }
+
+    let seed_has_numeric_suffix = has_trailing_number_suffix(seed);
+    let value_has_numeric_suffix = has_trailing_number_suffix(value);
+    if !seed_has_numeric_suffix && !value_has_numeric_suffix {
+        return false;
+    }
+    if seed_norm == value_norm && seed != value {
+        return true;
+    }
+    if !value_has_numeric_suffix {
+        return false;
+    }
+
+    has_related_name_core(seed, &strip_raw_trailing_number_suffix(value))
+}
+
+fn has_related_name_core(seed: &str, value: &str) -> bool {
+    let seed_core = strip_raw_augmentation_suffix(seed);
+    let value_core = strip_raw_augmentation_suffix(value);
+    let seed_core_norm = normalize_name(&seed_core);
+    let value_core_norm = normalize_name(&value_core);
+    if seed_core_norm.is_empty() || value_core_norm.is_empty() {
+        return false;
+    }
+    seed_core_norm == value_core_norm
+        || canonical_format_name(&seed_core) == canonical_format_name(&value_core)
+        || has_name_lexical_mutation(&seed_core_norm, &value_core_norm)
 }
 
 fn canonical_format_name(value: &str) -> String {
@@ -1591,8 +1618,12 @@ fn render_markdown_report(report: &SampleReport) -> String {
         if !is_usable_seed_name(&seed.name.seed) {
             continue;
         }
+        let values = labeled_matches_for_report(&seed.name, classify_name_modifications);
+        if values.is_empty() {
+            continue;
+        }
         out.push_str(&format!("- seed: {}\n", inline_or_empty(&seed.name.seed)));
-        for value in labeled_matches_for_report(&seed.name, classify_name_modifications) {
+        for value in values {
             out.push_str(&format!(
                 "  - [{}] {}\n",
                 value.labels.join(", "),
@@ -1603,9 +1634,13 @@ fn render_markdown_report(report: &SampleReport) -> String {
 
     out.push_str("\n## Metadata Matches\n\n");
     for seed in &report.seed_reports {
+        let values = labeled_matches_for_report(&seed.metadata, classify_metadata_modifications);
+        if values.is_empty() {
+            continue;
+        }
         out.push_str("- seed:\n\n");
         push_fenced(&mut out, &seed.metadata.seed);
-        for value in labeled_matches_for_report(&seed.metadata, classify_metadata_modifications) {
+        for value in values {
             out.push_str(&format!("- match labels: {}\n\n", value.labels.join(", ")));
             push_fenced(&mut out, &value.text);
         }
@@ -1871,6 +1906,13 @@ mod tests {
     }
 
     #[test]
+    fn name_numeric_suffix_detects_lexical_core_variants() {
+        let labels = classify_name_modifications("PudgyPenguins", "Pudgy Penguin #1839");
+
+        assert!(labels.contains(&"suffix_augmentation".to_string()));
+    }
+
+    #[test]
     fn metadata_labels_describe_changes_not_reuse() {
         assert_eq!(
             classify_metadata_modifications(
@@ -2072,6 +2114,51 @@ mod tests {
         assert!(!name_matches.contains("????"));
         assert!(name_matches.contains("- seed: Real Seed"));
         assert!(name_matches.contains("[exact_clone] Real Seed"));
+    }
+
+    #[test]
+    fn report_omits_seed_sections_without_matches() {
+        let report = SampleReport {
+            chain: "ethereum".into(),
+            seed_reports: vec![
+                SeedSampleReport {
+                    name: TextComparison {
+                        seed: "No Hit Seed".into(),
+                        matches: Vec::new(),
+                        labeled_matches: Vec::new(),
+                    },
+                    metadata: TextComparison {
+                        seed: "no hit metadata".into(),
+                        matches: Vec::new(),
+                        labeled_matches: Vec::new(),
+                    },
+                },
+                SeedSampleReport {
+                    name: TextComparison {
+                        seed: "Name Hit Seed".into(),
+                        matches: vec!["Name Hit Seed".into()],
+                        labeled_matches: Vec::new(),
+                    },
+                    metadata: TextComparison::default(),
+                },
+                SeedSampleReport {
+                    name: TextComparison::default(),
+                    metadata: TextComparison {
+                        seed: "metadata hit seed".into(),
+                        matches: vec!["metadata hit seed changed".into()],
+                        labeled_matches: Vec::new(),
+                    },
+                },
+            ],
+        };
+
+        let output = render_markdown_report(&report);
+
+        assert!(!output.contains("No Hit Seed"));
+        assert!(!output.contains("no hit metadata"));
+        assert!(output.contains("- seed: Name Hit Seed"));
+        assert!(output.contains("metadata hit seed"));
+        assert!(output.contains("metadata hit seed changed"));
     }
 
     #[test]
