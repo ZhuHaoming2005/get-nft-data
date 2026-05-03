@@ -25,6 +25,10 @@ static TRAILING_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
         Regex::new(r"\s+No\.?\s*\d+\s*$").unwrap(),
         Regex::new(r"\s+nr\.?\s*\d+\s*$").unwrap(),
         Regex::new(r"\s+\d{1,12}\s*$").unwrap(),
+        Regex::new(r"\s*(?:404|420|777|888|999)\s*$").unwrap(),
+        Regex::new(r"\s*(?:v|version)\s*\d+\s*$").unwrap(),
+        Regex::new(r"\s*\d+\.0\s*$").unwrap(),
+        Regex::new(r"\s*(?:gen|generation)\s*\d+\s*$").unwrap(),
     ]
 });
 static WHITESPACE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
@@ -32,6 +36,16 @@ static TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\p{L}\p{N}_]+").unwrap
 static ASSET_REF_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)(ipfs://[^\s]+|https?://[^\s]*ipfs[^\s]+|\bqm[1-9a-hj-np-z]{20,}\b|\bbafy[a-z2-7]{20,}\b)")
         .unwrap()
+});
+static URL_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?i)https?://[^\s"')<>\]]+"#).unwrap());
+static DERIVATIVE_SUFFIX_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"(?i)(?:\.fun|x)\s*$").unwrap(),
+        Regex::new(
+            r"(?i)(?:\s|[-_.])(?:official|nft|club|dao|pass|mint|claim|free|vip|collection|edition|clone|copy|reloaded|remastered|alpha|beta)\s*$",
+        )
+        .unwrap(),
+    ]
 });
 
 const METADATA_BM25_K1: f64 = 1.2;
@@ -1165,15 +1179,6 @@ fn classify_name_modifications(seed: &str, value: &str) -> Vec<String> {
     if has_derivative_suffix(value_trimmed) {
         labels.push("derivative_suffix");
     }
-    if has_inserted_ai_marker(seed_trimmed, value_trimmed) {
-        labels.push("ai_marker");
-    }
-    if labels.is_empty()
-        && score_normalized_name_pair(&seed_norm, &value_norm) >= 90.0
-        && seed_norm != value_norm
-    {
-        labels.push("homoglyph_or_typo");
-    }
     if labels.is_empty() {
         labels.push("other");
     }
@@ -1182,50 +1187,36 @@ fn classify_name_modifications(seed: &str, value: &str) -> Vec<String> {
 
 fn classify_metadata_modifications(seed: &str, value: &str) -> Vec<String> {
     let mut labels = Vec::new();
-    if normalize_text(seed) == normalize_text(value) && !value.trim().is_empty() {
-        labels.push("exact_metadata_clone");
+    let seed_text = metadata_change_text(seed);
+    let value_text = metadata_change_text(value);
+    let seed_norm = normalize_text(&seed_text);
+    let value_norm = normalize_text(&value_text);
+    if seed_norm == value_norm && !value.trim().is_empty() {
+        labels.push("uri-only");
+        return labels.into_iter().map(str::to_string).collect();
     }
-    if !shared_asset_refs(seed, value).is_empty() {
-        labels.push("asset_pointer_reuse");
-    } else if !asset_refs(value).is_empty() {
-        labels.push("asset_pointer_present");
+
+    if has_template_changed(&seed_text, &value_text) {
+        labels.push("template_changed");
+    } else if has_attribute_values_changed(&seed_text, &value_text) {
+        labels.push("attribute_values_changed");
     }
-    if has_shared_terms(seed, value, TRAIT_SCHEMA_TERMS) {
-        labels.push("trait_schema_reuse");
-    }
-    if has_shared_terms(seed, value, COLLECTION_TERMS) {
-        labels.push("collection_terms_reuse");
-    }
-    if has_metadata_template_reuse(seed, value) {
-        labels.push("metadata_template_reuse");
-    }
-    let value_lower = normalize_text(value);
-    if value_lower.contains("trait") && value_lower.contains('%') {
+    if !seed_norm.contains("trait") && value_norm.contains("trait") && value_norm.contains('%') {
         labels.push("rarity_text_added");
     }
+    if has_description_changed(&seed_text, &value_text) {
+        labels.push("description_changed");
+    } else if has_description_added(&seed_text, &value_text) {
+        labels.push("description_added");
+    } else if has_description_removed(&seed_text, &value_text) {
+        labels.push("description_removed");
+    }
+
     if labels.is_empty() {
         labels.push("other");
     }
     labels.into_iter().map(str::to_string).collect()
 }
-
-const TRAIT_SCHEMA_TERMS: &[&str] = &[
-    "attribute",
-    "attributes",
-    "background",
-    "clothes",
-    "eyes",
-    "fur",
-    "hat",
-    "headwear",
-    "mouth",
-    "trait",
-];
-
-const COLLECTION_TERMS: &[&str] = &[
-    "ape", "azuki", "bayc", "beanz", "bored", "cool", "doodle", "milady", "mooncat", "mutant",
-    "pudgy",
-];
 
 const METADATA_TEMPLATE_TERMS: &[&str] = &[
     "admission",
@@ -1248,6 +1239,10 @@ const METADATA_TEMPLATE_TERMS: &[&str] = &[
     "hair",
     "hat",
     "head",
+    "hand",
+    "item",
+    "left",
+    "legs",
     "mouth",
     "number",
     "pants",
@@ -1259,9 +1254,14 @@ const METADATA_TEMPLATE_TERMS: &[&str] = &[
     "shoes",
     "skin",
     "style",
+    "right",
     "tier",
     "token",
     "type",
+];
+
+const DESCRIPTION_STOP_TERMS: &[&str] = &[
+    "and", "for", "from", "has", "have", "into", "not", "that", "the", "this", "with", "your",
 ];
 
 fn has_trailing_number_suffix(value: &str) -> bool {
@@ -1272,46 +1272,18 @@ fn has_trailing_number_suffix(value: &str) -> bool {
 }
 
 fn has_derivative_suffix(value: &str) -> bool {
-    let value = normalize_nfkc(value).to_lowercase();
-    value.ends_with("404")
-        || value.ends_with("v2")
-        || value.ends_with(".fun")
-        || value.ends_with('x')
-}
-
-fn has_inserted_ai_marker(seed: &str, value: &str) -> bool {
-    !normalize_nfkc(seed).to_lowercase().contains("ai")
-        && normalize_nfkc(value).to_lowercase().contains("ai")
-}
-
-fn asset_refs(value: &str) -> BTreeSet<String> {
-    ASSET_REF_RE
-        .find_iter(value)
-        .map(|m| {
-            m.as_str()
-                .trim_matches(|ch| ch == '"' || ch == '\'')
-                .to_lowercase()
-        })
-        .collect()
-}
-
-fn shared_asset_refs(seed: &str, value: &str) -> BTreeSet<String> {
-    let seed_refs = asset_refs(seed);
-    asset_refs(value)
-        .into_iter()
-        .filter(|reference| seed_refs.contains(reference))
-        .collect()
-}
-
-fn has_shared_terms(seed: &str, value: &str, terms: &[&str]) -> bool {
-    let seed_tokens = metadata_tokens(seed).into_iter().collect::<BTreeSet<_>>();
-    let value_tokens = metadata_tokens(value).into_iter().collect::<BTreeSet<_>>();
-    terms
+    let value = normalize_nfkc(value);
+    DERIVATIVE_SUFFIX_PATTERNS
         .iter()
-        .any(|term| seed_tokens.contains(*term) && value_tokens.contains(*term))
+        .any(|pattern| pattern.is_match(&value))
 }
 
-fn has_metadata_template_reuse(seed: &str, value: &str) -> bool {
+fn metadata_change_text(value: &str) -> String {
+    let without_assets = ASSET_REF_RE.replace_all(value, " ");
+    URL_RE.replace_all(&without_assets, " ").trim().to_string()
+}
+
+fn has_attribute_values_changed(seed: &str, value: &str) -> bool {
     let seed_norm = normalize_text(seed);
     let value_norm = normalize_text(value);
     if seed_norm.is_empty() || value_norm.is_empty() || seed_norm == value_norm {
@@ -1332,15 +1304,75 @@ fn has_metadata_template_reuse(seed: &str, value: &str) -> bool {
         .iter()
         .filter(|term| seed_tokens.contains(**term) && value_tokens.contains(**term))
         .count();
-    if shared_template_terms >= 3 {
-        return true;
+    if shared_template_terms == 0 {
+        return false;
     }
 
     let shared_terms = seed_tokens.intersection(&value_tokens).count();
     let smaller_doc_terms = seed_tokens.len().min(value_tokens.len());
-    shared_template_terms >= 1
-        && shared_terms >= 8
-        && shared_terms as f64 / smaller_doc_terms as f64 >= 0.35
+    let has_seed_only = seed_tokens.difference(&value_tokens).next().is_some();
+    let has_value_only = value_tokens.difference(&seed_tokens).next().is_some();
+    has_seed_only
+        && has_value_only
+        && (shared_template_terms >= 3
+            || (shared_terms >= 1 && shared_terms as f64 / smaller_doc_terms as f64 >= 0.30))
+}
+
+fn metadata_template_term_set(value: &str) -> BTreeSet<&'static str> {
+    let tokens = metadata_tokens(value).into_iter().collect::<BTreeSet<_>>();
+    METADATA_TEMPLATE_TERMS
+        .iter()
+        .copied()
+        .filter(|term| tokens.contains(*term))
+        .collect()
+}
+
+fn has_template_changed(seed: &str, value: &str) -> bool {
+    let seed_terms = metadata_template_term_set(seed);
+    let value_terms = metadata_template_term_set(value);
+    if seed_terms.is_empty() || value_terms.is_empty() {
+        return false;
+    }
+    seed_terms.symmetric_difference(&value_terms).count() >= 1
+}
+
+fn description_tokens(value: &str) -> BTreeSet<String> {
+    metadata_tokens(value)
+        .into_iter()
+        .filter(|token| !METADATA_TEMPLATE_TERMS.contains(&token.as_str()))
+        .filter(|token| !DESCRIPTION_STOP_TERMS.contains(&token.as_str()))
+        .filter(|token| token.chars().any(char::is_alphabetic))
+        .filter(|token| token.len() >= 4)
+        .collect()
+}
+
+fn has_description_changed(seed: &str, value: &str) -> bool {
+    let seed_tokens = description_tokens(seed);
+    let value_tokens = description_tokens(value);
+    if seed_tokens.len() < 3 || value_tokens.len() < 3 {
+        return false;
+    }
+    let shared = seed_tokens.intersection(&value_tokens).count();
+    let seed_only = seed_tokens.difference(&value_tokens).count();
+    let value_only = value_tokens.difference(&seed_tokens).count();
+    shared >= 1 && seed_only >= 2 && value_only >= 2
+}
+
+fn has_description_added(seed: &str, value: &str) -> bool {
+    let seed_tokens = description_tokens(seed);
+    let value_tokens = description_tokens(value);
+    let added = value_tokens.difference(&seed_tokens).count();
+    added >= 4 && (seed_tokens.len() < 4 || added as f64 / seed_tokens.len().max(1) as f64 >= 0.25)
+}
+
+fn has_description_removed(seed: &str, value: &str) -> bool {
+    let seed_tokens = description_tokens(seed);
+    let value_tokens = description_tokens(value);
+    if value_tokens.len() < 4 {
+        return false;
+    }
+    let removed = seed_tokens.difference(&value_tokens).count();
+    removed >= 4 && removed as f64 / value_tokens.len() as f64 >= 0.25
 }
 
 fn modification_summary<'a>(
@@ -1612,11 +1644,99 @@ mod tests {
         assert!(output.contains("- unicode_compatibility: 1 (50.0%)"));
         assert!(output.contains("- other: 1 (50.0%)"));
         assert!(output.contains("- total matches: 1"));
-        assert!(output.contains("- exact_metadata_clone: 1 (100.0%)"));
-        assert!(output.contains("- asset_pointer_reuse: 1 (100.0%)"));
-        assert!(output.contains("- trait_schema_reuse: 1 (100.0%)"));
+        assert!(output.contains("- uri-only: 1 (100.0%)"));
+        assert!(!output.contains("- asset_pointer_reuse:"));
+        assert!(!output.contains("- trait_schema_reuse:"));
         assert!(!output.contains("1/2"));
         assert!(!output.contains("1/1"));
+    }
+
+    #[test]
+    fn name_labels_remove_ai_and_homoglyph_and_count_versions_as_token_suffix() {
+        assert_eq!(
+            classify_name_modifications("Azuki", "AIZUKI"),
+            vec!["other"]
+        );
+        assert_eq!(
+            classify_name_modifications("Azuki", "Azuki 404"),
+            vec!["token_number_suffix"]
+        );
+        assert_eq!(
+            classify_name_modifications("Azuki", "Azuki v2"),
+            vec!["token_number_suffix"]
+        );
+        assert_eq!(
+            classify_name_modifications("Azuki", "Azuki Official"),
+            vec!["derivative_suffix"]
+        );
+    }
+
+    #[test]
+    fn metadata_labels_describe_changes_not_reuse() {
+        assert_eq!(
+            classify_metadata_modifications(
+                "background gold ipfs://seed/image.png",
+                "background red ipfs://copy/image.png"
+            ),
+            vec!["attribute_values_changed"]
+        );
+        assert_eq!(
+            classify_metadata_modifications(
+                "background gold",
+                "background gold ipfs://copy/image.png"
+            ),
+            vec!["uri-only"]
+        );
+        assert_eq!(
+            classify_metadata_modifications(
+                "background gold ipfs://seed/image.png",
+                "background gold"
+            ),
+            vec!["uri-only"]
+        );
+    }
+
+    #[test]
+    fn metadata_distinguishes_template_changes_from_attribute_value_changes() {
+        assert_eq!(
+            classify_metadata_modifications(
+                "background yellow fur dark brown eyes wide",
+                "background red fur golden eyes bored"
+            ),
+            vec!["attribute_values_changed"]
+        );
+        assert_eq!(
+            classify_metadata_modifications(
+                "background yellow fur dark brown eyes wide",
+                "background yellow fur dark brown legs cream item phone"
+            ),
+            vec!["template_changed"]
+        );
+    }
+
+    #[test]
+    fn metadata_labels_description_text_changes_from_current_examples() {
+        assert_eq!(
+            classify_metadata_modifications(
+                "background yellow fur dark brown",
+                "background yellow fur dark brown a homage to mayc not affiliated created for holders"
+            ),
+            vec!["description_added"]
+        );
+        assert_eq!(
+            classify_metadata_modifications(
+                "rarity spectacular token benefit admission edition character this token has been redeemed for a ticket to veecon",
+                "rarity very rare token benefit admission edition character this token is verifiable for admission to veecon"
+            ),
+            vec!["attribute_values_changed", "description_changed"]
+        );
+        assert_eq!(
+            classify_metadata_modifications(
+                "background m1 yellow fur m1 pink eyes m1 blindfold",
+                "background m1 army green 9% have this trait fur m1 dark brown 10% have this trait eyes m1 crazy 3% have this trait"
+            ),
+            vec!["attribute_values_changed", "rarity_text_added", "description_added"]
+        );
     }
 
     #[test]
@@ -1698,13 +1818,13 @@ mod tests {
     }
 
     #[test]
-    fn metadata_template_reuse_labels_structured_value_substitution() {
+    fn metadata_structured_template_changes_label_attribute_values_changed() {
         let seed = "category spirit sediment biogenic swamp number sediment tier environment steppes number environment tier eastern resource whisper number eastern resource tier southern resource lumileaf number southern resource tier northern resource moldium number northern resource tier plot";
         let value = "category decay sediment chemical goo number sediment tier environment bog number environment tier southern resource whisper number southern resource tier western resource spikeweed number western resource tier number plot obelisk piece first trip";
 
         let labels = classify_metadata_modifications(seed, value);
 
-        assert!(labels.contains(&"metadata_template_reuse".to_string()));
+        assert!(labels.contains(&"attribute_values_changed".to_string()));
         assert!(!labels.contains(&"other".to_string()));
     }
 
