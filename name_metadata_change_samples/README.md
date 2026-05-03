@@ -33,12 +33,13 @@ cargo run --release -- \
 
 ## 输出口径
 
-工具只输出两个部分：
+工具输出三个部分：
 
-- `Name Matches`：每个 seed 的 name，以及查到重复的合约级代表 name 文本。
-- `Metadata Matches`：每个 seed 的 metadata，以及查到重复的 metadata 文本。
+- `Modification Summary`：按 name/metadata 分别统计修改方式标签。标签采用叠加统计，同一条重复记录可同时计入多个标签；未命中任何规则时计入 `other`。
+- `Name Matches`：每个 seed 的 name，以及查到重复的合约级代表 name 文本；每条 match 前显示对应标签。
+- `Metadata Matches`：每个 seed 的 metadata，以及查到重复的 metadata 文本；每条 match 前显示对应标签。
 
-工具不进行 URI/image URI 查重，不输出合约地址、symbol、match reason、confidence、row count 等辅助数据。name 使用 NFKC、去尾部 token 编号、小写化后的 Jaro-Winkler 比较；metadata 使用 JSON 字段抽取、Unicode tokenization 和 full-corpus BM25 相对分比较，并用 query-token index 跳过 BM25 必为 0 的候选。
+工具不进行 URI/image URI 查重，不输出合约地址、symbol、confidence、row count 等辅助数据。name 使用 NFKC、去尾部 token 编号、小写化后的 Jaro-Winkler 比较；metadata 使用 JSON 字段抽取、Unicode tokenization 和 full-corpus BM25 相对分比较，并用 query-token index 跳过 BM25 必为 0 的候选。
 
 ## seeds
 

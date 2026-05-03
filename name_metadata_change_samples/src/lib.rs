@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -29,6 +29,10 @@ static TRAILING_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
 });
 static WHITESPACE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
 static TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\p{L}\p{N}_]+").unwrap());
+static ASSET_REF_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(ipfs://[^\s]+|https?://[^\s]*ipfs[^\s]+|\bqm[1-9a-hj-np-z]{20,}\b|\bbafy[a-z2-7]{20,}\b)")
+        .unwrap()
+});
 
 const METADATA_BM25_K1: f64 = 1.2;
 const METADATA_BM25_B: f64 = 0.75;
@@ -63,6 +67,13 @@ pub struct SeedSampleReport {
 pub struct TextComparison {
     pub seed: String,
     pub matches: Vec<String>,
+    pub labeled_matches: Vec<LabeledTextMatch>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LabeledTextMatch {
+    pub text: String,
+    pub labels: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -307,14 +318,8 @@ fn process_seed_contract(
     );
 
     let report = SeedSampleReport {
-        name: TextComparison {
-            seed: seed_name,
-            matches: name_matches,
-        },
-        metadata: TextComparison {
-            seed: seed_metadata,
-            matches: metadata_matches,
-        },
+        name: build_name_comparison(seed_name, name_matches),
+        metadata: build_metadata_comparison(seed_metadata, metadata_matches),
     };
     let match_count = report.name.matches.len() + report.metadata.matches.len();
     emit_progress(
@@ -1095,6 +1100,200 @@ fn effective_duckdb_threads(requested: usize) -> usize {
     }
 }
 
+fn build_name_comparison(seed: String, matches: Vec<String>) -> TextComparison {
+    let labeled_matches = matches
+        .iter()
+        .map(|value| LabeledTextMatch {
+            text: value.clone(),
+            labels: classify_name_modifications(&seed, value),
+        })
+        .collect();
+    TextComparison {
+        seed,
+        matches,
+        labeled_matches,
+    }
+}
+
+fn build_metadata_comparison(seed: String, matches: Vec<String>) -> TextComparison {
+    let labeled_matches = matches
+        .iter()
+        .map(|value| LabeledTextMatch {
+            text: value.clone(),
+            labels: classify_metadata_modifications(&seed, value),
+        })
+        .collect();
+    TextComparison {
+        seed,
+        matches,
+        labeled_matches,
+    }
+}
+
+fn classify_name_modifications(seed: &str, value: &str) -> Vec<String> {
+    let mut labels = Vec::new();
+    let seed_trimmed = seed.trim();
+    let value_trimmed = value.trim();
+    let seed_lower = normalize_nfkc(seed_trimmed).to_lowercase();
+    let value_lower = normalize_nfkc(value_trimmed).to_lowercase();
+    let seed_compact = WHITESPACE_RE.replace_all(&seed_lower, "").to_string();
+    let value_compact = WHITESPACE_RE.replace_all(&value_lower, "").to_string();
+    let seed_norm = normalize_name(seed_trimmed);
+    let value_norm = normalize_name(value_trimmed);
+
+    if seed_trimmed == value_trimmed && !seed_trimmed.is_empty() {
+        labels.push("exact_clone");
+    }
+    if seed_lower == value_lower && seed_trimmed != value_trimmed {
+        labels.push("case_change");
+    }
+    if seed_compact == value_compact && seed_lower != value_lower {
+        labels.push("spacing_change");
+    }
+    if value_trimmed.chars().any(should_render_as_codepoint) {
+        labels.push("invisible_unicode");
+    }
+    if normalize_nfkc(value_trimmed) != value_trimmed {
+        labels.push("unicode_compatibility");
+    }
+    if seed_norm == value_norm
+        && seed_trimmed != value_trimmed
+        && (has_trailing_number_suffix(seed_trimmed) || has_trailing_number_suffix(value_trimmed))
+    {
+        labels.push("token_number_suffix");
+    }
+    if has_derivative_suffix(value_trimmed) {
+        labels.push("derivative_suffix");
+    }
+    if has_inserted_ai_marker(seed_trimmed, value_trimmed) {
+        labels.push("ai_marker");
+    }
+    if labels.is_empty()
+        && score_normalized_name_pair(&seed_norm, &value_norm) >= 90.0
+        && seed_norm != value_norm
+    {
+        labels.push("homoglyph_or_typo");
+    }
+    if labels.is_empty() {
+        labels.push("other");
+    }
+    labels.into_iter().map(str::to_string).collect()
+}
+
+fn classify_metadata_modifications(seed: &str, value: &str) -> Vec<String> {
+    let mut labels = Vec::new();
+    if normalize_text(seed) == normalize_text(value) && !value.trim().is_empty() {
+        labels.push("exact_metadata_clone");
+    }
+    if !shared_asset_refs(seed, value).is_empty() {
+        labels.push("asset_pointer_reuse");
+    } else if !asset_refs(value).is_empty() {
+        labels.push("asset_pointer_present");
+    }
+    if has_shared_terms(seed, value, TRAIT_SCHEMA_TERMS) {
+        labels.push("trait_schema_reuse");
+    }
+    if has_shared_terms(seed, value, COLLECTION_TERMS) {
+        labels.push("collection_terms_reuse");
+    }
+    let value_lower = normalize_text(value);
+    if value_lower.contains("trait") && value_lower.contains('%') {
+        labels.push("rarity_text_added");
+    }
+    if labels.is_empty() {
+        labels.push("other");
+    }
+    labels.into_iter().map(str::to_string).collect()
+}
+
+const TRAIT_SCHEMA_TERMS: &[&str] = &[
+    "attribute",
+    "attributes",
+    "background",
+    "clothes",
+    "eyes",
+    "fur",
+    "hat",
+    "headwear",
+    "mouth",
+    "trait",
+];
+
+const COLLECTION_TERMS: &[&str] = &[
+    "ape", "azuki", "bayc", "beanz", "bored", "cool", "doodle", "milady", "mooncat", "mutant",
+    "pudgy",
+];
+
+fn has_trailing_number_suffix(value: &str) -> bool {
+    let normalized = normalize_nfkc(value);
+    TRAILING_PATTERNS
+        .iter()
+        .any(|pattern| pattern.is_match(&normalized))
+}
+
+fn has_derivative_suffix(value: &str) -> bool {
+    let value = normalize_nfkc(value).to_lowercase();
+    value.ends_with("404")
+        || value.ends_with("v2")
+        || value.ends_with(".fun")
+        || value.ends_with('x')
+}
+
+fn has_inserted_ai_marker(seed: &str, value: &str) -> bool {
+    !normalize_nfkc(seed).to_lowercase().contains("ai")
+        && normalize_nfkc(value).to_lowercase().contains("ai")
+}
+
+fn asset_refs(value: &str) -> BTreeSet<String> {
+    ASSET_REF_RE
+        .find_iter(value)
+        .map(|m| {
+            m.as_str()
+                .trim_matches(|ch| ch == '"' || ch == '\'')
+                .to_lowercase()
+        })
+        .collect()
+}
+
+fn shared_asset_refs(seed: &str, value: &str) -> BTreeSet<String> {
+    let seed_refs = asset_refs(seed);
+    asset_refs(value)
+        .into_iter()
+        .filter(|reference| seed_refs.contains(reference))
+        .collect()
+}
+
+fn has_shared_terms(seed: &str, value: &str, terms: &[&str]) -> bool {
+    let seed_tokens = metadata_tokens(seed).into_iter().collect::<BTreeSet<_>>();
+    let value_tokens = metadata_tokens(value).into_iter().collect::<BTreeSet<_>>();
+    terms
+        .iter()
+        .any(|term| seed_tokens.contains(*term) && value_tokens.contains(*term))
+}
+
+fn modification_counts<'a>(
+    reports: impl Iterator<Item = &'a TextComparison>,
+    classifier: fn(&str, &str) -> Vec<String>,
+) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for comparison in reports {
+        if comparison.labeled_matches.is_empty() {
+            for value in &comparison.matches {
+                for label in classifier(&comparison.seed, value) {
+                    *counts.entry(label).or_default() += 1;
+                }
+            }
+        } else {
+            for labeled in &comparison.labeled_matches {
+                for label in &labeled.labels {
+                    *counts.entry(label.clone()).or_default() += 1;
+                }
+            }
+        }
+    }
+    counts
+}
+
 fn write_markdown_report(path: &Path, report: &SampleReport) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -1113,11 +1312,17 @@ fn render_markdown_report(report: &SampleReport) -> String {
         report.seed_reports.len()
     ));
 
+    push_modification_summary(&mut out, report);
+
     out.push_str("## Name Matches\n\n");
     for seed in &report.seed_reports {
         out.push_str(&format!("- seed: {}\n", inline_or_empty(&seed.name.seed)));
-        for value in &seed.name.matches {
-            out.push_str(&format!("  - {}\n", inline_or_empty(value)));
+        for value in labeled_matches_for_report(&seed.name, classify_name_modifications) {
+            out.push_str(&format!(
+                "  - [{}] {}\n",
+                value.labels.join(", "),
+                inline_or_empty(&value.text)
+            ));
         }
     }
 
@@ -1125,18 +1330,68 @@ fn render_markdown_report(report: &SampleReport) -> String {
     for seed in &report.seed_reports {
         out.push_str("- seed:\n\n");
         push_fenced(&mut out, &seed.metadata.seed);
-        for value in &seed.metadata.matches {
-            out.push_str("- match:\n\n");
-            push_fenced(&mut out, value);
+        for value in labeled_matches_for_report(&seed.metadata, classify_metadata_modifications) {
+            out.push_str(&format!("- match labels: {}\n\n", value.labels.join(", ")));
+            push_fenced(&mut out, &value.text);
         }
     }
 
     out
 }
 
+fn push_modification_summary(out: &mut String, report: &SampleReport) {
+    out.push_str("## Modification Summary\n\n");
+    out.push_str("### Name\n\n");
+    push_counts(
+        out,
+        modification_counts(
+            report.seed_reports.iter().map(|seed| &seed.name),
+            classify_name_modifications,
+        ),
+    );
+    out.push_str("\n### Metadata\n\n");
+    push_counts(
+        out,
+        modification_counts(
+            report.seed_reports.iter().map(|seed| &seed.metadata),
+            classify_metadata_modifications,
+        ),
+    );
+    out.push('\n');
+}
+
+fn push_counts(out: &mut String, counts: BTreeMap<String, usize>) {
+    if counts.is_empty() {
+        out.push_str("- _none_\n");
+        return;
+    }
+    for (label, count) in counts {
+        out.push_str(&format!("- {label}: {count}\n"));
+    }
+}
+
+fn labeled_matches_for_report(
+    comparison: &TextComparison,
+    classifier: fn(&str, &str) -> Vec<String>,
+) -> Vec<LabeledTextMatch> {
+    if !comparison.labeled_matches.is_empty() {
+        return comparison.labeled_matches.clone();
+    }
+    comparison
+        .matches
+        .iter()
+        .map(|value| LabeledTextMatch {
+            text: value.clone(),
+            labels: classifier(&comparison.seed, value),
+        })
+        .collect()
+}
+
 fn inline_or_empty(value: &str) -> String {
     if value.trim().is_empty() {
         "_empty_".to_string()
+    } else if is_unavailable_display_text(value) {
+        "_unavailable_".to_string()
     } else {
         render_visible_text(value)
     }
@@ -1161,6 +1416,14 @@ fn render_visible_text(value: &str) -> String {
         }
     }
     out
+}
+
+fn is_unavailable_display_text(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && trimmed
+            .chars()
+            .all(|ch| ch == '?' || ch == '\u{fffd}' || ch.is_whitespace())
 }
 
 fn should_render_as_codepoint(ch: char) -> bool {
@@ -1216,5 +1479,59 @@ mod tests {
     fn report_text_makes_invisible_characters_visible() {
         assert_eq!(render_visible_text("Dood\u{034f}les"), "Dood<U+034F>les");
         assert_eq!(render_visible_text("Dood\u{e002}0les"), "Dood<U+E002>0les");
+    }
+
+    #[test]
+    fn report_summarizes_overlapping_modification_labels() {
+        let report = SampleReport {
+            chain: "ethereum".into(),
+            seed_reports: vec![SeedSampleReport {
+                name: TextComparison {
+                    seed: "Azuki #1".into(),
+                    matches: vec!["Ａｚｕｋｉ #456".into(), "Unrelated".into()],
+                    labeled_matches: Vec::new(),
+                },
+                metadata: TextComparison {
+                    seed: "background gold ipfs://seed/image.png".into(),
+                    matches: vec!["background gold ipfs://seed/image.png".into()],
+                    labeled_matches: Vec::new(),
+                },
+            }],
+        };
+
+        let output = render_markdown_report(&report);
+
+        assert!(output.contains("## Modification Summary"));
+        assert!(output.contains("- token_number_suffix: 1"));
+        assert!(output.contains("- unicode_compatibility: 1"));
+        assert!(output.contains("- other: 1"));
+        assert!(output.contains("- exact_metadata_clone: 1"));
+        assert!(output.contains("- asset_pointer_reuse: 1"));
+        assert!(output.contains("- trait_schema_reuse: 1"));
+    }
+
+    #[test]
+    fn report_hides_all_question_mark_display_text_without_seed_contract_identifier() {
+        let report = SampleReport {
+            chain: "ethereum".into(),
+            seed_reports: vec![SeedSampleReport {
+                name: TextComparison {
+                    seed: "????".into(),
+                    matches: vec!["????".into()],
+                    labeled_matches: Vec::new(),
+                },
+                metadata: TextComparison {
+                    seed: String::new(),
+                    matches: Vec::new(),
+                    labeled_matches: Vec::new(),
+                },
+            }],
+        };
+
+        let output = render_markdown_report(&report);
+
+        assert!(output.contains("- seed: _unavailable_"));
+        assert!(output.contains("[exact_clone] _unavailable_"));
+        assert!(!output.contains("contract:"));
     }
 }
