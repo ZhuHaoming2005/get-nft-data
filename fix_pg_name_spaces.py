@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-off PostgreSQL repair for contract names with inconsistent trailing spaces."""
+"""One-off PostgreSQL repair for contract names with inconsistent edge spaces."""
 
 from __future__ import annotations
 
@@ -32,8 +32,8 @@ def quote_ident(value: str) -> str:
     return value
 
 
-def trim_trailing_spaces(value: str | None) -> str | None:
-    return None if value is None else value.rstrip()
+def normalize_edge_spaces(value: str | None) -> str | None:
+    return None if value is None else value.strip()
 
 
 def fixable_contracts_cte(table: str) -> str:
@@ -43,15 +43,15 @@ def fixable_contracts_cte(table: str) -> str:
             SELECT
                 lower(contract_address) AS contract_address,
                 COUNT(*) FILTER (
-                    WHERE name IS NOT NULL AND name <> rtrim(name)
-                ) AS trailing_space_rows,
+                    WHERE name IS NOT NULL AND name <> btrim(name)
+                ) AS edge_space_rows,
                 COUNT(DISTINCT name) FILTER (
                     WHERE name IS NOT NULL
                 ) AS raw_name_count,
-                COUNT(DISTINCT rtrim(name)) FILTER (
+                COUNT(DISTINCT btrim(name)) FILTER (
                     WHERE name IS NOT NULL
                 ) AS trimmed_name_count,
-                MIN(rtrim(name)) FILTER (
+                MIN(btrim(name)) FILTER (
                     WHERE name IS NOT NULL
                 ) AS canonical_name
             FROM {table}
@@ -62,9 +62,9 @@ def fixable_contracts_cte(table: str) -> str:
             SELECT
                 contract_address,
                 canonical_name,
-                trailing_space_rows
+                edge_space_rows
             FROM per_contract
-            WHERE trailing_space_rows > 0
+            WHERE edge_space_rows > 0
               AND raw_name_count > 1
               AND trimmed_name_count = 1
               AND canonical_name IS NOT NULL
@@ -76,9 +76,9 @@ def select_fixable_contracts_sql(table: str) -> str:
     return (
         fixable_contracts_cte(table)
         + """
-        SELECT contract_address, canonical_name, trailing_space_rows
+        SELECT contract_address, canonical_name, edge_space_rows
         FROM fixable
-        ORDER BY trailing_space_rows DESC, contract_address
+        ORDER BY edge_space_rows DESC, contract_address
         LIMIT %s
         """
     )
@@ -91,7 +91,7 @@ def count_fixable_sql(table: str) -> str:
         + f"""
         SELECT
             COUNT(*) AS fixable_contracts,
-            COALESCE(SUM(trailing_space_rows), 0) AS rows_to_update,
+            COALESCE(SUM(edge_space_rows), 0) AS rows_to_update,
             (
                 SELECT COUNT(*)
                 FROM (
@@ -100,9 +100,9 @@ def count_fixable_sql(table: str) -> str:
                     WHERE contract_address IS NOT NULL
                     GROUP BY lower(contract_address)
                     HAVING COUNT(*) FILTER (
-                               WHERE name IS NOT NULL AND name <> rtrim(name)
+                               WHERE name IS NOT NULL AND name <> btrim(name)
                            ) > 0
-                       AND COUNT(DISTINCT rtrim(name)) FILTER (
+                       AND COUNT(DISTINCT btrim(name)) FILTER (
                                WHERE name IS NOT NULL
                            ) > 1
                 ) ambiguous
@@ -122,7 +122,7 @@ def apply_fix_sql(table: str) -> str:
         FROM fixable
         WHERE lower(target.contract_address) = fixable.contract_address
           AND target.name IS NOT NULL
-          AND target.name <> rtrim(target.name)
+          AND target.name <> btrim(target.name)
         """
     )
 
@@ -167,8 +167,8 @@ def apply_fix(conn, table: str) -> int:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Fix nft_assets_{chain}.name rows where a contract has both trailing-space "
-            "and non-trailing-space versions of the same name."
+            "Fix nft_assets_{chain}.name rows where a contract has edge-space "
+            "and clean versions of the same name."
         )
     )
     parser.add_argument("--chain", default=os.getenv("CHAIN_NAME", "ethereum"))
@@ -192,8 +192,8 @@ def main(argv: list[str] | None = None) -> int:
         examples = fetch_examples(conn, table, args.examples)
         if examples:
             print("examples:")
-            for contract_address, canonical_name, trailing_rows in examples:
-                print(f"  {contract_address}: {trailing_rows} rows -> {canonical_name!r}")
+            for contract_address, canonical_name, edge_rows in examples:
+                print(f"  {contract_address}: {edge_rows} rows -> {canonical_name!r}")
 
         if not args.apply:
             conn.rollback()
