@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-use duckdb::{params, Connection};
+use duckdb::{params, AccessMode, Config, Connection};
 use once_cell::sync::Lazy;
 use regex::Regex;
 
@@ -314,6 +314,28 @@ impl DuckDbFeatureStore {
             );
             ",
         )?;
+        Self::validate_schema(&conn)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+            resource_options,
+        })
+    }
+
+    pub fn open_read_only_with_options(
+        database_path: &str,
+        resource_options: DuckDbResourceOptions,
+    ) -> Result<Self, AppError> {
+        if database_path == ":memory:" {
+            return Self::new_with_options(database_path, resource_options);
+        }
+        validate_duckdb_memory_limit(&resource_options.memory_limit)?;
+        let conn = Connection::open_with_flags(
+            database_path,
+            Config::default().access_mode(AccessMode::ReadOnly)?,
+        )?;
+        let temp_directory = Self::default_temp_directory(database_path);
+        std::fs::create_dir_all(&temp_directory)?;
+        Self::apply_resource_options(&conn, &resource_options, &temp_directory)?;
         Self::validate_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
