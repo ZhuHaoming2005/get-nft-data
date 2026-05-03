@@ -1138,7 +1138,7 @@ fn inline_or_empty(value: &str) -> String {
     if value.trim().is_empty() {
         "_empty_".to_string()
     } else {
-        value.to_string()
+        render_visible_text(value)
     }
 }
 
@@ -1147,7 +1147,39 @@ fn push_fenced(out: &mut String, value: &str) {
         out.push_str("_empty_\n\n");
         return;
     }
+    let value = render_visible_text(value);
     out.push_str(&format!("````text\n{value}\n````\n\n"));
+}
+
+fn render_visible_text(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if should_render_as_codepoint(ch) {
+            out.push_str(&format!("<U+{:04X}>", ch as u32));
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn should_render_as_codepoint(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x0000..=0x0008
+            | 0x000B..=0x000C
+            | 0x000E..=0x001F
+            | 0x007F
+            | 0x00AD
+            | 0x034F
+            | 0x061C
+            | 0x180E
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060
+            | 0xFEFF
+            | 0xE000..=0xF8FF
+    )
 }
 
 #[cfg(test)]
@@ -1178,5 +1210,11 @@ mod tests {
     #[test]
     fn query_terms_preserve_duplicate_token_frequency() {
         assert_eq!(query_terms_from_tokens(&[7, 7, 9]), vec![(7, 2), (9, 1)]);
+    }
+
+    #[test]
+    fn report_text_makes_invisible_characters_visible() {
+        assert_eq!(render_visible_text("Dood\u{034f}les"), "Dood<U+034F>les");
+        assert_eq!(render_visible_text("Dood\u{e002}0les"), "Dood<U+E002>0les");
     }
 }
