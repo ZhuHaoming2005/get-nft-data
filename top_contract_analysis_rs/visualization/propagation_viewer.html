@@ -1123,54 +1123,6 @@
       return Number.isFinite(value) ? value : null;
     }
 
-    function inferredAcquisitionSummary(flows) {
-      const paidVictimAddresses = new Set();
-      for (const feature of reportArray("address_evidence_features")) {
-        const label = feature.attribution_label || "";
-        const hasPaidMint = (feature.evidence || []).some((item) => item.evidence_type === "paid_mint_payment");
-        if ((label === "likely_victim" || label === "corrupted_victim") && hasPaidMint) {
-          paidVictimAddresses.add(normalizeAddress(feature.address));
-        }
-      }
-      let paidMintEth = 0;
-      let paidMintUsd = 0;
-      let paidMintEdges = 0;
-      let paidMintStuckEth = 0;
-      let paidMintStuckUsd = 0;
-      let paidMintStuckTokens = 0;
-      const paths = Object.values(state.paths || {});
-
-      for (const flow of flows) {
-        if (flow.channel !== "mint_payment") continue;
-        const payer = normalizeAddress(flow.from_address);
-        if (!paidVictimAddresses.has(payer)) continue;
-        paidMintEdges += 1;
-        paidMintEth += Number(flow.value_eth || 0);
-        paidMintUsd += Number(flow.value_usd || 0);
-        const tokenIds = String(flow.token_id || "")
-          .split(",")
-          .map((tokenId) => tokenId.trim())
-          .filter(Boolean);
-        const path = paths.find((item) => sameContract(item, flow.contract_address));
-        if (!path || tokenIds.length === 0) continue;
-        let stuck = 0;
-        for (const tokenId of tokenIds) {
-          const tokenPath = (path.token_paths || []).find((item) => item.token_id === tokenId);
-          if ((tokenPath?.current_holder_addresses || []).some((holder) => normalizeAddress(holder) === payer)) {
-            stuck += 1;
-          }
-        }
-        if (stuck > 0) {
-          const fraction = stuck / tokenIds.length;
-          paidMintStuckTokens += stuck;
-          paidMintStuckEth += Number(flow.value_eth || 0) * fraction;
-          paidMintStuckUsd += Number(flow.value_usd || 0) * fraction;
-        }
-      }
-
-      return { paidMintEth, paidMintUsd, paidMintEdges, paidMintStuckEth, paidMintStuckUsd, paidMintStuckTokens };
-    }
-
     function lifecycleMetricFor(contract = state.selectedContract) {
       return reportArray("lifecycle_metrics").find((item) => sameContract(item, contract)) || null;
     }
@@ -1417,37 +1369,37 @@
       const flowCounts = countBy(valueFlows, (edge) => edge.channel);
       const royaltyEdges = valueFlows.filter((edge) => edge.channel === "royalty_fee");
       const knownRoyalty = royaltyEdges.filter((edge) => edge.recipient_known).length;
-      const inferredCosts = inferredAcquisitionSummary(valueFlows);
-      const secondarySaleUsd = summaryNumber(summary, "secondary_sale_victim_purchase_total_usd") ?? Number(summary.honest_purchase_total_usd || 0);
-      const secondaryStuckUsd = summaryNumber(summary, "secondary_sale_stuck_cost_usd") ?? Number(summary.stuck_cost_usd || 0);
-      const paidMintUsd = summaryNumber(summary, "paid_mint_victim_cost_usd") ?? inferredCosts.paidMintUsd;
-      const paidMintStuckUsd = summaryNumber(summary, "paid_mint_stuck_cost_usd") ?? inferredCosts.paidMintStuckUsd;
-      const victimTotalUsd = summaryNumber(summary, "victim_acquisition_total_usd") ?? (secondarySaleUsd + paidMintUsd);
-      const victimStuckUsd = summaryNumber(summary, "victim_acquisition_stuck_cost_usd") ?? (secondaryStuckUsd + paidMintStuckUsd);
-      const victimStuckRatio = summaryNumber(summary, "victim_acquisition_stuck_cost_ratio") ?? (victimTotalUsd > 0 ? victimStuckUsd / victimTotalUsd : 0);
+      const secondarySaleUsd = summaryNumber(summary, "secondary_sale_victim_cost_usd") ?? 0;
+      const secondaryStuckUsd = summaryNumber(summary, "secondary_sale_stuck_cost_usd") ?? 0;
+      const paidMintUsd = summaryNumber(summary, "paid_mint_victim_cost_usd") ?? 0;
+      const paidMintStuckUsd = summaryNumber(summary, "paid_mint_stuck_cost_usd") ?? 0;
+      const victimTotalUsd = summaryNumber(summary, "victim_acquisition_total_usd") ?? 0;
+      const victimStuckUsd = summaryNumber(summary, "victim_acquisition_stuck_cost_usd") ?? 0;
+      const victimAddressCount = summaryNumber(summary, "victim_acquisition_address_count") ?? 0;
+      const stablecoinUsd = summaryNumber(summary, "stablecoin_erc20_value_usd") ?? 0;
 
       const wrapper = document.createElement("div");
       wrapper.innerHTML = `
         ${miniStats([
-          ["疑似合约", summary.candidate_contract_count || Object.keys(state.paths).length],
-          ["侵权NFT", summary.infringing_nft_count || 0],
+          ["疑似合约", summaryNumber(summary, "candidate_contract_count") ?? 0],
+          ["侵权NFT", summaryNumber(summary, "infringing_nft_count") ?? 0],
           ["活动簇", campaigns.length],
         ])}
         ${miniStats([
           ["传播中位数", secondsText(summary.median_seconds_to_honest_holder)],
+          ["受害地址", victimAddressCount.toLocaleString()],
           ["受害获取", formatUsd(victimTotalUsd)],
           ["总套牢", formatUsd(victimStuckUsd)],
-          ["套牢比例", percentText(victimStuckRatio)],
         ])}
         ${miniStats([
-          ["二级购买", formatUsd(secondarySaleUsd)],
+          ["二级受害成本", formatUsd(secondarySaleUsd)],
           ["付费mint", formatUsd(paidMintUsd)],
           ["mint套牢", formatUsd(paidMintStuckUsd)],
         ])}
         ${miniStats([
           ["USD覆盖ETH", formatEth(coverage.pricedEth)],
           ["未定价ETH", formatEth(coverage.unpricedEth)],
-          ["稳定币USD", formatUsd(summary.stablecoin_erc20_value_usd ?? coverage.stablecoinUsd)],
+          ["稳定币USD", formatUsd(stablecoinUsd)],
         ])}
         <div class="flow-list">
           ${flowCounts.slice(0, 6).map(([channel, count]) => {

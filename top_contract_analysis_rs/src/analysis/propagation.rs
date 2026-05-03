@@ -4,7 +4,7 @@ use crate::models::{
     HonestAddressPayload, InfringingTokenRecord, MaliciousAddressPayload,
     NftPropagationEdgePayload, NftPropagationNodePayload, NftPropagationPathPayload,
     NftPropagationSummaryPayload, NftSaleRecord, NftTokenPropagationPayload, OwnerBalance,
-    TransferRecord, VictimAddressPayload, ZERO_ADDRESS,
+    SecondarySaleVictimAddressPayload, TransferRecord, ZERO_ADDRESS,
 };
 
 #[derive(Default)]
@@ -292,7 +292,7 @@ pub fn build_nft_propagation_path(
     infringing_tokens: &[InfringingTokenRecord],
     malicious_addresses: &[MaliciousAddressPayload],
     honest_addresses: &[HonestAddressPayload],
-    victim_addresses: &[VictimAddressPayload],
+    secondary_sale_victim_addresses: &[SecondarySaleVictimAddressPayload],
 ) -> NftPropagationPathPayload {
     let relevant_token_ids: HashSet<String> = infringing_tokens
         .iter()
@@ -341,7 +341,7 @@ pub fn build_nft_propagation_path(
                 .max(item.currently_holding_token_count);
         }
     }
-    for item in victim_addresses {
+    for item in secondary_sale_victim_addresses {
         if let Some(node) = node_mut(&mut nodes, &item.address) {
             node.roles.insert("victim_buyer".into());
             node.is_stuck_victim |= item.is_stuck;

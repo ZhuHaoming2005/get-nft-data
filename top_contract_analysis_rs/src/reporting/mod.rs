@@ -176,8 +176,8 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
             format_ratio(summary.victim_acquisition_stuck_cost_ratio)
         ),
         format!(
-            "- 二级市场受害者购买额(USD): {}",
-            summary.secondary_sale_victim_purchase_total_usd
+            "- 二级市场受害者成本(USD): {} / addresses={}",
+            summary.secondary_sale_victim_cost_usd, summary.secondary_sale_victim_address_count
         ),
         format!(
             "- 二级市场套牢资金(USD): {} / {}",
@@ -317,12 +317,12 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
         format!("- 有定价销售记录数: {}", total_usd_priced_sale_count),
         format!("- 有定价销售额(USD): {}", total_usd_priced_volume),
         format!(
-            "- 受害者获取成本合计(USD): {}",
-            summary.victim_acquisition_total_usd
+            "- 受害者获取成本合计(USD): {} / addresses={}",
+            summary.victim_acquisition_total_usd, summary.victim_acquisition_address_count
         ),
         format!(
-            "- 二级市场受害者购买额(USD): {}",
-            summary.secondary_sale_victim_purchase_total_usd
+            "- 二级市场受害者成本(USD): {} / addresses={}",
+            summary.secondary_sale_victim_cost_usd, summary.secondary_sale_victim_address_count
         ),
         format!(
             "- 付费 mint 受害者成本(USD): {} / edges={} / addresses={}",
@@ -402,8 +402,9 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
             format_ratio(summary.victim_acquisition_stuck_cost_ratio_overall)
         ),
         format!(
-            "- 二级市场受害者购买额(USD)汇总: {}",
-            summary.secondary_sale_victim_purchase_total_usd_total
+            "- 二级市场受害者成本(USD)汇总: {} / addresses={}",
+            summary.secondary_sale_victim_cost_usd_total,
+            summary.secondary_sale_victim_address_count_total
         ),
         format!(
             "- 付费 mint 受害者成本(USD)汇总: {} / edges={}",
@@ -479,7 +480,7 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
             };
 
             lines.push(format!(
-                "- {} ({}) | 重复合约={} | 侵权NFT={} | 恶意地址={} | 诚实地址={} | 多次侵权地址={} | 官方参与={} | 受害者获取成本(USD)={} | 二级购买(USD)={} | 付费mint(USD)={} | 总套牢(USD)={}/{} | >60%={}/{} | 套牢节点={}/{} | 被腐化={} | 诚实购买时长={}秒 | 传播中位数={}秒 | 首次转手中位数={}秒 | JSON={} | MD={}",
+                "- {} ({}) | 重复合约={} | 侵权NFT={} | 恶意地址={} | 诚实地址={} | 多次侵权地址={} | 官方参与={} | 受害者获取成本(USD)={} | 二级成本(USD)={} | 付费mint(USD)={} | 总套牢(USD)={}/{} | >60%={}/{} | 套牢节点={}/{} | 被腐化={} | 诚实购买时长={}秒 | 传播中位数={}秒 | 首次转手中位数={}秒 | JSON={} | MD={}",
                 seed_name,
                 seed.contract_address,
                 report_summary.candidate_contract_count,
@@ -489,7 +490,7 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
                 report_summary.repeat_infringing_address_count,
                 report_summary.legit_duplicate_contract_count,
                 report_summary.victim_acquisition_total_usd,
-                report_summary.secondary_sale_victim_purchase_total_usd,
+                report_summary.secondary_sale_victim_cost_usd,
                 report_summary.paid_mint_victim_cost_usd,
                 report_summary.victim_acquisition_stuck_cost_usd,
                 format_ratio(report_summary.victim_acquisition_stuck_cost_ratio),

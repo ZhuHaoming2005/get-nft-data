@@ -414,7 +414,7 @@ fn build_contract_lifecycle_events(
                     event_id: format!("victim:{}", edge.edge_id),
                     contract_address: edge.contract_address.clone(),
                     lifecycle_stage: "victimization".into(),
-                    event_type: "victim_purchase".into(),
+                    event_type: "secondary_sale_victim_acquisition".into(),
                     block_number: edge.block_number,
                     block_time: edge.block_time,
                     tx_hash: edge.tx_hash.clone(),
@@ -1054,7 +1054,10 @@ fn is_outcome_lifecycle_event(event: &ContractLifecycleEventPayload) -> bool {
     matches!(
         event.lifecycle_stage.as_str(),
         "monetization" | "victimization"
-    ) || matches!(event.event_type.as_str(), "sale" | "victim_purchase")
+    ) || matches!(
+        event.event_type.as_str(),
+        "sale" | "secondary_sale_victim_acquisition"
+    )
 }
 
 fn has_strong_operator_address_evidence(
@@ -1817,7 +1820,7 @@ mod tests {
             ContractLifecycleEventPayload {
                 contract_address: "0xdup".into(),
                 lifecycle_stage: "victimization".into(),
-                event_type: "victim_purchase".into(),
+                event_type: "secondary_sale_victim_acquisition".into(),
                 block_time: 150,
                 ..ContractLifecycleEventPayload::default()
             },
@@ -1862,7 +1865,7 @@ mod tests {
             ContractLifecycleEventPayload {
                 contract_address: "0xdup".into(),
                 lifecycle_stage: "victimization".into(),
-                event_type: "victim_purchase".into(),
+                event_type: "secondary_sale_victim_acquisition".into(),
                 block_time: 150,
                 ..ContractLifecycleEventPayload::default()
             },

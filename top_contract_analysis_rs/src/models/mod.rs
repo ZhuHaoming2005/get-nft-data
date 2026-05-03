@@ -313,49 +313,26 @@ pub struct ReportSummary {
     pub legit_duplicate_contract_count: i64,
     pub candidate_open_license_token_count: i64,
     pub candidate_open_license_contract_count: i64,
-    pub honest_purchase_total_eth: f64,
-    #[serde(default)]
-    pub honest_purchase_total_usd: f64,
-    pub stuck_cost_eth: f64,
-    #[serde(default)]
-    pub stuck_cost_usd: f64,
-    pub stuck_cost_ratio: Option<f64>,
-    #[serde(default)]
-    pub secondary_sale_victim_purchase_total_eth: f64,
-    #[serde(default)]
-    pub secondary_sale_victim_purchase_total_usd: f64,
-    #[serde(default)]
+    pub secondary_sale_victim_cost_eth: f64,
+    pub secondary_sale_victim_cost_usd: f64,
+    pub secondary_sale_victim_address_count: i64,
     pub secondary_sale_stuck_cost_eth: f64,
-    #[serde(default)]
     pub secondary_sale_stuck_cost_usd: f64,
-    #[serde(default)]
     pub secondary_sale_stuck_cost_ratio: Option<f64>,
-    #[serde(default)]
     pub paid_mint_victim_cost_eth: f64,
-    #[serde(default)]
     pub paid_mint_victim_cost_usd: f64,
-    #[serde(default)]
     pub paid_mint_victim_edge_count: i64,
-    #[serde(default)]
     pub paid_mint_victim_address_count: i64,
-    #[serde(default)]
     pub paid_mint_stuck_cost_eth: f64,
-    #[serde(default)]
     pub paid_mint_stuck_cost_usd: f64,
-    #[serde(default)]
     pub paid_mint_stuck_edge_count: i64,
-    #[serde(default)]
     pub paid_mint_stuck_token_count: i64,
-    #[serde(default)]
     pub victim_acquisition_total_eth: f64,
-    #[serde(default)]
     pub victim_acquisition_total_usd: f64,
-    #[serde(default)]
     pub victim_acquisition_stuck_cost_eth: f64,
-    #[serde(default)]
     pub victim_acquisition_stuck_cost_usd: f64,
-    #[serde(default)]
     pub victim_acquisition_stuck_cost_ratio: Option<f64>,
+    pub victim_acquisition_address_count: i64,
     #[serde(default)]
     pub stablecoin_erc20_value_usd: f64,
     #[serde(default)]
@@ -437,7 +414,7 @@ pub struct VictimSignalPayload {
 pub struct HonestAddressStatsPayload {
     pub honest_address_count: i64,
     pub corrupted_address_count: i64,
-    pub honest_to_honest_transfer_count: i64,
+    pub victim_resale_count: i64,
     pub median_holding_seconds: Option<f64>,
     pub avg_seconds_to_honest_holder: Option<f64>,
     #[serde(default)]
@@ -453,12 +430,13 @@ pub struct HonestAddressPayload {
     pub hold_duration_median_seconds: Option<f64>,
     pub hold_duration_count: i64,
     pub is_corrupted_address: bool,
-    pub honest_sale_to_honest_count: i64,
+    pub victim_resale_count: i64,
     pub mint_to_honest_seconds_samples: Vec<i64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-pub struct VictimAddressPayload {
+pub struct SecondarySaleVictimAddressPayload {
+    pub contract_address: String,
     pub address: String,
     pub buy_tx_hashes: Vec<String>,
     pub buy_amount_eth: f64,
@@ -480,6 +458,34 @@ pub struct VictimAddressPayload {
 
 fn default_ratio_status() -> String {
     "unavailable".into()
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct VictimAcquisitionAddressPayload {
+    pub address: String,
+    pub contract_addresses: Vec<String>,
+    pub acquisition_channels: Vec<String>,
+    pub attribution_labels: Vec<String>,
+    pub tx_hashes: Vec<String>,
+    pub secondary_sale_cost_eth: f64,
+    pub secondary_sale_cost_usd: f64,
+    pub secondary_sale_stuck_cost_eth: f64,
+    pub secondary_sale_stuck_cost_usd: f64,
+    pub secondary_sale_count: i64,
+    pub paid_mint_cost_eth: f64,
+    pub paid_mint_cost_usd: f64,
+    pub paid_mint_stuck_cost_eth: f64,
+    pub paid_mint_stuck_cost_usd: f64,
+    pub paid_mint_edge_count: i64,
+    pub paid_mint_stuck_token_count: i64,
+    pub total_acquisition_cost_eth: f64,
+    pub total_acquisition_cost_usd: f64,
+    pub total_stuck_cost_eth: f64,
+    pub total_stuck_cost_usd: f64,
+    pub is_stuck: bool,
+    pub is_corrupted: bool,
+    pub buy_asset_ratio: Option<f64>,
+    pub buy_asset_ratio_with_gas: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -911,7 +917,8 @@ pub struct SingleReportPayload {
     pub malicious_addresses: Vec<MaliciousAddressPayload>,
     pub honest_addresses: Vec<HonestAddressPayload>,
     pub honest_address_stats: BTreeMap<String, HonestAddressStatsPayload>,
-    pub victim_addresses: Vec<VictimAddressPayload>,
+    pub secondary_sale_victim_addresses: Vec<SecondarySaleVictimAddressPayload>,
+    pub victim_acquisition_addresses: Vec<VictimAcquisitionAddressPayload>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub address_attributions: Vec<AddressAttributionPayload>,
     #[serde(default)]
@@ -950,49 +957,26 @@ pub struct BatchReportSummary {
     pub repeat_infringing_address_count_total: i64,
     pub repeat_infringing_address_count_global: i64,
     pub legit_duplicate_contract_count_total: i64,
-    pub honest_purchase_total_eth_total: f64,
-    #[serde(default)]
-    pub honest_purchase_total_usd_total: f64,
-    pub stuck_cost_eth_total: f64,
-    #[serde(default)]
-    pub stuck_cost_usd_total: f64,
-    pub stuck_cost_ratio_overall: Option<f64>,
-    #[serde(default)]
-    pub secondary_sale_victim_purchase_total_eth_total: f64,
-    #[serde(default)]
-    pub secondary_sale_victim_purchase_total_usd_total: f64,
-    #[serde(default)]
+    pub secondary_sale_victim_cost_eth_total: f64,
+    pub secondary_sale_victim_cost_usd_total: f64,
+    pub secondary_sale_victim_address_count_total: i64,
     pub secondary_sale_stuck_cost_eth_total: f64,
-    #[serde(default)]
     pub secondary_sale_stuck_cost_usd_total: f64,
-    #[serde(default)]
     pub secondary_sale_stuck_cost_ratio_overall: Option<f64>,
-    #[serde(default)]
     pub paid_mint_victim_cost_eth_total: f64,
-    #[serde(default)]
     pub paid_mint_victim_cost_usd_total: f64,
-    #[serde(default)]
     pub paid_mint_victim_edge_count_total: i64,
-    #[serde(default)]
     pub paid_mint_victim_address_count_total: i64,
-    #[serde(default)]
     pub paid_mint_stuck_cost_eth_total: f64,
-    #[serde(default)]
     pub paid_mint_stuck_cost_usd_total: f64,
-    #[serde(default)]
     pub paid_mint_stuck_edge_count_total: i64,
-    #[serde(default)]
     pub paid_mint_stuck_token_count_total: i64,
-    #[serde(default)]
     pub victim_acquisition_total_eth_total: f64,
-    #[serde(default)]
     pub victim_acquisition_total_usd_total: f64,
-    #[serde(default)]
     pub victim_acquisition_stuck_cost_eth_total: f64,
-    #[serde(default)]
     pub victim_acquisition_stuck_cost_usd_total: f64,
-    #[serde(default)]
     pub victim_acquisition_stuck_cost_ratio_overall: Option<f64>,
+    pub victim_acquisition_address_count_total: i64,
     #[serde(default)]
     pub stablecoin_erc20_value_usd_total: f64,
     #[serde(default)]

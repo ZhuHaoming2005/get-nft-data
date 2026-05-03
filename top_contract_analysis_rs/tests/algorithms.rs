@@ -19,8 +19,8 @@ use top_contract_analysis_rs::analysis::signals::analyze_transfer_signals;
 use top_contract_analysis_rs::models::{
     DatabaseNftRecord, DuplicateCandidate, DuplicateContractPayload, HonestAddressPayload,
     InfringingTokenRecord, NftMarketEventRecord, NftPropagationPathPayload, NftSaleRecord,
-    OwnerBalance, SeedContractPayload, SeedNft, TransferRecord, ValueFlowEdgePayload,
-    VictimAddressPayload, ZERO_ADDRESS,
+    OwnerBalance, SecondarySaleVictimAddressPayload, SeedContractPayload, SeedNft, TransferRecord,
+    ValueFlowEdgePayload, ZERO_ADDRESS,
 };
 use top_contract_analysis_rs::normalize::{normalize_name, normalize_symbol, normalize_url};
 use unicode_normalization::UnicodeNormalization;
@@ -580,12 +580,12 @@ fn address_attribution_records_emit_multiscore_labels() {
         is_native_eth: true,
         ..NftSaleRecord::default()
     }];
-    let victims = vec![VictimAddressPayload {
+    let victims = vec![SecondarySaleVictimAddressPayload {
         address: "0xbuyer".into(),
         last_buy_tx_hash: "0xsale".into(),
         is_stuck: true,
         buy_asset_ratio: Some(0.72),
-        ..VictimAddressPayload::default()
+        ..SecondarySaleVictimAddressPayload::default()
     }];
     let honest = vec![HonestAddressPayload {
         contract_address: "0xdup".into(),
@@ -876,14 +876,14 @@ fn lifecycle_model_outputs_expose_research_graph_payloads() {
         match_reasons: vec!["token_uri_match".into()],
         ..InfringingTokenRecord::default()
     }];
-    let victims = vec![VictimAddressPayload {
+    let victims = vec![SecondarySaleVictimAddressPayload {
         address: "0xbuyer".into(),
         buy_tx_hashes: vec!["0xsale".into()],
         buy_amount_eth: 1.5,
         buy_amount_usd: 4500.0,
         last_buy_tx_hash: "0xsale".into(),
         is_stuck: true,
-        ..VictimAddressPayload::default()
+        ..SecondarySaleVictimAddressPayload::default()
     }];
     let attributions = build_address_attribution_records(
         "0xdup",
@@ -1602,13 +1602,13 @@ fn campaign_clusters_do_not_merge_contracts_only_because_they_share_sale_seller(
             match_reasons: vec!["token_uri_match".into()],
             ..InfringingTokenRecord::default()
         }];
-        let victims = vec![VictimAddressPayload {
+        let victims = vec![SecondarySaleVictimAddressPayload {
             address: buyer.into(),
             buy_tx_hashes: vec![format!("0xsale{contract}")],
             buy_amount_eth: 1.0,
             last_buy_tx_hash: format!("0xsale{contract}"),
             is_stuck: true,
-            ..VictimAddressPayload::default()
+            ..SecondarySaleVictimAddressPayload::default()
         }];
         attributions.extend(build_address_attribution_records(
             contract,

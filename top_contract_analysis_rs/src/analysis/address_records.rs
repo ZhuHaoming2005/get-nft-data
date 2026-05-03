@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use crate::models::{
     AddressAttributionPayload, AddressEvidencePayload, DuplicateCandidate, FraudTradeStatsPayload,
     HonestAddressPayload, HonestAddressStatsPayload, InfringingTokenRecord,
-    MaliciousAddressPayload, NftSaleRecord, OwnerBalance, TransferRecord, ValueFlowEdgePayload,
-    VictimAddressPayload, ZERO_ADDRESS,
+    MaliciousAddressPayload, NftSaleRecord, OwnerBalance, SecondarySaleVictimAddressPayload,
+    TransferRecord, ValueFlowEdgePayload, ZERO_ADDRESS,
 };
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -86,6 +86,30 @@ fn mean_f64(values: &[f64]) -> Option<f64> {
 
 fn sale_usd_value(sale: &NftSaleRecord) -> Option<f64> {
     sale.price_usd
+}
+
+fn sale_has_positive_value(sale: &NftSaleRecord) -> bool {
+    sale.price_eth.unwrap_or_default() > 0.0 || sale.price_usd.unwrap_or_default() > 0.0
+}
+
+fn value_flow_has_positive_value(edge: &ValueFlowEdgePayload) -> bool {
+    edge.value_eth.unwrap_or_default() > 0.0 || edge.value_usd.unwrap_or_default() > 0.0
+}
+
+fn value_flow_token_ids(edge: &ValueFlowEdgePayload) -> Vec<String> {
+    edge.token_id
+        .split(',')
+        .map(str::trim)
+        .filter(|token_id| !token_id.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn value_flow_precedes_sale(edge: &ValueFlowEdgePayload, sale: &NftSaleRecord) -> bool {
+    if edge.block_number > 0 && sale.block_number > 0 {
+        return edge.block_number <= sale.block_number;
+    }
+    false
 }
 
 fn build_owner_token_map(owners: &[OwnerBalance]) -> HashMap<String, HashSet<String>> {
@@ -540,7 +564,7 @@ pub fn build_address_attribution_records(
     mint_payment_edges: &[ValueFlowEdgePayload],
     malicious_addresses: &[MaliciousAddressPayload],
     honest_addresses: &[HonestAddressPayload],
-    victim_addresses: &[VictimAddressPayload],
+    secondary_sale_victim_addresses: &[SecondarySaleVictimAddressPayload],
 ) -> Vec<AddressAttributionPayload> {
     let relevant_token_ids: HashSet<String> = infringing_tokens
         .iter()
@@ -741,14 +765,14 @@ pub fn build_address_attribution_records(
         );
     }
 
-    for item in victim_addresses {
+    for item in secondary_sale_victim_addresses {
         add_attribution_evidence(
             &mut rows,
             EvidenceInput {
                 contract_address,
                 address: &item.address,
                 role: "victim_candidate",
-                evidence_type: "victim_purchase_profile",
+                evidence_type: "secondary_sale_victim_profile",
                 token_id: "",
                 tx_hash: &item.last_buy_tx_hash,
                 weight: 0.20,
@@ -855,21 +879,27 @@ pub fn build_address_attribution_records(
         .collect()
 }
 
-pub fn build_victim_address_records(
+pub fn build_secondary_sale_victim_address_records(
+    contract_address: &str,
     sales: &[NftSaleRecord],
     transfers: &[TransferRecord],
     owners: &[OwnerBalance],
     sale_metrics_by_tx: &BTreeMap<String, SaleMetricRecord>,
-) -> Vec<VictimAddressPayload> {
+) -> Vec<SecondarySaleVictimAddressPayload> {
     let activity = prepare_contract_activity(transfers, sales, owners);
-    build_victim_address_records_from_activity(&activity, sale_metrics_by_tx)
+    build_secondary_sale_victim_address_records_from_activity(
+        contract_address,
+        &activity,
+        sale_metrics_by_tx,
+    )
 }
 
-pub(crate) fn build_victim_address_records_from_activity(
+pub(crate) fn build_secondary_sale_victim_address_records_from_activity(
+    contract_address: &str,
     activity: &PreparedContractActivity<'_>,
     sale_metrics_by_tx: &BTreeMap<String, SaleMetricRecord>,
-) -> Vec<VictimAddressPayload> {
-    let mut grouped: BTreeMap<String, VictimAddressPayload> = BTreeMap::new();
+) -> Vec<SecondarySaleVictimAddressPayload> {
+    let mut grouped: BTreeMap<String, SecondarySaleVictimAddressPayload> = BTreeMap::new();
     let mut last_buy_key: HashMap<String, (i64, i64, i64, String)> = HashMap::new();
 
     for sale in &activity.sorted_sales {
@@ -898,10 +928,11 @@ pub(crate) fn build_victim_address_records_from_activity(
 
         let entry = grouped
             .entry(sale.buyer_address.clone())
-            .or_insert_with(|| VictimAddressPayload {
+            .or_insert_with(|| SecondarySaleVictimAddressPayload {
+                contract_address: contract_address.to_string(),
                 address: sale.buyer_address.clone(),
                 ratio_status: "unavailable".into(),
-                ..VictimAddressPayload::default()
+                ..SecondarySaleVictimAddressPayload::default()
             });
         entry.buy_tx_hashes.push(sale.tx_hash.clone());
         if sale.price_eth.is_some() {
@@ -948,6 +979,7 @@ pub fn build_honest_address_records(
     owners: &[OwnerBalance],
     infringing_tokens: &[InfringingTokenRecord],
     malicious_addresses: &[MaliciousAddressPayload],
+    mint_payment_edges: &[ValueFlowEdgePayload],
     analysis_timestamp: i64,
 ) -> Vec<HonestAddressPayload> {
     let activity = prepare_contract_activity(transfers, sales, owners);
@@ -956,6 +988,7 @@ pub fn build_honest_address_records(
         &activity,
         infringing_tokens,
         malicious_addresses,
+        mint_payment_edges,
         analysis_timestamp,
     )
 }
@@ -965,6 +998,7 @@ pub(crate) fn build_honest_address_records_from_activity(
     activity: &PreparedContractActivity<'_>,
     infringing_tokens: &[InfringingTokenRecord],
     malicious_addresses: &[MaliciousAddressPayload],
+    mint_payment_edges: &[ValueFlowEdgePayload],
     analysis_timestamp: i64,
 ) -> Vec<HonestAddressPayload> {
     let cutoff_time = analysis_timestamp.max(0);
@@ -1061,8 +1095,64 @@ pub(crate) fn build_honest_address_records_from_activity(
     let mut token_interactions_by_address: HashMap<String, HashSet<String>> = HashMap::new();
     let mut durations_by_address: HashMap<String, Vec<i64>> = HashMap::new();
     let mut mint_to_honest_samples_by_address: HashMap<String, Vec<i64>> = HashMap::new();
-    let mut honest_to_honest_count: HashMap<String, i64> = HashMap::new();
+    let mut victim_resale_count: HashMap<String, i64> = HashMap::new();
     let mut corrupted_addresses: HashSet<String> = HashSet::new();
+
+    let mut paid_mint_acquisitions_by_token: HashMap<
+        String,
+        HashMap<String, Vec<&ValueFlowEdgePayload>>,
+    > = HashMap::new();
+    for edge in mint_payment_edges {
+        if edge.channel != "mint_payment"
+            || !edge.contract_address.eq_ignore_ascii_case(contract_address)
+            || !value_flow_has_positive_value(edge)
+        {
+            continue;
+        }
+        let payer = &edge.from_address;
+        if !honest_set.contains(payer) {
+            continue;
+        }
+        for token_id in value_flow_token_ids(edge) {
+            if relevant_token_ids.is_empty() || relevant_token_ids.contains(&token_id) {
+                paid_mint_acquisitions_by_token
+                    .entry(token_id)
+                    .or_default()
+                    .entry(payer.clone())
+                    .or_default()
+                    .push(edge);
+            }
+        }
+    }
+
+    let mut prior_paid_buyers_by_token: HashMap<String, HashSet<String>> = HashMap::new();
+    for sale in &relevant_sales {
+        if !sale_has_positive_value(sale) {
+            continue;
+        }
+        let seller = &sale.seller_address;
+        let prior_paid_buyers = prior_paid_buyers_by_token
+            .entry(sale.token_id.clone())
+            .or_default();
+        let has_paid_mint_acquisition = paid_mint_acquisitions_by_token
+            .get(&sale.token_id)
+            .and_then(|by_address| by_address.get(seller))
+            .map(|edges| {
+                edges
+                    .iter()
+                    .any(|edge| value_flow_precedes_sale(edge, sale))
+            })
+            .unwrap_or(false);
+        if honest_set.contains(seller)
+            && (prior_paid_buyers.contains(seller) || has_paid_mint_acquisition)
+        {
+            corrupted_addresses.insert(seller.clone());
+            *victim_resale_count.entry(seller.clone()).or_insert(0) += 1;
+        }
+        if honest_set.contains(&sale.buyer_address) {
+            prior_paid_buyers.insert(sale.buyer_address.clone());
+        }
+    }
 
     for (token_id, token_transfers) in transfers_by_token {
         let mut mint_time = 0_i64;
@@ -1086,14 +1176,6 @@ pub(crate) fn build_honest_address_records_from_activity(
                             .push(transfer.block_time - start_time);
                     }
                 }
-            }
-            if honest_set.contains(&transfer.from_address)
-                && honest_set.contains(&transfer.to_address)
-            {
-                corrupted_addresses.insert(transfer.from_address.clone());
-                *honest_to_honest_count
-                    .entry(transfer.from_address.clone())
-                    .or_insert(0) += 1;
             }
             if honest_set.contains(&transfer.to_address) {
                 token_interactions_by_address
@@ -1153,7 +1235,7 @@ pub(crate) fn build_honest_address_records_from_activity(
                 hold_duration_median_seconds: median_i64(&hold_durations),
                 hold_duration_count: hold_durations.len() as i64,
                 is_corrupted_address: corrupted_addresses.contains(&address),
-                honest_sale_to_honest_count: *honest_to_honest_count.get(&address).unwrap_or(&0),
+                victim_resale_count: *victim_resale_count.get(&address).unwrap_or(&0),
                 mint_to_honest_seconds_samples: mint_to_honest_samples_by_address
                     .get(&address)
                     .cloned()
@@ -1190,9 +1272,9 @@ pub fn build_honest_address_stats(
         HonestAddressStatsPayload {
             honest_address_count: honest_addresses.len() as i64,
             corrupted_address_count: corrupted_addresses.len() as i64,
-            honest_to_honest_transfer_count: honest_addresses
+            victim_resale_count: honest_addresses
                 .iter()
-                .map(|item| item.honest_sale_to_honest_count)
+                .map(|item| item.victim_resale_count)
                 .sum(),
             median_holding_seconds: median_f64(&holding_medians),
             avg_seconds_to_honest_holder: mean_f64(&mint_to_honest_samples),
@@ -1208,7 +1290,7 @@ fn positive_seconds(value: i64) -> Option<f64> {
 pub fn build_fraud_trade_stats(
     contract_address: &str,
     sales: &[NftSaleRecord],
-    victim_addresses: &[VictimAddressPayload],
+    secondary_sale_victim_addresses: &[SecondarySaleVictimAddressPayload],
 ) -> BTreeMap<String, FraudTradeStatsPayload> {
     let contract_sales: Vec<&NftSaleRecord> = sales
         .iter()
@@ -1262,13 +1344,16 @@ pub fn build_fraud_trade_stats(
                     .map(|sale| sale.price_eth.unwrap_or(0.0))
                     .sum(),
             ),
-            stuck_wallet_count: victim_addresses.iter().filter(|item| item.is_stuck).count() as i64,
-            stuck_cost_eth: victim_addresses
+            stuck_wallet_count: secondary_sale_victim_addresses
+                .iter()
+                .filter(|item| item.is_stuck)
+                .count() as i64,
+            stuck_cost_eth: secondary_sale_victim_addresses
                 .iter()
                 .filter(|item| item.is_stuck)
                 .map(|item| item.last_buy_amount_eth.unwrap_or(0.0))
                 .sum(),
-            stuck_cost_usd: victim_addresses
+            stuck_cost_usd: secondary_sale_victim_addresses
                 .iter()
                 .filter(|item| item.is_stuck)
                 .map(|item| item.last_buy_amount_usd.unwrap_or(0.0))
@@ -1298,11 +1383,89 @@ mod tests {
         }
     }
 
+    fn transfer(
+        tx_hash: &str,
+        block_time: i64,
+        from_address: &str,
+        to_address: &str,
+    ) -> TransferRecord {
+        TransferRecord {
+            contract_address: "0xdup".into(),
+            token_id: "1".into(),
+            tx_hash: tx_hash.into(),
+            block_number: block_time,
+            block_time,
+            from_address: from_address.into(),
+            to_address: to_address.into(),
+            event_type: "erc721".into(),
+            source: "test".into(),
+            ..TransferRecord::default()
+        }
+    }
+
+    fn infringing_token() -> InfringingTokenRecord {
+        InfringingTokenRecord {
+            contract_address: "0xdup".into(),
+            token_id: "1".into(),
+            minter_address: "0xoperator".into(),
+            ..InfringingTokenRecord::default()
+        }
+    }
+
+    fn operator_address() -> MaliciousAddressPayload {
+        MaliciousAddressPayload {
+            address: "0xoperator".into(),
+            mint_role: true,
+            ..MaliciousAddressPayload::default()
+        }
+    }
+
+    fn sale_between(
+        tx_hash: &str,
+        block_time: i64,
+        seller_address: &str,
+        buyer_address: &str,
+        price_eth: f64,
+    ) -> NftSaleRecord {
+        NftSaleRecord {
+            contract_address: "0xdup".into(),
+            token_id: "1".into(),
+            tx_hash: tx_hash.into(),
+            block_number: block_time,
+            log_index: 0,
+            buyer_address: buyer_address.into(),
+            seller_address: seller_address.into(),
+            payment_token_symbol: "ETH".into(),
+            price_eth: Some(price_eth),
+            price_usd: Some(price_eth),
+            is_native_eth: true,
+            ..NftSaleRecord::default()
+        }
+    }
+
+    fn mint_payment_edge(from_address: &str) -> ValueFlowEdgePayload {
+        ValueFlowEdgePayload {
+            contract_address: "0xdup".into(),
+            from_address: from_address.into(),
+            to_address: "0xdup".into(),
+            tx_hash: "0xmint".into(),
+            block_number: 100,
+            block_time: 100,
+            token_id: "1".into(),
+            value_eth: Some(0.08),
+            value_usd: Some(160.0),
+            channel: "mint_payment".into(),
+            evidence_type: "same_tx_mint_payment".into(),
+            ..ValueFlowEdgePayload::default()
+        }
+    }
+
     #[test]
     fn fraud_trade_stats_include_weth_and_stablecoin_eth_equivalent_amounts() {
         let sales = vec![sale("ETH", 1.0), sale("WETH", 2.0), sale("USDC", 0.05)];
 
-        let stats = build_fraud_trade_stats("0xdup", &sales, &[] as &[VictimAddressPayload]);
+        let stats =
+            build_fraud_trade_stats("0xdup", &sales, &[] as &[SecondarySaleVictimAddressPayload]);
         let stats = &stats["0xdup"];
 
         assert_eq!(stats.native_eth_sale_count, Some(1));
@@ -1353,7 +1516,11 @@ mod tests {
         let sales = vec![eth_sale];
         let activity = prepare_contract_activity(&[], &sales, &owners);
 
-        let victims = build_victim_address_records_from_activity(&activity, &BTreeMap::new());
+        let victims = build_secondary_sale_victim_address_records_from_activity(
+            "0xdup",
+            &activity,
+            &BTreeMap::new(),
+        );
 
         assert_eq!(victims.len(), 1);
         assert_eq!(victims[0].buy_amount_eth, 1.25);
@@ -1371,7 +1538,11 @@ mod tests {
         }];
         let activity = prepare_contract_activity(&[], &sales, &owners);
 
-        let victims = build_victim_address_records_from_activity(&activity, &BTreeMap::new());
+        let victims = build_secondary_sale_victim_address_records_from_activity(
+            "0xdup",
+            &activity,
+            &BTreeMap::new(),
+        );
 
         assert_eq!(victims.len(), 1);
         assert_eq!(victims[0].buy_amount_eth, 0.1);
@@ -1379,5 +1550,153 @@ mod tests {
         assert_eq!(victims[0].last_buy_amount_eth, Some(0.1));
         assert_eq!(victims[0].last_buy_amount_usd, Some(0.1));
         assert!(victims[0].is_stuck);
+    }
+
+    #[test]
+    fn honest_records_do_not_mark_free_transfer_after_purchase_as_corrupted() {
+        let transfers = vec![
+            transfer("0xmint", 100, ZERO_ADDRESS, "0xoperator"),
+            transfer("0xbuy", 120, "0xoperator", "0xvictim"),
+            transfer("0xgift", 140, "0xvictim", "0xrecipient"),
+        ];
+        let sales = vec![sale_between("0xbuy", 120, "0xoperator", "0xvictim", 1.0)];
+        let owners = vec![OwnerBalance {
+            owner_address: "0xrecipient".into(),
+            token_balances: BTreeMap::from([("1".into(), 1)]),
+        }];
+
+        let rows = build_honest_address_records(
+            "0xdup",
+            &transfers,
+            &sales,
+            &owners,
+            &[infringing_token()],
+            &[operator_address()],
+            &[],
+            200,
+        );
+        let victim = rows
+            .iter()
+            .find(|row| row.address == "0xvictim")
+            .expect("victim row");
+
+        assert!(!victim.is_corrupted_address);
+        assert_eq!(victim.victim_resale_count, 0);
+        assert_eq!(
+            build_honest_address_stats("0xdup", &rows)["0xdup"].corrupted_address_count,
+            0
+        );
+    }
+
+    #[test]
+    fn honest_records_mark_paid_resale_after_purchase_as_corrupted() {
+        let transfers = vec![
+            transfer("0xmint", 100, ZERO_ADDRESS, "0xoperator"),
+            transfer("0xbuy", 120, "0xoperator", "0xvictim"),
+            transfer("0xresale", 140, "0xvictim", "0xrecipient"),
+        ];
+        let sales = vec![
+            sale_between("0xbuy", 120, "0xoperator", "0xvictim", 1.0),
+            sale_between("0xresale", 140, "0xvictim", "0xrecipient", 0.4),
+        ];
+        let owners = vec![OwnerBalance {
+            owner_address: "0xrecipient".into(),
+            token_balances: BTreeMap::from([("1".into(), 1)]),
+        }];
+
+        let rows = build_honest_address_records(
+            "0xdup",
+            &transfers,
+            &sales,
+            &owners,
+            &[infringing_token()],
+            &[operator_address()],
+            &[],
+            200,
+        );
+        let victim = rows
+            .iter()
+            .find(|row| row.address == "0xvictim")
+            .expect("victim row");
+
+        assert!(victim.is_corrupted_address);
+        assert_eq!(victim.victim_resale_count, 1);
+        assert_eq!(
+            build_honest_address_stats("0xdup", &rows)["0xdup"].corrupted_address_count,
+            1
+        );
+    }
+
+    #[test]
+    fn honest_records_mark_paid_mint_resale_as_corrupted() {
+        let transfers = vec![
+            transfer("0xmint", 100, ZERO_ADDRESS, "0xvictim"),
+            transfer("0xresale", 140, "0xvictim", "0xrecipient"),
+        ];
+        let sales = vec![sale_between(
+            "0xresale",
+            140,
+            "0xvictim",
+            "0xrecipient",
+            0.4,
+        )];
+        let owners = vec![OwnerBalance {
+            owner_address: "0xrecipient".into(),
+            token_balances: BTreeMap::from([("1".into(), 1)]),
+        }];
+
+        let rows = build_honest_address_records(
+            "0xdup",
+            &transfers,
+            &sales,
+            &owners,
+            &[infringing_token()],
+            &[operator_address()],
+            &[mint_payment_edge("0xvictim")],
+            200,
+        );
+        let victim = rows
+            .iter()
+            .find(|row| row.address == "0xvictim")
+            .expect("paid minter resale row");
+
+        assert!(victim.is_corrupted_address);
+        assert_eq!(victim.victim_resale_count, 1);
+    }
+
+    #[test]
+    fn honest_records_do_not_mark_malicious_paid_mint_resale_as_corrupted() {
+        let transfers = vec![
+            transfer("0xmint", 100, ZERO_ADDRESS, "0xoperator"),
+            transfer("0xresale", 140, "0xoperator", "0xrecipient"),
+        ];
+        let sales = vec![sale_between(
+            "0xresale",
+            140,
+            "0xoperator",
+            "0xrecipient",
+            0.4,
+        )];
+        let owners = vec![OwnerBalance {
+            owner_address: "0xrecipient".into(),
+            token_balances: BTreeMap::from([("1".into(), 1)]),
+        }];
+
+        let rows = build_honest_address_records(
+            "0xdup",
+            &transfers,
+            &sales,
+            &owners,
+            &[infringing_token()],
+            &[operator_address()],
+            &[mint_payment_edge("0xoperator")],
+            200,
+        );
+
+        assert!(rows.iter().all(|row| row.address != "0xoperator"));
+        assert_eq!(
+            build_honest_address_stats("0xdup", &rows)["0xdup"].corrupted_address_count,
+            0
+        );
     }
 }

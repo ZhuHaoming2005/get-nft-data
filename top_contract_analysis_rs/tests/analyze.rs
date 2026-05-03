@@ -12,8 +12,9 @@ use top_contract_analysis_rs::analysis::{
 use top_contract_analysis_rs::error::AppError;
 use top_contract_analysis_rs::models::{
     AddressSignalPayload, DuplicateContractPayload, FraudTradeStatsPayload, HonestAddressPayload,
-    HonestAddressStatsPayload, MaliciousAddressPayload, ReportSummary, SeedCollectionStatsPayload,
-    SeedContractPayload, SingleReportPayload, VictimAddressPayload, VictimSignalPayload,
+    HonestAddressStatsPayload, MaliciousAddressPayload, ReportSummary,
+    SecondarySaleVictimAddressPayload, SeedCollectionStatsPayload, SeedContractPayload,
+    SingleReportPayload, VictimSignalPayload,
 };
 use top_contract_analysis_rs::models::{
     ContractMetadata, ContractNameRecord, DatabaseNftRecord, DatabaseSnapshot, EthTransferRecord,
@@ -2988,7 +2989,8 @@ fn single_report_payload_serializes_current_python_top_level_shape() {
             "malicious_addresses",
             "honest_addresses",
             "honest_address_stats",
-            "victim_addresses",
+            "secondary_sale_victim_addresses",
+            "victim_acquisition_addresses",
             "address_evidence_features",
             "contract_lifecycle_events",
             "value_flow_edges",
@@ -3058,15 +3060,14 @@ fn single_report_markdown_preserves_summary_sections_only() {
             legit_duplicate_contract_count: 1,
             candidate_open_license_token_count: 6,
             candidate_open_license_contract_count: 2,
-            honest_purchase_total_eth: 10.0,
-            honest_purchase_total_usd: 10.0,
-            stuck_cost_eth: 6.5,
-            stuck_cost_usd: 6.5,
-            stuck_cost_ratio: Some(0.65),
-            secondary_sale_victim_purchase_total_usd: 10.0,
+            secondary_sale_victim_cost_eth: 10.0,
+            secondary_sale_victim_cost_usd: 10.0,
+            secondary_sale_stuck_cost_eth: 6.5,
             secondary_sale_stuck_cost_usd: 6.5,
             secondary_sale_stuck_cost_ratio: Some(0.65),
+            victim_acquisition_total_eth: 10.0,
             victim_acquisition_total_usd: 10.0,
+            victim_acquisition_stuck_cost_eth: 6.5,
             victim_acquisition_stuck_cost_usd: 6.5,
             victim_acquisition_stuck_cost_ratio: Some(0.65),
             buy_asset_ratio_known_address_count: 5,
@@ -3130,7 +3131,7 @@ fn single_report_markdown_preserves_summary_sections_only() {
             HonestAddressStatsPayload {
                 honest_address_count: 2,
                 corrupted_address_count: 1,
-                honest_to_honest_transfer_count: 3,
+                victim_resale_count: 3,
                 median_holding_seconds: Some(44.0),
                 avg_seconds_to_honest_holder: Some(12.5),
                 corrupted_addresses: vec!["0xhonest".into()],
@@ -3144,10 +3145,11 @@ fn single_report_markdown_preserves_summary_sections_only() {
             hold_duration_median_seconds: Some(44.0),
             hold_duration_count: 2,
             is_corrupted_address: true,
-            honest_sale_to_honest_count: 1,
+            victim_resale_count: 1,
             mint_to_honest_seconds_samples: vec![12, 13],
         }],
-        victim_addresses: vec![VictimAddressPayload {
+        secondary_sale_victim_addresses: vec![SecondarySaleVictimAddressPayload {
+            contract_address: "0xhigh".into(),
             address: "0xvictim".into(),
             buy_tx_hashes: vec!["0xbuy1".into(), "0xbuy2".into()],
             buy_amount_eth: 3.5,
@@ -3191,7 +3193,7 @@ fn single_report_markdown_preserves_summary_sections_only() {
     assert!(markdown.contains("- 恶意地址数: 4"));
     assert!(markdown.contains("- 候选侧开放许可 token 数: 6"));
     assert!(markdown.contains("- 受害者套牢成本合计(USD): 6.5 / 65.00%"));
-    assert!(markdown.contains("- 二级市场受害者购买额(USD): 10"));
+    assert!(markdown.contains("- 二级市场受害者成本(USD): 10 / addresses=0"));
     assert!(markdown.contains("- 买入金额占钱包总额 >60% 的地址数/占比: 3 / 60.00%"));
     assert!(markdown.contains("## 种子集合统计"));
     assert!(markdown.contains("- 拉取到的种子 NFT 数: 10"));
@@ -3224,7 +3226,7 @@ fn single_report_markdown_omits_detailed_address_sections() {
             HonestAddressStatsPayload {
                 honest_address_count: 1,
                 corrupted_address_count: 0,
-                honest_to_honest_transfer_count: 0,
+                victim_resale_count: 0,
                 median_holding_seconds: None,
                 avg_seconds_to_honest_holder: None,
                 corrupted_addresses: vec![],
@@ -3238,10 +3240,11 @@ fn single_report_markdown_omits_detailed_address_sections() {
             hold_duration_median_seconds: None,
             hold_duration_count: 0,
             is_corrupted_address: false,
-            honest_sale_to_honest_count: 0,
+            victim_resale_count: 0,
             mint_to_honest_seconds_samples: vec![],
         }],
-        victim_addresses: vec![VictimAddressPayload {
+        secondary_sale_victim_addresses: vec![SecondarySaleVictimAddressPayload {
+            contract_address: "0xdup".into(),
             address: "0xvictim".into(),
             buy_tx_hashes: vec!["0xbuy".into()],
             buy_amount_eth: 1.0,
@@ -3274,8 +3277,8 @@ fn single_report_markdown_omits_detailed_address_sections() {
 #[test]
 fn single_report_markdown_omits_victim_address_rows() {
     let payload = SingleReportPayload {
-        victim_addresses: vec![
-            VictimAddressPayload {
+        secondary_sale_victim_addresses: vec![
+            SecondarySaleVictimAddressPayload {
                 address: "0xvictim".into(),
                 buy_tx_hashes: vec!["0xbuy1".into()],
                 buy_amount_eth: 0.0,
@@ -3289,7 +3292,7 @@ fn single_report_markdown_omits_victim_address_rows() {
                 ratio_status: "ok".into(),
                 ..Default::default()
             },
-            VictimAddressPayload {
+            SecondarySaleVictimAddressPayload {
                 address: "0xvictim".into(),
                 buy_tx_hashes: vec!["0xbuy2".into()],
                 buy_amount_eth: 0.0,
@@ -3374,7 +3377,7 @@ fn single_report_fraud_trade_stats_preserve_explicit_zero_eth_priced_values() {
 #[test]
 fn single_report_does_not_display_eth_values_in_usd_fields() {
     let payload = SingleReportPayload {
-        victim_addresses: vec![VictimAddressPayload {
+        secondary_sale_victim_addresses: vec![SecondarySaleVictimAddressPayload {
             address: "0xvictim".into(),
             buy_tx_hashes: vec!["0xbuy".into()],
             buy_amount_eth: 1.25,
@@ -4110,22 +4113,25 @@ async fn analyze_builds_address_profiles_and_trade_stats_for_duplicate_contracts
     assert_eq!(payload.malicious_addresses.len(), 1);
     assert_eq!(payload.malicious_addresses[0].address, "0xminter");
     assert_eq!(payload.honest_addresses.len(), 2);
-    assert_eq!(payload.victim_addresses.len(), 1);
-    assert_eq!(payload.victim_addresses[0].address, "0xvictim");
-    assert_eq!(payload.victim_addresses[0].buy_amount_eth, 1.5);
-    assert!(!payload.victim_addresses[0].is_stuck);
+    assert_eq!(payload.secondary_sale_victim_addresses.len(), 1);
+    assert_eq!(
+        payload.secondary_sale_victim_addresses[0].address,
+        "0xvictim"
+    );
+    assert_eq!(
+        payload.secondary_sale_victim_addresses[0].buy_amount_eth,
+        1.5
+    );
+    assert!(!payload.secondary_sale_victim_addresses[0].is_stuck);
     assert_eq!(
         payload.honest_address_stats["0xdup"].honest_address_count,
         2
     );
     assert_eq!(
         payload.honest_address_stats["0xdup"].corrupted_address_count,
-        1
+        0
     );
-    assert_eq!(
-        payload.honest_address_stats["0xdup"].honest_to_honest_transfer_count,
-        1
-    );
+    assert_eq!(payload.honest_address_stats["0xdup"].victim_resale_count, 0);
     assert_eq!(
         payload.honest_address_stats["0xdup"].avg_seconds_to_honest_holder,
         Some(10.0)
@@ -4142,8 +4148,8 @@ async fn analyze_builds_address_profiles_and_trade_stats_for_duplicate_contracts
     assert_eq!(payload.fraud_trade_stats["0xdup"].stuck_wallet_count, 0);
     assert_eq!(payload.report_summary.malicious_address_count, 1);
     assert_eq!(payload.report_summary.honest_address_count, 2);
-    assert_eq!(payload.report_summary.honest_purchase_total_eth, 1.5);
-    assert_eq!(payload.report_summary.corrupted_honest_address_count, 1);
+    assert_eq!(payload.report_summary.secondary_sale_victim_cost_eth, 1.5);
+    assert_eq!(payload.report_summary.corrupted_honest_address_count, 0);
 
     let propagation = &payload.nft_propagation_paths["0xdup"];
     assert_eq!(propagation.summary.token_count, 1);
@@ -4217,7 +4223,7 @@ async fn analyze_reuses_signal_cache_for_transfers_and_owners() {
 }
 
 #[tokio::test]
-async fn analyze_computes_native_eth_sale_metrics_for_victim_addresses() {
+async fn analyze_computes_native_eth_sale_metrics_for_secondary_sale_victim_addresses() {
     let deps = AnalysisDeps {
         api: Arc::new(FakeSaleMetricApi),
         feature_store: Arc::new(FakeFeatureStore {
@@ -4254,20 +4260,29 @@ async fn analyze_computes_native_eth_sale_metrics_for_victim_addresses() {
     .await
     .unwrap();
 
-    assert_eq!(payload.victim_addresses.len(), 1);
-    assert_eq!(payload.victim_addresses[0].address, "0xvictim");
+    assert_eq!(payload.secondary_sale_victim_addresses.len(), 1);
     assert_eq!(
-        payload.victim_addresses[0].buy_before_eth_balance,
+        payload.secondary_sale_victim_addresses[0].address,
+        "0xvictim"
+    );
+    assert_eq!(
+        payload.secondary_sale_victim_addresses[0].buy_before_eth_balance,
         Some(3.0)
     );
-    assert_eq!(payload.victim_addresses[0].buy_asset_ratio, Some(0.5));
+    assert_eq!(
+        payload.secondary_sale_victim_addresses[0].buy_asset_ratio,
+        Some(0.5)
+    );
     assert!(
-        payload.victim_addresses[0]
+        payload.secondary_sale_victim_addresses[0]
             .buy_asset_ratio_with_gas
             .unwrap()
             > 0.5
     );
-    assert_eq!(payload.victim_addresses[0].ratio_status, "ok");
+    assert_eq!(
+        payload.secondary_sale_victim_addresses[0].ratio_status,
+        "ok"
+    );
     assert_eq!(
         payload.report_summary.buy_asset_ratio_known_address_count,
         1
@@ -4328,12 +4343,12 @@ async fn analyze_sale_metrics_are_keyed_by_transaction_and_buyer() {
     .unwrap();
 
     let buyer1 = payload
-        .victim_addresses
+        .secondary_sale_victim_addresses
         .iter()
         .find(|row| row.address == "0xbuyer1")
         .expect("buyer1 victim row");
     let buyer2 = payload
-        .victim_addresses
+        .secondary_sale_victim_addresses
         .iter()
         .find(|row| row.address == "0xbuyer2")
         .expect("buyer2 victim row");
@@ -4508,7 +4523,7 @@ async fn analyze_computes_sale_metrics_concurrently_within_a_contract() {
     .await
     .unwrap();
 
-    assert_eq!(payload.victim_addresses.len(), 2);
+    assert_eq!(payload.secondary_sale_victim_addresses.len(), 2);
     assert!(
         api.max_receipts.load(Ordering::SeqCst) >= 2,
         "expected sale metric receipt fetches to overlap within one contract"
@@ -4555,7 +4570,7 @@ async fn analyze_prefetches_sale_metrics_per_buyer_with_shared_transaction_hash(
     .await
     .unwrap();
 
-    assert_eq!(payload.victim_addresses.len(), 2);
+    assert_eq!(payload.secondary_sale_victim_addresses.len(), 2);
     assert_eq!(api.receipt_calls.load(Ordering::SeqCst), 2);
     assert_eq!(api.balance_calls.load(Ordering::SeqCst), 2);
     assert_eq!(api.same_block_transfer_calls.load(Ordering::SeqCst), 2);
@@ -4601,7 +4616,7 @@ async fn analyze_prefetches_sale_metrics_only_for_latest_buyer_purchase() {
     .await
     .unwrap();
 
-    assert_eq!(payload.victim_addresses.len(), 1);
+    assert_eq!(payload.secondary_sale_victim_addresses.len(), 1);
     assert_eq!(api.receipt_calls.load(Ordering::SeqCst), 1);
     assert_eq!(api.balance_calls.load(Ordering::SeqCst), 1);
     assert_eq!(api.same_block_transfer_calls.load(Ordering::SeqCst), 1);
