@@ -20,6 +20,15 @@ cargo run --release -- \
   --output ./result.md
 ```
 
+如需从 OpenSea 当前 Top NFT collections 按 30 日交易量生成 seed 输入文件：
+
+```powershell
+$env:OPENSEA_API_KEY="..."
+python .\scripts\fetch_opensea_top_seeds.py --output .\seeds.txt --limit 100 --chain ethereum
+```
+
+脚本只调用官方 API `GET https://api.opensea.io/api/v2/collections/top`，默认使用 `sort_by=thirty_days_volume`、`chains=ethereum`，从响应的 `collections[].contracts[].address` 提取合约地址，最终按一行一个小写合约地址写入 `seeds.txt`。默认读取 `OPENSEA_API_KEY`，也可用 `--api-key` 显式传入。
+
 常用参数：
 
 - `--chain`：默认 `ethereum`
