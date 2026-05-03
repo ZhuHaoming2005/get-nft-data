@@ -1271,19 +1271,22 @@ fn has_shared_terms(seed: &str, value: &str, terms: &[&str]) -> bool {
         .any(|term| seed_tokens.contains(*term) && value_tokens.contains(*term))
 }
 
-fn modification_counts<'a>(
+fn modification_summary<'a>(
     reports: impl Iterator<Item = &'a TextComparison>,
     classifier: fn(&str, &str) -> Vec<String>,
-) -> BTreeMap<String, usize> {
+) -> (usize, BTreeMap<String, usize>) {
     let mut counts = BTreeMap::new();
     for comparison in reports {
         if comparison.labeled_matches.is_empty() {
+            let total = comparison.matches.len();
             for value in &comparison.matches {
                 for label in classifier(&comparison.seed, value) {
                     *counts.entry(label).or_default() += 1;
                 }
             }
+            *counts.entry("__total__".to_string()).or_default() += total;
         } else {
+            *counts.entry("__total__".to_string()).or_default() += comparison.labeled_matches.len();
             for labeled in &comparison.labeled_matches {
                 for label in &labeled.labels {
                     *counts.entry(label.clone()).or_default() += 1;
@@ -1291,7 +1294,8 @@ fn modification_counts<'a>(
             }
         }
     }
-    counts
+    let total = counts.remove("__total__").unwrap_or_default();
+    (total, counts)
 }
 
 fn write_markdown_report(path: &Path, report: &SampleReport) -> Result<(), std::io::Error> {
@@ -1342,17 +1346,17 @@ fn render_markdown_report(report: &SampleReport) -> String {
 fn push_modification_summary(out: &mut String, report: &SampleReport) {
     out.push_str("## Modification Summary\n\n");
     out.push_str("### Name\n\n");
-    push_counts(
+    push_counts_with_ratios(
         out,
-        modification_counts(
+        modification_summary(
             report.seed_reports.iter().map(|seed| &seed.name),
             classify_name_modifications,
         ),
     );
     out.push_str("\n### Metadata\n\n");
-    push_counts(
+    push_counts_with_ratios(
         out,
-        modification_counts(
+        modification_summary(
             report.seed_reports.iter().map(|seed| &seed.metadata),
             classify_metadata_modifications,
         ),
@@ -1360,13 +1364,20 @@ fn push_modification_summary(out: &mut String, report: &SampleReport) {
     out.push('\n');
 }
 
-fn push_counts(out: &mut String, counts: BTreeMap<String, usize>) {
+fn push_counts_with_ratios(out: &mut String, summary: (usize, BTreeMap<String, usize>)) {
+    let (total, counts) = summary;
+    out.push_str(&format!("- total matches: {total}\n"));
     if counts.is_empty() {
         out.push_str("- _none_\n");
         return;
     }
     for (label, count) in counts {
-        out.push_str(&format!("- {label}: {count}\n"));
+        let ratio = if total > 0 {
+            count as f64 * 100.0 / total as f64
+        } else {
+            0.0
+        };
+        out.push_str(&format!("- {label}: {count}/{total} ({ratio:.1}%)\n"));
     }
 }
 
@@ -1502,12 +1513,14 @@ mod tests {
         let output = render_markdown_report(&report);
 
         assert!(output.contains("## Modification Summary"));
-        assert!(output.contains("- token_number_suffix: 1"));
-        assert!(output.contains("- unicode_compatibility: 1"));
-        assert!(output.contains("- other: 1"));
-        assert!(output.contains("- exact_metadata_clone: 1"));
-        assert!(output.contains("- asset_pointer_reuse: 1"));
-        assert!(output.contains("- trait_schema_reuse: 1"));
+        assert!(output.contains("- total matches: 2"));
+        assert!(output.contains("- token_number_suffix: 1/2 (50.0%)"));
+        assert!(output.contains("- unicode_compatibility: 1/2 (50.0%)"));
+        assert!(output.contains("- other: 1/2 (50.0%)"));
+        assert!(output.contains("- total matches: 1"));
+        assert!(output.contains("- exact_metadata_clone: 1/1 (100.0%)"));
+        assert!(output.contains("- asset_pointer_reuse: 1/1 (100.0%)"));
+        assert!(output.contains("- trait_schema_reuse: 1/1 (100.0%)"));
     }
 
     #[test]

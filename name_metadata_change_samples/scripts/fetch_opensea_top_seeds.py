@@ -169,7 +169,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Fetch top OpenSea collection contract addresses into seeds.txt"
     )
-    parser.add_argument("--output", type=Path, default=Path("seeds.txt"))
+    parser.add_argument("--output", type=Path, default=Path("../seeds.txt"))
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--page-size", type=int, default=100)
     parser.add_argument("--chain", default="ethereum")

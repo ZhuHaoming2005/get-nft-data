@@ -44,7 +44,7 @@ python .\scripts\fetch_opensea_top_seeds.py --output .\seeds.txt --limit 100 --c
 
 工具输出三个部分：
 
-- `Modification Summary`：按 name/metadata 分别统计修改方式标签。标签采用叠加统计，同一条重复记录可同时计入多个标签；未命中任何规则时计入 `other`。
+- `Modification Summary`：按 name/metadata 分别统计修改方式标签，输出 `count/total (percent)`。`total` 是该侧查到的重复记录数；标签采用叠加统计，同一条重复记录可同时计入多个标签，因此各标签比例相加可能超过 100%；未命中任何规则时计入 `other`。
 - `Name Matches`：每个 seed 的 name，以及查到重复的合约级代表 name 文本；每条 match 前显示对应标签。
 - `Metadata Matches`：每个 seed 的 metadata，以及查到重复的 metadata 文本；每条 match 前显示对应标签。
 
