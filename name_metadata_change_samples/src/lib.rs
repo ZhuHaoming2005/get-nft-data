@@ -1196,6 +1196,9 @@ fn classify_metadata_modifications(seed: &str, value: &str) -> Vec<String> {
     if has_shared_terms(seed, value, COLLECTION_TERMS) {
         labels.push("collection_terms_reuse");
     }
+    if has_metadata_template_reuse(seed, value) {
+        labels.push("metadata_template_reuse");
+    }
     let value_lower = normalize_text(value);
     if value_lower.contains("trait") && value_lower.contains('%') {
         labels.push("rarity_text_added");
@@ -1222,6 +1225,43 @@ const TRAIT_SCHEMA_TERMS: &[&str] = &[
 const COLLECTION_TERMS: &[&str] = &[
     "ape", "azuki", "bayc", "beanz", "bored", "cool", "doodle", "milady", "mooncat", "mutant",
     "pudgy",
+];
+
+const METADATA_TEMPLATE_TERMS: &[&str] = &[
+    "admission",
+    "artifact",
+    "background",
+    "benefit",
+    "body",
+    "card",
+    "category",
+    "character",
+    "clothes",
+    "color",
+    "content",
+    "edition",
+    "environment",
+    "eyes",
+    "face",
+    "fur",
+    "glasses",
+    "hair",
+    "hat",
+    "head",
+    "mouth",
+    "number",
+    "pants",
+    "plot",
+    "rarity",
+    "resource",
+    "sediment",
+    "shirt",
+    "shoes",
+    "skin",
+    "style",
+    "tier",
+    "token",
+    "type",
 ];
 
 fn has_trailing_number_suffix(value: &str) -> bool {
@@ -1269,6 +1309,38 @@ fn has_shared_terms(seed: &str, value: &str, terms: &[&str]) -> bool {
     terms
         .iter()
         .any(|term| seed_tokens.contains(*term) && value_tokens.contains(*term))
+}
+
+fn has_metadata_template_reuse(seed: &str, value: &str) -> bool {
+    let seed_norm = normalize_text(seed);
+    let value_norm = normalize_text(value);
+    if seed_norm.is_empty() || value_norm.is_empty() || seed_norm == value_norm {
+        return false;
+    }
+
+    let seed_tokens = metadata_tokens(&seed_norm)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let value_tokens = metadata_tokens(&value_norm)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if seed_tokens.is_empty() || value_tokens.is_empty() {
+        return false;
+    }
+
+    let shared_template_terms = METADATA_TEMPLATE_TERMS
+        .iter()
+        .filter(|term| seed_tokens.contains(**term) && value_tokens.contains(**term))
+        .count();
+    if shared_template_terms >= 3 {
+        return true;
+    }
+
+    let shared_terms = seed_tokens.intersection(&value_tokens).count();
+    let smaller_doc_terms = seed_tokens.len().min(value_tokens.len());
+    shared_template_terms >= 1
+        && shared_terms >= 8
+        && shared_terms as f64 / smaller_doc_terms as f64 >= 0.35
 }
 
 fn modification_summary<'a>(
@@ -1320,6 +1392,9 @@ fn render_markdown_report(report: &SampleReport) -> String {
 
     out.push_str("## Name Matches\n\n");
     for seed in &report.seed_reports {
+        if !is_usable_seed_name(&seed.name.seed) {
+            continue;
+        }
         out.push_str(&format!("- seed: {}\n", inline_or_empty(&seed.name.seed)));
         for value in labeled_matches_for_report(&seed.name, classify_name_modifications) {
             out.push_str(&format!(
@@ -1446,8 +1521,12 @@ fn is_usable_seed_name(value: &str) -> bool {
     if trimmed.is_empty() || is_unavailable_display_text(trimmed) {
         return false;
     }
+    let normalized = normalize_nfkc(trimmed);
+    if !normalized.chars().any(char::is_alphanumeric) {
+        return false;
+    }
     !matches!(
-        normalize_nfkc(trimmed).to_lowercase().as_str(),
+        normalized.to_lowercase().as_str(),
         "none" | "null" | "undefined" | "n/a" | "na" | "_empty_" | "_unavailable_"
     )
 }
@@ -1583,6 +1662,53 @@ mod tests {
     }
 
     #[test]
+    fn name_matches_do_not_emit_unusable_seed_sections() {
+        let report = SampleReport {
+            chain: "ethereum".into(),
+            seed_reports: vec![
+                SeedSampleReport {
+                    name: TextComparison {
+                        seed: "????: ??????".into(),
+                        matches: vec!["????: ?????? clone".into()],
+                        labeled_matches: Vec::new(),
+                    },
+                    metadata: TextComparison::default(),
+                },
+                SeedSampleReport {
+                    name: TextComparison {
+                        seed: "Real Seed".into(),
+                        matches: vec!["Real Seed".into()],
+                        labeled_matches: Vec::new(),
+                    },
+                    metadata: TextComparison::default(),
+                },
+            ],
+        };
+
+        let output = render_markdown_report(&report);
+        let name_matches = output
+            .split("## Name Matches")
+            .nth(1)
+            .and_then(|section| section.split("## Metadata Matches").next())
+            .expect("name matches section");
+
+        assert!(!name_matches.contains("????"));
+        assert!(name_matches.contains("- seed: Real Seed"));
+        assert!(name_matches.contains("[exact_clone] Real Seed"));
+    }
+
+    #[test]
+    fn metadata_template_reuse_labels_structured_value_substitution() {
+        let seed = "category spirit sediment biogenic swamp number sediment tier environment steppes number environment tier eastern resource whisper number eastern resource tier southern resource lumileaf number southern resource tier northern resource moldium number northern resource tier plot";
+        let value = "category decay sediment chemical goo number sediment tier environment bog number environment tier southern resource whisper number southern resource tier western resource spikeweed number western resource tier number plot obelisk piece first trip";
+
+        let labels = classify_metadata_modifications(seed, value);
+
+        assert!(labels.contains(&"metadata_template_reuse".to_string()));
+        assert!(!labels.contains(&"other".to_string()));
+    }
+
+    #[test]
     fn report_hides_all_question_mark_display_text_without_seed_contract_identifier() {
         let report = SampleReport {
             chain: "ethereum".into(),
@@ -1602,8 +1728,8 @@ mod tests {
 
         let output = render_markdown_report(&report);
 
-        assert!(output.contains("- seed: _unavailable_"));
-        assert!(output.contains("[exact_clone] _unavailable_"));
+        assert!(!output.contains("- seed: _unavailable_"));
+        assert!(!output.contains("[exact_clone] _unavailable_"));
         assert!(!output.contains("contract:"));
     }
 }
