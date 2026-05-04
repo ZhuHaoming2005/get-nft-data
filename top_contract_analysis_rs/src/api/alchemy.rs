@@ -273,7 +273,7 @@ pub async fn fetch_contract_metadata(
         .append_pair("contractAddress", contract_address);
     let payload: Value = client.get_json(url.as_str()).await?;
     let meta = payload.get("contractMetadata").unwrap_or(&payload);
-    Ok(ContractMetadata {
+    let mut metadata = ContractMetadata {
         chain: chain.to_string(),
         contract_address: payload
             .get("address")
@@ -319,7 +319,9 @@ pub async fn fetch_contract_metadata(
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
-    })
+    };
+    enrich_contract_control_addresses(client, endpoints, &mut metadata).await;
+    Ok(metadata)
 }
 
 fn contract_metadata_lower_field(payload: &Value, meta: &Value, fields: &[&str]) -> String {
@@ -336,6 +338,170 @@ fn contract_metadata_lower_field(payload: &Value, meta: &Value, fields: &[&str])
         }
     }
     String::new()
+}
+
+async fn enrich_contract_control_addresses(
+    client: &AsyncApiClient,
+    endpoints: &ApiEndpoints,
+    metadata: &mut ContractMetadata,
+) {
+    if metadata.owner_address.is_empty() {
+        let mut owner =
+            eth_call_address(client, endpoints, &metadata.contract_address, "0x8da5cb5b").await;
+        if owner.is_none() {
+            owner =
+                eth_call_address(client, endpoints, &metadata.contract_address, "0x893d20e8").await;
+        }
+        metadata.owner_address = owner.unwrap_or_default();
+    }
+    if metadata.admin_address.is_empty() {
+        metadata.admin_address =
+            eth_call_address(client, endpoints, &metadata.contract_address, "0xf851a440")
+                .await
+                .unwrap_or_default();
+    }
+    if metadata.proxy_admin_address.is_empty() {
+        let proxy_admin = eth_get_storage_address(
+            client,
+            endpoints,
+            &metadata.contract_address,
+            "0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103",
+        )
+        .await;
+        metadata.proxy_admin_address = proxy_admin.unwrap_or_default();
+    }
+}
+
+async fn eth_call_address(
+    client: &AsyncApiClient,
+    endpoints: &ApiEndpoints,
+    contract_address: &str,
+    data: &str,
+) -> Option<String> {
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_call",
+        "params": [{ "to": contract_address, "data": data }, "latest"]
+    });
+    let body: Value = client
+        .post_json(&endpoints.alchemy_rpc_base, &payload)
+        .await
+        .ok()?;
+    abi_address_from_hex(body.get("result").and_then(Value::as_str).unwrap_or(""))
+}
+
+async fn eth_get_storage_address(
+    client: &AsyncApiClient,
+    endpoints: &ApiEndpoints,
+    contract_address: &str,
+    slot: &str,
+) -> Option<String> {
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_getStorageAt",
+        "params": [contract_address, slot, "latest"]
+    });
+    let body: Value = client
+        .post_json(&endpoints.alchemy_rpc_base, &payload)
+        .await
+        .ok()?;
+    abi_address_from_hex(body.get("result").and_then(Value::as_str).unwrap_or(""))
+}
+
+fn abi_address_from_hex(value: &str) -> Option<String> {
+    let hex = value
+        .trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X");
+    if hex.len() < 40 {
+        return None;
+    }
+    let address = format!("0x{}", &hex[hex.len() - 40..]).to_lowercase();
+    (address != ZERO_ADDRESS).then_some(address)
+}
+
+pub async fn fetch_eip2981_royalty_recipient(
+    client: &AsyncApiClient,
+    endpoints: &ApiEndpoints,
+    contract_address: &str,
+    token_id: &str,
+) -> Result<Option<String>, AppError> {
+    let Some(token_word) = token_id_to_abi_word(token_id) else {
+        return Ok(None);
+    };
+    let sale_price_word = "0000000000000000000000000000000000000000000000000de0b6b3a7640000";
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_call",
+        "params": [{
+            "to": contract_address,
+            "data": format!("0x2a55205a{token_word}{sale_price_word}")
+        }, "latest"]
+    });
+    let body: Value = client
+        .post_json(&endpoints.alchemy_rpc_base, &payload)
+        .await?;
+    Ok(abi_first_word_address_from_hex(
+        body.get("result").and_then(Value::as_str).unwrap_or(""),
+    ))
+}
+
+fn abi_first_word_address_from_hex(value: &str) -> Option<String> {
+    let hex = value
+        .trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X");
+    if hex.len() < 64 {
+        return None;
+    }
+    abi_address_from_hex(&hex[..64])
+}
+
+fn token_id_to_abi_word(token_id: &str) -> Option<String> {
+    let trimmed = token_id.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let hex = if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
+        trimmed
+            .trim_start_matches("0x")
+            .trim_start_matches("0X")
+            .to_string()
+    } else {
+        decimal_to_hex(trimmed)?
+    };
+    if hex.len() > 64 || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(format!("{hex:0>64}").to_lowercase())
+}
+
+fn decimal_to_hex(value: &str) -> Option<String> {
+    if !value.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let mut digits: Vec<u8> = value.bytes().map(|byte| byte - b'0').collect();
+    let mut hex_digits = Vec::new();
+    while digits.iter().any(|digit| *digit != 0) {
+        let mut carry = 0_u16;
+        for digit in &mut digits {
+            let current = carry * 10 + *digit as u16;
+            *digit = (current / 16) as u8;
+            carry = current % 16;
+        }
+        hex_digits.push(std::char::from_digit(carry as u32, 16)?);
+        while digits.first() == Some(&0) && digits.len() > 1 {
+            digits.remove(0);
+        }
+    }
+    if hex_digits.is_empty() {
+        Some("0".into())
+    } else {
+        Some(hex_digits.into_iter().rev().collect())
+    }
 }
 
 pub async fn fetch_alchemy_contract_transfers(

@@ -1,9 +1,10 @@
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT};
 use reqwest::Url;
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::analysis::scoring::metadata_document_from_json;
+use crate::api::alchemy::fetch_eip2981_royalty_recipient;
 use crate::api::{ApiEndpoints, AsyncApiClient};
 use crate::currency::{is_native_eth_symbol, is_supported_priced_symbol, to_normalized_amount};
 use crate::error::AppError;
@@ -684,7 +685,9 @@ pub async fn fetch_opensea_contract_market_events(
             "{base_url}/api/v2/events/collection/{collection_slug}"
         ))
         .map_err(|err| AppError::Http(err.to_string()))?;
-        url.query_pairs_mut().append_pair("limit", "200");
+        url.query_pairs_mut()
+            .append_pair("event_type", "all")
+            .append_pair("limit", "200");
         if let Some(cursor) = next.as_deref() {
             url.query_pairs_mut().append_pair("next", cursor);
         }
@@ -1194,6 +1197,34 @@ async fn enrich_sales_with_royalty_recipient(
     opensea_api_key: &str,
     mut rows: Vec<NftSaleRecord>,
 ) -> Vec<NftSaleRecord> {
+    if rows.iter().all(|sale| {
+        !sale.royalty_recipient_address.trim().is_empty()
+            || (sale.royalty_fee_eth <= 0.0 && sale.royalty_fee_usd <= 0.0)
+    }) {
+        return rows;
+    }
+
+    let mut royalty_by_token = BTreeMap::<String, String>::new();
+    for sale in &mut rows {
+        if !sale.royalty_recipient_address.trim().is_empty()
+            || (sale.royalty_fee_eth <= 0.0 && sale.royalty_fee_usd <= 0.0)
+            || sale.token_id.trim().is_empty()
+        {
+            continue;
+        }
+        if !royalty_by_token.contains_key(&sale.token_id) {
+            if let Ok(Some(recipient)) =
+                fetch_eip2981_royalty_recipient(client, endpoints, contract_address, &sale.token_id)
+                    .await
+            {
+                royalty_by_token.insert(sale.token_id.clone(), recipient);
+            }
+        }
+        if let Some(recipient) = royalty_by_token.get(&sale.token_id) {
+            sale.royalty_recipient_address = recipient.clone();
+        }
+    }
+
     if opensea_api_key.trim().is_empty()
         || rows.iter().all(|sale| {
             !sale.royalty_recipient_address.trim().is_empty()

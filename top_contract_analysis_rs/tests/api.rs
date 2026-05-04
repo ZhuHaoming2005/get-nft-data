@@ -425,6 +425,80 @@ async fn fetch_contract_metadata_parses_contract_metadata_fields() {
 }
 
 #[tokio::test]
+async fn fetch_contract_metadata_enriches_control_addresses_from_rpc() {
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET)
+                .path("/nft/v3/key/getContractMetadata")
+                .query_param("contractAddress", "0xseed");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "address": "0xseed",
+                "contractMetadata": {
+                    "tokenType": "ERC721",
+                    "contractDeployer": "0xcreator",
+                    "deployedBlockNumber": 123,
+                    "name": "Azuki",
+                    "symbol": "AZUKI"
+                }
+            }));
+        })
+        .await;
+    server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/v2/key")
+                .body_contains("eth_call")
+                .body_contains("8da5cb5b");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "result": "0x0000000000000000000000001111111111111111111111111111111111111111"
+            }));
+        })
+        .await;
+    server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/v2/key")
+                .body_contains("eth_call")
+                .body_contains("f851a440");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "result": "0x0000000000000000000000002222222222222222222222222222222222222222"
+            }));
+        })
+        .await;
+    server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/v2/key")
+                .body_contains("eth_getStorageAt")
+                .body_contains("b53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "result": "0x0000000000000000000000003333333333333333333333333333333333333333"
+            }));
+        })
+        .await;
+
+    let client = test_client();
+    let endpoints = test_endpoints(&server.base_url());
+    let meta = fetch_contract_metadata(&client, &endpoints, "ethereum", "0xseed")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        meta.owner_address,
+        "0x1111111111111111111111111111111111111111"
+    );
+    assert_eq!(
+        meta.admin_address,
+        "0x2222222222222222222222222222222222222222"
+    );
+    assert_eq!(
+        meta.proxy_admin_address,
+        "0x3333333333333333333333333333333333333333"
+    );
+}
+
+#[tokio::test]
 async fn contract_info_uses_alchemy_before_opensea_when_available() {
     let alchemy_server = MockServer::start_async().await;
     alchemy_server
@@ -892,7 +966,7 @@ async fn contract_sales_paginates_opensea_events_with_next_cursor() {
 #[tokio::test]
 async fn opensea_market_events_parse_order_cancel_and_transfer_events() {
     let (opensea_base_url, server) = spawn_sequential_json_server(vec![(
-        "/api/v2/events/collection/dup-collection?limit=200".to_string(),
+        "/api/v2/events/collection/dup-collection?event_type=all&limit=200".to_string(),
         serde_json::json!({
             "events": [
                 {
@@ -966,6 +1040,54 @@ async fn opensea_market_events_parse_order_cancel_and_transfer_events() {
     assert_eq!(rows[2].block_number, 32);
     assert_eq!(rows[2].from_address, "0xfrom");
     assert_eq!(rows[2].to_address, "0xto");
+}
+
+#[tokio::test]
+async fn contract_sales_enrich_royalty_recipient_from_eip2981() {
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/nft/v3/key/getNFTSales");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "nftSales": [{
+                    "marketplace": "seaport",
+                    "contractAddress": "0xdup",
+                    "tokenId": "1",
+                    "buyerAddress": "0xbuyer",
+                    "sellerAddress": "0xseller",
+                    "sellerFee": {"amount": "1000000000000000000", "symbol": "ETH", "decimals": 18},
+                    "royaltyFee": {"amount": "50000000000000000", "symbol": "ETH", "decimals": 18},
+                    "blockNumber": 10,
+                    "logIndex": 1,
+                    "bundleIndex": 0,
+                    "transactionHash": "0xsale"
+                }]
+            }));
+        })
+        .await;
+    server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/v2/key")
+                .body_contains("eth_call")
+                .body_contains("2a55205a");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "result": "0x000000000000000000000000444444444444444444444444444444444444444400000000000000000000000000000000000000000000000000b1a2bc2ec50000"
+            }));
+        })
+        .await;
+
+    let client = test_client();
+    let endpoints = test_endpoints(&server.base_url());
+    let rows = fetch_contract_sales(&client, &endpoints, "ethereum", "0xdup", "", None)
+        .await
+        .unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].royalty_recipient_address,
+        "0x4444444444444444444444444444444444444444"
+    );
 }
 
 #[tokio::test]
