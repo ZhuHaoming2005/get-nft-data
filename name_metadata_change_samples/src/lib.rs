@@ -31,6 +31,8 @@ static TRAILING_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
         Regex::new(r"\s*(?:gen|generation)\s*\d+\s*$").unwrap(),
     ]
 });
+static ATTACHED_TRAILING_NUMBER_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)([\p{L}])\d{1,6}\s*$").unwrap());
 static WHITESPACE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
 static TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\p{L}\p{N}_]+").unwrap());
 static ASSET_REF_RE: Lazy<Regex> = Lazy::new(|| {
@@ -38,6 +40,8 @@ static ASSET_REF_RE: Lazy<Regex> = Lazy::new(|| {
         .unwrap()
 });
 static URL_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?i)https?://[^\s"')<>\]]+"#).unwrap());
+static MEDIA_EXT_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\.(?:png|jpe?g|gif|svg|webp|mp4|webm)(?:\b|[/?#])").unwrap());
 static DERIVATIVE_SUFFIX_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
         Regex::new(r"(?i)(?:\.fun|x)\s*$").unwrap(),
@@ -796,6 +800,16 @@ fn strip_trailing_number_suffix(raw: &str) -> String {
                 break;
             }
         }
+        if !changed {
+            let updated = ATTACHED_TRAILING_NUMBER_RE
+                .replace(&text, "$1")
+                .trim()
+                .to_string();
+            if updated != text {
+                text = updated;
+                changed = true;
+            }
+        }
     }
     WHITESPACE_RE.replace_all(&text, " ").trim().to_string()
 }
@@ -1154,14 +1168,22 @@ fn classify_name_modifications(seed: &str, value: &str) -> Vec<String> {
     if seed_trimmed == value_trimmed && !seed_trimmed.is_empty() {
         return vec!["exact_clone".to_string()];
     }
-    if has_suffix_augmentation(seed_trimmed, value_trimmed, &seed_norm, &value_norm) {
+    let suffix_augmented =
+        has_suffix_augmentation(seed_trimmed, value_trimmed, &seed_norm, &value_norm);
+    if suffix_augmented {
         labels.push("suffix_augmentation");
     }
     if has_name_format_perturbation(seed_trimmed, value_trimmed) {
         labels.push("format_perturbation");
     }
-    let seed_lexical_core = normalize_name(&strip_raw_augmentation_suffix(seed_trimmed));
-    let value_lexical_core = normalize_name(&strip_raw_augmentation_suffix(value_trimmed));
+    let seed_lexical_raw = strip_raw_trailing_number_suffix(seed_trimmed);
+    let value_lexical_raw = if suffix_augmented {
+        strip_raw_augmentation_suffix(value_trimmed)
+    } else {
+        strip_raw_trailing_number_suffix(value_trimmed)
+    };
+    let seed_lexical_core = canonical_format_name(&seed_lexical_raw);
+    let value_lexical_core = canonical_format_name(&value_lexical_raw);
     if has_name_lexical_mutation(&seed_lexical_core, &value_lexical_core) {
         labels.push("lexical_mutation");
     }
@@ -1182,11 +1204,19 @@ fn classify_metadata_modifications(seed: &str, value: &str) -> Vec<String> {
         return labels.into_iter().map(str::to_string).collect();
     }
 
+    if has_media_reference_changed(seed, value) {
+        labels.push("media_reference_changed");
+    }
+    if has_template_value_changed(&seed_text, &value_text) {
+        labels.push("template_value_changed");
+    }
     if has_template_changed(&seed_text, &value_text)
         || has_attribute_values_changed(&seed_text, &value_text)
+        || has_symbolic_attribute_value_changed(&seed_text, &value_text)
+        || has_attribute_fields_added_or_removed(&seed_text, &value_text)
         || has_custom_fields_changed(&seed_text, &value_text)
     {
-        labels.push("attribute_manipulation");
+        labels.push("attribute_value_changed");
     }
     if has_field_wrapper_changed(&seed_text, &value_text) {
         labels.push("metadata_structure_changed");
@@ -1300,6 +1330,7 @@ fn has_trailing_number_suffix(value: &str) -> bool {
     TRAILING_PATTERNS
         .iter()
         .any(|pattern| pattern.is_match(&normalized))
+        || ATTACHED_TRAILING_NUMBER_RE.is_match(&normalized)
 }
 
 fn has_derivative_suffix(value: &str) -> bool {
@@ -1311,7 +1342,8 @@ fn has_derivative_suffix(value: &str) -> bool {
 
 fn has_suffix_augmentation(seed: &str, value: &str, seed_norm: &str, value_norm: &str) -> bool {
     if has_derivative_suffix(value) {
-        return true;
+        let stripped_value = strip_raw_augmentation_suffix(value);
+        return canonical_format_name(seed) == canonical_format_name(&stripped_value);
     }
 
     let seed_has_numeric_suffix = has_trailing_number_suffix(seed);
@@ -1346,8 +1378,14 @@ fn canonical_format_name(value: &str) -> String {
     normalize_nfkc(value)
         .to_lowercase()
         .chars()
-        .filter(|ch| !ch.is_whitespace() && !should_render_as_codepoint(*ch))
+        .filter(|ch| !is_name_format_separator(*ch))
         .collect()
+}
+
+fn is_name_format_separator(ch: char) -> bool {
+    ch.is_whitespace()
+        || should_render_as_codepoint(ch)
+        || matches!(ch, '-' | '_' | '.' | ':' | '：' | '/' | '\\' | '|')
 }
 
 fn has_name_format_perturbation(seed: &str, value: &str) -> bool {
@@ -1367,6 +1405,16 @@ fn strip_raw_trailing_number_suffix(raw: &str) -> String {
                 text = updated;
                 changed = true;
                 break;
+            }
+        }
+        if !changed {
+            let updated = ATTACHED_TRAILING_NUMBER_RE
+                .replace(&text, "$1")
+                .trim()
+                .to_string();
+            if updated != text {
+                text = updated;
+                changed = true;
             }
         }
         if !changed {
@@ -1407,6 +1455,35 @@ fn metadata_change_text(value: &str) -> String {
     URL_RE.replace_all(&without_assets, " ").trim().to_string()
 }
 
+fn media_reference_set(value: &str) -> BTreeSet<String> {
+    ASSET_REF_RE
+        .find_iter(value)
+        .chain(URL_RE.find_iter(value))
+        .filter_map(|m| {
+            let reference = m
+                .as_str()
+                .trim_matches(|ch: char| matches!(ch, '"' | '\'' | ')' | ']' | '}' | ',' | '.'))
+                .to_lowercase();
+            if reference.starts_with("ipfs://")
+                || reference.contains("/ipfs/")
+                || reference.starts_with("qm")
+                || reference.starts_with("bafy")
+                || MEDIA_EXT_RE.is_match(&reference)
+            {
+                Some(reference)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn has_media_reference_changed(seed: &str, value: &str) -> bool {
+    let seed_refs = media_reference_set(seed);
+    let value_refs = media_reference_set(value);
+    !seed_refs.is_empty() && !value_refs.is_empty() && seed_refs != value_refs
+}
+
 fn has_attribute_values_changed(seed: &str, value: &str) -> bool {
     let seed_norm = normalize_text(seed);
     let value_norm = normalize_text(value);
@@ -1442,6 +1519,38 @@ fn has_attribute_values_changed(seed: &str, value: &str) -> bool {
             || (shared_terms >= 1 && shared_terms as f64 / smaller_doc_terms as f64 >= 0.30))
 }
 
+fn has_symbolic_attribute_value_changed(seed: &str, value: &str) -> bool {
+    let seed_norm = normalize_text(seed);
+    let value_norm = normalize_text(value);
+    if seed_norm.is_empty() || value_norm.is_empty() || seed_norm == value_norm {
+        return false;
+    }
+    let seed_terms = metadata_template_term_set(seed);
+    let value_terms = metadata_template_term_set(value);
+    !seed_terms.is_empty()
+        && seed_terms == value_terms
+        && metadata_token_set(seed) == metadata_token_set(value)
+}
+
+fn has_attribute_fields_added_or_removed(seed: &str, value: &str) -> bool {
+    let seed_tokens = metadata_token_set(seed);
+    let value_tokens = metadata_token_set(value);
+    if seed_tokens.is_empty() || value_tokens.is_empty() || seed_tokens == value_tokens {
+        return false;
+    }
+    let seed_terms = metadata_template_term_set(seed);
+    let value_terms = metadata_template_term_set(value);
+    if seed_terms == value_terms {
+        return false;
+    }
+    let shared_description_terms = description_tokens(seed)
+        .intersection(&description_tokens(value))
+        .count();
+    shared_description_terms >= 2
+        && (!seed_terms.is_empty() || !value_terms.is_empty())
+        && seed_tokens.intersection(&value_tokens).count() >= 3
+}
+
 fn metadata_template_term_set(value: &str) -> BTreeSet<&'static str> {
     let tokens = metadata_tokens(value).into_iter().collect::<BTreeSet<_>>();
     METADATA_TEMPLATE_TERMS
@@ -1458,6 +1567,30 @@ fn has_template_changed(seed: &str, value: &str) -> bool {
         return false;
     }
     seed_terms.symmetric_difference(&value_terms).count() >= 1
+}
+
+fn has_template_value_changed(seed: &str, value: &str) -> bool {
+    let seed_norm = normalize_text(seed);
+    let value_norm = normalize_text(value);
+    if seed_norm.is_empty() || value_norm.is_empty() || seed_norm == value_norm {
+        return false;
+    }
+    let shared_template_phrase = ["created by", "series"]
+        .iter()
+        .any(|phrase| seed_norm.contains(phrase) && value_norm.contains(phrase));
+    if shared_template_phrase
+        && metadata_token_set(seed)
+            .intersection(&metadata_token_set(value))
+            .count()
+            >= 4
+    {
+        return true;
+    }
+
+    seed_norm.contains("artist")
+        && value_norm.contains("artist")
+        && seed_norm.contains("interpretation")
+        && value_norm.contains("interpretation")
 }
 
 fn metadata_token_set(value: &str) -> BTreeSet<String> {
@@ -1872,6 +2005,30 @@ mod tests {
     #[test]
     fn name_uses_paper_level_mutually_exclusive_labels() {
         assert_eq!(
+            classify_name_modifications("BoredApeYachtClub", "Bored Ape Yacht Club"),
+            vec!["format_perturbation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Azuki", "Azuk\u{034F}i"),
+            vec!["format_perturbation"]
+        );
+        assert_eq!(
+            classify_name_modifications("BoredApeYachtClub", "Bored Ape Yacht Clubie"),
+            vec!["lexical_mutation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Azuki", "Azuki2"),
+            vec!["suffix_augmentation"]
+        );
+        assert_eq!(
+            classify_name_modifications("TEST NFT", "TEST-NFT"),
+            vec!["format_perturbation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Opepen Edition", "O$pepen Edition"),
+            vec!["lexical_mutation"]
+        );
+        assert_eq!(
             classify_name_modifications("Azuki", "Ａｚｕｋｉ"),
             vec!["format_perturbation"]
         );
@@ -1919,7 +2076,7 @@ mod tests {
                 "background gold ipfs://seed/image.png",
                 "background red ipfs://copy/image.png"
             ),
-            vec!["attribute_manipulation"]
+            vec!["media_reference_changed", "attribute_value_changed"]
         );
         assert_eq!(
             classify_metadata_modifications(
@@ -1944,14 +2101,14 @@ mod tests {
                 "background yellow fur dark brown eyes wide",
                 "background red fur golden eyes bored"
             ),
-            vec!["attribute_manipulation"]
+            vec!["attribute_value_changed"]
         );
         assert_eq!(
             classify_metadata_modifications(
                 "background yellow fur dark brown eyes wide",
                 "background yellow fur dark brown legs cream item phone"
             ),
-            vec!["attribute_manipulation"]
+            vec!["attribute_value_changed"]
         );
     }
 
@@ -1969,7 +2126,7 @@ mod tests {
                 "stage 2 type human captainz",
                 "stage 1 type human baby captainz"
             ),
-            vec!["attribute_manipulation"]
+            vec!["attribute_value_changed"]
         );
         assert_eq!(
             classify_metadata_modifications("guzzler by xcopy", "afterburn by xcopy"),
@@ -1991,14 +2148,14 @@ mod tests {
                 "rarity spectacular token benefit admission edition character this token has been redeemed for a ticket to veecon",
                 "rarity very rare token benefit admission edition character this token is verifiable for admission to veecon"
             ),
-            vec!["attribute_manipulation", "descriptive_text_changed"]
+            vec!["attribute_value_changed", "descriptive_text_changed"]
         );
         assert_eq!(
             classify_metadata_modifications(
                 "background m1 yellow fur m1 pink eyes m1 blindfold",
                 "background m1 army green 9% have this trait fur m1 dark brown 10% have this trait eyes m1 crazy 3% have this trait"
             ),
-            vec!["attribute_manipulation", "descriptive_text_changed"]
+            vec!["attribute_value_changed", "descriptive_text_changed"]
         );
     }
 
@@ -2009,7 +2166,7 @@ mod tests {
                 "background yellow fur dark brown eyes wide",
                 "background yellow fur dark brown legs cream item phone"
             ),
-            vec!["attribute_manipulation"]
+            vec!["attribute_value_changed"]
         );
         assert_eq!(
             classify_metadata_modifications(
@@ -2027,14 +2184,14 @@ mod tests {
                 "stage 2 type human captainz",
                 "stage 1 type human baby captainz"
             ),
-            vec!["attribute_manipulation"]
+            vec!["attribute_value_changed"]
         );
         assert_eq!(
             classify_metadata_modifications(
                 "background m1 yellow fur m1 pink eyes m1 blindfold",
                 "background m1 army green 9% have this trait fur m1 dark brown 10% have this trait eyes m1 crazy 3% have this trait"
             ),
-            vec!["attribute_manipulation", "descriptive_text_changed"]
+            vec!["attribute_value_changed", "descriptive_text_changed"]
         );
     }
 
@@ -2162,13 +2319,39 @@ mod tests {
     }
 
     #[test]
-    fn metadata_structured_template_changes_label_attribute_manipulation() {
+    fn metadata_structured_template_changes_label_attribute_value_changed() {
         let seed = "category spirit sediment biogenic swamp number sediment tier environment steppes number environment tier eastern resource whisper number eastern resource tier southern resource lumileaf number southern resource tier northern resource moldium number northern resource tier plot";
         let value = "category decay sediment chemical goo number sediment tier environment bog number environment tier southern resource whisper number southern resource tier western resource spikeweed number western resource tier number plot obelisk piece first trip";
 
         let labels = classify_metadata_modifications(seed, value);
 
-        assert!(labels.contains(&"attribute_manipulation".to_string()));
+        assert!(labels.contains(&"attribute_value_changed".to_string()));
+        assert!(!labels.contains(&"other".to_string()));
+    }
+
+    #[test]
+    fn metadata_other_examples_map_to_paper_level_categories() {
+        let labels = classify_metadata_modifications(
+            "this is an artwork for interleave created by dirtyrobot. https://arweave.net/interleave/dirtyrobot_interleave_artwork.jpg",
+            "this is an artwork for interleave created by jack butcher. https://arweave.net/interleave/jack_butcher_interleave_artwork.mp4",
+        );
+        assert!(labels.contains(&"template_value_changed".to_string()));
+        assert!(labels.contains(&"media_reference_changed".to_string()));
+        assert!(!labels.contains(&"other".to_string()));
+
+        let labels = classify_metadata_modifications(
+            "tier ✦✦✦ https://elementals-metadata.azuki.com/mystery-bean/0 https://elementals-images.azuki.com/3.gif",
+            "tier ✦ https://elementals-metadata.azuki.com/mystery-bean/7100 https://elementals-images.azuki.com/1.gif",
+        );
+        assert!(labels.contains(&"attribute_value_changed".to_string()));
+        assert!(labels.contains(&"media_reference_changed".to_string()));
+        assert!(!labels.contains(&"other".to_string()));
+
+        let labels = classify_metadata_modifications(
+            "this artwork may or may not be notable. ipfs://bafkreicjj7ksr3nau676datyren2kuiiiwpgbn4pwcbzia4sn7cbjrtkc4",
+            "color band twenty this artwork may or may not be notable. ipfs://bafybeicorfimu5v3xjqce4fbfl2b667bjbiee6dm2wk37rkjkhgd7carqq",
+        );
+        assert!(labels.contains(&"attribute_value_changed".to_string()));
         assert!(!labels.contains(&"other".to_string()));
     }
 
