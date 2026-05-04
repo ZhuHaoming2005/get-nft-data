@@ -1863,17 +1863,26 @@ fn push_metadata_matrix_summary<'a>(
     reports: impl Iterator<Item = &'a TextComparison>,
 ) {
     let mut total = 0usize;
+    let mut content_total = 0usize;
+    let mut non_content_total = 0usize;
+    let mut region_totals = BTreeMap::<String, usize>::new();
     let mut matrix = BTreeMap::<(String, String), usize>::new();
     let mut residual_counts = BTreeMap::<String, usize>::new();
     for comparison in reports {
         let values = labeled_matches_for_report(comparison, classify_metadata_modifications);
         total += values.len();
         for labeled in values {
+            let mut has_content_change = false;
+            let mut has_non_content_change = false;
+            let mut sample_regions = BTreeSet::<String>::new();
             for label in labeled.labels {
                 if let Some((region, operation)) = label.split_once(':') {
                     if METADATA_REGIONS.contains(&region)
                         && METADATA_OPERATIONS.contains(&operation)
                     {
+                        has_content_change |= METADATA_CONTENT_REGIONS.contains(&region);
+                        has_non_content_change |= METADATA_NON_CONTENT_REGIONS.contains(&region);
+                        sample_regions.insert(region.to_string());
                         *matrix
                             .entry((operation.to_string(), region.to_string()))
                             .or_default() += 1;
@@ -1890,19 +1899,13 @@ fn push_metadata_matrix_summary<'a>(
                         .or_default() += 1;
                 }
             }
+            content_total += usize::from(has_content_change);
+            non_content_total += usize::from(has_non_content_change);
+            for region in sample_regions {
+                *region_totals.entry(region).or_default() += 1;
+            }
         }
     }
-
-    let content_total = matrix
-        .iter()
-        .filter(|((_, region), _)| METADATA_CONTENT_REGIONS.contains(&region.as_str()))
-        .map(|(_, count)| *count)
-        .sum::<usize>();
-    let non_content_total = matrix
-        .iter()
-        .filter(|((_, region), _)| METADATA_NON_CONTENT_REGIONS.contains(&region.as_str()))
-        .map(|(_, count)| *count)
-        .sum::<usize>();
 
     out.push_str(&format!("- total matches: {total}\n"));
     out.push_str(&format!("- content-bearing changes: {content_total}\n"));
@@ -1924,6 +1927,12 @@ fn push_metadata_matrix_summary<'a>(
     out.push_str("| --- |");
     for _ in METADATA_REGIONS {
         out.push_str(" ---: |");
+    }
+    out.push('\n');
+    out.push_str("| total |");
+    for region in METADATA_REGIONS {
+        let count = region_totals.get(region).copied().unwrap_or(0);
+        out.push_str(&format!(" {count} |"));
     }
     out.push('\n');
     for operation in METADATA_OPERATIONS {
@@ -2520,8 +2529,9 @@ mod tests {
             seed_reports: vec![SeedSampleReport {
                 name: TextComparison::default(),
                 metadata: TextComparison {
-                    seed: r#"{"name":"Seed","image":"ipfs://seed","seller_fee_basis_points":500}"#
-                        .into(),
+                    seed:
+                        r#"{"name":"Seed","title":"Old","image":"ipfs://seed","seller_fee_basis_points":500}"#
+                            .into(),
                     matches: vec![
                         r#"{"name":"Copy","image":"ipfs://copy","seller_fee_basis_points":750}"#
                             .into(),
@@ -2535,8 +2545,10 @@ mod tests {
 
         assert!(output.contains("#### Metadata Change Matrix"));
         assert!(output.contains("| operation | title | description | attributes | references | auxiliary_fields | platform_fields | structure |"));
+        assert!(output.contains("| total | 1 | 0 | 0 | 1 | 0 | 1 | 0 |"));
+        assert!(output.contains("| removed | 1 | 0 | 0 | 0 | 0 | 0 | 0 |"));
         assert!(output.contains("| replaced | 1 | 0 | 0 | 1 | 0 | 1 | 0 |"));
-        assert!(output.contains("- content-bearing changes: 2"));
+        assert!(output.contains("- content-bearing changes: 1"));
         assert!(output.contains("- non-content-bearing changes: 1"));
     }
 
