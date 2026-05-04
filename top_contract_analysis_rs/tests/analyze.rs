@@ -3895,7 +3895,12 @@ async fn analyze_enriches_duplicate_contracts_with_signals_and_infringing_tokens
     assert_eq!(lifecycle_metric.funding_edge_count, 1);
     assert_eq!(lifecycle_metric.withdrawal_edge_count, 1);
     assert_eq!(lifecycle_metric.revenue_backflow_edge_count, 1);
-    assert!(lifecycle_metric.early_detection_positive);
+    assert_eq!(
+        lifecycle_metric.first_victim_time,
+        mint_payment_edge.block_time
+    );
+    assert_eq!(lifecycle_metric.time_to_first_victim_seconds, Some(0));
+    assert!(!lifecycle_metric.early_detection_positive);
     assert!(payload.weak_supervision_labels.iter().any(|label| {
         label.entity_type == "contract"
             && label.contract_address == "0xdup"

@@ -1113,6 +1113,8 @@ fn lifecycle_model_outputs_expose_research_graph_payloads() {
         .expect("contract lifecycle metric");
     assert_eq!(metric.time_to_first_listing_seconds, Some(20));
     assert_eq!(metric.time_to_first_sale_seconds, Some(80));
+    assert_eq!(metric.first_victim_time, 100);
+    assert_eq!(metric.time_to_first_victim_seconds, Some(0));
     assert_eq!(metric.market_event_count, 2);
     assert!((metric.gross_revenue_eth - 1.58).abs() < 1e-9);
     assert!((metric.operator_revenue_eth - 0.08).abs() < 1e-9);
@@ -1130,8 +1132,7 @@ fn lifecycle_model_outputs_expose_research_graph_payloads() {
     assert_eq!(metric.top_value_recipient_address, "0xdup");
     assert!((metric.top_value_recipient_eth - 0.08).abs() < 1e-9);
     assert!((metric.withdrawal_amount_eth - 0.4).abs() < 1e-9);
-    assert!(metric.early_detection_positive);
-    assert!(metric.pre_sale_signal_count >= 4);
+    assert!(!metric.early_detection_positive);
     assert!(outputs.weak_supervision_labels.iter().any(|label| {
         label.entity_type == "contract"
             && label.contract_address == "0xdup"
@@ -1140,8 +1141,7 @@ fn lifecycle_model_outputs_expose_research_graph_payloads() {
     assert!(outputs.early_detection_features.iter().any(|row| {
         row.contract_address == "0xdup"
             && row.observation_window_seconds == 60
-            && row.pre_sale_signal_count >= 4
-            && row.weak_label == "positive_future_sale_or_victimization"
+            && row.weak_label == "positive_observed_sale_or_victimization"
     }));
 }
 

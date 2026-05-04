@@ -674,17 +674,17 @@ fn value_flow_lifecycle_event(edge: &ValueFlowEdgePayload) -> ContractLifecycleE
 
 fn market_lifecycle_event(event: &NftMarketEventRecord) -> ContractLifecycleEventPayload {
     let (stage, event_type, confidence, detail) = match event.event_type.as_str() {
-        "order" => (
+        "order" | "listing" | "item_listed" => (
             "market_exposure",
             if event.order_type.is_empty() {
-                "market_order"
+                "market_listing"
             } else {
                 event.order_type.as_str()
             },
             "medium",
             "OpenSea order event for copied NFT",
         ),
-        "cancel" => (
+        "cancel" | "order_cancelled" | "item_cancelled" => (
             "exit_or_cleanup",
             "order_cancel",
             "medium",
@@ -783,7 +783,10 @@ fn build_lifecycle_metrics(
             let first_listing_time =
                 first_stage_time(lifecycle_events, &contract, "market_exposure");
             let first_sale_time = first_stage_time(lifecycle_events, &contract, "monetization");
-            let first_victim_time = first_stage_time(lifecycle_events, &contract, "victimization");
+            let first_victim_time = earliest_positive_time(
+                first_stage_time(lifecycle_events, &contract, "victimization"),
+                first_paid_mint_victim_time(value_flow_edges, &contract),
+            );
             let path_summary = propagation_paths.get(&contract).map(|path| &path.summary);
             let victim_count = address_evidence_features
                 .iter()
@@ -1050,13 +1053,31 @@ fn earliest_positive_time(left: i64, right: i64) -> i64 {
     }
 }
 
+fn first_paid_mint_victim_time(
+    value_flow_edges: &[ValueFlowEdgePayload],
+    contract_address: &str,
+) -> i64 {
+    value_flow_edges
+        .iter()
+        .filter(|edge| edge.contract_address == contract_address)
+        .filter(|edge| edge.channel == "mint_payment")
+        .filter(|edge| edge.block_time > 0 && value_flow_has_positive_amount(edge))
+        .map(|edge| edge.block_time)
+        .min()
+        .unwrap_or(0)
+}
+
+fn value_flow_has_positive_amount(edge: &ValueFlowEdgePayload) -> bool {
+    edge.value_eth.unwrap_or(0.0) > 0.0 || edge.value_usd.unwrap_or(0.0) > 0.0
+}
+
 fn is_outcome_lifecycle_event(event: &ContractLifecycleEventPayload) -> bool {
     matches!(
         event.lifecycle_stage.as_str(),
-        "monetization" | "victimization"
+        "monetization" | "primary_monetization" | "victimization"
     ) || matches!(
         event.event_type.as_str(),
-        "sale" | "secondary_sale_victim_acquisition"
+        "sale" | "mint_payment" | "secondary_sale_victim_acquisition"
     )
 }
 
@@ -1843,6 +1864,56 @@ mod tests {
         assert_eq!(metric.first_victim_time, 150);
         assert_eq!(metric.pre_sale_signal_count, 1);
         assert!(!metric.early_detection_positive);
+    }
+
+    #[test]
+    fn lifecycle_metric_uses_paid_mint_as_victim_outcome_time() {
+        let seed_contract = SeedContractPayload {
+            contract_address: "0xseed".into(),
+            ..SeedContractPayload::default()
+        };
+        let lifecycle_events = vec![ContractLifecycleEventPayload {
+            contract_address: "0xdup".into(),
+            lifecycle_stage: "replica_mint".into(),
+            event_type: "mint".into(),
+            block_time: 100,
+            ..ContractLifecycleEventPayload::default()
+        }];
+        let value_flow_edges = vec![ValueFlowEdgePayload {
+            contract_address: "0xdup".into(),
+            block_time: 120,
+            channel: "mint_payment".into(),
+            value_eth: Some(0.08),
+            ..ValueFlowEdgePayload::default()
+        }];
+
+        let metrics = build_lifecycle_metrics(
+            &seed_contract,
+            &BTreeMap::new(),
+            &[],
+            &[],
+            &value_flow_edges,
+            &lifecycle_events,
+        );
+        let metric = metrics
+            .iter()
+            .find(|metric| metric.contract_address == "0xdup")
+            .expect("contract metric");
+
+        assert_eq!(metric.first_sale_time, 0);
+        assert_eq!(metric.first_victim_time, 120);
+        assert_eq!(metric.time_to_first_victim_seconds, Some(20));
+        assert_eq!(metric.pre_sale_signal_count, 1);
+
+        let rows = build_early_detection_features(&metrics, &lifecycle_events, &value_flow_edges);
+        let first_window = rows
+            .iter()
+            .find(|row| row.observation_window_seconds == 60)
+            .expect("first window");
+        assert_eq!(
+            first_window.weak_label,
+            "positive_observed_sale_or_victimization"
+        );
     }
 
     #[test]

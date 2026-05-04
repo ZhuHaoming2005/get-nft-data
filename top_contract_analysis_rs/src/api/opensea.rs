@@ -684,11 +684,7 @@ pub async fn fetch_opensea_contract_market_events(
             "{base_url}/api/v2/events/collection/{collection_slug}"
         ))
         .map_err(|err| AppError::Http(err.to_string()))?;
-        url.query_pairs_mut()
-            .append_pair("limit", "200")
-            .append_pair("event_type", "order")
-            .append_pair("event_type", "cancel")
-            .append_pair("event_type", "transfer");
+        url.query_pairs_mut().append_pair("limit", "200");
         if let Some(cursor) = next.as_deref() {
             url.query_pairs_mut().append_pair("next", cursor);
         }
@@ -739,7 +735,8 @@ pub async fn fetch_opensea_contract_market_events(
                 string_or_nested_field(&item, &["to_account", "to_address", "toAddress"])
                     .to_lowercase();
             let actor_address = match event_type.as_str() {
-                "order" | "cancel" => maker_address.clone(),
+                "order" | "listing" | "item_listed" | "cancel" | "order_cancelled"
+                | "item_cancelled" => maker_address.clone(),
                 "transfer" => from_address.clone(),
                 _ => maker_address.clone(),
             };

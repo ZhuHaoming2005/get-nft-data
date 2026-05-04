@@ -892,8 +892,7 @@ async fn contract_sales_paginates_opensea_events_with_next_cursor() {
 #[tokio::test]
 async fn opensea_market_events_parse_order_cancel_and_transfer_events() {
     let (opensea_base_url, server) = spawn_sequential_json_server(vec![(
-        "/api/v2/events/collection/dup-collection?limit=200&event_type=order&event_type=cancel&event_type=transfer"
-            .to_string(),
+        "/api/v2/events/collection/dup-collection?limit=200".to_string(),
         serde_json::json!({
             "events": [
                 {
