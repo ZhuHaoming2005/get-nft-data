@@ -126,13 +126,19 @@ fn collect_samples_outputs_split_name_and_metadata_text_only() {
         &[
             TestRow::new("0xseed", "1")
                 .name("Azuki #1")
-                .metadata_doc("gold dragon red background"),
+                .metadata_doc("gold dragon red background")
+                .metadata_json(
+                    r#"{"description":"gold dragon","attributes":[{"trait_type":"Background","value":"Red"}],"image":"ipfs://seed/image.png"}"#,
+                ),
             TestRow::new("0xname", "3")
                 .name("Azuki #1")
                 .metadata_doc("unrelated text"),
             TestRow::new("0xmetadata", "8")
                 .name("Changed Creature")
-                .metadata_doc("gold dragon red background"),
+                .metadata_doc("gold dragon red background")
+                .metadata_json(
+                    r#"{"description":"gold dragon","attributes":[{"trait_type":"Background","value":"Red"}],"image":"ipfs://copy/image.png"}"#,
+                ),
             TestRow::new("0xuri", "9")
                 .name("Different")
                 .token_uri("ipfs://seed/1")
@@ -142,30 +148,36 @@ fn collect_samples_outputs_split_name_and_metadata_text_only() {
     );
     fs::write(&input_path, "0xseed\n").unwrap();
 
-    let report = collect_samples(config(db_path, input_path, output_path.clone())).unwrap();
+    let mut sample_config = config(db_path, input_path, output_path.clone());
+    sample_config.metadata_threshold = 0.1;
+    let report = collect_samples(sample_config).unwrap();
 
     assert_eq!(report.seed_reports.len(), 1);
     assert_eq!(report.seed_reports[0].name.seed, "Azuki #1");
     assert_eq!(report.seed_reports[0].name.matches, vec!["Azuki #1"]);
     assert_eq!(
         report.seed_reports[0].metadata.seed,
-        "gold dragon red background"
+        r#"{"description":"gold dragon","attributes":[{"trait_type":"Background","value":"Red"}],"image":"ipfs://seed/image.png"}"#
     );
     assert_eq!(
         report.seed_reports[0].metadata.matches,
-        vec!["gold dragon red background"]
+        vec![
+            r#"{"description":"gold dragon","attributes":[{"trait_type":"Background","value":"Red"}],"image":"ipfs://copy/image.png"}"#
+        ]
     );
 
     let output = fs::read_to_string(output_path).unwrap();
     assert!(output.contains("## Modification Summary"));
     assert!(output.contains("- exact_clone: 1"));
-    assert!(output.contains("- uri-only: 1"));
+    assert!(output.contains("#### Metadata Change Matrix"));
+    assert!(output.contains("| replaced | 0 | 0 | 0 | 1 | 0 | 0 | 0 |"));
     assert!(output.contains("## Name Matches"));
     assert!(output.contains("- seed: Azuki #1"));
     assert!(output.contains("[exact_clone] Azuki #1"));
     assert!(output.contains("## Metadata Matches"));
-    assert!(output.contains("- match labels: uri-only"));
-    assert!(output.contains("gold dragon red background"));
+    assert!(output.contains("- match labels: references:replaced"));
+    assert!(output.contains(r#""description":"gold dragon""#));
+    assert!(output.contains(r#""image":"ipfs://copy/image.png""#));
     assert!(!output.contains("0xseed"));
     assert!(!output.contains("0xname"));
     assert!(!output.contains("0xmetadata"));
@@ -208,7 +220,7 @@ fn collect_samples_uses_equivalent_name_and_metadata_normalization() {
     assert_eq!(report.seed_reports[0].name.matches, vec!["Ａｚｕｋｉ #456"]);
     assert_eq!(
         report.seed_reports[0].metadata.seed,
-        "background red gold dragon"
+        r#"{"description":"Gold Dragon","attributes":[{"trait_type":"Background","value":"Red"}],"ignored":"noise"}"#
     );
     assert_eq!(
         report.seed_reports[0].metadata.matches,

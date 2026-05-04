@@ -13,6 +13,25 @@ use unicode_normalization::UnicodeNormalization;
 
 type TokenId = u32;
 
+const METADATA_REGIONS: [&str; 7] = [
+    "title",
+    "description",
+    "attributes",
+    "references",
+    "auxiliary_fields",
+    "platform_fields",
+    "structure",
+];
+const METADATA_CONTENT_REGIONS: [&str; 5] = [
+    "title",
+    "description",
+    "attributes",
+    "references",
+    "auxiliary_fields",
+];
+const METADATA_NON_CONTENT_REGIONS: [&str; 2] = ["platform_fields", "structure"];
+const METADATA_OPERATIONS: [&str; 4] = ["added", "removed", "replaced", "reordered"];
+
 static TRAILING_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
         Regex::new(r"\s*#\s*[0-9a-fA-FxX]+\s*$").unwrap(),
@@ -35,13 +54,6 @@ static ATTACHED_TRAILING_NUMBER_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)([\p{L}])\d{1,6}\s*$").unwrap());
 static WHITESPACE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
 static TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\p{L}\p{N}_]+").unwrap());
-static ASSET_REF_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)(ipfs://[^\s]+|https?://[^\s]*ipfs[^\s]+|\bqm[1-9a-hj-np-z]{20,}\b|\bbafy[a-z2-7]{20,}\b)")
-        .unwrap()
-});
-static URL_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?i)https?://[^\s"')<>\]]+"#).unwrap());
-static MEDIA_EXT_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)\.(?:png|jpe?g|gif|svg|webp|mp4|webm)(?:\b|[/?#])").unwrap());
 static DERIVATIVE_SUFFIX_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
         Regex::new(r"(?i)(?:\.fun|x)\s*$").unwrap(),
@@ -565,10 +577,11 @@ fn load_metadata_index(
     let mut candidates = Vec::new();
     for row in rows {
         let (contract_address, metadata_doc, metadata_json) = row?;
-        let text = record_metadata_doc(&metadata_doc, &metadata_json);
-        let Some(doc) = MetadataDocument::from_text_with_interner(&text, token_interner) else {
+        let doc_text = record_metadata_doc(&metadata_doc, &metadata_json);
+        let Some(doc) = MetadataDocument::from_text_with_interner(&doc_text, token_interner) else {
             continue;
         };
+        let text = record_metadata_text(&metadata_doc, &metadata_json);
         candidates.push(MetadataCandidate {
             contract_address,
             text,
@@ -618,7 +631,7 @@ fn seed_name_norms(rows: &[NftTextRow]) -> Vec<String> {
 
 fn first_seed_metadata(rows: &[NftTextRow]) -> String {
     rows.iter()
-        .find_map(|row| non_empty(&record_metadata_doc(&row.metadata_doc, &row.metadata_json)))
+        .find_map(|row| non_empty(&record_metadata_text(&row.metadata_doc, &row.metadata_json)))
         .unwrap_or_default()
 }
 
@@ -696,9 +709,11 @@ fn match_metadata(
     threshold: f64,
     limit: usize,
 ) -> Vec<String> {
-    let Some(seed_doc) =
-        MetadataDocument::from_text_with_vocab(seed_metadata, &text_index.metadata_token_ids)
-    else {
+    let scoring_seed_metadata = metadata_scoring_text(seed_metadata);
+    let Some(seed_doc) = MetadataDocument::from_text_with_vocab(
+        &scoring_seed_metadata,
+        &text_index.metadata_token_ids,
+    ) else {
         return Vec::new();
     };
     let seed_contract = seed_contract.to_lowercase();
@@ -878,6 +893,22 @@ fn record_metadata_doc(metadata_doc: &str, metadata_json: &str) -> String {
         metadata_doc.to_string()
     } else {
         metadata_document_from_json(metadata_json)
+    }
+}
+
+fn record_metadata_text(metadata_doc: &str, metadata_json: &str) -> String {
+    if !metadata_json.trim().is_empty() {
+        metadata_json.to_string()
+    } else {
+        metadata_doc.to_string()
+    }
+}
+
+fn metadata_scoring_text(value: &str) -> String {
+    if looks_like_json(value) {
+        metadata_document_from_json(value)
+    } else {
+        value.to_string()
     }
 }
 
@@ -1194,136 +1225,396 @@ fn classify_name_modifications(seed: &str, value: &str) -> Vec<String> {
 }
 
 fn classify_metadata_modifications(seed: &str, value: &str) -> Vec<String> {
-    let mut labels = Vec::new();
-    let seed_text = metadata_change_text(seed);
-    let value_text = metadata_change_text(value);
-    let seed_norm = normalize_text(&seed_text);
-    let value_norm = normalize_text(&value_text);
-    if seed_norm == value_norm && !value.trim().is_empty() {
-        labels.push("uri-only");
-        return labels.into_iter().map(str::to_string).collect();
-    }
-
-    if has_media_reference_changed(seed, value) {
-        labels.push("media_reference_changed");
-    }
-    if has_template_value_changed(&seed_text, &value_text) {
-        labels.push("template_value_changed");
-    }
-    if has_template_changed(&seed_text, &value_text)
-        || has_attribute_values_changed(&seed_text, &value_text)
-        || has_symbolic_attribute_value_changed(&seed_text, &value_text)
-        || has_attribute_fields_added_or_removed(&seed_text, &value_text)
-        || has_custom_fields_changed(&seed_text, &value_text)
-    {
-        labels.push("attribute_value_changed");
-    }
-    if has_field_wrapper_changed(&seed_text, &value_text) {
-        labels.push("metadata_structure_changed");
-    }
-    if has_short_text_changed(&seed_text, &value_text) {
-        labels.push("title_or_short_text_changed");
-    }
-    if has_description_changed(&seed_text, &value_text)
-        || has_description_added(&seed_text, &value_text)
-        || has_description_removed(&seed_text, &value_text)
-    {
-        labels.push("descriptive_text_changed");
-    }
-
-    if labels.is_empty() {
-        labels.push("other");
-    }
-    labels.into_iter().map(str::to_string).collect()
+    classify_json_metadata_modifications(seed, value)
 }
 
-const METADATA_TEMPLATE_TERMS: &[&str] = &[
-    "admission",
-    "artifact",
-    "background",
-    "benefit",
-    "body",
-    "card",
-    "category",
-    "character",
-    "clothes",
-    "color",
-    "content",
-    "edition",
-    "environment",
-    "eyes",
-    "face",
-    "fur",
-    "glasses",
-    "hair",
-    "hat",
-    "head",
-    "hand",
-    "item",
-    "left",
-    "legs",
-    "mouth",
-    "number",
-    "pants",
-    "plot",
-    "rarity",
-    "resource",
-    "sediment",
-    "shirt",
-    "shoes",
-    "skin",
-    "style",
-    "right",
-    "tier",
-    "token",
-    "type",
-];
+fn looks_like_json(value: &str) -> bool {
+    matches!(value.trim().chars().next(), Some('{') | Some('['))
+}
 
-const DESCRIPTION_STOP_TERMS: &[&str] = &[
-    "and", "for", "from", "has", "have", "into", "not", "that", "the", "this", "with", "your",
-];
+fn classify_json_metadata_modifications(seed: &str, value: &str) -> Vec<String> {
+    let seed_trimmed = seed.trim();
+    let value_trimmed = value.trim();
+    let seed_json = serde_json::from_str::<Value>(seed_trimmed);
+    let value_json = serde_json::from_str::<Value>(value_trimmed);
+    let (Ok(seed_json), Ok(value_json)) = (seed_json, value_json) else {
+        if normalize_text(seed_trimmed) == normalize_text(value_trimmed)
+            && !value_trimmed.is_empty()
+        {
+            return vec!["metadata_unchanged".to_string()];
+        }
+        return vec!["unparseable_changed".to_string()];
+    };
 
-const METADATA_WRAPPER_TERMS: &[&str] = &[
-    "artist",
-    "attributes",
-    "column",
-    "description",
-    "metadata",
-    "string",
-    "text",
-    "url",
-];
+    let mut labels = BTreeSet::new();
+    diff_metadata_json(&seed_json, &value_json, &mut Vec::new(), &mut labels);
+    if labels.is_empty() {
+        labels.insert("metadata_unchanged".to_string());
+    }
+    labels.into_iter().collect()
+}
 
-const CUSTOM_FIELD_TERMS: &[&str] = &[
-    "action",
-    "affinity",
-    "airdrop",
-    "attendee",
-    "card",
-    "class",
-    "created",
-    "date",
-    "day",
-    "edition",
-    "faction",
-    "filing",
-    "insured",
-    "membership",
-    "month",
-    "observation",
-    "period",
-    "place",
-    "pose",
-    "power",
-    "skill",
-    "skills",
-    "stage",
-    "taxpayer",
-    "technique",
-    "tier",
-    "type",
-    "year",
-];
+fn diff_metadata_json(
+    seed: &Value,
+    value: &Value,
+    path: &mut Vec<String>,
+    labels: &mut BTreeSet<String>,
+) {
+    match (seed, value) {
+        (Value::Object(seed_map), Value::Object(value_map)) => {
+            if diff_metadata_wrapper_transform(seed_map, value_map, path, labels) {
+                return;
+            }
+            let keys = seed_map
+                .keys()
+                .chain(value_map.keys())
+                .map(|key| key.as_str())
+                .collect::<BTreeSet<_>>();
+            for key in keys {
+                path.push(key.to_lowercase());
+                match (seed_map.get(key), value_map.get(key)) {
+                    (Some(seed_value), Some(value_value)) => {
+                        diff_metadata_json(seed_value, value_value, path, labels);
+                    }
+                    (None, Some(_value_value)) => {
+                        add_metadata_change(path, "added", labels);
+                    }
+                    (Some(_seed_value), None) => {
+                        add_metadata_change(path, "removed", labels);
+                    }
+                    (None, None) => {}
+                }
+                path.pop();
+            }
+        }
+        (Value::Array(seed_items), Value::Array(value_items)) => {
+            if same_json_multiset(seed_items, value_items) && seed_items != value_items {
+                add_metadata_change(path, "reordered", labels);
+                return;
+            }
+            if diff_keyed_attribute_array(seed_items, value_items, path, labels) {
+                return;
+            }
+            let common_len = seed_items.len().min(value_items.len());
+            for index in 0..common_len {
+                path.push(index.to_string());
+                diff_metadata_json(&seed_items[index], &value_items[index], path, labels);
+                path.pop();
+            }
+            for _ in &value_items[common_len..] {
+                path.push(common_len.to_string());
+                add_metadata_change(path, "added", labels);
+                path.pop();
+            }
+            for _ in &seed_items[common_len..] {
+                path.push(common_len.to_string());
+                add_metadata_change(path, "removed", labels);
+                path.pop();
+            }
+        }
+        _ if seed == value => {}
+        _ => {
+            let operation_region = metadata_region_for_path(path);
+            add_metadata_label(operation_region, "replaced", labels);
+        }
+    }
+}
+
+fn same_json_multiset(seed_items: &[Value], value_items: &[Value]) -> bool {
+    if seed_items.len() != value_items.len() {
+        return false;
+    }
+    let mut seed_canonical = seed_items.iter().map(canonical_json).collect::<Vec<_>>();
+    let mut value_canonical = value_items.iter().map(canonical_json).collect::<Vec<_>>();
+    seed_canonical.sort();
+    value_canonical.sort();
+    seed_canonical == value_canonical
+}
+
+fn canonical_json(value: &Value) -> String {
+    serde_json::to_string(value).unwrap_or_default()
+}
+
+fn diff_metadata_wrapper_transform(
+    seed_map: &serde_json::Map<String, Value>,
+    value_map: &serde_json::Map<String, Value>,
+    path: &mut Vec<String>,
+    labels: &mut BTreeSet<String>,
+) -> bool {
+    let wrapped_seed = structure_wrapper_entry(seed_map);
+    let wrapped_value = structure_wrapper_entry(value_map);
+    if let (None, Some((wrapper_key, wrapped_value))) = (wrapped_seed, wrapped_value) {
+        if seed_map.contains_key(wrapper_key) {
+            return false;
+        }
+        add_metadata_label(Some("structure"), "added", labels);
+        let seed_value = Value::Object(seed_map.clone());
+        diff_metadata_json(&seed_value, wrapped_value, path, labels);
+        diff_wrapper_siblings(value_map, wrapper_key, "added", path, labels);
+        return true;
+    }
+    if let (Some((wrapper_key, wrapped_seed)), None) = (wrapped_seed, wrapped_value) {
+        if value_map.contains_key(wrapper_key) {
+            return false;
+        }
+        add_metadata_label(Some("structure"), "removed", labels);
+        let value_value = Value::Object(value_map.clone());
+        diff_metadata_json(wrapped_seed, &value_value, path, labels);
+        diff_wrapper_siblings(seed_map, wrapper_key, "removed", path, labels);
+        return true;
+    }
+    false
+}
+
+fn structure_wrapper_entry(map: &serde_json::Map<String, Value>) -> Option<(&str, &Value)> {
+    let mut entries = map
+        .iter()
+        .filter(|(key, value)| is_structure_wrapper_key(&key.to_lowercase()) && value.is_object());
+    let (key, value) = entries.next()?;
+    if entries.next().is_some() {
+        return None;
+    }
+    Some((key.as_str(), value))
+}
+
+fn diff_wrapper_siblings(
+    map: &serde_json::Map<String, Value>,
+    wrapper_key: &str,
+    operation: &str,
+    path: &mut Vec<String>,
+    labels: &mut BTreeSet<String>,
+) {
+    for key in map.keys().filter(|key| key.as_str() != wrapper_key) {
+        path.push(key.to_lowercase());
+        add_metadata_change(path, operation, labels);
+        path.pop();
+    }
+}
+
+fn diff_keyed_attribute_array(
+    seed_items: &[Value],
+    value_items: &[Value],
+    path: &mut Vec<String>,
+    labels: &mut BTreeSet<String>,
+) -> bool {
+    if metadata_region_for_path(path) != Some("attributes") {
+        return false;
+    }
+    let Some(seed_by_key) = attribute_items_by_key(seed_items) else {
+        return false;
+    };
+    let Some(value_by_key) = attribute_items_by_key(value_items) else {
+        return false;
+    };
+    if shared_attribute_order_changed(seed_items, value_items) {
+        add_metadata_change(path, "reordered", labels);
+    }
+
+    let keys = seed_by_key
+        .keys()
+        .chain(value_by_key.keys())
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    for key in keys {
+        match (seed_by_key.get(key), value_by_key.get(key)) {
+            (Some(seed_index), Some(value_index)) => {
+                path.push(key.to_string());
+                diff_metadata_json(
+                    &seed_items[*seed_index],
+                    &value_items[*value_index],
+                    path,
+                    labels,
+                );
+                path.pop();
+            }
+            (None, Some(_value_index)) => {
+                path.push(key.to_string());
+                add_metadata_change(path, "added", labels);
+                path.pop();
+            }
+            (Some(_seed_index), None) => {
+                path.push(key.to_string());
+                add_metadata_change(path, "removed", labels);
+                path.pop();
+            }
+            (None, None) => {}
+        }
+    }
+    true
+}
+
+fn attribute_items_by_key(items: &[Value]) -> Option<BTreeMap<String, usize>> {
+    let mut by_key = BTreeMap::new();
+    for (index, item) in items.iter().enumerate() {
+        let key = attribute_item_key(item)?;
+        if by_key.insert(key, index).is_some() {
+            return None;
+        }
+    }
+    Some(by_key)
+}
+
+fn shared_attribute_order_changed(seed_items: &[Value], value_items: &[Value]) -> bool {
+    let seed_order = attribute_item_order(seed_items);
+    let value_order = attribute_item_order(value_items);
+    if seed_order.is_empty() || value_order.is_empty() {
+        return false;
+    }
+    let shared = seed_order
+        .iter()
+        .filter(|key| value_order.contains(*key))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if shared.len() < 2 {
+        return false;
+    }
+    let seed_shared = seed_order
+        .into_iter()
+        .filter(|key| shared.contains(key))
+        .collect::<Vec<_>>();
+    let value_shared = value_order
+        .into_iter()
+        .filter(|key| shared.contains(key))
+        .collect::<Vec<_>>();
+    seed_shared != value_shared
+}
+
+fn attribute_item_order(items: &[Value]) -> Vec<String> {
+    items.iter().filter_map(attribute_item_key).collect()
+}
+
+fn attribute_item_key(item: &Value) -> Option<String> {
+    let key = item
+        .as_object()?
+        .get("trait_type")?
+        .as_str()
+        .map(normalize_text)?;
+    (!key.is_empty()).then_some(key)
+}
+
+fn add_metadata_change(path: &[String], operation: &str, labels: &mut BTreeSet<String>) {
+    add_metadata_label(metadata_region_for_path(path), operation, labels);
+}
+
+fn add_metadata_label(
+    region: Option<&'static str>,
+    operation: &str,
+    labels: &mut BTreeSet<String>,
+) {
+    let region = region.unwrap_or("auxiliary_fields");
+    labels.insert(format!("{region}:{operation}"));
+}
+
+fn metadata_region_for_path(path: &[String]) -> Option<&'static str> {
+    if path.is_empty() {
+        return Some("structure");
+    }
+    let semantic_path = semantic_path_segments(path);
+    let primary_segment = metadata_primary_region_segment(&semantic_path)?;
+    if is_structure_wrapper_key(primary_segment) {
+        return Some("structure");
+    }
+
+    if is_attribute_key(primary_segment) {
+        return Some("attributes");
+    }
+    if is_platform_key(primary_segment) {
+        return Some("platform_fields");
+    }
+    if is_reference_key(primary_segment) {
+        return Some("references");
+    }
+    if is_title_key(primary_segment) {
+        return Some("title");
+    }
+    if is_description_key(primary_segment) {
+        return Some("description");
+    }
+    None
+}
+
+fn semantic_path_segments(path: &[String]) -> Vec<&str> {
+    path.iter()
+        .map(String::as_str)
+        .filter(|part| !part.chars().all(|ch| ch.is_ascii_digit()))
+        .collect()
+}
+
+fn metadata_primary_region_segment<'a>(semantic_path: &'a [&str]) -> Option<&'a str> {
+    let first = semantic_path.first().copied()?;
+    if is_structure_wrapper_key(first) {
+        semantic_path.get(1).copied().or(Some(first))
+    } else {
+        Some(first)
+    }
+}
+
+fn is_structure_wrapper_key(key: &str) -> bool {
+    matches!(key, "metadata" | "rawmetadata" | "raw")
+}
+
+fn is_attribute_key(key: &str) -> bool {
+    matches!(
+        key,
+        "attributes"
+            | "attribute"
+            | "traits"
+            | "trait"
+            | "trait_type"
+            | "display_type"
+            | "levels"
+            | "level"
+            | "stats"
+            | "stat"
+    )
+}
+
+fn is_reference_key(key: &str) -> bool {
+    matches!(
+        key,
+        "image"
+            | "image_url"
+            | "image_data"
+            | "animation_url"
+            | "external_url"
+            | "youtube_url"
+            | "asset_url"
+            | "media_url"
+            | "background_image"
+            | "thumbnail"
+            | "uri"
+            | "url"
+    )
+}
+
+fn is_title_key(key: &str) -> bool {
+    matches!(key, "name" | "title" | "token_name")
+}
+
+fn is_description_key(key: &str) -> bool {
+    matches!(
+        key,
+        "description" | "bio" | "story" | "lore" | "summary" | "about"
+    )
+}
+
+fn is_platform_key(key: &str) -> bool {
+    matches!(
+        key,
+        "seller_fee_basis_points"
+            | "fee_recipient"
+            | "royalty"
+            | "royalties"
+            | "creator"
+            | "creators"
+            | "compiler"
+            | "license"
+            | "collection"
+            | "marketplace"
+            | "contract"
+            | "chain"
+    )
+}
 
 fn has_trailing_number_suffix(value: &str) -> bool {
     let normalized = normalize_nfkc(value);
@@ -1450,255 +1741,6 @@ fn has_name_lexical_mutation(seed_norm: &str, value_norm: &str) -> bool {
     score_normalized_name_pair(seed_norm, value_norm) >= 82.0
 }
 
-fn metadata_change_text(value: &str) -> String {
-    let without_assets = ASSET_REF_RE.replace_all(value, " ");
-    URL_RE.replace_all(&without_assets, " ").trim().to_string()
-}
-
-fn media_reference_set(value: &str) -> BTreeSet<String> {
-    ASSET_REF_RE
-        .find_iter(value)
-        .chain(URL_RE.find_iter(value))
-        .filter_map(|m| {
-            let reference = m
-                .as_str()
-                .trim_matches(|ch: char| matches!(ch, '"' | '\'' | ')' | ']' | '}' | ',' | '.'))
-                .to_lowercase();
-            if reference.starts_with("ipfs://")
-                || reference.contains("/ipfs/")
-                || reference.starts_with("qm")
-                || reference.starts_with("bafy")
-                || MEDIA_EXT_RE.is_match(&reference)
-            {
-                Some(reference)
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-fn has_media_reference_changed(seed: &str, value: &str) -> bool {
-    let seed_refs = media_reference_set(seed);
-    let value_refs = media_reference_set(value);
-    !seed_refs.is_empty() && !value_refs.is_empty() && seed_refs != value_refs
-}
-
-fn has_attribute_values_changed(seed: &str, value: &str) -> bool {
-    let seed_norm = normalize_text(seed);
-    let value_norm = normalize_text(value);
-    if seed_norm.is_empty() || value_norm.is_empty() || seed_norm == value_norm {
-        return false;
-    }
-
-    let seed_tokens = metadata_tokens(&seed_norm)
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    let value_tokens = metadata_tokens(&value_norm)
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    if seed_tokens.is_empty() || value_tokens.is_empty() {
-        return false;
-    }
-
-    let shared_template_terms = METADATA_TEMPLATE_TERMS
-        .iter()
-        .filter(|term| seed_tokens.contains(**term) && value_tokens.contains(**term))
-        .count();
-    if shared_template_terms == 0 {
-        return false;
-    }
-
-    let shared_terms = seed_tokens.intersection(&value_tokens).count();
-    let smaller_doc_terms = seed_tokens.len().min(value_tokens.len());
-    let has_seed_only = seed_tokens.difference(&value_tokens).next().is_some();
-    let has_value_only = value_tokens.difference(&seed_tokens).next().is_some();
-    has_seed_only
-        && has_value_only
-        && (shared_template_terms >= 3
-            || (shared_terms >= 1 && shared_terms as f64 / smaller_doc_terms as f64 >= 0.30))
-}
-
-fn has_symbolic_attribute_value_changed(seed: &str, value: &str) -> bool {
-    let seed_norm = normalize_text(seed);
-    let value_norm = normalize_text(value);
-    if seed_norm.is_empty() || value_norm.is_empty() || seed_norm == value_norm {
-        return false;
-    }
-    let seed_terms = metadata_template_term_set(seed);
-    let value_terms = metadata_template_term_set(value);
-    !seed_terms.is_empty()
-        && seed_terms == value_terms
-        && metadata_token_set(seed) == metadata_token_set(value)
-}
-
-fn has_attribute_fields_added_or_removed(seed: &str, value: &str) -> bool {
-    let seed_tokens = metadata_token_set(seed);
-    let value_tokens = metadata_token_set(value);
-    if seed_tokens.is_empty() || value_tokens.is_empty() || seed_tokens == value_tokens {
-        return false;
-    }
-    let seed_terms = metadata_template_term_set(seed);
-    let value_terms = metadata_template_term_set(value);
-    if seed_terms == value_terms {
-        return false;
-    }
-    let shared_description_terms = description_tokens(seed)
-        .intersection(&description_tokens(value))
-        .count();
-    shared_description_terms >= 2
-        && (!seed_terms.is_empty() || !value_terms.is_empty())
-        && seed_tokens.intersection(&value_tokens).count() >= 3
-}
-
-fn metadata_template_term_set(value: &str) -> BTreeSet<&'static str> {
-    let tokens = metadata_tokens(value).into_iter().collect::<BTreeSet<_>>();
-    METADATA_TEMPLATE_TERMS
-        .iter()
-        .copied()
-        .filter(|term| tokens.contains(*term))
-        .collect()
-}
-
-fn has_template_changed(seed: &str, value: &str) -> bool {
-    let seed_terms = metadata_template_term_set(seed);
-    let value_terms = metadata_template_term_set(value);
-    if seed_terms.is_empty() || value_terms.is_empty() {
-        return false;
-    }
-    seed_terms.symmetric_difference(&value_terms).count() >= 1
-}
-
-fn has_template_value_changed(seed: &str, value: &str) -> bool {
-    let seed_norm = normalize_text(seed);
-    let value_norm = normalize_text(value);
-    if seed_norm.is_empty() || value_norm.is_empty() || seed_norm == value_norm {
-        return false;
-    }
-    let shared_template_phrase = ["created by", "series"]
-        .iter()
-        .any(|phrase| seed_norm.contains(phrase) && value_norm.contains(phrase));
-    if shared_template_phrase
-        && metadata_token_set(seed)
-            .intersection(&metadata_token_set(value))
-            .count()
-            >= 4
-    {
-        return true;
-    }
-
-    seed_norm.contains("artist")
-        && value_norm.contains("artist")
-        && seed_norm.contains("interpretation")
-        && value_norm.contains("interpretation")
-}
-
-fn metadata_token_set(value: &str) -> BTreeSet<String> {
-    metadata_tokens(value).into_iter().collect()
-}
-
-fn has_field_wrapper_changed(seed: &str, value: &str) -> bool {
-    let seed_tokens = metadata_token_set(seed);
-    let value_tokens = metadata_token_set(value);
-    if seed_tokens.is_empty() || value_tokens.is_empty() {
-        return false;
-    }
-    let seed_only = seed_tokens.difference(&value_tokens).count();
-    let value_only = value_tokens.difference(&seed_tokens).count();
-    let wrapper_delta = seed_tokens
-        .symmetric_difference(&value_tokens)
-        .any(|token| METADATA_WRAPPER_TERMS.contains(&token.as_str()));
-    wrapper_delta && seed_only.min(value_only) <= 2
-}
-
-fn has_custom_fields_changed(seed: &str, value: &str) -> bool {
-    let seed_tokens = metadata_token_set(seed);
-    let value_tokens = metadata_token_set(value);
-    if seed_tokens.is_empty() || value_tokens.is_empty() {
-        return false;
-    }
-    let shared_custom_terms = CUSTOM_FIELD_TERMS
-        .iter()
-        .filter(|term| seed_tokens.contains(**term) && value_tokens.contains(**term))
-        .count();
-    shared_custom_terms >= 2 && normalize_text(seed) != normalize_text(value)
-}
-
-fn has_short_text_changed(seed: &str, value: &str) -> bool {
-    let seed_tokens = metadata_token_set(seed);
-    let value_tokens = metadata_token_set(value);
-    if seed_tokens.is_empty() || value_tokens.is_empty() {
-        return false;
-    }
-    if !metadata_template_term_set(seed).is_empty()
-        || !metadata_template_term_set(value).is_empty()
-        || has_custom_field_terms(seed)
-        || has_custom_field_terms(value)
-        || has_wrapper_terms(seed)
-        || has_wrapper_terms(value)
-    {
-        return false;
-    }
-    seed_tokens.len() <= 8
-        && value_tokens.len() <= 8
-        && seed_tokens.intersection(&value_tokens).count() >= 1
-        && seed_tokens.difference(&value_tokens).next().is_some()
-        && value_tokens.difference(&seed_tokens).next().is_some()
-}
-
-fn has_wrapper_terms(value: &str) -> bool {
-    let tokens = metadata_token_set(value);
-    METADATA_WRAPPER_TERMS
-        .iter()
-        .any(|term| tokens.contains(*term))
-}
-
-fn has_custom_field_terms(value: &str) -> bool {
-    let tokens = metadata_token_set(value);
-    CUSTOM_FIELD_TERMS.iter().any(|term| tokens.contains(*term))
-}
-
-fn description_tokens(value: &str) -> BTreeSet<String> {
-    metadata_tokens(value)
-        .into_iter()
-        .filter(|token| !METADATA_TEMPLATE_TERMS.contains(&token.as_str()))
-        .filter(|token| !METADATA_WRAPPER_TERMS.contains(&token.as_str()))
-        .filter(|token| !CUSTOM_FIELD_TERMS.contains(&token.as_str()))
-        .filter(|token| !DESCRIPTION_STOP_TERMS.contains(&token.as_str()))
-        .filter(|token| token.chars().any(char::is_alphabetic))
-        .filter(|token| token.len() >= 4)
-        .collect()
-}
-
-fn has_description_changed(seed: &str, value: &str) -> bool {
-    let seed_tokens = description_tokens(seed);
-    let value_tokens = description_tokens(value);
-    if seed_tokens.len() < 3 || value_tokens.len() < 3 {
-        return false;
-    }
-    let shared = seed_tokens.intersection(&value_tokens).count();
-    let seed_only = seed_tokens.difference(&value_tokens).count();
-    let value_only = value_tokens.difference(&seed_tokens).count();
-    shared >= 1 && seed_only >= 2 && value_only >= 2
-}
-
-fn has_description_added(seed: &str, value: &str) -> bool {
-    let seed_tokens = description_tokens(seed);
-    let value_tokens = description_tokens(value);
-    let added = value_tokens.difference(&seed_tokens).count();
-    added >= 4 && (seed_tokens.len() < 4 || added as f64 / seed_tokens.len().max(1) as f64 >= 0.25)
-}
-
-fn has_description_removed(seed: &str, value: &str) -> bool {
-    let seed_tokens = description_tokens(seed);
-    let value_tokens = description_tokens(value);
-    if value_tokens.len() < 4 {
-        return false;
-    }
-    let removed = seed_tokens.difference(&value_tokens).count();
-    removed >= 4 && removed as f64 / value_tokens.len() as f64 >= 0.25
-}
-
 fn modification_summary<'a>(
     reports: impl Iterator<Item = &'a TextComparison>,
     classifier: fn(&str, &str) -> Vec<String>,
@@ -1797,14 +1839,93 @@ fn push_modification_summary(out: &mut String, report: &SampleReport) {
         ),
     );
     out.push_str("\n### Metadata\n\n");
-    push_counts_with_ratios(
-        out,
-        modification_summary(
-            report.seed_reports.iter().map(|seed| &seed.metadata),
-            classify_metadata_modifications,
-        ),
-    );
+    push_metadata_matrix_summary(out, report.seed_reports.iter().map(|seed| &seed.metadata));
     out.push('\n');
+}
+
+fn push_metadata_matrix_summary<'a>(
+    out: &mut String,
+    reports: impl Iterator<Item = &'a TextComparison>,
+) {
+    let mut total = 0usize;
+    let mut matrix = BTreeMap::<(String, String), usize>::new();
+    let mut residual_counts = BTreeMap::<String, usize>::new();
+    for comparison in reports {
+        let values = labeled_matches_for_report(comparison, classify_metadata_modifications);
+        total += values.len();
+        for labeled in values {
+            for label in labeled.labels {
+                if let Some((region, operation)) = label.split_once(':') {
+                    if METADATA_REGIONS.contains(&region)
+                        && METADATA_OPERATIONS.contains(&operation)
+                    {
+                        *matrix
+                            .entry((operation.to_string(), region.to_string()))
+                            .or_default() += 1;
+                    } else {
+                        *residual_counts
+                            .entry(metadata_residual_summary_label(&label).to_string())
+                            .or_default() += 1;
+                    }
+                } else if matches!(label.as_str(), "unparseable_changed" | "metadata_unchanged") {
+                    *residual_counts.entry(label).or_default() += 1;
+                } else {
+                    *residual_counts
+                        .entry(metadata_residual_summary_label(&label).to_string())
+                        .or_default() += 1;
+                }
+            }
+        }
+    }
+
+    let content_total = matrix
+        .iter()
+        .filter(|((_, region), _)| METADATA_CONTENT_REGIONS.contains(&region.as_str()))
+        .map(|(_, count)| *count)
+        .sum::<usize>();
+    let non_content_total = matrix
+        .iter()
+        .filter(|((_, region), _)| METADATA_NON_CONTENT_REGIONS.contains(&region.as_str()))
+        .map(|(_, count)| *count)
+        .sum::<usize>();
+
+    out.push_str(&format!("- total matches: {total}\n"));
+    out.push_str(&format!("- content-bearing changes: {content_total}\n"));
+    out.push_str(&format!(
+        "- non-content-bearing changes: {non_content_total}\n"
+    ));
+    for label in ["unparseable_changed", "metadata_unchanged"] {
+        if let Some(count) = residual_counts.get(label) {
+            out.push_str(&format!("- {label}: {count}\n"));
+        }
+    }
+
+    out.push_str("\n#### Metadata Change Matrix\n\n");
+    out.push_str("| operation |");
+    for region in METADATA_REGIONS {
+        out.push_str(&format!(" {region} |"));
+    }
+    out.push('\n');
+    out.push_str("| --- |");
+    for _ in METADATA_REGIONS {
+        out.push_str(" ---: |");
+    }
+    out.push('\n');
+    for operation in METADATA_OPERATIONS {
+        out.push_str(&format!("| {operation} |"));
+        for region in METADATA_REGIONS {
+            let count = matrix
+                .get(&(operation.to_string(), region.to_string()))
+                .copied()
+                .unwrap_or(0);
+            out.push_str(&format!(" {count} |"));
+        }
+        out.push('\n');
+    }
+}
+
+fn metadata_residual_summary_label(label: &str) -> &str {
+    label
 }
 
 fn push_counts_with_ratios(out: &mut String, summary: (usize, BTreeMap<String, usize>)) {
@@ -1961,8 +2082,12 @@ mod tests {
                     labeled_matches: Vec::new(),
                 },
                 metadata: TextComparison {
-                    seed: "background gold ipfs://seed/image.png".into(),
-                    matches: vec!["background gold ipfs://seed/image.png".into()],
+                    seed: r#"{"description":"background gold","image":"ipfs://seed/image.png"}"#
+                        .into(),
+                    matches: vec![
+                        r#"{"description":"background gold","image":"ipfs://copy/image.png"}"#
+                            .into(),
+                    ],
                     labeled_matches: Vec::new(),
                 },
             }],
@@ -1975,7 +2100,8 @@ mod tests {
         assert!(output.contains("- suffix_augmentation: 1 (50.0%)"));
         assert!(output.contains("- other: 1 (50.0%)"));
         assert!(output.contains("- total matches: 1"));
-        assert!(output.contains("- uri-only: 1 (100.0%)"));
+        assert!(output.contains("#### Metadata Change Matrix"));
+        assert!(output.contains("| replaced | 0 | 0 | 0 | 1 | 0 | 0 | 0 |"));
         assert!(!output.contains("- asset_pointer_reuse:"));
         assert!(!output.contains("- trait_schema_reuse:"));
         assert!(!output.contains("1/2"));
@@ -2067,132 +2193,6 @@ mod tests {
         let labels = classify_name_modifications("PudgyPenguins", "Pudgy Penguin #1839");
 
         assert!(labels.contains(&"suffix_augmentation".to_string()));
-    }
-
-    #[test]
-    fn metadata_labels_describe_changes_not_reuse() {
-        assert_eq!(
-            classify_metadata_modifications(
-                "background gold ipfs://seed/image.png",
-                "background red ipfs://copy/image.png"
-            ),
-            vec!["media_reference_changed", "attribute_value_changed"]
-        );
-        assert_eq!(
-            classify_metadata_modifications(
-                "background gold",
-                "background gold ipfs://copy/image.png"
-            ),
-            vec!["uri-only"]
-        );
-        assert_eq!(
-            classify_metadata_modifications(
-                "background gold ipfs://seed/image.png",
-                "background gold"
-            ),
-            vec!["uri-only"]
-        );
-    }
-
-    #[test]
-    fn metadata_distinguishes_template_changes_from_attribute_value_changes() {
-        assert_eq!(
-            classify_metadata_modifications(
-                "background yellow fur dark brown eyes wide",
-                "background red fur golden eyes bored"
-            ),
-            vec!["attribute_value_changed"]
-        );
-        assert_eq!(
-            classify_metadata_modifications(
-                "background yellow fur dark brown eyes wide",
-                "background yellow fur dark brown legs cream item phone"
-            ),
-            vec!["attribute_value_changed"]
-        );
-    }
-
-    #[test]
-    fn metadata_other_examples_map_to_broad_change_classes() {
-        assert_eq!(
-            classify_metadata_modifications(
-                "this artwork may or may not be notable.",
-                "artist thenftstudio this artwork may or may not be notable."
-            ),
-            vec!["metadata_structure_changed"]
-        );
-        assert_eq!(
-            classify_metadata_modifications(
-                "stage 2 type human captainz",
-                "stage 1 type human baby captainz"
-            ),
-            vec!["attribute_value_changed"]
-        );
-        assert_eq!(
-            classify_metadata_modifications("guzzler by xcopy", "afterburn by xcopy"),
-            vec!["title_or_short_text_changed"]
-        );
-    }
-
-    #[test]
-    fn metadata_labels_description_text_changes_from_current_examples() {
-        assert_eq!(
-            classify_metadata_modifications(
-                "background yellow fur dark brown",
-                "background yellow fur dark brown a homage to mayc not affiliated created for holders"
-            ),
-            vec!["descriptive_text_changed"]
-        );
-        assert_eq!(
-            classify_metadata_modifications(
-                "rarity spectacular token benefit admission edition character this token has been redeemed for a ticket to veecon",
-                "rarity very rare token benefit admission edition character this token is verifiable for admission to veecon"
-            ),
-            vec!["attribute_value_changed", "descriptive_text_changed"]
-        );
-        assert_eq!(
-            classify_metadata_modifications(
-                "background m1 yellow fur m1 pink eyes m1 blindfold",
-                "background m1 army green 9% have this trait fur m1 dark brown 10% have this trait eyes m1 crazy 3% have this trait"
-            ),
-            vec!["attribute_value_changed", "descriptive_text_changed"]
-        );
-    }
-
-    #[test]
-    fn metadata_uses_paper_level_non_overlapping_change_labels() {
-        assert_eq!(
-            classify_metadata_modifications(
-                "background yellow fur dark brown eyes wide",
-                "background yellow fur dark brown legs cream item phone"
-            ),
-            vec!["attribute_value_changed"]
-        );
-        assert_eq!(
-            classify_metadata_modifications(
-                "this artwork may or may not be notable.",
-                "artist thenftstudio this artwork may or may not be notable."
-            ),
-            vec!["metadata_structure_changed"]
-        );
-        assert_eq!(
-            classify_metadata_modifications("guzzler by xcopy", "afterburn by xcopy"),
-            vec!["title_or_short_text_changed"]
-        );
-        assert_eq!(
-            classify_metadata_modifications(
-                "stage 2 type human captainz",
-                "stage 1 type human baby captainz"
-            ),
-            vec!["attribute_value_changed"]
-        );
-        assert_eq!(
-            classify_metadata_modifications(
-                "background m1 yellow fur m1 pink eyes m1 blindfold",
-                "background m1 army green 9% have this trait fur m1 dark brown 10% have this trait eyes m1 crazy 3% have this trait"
-            ),
-            vec!["attribute_value_changed", "descriptive_text_changed"]
-        );
     }
 
     #[test]
@@ -2319,40 +2319,210 @@ mod tests {
     }
 
     #[test]
-    fn metadata_structured_template_changes_label_attribute_value_changed() {
-        let seed = "category spirit sediment biogenic swamp number sediment tier environment steppes number environment tier eastern resource whisper number eastern resource tier southern resource lumileaf number southern resource tier northern resource moldium number northern resource tier plot";
-        let value = "category decay sediment chemical goo number sediment tier environment bog number environment tier southern resource whisper number southern resource tier western resource spikeweed number western resource tier number plot obelisk piece first trip";
+    fn metadata_json_diff_labels_are_path_based_region_operations() {
+        let seed = r#"{
+            "name":"Seed #1",
+            "description":"Original story",
+            "image":"ipfs://seed-image",
+            "external_url":"https://seed.example",
+            "attributes":[
+                {"trait_type":"Background","value":"Blue"},
+                {"trait_type":"Eyes","value":"Open"}
+            ],
+            "seller_fee_basis_points":500
+        }"#;
+        let value = r#"{
+            "name":"Seed #404",
+            "description":"Copied story",
+            "image":"ipfs://copy-image",
+            "external_url":"https://copy.example",
+            "attributes":[
+                {"trait_type":"Background","value":"Red"},
+                {"trait_type":"Eyes","value":"Open"},
+                {"trait_type":"Hat","value":"Cap"}
+            ],
+            "seller_fee_basis_points":750
+        }"#;
 
         let labels = classify_metadata_modifications(seed, value);
 
-        assert!(labels.contains(&"attribute_value_changed".to_string()));
-        assert!(!labels.contains(&"other".to_string()));
+        assert!(labels.contains(&"title:replaced".to_string()));
+        assert!(labels.contains(&"description:replaced".to_string()));
+        assert!(labels.contains(&"references:replaced".to_string()));
+        assert!(labels.contains(&"attributes:added".to_string()));
+        assert!(labels.contains(&"attributes:replaced".to_string()));
+        assert!(labels.contains(&"platform_fields:replaced".to_string()));
+        assert!(!labels.iter().any(|label| label.starts_with("other")));
     }
 
     #[test]
-    fn metadata_other_examples_map_to_paper_level_categories() {
-        let labels = classify_metadata_modifications(
-            "this is an artwork for interleave created by dirtyrobot. https://arweave.net/interleave/dirtyrobot_interleave_artwork.jpg",
-            "this is an artwork for interleave created by jack butcher. https://arweave.net/interleave/jack_butcher_interleave_artwork.mp4",
-        );
-        assert!(labels.contains(&"template_value_changed".to_string()));
-        assert!(labels.contains(&"media_reference_changed".to_string()));
-        assert!(!labels.contains(&"other".to_string()));
+    fn metadata_json_diff_detects_narrow_structure_and_reordered_changes() {
+        let seed = r#"{"attributes":[{"trait_type":"A","value":"1"},{"trait_type":"B","value":"2"}],"metadata":{"image":"ipfs://seed"}}"#;
+        let value = r#"{"attributes":[{"trait_type":"B","value":"2"},{"trait_type":"A","value":"1"}],"metadata":[{"image":"ipfs://seed"}]}"#;
 
-        let labels = classify_metadata_modifications(
-            "tier ✦✦✦ https://elementals-metadata.azuki.com/mystery-bean/0 https://elementals-images.azuki.com/3.gif",
-            "tier ✦ https://elementals-metadata.azuki.com/mystery-bean/7100 https://elementals-images.azuki.com/1.gif",
-        );
-        assert!(labels.contains(&"attribute_value_changed".to_string()));
-        assert!(labels.contains(&"media_reference_changed".to_string()));
-        assert!(!labels.contains(&"other".to_string()));
+        let labels = classify_metadata_modifications(seed, value);
 
-        let labels = classify_metadata_modifications(
-            "this artwork may or may not be notable. ipfs://bafkreicjj7ksr3nau676datyren2kuiiiwpgbn4pwcbzia4sn7cbjrtkc4",
-            "color band twenty this artwork may or may not be notable. ipfs://bafybeicorfimu5v3xjqce4fbfl2b667bjbiee6dm2wk37rkjkhgd7carqq",
+        assert!(labels.contains(&"attributes:reordered".to_string()));
+        assert!(labels.contains(&"structure:replaced".to_string()));
+    }
+
+    #[test]
+    fn metadata_wrapper_added_or_removed_counts_as_structure() {
+        let added = classify_metadata_modifications(
+            r#"{"name":"Seed"}"#,
+            r#"{"metadata":{"name":"Seed"}}"#,
         );
-        assert!(labels.contains(&"attribute_value_changed".to_string()));
-        assert!(!labels.contains(&"other".to_string()));
+        let removed = classify_metadata_modifications(
+            r#"{"rawmetadata":{"name":"Seed"}}"#,
+            r#"{"name":"Seed"}"#,
+        );
+
+        assert_eq!(added, vec!["structure:added"]);
+        assert_eq!(removed, vec!["structure:removed"]);
+    }
+
+    #[test]
+    fn metadata_wrapper_transform_with_sibling_fields_does_not_emit_false_removals() {
+        let added = classify_metadata_modifications(
+            r#"{"name":"Seed"}"#,
+            r#"{"metadata":{"name":"Seed"},"compiler":"copybot"}"#,
+        );
+        let removed = classify_metadata_modifications(
+            r#"{"rawmetadata":{"name":"Seed"},"compiler":"copybot"}"#,
+            r#"{"name":"Seed"}"#,
+        );
+
+        assert_eq!(
+            added,
+            vec![
+                "platform_fields:added".to_string(),
+                "structure:added".to_string()
+            ]
+        );
+        assert_eq!(
+            removed,
+            vec![
+                "platform_fields:removed".to_string(),
+                "structure:removed".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn metadata_structure_changed_does_not_swallow_semantic_field_type_changes() {
+        let labels = classify_metadata_modifications(
+            r#"{"image":"ipfs://seed","attributes":[{"trait_type":"A","value":"1"}]}"#,
+            r#"{"image":["ipfs://copy"],"attributes":{"A":"1"}}"#,
+        );
+
+        assert!(labels.contains(&"references:replaced".to_string()));
+        assert!(labels.contains(&"attributes:replaced".to_string()));
+        assert!(!labels.contains(&"structure:replaced".to_string()));
+    }
+
+    #[test]
+    fn metadata_region_rules_are_parent_anchored_and_non_overlapping() {
+        let labels = classify_metadata_modifications(
+            r#"{"collection":{"name":"Seed Collection"},"attributes":[{"trait_type":"Image","image":"ipfs://seed"}]}"#,
+            r#"{"collection":{"name":"Copy Collection"},"attributes":[{"trait_type":"Image","image":"ipfs://copy"}]}"#,
+        );
+
+        assert_eq!(
+            labels,
+            vec![
+                "attributes:replaced".to_string(),
+                "platform_fields:replaced".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn metadata_attribute_array_insertions_are_matched_by_trait_type() {
+        let labels = classify_metadata_modifications(
+            r#"{"attributes":[{"trait_type":"Background","value":"Blue"},{"trait_type":"Eyes","value":"Open"}]}"#,
+            r#"{"attributes":[{"trait_type":"Hat","value":"Cap"},{"trait_type":"Background","value":"Blue"},{"trait_type":"Eyes","value":"Open"}]}"#,
+        );
+
+        assert_eq!(labels, vec!["attributes:added"]);
+    }
+
+    #[test]
+    fn metadata_attribute_array_reorder_is_counted_with_content_changes() {
+        let labels = classify_metadata_modifications(
+            r#"{"attributes":[{"trait_type":"Background","value":"Blue"},{"trait_type":"Eyes","value":"Open"},{"trait_type":"Mouth","value":"Smile"}]}"#,
+            r#"{"attributes":[{"trait_type":"Eyes","value":"Closed"},{"trait_type":"Background","value":"Blue"},{"trait_type":"Mouth","value":"Smile"}]}"#,
+        );
+
+        assert!(labels.contains(&"attributes:reordered".to_string()));
+        assert!(labels.contains(&"attributes:replaced".to_string()));
+    }
+
+    #[test]
+    fn metadata_unknown_json_paths_are_auxiliary_fields_not_other() {
+        let labels =
+            classify_metadata_modifications(r#"{"artist":"alice"}"#, r#"{"artist":"bob"}"#);
+
+        assert_eq!(labels, vec!["auxiliary_fields:replaced"]);
+    }
+
+    #[test]
+    fn metadata_reference_region_is_path_based_not_value_based() {
+        let labels = classify_metadata_modifications(
+            r#"{"artist":"https://seed.example"}"#,
+            r#"{"artist":"https://copy.example"}"#,
+        );
+
+        assert_eq!(labels, vec!["auxiliary_fields:replaced"]);
+    }
+
+    #[test]
+    fn metadata_unparseable_is_not_other() {
+        let labels =
+            classify_metadata_modifications(r#"{"name":"Seed"}"#, "not valid json metadata");
+
+        assert_eq!(labels, vec!["unparseable_changed"]);
+    }
+
+    #[test]
+    fn metadata_non_json_inputs_do_not_use_text_similarity_labels() {
+        assert_eq!(
+            classify_metadata_modifications(
+                "background gold ipfs://seed/image.png",
+                "background red ipfs://copy/image.png"
+            ),
+            vec!["unparseable_changed"]
+        );
+        assert_eq!(
+            classify_metadata_modifications("background gold", "background gold"),
+            vec!["metadata_unchanged"]
+        );
+    }
+
+    #[test]
+    fn metadata_summary_uses_operation_region_matrix_and_group_totals() {
+        let report = SampleReport {
+            chain: "ethereum".into(),
+            seed_reports: vec![SeedSampleReport {
+                name: TextComparison::default(),
+                metadata: TextComparison {
+                    seed: r#"{"name":"Seed","image":"ipfs://seed","seller_fee_basis_points":500}"#
+                        .into(),
+                    matches: vec![
+                        r#"{"name":"Copy","image":"ipfs://copy","seller_fee_basis_points":750}"#
+                            .into(),
+                    ],
+                    labeled_matches: Vec::new(),
+                },
+            }],
+        };
+
+        let output = render_markdown_report(&report);
+
+        assert!(output.contains("#### Metadata Change Matrix"));
+        assert!(output.contains("| operation | title | description | attributes | references | auxiliary_fields | platform_fields | structure |"));
+        assert!(output.contains("| replaced | 1 | 0 | 0 | 1 | 0 | 1 | 0 |"));
+        assert!(output.contains("- content-bearing changes: 2"));
+        assert!(output.contains("- non-content-bearing changes: 1"));
     }
 
     #[test]
