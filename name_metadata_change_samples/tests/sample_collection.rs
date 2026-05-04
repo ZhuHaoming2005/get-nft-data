@@ -159,12 +159,12 @@ fn collect_samples_outputs_split_name_and_metadata_text_only() {
     let output = fs::read_to_string(output_path).unwrap();
     assert!(output.contains("## Modification Summary"));
     assert!(output.contains("- exact_clone: 1"));
-    assert!(output.contains("- exact_metadata_clone: 1"));
+    assert!(output.contains("- uri-only: 1"));
     assert!(output.contains("## Name Matches"));
     assert!(output.contains("- seed: Azuki #1"));
     assert!(output.contains("[exact_clone] Azuki #1"));
     assert!(output.contains("## Metadata Matches"));
-    assert!(output.contains("- match labels: exact_metadata_clone"));
+    assert!(output.contains("- match labels: uri-only"));
     assert!(output.contains("gold dragon red background"));
     assert!(!output.contains("0xseed"));
     assert!(!output.contains("0xname"));

@@ -25,13 +25,31 @@ static TRAILING_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
         Regex::new(r"\s+No\.?\s*\d+\s*$").unwrap(),
         Regex::new(r"\s+nr\.?\s*\d+\s*$").unwrap(),
         Regex::new(r"\s+\d{1,12}\s*$").unwrap(),
+        Regex::new(r"\s*(?:404|420|777|888|999)\s*$").unwrap(),
+        Regex::new(r"\s*(?:v|version)\s*\d+\s*$").unwrap(),
+        Regex::new(r"\s*\d+\.0\s*$").unwrap(),
+        Regex::new(r"\s*(?:gen|generation)\s*\d+\s*$").unwrap(),
     ]
 });
+static ATTACHED_TRAILING_NUMBER_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)([\p{L}])\d{1,6}\s*$").unwrap());
 static WHITESPACE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
 static TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\p{L}\p{N}_]+").unwrap());
 static ASSET_REF_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)(ipfs://[^\s]+|https?://[^\s]*ipfs[^\s]+|\bqm[1-9a-hj-np-z]{20,}\b|\bbafy[a-z2-7]{20,}\b)")
         .unwrap()
+});
+static URL_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?i)https?://[^\s"')<>\]]+"#).unwrap());
+static MEDIA_EXT_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\.(?:png|jpe?g|gif|svg|webp|mp4|webm)(?:\b|[/?#])").unwrap());
+static DERIVATIVE_SUFFIX_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"(?i)(?:\.fun|x)\s*$").unwrap(),
+        Regex::new(
+            r"(?i)(?:\s|[-_.])(?:official|nft|club|dao|pass|mint|claim|free|vip|collection|edition|clone|copy|reloaded|remastered|alpha|beta)\s*$",
+        )
+        .unwrap(),
+    ]
 });
 
 const METADATA_BM25_K1: f64 = 1.2;
@@ -782,6 +800,16 @@ fn strip_trailing_number_suffix(raw: &str) -> String {
                 break;
             }
         }
+        if !changed {
+            let updated = ATTACHED_TRAILING_NUMBER_RE
+                .replace(&text, "$1")
+                .trim()
+                .to_string();
+            if updated != text {
+                text = updated;
+                changed = true;
+            }
+        }
     }
     WHITESPACE_RE.replace_all(&text, " ").trim().to_string()
 }
@@ -1134,45 +1162,30 @@ fn classify_name_modifications(seed: &str, value: &str) -> Vec<String> {
     let mut labels = Vec::new();
     let seed_trimmed = seed.trim();
     let value_trimmed = value.trim();
-    let seed_lower = normalize_nfkc(seed_trimmed).to_lowercase();
-    let value_lower = normalize_nfkc(value_trimmed).to_lowercase();
-    let seed_compact = WHITESPACE_RE.replace_all(&seed_lower, "").to_string();
-    let value_compact = WHITESPACE_RE.replace_all(&value_lower, "").to_string();
     let seed_norm = normalize_name(seed_trimmed);
     let value_norm = normalize_name(value_trimmed);
 
     if seed_trimmed == value_trimmed && !seed_trimmed.is_empty() {
-        labels.push("exact_clone");
+        return vec!["exact_clone".to_string()];
     }
-    if seed_lower == value_lower && seed_trimmed != value_trimmed {
-        labels.push("case_change");
+    let suffix_augmented =
+        has_suffix_augmentation(seed_trimmed, value_trimmed, &seed_norm, &value_norm);
+    if suffix_augmented {
+        labels.push("suffix_augmentation");
     }
-    if seed_compact == value_compact && seed_lower != value_lower {
-        labels.push("spacing_change");
+    if has_name_format_perturbation(seed_trimmed, value_trimmed) {
+        labels.push("format_perturbation");
     }
-    if value_trimmed.chars().any(should_render_as_codepoint) {
-        labels.push("invisible_unicode");
-    }
-    if normalize_nfkc(value_trimmed) != value_trimmed {
-        labels.push("unicode_compatibility");
-    }
-    if seed_norm == value_norm
-        && seed_trimmed != value_trimmed
-        && (has_trailing_number_suffix(seed_trimmed) || has_trailing_number_suffix(value_trimmed))
-    {
-        labels.push("token_number_suffix");
-    }
-    if has_derivative_suffix(value_trimmed) {
-        labels.push("derivative_suffix");
-    }
-    if has_inserted_ai_marker(seed_trimmed, value_trimmed) {
-        labels.push("ai_marker");
-    }
-    if labels.is_empty()
-        && score_normalized_name_pair(&seed_norm, &value_norm) >= 90.0
-        && seed_norm != value_norm
-    {
-        labels.push("homoglyph_or_typo");
+    let seed_lexical_raw = strip_raw_trailing_number_suffix(seed_trimmed);
+    let value_lexical_raw = if suffix_augmented {
+        strip_raw_augmentation_suffix(value_trimmed)
+    } else {
+        strip_raw_trailing_number_suffix(value_trimmed)
+    };
+    let seed_lexical_core = canonical_format_name(&seed_lexical_raw);
+    let value_lexical_core = canonical_format_name(&value_lexical_raw);
+    if has_name_lexical_mutation(&seed_lexical_core, &value_lexical_core) {
+        labels.push("lexical_mutation");
     }
     if labels.is_empty() {
         labels.push("other");
@@ -1182,50 +1195,47 @@ fn classify_name_modifications(seed: &str, value: &str) -> Vec<String> {
 
 fn classify_metadata_modifications(seed: &str, value: &str) -> Vec<String> {
     let mut labels = Vec::new();
-    if normalize_text(seed) == normalize_text(value) && !value.trim().is_empty() {
-        labels.push("exact_metadata_clone");
+    let seed_text = metadata_change_text(seed);
+    let value_text = metadata_change_text(value);
+    let seed_norm = normalize_text(&seed_text);
+    let value_norm = normalize_text(&value_text);
+    if seed_norm == value_norm && !value.trim().is_empty() {
+        labels.push("uri-only");
+        return labels.into_iter().map(str::to_string).collect();
     }
-    if !shared_asset_refs(seed, value).is_empty() {
-        labels.push("asset_pointer_reuse");
-    } else if !asset_refs(value).is_empty() {
-        labels.push("asset_pointer_present");
+
+    if has_media_reference_changed(seed, value) {
+        labels.push("media_reference_changed");
     }
-    if has_shared_terms(seed, value, TRAIT_SCHEMA_TERMS) {
-        labels.push("trait_schema_reuse");
+    if has_template_value_changed(&seed_text, &value_text) {
+        labels.push("template_value_changed");
     }
-    if has_shared_terms(seed, value, COLLECTION_TERMS) {
-        labels.push("collection_terms_reuse");
+    if has_template_changed(&seed_text, &value_text)
+        || has_attribute_values_changed(&seed_text, &value_text)
+        || has_symbolic_attribute_value_changed(&seed_text, &value_text)
+        || has_attribute_fields_added_or_removed(&seed_text, &value_text)
+        || has_custom_fields_changed(&seed_text, &value_text)
+    {
+        labels.push("attribute_value_changed");
     }
-    if has_metadata_template_reuse(seed, value) {
-        labels.push("metadata_template_reuse");
+    if has_field_wrapper_changed(&seed_text, &value_text) {
+        labels.push("metadata_structure_changed");
     }
-    let value_lower = normalize_text(value);
-    if value_lower.contains("trait") && value_lower.contains('%') {
-        labels.push("rarity_text_added");
+    if has_short_text_changed(&seed_text, &value_text) {
+        labels.push("title_or_short_text_changed");
     }
+    if has_description_changed(&seed_text, &value_text)
+        || has_description_added(&seed_text, &value_text)
+        || has_description_removed(&seed_text, &value_text)
+    {
+        labels.push("descriptive_text_changed");
+    }
+
     if labels.is_empty() {
         labels.push("other");
     }
     labels.into_iter().map(str::to_string).collect()
 }
-
-const TRAIT_SCHEMA_TERMS: &[&str] = &[
-    "attribute",
-    "attributes",
-    "background",
-    "clothes",
-    "eyes",
-    "fur",
-    "hat",
-    "headwear",
-    "mouth",
-    "trait",
-];
-
-const COLLECTION_TERMS: &[&str] = &[
-    "ape", "azuki", "bayc", "beanz", "bored", "cool", "doodle", "milady", "mooncat", "mutant",
-    "pudgy",
-];
 
 const METADATA_TEMPLATE_TERMS: &[&str] = &[
     "admission",
@@ -1248,6 +1258,10 @@ const METADATA_TEMPLATE_TERMS: &[&str] = &[
     "hair",
     "hat",
     "head",
+    "hand",
+    "item",
+    "left",
+    "legs",
     "mouth",
     "number",
     "pants",
@@ -1259,9 +1273,56 @@ const METADATA_TEMPLATE_TERMS: &[&str] = &[
     "shoes",
     "skin",
     "style",
+    "right",
     "tier",
     "token",
     "type",
+];
+
+const DESCRIPTION_STOP_TERMS: &[&str] = &[
+    "and", "for", "from", "has", "have", "into", "not", "that", "the", "this", "with", "your",
+];
+
+const METADATA_WRAPPER_TERMS: &[&str] = &[
+    "artist",
+    "attributes",
+    "column",
+    "description",
+    "metadata",
+    "string",
+    "text",
+    "url",
+];
+
+const CUSTOM_FIELD_TERMS: &[&str] = &[
+    "action",
+    "affinity",
+    "airdrop",
+    "attendee",
+    "card",
+    "class",
+    "created",
+    "date",
+    "day",
+    "edition",
+    "faction",
+    "filing",
+    "insured",
+    "membership",
+    "month",
+    "observation",
+    "period",
+    "place",
+    "pose",
+    "power",
+    "skill",
+    "skills",
+    "stage",
+    "taxpayer",
+    "technique",
+    "tier",
+    "type",
+    "year",
 ];
 
 fn has_trailing_number_suffix(value: &str) -> bool {
@@ -1269,49 +1330,161 @@ fn has_trailing_number_suffix(value: &str) -> bool {
     TRAILING_PATTERNS
         .iter()
         .any(|pattern| pattern.is_match(&normalized))
+        || ATTACHED_TRAILING_NUMBER_RE.is_match(&normalized)
 }
 
 fn has_derivative_suffix(value: &str) -> bool {
-    let value = normalize_nfkc(value).to_lowercase();
-    value.ends_with("404")
-        || value.ends_with("v2")
-        || value.ends_with(".fun")
-        || value.ends_with('x')
+    let value = normalize_nfkc(value);
+    DERIVATIVE_SUFFIX_PATTERNS
+        .iter()
+        .any(|pattern| pattern.is_match(&value))
 }
 
-fn has_inserted_ai_marker(seed: &str, value: &str) -> bool {
-    !normalize_nfkc(seed).to_lowercase().contains("ai")
-        && normalize_nfkc(value).to_lowercase().contains("ai")
+fn has_suffix_augmentation(seed: &str, value: &str, seed_norm: &str, value_norm: &str) -> bool {
+    if has_derivative_suffix(value) {
+        let stripped_value = strip_raw_augmentation_suffix(value);
+        return canonical_format_name(seed) == canonical_format_name(&stripped_value);
+    }
+
+    let seed_has_numeric_suffix = has_trailing_number_suffix(seed);
+    let value_has_numeric_suffix = has_trailing_number_suffix(value);
+    if !seed_has_numeric_suffix && !value_has_numeric_suffix {
+        return false;
+    }
+    if seed_norm == value_norm && seed != value {
+        return true;
+    }
+    if !value_has_numeric_suffix {
+        return false;
+    }
+
+    has_related_name_core(seed, &strip_raw_trailing_number_suffix(value))
 }
 
-fn asset_refs(value: &str) -> BTreeSet<String> {
+fn has_related_name_core(seed: &str, value: &str) -> bool {
+    let seed_core = strip_raw_augmentation_suffix(seed);
+    let value_core = strip_raw_augmentation_suffix(value);
+    let seed_core_norm = normalize_name(&seed_core);
+    let value_core_norm = normalize_name(&value_core);
+    if seed_core_norm.is_empty() || value_core_norm.is_empty() {
+        return false;
+    }
+    seed_core_norm == value_core_norm
+        || canonical_format_name(&seed_core) == canonical_format_name(&value_core)
+        || has_name_lexical_mutation(&seed_core_norm, &value_core_norm)
+}
+
+fn canonical_format_name(value: &str) -> String {
+    normalize_nfkc(value)
+        .to_lowercase()
+        .chars()
+        .filter(|ch| !is_name_format_separator(*ch))
+        .collect()
+}
+
+fn is_name_format_separator(ch: char) -> bool {
+    ch.is_whitespace()
+        || should_render_as_codepoint(ch)
+        || matches!(ch, '-' | '_' | '.' | ':' | '：' | '/' | '\\' | '|')
+}
+
+fn has_name_format_perturbation(seed: &str, value: &str) -> bool {
+    let seed_core = strip_raw_trailing_number_suffix(seed);
+    let value_core = strip_raw_trailing_number_suffix(value);
+    seed_core != value_core
+        && canonical_format_name(&seed_core) == canonical_format_name(&value_core)
+}
+
+fn strip_raw_trailing_number_suffix(raw: &str) -> String {
+    let mut text = raw.trim().to_string();
+    loop {
+        let mut changed = false;
+        for pattern in TRAILING_PATTERNS.iter() {
+            let updated = pattern.replace(&text, "").trim().to_string();
+            if updated != text {
+                text = updated;
+                changed = true;
+                break;
+            }
+        }
+        if !changed {
+            let updated = ATTACHED_TRAILING_NUMBER_RE
+                .replace(&text, "$1")
+                .trim()
+                .to_string();
+            if updated != text {
+                text = updated;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    text
+}
+
+fn strip_raw_augmentation_suffix(raw: &str) -> String {
+    let mut text = strip_raw_trailing_number_suffix(raw);
+    loop {
+        let mut changed = false;
+        for pattern in DERIVATIVE_SUFFIX_PATTERNS.iter() {
+            let updated = pattern.replace(&text, "").trim().to_string();
+            if updated != text {
+                text = updated;
+                changed = true;
+                break;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    text
+}
+
+fn has_name_lexical_mutation(seed_norm: &str, value_norm: &str) -> bool {
+    if seed_norm.is_empty() || value_norm.is_empty() || seed_norm == value_norm {
+        return false;
+    }
+    score_normalized_name_pair(seed_norm, value_norm) >= 82.0
+}
+
+fn metadata_change_text(value: &str) -> String {
+    let without_assets = ASSET_REF_RE.replace_all(value, " ");
+    URL_RE.replace_all(&without_assets, " ").trim().to_string()
+}
+
+fn media_reference_set(value: &str) -> BTreeSet<String> {
     ASSET_REF_RE
         .find_iter(value)
-        .map(|m| {
-            m.as_str()
-                .trim_matches(|ch| ch == '"' || ch == '\'')
-                .to_lowercase()
+        .chain(URL_RE.find_iter(value))
+        .filter_map(|m| {
+            let reference = m
+                .as_str()
+                .trim_matches(|ch: char| matches!(ch, '"' | '\'' | ')' | ']' | '}' | ',' | '.'))
+                .to_lowercase();
+            if reference.starts_with("ipfs://")
+                || reference.contains("/ipfs/")
+                || reference.starts_with("qm")
+                || reference.starts_with("bafy")
+                || MEDIA_EXT_RE.is_match(&reference)
+            {
+                Some(reference)
+            } else {
+                None
+            }
         })
         .collect()
 }
 
-fn shared_asset_refs(seed: &str, value: &str) -> BTreeSet<String> {
-    let seed_refs = asset_refs(seed);
-    asset_refs(value)
-        .into_iter()
-        .filter(|reference| seed_refs.contains(reference))
-        .collect()
+fn has_media_reference_changed(seed: &str, value: &str) -> bool {
+    let seed_refs = media_reference_set(seed);
+    let value_refs = media_reference_set(value);
+    !seed_refs.is_empty() && !value_refs.is_empty() && seed_refs != value_refs
 }
 
-fn has_shared_terms(seed: &str, value: &str, terms: &[&str]) -> bool {
-    let seed_tokens = metadata_tokens(seed).into_iter().collect::<BTreeSet<_>>();
-    let value_tokens = metadata_tokens(value).into_iter().collect::<BTreeSet<_>>();
-    terms
-        .iter()
-        .any(|term| seed_tokens.contains(*term) && value_tokens.contains(*term))
-}
-
-fn has_metadata_template_reuse(seed: &str, value: &str) -> bool {
+fn has_attribute_values_changed(seed: &str, value: &str) -> bool {
     let seed_norm = normalize_text(seed);
     let value_norm = normalize_text(value);
     if seed_norm.is_empty() || value_norm.is_empty() || seed_norm == value_norm {
@@ -1332,15 +1505,198 @@ fn has_metadata_template_reuse(seed: &str, value: &str) -> bool {
         .iter()
         .filter(|term| seed_tokens.contains(**term) && value_tokens.contains(**term))
         .count();
-    if shared_template_terms >= 3 {
-        return true;
+    if shared_template_terms == 0 {
+        return false;
     }
 
     let shared_terms = seed_tokens.intersection(&value_tokens).count();
     let smaller_doc_terms = seed_tokens.len().min(value_tokens.len());
-    shared_template_terms >= 1
-        && shared_terms >= 8
-        && shared_terms as f64 / smaller_doc_terms as f64 >= 0.35
+    let has_seed_only = seed_tokens.difference(&value_tokens).next().is_some();
+    let has_value_only = value_tokens.difference(&seed_tokens).next().is_some();
+    has_seed_only
+        && has_value_only
+        && (shared_template_terms >= 3
+            || (shared_terms >= 1 && shared_terms as f64 / smaller_doc_terms as f64 >= 0.30))
+}
+
+fn has_symbolic_attribute_value_changed(seed: &str, value: &str) -> bool {
+    let seed_norm = normalize_text(seed);
+    let value_norm = normalize_text(value);
+    if seed_norm.is_empty() || value_norm.is_empty() || seed_norm == value_norm {
+        return false;
+    }
+    let seed_terms = metadata_template_term_set(seed);
+    let value_terms = metadata_template_term_set(value);
+    !seed_terms.is_empty()
+        && seed_terms == value_terms
+        && metadata_token_set(seed) == metadata_token_set(value)
+}
+
+fn has_attribute_fields_added_or_removed(seed: &str, value: &str) -> bool {
+    let seed_tokens = metadata_token_set(seed);
+    let value_tokens = metadata_token_set(value);
+    if seed_tokens.is_empty() || value_tokens.is_empty() || seed_tokens == value_tokens {
+        return false;
+    }
+    let seed_terms = metadata_template_term_set(seed);
+    let value_terms = metadata_template_term_set(value);
+    if seed_terms == value_terms {
+        return false;
+    }
+    let shared_description_terms = description_tokens(seed)
+        .intersection(&description_tokens(value))
+        .count();
+    shared_description_terms >= 2
+        && (!seed_terms.is_empty() || !value_terms.is_empty())
+        && seed_tokens.intersection(&value_tokens).count() >= 3
+}
+
+fn metadata_template_term_set(value: &str) -> BTreeSet<&'static str> {
+    let tokens = metadata_tokens(value).into_iter().collect::<BTreeSet<_>>();
+    METADATA_TEMPLATE_TERMS
+        .iter()
+        .copied()
+        .filter(|term| tokens.contains(*term))
+        .collect()
+}
+
+fn has_template_changed(seed: &str, value: &str) -> bool {
+    let seed_terms = metadata_template_term_set(seed);
+    let value_terms = metadata_template_term_set(value);
+    if seed_terms.is_empty() || value_terms.is_empty() {
+        return false;
+    }
+    seed_terms.symmetric_difference(&value_terms).count() >= 1
+}
+
+fn has_template_value_changed(seed: &str, value: &str) -> bool {
+    let seed_norm = normalize_text(seed);
+    let value_norm = normalize_text(value);
+    if seed_norm.is_empty() || value_norm.is_empty() || seed_norm == value_norm {
+        return false;
+    }
+    let shared_template_phrase = ["created by", "series"]
+        .iter()
+        .any(|phrase| seed_norm.contains(phrase) && value_norm.contains(phrase));
+    if shared_template_phrase
+        && metadata_token_set(seed)
+            .intersection(&metadata_token_set(value))
+            .count()
+            >= 4
+    {
+        return true;
+    }
+
+    seed_norm.contains("artist")
+        && value_norm.contains("artist")
+        && seed_norm.contains("interpretation")
+        && value_norm.contains("interpretation")
+}
+
+fn metadata_token_set(value: &str) -> BTreeSet<String> {
+    metadata_tokens(value).into_iter().collect()
+}
+
+fn has_field_wrapper_changed(seed: &str, value: &str) -> bool {
+    let seed_tokens = metadata_token_set(seed);
+    let value_tokens = metadata_token_set(value);
+    if seed_tokens.is_empty() || value_tokens.is_empty() {
+        return false;
+    }
+    let seed_only = seed_tokens.difference(&value_tokens).count();
+    let value_only = value_tokens.difference(&seed_tokens).count();
+    let wrapper_delta = seed_tokens
+        .symmetric_difference(&value_tokens)
+        .any(|token| METADATA_WRAPPER_TERMS.contains(&token.as_str()));
+    wrapper_delta && seed_only.min(value_only) <= 2
+}
+
+fn has_custom_fields_changed(seed: &str, value: &str) -> bool {
+    let seed_tokens = metadata_token_set(seed);
+    let value_tokens = metadata_token_set(value);
+    if seed_tokens.is_empty() || value_tokens.is_empty() {
+        return false;
+    }
+    let shared_custom_terms = CUSTOM_FIELD_TERMS
+        .iter()
+        .filter(|term| seed_tokens.contains(**term) && value_tokens.contains(**term))
+        .count();
+    shared_custom_terms >= 2 && normalize_text(seed) != normalize_text(value)
+}
+
+fn has_short_text_changed(seed: &str, value: &str) -> bool {
+    let seed_tokens = metadata_token_set(seed);
+    let value_tokens = metadata_token_set(value);
+    if seed_tokens.is_empty() || value_tokens.is_empty() {
+        return false;
+    }
+    if !metadata_template_term_set(seed).is_empty()
+        || !metadata_template_term_set(value).is_empty()
+        || has_custom_field_terms(seed)
+        || has_custom_field_terms(value)
+        || has_wrapper_terms(seed)
+        || has_wrapper_terms(value)
+    {
+        return false;
+    }
+    seed_tokens.len() <= 8
+        && value_tokens.len() <= 8
+        && seed_tokens.intersection(&value_tokens).count() >= 1
+        && seed_tokens.difference(&value_tokens).next().is_some()
+        && value_tokens.difference(&seed_tokens).next().is_some()
+}
+
+fn has_wrapper_terms(value: &str) -> bool {
+    let tokens = metadata_token_set(value);
+    METADATA_WRAPPER_TERMS
+        .iter()
+        .any(|term| tokens.contains(*term))
+}
+
+fn has_custom_field_terms(value: &str) -> bool {
+    let tokens = metadata_token_set(value);
+    CUSTOM_FIELD_TERMS.iter().any(|term| tokens.contains(*term))
+}
+
+fn description_tokens(value: &str) -> BTreeSet<String> {
+    metadata_tokens(value)
+        .into_iter()
+        .filter(|token| !METADATA_TEMPLATE_TERMS.contains(&token.as_str()))
+        .filter(|token| !METADATA_WRAPPER_TERMS.contains(&token.as_str()))
+        .filter(|token| !CUSTOM_FIELD_TERMS.contains(&token.as_str()))
+        .filter(|token| !DESCRIPTION_STOP_TERMS.contains(&token.as_str()))
+        .filter(|token| token.chars().any(char::is_alphabetic))
+        .filter(|token| token.len() >= 4)
+        .collect()
+}
+
+fn has_description_changed(seed: &str, value: &str) -> bool {
+    let seed_tokens = description_tokens(seed);
+    let value_tokens = description_tokens(value);
+    if seed_tokens.len() < 3 || value_tokens.len() < 3 {
+        return false;
+    }
+    let shared = seed_tokens.intersection(&value_tokens).count();
+    let seed_only = seed_tokens.difference(&value_tokens).count();
+    let value_only = value_tokens.difference(&seed_tokens).count();
+    shared >= 1 && seed_only >= 2 && value_only >= 2
+}
+
+fn has_description_added(seed: &str, value: &str) -> bool {
+    let seed_tokens = description_tokens(seed);
+    let value_tokens = description_tokens(value);
+    let added = value_tokens.difference(&seed_tokens).count();
+    added >= 4 && (seed_tokens.len() < 4 || added as f64 / seed_tokens.len().max(1) as f64 >= 0.25)
+}
+
+fn has_description_removed(seed: &str, value: &str) -> bool {
+    let seed_tokens = description_tokens(seed);
+    let value_tokens = description_tokens(value);
+    if value_tokens.len() < 4 {
+        return false;
+    }
+    let removed = seed_tokens.difference(&value_tokens).count();
+    removed >= 4 && removed as f64 / value_tokens.len() as f64 >= 0.25
 }
 
 fn modification_summary<'a>(
@@ -1395,8 +1751,12 @@ fn render_markdown_report(report: &SampleReport) -> String {
         if !is_usable_seed_name(&seed.name.seed) {
             continue;
         }
+        let values = labeled_matches_for_report(&seed.name, classify_name_modifications);
+        if values.is_empty() {
+            continue;
+        }
         out.push_str(&format!("- seed: {}\n", inline_or_empty(&seed.name.seed)));
-        for value in labeled_matches_for_report(&seed.name, classify_name_modifications) {
+        for value in values {
             out.push_str(&format!(
                 "  - [{}] {}\n",
                 value.labels.join(", "),
@@ -1407,9 +1767,13 @@ fn render_markdown_report(report: &SampleReport) -> String {
 
     out.push_str("\n## Metadata Matches\n\n");
     for seed in &report.seed_reports {
+        let values = labeled_matches_for_report(&seed.metadata, classify_metadata_modifications);
+        if values.is_empty() {
+            continue;
+        }
         out.push_str("- seed:\n\n");
         push_fenced(&mut out, &seed.metadata.seed);
-        for value in labeled_matches_for_report(&seed.metadata, classify_metadata_modifications) {
+        for value in values {
             out.push_str(&format!("- match labels: {}\n\n", value.labels.join(", ")));
             push_fenced(&mut out, &value.text);
         }
@@ -1608,15 +1972,227 @@ mod tests {
 
         assert!(output.contains("## Modification Summary"));
         assert!(output.contains("- total matches: 2"));
-        assert!(output.contains("- token_number_suffix: 1 (50.0%)"));
-        assert!(output.contains("- unicode_compatibility: 1 (50.0%)"));
+        assert!(output.contains("- suffix_augmentation: 1 (50.0%)"));
         assert!(output.contains("- other: 1 (50.0%)"));
         assert!(output.contains("- total matches: 1"));
-        assert!(output.contains("- exact_metadata_clone: 1 (100.0%)"));
-        assert!(output.contains("- asset_pointer_reuse: 1 (100.0%)"));
-        assert!(output.contains("- trait_schema_reuse: 1 (100.0%)"));
+        assert!(output.contains("- uri-only: 1 (100.0%)"));
+        assert!(!output.contains("- asset_pointer_reuse:"));
+        assert!(!output.contains("- trait_schema_reuse:"));
         assert!(!output.contains("1/2"));
         assert!(!output.contains("1/1"));
+    }
+
+    #[test]
+    fn name_labels_remove_ai_and_homoglyph_and_count_versions_as_token_suffix() {
+        assert_eq!(
+            classify_name_modifications("Azuki", "AIZUKI"),
+            vec!["lexical_mutation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Azuki", "Azuki 404"),
+            vec!["suffix_augmentation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Azuki", "Azuki v2"),
+            vec!["suffix_augmentation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Azuki", "Azuki Official"),
+            vec!["suffix_augmentation"]
+        );
+    }
+
+    #[test]
+    fn name_uses_paper_level_mutually_exclusive_labels() {
+        assert_eq!(
+            classify_name_modifications("BoredApeYachtClub", "Bored Ape Yacht Club"),
+            vec!["format_perturbation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Azuki", "Azuk\u{034F}i"),
+            vec!["format_perturbation"]
+        );
+        assert_eq!(
+            classify_name_modifications("BoredApeYachtClub", "Bored Ape Yacht Clubie"),
+            vec!["lexical_mutation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Azuki", "Azuki2"),
+            vec!["suffix_augmentation"]
+        );
+        assert_eq!(
+            classify_name_modifications("TEST NFT", "TEST-NFT"),
+            vec!["format_perturbation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Opepen Edition", "O$pepen Edition"),
+            vec!["lexical_mutation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Azuki", "Ａｚｕｋｉ"),
+            vec!["format_perturbation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Azuki", "Ａｚｕｋｉ v2"),
+            vec!["suffix_augmentation", "format_perturbation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Azuki", "Azuki v2"),
+            vec!["suffix_augmentation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Azuki", "Azuki Official"),
+            vec!["suffix_augmentation"]
+        );
+    }
+
+    #[test]
+    fn name_other_examples_are_broad_lexical_mutations() {
+        assert_eq!(
+            classify_name_modifications("PudgyPenguins", "Phudgy Penguins"),
+            vec!["lexical_mutation"]
+        );
+        assert_eq!(
+            classify_name_modifications("World Of Women", "WORLD OF MEN"),
+            vec!["lexical_mutation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Art Blocks", "Art Block"),
+            vec!["lexical_mutation"]
+        );
+    }
+
+    #[test]
+    fn name_numeric_suffix_detects_lexical_core_variants() {
+        let labels = classify_name_modifications("PudgyPenguins", "Pudgy Penguin #1839");
+
+        assert!(labels.contains(&"suffix_augmentation".to_string()));
+    }
+
+    #[test]
+    fn metadata_labels_describe_changes_not_reuse() {
+        assert_eq!(
+            classify_metadata_modifications(
+                "background gold ipfs://seed/image.png",
+                "background red ipfs://copy/image.png"
+            ),
+            vec!["media_reference_changed", "attribute_value_changed"]
+        );
+        assert_eq!(
+            classify_metadata_modifications(
+                "background gold",
+                "background gold ipfs://copy/image.png"
+            ),
+            vec!["uri-only"]
+        );
+        assert_eq!(
+            classify_metadata_modifications(
+                "background gold ipfs://seed/image.png",
+                "background gold"
+            ),
+            vec!["uri-only"]
+        );
+    }
+
+    #[test]
+    fn metadata_distinguishes_template_changes_from_attribute_value_changes() {
+        assert_eq!(
+            classify_metadata_modifications(
+                "background yellow fur dark brown eyes wide",
+                "background red fur golden eyes bored"
+            ),
+            vec!["attribute_value_changed"]
+        );
+        assert_eq!(
+            classify_metadata_modifications(
+                "background yellow fur dark brown eyes wide",
+                "background yellow fur dark brown legs cream item phone"
+            ),
+            vec!["attribute_value_changed"]
+        );
+    }
+
+    #[test]
+    fn metadata_other_examples_map_to_broad_change_classes() {
+        assert_eq!(
+            classify_metadata_modifications(
+                "this artwork may or may not be notable.",
+                "artist thenftstudio this artwork may or may not be notable."
+            ),
+            vec!["metadata_structure_changed"]
+        );
+        assert_eq!(
+            classify_metadata_modifications(
+                "stage 2 type human captainz",
+                "stage 1 type human baby captainz"
+            ),
+            vec!["attribute_value_changed"]
+        );
+        assert_eq!(
+            classify_metadata_modifications("guzzler by xcopy", "afterburn by xcopy"),
+            vec!["title_or_short_text_changed"]
+        );
+    }
+
+    #[test]
+    fn metadata_labels_description_text_changes_from_current_examples() {
+        assert_eq!(
+            classify_metadata_modifications(
+                "background yellow fur dark brown",
+                "background yellow fur dark brown a homage to mayc not affiliated created for holders"
+            ),
+            vec!["descriptive_text_changed"]
+        );
+        assert_eq!(
+            classify_metadata_modifications(
+                "rarity spectacular token benefit admission edition character this token has been redeemed for a ticket to veecon",
+                "rarity very rare token benefit admission edition character this token is verifiable for admission to veecon"
+            ),
+            vec!["attribute_value_changed", "descriptive_text_changed"]
+        );
+        assert_eq!(
+            classify_metadata_modifications(
+                "background m1 yellow fur m1 pink eyes m1 blindfold",
+                "background m1 army green 9% have this trait fur m1 dark brown 10% have this trait eyes m1 crazy 3% have this trait"
+            ),
+            vec!["attribute_value_changed", "descriptive_text_changed"]
+        );
+    }
+
+    #[test]
+    fn metadata_uses_paper_level_non_overlapping_change_labels() {
+        assert_eq!(
+            classify_metadata_modifications(
+                "background yellow fur dark brown eyes wide",
+                "background yellow fur dark brown legs cream item phone"
+            ),
+            vec!["attribute_value_changed"]
+        );
+        assert_eq!(
+            classify_metadata_modifications(
+                "this artwork may or may not be notable.",
+                "artist thenftstudio this artwork may or may not be notable."
+            ),
+            vec!["metadata_structure_changed"]
+        );
+        assert_eq!(
+            classify_metadata_modifications("guzzler by xcopy", "afterburn by xcopy"),
+            vec!["title_or_short_text_changed"]
+        );
+        assert_eq!(
+            classify_metadata_modifications(
+                "stage 2 type human captainz",
+                "stage 1 type human baby captainz"
+            ),
+            vec!["attribute_value_changed"]
+        );
+        assert_eq!(
+            classify_metadata_modifications(
+                "background m1 yellow fur m1 pink eyes m1 blindfold",
+                "background m1 army green 9% have this trait fur m1 dark brown 10% have this trait eyes m1 crazy 3% have this trait"
+            ),
+            vec!["attribute_value_changed", "descriptive_text_changed"]
+        );
     }
 
     #[test]
@@ -1698,13 +2274,84 @@ mod tests {
     }
 
     #[test]
-    fn metadata_template_reuse_labels_structured_value_substitution() {
+    fn report_omits_seed_sections_without_matches() {
+        let report = SampleReport {
+            chain: "ethereum".into(),
+            seed_reports: vec![
+                SeedSampleReport {
+                    name: TextComparison {
+                        seed: "No Hit Seed".into(),
+                        matches: Vec::new(),
+                        labeled_matches: Vec::new(),
+                    },
+                    metadata: TextComparison {
+                        seed: "no hit metadata".into(),
+                        matches: Vec::new(),
+                        labeled_matches: Vec::new(),
+                    },
+                },
+                SeedSampleReport {
+                    name: TextComparison {
+                        seed: "Name Hit Seed".into(),
+                        matches: vec!["Name Hit Seed".into()],
+                        labeled_matches: Vec::new(),
+                    },
+                    metadata: TextComparison::default(),
+                },
+                SeedSampleReport {
+                    name: TextComparison::default(),
+                    metadata: TextComparison {
+                        seed: "metadata hit seed".into(),
+                        matches: vec!["metadata hit seed changed".into()],
+                        labeled_matches: Vec::new(),
+                    },
+                },
+            ],
+        };
+
+        let output = render_markdown_report(&report);
+
+        assert!(!output.contains("No Hit Seed"));
+        assert!(!output.contains("no hit metadata"));
+        assert!(output.contains("- seed: Name Hit Seed"));
+        assert!(output.contains("metadata hit seed"));
+        assert!(output.contains("metadata hit seed changed"));
+    }
+
+    #[test]
+    fn metadata_structured_template_changes_label_attribute_value_changed() {
         let seed = "category spirit sediment biogenic swamp number sediment tier environment steppes number environment tier eastern resource whisper number eastern resource tier southern resource lumileaf number southern resource tier northern resource moldium number northern resource tier plot";
         let value = "category decay sediment chemical goo number sediment tier environment bog number environment tier southern resource whisper number southern resource tier western resource spikeweed number western resource tier number plot obelisk piece first trip";
 
         let labels = classify_metadata_modifications(seed, value);
 
-        assert!(labels.contains(&"metadata_template_reuse".to_string()));
+        assert!(labels.contains(&"attribute_value_changed".to_string()));
+        assert!(!labels.contains(&"other".to_string()));
+    }
+
+    #[test]
+    fn metadata_other_examples_map_to_paper_level_categories() {
+        let labels = classify_metadata_modifications(
+            "this is an artwork for interleave created by dirtyrobot. https://arweave.net/interleave/dirtyrobot_interleave_artwork.jpg",
+            "this is an artwork for interleave created by jack butcher. https://arweave.net/interleave/jack_butcher_interleave_artwork.mp4",
+        );
+        assert!(labels.contains(&"template_value_changed".to_string()));
+        assert!(labels.contains(&"media_reference_changed".to_string()));
+        assert!(!labels.contains(&"other".to_string()));
+
+        let labels = classify_metadata_modifications(
+            "tier ✦✦✦ https://elementals-metadata.azuki.com/mystery-bean/0 https://elementals-images.azuki.com/3.gif",
+            "tier ✦ https://elementals-metadata.azuki.com/mystery-bean/7100 https://elementals-images.azuki.com/1.gif",
+        );
+        assert!(labels.contains(&"attribute_value_changed".to_string()));
+        assert!(labels.contains(&"media_reference_changed".to_string()));
+        assert!(!labels.contains(&"other".to_string()));
+
+        let labels = classify_metadata_modifications(
+            "this artwork may or may not be notable. ipfs://bafkreicjj7ksr3nau676datyren2kuiiiwpgbn4pwcbzia4sn7cbjrtkc4",
+            "color band twenty this artwork may or may not be notable. ipfs://bafybeicorfimu5v3xjqce4fbfl2b667bjbiee6dm2wk37rkjkhgd7carqq",
+        );
+        assert!(labels.contains(&"attribute_value_changed".to_string()));
         assert!(!labels.contains(&"other".to_string()));
     }
 
