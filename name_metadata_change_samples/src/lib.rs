@@ -553,8 +553,10 @@ fn load_metadata_index(
                    row_number() OVER (
                        PARTITION BY contract_address
                        ORDER BY CASE
-                           WHEN trim(metadata_doc) <> '' OR trim(metadata_json) <> '' THEN 0
-                           ELSE 1
+                           WHEN trim(metadata_json) LIKE '{%' OR trim(metadata_json) LIKE '[%' THEN 0
+                           WHEN trim(metadata_json) <> '' THEN 1
+                           WHEN trim(metadata_doc) <> '' THEN 2
+                           ELSE 3
                        END, token_id
                    ) AS metadata_rank
             FROM selected
@@ -631,7 +633,11 @@ fn seed_name_norms(rows: &[NftTextRow]) -> Vec<String> {
 
 fn first_seed_metadata(rows: &[NftTextRow]) -> String {
     rows.iter()
-        .find_map(|row| non_empty(&record_metadata_text(&row.metadata_doc, &row.metadata_json)))
+        .find_map(|row| non_empty_json(&row.metadata_json))
+        .or_else(|| {
+            rows.iter()
+                .find_map(|row| non_empty(&record_metadata_text(&row.metadata_doc, &row.metadata_json)))
+        })
         .unwrap_or_default()
 }
 
@@ -1124,6 +1130,15 @@ fn non_empty(value: &str) -> Option<String> {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+fn non_empty_json(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if looks_like_json(trimmed) {
+        Some(trimmed.to_string())
+    } else {
+        None
     }
 }
 

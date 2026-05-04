@@ -190,6 +190,56 @@ fn collect_samples_outputs_split_name_and_metadata_text_only() {
 }
 
 #[test]
+fn collect_samples_prefers_json_metadata_for_path_based_matrix() {
+    let temp = tempdir().unwrap();
+    let db_path = temp.path().join("features.duckdb");
+    let input_path = temp.path().join("contracts.txt");
+    let output_path = temp.path().join("samples.md");
+
+    write_feature_db(
+        &db_path,
+        &[
+            TestRow::new("0xseed", "1")
+                .name("Azuki #1")
+                .metadata_doc("gold dragon red background"),
+            TestRow::new("0xseed", "2")
+                .name("Azuki #2")
+                .metadata_json(
+                    r#"{"description":"gold dragon","attributes":[{"trait_type":"Background","value":"Red"}],"image":"ipfs://seed/image.png"}"#,
+                ),
+            TestRow::new("0xcopy", "1")
+                .name("Changed Creature")
+                .metadata_doc("gold dragon red background"),
+            TestRow::new("0xcopy", "2")
+                .name("Changed Creature")
+                .metadata_json(
+                    r#"{"description":"gold dragon","attributes":[{"trait_type":"Background","value":"Red"}],"image":"ipfs://copy/image.png"}"#,
+                ),
+        ],
+    );
+    fs::write(&input_path, "0xseed\n").unwrap();
+
+    let mut sample_config = config(db_path, input_path, output_path.clone());
+    sample_config.metadata_threshold = 0.1;
+    let report = collect_samples(sample_config).unwrap();
+
+    assert_eq!(
+        report.seed_reports[0].metadata.seed,
+        r#"{"description":"gold dragon","attributes":[{"trait_type":"Background","value":"Red"}],"image":"ipfs://seed/image.png"}"#
+    );
+    assert_eq!(
+        report.seed_reports[0].metadata.matches,
+        vec![
+            r#"{"description":"gold dragon","attributes":[{"trait_type":"Background","value":"Red"}],"image":"ipfs://copy/image.png"}"#
+        ]
+    );
+
+    let output = fs::read_to_string(output_path).unwrap();
+    assert!(output.contains("| replaced | 0 | 0 | 0 | 1 | 0 | 0 | 0 |"));
+    assert!(!output.contains("- unparseable_changed:"));
+}
+
+#[test]
 fn collect_samples_uses_equivalent_name_and_metadata_normalization() {
     let temp = tempdir().unwrap();
     let db_path = temp.path().join("features.duckdb");
