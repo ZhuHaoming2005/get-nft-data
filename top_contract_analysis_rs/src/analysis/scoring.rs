@@ -72,7 +72,7 @@ fn metadata_document(raw: &str) -> String {
 fn tokenize(document: &str) -> Vec<String> {
     TOKEN_RE
         .find_iter(document)
-        .map(|m| m.as_str().to_lowercase())
+        .map(|m| m.as_str().to_string())
         .filter(|token| token.len() >= 2)
         .collect()
 }
@@ -144,6 +144,19 @@ mod tests {
     }
 
     #[test]
+    fn prepared_metadata_query_matches_indexed_pair_score() {
+        let query = MetadataBm25Document::from_text("gold dragon gold").unwrap();
+        let doc = MetadataBm25Document::from_text("rare gold dragon").unwrap();
+        let corpus = MetadataBm25Corpus::from_indexed_documents(std::slice::from_ref(&doc));
+
+        let prepared_query = MetadataBm25Query::new(&query, &corpus);
+        let prepared_score = score_metadata_indexed_pair_with_query(&prepared_query, &doc);
+        let indexed_score = score_metadata_indexed_pair_with_corpus(&query, &doc, &corpus);
+
+        assert!((prepared_score - indexed_score).abs() < 1e-9);
+    }
+
+    #[test]
     fn metadata_bm25_uses_common_okapi_defaults() {
         assert_eq!(METADATA_BM25_K1, 1.2);
         assert_eq!(METADATA_BM25_B, 0.75);
@@ -155,6 +168,13 @@ pub struct MetadataBm25Corpus {
     total_docs: usize,
     avg_doc_len: f64,
     doc_freqs: HashMap<String, usize>,
+}
+
+#[derive(Debug)]
+pub(crate) struct MetadataBm25Query<'a> {
+    terms: Vec<(String, usize)>,
+    denominator: f64,
+    corpus: &'a MetadataBm25Corpus,
 }
 
 #[derive(Debug, Default)]
@@ -214,12 +234,35 @@ impl MetadataBm25Corpus {
     }
 }
 
-fn bm25_score_tokens(
-    query_tokens: &[String],
+impl<'a> MetadataBm25Query<'a> {
+    pub(crate) fn new(query: &MetadataBm25Document, corpus: &'a MetadataBm25Corpus) -> Self {
+        let terms = query_terms_from_tokens(query.tokens());
+        let self_score = bm25_score_terms(&terms, query, corpus);
+        let denominator = if self_score > 0.0 { self_score } else { 1.0 };
+        Self {
+            terms,
+            denominator,
+            corpus,
+        }
+    }
+}
+
+fn query_terms_from_tokens(query_tokens: &[String]) -> Vec<(String, usize)> {
+    let mut query_terms = HashMap::<String, usize>::new();
+    for token in query_tokens {
+        *query_terms.entry(token.clone()).or_insert(0) += 1;
+    }
+    let mut query_terms = query_terms.into_iter().collect::<Vec<_>>();
+    query_terms.sort_by(|left, right| left.0.cmp(&right.0));
+    query_terms
+}
+
+fn bm25_score_terms(
+    query_terms: &[(String, usize)],
     doc: &MetadataBm25Document,
     corpus: &MetadataBm25Corpus,
 ) -> f64 {
-    if query_tokens.is_empty()
+    if query_terms.is_empty()
         || doc.len() == 0
         || corpus.total_docs == 0
         || corpus.avg_doc_len <= 0.0
@@ -231,18 +274,25 @@ fn bm25_score_tokens(
     let norm =
         METADATA_BM25_K1 * (1.0 - METADATA_BM25_B + METADATA_BM25_B * doc_len / corpus.avg_doc_len);
 
-    query_tokens
+    query_terms
         .iter()
-        .map(|token| {
+        .map(|(token, query_tf)| {
             let tf = doc.term_frequency(token) as f64;
             if tf == 0.0 {
                 return 0.0;
             }
             let df = *corpus.doc_freqs.get(token).unwrap_or(&0) as f64;
             let idf = ((corpus.total_docs as f64 - df + 0.5) / (df + 0.5) + 1.0).ln();
-            idf * (tf * (METADATA_BM25_K1 + 1.0)) / (tf + norm)
+            *query_tf as f64 * idf * (tf * (METADATA_BM25_K1 + 1.0)) / (tf + norm)
         })
         .sum()
+}
+
+pub(crate) fn score_metadata_indexed_pair_with_query(
+    query: &MetadataBm25Query<'_>,
+    right: &MetadataBm25Document,
+) -> f64 {
+    (bm25_score_terms(&query.terms, right, query.corpus) / query.denominator).clamp(0.0, 1.0)
 }
 
 pub fn score_metadata_indexed_pair_with_corpus(
@@ -250,9 +300,8 @@ pub fn score_metadata_indexed_pair_with_corpus(
     right: &MetadataBm25Document,
     corpus: &MetadataBm25Corpus,
 ) -> f64 {
-    let self_score = bm25_score_tokens(left.tokens(), left, corpus);
-    let denominator = if self_score > 0.0 { self_score } else { 1.0 };
-    (bm25_score_tokens(left.tokens(), right, corpus) / denominator).clamp(0.0, 1.0)
+    let query = MetadataBm25Query::new(left, corpus);
+    score_metadata_indexed_pair_with_query(&query, right)
 }
 
 fn metadata_bm25_score_from_documents(left: &str, right: &str, corpus: &MetadataBm25Corpus) -> f64 {

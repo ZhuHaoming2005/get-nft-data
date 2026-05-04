@@ -3,8 +3,9 @@ use std::collections::{HashMap, HashSet};
 use rayon::prelude::*;
 
 use crate::analysis::scoring::{
-    metadata_bm25_tokens, metadata_document_from_json, score_metadata_indexed_pair_with_corpus,
+    metadata_bm25_tokens, metadata_document_from_json, score_metadata_indexed_pair_with_query,
     score_name_pair, MetadataBm25Corpus, MetadataBm25CorpusBuilder, MetadataBm25Document,
+    MetadataBm25Query,
 };
 use crate::models::{ContractDuplicateRecord, DatabaseNftRecord, DuplicateCandidate, SeedNft};
 use crate::normalize::{normalize_name, normalize_url};
@@ -17,6 +18,44 @@ fn has_name_match(row_name_norm: &str, name_threshold: f64, seed_name_norms: &[S
     seed_name_norms
         .iter()
         .any(|candidate| score_name_pair(row_name_norm, candidate) >= name_threshold)
+}
+
+fn build_contract_name_match_index(
+    contract_rows: &[&ContractDuplicateRecord],
+    name_threshold: f64,
+    seed_name_norms: &[String],
+) -> Vec<bool> {
+    if seed_name_norms.is_empty() || name_threshold > 100.0 {
+        return vec![false; contract_rows.len()];
+    }
+
+    let mut contract_indices_by_name = HashMap::<String, Vec<usize>>::new();
+    for (contract_index, row) in contract_rows.iter().enumerate() {
+        for name_norm in &row.name_norms {
+            if !name_norm.is_empty() {
+                contract_indices_by_name
+                    .entry(name_norm.clone())
+                    .or_default()
+                    .push(contract_index);
+            }
+        }
+    }
+
+    let matching_contract_indices: HashSet<usize> = contract_indices_by_name
+        .into_par_iter()
+        .filter_map(|(name_norm, contract_indices)| {
+            has_name_match(&name_norm, name_threshold, seed_name_norms).then_some(contract_indices)
+        })
+        .flatten()
+        .collect();
+
+    let mut matches = vec![false; contract_rows.len()];
+    for index in matching_contract_indices {
+        if let Some(value) = matches.get_mut(index) {
+            *value = true;
+        }
+    }
+    matches
 }
 
 fn record_metadata_doc(metadata_doc: &str, metadata_json: &str) -> String {
@@ -37,14 +76,15 @@ fn seed_metadata_example_doc(seed_nfts: &[SeedNft]) -> Option<MetadataBm25Docume
 struct MetadataBm25Index {
     corpus: MetadataBm25Corpus,
     docs: Vec<MetadataBm25Document>,
-    candidate_doc_index_by_contract: HashMap<String, usize>,
+    candidate_doc_indices: Vec<Option<usize>>,
 }
 
 impl MetadataBm25Index {
-    fn candidate_doc(&self, contract_address: &str) -> Option<&MetadataBm25Document> {
-        self.candidate_doc_index_by_contract
-            .get(contract_address)
-            .and_then(|index| self.docs.get(*index))
+    fn candidate_doc(&self, contract_index: usize) -> Option<&MetadataBm25Document> {
+        self.candidate_doc_indices
+            .get(contract_index)
+            .and_then(|index| *index)
+            .and_then(|index| self.docs.get(index))
     }
 }
 
@@ -126,15 +166,15 @@ fn build_metadata_bm25_index(
         return MetadataBm25Index {
             corpus: MetadataBm25Corpus::from_indexed_documents(&[]),
             docs: Vec::new(),
-            candidate_doc_index_by_contract: HashMap::new(),
+            candidate_doc_indices: vec![None; contract_rows.len()],
         };
     }
 
     let mut docs = Vec::new();
-    let mut candidate_doc_index_by_contract = HashMap::new();
+    let mut candidate_doc_indices = vec![None; contract_rows.len()];
     let mut corpus_builder = MetadataBm25CorpusBuilder::default();
 
-    for row in contract_rows {
+    for (contract_index, row) in contract_rows.iter().enumerate() {
         let row = *row;
         if !should_score_metadata(row, has_metadata_recall_flags) || row.metadata_doc.is_empty() {
             continue;
@@ -153,14 +193,14 @@ fn build_metadata_bm25_index(
             continue;
         };
         let doc_index = docs.len();
-        candidate_doc_index_by_contract.insert(row.contract_address.clone(), doc_index);
+        candidate_doc_indices[contract_index] = Some(doc_index);
         docs.push(indexed_doc);
     }
 
     MetadataBm25Index {
         corpus: corpus_builder.finish(),
         docs,
-        candidate_doc_index_by_contract,
+        candidate_doc_indices,
     }
 }
 
@@ -229,16 +269,23 @@ pub fn build_duplicate_candidates_from_contract_rows(
     let seed_metadata_docs: Vec<MetadataBm25Document> =
         seed_metadata_example_doc(seed_nfts).into_iter().collect();
 
+    let name_match_contracts =
+        build_contract_name_match_index(&contract_rows, name_threshold, &seed_name_norms);
     let has_metadata_recall_flags = contract_rows.iter().any(|row| row.metadata_recall_checked);
     let metadata_index = build_metadata_bm25_index(
         &seed_metadata_docs,
         &contract_rows,
         has_metadata_recall_flags,
     );
+    let metadata_queries = seed_metadata_docs
+        .iter()
+        .map(|seed_doc| MetadataBm25Query::new(seed_doc, &metadata_index.corpus))
+        .collect::<Vec<_>>();
 
     let mut rows: Vec<DuplicateCandidate> = contract_rows
         .par_iter()
-        .filter_map(|row| {
+        .enumerate()
+        .filter_map(|(contract_index, row)| {
             let row = *row;
             let mut reasons = Vec::new();
             if row.token_uri_match {
@@ -247,21 +294,17 @@ pub fn build_duplicate_candidates_from_contract_rows(
             if row.image_uri_match {
                 reasons.push("image_uri_match".to_string());
             }
-            if row
-                .name_norms
-                .iter()
-                .any(|name_norm| has_name_match(name_norm, name_threshold, &seed_name_norms))
+            if name_match_contracts
+                .get(contract_index)
+                .copied()
+                .unwrap_or(false)
             {
                 reasons.push("name_match".to_string());
             }
             if should_score_metadata(row, has_metadata_recall_flags) {
-                if let Some(row_doc) = metadata_index.candidate_doc(&row.contract_address) {
-                    if seed_metadata_docs.iter().any(|seed_doc| {
-                        score_metadata_indexed_pair_with_corpus(
-                            seed_doc,
-                            row_doc,
-                            &metadata_index.corpus,
-                        ) >= metadata_threshold
+                if let Some(row_doc) = metadata_index.candidate_doc(contract_index) {
+                    if metadata_queries.iter().any(|query| {
+                        score_metadata_indexed_pair_with_query(query, row_doc) >= metadata_threshold
                     }) {
                         reasons.push("metadata_match".to_string());
                     }
@@ -341,12 +384,62 @@ mod tests {
         let contract_row_refs: Vec<_> = contract_rows.iter().collect();
         let index = build_metadata_bm25_index(&seed_docs, &contract_row_refs, false);
 
-        assert!(index.candidate_doc("0xgold").is_some());
-        assert!(index.candidate_doc("0xai").is_some());
-        assert!(index.candidate_doc("0xseed").is_none());
-        assert!(index.candidate_doc("0xmiss").is_none());
+        let gold_index = contract_rows
+            .iter()
+            .position(|row| row.contract_address == "0xgold")
+            .unwrap();
+        let ai_index = contract_rows
+            .iter()
+            .position(|row| row.contract_address == "0xai")
+            .unwrap();
+        let miss_index = contract_rows
+            .iter()
+            .position(|row| row.contract_address == "0xmiss")
+            .unwrap();
+
+        assert!(index.candidate_doc(gold_index).is_some());
+        assert!(index.candidate_doc(ai_index).is_some());
+        assert!(index.candidate_doc(miss_index).is_none());
         assert_eq!(index.docs.len(), 2);
         assert_eq!(index.corpus.total_docs(), 3);
+    }
+
+    #[test]
+    fn contract_name_match_index_matches_any_normalized_name_per_contract() {
+        let contract_rows = vec![
+            ContractDuplicateRecord {
+                contract_address: "0xhit".into(),
+                name_norms: vec!["unrelated".into(), "azuki".into()],
+                ..Default::default()
+            },
+            ContractDuplicateRecord {
+                contract_address: "0xmiss".into(),
+                name_norms: vec!["doodles".into()],
+                ..Default::default()
+            },
+        ];
+        let contract_row_refs = contract_rows.iter().collect::<Vec<_>>();
+        let seed_name_norms = vec!["azuki".to_string()];
+
+        let index = build_contract_name_match_index(&contract_row_refs, 100.0, &seed_name_norms);
+
+        assert!(index[0]);
+        assert!(!index[1]);
+    }
+
+    #[test]
+    fn contract_name_match_index_preserves_name_scoring_normalization() {
+        let contract_rows = vec![ContractDuplicateRecord {
+            contract_address: "0xhit".into(),
+            name_norms: vec!["Azuki #123".into()],
+            ..Default::default()
+        }];
+        let contract_row_refs = contract_rows.iter().collect::<Vec<_>>();
+        let seed_name_norms = vec!["azuki".to_string()];
+
+        let index = build_contract_name_match_index(&contract_row_refs, 100.0, &seed_name_norms);
+
+        assert!(index[0]);
     }
 
     #[test]

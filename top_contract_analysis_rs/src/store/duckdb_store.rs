@@ -190,6 +190,40 @@ mod tests {
 
         assert_eq!(contracts, vec!["0xcandidate_a", "0xcandidate_b"]);
     }
+
+    #[test]
+    fn duplicate_contract_row_uses_precomputed_name_pair_uniqueness() {
+        let record = DatabaseNftRecord {
+            contract_address: "0xcandidate".into(),
+            token_id: "1".into(),
+            ..Default::default()
+        };
+        let mut rows_by_contract = HashMap::new();
+
+        update_duplicate_contract_row(
+            &mut rows_by_contract,
+            &record,
+            false,
+            false,
+            "azuki",
+            true,
+            false,
+        );
+        update_duplicate_contract_row(
+            &mut rows_by_contract,
+            &record,
+            false,
+            false,
+            "azuki",
+            false,
+            false,
+        );
+
+        assert_eq!(
+            rows_by_contract["0xcandidate"].name_norms,
+            vec!["azuki".to_string()]
+        );
+    }
 }
 
 impl DuckDbResourceOptions {
@@ -244,6 +278,7 @@ fn update_duplicate_contract_row(
     token_uri_match: bool,
     image_uri_match: bool,
     name_norm: &str,
+    name_pair_is_new: bool,
     metadata_recall_match: bool,
 ) {
     let entry = rows_by_contract
@@ -256,7 +291,7 @@ fn update_duplicate_contract_row(
 
     entry.token_uri_match |= token_uri_match;
     entry.image_uri_match |= image_uri_match;
-    if !name_norm.is_empty() && !entry.name_norms.iter().any(|value| value == name_norm) {
+    if name_pair_is_new && !name_norm.is_empty() {
         entry.name_norms.push(name_norm.to_string());
     }
 
@@ -787,10 +822,10 @@ impl DuckDbFeatureStore {
 
                 let token_uri_match = exact_token_keys.contains(&token_uri_norm);
                 let image_uri_match = exact_image_keys.contains(&image_uri_norm);
-                if !name_norm.is_empty()
+                let name_pair_is_new = !name_norm.is_empty()
                     && seen_contract_name_pairs
-                        .insert((record.contract_address.clone(), name_norm.clone()))
-                {
+                        .insert((record.contract_address.clone(), name_norm.clone()));
+                if name_pair_is_new {
                     contract_names.push(ContractNameRecord {
                         contract_address: record.contract_address.clone(),
                         name_norm: name_norm.clone(),
@@ -824,6 +859,7 @@ impl DuckDbFeatureStore {
                     token_uri_match,
                     image_uri_match,
                     &name_norm,
+                    name_pair_is_new,
                     metadata_recall_match,
                 );
                 nft_rows.push(record);
