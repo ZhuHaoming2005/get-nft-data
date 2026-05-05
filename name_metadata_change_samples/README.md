@@ -44,10 +44,10 @@ python .\scripts\fetch_opensea_top_seeds.py --output .\seeds.txt --limit 100 --c
 
 工具输出三个部分：
 
-- `Modification Summary`：按 name/metadata 分别统计修改方式标签，输出 `count (percent)`。`total matches` 是该侧参与统计的重复记录数；标签采用叠加统计，同一条重复记录可同时计入多个标签，因此各标签比例相加可能超过 100%；未命中任何规则时计入 `other`。seed name 为空、`None`、`null`、全问号或无字母数字等无效值时，该 seed 的 name matches 不参与 name 统计。
+- `Modification Summary`：name 按修改标签统计 `count (percent)`；metadata 按“语义区域 × 操作类型”矩阵统计。`total matches` 是该侧参与统计的重复记录数；标签采用叠加统计，同一条重复记录可同时计入多个标签，因此各标签比例相加可能超过 100%。seed name 为空、`None`、`null`、全问号或无字母数字等无效值时，该 seed 的 name matches 不参与 name 统计。
 - `Name Matches`：每个有效 seed 的 name，以及查到重复的合约级代表 name 文本；每条 match 前显示对应标签。
 - `Metadata Matches`：每个 seed 的 metadata，以及查到重复的 metadata 文本；每条 match 前显示对应标签。
 
 Name 标签只保留可解释的高层改动方式：`exact_clone`、`format_perturbation`、`suffix_augmentation`、`lexical_mutation`。`format_perturbation` 覆盖大小写、空白、不可见 Unicode 和 Unicode 兼容字符变化；`suffix_augmentation` 覆盖 `404`、`v2`、`gen2`、`2.0` 等编号/版本后缀，也覆盖 `.fun`、`x`、`official`、`nft`、`club`、`dao`、`pass`、`mint`、`claim`、`free`、`vip`、`collection`、`edition`、`clone`、`copy`、`reloaded`、`remastered` 等衍生语义后缀；`lexical_mutation` 覆盖拼写变体、单复数变化、近似词替换和可识别品牌名变形。不再输出 `case_change`、`spacing_change`、`unicode_compatibility`、`invisible_unicode`、`token_number_suffix`、`derivative_suffix`、`ai_marker` 和 `homoglyph_or_typo` 这类细粒度探索标签。
 
-Metadata 标签关注发生了什么文本/属性修改，标签判断会忽略 URI、IPFS 和 CID 差异：`uri-only`、`attribute_manipulation`、`metadata_structure_changed`、`title_or_short_text_changed`、`descriptive_text_changed`。其中 `attribute_manipulation` 覆盖属性模板变化、属性值变化和项目自定义字段变化；`metadata_structure_changed` 覆盖字段包装/前缀变化；`title_or_short_text_changed` 覆盖短标题或短 metadata 文本变化；`descriptive_text_changed` 覆盖描述文本增删改，包括新增 trait 百分比等文本。metadata 标签不再输出 URI/asset 指针类标签，也不再输出 `template_changed`、`attribute_values_changed`、`field_wrapper_changed`、`custom_fields_changed`、`short_text_changed`、`description_added`、`description_removed`、`description_changed` 这类细粒度探索标签。
+Metadata 标签只基于可解析 JSON 的 path diff，不再使用文本相似度启发式。横向语义区域为 `title`、`description`、`attributes`、`references`、`auxiliary_fields`、`platform_fields`、`structure`；纵向操作类型为 `added`、`removed`、`replaced`、`reordered`。`title`、`description`、`attributes`、`references`、`auxiliary_fields` 计入 content-bearing changes；`platform_fields` 和窄口径 `structure` 计入 non-content-bearing changes。无法解析为 JSON 且发生变化的 metadata 计入 `unparseable_changed`，不混入 `other`；JSON 中未知 path 的变化按 path-based 的 `auxiliary_fields` 统计。
