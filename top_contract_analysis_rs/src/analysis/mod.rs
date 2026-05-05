@@ -367,6 +367,7 @@ struct BatchSeedAggregate {
 struct ContractAnalysisResult {
     contract_address: String,
     contract_metadata: Option<ContractMetadata>,
+    implausible_candidate_filtered: bool,
     legit_duplicate: Option<DuplicateContractPayload>,
     address_signal: Option<AddressSignalPayload>,
     victim_signal: Option<VictimSignalPayload>,
@@ -1131,7 +1132,9 @@ async fn analyze_seed_contract_with_limits(
     let mut nft_propagation_paths = BTreeMap::<String, NftPropagationPathPayload>::new();
     let mut expanded_candidates_by_contract = BTreeMap::new();
     let mut candidate_contract_metadata = BTreeMap::new();
+    let mut implausible_candidate_contracts = BTreeSet::new();
     let analysis_timestamp = chrono::Utc::now().timestamp();
+    let seed_deployed_block_number = seed_contract.deployed_block_number;
     if !open_license {
         progress
             .on_duplicate_contracts_started(contracts_to_analyze.len())
@@ -1150,6 +1153,23 @@ async fn analyze_seed_contract_with_limits(
         let runtime_limits_ref = &runtime_limits;
         let mut contract_analyses = stream::iter(contracts_to_analyze.iter().enumerate().map(
             |(index, contract_address)| async move {
+                let contract_metadata = fetch_candidate_contract_metadata(
+                    request_ref,
+                    deps_ref,
+                    contract_address,
+                    runtime_limits_ref,
+                )
+                .await?;
+                if deployed_before_seed(seed_deployed_block_number, contract_metadata.as_ref()) {
+                    let result =
+                        implausible_candidate_filtered_result(contract_address, contract_metadata);
+                    return Ok::<_, AppError>((
+                        index,
+                        contract_address.clone(),
+                        Vec::new(),
+                        result,
+                    ));
+                }
                 let contract_candidates = fetch_and_expand_contract_candidates(
                     request_ref,
                     deps_ref,
@@ -1166,6 +1186,7 @@ async fn analyze_seed_contract_with_limits(
                     token_type_ref,
                     contract_address,
                     &contract_candidates,
+                    contract_metadata,
                     official_addresses_ref,
                     candidate_open_license_by_token_ref,
                     analysis_timestamp,
@@ -1210,11 +1231,16 @@ async fn analyze_seed_contract_with_limits(
                     &mut mint_payment_edges,
                     &mut nft_propagation_paths,
                     &mut candidate_contract_metadata,
+                    &mut implausible_candidate_contracts,
                 );
                 next_contract_index_to_merge += 1;
             }
         }
     }
+    expanded_candidates_by_contract
+        .retain(|contract, _| !implausible_candidate_contracts.contains(contract));
+    candidate_contract_metadata
+        .retain(|contract, _| !implausible_candidate_contracts.contains(contract));
     let mut duplicate_contracts = build_duplicate_contract_payloads(
         &expanded_candidates_by_contract,
         &candidate_contract_metadata,
@@ -1246,6 +1272,18 @@ async fn analyze_seed_contract_with_limits(
             .cloned()
             .collect()
     };
+    let output_candidates: Vec<DuplicateCandidate> = if implausible_candidate_contracts.is_empty() {
+        candidates.clone()
+    } else {
+        candidates
+            .iter()
+            .filter(|candidate| {
+                !implausible_candidate_contracts.contains(&candidate.contract_address)
+            })
+            .cloned()
+            .collect()
+    };
+    let summary_grouped = group_candidates_by_contract(&output_candidates);
     let lifecycle_outputs =
         lifecycle::build_lifecycle_model_outputs(lifecycle::LifecycleModelInput {
             seed_contract: &seed_contract_payload,
@@ -1267,11 +1305,12 @@ async fn analyze_seed_contract_with_limits(
     let payload = SingleReportPayload {
         seed_contract: seed_contract_payload,
         seed_collection_stats: build_seed_collection_stats(&seed_nfts),
-        duplicate_candidates: candidates,
+        duplicate_candidates: output_candidates,
         contract_level_summary: build_contract_level_summary(&expanded_candidates_by_contract),
         report_summary: build_report_summary(
             open_license,
-            &grouped,
+            &summary_grouped,
+            implausible_candidate_contracts.len() as i64,
             &legit_duplicates,
             &infringing_tokens,
             &malicious_addresses,
@@ -1327,9 +1366,14 @@ fn merge_contract_analysis_result(
     mint_payment_edges: &mut Vec<ValueFlowEdgePayload>,
     nft_propagation_paths: &mut BTreeMap<String, NftPropagationPathPayload>,
     candidate_contract_metadata: &mut BTreeMap<String, ContractMetadata>,
+    implausible_candidate_contracts: &mut BTreeSet<String>,
 ) {
     if let Some(metadata) = result.contract_metadata {
         candidate_contract_metadata.insert(result.contract_address.clone(), metadata);
+    }
+    if result.implausible_candidate_filtered {
+        implausible_candidate_contracts.insert(result.contract_address);
+        return;
     }
     if let Some(legit_duplicate) = result.legit_duplicate {
         legit_contract_addresses.insert(result.contract_address.clone());
@@ -1381,6 +1425,43 @@ fn enrich_duplicate_contract_payload_with_metadata(
     payload
 }
 
+fn deployed_before_seed(
+    seed_deployed_block_number: i64,
+    metadata: Option<&ContractMetadata>,
+) -> bool {
+    seed_deployed_block_number > 0
+        && metadata
+            .map(|metadata| {
+                metadata.deployed_block_number > 0
+                    && metadata.deployed_block_number < seed_deployed_block_number
+            })
+            .unwrap_or(false)
+}
+
+fn implausible_candidate_filtered_result(
+    contract_address: &str,
+    contract_metadata: Option<ContractMetadata>,
+) -> ContractAnalysisResult {
+    ContractAnalysisResult {
+        contract_address: contract_address.to_string(),
+        contract_metadata,
+        implausible_candidate_filtered: true,
+        legit_duplicate: None,
+        address_signal: None,
+        victim_signal: None,
+        infringing_tokens: Vec::new(),
+        malicious_addresses: Vec::new(),
+        honest_addresses: Vec::new(),
+        honest_address_stats: BTreeMap::new(),
+        secondary_sale_victim_addresses: Vec::new(),
+        address_attributions: Vec::new(),
+        market_events: Vec::new(),
+        mint_payment_edges: Vec::new(),
+        fraud_trade_stats: BTreeMap::new(),
+        nft_propagation_path: None,
+    }
+}
+
 async fn fetch_candidate_contract_metadata(
     request: &AnalyzeRequest,
     deps: &AnalysisDeps,
@@ -1415,14 +1496,13 @@ async fn analyze_duplicate_contract(
     token_type: &str,
     contract_address: &str,
     contract_candidates: &[DuplicateCandidate],
+    contract_metadata: Option<ContractMetadata>,
     official_addresses: &HashSet<String>,
     candidate_open_license_by_token: &HashMap<(String, String), bool>,
     analysis_timestamp: i64,
     runtime_limits: &RuntimeLimits,
 ) -> Result<ContractAnalysisResult, AppError> {
     let contract_candidate_refs: Vec<&DuplicateCandidate> = contract_candidates.iter().collect();
-    let contract_metadata =
-        fetch_candidate_contract_metadata(request, deps, contract_address, runtime_limits).await?;
     let cached_signals = if let Some(cache) = deps.signal_cache.as_ref() {
         cache.get(&request.chain, contract_address, token_type)?
     } else {
@@ -1489,6 +1569,7 @@ async fn analyze_duplicate_contract(
         return Ok(ContractAnalysisResult {
             contract_address: contract_address.to_string(),
             contract_metadata: contract_metadata.clone(),
+            implausible_candidate_filtered: false,
             legit_duplicate: Some(enrich_duplicate_contract_payload_with_metadata(
                 DuplicateContractPayload {
                     contract_address: contract_address.to_string(),
@@ -1601,6 +1682,7 @@ async fn analyze_duplicate_contract(
     Ok(ContractAnalysisResult {
         contract_address: contract_address.to_string(),
         contract_metadata,
+        implausible_candidate_filtered: false,
         legit_duplicate: None,
         address_signal: Some(map_address_signals(&transfer_signals)),
         victim_signal: Some(victim_signal),
@@ -3277,6 +3359,7 @@ fn is_stablecoin_symbol(symbol: &str) -> bool {
 fn build_report_summary(
     open_license: bool,
     grouped: &BTreeMap<String, Vec<usize>>,
+    implausible_candidate_contract_count: i64,
     legit_duplicates: &[DuplicateContractPayload],
     infringing_tokens: &[InfringingTokenRecord],
     malicious_addresses: &[MaliciousAddressPayload],
@@ -3367,6 +3450,11 @@ fn build_report_summary(
         .iter()
         .filter(|item| item.is_corrupted_address)
         .count() as i64;
+    let corrupted_holding_values: Vec<f64> = honest_addresses
+        .iter()
+        .filter(|item| item.is_corrupted_address)
+        .filter_map(|item| item.hold_duration_median_seconds)
+        .collect();
     let mint_to_honest_samples: Vec<f64> = honest_addresses
         .iter()
         .flat_map(|item| {
@@ -3411,6 +3499,7 @@ fn build_report_summary(
     ReportSummary {
         open_license_detected: open_license,
         candidate_contract_count: grouped.len() as i64,
+        implausible_candidate_contract_count,
         infringing_nft_count,
         malicious_address_count,
         honest_address_count,
@@ -3466,6 +3555,8 @@ fn build_report_summary(
             None
         },
         corrupted_honest_address_count,
+        avg_corrupted_address_holding_seconds: mean_f64(&corrupted_holding_values),
+        median_corrupted_address_holding_seconds: median_f64(&corrupted_holding_values),
         avg_seconds_to_honest_holder: mean_f64(&mint_to_honest_samples),
         median_seconds_to_honest_holder: median_f64(&mint_to_honest_samples),
         avg_mint_to_first_transfer_seconds: mean_f64(&mint_to_first_transfer_values),
@@ -3632,6 +3723,22 @@ fn build_batch_report_summary(seed_reports: &[BatchSeedAggregate]) -> BatchRepor
         .iter()
         .map(|item| item.report.report_summary.stuck_honest_address_count)
         .sum();
+    let mean_corrupted_holding_values: Vec<f64> = seed_reports
+        .iter()
+        .filter_map(|item| {
+            item.report
+                .report_summary
+                .avg_corrupted_address_holding_seconds
+        })
+        .collect();
+    let median_corrupted_holding_values: Vec<f64> = seed_reports
+        .iter()
+        .filter_map(|item| {
+            item.report
+                .report_summary
+                .median_corrupted_address_holding_seconds
+        })
+        .collect();
     let mean_honest_holder_values: Vec<f64> = seed_reports
         .iter()
         .filter_map(|item| item.report.report_summary.avg_seconds_to_honest_holder)
@@ -3677,6 +3784,14 @@ fn build_batch_report_summary(seed_reports: &[BatchSeedAggregate]) -> BatchRepor
         candidate_contract_count_total: seed_reports
             .iter()
             .map(|item| item.report.report_summary.candidate_contract_count)
+            .sum(),
+        implausible_candidate_contract_count_total: seed_reports
+            .iter()
+            .map(|item| {
+                item.report
+                    .report_summary
+                    .implausible_candidate_contract_count
+            })
             .sum(),
         infringing_nft_count_total: seed_reports
             .iter()
@@ -3764,6 +3879,10 @@ fn build_batch_report_summary(seed_reports: &[BatchSeedAggregate]) -> BatchRepor
             .iter()
             .map(|item| item.report.report_summary.corrupted_honest_address_count)
             .sum(),
+        avg_corrupted_address_holding_seconds_mean: mean(&mean_corrupted_holding_values),
+        median_corrupted_address_holding_seconds_median: median_f64(
+            &median_corrupted_holding_values,
+        ),
         avg_seconds_to_honest_holder_mean: mean(&mean_honest_holder_values),
         median_seconds_to_honest_holder_median: median_f64(&median_honest_holder_values),
         avg_mint_to_first_transfer_seconds_mean: mean(&mean_first_transfer_values),
@@ -3895,6 +4014,7 @@ mod tests {
         let summary = build_report_summary(
             false,
             &BTreeMap::new(),
+            0,
             &[],
             &[],
             &[],
@@ -3933,6 +4053,7 @@ mod tests {
         let summary = build_report_summary(
             false,
             &BTreeMap::new(),
+            0,
             &[],
             &[],
             &[],
@@ -3946,6 +4067,55 @@ mod tests {
 
         assert_eq!(summary.avg_seconds_to_honest_holder, Some(16.0));
         assert_eq!(summary.median_seconds_to_honest_holder, Some(16.0));
+    }
+
+    #[test]
+    fn report_summary_tracks_corrupted_address_holding_duration_stats() {
+        let honest_addresses = vec![
+            HonestAddressPayload {
+                address: "0xcorrupted-fast".into(),
+                is_corrupted_address: true,
+                hold_duration_median_seconds: Some(12.0),
+                ..HonestAddressPayload::default()
+            },
+            HonestAddressPayload {
+                address: "0xcorrupted-slow".into(),
+                is_corrupted_address: true,
+                hold_duration_median_seconds: Some(30.0),
+                ..HonestAddressPayload::default()
+            },
+            HonestAddressPayload {
+                address: "0xvictim-no-duration".into(),
+                is_corrupted_address: true,
+                hold_duration_median_seconds: None,
+                ..HonestAddressPayload::default()
+            },
+            HonestAddressPayload {
+                address: "0xplain-victim".into(),
+                is_corrupted_address: false,
+                hold_duration_median_seconds: Some(100.0),
+                ..HonestAddressPayload::default()
+            },
+        ];
+
+        let summary = build_report_summary(
+            false,
+            &BTreeMap::new(),
+            0,
+            &[],
+            &[],
+            &[],
+            &honest_addresses,
+            &[],
+            &BTreeMap::new(),
+            &[],
+            &[],
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(summary.corrupted_honest_address_count, 3);
+        assert_eq!(summary.avg_corrupted_address_holding_seconds, Some(21.0));
+        assert_eq!(summary.median_corrupted_address_holding_seconds, Some(21.0));
     }
 
     #[test]
@@ -4062,6 +4232,7 @@ mod tests {
         let summary = build_report_summary(
             false,
             &BTreeMap::new(),
+            0,
             &[],
             &[],
             &[],

@@ -1285,6 +1285,151 @@ impl AnalyzeApi for FakeEnrichedApi {
     }
 }
 
+struct PreSeedDeploymentApi {
+    contract_nft_calls: AtomicUsize,
+    transfer_calls: AtomicUsize,
+    owner_calls: AtomicUsize,
+    sale_calls: AtomicUsize,
+}
+
+#[async_trait]
+impl AnalyzeApi for PreSeedDeploymentApi {
+    async fn fetch_contract_metadata(
+        &self,
+        chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _opensea_api_key: &str,
+        contract_address: &str,
+    ) -> Result<ContractMetadata, AppError> {
+        Ok(ContractMetadata {
+            chain: chain.to_string(),
+            contract_address: contract_address.to_string(),
+            token_type: "ERC721".into(),
+            contract_deployer: "0xcreator".into(),
+            deployed_block_number: if contract_address == "0xseed" {
+                200
+            } else {
+                100
+            },
+            owner_address: "0xowner".into(),
+            admin_address: String::new(),
+            proxy_admin_address: String::new(),
+            name: "Azuki".into(),
+            symbol: "AZUKI".into(),
+        })
+    }
+
+    async fn fetch_seed_contract_nfts(
+        &self,
+        chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        contract_address: &str,
+    ) -> Result<Vec<SeedNft>, AppError> {
+        Ok(vec![SeedNft {
+            chain: chain.to_string(),
+            contract_address: contract_address.to_string(),
+            token_id: "1".into(),
+            name: "Azuki #1".into(),
+            symbol: "AZUKI".into(),
+            token_uri: "ipfs://seed/1".into(),
+            image_uri: "ipfs://image/1.png".into(),
+            metadata_json: r#"{"name":"Azuki #1"}"#.into(),
+            metadata_doc: "azuki".into(),
+        }])
+    }
+
+    async fn fetch_contract_nfts(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _etherscan_api_key: &str,
+        _opensea_api_key: &str,
+        _contract_address: &str,
+    ) -> Result<Vec<SeedNft>, AppError> {
+        self.contract_nft_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Vec::new())
+    }
+
+    async fn fetch_contract_transfers(
+        &self,
+        _chain: &str,
+        _etherscan_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _alchemy_api_key: &str,
+        contract_address: &str,
+        _token_type: &str,
+    ) -> Result<Vec<TransferRecord>, AppError> {
+        if contract_address != "0xseed" {
+            self.transfer_calls.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(Vec::new())
+    }
+
+    async fn fetch_contract_owners(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _contract_address: &str,
+    ) -> Result<Vec<OwnerBalance>, AppError> {
+        self.owner_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Vec::new())
+    }
+
+    async fn fetch_contract_sales(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _contract_address: &str,
+        _opensea_api_key: &str,
+    ) -> Result<Vec<NftSaleRecord>, AppError> {
+        self.sale_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Vec::new())
+    }
+
+    async fn fetch_transaction_receipt(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _tx_hash: &str,
+    ) -> Result<TransactionReceiptRecord, AppError> {
+        Ok(TransactionReceiptRecord::default())
+    }
+
+    async fn fetch_transaction_receipts_for_block(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _block_number: i64,
+    ) -> Result<BTreeMap<String, TransactionReceiptRecord>, AppError> {
+        Ok(BTreeMap::new())
+    }
+
+    async fn fetch_eth_balance(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _address: &str,
+        _block_number: i64,
+    ) -> Result<f64, AppError> {
+        Ok(0.0)
+    }
+
+    async fn fetch_same_block_eth_transfers_for_address(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _block_number: i64,
+        _address: &str,
+    ) -> Result<Vec<EthTransferRecord>, AppError> {
+        Ok(Vec::new())
+    }
+}
+
 #[derive(Default)]
 struct FakeLegitApi {
     sales_calls: AtomicUsize,
@@ -3916,6 +4061,68 @@ async fn analyze_enriches_duplicate_contracts_with_signals_and_infringing_tokens
             && event.event_type == "mint_payment"
             && event.tx_hash == "0xmint"
     }));
+}
+
+#[tokio::test]
+async fn analyze_filters_candidates_deployed_before_seed_contract() {
+    let api = Arc::new(PreSeedDeploymentApi {
+        contract_nft_calls: AtomicUsize::new(0),
+        transfer_calls: AtomicUsize::new(0),
+        owner_calls: AtomicUsize::new(0),
+        sale_calls: AtomicUsize::new(0),
+    });
+    let deps = AnalysisDeps {
+        api: api.clone(),
+        feature_store: Arc::new(FakeFeatureStore {
+            snapshot: DatabaseSnapshot {
+                nft_rows: vec![DatabaseNftRecord {
+                    contract_address: "0xold".into(),
+                    token_id: "1".into(),
+                    token_uri: "ipfs://seed/1".into(),
+                    image_uri: "ipfs://image/1.png".into(),
+                    name: "Azuki Mirror #1".into(),
+                    symbol: "AZUKI".into(),
+                    metadata_json: r#"{"name":"Azuki Mirror #1"}"#.into(),
+                    metadata_doc: "azuki".into(),
+                    metadata_recall_checked: false,
+                    metadata_recall_match: false,
+                }],
+                ..DatabaseSnapshot::default()
+            },
+        }),
+        signal_cache: None,
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    let payload = analyze_seed_contract(
+        AnalyzeRequest {
+            chain: "ethereum".into(),
+            seed_contract_address: "0xseed".into(),
+            alchemy_api_key: "key".into(),
+            ..AnalyzeRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(payload.report_summary.candidate_contract_count, 0);
+    assert_eq!(
+        payload.report_summary.implausible_candidate_contract_count,
+        1
+    );
+    assert_eq!(payload.report_summary.infringing_nft_count, 0);
+    assert!(payload.duplicate_candidates.is_empty());
+    assert!(payload.duplicate_contracts.is_empty());
+    assert!(!payload
+        .contract_lifecycle_events
+        .iter()
+        .any(|event| event.contract_address == "0xold"));
+    assert_eq!(api.contract_nft_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(api.transfer_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(api.owner_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(api.sale_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

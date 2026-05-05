@@ -147,6 +147,10 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
             }
         ),
         format!("- 重复候选合约数: {}", summary.candidate_contract_count),
+        format!(
+            "- 不合理候选合约数: {}",
+            summary.implausible_candidate_contract_count
+        ),
         format!("- 疑似侵权 NFT 总数: {}", summary.infringing_nft_count),
         format!("- 恶意地址数: {}", summary.malicious_address_count),
         format!("- 诚实地址数: {}", summary.honest_address_count),
@@ -224,6 +228,14 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
         format!(
             "- 被腐化的地址数: {}",
             summary.corrupted_honest_address_count
+        ),
+        format!(
+            "- 被腐化地址持有时长平均数: {} 秒",
+            format_scalar(summary.avg_corrupted_address_holding_seconds)
+        ),
+        format!(
+            "- 被腐化地址持有时长中位数: {} 秒",
+            format_scalar(summary.median_corrupted_address_holding_seconds)
         ),
         format!(
             "- Mint 到被诚实节点购买平均时间: {} 秒",
@@ -375,6 +387,10 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
             summary.candidate_contract_count_total
         ),
         format!(
+            "- 不合理候选合约总数: {}",
+            summary.implausible_candidate_contract_count_total
+        ),
+        format!(
             "- 疑似侵权 NFT 总数: {}",
             summary.infringing_nft_count_total
         ),
@@ -436,6 +452,14 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
         format!(
             "- 被腐化的诚实地址总数: {}",
             summary.corrupted_honest_address_count_total
+        ),
+        format!(
+            "- 被腐化地址持有时长平均数(跨 seed 均值): {} 秒",
+            format_scalar(summary.avg_corrupted_address_holding_seconds_mean)
+        ),
+        format!(
+            "- 被腐化地址持有时长中位数(跨 seed 中位数): {} 秒",
+            format_scalar(summary.median_corrupted_address_holding_seconds_median)
         ),
         format!(
             "- Mint 到被诚实节点购买平均时间(跨 seed 均值): {} 秒",

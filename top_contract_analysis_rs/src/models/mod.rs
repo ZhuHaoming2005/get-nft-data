@@ -306,6 +306,8 @@ pub struct SeedContractPayload {
 pub struct ReportSummary {
     pub open_license_detected: bool,
     pub candidate_contract_count: i64,
+    #[serde(default)]
+    pub implausible_candidate_contract_count: i64,
     pub infringing_nft_count: i64,
     pub malicious_address_count: i64,
     pub honest_address_count: i64,
@@ -349,6 +351,8 @@ pub struct ReportSummary {
     pub stuck_honest_address_count: i64,
     pub stuck_honest_address_ratio: Option<f64>,
     pub corrupted_honest_address_count: i64,
+    pub avg_corrupted_address_holding_seconds: Option<f64>,
+    pub median_corrupted_address_holding_seconds: Option<f64>,
     pub avg_seconds_to_honest_holder: Option<f64>,
     pub median_seconds_to_honest_holder: Option<f64>,
     pub avg_mint_to_first_transfer_seconds: Option<f64>,
@@ -951,6 +955,8 @@ pub struct BatchReportSummary {
     pub chains: Vec<String>,
     pub open_license_detected_count: i64,
     pub candidate_contract_count_total: i64,
+    #[serde(default)]
+    pub implausible_candidate_contract_count_total: i64,
     pub infringing_nft_count_total: i64,
     pub malicious_address_count_total: i64,
     pub honest_address_count_total: i64,
@@ -993,6 +999,8 @@ pub struct BatchReportSummary {
     pub stuck_honest_address_count_total: i64,
     pub stuck_honest_address_ratio_overall: Option<f64>,
     pub corrupted_honest_address_count_total: i64,
+    pub avg_corrupted_address_holding_seconds_mean: Option<f64>,
+    pub median_corrupted_address_holding_seconds_median: Option<f64>,
     pub avg_seconds_to_honest_holder_mean: Option<f64>,
     pub median_seconds_to_honest_holder_median: Option<f64>,
     pub avg_mint_to_first_transfer_seconds_mean: Option<f64>,
