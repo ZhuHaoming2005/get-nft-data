@@ -1256,10 +1256,14 @@ fn classify_json_metadata_modifications(seed: &str, value: &str) -> Vec<String> 
         if normalize_text(seed_trimmed) == normalize_text(value_trimmed)
             && !value_trimmed.is_empty()
         {
-            return vec!["metadata_unchanged".to_string()];
+            return vec!["exact_match".to_string()];
         }
         return vec!["unparseable_changed".to_string()];
     };
+
+    if seed_json == value_json {
+        return vec!["exact_match".to_string()];
+    }
 
     let mut labels = BTreeSet::new();
     diff_metadata_json(&seed_json, &value_json, &mut Vec::new(), &mut labels);
@@ -1291,11 +1295,15 @@ fn diff_metadata_json(
                     (Some(seed_value), Some(value_value)) => {
                         diff_metadata_json(seed_value, value_value, path, labels);
                     }
-                    (None, Some(_value_value)) => {
-                        add_metadata_change(path, "added", labels);
+                    (None, Some(value_value)) => {
+                        if metadata_value_has_content(value_value) {
+                            add_metadata_change(path, "added", labels);
+                        }
                     }
-                    (Some(_seed_value), None) => {
-                        add_metadata_change(path, "removed", labels);
+                    (Some(seed_value), None) => {
+                        if metadata_value_has_content(seed_value) {
+                            add_metadata_change(path, "removed", labels);
+                        }
                     }
                     (None, None) => {}
                 }
@@ -1316,12 +1324,18 @@ fn diff_metadata_json(
                 diff_metadata_json(&seed_items[index], &value_items[index], path, labels);
                 path.pop();
             }
-            for _ in &value_items[common_len..] {
+            for value_item in &value_items[common_len..] {
+                if !metadata_value_has_content(value_item) {
+                    continue;
+                }
                 path.push(common_len.to_string());
                 add_metadata_change(path, "added", labels);
                 path.pop();
             }
-            for _ in &seed_items[common_len..] {
+            for seed_item in &seed_items[common_len..] {
+                if !metadata_value_has_content(seed_item) {
+                    continue;
+                }
                 path.push(common_len.to_string());
                 add_metadata_change(path, "removed", labels);
                 path.pop();
@@ -1332,6 +1346,16 @@ fn diff_metadata_json(
             let operation_region = metadata_region_for_path(path);
             add_metadata_label(operation_region, "replaced", labels);
         }
+    }
+}
+
+fn metadata_value_has_content(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(_) | Value::Number(_) => true,
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Array(items) => items.iter().any(metadata_value_has_content),
+        Value::Object(map) => map.values().any(metadata_value_has_content),
     }
 }
 
@@ -1912,7 +1936,7 @@ fn push_metadata_matrix_summary<'a>(
     out.push_str(&format!(
         "- non-content-bearing changes: {non_content_total}\n"
     ));
-    for label in ["unparseable_changed", "metadata_unchanged"] {
+    for label in ["exact_match", "metadata_unchanged", "unparseable_changed"] {
         if let Some(count) = residual_counts.get(label) {
             out.push_str(&format!("- {label}: {count}\n"));
         }
@@ -2500,6 +2524,26 @@ mod tests {
     }
 
     #[test]
+    fn metadata_exact_match_is_reported_separately_from_unchanged() {
+        let labels = classify_metadata_modifications(
+            r#"{"name":"Seed","image":"ipfs://seed"}"#,
+            r#"{"name":"Seed","image":"ipfs://seed"}"#,
+        );
+
+        assert_eq!(labels, vec!["exact_match"]);
+    }
+
+    #[test]
+    fn metadata_empty_optional_field_additions_do_not_inflate_changes() {
+        let labels = classify_metadata_modifications(
+            r#"{"name":"Seed","image":"ipfs://seed"}"#,
+            r#"{"name":"Seed","image":"ipfs://seed","external_url":null,"description":"","attributes":[]}"#,
+        );
+
+        assert_eq!(labels, vec!["metadata_unchanged"]);
+    }
+
+    #[test]
     fn metadata_unparseable_is_not_other() {
         let labels =
             classify_metadata_modifications(r#"{"name":"Seed"}"#, "not valid json metadata");
@@ -2518,7 +2562,7 @@ mod tests {
         );
         assert_eq!(
             classify_metadata_modifications("background gold", "background gold"),
-            vec!["metadata_unchanged"]
+            vec!["exact_match"]
         );
     }
 
@@ -2535,6 +2579,8 @@ mod tests {
                     matches: vec![
                         r#"{"name":"Copy","image":"ipfs://copy","seller_fee_basis_points":750}"#
                             .into(),
+                        r#"{"name":"Seed","title":"Old","image":"ipfs://seed","seller_fee_basis_points":500}"#
+                            .into(),
                     ],
                     labeled_matches: Vec::new(),
                 },
@@ -2550,6 +2596,7 @@ mod tests {
         assert!(output.contains("| replaced | 1 | 0 | 0 | 1 | 0 | 1 | 0 |"));
         assert!(output.contains("- content-bearing changes: 1"));
         assert!(output.contains("- non-content-bearing changes: 1"));
+        assert!(output.contains("- exact_match: 1"));
     }
 
     #[test]
