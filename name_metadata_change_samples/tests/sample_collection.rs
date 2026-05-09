@@ -201,20 +201,20 @@ fn collect_samples_prefers_json_metadata_for_path_based_matrix() {
         &[
             TestRow::new("0xseed", "1")
                 .name("Azuki #1")
-                .metadata_doc("gold dragon red background"),
-            TestRow::new("0xseed", "2")
-                .name("Azuki #2")
                 .metadata_json(
                     r#"{"description":"gold dragon","attributes":[{"trait_type":"Background","value":"Red"}],"image":"ipfs://seed/image.png"}"#,
                 ),
-            TestRow::new("0xcopy", "1")
-                .name("Changed Creature")
+            TestRow::new("0xseed", "2")
+                .name("Azuki #2")
                 .metadata_doc("gold dragon red background"),
-            TestRow::new("0xcopy", "2")
+            TestRow::new("0xcopy", "1")
                 .name("Changed Creature")
                 .metadata_json(
                     r#"{"description":"gold dragon","attributes":[{"trait_type":"Background","value":"Red"}],"image":"ipfs://copy/image.png"}"#,
                 ),
+            TestRow::new("0xcopy", "2")
+                .name("Changed Creature")
+                .metadata_doc("gold dragon red background"),
         ],
     );
     fs::write(&input_path, "0xseed\n").unwrap();
@@ -275,6 +275,40 @@ fn collect_samples_rechecks_representative_metadata_candidates_by_overlapping_to
         .metadata
         .matches
         .contains(&rejected_overlap.to_string()));
+}
+
+#[test]
+fn collect_samples_reports_metadata_seed_from_matched_token_id() {
+    let temp = tempdir().unwrap();
+    let db_path = temp.path().join("features.duckdb");
+    let input_path = temp.path().join("contracts.txt");
+    let output_path = temp.path().join("samples.md");
+    let unmatched_seed_metadata = r#"{"description":"shared collection","image":"ipfs://same","seller_fee_basis_points":500}"#;
+    let matched_seed_metadata = r#"{"description":"shared collection","image":"ipfs://same","seller_fee_basis_points":750}"#;
+
+    write_feature_db(
+        &db_path,
+        &[
+            TestRow::new("0xseed", "1").metadata_json(unmatched_seed_metadata),
+            TestRow::new("0xseed", "2").metadata_json(matched_seed_metadata),
+            TestRow::new("0xcopy", "2").metadata_json(matched_seed_metadata),
+        ],
+    );
+    fs::write(&input_path, "0xseed\n").unwrap();
+
+    let mut sample_config = config(db_path, input_path, output_path.clone());
+    sample_config.metadata_threshold = 0.1;
+    let report = collect_samples(sample_config).unwrap();
+    let metadata = &report.seed_reports[0].metadata;
+
+    assert_eq!(metadata.seed, matched_seed_metadata);
+    assert_eq!(metadata.matches, vec![matched_seed_metadata]);
+    assert_eq!(metadata.labeled_matches[0].labels, vec!["exact_match"]);
+    assert_eq!(metadata.paired_matches[0].seed, matched_seed_metadata);
+
+    let output = fs::read_to_string(output_path).unwrap();
+    assert!(output.contains(matched_seed_metadata));
+    assert!(!output.contains(unmatched_seed_metadata));
 }
 
 #[test]
@@ -458,20 +492,30 @@ fn collect_samples_reports_serial_in_contract_progress_without_addresses() {
     })
     .unwrap();
 
-    assert_eq!(events.len(), 20);
+    assert_eq!(events.len(), 28);
     assert!(events.iter().all(|event| event.1 == 2));
-    assert!(events.iter().all(|event| event.4 == 10));
+    assert!(events.iter().all(|event| event.4 == 14));
     assert_eq!(events[0].0, 1);
     assert_eq!(events[0].2, SampleProgressStage::ReadSeedRows);
     assert_eq!(events[3].2, SampleProgressStage::PrepareMetadataQuery);
-    assert_eq!(events[4].2, SampleProgressStage::CollectMetadataCandidates);
-    assert_eq!(events[5].2, SampleProgressStage::ScoreMetadataPrefilter);
-    assert_eq!(events[6].2, SampleProgressStage::LoadOverlappingMetadata);
-    assert_eq!(events[7].2, SampleProgressStage::ScoreOverlappingMetadata);
-    assert_eq!(events[8].2, SampleProgressStage::BuildReport);
-    assert_eq!(events[9].0, 1);
-    assert_eq!(events[9].2, SampleProgressStage::FinishedSeed);
-    assert_eq!(events[9].5, Some(1));
-    assert_eq!(events[19].0, 2);
-    assert_eq!(events[19].2, SampleProgressStage::FinishedSeed);
+    assert_eq!(events[4].2, SampleProgressStage::BuildMetadataSeedDoc);
+    assert_eq!(events[5].2, SampleProgressStage::BuildMetadataSeedSketch);
+    assert_eq!(
+        events[6].2,
+        SampleProgressStage::CollectMetadataSourceBuckets
+    );
+    assert_eq!(
+        events[7].2,
+        SampleProgressStage::VerifyMetadataSourceBuckets
+    );
+    assert_eq!(events[8].2, SampleProgressStage::CollectMetadataCandidates);
+    assert_eq!(events[9].2, SampleProgressStage::ScoreMetadataPrefilter);
+    assert_eq!(events[10].2, SampleProgressStage::LoadOverlappingMetadata);
+    assert_eq!(events[11].2, SampleProgressStage::ScoreOverlappingMetadata);
+    assert_eq!(events[12].2, SampleProgressStage::BuildReport);
+    assert_eq!(events[13].0, 1);
+    assert_eq!(events[13].2, SampleProgressStage::FinishedSeed);
+    assert_eq!(events[13].5, Some(1));
+    assert_eq!(events[27].0, 2);
+    assert_eq!(events[27].2, SampleProgressStage::FinishedSeed);
 }

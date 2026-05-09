@@ -68,7 +68,7 @@ const METADATA_BM25_K1: f64 = 1.2;
 const METADATA_BM25_B: f64 = 0.75;
 const MAX_METADATA_BYTES_FOR_DEDUP: usize = 64 * 1024;
 const MAX_OVERLAPPING_METADATA_ROWS_PER_CONTRACT: usize = 1;
-const SAMPLE_PROGRESS_STAGE_COUNT: usize = 10;
+const SAMPLE_PROGRESS_STAGE_COUNT: usize = 14;
 const METADATA_SKETCH_ANCHOR_COUNT: usize = 8;
 const METADATA_SKETCH_SOURCE_HAMMING_THRESHOLD: u32 = 24;
 const METADATA_SIMHASH_BAND_COUNT: usize = 8;
@@ -100,7 +100,7 @@ pub struct SampleReport {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SeedSampleReport {
     pub name: TextComparison,
-    pub metadata: TextComparison,
+    pub metadata: MetadataComparison,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -108,6 +108,21 @@ pub struct TextComparison {
     pub seed: String,
     pub matches: Vec<String>,
     pub labeled_matches: Vec<LabeledTextMatch>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MetadataComparison {
+    pub seed: String,
+    pub matches: Vec<String>,
+    pub labeled_matches: Vec<LabeledTextMatch>,
+    pub paired_matches: Vec<MetadataPairMatch>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MetadataPairMatch {
+    pub seed: String,
+    pub text: String,
+    pub labels: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -122,6 +137,10 @@ pub enum SampleProgressStage {
     LoadNameCandidates,
     ScoreNameCandidates,
     PrepareMetadataQuery,
+    BuildMetadataSeedDoc,
+    BuildMetadataSeedSketch,
+    CollectMetadataSourceBuckets,
+    VerifyMetadataSourceBuckets,
     CollectMetadataCandidates,
     ScoreMetadataPrefilter,
     LoadOverlappingMetadata,
@@ -196,6 +215,7 @@ struct NormalizedNameEntry {
 struct SampleScratch {
     metadata_seen_epochs: Vec<u32>,
     metadata_epoch: u32,
+    metadata_verify_count: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -228,6 +248,7 @@ impl SampleScratch {
         Self {
             metadata_seen_epochs: vec![0; metadata_len],
             metadata_epoch: 0,
+            metadata_verify_count: 0,
         }
     }
 
@@ -376,7 +397,7 @@ fn process_seed_contract(
         position.index,
         position.total,
         SampleProgressStage::BuildReport,
-        9,
+        13,
         None,
     );
 
@@ -390,7 +411,7 @@ fn process_seed_contract(
         position.index,
         position.total,
         SampleProgressStage::FinishedSeed,
-        10,
+        14,
         Some(match_count),
     );
     Ok(report)
@@ -596,29 +617,23 @@ fn load_metadata_index(
                    coalesce(CAST(metadata_json AS VARCHAR), '') AS metadata_json
             FROM nft_features
             WHERE chain = ?
-              AND length(trim(coalesce(CAST(metadata_json AS VARCHAR), ''))) <= 65536
-              AND (
-                  trim(coalesce(CAST(metadata_json AS VARCHAR), '')) LIKE '{%'
-                  OR trim(coalesce(CAST(metadata_json AS VARCHAR), '')) LIKE '[%'
-              )
         ),
         ranked AS (
             SELECT contract_address, token_id, metadata_doc, metadata_json,
                    row_number() OVER (
                        PARTITION BY contract_address
-                       ORDER BY CASE
-                           WHEN trim(metadata_json) LIKE '{%' OR trim(metadata_json) LIKE '[%' THEN 0
-                           WHEN trim(metadata_json) <> '' THEN 1
-                           WHEN trim(metadata_doc) <> '' THEN 2
-                           ELSE 3
-                       END, token_id
+                       ORDER BY token_id
                    ) AS metadata_rank
             FROM selected
         )
         SELECT contract_address, metadata_doc, metadata_json
         FROM ranked
         WHERE metadata_rank = 1
-          AND (trim(metadata_doc) <> '' OR trim(metadata_json) <> '')
+          AND length(trim(metadata_json)) <= 65536
+          AND (
+              trim(metadata_json) LIKE '{%'
+              OR trim(metadata_json) LIKE '[%'
+          )
         ORDER BY contract_address
         ",
     )?;
@@ -828,21 +843,8 @@ fn seed_name_norms(rows: &[NftTextRow]) -> Vec<String> {
 }
 
 fn first_seed_metadata(rows: &[NftTextRow]) -> String {
-    rows.iter()
-        .find_map(|row| {
-            if metadata_is_dedup_eligible(&row.metadata_doc, &row.metadata_json)
-                && !row.metadata_json.trim().is_empty()
-            {
-                non_empty(&row.metadata_json)
-            } else {
-                None
-            }
-        })
-        .or_else(|| {
-            rows.iter().find_map(|row| {
-                non_empty(&record_metadata_text(&row.metadata_doc, &row.metadata_json))
-            })
-        })
+    rows.first()
+        .and_then(|row| non_empty(&record_metadata_text(&row.metadata_doc, &row.metadata_json)))
         .unwrap_or_default()
 }
 
@@ -913,7 +915,7 @@ fn exact_name_candidate_indices(
 }
 
 fn seed_metadata_prefilter_text(seed_rows: &[NftTextRow]) -> Option<String> {
-    seed_rows.iter().find_map(|row| {
+    seed_rows.first().and_then(|row| {
         non_empty(&record_metadata_prefilter_text(
             &row.metadata_doc,
             &row.metadata_json,
@@ -932,11 +934,19 @@ fn match_metadata(
     limit: usize,
     position: SeedPosition,
     progress: &mut impl FnMut(SampleProgress),
-) -> Result<Vec<String>, duckdb::Error> {
+) -> Result<Vec<FinalMetadataMatch>, duckdb::Error> {
     let Some(scoring_seed_metadata) = seed_metadata_prefilter_text(seed_rows) else {
         emit_empty_metadata_scoring_progress(progress, position);
         return Ok(Vec::new());
     };
+    emit_progress(
+        progress,
+        position.index,
+        position.total,
+        SampleProgressStage::BuildMetadataSeedDoc,
+        5,
+        Some(scoring_seed_metadata.len()),
+    );
     let Some(seed_doc) = MetadataDocument::from_text_with_vocab(
         &scoring_seed_metadata,
         &text_index.metadata_token_ids,
@@ -967,22 +977,49 @@ fn match_metadata(
         return Ok(Vec::new());
     }
 
+    emit_progress(
+        progress,
+        position.index,
+        position.total,
+        SampleProgressStage::BuildMetadataSeedSketch,
+        6,
+        Some(seed_doc.unique_tokens.len()),
+    );
     let seed_sketch = metadata_sketch_from_document(&seed_doc, corpus.total_docs, |token| {
         corpus.document_frequency(token)
     });
-    let candidate_indices = collect_metadata_source_indices(
+    let source_bucket_indices =
+        collect_metadata_source_bucket_indices(&seed_sketch, text_index, scratch);
+    emit_progress(
+        progress,
+        position.index,
+        position.total,
+        SampleProgressStage::CollectMetadataSourceBuckets,
+        7,
+        Some(source_bucket_indices.len()),
+    );
+    let candidate_indices = verify_metadata_source_bucket_indices(
         &seed_sketch,
         text_index,
         scratch,
         &seed_contract,
         METADATA_SKETCH_SOURCE_HAMMING_THRESHOLD,
+        source_bucket_indices,
+    );
+    emit_progress(
+        progress,
+        position.index,
+        position.total,
+        SampleProgressStage::VerifyMetadataSourceBuckets,
+        8,
+        Some(scratch.metadata_verify_count),
     );
     emit_progress(
         progress,
         position.index,
         position.total,
         SampleProgressStage::CollectMetadataCandidates,
-        5,
+        9,
         Some(candidate_indices.len()),
     );
 
@@ -992,7 +1029,7 @@ fn match_metadata(
         position.index,
         position.total,
         SampleProgressStage::ScoreMetadataPrefilter,
-        6,
+        10,
         Some(candidate_indices.len()),
     );
     let matched_indices = candidate_indices
@@ -1013,7 +1050,7 @@ fn match_metadata(
         position.index,
         position.total,
         SampleProgressStage::LoadOverlappingMetadata,
-        7,
+        11,
         Some(candidate_contracts.len()),
     );
     let matches = final_metadata_matches_for_overlapping_tokens(
@@ -1029,89 +1066,41 @@ fn match_metadata(
         position.index,
         position.total,
         SampleProgressStage::ScoreOverlappingMetadata,
-        8,
+        12,
         Some(matches.len()),
     );
     Ok(matches)
 }
 
-fn collect_metadata_source_indices(
+fn collect_metadata_source_bucket_indices(
     seed_sketch: &MetadataSketch,
     text_index: &TextIndex,
     scratch: &mut SampleScratch,
-    seed_contract: &str,
-    hamming_threshold: u32,
 ) -> Vec<usize> {
+    scratch.metadata_verify_count = 0;
     if seed_sketch.is_empty() {
         return Vec::new();
     }
-    let epoch = scratch.next_metadata_epoch();
     if !text_index.metadata_source_index.is_empty() {
-        return collect_metadata_source_indices_from_index(
-            seed_sketch,
-            text_index,
-            scratch,
-            seed_contract,
-            hamming_threshold,
-            epoch,
-        );
+        return collect_metadata_source_bucket_indices_from_index(seed_sketch, text_index);
     }
-
-    let mut source_indices = text_index
-        .metadata
-        .par_iter()
-        .enumerate()
-        .filter_map(|(index, candidate)| {
-            if candidate.contract_address == seed_contract {
-                return None;
-            }
-            metadata_sketch_source_match(seed_sketch, &candidate.sketch, hamming_threshold)
-                .then_some(index)
-        })
-        .collect::<Vec<_>>();
-    source_indices.sort_unstable();
-    source_indices.dedup();
-
-    let mut unique_source_indices = Vec::with_capacity(source_indices.len());
-    for index in source_indices {
-        if scratch.metadata_seen_epochs[index] == epoch {
-            continue;
-        }
-        scratch.metadata_seen_epochs[index] = epoch;
-        unique_source_indices.push(index);
-    }
-    unique_source_indices
+    (0..text_index.metadata.len()).collect()
 }
 
-fn collect_metadata_source_indices_from_index(
+fn collect_metadata_source_bucket_indices_from_index(
     seed_sketch: &MetadataSketch,
     text_index: &TextIndex,
-    scratch: &mut SampleScratch,
-    seed_contract: &str,
-    hamming_threshold: u32,
-    epoch: u32,
 ) -> Vec<usize> {
-    let mut source_indices = Vec::new();
+    let mut bucket_indices = Vec::new();
 
     for anchor in &seed_sketch.anchors {
         let Some(indices) = text_index.metadata_source_index.anchor_indices.get(anchor) else {
             continue;
         };
-        for index in indices {
-            push_metadata_source_if_match(
-                *index,
-                seed_sketch,
-                text_index,
-                scratch,
-                seed_contract,
-                hamming_threshold,
-                epoch,
-                &mut source_indices,
-            );
-        }
+        bucket_indices.extend(indices.iter().copied());
     }
 
-    let band_radius = hamming_threshold / METADATA_SIMHASH_BAND_COUNT as u32;
+    let band_radius = METADATA_SKETCH_SOURCE_HAMMING_THRESHOLD / METADATA_SIMHASH_BAND_COUNT as u32;
     for band_index in 0..METADATA_SIMHASH_BAND_COUNT {
         let seed_band = metadata_simhash_band_value(seed_sketch.simhash, band_index);
         for band_value in 0..METADATA_SIMHASH_BAND_VALUES {
@@ -1127,46 +1116,41 @@ fn collect_metadata_source_indices_from_index(
             else {
                 continue;
             };
-            for index in indices {
-                push_metadata_source_if_match(
-                    *index,
-                    seed_sketch,
-                    text_index,
-                    scratch,
-                    seed_contract,
-                    hamming_threshold,
-                    epoch,
-                    &mut source_indices,
-                );
-            }
+            bucket_indices.extend(indices.iter().copied());
         }
     }
 
-    source_indices.sort_unstable();
-    source_indices
+    bucket_indices.sort_unstable();
+    bucket_indices.dedup();
+    bucket_indices
 }
 
-fn push_metadata_source_if_match(
-    index: usize,
+fn verify_metadata_source_bucket_indices(
     seed_sketch: &MetadataSketch,
     text_index: &TextIndex,
     scratch: &mut SampleScratch,
     seed_contract: &str,
     hamming_threshold: u32,
-    epoch: u32,
-    source_indices: &mut Vec<usize>,
-) {
-    if scratch.metadata_seen_epochs[index] == epoch {
-        return;
+    bucket_indices: Vec<usize>,
+) -> Vec<usize> {
+    let epoch = scratch.next_metadata_epoch();
+    scratch.metadata_verify_count = 0;
+    let mut source_indices = Vec::new();
+    for index in bucket_indices {
+        if scratch.metadata_seen_epochs[index] == epoch {
+            continue;
+        }
+        scratch.metadata_seen_epochs[index] = epoch;
+        let candidate = &text_index.metadata[index];
+        if candidate.contract_address == seed_contract {
+            continue;
+        }
+        scratch.metadata_verify_count += 1;
+        if metadata_sketch_source_match(seed_sketch, &candidate.sketch, hamming_threshold) {
+            source_indices.push(index);
+        }
     }
-    let candidate = &text_index.metadata[index];
-    if candidate.contract_address == seed_contract
-        || !metadata_sketch_source_match(seed_sketch, &candidate.sketch, hamming_threshold)
-    {
-        return;
-    }
-    scratch.metadata_seen_epochs[index] = epoch;
-    source_indices.push(index);
+    source_indices
 }
 
 fn metadata_sketch_source_match(
@@ -1201,10 +1185,14 @@ fn emit_empty_metadata_scoring_progress(
     position: SeedPosition,
 ) {
     for (stage, stage_index) in [
-        (SampleProgressStage::CollectMetadataCandidates, 5),
-        (SampleProgressStage::ScoreMetadataPrefilter, 6),
-        (SampleProgressStage::LoadOverlappingMetadata, 7),
-        (SampleProgressStage::ScoreOverlappingMetadata, 8),
+        (SampleProgressStage::BuildMetadataSeedDoc, 5),
+        (SampleProgressStage::BuildMetadataSeedSketch, 6),
+        (SampleProgressStage::CollectMetadataSourceBuckets, 7),
+        (SampleProgressStage::VerifyMetadataSourceBuckets, 8),
+        (SampleProgressStage::CollectMetadataCandidates, 9),
+        (SampleProgressStage::ScoreMetadataPrefilter, 10),
+        (SampleProgressStage::LoadOverlappingMetadata, 11),
+        (SampleProgressStage::ScoreOverlappingMetadata, 12),
     ] {
         emit_progress(
             progress,
@@ -1223,6 +1211,11 @@ struct FinalMetadataRow {
     doc: MetadataDocument,
 }
 
+struct FinalMetadataMatch {
+    seed_text: String,
+    match_text: String,
+}
+
 fn final_metadata_matches_for_overlapping_tokens(
     conn: &Connection,
     chain: &str,
@@ -1230,7 +1223,7 @@ fn final_metadata_matches_for_overlapping_tokens(
     candidate_contracts: &[String],
     threshold: f64,
     limit: usize,
-) -> Result<Vec<String>, duckdb::Error> {
+) -> Result<Vec<FinalMetadataMatch>, duckdb::Error> {
     if candidate_contracts.is_empty() {
         return Ok(Vec::new());
     }
@@ -1247,19 +1240,25 @@ fn final_metadata_matches_for_overlapping_tokens(
         &seed_token_ids,
         &mut token_interner,
     )?;
-    let mut matches = BTreeSet::new();
+    let mut matches = Vec::new();
+    let mut seen_match_texts = BTreeSet::new();
     for contract in candidate_contracts {
         let Some(rows) = candidate_rows.get(contract) else {
             continue;
         };
-        if let Some(text) = first_overlapping_metadata_match(&seed_docs, rows, threshold) {
-            matches.insert(text);
+        if let Some(match_pair) = first_overlapping_metadata_match(&seed_docs, rows, threshold) {
+            if seen_match_texts.insert(match_pair.match_text.clone()) {
+                matches.push(match_pair);
+            }
         }
         if limit > 0 && matches.len() >= limit {
             break;
         }
     }
-    Ok(take_recall_limit(matches, limit))
+    if limit > 0 && matches.len() > limit {
+        matches.truncate(limit);
+    }
+    Ok(matches)
 }
 
 fn seed_metadata_docs_by_token(
@@ -1271,12 +1270,14 @@ fn seed_metadata_docs_by_token(
         if row.token_id.trim().is_empty() {
             continue;
         }
-        let text = record_metadata_doc(&row.metadata_doc, &row.metadata_json);
-        let Some(doc) = MetadataDocument::from_text_with_interner(&text, token_interner) else {
+        let display_text = record_metadata_text(&row.metadata_doc, &row.metadata_json);
+        let scoring_text = record_metadata_doc(&row.metadata_doc, &row.metadata_json);
+        let Some(doc) = MetadataDocument::from_text_with_interner(&scoring_text, token_interner)
+        else {
             continue;
         };
         docs.entry(row.token_id.clone())
-            .or_insert_with(|| PreparedSingleMetadataQuery::new(doc));
+            .or_insert_with(|| PreparedSingleMetadataQuery::new(display_text, doc));
     }
     docs
 }
@@ -1313,26 +1314,19 @@ fn read_candidate_metadata_rows(
                        coalesce(CAST(metadata_json AS VARCHAR), '') AS metadata_json,
                        row_number() OVER (
                            PARTITION BY lower(contract_address)
-                           ORDER BY CASE
-                               WHEN trim(coalesce(CAST(metadata_json AS VARCHAR), '')) LIKE '{{%'
-                                    OR trim(coalesce(CAST(metadata_json AS VARCHAR), '')) LIKE '[%' THEN 0
-                               WHEN trim(coalesce(CAST(metadata_json AS VARCHAR), '')) <> '' THEN 1
-                               WHEN trim(coalesce(CAST(metadata_doc AS VARCHAR), '')) <> '' THEN 2
-                               ELSE 3
-                           END,
-                           CAST(token_id AS VARCHAR)
+                           ORDER BY CAST(token_id AS VARCHAR)
                        ) AS overlap_rank
                 FROM nft_features
                 WHERE chain = ?
                   AND lower(contract_address) IN ({contract_values})
                   AND CAST(token_id AS VARCHAR) IN ({token_values})
-                  AND length(trim(coalesce(CAST(metadata_json AS VARCHAR), ''))) <= {MAX_METADATA_BYTES_FOR_DEDUP}
-                  AND (
-                      trim(coalesce(CAST(metadata_json AS VARCHAR), '')) LIKE '{{%'
-                      OR trim(coalesce(CAST(metadata_json AS VARCHAR), '')) LIKE '[%'
-                  )
             )
             WHERE overlap_rank <= {MAX_OVERLAPPING_METADATA_ROWS_PER_CONTRACT}
+              AND length(trim(metadata_json)) <= {MAX_METADATA_BYTES_FOR_DEDUP}
+              AND (
+                  trim(metadata_json) LIKE '{{%'
+                  OR trim(metadata_json) LIKE '[%'
+              )
             ORDER BY contract_address, token_id
             "
         );
@@ -1371,11 +1365,14 @@ fn first_overlapping_metadata_match(
     seed_queries: &BTreeMap<String, PreparedSingleMetadataQuery>,
     rows: &[FinalMetadataRow],
     threshold: f64,
-) -> Option<String> {
+) -> Option<FinalMetadataMatch> {
     if rows.len() == 1 {
         let row = &rows[0];
         let seed_query = seed_queries.get(&row.token_id)?;
-        return (seed_query.score(&row.doc) >= threshold).then(|| row.text.trim().to_string());
+        return (seed_query.score(&row.doc) >= threshold).then(|| FinalMetadataMatch {
+            seed_text: seed_query.text.trim().to_string(),
+            match_text: row.text.trim().to_string(),
+        });
     }
 
     let corpus = MetadataCorpus::from_documents(rows.iter().map(|row| &row.doc));
@@ -1395,11 +1392,18 @@ fn first_overlapping_metadata_match(
             continue;
         };
         if seed_query.score(&row.doc) >= threshold {
-            let text = row.text.trim().to_string();
-            if looks_like_json(&text) {
-                return Some(text);
+            let match_text = row.text.trim().to_string();
+            let match_pair = FinalMetadataMatch {
+                seed_text: seed_queries
+                    .get(&row.token_id)
+                    .map(|query| query.text.trim().to_string())
+                    .unwrap_or_default(),
+                match_text,
+            };
+            if looks_like_json(&match_pair.match_text) {
+                return Some(match_pair);
             }
-            first_match.get_or_insert(text);
+            first_match.get_or_insert(match_pair);
         }
     }
     first_match
@@ -1762,6 +1766,7 @@ struct PreparedMetadataQuery<'a> {
 struct PreparedSingleMetadataQuery {
     document: MetadataDocument,
     terms: Vec<(TokenId, usize)>,
+    text: String,
 }
 
 impl<'a> MetadataCorpusView<'a> {
@@ -1865,9 +1870,13 @@ impl<'a> PreparedMetadataQuery<'a> {
 }
 
 impl PreparedSingleMetadataQuery {
-    fn new(document: MetadataDocument) -> Self {
+    fn new(text: String, document: MetadataDocument) -> Self {
         let terms = query_terms_from_tokens(&document.tokens);
-        Self { document, terms }
+        Self {
+            document,
+            terms,
+            text,
+        }
     }
 
     fn document(&self) -> &MetadataDocument {
@@ -1898,7 +1907,7 @@ fn score_metadata_pair_with_single_document_corpus(
     left: &MetadataDocument,
     right: &MetadataDocument,
 ) -> f64 {
-    PreparedSingleMetadataQuery::new(left.clone()).score(right)
+    PreparedSingleMetadataQuery::new(String::new(), left.clone()).score(right)
 }
 
 fn query_terms_from_tokens(query_tokens: &[TokenId]) -> Vec<(TokenId, usize)> {
@@ -2026,18 +2035,35 @@ fn build_name_comparison(seed: String, matches: Vec<String>) -> TextComparison {
     }
 }
 
-fn build_metadata_comparison(seed: String, matches: Vec<String>) -> TextComparison {
-    let labeled_matches = matches
+fn build_metadata_comparison(seed: String, matches: Vec<FinalMetadataMatch>) -> MetadataComparison {
+    let seed = matches
+        .first()
+        .map(|value| value.seed_text.clone())
+        .unwrap_or(seed);
+    let paired_matches = matches
+        .iter()
+        .map(|value| MetadataPairMatch {
+            seed: value.seed_text.clone(),
+            text: value.match_text.clone(),
+            labels: classify_metadata_modifications(&value.seed_text, &value.match_text),
+        })
+        .collect::<Vec<_>>();
+    let matches = paired_matches
+        .iter()
+        .map(|value| value.text.clone())
+        .collect::<Vec<_>>();
+    let labeled_matches = paired_matches
         .iter()
         .map(|value| LabeledTextMatch {
-            text: value.clone(),
-            labels: classify_metadata_modifications(&seed, value),
+            text: value.text.clone(),
+            labels: value.labels.clone(),
         })
-        .collect();
-    TextComparison {
+        .collect::<Vec<_>>();
+    MetadataComparison {
         seed,
         matches,
         labeled_matches,
+        paired_matches,
     }
 }
 
@@ -2685,13 +2711,13 @@ fn render_markdown_report(report: &SampleReport) -> String {
 
     out.push_str("\n## Metadata Matches\n\n");
     for seed in &report.seed_reports {
-        let values = labeled_matches_for_report(&seed.metadata, classify_metadata_modifications);
+        let values = metadata_pairs_for_report(&seed.metadata);
         if values.is_empty() {
             continue;
         }
-        out.push_str("- seed:\n\n");
-        push_fenced(&mut out, &seed.metadata.seed);
         for value in values {
+            out.push_str("- seed:\n\n");
+            push_fenced(&mut out, &value.seed);
             out.push_str(&format!("- match labels: {}\n\n", value.labels.join(", ")));
             push_fenced(&mut out, &value.text);
         }
@@ -2721,7 +2747,7 @@ fn push_modification_summary(out: &mut String, report: &SampleReport) {
 
 fn push_metadata_matrix_summary<'a>(
     out: &mut String,
-    reports: impl Iterator<Item = &'a TextComparison>,
+    reports: impl Iterator<Item = &'a MetadataComparison>,
 ) {
     let mut total = 0usize;
     let mut content_total = 0usize;
@@ -2730,7 +2756,7 @@ fn push_metadata_matrix_summary<'a>(
     let mut matrix = BTreeMap::<(String, String), usize>::new();
     let mut residual_counts = BTreeMap::<String, usize>::new();
     for comparison in reports {
-        let values = labeled_matches_for_report(comparison, classify_metadata_modifications);
+        let values = metadata_pairs_for_report(comparison);
         total += values.len();
         for labeled in values {
             let mut has_content_change = false;
@@ -2847,6 +2873,32 @@ fn labeled_matches_for_report(
         .collect()
 }
 
+fn metadata_pairs_for_report(comparison: &MetadataComparison) -> Vec<MetadataPairMatch> {
+    if !comparison.paired_matches.is_empty() {
+        return comparison.paired_matches.clone();
+    }
+    if !comparison.labeled_matches.is_empty() {
+        return comparison
+            .labeled_matches
+            .iter()
+            .map(|value| MetadataPairMatch {
+                seed: comparison.seed.clone(),
+                text: value.text.clone(),
+                labels: value.labels.clone(),
+            })
+            .collect();
+    }
+    comparison
+        .matches
+        .iter()
+        .map(|value| MetadataPairMatch {
+            seed: comparison.seed.clone(),
+            text: value.clone(),
+            labels: classify_metadata_modifications(&comparison.seed, value),
+        })
+        .collect()
+}
+
 fn inline_or_empty(value: &str) -> String {
     if value.trim().is_empty() {
         "_empty_".to_string()
@@ -2923,6 +2975,24 @@ fn should_render_as_codepoint(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn collect_test_metadata_source_indices(
+        seed_sketch: &MetadataSketch,
+        text_index: &TextIndex,
+        scratch: &mut SampleScratch,
+        seed_contract: &str,
+    ) -> Vec<usize> {
+        let bucket_indices =
+            collect_metadata_source_bucket_indices(seed_sketch, text_index, scratch);
+        verify_metadata_source_bucket_indices(
+            seed_sketch,
+            text_index,
+            scratch,
+            seed_contract,
+            METADATA_SKETCH_SOURCE_HAMMING_THRESHOLD,
+            bucket_indices,
+        )
+    }
 
     #[test]
     fn name_normalization_matches_top_contract_analysis_style() {
@@ -3094,6 +3164,27 @@ mod tests {
     }
 
     #[test]
+    fn seed_metadata_prefilter_does_not_scan_past_first_metadata() {
+        let rows = vec![
+            NftTextRow {
+                token_id: "1".into(),
+                name: "Seed One".into(),
+                metadata_doc: String::new(),
+                metadata_json: String::new(),
+            },
+            NftTextRow {
+                token_id: "2".into(),
+                name: "Seed Two".into(),
+                metadata_doc: String::new(),
+                metadata_json: r#"{"description":"valid"}"#.into(),
+            },
+        ];
+
+        assert_eq!(first_seed_metadata(&rows), "");
+        assert_eq!(seed_metadata_prefilter_text(&rows), None);
+    }
+
+    #[test]
     fn query_terms_preserve_duplicate_token_frequency() {
         assert_eq!(query_terms_from_tokens(&[7, 7, 9]), vec![(7, 2), (9, 1)]);
     }
@@ -3181,13 +3272,8 @@ mod tests {
         });
         let mut scratch = SampleScratch::new(text_index.metadata.len());
 
-        let source_indices = collect_metadata_source_indices(
-            &seed_sketch,
-            &text_index,
-            &mut scratch,
-            "0xseed",
-            METADATA_SKETCH_SOURCE_HAMMING_THRESHOLD,
-        );
+        let source_indices =
+            collect_test_metadata_source_indices(&seed_sketch, &text_index, &mut scratch, "0xseed");
         let source_contracts = source_indices
             .iter()
             .map(|index| text_index.metadata[*index].contract_address.as_str())
@@ -3223,13 +3309,8 @@ mod tests {
         };
         let mut scratch = SampleScratch::new(text_index.metadata.len());
 
-        let source_indices = collect_metadata_source_indices(
-            &seed_sketch,
-            &text_index,
-            &mut scratch,
-            "0xseed",
-            METADATA_SKETCH_SOURCE_HAMMING_THRESHOLD,
-        );
+        let source_indices =
+            collect_test_metadata_source_indices(&seed_sketch, &text_index, &mut scratch, "0xseed");
 
         assert_eq!(source_indices, vec![0]);
     }
@@ -3260,14 +3341,51 @@ mod tests {
         };
         let mut scratch = SampleScratch::new(text_index.metadata.len());
 
-        let source_indices = collect_metadata_source_indices(
+        let source_indices =
+            collect_test_metadata_source_indices(&seed_sketch, &text_index, &mut scratch, "0xseed");
+
+        assert_eq!(source_indices, vec![0]);
+    }
+
+    #[test]
+    fn metadata_source_bucket_indices_are_deduped_before_verification() {
+        let mut token_interner = TokenInterner::default();
+        let doc =
+            MetadataDocument::from_text_with_interner("description rarealpha", &mut token_interner)
+                .unwrap();
+        let metadata = vec![MetadataCandidate {
+            contract_address: "0xhit".into(),
+            doc,
+            sketch: MetadataSketch {
+                simhash: 0,
+                anchors: vec![7],
+            },
+        }];
+        let metadata_source_index = build_metadata_source_index(&metadata);
+        let text_index = TextIndex {
+            metadata,
+            metadata_source_index,
+            ..TextIndex::default()
+        };
+        let seed_sketch = MetadataSketch {
+            simhash: 0,
+            anchors: vec![7],
+        };
+        let mut scratch = SampleScratch::new(text_index.metadata.len());
+
+        let bucket_indices =
+            collect_metadata_source_bucket_indices(&seed_sketch, &text_index, &mut scratch);
+        let source_indices = verify_metadata_source_bucket_indices(
             &seed_sketch,
             &text_index,
             &mut scratch,
             "0xseed",
             METADATA_SKETCH_SOURCE_HAMMING_THRESHOLD,
+            bucket_indices.clone(),
         );
 
+        assert_eq!(bucket_indices, vec![0]);
+        assert_eq!(scratch.metadata_verify_count, 1);
         assert_eq!(source_indices, vec![0]);
     }
 
@@ -3337,7 +3455,7 @@ mod tests {
                     matches: vec!["Ａｚｕｋｉ #456".into(), "Unrelated".into()],
                     labeled_matches: Vec::new(),
                 },
-                metadata: TextComparison {
+                metadata: MetadataComparison {
                     seed: r#"{"description":"background gold","image":"ipfs://seed/image.png"}"#
                         .into(),
                     matches: vec![
@@ -3345,6 +3463,7 @@ mod tests {
                             .into(),
                     ],
                     labeled_matches: Vec::new(),
+                    paired_matches: Vec::new(),
                 },
             }],
         };
@@ -3462,7 +3581,7 @@ mod tests {
                         matches: vec!["Empty Clone".into()],
                         labeled_matches: Vec::new(),
                     },
-                    metadata: TextComparison::default(),
+                    metadata: MetadataComparison::default(),
                 },
                 SeedSampleReport {
                     name: TextComparison {
@@ -3470,7 +3589,7 @@ mod tests {
                         matches: vec!["None".into()],
                         labeled_matches: Vec::new(),
                     },
-                    metadata: TextComparison::default(),
+                    metadata: MetadataComparison::default(),
                 },
                 SeedSampleReport {
                     name: TextComparison {
@@ -3478,7 +3597,7 @@ mod tests {
                         matches: vec!["Real Seed".into()],
                         labeled_matches: Vec::new(),
                     },
-                    metadata: TextComparison::default(),
+                    metadata: MetadataComparison::default(),
                 },
             ],
         };
@@ -3504,7 +3623,7 @@ mod tests {
                         matches: vec!["????: ?????? clone".into()],
                         labeled_matches: Vec::new(),
                     },
-                    metadata: TextComparison::default(),
+                    metadata: MetadataComparison::default(),
                 },
                 SeedSampleReport {
                     name: TextComparison {
@@ -3512,7 +3631,7 @@ mod tests {
                         matches: vec!["Real Seed".into()],
                         labeled_matches: Vec::new(),
                     },
-                    metadata: TextComparison::default(),
+                    metadata: MetadataComparison::default(),
                 },
             ],
         };
@@ -3540,10 +3659,11 @@ mod tests {
                         matches: Vec::new(),
                         labeled_matches: Vec::new(),
                     },
-                    metadata: TextComparison {
+                    metadata: MetadataComparison {
                         seed: "no hit metadata".into(),
                         matches: Vec::new(),
                         labeled_matches: Vec::new(),
+                        paired_matches: Vec::new(),
                     },
                 },
                 SeedSampleReport {
@@ -3552,14 +3672,15 @@ mod tests {
                         matches: vec!["Name Hit Seed".into()],
                         labeled_matches: Vec::new(),
                     },
-                    metadata: TextComparison::default(),
+                    metadata: MetadataComparison::default(),
                 },
                 SeedSampleReport {
                     name: TextComparison::default(),
-                    metadata: TextComparison {
+                    metadata: MetadataComparison {
                         seed: "metadata hit seed".into(),
                         matches: vec!["metadata hit seed changed".into()],
                         labeled_matches: Vec::new(),
+                        paired_matches: Vec::new(),
                     },
                 },
             ],
@@ -3780,7 +3901,7 @@ mod tests {
             chain: "ethereum".into(),
             seed_reports: vec![SeedSampleReport {
                 name: TextComparison::default(),
-                metadata: TextComparison {
+                metadata: MetadataComparison {
                     seed:
                         r#"{"name":"Seed","title":"Old","image":"ipfs://seed","seller_fee_basis_points":500}"#
                             .into(),
@@ -3791,6 +3912,7 @@ mod tests {
                             .into(),
                     ],
                     labeled_matches: Vec::new(),
+                    paired_matches: Vec::new(),
                 },
             }],
         };
@@ -3817,10 +3939,11 @@ mod tests {
                     matches: vec!["????".into()],
                     labeled_matches: Vec::new(),
                 },
-                metadata: TextComparison {
+                metadata: MetadataComparison {
                     seed: String::new(),
                     matches: Vec::new(),
                     labeled_matches: Vec::new(),
+                    paired_matches: Vec::new(),
                 },
             }],
         };
