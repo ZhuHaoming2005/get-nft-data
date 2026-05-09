@@ -452,12 +452,35 @@ fn read_seed_rows(
     };
     let sql = format!(
         "
-        SELECT CAST(token_id AS VARCHAR),
-               coalesce(CAST(name AS VARCHAR), ''),
-               coalesce(CAST(metadata_doc AS VARCHAR), ''),
-               coalesce(CAST(metadata_json AS VARCHAR), '')
-        FROM nft_features
-        WHERE chain = ? AND lower(contract_address) = ?
+        WITH seed_rows AS (
+            SELECT CAST(token_id AS VARCHAR) AS token_id,
+                   coalesce(CAST(name AS VARCHAR), '') AS name,
+                   coalesce(CAST(metadata_doc AS VARCHAR), '') AS metadata_doc,
+                   coalesce(CAST(metadata_json AS VARCHAR), '') AS metadata_json
+            FROM nft_features
+            WHERE chain = ? AND lower(contract_address) = ?
+        )
+        SELECT token_id,
+               name,
+               CASE
+                   WHEN length(trim(metadata_json)) <= {MAX_METADATA_BYTES_FOR_DEDUP}
+                        AND (
+                            trim(metadata_json) LIKE '{{%'
+                            OR trim(metadata_json) LIKE '[%'
+                        )
+                   THEN metadata_doc
+                   ELSE ''
+               END AS metadata_doc,
+               CASE
+                   WHEN length(trim(metadata_json)) <= {MAX_METADATA_BYTES_FOR_DEDUP}
+                        AND (
+                            trim(metadata_json) LIKE '{{%'
+                            OR trim(metadata_json) LIKE '[%'
+                        )
+                   THEN metadata_json
+                   ELSE ''
+               END AS metadata_json
+        FROM seed_rows
         ORDER BY token_id
         {limit_sql}
         "
@@ -2997,6 +3020,77 @@ mod tests {
             .map(|row| row.token_id.as_str())
             .collect::<Vec<_>>();
         assert_eq!(token_ids, vec!["1"]);
+    }
+
+    #[test]
+    fn seed_row_loader_removes_ineligible_metadata_without_dropping_names() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE nft_features (
+                chain VARCHAR NOT NULL,
+                contract_address VARCHAR NOT NULL,
+                token_id VARCHAR NOT NULL,
+                name VARCHAR,
+                metadata_doc VARCHAR,
+                metadata_json VARCHAR
+            );
+            "#,
+        )
+        .unwrap();
+        let overlong_json = format!(
+            "{{\"description\":\"{}\"}}",
+            "x".repeat(MAX_METADATA_BYTES_FOR_DEDUP + 1)
+        );
+        let mut stmt = conn
+            .prepare(
+                "
+                INSERT INTO nft_features
+                    (chain, contract_address, token_id, name, metadata_doc, metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ",
+            )
+            .unwrap();
+        stmt.execute(params![
+            "ethereum",
+            "0xseed",
+            "1",
+            "Seed One",
+            "non-json doc",
+            "not json"
+        ])
+        .unwrap();
+        stmt.execute(params![
+            "ethereum",
+            "0xseed",
+            "2",
+            "Seed Two",
+            "overlong doc",
+            overlong_json
+        ])
+        .unwrap();
+        stmt.execute(params![
+            "ethereum",
+            "0xseed",
+            "3",
+            "Seed Three",
+            "valid doc",
+            r#"{"description":"valid"}"#
+        ])
+        .unwrap();
+
+        let rows = read_seed_rows(&conn, "ethereum", "0xseed", 0).unwrap();
+
+        assert_eq!(
+            rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+            vec!["Seed One", "Seed Two", "Seed Three"]
+        );
+        assert_eq!(rows[0].metadata_doc, "");
+        assert_eq!(rows[0].metadata_json, "");
+        assert_eq!(rows[1].metadata_doc, "");
+        assert_eq!(rows[1].metadata_json, "");
+        assert_eq!(rows[2].metadata_doc, "valid doc");
+        assert_eq!(rows[2].metadata_json, r#"{"description":"valid"}"#);
     }
 
     #[test]
