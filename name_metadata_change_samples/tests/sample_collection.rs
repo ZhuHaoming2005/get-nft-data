@@ -354,7 +354,7 @@ fn collect_samples_outputs_one_representative_name_per_matching_contract() {
 }
 
 #[test]
-fn collect_samples_matches_any_normalized_name_but_outputs_one_contract_name() {
+fn collect_samples_uses_one_representative_name_per_contract_address() {
     let temp = tempdir().unwrap();
     let db_path = temp.path().join("features.duckdb");
     let input_path = temp.path().join("contracts.txt");
@@ -378,7 +378,7 @@ fn collect_samples_matches_any_normalized_name_but_outputs_one_contract_name() {
 
     let report = collect_samples(config(db_path, input_path, output_path)).unwrap();
 
-    assert_eq!(report.seed_reports[0].name.matches, vec!["Displayed Name"]);
+    assert!(report.seed_reports[0].name.matches.is_empty());
 }
 
 #[test]

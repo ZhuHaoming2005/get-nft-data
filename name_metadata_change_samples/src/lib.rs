@@ -71,6 +71,9 @@ const MAX_OVERLAPPING_METADATA_ROWS_PER_CONTRACT: usize = 1;
 const SAMPLE_PROGRESS_STAGE_COUNT: usize = 10;
 const METADATA_SKETCH_ANCHOR_COUNT: usize = 8;
 const METADATA_SKETCH_SOURCE_HAMMING_THRESHOLD: u32 = 24;
+const METADATA_SIMHASH_BAND_COUNT: usize = 8;
+const METADATA_SIMHASH_BAND_BITS: usize = 8;
+const METADATA_SIMHASH_BAND_VALUES: usize = 1 << METADATA_SIMHASH_BAND_BITS;
 const METADATA_SKETCH_HIGH_FREQ_MIN_DOCS: usize = 32;
 const METADATA_SKETCH_HIGH_FREQ_DIVISOR: usize = 5;
 
@@ -179,18 +182,14 @@ struct TextIndex {
     metadata_token_ids: HashMap<String, TokenId>,
     metadata_corpus: MetadataCorpus,
     metadata_indices_by_contract: HashMap<String, Vec<usize>>,
+    metadata_source_index: MetadataSourceIndex,
+    metadata_corpus_exclusions_by_contract: HashMap<String, ContractMetadataCorpusExclusion>,
 }
 
 #[derive(Clone, Debug)]
 struct NormalizedNameEntry {
     normalized: String,
     candidate_indices: Vec<usize>,
-}
-
-#[derive(Default)]
-struct NameCandidateBuilder {
-    display_name: Option<String>,
-    normalized_names: BTreeSet<String>,
 }
 
 #[derive(Default)]
@@ -203,6 +202,19 @@ struct SampleScratch {
 struct MetadataSketch {
     simhash: u64,
     anchors: Vec<TokenId>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MetadataSourceIndex {
+    anchor_indices: HashMap<TokenId, Vec<usize>>,
+    simhash_band_indices: Vec<Vec<usize>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ContractMetadataCorpusExclusion {
+    doc_count: usize,
+    term_count: usize,
+    doc_freqs: HashMap<TokenId, usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -471,6 +483,9 @@ fn load_text_index(conn: &Connection, chain: &str) -> Result<TextIndex, duckdb::
     let metadata_corpus = MetadataCorpus::from_documents(metadata.iter().map(|item| &item.doc));
     populate_metadata_sketches(&mut metadata, &metadata_corpus);
     let metadata_indices_by_contract = build_metadata_indices_by_contract(&metadata);
+    let metadata_source_index = build_metadata_source_index(&metadata);
+    let metadata_corpus_exclusions_by_contract =
+        build_contract_metadata_corpus_exclusions(&metadata);
     Ok(TextIndex {
         names,
         name_indices_by_normalized,
@@ -478,6 +493,8 @@ fn load_text_index(conn: &Connection, chain: &str) -> Result<TextIndex, duckdb::
         metadata_token_ids,
         metadata_corpus,
         metadata_indices_by_contract,
+        metadata_source_index,
+        metadata_corpus_exclusions_by_contract,
     })
 }
 
@@ -485,19 +502,18 @@ fn load_name_index(conn: &Connection, chain: &str) -> Result<Vec<NameCandidate>,
     let mut stmt = conn.prepare(
         "
         SELECT lower(contract_address) AS contract_address,
-               coalesce(CAST(name AS VARCHAR), '') AS name,
-               min(CAST(token_id AS VARCHAR)) AS first_token_id
+               min(trim(coalesce(CAST(name AS VARCHAR), ''))) AS name
         FROM nft_features
         WHERE chain = ? AND trim(coalesce(CAST(name AS VARCHAR), '')) <> ''
-        GROUP BY contract_address, name
-        ORDER BY contract_address, first_token_id
+        GROUP BY lower(contract_address)
+        ORDER BY contract_address
         ",
     )?;
     let rows = stmt.query_map(params![chain], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
 
-    let mut by_contract = HashMap::<String, NameCandidateBuilder>::new();
+    let mut candidates = Vec::new();
     for row in rows {
         let (contract_address, name) = row?;
         let trimmed = name.trim();
@@ -508,25 +524,13 @@ fn load_name_index(conn: &Connection, chain: &str) -> Result<Vec<NameCandidate>,
         if normalized.is_empty() {
             continue;
         }
-        let builder = by_contract.entry(contract_address).or_default();
-        if builder.display_name.is_none() {
-            builder.display_name = Some(trimmed.to_string());
-        }
-        builder.normalized_names.insert(normalized);
+        candidates.push(NameCandidate {
+            contract_address,
+            display_name: trimmed.to_string(),
+            normalized_names: vec![normalized],
+        });
     }
 
-    let mut candidates = by_contract
-        .into_iter()
-        .filter_map(|(contract_address, builder)| {
-            let display_name = builder.display_name?;
-            let normalized_names = builder.normalized_names.into_iter().collect::<Vec<_>>();
-            (!normalized_names.is_empty()).then_some(NameCandidate {
-                contract_address,
-                display_name,
-                normalized_names,
-            })
-        })
-        .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
         (&left.display_name, &left.contract_address)
             .cmp(&(&right.display_name, &right.contract_address))
@@ -632,6 +636,51 @@ fn build_metadata_indices_by_contract(
     index
 }
 
+fn build_metadata_source_index(metadata: &[MetadataCandidate]) -> MetadataSourceIndex {
+    let mut index = MetadataSourceIndex {
+        anchor_indices: HashMap::new(),
+        simhash_band_indices: vec![
+            Vec::new();
+            METADATA_SIMHASH_BAND_COUNT * METADATA_SIMHASH_BAND_VALUES
+        ],
+    };
+    for (metadata_index, candidate) in metadata.iter().enumerate() {
+        if candidate.sketch.is_empty() {
+            continue;
+        }
+        for anchor in &candidate.sketch.anchors {
+            index
+                .anchor_indices
+                .entry(*anchor)
+                .or_default()
+                .push(metadata_index);
+        }
+        for band_index in 0..METADATA_SIMHASH_BAND_COUNT {
+            let band_value = metadata_simhash_band_value(candidate.sketch.simhash, band_index);
+            index.simhash_band_indices[metadata_simhash_band_key(band_index, band_value)]
+                .push(metadata_index);
+        }
+    }
+    index
+}
+
+fn build_contract_metadata_corpus_exclusions(
+    metadata: &[MetadataCandidate],
+) -> HashMap<String, ContractMetadataCorpusExclusion> {
+    let mut exclusions = HashMap::<String, ContractMetadataCorpusExclusion>::new();
+    for candidate in metadata {
+        let exclusion = exclusions
+            .entry(candidate.contract_address.clone())
+            .or_default();
+        exclusion.doc_count += 1;
+        exclusion.term_count += candidate.doc.tokens.len();
+        for token in &candidate.doc.unique_tokens {
+            *exclusion.doc_freqs.entry(*token).or_insert(0) += 1;
+        }
+    }
+    exclusions
+}
+
 fn populate_metadata_sketches(metadata: &mut [MetadataCandidate], corpus: &MetadataCorpus) {
     for candidate in metadata {
         candidate.sketch =
@@ -723,6 +772,20 @@ impl MetadataSketch {
     }
 }
 
+impl MetadataSourceIndex {
+    fn is_empty(&self) -> bool {
+        self.anchor_indices.is_empty() && self.simhash_band_indices.iter().all(Vec::is_empty)
+    }
+}
+
+fn metadata_simhash_band_key(band_index: usize, band_value: u8) -> usize {
+    band_index * METADATA_SIMHASH_BAND_VALUES + band_value as usize
+}
+
+fn metadata_simhash_band_value(simhash: u64, band_index: usize) -> u8 {
+    ((simhash >> (band_index * METADATA_SIMHASH_BAND_BITS)) & 0xff) as u8
+}
+
 fn first_seed_name(rows: &[NftTextRow]) -> String {
     rows.iter()
         .find_map(|row| non_empty(&row.name))
@@ -731,7 +794,10 @@ fn first_seed_name(rows: &[NftTextRow]) -> String {
 
 fn seed_name_norms(rows: &[NftTextRow]) -> Vec<String> {
     rows.iter()
-        .map(|row| normalize_name(&row.name))
+        .filter_map(|row| non_empty(&row.name))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|name| normalize_name(&name))
         .filter(|name| !name.is_empty())
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -856,16 +922,23 @@ fn match_metadata(
         return Ok(Vec::new());
     };
     let seed_contract = seed_contract.to_lowercase();
-    let excluded_indices = text_index
-        .metadata_indices_by_contract
-        .get(&seed_contract)
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
-    let corpus = MetadataCorpusView::new(
-        &text_index.metadata_corpus,
-        &text_index.metadata,
-        excluded_indices,
-    );
+    let corpus_exclusion = text_index
+        .metadata_corpus_exclusions_by_contract
+        .get(&seed_contract);
+    let corpus = if let Some(exclusion) = corpus_exclusion {
+        MetadataCorpusView::from_exclusion(&text_index.metadata_corpus, Some(exclusion))
+    } else {
+        let excluded_indices = text_index
+            .metadata_indices_by_contract
+            .get(&seed_contract)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        MetadataCorpusView::new(
+            &text_index.metadata_corpus,
+            &text_index.metadata,
+            excluded_indices,
+        )
+    };
     if corpus.total_docs == 0 {
         emit_empty_metadata_scoring_progress(progress, position);
         return Ok(Vec::new());
@@ -946,7 +1019,21 @@ fn collect_metadata_source_indices(
     seed_contract: &str,
     hamming_threshold: u32,
 ) -> Vec<usize> {
+    if seed_sketch.is_empty() {
+        return Vec::new();
+    }
     let epoch = scratch.next_metadata_epoch();
+    if !text_index.metadata_source_index.is_empty() {
+        return collect_metadata_source_indices_from_index(
+            seed_sketch,
+            text_index,
+            scratch,
+            seed_contract,
+            hamming_threshold,
+            epoch,
+        );
+    }
+
     let mut source_indices = text_index
         .metadata
         .par_iter()
@@ -971,6 +1058,92 @@ fn collect_metadata_source_indices(
         unique_source_indices.push(index);
     }
     unique_source_indices
+}
+
+fn collect_metadata_source_indices_from_index(
+    seed_sketch: &MetadataSketch,
+    text_index: &TextIndex,
+    scratch: &mut SampleScratch,
+    seed_contract: &str,
+    hamming_threshold: u32,
+    epoch: u32,
+) -> Vec<usize> {
+    let mut source_indices = Vec::new();
+
+    for anchor in &seed_sketch.anchors {
+        let Some(indices) = text_index.metadata_source_index.anchor_indices.get(anchor) else {
+            continue;
+        };
+        for index in indices {
+            push_metadata_source_if_match(
+                *index,
+                seed_sketch,
+                text_index,
+                scratch,
+                seed_contract,
+                hamming_threshold,
+                epoch,
+                &mut source_indices,
+            );
+        }
+    }
+
+    let band_radius = hamming_threshold / METADATA_SIMHASH_BAND_COUNT as u32;
+    for band_index in 0..METADATA_SIMHASH_BAND_COUNT {
+        let seed_band = metadata_simhash_band_value(seed_sketch.simhash, band_index);
+        for band_value in 0..METADATA_SIMHASH_BAND_VALUES {
+            let band_value = band_value as u8;
+            if (seed_band ^ band_value).count_ones() > band_radius {
+                continue;
+            }
+            let band_key = metadata_simhash_band_key(band_index, band_value);
+            let Some(indices) = text_index
+                .metadata_source_index
+                .simhash_band_indices
+                .get(band_key)
+            else {
+                continue;
+            };
+            for index in indices {
+                push_metadata_source_if_match(
+                    *index,
+                    seed_sketch,
+                    text_index,
+                    scratch,
+                    seed_contract,
+                    hamming_threshold,
+                    epoch,
+                    &mut source_indices,
+                );
+            }
+        }
+    }
+
+    source_indices.sort_unstable();
+    source_indices
+}
+
+fn push_metadata_source_if_match(
+    index: usize,
+    seed_sketch: &MetadataSketch,
+    text_index: &TextIndex,
+    scratch: &mut SampleScratch,
+    seed_contract: &str,
+    hamming_threshold: u32,
+    epoch: u32,
+    source_indices: &mut Vec<usize>,
+) {
+    if scratch.metadata_seen_epochs[index] == epoch {
+        return;
+    }
+    let candidate = &text_index.metadata[index];
+    if candidate.contract_address == seed_contract
+        || !metadata_sketch_source_match(seed_sketch, &candidate.sketch, hamming_threshold)
+    {
+        return;
+    }
+    scratch.metadata_seen_epochs[index] = epoch;
+    source_indices.push(index);
 }
 
 fn metadata_sketch_source_match(
@@ -1550,7 +1723,8 @@ impl MetadataCorpus {
 
 struct MetadataCorpusView<'a> {
     base: &'a MetadataCorpus,
-    excluded_doc_freqs: HashMap<TokenId, usize>,
+    excluded_doc_freqs: Option<&'a HashMap<TokenId, usize>>,
+    owned_excluded_doc_freqs: HashMap<TokenId, usize>,
     total_docs: usize,
     avg_doc_len: f64,
 }
@@ -1576,7 +1750,8 @@ impl<'a> MetadataCorpusView<'a> {
         };
         Self {
             base,
-            excluded_doc_freqs: HashMap::new(),
+            excluded_doc_freqs: None,
+            owned_excluded_doc_freqs: HashMap::new(),
             total_docs: base.total_docs,
             avg_doc_len,
         }
@@ -1605,14 +1780,41 @@ impl<'a> MetadataCorpusView<'a> {
         };
         Self {
             base,
-            excluded_doc_freqs,
+            excluded_doc_freqs: None,
+            owned_excluded_doc_freqs: excluded_doc_freqs,
+            total_docs,
+            avg_doc_len,
+        }
+    }
+
+    fn from_exclusion(
+        base: &'a MetadataCorpus,
+        exclusion: Option<&'a ContractMetadataCorpusExclusion>,
+    ) -> Self {
+        let excluded_docs = exclusion.map(|item| item.doc_count).unwrap_or(0);
+        let excluded_terms = exclusion.map(|item| item.term_count).unwrap_or(0);
+        let total_docs = base.total_docs.saturating_sub(excluded_docs);
+        let total_terms = base.total_terms.saturating_sub(excluded_terms);
+        let avg_doc_len = if total_docs == 0 {
+            0.0
+        } else {
+            total_terms as f64 / total_docs as f64
+        };
+        Self {
+            base,
+            excluded_doc_freqs: exclusion.map(|item| &item.doc_freqs),
+            owned_excluded_doc_freqs: HashMap::new(),
             total_docs,
             avg_doc_len,
         }
     }
 
     fn document_frequency(&self, token: TokenId) -> usize {
-        let excluded_frequency = self.excluded_doc_freqs.get(&token).copied().unwrap_or(0);
+        let excluded_frequency = self
+            .excluded_doc_freqs
+            .and_then(|doc_freqs| doc_freqs.get(&token).copied())
+            .or_else(|| self.owned_excluded_doc_freqs.get(&token).copied())
+            .unwrap_or(0);
         self.base
             .doc_freqs
             .get(&token)
@@ -2870,11 +3072,13 @@ mod tests {
             MetadataCorpus::from_documents(metadata.iter().map(|candidate| &candidate.doc));
         populate_metadata_sketches(&mut metadata, &metadata_corpus);
         let metadata_indices_by_contract = build_metadata_indices_by_contract(&metadata);
+        let metadata_source_index = build_metadata_source_index(&metadata);
         let text_index = TextIndex {
             metadata,
             metadata_token_ids: token_interner.into_ids(),
             metadata_corpus,
             metadata_indices_by_contract,
+            metadata_source_index,
             ..TextIndex::default()
         };
         let corpus = MetadataCorpusView::from_corpus(&text_index.metadata_corpus);
@@ -2934,6 +3138,93 @@ mod tests {
         );
 
         assert_eq!(source_indices, vec![0]);
+    }
+
+    #[test]
+    fn metadata_source_index_routes_hamming_sources_without_anchor_match() {
+        let mut token_interner = TokenInterner::default();
+        let doc =
+            MetadataDocument::from_text_with_interner("description rarealpha", &mut token_interner)
+                .unwrap();
+        let metadata = vec![MetadataCandidate {
+            contract_address: "0xfallback".into(),
+            doc,
+            sketch: MetadataSketch {
+                simhash: (1u64 << 20) - 1,
+                anchors: vec![2],
+            },
+        }];
+        let metadata_source_index = build_metadata_source_index(&metadata);
+        let text_index = TextIndex {
+            metadata,
+            metadata_source_index,
+            ..TextIndex::default()
+        };
+        let seed_sketch = MetadataSketch {
+            simhash: 0,
+            anchors: vec![1],
+        };
+        let mut scratch = SampleScratch::new(text_index.metadata.len());
+
+        let source_indices = collect_metadata_source_indices(
+            &seed_sketch,
+            &text_index,
+            &mut scratch,
+            "0xseed",
+            METADATA_SKETCH_SOURCE_HAMMING_THRESHOLD,
+        );
+
+        assert_eq!(source_indices, vec![0]);
+    }
+
+    #[test]
+    fn contract_metadata_corpus_exclusion_matches_dynamic_view() {
+        let mut token_interner = TokenInterner::default();
+        let metadata = vec![
+            MetadataCandidate {
+                contract_address: "0xseed".into(),
+                doc: MetadataDocument::from_text_with_interner(
+                    "description gold dragon",
+                    &mut token_interner,
+                )
+                .unwrap(),
+                sketch: MetadataSketch::default(),
+            },
+            MetadataCandidate {
+                contract_address: "0xseed".into(),
+                doc: MetadataDocument::from_text_with_interner(
+                    "description silver dragon",
+                    &mut token_interner,
+                )
+                .unwrap(),
+                sketch: MetadataSketch::default(),
+            },
+            MetadataCandidate {
+                contract_address: "0xother".into(),
+                doc: MetadataDocument::from_text_with_interner(
+                    "description green forest",
+                    &mut token_interner,
+                )
+                .unwrap(),
+                sketch: MetadataSketch::default(),
+            },
+        ];
+        let corpus =
+            MetadataCorpus::from_documents(metadata.iter().map(|candidate| &candidate.doc));
+        let indices_by_contract = build_metadata_indices_by_contract(&metadata);
+        let dynamic =
+            MetadataCorpusView::new(&corpus, &metadata, indices_by_contract["0xseed"].as_slice());
+        let exclusions = build_contract_metadata_corpus_exclusions(&metadata);
+        let cached = MetadataCorpusView::from_exclusion(&corpus, exclusions.get("0xseed"));
+
+        assert_eq!(cached.total_docs, dynamic.total_docs);
+        assert!((cached.avg_doc_len - dynamic.avg_doc_len).abs() < 1e-9);
+        for token in token_interner.into_ids().values() {
+            assert_eq!(
+                cached.document_frequency(*token),
+                dynamic.document_frequency(*token)
+            );
+        }
     }
 
     #[test]
