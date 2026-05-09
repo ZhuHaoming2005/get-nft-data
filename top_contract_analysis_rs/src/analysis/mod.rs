@@ -42,7 +42,7 @@ pub mod scoring;
 pub mod signals;
 
 const DEFAULT_NAME_THRESHOLD: f64 = 95.0;
-const DEFAULT_METADATA_THRESHOLD: f64 = 0.55;
+const DEFAULT_METADATA_THRESHOLD: f64 = 0.6;
 const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
 
 #[derive(Clone, Debug)]

@@ -653,7 +653,14 @@ impl DuckDbFeatureStore {
                            coalesce(metadata_doc, '') AS metadata_doc,
                            row_number() OVER (
                                PARTITION BY lower(contract_address)
-                               ORDER BY CAST(token_id AS VARCHAR)
+                               ORDER BY CASE
+                                   WHEN trim(coalesce(CAST(metadata_json AS VARCHAR), '')) LIKE '{{%'
+                                        OR trim(coalesce(CAST(metadata_json AS VARCHAR), '')) LIKE '[%' THEN 0
+                                   WHEN trim(coalesce(CAST(metadata_json AS VARCHAR), '')) <> '' THEN 1
+                                   WHEN trim(coalesce(CAST(metadata_doc AS VARCHAR), '')) <> '' THEN 2
+                                   ELSE 3
+                               END,
+                               CAST(token_id AS VARCHAR)
                            ) AS overlap_rank
                     FROM nft_features
                     WHERE chain = ?
@@ -690,6 +697,7 @@ impl DuckDbFeatureStore {
                     continue;
                 };
                 if let Some(entry) = rows_by_contract.get_mut(original_key) {
+                    entry.metadata_token_rows.clear();
                     push_metadata_token_row(entry, &record);
                 }
             }

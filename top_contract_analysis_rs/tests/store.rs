@@ -233,6 +233,64 @@ fn feature_store_limits_overlapping_metadata_rows_per_candidate_contract() {
 }
 
 #[test]
+fn feature_store_prefers_json_overlapping_metadata_row_for_final_recheck() {
+    let store = DuckDbFeatureStore::new(":memory:").unwrap();
+    store
+        .replace_chain_rows(
+            "ethereum",
+            &[
+                DatabaseNftRecord {
+                    contract_address: "0xdup".into(),
+                    token_id: "0".into(),
+                    token_uri: "ipfs://shared-recall".into(),
+                    ..Default::default()
+                },
+                DatabaseNftRecord {
+                    contract_address: "0xdup".into(),
+                    token_id: "1".into(),
+                    metadata_doc: "alpha beta".into(),
+                    ..Default::default()
+                },
+                DatabaseNftRecord {
+                    contract_address: "0xdup".into(),
+                    token_id: "2".into(),
+                    metadata_json: r#"{"description":"gold dragon"}"#.into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+
+    let seed_nfts = vec![
+        SeedNft {
+            chain: "ethereum".into(),
+            contract_address: "0xseed".into(),
+            token_id: "1".into(),
+            token_uri: "ipfs://shared-recall".into(),
+            metadata_doc: "alpha beta".into(),
+            ..Default::default()
+        },
+        SeedNft {
+            chain: "ethereum".into(),
+            contract_address: "0xseed".into(),
+            token_id: "2".into(),
+            metadata_json: r#"{"description":"gold dragon"}"#.into(),
+            ..Default::default()
+        },
+    ];
+
+    let snapshot = store.load_snapshot("ethereum", &seed_nfts, 0, 0).unwrap();
+
+    assert_eq!(snapshot.duplicate_contract_rows.len(), 1);
+    let metadata_token_ids = snapshot.duplicate_contract_rows[0]
+        .metadata_token_rows
+        .iter()
+        .map(|row| row.token_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(metadata_token_ids, vec!["2"]);
+}
+
+#[test]
 fn parquet_rejects_missing_precomputed_columns() {
     let dir = tempdir().unwrap();
     let parquet_path = dir.path().join("missing_columns.parquet");

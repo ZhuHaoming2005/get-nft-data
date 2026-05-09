@@ -66,6 +66,7 @@ static DERIVATIVE_SUFFIX_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
 
 const METADATA_BM25_K1: f64 = 1.2;
 const METADATA_BM25_B: f64 = 0.75;
+const MAX_OVERLAPPING_METADATA_ROWS_PER_CONTRACT: usize = 1;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SampleCollectionConfig {
@@ -881,16 +882,31 @@ fn read_candidate_metadata_rows(
             .join(", ");
         let sql = format!(
             "
-            SELECT lower(contract_address) AS contract_address,
-                   CAST(token_id AS VARCHAR) AS token_id,
-                   coalesce(CAST(metadata_doc AS VARCHAR), '') AS metadata_doc,
-                   coalesce(CAST(metadata_json AS VARCHAR), '') AS metadata_json
-            FROM nft_features
-            WHERE chain = ?
-              AND lower(contract_address) IN ({contract_values})
-              AND CAST(token_id AS VARCHAR) IN ({token_values})
-              AND (trim(coalesce(CAST(metadata_doc AS VARCHAR), '')) <> ''
-                   OR trim(coalesce(CAST(metadata_json AS VARCHAR), '')) <> '')
+            SELECT contract_address, token_id, metadata_doc, metadata_json
+            FROM (
+                SELECT lower(contract_address) AS contract_address,
+                       CAST(token_id AS VARCHAR) AS token_id,
+                       coalesce(CAST(metadata_doc AS VARCHAR), '') AS metadata_doc,
+                       coalesce(CAST(metadata_json AS VARCHAR), '') AS metadata_json,
+                       row_number() OVER (
+                           PARTITION BY lower(contract_address)
+                           ORDER BY CASE
+                               WHEN trim(coalesce(CAST(metadata_json AS VARCHAR), '')) LIKE '{{%'
+                                    OR trim(coalesce(CAST(metadata_json AS VARCHAR), '')) LIKE '[%' THEN 0
+                               WHEN trim(coalesce(CAST(metadata_json AS VARCHAR), '')) <> '' THEN 1
+                               WHEN trim(coalesce(CAST(metadata_doc AS VARCHAR), '')) <> '' THEN 2
+                               ELSE 3
+                           END,
+                           CAST(token_id AS VARCHAR)
+                       ) AS overlap_rank
+                FROM nft_features
+                WHERE chain = ?
+                  AND lower(contract_address) IN ({contract_values})
+                  AND CAST(token_id AS VARCHAR) IN ({token_values})
+                  AND (trim(coalesce(CAST(metadata_doc AS VARCHAR), '')) <> ''
+                       OR trim(coalesce(CAST(metadata_json AS VARCHAR), '')) <> '')
+            )
+            WHERE overlap_rank <= {MAX_OVERLAPPING_METADATA_ROWS_PER_CONTRACT}
             ORDER BY contract_address, token_id
             "
         );
@@ -930,6 +946,13 @@ fn first_overlapping_metadata_match(
     rows: &[FinalMetadataRow],
     threshold: f64,
 ) -> Option<String> {
+    if rows.len() == 1 {
+        let row = &rows[0];
+        let seed_doc = seed_docs.get(&row.token_id)?;
+        return (score_metadata_pair_with_single_document_corpus(seed_doc, &row.doc) >= threshold)
+            .then(|| row.text.trim().to_string());
+    }
+
     let corpus = MetadataCorpus::from_documents(rows.iter().map(|row| &row.doc));
     let corpus = MetadataCorpusView::from_corpus(&corpus);
     let mut first_match = None;
@@ -1355,6 +1378,17 @@ fn score_metadata_pair(
     (bm25_score_terms(&query_terms, right, corpus) / denominator).clamp(0.0, 1.0)
 }
 
+fn score_metadata_pair_with_single_document_corpus(
+    left: &MetadataDocument,
+    right: &MetadataDocument,
+) -> f64 {
+    let query_terms = query_terms_from_tokens(&left.tokens);
+    let self_score = bm25_score_terms_with_single_document_corpus(&query_terms, left, right);
+    let denominator = if self_score > 0.0 { self_score } else { 1.0 };
+    (bm25_score_terms_with_single_document_corpus(&query_terms, right, right) / denominator)
+        .clamp(0.0, 1.0)
+}
+
 fn query_terms_from_tokens(query_tokens: &[TokenId]) -> Vec<(TokenId, usize)> {
     let mut query_terms = HashMap::<TokenId, usize>::new();
     for token in query_tokens {
@@ -1363,6 +1397,35 @@ fn query_terms_from_tokens(query_tokens: &[TokenId]) -> Vec<(TokenId, usize)> {
     let mut query_terms = query_terms.into_iter().collect::<Vec<_>>();
     query_terms.sort_by_key(|(token, _)| *token);
     query_terms
+}
+
+fn bm25_score_terms_with_single_document_corpus(
+    query_terms: &[(TokenId, usize)],
+    document: &MetadataDocument,
+    corpus_document: &MetadataDocument,
+) -> f64 {
+    if query_terms.is_empty() || document.tokens.is_empty() || corpus_document.tokens.is_empty() {
+        return 0.0;
+    }
+    let doc_len = document.tokens.len() as f64;
+    let avg_doc_len = corpus_document.tokens.len() as f64;
+    let norm = METADATA_BM25_K1 * (1.0 - METADATA_BM25_B + METADATA_BM25_B * doc_len / avg_doc_len);
+    query_terms
+        .iter()
+        .map(|(token, query_tf)| {
+            let tf = document.term_frequency(*token) as f64;
+            if tf == 0.0 {
+                return 0.0;
+            }
+            let df = if corpus_document.term_frequency(*token) > 0 {
+                1.0
+            } else {
+                0.0
+            };
+            let idf = ((1.0_f64 - df + 0.5) / (df + 0.5) + 1.0).ln();
+            *query_tf as f64 * idf * (tf * (METADATA_BM25_K1 + 1.0)) / (tf + norm)
+        })
+        .sum()
 }
 
 fn bm25_score_terms(
@@ -2397,8 +2460,61 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_metadata_row_loader_keeps_one_row_per_candidate_contract() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE nft_features (
+                chain VARCHAR NOT NULL,
+                contract_address VARCHAR NOT NULL,
+                token_id VARCHAR NOT NULL,
+                metadata_doc VARCHAR,
+                metadata_json VARCHAR
+            );
+            INSERT INTO nft_features VALUES
+                ('ethereum', '0xdup', '1', 'alpha beta', ''),
+                ('ethereum', '0xdup', '2', 'gold dragon', ''),
+                ('ethereum', '0xother', '1', 'alpha beta', '');
+            ",
+        )
+        .unwrap();
+        let mut token_interner = TokenInterner::default();
+        let rows = read_candidate_metadata_rows(
+            &conn,
+            "ethereum",
+            &["0xdup".to_string()],
+            &BTreeSet::from(["1".to_string(), "2".to_string()]),
+            &mut token_interner,
+        )
+        .unwrap();
+
+        let token_ids = rows["0xdup"]
+            .iter()
+            .map(|row| row.token_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(token_ids, vec!["1"]);
+    }
+
+    #[test]
     fn query_terms_preserve_duplicate_token_frequency() {
         assert_eq!(query_terms_from_tokens(&[7, 7, 9]), vec![(7, 2), (9, 1)]);
+    }
+
+    #[test]
+    fn single_document_metadata_pair_score_matches_corpus_path() {
+        let mut token_interner = TokenInterner::default();
+        let query =
+            MetadataDocument::from_text_with_interner("gold dragon", &mut token_interner).unwrap();
+        let doc =
+            MetadataDocument::from_text_with_interner("rare gold dragon", &mut token_interner)
+                .unwrap();
+        let corpus = MetadataCorpus::from_documents(std::iter::once(&doc));
+        let corpus = MetadataCorpusView::from_corpus(&corpus);
+
+        let single_doc_score = score_metadata_pair_with_single_document_corpus(&query, &doc);
+        let corpus_score = score_metadata_pair(&query, &doc, &corpus);
+
+        assert!((single_doc_score - corpus_score).abs() < 1e-9);
     }
 
     #[test]

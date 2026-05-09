@@ -298,6 +298,18 @@ mod tests {
     }
 
     #[test]
+    fn single_document_metadata_pair_score_matches_corpus_path() {
+        let query = MetadataBm25Document::from_text("gold dragon").unwrap();
+        let doc = MetadataBm25Document::from_text("rare gold dragon").unwrap();
+        let corpus = MetadataBm25Corpus::from_indexed_documents(std::slice::from_ref(&doc));
+
+        let single_doc_score = score_metadata_single_document_pair(&query, &doc);
+        let corpus_score = score_metadata_indexed_pair_with_corpus(&query, &doc, &corpus);
+
+        assert!((single_doc_score - corpus_score).abs() < 1e-9);
+    }
+
+    #[test]
     fn metadata_bm25_uses_common_okapi_defaults() {
         assert_eq!(METADATA_BM25_K1, 1.2);
         assert_eq!(METADATA_BM25_B, 0.75);
@@ -446,11 +458,53 @@ fn bm25_score_terms(
         .sum()
 }
 
+fn bm25_score_terms_with_single_document_corpus(
+    query_terms: &[(String, usize)],
+    doc: &MetadataBm25Document,
+    corpus_doc: &MetadataBm25Document,
+) -> f64 {
+    if query_terms.is_empty() || doc.len() == 0 || corpus_doc.len() == 0 {
+        return 0.0;
+    }
+
+    let doc_len = doc.len() as f64;
+    let avg_doc_len = corpus_doc.len() as f64;
+    let norm = METADATA_BM25_K1 * (1.0 - METADATA_BM25_B + METADATA_BM25_B * doc_len / avg_doc_len);
+
+    query_terms
+        .iter()
+        .map(|(token, query_tf)| {
+            let tf = doc.term_frequency(token) as f64;
+            if tf == 0.0 {
+                return 0.0;
+            }
+            let df = if corpus_doc.term_frequency(token) > 0 {
+                1.0
+            } else {
+                0.0
+            };
+            let idf = ((1.0_f64 - df + 0.5) / (df + 0.5) + 1.0).ln();
+            *query_tf as f64 * idf * (tf * (METADATA_BM25_K1 + 1.0)) / (tf + norm)
+        })
+        .sum()
+}
+
 pub(crate) fn score_metadata_indexed_pair_with_query(
     query: &MetadataBm25Query<'_>,
     right: &MetadataBm25Document,
 ) -> f64 {
     (bm25_score_terms(&query.terms, right, query.corpus) / query.denominator).clamp(0.0, 1.0)
+}
+
+pub(crate) fn score_metadata_single_document_pair(
+    left: &MetadataBm25Document,
+    right: &MetadataBm25Document,
+) -> f64 {
+    let query_terms = query_terms_from_tokens(left.tokens());
+    let self_score = bm25_score_terms_with_single_document_corpus(&query_terms, left, right);
+    let denominator = if self_score > 0.0 { self_score } else { 1.0 };
+    (bm25_score_terms_with_single_document_corpus(&query_terms, right, right) / denominator)
+        .clamp(0.0, 1.0)
 }
 
 pub fn score_metadata_indexed_pair_with_corpus(

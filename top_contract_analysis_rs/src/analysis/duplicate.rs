@@ -5,8 +5,8 @@ use rayon::prelude::*;
 use crate::analysis::scoring::{
     metadata_bm25_tokens, metadata_document_from_json, metadata_prefilter_document_from_json,
     score_metadata_indexed_pair_with_corpus, score_metadata_indexed_pair_with_query,
-    score_name_pair, MetadataBm25Corpus, MetadataBm25CorpusBuilder, MetadataBm25Document,
-    MetadataBm25Query,
+    score_metadata_single_document_pair, score_name_pair, MetadataBm25Corpus,
+    MetadataBm25CorpusBuilder, MetadataBm25Document, MetadataBm25Query,
 };
 use crate::models::{ContractDuplicateRecord, DatabaseNftRecord, DuplicateCandidate, SeedNft};
 use crate::normalize::{normalize_name, normalize_url};
@@ -149,6 +149,15 @@ fn first_overlapping_metadata_match<'a>(
     }
     if candidate_docs.is_empty() {
         return None;
+    }
+
+    if candidate_docs.len() == 1 {
+        let candidate_row = candidate_rows[0];
+        let candidate_doc = &candidate_docs[0];
+        let seed_doc = seed_docs_by_token.get(&candidate_row.token_id)?;
+        return (score_metadata_single_document_pair(seed_doc, candidate_doc)
+            >= metadata_threshold)
+            .then_some(candidate_row);
     }
 
     let corpus = MetadataBm25Corpus::from_indexed_documents(&candidate_docs);
