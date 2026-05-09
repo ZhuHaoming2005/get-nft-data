@@ -2,19 +2,18 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-use duckdb::{params, AccessMode, Config, Connection};
-use once_cell::sync::Lazy;
-use regex::Regex;
-
-use crate::analysis::scoring::metadata_document_from_json;
+use crate::analysis::scoring::{
+    metadata_document_from_json, metadata_recall_document, metadata_recall_keywords,
+};
 use crate::error::AppError;
 use crate::models::{
     ContractDuplicateRecord, ContractNameRecord, ContractSignal, DatabaseNftRecord,
     DatabaseSnapshot, SeedNft,
 };
 use crate::normalize::{normalize_name, normalize_url};
+use duckdb::{params, AccessMode, Config, Connection};
 
-static TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\p{L}\p{N}_]+").unwrap());
+const MAX_OVERLAPPING_METADATA_ROWS_PER_CONTRACT: usize = 1;
 
 const PRECOMPUTED_COLUMNS: [&str; 5] = [
     "token_uri_norm",
@@ -23,30 +22,6 @@ const PRECOMPUTED_COLUMNS: [&str; 5] = [
     "metadata_doc",
     "metadata_keywords_arr",
 ];
-
-fn metadata_keywords(document: &str, limit: usize) -> Vec<String> {
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for token in TOKEN_RE.find_iter(document) {
-        let normalized = token.as_str().to_lowercase();
-        if normalized.len() < 2 {
-            continue;
-        }
-        *counts.entry(normalized).or_insert(0) += 1;
-    }
-    let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();
-    ranked.sort_by(|left, right| {
-        right
-            .1
-            .cmp(&left.1)
-            .then_with(|| right.0.len().cmp(&left.0.len()))
-            .then_with(|| left.0.cmp(&right.0))
-    });
-    ranked
-        .into_iter()
-        .take(limit)
-        .map(|(token, _)| token)
-        .collect()
-}
 
 pub struct DuckDbFeatureStore {
     conn: Mutex<Connection>,
@@ -257,12 +232,8 @@ fn seed_metadata_recall_terms(seed_nfts: &[SeedNft]) -> HashSet<String> {
     seed_nfts
         .iter()
         .find_map(|item| {
-            let doc = if item.metadata_doc.trim().is_empty() {
-                metadata_document_from_json(&item.metadata_json)
-            } else {
-                item.metadata_doc.clone()
-            };
-            let keywords = metadata_keywords(&doc, 8);
+            let doc = metadata_recall_document(&item.metadata_doc, &item.metadata_json);
+            let keywords = metadata_recall_keywords(&doc, 8);
             if keywords.is_empty() {
                 None
             } else {
@@ -294,6 +265,7 @@ fn update_duplicate_contract_row(
     if name_pair_is_new && !name_norm.is_empty() {
         entry.name_norms.push(name_norm.to_string());
     }
+    push_metadata_token_row(entry, record);
 
     entry.metadata_recall_checked = true;
     entry.metadata_recall_match |= metadata_recall_match;
@@ -310,6 +282,25 @@ fn update_duplicate_contract_row(
     if metadata_recall_match {
         entry.representative = record.clone();
     }
+}
+
+fn push_metadata_token_row(entry: &mut ContractDuplicateRecord, record: &DatabaseNftRecord) {
+    let metadata_doc = if record.metadata_doc.is_empty() {
+        metadata_document_from_json(&record.metadata_json)
+    } else {
+        record.metadata_doc.clone()
+    };
+    if metadata_doc.is_empty() {
+        return;
+    }
+    if entry
+        .metadata_token_rows
+        .iter()
+        .any(|row| row.token_id == record.token_id)
+    {
+        return;
+    }
+    entry.metadata_token_rows.push(record.clone());
 }
 
 impl DuckDbFeatureStore {
@@ -470,8 +461,9 @@ impl DuckDbFeatureStore {
             } else {
                 row.metadata_doc.clone()
             };
+            let metadata_recall_doc = metadata_recall_document(&metadata_doc, &row.metadata_json);
             let metadata_keywords_arr =
-                serde_json::to_string(&metadata_keywords(&metadata_doc, 8))?;
+                serde_json::to_string(&metadata_recall_keywords(&metadata_recall_doc, 8))?;
             stmt.execute(params![
                 chain,
                 row.contract_address.to_lowercase(),
@@ -620,6 +612,91 @@ impl DuckDbFeatureStore {
         }
     }
 
+    fn append_overlapping_metadata_token_rows(
+        conn: &Connection,
+        chain: &str,
+        seed_token_ids: &HashSet<String>,
+        rows_by_contract: &mut HashMap<String, ContractDuplicateRecord>,
+    ) -> Result<(), AppError> {
+        if seed_token_ids.is_empty() || rows_by_contract.is_empty() {
+            return Ok(());
+        }
+        let contract_key_by_lower = rows_by_contract
+            .keys()
+            .map(|key| (key.to_lowercase(), key.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let token_values = seed_token_ids
+            .iter()
+            .filter(|value| !value.is_empty())
+            .map(|value| Self::sql_string_literal(value))
+            .collect::<BTreeSet<_>>();
+        if token_values.is_empty() {
+            return Ok(());
+        }
+        let token_values = token_values.into_iter().collect::<Vec<_>>().join(", ");
+        let contract_keys = contract_key_by_lower.keys().cloned().collect::<Vec<_>>();
+        for chunk in contract_keys.chunks(500) {
+            let contract_values = chunk
+                .iter()
+                .map(|value| Self::sql_string_literal(value))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "
+                SELECT contract_key, contract_address, token_id, token_uri, image_uri, name, symbol,
+                       metadata_json, metadata_doc
+                FROM (
+                    SELECT lower(contract_address) AS contract_key,
+                           contract_address, token_id, coalesce(token_uri, '') AS token_uri,
+                           coalesce(image_uri, '') AS image_uri, coalesce(name, '') AS name,
+                           coalesce(symbol, '') AS symbol, coalesce(metadata_json, '') AS metadata_json,
+                           coalesce(metadata_doc, '') AS metadata_doc,
+                           row_number() OVER (
+                               PARTITION BY lower(contract_address)
+                               ORDER BY CAST(token_id AS VARCHAR)
+                           ) AS overlap_rank
+                    FROM nft_features
+                    WHERE chain = ?
+                      AND lower(contract_address) IN ({contract_values})
+                      AND CAST(token_id AS VARCHAR) IN ({token_values})
+                      AND (trim(coalesce(CAST(metadata_doc AS VARCHAR), '')) <> ''
+                           OR trim(coalesce(CAST(metadata_json AS VARCHAR), '')) <> '')
+                )
+                WHERE overlap_rank <= {MAX_OVERLAPPING_METADATA_ROWS_PER_CONTRACT}
+                ORDER BY contract_key, token_id
+                "
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params![chain], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    DatabaseNftRecord {
+                        contract_address: row.get::<_, String>(1)?,
+                        token_id: row.get::<_, String>(2)?,
+                        token_uri: row.get::<_, String>(3)?,
+                        image_uri: row.get::<_, String>(4)?,
+                        name: row.get::<_, String>(5)?,
+                        symbol: row.get::<_, String>(6)?,
+                        metadata_json: row.get::<_, String>(7)?,
+                        metadata_doc: row.get::<_, String>(8)?,
+                        metadata_recall_checked: false,
+                        metadata_recall_match: false,
+                    },
+                ))
+            })?;
+            for row in rows {
+                let (contract_key, record) = row?;
+                let Some(original_key) = contract_key_by_lower.get(&contract_key) else {
+                    continue;
+                };
+                if let Some(entry) = rows_by_contract.get_mut(original_key) {
+                    push_metadata_token_row(entry, &record);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn load_snapshot(
         &self,
         chain: &str,
@@ -630,6 +707,11 @@ impl DuckDbFeatureStore {
         let seed_contracts: HashSet<String> = seed_nfts
             .iter()
             .map(|item| item.contract_address.to_lowercase())
+            .collect();
+        let seed_token_ids: HashSet<String> = seed_nfts
+            .iter()
+            .map(|item| item.token_id.clone())
+            .filter(|value| !value.is_empty())
             .collect();
         let exact_token_keys: HashSet<String> = seed_nfts
             .iter()
@@ -872,8 +954,18 @@ impl DuckDbFeatureStore {
             last_recall_row_id = last_seen_recall_row_id;
         }
         conn.execute_batch(&format!("DROP TABLE IF EXISTS {temp_table}"))?;
+        Self::append_overlapping_metadata_token_rows(
+            &conn,
+            chain,
+            &seed_token_ids,
+            &mut duplicate_rows_by_contract,
+        )?;
         let mut duplicate_contract_rows: Vec<_> =
             duplicate_rows_by_contract.into_values().collect();
+        for row in &mut duplicate_contract_rows {
+            row.metadata_token_rows
+                .sort_by(|left, right| left.token_id.cmp(&right.token_id));
+        }
         duplicate_contract_rows
             .sort_by(|left, right| left.contract_address.cmp(&right.contract_address));
 

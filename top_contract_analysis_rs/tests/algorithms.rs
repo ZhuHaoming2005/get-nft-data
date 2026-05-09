@@ -340,6 +340,7 @@ fn duplicate_candidates_compare_seed_names_without_length_prefilter() {
 #[test]
 fn duplicate_candidates_score_short_metadata_tokens_with_bm25() {
     let seed_nfts = vec![SeedNft {
+        token_id: "1".into(),
         metadata_doc: "cat".into(),
         ..Default::default()
     }];

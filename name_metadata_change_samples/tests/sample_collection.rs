@@ -133,7 +133,7 @@ fn collect_samples_outputs_split_name_and_metadata_text_only() {
             TestRow::new("0xname", "3")
                 .name("Azuki #1")
                 .metadata_doc("unrelated text"),
-            TestRow::new("0xmetadata", "8")
+            TestRow::new("0xmetadata", "1")
                 .name("Changed Creature")
                 .metadata_doc("gold dragon red background")
                 .metadata_json(
@@ -240,6 +240,44 @@ fn collect_samples_prefers_json_metadata_for_path_based_matrix() {
 }
 
 #[test]
+fn collect_samples_rechecks_representative_metadata_candidates_by_overlapping_token_id() {
+    let temp = tempdir().unwrap();
+    let db_path = temp.path().join("features.duckdb");
+    let input_path = temp.path().join("contracts.txt");
+    let output_path = temp.path().join("samples.md");
+    let seed_metadata = r#"{"description":"shared collection","attributes":[{"trait_type":"Background","value":"Red"}]}"#;
+    let accepted_overlap = r#"{"attributes":[{"value":"Red","trait_type":"Background"}],"description":"shared collection"}"#;
+    let rejected_overlap = r#"{"description":"shared collection","attributes":[{"trait_type":"Background","value":"Blue"}]}"#;
+
+    write_feature_db(
+        &db_path,
+        &[
+            TestRow::new("0xseed", "2").metadata_json(seed_metadata),
+            TestRow::new("0xaccepted", "1").metadata_json(seed_metadata),
+            TestRow::new("0xaccepted", "2").metadata_json(accepted_overlap),
+            TestRow::new("0xrejected", "1").metadata_json(seed_metadata),
+            TestRow::new("0xrejected", "2").metadata_json(rejected_overlap),
+        ],
+    );
+    fs::write(&input_path, "0xseed\n").unwrap();
+
+    let mut sample_config = config(db_path, input_path, output_path);
+    sample_config.metadata_threshold = 0.9;
+    let report = collect_samples(sample_config).unwrap();
+
+    assert_eq!(report.seed_reports.len(), 1);
+    assert_eq!(report.seed_reports[0].metadata.seed, seed_metadata);
+    assert_eq!(
+        report.seed_reports[0].metadata.matches,
+        vec![accepted_overlap]
+    );
+    assert!(!report.seed_reports[0]
+        .metadata
+        .matches
+        .contains(&rejected_overlap.to_string()));
+}
+
+#[test]
 fn collect_samples_uses_equivalent_name_and_metadata_normalization() {
     let temp = tempdir().unwrap();
     let db_path = temp.path().join("features.duckdb");
@@ -264,7 +302,9 @@ fn collect_samples_uses_equivalent_name_and_metadata_normalization() {
     );
     fs::write(&input_path, "0xseed\n").unwrap();
 
-    let report = collect_samples(config(db_path, input_path, output_path)).unwrap();
+    let mut sample_config = config(db_path, input_path, output_path);
+    sample_config.metadata_threshold = 0.1;
+    let report = collect_samples(sample_config).unwrap();
 
     assert_eq!(report.seed_reports[0].name.seed, "Azuki #123");
     assert_eq!(report.seed_reports[0].name.matches, vec!["Ａｚｕｋｉ #456"]);

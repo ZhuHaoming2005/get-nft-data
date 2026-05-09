@@ -140,6 +140,7 @@ pub enum SampleCollectionError {
 
 #[derive(Clone, Debug, Default)]
 struct NftTextRow {
+    token_id: String,
     name: String,
     metadata_doc: String,
     metadata_json: String,
@@ -155,7 +156,6 @@ struct NameCandidate {
 #[derive(Clone, Debug)]
 struct MetadataCandidate {
     contract_address: String,
-    text: String,
     doc: MetadataDocument,
 }
 
@@ -331,13 +331,15 @@ fn process_seed_contract(
     );
     let seed_metadata = first_seed_metadata(&seed_rows);
     let metadata_matches = match_metadata(
-        &seed_metadata,
+        conn,
+        &config.chain,
+        &seed_rows,
         text_index,
         scratch,
         seed_contract,
         config.metadata_threshold,
         config.max_recall_rows,
-    );
+    )?;
     emit_progress(
         progress,
         position.index,
@@ -419,7 +421,8 @@ fn read_seed_rows(
     };
     let sql = format!(
         "
-        SELECT coalesce(CAST(name AS VARCHAR), ''),
+        SELECT CAST(token_id AS VARCHAR),
+               coalesce(CAST(name AS VARCHAR), ''),
                coalesce(CAST(metadata_doc AS VARCHAR), ''),
                coalesce(CAST(metadata_json AS VARCHAR), '')
         FROM nft_features
@@ -431,9 +434,10 @@ fn read_seed_rows(
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![chain, contract_address.to_lowercase()], |row| {
         Ok(NftTextRow {
-            name: row.get::<_, String>(0)?,
-            metadata_doc: row.get::<_, String>(1)?,
-            metadata_json: row.get::<_, String>(2)?,
+            token_id: row.get::<_, String>(0)?,
+            name: row.get::<_, String>(1)?,
+            metadata_doc: row.get::<_, String>(2)?,
+            metadata_json: row.get::<_, String>(3)?,
         })
     })?;
     rows.collect()
@@ -549,7 +553,7 @@ fn load_metadata_index(
             WHERE chain = ?
         ),
         ranked AS (
-            SELECT contract_address, metadata_doc, metadata_json,
+            SELECT contract_address, token_id, metadata_doc, metadata_json,
                    row_number() OVER (
                        PARTITION BY contract_address
                        ORDER BY CASE
@@ -579,14 +583,12 @@ fn load_metadata_index(
     let mut candidates = Vec::new();
     for row in rows {
         let (contract_address, metadata_doc, metadata_json) = row?;
-        let doc_text = record_metadata_doc(&metadata_doc, &metadata_json);
+        let doc_text = record_metadata_prefilter_text(&metadata_doc, &metadata_json);
         let Some(doc) = MetadataDocument::from_text_with_interner(&doc_text, token_interner) else {
             continue;
         };
-        let text = record_metadata_text(&metadata_doc, &metadata_json);
         candidates.push(MetadataCandidate {
             contract_address,
-            text,
             doc,
         });
     }
@@ -635,8 +637,9 @@ fn first_seed_metadata(rows: &[NftTextRow]) -> String {
     rows.iter()
         .find_map(|row| non_empty_json(&row.metadata_json))
         .or_else(|| {
-            rows.iter()
-                .find_map(|row| non_empty(&record_metadata_text(&row.metadata_doc, &row.metadata_json)))
+            rows.iter().find_map(|row| {
+                non_empty(&record_metadata_text(&row.metadata_doc, &row.metadata_json))
+            })
         })
         .unwrap_or_default()
 }
@@ -707,20 +710,33 @@ fn exact_name_candidate_indices(
     indices
 }
 
+fn seed_metadata_prefilter_text(seed_rows: &[NftTextRow]) -> Option<String> {
+    seed_rows.iter().find_map(|row| {
+        non_empty(&record_metadata_prefilter_text(
+            &row.metadata_doc,
+            &row.metadata_json,
+        ))
+    })
+}
+
 fn match_metadata(
-    seed_metadata: &str,
+    conn: &Connection,
+    chain: &str,
+    seed_rows: &[NftTextRow],
     text_index: &TextIndex,
     scratch: &mut SampleScratch,
     seed_contract: &str,
     threshold: f64,
     limit: usize,
-) -> Vec<String> {
-    let scoring_seed_metadata = metadata_scoring_text(seed_metadata);
+) -> Result<Vec<String>, duckdb::Error> {
+    let Some(scoring_seed_metadata) = seed_metadata_prefilter_text(seed_rows) else {
+        return Ok(Vec::new());
+    };
     let Some(seed_doc) = MetadataDocument::from_text_with_vocab(
         &scoring_seed_metadata,
         &text_index.metadata_token_ids,
     ) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let seed_contract = seed_contract.to_lowercase();
     let excluded_indices = text_index
@@ -734,7 +750,7 @@ fn match_metadata(
         excluded_indices,
     );
     if corpus.total_docs == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let epoch = scratch.next_metadata_epoch();
@@ -762,7 +778,178 @@ fn match_metadata(
             (score_metadata_pair(&seed_doc, &candidate.doc, &corpus) >= threshold).then_some(*index)
         })
         .collect::<Vec<_>>();
-    materialize_metadata_matches(text_index, matched_indices, limit)
+    let candidate_contracts = matched_indices
+        .into_iter()
+        .map(|index| text_index.metadata[index].contract_address.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    final_metadata_matches_for_overlapping_tokens(
+        conn,
+        chain,
+        seed_rows,
+        &candidate_contracts,
+        threshold,
+        limit,
+    )
+}
+
+struct FinalMetadataRow {
+    token_id: String,
+    text: String,
+    doc: MetadataDocument,
+}
+
+fn final_metadata_matches_for_overlapping_tokens(
+    conn: &Connection,
+    chain: &str,
+    seed_rows: &[NftTextRow],
+    candidate_contracts: &[String],
+    threshold: f64,
+    limit: usize,
+) -> Result<Vec<String>, duckdb::Error> {
+    if candidate_contracts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut token_interner = TokenInterner::default();
+    let seed_docs = seed_metadata_docs_by_token(seed_rows, &mut token_interner);
+    if seed_docs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let seed_token_ids = seed_docs.keys().cloned().collect::<BTreeSet<_>>();
+    let candidate_rows = read_candidate_metadata_rows(
+        conn,
+        chain,
+        candidate_contracts,
+        &seed_token_ids,
+        &mut token_interner,
+    )?;
+    let mut matches = BTreeSet::new();
+    for contract in candidate_contracts {
+        let Some(rows) = candidate_rows.get(contract) else {
+            continue;
+        };
+        if let Some(text) = first_overlapping_metadata_match(&seed_docs, rows, threshold) {
+            matches.insert(text);
+        }
+        if limit > 0 && matches.len() >= limit {
+            break;
+        }
+    }
+    Ok(take_recall_limit(matches, limit))
+}
+
+fn seed_metadata_docs_by_token(
+    seed_rows: &[NftTextRow],
+    token_interner: &mut TokenInterner,
+) -> BTreeMap<String, MetadataDocument> {
+    let mut docs = BTreeMap::new();
+    for row in seed_rows {
+        if row.token_id.trim().is_empty() {
+            continue;
+        }
+        let text = record_metadata_doc(&row.metadata_doc, &row.metadata_json);
+        let Some(doc) = MetadataDocument::from_text_with_interner(&text, token_interner) else {
+            continue;
+        };
+        docs.entry(row.token_id.clone()).or_insert(doc);
+    }
+    docs
+}
+
+fn read_candidate_metadata_rows(
+    conn: &Connection,
+    chain: &str,
+    candidate_contracts: &[String],
+    seed_token_ids: &BTreeSet<String>,
+    token_interner: &mut TokenInterner,
+) -> Result<BTreeMap<String, Vec<FinalMetadataRow>>, duckdb::Error> {
+    if seed_token_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let token_values = seed_token_ids
+        .iter()
+        .map(|value| sql_string_literal(value))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut rows_by_contract = BTreeMap::<String, Vec<FinalMetadataRow>>::new();
+    for chunk in candidate_contracts.chunks(500) {
+        let contract_values = chunk
+            .iter()
+            .map(|value| sql_string_literal(value))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "
+            SELECT lower(contract_address) AS contract_address,
+                   CAST(token_id AS VARCHAR) AS token_id,
+                   coalesce(CAST(metadata_doc AS VARCHAR), '') AS metadata_doc,
+                   coalesce(CAST(metadata_json AS VARCHAR), '') AS metadata_json
+            FROM nft_features
+            WHERE chain = ?
+              AND lower(contract_address) IN ({contract_values})
+              AND CAST(token_id AS VARCHAR) IN ({token_values})
+              AND (trim(coalesce(CAST(metadata_doc AS VARCHAR), '')) <> ''
+                   OR trim(coalesce(CAST(metadata_json AS VARCHAR), '')) <> '')
+            ORDER BY contract_address, token_id
+            "
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![chain], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (contract_address, token_id, metadata_doc, metadata_json) = row?;
+            let text = record_metadata_text(&metadata_doc, &metadata_json);
+            let scoring_text = record_metadata_doc(&metadata_doc, &metadata_json);
+            let Some(doc) =
+                MetadataDocument::from_text_with_interner(&scoring_text, token_interner)
+            else {
+                continue;
+            };
+            rows_by_contract
+                .entry(contract_address)
+                .or_default()
+                .push(FinalMetadataRow {
+                    token_id,
+                    text,
+                    doc,
+                });
+        }
+    }
+    Ok(rows_by_contract)
+}
+
+fn first_overlapping_metadata_match(
+    seed_docs: &BTreeMap<String, MetadataDocument>,
+    rows: &[FinalMetadataRow],
+    threshold: f64,
+) -> Option<String> {
+    let corpus = MetadataCorpus::from_documents(rows.iter().map(|row| &row.doc));
+    let corpus = MetadataCorpusView::from_corpus(&corpus);
+    let mut first_match = None;
+    for row in rows {
+        let Some(seed_doc) = seed_docs.get(&row.token_id) else {
+            continue;
+        };
+        if score_metadata_pair(seed_doc, &row.doc, &corpus) >= threshold {
+            let text = row.text.trim().to_string();
+            if looks_like_json(&text) {
+                return Some(text);
+            }
+            first_match.get_or_insert(text);
+        }
+    }
+    first_match
+}
+
+fn sql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn materialize_name_matches(
@@ -774,20 +961,6 @@ fn materialize_name_matches(
         indices
             .into_iter()
             .map(|index| text_index.names[index].display_name.trim().to_string())
-            .collect(),
-        limit,
-    )
-}
-
-fn materialize_metadata_matches(
-    text_index: &TextIndex,
-    indices: Vec<usize>,
-    limit: usize,
-) -> Vec<String> {
-    take_recall_limit(
-        indices
-            .into_iter()
-            .map(|index| text_index.metadata[index].text.trim().to_string())
             .collect(),
         limit,
     )
@@ -894,6 +1067,90 @@ fn metadata_document_from_json(raw: &str) -> String {
     }
 }
 
+fn metadata_prefilter_text(raw: &str) -> String {
+    if raw.trim().is_empty() {
+        return String::new();
+    }
+    match serde_json::from_str::<Value>(raw) {
+        Ok(value) => {
+            let mut parts = BTreeSet::new();
+            collect_metadata_prefilter_parts(&value, &mut Vec::new(), &mut parts);
+            parts.into_iter().collect::<Vec<_>>().join(" ")
+        }
+        Err(_) => normalize_text(raw),
+    }
+}
+
+fn collect_metadata_prefilter_parts(
+    value: &Value,
+    path: &mut Vec<String>,
+    parts: &mut BTreeSet<String>,
+) {
+    match value {
+        Value::Object(map) => {
+            for (key, item) in map {
+                let key_norm = normalize_text(key);
+                if key_norm.is_empty() {
+                    continue;
+                }
+                path.push(key_norm.clone());
+                if is_structure_wrapper_key(&key_norm) {
+                    collect_metadata_prefilter_parts(item, path, parts);
+                } else if key_norm == "trait_type" {
+                    push_metadata_prefilter_part(parts, &key_norm);
+                    if let Some(text) = item.as_str() {
+                        push_metadata_prefilter_part(parts, text);
+                    }
+                } else if metadata_prefilter_includes_value(&key_norm) {
+                    push_metadata_prefilter_part(parts, &key_norm);
+                    collect_metadata_prefilter_values(item, parts);
+                } else {
+                    push_metadata_prefilter_part(parts, &key_norm);
+                    collect_metadata_prefilter_parts(item, path, parts);
+                }
+                path.pop();
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_metadata_prefilter_parts(item, path, parts);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_metadata_prefilter_values(value: &Value, parts: &mut BTreeSet<String>) {
+    match value {
+        Value::String(text) => push_metadata_prefilter_part(parts, text),
+        Value::Number(number) => push_metadata_prefilter_part(parts, &number.to_string()),
+        Value::Bool(value) => push_metadata_prefilter_part(parts, &value.to_string()),
+        Value::Array(items) => {
+            for item in items {
+                collect_metadata_prefilter_values(item, parts);
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map {
+                push_metadata_prefilter_part(parts, key);
+                collect_metadata_prefilter_values(item, parts);
+            }
+        }
+        Value::Null => {}
+    }
+}
+
+fn metadata_prefilter_includes_value(key: &str) -> bool {
+    is_description_key(key) || is_platform_key(key)
+}
+
+fn push_metadata_prefilter_part(parts: &mut BTreeSet<String>, raw: &str) {
+    let text = normalize_text(raw);
+    if !text.is_empty() {
+        parts.insert(text);
+    }
+}
+
 fn record_metadata_doc(metadata_doc: &str, metadata_json: &str) -> String {
     if !metadata_doc.trim().is_empty() {
         metadata_doc.to_string()
@@ -910,11 +1167,11 @@ fn record_metadata_text(metadata_doc: &str, metadata_json: &str) -> String {
     }
 }
 
-fn metadata_scoring_text(value: &str) -> String {
-    if looks_like_json(value) {
-        metadata_document_from_json(value)
+fn record_metadata_prefilter_text(metadata_doc: &str, metadata_json: &str) -> String {
+    if !metadata_json.trim().is_empty() {
+        metadata_prefilter_text(metadata_json)
     } else {
-        value.to_string()
+        metadata_prefilter_text(metadata_doc)
     }
 }
 
@@ -1033,6 +1290,20 @@ struct MetadataCorpusView<'a> {
 }
 
 impl<'a> MetadataCorpusView<'a> {
+    fn from_corpus(base: &'a MetadataCorpus) -> Self {
+        let avg_doc_len = if base.total_docs == 0 {
+            0.0
+        } else {
+            base.total_terms as f64 / base.total_docs as f64
+        };
+        Self {
+            base,
+            excluded_doc_freqs: HashMap::new(),
+            total_docs: base.total_docs,
+            avg_doc_len,
+        }
+    }
+
     fn new(
         base: &'a MetadataCorpus,
         documents: &'a [MetadataCandidate],
@@ -2100,6 +2371,23 @@ mod tests {
             metadata_document_from_json(json),
             "background red gold dragon"
         );
+    }
+
+    #[test]
+    fn metadata_prefilter_text_keeps_insensitive_values_but_only_sensitive_keys() {
+        let json = r#"{"name":"Seed #1","description":"Shared Story","attributes":[{"trait_type":"Background","value":"Red"}],"image":"ipfs://seed/1.png"}"#;
+
+        let text = metadata_prefilter_text(json);
+
+        assert!(text.contains("description"));
+        assert!(text.contains("shared story"));
+        assert!(text.contains("background"));
+        assert!(text.contains("name"));
+        assert!(text.contains("image"));
+        let tokens = text.split_whitespace().collect::<Vec<_>>();
+        assert!(!tokens.contains(&"seed"));
+        assert!(!tokens.contains(&"red"));
+        assert!(!tokens.contains(&"ipfs"));
     }
 
     #[test]

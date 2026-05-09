@@ -3,20 +3,18 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use once_cell::sync::Lazy;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use postgres::fallible_iterator::FallibleIterator;
 use postgres::types::ToSql;
 use postgres::Client;
-use regex::Regex;
 
-use crate::analysis::scoring::metadata_document_from_json;
+use crate::analysis::scoring::{
+    metadata_document_from_json, metadata_recall_document, metadata_recall_keywords,
+};
 use crate::error::AppError;
 use crate::normalize::{normalize_name, normalize_url};
-
-static TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\p{L}\p{N}_]+").unwrap());
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SnapshotExportRow {
@@ -42,30 +40,6 @@ fn chain_to_table(chain: &str) -> Result<String, AppError> {
         )));
     }
     Ok(format!("nft_assets_{safe}"))
-}
-
-fn metadata_keywords(document: &str, limit: usize) -> Vec<String> {
-    let mut counts = std::collections::BTreeMap::<String, usize>::new();
-    for token in TOKEN_RE.find_iter(document) {
-        let normalized = token.as_str().to_lowercase();
-        if normalized.len() < 4 {
-            continue;
-        }
-        *counts.entry(normalized).or_insert(0) += 1;
-    }
-    let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();
-    ranked.sort_by(|left, right| {
-        right
-            .1
-            .cmp(&left.1)
-            .then_with(|| right.0.len().cmp(&left.0.len()))
-            .then_with(|| left.0.cmp(&right.0))
-    });
-    ranked
-        .into_iter()
-        .take(limit)
-        .map(|(token, _)| token)
-        .collect()
 }
 
 fn snapshot_schema(keep_metadata_json: bool) -> Arc<Schema> {
@@ -113,9 +87,13 @@ fn snapshot_batch(
         .iter()
         .map(|row| metadata_document_from_json(&row.metadata_json))
         .collect();
-    let metadata_keyword_values: Vec<String> = metadata_doc_values
+    let metadata_keyword_values: Vec<String> = rows
         .iter()
-        .map(|doc| serde_json::to_string(&metadata_keywords(doc, 8)))
+        .zip(metadata_doc_values.iter())
+        .map(|(row, doc)| {
+            let recall_doc = metadata_recall_document(doc, &row.metadata_json);
+            serde_json::to_string(&metadata_recall_keywords(&recall_doc, 8))
+        })
         .collect::<Result<_, _>>()?;
 
     let mut columns: Vec<ArrayRef> = vec![

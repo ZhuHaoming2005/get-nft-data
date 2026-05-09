@@ -79,6 +79,7 @@ pub struct ContractDuplicateRecord {
     pub image_uri_match: bool,
     pub name_norms: Vec<String>,
     pub metadata_doc: String,
+    pub metadata_token_rows: Vec<DatabaseNftRecord>,
     pub metadata_recall_checked: bool,
     pub metadata_recall_match: bool,
 }

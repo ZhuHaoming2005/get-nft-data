@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -67,6 +67,147 @@ fn metadata_document(raw: &str) -> String {
         }
         Err(_) => normalize_text(raw),
     }
+}
+
+pub fn metadata_prefilter_document_from_json(raw: &str) -> String {
+    if raw.trim().is_empty() {
+        return String::new();
+    }
+
+    match serde_json::from_str::<Value>(raw) {
+        Ok(value) => {
+            let mut parts = BTreeSet::new();
+            collect_metadata_prefilter_parts(&value, &mut parts);
+            parts.into_iter().collect::<Vec<_>>().join(" ")
+        }
+        Err(_) => normalize_text(raw),
+    }
+}
+
+pub fn metadata_recall_document(metadata_doc: &str, metadata_json: &str) -> String {
+    let prefilter_doc = metadata_prefilter_document_from_json(metadata_json);
+    if prefilter_doc.is_empty() {
+        metadata_doc.to_string()
+    } else {
+        prefilter_doc
+    }
+}
+
+pub fn metadata_recall_keywords(document: &str, limit: usize) -> Vec<String> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for token in TOKEN_RE.find_iter(document) {
+        let normalized = token.as_str().to_lowercase();
+        if normalized.len() < 2 {
+            continue;
+        }
+        *counts.entry(normalized).or_insert(0) += 1;
+    }
+    let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| right.0.len().cmp(&left.0.len()))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    ranked
+        .into_iter()
+        .take(limit)
+        .map(|(token, _)| token)
+        .collect()
+}
+
+fn collect_metadata_prefilter_parts(value: &Value, parts: &mut BTreeSet<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, item) in map {
+                let key_norm = normalize_text(key);
+                if key_norm.is_empty() {
+                    continue;
+                }
+                if is_structure_wrapper_key(&key_norm) {
+                    collect_metadata_prefilter_parts(item, parts);
+                } else if key_norm == "trait_type" {
+                    push_metadata_prefilter_part(parts, &key_norm);
+                    if let Some(text) = item.as_str() {
+                        push_metadata_prefilter_part(parts, text);
+                    }
+                } else if metadata_prefilter_includes_value(&key_norm) {
+                    push_metadata_prefilter_part(parts, &key_norm);
+                    collect_metadata_prefilter_values(item, parts);
+                } else {
+                    push_metadata_prefilter_part(parts, &key_norm);
+                    collect_metadata_prefilter_parts(item, parts);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_metadata_prefilter_parts(item, parts);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_metadata_prefilter_values(value: &Value, parts: &mut BTreeSet<String>) {
+    match value {
+        Value::String(text) => push_metadata_prefilter_part(parts, text),
+        Value::Number(number) => push_metadata_prefilter_part(parts, &number.to_string()),
+        Value::Bool(value) => push_metadata_prefilter_part(parts, &value.to_string()),
+        Value::Array(items) => {
+            for item in items {
+                collect_metadata_prefilter_values(item, parts);
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map {
+                push_metadata_prefilter_part(parts, key);
+                collect_metadata_prefilter_values(item, parts);
+            }
+        }
+        Value::Null => {}
+    }
+}
+
+fn metadata_prefilter_includes_value(key: &str) -> bool {
+    is_description_key(key) || is_platform_key(key)
+}
+
+fn push_metadata_prefilter_part(parts: &mut BTreeSet<String>, raw: &str) {
+    let text = normalize_text(raw);
+    if !text.is_empty() {
+        parts.insert(text);
+    }
+}
+
+fn is_structure_wrapper_key(key: &str) -> bool {
+    matches!(key, "metadata" | "rawmetadata" | "raw")
+}
+
+fn is_description_key(key: &str) -> bool {
+    matches!(
+        key,
+        "description" | "bio" | "story" | "lore" | "summary" | "about"
+    )
+}
+
+fn is_platform_key(key: &str) -> bool {
+    matches!(
+        key,
+        "seller_fee_basis_points"
+            | "fee_recipient"
+            | "royalty"
+            | "royalties"
+            | "creator"
+            | "creators"
+            | "compiler"
+            | "license"
+            | "collection"
+            | "marketplace"
+            | "contract"
+            | "chain"
+    )
 }
 
 fn tokenize(document: &str) -> Vec<String> {
@@ -160,6 +301,23 @@ mod tests {
     fn metadata_bm25_uses_common_okapi_defaults() {
         assert_eq!(METADATA_BM25_K1, 1.2);
         assert_eq!(METADATA_BM25_B, 0.75);
+    }
+
+    #[test]
+    fn metadata_prefilter_document_keeps_insensitive_values_but_only_sensitive_keys() {
+        let json = r#"{"name":"Seed #1","description":"Shared Story","attributes":[{"trait_type":"Background","value":"Red"}],"image":"ipfs://seed/1.png"}"#;
+
+        let text = metadata_prefilter_document_from_json(json);
+
+        assert!(text.contains("description"));
+        assert!(text.contains("shared story"));
+        assert!(text.contains("background"));
+        assert!(text.contains("name"));
+        assert!(text.contains("image"));
+        let tokens = text.split_whitespace().collect::<Vec<_>>();
+        assert!(!tokens.contains(&"seed"));
+        assert!(!tokens.contains(&"red"));
+        assert!(!tokens.contains(&"ipfs"));
     }
 }
 
