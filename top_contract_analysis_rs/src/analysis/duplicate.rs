@@ -156,7 +156,22 @@ fn first_overlapping_metadata_match<'a>(
         let candidate_row = candidate_rows[0];
         let candidate_doc = &candidate_docs[0];
         let seed_query = seed_queries_by_token.get(&candidate_row.token_id)?;
-        return (seed_query.score(candidate_doc) >= metadata_threshold).then_some(candidate_row);
+        return (seed_query.has_term_overlap(candidate_doc)
+            && seed_query.score(candidate_doc) >= metadata_threshold)
+            .then_some(candidate_row);
+    }
+
+    let has_any_term_overlap =
+        candidate_rows
+            .iter()
+            .zip(candidate_docs.iter())
+            .any(|(candidate_row, candidate_doc)| {
+                seed_queries_by_token
+                    .get(&candidate_row.token_id)
+                    .is_some_and(|seed_query| seed_query.has_term_overlap(candidate_doc))
+            });
+    if !has_any_term_overlap {
+        return None;
     }
 
     let corpus = MetadataBm25Corpus::from_indexed_documents(&candidate_docs);
@@ -174,6 +189,9 @@ fn first_overlapping_metadata_match<'a>(
         else {
             continue;
         };
+        if !seed_query.has_term_overlap(candidate_doc) {
+            continue;
+        }
         if score_metadata_indexed_pair_with_query(seed_query, candidate_doc) >= metadata_threshold {
             return Some(candidate_row);
         }
@@ -421,7 +439,9 @@ pub fn build_duplicate_candidates_from_contract_rows(
             if should_score_metadata(row, has_metadata_recall_flags) {
                 if let Some(row_doc) = metadata_index.candidate_doc(contract_index) {
                     if metadata_queries.iter().any(|query| {
-                        score_metadata_indexed_pair_with_query(query, row_doc) >= metadata_threshold
+                        query.has_term_overlap(row_doc)
+                            && score_metadata_indexed_pair_with_query(query, row_doc)
+                                >= metadata_threshold
                     }) {
                         metadata_match_row = first_overlapping_metadata_match(
                             &seed_final_metadata_queries_by_token,

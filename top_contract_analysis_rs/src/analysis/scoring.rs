@@ -305,6 +305,20 @@ mod tests {
     }
 
     #[test]
+    fn prepared_metadata_query_detects_term_overlap() {
+        let query = MetadataBm25Document::from_text("gold dragon gold").unwrap();
+        let overlap_doc = MetadataBm25Document::from_text("rare gold").unwrap();
+        let miss_doc = MetadataBm25Document::from_text("silver cat").unwrap();
+        let corpus =
+            MetadataBm25Corpus::from_indexed_documents(&[overlap_doc.clone(), miss_doc.clone()]);
+
+        let prepared_query = MetadataBm25Query::new(&query, &corpus);
+
+        assert!(prepared_query.has_term_overlap(&overlap_doc));
+        assert!(!prepared_query.has_term_overlap(&miss_doc));
+    }
+
+    #[test]
     fn single_document_metadata_pair_score_matches_corpus_path() {
         let query = MetadataBm25Document::from_text("gold dragon").unwrap();
         let doc = MetadataBm25Document::from_text("rare gold dragon").unwrap();
@@ -326,6 +340,18 @@ mod tests {
         let pair_score = score_metadata_single_document_pair(&query, &doc);
 
         assert!((prepared_score - pair_score).abs() < 1e-9);
+    }
+
+    #[test]
+    fn prepared_single_document_query_detects_term_overlap() {
+        let query = MetadataBm25Document::from_text("gold dragon").unwrap();
+        let overlap_doc = MetadataBm25Document::from_text("dragon scale").unwrap();
+        let miss_doc = MetadataBm25Document::from_text("silver cat").unwrap();
+
+        let prepared_query = MetadataBm25SingleDocumentQuery::new(query);
+
+        assert!(prepared_query.has_term_overlap(&overlap_doc));
+        assert!(!prepared_query.has_term_overlap(&miss_doc));
     }
 
     #[test]
@@ -459,6 +485,10 @@ impl<'a> MetadataBm25Query<'a> {
             corpus,
         }
     }
+
+    pub(crate) fn has_term_overlap(&self, document: &MetadataBm25Document) -> bool {
+        query_terms_overlap_document(&self.terms, document)
+    }
 }
 
 impl MetadataBm25SingleDocumentQuery {
@@ -478,6 +508,10 @@ impl MetadataBm25SingleDocumentQuery {
         (bm25_score_terms_with_single_document_corpus(&self.terms, right, right) / denominator)
             .clamp(0.0, 1.0)
     }
+
+    pub(crate) fn has_term_overlap(&self, document: &MetadataBm25Document) -> bool {
+        query_terms_overlap_document(&self.terms, document)
+    }
 }
 
 fn query_terms_from_tokens(query_tokens: &[String]) -> Vec<(String, usize)> {
@@ -488,6 +522,15 @@ fn query_terms_from_tokens(query_tokens: &[String]) -> Vec<(String, usize)> {
     let mut query_terms = query_terms.into_iter().collect::<Vec<_>>();
     query_terms.sort_by(|left, right| left.0.cmp(&right.0));
     query_terms
+}
+
+fn query_terms_overlap_document(
+    query_terms: &[(String, usize)],
+    document: &MetadataBm25Document,
+) -> bool {
+    query_terms
+        .iter()
+        .any(|(token, _)| document.term_frequency(token) > 0)
 }
 
 fn bm25_score_terms(
