@@ -231,6 +231,13 @@ struct MetadataSourceIndex {
 }
 
 #[derive(Clone, Debug, Default)]
+struct MetadataSourceCandidates {
+    indices: Vec<usize>,
+    bucket_hits: usize,
+    verified: usize,
+}
+
+#[derive(Clone, Debug, Default)]
 struct ContractMetadataCorpusExclusion {
     doc_count: usize,
     term_count: usize,
@@ -988,23 +995,20 @@ fn match_metadata(
     let seed_sketch = metadata_sketch_from_document(&seed_doc, corpus.total_docs, |token| {
         corpus.document_frequency(token)
     });
-    let source_bucket_indices =
-        collect_metadata_source_bucket_indices(&seed_sketch, text_index, scratch);
+    let source_candidates = collect_metadata_source_candidates(
+        &seed_sketch,
+        text_index,
+        scratch,
+        &seed_contract,
+        METADATA_SKETCH_SOURCE_HAMMING_THRESHOLD,
+    );
     emit_progress(
         progress,
         position.index,
         position.total,
         SampleProgressStage::CollectMetadataSourceBuckets,
         7,
-        Some(source_bucket_indices.len()),
-    );
-    let candidate_indices = verify_metadata_source_bucket_indices(
-        &seed_sketch,
-        text_index,
-        scratch,
-        &seed_contract,
-        METADATA_SKETCH_SOURCE_HAMMING_THRESHOLD,
-        source_bucket_indices,
+        Some(source_candidates.bucket_hits),
     );
     emit_progress(
         progress,
@@ -1012,8 +1016,9 @@ fn match_metadata(
         position.total,
         SampleProgressStage::VerifyMetadataSourceBuckets,
         8,
-        Some(scratch.metadata_verify_count),
+        Some(source_candidates.verified),
     );
+    let candidate_indices = source_candidates.indices;
     emit_progress(
         progress,
         position.index,
@@ -1072,35 +1077,75 @@ fn match_metadata(
     Ok(matches)
 }
 
-fn collect_metadata_source_bucket_indices(
+fn collect_metadata_source_candidates(
     seed_sketch: &MetadataSketch,
     text_index: &TextIndex,
     scratch: &mut SampleScratch,
-) -> Vec<usize> {
+    seed_contract: &str,
+    hamming_threshold: u32,
+) -> MetadataSourceCandidates {
     scratch.metadata_verify_count = 0;
     if seed_sketch.is_empty() {
-        return Vec::new();
+        return MetadataSourceCandidates::default();
     }
-    if !text_index.metadata_source_index.is_empty() {
-        return collect_metadata_source_bucket_indices_from_index(seed_sketch, text_index);
+    let epoch = scratch.next_metadata_epoch();
+    let mut candidates = MetadataSourceCandidates::default();
+    if text_index.metadata_source_index.is_empty() {
+        for index in 0..text_index.metadata.len() {
+            push_metadata_source_candidate(
+                index,
+                seed_sketch,
+                text_index,
+                scratch,
+                seed_contract,
+                hamming_threshold,
+                epoch,
+                &mut candidates,
+            );
+        }
+    } else {
+        collect_metadata_source_candidates_from_index(
+            seed_sketch,
+            text_index,
+            scratch,
+            seed_contract,
+            hamming_threshold,
+            epoch,
+            &mut candidates,
+        );
     }
-    (0..text_index.metadata.len()).collect()
+    candidates.verified = scratch.metadata_verify_count;
+    candidates
 }
 
-fn collect_metadata_source_bucket_indices_from_index(
+fn collect_metadata_source_candidates_from_index(
     seed_sketch: &MetadataSketch,
     text_index: &TextIndex,
-) -> Vec<usize> {
-    let mut bucket_indices = Vec::new();
-
+    scratch: &mut SampleScratch,
+    seed_contract: &str,
+    hamming_threshold: u32,
+    epoch: u32,
+    candidates: &mut MetadataSourceCandidates,
+) {
     for anchor in &seed_sketch.anchors {
         let Some(indices) = text_index.metadata_source_index.anchor_indices.get(anchor) else {
             continue;
         };
-        bucket_indices.extend(indices.iter().copied());
+        for index in indices {
+            push_metadata_source_candidate(
+                *index,
+                seed_sketch,
+                text_index,
+                scratch,
+                seed_contract,
+                hamming_threshold,
+                epoch,
+                candidates,
+            );
+        }
     }
 
-    let band_radius = METADATA_SKETCH_SOURCE_HAMMING_THRESHOLD / METADATA_SIMHASH_BAND_COUNT as u32;
+    let band_radius = hamming_threshold / METADATA_SIMHASH_BAND_COUNT as u32;
     for band_index in 0..METADATA_SIMHASH_BAND_COUNT {
         let seed_band = metadata_simhash_band_value(seed_sketch.simhash, band_index);
         for band_value in 0..METADATA_SIMHASH_BAND_VALUES {
@@ -1116,41 +1161,45 @@ fn collect_metadata_source_bucket_indices_from_index(
             else {
                 continue;
             };
-            bucket_indices.extend(indices.iter().copied());
+            for index in indices {
+                push_metadata_source_candidate(
+                    *index,
+                    seed_sketch,
+                    text_index,
+                    scratch,
+                    seed_contract,
+                    hamming_threshold,
+                    epoch,
+                    candidates,
+                );
+            }
         }
     }
-
-    bucket_indices.sort_unstable();
-    bucket_indices.dedup();
-    bucket_indices
 }
 
-fn verify_metadata_source_bucket_indices(
+fn push_metadata_source_candidate(
+    index: usize,
     seed_sketch: &MetadataSketch,
     text_index: &TextIndex,
     scratch: &mut SampleScratch,
     seed_contract: &str,
     hamming_threshold: u32,
-    bucket_indices: Vec<usize>,
-) -> Vec<usize> {
-    let epoch = scratch.next_metadata_epoch();
-    scratch.metadata_verify_count = 0;
-    let mut source_indices = Vec::new();
-    for index in bucket_indices {
-        if scratch.metadata_seen_epochs[index] == epoch {
-            continue;
-        }
-        scratch.metadata_seen_epochs[index] = epoch;
-        let candidate = &text_index.metadata[index];
-        if candidate.contract_address == seed_contract {
-            continue;
-        }
-        scratch.metadata_verify_count += 1;
-        if metadata_sketch_source_match(seed_sketch, &candidate.sketch, hamming_threshold) {
-            source_indices.push(index);
-        }
+    epoch: u32,
+    candidates: &mut MetadataSourceCandidates,
+) {
+    candidates.bucket_hits += 1;
+    if scratch.metadata_seen_epochs[index] == epoch {
+        return;
     }
-    source_indices
+    scratch.metadata_seen_epochs[index] = epoch;
+    let candidate = &text_index.metadata[index];
+    if candidate.contract_address == seed_contract {
+        return;
+    }
+    scratch.metadata_verify_count += 1;
+    if metadata_sketch_source_match(seed_sketch, &candidate.sketch, hamming_threshold) {
+        candidates.indices.push(index);
+    }
 }
 
 fn metadata_sketch_source_match(
@@ -2982,16 +3031,14 @@ mod tests {
         scratch: &mut SampleScratch,
         seed_contract: &str,
     ) -> Vec<usize> {
-        let bucket_indices =
-            collect_metadata_source_bucket_indices(seed_sketch, text_index, scratch);
-        verify_metadata_source_bucket_indices(
+        collect_metadata_source_candidates(
             seed_sketch,
             text_index,
             scratch,
             seed_contract,
             METADATA_SKETCH_SOURCE_HAMMING_THRESHOLD,
-            bucket_indices,
         )
+        .indices
     }
 
     #[test]
@@ -3348,7 +3395,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_source_bucket_indices_are_deduped_before_verification() {
+    fn metadata_source_candidates_are_deduped_during_bucket_scan() {
         let mut token_interner = TokenInterner::default();
         let doc =
             MetadataDocument::from_text_with_interner("description rarealpha", &mut token_interner)
@@ -3373,20 +3420,17 @@ mod tests {
         };
         let mut scratch = SampleScratch::new(text_index.metadata.len());
 
-        let bucket_indices =
-            collect_metadata_source_bucket_indices(&seed_sketch, &text_index, &mut scratch);
-        let source_indices = verify_metadata_source_bucket_indices(
+        let source_candidates = collect_metadata_source_candidates(
             &seed_sketch,
             &text_index,
             &mut scratch,
             "0xseed",
             METADATA_SKETCH_SOURCE_HAMMING_THRESHOLD,
-            bucket_indices.clone(),
         );
 
-        assert_eq!(bucket_indices, vec![0]);
-        assert_eq!(scratch.metadata_verify_count, 1);
-        assert_eq!(source_indices, vec![0]);
+        assert!(source_candidates.bucket_hits > source_candidates.verified);
+        assert_eq!(source_candidates.verified, 1);
+        assert_eq!(source_candidates.indices, vec![0]);
     }
 
     #[test]
