@@ -1113,18 +1113,23 @@ fn collect_metadata_source_candidates(
     let epoch = scratch.next_metadata_epoch();
     let mut candidates = MetadataSourceCandidates::default();
     if text_index.metadata_source_index.is_empty() {
-        for index in 0..text_index.metadata.len() {
-            push_metadata_source_candidate(
-                index,
-                seed_sketch,
-                text_index,
-                scratch,
-                seed_contract,
-                hamming_threshold,
-                epoch,
-                &mut candidates,
-            );
-        }
+        candidates = collect_metadata_source_candidates_full_scan(
+            seed_sketch,
+            text_index,
+            seed_contract,
+            hamming_threshold,
+        );
+        scratch.metadata_verify_count = candidates.verified;
+    } else if estimate_metadata_source_bucket_hits(seed_sketch, text_index, hamming_threshold)
+        >= text_index.metadata.len()
+    {
+        candidates = collect_metadata_source_candidates_full_scan(
+            seed_sketch,
+            text_index,
+            seed_contract,
+            hamming_threshold,
+        );
+        scratch.metadata_verify_count = candidates.verified;
     } else {
         collect_metadata_source_candidates_from_index(
             seed_sketch,
@@ -1138,6 +1143,77 @@ fn collect_metadata_source_candidates(
     }
     candidates.verified = scratch.metadata_verify_count;
     candidates
+}
+
+fn collect_metadata_source_candidates_full_scan(
+    seed_sketch: &MetadataSketch,
+    text_index: &TextIndex,
+    seed_contract: &str,
+    hamming_threshold: u32,
+) -> MetadataSourceCandidates {
+    let (verified, mut indices) = text_index
+        .metadata
+        .par_iter()
+        .enumerate()
+        .fold(
+            || (0usize, Vec::new()),
+            |mut output, (index, candidate)| {
+                if candidate.contract_address == seed_contract {
+                    return output;
+                }
+                output.0 += 1;
+                if metadata_sketch_source_match(seed_sketch, &candidate.sketch, hamming_threshold) {
+                    output.1.push(index);
+                }
+                output
+            },
+        )
+        .reduce(
+            || (0usize, Vec::new()),
+            |mut left, mut right| {
+                left.0 += right.0;
+                left.1.append(&mut right.1);
+                left
+            },
+        );
+    indices.sort_unstable();
+    MetadataSourceCandidates {
+        indices,
+        bucket_hits: text_index.metadata.len(),
+        verified,
+    }
+}
+
+fn estimate_metadata_source_bucket_hits(
+    seed_sketch: &MetadataSketch,
+    text_index: &TextIndex,
+    hamming_threshold: u32,
+) -> usize {
+    let mut hits = 0usize;
+    for anchor in &seed_sketch.anchors {
+        if let Some(indices) = text_index.metadata_source_index.anchor_indices.get(anchor) {
+            hits = hits.saturating_add(indices.len());
+        }
+    }
+    let band_radius = hamming_threshold / METADATA_SIMHASH_BAND_COUNT as u32;
+    for band_index in 0..METADATA_SIMHASH_BAND_COUNT {
+        let seed_band = metadata_simhash_band_value(seed_sketch.simhash, band_index);
+        for band_value in 0..METADATA_SIMHASH_BAND_VALUES {
+            let band_value = band_value as u8;
+            if (seed_band ^ band_value).count_ones() > band_radius {
+                continue;
+            }
+            let band_key = metadata_simhash_band_key(band_index, band_value);
+            if let Some(indices) = text_index
+                .metadata_source_index
+                .simhash_band_indices
+                .get(band_key)
+            {
+                hits = hits.saturating_add(indices.len());
+            }
+        }
+    }
+    hits
 }
 
 fn collect_metadata_source_candidates_from_index(
@@ -3422,7 +3498,7 @@ mod tests {
         let doc =
             MetadataDocument::from_text_with_interner("description rarealpha", &mut token_interner)
                 .unwrap();
-        let metadata = vec![MetadataCandidate {
+        let mut metadata = vec![MetadataCandidate {
             contract_address: "0xhit".into(),
             doc,
             sketch: MetadataSketch {
@@ -3430,6 +3506,20 @@ mod tests {
                 anchors: vec![7],
             },
         }];
+        for index in 0..64 {
+            metadata.push(MetadataCandidate {
+                contract_address: format!("0xmiss{index}"),
+                doc: MetadataDocument {
+                    tokens: vec![index as TokenId + 100],
+                    unique_tokens: vec![index as TokenId + 100],
+                    term_freqs: vec![(index as TokenId + 100, 1)],
+                },
+                sketch: MetadataSketch {
+                    simhash: u64::MAX,
+                    anchors: vec![8],
+                },
+            });
+        }
         let metadata_source_index = build_metadata_source_index(&metadata);
         let text_index = TextIndex {
             metadata,
@@ -3453,6 +3543,48 @@ mod tests {
         assert!(source_candidates.bucket_hits > source_candidates.verified);
         assert_eq!(source_candidates.verified, 1);
         assert_eq!(source_candidates.indices, vec![0]);
+    }
+
+    #[test]
+    fn metadata_source_candidates_use_full_scan_for_broad_bucket_queries() {
+        let mut metadata = Vec::new();
+        for index in 0..64 {
+            metadata.push(MetadataCandidate {
+                contract_address: format!("0xhit{index}"),
+                doc: MetadataDocument {
+                    tokens: vec![index as TokenId],
+                    unique_tokens: vec![index as TokenId],
+                    term_freqs: vec![(index as TokenId, 1)],
+                },
+                sketch: MetadataSketch {
+                    simhash: 0,
+                    anchors: vec![7],
+                },
+            });
+        }
+        let metadata_source_index = build_metadata_source_index(&metadata);
+        let text_index = TextIndex {
+            metadata,
+            metadata_source_index,
+            ..TextIndex::default()
+        };
+        let seed_sketch = MetadataSketch {
+            simhash: 0,
+            anchors: vec![7],
+        };
+        let mut scratch = SampleScratch::new(text_index.metadata.len());
+
+        let source_candidates = collect_metadata_source_candidates(
+            &seed_sketch,
+            &text_index,
+            &mut scratch,
+            "0xseed",
+            METADATA_SKETCH_SOURCE_HAMMING_THRESHOLD,
+        );
+
+        assert_eq!(source_candidates.bucket_hits, text_index.metadata.len());
+        assert_eq!(source_candidates.verified, text_index.metadata.len());
+        assert_eq!(source_candidates.indices.len(), text_index.metadata.len());
     }
 
     #[test]
