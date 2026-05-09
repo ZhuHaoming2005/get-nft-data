@@ -740,48 +740,62 @@ fn metadata_sketch_from_document(
     total_docs: usize,
     mut document_frequency: impl FnMut(TokenId) -> usize,
 ) -> MetadataSketch {
-    let simhash = metadata_weighted_simhash(document, total_docs, &mut document_frequency);
-    let mut anchors = Vec::new();
+    let mut weights = [0.0f64; 64];
+    let mut anchors = Vec::<(TokenId, f64)>::new();
     for token in &document.unique_tokens {
         let df = document_frequency(*token);
+        let idf = metadata_token_idf(total_docs, df);
+        let token_hash = stable_token_hash(*token);
+        for (bit, weight) in weights.iter_mut().enumerate() {
+            if ((token_hash >> bit) & 1) == 1 {
+                *weight += idf;
+            } else {
+                *weight -= idf;
+            }
+        }
         if metadata_token_is_high_frequency(total_docs, df) {
             continue;
         }
-        anchors.push((*token, metadata_token_idf(total_docs, df)));
+        push_metadata_anchor_candidate(&mut anchors, (*token, idf));
     }
-    anchors.sort_by(|left, right| {
-        right
-            .1
-            .partial_cmp(&left.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.0.cmp(&right.0))
-    });
+    let simhash = metadata_simhash_from_weights(weights);
     let mut anchors = anchors
         .into_iter()
-        .take(METADATA_SKETCH_ANCHOR_COUNT)
         .map(|(token, _)| token)
         .collect::<Vec<_>>();
     anchors.sort_unstable();
     MetadataSketch { simhash, anchors }
 }
 
-fn metadata_weighted_simhash(
-    document: &MetadataDocument,
-    total_docs: usize,
-    document_frequency: &mut impl FnMut(TokenId) -> usize,
-) -> u64 {
-    let mut weights = [0.0f64; 64];
-    for token in &document.unique_tokens {
-        let token_hash = stable_token_hash(*token);
-        let idf = metadata_token_idf(total_docs, document_frequency(*token));
-        for bit in 0..64 {
-            if ((token_hash >> bit) & 1) == 1 {
-                weights[bit] += idf;
-            } else {
-                weights[bit] -= idf;
-            }
-        }
+fn push_metadata_anchor_candidate(anchors: &mut Vec<(TokenId, f64)>, candidate: (TokenId, f64)) {
+    if anchors.len() < METADATA_SKETCH_ANCHOR_COUNT {
+        anchors.push(candidate);
+        return;
     }
+
+    let Some((worst_index, worst_anchor)) = anchors
+        .iter()
+        .enumerate()
+        .min_by(|(_, left), (_, right)| compare_metadata_anchor_quality(left, right))
+    else {
+        return;
+    };
+    if compare_metadata_anchor_quality(&candidate, worst_anchor).is_gt() {
+        anchors[worst_index] = candidate;
+    }
+}
+
+fn compare_metadata_anchor_quality(
+    left: &(TokenId, f64),
+    right: &(TokenId, f64),
+) -> std::cmp::Ordering {
+    left.1
+        .partial_cmp(&right.1)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| right.0.cmp(&left.0))
+}
+
+fn metadata_simhash_from_weights(weights: [f64; 64]) -> u64 {
     let mut simhash = 0u64;
     for (bit, weight) in weights.into_iter().enumerate() {
         if weight >= 0.0 {
