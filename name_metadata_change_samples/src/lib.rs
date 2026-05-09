@@ -235,6 +235,7 @@ struct MetadataSourceCandidates {
     indices: Vec<usize>,
     bucket_hits: usize,
     verified: usize,
+    full_scan: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1040,7 +1041,16 @@ fn match_metadata(
         8,
         Some(source_candidates.verified),
     );
-    let candidate_indices = source_candidates.indices;
+    let seed_query = PreparedMetadataQuery::new(seed_doc, &corpus);
+    let candidate_indices = if source_candidates.full_scan {
+        metadata_prefilter_score_candidate_indices(
+            &seed_query,
+            &text_index.metadata,
+            &source_candidates.indices,
+        )
+    } else {
+        source_candidates.indices
+    };
     emit_progress(
         progress,
         position.index,
@@ -1050,7 +1060,6 @@ fn match_metadata(
         Some(candidate_indices.len()),
     );
 
-    let seed_query = PreparedMetadataQuery::new(seed_doc, &corpus);
     emit_progress(
         progress,
         position.index,
@@ -1097,6 +1106,18 @@ fn match_metadata(
         Some(matches.len()),
     );
     Ok(matches)
+}
+
+fn metadata_prefilter_score_candidate_indices(
+    seed_query: &PreparedMetadataQuery<'_>,
+    metadata: &[MetadataCandidate],
+    candidate_indices: &[usize],
+) -> Vec<usize> {
+    candidate_indices
+        .par_iter()
+        .copied()
+        .filter(|index| seed_query.has_term_overlap(&metadata[*index].doc))
+        .collect()
 }
 
 fn collect_metadata_source_candidates(
@@ -1181,6 +1202,7 @@ fn collect_metadata_source_candidates_full_scan(
         indices,
         bucket_hits: text_index.metadata.len(),
         verified,
+        full_scan: true,
     }
 }
 
@@ -2014,6 +2036,25 @@ impl<'a> PreparedMetadataQuery<'a> {
     fn score(&self, document: &MetadataDocument) -> f64 {
         (bm25_score_terms(&self.terms, document, self.corpus) / self.denominator).clamp(0.0, 1.0)
     }
+
+    fn has_term_overlap(&self, document: &MetadataDocument) -> bool {
+        sorted_token_terms_overlap(&self.terms, &document.term_freqs)
+    }
+}
+
+fn sorted_token_terms_overlap(left: &[(TokenId, usize)], right: &[(TokenId, usize)]) -> bool {
+    let mut left_index = 0usize;
+    let mut right_index = 0usize;
+    while left_index < left.len() && right_index < right.len() {
+        let left_token = left[left_index].0;
+        let right_token = right[right_index].0;
+        match left_token.cmp(&right_token) {
+            std::cmp::Ordering::Less => left_index += 1,
+            std::cmp::Ordering::Greater => right_index += 1,
+            std::cmp::Ordering::Equal => return true,
+        }
+    }
+    false
 }
 
 impl PreparedSingleMetadataQuery {
@@ -3371,6 +3412,42 @@ mod tests {
     }
 
     #[test]
+    fn metadata_prefilter_candidates_skip_zero_bm25_overlap() {
+        let mut token_interner = TokenInterner::default();
+        let query =
+            MetadataDocument::from_text_with_interner("gold dragon", &mut token_interner).unwrap();
+        let no_overlap =
+            MetadataDocument::from_text_with_interner("silver forest", &mut token_interner)
+                .unwrap();
+        let overlap =
+            MetadataDocument::from_text_with_interner("rare gold", &mut token_interner).unwrap();
+        let metadata = vec![
+            MetadataCandidate {
+                contract_address: "0xmiss".into(),
+                doc: no_overlap.clone(),
+                sketch: MetadataSketch::default(),
+            },
+            MetadataCandidate {
+                contract_address: "0xhit".into(),
+                doc: overlap.clone(),
+                sketch: MetadataSketch::default(),
+            },
+        ];
+        let corpus =
+            MetadataCorpus::from_documents(metadata.iter().map(|candidate| &candidate.doc));
+        let corpus = MetadataCorpusView::from_corpus(&corpus);
+        let seed_query = PreparedMetadataQuery::new(query, &corpus);
+
+        let filtered = metadata_prefilter_score_candidate_indices(&seed_query, &metadata, &[0, 1]);
+
+        assert_eq!(
+            bm25_score_terms(&seed_query.terms, &no_overlap, &corpus),
+            0.0
+        );
+        assert_eq!(filtered, vec![1]);
+    }
+
+    #[test]
     fn metadata_sketch_source_scan_ignores_shared_high_frequency_structure_tokens() {
         let mut token_interner = TokenInterner::default();
         let seed_doc = MetadataDocument::from_text_with_interner(
@@ -3543,6 +3620,7 @@ mod tests {
         assert!(source_candidates.bucket_hits > source_candidates.verified);
         assert_eq!(source_candidates.verified, 1);
         assert_eq!(source_candidates.indices, vec![0]);
+        assert!(!source_candidates.full_scan);
     }
 
     #[test]
@@ -3585,6 +3663,7 @@ mod tests {
         assert_eq!(source_candidates.bucket_hits, text_index.metadata.len());
         assert_eq!(source_candidates.verified, text_index.metadata.len());
         assert_eq!(source_candidates.indices.len(), text_index.metadata.len());
+        assert!(source_candidates.full_scan);
     }
 
     #[test]
