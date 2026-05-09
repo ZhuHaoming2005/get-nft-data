@@ -69,6 +69,10 @@ const METADATA_BM25_B: f64 = 0.75;
 const MAX_METADATA_BYTES_FOR_DEDUP: usize = 64 * 1024;
 const MAX_OVERLAPPING_METADATA_ROWS_PER_CONTRACT: usize = 1;
 const SAMPLE_PROGRESS_STAGE_COUNT: usize = 10;
+const METADATA_SKETCH_ANCHOR_COUNT: usize = 8;
+const METADATA_SKETCH_SOURCE_HAMMING_THRESHOLD: u32 = 24;
+const METADATA_SKETCH_HIGH_FREQ_MIN_DOCS: usize = 32;
+const METADATA_SKETCH_HIGH_FREQ_DIVISOR: usize = 5;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SampleCollectionConfig {
@@ -164,6 +168,7 @@ struct NameCandidate {
 struct MetadataCandidate {
     contract_address: String,
     doc: MetadataDocument,
+    sketch: MetadataSketch,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -173,7 +178,6 @@ struct TextIndex {
     metadata: Vec<MetadataCandidate>,
     metadata_token_ids: HashMap<String, TokenId>,
     metadata_corpus: MetadataCorpus,
-    metadata_indices_by_token: HashMap<TokenId, Vec<usize>>,
     metadata_indices_by_contract: HashMap<String, Vec<usize>>,
 }
 
@@ -193,6 +197,12 @@ struct NameCandidateBuilder {
 struct SampleScratch {
     metadata_seen_epochs: Vec<u32>,
     metadata_epoch: u32,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MetadataSketch {
+    simhash: u64,
+    anchors: Vec<TokenId>,
 }
 
 #[derive(Clone, Copy)]
@@ -456,10 +466,10 @@ fn load_text_index(conn: &Connection, chain: &str) -> Result<TextIndex, duckdb::
     let names = load_name_index(conn, chain)?;
     let name_indices_by_normalized = build_name_indices_by_normalized(&names);
     let mut metadata_token_interner = TokenInterner::default();
-    let metadata = load_metadata_index(conn, chain, &mut metadata_token_interner)?;
+    let mut metadata = load_metadata_index(conn, chain, &mut metadata_token_interner)?;
     let metadata_token_ids = metadata_token_interner.into_ids();
     let metadata_corpus = MetadataCorpus::from_documents(metadata.iter().map(|item| &item.doc));
-    let metadata_indices_by_token = build_metadata_indices_by_token(&metadata);
+    populate_metadata_sketches(&mut metadata, &metadata_corpus);
     let metadata_indices_by_contract = build_metadata_indices_by_contract(&metadata);
     Ok(TextIndex {
         names,
@@ -467,7 +477,6 @@ fn load_text_index(conn: &Connection, chain: &str) -> Result<TextIndex, duckdb::
         metadata,
         metadata_token_ids,
         metadata_corpus,
-        metadata_indices_by_token,
         metadata_indices_by_contract,
     })
 }
@@ -604,19 +613,10 @@ fn load_metadata_index(
         candidates.push(MetadataCandidate {
             contract_address,
             doc,
+            sketch: MetadataSketch::default(),
         });
     }
     Ok(candidates)
-}
-
-fn build_metadata_indices_by_token(metadata: &[MetadataCandidate]) -> HashMap<TokenId, Vec<usize>> {
-    let mut index = HashMap::<TokenId, Vec<usize>>::new();
-    for (doc_index, candidate) in metadata.iter().enumerate() {
-        for token in &candidate.doc.unique_tokens {
-            index.entry(*token).or_default().push(doc_index);
-        }
-    }
-    index
 }
 
 fn build_metadata_indices_by_contract(
@@ -630,6 +630,97 @@ fn build_metadata_indices_by_contract(
             .push(doc_index);
     }
     index
+}
+
+fn populate_metadata_sketches(metadata: &mut [MetadataCandidate], corpus: &MetadataCorpus) {
+    for candidate in metadata {
+        candidate.sketch =
+            metadata_sketch_from_document(&candidate.doc, corpus.total_docs, |token| {
+                corpus.doc_freqs.get(&token).copied().unwrap_or(0)
+            });
+    }
+}
+
+fn metadata_sketch_from_document(
+    document: &MetadataDocument,
+    total_docs: usize,
+    mut document_frequency: impl FnMut(TokenId) -> usize,
+) -> MetadataSketch {
+    let simhash = metadata_weighted_simhash(document, total_docs, &mut document_frequency);
+    let mut anchors = Vec::new();
+    for token in &document.unique_tokens {
+        let df = document_frequency(*token);
+        if metadata_token_is_high_frequency(total_docs, df) {
+            continue;
+        }
+        anchors.push((*token, metadata_token_idf(total_docs, df)));
+    }
+    anchors.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    let mut anchors = anchors
+        .into_iter()
+        .take(METADATA_SKETCH_ANCHOR_COUNT)
+        .map(|(token, _)| token)
+        .collect::<Vec<_>>();
+    anchors.sort_unstable();
+    MetadataSketch { simhash, anchors }
+}
+
+fn metadata_weighted_simhash(
+    document: &MetadataDocument,
+    total_docs: usize,
+    document_frequency: &mut impl FnMut(TokenId) -> usize,
+) -> u64 {
+    let mut weights = [0.0f64; 64];
+    for token in &document.unique_tokens {
+        let token_hash = stable_token_hash(*token);
+        let idf = metadata_token_idf(total_docs, document_frequency(*token));
+        for bit in 0..64 {
+            if ((token_hash >> bit) & 1) == 1 {
+                weights[bit] += idf;
+            } else {
+                weights[bit] -= idf;
+            }
+        }
+    }
+    let mut simhash = 0u64;
+    for (bit, weight) in weights.into_iter().enumerate() {
+        if weight >= 0.0 {
+            simhash |= 1u64 << bit;
+        }
+    }
+    simhash
+}
+
+fn stable_token_hash(token: TokenId) -> u64 {
+    let mut value = token as u64 + 0x9E37_79B9_7F4A_7C15;
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
+fn metadata_token_idf(total_docs: usize, doc_freq: usize) -> f64 {
+    (((total_docs + 1) as f64) / ((doc_freq + 1) as f64)).ln() + 1.0
+}
+
+fn metadata_token_is_high_frequency(total_docs: usize, doc_freq: usize) -> bool {
+    doc_freq >= METADATA_SKETCH_HIGH_FREQ_MIN_DOCS
+        && doc_freq.saturating_mul(METADATA_SKETCH_HIGH_FREQ_DIVISOR) > total_docs
+}
+
+impl MetadataSketch {
+    fn is_empty(&self) -> bool {
+        self.simhash == 0 && self.anchors.is_empty()
+    }
+
+    fn has_anchors(&self) -> bool {
+        !self.anchors.is_empty()
+    }
 }
 
 fn first_seed_name(rows: &[NftTextRow]) -> String {
@@ -764,7 +855,6 @@ fn match_metadata(
         emit_empty_metadata_scoring_progress(progress, position);
         return Ok(Vec::new());
     };
-    let seed_unique_tokens = seed_doc.unique_tokens.clone();
     let seed_contract = seed_contract.to_lowercase();
     let excluded_indices = text_index
         .metadata_indices_by_contract
@@ -781,23 +871,16 @@ fn match_metadata(
         return Ok(Vec::new());
     }
 
-    let epoch = scratch.next_metadata_epoch();
-    let mut candidate_indices = Vec::new();
-    for token in &seed_unique_tokens {
-        let Some(indices) = text_index.metadata_indices_by_token.get(token) else {
-            continue;
-        };
-        for index in indices {
-            if text_index.metadata[*index].contract_address == seed_contract {
-                continue;
-            }
-            if scratch.metadata_seen_epochs[*index] == epoch {
-                continue;
-            }
-            scratch.metadata_seen_epochs[*index] = epoch;
-            candidate_indices.push(*index);
-        }
-    }
+    let seed_sketch = metadata_sketch_from_document(&seed_doc, corpus.total_docs, |token| {
+        corpus.document_frequency(token)
+    });
+    let candidate_indices = collect_metadata_source_indices(
+        &seed_sketch,
+        text_index,
+        scratch,
+        &seed_contract,
+        METADATA_SKETCH_SOURCE_HAMMING_THRESHOLD,
+    );
     emit_progress(
         progress,
         position.index,
@@ -854,6 +937,67 @@ fn match_metadata(
         Some(matches.len()),
     );
     Ok(matches)
+}
+
+fn collect_metadata_source_indices(
+    seed_sketch: &MetadataSketch,
+    text_index: &TextIndex,
+    scratch: &mut SampleScratch,
+    seed_contract: &str,
+    hamming_threshold: u32,
+) -> Vec<usize> {
+    let epoch = scratch.next_metadata_epoch();
+    let mut source_indices = text_index
+        .metadata
+        .par_iter()
+        .enumerate()
+        .filter_map(|(index, candidate)| {
+            if candidate.contract_address == seed_contract {
+                return None;
+            }
+            metadata_sketch_source_match(seed_sketch, &candidate.sketch, hamming_threshold)
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    source_indices.sort_unstable();
+    source_indices.dedup();
+
+    let mut unique_source_indices = Vec::with_capacity(source_indices.len());
+    for index in source_indices {
+        if scratch.metadata_seen_epochs[index] == epoch {
+            continue;
+        }
+        scratch.metadata_seen_epochs[index] = epoch;
+        unique_source_indices.push(index);
+    }
+    unique_source_indices
+}
+
+fn metadata_sketch_source_match(
+    seed: &MetadataSketch,
+    candidate: &MetadataSketch,
+    hamming_threshold: u32,
+) -> bool {
+    if seed.is_empty() || candidate.is_empty() {
+        return false;
+    }
+    if seed.has_anchors() && sorted_tokens_intersect(&seed.anchors, &candidate.anchors) {
+        return true;
+    }
+    (seed.simhash ^ candidate.simhash).count_ones() <= hamming_threshold
+}
+
+fn sorted_tokens_intersect(left: &[TokenId], right: &[TokenId]) -> bool {
+    let mut left_index = 0;
+    let mut right_index = 0;
+    while left_index < left.len() && right_index < right.len() {
+        match left[left_index].cmp(&right[right_index]) {
+            std::cmp::Ordering::Equal => return true,
+            std::cmp::Ordering::Less => left_index += 1,
+            std::cmp::Ordering::Greater => right_index += 1,
+        }
+    }
+    false
 }
 
 fn emit_empty_metadata_scoring_progress(
@@ -2692,6 +2836,104 @@ mod tests {
         let direct_score = score_metadata_pair(&query, &doc, &corpus);
 
         assert!((prepared_score - direct_score).abs() < 1e-9);
+    }
+
+    #[test]
+    fn metadata_sketch_source_scan_ignores_shared_high_frequency_structure_tokens() {
+        let mut token_interner = TokenInterner::default();
+        let seed_doc = MetadataDocument::from_text_with_interner(
+            "name image attributes description rarealpha",
+            &mut token_interner,
+        )
+        .unwrap();
+        let mut metadata = vec![MetadataCandidate {
+            contract_address: "0xhit".into(),
+            doc: MetadataDocument::from_text_with_interner(
+                "name image attributes description rarealpha",
+                &mut token_interner,
+            )
+            .unwrap(),
+            sketch: MetadataSketch::default(),
+        }];
+        for index in 0..96 {
+            metadata.push(MetadataCandidate {
+                contract_address: format!("0xnoise{index}"),
+                doc: MetadataDocument::from_text_with_interner(
+                    &format!("name image attributes description noise{index}"),
+                    &mut token_interner,
+                )
+                .unwrap(),
+                sketch: MetadataSketch::default(),
+            });
+        }
+        let metadata_corpus =
+            MetadataCorpus::from_documents(metadata.iter().map(|candidate| &candidate.doc));
+        populate_metadata_sketches(&mut metadata, &metadata_corpus);
+        let metadata_indices_by_contract = build_metadata_indices_by_contract(&metadata);
+        let text_index = TextIndex {
+            metadata,
+            metadata_token_ids: token_interner.into_ids(),
+            metadata_corpus,
+            metadata_indices_by_contract,
+            ..TextIndex::default()
+        };
+        let corpus = MetadataCorpusView::from_corpus(&text_index.metadata_corpus);
+        let seed_sketch = metadata_sketch_from_document(&seed_doc, corpus.total_docs, |token| {
+            corpus.document_frequency(token)
+        });
+        let mut scratch = SampleScratch::new(text_index.metadata.len());
+
+        let source_indices = collect_metadata_source_indices(
+            &seed_sketch,
+            &text_index,
+            &mut scratch,
+            "0xseed",
+            METADATA_SKETCH_SOURCE_HAMMING_THRESHOLD,
+        );
+        let source_contracts = source_indices
+            .iter()
+            .map(|index| text_index.metadata[*index].contract_address.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(source_contracts.contains(&"0xhit"));
+        assert!(
+            source_contracts.len() < 20,
+            "high-frequency structure tokens should not route every representative metadata"
+        );
+    }
+
+    #[test]
+    fn metadata_sketch_source_scan_includes_fallback_distance_sources_initially() {
+        let mut token_interner = TokenInterner::default();
+        let doc =
+            MetadataDocument::from_text_with_interner("description rarealpha", &mut token_interner)
+                .unwrap();
+        let text_index = TextIndex {
+            metadata: vec![MetadataCandidate {
+                contract_address: "0xfallback".into(),
+                doc,
+                sketch: MetadataSketch {
+                    simhash: (1u64 << 20) - 1,
+                    anchors: vec![2],
+                },
+            }],
+            ..TextIndex::default()
+        };
+        let seed_sketch = MetadataSketch {
+            simhash: 0,
+            anchors: vec![1],
+        };
+        let mut scratch = SampleScratch::new(text_index.metadata.len());
+
+        let source_indices = collect_metadata_source_indices(
+            &seed_sketch,
+            &text_index,
+            &mut scratch,
+            "0xseed",
+            METADATA_SKETCH_SOURCE_HAMMING_THRESHOLD,
+        );
+
+        assert_eq!(source_indices, vec![0]);
     }
 
     #[test]
