@@ -161,11 +161,29 @@ pub trait AnalyzeApi: Send + Sync {
 
     async fn fetch_seed_collection_slug(
         &self,
+        chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        opensea_api_key: &str,
+        seed_contract_address: &str,
+    ) -> Result<Option<String>, AppError> {
+        self.fetch_contract_collection_slug(
+            chain,
+            alchemy_api_key,
+            alchemy_network,
+            opensea_api_key,
+            seed_contract_address,
+        )
+        .await
+    }
+
+    async fn fetch_contract_collection_slug(
+        &self,
         _chain: &str,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
         _opensea_api_key: &str,
-        _seed_contract_address: &str,
+        _contract_address: &str,
     ) -> Result<Option<String>, AppError> {
         Ok(None)
     }
@@ -654,6 +672,24 @@ impl AnalyzeApi for RealApi {
         opensea_api_key: &str,
         seed_contract_address: &str,
     ) -> Result<Option<String>, AppError> {
+        self.fetch_contract_collection_slug(
+            chain,
+            alchemy_api_key,
+            alchemy_network,
+            opensea_api_key,
+            seed_contract_address,
+        )
+        .await
+    }
+
+    async fn fetch_contract_collection_slug(
+        &self,
+        chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        opensea_api_key: &str,
+        contract_address: &str,
+    ) -> Result<Option<String>, AppError> {
         if opensea_api_key.trim().is_empty() {
             return Ok(None);
         }
@@ -662,7 +698,7 @@ impl AnalyzeApi for RealApi {
             &self.client,
             &endpoints.opensea_base,
             chain,
-            seed_contract_address,
+            contract_address,
             opensea_api_key,
         )
         .await
@@ -2608,6 +2644,11 @@ pub fn group_candidates_by_contract(
     grouped
 }
 
+enum CandidateSeedRelationCheck {
+    Exclude(&'static str),
+    Holder(Result<Option<bool>, AppError>),
+}
+
 async fn filter_seed_related_candidate_contracts(
     request: &AnalyzeRequest,
     deps: &AnalysisDeps,
@@ -2661,9 +2702,14 @@ async fn filter_seed_related_candidate_contracts(
             }
         }
     };
+    let normalized_seed_collection_slug = seed_collection_slug
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
 
     let mut holder_checks = stream::iter(candidate_contracts.values().cloned().map(|contract_address| {
         let seed_collection_slug = seed_collection_slug.clone();
+        let normalized_seed_collection_slug = normalized_seed_collection_slug.clone();
         async move {
             let _permit = match acquire_optional_limit(&runtime_limits.contract_limit).await {
                 Ok(permit) => permit,
@@ -2671,9 +2717,39 @@ async fn filter_seed_related_candidate_contracts(
                     eprintln!(
                         "warning: contract concurrency limit failed for {contract_address}: {err}; continuing without holder-based candidate exclusion"
                     );
-                    return (contract_address, Ok(None));
+                    return (contract_address, CandidateSeedRelationCheck::Holder(Ok(None)));
                 }
             };
+            if let Some(seed_collection_slug) = normalized_seed_collection_slug.as_deref() {
+                match deps
+                    .api
+                    .fetch_contract_collection_slug(
+                        &request.chain,
+                        &request.alchemy_api_key,
+                        request.alchemy_network.as_deref(),
+                        &request.opensea_api_key,
+                        &contract_address,
+                    )
+                    .await
+                {
+                    Ok(Some(candidate_collection_slug))
+                        if candidate_collection_slug
+                            .trim()
+                            .eq_ignore_ascii_case(seed_collection_slug) =>
+                    {
+                        return (
+                            contract_address,
+                            CandidateSeedRelationCheck::Exclude("OpenSea collection 与 seed 合约一致"),
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        eprintln!(
+                            "warning: OpenSea candidate collection lookup failed for {contract_address}: {err}; continuing without collection-based candidate exclusion"
+                        );
+                    }
+                }
+            }
             let holds_seed_nft = deps
                 .api
                 .candidate_currently_holds_seed_nft(
@@ -2686,23 +2762,32 @@ async fn filter_seed_related_candidate_contracts(
                     seed_collection_slug.as_deref(),
                 )
                 .await;
-            (contract_address, holds_seed_nft)
+            (
+                contract_address,
+                CandidateSeedRelationCheck::Holder(holds_seed_nft),
+            )
         }
     }))
     .buffer_unordered(concurrency.max(1));
 
-    while let Some((contract_address, holds_seed_nft)) = holder_checks.next().await {
+    while let Some((contract_address, check)) = holder_checks.next().await {
         let contract_key = contract_address.to_lowercase();
-        match holds_seed_nft {
-            Ok(Some(true)) => {
+        match check {
+            CandidateSeedRelationCheck::Exclude(reason) => {
+                exclusion_reasons_by_contract
+                    .entry(contract_key)
+                    .or_default()
+                    .insert(reason.to_string());
+            }
+            CandidateSeedRelationCheck::Holder(Ok(Some(true))) => {
                 exclusion_reasons_by_contract
                     .entry(contract_key)
                     .or_default()
                     .insert("当前持有 seed 合约 NFT".to_string());
             }
-            Ok(Some(false)) => {}
-            Ok(None) => {}
-            Err(err) => {
+            CandidateSeedRelationCheck::Holder(Ok(Some(false))) => {}
+            CandidateSeedRelationCheck::Holder(Ok(None)) => {}
+            CandidateSeedRelationCheck::Holder(Err(err)) => {
                 eprintln!(
                     "warning: current seed NFT holder check failed for {contract_address}: {err}; continuing without holder-based candidate exclusion"
                 );

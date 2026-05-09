@@ -1602,6 +1602,8 @@ impl AnalyzeApi for FakeLegitApi {
 struct CountingApi {
     transfer_fetch_count: AtomicUsize,
     owner_fetch_count: AtomicUsize,
+    seed_collection_slug: Option<String>,
+    candidate_collection_slug: Option<String>,
 }
 
 impl CountingApi {
@@ -1609,6 +1611,16 @@ impl CountingApi {
         Self {
             transfer_fetch_count: AtomicUsize::new(0),
             owner_fetch_count: AtomicUsize::new(0),
+            seed_collection_slug: None,
+            candidate_collection_slug: None,
+        }
+    }
+
+    fn with_seed_collection_slug(seed_collection_slug: &str) -> Self {
+        Self {
+            seed_collection_slug: Some(seed_collection_slug.to_string()),
+            candidate_collection_slug: Some(seed_collection_slug.to_string()),
+            ..Self::new()
         }
     }
 }
@@ -1735,6 +1747,32 @@ impl AnalyzeApi for CountingApi {
         _seed_collection_slug: Option<&str>,
     ) -> Result<Option<bool>, AppError> {
         Ok(Some(false))
+    }
+
+    async fn fetch_seed_collection_slug(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _opensea_api_key: &str,
+        _seed_contract_address: &str,
+    ) -> Result<Option<String>, AppError> {
+        Ok(self.seed_collection_slug.clone())
+    }
+
+    async fn fetch_contract_collection_slug(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _opensea_api_key: &str,
+        contract_address: &str,
+    ) -> Result<Option<String>, AppError> {
+        if contract_address.eq_ignore_ascii_case("0xseed") {
+            Ok(self.seed_collection_slug.clone())
+        } else {
+            Ok(self.candidate_collection_slug.clone())
+        }
     }
 
     async fn fetch_contract_sales(
@@ -3621,6 +3659,57 @@ async fn analyze_moves_official_reissues_into_legit_duplicates() {
         0,
         "official reissues should not fetch sale history"
     );
+}
+
+#[tokio::test]
+async fn analyze_moves_same_opensea_collection_candidates_into_legit_duplicates() {
+    let api = Arc::new(CountingApi::with_seed_collection_slug("art-blocks"));
+    let deps = AnalysisDeps {
+        api,
+        feature_store: Arc::new(FakeFeatureStore {
+            snapshot: DatabaseSnapshot {
+                nft_rows: vec![DatabaseNftRecord {
+                    contract_address: "0xdup".into(),
+                    token_id: "1".into(),
+                    token_uri: "ipfs://seed/1".into(),
+                    image_uri: "ipfs://image/1.png".into(),
+                    name: "Azuki Mirror #1".into(),
+                    symbol: "AZUKI".into(),
+                    metadata_json: r#"{"description":"gold dragon"}"#.into(),
+                    metadata_doc: "gold dragon".into(),
+                    metadata_recall_checked: false,
+                    metadata_recall_match: false,
+                }],
+                ..DatabaseSnapshot::default()
+            },
+        }),
+        signal_cache: None,
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    let payload = analyze_seed_contract(
+        AnalyzeRequest {
+            chain: "ethereum".into(),
+            seed_contract_address: "0xseed".into(),
+            alchemy_api_key: "key".into(),
+            opensea_api_key: "opensea".into(),
+            ..AnalyzeRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
+    assert!(payload.duplicate_candidates.is_empty());
+    assert!(payload.duplicate_contracts.is_empty());
+    assert_eq!(payload.legit_duplicates.len(), 1);
+    assert_eq!(payload.legit_duplicates[0].contract_address, "0xdup");
+    assert_eq!(
+        payload.legit_duplicates[0].exclusion_reasons,
+        vec!["OpenSea collection 与 seed 合约一致"]
+    );
+    assert_eq!(payload.report_summary.legit_duplicate_contract_count, 1);
 }
 
 #[tokio::test]
