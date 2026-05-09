@@ -35,7 +35,7 @@ fn feature_store_builds_contract_duplicate_rows_from_normalized_recall_columns()
                     token_uri: "https://gateway.example/ipfs/seed/meta-1?cache=1".into(),
                     image_uri: "ipfs://dup/image-2.png".into(),
                     name: "Azuki Mirror #2".into(),
-                    metadata_doc: "silver cat".into(),
+                    metadata_json: r#"{"description":"silver cat"}"#.into(),
                     ..Default::default()
                 },
                 DatabaseNftRecord {
@@ -44,7 +44,7 @@ fn feature_store_builds_contract_duplicate_rows_from_normalized_recall_columns()
                     token_uri: "ipfs://other/meta-1".into(),
                     image_uri: "https://cdn.example/ipfs/seed/image-1.png".into(),
                     name: "Azuki Mirror #1".into(),
-                    metadata_doc: "gold dragon".into(),
+                    metadata_json: r#"{"description":"gold dragon"}"#.into(),
                     ..Default::default()
                 },
             ],
@@ -58,7 +58,7 @@ fn feature_store_builds_contract_duplicate_rows_from_normalized_recall_columns()
         token_uri: "ipfs://seed/meta-1".into(),
         image_uri: "ipfs://seed/image-1.png".into(),
         name: "Azuki #1".into(),
-        metadata_doc: "gold dragon".into(),
+        metadata_json: r#"{"description":"gold dragon"}"#.into(),
         ..Default::default()
     }];
 
@@ -95,13 +95,13 @@ fn feature_store_keeps_one_overlapping_metadata_row_for_final_duplicate_recheck(
                 DatabaseNftRecord {
                     contract_address: "0xdup".into(),
                     token_id: "1".into(),
-                    metadata_doc: "alpha beta".into(),
+                    metadata_json: r#"{"description":"alpha beta"}"#.into(),
                     ..Default::default()
                 },
                 DatabaseNftRecord {
                     contract_address: "0xdup".into(),
                     token_id: "2".into(),
-                    metadata_doc: "silver cat".into(),
+                    metadata_json: r#"{"description":"silver cat"}"#.into(),
                     ..Default::default()
                 },
             ],
@@ -113,14 +113,14 @@ fn feature_store_keeps_one_overlapping_metadata_row_for_final_duplicate_recheck(
             chain: "ethereum".into(),
             contract_address: "0xseed".into(),
             token_id: "1".into(),
-            metadata_doc: "alpha beta".into(),
+            metadata_json: r#"{"description":"alpha beta"}"#.into(),
             ..Default::default()
         },
         SeedNft {
             chain: "ethereum".into(),
             contract_address: "0xseed".into(),
             token_id: "2".into(),
-            metadata_doc: "gold dragon".into(),
+            metadata_json: r#"{"description":"gold dragon"}"#.into(),
             ..Default::default()
         },
     ];
@@ -190,13 +190,13 @@ fn feature_store_limits_overlapping_metadata_rows_per_candidate_contract() {
                 DatabaseNftRecord {
                     contract_address: "0xdup".into(),
                     token_id: "1".into(),
-                    metadata_doc: "alpha beta".into(),
+                    metadata_json: r#"{"description":"alpha beta"}"#.into(),
                     ..Default::default()
                 },
                 DatabaseNftRecord {
                     contract_address: "0xdup".into(),
                     token_id: "2".into(),
-                    metadata_doc: "gold dragon".into(),
+                    metadata_json: r#"{"description":"gold dragon"}"#.into(),
                     ..Default::default()
                 },
             ],
@@ -209,14 +209,14 @@ fn feature_store_limits_overlapping_metadata_rows_per_candidate_contract() {
             contract_address: "0xseed".into(),
             token_id: "1".into(),
             token_uri: "ipfs://shared-recall".into(),
-            metadata_doc: "alpha beta".into(),
+            metadata_json: r#"{"description":"alpha beta"}"#.into(),
             ..Default::default()
         },
         SeedNft {
             chain: "ethereum".into(),
             contract_address: "0xseed".into(),
             token_id: "2".into(),
-            metadata_doc: "gold dragon".into(),
+            metadata_json: r#"{"description":"gold dragon"}"#.into(),
             ..Default::default()
         },
     ];
@@ -576,7 +576,7 @@ fn feature_store_applies_per_contract_token_cap() {
 }
 
 #[test]
-fn feature_store_reuses_precomputed_metadata_keywords_for_recall_verification() {
+fn feature_store_rejects_precomputed_metadata_keywords_without_valid_json() {
     let dir = tempdir().unwrap();
     let parquet_path = dir.path().join("snapshot.parquet");
     write_parquet(
@@ -611,7 +611,7 @@ fn feature_store_reuses_precomputed_metadata_keywords_for_recall_verification() 
                 chain: "ethereum".into(),
                 contract_address: "0xseed".into(),
                 token_id: "1".into(),
-                metadata_doc: "cat".into(),
+                metadata_json: r#"{"description":"cat"}"#.into(),
                 ..Default::default()
             }],
             0,
@@ -619,9 +619,7 @@ fn feature_store_reuses_precomputed_metadata_keywords_for_recall_verification() 
         )
         .unwrap();
 
-    assert_eq!(snapshot.nft_rows.len(), 1);
-    assert_eq!(snapshot.nft_rows[0].contract_address, "0xkeyword");
-    assert!(snapshot.contract_signals["0xkeyword"].keyword_match);
+    assert!(snapshot.nft_rows.is_empty());
 }
 
 #[test]
@@ -634,13 +632,12 @@ fn feature_store_recalls_short_metadata_terms() {
                 DatabaseNftRecord {
                     contract_address: "0xshort".into(),
                     token_id: "1".into(),
-                    metadata_doc: "ai cat".into(),
+                    metadata_json: r#"{"description":"ai cat"}"#.into(),
                     ..Default::default()
                 },
                 DatabaseNftRecord {
                     contract_address: "0xmiss".into(),
                     token_id: "1".into(),
-                    metadata_doc: "dog".into(),
                     ..Default::default()
                 },
             ],
@@ -654,7 +651,7 @@ fn feature_store_recalls_short_metadata_terms() {
                 chain: "ethereum".into(),
                 contract_address: "0xseed".into(),
                 token_id: "1".into(),
-                metadata_doc: "ai cat".into(),
+                metadata_json: r#"{"description":"ai cat"}"#.into(),
                 ..Default::default()
             }],
             0,
@@ -681,19 +678,18 @@ fn feature_store_uses_max_recall_rows_as_batch_size_after_sql_recall() {
                 DatabaseNftRecord {
                     contract_address: "0xone".into(),
                     token_id: "1".into(),
-                    metadata_doc: "gold dragon".into(),
+                    metadata_json: r#"{"description":"gold dragon"}"#.into(),
                     ..Default::default()
                 },
                 DatabaseNftRecord {
                     contract_address: "0xtwo".into(),
                     token_id: "1".into(),
-                    metadata_doc: "gold dragon".into(),
+                    metadata_json: r#"{"description":"gold dragon"}"#.into(),
                     ..Default::default()
                 },
                 DatabaseNftRecord {
                     contract_address: "0xthree".into(),
                     token_id: "1".into(),
-                    metadata_doc: "silver cat".into(),
                     ..Default::default()
                 },
             ],
@@ -707,7 +703,7 @@ fn feature_store_uses_max_recall_rows_as_batch_size_after_sql_recall() {
                 chain: "ethereum".into(),
                 contract_address: "0xseed".into(),
                 token_id: "1".into(),
-                metadata_doc: "gold dragon".into(),
+                metadata_json: r#"{"description":"gold dragon"}"#.into(),
                 ..Default::default()
             }],
             0,

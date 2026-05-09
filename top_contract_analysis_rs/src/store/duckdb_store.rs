@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use crate::analysis::scoring::{
-    metadata_document_from_json, metadata_recall_document, metadata_recall_keywords,
+    metadata_document_from_json, metadata_is_dedup_eligible, metadata_recall_document,
+    metadata_recall_keywords, MAX_METADATA_BYTES_FOR_DEDUP,
 };
 use crate::error::AppError;
 use crate::models::{
@@ -93,14 +94,13 @@ mod tests {
                     DatabaseNftRecord {
                         contract_address: "0xmetadata".into(),
                         token_id: "1".into(),
-                        metadata_doc: "gold dragon".into(),
+                        metadata_json: r#"{"description":"gold dragon"}"#.into(),
                         ..Default::default()
                     },
                     DatabaseNftRecord {
                         contract_address: "0ximage".into(),
                         token_id: "1".into(),
                         image_uri: "ipfs://seed-image.png".into(),
-                        metadata_doc: "silver cat".into(),
                         ..Default::default()
                     },
                 ],
@@ -110,7 +110,7 @@ mod tests {
             contract_address: "0xseed".into(),
             token_id: "1".into(),
             image_uri: "ipfs://seed-image.png".into(),
-            metadata_doc: "gold dragon".into(),
+            metadata_json: r#"{"description":"gold dragon"}"#.into(),
             ..Default::default()
         }];
 
@@ -285,11 +285,10 @@ fn update_duplicate_contract_row(
 }
 
 fn push_metadata_token_row(entry: &mut ContractDuplicateRecord, record: &DatabaseNftRecord) {
-    let metadata_doc = if record.metadata_doc.is_empty() {
-        metadata_document_from_json(&record.metadata_json)
-    } else {
-        record.metadata_doc.clone()
-    };
+    if !metadata_is_dedup_eligible(&record.metadata_doc, &record.metadata_json) {
+        return;
+    }
+    let metadata_doc = metadata_document_from_json(&record.metadata_json);
     if metadata_doc.is_empty() {
         return;
     }
@@ -456,10 +455,11 @@ impl DuckDbFeatureStore {
         )?;
 
         for row in rows {
-            let metadata_doc = if row.metadata_doc.trim().is_empty() {
+            let metadata_doc = if metadata_is_dedup_eligible(&row.metadata_doc, &row.metadata_json)
+            {
                 metadata_document_from_json(&row.metadata_json)
             } else {
-                row.metadata_doc.clone()
+                String::new()
             };
             let metadata_recall_doc = metadata_recall_document(&metadata_doc, &row.metadata_json);
             let metadata_keywords_arr =
@@ -612,6 +612,14 @@ impl DuckDbFeatureStore {
         }
     }
 
+    fn sql_metadata_json_eligible_predicate() -> String {
+        format!(
+            "length(trim(coalesce(CAST(metadata_json AS VARCHAR), ''))) <= {MAX_METADATA_BYTES_FOR_DEDUP} \
+             AND (trim(coalesce(CAST(metadata_json AS VARCHAR), '')) LIKE '{{%' \
+             OR trim(coalesce(CAST(metadata_json AS VARCHAR), '')) LIKE '[%')"
+        )
+    }
+
     fn append_overlapping_metadata_token_rows(
         conn: &Connection,
         chain: &str,
@@ -666,8 +674,11 @@ impl DuckDbFeatureStore {
                     WHERE chain = ?
                       AND lower(contract_address) IN ({contract_values})
                       AND CAST(token_id AS VARCHAR) IN ({token_values})
-                      AND (trim(coalesce(CAST(metadata_doc AS VARCHAR), '')) <> ''
-                           OR trim(coalesce(CAST(metadata_json AS VARCHAR), '')) <> '')
+                      AND length(trim(coalesce(CAST(metadata_json AS VARCHAR), ''))) <= {MAX_METADATA_BYTES_FOR_DEDUP}
+                      AND (
+                          trim(coalesce(CAST(metadata_json AS VARCHAR), '')) LIKE '{{%'
+                          OR trim(coalesce(CAST(metadata_json AS VARCHAR), '')) LIKE '[%'
+                      )
                 )
                 WHERE overlap_rank <= {MAX_OVERLAPPING_METADATA_ROWS_PER_CONTRACT}
                 ORDER BY contract_key, token_id
@@ -749,7 +760,12 @@ impl DuckDbFeatureStore {
             predicates.push(format!("({predicate})"));
         }
         let metadata_recall_predicate =
-            Self::sql_metadata_keyword_predicate(&metadata_recall_terms);
+            Self::sql_metadata_keyword_predicate(&metadata_recall_terms).map(|predicate| {
+                format!(
+                    "({}) AND ({predicate})",
+                    Self::sql_metadata_json_eligible_predicate()
+                )
+            });
         if let Some(predicate) = metadata_recall_predicate.as_ref() {
             predicates.push(predicate.clone());
         }

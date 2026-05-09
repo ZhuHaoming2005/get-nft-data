@@ -9,6 +9,7 @@ use thiserror::Error;
 use crate::normalize::{normalize_name, normalize_text};
 
 static TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\p{L}\p{N}_]+").unwrap());
+pub const MAX_METADATA_BYTES_FOR_DEDUP: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ScoringError {
@@ -85,12 +86,18 @@ pub fn metadata_prefilter_document_from_json(raw: &str) -> String {
 }
 
 pub fn metadata_recall_document(metadata_doc: &str, metadata_json: &str) -> String {
-    let prefilter_doc = metadata_prefilter_document_from_json(metadata_json);
-    if prefilter_doc.is_empty() {
-        metadata_doc.to_string()
-    } else {
-        prefilter_doc
+    if !metadata_is_dedup_eligible(metadata_doc, metadata_json) {
+        return String::new();
     }
+    metadata_prefilter_document_from_json(metadata_json)
+}
+
+pub fn metadata_is_dedup_eligible(metadata_doc: &str, metadata_json: &str) -> bool {
+    let _ = metadata_doc;
+    let metadata_json = metadata_json.trim();
+    !metadata_json.is_empty()
+        && metadata_json.len() <= MAX_METADATA_BYTES_FOR_DEDUP
+        && matches!(metadata_json.chars().next(), Some('{') | Some('['))
 }
 
 pub fn metadata_recall_keywords(document: &str, limit: usize) -> Vec<String> {
@@ -310,6 +317,18 @@ mod tests {
     }
 
     #[test]
+    fn prepared_single_document_query_reuses_terms_without_changing_score() {
+        let query = MetadataBm25Document::from_text("gold dragon gold").unwrap();
+        let doc = MetadataBm25Document::from_text("rare gold dragon").unwrap();
+
+        let prepared_query = MetadataBm25SingleDocumentQuery::new(query.clone());
+        let prepared_score = prepared_query.score(&doc);
+        let pair_score = score_metadata_single_document_pair(&query, &doc);
+
+        assert!((prepared_score - pair_score).abs() < 1e-9);
+    }
+
+    #[test]
     fn metadata_bm25_uses_common_okapi_defaults() {
         assert_eq!(METADATA_BM25_K1, 1.2);
         assert_eq!(METADATA_BM25_B, 0.75);
@@ -331,6 +350,25 @@ mod tests {
         assert!(!tokens.contains(&"red"));
         assert!(!tokens.contains(&"ipfs"));
     }
+
+    #[test]
+    fn metadata_recall_document_rejects_non_json_and_overlong_raw_metadata() {
+        assert_eq!(
+            metadata_recall_document("gold dragon", r#"{"description":"Gold Dragon"}"#),
+            "description gold dragon"
+        );
+        assert_eq!(
+            metadata_recall_document("gold dragon", "not json metadata"),
+            ""
+        );
+        assert_eq!(metadata_recall_document("gold dragon", ""), "");
+
+        let overlong_json = format!(
+            r#"{{"description":"{}"}}"#,
+            "x".repeat(MAX_METADATA_BYTES_FOR_DEDUP)
+        );
+        assert_eq!(metadata_recall_document("gold dragon", &overlong_json), "");
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -345,6 +383,12 @@ pub(crate) struct MetadataBm25Query<'a> {
     terms: Vec<(String, usize)>,
     denominator: f64,
     corpus: &'a MetadataBm25Corpus,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MetadataBm25SingleDocumentQuery {
+    document: MetadataBm25Document,
+    terms: Vec<(String, usize)>,
 }
 
 #[derive(Debug, Default)]
@@ -414,6 +458,25 @@ impl<'a> MetadataBm25Query<'a> {
             denominator,
             corpus,
         }
+    }
+}
+
+impl MetadataBm25SingleDocumentQuery {
+    pub(crate) fn new(document: MetadataBm25Document) -> Self {
+        let terms = query_terms_from_tokens(document.tokens());
+        Self { document, terms }
+    }
+
+    pub(crate) fn document(&self) -> &MetadataBm25Document {
+        &self.document
+    }
+
+    pub(crate) fn score(&self, right: &MetadataBm25Document) -> f64 {
+        let self_score =
+            bm25_score_terms_with_single_document_corpus(&self.terms, &self.document, right);
+        let denominator = if self_score > 0.0 { self_score } else { 1.0 };
+        (bm25_score_terms_with_single_document_corpus(&self.terms, right, right) / denominator)
+            .clamp(0.0, 1.0)
     }
 }
 
@@ -496,15 +559,12 @@ pub(crate) fn score_metadata_indexed_pair_with_query(
     (bm25_score_terms(&query.terms, right, query.corpus) / query.denominator).clamp(0.0, 1.0)
 }
 
+#[cfg(test)]
 pub(crate) fn score_metadata_single_document_pair(
     left: &MetadataBm25Document,
     right: &MetadataBm25Document,
 ) -> f64 {
-    let query_terms = query_terms_from_tokens(left.tokens());
-    let self_score = bm25_score_terms_with_single_document_corpus(&query_terms, left, right);
-    let denominator = if self_score > 0.0 { self_score } else { 1.0 };
-    (bm25_score_terms_with_single_document_corpus(&query_terms, right, right) / denominator)
-        .clamp(0.0, 1.0)
+    MetadataBm25SingleDocumentQuery::new(left.clone()).score(right)
 }
 
 pub fn score_metadata_indexed_pair_with_corpus(

@@ -66,7 +66,9 @@ static DERIVATIVE_SUFFIX_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
 
 const METADATA_BM25_K1: f64 = 1.2;
 const METADATA_BM25_B: f64 = 0.75;
+const MAX_METADATA_BYTES_FOR_DEDUP: usize = 64 * 1024;
 const MAX_OVERLAPPING_METADATA_ROWS_PER_CONTRACT: usize = 1;
+const SAMPLE_PROGRESS_STAGE_COUNT: usize = 10;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SampleCollectionConfig {
@@ -112,8 +114,12 @@ pub enum SampleProgressStage {
     ReadSeedRows,
     LoadNameCandidates,
     ScoreNameCandidates,
-    LoadMetadataCandidates,
-    ScoreMetadataCandidates,
+    PrepareMetadataQuery,
+    CollectMetadataCandidates,
+    ScoreMetadataPrefilter,
+    LoadOverlappingMetadata,
+    ScoreOverlappingMetadata,
+    BuildReport,
     FinishedSeed,
 }
 
@@ -322,15 +328,15 @@ fn process_seed_contract(
         Some(name_matches.len()),
     );
 
+    let seed_metadata = first_seed_metadata(&seed_rows);
     emit_progress(
         progress,
         position.index,
         position.total,
-        SampleProgressStage::LoadMetadataCandidates,
+        SampleProgressStage::PrepareMetadataQuery,
         4,
         Some(text_index.metadata.len()),
     );
-    let seed_metadata = first_seed_metadata(&seed_rows);
     let metadata_matches = match_metadata(
         conn,
         &config.chain,
@@ -340,14 +346,16 @@ fn process_seed_contract(
         seed_contract,
         config.metadata_threshold,
         config.max_recall_rows,
+        position,
+        progress,
     )?;
     emit_progress(
         progress,
         position.index,
         position.total,
-        SampleProgressStage::ScoreMetadataCandidates,
-        5,
-        Some(metadata_matches.len()),
+        SampleProgressStage::BuildReport,
+        9,
+        None,
     );
 
     let report = SeedSampleReport {
@@ -360,7 +368,7 @@ fn process_seed_contract(
         position.index,
         position.total,
         SampleProgressStage::FinishedSeed,
-        6,
+        10,
         Some(match_count),
     );
     Ok(report)
@@ -379,7 +387,7 @@ fn emit_progress(
         total_seeds,
         stage,
         stage_index,
-        stage_count: 6,
+        stage_count: SAMPLE_PROGRESS_STAGE_COUNT,
         candidate_count,
     });
 }
@@ -552,6 +560,11 @@ fn load_metadata_index(
                    coalesce(CAST(metadata_json AS VARCHAR), '') AS metadata_json
             FROM nft_features
             WHERE chain = ?
+              AND length(trim(coalesce(CAST(metadata_json AS VARCHAR), ''))) <= 65536
+              AND (
+                  trim(coalesce(CAST(metadata_json AS VARCHAR), '')) LIKE '{%'
+                  OR trim(coalesce(CAST(metadata_json AS VARCHAR), '')) LIKE '[%'
+              )
         ),
         ranked AS (
             SELECT contract_address, token_id, metadata_doc, metadata_json,
@@ -636,7 +649,15 @@ fn seed_name_norms(rows: &[NftTextRow]) -> Vec<String> {
 
 fn first_seed_metadata(rows: &[NftTextRow]) -> String {
     rows.iter()
-        .find_map(|row| non_empty_json(&row.metadata_json))
+        .find_map(|row| {
+            if metadata_is_dedup_eligible(&row.metadata_doc, &row.metadata_json)
+                && !row.metadata_json.trim().is_empty()
+            {
+                non_empty(&row.metadata_json)
+            } else {
+                None
+            }
+        })
         .or_else(|| {
             rows.iter().find_map(|row| {
                 non_empty(&record_metadata_text(&row.metadata_doc, &row.metadata_json))
@@ -729,16 +750,21 @@ fn match_metadata(
     seed_contract: &str,
     threshold: f64,
     limit: usize,
+    position: SeedPosition,
+    progress: &mut impl FnMut(SampleProgress),
 ) -> Result<Vec<String>, duckdb::Error> {
     let Some(scoring_seed_metadata) = seed_metadata_prefilter_text(seed_rows) else {
+        emit_empty_metadata_scoring_progress(progress, position);
         return Ok(Vec::new());
     };
     let Some(seed_doc) = MetadataDocument::from_text_with_vocab(
         &scoring_seed_metadata,
         &text_index.metadata_token_ids,
     ) else {
+        emit_empty_metadata_scoring_progress(progress, position);
         return Ok(Vec::new());
     };
+    let seed_unique_tokens = seed_doc.unique_tokens.clone();
     let seed_contract = seed_contract.to_lowercase();
     let excluded_indices = text_index
         .metadata_indices_by_contract
@@ -751,12 +777,13 @@ fn match_metadata(
         excluded_indices,
     );
     if corpus.total_docs == 0 {
+        emit_empty_metadata_scoring_progress(progress, position);
         return Ok(Vec::new());
     }
 
     let epoch = scratch.next_metadata_epoch();
     let mut candidate_indices = Vec::new();
-    for token in &seed_doc.unique_tokens {
+    for token in &seed_unique_tokens {
         let Some(indices) = text_index.metadata_indices_by_token.get(token) else {
             continue;
         };
@@ -771,12 +798,29 @@ fn match_metadata(
             candidate_indices.push(*index);
         }
     }
+    emit_progress(
+        progress,
+        position.index,
+        position.total,
+        SampleProgressStage::CollectMetadataCandidates,
+        5,
+        Some(candidate_indices.len()),
+    );
 
+    let seed_query = PreparedMetadataQuery::new(seed_doc, &corpus);
+    emit_progress(
+        progress,
+        position.index,
+        position.total,
+        SampleProgressStage::ScoreMetadataPrefilter,
+        6,
+        Some(candidate_indices.len()),
+    );
     let matched_indices = candidate_indices
         .par_iter()
         .filter_map(|index| {
             let candidate = &text_index.metadata[*index];
-            (score_metadata_pair(&seed_doc, &candidate.doc, &corpus) >= threshold).then_some(*index)
+            (seed_query.score(&candidate.doc) >= threshold).then_some(*index)
         })
         .collect::<Vec<_>>();
     let candidate_contracts = matched_indices
@@ -785,14 +829,52 @@ fn match_metadata(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    final_metadata_matches_for_overlapping_tokens(
+    emit_progress(
+        progress,
+        position.index,
+        position.total,
+        SampleProgressStage::LoadOverlappingMetadata,
+        7,
+        Some(candidate_contracts.len()),
+    );
+    let matches = final_metadata_matches_for_overlapping_tokens(
         conn,
         chain,
         seed_rows,
         &candidate_contracts,
         threshold,
         limit,
-    )
+    )?;
+    emit_progress(
+        progress,
+        position.index,
+        position.total,
+        SampleProgressStage::ScoreOverlappingMetadata,
+        8,
+        Some(matches.len()),
+    );
+    Ok(matches)
+}
+
+fn emit_empty_metadata_scoring_progress(
+    progress: &mut impl FnMut(SampleProgress),
+    position: SeedPosition,
+) {
+    for (stage, stage_index) in [
+        (SampleProgressStage::CollectMetadataCandidates, 5),
+        (SampleProgressStage::ScoreMetadataPrefilter, 6),
+        (SampleProgressStage::LoadOverlappingMetadata, 7),
+        (SampleProgressStage::ScoreOverlappingMetadata, 8),
+    ] {
+        emit_progress(
+            progress,
+            position.index,
+            position.total,
+            stage,
+            stage_index,
+            Some(0),
+        );
+    }
 }
 
 struct FinalMetadataRow {
@@ -843,7 +925,7 @@ fn final_metadata_matches_for_overlapping_tokens(
 fn seed_metadata_docs_by_token(
     seed_rows: &[NftTextRow],
     token_interner: &mut TokenInterner,
-) -> BTreeMap<String, MetadataDocument> {
+) -> BTreeMap<String, PreparedSingleMetadataQuery> {
     let mut docs = BTreeMap::new();
     for row in seed_rows {
         if row.token_id.trim().is_empty() {
@@ -853,7 +935,8 @@ fn seed_metadata_docs_by_token(
         let Some(doc) = MetadataDocument::from_text_with_interner(&text, token_interner) else {
             continue;
         };
-        docs.entry(row.token_id.clone()).or_insert(doc);
+        docs.entry(row.token_id.clone())
+            .or_insert_with(|| PreparedSingleMetadataQuery::new(doc));
     }
     docs
 }
@@ -903,8 +986,11 @@ fn read_candidate_metadata_rows(
                 WHERE chain = ?
                   AND lower(contract_address) IN ({contract_values})
                   AND CAST(token_id AS VARCHAR) IN ({token_values})
-                  AND (trim(coalesce(CAST(metadata_doc AS VARCHAR), '')) <> ''
-                       OR trim(coalesce(CAST(metadata_json AS VARCHAR), '')) <> '')
+                  AND length(trim(coalesce(CAST(metadata_json AS VARCHAR), ''))) <= {MAX_METADATA_BYTES_FOR_DEDUP}
+                  AND (
+                      trim(coalesce(CAST(metadata_json AS VARCHAR), '')) LIKE '{{%'
+                      OR trim(coalesce(CAST(metadata_json AS VARCHAR), '')) LIKE '[%'
+                  )
             )
             WHERE overlap_rank <= {MAX_OVERLAPPING_METADATA_ROWS_PER_CONTRACT}
             ORDER BY contract_address, token_id
@@ -942,25 +1028,33 @@ fn read_candidate_metadata_rows(
 }
 
 fn first_overlapping_metadata_match(
-    seed_docs: &BTreeMap<String, MetadataDocument>,
+    seed_queries: &BTreeMap<String, PreparedSingleMetadataQuery>,
     rows: &[FinalMetadataRow],
     threshold: f64,
 ) -> Option<String> {
     if rows.len() == 1 {
         let row = &rows[0];
-        let seed_doc = seed_docs.get(&row.token_id)?;
-        return (score_metadata_pair_with_single_document_corpus(seed_doc, &row.doc) >= threshold)
-            .then(|| row.text.trim().to_string());
+        let seed_query = seed_queries.get(&row.token_id)?;
+        return (seed_query.score(&row.doc) >= threshold).then(|| row.text.trim().to_string());
     }
 
     let corpus = MetadataCorpus::from_documents(rows.iter().map(|row| &row.doc));
     let corpus = MetadataCorpusView::from_corpus(&corpus);
+    let mut seed_queries_by_token = BTreeMap::<&str, PreparedMetadataQuery<'_>>::new();
     let mut first_match = None;
     for row in rows {
-        let Some(seed_doc) = seed_docs.get(&row.token_id) else {
+        if !seed_queries_by_token.contains_key(row.token_id.as_str()) {
+            if let Some(seed_query) = seed_queries.get(&row.token_id) {
+                seed_queries_by_token.insert(
+                    row.token_id.as_str(),
+                    PreparedMetadataQuery::new(seed_query.document().clone(), &corpus),
+                );
+            }
+        }
+        let Some(seed_query) = seed_queries_by_token.get(row.token_id.as_str()) else {
             continue;
         };
-        if score_metadata_pair(seed_doc, &row.doc, &corpus) >= threshold {
+        if seed_query.score(&row.doc) >= threshold {
             let text = row.text.trim().to_string();
             if looks_like_json(&text) {
                 return Some(text);
@@ -1174,28 +1268,33 @@ fn push_metadata_prefilter_part(parts: &mut BTreeSet<String>, raw: &str) {
     }
 }
 
+fn metadata_is_dedup_eligible(metadata_doc: &str, metadata_json: &str) -> bool {
+    let _ = metadata_doc;
+    let metadata_json = metadata_json.trim();
+    !metadata_json.is_empty()
+        && metadata_json.len() <= MAX_METADATA_BYTES_FOR_DEDUP
+        && looks_like_json(metadata_json)
+}
+
 fn record_metadata_doc(metadata_doc: &str, metadata_json: &str) -> String {
-    if !metadata_doc.trim().is_empty() {
-        metadata_doc.to_string()
-    } else {
-        metadata_document_from_json(metadata_json)
+    if !metadata_is_dedup_eligible(metadata_doc, metadata_json) {
+        return String::new();
     }
+    metadata_document_from_json(metadata_json)
 }
 
 fn record_metadata_text(metadata_doc: &str, metadata_json: &str) -> String {
-    if !metadata_json.trim().is_empty() {
-        metadata_json.to_string()
-    } else {
-        metadata_doc.to_string()
+    if !metadata_is_dedup_eligible(metadata_doc, metadata_json) {
+        return String::new();
     }
+    metadata_json.to_string()
 }
 
 fn record_metadata_prefilter_text(metadata_doc: &str, metadata_json: &str) -> String {
-    if !metadata_json.trim().is_empty() {
-        metadata_prefilter_text(metadata_json)
-    } else {
-        metadata_prefilter_text(metadata_doc)
+    if !metadata_is_dedup_eligible(metadata_doc, metadata_json) {
+        return String::new();
     }
+    metadata_prefilter_text(metadata_json)
 }
 
 fn metadata_tokens(value: &str) -> Vec<String> {
@@ -1312,6 +1411,18 @@ struct MetadataCorpusView<'a> {
     avg_doc_len: f64,
 }
 
+struct PreparedMetadataQuery<'a> {
+    terms: Vec<(TokenId, usize)>,
+    denominator: f64,
+    corpus: &'a MetadataCorpusView<'a>,
+}
+
+#[derive(Clone)]
+struct PreparedSingleMetadataQuery {
+    document: MetadataDocument,
+    terms: Vec<(TokenId, usize)>,
+}
+
 impl<'a> MetadataCorpusView<'a> {
     fn from_corpus(base: &'a MetadataCorpus) -> Self {
         let avg_doc_len = if base.total_docs == 0 {
@@ -1367,26 +1478,58 @@ impl<'a> MetadataCorpusView<'a> {
     }
 }
 
+impl<'a> PreparedMetadataQuery<'a> {
+    fn new(document: MetadataDocument, corpus: &'a MetadataCorpusView<'a>) -> Self {
+        let terms = query_terms_from_tokens(&document.tokens);
+        let self_score = bm25_score_terms(&terms, &document, corpus);
+        let denominator = if self_score > 0.0 { self_score } else { 1.0 };
+        Self {
+            terms,
+            denominator,
+            corpus,
+        }
+    }
+
+    fn score(&self, document: &MetadataDocument) -> f64 {
+        (bm25_score_terms(&self.terms, document, self.corpus) / self.denominator).clamp(0.0, 1.0)
+    }
+}
+
+impl PreparedSingleMetadataQuery {
+    fn new(document: MetadataDocument) -> Self {
+        let terms = query_terms_from_tokens(&document.tokens);
+        Self { document, terms }
+    }
+
+    fn document(&self) -> &MetadataDocument {
+        &self.document
+    }
+
+    fn score(&self, document: &MetadataDocument) -> f64 {
+        let self_score =
+            bm25_score_terms_with_single_document_corpus(&self.terms, &self.document, document);
+        let denominator = if self_score > 0.0 { self_score } else { 1.0 };
+        (bm25_score_terms_with_single_document_corpus(&self.terms, document, document)
+            / denominator)
+            .clamp(0.0, 1.0)
+    }
+}
+
+#[cfg(test)]
 fn score_metadata_pair(
     left: &MetadataDocument,
     right: &MetadataDocument,
     corpus: &MetadataCorpusView<'_>,
 ) -> f64 {
-    let query_terms = query_terms_from_tokens(&left.tokens);
-    let self_score = bm25_score_terms(&query_terms, left, corpus);
-    let denominator = if self_score > 0.0 { self_score } else { 1.0 };
-    (bm25_score_terms(&query_terms, right, corpus) / denominator).clamp(0.0, 1.0)
+    PreparedMetadataQuery::new(left.clone(), corpus).score(right)
 }
 
+#[cfg(test)]
 fn score_metadata_pair_with_single_document_corpus(
     left: &MetadataDocument,
     right: &MetadataDocument,
 ) -> f64 {
-    let query_terms = query_terms_from_tokens(&left.tokens);
-    let self_score = bm25_score_terms_with_single_document_corpus(&query_terms, left, right);
-    let denominator = if self_score > 0.0 { self_score } else { 1.0 };
-    (bm25_score_terms_with_single_document_corpus(&query_terms, right, right) / denominator)
-        .clamp(0.0, 1.0)
+    PreparedSingleMetadataQuery::new(left.clone()).score(right)
 }
 
 fn query_terms_from_tokens(query_tokens: &[TokenId]) -> Vec<(TokenId, usize)> {
@@ -1464,15 +1607,6 @@ fn non_empty(value: &str) -> Option<String> {
         None
     } else {
         Some(trimmed.to_string())
-    }
-}
-
-fn non_empty_json(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if looks_like_json(trimmed) {
-        Some(trimmed.to_string())
-    } else {
-        None
     }
 }
 
@@ -2437,6 +2571,30 @@ mod tests {
     }
 
     #[test]
+    fn metadata_dedup_rejects_non_json_and_overlong_raw_metadata() {
+        assert!(metadata_is_dedup_eligible(
+            "gold dragon",
+            r#"{"description":"Gold Dragon"}"#
+        ));
+        assert!(!metadata_is_dedup_eligible("gold dragon", ""));
+        assert!(!metadata_is_dedup_eligible(
+            "gold dragon",
+            "not json metadata"
+        ));
+
+        let overlong_json = format!(
+            r#"{{"description":"{}"}}"#,
+            "x".repeat(MAX_METADATA_BYTES_FOR_DEDUP)
+        );
+        assert!(!metadata_is_dedup_eligible("gold dragon", &overlong_json));
+        assert_eq!(record_metadata_doc("gold dragon", "not json metadata"), "");
+        assert_eq!(
+            record_metadata_prefilter_text("gold dragon", "not json metadata"),
+            ""
+        );
+    }
+
+    #[test]
     fn metadata_prefilter_text_keeps_insensitive_values_but_only_sensitive_keys() {
         let json = r#"{"name":"Seed #1","description":"Shared Story","attributes":[{"trait_type":"Background","value":"Red"}],"image":"ipfs://seed/1.png"}"#;
 
@@ -2463,7 +2621,7 @@ mod tests {
     fn overlapping_metadata_row_loader_keeps_one_row_per_candidate_contract() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "
+            r#"
             CREATE TABLE nft_features (
                 chain VARCHAR NOT NULL,
                 contract_address VARCHAR NOT NULL,
@@ -2472,10 +2630,10 @@ mod tests {
                 metadata_json VARCHAR
             );
             INSERT INTO nft_features VALUES
-                ('ethereum', '0xdup', '1', 'alpha beta', ''),
-                ('ethereum', '0xdup', '2', 'gold dragon', ''),
-                ('ethereum', '0xother', '1', 'alpha beta', '');
-            ",
+                ('ethereum', '0xdup', '1', '', '{"description":"alpha beta"}'),
+                ('ethereum', '0xdup', '2', '', '{"description":"gold dragon"}'),
+                ('ethereum', '0xother', '1', '', '{"description":"alpha beta"}');
+            "#,
         )
         .unwrap();
         let mut token_interner = TokenInterner::default();
@@ -2515,6 +2673,25 @@ mod tests {
         let corpus_score = score_metadata_pair(&query, &doc, &corpus);
 
         assert!((single_doc_score - corpus_score).abs() < 1e-9);
+    }
+
+    #[test]
+    fn prepared_metadata_query_reuses_terms_without_changing_score() {
+        let mut token_interner = TokenInterner::default();
+        let query =
+            MetadataDocument::from_text_with_interner("gold dragon gold", &mut token_interner)
+                .unwrap();
+        let doc =
+            MetadataDocument::from_text_with_interner("rare gold dragon", &mut token_interner)
+                .unwrap();
+        let corpus = MetadataCorpus::from_documents(std::iter::once(&doc));
+        let corpus = MetadataCorpusView::from_corpus(&corpus);
+
+        let prepared_query = PreparedMetadataQuery::new(query.clone(), &corpus);
+        let prepared_score = prepared_query.score(&doc);
+        let direct_score = score_metadata_pair(&query, &doc, &corpus);
+
+        assert!((prepared_score - direct_score).abs() < 1e-9);
     }
 
     #[test]

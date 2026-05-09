@@ -3,10 +3,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use rayon::prelude::*;
 
 use crate::analysis::scoring::{
-    metadata_bm25_tokens, metadata_document_from_json, metadata_prefilter_document_from_json,
-    score_metadata_indexed_pair_with_corpus, score_metadata_indexed_pair_with_query,
-    score_metadata_single_document_pair, score_name_pair, MetadataBm25Corpus,
-    MetadataBm25CorpusBuilder, MetadataBm25Document, MetadataBm25Query,
+    metadata_bm25_tokens, metadata_document_from_json, metadata_is_dedup_eligible,
+    metadata_prefilter_document_from_json, score_metadata_indexed_pair_with_query, score_name_pair,
+    MetadataBm25Corpus, MetadataBm25CorpusBuilder, MetadataBm25Document, MetadataBm25Query,
+    MetadataBm25SingleDocumentQuery,
 };
 use crate::models::{ContractDuplicateRecord, DatabaseNftRecord, DuplicateCandidate, SeedNft};
 use crate::normalize::{normalize_name, normalize_url};
@@ -60,19 +60,17 @@ fn build_contract_name_match_index(
 }
 
 fn record_metadata_doc(metadata_doc: &str, metadata_json: &str) -> String {
-    if !metadata_doc.is_empty() {
-        metadata_doc.to_string()
-    } else {
-        metadata_document_from_json(metadata_json)
+    if !metadata_is_dedup_eligible(metadata_doc, metadata_json) {
+        return String::new();
     }
+    metadata_document_from_json(metadata_json)
 }
 
 fn record_metadata_prefilter_doc(metadata_doc: &str, metadata_json: &str) -> String {
-    if !metadata_json.trim().is_empty() {
-        metadata_prefilter_document_from_json(metadata_json)
-    } else {
-        metadata_prefilter_document_from_json(metadata_doc)
+    if !metadata_is_dedup_eligible(metadata_doc, metadata_json) {
+        return String::new();
     }
+    metadata_prefilter_document_from_json(metadata_json)
 }
 
 fn record_metadata_doc_from_record(row: &DatabaseNftRecord) -> String {
@@ -109,7 +107,9 @@ fn should_score_metadata(row: &ContractDuplicateRecord, has_metadata_recall_flag
     !has_metadata_recall_flags || row.metadata_recall_match
 }
 
-fn seed_metadata_docs_by_token(seed_nfts: &[SeedNft]) -> BTreeMap<String, MetadataBm25Document> {
+fn seed_metadata_queries_by_token(
+    seed_nfts: &[SeedNft],
+) -> BTreeMap<String, MetadataBm25SingleDocumentQuery> {
     let mut docs = BTreeMap::new();
     for item in seed_nfts {
         if item.token_id.trim().is_empty() {
@@ -119,13 +119,14 @@ fn seed_metadata_docs_by_token(seed_nfts: &[SeedNft]) -> BTreeMap<String, Metada
         let Some(doc) = MetadataBm25Document::from_text(&metadata_doc) else {
             continue;
         };
-        docs.entry(item.token_id.clone()).or_insert(doc);
+        docs.entry(item.token_id.clone())
+            .or_insert_with(|| MetadataBm25SingleDocumentQuery::new(doc));
     }
     docs
 }
 
 fn first_overlapping_metadata_match<'a>(
-    seed_docs_by_token: &BTreeMap<String, MetadataBm25Document>,
+    seed_queries_by_token: &BTreeMap<String, MetadataBm25SingleDocumentQuery>,
     row: &'a ContractDuplicateRecord,
     metadata_threshold: f64,
 ) -> Option<&'a DatabaseNftRecord> {
@@ -137,7 +138,7 @@ fn first_overlapping_metadata_match<'a>(
     let mut candidate_rows = Vec::new();
     let mut candidate_docs = Vec::new();
     for candidate_row in source_rows {
-        if !seed_docs_by_token.contains_key(&candidate_row.token_id) {
+        if !seed_queries_by_token.contains_key(&candidate_row.token_id) {
             continue;
         }
         let metadata_doc = record_metadata_doc_from_record(candidate_row);
@@ -154,20 +155,26 @@ fn first_overlapping_metadata_match<'a>(
     if candidate_docs.len() == 1 {
         let candidate_row = candidate_rows[0];
         let candidate_doc = &candidate_docs[0];
-        let seed_doc = seed_docs_by_token.get(&candidate_row.token_id)?;
-        return (score_metadata_single_document_pair(seed_doc, candidate_doc)
-            >= metadata_threshold)
-            .then_some(candidate_row);
+        let seed_query = seed_queries_by_token.get(&candidate_row.token_id)?;
+        return (seed_query.score(candidate_doc) >= metadata_threshold).then_some(candidate_row);
     }
 
     let corpus = MetadataBm25Corpus::from_indexed_documents(&candidate_docs);
+    let mut prepared_queries_by_token = BTreeMap::<&str, MetadataBm25Query<'_>>::new();
     for (candidate_row, candidate_doc) in candidate_rows.into_iter().zip(candidate_docs.iter()) {
-        let Some(seed_doc) = seed_docs_by_token.get(&candidate_row.token_id) else {
+        if !prepared_queries_by_token.contains_key(candidate_row.token_id.as_str()) {
+            if let Some(seed_query) = seed_queries_by_token.get(&candidate_row.token_id) {
+                prepared_queries_by_token.insert(
+                    candidate_row.token_id.as_str(),
+                    MetadataBm25Query::new(seed_query.document(), &corpus),
+                );
+            }
+        }
+        let Some(seed_query) = prepared_queries_by_token.get(candidate_row.token_id.as_str())
+        else {
             continue;
         };
-        if score_metadata_indexed_pair_with_corpus(seed_doc, candidate_doc, &corpus)
-            >= metadata_threshold
-        {
+        if score_metadata_indexed_pair_with_query(seed_query, candidate_doc) >= metadata_threshold {
             return Some(candidate_row);
         }
     }
@@ -376,7 +383,7 @@ pub fn build_duplicate_candidates_from_contract_rows(
 
     let seed_metadata_docs: Vec<MetadataBm25Document> =
         seed_metadata_example_doc(seed_nfts).into_iter().collect();
-    let seed_final_metadata_docs_by_token = seed_metadata_docs_by_token(seed_nfts);
+    let seed_final_metadata_queries_by_token = seed_metadata_queries_by_token(seed_nfts);
 
     let name_match_contracts =
         build_contract_name_match_index(&contract_rows, name_threshold, &seed_name_norms);
@@ -417,7 +424,7 @@ pub fn build_duplicate_candidates_from_contract_rows(
                         score_metadata_indexed_pair_with_query(query, row_doc) >= metadata_threshold
                     }) {
                         metadata_match_row = first_overlapping_metadata_match(
-                            &seed_final_metadata_docs_by_token,
+                            &seed_final_metadata_queries_by_token,
                             row,
                             metadata_threshold,
                         );
@@ -466,6 +473,13 @@ pub fn build_duplicate_candidates_from_contract_rows(
 mod tests {
     use super::*;
 
+    fn metadata_json(text: &str) -> String {
+        format!(
+            r#"{{"description":{}}}"#,
+            serde_json::to_string(text).unwrap()
+        )
+    }
+
     #[test]
     fn metadata_bm25_index_keeps_full_corpus_stats_while_caching_only_query_token_candidates() {
         let seed_docs = vec![MetadataBm25Document::from_text("gold ai dragon").unwrap()];
@@ -474,25 +488,25 @@ mod tests {
             DatabaseNftRecord {
                 contract_address: "0xseed".into(),
                 token_id: "1".into(),
-                metadata_doc: "gold ai dragon".into(),
+                metadata_json: metadata_json("gold ai dragon"),
                 ..Default::default()
             },
             DatabaseNftRecord {
                 contract_address: "0xgold".into(),
                 token_id: "1".into(),
-                metadata_doc: "gold rare".into(),
+                metadata_json: metadata_json("gold rare"),
                 ..Default::default()
             },
             DatabaseNftRecord {
                 contract_address: "0xai".into(),
                 token_id: "1".into(),
-                metadata_doc: "ai generated".into(),
+                metadata_json: metadata_json("ai generated"),
                 ..Default::default()
             },
             DatabaseNftRecord {
                 contract_address: "0xmiss".into(),
                 token_id: "1".into(),
-                metadata_doc: "silver cat".into(),
+                metadata_json: metadata_json("silver cat"),
                 ..Default::default()
             },
         ];
@@ -567,20 +581,20 @@ mod tests {
             SeedNft {
                 contract_address: "0xseed".into(),
                 token_id: "1".into(),
-                metadata_doc: "gold dragon".into(),
+                metadata_json: metadata_json("gold dragon"),
                 ..Default::default()
             },
             SeedNft {
                 contract_address: "0xseed".into(),
                 token_id: "2".into(),
-                metadata_doc: "silver cat".into(),
+                metadata_json: metadata_json("silver cat"),
                 ..Default::default()
             },
         ];
         let snapshot_rows = vec![DatabaseNftRecord {
             contract_address: "0xcandidate".into(),
             token_id: "1".into(),
-            metadata_doc: "silver cat".into(),
+            metadata_json: metadata_json("silver cat"),
             ..Default::default()
         }];
 
@@ -595,13 +609,13 @@ mod tests {
         let seed_nfts = vec![SeedNft {
             contract_address: "0xseed".into(),
             token_id: "1".into(),
-            metadata_doc: "gold dragon".into(),
+            metadata_json: metadata_json("gold dragon"),
             ..Default::default()
         }];
         let snapshot_rows = vec![DatabaseNftRecord {
             contract_address: "0xcandidate".into(),
             token_id: "1".into(),
-            metadata_doc: "gold dragon".into(),
+            metadata_json: metadata_json("gold dragon"),
             metadata_recall_checked: true,
             metadata_recall_match: false,
             ..Default::default()
@@ -618,14 +632,14 @@ mod tests {
         let seed_nfts = vec![SeedNft {
             contract_address: "0xseed".into(),
             token_id: "1".into(),
-            metadata_doc: "gold dragon".into(),
+            metadata_json: metadata_json("gold dragon"),
             ..Default::default()
         }];
         let snapshot_rows = vec![
             DatabaseNftRecord {
                 contract_address: "0xcandidate".into(),
                 token_id: "1".into(),
-                metadata_doc: "gold dragon".into(),
+                metadata_json: metadata_json("gold dragon"),
                 metadata_recall_checked: true,
                 metadata_recall_match: true,
                 ..Default::default()
@@ -633,7 +647,7 @@ mod tests {
             DatabaseNftRecord {
                 contract_address: "0xcandidate".into(),
                 token_id: "2".into(),
-                metadata_doc: "gold dragon".into(),
+                metadata_json: metadata_json("gold dragon"),
                 metadata_recall_checked: true,
                 metadata_recall_match: true,
                 ..Default::default()
@@ -653,32 +667,32 @@ mod tests {
         let seed_nfts = vec![SeedNft {
             contract_address: "0xseed".into(),
             token_id: "2".into(),
-            metadata_doc: "shared collection background red".into(),
+            metadata_json: metadata_json("shared collection background red"),
             ..Default::default()
         }];
         let snapshot_rows = vec![
             DatabaseNftRecord {
                 contract_address: "0xaccepted".into(),
                 token_id: "1".into(),
-                metadata_doc: "shared collection background red".into(),
+                metadata_json: metadata_json("shared collection background red"),
                 ..Default::default()
             },
             DatabaseNftRecord {
                 contract_address: "0xaccepted".into(),
                 token_id: "2".into(),
-                metadata_doc: "shared collection background red".into(),
+                metadata_json: metadata_json("shared collection background red"),
                 ..Default::default()
             },
             DatabaseNftRecord {
                 contract_address: "0xrejected".into(),
                 token_id: "1".into(),
-                metadata_doc: "shared collection background red".into(),
+                metadata_json: metadata_json("shared collection background red"),
                 ..Default::default()
             },
             DatabaseNftRecord {
                 contract_address: "0xrejected".into(),
                 token_id: "2".into(),
-                metadata_doc: "shared collection background blue".into(),
+                metadata_json: metadata_json("shared collection background blue"),
                 ..Default::default()
             },
         ];
@@ -697,14 +711,14 @@ mod tests {
         let seed_nfts = vec![SeedNft {
             contract_address: "0xseed".into(),
             token_id: "1".into(),
-            metadata_doc: "gold dragon".into(),
+            metadata_json: metadata_json("gold dragon"),
             ..Default::default()
         }];
         let snapshot_rows = vec![
             DatabaseNftRecord {
                 contract_address: "0x7C770595a2Be9A87CF49B35eA9bC534f1a59552D".into(),
                 token_id: "1".into(),
-                metadata_doc: "gold dragon".into(),
+                metadata_json: metadata_json("gold dragon"),
                 metadata_recall_checked: true,
                 metadata_recall_match: true,
                 ..Default::default()
@@ -713,7 +727,7 @@ mod tests {
                 contract_address: "0xfactorynameonly".into(),
                 token_id: "1".into(),
                 name: "NFT Factory Test".into(),
-                metadata_doc: "gold dragon".into(),
+                metadata_json: metadata_json("gold dragon"),
                 metadata_recall_checked: true,
                 metadata_recall_match: true,
                 ..Default::default()
@@ -732,13 +746,13 @@ mod tests {
         let seed_nfts = vec![SeedNft {
             contract_address: "0xseed".into(),
             token_id: "1".into(),
-            metadata_doc: "gold dragon".into(),
+            metadata_json: metadata_json("gold dragon"),
             ..Default::default()
         }];
         let snapshot_rows = vec![DatabaseNftRecord {
             contract_address: "0x7C770595a2Be9A87CF49B35eA9bC534f1a59552D".into(),
             token_id: "1".into(),
-            metadata_doc: "gold dragon".into(),
+            metadata_json: metadata_json("gold dragon"),
             metadata_recall_checked: true,
             metadata_recall_match: true,
             ..Default::default()
@@ -758,14 +772,14 @@ mod tests {
         let seed_nfts = vec![SeedNft {
             contract_address: "0xseed".into(),
             token_id: "2".into(),
-            metadata_doc: "gold dragon".into(),
+            metadata_json: metadata_json("gold dragon"),
             ..Default::default()
         }];
         let snapshot_rows = vec![
             DatabaseNftRecord {
                 contract_address: "0xcandidate".into(),
                 token_id: "1".into(),
-                metadata_doc: "silver cat".into(),
+                metadata_json: metadata_json("silver cat"),
                 metadata_recall_checked: true,
                 metadata_recall_match: false,
                 ..Default::default()
@@ -773,7 +787,7 @@ mod tests {
             DatabaseNftRecord {
                 contract_address: "0xcandidate".into(),
                 token_id: "2".into(),
-                metadata_doc: "gold dragon".into(),
+                metadata_json: metadata_json("gold dragon"),
                 metadata_recall_checked: true,
                 metadata_recall_match: true,
                 ..Default::default()

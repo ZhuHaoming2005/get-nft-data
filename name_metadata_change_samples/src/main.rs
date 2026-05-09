@@ -100,8 +100,12 @@ fn progress_message(stage: SampleProgressStage, candidate_count: Option<usize>) 
         SampleProgressStage::ReadSeedRows => "read seed rows",
         SampleProgressStage::LoadNameCandidates => "load name candidates",
         SampleProgressStage::ScoreNameCandidates => "score name candidates",
-        SampleProgressStage::LoadMetadataCandidates => "load metadata candidates",
-        SampleProgressStage::ScoreMetadataCandidates => "score metadata candidates",
+        SampleProgressStage::PrepareMetadataQuery => "prepare metadata query",
+        SampleProgressStage::CollectMetadataCandidates => "collect metadata candidates",
+        SampleProgressStage::ScoreMetadataPrefilter => "score metadata prefilter",
+        SampleProgressStage::LoadOverlappingMetadata => "load overlapping metadata",
+        SampleProgressStage::ScoreOverlappingMetadata => "score overlapping metadata",
+        SampleProgressStage::BuildReport => "build report",
         SampleProgressStage::FinishedSeed => "finish seed",
     };
     match candidate_count {

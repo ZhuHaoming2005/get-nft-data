@@ -297,7 +297,9 @@ fn collect_samples_uses_equivalent_name_and_metadata_normalization() {
                 .metadata_doc("unrelated"),
             TestRow::new("0xmetadata", "1")
                 .name("Different")
-                .metadata_doc("background red gold dragon"),
+                .metadata_json(
+                    r#"{"description":"Gold Dragon","attributes":[{"trait_type":"Background","value":"Red"}]}"#,
+                ),
         ],
     );
     fs::write(&input_path, "0xseed\n").unwrap();
@@ -314,7 +316,9 @@ fn collect_samples_uses_equivalent_name_and_metadata_normalization() {
     );
     assert_eq!(
         report.seed_reports[0].metadata.matches,
-        vec!["background red gold dragon"]
+        vec![
+            r#"{"description":"Gold Dragon","attributes":[{"trait_type":"Background","value":"Red"}]}"#
+        ]
     );
 }
 
@@ -395,10 +399,10 @@ fn collect_samples_processes_multiple_seeds_serially() {
                 .metadata_doc("changed"),
             TestRow::new("0xseed2", "1")
                 .name("Seed Two")
-                .metadata_doc("shared two"),
+                .metadata_json(r#"{"description":"shared two"}"#),
             TestRow::new("0xcopy2", "1")
                 .name("Different")
-                .metadata_doc("shared two"),
+                .metadata_json(r#"{"description":"shared two"}"#),
         ],
     );
     fs::write(&input_path, "0xseed1\n0xseed2\n").unwrap();
@@ -409,7 +413,10 @@ fn collect_samples_processes_multiple_seeds_serially() {
     assert_eq!(report.seed_reports[0].name.matches, vec!["Seed One"]);
     assert!(report.seed_reports[0].metadata.matches.is_empty());
     assert!(report.seed_reports[1].name.matches.is_empty());
-    assert_eq!(report.seed_reports[1].metadata.matches, vec!["shared two"]);
+    assert_eq!(
+        report.seed_reports[1].metadata.matches,
+        vec![r#"{"description":"shared two"}"#]
+    );
 }
 
 #[test]
@@ -451,14 +458,20 @@ fn collect_samples_reports_serial_in_contract_progress_without_addresses() {
     })
     .unwrap();
 
-    assert_eq!(events.len(), 12);
+    assert_eq!(events.len(), 20);
     assert!(events.iter().all(|event| event.1 == 2));
-    assert!(events.iter().all(|event| event.4 == 6));
+    assert!(events.iter().all(|event| event.4 == 10));
     assert_eq!(events[0].0, 1);
     assert_eq!(events[0].2, SampleProgressStage::ReadSeedRows);
-    assert_eq!(events[5].0, 1);
-    assert_eq!(events[5].2, SampleProgressStage::FinishedSeed);
-    assert_eq!(events[5].5, Some(1));
-    assert_eq!(events[11].0, 2);
-    assert_eq!(events[11].2, SampleProgressStage::FinishedSeed);
+    assert_eq!(events[3].2, SampleProgressStage::PrepareMetadataQuery);
+    assert_eq!(events[4].2, SampleProgressStage::CollectMetadataCandidates);
+    assert_eq!(events[5].2, SampleProgressStage::ScoreMetadataPrefilter);
+    assert_eq!(events[6].2, SampleProgressStage::LoadOverlappingMetadata);
+    assert_eq!(events[7].2, SampleProgressStage::ScoreOverlappingMetadata);
+    assert_eq!(events[8].2, SampleProgressStage::BuildReport);
+    assert_eq!(events[9].0, 1);
+    assert_eq!(events[9].2, SampleProgressStage::FinishedSeed);
+    assert_eq!(events[9].5, Some(1));
+    assert_eq!(events[19].0, 2);
+    assert_eq!(events[19].2, SampleProgressStage::FinishedSeed);
 }
