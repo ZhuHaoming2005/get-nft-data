@@ -1009,6 +1009,14 @@ fn match_metadata(
     let seed_sketch = metadata_sketch_from_document(&seed_doc, corpus.total_docs, |token| {
         corpus.document_frequency(token)
     });
+    emit_progress(
+        progress,
+        position.index,
+        position.total,
+        SampleProgressStage::CollectMetadataSourceBuckets,
+        7,
+        Some(0),
+    );
     let source_candidates = collect_metadata_source_candidates(
         &seed_sketch,
         text_index,

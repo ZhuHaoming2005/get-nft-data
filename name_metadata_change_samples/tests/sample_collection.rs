@@ -519,3 +519,49 @@ fn collect_samples_reports_serial_in_contract_progress_without_addresses() {
     assert_eq!(events[27].0, 2);
     assert_eq!(events[27].2, SampleProgressStage::FinishedSeed);
 }
+
+#[test]
+fn collect_samples_attributes_metadata_bucket_collection_progress() {
+    let temp = tempdir().unwrap();
+    let db_path = temp.path().join("features.duckdb");
+    let input_path = temp.path().join("contracts.txt");
+    let output_path = temp.path().join("samples.md");
+
+    write_feature_db(
+        &db_path,
+        &[
+            TestRow::new("0xseed", "1")
+                .metadata_json(r#"{"description":"shared story","image":"ipfs://seed"}"#),
+            TestRow::new("0xcopy", "1")
+                .metadata_json(r#"{"description":"shared story","image":"ipfs://copy"}"#),
+        ],
+    );
+    fs::write(&input_path, "0xseed\n").unwrap();
+
+    let mut events = Vec::new();
+    let mut sample_config = config(db_path, input_path, output_path);
+    sample_config.metadata_threshold = 0.1;
+    collect_samples_with_progress(sample_config, |event| {
+        events.push((event.stage, event.candidate_count));
+    })
+    .unwrap();
+
+    let collect_events = events
+        .iter()
+        .filter(|event| event.0 == SampleProgressStage::CollectMetadataSourceBuckets)
+        .map(|event| event.1)
+        .collect::<Vec<_>>();
+    assert_eq!(collect_events.len(), 2);
+    assert_eq!(collect_events[0], Some(0));
+    assert!(collect_events[1].unwrap_or_default() > 0);
+
+    let first_collect_index = events
+        .iter()
+        .position(|event| event.0 == SampleProgressStage::CollectMetadataSourceBuckets)
+        .unwrap();
+    let verify_index = events
+        .iter()
+        .position(|event| event.0 == SampleProgressStage::VerifyMetadataSourceBuckets)
+        .unwrap();
+    assert!(first_collect_index < verify_index);
+}
