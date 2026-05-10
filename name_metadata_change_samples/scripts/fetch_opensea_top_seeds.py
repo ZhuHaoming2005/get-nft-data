@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch top OpenSea collection contract addresses and write seeds.txt."""
+"""Fetch trending OpenSea collection contract addresses and write seeds.txt."""
 
 from __future__ import annotations
 
@@ -15,8 +15,10 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 
-DEFAULT_TOP_COLLECTIONS_URL = "https://api.opensea.io/api/v2/collections/top"
-DEFAULT_SORT_BY = "thirty_days_volume"
+DEFAULT_TRENDING_COLLECTIONS_URL = (
+    "https://api.opensea.io/api/v2/collections/trending"
+)
+DEFAULT_TIMEFRAME = "thirty_days"
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 COLLECTION_KEYS = ("collections", "top_collections", "data", "results")
 CONTRACT_LIST_KEYS = ("contracts", "primary_asset_contracts", "asset_contracts")
@@ -29,10 +31,12 @@ def parse_json_response(raw: bytes) -> dict[str, Any]:
     return value
 
 
-def extract_top_collection_addresses(payload: dict[str, Any], chain: str) -> list[str]:
+def extract_trending_collection_addresses(
+    payload: dict[str, Any], chain: str
+) -> list[str]:
     addresses: list[str] = []
     seen: set[str] = set()
-    for collection in top_collection_items(payload):
+    for collection in collection_items(payload):
         for address in collection_contract_addresses(collection, chain):
             if address not in seen:
                 seen.add(address)
@@ -40,7 +44,7 @@ def extract_top_collection_addresses(payload: dict[str, Any], chain: str) -> lis
     return addresses
 
 
-def top_collection_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
+def collection_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
     for key in COLLECTION_KEYS:
         value = payload.get(key)
         if isinstance(value, list):
@@ -87,18 +91,18 @@ def next_cursor(payload: dict[str, Any]) -> str | None:
     return None
 
 
-def build_top_collections_url(
+def build_trending_collections_url(
     base_url: str,
     *,
     chain: str,
     page_size: int,
-    sort_by: str,
+    timeframe: str,
     cursor: str | None,
 ) -> str:
     query: dict[str, str | int] = {
         "chains": chain,
         "limit": page_size,
-        "sort_by": sort_by,
+        "timeframe": timeframe,
     }
     if cursor:
         query["cursor"] = cursor
@@ -124,8 +128,8 @@ def collect_seed_addresses(
     chain: str,
     limit: int,
     page_size: int,
-    top_collections_url: str,
-    sort_by: str,
+    trending_collections_url: str,
+    timeframe: str,
     timeout: float,
 ) -> list[str]:
     addresses: list[str] = []
@@ -133,15 +137,15 @@ def collect_seed_addresses(
     cursor: str | None = None
 
     while len(addresses) < limit:
-        url = build_top_collections_url(
-            top_collections_url,
+        url = build_trending_collections_url(
+            trending_collections_url,
             chain=chain,
             page_size=min(page_size, limit - len(addresses)),
-            sort_by=sort_by,
+            timeframe=timeframe,
             cursor=cursor,
         )
         payload = parse_json_response(fetch_bytes(url, api_key=api_key, timeout=timeout))
-        page_addresses = extract_top_collection_addresses(payload, chain)
+        page_addresses = extract_trending_collection_addresses(payload, chain)
         for address in page_addresses:
             if address not in seen:
                 seen.add(address)
@@ -167,14 +171,20 @@ def write_seeds(path: Path, addresses: list[str]) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Fetch top OpenSea collection contract addresses into seeds.txt"
+        description="Fetch trending OpenSea collection contract addresses into seeds.txt"
     )
     parser.add_argument("--output", type=Path, default=Path("../seeds.txt"))
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--page-size", type=int, default=100)
     parser.add_argument("--chain", default="ethereum")
-    parser.add_argument("--sort-by", default=DEFAULT_SORT_BY)
-    parser.add_argument("--top-collections-url", default=DEFAULT_TOP_COLLECTIONS_URL)
+    parser.add_argument("--timeframe", default=DEFAULT_TIMEFRAME)
+    parser.add_argument(
+        "--trending-collections-url",
+        "--top-collections-url",
+        dest="trending_collections_url",
+        default=DEFAULT_TRENDING_COLLECTIONS_URL,
+        help="OpenSea trending collections API URL",
+    )
     parser.add_argument("--api-key", default="2d17a25e68714720883ac996f5459b17")
     parser.add_argument("--api-key-env", default="OPENSEA_API_KEY")
     parser.add_argument("--timeout", type=float, default=30.0)
@@ -198,8 +208,8 @@ def main(argv: list[str] | None = None) -> int:
             chain=args.chain,
             limit=args.limit,
             page_size=args.page_size,
-            top_collections_url=args.top_collections_url,
-            sort_by=args.sort_by,
+            trending_collections_url=args.trending_collections_url,
+            timeframe=args.timeframe,
             timeout=args.timeout,
         )
     except HTTPError as exc:

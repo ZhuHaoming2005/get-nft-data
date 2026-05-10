@@ -15,7 +15,7 @@ spec.loader.exec_module(fetch_opensea_top_seeds)
 
 
 class FetchOpenSeaTopSeedsTest(unittest.TestCase):
-    def test_extract_top_collection_addresses_filters_chain_and_deduplicates(self):
+    def test_extract_trending_collection_addresses_filters_chain_and_deduplicates(self):
         payload = {
             "collections": [
                 {
@@ -49,7 +49,7 @@ class FetchOpenSeaTopSeedsTest(unittest.TestCase):
         }
 
         self.assertEqual(
-            fetch_opensea_top_seeds.extract_top_collection_addresses(
+            fetch_opensea_top_seeds.extract_trending_collection_addresses(
                 payload, "ethereum"
             ),
             [
@@ -58,27 +58,27 @@ class FetchOpenSeaTopSeedsTest(unittest.TestCase):
             ],
         )
 
-    def test_build_top_collections_url_uses_30_day_volume_sort(self):
-        url = fetch_opensea_top_seeds.build_top_collections_url(
-            "https://api.opensea.io/api/v2/collections/top",
+    def test_build_trending_collections_url_uses_trending_endpoint_params(self):
+        url = fetch_opensea_top_seeds.build_trending_collections_url(
+            "https://api.opensea.io/api/v2/collections/trending",
             chain="ethereum",
             page_size=50,
-            sort_by="thirty_days_volume",
+            timeframe="thirty_days",
             cursor=None,
         )
 
         self.assertEqual(
             url,
-            "https://api.opensea.io/api/v2/collections/top?"
-            "chains=ethereum&limit=50&sort_by=thirty_days_volume",
+            "https://api.opensea.io/api/v2/collections/trending?"
+            "chains=ethereum&limit=50&timeframe=thirty_days",
         )
 
-    def test_build_top_collections_url_adds_cursor_when_present(self):
-        url = fetch_opensea_top_seeds.build_top_collections_url(
-            "https://api.opensea.io/api/v2/collections/top",
+    def test_build_trending_collections_url_adds_cursor_when_present(self):
+        url = fetch_opensea_top_seeds.build_trending_collections_url(
+            "https://api.opensea.io/api/v2/collections/trending",
             chain="ethereum",
             page_size=50,
-            sort_by="thirty_days_volume",
+            timeframe="thirty_days",
             cursor="abc",
         )
 
