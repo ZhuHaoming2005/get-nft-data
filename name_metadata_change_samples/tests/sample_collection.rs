@@ -170,7 +170,9 @@ fn collect_samples_outputs_split_name_and_metadata_text_only() {
     assert!(output.contains("## Modification Summary"));
     assert!(output.contains("- exact_clone: 1"));
     assert!(output.contains("#### Metadata Change Matrix"));
-    assert!(output.contains("| replaced | 0 | 0 | 0 | 1 | 0 | 0 | 0 |"));
+    assert!(output.contains(
+        "| replaced | 0 (0.0%) | 0 (0.0%) | 0 (0.0%) | 1 (100.0%) | 0 (0.0%) | 0 (0.0%) | 0 (0.0%) |"
+    ));
     assert!(output.contains("## Name Matches"));
     assert!(output.contains("- seed: Azuki #1"));
     assert!(output.contains("[exact_clone] Azuki #1"));
@@ -235,7 +237,9 @@ fn collect_samples_prefers_json_metadata_for_path_based_matrix() {
     );
 
     let output = fs::read_to_string(output_path).unwrap();
-    assert!(output.contains("| replaced | 0 | 0 | 0 | 1 | 0 | 0 | 0 |"));
+    assert!(output.contains(
+        "| replaced | 0 (0.0%) | 0 (0.0%) | 0 (0.0%) | 1 (100.0%) | 0 (0.0%) | 0 (0.0%) | 0 (0.0%) |"
+    ));
     assert!(!output.contains("- unparseable_changed:"));
 }
 
@@ -413,6 +417,62 @@ fn collect_samples_uses_one_representative_name_per_contract_address() {
     let report = collect_samples(config(db_path, input_path, output_path)).unwrap();
 
     assert!(report.seed_reports[0].name.matches.is_empty());
+}
+
+#[test]
+fn collect_samples_excludes_art_blocks_studio_name_candidates() {
+    let temp = tempdir().unwrap();
+    let db_path = temp.path().join("features.duckdb");
+    let input_path = temp.path().join("contracts.txt");
+    let output_path = temp.path().join("samples.md");
+
+    write_feature_db(
+        &db_path,
+        &[
+            TestRow::new("0xseed", "1")
+                .name("Art Blocks Studio: Official Drop")
+                .metadata_doc("seed metadata"),
+            TestRow::new("0xofficial", "1")
+                .name("Art Blocks Studio: Official Drop")
+                .metadata_doc("official metadata"),
+        ],
+    );
+    fs::write(&input_path, "0xseed\n").unwrap();
+
+    let mut sample_config = config(db_path, input_path, output_path);
+    sample_config.name_threshold = 100.0;
+    let report = collect_samples(sample_config).unwrap();
+
+    assert!(report.seed_reports[0].name.matches.is_empty());
+}
+
+#[test]
+fn collect_samples_excludes_art_blocks_studio_metadata_candidates() {
+    let temp = tempdir().unwrap();
+    let db_path = temp.path().join("features.duckdb");
+    let input_path = temp.path().join("contracts.txt");
+    let output_path = temp.path().join("samples.md");
+
+    write_feature_db(
+        &db_path,
+        &[
+            TestRow::new("0xseed", "1")
+                .name("Art Blocks")
+                .metadata_json(r#"{"description":"shared curated output","image":"ipfs://seed"}"#),
+            TestRow::new("0xofficial", "1")
+                .name("Art Blocks Studio: Curated Output")
+                .metadata_json(
+                    r#"{"description":"shared curated output","image":"ipfs://official"}"#,
+                ),
+        ],
+    );
+    fs::write(&input_path, "0xseed\n").unwrap();
+
+    let mut sample_config = config(db_path, input_path, output_path);
+    sample_config.metadata_threshold = 0.1;
+    let report = collect_samples(sample_config).unwrap();
+
+    assert!(report.seed_reports[0].metadata.matches.is_empty());
 }
 
 #[test]

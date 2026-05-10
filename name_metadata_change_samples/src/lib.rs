@@ -66,6 +66,7 @@ static DERIVATIVE_SUFFIX_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
 
 const METADATA_BM25_K1: f64 = 1.2;
 const METADATA_BM25_B: f64 = 0.75;
+const ART_BLOCKS_STUDIO_NAME_PREFIX: &str = "art blocks studio";
 const MAX_METADATA_BYTES_FOR_DEDUP: usize = 64 * 1024;
 const MAX_OVERLAPPING_METADATA_ROWS_PER_CONTRACT: usize = 1;
 const SAMPLE_PROGRESS_STAGE_COUNT: usize = 14;
@@ -197,6 +198,7 @@ struct MetadataCandidate {
 struct TextIndex {
     names: Vec<NameCandidate>,
     name_indices_by_normalized: Vec<NormalizedNameEntry>,
+    official_contract_addresses: BTreeSet<String>,
     metadata: Vec<MetadataCandidate>,
     metadata_token_ids: HashMap<String, TokenId>,
     metadata_corpus: MetadataCorpus,
@@ -529,6 +531,7 @@ fn read_seed_rows(
 fn load_text_index(conn: &Connection, chain: &str) -> Result<TextIndex, duckdb::Error> {
     let names = load_name_index(conn, chain)?;
     let name_indices_by_normalized = build_name_indices_by_normalized(&names);
+    let official_contract_addresses = build_official_contract_addresses(&names);
     let mut metadata_token_interner = TokenInterner::default();
     let mut metadata = load_metadata_index(conn, chain, &mut metadata_token_interner)?;
     let metadata_token_ids = metadata_token_interner.into_ids();
@@ -541,6 +544,7 @@ fn load_text_index(conn: &Connection, chain: &str) -> Result<TextIndex, duckdb::
     Ok(TextIndex {
         names,
         name_indices_by_normalized,
+        official_contract_addresses,
         metadata,
         metadata_token_ids,
         metadata_corpus,
@@ -548,6 +552,14 @@ fn load_text_index(conn: &Connection, chain: &str) -> Result<TextIndex, duckdb::
         metadata_source_index,
         metadata_corpus_exclusions_by_contract,
     })
+}
+
+fn build_official_contract_addresses(names: &[NameCandidate]) -> BTreeSet<String> {
+    names
+        .iter()
+        .filter(|candidate| is_official_contract_name(&candidate.display_name))
+        .map(|candidate| candidate.contract_address.clone())
+        .collect()
 }
 
 fn load_name_index(conn: &Connection, chain: &str) -> Result<Vec<NameCandidate>, duckdb::Error> {
@@ -901,7 +913,13 @@ fn match_names(
                         .candidate_indices
                         .iter()
                         .copied()
-                        .filter(|index| text_index.names[*index].contract_address != seed_contract)
+                        .filter(|index| {
+                            !is_excluded_candidate_contract(
+                                text_index,
+                                &text_index.names[*index].contract_address,
+                                &seed_contract,
+                            )
+                        })
                         .collect::<Vec<_>>(),
                 )
             })
@@ -929,11 +947,28 @@ fn exact_name_candidate_indices(
                     .candidate_indices
                     .iter()
                     .copied()
-                    .filter(|index| text_index.names[*index].contract_address != seed_contract),
+                    .filter(|index| {
+                        !is_excluded_candidate_contract(
+                            text_index,
+                            &text_index.names[*index].contract_address,
+                            seed_contract,
+                        )
+                    }),
             );
         }
     }
     indices
+}
+
+fn is_excluded_candidate_contract(
+    text_index: &TextIndex,
+    candidate_contract: &str,
+    seed_contract: &str,
+) -> bool {
+    candidate_contract == seed_contract
+        || text_index
+            .official_contract_addresses
+            .contains(candidate_contract)
 }
 
 fn seed_metadata_prefilter_text(seed_rows: &[NftTextRow]) -> Option<String> {
@@ -977,21 +1012,17 @@ fn match_metadata(
         return Ok(Vec::new());
     };
     let seed_contract = seed_contract.to_lowercase();
-    let corpus_exclusion = text_index
-        .metadata_corpus_exclusions_by_contract
-        .get(&seed_contract);
-    let corpus = if let Some(exclusion) = corpus_exclusion {
-        MetadataCorpusView::from_exclusion(&text_index.metadata_corpus, Some(exclusion))
+    let corpus = if text_index.official_contract_addresses.is_empty() {
+        let corpus_exclusion = text_index
+            .metadata_corpus_exclusions_by_contract
+            .get(&seed_contract);
+        MetadataCorpusView::from_exclusion(&text_index.metadata_corpus, corpus_exclusion)
     } else {
-        let excluded_indices = text_index
-            .metadata_indices_by_contract
-            .get(&seed_contract)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
+        let excluded_indices = metadata_corpus_excluded_indices(text_index, &seed_contract);
         MetadataCorpusView::new(
             &text_index.metadata_corpus,
             &text_index.metadata,
-            excluded_indices,
+            &excluded_indices,
         )
     };
     if corpus.total_docs == 0 {
@@ -1108,6 +1139,21 @@ fn match_metadata(
     Ok(matches)
 }
 
+fn metadata_corpus_excluded_indices(text_index: &TextIndex, seed_contract: &str) -> Vec<usize> {
+    let mut excluded_indices = Vec::new();
+    if let Some(indices) = text_index.metadata_indices_by_contract.get(seed_contract) {
+        excluded_indices.extend(indices.iter().copied());
+    }
+    for contract in &text_index.official_contract_addresses {
+        if let Some(indices) = text_index.metadata_indices_by_contract.get(contract) {
+            excluded_indices.extend(indices.iter().copied());
+        }
+    }
+    excluded_indices.sort_unstable();
+    excluded_indices.dedup();
+    excluded_indices
+}
+
 fn metadata_prefilter_score_candidate_indices(
     seed_query: &PreparedMetadataQuery<'_>,
     metadata: &[MetadataCandidate],
@@ -1180,6 +1226,12 @@ fn collect_metadata_source_candidates_full_scan(
             || (0usize, Vec::new()),
             |mut output, (index, candidate)| {
                 if candidate.contract_address == seed_contract {
+                    return output;
+                }
+                if text_index
+                    .official_contract_addresses
+                    .contains(&candidate.contract_address)
+                {
                     return output;
                 }
                 output.0 += 1;
@@ -1313,7 +1365,7 @@ fn push_metadata_source_candidate(
     }
     scratch.metadata_seen_epochs[index] = epoch;
     let candidate = &text_index.metadata[index];
-    if candidate.contract_address == seed_contract {
+    if is_excluded_candidate_contract(text_index, &candidate.contract_address, seed_contract) {
         return;
     }
     scratch.metadata_verify_count += 1;
@@ -1603,6 +1655,13 @@ fn take_recall_limit(values: BTreeSet<String>, limit: usize) -> Vec<String> {
     } else {
         iter.collect()
     }
+}
+
+fn is_official_contract_name(name: &str) -> bool {
+    normalize_nfkc(name)
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with(ART_BLOCKS_STUDIO_NAME_PREFIX)
 }
 
 fn normalize_nfkc(raw: &str) -> String {
@@ -1957,7 +2016,7 @@ impl<'a> MetadataCorpusView<'a> {
     fn new(
         base: &'a MetadataCorpus,
         documents: &'a [MetadataCandidate],
-        excluded_indices: &'a [usize],
+        excluded_indices: &[usize],
     ) -> Self {
         let mut excluded_doc_freqs = HashMap::new();
         let mut excluded_terms = 0usize;
@@ -2982,14 +3041,24 @@ fn push_metadata_matrix_summary<'a>(
         }
     }
 
-    out.push_str(&format!("- total matches: {total}\n"));
-    out.push_str(&format!("- content-bearing changes: {content_total}\n"));
     out.push_str(&format!(
-        "- non-content-bearing changes: {non_content_total}\n"
+        "- total matches: {}\n",
+        count_with_total_ratio(total, total)
+    ));
+    out.push_str(&format!(
+        "- content-bearing changes: {}\n",
+        count_with_total_ratio(content_total, total)
+    ));
+    out.push_str(&format!(
+        "- non-content-bearing changes: {}\n",
+        count_with_total_ratio(non_content_total, total)
     ));
     for label in ["exact_match", "metadata_unchanged", "unparseable_changed"] {
         if let Some(count) = residual_counts.get(label) {
-            out.push_str(&format!("- {label}: {count}\n"));
+            out.push_str(&format!(
+                "- {label}: {}\n",
+                count_with_total_ratio(*count, total)
+            ));
         }
     }
 
@@ -3007,7 +3076,7 @@ fn push_metadata_matrix_summary<'a>(
     out.push_str("| total |");
     for region in METADATA_REGIONS {
         let count = region_totals.get(region).copied().unwrap_or(0);
-        out.push_str(&format!(" {count} |"));
+        out.push_str(&format!(" {} |", count_with_total_ratio(count, total)));
     }
     out.push('\n');
     for operation in METADATA_OPERATIONS {
@@ -3017,7 +3086,7 @@ fn push_metadata_matrix_summary<'a>(
                 .get(&(operation.to_string(), region.to_string()))
                 .copied()
                 .unwrap_or(0);
-            out.push_str(&format!(" {count} |"));
+            out.push_str(&format!(" {} |", count_with_total_ratio(count, total)));
         }
         out.push('\n');
     }
@@ -3042,6 +3111,15 @@ fn push_counts_with_ratios(out: &mut String, summary: (usize, BTreeMap<String, u
         };
         out.push_str(&format!("- {label}: {count} ({ratio:.1}%)\n"));
     }
+}
+
+fn count_with_total_ratio(count: usize, total: usize) -> String {
+    let ratio = if total > 0 {
+        count as f64 * 100.0 / total as f64
+    } else {
+        0.0
+    };
+    format!("{count} ({ratio:.1}%)")
 }
 
 fn labeled_matches_for_report(
@@ -3753,7 +3831,9 @@ mod tests {
         assert!(output.contains("- other: 1 (50.0%)"));
         assert!(output.contains("- total matches: 1"));
         assert!(output.contains("#### Metadata Change Matrix"));
-        assert!(output.contains("| replaced | 0 | 0 | 0 | 1 | 0 | 0 | 0 |"));
+        assert!(output.contains(
+            "| replaced | 0 (0.0%) | 0 (0.0%) | 0 (0.0%) | 1 (100.0%) | 0 (0.0%) | 0 (0.0%) | 0 (0.0%) |"
+        ));
         assert!(!output.contains("- asset_pointer_reuse:"));
         assert!(!output.contains("- trait_schema_reuse:"));
         assert!(!output.contains("1/2"));
@@ -4198,12 +4278,18 @@ mod tests {
 
         assert!(output.contains("#### Metadata Change Matrix"));
         assert!(output.contains("| operation | title | description | attributes | references | auxiliary_fields | platform_fields | structure |"));
-        assert!(output.contains("| total | 1 | 0 | 0 | 1 | 0 | 1 | 0 |"));
-        assert!(output.contains("| removed | 1 | 0 | 0 | 0 | 0 | 0 | 0 |"));
-        assert!(output.contains("| replaced | 1 | 0 | 0 | 1 | 0 | 1 | 0 |"));
-        assert!(output.contains("- content-bearing changes: 1"));
-        assert!(output.contains("- non-content-bearing changes: 1"));
-        assert!(output.contains("- exact_match: 1"));
+        assert!(output.contains(
+            "| total | 1 (50.0%) | 0 (0.0%) | 0 (0.0%) | 1 (50.0%) | 0 (0.0%) | 1 (50.0%) | 0 (0.0%) |"
+        ));
+        assert!(output.contains(
+            "| removed | 1 (50.0%) | 0 (0.0%) | 0 (0.0%) | 0 (0.0%) | 0 (0.0%) | 0 (0.0%) | 0 (0.0%) |"
+        ));
+        assert!(output.contains(
+            "| replaced | 1 (50.0%) | 0 (0.0%) | 0 (0.0%) | 1 (50.0%) | 0 (0.0%) | 1 (50.0%) | 0 (0.0%) |"
+        ));
+        assert!(output.contains("- content-bearing changes: 1 (50.0%)"));
+        assert!(output.contains("- non-content-bearing changes: 1 (50.0%)"));
+        assert!(output.contains("- exact_match: 1 (50.0%)"));
     }
 
     #[test]
