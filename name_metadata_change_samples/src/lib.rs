@@ -41,13 +41,13 @@ static TRAILING_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
         Regex::new(r"\s*\(\s*\d+\s*\)\s*$").unwrap(),
         Regex::new(r"\s*\[\s*\d+\s*\]\s*$").unwrap(),
         Regex::new(r"\s*/\s*\d+\s*$").unwrap(),
-        Regex::new(r"\s+No\.?\s*\d+\s*$").unwrap(),
-        Regex::new(r"\s+nr\.?\s*\d+\s*$").unwrap(),
+        Regex::new(r"(?i)\s+No\.?\s*\d+\s*$").unwrap(),
+        Regex::new(r"(?i)\s+nr\.?\s*\d+\s*$").unwrap(),
         Regex::new(r"\s+\d{1,12}\s*$").unwrap(),
         Regex::new(r"\s*(?:404|420|777|888|999)\s*$").unwrap(),
-        Regex::new(r"\s*(?:v|version)\s*\d+\s*$").unwrap(),
+        Regex::new(r"(?i)(?:\s|[-_.])*(?:v|version)\s*\d+\s*$").unwrap(),
         Regex::new(r"\s*\d+\.0\s*$").unwrap(),
-        Regex::new(r"\s*(?:gen|generation)\s*\d+\s*$").unwrap(),
+        Regex::new(r"(?i)(?:\s|[-_.])*(?:gen|generation)\s*\d+\s*$").unwrap(),
     ]
 });
 static ATTACHED_TRAILING_NUMBER_RE: Lazy<Regex> =
@@ -56,7 +56,12 @@ static WHITESPACE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
 static TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\p{L}\p{N}_]+").unwrap());
 static DERIVATIVE_SUFFIX_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
-        Regex::new(r"(?i)(?:\.fun|x)\s*$").unwrap(),
+        Regex::new(r"(?i)\.fun\s*$").unwrap(),
+        Regex::new(r"(?i)(?:\s|[-_.])?(?:2d|3d|vx|x)\s*$").unwrap(),
+        Regex::new(r"(?i)(?:\s|[-_.])?(?:ai|xr|gif|fc|id|art)\s*$").unwrap(),
+        Regex::new(r"(?i)(?:\s|[-_.])?(?:1st|2nd|3rd|\d+th)\s*$").unwrap(),
+        Regex::new(r"(?i)(?:\s|[-_.])?\(\s*test\s*\)\s*$").unwrap(),
+        Regex::new(r"(?i)(?:\s|[-_.])(?:viii|vii|vi|iv|iii|ii|ix|i|v|x)\s*$").unwrap(),
         Regex::new(
             r"(?i)(?:\s|[-_.])(?:official|nft|club|dao|pass|mint|claim|free|vip|collection|edition|clone|copy|reloaded|remastered|alpha|beta)\s*$",
         )
@@ -2329,14 +2334,32 @@ fn classify_name_modifications(seed: &str, value: &str) -> Vec<String> {
     if suffix_augmented {
         labels.push("suffix_augmentation");
     }
-    if has_name_format_perturbation(seed_trimmed, value_trimmed) {
+    let value_augmentation_core = if suffix_augmented {
+        Some(strip_raw_augmentation_suffix_matching_seed(
+            seed_trimmed,
+            value_trimmed,
+        ))
+    } else {
+        None
+    };
+    if has_name_format_perturbation(seed_trimmed, value_trimmed)
+        || value_augmentation_core
+            .as_deref()
+            .is_some_and(|core| has_name_format_perturbation(seed_trimmed, core))
+    {
         labels.push("format_perturbation");
     }
-    let seed_lexical_raw = strip_raw_trailing_number_suffix(seed_trimmed);
-    let value_lexical_raw = if suffix_augmented {
-        strip_raw_augmentation_suffix(value_trimmed)
+    let seed_lexical_raw = if suffix_augmented {
+        strip_raw_trailing_number_suffix(seed_trimmed)
     } else {
-        strip_raw_trailing_number_suffix(value_trimmed)
+        seed_trimmed.to_string()
+    };
+    let value_lexical_raw = if suffix_augmented {
+        value_augmentation_core.unwrap_or_else(|| {
+            strip_raw_augmentation_suffix_matching_seed(seed_trimmed, value_trimmed)
+        })
+    } else {
+        value_trimmed.to_string()
     };
     let seed_lexical_core = canonical_format_name(&seed_lexical_raw);
     let value_lexical_core = canonical_format_name(&value_lexical_raw);
@@ -2782,8 +2805,10 @@ fn has_derivative_suffix(value: &str) -> bool {
 
 fn has_suffix_augmentation(seed: &str, value: &str, seed_norm: &str, value_norm: &str) -> bool {
     if has_derivative_suffix(value) {
-        let stripped_value = strip_raw_augmentation_suffix(value);
-        return canonical_format_name(seed) == canonical_format_name(&stripped_value);
+        let seed_canonical = canonical_format_name(seed);
+        return raw_augmentation_suffix_candidates(value)
+            .iter()
+            .any(|candidate| seed_canonical == canonical_format_name(candidate));
     }
 
     let seed_has_numeric_suffix = has_trailing_number_suffix(seed);
@@ -2829,10 +2854,7 @@ fn is_name_format_separator(ch: char) -> bool {
 }
 
 fn has_name_format_perturbation(seed: &str, value: &str) -> bool {
-    let seed_core = strip_raw_trailing_number_suffix(seed);
-    let value_core = strip_raw_trailing_number_suffix(value);
-    seed_core != value_core
-        && canonical_format_name(&seed_core) == canonical_format_name(&value_core)
+    seed.trim() != value.trim() && canonical_format_name(seed) == canonical_format_name(value)
 }
 
 fn strip_raw_trailing_number_suffix(raw: &str) -> String {
@@ -2865,13 +2887,33 @@ fn strip_raw_trailing_number_suffix(raw: &str) -> String {
 }
 
 fn strip_raw_augmentation_suffix(raw: &str) -> String {
+    raw_augmentation_suffix_candidates(raw)
+        .last()
+        .cloned()
+        .unwrap_or_else(|| strip_raw_trailing_number_suffix(raw))
+}
+
+fn strip_raw_augmentation_suffix_matching_seed(seed: &str, raw: &str) -> String {
+    let seed_canonical = canonical_format_name(seed);
+    raw_augmentation_suffix_candidates(raw)
+        .into_iter()
+        .find(|candidate| canonical_format_name(candidate) == seed_canonical)
+        .unwrap_or_else(|| strip_raw_augmentation_suffix(raw))
+}
+
+fn raw_augmentation_suffix_candidates(raw: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
     let mut text = strip_raw_trailing_number_suffix(raw);
+    if text != raw.trim() {
+        candidates.push(text.clone());
+    }
     loop {
         let mut changed = false;
         for pattern in DERIVATIVE_SUFFIX_PATTERNS.iter() {
             let updated = pattern.replace(&text, "").trim().to_string();
             if updated != text {
                 text = updated;
+                candidates.push(text.clone());
                 changed = true;
                 break;
             }
@@ -2880,7 +2922,7 @@ fn strip_raw_augmentation_suffix(raw: &str) -> String {
             break;
         }
     }
-    text
+    candidates
 }
 
 fn has_name_lexical_mutation(seed_norm: &str, value_norm: &str) -> bool {
@@ -3901,6 +3943,151 @@ mod tests {
         assert_eq!(
             classify_name_modifications("Azuki", "Azuki Official"),
             vec!["suffix_augmentation"]
+        );
+    }
+
+    #[test]
+    fn name_3d_suffix_preserves_seed_terminal_words() {
+        assert!(has_derivative_suffix("Mutant Ape Yacht Club 3D"));
+        assert_eq!(
+            strip_raw_augmentation_suffix_matching_seed(
+                "MutantApeYachtClub",
+                "Mutant Ape Yacht Club 3D"
+            ),
+            "Mutant Ape Yacht Club"
+        );
+        assert_eq!(
+            classify_name_modifications("MutantApeYachtClub", "Mutant Ape Yacht Club 3D"),
+            vec!["suffix_augmentation", "format_perturbation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Camels", "Camels3D"),
+            vec!["suffix_augmentation"]
+        );
+    }
+
+    #[test]
+    fn name_derivative_tail_tokens_are_suffixes_only_when_seed_core_is_preserved() {
+        assert_eq!(
+            classify_name_modifications("Mutant Hounds", "Mutant Hounds AI"),
+            vec!["suffix_augmentation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Checks", "ChecksAI"),
+            vec!["suffix_augmentation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Elemental", "ElementalArt"),
+            vec!["suffix_augmentation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Nakamigos", "NakamigosGif"),
+            vec!["suffix_augmentation"]
+        );
+        assert_eq!(
+            classify_name_modifications("parallel", "ParallelID"),
+            vec!["suffix_augmentation", "format_perturbation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Cool Cats", "Cool Cats FC"),
+            vec!["suffix_augmentation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Saint of LA | ETERNAL", "Saint of LA | ETERNAL (TEST)"),
+            vec!["suffix_augmentation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Chain Runners", "Chain Runners XR"),
+            vec!["suffix_augmentation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Planets", "planetsid"),
+            vec!["suffix_augmentation", "format_perturbation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Average Creatures", "Average Creatures II"),
+            vec!["suffix_augmentation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Metamorphosis", "Metamorphosis I"),
+            vec!["suffix_augmentation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Moonrunners", "Moonrunners 2D"),
+            vec!["suffix_augmentation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Wanderers", "Wanderers2nd"),
+            vec!["suffix_augmentation"]
+        );
+        assert_eq!(
+            classify_name_modifications("SupDucks", "SupDucksVX"),
+            vec!["suffix_augmentation"]
+        );
+        assert_eq!(
+            classify_name_modifications("CyberKongz", "CyberKongz VX"),
+            vec!["suffix_augmentation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Kitaro World", "Kitaro World V2"),
+            vec!["suffix_augmentation"]
+        );
+        assert_eq!(
+            classify_name_modifications("KILLABEARS", "KILLABEARS-V43"),
+            vec!["suffix_augmentation"]
+        );
+        assert_eq!(
+            classify_name_modifications("SHRIMPERS", "Shrimpers V2"),
+            vec!["suffix_augmentation", "format_perturbation"]
+        );
+        assert_eq!(
+            classify_name_modifications("VeeFriends", "VeeFriendsV2"),
+            vec!["suffix_augmentation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Critters Quest Blind Box", "Critters Quest Blind Box x12"),
+            vec!["suffix_augmentation"]
+        );
+        assert_eq!(
+            classify_name_modifications("MidnightBreeze", "MidnightBreezeV2"),
+            vec!["suffix_augmentation"]
+        );
+        assert_eq!(
+            strip_raw_trailing_number_suffix("Bored Ape Yacht Club 2.0"),
+            "Bored Ape Yacht Club"
+        );
+        assert_eq!(
+            classify_name_modifications("BoredApeYachtClub", "Bored Ape Yacht Club 2.0"),
+            vec!["suffix_augmentation", "format_perturbation"]
+        );
+        assert_eq!(
+            classify_name_modifications("CloneX", "CLONEX404"),
+            vec!["suffix_augmentation", "format_perturbation"]
+        );
+
+        assert_eq!(
+            classify_name_modifications("BoredApeYachtClub", "BoredAIYachtClub"),
+            vec!["lexical_mutation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Nakamigos", "NakamAIgos"),
+            vec!["lexical_mutation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Elemental", "ElementalsAI"),
+            vec!["lexical_mutation"]
+        );
+    }
+
+    #[test]
+    fn name_format_perturbation_does_not_hide_seed_version_words() {
+        assert_eq!(
+            classify_name_modifications("CryptoDickbutts S3", "CryptoDickbuttss"),
+            vec!["lexical_mutation"]
+        );
+        assert_eq!(
+            classify_name_modifications("CyberKongz", "Cyberkongz 404"),
+            vec!["suffix_augmentation", "format_perturbation"]
         );
     }
 
