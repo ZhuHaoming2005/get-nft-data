@@ -311,7 +311,8 @@ pub struct ReportSummary {
     pub implausible_candidate_contract_count: i64,
     pub infringing_nft_count: i64,
     pub malicious_address_count: i64,
-    pub honest_address_count: i64,
+    #[serde(alias = "honest_address_count")]
+    pub neutral_address_count: i64,
     pub repeat_infringing_address_count: i64,
     pub legit_duplicate_contract_count: i64,
     pub candidate_open_license_token_count: i64,
@@ -349,13 +350,18 @@ pub struct ReportSummary {
     pub ratio_over_60_address_ratio: Option<f64>,
     pub ratio_over_80_address_count: i64,
     pub ratio_over_80_address_ratio: Option<f64>,
-    pub stuck_honest_address_count: i64,
-    pub stuck_honest_address_ratio: Option<f64>,
-    pub corrupted_honest_address_count: i64,
+    #[serde(alias = "stuck_honest_address_count")]
+    pub stuck_victim_address_count: i64,
+    #[serde(alias = "stuck_honest_address_ratio")]
+    pub stuck_victim_address_ratio: Option<f64>,
+    #[serde(alias = "corrupted_honest_address_count")]
+    pub corrupted_victim_address_count: i64,
     pub avg_corrupted_address_holding_seconds: Option<f64>,
     pub median_corrupted_address_holding_seconds: Option<f64>,
-    pub avg_seconds_to_honest_holder: Option<f64>,
-    pub median_seconds_to_honest_holder: Option<f64>,
+    #[serde(alias = "avg_seconds_to_honest_holder")]
+    pub avg_seconds_to_neutral_holder: Option<f64>,
+    #[serde(alias = "median_seconds_to_honest_holder")]
+    pub median_seconds_to_neutral_holder: Option<f64>,
     pub avg_mint_to_first_transfer_seconds: Option<f64>,
     pub median_mint_to_first_transfer_seconds: Option<f64>,
     pub avg_unique_receiver_count: Option<f64>,
@@ -417,12 +423,25 @@ pub struct VictimSignalPayload {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct HonestAddressStatsPayload {
+    #[serde(rename = "neutral_address_count", alias = "honest_address_count")]
     pub honest_address_count: i64,
+    #[serde(
+        rename = "corrupted_victim_address_count",
+        alias = "corrupted_address_count"
+    )]
     pub corrupted_address_count: i64,
     pub victim_resale_count: i64,
     pub median_holding_seconds: Option<f64>,
+    #[serde(
+        rename = "avg_seconds_to_neutral_holder",
+        alias = "avg_seconds_to_honest_holder"
+    )]
     pub avg_seconds_to_honest_holder: Option<f64>,
-    #[serde(default)]
+    #[serde(
+        default,
+        rename = "corrupted_victim_addresses",
+        alias = "corrupted_addresses"
+    )]
     pub corrupted_addresses: Vec<String>,
 }
 
@@ -434,8 +453,13 @@ pub struct HonestAddressPayload {
     pub currently_holding_token_count: i64,
     pub hold_duration_median_seconds: Option<f64>,
     pub hold_duration_count: i64,
+    #[serde(rename = "is_corrupted_victim", alias = "is_corrupted_address")]
     pub is_corrupted_address: bool,
     pub victim_resale_count: i64,
+    #[serde(
+        rename = "mint_to_neutral_holder_seconds_samples",
+        alias = "mint_to_honest_seconds_samples"
+    )]
     pub mint_to_honest_seconds_samples: Vec<i64>,
 }
 
@@ -920,7 +944,9 @@ pub struct SingleReportPayload {
     pub victim_signals: BTreeMap<String, VictimSignalPayload>,
     pub infringing_tokens: Vec<InfringingTokenRecord>,
     pub malicious_addresses: Vec<MaliciousAddressPayload>,
+    #[serde(rename = "neutral_addresses", alias = "honest_addresses")]
     pub honest_addresses: Vec<HonestAddressPayload>,
+    #[serde(rename = "neutral_address_stats", alias = "honest_address_stats")]
     pub honest_address_stats: BTreeMap<String, HonestAddressStatsPayload>,
     pub secondary_sale_victim_addresses: Vec<SecondarySaleVictimAddressPayload>,
     pub victim_acquisition_addresses: Vec<VictimAcquisitionAddressPayload>,
@@ -960,7 +986,8 @@ pub struct BatchReportSummary {
     pub implausible_candidate_contract_count_total: i64,
     pub infringing_nft_count_total: i64,
     pub malicious_address_count_total: i64,
-    pub honest_address_count_total: i64,
+    #[serde(alias = "honest_address_count_total")]
+    pub neutral_address_count_total: i64,
     pub repeat_infringing_address_count_total: i64,
     pub repeat_infringing_address_count_global: i64,
     pub legit_duplicate_contract_count_total: i64,
@@ -997,13 +1024,18 @@ pub struct BatchReportSummary {
     pub ratio_over_60_address_ratio_overall: Option<f64>,
     pub ratio_over_80_address_count_total: i64,
     pub ratio_over_80_address_ratio_overall: Option<f64>,
-    pub stuck_honest_address_count_total: i64,
-    pub stuck_honest_address_ratio_overall: Option<f64>,
-    pub corrupted_honest_address_count_total: i64,
+    #[serde(alias = "stuck_honest_address_count_total")]
+    pub stuck_victim_address_count_total: i64,
+    #[serde(alias = "stuck_honest_address_ratio_overall")]
+    pub stuck_victim_address_ratio_overall: Option<f64>,
+    #[serde(alias = "corrupted_honest_address_count_total")]
+    pub corrupted_victim_address_count_total: i64,
     pub avg_corrupted_address_holding_seconds_mean: Option<f64>,
     pub median_corrupted_address_holding_seconds_median: Option<f64>,
-    pub avg_seconds_to_honest_holder_mean: Option<f64>,
-    pub median_seconds_to_honest_holder_median: Option<f64>,
+    #[serde(alias = "avg_seconds_to_honest_holder_mean")]
+    pub avg_seconds_to_neutral_holder_mean: Option<f64>,
+    #[serde(alias = "median_seconds_to_honest_holder_median")]
+    pub median_seconds_to_neutral_holder_median: Option<f64>,
     pub avg_mint_to_first_transfer_seconds_mean: Option<f64>,
     pub median_mint_to_first_transfer_seconds_median: Option<f64>,
     pub avg_unique_receiver_count_mean: Option<f64>,

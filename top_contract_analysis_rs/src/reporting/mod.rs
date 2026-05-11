@@ -152,8 +152,9 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
             summary.implausible_candidate_contract_count
         ),
         format!("- 疑似侵权 NFT 总数: {}", summary.infringing_nft_count),
-        format!("- 恶意地址数: {}", summary.malicious_address_count),
-        format!("- 诚实地址数: {}", summary.honest_address_count),
+        format!("- 疑似操作者地址数: {}", summary.malicious_address_count),
+        format!("- 中性地址数: {}", summary.neutral_address_count),
+        format!("- 受害者数: {}", summary.victim_acquisition_address_count),
         format!(
             "- 多次侵权地址数: {}",
             summary.repeat_infringing_address_count
@@ -207,43 +208,43 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
             summary.value_flow_priced_edge_count, summary.value_flow_unpriced_edge_count
         ),
         format!(
-            "- 可计算买入占比的诚实地址数: {}",
+            "- 可计算买入占比的二级市场受害者数: {}",
             summary.buy_asset_ratio_known_address_count
         ),
         format!(
-            "- 买入金额占钱包总额 >60% 的地址数/占比: {} / {}",
+            "- 买入金额占钱包总额 >60% 的受害者数/占比: {} / {}",
             summary.ratio_over_60_address_count,
             format_ratio(summary.ratio_over_60_address_ratio)
         ),
         format!(
-            "- 买入金额占钱包总额 >80% 的地址数/占比: {} / {}",
+            "- 买入金额占钱包总额 >80% 的受害者数/占比: {} / {}",
             summary.ratio_over_80_address_count,
             format_ratio(summary.ratio_over_80_address_ratio)
         ),
         format!(
-            "- 购买后无法再次售出的诚实节点数/占比: {} / {}",
-            summary.stuck_honest_address_count,
-            format_ratio(summary.stuck_honest_address_ratio)
+            "- 二级市场套牢受害者数/占比: {} / {}",
+            summary.stuck_victim_address_count,
+            format_ratio(summary.stuck_victim_address_ratio)
         ),
         format!(
-            "- 被腐化的地址数: {}",
-            summary.corrupted_honest_address_count
+            "- 被腐化受害者数: {}",
+            summary.corrupted_victim_address_count
         ),
         format!(
-            "- 被腐化地址持有时长平均数: {} 秒",
+            "- 被腐化受害者持有时长平均数: {} 秒",
             format_scalar(summary.avg_corrupted_address_holding_seconds)
         ),
         format!(
-            "- 被腐化地址持有时长中位数: {} 秒",
+            "- 被腐化受害者持有时长中位数: {} 秒",
             format_scalar(summary.median_corrupted_address_holding_seconds)
         ),
         format!(
-            "- Mint 到被诚实节点购买平均时间: {} 秒",
-            format_scalar(summary.avg_seconds_to_honest_holder)
+            "- Mint 到中性地址接收平均时间: {} 秒",
+            format_scalar(summary.avg_seconds_to_neutral_holder)
         ),
         format!(
             "- 传播时间中位数: {} 秒",
-            format_scalar(summary.median_seconds_to_honest_holder)
+            format_scalar(summary.median_seconds_to_neutral_holder)
         ),
         format!(
             "- Mint 到首次转手平均时间: {} 秒",
@@ -345,7 +346,7 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
         format!("- 唯一买家计数合计: {}", total_unique_buyers),
         format!(
             "- 二级市场套牢钱包数: {}",
-            summary.stuck_honest_address_count
+            summary.stuck_victim_address_count
         ),
         format!(
             "- 二级市场套牢资金(USD): {}",
@@ -394,8 +395,15 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
             "- 疑似侵权 NFT 总数: {}",
             summary.infringing_nft_count_total
         ),
-        format!("- 恶意地址总数: {}", summary.malicious_address_count_total),
-        format!("- 诚实地址总数: {}", summary.honest_address_count_total),
+        format!(
+            "- 疑似操作者地址总数: {}",
+            summary.malicious_address_count_total
+        ),
+        format!("- 中性地址总数: {}", summary.neutral_address_count_total),
+        format!(
+            "- 受害者总数: {}",
+            summary.victim_acquisition_address_count_total
+        ),
         format!(
             "- 多次侵权地址总数(按 seed 求和): {}",
             summary.repeat_infringing_address_count_total
@@ -431,43 +439,43 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
             summary.stablecoin_erc20_value_usd_total, summary.stablecoin_erc20_edge_count_total
         ),
         format!(
-            "- 可计算买入占比的诚实地址总数: {}",
+            "- 可计算买入占比的二级市场受害者总数: {}",
             summary.buy_asset_ratio_known_address_count_total
         ),
         format!(
-            "- 买入金额占钱包总额 >60% 的地址数/总体占比: {} / {}",
+            "- 买入金额占钱包总额 >60% 的受害者数/总体占比: {} / {}",
             summary.ratio_over_60_address_count_total,
             format_ratio(summary.ratio_over_60_address_ratio_overall)
         ),
         format!(
-            "- 买入金额占钱包总额 >80% 的地址数/总体占比: {} / {}",
+            "- 买入金额占钱包总额 >80% 的受害者数/总体占比: {} / {}",
             summary.ratio_over_80_address_count_total,
             format_ratio(summary.ratio_over_80_address_ratio_overall)
         ),
         format!(
-            "- 购买后无法再次售出的诚实节点数/总体占比: {} / {}",
-            summary.stuck_honest_address_count_total,
-            format_ratio(summary.stuck_honest_address_ratio_overall)
+            "- 二级市场套牢受害者数/总体占比: {} / {}",
+            summary.stuck_victim_address_count_total,
+            format_ratio(summary.stuck_victim_address_ratio_overall)
         ),
         format!(
-            "- 被腐化的诚实地址总数: {}",
-            summary.corrupted_honest_address_count_total
+            "- 被腐化受害者总数: {}",
+            summary.corrupted_victim_address_count_total
         ),
         format!(
-            "- 被腐化地址持有时长平均数(跨 seed 均值): {} 秒",
+            "- 被腐化受害者持有时长平均数(跨 seed 均值): {} 秒",
             format_scalar(summary.avg_corrupted_address_holding_seconds_mean)
         ),
         format!(
-            "- 被腐化地址持有时长中位数(跨 seed 中位数): {} 秒",
+            "- 被腐化受害者持有时长中位数(跨 seed 中位数): {} 秒",
             format_scalar(summary.median_corrupted_address_holding_seconds_median)
         ),
         format!(
-            "- Mint 到被诚实节点购买平均时间(跨 seed 均值): {} 秒",
-            format_scalar(summary.avg_seconds_to_honest_holder_mean)
+            "- Mint 到中性地址接收平均时间(跨 seed 均值): {} 秒",
+            format_scalar(summary.avg_seconds_to_neutral_holder_mean)
         ),
         format!(
             "- 传播时间中位数(跨 seed 中位数): {} 秒",
-            format_scalar(summary.median_seconds_to_honest_holder_median)
+            format_scalar(summary.median_seconds_to_neutral_holder_median)
         ),
         format!(
             "- Mint 到首次转手平均时间(跨 seed 均值): {} 秒",
@@ -504,13 +512,14 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
             };
 
             lines.push(format!(
-                "- {} ({}) | 重复合约={} | 侵权NFT={} | 恶意地址={} | 诚实地址={} | 多次侵权地址={} | 官方参与={} | 受害者获取成本(USD)={} | 二级成本(USD)={} | 付费mint(USD)={} | 总套牢(USD)={}/{} | >60%={}/{} | 套牢节点={}/{} | 被腐化={} | 诚实购买时长={}秒 | 传播中位数={}秒 | 首次转手中位数={}秒 | JSON={} | MD={}",
+                "- {} ({}) | 重复合约={} | 侵权NFT={} | 疑似操作者={} | 中性地址={} | 受害者={} | 多次侵权地址={} | 官方参与={} | 受害者获取成本(USD)={} | 二级成本(USD)={} | 付费mint(USD)={} | 总套牢(USD)={}/{} | >60%={}/{} | 套牢受害者={}/{} | 被腐化受害者={} | 中性接收时长={}秒 | 传播中位数={}秒 | 首次转手中位数={}秒 | JSON={} | MD={}",
                 seed_name,
                 seed.contract_address,
                 report_summary.candidate_contract_count,
                 report_summary.infringing_nft_count,
                 report_summary.malicious_address_count,
-                report_summary.honest_address_count,
+                report_summary.neutral_address_count,
+                report_summary.victim_acquisition_address_count,
                 report_summary.repeat_infringing_address_count,
                 report_summary.legit_duplicate_contract_count,
                 report_summary.victim_acquisition_total_usd,
@@ -520,11 +529,11 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
                 format_ratio(report_summary.victim_acquisition_stuck_cost_ratio),
                 report_summary.ratio_over_60_address_count,
                 format_ratio(report_summary.ratio_over_60_address_ratio),
-                report_summary.stuck_honest_address_count,
-                format_ratio(report_summary.stuck_honest_address_ratio),
-                report_summary.corrupted_honest_address_count,
-                format_scalar(report_summary.avg_seconds_to_honest_holder),
-                format_scalar(report_summary.median_seconds_to_honest_holder),
+                report_summary.stuck_victim_address_count,
+                format_ratio(report_summary.stuck_victim_address_ratio),
+                report_summary.corrupted_victim_address_count,
+                format_scalar(report_summary.avg_seconds_to_neutral_holder),
+                format_scalar(report_summary.median_seconds_to_neutral_holder),
                 format_scalar(report_summary.median_mint_to_first_transfer_seconds),
                 output_files.map(|files| files.json.as_str()).unwrap_or(""),
                 output_files

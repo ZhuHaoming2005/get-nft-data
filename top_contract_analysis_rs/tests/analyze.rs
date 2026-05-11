@@ -3140,9 +3140,21 @@ fn single_report_payload_serializes_current_python_top_level_shape() {
             contract_address: "0xdup".into(),
             address: "0xholder".into(),
             hold_duration_count: 2,
+            is_corrupted_address: true,
             mint_to_honest_seconds_samples: vec![15, 30],
             ..Default::default()
         }],
+        honest_address_stats: BTreeMap::from([(
+            "0xdup".into(),
+            HonestAddressStatsPayload {
+                honest_address_count: 1,
+                corrupted_address_count: 1,
+                victim_resale_count: 1,
+                avg_seconds_to_honest_holder: Some(22.0),
+                corrupted_addresses: vec!["0xholder".into()],
+                ..Default::default()
+            },
+        )]),
         fraud_trade_stats: BTreeMap::from([(
             "0xdup".into(),
             FraudTradeStatsPayload {
@@ -3170,8 +3182,8 @@ fn single_report_payload_serializes_current_python_top_level_shape() {
             "victim_signals",
             "infringing_tokens",
             "malicious_addresses",
-            "honest_addresses",
-            "honest_address_stats",
+            "neutral_addresses",
+            "neutral_address_stats",
             "secondary_sale_victim_addresses",
             "victim_acquisition_addresses",
             "address_evidence_features",
@@ -3199,11 +3211,33 @@ fn single_report_payload_serializes_current_python_top_level_shape() {
         "0xminter"
     );
     assert_eq!(serialized["malicious_addresses"][0]["address"], "0xsybil");
-    assert_eq!(serialized["honest_addresses"][0]["hold_duration_count"], 2);
+    assert_eq!(serialized["neutral_addresses"][0]["hold_duration_count"], 2);
     assert_eq!(
-        serialized["honest_addresses"][0]["mint_to_honest_seconds_samples"],
+        serialized["neutral_addresses"][0]["mint_to_neutral_holder_seconds_samples"],
         serde_json::json!([15, 30])
     );
+    assert_eq!(
+        serialized["neutral_addresses"][0]["is_corrupted_victim"],
+        true
+    );
+    assert_eq!(
+        serialized["neutral_address_stats"]["0xdup"]["neutral_address_count"],
+        1
+    );
+    assert_eq!(
+        serialized["neutral_address_stats"]["0xdup"]["corrupted_victim_address_count"],
+        1
+    );
+    assert_eq!(
+        serialized["neutral_address_stats"]["0xdup"]["avg_seconds_to_neutral_holder"],
+        22.0
+    );
+    assert_eq!(
+        serialized["neutral_address_stats"]["0xdup"]["corrupted_victim_addresses"],
+        serde_json::json!(["0xholder"])
+    );
+    assert!(serialized["honest_addresses"].is_null());
+    assert!(serialized["honest_address_stats"].is_null());
     assert_eq!(
         serialized["fraud_trade_stats"]["0xdup"]["native_eth_sale_count"],
         4
@@ -3238,7 +3272,7 @@ fn single_report_markdown_preserves_summary_sections_only() {
             candidate_contract_count: 9,
             infringing_nft_count: 11,
             malicious_address_count: 4,
-            honest_address_count: 5,
+            neutral_address_count: 5,
             repeat_infringing_address_count: 2,
             legit_duplicate_contract_count: 1,
             candidate_open_license_token_count: 6,
@@ -3258,11 +3292,11 @@ fn single_report_markdown_preserves_summary_sections_only() {
             ratio_over_60_address_ratio: Some(0.6),
             ratio_over_80_address_count: 1,
             ratio_over_80_address_ratio: Some(0.2),
-            stuck_honest_address_count: 2,
-            stuck_honest_address_ratio: Some(0.4),
-            corrupted_honest_address_count: 1,
-            avg_seconds_to_honest_holder: Some(12.5),
-            median_seconds_to_honest_holder: Some(10.0),
+            stuck_victim_address_count: 2,
+            stuck_victim_address_ratio: Some(0.4),
+            corrupted_victim_address_count: 1,
+            avg_seconds_to_neutral_holder: Some(12.5),
+            median_seconds_to_neutral_holder: Some(10.0),
             avg_mint_to_first_transfer_seconds: Some(8.0),
             median_mint_to_first_transfer_seconds: Some(7.0),
             avg_unique_receiver_count: Some(4.0),
@@ -3373,11 +3407,16 @@ fn single_report_markdown_preserves_summary_sections_only() {
     assert!(markdown.contains("- 合约部署者: 0xdeployer"));
     assert!(markdown.contains("## 摘要"));
     assert!(markdown.contains("- 检测到开放许可: 是"));
-    assert!(markdown.contains("- 恶意地址数: 4"));
+    assert!(markdown.contains("- 疑似操作者地址数: 4"));
+    assert!(markdown.contains("- 中性地址数: 5"));
+    assert!(markdown.contains("- 受害者数: 0"));
     assert!(markdown.contains("- 候选侧开放许可 token 数: 6"));
     assert!(markdown.contains("- 受害者套牢成本合计(USD): 6.5 / 65.00%"));
     assert!(markdown.contains("- 二级市场受害者成本(USD): 10 / addresses=0"));
-    assert!(markdown.contains("- 买入金额占钱包总额 >60% 的地址数/占比: 3 / 60.00%"));
+    assert!(markdown.contains("- 买入金额占钱包总额 >60% 的受害者数/占比: 3 / 60.00%"));
+    assert!(markdown.contains("- 二级市场套牢受害者数/占比: 2 / 40.00%"));
+    assert!(markdown.contains("- 被腐化受害者数: 1"));
+    assert!(markdown.contains("- Mint 到中性地址接收平均时间: 12.5 秒"));
     assert!(markdown.contains("## 种子集合统计"));
     assert!(markdown.contains("- 拉取到的种子 NFT 数: 10"));
     assert!(markdown.contains("## 合约分类摘要"));
@@ -3394,6 +3433,9 @@ fn single_report_markdown_preserves_summary_sections_only() {
     assert!(!markdown.contains("## 地址行为信号"));
     assert!(!markdown.contains("## 受害者信号"));
     assert!(!markdown.contains("## 诚实地址画像"));
+    assert!(!markdown.contains("诚实地址数"));
+    assert!(!markdown.contains("诚实节点"));
+    assert!(!markdown.contains("诚实购买"));
     assert!(!markdown.contains("## 被骗地址画像"));
     assert!(!markdown.contains("## 被骗交易与套牢资金"));
     assert!(!markdown.contains("0xhonest"));
@@ -4263,7 +4305,17 @@ async fn analyze_expands_matched_contracts_to_all_tokens_for_report_analysis() {
             .collect::<BTreeSet<_>>(),
         BTreeSet::from(["1", "2"])
     );
-    assert_eq!(payload.report_summary.honest_address_count, 2);
+    let neutral_address_count = payload
+        .address_attributions
+        .iter()
+        .filter(|item| item.attribution_label == "neutral_participant")
+        .map(|item| item.address.as_str())
+        .collect::<BTreeSet<_>>()
+        .len() as i64;
+    assert_eq!(
+        payload.report_summary.neutral_address_count,
+        neutral_address_count
+    );
     assert_eq!(
         payload
             .honest_addresses
@@ -4448,9 +4500,19 @@ async fn analyze_builds_address_profiles_and_trade_stats_for_duplicate_contracts
     );
     assert_eq!(payload.fraud_trade_stats["0xdup"].stuck_wallet_count, 0);
     assert_eq!(payload.report_summary.malicious_address_count, 1);
-    assert_eq!(payload.report_summary.honest_address_count, 2);
+    let neutral_address_count = payload
+        .address_attributions
+        .iter()
+        .filter(|item| item.attribution_label == "neutral_participant")
+        .map(|item| item.address.as_str())
+        .collect::<BTreeSet<_>>()
+        .len() as i64;
+    assert_eq!(
+        payload.report_summary.neutral_address_count,
+        neutral_address_count
+    );
     assert_eq!(payload.report_summary.secondary_sale_victim_cost_eth, 1.5);
-    assert_eq!(payload.report_summary.corrupted_honest_address_count, 0);
+    assert_eq!(payload.report_summary.corrupted_victim_address_count, 0);
 
     let propagation = &payload.nft_propagation_paths["0xdup"];
     assert_eq!(propagation.summary.token_count, 1);

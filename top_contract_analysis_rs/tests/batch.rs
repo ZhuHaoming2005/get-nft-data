@@ -10,11 +10,11 @@ use top_contract_analysis_rs::analysis::{
 };
 use top_contract_analysis_rs::error::AppError;
 use top_contract_analysis_rs::models::{
-    AddressSignalPayload, BatchReportSummary, BatchSeedReportPayload, BatchSummaryPayload,
-    ContractMetadata, DatabaseNftRecord, DatabaseSnapshot, EthTransferRecord, HonestAddressPayload,
-    InfringingTokenRecord, MaliciousAddressPayload, NftSaleRecord, OutputFilesPayload,
-    OwnerBalance, ReportSummary, SecondarySaleVictimAddressPayload, SeedContractPayload, SeedNft,
-    SingleReportPayload, TransactionReceiptRecord, TransferRecord,
+    AddressAttributionPayload, AddressSignalPayload, BatchReportSummary, BatchSeedReportPayload,
+    BatchSummaryPayload, ContractMetadata, DatabaseNftRecord, DatabaseSnapshot, EthTransferRecord,
+    HonestAddressPayload, InfringingTokenRecord, MaliciousAddressPayload, NftSaleRecord,
+    OutputFilesPayload, OwnerBalance, ReportSummary, SecondarySaleVictimAddressPayload,
+    SeedContractPayload, SeedNft, SingleReportPayload, TransactionReceiptRecord, TransferRecord,
 };
 use top_contract_analysis_rs::progress::{
     BatchProgressReporter, NoopBatchProgressReporter, NoopProgressReporter, SeedProgressReporter,
@@ -447,12 +447,26 @@ fn cached_single_report(
     secondary_sale_victim_addresses: Vec<SecondarySaleVictimAddressPayload>,
     address_signals: BTreeMap<String, AddressSignalPayload>,
 ) -> SingleReportPayload {
+    let address_attributions = honest_addresses
+        .iter()
+        .map(|item| AddressAttributionPayload {
+            contract_address: item.contract_address.clone(),
+            address: item.address.clone(),
+            observed_roles: vec!["neutral_holder".into()],
+            attribution_label: "neutral_participant".into(),
+            neutral_score: 1.0,
+            confidence: "test".into(),
+            ..AddressAttributionPayload::default()
+        })
+        .collect();
+
     SingleReportPayload {
         seed_contract,
         report_summary,
         infringing_tokens,
         malicious_addresses,
         honest_addresses,
+        address_attributions,
         secondary_sale_victim_addresses,
         address_signals,
         ..SingleReportPayload::default()
@@ -625,7 +639,7 @@ fn batch_markdown_preserves_reference_summary_and_output_index_lines() {
             candidate_contract_count_total: 10,
             infringing_nft_count_total: 11,
             malicious_address_count_total: 7,
-            honest_address_count_total: 8,
+            neutral_address_count_total: 8,
             repeat_infringing_address_count_total: 3,
             repeat_infringing_address_count_global: 2,
             legit_duplicate_contract_count_total: 1,
@@ -644,11 +658,11 @@ fn batch_markdown_preserves_reference_summary_and_output_index_lines() {
             ratio_over_60_address_ratio_overall: Some(0.375),
             ratio_over_80_address_count_total: 1,
             ratio_over_80_address_ratio_overall: Some(0.125),
-            stuck_honest_address_count_total: 2,
-            stuck_honest_address_ratio_overall: Some(0.25),
-            corrupted_honest_address_count_total: 1,
-            avg_seconds_to_honest_holder_mean: Some(12.5),
-            median_seconds_to_honest_holder_median: Some(10.0),
+            stuck_victim_address_count_total: 2,
+            stuck_victim_address_ratio_overall: Some(0.25),
+            corrupted_victim_address_count_total: 1,
+            avg_seconds_to_neutral_holder_mean: Some(12.5),
+            median_seconds_to_neutral_holder_median: Some(10.0),
             avg_mint_to_first_transfer_seconds_mean: Some(8.0),
             median_mint_to_first_transfer_seconds_median: Some(7.0),
             avg_unique_receiver_count_mean: Some(4.0),
@@ -665,7 +679,7 @@ fn batch_markdown_preserves_reference_summary_and_output_index_lines() {
                 candidate_contract_count: 5,
                 infringing_nft_count: 4,
                 malicious_address_count: 5,
-                honest_address_count: 6,
+                neutral_address_count: 6,
                 repeat_infringing_address_count: 1,
                 legit_duplicate_contract_count: 1,
                 secondary_sale_victim_cost_eth: 7.5,
@@ -680,11 +694,11 @@ fn batch_markdown_preserves_reference_summary_and_output_index_lines() {
                 victim_acquisition_stuck_cost_ratio: Some(1.0 / 3.0),
                 ratio_over_60_address_count: 2,
                 ratio_over_60_address_ratio: Some(0.5),
-                stuck_honest_address_count: 1,
-                stuck_honest_address_ratio: Some(0.25),
-                corrupted_honest_address_count: 1,
-                avg_seconds_to_honest_holder: Some(10.0),
-                median_seconds_to_honest_holder: Some(9.0),
+                stuck_victim_address_count: 1,
+                stuck_victim_address_ratio: Some(0.25),
+                corrupted_victim_address_count: 1,
+                avg_seconds_to_neutral_holder: Some(10.0),
+                median_seconds_to_neutral_holder: Some(9.0),
                 median_mint_to_first_transfer_seconds: Some(8.0),
                 ..Default::default()
             },
@@ -699,16 +713,16 @@ fn batch_markdown_preserves_reference_summary_and_output_index_lines() {
 
     assert!(markdown.contains("# Top NFT 合约批量分析总报告"));
     assert!(markdown.contains("- 检测到开放许可的 seed 数: 1"));
-    assert!(markdown.contains("- 恶意地址总数: 7"));
+    assert!(markdown.contains("- 疑似操作者地址总数: 7"));
     assert!(markdown.contains("- 受害者获取成本(USD)汇总: 12.5"));
     assert!(markdown.contains("- 总套牢成本(USD)汇总: 5 / 40.00%"));
     assert!(markdown.contains("- 二级市场受害者成本(USD)汇总: 12.5"));
     assert!(markdown.contains("- 付费 mint 受害者成本(USD)汇总: 0 / edges=0"));
-    assert!(markdown.contains("- 买入金额占钱包总额 >60% 的地址数/总体占比: 3 / 37.50%"));
+    assert!(markdown.contains("- 买入金额占钱包总额 >60% 的受害者数/总体占比: 3 / 37.50%"));
     assert!(markdown.contains("- 生成时间(UTC): 2026-04-17T00:00:00+00:00"));
     assert!(markdown.contains("## Seed 报告索引"));
     assert!(markdown.contains(
-        "- Azuki (0xseed) | 重复合约=5 | 侵权NFT=4 | 恶意地址=5 | 诚实地址=6 | 多次侵权地址=1 | 官方参与=1 | 受害者获取成本(USD)=7.5 | 二级成本(USD)=7.5 | 付费mint(USD)=0 | 总套牢(USD)=2.5/33.33% | >60%=2/50.00% | 套牢节点=1/25.00% | 被腐化=1 | 诚实购买时长=10秒 | 传播中位数=9秒 | 首次转手中位数=8秒 | JSON=result/top_contract_analysis__azuki.json | MD=result/top_contract_analysis__azuki.md"
+        "- Azuki (0xseed) | 重复合约=5 | 侵权NFT=4 | 疑似操作者=5 | 中性地址=6 | 受害者=0 | 多次侵权地址=1 | 官方参与=1 | 受害者获取成本(USD)=7.5 | 二级成本(USD)=7.5 | 付费mint(USD)=0 | 总套牢(USD)=2.5/33.33% | >60%=2/50.00% | 套牢受害者=1/25.00% | 被腐化受害者=1 | 中性接收时长=10秒 | 传播中位数=9秒 | 首次转手中位数=8秒 | JSON=result/top_contract_analysis__azuki.json | MD=result/top_contract_analysis__azuki.md"
     ));
 }
 
@@ -802,7 +816,7 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
             candidate_contract_count: 2,
             infringing_nft_count: 2,
             malicious_address_count: 2,
-            honest_address_count: 1,
+            neutral_address_count: 1,
             repeat_infringing_address_count: 1,
             secondary_sale_victim_cost_eth: 10.0,
             secondary_sale_victim_cost_usd: 10.0,
@@ -817,10 +831,10 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
             buy_asset_ratio_known_address_count: 2,
             ratio_over_60_address_count: 1,
             ratio_over_80_address_count: 0,
-            stuck_honest_address_count: 1,
-            corrupted_honest_address_count: 1,
-            avg_seconds_to_honest_holder: Some(12.0),
-            median_seconds_to_honest_holder: Some(10.0),
+            stuck_victim_address_count: 1,
+            corrupted_victim_address_count: 1,
+            avg_seconds_to_neutral_holder: Some(12.0),
+            median_seconds_to_neutral_holder: Some(10.0),
             avg_mint_to_first_transfer_seconds: Some(8.0),
             median_mint_to_first_transfer_seconds: Some(7.0),
             avg_unique_receiver_count: Some(2.0),
@@ -910,7 +924,7 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
             candidate_contract_count: 3,
             infringing_nft_count: 1,
             malicious_address_count: 2,
-            honest_address_count: 2,
+            neutral_address_count: 2,
             secondary_sale_victim_cost_eth: 5.0,
             secondary_sale_victim_cost_usd: 5.0,
             secondary_sale_stuck_cost_eth: 1.0,
@@ -924,9 +938,9 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
             buy_asset_ratio_known_address_count: 3,
             ratio_over_60_address_count: 2,
             ratio_over_80_address_count: 1,
-            stuck_honest_address_count: 1,
-            avg_seconds_to_honest_holder: Some(18.0),
-            median_seconds_to_honest_holder: Some(20.0),
+            stuck_victim_address_count: 1,
+            avg_seconds_to_neutral_holder: Some(18.0),
+            median_seconds_to_neutral_holder: Some(20.0),
             avg_mint_to_first_transfer_seconds: Some(14.0),
             median_mint_to_first_transfer_seconds: Some(20.0),
             avg_unique_receiver_count: Some(4.0),
@@ -1010,7 +1024,7 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
     assert_eq!(summary.batch_summary.candidate_contract_count_total, 5);
     assert_eq!(summary.batch_summary.infringing_nft_count_total, 3);
     assert_eq!(summary.batch_summary.malicious_address_count_total, 3);
-    assert_eq!(summary.batch_summary.honest_address_count_total, 2);
+    assert_eq!(summary.batch_summary.neutral_address_count_total, 2);
     assert_eq!(
         summary.batch_summary.repeat_infringing_address_count_total,
         1
@@ -1049,21 +1063,23 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
         summary.batch_summary.ratio_over_80_address_ratio_overall,
         Some(0.2)
     );
-    assert_eq!(summary.batch_summary.stuck_honest_address_count_total, 2);
+    assert_eq!(summary.batch_summary.stuck_victim_address_count_total, 2);
     assert_eq!(
-        summary.batch_summary.stuck_honest_address_ratio_overall,
+        summary.batch_summary.stuck_victim_address_ratio_overall,
         Some(0.4)
     );
     assert_eq!(
-        summary.batch_summary.corrupted_honest_address_count_total,
+        summary.batch_summary.corrupted_victim_address_count_total,
         1
     );
     assert_eq!(
-        summary.batch_summary.avg_seconds_to_honest_holder_mean,
+        summary.batch_summary.avg_seconds_to_neutral_holder_mean,
         Some(15.0)
     );
     assert_eq!(
-        summary.batch_summary.median_seconds_to_honest_holder_median,
+        summary
+            .batch_summary
+            .median_seconds_to_neutral_holder_median,
         Some(15.0)
     );
     assert_eq!(
@@ -1094,7 +1110,7 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
         2
     );
     assert_eq!(
-        summary.seed_reports[0].report_summary.honest_address_count,
+        summary.seed_reports[0].report_summary.neutral_address_count,
         1
     );
     assert_eq!(
@@ -1118,7 +1134,7 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
     assert_eq!(
         summary.seed_reports[0]
             .report_summary
-            .median_seconds_to_honest_holder,
+            .median_seconds_to_neutral_holder,
         Some(10.0)
     );
     assert_eq!(

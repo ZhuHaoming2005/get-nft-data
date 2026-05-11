@@ -378,7 +378,7 @@ async fn acquire_optional_limit(
 struct BatchSeedAggregate {
     report: BatchSeedReportPayload,
     malicious_addresses: BTreeSet<String>,
-    honest_addresses: BTreeSet<String>,
+    neutral_addresses: BTreeSet<String>,
     minter_infringing_contracts: BTreeMap<String, BTreeSet<String>>,
 }
 
@@ -3380,6 +3380,10 @@ fn is_victim_attribution_label(label: &str) -> bool {
     matches!(label, "likely_victim" | "corrupted_victim")
 }
 
+fn is_neutral_attribution_label(label: &str) -> bool {
+    label == "neutral_participant"
+}
+
 fn normalized_address(address: &str) -> String {
     address.trim().to_lowercase()
 }
@@ -3466,9 +3470,10 @@ fn build_report_summary(
         .filter(|value| !value.is_empty())
         .collect::<BTreeSet<_>>()
         .len() as i64;
-    let honest_address_count = honest_addresses
+    let neutral_address_count = address_attributions
         .iter()
-        .map(|item| item.address.trim().to_string())
+        .filter(|item| is_neutral_attribution_label(&item.attribution_label))
+        .map(|item| normalized_address(&item.address))
         .filter(|value| !value.is_empty())
         .collect::<BTreeSet<_>>()
         .len() as i64;
@@ -3527,11 +3532,11 @@ fn build_report_summary(
         .iter()
         .filter(|value| **value > 0.8)
         .count() as i64;
-    let stuck_honest_address_count = secondary_sale_victim_addresses
+    let stuck_victim_address_count = secondary_sale_victim_addresses
         .iter()
         .filter(|item| item.is_stuck)
         .count() as i64;
-    let corrupted_honest_address_count = honest_addresses
+    let corrupted_victim_address_count = honest_addresses
         .iter()
         .filter(|item| item.is_corrupted_address)
         .count() as i64;
@@ -3540,7 +3545,7 @@ fn build_report_summary(
         .filter(|item| item.is_corrupted_address)
         .filter_map(|item| item.hold_duration_median_seconds)
         .collect();
-    let mint_to_honest_samples: Vec<f64> = honest_addresses
+    let mint_to_neutral_holder_samples: Vec<f64> = honest_addresses
         .iter()
         .flat_map(|item| {
             item.mint_to_honest_seconds_samples
@@ -3587,7 +3592,7 @@ fn build_report_summary(
         implausible_candidate_contract_count,
         infringing_nft_count,
         malicious_address_count,
-        honest_address_count,
+        neutral_address_count,
         repeat_infringing_address_count,
         legit_duplicate_contract_count: legit_duplicates.len() as i64,
         candidate_open_license_token_count: candidate_open_license_tokens.len() as i64,
@@ -3633,17 +3638,17 @@ fn build_report_summary(
         } else {
             None
         },
-        stuck_honest_address_count,
-        stuck_honest_address_ratio: if !secondary_sale_victim_addresses.is_empty() {
-            Some(stuck_honest_address_count as f64 / secondary_sale_victim_addresses.len() as f64)
+        stuck_victim_address_count,
+        stuck_victim_address_ratio: if !secondary_sale_victim_addresses.is_empty() {
+            Some(stuck_victim_address_count as f64 / secondary_sale_victim_addresses.len() as f64)
         } else {
             None
         },
-        corrupted_honest_address_count,
+        corrupted_victim_address_count,
         avg_corrupted_address_holding_seconds: mean_f64(&corrupted_holding_values),
         median_corrupted_address_holding_seconds: median_f64(&corrupted_holding_values),
-        avg_seconds_to_honest_holder: mean_f64(&mint_to_honest_samples),
-        median_seconds_to_honest_holder: median_f64(&mint_to_honest_samples),
+        avg_seconds_to_neutral_holder: mean_f64(&mint_to_neutral_holder_samples),
+        median_seconds_to_neutral_holder: median_f64(&mint_to_neutral_holder_samples),
         avg_mint_to_first_transfer_seconds: mean_f64(&mint_to_first_transfer_values),
         median_mint_to_first_transfer_seconds: median_f64(&mint_to_first_transfer_values),
         avg_unique_receiver_count: mean_f64(&unique_receiver_values),
@@ -3683,9 +3688,9 @@ fn build_batch_report_summary(seed_reports: &[BatchSeedAggregate]) -> BatchRepor
         .iter()
         .flat_map(|item| item.malicious_addresses.iter().cloned())
         .collect();
-    let honest_addresses: BTreeSet<String> = seed_reports
+    let neutral_addresses: BTreeSet<String> = seed_reports
         .iter()
-        .flat_map(|item| item.honest_addresses.iter().cloned())
+        .flat_map(|item| item.neutral_addresses.iter().cloned())
         .collect();
     let mut minter_infringing_contracts: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for seed_report in seed_reports {
@@ -3804,9 +3809,9 @@ fn build_batch_report_summary(seed_reports: &[BatchSeedAggregate]) -> BatchRepor
         .iter()
         .map(|item| item.report.report_summary.ratio_over_80_address_count)
         .sum();
-    let stuck_honest_address_count_total: i64 = seed_reports
+    let stuck_victim_address_count_total: i64 = seed_reports
         .iter()
-        .map(|item| item.report.report_summary.stuck_honest_address_count)
+        .map(|item| item.report.report_summary.stuck_victim_address_count)
         .sum();
     let mean_corrupted_holding_values: Vec<f64> = seed_reports
         .iter()
@@ -3824,13 +3829,13 @@ fn build_batch_report_summary(seed_reports: &[BatchSeedAggregate]) -> BatchRepor
                 .median_corrupted_address_holding_seconds
         })
         .collect();
-    let mean_honest_holder_values: Vec<f64> = seed_reports
+    let mean_neutral_holder_values: Vec<f64> = seed_reports
         .iter()
-        .filter_map(|item| item.report.report_summary.avg_seconds_to_honest_holder)
+        .filter_map(|item| item.report.report_summary.avg_seconds_to_neutral_holder)
         .collect();
-    let median_honest_holder_values: Vec<f64> = seed_reports
+    let median_neutral_holder_values: Vec<f64> = seed_reports
         .iter()
-        .filter_map(|item| item.report.report_summary.median_seconds_to_honest_holder)
+        .filter_map(|item| item.report.report_summary.median_seconds_to_neutral_holder)
         .collect();
     let mean_first_transfer_values: Vec<f64> = seed_reports
         .iter()
@@ -3883,7 +3888,7 @@ fn build_batch_report_summary(seed_reports: &[BatchSeedAggregate]) -> BatchRepor
             .map(|item| item.report.report_summary.infringing_nft_count)
             .sum(),
         malicious_address_count_total: malicious_addresses.len() as i64,
-        honest_address_count_total: honest_addresses.len() as i64,
+        neutral_address_count_total: neutral_addresses.len() as i64,
         repeat_infringing_address_count_total: seed_reports
             .iter()
             .map(|item| item.report.report_summary.repeat_infringing_address_count)
@@ -3951,25 +3956,25 @@ fn build_batch_report_summary(seed_reports: &[BatchSeedAggregate]) -> BatchRepor
         } else {
             None
         },
-        stuck_honest_address_count_total,
-        stuck_honest_address_ratio_overall: if buy_asset_ratio_known_address_count_total > 0 {
+        stuck_victim_address_count_total,
+        stuck_victim_address_ratio_overall: if buy_asset_ratio_known_address_count_total > 0 {
             Some(
-                stuck_honest_address_count_total as f64
+                stuck_victim_address_count_total as f64
                     / buy_asset_ratio_known_address_count_total as f64,
             )
         } else {
             None
         },
-        corrupted_honest_address_count_total: seed_reports
+        corrupted_victim_address_count_total: seed_reports
             .iter()
-            .map(|item| item.report.report_summary.corrupted_honest_address_count)
+            .map(|item| item.report.report_summary.corrupted_victim_address_count)
             .sum(),
         avg_corrupted_address_holding_seconds_mean: mean(&mean_corrupted_holding_values),
         median_corrupted_address_holding_seconds_median: median_f64(
             &median_corrupted_holding_values,
         ),
-        avg_seconds_to_honest_holder_mean: mean(&mean_honest_holder_values),
-        median_seconds_to_honest_holder_median: median_f64(&median_honest_holder_values),
+        avg_seconds_to_neutral_holder_mean: mean(&mean_neutral_holder_values),
+        median_seconds_to_neutral_holder_median: median_f64(&median_neutral_holder_values),
         avg_mint_to_first_transfer_seconds_mean: mean(&mean_first_transfer_values),
         median_mint_to_first_transfer_seconds_median: median_f64(&median_first_transfer_values),
         avg_unique_receiver_count_mean: mean(&mean_unique_receiver_values),
@@ -3984,10 +3989,11 @@ fn build_batch_seed_aggregate(payload: SingleReportPayload) -> BatchSeedAggregat
         .map(|item| item.address.trim().to_lowercase())
         .filter(|value| !value.is_empty())
         .collect();
-    let honest_addresses: BTreeSet<String> = payload
-        .honest_addresses
+    let neutral_addresses: BTreeSet<String> = payload
+        .address_attributions
         .iter()
-        .map(|item| item.address.trim().to_lowercase())
+        .filter(|item| is_neutral_attribution_label(&item.attribution_label))
+        .map(|item| normalized_address(&item.address))
         .filter(|value| !value.is_empty())
         .collect();
     let minter_infringing_contracts = payload_minter_contracts(&payload.infringing_tokens);
@@ -4000,7 +4006,7 @@ fn build_batch_seed_aggregate(payload: SingleReportPayload) -> BatchSeedAggregat
             output_files: None,
         },
         malicious_addresses,
-        honest_addresses,
+        neutral_addresses,
         minter_infringing_contracts,
     }
 }
@@ -4021,7 +4027,7 @@ fn payload_minter_contracts(
 }
 
 #[cfg(test)]
-fn payload_median_seconds_to_honest_holder(payload: &SingleReportPayload) -> Option<f64> {
+fn payload_median_seconds_to_neutral_holder(payload: &SingleReportPayload) -> Option<f64> {
     let values: Vec<f64> = payload
         .honest_addresses
         .iter()
@@ -4150,8 +4156,8 @@ mod tests {
             &BTreeMap::new(),
         );
 
-        assert_eq!(summary.avg_seconds_to_honest_holder, Some(16.0));
-        assert_eq!(summary.median_seconds_to_honest_holder, Some(16.0));
+        assert_eq!(summary.avg_seconds_to_neutral_holder, Some(16.0));
+        assert_eq!(summary.median_seconds_to_neutral_holder, Some(16.0));
     }
 
     #[test]
@@ -4198,7 +4204,7 @@ mod tests {
             &BTreeMap::new(),
         );
 
-        assert_eq!(summary.corrupted_honest_address_count, 3);
+        assert_eq!(summary.corrupted_victim_address_count, 3);
         assert_eq!(summary.avg_corrupted_address_holding_seconds, Some(21.0));
         assert_eq!(summary.median_corrupted_address_holding_seconds, Some(21.0));
     }
@@ -4248,7 +4254,7 @@ mod tests {
         };
 
         assert_eq!(
-            payload_median_seconds_to_honest_holder(&payload),
+            payload_median_seconds_to_neutral_holder(&payload),
             Some(16.0)
         );
     }
