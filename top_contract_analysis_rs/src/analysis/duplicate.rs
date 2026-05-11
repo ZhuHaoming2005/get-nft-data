@@ -81,7 +81,7 @@ fn record_metadata_prefilter_doc_from_record(row: &DatabaseNftRecord) -> String 
     record_metadata_prefilter_doc(&row.metadata_doc, &row.metadata_json)
 }
 
-fn seed_metadata_example_doc(seed_nfts: &[SeedNft]) -> Option<MetadataBm25Document> {
+fn seed_metadata_representative_doc(seed_nfts: &[SeedNft]) -> Option<MetadataBm25Document> {
     seed_nfts.iter().find_map(|item| {
         let seed_doc = record_metadata_prefilter_doc(&item.metadata_doc, &item.metadata_json);
         MetadataBm25Document::from_text(&seed_doc)
@@ -399,8 +399,9 @@ pub fn build_duplicate_candidates_from_contract_rows(
         .filter(|name| !name.is_empty())
         .collect();
 
-    let seed_metadata_docs: Vec<MetadataBm25Document> =
-        seed_metadata_example_doc(seed_nfts).into_iter().collect();
+    let seed_metadata_docs: Vec<MetadataBm25Document> = seed_metadata_representative_doc(seed_nfts)
+        .into_iter()
+        .collect();
     let seed_final_metadata_queries_by_token = seed_metadata_queries_by_token(seed_nfts);
 
     let name_match_contracts =
@@ -596,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_candidates_use_only_one_seed_metadata_example() {
+    fn duplicate_candidates_use_representative_seed_metadata_template_before_token_id_recheck() {
         let seed_nfts = vec![
             SeedNft {
                 contract_address: "0xseed".into(),
@@ -613,7 +614,7 @@ mod tests {
         ];
         let snapshot_rows = vec![DatabaseNftRecord {
             contract_address: "0xcandidate".into(),
-            token_id: "1".into(),
+            token_id: "2".into(),
             metadata_json: metadata_json("silver cat"),
             ..Default::default()
         }];

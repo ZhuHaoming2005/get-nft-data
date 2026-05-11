@@ -118,6 +118,8 @@ pub struct ContractMetadata {
     pub token_type: String,
     pub contract_deployer: String,
     pub deployed_block_number: i64,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub deployed_block_time: i64,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub owner_address: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -272,7 +274,8 @@ pub struct AddressSignals {
     pub unique_receiver_count: usize,
     pub cycle_edge_count: usize,
     pub star_distributor_count: usize,
-    pub mint_to_first_transfer_seconds: i64,
+    #[serde(alias = "mint_to_first_transfer_seconds")]
+    pub first_transfer_delay_seconds: i64,
     pub fast_spread: bool,
 }
 
@@ -358,12 +361,28 @@ pub struct ReportSummary {
     pub corrupted_victim_address_count: i64,
     pub avg_corrupted_address_holding_seconds: Option<f64>,
     pub median_corrupted_address_holding_seconds: Option<f64>,
-    #[serde(alias = "avg_seconds_to_honest_holder")]
-    pub avg_seconds_to_neutral_holder: Option<f64>,
-    #[serde(alias = "median_seconds_to_honest_holder")]
-    pub median_seconds_to_neutral_holder: Option<f64>,
-    pub avg_mint_to_first_transfer_seconds: Option<f64>,
-    pub median_mint_to_first_transfer_seconds: Option<f64>,
+    #[serde(
+        rename = "avg_deployment_to_neutral_holder_seconds",
+        alias = "avg_seconds_to_honest_holder",
+        alias = "avg_seconds_to_neutral_holder"
+    )]
+    pub avg_deployment_to_neutral_holder_seconds: Option<f64>,
+    #[serde(
+        rename = "median_deployment_to_neutral_holder_seconds",
+        alias = "median_seconds_to_honest_holder",
+        alias = "median_seconds_to_neutral_holder"
+    )]
+    pub median_deployment_to_neutral_holder_seconds: Option<f64>,
+    #[serde(
+        rename = "avg_deployment_to_first_transfer_seconds",
+        alias = "avg_mint_to_first_transfer_seconds"
+    )]
+    pub avg_deployment_to_first_transfer_seconds: Option<f64>,
+    #[serde(
+        rename = "median_deployment_to_first_transfer_seconds",
+        alias = "median_mint_to_first_transfer_seconds"
+    )]
+    pub median_deployment_to_first_transfer_seconds: Option<f64>,
     pub avg_unique_receiver_count: Option<f64>,
 }
 
@@ -388,6 +407,8 @@ pub struct DuplicateContractPayload {
     pub contract_deployer: String,
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub deployed_block_number: i64,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub deployed_block_time: i64,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub token_type: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -409,7 +430,8 @@ pub struct AddressSignalPayload {
     pub unique_receiver_count: i64,
     pub cycle_edge_count: i64,
     pub star_distributor_count: i64,
-    pub mint_to_first_transfer_seconds: i64,
+    #[serde(alias = "mint_to_first_transfer_seconds")]
+    pub first_transfer_delay_seconds: i64,
     pub fast_spread: bool,
 }
 
@@ -433,10 +455,11 @@ pub struct HonestAddressStatsPayload {
     pub victim_resale_count: i64,
     pub median_holding_seconds: Option<f64>,
     #[serde(
-        rename = "avg_seconds_to_neutral_holder",
-        alias = "avg_seconds_to_honest_holder"
+        rename = "avg_deployment_to_neutral_holder_seconds",
+        alias = "avg_seconds_to_honest_holder",
+        alias = "avg_seconds_to_neutral_holder"
     )]
-    pub avg_seconds_to_honest_holder: Option<f64>,
+    pub avg_deployment_to_neutral_holder_seconds: Option<f64>,
     #[serde(
         default,
         rename = "corrupted_victim_addresses",
@@ -457,10 +480,11 @@ pub struct HonestAddressPayload {
     pub is_corrupted_address: bool,
     pub victim_resale_count: i64,
     #[serde(
-        rename = "mint_to_neutral_holder_seconds_samples",
+        rename = "deployment_to_neutral_holder_seconds_samples",
+        alias = "mint_to_neutral_holder_seconds_samples",
         alias = "mint_to_honest_seconds_samples"
     )]
-    pub mint_to_honest_seconds_samples: Vec<i64>,
+    pub deployment_to_neutral_holder_seconds_samples: Vec<i64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -513,6 +537,10 @@ pub struct VictimAcquisitionAddressPayload {
     pub total_stuck_cost_usd: f64,
     pub is_stuck: bool,
     pub is_corrupted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buy_before_eth_balance: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buy_before_usd_balance: Option<f64>,
     pub buy_asset_ratio: Option<f64>,
     pub buy_asset_ratio_with_gas: Option<f64>,
 }
@@ -603,6 +631,14 @@ pub struct ValueFlowEdgePayload {
     pub value_eth: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_with_gas_eth: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_with_gas_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_before_eth_balance: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_before_usd_balance: Option<f64>,
     pub payment_token_symbol: String,
     pub payment_token_address: String,
     pub channel: String,
@@ -685,10 +721,16 @@ pub struct CampaignClusterPayload {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ContractLifecycleMetricPayload {
     pub contract_address: String,
+    #[serde(default)]
+    pub deployment_time: i64,
     pub first_mint_time: i64,
+    #[serde(default)]
+    pub first_transfer_time: i64,
     pub first_listing_time: i64,
     pub first_sale_time: i64,
     pub first_victim_time: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_to_first_transfer_seconds: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_to_first_listing_seconds: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -808,7 +850,8 @@ pub struct ContractLevelSummaryPayload {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MaliciousAddressPayload {
     pub address: String,
-    pub mint_role: bool,
+    #[serde(rename = "mint_activity_observed", alias = "mint_role")]
+    pub mint_activity_observed: bool,
     pub wash_cycle_count: i64,
     pub star_out_degree: i64,
     pub rapid_spread_contracts: Vec<String>,
@@ -1032,12 +1075,28 @@ pub struct BatchReportSummary {
     pub corrupted_victim_address_count_total: i64,
     pub avg_corrupted_address_holding_seconds_mean: Option<f64>,
     pub median_corrupted_address_holding_seconds_median: Option<f64>,
-    #[serde(alias = "avg_seconds_to_honest_holder_mean")]
-    pub avg_seconds_to_neutral_holder_mean: Option<f64>,
-    #[serde(alias = "median_seconds_to_honest_holder_median")]
-    pub median_seconds_to_neutral_holder_median: Option<f64>,
-    pub avg_mint_to_first_transfer_seconds_mean: Option<f64>,
-    pub median_mint_to_first_transfer_seconds_median: Option<f64>,
+    #[serde(
+        rename = "avg_deployment_to_neutral_holder_seconds_mean",
+        alias = "avg_seconds_to_honest_holder_mean",
+        alias = "avg_seconds_to_neutral_holder_mean"
+    )]
+    pub avg_deployment_to_neutral_holder_seconds_mean: Option<f64>,
+    #[serde(
+        rename = "median_deployment_to_neutral_holder_seconds_median",
+        alias = "median_seconds_to_honest_holder_median",
+        alias = "median_seconds_to_neutral_holder_median"
+    )]
+    pub median_deployment_to_neutral_holder_seconds_median: Option<f64>,
+    #[serde(
+        rename = "avg_deployment_to_first_transfer_seconds_mean",
+        alias = "avg_mint_to_first_transfer_seconds_mean"
+    )]
+    pub avg_deployment_to_first_transfer_seconds_mean: Option<f64>,
+    #[serde(
+        rename = "median_deployment_to_first_transfer_seconds_median",
+        alias = "median_mint_to_first_transfer_seconds_median"
+    )]
+    pub median_deployment_to_first_transfer_seconds_median: Option<f64>,
     pub avg_unique_receiver_count_mean: Option<f64>,
     pub generated_at: String,
 }

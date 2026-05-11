@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use crate::analysis::scoring::{
-    metadata_document_from_json, metadata_is_dedup_eligible, metadata_recall_document,
-    metadata_recall_keywords, MAX_METADATA_BYTES_FOR_DEDUP,
+    metadata_document_from_json, metadata_is_dedup_eligible, metadata_recall_all_keywords,
+    metadata_recall_document, MAX_METADATA_BYTES_FOR_DEDUP,
 };
 use crate::error::AppError;
 use crate::models::{
@@ -233,7 +233,7 @@ fn seed_metadata_recall_terms(seed_nfts: &[SeedNft]) -> HashSet<String> {
         .iter()
         .find_map(|item| {
             let doc = metadata_recall_document(&item.metadata_doc, &item.metadata_json);
-            let keywords = metadata_recall_keywords(&doc, 8);
+            let keywords = metadata_recall_all_keywords(&doc);
             if keywords.is_empty() {
                 None
             } else {
@@ -463,7 +463,7 @@ impl DuckDbFeatureStore {
             };
             let metadata_recall_doc = metadata_recall_document(&metadata_doc, &row.metadata_json);
             let metadata_keywords_arr =
-                serde_json::to_string(&metadata_recall_keywords(&metadata_recall_doc, 8))?;
+                serde_json::to_string(&metadata_recall_all_keywords(&metadata_recall_doc))?;
             stmt.execute(params![
                 chain,
                 row.contract_address.to_lowercase(),
@@ -612,6 +612,10 @@ impl DuckDbFeatureStore {
         }
     }
 
+    fn sql_metadata_template_predicate(values: &HashSet<String>) -> Option<String> {
+        Self::sql_metadata_keyword_predicate(values)
+    }
+
     fn sql_metadata_json_eligible_predicate() -> String {
         format!(
             "length(trim(coalesce(CAST(metadata_json AS VARCHAR), ''))) <= {MAX_METADATA_BYTES_FOR_DEDUP} \
@@ -750,17 +754,18 @@ impl DuckDbFeatureStore {
 
         let mut predicates = Vec::new();
         predicates.push("chain = ?".to_string());
-        if let Some(predicate) = Self::sql_in_predicate("token_uri_norm", &exact_token_keys) {
-            predicates.push(format!("({predicate})"));
-        }
-        if let Some(predicate) = Self::sql_in_predicate("image_uri_norm", &exact_image_keys) {
-            predicates.push(format!("({predicate})"));
-        }
-        if let Some(predicate) = Self::sql_in_predicate("substr(name_norm, 1, 8)", &name_prefixes) {
-            predicates.push(format!("({predicate})"));
-        }
+        let token_uri_match_expr =
+            Self::sql_in_predicate("token_uri_norm", &exact_token_keys).unwrap_or("FALSE".into());
+        let image_uri_match_expr =
+            Self::sql_in_predicate("image_uri_norm", &exact_image_keys).unwrap_or("FALSE".into());
+        let name_prefix_match_expr =
+            Self::sql_in_predicate("substr(name_norm, 1, 8)", &name_prefixes)
+                .unwrap_or("FALSE".into());
+        predicates.push(format!("({token_uri_match_expr})"));
+        predicates.push(format!("({image_uri_match_expr})"));
+        predicates.push(format!("({name_prefix_match_expr})"));
         let metadata_recall_predicate =
-            Self::sql_metadata_keyword_predicate(&metadata_recall_terms).map(|predicate| {
+            Self::sql_metadata_template_predicate(&metadata_recall_terms).map(|predicate| {
                 format!(
                     "({}) AND ({predicate})",
                     Self::sql_metadata_json_eligible_predicate()
@@ -798,18 +803,35 @@ impl DuckDbFeatureStore {
         let base_select_sql = format!(
             "
             SELECT feature_rowid, contract_address, token_id,
-                   token_uri_norm, image_uri_norm, name_norm, metadata_recall_match
+                   token_uri_norm, image_uri_norm, name_norm, metadata_recall_match,
+                   recall_priority
             FROM (
                 SELECT rowid AS feature_rowid, contract_address, token_id,
                        token_uri_norm, image_uri_norm, name_norm,
                        {metadata_recall_expr} AS metadata_recall_match,
-                       row_number() OVER (PARTITION BY contract_address ORDER BY token_id) AS rn
+                       CASE
+                           WHEN ({token_uri_match_expr}) OR ({image_uri_match_expr})
+                                OR ({name_prefix_match_expr}) THEN 0
+                           WHEN {metadata_recall_expr} THEN 1
+                           ELSE 2
+                       END AS recall_priority,
+                       row_number() OVER (
+                           PARTITION BY contract_address
+                           ORDER BY
+                               CASE
+                                   WHEN ({token_uri_match_expr}) OR ({image_uri_match_expr})
+                                        OR ({name_prefix_match_expr}) THEN 0
+                                   WHEN {metadata_recall_expr} THEN 1
+                                   ELSE 2
+                               END,
+                               token_id
+                       ) AS rn
                 FROM nft_features
                 WHERE chain = ?{seed_contract_filter}
                   AND {recall_predicate}
             )
             {per_contract_filter}
-            ORDER BY contract_address, token_id
+            ORDER BY contract_address, recall_priority, token_id
             "
         );
 
@@ -827,9 +849,9 @@ impl DuckDbFeatureStore {
             &format!(
                 "
                 CREATE TEMP TABLE {temp_table} AS
-                SELECT row_number() OVER (ORDER BY contract_address, token_id) AS recall_row_id,
+                SELECT row_number() OVER (ORDER BY contract_address, recall_priority, token_id) AS recall_row_id,
                        feature_rowid, contract_address, token_id, token_uri_norm, image_uri_norm,
-                       name_norm, metadata_recall_match
+                       name_norm, metadata_recall_match, recall_priority
                 FROM ({base_select_sql})
                 "
             ),

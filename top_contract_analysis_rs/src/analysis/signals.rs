@@ -65,14 +65,13 @@ pub fn analyze_transfer_signals(transfers: &[TransferRecord]) -> AddressSignals 
         })
         .count();
 
-    let mint_to_first_transfer_seconds =
+    let first_transfer_delay_seconds =
         if first_mint_time > 0 && first_non_mint_time >= first_mint_time {
             first_non_mint_time - first_mint_time
         } else {
             0
         };
-    let fast_spread =
-        mint_to_first_transfer_seconds > 0 && mint_to_first_transfer_seconds <= 24 * 3600;
+    let fast_spread = first_transfer_delay_seconds > 0 && first_transfer_delay_seconds <= 24 * 3600;
 
     AddressSignals {
         mint_address_count: mint_recipients.len(),
@@ -80,7 +79,7 @@ pub fn analyze_transfer_signals(transfers: &[TransferRecord]) -> AddressSignals 
         unique_receiver_count: receiver_addresses.len(),
         cycle_edge_count: cycle_pairs.len(),
         star_distributor_count,
-        mint_to_first_transfer_seconds,
+        first_transfer_delay_seconds,
         fast_spread,
     }
 }

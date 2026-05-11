@@ -124,6 +124,10 @@ pub fn metadata_recall_keywords(document: &str, limit: usize) -> Vec<String> {
         .collect()
 }
 
+pub fn metadata_recall_all_keywords(document: &str) -> Vec<String> {
+    metadata_recall_keywords(document, usize::MAX)
+}
+
 fn collect_metadata_prefilter_parts(value: &Value, parts: &mut BTreeSet<String>) {
     match value {
         Value::Object(map) => {

@@ -11,7 +11,7 @@ use postgres::types::ToSql;
 use postgres::Client;
 
 use crate::analysis::scoring::{
-    metadata_document_from_json, metadata_recall_document, metadata_recall_keywords,
+    metadata_document_from_json, metadata_recall_all_keywords, metadata_recall_document,
 };
 use crate::error::AppError;
 use crate::normalize::{normalize_name, normalize_url};
@@ -92,7 +92,7 @@ fn snapshot_batch(
         .zip(metadata_doc_values.iter())
         .map(|(row, doc)| {
             let recall_doc = metadata_recall_document(doc, &row.metadata_json);
-            serde_json::to_string(&metadata_recall_keywords(&recall_doc, 8))
+            serde_json::to_string(&metadata_recall_all_keywords(&recall_doc))
         })
         .collect::<Result<_, _>>()?;
 

@@ -304,6 +304,10 @@ fn sale_value_edge(
         token_id: edge.token_id.clone(),
         value_eth,
         value_usd,
+        value_with_gas_eth: value_eth,
+        value_with_gas_usd: value_usd,
+        from_before_eth_balance: None,
+        from_before_usd_balance: None,
         payment_token_symbol: edge.payment_token_symbol.clone(),
         payment_token_address: edge.payment_token_address.clone(),
         channel: channel.into(),
@@ -382,6 +386,7 @@ fn build_contract_lifecycle_events(
             lifecycle_stage: "replica_deployment".into(),
             event_type: "candidate_contract_deployed".into(),
             block_number: duplicate_contract.deployed_block_number,
+            block_time: duplicate_contract.deployed_block_time,
             actor_address: duplicate_contract.contract_deployer.clone(),
             evidence_type: "contract_metadata".into(),
             evidence_flags: vec!["candidate_contract".into(), "contract_metadata".into()],
@@ -779,7 +784,13 @@ fn build_lifecycle_metrics(
         .into_iter()
         .filter(|contract| !contract.is_empty())
         .map(|contract| {
+            let deployment_time =
+                first_stage_time(lifecycle_events, &contract, "replica_deployment");
             let first_mint_time = first_stage_time(lifecycle_events, &contract, "replica_mint");
+            let first_transfer_time = earliest_positive_time(
+                first_stage_time(lifecycle_events, &contract, "distribution"),
+                first_stage_time(lifecycle_events, &contract, "monetization"),
+            );
             let first_listing_time =
                 first_stage_time(lifecycle_events, &contract, "market_exposure");
             let first_sale_time = first_stage_time(lifecycle_events, &contract, "monetization");
@@ -809,16 +820,19 @@ fn build_lifecycle_metrics(
                 pre_sale_signal_count(lifecycle_events, &contract, first_outcome_time);
             let sale_observed = first_outcome_time > 0;
             let early_detection_positive =
-                sale_observed && first_mint_time > 0 && pre_sale_signal_count >= 2;
+                sale_observed && deployment_time > 0 && pre_sale_signal_count >= 2;
             ContractLifecycleMetricPayload {
                 contract_address: contract.clone(),
+                deployment_time,
                 first_mint_time,
+                first_transfer_time,
                 first_listing_time,
                 first_sale_time,
                 first_victim_time,
-                time_to_first_listing_seconds: elapsed(first_mint_time, first_listing_time),
-                time_to_first_sale_seconds: elapsed(first_mint_time, first_sale_time),
-                time_to_first_victim_seconds: elapsed(first_mint_time, first_victim_time),
+                time_to_first_transfer_seconds: elapsed(deployment_time, first_transfer_time),
+                time_to_first_listing_seconds: elapsed(deployment_time, first_listing_time),
+                time_to_first_sale_seconds: elapsed(deployment_time, first_sale_time),
+                time_to_first_victim_seconds: elapsed(deployment_time, first_victim_time),
                 cascade_node_count: path_summary.map(|summary| summary.node_count).unwrap_or(0),
                 cascade_edge_count: path_summary.map(|summary| summary.edge_count).unwrap_or(0),
                 victim_count,
@@ -1276,11 +1290,11 @@ fn build_early_detection_features(
 ) -> Vec<EarlyDetectionFeaturePayload> {
     let mut rows = Vec::new();
     for metric in lifecycle_metrics {
-        if metric.first_mint_time <= 0 {
+        if metric.deployment_time <= 0 {
             continue;
         }
         for window_seconds in [60_i64, 3_600_i64, 86_400_i64] {
-            let window_end = metric.first_mint_time + window_seconds;
+            let window_end = metric.deployment_time + window_seconds;
             let contract_events: Vec<_> = lifecycle_events
                 .iter()
                 .filter(|event| event.contract_address == metric.contract_address)
@@ -1301,7 +1315,7 @@ fn build_early_detection_features(
             rows.push(EarlyDetectionFeaturePayload {
                 contract_address: metric.contract_address.clone(),
                 observation_window_seconds: window_seconds,
-                window_start_time: metric.first_mint_time,
+                window_start_time: metric.deployment_time,
                 window_end_time: window_end,
                 content_similarity_count: contract_events
                     .iter()
@@ -1419,11 +1433,7 @@ fn has_strong_campaign_address_evidence(feature: &AddressEvidenceFeaturePayload)
     feature.evidence.iter().any(|evidence| {
         matches!(
             evidence.evidence_type.as_str(),
-            "mint_role_with_behavior"
-                | "wash_cycle"
-                | "star_distribution"
-                | "rapid_spread"
-                | "corrupted_honest_resale"
+            "wash_cycle" | "star_distribution" | "rapid_spread" | "corrupted_honest_resale"
         )
     })
 }
@@ -1833,6 +1843,13 @@ mod tests {
         let lifecycle_events = vec![
             ContractLifecycleEventPayload {
                 contract_address: "0xdup".into(),
+                lifecycle_stage: "replica_deployment".into(),
+                event_type: "candidate_contract_deployed".into(),
+                block_time: 80,
+                ..ContractLifecycleEventPayload::default()
+            },
+            ContractLifecycleEventPayload {
+                contract_address: "0xdup".into(),
                 lifecycle_stage: "replica_mint".into(),
                 event_type: "mint".into(),
                 block_time: 100,
@@ -1861,9 +1878,10 @@ mod tests {
             .expect("contract metric");
 
         assert_eq!(metric.first_sale_time, 0);
+        assert_eq!(metric.deployment_time, 80);
         assert_eq!(metric.first_victim_time, 150);
-        assert_eq!(metric.pre_sale_signal_count, 1);
-        assert!(!metric.early_detection_positive);
+        assert_eq!(metric.pre_sale_signal_count, 2);
+        assert!(metric.early_detection_positive);
     }
 
     #[test]
@@ -1872,13 +1890,22 @@ mod tests {
             contract_address: "0xseed".into(),
             ..SeedContractPayload::default()
         };
-        let lifecycle_events = vec![ContractLifecycleEventPayload {
-            contract_address: "0xdup".into(),
-            lifecycle_stage: "replica_mint".into(),
-            event_type: "mint".into(),
-            block_time: 100,
-            ..ContractLifecycleEventPayload::default()
-        }];
+        let lifecycle_events = vec![
+            ContractLifecycleEventPayload {
+                contract_address: "0xdup".into(),
+                lifecycle_stage: "replica_deployment".into(),
+                event_type: "candidate_contract_deployed".into(),
+                block_time: 80,
+                ..ContractLifecycleEventPayload::default()
+            },
+            ContractLifecycleEventPayload {
+                contract_address: "0xdup".into(),
+                lifecycle_stage: "replica_mint".into(),
+                event_type: "mint".into(),
+                block_time: 100,
+                ..ContractLifecycleEventPayload::default()
+            },
+        ];
         let value_flow_edges = vec![ValueFlowEdgePayload {
             contract_address: "0xdup".into(),
             block_time: 120,
@@ -1901,9 +1928,10 @@ mod tests {
             .expect("contract metric");
 
         assert_eq!(metric.first_sale_time, 0);
+        assert_eq!(metric.deployment_time, 80);
         assert_eq!(metric.first_victim_time, 120);
-        assert_eq!(metric.time_to_first_victim_seconds, Some(20));
-        assert_eq!(metric.pre_sale_signal_count, 1);
+        assert_eq!(metric.time_to_first_victim_seconds, Some(40));
+        assert_eq!(metric.pre_sale_signal_count, 2);
 
         let rows = build_early_detection_features(&metrics, &lifecycle_events, &value_flow_edges);
         let first_window = rows
@@ -1920,12 +1948,20 @@ mod tests {
     fn early_detection_window_pre_sale_signals_exclude_victim_outcome() {
         let metrics = vec![ContractLifecycleMetricPayload {
             contract_address: "0xdup".into(),
+            deployment_time: 80,
             first_mint_time: 100,
             first_sale_time: 0,
             first_victim_time: 150,
             ..ContractLifecycleMetricPayload::default()
         }];
         let lifecycle_events = vec![
+            ContractLifecycleEventPayload {
+                contract_address: "0xdup".into(),
+                lifecycle_stage: "replica_deployment".into(),
+                event_type: "candidate_contract_deployed".into(),
+                block_time: 80,
+                ..ContractLifecycleEventPayload::default()
+            },
             ContractLifecycleEventPayload {
                 contract_address: "0xdup".into(),
                 lifecycle_stage: "replica_mint".into(),
@@ -1948,11 +1984,56 @@ mod tests {
             .find(|row| row.observation_window_seconds == 60)
             .expect("first window");
 
-        assert_eq!(first_window.victim_signal_count, 1);
-        assert_eq!(first_window.pre_sale_signal_count, 1);
+        assert_eq!(first_window.window_start_time, 80);
+        assert_eq!(first_window.victim_signal_count, 0);
+        assert_eq!(first_window.pre_sale_signal_count, 2);
+        let long_window = rows
+            .iter()
+            .find(|row| row.observation_window_seconds == 3_600)
+            .expect("long window");
+        assert_eq!(long_window.victim_signal_count, 1);
         assert_eq!(
-            first_window.weak_label,
+            long_window.weak_label,
             "positive_observed_sale_or_victimization"
         );
+    }
+
+    #[test]
+    fn lifecycle_metric_treats_sale_as_first_transfer_when_no_distribution_edge_exists() {
+        let seed_contract = SeedContractPayload {
+            contract_address: "0xseed".into(),
+            ..SeedContractPayload::default()
+        };
+        let lifecycle_events = vec![
+            ContractLifecycleEventPayload {
+                contract_address: "0xdup".into(),
+                lifecycle_stage: "replica_deployment".into(),
+                block_time: 80,
+                ..ContractLifecycleEventPayload::default()
+            },
+            ContractLifecycleEventPayload {
+                contract_address: "0xdup".into(),
+                lifecycle_stage: "monetization".into(),
+                event_type: "sale".into(),
+                block_time: 150,
+                ..ContractLifecycleEventPayload::default()
+            },
+        ];
+
+        let metrics = build_lifecycle_metrics(
+            &seed_contract,
+            &BTreeMap::new(),
+            &[],
+            &[],
+            &[],
+            &lifecycle_events,
+        );
+        let metric = metrics
+            .iter()
+            .find(|item| item.contract_address == "0xdup")
+            .expect("contract metric");
+
+        assert_eq!(metric.first_transfer_time, 150);
+        assert_eq!(metric.time_to_first_transfer_seconds, Some(70));
     }
 }

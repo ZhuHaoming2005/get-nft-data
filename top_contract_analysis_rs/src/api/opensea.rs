@@ -859,6 +859,7 @@ pub async fn fetch_opensea_contract_metadata(
             &payload,
             &["deployed_block_number", "deployedBlockNumber"],
         ),
+        deployed_block_time: int_field(&payload, &["deployed_block_time", "deployedBlockTime"]),
         owner_address: string_field(
             &payload,
             &["owner_address", "ownerAddress", "owner", "contract_owner"],

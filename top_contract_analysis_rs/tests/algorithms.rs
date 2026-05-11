@@ -365,7 +365,7 @@ fn transfer_signals_calculate_fast_spread() {
         TransferRecord::transfer("0xdup", "1", 120, "0xholder1", "0xholder2"),
     ]);
 
-    assert_eq!(signals.mint_to_first_transfer_seconds, 20);
+    assert_eq!(signals.first_transfer_delay_seconds, 20);
     assert!(signals.fast_spread);
 }
 
@@ -375,7 +375,7 @@ fn transfer_signals_return_zero_when_delay_is_zero_or_invalid() {
         TransferRecord::mint("0xdup", "1", 100, "0xholder1"),
         TransferRecord::transfer("0xdup", "1", 100, "0xholder1", "0xholder2"),
     ]);
-    assert_eq!(zero_delay.mint_to_first_transfer_seconds, 0);
+    assert_eq!(zero_delay.first_transfer_delay_seconds, 0);
     assert!(!zero_delay.fast_spread);
 
     let no_mint = analyze_transfer_signals(&[TransferRecord::transfer(
@@ -385,7 +385,7 @@ fn transfer_signals_return_zero_when_delay_is_zero_or_invalid() {
         "0xholder1",
         "0xholder2",
     )]);
-    assert_eq!(no_mint.mint_to_first_transfer_seconds, 0);
+    assert_eq!(no_mint.first_transfer_delay_seconds, 0);
     assert!(!no_mint.fast_spread);
 }
 
@@ -817,6 +817,8 @@ fn lifecycle_model_outputs_expose_research_graph_payloads() {
         candidate_count: 1,
         match_reasons: vec!["token_uri_match".into()],
         mint_recipients: vec!["0xseller".into()],
+        deployed_block_number: 8,
+        deployed_block_time: 80,
         ..DuplicateContractPayload::default()
     }];
     let transfers = vec![
@@ -948,6 +950,10 @@ fn lifecycle_model_outputs_expose_research_graph_payloads() {
             token_id: "1".into(),
             value_eth: Some(0.08),
             value_usd: None,
+            value_with_gas_eth: None,
+            value_with_gas_usd: None,
+            from_before_eth_balance: None,
+            from_before_usd_balance: None,
             payment_token_symbol: "ETH".into(),
             payment_token_address: ZERO_ADDRESS.into(),
             channel: "mint_payment".into(),
@@ -969,6 +975,10 @@ fn lifecycle_model_outputs_expose_research_graph_payloads() {
             token_id: "1".into(),
             value_eth: Some(0.08),
             value_usd: None,
+            value_with_gas_eth: None,
+            value_with_gas_usd: None,
+            from_before_eth_balance: None,
+            from_before_usd_balance: None,
             payment_token_symbol: "ETH".into(),
             payment_token_address: ZERO_ADDRESS.into(),
             channel: "funding".into(),
@@ -990,6 +1000,10 @@ fn lifecycle_model_outputs_expose_research_graph_payloads() {
             token_id: "1".into(),
             value_eth: Some(0.4),
             value_usd: None,
+            value_with_gas_eth: None,
+            value_with_gas_usd: None,
+            from_before_eth_balance: None,
+            from_before_usd_balance: None,
             payment_token_symbol: "ETH".into(),
             payment_token_address: ZERO_ADDRESS.into(),
             channel: "withdrawal".into(),
@@ -1083,9 +1097,9 @@ fn lifecycle_model_outputs_expose_research_graph_payloads() {
         .iter()
         .find(|event| {
             event.lifecycle_stage == "stage_transition"
-                && event.event_type == "copy_preparation_to_replica_mint"
+                && event.event_type == "replica_deployment_to_replica_mint"
         })
-        .expect("copy to mint transition event");
+        .expect("deployment to mint transition event");
     assert!(transition.detail.contains("evidence_flags"));
     assert!(!outputs.campaign_clusters[0]
         .suspected_operator_addresses
@@ -1102,7 +1116,7 @@ fn lifecycle_model_outputs_expose_research_graph_payloads() {
     assert!(!outputs.campaign_clusters[0]
         .lifecycle_stages
         .contains(&"reference_deployment".to_string()));
-    assert_eq!(outputs.campaign_clusters[0].first_block_number, 10);
+    assert_eq!(outputs.campaign_clusters[0].first_block_number, 8);
     assert!(outputs
         .lifecycle_metrics
         .iter()
@@ -1112,10 +1126,10 @@ fn lifecycle_model_outputs_expose_research_graph_payloads() {
         .iter()
         .find(|metric| metric.contract_address == "0xdup")
         .expect("contract lifecycle metric");
-    assert_eq!(metric.time_to_first_listing_seconds, Some(20));
-    assert_eq!(metric.time_to_first_sale_seconds, Some(80));
+    assert_eq!(metric.time_to_first_listing_seconds, Some(40));
+    assert_eq!(metric.time_to_first_sale_seconds, Some(100));
     assert_eq!(metric.first_victim_time, 100);
-    assert_eq!(metric.time_to_first_victim_seconds, Some(0));
+    assert_eq!(metric.time_to_first_victim_seconds, Some(20));
     assert_eq!(metric.market_event_count, 2);
     assert!((metric.gross_revenue_eth - 1.58).abs() < 1e-9);
     assert!((metric.operator_revenue_eth - 0.08).abs() < 1e-9);
@@ -1247,6 +1261,8 @@ fn early_detection_features_do_not_treat_undated_sales_as_window_observed() {
         contract_address: "0xdup".into(),
         candidate_count: 1,
         match_reasons: vec!["token_uri_match".into()],
+        deployed_block_number: 9,
+        deployed_block_time: 90,
         ..DuplicateContractPayload::default()
     }];
     let candidates = vec![DuplicateCandidate {

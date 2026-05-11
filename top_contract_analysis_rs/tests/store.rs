@@ -175,6 +175,53 @@ fn feature_store_recalls_metadata_candidates_from_representative_prefilter_keys(
 }
 
 #[test]
+fn feature_store_uses_representative_seed_metadata_for_template_recall() {
+    let store = DuckDbFeatureStore::new(":memory:").unwrap();
+    store
+        .replace_chain_rows(
+            "ethereum",
+            &[DatabaseNftRecord {
+                contract_address: "0xtemplate".into(),
+                token_id: "2".into(),
+                metadata_json: r#"{"attributes":[{"trait_type":"Background","value":"Red"}],"image":"ipfs://shared/2.png"}"#.into(),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+
+    let seed_nfts = vec![
+        SeedNft {
+            chain: "ethereum".into(),
+            contract_address: "0xseed".into(),
+            token_id: "1".into(),
+            metadata_json: r#"{"description":"unrelated alpha"}"#.into(),
+            ..Default::default()
+        },
+        SeedNft {
+            chain: "ethereum".into(),
+            contract_address: "0xseed".into(),
+            token_id: "2".into(),
+            metadata_json: r#"{"attributes":[{"trait_type":"Background","value":"Red"}],"image":"ipfs://shared/2.png"}"#.into(),
+            ..Default::default()
+        },
+    ];
+
+    let snapshot = store.load_snapshot("ethereum", &seed_nfts, 0, 0).unwrap();
+
+    assert!(snapshot.duplicate_contract_rows.is_empty());
+    assert!(!snapshot.contract_signals.contains_key("0xtemplate"));
+
+    let candidates = build_duplicate_candidates_from_contract_rows(
+        "ethereum",
+        &seed_nfts,
+        &snapshot.duplicate_contract_rows,
+        95.0,
+        0.9,
+    );
+    assert!(candidates.is_empty());
+}
+
+#[test]
 fn feature_store_limits_overlapping_metadata_rows_per_candidate_contract() {
     let store = DuckDbFeatureStore::new(":memory:").unwrap();
     store
@@ -666,6 +713,91 @@ fn feature_store_recalls_short_metadata_terms() {
         .collect();
     assert_eq!(contracts, vec!["0xshort"]);
     assert!(snapshot.contract_signals["0xshort"].keyword_match);
+}
+
+#[test]
+fn feature_store_does_not_limit_representative_metadata_template_terms() {
+    let store = DuckDbFeatureStore::new(":memory:").unwrap();
+    store
+        .replace_chain_rows(
+            "ethereum",
+            &[DatabaseNftRecord {
+                contract_address: "0xlate".into(),
+                token_id: "1".into(),
+                metadata_json: r#"{"description":"zz"}"#.into(),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+
+    let snapshot = store
+        .load_snapshot(
+            "ethereum",
+            &[SeedNft {
+                chain: "ethereum".into(),
+                contract_address: "0xseed".into(),
+                token_id: "1".into(),
+                metadata_json: r#"{"description":"alexandria boulevard charleston driftwood everglades fountainhead grandmaster hemisphere illuminate jewelcraft knowledgebase luminescence zz"}"#.into(),
+                ..Default::default()
+            }],
+            0,
+            0,
+        )
+        .unwrap();
+
+    let contracts: Vec<&str> = snapshot
+        .nft_rows
+        .iter()
+        .map(|row| row.contract_address.as_str())
+        .collect();
+    assert_eq!(contracts, vec!["0xlate"]);
+    assert!(snapshot.contract_signals["0xlate"].keyword_match);
+}
+
+#[test]
+fn feature_store_prioritizes_strong_signal_rows_over_metadata_only_cap_rows() {
+    let store = DuckDbFeatureStore::new(":memory:").unwrap();
+    store
+        .replace_chain_rows(
+            "ethereum",
+            &[
+                DatabaseNftRecord {
+                    contract_address: "0xdup".into(),
+                    token_id: "1".into(),
+                    metadata_json: r#"{"description":"template noise"}"#.into(),
+                    ..Default::default()
+                },
+                DatabaseNftRecord {
+                    contract_address: "0xdup".into(),
+                    token_id: "2".into(),
+                    token_uri: "ipfs://shared-token".into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+
+    let snapshot = store
+        .load_snapshot(
+            "ethereum",
+            &[SeedNft {
+                chain: "ethereum".into(),
+                contract_address: "0xseed".into(),
+                token_id: "1".into(),
+                token_uri: "ipfs://shared-token".into(),
+                metadata_json: r#"{"description":"template"}"#.into(),
+                ..Default::default()
+            }],
+            1,
+            0,
+        )
+        .unwrap();
+
+    assert_eq!(snapshot.duplicate_contract_rows.len(), 1);
+    let row = &snapshot.duplicate_contract_rows[0];
+    assert_eq!(row.contract_address, "0xdup");
+    assert!(row.token_uri_match);
+    assert_eq!(row.representative.token_id, "2");
 }
 
 #[test]

@@ -317,8 +317,8 @@ pub fn build_nft_propagation_path(
     }
     for item in malicious_addresses {
         add_role(&mut nodes, &item.address, "malicious");
-        if item.mint_role {
-            add_role(&mut nodes, &item.address, "mint_role");
+        if item.mint_activity_observed {
+            add_role(&mut nodes, &item.address, "mint_activity_observed");
         }
         if item.wash_cycle_count > 0 {
             add_role(&mut nodes, &item.address, "wash_cycle");

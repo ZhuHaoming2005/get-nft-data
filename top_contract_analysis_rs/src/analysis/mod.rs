@@ -20,13 +20,13 @@ use crate::api::{
 use crate::error::AppError;
 use crate::models::{
     AddressAttributionPayload, AddressSignalPayload, BatchReportSummary, BatchSeedReportPayload,
-    BatchSummaryPayload, ContractLevelSummaryPayload, ContractMetadata, DatabaseSnapshot,
-    DuplicateCandidate, DuplicateContractPayload, EthTransferRecord, FraudTradeStatsPayload,
-    HonestAddressPayload, HonestAddressStatsPayload, InfringingTokenRecord,
-    MaliciousAddressPayload, NftMarketEventRecord, NftPropagationPathPayload, NftSaleRecord,
-    OutputFilesPayload, OwnerBalance, ReportSummary, SecondarySaleVictimAddressPayload,
-    SeedCollectionStatsPayload, SeedContractPayload, SeedNft, SingleReportPayload,
-    TransactionReceiptRecord, TransferRecord, ValueFlowEdgePayload,
+    BatchSummaryPayload, ContractLevelSummaryPayload, ContractLifecycleMetricPayload,
+    ContractMetadata, DatabaseSnapshot, DuplicateCandidate, DuplicateContractPayload,
+    EthTransferRecord, FraudTradeStatsPayload, HonestAddressPayload, HonestAddressStatsPayload,
+    InfringingTokenRecord, MaliciousAddressPayload, NftMarketEventRecord,
+    NftPropagationPathPayload, NftSaleRecord, OutputFilesPayload, OwnerBalance, ReportSummary,
+    SecondarySaleVictimAddressPayload, SeedCollectionStatsPayload, SeedContractPayload, SeedNft,
+    SingleReportPayload, TransactionReceiptRecord, TransferRecord, ValueFlowEdgePayload,
     VictimAcquisitionAddressPayload, VictimSignalPayload, ZERO_ADDRESS,
 };
 use crate::normalize::{normalize_name, normalize_symbol, normalize_url};
@@ -1320,7 +1320,7 @@ async fn analyze_seed_contract_with_limits(
             .collect()
     };
     let summary_grouped = group_candidates_by_contract(&output_candidates);
-    let lifecycle_outputs =
+    let mut lifecycle_outputs =
         lifecycle::build_lifecycle_model_outputs(lifecycle::LifecycleModelInput {
             seed_contract: &seed_contract_payload,
             duplicate_candidates: &lifecycle_candidates,
@@ -1337,6 +1337,19 @@ async fn analyze_seed_contract_with_limits(
         &lifecycle_outputs.value_flow_edges,
         &nft_propagation_paths,
     );
+    address_attributions = address_records::add_acquisition_exposure_attribution_evidence(
+        address_attributions,
+        &victim_acquisition_addresses,
+    );
+    lifecycle_outputs = lifecycle::build_lifecycle_model_outputs(lifecycle::LifecycleModelInput {
+        seed_contract: &seed_contract_payload,
+        duplicate_candidates: &lifecycle_candidates,
+        duplicate_contracts: &duplicate_contracts,
+        address_attributions: &address_attributions,
+        nft_propagation_paths: &nft_propagation_paths,
+        mint_payment_edges: &mint_payment_edges,
+        market_events: &market_events,
+    });
 
     let payload = SingleReportPayload {
         seed_contract: seed_contract_payload,
@@ -1352,10 +1365,12 @@ async fn analyze_seed_contract_with_limits(
             &malicious_addresses,
             &honest_addresses,
             &secondary_sale_victim_addresses,
+            &victim_acquisition_addresses,
             &address_signals,
             &address_attributions,
             &lifecycle_outputs.value_flow_edges,
             &nft_propagation_paths,
+            &lifecycle_outputs.lifecycle_metrics,
         ),
         duplicate_contracts,
         legit_duplicates,
@@ -1451,6 +1466,7 @@ fn enrich_duplicate_contract_payload_with_metadata(
     if let Some(metadata) = metadata {
         payload.contract_deployer = metadata.contract_deployer.clone();
         payload.deployed_block_number = metadata.deployed_block_number;
+        payload.deployed_block_time = metadata.deployed_block_time;
         payload.token_type = metadata.token_type.clone();
         payload.owner_address = metadata.owner_address.clone();
         payload.admin_address = metadata.admin_address.clone();
@@ -1693,6 +1709,10 @@ async fn analyze_duplicate_contract(
         &contract_infringing,
         &contract_malicious,
         &mint_payment_edges,
+        contract_metadata
+            .as_ref()
+            .map(|metadata| metadata.deployed_block_time)
+            .unwrap_or_default(),
         analysis_timestamp,
     );
     let address_attributions = address_records::build_address_attribution_records(
@@ -1751,6 +1771,20 @@ struct MintPaymentLookup {
     token_ids: Vec<String>,
 }
 
+struct MintPaymentInputs {
+    lookup: MintPaymentLookup,
+    transfers: Vec<EthTransferRecord>,
+    receipt: Option<TransactionReceiptRecord>,
+    base_balance_eth: Option<f64>,
+    block_receipts: BTreeMap<String, TransactionReceiptRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MintPaymentWalletSnapshot {
+    before_eth_balance: Option<f64>,
+    before_usd_balance: Option<f64>,
+}
+
 async fn compute_mint_payment_edges_for_contract(
     request: &AnalyzeRequest,
     deps: &AnalysisDeps,
@@ -1807,14 +1841,68 @@ async fn compute_mint_payment_edges_for_contract(
                     }
                 }
             }
-            Ok::<_, AppError>((lookup, transfers))
+            let has_mint_payment_transfer = transfers.iter().any(|transfer| {
+                is_matching_mint_payment_transfer(
+                    transfer,
+                    &lookup,
+                    contract_address,
+                    &contract_deployer,
+                    contract_metadata,
+                )
+            });
+            if !has_mint_payment_transfer {
+                return Ok::<_, AppError>(MintPaymentInputs {
+                    lookup,
+                    transfers,
+                    receipt: None,
+                    base_balance_eth: None,
+                    block_receipts: BTreeMap::new(),
+                });
+            }
+            let (receipt, base_balance_eth, block_receipts) = tokio::join!(
+                deps.api.fetch_transaction_receipt_on_chain(
+                    &request.chain,
+                    &request.alchemy_api_key,
+                    request.alchemy_network.as_deref(),
+                    &lookup.tx_hash,
+                ),
+                deps.api.fetch_eth_balance_on_chain(
+                    &request.chain,
+                    &request.alchemy_api_key,
+                    request.alchemy_network.as_deref(),
+                    &lookup.minter_address,
+                    lookup.block_number - 1,
+                ),
+                deps.api.fetch_transaction_receipts_for_block_on_chain(
+                    &request.chain,
+                    &request.alchemy_api_key,
+                    request.alchemy_network.as_deref(),
+                    lookup.block_number,
+                )
+            );
+            Ok::<_, AppError>(MintPaymentInputs {
+                lookup,
+                transfers,
+                receipt: receipt.ok(),
+                base_balance_eth: base_balance_eth.ok(),
+                block_receipts: block_receipts.unwrap_or_default(),
+            })
         }
     }))
     .buffer_unordered(request.sale_metric_max_concurrency.max(1));
 
     let mut rows = BTreeMap::<String, ValueFlowEdgePayload>::new();
     while let Some(result) = fetched.next().await {
-        let (lookup, eth_transfers) = result?;
+        let inputs = result?;
+        let lookup = inputs.lookup;
+        let eth_transfers = inputs.transfers;
+        let wallet_snapshot = mint_payment_wallet_snapshot(
+            &lookup.minter_address,
+            inputs.base_balance_eth,
+            inputs.receipt.as_ref(),
+            &eth_transfers,
+            &inputs.block_receipts,
+        );
         for transfer in eth_transfers {
             if transfer.tx_hash != lookup.tx_hash
                 || (transfer.value_eth <= 0.0 && transfer.value_usd.unwrap_or(0.0) <= 0.0)
@@ -1836,6 +1924,10 @@ async fn compute_mint_payment_edges_for_contract(
                 channel, transfer.tx_hash, transfer.from_address, transfer.to_address
             );
             rows.entry(edge_id.clone()).or_insert(ValueFlowEdgePayload {
+                value_with_gas_eth: value_with_gas_eth(&transfer, inputs.receipt.as_ref()),
+                value_with_gas_usd: value_with_gas_usd(&transfer, inputs.receipt.as_ref()),
+                from_before_eth_balance: wallet_snapshot.before_eth_balance,
+                from_before_usd_balance: wallet_snapshot.before_usd_balance,
                 edge_id,
                 contract_address: contract_address.to_string(),
                 from_address: transfer.from_address,
@@ -1946,6 +2038,106 @@ fn classify_mint_value_flow_transfer(
         ));
     }
     None
+}
+
+fn mint_payment_wallet_snapshot(
+    minter_address: &str,
+    base_balance_eth: Option<f64>,
+    receipt: Option<&TransactionReceiptRecord>,
+    transfers: &[EthTransferRecord],
+    receipts_by_hash: &BTreeMap<String, TransactionReceiptRecord>,
+) -> MintPaymentWalletSnapshot {
+    let Some(base_balance_eth) = base_balance_eth else {
+        return MintPaymentWalletSnapshot::default();
+    };
+    let eth_usd_rate = infer_eth_usd_rate_from_transfers(transfers);
+    let mut same_block_eth_delta = 0.0;
+    let mut same_block_usd_delta = 0.0;
+    if let Some(receipt) = receipt {
+        for transfer in transfers {
+            let Some(transfer_receipt) = receipts_by_hash.get(&transfer.tx_hash) else {
+                continue;
+            };
+            if transfer_receipt.transaction_index >= receipt.transaction_index {
+                continue;
+            }
+            let sign = if transfer.to_address.eq_ignore_ascii_case(minter_address) {
+                1.0
+            } else if transfer.from_address.eq_ignore_ascii_case(minter_address) {
+                -1.0
+            } else {
+                continue;
+            };
+            same_block_eth_delta += sign * transfer.value_eth;
+            if let Some(value_usd) = transfer_value_usd(transfer, eth_usd_rate) {
+                same_block_usd_delta += sign * value_usd;
+            }
+        }
+    }
+    let before_eth_balance = (base_balance_eth + same_block_eth_delta).max(0.0);
+    let before_usd_balance =
+        eth_usd_rate.map(|rate| (base_balance_eth * rate + same_block_usd_delta).max(0.0));
+    MintPaymentWalletSnapshot {
+        before_eth_balance: Some(before_eth_balance),
+        before_usd_balance,
+    }
+}
+
+fn value_with_gas_eth(
+    transfer: &EthTransferRecord,
+    receipt: Option<&TransactionReceiptRecord>,
+) -> Option<f64> {
+    let value_eth = (transfer.value_eth > 0.0).then_some(transfer.value_eth)?;
+    let gas_eth = receipt
+        .filter(|receipt| {
+            receipt
+                .from_address
+                .eq_ignore_ascii_case(&transfer.from_address)
+        })
+        .map(gas_eth_from_receipt)
+        .unwrap_or_default();
+    Some(value_eth + gas_eth)
+}
+
+fn value_with_gas_usd(
+    transfer: &EthTransferRecord,
+    receipt: Option<&TransactionReceiptRecord>,
+) -> Option<f64> {
+    let value_usd = transfer.value_usd?;
+    let gas_usd = receipt
+        .filter(|receipt| {
+            receipt
+                .from_address
+                .eq_ignore_ascii_case(&transfer.from_address)
+        })
+        .and_then(|receipt| {
+            infer_eth_usd_rate_from_transfer(transfer)
+                .map(|rate| gas_eth_from_receipt(receipt) * rate)
+        })
+        .unwrap_or_default();
+    Some(value_usd + gas_usd)
+}
+
+fn gas_eth_from_receipt(receipt: &TransactionReceiptRecord) -> f64 {
+    (receipt.gas_used as f64 * receipt.effective_gas_price_wei as f64)
+        / 1_000_000_000_000_000_000_f64
+}
+
+fn infer_eth_usd_rate_from_transfers(transfers: &[EthTransferRecord]) -> Option<f64> {
+    transfers.iter().find_map(infer_eth_usd_rate_from_transfer)
+}
+
+fn infer_eth_usd_rate_from_transfer(transfer: &EthTransferRecord) -> Option<f64> {
+    transfer
+        .value_usd
+        .filter(|value| *value > 0.0 && transfer.value_eth > 0.0)
+        .map(|value| value / transfer.value_eth)
+}
+
+fn transfer_value_usd(transfer: &EthTransferRecord, eth_usd_rate: Option<f64>) -> Option<f64> {
+    transfer
+        .value_usd
+        .or_else(|| eth_usd_rate.map(|rate| transfer.value_eth * rate))
 }
 
 fn contract_control_role<'a>(
@@ -2147,7 +2339,7 @@ fn map_address_signals(signals: &crate::models::AddressSignals) -> AddressSignal
         unique_receiver_count: signals.unique_receiver_count as i64,
         cycle_edge_count: signals.cycle_edge_count as i64,
         star_distributor_count: signals.star_distributor_count as i64,
-        mint_to_first_transfer_seconds: signals.mint_to_first_transfer_seconds,
+        first_transfer_delay_seconds: signals.first_transfer_delay_seconds,
         fast_spread: signals.fast_spread,
     }
 }
@@ -3254,19 +3446,6 @@ fn paid_mint_victim_address_set(
         .collect()
 }
 
-fn build_victim_acquisition_address_set(
-    secondary_sale_victim_addresses: &[SecondarySaleVictimAddressPayload],
-    address_attributions: &[AddressAttributionPayload],
-) -> BTreeSet<String> {
-    let mut addresses: BTreeSet<String> = secondary_sale_victim_addresses
-        .iter()
-        .map(|item| normalized_address(&item.address))
-        .filter(|value| !value.is_empty())
-        .collect();
-    addresses.extend(paid_mint_victim_address_set(address_attributions));
-    addresses
-}
-
 fn build_victim_acquisition_addresses(
     secondary_sale_victim_addresses: &[SecondarySaleVictimAddressPayload],
     address_attributions: &[AddressAttributionPayload],
@@ -3287,6 +3466,7 @@ fn build_victim_acquisition_addresses(
     }
 
     let mut rows = BTreeMap::<String, VictimAcquisitionAddressPayload>::new();
+    let mut gas_extra_by_address = BTreeMap::<String, (f64, f64)>::new();
     for victim in secondary_sale_victim_addresses {
         let address = normalized_address(&victim.address);
         if address.is_empty() {
@@ -3309,11 +3489,28 @@ fn build_victim_acquisition_addresses(
             row.secondary_sale_stuck_cost_usd += victim.last_buy_amount_usd.unwrap_or_default();
             row.is_stuck = true;
         }
+        if row.buy_before_eth_balance.is_none() {
+            row.buy_before_eth_balance = victim.buy_before_eth_balance;
+        }
+        if row.buy_before_usd_balance.is_none() {
+            row.buy_before_usd_balance = victim.buy_before_usd_balance;
+        }
         if row.buy_asset_ratio.is_none() {
             row.buy_asset_ratio = victim.buy_asset_ratio;
         }
         if row.buy_asset_ratio_with_gas.is_none() {
             row.buy_asset_ratio_with_gas = victim.buy_asset_ratio_with_gas;
+        }
+        let gas_extra = ratio_gas_extra(
+            victim.buy_asset_ratio,
+            victim.buy_asset_ratio_with_gas,
+            victim.buy_before_usd_balance,
+            victim.buy_before_eth_balance,
+        );
+        if gas_extra.0 > 0.0 || gas_extra.1 > 0.0 {
+            let entry = gas_extra_by_address.entry(address).or_default();
+            entry.0 += gas_extra.0;
+            entry.1 += gas_extra.1;
         }
     }
 
@@ -3336,6 +3533,27 @@ fn build_victim_acquisition_addresses(
         push_unique(&mut row.tx_hashes, &edge.tx_hash);
         row.paid_mint_cost_eth += edge.value_eth.unwrap_or_default();
         row.paid_mint_cost_usd += edge.value_usd.unwrap_or_default();
+        if row.buy_before_eth_balance.is_none() {
+            row.buy_before_eth_balance = edge.from_before_eth_balance;
+        }
+        if row.buy_before_usd_balance.is_none() {
+            row.buy_before_usd_balance = edge.from_before_usd_balance;
+        }
+        let value_with_gas_eth = edge
+            .value_with_gas_eth
+            .unwrap_or_else(|| edge.value_eth.unwrap_or_default());
+        let value_with_gas_usd = edge
+            .value_with_gas_usd
+            .unwrap_or_else(|| edge.value_usd.unwrap_or_default());
+        let gas_extra_eth = (value_with_gas_eth - edge.value_eth.unwrap_or_default()).max(0.0);
+        let gas_extra_usd = (value_with_gas_usd - edge.value_usd.unwrap_or_default()).max(0.0);
+        if gas_extra_eth > 0.0 || gas_extra_usd > 0.0 {
+            let entry = gas_extra_by_address
+                .entry(row.address.to_lowercase())
+                .or_default();
+            entry.0 += gas_extra_eth;
+            entry.1 += gas_extra_usd;
+        }
         row.paid_mint_edge_count += 1;
         let (stuck_token_count, total_token_count) =
             paid_mint_stuck_token_counts(edge, propagation_paths);
@@ -3357,9 +3575,68 @@ fn build_victim_acquisition_addresses(
         row.total_acquisition_cost_usd = row.secondary_sale_cost_usd + row.paid_mint_cost_usd;
         row.total_stuck_cost_eth = row.secondary_sale_stuck_cost_eth + row.paid_mint_stuck_cost_eth;
         row.total_stuck_cost_usd = row.secondary_sale_stuck_cost_usd + row.paid_mint_stuck_cost_usd;
+        row.buy_asset_ratio = acquisition_ratio(
+            row.total_acquisition_cost_usd,
+            row.total_acquisition_cost_eth,
+            row.buy_before_usd_balance,
+            row.buy_before_eth_balance,
+        )
+        .or(row.buy_asset_ratio);
+        let (gas_extra_eth, gas_extra_usd) = gas_extra_by_address
+            .get(address)
+            .copied()
+            .unwrap_or_default();
+        row.buy_asset_ratio_with_gas = acquisition_ratio(
+            row.total_acquisition_cost_usd + gas_extra_usd,
+            row.total_acquisition_cost_eth + gas_extra_eth,
+            row.buy_before_usd_balance,
+            row.buy_before_eth_balance,
+        )
+        .or(row.buy_asset_ratio_with_gas);
     }
 
     rows.into_values().collect()
+}
+
+fn acquisition_ratio(
+    acquisition_cost_usd: f64,
+    acquisition_cost_eth: f64,
+    before_usd_balance: Option<f64>,
+    before_eth_balance: Option<f64>,
+) -> Option<f64> {
+    if let Some(balance) = before_usd_balance.filter(|value| *value > 0.0) {
+        if acquisition_cost_usd > 0.0 {
+            return Some(acquisition_cost_usd / balance);
+        }
+    }
+    if let Some(balance) = before_eth_balance.filter(|value| *value > 0.0) {
+        if acquisition_cost_eth > 0.0 {
+            return Some(acquisition_cost_eth / balance);
+        }
+    }
+    None
+}
+
+fn ratio_gas_extra(
+    ratio_without_gas: Option<f64>,
+    ratio_with_gas: Option<f64>,
+    before_usd_balance: Option<f64>,
+    before_eth_balance: Option<f64>,
+) -> (f64, f64) {
+    let Some(delta_ratio) = ratio_with_gas
+        .zip(ratio_without_gas)
+        .map(|(with_gas, without_gas)| with_gas - without_gas)
+        .filter(|value| *value > 0.0)
+    else {
+        return (0.0, 0.0);
+    };
+    if let Some(balance) = before_usd_balance.filter(|value| *value > 0.0) {
+        return (0.0, delta_ratio * balance);
+    }
+    if let Some(balance) = before_eth_balance.filter(|value| *value > 0.0) {
+        return (delta_ratio * balance, 0.0);
+    }
+    (0.0, 0.0)
 }
 
 fn push_unique(values: &mut Vec<String>, value: &str) {
@@ -3454,10 +3731,12 @@ fn build_report_summary(
     malicious_addresses: &[MaliciousAddressPayload],
     honest_addresses: &[HonestAddressPayload],
     secondary_sale_victim_addresses: &[SecondarySaleVictimAddressPayload],
+    victim_acquisition_addresses: &[VictimAcquisitionAddressPayload],
     address_signals: &BTreeMap<String, AddressSignalPayload>,
     address_attributions: &[AddressAttributionPayload],
     value_flow_edges: &[ValueFlowEdgePayload],
     propagation_paths: &BTreeMap<String, NftPropagationPathPayload>,
+    lifecycle_metrics: &[ContractLifecycleMetricPayload],
 ) -> ReportSummary {
     let infringing_nft_count = infringing_tokens
         .iter()
@@ -3519,7 +3798,7 @@ fn build_report_summary(
         .filter(|item| item.is_stuck)
         .map(|item| item.last_buy_amount_usd.unwrap_or(0.0))
         .sum::<f64>();
-    let buy_ratio_values: Vec<f64> = secondary_sale_victim_addresses
+    let buy_ratio_values: Vec<f64> = victim_acquisition_addresses
         .iter()
         .filter_map(|item| item.buy_asset_ratio)
         .collect();
@@ -3532,7 +3811,7 @@ fn build_report_summary(
         .iter()
         .filter(|value| **value > 0.8)
         .count() as i64;
-    let stuck_victim_address_count = secondary_sale_victim_addresses
+    let stuck_victim_address_count = victim_acquisition_addresses
         .iter()
         .filter(|item| item.is_stuck)
         .count() as i64;
@@ -3545,17 +3824,18 @@ fn build_report_summary(
         .filter(|item| item.is_corrupted_address)
         .filter_map(|item| item.hold_duration_median_seconds)
         .collect();
-    let mint_to_neutral_holder_samples: Vec<f64> = honest_addresses
+    let deployment_to_neutral_holder_samples: Vec<f64> = honest_addresses
         .iter()
         .flat_map(|item| {
-            item.mint_to_honest_seconds_samples
+            item.deployment_to_neutral_holder_seconds_samples
                 .iter()
                 .filter_map(|sample| positive_seconds(*sample))
         })
         .collect();
-    let mint_to_first_transfer_values: Vec<f64> = address_signals
-        .values()
-        .filter_map(|signal| positive_seconds(signal.mint_to_first_transfer_seconds))
+    let deployment_to_first_transfer_values: Vec<f64> = lifecycle_metrics
+        .iter()
+        .filter_map(|metric| metric.time_to_first_transfer_seconds)
+        .filter_map(positive_seconds)
         .collect();
     let unique_receiver_values: Vec<f64> = address_signals
         .values()
@@ -3616,11 +3896,7 @@ fn build_report_summary(
         victim_acquisition_stuck_cost_eth,
         victim_acquisition_stuck_cost_usd,
         victim_acquisition_stuck_cost_ratio,
-        victim_acquisition_address_count: build_victim_acquisition_address_set(
-            secondary_sale_victim_addresses,
-            address_attributions,
-        )
-        .len() as i64,
+        victim_acquisition_address_count: victim_acquisition_addresses.len() as i64,
         stablecoin_erc20_value_usd: acquisition_stats.stablecoin_erc20_value_usd,
         stablecoin_erc20_edge_count: acquisition_stats.stablecoin_erc20_edge_count,
         value_flow_priced_edge_count: acquisition_stats.value_flow_priced_edge_count,
@@ -3639,18 +3915,22 @@ fn build_report_summary(
             None
         },
         stuck_victim_address_count,
-        stuck_victim_address_ratio: if !secondary_sale_victim_addresses.is_empty() {
-            Some(stuck_victim_address_count as f64 / secondary_sale_victim_addresses.len() as f64)
+        stuck_victim_address_ratio: if !victim_acquisition_addresses.is_empty() {
+            Some(stuck_victim_address_count as f64 / victim_acquisition_addresses.len() as f64)
         } else {
             None
         },
         corrupted_victim_address_count,
         avg_corrupted_address_holding_seconds: mean_f64(&corrupted_holding_values),
         median_corrupted_address_holding_seconds: median_f64(&corrupted_holding_values),
-        avg_seconds_to_neutral_holder: mean_f64(&mint_to_neutral_holder_samples),
-        median_seconds_to_neutral_holder: median_f64(&mint_to_neutral_holder_samples),
-        avg_mint_to_first_transfer_seconds: mean_f64(&mint_to_first_transfer_values),
-        median_mint_to_first_transfer_seconds: median_f64(&mint_to_first_transfer_values),
+        avg_deployment_to_neutral_holder_seconds: mean_f64(&deployment_to_neutral_holder_samples),
+        median_deployment_to_neutral_holder_seconds: median_f64(
+            &deployment_to_neutral_holder_samples,
+        ),
+        avg_deployment_to_first_transfer_seconds: mean_f64(&deployment_to_first_transfer_values),
+        median_deployment_to_first_transfer_seconds: median_f64(
+            &deployment_to_first_transfer_values,
+        ),
         avg_unique_receiver_count: mean_f64(&unique_receiver_values),
     }
 }
@@ -3831,18 +4111,26 @@ fn build_batch_report_summary(seed_reports: &[BatchSeedAggregate]) -> BatchRepor
         .collect();
     let mean_neutral_holder_values: Vec<f64> = seed_reports
         .iter()
-        .filter_map(|item| item.report.report_summary.avg_seconds_to_neutral_holder)
+        .filter_map(|item| {
+            item.report
+                .report_summary
+                .avg_deployment_to_neutral_holder_seconds
+        })
         .collect();
     let median_neutral_holder_values: Vec<f64> = seed_reports
         .iter()
-        .filter_map(|item| item.report.report_summary.median_seconds_to_neutral_holder)
+        .filter_map(|item| {
+            item.report
+                .report_summary
+                .median_deployment_to_neutral_holder_seconds
+        })
         .collect();
     let mean_first_transfer_values: Vec<f64> = seed_reports
         .iter()
         .filter_map(|item| {
             item.report
                 .report_summary
-                .avg_mint_to_first_transfer_seconds
+                .avg_deployment_to_first_transfer_seconds
         })
         .filter(|value| *value > 0.0)
         .collect();
@@ -3851,7 +4139,7 @@ fn build_batch_report_summary(seed_reports: &[BatchSeedAggregate]) -> BatchRepor
         .filter_map(|item| {
             item.report
                 .report_summary
-                .median_mint_to_first_transfer_seconds
+                .median_deployment_to_first_transfer_seconds
         })
         .filter(|value| *value > 0.0)
         .collect();
@@ -3957,10 +4245,10 @@ fn build_batch_report_summary(seed_reports: &[BatchSeedAggregate]) -> BatchRepor
             None
         },
         stuck_victim_address_count_total,
-        stuck_victim_address_ratio_overall: if buy_asset_ratio_known_address_count_total > 0 {
+        stuck_victim_address_ratio_overall: if victim_acquisition_address_count_total > 0 {
             Some(
                 stuck_victim_address_count_total as f64
-                    / buy_asset_ratio_known_address_count_total as f64,
+                    / victim_acquisition_address_count_total as f64,
             )
         } else {
             None
@@ -3973,10 +4261,14 @@ fn build_batch_report_summary(seed_reports: &[BatchSeedAggregate]) -> BatchRepor
         median_corrupted_address_holding_seconds_median: median_f64(
             &median_corrupted_holding_values,
         ),
-        avg_seconds_to_neutral_holder_mean: mean(&mean_neutral_holder_values),
-        median_seconds_to_neutral_holder_median: median_f64(&median_neutral_holder_values),
-        avg_mint_to_first_transfer_seconds_mean: mean(&mean_first_transfer_values),
-        median_mint_to_first_transfer_seconds_median: median_f64(&median_first_transfer_values),
+        avg_deployment_to_neutral_holder_seconds_mean: mean(&mean_neutral_holder_values),
+        median_deployment_to_neutral_holder_seconds_median: median_f64(
+            &median_neutral_holder_values,
+        ),
+        avg_deployment_to_first_transfer_seconds_mean: mean(&mean_first_transfer_values),
+        median_deployment_to_first_transfer_seconds_median: median_f64(
+            &median_first_transfer_values,
+        ),
         avg_unique_receiver_count_mean: mean(&mean_unique_receiver_values),
         generated_at: chrono::Utc::now().to_rfc3339(),
     }
@@ -4027,22 +4319,31 @@ fn payload_minter_contracts(
 }
 
 #[cfg(test)]
-fn payload_median_seconds_to_neutral_holder(payload: &SingleReportPayload) -> Option<f64> {
+fn payload_median_deployment_to_neutral_holder_seconds(
+    payload: &SingleReportPayload,
+) -> Option<f64> {
     let values: Vec<f64> = payload
         .honest_addresses
         .iter()
-        .flat_map(|item| item.mint_to_honest_seconds_samples.iter().copied())
+        .flat_map(|item| {
+            item.deployment_to_neutral_holder_seconds_samples
+                .iter()
+                .copied()
+        })
         .filter_map(positive_seconds)
         .collect();
     median_f64(&values)
 }
 
 #[cfg(test)]
-fn payload_median_mint_to_first_transfer_seconds(payload: &SingleReportPayload) -> Option<f64> {
+fn payload_median_deployment_to_first_transfer_seconds(
+    payload: &SingleReportPayload,
+) -> Option<f64> {
     let values: Vec<f64> = payload
-        .address_signals
-        .values()
-        .filter_map(|signal| positive_seconds(signal.mint_to_first_transfer_seconds))
+        .lifecycle_metrics
+        .iter()
+        .filter_map(|metric| metric.time_to_first_transfer_seconds)
+        .filter_map(positive_seconds)
         .collect();
     median_f64(&values)
 }
@@ -4077,30 +4378,24 @@ mod tests {
     use crate::models::{AddressEvidencePayload, NftTokenPropagationPayload};
 
     #[test]
-    fn report_summary_ignores_zero_mint_to_first_transfer_samples() {
-        let address_signals = BTreeMap::from([
-            (
-                "0xmintonly".into(),
-                AddressSignalPayload {
-                    mint_to_first_transfer_seconds: 0,
-                    ..AddressSignalPayload::default()
-                },
-            ),
-            (
-                "0xfast".into(),
-                AddressSignalPayload {
-                    mint_to_first_transfer_seconds: 8,
-                    ..AddressSignalPayload::default()
-                },
-            ),
-            (
-                "0xslow".into(),
-                AddressSignalPayload {
-                    mint_to_first_transfer_seconds: 20,
-                    ..AddressSignalPayload::default()
-                },
-            ),
-        ]);
+    fn report_summary_uses_deployment_to_first_transfer_samples() {
+        let lifecycle_metrics = vec![
+            ContractLifecycleMetricPayload {
+                contract_address: "0xdeployonly".into(),
+                time_to_first_transfer_seconds: Some(0),
+                ..ContractLifecycleMetricPayload::default()
+            },
+            ContractLifecycleMetricPayload {
+                contract_address: "0xfast".into(),
+                time_to_first_transfer_seconds: Some(8),
+                ..ContractLifecycleMetricPayload::default()
+            },
+            ContractLifecycleMetricPayload {
+                contract_address: "0xslow".into(),
+                time_to_first_transfer_seconds: Some(20),
+                ..ContractLifecycleMetricPayload::default()
+            },
+        ];
 
         let summary = build_report_summary(
             false,
@@ -4111,32 +4406,37 @@ mod tests {
             &[],
             &[],
             &[],
-            &address_signals,
+            &[],
+            &BTreeMap::new(),
             &[],
             &[],
             &BTreeMap::new(),
+            &lifecycle_metrics,
         );
 
-        assert_eq!(summary.avg_mint_to_first_transfer_seconds, Some(14.0));
-        assert_eq!(summary.median_mint_to_first_transfer_seconds, Some(14.0));
+        assert_eq!(summary.avg_deployment_to_first_transfer_seconds, Some(14.0));
+        assert_eq!(
+            summary.median_deployment_to_first_transfer_seconds,
+            Some(14.0)
+        );
     }
 
     #[test]
-    fn report_summary_ignores_zero_mint_to_honest_holder_samples() {
+    fn report_summary_ignores_zero_deployment_to_neutral_holder_samples() {
         let honest_addresses = vec![
             HonestAddressPayload {
                 address: "0xmintvictim".into(),
-                mint_to_honest_seconds_samples: vec![0],
+                deployment_to_neutral_holder_seconds_samples: vec![0],
                 ..HonestAddressPayload::default()
             },
             HonestAddressPayload {
                 address: "0xpropagated1".into(),
-                mint_to_honest_seconds_samples: vec![12],
+                deployment_to_neutral_holder_seconds_samples: vec![12],
                 ..HonestAddressPayload::default()
             },
             HonestAddressPayload {
                 address: "0xpropagated2".into(),
-                mint_to_honest_seconds_samples: vec![20],
+                deployment_to_neutral_holder_seconds_samples: vec![20],
                 ..HonestAddressPayload::default()
             },
         ];
@@ -4150,14 +4450,19 @@ mod tests {
             &[],
             &honest_addresses,
             &[],
+            &[],
             &BTreeMap::new(),
             &[],
             &[],
             &BTreeMap::new(),
+            &[],
         );
 
-        assert_eq!(summary.avg_seconds_to_neutral_holder, Some(16.0));
-        assert_eq!(summary.median_seconds_to_neutral_holder, Some(16.0));
+        assert_eq!(summary.avg_deployment_to_neutral_holder_seconds, Some(16.0));
+        assert_eq!(
+            summary.median_deployment_to_neutral_holder_seconds,
+            Some(16.0)
+        );
     }
 
     #[test]
@@ -4198,10 +4503,12 @@ mod tests {
             &[],
             &honest_addresses,
             &[],
+            &[],
             &BTreeMap::new(),
             &[],
             &[],
             &BTreeMap::new(),
+            &[],
         );
 
         assert_eq!(summary.corrupted_victim_address_count, 3);
@@ -4210,43 +4517,37 @@ mod tests {
     }
 
     #[test]
-    fn cached_payload_median_ignores_zero_mint_to_first_transfer_samples() {
+    fn cached_payload_median_ignores_zero_deployment_to_first_transfer_samples() {
         let payload = SingleReportPayload {
-            address_signals: BTreeMap::from([
-                (
-                    "0xmintonly".into(),
-                    AddressSignalPayload {
-                        mint_to_first_transfer_seconds: 0,
-                        ..AddressSignalPayload::default()
-                    },
-                ),
-                (
-                    "0xtransfer".into(),
-                    AddressSignalPayload {
-                        mint_to_first_transfer_seconds: 12,
-                        ..AddressSignalPayload::default()
-                    },
-                ),
-            ]),
+            lifecycle_metrics: vec![
+                ContractLifecycleMetricPayload {
+                    time_to_first_transfer_seconds: Some(0),
+                    ..ContractLifecycleMetricPayload::default()
+                },
+                ContractLifecycleMetricPayload {
+                    time_to_first_transfer_seconds: Some(12),
+                    ..ContractLifecycleMetricPayload::default()
+                },
+            ],
             ..SingleReportPayload::default()
         };
 
         assert_eq!(
-            payload_median_mint_to_first_transfer_seconds(&payload),
+            payload_median_deployment_to_first_transfer_seconds(&payload),
             Some(12.0)
         );
     }
 
     #[test]
-    fn cached_payload_median_ignores_zero_mint_to_honest_holder_samples() {
+    fn cached_payload_median_ignores_zero_deployment_to_neutral_holder_samples() {
         let payload = SingleReportPayload {
             honest_addresses: vec![
                 HonestAddressPayload {
-                    mint_to_honest_seconds_samples: vec![0],
+                    deployment_to_neutral_holder_seconds_samples: vec![0],
                     ..HonestAddressPayload::default()
                 },
                 HonestAddressPayload {
-                    mint_to_honest_seconds_samples: vec![12, 20],
+                    deployment_to_neutral_holder_seconds_samples: vec![12, 20],
                     ..HonestAddressPayload::default()
                 },
             ],
@@ -4254,7 +4555,7 @@ mod tests {
         };
 
         assert_eq!(
-            payload_median_seconds_to_neutral_holder(&payload),
+            payload_median_deployment_to_neutral_holder_seconds(&payload),
             Some(16.0)
         );
     }
@@ -4319,6 +4620,12 @@ mod tests {
                 ..NftPropagationPathPayload::default()
             },
         )]);
+        let victim_acquisition_addresses = build_victim_acquisition_addresses(
+            &secondary_sale_victim_addresses,
+            &address_attributions,
+            &value_flow_edges,
+            &propagation_paths,
+        );
 
         let summary = build_report_summary(
             false,
@@ -4329,10 +4636,12 @@ mod tests {
             &[],
             &[],
             &secondary_sale_victim_addresses,
+            &victim_acquisition_addresses,
             &BTreeMap::new(),
             &address_attributions,
             &value_flow_edges,
             &propagation_paths,
+            &[],
         );
 
         assert_eq!(summary.secondary_sale_victim_cost_eth, 0.5);
@@ -4344,6 +4653,189 @@ mod tests {
         assert_eq!(summary.victim_acquisition_total_eth, 2.5);
         assert_eq!(summary.victim_acquisition_stuck_cost_eth, 1.25);
         assert_eq!(summary.victim_acquisition_address_count, 2);
+    }
+
+    #[test]
+    fn victim_acquisition_ratio_uses_total_cost_for_all_acquisition_channels() {
+        let secondary_sale_victim_addresses = vec![SecondarySaleVictimAddressPayload {
+            contract_address: "0xdup".into(),
+            address: "0xvictim".into(),
+            buy_tx_hashes: vec!["0xbuy".into()],
+            buy_amount_eth: 4.0,
+            buy_amount_usd: 4_000.0,
+            buy_before_eth_balance: Some(10.0),
+            buy_before_usd_balance: Some(10_000.0),
+            buy_asset_ratio: Some(0.4),
+            ..SecondarySaleVictimAddressPayload::default()
+        }];
+        let address_attributions = vec![AddressAttributionPayload {
+            contract_address: "0xdup".into(),
+            address: "0xvictim".into(),
+            attribution_label: "likely_victim".into(),
+            evidence: vec![AddressEvidencePayload {
+                evidence_type: "paid_mint_payment".into(),
+                contract_address: "0xdup".into(),
+                token_id: "1".into(),
+                tx_hash: "0xmint".into(),
+                weight: 0.45,
+                detail: "paid mint victim evidence".into(),
+            }],
+            ..AddressAttributionPayload::default()
+        }];
+        let value_flow_edges = vec![ValueFlowEdgePayload {
+            edge_id: "value:mint_payment:0xmint".into(),
+            contract_address: "0xdup".into(),
+            from_address: "0xvictim".into(),
+            tx_hash: "0xmint".into(),
+            token_id: "1".into(),
+            value_eth: Some(3.0),
+            value_usd: Some(3_000.0),
+            channel: "mint_payment".into(),
+            ..ValueFlowEdgePayload::default()
+        }];
+        let victim_acquisition_addresses = build_victim_acquisition_addresses(
+            &secondary_sale_victim_addresses,
+            &address_attributions,
+            &value_flow_edges,
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(victim_acquisition_addresses.len(), 1);
+        assert_eq!(
+            victim_acquisition_addresses[0].total_acquisition_cost_eth,
+            7.0
+        );
+        assert_eq!(victim_acquisition_addresses[0].buy_asset_ratio, Some(0.7));
+
+        let summary = build_report_summary(
+            false,
+            &BTreeMap::new(),
+            0,
+            &[],
+            &[],
+            &[],
+            &[],
+            &secondary_sale_victim_addresses,
+            &victim_acquisition_addresses,
+            &BTreeMap::new(),
+            &address_attributions,
+            &value_flow_edges,
+            &BTreeMap::new(),
+            &[],
+        );
+
+        assert_eq!(summary.buy_asset_ratio_known_address_count, 1);
+        assert_eq!(summary.ratio_over_60_address_count, 1);
+        assert_eq!(summary.ratio_over_60_address_ratio, Some(1.0));
+    }
+
+    #[test]
+    fn victim_acquisition_ratio_with_gas_preserves_secondary_sale_gas_delta() {
+        let secondary_sale_victim_addresses = vec![SecondarySaleVictimAddressPayload {
+            contract_address: "0xdup".into(),
+            address: "0xvictim".into(),
+            buy_tx_hashes: vec!["0xbuy".into()],
+            buy_amount_eth: 4.0,
+            buy_amount_usd: 4_000.0,
+            buy_before_eth_balance: Some(10.0),
+            buy_before_usd_balance: Some(10_000.0),
+            buy_asset_ratio: Some(0.4),
+            buy_asset_ratio_with_gas: Some(0.45),
+            ..SecondarySaleVictimAddressPayload::default()
+        }];
+        let address_attributions = vec![AddressAttributionPayload {
+            contract_address: "0xdup".into(),
+            address: "0xvictim".into(),
+            attribution_label: "likely_victim".into(),
+            evidence: vec![AddressEvidencePayload {
+                evidence_type: "paid_mint_payment".into(),
+                contract_address: "0xdup".into(),
+                token_id: "1".into(),
+                tx_hash: "0xmint".into(),
+                weight: 0.45,
+                detail: "paid mint victim evidence".into(),
+            }],
+            ..AddressAttributionPayload::default()
+        }];
+        let value_flow_edges = vec![ValueFlowEdgePayload {
+            edge_id: "value:mint_payment:0xmint".into(),
+            contract_address: "0xdup".into(),
+            from_address: "0xvictim".into(),
+            tx_hash: "0xmint".into(),
+            token_id: "1".into(),
+            value_eth: Some(3.0),
+            value_usd: Some(3_000.0),
+            channel: "mint_payment".into(),
+            ..ValueFlowEdgePayload::default()
+        }];
+
+        let rows = build_victim_acquisition_addresses(
+            &secondary_sale_victim_addresses,
+            &address_attributions,
+            &value_flow_edges,
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(rows[0].buy_asset_ratio, Some(0.7));
+        assert_eq!(rows[0].buy_asset_ratio_with_gas, Some(0.75));
+    }
+
+    #[test]
+    fn paid_mint_only_victim_ratio_uses_observed_pre_mint_eth_balance() {
+        let address_attributions = vec![AddressAttributionPayload {
+            contract_address: "0xdup".into(),
+            address: "0xvictim".into(),
+            attribution_label: "likely_victim".into(),
+            evidence: vec![AddressEvidencePayload {
+                evidence_type: "paid_mint_payment".into(),
+                contract_address: "0xdup".into(),
+                token_id: "1".into(),
+                tx_hash: "0xmint".into(),
+                weight: 0.45,
+                detail: "paid mint victim evidence".into(),
+            }],
+            ..AddressAttributionPayload::default()
+        }];
+        let value_flow_edges = vec![ValueFlowEdgePayload {
+            edge_id: "value:mint_payment:0xmint".into(),
+            contract_address: "0xdup".into(),
+            from_address: "0xvictim".into(),
+            tx_hash: "0xmint".into(),
+            token_id: "1".into(),
+            value_eth: Some(7.0),
+            value_usd: Some(7_000.0),
+            from_before_eth_balance: Some(10.0),
+            from_before_usd_balance: Some(10_000.0),
+            channel: "mint_payment".into(),
+            ..ValueFlowEdgePayload::default()
+        }];
+
+        let victim_acquisition_addresses = build_victim_acquisition_addresses(
+            &[],
+            &address_attributions,
+            &value_flow_edges,
+            &BTreeMap::new(),
+        );
+        let summary = build_report_summary(
+            false,
+            &BTreeMap::new(),
+            0,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &victim_acquisition_addresses,
+            &BTreeMap::new(),
+            &address_attributions,
+            &value_flow_edges,
+            &BTreeMap::new(),
+            &[],
+        );
+
+        assert_eq!(victim_acquisition_addresses[0].buy_asset_ratio, Some(0.7));
+        assert_eq!(summary.buy_asset_ratio_known_address_count, 1);
+        assert_eq!(summary.ratio_over_60_address_count, 1);
     }
 
     #[test]

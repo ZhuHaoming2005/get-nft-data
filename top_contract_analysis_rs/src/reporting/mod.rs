@@ -208,21 +208,21 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
             summary.value_flow_priced_edge_count, summary.value_flow_unpriced_edge_count
         ),
         format!(
-            "- 可计算买入占比的二级市场受害者数: {}",
+            "- 可计算获取成本占比的受害者数: {}",
             summary.buy_asset_ratio_known_address_count
         ),
         format!(
-            "- 买入金额占钱包总额 >60% 的受害者数/占比: {} / {}",
+            "- 获取成本占购买前 ETH 余额估算 >60% 的受害者数/占比: {} / {}",
             summary.ratio_over_60_address_count,
             format_ratio(summary.ratio_over_60_address_ratio)
         ),
         format!(
-            "- 买入金额占钱包总额 >80% 的受害者数/占比: {} / {}",
+            "- 获取成本占购买前 ETH 余额估算 >80% 的受害者数/占比: {} / {}",
             summary.ratio_over_80_address_count,
             format_ratio(summary.ratio_over_80_address_ratio)
         ),
         format!(
-            "- 二级市场套牢受害者数/占比: {} / {}",
+            "- 套牢受害者数/占比: {} / {}",
             summary.stuck_victim_address_count,
             format_ratio(summary.stuck_victim_address_ratio)
         ),
@@ -239,20 +239,20 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
             format_scalar(summary.median_corrupted_address_holding_seconds)
         ),
         format!(
-            "- Mint 到中性地址接收平均时间: {} 秒",
-            format_scalar(summary.avg_seconds_to_neutral_holder)
+            "- 部署到中性地址首次接收平均时间: {} 秒",
+            format_scalar(summary.avg_deployment_to_neutral_holder_seconds)
         ),
         format!(
-            "- 传播时间中位数: {} 秒",
-            format_scalar(summary.median_seconds_to_neutral_holder)
+            "- 部署到中性地址首次接收中位数: {} 秒",
+            format_scalar(summary.median_deployment_to_neutral_holder_seconds)
         ),
         format!(
-            "- Mint 到首次转手平均时间: {} 秒",
-            format_scalar(summary.avg_mint_to_first_transfer_seconds)
+            "- 部署到首次转手平均时间: {} 秒",
+            format_scalar(summary.avg_deployment_to_first_transfer_seconds)
         ),
         format!(
-            "- Mint 到首次转手中位数: {} 秒",
-            format_scalar(summary.median_mint_to_first_transfer_seconds)
+            "- 部署到首次转手中位数: {} 秒",
+            format_scalar(summary.median_deployment_to_first_transfer_seconds)
         ),
         format!(
             "- 候选合约平均唯一接收钱包数: {}",
@@ -344,10 +344,7 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
             summary.paid_mint_victim_address_count
         ),
         format!("- 唯一买家计数合计: {}", total_unique_buyers),
-        format!(
-            "- 二级市场套牢钱包数: {}",
-            summary.stuck_victim_address_count
-        ),
+        format!("- 套牢受害者钱包数: {}", summary.stuck_victim_address_count),
         format!(
             "- 二级市场套牢资金(USD): {}",
             summary.secondary_sale_stuck_cost_usd
@@ -439,21 +436,21 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
             summary.stablecoin_erc20_value_usd_total, summary.stablecoin_erc20_edge_count_total
         ),
         format!(
-            "- 可计算买入占比的二级市场受害者总数: {}",
+            "- 可计算获取成本占比的受害者总数: {}",
             summary.buy_asset_ratio_known_address_count_total
         ),
         format!(
-            "- 买入金额占钱包总额 >60% 的受害者数/总体占比: {} / {}",
+            "- 获取成本占购买前 ETH 余额估算 >60% 的受害者数/总体占比: {} / {}",
             summary.ratio_over_60_address_count_total,
             format_ratio(summary.ratio_over_60_address_ratio_overall)
         ),
         format!(
-            "- 买入金额占钱包总额 >80% 的受害者数/总体占比: {} / {}",
+            "- 获取成本占购买前 ETH 余额估算 >80% 的受害者数/总体占比: {} / {}",
             summary.ratio_over_80_address_count_total,
             format_ratio(summary.ratio_over_80_address_ratio_overall)
         ),
         format!(
-            "- 二级市场套牢受害者数/总体占比: {} / {}",
+            "- 套牢受害者数/总体占比: {} / {}",
             summary.stuck_victim_address_count_total,
             format_ratio(summary.stuck_victim_address_ratio_overall)
         ),
@@ -470,20 +467,20 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
             format_scalar(summary.median_corrupted_address_holding_seconds_median)
         ),
         format!(
-            "- Mint 到中性地址接收平均时间(跨 seed 均值): {} 秒",
-            format_scalar(summary.avg_seconds_to_neutral_holder_mean)
+            "- 部署到中性地址首次接收平均时间(跨 seed 均值): {} 秒",
+            format_scalar(summary.avg_deployment_to_neutral_holder_seconds_mean)
         ),
         format!(
-            "- 传播时间中位数(跨 seed 中位数): {} 秒",
-            format_scalar(summary.median_seconds_to_neutral_holder_median)
+            "- 部署到中性地址首次接收中位数(跨 seed 中位数): {} 秒",
+            format_scalar(summary.median_deployment_to_neutral_holder_seconds_median)
         ),
         format!(
-            "- Mint 到首次转手平均时间(跨 seed 均值): {} 秒",
-            format_scalar(summary.avg_mint_to_first_transfer_seconds_mean)
+            "- 部署到首次转手平均时间(跨 seed 均值): {} 秒",
+            format_scalar(summary.avg_deployment_to_first_transfer_seconds_mean)
         ),
         format!(
-            "- Mint 到首次转手中位数(跨 seed 中位数): {} 秒",
-            format_scalar(summary.median_mint_to_first_transfer_seconds_median)
+            "- 部署到首次转手中位数(跨 seed 中位数): {} 秒",
+            format_scalar(summary.median_deployment_to_first_transfer_seconds_median)
         ),
         format!(
             "- 候选合约平均唯一接收钱包数(跨 seed 均值): {}",
@@ -512,7 +509,7 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
             };
 
             lines.push(format!(
-                "- {} ({}) | 重复合约={} | 侵权NFT={} | 疑似操作者={} | 中性地址={} | 受害者={} | 多次侵权地址={} | 官方参与={} | 受害者获取成本(USD)={} | 二级成本(USD)={} | 付费mint(USD)={} | 总套牢(USD)={}/{} | >60%={}/{} | 套牢受害者={}/{} | 被腐化受害者={} | 中性接收时长={}秒 | 传播中位数={}秒 | 首次转手中位数={}秒 | JSON={} | MD={}",
+                "- {} ({}) | 重复合约={} | 侵权NFT={} | 疑似操作者={} | 中性地址={} | 受害者={} | 多次侵权地址={} | 官方参与={} | 受害者获取成本(USD)={} | 二级成本(USD)={} | 付费mint(USD)={} | 总套牢(USD)={}/{} | >60%={}/{} | 套牢受害者={}/{} | 被腐化受害者={} | 部署到中性接收平均={}秒 | 部署到中性接收中位={}秒 | 部署到首次转手中位={}秒 | JSON={} | MD={}",
                 seed_name,
                 seed.contract_address,
                 report_summary.candidate_contract_count,
@@ -532,9 +529,9 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
                 report_summary.stuck_victim_address_count,
                 format_ratio(report_summary.stuck_victim_address_ratio),
                 report_summary.corrupted_victim_address_count,
-                format_scalar(report_summary.avg_seconds_to_neutral_holder),
-                format_scalar(report_summary.median_seconds_to_neutral_holder),
-                format_scalar(report_summary.median_mint_to_first_transfer_seconds),
+                format_scalar(report_summary.avg_deployment_to_neutral_holder_seconds),
+                format_scalar(report_summary.median_deployment_to_neutral_holder_seconds),
+                format_scalar(report_summary.median_deployment_to_first_transfer_seconds),
                 output_files.map(|files| files.json.as_str()).unwrap_or(""),
                 output_files
                     .map(|files| files.markdown.as_str())

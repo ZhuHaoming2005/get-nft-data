@@ -273,6 +273,17 @@ pub async fn fetch_contract_metadata(
         .append_pair("contractAddress", contract_address);
     let payload: Value = client.get_json(url.as_str()).await?;
     let meta = payload.get("contractMetadata").unwrap_or(&payload);
+    let deployed_block_number = meta
+        .get("deployedBlockNumber")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let deployed_block_time = if deployed_block_number > 0 {
+        fetch_block_timestamp(client, endpoints, &format!("0x{:x}", deployed_block_number))
+            .await
+            .unwrap_or_default()
+    } else {
+        0
+    };
     let mut metadata = ContractMetadata {
         chain: chain.to_string(),
         contract_address: payload
@@ -290,10 +301,8 @@ pub async fn fetch_contract_metadata(
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_lowercase(),
-        deployed_block_number: meta
-            .get("deployedBlockNumber")
-            .and_then(Value::as_i64)
-            .unwrap_or(0),
+        deployed_block_number,
+        deployed_block_time,
         owner_address: contract_metadata_lower_field(
             &payload,
             meta,

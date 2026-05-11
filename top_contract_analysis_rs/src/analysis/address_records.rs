@@ -4,7 +4,7 @@ use crate::models::{
     AddressAttributionPayload, AddressEvidencePayload, DuplicateCandidate, FraudTradeStatsPayload,
     HonestAddressPayload, HonestAddressStatsPayload, InfringingTokenRecord,
     MaliciousAddressPayload, NftSaleRecord, OwnerBalance, SecondarySaleVictimAddressPayload,
-    TransferRecord, ValueFlowEdgePayload, ZERO_ADDRESS,
+    TransferRecord, ValueFlowEdgePayload, VictimAcquisitionAddressPayload, ZERO_ADDRESS,
 };
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -402,10 +402,9 @@ pub(crate) fn build_malicious_address_records_from_activity(
         }
     }
 
-    let mut candidate_addresses: Vec<String> = mint_addresses
-        .iter()
+    let mut candidate_addresses: Vec<String> = outgoing
+        .keys()
         .cloned()
-        .chain(outgoing.keys().cloned())
         .chain(sale_seller_counts.keys().cloned())
         .chain(receiver_candidates)
         .collect::<HashSet<_>>()
@@ -418,7 +417,7 @@ pub(crate) fn build_malicious_address_records_from_activity(
         if address.is_empty() {
             continue;
         }
-        let mint_role = mint_addresses.contains(&address);
+        let mint_activity_observed = mint_addresses.contains(&address);
         let wash_cycle_count = *cycle_counts.get(&address).unwrap_or(&0);
         let star_out_degree = outgoing.get(&address).map(|value| value.len()).unwrap_or(0) as i64;
         let is_star_distributor = star_out_degree >= 3;
@@ -429,9 +428,8 @@ pub(crate) fn build_malicious_address_records_from_activity(
             && wash_cycle_count == 0
             && !is_star_distributor
             && sale_seller_count < 3;
-        let attacker_like_seller = sale_seller_count > 0
-            && (mint_role || is_star_distributor || rapid_spread)
-            && !acquired_victim_like;
+        let attacker_like_seller =
+            sale_seller_count > 0 && (is_star_distributor || rapid_spread) && !acquired_victim_like;
         let high_volume_seller = sale_seller_count >= 3;
         if wash_cycle_count == 0
             && !is_star_distributor
@@ -442,7 +440,7 @@ pub(crate) fn build_malicious_address_records_from_activity(
         }
         rows.push(MaliciousAddressPayload {
             address: address.clone(),
-            mint_role,
+            mint_activity_observed,
             wash_cycle_count,
             star_out_degree,
             rapid_spread_contracts: if rapid_spread {
@@ -668,22 +666,6 @@ pub fn build_address_attribution_records(
     }
 
     for item in malicious_addresses {
-        if item.mint_role {
-            add_attribution_evidence(
-                &mut rows,
-                EvidenceInput {
-                    contract_address,
-                    address: &item.address,
-                    role: "suspicious_mint_actor",
-                    evidence_type: "mint_role_with_behavior",
-                    token_id: "",
-                    tx_hash: "",
-                    weight: 0.15,
-                    detail: "mint role combined with other suspicious propagation behavior",
-                    bucket: EvidenceBucket::Operator,
-                },
-            );
-        }
         if item.wash_cycle_count > 0 {
             add_attribution_evidence(
                 &mut rows,
@@ -915,6 +897,90 @@ pub fn build_address_attribution_records(
         .collect()
 }
 
+pub fn add_acquisition_exposure_attribution_evidence(
+    address_attributions: Vec<AddressAttributionPayload>,
+    victim_acquisition_addresses: &[VictimAcquisitionAddressPayload],
+) -> Vec<AddressAttributionPayload> {
+    let mut rows: BTreeMap<(String, String), AddressAttributionPayload> = address_attributions
+        .into_iter()
+        .map(|item| {
+            (
+                (
+                    item.contract_address.to_lowercase(),
+                    item.address.to_lowercase(),
+                ),
+                item,
+            )
+        })
+        .collect();
+
+    for acquisition in victim_acquisition_addresses {
+        if !acquisition
+            .buy_asset_ratio
+            .map(|ratio| ratio >= 0.60)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        for contract_address in &acquisition.contract_addresses {
+            let contract_address = contract_address.trim().to_lowercase();
+            let address = acquisition.address.trim().to_lowercase();
+            if contract_address.is_empty() || address.is_empty() || address == ZERO_ADDRESS {
+                continue;
+            }
+            let entry = rows
+                .entry((contract_address.clone(), address.clone()))
+                .or_insert_with(|| AddressAttributionPayload {
+                    contract_address: contract_address.clone(),
+                    address: address.clone(),
+                    attribution_label: "likely_victim".into(),
+                    confidence: "low".into(),
+                    ..AddressAttributionPayload::default()
+                });
+            if !entry
+                .observed_roles
+                .iter()
+                .any(|role| role == "high_exposure_acquirer")
+            {
+                entry.observed_roles.push("high_exposure_acquirer".into());
+                entry.observed_roles.sort();
+            }
+            entry.victim_score = (entry.victim_score + 0.15).clamp(0.0, 1.0);
+            if !entry
+                .evidence
+                .iter()
+                .any(|evidence| evidence.evidence_type == "high_acquisition_balance_ratio")
+            {
+                entry.evidence.push(AddressEvidencePayload {
+                    evidence_type: "high_acquisition_balance_ratio".into(),
+                    contract_address: contract_address.clone(),
+                    token_id: String::new(),
+                    tx_hash: acquisition.tx_hashes.first().cloned().unwrap_or_default(),
+                    weight: 0.15,
+                    detail:
+                        "total acquisition cost consumed a high share of the observed pre-acquisition ETH balance"
+                            .into(),
+                });
+            }
+            entry.attribution_label = attribution_label(
+                entry.operator_score,
+                entry.colluder_score,
+                entry.victim_score,
+                entry.corruption_score,
+                entry.neutral_score,
+            );
+            entry.confidence = attribution_confidence(
+                entry.operator_score,
+                entry.colluder_score,
+                entry.victim_score,
+                entry.corruption_score,
+            );
+        }
+    }
+
+    rows.into_values().collect()
+}
+
 pub fn build_secondary_sale_victim_address_records(
     contract_address: &str,
     sales: &[NftSaleRecord],
@@ -1016,6 +1082,7 @@ pub fn build_honest_address_records(
     infringing_tokens: &[InfringingTokenRecord],
     malicious_addresses: &[MaliciousAddressPayload],
     mint_payment_edges: &[ValueFlowEdgePayload],
+    deployment_time: i64,
     analysis_timestamp: i64,
 ) -> Vec<HonestAddressPayload> {
     let activity = prepare_contract_activity(transfers, sales, owners);
@@ -1025,6 +1092,7 @@ pub fn build_honest_address_records(
         infringing_tokens,
         malicious_addresses,
         mint_payment_edges,
+        deployment_time,
         analysis_timestamp,
     )
 }
@@ -1035,9 +1103,11 @@ pub(crate) fn build_honest_address_records_from_activity(
     infringing_tokens: &[InfringingTokenRecord],
     malicious_addresses: &[MaliciousAddressPayload],
     mint_payment_edges: &[ValueFlowEdgePayload],
+    deployment_time: i64,
     analysis_timestamp: i64,
 ) -> Vec<HonestAddressPayload> {
     let cutoff_time = analysis_timestamp.max(0);
+    let deployment_time = deployment_time.max(0);
     let relevant_token_ids: HashSet<String> = infringing_tokens
         .iter()
         .filter_map(|item| (!item.token_id.is_empty()).then(|| item.token_id.clone()))
@@ -1130,7 +1200,8 @@ pub(crate) fn build_honest_address_records_from_activity(
 
     let mut token_interactions_by_address: HashMap<String, HashSet<String>> = HashMap::new();
     let mut durations_by_address: HashMap<String, Vec<i64>> = HashMap::new();
-    let mut mint_to_honest_samples_by_address: HashMap<String, Vec<i64>> = HashMap::new();
+    let mut deployment_to_neutral_holder_samples_by_address: HashMap<String, Vec<i64>> =
+        HashMap::new();
     let mut victim_resale_count: HashMap<String, i64> = HashMap::new();
     let mut corrupted_addresses: HashSet<String> = HashSet::new();
 
@@ -1191,14 +1262,10 @@ pub(crate) fn build_honest_address_records_from_activity(
     }
 
     for (token_id, token_transfers) in transfers_by_token {
-        let mut mint_time = 0_i64;
         let mut first_honest_recorded = false;
         let mut open_holds: HashMap<String, i64> = HashMap::new();
 
         for transfer in &token_transfers {
-            if transfer.from_address == ZERO_ADDRESS && transfer.block_time > 0 {
-                mint_time = transfer.block_time;
-            }
             if honest_set.contains(&transfer.from_address) {
                 token_interactions_by_address
                     .entry(transfer.from_address.clone())
@@ -1220,11 +1287,11 @@ pub(crate) fn build_honest_address_records_from_activity(
                     .insert(token_id.clone());
                 if transfer.block_time > 0 {
                     open_holds.insert(transfer.to_address.clone(), transfer.block_time);
-                    if mint_time > 0 && !first_honest_recorded {
-                        mint_to_honest_samples_by_address
+                    if deployment_time > 0 && !first_honest_recorded {
+                        deployment_to_neutral_holder_samples_by_address
                             .entry(transfer.to_address.clone())
                             .or_default()
-                            .push((transfer.block_time - mint_time).max(0));
+                            .push((transfer.block_time - deployment_time).max(0));
                         first_honest_recorded = true;
                     }
                 }
@@ -1272,10 +1339,11 @@ pub(crate) fn build_honest_address_records_from_activity(
                 hold_duration_count: hold_durations.len() as i64,
                 is_corrupted_address: corrupted_addresses.contains(&address),
                 victim_resale_count: *victim_resale_count.get(&address).unwrap_or(&0),
-                mint_to_honest_seconds_samples: mint_to_honest_samples_by_address
-                    .get(&address)
-                    .cloned()
-                    .unwrap_or_default(),
+                deployment_to_neutral_holder_seconds_samples:
+                    deployment_to_neutral_holder_samples_by_address
+                        .get(&address)
+                        .cloned()
+                        .unwrap_or_default(),
             }
         })
         .collect()
@@ -1294,10 +1362,10 @@ pub fn build_honest_address_stats(
         .iter()
         .filter_map(|item| item.hold_duration_median_seconds)
         .collect();
-    let mint_to_honest_samples: Vec<f64> = honest_addresses
+    let deployment_to_neutral_holder_samples: Vec<f64> = honest_addresses
         .iter()
         .flat_map(|item| {
-            item.mint_to_honest_seconds_samples
+            item.deployment_to_neutral_holder_seconds_samples
                 .iter()
                 .filter_map(|sample| positive_seconds(*sample))
         })
@@ -1313,7 +1381,9 @@ pub fn build_honest_address_stats(
                 .map(|item| item.victim_resale_count)
                 .sum(),
             median_holding_seconds: median_f64(&holding_medians),
-            avg_seconds_to_honest_holder: mean_f64(&mint_to_honest_samples),
+            avg_deployment_to_neutral_holder_seconds: mean_f64(
+                &deployment_to_neutral_holder_samples,
+            ),
             corrupted_addresses,
         },
     )])
@@ -1455,7 +1525,7 @@ mod tests {
     fn operator_address() -> MaliciousAddressPayload {
         MaliciousAddressPayload {
             address: "0xoperator".into(),
-            mint_role: true,
+            mint_activity_observed: true,
             ..MaliciousAddressPayload::default()
         }
     }
@@ -1613,6 +1683,7 @@ mod tests {
             &[infringing_token()],
             &[operator_address()],
             &[],
+            90,
             200,
         );
         let victim = rows
@@ -1652,6 +1723,7 @@ mod tests {
             &[infringing_token()],
             &[operator_address()],
             &[],
+            90,
             200,
         );
         let victim = rows
@@ -1693,6 +1765,7 @@ mod tests {
             &[infringing_token()],
             &[operator_address()],
             &[mint_payment_edge("0xvictim")],
+            90,
             200,
         );
         let victim = rows
@@ -1739,6 +1812,7 @@ mod tests {
             &infringing_tokens,
             &malicious,
             &mint_payment_edges,
+            90,
             200,
         );
         let victim = honest
@@ -1780,6 +1854,7 @@ mod tests {
             &infringing_tokens,
             &malicious,
             &[],
+            90,
             200,
         );
         let victim = honest
@@ -1843,6 +1918,7 @@ mod tests {
             &[infringing_token()],
             &[operator_address()],
             &[mint_payment_edge("0xoperator")],
+            90,
             200,
         );
 
@@ -1851,5 +1927,39 @@ mod tests {
             build_honest_address_stats("0xdup", &rows)["0xdup"].corrupted_address_count,
             0
         );
+    }
+
+    #[test]
+    fn acquisition_exposure_evidence_uses_total_victim_acquisition_ratio() {
+        let rows = add_acquisition_exposure_attribution_evidence(
+            vec![AddressAttributionPayload {
+                contract_address: "0xdup".into(),
+                address: "0xvictim".into(),
+                attribution_label: "likely_victim".into(),
+                victim_score: 0.45,
+                confidence: "medium".into(),
+                ..AddressAttributionPayload::default()
+            }],
+            &[VictimAcquisitionAddressPayload {
+                address: "0xvictim".into(),
+                contract_addresses: vec!["0xdup".into()],
+                tx_hashes: vec!["0xbuy".into(), "0xmint".into()],
+                buy_asset_ratio: Some(0.7),
+                ..VictimAcquisitionAddressPayload::default()
+            }],
+        );
+
+        let victim = rows
+            .iter()
+            .find(|item| item.address == "0xvictim")
+            .expect("victim attribution");
+        assert!(victim
+            .observed_roles
+            .iter()
+            .any(|role| role == "high_exposure_acquirer"));
+        assert!(victim
+            .evidence
+            .iter()
+            .any(|evidence| evidence.evidence_type == "high_acquisition_balance_ratio"));
     }
 }

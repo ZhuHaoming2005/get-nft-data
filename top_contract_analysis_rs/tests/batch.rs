@@ -209,6 +209,7 @@ impl AnalyzeApi for InstrumentedBatchApi {
             token_type: "ERC721".into(),
             contract_deployer: "0xcreator".into(),
             deployed_block_number: 1,
+            deployed_block_time: 0,
             owner_address: String::new(),
             admin_address: String::new(),
             proxy_admin_address: String::new(),
@@ -491,6 +492,7 @@ impl AnalyzeApi for FakeBatchApi {
             token_type: "ERC721".into(),
             contract_deployer: "0xcreator".into(),
             deployed_block_number: 1,
+            deployed_block_time: 0,
             owner_address: String::new(),
             admin_address: String::new(),
             proxy_admin_address: String::new(),
@@ -661,10 +663,10 @@ fn batch_markdown_preserves_reference_summary_and_output_index_lines() {
             stuck_victim_address_count_total: 2,
             stuck_victim_address_ratio_overall: Some(0.25),
             corrupted_victim_address_count_total: 1,
-            avg_seconds_to_neutral_holder_mean: Some(12.5),
-            median_seconds_to_neutral_holder_median: Some(10.0),
-            avg_mint_to_first_transfer_seconds_mean: Some(8.0),
-            median_mint_to_first_transfer_seconds_median: Some(7.0),
+            avg_deployment_to_neutral_holder_seconds_mean: Some(12.5),
+            median_deployment_to_neutral_holder_seconds_median: Some(10.0),
+            avg_deployment_to_first_transfer_seconds_mean: Some(8.0),
+            median_deployment_to_first_transfer_seconds_median: Some(7.0),
             avg_unique_receiver_count_mean: Some(4.0),
             generated_at: "2026-04-17T00:00:00+00:00".into(),
             ..BatchReportSummary::default()
@@ -697,9 +699,9 @@ fn batch_markdown_preserves_reference_summary_and_output_index_lines() {
                 stuck_victim_address_count: 1,
                 stuck_victim_address_ratio: Some(0.25),
                 corrupted_victim_address_count: 1,
-                avg_seconds_to_neutral_holder: Some(10.0),
-                median_seconds_to_neutral_holder: Some(9.0),
-                median_mint_to_first_transfer_seconds: Some(8.0),
+                avg_deployment_to_neutral_holder_seconds: Some(10.0),
+                median_deployment_to_neutral_holder_seconds: Some(9.0),
+                median_deployment_to_first_transfer_seconds: Some(8.0),
                 ..Default::default()
             },
             output_files: Some(OutputFilesPayload {
@@ -718,11 +720,13 @@ fn batch_markdown_preserves_reference_summary_and_output_index_lines() {
     assert!(markdown.contains("- 总套牢成本(USD)汇总: 5 / 40.00%"));
     assert!(markdown.contains("- 二级市场受害者成本(USD)汇总: 12.5"));
     assert!(markdown.contains("- 付费 mint 受害者成本(USD)汇总: 0 / edges=0"));
-    assert!(markdown.contains("- 买入金额占钱包总额 >60% 的受害者数/总体占比: 3 / 37.50%"));
+    assert!(
+        markdown.contains("- 获取成本占购买前 ETH 余额估算 >60% 的受害者数/总体占比: 3 / 37.50%")
+    );
     assert!(markdown.contains("- 生成时间(UTC): 2026-04-17T00:00:00+00:00"));
     assert!(markdown.contains("## Seed 报告索引"));
     assert!(markdown.contains(
-        "- Azuki (0xseed) | 重复合约=5 | 侵权NFT=4 | 疑似操作者=5 | 中性地址=6 | 受害者=0 | 多次侵权地址=1 | 官方参与=1 | 受害者获取成本(USD)=7.5 | 二级成本(USD)=7.5 | 付费mint(USD)=0 | 总套牢(USD)=2.5/33.33% | >60%=2/50.00% | 套牢受害者=1/25.00% | 被腐化受害者=1 | 中性接收时长=10秒 | 传播中位数=9秒 | 首次转手中位数=8秒 | JSON=result/top_contract_analysis__azuki.json | MD=result/top_contract_analysis__azuki.md"
+        "- Azuki (0xseed) | 重复合约=5 | 侵权NFT=4 | 疑似操作者=5 | 中性地址=6 | 受害者=0 | 多次侵权地址=1 | 官方参与=1 | 受害者获取成本(USD)=7.5 | 二级成本(USD)=7.5 | 付费mint(USD)=0 | 总套牢(USD)=2.5/33.33% | >60%=2/50.00% | 套牢受害者=1/25.00% | 被腐化受害者=1 | 部署到中性接收平均=10秒 | 部署到中性接收中位=9秒 | 部署到首次转手中位=8秒 | JSON=result/top_contract_analysis__azuki.json | MD=result/top_contract_analysis__azuki.md"
     ));
 }
 
@@ -828,15 +832,16 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
             victim_acquisition_stuck_cost_eth: 2.0,
             victim_acquisition_stuck_cost_usd: 2.0,
             victim_acquisition_stuck_cost_ratio: Some(0.2),
+            victim_acquisition_address_count: 2,
             buy_asset_ratio_known_address_count: 2,
             ratio_over_60_address_count: 1,
             ratio_over_80_address_count: 0,
             stuck_victim_address_count: 1,
             corrupted_victim_address_count: 1,
-            avg_seconds_to_neutral_holder: Some(12.0),
-            median_seconds_to_neutral_holder: Some(10.0),
-            avg_mint_to_first_transfer_seconds: Some(8.0),
-            median_mint_to_first_transfer_seconds: Some(7.0),
+            avg_deployment_to_neutral_holder_seconds: Some(12.0),
+            median_deployment_to_neutral_holder_seconds: Some(10.0),
+            avg_deployment_to_first_transfer_seconds: Some(8.0),
+            median_deployment_to_first_transfer_seconds: Some(7.0),
             avg_unique_receiver_count: Some(2.0),
             ..ReportSummary::default()
         },
@@ -866,7 +871,7 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
         ],
         vec![HonestAddressPayload {
             address: "0xh1".into(),
-            mint_to_honest_seconds_samples: vec![5, 15],
+            deployment_to_neutral_holder_seconds_samples: vec![5, 15],
             ..HonestAddressPayload::default()
         }],
         vec![
@@ -889,14 +894,14 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
             (
                 "0xa1".into(),
                 AddressSignalPayload {
-                    mint_to_first_transfer_seconds: 4,
+                    first_transfer_delay_seconds: 4,
                     ..AddressSignalPayload::default()
                 },
             ),
             (
                 "0xa2".into(),
                 AddressSignalPayload {
-                    mint_to_first_transfer_seconds: 10,
+                    first_transfer_delay_seconds: 10,
                     ..AddressSignalPayload::default()
                 },
             ),
@@ -935,14 +940,15 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
             victim_acquisition_stuck_cost_eth: 1.0,
             victim_acquisition_stuck_cost_usd: 1.0,
             victim_acquisition_stuck_cost_ratio: Some(0.2),
+            victim_acquisition_address_count: 3,
             buy_asset_ratio_known_address_count: 3,
             ratio_over_60_address_count: 2,
             ratio_over_80_address_count: 1,
             stuck_victim_address_count: 1,
-            avg_seconds_to_neutral_holder: Some(18.0),
-            median_seconds_to_neutral_holder: Some(20.0),
-            avg_mint_to_first_transfer_seconds: Some(14.0),
-            median_mint_to_first_transfer_seconds: Some(20.0),
+            avg_deployment_to_neutral_holder_seconds: Some(18.0),
+            median_deployment_to_neutral_holder_seconds: Some(20.0),
+            avg_deployment_to_first_transfer_seconds: Some(14.0),
+            median_deployment_to_first_transfer_seconds: Some(20.0),
             avg_unique_receiver_count: Some(4.0),
             ..ReportSummary::default()
         },
@@ -965,7 +971,7 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
         vec![
             HonestAddressPayload {
                 address: "0xh1".into(),
-                mint_to_honest_seconds_samples: vec![20],
+                deployment_to_neutral_holder_seconds_samples: vec![20],
                 ..HonestAddressPayload::default()
             },
             HonestAddressPayload {
@@ -983,7 +989,7 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
         BTreeMap::from([(
             "0xa3".into(),
             AddressSignalPayload {
-                mint_to_first_transfer_seconds: 20,
+                first_transfer_delay_seconds: 20,
                 ..AddressSignalPayload::default()
             },
         )]),
@@ -1073,25 +1079,27 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
         1
     );
     assert_eq!(
-        summary.batch_summary.avg_seconds_to_neutral_holder_mean,
+        summary
+            .batch_summary
+            .avg_deployment_to_neutral_holder_seconds_mean,
         Some(15.0)
     );
     assert_eq!(
         summary
             .batch_summary
-            .median_seconds_to_neutral_holder_median,
+            .median_deployment_to_neutral_holder_seconds_median,
         Some(15.0)
     );
     assert_eq!(
         summary
             .batch_summary
-            .avg_mint_to_first_transfer_seconds_mean,
+            .avg_deployment_to_first_transfer_seconds_mean,
         Some(11.0)
     );
     assert_eq!(
         summary
             .batch_summary
-            .median_mint_to_first_transfer_seconds_median,
+            .median_deployment_to_first_transfer_seconds_median,
         Some(13.5)
     );
     assert_eq!(
@@ -1134,13 +1142,13 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
     assert_eq!(
         summary.seed_reports[0]
             .report_summary
-            .median_seconds_to_neutral_holder,
+            .median_deployment_to_neutral_holder_seconds,
         Some(10.0)
     );
     assert_eq!(
         summary.seed_reports[0]
             .report_summary
-            .median_mint_to_first_transfer_seconds,
+            .median_deployment_to_first_transfer_seconds,
         Some(7.0)
     );
 }
@@ -1224,6 +1232,7 @@ impl AnalyzeApi for SlowBatchApi {
             token_type: "ERC721".into(),
             contract_deployer: "0xcreator".into(),
             deployed_block_number: 1,
+            deployed_block_time: 0,
             owner_address: String::new(),
             admin_address: String::new(),
             proxy_admin_address: String::new(),

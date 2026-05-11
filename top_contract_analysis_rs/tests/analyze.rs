@@ -60,6 +60,7 @@ impl AnalyzeApi for FakeApi {
             token_type: "ERC721".into(),
             contract_deployer: "0xcreator".into(),
             deployed_block_number: 123,
+            deployed_block_time: 0,
             owner_address: "0xowner".into(),
             admin_address: "0xadmin".into(),
             proxy_admin_address: "0xproxyadmin".into(),
@@ -1068,6 +1069,7 @@ impl AnalyzeApi for FakeEnrichedApi {
             token_type: "ERC721".into(),
             contract_deployer: "0xcreator".into(),
             deployed_block_number: 123,
+            deployed_block_time: 0,
             owner_address: "0xowner".into(),
             admin_address: "0xadmin".into(),
             proxy_admin_address: "0xproxyadmin".into(),
@@ -1312,6 +1314,7 @@ impl AnalyzeApi for PreSeedDeploymentApi {
             } else {
                 100
             },
+            deployed_block_time: 0,
             owner_address: "0xowner".into(),
             admin_address: String::new(),
             proxy_admin_address: String::new(),
@@ -1451,6 +1454,7 @@ impl AnalyzeApi for FakeLegitApi {
             token_type: "ERC721".into(),
             contract_deployer: "0xminter".into(),
             deployed_block_number: 123,
+            deployed_block_time: 0,
             owner_address: String::new(),
             admin_address: String::new(),
             proxy_admin_address: String::new(),
@@ -1641,6 +1645,7 @@ impl AnalyzeApi for CountingApi {
             token_type: "ERC721".into(),
             contract_deployer: "0xcreator".into(),
             deployed_block_number: 123,
+            deployed_block_time: 0,
             owner_address: String::new(),
             admin_address: String::new(),
             proxy_admin_address: String::new(),
@@ -1867,6 +1872,7 @@ impl AnalyzeApi for FakeSaleMetricApi {
             token_type: "ERC721".into(),
             contract_deployer: "0xcreator".into(),
             deployed_block_number: 123,
+            deployed_block_time: 0,
             owner_address: String::new(),
             admin_address: String::new(),
             proxy_admin_address: String::new(),
@@ -2062,6 +2068,7 @@ impl AnalyzeApi for MultiBuyerSameTxSaleMetricApi {
             token_type: "ERC721".into(),
             contract_deployer: "0xcreator".into(),
             deployed_block_number: 123,
+            deployed_block_time: 0,
             owner_address: String::new(),
             admin_address: String::new(),
             proxy_admin_address: String::new(),
@@ -2310,6 +2317,7 @@ impl AnalyzeApi for StaggeredExpansionApi {
             token_type: "ERC721".into(),
             contract_deployer: "0xcreator".into(),
             deployed_block_number: 123,
+            deployed_block_time: 0,
             owner_address: String::new(),
             admin_address: String::new(),
             proxy_admin_address: String::new(),
@@ -2467,6 +2475,7 @@ impl AnalyzeApi for ConcurrentContractApi {
             token_type: "ERC721".into(),
             contract_deployer: "0xcreator".into(),
             deployed_block_number: 123,
+            deployed_block_time: 0,
             owner_address: String::new(),
             admin_address: String::new(),
             proxy_admin_address: String::new(),
@@ -2659,6 +2668,7 @@ impl AnalyzeApi for ConcurrentSingleContractFetchApi {
             token_type: "ERC721".into(),
             contract_deployer: "0xcreator".into(),
             deployed_block_number: 123,
+            deployed_block_time: 0,
             owner_address: String::new(),
             admin_address: String::new(),
             proxy_admin_address: String::new(),
@@ -2813,6 +2823,7 @@ impl AnalyzeApi for ConcurrentSaleMetricApi {
             token_type: "ERC721".into(),
             contract_deployer: "0xcreator".into(),
             deployed_block_number: 123,
+            deployed_block_time: 0,
             owner_address: String::new(),
             admin_address: String::new(),
             proxy_admin_address: String::new(),
@@ -3141,7 +3152,7 @@ fn single_report_payload_serializes_current_python_top_level_shape() {
             address: "0xholder".into(),
             hold_duration_count: 2,
             is_corrupted_address: true,
-            mint_to_honest_seconds_samples: vec![15, 30],
+            deployment_to_neutral_holder_seconds_samples: vec![15, 30],
             ..Default::default()
         }],
         honest_address_stats: BTreeMap::from([(
@@ -3150,7 +3161,7 @@ fn single_report_payload_serializes_current_python_top_level_shape() {
                 honest_address_count: 1,
                 corrupted_address_count: 1,
                 victim_resale_count: 1,
-                avg_seconds_to_honest_holder: Some(22.0),
+                avg_deployment_to_neutral_holder_seconds: Some(22.0),
                 corrupted_addresses: vec!["0xholder".into()],
                 ..Default::default()
             },
@@ -3213,7 +3224,7 @@ fn single_report_payload_serializes_current_python_top_level_shape() {
     assert_eq!(serialized["malicious_addresses"][0]["address"], "0xsybil");
     assert_eq!(serialized["neutral_addresses"][0]["hold_duration_count"], 2);
     assert_eq!(
-        serialized["neutral_addresses"][0]["mint_to_neutral_holder_seconds_samples"],
+        serialized["neutral_addresses"][0]["deployment_to_neutral_holder_seconds_samples"],
         serde_json::json!([15, 30])
     );
     assert_eq!(
@@ -3229,7 +3240,7 @@ fn single_report_payload_serializes_current_python_top_level_shape() {
         1
     );
     assert_eq!(
-        serialized["neutral_address_stats"]["0xdup"]["avg_seconds_to_neutral_holder"],
+        serialized["neutral_address_stats"]["0xdup"]["avg_deployment_to_neutral_holder_seconds"],
         22.0
     );
     assert_eq!(
@@ -3295,10 +3306,10 @@ fn single_report_markdown_preserves_summary_sections_only() {
             stuck_victim_address_count: 2,
             stuck_victim_address_ratio: Some(0.4),
             corrupted_victim_address_count: 1,
-            avg_seconds_to_neutral_holder: Some(12.5),
-            median_seconds_to_neutral_holder: Some(10.0),
-            avg_mint_to_first_transfer_seconds: Some(8.0),
-            median_mint_to_first_transfer_seconds: Some(7.0),
+            avg_deployment_to_neutral_holder_seconds: Some(12.5),
+            median_deployment_to_neutral_holder_seconds: Some(10.0),
+            avg_deployment_to_first_transfer_seconds: Some(8.0),
+            median_deployment_to_first_transfer_seconds: Some(7.0),
             avg_unique_receiver_count: Some(4.0),
             ..ReportSummary::default()
         },
@@ -3330,7 +3341,7 @@ fn single_report_markdown_preserves_summary_sections_only() {
                 unique_receiver_count: 4,
                 cycle_edge_count: 1,
                 star_distributor_count: 1,
-                mint_to_first_transfer_seconds: 8,
+                first_transfer_delay_seconds: 8,
                 fast_spread: true,
             },
         )]),
@@ -3350,7 +3361,7 @@ fn single_report_markdown_preserves_summary_sections_only() {
                 corrupted_address_count: 1,
                 victim_resale_count: 3,
                 median_holding_seconds: Some(44.0),
-                avg_seconds_to_honest_holder: Some(12.5),
+                avg_deployment_to_neutral_holder_seconds: Some(12.5),
                 corrupted_addresses: vec!["0xhonest".into()],
             },
         )]),
@@ -3363,7 +3374,7 @@ fn single_report_markdown_preserves_summary_sections_only() {
             hold_duration_count: 2,
             is_corrupted_address: true,
             victim_resale_count: 1,
-            mint_to_honest_seconds_samples: vec![12, 13],
+            deployment_to_neutral_holder_seconds_samples: vec![12, 13],
         }],
         secondary_sale_victim_addresses: vec![SecondarySaleVictimAddressPayload {
             contract_address: "0xhigh".into(),
@@ -3413,10 +3424,10 @@ fn single_report_markdown_preserves_summary_sections_only() {
     assert!(markdown.contains("- 候选侧开放许可 token 数: 6"));
     assert!(markdown.contains("- 受害者套牢成本合计(USD): 6.5 / 65.00%"));
     assert!(markdown.contains("- 二级市场受害者成本(USD): 10 / addresses=0"));
-    assert!(markdown.contains("- 买入金额占钱包总额 >60% 的受害者数/占比: 3 / 60.00%"));
-    assert!(markdown.contains("- 二级市场套牢受害者数/占比: 2 / 40.00%"));
+    assert!(markdown.contains("- 获取成本占购买前 ETH 余额估算 >60% 的受害者数/占比: 3 / 60.00%"));
+    assert!(markdown.contains("- 套牢受害者数/占比: 2 / 40.00%"));
     assert!(markdown.contains("- 被腐化受害者数: 1"));
-    assert!(markdown.contains("- Mint 到中性地址接收平均时间: 12.5 秒"));
+    assert!(markdown.contains("- 部署到中性地址首次接收平均时间: 12.5 秒"));
     assert!(markdown.contains("## 种子集合统计"));
     assert!(markdown.contains("- 拉取到的种子 NFT 数: 10"));
     assert!(markdown.contains("## 合约分类摘要"));
@@ -3453,7 +3464,7 @@ fn single_report_markdown_omits_detailed_address_sections() {
                 corrupted_address_count: 0,
                 victim_resale_count: 0,
                 median_holding_seconds: None,
-                avg_seconds_to_honest_holder: None,
+                avg_deployment_to_neutral_holder_seconds: None,
                 corrupted_addresses: vec![],
             },
         )]),
@@ -3466,7 +3477,7 @@ fn single_report_markdown_omits_detailed_address_sections() {
             hold_duration_count: 0,
             is_corrupted_address: false,
             victim_resale_count: 0,
-            mint_to_honest_seconds_samples: vec![],
+            deployment_to_neutral_holder_seconds_samples: vec![],
         }],
         secondary_sale_victim_addresses: vec![SecondarySaleVictimAddressPayload {
             contract_address: "0xdup".into(),
@@ -4175,18 +4186,17 @@ async fn analyze_enriches_duplicate_contracts_with_signals_and_infringing_tokens
         lifecycle_metric.first_victim_time,
         mint_payment_edge.block_time
     );
-    assert_eq!(lifecycle_metric.time_to_first_victim_seconds, Some(0));
+    assert_eq!(lifecycle_metric.time_to_first_victim_seconds, None);
     assert!(!lifecycle_metric.early_detection_positive);
     assert!(payload.weak_supervision_labels.iter().any(|label| {
         label.entity_type == "contract"
             && label.contract_address == "0xdup"
             && label.label == "probable_infringement_campaign"
     }));
-    assert!(payload.early_detection_features.iter().any(|row| {
-        row.contract_address == "0xdup"
-            && row.observation_window_seconds == 86_400
-            && row.weak_label == "positive_observed_sale_or_victimization"
-    }));
+    assert!(payload
+        .early_detection_features
+        .iter()
+        .all(|row| row.contract_address != "0xdup"));
     assert!(payload.contract_lifecycle_events.iter().any(|event| {
         event.lifecycle_stage == "primary_monetization"
             && event.event_type == "mint_payment"
@@ -4486,8 +4496,8 @@ async fn analyze_builds_address_profiles_and_trade_stats_for_duplicate_contracts
     );
     assert_eq!(payload.honest_address_stats["0xdup"].victim_resale_count, 0);
     assert_eq!(
-        payload.honest_address_stats["0xdup"].avg_seconds_to_honest_holder,
-        Some(10.0)
+        payload.honest_address_stats["0xdup"].avg_deployment_to_neutral_holder_seconds,
+        None
     );
     assert_eq!(payload.fraud_trade_stats["0xdup"].unique_buyers, 1);
     assert_eq!(
