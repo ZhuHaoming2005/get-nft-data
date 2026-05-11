@@ -1159,6 +1159,10 @@
       return "";
     }
 
+    function isVictimAttributionLabel(label) {
+      return label === "likely_victim" || label === "corrupted_victim";
+    }
+
     function valueFlowsFor(contract = state.selectedContract) {
       return reportArray("value_flow_edges").filter((item) => sameContract(item, contract));
     }
@@ -1206,10 +1210,23 @@
 
     function victimAddressSet(path) {
       const victims = new Set();
+      const contract = path.contract_address || state.selectedContract;
       for (const [address, node] of Object.entries(path.nodes || {})) {
         const roles = new Set(node.roles || []);
-        if (roles.has("victim_buyer") || roles.has("stuck_victim") || node.is_stuck_victim) {
+        const feature = evidenceFeatureForAddress(contract, node.address || address);
+        if (
+          roles.has("victim_buyer")
+          || roles.has("stuck_victim")
+          || roles.has("corrupted_victim")
+          || node.is_stuck_victim
+          || isVictimAttributionLabel(feature?.attribution_label)
+        ) {
           victims.add(node.address || address);
+        }
+      }
+      for (const feature of evidenceFeaturesFor(contract)) {
+        if (isVictimAttributionLabel(feature.attribution_label) && feature.address) {
+          victims.add(feature.address);
         }
       }
       return victims;
