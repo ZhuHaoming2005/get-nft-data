@@ -670,6 +670,59 @@ fn feature_store_rejects_precomputed_metadata_keywords_without_valid_json() {
 }
 
 #[test]
+fn feature_store_recalls_parquet_metadata_candidates_from_keyword_index() {
+    let dir = tempdir().unwrap();
+    let parquet_path = dir.path().join("snapshot.parquet");
+    write_parquet(
+        "
+        SELECT
+            'ethereum' AS chain,
+            '0xkeyword' AS contract_address,
+            '1' AS token_id,
+            '' AS token_uri,
+            '' AS image_uri,
+            '' AS name,
+            '' AS symbol,
+            '{\"description\":\"gold dragon\"}' AS metadata_json,
+            '' AS token_uri_norm,
+            '' AS image_uri_norm,
+            '' AS name_norm,
+            'gold dragon' AS metadata_doc,
+            '[\"description\",\"dragon\",\"gold\"]' AS metadata_keywords_arr
+        ",
+        &parquet_path,
+    );
+
+    let store = DuckDbFeatureStore::new(":memory:").unwrap();
+    store
+        .load_parquet_dataset("ethereum", &parquet_path.to_string_lossy())
+        .unwrap();
+
+    let snapshot = store
+        .load_snapshot(
+            "ethereum",
+            &[SeedNft {
+                chain: "ethereum".into(),
+                contract_address: "0xseed".into(),
+                token_id: "1".into(),
+                metadata_json: r#"{"description":"gold dragon"}"#.into(),
+                ..Default::default()
+            }],
+            0,
+            0,
+        )
+        .unwrap();
+
+    let contracts = snapshot
+        .nft_rows
+        .iter()
+        .map(|row| row.contract_address.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(contracts, vec!["0xkeyword"]);
+    assert!(snapshot.contract_signals["0xkeyword"].keyword_match);
+}
+
+#[test]
 fn feature_store_recalls_short_metadata_terms() {
     let store = DuckDbFeatureStore::new(":memory:").unwrap();
     store
