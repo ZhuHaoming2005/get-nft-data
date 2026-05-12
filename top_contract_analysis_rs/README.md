@@ -169,8 +169,8 @@ cargo run --release -- batch \
 - `--signal-cache-db` 默认是 `:memory:`。如果你希望 transfers / owners 的 signal cache 跨运行保留，请传文件路径。
 - 如果不传 `--feature-parquet`，程序会假设 DuckDB 特征库里已经有可用数据集。
 - 如果同时传了 `--feature-db` 和 `--feature-parquet`，且 `feature-db` 中该链已经有当前版本数据，则会复用 `feature-db`；如果没有该链数据，才从 Parquet 导入。旧版本 `feature-db` / 旧快照缺少预计算列会直接报错，需要重新运行 `export-snapshot`。
-- 当前快照 schema 强制包含 `token_uri_norm`、`image_uri_norm`、`name_norm`、`metadata_keywords_arr`。metadata 文档不再持久化，召回和最终复核都从 `metadata_json` 派生；SQL recall 会先用这些预计算列和 keyword index 下推筛选，并把 metadata recall 结果作为布尔标记交给 Rust 复核。
+- 当前快照 schema 强制包含 `token_uri_norm`、`image_uri_norm`、`name_norm`、`name_prefix8`、`metadata_keywords_arr`。metadata 文档不再持久化，召回和最终复核都从 `metadata_json` 派生；SQL recall 会先用这些预计算列和 keyword index 下推筛选，并把 metadata recall 结果作为布尔标记交给 Rust 复核。
 - duplicate scoring 使用合约级聚合：查重阶段每个候选合约只用代表 token 评分，BM25 metadata scoring 会复用缓存的 token、term frequency 和文档长度；合约命中后，分析阶段会通过 Alchemy `getNFTsForContract` 拉取该合约下全量 NFT，用于 NFT 级报告、地址和交易统计。
-- `batch` 使用 seed 级流水线调度：一个 seed 在 DuckDB recall / duplicate scoring 时，其他 seed 可以继续下载 seed context 或分析已命中的候选合约，尽量错开 CPU 密集阶段和网络 IO 阶段。
+- `batch` 按 worker chunk 调度：先并发下载当前 chunk 的 seed context，再用一次批量 DuckDB recall 复用候选扫描结果，随后按 seed 生成候选和报告；批量 recall 内部会对命中行做有界分批拉取，避免按 seed 数倍增物化完整中间行。
 - `batch` 的资源在整个进程内全局复用：API client、HTTP semaphore、DuckDB feature store、signal cache 不按 worker 复制，避免多 worker 重复占用内存。
 - `batch` 的并发参数都是全局限制，不是单 worker 限制：`--workers` 控制同时进入流水线的 seed 数，`--api-max-concurrency` 控制全局 HTTP 请求并发，`--seed-metadata-max-concurrency` 控制同时下载 seed 合约 metadata 的 seed 数，`--contract-max-concurrency` 控制全局候选合约分析并发，`--sale-metric-max-concurrency` 控制全局 sale metric 并发，`--cpu-max-concurrency` 控制同时执行 DuckDB recall / duplicate scoring 的 seed 数。默认 `--seed-metadata-max-concurrency 1` 和 `--cpu-max-concurrency 1`，避免多个 seed 同时前置下载 metadata 或同时打满 DuckDB / Rayon CPU。
