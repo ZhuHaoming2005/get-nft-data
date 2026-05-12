@@ -757,7 +757,7 @@ fn feature_store_rejects_precomputed_metadata_keywords_without_valid_json() {
 }
 
 #[test]
-fn feature_store_recalls_parquet_metadata_candidates_from_keyword_index() {
+fn feature_store_recalls_parquet_metadata_candidates_from_seed_scoped_terms() {
     let dir = tempdir().unwrap();
     let parquet_path = dir.path().join("snapshot.parquet");
     write_parquet(

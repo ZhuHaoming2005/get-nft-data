@@ -17,7 +17,10 @@ use duckdb::{params, AccessMode, Config, Connection};
 const MAX_OVERLAPPING_METADATA_ROWS_PER_CONTRACT: usize = 1;
 const DEFAULT_RECALL_BATCH_SIZE: usize = 500_000;
 const SELECTED_RECALL_ROWID_CHUNK_SIZE: usize = 50_000;
+const BULK_IMPORT_CHECKPOINT_THRESHOLD: &str = "1TB";
+const BULK_IMPORT_SKIP_WAL_THRESHOLD_BYTES: u64 = 1_099_511_627_776;
 const SEED_METADATA_TERM_TABLE: &str = "__top_contract_analysis_seed_metadata_terms";
+const SEED_METADATA_ROWID_TABLE: &str = "__top_contract_analysis_seed_metadata_rowids";
 const SEED_TOKEN_URI_TABLE: &str = "__top_contract_analysis_seed_token_uri_keys";
 const SEED_IMAGE_URI_TABLE: &str = "__top_contract_analysis_seed_image_uri_keys";
 const SEED_NAME_PREFIX_TABLE: &str = "__top_contract_analysis_seed_name_prefixes";
@@ -260,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_chain_rows_populates_metadata_keyword_index() {
+    fn load_snapshot_recalls_metadata_without_persistent_keyword_index() {
         let store = DuckDbFeatureStore::new(":memory:").unwrap();
         store
             .replace_chain_rows(
@@ -275,26 +278,41 @@ mod tests {
             .unwrap();
 
         let conn = store.conn().unwrap();
-        let indexed = conn
+        let has_persistent_index = conn
             .query_row(
                 "
                 SELECT EXISTS(
                     SELECT 1
-                    FROM metadata_keyword_index
-                    WHERE chain = 'ethereum'
-                      AND keyword = 'gold'
+                    FROM information_schema.tables
+                    WHERE table_name = 'metadata_keyword_index'
                 )
                 ",
                 [],
                 |row| row.get::<_, bool>(0),
             )
             .unwrap();
+        drop(conn);
+        let snapshot = store
+            .load_snapshot(
+                "ethereum",
+                &[SeedNft {
+                    contract_address: "0xseed".into(),
+                    token_id: "1".into(),
+                    metadata_json: r#"{"description":"gold dragon"}"#.into(),
+                    ..Default::default()
+                }],
+                0,
+                0,
+            )
+            .unwrap();
 
-        assert!(indexed);
+        assert!(!has_persistent_index);
+        assert_eq!(snapshot.duplicate_contract_rows.len(), 1);
+        assert!(snapshot.contract_signals["0xcandidate"].keyword_match);
     }
 
     #[test]
-    fn opening_existing_feature_db_backfills_missing_metadata_keyword_index() {
+    fn opening_existing_feature_db_does_not_backfill_persistent_metadata_keyword_index() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("features.duckdb");
         {
@@ -327,23 +345,36 @@ mod tests {
 
         let store = DuckDbFeatureStore::new(&db_path.to_string_lossy()).unwrap();
         let conn = store.conn().unwrap();
-        let indexed = conn
+        let has_persistent_index = conn
             .query_row(
                 "
                 SELECT EXISTS(
                     SELECT 1
-                    FROM metadata_keyword_index
-                    WHERE chain = 'ethereum'
-                      AND feature_rowid = 0
-                      AND keyword = 'gold'
+                    FROM information_schema.tables
+                    WHERE table_name = 'metadata_keyword_index'
                 )
                 ",
                 [],
                 |row| row.get::<_, bool>(0),
             )
             .unwrap();
+        drop(conn);
+        let snapshot = store
+            .load_snapshot(
+                "ethereum",
+                &[SeedNft {
+                    contract_address: "0xseed".into(),
+                    token_id: "1".into(),
+                    metadata_json: r#"{"description":"gold dragon"}"#.into(),
+                    ..Default::default()
+                }],
+                0,
+                0,
+            )
+            .unwrap();
 
-        assert!(indexed);
+        assert!(!has_persistent_index);
+        assert_eq!(snapshot.duplicate_contract_rows.len(), 1);
     }
 
     #[test]
@@ -388,6 +419,37 @@ mod tests {
 
         assert!(!columns.contains("metadata_doc"));
         assert_eq!(row_count, 1);
+    }
+
+    #[test]
+    fn feature_store_configures_bulk_import_checkpoint_limits() {
+        let store = DuckDbFeatureStore::new(":memory:").unwrap();
+        let conn = store.conn().unwrap();
+        let checkpoint_threshold: String = conn
+            .query_row(
+                "SELECT current_setting('checkpoint_threshold')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let skip_wal_threshold: u64 = conn
+            .query_row(
+                "SELECT current_setting('auto_checkpoint_skip_wal_threshold')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let write_buffer_row_group_count: u64 = conn
+            .query_row(
+                "SELECT current_setting('write_buffer_row_group_count')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(checkpoint_threshold.contains("GiB"));
+        assert_eq!(skip_wal_threshold, BULK_IMPORT_SKIP_WAL_THRESHOLD_BYTES);
+        assert_eq!(write_buffer_row_group_count, 1);
     }
 }
 
@@ -708,7 +770,6 @@ impl DuckDbFeatureStore {
         } else {
             Connection::open(database_path)?
         };
-        let had_metadata_keyword_index = Self::table_exists(&conn, "metadata_keyword_index")?;
         let temp_directory = Self::default_temp_directory(database_path);
         std::fs::create_dir_all(&temp_directory)?;
         Self::apply_resource_options(&conn, &resource_options, &temp_directory)?;
@@ -729,23 +790,11 @@ impl DuckDbFeatureStore {
                 name_prefix8 VARCHAR,
                 metadata_keywords_arr VARCHAR
             );
-            CREATE TABLE IF NOT EXISTS metadata_keyword_index (
-                chain VARCHAR NOT NULL,
-                keyword VARCHAR NOT NULL,
-                feature_rowid BIGINT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_metadata_keyword_index_chain_keyword
-                ON metadata_keyword_index(chain, keyword);
-            CREATE INDEX IF NOT EXISTS idx_metadata_keyword_index_feature_rowid
-                ON metadata_keyword_index(feature_rowid);
             ",
         )?;
         Self::drop_obsolete_nft_feature_columns(&conn)?;
         Self::add_missing_nft_feature_columns(&conn)?;
         Self::validate_schema(&conn)?;
-        if !had_metadata_keyword_index {
-            Self::rebuild_all_metadata_keyword_indexes(&conn)?;
-        }
         Ok(Self {
             conn: Mutex::new(conn),
             resource_options,
@@ -797,10 +846,16 @@ impl DuckDbFeatureStore {
             PRAGMA memory_limit='{}';
             PRAGMA temp_directory='{}';
             PRAGMA preserve_insertion_order=false;
+            PRAGMA disable_checkpoint_on_shutdown;
+            SET checkpoint_threshold='{}';
+            SET auto_checkpoint_skip_wal_threshold={};
+            SET write_buffer_row_group_count=1;
             ",
             options.threads.max(1),
             memory_limit,
-            temp_directory
+            temp_directory,
+            BULK_IMPORT_CHECKPOINT_THRESHOLD,
+            BULK_IMPORT_SKIP_WAL_THRESHOLD_BYTES
         ))?;
         Ok(())
     }
@@ -826,18 +881,6 @@ impl DuckDbFeatureStore {
             )));
         }
 
-        let columns = Self::table_columns(conn, "metadata_keyword_index").map_err(|_| {
-            AppError::InvalidData(
-                "feature DB is missing metadata_keyword_index. Rebuild it from a current export-snapshot Parquet file.".to_string(),
-            )
-        })?;
-        for column in ["chain", "keyword", "feature_rowid"] {
-            if !columns.contains(column) {
-                return Err(AppError::InvalidData(format!(
-                    "feature DB metadata_keyword_index table is missing column {column:?}. Rebuild it from a current export-snapshot Parquet file."
-                )));
-            }
-        }
         Ok(())
     }
 
@@ -874,36 +917,6 @@ impl DuckDbFeatureStore {
         Ok(columns)
     }
 
-    fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, AppError> {
-        let exists = conn.query_row(
-            "
-            SELECT EXISTS(
-                SELECT 1
-                FROM information_schema.tables
-                WHERE table_name = ?
-            )
-            ",
-            params![table_name],
-            |row| row.get::<_, bool>(0),
-        )?;
-        Ok(exists)
-    }
-
-    fn rebuild_all_metadata_keyword_indexes(conn: &Connection) -> Result<(), AppError> {
-        let mut stmt = conn.prepare("SELECT DISTINCT chain FROM nft_features")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        let mut chains = Vec::new();
-        for row in rows {
-            chains.push(row?);
-        }
-        drop(stmt);
-
-        for chain in chains {
-            Self::rebuild_metadata_keyword_index_for_chain(conn, &chain)?;
-        }
-        Ok(())
-    }
-
     pub fn has_chain_rows(&self, chain: &str) -> Result<bool, AppError> {
         let conn = self.conn()?;
         let exists = conn.query_row(
@@ -920,10 +933,6 @@ impl DuckDbFeatureStore {
         rows: &[DatabaseNftRecord],
     ) -> Result<(), AppError> {
         let conn = self.conn()?;
-        conn.execute(
-            "DELETE FROM metadata_keyword_index WHERE chain = ?",
-            params![chain],
-        )?;
         conn.execute("DELETE FROM nft_features WHERE chain = ?", params![chain])?;
 
         let mut stmt = conn.prepare(
@@ -957,40 +966,6 @@ impl DuckDbFeatureStore {
                 metadata_keywords_arr,
             ])?;
         }
-        Self::rebuild_metadata_keyword_index_for_chain(&conn, chain)?;
-
-        Ok(())
-    }
-
-    fn rebuild_metadata_keyword_index_for_chain(
-        conn: &Connection,
-        chain: &str,
-    ) -> Result<(), AppError> {
-        conn.execute(
-            "DELETE FROM metadata_keyword_index WHERE chain = ?",
-            params![chain],
-        )?;
-        conn.execute(
-            "
-            INSERT INTO metadata_keyword_index (chain, keyword, feature_rowid)
-            SELECT f.chain, k.keyword, f.rowid
-            FROM nft_features f,
-                 LATERAL (
-                     SELECT DISTINCT json_extract_string(value, '$') AS keyword
-                     FROM json_each(
-                         CASE
-                             WHEN json_valid(coalesce(f.metadata_keywords_arr, '[]'))
-                             THEN coalesce(f.metadata_keywords_arr, '[]')
-                             ELSE '[]'
-                         END
-                     )
-                 ) k
-            WHERE f.chain = ?
-              AND k.keyword IS NOT NULL
-              AND k.keyword <> ''
-            ",
-            params![chain],
-        )?;
         Ok(())
     }
 
@@ -1030,13 +1005,8 @@ impl DuckDbFeatureStore {
             ",
         );
         let conn = self.conn()?;
-        conn.execute(
-            "DELETE FROM metadata_keyword_index WHERE chain = ?",
-            params![chain],
-        )?;
         conn.execute("DELETE FROM nft_features WHERE chain = ?", params![chain])?;
         conn.execute(&insert_sql, params![chain])?;
-        Self::rebuild_metadata_keyword_index_for_chain(&conn, chain)?;
         Ok(())
     }
 
@@ -1092,16 +1062,8 @@ impl DuckDbFeatureStore {
         )
     }
 
-    fn sql_metadata_keyword_index_predicate(chain: &str) -> String {
-        let chain = Self::sql_string_literal(chain);
-        format!(
-            "rowid IN (
-                SELECT m.feature_rowid
-                FROM metadata_keyword_index m
-                JOIN {SEED_METADATA_TERM_TABLE} t ON t.keyword = m.keyword
-                WHERE m.chain = {chain}
-            )"
-        )
+    fn sql_metadata_rowid_candidate_predicate() -> String {
+        format!("rowid IN (SELECT feature_rowid FROM {SEED_METADATA_ROWID_TABLE})")
     }
 
     fn prepare_seed_metadata_term_table(
@@ -1130,6 +1092,44 @@ impl DuckDbFeatureStore {
         for term in terms {
             stmt.execute(params![term])?;
         }
+        Ok(())
+    }
+
+    fn prepare_seed_metadata_rowid_table(conn: &Connection, chain: &str) -> Result<(), AppError> {
+        conn.execute_batch(&format!(
+            "
+            DROP TABLE IF EXISTS {SEED_METADATA_ROWID_TABLE};
+            CREATE TEMP TABLE {SEED_METADATA_ROWID_TABLE} (
+                feature_rowid BIGINT NOT NULL
+            );
+            "
+        ))?;
+        conn.execute(
+            &format!(
+                "
+                INSERT INTO {SEED_METADATA_ROWID_TABLE} (feature_rowid)
+                SELECT DISTINCT f.rowid
+                FROM nft_features f,
+                     LATERAL (
+                         SELECT DISTINCT json_extract_string(value, '$') AS keyword
+                         FROM json_each(
+                             CASE
+                                 WHEN json_valid(coalesce(f.metadata_keywords_arr, '[]'))
+                                 THEN coalesce(f.metadata_keywords_arr, '[]')
+                                 ELSE '[]'
+                             END
+                         )
+                     ) k
+                JOIN {SEED_METADATA_TERM_TABLE} t ON t.keyword = k.keyword
+                WHERE f.chain = ?
+                  AND k.keyword IS NOT NULL
+                  AND k.keyword <> ''
+                  AND {}
+                ",
+                Self::sql_metadata_json_eligible_predicate()
+            ),
+            params![chain],
+        )?;
         Ok(())
     }
 
@@ -1165,6 +1165,7 @@ impl DuckDbFeatureStore {
         conn.execute_batch(&format!(
             "
             DROP TABLE IF EXISTS {SEED_METADATA_TERM_TABLE};
+            DROP TABLE IF EXISTS {SEED_METADATA_ROWID_TABLE};
             DROP TABLE IF EXISTS {SEED_TOKEN_URI_TABLE};
             DROP TABLE IF EXISTS {SEED_IMAGE_URI_TABLE};
             DROP TABLE IF EXISTS {SEED_NAME_PREFIX_TABLE};
@@ -1426,6 +1427,9 @@ impl DuckDbFeatureStore {
         Self::prepare_seed_value_table(&conn, SEED_IMAGE_URI_TABLE, &exact_image_keys)?;
         Self::prepare_seed_value_table(&conn, SEED_NAME_PREFIX_TABLE, &name_prefixes)?;
         Self::prepare_seed_metadata_term_table(&conn, &metadata_recall_terms)?;
+        if !metadata_recall_terms.is_empty() {
+            Self::prepare_seed_metadata_rowid_table(&conn, chain)?;
+        }
         let token_uri_match_expr = if exact_token_keys.is_empty() {
             "FALSE".to_string()
         } else {
@@ -1447,7 +1451,7 @@ impl DuckDbFeatureStore {
             Some(format!(
                 "({}) AND ({})",
                 Self::sql_metadata_json_eligible_predicate(),
-                Self::sql_metadata_keyword_index_predicate(chain)
+                Self::sql_metadata_rowid_candidate_predicate()
             ))
         };
         let metadata_recall_expr = metadata_recall_predicate
@@ -1661,6 +1665,9 @@ impl DuckDbFeatureStore {
         Self::prepare_seed_value_table(&conn, SEED_IMAGE_URI_TABLE, &all_image_keys)?;
         Self::prepare_seed_value_table(&conn, SEED_NAME_PREFIX_TABLE, &all_name_prefixes)?;
         Self::prepare_seed_metadata_term_table(&conn, &all_metadata_terms)?;
+        if !all_metadata_terms.is_empty() {
+            Self::prepare_seed_metadata_rowid_table(&conn, chain)?;
+        }
         let token_uri_match_expr = if all_token_keys.is_empty() {
             "FALSE".to_string()
         } else {
@@ -1685,7 +1692,7 @@ impl DuckDbFeatureStore {
             Some(format!(
                 "({}) AND ({})",
                 Self::sql_metadata_json_eligible_predicate(),
-                Self::sql_metadata_keyword_index_predicate(chain)
+                Self::sql_metadata_rowid_candidate_predicate()
             ))
         };
         let metadata_recall_expr = metadata_recall_predicate
