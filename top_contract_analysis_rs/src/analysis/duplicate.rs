@@ -59,32 +59,32 @@ fn build_contract_name_match_index(
     matches
 }
 
-fn record_metadata_doc(metadata_doc: &str, metadata_json: &str) -> String {
-    if !metadata_is_dedup_eligible(metadata_doc, metadata_json) {
+fn record_metadata_text(metadata_json: &str) -> String {
+    if !metadata_is_dedup_eligible(metadata_json) {
         return String::new();
     }
     metadata_document_from_json(metadata_json)
 }
 
-fn record_metadata_prefilter_doc(metadata_doc: &str, metadata_json: &str) -> String {
-    if !metadata_is_dedup_eligible(metadata_doc, metadata_json) {
+fn record_metadata_prefilter_text(metadata_json: &str) -> String {
+    if !metadata_is_dedup_eligible(metadata_json) {
         return String::new();
     }
     metadata_prefilter_document_from_json(metadata_json)
 }
 
-fn record_metadata_doc_from_record(row: &DatabaseNftRecord) -> String {
-    record_metadata_doc(&row.metadata_doc, &row.metadata_json)
+fn record_metadata_text_from_record(row: &DatabaseNftRecord) -> String {
+    record_metadata_text(&row.metadata_json)
 }
 
-fn record_metadata_prefilter_doc_from_record(row: &DatabaseNftRecord) -> String {
-    record_metadata_prefilter_doc(&row.metadata_doc, &row.metadata_json)
+fn record_metadata_prefilter_text_from_record(row: &DatabaseNftRecord) -> String {
+    record_metadata_prefilter_text(&row.metadata_json)
 }
 
 fn seed_metadata_representative_doc(seed_nfts: &[SeedNft]) -> Option<MetadataBm25Document> {
     seed_nfts.iter().find_map(|item| {
-        let seed_doc = record_metadata_prefilter_doc(&item.metadata_doc, &item.metadata_json);
-        MetadataBm25Document::from_text(&seed_doc)
+        let seed_text = record_metadata_prefilter_text(&item.metadata_json);
+        MetadataBm25Document::from_text(&seed_text)
     })
 }
 
@@ -115,8 +115,8 @@ fn seed_metadata_queries_by_token(
         if item.token_id.trim().is_empty() {
             continue;
         }
-        let metadata_doc = record_metadata_doc(&item.metadata_doc, &item.metadata_json);
-        let Some(doc) = MetadataBm25Document::from_text(&metadata_doc) else {
+        let metadata_text = record_metadata_text(&item.metadata_json);
+        let Some(doc) = MetadataBm25Document::from_text(&metadata_text) else {
             continue;
         };
         docs.entry(item.token_id.clone())
@@ -141,8 +141,8 @@ fn first_overlapping_metadata_match<'a>(
         if !seed_queries_by_token.contains_key(&candidate_row.token_id) {
             continue;
         }
-        let metadata_doc = record_metadata_doc_from_record(candidate_row);
-        let Some(doc) = MetadataBm25Document::from_text(&metadata_doc) else {
+        let metadata_text = record_metadata_text_from_record(candidate_row);
+        let Some(doc) = MetadataBm25Document::from_text(&metadata_text) else {
             continue;
         };
         candidate_rows.push(candidate_row);
@@ -210,7 +210,7 @@ fn new_contract_duplicate_record(row: &DatabaseNftRecord) -> ContractDuplicateRe
 }
 
 fn push_metadata_token_row(record: &mut ContractDuplicateRecord, row: &DatabaseNftRecord) {
-    if record_metadata_doc_from_record(row).is_empty() {
+    if record_metadata_text_from_record(row).is_empty() {
         return;
     }
     if record
@@ -257,20 +257,10 @@ fn aggregate_contract_rows(
 
         entry.metadata_recall_checked |= row.metadata_recall_checked;
         entry.metadata_recall_match |= row.metadata_recall_match;
-        let should_update_metadata_doc = entry.metadata_doc.is_empty()
-            || (row.metadata_recall_match && !entry.representative.metadata_recall_match);
-        if !should_update_metadata_doc {
+        if !row.metadata_recall_match || entry.representative.metadata_recall_match {
             continue;
         }
-
-        let metadata_doc = record_metadata_doc(&row.metadata_doc, &row.metadata_json);
-        if metadata_doc.is_empty() {
-            continue;
-        }
-        entry.metadata_doc = metadata_doc;
-        if row.metadata_recall_match {
-            entry.representative = row.clone();
-        }
+        entry.representative = row.clone();
     }
     let mut rows: Vec<_> = rows_by_contract.into_values().collect();
     for row in &mut rows {
@@ -308,12 +298,12 @@ fn build_metadata_bm25_index(
             continue;
         }
 
-        let metadata_doc = record_metadata_prefilter_doc_from_record(&row.representative);
-        if metadata_doc.is_empty() {
+        let metadata_text = record_metadata_prefilter_text_from_record(&row.representative);
+        if metadata_text.is_empty() {
             continue;
         }
 
-        let tokens = metadata_bm25_tokens(&metadata_doc);
+        let tokens = metadata_bm25_tokens(&metadata_text);
         corpus_builder.add_tokens(&tokens);
 
         // Keep corpus statistics over every scoreable representative document, but only

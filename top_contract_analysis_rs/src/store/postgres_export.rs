@@ -10,9 +10,7 @@ use postgres::fallible_iterator::FallibleIterator;
 use postgres::types::ToSql;
 use postgres::Client;
 
-use crate::analysis::scoring::{
-    metadata_document_from_json, metadata_recall_all_keywords, metadata_recall_document,
-};
+use crate::analysis::scoring::{metadata_recall_all_keywords, metadata_recall_document};
 use crate::error::AppError;
 use crate::normalize::{normalize_name, normalize_url};
 
@@ -59,7 +57,7 @@ fn snapshot_schema(keep_metadata_json: bool) -> Arc<Schema> {
         Field::new("token_uri_norm", DataType::Utf8, false),
         Field::new("image_uri_norm", DataType::Utf8, false),
         Field::new("name_norm", DataType::Utf8, false),
-        Field::new("metadata_doc", DataType::Utf8, false),
+        Field::new("name_prefix8", DataType::Utf8, false),
         Field::new("metadata_keywords_arr", DataType::Utf8, false),
     ]);
     Arc::new(Schema::new(fields))
@@ -83,15 +81,10 @@ fn snapshot_batch(
     let symbol_values: Vec<String> = rows.iter().map(|row| row.symbol.clone()).collect();
     let metadata_json_values: Vec<String> =
         rows.iter().map(|row| row.metadata_json.clone()).collect();
-    let metadata_doc_values: Vec<String> = rows
-        .iter()
-        .map(|row| metadata_document_from_json(&row.metadata_json))
-        .collect();
     let metadata_keyword_values: Vec<String> = rows
         .iter()
-        .zip(metadata_doc_values.iter())
-        .map(|(row, doc)| {
-            let recall_doc = metadata_recall_document(doc, &row.metadata_json);
+        .map(|row| {
+            let recall_doc = metadata_recall_document(&row.metadata_json);
             serde_json::to_string(&metadata_recall_all_keywords(&recall_doc))
         })
         .collect::<Result<_, _>>()?;
@@ -127,7 +120,12 @@ fn snapshot_batch(
                 .map(|value| normalize_name(value))
                 .collect::<Vec<_>>(),
         )) as ArrayRef,
-        Arc::new(StringArray::from(metadata_doc_values)) as ArrayRef,
+        Arc::new(StringArray::from(
+            name_values
+                .iter()
+                .map(|value| normalize_name(value).chars().take(8).collect::<String>())
+                .collect::<Vec<_>>(),
+        )) as ArrayRef,
         Arc::new(StringArray::from(metadata_keyword_values)) as ArrayRef,
     ]);
 

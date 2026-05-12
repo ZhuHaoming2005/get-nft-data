@@ -2,7 +2,6 @@ use reqwest::Url;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::analysis::scoring::metadata_document_from_json;
 use crate::api::{ApiEndpoints, AsyncApiClient};
 use crate::currency::{is_supported_priced_symbol, to_normalized_amount};
 use crate::error::AppError;
@@ -194,7 +193,6 @@ pub async fn fetch_seed_contract_nfts(
                     .to_string(),
                 token_uri,
                 image_uri,
-                metadata_doc: metadata_document_from_json(&metadata_json),
                 metadata_json,
             });
         }

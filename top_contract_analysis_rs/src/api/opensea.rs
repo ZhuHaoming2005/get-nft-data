@@ -3,7 +3,6 @@ use reqwest::Url;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::analysis::scoring::metadata_document_from_json;
 use crate::api::alchemy::fetch_eip2981_royalty_recipient;
 use crate::api::{ApiEndpoints, AsyncApiClient};
 use crate::currency::{is_native_eth_symbol, is_supported_priced_symbol, to_normalized_amount};
@@ -1017,7 +1016,6 @@ pub async fn fetch_opensea_contract_nfts(
                 symbol: String::new(),
                 token_uri,
                 image_uri,
-                metadata_doc: metadata_document_from_json(&metadata_json),
                 metadata_json,
             });
         }

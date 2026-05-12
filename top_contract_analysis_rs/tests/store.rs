@@ -70,7 +70,6 @@ fn feature_store_builds_contract_duplicate_rows_from_normalized_recall_columns()
     assert!(row.token_uri_match);
     assert!(row.image_uri_match);
     assert!(row.name_norms.contains(&"azuki mirror".to_string()));
-    assert_eq!(row.metadata_doc, "gold dragon");
     assert_eq!(row.representative.token_id, "1");
 
     let old_path =
@@ -83,6 +82,104 @@ fn feature_store_builds_contract_duplicate_rows_from_normalized_recall_columns()
         0.6,
     );
     assert_eq!(new_path, old_path);
+}
+
+#[test]
+fn feature_store_load_snapshots_matches_individual_recall_for_mixed_seed_keys() {
+    let store = DuckDbFeatureStore::new(":memory:").unwrap();
+    store
+        .replace_chain_rows(
+            "ethereum",
+            &[DatabaseNftRecord {
+                contract_address: "0xdup".into(),
+                token_id: "1".into(),
+                token_uri: "ipfs://seed-one/meta-1".into(),
+                image_uri: "ipfs://dup/image-1.png".into(),
+                name: "Seed One Mirror #1".into(),
+                metadata_json: r#"{"description":"silver cat"}"#.into(),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+
+    let seed_one = vec![SeedNft {
+        chain: "ethereum".into(),
+        contract_address: "0xseed1".into(),
+        token_id: "1".into(),
+        token_uri: "ipfs://seed-one/meta-1".into(),
+        name: "Seed One #1".into(),
+        metadata_json: r#"{"description":"gold dragon"}"#.into(),
+        ..Default::default()
+    }];
+    let seed_two = vec![SeedNft {
+        chain: "ethereum".into(),
+        contract_address: "0xseed2".into(),
+        token_id: "1".into(),
+        token_uri: "ipfs://seed-two/meta-1".into(),
+        name: "Unrelated #1".into(),
+        metadata_json: r#"{"description":"silver cat"}"#.into(),
+        ..Default::default()
+    }];
+
+    let individual_one = store.load_snapshot("ethereum", &seed_one, 0, 0).unwrap();
+    let individual_two = store.load_snapshot("ethereum", &seed_two, 0, 0).unwrap();
+    let batch = store
+        .load_snapshots(
+            "ethereum",
+            &[("0xseed1".into(), seed_one), ("0xseed2".into(), seed_two)],
+            0,
+            0,
+        )
+        .unwrap();
+
+    assert_eq!(batch["0xseed1"], individual_one);
+    assert_eq!(batch["0xseed2"], individual_two);
+    assert!(batch["0xseed2"].contract_signals["0xdup"].keyword_match);
+}
+
+#[test]
+fn feature_store_load_snapshots_does_not_mark_invalid_json_strong_rows_as_metadata_matches() {
+    let store = DuckDbFeatureStore::new(":memory:").unwrap();
+    store
+        .replace_chain_rows(
+            "ethereum",
+            &[DatabaseNftRecord {
+                contract_address: "0xdup".into(),
+                token_id: "1".into(),
+                token_uri: "ipfs://seed/meta-1".into(),
+                metadata_json: "not json metadata".into(),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+    let seed = vec![SeedNft {
+        chain: "ethereum".into(),
+        contract_address: "0xseed".into(),
+        token_id: "1".into(),
+        token_uri: "ipfs://seed/meta-1".into(),
+        metadata_json: r#"{"description":"json metadata"}"#.into(),
+        ..Default::default()
+    }];
+    let other_seed = vec![SeedNft {
+        chain: "ethereum".into(),
+        contract_address: "0xotherseed".into(),
+        token_id: "1".into(),
+        token_uri: "ipfs://other/meta-1".into(),
+        metadata_json: r#"{"description":"other metadata"}"#.into(),
+        ..Default::default()
+    }];
+
+    let batch = store
+        .load_snapshots(
+            "ethereum",
+            &[("0xseed".into(), seed), ("0xotherseed".into(), other_seed)],
+            0,
+            0,
+        )
+        .unwrap();
+
+    assert!(!batch["0xseed"].contract_signals["0xdup"].keyword_match);
+    assert!(!batch["0xseed"].nft_rows[0].metadata_recall_match);
 }
 
 #[test]
@@ -295,7 +392,6 @@ fn feature_store_prefers_json_overlapping_metadata_row_for_final_recheck() {
                 DatabaseNftRecord {
                     contract_address: "0xdup".into(),
                     token_id: "1".into(),
-                    metadata_doc: "alpha beta".into(),
                     ..Default::default()
                 },
                 DatabaseNftRecord {
@@ -314,7 +410,6 @@ fn feature_store_prefers_json_overlapping_metadata_row_for_final_recheck() {
             contract_address: "0xseed".into(),
             token_id: "1".into(),
             token_uri: "ipfs://shared-recall".into(),
-            metadata_doc: "alpha beta".into(),
             ..Default::default()
         },
         SeedNft {
@@ -382,7 +477,7 @@ fn existing_current_feature_db_chain_rows_take_priority_over_parquet() {
             'ipfs:seed/meta-1' AS token_uri_norm,
             '' AS image_uri_norm,
             'parquet clone' AS name_norm,
-            '' AS metadata_doc,
+            'parquet ' AS name_prefix8,
             '[]' AS metadata_keywords_arr
         ",
         &parquet_path,
@@ -400,7 +495,6 @@ fn existing_current_feature_db_chain_rows_take_priority_over_parquet() {
                 name: "Db Clone #1".into(),
                 symbol: "AZUKI".into(),
                 metadata_json: "".into(),
-                metadata_doc: "".into(),
                 metadata_recall_checked: false,
                 metadata_recall_match: false,
             }],
@@ -424,7 +518,6 @@ fn existing_current_feature_db_chain_rows_take_priority_over_parquet() {
                 token_uri: "ipfs://seed/meta-1".into(),
                 image_uri: "".into(),
                 metadata_json: "".into(),
-                metadata_doc: "".into(),
             }],
             0,
             0,
@@ -457,7 +550,7 @@ fn parquet_loads_when_feature_db_has_no_chain_rows() {
             'ipfs:seed/meta-1' AS token_uri_norm,
             '' AS image_uri_norm,
             'parquet clone' AS name_norm,
-            '' AS metadata_doc,
+            'parquet ' AS name_prefix8,
             '[]' AS metadata_keywords_arr
         ",
         &parquet_path,
@@ -482,7 +575,6 @@ fn parquet_loads_when_feature_db_has_no_chain_rows() {
                 token_uri: "ipfs://seed/meta-1".into(),
                 image_uri: "".into(),
                 metadata_json: "".into(),
-                metadata_doc: "".into(),
             }],
             0,
             0,
@@ -517,7 +609,6 @@ fn old_feature_db_schema_is_rejected() {
                 token_uri_norm VARCHAR,
                 image_uri_norm VARCHAR,
                 name_norm VARCHAR,
-                metadata_doc VARCHAR
             );
             ",
         )
@@ -560,7 +651,6 @@ fn feature_store_applies_per_contract_token_cap() {
                     name: "Clone #1".into(),
                     symbol: "AZUKI".into(),
                     metadata_json: "".into(),
-                    metadata_doc: "".into(),
                     metadata_recall_checked: false,
                     metadata_recall_match: false,
                 },
@@ -572,7 +662,6 @@ fn feature_store_applies_per_contract_token_cap() {
                     name: "Clone #2".into(),
                     symbol: "AZUKI".into(),
                     metadata_json: "".into(),
-                    metadata_doc: "".into(),
                     metadata_recall_checked: false,
                     metadata_recall_match: false,
                 },
@@ -584,7 +673,6 @@ fn feature_store_applies_per_contract_token_cap() {
                     name: "Other Clone #1".into(),
                     symbol: "AZUKI".into(),
                     metadata_json: "".into(),
-                    metadata_doc: "".into(),
                     metadata_recall_checked: false,
                     metadata_recall_match: false,
                 },
@@ -604,7 +692,6 @@ fn feature_store_applies_per_contract_token_cap() {
                 token_uri: "ipfs://seed/meta-1".into(),
                 image_uri: "".into(),
                 metadata_json: "".into(),
-                metadata_doc: "".into(),
             }],
             1,
             0,
@@ -640,7 +727,7 @@ fn feature_store_rejects_precomputed_metadata_keywords_without_valid_json() {
             '' AS token_uri_norm,
             '' AS image_uri_norm,
             '' AS name_norm,
-            'dog' AS metadata_doc,
+            '' AS name_prefix8,
             '[\"cat\"]' AS metadata_keywords_arr
         ",
         &parquet_path,
@@ -687,7 +774,7 @@ fn feature_store_recalls_parquet_metadata_candidates_from_keyword_index() {
             '' AS token_uri_norm,
             '' AS image_uri_norm,
             '' AS name_norm,
-            'gold dragon' AS metadata_doc,
+            '' AS name_prefix8,
             '[\"description\",\"dragon\",\"gold\"]' AS metadata_keywords_arr
         ",
         &parquet_path,
@@ -951,17 +1038,23 @@ fn snapshot_export_writes_precomputed_columns() {
 
     let conn = Connection::open_in_memory().unwrap();
     let path = parquet_path_literal(&parquet_path);
-    let (metadata_json, token_uri_norm, metadata_doc): (String, String, String) = conn
+    let (metadata_json, token_uri_norm, name_prefix8, metadata_keywords_arr): (
+        String,
+        String,
+        String,
+        String,
+    ) = conn
         .query_row(
             &format!(
-                "SELECT metadata_json, token_uri_norm, metadata_doc FROM read_parquet('{path}')"
+                "SELECT metadata_json, token_uri_norm, name_prefix8, metadata_keywords_arr FROM read_parquet('{path}')"
             ),
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .unwrap();
 
     assert!(metadata_json.contains("red hooded anime portrait"));
     assert_eq!(token_uri_norm, "ipfs:seed/meta-1");
-    assert_eq!(metadata_doc, "red hooded anime portrait");
+    assert_eq!(name_prefix8, "azuki mi");
+    assert!(metadata_keywords_arr.contains("portrait"));
 }

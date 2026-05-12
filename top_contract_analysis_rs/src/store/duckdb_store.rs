@@ -18,12 +18,15 @@ const MAX_OVERLAPPING_METADATA_ROWS_PER_CONTRACT: usize = 1;
 const DEFAULT_RECALL_BATCH_SIZE: usize = 500_000;
 const SELECTED_RECALL_ROWID_CHUNK_SIZE: usize = 50_000;
 const SEED_METADATA_TERM_TABLE: &str = "__top_contract_analysis_seed_metadata_terms";
+const SEED_TOKEN_URI_TABLE: &str = "__top_contract_analysis_seed_token_uri_keys";
+const SEED_IMAGE_URI_TABLE: &str = "__top_contract_analysis_seed_image_uri_keys";
+const SEED_NAME_PREFIX_TABLE: &str = "__top_contract_analysis_seed_name_prefixes";
 
 const PRECOMPUTED_COLUMNS: [&str; 5] = [
     "token_uri_norm",
     "image_uri_norm",
     "name_norm",
-    "metadata_doc",
+    "name_prefix8",
     "metadata_keywords_arr",
 ];
 
@@ -35,6 +38,35 @@ struct RecallRow {
     token_uri_norm: String,
     image_uri_norm: String,
     name_norm: String,
+    metadata_keywords_arr: String,
+    metadata_recall_match: bool,
+}
+
+struct SeedRecallProfile {
+    seed_address: String,
+    seed_contracts: HashSet<String>,
+    seed_token_ids: HashSet<String>,
+    exact_token_keys: HashSet<String>,
+    exact_image_keys: HashSet<String>,
+    name_prefixes: HashSet<String>,
+    metadata_terms: HashSet<String>,
+}
+
+#[derive(Default)]
+struct SnapshotAccumulator {
+    per_contract_counts: HashMap<String, usize>,
+    nft_rows: Vec<DatabaseNftRecord>,
+    duplicate_rows_by_contract: HashMap<String, ContractDuplicateRecord>,
+    seen_contract_name_pairs: BTreeSet<(String, String)>,
+    contract_names: Vec<ContractNameRecord>,
+    contract_signals_raw: BTreeMap<String, ContractSignal>,
+}
+
+struct SeedRowMatch {
+    seed_address: String,
+    token_uri_match: bool,
+    image_uri_match: bool,
+    name_prefix_match: bool,
     metadata_recall_match: bool,
 }
 
@@ -73,7 +105,7 @@ mod tests {
                 &[DatabaseNftRecord {
                     contract_address: "0xcandidate".into(),
                     token_id: "1".into(),
-                    metadata_doc: "silver cat".into(),
+                    metadata_json: r#"{"second_unique":"silver cat"}"#.into(),
                     ..Default::default()
                 }],
             )
@@ -82,13 +114,13 @@ mod tests {
             SeedNft {
                 contract_address: "0xseed".into(),
                 token_id: "1".into(),
-                metadata_doc: "gold dragon".into(),
+                metadata_json: r#"{"first_unique":"gold dragon"}"#.into(),
                 ..Default::default()
             },
             SeedNft {
                 contract_address: "0xseed".into(),
                 token_id: "2".into(),
-                metadata_doc: "silver cat".into(),
+                metadata_json: r#"{"second_unique":"silver cat"}"#.into(),
                 ..Default::default()
             },
         ];
@@ -268,12 +300,12 @@ mod tests {
                     token_uri_norm VARCHAR,
                     image_uri_norm VARCHAR,
                     name_norm VARCHAR,
-                    metadata_doc VARCHAR,
+                    name_prefix8 VARCHAR,
                     metadata_keywords_arr VARCHAR
                 );
                 INSERT INTO nft_features VALUES (
                     'ethereum', '0xcandidate', '1', '', '', '', '', '{\"description\":\"gold dragon\"}',
-                    '', '', '', 'gold dragon', '[\"description\",\"dragon\",\"gold\"]'
+                    '', '', '', '', '[\"description\",\"dragon\",\"gold\"]'
                 );
                 ",
             )
@@ -299,6 +331,50 @@ mod tests {
             .unwrap();
 
         assert!(indexed);
+    }
+
+    #[test]
+    fn opening_writable_feature_db_drops_obsolete_metadata_doc_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("features.duckdb");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "
+                CREATE TABLE nft_features (
+                    chain VARCHAR NOT NULL,
+                    contract_address VARCHAR NOT NULL,
+                    token_id VARCHAR NOT NULL,
+                    token_uri VARCHAR,
+                    image_uri VARCHAR,
+                    name VARCHAR,
+                    symbol VARCHAR,
+                    metadata_json VARCHAR,
+                    token_uri_norm VARCHAR,
+                    image_uri_norm VARCHAR,
+                    name_norm VARCHAR,
+                    metadata_doc VARCHAR,
+                    name_prefix8 VARCHAR,
+                    metadata_keywords_arr VARCHAR
+                );
+                INSERT INTO nft_features VALUES (
+                    'ethereum', '0xcandidate', '1', '', '', '', '', '{\"description\":\"gold dragon\"}',
+                    '', '', '', 'gold dragon', '', '[\"description\",\"dragon\",\"gold\"]'
+                );
+                ",
+            )
+            .unwrap();
+        }
+
+        let store = DuckDbFeatureStore::new(&db_path.to_string_lossy()).unwrap();
+        let conn = store.conn().unwrap();
+        let columns = DuckDbFeatureStore::table_columns(&conn, "nft_features").unwrap();
+        let row_count: i64 = conn
+            .query_row("SELECT count(*) FROM nft_features", [], |row| row.get(0))
+            .unwrap();
+
+        assert!(!columns.contains("metadata_doc"));
+        assert_eq!(row_count, 1);
     }
 }
 
@@ -333,7 +409,7 @@ fn seed_metadata_recall_terms(seed_nfts: &[SeedNft]) -> HashSet<String> {
     seed_nfts
         .iter()
         .find_map(|item| {
-            let doc = metadata_recall_document(&item.metadata_doc, &item.metadata_json);
+            let doc = metadata_recall_document(&item.metadata_json);
             let keywords = metadata_recall_all_keywords(&doc);
             if keywords.is_empty() {
                 None
@@ -342,6 +418,132 @@ fn seed_metadata_recall_terms(seed_nfts: &[SeedNft]) -> HashSet<String> {
             }
         })
         .unwrap_or_default()
+}
+
+impl SeedRecallProfile {
+    fn new(seed_address: String, seed_nfts: &[SeedNft]) -> Self {
+        Self {
+            seed_address,
+            seed_contracts: seed_nfts
+                .iter()
+                .map(|item| item.contract_address.to_lowercase())
+                .collect(),
+            seed_token_ids: seed_nfts
+                .iter()
+                .map(|item| item.token_id.clone())
+                .filter(|value| !value.is_empty())
+                .collect(),
+            exact_token_keys: seed_nfts
+                .iter()
+                .filter_map(|item| normalize_url(&item.token_uri))
+                .collect(),
+            exact_image_keys: seed_nfts
+                .iter()
+                .filter_map(|item| normalize_url(&item.image_uri))
+                .collect(),
+            name_prefixes: seed_nfts
+                .iter()
+                .map(|item| normalize_name(&item.name))
+                .filter(|value| !value.is_empty())
+                .map(|value| value.chars().take(8).collect::<String>())
+                .collect(),
+            metadata_terms: seed_metadata_recall_terms(seed_nfts),
+        }
+    }
+
+    fn has_strong_recall_keys(&self) -> bool {
+        !self.exact_token_keys.is_empty()
+            || !self.exact_image_keys.is_empty()
+            || !self.name_prefixes.is_empty()
+    }
+}
+
+impl SnapshotAccumulator {
+    fn push_recall_row(
+        &mut self,
+        profile: &SeedRecallProfile,
+        row: &RecallRow,
+        mut record: DatabaseNftRecord,
+        row_match: &SeedRowMatch,
+        max_tokens_per_contract: usize,
+    ) {
+        if profile.seed_contracts.contains(&row.contract_address) {
+            return;
+        }
+
+        let entry = self
+            .per_contract_counts
+            .entry(row.contract_address.clone())
+            .or_default();
+        if max_tokens_per_contract > 0 && *entry >= max_tokens_per_contract {
+            return;
+        }
+        *entry += 1;
+
+        record.metadata_recall_checked = true;
+        record.metadata_recall_match = row_match.metadata_recall_match;
+
+        let name_pair_is_new = !row.name_norm.is_empty()
+            && self
+                .seen_contract_name_pairs
+                .insert((record.contract_address.clone(), row.name_norm.clone()));
+        if name_pair_is_new {
+            self.contract_names.push(ContractNameRecord {
+                contract_address: record.contract_address.clone(),
+                name_norm: row.name_norm.clone(),
+            });
+        }
+
+        let signal = self
+            .contract_signals_raw
+            .entry(record.contract_address.clone())
+            .or_insert_with(|| ContractSignal {
+                contract_address: record.contract_address.clone(),
+                ..ContractSignal::default()
+            });
+        signal.token_count += 1;
+        if row_match.token_uri_match {
+            signal.uri_match_count += 1;
+        }
+        if row_match.image_uri_match {
+            signal.image_match_count += 1;
+        }
+        if row_match.name_prefix_match {
+            signal.name_prefix_match = true;
+        }
+        if row_match.metadata_recall_match {
+            signal.keyword_match = true;
+        }
+
+        update_duplicate_contract_row(
+            &mut self.duplicate_rows_by_contract,
+            &record,
+            row_match.token_uri_match,
+            row_match.image_uri_match,
+            &row.name_norm,
+            name_pair_is_new,
+            row_match.metadata_recall_match,
+        );
+        self.nft_rows.push(record);
+    }
+
+    fn finish(self) -> DatabaseSnapshot {
+        let mut duplicate_contract_rows: Vec<_> =
+            self.duplicate_rows_by_contract.into_values().collect();
+        for row in &mut duplicate_contract_rows {
+            row.metadata_token_rows
+                .sort_by(|left, right| left.token_id.cmp(&right.token_id));
+        }
+        duplicate_contract_rows
+            .sort_by(|left, right| left.contract_address.cmp(&right.contract_address));
+
+        DatabaseSnapshot {
+            nft_rows: self.nft_rows,
+            duplicate_contract_rows,
+            contract_names: self.contract_names,
+            contract_signals: self.contract_signals_raw,
+        }
+    }
 }
 
 fn update_duplicate_contract_row(
@@ -370,29 +572,20 @@ fn update_duplicate_contract_row(
 
     entry.metadata_recall_checked = true;
     entry.metadata_recall_match |= metadata_recall_match;
-    let should_update_metadata_doc = entry.metadata_doc.is_empty()
-        || (metadata_recall_match
-            && (!entry.representative.metadata_recall_match
-                || record.token_id < entry.representative.token_id));
-    if !should_update_metadata_doc {
+    let should_update_representative = metadata_recall_match
+        && (!entry.representative.metadata_recall_match
+            || record.token_id < entry.representative.token_id);
+    if !should_update_representative {
         return;
     }
-
-    if record.metadata_doc.is_empty() {
-        return;
-    }
-    entry.metadata_doc = record.metadata_doc.clone();
-    if metadata_recall_match {
-        entry.representative = record.clone();
-    }
+    entry.representative = record.clone();
 }
 
 fn push_metadata_token_row(entry: &mut ContractDuplicateRecord, record: &DatabaseNftRecord) {
-    if !metadata_is_dedup_eligible(&record.metadata_doc, &record.metadata_json) {
+    if !metadata_is_dedup_eligible(&record.metadata_json) {
         return;
     }
-    let metadata_doc = metadata_document_from_json(&record.metadata_json);
-    if metadata_doc.is_empty() {
+    if metadata_document_from_json(&record.metadata_json).is_empty() {
         return;
     }
     if entry
@@ -438,7 +631,7 @@ impl DuckDbFeatureStore {
                 token_uri_norm VARCHAR,
                 image_uri_norm VARCHAR,
                 name_norm VARCHAR,
-                metadata_doc VARCHAR,
+                name_prefix8 VARCHAR,
                 metadata_keywords_arr VARCHAR
             );
             CREATE TABLE IF NOT EXISTS metadata_keyword_index (
@@ -452,6 +645,8 @@ impl DuckDbFeatureStore {
                 ON metadata_keyword_index(feature_rowid);
             ",
         )?;
+        Self::drop_obsolete_nft_feature_columns(&conn)?;
+        Self::add_missing_nft_feature_columns(&conn)?;
         Self::validate_schema(&conn)?;
         if !had_metadata_keyword_index {
             Self::rebuild_all_metadata_keyword_indexes(&conn)?;
@@ -524,12 +719,7 @@ impl DuckDbFeatureStore {
     }
 
     fn validate_schema(conn: &Connection) -> Result<(), AppError> {
-        let mut stmt = conn.prepare("DESCRIBE nft_features")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        let mut columns = HashSet::new();
-        for row in rows {
-            columns.insert(row?);
-        }
+        let columns = Self::table_columns(conn, "nft_features")?;
         let missing: Vec<&str> = PRECOMPUTED_COLUMNS
             .iter()
             .copied()
@@ -540,20 +730,12 @@ impl DuckDbFeatureStore {
                 "feature DB nft_features table is missing current pre-computed columns {missing:?}. Rebuild it from a current export-snapshot Parquet file."
             )));
         }
-        drop(stmt);
 
-        let mut stmt = conn
-            .prepare("DESCRIBE metadata_keyword_index")
-            .map_err(|_| {
-                AppError::InvalidData(
-                    "feature DB is missing metadata_keyword_index. Rebuild it from a current export-snapshot Parquet file.".to_string(),
-                )
-            })?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        let mut columns = HashSet::new();
-        for row in rows {
-            columns.insert(row?);
-        }
+        let columns = Self::table_columns(conn, "metadata_keyword_index").map_err(|_| {
+            AppError::InvalidData(
+                "feature DB is missing metadata_keyword_index. Rebuild it from a current export-snapshot Parquet file.".to_string(),
+            )
+        })?;
         for column in ["chain", "keyword", "feature_rowid"] {
             if !columns.contains(column) {
                 return Err(AppError::InvalidData(format!(
@@ -562,6 +744,39 @@ impl DuckDbFeatureStore {
             }
         }
         Ok(())
+    }
+
+    fn drop_obsolete_nft_feature_columns(conn: &Connection) -> Result<(), AppError> {
+        let columns = Self::table_columns(conn, "nft_features")?;
+        if columns.contains("metadata_doc") {
+            conn.execute("ALTER TABLE nft_features DROP COLUMN metadata_doc", [])?;
+        }
+        Ok(())
+    }
+
+    fn add_missing_nft_feature_columns(conn: &Connection) -> Result<(), AppError> {
+        let columns = Self::table_columns(conn, "nft_features")?;
+        if !columns.contains("name_prefix8") && columns.contains("name_norm") {
+            conn.execute(
+                "ALTER TABLE nft_features ADD COLUMN name_prefix8 VARCHAR",
+                [],
+            )?;
+            conn.execute(
+                "UPDATE nft_features SET name_prefix8 = substr(coalesce(name_norm, ''), 1, 8)",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn table_columns(conn: &Connection, table_name: &str) -> Result<HashSet<String>, AppError> {
+        let mut stmt = conn.prepare(&format!("DESCRIBE {table_name}"))?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut columns = HashSet::new();
+        for row in rows {
+            columns.insert(row?);
+        }
+        Ok(columns)
     }
 
     fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, AppError> {
@@ -620,21 +835,17 @@ impl DuckDbFeatureStore {
             "
             INSERT INTO nft_features (
                 chain, contract_address, token_id, token_uri, image_uri, name, symbol, metadata_json,
-                token_uri_norm, image_uri_norm, name_norm, metadata_doc, metadata_keywords_arr
+                token_uri_norm, image_uri_norm, name_norm, name_prefix8, metadata_keywords_arr
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ",
         )?;
 
         for row in rows {
-            let metadata_doc = if metadata_is_dedup_eligible(&row.metadata_doc, &row.metadata_json)
-            {
-                metadata_document_from_json(&row.metadata_json)
-            } else {
-                String::new()
-            };
-            let metadata_recall_doc = metadata_recall_document(&metadata_doc, &row.metadata_json);
+            let metadata_recall_doc = metadata_recall_document(&row.metadata_json);
             let metadata_keywords_arr =
                 serde_json::to_string(&metadata_recall_all_keywords(&metadata_recall_doc))?;
+            let name_norm = normalize_name(&row.name);
+            let name_prefix8 = name_norm.chars().take(8).collect::<String>();
             stmt.execute(params![
                 chain,
                 row.contract_address.to_lowercase(),
@@ -646,8 +857,8 @@ impl DuckDbFeatureStore {
                 row.metadata_json,
                 normalize_url(&row.token_uri).unwrap_or_default(),
                 normalize_url(&row.image_uri).unwrap_or_default(),
-                normalize_name(&row.name),
-                metadata_doc,
+                name_norm,
+                name_prefix8,
                 metadata_keywords_arr,
             ])?;
         }
@@ -704,7 +915,7 @@ impl DuckDbFeatureStore {
             "
             INSERT INTO nft_features (
                 chain, contract_address, token_id, token_uri, image_uri, name, symbol, metadata_json,
-                token_uri_norm, image_uri_norm, name_norm, metadata_doc, metadata_keywords_arr
+                token_uri_norm, image_uri_norm, name_norm, name_prefix8, metadata_keywords_arr
             )
             SELECT
                 ? AS chain,
@@ -718,7 +929,7 @@ impl DuckDbFeatureStore {
                 coalesce(CAST(token_uri_norm AS VARCHAR), '') AS token_uri_norm,
                 coalesce(CAST(image_uri_norm AS VARCHAR), '') AS image_uri_norm,
                 coalesce(CAST(name_norm AS VARCHAR), '') AS name_norm,
-                coalesce(CAST(metadata_doc AS VARCHAR), '') AS metadata_doc,
+                coalesce(CAST(name_prefix8 AS VARCHAR), '') AS name_prefix8,
                 coalesce(CAST(metadata_keywords_arr AS VARCHAR), '[]') AS metadata_keywords_arr
             FROM read_parquet({path})
             ",
@@ -778,25 +989,6 @@ impl DuckDbFeatureStore {
         format!("'{}'", value.replace('\'', "''"))
     }
 
-    fn sql_in_predicate(column: &str, values: &HashSet<String>) -> Option<String> {
-        if values.is_empty() {
-            return None;
-        }
-        let values = values
-            .iter()
-            .filter(|value| !value.is_empty())
-            .map(|value| Self::sql_string_literal(value))
-            .collect::<BTreeSet<_>>();
-        if values.is_empty() {
-            None
-        } else {
-            Some(format!(
-                "{column} IN ({})",
-                values.into_iter().collect::<Vec<_>>().join(", ")
-            ))
-        }
-    }
-
     fn sql_metadata_json_eligible_predicate() -> String {
         format!(
             "length(trim(coalesce(CAST(metadata_json AS VARCHAR), ''))) <= {MAX_METADATA_BYTES_FOR_DEDUP} \
@@ -846,6 +1038,74 @@ impl DuckDbFeatureStore {
         Ok(())
     }
 
+    fn prepare_seed_value_table(
+        conn: &Connection,
+        table_name: &str,
+        values: &HashSet<String>,
+    ) -> Result<(), AppError> {
+        conn.execute_batch(&format!(
+            "
+            DROP TABLE IF EXISTS {table_name};
+            CREATE TEMP TABLE {table_name} (
+                value VARCHAR NOT NULL
+            );
+            "
+        ))?;
+        if values.is_empty() {
+            return Ok(());
+        }
+
+        let mut stmt = conn.prepare(&format!("INSERT INTO {table_name} (value) VALUES (?)"))?;
+        let values = values
+            .iter()
+            .filter(|value| !value.is_empty())
+            .collect::<BTreeSet<_>>();
+        for value in values {
+            stmt.execute(params![value])?;
+        }
+        Ok(())
+    }
+
+    fn drop_seed_temp_tables(conn: &Connection) -> Result<(), AppError> {
+        conn.execute_batch(&format!(
+            "
+            DROP TABLE IF EXISTS {SEED_METADATA_TERM_TABLE};
+            DROP TABLE IF EXISTS {SEED_TOKEN_URI_TABLE};
+            DROP TABLE IF EXISTS {SEED_IMAGE_URI_TABLE};
+            DROP TABLE IF EXISTS {SEED_NAME_PREFIX_TABLE};
+            "
+        ))?;
+        Ok(())
+    }
+
+    fn metadata_keywords_from_recall_row(row: &RecallRow) -> HashSet<String> {
+        serde_json::from_str::<Vec<String>>(&row.metadata_keywords_arr)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .collect()
+    }
+
+    fn seed_row_match(
+        profile: &SeedRecallProfile,
+        row: &RecallRow,
+        metadata_keywords: &HashSet<String>,
+    ) -> SeedRowMatch {
+        let name_prefix = row.name_norm.chars().take(8).collect::<String>();
+        let metadata_recall_match = row.metadata_recall_match
+            && metadata_keywords
+                .iter()
+                .any(|keyword| profile.metadata_terms.contains(keyword));
+        SeedRowMatch {
+            seed_address: profile.seed_address.clone(),
+            token_uri_match: profile.exact_token_keys.contains(&row.token_uri_norm),
+            image_uri_match: profile.exact_image_keys.contains(&row.image_uri_norm),
+            name_prefix_match: !name_prefix.is_empty()
+                && profile.name_prefixes.contains(&name_prefix),
+            metadata_recall_match,
+        }
+    }
+
     fn fetch_records_by_feature_rowid(
         conn: &Connection,
         rowids: &[i64],
@@ -864,7 +1124,7 @@ impl DuckDbFeatureStore {
                 "
                 SELECT rowid, contract_address, token_id, coalesce(token_uri, ''),
                        coalesce(image_uri, ''), coalesce(name, ''), coalesce(symbol, ''),
-                       coalesce(metadata_json, ''), coalesce(metadata_doc, '')
+                       coalesce(metadata_json, '')
                 FROM nft_features
                 WHERE rowid IN ({values})
                 "
@@ -881,7 +1141,6 @@ impl DuckDbFeatureStore {
                         name: row.get::<_, String>(5)?,
                         symbol: row.get::<_, String>(6)?,
                         metadata_json: row.get::<_, String>(7)?,
-                        metadata_doc: row.get::<_, String>(8)?,
                         metadata_recall_checked: false,
                         metadata_recall_match: false,
                     },
@@ -927,21 +1186,19 @@ impl DuckDbFeatureStore {
             let sql = format!(
                 "
                 SELECT contract_key, contract_address, token_id, token_uri, image_uri, name, symbol,
-                       metadata_json, metadata_doc
+                       metadata_json
                 FROM (
                     SELECT lower(contract_address) AS contract_key,
                            contract_address, token_id, coalesce(token_uri, '') AS token_uri,
                            coalesce(image_uri, '') AS image_uri, coalesce(name, '') AS name,
                            coalesce(symbol, '') AS symbol, coalesce(metadata_json, '') AS metadata_json,
-                           coalesce(metadata_doc, '') AS metadata_doc,
                            row_number() OVER (
                                PARTITION BY lower(contract_address)
                                ORDER BY CASE
                                    WHEN trim(coalesce(CAST(metadata_json AS VARCHAR), '')) LIKE '{{%'
                                         OR trim(coalesce(CAST(metadata_json AS VARCHAR), '')) LIKE '[%' THEN 0
                                    WHEN trim(coalesce(CAST(metadata_json AS VARCHAR), '')) <> '' THEN 1
-                                   WHEN trim(coalesce(CAST(metadata_doc AS VARCHAR), '')) <> '' THEN 2
-                                   ELSE 3
+                                   ELSE 2
                                END,
                                CAST(token_id AS VARCHAR)
                            ) AS overlap_rank
@@ -971,7 +1228,6 @@ impl DuckDbFeatureStore {
                         name: row.get::<_, String>(5)?,
                         symbol: row.get::<_, String>(6)?,
                         metadata_json: row.get::<_, String>(7)?,
-                        metadata_doc: row.get::<_, String>(8)?,
                         metadata_recall_checked: false,
                         metadata_recall_match: false,
                     },
@@ -1023,15 +1279,26 @@ impl DuckDbFeatureStore {
             .collect();
         let metadata_recall_terms = seed_metadata_recall_terms(seed_nfts);
 
-        let token_uri_match_expr =
-            Self::sql_in_predicate("token_uri_norm", &exact_token_keys).unwrap_or("FALSE".into());
-        let image_uri_match_expr =
-            Self::sql_in_predicate("image_uri_norm", &exact_image_keys).unwrap_or("FALSE".into());
-        let name_prefix_match_expr =
-            Self::sql_in_predicate("substr(name_norm, 1, 8)", &name_prefixes)
-                .unwrap_or("FALSE".into());
         let conn = self.conn()?;
+        Self::prepare_seed_value_table(&conn, SEED_TOKEN_URI_TABLE, &exact_token_keys)?;
+        Self::prepare_seed_value_table(&conn, SEED_IMAGE_URI_TABLE, &exact_image_keys)?;
+        Self::prepare_seed_value_table(&conn, SEED_NAME_PREFIX_TABLE, &name_prefixes)?;
         Self::prepare_seed_metadata_term_table(&conn, &metadata_recall_terms)?;
+        let token_uri_match_expr = if exact_token_keys.is_empty() {
+            "FALSE".to_string()
+        } else {
+            format!("token_uri_norm IN (SELECT value FROM {SEED_TOKEN_URI_TABLE})")
+        };
+        let image_uri_match_expr = if exact_image_keys.is_empty() {
+            "FALSE".to_string()
+        } else {
+            format!("image_uri_norm IN (SELECT value FROM {SEED_IMAGE_URI_TABLE})")
+        };
+        let name_prefix_match_expr = if name_prefixes.is_empty() {
+            "FALSE".to_string()
+        } else {
+            format!("name_prefix8 IN (SELECT value FROM {SEED_NAME_PREFIX_TABLE})")
+        };
         let metadata_recall_predicate = if metadata_recall_terms.is_empty() {
             None
         } else {
@@ -1089,6 +1356,7 @@ impl DuckDbFeatureStore {
                     "
                     SELECT rowid AS feature_rowid, contract_address,
                            token_uri_norm, image_uri_norm, name_norm,
+                           coalesce(metadata_keywords_arr, '[]') AS metadata_keywords_arr,
                            {metadata_recall_expr} AS metadata_recall_match,
                            CAST(token_id AS VARCHAR) AS token_id
                     FROM nft_features
@@ -1107,8 +1375,9 @@ impl DuckDbFeatureStore {
                         token_uri_norm: row.get::<_, String>(2)?,
                         image_uri_norm: row.get::<_, String>(3)?,
                         name_norm: row.get::<_, String>(4)?,
-                        metadata_recall_match: row.get::<_, bool>(5)?,
-                        token_id: row.get::<_, String>(6)?,
+                        metadata_keywords_arr: row.get::<_, String>(5)?,
+                        metadata_recall_match: row.get::<_, bool>(6)?,
+                        token_id: row.get::<_, String>(7)?,
                     })
                 })?;
 
@@ -1225,7 +1494,7 @@ impl DuckDbFeatureStore {
                 last_feature_rowid = last_seen_feature_rowid;
             }
         }
-        conn.execute_batch(&format!("DROP TABLE IF EXISTS {SEED_METADATA_TERM_TABLE}"))?;
+        Self::drop_seed_temp_tables(&conn)?;
         Self::append_overlapping_metadata_token_rows(
             &conn,
             chain,
@@ -1247,5 +1516,238 @@ impl DuckDbFeatureStore {
             contract_names,
             contract_signals: contract_signals_raw,
         })
+    }
+
+    pub fn load_snapshots(
+        &self,
+        chain: &str,
+        seeds: &[(String, Vec<SeedNft>)],
+        max_tokens_per_contract: usize,
+        max_recall_rows: usize,
+    ) -> Result<BTreeMap<String, DatabaseSnapshot>, AppError> {
+        if seeds.len() <= 1 {
+            let mut snapshots = BTreeMap::new();
+            for (seed_address, seed_nfts) in seeds {
+                snapshots.insert(
+                    seed_address.clone(),
+                    self.load_snapshot(chain, seed_nfts, max_tokens_per_contract, max_recall_rows)?,
+                );
+            }
+            return Ok(snapshots);
+        }
+
+        let profiles = seeds
+            .iter()
+            .map(|(seed_address, seed_nfts)| {
+                SeedRecallProfile::new(seed_address.clone(), seed_nfts)
+            })
+            .collect::<Vec<_>>();
+        let mut all_token_keys = HashSet::new();
+        let mut all_image_keys = HashSet::new();
+        let mut all_name_prefixes = HashSet::new();
+        let mut all_metadata_terms = HashSet::new();
+        for profile in &profiles {
+            all_token_keys.extend(profile.exact_token_keys.iter().cloned());
+            all_image_keys.extend(profile.exact_image_keys.iter().cloned());
+            all_name_prefixes.extend(profile.name_prefixes.iter().cloned());
+            all_metadata_terms.extend(profile.metadata_terms.iter().cloned());
+        }
+
+        let mut accumulators = profiles
+            .iter()
+            .map(|profile| (profile.seed_address.clone(), SnapshotAccumulator::default()))
+            .collect::<BTreeMap<_, _>>();
+        if !profiles
+            .iter()
+            .any(SeedRecallProfile::has_strong_recall_keys)
+            && all_metadata_terms.is_empty()
+        {
+            return Ok(accumulators
+                .into_iter()
+                .map(|(seed_address, accumulator)| (seed_address, accumulator.finish()))
+                .collect());
+        }
+
+        let conn = self.conn()?;
+        Self::prepare_seed_value_table(&conn, SEED_TOKEN_URI_TABLE, &all_token_keys)?;
+        Self::prepare_seed_value_table(&conn, SEED_IMAGE_URI_TABLE, &all_image_keys)?;
+        Self::prepare_seed_value_table(&conn, SEED_NAME_PREFIX_TABLE, &all_name_prefixes)?;
+        Self::prepare_seed_metadata_term_table(&conn, &all_metadata_terms)?;
+        let token_uri_match_expr = if all_token_keys.is_empty() {
+            "FALSE".to_string()
+        } else {
+            format!("token_uri_norm IN (SELECT value FROM {SEED_TOKEN_URI_TABLE})")
+        };
+        let image_uri_match_expr = if all_image_keys.is_empty() {
+            "FALSE".to_string()
+        } else {
+            format!("image_uri_norm IN (SELECT value FROM {SEED_IMAGE_URI_TABLE})")
+        };
+        let name_prefix_match_expr = if all_name_prefixes.is_empty() {
+            "FALSE".to_string()
+        } else {
+            format!("name_prefix8 IN (SELECT value FROM {SEED_NAME_PREFIX_TABLE})")
+        };
+        let strong_recall_predicate = format!(
+            "({token_uri_match_expr}) OR ({image_uri_match_expr}) OR ({name_prefix_match_expr})"
+        );
+        let metadata_recall_predicate = if all_metadata_terms.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "({}) AND ({})",
+                Self::sql_metadata_json_eligible_predicate(),
+                Self::sql_metadata_keyword_index_predicate(chain)
+            ))
+        };
+        let metadata_recall_expr = metadata_recall_predicate
+            .as_deref()
+            .unwrap_or("FALSE")
+            .to_string();
+        let mut recall_pass_predicates = Vec::new();
+        if !all_token_keys.is_empty() || !all_image_keys.is_empty() || !all_name_prefixes.is_empty()
+        {
+            recall_pass_predicates.push((strong_recall_predicate, false));
+        }
+        if metadata_recall_predicate.is_some() {
+            recall_pass_predicates.push((metadata_recall_expr.clone(), true));
+        }
+        let recall_batch_size = if max_recall_rows == 0 {
+            DEFAULT_RECALL_BATCH_SIZE
+        } else {
+            max_recall_rows
+        };
+
+        for (recall_predicate, metadata_only_pass) in recall_pass_predicates {
+            let mut last_feature_rowid = -1_i64;
+            loop {
+                let select_sql = format!(
+                    "
+                    SELECT rowid AS feature_rowid, contract_address,
+                           token_uri_norm, image_uri_norm, name_norm,
+                           coalesce(metadata_keywords_arr, '[]') AS metadata_keywords_arr,
+                           {metadata_recall_expr} AS metadata_recall_match,
+                           CAST(token_id AS VARCHAR) AS token_id
+                    FROM nft_features
+                    WHERE chain = ?
+                      AND ({recall_predicate})
+                      AND rowid > {last_feature_rowid}
+                    ORDER BY rowid
+                    LIMIT {recall_batch_size}
+                    "
+                );
+                let mut stmt = conn.prepare(&select_sql)?;
+                let rows = stmt.query_map(params![chain], |row| {
+                    Ok(RecallRow {
+                        feature_rowid: row.get::<_, i64>(0)?,
+                        contract_address: row.get::<_, String>(1)?,
+                        token_uri_norm: row.get::<_, String>(2)?,
+                        image_uri_norm: row.get::<_, String>(3)?,
+                        name_norm: row.get::<_, String>(4)?,
+                        metadata_keywords_arr: row.get::<_, String>(5)?,
+                        metadata_recall_match: row.get::<_, bool>(6)?,
+                        token_id: row.get::<_, String>(7)?,
+                    })
+                })?;
+
+                let mut fetched_rows = 0usize;
+                let mut last_seen_feature_rowid = last_feature_rowid;
+                let mut batch_rows = Vec::new();
+                for row in rows {
+                    fetched_rows += 1;
+                    let row = row?;
+                    last_seen_feature_rowid = row.feature_rowid;
+                    batch_rows.push(row);
+                }
+                drop(stmt);
+
+                batch_rows.sort_by(|left, right| {
+                    (&left.contract_address, &left.token_id, left.feature_rowid).cmp(&(
+                        &right.contract_address,
+                        &right.token_id,
+                        right.feature_rowid,
+                    ))
+                });
+
+                let mut selected_rows = Vec::new();
+                for row in batch_rows {
+                    let metadata_keywords = Self::metadata_keywords_from_recall_row(&row);
+                    for profile in &profiles {
+                        let row_match = Self::seed_row_match(profile, &row, &metadata_keywords);
+                        let strong_match = row_match.token_uri_match
+                            || row_match.image_uri_match
+                            || row_match.name_prefix_match;
+                        if metadata_only_pass {
+                            if strong_match || !row_match.metadata_recall_match {
+                                continue;
+                            }
+                        } else if !strong_match {
+                            continue;
+                        }
+                        selected_rows.push((
+                            row_match.seed_address.clone(),
+                            row.clone(),
+                            row_match,
+                        ));
+                    }
+                }
+
+                for selected_chunk in selected_rows.chunks(SELECTED_RECALL_ROWID_CHUNK_SIZE) {
+                    let selected_rowids = selected_chunk
+                        .iter()
+                        .map(|(_, row, _)| row.feature_rowid)
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    let full_records_by_rowid =
+                        Self::fetch_records_by_feature_rowid(&conn, &selected_rowids)?;
+
+                    for (seed_address, row, row_match) in selected_chunk {
+                        let Some(record) = full_records_by_rowid.get(&row.feature_rowid) else {
+                            continue;
+                        };
+                        let Some(profile) = profiles
+                            .iter()
+                            .find(|profile| profile.seed_address == *seed_address)
+                        else {
+                            continue;
+                        };
+                        let Some(accumulator) = accumulators.get_mut(seed_address) else {
+                            continue;
+                        };
+                        accumulator.push_recall_row(
+                            profile,
+                            row,
+                            record.clone(),
+                            row_match,
+                            max_tokens_per_contract,
+                        );
+                    }
+                }
+
+                if fetched_rows < recall_batch_size {
+                    break;
+                }
+                last_feature_rowid = last_seen_feature_rowid;
+            }
+        }
+        Self::drop_seed_temp_tables(&conn)?;
+        for profile in &profiles {
+            let Some(accumulator) = accumulators.get_mut(&profile.seed_address) else {
+                continue;
+            };
+            Self::append_overlapping_metadata_token_rows(
+                &conn,
+                chain,
+                &profile.seed_token_ids,
+                &mut accumulator.duplicate_rows_by_contract,
+            )?;
+        }
+
+        let snapshots = accumulators
+            .into_iter()
+            .map(|(seed_address, accumulator)| (seed_address, accumulator.finish()))
+            .collect();
+        Ok(snapshots)
     }
 }

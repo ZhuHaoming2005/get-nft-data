@@ -36,7 +36,6 @@ pub struct SeedNft {
     pub token_uri: String,
     pub image_uri: String,
     pub metadata_json: String,
-    pub metadata_doc: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -48,7 +47,6 @@ pub struct DatabaseNftRecord {
     pub name: String,
     pub symbol: String,
     pub metadata_json: String,
-    pub metadata_doc: String,
     #[serde(skip_serializing, skip_deserializing, default)]
     pub metadata_recall_checked: bool,
     #[serde(skip_serializing, skip_deserializing, default)]
@@ -78,7 +76,6 @@ pub struct ContractDuplicateRecord {
     pub token_uri_match: bool,
     pub image_uri_match: bool,
     pub name_norms: Vec<String>,
-    pub metadata_doc: String,
     pub metadata_token_rows: Vec<DatabaseNftRecord>,
     pub metadata_recall_checked: bool,
     pub metadata_recall_match: bool,

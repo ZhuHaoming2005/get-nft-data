@@ -208,7 +208,6 @@ async fn fetch_opensea_contract_nfts_paginates_contract_tokens() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].contract_address, "0xdup");
     assert_eq!(rows[0].token_id, "1");
-    assert_eq!(rows[0].metadata_doc, "gold dragon");
     assert_eq!(rows[1].token_id, "2");
     assert_eq!(rows[1].image_uri, "ipfs://candidate/2.png");
 }

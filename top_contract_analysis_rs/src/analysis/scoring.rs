@@ -85,15 +85,14 @@ pub fn metadata_prefilter_document_from_json(raw: &str) -> String {
     }
 }
 
-pub fn metadata_recall_document(metadata_doc: &str, metadata_json: &str) -> String {
-    if !metadata_is_dedup_eligible(metadata_doc, metadata_json) {
+pub fn metadata_recall_document(metadata_json: &str) -> String {
+    if !metadata_is_dedup_eligible(metadata_json) {
         return String::new();
     }
     metadata_prefilter_document_from_json(metadata_json)
 }
 
-pub fn metadata_is_dedup_eligible(metadata_doc: &str, metadata_json: &str) -> bool {
-    let _ = metadata_doc;
+pub fn metadata_is_dedup_eligible(metadata_json: &str) -> bool {
     let metadata_json = metadata_json.trim();
     !metadata_json.is_empty()
         && metadata_json.len() <= MAX_METADATA_BYTES_FOR_DEDUP
@@ -384,20 +383,17 @@ mod tests {
     #[test]
     fn metadata_recall_document_rejects_non_json_and_overlong_raw_metadata() {
         assert_eq!(
-            metadata_recall_document("gold dragon", r#"{"description":"Gold Dragon"}"#),
+            metadata_recall_document(r#"{"description":"Gold Dragon"}"#),
             "description gold dragon"
         );
-        assert_eq!(
-            metadata_recall_document("gold dragon", "not json metadata"),
-            ""
-        );
-        assert_eq!(metadata_recall_document("gold dragon", ""), "");
+        assert_eq!(metadata_recall_document("not json metadata"), "");
+        assert_eq!(metadata_recall_document(""), "");
 
         let overlong_json = format!(
             r#"{{"description":"{}"}}"#,
             "x".repeat(MAX_METADATA_BYTES_FOR_DEDUP)
         );
-        assert_eq!(metadata_recall_document("gold dragon", &overlong_json), "");
+        assert_eq!(metadata_recall_document(&overlong_json), "");
     }
 }
 

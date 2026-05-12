@@ -85,7 +85,6 @@ impl AnalyzeApi for FakeApi {
             token_uri: "ipfs://seed/1".into(),
             image_uri: "ipfs://image/1.png".into(),
             metadata_json: r#"{"name":"Azuki #1","description":"gold dragon"}"#.into(),
-            metadata_doc: "gold dragon".into(),
         }])
     }
 
@@ -581,7 +580,6 @@ impl AnalyzeApi for FakeTwoTokenOwnersApi {
                 token_uri: "ipfs://seed/1".into(),
                 image_uri: "ipfs://image/1.png".into(),
                 metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                metadata_doc: "gold dragon".into(),
             },
             SeedNft {
                 chain: chain.to_string(),
@@ -592,7 +590,6 @@ impl AnalyzeApi for FakeTwoTokenOwnersApi {
                 token_uri: "ipfs://candidate/2".into(),
                 image_uri: "ipfs://candidate/2.png".into(),
                 metadata_json: r#"{"description":"different trait"}"#.into(),
-                metadata_doc: "different trait".into(),
             },
         ])
     }
@@ -1094,7 +1091,6 @@ impl AnalyzeApi for FakeEnrichedApi {
             token_uri: "ipfs://seed/1".into(),
             image_uri: "ipfs://image/1.png".into(),
             metadata_json: r#"{"name":"Azuki #1","description":"gold dragon"}"#.into(),
-            metadata_doc: "gold dragon".into(),
         }])
     }
 
@@ -1339,7 +1335,6 @@ impl AnalyzeApi for PreSeedDeploymentApi {
             token_uri: "ipfs://seed/1".into(),
             image_uri: "ipfs://image/1.png".into(),
             metadata_json: r#"{"name":"Azuki #1"}"#.into(),
-            metadata_doc: "azuki".into(),
         }])
     }
 
@@ -1670,7 +1665,6 @@ impl AnalyzeApi for CountingApi {
             token_uri: "ipfs://seed/1".into(),
             image_uri: "ipfs://image/1.png".into(),
             metadata_json: r#"{"name":"Azuki #1","description":"gold dragon"}"#.into(),
-            metadata_doc: "gold dragon".into(),
         }])
     }
 
@@ -1897,7 +1891,6 @@ impl AnalyzeApi for FakeSaleMetricApi {
             token_uri: "ipfs://seed/1".into(),
             image_uri: "ipfs://image/1.png".into(),
             metadata_json: r#"{"name":"Azuki #1","description":"gold dragon"}"#.into(),
-            metadata_doc: "gold dragon".into(),
         }])
     }
 
@@ -2093,7 +2086,6 @@ impl AnalyzeApi for MultiBuyerSameTxSaleMetricApi {
             token_uri: "ipfs://seed/1".into(),
             image_uri: "ipfs://image/1.png".into(),
             metadata_json: r#"{"name":"Azuki #1","description":"gold dragon"}"#.into(),
-            metadata_doc: "gold dragon".into(),
         }])
     }
 
@@ -2342,7 +2334,6 @@ impl AnalyzeApi for StaggeredExpansionApi {
             token_uri: "ipfs://seed/1".into(),
             image_uri: "ipfs://image/1.png".into(),
             metadata_json: r#"{"name":"Azuki #1","description":"gold dragon"}"#.into(),
-            metadata_doc: "gold dragon".into(),
         }])
     }
 
@@ -2368,7 +2359,6 @@ impl AnalyzeApi for StaggeredExpansionApi {
             token_uri: "ipfs://seed/1".into(),
             image_uri: "ipfs://image/1.png".into(),
             metadata_json: r#"{"description":"gold dragon"}"#.into(),
-            metadata_doc: "gold dragon".into(),
         }])
     }
 
@@ -2500,7 +2490,6 @@ impl AnalyzeApi for ConcurrentContractApi {
             token_uri: "ipfs://seed/1".into(),
             image_uri: "ipfs://image/1.png".into(),
             metadata_json: r#"{"name":"Azuki #1","description":"gold dragon"}"#.into(),
-            metadata_doc: "gold dragon".into(),
         }])
     }
 
@@ -2693,7 +2682,6 @@ impl AnalyzeApi for ConcurrentSingleContractFetchApi {
             token_uri: "ipfs://seed/1".into(),
             image_uri: "ipfs://image/1.png".into(),
             metadata_json: r#"{"name":"Azuki #1","description":"gold dragon"}"#.into(),
-            metadata_doc: "gold dragon".into(),
         }])
     }
 
@@ -2848,7 +2836,6 @@ impl AnalyzeApi for ConcurrentSaleMetricApi {
             token_uri: "ipfs://seed/1".into(),
             image_uri: "ipfs://image/1.png".into(),
             metadata_json: r#"{"name":"Azuki #1","description":"gold dragon"}"#.into(),
-            metadata_doc: "gold dragon".into(),
         }])
     }
 
@@ -3667,7 +3654,6 @@ async fn analyze_moves_official_reissues_into_legit_duplicates() {
                     name: "Azuki Mirror #1".into(),
                     symbol: "AZUKI".into(),
                     metadata_json: r#"{"description":"Creative Commons Zero license: CC0"}"#.into(),
-                    metadata_doc: "creative commons zero public domain".into(),
                     metadata_recall_checked: false,
                     metadata_recall_match: false,
                 }],
@@ -3729,7 +3715,6 @@ async fn analyze_moves_same_opensea_collection_candidates_into_legit_duplicates(
                     name: "Azuki Mirror #1".into(),
                     symbol: "AZUKI".into(),
                     metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                    metadata_doc: "gold dragon".into(),
                     metadata_recall_checked: false,
                     metadata_recall_match: false,
                 }],
@@ -3779,7 +3764,6 @@ async fn analyze_builds_expected_summary_counts() {
                     name: "Azuki Mirror #1".into(),
                     symbol: "AZUKI".into(),
                     metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                    metadata_doc: "gold dragon".into(),
                     metadata_recall_checked: false,
                     metadata_recall_match: false,
                 }],
@@ -3824,7 +3808,6 @@ async fn analyze_excludes_candidate_contract_that_currently_holds_seed_nft() {
                     name: "Azuki Mirror #1".into(),
                     symbol: "AZUKI".into(),
                     metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                    metadata_doc: "gold dragon".into(),
                     metadata_recall_checked: false,
                     metadata_recall_match: false,
                 }],
@@ -3875,7 +3858,6 @@ async fn analyze_excludes_candidate_contract_with_seed_transfer_history() {
                     name: "Azuki Mirror #1".into(),
                     symbol: "AZUKI".into(),
                     metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                    metadata_doc: "gold dragon".into(),
                     metadata_recall_checked: false,
                     metadata_recall_match: false,
                 }],
@@ -3924,7 +3906,6 @@ async fn analyze_keeps_wrapper_named_candidate_without_chain_seed_relation() {
                     name: "Wrapped Azuki #1".into(),
                     symbol: "WAZUKI".into(),
                     metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                    metadata_doc: "gold dragon".into(),
                     metadata_recall_checked: false,
                     metadata_recall_match: false,
                 }],
@@ -3972,7 +3953,6 @@ async fn analyze_keeps_locally_wrapper_named_candidate_without_chain_seed_relati
                     name: "Azuki Mirror #1".into(),
                     symbol: "AZUKI".into(),
                     metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                    metadata_doc: "gold dragon".into(),
                     metadata_recall_checked: false,
                     metadata_recall_match: false,
                 }],
@@ -4024,7 +4004,6 @@ async fn analyze_marks_seed_open_license_and_skips_suspected_contracts() {
                     name: "Azuki Mirror #1".into(),
                     symbol: "AZUKI".into(),
                     metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                    metadata_doc: "gold dragon".into(),
                     metadata_recall_checked: false,
                     metadata_recall_match: false,
                 }],
@@ -4101,7 +4080,6 @@ async fn analyze_enriches_duplicate_contracts_with_signals_and_infringing_tokens
                     name: "Azuki Mirror #1".into(),
                     symbol: "AZUKI".into(),
                     metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                    metadata_doc: "gold dragon".into(),
                     metadata_recall_checked: false,
                     metadata_recall_match: false,
                 }],
@@ -4224,7 +4202,6 @@ async fn analyze_filters_candidates_deployed_before_seed_contract() {
                     name: "Azuki Mirror #1".into(),
                     symbol: "AZUKI".into(),
                     metadata_json: r#"{"name":"Azuki Mirror #1"}"#.into(),
-                    metadata_doc: "azuki".into(),
                     metadata_recall_checked: false,
                     metadata_recall_match: false,
                 }],
@@ -4280,7 +4257,6 @@ async fn analyze_expands_matched_contracts_to_all_tokens_for_report_analysis() {
                     name: "Azuki Mirror #1".into(),
                     symbol: "AZUKI".into(),
                     metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                    metadata_doc: "gold dragon".into(),
                     ..DatabaseNftRecord::default()
                 }],
                 ..DatabaseSnapshot::default()
@@ -4350,7 +4326,6 @@ async fn analyze_falls_back_to_local_snapshot_when_provider_expansion_is_empty()
                         image_uri: "ipfs://image/1.png".into(),
                         name: "Azuki Mirror #1".into(),
                         metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                        metadata_doc: "gold dragon".into(),
                         ..DatabaseNftRecord::default()
                     },
                     DatabaseNftRecord {
@@ -4360,7 +4335,6 @@ async fn analyze_falls_back_to_local_snapshot_when_provider_expansion_is_empty()
                         image_uri: "ipfs://candidate/2.png".into(),
                         name: "Azuki Mirror #2".into(),
                         metadata_json: r#"{"description":"different trait"}"#.into(),
-                        metadata_doc: "different trait".into(),
                         ..DatabaseNftRecord::default()
                     },
                 ],
@@ -4403,7 +4377,6 @@ async fn analyze_ignores_symbol_only_candidate_contracts() {
                     name: "Completely Different".into(),
                     symbol: "AZUKI".into(),
                     metadata_json: r#"{"description":"unrelated"}"#.into(),
-                    metadata_doc: "unrelated".into(),
                     metadata_recall_checked: false,
                     metadata_recall_match: false,
                 }],
@@ -4449,7 +4422,6 @@ async fn analyze_builds_address_profiles_and_trade_stats_for_duplicate_contracts
                     name: "Azuki Mirror #1".into(),
                     symbol: "AZUKI".into(),
                     metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                    metadata_doc: "gold dragon".into(),
                     metadata_recall_checked: false,
                     metadata_recall_match: false,
                 }],
@@ -4562,7 +4534,6 @@ async fn analyze_reuses_signal_cache_for_transfers_and_owners() {
                     name: "Azuki Mirror #1".into(),
                     symbol: "AZUKI".into(),
                     metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                    metadata_doc: "gold dragon".into(),
                     metadata_recall_checked: false,
                     metadata_recall_match: false,
                 }],
@@ -4609,7 +4580,6 @@ async fn analyze_computes_native_eth_sale_metrics_for_secondary_sale_victim_addr
                     name: "Azuki Mirror #1".into(),
                     symbol: "AZUKI".into(),
                     metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                    metadata_doc: "gold dragon".into(),
                     metadata_recall_checked: false,
                     metadata_recall_match: false,
                 }],
@@ -4678,7 +4648,6 @@ async fn analyze_sale_metrics_are_keyed_by_transaction_and_buyer() {
                         name: "Azuki Mirror #1".into(),
                         symbol: "AZUKI".into(),
                         metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                        metadata_doc: "gold dragon".into(),
                         metadata_recall_checked: false,
                         metadata_recall_match: false,
                     },
@@ -4690,7 +4659,6 @@ async fn analyze_sale_metrics_are_keyed_by_transaction_and_buyer() {
                         name: "Azuki Mirror #2".into(),
                         symbol: "AZUKI".into(),
                         metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                        metadata_doc: "gold dragon".into(),
                         metadata_recall_checked: false,
                         metadata_recall_match: false,
                     },
@@ -4748,7 +4716,6 @@ async fn analyze_processes_duplicate_contracts_within_a_seed_concurrently() {
                         name: "Azuki Mirror #1".into(),
                         symbol: "AZUKI".into(),
                         metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                        metadata_doc: "gold dragon".into(),
                         metadata_recall_checked: false,
                         metadata_recall_match: false,
                     },
@@ -4760,7 +4727,6 @@ async fn analyze_processes_duplicate_contracts_within_a_seed_concurrently() {
                         name: "Azuki Mirror #2".into(),
                         symbol: "AZUKI".into(),
                         metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                        metadata_doc: "gold dragon".into(),
                         metadata_recall_checked: false,
                         metadata_recall_match: false,
                     },
@@ -4809,7 +4775,6 @@ async fn analyze_starts_contract_analysis_before_all_provider_expansions_finish(
                         name: "Azuki Mirror #1".into(),
                         symbol: "AZUKI".into(),
                         metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                        metadata_doc: "gold dragon".into(),
                         metadata_recall_checked: false,
                         metadata_recall_match: false,
                     },
@@ -4821,7 +4786,6 @@ async fn analyze_starts_contract_analysis_before_all_provider_expansions_finish(
                         name: "Azuki Mirror #2".into(),
                         symbol: "AZUKI".into(),
                         metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                        metadata_doc: "gold dragon".into(),
                         metadata_recall_checked: false,
                         metadata_recall_match: false,
                     },
@@ -4871,7 +4835,6 @@ async fn analyze_computes_sale_metrics_concurrently_within_a_contract() {
                     name: "Azuki Mirror #1".into(),
                     symbol: "AZUKI".into(),
                     metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                    metadata_doc: "gold dragon".into(),
                     metadata_recall_checked: false,
                     metadata_recall_match: false,
                 }],
@@ -4918,7 +4881,6 @@ async fn analyze_prefetches_sale_metrics_per_buyer_with_shared_transaction_hash(
                     name: "Azuki Mirror #1".into(),
                     symbol: "AZUKI".into(),
                     metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                    metadata_doc: "gold dragon".into(),
                     metadata_recall_checked: false,
                     metadata_recall_match: false,
                 }],
@@ -4964,7 +4926,6 @@ async fn analyze_prefetches_sale_metrics_only_for_latest_buyer_purchase() {
                     name: "Azuki Mirror #1".into(),
                     symbol: "AZUKI".into(),
                     metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                    metadata_doc: "gold dragon".into(),
                     metadata_recall_checked: false,
                     metadata_recall_match: false,
                 }],
@@ -5010,7 +4971,6 @@ async fn analyze_fetches_contract_inputs_concurrently_within_one_contract() {
                     name: "Azuki Mirror #1".into(),
                     symbol: "AZUKI".into(),
                     metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                    metadata_doc: "gold dragon".into(),
                     metadata_recall_checked: false,
                     metadata_recall_match: false,
                 }],
