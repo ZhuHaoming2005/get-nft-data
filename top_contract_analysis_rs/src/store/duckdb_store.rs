@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::analysis::scoring::{
     metadata_document_from_json, metadata_is_dedup_eligible, metadata_recall_document,
@@ -25,6 +25,7 @@ const SEED_TOKEN_URI_TABLE: &str = "__top_contract_analysis_seed_token_uri_keys"
 const SEED_IMAGE_URI_TABLE: &str = "__top_contract_analysis_seed_image_uri_keys";
 const SEED_TOKEN_ID_TABLE: &str = "__top_contract_analysis_seed_token_ids";
 const CANDIDATE_CONTRACT_TABLE: &str = "__top_contract_analysis_candidate_contracts";
+const CONTRACT_REPRESENTATIVE_TABLE: &str = "nft_contract_representatives";
 const METADATA_SKETCH_ANCHOR_COUNT: usize = 8;
 const METADATA_SKETCH_SOURCE_HAMMING_THRESHOLD: u32 = 24;
 const METADATA_SIMHASH_BAND_COUNT: usize = 8;
@@ -126,6 +127,7 @@ struct MetadataRecallIndex {
 pub struct DuckDbFeatureStore {
     conn: Mutex<Connection>,
     resource_options: DuckDbResourceOptions,
+    metadata_recall_index_cache: Mutex<HashMap<String, Arc<MetadataRecallIndex>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -420,6 +422,97 @@ mod tests {
 
         assert!(!has_persistent_index);
         assert_eq!(snapshot.duplicate_contract_rows.len(), 1);
+    }
+
+    #[test]
+    fn replace_chain_rows_populates_contract_representatives() {
+        let store = DuckDbFeatureStore::new(":memory:").unwrap();
+        store
+            .replace_chain_rows(
+                "ethereum",
+                &[
+                    DatabaseNftRecord {
+                        contract_address: "0xdup".into(),
+                        token_id: "2".into(),
+                        name: "Zed Clone".into(),
+                        metadata_json: r#"{"description":"silver cat"}"#.into(),
+                        ..Default::default()
+                    },
+                    DatabaseNftRecord {
+                        contract_address: "0xdup".into(),
+                        token_id: "1".into(),
+                        name: "Alpha Clone".into(),
+                        metadata_json: r#"{"description":"gold dragon"}"#.into(),
+                        ..Default::default()
+                    },
+                ],
+            )
+            .unwrap();
+
+        let conn = store.conn().unwrap();
+        let (contract_address, name_token_id, metadata_token_id): (String, String, String) = conn
+            .query_row(
+                "
+                SELECT r.contract_address, name_row.token_id, metadata_row.token_id
+                FROM nft_contract_representatives r
+                JOIN nft_features name_row ON name_row.rowid = r.name_feature_rowid
+                JOIN nft_features metadata_row ON metadata_row.rowid = r.metadata_feature_rowid
+                WHERE r.chain = 'ethereum'
+                ",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!(contract_address, "0xdup");
+        assert_eq!(name_token_id, "1");
+        assert_eq!(metadata_token_id, "1");
+    }
+
+    #[test]
+    fn load_snapshot_reuses_and_invalidates_metadata_recall_index_cache() {
+        let store = DuckDbFeatureStore::new(":memory:").unwrap();
+        store
+            .replace_chain_rows(
+                "ethereum",
+                &[DatabaseNftRecord {
+                    contract_address: "0xdup".into(),
+                    token_id: "1".into(),
+                    metadata_json: r#"{"description":"gold dragon"}"#.into(),
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+        let seed = vec![SeedNft {
+            chain: "ethereum".into(),
+            contract_address: "0xseed".into(),
+            token_id: "1".into(),
+            metadata_json: r#"{"description":"gold dragon"}"#.into(),
+            ..Default::default()
+        }];
+
+        assert_eq!(store.metadata_recall_index_cache_len(), 0);
+        store
+            .load_snapshot("ethereum", &seed, 101.0, 0.6, 0, 0)
+            .unwrap();
+        assert_eq!(store.metadata_recall_index_cache_len(), 1);
+        store
+            .load_snapshot("ethereum", &seed, 101.0, 0.6, 0, 0)
+            .unwrap();
+        assert_eq!(store.metadata_recall_index_cache_len(), 1);
+
+        store
+            .replace_chain_rows(
+                "ethereum",
+                &[DatabaseNftRecord {
+                    contract_address: "0xother".into(),
+                    token_id: "1".into(),
+                    metadata_json: r#"{"description":"silver cat"}"#.into(),
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+        assert_eq!(store.metadata_recall_index_cache_len(), 0);
     }
 
     #[test]
@@ -991,11 +1084,13 @@ impl DuckDbFeatureStore {
             );
             ",
         )?;
+        Self::create_contract_representative_table(&conn)?;
         Self::drop_obsolete_nft_feature_columns(&conn)?;
         Self::validate_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             resource_options,
+            metadata_recall_index_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1018,6 +1113,7 @@ impl DuckDbFeatureStore {
         Ok(Self {
             conn: Mutex::new(conn),
             resource_options,
+            metadata_recall_index_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1029,6 +1125,27 @@ impl DuckDbFeatureStore {
         self.conn
             .lock()
             .map_err(|err| AppError::DuckDb(format!("DuckDB connection lock poisoned: {err}")))
+    }
+
+    fn metadata_recall_index_cache(
+        &self,
+    ) -> Result<MutexGuard<'_, HashMap<String, Arc<MetadataRecallIndex>>>, AppError> {
+        self.metadata_recall_index_cache.lock().map_err(|err| {
+            AppError::DuckDb(format!("metadata recall index cache lock poisoned: {err}"))
+        })
+    }
+
+    #[cfg(test)]
+    fn metadata_recall_index_cache_len(&self) -> usize {
+        self.metadata_recall_index_cache
+            .lock()
+            .expect("metadata recall index cache lock")
+            .len()
+    }
+
+    fn invalidate_metadata_recall_index(&self, chain: &str) -> Result<(), AppError> {
+        self.metadata_recall_index_cache()?.remove(chain);
+        Ok(())
     }
 
     fn apply_resource_options(
@@ -1082,6 +1199,128 @@ impl DuckDbFeatureStore {
         Ok(())
     }
 
+    fn create_contract_representative_table(conn: &Connection) -> Result<(), AppError> {
+        conn.execute_batch(&format!(
+            "
+            CREATE TABLE IF NOT EXISTS {CONTRACT_REPRESENTATIVE_TABLE} (
+                chain VARCHAR NOT NULL,
+                contract_address VARCHAR NOT NULL,
+                name_feature_rowid BIGINT,
+                metadata_feature_rowid BIGINT
+            );
+            "
+        ))?;
+        Ok(())
+    }
+
+    fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, AppError> {
+        let exists = conn.query_row(
+            "
+            SELECT EXISTS(
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_name = ?
+            )
+            ",
+            params![table_name],
+            |row| row.get::<_, bool>(0),
+        )?;
+        Ok(exists)
+    }
+
+    fn contract_representatives_have_chain(
+        conn: &Connection,
+        chain: &str,
+    ) -> Result<bool, AppError> {
+        let exists = conn.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM {CONTRACT_REPRESENTATIVE_TABLE} WHERE chain = ? LIMIT 1)"
+            ),
+            params![chain],
+            |row| row.get::<_, bool>(0),
+        )?;
+        Ok(exists)
+    }
+
+    fn refresh_contract_representatives_for_chain(
+        conn: &Connection,
+        chain: &str,
+    ) -> Result<(), AppError> {
+        Self::create_contract_representative_table(conn)?;
+        conn.execute(
+            &format!("DELETE FROM {CONTRACT_REPRESENTATIVE_TABLE} WHERE chain = ?"),
+            params![chain],
+        )?;
+        let sql = format!(
+            "
+            INSERT INTO {CONTRACT_REPRESENTATIVE_TABLE} (
+                chain, contract_address, name_feature_rowid, metadata_feature_rowid
+            )
+            WITH name_reps AS (
+                SELECT chain, contract_address, feature_rowid AS name_feature_rowid
+                FROM (
+                    SELECT chain,
+                           lower(CAST(contract_address AS VARCHAR)) AS contract_address,
+                           rowid AS feature_rowid,
+                           row_number() OVER (
+                               PARTITION BY lower(CAST(contract_address AS VARCHAR))
+                               ORDER BY trim(coalesce(CAST(name AS VARCHAR), '')), rowid
+                           ) AS name_rank
+                    FROM nft_features
+                    WHERE chain = ?
+                      AND trim(coalesce(CAST(name_norm AS VARCHAR), '')) <> ''
+                )
+                WHERE name_rank = 1
+            ),
+            metadata_reps AS (
+                SELECT chain, contract_address, feature_rowid AS metadata_feature_rowid
+                FROM (
+                    SELECT chain,
+                           lower(CAST(contract_address AS VARCHAR)) AS contract_address,
+                           rowid AS feature_rowid,
+                           row_number() OVER (
+                               PARTITION BY lower(CAST(contract_address AS VARCHAR))
+                               ORDER BY CAST(token_id AS VARCHAR), rowid
+                           ) AS metadata_rank
+                    FROM nft_features
+                    WHERE chain = ?
+                      AND {}
+                )
+                WHERE metadata_rank = 1
+            )
+            SELECT
+                coalesce(name_reps.chain, metadata_reps.chain) AS chain,
+                coalesce(name_reps.contract_address, metadata_reps.contract_address) AS contract_address,
+                name_reps.name_feature_rowid,
+                metadata_reps.metadata_feature_rowid
+            FROM name_reps
+            FULL OUTER JOIN metadata_reps
+              ON name_reps.chain = metadata_reps.chain
+             AND name_reps.contract_address = metadata_reps.contract_address
+            ",
+            Self::sql_metadata_json_eligible_predicate()
+        );
+        conn.execute(&sql, params![chain, chain])?;
+        Ok(())
+    }
+
+    fn ensure_contract_representatives(conn: &Connection, chain: &str) -> Result<bool, AppError> {
+        if !Self::table_exists(conn, CONTRACT_REPRESENTATIVE_TABLE)? {
+            return Ok(false);
+        }
+        if !Self::contract_representatives_have_chain(conn, chain)? && {
+            let exists = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM nft_features WHERE chain = ? LIMIT 1)",
+                params![chain],
+                |row| row.get::<_, bool>(0),
+            )?;
+            exists
+        } {
+            Self::refresh_contract_representatives_for_chain(conn, chain)?;
+        }
+        Ok(Self::contract_representatives_have_chain(conn, chain)?)
+    }
+
     fn drop_obsolete_nft_feature_columns(conn: &Connection) -> Result<(), AppError> {
         let columns = Self::table_columns(conn, "nft_features")?;
         for column in ["metadata_doc", "name_prefix8", "metadata_keywords_arr"] {
@@ -1120,6 +1359,7 @@ impl DuckDbFeatureStore {
         chain: &str,
         rows: &[DatabaseNftRecord],
     ) -> Result<(), AppError> {
+        self.invalidate_metadata_recall_index(chain)?;
         let conn = self.conn()?;
         conn.execute("DELETE FROM nft_features WHERE chain = ?", params![chain])?;
 
@@ -1148,6 +1388,8 @@ impl DuckDbFeatureStore {
                 name_norm,
             ])?;
         }
+        drop(stmt);
+        Self::refresh_contract_representatives_for_chain(&conn, chain)?;
         Ok(())
     }
 
@@ -1156,6 +1398,7 @@ impl DuckDbFeatureStore {
         chain: &str,
         parquet_path: &str,
     ) -> Result<(), AppError> {
+        self.invalidate_metadata_recall_index(chain)?;
         let path = Self::sql_string_literal(&parquet_path.replace('\\', "/"));
         let insert_sql = format!(
             "
@@ -1181,6 +1424,7 @@ impl DuckDbFeatureStore {
         let conn = self.conn()?;
         conn.execute("DELETE FROM nft_features WHERE chain = ?", params![chain])?;
         conn.execute(&insert_sql, params![chain])?;
+        Self::refresh_contract_representatives_for_chain(&conn, chain)?;
         Ok(())
     }
 
@@ -1267,32 +1511,54 @@ impl DuckDbFeatureStore {
     fn load_metadata_recall_index(
         conn: &Connection,
         chain: &str,
+        use_contract_representatives: bool,
     ) -> Result<MetadataRecallIndex, AppError> {
-        let sql = format!(
-            "
-            SELECT rowid, contract_address, token_id, token_uri_norm, image_uri_norm, name_norm,
-                   metadata_json
-            FROM (
-                SELECT rowid,
-                       lower(CAST(contract_address AS VARCHAR)) AS contract_address,
-                       CAST(token_id AS VARCHAR) AS token_id,
-                       coalesce(CAST(token_uri_norm AS VARCHAR), '') AS token_uri_norm,
-                       coalesce(CAST(image_uri_norm AS VARCHAR), '') AS image_uri_norm,
-                       coalesce(CAST(name_norm AS VARCHAR), '') AS name_norm,
-                       coalesce(CAST(metadata_json AS VARCHAR), '') AS metadata_json,
-                       row_number() OVER (
-                           PARTITION BY lower(CAST(contract_address AS VARCHAR))
-                           ORDER BY CAST(token_id AS VARCHAR), rowid
-                       ) AS metadata_rank
-                FROM nft_features
-                WHERE chain = ?
+        let sql = if use_contract_representatives {
+            format!(
+                "
+                SELECT f.rowid, lower(CAST(f.contract_address AS VARCHAR)) AS contract_address,
+                       CAST(f.token_id AS VARCHAR) AS token_id,
+                       coalesce(CAST(f.token_uri_norm AS VARCHAR), '') AS token_uri_norm,
+                       coalesce(CAST(f.image_uri_norm AS VARCHAR), '') AS image_uri_norm,
+                       coalesce(CAST(f.name_norm AS VARCHAR), '') AS name_norm,
+                       coalesce(CAST(f.metadata_json AS VARCHAR), '') AS metadata_json
+                FROM {CONTRACT_REPRESENTATIVE_TABLE} r
+                JOIN nft_features f ON f.rowid = r.metadata_feature_rowid
+                WHERE r.chain = ?
+                  AND r.metadata_feature_rowid IS NOT NULL
                   AND {}
+                ORDER BY f.rowid
+                ",
+                Self::sql_metadata_json_eligible_predicate()
+                    .replace("metadata_json", "f.metadata_json")
             )
-            WHERE metadata_rank = 1
-            ORDER BY rowid
-            ",
-            Self::sql_metadata_json_eligible_predicate()
-        );
+        } else {
+            format!(
+                "
+                SELECT rowid, contract_address, token_id, token_uri_norm, image_uri_norm, name_norm,
+                       metadata_json
+                FROM (
+                    SELECT rowid,
+                           lower(CAST(contract_address AS VARCHAR)) AS contract_address,
+                           CAST(token_id AS VARCHAR) AS token_id,
+                           coalesce(CAST(token_uri_norm AS VARCHAR), '') AS token_uri_norm,
+                           coalesce(CAST(image_uri_norm AS VARCHAR), '') AS image_uri_norm,
+                           coalesce(CAST(name_norm AS VARCHAR), '') AS name_norm,
+                           coalesce(CAST(metadata_json AS VARCHAR), '') AS metadata_json,
+                           row_number() OVER (
+                               PARTITION BY lower(CAST(contract_address AS VARCHAR))
+                               ORDER BY CAST(token_id AS VARCHAR), rowid
+                           ) AS metadata_rank
+                    FROM nft_features
+                    WHERE chain = ?
+                      AND {}
+                )
+                WHERE metadata_rank = 1
+                ORDER BY rowid
+                ",
+                Self::sql_metadata_json_eligible_predicate()
+            )
+        };
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params![chain], |row| {
             Ok((
@@ -1354,6 +1620,26 @@ impl DuckDbFeatureStore {
             doc_freqs,
             source_index,
         })
+    }
+
+    fn cached_metadata_recall_index(
+        &self,
+        conn: &Connection,
+        chain: &str,
+        use_contract_representatives: bool,
+    ) -> Result<Arc<MetadataRecallIndex>, AppError> {
+        if let Some(index) = self.metadata_recall_index_cache()?.get(chain).cloned() {
+            return Ok(index);
+        }
+
+        let index = Arc::new(Self::load_metadata_recall_index(
+            conn,
+            chain,
+            use_contract_representatives,
+        )?);
+        self.metadata_recall_index_cache()?
+            .insert(chain.to_string(), Arc::clone(&index));
+        Ok(index)
     }
 
     fn estimate_metadata_source_bucket_hits(
@@ -2015,6 +2301,7 @@ impl DuckDbFeatureStore {
         name_threshold: f64,
         accumulators: &mut BTreeMap<String, SnapshotAccumulator>,
         max_tokens_per_contract: usize,
+        use_contract_representatives: bool,
     ) -> Result<(), AppError> {
         if name_threshold > 100.0
             || !profiles
@@ -2023,27 +2310,47 @@ impl DuckDbFeatureStore {
         {
             return Ok(());
         }
-        let sql = "
-            SELECT rowid, contract_address, token_id, token_uri_norm, image_uri_norm, name_norm
-            FROM (
-                SELECT rowid,
-                       lower(CAST(contract_address AS VARCHAR)) AS contract_address,
-                       CAST(token_id AS VARCHAR) AS token_id,
-                       coalesce(CAST(token_uri_norm AS VARCHAR), '') AS token_uri_norm,
-                       coalesce(CAST(image_uri_norm AS VARCHAR), '') AS image_uri_norm,
-                       coalesce(CAST(name_norm AS VARCHAR), '') AS name_norm,
-                       row_number() OVER (
-                           PARTITION BY lower(CAST(contract_address AS VARCHAR))
-                           ORDER BY trim(coalesce(CAST(name AS VARCHAR), '')), rowid
-                       ) AS name_rank
-                FROM nft_features
-                WHERE chain = ?
-                  AND trim(coalesce(CAST(name_norm AS VARCHAR), '')) <> ''
+        let sql = if use_contract_representatives {
+            format!(
+                "
+                SELECT f.rowid,
+                       lower(CAST(f.contract_address AS VARCHAR)) AS contract_address,
+                       CAST(f.token_id AS VARCHAR) AS token_id,
+                       coalesce(CAST(f.token_uri_norm AS VARCHAR), '') AS token_uri_norm,
+                       coalesce(CAST(f.image_uri_norm AS VARCHAR), '') AS image_uri_norm,
+                       coalesce(CAST(f.name_norm AS VARCHAR), '') AS name_norm
+                FROM {CONTRACT_REPRESENTATIVE_TABLE} r
+                JOIN nft_features f ON f.rowid = r.name_feature_rowid
+                WHERE r.chain = ?
+                  AND r.name_feature_rowid IS NOT NULL
+                  AND trim(coalesce(CAST(f.name_norm AS VARCHAR), '')) <> ''
+                ORDER BY f.rowid
+                "
             )
-            WHERE name_rank = 1
-            ORDER BY rowid
-            ";
-        let mut stmt = conn.prepare(sql)?;
+        } else {
+            "
+                SELECT rowid, contract_address, token_id, token_uri_norm, image_uri_norm, name_norm
+                FROM (
+                    SELECT rowid,
+                           lower(CAST(contract_address AS VARCHAR)) AS contract_address,
+                           CAST(token_id AS VARCHAR) AS token_id,
+                           coalesce(CAST(token_uri_norm AS VARCHAR), '') AS token_uri_norm,
+                           coalesce(CAST(image_uri_norm AS VARCHAR), '') AS image_uri_norm,
+                           coalesce(CAST(name_norm AS VARCHAR), '') AS name_norm,
+                           row_number() OVER (
+                               PARTITION BY lower(CAST(contract_address AS VARCHAR))
+                               ORDER BY trim(coalesce(CAST(name AS VARCHAR), '')), rowid
+                           ) AS name_rank
+                    FROM nft_features
+                    WHERE chain = ?
+                      AND trim(coalesce(CAST(name_norm AS VARCHAR), '')) <> ''
+                )
+                WHERE name_rank = 1
+                ORDER BY rowid
+                "
+            .to_string()
+        };
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params![chain], |row| {
             Ok(RecallRow {
                 feature_rowid: row.get::<_, i64>(0)?,
@@ -2312,6 +2619,7 @@ impl DuckDbFeatureStore {
         let profile_index = SeedProfileIndex::new(&profiles);
 
         let conn = self.conn()?;
+        let use_contract_representatives = Self::ensure_contract_representatives(&conn, chain)?;
         Self::append_exact_uri_recall_rows(
             &conn,
             chain,
@@ -2331,18 +2639,20 @@ impl DuckDbFeatureStore {
             name_threshold,
             &mut accumulators,
             max_tokens_per_contract,
+            use_contract_representatives,
         )?;
         if metadata_threshold <= 1.0
             && profiles
                 .iter()
                 .any(|profile| profile.seed_metadata_doc.is_some())
         {
-            let metadata_index = Self::load_metadata_recall_index(&conn, chain)?;
+            let metadata_index =
+                self.cached_metadata_recall_index(&conn, chain, use_contract_representatives)?;
             Self::append_metadata_recall_rows(
                 &conn,
                 &profiles,
                 metadata_threshold,
-                &metadata_index,
+                metadata_index.as_ref(),
                 &mut accumulators,
                 max_tokens_per_contract,
             )?;
@@ -2422,6 +2732,7 @@ impl DuckDbFeatureStore {
         }
 
         let conn = self.conn()?;
+        let use_contract_representatives = Self::ensure_contract_representatives(&conn, chain)?;
         Self::append_exact_uri_recall_rows(
             &conn,
             chain,
@@ -2441,18 +2752,20 @@ impl DuckDbFeatureStore {
             name_threshold,
             &mut accumulators,
             max_tokens_per_contract,
+            use_contract_representatives,
         )?;
         if metadata_threshold <= 1.0
             && profiles
                 .iter()
                 .any(|profile| profile.seed_metadata_doc.is_some())
         {
-            let metadata_index = Self::load_metadata_recall_index(&conn, chain)?;
+            let metadata_index =
+                self.cached_metadata_recall_index(&conn, chain, use_contract_representatives)?;
             Self::append_metadata_recall_rows(
                 &conn,
                 &profiles,
                 metadata_threshold,
-                &metadata_index,
+                metadata_index.as_ref(),
                 &mut accumulators,
                 max_tokens_per_contract,
             )?;
