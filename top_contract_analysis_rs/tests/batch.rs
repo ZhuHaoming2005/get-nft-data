@@ -30,6 +30,8 @@ impl FeatureStoreReader for EmptyFeatureStore {
         &self,
         _chain: &str,
         _seed_nfts: &[SeedNft],
+        _name_threshold: f64,
+        _metadata_threshold: f64,
         _max_tokens_per_contract: usize,
         _max_recall_rows: usize,
     ) -> Result<DatabaseSnapshot, AppError> {
@@ -92,6 +94,8 @@ impl FeatureStoreReader for InstrumentedFeatureStore {
         &self,
         _chain: &str,
         seed_nfts: &[SeedNft],
+        _name_threshold: f64,
+        _metadata_threshold: f64,
         _max_tokens_per_contract: usize,
         _max_recall_rows: usize,
     ) -> Result<DatabaseSnapshot, AppError> {
@@ -147,6 +151,8 @@ impl FeatureStoreReader for InstrumentedFeatureStore {
         &self,
         chain: &str,
         seeds: &[(String, Vec<SeedNft>)],
+        name_threshold: f64,
+        metadata_threshold: f64,
         max_tokens_per_contract: usize,
         max_recall_rows: usize,
     ) -> Result<BTreeMap<String, DatabaseSnapshot>, AppError> {
@@ -157,7 +163,14 @@ impl FeatureStoreReader for InstrumentedFeatureStore {
         for (seed_address, seed_nfts) in seeds {
             rows.insert(
                 seed_address.clone(),
-                self.load_snapshot(chain, seed_nfts, max_tokens_per_contract, max_recall_rows)?,
+                self.load_snapshot(
+                    chain,
+                    seed_nfts,
+                    name_threshold,
+                    metadata_threshold,
+                    max_tokens_per_contract,
+                    max_recall_rows,
+                )?,
             );
         }
         Ok(rows)

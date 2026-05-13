@@ -35,6 +35,8 @@ impl FeatureStoreReader for FakeFeatureStore {
         &self,
         _chain: &str,
         _seed_nfts: &[SeedNft],
+        _name_threshold: f64,
+        _metadata_threshold: f64,
         _max_tokens_per_contract: usize,
         _max_recall_rows: usize,
     ) -> Result<DatabaseSnapshot, AppError> {

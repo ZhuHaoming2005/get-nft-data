@@ -306,6 +306,8 @@ pub trait FeatureStoreReader: Send + Sync {
         &self,
         chain: &str,
         seed_nfts: &[SeedNft],
+        name_threshold: f64,
+        metadata_threshold: f64,
         max_tokens_per_contract: usize,
         max_recall_rows: usize,
     ) -> Result<DatabaseSnapshot, AppError>;
@@ -314,6 +316,8 @@ pub trait FeatureStoreReader: Send + Sync {
         &self,
         chain: &str,
         seeds: &[(String, Vec<SeedNft>)],
+        name_threshold: f64,
+        metadata_threshold: f64,
         max_tokens_per_contract: usize,
         max_recall_rows: usize,
     ) -> Result<BTreeMap<String, DatabaseSnapshot>, AppError> {
@@ -321,7 +325,14 @@ pub trait FeatureStoreReader: Send + Sync {
         for (seed_address, seed_nfts) in seeds {
             snapshots.insert(
                 seed_address.clone(),
-                self.load_snapshot(chain, seed_nfts, max_tokens_per_contract, max_recall_rows)?,
+                self.load_snapshot(
+                    chain,
+                    seed_nfts,
+                    name_threshold,
+                    metadata_threshold,
+                    max_tokens_per_contract,
+                    max_recall_rows,
+                )?,
             );
         }
         Ok(snapshots)
@@ -948,6 +959,8 @@ impl FeatureStoreReader for DuckDbFeatureStore {
         &self,
         chain: &str,
         seed_nfts: &[SeedNft],
+        name_threshold: f64,
+        metadata_threshold: f64,
         max_tokens_per_contract: usize,
         max_recall_rows: usize,
     ) -> Result<DatabaseSnapshot, AppError> {
@@ -955,6 +968,8 @@ impl FeatureStoreReader for DuckDbFeatureStore {
             self,
             chain,
             seed_nfts,
+            name_threshold,
+            metadata_threshold,
             max_tokens_per_contract,
             max_recall_rows,
         )
@@ -964,6 +979,8 @@ impl FeatureStoreReader for DuckDbFeatureStore {
         &self,
         chain: &str,
         seeds: &[(String, Vec<SeedNft>)],
+        name_threshold: f64,
+        metadata_threshold: f64,
         max_tokens_per_contract: usize,
         max_recall_rows: usize,
     ) -> Result<BTreeMap<String, DatabaseSnapshot>, AppError> {
@@ -971,6 +988,8 @@ impl FeatureStoreReader for DuckDbFeatureStore {
             self,
             chain,
             seeds,
+            name_threshold,
+            metadata_threshold,
             max_tokens_per_contract,
             max_recall_rows,
         )
@@ -1066,6 +1085,8 @@ async fn build_candidate_plan_for_seed(
         let snapshot = feature_store.load_snapshot(
             &request.chain,
             &context.seed_nfts,
+            request.name_threshold,
+            request.metadata_threshold,
             request.max_tokens_per_contract,
             request.max_recall_rows,
         )?;
@@ -2810,11 +2831,15 @@ pub async fn run_batch(
         let feature_store = deps.feature_store.clone();
         let max_tokens_per_contract = request.max_tokens_per_contract;
         let max_recall_rows = request.max_recall_rows;
+        let name_threshold = request.name_threshold;
+        let metadata_threshold = request.metadata_threshold;
         let _permit = acquire_optional_limit(&Some(cpu_limit.clone())).await?;
         let snapshot_result = tokio::task::spawn_blocking(move || {
             feature_store.load_snapshots(
                 &chain,
                 &snapshot_inputs,
+                name_threshold,
+                metadata_threshold,
                 max_tokens_per_contract,
                 max_recall_rows,
             )
