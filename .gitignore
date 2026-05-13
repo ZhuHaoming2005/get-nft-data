@@ -16,7 +16,7 @@ dist
 CLAUDE.md
 output
 *tmp*
-*.db
+*.db*
 */examples
 top_contract_analysis
 rust_ext
