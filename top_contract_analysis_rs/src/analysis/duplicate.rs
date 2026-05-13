@@ -4,9 +4,9 @@ use rayon::prelude::*;
 
 use crate::analysis::scoring::{
     metadata_bm25_tokens, metadata_document_from_json, metadata_is_dedup_eligible,
-    metadata_prefilter_document_from_json, score_metadata_indexed_pair_with_query, score_name_pair,
-    MetadataBm25Corpus, MetadataBm25CorpusBuilder, MetadataBm25Document, MetadataBm25Query,
-    MetadataBm25SingleDocumentQuery,
+    metadata_prefilter_document_from_json, score_metadata_indexed_pair_with_query,
+    score_normalized_name_pair, MetadataBm25Corpus, MetadataBm25CorpusBuilder,
+    MetadataBm25Document, MetadataBm25Query, MetadataBm25SingleDocumentQuery,
 };
 use crate::models::{ContractDuplicateRecord, DatabaseNftRecord, DuplicateCandidate, SeedNft};
 use crate::normalize::{normalize_name, normalize_url};
@@ -18,7 +18,7 @@ fn has_name_match(row_name_norm: &str, name_threshold: f64, seed_name_norms: &[S
     }
     seed_name_norms
         .iter()
-        .any(|candidate| score_name_pair(row_name_norm, candidate) >= name_threshold)
+        .any(|candidate| score_normalized_name_pair(row_name_norm, candidate) >= name_threshold)
 }
 
 fn build_contract_name_match_index(
@@ -288,35 +288,55 @@ fn build_metadata_bm25_index(
         };
     }
 
+    struct IndexedMetadataTokens {
+        contract_index: usize,
+        tokens: Vec<String>,
+        has_query_overlap: bool,
+    }
+
+    let mut indexed_tokens = contract_rows
+        .par_iter()
+        .enumerate()
+        .filter_map(|(contract_index, row)| {
+            let row = *row;
+            if !should_score_metadata(row, has_metadata_recall_flags) {
+                return None;
+            }
+
+            let metadata_text = record_metadata_prefilter_text_from_record(&row.representative);
+            if metadata_text.is_empty() {
+                return None;
+            }
+
+            let tokens = metadata_bm25_tokens(&metadata_text);
+            let has_query_overlap = tokens.iter().any(|token| query_tokens.contains(token));
+            Some(IndexedMetadataTokens {
+                contract_index,
+                tokens,
+                has_query_overlap,
+            })
+        })
+        .collect::<Vec<_>>();
+    indexed_tokens.sort_by_key(|indexed| indexed.contract_index);
+
     let mut docs = Vec::new();
     let mut candidate_doc_indices = vec![None; contract_rows.len()];
     let mut corpus_builder = MetadataBm25CorpusBuilder::default();
 
-    for (contract_index, row) in contract_rows.iter().enumerate() {
-        let row = *row;
-        if !should_score_metadata(row, has_metadata_recall_flags) {
-            continue;
-        }
-
-        let metadata_text = record_metadata_prefilter_text_from_record(&row.representative);
-        if metadata_text.is_empty() {
-            continue;
-        }
-
-        let tokens = metadata_bm25_tokens(&metadata_text);
-        corpus_builder.add_tokens(&tokens);
+    for indexed in indexed_tokens {
+        corpus_builder.add_tokens(&indexed.tokens);
 
         // Keep corpus statistics over every scoreable representative document, but only
         // cache documents that can actually match the seed metadata query.
-        if !tokens.iter().any(|token| query_tokens.contains(token)) {
+        if !indexed.has_query_overlap {
             continue;
         }
 
-        let Some(indexed_doc) = MetadataBm25Document::from_tokens(tokens) else {
+        let Some(indexed_doc) = MetadataBm25Document::from_tokens(indexed.tokens) else {
             continue;
         };
         let doc_index = docs.len();
-        candidate_doc_indices[contract_index] = Some(doc_index);
+        candidate_doc_indices[indexed.contract_index] = Some(doc_index);
         docs.push(indexed_doc);
     }
 
@@ -572,10 +592,10 @@ mod tests {
     }
 
     #[test]
-    fn contract_name_match_index_preserves_name_scoring_normalization() {
+    fn contract_name_match_index_scores_normalized_name_fields() {
         let contract_rows = [ContractDuplicateRecord {
             contract_address: "0xhit".into(),
-            name_norms: vec!["Azuki #123".into()],
+            name_norms: vec!["azuki".into()],
             ..Default::default()
         }];
         let contract_row_refs = contract_rows.iter().collect::<Vec<_>>();

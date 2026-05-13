@@ -55,41 +55,26 @@ pub(super) async fn compute_mint_payment_edges_for_contract(
     let contract_deployer = contract_metadata
         .map(|metadata| metadata.contract_deployer.clone())
         .unwrap_or_default();
+    let transfer_rows_by_request = fetch_mint_payment_transfers_for_lookups(
+        request,
+        deps,
+        contract_address,
+        &lookups,
+        &contract_deployer,
+        &payment_limit,
+    )
+    .await?;
 
     let mut fetched = stream::iter(lookups.into_iter().map(|lookup| {
         let payment_limit = payment_limit.clone();
+        let transfers = mint_payment_transfers_for_lookup(
+            &lookup,
+            contract_address,
+            &contract_deployer,
+            &transfer_rows_by_request,
+        );
         let contract_deployer = contract_deployer.clone();
         async move {
-            let _permit = acquire_optional_limit(&payment_limit).await?;
-            let mut lookup_addresses = BTreeSet::from([
-                lookup.minter_address.clone(),
-                contract_address.to_string(),
-            ]);
-            if !contract_deployer.is_empty() {
-                lookup_addresses.insert(contract_deployer.clone());
-            }
-            let mut transfers = Vec::new();
-            for address in lookup_addresses {
-                match deps
-                    .api
-                    .fetch_mint_payment_eth_transfers_on_chain(
-                        &request.chain,
-                        &request.alchemy_api_key,
-                        request.alchemy_network.as_deref(),
-                        lookup.block_number,
-                        &address,
-                    )
-                    .await
-                {
-                    Ok(rows) => transfers.extend(rows),
-                    Err(err) => {
-                        eprintln!(
-                            "warning: mint value-flow transfer lookup failed for {address} in {}: {err}; continuing without this value-flow evidence",
-                            lookup.tx_hash
-                        );
-                    }
-                }
-            }
             let has_mint_payment_transfer = transfers.iter().any(|transfer| {
                 is_matching_mint_payment_transfer(
                     transfer,
@@ -108,6 +93,7 @@ pub(super) async fn compute_mint_payment_edges_for_contract(
                     block_receipts: BTreeMap::new(),
                 });
             }
+            let _permit = acquire_optional_limit(&payment_limit).await?;
             let (receipt, base_balance_eth, block_receipts) = tokio::join!(
                 deps.api.fetch_transaction_receipt_on_chain(
                     &request.chain,
@@ -209,6 +195,90 @@ pub(super) async fn compute_mint_payment_edges_for_contract(
     }
 
     Ok(rows.into_values().collect())
+}
+
+fn mint_payment_lookup_addresses(
+    lookup: &MintPaymentLookup,
+    contract_address: &str,
+    contract_deployer: &str,
+) -> BTreeSet<String> {
+    let mut lookup_addresses =
+        BTreeSet::from([lookup.minter_address.clone(), contract_address.to_string()]);
+    if !contract_deployer.is_empty() {
+        lookup_addresses.insert(contract_deployer.to_string());
+    }
+    lookup_addresses
+}
+
+async fn fetch_mint_payment_transfers_for_lookups(
+    request: &AnalyzeRequest,
+    deps: &AnalysisDeps,
+    contract_address: &str,
+    lookups: &[MintPaymentLookup],
+    contract_deployer: &str,
+    payment_limit: &Option<Arc<Semaphore>>,
+) -> Result<BTreeMap<(i64, String), Vec<EthTransferRecord>>, AppError> {
+    let mut requests = BTreeMap::<(i64, String), String>::new();
+    for lookup in lookups {
+        for address in mint_payment_lookup_addresses(lookup, contract_address, contract_deployer) {
+            requests
+                .entry((lookup.block_number, address.to_lowercase()))
+                .or_insert(address);
+        }
+    }
+
+    let mut fetched = stream::iter(requests.into_iter().map(
+        |((block_number, address_key), address)| {
+            let payment_limit = payment_limit.clone();
+            async move {
+                let _permit = acquire_optional_limit(&payment_limit).await?;
+                match deps
+                    .api
+                    .fetch_mint_payment_eth_transfers_on_chain(
+                        &request.chain,
+                        &request.alchemy_api_key,
+                        request.alchemy_network.as_deref(),
+                        block_number,
+                        &address,
+                    )
+                    .await
+                {
+                    Ok(rows) => Ok::<_, AppError>(((block_number, address_key), rows)),
+                    Err(err) => {
+                        eprintln!(
+                            "warning: mint value-flow transfer lookup failed for {address} at block {block_number}: {err}; continuing without this value-flow evidence"
+                        );
+                        Ok::<_, AppError>(((block_number, address_key), Vec::new()))
+                    }
+                }
+            }
+        },
+    ))
+    .buffer_unordered(request.sale_metric_max_concurrency.max(1));
+
+    let mut rows_by_request = BTreeMap::new();
+    while let Some(result) = fetched.next().await {
+        let (request_key, rows) = result?;
+        rows_by_request.insert(request_key, rows);
+    }
+    Ok(rows_by_request)
+}
+
+fn mint_payment_transfers_for_lookup(
+    lookup: &MintPaymentLookup,
+    contract_address: &str,
+    contract_deployer: &str,
+    transfer_rows_by_request: &BTreeMap<(i64, String), Vec<EthTransferRecord>>,
+) -> Vec<EthTransferRecord> {
+    let mut transfers = Vec::new();
+    for address in mint_payment_lookup_addresses(lookup, contract_address, contract_deployer) {
+        if let Some(rows) =
+            transfer_rows_by_request.get(&(lookup.block_number, address.to_lowercase()))
+        {
+            transfers.extend(rows.iter().cloned());
+        }
+    }
+    transfers
 }
 
 pub(super) fn classify_mint_value_flow_transfer(

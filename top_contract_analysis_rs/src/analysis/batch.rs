@@ -12,8 +12,8 @@ use crate::reporting::write_outputs_to_directory;
 use super::summary::{build_batch_report_summary, build_batch_seed_aggregate};
 use super::{
     acquire_optional_limit, analyze_seed_contract_with_limits, build_candidate_plan_from_snapshot,
-    fetch_seed_context, AnalysisDeps, AnalyzeRequest, BatchRequest, BatchSeedAggregate,
-    RuntimeLimits,
+    fetch_seed_context, seed_nfts_for_duplicate_matching, AnalysisDeps, AnalyzeRequest,
+    BatchRequest, BatchSeedAggregate, RuntimeLimits,
 };
 
 fn analyze_request_for_batch_seed(
@@ -117,7 +117,12 @@ pub async fn run_batch(
         }
         let snapshot_inputs = context_entries
             .iter()
-            .map(|(seed_address, _, context, _)| (seed_address.clone(), context.seed_nfts.clone()))
+            .map(|(seed_address, _, context, _)| {
+                (
+                    seed_address.clone(),
+                    seed_nfts_for_duplicate_matching(&context.seed_nfts, &context.seed_contract),
+                )
+            })
             .collect::<Vec<_>>();
         for (_, _, _, seed_progress) in &context_entries {
             seed_progress.on_seed_stage("load_snapshot").await;

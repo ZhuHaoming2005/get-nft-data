@@ -41,6 +41,56 @@ impl FeatureStoreReader for EmptyFeatureStore {
 }
 
 #[derive(Default)]
+struct CapturingBatchFeatureStore {
+    captured_seed_names: Arc<Mutex<BTreeMap<String, Vec<String>>>>,
+}
+
+impl FeatureStoreReader for CapturingBatchFeatureStore {
+    fn load_snapshot(
+        &self,
+        _chain: &str,
+        _seed_nfts: &[SeedNft],
+        _name_threshold: f64,
+        _metadata_threshold: f64,
+        _max_tokens_per_contract: usize,
+        _max_recall_rows: usize,
+    ) -> Result<DatabaseSnapshot, AppError> {
+        Ok(DatabaseSnapshot::default())
+    }
+
+    fn load_snapshots(
+        &self,
+        chain: &str,
+        seeds: &[(String, Vec<SeedNft>)],
+        name_threshold: f64,
+        metadata_threshold: f64,
+        max_tokens_per_contract: usize,
+        max_recall_rows: usize,
+    ) -> Result<BTreeMap<String, DatabaseSnapshot>, AppError> {
+        let mut snapshots = BTreeMap::new();
+        let mut captured_seed_names = self.captured_seed_names.lock().unwrap();
+        for (seed_address, seed_nfts) in seeds {
+            captured_seed_names.insert(
+                seed_address.clone(),
+                seed_nfts.iter().map(|item| item.name.clone()).collect(),
+            );
+            snapshots.insert(
+                seed_address.clone(),
+                self.load_snapshot(
+                    chain,
+                    seed_nfts,
+                    name_threshold,
+                    metadata_threshold,
+                    max_tokens_per_contract,
+                    max_recall_rows,
+                )?,
+            );
+        }
+        Ok(snapshots)
+    }
+}
+
+#[derive(Default)]
 struct BatchPipelineProbe {
     seed_one_snapshot_active: AtomicBool,
     seed_two_context_overlapped_snapshot: AtomicBool,
@@ -539,7 +589,7 @@ impl AnalyzeApi for FakeBatchApi {
             chain: chain.to_string(),
             contract_address: contract_address.to_string(),
             token_id: "1".into(),
-            name: format!("Seed {}", &contract_address[2..]),
+            name: format!("Token {} #1", &contract_address[2..]),
             symbol: "SEED".into(),
             ..SeedNft::default()
         }])
@@ -829,6 +879,43 @@ async fn batch_skips_cached_seed_reports_in_output_directory() {
         .unwrap()
         .json
         .starts_with("top_contract_analysis__"));
+}
+
+#[tokio::test]
+async fn batch_uses_contract_level_seed_name_for_snapshot_recall() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n").unwrap();
+    let feature_store = Arc::new(CapturingBatchFeatureStore::default());
+    let captured_seed_names = feature_store.captured_seed_names.clone();
+    let deps = AnalysisDeps {
+        api: Arc::new(FakeBatchApi),
+        feature_store,
+        signal_cache: None,
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    run_batch(
+        BatchRequest {
+            chain: "ethereum".into(),
+            seed_file: dir.path().join("seeds.txt"),
+            output_dir: dir.path().to_path_buf(),
+            alchemy_api_key: "key".into(),
+            workers: 2,
+            ..BatchRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        captured_seed_names.lock().unwrap().clone(),
+        BTreeMap::from([
+            ("0xseed1".to_string(), vec!["Seed seed1".to_string()]),
+            ("0xseed2".to_string(), vec!["Seed seed2".to_string()]),
+        ])
+    );
 }
 
 #[tokio::test]

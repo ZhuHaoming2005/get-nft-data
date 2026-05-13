@@ -171,6 +171,37 @@ struct CandidateContractFilterResult {
     seed_related_legit_duplicates: Vec<DuplicateContractPayload>,
 }
 
+fn seed_nfts_for_duplicate_matching(
+    seed_nfts: &[SeedNft],
+    seed_contract: &ContractMetadata,
+) -> Vec<SeedNft> {
+    let contract_name = seed_contract.name.trim();
+    if seed_nfts.is_empty() {
+        return if contract_name.is_empty() {
+            Vec::new()
+        } else {
+            vec![SeedNft {
+                chain: seed_contract.chain.clone(),
+                contract_address: seed_contract.contract_address.clone(),
+                name: contract_name.to_string(),
+                symbol: seed_contract.symbol.clone(),
+                ..SeedNft::default()
+            }]
+        };
+    }
+
+    let mut dedup_seed_nfts = seed_nfts.to_vec();
+    for seed_nft in &mut dedup_seed_nfts {
+        seed_nft.name.clear();
+    }
+    if !contract_name.is_empty() {
+        if let Some(first_seed_nft) = dedup_seed_nfts.first_mut() {
+            first_seed_nft.name = contract_name.to_string();
+        }
+    }
+    dedup_seed_nfts
+}
+
 async fn acquire_optional_limit(
     limit: &Option<Arc<Semaphore>>,
 ) -> Result<Option<OwnedSemaphorePermit>, AppError> {
@@ -420,16 +451,18 @@ async fn build_candidate_plan_for_seed(
 ) -> Result<(SeedContext, CandidatePlan), AppError> {
     progress.on_seed_stage("load_snapshot").await;
     let _permit = acquire_optional_limit(&cpu_limit).await?;
-    let (request, context, snapshot) = tokio::task::spawn_blocking(move || {
+    let (request, context, snapshot, dedup_seed_nfts) = tokio::task::spawn_blocking(move || {
+        let dedup_seed_nfts =
+            seed_nfts_for_duplicate_matching(&context.seed_nfts, &context.seed_contract);
         let snapshot = feature_store.load_snapshot(
             &request.chain,
-            &context.seed_nfts,
+            &dedup_seed_nfts,
             request.name_threshold,
             request.metadata_threshold,
             request.max_tokens_per_contract,
             request.max_recall_rows,
         )?;
-        Ok::<_, AppError>((request, context, snapshot))
+        Ok::<_, AppError>((request, context, snapshot, dedup_seed_nfts))
     })
     .await
     .map_err(|err| AppError::InvalidData(format!("snapshot CPU task failed: {err}")))??;
@@ -440,7 +473,7 @@ async fn build_candidate_plan_for_seed(
             if snapshot.duplicate_contract_rows.is_empty() && !snapshot.nft_rows.is_empty() {
                 duplicate::build_duplicate_candidates(
                     &request.chain,
-                    &context.seed_nfts,
+                    &dedup_seed_nfts,
                     &snapshot.nft_rows,
                     request.name_threshold,
                     request.metadata_threshold,
@@ -448,7 +481,7 @@ async fn build_candidate_plan_for_seed(
             } else {
                 duplicate::build_duplicate_candidates_from_contract_rows(
                     &request.chain,
-                    &context.seed_nfts,
+                    &dedup_seed_nfts,
                     &snapshot.duplicate_contract_rows,
                     request.name_threshold,
                     request.metadata_threshold,
@@ -471,11 +504,13 @@ fn build_candidate_plan_from_snapshot(
     context: &SeedContext,
     snapshot: DatabaseSnapshot,
 ) -> CandidatePlan {
+    let dedup_seed_nfts =
+        seed_nfts_for_duplicate_matching(&context.seed_nfts, &context.seed_contract);
     let candidates = if snapshot.duplicate_contract_rows.is_empty() && !snapshot.nft_rows.is_empty()
     {
         duplicate::build_duplicate_candidates(
             &request.chain,
-            &context.seed_nfts,
+            &dedup_seed_nfts,
             &snapshot.nft_rows,
             request.name_threshold,
             request.metadata_threshold,
@@ -483,7 +518,7 @@ fn build_candidate_plan_from_snapshot(
     } else {
         duplicate::build_duplicate_candidates_from_contract_rows(
             &request.chain,
-            &context.seed_nfts,
+            &dedup_seed_nfts,
             &snapshot.duplicate_contract_rows,
             request.name_threshold,
             request.metadata_threshold,

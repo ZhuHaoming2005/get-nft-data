@@ -284,7 +284,7 @@ pub(super) async fn analyze_duplicate_contract(
         });
     }
 
-    let sales = {
+    let sales_fut = async {
         let _contract_permit = acquire_optional_limit(&runtime_limits.contract_limit).await?;
         deps.api
             .fetch_contract_sales(
@@ -294,9 +294,9 @@ pub(super) async fn analyze_duplicate_contract(
                 contract_address,
                 &request.opensea_api_key,
             )
-            .await?
+            .await
     };
-    let market_events = {
+    let market_events_fut = async {
         let _contract_permit = acquire_optional_limit(&runtime_limits.contract_limit).await?;
         deps.api
             .fetch_contract_market_events(
@@ -306,9 +306,9 @@ pub(super) async fn analyze_duplicate_contract(
                 contract_address,
                 &request.opensea_api_key,
             )
-            .await?
+            .await
     };
-    let mint_payment_edges = compute_mint_payment_edges_for_contract(
+    let mint_payment_edges_fut = compute_mint_payment_edges_for_contract(
         request,
         deps,
         contract_address,
@@ -316,8 +316,9 @@ pub(super) async fn analyze_duplicate_contract(
         &transfers,
         contract_metadata.as_ref(),
         runtime_limits,
-    )
-    .await?;
+    );
+    let (sales, market_events, mint_payment_edges) =
+        tokio::try_join!(sales_fut, market_events_fut, mint_payment_edges_fut)?;
     let sale_metrics_by_tx =
         compute_sale_metrics_for_contract(request, deps, &sales, runtime_limits).await?;
 

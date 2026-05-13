@@ -31,6 +31,47 @@ fn payload_median_deployment_to_first_transfer_seconds(
 }
 
 #[test]
+fn seed_duplicate_matching_uses_single_contract_level_name() {
+    let seed_contract = ContractMetadata {
+        chain: "ethereum".into(),
+        contract_address: "0xseed".into(),
+        name: "Azuki".into(),
+        symbol: "AZUKI".into(),
+        ..ContractMetadata::default()
+    };
+    let seed_nfts = vec![
+        SeedNft {
+            token_id: "1".into(),
+            name: "Azuki #1".into(),
+            metadata_json: r#"{"name":"Azuki #1"}"#.into(),
+            ..SeedNft::default()
+        },
+        SeedNft {
+            token_id: "2".into(),
+            name: "Azuki #2".into(),
+            metadata_json: r#"{"name":"Azuki #2"}"#.into(),
+            ..SeedNft::default()
+        },
+    ];
+
+    let dedup_seed_nfts = seed_nfts_for_duplicate_matching(&seed_nfts, &seed_contract);
+    let non_empty_names = dedup_seed_nfts
+        .iter()
+        .filter(|item| !item.name.is_empty())
+        .map(|item| item.name.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(non_empty_names, vec!["Azuki"]);
+    assert_eq!(dedup_seed_nfts[0].metadata_json, seed_nfts[0].metadata_json);
+    assert_eq!(dedup_seed_nfts[1].token_id, "2");
+
+    let name_only_seed_nfts = seed_nfts_for_duplicate_matching(&[], &seed_contract);
+    assert_eq!(name_only_seed_nfts.len(), 1);
+    assert_eq!(name_only_seed_nfts[0].contract_address, "0xseed");
+    assert_eq!(name_only_seed_nfts[0].name, "Azuki");
+}
+
+#[test]
 fn report_summary_uses_deployment_to_first_transfer_samples() {
     let lifecycle_metrics = vec![
         ContractLifecycleMetricPayload {

@@ -18,7 +18,8 @@ use top_contract_analysis_rs::models::{
 };
 use top_contract_analysis_rs::models::{
     ContractMetadata, ContractNameRecord, DatabaseNftRecord, DatabaseSnapshot, EthTransferRecord,
-    NftSaleRecord, OwnerBalance, SeedNft, TransactionReceiptRecord, TransferRecord, ZERO_ADDRESS,
+    NftMarketEventRecord, NftSaleRecord, OwnerBalance, SeedNft, TransactionReceiptRecord,
+    TransferRecord, ZERO_ADDRESS,
 };
 use top_contract_analysis_rs::progress::{NoopBatchProgressReporter, NoopProgressReporter};
 use top_contract_analysis_rs::reporting::{
@@ -41,6 +42,29 @@ impl FeatureStoreReader for FakeFeatureStore {
         _max_recall_rows: usize,
     ) -> Result<DatabaseSnapshot, AppError> {
         Ok(self.snapshot.clone())
+    }
+}
+
+#[derive(Default)]
+struct CapturingFeatureStore {
+    captured_seed_names: Arc<Mutex<Vec<Vec<String>>>>,
+}
+
+impl FeatureStoreReader for CapturingFeatureStore {
+    fn load_snapshot(
+        &self,
+        _chain: &str,
+        seed_nfts: &[SeedNft],
+        _name_threshold: f64,
+        _metadata_threshold: f64,
+        _max_tokens_per_contract: usize,
+        _max_recall_rows: usize,
+    ) -> Result<DatabaseSnapshot, AppError> {
+        self.captured_seed_names
+            .lock()
+            .unwrap()
+            .push(seed_nfts.iter().map(|item| item.name.clone()).collect());
+        Ok(DatabaseSnapshot::default())
     }
 }
 
@@ -2606,6 +2630,8 @@ impl ConcurrentSaleMetricApi {
 struct ConcurrentSingleContractFetchApi {
     active_fetches: AtomicUsize,
     max_fetches: AtomicUsize,
+    active_post_signal_fetches: AtomicUsize,
+    max_post_signal_fetches: AtomicUsize,
 }
 
 impl ConcurrentSingleContractFetchApi {
@@ -2613,6 +2639,8 @@ impl ConcurrentSingleContractFetchApi {
         Self {
             active_fetches: AtomicUsize::new(0),
             max_fetches: AtomicUsize::new(0),
+            active_post_signal_fetches: AtomicUsize::new(0),
+            max_post_signal_fetches: AtomicUsize::new(0),
         }
     }
 
@@ -2621,6 +2649,18 @@ impl ConcurrentSingleContractFetchApi {
         self.max_fetches.fetch_max(active, Ordering::SeqCst);
         sleep(Duration::from_millis(40)).await;
         self.active_fetches.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    async fn post_signal_overlap_delay(&self) {
+        let active = self
+            .active_post_signal_fetches
+            .fetch_add(1, Ordering::SeqCst)
+            + 1;
+        self.max_post_signal_fetches
+            .fetch_max(active, Ordering::SeqCst);
+        sleep(Duration::from_millis(40)).await;
+        self.active_post_signal_fetches
+            .fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -2711,7 +2751,7 @@ impl AnalyzeApi for ConcurrentSingleContractFetchApi {
         contract_address: &str,
         _opensea_api_key: &str,
     ) -> Result<Vec<NftSaleRecord>, AppError> {
-        self.overlap_delay().await;
+        self.post_signal_overlap_delay().await;
         Ok(vec![NftSaleRecord {
             contract_address: contract_address.to_string(),
             token_id: "1".into(),
@@ -2736,6 +2776,24 @@ impl AnalyzeApi for ConcurrentSingleContractFetchApi {
             royalty_recipient_address: String::new(),
             source: "opensea".into(),
             is_native_eth: false,
+        }])
+    }
+
+    async fn fetch_contract_market_events(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        contract_address: &str,
+        _opensea_api_key: &str,
+    ) -> Result<Vec<NftMarketEventRecord>, AppError> {
+        self.post_signal_overlap_delay().await;
+        Ok(vec![NftMarketEventRecord {
+            contract_address: contract_address.to_string(),
+            token_id: "1".into(),
+            event_type: "listing".into(),
+            source: "opensea".into(),
+            ..NftMarketEventRecord::default()
         }])
     }
 
@@ -2774,6 +2832,244 @@ impl AnalyzeApi for ConcurrentSingleContractFetchApi {
         _block_number: i64,
         _address: &str,
     ) -> Result<Vec<EthTransferRecord>, AppError> {
+        Ok(vec![])
+    }
+
+    async fn fetch_mint_payment_eth_transfers_on_chain(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        block_number: i64,
+        address: &str,
+    ) -> Result<Vec<EthTransferRecord>, AppError> {
+        self.post_signal_overlap_delay().await;
+        if block_number == 1 && address == "0xminter" {
+            return Ok(vec![EthTransferRecord {
+                tx_hash: "0xmint".into(),
+                block_number,
+                from_address: "0xminter".into(),
+                to_address: "0xcreator".into(),
+                value_eth: 0.08,
+                value_usd: Some(184.0),
+                payment_token_symbol: "ETH".into(),
+                payment_token_address: ZERO_ADDRESS.into(),
+                category: "external".into(),
+            }]);
+        }
+        Ok(vec![])
+    }
+}
+
+struct DuplicateMintPaymentLookupApi {
+    mint_transfer_calls: Mutex<Vec<(i64, String)>>,
+}
+
+impl DuplicateMintPaymentLookupApi {
+    fn new() -> Self {
+        Self {
+            mint_transfer_calls: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl AnalyzeApi for DuplicateMintPaymentLookupApi {
+    async fn fetch_contract_metadata(
+        &self,
+        chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _opensea_api_key: &str,
+        contract_address: &str,
+    ) -> Result<ContractMetadata, AppError> {
+        Ok(ContractMetadata {
+            chain: chain.to_string(),
+            contract_address: contract_address.to_string(),
+            token_type: "ERC721".into(),
+            contract_deployer: "0xcreator".into(),
+            deployed_block_number: 123,
+            deployed_block_time: 0,
+            owner_address: String::new(),
+            admin_address: String::new(),
+            proxy_admin_address: String::new(),
+            name: "Azuki".into(),
+            symbol: "AZUKI".into(),
+        })
+    }
+
+    async fn fetch_seed_contract_nfts(
+        &self,
+        chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        contract_address: &str,
+    ) -> Result<Vec<SeedNft>, AppError> {
+        Ok(vec![
+            SeedNft {
+                chain: chain.to_string(),
+                contract_address: contract_address.to_string(),
+                token_id: "1".into(),
+                name: "Azuki #1".into(),
+                symbol: "AZUKI".into(),
+                token_uri: "ipfs://seed/1".into(),
+                image_uri: "ipfs://image/1.png".into(),
+                metadata_json: r#"{"name":"Azuki #1","description":"gold dragon"}"#.into(),
+            },
+            SeedNft {
+                chain: chain.to_string(),
+                contract_address: contract_address.to_string(),
+                token_id: "2".into(),
+                name: "Azuki #2".into(),
+                symbol: "AZUKI".into(),
+                token_uri: "ipfs://seed/2".into(),
+                image_uri: "ipfs://image/2.png".into(),
+                metadata_json: r#"{"name":"Azuki #2","description":"gold dragon"}"#.into(),
+            },
+        ])
+    }
+
+    async fn fetch_contract_transfers(
+        &self,
+        _chain: &str,
+        _etherscan_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _alchemy_api_key: &str,
+        contract_address: &str,
+        _token_type: &str,
+    ) -> Result<Vec<TransferRecord>, AppError> {
+        Ok(vec![
+            TransferRecord {
+                contract_address: contract_address.to_string(),
+                token_id: "1".into(),
+                tx_hash: "0xmint1".into(),
+                log_index: 0,
+                block_number: 1,
+                block_time: 100,
+                from_address: ZERO_ADDRESS.into(),
+                to_address: "0xminter".into(),
+                event_type: "erc721".into(),
+                source: "alchemy".into(),
+            },
+            TransferRecord {
+                contract_address: contract_address.to_string(),
+                token_id: "2".into(),
+                tx_hash: "0xmint2".into(),
+                log_index: 1,
+                block_number: 1,
+                block_time: 101,
+                from_address: ZERO_ADDRESS.into(),
+                to_address: "0xminter".into(),
+                event_type: "erc721".into(),
+                source: "alchemy".into(),
+            },
+        ])
+    }
+
+    async fn fetch_contract_owners(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _contract_address: &str,
+    ) -> Result<Vec<OwnerBalance>, AppError> {
+        Ok(vec![])
+    }
+
+    async fn fetch_contract_sales(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _contract_address: &str,
+        _opensea_api_key: &str,
+    ) -> Result<Vec<NftSaleRecord>, AppError> {
+        Ok(vec![])
+    }
+
+    async fn fetch_transaction_receipt(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        tx_hash: &str,
+    ) -> Result<TransactionReceiptRecord, AppError> {
+        Ok(TransactionReceiptRecord {
+            tx_hash: tx_hash.into(),
+            block_number: 1,
+            transaction_index: 1,
+            from_address: "0xminter".into(),
+            gas_used: 21000,
+            effective_gas_price_wei: 1_000_000_000,
+        })
+    }
+
+    async fn fetch_transaction_receipts_for_block(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _block_number: i64,
+    ) -> Result<BTreeMap<String, TransactionReceiptRecord>, AppError> {
+        Ok(BTreeMap::new())
+    }
+
+    async fn fetch_eth_balance(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _address: &str,
+        _block_number: i64,
+    ) -> Result<f64, AppError> {
+        Ok(1.0)
+    }
+
+    async fn fetch_same_block_eth_transfers_for_address(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _block_number: i64,
+        _address: &str,
+    ) -> Result<Vec<EthTransferRecord>, AppError> {
+        Ok(vec![])
+    }
+
+    async fn fetch_mint_payment_eth_transfers_on_chain(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        block_number: i64,
+        address: &str,
+    ) -> Result<Vec<EthTransferRecord>, AppError> {
+        self.mint_transfer_calls
+            .lock()
+            .unwrap()
+            .push((block_number, address.to_string()));
+        if block_number == 1 && address == "0xminter" {
+            return Ok(vec![
+                EthTransferRecord {
+                    tx_hash: "0xmint1".into(),
+                    block_number,
+                    from_address: "0xminter".into(),
+                    to_address: "0xcreator".into(),
+                    value_eth: 0.08,
+                    value_usd: Some(184.0),
+                    payment_token_symbol: "ETH".into(),
+                    payment_token_address: ZERO_ADDRESS.into(),
+                    category: "external".into(),
+                },
+                EthTransferRecord {
+                    tx_hash: "0xmint2".into(),
+                    block_number,
+                    from_address: "0xminter".into(),
+                    to_address: "0xcreator".into(),
+                    value_eth: 0.09,
+                    value_usd: Some(207.0),
+                    payment_token_symbol: "ETH".into(),
+                    payment_token_address: ZERO_ADDRESS.into(),
+                    category: "external".into(),
+                },
+            ]);
+        }
         Ok(vec![])
     }
 }
@@ -3819,6 +4115,37 @@ async fn analyze_builds_expected_summary_counts() {
     assert_eq!(payload.duplicate_candidates.len(), 1);
     assert_eq!(payload.duplicate_contracts.len(), 1);
     assert_eq!(payload.contract_level_summary["0xdup"].candidate_count, 1);
+}
+
+#[tokio::test]
+async fn analyze_uses_contract_level_seed_name_for_snapshot_recall() {
+    let feature_store = Arc::new(CapturingFeatureStore::default());
+    let captured_seed_names = feature_store.captured_seed_names.clone();
+    let deps = AnalysisDeps {
+        api: Arc::new(FakeApi),
+        feature_store,
+        signal_cache: None,
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    let payload = analyze_seed_contract(
+        AnalyzeRequest {
+            chain: "ethereum".into(),
+            seed_contract_address: "0xseed".into(),
+            alchemy_api_key: "key".into(),
+            ..AnalyzeRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(payload.seed_contract.name, "Azuki");
+    assert_eq!(
+        captured_seed_names.lock().unwrap().as_slice(),
+        &[vec!["Azuki".to_string()]]
+    );
 }
 
 #[tokio::test]
@@ -5066,5 +5393,125 @@ async fn analyze_fetches_contract_inputs_concurrently_within_one_contract() {
     assert!(
         api.max_fetches.load(Ordering::SeqCst) >= 2,
         "expected transfers/owners/sales fetches to overlap within one contract"
+    );
+}
+
+#[tokio::test]
+async fn analyze_fetches_post_signal_inputs_concurrently_within_one_contract() {
+    let api = Arc::new(ConcurrentSingleContractFetchApi::new());
+    let deps = AnalysisDeps {
+        api: api.clone(),
+        feature_store: Arc::new(FakeFeatureStore {
+            snapshot: DatabaseSnapshot {
+                nft_rows: vec![DatabaseNftRecord {
+                    contract_address: "0xdup".into(),
+                    token_id: "1".into(),
+                    token_uri: "ipfs://seed/1".into(),
+                    image_uri: "ipfs://image/1.png".into(),
+                    name: "Azuki Mirror #1".into(),
+                    symbol: "AZUKI".into(),
+                    metadata_json: r#"{"description":"gold dragon"}"#.into(),
+                    metadata_recall_checked: false,
+                    metadata_recall_match: false,
+                }],
+                ..DatabaseSnapshot::default()
+            },
+        }),
+        signal_cache: None,
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    let payload = analyze_seed_contract(
+        AnalyzeRequest {
+            chain: "ethereum".into(),
+            seed_contract_address: "0xseed".into(),
+            alchemy_api_key: "key".into(),
+            contract_max_concurrency: 3,
+            sale_metric_max_concurrency: 3,
+            ..AnalyzeRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(payload.duplicate_contracts.len(), 1);
+    assert!(!payload.market_events.is_empty());
+    assert!(
+        api.max_post_signal_fetches.load(Ordering::SeqCst) >= 2,
+        "expected sales/market-events/mint value-flow fetches to overlap within one contract"
+    );
+}
+
+#[tokio::test]
+async fn analyze_deduplicates_mint_value_flow_transfer_lookups_by_block_and_address() {
+    let api = Arc::new(DuplicateMintPaymentLookupApi::new());
+    let deps = AnalysisDeps {
+        api: api.clone(),
+        feature_store: Arc::new(FakeFeatureStore {
+            snapshot: DatabaseSnapshot {
+                nft_rows: vec![
+                    DatabaseNftRecord {
+                        contract_address: "0xdup".into(),
+                        token_id: "1".into(),
+                        token_uri: "ipfs://seed/1".into(),
+                        image_uri: "ipfs://image/1.png".into(),
+                        name: "Azuki Mirror #1".into(),
+                        symbol: "AZUKI".into(),
+                        metadata_json: r#"{"description":"gold dragon"}"#.into(),
+                        metadata_recall_checked: false,
+                        metadata_recall_match: false,
+                    },
+                    DatabaseNftRecord {
+                        contract_address: "0xdup".into(),
+                        token_id: "2".into(),
+                        token_uri: "ipfs://seed/2".into(),
+                        image_uri: "ipfs://image/2.png".into(),
+                        name: "Azuki Mirror #2".into(),
+                        symbol: "AZUKI".into(),
+                        metadata_json: r#"{"description":"gold dragon"}"#.into(),
+                        metadata_recall_checked: false,
+                        metadata_recall_match: false,
+                    },
+                ],
+                ..DatabaseSnapshot::default()
+            },
+        }),
+        signal_cache: None,
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    let payload = analyze_seed_contract(
+        AnalyzeRequest {
+            chain: "ethereum".into(),
+            seed_contract_address: "0xseed".into(),
+            alchemy_api_key: "key".into(),
+            sale_metric_max_concurrency: 3,
+            ..AnalyzeRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        payload
+            .value_flow_edges
+            .iter()
+            .filter(|edge| edge.channel == "mint_payment")
+            .count(),
+        2
+    );
+    let calls = api.mint_transfer_calls.lock().unwrap().clone();
+    assert_eq!(
+        calls,
+        vec![
+            (1, "0xcreator".to_string()),
+            (1, "0xdup".to_string()),
+            (1, "0xminter".to_string()),
+        ],
+        "expected shared mint value-flow transfer lookups to be fetched once per block/address"
     );
 }

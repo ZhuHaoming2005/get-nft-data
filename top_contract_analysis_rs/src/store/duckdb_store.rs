@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use crate::analysis::scoring::{
-    metadata_recall_document, score_metadata_indexed_pair_with_query, score_name_pair,
+    metadata_recall_document, score_metadata_indexed_pair_with_query, score_normalized_name_pair,
     MetadataBm25CorpusBuilder, MetadataBm25Document, MetadataBm25Query,
     MAX_METADATA_BYTES_FOR_DEDUP,
 };
@@ -11,10 +12,13 @@ use crate::error::AppError;
 use crate::models::{ContractDuplicateRecord, DatabaseNftRecord, DatabaseSnapshot, SeedNft};
 use crate::normalize::{normalize_name, normalize_url};
 use duckdb::{params, AccessMode, Config, Connection};
+use rayon::prelude::*;
 
 const MAX_OVERLAPPING_METADATA_ROWS_PER_CONTRACT: usize = 1;
 const DEFAULT_RECALL_BATCH_SIZE: usize = 500_000;
 const SELECTED_RECALL_ROWID_CHUNK_SIZE: usize = 50_000;
+const SELECTED_RECALL_ROWID_VALUES_CHUNK_SIZE: usize = 10_000;
+const SNAPSHOT_LOAD_LOG_THRESHOLD: Duration = Duration::from_millis(250);
 const BULK_IMPORT_CHECKPOINT_THRESHOLD: &str = "1TB";
 const BULK_IMPORT_SKIP_WAL_THRESHOLD_BYTES: u64 = 1_099_511_627_776;
 #[cfg(test)]
@@ -113,6 +117,62 @@ struct ExactUriRecallInput<'a> {
     max_tokens_per_contract: usize,
     max_recall_rows: usize,
     prepared_recall_state: PreparedRecallState,
+}
+
+struct NameRecallMatch {
+    row_index: usize,
+    seed_index: usize,
+    row_match: SeedRowMatch,
+}
+
+struct NameRecallAppendState<'a> {
+    conn: &'a Connection,
+    profiles: &'a [SeedRecallProfile],
+    selected_rows: &'a mut Vec<PendingMetadataRecallRow>,
+    pending_contract_counts: &'a mut HashMap<(usize, String), usize>,
+    accumulators: &'a mut BTreeMap<String, SnapshotAccumulator>,
+    max_tokens_per_contract: usize,
+}
+
+struct SnapshotLoadTimer {
+    label: &'static str,
+    phase_start: Instant,
+    total_start: Instant,
+}
+
+impl SnapshotLoadTimer {
+    fn new(label: &'static str) -> Self {
+        let now = Instant::now();
+        Self {
+            label,
+            phase_start: now,
+            total_start: now,
+        }
+    }
+
+    fn finish_phase(&mut self, phase: &str) {
+        let elapsed = self.phase_start.elapsed();
+        if elapsed >= SNAPSHOT_LOAD_LOG_THRESHOLD {
+            eprintln!(
+                "[{}] {} completed in {:.3}s",
+                self.label,
+                phase,
+                elapsed.as_secs_f64()
+            );
+        }
+        self.phase_start = Instant::now();
+    }
+
+    fn finish(&self) {
+        let elapsed = self.total_start.elapsed();
+        if elapsed >= SNAPSHOT_LOAD_LOG_THRESHOLD {
+            eprintln!(
+                "[{}] total completed in {:.3}s",
+                self.label,
+                elapsed.as_secs_f64()
+            );
+        }
+    }
 }
 
 impl DuckDbFeatureStore {
@@ -346,18 +406,6 @@ impl DuckDbFeatureStore {
             )
             ",
             params![table_name],
-            |row| row.get::<_, bool>(0),
-        )?;
-        Ok(exists)
-    }
-
-    fn table_has_chain(conn: &Connection, table_name: &str, chain: &str) -> Result<bool, AppError> {
-        if !Self::table_exists(conn, table_name)? {
-            return Ok(false);
-        }
-        let exists = conn.query_row(
-            &format!("SELECT EXISTS(SELECT 1 FROM {table_name} WHERE chain = ? LIMIT 1)"),
-            params![chain],
             |row| row.get::<_, bool>(0),
         )?;
         Ok(exists)
@@ -676,16 +724,19 @@ impl DuckDbFeatureStore {
         chain: &str,
     ) -> Result<PreparedRecallState, AppError> {
         let mut state = Self::prepared_recall_state(conn, chain)?;
-        if !state.ready && self.writable && {
-            conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM nft_features WHERE chain = ? LIMIT 1)",
-                params![chain],
-                |row| row.get::<_, bool>(0),
-            )?
-        } {
+        let stats = Self::feature_chain_stats(conn, chain)?;
+        if state.ready || stats.row_count == 0 {
+            return Ok(state);
+        }
+        if self.writable {
             self.invalidate_metadata_recall_index(chain)?;
             Self::refresh_prepared_recall_tables_for_chain(conn, chain)?;
             state = Self::prepared_recall_state(conn, chain)?;
+        }
+        if !state.ready {
+            return Err(AppError::InvalidData(format!(
+                "prepared recall tables are missing or stale for chain {chain:?}; reopen the feature DB in writable mode or rebuild the snapshot"
+            )));
         }
         Ok(state)
     }
@@ -882,62 +933,20 @@ impl DuckDbFeatureStore {
         chain: &str,
         prepared_recall_state: PreparedRecallState,
     ) -> Result<MetadataRecallIndex, AppError> {
-        let sql = if prepared_recall_state.ready {
-            format!(
-                "
-                SELECT feature_rowid, contract_address, token_id, token_uri_norm, image_uri_norm,
-                       name_norm, recall_doc
-                FROM {METADATA_RECALL_DOC_TABLE}
-                WHERE chain = ?
-                ORDER BY feature_rowid
-                "
-            )
-        } else if Self::table_has_chain(conn, CONTRACT_REPRESENTATIVE_TABLE, chain)? {
-            format!(
-                "
-                SELECT f.rowid, lower(CAST(f.contract_address AS VARCHAR)) AS contract_address,
-                       CAST(f.token_id AS VARCHAR) AS token_id,
-                       coalesce(CAST(f.token_uri_norm AS VARCHAR), '') AS token_uri_norm,
-                       coalesce(CAST(f.image_uri_norm AS VARCHAR), '') AS image_uri_norm,
-                       coalesce(CAST(f.name_norm AS VARCHAR), '') AS name_norm,
-                       coalesce(CAST(f.metadata_json AS VARCHAR), '') AS metadata_json
-                FROM {CONTRACT_REPRESENTATIVE_TABLE} r
-                JOIN nft_features f ON f.rowid = r.metadata_feature_rowid
-                WHERE r.chain = ?
-                  AND r.metadata_feature_rowid IS NOT NULL
-                  AND {}
-                ORDER BY f.rowid
-                ",
-                Self::sql_metadata_json_eligible_predicate()
-                    .replace("metadata_json", "f.metadata_json")
-            )
-        } else {
-            format!(
-                "
-                SELECT rowid, contract_address, token_id, token_uri_norm, image_uri_norm, name_norm,
-                       metadata_json
-                FROM (
-                    SELECT rowid,
-                           lower(CAST(contract_address AS VARCHAR)) AS contract_address,
-                           CAST(token_id AS VARCHAR) AS token_id,
-                           coalesce(CAST(token_uri_norm AS VARCHAR), '') AS token_uri_norm,
-                           coalesce(CAST(image_uri_norm AS VARCHAR), '') AS image_uri_norm,
-                           coalesce(CAST(name_norm AS VARCHAR), '') AS name_norm,
-                           coalesce(CAST(metadata_json AS VARCHAR), '') AS metadata_json,
-                           row_number() OVER (
-                               PARTITION BY lower(CAST(contract_address AS VARCHAR))
-                               ORDER BY CAST(token_id AS VARCHAR), rowid
-                           ) AS metadata_rank
-                    FROM nft_features
-                    WHERE chain = ?
-                      AND {}
-                )
-                WHERE metadata_rank = 1
-                ORDER BY rowid
-                ",
-                Self::sql_metadata_json_eligible_predicate()
-            )
-        };
+        if !prepared_recall_state.ready {
+            return Err(AppError::InvalidData(format!(
+                "prepared recall tables are required before loading metadata recall index for chain {chain:?}"
+            )));
+        }
+        let sql = format!(
+            "
+            SELECT feature_rowid, contract_address, token_id, token_uri_norm, image_uri_norm,
+                   name_norm, recall_doc
+            FROM {METADATA_RECALL_DOC_TABLE}
+            WHERE chain = ?
+            ORDER BY feature_rowid
+            "
+        );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params![chain], |row| {
             Ok((
@@ -964,11 +973,7 @@ impl DuckDbFeatureStore {
                 name_norm,
                 metadata_source_doc,
             ) = row?;
-            let recall_doc = if prepared_recall_state.ready {
-                metadata_source_doc
-            } else {
-                metadata_recall_document(&metadata_source_doc)
-            };
+            let recall_doc = metadata_source_doc;
             let Some(doc) = MetadataBm25Document::from_text(&recall_doc) else {
                 continue;
             };
@@ -992,10 +997,10 @@ impl DuckDbFeatureStore {
         }
         let corpus = corpus_builder.finish();
         let total_docs = candidates.len();
-        for candidate in &mut candidates {
+        candidates.par_iter_mut().for_each(|candidate| {
             candidate.sketch =
                 metadata_sketch_from_document(&candidate.doc, total_docs, &doc_freqs);
-        }
+        });
         let source_index = Self::build_metadata_source_index(&candidates);
         Ok(MetadataRecallIndex {
             candidates,
@@ -1237,12 +1242,26 @@ impl DuckDbFeatureStore {
 
     fn replace_selected_recall_rowids(conn: &Connection, rowids: &[i64]) -> Result<(), AppError> {
         conn.execute(&format!("DELETE FROM {SELECTED_RECALL_ROWID_TABLE}"), [])?;
-        let mut stmt = conn.prepare(&format!(
-            "INSERT INTO {SELECTED_RECALL_ROWID_TABLE} (feature_rowid) VALUES (?)"
-        ))?;
         let unique_rowids = rowids.iter().copied().collect::<BTreeSet<_>>();
-        for rowid in unique_rowids {
-            stmt.execute(params![rowid])?;
+        for chunk in unique_rowids
+            .into_iter()
+            .collect::<Vec<_>>()
+            .chunks(SELECTED_RECALL_ROWID_VALUES_CHUNK_SIZE)
+        {
+            if chunk.is_empty() {
+                continue;
+            }
+            let values = chunk
+                .iter()
+                .map(|rowid| format!("({rowid})"))
+                .collect::<Vec<_>>()
+                .join(",");
+            conn.execute(
+                &format!(
+                    "INSERT INTO {SELECTED_RECALL_ROWID_TABLE} (feature_rowid) VALUES {values}"
+                ),
+                [],
+            )?;
         }
         Ok(())
     }
@@ -1253,10 +1272,9 @@ impl DuckDbFeatureStore {
         name_threshold: f64,
         metadata_recall_match: bool,
     ) -> SeedRowMatch {
-        let name_match = profile
-            .seed_name_norms
-            .iter()
-            .any(|seed_name| score_name_pair(&row.name_norm, seed_name) >= name_threshold);
+        let name_match = profile.seed_name_norms.iter().any(|seed_name| {
+            score_normalized_name_pair(&row.name_norm, seed_name) >= name_threshold
+        });
         SeedRowMatch {
             token_uri_match: profile.exact_token_keys.contains(&row.token_uri_norm),
             image_uri_match: profile.exact_image_keys.contains(&row.image_uri_norm),
@@ -1587,6 +1605,9 @@ impl DuckDbFeatureStore {
             max_recall_rows,
             prepared_recall_state,
         } = input;
+        if !prepared_recall_state.ready {
+            return Ok(());
+        }
         if all_token_keys.is_empty() && all_image_keys.is_empty() {
             return Ok(());
         }
@@ -1613,9 +1634,8 @@ impl DuckDbFeatureStore {
 
         let mut last_feature_rowid = -1_i64;
         loop {
-            let select_sql = if prepared_recall_state.ready {
-                format!(
-                    "
+            let select_sql = format!(
+                "
                     SELECT feature_rowid,
                            contract_address,
                            token_id,
@@ -1629,25 +1649,7 @@ impl DuckDbFeatureStore {
                     ORDER BY feature_rowid
                     LIMIT {recall_batch_size}
                     "
-                )
-            } else {
-                format!(
-                    "
-                    SELECT rowid AS feature_rowid,
-                           lower(CAST(contract_address AS VARCHAR)) AS contract_address,
-                           CAST(token_id AS VARCHAR) AS token_id,
-                           coalesce(CAST(token_uri_norm AS VARCHAR), '') AS token_uri_norm,
-                           coalesce(CAST(image_uri_norm AS VARCHAR), '') AS image_uri_norm,
-                           coalesce(CAST(name_norm AS VARCHAR), '') AS name_norm
-                    FROM nft_features
-                    WHERE chain = ?
-                      AND ({exact_uri_predicate})
-                      AND rowid > {last_feature_rowid}
-                    ORDER BY rowid
-                    LIMIT {recall_batch_size}
-                    "
-                )
-            };
+            );
             let mut stmt = conn.prepare(&select_sql)?;
             let rows = stmt.query_map(params![chain], |row| {
                 Ok(RecallRow {
@@ -1750,6 +1752,9 @@ impl DuckDbFeatureStore {
         max_tokens_per_contract: usize,
         prepared_recall_state: PreparedRecallState,
     ) -> Result<(), AppError> {
+        if !prepared_recall_state.ready {
+            return Ok(());
+        }
         if name_threshold > 100.0
             || !profiles
                 .iter()
@@ -1757,9 +1762,8 @@ impl DuckDbFeatureStore {
         {
             return Ok(());
         }
-        let sql = if prepared_recall_state.ready {
-            format!(
-                "
+        let sql = format!(
+            "
                 SELECT rr.feature_rowid,
                        rr.contract_address,
                        rr.token_id,
@@ -1775,47 +1779,7 @@ impl DuckDbFeatureStore {
                   AND trim(coalesce(rr.name_norm, '')) <> ''
                 ORDER BY rr.feature_rowid
                 "
-            )
-        } else if Self::table_has_chain(conn, CONTRACT_REPRESENTATIVE_TABLE, chain)? {
-            format!(
-                "
-                SELECT f.rowid,
-                       lower(CAST(f.contract_address AS VARCHAR)) AS contract_address,
-                       CAST(f.token_id AS VARCHAR) AS token_id,
-                       coalesce(CAST(f.token_uri_norm AS VARCHAR), '') AS token_uri_norm,
-                       coalesce(CAST(f.image_uri_norm AS VARCHAR), '') AS image_uri_norm,
-                       coalesce(CAST(f.name_norm AS VARCHAR), '') AS name_norm
-                FROM {CONTRACT_REPRESENTATIVE_TABLE} r
-                JOIN nft_features f ON f.rowid = r.name_feature_rowid
-                WHERE r.chain = ?
-                  AND r.name_feature_rowid IS NOT NULL
-                  AND trim(coalesce(CAST(f.name_norm AS VARCHAR), '')) <> ''
-                ORDER BY f.rowid
-                "
-            )
-        } else {
-            "
-                SELECT rowid, contract_address, token_id, token_uri_norm, image_uri_norm, name_norm
-                FROM (
-                    SELECT rowid,
-                           lower(CAST(contract_address AS VARCHAR)) AS contract_address,
-                           CAST(token_id AS VARCHAR) AS token_id,
-                           coalesce(CAST(token_uri_norm AS VARCHAR), '') AS token_uri_norm,
-                           coalesce(CAST(image_uri_norm AS VARCHAR), '') AS image_uri_norm,
-                           coalesce(CAST(name_norm AS VARCHAR), '') AS name_norm,
-                           row_number() OVER (
-                               PARTITION BY lower(CAST(contract_address AS VARCHAR))
-                               ORDER BY trim(coalesce(CAST(name AS VARCHAR), '')), rowid
-                           ) AS name_rank
-                    FROM nft_features
-                    WHERE chain = ?
-                      AND trim(coalesce(CAST(name_norm AS VARCHAR), '')) <> ''
-                )
-                WHERE name_rank = 1
-                ORDER BY rowid
-                "
-            .to_string()
-        };
+        );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params![chain], |row| {
             Ok(RecallRow {
@@ -1831,47 +1795,28 @@ impl DuckDbFeatureStore {
 
         let mut selected_rows = Vec::new();
         let mut pending_contract_counts = HashMap::new();
-        for row in rows {
-            let row = row?;
-            for (seed_index, profile) in profiles.iter().enumerate() {
-                if !profile
-                    .seed_name_norms
-                    .iter()
-                    .any(|seed_name| score_name_pair(&row.name_norm, seed_name) >= name_threshold)
-                {
-                    continue;
-                }
-                let row_match = Self::seed_row_match(profile, &row, name_threshold, false);
-                if !row_match.name_prefix_match {
-                    continue;
-                }
-                if !Self::can_select_recall_row(
-                    seed_index,
-                    profile,
-                    &row,
-                    accumulators,
-                    &pending_contract_counts,
-                    max_tokens_per_contract,
-                ) {
-                    continue;
-                }
-                selected_rows.push(PendingMetadataRecallRow {
-                    seed_index,
-                    row: row.clone(),
-                    row_match,
-                });
-                Self::note_pending_recall_row(seed_index, &row, &mut pending_contract_counts);
-                if selected_rows.len() >= SELECTED_RECALL_ROWID_CHUNK_SIZE {
-                    Self::drain_owned_recall_rows(
-                        conn,
-                        profiles,
-                        &mut selected_rows,
-                        accumulators,
-                        max_tokens_per_contract,
+        let mut batch_rows = Vec::with_capacity(SELECTED_RECALL_ROWID_CHUNK_SIZE);
+        {
+            let mut append_state = NameRecallAppendState {
+                conn,
+                profiles,
+                selected_rows: &mut selected_rows,
+                pending_contract_counts: &mut pending_contract_counts,
+                accumulators,
+                max_tokens_per_contract,
+            };
+            for row in rows {
+                batch_rows.push(row?);
+                if batch_rows.len() >= SELECTED_RECALL_ROWID_CHUNK_SIZE {
+                    Self::append_scored_name_recall_rows(
+                        &mut append_state,
+                        &batch_rows,
+                        name_threshold,
                     )?;
-                    pending_contract_counts.clear();
+                    batch_rows.clear();
                 }
             }
+            Self::append_scored_name_recall_rows(&mut append_state, &batch_rows, name_threshold)?;
         }
         Self::drain_owned_recall_rows(
             conn,
@@ -1880,6 +1825,88 @@ impl DuckDbFeatureStore {
             accumulators,
             max_tokens_per_contract,
         )
+    }
+
+    fn append_scored_name_recall_rows(
+        state: &mut NameRecallAppendState<'_>,
+        batch_rows: &[RecallRow],
+        name_threshold: f64,
+    ) -> Result<(), AppError> {
+        if batch_rows.is_empty() {
+            return Ok(());
+        }
+        for matched in Self::score_name_recall_batch(state.profiles, batch_rows, name_threshold) {
+            let row = &batch_rows[matched.row_index];
+            let profile = &state.profiles[matched.seed_index];
+            if !Self::can_select_recall_row(
+                matched.seed_index,
+                profile,
+                row,
+                &*state.accumulators,
+                &*state.pending_contract_counts,
+                state.max_tokens_per_contract,
+            ) {
+                continue;
+            }
+            state.selected_rows.push(PendingMetadataRecallRow {
+                seed_index: matched.seed_index,
+                row: row.clone(),
+                row_match: matched.row_match,
+            });
+            Self::note_pending_recall_row(
+                matched.seed_index,
+                row,
+                &mut *state.pending_contract_counts,
+            );
+            if state.selected_rows.len() >= SELECTED_RECALL_ROWID_CHUNK_SIZE {
+                Self::drain_owned_recall_rows(
+                    state.conn,
+                    state.profiles,
+                    &mut *state.selected_rows,
+                    &mut *state.accumulators,
+                    state.max_tokens_per_contract,
+                )?;
+                state.pending_contract_counts.clear();
+            }
+        }
+        Ok(())
+    }
+
+    fn score_name_recall_batch(
+        profiles: &[SeedRecallProfile],
+        batch_rows: &[RecallRow],
+        name_threshold: f64,
+    ) -> Vec<NameRecallMatch> {
+        let mut matches = batch_rows
+            .par_iter()
+            .enumerate()
+            .map(|(row_index, row)| {
+                let mut row_matches = Vec::new();
+                for (seed_index, profile) in profiles.iter().enumerate() {
+                    if row.name_norm.is_empty()
+                        || !profile.seed_name_norms.iter().any(|seed_name| {
+                            score_normalized_name_pair(&row.name_norm, seed_name) >= name_threshold
+                        })
+                    {
+                        continue;
+                    }
+                    row_matches.push(NameRecallMatch {
+                        row_index,
+                        seed_index,
+                        row_match: SeedRowMatch {
+                            token_uri_match: profile.exact_token_keys.contains(&row.token_uri_norm),
+                            image_uri_match: profile.exact_image_keys.contains(&row.image_uri_norm),
+                            name_prefix_match: true,
+                            metadata_recall_match: false,
+                        },
+                    });
+                }
+                row_matches
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        matches.sort_by_key(|matched| (matched.row_index, matched.seed_index));
+        matches
     }
 
     fn append_metadata_recall_rows(
@@ -1913,24 +1940,30 @@ impl DuckDbFeatureStore {
                 metadata_index,
                 &profile.seed_contracts,
             );
-            for candidate_index in candidate_indices {
-                let Some(candidate) = metadata_index.candidates.get(candidate_index) else {
-                    continue;
-                };
-                if !seed_query.has_term_overlap(&candidate.doc)
-                    || score_metadata_indexed_pair_with_query(&seed_query, &candidate.doc)
-                        < metadata_threshold
-                {
-                    continue;
-                }
-                let mut row = candidate.row.clone();
-                row.metadata_recall_match = true;
+            let mut matched_rows = candidate_indices
+                .par_iter()
+                .filter_map(|candidate_index| {
+                    let candidate = metadata_index.candidates.get(*candidate_index)?;
+                    if !seed_query.has_term_overlap(&candidate.doc)
+                        || score_metadata_indexed_pair_with_query(&seed_query, &candidate.doc)
+                            < metadata_threshold
+                    {
+                        return None;
+                    }
+                    let mut row = candidate.row.clone();
+                    row.metadata_recall_match = true;
+                    let row_match = Self::seed_row_match(profile, &row, 101.0, true);
+                    Some((*candidate_index, row, row_match))
+                })
+                .collect::<Vec<_>>();
+            matched_rows.sort_by_key(|(candidate_index, _, _)| *candidate_index);
+
+            for (_, row, row_match) in matched_rows {
                 if let Some(accumulator) = accumulators.get_mut(&profile.seed_address) {
                     if accumulator.mark_selected_metadata_recall(&row) {
                         continue;
                     }
                 }
-                let row_match = Self::seed_row_match(profile, &row, 101.0, true);
                 let strong_match = row_match.token_uri_match
                     || row_match.image_uri_match
                     || row_match.name_prefix_match;
@@ -2080,15 +2113,25 @@ impl DuckDbFeatureStore {
         max_tokens_per_contract: usize,
         max_recall_rows: usize,
     ) -> Result<DatabaseSnapshot, AppError> {
+        let mut timer = SnapshotLoadTimer::new("load_snapshot");
         let profiles = vec![SeedRecallProfile::new(String::new(), seed_nfts)];
         let mut accumulators = BTreeMap::from([(String::new(), SnapshotAccumulator::default())]);
         let profile_index = SeedProfileIndex::new(&profiles);
 
         let conn = self.conn()?;
         let prepared_recall_state = self.ensure_prepared_recall_state(&conn, chain)?;
+        timer.finish_phase("ensure_prepared_recall");
+        if !prepared_recall_state.ready {
+            timer.finish();
+            return Ok(accumulators
+                .remove("")
+                .expect("single-seed snapshot accumulator exists")
+                .finish());
+        }
         Self::create_selected_recall_rowid_table(&conn)?;
+        timer.finish_phase("create_temp_tables");
         let result = (|| {
-            Self::append_exact_uri_recall_rows(
+            let phase_result = Self::append_exact_uri_recall_rows(
                 &conn,
                 ExactUriRecallInput {
                     chain,
@@ -2102,8 +2145,11 @@ impl DuckDbFeatureStore {
                     prepared_recall_state,
                 },
                 &mut accumulators,
-            )?;
-            Self::append_name_recall_rows(
+            );
+            timer.finish_phase("exact_uri_recall");
+            phase_result?;
+
+            let phase_result = Self::append_name_recall_rows(
                 &conn,
                 chain,
                 &profiles,
@@ -2111,24 +2157,32 @@ impl DuckDbFeatureStore {
                 &mut accumulators,
                 max_tokens_per_contract,
                 prepared_recall_state,
-            )?;
+            );
+            timer.finish_phase("name_recall");
+            phase_result?;
+
             if metadata_threshold <= 1.0
                 && profiles
                     .iter()
                     .any(|profile| profile.seed_metadata_doc.is_some())
             {
-                let metadata_index =
-                    self.cached_metadata_recall_index(&conn, chain, prepared_recall_state)?;
-                Self::append_metadata_recall_rows(
+                let phase_result =
+                    self.cached_metadata_recall_index(&conn, chain, prepared_recall_state);
+                timer.finish_phase("metadata_index");
+                let metadata_index = phase_result?;
+
+                let phase_result = Self::append_metadata_recall_rows(
                     &conn,
                     &profiles,
                     metadata_threshold,
                     metadata_index.as_ref(),
                     &mut accumulators,
                     max_tokens_per_contract,
-                )?;
+                );
+                timer.finish_phase("metadata_recall");
+                phase_result?;
             }
-            Self::append_overlapping_metadata_token_rows(
+            let phase_result = Self::append_overlapping_metadata_token_rows(
                 &conn,
                 chain,
                 &profiles[0].seed_token_ids,
@@ -2136,13 +2190,17 @@ impl DuckDbFeatureStore {
                     .get_mut("")
                     .expect("single-seed snapshot accumulator exists")
                     .duplicate_rows_by_contract,
-            )?;
+            );
+            timer.finish_phase("overlapping_metadata_rows");
+            phase_result?;
             Ok(accumulators
                 .remove("")
                 .expect("single-seed snapshot accumulator exists")
                 .finish())
         })();
         let cleanup_result = Self::drop_seed_temp_tables(&conn);
+        timer.finish_phase("cleanup_temp_tables");
+        timer.finish();
         match (result, cleanup_result) {
             (Ok(snapshot), Ok(())) => Ok(snapshot),
             (Err(err), _) => Err(err),
@@ -2159,6 +2217,7 @@ impl DuckDbFeatureStore {
         max_tokens_per_contract: usize,
         max_recall_rows: usize,
     ) -> Result<BTreeMap<String, DatabaseSnapshot>, AppError> {
+        let mut timer = SnapshotLoadTimer::new("load_snapshots");
         if seeds.len() <= 1 {
             let mut snapshots = BTreeMap::new();
             for (seed_address, seed_nfts) in seeds {
@@ -2210,9 +2269,18 @@ impl DuckDbFeatureStore {
 
         let conn = self.conn()?;
         let prepared_recall_state = self.ensure_prepared_recall_state(&conn, chain)?;
+        timer.finish_phase("ensure_prepared_recall");
+        if !prepared_recall_state.ready {
+            timer.finish();
+            return Ok(accumulators
+                .into_iter()
+                .map(|(seed_address, accumulator)| (seed_address, accumulator.finish()))
+                .collect());
+        }
         Self::create_selected_recall_rowid_table(&conn)?;
+        timer.finish_phase("create_temp_tables");
         let result = (|| {
-            Self::append_exact_uri_recall_rows(
+            let phase_result = Self::append_exact_uri_recall_rows(
                 &conn,
                 ExactUriRecallInput {
                     chain,
@@ -2226,8 +2294,11 @@ impl DuckDbFeatureStore {
                     prepared_recall_state,
                 },
                 &mut accumulators,
-            )?;
-            Self::append_name_recall_rows(
+            );
+            timer.finish_phase("exact_uri_recall");
+            phase_result?;
+
+            let phase_result = Self::append_name_recall_rows(
                 &conn,
                 chain,
                 &profiles,
@@ -2235,33 +2306,43 @@ impl DuckDbFeatureStore {
                 &mut accumulators,
                 max_tokens_per_contract,
                 prepared_recall_state,
-            )?;
+            );
+            timer.finish_phase("name_recall");
+            phase_result?;
+
             if metadata_threshold <= 1.0
                 && profiles
                     .iter()
                     .any(|profile| profile.seed_metadata_doc.is_some())
             {
-                let metadata_index =
-                    self.cached_metadata_recall_index(&conn, chain, prepared_recall_state)?;
-                Self::append_metadata_recall_rows(
+                let phase_result =
+                    self.cached_metadata_recall_index(&conn, chain, prepared_recall_state);
+                timer.finish_phase("metadata_index");
+                let metadata_index = phase_result?;
+
+                let phase_result = Self::append_metadata_recall_rows(
                     &conn,
                     &profiles,
                     metadata_threshold,
                     metadata_index.as_ref(),
                     &mut accumulators,
                     max_tokens_per_contract,
-                )?;
+                );
+                timer.finish_phase("metadata_recall");
+                phase_result?;
             }
             for profile in &profiles {
                 let Some(accumulator) = accumulators.get_mut(&profile.seed_address) else {
                     continue;
                 };
-                Self::append_overlapping_metadata_token_rows(
+                let phase_result = Self::append_overlapping_metadata_token_rows(
                     &conn,
                     chain,
                     &profile.seed_token_ids,
                     &mut accumulator.duplicate_rows_by_contract,
-                )?;
+                );
+                timer.finish_phase("overlapping_metadata_rows");
+                phase_result?;
             }
 
             let snapshots = accumulators
@@ -2271,6 +2352,8 @@ impl DuckDbFeatureStore {
             Ok(snapshots)
         })();
         let cleanup_result = Self::drop_seed_temp_tables(&conn);
+        timer.finish_phase("cleanup_temp_tables");
+        timer.finish();
         match (result, cleanup_result) {
             (Ok(snapshots), Ok(())) => Ok(snapshots),
             (Err(err), _) => Err(err),

@@ -245,6 +245,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn normalized_name_pair_scoring_assumes_inputs_are_already_normalized() {
+        assert_eq!(score_normalized_name_pair("azuki", "azuki"), 100.0);
+        assert_eq!(score_name_pair("Azuki #123", "azuki"), 100.0);
+        assert!(score_normalized_name_pair("Azuki #123", "azuki") < 100.0);
+    }
+
+    #[test]
     fn indexed_metadata_documents_reuse_cached_tokens_and_term_frequencies() {
         let query = MetadataBm25Document::from_text("gold dragon gold").unwrap();
         let doc = MetadataBm25Document::from_text("rare gold dragon").unwrap();
@@ -604,12 +611,16 @@ pub fn metadata_document_from_json(raw: &str) -> String {
 pub fn score_name_pair(left: &str, right: &str) -> f64 {
     let left_norm = normalize_name(left);
     let right_norm = normalize_name(right);
+    score_normalized_name_pair(&left_norm, &right_norm)
+}
+
+pub fn score_normalized_name_pair(left_norm: &str, right_norm: &str) -> f64 {
     if left_norm.is_empty() || right_norm.is_empty() {
         0.0
     } else if left_norm == right_norm {
         100.0
     } else {
-        jaro_winkler(&left_norm, &right_norm) * 100.0
+        jaro_winkler(left_norm, right_norm) * 100.0
     }
 }
 

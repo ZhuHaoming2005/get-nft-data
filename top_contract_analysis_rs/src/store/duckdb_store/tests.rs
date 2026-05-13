@@ -274,6 +274,64 @@ fn opening_existing_feature_db_does_not_backfill_persistent_metadata_keyword_ind
 }
 
 #[test]
+fn load_snapshot_rejects_read_only_db_without_prepared_recall_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("features.duckdb");
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+                CREATE TABLE nft_features (
+                    chain VARCHAR NOT NULL,
+                    contract_address VARCHAR NOT NULL,
+                    token_id VARCHAR NOT NULL,
+                    token_uri VARCHAR,
+                    image_uri VARCHAR,
+                    name VARCHAR,
+                    symbol VARCHAR,
+                    metadata_json VARCHAR,
+                    token_uri_norm VARCHAR,
+                    image_uri_norm VARCHAR,
+                    name_norm VARCHAR
+                );
+                INSERT INTO nft_features VALUES (
+                    'ethereum', '0xcandidate', '1', 'ipfs://shared/1', '', '', '',
+                    '{\"description\":\"gold dragon\"}', 'ipfs://shared/1', '', ''
+                );
+                ",
+        )
+        .unwrap();
+    }
+
+    let store = DuckDbFeatureStore::open_read_only_with_options(
+        &db_path.to_string_lossy(),
+        DuckDbResourceOptions::default(),
+    )
+    .unwrap();
+    let err = store
+        .load_snapshot(
+            "ethereum",
+            &[SeedNft {
+                contract_address: "0xseed".into(),
+                token_id: "1".into(),
+                token_uri: "ipfs://shared/1".into(),
+                metadata_json: r#"{"description":"gold dragon"}"#.into(),
+                ..Default::default()
+            }],
+            101.0,
+            0.6,
+            0,
+            0,
+        )
+        .unwrap_err();
+
+    assert!(
+        err.to_string().contains("prepared recall tables"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
 fn replace_chain_rows_populates_contract_representatives() {
     let store = DuckDbFeatureStore::new(":memory:").unwrap();
     store
@@ -720,4 +778,25 @@ fn selected_recall_rowid_table_is_reusable_across_fetches() {
     assert_eq!(first[&0].contract_address, "0xa");
     assert_eq!(second[&1].contract_address, "0xb");
     assert!(table_still_exists);
+}
+
+#[test]
+fn selected_recall_rowid_table_deduplicates_bulk_rowids() {
+    let store = DuckDbFeatureStore::new(":memory:").unwrap();
+    let conn = store.conn().unwrap();
+    DuckDbFeatureStore::create_selected_recall_rowid_table(&conn).unwrap();
+
+    DuckDbFeatureStore::replace_selected_recall_rowids(&conn, &[3, 1, 3, 2, 1]).unwrap();
+    let rowids = conn
+        .prepare(&format!(
+            "SELECT feature_rowid FROM {SELECTED_RECALL_ROWID_TABLE} ORDER BY feature_rowid"
+        ))
+        .unwrap()
+        .query_map([], |row| row.get::<_, i64>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    DuckDbFeatureStore::drop_seed_temp_tables(&conn).unwrap();
+
+    assert_eq!(rowids, vec![1, 2, 3]);
 }
