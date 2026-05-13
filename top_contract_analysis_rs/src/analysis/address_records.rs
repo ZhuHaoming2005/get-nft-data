@@ -121,7 +121,8 @@ fn build_owner_token_map(owners: &[OwnerBalance]) -> HashMap<String, HashSet<Str
         let held_tokens: HashSet<String> = owner
             .token_balances
             .iter()
-            .filter_map(|(token_id, balance)| (*balance > 0).then(|| token_id.clone()))
+            .filter(|(_, balance)| **balance > 0)
+            .map(|(token_id, _)| token_id.clone())
             .collect();
         if !held_tokens.is_empty() {
             owner_token_map.insert(owner.owner_address.clone(), held_tokens);
@@ -310,11 +311,13 @@ pub(crate) fn build_malicious_address_records_from_activity(
 ) -> Vec<MaliciousAddressPayload> {
     let relevant_token_ids: HashSet<String> = infringing_tokens
         .iter()
-        .filter_map(|item| (!item.token_id.is_empty()).then(|| item.token_id.clone()))
+        .filter(|item| !item.token_id.is_empty())
+        .map(|item| item.token_id.clone())
         .collect();
     let mint_addresses: HashSet<String> = infringing_tokens
         .iter()
-        .filter_map(|item| (!item.minter_address.is_empty()).then(|| item.minter_address.clone()))
+        .filter(|item| !item.minter_address.is_empty())
+        .map(|item| item.minter_address.clone())
         .collect();
 
     let mut outgoing: HashMap<String, HashSet<String>> = HashMap::new();
@@ -602,7 +605,8 @@ pub fn build_address_attribution_records(
 ) -> Vec<AddressAttributionPayload> {
     let relevant_token_ids: HashSet<String> = infringing_tokens
         .iter()
-        .filter_map(|item| (!item.token_id.is_empty()).then(|| item.token_id.clone()))
+        .filter(|item| !item.token_id.is_empty())
+        .map(|item| item.token_id.clone())
         .collect();
     let mut rows = BTreeMap::<String, AttributionAccumulator>::new();
 
@@ -1074,17 +1078,32 @@ pub(crate) fn build_secondary_sale_victim_address_records_from_activity(
     grouped.into_values().collect()
 }
 
+pub struct HonestAddressRecordInput<'a> {
+    pub contract_address: &'a str,
+    pub transfers: &'a [TransferRecord],
+    pub sales: &'a [NftSaleRecord],
+    pub owners: &'a [OwnerBalance],
+    pub infringing_tokens: &'a [InfringingTokenRecord],
+    pub malicious_addresses: &'a [MaliciousAddressPayload],
+    pub mint_payment_edges: &'a [ValueFlowEdgePayload],
+    pub deployment_time: i64,
+    pub analysis_timestamp: i64,
+}
+
 pub fn build_honest_address_records(
-    contract_address: &str,
-    transfers: &[TransferRecord],
-    sales: &[NftSaleRecord],
-    owners: &[OwnerBalance],
-    infringing_tokens: &[InfringingTokenRecord],
-    malicious_addresses: &[MaliciousAddressPayload],
-    mint_payment_edges: &[ValueFlowEdgePayload],
-    deployment_time: i64,
-    analysis_timestamp: i64,
+    input: HonestAddressRecordInput<'_>,
 ) -> Vec<HonestAddressPayload> {
+    let HonestAddressRecordInput {
+        contract_address,
+        transfers,
+        sales,
+        owners,
+        infringing_tokens,
+        malicious_addresses,
+        mint_payment_edges,
+        deployment_time,
+        analysis_timestamp,
+    } = input;
     let activity = prepare_contract_activity(transfers, sales, owners);
     build_honest_address_records_from_activity(
         contract_address,
@@ -1110,11 +1129,13 @@ pub(crate) fn build_honest_address_records_from_activity(
     let deployment_time = deployment_time.max(0);
     let relevant_token_ids: HashSet<String> = infringing_tokens
         .iter()
-        .filter_map(|item| (!item.token_id.is_empty()).then(|| item.token_id.clone()))
+        .filter(|item| !item.token_id.is_empty())
+        .map(|item| item.token_id.clone())
         .collect();
     let malicious_set: HashSet<String> = malicious_addresses
         .iter()
-        .filter_map(|item| (!item.address.is_empty()).then(|| item.address.clone()))
+        .filter(|item| !item.address.is_empty())
+        .map(|item| item.address.clone())
         .collect();
 
     let owner_token_map: HashMap<String, HashSet<String>> = activity
@@ -1424,9 +1445,8 @@ pub fn build_fraud_trade_stats(
             unique_buyers: sales
                 .iter()
                 .filter(|sale| sale.contract_address.eq_ignore_ascii_case(contract_address))
-                .filter_map(|sale| {
-                    (!sale.buyer_address.is_empty()).then(|| sale.buyer_address.clone())
-                })
+                .filter(|sale| !sale.buyer_address.is_empty())
+                .map(|sale| sale.buyer_address.clone())
                 .collect::<BTreeSet<_>>()
                 .len() as i64,
             native_eth_sale_count: Some(native_sales.len() as i64),
@@ -1675,17 +1695,17 @@ mod tests {
             token_balances: BTreeMap::from([("1".into(), 1)]),
         }];
 
-        let rows = build_honest_address_records(
-            "0xdup",
-            &transfers,
-            &sales,
-            &owners,
-            &[infringing_token()],
-            &[operator_address()],
-            &[],
-            90,
-            200,
-        );
+        let rows = build_honest_address_records(HonestAddressRecordInput {
+            contract_address: "0xdup",
+            transfers: &transfers,
+            sales: &sales,
+            owners: &owners,
+            infringing_tokens: &[infringing_token()],
+            malicious_addresses: &[operator_address()],
+            mint_payment_edges: &[],
+            deployment_time: 90,
+            analysis_timestamp: 200,
+        });
         let victim = rows
             .iter()
             .find(|row| row.address == "0xvictim")
@@ -1715,17 +1735,17 @@ mod tests {
             token_balances: BTreeMap::from([("1".into(), 1)]),
         }];
 
-        let rows = build_honest_address_records(
-            "0xdup",
-            &transfers,
-            &sales,
-            &owners,
-            &[infringing_token()],
-            &[operator_address()],
-            &[],
-            90,
-            200,
-        );
+        let rows = build_honest_address_records(HonestAddressRecordInput {
+            contract_address: "0xdup",
+            transfers: &transfers,
+            sales: &sales,
+            owners: &owners,
+            infringing_tokens: &[infringing_token()],
+            malicious_addresses: &[operator_address()],
+            mint_payment_edges: &[],
+            deployment_time: 90,
+            analysis_timestamp: 200,
+        });
         let victim = rows
             .iter()
             .find(|row| row.address == "0xvictim")
@@ -1757,17 +1777,17 @@ mod tests {
             token_balances: BTreeMap::from([("1".into(), 1)]),
         }];
 
-        let rows = build_honest_address_records(
-            "0xdup",
-            &transfers,
-            &sales,
-            &owners,
-            &[infringing_token()],
-            &[operator_address()],
-            &[mint_payment_edge("0xvictim")],
-            90,
-            200,
-        );
+        let rows = build_honest_address_records(HonestAddressRecordInput {
+            contract_address: "0xdup",
+            transfers: &transfers,
+            sales: &sales,
+            owners: &owners,
+            infringing_tokens: &[infringing_token()],
+            malicious_addresses: &[operator_address()],
+            mint_payment_edges: &[mint_payment_edge("0xvictim")],
+            deployment_time: 90,
+            analysis_timestamp: 200,
+        });
         let victim = rows
             .iter()
             .find(|row| row.address == "0xvictim")
@@ -1910,17 +1930,17 @@ mod tests {
             token_balances: BTreeMap::from([("1".into(), 1)]),
         }];
 
-        let rows = build_honest_address_records(
-            "0xdup",
-            &transfers,
-            &sales,
-            &owners,
-            &[infringing_token()],
-            &[operator_address()],
-            &[mint_payment_edge("0xoperator")],
-            90,
-            200,
-        );
+        let rows = build_honest_address_records(HonestAddressRecordInput {
+            contract_address: "0xdup",
+            transfers: &transfers,
+            sales: &sales,
+            owners: &owners,
+            infringing_tokens: &[infringing_token()],
+            malicious_addresses: &[operator_address()],
+            mint_payment_edges: &[mint_payment_edge("0xoperator")],
+            deployment_time: 90,
+            analysis_timestamp: 200,
+        });
 
         assert!(rows.iter().all(|row| row.address != "0xoperator"));
         assert_eq!(

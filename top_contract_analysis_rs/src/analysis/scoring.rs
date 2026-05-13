@@ -46,11 +46,7 @@ fn flatten_metadata(value: &Value, parts: &mut Vec<String>) {
                 flatten_metadata(item, parts);
             }
         }
-        Value::String(text) => {
-            if !text.trim().is_empty() {
-                parts.push(text.trim().to_string());
-            }
-        }
+        Value::String(text) if !text.trim().is_empty() => parts.push(text.trim().to_string()),
         _ => {}
     }
 }

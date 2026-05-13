@@ -550,7 +550,7 @@ mod tests {
 
     #[test]
     fn contract_name_match_index_matches_any_normalized_name_per_contract() {
-        let contract_rows = vec![
+        let contract_rows = [
             ContractDuplicateRecord {
                 contract_address: "0xhit".into(),
                 name_norms: vec!["unrelated".into(), "azuki".into()],
@@ -573,7 +573,7 @@ mod tests {
 
     #[test]
     fn contract_name_match_index_preserves_name_scoring_normalization() {
-        let contract_rows = vec![ContractDuplicateRecord {
+        let contract_rows = [ContractDuplicateRecord {
             contract_address: "0xhit".into(),
             name_norms: vec!["Azuki #123".into()],
             ..Default::default()

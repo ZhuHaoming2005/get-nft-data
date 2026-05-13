@@ -99,16 +99,14 @@ fn build_address_evidence_features(
             let related_tokens: BTreeSet<String> = item
                 .evidence
                 .iter()
-                .filter_map(|evidence| {
-                    (!evidence.token_id.is_empty()).then(|| evidence.token_id.clone())
-                })
+                .filter(|evidence| !evidence.token_id.is_empty())
+                .map(|evidence| evidence.token_id.clone())
                 .collect();
             let related_txs: BTreeSet<String> = item
                 .evidence
                 .iter()
-                .filter_map(|evidence| {
-                    (!evidence.tx_hash.is_empty()).then(|| evidence.tx_hash.clone())
-                })
+                .filter(|evidence| !evidence.tx_hash.is_empty())
+                .map(|evidence| evidence.tx_hash.clone())
                 .collect();
             AddressEvidenceFeaturePayload {
                 contract_address: item.contract_address.clone(),
@@ -215,31 +213,31 @@ fn build_value_flow_edges(
             if edge.channel != "sale" {
                 continue;
             }
-            rows.push(sale_value_edge(
+            rows.push(sale_value_edge(SaleValueEdgeInput {
                 edge,
-                "sale_payment",
-                &edge.from_address,
-                "marketplace_sale",
-                "buyer",
-                "seller",
-                true,
-                edge.seller_fee_eth.or(edge.price_eth),
-                edge.seller_fee_usd.or(edge.price_usd),
-            ));
+                channel: "sale_payment",
+                to_address: &edge.from_address,
+                evidence_type: "marketplace_sale",
+                from_role: "buyer",
+                to_role: "seller",
+                recipient_known: true,
+                value_eth: edge.seller_fee_eth.or(edge.price_eth),
+                value_usd: edge.seller_fee_usd.or(edge.price_usd),
+            }));
             if edge.protocol_fee_eth.unwrap_or(0.0) > 0.0
                 || edge.protocol_fee_usd.unwrap_or(0.0) > 0.0
             {
-                rows.push(sale_value_edge(
+                rows.push(sale_value_edge(SaleValueEdgeInput {
                     edge,
-                    "protocol_fee",
-                    &unknown_value_recipient("protocol_fee", &edge.marketplace),
-                    "marketplace_protocol_fee",
-                    "buyer",
-                    "marketplace_protocol",
-                    false,
-                    edge.protocol_fee_eth,
-                    edge.protocol_fee_usd,
-                ));
+                    channel: "protocol_fee",
+                    to_address: &unknown_value_recipient("protocol_fee", &edge.marketplace),
+                    evidence_type: "marketplace_protocol_fee",
+                    from_role: "buyer",
+                    to_role: "marketplace_protocol",
+                    recipient_known: false,
+                    value_eth: edge.protocol_fee_eth,
+                    value_usd: edge.protocol_fee_usd,
+                }));
             }
             if edge.royalty_fee_eth.unwrap_or(0.0) > 0.0
                 || edge.royalty_fee_usd.unwrap_or(0.0) > 0.0
@@ -251,17 +249,17 @@ fn build_value_flow_edges(
                 } else {
                     unknown_value_recipient("royalty_recipient", &edge.contract_address)
                 };
-                rows.push(sale_value_edge(
+                rows.push(sale_value_edge(SaleValueEdgeInput {
                     edge,
-                    "royalty_fee",
-                    &royalty_recipient_address,
-                    "marketplace_royalty_fee",
-                    "buyer",
-                    "royalty_recipient",
-                    royalty_recipient_known,
-                    edge.royalty_fee_eth,
-                    edge.royalty_fee_usd,
-                ));
+                    channel: "royalty_fee",
+                    to_address: &royalty_recipient_address,
+                    evidence_type: "marketplace_royalty_fee",
+                    from_role: "buyer",
+                    to_role: "royalty_recipient",
+                    recipient_known: royalty_recipient_known,
+                    value_eth: edge.royalty_fee_eth,
+                    value_usd: edge.royalty_fee_usd,
+                }));
             }
         }
     }
@@ -282,17 +280,30 @@ fn build_value_flow_edges(
     rows
 }
 
-fn sale_value_edge(
-    edge: &NftPropagationEdgePayload,
-    channel: &str,
-    to_address: &str,
-    evidence_type: &str,
-    from_role: &str,
-    to_role: &str,
+struct SaleValueEdgeInput<'a> {
+    edge: &'a NftPropagationEdgePayload,
+    channel: &'a str,
+    to_address: &'a str,
+    evidence_type: &'a str,
+    from_role: &'a str,
+    to_role: &'a str,
     recipient_known: bool,
     value_eth: Option<f64>,
     value_usd: Option<f64>,
-) -> ValueFlowEdgePayload {
+}
+
+fn sale_value_edge(input: SaleValueEdgeInput<'_>) -> ValueFlowEdgePayload {
+    let SaleValueEdgeInput {
+        edge,
+        channel,
+        to_address,
+        evidence_type,
+        from_role,
+        to_role,
+        recipient_known,
+        value_eth,
+        value_usd,
+    } = input;
     ValueFlowEdgePayload {
         edge_id: format!("value:{}:{}", channel, edge.edge_id),
         contract_address: edge.contract_address.clone(),
@@ -494,10 +505,7 @@ fn build_stage_transition_events(
         if event.contract_address.is_empty() || event.lifecycle_stage == "stage_transition" {
             continue;
         }
-        if !stage_order
-            .iter()
-            .any(|stage| *stage == event.lifecycle_stage.as_str())
-        {
+        if !stage_order.contains(&event.lifecycle_stage.as_str()) {
             continue;
         }
         let key = (
@@ -1453,11 +1461,11 @@ fn build_campaign_clusters(
 
     let mut contract_addresses: BTreeSet<String> = duplicate_contracts
         .iter()
-        .filter_map(|item| {
-            (!item.contract_address.is_empty()
-                && item.contract_address != seed_contract.contract_address)
-                .then(|| item.contract_address.clone())
+        .filter(|item| {
+            !item.contract_address.is_empty()
+                && item.contract_address != seed_contract.contract_address
         })
+        .map(|item| item.contract_address.clone())
         .collect();
     for event in &campaign_events {
         contract_addresses.insert(event.contract_address.clone());
@@ -1602,7 +1610,8 @@ fn build_campaign_clusters(
             .collect();
         let token_count = component_events
             .iter()
-            .filter_map(|event| (!event.token_id.is_empty()).then(|| event.token_id.clone()))
+            .filter(|event| !event.token_id.is_empty())
+            .map(|event| event.token_id.clone())
             .collect::<BTreeSet<_>>()
             .len() as i64;
         let sale_count = component_events

@@ -6,7 +6,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tempfile::tempdir;
 use top_contract_analysis_rs::analysis::{
-    run_batch, AnalysisDeps, AnalyzeApi, BatchRequest, FeatureStoreReader,
+    run_batch, AnalysisDeps, AnalyzeApi, BatchRequest, CandidateSeedHolderRequest,
+    FeatureStoreReader,
 };
 use top_contract_analysis_rs::error::AppError;
 use top_contract_analysis_rs::models::{
@@ -290,15 +291,9 @@ impl AnalyzeApi for InstrumentedBatchApi {
 
     async fn candidate_currently_holds_seed_nft(
         &self,
-        _chain: &str,
-        _alchemy_api_key: &str,
-        _alchemy_network: Option<&str>,
-        _opensea_api_key: &str,
-        _seed_contract_address: &str,
-        candidate_contract_address: &str,
-        _seed_collection_slug: Option<&str>,
+        request: CandidateSeedHolderRequest<'_>,
     ) -> Result<Option<bool>, AppError> {
-        if !self.emit_native_sale && candidate_contract_address.contains("seed2") {
+        if !self.emit_native_sale && request.candidate_contract_address.contains("seed2") {
             let mut waited = 0;
             while self.probe.holder_current.load(Ordering::SeqCst) == 0 && waited < 100 {
                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -307,7 +302,7 @@ impl AnalyzeApi for InstrumentedBatchApi {
         }
         let current = self.probe.holder_current.fetch_add(1, Ordering::SeqCst) + 1;
         if self.emit_native_sale
-            && candidate_contract_address.contains("seed2")
+            && request.candidate_contract_address.contains("seed2")
             && !self.probe.sale_metric_finished.load(Ordering::SeqCst)
         {
             self.probe
@@ -331,12 +326,13 @@ impl AnalyzeApi for InstrumentedBatchApi {
         _opensea_api_key: &str,
         contract_address: &str,
     ) -> Result<Vec<SeedNft>, AppError> {
-        if self.emit_native_sale && contract_address.contains("seed2") {
-            if self.probe.sale_metric_active.load(Ordering::SeqCst) {
-                self.probe
-                    .expansion_observed_sale_metric_active
-                    .store(true, Ordering::SeqCst);
-            }
+        if self.emit_native_sale
+            && contract_address.contains("seed2")
+            && self.probe.sale_metric_active.load(Ordering::SeqCst)
+        {
+            self.probe
+                .expansion_observed_sale_metric_active
+                .store(true, Ordering::SeqCst);
         }
         if !self.emit_native_sale && contract_address.contains("seed2") {
             let mut waited = 0;

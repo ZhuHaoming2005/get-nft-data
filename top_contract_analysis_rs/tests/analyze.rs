@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use tempfile::tempdir;
 use tokio::time::{sleep, Duration};
 use top_contract_analysis_rs::analysis::{
-    analyze_seed_contract, AnalysisDeps, AnalyzeApi, AnalyzeRequest, FeatureStoreReader,
-    SignalCacheStore,
+    analyze_seed_contract, AnalysisDeps, AnalyzeApi, AnalyzeRequest, CandidateSeedHolderRequest,
+    FeatureStoreReader, SignalCacheStore,
 };
 use top_contract_analysis_rs::error::AppError;
 use top_contract_analysis_rs::models::{
@@ -241,16 +241,12 @@ impl AnalyzeApi for FakeSeedOwnerApi {
 
     async fn candidate_currently_holds_seed_nft(
         &self,
-        _chain: &str,
-        _alchemy_api_key: &str,
-        _alchemy_network: Option<&str>,
-        _opensea_api_key: &str,
-        _seed_contract_address: &str,
-        candidate_contract_address: &str,
-        _seed_collection_slug: Option<&str>,
+        request: CandidateSeedHolderRequest<'_>,
     ) -> Result<Option<bool>, AppError> {
         Ok(Some(
-            candidate_contract_address.eq_ignore_ascii_case("0xwrapped"),
+            request
+                .candidate_contract_address
+                .eq_ignore_ascii_case("0xwrapped"),
         ))
     }
 
@@ -422,13 +418,7 @@ impl AnalyzeApi for FakeSeedTransferHistoryApi {
 
     async fn candidate_currently_holds_seed_nft(
         &self,
-        _chain: &str,
-        _alchemy_api_key: &str,
-        _alchemy_network: Option<&str>,
-        _opensea_api_key: &str,
-        _seed_contract_address: &str,
-        _candidate_contract_address: &str,
-        _seed_collection_slug: Option<&str>,
+        _request: CandidateSeedHolderRequest<'_>,
     ) -> Result<Option<bool>, AppError> {
         Ok(Some(false))
     }
@@ -1251,7 +1241,6 @@ impl AnalyzeApi for FakeEnrichedApi {
                     payment_token_symbol: "ETH".into(),
                     payment_token_address: ZERO_ADDRESS.into(),
                     category: "external".into(),
-                    ..EthTransferRecord::default()
                 },
                 EthTransferRecord {
                     tx_hash: "0xmint".into(),
@@ -1263,7 +1252,6 @@ impl AnalyzeApi for FakeEnrichedApi {
                     payment_token_symbol: "ETH".into(),
                     payment_token_address: ZERO_ADDRESS.into(),
                     category: "external".into(),
-                    ..EthTransferRecord::default()
                 },
             ]);
         }
@@ -1278,7 +1266,6 @@ impl AnalyzeApi for FakeEnrichedApi {
                 payment_token_symbol: "ETH".into(),
                 payment_token_address: ZERO_ADDRESS.into(),
                 category: "internal".into(),
-                ..EthTransferRecord::default()
             }]);
         }
         Ok(vec![])
@@ -1739,13 +1726,7 @@ impl AnalyzeApi for CountingApi {
 
     async fn candidate_currently_holds_seed_nft(
         &self,
-        _chain: &str,
-        _alchemy_api_key: &str,
-        _alchemy_network: Option<&str>,
-        _opensea_api_key: &str,
-        _seed_contract_address: &str,
-        _candidate_contract_address: &str,
-        _seed_collection_slug: Option<&str>,
+        _request: CandidateSeedHolderRequest<'_>,
     ) -> Result<Option<bool>, AppError> {
         Ok(Some(false))
     }
@@ -3068,6 +3049,47 @@ impl SignalCacheStore for FakeSignalCache {
     }
 }
 
+struct MissingVictimSignalCache;
+
+impl SignalCacheStore for MissingVictimSignalCache {
+    fn get(
+        &self,
+        _chain: &str,
+        contract_address: &str,
+        _token_type: &str,
+    ) -> Result<Option<CachedSignals>, AppError> {
+        let transfers = vec![
+            TransferRecord::mint(contract_address, "1", 100, "0xminter"),
+            TransferRecord::transfer(contract_address, "1", 160, "0xminter", "0xbuyer"),
+        ];
+        let owners = vec![OwnerBalance {
+            owner_address: "0xbuyer".into(),
+            token_balances: BTreeMap::from([("1".into(), 1)]),
+        }];
+        Ok(Some(CachedSignals {
+            mint_recipients: vec!["0xminter".into()],
+            active_sellers: vec!["0xminter".into()],
+            address_signals: top_contract_analysis_rs::analysis::signals::analyze_transfer_signals(
+                &transfers,
+            ),
+            victim_signals: None,
+            transfers,
+            owners,
+        }))
+    }
+
+    fn put(
+        &self,
+        _chain: &str,
+        _contract_address: &str,
+        _token_type: &str,
+        _transfers: &[TransferRecord],
+        _owners: &[OwnerBalance],
+    ) -> Result<(), AppError> {
+        Ok(())
+    }
+}
+
 #[test]
 fn default_output_basename_matches_existing_prefix() {
     let payload = SingleReportPayload {
@@ -3680,6 +3702,8 @@ async fn analyze_moves_official_reissues_into_legit_duplicates() {
     .unwrap();
 
     assert!(payload.duplicate_contracts.is_empty());
+    assert!(payload.duplicate_candidates.is_empty());
+    assert!(payload.contract_level_summary.is_empty());
     assert!(payload.infringing_tokens.is_empty());
     assert_eq!(payload.legit_duplicates.len(), 1);
     assert_eq!(payload.legit_duplicates[0].contract_address, "0xdup");
@@ -3688,6 +3712,7 @@ async fn analyze_moves_official_reissues_into_legit_duplicates() {
         vec!["0xminter"]
     );
     assert_eq!(payload.report_summary.legit_duplicate_contract_count, 1);
+    assert_eq!(payload.report_summary.candidate_contract_count, 0);
     assert!(payload.content_similarity_edges.is_empty());
     assert!(payload
         .contract_lifecycle_events
@@ -4566,6 +4591,46 @@ async fn analyze_reuses_signal_cache_for_transfers_and_owners() {
         first.victim_signals["0xdup"],
         second.victim_signals["0xdup"]
     );
+}
+
+#[tokio::test]
+async fn analyze_rejects_signal_cache_rows_without_victim_signals() {
+    let deps = AnalysisDeps {
+        api: Arc::new(CountingApi::new()),
+        feature_store: Arc::new(FakeFeatureStore {
+            snapshot: DatabaseSnapshot {
+                nft_rows: vec![DatabaseNftRecord {
+                    contract_address: "0xdup".into(),
+                    token_id: "1".into(),
+                    token_uri: "ipfs://seed/1".into(),
+                    image_uri: "ipfs://image/1.png".into(),
+                    name: "Azuki Mirror #1".into(),
+                    symbol: "AZUKI".into(),
+                    metadata_json: r#"{"description":"gold dragon"}"#.into(),
+                    metadata_recall_checked: false,
+                    metadata_recall_match: false,
+                }],
+                ..DatabaseSnapshot::default()
+            },
+        }),
+        signal_cache: Some(Arc::new(MissingVictimSignalCache)),
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    let err = analyze_seed_contract(
+        AnalyzeRequest {
+            chain: "ethereum".into(),
+            seed_contract_address: "0xseed".into(),
+            alchemy_api_key: "key".into(),
+            ..AnalyzeRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .expect_err("cache rows without victim signals should be rejected");
+
+    assert!(err.to_string().contains("victim signals"));
 }
 
 #[tokio::test]

@@ -178,10 +178,7 @@ impl TerminalBatchProgressReporter {
             let mut state = self.state.lock().unwrap();
             let mut increment_completed = false;
             let message = {
-                let seed_state = state
-                    .seeds
-                    .entry(seed_address.to_string())
-                    .or_insert_with(SeedProgressState::default);
+                let seed_state = state.seeds.entry(seed_address.to_string()).or_default();
                 if let Some(stage_label) = stage_label {
                     seed_state.stage_label = stage_label;
                 }
@@ -271,10 +268,7 @@ impl BatchProgressReporter for TerminalBatchProgressReporter {
     fn create_seed_reporter(&self, seed_address: &str) -> Arc<dyn SeedProgressReporter> {
         {
             let mut state = self.state.lock().unwrap();
-            state
-                .seeds
-                .entry(seed_address.to_string())
-                .or_insert_with(SeedProgressState::default);
+            state.seeds.entry(seed_address.to_string()).or_default();
         }
         Arc::new(BatchSeedProgressReporter {
             seed_address: seed_address.to_string(),
@@ -298,10 +292,7 @@ impl BatchSeedProgressReporter {
         let (completed, total, running, workers, changed) = {
             let mut state = self.state.lock().unwrap();
             let changed = {
-                let seed_state = state
-                    .seeds
-                    .entry(self.seed_address.clone())
-                    .or_insert_with(SeedProgressState::default);
+                let seed_state = state.seeds.entry(self.seed_address.clone()).or_default();
                 let changed = seed_state.stage_label != stage_label
                     || contract_completed
                         .map(|value| value != seed_state.contract_completed)

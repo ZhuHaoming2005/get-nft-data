@@ -3,16 +3,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::analysis::scoring::{
-    metadata_document_from_json, metadata_is_dedup_eligible, metadata_recall_document,
-    score_metadata_indexed_pair_with_query, score_name_pair, MetadataBm25Corpus,
+    metadata_recall_document, score_metadata_indexed_pair_with_query, score_name_pair,
     MetadataBm25CorpusBuilder, MetadataBm25Document, MetadataBm25Query,
     MAX_METADATA_BYTES_FOR_DEDUP,
 };
 use crate::error::AppError;
-use crate::models::{
-    ContractDuplicateRecord, ContractNameRecord, ContractSignal, DatabaseNftRecord,
-    DatabaseSnapshot, SeedNft,
-};
+use crate::models::{ContractDuplicateRecord, DatabaseNftRecord, DatabaseSnapshot, SeedNft};
 use crate::normalize::{normalize_name, normalize_url};
 use duckdb::{params, AccessMode, Config, Connection};
 
@@ -21,11 +17,19 @@ const DEFAULT_RECALL_BATCH_SIZE: usize = 500_000;
 const SELECTED_RECALL_ROWID_CHUNK_SIZE: usize = 50_000;
 const BULK_IMPORT_CHECKPOINT_THRESHOLD: &str = "1TB";
 const BULK_IMPORT_SKIP_WAL_THRESHOLD_BYTES: u64 = 1_099_511_627_776;
+#[cfg(test)]
+const PREPARED_METADATA_DOC_BATCH_SIZE: usize = 2;
+#[cfg(not(test))]
+const PREPARED_METADATA_DOC_BATCH_SIZE: usize = 50_000;
 const SEED_TOKEN_URI_TABLE: &str = "__top_contract_analysis_seed_token_uri_keys";
 const SEED_IMAGE_URI_TABLE: &str = "__top_contract_analysis_seed_image_uri_keys";
 const SEED_TOKEN_ID_TABLE: &str = "__top_contract_analysis_seed_token_ids";
 const CANDIDATE_CONTRACT_TABLE: &str = "__top_contract_analysis_candidate_contracts";
+const SELECTED_RECALL_ROWID_TABLE: &str = "__top_contract_analysis_selected_recall_rowids";
 const CONTRACT_REPRESENTATIVE_TABLE: &str = "nft_contract_representatives";
+const FEATURE_RECALL_TABLE: &str = "nft_feature_recall_rows";
+const METADATA_RECALL_DOC_TABLE: &str = "nft_metadata_recall_docs";
+const PREPARED_RECALL_CHAIN_TABLE: &str = "nft_prepared_recall_chains";
 const METADATA_SKETCH_ANCHOR_COUNT: usize = 8;
 const METADATA_SKETCH_SOURCE_HAMMING_THRESHOLD: u32 = 24;
 const METADATA_SIMHASH_BAND_COUNT: usize = 8;
@@ -41,93 +45,15 @@ const REQUIRED_SNAPSHOT_COLUMNS: [&str; 4] = [
     "name_norm",
 ];
 
-#[derive(Clone)]
-struct RecallRow {
-    feature_rowid: i64,
-    contract_address: String,
-    token_id: String,
-    token_uri_norm: String,
-    image_uri_norm: String,
-    name_norm: String,
-    metadata_recall_match: bool,
-}
+mod support;
 
-struct SeedRecallProfile {
-    seed_address: String,
-    seed_contracts: HashSet<String>,
-    seed_token_ids: HashSet<String>,
-    exact_token_keys: HashSet<String>,
-    exact_image_keys: HashSet<String>,
-    seed_name_norms: Vec<String>,
-    seed_metadata_doc: Option<MetadataBm25Document>,
-}
-
-#[derive(Default)]
-struct SnapshotAccumulator {
-    per_contract_counts: HashMap<String, usize>,
-    nft_rows: Vec<DatabaseNftRecord>,
-    selected_rowids: HashMap<i64, usize>,
-    duplicate_rows_by_contract: HashMap<String, ContractDuplicateRecord>,
-    seen_contract_name_pairs: BTreeSet<(String, String)>,
-    seen_feature_rowids: HashSet<i64>,
-    contract_names: Vec<ContractNameRecord>,
-    contract_signals_raw: BTreeMap<String, ContractSignal>,
-}
-
-struct SeedRowMatch {
-    token_uri_match: bool,
-    image_uri_match: bool,
-    name_prefix_match: bool,
-    metadata_recall_match: bool,
-}
-
-struct SelectedRecallRow {
-    seed_index: usize,
-    row_index: usize,
-    row_match: SeedRowMatch,
-}
-
-struct PendingMetadataRecallRow {
-    seed_index: usize,
-    row: RecallRow,
-    row_match: SeedRowMatch,
-}
-
-struct SeedProfileIndex {
-    token_uri: HashMap<String, Vec<usize>>,
-    image_uri: HashMap<String, Vec<usize>>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct MetadataSketch {
-    simhash: u64,
-    anchors: Vec<String>,
-}
-
-#[derive(Clone)]
-struct MetadataRecallCandidate {
-    row: RecallRow,
-    doc: MetadataBm25Document,
-    sketch: MetadataSketch,
-}
-
-#[derive(Default)]
-struct MetadataSourceIndex {
-    anchor_indices: HashMap<String, Vec<usize>>,
-    simhash_band_indices: Vec<Vec<usize>>,
-}
-
-struct MetadataRecallIndex {
-    candidates: Vec<MetadataRecallCandidate>,
-    corpus: MetadataBm25Corpus,
-    doc_freqs: HashMap<String, usize>,
-    source_index: MetadataSourceIndex,
-}
+use support::*;
 
 pub struct DuckDbFeatureStore {
     conn: Mutex<Connection>,
     resource_options: DuckDbResourceOptions,
     metadata_recall_index_cache: Mutex<HashMap<String, Arc<MetadataRecallIndex>>>,
+    writable: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -148,450 +74,7 @@ impl Default for DuckDbResourceOptions {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn load_snapshot_recalls_metadata_from_only_one_seed_example() {
-        let store = DuckDbFeatureStore::new(":memory:").unwrap();
-        store
-            .replace_chain_rows(
-                "ethereum",
-                &[DatabaseNftRecord {
-                    contract_address: "0xcandidate".into(),
-                    token_id: "1".into(),
-                    metadata_json: r#"{"second_unique":"silver cat"}"#.into(),
-                    ..Default::default()
-                }],
-            )
-            .unwrap();
-        let seed_nfts = vec![
-            SeedNft {
-                contract_address: "0xseed".into(),
-                token_id: "1".into(),
-                metadata_json: r#"{"first_unique":"gold dragon"}"#.into(),
-                ..Default::default()
-            },
-            SeedNft {
-                contract_address: "0xseed".into(),
-                token_id: "2".into(),
-                metadata_json: r#"{"second_unique":"silver cat"}"#.into(),
-                ..Default::default()
-            },
-        ];
-
-        let snapshot = store
-            .load_snapshot("ethereum", &seed_nfts, 95.0, 0.6, 0, 0)
-            .unwrap();
-
-        assert!(snapshot.nft_rows.is_empty());
-    }
-
-    #[test]
-    fn load_snapshot_marks_rows_that_were_recalled_by_metadata() {
-        let store = DuckDbFeatureStore::new(":memory:").unwrap();
-        store
-            .replace_chain_rows(
-                "ethereum",
-                &[
-                    DatabaseNftRecord {
-                        contract_address: "0xmetadata".into(),
-                        token_id: "1".into(),
-                        metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                        ..Default::default()
-                    },
-                    DatabaseNftRecord {
-                        contract_address: "0ximage".into(),
-                        token_id: "1".into(),
-                        image_uri: "ipfs://seed-image.png".into(),
-                        ..Default::default()
-                    },
-                ],
-            )
-            .unwrap();
-        let seed_nfts = vec![SeedNft {
-            contract_address: "0xseed".into(),
-            token_id: "1".into(),
-            image_uri: "ipfs://seed-image.png".into(),
-            metadata_json: r#"{"description":"gold dragon"}"#.into(),
-            ..Default::default()
-        }];
-
-        let snapshot = store
-            .load_snapshot("ethereum", &seed_nfts, 95.0, 0.6, 0, 0)
-            .unwrap();
-        let by_contract: BTreeMap<_, _> = snapshot
-            .nft_rows
-            .iter()
-            .map(|row| (row.contract_address.as_str(), row))
-            .collect();
-
-        assert!(by_contract["0xmetadata"].metadata_recall_checked);
-        assert!(by_contract["0xmetadata"].metadata_recall_match);
-        assert!(by_contract["0ximage"].metadata_recall_checked);
-        assert!(!by_contract["0ximage"].metadata_recall_match);
-    }
-
-    #[test]
-    fn load_snapshot_uses_max_recall_rows_as_batch_size_not_total_limit() {
-        let store = DuckDbFeatureStore::new(":memory:").unwrap();
-        store
-            .replace_chain_rows(
-                "ethereum",
-                &[
-                    DatabaseNftRecord {
-                        contract_address: "0xcandidate_a".into(),
-                        token_id: "1".into(),
-                        token_uri: "ipfs://shared/1".into(),
-                        ..Default::default()
-                    },
-                    DatabaseNftRecord {
-                        contract_address: "0xcandidate_b".into(),
-                        token_id: "1".into(),
-                        token_uri: "ipfs://shared/1".into(),
-                        ..Default::default()
-                    },
-                ],
-            )
-            .unwrap();
-        let seed_nfts = vec![SeedNft {
-            contract_address: "0xseed".into(),
-            token_id: "1".into(),
-            token_uri: "ipfs://shared/1".into(),
-            ..Default::default()
-        }];
-
-        let snapshot = store
-            .load_snapshot("ethereum", &seed_nfts, 95.0, 0.6, 0, 1)
-            .unwrap();
-        let contracts: Vec<_> = snapshot
-            .nft_rows
-            .iter()
-            .map(|row| row.contract_address.as_str())
-            .collect();
-
-        assert_eq!(contracts, vec!["0xcandidate_a", "0xcandidate_b"]);
-    }
-
-    #[test]
-    fn duplicate_contract_row_uses_precomputed_name_pair_uniqueness() {
-        let record = DatabaseNftRecord {
-            contract_address: "0xcandidate".into(),
-            token_id: "1".into(),
-            ..Default::default()
-        };
-        let mut rows_by_contract = HashMap::new();
-
-        update_duplicate_contract_row(
-            &mut rows_by_contract,
-            &record,
-            false,
-            false,
-            "azuki",
-            true,
-            false,
-        );
-        update_duplicate_contract_row(
-            &mut rows_by_contract,
-            &record,
-            false,
-            false,
-            "azuki",
-            false,
-            false,
-        );
-
-        assert_eq!(
-            rows_by_contract["0xcandidate"].name_norms,
-            vec!["azuki".to_string()]
-        );
-    }
-
-    #[test]
-    fn load_snapshot_recalls_metadata_without_persistent_keyword_index() {
-        let store = DuckDbFeatureStore::new(":memory:").unwrap();
-        store
-            .replace_chain_rows(
-                "ethereum",
-                &[DatabaseNftRecord {
-                    contract_address: "0xcandidate".into(),
-                    token_id: "1".into(),
-                    metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                    ..Default::default()
-                }],
-            )
-            .unwrap();
-
-        let conn = store.conn().unwrap();
-        let has_persistent_index = conn
-            .query_row(
-                "
-                SELECT EXISTS(
-                    SELECT 1
-                    FROM information_schema.tables
-                    WHERE table_name = 'metadata_keyword_index'
-                )
-                ",
-                [],
-                |row| row.get::<_, bool>(0),
-            )
-            .unwrap();
-        drop(conn);
-        let snapshot = store
-            .load_snapshot(
-                "ethereum",
-                &[SeedNft {
-                    contract_address: "0xseed".into(),
-                    token_id: "1".into(),
-                    metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                    ..Default::default()
-                }],
-                95.0,
-                0.6,
-                0,
-                0,
-            )
-            .unwrap();
-
-        assert!(!has_persistent_index);
-        assert_eq!(snapshot.duplicate_contract_rows.len(), 1);
-        assert!(snapshot.contract_signals["0xcandidate"].keyword_match);
-    }
-
-    #[test]
-    fn opening_existing_feature_db_does_not_backfill_persistent_metadata_keyword_index() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("features.duckdb");
-        {
-            let conn = Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                "
-                CREATE TABLE nft_features (
-                    chain VARCHAR NOT NULL,
-                    contract_address VARCHAR NOT NULL,
-                    token_id VARCHAR NOT NULL,
-                    token_uri VARCHAR,
-                    image_uri VARCHAR,
-                    name VARCHAR,
-                    symbol VARCHAR,
-                    metadata_json VARCHAR,
-                    token_uri_norm VARCHAR,
-                    image_uri_norm VARCHAR,
-                    name_norm VARCHAR
-                );
-                INSERT INTO nft_features VALUES (
-                    'ethereum', '0xcandidate', '1', '', '', '', '', '{\"description\":\"gold dragon\"}',
-                    '', '', ''
-                );
-                ",
-            )
-            .unwrap();
-        }
-
-        let store = DuckDbFeatureStore::new(&db_path.to_string_lossy()).unwrap();
-        let conn = store.conn().unwrap();
-        let has_persistent_index = conn
-            .query_row(
-                "
-                SELECT EXISTS(
-                    SELECT 1
-                    FROM information_schema.tables
-                    WHERE table_name = 'metadata_keyword_index'
-                )
-                ",
-                [],
-                |row| row.get::<_, bool>(0),
-            )
-            .unwrap();
-        drop(conn);
-        let snapshot = store
-            .load_snapshot(
-                "ethereum",
-                &[SeedNft {
-                    contract_address: "0xseed".into(),
-                    token_id: "1".into(),
-                    metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                    ..Default::default()
-                }],
-                95.0,
-                0.6,
-                0,
-                0,
-            )
-            .unwrap();
-
-        assert!(!has_persistent_index);
-        assert_eq!(snapshot.duplicate_contract_rows.len(), 1);
-    }
-
-    #[test]
-    fn replace_chain_rows_populates_contract_representatives() {
-        let store = DuckDbFeatureStore::new(":memory:").unwrap();
-        store
-            .replace_chain_rows(
-                "ethereum",
-                &[
-                    DatabaseNftRecord {
-                        contract_address: "0xdup".into(),
-                        token_id: "2".into(),
-                        name: "Zed Clone".into(),
-                        metadata_json: r#"{"description":"silver cat"}"#.into(),
-                        ..Default::default()
-                    },
-                    DatabaseNftRecord {
-                        contract_address: "0xdup".into(),
-                        token_id: "1".into(),
-                        name: "Alpha Clone".into(),
-                        metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                        ..Default::default()
-                    },
-                ],
-            )
-            .unwrap();
-
-        let conn = store.conn().unwrap();
-        let (contract_address, name_token_id, metadata_token_id): (String, String, String) = conn
-            .query_row(
-                "
-                SELECT r.contract_address, name_row.token_id, metadata_row.token_id
-                FROM nft_contract_representatives r
-                JOIN nft_features name_row ON name_row.rowid = r.name_feature_rowid
-                JOIN nft_features metadata_row ON metadata_row.rowid = r.metadata_feature_rowid
-                WHERE r.chain = 'ethereum'
-                ",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-
-        assert_eq!(contract_address, "0xdup");
-        assert_eq!(name_token_id, "1");
-        assert_eq!(metadata_token_id, "1");
-    }
-
-    #[test]
-    fn load_snapshot_reuses_and_invalidates_metadata_recall_index_cache() {
-        let store = DuckDbFeatureStore::new(":memory:").unwrap();
-        store
-            .replace_chain_rows(
-                "ethereum",
-                &[DatabaseNftRecord {
-                    contract_address: "0xdup".into(),
-                    token_id: "1".into(),
-                    metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                    ..Default::default()
-                }],
-            )
-            .unwrap();
-        let seed = vec![SeedNft {
-            chain: "ethereum".into(),
-            contract_address: "0xseed".into(),
-            token_id: "1".into(),
-            metadata_json: r#"{"description":"gold dragon"}"#.into(),
-            ..Default::default()
-        }];
-
-        assert_eq!(store.metadata_recall_index_cache_len(), 0);
-        store
-            .load_snapshot("ethereum", &seed, 101.0, 0.6, 0, 0)
-            .unwrap();
-        assert_eq!(store.metadata_recall_index_cache_len(), 1);
-        store
-            .load_snapshot("ethereum", &seed, 101.0, 0.6, 0, 0)
-            .unwrap();
-        assert_eq!(store.metadata_recall_index_cache_len(), 1);
-
-        store
-            .replace_chain_rows(
-                "ethereum",
-                &[DatabaseNftRecord {
-                    contract_address: "0xother".into(),
-                    token_id: "1".into(),
-                    metadata_json: r#"{"description":"silver cat"}"#.into(),
-                    ..Default::default()
-                }],
-            )
-            .unwrap();
-        assert_eq!(store.metadata_recall_index_cache_len(), 0);
-    }
-
-    #[test]
-    fn opening_writable_feature_db_drops_obsolete_metadata_columns() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("features.duckdb");
-        {
-            let conn = Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                "
-                CREATE TABLE nft_features (
-                    chain VARCHAR NOT NULL,
-                    contract_address VARCHAR NOT NULL,
-                    token_id VARCHAR NOT NULL,
-                    token_uri VARCHAR,
-                    image_uri VARCHAR,
-                    name VARCHAR,
-                    symbol VARCHAR,
-                    metadata_json VARCHAR,
-                    token_uri_norm VARCHAR,
-                    image_uri_norm VARCHAR,
-                    name_norm VARCHAR,
-                    metadata_doc VARCHAR,
-                    name_prefix8 VARCHAR,
-                    metadata_keywords_arr VARCHAR
-                );
-                INSERT INTO nft_features VALUES (
-                    'ethereum', '0xcandidate', '1', '', '', '', '', '{\"description\":\"gold dragon\"}',
-                    '', '', '', 'gold dragon', '', '[\"description\",\"dragon\",\"gold\"]'
-                );
-                ",
-            )
-            .unwrap();
-        }
-
-        let store = DuckDbFeatureStore::new(&db_path.to_string_lossy()).unwrap();
-        let conn = store.conn().unwrap();
-        let columns = DuckDbFeatureStore::table_columns(&conn, "nft_features").unwrap();
-        let row_count: i64 = conn
-            .query_row("SELECT count(*) FROM nft_features", [], |row| row.get(0))
-            .unwrap();
-
-        assert!(!columns.contains("metadata_doc"));
-        assert!(!columns.contains("name_prefix8"));
-        assert!(!columns.contains("metadata_keywords_arr"));
-        assert_eq!(row_count, 1);
-    }
-
-    #[test]
-    fn feature_store_configures_bulk_import_checkpoint_limits() {
-        let store = DuckDbFeatureStore::new(":memory:").unwrap();
-        let conn = store.conn().unwrap();
-        let checkpoint_threshold: String = conn
-            .query_row(
-                "SELECT current_setting('checkpoint_threshold')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let skip_wal_threshold: u64 = conn
-            .query_row(
-                "SELECT current_setting('auto_checkpoint_skip_wal_threshold')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let write_buffer_row_group_count: u64 = conn
-            .query_row(
-                "SELECT current_setting('write_buffer_row_group_count')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-
-        assert!(checkpoint_threshold.contains("GiB"));
-        assert_eq!(skip_wal_threshold, BULK_IMPORT_SKIP_WAL_THRESHOLD_BYTES);
-        assert_eq!(write_buffer_row_group_count, 1);
-    }
-}
+mod tests;
 
 impl DuckDbResourceOptions {
     pub fn from_cli(threads: usize, memory_limit: &str) -> Result<Self, AppError> {
@@ -620,433 +103,16 @@ fn validate_duckdb_memory_limit(value: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-fn seed_metadata_representative_doc(seed_nfts: &[SeedNft]) -> Option<MetadataBm25Document> {
-    seed_nfts.first().and_then(|item| {
-        let doc = metadata_recall_document(&item.metadata_json);
-        MetadataBm25Document::from_text(&doc)
-    })
-}
-
-impl SeedRecallProfile {
-    fn new(seed_address: String, seed_nfts: &[SeedNft]) -> Self {
-        Self {
-            seed_address,
-            seed_contracts: seed_nfts
-                .iter()
-                .map(|item| item.contract_address.to_lowercase())
-                .collect(),
-            seed_token_ids: seed_nfts
-                .iter()
-                .map(|item| item.token_id.clone())
-                .filter(|value| !value.is_empty())
-                .collect(),
-            exact_token_keys: seed_nfts
-                .iter()
-                .filter_map(|item| normalize_url(&item.token_uri))
-                .collect(),
-            exact_image_keys: seed_nfts
-                .iter()
-                .filter_map(|item| normalize_url(&item.image_uri))
-                .collect(),
-            seed_name_norms: seed_nfts
-                .iter()
-                .map(|item| normalize_name(&item.name))
-                .filter(|value| !value.is_empty())
-                .collect(),
-            seed_metadata_doc: seed_metadata_representative_doc(seed_nfts),
-        }
-    }
-
-    fn has_strong_recall_keys(&self) -> bool {
-        !self.exact_token_keys.is_empty()
-            || !self.exact_image_keys.is_empty()
-            || !self.seed_name_norms.is_empty()
-    }
-}
-
-impl SnapshotAccumulator {
-    fn push_recall_row(
-        &mut self,
-        profile: &SeedRecallProfile,
-        row: &RecallRow,
-        mut record: DatabaseNftRecord,
-        row_match: &SeedRowMatch,
-        max_tokens_per_contract: usize,
-    ) {
-        if profile.seed_contracts.contains(&row.contract_address) {
-            return;
-        }
-
-        if self.seen_feature_rowids.contains(&row.feature_rowid) {
-            return;
-        }
-
-        let entry = self
-            .per_contract_counts
-            .entry(row.contract_address.clone())
-            .or_default();
-        if max_tokens_per_contract > 0 && *entry >= max_tokens_per_contract {
-            return;
-        }
-        *entry += 1;
-        self.seen_feature_rowids.insert(row.feature_rowid);
-        self.selected_rowids
-            .insert(row.feature_rowid, self.nft_rows.len());
-
-        record.metadata_recall_checked = true;
-        record.metadata_recall_match = row_match.metadata_recall_match;
-
-        let name_pair_is_new = !row.name_norm.is_empty()
-            && self
-                .seen_contract_name_pairs
-                .insert((record.contract_address.clone(), row.name_norm.clone()));
-        if name_pair_is_new {
-            self.contract_names.push(ContractNameRecord {
-                contract_address: record.contract_address.clone(),
-                name_norm: row.name_norm.clone(),
-            });
-        }
-
-        let signal = self
-            .contract_signals_raw
-            .entry(record.contract_address.clone())
-            .or_insert_with(|| ContractSignal {
-                contract_address: record.contract_address.clone(),
-                ..ContractSignal::default()
-            });
-        signal.token_count += 1;
-        if row_match.token_uri_match {
-            signal.uri_match_count += 1;
-        }
-        if row_match.image_uri_match {
-            signal.image_match_count += 1;
-        }
-        if row_match.name_prefix_match {
-            signal.name_prefix_match = true;
-        }
-        if row_match.metadata_recall_match {
-            signal.keyword_match = true;
-        }
-
-        update_duplicate_contract_row(
-            &mut self.duplicate_rows_by_contract,
-            &record,
-            row_match.token_uri_match,
-            row_match.image_uri_match,
-            &row.name_norm,
-            name_pair_is_new,
-            row_match.metadata_recall_match,
-        );
-        self.nft_rows.push(record);
-    }
-
-    fn mark_selected_metadata_recall(&mut self, row: &RecallRow) -> bool {
-        let Some(index) = self.selected_rowids.get(&row.feature_rowid).copied() else {
-            return false;
-        };
-        let Some(record) = self.nft_rows.get_mut(index) else {
-            return false;
-        };
-        record.metadata_recall_checked = true;
-        record.metadata_recall_match = true;
-        let record = record.clone();
-
-        if let Some(signal) = self.contract_signals_raw.get_mut(&record.contract_address) {
-            signal.keyword_match = true;
-        }
-        if let Some(entry) = self
-            .duplicate_rows_by_contract
-            .get_mut(&record.contract_address)
-        {
-            entry.metadata_recall_checked = true;
-            entry.metadata_recall_match = true;
-            for token_row in &mut entry.metadata_token_rows {
-                if token_row.token_id == record.token_id {
-                    token_row.metadata_recall_checked = true;
-                    token_row.metadata_recall_match = true;
-                }
-            }
-            if !entry.representative.metadata_recall_match
-                || record.token_id < entry.representative.token_id
-            {
-                entry.representative = record;
-            }
-        }
-        true
-    }
-
-    fn finish(self) -> DatabaseSnapshot {
-        let mut duplicate_contract_rows: Vec<_> =
-            self.duplicate_rows_by_contract.into_values().collect();
-        for row in &mut duplicate_contract_rows {
-            row.metadata_token_rows
-                .sort_by(|left, right| left.token_id.cmp(&right.token_id));
-        }
-        duplicate_contract_rows
-            .sort_by(|left, right| left.contract_address.cmp(&right.contract_address));
-
-        DatabaseSnapshot {
-            nft_rows: self.nft_rows,
-            duplicate_contract_rows,
-            contract_names: self.contract_names,
-            contract_signals: self.contract_signals_raw,
-        }
-    }
-}
-
-impl SeedProfileIndex {
-    fn new(profiles: &[SeedRecallProfile]) -> Self {
-        let mut index = Self {
-            token_uri: HashMap::new(),
-            image_uri: HashMap::new(),
-        };
-        for (profile_index, profile) in profiles.iter().enumerate() {
-            Self::insert_values(
-                &mut index.token_uri,
-                &profile.exact_token_keys,
-                profile_index,
-            );
-            Self::insert_values(
-                &mut index.image_uri,
-                &profile.exact_image_keys,
-                profile_index,
-            );
-        }
-        index
-    }
-
-    fn insert_values(
-        target: &mut HashMap<String, Vec<usize>>,
-        values: &HashSet<String>,
-        profile_index: usize,
-    ) {
-        for value in values {
-            if value.is_empty() {
-                continue;
-            }
-            target.entry(value.clone()).or_default().push(profile_index);
-        }
-    }
-
-    fn append_matching_profiles(
-        target: &mut Vec<usize>,
-        source: &HashMap<String, Vec<usize>>,
-        value: &str,
-    ) {
-        if value.is_empty() {
-            return;
-        }
-        let Some(profile_indices) = source.get(value) else {
-            return;
-        };
-        for profile_index in profile_indices {
-            if !target.contains(profile_index) {
-                target.push(*profile_index);
-            }
-        }
-    }
-
-    fn strong_match_profiles(&self, row: &RecallRow) -> Vec<usize> {
-        let mut matches = Vec::new();
-        Self::append_matching_profiles(&mut matches, &self.token_uri, &row.token_uri_norm);
-        Self::append_matching_profiles(&mut matches, &self.image_uri, &row.image_uri_norm);
-        matches
-    }
-}
-
-fn metadata_token_idf(total_docs: usize, doc_freq: usize) -> f64 {
-    (((total_docs + 1) as f64) / ((doc_freq + 1) as f64)).ln() + 1.0
-}
-
-fn metadata_token_is_high_frequency(total_docs: usize, doc_freq: usize) -> bool {
-    doc_freq >= METADATA_SKETCH_HIGH_FREQ_MIN_DOCS
-        && doc_freq.saturating_mul(METADATA_SKETCH_HIGH_FREQ_DIVISOR) > total_docs
-}
-
-fn stable_token_hash(token: &str) -> u64 {
-    let mut value = 0xcbf2_9ce4_8422_2325u64;
-    for byte in token.as_bytes() {
-        value ^= u64::from(*byte);
-        value = value.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
-}
-
-fn metadata_simhash_from_weights(weights: [f64; 64]) -> u64 {
-    let mut simhash = 0u64;
-    for (bit, weight) in weights.into_iter().enumerate() {
-        if weight >= 0.0 {
-            simhash |= 1u64 << bit;
-        }
-    }
-    simhash
-}
-
-fn compare_metadata_anchor_quality(
-    left: &(String, f64),
-    right: &(String, f64),
-) -> std::cmp::Ordering {
-    left.1
-        .partial_cmp(&right.1)
-        .unwrap_or(std::cmp::Ordering::Equal)
-        .then_with(|| right.0.cmp(&left.0))
-}
-
-fn push_metadata_anchor_candidate(anchors: &mut Vec<(String, f64)>, candidate: (String, f64)) {
-    if anchors.len() < METADATA_SKETCH_ANCHOR_COUNT {
-        anchors.push(candidate);
-        return;
-    }
-
-    let Some((worst_index, worst_anchor)) = anchors
-        .iter()
-        .enumerate()
-        .min_by(|(_, left), (_, right)| compare_metadata_anchor_quality(left, right))
-    else {
-        return;
-    };
-    if compare_metadata_anchor_quality(&candidate, worst_anchor).is_gt() {
-        anchors[worst_index] = candidate;
-    }
-}
-
-fn metadata_sketch_from_document(
-    document: &MetadataBm25Document,
-    total_docs: usize,
-    doc_freqs: &HashMap<String, usize>,
-) -> MetadataSketch {
-    let mut weights = [0.0f64; 64];
-    let mut anchors = Vec::<(String, f64)>::new();
-    let unique_tokens = document.tokens().iter().collect::<BTreeSet<_>>();
-    for token in unique_tokens {
-        let df = doc_freqs.get(token).copied().unwrap_or(0);
-        let idf = metadata_token_idf(total_docs, df);
-        let token_hash = stable_token_hash(token);
-        for (bit, weight) in weights.iter_mut().enumerate() {
-            if ((token_hash >> bit) & 1) == 1 {
-                *weight += idf;
-            } else {
-                *weight -= idf;
-            }
-        }
-        if metadata_token_is_high_frequency(total_docs, df) {
-            continue;
-        }
-        push_metadata_anchor_candidate(&mut anchors, ((*token).clone(), idf));
-    }
-    let mut anchors = anchors
-        .into_iter()
-        .map(|(token, _)| token)
-        .collect::<Vec<_>>();
-    anchors.sort();
-    MetadataSketch {
-        simhash: metadata_simhash_from_weights(weights),
-        anchors,
-    }
-}
-
-fn metadata_simhash_band_key(band_index: usize, band_value: u8) -> usize {
-    band_index * METADATA_SIMHASH_BAND_VALUES + band_value as usize
-}
-
-fn metadata_simhash_band_value(simhash: u64, band_index: usize) -> u8 {
-    ((simhash >> (band_index * METADATA_SIMHASH_BAND_BITS)) & 0xff) as u8
-}
-
-fn sorted_strings_intersect(left: &[String], right: &[String]) -> bool {
-    let mut left_index = 0;
-    let mut right_index = 0;
-    while left_index < left.len() && right_index < right.len() {
-        match left[left_index].cmp(&right[right_index]) {
-            std::cmp::Ordering::Equal => return true,
-            std::cmp::Ordering::Less => left_index += 1,
-            std::cmp::Ordering::Greater => right_index += 1,
-        }
-    }
-    false
-}
-
-fn metadata_sketch_source_match(
-    seed: &MetadataSketch,
-    candidate: &MetadataSketch,
-    hamming_threshold: u32,
-) -> bool {
-    if (seed.simhash == 0 && seed.anchors.is_empty())
-        || (candidate.simhash == 0 && candidate.anchors.is_empty())
-    {
-        return false;
-    }
-    if !seed.anchors.is_empty() && sorted_strings_intersect(&seed.anchors, &candidate.anchors) {
-        return true;
-    }
-    (seed.simhash ^ candidate.simhash).count_ones() <= hamming_threshold
-}
-
-fn metadata_seed_doc_for_index(
-    seed_doc: &MetadataBm25Document,
-    metadata_index: &MetadataRecallIndex,
-) -> Option<MetadataBm25Document> {
-    let tokens = seed_doc
-        .tokens()
-        .iter()
-        .filter(|token| metadata_index.doc_freqs.contains_key(*token))
-        .cloned()
-        .collect::<Vec<_>>();
-    MetadataBm25Document::from_tokens(tokens)
-}
-
-fn update_duplicate_contract_row(
-    rows_by_contract: &mut HashMap<String, ContractDuplicateRecord>,
-    record: &DatabaseNftRecord,
-    token_uri_match: bool,
-    image_uri_match: bool,
-    name_norm: &str,
-    name_pair_is_new: bool,
-    metadata_recall_match: bool,
-) {
-    let entry = rows_by_contract
-        .entry(record.contract_address.clone())
-        .or_insert_with(|| ContractDuplicateRecord {
-            contract_address: record.contract_address.clone(),
-            representative: record.clone(),
-            ..ContractDuplicateRecord::default()
-        });
-
-    entry.token_uri_match |= token_uri_match;
-    entry.image_uri_match |= image_uri_match;
-    if name_pair_is_new && !name_norm.is_empty() {
-        entry.name_norms.push(name_norm.to_string());
-    }
-    push_metadata_token_row(entry, record);
-
-    entry.metadata_recall_checked = true;
-    entry.metadata_recall_match |= metadata_recall_match;
-    let should_update_representative = metadata_recall_match
-        && (!entry.representative.metadata_recall_match
-            || record.token_id < entry.representative.token_id);
-    if !should_update_representative {
-        return;
-    }
-    entry.representative = record.clone();
-}
-
-fn push_metadata_token_row(entry: &mut ContractDuplicateRecord, record: &DatabaseNftRecord) {
-    if !metadata_is_dedup_eligible(&record.metadata_json) {
-        return;
-    }
-    if metadata_document_from_json(&record.metadata_json).is_empty() {
-        return;
-    }
-    if entry
-        .metadata_token_rows
-        .iter()
-        .any(|row| row.token_id == record.token_id)
-    {
-        return;
-    }
-    entry.metadata_token_rows.push(record.clone());
+struct ExactUriRecallInput<'a> {
+    chain: &'a str,
+    profiles: &'a [SeedRecallProfile],
+    profile_index: &'a SeedProfileIndex,
+    all_token_keys: &'a HashSet<String>,
+    all_image_keys: &'a HashSet<String>,
+    name_threshold: f64,
+    max_tokens_per_contract: usize,
+    max_recall_rows: usize,
+    prepared_recall_state: PreparedRecallState,
 }
 
 impl DuckDbFeatureStore {
@@ -1084,13 +150,14 @@ impl DuckDbFeatureStore {
             );
             ",
         )?;
-        Self::create_contract_representative_table(&conn)?;
+        Self::create_prepared_recall_tables(&conn)?;
         Self::drop_obsolete_nft_feature_columns(&conn)?;
         Self::validate_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             resource_options,
             metadata_recall_index_cache: Mutex::new(HashMap::new()),
+            writable: true,
         })
     }
 
@@ -1114,6 +181,7 @@ impl DuckDbFeatureStore {
             conn: Mutex::new(conn),
             resource_options,
             metadata_recall_index_cache: Mutex::new(HashMap::new()),
+            writable: false,
         })
     }
 
@@ -1213,6 +281,61 @@ impl DuckDbFeatureStore {
         Ok(())
     }
 
+    fn create_prepared_recall_tables(conn: &Connection) -> Result<(), AppError> {
+        Self::create_contract_representative_table(conn)?;
+        conn.execute_batch(&format!(
+            "
+            CREATE TABLE IF NOT EXISTS {FEATURE_RECALL_TABLE} (
+                chain VARCHAR NOT NULL,
+                feature_rowid BIGINT NOT NULL,
+                contract_address VARCHAR NOT NULL,
+                token_id VARCHAR NOT NULL,
+                token_uri_norm VARCHAR,
+                image_uri_norm VARCHAR,
+                name_norm VARCHAR,
+                name_sort VARCHAR
+            );
+            CREATE TABLE IF NOT EXISTS {METADATA_RECALL_DOC_TABLE} (
+                chain VARCHAR NOT NULL,
+                feature_rowid BIGINT NOT NULL,
+                contract_address VARCHAR NOT NULL,
+                token_id VARCHAR NOT NULL,
+                token_uri_norm VARCHAR,
+                image_uri_norm VARCHAR,
+                name_norm VARCHAR,
+                recall_doc VARCHAR NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS {PREPARED_RECALL_CHAIN_TABLE} (
+                chain VARCHAR NOT NULL,
+                feature_row_count BIGINT,
+                max_feature_rowid BIGINT,
+                feature_fingerprint VARCHAR
+            );
+            "
+        ))?;
+        Self::ensure_prepared_recall_chain_columns(conn)?;
+        Ok(())
+    }
+
+    fn ensure_prepared_recall_chain_columns(conn: &Connection) -> Result<(), AppError> {
+        let columns = Self::table_columns(conn, PREPARED_RECALL_CHAIN_TABLE)?;
+        for (column, definition) in [
+            ("feature_row_count", "BIGINT DEFAULT -1"),
+            ("max_feature_rowid", "BIGINT DEFAULT -1"),
+            ("feature_fingerprint", "VARCHAR DEFAULT ''"),
+        ] {
+            if !columns.contains(column) {
+                conn.execute(
+                    &format!(
+                        "ALTER TABLE {PREPARED_RECALL_CHAIN_TABLE} ADD COLUMN {column} {definition}"
+                    ),
+                    [],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, AppError> {
         let exists = conn.query_row(
             "
@@ -1228,18 +351,105 @@ impl DuckDbFeatureStore {
         Ok(exists)
     }
 
-    fn contract_representatives_have_chain(
-        conn: &Connection,
-        chain: &str,
-    ) -> Result<bool, AppError> {
+    fn table_has_chain(conn: &Connection, table_name: &str, chain: &str) -> Result<bool, AppError> {
+        if !Self::table_exists(conn, table_name)? {
+            return Ok(false);
+        }
         let exists = conn.query_row(
-            &format!(
-                "SELECT EXISTS(SELECT 1 FROM {CONTRACT_REPRESENTATIVE_TABLE} WHERE chain = ? LIMIT 1)"
-            ),
+            &format!("SELECT EXISTS(SELECT 1 FROM {table_name} WHERE chain = ? LIMIT 1)"),
             params![chain],
             |row| row.get::<_, bool>(0),
         )?;
         Ok(exists)
+    }
+
+    fn prepared_recall_state(
+        conn: &Connection,
+        chain: &str,
+    ) -> Result<PreparedRecallState, AppError> {
+        let tables_exist = Self::table_exists(conn, CONTRACT_REPRESENTATIVE_TABLE)?
+            && Self::table_exists(conn, FEATURE_RECALL_TABLE)?
+            && Self::table_exists(conn, METADATA_RECALL_DOC_TABLE)?
+            && Self::table_exists(conn, PREPARED_RECALL_CHAIN_TABLE)?;
+        if !tables_exist {
+            return Ok(PreparedRecallState { ready: false });
+        }
+        let prepared_columns = Self::table_columns(conn, PREPARED_RECALL_CHAIN_TABLE)?;
+        if !prepared_columns.contains("feature_row_count")
+            || !prepared_columns.contains("max_feature_rowid")
+            || !prepared_columns.contains("feature_fingerprint")
+        {
+            return Ok(PreparedRecallState { ready: false });
+        }
+        let current_stats = Self::feature_chain_stats(conn, chain)?;
+        let prepared_stats = Self::prepared_recall_chain_stats(conn, chain)?;
+        let recall_row_count = Self::chain_row_count(conn, FEATURE_RECALL_TABLE, chain)?;
+        Ok(PreparedRecallState {
+            ready: prepared_stats.as_ref() == Some(&current_stats)
+                && recall_row_count == current_stats.row_count,
+        })
+    }
+
+    fn chain_row_count(conn: &Connection, table_name: &str, chain: &str) -> Result<i64, AppError> {
+        if !Self::table_exists(conn, table_name)? {
+            return Ok(0);
+        }
+        let count = conn.query_row(
+            &format!("SELECT CAST(count(*) AS BIGINT) FROM {table_name} WHERE chain = ?"),
+            params![chain],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count)
+    }
+
+    fn feature_chain_stats(conn: &Connection, chain: &str) -> Result<FeatureChainStats, AppError> {
+        conn.query_row(
+            "
+            SELECT
+                CAST(count(*) AS BIGINT) AS row_count,
+                CAST(coalesce(max(rowid), -1) AS BIGINT) AS max_feature_rowid,
+                CAST(coalesce(sum(rowid), -1) AS VARCHAR) AS feature_fingerprint
+            FROM nft_features
+            WHERE chain = ?
+            ",
+            params![chain],
+            |row| {
+                Ok(FeatureChainStats {
+                    row_count: row.get(0)?,
+                    max_feature_rowid: row.get(1)?,
+                    fingerprint: row.get(2)?,
+                })
+            },
+        )
+        .map_err(AppError::from)
+    }
+
+    fn prepared_recall_chain_stats(
+        conn: &Connection,
+        chain: &str,
+    ) -> Result<Option<FeatureChainStats>, AppError> {
+        let mut stmt = conn.prepare(&format!(
+            "
+            SELECT
+                coalesce(feature_row_count, -1),
+                coalesce(max_feature_rowid, -1),
+                coalesce(feature_fingerprint, '')
+            FROM {PREPARED_RECALL_CHAIN_TABLE}
+            WHERE chain = ?
+            LIMIT 1
+            "
+        ))?;
+        let mut rows = stmt.query_map(params![chain], |row| {
+            Ok(FeatureChainStats {
+                row_count: row.get(0)?,
+                max_feature_rowid: row.get(1)?,
+                fingerprint: row.get(2)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
     }
 
     fn refresh_contract_representatives_for_chain(
@@ -1304,21 +514,180 @@ impl DuckDbFeatureStore {
         Ok(())
     }
 
-    fn ensure_contract_representatives(conn: &Connection, chain: &str) -> Result<bool, AppError> {
-        if !Self::table_exists(conn, CONTRACT_REPRESENTATIVE_TABLE)? {
-            return Ok(false);
+    fn refresh_feature_recall_rows_for_chain(
+        conn: &Connection,
+        chain: &str,
+    ) -> Result<(), AppError> {
+        conn.execute(
+            &format!("DELETE FROM {FEATURE_RECALL_TABLE} WHERE chain = ?"),
+            params![chain],
+        )?;
+        let sql = format!(
+            "
+            INSERT INTO {FEATURE_RECALL_TABLE} (
+                chain, feature_rowid, contract_address, token_id, token_uri_norm,
+                image_uri_norm, name_norm, name_sort
+            )
+            SELECT
+                chain,
+                rowid AS feature_rowid,
+                lower(CAST(contract_address AS VARCHAR)) AS contract_address,
+                CAST(token_id AS VARCHAR) AS token_id,
+                coalesce(CAST(token_uri_norm AS VARCHAR), '') AS token_uri_norm,
+                coalesce(CAST(image_uri_norm AS VARCHAR), '') AS image_uri_norm,
+                coalesce(CAST(name_norm AS VARCHAR), '') AS name_norm,
+                trim(coalesce(CAST(name AS VARCHAR), '')) AS name_sort
+            FROM nft_features
+            WHERE chain = ?
+            "
+        );
+        conn.execute(&sql, params![chain])?;
+        Ok(())
+    }
+
+    fn refresh_metadata_recall_docs_for_chain(
+        conn: &Connection,
+        chain: &str,
+    ) -> Result<(), AppError> {
+        conn.execute(
+            &format!("DELETE FROM {METADATA_RECALL_DOC_TABLE} WHERE chain = ?"),
+            params![chain],
+        )?;
+        let mut insert = conn.prepare(&format!(
+            "
+            INSERT INTO {METADATA_RECALL_DOC_TABLE} (
+                chain, feature_rowid, contract_address, token_id, token_uri_norm,
+                image_uri_norm, name_norm, recall_doc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "
+        ))?;
+        let mut last_feature_rowid = -1_i64;
+        loop {
+            let sql = format!(
+                "
+                SELECT f.rowid, lower(CAST(f.contract_address AS VARCHAR)) AS contract_address,
+                       CAST(f.token_id AS VARCHAR) AS token_id,
+                       coalesce(CAST(f.token_uri_norm AS VARCHAR), '') AS token_uri_norm,
+                       coalesce(CAST(f.image_uri_norm AS VARCHAR), '') AS image_uri_norm,
+                       coalesce(CAST(f.name_norm AS VARCHAR), '') AS name_norm,
+                       coalesce(CAST(f.metadata_json AS VARCHAR), '') AS metadata_json
+                FROM {CONTRACT_REPRESENTATIVE_TABLE} r
+                JOIN nft_features f ON f.rowid = r.metadata_feature_rowid
+                WHERE r.chain = ?
+                  AND r.metadata_feature_rowid IS NOT NULL
+                  AND f.rowid > {last_feature_rowid}
+                  AND {}
+                ORDER BY f.rowid
+                LIMIT {PREPARED_METADATA_DOC_BATCH_SIZE}
+                ",
+                Self::sql_metadata_json_eligible_predicate()
+                    .replace("metadata_json", "f.metadata_json")
+            );
+            let rows = {
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(params![chain], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                })?;
+                let mut collected = Vec::new();
+                for row in rows {
+                    collected.push(row?);
+                }
+                collected
+            };
+            if rows.is_empty() {
+                break;
+            }
+            let fetched_rows = rows.len();
+            for (
+                feature_rowid,
+                contract_address,
+                token_id,
+                token_uri_norm,
+                image_uri_norm,
+                name_norm,
+                metadata_json,
+            ) in rows
+            {
+                last_feature_rowid = feature_rowid;
+                let recall_doc = metadata_recall_document(&metadata_json);
+                if MetadataBm25Document::from_text(&recall_doc).is_none() {
+                    continue;
+                }
+                insert.execute(params![
+                    chain,
+                    feature_rowid,
+                    contract_address,
+                    token_id,
+                    token_uri_norm,
+                    image_uri_norm,
+                    name_norm,
+                    recall_doc
+                ])?;
+            }
+            if fetched_rows < PREPARED_METADATA_DOC_BATCH_SIZE {
+                break;
+            }
         }
-        if !Self::contract_representatives_have_chain(conn, chain)? && {
-            let exists = conn.query_row(
+        Ok(())
+    }
+
+    fn refresh_prepared_recall_tables_for_chain(
+        conn: &Connection,
+        chain: &str,
+    ) -> Result<(), AppError> {
+        Self::create_prepared_recall_tables(conn)?;
+        conn.execute(
+            &format!("DELETE FROM {PREPARED_RECALL_CHAIN_TABLE} WHERE chain = ?"),
+            params![chain],
+        )?;
+        Self::refresh_contract_representatives_for_chain(conn, chain)?;
+        Self::refresh_feature_recall_rows_for_chain(conn, chain)?;
+        Self::refresh_metadata_recall_docs_for_chain(conn, chain)?;
+        let stats = Self::feature_chain_stats(conn, chain)?;
+        conn.execute(
+            &format!(
+                "
+                INSERT INTO {PREPARED_RECALL_CHAIN_TABLE} (
+                    chain, feature_row_count, max_feature_rowid, feature_fingerprint
+                ) VALUES (?, ?, ?, ?)
+                "
+            ),
+            params![
+                chain,
+                stats.row_count,
+                stats.max_feature_rowid,
+                stats.fingerprint
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn ensure_prepared_recall_state(
+        &self,
+        conn: &Connection,
+        chain: &str,
+    ) -> Result<PreparedRecallState, AppError> {
+        let mut state = Self::prepared_recall_state(conn, chain)?;
+        if !state.ready && self.writable && {
+            conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM nft_features WHERE chain = ? LIMIT 1)",
                 params![chain],
                 |row| row.get::<_, bool>(0),
-            )?;
-            exists
+            )?
         } {
-            Self::refresh_contract_representatives_for_chain(conn, chain)?;
+            self.invalidate_metadata_recall_index(chain)?;
+            Self::refresh_prepared_recall_tables_for_chain(conn, chain)?;
+            state = Self::prepared_recall_state(conn, chain)?;
         }
-        Ok(Self::contract_representatives_have_chain(conn, chain)?)
+        Ok(state)
     }
 
     fn drop_obsolete_nft_feature_columns(conn: &Connection) -> Result<(), AppError> {
@@ -1389,7 +758,7 @@ impl DuckDbFeatureStore {
             ])?;
         }
         drop(stmt);
-        Self::refresh_contract_representatives_for_chain(&conn, chain)?;
+        Self::refresh_prepared_recall_tables_for_chain(&conn, chain)?;
         Ok(())
     }
 
@@ -1424,7 +793,7 @@ impl DuckDbFeatureStore {
         let conn = self.conn()?;
         conn.execute("DELETE FROM nft_features WHERE chain = ?", params![chain])?;
         conn.execute(&insert_sql, params![chain])?;
-        Self::refresh_contract_representatives_for_chain(&conn, chain)?;
+        Self::refresh_prepared_recall_tables_for_chain(&conn, chain)?;
         Ok(())
     }
 
@@ -1511,9 +880,19 @@ impl DuckDbFeatureStore {
     fn load_metadata_recall_index(
         conn: &Connection,
         chain: &str,
-        use_contract_representatives: bool,
+        prepared_recall_state: PreparedRecallState,
     ) -> Result<MetadataRecallIndex, AppError> {
-        let sql = if use_contract_representatives {
+        let sql = if prepared_recall_state.ready {
+            format!(
+                "
+                SELECT feature_rowid, contract_address, token_id, token_uri_norm, image_uri_norm,
+                       name_norm, recall_doc
+                FROM {METADATA_RECALL_DOC_TABLE}
+                WHERE chain = ?
+                ORDER BY feature_rowid
+                "
+            )
+        } else if Self::table_has_chain(conn, CONTRACT_REPRESENTATIVE_TABLE, chain)? {
             format!(
                 "
                 SELECT f.rowid, lower(CAST(f.contract_address AS VARCHAR)) AS contract_address,
@@ -1583,9 +962,13 @@ impl DuckDbFeatureStore {
                 token_uri_norm,
                 image_uri_norm,
                 name_norm,
-                metadata_json,
+                metadata_source_doc,
             ) = row?;
-            let recall_doc = metadata_recall_document(&metadata_json);
+            let recall_doc = if prepared_recall_state.ready {
+                metadata_source_doc
+            } else {
+                metadata_recall_document(&metadata_source_doc)
+            };
             let Some(doc) = MetadataBm25Document::from_text(&recall_doc) else {
                 continue;
             };
@@ -1626,7 +1009,7 @@ impl DuckDbFeatureStore {
         &self,
         conn: &Connection,
         chain: &str,
-        use_contract_representatives: bool,
+        prepared_recall_state: PreparedRecallState,
     ) -> Result<Arc<MetadataRecallIndex>, AppError> {
         if let Some(index) = self.metadata_recall_index_cache()?.get(chain).cloned() {
             return Ok(index);
@@ -1635,7 +1018,7 @@ impl DuckDbFeatureStore {
         let index = Arc::new(Self::load_metadata_recall_index(
             conn,
             chain,
-            use_contract_representatives,
+            prepared_recall_state,
         )?);
         self.metadata_recall_index_cache()?
             .insert(chain.to_string(), Arc::clone(&index));
@@ -1646,11 +1029,20 @@ impl DuckDbFeatureStore {
         seed_sketch: &MetadataSketch,
         source_index: &MetadataSourceIndex,
         hamming_threshold: u32,
+        cap: usize,
     ) -> usize {
-        let mut hits = 0usize;
+        if cap == 0 {
+            return 0;
+        }
+        let mut seen = HashSet::new();
         for anchor in &seed_sketch.anchors {
             if let Some(indices) = source_index.anchor_indices.get(anchor) {
-                hits = hits.saturating_add(indices.len());
+                for index in indices {
+                    seen.insert(*index);
+                    if seen.len() >= cap {
+                        return cap;
+                    }
+                }
             }
         }
         let band_radius = hamming_threshold / METADATA_SIMHASH_BAND_COUNT as u32;
@@ -1663,11 +1055,16 @@ impl DuckDbFeatureStore {
                 }
                 let band_key = metadata_simhash_band_key(band_index, band_value);
                 if let Some(indices) = source_index.simhash_band_indices.get(band_key) {
-                    hits = hits.saturating_add(indices.len());
+                    for index in indices {
+                        seen.insert(*index);
+                        if seen.len() >= cap {
+                            return cap;
+                        }
+                    }
                 }
             }
         }
-        hits
+        seen.len()
     }
 
     fn metadata_source_candidate_indices(
@@ -1688,6 +1085,7 @@ impl DuckDbFeatureStore {
                 seed_sketch,
                 &metadata_index.source_index,
                 METADATA_SKETCH_SOURCE_HAMMING_THRESHOLD,
+                metadata_index.candidates.len(),
             ) >= metadata_index.candidates.len();
 
         if use_full_scan {
@@ -1819,8 +1217,33 @@ impl DuckDbFeatureStore {
             DROP TABLE IF EXISTS {SEED_IMAGE_URI_TABLE};
             DROP TABLE IF EXISTS {SEED_TOKEN_ID_TABLE};
             DROP TABLE IF EXISTS {CANDIDATE_CONTRACT_TABLE};
+            DROP TABLE IF EXISTS {SELECTED_RECALL_ROWID_TABLE};
             "
         ))?;
+        Ok(())
+    }
+
+    fn create_selected_recall_rowid_table(conn: &Connection) -> Result<(), AppError> {
+        conn.execute_batch(&format!(
+            "
+            DROP TABLE IF EXISTS {SELECTED_RECALL_ROWID_TABLE};
+            CREATE TEMP TABLE {SELECTED_RECALL_ROWID_TABLE} (
+                feature_rowid BIGINT NOT NULL
+            );
+            "
+        ))?;
+        Ok(())
+    }
+
+    fn replace_selected_recall_rowids(conn: &Connection, rowids: &[i64]) -> Result<(), AppError> {
+        conn.execute(&format!("DELETE FROM {SELECTED_RECALL_ROWID_TABLE}"), [])?;
+        let mut stmt = conn.prepare(&format!(
+            "INSERT INTO {SELECTED_RECALL_ROWID_TABLE} (feature_rowid) VALUES (?)"
+        ))?;
+        let unique_rowids = rowids.iter().copied().collect::<BTreeSet<_>>();
+        for rowid in unique_rowids {
+            stmt.execute(params![rowid])?;
+        }
         Ok(())
     }
 
@@ -2103,23 +1526,24 @@ impl DuckDbFeatureStore {
         conn: &Connection,
         rowids: &[i64],
     ) -> Result<HashMap<i64, DatabaseNftRecord>, AppError> {
+        if rowids.is_empty() {
+            return Ok(HashMap::new());
+        }
         let mut records = HashMap::new();
         for chunk in rowids.chunks(SELECTED_RECALL_ROWID_CHUNK_SIZE) {
             if chunk.is_empty() {
                 continue;
             }
-            let values = chunk
-                .iter()
-                .map(|value| value.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
+            Self::replace_selected_recall_rowids(conn, chunk)?;
             let sql = format!(
                 "
-                SELECT rowid, contract_address, token_id, coalesce(token_uri, ''),
-                       coalesce(image_uri, ''), coalesce(name, ''), coalesce(symbol, ''),
-                       coalesce(metadata_json, '')
-                FROM nft_features
-                WHERE rowid IN ({values})
+                SELECT f.rowid, f.contract_address, f.token_id, coalesce(f.token_uri, ''),
+                       coalesce(f.image_uri, ''), coalesce(f.name, ''), coalesce(f.symbol, ''),
+                       coalesce(f.metadata_json, '')
+                FROM nft_features f
+                JOIN {SELECTED_RECALL_ROWID_TABLE} selected
+                  ON selected.feature_rowid = f.rowid
+                ORDER BY f.rowid
                 "
             );
             let mut stmt = conn.prepare(&sql)?;
@@ -2149,16 +1573,20 @@ impl DuckDbFeatureStore {
 
     fn append_exact_uri_recall_rows(
         conn: &Connection,
-        chain: &str,
-        profiles: &[SeedRecallProfile],
-        profile_index: &SeedProfileIndex,
-        all_token_keys: &HashSet<String>,
-        all_image_keys: &HashSet<String>,
-        name_threshold: f64,
+        input: ExactUriRecallInput<'_>,
         accumulators: &mut BTreeMap<String, SnapshotAccumulator>,
-        max_tokens_per_contract: usize,
-        max_recall_rows: usize,
     ) -> Result<(), AppError> {
+        let ExactUriRecallInput {
+            chain,
+            profiles,
+            profile_index,
+            all_token_keys,
+            all_image_keys,
+            name_threshold,
+            max_tokens_per_contract,
+            max_recall_rows,
+            prepared_recall_state,
+        } = input;
         if all_token_keys.is_empty() && all_image_keys.is_empty() {
             return Ok(());
         }
@@ -2185,22 +1613,41 @@ impl DuckDbFeatureStore {
 
         let mut last_feature_rowid = -1_i64;
         loop {
-            let select_sql = format!(
-                "
-                SELECT rowid AS feature_rowid,
-                       lower(CAST(contract_address AS VARCHAR)) AS contract_address,
-                       CAST(token_id AS VARCHAR) AS token_id,
-                       coalesce(CAST(token_uri_norm AS VARCHAR), '') AS token_uri_norm,
-                       coalesce(CAST(image_uri_norm AS VARCHAR), '') AS image_uri_norm,
-                       coalesce(CAST(name_norm AS VARCHAR), '') AS name_norm
-                FROM nft_features
-                WHERE chain = ?
-                  AND ({exact_uri_predicate})
-                  AND rowid > {last_feature_rowid}
-                ORDER BY rowid
-                LIMIT {recall_batch_size}
-                "
-            );
+            let select_sql = if prepared_recall_state.ready {
+                format!(
+                    "
+                    SELECT feature_rowid,
+                           contract_address,
+                           token_id,
+                           coalesce(token_uri_norm, '') AS token_uri_norm,
+                           coalesce(image_uri_norm, '') AS image_uri_norm,
+                           coalesce(name_norm, '') AS name_norm
+                    FROM {FEATURE_RECALL_TABLE}
+                    WHERE chain = ?
+                      AND ({exact_uri_predicate})
+                      AND feature_rowid > {last_feature_rowid}
+                    ORDER BY feature_rowid
+                    LIMIT {recall_batch_size}
+                    "
+                )
+            } else {
+                format!(
+                    "
+                    SELECT rowid AS feature_rowid,
+                           lower(CAST(contract_address AS VARCHAR)) AS contract_address,
+                           CAST(token_id AS VARCHAR) AS token_id,
+                           coalesce(CAST(token_uri_norm AS VARCHAR), '') AS token_uri_norm,
+                           coalesce(CAST(image_uri_norm AS VARCHAR), '') AS image_uri_norm,
+                           coalesce(CAST(name_norm AS VARCHAR), '') AS name_norm
+                    FROM nft_features
+                    WHERE chain = ?
+                      AND ({exact_uri_predicate})
+                      AND rowid > {last_feature_rowid}
+                    ORDER BY rowid
+                    LIMIT {recall_batch_size}
+                    "
+                )
+            };
             let mut stmt = conn.prepare(&select_sql)?;
             let rows = stmt.query_map(params![chain], |row| {
                 Ok(RecallRow {
@@ -2301,7 +1748,7 @@ impl DuckDbFeatureStore {
         name_threshold: f64,
         accumulators: &mut BTreeMap<String, SnapshotAccumulator>,
         max_tokens_per_contract: usize,
-        use_contract_representatives: bool,
+        prepared_recall_state: PreparedRecallState,
     ) -> Result<(), AppError> {
         if name_threshold > 100.0
             || !profiles
@@ -2310,7 +1757,26 @@ impl DuckDbFeatureStore {
         {
             return Ok(());
         }
-        let sql = if use_contract_representatives {
+        let sql = if prepared_recall_state.ready {
+            format!(
+                "
+                SELECT rr.feature_rowid,
+                       rr.contract_address,
+                       rr.token_id,
+                       coalesce(rr.token_uri_norm, '') AS token_uri_norm,
+                       coalesce(rr.image_uri_norm, '') AS image_uri_norm,
+                       coalesce(rr.name_norm, '') AS name_norm
+                FROM {CONTRACT_REPRESENTATIVE_TABLE} r
+                JOIN {FEATURE_RECALL_TABLE} rr
+                  ON rr.chain = r.chain
+                 AND rr.feature_rowid = r.name_feature_rowid
+                WHERE r.chain = ?
+                  AND r.name_feature_rowid IS NOT NULL
+                  AND trim(coalesce(rr.name_norm, '')) <> ''
+                ORDER BY rr.feature_rowid
+                "
+            )
+        } else if Self::table_has_chain(conn, CONTRACT_REPRESENTATIVE_TABLE, chain)? {
             format!(
                 "
                 SELECT f.rowid,
@@ -2619,58 +2085,69 @@ impl DuckDbFeatureStore {
         let profile_index = SeedProfileIndex::new(&profiles);
 
         let conn = self.conn()?;
-        let use_contract_representatives = Self::ensure_contract_representatives(&conn, chain)?;
-        Self::append_exact_uri_recall_rows(
-            &conn,
-            chain,
-            &profiles,
-            &profile_index,
-            &profiles[0].exact_token_keys,
-            &profiles[0].exact_image_keys,
-            name_threshold,
-            &mut accumulators,
-            max_tokens_per_contract,
-            max_recall_rows,
-        )?;
-        Self::append_name_recall_rows(
-            &conn,
-            chain,
-            &profiles,
-            name_threshold,
-            &mut accumulators,
-            max_tokens_per_contract,
-            use_contract_representatives,
-        )?;
-        if metadata_threshold <= 1.0
-            && profiles
-                .iter()
-                .any(|profile| profile.seed_metadata_doc.is_some())
-        {
-            let metadata_index =
-                self.cached_metadata_recall_index(&conn, chain, use_contract_representatives)?;
-            Self::append_metadata_recall_rows(
+        let prepared_recall_state = self.ensure_prepared_recall_state(&conn, chain)?;
+        Self::create_selected_recall_rowid_table(&conn)?;
+        let result = (|| {
+            Self::append_exact_uri_recall_rows(
                 &conn,
+                ExactUriRecallInput {
+                    chain,
+                    profiles: &profiles,
+                    profile_index: &profile_index,
+                    all_token_keys: &profiles[0].exact_token_keys,
+                    all_image_keys: &profiles[0].exact_image_keys,
+                    name_threshold,
+                    max_tokens_per_contract,
+                    max_recall_rows,
+                    prepared_recall_state,
+                },
+                &mut accumulators,
+            )?;
+            Self::append_name_recall_rows(
+                &conn,
+                chain,
                 &profiles,
-                metadata_threshold,
-                metadata_index.as_ref(),
+                name_threshold,
                 &mut accumulators,
                 max_tokens_per_contract,
+                prepared_recall_state,
             )?;
-        }
-        Self::drop_seed_temp_tables(&conn)?;
-        Self::append_overlapping_metadata_token_rows(
-            &conn,
-            chain,
-            &profiles[0].seed_token_ids,
-            &mut accumulators
-                .get_mut("")
+            if metadata_threshold <= 1.0
+                && profiles
+                    .iter()
+                    .any(|profile| profile.seed_metadata_doc.is_some())
+            {
+                let metadata_index =
+                    self.cached_metadata_recall_index(&conn, chain, prepared_recall_state)?;
+                Self::append_metadata_recall_rows(
+                    &conn,
+                    &profiles,
+                    metadata_threshold,
+                    metadata_index.as_ref(),
+                    &mut accumulators,
+                    max_tokens_per_contract,
+                )?;
+            }
+            Self::append_overlapping_metadata_token_rows(
+                &conn,
+                chain,
+                &profiles[0].seed_token_ids,
+                &mut accumulators
+                    .get_mut("")
+                    .expect("single-seed snapshot accumulator exists")
+                    .duplicate_rows_by_contract,
+            )?;
+            Ok(accumulators
+                .remove("")
                 .expect("single-seed snapshot accumulator exists")
-                .duplicate_rows_by_contract,
-        )?;
-        Ok(accumulators
-            .remove("")
-            .expect("single-seed snapshot accumulator exists")
-            .finish())
+                .finish())
+        })();
+        let cleanup_result = Self::drop_seed_temp_tables(&conn);
+        match (result, cleanup_result) {
+            (Ok(snapshot), Ok(())) => Ok(snapshot),
+            (Err(err), _) => Err(err),
+            (Ok(_), Err(err)) => Err(err),
+        }
     }
 
     pub fn load_snapshots(
@@ -2732,61 +2209,72 @@ impl DuckDbFeatureStore {
         }
 
         let conn = self.conn()?;
-        let use_contract_representatives = Self::ensure_contract_representatives(&conn, chain)?;
-        Self::append_exact_uri_recall_rows(
-            &conn,
-            chain,
-            &profiles,
-            &profile_index,
-            &all_token_keys,
-            &all_image_keys,
-            name_threshold,
-            &mut accumulators,
-            max_tokens_per_contract,
-            max_recall_rows,
-        )?;
-        Self::append_name_recall_rows(
-            &conn,
-            chain,
-            &profiles,
-            name_threshold,
-            &mut accumulators,
-            max_tokens_per_contract,
-            use_contract_representatives,
-        )?;
-        if metadata_threshold <= 1.0
-            && profiles
-                .iter()
-                .any(|profile| profile.seed_metadata_doc.is_some())
-        {
-            let metadata_index =
-                self.cached_metadata_recall_index(&conn, chain, use_contract_representatives)?;
-            Self::append_metadata_recall_rows(
+        let prepared_recall_state = self.ensure_prepared_recall_state(&conn, chain)?;
+        Self::create_selected_recall_rowid_table(&conn)?;
+        let result = (|| {
+            Self::append_exact_uri_recall_rows(
                 &conn,
-                &profiles,
-                metadata_threshold,
-                metadata_index.as_ref(),
+                ExactUriRecallInput {
+                    chain,
+                    profiles: &profiles,
+                    profile_index: &profile_index,
+                    all_token_keys: &all_token_keys,
+                    all_image_keys: &all_image_keys,
+                    name_threshold,
+                    max_tokens_per_contract,
+                    max_recall_rows,
+                    prepared_recall_state,
+                },
                 &mut accumulators,
-                max_tokens_per_contract,
             )?;
-        }
-        Self::drop_seed_temp_tables(&conn)?;
-        for profile in &profiles {
-            let Some(accumulator) = accumulators.get_mut(&profile.seed_address) else {
-                continue;
-            };
-            Self::append_overlapping_metadata_token_rows(
+            Self::append_name_recall_rows(
                 &conn,
                 chain,
-                &profile.seed_token_ids,
-                &mut accumulator.duplicate_rows_by_contract,
+                &profiles,
+                name_threshold,
+                &mut accumulators,
+                max_tokens_per_contract,
+                prepared_recall_state,
             )?;
-        }
+            if metadata_threshold <= 1.0
+                && profiles
+                    .iter()
+                    .any(|profile| profile.seed_metadata_doc.is_some())
+            {
+                let metadata_index =
+                    self.cached_metadata_recall_index(&conn, chain, prepared_recall_state)?;
+                Self::append_metadata_recall_rows(
+                    &conn,
+                    &profiles,
+                    metadata_threshold,
+                    metadata_index.as_ref(),
+                    &mut accumulators,
+                    max_tokens_per_contract,
+                )?;
+            }
+            for profile in &profiles {
+                let Some(accumulator) = accumulators.get_mut(&profile.seed_address) else {
+                    continue;
+                };
+                Self::append_overlapping_metadata_token_rows(
+                    &conn,
+                    chain,
+                    &profile.seed_token_ids,
+                    &mut accumulator.duplicate_rows_by_contract,
+                )?;
+            }
 
-        let snapshots = accumulators
-            .into_iter()
-            .map(|(seed_address, accumulator)| (seed_address, accumulator.finish()))
-            .collect();
-        Ok(snapshots)
+            let snapshots = accumulators
+                .into_iter()
+                .map(|(seed_address, accumulator)| (seed_address, accumulator.finish()))
+                .collect();
+            Ok(snapshots)
+        })();
+        let cleanup_result = Self::drop_seed_temp_tables(&conn);
+        match (result, cleanup_result) {
+            (Ok(snapshots), Ok(())) => Ok(snapshots),
+            (Err(err), _) => Err(err),
+            (Ok(_), Err(err)) => Err(err),
+        }
     }
 }

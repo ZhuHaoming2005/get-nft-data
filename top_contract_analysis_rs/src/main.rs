@@ -115,7 +115,6 @@ fn main() -> Result<(), AppError> {
                     max_tokens_per_contract: args.max_tokens_per_contract,
                     max_recall_rows: args.max_recall_rows,
                     workers: args.workers,
-                    ..BatchRequest::default()
                 },
                 &deps,
             )

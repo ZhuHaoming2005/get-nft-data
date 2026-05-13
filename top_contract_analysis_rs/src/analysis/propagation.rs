@@ -284,19 +284,32 @@ fn build_summary(
     }
 }
 
-pub fn build_nft_propagation_path(
-    contract_address: &str,
-    transfers: &[TransferRecord],
-    sales: &[NftSaleRecord],
-    owners: &[OwnerBalance],
-    infringing_tokens: &[InfringingTokenRecord],
-    malicious_addresses: &[MaliciousAddressPayload],
-    honest_addresses: &[HonestAddressPayload],
-    secondary_sale_victim_addresses: &[SecondarySaleVictimAddressPayload],
-) -> NftPropagationPathPayload {
+pub struct NftPropagationInput<'a> {
+    pub contract_address: &'a str,
+    pub transfers: &'a [TransferRecord],
+    pub sales: &'a [NftSaleRecord],
+    pub owners: &'a [OwnerBalance],
+    pub infringing_tokens: &'a [InfringingTokenRecord],
+    pub malicious_addresses: &'a [MaliciousAddressPayload],
+    pub honest_addresses: &'a [HonestAddressPayload],
+    pub secondary_sale_victim_addresses: &'a [SecondarySaleVictimAddressPayload],
+}
+
+pub fn build_nft_propagation_path(input: NftPropagationInput<'_>) -> NftPropagationPathPayload {
+    let NftPropagationInput {
+        contract_address,
+        transfers,
+        sales,
+        owners,
+        infringing_tokens,
+        malicious_addresses,
+        honest_addresses,
+        secondary_sale_victim_addresses,
+    } = input;
     let relevant_token_ids: HashSet<String> = infringing_tokens
         .iter()
-        .filter_map(|item| (!item.token_id.is_empty()).then(|| item.token_id.clone()))
+        .filter(|item| !item.token_id.is_empty())
+        .map(|item| item.token_id.clone())
         .collect();
     let mut nodes = BTreeMap::<String, NodeAccumulator>::new();
     let mut transfer_edges = Vec::new();

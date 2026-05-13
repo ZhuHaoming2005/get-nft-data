@@ -11,7 +11,9 @@ use top_contract_analysis_rs::analysis::duplicate::build_duplicate_candidates;
 use top_contract_analysis_rs::analysis::lifecycle::{
     build_lifecycle_model_outputs, LifecycleModelInput,
 };
-use top_contract_analysis_rs::analysis::propagation::build_nft_propagation_path;
+use top_contract_analysis_rs::analysis::propagation::{
+    build_nft_propagation_path, NftPropagationInput,
+};
 use top_contract_analysis_rs::analysis::scoring::{
     metadata_document_from_json, score_metadata_documents, score_name_pairs, ScoringError,
 };
@@ -755,16 +757,16 @@ fn propagation_edges_merge_sale_transfer_and_aggregate_mints() {
         },
     ];
 
-    let path = build_nft_propagation_path(
-        "0xdup",
-        &transfers,
-        &sales,
-        &[] as &[OwnerBalance],
-        &infringing_tokens,
-        &[],
-        &[],
-        &[],
-    );
+    let path = build_nft_propagation_path(NftPropagationInput {
+        contract_address: "0xdup",
+        transfers: &transfers,
+        sales: &sales,
+        owners: &[] as &[OwnerBalance],
+        infringing_tokens: &infringing_tokens,
+        malicious_addresses: &[],
+        honest_addresses: &[],
+        secondary_sale_victim_addresses: &[],
+    });
 
     let mint_edge = path
         .edges
@@ -897,16 +899,16 @@ fn lifecycle_model_outputs_expose_research_graph_payloads() {
         &[],
         &victims,
     );
-    let path = build_nft_propagation_path(
-        "0xdup",
-        &transfers,
-        &sales,
-        &[] as &[OwnerBalance],
-        &infringing_tokens,
-        &[],
-        &[],
-        &victims,
-    );
+    let path = build_nft_propagation_path(NftPropagationInput {
+        contract_address: "0xdup",
+        transfers: &transfers,
+        sales: &sales,
+        owners: &[] as &[OwnerBalance],
+        infringing_tokens: &infringing_tokens,
+        malicious_addresses: &[],
+        honest_addresses: &[],
+        secondary_sale_victim_addresses: &victims,
+    });
     let propagation_paths = BTreeMap::from([("0xdup".to_string(), path)]);
     let market_events = vec![
         NftMarketEventRecord {
@@ -1272,9 +1274,9 @@ fn early_detection_features_do_not_treat_undated_sales_as_window_observed() {
         confidence: "high".into(),
         ..DuplicateCandidate::default()
     }];
-    let path = build_nft_propagation_path(
-        "0xdup",
-        &[TransferRecord {
+    let path = build_nft_propagation_path(NftPropagationInput {
+        contract_address: "0xdup",
+        transfers: &[TransferRecord {
             contract_address: "0xdup".into(),
             token_id: "1".into(),
             tx_hash: "0xmint".into(),
@@ -1284,7 +1286,7 @@ fn early_detection_features_do_not_treat_undated_sales_as_window_observed() {
             to_address: "0xseller".into(),
             ..TransferRecord::default()
         }],
-        &[NftSaleRecord {
+        sales: &[NftSaleRecord {
             contract_address: "0xdup".into(),
             token_id: "1".into(),
             tx_hash: "0xsale_without_transfer_time".into(),
@@ -1294,8 +1296,8 @@ fn early_detection_features_do_not_treat_undated_sales_as_window_observed() {
             price_eth: Some(1.0),
             ..NftSaleRecord::default()
         }],
-        &[] as &[OwnerBalance],
-        &[InfringingTokenRecord {
+        owners: &[] as &[OwnerBalance],
+        infringing_tokens: &[InfringingTokenRecord {
             contract_address: "0xdup".into(),
             token_id: "1".into(),
             minter_address: "0xseller".into(),
@@ -1303,10 +1305,10 @@ fn early_detection_features_do_not_treat_undated_sales_as_window_observed() {
             mint_block: 10,
             ..InfringingTokenRecord::default()
         }],
-        &[],
-        &[],
-        &[],
-    );
+        malicious_addresses: &[],
+        honest_addresses: &[],
+        secondary_sale_victim_addresses: &[],
+    });
 
     let unknown_time_value_edges = vec![ValueFlowEdgePayload {
         edge_id: "value:funding:0xunknown".into(),
@@ -1638,16 +1640,16 @@ fn campaign_clusters_do_not_merge_contracts_only_because_they_share_sale_seller(
         ));
         propagation_paths.insert(
             contract.to_string(),
-            build_nft_propagation_path(
-                contract,
-                &transfers,
-                &sales,
-                &[] as &[OwnerBalance],
-                &tokens,
-                &[],
-                &[],
-                &victims,
-            ),
+            build_nft_propagation_path(NftPropagationInput {
+                contract_address: contract,
+                transfers: &transfers,
+                sales: &sales,
+                owners: &[] as &[OwnerBalance],
+                infringing_tokens: &tokens,
+                malicious_addresses: &[],
+                honest_addresses: &[],
+                secondary_sale_victim_addresses: &victims,
+            }),
         );
     }
 
@@ -1712,16 +1714,16 @@ fn lifecycle_stage_transitions_do_not_move_backward_in_time() {
     }];
     let propagation_paths = BTreeMap::from([(
         "0xdup".to_string(),
-        build_nft_propagation_path(
-            "0xdup",
-            &transfers,
-            &[],
-            &[] as &[OwnerBalance],
-            &tokens,
-            &[],
-            &[],
-            &[],
-        ),
+        build_nft_propagation_path(NftPropagationInput {
+            contract_address: "0xdup",
+            transfers: &transfers,
+            sales: &[],
+            owners: &[] as &[OwnerBalance],
+            infringing_tokens: &tokens,
+            malicious_addresses: &[],
+            honest_addresses: &[],
+            secondary_sale_victim_addresses: &[],
+        }),
     )]);
     let market_events = vec![NftMarketEventRecord {
         contract_address: "0xdup".into(),
