@@ -895,6 +895,58 @@ fn feature_store_does_not_limit_representative_metadata_template_terms() {
 }
 
 #[test]
+fn feature_store_applies_metadata_only_cap_after_all_term_chunks() {
+    let store = DuckDbFeatureStore::new(":memory:").unwrap();
+    store
+        .replace_chain_rows(
+            "ethereum",
+            &[
+                DatabaseNftRecord {
+                    contract_address: "0xdup".into(),
+                    token_id: "2".into(),
+                    metadata_json: r#"{"description":"term000"}"#.into(),
+                    ..Default::default()
+                },
+                DatabaseNftRecord {
+                    contract_address: "0xdup".into(),
+                    token_id: "1".into(),
+                    metadata_json: r#"{"description":"term299"}"#.into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+    let seed_description = (0..300)
+        .map(|index| format!("term{index:03}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let seed_metadata_json = format!(r#"{{"description":"{seed_description}"}}"#);
+
+    let snapshot = store
+        .load_snapshot(
+            "ethereum",
+            &[SeedNft {
+                chain: "ethereum".into(),
+                contract_address: "0xseed".into(),
+                token_id: "1".into(),
+                metadata_json: seed_metadata_json,
+                ..Default::default()
+            }],
+            1,
+            0,
+        )
+        .unwrap();
+
+    assert_eq!(snapshot.nft_rows.len(), 1);
+    assert_eq!(snapshot.nft_rows[0].contract_address, "0xdup");
+    assert_eq!(snapshot.nft_rows[0].token_id, "1");
+    assert_eq!(
+        snapshot.duplicate_contract_rows[0].representative.token_id,
+        "1"
+    );
+}
+
+#[test]
 fn feature_store_prioritizes_strong_signal_rows_over_metadata_only_cap_rows() {
     let store = DuckDbFeatureStore::new(":memory:").unwrap();
     store

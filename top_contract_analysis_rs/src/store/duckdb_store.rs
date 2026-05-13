@@ -19,12 +19,12 @@ const DEFAULT_RECALL_BATCH_SIZE: usize = 500_000;
 const SELECTED_RECALL_ROWID_CHUNK_SIZE: usize = 50_000;
 const BULK_IMPORT_CHECKPOINT_THRESHOLD: &str = "1TB";
 const BULK_IMPORT_SKIP_WAL_THRESHOLD_BYTES: u64 = 1_099_511_627_776;
-const SEED_METADATA_TERM_TABLE: &str = "__top_contract_analysis_seed_metadata_terms";
-const SEED_METADATA_ROWID_TABLE: &str = "__top_contract_analysis_seed_metadata_rowids";
+const METADATA_RECALL_TERM_CHUNK_SIZE: usize = 256;
 const SEED_TOKEN_URI_TABLE: &str = "__top_contract_analysis_seed_token_uri_keys";
 const SEED_IMAGE_URI_TABLE: &str = "__top_contract_analysis_seed_image_uri_keys";
 const SEED_NAME_PREFIX_TABLE: &str = "__top_contract_analysis_seed_name_prefixes";
 const SEED_TOKEN_ID_TABLE: &str = "__top_contract_analysis_seed_token_ids";
+const CANDIDATE_CONTRACT_TABLE: &str = "__top_contract_analysis_candidate_contracts";
 
 const PRECOMPUTED_COLUMNS: [&str; 5] = [
     "token_uri_norm",
@@ -62,6 +62,7 @@ struct SnapshotAccumulator {
     nft_rows: Vec<DatabaseNftRecord>,
     duplicate_rows_by_contract: HashMap<String, ContractDuplicateRecord>,
     seen_contract_name_pairs: BTreeSet<(String, String)>,
+    seen_feature_rowids: HashSet<i64>,
     contract_names: Vec<ContractNameRecord>,
     contract_signals_raw: BTreeMap<String, ContractSignal>,
 }
@@ -77,6 +78,18 @@ struct SelectedRecallRow {
     seed_index: usize,
     row_index: usize,
     row_match: SeedRowMatch,
+}
+
+struct PendingMetadataRecallRow {
+    seed_index: usize,
+    row: RecallRow,
+    row_match: SeedRowMatch,
+}
+
+struct RecallPass {
+    predicate: String,
+    metadata_only: bool,
+    metadata_match_expr: String,
 }
 
 struct SeedProfileIndex {
@@ -546,6 +559,10 @@ impl SnapshotAccumulator {
             return;
         }
 
+        if self.seen_feature_rowids.contains(&row.feature_rowid) {
+            return;
+        }
+
         let entry = self
             .per_contract_counts
             .entry(row.contract_address.clone())
@@ -554,6 +571,7 @@ impl SnapshotAccumulator {
             return;
         }
         *entry += 1;
+        self.seen_feature_rowids.insert(row.feature_rowid);
 
         record.metadata_recall_checked = true;
         record.metadata_recall_match = row_match.metadata_recall_match;
@@ -1062,75 +1080,46 @@ impl DuckDbFeatureStore {
         )
     }
 
-    fn sql_metadata_rowid_candidate_predicate() -> String {
-        format!("rowid IN (SELECT feature_rowid FROM {SEED_METADATA_ROWID_TABLE})")
-    }
-
-    fn prepare_seed_metadata_term_table(
-        conn: &Connection,
+    fn metadata_recall_term_chunk_predicates(
         metadata_recall_terms: &HashSet<String>,
-    ) -> Result<(), AppError> {
-        conn.execute_batch(&format!(
-            "
-            DROP TABLE IF EXISTS {SEED_METADATA_TERM_TABLE};
-            CREATE TEMP TABLE {SEED_METADATA_TERM_TABLE} (
-                keyword VARCHAR NOT NULL
-            );
-            "
-        ))?;
-        if metadata_recall_terms.is_empty() {
-            return Ok(());
-        }
-
-        let mut stmt = conn.prepare(&format!(
-            "INSERT INTO {SEED_METADATA_TERM_TABLE} (keyword) VALUES (?)"
-        ))?;
+    ) -> Result<Vec<String>, AppError> {
         let terms = metadata_recall_terms
             .iter()
             .filter(|value| !value.is_empty())
-            .collect::<BTreeSet<_>>();
-        for term in terms {
-            stmt.execute(params![term])?;
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut predicates = Vec::new();
+        for chunk in terms.chunks(METADATA_RECALL_TERM_CHUNK_SIZE) {
+            let term_predicate = chunk
+                .iter()
+                .map(|term| {
+                    let json_term = serde_json::to_string(term)?;
+                    Ok(format!(
+                        "contains(coalesce(CAST(metadata_keywords_arr AS VARCHAR), '[]'), {})",
+                        Self::sql_string_literal(&json_term)
+                    ))
+                })
+                .collect::<Result<Vec<_>, AppError>>()?
+                .join(" OR ");
+            if !term_predicate.is_empty() {
+                predicates.push(format!("({term_predicate})"));
+            }
         }
-        Ok(())
+        Ok(predicates)
     }
 
-    fn prepare_seed_metadata_rowid_table(conn: &Connection, chain: &str) -> Result<(), AppError> {
-        conn.execute_batch(&format!(
-            "
-            DROP TABLE IF EXISTS {SEED_METADATA_ROWID_TABLE};
-            CREATE TEMP TABLE {SEED_METADATA_ROWID_TABLE} (
-                feature_rowid BIGINT NOT NULL
-            );
-            "
-        ))?;
-        conn.execute(
-            &format!(
-                "
-                INSERT INTO {SEED_METADATA_ROWID_TABLE} (feature_rowid)
-                SELECT DISTINCT f.rowid
-                FROM nft_features f,
-                     LATERAL (
-                         SELECT DISTINCT json_extract_string(value, '$') AS keyword
-                         FROM json_each(
-                             CASE
-                                 WHEN json_valid(coalesce(f.metadata_keywords_arr, '[]'))
-                                 THEN coalesce(f.metadata_keywords_arr, '[]')
-                                 ELSE '[]'
-                             END
-                         )
-                     ) k
-                JOIN {SEED_METADATA_TERM_TABLE} t ON t.keyword = k.keyword
-                WHERE f.chain = ?
-                  AND k.keyword IS NOT NULL
-                  AND k.keyword <> ''
-                  AND {}
-                ",
-                Self::sql_metadata_json_eligible_predicate()
-            ),
-            params![chain],
-        )?;
-        Ok(())
+    fn metadata_recall_sql_expr(
+        metadata_json_eligible_predicate: &str,
+        metadata_term_predicates: &[String],
+    ) -> String {
+        if metadata_term_predicates.is_empty() {
+            return "FALSE".to_string();
+        }
+        format!(
+            "({metadata_json_eligible_predicate}) AND ({})",
+            metadata_term_predicates.join(" OR ")
+        )
     }
 
     fn prepare_seed_value_table(
@@ -1164,12 +1153,11 @@ impl DuckDbFeatureStore {
     fn drop_seed_temp_tables(conn: &Connection) -> Result<(), AppError> {
         conn.execute_batch(&format!(
             "
-            DROP TABLE IF EXISTS {SEED_METADATA_TERM_TABLE};
-            DROP TABLE IF EXISTS {SEED_METADATA_ROWID_TABLE};
             DROP TABLE IF EXISTS {SEED_TOKEN_URI_TABLE};
             DROP TABLE IF EXISTS {SEED_IMAGE_URI_TABLE};
             DROP TABLE IF EXISTS {SEED_NAME_PREFIX_TABLE};
             DROP TABLE IF EXISTS {SEED_TOKEN_ID_TABLE};
+            DROP TABLE IF EXISTS {CANDIDATE_CONTRACT_TABLE};
             "
         ))?;
         Ok(())
@@ -1200,6 +1188,102 @@ impl DuckDbFeatureStore {
                 && profile.name_prefixes.contains(&name_prefix),
             metadata_recall_match,
         }
+    }
+
+    fn can_select_recall_row(
+        seed_index: usize,
+        profile: &SeedRecallProfile,
+        row: &RecallRow,
+        accumulators: &BTreeMap<String, SnapshotAccumulator>,
+        pending_contract_counts: &HashMap<(usize, String), usize>,
+        max_tokens_per_contract: usize,
+    ) -> bool {
+        if profile.seed_contracts.contains(&row.contract_address) {
+            return false;
+        }
+        let Some(accumulator) = accumulators.get(&profile.seed_address) else {
+            return false;
+        };
+        if accumulator.seen_feature_rowids.contains(&row.feature_rowid) {
+            return false;
+        }
+        if max_tokens_per_contract == 0 {
+            return true;
+        }
+        let accepted = accumulator
+            .per_contract_counts
+            .get(&row.contract_address)
+            .copied()
+            .unwrap_or_default();
+        let pending = pending_contract_counts
+            .get(&(seed_index, row.contract_address.clone()))
+            .copied()
+            .unwrap_or_default();
+        accepted + pending < max_tokens_per_contract
+    }
+
+    fn note_pending_recall_row(
+        seed_index: usize,
+        row: &RecallRow,
+        pending_contract_counts: &mut HashMap<(usize, String), usize>,
+    ) {
+        *pending_contract_counts
+            .entry((seed_index, row.contract_address.clone()))
+            .or_default() += 1;
+    }
+
+    fn can_stage_metadata_recall_row(
+        profile: &SeedRecallProfile,
+        row: &RecallRow,
+        accumulators: &BTreeMap<String, SnapshotAccumulator>,
+        max_tokens_per_contract: usize,
+    ) -> bool {
+        if profile.seed_contracts.contains(&row.contract_address) {
+            return false;
+        }
+        let Some(accumulator) = accumulators.get(&profile.seed_address) else {
+            return false;
+        };
+        if accumulator.seen_feature_rowids.contains(&row.feature_rowid) {
+            return false;
+        }
+        let accepted = accumulator
+            .per_contract_counts
+            .get(&row.contract_address)
+            .copied()
+            .unwrap_or_default();
+        accepted < max_tokens_per_contract
+    }
+
+    fn stage_metadata_recall_row(
+        pending_rows: &mut HashMap<(usize, String), Vec<PendingMetadataRecallRow>>,
+        seed_index: usize,
+        row: &RecallRow,
+        row_match: SeedRowMatch,
+        max_tokens_per_contract: usize,
+    ) {
+        if max_tokens_per_contract == 0 {
+            return;
+        }
+        let entry = pending_rows
+            .entry((seed_index, row.contract_address.clone()))
+            .or_default();
+        if entry
+            .iter()
+            .any(|pending| pending.row.feature_rowid == row.feature_rowid)
+        {
+            return;
+        }
+        entry.push(PendingMetadataRecallRow {
+            seed_index,
+            row: row.clone(),
+            row_match,
+        });
+        entry.sort_by(|left, right| {
+            (&left.row.token_id, left.row.feature_rowid)
+                .cmp(&(&right.row.token_id, right.row.feature_rowid))
+        });
+        entry.truncate(max_tokens_per_contract);
     }
 
     fn drain_selected_recall_rows(
@@ -1242,6 +1326,67 @@ impl DuckDbFeatureStore {
                 &selected.row_match,
                 max_tokens_per_contract,
             );
+        }
+
+        Ok(())
+    }
+
+    fn drain_pending_metadata_recall_rows(
+        conn: &Connection,
+        profiles: &[SeedRecallProfile],
+        pending_rows: &mut HashMap<(usize, String), Vec<PendingMetadataRecallRow>>,
+        accumulators: &mut BTreeMap<String, SnapshotAccumulator>,
+        max_tokens_per_contract: usize,
+    ) -> Result<(), AppError> {
+        if pending_rows.is_empty() {
+            return Ok(());
+        }
+
+        let mut rows = pending_rows
+            .drain()
+            .flat_map(|(_, rows)| rows)
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| {
+            (
+                left.seed_index,
+                &left.row.contract_address,
+                &left.row.token_id,
+                left.row.feature_rowid,
+            )
+                .cmp(&(
+                    right.seed_index,
+                    &right.row.contract_address,
+                    &right.row.token_id,
+                    right.row.feature_rowid,
+                ))
+        });
+
+        for chunk in rows.chunks(SELECTED_RECALL_ROWID_CHUNK_SIZE) {
+            let rowids = chunk
+                .iter()
+                .map(|pending| pending.row.feature_rowid)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let full_records_by_rowid = Self::fetch_records_by_feature_rowid(conn, &rowids)?;
+            for pending in chunk {
+                let Some(record) = full_records_by_rowid.get(&pending.row.feature_rowid) else {
+                    continue;
+                };
+                let Some(profile) = profiles.get(pending.seed_index) else {
+                    continue;
+                };
+                let Some(accumulator) = accumulators.get_mut(&profile.seed_address) else {
+                    continue;
+                };
+                accumulator.push_recall_row(
+                    profile,
+                    &pending.row,
+                    record.clone(),
+                    &pending.row_match,
+                    max_tokens_per_contract,
+                );
+            }
         }
 
         Ok(())
@@ -1309,72 +1454,71 @@ impl DuckDbFeatureStore {
             .keys()
             .map(|key| (key.to_lowercase(), key.clone()))
             .collect::<BTreeMap<_, _>>();
-        let contract_keys = contract_key_by_lower.keys().cloned().collect::<Vec<_>>();
-        for chunk in contract_keys.chunks(500) {
-            let contract_values = chunk
-                .iter()
-                .map(|value| Self::sql_string_literal(value))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let sql = format!(
-                "
-                SELECT contract_key, contract_address, token_id, token_uri, image_uri, name, symbol,
-                       metadata_json
-                FROM (
-                    SELECT lower(contract_address) AS contract_key,
-                           contract_address, token_id, coalesce(token_uri, '') AS token_uri,
-                           coalesce(image_uri, '') AS image_uri, coalesce(name, '') AS name,
-                           coalesce(symbol, '') AS symbol, coalesce(metadata_json, '') AS metadata_json,
-                           row_number() OVER (
-                               PARTITION BY lower(contract_address)
-                               ORDER BY CASE
-                                   WHEN trim(coalesce(CAST(metadata_json AS VARCHAR), '')) LIKE '{{%'
-                                        OR trim(coalesce(CAST(metadata_json AS VARCHAR), '')) LIKE '[%' THEN 0
-                                   WHEN trim(coalesce(CAST(metadata_json AS VARCHAR), '')) <> '' THEN 1
-                                   ELSE 2
-                               END,
-                               CAST(token_id AS VARCHAR)
-                           ) AS overlap_rank
-                    FROM nft_features
-                    WHERE chain = ?
-                      AND lower(contract_address) IN ({contract_values})
-                      AND CAST(token_id AS VARCHAR) IN (SELECT value FROM {SEED_TOKEN_ID_TABLE})
-                      AND length(trim(coalesce(CAST(metadata_json AS VARCHAR), ''))) <= {MAX_METADATA_BYTES_FOR_DEDUP}
-                      AND (
-                          trim(coalesce(CAST(metadata_json AS VARCHAR), '')) LIKE '{{%'
-                          OR trim(coalesce(CAST(metadata_json AS VARCHAR), '')) LIKE '[%'
-                      )
-                )
-                WHERE overlap_rank <= {MAX_OVERLAPPING_METADATA_ROWS_PER_CONTRACT}
-                ORDER BY contract_key, token_id
-                "
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params![chain], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    DatabaseNftRecord {
-                        contract_address: row.get::<_, String>(1)?,
-                        token_id: row.get::<_, String>(2)?,
-                        token_uri: row.get::<_, String>(3)?,
-                        image_uri: row.get::<_, String>(4)?,
-                        name: row.get::<_, String>(5)?,
-                        symbol: row.get::<_, String>(6)?,
-                        metadata_json: row.get::<_, String>(7)?,
-                        metadata_recall_checked: false,
-                        metadata_recall_match: false,
-                    },
-                ))
-            })?;
-            for row in rows {
-                let (contract_key, record) = row?;
-                let Some(original_key) = contract_key_by_lower.get(&contract_key) else {
-                    continue;
-                };
-                if let Some(entry) = rows_by_contract.get_mut(original_key) {
-                    entry.metadata_token_rows.clear();
-                    push_metadata_token_row(entry, &record);
-                }
+        let contract_keys = contract_key_by_lower
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        Self::prepare_seed_value_table(conn, CANDIDATE_CONTRACT_TABLE, &contract_keys)?;
+
+        let sql = format!(
+            "
+            SELECT contract_key, contract_address, token_id, token_uri, image_uri, name, symbol,
+                   metadata_json
+            FROM (
+                SELECT lower(f.contract_address) AS contract_key,
+                       f.contract_address, f.token_id, coalesce(f.token_uri, '') AS token_uri,
+                       coalesce(f.image_uri, '') AS image_uri, coalesce(f.name, '') AS name,
+                       coalesce(f.symbol, '') AS symbol, coalesce(f.metadata_json, '') AS metadata_json,
+                       row_number() OVER (
+                           PARTITION BY lower(f.contract_address)
+                           ORDER BY CASE
+                               WHEN trim(coalesce(CAST(f.metadata_json AS VARCHAR), '')) LIKE '{{%'
+                                    OR trim(coalesce(CAST(f.metadata_json AS VARCHAR), '')) LIKE '[%' THEN 0
+                               WHEN trim(coalesce(CAST(f.metadata_json AS VARCHAR), '')) <> '' THEN 1
+                               ELSE 2
+                           END,
+                           CAST(f.token_id AS VARCHAR)
+                       ) AS overlap_rank
+                FROM nft_features f
+                JOIN {CANDIDATE_CONTRACT_TABLE} c
+                  ON c.value = lower(f.contract_address)
+                WHERE f.chain = ?
+                  AND CAST(f.token_id AS VARCHAR) IN (SELECT value FROM {SEED_TOKEN_ID_TABLE})
+                  AND length(trim(coalesce(CAST(f.metadata_json AS VARCHAR), ''))) <= {MAX_METADATA_BYTES_FOR_DEDUP}
+                  AND (
+                      trim(coalesce(CAST(f.metadata_json AS VARCHAR), '')) LIKE '{{%'
+                      OR trim(coalesce(CAST(f.metadata_json AS VARCHAR), '')) LIKE '[%'
+                  )
+            )
+            WHERE overlap_rank <= {MAX_OVERLAPPING_METADATA_ROWS_PER_CONTRACT}
+            ORDER BY contract_key, token_id
+            "
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![chain], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                DatabaseNftRecord {
+                    contract_address: row.get::<_, String>(1)?,
+                    token_id: row.get::<_, String>(2)?,
+                    token_uri: row.get::<_, String>(3)?,
+                    image_uri: row.get::<_, String>(4)?,
+                    name: row.get::<_, String>(5)?,
+                    symbol: row.get::<_, String>(6)?,
+                    metadata_json: row.get::<_, String>(7)?,
+                    metadata_recall_checked: false,
+                    metadata_recall_match: false,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (contract_key, record) = row?;
+            let Some(original_key) = contract_key_by_lower.get(&contract_key) else {
+                continue;
+            };
+            if let Some(entry) = rows_by_contract.get_mut(original_key) {
+                entry.metadata_token_rows.clear();
+                push_metadata_token_row(entry, &record);
             }
         }
         Ok(())
@@ -1426,10 +1570,8 @@ impl DuckDbFeatureStore {
         Self::prepare_seed_value_table(&conn, SEED_TOKEN_URI_TABLE, &exact_token_keys)?;
         Self::prepare_seed_value_table(&conn, SEED_IMAGE_URI_TABLE, &exact_image_keys)?;
         Self::prepare_seed_value_table(&conn, SEED_NAME_PREFIX_TABLE, &name_prefixes)?;
-        Self::prepare_seed_metadata_term_table(&conn, &metadata_recall_terms)?;
-        if !metadata_recall_terms.is_empty() {
-            Self::prepare_seed_metadata_rowid_table(&conn, chain)?;
-        }
+        let metadata_term_predicates =
+            Self::metadata_recall_term_chunk_predicates(&metadata_recall_terms)?;
         let token_uri_match_expr = if exact_token_keys.is_empty() {
             "FALSE".to_string()
         } else {
@@ -1445,31 +1587,30 @@ impl DuckDbFeatureStore {
         } else {
             format!("name_prefix8 IN (SELECT value FROM {SEED_NAME_PREFIX_TABLE})")
         };
-        let metadata_recall_predicate = if metadata_recall_terms.is_empty() {
-            None
-        } else {
-            Some(format!(
-                "({}) AND ({})",
-                Self::sql_metadata_json_eligible_predicate(),
-                Self::sql_metadata_rowid_candidate_predicate()
-            ))
-        };
-        let metadata_recall_expr = metadata_recall_predicate
-            .as_deref()
-            .unwrap_or("FALSE")
-            .to_string();
         let strong_recall_predicate = format!(
             "({token_uri_match_expr}) OR ({image_uri_match_expr}) OR ({name_prefix_match_expr})"
         );
+        let metadata_json_eligible_predicate = Self::sql_metadata_json_eligible_predicate();
         let mut recall_pass_predicates = Vec::new();
         if !exact_token_keys.is_empty() || !exact_image_keys.is_empty() || !name_prefixes.is_empty()
         {
-            recall_pass_predicates.push(strong_recall_predicate.clone());
+            recall_pass_predicates.push(RecallPass {
+                predicate: strong_recall_predicate.clone(),
+                metadata_only: false,
+                metadata_match_expr: Self::metadata_recall_sql_expr(
+                    &metadata_json_eligible_predicate,
+                    &metadata_term_predicates,
+                ),
+            });
         }
-        if metadata_recall_predicate.is_some() {
-            recall_pass_predicates.push(format!(
-                "({metadata_recall_expr}) AND NOT ({strong_recall_predicate})"
-            ));
+        for term_predicate in metadata_term_predicates {
+            recall_pass_predicates.push(RecallPass {
+                predicate: format!(
+                    "({metadata_json_eligible_predicate}) AND ({term_predicate}) AND NOT ({strong_recall_predicate})"
+                ),
+                metadata_only: true,
+                metadata_match_expr: "TRUE".to_string(),
+            });
         }
         let seed_contract_filter = if seed_contracts.is_empty() {
             String::new()
@@ -1489,23 +1630,27 @@ impl DuckDbFeatureStore {
         } else {
             max_recall_rows
         };
-        for recall_predicate in recall_pass_predicates {
+        let mut pending_metadata_rows = HashMap::new();
+        for recall_pass in recall_pass_predicates {
             let mut last_feature_rowid = -1_i64;
             loop {
                 let select_sql = format!(
                     "
                     SELECT rowid AS feature_rowid, contract_address,
                            token_uri_norm, image_uri_norm, name_norm,
-                           coalesce(metadata_keywords_arr, '[]') AS metadata_keywords_arr,
-                           {metadata_recall_expr} AS metadata_recall_match,
+                           CASE WHEN ({}) THEN coalesce(metadata_keywords_arr, '[]') ELSE '[]' END AS metadata_keywords_arr,
+                           {} AS metadata_recall_match,
                            CAST(token_id AS VARCHAR) AS token_id
                     FROM nft_features
                     WHERE chain = ?{seed_contract_filter}
-                      AND ({recall_predicate})
+                      AND ({})
                       AND rowid > {last_feature_rowid}
                     ORDER BY rowid
                     LIMIT {recall_batch_size}
-                    "
+                    ",
+                    recall_pass.metadata_match_expr,
+                    recall_pass.metadata_match_expr,
+                    recall_pass.predicate
                 );
                 let mut stmt = conn.prepare(&select_sql)?;
                 let rows = stmt.query_map(params![chain], |row| {
@@ -1541,32 +1686,62 @@ impl DuckDbFeatureStore {
                 });
 
                 let mut selected_rows = Vec::with_capacity(SELECTED_RECALL_ROWID_CHUNK_SIZE);
+                let mut pending_contract_counts = HashMap::new();
+                let defer_metadata_cap = recall_pass.metadata_only && max_tokens_per_contract > 0;
                 for (row_index, row) in batch_rows.iter().enumerate() {
-                    if seed_contracts.contains(&row.contract_address) {
-                        continue;
-                    }
-
-                    let name_prefix = row.name_norm.chars().take(8).collect::<String>();
-                    let matches = exact_token_keys.contains(&row.token_uri_norm)
-                        || exact_image_keys.contains(&row.image_uri_norm)
-                        || (!name_prefix.is_empty() && name_prefixes.contains(&name_prefix))
-                        || row.metadata_recall_match;
+                    let metadata_keywords = if row.metadata_recall_match {
+                        Self::metadata_keywords_from_recall_row(row)
+                    } else {
+                        HashSet::new()
+                    };
+                    let row_match = Self::seed_row_match(&profiles[0], row, &metadata_keywords);
+                    let strong_match = row_match.token_uri_match
+                        || row_match.image_uri_match
+                        || row_match.name_prefix_match;
+                    let matches = if recall_pass.metadata_only {
+                        !strong_match && row_match.metadata_recall_match
+                    } else {
+                        strong_match
+                    };
 
                     if !matches {
+                        continue;
+                    }
+                    if defer_metadata_cap {
+                        if !Self::can_stage_metadata_recall_row(
+                            &profiles[0],
+                            row,
+                            &accumulators,
+                            max_tokens_per_contract,
+                        ) {
+                            continue;
+                        }
+                        Self::stage_metadata_recall_row(
+                            &mut pending_metadata_rows,
+                            0,
+                            row,
+                            row_match,
+                            max_tokens_per_contract,
+                        );
+                        continue;
+                    }
+                    if !Self::can_select_recall_row(
+                        0,
+                        &profiles[0],
+                        row,
+                        &accumulators,
+                        &pending_contract_counts,
+                        max_tokens_per_contract,
+                    ) {
                         continue;
                     }
 
                     selected_rows.push(SelectedRecallRow {
                         seed_index: 0,
                         row_index,
-                        row_match: SeedRowMatch {
-                            token_uri_match: exact_token_keys.contains(&row.token_uri_norm),
-                            image_uri_match: exact_image_keys.contains(&row.image_uri_norm),
-                            name_prefix_match: !name_prefix.is_empty()
-                                && name_prefixes.contains(&name_prefix),
-                            metadata_recall_match: row.metadata_recall_match,
-                        },
+                        row_match,
                     });
+                    Self::note_pending_recall_row(0, row, &mut pending_contract_counts);
                     if selected_rows.len() >= SELECTED_RECALL_ROWID_CHUNK_SIZE {
                         Self::drain_selected_recall_rows(
                             &conn,
@@ -1576,6 +1751,7 @@ impl DuckDbFeatureStore {
                             &mut accumulators,
                             max_tokens_per_contract,
                         )?;
+                        pending_contract_counts.clear();
                     }
                 }
                 Self::drain_selected_recall_rows(
@@ -1593,6 +1769,13 @@ impl DuckDbFeatureStore {
                 last_feature_rowid = last_seen_feature_rowid;
             }
         }
+        Self::drain_pending_metadata_recall_rows(
+            &conn,
+            &profiles,
+            &mut pending_metadata_rows,
+            &mut accumulators,
+            max_tokens_per_contract,
+        )?;
         Self::drop_seed_temp_tables(&conn)?;
         Self::append_overlapping_metadata_token_rows(
             &conn,
@@ -1664,10 +1847,8 @@ impl DuckDbFeatureStore {
         Self::prepare_seed_value_table(&conn, SEED_TOKEN_URI_TABLE, &all_token_keys)?;
         Self::prepare_seed_value_table(&conn, SEED_IMAGE_URI_TABLE, &all_image_keys)?;
         Self::prepare_seed_value_table(&conn, SEED_NAME_PREFIX_TABLE, &all_name_prefixes)?;
-        Self::prepare_seed_metadata_term_table(&conn, &all_metadata_terms)?;
-        if !all_metadata_terms.is_empty() {
-            Self::prepare_seed_metadata_rowid_table(&conn, chain)?;
-        }
+        let metadata_term_predicates =
+            Self::metadata_recall_term_chunk_predicates(&all_metadata_terms)?;
         let token_uri_match_expr = if all_token_keys.is_empty() {
             "FALSE".to_string()
         } else {
@@ -1686,26 +1867,25 @@ impl DuckDbFeatureStore {
         let strong_recall_predicate = format!(
             "({token_uri_match_expr}) OR ({image_uri_match_expr}) OR ({name_prefix_match_expr})"
         );
-        let metadata_recall_predicate = if all_metadata_terms.is_empty() {
-            None
-        } else {
-            Some(format!(
-                "({}) AND ({})",
-                Self::sql_metadata_json_eligible_predicate(),
-                Self::sql_metadata_rowid_candidate_predicate()
-            ))
-        };
-        let metadata_recall_expr = metadata_recall_predicate
-            .as_deref()
-            .unwrap_or("FALSE")
-            .to_string();
+        let metadata_json_eligible_predicate = Self::sql_metadata_json_eligible_predicate();
         let mut recall_pass_predicates = Vec::new();
         if !all_token_keys.is_empty() || !all_image_keys.is_empty() || !all_name_prefixes.is_empty()
         {
-            recall_pass_predicates.push((strong_recall_predicate, false));
+            recall_pass_predicates.push(RecallPass {
+                predicate: strong_recall_predicate.clone(),
+                metadata_only: false,
+                metadata_match_expr: Self::metadata_recall_sql_expr(
+                    &metadata_json_eligible_predicate,
+                    &metadata_term_predicates,
+                ),
+            });
         }
-        if metadata_recall_predicate.is_some() {
-            recall_pass_predicates.push((metadata_recall_expr.clone(), true));
+        for term_predicate in metadata_term_predicates {
+            recall_pass_predicates.push(RecallPass {
+                predicate: format!("({metadata_json_eligible_predicate}) AND ({term_predicate})"),
+                metadata_only: true,
+                metadata_match_expr: "TRUE".to_string(),
+            });
         }
         let recall_batch_size = if max_recall_rows == 0 {
             DEFAULT_RECALL_BATCH_SIZE
@@ -1713,23 +1893,27 @@ impl DuckDbFeatureStore {
             max_recall_rows
         };
 
-        for (recall_predicate, metadata_only_pass) in recall_pass_predicates {
+        let mut pending_metadata_rows = HashMap::new();
+        for recall_pass in recall_pass_predicates {
             let mut last_feature_rowid = -1_i64;
             loop {
                 let select_sql = format!(
                     "
                     SELECT rowid AS feature_rowid, contract_address,
                            token_uri_norm, image_uri_norm, name_norm,
-                           coalesce(metadata_keywords_arr, '[]') AS metadata_keywords_arr,
-                           {metadata_recall_expr} AS metadata_recall_match,
+                           CASE WHEN ({}) THEN coalesce(metadata_keywords_arr, '[]') ELSE '[]' END AS metadata_keywords_arr,
+                           {} AS metadata_recall_match,
                            CAST(token_id AS VARCHAR) AS token_id
                     FROM nft_features
                     WHERE chain = ?
-                      AND ({recall_predicate})
+                      AND ({})
                       AND rowid > {last_feature_rowid}
                     ORDER BY rowid
                     LIMIT {recall_batch_size}
-                    "
+                    ",
+                    recall_pass.metadata_match_expr,
+                    recall_pass.metadata_match_expr,
+                    recall_pass.predicate
                 );
                 let mut stmt = conn.prepare(&select_sql)?;
                 let rows = stmt.query_map(params![chain], |row| {
@@ -1765,13 +1949,15 @@ impl DuckDbFeatureStore {
                 });
 
                 let mut selected_rows = Vec::with_capacity(SELECTED_RECALL_ROWID_CHUNK_SIZE);
+                let mut pending_contract_counts = HashMap::new();
+                let defer_metadata_cap = recall_pass.metadata_only && max_tokens_per_contract > 0;
                 for (row_index, row) in batch_rows.iter().enumerate() {
                     let metadata_keywords = if row.metadata_recall_match {
                         Self::metadata_keywords_from_recall_row(row)
                     } else {
                         HashSet::new()
                     };
-                    let mut seed_indices = if metadata_only_pass {
+                    let mut seed_indices = if recall_pass.metadata_only {
                         profile_index.metadata_match_profiles(&metadata_keywords)
                     } else {
                         profile_index.strong_match_profiles(row)
@@ -1785,11 +1971,39 @@ impl DuckDbFeatureStore {
                         let strong_match = row_match.token_uri_match
                             || row_match.image_uri_match
                             || row_match.name_prefix_match;
-                        if metadata_only_pass {
+                        if recall_pass.metadata_only {
                             if strong_match || !row_match.metadata_recall_match {
                                 continue;
                             }
                         } else if !strong_match {
+                            continue;
+                        }
+                        if defer_metadata_cap {
+                            if !Self::can_stage_metadata_recall_row(
+                                profile,
+                                row,
+                                &accumulators,
+                                max_tokens_per_contract,
+                            ) {
+                                continue;
+                            }
+                            Self::stage_metadata_recall_row(
+                                &mut pending_metadata_rows,
+                                seed_index,
+                                row,
+                                row_match,
+                                max_tokens_per_contract,
+                            );
+                            continue;
+                        }
+                        if !Self::can_select_recall_row(
+                            seed_index,
+                            profile,
+                            row,
+                            &accumulators,
+                            &pending_contract_counts,
+                            max_tokens_per_contract,
+                        ) {
                             continue;
                         }
                         selected_rows.push(SelectedRecallRow {
@@ -1797,6 +2011,11 @@ impl DuckDbFeatureStore {
                             row_index,
                             row_match,
                         });
+                        Self::note_pending_recall_row(
+                            seed_index,
+                            row,
+                            &mut pending_contract_counts,
+                        );
                         if selected_rows.len() >= SELECTED_RECALL_ROWID_CHUNK_SIZE {
                             Self::drain_selected_recall_rows(
                                 &conn,
@@ -1806,6 +2025,7 @@ impl DuckDbFeatureStore {
                                 &mut accumulators,
                                 max_tokens_per_contract,
                             )?;
+                            pending_contract_counts.clear();
                         }
                     }
                 }
@@ -1824,6 +2044,13 @@ impl DuckDbFeatureStore {
                 last_feature_rowid = last_seen_feature_rowid;
             }
         }
+        Self::drain_pending_metadata_recall_rows(
+            &conn,
+            &profiles,
+            &mut pending_metadata_rows,
+            &mut accumulators,
+            max_tokens_per_contract,
+        )?;
         Self::drop_seed_temp_tables(&conn)?;
         for profile in &profiles {
             let Some(accumulator) = accumulators.get_mut(&profile.seed_address) else {
