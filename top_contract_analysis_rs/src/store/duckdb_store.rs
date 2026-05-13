@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use crate::analysis::scoring::{
-    metadata_document_from_json, metadata_is_dedup_eligible, metadata_recall_all_keywords,
-    metadata_recall_document, score_metadata_indexed_pair_with_query, score_name_pair,
-    MetadataBm25Corpus, MetadataBm25CorpusBuilder, MetadataBm25Document, MetadataBm25Query,
+    metadata_document_from_json, metadata_is_dedup_eligible, metadata_recall_document,
+    score_metadata_indexed_pair_with_query, score_name_pair, MetadataBm25Corpus,
+    MetadataBm25CorpusBuilder, MetadataBm25Document, MetadataBm25Query,
     MAX_METADATA_BYTES_FOR_DEDUP,
 };
 use crate::error::AppError;
@@ -33,13 +33,7 @@ const METADATA_SIMHASH_BAND_VALUES: usize = 1 << METADATA_SIMHASH_BAND_BITS;
 const METADATA_SKETCH_HIGH_FREQ_MIN_DOCS: usize = 32;
 const METADATA_SKETCH_HIGH_FREQ_DIVISOR: usize = 5;
 
-const PRECOMPUTED_COLUMNS: [&str; 5] = [
-    "token_uri_norm",
-    "image_uri_norm",
-    "name_norm",
-    "name_prefix8",
-    "metadata_keywords_arr",
-];
+const PRECOMPUTED_COLUMNS: [&str; 3] = ["token_uri_norm", "image_uri_norm", "name_norm"];
 
 #[derive(Clone)]
 struct RecallRow {
@@ -376,13 +370,11 @@ mod tests {
                     metadata_json VARCHAR,
                     token_uri_norm VARCHAR,
                     image_uri_norm VARCHAR,
-                    name_norm VARCHAR,
-                    name_prefix8 VARCHAR,
-                    metadata_keywords_arr VARCHAR
+                    name_norm VARCHAR
                 );
                 INSERT INTO nft_features VALUES (
                     'ethereum', '0xcandidate', '1', '', '', '', '', '{\"description\":\"gold dragon\"}',
-                    '', '', '', '', '[\"description\",\"dragon\",\"gold\"]'
+                    '', '', ''
                 );
                 ",
             )
@@ -426,7 +418,7 @@ mod tests {
     }
 
     #[test]
-    fn opening_writable_feature_db_drops_obsolete_metadata_doc_column() {
+    fn opening_writable_feature_db_drops_obsolete_metadata_columns() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("features.duckdb");
         {
@@ -466,6 +458,8 @@ mod tests {
             .unwrap();
 
         assert!(!columns.contains("metadata_doc"));
+        assert!(!columns.contains("name_prefix8"));
+        assert!(!columns.contains("metadata_keywords_arr"));
         assert_eq!(row_count, 1);
     }
 
@@ -988,14 +982,11 @@ impl DuckDbFeatureStore {
                 metadata_json VARCHAR,
                 token_uri_norm VARCHAR,
                 image_uri_norm VARCHAR,
-                name_norm VARCHAR,
-                name_prefix8 VARCHAR,
-                metadata_keywords_arr VARCHAR
+                name_norm VARCHAR
             );
             ",
         )?;
         Self::drop_obsolete_nft_feature_columns(&conn)?;
-        Self::add_missing_nft_feature_columns(&conn)?;
         Self::validate_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -1088,23 +1079,13 @@ impl DuckDbFeatureStore {
 
     fn drop_obsolete_nft_feature_columns(conn: &Connection) -> Result<(), AppError> {
         let columns = Self::table_columns(conn, "nft_features")?;
-        if columns.contains("metadata_doc") {
-            conn.execute("ALTER TABLE nft_features DROP COLUMN metadata_doc", [])?;
-        }
-        Ok(())
-    }
-
-    fn add_missing_nft_feature_columns(conn: &Connection) -> Result<(), AppError> {
-        let columns = Self::table_columns(conn, "nft_features")?;
-        if !columns.contains("name_prefix8") && columns.contains("name_norm") {
-            conn.execute(
-                "ALTER TABLE nft_features ADD COLUMN name_prefix8 VARCHAR",
-                [],
-            )?;
-            conn.execute(
-                "UPDATE nft_features SET name_prefix8 = substr(coalesce(name_norm, ''), 1, 8)",
-                [],
-            )?;
+        for column in ["metadata_doc", "name_prefix8", "metadata_keywords_arr"] {
+            if columns.contains(column) {
+                conn.execute(
+                    &format!("ALTER TABLE nft_features DROP COLUMN {column}"),
+                    [],
+                )?;
+            }
         }
         Ok(())
     }
@@ -1141,17 +1122,13 @@ impl DuckDbFeatureStore {
             "
             INSERT INTO nft_features (
                 chain, contract_address, token_id, token_uri, image_uri, name, symbol, metadata_json,
-                token_uri_norm, image_uri_norm, name_norm, name_prefix8, metadata_keywords_arr
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                token_uri_norm, image_uri_norm, name_norm
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ",
         )?;
 
         for row in rows {
-            let metadata_recall_doc = metadata_recall_document(&row.metadata_json);
-            let metadata_keywords_arr =
-                serde_json::to_string(&metadata_recall_all_keywords(&metadata_recall_doc))?;
             let name_norm = normalize_name(&row.name);
-            let name_prefix8 = name_norm.chars().take(8).collect::<String>();
             stmt.execute(params![
                 chain,
                 row.contract_address.to_lowercase(),
@@ -1164,8 +1141,6 @@ impl DuckDbFeatureStore {
                 normalize_url(&row.token_uri).unwrap_or_default(),
                 normalize_url(&row.image_uri).unwrap_or_default(),
                 name_norm,
-                name_prefix8,
-                metadata_keywords_arr,
             ])?;
         }
         Ok(())
@@ -1187,7 +1162,7 @@ impl DuckDbFeatureStore {
             "
             INSERT INTO nft_features (
                 chain, contract_address, token_id, token_uri, image_uri, name, symbol, metadata_json,
-                token_uri_norm, image_uri_norm, name_norm, name_prefix8, metadata_keywords_arr
+                token_uri_norm, image_uri_norm, name_norm
             )
             SELECT
                 ? AS chain,
@@ -1200,9 +1175,7 @@ impl DuckDbFeatureStore {
                 {metadata_json_expr} AS metadata_json,
                 coalesce(CAST(token_uri_norm AS VARCHAR), '') AS token_uri_norm,
                 coalesce(CAST(image_uri_norm AS VARCHAR), '') AS image_uri_norm,
-                coalesce(CAST(name_norm AS VARCHAR), '') AS name_norm,
-                coalesce(CAST(name_prefix8 AS VARCHAR), '') AS name_prefix8,
-                coalesce(CAST(metadata_keywords_arr AS VARCHAR), '[]') AS metadata_keywords_arr
+                coalesce(CAST(name_norm AS VARCHAR), '') AS name_norm
             FROM read_parquet({path})
             ",
         );

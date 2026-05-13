@@ -99,34 +99,6 @@ pub fn metadata_is_dedup_eligible(metadata_json: &str) -> bool {
         && matches!(metadata_json.chars().next(), Some('{') | Some('['))
 }
 
-pub fn metadata_recall_keywords(document: &str, limit: usize) -> Vec<String> {
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for token in TOKEN_RE.find_iter(document) {
-        let normalized = token.as_str().to_lowercase();
-        if normalized.len() < 2 {
-            continue;
-        }
-        *counts.entry(normalized).or_insert(0) += 1;
-    }
-    let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();
-    ranked.sort_by(|left, right| {
-        right
-            .1
-            .cmp(&left.1)
-            .then_with(|| right.0.len().cmp(&left.0.len()))
-            .then_with(|| left.0.cmp(&right.0))
-    });
-    ranked
-        .into_iter()
-        .take(limit)
-        .map(|(token, _)| token)
-        .collect()
-}
-
-pub fn metadata_recall_all_keywords(document: &str) -> Vec<String> {
-    metadata_recall_keywords(document, usize::MAX)
-}
-
 fn collect_metadata_prefilter_parts(value: &Value, parts: &mut BTreeSet<String>) {
     match value {
         Value::Object(map) => {

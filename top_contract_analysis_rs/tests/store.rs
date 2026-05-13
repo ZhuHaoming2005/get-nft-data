@@ -407,9 +407,7 @@ fn feature_store_recalls_metadata_candidates_from_sketch_without_keyword_terms()
             '{\"description\":\"gold dragon\"}' AS metadata_json,
             '' AS token_uri_norm,
             '' AS image_uri_norm,
-            '' AS name_norm,
-            '' AS name_prefix8,
-            '[]' AS metadata_keywords_arr
+            '' AS name_norm
         ",
         &parquet_path,
     );
@@ -653,9 +651,7 @@ fn existing_current_feature_db_chain_rows_take_priority_over_parquet() {
             '' AS metadata_json,
             'ipfs:seed/meta-1' AS token_uri_norm,
             '' AS image_uri_norm,
-            'parquet clone' AS name_norm,
-            'parquet ' AS name_prefix8,
-            '[]' AS metadata_keywords_arr
+            'parquet clone' AS name_norm
         ",
         &parquet_path,
     );
@@ -728,9 +724,7 @@ fn parquet_loads_when_feature_db_has_no_chain_rows() {
             '' AS metadata_json,
             'ipfs:seed/meta-1' AS token_uri_norm,
             '' AS image_uri_norm,
-            'parquet clone' AS name_norm,
-            'parquet ' AS name_prefix8,
-            '[]' AS metadata_keywords_arr
+            'parquet clone' AS name_norm
         ",
         &parquet_path,
     );
@@ -771,7 +765,7 @@ fn parquet_loads_when_feature_db_has_no_chain_rows() {
 }
 
 #[test]
-fn old_feature_db_schema_is_rejected() {
+fn feature_db_schema_does_not_require_legacy_precomputed_columns() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("old.duckdb");
     {
@@ -796,8 +790,36 @@ fn old_feature_db_schema_is_rejected() {
         .unwrap();
     }
 
+    DuckDbFeatureStore::new(&db_path.to_string_lossy()).unwrap();
+}
+
+#[test]
+fn feature_db_schema_rejects_missing_current_precomputed_columns() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("old.duckdb");
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE nft_features (
+                chain VARCHAR NOT NULL,
+                contract_address VARCHAR NOT NULL,
+                token_id VARCHAR NOT NULL,
+                token_uri VARCHAR,
+                image_uri VARCHAR,
+                name VARCHAR,
+                symbol VARCHAR,
+                metadata_json VARCHAR,
+                token_uri_norm VARCHAR,
+                image_uri_norm VARCHAR
+            );
+            ",
+        )
+        .unwrap();
+    }
+
     let err = match DuckDbFeatureStore::new(&db_path.to_string_lossy()) {
-        Ok(_) => panic!("old feature DB schema should be rejected"),
+        Ok(_) => panic!("feature DB schema without current precomputed columns should be rejected"),
         Err(err) => err,
     };
 
@@ -893,7 +915,7 @@ fn feature_store_applies_per_contract_token_cap() {
 }
 
 #[test]
-fn feature_store_rejects_precomputed_metadata_keywords_without_valid_json() {
+fn feature_store_does_not_recall_metadata_candidates_without_valid_json() {
     let dir = tempdir().unwrap();
     let parquet_path = dir.path().join("snapshot.parquet");
     write_parquet(
@@ -909,9 +931,7 @@ fn feature_store_rejects_precomputed_metadata_keywords_without_valid_json() {
             '' AS metadata_json,
             '' AS token_uri_norm,
             '' AS image_uri_norm,
-            '' AS name_norm,
-            '' AS name_prefix8,
-            '[\"cat\"]' AS metadata_keywords_arr
+            '' AS name_norm
         ",
         &parquet_path,
     );
@@ -958,9 +978,7 @@ fn feature_store_recalls_parquet_metadata_candidates_from_seed_sketch() {
             '{\"description\":\"gold dragon\"}' AS metadata_json,
             '' AS token_uri_norm,
             '' AS image_uri_norm,
-            '' AS name_norm,
-            '' AS name_prefix8,
-            '[\"description\",\"dragon\",\"gold\"]' AS metadata_keywords_arr
+            '' AS name_norm
         ",
         &parquet_path,
     );
@@ -1262,7 +1280,7 @@ fn signal_cache_round_trips_transfers_and_owners() {
 }
 
 #[test]
-fn snapshot_export_writes_precomputed_columns() {
+fn snapshot_export_writes_current_precomputed_columns_without_legacy_fields() {
     let dir = tempdir().unwrap();
     let parquet_path = dir.path().join("snapshot.parquet");
     write_snapshot_rows_to_parquet(
@@ -1283,23 +1301,28 @@ fn snapshot_export_writes_precomputed_columns() {
 
     let conn = Connection::open_in_memory().unwrap();
     let path = parquet_path_literal(&parquet_path);
-    let (metadata_json, token_uri_norm, name_prefix8, metadata_keywords_arr): (
-        String,
-        String,
-        String,
-        String,
-    ) = conn
+    let mut describe_stmt = conn
+        .prepare(&format!("DESCRIBE SELECT * FROM read_parquet('{path}')"))
+        .unwrap();
+    let describe_rows = describe_stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap();
+    let mut column_names = Vec::new();
+    for row in describe_rows {
+        column_names.push(row.unwrap());
+    }
+
+    let (metadata_json, token_uri_norm, name_norm): (String, String, String) = conn
         .query_row(
-            &format!(
-                "SELECT metadata_json, token_uri_norm, name_prefix8, metadata_keywords_arr FROM read_parquet('{path}')"
-            ),
+            &format!("SELECT metadata_json, token_uri_norm, name_norm FROM read_parquet('{path}')"),
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
 
     assert!(metadata_json.contains("red hooded anime portrait"));
     assert_eq!(token_uri_norm, "ipfs:seed/meta-1");
-    assert_eq!(name_prefix8, "azuki mi");
-    assert!(metadata_keywords_arr.contains("portrait"));
+    assert_eq!(name_norm, "azuki mirror");
+    assert!(!column_names.contains(&"name_prefix8".to_string()));
+    assert!(!column_names.contains(&"metadata_keywords_arr".to_string()));
 }
