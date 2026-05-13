@@ -33,7 +33,12 @@ const METADATA_SIMHASH_BAND_VALUES: usize = 1 << METADATA_SIMHASH_BAND_BITS;
 const METADATA_SKETCH_HIGH_FREQ_MIN_DOCS: usize = 32;
 const METADATA_SKETCH_HIGH_FREQ_DIVISOR: usize = 5;
 
-const PRECOMPUTED_COLUMNS: [&str; 3] = ["token_uri_norm", "image_uri_norm", "name_norm"];
+const REQUIRED_SNAPSHOT_COLUMNS: [&str; 4] = [
+    "metadata_json",
+    "token_uri_norm",
+    "image_uri_norm",
+    "name_norm",
+];
 
 #[derive(Clone)]
 struct RecallRow {
@@ -1063,14 +1068,14 @@ impl DuckDbFeatureStore {
 
     fn validate_schema(conn: &Connection) -> Result<(), AppError> {
         let columns = Self::table_columns(conn, "nft_features")?;
-        let missing: Vec<&str> = PRECOMPUTED_COLUMNS
+        let missing: Vec<&str> = REQUIRED_SNAPSHOT_COLUMNS
             .iter()
             .copied()
             .filter(|column| !columns.contains(*column))
             .collect();
         if !missing.is_empty() {
             return Err(AppError::InvalidData(format!(
-                "feature DB nft_features table is missing current pre-computed columns {missing:?}. Rebuild it from a current export-snapshot Parquet file."
+                "feature DB nft_features table is missing current required snapshot columns {missing:?}. Rebuild it from a current export-snapshot Parquet file."
             )));
         }
 
@@ -1150,14 +1155,8 @@ impl DuckDbFeatureStore {
         &self,
         chain: &str,
         parquet_path: &str,
-        column_names: &HashSet<String>,
     ) -> Result<(), AppError> {
         let path = Self::sql_string_literal(&parquet_path.replace('\\', "/"));
-        let metadata_json_expr = if column_names.contains("metadata_json") {
-            "coalesce(CAST(metadata_json AS VARCHAR), '')"
-        } else {
-            "''"
-        };
         let insert_sql = format!(
             "
             INSERT INTO nft_features (
@@ -1172,7 +1171,7 @@ impl DuckDbFeatureStore {
                 coalesce(CAST(image_uri AS VARCHAR), '') AS image_uri,
                 coalesce(CAST(name AS VARCHAR), '') AS name,
                 coalesce(CAST(symbol AS VARCHAR), '') AS symbol,
-                {metadata_json_expr} AS metadata_json,
+                coalesce(CAST(metadata_json AS VARCHAR), '') AS metadata_json,
                 coalesce(CAST(token_uri_norm AS VARCHAR), '') AS token_uri_norm,
                 coalesce(CAST(image_uri_norm AS VARCHAR), '') AS image_uri_norm,
                 coalesce(CAST(name_norm AS VARCHAR), '') AS name_norm
@@ -1199,18 +1198,18 @@ impl DuckDbFeatureStore {
             column_names
         };
 
-        let missing: Vec<&str> = PRECOMPUTED_COLUMNS
+        let missing: Vec<&str> = REQUIRED_SNAPSHOT_COLUMNS
             .iter()
             .copied()
             .filter(|column| !column_names.contains(*column))
             .collect();
         if !missing.is_empty() {
             return Err(AppError::InvalidData(format!(
-                "Parquet file {parquet_path:?} is missing pre-computed columns {missing:?}. Re-export the snapshot with the current export-snapshot command."
+                "Parquet file {parquet_path:?} is missing required snapshot columns {missing:?}. Re-export the snapshot with the current export-snapshot command."
             )));
         }
 
-        self.load_parquet_dataset_via_duckdb(chain, parquet_path, &column_names)
+        self.load_parquet_dataset_via_duckdb(chain, parquet_path)
     }
 
     pub fn load_parquet_dataset_if_chain_missing(

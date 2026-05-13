@@ -608,7 +608,7 @@ fn feature_store_prefers_json_overlapping_metadata_row_for_final_recheck() {
 }
 
 #[test]
-fn parquet_rejects_missing_precomputed_columns() {
+fn parquet_rejects_missing_required_snapshot_columns() {
     let dir = tempdir().unwrap();
     let parquet_path = dir.path().join("missing_columns.parquet");
     write_parquet(
@@ -631,7 +631,38 @@ fn parquet_rejects_missing_precomputed_columns() {
         .load_parquet_dataset("ethereum", &parquet_path.to_string_lossy())
         .unwrap_err();
 
-    assert!(err.to_string().contains("missing pre-computed columns"));
+    assert!(err
+        .to_string()
+        .contains("missing required snapshot columns"));
+}
+
+#[test]
+fn parquet_rejects_missing_required_metadata_json() {
+    let dir = tempdir().unwrap();
+    let parquet_path = dir.path().join("missing_metadata.parquet");
+    write_parquet(
+        "
+        SELECT
+            'ethereum' AS chain,
+            '0xdup' AS contract_address,
+            '1' AS token_id,
+            'ipfs://seed/meta-1' AS token_uri,
+            'ipfs://dup/image-1.png' AS image_uri,
+            'Azuki Mirror #1' AS name,
+            'AZUKI' AS symbol,
+            'ipfs:seed/meta-1' AS token_uri_norm,
+            'ipfs:dup/image-1.png' AS image_uri_norm,
+            'azuki mirror' AS name_norm
+        ",
+        &parquet_path,
+    );
+
+    let store = DuckDbFeatureStore::new(":memory:").unwrap();
+    let err = store
+        .load_parquet_dataset("ethereum", &parquet_path.to_string_lossy())
+        .unwrap_err();
+
+    assert!(err.to_string().contains("metadata_json"));
 }
 
 #[test]
@@ -794,7 +825,7 @@ fn feature_db_schema_does_not_require_legacy_precomputed_columns() {
 }
 
 #[test]
-fn feature_db_schema_rejects_missing_current_precomputed_columns() {
+fn feature_db_schema_rejects_missing_current_required_columns() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("old.duckdb");
     {
@@ -819,13 +850,13 @@ fn feature_db_schema_rejects_missing_current_precomputed_columns() {
     }
 
     let err = match DuckDbFeatureStore::new(&db_path.to_string_lossy()) {
-        Ok(_) => panic!("feature DB schema without current precomputed columns should be rejected"),
+        Ok(_) => panic!("feature DB schema without current required columns should be rejected"),
         Err(err) => err,
     };
 
     assert!(err
         .to_string()
-        .contains("missing current pre-computed columns"));
+        .contains("missing current required snapshot columns"));
 }
 
 #[test]
@@ -1295,7 +1326,6 @@ fn snapshot_export_writes_current_precomputed_columns_without_legacy_fields() {
             metadata_json: "{\"description\":\"red hooded anime portrait\"}".into(),
         }],
         &parquet_path,
-        true,
     )
     .unwrap();
 

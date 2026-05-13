@@ -115,6 +115,4 @@ pub struct ExportSnapshotArgs {
     pub output: String,
     #[arg(long, default_value_t = 100_000)]
     pub fetch_size: usize,
-    #[arg(long, default_value_t = false)]
-    pub keep_metadata_json: bool,
 }

@@ -130,7 +130,6 @@ fn main() -> Result<(), AppError> {
                 &args.chain,
                 std::path::Path::new(&args.output),
                 args.fetch_size,
-                args.keep_metadata_json,
             )?;
             Ok(())
         }

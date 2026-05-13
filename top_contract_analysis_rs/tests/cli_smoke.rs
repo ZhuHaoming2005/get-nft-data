@@ -76,3 +76,18 @@ fn export_snapshot_subcommand_is_exposed() {
                 .and(contains("Cannot start a runtime").not()),
         );
 }
+
+#[test]
+fn export_snapshot_rejects_removed_keep_metadata_json_flag() {
+    Command::cargo_bin("top_contract_analysis_rs")
+        .unwrap()
+        .args([
+            "export-snapshot",
+            "--output",
+            "snapshot.json",
+            "--keep-metadata-json",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("unexpected argument"));
+}

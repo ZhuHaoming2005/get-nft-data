@@ -39,8 +39,8 @@ fn chain_to_table(chain: &str) -> Result<String, AppError> {
     Ok(format!("nft_assets_{safe}"))
 }
 
-fn snapshot_schema(keep_metadata_json: bool) -> Arc<Schema> {
-    let mut fields = vec![
+fn snapshot_schema() -> Arc<Schema> {
+    let fields = vec![
         Field::new("chain", DataType::Utf8, false),
         Field::new("contract_address", DataType::Utf8, false),
         Field::new("token_id", DataType::Utf8, false),
@@ -48,24 +48,16 @@ fn snapshot_schema(keep_metadata_json: bool) -> Arc<Schema> {
         Field::new("image_uri", DataType::Utf8, false),
         Field::new("name", DataType::Utf8, false),
         Field::new("symbol", DataType::Utf8, false),
-    ];
-    if keep_metadata_json {
-        fields.push(Field::new("metadata_json", DataType::Utf8, false));
-    }
-    fields.extend([
+        Field::new("metadata_json", DataType::Utf8, false),
         Field::new("token_uri_norm", DataType::Utf8, false),
         Field::new("image_uri_norm", DataType::Utf8, false),
         Field::new("name_norm", DataType::Utf8, false),
-    ]);
+    ];
     Arc::new(Schema::new(fields))
 }
 
-fn snapshot_batch(
-    chain: &str,
-    rows: &[SnapshotExportRow],
-    keep_metadata_json: bool,
-) -> Result<RecordBatch, AppError> {
-    let schema = snapshot_schema(keep_metadata_json);
+fn snapshot_batch(chain: &str, rows: &[SnapshotExportRow]) -> Result<RecordBatch, AppError> {
+    let schema = snapshot_schema();
     let chain_values: Vec<String> = rows.iter().map(|_| chain.to_string()).collect();
     let contract_address_values: Vec<String> = rows
         .iter()
@@ -86,10 +78,8 @@ fn snapshot_batch(
         Arc::new(StringArray::from(image_uri_values.clone())),
         Arc::new(StringArray::from(name_values.clone())),
         Arc::new(StringArray::from(symbol_values.clone())),
+        Arc::new(StringArray::from(metadata_json_values)),
     ];
-    if keep_metadata_json {
-        columns.push(Arc::new(StringArray::from(metadata_json_values.clone())));
-    }
     columns.extend([
         Arc::new(StringArray::from(
             token_uri_values
@@ -114,10 +104,7 @@ fn snapshot_batch(
     RecordBatch::try_new(schema, columns).map_err(|err| AppError::InvalidData(err.to_string()))
 }
 
-fn open_snapshot_writer(
-    output_path: &Path,
-    keep_metadata_json: bool,
-) -> Result<ArrowWriter<std::fs::File>, AppError> {
+fn open_snapshot_writer(output_path: &Path) -> Result<ArrowWriter<std::fs::File>, AppError> {
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -125,7 +112,7 @@ fn open_snapshot_writer(
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(Default::default()))
         .build();
-    ArrowWriter::try_new(file, snapshot_schema(keep_metadata_json), Some(props))
+    ArrowWriter::try_new(file, snapshot_schema(), Some(props))
         .map_err(|err| AppError::InvalidData(err.to_string()))
 }
 
@@ -133,10 +120,9 @@ pub fn write_snapshot_rows_to_parquet(
     chain: &str,
     rows: &[SnapshotExportRow],
     output_path: &Path,
-    keep_metadata_json: bool,
 ) -> Result<(), AppError> {
-    let mut writer = open_snapshot_writer(output_path, keep_metadata_json)?;
-    let batch = snapshot_batch(chain, rows, keep_metadata_json)?;
+    let mut writer = open_snapshot_writer(output_path)?;
+    let batch = snapshot_batch(chain, rows)?;
     writer
         .write(&batch)
         .map_err(|err| AppError::InvalidData(err.to_string()))?;
@@ -151,7 +137,6 @@ pub fn export_chain_snapshot_to_parquet(
     chain: &str,
     output_path: &Path,
     fetch_size: usize,
-    keep_metadata_json: bool,
 ) -> Result<(), AppError> {
     let table = chain_to_table(chain)?;
     let metadata_row = conn.query_opt(
@@ -177,7 +162,7 @@ pub fn export_chain_snapshot_to_parquet(
         ORDER BY id
         "
     );
-    let mut writer = open_snapshot_writer(output_path, keep_metadata_json)?;
+    let mut writer = open_snapshot_writer(output_path)?;
     let mut rows = conn.query_raw(&query, std::iter::empty::<&(dyn ToSql + Sync)>())?;
     let batch_size = fetch_size.max(1);
     let mut buffer: Vec<SnapshotExportRow> = Vec::with_capacity(batch_size);
@@ -192,7 +177,7 @@ pub fn export_chain_snapshot_to_parquet(
             metadata_json: row.get::<_, String>(6),
         });
         if buffer.len() >= batch_size {
-            let batch = snapshot_batch(chain, &buffer, keep_metadata_json)?;
+            let batch = snapshot_batch(chain, &buffer)?;
             writer
                 .write(&batch)
                 .map_err(|err| AppError::InvalidData(err.to_string()))?;
@@ -200,7 +185,7 @@ pub fn export_chain_snapshot_to_parquet(
         }
     }
     if !buffer.is_empty() {
-        let batch = snapshot_batch(chain, &buffer, keep_metadata_json)?;
+        let batch = snapshot_batch(chain, &buffer)?;
         writer
             .write(&batch)
             .map_err(|err| AppError::InvalidData(err.to_string()))?;
