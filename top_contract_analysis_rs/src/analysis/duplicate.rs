@@ -107,6 +107,18 @@ fn should_score_metadata(row: &ContractDuplicateRecord, has_metadata_recall_flag
     !has_metadata_recall_flags || row.metadata_recall_match
 }
 
+fn has_non_metadata_reason(row: &ContractDuplicateRecord, has_name_match: bool) -> bool {
+    row.token_uri_match || row.image_uri_match || has_name_match
+}
+
+fn should_recheck_metadata(
+    row: &ContractDuplicateRecord,
+    has_metadata_recall_flags: bool,
+    has_non_metadata_reason: bool,
+) -> bool {
+    should_score_metadata(row, has_metadata_recall_flags) || has_non_metadata_reason
+}
+
 fn seed_metadata_queries_by_token(
     seed_nfts: &[SeedNft],
 ) -> BTreeMap<String, MetadataBm25SingleDocumentQuery> {
@@ -439,30 +451,34 @@ pub fn build_duplicate_candidates_from_contract_rows(
             if row.image_uri_match {
                 reasons.push("image_uri_match".to_string());
             }
-            if name_match_contracts
+            let has_name_match = name_match_contracts
                 .get(contract_index)
                 .copied()
-                .unwrap_or(false)
-            {
+                .unwrap_or(false);
+            if has_name_match {
                 reasons.push("name_match".to_string());
             }
             let mut metadata_match_row = None;
-            if should_score_metadata(row, has_metadata_recall_flags) {
-                if let Some(row_doc) = metadata_index.candidate_doc(contract_index) {
-                    if metadata_queries.iter().any(|query| {
-                        query.has_term_overlap(row_doc)
-                            && score_metadata_indexed_pair_with_query(query, row_doc)
-                                >= metadata_threshold
-                    }) {
-                        metadata_match_row = first_overlapping_metadata_match(
-                            &seed_final_metadata_queries_by_token,
-                            row,
-                            metadata_threshold,
-                        );
-                    }
-                    if metadata_match_row.is_some() {
-                        reasons.push("metadata_match".to_string());
-                    }
+            let has_non_metadata_reason = has_non_metadata_reason(row, has_name_match);
+            if should_recheck_metadata(row, has_metadata_recall_flags, has_non_metadata_reason) {
+                let representative_prefilter_match = metadata_index
+                    .candidate_doc(contract_index)
+                    .is_some_and(|row_doc| {
+                        metadata_queries.iter().any(|query| {
+                            query.has_term_overlap(row_doc)
+                                && score_metadata_indexed_pair_with_query(query, row_doc)
+                                    >= metadata_threshold
+                        })
+                    });
+                if has_non_metadata_reason || representative_prefilter_match {
+                    metadata_match_row = first_overlapping_metadata_match(
+                        &seed_final_metadata_queries_by_token,
+                        row,
+                        metadata_threshold,
+                    );
+                }
+                if metadata_match_row.is_some() {
+                    reasons.push("metadata_match".to_string());
                 }
             }
 
@@ -656,6 +672,101 @@ mod tests {
             build_duplicate_candidates("ethereum", &seed_nfts, &snapshot_rows, 95.0, 0.55);
 
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn duplicate_candidates_add_metadata_reason_to_name_recalled_contracts() {
+        let seed_nfts = vec![SeedNft {
+            contract_address: "0xseed".into(),
+            token_id: "1".into(),
+            name: "PudgyPenguins".into(),
+            metadata_json: metadata_json("gold dragon"),
+            ..Default::default()
+        }];
+        let metadata_row = DatabaseNftRecord {
+            contract_address: "0xcandidate".into(),
+            token_id: "1".into(),
+            name: "Pudgy Penguins".into(),
+            metadata_json: metadata_json("gold dragon"),
+            metadata_recall_checked: true,
+            metadata_recall_match: false,
+            ..Default::default()
+        };
+        let contract_rows = vec![ContractDuplicateRecord {
+            contract_address: "0xcandidate".into(),
+            representative: metadata_row.clone(),
+            name_norms: vec![normalize_name("Pudgy Penguins")],
+            metadata_token_rows: vec![metadata_row],
+            metadata_recall_checked: true,
+            metadata_recall_match: false,
+            ..Default::default()
+        }];
+
+        let candidates = build_duplicate_candidates_from_contract_rows(
+            "ethereum",
+            &seed_nfts,
+            &contract_rows,
+            95.0,
+            0.55,
+        );
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].match_reasons,
+            vec!["metadata_match", "name_match"]
+        );
+    }
+
+    #[test]
+    fn duplicate_candidates_recheck_overlap_metadata_when_representative_metadata_misses() {
+        let seed_nfts = vec![SeedNft {
+            contract_address: "0xseed".into(),
+            token_id: "1".into(),
+            name: "PudgyPenguins".into(),
+            metadata_json: metadata_json("gold dragon"),
+            ..Default::default()
+        }];
+        let name_representative = DatabaseNftRecord {
+            contract_address: "0xcandidate".into(),
+            token_id: "0".into(),
+            name: "Pudgy Penguins".into(),
+            metadata_json: metadata_json("silver cat"),
+            metadata_recall_checked: true,
+            metadata_recall_match: false,
+            ..Default::default()
+        };
+        let overlapping_metadata_row = DatabaseNftRecord {
+            contract_address: "0xcandidate".into(),
+            token_id: "1".into(),
+            metadata_json: metadata_json("gold dragon"),
+            metadata_recall_checked: false,
+            metadata_recall_match: false,
+            ..Default::default()
+        };
+        let contract_rows = vec![ContractDuplicateRecord {
+            contract_address: "0xcandidate".into(),
+            representative: name_representative,
+            name_norms: vec![normalize_name("Pudgy Penguins")],
+            metadata_token_rows: vec![overlapping_metadata_row],
+            metadata_recall_checked: true,
+            metadata_recall_match: false,
+            ..Default::default()
+        }];
+
+        let candidates = build_duplicate_candidates_from_contract_rows(
+            "ethereum",
+            &seed_nfts,
+            &contract_rows,
+            95.0,
+            0.55,
+        );
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].token_id, "1");
+        assert_eq!(
+            candidates[0].match_reasons,
+            vec!["metadata_match", "name_match"]
+        );
     }
 
     #[test]
