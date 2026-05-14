@@ -173,14 +173,7 @@ impl ContractSignalCache {
             .into_iter()
             .collect();
         let address_signals = analyze_transfer_signals(transfers);
-        let victim_signals = if owners.is_empty() {
-            None
-        } else {
-            Some(analyze_victim_signals_from_active_sellers(
-                &active_sellers,
-                owners,
-            ))
-        };
+        let victim_signals = analyze_victim_signals_from_active_sellers(&active_sellers, owners);
 
         let conn = self.conn()?;
         conn.execute(
@@ -197,10 +190,7 @@ impl ContractSignalCache {
                 serde_json::to_string(&mint_recipients)?,
                 serde_json::to_string(&active_sellers)?,
                 serde_json::to_string(&address_signals)?,
-                victim_signals
-                    .as_ref()
-                    .map(serde_json::to_string)
-                    .transpose()?,
+                serde_json::to_string(&victim_signals)?,
                 serde_json::to_string(transfers)?,
                 serde_json::to_string(owners)?,
             ],

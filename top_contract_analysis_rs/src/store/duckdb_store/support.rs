@@ -113,7 +113,7 @@ pub(super) struct FeatureChainStats {
 pub(super) fn seed_metadata_representative_doc(
     seed_nfts: &[SeedNft],
 ) -> Option<MetadataBm25Document> {
-    seed_nfts.first().and_then(|item| {
+    seed_nfts.iter().find_map(|item| {
         let doc = metadata_recall_document(&item.metadata_json);
         MetadataBm25Document::from_text(&doc)
     })

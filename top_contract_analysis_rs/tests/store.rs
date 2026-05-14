@@ -1136,6 +1136,102 @@ fn feature_store_uses_full_representative_metadata_document_for_sketch_recall() 
 }
 
 #[test]
+fn feature_store_preserves_real_seed_scoped_metadata_recall_harness() {
+    let store = DuckDbFeatureStore::new(":memory:").unwrap();
+    let pudgy_seed = "0xbd3531da5cf5857e7cfaa92426877b022e612cf8";
+    let expected_contracts = vec![
+        "0x04c99966055a5ed25515b39b90380818d0be4f7d",
+        "0x62356ee545fad90275893e349f1ff1f7b519dfcb",
+    ];
+    let pudgy_metadata = r#"{
+        "description":"Pudgy Penguins seed metadata recall fixture with iceberg expedition, blue beanie, flippers, snowdrift, arctic license, and companion colony traits",
+        "image":"ipfs://pudgy-fixture/1.png",
+        "attributes":[
+            {"trait_type":"Background","value":"Iceberg"},
+            {"trait_type":"Skin","value":"Blue"},
+            {"trait_type":"Head","value":"Beanie"},
+            {"trait_type":"Body","value":"Expedition Parka"}
+        ]
+    }"#;
+
+    store
+        .replace_chain_rows(
+            "ethereum",
+            &[
+                DatabaseNftRecord {
+                    contract_address: expected_contracts[0].into(),
+                    token_id: "1".into(),
+                    metadata_json: pudgy_metadata.into(),
+                    ..Default::default()
+                },
+                DatabaseNftRecord {
+                    contract_address: expected_contracts[1].into(),
+                    token_id: "1".into(),
+                    metadata_json: pudgy_metadata.into(),
+                    ..Default::default()
+                },
+                DatabaseNftRecord {
+                    contract_address: "0x274efe754cf11df3321748251fd3024a79881852".into(),
+                    token_id: "1".into(),
+                    metadata_json:
+                        r#"{"description":"Azuki garden red bean samurai alley fixture"}"#.into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+
+    let seed_nfts = vec![
+        SeedNft {
+            chain: "ethereum".into(),
+            contract_address: pudgy_seed.into(),
+            token_id: "0".into(),
+            metadata_json: String::new(),
+            ..Default::default()
+        },
+        SeedNft {
+            chain: "ethereum".into(),
+            contract_address: pudgy_seed.into(),
+            token_id: "1".into(),
+            metadata_json: pudgy_metadata.into(),
+            ..Default::default()
+        },
+    ];
+    let snapshot = store
+        .load_snapshot("ethereum", &seed_nfts, 101.0, 0.6, 0, 1)
+        .unwrap();
+
+    let mut recalled_contracts = snapshot
+        .duplicate_contract_rows
+        .iter()
+        .filter(|row| row.metadata_recall_match)
+        .map(|row| row.contract_address.as_str())
+        .collect::<Vec<_>>();
+    recalled_contracts.sort_unstable();
+    assert_eq!(recalled_contracts, expected_contracts);
+
+    let candidates = build_duplicate_candidates_from_contract_rows(
+        "ethereum",
+        &seed_nfts,
+        &snapshot.duplicate_contract_rows,
+        101.0,
+        0.6,
+    );
+    let mut metadata_hits = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .match_reasons
+                .iter()
+                .any(|reason| reason == "metadata_match")
+        })
+        .map(|candidate| candidate.contract_address.as_str())
+        .collect::<Vec<_>>();
+    metadata_hits.sort_unstable();
+    assert_eq!(metadata_hits, expected_contracts);
+}
+
+#[test]
 fn feature_store_applies_metadata_only_cap_after_source_prefilter() {
     let store = DuckDbFeatureStore::new(":memory:").unwrap();
     store
@@ -1308,6 +1404,23 @@ fn signal_cache_round_trips_transfers_and_owners() {
     assert_eq!(cached.active_sellers, vec!["0xminter"]);
     assert_eq!(cached.address_signals.mint_count, 1);
     assert_eq!(cached.victim_signals.unwrap().owner_count, 1);
+}
+
+#[test]
+fn signal_cache_stores_empty_victim_signals_when_owners_are_empty() {
+    let cache = ContractSignalCache::new(":memory:").unwrap();
+    let transfers = vec![TransferRecord::mint("0xdup", "1", 100, "0xminter")];
+
+    cache
+        .put("ethereum", "0xdup", "ERC721", &transfers, &[])
+        .unwrap();
+    let cached = cache.get("ethereum", "0xdup", "ERC721").unwrap().unwrap();
+    let victim_signals = cached.victim_signals.unwrap();
+
+    assert_eq!(victim_signals.owner_count, 0);
+    assert_eq!(victim_signals.stuck_holder_count, 0);
+    assert_eq!(victim_signals.stuck_holder_ratio, Some(0.0));
+    assert_eq!(victim_signals.victim_wallet_count, 0);
 }
 
 #[test]

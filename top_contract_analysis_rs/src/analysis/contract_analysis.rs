@@ -191,17 +191,12 @@ pub(super) async fn analyze_duplicate_contract(
     };
     let (transfers, owners, transfer_signals, victim_signal) = if let Some(cached) = cached_signals
     {
-        let victim_signal = cached.victim_signals.ok_or_else(|| {
-            AppError::InvalidData(format!(
-                "signal cache missing victim signals for {contract_address}; rebuild the signal cache"
-            ))
-        })?;
-        (
-            cached.transfers,
-            cached.owners,
-            cached.address_signals,
-            victim_signal,
-        )
+        let transfers = cached.transfers;
+        let owners = cached.owners;
+        let victim_signal = cached
+            .victim_signals
+            .unwrap_or_else(|| analyze_victim_signals_from_active_sellers(&transfers, &owners));
+        (transfers, owners, cached.address_signals, victim_signal)
     } else {
         let (transfers, owners) = {
             let _contract_permit = acquire_optional_limit(&runtime_limits.contract_limit).await?;

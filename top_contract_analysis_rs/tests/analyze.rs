@@ -4921,7 +4921,7 @@ async fn analyze_reuses_signal_cache_for_transfers_and_owners() {
 }
 
 #[tokio::test]
-async fn analyze_rejects_signal_cache_rows_without_victim_signals() {
+async fn analyze_recovers_signal_cache_rows_without_victim_signals() {
     let deps = AnalysisDeps {
         api: Arc::new(CountingApi::new()),
         feature_store: Arc::new(FakeFeatureStore {
@@ -4945,7 +4945,7 @@ async fn analyze_rejects_signal_cache_rows_without_victim_signals() {
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
 
-    let err = analyze_seed_contract(
+    let payload = analyze_seed_contract(
         AnalyzeRequest {
             chain: "ethereum".into(),
             seed_contract_address: "0xseed".into(),
@@ -4955,9 +4955,10 @@ async fn analyze_rejects_signal_cache_rows_without_victim_signals() {
         &deps,
     )
     .await
-    .expect_err("cache rows without victim signals should be rejected");
+    .expect("cache rows without victim signals should be recomputed from cached rows");
 
-    assert!(err.to_string().contains("victim signals"));
+    assert_eq!(payload.victim_signals["0xdup"].owner_count, 1);
+    assert_eq!(payload.victim_signals["0xdup"].stuck_holder_count, 1);
 }
 
 #[tokio::test]
