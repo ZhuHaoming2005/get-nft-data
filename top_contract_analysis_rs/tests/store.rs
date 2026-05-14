@@ -6,9 +6,10 @@ use top_contract_analysis_rs::analysis::duplicate::{
     build_duplicate_candidates, build_duplicate_candidates_from_contract_rows,
 };
 use top_contract_analysis_rs::models::{DatabaseNftRecord, OwnerBalance, SeedNft, TransferRecord};
+#[cfg(feature = "export-snapshot")]
+use top_contract_analysis_rs::store::{write_snapshot_rows_to_parquet, SnapshotExportRow};
 use top_contract_analysis_rs::store::{
-    write_snapshot_rows_to_parquet, ContractSignalCache, DuckDbFeatureStore, DuckDbResourceOptions,
-    SnapshotExportRow,
+    ContractSignalCache, DuckDbFeatureStore, DuckDbResourceOptions,
 };
 
 fn parquet_path_literal(path: &std::path::Path) -> String {
@@ -1423,6 +1424,7 @@ fn signal_cache_stores_empty_victim_signals_when_owners_are_empty() {
     assert_eq!(victim_signals.victim_wallet_count, 0);
 }
 
+#[cfg(feature = "export-snapshot")]
 #[test]
 fn snapshot_export_writes_current_precomputed_columns_without_legacy_fields() {
     let dir = tempdir().unwrap();

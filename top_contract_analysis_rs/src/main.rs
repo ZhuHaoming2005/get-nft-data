@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use clap::Parser;
+#[cfg(feature = "export-snapshot")]
 use postgres::{Client, NoTls};
 use tokio::runtime::Runtime;
 use top_contract_analysis_rs::analysis::{
@@ -8,6 +9,7 @@ use top_contract_analysis_rs::analysis::{
     BatchRequest, RealApi,
 };
 use top_contract_analysis_rs::cli::{Command, TopContractAnalysisCli};
+#[cfg(feature = "export-snapshot")]
 use top_contract_analysis_rs::config::postgres_connection_config;
 use top_contract_analysis_rs::error::AppError;
 use top_contract_analysis_rs::progress::{
@@ -15,11 +17,13 @@ use top_contract_analysis_rs::progress::{
     NoopBatchProgressReporter, NoopProgressReporter,
 };
 use top_contract_analysis_rs::reporting::{write_batch_summary_outputs, write_default_outputs};
+#[cfg(feature = "export-snapshot")]
+use top_contract_analysis_rs::store::export_chain_snapshot_to_parquet;
 use top_contract_analysis_rs::store::{
-    export_chain_snapshot_to_parquet, ContractSignalCache, DuckDbFeatureStore,
-    DuckDbResourceOptions,
+    ContractSignalCache, DuckDbFeatureStore, DuckDbResourceOptions,
 };
 
+#[cfg(feature = "export-snapshot")]
 fn connect_postgres_from_constants() -> Result<Client, AppError> {
     let config = postgres_connection_config();
     Client::connect(&config, NoTls).map_err(AppError::from)
@@ -122,6 +126,7 @@ fn main() -> Result<(), AppError> {
             write_batch_summary_outputs(&payload, &output_dir)?;
             Ok(())
         }),
+        #[cfg(feature = "export-snapshot")]
         Command::ExportSnapshot(args) => {
             let mut conn = connect_postgres_from_constants()?;
             export_chain_snapshot_to_parquet(
@@ -132,5 +137,9 @@ fn main() -> Result<(), AppError> {
             )?;
             Ok(())
         }
+        #[cfg(not(feature = "export-snapshot"))]
+        Command::ExportSnapshot(_) => Err(AppError::InvalidData(
+            "export-snapshot requires building with --features export-snapshot".to_string(),
+        )),
     }
 }

@@ -53,7 +53,7 @@ set +a
 把 PostgreSQL 中的 NFT 特征快照导出为 Parquet 文件。
 
 ```bash
-cargo run --release -- export-snapshot \
+cargo run --release --features export-snapshot -- export-snapshot \
   --chain ethereum \
   --output ../output/top_contract_analysis/ethereum.parquet
 ```
@@ -158,7 +158,7 @@ cargo run --release -- batch \
 
 ## 典型使用流程
 
-1. 先用 `export-snapshot` 从 PostgreSQL 导出特征快照到 Parquet。
+1. 先用 `cargo run --release --features export-snapshot -- export-snapshot ...` 从 PostgreSQL 导出特征快照到 Parquet。
 2. 用 `analyze` 跑一个 seed 合约，确认 API 凭证、阈值和输出格式都正常。
 3. 再用 `batch` 跑正式批量分析。
 

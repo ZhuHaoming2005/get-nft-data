@@ -24,6 +24,7 @@ impl From<duckdb::Error> for AppError {
     }
 }
 
+#[cfg(feature = "export-snapshot")]
 impl From<postgres::Error> for AppError {
     fn from(value: postgres::Error) -> Self {
         Self::Postgres(value.to_string())
