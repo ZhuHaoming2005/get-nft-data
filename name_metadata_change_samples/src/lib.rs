@@ -2319,57 +2319,117 @@ fn build_metadata_comparison(seed: String, matches: Vec<FinalMetadataMatch>) -> 
     }
 }
 
-fn classify_name_modifications(seed: &str, value: &str) -> Vec<String> {
-    let mut labels = Vec::new();
-    let seed_trimmed = seed.trim();
-    let value_trimmed = value.trim();
-    let seed_norm = normalize_name(seed_trimmed);
-    let value_norm = normalize_name(value_trimmed);
+const NAME_LABEL_EXACT_CLONE: &str = "exact_clone";
+const NAME_LABEL_FORMAT_PERTURBATION: &str = "format_perturbation";
+const NAME_LABEL_LEXICAL_MUTATION: &str = "lexical_mutation";
+const NAME_LABEL_OTHER: &str = "other";
+const NAME_LABEL_SUFFIX_AUGMENTATION: &str = "suffix_augmentation";
 
-    if seed_trimmed == value_trimmed && !seed_trimmed.is_empty() {
-        return vec!["exact_clone".to_string()];
-    }
-    let suffix_augmented =
-        has_suffix_augmentation(seed_trimmed, value_trimmed, &seed_norm, &value_norm);
-    if suffix_augmented {
-        labels.push("suffix_augmentation");
-    }
-    let value_augmentation_core = if suffix_augmented {
-        Some(strip_raw_augmentation_suffix_matching_seed(
-            seed_trimmed,
-            value_trimmed,
-        ))
-    } else {
-        None
-    };
-    if has_name_format_perturbation(seed_trimmed, value_trimmed)
-        || value_augmentation_core
-            .as_deref()
-            .is_some_and(|core| has_name_format_perturbation(seed_trimmed, core))
-    {
-        labels.push("format_perturbation");
-    }
-    let seed_lexical_raw = if suffix_augmented {
-        strip_raw_trailing_number_suffix(seed_trimmed)
-    } else {
-        seed_trimmed.to_string()
-    };
-    let value_lexical_raw = if suffix_augmented {
-        value_augmentation_core.unwrap_or_else(|| {
-            strip_raw_augmentation_suffix_matching_seed(seed_trimmed, value_trimmed)
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum NameClassificationState {
+    ExactClone,
+    Compare(NameComparisonState),
+}
+
+// Name labels are emitted from this state machine:
+// ExactClone -> exact_clone; otherwise compare the value core after any confirmed
+// suffix removal, then emit suffix, format, and lexical labels in stable order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NameComparisonState {
+    seed_raw: String,
+    value_core_after_suffix: String,
+    lexical_seed_core: String,
+    lexical_value_core: String,
+    suffix_augmented: bool,
+}
+
+impl NameClassificationState {
+    fn from_pair(seed: &str, value: &str) -> Self {
+        let seed_raw = seed.trim().to_string();
+        let value_raw = value.trim().to_string();
+        if seed_raw == value_raw && !seed_raw.is_empty() {
+            return Self::ExactClone;
+        }
+
+        let suffix_augmented = has_suffix_augmentation(&seed_raw, &value_raw);
+        let value_core_after_suffix = if suffix_augmented {
+            strip_raw_augmentation_suffix_matching_seed(&seed_raw, &value_raw)
+        } else {
+            value_raw
+        };
+        let seed_lexical_raw = if suffix_augmented {
+            strip_raw_trailing_number_suffix(&seed_raw)
+        } else {
+            seed_raw.clone()
+        };
+
+        Self::Compare(NameComparisonState {
+            lexical_seed_core: canonical_format_name(&seed_lexical_raw),
+            lexical_value_core: canonical_format_name(&value_core_after_suffix),
+            seed_raw,
+            value_core_after_suffix,
+            suffix_augmented,
         })
-    } else {
-        value_trimmed.to_string()
-    };
-    let seed_lexical_core = canonical_format_name(&seed_lexical_raw);
-    let value_lexical_core = canonical_format_name(&value_lexical_raw);
-    if has_name_lexical_mutation(&seed_lexical_core, &value_lexical_core) {
-        labels.push("lexical_mutation");
     }
-    if labels.is_empty() {
-        labels.push("other");
+
+    fn labels(&self) -> Vec<&'static str> {
+        match self {
+            Self::ExactClone => vec![NAME_LABEL_EXACT_CLONE],
+            Self::Compare(state) => state.labels(),
+        }
     }
-    labels.into_iter().map(str::to_string).collect()
+}
+
+impl NameComparisonState {
+    fn labels(&self) -> Vec<&'static str> {
+        let mut labels = Vec::new();
+        if self.suffix_augmented {
+            labels.push(NAME_LABEL_SUFFIX_AUGMENTATION);
+        }
+        if self.has_format_perturbation() {
+            labels.push(NAME_LABEL_FORMAT_PERTURBATION);
+        }
+        if self.has_lexical_mutation() {
+            labels.push(NAME_LABEL_LEXICAL_MUTATION);
+        }
+        if labels.is_empty() {
+            labels.push(NAME_LABEL_OTHER);
+        }
+        labels
+    }
+
+    fn has_format_perturbation(&self) -> bool {
+        has_name_format_perturbation(&self.seed_raw, &self.value_core_after_suffix)
+    }
+
+    fn has_lexical_mutation(&self) -> bool {
+        has_name_lexical_mutation(&self.lexical_seed_core, &self.lexical_value_core)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NameFormatRelation {
+    SameRaw,
+    CanonicalEquivalent,
+    SeparatorShiftedLexicalNeighbor,
+    NoFormatEvidence,
+}
+
+impl NameFormatRelation {
+    fn emits_format_label(self) -> bool {
+        matches!(
+            self,
+            Self::CanonicalEquivalent | Self::SeparatorShiftedLexicalNeighbor
+        )
+    }
+}
+
+fn classify_name_modifications(seed: &str, value: &str) -> Vec<String> {
+    NameClassificationState::from_pair(seed, value)
+        .labels()
+        .into_iter()
+        .map(str::to_string)
+        .collect()
 }
 
 fn classify_metadata_modifications(seed: &str, value: &str) -> Vec<String> {
@@ -2803,19 +2863,29 @@ fn has_derivative_suffix(value: &str) -> bool {
         .any(|pattern| pattern.is_match(&value))
 }
 
-fn has_suffix_augmentation(seed: &str, value: &str, seed_norm: &str, value_norm: &str) -> bool {
-    if has_derivative_suffix(value) {
-        let seed_canonical = canonical_format_name(seed);
-        return raw_augmentation_suffix_candidates(value)
-            .iter()
-            .any(|candidate| seed_canonical == canonical_format_name(candidate));
-    }
+fn has_suffix_augmentation(seed: &str, value: &str) -> bool {
+    has_seed_preserving_derivative_suffix(seed, value)
+        || has_seed_preserving_numeric_suffix(seed, value)
+}
 
+fn has_seed_preserving_derivative_suffix(seed: &str, value: &str) -> bool {
+    if !has_derivative_suffix(value) {
+        return false;
+    }
+    let seed_canonical = canonical_format_name(seed);
+    raw_augmentation_suffix_candidates(value)
+        .iter()
+        .any(|candidate| seed_canonical == canonical_format_name(candidate))
+}
+
+fn has_seed_preserving_numeric_suffix(seed: &str, value: &str) -> bool {
     let seed_has_numeric_suffix = has_trailing_number_suffix(seed);
     let value_has_numeric_suffix = has_trailing_number_suffix(value);
     if !seed_has_numeric_suffix && !value_has_numeric_suffix {
         return false;
     }
+    let seed_norm = normalize_name(seed);
+    let value_norm = normalize_name(value);
     if seed_norm == value_norm && seed != value {
         return true;
     }
@@ -2854,7 +2924,67 @@ fn is_name_format_separator(ch: char) -> bool {
 }
 
 fn has_name_format_perturbation(seed: &str, value: &str) -> bool {
-    seed.trim() != value.trim() && canonical_format_name(seed) == canonical_format_name(value)
+    name_format_relation(seed, value).emits_format_label()
+}
+
+fn name_format_relation(seed: &str, value: &str) -> NameFormatRelation {
+    let seed_trimmed = seed.trim();
+    let value_trimmed = value.trim();
+    if seed_trimmed == value_trimmed {
+        return NameFormatRelation::SameRaw;
+    }
+
+    let seed_canonical = canonical_format_name(seed_trimmed);
+    let value_canonical = canonical_format_name(value_trimmed);
+    if seed_canonical == value_canonical {
+        return NameFormatRelation::CanonicalEquivalent;
+    }
+
+    if has_name_format_separator_perturbation(seed_trimmed, value_trimmed)
+        && !suffix_removal_absorbs_format_delta(seed_trimmed, value_trimmed)
+        && seed_canonical.len().abs_diff(value_canonical.len()) <= 2
+        && has_name_lexical_mutation(&seed_canonical, &value_canonical)
+    {
+        return NameFormatRelation::SeparatorShiftedLexicalNeighbor;
+    }
+
+    NameFormatRelation::NoFormatEvidence
+}
+
+fn has_name_format_separator_perturbation(seed: &str, value: &str) -> bool {
+    let seed_signature = name_format_separator_signature(seed);
+    let value_signature = name_format_separator_signature(value);
+    seed_signature != value_signature && (seed_signature.is_empty() || value_signature.is_empty())
+}
+
+fn name_format_separator_signature(value: &str) -> Vec<char> {
+    normalize_nfkc(value)
+        .chars()
+        .filter_map(|ch| {
+            if ch.is_whitespace() {
+                Some(' ')
+            } else if should_render_as_codepoint(ch) {
+                Some('\u{0}')
+            } else if matches!(ch, '-' | '_' | '.' | ':' | '：' | '/' | '\\' | '|') {
+                Some(ch)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn suffix_removal_absorbs_format_delta(seed: &str, value: &str) -> bool {
+    let seed_stripped = strip_raw_trailing_number_suffix(seed);
+    let value_stripped = strip_raw_trailing_number_suffix(value);
+    let same_after_number_suffix_removal = (seed_stripped != seed.trim()
+        || value_stripped != value.trim())
+        && canonical_format_name(&seed_stripped) == canonical_format_name(&value_stripped);
+    let seed_suffix_removed_from_value = (has_trailing_number_suffix(seed)
+        || has_derivative_suffix(seed))
+        && !has_trailing_number_suffix(value)
+        && !has_derivative_suffix(value);
+    same_after_number_suffix_removal || seed_suffix_removed_from_value
 }
 
 fn strip_raw_trailing_number_suffix(raw: &str) -> String {
@@ -3903,7 +4033,7 @@ mod tests {
     }
 
     #[test]
-    fn name_uses_paper_level_mutually_exclusive_labels() {
+    fn name_uses_paper_level_labels() {
         assert_eq!(
             classify_name_modifications("BoredApeYachtClub", "Bored Ape Yacht Club"),
             vec!["format_perturbation"]
@@ -3914,7 +4044,7 @@ mod tests {
         );
         assert_eq!(
             classify_name_modifications("BoredApeYachtClub", "Bored Ape Yacht Clubie"),
-            vec!["lexical_mutation"]
+            vec!["format_perturbation", "lexical_mutation"]
         );
         assert_eq!(
             classify_name_modifications("Azuki", "Azuki2"),
@@ -4086,8 +4216,32 @@ mod tests {
             vec!["lexical_mutation"]
         );
         assert_eq!(
+            classify_name_modifications("CryptoDickbutts S3", "CryptoBickdutts"),
+            vec!["lexical_mutation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Invisible Friends 3D", "Invisible Friends"),
+            vec!["lexical_mutation"]
+        );
+        assert_eq!(
             classify_name_modifications("CyberKongz", "Cyberkongz 404"),
             vec!["suffix_augmentation", "format_perturbation"]
+        );
+    }
+
+    #[test]
+    fn name_format_perturbation_overlaps_with_lexical_mutation() {
+        assert_eq!(
+            classify_name_modifications("LilPudgys", "Lil Pudygs"),
+            vec!["format_perturbation", "lexical_mutation"]
+        );
+        assert_eq!(
+            classify_name_modifications("PudgyPenguins", "Phudgy Penguins"),
+            vec!["format_perturbation", "lexical_mutation"]
+        );
+        assert_eq!(
+            classify_name_modifications("Elemental", "Element 280"),
+            vec!["suffix_augmentation", "lexical_mutation"]
         );
     }
 
@@ -4095,7 +4249,7 @@ mod tests {
     fn name_other_examples_are_broad_lexical_mutations() {
         assert_eq!(
             classify_name_modifications("PudgyPenguins", "Phudgy Penguins"),
-            vec!["lexical_mutation"]
+            vec!["format_perturbation", "lexical_mutation"]
         );
         assert_eq!(
             classify_name_modifications("World Of Women", "WORLD OF MEN"),
