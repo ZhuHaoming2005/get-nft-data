@@ -491,22 +491,12 @@ fn read_seed_rows(
         WITH seed_rows AS (
             SELECT CAST(token_id AS VARCHAR) AS token_id,
                    coalesce(CAST(name AS VARCHAR), '') AS name,
-                   coalesce(CAST(metadata_doc AS VARCHAR), '') AS metadata_doc,
                    coalesce(CAST(metadata_json AS VARCHAR), '') AS metadata_json
             FROM nft_features
             WHERE chain = ? AND lower(contract_address) = ?
         )
         SELECT token_id,
                name,
-               CASE
-                   WHEN length(trim(metadata_json)) <= {MAX_METADATA_BYTES_FOR_DEDUP}
-                        AND (
-                            trim(metadata_json) LIKE '{{%'
-                            OR trim(metadata_json) LIKE '[%'
-                        )
-                   THEN metadata_doc
-                   ELSE ''
-               END AS metadata_doc,
                CASE
                    WHEN length(trim(metadata_json)) <= {MAX_METADATA_BYTES_FOR_DEDUP}
                         AND (
@@ -523,11 +513,13 @@ fn read_seed_rows(
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![chain, contract_address.to_lowercase()], |row| {
+        let metadata_json = row.get::<_, String>(2)?;
+        let metadata_doc = record_metadata_doc("", &metadata_json);
         Ok(NftTextRow {
             token_id: row.get::<_, String>(0)?,
             name: row.get::<_, String>(1)?,
-            metadata_doc: row.get::<_, String>(2)?,
-            metadata_json: row.get::<_, String>(3)?,
+            metadata_doc,
+            metadata_json,
         })
     })?;
     rows.collect()
@@ -638,20 +630,19 @@ fn load_metadata_index(
         WITH selected AS (
             SELECT lower(contract_address) AS contract_address,
                    CAST(token_id AS VARCHAR) AS token_id,
-                   coalesce(CAST(metadata_doc AS VARCHAR), '') AS metadata_doc,
                    coalesce(CAST(metadata_json AS VARCHAR), '') AS metadata_json
             FROM nft_features
             WHERE chain = ?
         ),
         ranked AS (
-            SELECT contract_address, token_id, metadata_doc, metadata_json,
+            SELECT contract_address, token_id, metadata_json,
                    row_number() OVER (
                        PARTITION BY contract_address
                        ORDER BY token_id
                    ) AS metadata_rank
             FROM selected
         )
-        SELECT contract_address, metadata_doc, metadata_json
+        SELECT contract_address, metadata_json
         FROM ranked
         WHERE metadata_rank = 1
           AND length(trim(metadata_json)) <= 65536
@@ -663,17 +654,13 @@ fn load_metadata_index(
         ",
     )?;
     let rows = stmt.query_map(params![chain], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
 
     let mut candidates = Vec::new();
     for row in rows {
-        let (contract_address, metadata_doc, metadata_json) = row?;
-        let doc_text = record_metadata_prefilter_text(&metadata_doc, &metadata_json);
+        let (contract_address, metadata_json) = row?;
+        let doc_text = record_metadata_prefilter_text("", &metadata_json);
         let Some(doc) = MetadataDocument::from_text_with_interner(&doc_text, token_interner) else {
             continue;
         };
@@ -1532,11 +1519,10 @@ fn read_candidate_metadata_rows(
             .join(", ");
         let sql = format!(
             "
-            SELECT contract_address, token_id, metadata_doc, metadata_json
+            SELECT contract_address, token_id, metadata_json
             FROM (
                 SELECT lower(contract_address) AS contract_address,
                        CAST(token_id AS VARCHAR) AS token_id,
-                       coalesce(CAST(metadata_doc AS VARCHAR), '') AS metadata_doc,
                        coalesce(CAST(metadata_json AS VARCHAR), '') AS metadata_json,
                        row_number() OVER (
                            PARTITION BY lower(contract_address)
@@ -1562,13 +1548,13 @@ fn read_candidate_metadata_rows(
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
             ))
         })?;
         for row in rows {
-            let (contract_address, token_id, metadata_doc, metadata_json) = row?;
+            let (contract_address, token_id, metadata_json) = row?;
+            let metadata_doc = record_metadata_doc("", &metadata_json);
             let text = record_metadata_text(&metadata_doc, &metadata_json);
-            let scoring_text = record_metadata_doc(&metadata_doc, &metadata_json);
+            let scoring_text = metadata_doc;
             let Some(doc) =
                 MetadataDocument::from_text_with_interner(&scoring_text, token_interner)
             else {
@@ -3493,6 +3479,48 @@ mod tests {
     }
 
     #[test]
+    fn metadata_loaders_derive_doc_from_metadata_json_without_db_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        let shared_json = r#"{"description":"Gold Dragon","attributes":[{"trait_type":"Background","value":"Red"}]}"#;
+        conn.execute_batch(&format!(
+            r#"
+            CREATE TABLE nft_features (
+                chain VARCHAR NOT NULL,
+                contract_address VARCHAR NOT NULL,
+                token_id VARCHAR NOT NULL,
+                name VARCHAR,
+                metadata_json VARCHAR
+            );
+            INSERT INTO nft_features VALUES
+                ('ethereum', '0xseed', '1', 'Seed One', '{shared_json}'),
+                ('ethereum', '0xcopy', '1', 'Copy One', '{shared_json}'),
+                ('ethereum', '0xother', '2', 'Other One', '{{"description":"Other"}}');
+            "#
+        ))
+        .unwrap();
+
+        let seed_rows = read_seed_rows(&conn, "ethereum", "0xseed", 0).unwrap();
+        assert_eq!(seed_rows[0].metadata_doc, "background red gold dragon");
+        assert_eq!(seed_rows[0].metadata_json, shared_json);
+
+        let mut token_interner = TokenInterner::default();
+        let metadata = load_metadata_index(&conn, "ethereum", &mut token_interner).unwrap();
+        assert_eq!(metadata.len(), 3);
+
+        let rows = read_candidate_metadata_rows(
+            &conn,
+            "ethereum",
+            &["0xcopy".to_string()],
+            &BTreeSet::from(["1".to_string()]),
+            &mut token_interner,
+        )
+        .unwrap();
+        let copy_rows = rows.get("0xcopy").unwrap();
+        assert_eq!(copy_rows[0].text, shared_json);
+        assert!(!copy_rows[0].doc.unique_tokens.is_empty());
+    }
+
+    #[test]
     fn overlapping_metadata_row_loader_keeps_one_row_per_candidate_contract() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -3595,7 +3623,7 @@ mod tests {
         assert_eq!(rows[0].metadata_json, "");
         assert_eq!(rows[1].metadata_doc, "");
         assert_eq!(rows[1].metadata_json, "");
-        assert_eq!(rows[2].metadata_doc, "valid doc");
+        assert_eq!(rows[2].metadata_doc, "valid");
         assert_eq!(rows[2].metadata_json, r#"{"description":"valid"}"#);
     }
 
