@@ -772,6 +772,7 @@
       protocol_fee: "平台费用",
       royalty_fee: "版税流",
       withdrawal: "提现",
+      cashout_hop: "多跳提现",
       funding: "启动资金",
       revenue_backflow: "收入回流",
     };
@@ -779,10 +780,16 @@
     const COVERAGE_NAMES = {
       same_tx_native_eth_only: "仅同交易原生 ETH",
       same_tx_native_eth_and_stablecoin_erc20: "同交易 ETH + 稳定币 ERC20",
+      same_block_native_eth_and_stablecoin_erc20_with_bounded_cashout: "同区块 ETH + 稳定币 + 有界提现追踪",
+      same_block_native_eth_and_stablecoin_erc20_with_value_constrained_cashout: "同区块 ETH + 稳定币 + 金额约束提现追踪",
       erc20_transfers_not_traced: "未追踪 ERC20",
       erc20_flows_not_traced: "未追踪 ERC20",
+      later_withdrawals_not_traced: "后续提现未追踪",
       later_withdrawals_not_exhaustive: "后续提现未穷尽",
       cex_bridge_mixer_not_classified: "CEX/Bridge/Mixer 未分类",
+      cashout_trace_same_block_value_constrained: "提现追踪限同区块且需金额约束",
+      known_cex_bridge_mixer_labels_incomplete: "CEX/Bridge/Mixer 地址库未穷尽",
+      multi_hop_cashout_not_traced: "多跳提现未追踪",
       multi_hop_consolidation_not_traced: "多跳归集未追踪",
       royalty_receiver_unresolved: "版税接收者未解析",
     };

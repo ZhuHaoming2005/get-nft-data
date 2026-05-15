@@ -19,10 +19,10 @@ use top_contract_analysis_rs::analysis::scoring::{
 };
 use top_contract_analysis_rs::analysis::signals::analyze_transfer_signals;
 use top_contract_analysis_rs::models::{
-    DatabaseNftRecord, DuplicateCandidate, DuplicateContractPayload, HonestAddressPayload,
-    InfringingTokenRecord, NftMarketEventRecord, NftPropagationPathPayload, NftSaleRecord,
-    OwnerBalance, SecondarySaleVictimAddressPayload, SeedContractPayload, SeedNft, TransferRecord,
-    ValueFlowEdgePayload, ZERO_ADDRESS,
+    AddressAttributionPayload, AddressEvidencePayload, DatabaseNftRecord, DuplicateCandidate,
+    DuplicateContractPayload, HonestAddressPayload, InfringingTokenRecord, NftMarketEventRecord,
+    NftPropagationPathPayload, NftSaleRecord, OwnerBalance, SecondarySaleVictimAddressPayload,
+    SeedContractPayload, SeedNft, TransferRecord, ValueFlowEdgePayload, ZERO_ADDRESS,
 };
 use top_contract_analysis_rs::normalize::{normalize_name, normalize_symbol, normalize_url};
 use unicode_normalization::UnicodeNormalization;
@@ -1141,11 +1141,17 @@ fn lifecycle_model_outputs_expose_research_graph_payloads() {
     assert_eq!(metric.revenue_backflow_edge_count, 1);
     assert_eq!(
         metric.value_flow_coverage_scope,
-        "same_tx_native_eth_and_stablecoin_erc20"
+        "same_block_native_eth_and_stablecoin_erc20_with_value_constrained_cashout"
     );
     assert!(metric
         .value_flow_coverage_gaps
-        .contains(&"later_withdrawals_not_traced".to_string()));
+        .contains(&"later_withdrawals_not_exhaustive".to_string()));
+    assert!(metric
+        .value_flow_coverage_gaps
+        .contains(&"cashout_trace_same_block_value_constrained".to_string()));
+    assert!(metric
+        .value_flow_coverage_gaps
+        .contains(&"known_cex_bridge_mixer_labels_incomplete".to_string()));
     assert_eq!(metric.top_value_recipient_address, "0xdup");
     assert!((metric.top_value_recipient_eth - 0.08).abs() < 1e-9);
     assert!((metric.withdrawal_amount_eth - 0.4).abs() < 1e-9);
@@ -1462,6 +1468,90 @@ fn campaign_clusters_use_funding_source_not_paid_minter_as_shared_evidence() {
         .shared_evidence
         .iter()
         .any(|item| item == "shared_funding_source:0xsharedfunder"));
+}
+
+#[test]
+fn campaign_clusters_use_aggregation_attribution_as_shared_operator_evidence() {
+    let seed_contract = SeedContractPayload {
+        chain: "ethereum".into(),
+        contract_address: "0xseed".into(),
+        token_type: "ERC721".into(),
+        ..SeedContractPayload::default()
+    };
+    let duplicate_contracts = vec![
+        DuplicateContractPayload {
+            contract_address: "0xdup1".into(),
+            candidate_count: 1,
+            ..DuplicateContractPayload::default()
+        },
+        DuplicateContractPayload {
+            contract_address: "0xdup2".into(),
+            candidate_count: 1,
+            ..DuplicateContractPayload::default()
+        },
+    ];
+    let candidates = vec![
+        DuplicateCandidate {
+            contract_address: "0xdup1".into(),
+            token_id: "1".into(),
+            match_reasons: vec!["token_uri_match".into()],
+            confidence: "high".into(),
+            ..DuplicateCandidate::default()
+        },
+        DuplicateCandidate {
+            contract_address: "0xdup2".into(),
+            token_id: "1".into(),
+            match_reasons: vec!["token_uri_match".into()],
+            confidence: "high".into(),
+            ..DuplicateCandidate::default()
+        },
+    ];
+    let address_attributions = vec![
+        AddressAttributionPayload {
+            contract_address: "0xdup1".into(),
+            address: "0xcollector".into(),
+            attribution_label: "suspected_operator".into(),
+            operator_score: 0.35,
+            attacker_score: 0.35,
+            evidence: vec![AddressEvidencePayload {
+                evidence_type: "nft_aggregation".into(),
+                contract_address: "0xdup1".into(),
+                weight: 0.35,
+                ..AddressEvidencePayload::default()
+            }],
+            ..AddressAttributionPayload::default()
+        },
+        AddressAttributionPayload {
+            contract_address: "0xdup2".into(),
+            address: "0xcollector".into(),
+            attribution_label: "suspected_operator".into(),
+            operator_score: 0.35,
+            attacker_score: 0.35,
+            evidence: vec![AddressEvidencePayload {
+                evidence_type: "nft_aggregation".into(),
+                contract_address: "0xdup2".into(),
+                weight: 0.35,
+                ..AddressEvidencePayload::default()
+            }],
+            ..AddressAttributionPayload::default()
+        },
+    ];
+
+    let outputs = build_lifecycle_model_outputs(LifecycleModelInput {
+        seed_contract: &seed_contract,
+        duplicate_candidates: &candidates,
+        duplicate_contracts: &duplicate_contracts,
+        address_attributions: &address_attributions,
+        nft_propagation_paths: &BTreeMap::new(),
+        mint_payment_edges: &[],
+        market_events: &[],
+    });
+
+    assert_eq!(outputs.campaign_clusters.len(), 1);
+    assert!(outputs.campaign_clusters[0]
+        .shared_evidence
+        .iter()
+        .any(|item| item == "shared_address:suspected_operator:0xcollector"));
 }
 
 #[test]

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use futures::{stream, StreamExt};
@@ -11,6 +11,76 @@ use crate::models::{
 };
 
 use super::{acquire_optional_limit, AnalysisDeps, AnalyzeRequest, RuntimeLimits};
+
+const MAX_WITHDRAWAL_TRACE_HOPS: usize = 3;
+const MAX_WITHDRAWAL_TRACE_FRONTIER: usize = 32;
+const MIN_CASHOUT_VALUE_RATIO: f64 = 0.05;
+const MAX_CASHOUT_VALUE_RATIO: f64 = 1.02;
+
+#[derive(Clone, Copy)]
+struct KnownValueFlowEntity {
+    chain: &'static str,
+    address: &'static str,
+    role: &'static str,
+    label: &'static str,
+}
+
+const KNOWN_VALUE_FLOW_ENTITIES: &[KnownValueFlowEntity] = &[
+    KnownValueFlowEntity {
+        chain: "ethereum",
+        address: "0x28c6c06298d514db089934071355e5743bf21d60",
+        role: "cex",
+        label: "binance_hot_wallet",
+    },
+    KnownValueFlowEntity {
+        chain: "ethereum",
+        address: "0x503828976d22510aad0201ac7ec88293211d23da",
+        role: "cex",
+        label: "coinbase_hot_wallet",
+    },
+    KnownValueFlowEntity {
+        chain: "ethereum",
+        address: "0x267be1c1d684f78cb4f6a176c4911b741e4ffdc0",
+        role: "cex",
+        label: "kraken_hot_wallet",
+    },
+    KnownValueFlowEntity {
+        chain: "ethereum",
+        address: "0x8315177ab297ba92a06054ce80a67ed4dbd7ed3a",
+        role: "bridge",
+        label: "arbitrum_one_bridge",
+    },
+    KnownValueFlowEntity {
+        chain: "ethereum",
+        address: "0x99c9fc46f92e8a1c0dec1b1747d010903e884be1",
+        role: "bridge",
+        label: "optimism_standard_bridge",
+    },
+    KnownValueFlowEntity {
+        chain: "ethereum",
+        address: "0xa0c68c638235ee32657e8f720a23cec1bfc77c77",
+        role: "bridge",
+        label: "polygon_bridge",
+    },
+    KnownValueFlowEntity {
+        chain: "ethereum",
+        address: "0xd90e2f925da726b50c4ed8d0fb90ad053324f31b",
+        role: "mixer",
+        label: "tornado_cash_0_1_eth",
+    },
+    KnownValueFlowEntity {
+        chain: "ethereum",
+        address: "0x47ce0c6ed5b0ce3d3a51fdb1c52dc66a7c3c2936",
+        role: "mixer",
+        label: "tornado_cash_1_eth",
+    },
+    KnownValueFlowEntity {
+        chain: "ethereum",
+        address: "0x910cbd523d972eb0a6f4cae4618ad62622b39dbf",
+        role: "mixer",
+        label: "tornado_cash_10_eth",
+    },
+];
 
 pub(super) struct MintPaymentLookup {
     pub(super) tx_hash: String,
@@ -26,6 +96,45 @@ pub(super) struct MintPaymentInputs {
     receipt: Option<TransactionReceiptRecord>,
     base_balance_eth: Option<f64>,
     block_receipts: BTreeMap<String, TransactionReceiptRecord>,
+}
+
+struct CashoutTraceNode {
+    address: String,
+    depth: usize,
+    previous_tx_hash: String,
+    previous_tx_index: Option<i64>,
+    value_eth: Option<f64>,
+    value_usd: Option<f64>,
+    payment_token_symbol: String,
+    payment_token_address: String,
+    path_addresses: BTreeSet<String>,
+}
+
+struct ValueFlowEdgeInput<'a> {
+    chain: &'a str,
+    contract_address: &'a str,
+    lookup: &'a MintPaymentLookup,
+    transfer: &'a EthTransferRecord,
+    receipt: Option<&'a TransactionReceiptRecord>,
+    wallet_snapshot: MintPaymentWalletSnapshot,
+    channel: String,
+    from_role: String,
+    to_role: String,
+    evidence_type: String,
+    evidence_flags: Vec<String>,
+}
+
+struct CashoutTraceInput<'a> {
+    request: &'a AnalyzeRequest,
+    deps: &'a AnalysisDeps,
+    contract_address: &'a str,
+    contract_metadata: Option<&'a ContractMetadata>,
+    lookup: &'a MintPaymentLookup,
+    seed_transfers: &'a [EthTransferRecord],
+    direct_withdrawal_edges: &'a [ValueFlowEdgePayload],
+    mint_receipt: Option<&'a TransactionReceiptRecord>,
+    block_receipts: &'a BTreeMap<String, TransactionReceiptRecord>,
+    payment_limit: &'a Option<Arc<Semaphore>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -131,14 +240,16 @@ pub(super) async fn compute_mint_payment_edges_for_contract(
         let inputs = result?;
         let lookup = inputs.lookup;
         let eth_transfers = inputs.transfers;
+        let receipt = inputs.receipt.as_ref();
         let wallet_snapshot = mint_payment_wallet_snapshot(
             &lookup.minter_address,
             inputs.base_balance_eth,
-            inputs.receipt.as_ref(),
+            receipt,
             &eth_transfers,
             &inputs.block_receipts,
         );
-        for transfer in eth_transfers {
+        let mut direct_withdrawal_edges = Vec::new();
+        for transfer in &eth_transfers {
             if transfer.tx_hash != lookup.tx_hash
                 || (transfer.value_eth <= 0.0 && transfer.value_usd.unwrap_or(0.0) <= 0.0)
             {
@@ -146,7 +257,7 @@ pub(super) async fn compute_mint_payment_edges_for_contract(
             }
             let Some((channel, from_role, to_role, evidence_type, evidence_flags)) =
                 classify_mint_value_flow_transfer(
-                    &transfer,
+                    transfer,
                     &lookup,
                     contract_address,
                     contract_metadata,
@@ -154,43 +265,39 @@ pub(super) async fn compute_mint_payment_edges_for_contract(
             else {
                 continue;
             };
-            let edge_id = format!(
-                "value:{}:{}:{}:{}",
-                channel, transfer.tx_hash, transfer.from_address, transfer.to_address
-            );
-            rows.entry(edge_id.clone()).or_insert(ValueFlowEdgePayload {
-                value_with_gas_eth: value_with_gas_eth(&transfer, inputs.receipt.as_ref()),
-                value_with_gas_usd: value_with_gas_usd(&transfer, inputs.receipt.as_ref()),
-                from_before_eth_balance: wallet_snapshot.before_eth_balance,
-                from_before_usd_balance: wallet_snapshot.before_usd_balance,
-                edge_id,
-                contract_address: contract_address.to_string(),
-                from_address: transfer.from_address,
-                to_address: transfer.to_address,
-                tx_hash: lookup.tx_hash.clone(),
-                block_number: lookup.block_number,
-                block_time: lookup.block_time,
-                token_id: lookup.token_ids.join(","),
-                value_eth: (transfer.value_eth > 0.0).then_some(transfer.value_eth),
-                value_usd: transfer.value_usd.filter(|value| *value > 0.0),
-                payment_token_symbol: if transfer.payment_token_symbol.is_empty() {
-                    "ETH".into()
-                } else {
-                    transfer.payment_token_symbol
-                },
-                payment_token_address: if transfer.payment_token_address.is_empty() {
-                    ZERO_ADDRESS.into()
-                } else {
-                    transfer.payment_token_address
-                },
+            let edge = value_flow_edge_from_transfer(ValueFlowEdgeInput {
+                chain: request.chain.as_str(),
+                contract_address,
+                lookup: &lookup,
+                transfer,
+                receipt,
+                wallet_snapshot,
                 channel,
-                marketplace: String::new(),
-                evidence_type,
                 from_role,
                 to_role,
-                recipient_known: true,
+                evidence_type,
                 evidence_flags,
             });
+            if edge.channel == "withdrawal" {
+                direct_withdrawal_edges.push(edge.clone());
+            }
+            rows.entry(edge.edge_id.clone()).or_insert(edge);
+        }
+        for edge in trace_withdrawal_cashout_edges(CashoutTraceInput {
+            request,
+            deps,
+            contract_address,
+            contract_metadata,
+            lookup: &lookup,
+            seed_transfers: &eth_transfers,
+            direct_withdrawal_edges: &direct_withdrawal_edges,
+            mint_receipt: receipt,
+            block_receipts: &inputs.block_receipts,
+            payment_limit: &payment_limit,
+        })
+        .await?
+        {
+            rows.entry(edge.edge_id.clone()).or_insert(edge);
         }
     }
 
@@ -281,6 +388,99 @@ fn mint_payment_transfers_for_lookup(
     transfers
 }
 
+fn value_flow_edge_from_transfer(input: ValueFlowEdgeInput<'_>) -> ValueFlowEdgePayload {
+    let ValueFlowEdgeInput {
+        chain,
+        contract_address,
+        lookup,
+        transfer,
+        receipt,
+        wallet_snapshot,
+        channel,
+        from_role,
+        to_role,
+        evidence_type,
+        evidence_flags,
+    } = input;
+    let mut from_role = from_role;
+    let mut to_role = to_role;
+    let mut evidence_flags = evidence_flags;
+    if channel == "withdrawal" || channel == "cashout_hop" {
+        if let Some(entity) = known_value_flow_entity(chain, &transfer.to_address) {
+            to_role = entity.role.into();
+            push_unique_flag(
+                &mut evidence_flags,
+                format!("cashout_destination:{}", entity.role),
+            );
+            push_unique_flag(
+                &mut evidence_flags,
+                format!("known_entity:{}", entity.label),
+            );
+        }
+    } else if channel == "funding" {
+        if let Some(entity) = known_value_flow_entity(chain, &transfer.from_address) {
+            from_role = entity.role.into();
+            push_unique_flag(
+                &mut evidence_flags,
+                format!("funding_source:{}", entity.role),
+            );
+            push_unique_flag(
+                &mut evidence_flags,
+                format!("known_entity:{}", entity.label),
+            );
+        }
+    }
+
+    ValueFlowEdgePayload {
+        value_with_gas_eth: value_with_gas_eth(transfer, receipt),
+        value_with_gas_usd: value_with_gas_usd(transfer, receipt),
+        from_before_eth_balance: wallet_snapshot.before_eth_balance,
+        from_before_usd_balance: wallet_snapshot.before_usd_balance,
+        edge_id: format!(
+            "value:{}:{}:{}:{}",
+            channel, transfer.tx_hash, transfer.from_address, transfer.to_address
+        ),
+        contract_address: contract_address.to_string(),
+        from_address: transfer.from_address.clone(),
+        to_address: transfer.to_address.clone(),
+        tx_hash: transfer.tx_hash.clone(),
+        block_number: lookup.block_number,
+        block_time: lookup.block_time,
+        token_id: lookup.token_ids.join(","),
+        value_eth: (transfer.value_eth > 0.0).then_some(transfer.value_eth),
+        value_usd: transfer.value_usd.filter(|value| *value > 0.0),
+        payment_token_symbol: if transfer.payment_token_symbol.is_empty() {
+            "ETH".into()
+        } else {
+            transfer.payment_token_symbol.clone()
+        },
+        payment_token_address: if transfer.payment_token_address.is_empty() {
+            ZERO_ADDRESS.into()
+        } else {
+            transfer.payment_token_address.clone()
+        },
+        channel,
+        marketplace: String::new(),
+        evidence_type,
+        from_role,
+        to_role,
+        recipient_known: true,
+        evidence_flags,
+    }
+}
+
+fn push_unique_flag(flags: &mut Vec<String>, flag: String) {
+    if !flags.iter().any(|existing| existing == &flag) {
+        flags.push(flag);
+    }
+}
+
+fn known_value_flow_entity(chain: &str, address: &str) -> Option<KnownValueFlowEntity> {
+    KNOWN_VALUE_FLOW_ENTITIES.iter().copied().find(|entity| {
+        chain.eq_ignore_ascii_case(entity.chain) && address.eq_ignore_ascii_case(entity.address)
+    })
+}
+
 pub(super) fn classify_mint_value_flow_transfer(
     transfer: &EthTransferRecord,
     lookup: &MintPaymentLookup,
@@ -357,6 +557,354 @@ pub(super) fn classify_mint_value_flow_transfer(
         ));
     }
     None
+}
+
+async fn trace_withdrawal_cashout_edges(
+    input: CashoutTraceInput<'_>,
+) -> Result<Vec<ValueFlowEdgePayload>, AppError> {
+    let CashoutTraceInput {
+        request,
+        deps,
+        contract_address,
+        contract_metadata,
+        lookup,
+        seed_transfers,
+        direct_withdrawal_edges,
+        mint_receipt,
+        block_receipts,
+        payment_limit,
+    } = input;
+    let mut rows = BTreeMap::<String, ValueFlowEdgePayload>::new();
+    let mut seen_edge_ids: BTreeSet<String> = direct_withdrawal_edges
+        .iter()
+        .map(|edge| edge.edge_id.clone())
+        .collect();
+    let mut queue = VecDeque::<CashoutTraceNode>::new();
+
+    for edge in direct_withdrawal_edges {
+        enqueue_cashout_trace_node(
+            &mut queue,
+            request.chain.as_str(),
+            edge,
+            0,
+            BTreeSet::from([
+                normalized_address(contract_address),
+                normalized_address(&edge.to_address),
+            ]),
+            block_receipts,
+        );
+    }
+
+    for transfer in seed_transfers {
+        if !is_contract_withdrawal_transfer(transfer, lookup, contract_address)
+            || !transfer_is_at_or_after_mint(transfer, lookup, mint_receipt, block_receipts)
+        {
+            continue;
+        }
+        let to_role =
+            contract_control_role(&transfer.to_address, contract_address, contract_metadata)
+                .unwrap_or("external_wallet")
+                .to_string();
+        let timing_flag = if transfer.tx_hash == lookup.tx_hash {
+            "same_tx_contract_withdrawal"
+        } else {
+            "same_block_contract_withdrawal"
+        };
+        let receipt = receipt_for_transfer(transfer, block_receipts).or(mint_receipt);
+        let edge = value_flow_edge_from_transfer(ValueFlowEdgeInput {
+            chain: request.chain.as_str(),
+            contract_address,
+            lookup,
+            transfer,
+            receipt,
+            wallet_snapshot: MintPaymentWalletSnapshot::default(),
+            channel: "withdrawal".into(),
+            from_role: "mint_contract".into(),
+            to_role,
+            evidence_type: format!("same_block_contract_outflow:{}", transfer.category),
+            evidence_flags: vec![
+                timing_flag.into(),
+                "post_mint_value_extraction".into(),
+                transfer.category.clone(),
+            ],
+        });
+        enqueue_cashout_trace_node(
+            &mut queue,
+            request.chain.as_str(),
+            &edge,
+            0,
+            BTreeSet::from([
+                normalized_address(contract_address),
+                normalized_address(&edge.to_address),
+            ]),
+            block_receipts,
+        );
+        if seen_edge_ids.insert(edge.edge_id.clone()) {
+            rows.insert(edge.edge_id.clone(), edge);
+        }
+    }
+
+    let mut fetched_addresses = BTreeSet::<String>::new();
+    while let Some(node) = queue.pop_front() {
+        if node.depth >= MAX_WITHDRAWAL_TRACE_HOPS
+            || known_value_flow_entity(request.chain.as_str(), &node.address).is_some()
+            || !fetched_addresses.insert(node.address.clone())
+        {
+            continue;
+        }
+        if fetched_addresses.len() > MAX_WITHDRAWAL_TRACE_FRONTIER {
+            break;
+        }
+
+        let transfers = fetch_cashout_trace_transfers(
+            request,
+            deps,
+            lookup.block_number,
+            &node.address,
+            payment_limit,
+        )
+        .await?;
+        for transfer in transfers {
+            if !is_cashout_hop_transfer(&transfer, &node, lookup.block_number, block_receipts) {
+                continue;
+            }
+            let to_address = normalized_address(&transfer.to_address);
+            if node.path_addresses.contains(&to_address) {
+                continue;
+            }
+            let next_depth = node.depth + 1;
+            let value_ratio = cashout_value_ratio(&transfer, &node);
+            let receipt = receipt_for_transfer(&transfer, block_receipts);
+            let mut edge = value_flow_edge_from_transfer(ValueFlowEdgeInput {
+                chain: request.chain.as_str(),
+                contract_address,
+                lookup,
+                transfer: &transfer,
+                receipt,
+                wallet_snapshot: MintPaymentWalletSnapshot::default(),
+                channel: "cashout_hop".into(),
+                from_role: "cashout_intermediate".into(),
+                to_role: known_value_flow_entity(request.chain.as_str(), &transfer.to_address)
+                    .map(|entity| entity.role.to_string())
+                    .unwrap_or_else(|| "cashout_intermediate".into()),
+                evidence_type: format!("multi_hop_contract_cashout:{}", transfer.category),
+                evidence_flags: vec![
+                    "multi_hop_cashout".into(),
+                    "same_block_cashout_trace".into(),
+                    "value_constrained_cashout".into(),
+                    format!("cashout_hop:{next_depth}"),
+                    transfer.category.clone(),
+                ],
+            });
+            if let Some(ratio) = value_ratio {
+                push_unique_flag(
+                    &mut edge.evidence_flags,
+                    format!("cashout_value_ratio:{ratio:.4}"),
+                );
+            }
+            edge.edge_id = format!(
+                "value:cashout_hop:{}:{}:{}:{}",
+                transfer.tx_hash, transfer.from_address, transfer.to_address, next_depth
+            );
+            if !seen_edge_ids.insert(edge.edge_id.clone()) {
+                continue;
+            }
+            let mut next_path = node.path_addresses.clone();
+            next_path.insert(to_address);
+            enqueue_cashout_trace_node(
+                &mut queue,
+                request.chain.as_str(),
+                &edge,
+                next_depth,
+                next_path,
+                block_receipts,
+            );
+            rows.insert(edge.edge_id.clone(), edge);
+        }
+    }
+
+    Ok(rows.into_values().collect())
+}
+
+async fn fetch_cashout_trace_transfers(
+    request: &AnalyzeRequest,
+    deps: &AnalysisDeps,
+    block_number: i64,
+    address: &str,
+    payment_limit: &Option<Arc<Semaphore>>,
+) -> Result<Vec<EthTransferRecord>, AppError> {
+    let _permit = acquire_optional_limit(payment_limit).await?;
+    match deps
+        .api
+        .fetch_mint_payment_eth_transfers_on_chain(
+            &request.chain,
+            &request.alchemy_api_key,
+            request.alchemy_network.as_deref(),
+            block_number,
+            address,
+        )
+        .await
+    {
+        Ok(rows) => Ok(rows),
+        Err(err) => {
+            eprintln!(
+                "warning: cashout trace transfer lookup failed for {address} at block {block_number}: {err}; continuing without this cashout hop"
+            );
+            Ok(Vec::new())
+        }
+    }
+}
+
+fn enqueue_cashout_trace_node(
+    queue: &mut VecDeque<CashoutTraceNode>,
+    chain: &str,
+    edge: &ValueFlowEdgePayload,
+    depth: usize,
+    path_addresses: BTreeSet<String>,
+    block_receipts: &BTreeMap<String, TransactionReceiptRecord>,
+) {
+    let address = normalized_address(&edge.to_address);
+    if address.is_empty()
+        || address == ZERO_ADDRESS
+        || depth >= MAX_WITHDRAWAL_TRACE_HOPS
+        || known_value_flow_entity(chain, &address).is_some()
+    {
+        return;
+    }
+    queue.push_back(CashoutTraceNode {
+        address,
+        depth,
+        previous_tx_hash: edge.tx_hash.clone(),
+        previous_tx_index: receipt_index_for_tx(&edge.tx_hash, block_receipts),
+        value_eth: edge.value_eth,
+        value_usd: edge.value_usd,
+        payment_token_symbol: edge.payment_token_symbol.clone(),
+        payment_token_address: edge.payment_token_address.clone(),
+        path_addresses,
+    });
+}
+
+fn is_contract_withdrawal_transfer(
+    transfer: &EthTransferRecord,
+    lookup: &MintPaymentLookup,
+    contract_address: &str,
+) -> bool {
+    transfer.block_number == lookup.block_number
+        && transfer_value_positive(transfer)
+        && transfer.from_address.eq_ignore_ascii_case(contract_address)
+        && !transfer
+            .to_address
+            .eq_ignore_ascii_case(&lookup.minter_address)
+        && !transfer.to_address.eq_ignore_ascii_case(ZERO_ADDRESS)
+}
+
+fn transfer_is_at_or_after_mint(
+    transfer: &EthTransferRecord,
+    lookup: &MintPaymentLookup,
+    mint_receipt: Option<&TransactionReceiptRecord>,
+    block_receipts: &BTreeMap<String, TransactionReceiptRecord>,
+) -> bool {
+    if transfer.tx_hash == lookup.tx_hash {
+        return true;
+    }
+    let Some(mint_index) = mint_receipt.map(|receipt| receipt.transaction_index) else {
+        return false;
+    };
+    receipt_for_transfer(transfer, block_receipts)
+        .map(|receipt| receipt.transaction_index >= mint_index)
+        .unwrap_or(false)
+}
+
+fn is_cashout_hop_transfer(
+    transfer: &EthTransferRecord,
+    node: &CashoutTraceNode,
+    block_number: i64,
+    block_receipts: &BTreeMap<String, TransactionReceiptRecord>,
+) -> bool {
+    if transfer.block_number != block_number
+        || !transfer_value_positive(transfer)
+        || !transfer.from_address.eq_ignore_ascii_case(&node.address)
+        || transfer.to_address.eq_ignore_ascii_case(&node.address)
+        || transfer.to_address.eq_ignore_ascii_case(ZERO_ADDRESS)
+    {
+        return false;
+    }
+    if transfer.tx_hash == node.previous_tx_hash {
+        return cashout_value_is_trace_compatible(transfer, node);
+    }
+    let Some(previous_index) = node.previous_tx_index else {
+        return false;
+    };
+    receipt_for_transfer(transfer, block_receipts)
+        .map(|receipt| receipt.transaction_index > previous_index)
+        .unwrap_or(false)
+        && cashout_value_is_trace_compatible(transfer, node)
+}
+
+fn cashout_value_is_trace_compatible(
+    transfer: &EthTransferRecord,
+    node: &CashoutTraceNode,
+) -> bool {
+    cashout_token_matches(transfer, node)
+        && cashout_value_ratio(transfer, node)
+            .map(|ratio| (MIN_CASHOUT_VALUE_RATIO..=MAX_CASHOUT_VALUE_RATIO).contains(&ratio))
+            .unwrap_or(false)
+}
+
+fn cashout_value_ratio(transfer: &EthTransferRecord, node: &CashoutTraceNode) -> Option<f64> {
+    if transfer.value_eth > 0.0 {
+        if let Some(previous_value) = node.value_eth.filter(|value| *value > 0.0) {
+            return Some(transfer.value_eth / previous_value);
+        }
+    }
+    match (
+        transfer.value_usd.filter(|value| *value > 0.0),
+        node.value_usd.filter(|value| *value > 0.0),
+    ) {
+        (Some(value), Some(previous_value)) => Some(value / previous_value),
+        _ => None,
+    }
+}
+
+fn cashout_token_matches(transfer: &EthTransferRecord, node: &CashoutTraceNode) -> bool {
+    normalized_payment_token(
+        &transfer.payment_token_symbol,
+        &transfer.payment_token_address,
+    ) == normalized_payment_token(&node.payment_token_symbol, &node.payment_token_address)
+}
+
+fn normalized_payment_token(symbol: &str, address: &str) -> (String, String) {
+    let symbol = if symbol.trim().is_empty() {
+        "ETH".to_string()
+    } else {
+        symbol.trim().to_ascii_uppercase()
+    };
+    let address = if address.trim().is_empty() {
+        ZERO_ADDRESS.to_string()
+    } else {
+        address.trim().to_lowercase()
+    };
+    (symbol, address)
+}
+
+fn receipt_for_transfer<'a>(
+    transfer: &EthTransferRecord,
+    block_receipts: &'a BTreeMap<String, TransactionReceiptRecord>,
+) -> Option<&'a TransactionReceiptRecord> {
+    block_receipts.get(&transfer.tx_hash.to_lowercase())
+}
+
+fn receipt_index_for_tx(
+    tx_hash: &str,
+    block_receipts: &BTreeMap<String, TransactionReceiptRecord>,
+) -> Option<i64> {
+    block_receipts
+        .get(&tx_hash.to_lowercase())
+        .map(|receipt| receipt.transaction_index)
+}
+
+fn normalized_address(address: &str) -> String {
+    address.trim().to_lowercase()
 }
 
 pub(super) fn mint_payment_wallet_snapshot(

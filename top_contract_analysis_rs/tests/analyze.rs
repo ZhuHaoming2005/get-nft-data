@@ -2873,6 +2873,267 @@ impl DuplicateMintPaymentLookupApi {
     }
 }
 
+const BINANCE_HOT_WALLET: &str = "0x28c6c06298d514db089934071355e5743bf21d60";
+const TORNADO_CASH_1_ETH: &str = "0x47ce0c6ed5b0ce3d3a51fdb1c52dc66a7c3c2936";
+const ARBITRUM_ONE_BRIDGE: &str = "0x8315177ab297ba92a06054ce80a67ed4dbd7ed3a";
+
+struct CashoutTraceApi {
+    mint_transfer_calls: Mutex<Vec<(i64, String)>>,
+}
+
+impl CashoutTraceApi {
+    fn new() -> Self {
+        Self {
+            mint_transfer_calls: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl AnalyzeApi for CashoutTraceApi {
+    async fn fetch_contract_metadata(
+        &self,
+        chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _opensea_api_key: &str,
+        contract_address: &str,
+    ) -> Result<ContractMetadata, AppError> {
+        Ok(ContractMetadata {
+            chain: chain.to_string(),
+            contract_address: contract_address.to_string(),
+            token_type: "ERC721".into(),
+            contract_deployer: "0xcreator".into(),
+            deployed_block_number: 90,
+            deployed_block_time: 90,
+            owner_address: String::new(),
+            admin_address: String::new(),
+            proxy_admin_address: String::new(),
+            name: "Azuki".into(),
+            symbol: "AZUKI".into(),
+        })
+    }
+
+    async fn fetch_seed_contract_nfts(
+        &self,
+        chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        contract_address: &str,
+    ) -> Result<Vec<SeedNft>, AppError> {
+        Ok(vec![SeedNft {
+            chain: chain.to_string(),
+            contract_address: contract_address.to_string(),
+            token_id: "1".into(),
+            name: "Azuki #1".into(),
+            symbol: "AZUKI".into(),
+            token_uri: "ipfs://seed/1".into(),
+            image_uri: "ipfs://image/1.png".into(),
+            metadata_json: r#"{"name":"Azuki #1","description":"gold dragon"}"#.into(),
+        }])
+    }
+
+    async fn fetch_contract_transfers(
+        &self,
+        _chain: &str,
+        _etherscan_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _alchemy_api_key: &str,
+        contract_address: &str,
+        _token_type: &str,
+    ) -> Result<Vec<TransferRecord>, AppError> {
+        Ok(vec![TransferRecord {
+            contract_address: contract_address.to_string(),
+            token_id: "1".into(),
+            tx_hash: "0xmint".into(),
+            log_index: 0,
+            block_number: 10,
+            block_time: 100,
+            from_address: ZERO_ADDRESS.into(),
+            to_address: "0xminter".into(),
+            event_type: "erc721".into(),
+            source: "alchemy".into(),
+        }])
+    }
+
+    async fn fetch_contract_owners(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _contract_address: &str,
+    ) -> Result<Vec<OwnerBalance>, AppError> {
+        Ok(vec![])
+    }
+
+    async fn fetch_contract_sales(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _contract_address: &str,
+        _opensea_api_key: &str,
+    ) -> Result<Vec<NftSaleRecord>, AppError> {
+        Ok(vec![])
+    }
+
+    async fn fetch_transaction_receipt(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        tx_hash: &str,
+    ) -> Result<TransactionReceiptRecord, AppError> {
+        Ok(TransactionReceiptRecord {
+            tx_hash: tx_hash.into(),
+            block_number: 10,
+            transaction_index: 1,
+            from_address: "0xminter".into(),
+            gas_used: 21_000,
+            effective_gas_price_wei: 1_000_000_000,
+        })
+    }
+
+    async fn fetch_transaction_receipts_for_block(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        block_number: i64,
+    ) -> Result<BTreeMap<String, TransactionReceiptRecord>, AppError> {
+        Ok(BTreeMap::from([
+            (
+                "0xmint".into(),
+                TransactionReceiptRecord {
+                    tx_hash: "0xmint".into(),
+                    block_number,
+                    transaction_index: 1,
+                    from_address: "0xminter".into(),
+                    gas_used: 21_000,
+                    effective_gas_price_wei: 1_000_000_000,
+                },
+            ),
+            (
+                "0xbridge".into(),
+                TransactionReceiptRecord {
+                    tx_hash: "0xbridge".into(),
+                    block_number,
+                    transaction_index: 2,
+                    from_address: "0xhop1".into(),
+                    gas_used: 21_000,
+                    effective_gas_price_wei: 1_000_000_000,
+                },
+            ),
+        ]))
+    }
+
+    async fn fetch_eth_balance(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _address: &str,
+        _block_number: i64,
+    ) -> Result<f64, AppError> {
+        Ok(1.0)
+    }
+
+    async fn fetch_same_block_eth_transfers_for_address(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _block_number: i64,
+        _address: &str,
+    ) -> Result<Vec<EthTransferRecord>, AppError> {
+        Ok(vec![])
+    }
+
+    async fn fetch_mint_payment_eth_transfers_on_chain(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        block_number: i64,
+        address: &str,
+    ) -> Result<Vec<EthTransferRecord>, AppError> {
+        self.mint_transfer_calls
+            .lock()
+            .unwrap()
+            .push((block_number, address.to_string()));
+        let transfers = match address {
+            "0xminter" => vec![EthTransferRecord {
+                tx_hash: "0xmint".into(),
+                block_number,
+                from_address: "0xminter".into(),
+                to_address: "0xdup".into(),
+                value_eth: 0.08,
+                value_usd: Some(184.0),
+                payment_token_symbol: "ETH".into(),
+                payment_token_address: ZERO_ADDRESS.into(),
+                category: "external".into(),
+            }],
+            "0xdup" => vec![
+                EthTransferRecord {
+                    tx_hash: "0xmint".into(),
+                    block_number,
+                    from_address: "0xdup".into(),
+                    to_address: "0xhop1".into(),
+                    value_eth: 0.5,
+                    value_usd: Some(1_150.0),
+                    payment_token_symbol: "ETH".into(),
+                    payment_token_address: ZERO_ADDRESS.into(),
+                    category: "internal".into(),
+                },
+                EthTransferRecord {
+                    tx_hash: "0xmint".into(),
+                    block_number,
+                    from_address: "0xdup".into(),
+                    to_address: BINANCE_HOT_WALLET.into(),
+                    value_eth: 0.2,
+                    value_usd: Some(460.0),
+                    payment_token_symbol: "ETH".into(),
+                    payment_token_address: ZERO_ADDRESS.into(),
+                    category: "external".into(),
+                },
+                EthTransferRecord {
+                    tx_hash: "0xmint".into(),
+                    block_number,
+                    from_address: "0xdup".into(),
+                    to_address: TORNADO_CASH_1_ETH.into(),
+                    value_eth: 0.1,
+                    value_usd: Some(230.0),
+                    payment_token_symbol: "ETH".into(),
+                    payment_token_address: ZERO_ADDRESS.into(),
+                    category: "external".into(),
+                },
+            ],
+            "0xhop1" => vec![
+                EthTransferRecord {
+                    tx_hash: "0xbridge".into(),
+                    block_number,
+                    from_address: "0xhop1".into(),
+                    to_address: ARBITRUM_ONE_BRIDGE.into(),
+                    value_eth: 0.49,
+                    value_usd: Some(1_127.0),
+                    payment_token_symbol: "ETH".into(),
+                    payment_token_address: ZERO_ADDRESS.into(),
+                    category: "external".into(),
+                },
+                EthTransferRecord {
+                    tx_hash: "0xunrelated".into(),
+                    block_number,
+                    from_address: "0xhop1".into(),
+                    to_address: "0xunrelatedrecipient".into(),
+                    value_eth: 1.5,
+                    value_usd: Some(3_450.0),
+                    payment_token_symbol: "ETH".into(),
+                    payment_token_address: ZERO_ADDRESS.into(),
+                    category: "external".into(),
+                },
+            ],
+            _ => vec![],
+        };
+        Ok(transfers)
+    }
+}
+
 #[async_trait]
 impl AnalyzeApi for DuplicateMintPaymentLookupApi {
     async fn fetch_contract_metadata(
@@ -5515,4 +5776,122 @@ async fn analyze_deduplicates_mint_value_flow_transfer_lookups_by_block_and_addr
         ],
         "expected shared mint value-flow transfer lookups to be fetched once per block/address"
     );
+}
+
+#[tokio::test]
+async fn analyze_traces_multi_hop_cashout_and_classifies_known_destinations() {
+    let api = Arc::new(CashoutTraceApi::new());
+    let deps = AnalysisDeps {
+        api: api.clone(),
+        feature_store: Arc::new(FakeFeatureStore {
+            snapshot: DatabaseSnapshot {
+                nft_rows: vec![DatabaseNftRecord {
+                    contract_address: "0xdup".into(),
+                    token_id: "1".into(),
+                    token_uri: "ipfs://seed/1".into(),
+                    image_uri: "ipfs://image/1.png".into(),
+                    name: "Azuki Mirror #1".into(),
+                    symbol: "AZUKI".into(),
+                    metadata_json: r#"{"description":"gold dragon"}"#.into(),
+                    metadata_recall_checked: false,
+                    metadata_recall_match: false,
+                }],
+                ..DatabaseSnapshot::default()
+            },
+        }),
+        signal_cache: None,
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    let payload = analyze_seed_contract(
+        AnalyzeRequest {
+            chain: "ethereum".into(),
+            seed_contract_address: "0xseed".into(),
+            alchemy_api_key: "key".into(),
+            sale_metric_max_concurrency: 3,
+            ..AnalyzeRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
+    let calls = api.mint_transfer_calls.lock().unwrap().clone();
+    assert!(
+        calls.contains(&(10, "0xhop1".to_string())),
+        "expected withdrawal tracing to fetch the intermediate cashout wallet"
+    );
+
+    let bridge_hop = payload
+        .value_flow_edges
+        .iter()
+        .find(|edge| {
+            edge.channel == "cashout_hop"
+                && edge.to_address.eq_ignore_ascii_case(ARBITRUM_ONE_BRIDGE)
+        })
+        .expect("multi-hop cashout edge to bridge");
+    assert_eq!(bridge_hop.from_address, "0xhop1");
+    assert_eq!(bridge_hop.to_role, "bridge");
+    assert!(bridge_hop
+        .evidence_flags
+        .contains(&"multi_hop_cashout".to_string()));
+    assert!(bridge_hop
+        .evidence_flags
+        .contains(&"value_constrained_cashout".to_string()));
+    assert!(bridge_hop
+        .evidence_flags
+        .contains(&"cashout_destination:bridge".to_string()));
+    assert!(!payload.value_flow_edges.iter().any(|edge| {
+        edge.channel == "cashout_hop"
+            && edge.to_address.eq_ignore_ascii_case("0xunrelatedrecipient")
+    }));
+
+    let cex_withdrawal = payload
+        .value_flow_edges
+        .iter()
+        .find(|edge| {
+            edge.channel == "withdrawal" && edge.to_address.eq_ignore_ascii_case(BINANCE_HOT_WALLET)
+        })
+        .expect("direct withdrawal to known CEX");
+    assert_eq!(cex_withdrawal.to_role, "cex");
+    assert!(cex_withdrawal
+        .evidence_flags
+        .contains(&"cashout_destination:cex".to_string()));
+
+    let mixer_withdrawal = payload
+        .value_flow_edges
+        .iter()
+        .find(|edge| {
+            edge.channel == "withdrawal" && edge.to_address.eq_ignore_ascii_case(TORNADO_CASH_1_ETH)
+        })
+        .expect("direct withdrawal to known mixer");
+    assert_eq!(mixer_withdrawal.to_role, "mixer");
+    assert!(mixer_withdrawal
+        .evidence_flags
+        .contains(&"cashout_destination:mixer".to_string()));
+
+    assert!(payload.contract_lifecycle_events.iter().any(|event| {
+        event.lifecycle_stage == "exit_or_cleanup"
+            && event.event_type == "cashout_hop"
+            && event
+                .counterparty_address
+                .eq_ignore_ascii_case(ARBITRUM_ONE_BRIDGE)
+    }));
+
+    let lifecycle_metric = payload
+        .lifecycle_metrics
+        .iter()
+        .find(|metric| metric.contract_address == "0xdup")
+        .expect("contract lifecycle metric");
+    assert!((lifecycle_metric.withdrawal_amount_eth - 0.8).abs() < 1e-9);
+    assert!(lifecycle_metric
+        .value_flow_coverage_gaps
+        .contains(&"later_withdrawals_not_exhaustive".to_string()));
+    assert!(lifecycle_metric
+        .value_flow_coverage_gaps
+        .contains(&"cashout_trace_same_block_value_constrained".to_string()));
+    assert!(lifecycle_metric
+        .value_flow_coverage_gaps
+        .contains(&"known_cex_bridge_mixer_labels_incomplete".to_string()));
 }

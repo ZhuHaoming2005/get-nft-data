@@ -851,6 +851,12 @@ pub struct MaliciousAddressPayload {
     pub mint_activity_observed: bool,
     pub wash_cycle_count: i64,
     pub star_out_degree: i64,
+    #[serde(default)]
+    pub aggregation_in_degree: i64,
+    #[serde(default)]
+    pub withdrawal_edge_count: i64,
+    #[serde(default)]
+    pub cashout_edge_count: i64,
     pub rapid_spread_contracts: Vec<String>,
     pub evidence_contracts: Vec<String>,
 }

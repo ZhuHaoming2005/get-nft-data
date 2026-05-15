@@ -8,11 +8,12 @@ use crate::models::{
     SeedContractPayload, ValueFlowEdgePayload, WeakSupervisionLabelPayload,
 };
 
-const VALUE_FLOW_COVERAGE_SCOPE: &str = "same_tx_native_eth_and_stablecoin_erc20";
+const VALUE_FLOW_COVERAGE_SCOPE: &str =
+    "same_block_native_eth_and_stablecoin_erc20_with_value_constrained_cashout";
 const VALUE_FLOW_COVERAGE_GAPS: [&str; 3] = [
-    "later_withdrawals_not_traced",
-    "multi_hop_cashout_not_traced",
-    "cex_bridge_mixer_not_classified",
+    "later_withdrawals_not_exhaustive",
+    "cashout_trace_same_block_value_constrained",
+    "known_cex_bridge_mixer_labels_incomplete",
 ];
 
 pub struct LifecycleModelInput<'a> {
@@ -454,7 +455,12 @@ fn build_contract_lifecycle_events(
     for edge in value_flow_edges {
         if matches!(
             edge.channel.as_str(),
-            "mint_payment" | "royalty_fee" | "protocol_fee" | "funding" | "withdrawal"
+            "mint_payment"
+                | "royalty_fee"
+                | "protocol_fee"
+                | "funding"
+                | "withdrawal"
+                | "cashout_hop"
         ) {
             rows.push(value_flow_lifecycle_event(edge));
         }
@@ -656,7 +662,13 @@ fn value_flow_lifecycle_event(edge: &ValueFlowEdgePayload) -> ContractLifecycleE
             "exit_or_cleanup",
             "withdrawal",
             "medium",
-            "same-transaction ETH outflow from copied NFT contract",
+            "same-block value outflow from copied NFT contract",
+        ),
+        "cashout_hop" => (
+            "exit_or_cleanup",
+            "cashout_hop",
+            "medium",
+            "same-block multi-hop cashout after copied NFT contract withdrawal",
         ),
         _ => (
             "value_flow",
@@ -1441,7 +1453,13 @@ fn has_strong_campaign_address_evidence(feature: &AddressEvidenceFeaturePayload)
     feature.evidence.iter().any(|evidence| {
         matches!(
             evidence.evidence_type.as_str(),
-            "wash_cycle" | "star_distribution" | "rapid_spread" | "corrupted_honest_resale"
+            "wash_cycle"
+                | "star_distribution"
+                | "rapid_spread"
+                | "corrupted_honest_resale"
+                | "nft_aggregation"
+                | "contract_value_withdrawal"
+                | "multi_hop_cashout"
         )
     })
 }

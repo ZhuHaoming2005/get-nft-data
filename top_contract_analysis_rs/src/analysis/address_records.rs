@@ -112,6 +112,41 @@ fn value_flow_precedes_sale(edge: &ValueFlowEdgePayload, sale: &NftSaleRecord) -
     false
 }
 
+fn nft_transfer_key(
+    token_id: &str,
+    tx_hash: &str,
+    from_address: &str,
+    to_address: &str,
+) -> (String, String, String, String) {
+    (
+        token_id.trim().to_string(),
+        tx_hash.trim().to_lowercase(),
+        from_address.trim().to_lowercase(),
+        to_address.trim().to_lowercase(),
+    )
+}
+
+fn is_service_value_flow_role(role: &str) -> bool {
+    matches!(role, "cex" | "bridge" | "mixer")
+}
+
+fn value_flow_operator_address(
+    address: &str,
+    contract_address: &str,
+    role: &str,
+) -> Option<String> {
+    let address = address.trim();
+    if address.is_empty()
+        || address.eq_ignore_ascii_case(ZERO_ADDRESS)
+        || address.eq_ignore_ascii_case(contract_address)
+        || is_service_value_flow_role(role)
+    {
+        None
+    } else {
+        Some(address.to_string())
+    }
+}
+
 fn build_owner_token_map(owners: &[OwnerBalance]) -> HashMap<String, HashSet<String>> {
     let mut owner_token_map = HashMap::new();
     for owner in owners {
@@ -321,6 +356,7 @@ pub(crate) fn build_malicious_address_records_from_activity(
         .collect();
 
     let mut outgoing: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut incoming: HashMap<String, HashSet<String>> = HashMap::new();
     let mut cycle_counts: HashMap<String, i64> = HashMap::new();
     let mut sale_seller_counts: HashMap<String, i64> = HashMap::new();
     let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
@@ -339,6 +375,23 @@ pub(crate) fn build_malicious_address_records_from_activity(
         .collect();
     let mut secondary_market_resellers: HashSet<String> = HashSet::new();
     let mut prior_paid_buyers_by_token: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut paid_acquisition_addresses: HashSet<String> = paid_mint_payers.clone();
+    let sale_transfer_keys: HashSet<(String, String, String, String)> = activity
+        .sorted_sales
+        .iter()
+        .filter(|sale| {
+            sale_has_positive_value(sale)
+                && (relevant_token_ids.is_empty() || relevant_token_ids.contains(&sale.token_id))
+        })
+        .map(|sale| {
+            nft_transfer_key(
+                &sale.token_id,
+                &sale.tx_hash,
+                &sale.seller_address,
+                &sale.buyer_address,
+            )
+        })
+        .collect();
 
     for transfer in &activity.sorted_transfers {
         if !relevant_token_ids.is_empty() && !relevant_token_ids.contains(&transfer.token_id) {
@@ -358,6 +411,18 @@ pub(crate) fn build_malicious_address_records_from_activity(
                 .entry(transfer.from_address.clone())
                 .or_default()
                 .insert(transfer.to_address.clone());
+            let transfer_key = nft_transfer_key(
+                &transfer.token_id,
+                &transfer.tx_hash,
+                &transfer.from_address,
+                &transfer.to_address,
+            );
+            if !sale_transfer_keys.contains(&transfer_key) {
+                incoming
+                    .entry(transfer.to_address.clone())
+                    .or_default()
+                    .insert(transfer.from_address.clone());
+            }
             let pair = (transfer.from_address.clone(), transfer.to_address.clone());
             let reverse = (transfer.to_address.clone(), transfer.from_address.clone());
             if seen_pairs.contains(&reverse) {
@@ -392,6 +457,7 @@ pub(crate) fn build_malicious_address_records_from_activity(
                 secondary_market_resellers.insert(sale.seller_address.clone());
             }
             if !sale.buyer_address.is_empty() {
+                paid_acquisition_addresses.insert(sale.buyer_address.clone());
                 prior_paid_buyers.insert(sale.buyer_address.clone());
             }
         }
@@ -405,10 +471,47 @@ pub(crate) fn build_malicious_address_records_from_activity(
         }
     }
 
+    let mut withdrawal_edge_counts: HashMap<String, i64> = HashMap::new();
+    let mut cashout_edge_counts: HashMap<String, i64> = HashMap::new();
+    for edge in mint_payment_edges {
+        if !edge.contract_address.eq_ignore_ascii_case(contract_address)
+            || !value_flow_has_positive_value(edge)
+        {
+            continue;
+        }
+        match edge.channel.as_str() {
+            "withdrawal" => {
+                if let Some(address) =
+                    value_flow_operator_address(&edge.to_address, contract_address, &edge.to_role)
+                {
+                    *withdrawal_edge_counts.entry(address).or_insert(0) += 1;
+                }
+            }
+            "cashout_hop" => {
+                if let Some(address) = value_flow_operator_address(
+                    &edge.from_address,
+                    contract_address,
+                    &edge.from_role,
+                ) {
+                    *cashout_edge_counts.entry(address).or_insert(0) += 1;
+                }
+                if let Some(address) =
+                    value_flow_operator_address(&edge.to_address, contract_address, &edge.to_role)
+                {
+                    *cashout_edge_counts.entry(address).or_insert(0) += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
     let mut candidate_addresses: Vec<String> = outgoing
         .keys()
         .cloned()
+        .chain(incoming.keys().cloned())
         .chain(sale_seller_counts.keys().cloned())
+        .chain(withdrawal_edge_counts.keys().cloned())
+        .chain(cashout_edge_counts.keys().cloned())
         .chain(receiver_candidates)
         .collect::<HashSet<_>>()
         .into_iter()
@@ -424,18 +527,29 @@ pub(crate) fn build_malicious_address_records_from_activity(
         let wash_cycle_count = *cycle_counts.get(&address).unwrap_or(&0);
         let star_out_degree = outgoing.get(&address).map(|value| value.len()).unwrap_or(0) as i64;
         let is_star_distributor = star_out_degree >= 3;
+        let aggregation_in_degree =
+            incoming.get(&address).map(|value| value.len()).unwrap_or(0) as i64;
+        let is_aggregation_receiver =
+            aggregation_in_degree >= 3 && !paid_acquisition_addresses.contains(&address);
+        let withdrawal_edge_count = *withdrawal_edge_counts.get(&address).unwrap_or(&0);
+        let cashout_edge_count = *cashout_edge_counts.get(&address).unwrap_or(&0);
+        let value_extraction_observed = withdrawal_edge_count > 0 || cashout_edge_count > 0;
         let sale_seller_count = *sale_seller_counts.get(&address).unwrap_or(&0);
         let rapid_spread = rapid_addresses.contains(&address);
         let acquired_victim_like = (paid_mint_payers.contains(&address)
             || secondary_market_resellers.contains(&address))
             && wash_cycle_count == 0
             && !is_star_distributor
+            && !is_aggregation_receiver
+            && !value_extraction_observed
             && sale_seller_count < 3;
         let attacker_like_seller =
             sale_seller_count > 0 && (is_star_distributor || rapid_spread) && !acquired_victim_like;
         let high_volume_seller = sale_seller_count >= 3;
         if wash_cycle_count == 0
             && !is_star_distributor
+            && !is_aggregation_receiver
+            && !value_extraction_observed
             && !attacker_like_seller
             && !high_volume_seller
         {
@@ -446,6 +560,9 @@ pub(crate) fn build_malicious_address_records_from_activity(
             mint_activity_observed,
             wash_cycle_count,
             star_out_degree,
+            aggregation_in_degree,
+            withdrawal_edge_count,
+            cashout_edge_count,
             rapid_spread_contracts: if rapid_spread {
                 vec![contract_address.to_string()]
             } else {
@@ -699,6 +816,55 @@ pub fn build_address_attribution_records(
                     weight: 0.30,
                     detail: "address distributes copied NFTs to many unique receivers",
                     bucket: EvidenceBucket::Operator,
+                },
+            );
+        }
+        if item.aggregation_in_degree >= 3 {
+            add_attribution_evidence(
+                &mut rows,
+                EvidenceInput {
+                    contract_address,
+                    address: &item.address,
+                    role: "aggregation_receiver",
+                    evidence_type: "nft_aggregation",
+                    token_id: "",
+                    tx_hash: "",
+                    weight: 0.25,
+                    detail: "address receives copied NFTs from multiple distinct source wallets",
+                    bucket: EvidenceBucket::Operator,
+                },
+            );
+        }
+        if item.withdrawal_edge_count > 0 {
+            add_attribution_evidence(
+                &mut rows,
+                EvidenceInput {
+                    contract_address,
+                    address: &item.address,
+                    role: "withdrawal_recipient",
+                    evidence_type: "contract_value_withdrawal",
+                    token_id: "",
+                    tx_hash: "",
+                    weight: 0.35,
+                    detail: "address receives native or priced value withdrawn from the copied NFT contract",
+                    bucket: EvidenceBucket::Operator,
+                },
+            );
+        }
+        if item.cashout_edge_count > 0 {
+            add_attribution_evidence(
+                &mut rows,
+                EvidenceInput {
+                    contract_address,
+                    address: &item.address,
+                    role: "cashout_intermediate",
+                    evidence_type: "multi_hop_cashout",
+                    token_id: "",
+                    tx_hash: "",
+                    weight: 0.25,
+                    detail:
+                        "address appears as an intermediate wallet in same-block cashout tracing",
+                    bucket: EvidenceBucket::Colluder,
                 },
             );
         }
@@ -1515,9 +1681,19 @@ mod tests {
         from_address: &str,
         to_address: &str,
     ) -> TransferRecord {
+        transfer_token("1", tx_hash, block_time, from_address, to_address)
+    }
+
+    fn transfer_token(
+        token_id: &str,
+        tx_hash: &str,
+        block_time: i64,
+        from_address: &str,
+        to_address: &str,
+    ) -> TransferRecord {
         TransferRecord {
             contract_address: "0xdup".into(),
-            token_id: "1".into(),
+            token_id: token_id.into(),
             tx_hash: tx_hash.into(),
             block_number: block_time,
             block_time,
@@ -1534,9 +1710,16 @@ mod tests {
     }
 
     fn infringing_token_minted_by(minter_address: &str) -> InfringingTokenRecord {
+        infringing_token_id_minted_by("1", minter_address)
+    }
+
+    fn infringing_token_id_minted_by(
+        token_id: &str,
+        minter_address: &str,
+    ) -> InfringingTokenRecord {
         InfringingTokenRecord {
             contract_address: "0xdup".into(),
-            token_id: "1".into(),
+            token_id: token_id.into(),
             minter_address: minter_address.into(),
             ..InfringingTokenRecord::default()
         }
@@ -1557,9 +1740,27 @@ mod tests {
         buyer_address: &str,
         price_eth: f64,
     ) -> NftSaleRecord {
+        sale_between_token(
+            "1",
+            tx_hash,
+            block_time,
+            seller_address,
+            buyer_address,
+            price_eth,
+        )
+    }
+
+    fn sale_between_token(
+        token_id: &str,
+        tx_hash: &str,
+        block_time: i64,
+        seller_address: &str,
+        buyer_address: &str,
+        price_eth: f64,
+    ) -> NftSaleRecord {
         NftSaleRecord {
             contract_address: "0xdup".into(),
-            token_id: "1".into(),
+            token_id: token_id.into(),
             tx_hash: tx_hash.into(),
             block_number: block_time,
             log_index: 0,
@@ -1910,6 +2111,144 @@ mod tests {
         );
 
         assert!(malicious.iter().any(|row| row.address == "0xoperator"));
+    }
+
+    #[test]
+    fn aggregation_receiver_is_malicious_signal() {
+        let transfers = vec![
+            transfer_token("1", "0xmint1", 100, ZERO_ADDRESS, "0xsource1"),
+            transfer_token("2", "0xmint2", 100, ZERO_ADDRESS, "0xsource2"),
+            transfer_token("3", "0xmint3", 100, ZERO_ADDRESS, "0xsource3"),
+            transfer_token("1", "0xagg1", 120, "0xsource1", "0xcollector"),
+            transfer_token("2", "0xagg2", 121, "0xsource2", "0xcollector"),
+            transfer_token("3", "0xagg3", 122, "0xsource3", "0xcollector"),
+        ];
+        let infringing_tokens = vec![
+            infringing_token_id_minted_by("1", "0xsource1"),
+            infringing_token_id_minted_by("2", "0xsource2"),
+            infringing_token_id_minted_by("3", "0xsource3"),
+        ];
+        let activity = prepare_contract_activity(&transfers, &[], &[]);
+
+        let malicious = build_malicious_address_records_from_activity(
+            "0xdup",
+            &activity,
+            &infringing_tokens,
+            &[],
+        );
+        let collector = malicious
+            .iter()
+            .find(|row| row.address == "0xcollector")
+            .expect("aggregation receiver malicious signal");
+
+        assert_eq!(collector.aggregation_in_degree, 3);
+        assert_eq!(collector.star_out_degree, 0);
+        assert_eq!(collector.withdrawal_edge_count, 0);
+    }
+
+    #[test]
+    fn paid_multi_purchase_buyer_is_not_aggregation_operator() {
+        let transfers = vec![
+            transfer_token("1", "0xmint1", 100, ZERO_ADDRESS, "0xseller1"),
+            transfer_token("2", "0xmint2", 100, ZERO_ADDRESS, "0xseller2"),
+            transfer_token("3", "0xmint3", 100, ZERO_ADDRESS, "0xseller3"),
+            transfer_token("1", "0xbuy1", 120, "0xseller1", "0xbuyer"),
+            transfer_token("2", "0xbuy2", 121, "0xseller2", "0xbuyer"),
+            transfer_token("3", "0xbuy3", 122, "0xseller3", "0xbuyer"),
+        ];
+        let sales = vec![
+            sale_between_token("1", "0xbuy1", 120, "0xseller1", "0xbuyer", 0.4),
+            sale_between_token("2", "0xbuy2", 121, "0xseller2", "0xbuyer", 0.5),
+            sale_between_token("3", "0xbuy3", 122, "0xseller3", "0xbuyer", 0.6),
+        ];
+        let infringing_tokens = vec![
+            infringing_token_id_minted_by("1", "0xseller1"),
+            infringing_token_id_minted_by("2", "0xseller2"),
+            infringing_token_id_minted_by("3", "0xseller3"),
+        ];
+        let activity = prepare_contract_activity(&transfers, &sales, &[]);
+
+        let malicious = build_malicious_address_records_from_activity(
+            "0xdup",
+            &activity,
+            &infringing_tokens,
+            &[],
+        );
+
+        assert!(malicious.iter().all(|row| row.address != "0xbuyer"));
+    }
+
+    #[test]
+    fn withdrawal_recipient_is_malicious_signal() {
+        let activity = prepare_contract_activity(&[], &[], &[]);
+        let mint_payment_edges = vec![ValueFlowEdgePayload {
+            contract_address: "0xdup".into(),
+            from_address: "0xdup".into(),
+            to_address: "0xoperator".into(),
+            tx_hash: "0xwithdraw".into(),
+            block_number: 120,
+            block_time: 120,
+            token_id: "1".into(),
+            value_eth: Some(0.5),
+            channel: "withdrawal".into(),
+            to_role: "external_wallet".into(),
+            evidence_flags: vec!["same_tx_contract_withdrawal".into()],
+            ..ValueFlowEdgePayload::default()
+        }];
+
+        let malicious = build_malicious_address_records_from_activity(
+            "0xdup",
+            &activity,
+            &[infringing_token()],
+            &mint_payment_edges,
+        );
+        let operator = malicious
+            .iter()
+            .find(|row| row.address == "0xoperator")
+            .expect("withdrawal recipient malicious signal");
+
+        assert_eq!(operator.withdrawal_edge_count, 1);
+        assert_eq!(operator.cashout_edge_count, 0);
+        assert_eq!(operator.aggregation_in_degree, 0);
+    }
+
+    #[test]
+    fn attribution_records_explain_aggregation_and_withdrawal_signals() {
+        let malicious = vec![
+            MaliciousAddressPayload {
+                address: "0xcollector".into(),
+                aggregation_in_degree: 3,
+                evidence_contracts: vec!["0xdup".into()],
+                ..MaliciousAddressPayload::default()
+            },
+            MaliciousAddressPayload {
+                address: "0xoperator".into(),
+                withdrawal_edge_count: 1,
+                evidence_contracts: vec!["0xdup".into()],
+                ..MaliciousAddressPayload::default()
+            },
+        ];
+
+        let rows = build_address_attribution_records("0xdup", &[], &[], &[], &malicious, &[], &[]);
+        let collector = rows
+            .iter()
+            .find(|row| row.address == "0xcollector")
+            .expect("collector attribution");
+        let operator = rows
+            .iter()
+            .find(|row| row.address == "0xoperator")
+            .expect("operator attribution");
+
+        assert_eq!(collector.attribution_label, "suspected_operator");
+        assert!(collector
+            .evidence
+            .iter()
+            .any(|evidence| evidence.evidence_type == "nft_aggregation"));
+        assert_eq!(operator.attribution_label, "suspected_operator");
+        assert!(operator
+            .evidence
+            .iter()
+            .any(|evidence| evidence.evidence_type == "contract_value_withdrawal"));
     }
 
     #[test]

@@ -11,7 +11,7 @@
 
 - `nft_propagation_paths`: NFT mint、transfer、sale 传播图和 token 级路径。
 - `contract_lifecycle_events` / `lifecycle_metrics`: 复制准备、仿冒部署、复制铸造、传播、变现、受害购买、退场等生命周期阶段。
-- `value_flow_edges`: mint payment、sale payment、protocol fee、royalty fee、funding、withdrawal 等资金流证据。
+- `value_flow_edges`: mint payment、sale payment、protocol fee、royalty fee、funding、withdrawal、cashout hop 等资金流证据。
 - `weak_supervision_labels` / `address_evidence_features` / `campaign_clusters`: 地址归因、弱监督标签和活动簇证据。
 - `early_detection_features`: 早期检测窗口样本和正负/未标注弱标签。
 
