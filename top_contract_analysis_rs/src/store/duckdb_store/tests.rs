@@ -747,6 +747,41 @@ fn metadata_source_bucket_hit_estimate_deduplicates_candidates() {
 }
 
 #[test]
+fn metadata_sketch_keeps_more_low_frequency_anchor_terms_for_prefilter_recall() {
+    let doc = MetadataBm25Document::from_text(
+        "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa",
+    )
+    .unwrap();
+    let doc_freqs = doc
+        .tokens()
+        .iter()
+        .map(|token| (token.clone(), 1usize))
+        .collect::<HashMap<_, _>>();
+
+    let sketch = metadata_sketch_from_document(&doc, 100, &doc_freqs);
+
+    assert_eq!(sketch.anchors.len(), 16);
+}
+
+#[test]
+fn metadata_sketch_source_match_allows_wider_simhash_prefilter_window() {
+    let seed = MetadataSketch {
+        simhash: u64::MAX,
+        anchors: vec![],
+    };
+    let candidate = MetadataSketch {
+        simhash: u64::MAX ^ ((1u64 << 32) - 1),
+        anchors: vec![],
+    };
+
+    assert!(metadata_sketch_source_match(
+        &seed,
+        &candidate,
+        METADATA_SKETCH_SOURCE_HAMMING_THRESHOLD
+    ));
+}
+
+#[test]
 fn selected_recall_rowid_table_is_reusable_across_fetches() {
     let store = DuckDbFeatureStore::new(":memory:").unwrap();
     store
