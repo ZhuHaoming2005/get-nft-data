@@ -5507,7 +5507,7 @@ async fn analyze_computes_sale_metrics_concurrently_within_a_contract() {
             chain: "ethereum".into(),
             seed_contract_address: "0xseed".into(),
             alchemy_api_key: "key".into(),
-            sale_metric_max_concurrency: 2,
+            api_max_concurrency: 2,
             ..AnalyzeRequest::default()
         },
         &deps,
@@ -5553,7 +5553,7 @@ async fn analyze_prefetches_sale_metrics_per_buyer_with_shared_transaction_hash(
             chain: "ethereum".into(),
             seed_contract_address: "0xseed".into(),
             alchemy_api_key: "key".into(),
-            sale_metric_max_concurrency: 2,
+            api_max_concurrency: 2,
             ..AnalyzeRequest::default()
         },
         &deps,
@@ -5598,7 +5598,7 @@ async fn analyze_prefetches_sale_metrics_only_for_latest_buyer_purchase() {
             chain: "ethereum".into(),
             seed_contract_address: "0xseed".into(),
             alchemy_api_key: "key".into(),
-            sale_metric_max_concurrency: 2,
+            api_max_concurrency: 2,
             ..AnalyzeRequest::default()
         },
         &deps,
@@ -5690,7 +5690,7 @@ async fn analyze_fetches_post_signal_inputs_concurrently_within_one_contract() {
             seed_contract_address: "0xseed".into(),
             alchemy_api_key: "key".into(),
             contract_max_concurrency: 3,
-            sale_metric_max_concurrency: 3,
+            api_max_concurrency: 3,
             ..AnalyzeRequest::default()
         },
         &deps,
@@ -5750,7 +5750,7 @@ async fn analyze_deduplicates_mint_value_flow_transfer_lookups_by_block_and_addr
             chain: "ethereum".into(),
             seed_contract_address: "0xseed".into(),
             alchemy_api_key: "key".into(),
-            sale_metric_max_concurrency: 3,
+            api_max_concurrency: 3,
             ..AnalyzeRequest::default()
         },
         &deps,
@@ -5809,7 +5809,7 @@ async fn analyze_traces_multi_hop_cashout_and_classifies_known_destinations() {
             chain: "ethereum".into(),
             seed_contract_address: "0xseed".into(),
             alchemy_api_key: "key".into(),
-            sale_metric_max_concurrency: 3,
+            api_max_concurrency: 3,
             ..AnalyzeRequest::default()
         },
         &deps,

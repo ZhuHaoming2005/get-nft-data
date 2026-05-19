@@ -1,26 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 
-use futures::stream::FuturesUnordered;
+use futures::stream;
 use futures::StreamExt;
-use tokio::sync::Semaphore;
 
 use crate::error::AppError;
 use crate::models::{EthTransferRecord, NftSaleRecord, TransactionReceiptRecord};
 
-use super::{acquire_optional_limit, address_records, AnalysisDeps, AnalyzeRequest, RuntimeLimits};
+use super::{address_records, AnalysisDeps, AnalyzeRequest};
 
 pub(super) async fn compute_sale_metrics_for_contract(
     request: &AnalyzeRequest,
     deps: &AnalysisDeps,
     sales: &[NftSaleRecord],
-    runtime_limits: &RuntimeLimits,
 ) -> Result<BTreeMap<String, address_records::SaleMetricRecord>, AppError> {
-    let sale_metric_limit = runtime_limits.sale_metric_limit.clone().or_else(|| {
-        Some(Arc::new(Semaphore::new(
-            request.sale_metric_max_concurrency.max(1),
-        )))
-    });
     let mut latest_sale_by_buyer = BTreeMap::<String, &NftSaleRecord>::new();
     for sale in sales {
         if sale.buyer_address.is_empty() {
@@ -46,51 +38,42 @@ pub(super) async fn compute_sale_metrics_for_contract(
             .or_insert(sale);
     }
 
-    let mut prefetches = FuturesUnordered::new();
-    for sale in unique_sales_by_purchase.into_values() {
-        let sale_metric_limit = sale_metric_limit.clone();
-        prefetches.push(async move {
-            let _permit = acquire_optional_limit(&sale_metric_limit).await?;
+    let api_concurrency = request.api_max_concurrency.max(1);
+    let mut prefetches = stream::iter(unique_sales_by_purchase.into_values())
+        .map(|sale| async move {
             Ok::<_, AppError>(prefetch_sale_metric_inputs(request, deps, sale).await)
-        });
-    }
+        })
+        .buffer_unordered(api_concurrency);
 
     let mut prefetched_by_purchase = BTreeMap::new();
     let mut queued_blocks = BTreeSet::new();
-    let mut block_receipts = FuturesUnordered::new();
-    let mut receipts_by_block = BTreeMap::new();
-    loop {
-        tokio::select! {
-            Some(row) = prefetches.next(), if !prefetches.is_empty() => {
-                let row = row?;
-                if !row.same_block_transfers.is_empty() && queued_blocks.insert(row.block_number) {
-                    let sale_metric_limit = sale_metric_limit.clone();
-                    let block_number = row.block_number;
-                    block_receipts.push(async move {
-                        let _permit = match acquire_optional_limit(&sale_metric_limit).await {
-                            Ok(permit) => permit,
-                            Err(_) => return (block_number, BTreeMap::new()),
-                        };
-                        let receipts = deps
-                            .api
-                            .fetch_transaction_receipts_for_block_on_chain(
-                                &request.chain,
-                                &request.alchemy_api_key,
-                                request.alchemy_network.as_deref(),
-                                block_number,
-                            )
-                            .await
-                            .unwrap_or_default();
-                        (block_number, receipts)
-                    });
-                }
-                prefetched_by_purchase.insert(row.metric_key.clone(), row);
-            }
-            Some((block_number, receipts)) = block_receipts.next(), if !block_receipts.is_empty() => {
-                receipts_by_block.insert(block_number, receipts);
-            }
-            else => break,
+    while let Some(row) = prefetches.next().await {
+        let row = row?;
+        if !row.same_block_transfers.is_empty() {
+            queued_blocks.insert(row.block_number);
         }
+        prefetched_by_purchase.insert(row.metric_key.clone(), row);
+    }
+
+    let mut block_receipts = stream::iter(queued_blocks)
+        .map(|block_number| async move {
+            let receipts = deps
+                .api
+                .fetch_transaction_receipts_for_block_on_chain(
+                    &request.chain,
+                    &request.alchemy_api_key,
+                    request.alchemy_network.as_deref(),
+                    block_number,
+                )
+                .await
+                .unwrap_or_default();
+            (block_number, receipts)
+        })
+        .buffer_unordered(api_concurrency);
+
+    let mut receipts_by_block = BTreeMap::new();
+    while let Some((block_number, receipts)) = block_receipts.next().await {
+        receipts_by_block.insert(block_number, receipts);
     }
 
     let mut rows = BTreeMap::new();
