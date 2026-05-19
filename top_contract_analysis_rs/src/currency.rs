@@ -1,6 +1,8 @@
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, USER_AGENT};
 use serde_json::Value;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{Mutex, MutexGuard};
 
 use crate::api::AsyncApiClient;
 use crate::error::AppError;
@@ -75,27 +77,64 @@ pub fn to_eth_equivalent(amount: f64, symbol: &str, eth_usd_rate: Option<f64>) -
 
 #[derive(Default)]
 pub(crate) struct EthUsdRateCache {
-    value: futures::lock::Mutex<Option<Result<f64, String>>>,
+    value: Mutex<Option<Result<f64, String>>>,
+    fetch_in_progress: AtomicBool,
+}
+
+struct EthUsdRateFetchGuard<'a> {
+    fetch_in_progress: &'a AtomicBool,
+}
+
+impl Drop for EthUsdRateFetchGuard<'_> {
+    fn drop(&mut self) {
+        self.fetch_in_progress.store(false, AtomicOrdering::Release);
+    }
 }
 
 impl EthUsdRateCache {
+    fn value(&self) -> Result<MutexGuard<'_, Option<Result<f64, String>>>, AppError> {
+        self.value.lock().map_err(|err| {
+            AppError::InvalidData(format!("ETH/USD rate cache lock poisoned: {err}"))
+        })
+    }
+
+    fn cached_value(&self) -> Result<Option<Result<f64, AppError>>, AppError> {
+        Ok(self
+            .value()?
+            .as_ref()
+            .map(|result| result.clone().map_err(AppError::InvalidData)))
+    }
+
     pub(crate) async fn get_or_try_init<F, Fut>(&self, fetch: F) -> Result<f64, AppError>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<f64, AppError>>,
     {
-        let mut value = self.value.lock().await;
-        if let Some(result) = value.as_ref() {
-            return result
-                .clone()
-                .map_err(|err| AppError::InvalidData(err.to_string()));
+        if let Some(result) = self.cached_value()? {
+            return result;
         }
+
+        if self
+            .fetch_in_progress
+            .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+            .is_err()
+        {
+            if let Some(result) = self.cached_value()? {
+                return result;
+            }
+            return Err(AppError::InvalidData(
+                "ETH/USD rate fetch already in progress".to_string(),
+            ));
+        }
+        let _fetch_guard = EthUsdRateFetchGuard {
+            fetch_in_progress: &self.fetch_in_progress,
+        };
 
         let result = fetch().await.map_err(|err| err.to_string());
         let output = result
             .clone()
             .map_err(|err| AppError::InvalidData(err.to_string()));
-        *value = Some(result);
+        *self.value()? = Some(result);
         output
     }
 }
@@ -376,6 +415,64 @@ mod tests {
 
         assert_eq!(first, 3000.0);
         assert_eq!(second, 3000.0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn eth_usd_rate_cache_does_not_block_callers_while_initializing() {
+        let cache = Arc::new(EthUsdRateCache::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (release_fetch, wait_for_release) = futures::channel::oneshot::channel::<()>();
+
+        let first = {
+            let cache = Arc::clone(&cache);
+            let calls = Arc::clone(&calls);
+            tokio::spawn(async move {
+                cache
+                    .get_or_try_init(move || async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        wait_for_release.await.unwrap();
+                        Ok(3000.0)
+                    })
+                    .await
+            })
+        };
+
+        while calls.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+
+        let second = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            cache.get_or_try_init({
+                let calls = Arc::clone(&calls);
+                move || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(4000.0)
+                }
+            }),
+        )
+        .await
+        .expect("caller should not wait behind the in-flight price fetch");
+
+        let err = second.expect_err("in-flight fetch should be reported as a cache miss");
+        assert!(err.to_string().contains("already in progress"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        release_fetch.send(()).unwrap();
+        assert_eq!(first.await.unwrap().unwrap(), 3000.0);
+
+        let third = cache
+            .get_or_try_init({
+                let calls = Arc::clone(&calls);
+                move || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(4000.0)
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(third, 3000.0);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
