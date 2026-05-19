@@ -102,6 +102,7 @@ impl FeatureStoreReader for CapturingBatchFeatureStore {
 struct BatchPipelineProbe {
     seed_one_snapshot_active: AtomicBool,
     seed_two_context_overlapped_snapshot: AtomicBool,
+    seed_two_context_overlapped_contract_analysis: AtomicBool,
     cpu_current: AtomicUsize,
     cpu_max_seen: AtomicUsize,
     transfer_current: AtomicUsize,
@@ -287,6 +288,11 @@ impl AnalyzeApi for InstrumentedBatchApi {
             while self.probe.transfer_current.load(Ordering::SeqCst) == 0 && waited < 500 {
                 tokio::time::sleep(Duration::from_millis(1)).await;
                 waited += 1;
+            }
+            if self.probe.transfer_current.load(Ordering::SeqCst) > 0 {
+                self.probe
+                    .seed_two_context_overlapped_contract_analysis
+                    .store(true, Ordering::SeqCst);
             }
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1704,7 +1710,6 @@ async fn batch_uses_seed_network_concurrency_for_uncached_seeds() {
             output_dir: dir.path().to_path_buf(),
             alchemy_api_key: "key".into(),
             seed_network_max_concurrency: 2,
-            seed_metadata_max_concurrency: 2,
             ..BatchRequest::default()
         },
         &deps,
@@ -1844,6 +1849,51 @@ async fn batch_limits_cpu_stage_globally() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_runs_later_seed_network_stage_while_earlier_seed_analyzes_contracts() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n").unwrap();
+    let probe = Arc::new(BatchPipelineProbe::default());
+    let deps = AnalysisDeps {
+        api: Arc::new(InstrumentedBatchApi {
+            probe: probe.clone(),
+            transfer_sleep_ms: 300,
+            emit_native_sale: true,
+        }),
+        feature_store: Arc::new(InstrumentedFeatureStore {
+            probe: probe.clone(),
+            sleep_ms: 0,
+            wait_for_transfer_before_seed_two_snapshot: false,
+        }),
+        signal_cache: None,
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    let _summary = run_batch(
+        BatchRequest {
+            chain: "ethereum".into(),
+            seed_file: dir.path().join("seeds.txt"),
+            output_dir: dir.path().to_path_buf(),
+            alchemy_api_key: "key".into(),
+            seed_network_max_concurrency: 1,
+            seed_cpu_max_concurrency: 1,
+            contract_max_concurrency: 1,
+            ..BatchRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        probe
+            .seed_two_context_overlapped_contract_analysis
+            .load(Ordering::SeqCst),
+        "expected seed2 network IO stage to make progress while seed1 runs the unrestricted contract-analysis stage"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batch_loads_snapshots_per_seed_without_seed_chunks() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n").unwrap();
@@ -1885,7 +1935,7 @@ async fn batch_loads_snapshots_per_seed_without_seed_chunks() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn batch_limits_seed_metadata_fetches_globally() {
+async fn batch_seed_network_limit_controls_seed_context_metadata_fetches() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n0xseed3\n").unwrap();
     let probe = Arc::new(BatchPipelineProbe::default());
@@ -1911,8 +1961,7 @@ async fn batch_limits_seed_metadata_fetches_globally() {
             seed_file: dir.path().join("seeds.txt"),
             output_dir: dir.path().to_path_buf(),
             alchemy_api_key: "key".into(),
-            seed_network_max_concurrency: 3,
-            seed_metadata_max_concurrency: 1,
+            seed_network_max_concurrency: 1,
             ..BatchRequest::default()
         },
         &deps,

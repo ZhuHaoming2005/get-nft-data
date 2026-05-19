@@ -148,7 +148,6 @@ pub struct AnalysisDeps {
 
 #[derive(Clone, Default)]
 struct RuntimeLimits {
-    seed_metadata_limit: Option<Arc<Semaphore>>,
     match_contract_limit: Option<Arc<Semaphore>>,
 }
 
@@ -293,7 +292,6 @@ pub struct BatchRequest {
     pub contract_max_concurrency: usize,
     pub max_tokens_per_contract: usize,
     pub max_recall_rows: usize,
-    pub seed_metadata_max_concurrency: usize,
     pub seed_network_max_concurrency: usize,
     pub seed_cpu_max_concurrency: usize,
 }
@@ -315,7 +313,6 @@ impl Default for BatchRequest {
             contract_max_concurrency: 4,
             max_tokens_per_contract: 0,
             max_recall_rows: 0,
-            seed_metadata_max_concurrency: 1,
             seed_network_max_concurrency: 1,
             seed_cpu_max_concurrency: 1,
         }
@@ -396,14 +393,11 @@ pub async fn analyze_seed_contract(
 async fn fetch_seed_context(
     request: &AnalyzeRequest,
     deps: &AnalysisDeps,
-    runtime_limits: &RuntimeLimits,
     progress: Arc<dyn SeedProgressReporter>,
 ) -> Result<SeedContext, AppError> {
     progress.on_seed_stage("fetch_seed_context").await;
-    let seed_metadata_limit = runtime_limits.seed_metadata_limit.clone();
     let (seed_contract, seed_nfts) = tokio::try_join!(
         async {
-            let _permit = acquire_optional_limit(&seed_metadata_limit).await?;
             deps.api
                 .fetch_contract_metadata(
                     &request.chain,
@@ -524,7 +518,7 @@ async fn analyze_seed_contract_with_limits(
     let (context, plan) = if let Some(prepared) = prepared {
         prepared
     } else {
-        let context = fetch_seed_context(&request, deps, &runtime_limits, progress.clone()).await?;
+        let context = fetch_seed_context(&request, deps, progress.clone()).await?;
         build_candidate_plan_for_seed(
             request.clone(),
             deps.feature_store.clone(),

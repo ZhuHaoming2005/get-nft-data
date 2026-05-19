@@ -59,9 +59,6 @@ pub async fn run_batch(
     let cpu_limit = Arc::new(Semaphore::new(seed_cpu_max_concurrency));
     let seed_network_limit = Arc::new(Semaphore::new(seed_network_max_concurrency));
     let runtime_limits = RuntimeLimits {
-        seed_metadata_limit: Some(Arc::new(Semaphore::new(
-            request.seed_metadata_max_concurrency.max(1),
-        ))),
         match_contract_limit: Some(Arc::new(Semaphore::new(
             request.contract_max_concurrency.max(1),
         ))),
@@ -83,14 +80,7 @@ pub async fn run_batch(
             let context = {
                 let _permit = acquire_optional_limit(&Some(seed_network_limit.clone())).await?;
                 batch_progress.on_seed_started(&seed_address);
-                match fetch_seed_context(
-                    &per_seed_request,
-                    deps,
-                    &runtime_limits,
-                    seed_progress.clone(),
-                )
-                .await
-                {
+                match fetch_seed_context(&per_seed_request, deps, seed_progress.clone()).await {
                     Ok(context) => context,
                     Err(err) => {
                         batch_progress.on_seed_failed(&seed_address, &err.to_string());
@@ -102,7 +92,7 @@ pub async fn run_batch(
                 per_seed_request.clone(),
                 feature_store,
                 context,
-                Some(cpu_limit.clone()),
+                Some(cpu_limit),
                 seed_progress.clone(),
             )
             .await
@@ -113,18 +103,14 @@ pub async fn run_batch(
                     return Err(err);
                 }
             };
-            let result = async {
-                let _permit = acquire_optional_limit(&Some(seed_network_limit)).await?;
-                analyze_seed_contract_with_limits(
-                    per_seed_request,
-                    deps,
-                    seed_progress,
-                    Some(cpu_limit),
-                    runtime_limits,
-                    Some((context, plan)),
-                )
-                .await
-            }
+            let result = analyze_seed_contract_with_limits(
+                per_seed_request,
+                deps,
+                seed_progress,
+                None,
+                runtime_limits,
+                Some((context, plan)),
+            )
             .await;
             match result {
                 Ok(payload) => {

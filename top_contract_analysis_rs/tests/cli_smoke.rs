@@ -44,8 +44,6 @@ fn batch_subcommand_is_exposed() {
             "result",
             "--api-max-concurrency",
             "24",
-            "--seed-metadata-max-concurrency",
-            "1",
             "--contract-max-concurrency",
             "12",
             "--seed-cpu-max-concurrency",
@@ -60,6 +58,22 @@ fn batch_subcommand_is_exposed() {
                 .not()
                 .and(contains("required arguments were not provided").not()),
         );
+}
+
+#[test]
+fn batch_subcommand_rejects_removed_seed_metadata_concurrency_flag() {
+    Command::cargo_bin("top_contract_analysis_rs")
+        .unwrap()
+        .args([
+            "batch",
+            "--seed-file",
+            "seeds.txt",
+            "--seed-metadata-max-concurrency",
+            "1",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("unexpected argument"));
 }
 
 #[test]

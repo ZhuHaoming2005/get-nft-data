@@ -81,8 +81,6 @@ pub struct BatchArgs {
     pub seed_network_max_concurrency: usize,
     #[arg(long, default_value_t = 8)]
     pub api_max_concurrency: usize,
-    #[arg(long, default_value_t = 1)]
-    pub seed_metadata_max_concurrency: usize,
     #[arg(long, default_value_t = 4)]
     pub contract_max_concurrency: usize,
     #[arg(long, default_value_t = 1)]
