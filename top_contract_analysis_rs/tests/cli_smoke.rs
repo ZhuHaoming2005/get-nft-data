@@ -50,8 +50,10 @@ fn batch_subcommand_is_exposed() {
             "12",
             "--sale-metric-max-concurrency",
             "10",
-            "--cpu-max-concurrency",
+            "--seed-cpu-max-concurrency",
             "2",
+            "--seed-network-max-concurrency",
+            "3",
         ])
         .assert()
         .failure()
@@ -60,6 +62,24 @@ fn batch_subcommand_is_exposed() {
                 .not()
                 .and(contains("required arguments were not provided").not()),
         );
+}
+
+#[test]
+fn batch_subcommand_rejects_removed_worker_flags() {
+    Command::cargo_bin("top_contract_analysis_rs")
+        .unwrap()
+        .args([
+            "batch",
+            "--seed-file",
+            "seeds.txt",
+            "--workers",
+            "2",
+            "--cpu-max-concurrency",
+            "1",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("unexpected argument"));
 }
 
 #[test]

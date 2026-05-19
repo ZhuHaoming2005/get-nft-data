@@ -83,8 +83,8 @@ cargo run --release -- analyze \
   --feature-parquet ../output/top_contract_analysis/ethereum.parquet \
   --feature-db ../output/top_contract_analysis/features.duckdb \
   --signal-cache-db ../output/top_contract_analysis/signals.duckdb \
-  --max-recall-rows 5000000 \
-  --api-max-concurrency 16 \
+  --max-recall-rows 30000000 \
+  --api-max-concurrency 8 \
   --duckdb-memory-limit 50GB \
   --duckdb-threads 32
 ```
@@ -126,14 +126,14 @@ cargo run --release -- batch \
   --feature-db ../output/top_contract_analysis/features.duckdb \
   --signal-cache-db ../output/top_contract_analysis/signals.duckdb \
   --output-dir ./result \
-  --workers 3 \
-  --max-recall-rows 5000000 \
-  --api-max-concurrency 16 \
+  --seed-network-max-concurrency 3 \
+  --max-recall-rows 30000000 \
+  --api-max-concurrency 8 \
   --seed-metadata-max-concurrency 1 \
   --contract-max-concurrency 16 \
-  --sale-metric-max-concurrency 10 \
-  --cpu-max-concurrency 1 \
-  --duckdb-memory-limit 30GB
+  --sale-metric-max-concurrency 16 \
+  --seed-cpu-max-concurrency 1 \
+  --duckdb-memory-limit 50GB
 ```
 
 批量输出包括：
@@ -145,12 +145,12 @@ cargo run --release -- batch \
 常用参数：
 
 - `--timeout 30`
-- `--workers 4`
+- `--seed-network-max-concurrency 4`：同时处于 seed 级网络阶段的 seed 合约数，覆盖 seed context 抓取和后续候选合约网络分析阶段。
 - `--api-max-concurrency 8`
 - `--seed-metadata-max-concurrency 1`：批量模式下同时下载 seed 合约 metadata 的 seed 数。
 - `--contract-max-concurrency 4`
 - `--sale-metric-max-concurrency 4`
-- `--cpu-max-concurrency 1`
+- `--seed-cpu-max-concurrency 1`：同时处于 seed 级 CPU 密集阶段的 seed 合约数，覆盖 DuckDB recall / duplicate scoring。
 - `--duckdb-threads 0`
 - `--duckdb-memory-limit 80GB`
 - `--max-recall-rows 100000`：单批 SQL recall 读取行数；`0` 表示单次读取全部。非 `0` 时会分批读取完整 recall 结果，不作为总量截断。
@@ -170,6 +170,6 @@ cargo run --release -- batch \
 - 如果同时传了 `--feature-db` 和 `--feature-parquet`，且 `feature-db` 中该链已经有当前版本数据，则会复用 `feature-db`；如果没有该链数据，才从 Parquet 导入。旧版本 `feature-db` / 旧快照缺少预计算列会直接报错，需要重新运行 `export-snapshot`。
 - 当前快照 schema 强制包含 `metadata_json`、`token_uri_norm`、`image_uri_norm`、`name_norm`。metadata 文档不再持久化，召回和最终复核都从 `metadata_json` 派生；SQL recall 会先用规范化 URI/name 列做精确召回，metadata recall 则在 Rust 侧从 `metadata_json` 构建 sketch/source candidate 和 BM25 prefilter。
 - duplicate scoring 使用合约级聚合：查重阶段每个候选合约只用代表 token 评分，BM25 metadata scoring 会复用缓存的 token、term frequency 和文档长度；合约命中后，分析阶段会通过 Alchemy `getNFTsForContract` 拉取该合约下全量 NFT，用于 NFT 级报告、地址和交易统计。
-- `batch` 按 worker chunk 调度：先并发下载当前 chunk 的 seed context，再用一次批量 DuckDB recall 复用候选扫描结果，随后按 seed 生成候选和报告；批量 recall 内部会对命中行做有界分批拉取，避免按 seed 数倍增物化完整中间行。
-- `batch` 的资源在整个进程内全局复用：API client、HTTP semaphore、DuckDB feature store、signal cache 不按 worker 复制，避免多 worker 重复占用内存。
-- `batch` 的并发参数都是全局限制，不是单 worker 限制：`--workers` 控制同时进入流水线的 seed 数，`--api-max-concurrency` 控制全局 HTTP 请求并发，`--seed-metadata-max-concurrency` 控制同时下载 seed 合约 metadata 的 seed 数，`--contract-max-concurrency` 控制全局候选合约分析并发，`--sale-metric-max-concurrency` 控制全局 sale metric 并发，`--cpu-max-concurrency` 控制同时执行 DuckDB recall / duplicate scoring 的 seed 数。默认 `--seed-metadata-max-concurrency 1` 和 `--cpu-max-concurrency 1`，避免多个 seed 同时前置下载 metadata 或同时打满 DuckDB / Rayon CPU。
+- `batch` 按 seed 流式调度：每个 seed 依次经过 seed context 网络阶段、DuckDB recall / duplicate scoring CPU 阶段、候选合约网络分析阶段；不同 seed 可以在这些阶段之间错峰执行，不再等待同一批 seed 收齐后才进入 load 阶段。
+- `batch` 的资源在整个进程内全局复用：API client、HTTP semaphore、DuckDB feature store、signal cache 不按并发槽位复制，避免重复占用内存。
+- `batch` 的并发参数都是全局限制：`--seed-network-max-concurrency` 控制同时参与 seed 级网络阶段的 seed 数，`--seed-cpu-max-concurrency` 控制同时参与 DuckDB recall / duplicate scoring 的 seed 数，`--api-max-concurrency` 控制全局 HTTP 请求并发，`--seed-metadata-max-concurrency` 控制同时下载 seed 合约 metadata 的 seed 数，`--contract-max-concurrency` 控制全局候选合约分析并发，`--sale-metric-max-concurrency` 控制全局 sale metric 并发。默认 `--seed-metadata-max-concurrency 1` 和 `--seed-cpu-max-concurrency 1`，避免多个 seed 同时前置下载 metadata 或同时打满 DuckDB / Rayon CPU。

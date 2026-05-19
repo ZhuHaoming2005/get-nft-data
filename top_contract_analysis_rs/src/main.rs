@@ -92,7 +92,10 @@ fn main() -> Result<(), AppError> {
                 feature_store: Arc::new(feature_store),
                 signal_cache: Some(Arc::new(ContractSignalCache::new(&args.signal_cache_db)?)),
                 progress: Arc::new(NoopProgressReporter),
-                batch_progress: create_batch_progress_reporter(&seed_addresses, args.workers),
+                batch_progress: create_batch_progress_reporter(
+                    &seed_addresses,
+                    args.seed_network_max_concurrency,
+                ),
             };
             let output_dir = std::path::PathBuf::from(&args.output_dir);
             let payload = run_batch(
@@ -115,10 +118,10 @@ fn main() -> Result<(), AppError> {
                     seed_metadata_max_concurrency: args.seed_metadata_max_concurrency,
                     contract_max_concurrency: args.contract_max_concurrency,
                     sale_metric_max_concurrency: args.sale_metric_max_concurrency,
-                    cpu_max_concurrency: args.cpu_max_concurrency,
+                    seed_network_max_concurrency: args.seed_network_max_concurrency,
+                    seed_cpu_max_concurrency: args.seed_cpu_max_concurrency,
                     max_tokens_per_contract: args.max_tokens_per_contract,
                     max_recall_rows: args.max_recall_rows,
-                    workers: args.workers,
                 },
                 &deps,
             )

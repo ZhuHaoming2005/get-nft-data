@@ -16,6 +16,7 @@ use top_contract_analysis_rs::models::{
     HonestAddressPayload, InfringingTokenRecord, MaliciousAddressPayload, NftSaleRecord,
     OutputFilesPayload, OwnerBalance, ReportSummary, SecondarySaleVictimAddressPayload,
     SeedContractPayload, SeedNft, SingleReportPayload, TransactionReceiptRecord, TransferRecord,
+    VictimAcquisitionAddressPayload,
 };
 use top_contract_analysis_rs::progress::{
     BatchProgressReporter, NoopBatchProgressReporter, NoopProgressReporter, SeedProgressReporter,
@@ -49,12 +50,19 @@ impl FeatureStoreReader for CapturingBatchFeatureStore {
     fn load_snapshot(
         &self,
         _chain: &str,
-        _seed_nfts: &[SeedNft],
+        seed_nfts: &[SeedNft],
         _name_threshold: f64,
         _metadata_threshold: f64,
         _max_tokens_per_contract: usize,
         _max_recall_rows: usize,
     ) -> Result<DatabaseSnapshot, AppError> {
+        let mut captured_seed_names = self.captured_seed_names.lock().unwrap();
+        if let Some(seed) = seed_nfts.first() {
+            captured_seed_names.insert(
+                seed.contract_address.clone(),
+                seed_nfts.iter().map(|item| item.name.clone()).collect(),
+            );
+        }
         Ok(DatabaseSnapshot::default())
     }
 
@@ -537,6 +545,14 @@ fn cached_single_report(
             ..AddressAttributionPayload::default()
         })
         .collect();
+    let victim_acquisition_addresses = secondary_sale_victim_addresses
+        .iter()
+        .map(|item| VictimAcquisitionAddressPayload {
+            address: item.address.clone(),
+            is_stuck: item.is_stuck,
+            ..VictimAcquisitionAddressPayload::default()
+        })
+        .collect();
 
     SingleReportPayload {
         seed_contract,
@@ -546,6 +562,7 @@ fn cached_single_report(
         honest_addresses,
         address_attributions,
         secondary_sale_victim_addresses,
+        victim_acquisition_addresses,
         address_signals,
         ..SingleReportPayload::default()
     }
@@ -732,6 +749,8 @@ fn batch_markdown_preserves_reference_summary_and_output_index_lines() {
             victim_acquisition_stuck_cost_eth_total: 5.0,
             victim_acquisition_stuck_cost_usd_total: 5.0,
             victim_acquisition_stuck_cost_ratio_overall: Some(0.4),
+            victim_acquisition_address_count_total: 6,
+            victim_acquisition_address_count_distinct: 4,
             buy_asset_ratio_known_address_count_total: 8,
             ratio_over_60_address_count_total: 3,
             ratio_over_60_address_ratio_overall: Some(0.375),
@@ -739,7 +758,10 @@ fn batch_markdown_preserves_reference_summary_and_output_index_lines() {
             ratio_over_80_address_ratio_overall: Some(0.125),
             stuck_victim_address_count_total: 2,
             stuck_victim_address_ratio_overall: Some(0.25),
+            stuck_victim_address_count_distinct: 2,
+            stuck_victim_address_ratio_distinct: Some(0.5),
             corrupted_victim_address_count_total: 1,
+            corrupted_victim_address_count_distinct: 1,
             avg_deployment_to_neutral_holder_seconds_mean: Some(12.5),
             median_deployment_to_neutral_holder_seconds_median: Some(10.0),
             avg_deployment_to_first_transfer_seconds_mean: Some(8.0),
@@ -793,6 +815,8 @@ fn batch_markdown_preserves_reference_summary_and_output_index_lines() {
     assert!(markdown.contains("# Top NFT 合约批量分析总报告"));
     assert!(markdown.contains("- 检测到开放许可的 seed 数: 1"));
     assert!(markdown.contains("- 疑似操作者地址总数: 7"));
+    assert!(markdown.contains("- 受害者地址数(全局去重): 4"));
+    assert!(markdown.contains("- 受害者地址观测数(按 seed 求和): 6"));
     assert!(markdown.contains("- 受害者获取成本(USD)汇总: 12.5"));
     assert!(markdown.contains("- 总套牢成本(USD)汇总: 5 / 40.00%"));
     assert!(markdown.contains("- 二级市场受害者成本(USD)汇总: 12.5"));
@@ -800,6 +824,10 @@ fn batch_markdown_preserves_reference_summary_and_output_index_lines() {
     assert!(
         markdown.contains("- 获取成本占购买前 ETH 余额估算 >60% 的受害者数/总体占比: 3 / 37.50%")
     );
+    assert!(markdown.contains("- 套牢受害者地址数(全局去重)/占比: 2 / 50.00%"));
+    assert!(markdown.contains("- 套牢受害者地址观测数(按 seed 求和)/占比: 2 / 25.00%"));
+    assert!(markdown.contains("- 被腐化受害者地址数(全局去重): 1"));
+    assert!(markdown.contains("- 被腐化受害者地址观测数(按 seed 求和): 1"));
     assert!(markdown.contains("- 生成时间(UTC): 2026-04-17T00:00:00+00:00"));
     assert!(markdown.contains("## Seed 报告索引"));
     assert!(markdown.contains(
@@ -901,7 +929,7 @@ async fn batch_uses_contract_level_seed_name_for_snapshot_recall() {
             seed_file: dir.path().join("seeds.txt"),
             output_dir: dir.path().to_path_buf(),
             alchemy_api_key: "key".into(),
-            workers: 2,
+            seed_network_max_concurrency: 2,
             ..BatchRequest::default()
         },
         &deps,
@@ -985,6 +1013,7 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
         ],
         vec![HonestAddressPayload {
             address: "0xh1".into(),
+            is_corrupted_address: true,
             deployment_to_neutral_holder_seconds_samples: vec![5, 15],
             ..HonestAddressPayload::default()
         }],
@@ -1059,6 +1088,7 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
             ratio_over_60_address_count: 2,
             ratio_over_80_address_count: 1,
             stuck_victim_address_count: 1,
+            corrupted_victim_address_count: 1,
             avg_deployment_to_neutral_holder_seconds: Some(18.0),
             median_deployment_to_neutral_holder_seconds: Some(20.0),
             avg_deployment_to_first_transfer_seconds: Some(14.0),
@@ -1093,13 +1123,23 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
                 ..HonestAddressPayload::default()
             },
         ],
-        vec![SecondarySaleVictimAddressPayload {
-            address: "0xv3".into(),
-            last_buy_amount_eth: Some(1.0),
-            last_buy_amount_usd: Some(1.0),
-            is_stuck: true,
-            ..SecondarySaleVictimAddressPayload::default()
-        }],
+        vec![
+            SecondarySaleVictimAddressPayload {
+                address: "0xv2".into(),
+                last_buy_amount_eth: Some(1.0),
+                last_buy_amount_usd: Some(1.0),
+                is_stuck: true,
+                ..SecondarySaleVictimAddressPayload::default()
+            },
+            SecondarySaleVictimAddressPayload {
+                address: "0xv3".into(),
+                ..SecondarySaleVictimAddressPayload::default()
+            },
+            SecondarySaleVictimAddressPayload {
+                address: "0xv4".into(),
+                ..SecondarySaleVictimAddressPayload::default()
+            },
+        ],
         BTreeMap::from([(
             "0xa3".into(),
             AddressSignalPayload {
@@ -1184,12 +1224,26 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
         Some(0.2)
     );
     assert_eq!(summary.batch_summary.stuck_victim_address_count_total, 2);
+    let batch_summary_json = serde_json::to_value(&summary.batch_summary).unwrap();
+    assert_eq!(
+        batch_summary_json["victim_acquisition_address_count_distinct"],
+        4
+    );
+    assert_eq!(batch_summary_json["stuck_victim_address_count_distinct"], 2);
+    assert_eq!(
+        batch_summary_json["stuck_victim_address_ratio_distinct"],
+        0.5
+    );
     assert_eq!(
         summary.batch_summary.stuck_victim_address_ratio_overall,
         Some(0.4)
     );
     assert_eq!(
         summary.batch_summary.corrupted_victim_address_count_total,
+        2
+    );
+    assert_eq!(
+        batch_summary_json["corrupted_victim_address_count_distinct"],
         1
     );
     assert_eq!(
@@ -1615,7 +1669,7 @@ impl BatchProgressReporter for RecordingBatchProgressReporter {
 }
 
 #[tokio::test]
-async fn batch_uses_worker_concurrency_for_uncached_seeds() {
+async fn batch_uses_seed_network_concurrency_for_uncached_seeds() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n0xseed3\n").unwrap();
     let api = Arc::new(SlowBatchApi::new());
@@ -1633,7 +1687,7 @@ async fn batch_uses_worker_concurrency_for_uncached_seeds() {
             seed_file: dir.path().join("seeds.txt"),
             output_dir: dir.path().to_path_buf(),
             alchemy_api_key: "key".into(),
-            workers: 2,
+            seed_network_max_concurrency: 2,
             seed_metadata_max_concurrency: 2,
             ..BatchRequest::default()
         },
@@ -1646,7 +1700,7 @@ async fn batch_uses_worker_concurrency_for_uncached_seeds() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn batch_continues_successful_seed_in_chunk_after_context_failure() {
+async fn batch_continues_successful_seed_after_context_failure() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n").unwrap();
     let batch_progress = Arc::new(RecordingBatchProgressReporter::default());
@@ -1664,7 +1718,7 @@ async fn batch_continues_successful_seed_in_chunk_after_context_failure() {
             seed_file: dir.path().join("seeds.txt"),
             output_dir: dir.path().to_path_buf(),
             alchemy_api_key: "key".into(),
-            workers: 2,
+            seed_network_max_concurrency: 2,
             ..BatchRequest::default()
         },
         &deps,
@@ -1691,7 +1745,7 @@ async fn batch_continues_successful_seed_in_chunk_after_context_failure() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn batch_prefetches_seed_contexts_before_snapshot_batch() {
+async fn batch_prefetches_later_seed_context_while_earlier_seed_loads_snapshot() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n").unwrap();
     let probe = Arc::new(BatchPipelineProbe::default());
@@ -1717,8 +1771,8 @@ async fn batch_prefetches_seed_contexts_before_snapshot_batch() {
             seed_file: dir.path().join("seeds.txt"),
             output_dir: dir.path().to_path_buf(),
             alchemy_api_key: "key".into(),
-            workers: 2,
-            cpu_max_concurrency: 1,
+            seed_network_max_concurrency: 1,
+            seed_cpu_max_concurrency: 1,
             ..BatchRequest::default()
         },
         &deps,
@@ -1727,8 +1781,8 @@ async fn batch_prefetches_seed_contexts_before_snapshot_batch() {
     .unwrap();
 
     assert_eq!(probe.metadata_calls.load(Ordering::SeqCst), 2);
-    assert_eq!(probe.snapshot_batch_calls.load(Ordering::SeqCst), 1);
-    assert!(!probe
+    assert_eq!(probe.snapshot_batch_calls.load(Ordering::SeqCst), 0);
+    assert!(probe
         .seed_two_context_overlapped_snapshot
         .load(Ordering::SeqCst));
 }
@@ -1760,8 +1814,8 @@ async fn batch_limits_cpu_stage_globally() {
             seed_file: dir.path().join("seeds.txt"),
             output_dir: dir.path().to_path_buf(),
             alchemy_api_key: "key".into(),
-            workers: 3,
-            cpu_max_concurrency: 1,
+            seed_network_max_concurrency: 3,
+            seed_cpu_max_concurrency: 1,
             ..BatchRequest::default()
         },
         &deps,
@@ -1774,7 +1828,7 @@ async fn batch_limits_cpu_stage_globally() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn batch_uses_one_snapshot_batch_per_worker_chunk() {
+async fn batch_loads_snapshots_per_seed_without_seed_chunks() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n").unwrap();
     let probe = Arc::new(BatchPipelineProbe::default());
@@ -1800,8 +1854,8 @@ async fn batch_uses_one_snapshot_batch_per_worker_chunk() {
             seed_file: dir.path().join("seeds.txt"),
             output_dir: dir.path().to_path_buf(),
             alchemy_api_key: "key".into(),
-            workers: 2,
-            cpu_max_concurrency: 1,
+            seed_network_max_concurrency: 2,
+            seed_cpu_max_concurrency: 1,
             ..BatchRequest::default()
         },
         &deps,
@@ -1809,7 +1863,8 @@ async fn batch_uses_one_snapshot_batch_per_worker_chunk() {
     .await
     .unwrap();
 
-    assert_eq!(probe.snapshot_batch_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.snapshot_batch_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(probe.snapshot_calls.load(Ordering::SeqCst), 2);
     assert_eq!(probe.cpu_max_seen.load(Ordering::SeqCst), 1);
 }
 
@@ -1840,7 +1895,7 @@ async fn batch_limits_seed_metadata_fetches_globally() {
             seed_file: dir.path().join("seeds.txt"),
             output_dir: dir.path().to_path_buf(),
             alchemy_api_key: "key".into(),
-            workers: 3,
+            seed_network_max_concurrency: 3,
             seed_metadata_max_concurrency: 1,
             ..BatchRequest::default()
         },
@@ -1881,8 +1936,8 @@ async fn batch_limits_contract_analysis_globally_across_seeds() {
             seed_file: dir.path().join("seeds.txt"),
             output_dir: dir.path().to_path_buf(),
             alchemy_api_key: "key".into(),
-            workers: 2,
-            cpu_max_concurrency: 2,
+            seed_network_max_concurrency: 2,
+            seed_cpu_max_concurrency: 2,
             contract_max_concurrency: 1,
             ..BatchRequest::default()
         },
@@ -1926,8 +1981,8 @@ async fn batch_allows_contract_expansion_while_another_seed_computes_sale_metric
             seed_file: dir.path().join("seeds.txt"),
             output_dir: dir.path().to_path_buf(),
             alchemy_api_key: "key".into(),
-            workers: 2,
-            cpu_max_concurrency: 2,
+            seed_network_max_concurrency: 2,
+            seed_cpu_max_concurrency: 2,
             contract_max_concurrency: 1,
             sale_metric_max_concurrency: 1,
             ..BatchRequest::default()
@@ -1968,7 +2023,7 @@ async fn batch_progress_reporter_receives_seed_lifecycle_events() {
             seed_file: dir.path().join("seeds.txt"),
             output_dir: dir.path().to_path_buf(),
             alchemy_api_key: "key".into(),
-            workers: 1,
+            seed_network_max_concurrency: 1,
             ..BatchRequest::default()
         },
         &deps,
@@ -2038,7 +2093,7 @@ async fn batch_progress_reporter_counts_cached_seed_reports() {
             seed_file: dir.path().join("seeds.txt"),
             output_dir: dir.path().to_path_buf(),
             alchemy_api_key: "key".into(),
-            workers: 1,
+            seed_network_max_concurrency: 1,
             ..BatchRequest::default()
         },
         &deps,

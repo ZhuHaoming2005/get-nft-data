@@ -726,6 +726,18 @@ pub(super) fn build_batch_report_summary(
         .iter()
         .flat_map(|item| item.neutral_addresses.iter().cloned())
         .collect();
+    let victim_acquisition_addresses: BTreeSet<String> = seed_reports
+        .iter()
+        .flat_map(|item| item.victim_acquisition_addresses.iter().cloned())
+        .collect();
+    let stuck_victim_addresses: BTreeSet<String> = seed_reports
+        .iter()
+        .flat_map(|item| item.stuck_victim_addresses.iter().cloned())
+        .collect();
+    let corrupted_victim_addresses: BTreeSet<String> = seed_reports
+        .iter()
+        .flat_map(|item| item.corrupted_victim_addresses.iter().cloned())
+        .collect();
     let mut minter_infringing_contracts: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for seed_report in seed_reports {
         for (minter, contracts) in &seed_report.minter_infringing_contracts {
@@ -975,6 +987,7 @@ pub(super) fn build_batch_report_summary(
             None
         },
         victim_acquisition_address_count_total,
+        victim_acquisition_address_count_distinct: victim_acquisition_addresses.len() as i64,
         stablecoin_erc20_value_usd_total,
         stablecoin_erc20_edge_count_total,
         value_flow_priced_edge_count_total,
@@ -1007,10 +1020,17 @@ pub(super) fn build_batch_report_summary(
         } else {
             None
         },
+        stuck_victim_address_count_distinct: stuck_victim_addresses.len() as i64,
+        stuck_victim_address_ratio_distinct: if !victim_acquisition_addresses.is_empty() {
+            Some(stuck_victim_addresses.len() as f64 / victim_acquisition_addresses.len() as f64)
+        } else {
+            None
+        },
         corrupted_victim_address_count_total: seed_reports
             .iter()
             .map(|item| item.report.report_summary.corrupted_victim_address_count)
             .sum(),
+        corrupted_victim_address_count_distinct: corrupted_victim_addresses.len() as i64,
         avg_corrupted_address_holding_seconds_mean: mean(&mean_corrupted_holding_values),
         median_corrupted_address_holding_seconds_median: median_f64(
             &median_corrupted_holding_values,
@@ -1042,6 +1062,26 @@ pub(super) fn build_batch_seed_aggregate(payload: SingleReportPayload) -> BatchS
         .map(|item| normalized_address(&item.address))
         .filter(|value| !value.is_empty())
         .collect();
+    let victim_acquisition_addresses: BTreeSet<String> = payload
+        .victim_acquisition_addresses
+        .iter()
+        .map(|item| normalized_address(&item.address))
+        .filter(|value| !value.is_empty())
+        .collect();
+    let stuck_victim_addresses: BTreeSet<String> = payload
+        .victim_acquisition_addresses
+        .iter()
+        .filter(|item| item.is_stuck)
+        .map(|item| normalized_address(&item.address))
+        .filter(|value| !value.is_empty())
+        .collect();
+    let corrupted_victim_addresses: BTreeSet<String> = payload
+        .honest_addresses
+        .iter()
+        .filter(|item| item.is_corrupted_address)
+        .map(|item| normalized_address(&item.address))
+        .filter(|value| !value.is_empty())
+        .collect();
     let minter_infringing_contracts = payload_minter_contracts(&payload.infringing_tokens);
     let report_summary = payload.report_summary.clone();
 
@@ -1053,6 +1093,9 @@ pub(super) fn build_batch_seed_aggregate(payload: SingleReportPayload) -> BatchS
         },
         malicious_addresses,
         neutral_addresses,
+        victim_acquisition_addresses,
+        stuck_victim_addresses,
+        corrupted_victim_addresses,
         minter_infringing_contracts,
     }
 }

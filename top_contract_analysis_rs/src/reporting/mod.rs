@@ -398,7 +398,11 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
         ),
         format!("- 中性地址总数: {}", summary.neutral_address_count_total),
         format!(
-            "- 受害者总数: {}",
+            "- 受害者地址数(全局去重): {}",
+            summary.victim_acquisition_address_count_distinct
+        ),
+        format!(
+            "- 受害者地址观测数(按 seed 求和): {}",
             summary.victim_acquisition_address_count_total
         ),
         format!(
@@ -450,12 +454,21 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
             format_ratio(summary.ratio_over_80_address_ratio_overall)
         ),
         format!(
-            "- 套牢受害者数/总体占比: {} / {}",
+            "- 套牢受害者地址数(全局去重)/占比: {} / {}",
+            summary.stuck_victim_address_count_distinct,
+            format_ratio(summary.stuck_victim_address_ratio_distinct)
+        ),
+        format!(
+            "- 套牢受害者地址观测数(按 seed 求和)/占比: {} / {}",
             summary.stuck_victim_address_count_total,
             format_ratio(summary.stuck_victim_address_ratio_overall)
         ),
         format!(
-            "- 被腐化受害者总数: {}",
+            "- 被腐化受害者地址数(全局去重): {}",
+            summary.corrupted_victim_address_count_distinct
+        ),
+        format!(
+            "- 被腐化受害者地址观测数(按 seed 求和): {}",
             summary.corrupted_victim_address_count_total
         ),
         format!(

@@ -221,6 +221,9 @@ struct BatchSeedAggregate {
     report: BatchSeedReportPayload,
     malicious_addresses: BTreeSet<String>,
     neutral_addresses: BTreeSet<String>,
+    victim_acquisition_addresses: BTreeSet<String>,
+    stuck_victim_addresses: BTreeSet<String>,
+    corrupted_victim_addresses: BTreeSet<String>,
     minter_infringing_contracts: BTreeMap<String, BTreeSet<String>>,
 }
 
@@ -295,8 +298,8 @@ pub struct BatchRequest {
     pub max_tokens_per_contract: usize,
     pub max_recall_rows: usize,
     pub seed_metadata_max_concurrency: usize,
-    pub cpu_max_concurrency: usize,
-    pub workers: usize,
+    pub seed_network_max_concurrency: usize,
+    pub seed_cpu_max_concurrency: usize,
 }
 
 impl Default for BatchRequest {
@@ -318,8 +321,8 @@ impl Default for BatchRequest {
             max_tokens_per_contract: 0,
             max_recall_rows: 0,
             seed_metadata_max_concurrency: 1,
-            cpu_max_concurrency: 1,
-            workers: 1,
+            seed_network_max_concurrency: 1,
+            seed_cpu_max_concurrency: 1,
         }
     }
 }
@@ -497,37 +500,6 @@ async fn build_candidate_plan_for_seed(
     })
     .await
     .map_err(|err| AppError::InvalidData(format!("candidate CPU task failed: {err}")))?
-}
-
-fn build_candidate_plan_from_snapshot(
-    request: &AnalyzeRequest,
-    context: &SeedContext,
-    snapshot: DatabaseSnapshot,
-) -> CandidatePlan {
-    let dedup_seed_nfts =
-        seed_nfts_for_duplicate_matching(&context.seed_nfts, &context.seed_contract);
-    let candidates = if snapshot.duplicate_contract_rows.is_empty() && !snapshot.nft_rows.is_empty()
-    {
-        duplicate::build_duplicate_candidates(
-            &request.chain,
-            &dedup_seed_nfts,
-            &snapshot.nft_rows,
-            request.name_threshold,
-            request.metadata_threshold,
-        )
-    } else {
-        duplicate::build_duplicate_candidates_from_contract_rows(
-            &request.chain,
-            &dedup_seed_nfts,
-            &snapshot.duplicate_contract_rows,
-            request.name_threshold,
-            request.metadata_threshold,
-        )
-    };
-    CandidatePlan {
-        snapshot,
-        candidates,
-    }
 }
 
 pub async fn analyze_seed_contract_with_progress(

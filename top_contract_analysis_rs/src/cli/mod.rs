@@ -80,7 +80,7 @@ pub struct BatchArgs {
     #[arg(long, default_value = "../result")]
     pub output_dir: String,
     #[arg(long, default_value_t = 1)]
-    pub workers: usize,
+    pub seed_network_max_concurrency: usize,
     #[arg(long, default_value_t = 8)]
     pub api_max_concurrency: usize,
     #[arg(long, default_value_t = 1)]
@@ -90,7 +90,7 @@ pub struct BatchArgs {
     #[arg(long, default_value_t = 4)]
     pub sale_metric_max_concurrency: usize,
     #[arg(long, default_value_t = 1)]
-    pub cpu_max_concurrency: usize,
+    pub seed_cpu_max_concurrency: usize,
     #[arg(long, default_value_t = 0)]
     pub duckdb_threads: usize,
     #[arg(long, default_value = "80GB")]

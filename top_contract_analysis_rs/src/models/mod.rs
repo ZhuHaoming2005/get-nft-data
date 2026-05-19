@@ -1058,6 +1058,8 @@ pub struct BatchReportSummary {
     pub victim_acquisition_stuck_cost_ratio_overall: Option<f64>,
     pub victim_acquisition_address_count_total: i64,
     #[serde(default)]
+    pub victim_acquisition_address_count_distinct: i64,
+    #[serde(default)]
     pub stablecoin_erc20_value_usd_total: f64,
     #[serde(default)]
     pub stablecoin_erc20_edge_count_total: i64,
@@ -1074,8 +1076,14 @@ pub struct BatchReportSummary {
     pub stuck_victim_address_count_total: i64,
     #[serde(alias = "stuck_honest_address_ratio_overall")]
     pub stuck_victim_address_ratio_overall: Option<f64>,
+    #[serde(default)]
+    pub stuck_victim_address_count_distinct: i64,
+    #[serde(default)]
+    pub stuck_victim_address_ratio_distinct: Option<f64>,
     #[serde(alias = "corrupted_honest_address_count_total")]
     pub corrupted_victim_address_count_total: i64,
+    #[serde(default)]
+    pub corrupted_victim_address_count_distinct: i64,
     pub avg_corrupted_address_holding_seconds_mean: Option<f64>,
     pub median_corrupted_address_holding_seconds_median: Option<f64>,
     #[serde(

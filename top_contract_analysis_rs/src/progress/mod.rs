@@ -47,10 +47,13 @@ pub fn create_single_seed_progress_reporter(seed_address: &str) -> Arc<dyn SeedP
 
 pub fn create_batch_progress_reporter(
     seed_addresses: &[String],
-    workers: usize,
+    seed_network_max_concurrency: usize,
 ) -> Arc<dyn BatchProgressReporter> {
     if std::io::stderr().is_terminal() {
-        Arc::new(TerminalBatchProgressReporter::new(seed_addresses, workers))
+        Arc::new(TerminalBatchProgressReporter::new(
+            seed_addresses,
+            seed_network_max_concurrency,
+        ))
     } else {
         Arc::new(NoopBatchProgressReporter)
     }
@@ -141,7 +144,7 @@ impl Default for SeedProgressState {
 struct BatchProgressState {
     total: usize,
     completed: usize,
-    workers: usize,
+    seed_network_max_concurrency: usize,
     seeds: BTreeMap<String, SeedProgressState>,
 }
 
@@ -150,7 +153,7 @@ struct TerminalBatchProgressReporter {
 }
 
 impl TerminalBatchProgressReporter {
-    fn new(seed_addresses: &[String], workers: usize) -> Self {
+    fn new(seed_addresses: &[String], seed_network_max_concurrency: usize) -> Self {
         let mut seeds = BTreeMap::new();
         for seed_address in seed_addresses {
             seeds.insert(seed_address.clone(), SeedProgressState::default());
@@ -159,7 +162,7 @@ impl TerminalBatchProgressReporter {
             state: Arc::new(Mutex::new(BatchProgressState {
                 total: seed_addresses.len().max(1),
                 completed: 0,
-                workers: workers.max(1),
+                seed_network_max_concurrency: seed_network_max_concurrency.max(1),
                 seeds,
             })),
         }
@@ -174,7 +177,7 @@ impl TerminalBatchProgressReporter {
         contract_total: Option<usize>,
         prefix: &str,
     ) {
-        let (completed, total, running, workers, message) = {
+        let (completed, total, running, seed_network_max_concurrency, message) = {
             let mut state = self.state.lock().unwrap();
             let mut increment_completed = false;
             let message = {
@@ -207,14 +210,14 @@ impl TerminalBatchProgressReporter {
                 state.completed,
                 state.total,
                 running,
-                state.workers,
+                state.seed_network_max_concurrency,
                 message,
             )
         };
         let mut stderr = std::io::stderr().lock();
         let _ = writeln!(
             stderr,
-            "[batch {completed}/{total} | running {running}/{workers}] {} {prefix}: {message}",
+            "[batch {completed}/{total} | active {running} | seed-net limit {seed_network_max_concurrency}] {} {prefix}: {message}",
             short_address(seed_address, 10),
         );
     }
@@ -289,7 +292,7 @@ impl BatchSeedProgressReporter {
         contract_completed: Option<usize>,
         contract_total: Option<usize>,
     ) {
-        let (completed, total, running, workers, changed) = {
+        let (completed, total, running, seed_network_max_concurrency, changed) = {
             let mut state = self.state.lock().unwrap();
             let changed = {
                 let seed_state = state.seeds.entry(self.seed_address.clone()).or_default();
@@ -320,7 +323,7 @@ impl BatchSeedProgressReporter {
                 state.completed,
                 state.total,
                 running,
-                state.workers,
+                state.seed_network_max_concurrency,
                 changed,
             )
         };
@@ -329,10 +332,10 @@ impl BatchSeedProgressReporter {
         }
         let mut stderr = std::io::stderr().lock();
         let _ = writeln!(
-            stderr,
-            "[batch {completed}/{total} | running {running}/{workers}] {} stage: {stage_label}",
-            short_address(&self.seed_address, 10),
-        );
+                stderr,
+                "[batch {completed}/{total} | active {running} | seed-net limit {seed_network_max_concurrency}] {} stage: {stage_label}",
+                short_address(&self.seed_address, 10),
+            );
     }
 }
 
