@@ -1,8 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::Arc;
 
 use futures::{stream, StreamExt};
-use tokio::sync::Semaphore;
 
 use crate::error::AppError;
 use crate::models::{
@@ -10,7 +8,7 @@ use crate::models::{
     TransferRecord, ValueFlowEdgePayload, ZERO_ADDRESS,
 };
 
-use super::{acquire_optional_limit, AnalysisDeps, AnalyzeRequest, RuntimeLimits};
+use super::{AnalysisDeps, AnalyzeRequest};
 
 const MAX_WITHDRAWAL_TRACE_HOPS: usize = 3;
 const MAX_WITHDRAWAL_TRACE_FRONTIER: usize = 32;
@@ -134,7 +132,6 @@ struct CashoutTraceInput<'a> {
     direct_withdrawal_edges: &'a [ValueFlowEdgePayload],
     mint_receipt: Option<&'a TransactionReceiptRecord>,
     block_receipts: &'a BTreeMap<String, TransactionReceiptRecord>,
-    payment_limit: &'a Option<Arc<Semaphore>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -150,17 +147,12 @@ pub(super) async fn compute_mint_payment_edges_for_contract(
     infringing_tokens: &[InfringingTokenRecord],
     transfers: &[TransferRecord],
     contract_metadata: Option<&ContractMetadata>,
-    runtime_limits: &RuntimeLimits,
 ) -> Result<Vec<ValueFlowEdgePayload>, AppError> {
     let lookups = build_mint_payment_lookups(contract_address, infringing_tokens, transfers);
     if lookups.is_empty() {
         return Ok(vec![]);
     }
-    let payment_limit = runtime_limits.sale_metric_limit.clone().or_else(|| {
-        Some(Arc::new(Semaphore::new(
-            request.sale_metric_max_concurrency.max(1),
-        )))
-    });
+    let api_concurrency = request.api_max_concurrency.max(1);
     let contract_deployer = contract_metadata
         .map(|metadata| metadata.contract_deployer.clone())
         .unwrap_or_default();
@@ -170,12 +162,10 @@ pub(super) async fn compute_mint_payment_edges_for_contract(
         contract_address,
         &lookups,
         &contract_deployer,
-        &payment_limit,
     )
     .await?;
 
     let mut fetched = stream::iter(lookups.into_iter().map(|lookup| {
-        let payment_limit = payment_limit.clone();
         let transfers = mint_payment_transfers_for_lookup(
             &lookup,
             contract_address,
@@ -202,7 +192,6 @@ pub(super) async fn compute_mint_payment_edges_for_contract(
                     block_receipts: BTreeMap::new(),
                 });
             }
-            let _permit = acquire_optional_limit(&payment_limit).await?;
             let (receipt, base_balance_eth, block_receipts) = tokio::join!(
                 deps.api.fetch_transaction_receipt_on_chain(
                     &request.chain,
@@ -233,7 +222,7 @@ pub(super) async fn compute_mint_payment_edges_for_contract(
             })
         }
     }))
-    .buffer_unordered(request.sale_metric_max_concurrency.max(1));
+    .buffer_unordered(api_concurrency);
 
     let mut rows = BTreeMap::<String, ValueFlowEdgePayload>::new();
     while let Some(result) = fetched.next().await {
@@ -293,7 +282,6 @@ pub(super) async fn compute_mint_payment_edges_for_contract(
             direct_withdrawal_edges: &direct_withdrawal_edges,
             mint_receipt: receipt,
             block_receipts: &inputs.block_receipts,
-            payment_limit: &payment_limit,
         })
         .await?
         {
@@ -323,7 +311,6 @@ async fn fetch_mint_payment_transfers_for_lookups(
     contract_address: &str,
     lookups: &[MintPaymentLookup],
     contract_deployer: &str,
-    payment_limit: &Option<Arc<Semaphore>>,
 ) -> Result<BTreeMap<(i64, String), Vec<EthTransferRecord>>, AppError> {
     let mut requests = BTreeMap::<(i64, String), String>::new();
     for lookup in lookups {
@@ -335,33 +322,29 @@ async fn fetch_mint_payment_transfers_for_lookups(
     }
 
     let mut fetched = stream::iter(requests.into_iter().map(
-        |((block_number, address_key), address)| {
-            let payment_limit = payment_limit.clone();
-            async move {
-                let _permit = acquire_optional_limit(&payment_limit).await?;
-                match deps
-                    .api
-                    .fetch_mint_payment_eth_transfers_on_chain(
-                        &request.chain,
-                        &request.alchemy_api_key,
-                        request.alchemy_network.as_deref(),
-                        block_number,
-                        &address,
-                    )
-                    .await
-                {
-                    Ok(rows) => Ok::<_, AppError>(((block_number, address_key), rows)),
-                    Err(err) => {
-                        eprintln!(
-                            "warning: mint value-flow transfer lookup failed for {address} at block {block_number}: {err}; continuing without this value-flow evidence"
-                        );
-                        Ok::<_, AppError>(((block_number, address_key), Vec::new()))
-                    }
+        |((block_number, address_key), address)| async move {
+            let result = deps
+                .api
+                .fetch_mint_payment_eth_transfers_on_chain(
+                    &request.chain,
+                    &request.alchemy_api_key,
+                    request.alchemy_network.as_deref(),
+                    block_number,
+                    &address,
+                )
+                .await;
+            match result {
+                Ok(rows) => Ok::<_, AppError>(((block_number, address_key), rows)),
+                Err(err) => {
+                    eprintln!(
+                        "warning: mint value-flow transfer lookup failed for {address} at block {block_number}: {err}; continuing without this value-flow evidence"
+                    );
+                    Ok::<_, AppError>(((block_number, address_key), Vec::new()))
                 }
             }
         },
     ))
-    .buffer_unordered(request.sale_metric_max_concurrency.max(1));
+    .buffer_unordered(request.api_max_concurrency.max(1));
 
     let mut rows_by_request = BTreeMap::new();
     while let Some(result) = fetched.next().await {
@@ -572,7 +555,6 @@ async fn trace_withdrawal_cashout_edges(
         direct_withdrawal_edges,
         mint_receipt,
         block_receipts,
-        payment_limit,
     } = input;
     let mut rows = BTreeMap::<String, ValueFlowEdgePayload>::new();
     let mut seen_edge_ids: BTreeSet<String> = direct_withdrawal_edges
@@ -656,14 +638,9 @@ async fn trace_withdrawal_cashout_edges(
             break;
         }
 
-        let transfers = fetch_cashout_trace_transfers(
-            request,
-            deps,
-            lookup.block_number,
-            &node.address,
-            payment_limit,
-        )
-        .await?;
+        let transfers =
+            fetch_cashout_trace_transfers(request, deps, lookup.block_number, &node.address)
+                .await?;
         for transfer in transfers {
             if !is_cashout_hop_transfer(&transfer, &node, lookup.block_number, block_receipts) {
                 continue;
@@ -731,9 +708,7 @@ async fn fetch_cashout_trace_transfers(
     deps: &AnalysisDeps,
     block_number: i64,
     address: &str,
-    payment_limit: &Option<Arc<Semaphore>>,
 ) -> Result<Vec<EthTransferRecord>, AppError> {
-    let _permit = acquire_optional_limit(payment_limit).await?;
     match deps
         .api
         .fetch_mint_payment_eth_transfers_on_chain(

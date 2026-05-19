@@ -4,10 +4,10 @@ use crate::error::AppError;
 use crate::models::{ContractMetadata, DuplicateCandidate, DuplicateContractPayload};
 
 use super::{
-    acquire_optional_limit, address_records, analyze_victim_signals_from_active_sellers,
+    address_records, analyze_victim_signals_from_active_sellers,
     compute_mint_payment_edges_for_contract, compute_sale_metrics_for_contract,
     map_address_signals, propagation, signals, AnalysisDeps, AnalysisOutputState, AnalyzeRequest,
-    ContractAnalysisResult, RuntimeLimits,
+    ContractAnalysisResult,
 };
 
 pub(super) fn merge_contract_analysis_result(
@@ -131,9 +131,7 @@ pub(super) async fn fetch_candidate_contract_metadata(
     request: &AnalyzeRequest,
     deps: &AnalysisDeps,
     contract_address: &str,
-    runtime_limits: &RuntimeLimits,
 ) -> Result<Option<ContractMetadata>, AppError> {
-    let _contract_permit = acquire_optional_limit(&runtime_limits.contract_limit).await?;
     match deps
         .api
         .fetch_contract_metadata(
@@ -165,7 +163,6 @@ pub(super) struct DuplicateContractAnalysisInput<'a> {
     pub(super) official_addresses: &'a HashSet<String>,
     pub(super) candidate_open_license_by_token: &'a HashMap<(String, String), bool>,
     pub(super) analysis_timestamp: i64,
-    pub(super) runtime_limits: &'a RuntimeLimits,
 }
 
 pub(super) async fn analyze_duplicate_contract(
@@ -181,7 +178,6 @@ pub(super) async fn analyze_duplicate_contract(
         official_addresses,
         candidate_open_license_by_token,
         analysis_timestamp,
-        runtime_limits,
     } = input;
     let contract_candidate_refs: Vec<&DuplicateCandidate> = contract_candidates.iter().collect();
     let cached_signals = if let Some(cache) = deps.signal_cache.as_ref() {
@@ -198,25 +194,22 @@ pub(super) async fn analyze_duplicate_contract(
             .unwrap_or_else(|| analyze_victim_signals_from_active_sellers(&transfers, &owners));
         (transfers, owners, cached.address_signals, victim_signal)
     } else {
-        let (transfers, owners) = {
-            let _contract_permit = acquire_optional_limit(&runtime_limits.contract_limit).await?;
-            tokio::join!(
-                deps.api.fetch_contract_transfers(
-                    &request.chain,
-                    &request.etherscan_api_key,
-                    request.alchemy_network.as_deref(),
-                    &request.alchemy_api_key,
-                    contract_address,
-                    token_type,
-                ),
-                deps.api.fetch_contract_owners(
-                    &request.chain,
-                    &request.alchemy_api_key,
-                    request.alchemy_network.as_deref(),
-                    contract_address,
-                )
+        let (transfers, owners) = tokio::join!(
+            deps.api.fetch_contract_transfers(
+                &request.chain,
+                &request.etherscan_api_key,
+                request.alchemy_network.as_deref(),
+                &request.alchemy_api_key,
+                contract_address,
+                token_type,
+            ),
+            deps.api.fetch_contract_owners(
+                &request.chain,
+                &request.alchemy_api_key,
+                request.alchemy_network.as_deref(),
+                contract_address,
             )
-        };
+        );
         let transfers = transfers?;
         let owners = owners?;
         if let Some(cache) = deps.signal_cache.as_ref() {
@@ -280,7 +273,6 @@ pub(super) async fn analyze_duplicate_contract(
     }
 
     let sales_fut = async {
-        let _contract_permit = acquire_optional_limit(&runtime_limits.contract_limit).await?;
         deps.api
             .fetch_contract_sales(
                 &request.chain,
@@ -292,7 +284,6 @@ pub(super) async fn analyze_duplicate_contract(
             .await
     };
     let market_events_fut = async {
-        let _contract_permit = acquire_optional_limit(&runtime_limits.contract_limit).await?;
         deps.api
             .fetch_contract_market_events(
                 &request.chain,
@@ -310,12 +301,10 @@ pub(super) async fn analyze_duplicate_contract(
         &contract_infringing,
         &transfers,
         contract_metadata.as_ref(),
-        runtime_limits,
     );
     let (sales, market_events, mint_payment_edges) =
         tokio::try_join!(sales_fut, market_events_fut, mint_payment_edges_fut)?;
-    let sale_metrics_by_tx =
-        compute_sale_metrics_for_contract(request, deps, &sales, runtime_limits).await?;
+    let sale_metrics_by_tx = compute_sale_metrics_for_contract(request, deps, &sales).await?;
 
     let contract_activity = address_records::prepare_contract_activity(&transfers, &sales, &owners);
     let contract_malicious = address_records::build_malicious_address_records_from_activity(

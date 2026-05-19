@@ -32,7 +32,6 @@ fn analyze_request_for_batch_seed(
         timeout_seconds: request.timeout_seconds,
         api_max_concurrency: request.api_max_concurrency,
         contract_max_concurrency: request.contract_max_concurrency,
-        sale_metric_max_concurrency: request.sale_metric_max_concurrency,
         max_tokens_per_contract: request.max_tokens_per_contract,
         max_recall_rows: request.max_recall_rows,
     }
@@ -63,11 +62,8 @@ pub async fn run_batch(
         seed_metadata_limit: Some(Arc::new(Semaphore::new(
             request.seed_metadata_max_concurrency.max(1),
         ))),
-        contract_limit: Some(Arc::new(Semaphore::new(
+        match_contract_limit: Some(Arc::new(Semaphore::new(
             request.contract_max_concurrency.max(1),
-        ))),
-        sale_metric_limit: Some(Arc::new(Semaphore::new(
-            request.sale_metric_max_concurrency.max(1),
         ))),
     };
     let mut fresh_entries = Vec::new();

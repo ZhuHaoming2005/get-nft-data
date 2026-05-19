@@ -6,8 +6,7 @@ use crate::error::AppError;
 use crate::models::{DatabaseNftRecord, DuplicateCandidate, DuplicateContractPayload, SeedNft};
 
 use super::{
-    acquire_optional_limit, AnalysisDeps, AnalyzeRequest, CandidateContractFilterResult,
-    CandidateSeedHolderRequest, RuntimeLimits,
+    AnalysisDeps, AnalyzeRequest, CandidateContractFilterResult, CandidateSeedHolderRequest,
 };
 
 pub fn group_candidates_by_contract(
@@ -34,7 +33,6 @@ pub(super) async fn filter_seed_related_candidate_contracts(
     candidates: Vec<DuplicateCandidate>,
     seed_token_type: &str,
     concurrency: usize,
-    runtime_limits: &RuntimeLimits,
 ) -> CandidateContractFilterResult {
     if candidates.is_empty() {
         return CandidateContractFilterResult {
@@ -90,15 +88,6 @@ pub(super) async fn filter_seed_related_candidate_contracts(
         let seed_collection_slug = seed_collection_slug.clone();
         let normalized_seed_collection_slug = normalized_seed_collection_slug.clone();
         async move {
-            let _permit = match acquire_optional_limit(&runtime_limits.contract_limit).await {
-                Ok(permit) => permit,
-                Err(err) => {
-                    eprintln!(
-                        "warning: contract concurrency limit failed for {contract_address}: {err}; continuing without holder-based candidate exclusion"
-                    );
-                    return (contract_address, CandidateSeedRelationCheck::Holder(Ok(None)));
-                }
-            };
             if let Some(seed_collection_slug) = normalized_seed_collection_slug.as_deref() {
                 match deps
                     .api
@@ -306,25 +295,22 @@ pub(super) async fn fetch_and_expand_contract_candidates(
     grouped: &BTreeMap<String, Vec<usize>>,
     candidates: &[DuplicateCandidate],
     snapshot_token_index: &SnapshotTokenIndex<'_>,
-    runtime_limits: &RuntimeLimits,
 ) -> Result<Vec<DuplicateCandidate>, AppError> {
     let candidate_indexes = grouped
         .get(contract_address)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
-    let provider_tokens = {
-        let _permit = acquire_optional_limit(&runtime_limits.contract_limit).await?;
-        deps.api
-            .fetch_contract_nfts(
-                &request.chain,
-                &request.alchemy_api_key,
-                request.alchemy_network.as_deref(),
-                &request.etherscan_api_key,
-                &request.opensea_api_key,
-                contract_address,
-            )
-            .await
-    };
+    let provider_tokens = deps
+        .api
+        .fetch_contract_nfts(
+            &request.chain,
+            &request.alchemy_api_key,
+            request.alchemy_network.as_deref(),
+            &request.etherscan_api_key,
+            &request.opensea_api_key,
+            contract_address,
+        )
+        .await;
     let expanded = match provider_tokens {
         Ok(tokens) => {
             let expanded = expand_candidate_indexes_to_contract_tokens(

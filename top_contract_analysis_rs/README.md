@@ -99,7 +99,6 @@ cargo run --release -- analyze \
 - `--max-recall-rows 100000`：单批 SQL recall 读取行数；`0` 表示单次读取全部。非 `0` 时会分批读取完整 recall 结果。
 - `--api-max-concurrency 12`
 - `--contract-max-concurrency 4`
-- `--sale-metric-max-concurrency 4`
 - `--duckdb-threads 0`：`0` 表示使用当前可用线程数
 - `--duckdb-memory-limit 80GB`
 - `--output ./result/azuki.json`
@@ -131,7 +130,6 @@ cargo run --release -- batch \
   --api-max-concurrency 6 \
   --seed-metadata-max-concurrency 1 \
   --contract-max-concurrency 16 \
-  --sale-metric-max-concurrency 16 \
   --seed-cpu-max-concurrency 1 \
   --duckdb-memory-limit 50GB
 ```
@@ -148,8 +146,7 @@ cargo run --release -- batch \
 - `--seed-network-max-concurrency 4`：同时处于 seed 级网络阶段的 seed 合约数，覆盖 seed context 抓取和后续候选合约网络分析阶段。
 - `--api-max-concurrency 8`
 - `--seed-metadata-max-concurrency 1`：批量模式下同时下载 seed 合约 metadata 的 seed 数。
-- `--contract-max-concurrency 4`
-- `--sale-metric-max-concurrency 4`
+- `--contract-max-concurrency 4`：全局 matched contract 分析 worker 上限。合约分析内部的 metadata、扩展、transfers/owners、sales、market events、mint value-flow 等 API 请求仍统一计入 `--api-max-concurrency`。
 - `--seed-cpu-max-concurrency 1`：同时处于 seed 级 CPU 密集阶段的 seed 合约数，覆盖 DuckDB recall / duplicate scoring。
 - `--duckdb-threads 0`
 - `--duckdb-memory-limit 80GB`
@@ -172,4 +169,4 @@ cargo run --release -- batch \
 - duplicate scoring 使用合约级聚合：查重阶段每个候选合约只用代表 token 评分，BM25 metadata scoring 会复用缓存的 token、term frequency 和文档长度；合约命中后，分析阶段会通过 Alchemy `getNFTsForContract` 拉取该合约下全量 NFT，用于 NFT 级报告、地址和交易统计。
 - `batch` 按 seed 流式调度：每个 seed 依次经过 seed context 网络阶段、DuckDB recall / duplicate scoring CPU 阶段、候选合约网络分析阶段；不同 seed 可以在这些阶段之间错峰执行，不再等待同一批 seed 收齐后才进入 load 阶段。
 - `batch` 的资源在整个进程内全局复用：API client、HTTP semaphore、DuckDB feature store、signal cache 不按并发槽位复制，避免重复占用内存。
-- `batch` 的并发参数都是全局限制：`--seed-network-max-concurrency` 控制同时参与 seed 级网络阶段的 seed 数，`--seed-cpu-max-concurrency` 控制同时参与 DuckDB recall / duplicate scoring 的 seed 数，`--api-max-concurrency` 控制全局 HTTP 请求并发，`--seed-metadata-max-concurrency` 控制同时下载 seed 合约 metadata 的 seed 数，`--contract-max-concurrency` 控制全局候选合约分析并发，`--sale-metric-max-concurrency` 控制全局 sale metric 并发。默认 `--seed-metadata-max-concurrency 1` 和 `--seed-cpu-max-concurrency 1`，避免多个 seed 同时前置下载 metadata 或同时打满 DuckDB / Rayon CPU。
+- `batch` 的并发参数都是全局限制：`--seed-network-max-concurrency` 控制同时参与 seed 级网络阶段的 seed 数，`--seed-cpu-max-concurrency` 控制同时参与 DuckDB recall / duplicate scoring 的 seed 数，`--api-max-concurrency` 控制全局 HTTP 请求并发，`--seed-metadata-max-concurrency` 控制同时下载 seed 合约 metadata 的 seed 数，`--contract-max-concurrency` 控制全局 matched contract 分析 worker 数。sale metric 和 mint value-flow 不再有单独并发参数，它们的 API 请求统一走 `--api-max-concurrency`。默认 `--seed-metadata-max-concurrency 1` 和 `--seed-cpu-max-concurrency 1`，避免多个 seed 同时前置下载 metadata 或同时打满 DuckDB / Rayon CPU。

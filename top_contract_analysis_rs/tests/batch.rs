@@ -106,6 +106,8 @@ struct BatchPipelineProbe {
     cpu_max_seen: AtomicUsize,
     transfer_current: AtomicUsize,
     transfer_max_seen: AtomicUsize,
+    candidate_transfer_current: AtomicUsize,
+    candidate_transfer_max_seen: AtomicUsize,
     holder_current: AtomicUsize,
     holder_max_seen: AtomicUsize,
     expansion_current: AtomicUsize,
@@ -335,13 +337,27 @@ impl AnalyzeApi for InstrumentedBatchApi {
         _etherscan_api_key: &str,
         _alchemy_network: Option<&str>,
         _alchemy_api_key: &str,
-        _contract_address: &str,
+        contract_address: &str,
         _token_type: &str,
     ) -> Result<Vec<TransferRecord>, AppError> {
         let current = self.probe.transfer_current.fetch_add(1, Ordering::SeqCst) + 1;
         BatchPipelineProbe::record_max(&self.probe.transfer_max_seen, current);
+        let is_seed_contract = contract_address.starts_with("0xseed");
+        if !is_seed_contract {
+            let current = self
+                .probe
+                .candidate_transfer_current
+                .fetch_add(1, Ordering::SeqCst)
+                + 1;
+            BatchPipelineProbe::record_max(&self.probe.candidate_transfer_max_seen, current);
+        }
         if self.transfer_sleep_ms > 0 {
             tokio::time::sleep(Duration::from_millis(self.transfer_sleep_ms)).await;
+        }
+        if !is_seed_contract {
+            self.probe
+                .candidate_transfer_current
+                .fetch_sub(1, Ordering::SeqCst);
         }
         self.probe.transfer_current.fetch_sub(1, Ordering::SeqCst);
         Ok(vec![])
@@ -1946,8 +1962,11 @@ async fn batch_limits_contract_analysis_globally_across_seeds() {
     .await
     .unwrap();
 
-    assert_eq!(probe.transfer_max_seen.load(Ordering::SeqCst), 1);
-    assert_eq!(probe.holder_max_seen.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.candidate_transfer_max_seen.load(Ordering::SeqCst), 1);
+    assert!(
+        probe.holder_max_seen.load(Ordering::SeqCst) >= 2,
+        "expected candidate holder API checks to be scheduled outside the match-contract worker limit"
+    );
     assert_eq!(probe.expansion_max_seen.load(Ordering::SeqCst), 1);
     assert_eq!(probe.metadata_calls.load(Ordering::SeqCst), 2);
     assert_eq!(probe.candidate_metadata_calls.load(Ordering::SeqCst), 2);
@@ -1955,7 +1974,7 @@ async fn batch_limits_contract_analysis_globally_across_seeds() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn batch_allows_contract_expansion_while_another_seed_computes_sale_metrics() {
+async fn batch_keeps_match_contract_worker_slot_through_sale_metrics() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n").unwrap();
     let probe = Arc::new(BatchPipelineProbe::default());
@@ -1984,7 +2003,6 @@ async fn batch_allows_contract_expansion_while_another_seed_computes_sale_metric
             seed_network_max_concurrency: 2,
             seed_cpu_max_concurrency: 2,
             contract_max_concurrency: 1,
-            sale_metric_max_concurrency: 1,
             ..BatchRequest::default()
         },
         &deps,
@@ -2000,7 +2018,13 @@ async fn batch_allows_contract_expansion_while_another_seed_computes_sale_metric
         probe
             .holder_started_before_sale_metric_finished
             .load(Ordering::SeqCst),
-        "expected seed2 contract IO to start before seed1 sale metrics finished"
+        "expected seed2 pre-analysis holder API check to start before seed1 sale metrics finished"
+    );
+    assert!(
+        !probe
+            .expansion_observed_sale_metric_active
+            .load(Ordering::SeqCst),
+        "expected seed2 matched-contract expansion to wait for seed1 sale metrics when contract_max_concurrency is 1"
     );
 }
 

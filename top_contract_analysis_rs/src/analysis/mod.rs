@@ -58,7 +58,6 @@ pub struct AnalyzeRequest {
     pub timeout_seconds: u64,
     pub api_max_concurrency: usize,
     pub contract_max_concurrency: usize,
-    pub sale_metric_max_concurrency: usize,
     pub max_tokens_per_contract: usize,
     pub max_recall_rows: usize,
 }
@@ -77,7 +76,6 @@ impl Default for AnalyzeRequest {
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
             api_max_concurrency: 8,
             contract_max_concurrency: 4,
-            sale_metric_max_concurrency: 4,
             max_tokens_per_contract: 0,
             max_recall_rows: 0,
         }
@@ -151,8 +149,7 @@ pub struct AnalysisDeps {
 #[derive(Clone, Default)]
 struct RuntimeLimits {
     seed_metadata_limit: Option<Arc<Semaphore>>,
-    contract_limit: Option<Arc<Semaphore>>,
-    sale_metric_limit: Option<Arc<Semaphore>>,
+    match_contract_limit: Option<Arc<Semaphore>>,
 }
 
 struct SeedContext {
@@ -294,7 +291,6 @@ pub struct BatchRequest {
     pub timeout_seconds: u64,
     pub api_max_concurrency: usize,
     pub contract_max_concurrency: usize,
-    pub sale_metric_max_concurrency: usize,
     pub max_tokens_per_contract: usize,
     pub max_recall_rows: usize,
     pub seed_metadata_max_concurrency: usize,
@@ -317,7 +313,6 @@ impl Default for BatchRequest {
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
             api_max_concurrency: 8,
             contract_max_concurrency: 4,
-            sale_metric_max_concurrency: 4,
             max_tokens_per_contract: 0,
             max_recall_rows: 0,
             seed_metadata_max_concurrency: 1,
@@ -558,8 +553,7 @@ async fn analyze_seed_contract_with_limits(
         deps,
         candidates,
         token_type.as_str(),
-        contract_concurrency,
-        &runtime_limits,
+        request.api_max_concurrency.max(1),
     )
     .await;
     let grouped = group_candidates_by_contract(&candidates);
@@ -614,13 +608,11 @@ async fn analyze_seed_contract_with_limits(
         let runtime_limits_ref = &runtime_limits;
         let mut contract_analyses = stream::iter(contracts_to_analyze.iter().enumerate().map(
             |(index, contract_address)| async move {
-                let contract_metadata = fetch_candidate_contract_metadata(
-                    request_ref,
-                    deps_ref,
-                    contract_address,
-                    runtime_limits_ref,
-                )
-                .await?;
+                let _match_contract_permit =
+                    acquire_optional_limit(&runtime_limits_ref.match_contract_limit).await?;
+                let contract_metadata =
+                    fetch_candidate_contract_metadata(request_ref, deps_ref, contract_address)
+                        .await?;
                 if deployed_before_seed(seed_deployed_block_number, contract_metadata.as_ref()) {
                     let result =
                         implausible_candidate_filtered_result(contract_address, contract_metadata);
@@ -638,7 +630,6 @@ async fn analyze_seed_contract_with_limits(
                     grouped_ref,
                     candidates_ref,
                     snapshot_token_index_ref,
-                    runtime_limits_ref,
                 )
                 .await?;
                 let result = analyze_duplicate_contract(DuplicateContractAnalysisInput {
@@ -651,7 +642,6 @@ async fn analyze_seed_contract_with_limits(
                     official_addresses: official_addresses_ref,
                     candidate_open_license_by_token: candidate_open_license_by_token_ref,
                     analysis_timestamp,
-                    runtime_limits: runtime_limits_ref,
                 })
                 .await?;
                 Ok::<_, AppError>((index, contract_address.clone(), contract_candidates, result))
