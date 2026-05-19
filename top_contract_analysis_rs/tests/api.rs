@@ -1,3 +1,7 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use httpmock::prelude::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -9,12 +13,12 @@ use top_contract_analysis_rs::api::{
     fetch_opensea_contract_metadata, fetch_opensea_contract_nfts,
     fetch_same_block_eth_transfers_for_address, fetch_seed_contract_nfts,
     fetch_transaction_receipt, fetch_transaction_receipts_for_block, is_open_license_payload,
-    ApiEndpoints, AsyncApiClient,
+    ApiEndpoints, AsyncApiClient, DEFAULT_API_RETRIES,
 };
 use top_contract_analysis_rs::models::SeedNft;
 
 fn test_client() -> AsyncApiClient {
-    AsyncApiClient::new(5, 4).unwrap()
+    AsyncApiClient::new_with_retry_policy(5, 4, DEFAULT_API_RETRIES, Duration::ZERO).unwrap()
 }
 
 fn test_endpoints(base_url: &str) -> ApiEndpoints {
@@ -25,6 +29,43 @@ fn test_endpoints(base_url: &str) -> ApiEndpoints {
         etherscan_base: base_url.to_string(),
         opensea_base: base_url.to_string(),
     }
+}
+
+async fn spawn_retry_status_server(
+    statuses: Vec<u16>,
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_server = attempts.clone();
+    let handle = tokio::spawn(async move {
+        for status in statuses {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            attempts_for_server.fetch_add(1, Ordering::SeqCst);
+            let mut buffer = vec![0_u8; 8192];
+            let read = stream.read(&mut buffer).await.unwrap();
+            let request = String::from_utf8_lossy(&buffer[..read]);
+            let request_line = request.lines().next().unwrap_or("");
+            assert!(
+                request_line.starts_with("GET /retry HTTP/1.1"),
+                "unexpected request line: {request_line}",
+            );
+
+            let (reason, payload) = if status == 200 {
+                ("OK", r#"{"ok":true}"#)
+            } else {
+                ("Internal Server Error", r#"{"error":"retry later"}"#)
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                payload.len(),
+                payload
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+    });
+    (format!("http://{address}"), attempts, handle)
 }
 
 #[tokio::test]
@@ -50,6 +91,34 @@ async fn api_client_error_includes_status_and_response_body() {
     assert!(
         message.contains("asset_contract_address is not supported"),
         "{message}"
+    );
+}
+
+#[tokio::test]
+async fn api_client_defaults_retry_retryable_failures_five_times_with_delay() {
+    let (base_url, attempts, server) =
+        spawn_retry_status_server(vec![500, 500, 500, 500, 200]).await;
+
+    let client = AsyncApiClient::new(5, 1).unwrap();
+    let started = Instant::now();
+    let result = client
+        .get_json::<serde_json::Value>(&format!("{base_url}/retry"))
+        .await;
+
+    let value = match result {
+        Ok(value) => value,
+        Err(err) => {
+            server.abort();
+            panic!("expected request to succeed on the fifth attempt: {err}");
+        }
+    };
+    server.await.unwrap();
+
+    assert_eq!(value["ok"], true);
+    assert_eq!(attempts.load(Ordering::SeqCst), 5);
+    assert!(
+        started.elapsed() >= Duration::from_millis(1_800),
+        "expected retry delay between failed attempts"
     );
 }
 

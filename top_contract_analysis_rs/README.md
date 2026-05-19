@@ -161,6 +161,7 @@ cargo run --release -- batch \
 
 - `--feature-db` 默认是 `:memory:`。如果你希望 DuckDB 状态跨进程保留，请传文件路径。
 - `--signal-cache-db` 默认是 `:memory:`。如果你希望 transfers / owners 的 signal cache 跨运行保留，请传文件路径。
+- HTTP API 默认最多请求 5 次；429、408、5xx 和网络错误会重试，每次重试之间等待 500ms。400 等非临时客户端错误不会等待重试。
 - 如果不传 `--feature-parquet`，程序会假设 DuckDB 特征库里已经有可用数据集。
 - 如果同时传了 `--feature-db` 和 `--feature-parquet`，且 `feature-db` 中该链已经有当前版本数据，则会复用 `feature-db`；如果没有该链数据，才从 Parquet 导入。旧版本 `feature-db` / 旧快照缺少预计算列会直接报错，需要重新运行 `export-snapshot`。
 - 当前快照 schema 强制包含 `metadata_json`、`token_uri_norm`、`image_uri_norm`、`name_norm`。metadata 文档不再持久化，召回和最终复核都从 `metadata_json` 派生；SQL recall 会先用规范化 URI/name 列做精确召回，metadata recall 则在 Rust 侧从 `metadata_json` 构建 sketch/source candidate 和 BM25 prefilter。

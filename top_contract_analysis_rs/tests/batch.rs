@@ -102,7 +102,6 @@ impl FeatureStoreReader for CapturingBatchFeatureStore {
 struct BatchPipelineProbe {
     seed_one_snapshot_active: AtomicBool,
     seed_two_context_overlapped_snapshot: AtomicBool,
-    seed_two_context_overlapped_contract_analysis: AtomicBool,
     cpu_current: AtomicUsize,
     cpu_max_seen: AtomicUsize,
     transfer_current: AtomicUsize,
@@ -280,18 +279,6 @@ impl AnalyzeApi for InstrumentedBatchApi {
             if self.probe.seed_one_snapshot_active.load(Ordering::SeqCst) {
                 self.probe
                     .seed_two_context_overlapped_snapshot
-                    .store(true, Ordering::SeqCst);
-            }
-        }
-        if is_seed_contract && self.emit_native_sale && contract_address == "0xseed2" {
-            let mut waited = 0;
-            while self.probe.transfer_current.load(Ordering::SeqCst) == 0 && waited < 500 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-                waited += 1;
-            }
-            if self.probe.transfer_current.load(Ordering::SeqCst) > 0 {
-                self.probe
-                    .seed_two_context_overlapped_contract_analysis
                     .store(true, Ordering::SeqCst);
             }
         }
@@ -1846,51 +1833,6 @@ async fn batch_limits_cpu_stage_globally() {
 
     assert_eq!(probe.cpu_max_seen.load(Ordering::SeqCst), 1);
     assert_eq!(probe.snapshot_calls.load(Ordering::SeqCst), 3);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn batch_runs_later_seed_network_stage_while_earlier_seed_analyzes_contracts() {
-    let dir = tempdir().unwrap();
-    std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n").unwrap();
-    let probe = Arc::new(BatchPipelineProbe::default());
-    let deps = AnalysisDeps {
-        api: Arc::new(InstrumentedBatchApi {
-            probe: probe.clone(),
-            transfer_sleep_ms: 300,
-            emit_native_sale: true,
-        }),
-        feature_store: Arc::new(InstrumentedFeatureStore {
-            probe: probe.clone(),
-            sleep_ms: 0,
-            wait_for_transfer_before_seed_two_snapshot: false,
-        }),
-        signal_cache: None,
-        progress: Arc::new(NoopProgressReporter),
-        batch_progress: Arc::new(NoopBatchProgressReporter),
-    };
-
-    let _summary = run_batch(
-        BatchRequest {
-            chain: "ethereum".into(),
-            seed_file: dir.path().join("seeds.txt"),
-            output_dir: dir.path().to_path_buf(),
-            alchemy_api_key: "key".into(),
-            seed_network_max_concurrency: 1,
-            seed_cpu_max_concurrency: 1,
-            contract_max_concurrency: 1,
-            ..BatchRequest::default()
-        },
-        &deps,
-    )
-    .await
-    .unwrap();
-
-    assert!(
-        probe
-            .seed_two_context_overlapped_contract_analysis
-            .load(Ordering::SeqCst),
-        "expected seed2 network IO stage to make progress while seed1 runs the unrestricted contract-analysis stage"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

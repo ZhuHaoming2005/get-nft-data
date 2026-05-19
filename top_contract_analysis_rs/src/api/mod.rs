@@ -14,7 +14,8 @@ pub mod etherscan;
 pub mod opensea;
 
 pub const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
-pub const DEFAULT_ALCHEMY_RETRIES: usize = 3;
+pub const DEFAULT_API_RETRIES: usize = 5;
+pub const DEFAULT_API_RETRY_DELAY_MS: u64 = 500;
 
 #[derive(Clone, Debug)]
 pub struct ApiEndpoints {
@@ -42,17 +43,33 @@ pub struct AsyncApiClient {
     pub http: reqwest::Client,
     pub request_limit: Arc<Semaphore>,
     retries: usize,
+    retry_delay: Duration,
 }
 
 impl AsyncApiClient {
     pub fn new(timeout_seconds: u64, max_concurrency: usize) -> Result<Self, AppError> {
+        Self::new_with_retry_policy(
+            timeout_seconds,
+            max_concurrency,
+            DEFAULT_API_RETRIES,
+            Duration::from_millis(DEFAULT_API_RETRY_DELAY_MS),
+        )
+    }
+
+    pub fn new_with_retry_policy(
+        timeout_seconds: u64,
+        max_concurrency: usize,
+        retries: usize,
+        retry_delay: Duration,
+    ) -> Result<Self, AppError> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_seconds))
             .build()?;
         Ok(Self {
             http,
             request_limit: Arc::new(Semaphore::new(max_concurrency.max(1))),
-            retries: DEFAULT_ALCHEMY_RETRIES,
+            retries: retries.max(1),
+            retry_delay,
         })
     }
 
@@ -68,42 +85,53 @@ impl AsyncApiClient {
         B: Serialize + ?Sized,
     {
         let mut last_error: Option<String> = None;
-        for _ in 0..self.retries {
-            let _permit = self
-                .request_limit
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|err| AppError::Http(err.to_string()))?;
-            let mut builder = self.http.request(method.clone(), url);
-            if let Some(headers) = headers.clone() {
-                builder = builder.headers(headers);
-            }
-            if let Some(payload) = body {
-                builder = builder.json(payload);
-            }
-            match builder.send().await {
-                Ok(response) => {
-                    let status = response.status();
-                    if status.is_success() {
-                        return Ok(response.json::<T>().await?);
-                    }
-                    let body = response.text().await.unwrap_or_else(|err| {
-                        format!("<failed to read error response body: {err}>")
-                    });
-                    let status_kind = if status.is_client_error() {
-                        "client error"
-                    } else if status.is_server_error() {
-                        "server error"
-                    } else {
-                        "unexpected status"
-                    };
-                    last_error = Some(format!(
-                        "HTTP status {status_kind} ({status}) for url ({url}); response body: {}",
-                        response_body_excerpt(&body)
-                    ));
+        for attempt in 1..=self.retries {
+            let attempt_error = {
+                let _permit = self
+                    .request_limit
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|err| AppError::Http(err.to_string()))?;
+                let mut builder = self.http.request(method.clone(), url);
+                if let Some(headers) = headers.clone() {
+                    builder = builder.headers(headers);
                 }
-                Err(err) => last_error = Some(err.to_string()),
+                if let Some(payload) = body {
+                    builder = builder.json(payload);
+                }
+                match builder.send().await {
+                    Ok(response) => {
+                        let status = response.status();
+                        if status.is_success() {
+                            return Ok(response.json::<T>().await?);
+                        }
+                        let body = response.text().await.unwrap_or_else(|err| {
+                            format!("<failed to read error response body: {err}>")
+                        });
+                        let status_kind = if status.is_client_error() {
+                            "client error"
+                        } else if status.is_server_error() {
+                            "server error"
+                        } else {
+                            "unexpected status"
+                        };
+                        let message = format!(
+                            "HTTP status {status_kind} ({status}) for url ({url}); response body: {}",
+                            response_body_excerpt(&body)
+                        );
+                        if should_retry_status(status) {
+                            message
+                        } else {
+                            return Err(AppError::Http(message));
+                        }
+                    }
+                    Err(err) => err.to_string(),
+                }
+            };
+            last_error = Some(attempt_error);
+            if attempt < self.retries && !self.retry_delay.is_zero() {
+                tokio::time::sleep(self.retry_delay).await;
             }
         }
         Err(AppError::Http(
@@ -133,6 +161,12 @@ impl AsyncApiClient {
         self.request_json(reqwest::Method::POST, url, Some(body), None)
             .await
     }
+}
+
+fn should_retry_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
 }
 
 fn response_body_excerpt(body: &str) -> String {
