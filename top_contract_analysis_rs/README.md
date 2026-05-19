@@ -128,7 +128,7 @@ cargo run --release -- batch \
   --output-dir ./result \
   --seed-network-max-concurrency 3 \
   --max-recall-rows 30000000 \
-  --api-max-concurrency 8 \
+  --api-max-concurrency 6 \
   --seed-metadata-max-concurrency 1 \
   --contract-max-concurrency 16 \
   --sale-metric-max-concurrency 16 \
