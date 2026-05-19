@@ -126,7 +126,7 @@ cargo run --release -- batch \
   --feature-db ../output/top_contract_analysis/features.duckdb \
   --signal-cache-db ../output/top_contract_analysis/signals.duckdb \
   --output-dir ./result \
-  --seed-network-max-concurrency 3 \
+  --seed-network-max-concurrency 1 \
   --max-recall-rows 30000000 \
   --api-max-concurrency 6 \
   --seed-metadata-max-concurrency 1 \
