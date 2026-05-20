@@ -2353,7 +2353,7 @@ impl AnalyzeApi for StaggeredExpansionApi {
         _opensea_api_key: &str,
         contract_address: &str,
     ) -> Result<Vec<SeedNft>, AppError> {
-        if contract_address == "0xdup2" {
+        if contract_address == "0xdup1" {
             sleep(Duration::from_millis(120)).await;
             self.slow_expansion_done.store(1, Ordering::SeqCst);
         }
@@ -2378,7 +2378,7 @@ impl AnalyzeApi for StaggeredExpansionApi {
         contract_address: &str,
         _token_type: &str,
     ) -> Result<Vec<TransferRecord>, AppError> {
-        if contract_address == "0xdup1" && self.slow_expansion_done.load(Ordering::SeqCst) == 0 {
+        if contract_address == "0xdup2" && self.slow_expansion_done.load(Ordering::SeqCst) == 0 {
             self.transfer_before_slow_expansion_done
                 .store(1, Ordering::SeqCst);
         }
@@ -5357,7 +5357,7 @@ async fn analyze_sale_metrics_are_keyed_by_transaction_and_buyer() {
 }
 
 #[tokio::test]
-async fn analyze_processes_duplicate_contracts_within_a_seed_concurrently() {
+async fn analyze_processes_duplicate_contracts_within_a_seed_serially() {
     let api = Arc::new(ConcurrentContractApi::new());
     let deps = AnalysisDeps {
         api: api.clone(),
@@ -5400,7 +5400,6 @@ async fn analyze_processes_duplicate_contracts_within_a_seed_concurrently() {
             chain: "ethereum".into(),
             seed_contract_address: "0xseed".into(),
             alchemy_api_key: "key".into(),
-            contract_max_concurrency: 2,
             ..AnalyzeRequest::default()
         },
         &deps,
@@ -5409,14 +5408,15 @@ async fn analyze_processes_duplicate_contracts_within_a_seed_concurrently() {
     .unwrap();
 
     assert_eq!(payload.duplicate_contracts.len(), 2);
-    assert!(
-        api.max_transfer_fetches.load(Ordering::SeqCst) >= 2,
-        "expected duplicate contract analysis to overlap within one seed"
+    assert_eq!(
+        api.max_transfer_fetches.load(Ordering::SeqCst),
+        1,
+        "expected duplicate contract analysis to run one matched contract at a time"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn analyze_starts_contract_analysis_before_all_provider_expansions_finish() {
+async fn analyze_waits_for_one_matched_contract_before_starting_the_next() {
     let api = Arc::new(StaggeredExpansionApi::new());
     let deps = AnalysisDeps {
         api: api.clone(),
@@ -5459,7 +5459,6 @@ async fn analyze_starts_contract_analysis_before_all_provider_expansions_finish(
             chain: "ethereum".into(),
             seed_contract_address: "0xseed".into(),
             alchemy_api_key: "key".into(),
-            contract_max_concurrency: 2,
             ..AnalyzeRequest::default()
         },
         &deps,
@@ -5471,8 +5470,8 @@ async fn analyze_starts_contract_analysis_before_all_provider_expansions_finish(
     assert_eq!(
         api.transfer_before_slow_expansion_done
             .load(Ordering::SeqCst),
-        1,
-        "expected fast contract analysis to start before slow provider expansion finished"
+        0,
+        "expected later matched contracts to wait until the previous contract finishes expansion"
     );
 }
 
@@ -5643,7 +5642,6 @@ async fn analyze_fetches_contract_inputs_concurrently_within_one_contract() {
             chain: "ethereum".into(),
             seed_contract_address: "0xseed".into(),
             alchemy_api_key: "key".into(),
-            contract_max_concurrency: 1,
             ..AnalyzeRequest::default()
         },
         &deps,
@@ -5689,7 +5687,6 @@ async fn analyze_fetches_post_signal_inputs_concurrently_within_one_contract() {
             chain: "ethereum".into(),
             seed_contract_address: "0xseed".into(),
             alchemy_api_key: "key".into(),
-            contract_max_concurrency: 3,
             api_max_concurrency: 3,
             ..AnalyzeRequest::default()
         },

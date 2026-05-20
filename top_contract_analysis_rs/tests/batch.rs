@@ -1945,7 +1945,6 @@ async fn batch_limits_contract_analysis_globally_across_seeds() {
             alchemy_api_key: "key".into(),
             seed_network_max_concurrency: 2,
             seed_cpu_max_concurrency: 2,
-            contract_max_concurrency: 1,
             ..BatchRequest::default()
         },
         &deps,
@@ -1993,7 +1992,6 @@ async fn batch_keeps_match_contract_worker_slot_through_sale_metrics() {
             alchemy_api_key: "key".into(),
             seed_network_max_concurrency: 2,
             seed_cpu_max_concurrency: 2,
-            contract_max_concurrency: 1,
             ..BatchRequest::default()
         },
         &deps,
@@ -2015,7 +2013,7 @@ async fn batch_keeps_match_contract_worker_slot_through_sale_metrics() {
         !probe
             .expansion_observed_sale_metric_active
             .load(Ordering::SeqCst),
-        "expected seed2 matched-contract expansion to wait for seed1 sale metrics when contract_max_concurrency is 1"
+        "expected seed2 matched-contract expansion to wait for seed1 sale metrics while matched-contract analysis is serial"
     );
 }
 

@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use futures::stream::{self, StreamExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::error::AppError;
@@ -57,7 +56,6 @@ pub struct AnalyzeRequest {
     pub metadata_threshold: f64,
     pub timeout_seconds: u64,
     pub api_max_concurrency: usize,
-    pub contract_max_concurrency: usize,
     pub max_tokens_per_contract: usize,
     pub max_recall_rows: usize,
 }
@@ -75,7 +73,6 @@ impl Default for AnalyzeRequest {
             metadata_threshold: DEFAULT_METADATA_THRESHOLD,
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
             api_max_concurrency: 8,
-            contract_max_concurrency: 4,
             max_tokens_per_contract: 0,
             max_recall_rows: 0,
         }
@@ -158,17 +155,13 @@ pub trait SignalCacheStore: Send + Sync {
     }
 }
 
+#[derive(Clone)]
 pub struct AnalysisDeps {
     pub api: Arc<dyn AnalyzeApi>,
     pub feature_store: Arc<dyn FeatureStoreReader>,
     pub signal_cache: Option<Arc<dyn SignalCacheStore>>,
     pub progress: Arc<dyn SeedProgressReporter>,
     pub batch_progress: Arc<dyn BatchProgressReporter>,
-}
-
-#[derive(Clone, Default)]
-struct RuntimeLimits {
-    match_contract_limit: Option<Arc<Semaphore>>,
 }
 
 struct SeedContext {
@@ -296,6 +289,23 @@ impl AnalysisOutputState {
     }
 }
 
+struct SeedAnalysisState {
+    request: AnalyzeRequest,
+    seed_contract: ContractMetadata,
+    seed_nfts: Vec<SeedNft>,
+    open_license: bool,
+    snapshot: DatabaseSnapshot,
+    candidates: Vec<DuplicateCandidate>,
+    token_type: String,
+    grouped: BTreeMap<String, Vec<usize>>,
+    contracts_to_analyze: Vec<String>,
+    candidate_open_license_by_token: HashMap<(String, String), bool>,
+    official_addresses: HashSet<String>,
+    output_state: AnalysisOutputState,
+    expanded_candidates_by_contract: BTreeMap<String, Vec<DuplicateCandidate>>,
+    analysis_timestamp: i64,
+}
+
 #[derive(Clone, Debug)]
 pub struct BatchRequest {
     pub chain: String,
@@ -309,7 +319,6 @@ pub struct BatchRequest {
     pub metadata_threshold: f64,
     pub timeout_seconds: u64,
     pub api_max_concurrency: usize,
-    pub contract_max_concurrency: usize,
     pub max_tokens_per_contract: usize,
     pub max_recall_rows: usize,
     pub seed_network_max_concurrency: usize,
@@ -330,7 +339,6 @@ impl Default for BatchRequest {
             metadata_threshold: DEFAULT_METADATA_THRESHOLD,
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
             api_max_concurrency: 8,
-            contract_max_concurrency: 4,
             max_tokens_per_contract: 0,
             max_recall_rows: 0,
             seed_network_max_concurrency: 1,
@@ -536,15 +544,7 @@ pub async fn analyze_seed_contract_with_progress(
     deps: &AnalysisDeps,
     progress: Arc<dyn SeedProgressReporter>,
 ) -> Result<SingleReportPayload, AppError> {
-    analyze_seed_contract_with_limits(
-        request,
-        deps,
-        progress,
-        None,
-        RuntimeLimits::default(),
-        None,
-    )
-    .await
+    analyze_seed_contract_with_limits(request, deps, progress, None, None).await
 }
 
 async fn analyze_seed_contract_with_limits(
@@ -552,9 +552,21 @@ async fn analyze_seed_contract_with_limits(
     deps: &AnalysisDeps,
     progress: Arc<dyn SeedProgressReporter>,
     cpu_limit: Option<Arc<Semaphore>>,
-    runtime_limits: RuntimeLimits,
     prepared: Option<(SeedContext, CandidatePlan)>,
 ) -> Result<SingleReportPayload, AppError> {
+    let mut state =
+        prepare_seed_analysis_state(request, deps, progress.clone(), cpu_limit, prepared).await?;
+    analyze_matched_contracts_serially(&mut state, deps, progress.clone()).await?;
+    finalize_seed_report(state, progress).await
+}
+
+async fn prepare_seed_analysis_state(
+    request: AnalyzeRequest,
+    deps: &AnalysisDeps,
+    progress: Arc<dyn SeedProgressReporter>,
+    cpu_limit: Option<Arc<Semaphore>>,
+    prepared: Option<(SeedContext, CandidatePlan)>,
+) -> Result<SeedAnalysisState, AppError> {
     let (context, plan) = if let Some(prepared) = prepared {
         prepared
     } else {
@@ -577,7 +589,6 @@ async fn analyze_seed_contract_with_limits(
         snapshot,
         candidates,
     } = plan;
-    let contract_concurrency = request.contract_max_concurrency.max(1);
     let token_type = payload_token_type(&seed_contract);
     let CandidateContractFilterResult {
         candidates,
@@ -619,91 +630,107 @@ async fn analyze_seed_contract_with_limits(
     .into_iter()
     .filter(|value| !value.is_empty())
     .collect();
-    let mut output_state =
+    let output_state =
         AnalysisOutputState::with_seed_related_legit_duplicates(seed_related_legit_duplicates);
-    let mut expanded_candidates_by_contract = BTreeMap::new();
+    let expanded_candidates_by_contract = BTreeMap::new();
     let analysis_timestamp = chrono::Utc::now().timestamp();
-    let seed_deployed_block_number = seed_contract.deployed_block_number;
-    if !open_license {
-        progress
-            .on_duplicate_contracts_started(contracts_to_analyze.len())
-            .await;
 
-        let mut completed_contracts = 0;
-        let snapshot_token_index = SnapshotTokenIndex::new(&snapshot.nft_rows);
-        let request_ref = &request;
-        let deps_ref = deps;
-        let token_type_ref = token_type.as_str();
-        let grouped_ref = &grouped;
-        let candidates_ref = &candidates;
-        let snapshot_token_index_ref = &snapshot_token_index;
-        let official_addresses_ref = &official_addresses;
-        let candidate_open_license_by_token_ref = &candidate_open_license_by_token;
-        let runtime_limits_ref = &runtime_limits;
-        let mut contract_analyses = stream::iter(contracts_to_analyze.iter().enumerate().map(
-            |(index, contract_address)| async move {
-                let _match_contract_permit =
-                    acquire_optional_limit(&runtime_limits_ref.match_contract_limit).await?;
-                let contract_metadata =
-                    fetch_candidate_contract_metadata(request_ref, deps_ref, contract_address)
-                        .await?;
-                if deployed_before_seed(seed_deployed_block_number, contract_metadata.as_ref()) {
-                    let result =
-                        implausible_candidate_filtered_result(contract_address, contract_metadata);
-                    return Ok::<_, AppError>((
-                        index,
-                        contract_address.clone(),
-                        Vec::new(),
-                        result,
-                    ));
-                }
+    Ok(SeedAnalysisState {
+        request,
+        seed_contract,
+        seed_nfts,
+        open_license,
+        snapshot,
+        candidates,
+        token_type,
+        grouped,
+        contracts_to_analyze,
+        candidate_open_license_by_token,
+        official_addresses,
+        output_state,
+        expanded_candidates_by_contract,
+        analysis_timestamp,
+    })
+}
+
+async fn analyze_matched_contracts_serially(
+    state: &mut SeedAnalysisState,
+    deps: &AnalysisDeps,
+    progress: Arc<dyn SeedProgressReporter>,
+) -> Result<(), AppError> {
+    if state.open_license {
+        return Ok(());
+    }
+    progress
+        .on_duplicate_contracts_started(state.contracts_to_analyze.len())
+        .await;
+
+    let mut completed_contracts = 0;
+    let snapshot_token_index = SnapshotTokenIndex::new(&state.snapshot.nft_rows);
+    let seed_deployed_block_number = state.seed_contract.deployed_block_number;
+    for contract_address in &state.contracts_to_analyze {
+        let contract_metadata =
+            fetch_candidate_contract_metadata(&state.request, deps, contract_address).await?;
+        let (contract_candidates, result) =
+            if deployed_before_seed(seed_deployed_block_number, contract_metadata.as_ref()) {
+                (
+                    Vec::new(),
+                    implausible_candidate_filtered_result(contract_address, contract_metadata),
+                )
+            } else {
                 let contract_candidates = fetch_and_expand_contract_candidates(
-                    request_ref,
-                    deps_ref,
+                    &state.request,
+                    deps,
                     contract_address,
-                    grouped_ref,
-                    candidates_ref,
-                    snapshot_token_index_ref,
+                    &state.grouped,
+                    &state.candidates,
+                    &snapshot_token_index,
                 )
                 .await?;
                 let result = analyze_duplicate_contract(DuplicateContractAnalysisInput {
-                    request: request_ref,
-                    deps: deps_ref,
-                    token_type: token_type_ref,
+                    request: &state.request,
+                    deps,
+                    token_type: state.token_type.as_str(),
                     contract_address,
                     contract_candidates: &contract_candidates,
                     contract_metadata,
-                    official_addresses: official_addresses_ref,
-                    candidate_open_license_by_token: candidate_open_license_by_token_ref,
-                    analysis_timestamp,
+                    official_addresses: &state.official_addresses,
+                    candidate_open_license_by_token: &state.candidate_open_license_by_token,
+                    analysis_timestamp: state.analysis_timestamp,
                 })
                 .await?;
-                Ok::<_, AppError>((index, contract_address.clone(), contract_candidates, result))
-            },
-        ))
-        .buffer_unordered(contract_concurrency);
-
-        let mut pending_contract_results = BTreeMap::new();
-        let mut next_contract_index_to_merge = 0usize;
-        while let Some(result) = contract_analyses.next().await {
-            let (index, contract_address, contract_candidates, result) = result?;
-            completed_contracts += 1;
-            progress
-                .on_duplicate_contract_completed(
-                    &contract_address,
-                    completed_contracts,
-                    contracts_to_analyze.len(),
-                )
-                .await;
-            expanded_candidates_by_contract.insert(contract_address, contract_candidates);
-            pending_contract_results.insert(index, result);
-            while let Some(result) = pending_contract_results.remove(&next_contract_index_to_merge)
-            {
-                merge_contract_analysis_result(result, &mut output_state);
-                next_contract_index_to_merge += 1;
-            }
-        }
+                (contract_candidates, result)
+            };
+        completed_contracts += 1;
+        progress
+            .on_duplicate_contract_completed(
+                contract_address,
+                completed_contracts,
+                state.contracts_to_analyze.len(),
+            )
+            .await;
+        state
+            .expanded_candidates_by_contract
+            .insert(contract_address.clone(), contract_candidates);
+        merge_contract_analysis_result(result, &mut state.output_state);
     }
+    Ok(())
+}
+
+async fn finalize_seed_report(
+    state: SeedAnalysisState,
+    progress: Arc<dyn SeedProgressReporter>,
+) -> Result<SingleReportPayload, AppError> {
+    let SeedAnalysisState {
+        seed_contract,
+        seed_nfts,
+        open_license,
+        candidates,
+        mut output_state,
+        mut expanded_candidates_by_contract,
+        ..
+    } = state;
+
     expanded_candidates_by_contract.retain(|contract, _| {
         !output_state
             .implausible_candidate_contracts
