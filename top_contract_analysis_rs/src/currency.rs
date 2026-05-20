@@ -130,12 +130,9 @@ impl EthUsdRateCache {
             fetch_in_progress: &self.fetch_in_progress,
         };
 
-        let result = fetch().await.map_err(|err| err.to_string());
-        let output = result
-            .clone()
-            .map_err(|err| AppError::InvalidData(err.to_string()));
-        *self.value()? = Some(result);
-        output
+        let rate = fetch().await?;
+        *self.value()? = Some(Ok(rate));
+        Ok(rate)
     }
 }
 
@@ -416,6 +413,37 @@ mod tests {
         assert_eq!(first, 3000.0);
         assert_eq!(second, 3000.0);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn eth_usd_rate_cache_retries_after_failed_initialization() {
+        let cache = EthUsdRateCache::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let first = cache
+            .get_or_try_init({
+                let calls = Arc::clone(&calls);
+                move || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err(AppError::InvalidData("temporary price outage".into()))
+                }
+            })
+            .await;
+        assert!(first.is_err());
+
+        let second = cache
+            .get_or_try_init({
+                let calls = Arc::clone(&calls);
+                move || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(3100.0)
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(second, 3100.0);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
