@@ -136,6 +136,26 @@ pub trait SignalCacheStore: Send + Sync {
         transfers: &[TransferRecord],
         owners: &[OwnerBalance],
     ) -> Result<(), AppError>;
+
+    fn try_get(
+        &self,
+        chain: &str,
+        contract_address: &str,
+        token_type: &str,
+    ) -> Result<Option<CachedSignals>, AppError> {
+        self.get(chain, contract_address, token_type)
+    }
+
+    fn try_put(
+        &self,
+        chain: &str,
+        contract_address: &str,
+        token_type: &str,
+        transfers: &[TransferRecord],
+        owners: &[OwnerBalance],
+    ) -> Result<(), AppError> {
+        self.put(chain, contract_address, token_type, transfers, owners)
+    }
 }
 
 pub struct AnalysisDeps {
@@ -380,6 +400,26 @@ impl SignalCacheStore for ContractSignalCache {
         owners: &[OwnerBalance],
     ) -> Result<(), AppError> {
         ContractSignalCache::put(self, chain, contract_address, token_type, transfers, owners)
+    }
+
+    fn try_get(
+        &self,
+        chain: &str,
+        contract_address: &str,
+        token_type: &str,
+    ) -> Result<Option<CachedSignals>, AppError> {
+        ContractSignalCache::try_get(self, chain, contract_address, token_type)
+    }
+
+    fn try_put(
+        &self,
+        chain: &str,
+        contract_address: &str,
+        token_type: &str,
+        transfers: &[TransferRecord],
+        owners: &[OwnerBalance],
+    ) -> Result<(), AppError> {
+        ContractSignalCache::try_put(self, chain, contract_address, token_type, transfers, owners)
     }
 }
 

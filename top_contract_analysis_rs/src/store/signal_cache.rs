@@ -1,5 +1,5 @@
 use std::collections::{BTreeSet, HashSet};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, TryLockError};
 
 use duckdb::{params, Connection, OptionalExt};
 
@@ -21,6 +21,17 @@ pub struct CachedSignals {
 
 pub struct ContractSignalCache {
     conn: Mutex<Connection>,
+}
+
+type SignalCacheRow = (String, String, String, Option<String>, String, String);
+
+struct SignalCacheWritePayload {
+    mint_recipients_json: String,
+    active_sellers_json: String,
+    address_signals_json: String,
+    victim_signals_json: String,
+    transfers_json: String,
+    owners_json: String,
 }
 
 fn analyze_victim_signals_from_active_sellers(
@@ -95,14 +106,23 @@ impl ContractSignalCache {
             .map_err(|err| AppError::DuckDb(format!("signal cache lock poisoned: {err}")))
     }
 
-    pub fn get(
-        &self,
+    fn try_conn(&self) -> Result<Option<MutexGuard<'_, Connection>>, AppError> {
+        match self.conn.try_lock() {
+            Ok(conn) => Ok(Some(conn)),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Poisoned(err)) => Err(AppError::DuckDb(format!(
+                "signal cache lock poisoned: {err}"
+            ))),
+        }
+    }
+
+    fn read_row(
+        conn: &Connection,
         chain: &str,
         contract_address: &str,
         token_type: &str,
-    ) -> Result<Option<CachedSignals>, AppError> {
-        let conn = self.conn()?;
-        let row = conn
+    ) -> Result<Option<SignalCacheRow>, AppError> {
+        Ok(conn
             .query_row(
                 "
                 SELECT mint_recipients_json, active_sellers_json, address_signals_json,
@@ -122,9 +142,10 @@ impl ContractSignalCache {
                     ))
                 },
             )
-            .optional()?;
-        drop(conn);
+            .optional()?)
+    }
 
+    fn decode_row(row: Option<SignalCacheRow>) -> Result<Option<CachedSignals>, AppError> {
         let Some((
             mint_recipients_json,
             active_sellers_json,
@@ -150,14 +171,10 @@ impl ContractSignalCache {
         }))
     }
 
-    pub fn put(
-        &self,
-        chain: &str,
-        contract_address: &str,
-        token_type: &str,
+    fn write_payload(
         transfers: &[TransferRecord],
         owners: &[OwnerBalance],
-    ) -> Result<(), AppError> {
+    ) -> Result<SignalCacheWritePayload, AppError> {
         let mint_recipients: Vec<String> = transfers
             .iter()
             .filter(|item| item.from_address == ZERO_ADDRESS && !item.to_address.is_empty())
@@ -174,8 +191,23 @@ impl ContractSignalCache {
             .collect();
         let address_signals = analyze_transfer_signals(transfers);
         let victim_signals = analyze_victim_signals_from_active_sellers(&active_sellers, owners);
+        Ok(SignalCacheWritePayload {
+            mint_recipients_json: serde_json::to_string(&mint_recipients)?,
+            active_sellers_json: serde_json::to_string(&active_sellers)?,
+            address_signals_json: serde_json::to_string(&address_signals)?,
+            victim_signals_json: serde_json::to_string(&victim_signals)?,
+            transfers_json: serde_json::to_string(transfers)?,
+            owners_json: serde_json::to_string(owners)?,
+        })
+    }
 
-        let conn = self.conn()?;
+    fn write_row(
+        conn: &Connection,
+        chain: &str,
+        contract_address: &str,
+        token_type: &str,
+        payload: SignalCacheWritePayload,
+    ) -> Result<(), AppError> {
         conn.execute(
             "
             INSERT OR REPLACE INTO contract_signal_cache (
@@ -187,14 +219,99 @@ impl ContractSignalCache {
                 chain,
                 contract_address.to_lowercase(),
                 token_type,
-                serde_json::to_string(&mint_recipients)?,
-                serde_json::to_string(&active_sellers)?,
-                serde_json::to_string(&address_signals)?,
-                serde_json::to_string(&victim_signals)?,
-                serde_json::to_string(transfers)?,
-                serde_json::to_string(owners)?,
+                payload.mint_recipients_json,
+                payload.active_sellers_json,
+                payload.address_signals_json,
+                payload.victim_signals_json,
+                payload.transfers_json,
+                payload.owners_json,
             ],
         )?;
         Ok(())
+    }
+
+    pub fn get(
+        &self,
+        chain: &str,
+        contract_address: &str,
+        token_type: &str,
+    ) -> Result<Option<CachedSignals>, AppError> {
+        let row = {
+            let conn = self.conn()?;
+            Self::read_row(&conn, chain, contract_address, token_type)?
+        };
+        Self::decode_row(row)
+    }
+
+    pub fn try_get(
+        &self,
+        chain: &str,
+        contract_address: &str,
+        token_type: &str,
+    ) -> Result<Option<CachedSignals>, AppError> {
+        let Some(conn) = self.try_conn()? else {
+            return Ok(None);
+        };
+        let row = Self::read_row(&conn, chain, contract_address, token_type)?;
+        drop(conn);
+        Self::decode_row(row)
+    }
+
+    pub fn put(
+        &self,
+        chain: &str,
+        contract_address: &str,
+        token_type: &str,
+        transfers: &[TransferRecord],
+        owners: &[OwnerBalance],
+    ) -> Result<(), AppError> {
+        let payload = Self::write_payload(transfers, owners)?;
+        let conn = self.conn()?;
+        Self::write_row(&conn, chain, contract_address, token_type, payload)
+    }
+
+    pub fn try_put(
+        &self,
+        chain: &str,
+        contract_address: &str,
+        token_type: &str,
+        transfers: &[TransferRecord],
+        owners: &[OwnerBalance],
+    ) -> Result<(), AppError> {
+        let payload = Self::write_payload(transfers, owners)?;
+        let Some(conn) = self.try_conn()? else {
+            return Ok(());
+        };
+        Self::write_row(&conn, chain, contract_address, token_type, payload)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn try_get_returns_miss_when_cache_lock_is_busy() {
+        let cache = ContractSignalCache::new(":memory:").unwrap();
+        let _guard = cache.conn.lock().unwrap();
+
+        let cached = cache.try_get("ethereum", "0xdup", "ERC721").unwrap();
+
+        assert!(cached.is_none());
+    }
+
+    #[test]
+    fn try_put_skips_write_when_cache_lock_is_busy() {
+        let cache = ContractSignalCache::new(":memory:").unwrap();
+        let transfers = vec![TransferRecord::mint("0xdup", "1", 100, "0xminter")];
+        let owners = Vec::new();
+        let guard = cache.conn.lock().unwrap();
+
+        cache
+            .try_put("ethereum", "0xdup", "ERC721", &transfers, &owners)
+            .unwrap();
+        drop(guard);
+
+        assert!(cache.get("ethereum", "0xdup", "ERC721").unwrap().is_none());
     }
 }

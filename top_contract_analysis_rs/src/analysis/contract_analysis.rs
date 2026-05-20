@@ -1,13 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::error::AppError;
-use crate::models::{ContractMetadata, DuplicateCandidate, DuplicateContractPayload};
+use crate::models::{
+    ContractMetadata, DuplicateCandidate, DuplicateContractPayload, OwnerBalance, TransferRecord,
+};
+use crate::store::CachedSignals;
 
 use super::{
     address_records, analyze_victim_signals_from_active_sellers,
     compute_mint_payment_edges_for_contract, compute_sale_metrics_for_contract,
     map_address_signals, propagation, signals, AnalysisDeps, AnalysisOutputState, AnalyzeRequest,
-    ContractAnalysisResult,
+    ContractAnalysisResult, SignalCacheStore,
 };
 
 pub(super) fn merge_contract_analysis_result(
@@ -165,6 +169,33 @@ pub(super) struct DuplicateContractAnalysisInput<'a> {
     pub(super) analysis_timestamp: i64,
 }
 
+async fn get_cached_signals(
+    cache: Arc<dyn SignalCacheStore>,
+    chain: String,
+    contract_address: String,
+    token_type: String,
+) -> Result<Option<CachedSignals>, AppError> {
+    tokio::task::spawn_blocking(move || cache.try_get(&chain, &contract_address, &token_type))
+        .await
+        .map_err(|err| AppError::InvalidData(format!("signal cache get task failed: {err}")))?
+}
+
+async fn put_cached_signals(
+    cache: Arc<dyn SignalCacheStore>,
+    chain: String,
+    contract_address: String,
+    token_type: String,
+    transfers: Vec<TransferRecord>,
+    owners: Vec<OwnerBalance>,
+) -> Result<(Vec<TransferRecord>, Vec<OwnerBalance>), AppError> {
+    tokio::task::spawn_blocking(move || {
+        cache.try_put(&chain, &contract_address, &token_type, &transfers, &owners)?;
+        Ok::<_, AppError>((transfers, owners))
+    })
+    .await
+    .map_err(|err| AppError::InvalidData(format!("signal cache put task failed: {err}")))?
+}
+
 pub(super) async fn analyze_duplicate_contract(
     input: DuplicateContractAnalysisInput<'_>,
 ) -> Result<ContractAnalysisResult, AppError> {
@@ -181,7 +212,13 @@ pub(super) async fn analyze_duplicate_contract(
     } = input;
     let contract_candidate_refs: Vec<&DuplicateCandidate> = contract_candidates.iter().collect();
     let cached_signals = if let Some(cache) = deps.signal_cache.as_ref() {
-        cache.get(&request.chain, contract_address, token_type)?
+        get_cached_signals(
+            cache.clone(),
+            request.chain.clone(),
+            contract_address.to_string(),
+            token_type.to_string(),
+        )
+        .await?
     } else {
         None
     };
@@ -212,15 +249,19 @@ pub(super) async fn analyze_duplicate_contract(
         );
         let transfers = transfers?;
         let owners = owners?;
-        if let Some(cache) = deps.signal_cache.as_ref() {
-            cache.put(
-                &request.chain,
-                contract_address,
-                token_type,
-                &transfers,
-                &owners,
-            )?;
-        }
+        let (transfers, owners) = if let Some(cache) = deps.signal_cache.as_ref() {
+            put_cached_signals(
+                cache.clone(),
+                request.chain.clone(),
+                contract_address.to_string(),
+                token_type.to_string(),
+                transfers,
+                owners,
+            )
+            .await?
+        } else {
+            (transfers, owners)
+        };
         let transfer_signals = signals::analyze_transfer_signals(&transfers);
         let victim_signal = analyze_victim_signals_from_active_sellers(&transfers, &owners);
         (transfers, owners, transfer_signals, victim_signal)
