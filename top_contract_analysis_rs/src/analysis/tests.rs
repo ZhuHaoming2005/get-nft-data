@@ -116,6 +116,90 @@ fn report_summary_uses_deployment_to_first_transfer_samples() {
 }
 
 #[test]
+fn report_summary_splits_operator_used_funds_from_victim_acquisition_cost() {
+    let secondary_sale_victims = vec![SecondarySaleVictimAddressPayload {
+        contract_address: "0xdup".into(),
+        address: "0xvictim".into(),
+        buy_tx_hashes: vec!["0xvictimbuy".into()],
+        buy_amount_eth: 1.5,
+        buy_amount_usd: 3000.0,
+        ..SecondarySaleVictimAddressPayload::default()
+    }];
+    let malicious_addresses = vec![MaliciousAddressPayload {
+        address: "0xoperator".into(),
+        wash_cycle_count: 2,
+        ..MaliciousAddressPayload::default()
+    }];
+    let address_attributions = vec![AddressAttributionPayload {
+        contract_address: "0xdup".into(),
+        address: "0xvictim".into(),
+        attribution_label: "likely_victim".into(),
+        evidence: vec![AddressEvidencePayload {
+            evidence_type: "paid_mint_payment".into(),
+            contract_address: "0xdup".into(),
+            tx_hash: "0xvictimmint".into(),
+            ..AddressEvidencePayload::default()
+        }],
+        ..AddressAttributionPayload::default()
+    }];
+    let value_flow_edges = vec![
+        ValueFlowEdgePayload {
+            contract_address: "0xdup".into(),
+            from_address: "0xvictim".into(),
+            tx_hash: "0xvictimmint".into(),
+            value_eth: Some(0.2),
+            value_usd: Some(400.0),
+            channel: "mint_payment".into(),
+            ..ValueFlowEdgePayload::default()
+        },
+        ValueFlowEdgePayload {
+            contract_address: "0xdup".into(),
+            from_address: "0xoperator".into(),
+            tx_hash: "0xwashsale".into(),
+            value_eth: Some(10.0),
+            value_usd: Some(20_000.0),
+            channel: "sale_payment".into(),
+            ..ValueFlowEdgePayload::default()
+        },
+        ValueFlowEdgePayload {
+            contract_address: "0xdup".into(),
+            from_address: "0xoperator".into(),
+            tx_hash: "0xoperatormint".into(),
+            value_eth: Some(0.5),
+            value_usd: Some(1_000.0),
+            channel: "mint_payment".into(),
+            ..ValueFlowEdgePayload::default()
+        },
+    ];
+
+    let summary = build_report_summary(ReportSummaryInput {
+        open_license: false,
+        grouped: &BTreeMap::new(),
+        implausible_candidate_contract_count: 0,
+        legit_duplicates: &[],
+        infringing_tokens: &[],
+        malicious_addresses: &malicious_addresses,
+        honest_addresses: &[],
+        secondary_sale_victim_addresses: &secondary_sale_victims,
+        victim_acquisition_addresses: &[],
+        address_signals: &BTreeMap::new(),
+        address_attributions: &address_attributions,
+        value_flow_edges: &value_flow_edges,
+        propagation_paths: &BTreeMap::new(),
+        lifecycle_metrics: &[],
+    });
+
+    assert_eq!(summary.secondary_sale_victim_cost_eth, 1.5);
+    assert_eq!(summary.paid_mint_victim_cost_eth, 0.2);
+    assert_eq!(summary.victim_acquisition_total_eth, 1.7);
+    assert_eq!(summary.operator_secondary_sale_cost_eth, 10.0);
+    assert_eq!(summary.operator_paid_mint_cost_eth, 0.5);
+    assert_eq!(summary.operator_acquisition_total_eth, 10.5);
+    assert_eq!(summary.operator_acquisition_address_count, 1);
+    assert_eq!(summary.operator_acquisition_edge_count, 2);
+}
+
+#[test]
 fn report_summary_ignores_zero_deployment_to_neutral_holder_samples() {
     let honest_addresses = vec![
         HonestAddressPayload {

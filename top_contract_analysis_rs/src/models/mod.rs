@@ -338,6 +338,22 @@ pub struct ReportSummary {
     pub victim_acquisition_stuck_cost_ratio: Option<f64>,
     pub victim_acquisition_address_count: i64,
     #[serde(default)]
+    pub operator_secondary_sale_cost_eth: f64,
+    #[serde(default)]
+    pub operator_secondary_sale_cost_usd: f64,
+    #[serde(default)]
+    pub operator_paid_mint_cost_eth: f64,
+    #[serde(default)]
+    pub operator_paid_mint_cost_usd: f64,
+    #[serde(default)]
+    pub operator_acquisition_total_eth: f64,
+    #[serde(default)]
+    pub operator_acquisition_total_usd: f64,
+    #[serde(default)]
+    pub operator_acquisition_address_count: i64,
+    #[serde(default)]
+    pub operator_acquisition_edge_count: i64,
+    #[serde(default)]
     pub stablecoin_erc20_value_usd: f64,
     #[serde(default)]
     pub stablecoin_erc20_edge_count: i64,
@@ -1059,6 +1075,24 @@ pub struct BatchReportSummary {
     pub victim_acquisition_address_count_total: i64,
     #[serde(default)]
     pub victim_acquisition_address_count_distinct: i64,
+    #[serde(default)]
+    pub operator_secondary_sale_cost_eth_total: f64,
+    #[serde(default)]
+    pub operator_secondary_sale_cost_usd_total: f64,
+    #[serde(default)]
+    pub operator_paid_mint_cost_eth_total: f64,
+    #[serde(default)]
+    pub operator_paid_mint_cost_usd_total: f64,
+    #[serde(default)]
+    pub operator_acquisition_total_eth_total: f64,
+    #[serde(default)]
+    pub operator_acquisition_total_usd_total: f64,
+    #[serde(default)]
+    pub operator_acquisition_address_count_total: i64,
+    #[serde(default)]
+    pub operator_acquisition_address_count_distinct: i64,
+    #[serde(default)]
+    pub operator_acquisition_edge_count_total: i64,
     #[serde(default)]
     pub stablecoin_erc20_value_usd_total: f64,
     #[serde(default)]

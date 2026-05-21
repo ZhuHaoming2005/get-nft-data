@@ -217,6 +217,7 @@ struct BatchSeedAggregate {
     stuck_victim_addresses: BTreeSet<String>,
     corrupted_victim_addresses: BTreeSet<String>,
     repeat_infringing_addresses: BTreeSet<String>,
+    operator_acquisition_addresses: BTreeSet<String>,
 }
 
 struct ContractAnalysisResult {
@@ -830,11 +831,12 @@ async fn finalize_seed_report(
             market_events: &output_state.market_events,
         });
 
-    let victim_acquisition_addresses = build_victim_acquisition_addresses(
+    let victim_acquisition_addresses = build_victim_acquisition_addresses_excluding_malicious(
         &output_state.secondary_sale_victim_addresses,
         &output_state.address_attributions,
         &lifecycle_outputs.value_flow_edges,
         &output_state.nft_propagation_paths,
+        &output_state.malicious_addresses,
     );
     output_state.address_attributions =
         address_records::add_acquisition_exposure_attribution_evidence(

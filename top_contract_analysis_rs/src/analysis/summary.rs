@@ -116,12 +116,94 @@ pub(super) struct AcquisitionCostStats {
     value_flow_unpriced_edge_count: i64,
 }
 
+#[derive(Clone, Debug, Default)]
+struct SecondarySaleVictimCostStats {
+    secondary_sale_victim_cost_eth: f64,
+    secondary_sale_victim_cost_usd: f64,
+    secondary_sale_victim_address_count: i64,
+    secondary_sale_stuck_cost_eth: f64,
+    secondary_sale_stuck_cost_usd: f64,
+    secondary_sale_stuck_cost_ratio: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct OperatorAcquisitionCostStats {
+    operator_acquisition_addresses: BTreeSet<String>,
+    operator_secondary_sale_cost_eth: f64,
+    operator_secondary_sale_cost_usd: f64,
+    operator_paid_mint_cost_eth: f64,
+    operator_paid_mint_cost_usd: f64,
+    operator_acquisition_total_eth: f64,
+    operator_acquisition_total_usd: f64,
+    operator_acquisition_address_count: i64,
+    operator_acquisition_edge_count: i64,
+}
+
+pub(super) fn malicious_address_set(
+    malicious_addresses: &[MaliciousAddressPayload],
+) -> BTreeSet<String> {
+    malicious_addresses
+        .iter()
+        .map(|item| normalized_address(&item.address))
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn is_malicious_address(address: &str, malicious_addresses: &BTreeSet<String>) -> bool {
+    malicious_addresses.contains(&normalized_address(address))
+}
+
+fn filter_secondary_sale_victim_addresses(
+    secondary_sale_victim_addresses: &[SecondarySaleVictimAddressPayload],
+    malicious_addresses: &[MaliciousAddressPayload],
+) -> Vec<SecondarySaleVictimAddressPayload> {
+    let malicious_addresses = malicious_address_set(malicious_addresses);
+    secondary_sale_victim_addresses
+        .iter()
+        .filter(|item| !is_malicious_address(&item.address, &malicious_addresses))
+        .cloned()
+        .collect()
+}
+
+fn build_secondary_sale_victim_cost_stats(
+    secondary_sale_victim_addresses: &[SecondarySaleVictimAddressPayload],
+    malicious_addresses: &[MaliciousAddressPayload],
+) -> SecondarySaleVictimCostStats {
+    let malicious_addresses = malicious_address_set(malicious_addresses);
+    let mut stats = SecondarySaleVictimCostStats::default();
+    for victim in secondary_sale_victim_addresses {
+        if is_malicious_address(&victim.address, &malicious_addresses) {
+            continue;
+        }
+        stats.secondary_sale_victim_address_count += 1;
+        stats.secondary_sale_victim_cost_eth += victim.buy_amount_eth;
+        stats.secondary_sale_victim_cost_usd += victim.buy_amount_usd;
+        if victim.is_stuck {
+            stats.secondary_sale_stuck_cost_eth += victim.last_buy_amount_eth.unwrap_or_default();
+            stats.secondary_sale_stuck_cost_usd += victim.last_buy_amount_usd.unwrap_or_default();
+        }
+    }
+    stats.secondary_sale_stuck_cost_ratio = if stats.secondary_sale_victim_cost_usd > 0.0 {
+        Some(stats.secondary_sale_stuck_cost_usd / stats.secondary_sale_victim_cost_usd)
+    } else if stats.secondary_sale_victim_cost_eth > 0.0 {
+        Some(stats.secondary_sale_stuck_cost_eth / stats.secondary_sale_victim_cost_eth)
+    } else {
+        None
+    };
+    stats
+}
+
 pub(super) fn build_acquisition_cost_stats(
     address_attributions: &[AddressAttributionPayload],
     value_flow_edges: &[ValueFlowEdgePayload],
     propagation_paths: &BTreeMap<String, NftPropagationPathPayload>,
+    malicious_addresses: &[MaliciousAddressPayload],
 ) -> AcquisitionCostStats {
-    let paid_mint_victim_addresses = paid_mint_victim_address_set(address_attributions);
+    let malicious_addresses = malicious_address_set(malicious_addresses);
+    let paid_mint_victim_addresses = paid_mint_victim_address_set(address_attributions)
+        .into_iter()
+        .filter(|address| !malicious_addresses.contains(address))
+        .collect::<BTreeSet<_>>();
     let mut stats = AcquisitionCostStats {
         paid_mint_victim_address_count: paid_mint_victim_addresses.len() as i64,
         ..AcquisitionCostStats::default()
@@ -164,6 +246,52 @@ pub(super) fn build_acquisition_cost_stats(
     stats
 }
 
+pub(super) fn build_operator_acquisition_cost_stats(
+    malicious_addresses: &[MaliciousAddressPayload],
+    value_flow_edges: &[ValueFlowEdgePayload],
+) -> OperatorAcquisitionCostStats {
+    let malicious_addresses = malicious_address_set(malicious_addresses);
+    let mut operator_addresses = BTreeSet::new();
+    let mut stats = OperatorAcquisitionCostStats::default();
+
+    for edge in value_flow_edges {
+        let payer = normalized_address(&edge.from_address);
+        if payer.is_empty() || !malicious_addresses.contains(&payer) {
+            continue;
+        }
+        if !matches!(edge.channel.as_str(), "sale_payment" | "mint_payment") {
+            continue;
+        }
+        let value_eth = edge.value_eth.unwrap_or_default();
+        let value_usd = edge.value_usd.unwrap_or_default();
+        if value_eth <= 0.0 && value_usd <= 0.0 {
+            continue;
+        }
+
+        operator_addresses.insert(payer);
+        stats.operator_acquisition_edge_count += 1;
+        match edge.channel.as_str() {
+            "sale_payment" => {
+                stats.operator_secondary_sale_cost_eth += value_eth;
+                stats.operator_secondary_sale_cost_usd += value_usd;
+            }
+            "mint_payment" => {
+                stats.operator_paid_mint_cost_eth += value_eth;
+                stats.operator_paid_mint_cost_usd += value_usd;
+            }
+            _ => {}
+        }
+    }
+
+    stats.operator_acquisition_total_eth =
+        stats.operator_secondary_sale_cost_eth + stats.operator_paid_mint_cost_eth;
+    stats.operator_acquisition_total_usd =
+        stats.operator_secondary_sale_cost_usd + stats.operator_paid_mint_cost_usd;
+    stats.operator_acquisition_address_count = operator_addresses.len() as i64;
+    stats.operator_acquisition_addresses = operator_addresses;
+    stats
+}
+
 pub(super) fn paid_mint_victim_address_set(
     address_attributions: &[AddressAttributionPayload],
 ) -> BTreeSet<String> {
@@ -180,13 +308,34 @@ pub(super) fn paid_mint_victim_address_set(
         .collect()
 }
 
+#[cfg(test)]
 pub(super) fn build_victim_acquisition_addresses(
     secondary_sale_victim_addresses: &[SecondarySaleVictimAddressPayload],
     address_attributions: &[AddressAttributionPayload],
     value_flow_edges: &[ValueFlowEdgePayload],
     propagation_paths: &BTreeMap<String, NftPropagationPathPayload>,
 ) -> Vec<VictimAcquisitionAddressPayload> {
-    let paid_mint_victim_addresses = paid_mint_victim_address_set(address_attributions);
+    build_victim_acquisition_addresses_excluding_malicious(
+        secondary_sale_victim_addresses,
+        address_attributions,
+        value_flow_edges,
+        propagation_paths,
+        &[],
+    )
+}
+
+pub(super) fn build_victim_acquisition_addresses_excluding_malicious(
+    secondary_sale_victim_addresses: &[SecondarySaleVictimAddressPayload],
+    address_attributions: &[AddressAttributionPayload],
+    value_flow_edges: &[ValueFlowEdgePayload],
+    propagation_paths: &BTreeMap<String, NftPropagationPathPayload>,
+    malicious_addresses: &[MaliciousAddressPayload],
+) -> Vec<VictimAcquisitionAddressPayload> {
+    let malicious_addresses = malicious_address_set(malicious_addresses);
+    let paid_mint_victim_addresses = paid_mint_victim_address_set(address_attributions)
+        .into_iter()
+        .filter(|address| !malicious_addresses.contains(address))
+        .collect::<BTreeSet<_>>();
     let mut labels_by_address = BTreeMap::<String, BTreeSet<String>>::new();
     for attribution in address_attributions {
         let address = normalized_address(&attribution.address);
@@ -203,7 +352,7 @@ pub(super) fn build_victim_acquisition_addresses(
     let mut gas_extra_by_address = BTreeMap::<String, (f64, f64)>::new();
     for victim in secondary_sale_victim_addresses {
         let address = normalized_address(&victim.address);
-        if address.is_empty() {
+        if address.is_empty() || malicious_addresses.contains(&address) {
             continue;
         }
         let row = rows
@@ -519,24 +668,10 @@ pub(super) fn build_report_summary(input: ReportSummaryInput<'_>) -> ReportSumma
         .map(|item| item.contract_address.clone())
         .collect::<BTreeSet<_>>()
         .len() as i64;
-    let secondary_sale_victim_cost_eth = secondary_sale_victim_addresses
-        .iter()
-        .map(|item| item.buy_amount_eth)
-        .sum::<f64>();
-    let secondary_sale_victim_cost_usd = secondary_sale_victim_addresses
-        .iter()
-        .map(|item| item.buy_amount_usd)
-        .sum::<f64>();
-    let secondary_sale_stuck_cost_eth = secondary_sale_victim_addresses
-        .iter()
-        .filter(|item| item.is_stuck)
-        .map(|item| item.last_buy_amount_eth.unwrap_or(0.0))
-        .sum::<f64>();
-    let secondary_sale_stuck_cost_usd = secondary_sale_victim_addresses
-        .iter()
-        .filter(|item| item.is_stuck)
-        .map(|item| item.last_buy_amount_usd.unwrap_or(0.0))
-        .sum::<f64>();
+    let secondary_sale_stats = build_secondary_sale_victim_cost_stats(
+        secondary_sale_victim_addresses,
+        malicious_addresses,
+    );
     let buy_ratio_values: Vec<f64> = victim_acquisition_addresses
         .iter()
         .filter_map(|item| item.buy_asset_ratio)
@@ -580,23 +715,22 @@ pub(super) fn build_report_summary(input: ReportSummaryInput<'_>) -> ReportSumma
         .values()
         .map(|signal| signal.unique_receiver_count as f64)
         .collect();
-    let acquisition_stats =
-        build_acquisition_cost_stats(address_attributions, value_flow_edges, propagation_paths);
-    let secondary_sale_stuck_cost_ratio = if secondary_sale_victim_cost_usd > 0.0 {
-        Some(secondary_sale_stuck_cost_usd / secondary_sale_victim_cost_usd)
-    } else if secondary_sale_victim_cost_eth > 0.0 {
-        Some(secondary_sale_stuck_cost_eth / secondary_sale_victim_cost_eth)
-    } else {
-        None
-    };
-    let victim_acquisition_total_eth =
-        secondary_sale_victim_cost_eth + acquisition_stats.paid_mint_victim_cost_eth;
-    let victim_acquisition_total_usd =
-        secondary_sale_victim_cost_usd + acquisition_stats.paid_mint_victim_cost_usd;
-    let victim_acquisition_stuck_cost_eth =
-        secondary_sale_stuck_cost_eth + acquisition_stats.paid_mint_stuck_cost_eth;
-    let victim_acquisition_stuck_cost_usd =
-        secondary_sale_stuck_cost_usd + acquisition_stats.paid_mint_stuck_cost_usd;
+    let acquisition_stats = build_acquisition_cost_stats(
+        address_attributions,
+        value_flow_edges,
+        propagation_paths,
+        malicious_addresses,
+    );
+    let operator_acquisition_stats =
+        build_operator_acquisition_cost_stats(malicious_addresses, value_flow_edges);
+    let victim_acquisition_total_eth = secondary_sale_stats.secondary_sale_victim_cost_eth
+        + acquisition_stats.paid_mint_victim_cost_eth;
+    let victim_acquisition_total_usd = secondary_sale_stats.secondary_sale_victim_cost_usd
+        + acquisition_stats.paid_mint_victim_cost_usd;
+    let victim_acquisition_stuck_cost_eth = secondary_sale_stats.secondary_sale_stuck_cost_eth
+        + acquisition_stats.paid_mint_stuck_cost_eth;
+    let victim_acquisition_stuck_cost_usd = secondary_sale_stats.secondary_sale_stuck_cost_usd
+        + acquisition_stats.paid_mint_stuck_cost_usd;
     let victim_acquisition_stuck_cost_ratio = if victim_acquisition_total_usd > 0.0 {
         Some(victim_acquisition_stuck_cost_usd / victim_acquisition_total_usd)
     } else if victim_acquisition_total_eth > 0.0 {
@@ -616,12 +750,13 @@ pub(super) fn build_report_summary(input: ReportSummaryInput<'_>) -> ReportSumma
         legit_duplicate_contract_count: legit_duplicates.len() as i64,
         candidate_open_license_token_count: candidate_open_license_tokens.len() as i64,
         candidate_open_license_contract_count,
-        secondary_sale_victim_cost_eth,
-        secondary_sale_victim_cost_usd,
-        secondary_sale_victim_address_count: secondary_sale_victim_addresses.len() as i64,
-        secondary_sale_stuck_cost_eth,
-        secondary_sale_stuck_cost_usd,
-        secondary_sale_stuck_cost_ratio,
+        secondary_sale_victim_cost_eth: secondary_sale_stats.secondary_sale_victim_cost_eth,
+        secondary_sale_victim_cost_usd: secondary_sale_stats.secondary_sale_victim_cost_usd,
+        secondary_sale_victim_address_count: secondary_sale_stats
+            .secondary_sale_victim_address_count,
+        secondary_sale_stuck_cost_eth: secondary_sale_stats.secondary_sale_stuck_cost_eth,
+        secondary_sale_stuck_cost_usd: secondary_sale_stats.secondary_sale_stuck_cost_usd,
+        secondary_sale_stuck_cost_ratio: secondary_sale_stats.secondary_sale_stuck_cost_ratio,
         paid_mint_victim_cost_eth: acquisition_stats.paid_mint_victim_cost_eth,
         paid_mint_victim_cost_usd: acquisition_stats.paid_mint_victim_cost_usd,
         paid_mint_victim_edge_count: acquisition_stats.paid_mint_victim_edge_count,
@@ -636,6 +771,17 @@ pub(super) fn build_report_summary(input: ReportSummaryInput<'_>) -> ReportSumma
         victim_acquisition_stuck_cost_usd,
         victim_acquisition_stuck_cost_ratio,
         victim_acquisition_address_count: victim_acquisition_addresses.len() as i64,
+        operator_secondary_sale_cost_eth: operator_acquisition_stats
+            .operator_secondary_sale_cost_eth,
+        operator_secondary_sale_cost_usd: operator_acquisition_stats
+            .operator_secondary_sale_cost_usd,
+        operator_paid_mint_cost_eth: operator_acquisition_stats.operator_paid_mint_cost_eth,
+        operator_paid_mint_cost_usd: operator_acquisition_stats.operator_paid_mint_cost_usd,
+        operator_acquisition_total_eth: operator_acquisition_stats.operator_acquisition_total_eth,
+        operator_acquisition_total_usd: operator_acquisition_stats.operator_acquisition_total_usd,
+        operator_acquisition_address_count: operator_acquisition_stats
+            .operator_acquisition_address_count,
+        operator_acquisition_edge_count: operator_acquisition_stats.operator_acquisition_edge_count,
         stablecoin_erc20_value_usd: acquisition_stats.stablecoin_erc20_value_usd,
         stablecoin_erc20_edge_count: acquisition_stats.stablecoin_erc20_edge_count,
         value_flow_priced_edge_count: acquisition_stats.value_flow_priced_edge_count,
@@ -694,6 +840,98 @@ pub(super) fn median_f64(values: &[f64]) -> Option<f64> {
     } else {
         Some((sorted[mid - 1] + sorted[mid]) / 2.0)
     }
+}
+
+fn apply_acquisition_summary_fields(
+    report_summary: &mut ReportSummary,
+    secondary_sale_stats: &SecondarySaleVictimCostStats,
+    acquisition_stats: &AcquisitionCostStats,
+    victim_acquisition_addresses: &[VictimAcquisitionAddressPayload],
+) {
+    let victim_acquisition_total_eth = secondary_sale_stats.secondary_sale_victim_cost_eth
+        + acquisition_stats.paid_mint_victim_cost_eth;
+    let victim_acquisition_total_usd = secondary_sale_stats.secondary_sale_victim_cost_usd
+        + acquisition_stats.paid_mint_victim_cost_usd;
+    let victim_acquisition_stuck_cost_eth = secondary_sale_stats.secondary_sale_stuck_cost_eth
+        + acquisition_stats.paid_mint_stuck_cost_eth;
+    let victim_acquisition_stuck_cost_usd = secondary_sale_stats.secondary_sale_stuck_cost_usd
+        + acquisition_stats.paid_mint_stuck_cost_usd;
+    let victim_acquisition_stuck_cost_ratio = if victim_acquisition_total_usd > 0.0 {
+        Some(victim_acquisition_stuck_cost_usd / victim_acquisition_total_usd)
+    } else if victim_acquisition_total_eth > 0.0 {
+        Some(victim_acquisition_stuck_cost_eth / victim_acquisition_total_eth)
+    } else {
+        None
+    };
+    let buy_ratio_values: Vec<f64> = victim_acquisition_addresses
+        .iter()
+        .filter_map(|item| item.buy_asset_ratio)
+        .collect();
+    let ratio_known_count = buy_ratio_values.len() as i64;
+    let ratio_over_60_count = buy_ratio_values
+        .iter()
+        .filter(|value| **value > 0.6)
+        .count() as i64;
+    let ratio_over_80_count = buy_ratio_values
+        .iter()
+        .filter(|value| **value > 0.8)
+        .count() as i64;
+    let stuck_victim_address_count = victim_acquisition_addresses
+        .iter()
+        .filter(|item| item.is_stuck)
+        .count() as i64;
+
+    report_summary.secondary_sale_victim_cost_eth =
+        secondary_sale_stats.secondary_sale_victim_cost_eth;
+    report_summary.secondary_sale_victim_cost_usd =
+        secondary_sale_stats.secondary_sale_victim_cost_usd;
+    report_summary.secondary_sale_victim_address_count =
+        secondary_sale_stats.secondary_sale_victim_address_count;
+    report_summary.secondary_sale_stuck_cost_eth =
+        secondary_sale_stats.secondary_sale_stuck_cost_eth;
+    report_summary.secondary_sale_stuck_cost_usd =
+        secondary_sale_stats.secondary_sale_stuck_cost_usd;
+    report_summary.secondary_sale_stuck_cost_ratio =
+        secondary_sale_stats.secondary_sale_stuck_cost_ratio;
+    report_summary.paid_mint_victim_cost_eth = acquisition_stats.paid_mint_victim_cost_eth;
+    report_summary.paid_mint_victim_cost_usd = acquisition_stats.paid_mint_victim_cost_usd;
+    report_summary.paid_mint_victim_edge_count = acquisition_stats.paid_mint_victim_edge_count;
+    report_summary.paid_mint_victim_address_count =
+        acquisition_stats.paid_mint_victim_address_count;
+    report_summary.paid_mint_stuck_cost_eth = acquisition_stats.paid_mint_stuck_cost_eth;
+    report_summary.paid_mint_stuck_cost_usd = acquisition_stats.paid_mint_stuck_cost_usd;
+    report_summary.paid_mint_stuck_edge_count = acquisition_stats.paid_mint_stuck_edge_count;
+    report_summary.paid_mint_stuck_token_count = acquisition_stats.paid_mint_stuck_token_count;
+    report_summary.victim_acquisition_total_eth = victim_acquisition_total_eth;
+    report_summary.victim_acquisition_total_usd = victim_acquisition_total_usd;
+    report_summary.victim_acquisition_stuck_cost_eth = victim_acquisition_stuck_cost_eth;
+    report_summary.victim_acquisition_stuck_cost_usd = victim_acquisition_stuck_cost_usd;
+    report_summary.victim_acquisition_stuck_cost_ratio = victim_acquisition_stuck_cost_ratio;
+    report_summary.victim_acquisition_address_count = victim_acquisition_addresses.len() as i64;
+    report_summary.stablecoin_erc20_value_usd = acquisition_stats.stablecoin_erc20_value_usd;
+    report_summary.stablecoin_erc20_edge_count = acquisition_stats.stablecoin_erc20_edge_count;
+    report_summary.value_flow_priced_edge_count = acquisition_stats.value_flow_priced_edge_count;
+    report_summary.value_flow_unpriced_edge_count =
+        acquisition_stats.value_flow_unpriced_edge_count;
+    report_summary.buy_asset_ratio_known_address_count = ratio_known_count;
+    report_summary.ratio_over_60_address_count = ratio_over_60_count;
+    report_summary.ratio_over_60_address_ratio = if ratio_known_count > 0 {
+        Some(ratio_over_60_count as f64 / ratio_known_count as f64)
+    } else {
+        None
+    };
+    report_summary.ratio_over_80_address_count = ratio_over_80_count;
+    report_summary.ratio_over_80_address_ratio = if ratio_known_count > 0 {
+        Some(ratio_over_80_count as f64 / ratio_known_count as f64)
+    } else {
+        None
+    };
+    report_summary.stuck_victim_address_count = stuck_victim_address_count;
+    report_summary.stuck_victim_address_ratio = if !victim_acquisition_addresses.is_empty() {
+        Some(stuck_victim_address_count as f64 / victim_acquisition_addresses.len() as f64)
+    } else {
+        None
+    };
 }
 
 pub(super) fn build_batch_report_summary(
@@ -809,6 +1047,46 @@ pub(super) fn build_batch_report_summary(
         .iter()
         .map(|item| item.report.report_summary.victim_acquisition_address_count)
         .sum();
+    let operator_secondary_sale_cost_eth_total: f64 = seed_reports
+        .iter()
+        .map(|item| item.report.report_summary.operator_secondary_sale_cost_eth)
+        .sum();
+    let operator_secondary_sale_cost_usd_total: f64 = seed_reports
+        .iter()
+        .map(|item| item.report.report_summary.operator_secondary_sale_cost_usd)
+        .sum();
+    let operator_paid_mint_cost_eth_total: f64 = seed_reports
+        .iter()
+        .map(|item| item.report.report_summary.operator_paid_mint_cost_eth)
+        .sum();
+    let operator_paid_mint_cost_usd_total: f64 = seed_reports
+        .iter()
+        .map(|item| item.report.report_summary.operator_paid_mint_cost_usd)
+        .sum();
+    let operator_acquisition_total_eth_total: f64 = seed_reports
+        .iter()
+        .map(|item| item.report.report_summary.operator_acquisition_total_eth)
+        .sum();
+    let operator_acquisition_total_usd_total: f64 = seed_reports
+        .iter()
+        .map(|item| item.report.report_summary.operator_acquisition_total_usd)
+        .sum();
+    let operator_acquisition_address_count_total: i64 = seed_reports
+        .iter()
+        .map(|item| {
+            item.report
+                .report_summary
+                .operator_acquisition_address_count
+        })
+        .sum();
+    let operator_acquisition_edge_count_total: i64 = seed_reports
+        .iter()
+        .map(|item| item.report.report_summary.operator_acquisition_edge_count)
+        .sum();
+    let operator_acquisition_addresses: BTreeSet<String> = seed_reports
+        .iter()
+        .flat_map(|item| item.operator_acquisition_addresses.iter().cloned())
+        .collect();
     let stablecoin_erc20_value_usd_total: f64 = seed_reports
         .iter()
         .map(|item| item.report.report_summary.stablecoin_erc20_value_usd)
@@ -968,6 +1246,15 @@ pub(super) fn build_batch_report_summary(
         },
         victim_acquisition_address_count_total,
         victim_acquisition_address_count_distinct: victim_acquisition_addresses.len() as i64,
+        operator_secondary_sale_cost_eth_total,
+        operator_secondary_sale_cost_usd_total,
+        operator_paid_mint_cost_eth_total,
+        operator_paid_mint_cost_usd_total,
+        operator_acquisition_total_eth_total,
+        operator_acquisition_total_usd_total,
+        operator_acquisition_address_count_total,
+        operator_acquisition_address_count_distinct: operator_acquisition_addresses.len() as i64,
+        operator_acquisition_edge_count_total,
         stablecoin_erc20_value_usd_total,
         stablecoin_erc20_edge_count_total,
         value_flow_priced_edge_count_total,
@@ -1042,14 +1329,23 @@ pub(super) fn build_batch_seed_aggregate(payload: SingleReportPayload) -> BatchS
         .map(|item| normalized_address(&item.address))
         .filter(|value| !value.is_empty())
         .collect();
-    let victim_acquisition_addresses: BTreeSet<String> = payload
-        .victim_acquisition_addresses
+    let secondary_sale_victim_addresses = filter_secondary_sale_victim_addresses(
+        &payload.secondary_sale_victim_addresses,
+        &payload.malicious_addresses,
+    );
+    let victim_acquisition_rows = build_victim_acquisition_addresses_excluding_malicious(
+        &secondary_sale_victim_addresses,
+        &payload.address_attributions,
+        &payload.value_flow_edges,
+        &payload.nft_propagation_paths,
+        &payload.malicious_addresses,
+    );
+    let victim_acquisition_addresses: BTreeSet<String> = victim_acquisition_rows
         .iter()
         .map(|item| normalized_address(&item.address))
         .filter(|value| !value.is_empty())
         .collect();
-    let stuck_victim_addresses: BTreeSet<String> = payload
-        .victim_acquisition_addresses
+    let stuck_victim_addresses: BTreeSet<String> = victim_acquisition_rows
         .iter()
         .filter(|item| item.is_stuck)
         .map(|item| normalized_address(&item.address))
@@ -1063,8 +1359,44 @@ pub(super) fn build_batch_seed_aggregate(payload: SingleReportPayload) -> BatchS
         .filter(|value| !value.is_empty())
         .collect();
     let repeat_infringing_addresses = repeat_infringing_addresses(&payload.infringing_tokens);
+    let secondary_sale_stats = build_secondary_sale_victim_cost_stats(
+        &secondary_sale_victim_addresses,
+        &payload.malicious_addresses,
+    );
+    let acquisition_stats = build_acquisition_cost_stats(
+        &payload.address_attributions,
+        &payload.value_flow_edges,
+        &payload.nft_propagation_paths,
+        &payload.malicious_addresses,
+    );
+    let operator_acquisition_stats = build_operator_acquisition_cost_stats(
+        &payload.malicious_addresses,
+        &payload.value_flow_edges,
+    );
     let mut report_summary = payload.report_summary.clone();
     report_summary.repeat_infringing_address_count = repeat_infringing_addresses.len() as i64;
+    apply_acquisition_summary_fields(
+        &mut report_summary,
+        &secondary_sale_stats,
+        &acquisition_stats,
+        &victim_acquisition_rows,
+    );
+    report_summary.operator_secondary_sale_cost_eth =
+        operator_acquisition_stats.operator_secondary_sale_cost_eth;
+    report_summary.operator_secondary_sale_cost_usd =
+        operator_acquisition_stats.operator_secondary_sale_cost_usd;
+    report_summary.operator_paid_mint_cost_eth =
+        operator_acquisition_stats.operator_paid_mint_cost_eth;
+    report_summary.operator_paid_mint_cost_usd =
+        operator_acquisition_stats.operator_paid_mint_cost_usd;
+    report_summary.operator_acquisition_total_eth =
+        operator_acquisition_stats.operator_acquisition_total_eth;
+    report_summary.operator_acquisition_total_usd =
+        operator_acquisition_stats.operator_acquisition_total_usd;
+    report_summary.operator_acquisition_address_count =
+        operator_acquisition_stats.operator_acquisition_address_count;
+    report_summary.operator_acquisition_edge_count =
+        operator_acquisition_stats.operator_acquisition_edge_count;
 
     BatchSeedAggregate {
         report: BatchSeedReportPayload {
@@ -1078,6 +1410,7 @@ pub(super) fn build_batch_seed_aggregate(payload: SingleReportPayload) -> BatchS
         stuck_victim_addresses,
         corrupted_victim_addresses,
         repeat_infringing_addresses,
+        operator_acquisition_addresses: operator_acquisition_stats.operator_acquisition_addresses,
     }
 }
 

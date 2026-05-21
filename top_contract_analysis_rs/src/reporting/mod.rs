@@ -194,6 +194,20 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
             summary.paid_mint_victim_cost_usd
         ),
         format!(
+            "- 操作者使用资金合计(USD): {} / addresses={} / edges={}",
+            summary.operator_acquisition_total_usd,
+            summary.operator_acquisition_address_count,
+            summary.operator_acquisition_edge_count
+        ),
+        format!(
+            "- 操作者二级市场使用资金(USD): {}",
+            summary.operator_secondary_sale_cost_usd
+        ),
+        format!(
+            "- 操作者付费 mint 使用资金(USD): {}",
+            summary.operator_paid_mint_cost_usd
+        ),
+        format!(
             "- 付费 mint 套牢成本(USD): {} / edges={} / tokens={}",
             summary.paid_mint_stuck_cost_usd,
             summary.paid_mint_stuck_edge_count,
@@ -437,6 +451,21 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
         format!(
             "- 付费 mint 受害者成本(USD)汇总: {} / edges={}",
             summary.paid_mint_victim_cost_usd_total, summary.paid_mint_victim_edge_count_total
+        ),
+        format!(
+            "- 操作者使用资金(USD)汇总: {} / 全局地址={} / 观测地址={} / edges={}",
+            summary.operator_acquisition_total_usd_total,
+            summary.operator_acquisition_address_count_distinct,
+            summary.operator_acquisition_address_count_total,
+            summary.operator_acquisition_edge_count_total
+        ),
+        format!(
+            "- 操作者二级市场使用资金(USD)汇总: {}",
+            summary.operator_secondary_sale_cost_usd_total
+        ),
+        format!(
+            "- 操作者付费 mint 使用资金(USD)汇总: {}",
+            summary.operator_paid_mint_cost_usd_total
         ),
         format!(
             "- ERC20 稳定币有价资金流(USD)汇总: {} / edges={}",

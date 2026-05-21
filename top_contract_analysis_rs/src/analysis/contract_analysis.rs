@@ -339,10 +339,11 @@ pub(super) async fn analyze_duplicate_contract(
         &mint_payment_edges,
     );
     let contract_secondary_sale_victims =
-        address_records::build_secondary_sale_victim_address_records_from_activity(
+        address_records::build_secondary_sale_victim_address_records_excluding_malicious_from_activity(
             contract_address,
             &contract_activity,
             &sale_metrics_by_tx,
+            &contract_malicious,
         );
     let contract_honest = address_records::build_honest_address_records_from_activity(
         contract_address,

@@ -1171,11 +1171,31 @@ pub(crate) fn build_secondary_sale_victim_address_records_from_activity(
     activity: &PreparedContractActivity<'_>,
     sale_metrics_by_tx: &BTreeMap<String, SaleMetricRecord>,
 ) -> Vec<SecondarySaleVictimAddressPayload> {
+    build_secondary_sale_victim_address_records_excluding_malicious_from_activity(
+        contract_address,
+        activity,
+        sale_metrics_by_tx,
+        &[],
+    )
+}
+
+pub(crate) fn build_secondary_sale_victim_address_records_excluding_malicious_from_activity(
+    contract_address: &str,
+    activity: &PreparedContractActivity<'_>,
+    sale_metrics_by_tx: &BTreeMap<String, SaleMetricRecord>,
+    malicious_addresses: &[MaliciousAddressPayload],
+) -> Vec<SecondarySaleVictimAddressPayload> {
+    let malicious_buyers: HashSet<String> = malicious_addresses
+        .iter()
+        .map(|item| item.address.trim().to_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect();
     let mut grouped: BTreeMap<String, SecondarySaleVictimAddressPayload> = BTreeMap::new();
     let mut last_buy_key: HashMap<String, (i64, i64, i64, String)> = HashMap::new();
 
     for sale in &activity.sorted_sales {
-        if sale.buyer_address.is_empty() {
+        let buyer_address = sale.buyer_address.trim().to_lowercase();
+        if buyer_address.is_empty() || malicious_buyers.contains(&buyer_address) {
             continue;
         }
         let metric_key = sale_metric_key(&sale.tx_hash, &sale.buyer_address);
@@ -1881,6 +1901,40 @@ mod tests {
         assert_eq!(victims[0].last_buy_amount_eth, Some(0.1));
         assert_eq!(victims[0].last_buy_amount_usd, Some(0.1));
         assert!(victims[0].is_stuck);
+    }
+
+    #[test]
+    fn victim_records_exclude_malicious_secondary_sale_buyers() {
+        let sales = vec![
+            sale_between("0xvictim_buy", 120, "0xminter", "0xvictim", 1.0),
+            sale_between("0xwash_buy", 130, "0xvictim", "0xoperator", 10.0),
+        ];
+        let owners = vec![
+            OwnerBalance {
+                owner_address: "0xvictim".into(),
+                token_balances: BTreeMap::from([("1".into(), 1)]),
+            },
+            OwnerBalance {
+                owner_address: "0xoperator".into(),
+                token_balances: BTreeMap::from([("1".into(), 1)]),
+            },
+        ];
+        let activity = prepare_contract_activity(&[], &sales, &owners);
+
+        let victims = build_secondary_sale_victim_address_records_excluding_malicious_from_activity(
+            "0xdup",
+            &activity,
+            &BTreeMap::new(),
+            &[MaliciousAddressPayload {
+                address: "0xoperator".into(),
+                wash_cycle_count: 1,
+                ..MaliciousAddressPayload::default()
+            }],
+        );
+
+        assert_eq!(victims.len(), 1);
+        assert_eq!(victims[0].address, "0xvictim");
+        assert_eq!(victims[0].buy_amount_eth, 1.0);
     }
 
     #[test]

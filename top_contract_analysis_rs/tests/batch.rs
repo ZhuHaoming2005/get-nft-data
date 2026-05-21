@@ -16,7 +16,7 @@ use top_contract_analysis_rs::models::{
     HonestAddressPayload, InfringingTokenRecord, MaliciousAddressPayload, NftSaleRecord,
     OutputFilesPayload, OwnerBalance, ReportSummary, SecondarySaleVictimAddressPayload,
     SeedContractPayload, SeedNft, SingleReportPayload, TransactionReceiptRecord, TransferRecord,
-    VictimAcquisitionAddressPayload,
+    ValueFlowEdgePayload, VictimAcquisitionAddressPayload,
 };
 use top_contract_analysis_rs::progress::{
     BatchProgressReporter, NoopBatchProgressReporter, NoopProgressReporter, SeedProgressReporter,
@@ -1184,7 +1184,7 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n").unwrap();
 
-    let cached_one = cached_single_report(
+    let mut cached_one = cached_single_report(
         SeedContractPayload {
             chain: "ethereum".into(),
             contract_address: "0xseed1".into(),
@@ -1253,16 +1253,35 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
         vec![
             SecondarySaleVictimAddressPayload {
                 address: "0xv1".into(),
+                buy_amount_eth: 7.0,
+                buy_amount_usd: 7.0,
                 last_buy_amount_eth: Some(2.0),
                 last_buy_amount_usd: Some(2.0),
+                buy_before_eth_balance: Some(10.0),
+                buy_before_usd_balance: Some(10.0),
                 is_stuck: true,
                 ..SecondarySaleVictimAddressPayload::default()
             },
             SecondarySaleVictimAddressPayload {
                 address: "0xv2".into(),
+                buy_amount_eth: 3.0,
+                buy_amount_usd: 3.0,
                 last_buy_amount_eth: Some(4.0),
                 last_buy_amount_usd: Some(4.0),
+                buy_before_eth_balance: Some(10.0),
+                buy_before_usd_balance: Some(10.0),
                 is_stuck: false,
+                ..SecondarySaleVictimAddressPayload::default()
+            },
+            SecondarySaleVictimAddressPayload {
+                address: "0xm1".into(),
+                buy_amount_eth: 1_000.0,
+                buy_amount_usd: 1_000.0,
+                last_buy_amount_eth: Some(1_000.0),
+                last_buy_amount_usd: Some(1_000.0),
+                buy_before_eth_balance: Some(1_000.0),
+                buy_before_usd_balance: Some(1_000.0),
+                is_stuck: true,
                 ..SecondarySaleVictimAddressPayload::default()
             },
         ],
@@ -1283,6 +1302,13 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
             ),
         ]),
     );
+    cached_one.value_flow_edges = vec![ValueFlowEdgePayload {
+        from_address: "0xm1".into(),
+        value_eth: Some(1_000.0),
+        value_usd: Some(1_000.0),
+        channel: "sale_payment".into(),
+        ..ValueFlowEdgePayload::default()
+    }];
     std::fs::write(
         dir.path().join("top_contract_analysis__cached_one.json"),
         serde_json::to_string(&cached_one).unwrap(),
@@ -1294,7 +1320,7 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
     )
     .unwrap();
 
-    let cached_two = cached_single_report(
+    let mut cached_two = cached_single_report(
         SeedContractPayload {
             chain: "ethereum".into(),
             contract_address: "0xseed2".into(),
@@ -1359,17 +1385,29 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
         vec![
             SecondarySaleVictimAddressPayload {
                 address: "0xv2".into(),
+                buy_amount_eth: 1.0,
+                buy_amount_usd: 1.0,
                 last_buy_amount_eth: Some(1.0),
                 last_buy_amount_usd: Some(1.0),
+                buy_before_eth_balance: Some(1.0),
+                buy_before_usd_balance: Some(1.0),
                 is_stuck: true,
                 ..SecondarySaleVictimAddressPayload::default()
             },
             SecondarySaleVictimAddressPayload {
                 address: "0xv3".into(),
+                buy_amount_eth: 3.0,
+                buy_amount_usd: 3.0,
+                buy_before_eth_balance: Some(4.0),
+                buy_before_usd_balance: Some(4.0),
                 ..SecondarySaleVictimAddressPayload::default()
             },
             SecondarySaleVictimAddressPayload {
                 address: "0xv4".into(),
+                buy_amount_eth: 1.0,
+                buy_amount_usd: 1.0,
+                buy_before_eth_balance: Some(10.0),
+                buy_before_usd_balance: Some(10.0),
                 ..SecondarySaleVictimAddressPayload::default()
             },
         ],
@@ -1381,6 +1419,13 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
             },
         )]),
     );
+    cached_two.value_flow_edges = vec![ValueFlowEdgePayload {
+        from_address: "0xm2".into(),
+        value_eth: Some(50.0),
+        value_usd: Some(50.0),
+        channel: "sale_payment".into(),
+        ..ValueFlowEdgePayload::default()
+    }];
     std::fs::write(
         dir.path().join("top_contract_analysis__cached_two.json"),
         serde_json::to_string(&cached_two).unwrap(),
@@ -1438,6 +1483,30 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
             .batch_summary
             .secondary_sale_stuck_cost_ratio_overall,
         Some(0.2)
+    );
+    assert_eq!(
+        summary.batch_summary.operator_secondary_sale_cost_eth_total,
+        1_050.0
+    );
+    assert_eq!(
+        summary.batch_summary.operator_acquisition_total_eth_total,
+        1_050.0
+    );
+    assert_eq!(
+        summary
+            .batch_summary
+            .operator_acquisition_address_count_total,
+        2
+    );
+    assert_eq!(
+        summary
+            .batch_summary
+            .operator_acquisition_address_count_distinct,
+        2
+    );
+    assert_eq!(
+        summary.batch_summary.operator_acquisition_edge_count_total,
+        2
     );
     assert_eq!(
         summary
@@ -1530,6 +1599,12 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
     assert_eq!(
         summary.seed_reports[0]
             .report_summary
+            .secondary_sale_victim_cost_eth,
+        10.0
+    );
+    assert_eq!(
+        summary.seed_reports[0]
+            .report_summary
             .secondary_sale_stuck_cost_eth,
         2.0
     );
@@ -1538,6 +1613,12 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
             .report_summary
             .secondary_sale_stuck_cost_ratio,
         Some(0.2)
+    );
+    assert_eq!(
+        summary.seed_reports[0]
+            .report_summary
+            .operator_acquisition_total_eth,
+        1_000.0
     );
     assert_eq!(
         summary.seed_reports[0]
