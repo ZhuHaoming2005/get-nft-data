@@ -1,17 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
+use std::time::Instant;
 
 use crate::error::AppError;
-use crate::models::{
-    ContractMetadata, DuplicateCandidate, DuplicateContractPayload, OwnerBalance, TransferRecord,
-};
-use crate::store::CachedSignals;
+use crate::models::{ContractMetadata, DuplicateCandidate, DuplicateContractPayload};
 
 use super::{
     address_records, analyze_victim_signals_from_active_sellers,
     compute_mint_payment_edges_for_contract, compute_sale_metrics_for_contract,
-    map_address_signals, propagation, signals, AnalysisDeps, AnalysisOutputState, AnalyzeRequest,
-    ContractAnalysisResult, SignalCacheStore,
+    map_address_signals, propagation, signals, timing, AnalysisDeps, AnalysisOutputState,
+    AnalyzeRequest, ContractAnalysisResult,
 };
 
 pub(super) fn merge_contract_analysis_result(
@@ -169,33 +166,6 @@ pub(super) struct DuplicateContractAnalysisInput<'a> {
     pub(super) analysis_timestamp: i64,
 }
 
-async fn get_cached_signals(
-    cache: Arc<dyn SignalCacheStore>,
-    chain: String,
-    contract_address: String,
-    token_type: String,
-) -> Result<Option<CachedSignals>, AppError> {
-    tokio::task::spawn_blocking(move || cache.try_get(&chain, &contract_address, &token_type))
-        .await
-        .map_err(|err| AppError::InvalidData(format!("signal cache get task failed: {err}")))?
-}
-
-async fn put_cached_signals(
-    cache: Arc<dyn SignalCacheStore>,
-    chain: String,
-    contract_address: String,
-    token_type: String,
-    transfers: Vec<TransferRecord>,
-    owners: Vec<OwnerBalance>,
-) -> Result<(Vec<TransferRecord>, Vec<OwnerBalance>), AppError> {
-    tokio::task::spawn_blocking(move || {
-        cache.try_put(&chain, &contract_address, &token_type, &transfers, &owners)?;
-        Ok::<_, AppError>((transfers, owners))
-    })
-    .await
-    .map_err(|err| AppError::InvalidData(format!("signal cache put task failed: {err}")))?
-}
-
 pub(super) async fn analyze_duplicate_contract(
     input: DuplicateContractAnalysisInput<'_>,
 ) -> Result<ContractAnalysisResult, AppError> {
@@ -211,68 +181,47 @@ pub(super) async fn analyze_duplicate_contract(
         analysis_timestamp,
     } = input;
     let contract_candidate_refs: Vec<&DuplicateCandidate> = contract_candidates.iter().collect();
-    let cached_signals = if let Some(cache) = deps.signal_cache.as_ref() {
-        get_cached_signals(
-            cache.clone(),
-            request.chain.clone(),
-            contract_address.to_string(),
-            token_type.to_string(),
-        )
-        .await?
-    } else {
-        None
-    };
-    let (transfers, owners, transfer_signals, victim_signal) = if let Some(cached) = cached_signals
-    {
-        let transfers = cached.transfers;
-        let owners = cached.owners;
-        let victim_signal = cached
-            .victim_signals
-            .unwrap_or_else(|| analyze_victim_signals_from_active_sellers(&transfers, &owners));
-        (transfers, owners, cached.address_signals, victim_signal)
-    } else {
-        let (transfers, owners) = tokio::join!(
-            deps.api.fetch_contract_transfers(
-                &request.chain,
-                &request.etherscan_api_key,
-                request.alchemy_network.as_deref(),
-                &request.alchemy_api_key,
-                contract_address,
-                token_type,
-            ),
-            deps.api.fetch_contract_owners(
-                &request.chain,
-                &request.alchemy_api_key,
-                request.alchemy_network.as_deref(),
-                contract_address,
+    let (transfers, owners) = timing::time_async(
+        format!("contract:{contract_address}:fetch_transfers_and_owners"),
+        async {
+            tokio::try_join!(
+                deps.api.fetch_contract_transfers(
+                    &request.chain,
+                    &request.etherscan_api_key,
+                    request.alchemy_network.as_deref(),
+                    &request.alchemy_api_key,
+                    contract_address,
+                    token_type,
+                ),
+                deps.api.fetch_contract_owners(
+                    &request.chain,
+                    &request.alchemy_api_key,
+                    request.alchemy_network.as_deref(),
+                    contract_address,
+                )
             )
-        );
-        let transfers = transfers?;
-        let owners = owners?;
-        let (transfers, owners) = if let Some(cache) = deps.signal_cache.as_ref() {
-            put_cached_signals(
-                cache.clone(),
-                request.chain.clone(),
-                contract_address.to_string(),
-                token_type.to_string(),
-                transfers,
-                owners,
-            )
-            .await?
-        } else {
-            (transfers, owners)
-        };
-        let transfer_signals = signals::analyze_transfer_signals(&transfers);
-        let victim_signal = analyze_victim_signals_from_active_sellers(&transfers, &owners);
-        (transfers, owners, transfer_signals, victim_signal)
-    };
+        },
+    )
+    .await?;
+    let signal_timer = Instant::now();
+    let transfer_signals = signals::analyze_transfer_signals(&transfers);
+    let victim_signal = analyze_victim_signals_from_active_sellers(&transfers, &owners);
+    timing::log_timing(
+        &format!("contract:{contract_address}:analyze_transfer_and_victim_signals"),
+        signal_timer,
+    );
 
+    let infringing_timer = Instant::now();
     let contract_infringing = address_records::build_infringing_token_records_with_context_refs(
         contract_address,
         &contract_candidate_refs,
         &transfers,
         official_addresses,
         candidate_open_license_by_token,
+    );
+    timing::log_timing(
+        &format!("contract:{contract_address}:build_infringing_tokens"),
+        infringing_timer,
     );
     if !contract_infringing.is_empty()
         && contract_infringing
@@ -324,17 +273,6 @@ pub(super) async fn analyze_duplicate_contract(
             )
             .await
     };
-    let market_events_fut = async {
-        deps.api
-            .fetch_contract_market_events(
-                &request.chain,
-                &request.alchemy_api_key,
-                request.alchemy_network.as_deref(),
-                contract_address,
-                &request.opensea_api_key,
-            )
-            .await
-    };
     let mint_payment_edges_fut = compute_mint_payment_edges_for_contract(
         request,
         deps,
@@ -343,10 +281,18 @@ pub(super) async fn analyze_duplicate_contract(
         &transfers,
         contract_metadata.as_ref(),
     );
-    let (sales, market_events, mint_payment_edges) =
-        tokio::try_join!(sales_fut, market_events_fut, mint_payment_edges_fut)?;
-    let sale_metrics_by_tx = compute_sale_metrics_for_contract(request, deps, &sales).await?;
+    let (sales, mint_payment_edges) = timing::time_async(
+        format!("contract:{contract_address}:fetch_sales_and_mint_value_flow"),
+        async { tokio::try_join!(sales_fut, mint_payment_edges_fut) },
+    )
+    .await?;
+    let sale_metrics_by_tx = timing::time_async(
+        format!("contract:{contract_address}:compute_sale_metrics"),
+        compute_sale_metrics_for_contract(request, deps, &sales),
+    )
+    .await?;
 
+    let address_timer = Instant::now();
     let contract_activity = address_records::prepare_contract_activity(&transfers, &sales, &owners);
     let contract_malicious = address_records::build_malicious_address_records_from_activity(
         contract_address,
@@ -381,6 +327,11 @@ pub(super) async fn analyze_duplicate_contract(
         &contract_honest,
         &contract_secondary_sale_victims,
     );
+    timing::log_timing(
+        &format!("contract:{contract_address}:build_address_records"),
+        address_timer,
+    );
+    let propagation_timer = Instant::now();
     let nft_propagation_path =
         propagation::build_nft_propagation_path(propagation::NftPropagationInput {
             contract_address,
@@ -392,6 +343,10 @@ pub(super) async fn analyze_duplicate_contract(
             honest_addresses: &contract_honest,
             secondary_sale_victim_addresses: &contract_secondary_sale_victims,
         });
+    timing::log_timing(
+        &format!("contract:{contract_address}:build_propagation_path"),
+        propagation_timer,
+    );
 
     Ok(ContractAnalysisResult {
         contract_address: contract_address.to_string(),
@@ -414,7 +369,7 @@ pub(super) async fn analyze_duplicate_contract(
         honest_addresses: contract_honest,
         secondary_sale_victim_addresses: contract_secondary_sale_victims,
         address_attributions,
-        market_events,
+        market_events: Vec::new(),
         mint_payment_edges,
         nft_propagation_path: Some(nft_propagation_path),
     })

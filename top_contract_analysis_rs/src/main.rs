@@ -19,9 +19,7 @@ use top_contract_analysis_rs::progress::{
 use top_contract_analysis_rs::reporting::{write_batch_summary_outputs, write_default_outputs};
 #[cfg(feature = "export-snapshot")]
 use top_contract_analysis_rs::store::export_chain_snapshot_to_parquet;
-use top_contract_analysis_rs::store::{
-    ContractSignalCache, DuckDbFeatureStore, DuckDbResourceOptions,
-};
+use top_contract_analysis_rs::store::{DuckDbFeatureStore, DuckDbResourceOptions};
 
 #[cfg(feature = "export-snapshot")]
 fn connect_postgres_from_constants() -> Result<Client, AppError> {
@@ -45,7 +43,6 @@ fn main() -> Result<(), AppError> {
             let deps = AnalysisDeps {
                 api: Arc::new(api),
                 feature_store: Arc::new(feature_store),
-                signal_cache: Some(Arc::new(ContractSignalCache::new(&args.signal_cache_db)?)),
                 progress: create_single_seed_progress_reporter(&args.seed_contract_address),
                 batch_progress: Arc::new(NoopBatchProgressReporter),
             };
@@ -88,7 +85,6 @@ fn main() -> Result<(), AppError> {
             let deps = AnalysisDeps {
                 api: Arc::new(api),
                 feature_store: Arc::new(feature_store),
-                signal_cache: Some(Arc::new(ContractSignalCache::new(&args.signal_cache_db)?)),
                 progress: Arc::new(NoopProgressReporter),
                 batch_progress: create_batch_progress_reporter(
                     &seed_addresses,

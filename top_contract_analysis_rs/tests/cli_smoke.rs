@@ -58,8 +58,6 @@ fn batch_subcommand_is_exposed() {
             "ethereum",
             "--feature-db",
             "batch.db",
-            "--signal-cache-db",
-            "signals.db",
             "--output-dir",
             "result",
             "--api-max-concurrency",

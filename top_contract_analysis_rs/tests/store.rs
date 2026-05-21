@@ -1,16 +1,12 @@
-use std::collections::BTreeMap;
-
 use duckdb::Connection;
 use tempfile::tempdir;
 use top_contract_analysis_rs::analysis::duplicate::{
     build_duplicate_candidates, build_duplicate_candidates_from_contract_rows,
 };
-use top_contract_analysis_rs::models::{DatabaseNftRecord, OwnerBalance, SeedNft, TransferRecord};
+use top_contract_analysis_rs::models::{DatabaseNftRecord, SeedNft};
 #[cfg(feature = "export-snapshot")]
 use top_contract_analysis_rs::store::{write_snapshot_rows_to_parquet, SnapshotExportRow};
-use top_contract_analysis_rs::store::{
-    ContractSignalCache, DuckDbFeatureStore, DuckDbResourceOptions,
-};
+use top_contract_analysis_rs::store::{DuckDbFeatureStore, DuckDbResourceOptions};
 
 fn parquet_path_literal(path: &std::path::Path) -> String {
     path.to_string_lossy().replace('\\', "/")
@@ -1380,48 +1376,6 @@ fn feature_store_uses_max_recall_rows_as_batch_size_after_sql_recall() {
         .map(|row| row.contract_address.as_str())
         .collect();
     assert_eq!(contracts, vec!["0xone", "0xtwo"]);
-}
-
-#[test]
-fn signal_cache_round_trips_transfers_and_owners() {
-    let cache = ContractSignalCache::new(":memory:").unwrap();
-    let transfers = vec![
-        TransferRecord::mint("0xdup", "1", 100, "0xminter"),
-        TransferRecord::transfer("0xdup", "1", 160, "0xminter", "0xbuyer"),
-    ];
-    let owners = vec![OwnerBalance {
-        owner_address: "0xbuyer".into(),
-        token_balances: BTreeMap::from([("1".into(), 1)]),
-    }];
-
-    cache
-        .put("ethereum", "0xdup", "ERC721", &transfers, &owners)
-        .unwrap();
-    let cached = cache.get("ethereum", "0xdup", "ERC721").unwrap().unwrap();
-
-    assert_eq!(cached.transfers.len(), 2);
-    assert_eq!(cached.owners.len(), 1);
-    assert_eq!(cached.mint_recipients, vec!["0xminter"]);
-    assert_eq!(cached.active_sellers, vec!["0xminter"]);
-    assert_eq!(cached.address_signals.mint_count, 1);
-    assert_eq!(cached.victim_signals.unwrap().owner_count, 1);
-}
-
-#[test]
-fn signal_cache_stores_empty_victim_signals_when_owners_are_empty() {
-    let cache = ContractSignalCache::new(":memory:").unwrap();
-    let transfers = vec![TransferRecord::mint("0xdup", "1", 100, "0xminter")];
-
-    cache
-        .put("ethereum", "0xdup", "ERC721", &transfers, &[])
-        .unwrap();
-    let cached = cache.get("ethereum", "0xdup", "ERC721").unwrap().unwrap();
-    let victim_signals = cached.victim_signals.unwrap();
-
-    assert_eq!(victim_signals.owner_count, 0);
-    assert_eq!(victim_signals.stuck_holder_count, 0);
-    assert_eq!(victim_signals.stuck_holder_ratio, Some(0.0));
-    assert_eq!(victim_signals.victim_wallet_count, 0);
 }
 
 #[cfg(feature = "export-snapshot")]

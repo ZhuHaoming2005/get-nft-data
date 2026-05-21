@@ -49,8 +49,6 @@ pub struct AnalyzeArgs {
     pub feature_parquet: String,
     #[arg(long, default_value = ":memory:")]
     pub feature_db: String,
-    #[arg(long, default_value = ":memory:")]
-    pub signal_cache_db: String,
 }
 
 #[derive(Args, Debug)]
@@ -89,8 +87,6 @@ pub struct BatchArgs {
     pub feature_parquet: String,
     #[arg(long, default_value = ":memory:")]
     pub feature_db: String,
-    #[arg(long, default_value = ":memory:")]
-    pub signal_cache_db: String,
     #[arg(long, default_value_t = 0)]
     pub max_recall_rows: usize,
     #[arg(long, default_value_t = 0)]

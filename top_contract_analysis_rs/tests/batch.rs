@@ -100,8 +100,8 @@ impl FeatureStoreReader for CapturingBatchFeatureStore {
 
 #[derive(Default)]
 struct BatchPipelineProbe {
-    seed_one_snapshot_active: AtomicBool,
-    seed_two_context_overlapped_snapshot: AtomicBool,
+    snapshot_active: AtomicUsize,
+    later_context_overlapped_snapshot: AtomicBool,
     cpu_current: AtomicUsize,
     cpu_max_seen: AtomicUsize,
     transfer_current: AtomicUsize,
@@ -168,11 +168,7 @@ impl FeatureStoreReader for InstrumentedFeatureStore {
             .first()
             .map(|seed| seed.contract_address.as_str())
             .unwrap_or_default();
-        if seed_address == "0xseed1" {
-            self.probe
-                .seed_one_snapshot_active
-                .store(true, Ordering::SeqCst);
-        }
+        self.probe.snapshot_active.fetch_add(1, Ordering::SeqCst);
         if self.wait_for_transfer_before_seed_two_snapshot && seed_address == "0xseed2" {
             let mut waited = 0;
             while self.probe.transfer_current.load(Ordering::SeqCst) == 0 && waited < 1000 {
@@ -183,11 +179,7 @@ impl FeatureStoreReader for InstrumentedFeatureStore {
         if self.sleep_ms > 0 {
             std::thread::sleep(Duration::from_millis(self.sleep_ms));
         }
-        if seed_address == "0xseed1" {
-            self.probe
-                .seed_one_snapshot_active
-                .store(false, Ordering::SeqCst);
-        }
+        self.probe.snapshot_active.fetch_sub(1, Ordering::SeqCst);
         self.probe.cpu_current.fetch_sub(1, Ordering::SeqCst);
 
         let seed = seed_nfts.first().cloned().unwrap_or_default();
@@ -255,8 +247,12 @@ impl AnalyzeApi for InstrumentedBatchApi {
         contract_address: &str,
     ) -> Result<ContractMetadata, AppError> {
         let is_seed_contract = contract_address.starts_with("0xseed");
+        let seed_metadata_call_index = if is_seed_contract {
+            Some(self.probe.metadata_calls.fetch_add(1, Ordering::SeqCst))
+        } else {
+            None
+        };
         if is_seed_contract {
-            self.probe.metadata_calls.fetch_add(1, Ordering::SeqCst);
             let current = self.probe.metadata_current.fetch_add(1, Ordering::SeqCst) + 1;
             BatchPipelineProbe::record_max(&self.probe.metadata_max_seen, current);
         } else {
@@ -270,15 +266,15 @@ impl AnalyzeApi for InstrumentedBatchApi {
                 + 1;
             BatchPipelineProbe::record_max(&self.probe.candidate_metadata_max_seen, current);
         }
-        if is_seed_contract && contract_address == "0xseed2" {
+        if seed_metadata_call_index.is_some_and(|index| index > 0) {
             let mut waited = 0;
-            while !self.probe.seed_one_snapshot_active.load(Ordering::SeqCst) && waited < 100 {
+            while self.probe.snapshot_active.load(Ordering::SeqCst) == 0 && waited < 100 {
                 tokio::time::sleep(Duration::from_millis(1)).await;
                 waited += 1;
             }
-            if self.probe.seed_one_snapshot_active.load(Ordering::SeqCst) {
+            if self.probe.snapshot_active.load(Ordering::SeqCst) > 0 {
                 self.probe
-                    .seed_two_context_overlapped_snapshot
+                    .later_context_overlapped_snapshot
                     .store(true, Ordering::SeqCst);
             }
         }
@@ -878,7 +874,6 @@ async fn batch_skips_cached_seed_reports_in_output_directory() {
     let deps = AnalysisDeps {
         api: Arc::new(FakeBatchApi),
         feature_store: Arc::new(EmptyFeatureStore),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -927,7 +922,6 @@ async fn batch_uses_contract_level_seed_name_for_snapshot_recall() {
     let deps = AnalysisDeps {
         api: Arc::new(FakeBatchApi),
         feature_store,
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -1171,7 +1165,6 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
     let deps = AnalysisDeps {
         api: Arc::new(FakeBatchApi),
         feature_store: Arc::new(EmptyFeatureStore),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -1685,7 +1678,6 @@ async fn batch_uses_seed_network_concurrency_for_uncached_seeds() {
     let deps = AnalysisDeps {
         api: api.clone(),
         feature_store: Arc::new(EmptyFeatureStore),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -1715,7 +1707,6 @@ async fn batch_continues_successful_seed_after_context_failure() {
     let deps = AnalysisDeps {
         api: Arc::new(OneSeedFailsContextApi),
         feature_store: Arc::new(EmptyFeatureStore),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: batch_progress.clone(),
     };
@@ -1768,7 +1759,6 @@ async fn batch_prefetches_later_seed_context_while_earlier_seed_loads_snapshot()
             sleep_ms: 80,
             wait_for_transfer_before_seed_two_snapshot: false,
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -1791,7 +1781,7 @@ async fn batch_prefetches_later_seed_context_while_earlier_seed_loads_snapshot()
     assert_eq!(probe.metadata_calls.load(Ordering::SeqCst), 2);
     assert_eq!(probe.snapshot_batch_calls.load(Ordering::SeqCst), 0);
     assert!(probe
-        .seed_two_context_overlapped_snapshot
+        .later_context_overlapped_snapshot
         .load(Ordering::SeqCst));
 }
 
@@ -1811,7 +1801,6 @@ async fn batch_limits_cpu_stage_globally() {
             sleep_ms: 60,
             wait_for_transfer_before_seed_two_snapshot: false,
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -1851,7 +1840,6 @@ async fn batch_loads_snapshots_per_seed_without_seed_chunks() {
             sleep_ms: 0,
             wait_for_transfer_before_seed_two_snapshot: false,
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -1892,7 +1880,6 @@ async fn batch_seed_network_limit_controls_seed_context_metadata_fetches() {
             sleep_ms: 0,
             wait_for_transfer_before_seed_two_snapshot: false,
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -1932,7 +1919,6 @@ async fn batch_limits_contract_analysis_globally_across_seeds() {
             sleep_ms: 80,
             wait_for_transfer_before_seed_two_snapshot: false,
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -1979,7 +1965,6 @@ async fn batch_keeps_match_contract_worker_slot_through_sale_metrics() {
             sleep_ms: 0,
             wait_for_transfer_before_seed_two_snapshot: true,
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -2025,7 +2010,6 @@ async fn batch_progress_reporter_receives_seed_lifecycle_events() {
     let deps = AnalysisDeps {
         api: Arc::new(FakeBatchApi),
         feature_store: Arc::new(EmptyFeatureStore),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: batch_progress.clone(),
     };
@@ -2095,7 +2079,6 @@ async fn batch_progress_reporter_counts_cached_seed_reports() {
     let deps = AnalysisDeps {
         api: Arc::new(FakeBatchApi),
         feature_store: Arc::new(EmptyFeatureStore),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: batch_progress.clone(),
     };

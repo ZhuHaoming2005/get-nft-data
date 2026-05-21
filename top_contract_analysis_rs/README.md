@@ -20,7 +20,7 @@
 - `src/constants.rs`：`export-snapshot` 的 PostgreSQL 连接常量
 - `src/analysis`：重复合约分析逻辑
 - `src/reporting`：JSON / Markdown 报告渲染
-- `src/store`：DuckDB 特征库、Postgres 快照导出、signal cache
+- `src/store`：DuckDB 特征库、Postgres 快照导出
 - `tests`：集成测试
 
 ## 构建与测试
@@ -82,7 +82,6 @@ cargo run --release -- analyze \
   --opensea-api-key "2d17a25e68714720883ac996f5459b17" \
   --feature-parquet ../output/top_contract_analysis/ethereum.parquet \
   --feature-db ../output/top_contract_analysis/features.duckdb \
-  --signal-cache-db ../output/top_contract_analysis/signals.duckdb \
   --max-recall-rows 30000000 \
   --api-max-concurrency 8 \
   --duckdb-memory-limit 50GB \
@@ -122,7 +121,6 @@ cargo run --release -- batch \
   --opensea-api-key "2d17a25e68714720883ac996f5459b17" \
   --feature-parquet ../output/top_contract_analysis/ethereum.parquet \
   --feature-db ../output/top_contract_analysis/features.duckdb \
-  --signal-cache-db ../output/top_contract_analysis/signals.duckdb \
   --output-dir ./result \
   --max-recall-rows 30000000 \
   --api-max-concurrency 4 \
@@ -157,12 +155,11 @@ cargo run --release -- batch \
 ## 补充说明
 
 - `--feature-db` 默认是 `:memory:`。如果你希望 DuckDB 状态跨进程保留，请传文件路径。
-- `--signal-cache-db` 默认是 `:memory:`。如果你希望 transfers / owners 的 signal cache 跨运行保留，请传文件路径。
 - HTTP API 默认最多请求 5 次；429、408、5xx 和网络错误会重试，每次重试之间等待 500ms。400 等非临时客户端错误不会等待重试。
 - 如果不传 `--feature-parquet`，程序会假设 DuckDB 特征库里已经有可用数据集。
 - 如果同时传了 `--feature-db` 和 `--feature-parquet`，且 `feature-db` 中该链已经有当前版本数据，则会复用 `feature-db`；如果没有该链数据，才从 Parquet 导入。旧版本 `feature-db` / 旧快照缺少预计算列会直接报错，需要重新运行 `export-snapshot`。
 - 当前快照 schema 强制包含 `metadata_json`、`token_uri_norm`、`image_uri_norm`、`name_norm`。metadata 文档不再持久化，召回和最终复核都从 `metadata_json` 派生；SQL recall 会先用规范化 URI/name 列做精确召回，metadata recall 则在 Rust 侧从 `metadata_json` 构建 sketch/source candidate 和 BM25 prefilter。
 - duplicate scoring 使用合约级聚合：查重阶段每个候选合约只用代表 token 评分，BM25 metadata scoring 会复用缓存的 token、term frequency 和文档长度；合约命中后，分析阶段会通过 Alchemy `getNFTsForContract` 拉取该合约下全量 NFT，用于 NFT 级报告、地址和交易统计。
 - `batch` 按 seed 流式调度：每个 seed 依次经过三阶段：seed context 网络 IO 阶段、DuckDB recall / duplicate scoring CPU 阶段、matched contract 分析阶段。第三阶段不占用 seed 级网络或 CPU 槽位，因此某个 seed 正在分析 matched contracts 时，其他 seed 仍可进入第一、第二阶段；matched contract 合约级分析固定串行执行，合约内部的 API 请求仍统一计入全局 `--api-max-concurrency`。
-- `batch` 的资源在整个进程内全局复用：API client、HTTP semaphore、DuckDB feature store、signal cache 不按并发槽位复制，避免重复占用内存。
+- `batch` 的资源在整个进程内全局复用：API client、HTTP semaphore、DuckDB feature store 不按并发槽位复制，避免重复占用内存。
 - `batch` 的并发参数都是全局限制：`--seed-network-max-concurrency` 控制同时参与第一阶段网络 IO 的 seed 数，`--seed-cpu-max-concurrency` 控制同时参与第二阶段 DuckDB recall / duplicate scoring 的 seed 数，`--api-max-concurrency` 控制全局 HTTP 请求并发。sale metric 和 mint value-flow 不再有单独并发参数，它们的 API 请求统一走 `--api-max-concurrency`。默认 `--seed-cpu-max-concurrency 1`，避免多个 seed 同时打满 DuckDB / Rayon CPU。

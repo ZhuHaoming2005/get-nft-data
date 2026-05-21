@@ -7,7 +7,7 @@ use tempfile::tempdir;
 use tokio::time::{sleep, Duration};
 use top_contract_analysis_rs::analysis::{
     analyze_seed_contract, AnalysisDeps, AnalyzeApi, AnalyzeRequest, CandidateSeedHolderRequest,
-    FeatureStoreReader, SignalCacheStore,
+    FeatureStoreReader,
 };
 use top_contract_analysis_rs::error::AppError;
 use top_contract_analysis_rs::models::{
@@ -25,7 +25,6 @@ use top_contract_analysis_rs::progress::{NoopBatchProgressReporter, NoopProgress
 use top_contract_analysis_rs::reporting::{
     default_output_basename, render_human_readable_report, write_outputs_to_directory,
 };
-use top_contract_analysis_rs::store::CachedSignals;
 
 struct FakeFeatureStore {
     snapshot: DatabaseSnapshot,
@@ -2632,6 +2631,7 @@ struct ConcurrentSingleContractFetchApi {
     max_fetches: AtomicUsize,
     active_post_signal_fetches: AtomicUsize,
     max_post_signal_fetches: AtomicUsize,
+    market_event_fetch_count: AtomicUsize,
 }
 
 impl ConcurrentSingleContractFetchApi {
@@ -2641,6 +2641,7 @@ impl ConcurrentSingleContractFetchApi {
             max_fetches: AtomicUsize::new(0),
             active_post_signal_fetches: AtomicUsize::new(0),
             max_post_signal_fetches: AtomicUsize::new(0),
+            market_event_fetch_count: AtomicUsize::new(0),
         }
     }
 
@@ -2787,6 +2788,7 @@ impl AnalyzeApi for ConcurrentSingleContractFetchApi {
         contract_address: &str,
         _opensea_api_key: &str,
     ) -> Result<Vec<NftMarketEventRecord>, AppError> {
+        self.market_event_fetch_count.fetch_add(1, Ordering::SeqCst);
         self.post_signal_overlap_delay().await;
         Ok(vec![NftMarketEventRecord {
             contract_address: contract_address.to_string(),
@@ -3548,105 +3550,6 @@ impl AnalyzeApi for ConcurrentSaleMetricApi {
     }
 }
 
-#[derive(Default)]
-struct FakeSignalCache {
-    rows: Mutex<BTreeMap<(String, String, String), CachedSignals>>,
-}
-
-impl SignalCacheStore for FakeSignalCache {
-    fn get(
-        &self,
-        chain: &str,
-        contract_address: &str,
-        token_type: &str,
-    ) -> Result<Option<CachedSignals>, AppError> {
-        Ok(self
-            .rows
-            .lock()
-            .unwrap()
-            .get(&(
-                chain.to_string(),
-                contract_address.to_lowercase(),
-                token_type.to_string(),
-            ))
-            .cloned())
-    }
-
-    fn put(
-        &self,
-        chain: &str,
-        contract_address: &str,
-        token_type: &str,
-        transfers: &[TransferRecord],
-        owners: &[OwnerBalance],
-    ) -> Result<(), AppError> {
-        self.rows.lock().unwrap().insert(
-            (
-                chain.to_string(),
-                contract_address.to_lowercase(),
-                token_type.to_string(),
-            ),
-            CachedSignals {
-                mint_recipients: vec!["0xminter".into()],
-                active_sellers: vec!["0xminter".into(), "0xvictim".into()],
-                address_signals: top_contract_analysis_rs::analysis::signals::analyze_transfer_signals(
-                    transfers,
-                ),
-                victim_signals: Some(VictimSignalPayload {
-                    owner_count: 1,
-                    stuck_holder_count: 1,
-                    stuck_holder_ratio: Some(1.0),
-                    victim_wallet_count: 1,
-                }),
-                transfers: transfers.to_vec(),
-                owners: owners.to_vec(),
-            },
-        );
-        Ok(())
-    }
-}
-
-struct MissingVictimSignalCache;
-
-impl SignalCacheStore for MissingVictimSignalCache {
-    fn get(
-        &self,
-        _chain: &str,
-        contract_address: &str,
-        _token_type: &str,
-    ) -> Result<Option<CachedSignals>, AppError> {
-        let transfers = vec![
-            TransferRecord::mint(contract_address, "1", 100, "0xminter"),
-            TransferRecord::transfer(contract_address, "1", 160, "0xminter", "0xbuyer"),
-        ];
-        let owners = vec![OwnerBalance {
-            owner_address: "0xbuyer".into(),
-            token_balances: BTreeMap::from([("1".into(), 1)]),
-        }];
-        Ok(Some(CachedSignals {
-            mint_recipients: vec!["0xminter".into()],
-            active_sellers: vec!["0xminter".into()],
-            address_signals: top_contract_analysis_rs::analysis::signals::analyze_transfer_signals(
-                &transfers,
-            ),
-            victim_signals: None,
-            transfers,
-            owners,
-        }))
-    }
-
-    fn put(
-        &self,
-        _chain: &str,
-        _contract_address: &str,
-        _token_type: &str,
-        _transfers: &[TransferRecord],
-        _owners: &[OwnerBalance],
-    ) -> Result<(), AppError> {
-        Ok(())
-    }
-}
-
 #[test]
 fn default_output_basename_matches_existing_prefix() {
     let payload = SingleReportPayload {
@@ -4241,7 +4144,6 @@ async fn analyze_moves_official_reissues_into_legit_duplicates() {
                 ..DatabaseSnapshot::default()
             },
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -4305,7 +4207,6 @@ async fn analyze_moves_same_opensea_collection_candidates_into_legit_duplicates(
                 ..DatabaseSnapshot::default()
             },
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -4354,7 +4255,6 @@ async fn analyze_builds_expected_summary_counts() {
                 ..DatabaseSnapshot::default()
             },
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -4385,7 +4285,6 @@ async fn analyze_uses_contract_level_seed_name_for_snapshot_recall() {
     let deps = AnalysisDeps {
         api: Arc::new(FakeApi),
         feature_store,
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -4429,7 +4328,6 @@ async fn analyze_excludes_candidate_contract_that_currently_holds_seed_nft() {
                 ..DatabaseSnapshot::default()
             },
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -4479,7 +4377,6 @@ async fn analyze_excludes_candidate_contract_with_seed_transfer_history() {
                 ..DatabaseSnapshot::default()
             },
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -4527,7 +4424,6 @@ async fn analyze_keeps_wrapper_named_candidate_without_chain_seed_relation() {
                 ..DatabaseSnapshot::default()
             },
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -4578,7 +4474,6 @@ async fn analyze_keeps_locally_wrapper_named_candidate_without_chain_seed_relati
                 ..DatabaseSnapshot::default()
             },
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -4625,7 +4520,6 @@ async fn analyze_marks_seed_open_license_and_skips_suspected_contracts() {
                 ..DatabaseSnapshot::default()
             },
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -4654,7 +4548,6 @@ async fn analyze_writes_default_json_and_markdown_files() {
         feature_store: Arc::new(FakeFeatureStore {
             snapshot: DatabaseSnapshot::default(),
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -4701,7 +4594,6 @@ async fn analyze_enriches_duplicate_contracts_with_signals_and_infringing_tokens
                 ..DatabaseSnapshot::default()
             },
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -4823,7 +4715,6 @@ async fn analyze_filters_candidates_deployed_before_seed_contract() {
                 ..DatabaseSnapshot::default()
             },
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -4877,7 +4768,6 @@ async fn analyze_expands_matched_contracts_to_all_tokens_for_report_analysis() {
                 ..DatabaseSnapshot::default()
             },
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -4956,7 +4846,6 @@ async fn analyze_falls_back_to_local_snapshot_when_provider_expansion_is_empty()
                 ..DatabaseSnapshot::default()
             },
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -4998,7 +4887,6 @@ async fn analyze_ignores_symbol_only_candidate_contracts() {
                 ..DatabaseSnapshot::default()
             },
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -5043,7 +4931,6 @@ async fn analyze_builds_address_profiles_and_trade_stats_for_duplicate_contracts
                 ..DatabaseSnapshot::default()
             },
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -5135,7 +5022,7 @@ async fn analyze_builds_address_profiles_and_trade_stats_for_duplicate_contracts
 }
 
 #[tokio::test]
-async fn analyze_reuses_signal_cache_for_transfers_and_owners() {
+async fn analyze_fetches_transfers_and_owners_on_each_run() {
     let api = Arc::new(CountingApi::new());
     let deps = AnalysisDeps {
         api: api.clone(),
@@ -5155,7 +5042,6 @@ async fn analyze_reuses_signal_cache_for_transfers_and_owners() {
                 ..DatabaseSnapshot::default()
             },
         }),
-        signal_cache: Some(Arc::new(FakeSignalCache::default())),
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -5169,8 +5055,8 @@ async fn analyze_reuses_signal_cache_for_transfers_and_owners() {
     let first = analyze_seed_contract(request.clone(), &deps).await.unwrap();
     let second = analyze_seed_contract(request, &deps).await.unwrap();
 
-    assert_eq!(api.transfer_fetch_count.load(Ordering::SeqCst), 1);
-    assert_eq!(api.owner_fetch_count.load(Ordering::SeqCst), 1);
+    assert_eq!(api.transfer_fetch_count.load(Ordering::SeqCst), 2);
+    assert_eq!(api.owner_fetch_count.load(Ordering::SeqCst), 2);
     assert_eq!(
         first.address_signals["0xdup"],
         second.address_signals["0xdup"]
@@ -5179,47 +5065,6 @@ async fn analyze_reuses_signal_cache_for_transfers_and_owners() {
         first.victim_signals["0xdup"],
         second.victim_signals["0xdup"]
     );
-}
-
-#[tokio::test]
-async fn analyze_recovers_signal_cache_rows_without_victim_signals() {
-    let deps = AnalysisDeps {
-        api: Arc::new(CountingApi::new()),
-        feature_store: Arc::new(FakeFeatureStore {
-            snapshot: DatabaseSnapshot {
-                nft_rows: vec![DatabaseNftRecord {
-                    contract_address: "0xdup".into(),
-                    token_id: "1".into(),
-                    token_uri: "ipfs://seed/1".into(),
-                    image_uri: "ipfs://image/1.png".into(),
-                    name: "Azuki Mirror #1".into(),
-                    symbol: "AZUKI".into(),
-                    metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                    metadata_recall_checked: false,
-                    metadata_recall_match: false,
-                }],
-                ..DatabaseSnapshot::default()
-            },
-        }),
-        signal_cache: Some(Arc::new(MissingVictimSignalCache)),
-        progress: Arc::new(NoopProgressReporter),
-        batch_progress: Arc::new(NoopBatchProgressReporter),
-    };
-
-    let payload = analyze_seed_contract(
-        AnalyzeRequest {
-            chain: "ethereum".into(),
-            seed_contract_address: "0xseed".into(),
-            alchemy_api_key: "key".into(),
-            ..AnalyzeRequest::default()
-        },
-        &deps,
-    )
-    .await
-    .expect("cache rows without victim signals should be recomputed from cached rows");
-
-    assert_eq!(payload.victim_signals["0xdup"].owner_count, 1);
-    assert_eq!(payload.victim_signals["0xdup"].stuck_holder_count, 1);
 }
 
 #[tokio::test]
@@ -5242,7 +5087,6 @@ async fn analyze_computes_native_eth_sale_metrics_for_secondary_sale_victim_addr
                 ..DatabaseSnapshot::default()
             },
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -5322,7 +5166,6 @@ async fn analyze_sale_metrics_are_keyed_by_transaction_and_buyer() {
                 ..DatabaseSnapshot::default()
             },
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -5390,7 +5233,6 @@ async fn analyze_processes_duplicate_contracts_within_a_seed_serially() {
                 ..DatabaseSnapshot::default()
             },
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -5449,7 +5291,6 @@ async fn analyze_waits_for_one_matched_contract_before_starting_the_next() {
                 ..DatabaseSnapshot::default()
             },
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -5496,7 +5337,6 @@ async fn analyze_computes_sale_metrics_concurrently_within_a_contract() {
                 ..DatabaseSnapshot::default()
             },
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -5542,7 +5382,6 @@ async fn analyze_prefetches_sale_metrics_per_buyer_with_shared_transaction_hash(
                 ..DatabaseSnapshot::default()
             },
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -5587,7 +5426,6 @@ async fn analyze_prefetches_sale_metrics_only_for_latest_buyer_purchase() {
                 ..DatabaseSnapshot::default()
             },
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -5632,7 +5470,6 @@ async fn analyze_fetches_contract_inputs_concurrently_within_one_contract() {
                 ..DatabaseSnapshot::default()
             },
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -5657,7 +5494,7 @@ async fn analyze_fetches_contract_inputs_concurrently_within_one_contract() {
 }
 
 #[tokio::test]
-async fn analyze_fetches_post_signal_inputs_concurrently_within_one_contract() {
+async fn analyze_fetches_sales_and_mint_value_flow_without_market_events() {
     let api = Arc::new(ConcurrentSingleContractFetchApi::new());
     let deps = AnalysisDeps {
         api: api.clone(),
@@ -5677,7 +5514,6 @@ async fn analyze_fetches_post_signal_inputs_concurrently_within_one_contract() {
                 ..DatabaseSnapshot::default()
             },
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -5696,10 +5532,11 @@ async fn analyze_fetches_post_signal_inputs_concurrently_within_one_contract() {
     .unwrap();
 
     assert_eq!(payload.duplicate_contracts.len(), 1);
-    assert!(!payload.market_events.is_empty());
+    assert!(payload.market_events.is_empty());
+    assert_eq!(api.market_event_fetch_count.load(Ordering::SeqCst), 0);
     assert!(
         api.max_post_signal_fetches.load(Ordering::SeqCst) >= 2,
-        "expected sales/market-events/mint value-flow fetches to overlap within one contract"
+        "expected sales/mint value-flow fetches to overlap within one contract"
     );
 }
 
@@ -5737,7 +5574,6 @@ async fn analyze_deduplicates_mint_value_flow_transfer_lookups_by_block_and_addr
                 ..DatabaseSnapshot::default()
             },
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
@@ -5796,7 +5632,6 @@ async fn analyze_traces_multi_hop_cashout_and_classifies_known_destinations() {
                 ..DatabaseSnapshot::default()
             },
         }),
-        signal_cache: None,
         progress: Arc::new(NoopProgressReporter),
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
