@@ -1,6 +1,71 @@
 use assert_cmd::Command;
+use clap::Parser;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
+use top_contract_analysis_rs::api::DEFAULT_OTHER_API_RATE_LIMIT_INTERVAL_MS;
+use top_contract_analysis_rs::cli::{Command as CliCommand, TopContractAnalysisCli};
+
+#[test]
+fn cli_defaults_other_api_rate_limit_burst_to_four() {
+    let analyze = TopContractAnalysisCli::parse_from([
+        "top_contract_analysis_rs",
+        "analyze",
+        "--seed-contract-address",
+        "0xseed",
+    ]);
+    let CliCommand::Analyze(analyze_args) = analyze.command else {
+        panic!("expected analyze command");
+    };
+    assert_eq!(analyze_args.other_api_max_concurrency, 4);
+    assert_eq!(
+        analyze_args.other_api_rate_limit_refill_ms,
+        DEFAULT_OTHER_API_RATE_LIMIT_INTERVAL_MS
+    );
+
+    let batch = TopContractAnalysisCli::parse_from([
+        "top_contract_analysis_rs",
+        "batch",
+        "--seed-file",
+        "seeds.txt",
+    ]);
+    let CliCommand::Batch(batch_args) = batch.command else {
+        panic!("expected batch command");
+    };
+    assert_eq!(batch_args.other_api_max_concurrency, 4);
+    assert_eq!(
+        batch_args.other_api_rate_limit_refill_ms,
+        DEFAULT_OTHER_API_RATE_LIMIT_INTERVAL_MS
+    );
+}
+
+#[test]
+fn cli_accepts_custom_other_api_rate_limit_refill_ms() {
+    let analyze = TopContractAnalysisCli::parse_from([
+        "top_contract_analysis_rs",
+        "analyze",
+        "--seed-contract-address",
+        "0xseed",
+        "--other-api-rate-limit-refill-ms",
+        "450",
+    ]);
+    let CliCommand::Analyze(analyze_args) = analyze.command else {
+        panic!("expected analyze command");
+    };
+    assert_eq!(analyze_args.other_api_rate_limit_refill_ms, 450);
+
+    let batch = TopContractAnalysisCli::parse_from([
+        "top_contract_analysis_rs",
+        "batch",
+        "--seed-file",
+        "seeds.txt",
+        "--other-api-rate-limit-refill-ms",
+        "450",
+    ]);
+    let CliCommand::Batch(batch_args) = batch.command else {
+        panic!("expected batch command");
+    };
+    assert_eq!(batch_args.other_api_rate_limit_refill_ms, 450);
+}
 
 #[test]
 fn analyze_subcommand_accepts_existing_flag_names() {

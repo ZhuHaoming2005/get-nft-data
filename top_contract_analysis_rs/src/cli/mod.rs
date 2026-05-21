@@ -1,5 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 
+use crate::api::{DEFAULT_OTHER_API_RATE_LIMIT_BURST, DEFAULT_OTHER_API_RATE_LIMIT_INTERVAL_MS};
+
 #[derive(Parser, Debug)]
 pub struct TopContractAnalysisCli {
     #[command(subcommand)]
@@ -42,9 +44,14 @@ pub struct AnalyzeArgs {
     #[arg(
         long = "other-api-max-concurrency",
         alias = "api-max-concurrency",
-        default_value_t = 8
+        default_value_t = DEFAULT_OTHER_API_RATE_LIMIT_BURST
     )]
     pub other_api_max_concurrency: usize,
+    #[arg(
+        long = "other-api-rate-limit-refill-ms",
+        default_value_t = DEFAULT_OTHER_API_RATE_LIMIT_INTERVAL_MS
+    )]
+    pub other_api_rate_limit_refill_ms: u64,
     #[arg(long, default_value_t = 1)]
     pub matched_contract_max_concurrency: usize,
     #[arg(long, default_value_t = 0)]
@@ -88,9 +95,14 @@ pub struct BatchArgs {
     #[arg(
         long = "other-api-max-concurrency",
         alias = "api-max-concurrency",
-        default_value_t = 8
+        default_value_t = DEFAULT_OTHER_API_RATE_LIMIT_BURST
     )]
     pub other_api_max_concurrency: usize,
+    #[arg(
+        long = "other-api-rate-limit-refill-ms",
+        default_value_t = DEFAULT_OTHER_API_RATE_LIMIT_INTERVAL_MS
+    )]
+    pub other_api_rate_limit_refill_ms: u64,
     #[arg(long, default_value_t = 1)]
     pub matched_contract_max_concurrency: usize,
     #[arg(long, default_value_t = 1)]

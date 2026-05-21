@@ -278,10 +278,17 @@ impl RealApi {
         timeout_seconds: u64,
         alchemy_api_max_concurrency: usize,
         other_api_max_concurrency: usize,
+        other_api_rate_limit_refill_ms: u64,
     ) -> Result<Self, AppError> {
         Ok(Self {
             alchemy_client: AsyncApiClient::new(timeout_seconds, alchemy_api_max_concurrency)?,
-            other_client: AsyncApiClient::new(timeout_seconds, other_api_max_concurrency)?,
+            other_client: AsyncApiClient::new_rate_limited_with_retry_policy(
+                timeout_seconds,
+                other_api_max_concurrency,
+                Duration::from_millis(other_api_rate_limit_refill_ms.max(1)),
+                crate::api::DEFAULT_API_RETRIES,
+                Duration::from_millis(crate::api::DEFAULT_API_RETRY_DELAY_MS),
+            )?,
             eth_usd_rate: crate::currency::EthUsdRateCache::default(),
             eth_usd_rate_warning_emitted: AtomicBool::new(false),
         })

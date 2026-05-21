@@ -84,7 +84,7 @@ cargo run --release -- analyze \
   --feature-db ../output/top_contract_analysis/features.duckdb \
   --max-recall-rows 30000000 \
   --alchemy-api-max-concurrency 16 \
-  --other-api-max-concurrency 4 \
+  --other-api-max-concurrency 3 \
   --matched-contract-max-concurrency 16 \
   --duckdb-memory-limit 50GB \
   --duckdb-threads 32
@@ -99,7 +99,8 @@ cargo run --release -- analyze \
 - `--max-tokens-per-contract 500`
 - `--max-recall-rows 100000`：单批 SQL recall 读取行数；`0` 表示单次读取全部。非 `0` 时会分批读取完整 recall 结果。
 - `--alchemy-api-max-concurrency 12`：Alchemy 请求全局并发上限。
-- `--other-api-max-concurrency 4`：OpenSea、Etherscan、ETH/USD 等非 Alchemy 请求全局并发上限。旧参数 `--api-max-concurrency` 仍作为兼容别名。
+- `--other-api-max-concurrency 4`：OpenSea、Etherscan、ETH/USD 等非 Alchemy 请求的速率桶 burst 上限，默认 4；参数值优先。旧参数 `--api-max-concurrency` 仍作为兼容别名。
+- `--other-api-rate-limit-refill-ms 300`：非 Alchemy 请求速率桶补充间隔，默认每 300ms 补充 1 个请求 token。
 - `--matched-contract-max-concurrency 4`：matched contract 分析阶段的合约级全局并发上限。
 - `--duckdb-threads 0`：`0` 表示使用当前可用线程数
 - `--duckdb-memory-limit 80GB`
@@ -128,7 +129,7 @@ cargo run --release -- batch \
   --output-dir ./result \
   --max-recall-rows 30000000 \
   --alchemy-api-max-concurrency 16 \
-  --other-api-max-concurrency 4 \
+  --other-api-max-concurrency 3 \
   --matched-contract-max-concurrency 16 \
   --seed-network-max-concurrency 1 \
   --seed-cpu-max-concurrency 1 \
@@ -146,7 +147,8 @@ cargo run --release -- batch \
 - `--timeout 30`
 - `--seed-network-max-concurrency 4`：同时处于 seed context 网络 IO 阶段的 seed 合约数。
 - `--alchemy-api-max-concurrency 8`：Alchemy 请求全局并发上限。
-- `--other-api-max-concurrency 4`：OpenSea、Etherscan、ETH/USD 等非 Alchemy 请求全局并发上限。旧参数 `--api-max-concurrency` 仍作为兼容别名。
+- `--other-api-max-concurrency 4`：OpenSea、Etherscan、ETH/USD 等非 Alchemy 请求的速率桶 burst 上限，默认 4；参数值优先。旧参数 `--api-max-concurrency` 仍作为兼容别名。
+- `--other-api-rate-limit-refill-ms 300`：非 Alchemy 请求速率桶补充间隔，默认每 300ms 补充 1 个请求 token。
 - `--matched-contract-max-concurrency 4`：matched contract 分析阶段的合约级全局并发上限，跨 seed 共享。
 - `--seed-cpu-max-concurrency 1`：同时处于 seed 级 CPU 密集阶段的 seed 合约数，覆盖 DuckDB recall / duplicate scoring。
 - `--duckdb-threads 0`
@@ -170,4 +172,4 @@ cargo run --release -- batch \
 - duplicate scoring 使用合约级聚合：查重阶段每个候选合约只用代表 token 评分，BM25 metadata scoring 会复用缓存的 token、term frequency 和文档长度；合约命中后，分析阶段会通过 Alchemy `getNFTsForContract` 拉取该合约下全量 NFT，用于 NFT 级报告、地址和交易统计。
 - `batch` 按 seed 流式调度：每个 seed 依次经过三阶段：seed context 网络 IO 阶段、DuckDB recall / duplicate scoring CPU 阶段、matched contract 分析阶段。第三阶段不占用 seed 级网络或 CPU 槽位，因此某个 seed 正在分析 matched contracts 时，其他 seed 仍可进入第一、第二阶段；matched contract 合约级分析跨 seed 共享 `--matched-contract-max-concurrency`，不同 seed 下的 matched 合约可以同时执行。
 - `batch` 的资源在整个进程内全局复用：API client、HTTP semaphore、DuckDB feature store 不按并发槽位复制，避免重复占用内存。
-- `batch` 的并发参数都是全局限制：`--seed-network-max-concurrency` 控制同时参与第一阶段网络 IO 的 seed 数，`--seed-cpu-max-concurrency` 控制同时参与第二阶段 DuckDB recall / duplicate scoring 的 seed 数，`--matched-contract-max-concurrency` 控制第三阶段合约级分析并发，`--alchemy-api-max-concurrency` 和 `--other-api-max-concurrency` 分别控制 Alchemy 与其它 HTTP 请求并发。sale metric 和 mint value-flow 不再有单独并发参数。默认 `--seed-cpu-max-concurrency 1`，避免多个 seed 同时打满 DuckDB / Rayon CPU。
+- `batch` 的并发和速率参数都是全局限制：`--seed-network-max-concurrency` 控制同时参与第一阶段网络 IO 的 seed 数，`--seed-cpu-max-concurrency` 控制同时参与第二阶段 DuckDB recall / duplicate scoring 的 seed 数，`--matched-contract-max-concurrency` 控制第三阶段合约级分析并发，`--alchemy-api-max-concurrency` 控制 Alchemy HTTP 并发，`--other-api-max-concurrency` 控制其它 HTTP 请求的速率桶 burst 上限（默认 4，参数值优先），`--other-api-rate-limit-refill-ms` 控制补充间隔（默认 300ms，每次补 1 个 token）。sale metric 和 mint value-flow 不再有单独并发参数。默认 `--seed-cpu-max-concurrency 1`，避免多个 seed 同时打满 DuckDB / Rayon CPU。

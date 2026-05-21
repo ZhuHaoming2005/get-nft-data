@@ -16,6 +16,8 @@ pub mod opensea;
 pub const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
 pub const DEFAULT_API_RETRIES: usize = 5;
 pub const DEFAULT_API_RETRY_DELAY_MS: u64 = 500;
+pub const DEFAULT_OTHER_API_RATE_LIMIT_INTERVAL_MS: u64 = 300;
+pub const DEFAULT_OTHER_API_RATE_LIMIT_BURST: usize = 4;
 
 #[derive(Clone, Debug)]
 pub struct ApiEndpoints {
@@ -38,10 +40,17 @@ impl ApiEndpoints {
     }
 }
 
+#[derive(Clone, Copy)]
+enum RequestLimitMode {
+    InFlight,
+    Rate,
+}
+
 #[derive(Clone)]
 pub struct AsyncApiClient {
     pub http: reqwest::Client,
     pub request_limit: Arc<Semaphore>,
+    limit_mode: RequestLimitMode,
     retries: usize,
     retry_delay: Duration,
 }
@@ -68,6 +77,39 @@ impl AsyncApiClient {
         Ok(Self {
             http,
             request_limit: Arc::new(Semaphore::new(max_concurrency.max(1))),
+            limit_mode: RequestLimitMode::InFlight,
+            retries: retries.max(1),
+            retry_delay,
+        })
+    }
+
+    pub fn new_rate_limited(timeout_seconds: u64, max_burst: usize) -> Result<Self, AppError> {
+        Self::new_rate_limited_with_retry_policy(
+            timeout_seconds,
+            max_burst,
+            Duration::from_millis(DEFAULT_OTHER_API_RATE_LIMIT_INTERVAL_MS),
+            DEFAULT_API_RETRIES,
+            Duration::from_millis(DEFAULT_API_RETRY_DELAY_MS),
+        )
+    }
+
+    pub fn new_rate_limited_with_retry_policy(
+        timeout_seconds: u64,
+        max_burst: usize,
+        refill_interval: Duration,
+        retries: usize,
+        retry_delay: Duration,
+    ) -> Result<Self, AppError> {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(timeout_seconds))
+            .build()?;
+        let max_burst = max_burst.max(1);
+        let request_limit = Arc::new(Semaphore::new(1));
+        spawn_rate_limiter_refill(request_limit.clone(), max_burst, refill_interval);
+        Ok(Self {
+            http,
+            request_limit,
+            limit_mode: RequestLimitMode::Rate,
             retries: retries.max(1),
             retry_delay,
         })
@@ -87,12 +129,25 @@ impl AsyncApiClient {
         let mut last_error: Option<String> = None;
         for attempt in 1..=self.retries {
             let attempt_error = {
-                let _permit = self
-                    .request_limit
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .map_err(|err| AppError::Http(err.to_string()))?;
+                let _permit = match self.limit_mode {
+                    RequestLimitMode::InFlight => Some(
+                        self.request_limit
+                            .clone()
+                            .acquire_owned()
+                            .await
+                            .map_err(|err| AppError::Http(err.to_string()))?,
+                    ),
+                    RequestLimitMode::Rate => {
+                        let permit = self
+                            .request_limit
+                            .clone()
+                            .acquire_owned()
+                            .await
+                            .map_err(|err| AppError::Http(err.to_string()))?;
+                        permit.forget();
+                        None
+                    }
+                };
                 let mut builder = self.http.request(method.clone(), url);
                 if let Some(headers) = headers.clone() {
                     builder = builder.headers(headers);
@@ -161,6 +216,25 @@ impl AsyncApiClient {
         self.request_json(reqwest::Method::POST, url, Some(body), None)
             .await
     }
+}
+
+fn spawn_rate_limiter_refill(
+    request_limit: Arc<Semaphore>,
+    max_burst: usize,
+    refill_interval: Duration,
+) {
+    let weak_limit = Arc::downgrade(&request_limit);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(refill_interval).await;
+            let Some(limit) = weak_limit.upgrade() else {
+                break;
+            };
+            if limit.available_permits() < max_burst {
+                limit.add_permits(1);
+            }
+        }
+    });
 }
 
 fn should_retry_status(status: reqwest::StatusCode) -> bool {

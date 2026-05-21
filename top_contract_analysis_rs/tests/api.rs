@@ -68,6 +68,36 @@ async fn spawn_retry_status_server(
     (format!("http://{address}"), attempts, handle)
 }
 
+async fn spawn_fixed_json_server(
+    expected_requests: usize,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        for _ in 0..expected_requests {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0_u8; 8192];
+            let read = stream.read(&mut buffer).await.unwrap();
+            let request = String::from_utf8_lossy(&buffer[..read]);
+            let request_line = request.lines().next().unwrap_or("");
+            assert!(
+                request_line.starts_with("GET /rate HTTP/1.1"),
+                "unexpected request line: {request_line}",
+            );
+
+            let payload = r#"{"ok":true}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                payload.len(),
+                payload
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+    });
+    (format!("http://{address}"), handle)
+}
+
 async fn spawn_holding_json_server(
     hold_for: Duration,
 ) -> (
@@ -125,6 +155,71 @@ async fn api_client_error_includes_status_and_response_body() {
     assert!(
         message.contains("asset_contract_address is not supported"),
         "{message}"
+    );
+}
+
+#[tokio::test]
+async fn rate_limited_api_client_spaces_request_starts_by_refill_interval() {
+    let (base_url, server) = spawn_fixed_json_server(3).await;
+    let client = AsyncApiClient::new_rate_limited_with_retry_policy(
+        5,
+        1,
+        Duration::from_millis(100),
+        DEFAULT_API_RETRIES,
+        Duration::ZERO,
+    )
+    .unwrap();
+    let url = format!("{base_url}/rate");
+
+    let started = Instant::now();
+    let (first, second, third) = tokio::join!(
+        client.get_json::<serde_json::Value>(&url),
+        client.get_json::<serde_json::Value>(&url),
+        client.get_json::<serde_json::Value>(&url),
+    );
+
+    first.unwrap();
+    second.unwrap();
+    third.unwrap();
+    server.await.unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_millis(180),
+        "expected three concurrent requests to consume one token per refill interval"
+    );
+}
+
+#[tokio::test]
+async fn rate_limited_api_client_uses_configured_signal_permit_limit() {
+    let (base_url, server) = spawn_fixed_json_server(5).await;
+    let client = AsyncApiClient::new_rate_limited_with_retry_policy(
+        5,
+        5,
+        Duration::from_millis(500),
+        DEFAULT_API_RETRIES,
+        Duration::ZERO,
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    let url = format!("{base_url}/rate");
+
+    let started = Instant::now();
+    let (first, second, third, fourth, fifth) = tokio::join!(
+        client.get_json::<serde_json::Value>(&url),
+        client.get_json::<serde_json::Value>(&url),
+        client.get_json::<serde_json::Value>(&url),
+        client.get_json::<serde_json::Value>(&url),
+        client.get_json::<serde_json::Value>(&url),
+    );
+
+    first.unwrap();
+    second.unwrap();
+    third.unwrap();
+    fourth.unwrap();
+    fifth.unwrap();
+    server.await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "expected the configured five-token burst to override the default four-token limit"
     );
 }
 

@@ -43,6 +43,7 @@ fn main() -> Result<(), AppError> {
                 args.timeout,
                 args.alchemy_api_max_concurrency,
                 args.other_api_max_concurrency,
+                args.other_api_rate_limit_refill_ms,
             )?;
             let deps = AnalysisDeps {
                 api: Arc::new(api),
@@ -93,6 +94,7 @@ fn main() -> Result<(), AppError> {
                 args.timeout,
                 args.alchemy_api_max_concurrency,
                 args.other_api_max_concurrency,
+                args.other_api_rate_limit_refill_ms,
             )?;
             let deps = AnalysisDeps {
                 api: Arc::new(api),
