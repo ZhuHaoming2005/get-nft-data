@@ -2,19 +2,18 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use futures::{stream, StreamExt};
 use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
 
 use crate::error::AppError;
 use crate::models::{BatchSummaryPayload, OutputFilesPayload, SingleReportPayload};
-use crate::progress::SeedProgressReporter;
 use crate::reporting::write_outputs_to_directory;
 
 use super::summary::{build_batch_report_summary, build_batch_seed_aggregate};
 use super::{
-    acquire_optional_limit, analyze_matched_contracts_serially, build_candidate_plan_for_seed,
+    acquire_optional_limit, analyze_matched_contracts_parallel, build_candidate_plan_for_seed,
     fetch_seed_context, finalize_seed_report, prepare_seed_analysis_state, AnalysisDeps,
-    AnalyzeRequest, BatchRequest, BatchSeedAggregate, SeedAnalysisState,
+    AnalyzeRequest, BatchRequest, BatchSeedAggregate,
 };
 
 fn analyze_request_for_batch_seed(
@@ -32,15 +31,10 @@ fn analyze_request_for_batch_seed(
         metadata_threshold: request.metadata_threshold,
         timeout_seconds: request.timeout_seconds,
         api_max_concurrency: request.api_max_concurrency,
+        matched_contract_max_concurrency: request.matched_contract_max_concurrency,
         max_tokens_per_contract: request.max_tokens_per_contract,
         max_recall_rows: request.max_recall_rows,
     }
-}
-
-struct PreparedBatchSeed {
-    seed_address: String,
-    progress: Arc<dyn SeedProgressReporter>,
-    state: SeedAnalysisState,
 }
 
 pub async fn run_batch(
@@ -64,16 +58,21 @@ pub async fn run_batch(
     let seed_cpu_max_concurrency = request.seed_cpu_max_concurrency.max(1);
     let cpu_limit = Arc::new(Semaphore::new(seed_cpu_max_concurrency));
     let seed_network_limit = Arc::new(Semaphore::new(seed_network_max_concurrency));
+    let matched_contract_limit = Arc::new(Semaphore::new(
+        request.matched_contract_max_concurrency.max(1),
+    ));
     let mut fresh_entries = Vec::new();
     let mut first_error: Option<AppError> = None;
     let output_dir = request.output_dir.clone();
-    let mut prepared_seeds = JoinSet::new();
-    for seed_address in pending_seeds {
+    let pending_seed_count = pending_seeds.len().max(1);
+    let mut seed_tasks = stream::iter(pending_seeds.into_iter().map(|seed_address| {
         let per_seed_request = analyze_request_for_batch_seed(&request, seed_address.clone());
         let deps = deps.clone();
         let seed_network_limit = seed_network_limit.clone();
         let cpu_limit = cpu_limit.clone();
-        prepared_seeds.spawn(async move {
+        let matched_contract_limit = matched_contract_limit.clone();
+        let output_dir = output_dir.clone();
+        async move {
             let batch_progress = deps.batch_progress.clone();
             let seed_progress = batch_progress.create_seed_reporter(&seed_address);
             let context = {
@@ -110,69 +109,48 @@ pub async fn run_batch(
                 Some((context, plan)),
             )
             .await?;
-            Ok(PreparedBatchSeed {
-                seed_address,
-                progress: seed_progress,
-                state,
-            })
-        });
-    }
-    while let Some(entry) = prepared_seeds.join_next().await {
-        let prepared = match entry {
-            Ok(Ok(prepared)) => prepared,
-            Ok(Err(err)) => {
-                if first_error.is_none() {
-                    first_error = Some(err);
-                }
-                continue;
-            }
-            Err(err) => {
-                if first_error.is_none() {
-                    first_error = Some(AppError::InvalidData(format!(
-                        "batch seed preparation task failed: {err}"
-                    )));
-                }
-                continue;
-            }
-        };
-        let mut state = prepared.state;
-        let result =
-            match analyze_matched_contracts_serially(&mut state, deps, prepared.progress.clone())
-                .await
+            let mut state = state;
+            let result = match analyze_matched_contracts_parallel(
+                &mut state,
+                &deps,
+                seed_progress.clone(),
+                matched_contract_limit,
+            )
+            .await
             {
-                Ok(()) => finalize_seed_report(state, prepared.progress).await,
+                Ok(()) => finalize_seed_report(state, seed_progress).await,
                 Err(err) => Err(err),
             };
-        match result {
-            Ok(payload) => {
-                deps.batch_progress.on_seed_finished(&prepared.seed_address);
-                let (json_path, md_path) = match write_outputs_to_directory(&payload, &output_dir) {
-                    Ok(paths) => paths,
-                    Err(err) => {
-                        if first_error.is_none() {
-                            first_error = Some(err);
-                        }
-                        continue;
-                    }
-                };
-                let mut aggregate = build_batch_seed_aggregate(payload);
-                aggregate.report.output_files = Some(OutputFilesPayload {
-                    json: json_path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned(),
-                    markdown: md_path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned(),
-                });
-                fresh_entries.push(aggregate);
-            }
+            let payload = match result {
+                Ok(payload) => payload,
+                Err(err) => {
+                    batch_progress.on_seed_failed(&seed_address, &err.to_string());
+                    return Err(err);
+                }
+            };
+            batch_progress.on_seed_finished(&seed_address);
+            let (json_path, md_path) = write_outputs_to_directory(&payload, &output_dir)?;
+            let mut aggregate = build_batch_seed_aggregate(payload);
+            aggregate.report.output_files = Some(OutputFilesPayload {
+                json: json_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                markdown: md_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+            });
+            Ok(aggregate)
+        }
+    }))
+    .buffer_unordered(pending_seed_count);
+    while let Some(entry) = seed_tasks.next().await {
+        match entry {
+            Ok(aggregate) => fresh_entries.push(aggregate),
             Err(err) => {
-                deps.batch_progress
-                    .on_seed_failed(&prepared.seed_address, &err.to_string());
                 if first_error.is_none() {
                     first_error = Some(err);
                 }

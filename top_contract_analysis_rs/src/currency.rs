@@ -10,6 +10,7 @@ use crate::error::AppError;
 pub const ETH_USD_PRICE_URL: &str =
     "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd";
 pub const COINBASE_ETH_USD_SPOT_URL: &str = "https://api.coinbase.com/v2/prices/ETH-USD/spot";
+pub const FALLBACK_ETH_USD_RATE: f64 = 2200.0;
 const DEFAULT_ETH_USD_RATE_ATTEMPTS: usize = 2;
 
 const ETH_LIKE_SYMBOLS: &[&str] = &["ETH", "WETH"];
@@ -105,6 +106,7 @@ impl EthUsdRateCache {
             .map(|result| result.clone().map_err(AppError::InvalidData)))
     }
 
+    #[cfg(test)]
     pub(crate) async fn get_or_try_init<F, Fut>(&self, fetch: F) -> Result<f64, AppError>
     where
         F: FnOnce() -> Fut,
@@ -131,6 +133,47 @@ impl EthUsdRateCache {
         };
 
         let rate = fetch().await?;
+        *self.value()? = Some(Ok(rate));
+        Ok(rate)
+    }
+
+    pub(crate) async fn get_or_try_init_or_fallback<F, Fut>(
+        &self,
+        fetch: F,
+        fallback_rate: f64,
+    ) -> Result<f64, AppError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<f64, AppError>>,
+    {
+        if let Some(result) = self.cached_value()? {
+            return match result {
+                Ok(rate) => Ok(rate),
+                Err(_) => Ok(fallback_rate),
+            };
+        }
+
+        if self
+            .fetch_in_progress
+            .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+            .is_err()
+        {
+            if let Some(result) = self.cached_value()? {
+                return match result {
+                    Ok(rate) => Ok(rate),
+                    Err(_) => Ok(fallback_rate),
+                };
+            }
+            return Ok(fallback_rate);
+        }
+        let _fetch_guard = EthUsdRateFetchGuard {
+            fetch_in_progress: &self.fetch_in_progress,
+        };
+
+        let rate = match fetch().await {
+            Ok(rate) if rate.is_finite() && rate > 0.0 => rate,
+            Ok(_) | Err(_) => fallback_rate,
+        };
         *self.value()? = Some(Ok(rate));
         Ok(rate)
     }
@@ -444,6 +487,43 @@ mod tests {
 
         assert_eq!(second, 3100.0);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn eth_usd_rate_cache_uses_fallback_after_failed_initialization() {
+        let cache = EthUsdRateCache::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let first = cache
+            .get_or_try_init_or_fallback(
+                {
+                    let calls = Arc::clone(&calls);
+                    move || async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Err(AppError::InvalidData("temporary price outage".into()))
+                    }
+                },
+                2200.0,
+            )
+            .await
+            .unwrap();
+        let second = cache
+            .get_or_try_init_or_fallback(
+                {
+                    let calls = Arc::clone(&calls);
+                    move || async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(3100.0)
+                    }
+                },
+                2200.0,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(first, 2200.0);
+        assert_eq!(second, 2200.0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

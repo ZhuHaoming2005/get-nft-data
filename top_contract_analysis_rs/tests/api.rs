@@ -7,13 +7,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use top_contract_analysis_rs::api::{
     fetch_contract_metadata, fetch_contract_metadata_with_opensea_fallback, fetch_contract_owners,
-    fetch_contract_sales, fetch_contract_transfers, fetch_eth_balance, fetch_is_holder_of_contract,
-    fetch_license_sample, fetch_opensea_account_holds_contract_nft,
-    fetch_opensea_contract_collection_slug, fetch_opensea_contract_market_events,
-    fetch_opensea_contract_metadata, fetch_opensea_contract_nfts,
-    fetch_same_block_eth_transfers_for_address, fetch_seed_contract_nfts,
-    fetch_transaction_receipt, fetch_transaction_receipts_for_block, is_open_license_payload,
-    ApiEndpoints, AsyncApiClient, DEFAULT_API_RETRIES,
+    fetch_contract_sales, fetch_contract_sales_with_clients, fetch_contract_transfers,
+    fetch_eth_balance, fetch_is_holder_of_contract, fetch_license_sample,
+    fetch_opensea_account_holds_contract_nft, fetch_opensea_contract_collection_slug,
+    fetch_opensea_contract_market_events, fetch_opensea_contract_metadata,
+    fetch_opensea_contract_nfts, fetch_same_block_eth_transfers_for_address,
+    fetch_seed_contract_nfts, fetch_transaction_receipt, fetch_transaction_receipts_for_block,
+    is_open_license_payload, ApiEndpoints, AsyncApiClient, DEFAULT_API_RETRIES,
 };
 use top_contract_analysis_rs::models::SeedNft;
 
@@ -66,6 +66,40 @@ async fn spawn_retry_status_server(
         }
     });
     (format!("http://{address}"), attempts, handle)
+}
+
+async fn spawn_holding_json_server(
+    hold_for: Duration,
+) -> (
+    String,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buffer = vec![0_u8; 8192];
+        let read = stream.read(&mut buffer).await.unwrap();
+        let request = String::from_utf8_lossy(&buffer[..read]);
+        let request_line = request.lines().next().unwrap_or("");
+        assert!(
+            request_line.starts_with("GET /block HTTP/1.1"),
+            "unexpected request line: {request_line}",
+        );
+        let _ = accepted_tx.send(());
+        tokio::time::sleep(hold_for).await;
+        let payload = r#"{"ok":true}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            payload.len(),
+            payload
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.shutdown().await.unwrap();
+    });
+    (format!("http://{address}"), accepted_rx, handle)
 }
 
 #[tokio::test]
@@ -1156,6 +1190,89 @@ async fn contract_sales_enrich_royalty_recipient_from_eip2981() {
         rows[0].royalty_recipient_address,
         "0x4444444444444444444444444444444444444444"
     );
+}
+
+#[tokio::test]
+async fn contract_sales_eip2981_enrichment_uses_alchemy_client_when_clients_are_split() {
+    let alchemy_server = MockServer::start_async().await;
+    alchemy_server
+        .mock_async(|when, then| {
+            when.method(GET).path("/nft/v3/key/getNFTSales");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "nftSales": [{
+                    "marketplace": "seaport",
+                    "contractAddress": "0xdup",
+                    "tokenId": "1",
+                    "buyerAddress": "0xbuyer",
+                    "sellerAddress": "0xseller",
+                    "sellerFee": {"amount": "1000000000000000000", "symbol": "ETH", "decimals": 18},
+                    "royaltyFee": {"amount": "50000000000000000", "symbol": "ETH", "decimals": 18},
+                    "blockNumber": 10,
+                    "logIndex": 1,
+                    "bundleIndex": 0,
+                    "transactionHash": "0xsale"
+                }]
+            }));
+        })
+        .await;
+    let royalty_rpc = alchemy_server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/v2/key")
+                .body_contains("eth_call")
+                .body_contains("2a55205a");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "result": "0x000000000000000000000000444444444444444444444444444444444444444400000000000000000000000000000000000000000000000000b1a2bc2ec50000"
+            }));
+        })
+        .await;
+
+    let (blocking_base_url, accepted, blocking_server) =
+        spawn_holding_json_server(Duration::from_millis(750)).await;
+    let alchemy_client =
+        AsyncApiClient::new_with_retry_policy(5, 4, DEFAULT_API_RETRIES, Duration::ZERO).unwrap();
+    let other_client =
+        AsyncApiClient::new_with_retry_policy(5, 1, DEFAULT_API_RETRIES, Duration::ZERO).unwrap();
+    let blocking_client = other_client.clone();
+    let blocking_request = tokio::spawn(async move {
+        blocking_client
+            .get_json::<serde_json::Value>(&format!("{blocking_base_url}/block"))
+            .await
+    });
+    accepted.await.unwrap();
+
+    let endpoints = ApiEndpoints {
+        alchemy_nft_v2_base: format!("{}/nft/v2/key", alchemy_server.base_url()),
+        alchemy_nft_v3_base: format!("{}/nft/v3/key", alchemy_server.base_url()),
+        alchemy_rpc_base: format!("{}/v2/key", alchemy_server.base_url()),
+        etherscan_base: "http://127.0.0.1:9".to_string(),
+        opensea_base: "http://127.0.0.1:9".to_string(),
+    };
+
+    let rows = tokio::time::timeout(
+        Duration::from_millis(250),
+        fetch_contract_sales_with_clients(
+            &alchemy_client,
+            &other_client,
+            &endpoints,
+            "ethereum",
+            "0xdup",
+            "",
+            None,
+        ),
+    )
+    .await
+    .expect("EIP-2981 Alchemy RPC should not wait for the other API limiter")
+    .unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].royalty_recipient_address,
+        "0x4444444444444444444444444444444444444444"
+    );
+    assert_eq!(royalty_rpc.hits_async().await, 1);
+    blocking_request.await.unwrap().unwrap();
+    blocking_server.await.unwrap();
 }
 
 #[tokio::test]

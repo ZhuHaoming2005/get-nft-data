@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use futures::{stream, StreamExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::error::AppError;
@@ -58,6 +59,7 @@ pub struct AnalyzeRequest {
     pub metadata_threshold: f64,
     pub timeout_seconds: u64,
     pub api_max_concurrency: usize,
+    pub matched_contract_max_concurrency: usize,
     pub max_tokens_per_contract: usize,
     pub max_recall_rows: usize,
 }
@@ -75,6 +77,7 @@ impl Default for AnalyzeRequest {
             metadata_threshold: DEFAULT_METADATA_THRESHOLD,
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
             api_max_concurrency: 8,
+            matched_contract_max_concurrency: 1,
             max_tokens_per_contract: 0,
             max_recall_rows: 0,
         }
@@ -141,6 +144,25 @@ struct CandidatePlan {
 struct CandidateContractFilterResult {
     candidates: Vec<DuplicateCandidate>,
     seed_related_legit_duplicates: Vec<DuplicateContractPayload>,
+}
+
+struct MatchedContractAnalysisOutput {
+    contract_address: String,
+    contract_candidates: Vec<DuplicateCandidate>,
+    result: ContractAnalysisResult,
+}
+
+struct MatchedContractAnalysisContext<'a> {
+    request: AnalyzeRequest,
+    deps: AnalysisDeps,
+    token_type: String,
+    grouped: Arc<BTreeMap<String, Vec<usize>>>,
+    candidates: Arc<Vec<DuplicateCandidate>>,
+    snapshot_token_index: Arc<SnapshotTokenIndex<'a>>,
+    official_addresses: Arc<HashSet<String>>,
+    candidate_open_license_by_token: Arc<HashMap<(String, String), bool>>,
+    seed_deployed_block_number: i64,
+    analysis_timestamp: i64,
 }
 
 fn seed_nfts_for_duplicate_matching(
@@ -282,6 +304,7 @@ pub struct BatchRequest {
     pub metadata_threshold: f64,
     pub timeout_seconds: u64,
     pub api_max_concurrency: usize,
+    pub matched_contract_max_concurrency: usize,
     pub max_tokens_per_contract: usize,
     pub max_recall_rows: usize,
     pub seed_network_max_concurrency: usize,
@@ -302,6 +325,7 @@ impl Default for BatchRequest {
             metadata_threshold: DEFAULT_METADATA_THRESHOLD,
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
             api_max_concurrency: 8,
+            matched_contract_max_concurrency: 1,
             max_tokens_per_contract: 0,
             max_recall_rows: 0,
             seed_network_max_concurrency: 1,
@@ -499,9 +523,13 @@ async fn analyze_seed_contract_with_limits(
     cpu_limit: Option<Arc<Semaphore>>,
     prepared: Option<(SeedContext, CandidatePlan)>,
 ) -> Result<SingleReportPayload, AppError> {
+    let matched_contract_limit = Arc::new(Semaphore::new(
+        request.matched_contract_max_concurrency.max(1),
+    ));
     let mut state =
         prepare_seed_analysis_state(request, deps, progress.clone(), cpu_limit, prepared).await?;
-    analyze_matched_contracts_serially(&mut state, deps, progress.clone()).await?;
+    analyze_matched_contracts_parallel(&mut state, deps, progress.clone(), matched_contract_limit)
+        .await?;
     finalize_seed_report(state, progress).await
 }
 
@@ -620,10 +648,11 @@ async fn prepare_seed_analysis_state(
     })
 }
 
-async fn analyze_matched_contracts_serially(
+async fn analyze_matched_contracts_parallel(
     state: &mut SeedAnalysisState,
     deps: &AnalysisDeps,
     progress: Arc<dyn SeedProgressReporter>,
+    matched_contract_limit: Arc<Semaphore>,
 ) -> Result<(), AppError> {
     if state.open_license {
         return Ok(());
@@ -633,69 +662,124 @@ async fn analyze_matched_contracts_serially(
         .await;
 
     let mut completed_contracts = 0;
-    let snapshot_token_index = SnapshotTokenIndex::new(&state.snapshot.nft_rows);
-    let seed_deployed_block_number = state.seed_contract.deployed_block_number;
+    let mut outputs = {
+        let snapshot_token_index = SnapshotTokenIndex::new(&state.snapshot.nft_rows);
+        let context = Arc::new(MatchedContractAnalysisContext {
+            request: state.request.clone(),
+            deps: deps.clone(),
+            token_type: state.token_type.clone(),
+            grouped: Arc::new(state.grouped.clone()),
+            candidates: Arc::new(state.candidates.clone()),
+            snapshot_token_index: Arc::new(snapshot_token_index),
+            official_addresses: Arc::new(state.official_addresses.clone()),
+            candidate_open_license_by_token: Arc::new(
+                state.candidate_open_license_by_token.clone(),
+            ),
+            seed_deployed_block_number: state.seed_contract.deployed_block_number,
+            analysis_timestamp: state.analysis_timestamp,
+        });
+        let mut tasks = stream::iter(state.contracts_to_analyze.clone().into_iter().map(
+            |contract_address| {
+                let context = Arc::clone(&context);
+                let matched_contract_limit = Arc::clone(&matched_contract_limit);
+                async move {
+                    let _permit = matched_contract_limit
+                        .acquire_owned()
+                        .await
+                        .map_err(|err| {
+                            AppError::InvalidData(format!("matched-contract limit closed: {err}"))
+                        })?;
+                    analyze_one_matched_contract(context, contract_address).await
+                }
+            },
+        ))
+        .buffer_unordered(state.request.matched_contract_max_concurrency.max(1));
+
+        let mut outputs = BTreeMap::<String, MatchedContractAnalysisOutput>::new();
+        while let Some(output) = tasks.next().await {
+            let output = output?;
+            completed_contracts += 1;
+            progress
+                .on_duplicate_contract_completed(
+                    &output.contract_address,
+                    completed_contracts,
+                    state.contracts_to_analyze.len(),
+                )
+                .await;
+            outputs.insert(output.contract_address.clone(), output);
+        }
+        outputs
+    };
+
     for contract_address in &state.contracts_to_analyze {
-        let contract_timer = Instant::now();
-        let contract_metadata = timing::time_async(
-            format!("contract:{contract_address}:fetch_metadata"),
-            fetch_candidate_contract_metadata(&state.request, deps, contract_address),
-        )
-        .await?;
-        let (contract_candidates, result) =
-            if deployed_before_seed(seed_deployed_block_number, contract_metadata.as_ref()) {
-                (
-                    Vec::new(),
-                    implausible_candidate_filtered_result(contract_address, contract_metadata),
-                )
-            } else {
-                let contract_candidates = timing::time_async(
-                    format!("contract:{contract_address}:fetch_and_expand_candidates"),
-                    fetch_and_expand_contract_candidates(
-                        &state.request,
-                        deps,
-                        contract_address,
-                        &state.grouped,
-                        &state.candidates,
-                        &snapshot_token_index,
-                    ),
-                )
-                .await?;
-                let result = timing::time_async(
-                    format!("contract:{contract_address}:analyze_duplicate_contract"),
-                    analyze_duplicate_contract(DuplicateContractAnalysisInput {
-                        request: &state.request,
-                        deps,
-                        token_type: state.token_type.as_str(),
-                        contract_address,
-                        contract_candidates: &contract_candidates,
-                        contract_metadata,
-                        official_addresses: &state.official_addresses,
-                        candidate_open_license_by_token: &state.candidate_open_license_by_token,
-                        analysis_timestamp: state.analysis_timestamp,
-                    }),
-                )
-                .await?;
-                (contract_candidates, result)
-            };
-        completed_contracts += 1;
-        progress
-            .on_duplicate_contract_completed(
-                contract_address,
-                completed_contracts,
-                state.contracts_to_analyze.len(),
-            )
-            .await;
-        timing::log_timing(
-            &format!("contract:{contract_address}:matched_contract_total"),
-            contract_timer,
-        );
+        let Some(output) = outputs.remove(contract_address) else {
+            continue;
+        };
         state
             .expanded_candidates_by_contract
-            .insert(contract_address.clone(), contract_candidates);
-        merge_contract_analysis_result(result, &mut state.output_state);
+            .insert(contract_address.clone(), output.contract_candidates);
+        merge_contract_analysis_result(output.result, &mut state.output_state);
     }
     Ok(())
+}
+
+async fn analyze_one_matched_contract(
+    context: Arc<MatchedContractAnalysisContext<'_>>,
+    contract_address: String,
+) -> Result<MatchedContractAnalysisOutput, AppError> {
+    let contract_timer = Instant::now();
+    let contract_metadata = timing::time_async(
+        format!("contract:{contract_address}:fetch_metadata"),
+        fetch_candidate_contract_metadata(&context.request, &context.deps, &contract_address),
+    )
+    .await?;
+    let (contract_candidates, result) = if deployed_before_seed(
+        context.seed_deployed_block_number,
+        contract_metadata.as_ref(),
+    ) {
+        (
+            Vec::new(),
+            implausible_candidate_filtered_result(&contract_address, contract_metadata),
+        )
+    } else {
+        let contract_candidates = timing::time_async(
+            format!("contract:{contract_address}:fetch_and_expand_candidates"),
+            fetch_and_expand_contract_candidates(
+                &context.request,
+                &context.deps,
+                &contract_address,
+                &context.grouped,
+                &context.candidates,
+                &context.snapshot_token_index,
+            ),
+        )
+        .await?;
+        let result = timing::time_async(
+            format!("contract:{contract_address}:analyze_duplicate_contract"),
+            analyze_duplicate_contract(DuplicateContractAnalysisInput {
+                request: &context.request,
+                deps: &context.deps,
+                token_type: context.token_type.as_str(),
+                contract_address: &contract_address,
+                contract_candidates: &contract_candidates,
+                contract_metadata,
+                official_addresses: &context.official_addresses,
+                candidate_open_license_by_token: &context.candidate_open_license_by_token,
+                analysis_timestamp: context.analysis_timestamp,
+            }),
+        )
+        .await?;
+        (contract_candidates, result)
+    };
+    timing::log_timing(
+        &format!("contract:{contract_address}:matched_contract_total"),
+        contract_timer,
+    );
+    Ok(MatchedContractAnalysisOutput {
+        contract_address,
+        contract_candidates,
+        result,
+    })
 }
 
 async fn finalize_seed_report(

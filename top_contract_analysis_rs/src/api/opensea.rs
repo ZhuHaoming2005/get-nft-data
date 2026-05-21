@@ -1189,7 +1189,8 @@ fn creator_fee_recipient_from_collection_payload(payload: &Value) -> Option<Stri
 }
 
 async fn enrich_sales_with_royalty_recipient(
-    client: &AsyncApiClient,
+    alchemy_client: &AsyncApiClient,
+    other_client: &AsyncApiClient,
     endpoints: &ApiEndpoints,
     chain: &str,
     contract_address: &str,
@@ -1212,9 +1213,13 @@ async fn enrich_sales_with_royalty_recipient(
             continue;
         }
         if !royalty_by_token.contains_key(&sale.token_id) {
-            if let Ok(Some(recipient)) =
-                fetch_eip2981_royalty_recipient(client, endpoints, contract_address, &sale.token_id)
-                    .await
+            if let Ok(Some(recipient)) = fetch_eip2981_royalty_recipient(
+                alchemy_client,
+                endpoints,
+                contract_address,
+                &sale.token_id,
+            )
+            .await
             {
                 royalty_by_token.insert(sale.token_id.clone(), recipient);
             }
@@ -1234,7 +1239,7 @@ async fn enrich_sales_with_royalty_recipient(
     }
 
     match fetch_opensea_creator_fee_recipient(
-        client,
+        other_client,
         &endpoints.opensea_base,
         chain,
         contract_address,
@@ -1269,14 +1274,41 @@ pub async fn fetch_contract_sales(
     opensea_api_key: &str,
     eth_usd_rate: Option<f64>,
 ) -> Result<Vec<NftSaleRecord>, AppError> {
-    let alchemy_result =
-        fetch_alchemy_nft_sales(client, endpoints, contract_address, None, eth_usd_rate)
-            .await
-            .map(|rows| filter_sales_for_contract(rows, contract_address));
+    fetch_contract_sales_with_clients(
+        client,
+        client,
+        endpoints,
+        chain,
+        contract_address,
+        opensea_api_key,
+        eth_usd_rate,
+    )
+    .await
+}
+
+pub async fn fetch_contract_sales_with_clients(
+    alchemy_client: &AsyncApiClient,
+    other_client: &AsyncApiClient,
+    endpoints: &ApiEndpoints,
+    chain: &str,
+    contract_address: &str,
+    opensea_api_key: &str,
+    eth_usd_rate: Option<f64>,
+) -> Result<Vec<NftSaleRecord>, AppError> {
+    let alchemy_result = fetch_alchemy_nft_sales(
+        alchemy_client,
+        endpoints,
+        contract_address,
+        None,
+        eth_usd_rate,
+    )
+    .await
+    .map(|rows| filter_sales_for_contract(rows, contract_address));
     match alchemy_result {
         Ok(rows) => {
             return Ok(enrich_sales_with_royalty_recipient(
-                client,
+                alchemy_client,
+                other_client,
                 endpoints,
                 chain,
                 contract_address,
@@ -1299,7 +1331,7 @@ pub async fn fetch_contract_sales(
     }
 
     match fetch_opensea_nft_events(
-        client,
+        other_client,
         &endpoints.opensea_base,
         chain,
         contract_address,
@@ -1312,7 +1344,8 @@ pub async fn fetch_contract_sales(
         Ok(rows) => {
             let rows = filter_sales_for_contract(rows, contract_address);
             Ok(enrich_sales_with_royalty_recipient(
-                client,
+                alchemy_client,
+                other_client,
                 endpoints,
                 chain,
                 contract_address,

@@ -38,7 +38,15 @@ pub struct AnalyzeArgs {
     #[arg(long, default_value_t = 0)]
     pub max_recall_rows: usize,
     #[arg(long, default_value_t = 8)]
-    pub api_max_concurrency: usize,
+    pub alchemy_api_max_concurrency: usize,
+    #[arg(
+        long = "other-api-max-concurrency",
+        alias = "api-max-concurrency",
+        default_value_t = 8
+    )]
+    pub other_api_max_concurrency: usize,
+    #[arg(long, default_value_t = 1)]
+    pub matched_contract_max_concurrency: usize,
     #[arg(long, default_value_t = 0)]
     pub duckdb_threads: usize,
     #[arg(long, default_value = "80GB")]
@@ -76,7 +84,15 @@ pub struct BatchArgs {
     #[arg(long, default_value_t = 1)]
     pub seed_network_max_concurrency: usize,
     #[arg(long, default_value_t = 8)]
-    pub api_max_concurrency: usize,
+    pub alchemy_api_max_concurrency: usize,
+    #[arg(
+        long = "other-api-max-concurrency",
+        alias = "api-max-concurrency",
+        default_value_t = 8
+    )]
+    pub other_api_max_concurrency: usize,
+    #[arg(long, default_value_t = 1)]
+    pub matched_contract_max_concurrency: usize,
     #[arg(long, default_value_t = 1)]
     pub seed_cpu_max_concurrency: usize,
     #[arg(long, default_value_t = 0)]

@@ -39,7 +39,11 @@ fn main() -> Result<(), AppError> {
                 feature_store
                     .load_parquet_dataset_if_chain_missing(&args.chain, &args.feature_parquet)?;
             }
-            let api = RealApi::new(args.timeout, args.api_max_concurrency)?;
+            let api = RealApi::new(
+                args.timeout,
+                args.alchemy_api_max_concurrency,
+                args.other_api_max_concurrency,
+            )?;
             let deps = AnalysisDeps {
                 api: Arc::new(api),
                 feature_store: Arc::new(feature_store),
@@ -61,7 +65,11 @@ fn main() -> Result<(), AppError> {
                     name_threshold: args.name_threshold,
                     metadata_threshold: args.metadata_threshold,
                     timeout_seconds: args.timeout,
-                    api_max_concurrency: args.api_max_concurrency,
+                    api_max_concurrency: args
+                        .alchemy_api_max_concurrency
+                        .saturating_add(args.other_api_max_concurrency)
+                        .max(1),
+                    matched_contract_max_concurrency: args.matched_contract_max_concurrency,
                     max_tokens_per_contract: args.max_tokens_per_contract,
                     max_recall_rows: args.max_recall_rows,
                 },
@@ -81,7 +89,11 @@ fn main() -> Result<(), AppError> {
                 feature_store
                     .load_parquet_dataset_if_chain_missing(&args.chain, &args.feature_parquet)?;
             }
-            let api = RealApi::new(args.timeout, args.api_max_concurrency)?;
+            let api = RealApi::new(
+                args.timeout,
+                args.alchemy_api_max_concurrency,
+                args.other_api_max_concurrency,
+            )?;
             let deps = AnalysisDeps {
                 api: Arc::new(api),
                 feature_store: Arc::new(feature_store),
@@ -108,7 +120,11 @@ fn main() -> Result<(), AppError> {
                     name_threshold: args.name_threshold,
                     metadata_threshold: args.metadata_threshold,
                     timeout_seconds: args.timeout,
-                    api_max_concurrency: args.api_max_concurrency,
+                    api_max_concurrency: args
+                        .alchemy_api_max_concurrency
+                        .saturating_add(args.other_api_max_concurrency)
+                        .max(1),
+                    matched_contract_max_concurrency: args.matched_contract_max_concurrency,
                     seed_network_max_concurrency: args.seed_network_max_concurrency,
                     seed_cpu_max_concurrency: args.seed_cpu_max_concurrency,
                     max_tokens_per_contract: args.max_tokens_per_contract,

@@ -152,7 +152,6 @@ pub(super) async fn compute_mint_payment_edges_for_contract(
     if lookups.is_empty() {
         return Ok(vec![]);
     }
-    let api_concurrency = request.api_max_concurrency.max(1);
     let contract_deployer = contract_metadata
         .map(|metadata| metadata.contract_deployer.clone())
         .unwrap_or_default();
@@ -161,72 +160,77 @@ pub(super) async fn compute_mint_payment_edges_for_contract(
         deps,
         contract_address,
         &lookups,
-        &contract_deployer,
+        contract_metadata,
     )
     .await?;
 
-    let mut fetched = stream::iter(lookups.into_iter().map(|lookup| {
+    let mut inputs = Vec::with_capacity(lookups.len());
+    let mut receipt_tx_hashes = BTreeSet::<String>::new();
+    let mut balance_requests = BTreeSet::<(String, i64)>::new();
+    let mut block_receipt_requests = BTreeSet::<i64>::new();
+    let mut contract_transfer_requests = BTreeSet::<i64>::new();
+    for lookup in lookups {
         let transfers = mint_payment_transfers_for_lookup(
             &lookup,
             contract_address,
-            &contract_deployer,
+            contract_metadata,
             &transfer_rows_by_request,
         );
-        let contract_deployer = contract_deployer.clone();
-        async move {
-            let has_mint_payment_transfer = transfers.iter().any(|transfer| {
-                is_matching_mint_payment_transfer(
-                    transfer,
-                    &lookup,
-                    contract_address,
-                    &contract_deployer,
-                    contract_metadata,
-                )
-            });
-            if !has_mint_payment_transfer {
-                return Ok::<_, AppError>(MintPaymentInputs {
-                    lookup,
-                    transfers,
-                    receipt: None,
-                    base_balance_eth: None,
-                    block_receipts: BTreeMap::new(),
-                });
-            }
-            let (receipt, base_balance_eth, block_receipts) = tokio::join!(
-                deps.api.fetch_transaction_receipt_on_chain(
-                    &request.chain,
-                    &request.alchemy_api_key,
-                    request.alchemy_network.as_deref(),
-                    &lookup.tx_hash,
-                ),
-                deps.api.fetch_eth_balance_on_chain(
-                    &request.chain,
-                    &request.alchemy_api_key,
-                    request.alchemy_network.as_deref(),
-                    &lookup.minter_address,
-                    lookup.block_number - 1,
-                ),
-                deps.api.fetch_transaction_receipts_for_block_on_chain(
-                    &request.chain,
-                    &request.alchemy_api_key,
-                    request.alchemy_network.as_deref(),
-                    lookup.block_number,
-                )
-            );
-            Ok::<_, AppError>(MintPaymentInputs {
-                lookup,
-                transfers,
-                receipt: receipt.ok(),
-                base_balance_eth: base_balance_eth.ok(),
-                block_receipts: block_receipts.unwrap_or_default(),
-            })
+        let has_mint_payment_transfer = transfers.iter().any(|transfer| {
+            is_matching_mint_payment_transfer(
+                transfer,
+                &lookup,
+                contract_address,
+                &contract_deployer,
+                contract_metadata,
+            )
+        });
+        if has_mint_payment_transfer {
+            receipt_tx_hashes.insert(lookup.tx_hash.clone());
+            balance_requests.insert((lookup.minter_address.clone(), lookup.block_number - 1));
+            block_receipt_requests.insert(lookup.block_number);
+            contract_transfer_requests.insert(lookup.block_number);
         }
-    }))
-    .buffer_unordered(api_concurrency);
+        inputs.push(MintPaymentInputs {
+            lookup,
+            transfers,
+            receipt: None,
+            base_balance_eth: None,
+            block_receipts: BTreeMap::new(),
+        });
+    }
+
+    let receipts_by_tx = fetch_mint_payment_receipts(request, deps, receipt_tx_hashes).await?;
+    let balances_by_request = fetch_mint_payment_balances(request, deps, balance_requests).await?;
+    let block_receipts_by_block =
+        fetch_mint_payment_block_receipts(request, deps, block_receipt_requests).await?;
+    let contract_transfers_by_block = fetch_contract_value_transfers_for_blocks(
+        request,
+        deps,
+        contract_address,
+        contract_transfer_requests,
+    )
+    .await?;
 
     let mut rows = BTreeMap::<String, ValueFlowEdgePayload>::new();
-    while let Some(result) = fetched.next().await {
-        let inputs = result?;
+    for mut inputs in inputs {
+        if let Some(contract_transfers) =
+            contract_transfers_by_block.get(&inputs.lookup.block_number)
+        {
+            inputs.transfers.extend(contract_transfers.clone());
+            inputs.transfers = deduplicate_eth_transfer_rows(inputs.transfers);
+        }
+        inputs.receipt = receipts_by_tx.get(&inputs.lookup.tx_hash).cloned();
+        inputs.base_balance_eth = balances_by_request
+            .get(&(
+                inputs.lookup.minter_address.clone(),
+                inputs.lookup.block_number - 1,
+            ))
+            .copied();
+        inputs.block_receipts = block_receipts_by_block
+            .get(&inputs.lookup.block_number)
+            .cloned()
+            .unwrap_or_default();
         let lookup = inputs.lookup;
         let eth_transfers = inputs.transfers;
         let receipt = inputs.receipt.as_ref();
@@ -292,17 +296,24 @@ pub(super) async fn compute_mint_payment_edges_for_contract(
     Ok(rows.into_values().collect())
 }
 
-fn mint_payment_lookup_addresses(
-    lookup: &MintPaymentLookup,
+fn mint_payment_receiver_addresses(
     contract_address: &str,
-    contract_deployer: &str,
+    contract_metadata: Option<&ContractMetadata>,
 ) -> BTreeSet<String> {
-    let mut lookup_addresses =
-        BTreeSet::from([lookup.minter_address.clone(), contract_address.to_string()]);
-    if !contract_deployer.is_empty() {
-        lookup_addresses.insert(contract_deployer.to_string());
+    let mut addresses = BTreeSet::from([contract_address.to_string()]);
+    if let Some(metadata) = contract_metadata {
+        for address in [
+            metadata.contract_deployer.as_str(),
+            metadata.owner_address.as_str(),
+            metadata.admin_address.as_str(),
+            metadata.proxy_admin_address.as_str(),
+        ] {
+            if !address.is_empty() {
+                addresses.insert(address.to_string());
+            }
+        }
     }
-    lookup_addresses
+    addresses
 }
 
 async fn fetch_mint_payment_transfers_for_lookups(
@@ -310,14 +321,15 @@ async fn fetch_mint_payment_transfers_for_lookups(
     deps: &AnalysisDeps,
     contract_address: &str,
     lookups: &[MintPaymentLookup],
-    contract_deployer: &str,
+    contract_metadata: Option<&ContractMetadata>,
 ) -> Result<BTreeMap<(i64, String), Vec<EthTransferRecord>>, AppError> {
     let mut requests = BTreeMap::<(i64, String), String>::new();
+    let receiver_addresses = mint_payment_receiver_addresses(contract_address, contract_metadata);
     for lookup in lookups {
-        for address in mint_payment_lookup_addresses(lookup, contract_address, contract_deployer) {
+        for address in &receiver_addresses {
             requests
                 .entry((lookup.block_number, address.to_lowercase()))
-                .or_insert(address);
+                .or_insert_with(|| address.clone());
         }
     }
 
@@ -325,7 +337,7 @@ async fn fetch_mint_payment_transfers_for_lookups(
         |((block_number, address_key), address)| async move {
             let result = deps
                 .api
-                .fetch_mint_payment_eth_transfers_on_chain(
+                .fetch_mint_payment_eth_transfers_to_address_on_chain(
                     &request.chain,
                     &request.alchemy_api_key,
                     request.alchemy_network.as_deref(),
@@ -357,18 +369,157 @@ async fn fetch_mint_payment_transfers_for_lookups(
 fn mint_payment_transfers_for_lookup(
     lookup: &MintPaymentLookup,
     contract_address: &str,
-    contract_deployer: &str,
+    contract_metadata: Option<&ContractMetadata>,
     transfer_rows_by_request: &BTreeMap<(i64, String), Vec<EthTransferRecord>>,
 ) -> Vec<EthTransferRecord> {
     let mut transfers = Vec::new();
-    for address in mint_payment_lookup_addresses(lookup, contract_address, contract_deployer) {
+    for address in mint_payment_receiver_addresses(contract_address, contract_metadata) {
         if let Some(rows) =
             transfer_rows_by_request.get(&(lookup.block_number, address.to_lowercase()))
         {
             transfers.extend(rows.iter().cloned());
         }
     }
-    transfers
+    deduplicate_eth_transfer_rows(transfers)
+}
+
+async fn fetch_mint_payment_receipts(
+    request: &AnalyzeRequest,
+    deps: &AnalysisDeps,
+    tx_hashes: BTreeSet<String>,
+) -> Result<BTreeMap<String, TransactionReceiptRecord>, AppError> {
+    let mut fetched = stream::iter(tx_hashes.into_iter().map(|tx_hash| async move {
+        let receipt = deps
+            .api
+            .fetch_transaction_receipt_on_chain(
+                &request.chain,
+                &request.alchemy_api_key,
+                request.alchemy_network.as_deref(),
+                &tx_hash,
+            )
+            .await
+            .ok();
+        (tx_hash, receipt)
+    }))
+    .buffer_unordered(request.api_max_concurrency.max(1));
+
+    let mut rows = BTreeMap::new();
+    while let Some((tx_hash, receipt)) = fetched.next().await {
+        if let Some(receipt) = receipt {
+            rows.insert(tx_hash, receipt);
+        }
+    }
+    Ok(rows)
+}
+
+async fn fetch_mint_payment_balances(
+    request: &AnalyzeRequest,
+    deps: &AnalysisDeps,
+    balance_requests: BTreeSet<(String, i64)>,
+) -> Result<BTreeMap<(String, i64), f64>, AppError> {
+    let mut fetched = stream::iter(balance_requests.into_iter().map(
+        |(address, block_number)| async move {
+            let balance = deps
+                .api
+                .fetch_eth_balance_on_chain(
+                    &request.chain,
+                    &request.alchemy_api_key,
+                    request.alchemy_network.as_deref(),
+                    &address,
+                    block_number,
+                )
+                .await
+                .ok();
+            ((address, block_number), balance)
+        },
+    ))
+    .buffer_unordered(request.api_max_concurrency.max(1));
+
+    let mut rows = BTreeMap::new();
+    while let Some((request_key, balance)) = fetched.next().await {
+        if let Some(balance) = balance {
+            rows.insert(request_key, balance);
+        }
+    }
+    Ok(rows)
+}
+
+async fn fetch_mint_payment_block_receipts(
+    request: &AnalyzeRequest,
+    deps: &AnalysisDeps,
+    block_numbers: BTreeSet<i64>,
+) -> Result<BTreeMap<i64, BTreeMap<String, TransactionReceiptRecord>>, AppError> {
+    let mut fetched = stream::iter(block_numbers.into_iter().map(|block_number| async move {
+        let receipts = deps
+            .api
+            .fetch_transaction_receipts_for_block_on_chain(
+                &request.chain,
+                &request.alchemy_api_key,
+                request.alchemy_network.as_deref(),
+                block_number,
+            )
+            .await
+            .unwrap_or_default();
+        (block_number, receipts)
+    }))
+    .buffer_unordered(request.api_max_concurrency.max(1));
+
+    let mut rows = BTreeMap::new();
+    while let Some((block_number, receipts)) = fetched.next().await {
+        rows.insert(block_number, receipts);
+    }
+    Ok(rows)
+}
+
+async fn fetch_contract_value_transfers_for_blocks(
+    request: &AnalyzeRequest,
+    deps: &AnalysisDeps,
+    contract_address: &str,
+    block_numbers: BTreeSet<i64>,
+) -> Result<BTreeMap<i64, Vec<EthTransferRecord>>, AppError> {
+    let mut fetched = stream::iter(block_numbers.into_iter().map(|block_number| async move {
+        let rows = deps
+            .api
+            .fetch_mint_payment_eth_transfers_on_chain(
+                &request.chain,
+                &request.alchemy_api_key,
+                request.alchemy_network.as_deref(),
+                block_number,
+                contract_address,
+            )
+            .await
+            .unwrap_or_default();
+        (block_number, rows)
+    }))
+    .buffer_unordered(request.api_max_concurrency.max(1));
+
+    let mut rows_by_block = BTreeMap::new();
+    while let Some((block_number, rows)) = fetched.next().await {
+        rows_by_block.insert(block_number, rows);
+    }
+    Ok(rows_by_block)
+}
+
+fn deduplicate_eth_transfer_rows(rows: Vec<EthTransferRecord>) -> Vec<EthTransferRecord> {
+    let mut deduped = BTreeMap::new();
+    for row in rows {
+        deduped.insert(
+            (
+                row.tx_hash.clone(),
+                row.from_address.clone(),
+                row.to_address.clone(),
+                format!("{:.18}", row.value_eth),
+                row.value_usd
+                    .map(|value| format!("{value:.6}"))
+                    .unwrap_or_default(),
+                row.payment_token_symbol.clone(),
+                row.payment_token_address.clone(),
+                row.category.clone(),
+            ),
+            row,
+        );
+    }
+    deduped.into_values().collect()
 }
 
 fn value_flow_edge_from_transfer(input: ValueFlowEdgeInput<'_>) -> ValueFlowEdgePayload {

@@ -185,6 +185,189 @@ impl AnalyzeApi for FakeApi {
     }
 }
 
+struct WarmCountingApi<T> {
+    inner: T,
+    warm_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl<T> AnalyzeApi for WarmCountingApi<T>
+where
+    T: AnalyzeApi,
+{
+    async fn fetch_contract_metadata(
+        &self,
+        chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        opensea_api_key: &str,
+        contract_address: &str,
+    ) -> Result<ContractMetadata, AppError> {
+        self.inner
+            .fetch_contract_metadata(
+                chain,
+                alchemy_api_key,
+                alchemy_network,
+                opensea_api_key,
+                contract_address,
+            )
+            .await
+    }
+
+    async fn fetch_seed_contract_nfts(
+        &self,
+        chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        contract_address: &str,
+    ) -> Result<Vec<SeedNft>, AppError> {
+        self.inner
+            .fetch_seed_contract_nfts(chain, alchemy_api_key, alchemy_network, contract_address)
+            .await
+    }
+
+    async fn fetch_contract_nfts(
+        &self,
+        chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        etherscan_api_key: &str,
+        opensea_api_key: &str,
+        contract_address: &str,
+    ) -> Result<Vec<SeedNft>, AppError> {
+        self.inner
+            .fetch_contract_nfts(
+                chain,
+                alchemy_api_key,
+                alchemy_network,
+                etherscan_api_key,
+                opensea_api_key,
+                contract_address,
+            )
+            .await
+    }
+
+    async fn fetch_license_sample(
+        &self,
+        chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        seed_nfts: &[SeedNft],
+    ) -> Result<bool, AppError> {
+        self.inner
+            .fetch_license_sample(chain, alchemy_api_key, alchemy_network, seed_nfts)
+            .await
+    }
+
+    async fn fetch_contract_transfers(
+        &self,
+        chain: &str,
+        etherscan_api_key: &str,
+        alchemy_network: Option<&str>,
+        alchemy_api_key: &str,
+        contract_address: &str,
+        token_type: &str,
+    ) -> Result<Vec<TransferRecord>, AppError> {
+        self.inner
+            .fetch_contract_transfers(
+                chain,
+                etherscan_api_key,
+                alchemy_network,
+                alchemy_api_key,
+                contract_address,
+                token_type,
+            )
+            .await
+    }
+
+    async fn fetch_contract_owners(
+        &self,
+        chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        contract_address: &str,
+    ) -> Result<Vec<OwnerBalance>, AppError> {
+        self.inner
+            .fetch_contract_owners(chain, alchemy_api_key, alchemy_network, contract_address)
+            .await
+    }
+
+    async fn fetch_contract_sales(
+        &self,
+        chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        contract_address: &str,
+        opensea_api_key: &str,
+    ) -> Result<Vec<NftSaleRecord>, AppError> {
+        self.inner
+            .fetch_contract_sales(
+                chain,
+                alchemy_api_key,
+                alchemy_network,
+                contract_address,
+                opensea_api_key,
+            )
+            .await
+    }
+
+    async fn fetch_transaction_receipt(
+        &self,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        tx_hash: &str,
+    ) -> Result<TransactionReceiptRecord, AppError> {
+        self.inner
+            .fetch_transaction_receipt(alchemy_api_key, alchemy_network, tx_hash)
+            .await
+    }
+
+    async fn fetch_transaction_receipts_for_block(
+        &self,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        block_number: i64,
+    ) -> Result<BTreeMap<String, TransactionReceiptRecord>, AppError> {
+        self.inner
+            .fetch_transaction_receipts_for_block(alchemy_api_key, alchemy_network, block_number)
+            .await
+    }
+
+    async fn fetch_eth_balance(
+        &self,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        address: &str,
+        block_number: i64,
+    ) -> Result<f64, AppError> {
+        self.inner
+            .fetch_eth_balance(alchemy_api_key, alchemy_network, address, block_number)
+            .await
+    }
+
+    async fn fetch_same_block_eth_transfers_for_address(
+        &self,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        block_number: i64,
+        address: &str,
+    ) -> Result<Vec<EthTransferRecord>, AppError> {
+        self.inner
+            .fetch_same_block_eth_transfers_for_address(
+                alchemy_api_key,
+                alchemy_network,
+                block_number,
+                address,
+            )
+            .await
+    }
+
+    async fn warm_eth_usd_rate(&self) -> Result<(), AppError> {
+        self.warm_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.warm_eth_usd_rate().await
+    }
+}
+
 struct FakeSeedOwnerApi;
 
 #[async_trait]
@@ -1289,6 +1472,30 @@ impl AnalyzeApi for FakeEnrichedApi {
                 payment_token_symbol: "ETH".into(),
                 payment_token_address: ZERO_ADDRESS.into(),
                 category: "internal".into(),
+            }]);
+        }
+        Ok(vec![])
+    }
+
+    async fn fetch_mint_payment_eth_transfers_to_address_on_chain(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        block_number: i64,
+        address: &str,
+    ) -> Result<Vec<EthTransferRecord>, AppError> {
+        if block_number == 1 && address == "0xcreator" {
+            return Ok(vec![EthTransferRecord {
+                tx_hash: "0xmint".into(),
+                block_number,
+                from_address: "0xminter".into(),
+                to_address: "0xcreator".into(),
+                value_eth: 0.08,
+                value_usd: Some(184.0),
+                payment_token_symbol: "ETH".into(),
+                payment_token_address: ZERO_ADDRESS.into(),
+                category: "external".into(),
             }]);
         }
         Ok(vec![])
@@ -2861,16 +3068,45 @@ impl AnalyzeApi for ConcurrentSingleContractFetchApi {
         }
         Ok(vec![])
     }
+
+    async fn fetch_mint_payment_eth_transfers_to_address_on_chain(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        block_number: i64,
+        address: &str,
+    ) -> Result<Vec<EthTransferRecord>, AppError> {
+        self.post_signal_overlap_delay().await;
+        if block_number == 1 && address == "0xcreator" {
+            return Ok(vec![EthTransferRecord {
+                tx_hash: "0xmint".into(),
+                block_number,
+                from_address: "0xminter".into(),
+                to_address: "0xcreator".into(),
+                value_eth: 0.08,
+                value_usd: Some(184.0),
+                payment_token_symbol: "ETH".into(),
+                payment_token_address: ZERO_ADDRESS.into(),
+                category: "external".into(),
+            }]);
+        }
+        Ok(vec![])
+    }
 }
 
 struct DuplicateMintPaymentLookupApi {
     mint_transfer_calls: Mutex<Vec<(i64, String)>>,
+    balance_calls: Mutex<Vec<(String, i64)>>,
+    block_receipt_calls: Mutex<Vec<i64>>,
 }
 
 impl DuplicateMintPaymentLookupApi {
     fn new() -> Self {
         Self {
             mint_transfer_calls: Mutex::new(Vec::new()),
+            balance_calls: Mutex::new(Vec::new()),
+            block_receipt_calls: Mutex::new(Vec::new()),
         }
     }
 }
@@ -3134,6 +3370,35 @@ impl AnalyzeApi for CashoutTraceApi {
         };
         Ok(transfers)
     }
+
+    async fn fetch_mint_payment_eth_transfers_to_address_on_chain(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        block_number: i64,
+        address: &str,
+    ) -> Result<Vec<EthTransferRecord>, AppError> {
+        self.mint_transfer_calls
+            .lock()
+            .unwrap()
+            .push((block_number, address.to_string()));
+        let transfers = match address {
+            "0xdup" => vec![EthTransferRecord {
+                tx_hash: "0xmint".into(),
+                block_number,
+                from_address: "0xminter".into(),
+                to_address: "0xdup".into(),
+                value_eth: 0.08,
+                value_usd: Some(184.0),
+                payment_token_symbol: "ETH".into(),
+                payment_token_address: ZERO_ADDRESS.into(),
+                category: "external".into(),
+            }],
+            _ => vec![],
+        };
+        Ok(transfers)
+    }
 }
 
 #[async_trait]
@@ -3270,8 +3535,9 @@ impl AnalyzeApi for DuplicateMintPaymentLookupApi {
         &self,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
-        _block_number: i64,
+        block_number: i64,
     ) -> Result<BTreeMap<String, TransactionReceiptRecord>, AppError> {
+        self.block_receipt_calls.lock().unwrap().push(block_number);
         Ok(BTreeMap::new())
     }
 
@@ -3279,9 +3545,13 @@ impl AnalyzeApi for DuplicateMintPaymentLookupApi {
         &self,
         _alchemy_api_key: &str,
         _alchemy_network: Option<&str>,
-        _address: &str,
-        _block_number: i64,
+        address: &str,
+        block_number: i64,
     ) -> Result<f64, AppError> {
+        self.balance_calls
+            .lock()
+            .unwrap()
+            .push((address.to_string(), block_number));
         Ok(1.0)
     }
 
@@ -3295,7 +3565,7 @@ impl AnalyzeApi for DuplicateMintPaymentLookupApi {
         Ok(vec![])
     }
 
-    async fn fetch_mint_payment_eth_transfers_on_chain(
+    async fn fetch_mint_payment_eth_transfers_to_address_on_chain(
         &self,
         _chain: &str,
         _alchemy_api_key: &str,
@@ -3307,7 +3577,7 @@ impl AnalyzeApi for DuplicateMintPaymentLookupApi {
             .lock()
             .unwrap()
             .push((block_number, address.to_string()));
-        if block_number == 1 && address == "0xminter" {
+        if block_number == 1 && address == "0xcreator" {
             return Ok(vec![
                 EthTransferRecord {
                     tx_hash: "0xmint1".into(),
@@ -4502,8 +4772,12 @@ async fn analyze_keeps_locally_wrapper_named_candidate_without_chain_seed_relati
 
 #[tokio::test]
 async fn analyze_marks_seed_open_license_and_skips_suspected_contracts() {
+    let warm_calls = Arc::new(AtomicUsize::new(0));
     let deps = AnalysisDeps {
-        api: Arc::new(FakeOpenLicenseApi),
+        api: Arc::new(WarmCountingApi {
+            inner: FakeOpenLicenseApi,
+            warm_calls: warm_calls.clone(),
+        }),
         feature_store: Arc::new(FakeFeatureStore {
             snapshot: DatabaseSnapshot {
                 nft_rows: vec![DatabaseNftRecord {
@@ -4539,6 +4813,7 @@ async fn analyze_marks_seed_open_license_and_skips_suspected_contracts() {
     assert!(payload.report_summary.open_license_detected);
     assert!(payload.duplicate_contracts.is_empty());
     assert!(payload.infringing_tokens.is_empty());
+    assert_eq!(warm_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -4645,13 +4920,13 @@ async fn analyze_enriches_duplicate_contracts_with_signals_and_infringing_tokens
     assert_eq!(mint_payment_edge.to_address, "0xcreator");
     assert_eq!(mint_payment_edge.value_eth, Some(0.08));
     assert_eq!(mint_payment_edge.value_usd, Some(184.0));
-    let funding_edge = payload
-        .value_flow_edges
-        .iter()
-        .find(|edge| edge.channel == "funding")
-        .expect("funding value flow edge");
-    assert_eq!(funding_edge.from_address, "0xfunder");
-    assert_eq!(funding_edge.to_address, "0xminter");
+    assert!(
+        payload
+            .value_flow_edges
+            .iter()
+            .all(|edge| edge.channel != "funding"),
+        "receiver-only mint value-flow lookups should not fetch per-minter funding edges"
+    );
     let withdrawal_edge = payload
         .value_flow_edges
         .iter()
@@ -4664,9 +4939,9 @@ async fn analyze_enriches_duplicate_contracts_with_signals_and_infringing_tokens
         .iter()
         .find(|metric| metric.contract_address == "0xdup")
         .expect("contract lifecycle metric");
-    assert_eq!(lifecycle_metric.funding_edge_count, 1);
+    assert_eq!(lifecycle_metric.funding_edge_count, 0);
     assert_eq!(lifecycle_metric.withdrawal_edge_count, 1);
-    assert_eq!(lifecycle_metric.revenue_backflow_edge_count, 1);
+    assert_eq!(lifecycle_metric.revenue_backflow_edge_count, 0);
     assert_eq!(
         lifecycle_metric.first_victim_time,
         mint_payment_edge.block_time
@@ -5200,7 +5475,7 @@ async fn analyze_sale_metrics_are_keyed_by_transaction_and_buyer() {
 }
 
 #[tokio::test]
-async fn analyze_processes_duplicate_contracts_within_a_seed_serially() {
+async fn analyze_processes_duplicate_contracts_within_a_seed_in_parallel() {
     let api = Arc::new(ConcurrentContractApi::new());
     let deps = AnalysisDeps {
         api: api.clone(),
@@ -5242,6 +5517,7 @@ async fn analyze_processes_duplicate_contracts_within_a_seed_serially() {
             chain: "ethereum".into(),
             seed_contract_address: "0xseed".into(),
             alchemy_api_key: "key".into(),
+            matched_contract_max_concurrency: 2,
             ..AnalyzeRequest::default()
         },
         &deps,
@@ -5252,13 +5528,13 @@ async fn analyze_processes_duplicate_contracts_within_a_seed_serially() {
     assert_eq!(payload.duplicate_contracts.len(), 2);
     assert_eq!(
         api.max_transfer_fetches.load(Ordering::SeqCst),
-        1,
-        "expected duplicate contract analysis to run one matched contract at a time"
+        2,
+        "expected duplicate contract analysis to run matched contracts up to the configured limit"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn analyze_waits_for_one_matched_contract_before_starting_the_next() {
+async fn analyze_allows_later_matched_contract_to_start_before_previous_finishes() {
     let api = Arc::new(StaggeredExpansionApi::new());
     let deps = AnalysisDeps {
         api: api.clone(),
@@ -5300,6 +5576,7 @@ async fn analyze_waits_for_one_matched_contract_before_starting_the_next() {
             chain: "ethereum".into(),
             seed_contract_address: "0xseed".into(),
             alchemy_api_key: "key".into(),
+            matched_contract_max_concurrency: 2,
             ..AnalyzeRequest::default()
         },
         &deps,
@@ -5311,8 +5588,8 @@ async fn analyze_waits_for_one_matched_contract_before_starting_the_next() {
     assert_eq!(
         api.transfer_before_slow_expansion_done
             .load(Ordering::SeqCst),
-        0,
-        "expected later matched contracts to wait until the previous contract finishes expansion"
+        1,
+        "expected later matched contracts to start while an earlier contract is still expanding"
     );
 }
 
@@ -5602,12 +5879,18 @@ async fn analyze_deduplicates_mint_value_flow_transfer_lookups_by_block_and_addr
     let calls = api.mint_transfer_calls.lock().unwrap().clone();
     assert_eq!(
         calls,
-        vec![
-            (1, "0xcreator".to_string()),
-            (1, "0xdup".to_string()),
-            (1, "0xminter".to_string()),
-        ],
-        "expected shared mint value-flow transfer lookups to be fetched once per block/address"
+        vec![(1, "0xcreator".to_string()), (1, "0xdup".to_string()),],
+        "expected mint value-flow to fetch each receiver once per block without minter lookups"
+    );
+    assert_eq!(
+        api.balance_calls.lock().unwrap().clone(),
+        vec![("0xminter".to_string(), 0)],
+        "expected duplicate minter/block balance enrichment to be fetched once"
+    );
+    assert_eq!(
+        api.block_receipt_calls.lock().unwrap().clone(),
+        vec![1],
+        "expected duplicate block receipt enrichment to be fetched once"
     );
 }
 

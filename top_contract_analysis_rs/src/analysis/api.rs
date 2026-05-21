@@ -1,18 +1,21 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 
 use crate::api::{
-    fetch_contract_metadata_with_opensea_fallback, fetch_contract_owners, fetch_contract_sales,
-    fetch_contract_transfers, fetch_eth_balance, fetch_etherscan_contract_transfers,
-    fetch_is_holder_of_contract, fetch_license_sample, fetch_opensea_account_holds_contract_nft,
+    fetch_contract_metadata_with_opensea_fallback_clients, fetch_contract_owners,
+    fetch_contract_sales_with_clients, fetch_contract_transfers_with_etherscan_fallback,
+    fetch_eth_balance, fetch_etherscan_contract_transfers, fetch_is_holder_of_contract,
+    fetch_license_sample, fetch_opensea_account_holds_contract_nft,
     fetch_opensea_contract_collection_slug, fetch_opensea_contract_market_events,
     fetch_opensea_contract_nfts, fetch_same_block_eth_transfers_for_address,
-    fetch_same_block_value_transfers_for_address, fetch_seed_contract_nfts,
-    fetch_transaction_receipt, fetch_transaction_receipts_for_block, is_open_license_payload,
-    ApiEndpoints, AsyncApiClient,
+    fetch_same_block_value_transfers_for_address, fetch_same_block_value_transfers_to_address,
+    fetch_seed_contract_nfts, fetch_transaction_receipt, fetch_transaction_receipts_for_block,
+    is_open_license_payload, ApiEndpoints, AsyncApiClient,
 };
+use crate::currency::FALLBACK_ETH_USD_RATE;
 use crate::error::AppError;
 use crate::models::{
     ContractMetadata, EthTransferRecord, NftMarketEventRecord, NftSaleRecord, OwnerBalance,
@@ -239,18 +242,46 @@ pub trait AnalyzeApi: Send + Sync {
     ) -> Result<Vec<EthTransferRecord>, AppError> {
         Ok(Vec::new())
     }
+
+    async fn fetch_mint_payment_eth_transfers_to_address_on_chain(
+        &self,
+        chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        block_number: i64,
+        address: &str,
+    ) -> Result<Vec<EthTransferRecord>, AppError> {
+        self.fetch_mint_payment_eth_transfers_on_chain(
+            chain,
+            alchemy_api_key,
+            alchemy_network,
+            block_number,
+            address,
+        )
+        .await
+    }
+
+    async fn warm_eth_usd_rate(&self) -> Result<(), AppError> {
+        Ok(())
+    }
 }
 
 pub struct RealApi {
-    client: AsyncApiClient,
+    alchemy_client: AsyncApiClient,
+    other_client: AsyncApiClient,
     eth_usd_rate: crate::currency::EthUsdRateCache,
     eth_usd_rate_warning_emitted: AtomicBool,
 }
 
 impl RealApi {
-    pub fn new(timeout_seconds: u64, api_max_concurrency: usize) -> Result<Self, AppError> {
+    pub fn new(
+        timeout_seconds: u64,
+        alchemy_api_max_concurrency: usize,
+        other_api_max_concurrency: usize,
+    ) -> Result<Self, AppError> {
         Ok(Self {
-            client: AsyncApiClient::new(timeout_seconds, api_max_concurrency)?,
+            alchemy_client: AsyncApiClient::new(timeout_seconds, alchemy_api_max_concurrency)?,
+            other_client: AsyncApiClient::new(timeout_seconds, other_api_max_concurrency)?,
             eth_usd_rate: crate::currency::EthUsdRateCache::default(),
             eth_usd_rate_warning_emitted: AtomicBool::new(false),
         })
@@ -267,13 +298,32 @@ impl RealApi {
 
     async fn current_eth_usd_rate(&self) -> Result<f64, AppError> {
         self.eth_usd_rate
-            .get_or_try_init(|| crate::currency::fetch_current_eth_usd_rate(&self.client))
+            .get_or_try_init_or_fallback(
+                || async {
+                    match tokio::time::timeout(
+                        Duration::from_secs(5),
+                        crate::currency::fetch_current_eth_usd_rate(&self.other_client),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(AppError::InvalidData(
+                            "ETH/USD rate fetch timed out".to_string(),
+                        )),
+                    }
+                },
+                FALLBACK_ETH_USD_RATE,
+            )
             .await
     }
 }
 
 #[async_trait]
 impl AnalyzeApi for RealApi {
+    async fn warm_eth_usd_rate(&self) -> Result<(), AppError> {
+        self.current_eth_usd_rate().await.map(|_| ())
+    }
+
     async fn fetch_contract_metadata(
         &self,
         chain: &str,
@@ -283,8 +333,9 @@ impl AnalyzeApi for RealApi {
         contract_address: &str,
     ) -> Result<ContractMetadata, AppError> {
         let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
-        fetch_contract_metadata_with_opensea_fallback(
-            &self.client,
+        fetch_contract_metadata_with_opensea_fallback_clients(
+            &self.alchemy_client,
+            &self.other_client,
             &endpoints,
             chain,
             contract_address,
@@ -301,7 +352,7 @@ impl AnalyzeApi for RealApi {
         contract_address: &str,
     ) -> Result<Vec<SeedNft>, AppError> {
         let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
-        fetch_seed_contract_nfts(&self.client, &endpoints, chain, contract_address).await
+        fetch_seed_contract_nfts(&self.alchemy_client, &endpoints, chain, contract_address).await
     }
 
     async fn fetch_contract_nfts(
@@ -316,7 +367,7 @@ impl AnalyzeApi for RealApi {
         let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
         if !opensea_api_key.trim().is_empty() {
             match fetch_opensea_contract_nfts(
-                &self.client,
+                &self.other_client,
                 &endpoints.opensea_base,
                 chain,
                 contract_address,
@@ -334,7 +385,8 @@ impl AnalyzeApi for RealApi {
             }
         }
         let alchemy_result =
-            fetch_seed_contract_nfts(&self.client, &endpoints, chain, contract_address).await;
+            fetch_seed_contract_nfts(&self.alchemy_client, &endpoints, chain, contract_address)
+                .await;
         match alchemy_result {
             Ok(rows) => Ok(rows),
             Err(alchemy_err) if etherscan_api_key.trim().is_empty() => Err(alchemy_err),
@@ -343,7 +395,7 @@ impl AnalyzeApi for RealApi {
                     "warning: Alchemy NFT expansion failed for {contract_address}: {alchemy_err}; falling back to Etherscan transfers"
                 );
                 let transfers = fetch_etherscan_contract_transfers(
-                    &self.client,
+                    &self.other_client,
                     &endpoints.etherscan_base,
                     etherscan_api_key,
                     chain,
@@ -377,7 +429,7 @@ impl AnalyzeApi for RealApi {
         seed_nfts: &[SeedNft],
     ) -> Result<bool, AppError> {
         let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
-        let payload = fetch_license_sample(&self.client, &endpoints, seed_nfts).await?;
+        let payload = fetch_license_sample(&self.alchemy_client, &endpoints, seed_nfts).await?;
         Ok(is_open_license_payload(&payload))
     }
 
@@ -391,8 +443,9 @@ impl AnalyzeApi for RealApi {
         token_type: &str,
     ) -> Result<Vec<TransferRecord>, AppError> {
         let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
-        fetch_contract_transfers(
-            &self.client,
+        fetch_contract_transfers_with_etherscan_fallback(
+            &self.alchemy_client,
+            &self.other_client,
             &endpoints,
             etherscan_api_key,
             chain,
@@ -410,7 +463,7 @@ impl AnalyzeApi for RealApi {
         contract_address: &str,
     ) -> Result<Vec<OwnerBalance>, AppError> {
         let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
-        fetch_contract_owners(&self.client, &endpoints, contract_address).await
+        fetch_contract_owners(&self.alchemy_client, &endpoints, contract_address).await
     }
 
     async fn candidate_currently_holds_seed_nft(
@@ -425,7 +478,7 @@ impl AnalyzeApi for RealApi {
         if !request.opensea_api_key.trim().is_empty() {
             if let Some(seed_collection_slug) = request.seed_collection_slug {
                 match fetch_opensea_account_holds_contract_nft(
-                    &self.client,
+                    &self.other_client,
                     &endpoints.opensea_base,
                     request.chain,
                     request.candidate_contract_address,
@@ -447,7 +500,7 @@ impl AnalyzeApi for RealApi {
         }
 
         fetch_is_holder_of_contract(
-            &self.client,
+            &self.alchemy_client,
             &endpoints,
             request.candidate_contract_address,
             request.seed_contract_address,
@@ -487,7 +540,7 @@ impl AnalyzeApi for RealApi {
         }
         let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
         fetch_opensea_contract_collection_slug(
-            &self.client,
+            &self.other_client,
             &endpoints.opensea_base,
             chain,
             contract_address,
@@ -519,8 +572,9 @@ impl AnalyzeApi for RealApi {
                 None
             }
         };
-        fetch_contract_sales(
-            &self.client,
+        fetch_contract_sales_with_clients(
+            &self.alchemy_client,
+            &self.other_client,
             &endpoints,
             chain,
             contract_address,
@@ -557,7 +611,7 @@ impl AnalyzeApi for RealApi {
             }
         };
         let collection_slug = match fetch_opensea_contract_collection_slug(
-            &self.client,
+            &self.other_client,
             &endpoints.opensea_base,
             chain,
             contract_address,
@@ -574,7 +628,7 @@ impl AnalyzeApi for RealApi {
             }
         };
         match fetch_opensea_contract_market_events(
-            &self.client,
+            &self.other_client,
             &endpoints.opensea_base,
             chain,
             contract_address,
@@ -601,7 +655,7 @@ impl AnalyzeApi for RealApi {
         tx_hash: &str,
     ) -> Result<TransactionReceiptRecord, AppError> {
         let endpoints = self.endpoints("ethereum", alchemy_network, alchemy_api_key);
-        fetch_transaction_receipt(&self.client, &endpoints, tx_hash).await
+        fetch_transaction_receipt(&self.alchemy_client, &endpoints, tx_hash).await
     }
 
     async fn fetch_transaction_receipts_for_block(
@@ -611,7 +665,7 @@ impl AnalyzeApi for RealApi {
         block_number: i64,
     ) -> Result<BTreeMap<String, TransactionReceiptRecord>, AppError> {
         let endpoints = self.endpoints("ethereum", alchemy_network, alchemy_api_key);
-        fetch_transaction_receipts_for_block(&self.client, &endpoints, block_number).await
+        fetch_transaction_receipts_for_block(&self.alchemy_client, &endpoints, block_number).await
     }
 
     async fn fetch_eth_balance(
@@ -622,7 +676,7 @@ impl AnalyzeApi for RealApi {
         block_number: i64,
     ) -> Result<f64, AppError> {
         let endpoints = self.endpoints("ethereum", alchemy_network, alchemy_api_key);
-        fetch_eth_balance(&self.client, &endpoints, address, block_number).await
+        fetch_eth_balance(&self.alchemy_client, &endpoints, address, block_number).await
     }
 
     async fn fetch_same_block_eth_transfers_for_address(
@@ -633,8 +687,13 @@ impl AnalyzeApi for RealApi {
         address: &str,
     ) -> Result<Vec<EthTransferRecord>, AppError> {
         let endpoints = self.endpoints("ethereum", alchemy_network, alchemy_api_key);
-        fetch_same_block_eth_transfers_for_address(&self.client, &endpoints, block_number, address)
-            .await
+        fetch_same_block_eth_transfers_for_address(
+            &self.alchemy_client,
+            &endpoints,
+            block_number,
+            address,
+        )
+        .await
     }
 
     async fn fetch_transaction_receipt_on_chain(
@@ -645,7 +704,7 @@ impl AnalyzeApi for RealApi {
         tx_hash: &str,
     ) -> Result<TransactionReceiptRecord, AppError> {
         let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
-        fetch_transaction_receipt(&self.client, &endpoints, tx_hash).await
+        fetch_transaction_receipt(&self.alchemy_client, &endpoints, tx_hash).await
     }
 
     async fn fetch_transaction_receipts_for_block_on_chain(
@@ -656,7 +715,7 @@ impl AnalyzeApi for RealApi {
         block_number: i64,
     ) -> Result<BTreeMap<String, TransactionReceiptRecord>, AppError> {
         let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
-        fetch_transaction_receipts_for_block(&self.client, &endpoints, block_number).await
+        fetch_transaction_receipts_for_block(&self.alchemy_client, &endpoints, block_number).await
     }
 
     async fn fetch_eth_balance_on_chain(
@@ -668,7 +727,7 @@ impl AnalyzeApi for RealApi {
         block_number: i64,
     ) -> Result<f64, AppError> {
         let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
-        fetch_eth_balance(&self.client, &endpoints, address, block_number).await
+        fetch_eth_balance(&self.alchemy_client, &endpoints, address, block_number).await
     }
 
     async fn fetch_same_block_eth_transfers_for_address_on_chain(
@@ -680,8 +739,13 @@ impl AnalyzeApi for RealApi {
         address: &str,
     ) -> Result<Vec<EthTransferRecord>, AppError> {
         let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
-        fetch_same_block_eth_transfers_for_address(&self.client, &endpoints, block_number, address)
-            .await
+        fetch_same_block_eth_transfers_for_address(
+            &self.alchemy_client,
+            &endpoints,
+            block_number,
+            address,
+        )
+        .await
     }
 
     async fn fetch_mint_payment_eth_transfers_on_chain(
@@ -708,7 +772,40 @@ impl AnalyzeApi for RealApi {
         };
         let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
         fetch_same_block_value_transfers_for_address(
-            &self.client,
+            &self.alchemy_client,
+            &endpoints,
+            block_number,
+            address,
+            eth_usd_rate,
+        )
+        .await
+    }
+
+    async fn fetch_mint_payment_eth_transfers_to_address_on_chain(
+        &self,
+        chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        block_number: i64,
+        address: &str,
+    ) -> Result<Vec<EthTransferRecord>, AppError> {
+        let eth_usd_rate = match self.current_eth_usd_rate().await {
+            Ok(rate) => Some(rate),
+            Err(err) => {
+                if !self
+                    .eth_usd_rate_warning_emitted
+                    .swap(true, Ordering::Relaxed)
+                {
+                    eprintln!(
+                        "warning: failed to fetch current ETH/USD rate for mint value-flow at {address}: {err}; ETH/WETH mint payments will not be USD-normalized"
+                    );
+                }
+                None
+            }
+        };
+        let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
+        fetch_same_block_value_transfers_to_address(
+            &self.alchemy_client,
             &endpoints,
             block_number,
             address,

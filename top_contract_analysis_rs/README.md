@@ -83,7 +83,9 @@ cargo run --release -- analyze \
   --feature-parquet ../output/top_contract_analysis/ethereum.parquet \
   --feature-db ../output/top_contract_analysis/features.duckdb \
   --max-recall-rows 30000000 \
-  --api-max-concurrency 8 \
+  --alchemy-api-max-concurrency 16 \
+  --other-api-max-concurrency 4 \
+  --matched-contract-max-concurrency 16 \
   --duckdb-memory-limit 50GB \
   --duckdb-threads 32
 ```
@@ -96,7 +98,9 @@ cargo run --release -- analyze \
 - `--timeout 60`
 - `--max-tokens-per-contract 500`
 - `--max-recall-rows 100000`：单批 SQL recall 读取行数；`0` 表示单次读取全部。非 `0` 时会分批读取完整 recall 结果。
-- `--api-max-concurrency 12`
+- `--alchemy-api-max-concurrency 12`：Alchemy 请求全局并发上限。
+- `--other-api-max-concurrency 4`：OpenSea、Etherscan、ETH/USD 等非 Alchemy 请求全局并发上限。旧参数 `--api-max-concurrency` 仍作为兼容别名。
+- `--matched-contract-max-concurrency 4`：matched contract 分析阶段的合约级全局并发上限。
 - `--duckdb-threads 0`：`0` 表示使用当前可用线程数
 - `--duckdb-memory-limit 80GB`
 - `--output ./result/azuki.json`
@@ -123,7 +127,9 @@ cargo run --release -- batch \
   --feature-db ../output/top_contract_analysis/features.duckdb \
   --output-dir ./result \
   --max-recall-rows 30000000 \
-  --api-max-concurrency 4 \
+  --alchemy-api-max-concurrency 16 \
+  --other-api-max-concurrency 4 \
+  --matched-contract-max-concurrency 16 \
   --seed-network-max-concurrency 1 \
   --seed-cpu-max-concurrency 1 \
   --duckdb-memory-limit 50GB
@@ -139,7 +145,9 @@ cargo run --release -- batch \
 
 - `--timeout 30`
 - `--seed-network-max-concurrency 4`：同时处于 seed context 网络 IO 阶段的 seed 合约数。
-- `--api-max-concurrency 8`
+- `--alchemy-api-max-concurrency 8`：Alchemy 请求全局并发上限。
+- `--other-api-max-concurrency 4`：OpenSea、Etherscan、ETH/USD 等非 Alchemy 请求全局并发上限。旧参数 `--api-max-concurrency` 仍作为兼容别名。
+- `--matched-contract-max-concurrency 4`：matched contract 分析阶段的合约级全局并发上限，跨 seed 共享。
 - `--seed-cpu-max-concurrency 1`：同时处于 seed 级 CPU 密集阶段的 seed 合约数，覆盖 DuckDB recall / duplicate scoring。
 - `--duckdb-threads 0`
 - `--duckdb-memory-limit 80GB`
@@ -160,6 +168,6 @@ cargo run --release -- batch \
 - 如果同时传了 `--feature-db` 和 `--feature-parquet`，且 `feature-db` 中该链已经有当前版本数据，则会复用 `feature-db`；如果没有该链数据，才从 Parquet 导入。旧版本 `feature-db` / 旧快照缺少预计算列会直接报错，需要重新运行 `export-snapshot`。
 - 当前快照 schema 强制包含 `metadata_json`、`token_uri_norm`、`image_uri_norm`、`name_norm`。metadata 文档不再持久化，召回和最终复核都从 `metadata_json` 派生；SQL recall 会先用规范化 URI/name 列做精确召回，metadata recall 则在 Rust 侧从 `metadata_json` 构建 sketch/source candidate 和 BM25 prefilter。
 - duplicate scoring 使用合约级聚合：查重阶段每个候选合约只用代表 token 评分，BM25 metadata scoring 会复用缓存的 token、term frequency 和文档长度；合约命中后，分析阶段会通过 Alchemy `getNFTsForContract` 拉取该合约下全量 NFT，用于 NFT 级报告、地址和交易统计。
-- `batch` 按 seed 流式调度：每个 seed 依次经过三阶段：seed context 网络 IO 阶段、DuckDB recall / duplicate scoring CPU 阶段、matched contract 分析阶段。第三阶段不占用 seed 级网络或 CPU 槽位，因此某个 seed 正在分析 matched contracts 时，其他 seed 仍可进入第一、第二阶段；matched contract 合约级分析固定串行执行，合约内部的 API 请求仍统一计入全局 `--api-max-concurrency`。
+- `batch` 按 seed 流式调度：每个 seed 依次经过三阶段：seed context 网络 IO 阶段、DuckDB recall / duplicate scoring CPU 阶段、matched contract 分析阶段。第三阶段不占用 seed 级网络或 CPU 槽位，因此某个 seed 正在分析 matched contracts 时，其他 seed 仍可进入第一、第二阶段；matched contract 合约级分析跨 seed 共享 `--matched-contract-max-concurrency`，不同 seed 下的 matched 合约可以同时执行。
 - `batch` 的资源在整个进程内全局复用：API client、HTTP semaphore、DuckDB feature store 不按并发槽位复制，避免重复占用内存。
-- `batch` 的并发参数都是全局限制：`--seed-network-max-concurrency` 控制同时参与第一阶段网络 IO 的 seed 数，`--seed-cpu-max-concurrency` 控制同时参与第二阶段 DuckDB recall / duplicate scoring 的 seed 数，`--api-max-concurrency` 控制全局 HTTP 请求并发。sale metric 和 mint value-flow 不再有单独并发参数，它们的 API 请求统一走 `--api-max-concurrency`。默认 `--seed-cpu-max-concurrency 1`，避免多个 seed 同时打满 DuckDB / Rayon CPU。
+- `batch` 的并发参数都是全局限制：`--seed-network-max-concurrency` 控制同时参与第一阶段网络 IO 的 seed 数，`--seed-cpu-max-concurrency` 控制同时参与第二阶段 DuckDB recall / duplicate scoring 的 seed 数，`--matched-contract-max-concurrency` 控制第三阶段合约级分析并发，`--alchemy-api-max-concurrency` 和 `--other-api-max-concurrency` 分别控制 Alchemy 与其它 HTTP 请求并发。sale metric 和 mint value-flow 不再有单独并发参数。默认 `--seed-cpu-max-concurrency 1`，避免多个 seed 同时打满 DuckDB / Rayon CPU。

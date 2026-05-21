@@ -629,11 +629,32 @@ pub async fn fetch_contract_transfers(
     contract_address: &str,
     token_type: &str,
 ) -> Result<Vec<TransferRecord>, AppError> {
-    match fetch_alchemy_contract_transfers(client, endpoints, contract_address).await {
+    fetch_contract_transfers_with_etherscan_fallback(
+        client,
+        client,
+        endpoints,
+        etherscan_api_key,
+        chain,
+        contract_address,
+        token_type,
+    )
+    .await
+}
+
+pub async fn fetch_contract_transfers_with_etherscan_fallback(
+    alchemy_client: &AsyncApiClient,
+    other_client: &AsyncApiClient,
+    endpoints: &ApiEndpoints,
+    etherscan_api_key: &str,
+    chain: &str,
+    contract_address: &str,
+    token_type: &str,
+) -> Result<Vec<TransferRecord>, AppError> {
+    match fetch_alchemy_contract_transfers(alchemy_client, endpoints, contract_address).await {
         Ok(rows) => Ok(rows),
         Err(_) => {
             fetch_etherscan_contract_transfers(
-                client,
+                other_client,
                 &endpoints.etherscan_base,
                 etherscan_api_key,
                 chain,
@@ -944,6 +965,23 @@ pub async fn fetch_same_block_value_transfers_for_address(
     );
     let mut rows = from_rows?;
     rows.extend(to_rows?);
+    Ok(deduplicate_eth_transfer_rows(rows))
+}
+
+pub async fn fetch_same_block_value_transfers_to_address(
+    client: &AsyncApiClient,
+    endpoints: &ApiEndpoints,
+    block_number: i64,
+    address: &str,
+    eth_usd_rate: Option<f64>,
+) -> Result<Vec<EthTransferRecord>, AppError> {
+    let rows =
+        fetch_address_eth_transfers(client, endpoints, block_number, address, "to", eth_usd_rate)
+            .await?;
+    Ok(deduplicate_eth_transfer_rows(rows))
+}
+
+fn deduplicate_eth_transfer_rows(rows: Vec<EthTransferRecord>) -> Vec<EthTransferRecord> {
     let mut deduped = BTreeMap::new();
     for row in rows {
         deduped.insert(
@@ -961,7 +999,7 @@ pub async fn fetch_same_block_value_transfers_for_address(
             row,
         );
     }
-    Ok(deduped.into_values().collect())
+    deduped.into_values().collect()
 }
 
 fn parse_hex_or_decimal_i64(value: Option<&Value>) -> i64 {

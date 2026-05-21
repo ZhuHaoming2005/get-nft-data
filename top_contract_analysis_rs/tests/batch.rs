@@ -265,6 +265,14 @@ impl AnalyzeApi for InstrumentedBatchApi {
                 .fetch_add(1, Ordering::SeqCst)
                 + 1;
             BatchPipelineProbe::record_max(&self.probe.candidate_metadata_max_seen, current);
+            if self.transfer_sleep_ms > 0 && !self.emit_native_sale {
+                let mut waited = 0;
+                while self.probe.candidate_metadata_calls.load(Ordering::SeqCst) < 2 && waited < 100
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    waited += 1;
+                }
+            }
         }
         if seed_metadata_call_index.is_some_and(|index| index > 0) {
             let mut waited = 0;
@@ -484,7 +492,7 @@ impl AnalyzeApi for InstrumentedBatchApi {
             let mut waited = 0;
             while !self
                 .probe
-                .holder_started_before_sale_metric_finished
+                .expansion_observed_sale_metric_active
                 .load(Ordering::SeqCst)
                 && waited < 1000
             {
@@ -1931,6 +1939,7 @@ async fn batch_limits_contract_analysis_globally_across_seeds() {
             alchemy_api_key: "key".into(),
             seed_network_max_concurrency: 2,
             seed_cpu_max_concurrency: 2,
+            matched_contract_max_concurrency: 2,
             ..BatchRequest::default()
         },
         &deps,
@@ -1938,19 +1947,19 @@ async fn batch_limits_contract_analysis_globally_across_seeds() {
     .await
     .unwrap();
 
-    assert_eq!(probe.candidate_transfer_max_seen.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.candidate_transfer_max_seen.load(Ordering::SeqCst), 2);
     assert!(
         probe.holder_max_seen.load(Ordering::SeqCst) >= 2,
         "expected candidate holder API checks to be scheduled outside the match-contract worker limit"
     );
-    assert_eq!(probe.expansion_max_seen.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.expansion_max_seen.load(Ordering::SeqCst), 2);
     assert_eq!(probe.metadata_calls.load(Ordering::SeqCst), 2);
     assert_eq!(probe.candidate_metadata_calls.load(Ordering::SeqCst), 2);
-    assert_eq!(probe.candidate_metadata_max_seen.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.candidate_metadata_max_seen.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn batch_keeps_match_contract_worker_slot_through_sale_metrics() {
+async fn batch_allows_match_contracts_from_different_seeds_to_overlap_sale_metrics() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n").unwrap();
     let probe = Arc::new(BatchPipelineProbe::default());
@@ -1977,6 +1986,7 @@ async fn batch_keeps_match_contract_worker_slot_through_sale_metrics() {
             alchemy_api_key: "key".into(),
             seed_network_max_concurrency: 2,
             seed_cpu_max_concurrency: 2,
+            matched_contract_max_concurrency: 2,
             ..BatchRequest::default()
         },
         &deps,
@@ -1995,10 +2005,10 @@ async fn batch_keeps_match_contract_worker_slot_through_sale_metrics() {
         "expected seed2 pre-analysis holder API check to start before seed1 sale metrics finished"
     );
     assert!(
-        !probe
+        probe
             .expansion_observed_sale_metric_active
             .load(Ordering::SeqCst),
-        "expected seed2 matched-contract expansion to wait for seed1 sale metrics while matched-contract analysis is serial"
+        "expected seed2 matched-contract expansion to overlap seed1 sale metrics under the global matched-contract limit"
     );
 }
 

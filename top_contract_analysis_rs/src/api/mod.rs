@@ -184,16 +184,19 @@ fn response_body_excerpt(body: &str) -> String {
 }
 
 pub use alchemy::{
-    fetch_contract_metadata, fetch_contract_owners, fetch_contract_transfers, fetch_eth_balance,
+    fetch_contract_metadata, fetch_contract_owners, fetch_contract_transfers,
+    fetch_contract_transfers_with_etherscan_fallback, fetch_eth_balance,
     fetch_is_holder_of_contract, fetch_license_sample, fetch_same_block_eth_transfers_for_address,
-    fetch_same_block_value_transfers_for_address, fetch_seed_contract_nfts,
-    fetch_transaction_receipt, fetch_transaction_receipts_for_block, is_open_license_payload,
+    fetch_same_block_value_transfers_for_address, fetch_same_block_value_transfers_to_address,
+    fetch_seed_contract_nfts, fetch_transaction_receipt, fetch_transaction_receipts_for_block,
+    is_open_license_payload,
 };
 pub use etherscan::fetch_etherscan_contract_transfers;
 pub use opensea::{
-    fetch_contract_sales, fetch_opensea_account_holds_contract_nft,
-    fetch_opensea_contract_collection_slug, fetch_opensea_contract_market_events,
-    fetch_opensea_contract_metadata, fetch_opensea_contract_nfts,
+    fetch_contract_sales, fetch_contract_sales_with_clients,
+    fetch_opensea_account_holds_contract_nft, fetch_opensea_contract_collection_slug,
+    fetch_opensea_contract_market_events, fetch_opensea_contract_metadata,
+    fetch_opensea_contract_nfts,
 };
 
 pub async fn fetch_contract_metadata_with_opensea_fallback(
@@ -203,7 +206,26 @@ pub async fn fetch_contract_metadata_with_opensea_fallback(
     contract_address: &str,
     opensea_api_key: &str,
 ) -> Result<ContractMetadata, AppError> {
-    match fetch_contract_metadata(client, endpoints, chain, contract_address).await {
+    fetch_contract_metadata_with_opensea_fallback_clients(
+        client,
+        client,
+        endpoints,
+        chain,
+        contract_address,
+        opensea_api_key,
+    )
+    .await
+}
+
+pub async fn fetch_contract_metadata_with_opensea_fallback_clients(
+    alchemy_client: &AsyncApiClient,
+    other_client: &AsyncApiClient,
+    endpoints: &ApiEndpoints,
+    chain: &str,
+    contract_address: &str,
+    opensea_api_key: &str,
+) -> Result<ContractMetadata, AppError> {
+    match fetch_contract_metadata(alchemy_client, endpoints, chain, contract_address).await {
         Ok(metadata) => Ok(metadata),
         Err(err) if opensea_api_key.trim().is_empty() => Err(err),
         Err(err) => {
@@ -211,7 +233,7 @@ pub async fn fetch_contract_metadata_with_opensea_fallback(
                 "warning: Alchemy contract info failed for {contract_address}: {err}; falling back to OpenSea"
             );
             fetch_opensea_contract_metadata(
-                client,
+                other_client,
                 &endpoints.opensea_base,
                 chain,
                 contract_address,
