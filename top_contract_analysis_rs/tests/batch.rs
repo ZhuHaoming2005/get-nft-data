@@ -827,9 +827,13 @@ fn batch_markdown_preserves_reference_summary_and_output_index_lines() {
 
     assert!(markdown.contains("# Top NFT 合约批量分析总报告"));
     assert!(markdown.contains("- 检测到开放许可的 seed 数: 1"));
-    assert!(markdown.contains("- 疑似操作者地址总数: 7"));
+    assert!(markdown.contains("- 疑似操作者地址数(全局去重): 7"));
+    assert!(markdown.contains("- 中性地址数(全局去重): 8"));
     assert!(markdown.contains("- 受害者地址数(全局去重): 4"));
     assert!(markdown.contains("- 受害者地址观测数(按 seed 求和): 6"));
+    assert!(markdown.contains("- 多次侵权地址观测数(与单 seed 口径一致，按 seed 求和): 3"));
+    assert!(markdown.contains("- 多次侵权地址数(与单 seed 口径一致，全局去重): 2"));
+    assert!(!markdown.contains("多次侵权地址总数(跨批次全局去重)"));
     assert!(markdown.contains("- 受害者获取成本(USD)汇总: 12.5"));
     assert!(markdown.contains("- 总套牢成本(USD)汇总: 5 / 40.00%"));
     assert!(markdown.contains("- 二级市场受害者成本(USD)汇总: 12.5"));
@@ -954,6 +958,224 @@ async fn batch_uses_contract_level_seed_name_for_snapshot_recall() {
             ("0xseed1".to_string(), vec!["Seed seed1".to_string()]),
             ("0xseed2".to_string(), vec!["Seed seed2".to_string()]),
         ])
+    );
+}
+
+#[tokio::test]
+async fn batch_repeat_infringing_count_does_not_recompute_cross_seed_minter_contracts() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n").unwrap();
+
+    let cached_one = cached_single_report(
+        SeedContractPayload {
+            chain: "ethereum".into(),
+            contract_address: "0xseed1".into(),
+            name: "Seed One".into(),
+            ..SeedContractPayload::default()
+        },
+        ReportSummary {
+            repeat_infringing_address_count: 0,
+            ..ReportSummary::default()
+        },
+        vec![InfringingTokenRecord {
+            contract_address: "0xc1".into(),
+            token_id: "1".into(),
+            minter_address: "0xcrossseed".into(),
+            ..InfringingTokenRecord::default()
+        }],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        BTreeMap::new(),
+    );
+    std::fs::write(
+        dir.path().join("top_contract_analysis__cached_one.json"),
+        serde_json::to_string(&cached_one).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("top_contract_analysis__cached_one.md"),
+        "# cached one\n",
+    )
+    .unwrap();
+
+    let cached_two = cached_single_report(
+        SeedContractPayload {
+            chain: "ethereum".into(),
+            contract_address: "0xseed2".into(),
+            name: "Seed Two".into(),
+            ..SeedContractPayload::default()
+        },
+        ReportSummary {
+            repeat_infringing_address_count: 0,
+            ..ReportSummary::default()
+        },
+        vec![InfringingTokenRecord {
+            contract_address: "0xc2".into(),
+            token_id: "2".into(),
+            minter_address: "0xcrossseed".into(),
+            ..InfringingTokenRecord::default()
+        }],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        BTreeMap::new(),
+    );
+    std::fs::write(
+        dir.path().join("top_contract_analysis__cached_two.json"),
+        serde_json::to_string(&cached_two).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("top_contract_analysis__cached_two.md"),
+        "# cached two\n",
+    )
+    .unwrap();
+
+    let deps = AnalysisDeps {
+        api: Arc::new(FakeBatchApi),
+        feature_store: Arc::new(EmptyFeatureStore),
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    let summary = run_batch(
+        BatchRequest {
+            chain: "ethereum".into(),
+            seed_file: dir.path().join("seeds.txt"),
+            output_dir: dir.path().to_path_buf(),
+            alchemy_api_key: "key".into(),
+            ..BatchRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        summary.batch_summary.repeat_infringing_address_count_total,
+        0
+    );
+    assert_eq!(
+        summary.batch_summary.repeat_infringing_address_count_global,
+        0
+    );
+}
+
+#[tokio::test]
+async fn batch_repeat_infringing_global_deduplicates_single_seed_repeat_addresses() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n").unwrap();
+
+    let cached_one = cached_single_report(
+        SeedContractPayload {
+            chain: "ethereum".into(),
+            contract_address: "0xseed1".into(),
+            name: "Seed One".into(),
+            ..SeedContractPayload::default()
+        },
+        ReportSummary {
+            repeat_infringing_address_count: 1,
+            ..ReportSummary::default()
+        },
+        vec![
+            InfringingTokenRecord {
+                contract_address: "0xc1".into(),
+                token_id: "1".into(),
+                minter_address: "0xrepeat".into(),
+                ..InfringingTokenRecord::default()
+            },
+            InfringingTokenRecord {
+                contract_address: "0xc2".into(),
+                token_id: "2".into(),
+                minter_address: "0xrepeat".into(),
+                ..InfringingTokenRecord::default()
+            },
+        ],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        BTreeMap::new(),
+    );
+    std::fs::write(
+        dir.path().join("top_contract_analysis__cached_one.json"),
+        serde_json::to_string(&cached_one).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("top_contract_analysis__cached_one.md"),
+        "# cached one\n",
+    )
+    .unwrap();
+
+    let cached_two = cached_single_report(
+        SeedContractPayload {
+            chain: "ethereum".into(),
+            contract_address: "0xseed2".into(),
+            name: "Seed Two".into(),
+            ..SeedContractPayload::default()
+        },
+        ReportSummary {
+            repeat_infringing_address_count: 1,
+            ..ReportSummary::default()
+        },
+        vec![
+            InfringingTokenRecord {
+                contract_address: "0xc3".into(),
+                token_id: "3".into(),
+                minter_address: "0xrepeat".into(),
+                ..InfringingTokenRecord::default()
+            },
+            InfringingTokenRecord {
+                contract_address: "0xc4".into(),
+                token_id: "4".into(),
+                minter_address: "0xrepeat".into(),
+                ..InfringingTokenRecord::default()
+            },
+        ],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        BTreeMap::new(),
+    );
+    std::fs::write(
+        dir.path().join("top_contract_analysis__cached_two.json"),
+        serde_json::to_string(&cached_two).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("top_contract_analysis__cached_two.md"),
+        "# cached two\n",
+    )
+    .unwrap();
+
+    let deps = AnalysisDeps {
+        api: Arc::new(FakeBatchApi),
+        feature_store: Arc::new(EmptyFeatureStore),
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    let summary = run_batch(
+        BatchRequest {
+            chain: "ethereum".into(),
+            seed_file: dir.path().join("seeds.txt"),
+            output_dir: dir.path().to_path_buf(),
+            alchemy_api_key: "key".into(),
+            ..BatchRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        summary.batch_summary.repeat_infringing_address_count_total,
+        2
+    );
+    assert_eq!(
+        summary.batch_summary.repeat_infringing_address_count_global,
+        1
     );
 }
 

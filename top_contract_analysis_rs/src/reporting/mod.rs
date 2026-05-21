@@ -393,10 +393,13 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
             summary.infringing_nft_count_total
         ),
         format!(
-            "- 疑似操作者地址总数: {}",
+            "- 疑似操作者地址数(全局去重): {}",
             summary.malicious_address_count_total
         ),
-        format!("- 中性地址总数: {}", summary.neutral_address_count_total),
+        format!(
+            "- 中性地址数(全局去重): {}",
+            summary.neutral_address_count_total
+        ),
         format!(
             "- 受害者地址数(全局去重): {}",
             summary.victim_acquisition_address_count_distinct
@@ -406,11 +409,11 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
             summary.victim_acquisition_address_count_total
         ),
         format!(
-            "- 多次侵权地址总数(按 seed 求和): {}",
+            "- 多次侵权地址观测数(与单 seed 口径一致，按 seed 求和): {}",
             summary.repeat_infringing_address_count_total
         ),
         format!(
-            "- 多次侵权地址总数(跨批次全局去重): {}",
+            "- 多次侵权地址数(与单 seed 口径一致，全局去重): {}",
             summary.repeat_infringing_address_count_global
         ),
         format!(

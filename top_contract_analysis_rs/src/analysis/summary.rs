@@ -508,21 +508,8 @@ pub(super) fn build_report_summary(input: ReportSummaryInput<'_>) -> ReportSumma
         .filter(|value| !value.is_empty())
         .collect::<BTreeSet<_>>()
         .len() as i64;
-    let repeat_infringing_address_count = infringing_tokens
-        .iter()
-        .filter(|item| !item.minter_address.is_empty() && !item.contract_address.is_empty())
-        .fold(
-            BTreeMap::<String, BTreeSet<String>>::new(),
-            |mut acc, item| {
-                acc.entry(item.minter_address.clone())
-                    .or_default()
-                    .insert(item.contract_address.clone());
-                acc
-            },
-        )
-        .values()
-        .filter(|contracts| contracts.len() > 1)
-        .count() as i64;
+    let repeat_infringing_address_count =
+        repeat_infringing_addresses(infringing_tokens).len() as i64;
     let candidate_open_license_tokens: Vec<&InfringingTokenRecord> = infringing_tokens
         .iter()
         .filter(|item| item.candidate_open_license)
@@ -738,15 +725,14 @@ pub(super) fn build_batch_report_summary(
         .iter()
         .flat_map(|item| item.corrupted_victim_addresses.iter().cloned())
         .collect();
-    let mut minter_infringing_contracts: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for seed_report in seed_reports {
-        for (minter, contracts) in &seed_report.minter_infringing_contracts {
-            minter_infringing_contracts
-                .entry(minter.clone())
-                .or_default()
-                .extend(contracts.iter().cloned());
-        }
-    }
+    let repeat_infringing_address_count_total: i64 = seed_reports
+        .iter()
+        .map(|item| item.repeat_infringing_addresses.len() as i64)
+        .sum();
+    let repeat_infringing_addresses: BTreeSet<String> = seed_reports
+        .iter()
+        .flat_map(|item| item.repeat_infringing_addresses.iter().cloned())
+        .collect();
     let secondary_sale_victim_cost_eth_total: f64 = seed_reports
         .iter()
         .map(|item| item.report.report_summary.secondary_sale_victim_cost_eth)
@@ -943,14 +929,8 @@ pub(super) fn build_batch_report_summary(
             .sum(),
         malicious_address_count_total: malicious_addresses.len() as i64,
         neutral_address_count_total: neutral_addresses.len() as i64,
-        repeat_infringing_address_count_total: seed_reports
-            .iter()
-            .map(|item| item.report.report_summary.repeat_infringing_address_count)
-            .sum(),
-        repeat_infringing_address_count_global: minter_infringing_contracts
-            .values()
-            .filter(|contracts| contracts.len() > 1)
-            .count() as i64,
+        repeat_infringing_address_count_total,
+        repeat_infringing_address_count_global: repeat_infringing_addresses.len() as i64,
         legit_duplicate_contract_count_total: seed_reports
             .iter()
             .map(|item| item.report.report_summary.legit_duplicate_contract_count)
@@ -1082,8 +1062,9 @@ pub(super) fn build_batch_seed_aggregate(payload: SingleReportPayload) -> BatchS
         .map(|item| normalized_address(&item.address))
         .filter(|value| !value.is_empty())
         .collect();
-    let minter_infringing_contracts = payload_minter_contracts(&payload.infringing_tokens);
-    let report_summary = payload.report_summary.clone();
+    let repeat_infringing_addresses = repeat_infringing_addresses(&payload.infringing_tokens);
+    let mut report_summary = payload.report_summary.clone();
+    report_summary.repeat_infringing_address_count = repeat_infringing_addresses.len() as i64;
 
     BatchSeedAggregate {
         report: BatchSeedReportPayload {
@@ -1096,16 +1077,16 @@ pub(super) fn build_batch_seed_aggregate(payload: SingleReportPayload) -> BatchS
         victim_acquisition_addresses,
         stuck_victim_addresses,
         corrupted_victim_addresses,
-        minter_infringing_contracts,
+        repeat_infringing_addresses,
     }
 }
 
-pub(super) fn payload_minter_contracts(
+pub(super) fn repeat_infringing_addresses(
     infringing_tokens: &[InfringingTokenRecord],
-) -> BTreeMap<String, BTreeSet<String>> {
+) -> BTreeSet<String> {
     let mut minter_contracts: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for token in infringing_tokens {
-        let minter = token.minter_address.trim().to_lowercase();
+        let minter = normalized_address(&token.minter_address);
         let contract = token.contract_address.trim().to_lowercase();
         if minter.is_empty() || contract.is_empty() {
             continue;
@@ -1113,6 +1094,9 @@ pub(super) fn payload_minter_contracts(
         minter_contracts.entry(minter).or_default().insert(contract);
     }
     minter_contracts
+        .into_iter()
+        .filter_map(|(minter, contracts)| (contracts.len() > 1).then_some(minter))
+        .collect()
 }
 
 pub(super) fn positive_seconds(value: i64) -> Option<f64> {

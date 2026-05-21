@@ -216,7 +216,7 @@ struct BatchSeedAggregate {
     victim_acquisition_addresses: BTreeSet<String>,
     stuck_victim_addresses: BTreeSet<String>,
     corrupted_victim_addresses: BTreeSet<String>,
-    minter_infringing_contracts: BTreeMap<String, BTreeSet<String>>,
+    repeat_infringing_addresses: BTreeSet<String>,
 }
 
 struct ContractAnalysisResult {
