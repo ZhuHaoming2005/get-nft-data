@@ -29,7 +29,7 @@ pub struct AnalyzeArgs {
     pub etherscan_api_key: String,
     #[arg(long, default_value = "")]
     pub opensea_api_key: String,
-    #[arg(long, default_value_t = 95.0)]
+    #[arg(long, default_value_t = 98.0)]
     pub name_threshold: f64,
     #[arg(long, default_value_t = 0.6)]
     pub metadata_threshold: f64,
@@ -80,7 +80,7 @@ pub struct BatchArgs {
     pub etherscan_api_key: String,
     #[arg(long, default_value = "")]
     pub opensea_api_key: String,
-    #[arg(long, default_value_t = 95.0)]
+    #[arg(long, default_value_t = 98.0)]
     pub name_threshold: f64,
     #[arg(long, default_value_t = 0.6)]
     pub metadata_threshold: f64,
