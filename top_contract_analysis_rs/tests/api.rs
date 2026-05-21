@@ -7,8 +7,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use top_contract_analysis_rs::api::{
     fetch_contract_metadata, fetch_contract_metadata_with_opensea_fallback, fetch_contract_owners,
-    fetch_contract_sales, fetch_contract_sales_with_clients, fetch_contract_transfers,
-    fetch_eth_balance, fetch_is_holder_of_contract, fetch_license_sample,
+    fetch_contract_sales, fetch_contract_sales_with_clients, fetch_contract_total_supply,
+    fetch_contract_transfers, fetch_eth_balance, fetch_is_holder_of_contract, fetch_license_sample,
     fetch_opensea_account_holds_contract_nft, fetch_opensea_contract_collection_slug,
     fetch_opensea_contract_market_events, fetch_opensea_contract_metadata,
     fetch_opensea_contract_nfts, fetch_same_block_eth_transfers_for_address,
@@ -693,6 +693,58 @@ async fn fetch_contract_metadata_enriches_control_addresses_from_rpc() {
         meta.proxy_admin_address,
         "0x3333333333333333333333333333333333333333"
     );
+}
+
+#[tokio::test]
+async fn fetch_contract_total_supply_reads_abi_encoded_rpc_value() {
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/v2/key")
+                .body_contains("eth_call")
+                .body_contains("18160ddd");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": "0x0000000000000000000000000000000000000000000000000000000000000002"
+            }));
+        })
+        .await;
+
+    let client = test_client();
+    let endpoints = test_endpoints(&server.base_url());
+    let total_supply = fetch_contract_total_supply(&client, &endpoints, "0xseed")
+        .await
+        .unwrap();
+
+    assert_eq!(total_supply, Some(2));
+}
+
+#[tokio::test]
+async fn fetch_contract_total_supply_returns_none_for_rpc_error() {
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/v2/key")
+                .body_contains("eth_call")
+                .body_contains("18160ddd");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {"code": 3, "message": "execution reverted"}
+            }));
+        })
+        .await;
+
+    let client = test_client();
+    let endpoints = test_endpoints(&server.base_url());
+    let total_supply = fetch_contract_total_supply(&client, &endpoints, "0xseed")
+        .await
+        .unwrap();
+
+    assert_eq!(total_supply, None);
 }
 
 #[tokio::test]

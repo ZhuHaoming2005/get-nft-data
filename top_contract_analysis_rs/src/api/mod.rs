@@ -258,8 +258,8 @@ fn response_body_excerpt(body: &str) -> String {
 }
 
 pub use alchemy::{
-    fetch_contract_metadata, fetch_contract_owners, fetch_contract_transfers,
-    fetch_contract_transfers_with_etherscan_fallback, fetch_eth_balance,
+    fetch_contract_metadata, fetch_contract_owners, fetch_contract_total_supply,
+    fetch_contract_transfers, fetch_contract_transfers_with_etherscan_fallback, fetch_eth_balance,
     fetch_is_holder_of_contract, fetch_license_sample, fetch_same_block_eth_transfers_for_address,
     fetch_same_block_value_transfers_for_address, fetch_same_block_value_transfers_to_address,
     fetch_seed_contract_nfts, fetch_transaction_receipt, fetch_transaction_receipts_for_block,

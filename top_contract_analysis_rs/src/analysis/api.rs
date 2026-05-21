@@ -6,14 +6,15 @@ use async_trait::async_trait;
 
 use crate::api::{
     fetch_contract_metadata_with_opensea_fallback_clients, fetch_contract_owners,
-    fetch_contract_sales_with_clients, fetch_contract_transfers_with_etherscan_fallback,
-    fetch_eth_balance, fetch_etherscan_contract_transfers, fetch_is_holder_of_contract,
-    fetch_license_sample, fetch_opensea_account_holds_contract_nft,
-    fetch_opensea_contract_collection_slug, fetch_opensea_contract_market_events,
-    fetch_opensea_contract_nfts, fetch_same_block_eth_transfers_for_address,
-    fetch_same_block_value_transfers_for_address, fetch_same_block_value_transfers_to_address,
-    fetch_seed_contract_nfts, fetch_transaction_receipt, fetch_transaction_receipts_for_block,
-    is_open_license_payload, ApiEndpoints, AsyncApiClient,
+    fetch_contract_sales_with_clients, fetch_contract_total_supply,
+    fetch_contract_transfers_with_etherscan_fallback, fetch_eth_balance,
+    fetch_etherscan_contract_transfers, fetch_is_holder_of_contract, fetch_license_sample,
+    fetch_opensea_account_holds_contract_nft, fetch_opensea_contract_collection_slug,
+    fetch_opensea_contract_market_events, fetch_opensea_contract_nfts,
+    fetch_same_block_eth_transfers_for_address, fetch_same_block_value_transfers_for_address,
+    fetch_same_block_value_transfers_to_address, fetch_seed_contract_nfts,
+    fetch_transaction_receipt, fetch_transaction_receipts_for_block, is_open_license_payload,
+    ApiEndpoints, AsyncApiClient,
 };
 use crate::currency::FALLBACK_ETH_USD_RATE;
 use crate::error::AppError;
@@ -65,6 +66,16 @@ pub trait AnalyzeApi: Send + Sync {
         let _ = opensea_api_key;
         self.fetch_seed_contract_nfts(chain, alchemy_api_key, alchemy_network, contract_address)
             .await
+    }
+
+    async fn fetch_contract_total_supply(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _contract_address: &str,
+    ) -> Result<Option<u64>, AppError> {
+        Ok(None)
     }
 
     async fn fetch_license_sample(
@@ -426,6 +437,17 @@ impl AnalyzeApi for RealApi {
                 Ok(rows)
             }
         }
+    }
+
+    async fn fetch_contract_total_supply(
+        &self,
+        chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        contract_address: &str,
+    ) -> Result<Option<u64>, AppError> {
+        let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
+        fetch_contract_total_supply(&self.alchemy_client, &endpoints, contract_address).await
     }
 
     async fn fetch_license_sample(

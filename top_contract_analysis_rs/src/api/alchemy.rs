@@ -331,6 +331,31 @@ pub async fn fetch_contract_metadata(
     Ok(metadata)
 }
 
+pub async fn fetch_contract_total_supply(
+    client: &AsyncApiClient,
+    endpoints: &ApiEndpoints,
+    contract_address: &str,
+) -> Result<Option<u64>, AppError> {
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_call",
+        "params": [{
+            "to": contract_address,
+            "data": "0x18160ddd"
+        }, "latest"]
+    });
+    let body: Value = client
+        .post_json(&endpoints.alchemy_rpc_base, &payload)
+        .await?;
+    if body.get("error").is_some() {
+        return Ok(None);
+    }
+    Ok(abi_u64_from_hex(
+        body.get("result").and_then(Value::as_str).unwrap_or(""),
+    ))
+}
+
 fn contract_metadata_lower_field(payload: &Value, meta: &Value, fields: &[&str]) -> String {
     for source in [meta, payload] {
         for field in fields {
@@ -427,6 +452,18 @@ fn abi_address_from_hex(value: &str) -> Option<String> {
     }
     let address = format!("0x{}", &hex[hex.len() - 40..]).to_lowercase();
     (address != ZERO_ADDRESS).then_some(address)
+}
+
+fn abi_u64_from_hex(value: &str) -> Option<u64> {
+    let hex = value
+        .trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X")
+        .trim_start_matches('0');
+    if hex.is_empty() {
+        return Some(0);
+    }
+    u64::from_str_radix(hex, 16).ok()
 }
 
 pub async fn fetch_eip2981_royalty_recipient(

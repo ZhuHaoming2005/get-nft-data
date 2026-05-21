@@ -700,18 +700,29 @@ async fn analyze_one_matched_contract(
             &context.snapshot_token_index,
         )
         .await?;
-        let result = analyze_duplicate_contract(DuplicateContractAnalysisInput {
-            request: &context.request,
-            deps: &context.deps,
-            token_type: context.token_type.as_str(),
-            contract_address: &contract_address,
-            contract_candidates: &contract_candidates,
-            contract_metadata,
-            official_addresses: &context.official_addresses,
-            candidate_open_license_by_token: &context.candidate_open_license_by_token,
-            analysis_timestamp: context.analysis_timestamp,
-        })
-        .await?;
+        let result = if current_supply_implausibly_smaller_than_candidates(
+            &context.request,
+            &context.deps,
+            &contract_address,
+            contract_candidates.len(),
+        )
+        .await
+        {
+            implausible_candidate_filtered_result(&contract_address, contract_metadata)
+        } else {
+            analyze_duplicate_contract(DuplicateContractAnalysisInput {
+                request: &context.request,
+                deps: &context.deps,
+                token_type: context.token_type.as_str(),
+                contract_address: &contract_address,
+                contract_candidates: &contract_candidates,
+                contract_metadata,
+                official_addresses: &context.official_addresses,
+                candidate_open_license_by_token: &context.candidate_open_license_by_token,
+                analysis_timestamp: context.analysis_timestamp,
+            })
+            .await?
+        };
         (contract_candidates, result)
     };
     Ok(MatchedContractAnalysisOutput {

@@ -10,6 +10,11 @@ use super::{
     ContractAnalysisResult,
 };
 
+const CURRENT_SUPPLY_MISMATCH_MIN_CANDIDATES: usize = 20;
+const CURRENT_SUPPLY_MISMATCH_MIN_MULTIPLE: u64 = 5;
+const CURRENT_SUPPLY_MISMATCH_ABSOLUTE_TOLERANCE: u64 = 10;
+const CURRENT_SUPPLY_MISMATCH_RELATIVE_TOLERANCE_DIVISOR: u64 = 20;
+
 pub(super) fn merge_contract_analysis_result(
     result: ContractAnalysisResult,
     state: &mut AnalysisOutputState,
@@ -125,6 +130,65 @@ pub(super) fn implausible_candidate_filtered_result(
         fraud_trade_stats: BTreeMap::new(),
         nft_propagation_path: None,
     }
+}
+
+pub(super) async fn current_supply_implausibly_smaller_than_candidates(
+    request: &AnalyzeRequest,
+    deps: &AnalysisDeps,
+    contract_address: &str,
+    candidate_count: usize,
+) -> bool {
+    if candidate_count < CURRENT_SUPPLY_MISMATCH_MIN_CANDIDATES {
+        return false;
+    }
+
+    let current_total_supply = match deps
+        .api
+        .fetch_contract_total_supply(
+            &request.chain,
+            &request.alchemy_api_key,
+            request.alchemy_network.as_deref(),
+            contract_address,
+        )
+        .await
+    {
+        Ok(Some(current_total_supply)) => current_total_supply,
+        Ok(None) => return false,
+        Err(err) => {
+            eprintln!(
+                "warning: totalSupply lookup failed for {contract_address}: {err}; continuing without current-supply hard exclusion"
+            );
+            return false;
+        }
+    };
+
+    if !candidate_count_exceeds_current_supply(candidate_count, current_total_supply) {
+        return false;
+    }
+
+    eprintln!(
+        "warning: excluding implausible duplicate candidate {contract_address}: expanded candidate token count ({candidate_count}) conflicts with current totalSupply ({current_total_supply})"
+    );
+    true
+}
+
+fn candidate_count_exceeds_current_supply(
+    candidate_count: usize,
+    current_total_supply: u64,
+) -> bool {
+    if candidate_count < CURRENT_SUPPLY_MISMATCH_MIN_CANDIDATES {
+        return false;
+    }
+    if current_total_supply == 0 {
+        return true;
+    }
+
+    let candidate_count = candidate_count as u64;
+    let tolerated_drift = CURRENT_SUPPLY_MISMATCH_ABSOLUTE_TOLERANCE
+        .max(current_total_supply / CURRENT_SUPPLY_MISMATCH_RELATIVE_TOLERANCE_DIVISOR);
+    candidate_count > current_total_supply.saturating_add(tolerated_drift)
+        && candidate_count
+            >= current_total_supply.saturating_mul(CURRENT_SUPPLY_MISMATCH_MIN_MULTIPLE)
 }
 
 pub(super) async fn fetch_candidate_contract_metadata(
