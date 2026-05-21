@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
 
 use futures::{stream, StreamExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -30,7 +29,6 @@ mod sale_metrics;
 pub mod scoring;
 pub mod signals;
 mod summary;
-mod timing;
 mod value_flow;
 
 pub use api::{AnalyzeApi, CandidateSeedHolderRequest, RealApi};
@@ -389,49 +387,36 @@ async fn fetch_seed_context(
     progress: Arc<dyn SeedProgressReporter>,
 ) -> Result<SeedContext, AppError> {
     progress.on_seed_stage("fetch_seed_context").await;
-    let (seed_contract, seed_nfts) = timing::time_async(
-        format!(
-            "seed:{}:fetch_seed_metadata_and_nfts",
-            request.seed_contract_address
-        ),
+    let (seed_contract, seed_nfts) = tokio::try_join!(
         async {
-            tokio::try_join!(
-                async {
-                    deps.api
-                        .fetch_contract_metadata(
-                            &request.chain,
-                            &request.alchemy_api_key,
-                            request.alchemy_network.as_deref(),
-                            &request.opensea_api_key,
-                            &request.seed_contract_address,
-                        )
-                        .await
-                },
-                deps.api.fetch_seed_contract_nfts(
+            deps.api
+                .fetch_contract_metadata(
                     &request.chain,
                     &request.alchemy_api_key,
                     request.alchemy_network.as_deref(),
+                    &request.opensea_api_key,
                     &request.seed_contract_address,
                 )
-            )
+                .await
         },
-    )
-    .await?;
+        deps.api.fetch_seed_contract_nfts(
+            &request.chain,
+            &request.alchemy_api_key,
+            request.alchemy_network.as_deref(),
+            &request.seed_contract_address,
+        )
+    )?;
 
     progress.on_seed_stage("fetch_license_sample").await;
-    let open_license = timing::time_async(
-        format!(
-            "seed:{}:fetch_license_sample",
-            request.seed_contract_address
-        ),
-        deps.api.fetch_license_sample(
+    let open_license = deps
+        .api
+        .fetch_license_sample(
             &request.chain,
             &request.alchemy_api_key,
             request.alchemy_network.as_deref(),
             &seed_nfts,
-        ),
-    )
-    .await?;
+        )
+        .await?;
 
     Ok(SeedContext {
         seed_contract,
@@ -449,61 +434,50 @@ async fn build_candidate_plan_for_seed(
 ) -> Result<(SeedContext, CandidatePlan), AppError> {
     progress.on_seed_stage("load_snapshot").await;
     let _permit = acquire_optional_limit(&cpu_limit).await?;
-    let load_label = format!("seed:{}:load_snapshot", request.seed_contract_address);
-    let (request, context, snapshot, dedup_seed_nfts) = timing::time_async(
-        load_label,
-        tokio::task::spawn_blocking(move || {
-            let dedup_seed_nfts =
-                seed_nfts_for_duplicate_matching(&context.seed_nfts, &context.seed_contract);
-            let snapshot = feature_store.load_snapshot(
-                &request.chain,
-                &dedup_seed_nfts,
-                request.name_threshold,
-                request.metadata_threshold,
-                request.max_tokens_per_contract,
-                request.max_recall_rows,
-            )?;
-            Ok::<_, AppError>((request, context, snapshot, dedup_seed_nfts))
-        }),
-    )
+    let (request, context, snapshot, dedup_seed_nfts) = tokio::task::spawn_blocking(move || {
+        let dedup_seed_nfts =
+            seed_nfts_for_duplicate_matching(&context.seed_nfts, &context.seed_contract);
+        let snapshot = feature_store.load_snapshot(
+            &request.chain,
+            &dedup_seed_nfts,
+            request.name_threshold,
+            request.metadata_threshold,
+            request.max_tokens_per_contract,
+            request.max_recall_rows,
+        )?;
+        Ok::<_, AppError>((request, context, snapshot, dedup_seed_nfts))
+    })
     .await
     .map_err(|err| AppError::InvalidData(format!("snapshot CPU task failed: {err}")))??;
 
     progress.on_seed_stage("find_duplicate_candidates").await;
-    let candidate_label = format!(
-        "seed:{}:find_duplicate_candidates",
-        request.seed_contract_address
-    );
-    timing::time_async(
-        candidate_label,
-        tokio::task::spawn_blocking(move || {
-            let candidates =
-                if snapshot.duplicate_contract_rows.is_empty() && !snapshot.nft_rows.is_empty() {
-                    duplicate::build_duplicate_candidates(
-                        &request.chain,
-                        &dedup_seed_nfts,
-                        &snapshot.nft_rows,
-                        request.name_threshold,
-                        request.metadata_threshold,
-                    )
-                } else {
-                    duplicate::build_duplicate_candidates_from_contract_rows(
-                        &request.chain,
-                        &dedup_seed_nfts,
-                        &snapshot.duplicate_contract_rows,
-                        request.name_threshold,
-                        request.metadata_threshold,
-                    )
-                };
-            Ok::<_, AppError>((
-                context,
-                CandidatePlan {
-                    snapshot,
-                    candidates,
-                },
-            ))
-        }),
-    )
+    tokio::task::spawn_blocking(move || {
+        let candidates =
+            if snapshot.duplicate_contract_rows.is_empty() && !snapshot.nft_rows.is_empty() {
+                duplicate::build_duplicate_candidates(
+                    &request.chain,
+                    &dedup_seed_nfts,
+                    &snapshot.nft_rows,
+                    request.name_threshold,
+                    request.metadata_threshold,
+                )
+            } else {
+                duplicate::build_duplicate_candidates_from_contract_rows(
+                    &request.chain,
+                    &dedup_seed_nfts,
+                    &snapshot.duplicate_contract_rows,
+                    request.name_threshold,
+                    request.metadata_threshold,
+                )
+            };
+        Ok::<_, AppError>((
+            context,
+            CandidatePlan {
+                snapshot,
+                candidates,
+            },
+        ))
+    })
     .await
     .map_err(|err| AppError::InvalidData(format!("candidate CPU task failed: {err}")))?
 }
@@ -540,7 +514,6 @@ async fn prepare_seed_analysis_state(
     cpu_limit: Option<Arc<Semaphore>>,
     prepared: Option<(SeedContext, CandidatePlan)>,
 ) -> Result<SeedAnalysisState, AppError> {
-    let prepare_timer = Instant::now();
     let (context, plan) = if let Some(prepared) = prepared {
         prepared
     } else {
@@ -567,21 +540,14 @@ async fn prepare_seed_analysis_state(
     let CandidateContractFilterResult {
         candidates,
         seed_related_legit_duplicates,
-    } = timing::time_async(
-        format!(
-            "seed:{}:filter_seed_related_candidate_contracts",
-            request.seed_contract_address
-        ),
-        filter_seed_related_candidate_contracts(
-            &request,
-            deps,
-            candidates,
-            token_type.as_str(),
-            request.api_max_concurrency.max(1),
-        ),
+    } = filter_seed_related_candidate_contracts(
+        &request,
+        deps,
+        candidates,
+        token_type.as_str(),
+        request.api_max_concurrency.max(1),
     )
     .await;
-    let grouping_timer = Instant::now();
     let grouped = group_candidates_by_contract(&candidates);
 
     let contracts_to_analyze: Vec<String> = grouped.keys().cloned().collect();
@@ -615,20 +581,6 @@ async fn prepare_seed_analysis_state(
         AnalysisOutputState::with_seed_related_legit_duplicates(seed_related_legit_duplicates);
     let expanded_candidates_by_contract = BTreeMap::new();
     let analysis_timestamp = chrono::Utc::now().timestamp();
-    timing::log_timing(
-        &format!(
-            "seed:{}:prepare_grouping_and_indexes",
-            request.seed_contract_address
-        ),
-        grouping_timer,
-    );
-    timing::log_timing(
-        &format!(
-            "seed:{}:prepare_seed_analysis_state",
-            request.seed_contract_address
-        ),
-        prepare_timer,
-    );
 
     Ok(SeedAnalysisState {
         request,
@@ -727,12 +679,9 @@ async fn analyze_one_matched_contract(
     context: Arc<MatchedContractAnalysisContext<'_>>,
     contract_address: String,
 ) -> Result<MatchedContractAnalysisOutput, AppError> {
-    let contract_timer = Instant::now();
-    let contract_metadata = timing::time_async(
-        format!("contract:{contract_address}:fetch_metadata"),
-        fetch_candidate_contract_metadata(&context.request, &context.deps, &contract_address),
-    )
-    .await?;
+    let contract_metadata =
+        fetch_candidate_contract_metadata(&context.request, &context.deps, &contract_address)
+            .await?;
     let (contract_candidates, result) = if deployed_before_seed(
         context.seed_deployed_block_number,
         contract_metadata.as_ref(),
@@ -742,39 +691,29 @@ async fn analyze_one_matched_contract(
             implausible_candidate_filtered_result(&contract_address, contract_metadata),
         )
     } else {
-        let contract_candidates = timing::time_async(
-            format!("contract:{contract_address}:fetch_and_expand_candidates"),
-            fetch_and_expand_contract_candidates(
-                &context.request,
-                &context.deps,
-                &contract_address,
-                &context.grouped,
-                &context.candidates,
-                &context.snapshot_token_index,
-            ),
+        let contract_candidates = fetch_and_expand_contract_candidates(
+            &context.request,
+            &context.deps,
+            &contract_address,
+            &context.grouped,
+            &context.candidates,
+            &context.snapshot_token_index,
         )
         .await?;
-        let result = timing::time_async(
-            format!("contract:{contract_address}:analyze_duplicate_contract"),
-            analyze_duplicate_contract(DuplicateContractAnalysisInput {
-                request: &context.request,
-                deps: &context.deps,
-                token_type: context.token_type.as_str(),
-                contract_address: &contract_address,
-                contract_candidates: &contract_candidates,
-                contract_metadata,
-                official_addresses: &context.official_addresses,
-                candidate_open_license_by_token: &context.candidate_open_license_by_token,
-                analysis_timestamp: context.analysis_timestamp,
-            }),
-        )
+        let result = analyze_duplicate_contract(DuplicateContractAnalysisInput {
+            request: &context.request,
+            deps: &context.deps,
+            token_type: context.token_type.as_str(),
+            contract_address: &contract_address,
+            contract_candidates: &contract_candidates,
+            contract_metadata,
+            official_addresses: &context.official_addresses,
+            candidate_open_license_by_token: &context.candidate_open_license_by_token,
+            analysis_timestamp: context.analysis_timestamp,
+        })
         .await?;
         (contract_candidates, result)
     };
-    timing::log_timing(
-        &format!("contract:{contract_address}:matched_contract_total"),
-        contract_timer,
-    );
     Ok(MatchedContractAnalysisOutput {
         contract_address,
         contract_candidates,
@@ -786,7 +725,6 @@ async fn finalize_seed_report(
     state: SeedAnalysisState,
     progress: Arc<dyn SeedProgressReporter>,
 ) -> Result<SingleReportPayload, AppError> {
-    let finalize_timer = Instant::now();
     let SeedAnalysisState {
         seed_contract,
         seed_nfts,
@@ -796,7 +734,6 @@ async fn finalize_seed_report(
         mut expanded_candidates_by_contract,
         ..
     } = state;
-    let finalize_seed_address = seed_contract.contract_address.clone();
 
     expanded_candidates_by_contract.retain(|contract, _| {
         !output_state
@@ -950,10 +887,6 @@ async fn finalize_seed_report(
     };
     progress.on_seed_stage("finalize_report").await;
     progress.on_seed_completed().await;
-    timing::log_timing(
-        &format!("seed:{finalize_seed_address}:finalize_report"),
-        finalize_timer,
-    );
     Ok(payload)
 }
 
