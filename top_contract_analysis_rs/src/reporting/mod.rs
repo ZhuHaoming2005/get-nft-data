@@ -28,6 +28,21 @@ fn format_ratio(value: Option<f64>) -> String {
         .unwrap_or_else(|| "n/a".into())
 }
 
+fn cost_ratio(
+    stuck_cost_usd: f64,
+    acquisition_cost_usd: f64,
+    stuck_cost_eth: f64,
+    acquisition_cost_eth: f64,
+) -> Option<f64> {
+    if acquisition_cost_usd > 0.0 {
+        Some(stuck_cost_usd / acquisition_cost_usd)
+    } else if acquisition_cost_eth > 0.0 {
+        Some(stuck_cost_eth / acquisition_cost_eth)
+    } else {
+        None
+    }
+}
+
 fn format_scalar(value: Option<f64>) -> String {
     value
         .map(|number| number.to_string())
@@ -375,6 +390,12 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
 
 pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> String {
     let summary = &payload.batch_summary;
+    let paid_mint_stuck_cost_ratio_overall = cost_ratio(
+        summary.paid_mint_stuck_cost_usd_total,
+        summary.paid_mint_victim_cost_usd_total,
+        summary.paid_mint_stuck_cost_eth_total,
+        summary.paid_mint_victim_cost_eth_total,
+    );
     let mut lines = vec![
         "# Top NFT 合约批量分析总报告".to_string(),
         String::new(),
@@ -444,13 +465,21 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
             format_ratio(summary.victim_acquisition_stuck_cost_ratio_overall)
         ),
         format!(
-            "- 二级市场受害者成本(USD)汇总: {} / addresses={}",
+            "- 二级市场获取成本(USD)汇总: {} / 套牢成本(USD)={} / 套牢占比={} / addresses={}",
             summary.secondary_sale_victim_cost_usd_total,
+            summary.secondary_sale_stuck_cost_usd_total,
+            format_ratio(summary.secondary_sale_stuck_cost_ratio_overall),
             summary.secondary_sale_victim_address_count_total
         ),
         format!(
-            "- 付费 mint 受害者成本(USD)汇总: {} / edges={}",
-            summary.paid_mint_victim_cost_usd_total, summary.paid_mint_victim_edge_count_total
+            "- 付费 mint 获取成本(USD)汇总: {} / 套牢成本(USD)={} / 套牢占比={} / edges={} / addresses={} / stuck_edges={} / stuck_tokens={}",
+            summary.paid_mint_victim_cost_usd_total,
+            summary.paid_mint_stuck_cost_usd_total,
+            format_ratio(paid_mint_stuck_cost_ratio_overall),
+            summary.paid_mint_victim_edge_count_total,
+            summary.paid_mint_victim_address_count_total,
+            summary.paid_mint_stuck_edge_count_total,
+            summary.paid_mint_stuck_token_count_total
         ),
         format!(
             "- 操作者使用资金(USD)汇总: {} / 全局地址={} / 观测地址={} / edges={}",
@@ -552,9 +581,15 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
             } else {
                 &seed.name
             };
+            let paid_mint_stuck_cost_ratio = cost_ratio(
+                report_summary.paid_mint_stuck_cost_usd,
+                report_summary.paid_mint_victim_cost_usd,
+                report_summary.paid_mint_stuck_cost_eth,
+                report_summary.paid_mint_victim_cost_eth,
+            );
 
             lines.push(format!(
-                "- {} ({}) | 重复合约={} | 侵权NFT={} | 疑似操作者={} | 中性地址={} | 受害者={} | 多次侵权地址={} | 官方参与={} | 受害者获取成本(USD)={} | 二级成本(USD)={} | 付费mint(USD)={} | 总套牢(USD)={}/{} | >60%={}/{} | 套牢受害者={}/{} | 被腐化受害者={} | 部署到中性接收平均={}秒 | 部署到中性接收中位={}秒 | 部署到首次转手中位={}秒 | JSON={} | MD={}",
+                "- {} ({}) | 重复合约={} | 侵权NFT={} | 疑似操作者={} | 中性地址={} | 受害者={} | 多次侵权地址={} | 官方参与={} | 受害者获取成本(USD)={} | 二级获取(USD)={} | 二级套牢(USD)={}/{} | 付费mint获取(USD)={} | 付费mint套牢(USD)={}/{} | 总套牢(USD)={}/{} | >60%={}/{} | 套牢受害者={}/{} | 被腐化受害者={} | 部署到中性接收平均={}秒 | 部署到中性接收中位={}秒 | 部署到首次转手中位={}秒 | JSON={} | MD={}",
                 seed_name,
                 seed.contract_address,
                 report_summary.candidate_contract_count,
@@ -566,7 +601,11 @@ pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> Stri
                 report_summary.legit_duplicate_contract_count,
                 report_summary.victim_acquisition_total_usd,
                 report_summary.secondary_sale_victim_cost_usd,
+                report_summary.secondary_sale_stuck_cost_usd,
+                format_ratio(report_summary.secondary_sale_stuck_cost_ratio),
                 report_summary.paid_mint_victim_cost_usd,
+                report_summary.paid_mint_stuck_cost_usd,
+                format_ratio(paid_mint_stuck_cost_ratio),
                 report_summary.victim_acquisition_stuck_cost_usd,
                 format_ratio(report_summary.victim_acquisition_stuck_cost_ratio),
                 report_summary.ratio_over_60_address_count,

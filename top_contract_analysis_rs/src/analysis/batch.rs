@@ -196,6 +196,39 @@ pub fn read_seed_addresses(seed_file: &Path) -> Result<Vec<String>, AppError> {
         .collect())
 }
 
+fn validate_cached_operator_levels(path: &Path, raw: &serde_json::Value) -> Result<(), AppError> {
+    let Some(rows) = raw
+        .get("malicious_addresses")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Ok(());
+    };
+
+    for (index, row) in rows.iter().enumerate() {
+        let address = row
+            .get("address")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if address.is_empty() {
+            continue;
+        }
+        if matches!(
+            row.get("operator_level")
+                .and_then(serde_json::Value::as_i64),
+            Some(1..=3)
+        ) {
+            continue;
+        }
+        return Err(AppError::InvalidData(format!(
+            "cached seed report {} malicious_addresses[{index}] is missing a valid operator_level; delete or regenerate the cached report",
+            path.display()
+        )));
+    }
+
+    Ok(())
+}
+
 fn load_cached_seed_entries(
     output_dir: &Path,
     chain: &str,
@@ -225,6 +258,7 @@ fn load_cached_seed_entries(
             Ok(payload) => payload,
             Err(_) => continue,
         };
+        validate_cached_operator_levels(&path, &raw)?;
         let Ok(payload) = serde_json::from_value::<SingleReportPayload>(raw) else {
             continue;
         };

@@ -4,7 +4,7 @@ use crate::models::{
     AddressAttributionPayload, AddressSignalPayload, BatchReportSummary, BatchSeedReportPayload,
     ContractLevelSummaryPayload, ContractLifecycleMetricPayload, ContractMetadata,
     DuplicateCandidate, DuplicateContractPayload, HonestAddressPayload, InfringingTokenRecord,
-    MaliciousAddressPayload, NftPropagationPathPayload, ReportSummary,
+    MaliciousAddressPayload, NftPropagationPathPayload, OperatorLevelStatsPayload, ReportSummary,
     SecondarySaleVictimAddressPayload, SeedCollectionStatsPayload, SeedNft, SingleReportPayload,
     ValueFlowEdgePayload, VictimAcquisitionAddressPayload,
 };
@@ -129,6 +129,7 @@ struct SecondarySaleVictimCostStats {
 #[derive(Clone, Debug, Default)]
 pub(super) struct OperatorAcquisitionCostStats {
     operator_acquisition_addresses: BTreeSet<String>,
+    operator_level_stats: Vec<OperatorLevelStatsPayload>,
     operator_secondary_sale_cost_eth: f64,
     operator_secondary_sale_cost_usd: f64,
     operator_paid_mint_cost_eth: f64,
@@ -137,6 +138,146 @@ pub(super) struct OperatorAcquisitionCostStats {
     operator_acquisition_total_usd: f64,
     operator_acquisition_address_count: i64,
     operator_acquisition_edge_count: i64,
+}
+
+fn operator_level_label(level: i64) -> String {
+    match level {
+        1 => "weak_behavioral_operator".into(),
+        2 => "likely_behavioral_operator".into(),
+        3 => "strong_value_control_operator".into(),
+        _ => String::new(),
+    }
+}
+
+fn operator_level_by_address(
+    malicious_addresses: &[MaliciousAddressPayload],
+) -> BTreeMap<String, i64> {
+    let mut levels = BTreeMap::<String, i64>::new();
+    for item in malicious_addresses {
+        if !(1..=3).contains(&item.operator_level) {
+            continue;
+        }
+        let address = normalized_address(&item.address);
+        if address.is_empty() {
+            continue;
+        }
+        let entry = levels.entry(address).or_insert(0);
+        *entry = (*entry).max(item.operator_level);
+    }
+    levels
+}
+
+fn empty_operator_level_stats() -> BTreeMap<i64, OperatorLevelStatsPayload> {
+    (1..=3)
+        .map(|level| {
+            (
+                level,
+                OperatorLevelStatsPayload {
+                    level,
+                    level_label: operator_level_label(level),
+                    ..OperatorLevelStatsPayload::default()
+                },
+            )
+        })
+        .collect()
+}
+
+fn build_operator_level_stats(
+    malicious_addresses: &[MaliciousAddressPayload],
+    value_flow_edges: &[ValueFlowEdgePayload],
+) -> Vec<OperatorLevelStatsPayload> {
+    let levels_by_address = operator_level_by_address(malicious_addresses);
+    let mut stats_by_level = empty_operator_level_stats();
+    for level in levels_by_address.values() {
+        if let Some(stats) = stats_by_level.get_mut(level) {
+            stats.address_count += 1;
+        }
+    }
+
+    for edge in value_flow_edges {
+        let payer = normalized_address(&edge.from_address);
+        let Some(level) = levels_by_address.get(&payer).copied() else {
+            continue;
+        };
+        if !matches!(edge.channel.as_str(), "sale_payment" | "mint_payment") {
+            continue;
+        }
+        let value_eth = edge.value_eth.unwrap_or_default();
+        let value_usd = edge.value_usd.unwrap_or_default();
+        if value_eth <= 0.0 && value_usd <= 0.0 {
+            continue;
+        }
+        let Some(stats) = stats_by_level.get_mut(&level) else {
+            continue;
+        };
+        stats.acquisition_edge_count += 1;
+        match edge.channel.as_str() {
+            "sale_payment" => {
+                stats.secondary_sale_cost_eth += value_eth;
+                stats.secondary_sale_cost_usd += value_usd;
+            }
+            "mint_payment" => {
+                stats.paid_mint_cost_eth += value_eth;
+                stats.paid_mint_cost_usd += value_usd;
+            }
+            _ => {}
+        }
+    }
+
+    stats_by_level
+        .into_values()
+        .map(|mut stats| {
+            stats.acquisition_total_eth = stats.secondary_sale_cost_eth + stats.paid_mint_cost_eth;
+            stats.acquisition_total_usd = stats.secondary_sale_cost_usd + stats.paid_mint_cost_usd;
+            stats
+        })
+        .collect()
+}
+
+fn operator_level_addresses(
+    malicious_addresses: &[MaliciousAddressPayload],
+) -> BTreeMap<i64, BTreeSet<String>> {
+    let mut rows = BTreeMap::<i64, BTreeSet<String>>::new();
+    for (address, level) in operator_level_by_address(malicious_addresses) {
+        rows.entry(level).or_default().insert(address);
+    }
+    rows
+}
+
+fn build_batch_operator_level_stats(
+    seed_reports: &[BatchSeedAggregate],
+) -> Vec<OperatorLevelStatsPayload> {
+    let mut stats_by_level = empty_operator_level_stats();
+    for seed in seed_reports {
+        for stats in &seed.report.report_summary.operator_level_stats {
+            if let Some(entry) = stats_by_level.get_mut(&stats.level) {
+                entry.secondary_sale_cost_eth += stats.secondary_sale_cost_eth;
+                entry.secondary_sale_cost_usd += stats.secondary_sale_cost_usd;
+                entry.paid_mint_cost_eth += stats.paid_mint_cost_eth;
+                entry.paid_mint_cost_usd += stats.paid_mint_cost_usd;
+                entry.acquisition_total_eth += stats.acquisition_total_eth;
+                entry.acquisition_total_usd += stats.acquisition_total_usd;
+                entry.acquisition_edge_count += stats.acquisition_edge_count;
+            }
+        }
+    }
+
+    let mut highest_level_by_address = BTreeMap::<String, i64>::new();
+    for seed in seed_reports {
+        for (level, addresses) in &seed.operator_level_addresses {
+            for address in addresses {
+                let entry = highest_level_by_address.entry(address.clone()).or_insert(0);
+                *entry = (*entry).max(*level);
+            }
+        }
+    }
+    for level in highest_level_by_address.values() {
+        if let Some(entry) = stats_by_level.get_mut(level) {
+            entry.address_count += 1;
+        }
+    }
+
+    stats_by_level.into_values().collect()
 }
 
 pub(super) fn malicious_address_set(
@@ -250,13 +391,16 @@ pub(super) fn build_operator_acquisition_cost_stats(
     malicious_addresses: &[MaliciousAddressPayload],
     value_flow_edges: &[ValueFlowEdgePayload],
 ) -> OperatorAcquisitionCostStats {
-    let malicious_addresses = malicious_address_set(malicious_addresses);
+    let malicious_address_set = malicious_address_set(malicious_addresses);
     let mut operator_addresses = BTreeSet::new();
-    let mut stats = OperatorAcquisitionCostStats::default();
+    let mut stats = OperatorAcquisitionCostStats {
+        operator_level_stats: build_operator_level_stats(malicious_addresses, value_flow_edges),
+        ..OperatorAcquisitionCostStats::default()
+    };
 
     for edge in value_flow_edges {
         let payer = normalized_address(&edge.from_address);
-        if payer.is_empty() || !malicious_addresses.contains(&payer) {
+        if payer.is_empty() || !malicious_address_set.contains(&payer) {
             continue;
         }
         if !matches!(edge.channel.as_str(), "sale_payment" | "mint_payment") {
@@ -782,6 +926,7 @@ pub(super) fn build_report_summary(input: ReportSummaryInput<'_>) -> ReportSumma
         operator_acquisition_address_count: operator_acquisition_stats
             .operator_acquisition_address_count,
         operator_acquisition_edge_count: operator_acquisition_stats.operator_acquisition_edge_count,
+        operator_level_stats: operator_acquisition_stats.operator_level_stats,
         stablecoin_erc20_value_usd: acquisition_stats.stablecoin_erc20_value_usd,
         stablecoin_erc20_edge_count: acquisition_stats.stablecoin_erc20_edge_count,
         value_flow_priced_edge_count: acquisition_stats.value_flow_priced_edge_count,
@@ -1087,6 +1232,7 @@ pub(super) fn build_batch_report_summary(
         .iter()
         .flat_map(|item| item.operator_acquisition_addresses.iter().cloned())
         .collect();
+    let operator_level_stats = build_batch_operator_level_stats(seed_reports);
     let stablecoin_erc20_value_usd_total: f64 = seed_reports
         .iter()
         .map(|item| item.report.report_summary.stablecoin_erc20_value_usd)
@@ -1255,6 +1401,7 @@ pub(super) fn build_batch_report_summary(
         operator_acquisition_address_count_total,
         operator_acquisition_address_count_distinct: operator_acquisition_addresses.len() as i64,
         operator_acquisition_edge_count_total,
+        operator_level_stats,
         stablecoin_erc20_value_usd_total,
         stablecoin_erc20_edge_count_total,
         value_flow_priced_edge_count_total,
@@ -1397,6 +1544,8 @@ pub(super) fn build_batch_seed_aggregate(payload: SingleReportPayload) -> BatchS
         operator_acquisition_stats.operator_acquisition_address_count;
     report_summary.operator_acquisition_edge_count =
         operator_acquisition_stats.operator_acquisition_edge_count;
+    report_summary.operator_level_stats = operator_acquisition_stats.operator_level_stats;
+    let operator_level_addresses = operator_level_addresses(&payload.malicious_addresses);
 
     BatchSeedAggregate {
         report: BatchSeedReportPayload {
@@ -1411,6 +1560,7 @@ pub(super) fn build_batch_seed_aggregate(payload: SingleReportPayload) -> BatchS
         corrupted_victim_addresses,
         repeat_infringing_addresses,
         operator_acquisition_addresses: operator_acquisition_stats.operator_acquisition_addresses,
+        operator_level_addresses,
     }
 }
 

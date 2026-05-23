@@ -96,6 +96,124 @@ fn value_flow_has_positive_value(edge: &ValueFlowEdgePayload) -> bool {
     edge.value_eth.unwrap_or_default() > 0.0 || edge.value_usd.unwrap_or_default() > 0.0
 }
 
+const WASH_CYCLE_L2_PROPAGATION_THRESHOLD: i64 = 3;
+const WASH_CYCLE_L2_VALUE_USD_THRESHOLD: f64 = 1_000.0;
+const WASH_CYCLE_L2_VALUE_ETH_THRESHOLD: f64 = 0.5;
+const STAR_DISTRIBUTION_L1_THRESHOLD: i64 = 3;
+const STAR_DISTRIBUTION_L2_THRESHOLD: i64 = 5;
+const HIGH_VOLUME_SELLER_L1_THRESHOLD: i64 = 3;
+const HIGH_VOLUME_SELLER_L2_THRESHOLD: i64 = 5;
+const RAPID_SPREAD_L2_TOKEN_THRESHOLD: usize = 2;
+
+struct OperatorLevelSignals {
+    wash_cycle_count: i64,
+    wash_cycle_value_eth: f64,
+    wash_cycle_value_usd: f64,
+    wash_cycle_has_usd: bool,
+    star_out_degree: i64,
+    sale_seller_count: i64,
+    rapid_spread_token_count: usize,
+    value_extraction_observed: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct WashCycleScope {
+    token_ids: HashSet<String>,
+    tx_hashes: HashSet<String>,
+    participants: HashSet<String>,
+}
+
+#[derive(Clone, Debug)]
+struct WashCycleTransferScope {
+    token_id: String,
+    tx_hash: String,
+    from_address: String,
+    to_address: String,
+}
+
+impl WashCycleTransferScope {
+    fn from_transfer(transfer: &TransferRecord) -> Self {
+        Self {
+            token_id: transfer.token_id.trim().to_lowercase(),
+            tx_hash: transfer.tx_hash.trim().to_lowercase(),
+            from_address: transfer.from_address.trim().to_lowercase(),
+            to_address: transfer.to_address.trim().to_lowercase(),
+        }
+    }
+}
+
+fn add_wash_cycle_transfer_scope(
+    scopes: &mut HashMap<String, WashCycleScope>,
+    address: &str,
+    transfer: &WashCycleTransferScope,
+) {
+    let scope = scopes.entry(address.to_string()).or_default();
+    if !transfer.token_id.is_empty() {
+        scope.token_ids.insert(transfer.token_id.clone());
+    }
+    if !transfer.tx_hash.is_empty() {
+        scope.tx_hashes.insert(transfer.tx_hash.clone());
+    }
+    if !transfer.from_address.is_empty() {
+        scope.participants.insert(transfer.from_address.clone());
+    }
+    if !transfer.to_address.is_empty() {
+        scope.participants.insert(transfer.to_address.clone());
+    }
+}
+
+fn operator_level_label(level: i64) -> &'static str {
+    match level {
+        1 => "weak_behavioral_operator",
+        2 => "likely_behavioral_operator",
+        3 => "strong_value_control_operator",
+        _ => "",
+    }
+}
+
+fn classify_operator_level(signals: &OperatorLevelSignals) -> i64 {
+    if signals.value_extraction_observed {
+        return 3;
+    }
+
+    let has_wash_cycle = signals.wash_cycle_count > 0;
+    let has_star_distribution = signals.star_out_degree >= STAR_DISTRIBUTION_L1_THRESHOLD;
+    let has_high_volume_selling = signals.sale_seller_count >= HIGH_VOLUME_SELLER_L1_THRESHOLD;
+    let has_rapid_spread = signals.rapid_spread_token_count > 0;
+    let has_independent_rapid_spread = has_rapid_spread && !has_wash_cycle;
+    let behavior_family_count = [
+        has_wash_cycle,
+        has_star_distribution,
+        has_high_volume_selling,
+        has_independent_rapid_spread,
+    ]
+    .into_iter()
+    .filter(|value| *value)
+    .count();
+
+    if behavior_family_count == 0 {
+        return 0;
+    }
+
+    let wash_value_reaches_l2 = if signals.wash_cycle_has_usd {
+        signals.wash_cycle_value_usd >= WASH_CYCLE_L2_VALUE_USD_THRESHOLD
+    } else {
+        signals.wash_cycle_value_eth >= WASH_CYCLE_L2_VALUE_ETH_THRESHOLD
+    };
+    let severe_behavior = signals.wash_cycle_count >= WASH_CYCLE_L2_PROPAGATION_THRESHOLD
+        || wash_value_reaches_l2
+        || signals.star_out_degree >= STAR_DISTRIBUTION_L2_THRESHOLD
+        || signals.sale_seller_count >= HIGH_VOLUME_SELLER_L2_THRESHOLD
+        || signals.rapid_spread_token_count >= RAPID_SPREAD_L2_TOKEN_THRESHOLD
+        || behavior_family_count >= 2;
+
+    if severe_behavior {
+        2
+    } else {
+        1
+    }
+}
+
 fn value_flow_token_ids(edge: &ValueFlowEdgePayload) -> Vec<String> {
     edge.token_id
         .split(',')
@@ -124,6 +242,103 @@ fn nft_transfer_key(
         from_address.trim().to_lowercase(),
         to_address.trim().to_lowercase(),
     )
+}
+
+fn value_flow_scope_matches(
+    edge: &ValueFlowEdgePayload,
+    wash_cycle_scope: &WashCycleScope,
+) -> bool {
+    let tx_hash = edge.tx_hash.trim().to_lowercase();
+    if !wash_cycle_scope.tx_hashes.contains(&tx_hash) {
+        return false;
+    }
+    value_flow_token_ids(edge)
+        .iter()
+        .any(|token_id| wash_cycle_scope.token_ids.contains(token_id))
+        && (wash_cycle_scope
+            .participants
+            .contains(&edge.from_address.trim().to_lowercase())
+            || wash_cycle_scope
+                .participants
+                .contains(&edge.to_address.trim().to_lowercase()))
+}
+
+fn sale_scope_matches(sale: &NftSaleRecord, wash_cycle_scope: &WashCycleScope) -> bool {
+    let tx_hash = sale.tx_hash.trim().to_lowercase();
+    wash_cycle_scope.tx_hashes.contains(&tx_hash)
+        && wash_cycle_scope
+            .token_ids
+            .contains(&sale.token_id.trim().to_lowercase())
+        && (wash_cycle_scope
+            .participants
+            .contains(&sale.seller_address.trim().to_lowercase())
+            || wash_cycle_scope
+                .participants
+                .contains(&sale.buyer_address.trim().to_lowercase()))
+}
+
+fn wash_cycle_value_for_address(
+    address: &str,
+    wash_cycle_scope: &WashCycleScope,
+    activity: &PreparedContractActivity<'_>,
+    value_flow_edges: &[ValueFlowEdgePayload],
+) -> (f64, f64, bool) {
+    let address = address.trim().to_lowercase();
+    let mut value_eth = 0.0;
+    let mut value_usd = 0.0;
+    let mut has_usd = false;
+    let mut seen_sales = HashSet::<(String, String, String, String)>::new();
+    for sale in &activity.sorted_sales {
+        if !sale_has_positive_value(sale)
+            || !sale_scope_matches(sale, wash_cycle_scope)
+            || (!sale.seller_address.eq_ignore_ascii_case(&address)
+                && !sale.buyer_address.eq_ignore_ascii_case(&address))
+        {
+            continue;
+        }
+        let key = nft_transfer_key(
+            &sale.token_id,
+            &sale.tx_hash,
+            &sale.seller_address,
+            &sale.buyer_address,
+        );
+        if !seen_sales.insert(key) {
+            continue;
+        }
+        value_eth += sale.price_eth.unwrap_or_default();
+        if let Some(price_usd) = sale.price_usd {
+            has_usd = true;
+            value_usd += price_usd;
+        }
+    }
+
+    let mut seen_edges = HashSet::<(String, String, String, String, String)>::new();
+    for edge in value_flow_edges {
+        if !value_flow_has_positive_value(edge)
+            || !value_flow_scope_matches(edge, wash_cycle_scope)
+            || (!edge.from_address.eq_ignore_ascii_case(&address)
+                && !edge.to_address.eq_ignore_ascii_case(&address))
+        {
+            continue;
+        }
+        let key = (
+            edge.tx_hash.trim().to_lowercase(),
+            edge.token_id.trim().to_lowercase(),
+            edge.from_address.trim().to_lowercase(),
+            edge.to_address.trim().to_lowercase(),
+            edge.channel.trim().to_lowercase(),
+        );
+        if !seen_edges.insert(key) {
+            continue;
+        }
+        value_eth += edge.value_eth.unwrap_or_default();
+        if let Some(edge_value_usd) = edge.value_usd {
+            has_usd = true;
+            value_usd += edge_value_usd;
+        }
+    }
+
+    (value_eth, value_usd, has_usd)
 }
 
 fn is_service_value_flow_role(role: &str) -> bool {
@@ -358,9 +573,13 @@ pub(crate) fn build_malicious_address_records_from_activity(
     let mut outgoing: HashMap<String, HashSet<String>> = HashMap::new();
     let mut incoming: HashMap<String, HashSet<String>> = HashMap::new();
     let mut cycle_counts: HashMap<String, i64> = HashMap::new();
+    let mut wash_cycle_scopes: HashMap<String, WashCycleScope> = HashMap::new();
     let mut sale_seller_counts: HashMap<String, i64> = HashMap::new();
     let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
+    let mut seen_transfer_scopes_by_pair: HashMap<(String, String), Vec<WashCycleTransferScope>> =
+        HashMap::new();
     let mut rapid_addresses: HashSet<String> = HashSet::new();
+    let mut rapid_token_ids_by_address: HashMap<String, HashSet<String>> = HashMap::new();
     let mut mint_times: HashMap<String, i64> = HashMap::new();
     let mut receiver_candidates: HashSet<String> = HashSet::new();
     let paid_mint_payers: HashSet<String> = mint_payment_edges
@@ -425,23 +644,54 @@ pub(crate) fn build_malicious_address_records_from_activity(
             }
             let pair = (transfer.from_address.clone(), transfer.to_address.clone());
             let reverse = (transfer.to_address.clone(), transfer.from_address.clone());
+            let transfer_scope = WashCycleTransferScope::from_transfer(transfer);
             if seen_pairs.contains(&reverse) {
                 *cycle_counts
                     .entry(transfer.from_address.clone())
                     .or_insert(0) += 1;
                 *cycle_counts.entry(transfer.to_address.clone()).or_insert(0) += 1;
+                add_wash_cycle_transfer_scope(
+                    &mut wash_cycle_scopes,
+                    &transfer.from_address,
+                    &transfer_scope,
+                );
+                add_wash_cycle_transfer_scope(
+                    &mut wash_cycle_scopes,
+                    &transfer.to_address,
+                    &transfer_scope,
+                );
+                if let Some(reverse_scopes) = seen_transfer_scopes_by_pair.get(&reverse) {
+                    for reverse_scope in reverse_scopes {
+                        add_wash_cycle_transfer_scope(
+                            &mut wash_cycle_scopes,
+                            &transfer.from_address,
+                            reverse_scope,
+                        );
+                        add_wash_cycle_transfer_scope(
+                            &mut wash_cycle_scopes,
+                            &transfer.to_address,
+                            reverse_scope,
+                        );
+                    }
+                }
             }
-            seen_pairs.insert(pair);
+            seen_pairs.insert(pair.clone());
+            seen_transfer_scopes_by_pair
+                .entry(pair)
+                .or_default()
+                .push(transfer_scope);
         }
         let mint_time = *mint_times.get(&transfer.token_id).unwrap_or(&0);
-        if mint_time > 0 && transfer.block_time > 0 && transfer.block_time - mint_time <= 24 * 3600
+        if mint_time > 0
+            && transfer.block_time > 0
+            && transfer.block_time - mint_time <= 24 * 3600
+            && !transfer.from_address.is_empty()
         {
-            if !transfer.from_address.is_empty() {
-                rapid_addresses.insert(transfer.from_address.clone());
-            }
-            if !transfer.to_address.is_empty() {
-                rapid_addresses.insert(transfer.to_address.clone());
-            }
+            rapid_addresses.insert(transfer.from_address.clone());
+            rapid_token_ids_by_address
+                .entry(transfer.from_address.clone())
+                .or_default()
+                .insert(transfer.token_id.clone());
         }
     }
 
@@ -525,44 +775,72 @@ pub(crate) fn build_malicious_address_records_from_activity(
         }
         let mint_activity_observed = mint_addresses.contains(&address);
         let wash_cycle_count = *cycle_counts.get(&address).unwrap_or(&0);
+        let (wash_cycle_value_eth, wash_cycle_value_usd, wash_cycle_has_usd) =
+            if let Some(wash_cycle_scope) = wash_cycle_scopes.get(&address) {
+                wash_cycle_value_for_address(
+                    &address,
+                    wash_cycle_scope,
+                    activity,
+                    mint_payment_edges,
+                )
+            } else {
+                (0.0, 0.0, false)
+            };
         let star_out_degree = outgoing.get(&address).map(|value| value.len()).unwrap_or(0) as i64;
         let is_star_distributor = star_out_degree >= 3;
-        let aggregation_in_degree =
-            incoming.get(&address).map(|value| value.len()).unwrap_or(0) as i64;
-        let is_aggregation_receiver =
-            aggregation_in_degree >= 3 && !paid_acquisition_addresses.contains(&address);
         let withdrawal_edge_count = *withdrawal_edge_counts.get(&address).unwrap_or(&0);
         let cashout_edge_count = *cashout_edge_counts.get(&address).unwrap_or(&0);
         let value_extraction_observed = withdrawal_edge_count > 0 || cashout_edge_count > 0;
         let sale_seller_count = *sale_seller_counts.get(&address).unwrap_or(&0);
         let rapid_spread = rapid_addresses.contains(&address);
-        let acquired_victim_like = (paid_mint_payers.contains(&address)
+        let rapid_spread_token_count = rapid_token_ids_by_address
+            .get(&address)
+            .map(|tokens| tokens.len())
+            .unwrap_or(0);
+        let acquired_victim_like = (paid_acquisition_addresses.contains(&address)
             || secondary_market_resellers.contains(&address))
             && wash_cycle_count == 0
             && !is_star_distributor
-            && !is_aggregation_receiver
             && !value_extraction_observed
             && sale_seller_count < 3;
-        let attacker_like_seller =
-            sale_seller_count > 0 && (is_star_distributor || rapid_spread) && !acquired_victim_like;
+        if acquired_victim_like {
+            continue;
+        }
         let high_volume_seller = sale_seller_count >= 3;
+        let operator_level = classify_operator_level(&OperatorLevelSignals {
+            wash_cycle_count,
+            wash_cycle_value_eth,
+            wash_cycle_value_usd,
+            wash_cycle_has_usd,
+            star_out_degree,
+            sale_seller_count,
+            rapid_spread_token_count,
+            value_extraction_observed,
+        });
         if wash_cycle_count == 0
             && !is_star_distributor
-            && !is_aggregation_receiver
             && !value_extraction_observed
-            && !attacker_like_seller
             && !high_volume_seller
+            && !rapid_spread
         {
+            continue;
+        }
+        if operator_level == 0 {
             continue;
         }
         rows.push(MaliciousAddressPayload {
             address: address.clone(),
             mint_activity_observed,
             wash_cycle_count,
+            wash_cycle_propagation_count: wash_cycle_count,
+            wash_cycle_value_eth,
+            wash_cycle_value_usd,
             star_out_degree,
-            aggregation_in_degree,
+            sale_seller_count,
             withdrawal_edge_count,
             cashout_edge_count,
+            operator_level,
+            operator_level_label: operator_level_label(operator_level).into(),
             rapid_spread_contracts: if rapid_spread {
                 vec![contract_address.to_string()]
             } else {
@@ -583,6 +861,8 @@ struct AttributionAccumulator {
     victim_score: f64,
     corruption_score: f64,
     neutral_score: f64,
+    operator_level: i64,
+    operator_level_label: String,
     evidence: Vec<AddressEvidencePayload>,
 }
 
@@ -653,6 +933,13 @@ fn add_attribution_evidence(
         weight: input.weight,
         detail: input.detail.to_string(),
     });
+}
+
+fn apply_operator_level(entry: &mut AttributionAccumulator, level: i64, label: &str) {
+    if level > entry.operator_level {
+        entry.operator_level = level;
+        entry.operator_level_label = label.to_string();
+    }
 }
 
 fn attribution_confidence(
@@ -787,6 +1074,9 @@ pub fn build_address_attribution_records(
     }
 
     for item in malicious_addresses {
+        if let Some(entry) = attribution_entry(&mut rows, &item.address) {
+            apply_operator_level(entry, item.operator_level, &item.operator_level_label);
+        }
         if item.wash_cycle_count > 0 {
             add_attribution_evidence(
                 &mut rows,
@@ -819,18 +1109,18 @@ pub fn build_address_attribution_records(
                 },
             );
         }
-        if item.aggregation_in_degree >= 3 {
+        if item.sale_seller_count >= HIGH_VOLUME_SELLER_L1_THRESHOLD {
             add_attribution_evidence(
                 &mut rows,
                 EvidenceInput {
                     contract_address,
                     address: &item.address,
-                    role: "aggregation_receiver",
-                    evidence_type: "nft_aggregation",
+                    role: "high_volume_seller",
+                    evidence_type: "high_volume_sale_seller",
                     token_id: "",
                     tx_hash: "",
                     weight: 0.25,
-                    detail: "address receives copied NFTs from multiple distinct source wallets",
+                    detail: "address sells copied NFTs across repeated sale events",
                     bucket: EvidenceBucket::Operator,
                 },
             );
@@ -1061,6 +1351,8 @@ pub fn build_address_attribution_records(
                     victim_score,
                     corruption_score,
                 ),
+                operator_level: row.operator_level,
+                operator_level_label: row.operator_level_label,
                 evidence: row.evidence,
             }
         })
@@ -2190,14 +2482,137 @@ mod tests {
             &infringing_tokens,
             &[],
         );
-        let collector = malicious
-            .iter()
-            .find(|row| row.address == "0xcollector")
-            .expect("aggregation receiver malicious signal");
 
-        assert_eq!(collector.aggregation_in_degree, 3);
-        assert_eq!(collector.star_out_degree, 0);
-        assert_eq!(collector.withdrawal_edge_count, 0);
+        assert!(malicious.iter().all(|row| row.address != "0xcollector"));
+    }
+
+    #[test]
+    fn wash_cycle_operator_levels_use_count_and_value_thresholds() {
+        let low_transfers = vec![
+            transfer("0xmint", 100, ZERO_ADDRESS, "0xoperator"),
+            transfer("0xout", 110, "0xoperator", "0xpeer"),
+            transfer("0xback", 120, "0xpeer", "0xoperator"),
+        ];
+        let low_sales = vec![sale_between("0xout", 115, "0xoperator", "0xpeer", 0.1)];
+        let low_activity = prepare_contract_activity(&low_transfers, &low_sales, &[]);
+
+        let low_rows = build_malicious_address_records_from_activity(
+            "0xdup",
+            &low_activity,
+            &[infringing_token()],
+            &[],
+        );
+        let low_operator = low_rows
+            .iter()
+            .find(|row| row.address == "0xoperator")
+            .expect("low wash-cycle operator");
+        assert_eq!(low_operator.operator_level, 1);
+        assert_eq!(
+            low_operator.operator_level_label,
+            "weak_behavioral_operator"
+        );
+        assert_eq!(low_operator.wash_cycle_propagation_count, 1);
+
+        let unrelated_value_edges = vec![ValueFlowEdgePayload {
+            contract_address: "0xdup".into(),
+            from_address: "0xoperator".into(),
+            to_address: "0xdup".into(),
+            tx_hash: "0xunrelated_mint_payment".into(),
+            token_id: "1".into(),
+            value_eth: Some(2.0),
+            value_usd: Some(2_000.0),
+            channel: "mint_payment".into(),
+            ..ValueFlowEdgePayload::default()
+        }];
+        let unrelated_value_rows = build_malicious_address_records_from_activity(
+            "0xdup",
+            &low_activity,
+            &[infringing_token()],
+            &unrelated_value_edges,
+        );
+        let unrelated_value_operator = unrelated_value_rows
+            .iter()
+            .find(|row| row.address == "0xoperator")
+            .expect("wash-cycle operator with unrelated value flow");
+        assert_eq!(unrelated_value_operator.operator_level, 1);
+        assert_eq!(unrelated_value_operator.wash_cycle_value_usd, 0.1);
+
+        let count_transfers = vec![
+            transfer_token("1", "0xmint1", 100, ZERO_ADDRESS, "0xoperator"),
+            transfer_token("1", "0xout1", 110, "0xoperator", "0xpeer1"),
+            transfer_token("1", "0xback1", 120, "0xpeer1", "0xoperator"),
+            transfer_token("2", "0xmint2", 100, ZERO_ADDRESS, "0xoperator"),
+            transfer_token("2", "0xout2", 130, "0xoperator", "0xpeer2"),
+            transfer_token("2", "0xback2", 140, "0xpeer2", "0xoperator"),
+            transfer_token("3", "0xmint3", 100, ZERO_ADDRESS, "0xoperator"),
+            transfer_token("3", "0xout3", 150, "0xoperator", "0xpeer3"),
+            transfer_token("3", "0xback3", 160, "0xpeer3", "0xoperator"),
+        ];
+        let count_activity = prepare_contract_activity(&count_transfers, &[], &[]);
+        let count_rows = build_malicious_address_records_from_activity(
+            "0xdup",
+            &count_activity,
+            &[
+                infringing_token_id_minted_by("1", "0xoperator"),
+                infringing_token_id_minted_by("2", "0xoperator"),
+                infringing_token_id_minted_by("3", "0xoperator"),
+            ],
+            &[],
+        );
+        let count_operator = count_rows
+            .iter()
+            .find(|row| row.address == "0xoperator")
+            .expect("count-threshold wash-cycle operator");
+        assert_eq!(count_operator.operator_level, 2);
+        assert_eq!(
+            count_operator.operator_level_label,
+            "likely_behavioral_operator"
+        );
+        assert_eq!(count_operator.wash_cycle_propagation_count, 3);
+
+        let value_transfers = vec![
+            transfer("0xmint", 100, ZERO_ADDRESS, "0xoperator"),
+            transfer("0xout", 110, "0xoperator", "0xpeer"),
+            transfer("0xback", 120, "0xpeer", "0xoperator"),
+        ];
+        let value_sales = vec![sale_between("0xout", 115, "0xoperator", "0xpeer", 1_200.0)];
+        let value_activity = prepare_contract_activity(&value_transfers, &value_sales, &[]);
+        let value_rows = build_malicious_address_records_from_activity(
+            "0xdup",
+            &value_activity,
+            &[infringing_token()],
+            &[],
+        );
+        let value_operator = value_rows
+            .iter()
+            .find(|row| row.address == "0xoperator")
+            .expect("value-threshold wash-cycle operator");
+        assert_eq!(value_operator.operator_level, 2);
+        assert_eq!(value_operator.wash_cycle_value_usd, 1_200.0);
+
+        let eth_fallback_transfers = vec![
+            transfer("0xmint", 100, ZERO_ADDRESS, "0xoperator"),
+            transfer("0xout", 110, "0xoperator", "0xpeer"),
+            transfer("0xback", 120, "0xpeer", "0xoperator"),
+        ];
+        let mut eth_fallback_sale = sale_between("0xout", 115, "0xoperator", "0xpeer", 0.6);
+        eth_fallback_sale.price_usd = None;
+        let eth_fallback_sales = vec![eth_fallback_sale];
+        let eth_fallback_activity =
+            prepare_contract_activity(&eth_fallback_transfers, &eth_fallback_sales, &[]);
+        let eth_fallback_rows = build_malicious_address_records_from_activity(
+            "0xdup",
+            &eth_fallback_activity,
+            &[infringing_token()],
+            &[],
+        );
+        let eth_fallback_operator = eth_fallback_rows
+            .iter()
+            .find(|row| row.address == "0xoperator")
+            .expect("eth-fallback wash-cycle operator");
+        assert_eq!(eth_fallback_operator.operator_level, 2);
+        assert_eq!(eth_fallback_operator.wash_cycle_value_eth, 0.6);
+        assert_eq!(eth_fallback_operator.wash_cycle_value_usd, 0.0);
     }
 
     #[test]
@@ -2263,42 +2678,36 @@ mod tests {
 
         assert_eq!(operator.withdrawal_edge_count, 1);
         assert_eq!(operator.cashout_edge_count, 0);
-        assert_eq!(operator.aggregation_in_degree, 0);
+        assert_eq!(operator.operator_level, 3);
+        assert_eq!(
+            operator.operator_level_label,
+            "strong_value_control_operator"
+        );
     }
 
     #[test]
-    fn attribution_records_explain_aggregation_and_withdrawal_signals() {
-        let malicious = vec![
-            MaliciousAddressPayload {
-                address: "0xcollector".into(),
-                aggregation_in_degree: 3,
-                evidence_contracts: vec!["0xdup".into()],
-                ..MaliciousAddressPayload::default()
-            },
-            MaliciousAddressPayload {
-                address: "0xoperator".into(),
-                withdrawal_edge_count: 1,
-                evidence_contracts: vec!["0xdup".into()],
-                ..MaliciousAddressPayload::default()
-            },
-        ];
+    fn attribution_records_explain_withdrawal_operator_level() {
+        let malicious = vec![MaliciousAddressPayload {
+            address: "0xoperator".into(),
+            withdrawal_edge_count: 1,
+            operator_level: 3,
+            operator_level_label: "strong_value_control_operator".into(),
+            evidence_contracts: vec!["0xdup".into()],
+            ..MaliciousAddressPayload::default()
+        }];
 
         let rows = build_address_attribution_records("0xdup", &[], &[], &[], &malicious, &[], &[]);
-        let collector = rows
-            .iter()
-            .find(|row| row.address == "0xcollector")
-            .expect("collector attribution");
         let operator = rows
             .iter()
             .find(|row| row.address == "0xoperator")
             .expect("operator attribution");
 
-        assert_eq!(collector.attribution_label, "suspected_operator");
-        assert!(collector
-            .evidence
-            .iter()
-            .any(|evidence| evidence.evidence_type == "nft_aggregation"));
         assert_eq!(operator.attribution_label, "suspected_operator");
+        assert_eq!(operator.operator_level, 3);
+        assert_eq!(
+            operator.operator_level_label,
+            "strong_value_control_operator"
+        );
         assert!(operator
             .evidence
             .iter()

@@ -353,6 +353,8 @@ pub struct ReportSummary {
     pub operator_acquisition_address_count: i64,
     #[serde(default)]
     pub operator_acquisition_edge_count: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operator_level_stats: Vec<OperatorLevelStatsPayload>,
     #[serde(default)]
     pub stablecoin_erc20_value_usd: f64,
     #[serde(default)]
@@ -586,6 +588,10 @@ pub struct AddressAttributionPayload {
     #[serde(default)]
     pub neutral_score: f64,
     pub confidence: String,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub operator_level: i64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub operator_level_label: String,
     pub evidence: Vec<AddressEvidencePayload>,
 }
 
@@ -601,6 +607,10 @@ pub struct AddressEvidenceFeaturePayload {
     pub corruption_score: f64,
     pub neutral_score: f64,
     pub confidence: String,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub operator_level: i64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub operator_level_label: String,
     pub evidence_count: i64,
     pub related_token_count: i64,
     pub related_tx_count: i64,
@@ -849,6 +859,20 @@ pub struct FraudTradeStatsPayload {
     pub stuck_cost_usd: f64,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct OperatorLevelStatsPayload {
+    pub level: i64,
+    pub level_label: String,
+    pub address_count: i64,
+    pub secondary_sale_cost_eth: f64,
+    pub secondary_sale_cost_usd: f64,
+    pub paid_mint_cost_eth: f64,
+    pub paid_mint_cost_usd: f64,
+    pub acquisition_total_eth: f64,
+    pub acquisition_total_usd: f64,
+    pub acquisition_edge_count: i64,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OutputFilesPayload {
     pub json: String,
@@ -860,19 +884,29 @@ pub struct ContractLevelSummaryPayload {
     pub candidate_count: i64,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct MaliciousAddressPayload {
     pub address: String,
     #[serde(rename = "mint_activity_observed", alias = "mint_role")]
     pub mint_activity_observed: bool,
     pub wash_cycle_count: i64,
+    #[serde(default)]
+    pub wash_cycle_propagation_count: i64,
+    #[serde(default)]
+    pub wash_cycle_value_eth: f64,
+    #[serde(default)]
+    pub wash_cycle_value_usd: f64,
     pub star_out_degree: i64,
     #[serde(default)]
-    pub aggregation_in_degree: i64,
+    pub sale_seller_count: i64,
     #[serde(default)]
     pub withdrawal_edge_count: i64,
     #[serde(default)]
     pub cashout_edge_count: i64,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub operator_level: i64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub operator_level_label: String,
     pub rapid_spread_contracts: Vec<String>,
     pub evidence_contracts: Vec<String>,
 }
@@ -1093,6 +1127,8 @@ pub struct BatchReportSummary {
     pub operator_acquisition_address_count_distinct: i64,
     #[serde(default)]
     pub operator_acquisition_edge_count_total: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operator_level_stats: Vec<OperatorLevelStatsPayload>,
     #[serde(default)]
     pub stablecoin_erc20_value_usd_total: f64,
     #[serde(default)]

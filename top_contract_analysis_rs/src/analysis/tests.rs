@@ -128,6 +128,8 @@ fn report_summary_splits_operator_used_funds_from_victim_acquisition_cost() {
     let malicious_addresses = vec![MaliciousAddressPayload {
         address: "0xoperator".into(),
         wash_cycle_count: 2,
+        operator_level: 2,
+        operator_level_label: "likely_behavioral_operator".into(),
         ..MaliciousAddressPayload::default()
     }];
     let address_attributions = vec![AddressAttributionPayload {
@@ -197,6 +199,17 @@ fn report_summary_splits_operator_used_funds_from_victim_acquisition_cost() {
     assert_eq!(summary.operator_acquisition_total_eth, 10.5);
     assert_eq!(summary.operator_acquisition_address_count, 1);
     assert_eq!(summary.operator_acquisition_edge_count, 2);
+    assert_eq!(summary.operator_level_stats.len(), 3);
+    let l2_stats = summary
+        .operator_level_stats
+        .iter()
+        .find(|item| item.level == 2)
+        .expect("L2 stats");
+    assert_eq!(l2_stats.address_count, 1);
+    assert_eq!(l2_stats.secondary_sale_cost_eth, 10.0);
+    assert_eq!(l2_stats.paid_mint_cost_eth, 0.5);
+    assert_eq!(l2_stats.acquisition_total_eth, 10.5);
+    assert_eq!(l2_stats.acquisition_edge_count, 2);
 }
 
 #[test]

@@ -124,6 +124,8 @@ fn build_address_evidence_features(
                 corruption_score: item.corruption_score,
                 neutral_score: item.neutral_score,
                 confidence: item.confidence.clone(),
+                operator_level: item.operator_level,
+                operator_level_label: item.operator_level_label.clone(),
                 evidence_count: item.evidence.len() as i64,
                 related_token_count: related_tokens.len() as i64,
                 related_tx_count: related_txs.len() as i64,
@@ -1457,7 +1459,6 @@ fn has_strong_campaign_address_evidence(feature: &AddressEvidenceFeaturePayload)
                 | "star_distribution"
                 | "rapid_spread"
                 | "corrupted_honest_resale"
-                | "nft_aggregation"
                 | "contract_value_withdrawal"
                 | "multi_hop_cashout"
         )

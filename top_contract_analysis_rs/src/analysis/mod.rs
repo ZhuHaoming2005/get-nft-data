@@ -218,6 +218,7 @@ struct BatchSeedAggregate {
     corrupted_victim_addresses: BTreeSet<String>,
     repeat_infringing_addresses: BTreeSet<String>,
     operator_acquisition_addresses: BTreeSet<String>,
+    operator_level_addresses: BTreeMap<i64, BTreeSet<String>>,
 }
 
 struct ContractAnalysisResult {

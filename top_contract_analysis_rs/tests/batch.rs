@@ -754,13 +754,22 @@ fn batch_markdown_preserves_reference_summary_and_output_index_lines() {
             legit_duplicate_contract_count_total: 1,
             secondary_sale_victim_cost_eth_total: 12.5,
             secondary_sale_victim_cost_usd_total: 12.5,
+            secondary_sale_victim_address_count_total: 5,
             secondary_sale_stuck_cost_eth_total: 5.0,
             secondary_sale_stuck_cost_usd_total: 5.0,
             secondary_sale_stuck_cost_ratio_overall: Some(0.4),
-            victim_acquisition_total_eth_total: 12.5,
-            victim_acquisition_total_usd_total: 12.5,
-            victim_acquisition_stuck_cost_eth_total: 5.0,
-            victim_acquisition_stuck_cost_usd_total: 5.0,
+            paid_mint_victim_cost_eth_total: 2.5,
+            paid_mint_victim_cost_usd_total: 2.5,
+            paid_mint_victim_edge_count_total: 4,
+            paid_mint_victim_address_count_total: 3,
+            paid_mint_stuck_cost_eth_total: 1.0,
+            paid_mint_stuck_cost_usd_total: 1.0,
+            paid_mint_stuck_edge_count_total: 2,
+            paid_mint_stuck_token_count_total: 2,
+            victim_acquisition_total_eth_total: 15.0,
+            victim_acquisition_total_usd_total: 15.0,
+            victim_acquisition_stuck_cost_eth_total: 6.0,
+            victim_acquisition_stuck_cost_usd_total: 6.0,
             victim_acquisition_stuck_cost_ratio_overall: Some(0.4),
             victim_acquisition_address_count_total: 6,
             victim_acquisition_address_count_distinct: 4,
@@ -801,10 +810,18 @@ fn batch_markdown_preserves_reference_summary_and_output_index_lines() {
                 secondary_sale_stuck_cost_eth: 2.5,
                 secondary_sale_stuck_cost_usd: 2.5,
                 secondary_sale_stuck_cost_ratio: Some(1.0 / 3.0),
-                victim_acquisition_total_eth: 7.5,
-                victim_acquisition_total_usd: 7.5,
-                victim_acquisition_stuck_cost_eth: 2.5,
-                victim_acquisition_stuck_cost_usd: 2.5,
+                paid_mint_victim_cost_eth: 1.5,
+                paid_mint_victim_cost_usd: 1.5,
+                paid_mint_victim_edge_count: 2,
+                paid_mint_victim_address_count: 1,
+                paid_mint_stuck_cost_eth: 0.5,
+                paid_mint_stuck_cost_usd: 0.5,
+                paid_mint_stuck_edge_count: 1,
+                paid_mint_stuck_token_count: 1,
+                victim_acquisition_total_eth: 9.0,
+                victim_acquisition_total_usd: 9.0,
+                victim_acquisition_stuck_cost_eth: 3.0,
+                victim_acquisition_stuck_cost_usd: 3.0,
                 victim_acquisition_stuck_cost_ratio: Some(1.0 / 3.0),
                 ratio_over_60_address_count: 2,
                 ratio_over_60_address_ratio: Some(0.5),
@@ -834,10 +851,14 @@ fn batch_markdown_preserves_reference_summary_and_output_index_lines() {
     assert!(markdown.contains("- 多次侵权地址观测数(与单 seed 口径一致，按 seed 求和): 3"));
     assert!(markdown.contains("- 多次侵权地址数(与单 seed 口径一致，全局去重): 2"));
     assert!(!markdown.contains("多次侵权地址总数(跨批次全局去重)"));
-    assert!(markdown.contains("- 受害者获取成本(USD)汇总: 12.5"));
-    assert!(markdown.contains("- 总套牢成本(USD)汇总: 5 / 40.00%"));
-    assert!(markdown.contains("- 二级市场受害者成本(USD)汇总: 12.5"));
-    assert!(markdown.contains("- 付费 mint 受害者成本(USD)汇总: 0 / edges=0"));
+    assert!(markdown.contains("- 受害者获取成本(USD)汇总: 15"));
+    assert!(markdown.contains("- 总套牢成本(USD)汇总: 6 / 40.00%"));
+    assert!(markdown.contains(
+        "- 二级市场获取成本(USD)汇总: 12.5 / 套牢成本(USD)=5 / 套牢占比=40.00% / addresses=5"
+    ));
+    assert!(markdown.contains(
+        "- 付费 mint 获取成本(USD)汇总: 2.5 / 套牢成本(USD)=1 / 套牢占比=40.00% / edges=4 / addresses=3 / stuck_edges=2 / stuck_tokens=2"
+    ));
     assert!(
         markdown.contains("- 获取成本占购买前 ETH 余额估算 >60% 的受害者数/总体占比: 3 / 37.50%")
     );
@@ -848,7 +869,7 @@ fn batch_markdown_preserves_reference_summary_and_output_index_lines() {
     assert!(markdown.contains("- 生成时间(UTC): 2026-04-17T00:00:00+00:00"));
     assert!(markdown.contains("## Seed 报告索引"));
     assert!(markdown.contains(
-        "- Azuki (0xseed) | 重复合约=5 | 侵权NFT=4 | 疑似操作者=5 | 中性地址=6 | 受害者=0 | 多次侵权地址=1 | 官方参与=1 | 受害者获取成本(USD)=7.5 | 二级成本(USD)=7.5 | 付费mint(USD)=0 | 总套牢(USD)=2.5/33.33% | >60%=2/50.00% | 套牢受害者=1/25.00% | 被腐化受害者=1 | 部署到中性接收平均=10秒 | 部署到中性接收中位=9秒 | 部署到首次转手中位=8秒 | JSON=result/top_contract_analysis__azuki.json | MD=result/top_contract_analysis__azuki.md"
+        "- Azuki (0xseed) | 重复合约=5 | 侵权NFT=4 | 疑似操作者=5 | 中性地址=6 | 受害者=0 | 多次侵权地址=1 | 官方参与=1 | 受害者获取成本(USD)=9 | 二级获取(USD)=7.5 | 二级套牢(USD)=2.5/33.33% | 付费mint获取(USD)=1.5 | 付费mint套牢(USD)=0.5/33.33% | 总套牢(USD)=3/33.33% | >60%=2/50.00% | 套牢受害者=1/25.00% | 被腐化受害者=1 | 部署到中性接收平均=10秒 | 部署到中性接收中位=9秒 | 部署到首次转手中位=8秒 | JSON=result/top_contract_analysis__azuki.json | MD=result/top_contract_analysis__azuki.md"
     ));
 }
 
@@ -923,6 +944,65 @@ async fn batch_skips_cached_seed_reports_in_output_directory() {
         .unwrap()
         .json
         .starts_with("top_contract_analysis__"));
+}
+
+#[tokio::test]
+async fn batch_rejects_cached_seed_reports_without_operator_levels() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n").unwrap();
+    let cached_report = cached_single_report(
+        SeedContractPayload {
+            chain: "ethereum".into(),
+            contract_address: "0xseed1".into(),
+            name: "Old Cached Seed".into(),
+            ..SeedContractPayload::default()
+        },
+        ReportSummary {
+            candidate_contract_count: 1,
+            malicious_address_count: 1,
+            ..ReportSummary::default()
+        },
+        Vec::new(),
+        vec![MaliciousAddressPayload {
+            address: "0xoperator".into(),
+            wash_cycle_count: 1,
+            ..MaliciousAddressPayload::default()
+        }],
+        Vec::new(),
+        Vec::new(),
+        BTreeMap::new(),
+    );
+    std::fs::write(
+        dir.path().join("top_contract_analysis__cached.json"),
+        serde_json::to_string(&cached_report).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("top_contract_analysis__cached.md"),
+        "# cached\n",
+    )
+    .unwrap();
+    let deps = AnalysisDeps {
+        api: Arc::new(FakeBatchApi),
+        feature_store: Arc::new(EmptyFeatureStore),
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    let err = run_batch(
+        BatchRequest {
+            chain: "ethereum".into(),
+            seed_file: dir.path().join("seeds.txt"),
+            output_dir: dir.path().to_path_buf(),
+            alchemy_api_key: "key".into(),
+            ..BatchRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(err.to_string().contains("operator_level"));
 }
 
 #[tokio::test]
@@ -1237,10 +1317,14 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
         vec![
             MaliciousAddressPayload {
                 address: "0xm1".into(),
+                operator_level: 1,
+                operator_level_label: "weak_behavioral_operator".into(),
                 ..MaliciousAddressPayload::default()
             },
             MaliciousAddressPayload {
                 address: "0xm2".into(),
+                operator_level: 1,
+                operator_level_label: "weak_behavioral_operator".into(),
                 ..MaliciousAddressPayload::default()
             },
         ],
@@ -1364,10 +1448,14 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
         vec![
             MaliciousAddressPayload {
                 address: "0xm2".into(),
+                operator_level: 2,
+                operator_level_label: "likely_behavioral_operator".into(),
                 ..MaliciousAddressPayload::default()
             },
             MaliciousAddressPayload {
                 address: "0xm3".into(),
+                operator_level: 3,
+                operator_level_label: "strong_value_control_operator".into(),
                 ..MaliciousAddressPayload::default()
             },
         ],
@@ -1508,6 +1596,33 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
         summary.batch_summary.operator_acquisition_edge_count_total,
         2
     );
+    assert_eq!(summary.batch_summary.operator_level_stats.len(), 3);
+    let l1_stats = summary
+        .batch_summary
+        .operator_level_stats
+        .iter()
+        .find(|item| item.level == 1)
+        .expect("L1 stats");
+    assert_eq!(l1_stats.address_count, 1);
+    assert_eq!(l1_stats.acquisition_total_eth, 1_000.0);
+    assert_eq!(l1_stats.acquisition_edge_count, 1);
+    let l2_stats = summary
+        .batch_summary
+        .operator_level_stats
+        .iter()
+        .find(|item| item.level == 2)
+        .expect("L2 stats");
+    assert_eq!(l2_stats.address_count, 1);
+    assert_eq!(l2_stats.acquisition_total_eth, 50.0);
+    assert_eq!(l2_stats.acquisition_edge_count, 1);
+    let l3_stats = summary
+        .batch_summary
+        .operator_level_stats
+        .iter()
+        .find(|item| item.level == 3)
+        .expect("L3 stats");
+    assert_eq!(l3_stats.address_count, 1);
+    assert_eq!(l3_stats.acquisition_total_eth, 0.0);
     assert_eq!(
         summary
             .batch_summary

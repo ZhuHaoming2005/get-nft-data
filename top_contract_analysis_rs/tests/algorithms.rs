@@ -1471,7 +1471,7 @@ fn campaign_clusters_use_funding_source_not_paid_minter_as_shared_evidence() {
 }
 
 #[test]
-fn campaign_clusters_use_aggregation_attribution_as_shared_operator_evidence() {
+fn campaign_clusters_do_not_use_aggregation_attribution_as_shared_operator_evidence() {
     let seed_contract = SeedContractPayload {
         chain: "ethereum".into(),
         contract_address: "0xseed".into(),
@@ -1547,11 +1547,13 @@ fn campaign_clusters_use_aggregation_attribution_as_shared_operator_evidence() {
         market_events: &[],
     });
 
-    assert_eq!(outputs.campaign_clusters.len(), 1);
-    assert!(outputs.campaign_clusters[0]
-        .shared_evidence
-        .iter()
-        .any(|item| item == "shared_address:suspected_operator:0xcollector"));
+    assert_eq!(outputs.campaign_clusters.len(), 2);
+    assert!(outputs.campaign_clusters.iter().all(|cluster| {
+        !cluster
+            .shared_evidence
+            .iter()
+            .any(|item| item == "shared_address:suspected_operator:0xcollector")
+    }));
 }
 
 #[test]
