@@ -271,7 +271,6 @@ pub struct AddressSignals {
     pub unique_receiver_count: usize,
     pub cycle_edge_count: usize,
     pub star_distributor_count: usize,
-    #[serde(alias = "mint_to_first_transfer_seconds")]
     pub first_transfer_delay_seconds: i64,
     pub fast_spread: bool,
 }
@@ -301,104 +300,6 @@ pub struct SeedContractPayload {
     pub token_type: String,
     pub contract_deployer: String,
     pub deployed_block_number: i64,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-pub struct ReportSummary {
-    pub open_license_detected: bool,
-    pub candidate_contract_count: i64,
-    #[serde(default)]
-    pub implausible_candidate_contract_count: i64,
-    pub infringing_nft_count: i64,
-    pub malicious_address_count: i64,
-    #[serde(alias = "honest_address_count")]
-    pub neutral_address_count: i64,
-    pub repeat_infringing_address_count: i64,
-    pub legit_duplicate_contract_count: i64,
-    pub candidate_open_license_token_count: i64,
-    pub candidate_open_license_contract_count: i64,
-    pub secondary_sale_victim_cost_eth: f64,
-    pub secondary_sale_victim_cost_usd: f64,
-    pub secondary_sale_victim_address_count: i64,
-    pub secondary_sale_stuck_cost_eth: f64,
-    pub secondary_sale_stuck_cost_usd: f64,
-    pub secondary_sale_stuck_cost_ratio: Option<f64>,
-    pub paid_mint_victim_cost_eth: f64,
-    pub paid_mint_victim_cost_usd: f64,
-    pub paid_mint_victim_edge_count: i64,
-    pub paid_mint_victim_address_count: i64,
-    pub paid_mint_stuck_cost_eth: f64,
-    pub paid_mint_stuck_cost_usd: f64,
-    pub paid_mint_stuck_edge_count: i64,
-    pub paid_mint_stuck_token_count: i64,
-    pub victim_acquisition_total_eth: f64,
-    pub victim_acquisition_total_usd: f64,
-    pub victim_acquisition_stuck_cost_eth: f64,
-    pub victim_acquisition_stuck_cost_usd: f64,
-    pub victim_acquisition_stuck_cost_ratio: Option<f64>,
-    pub victim_acquisition_address_count: i64,
-    #[serde(default)]
-    pub operator_secondary_sale_cost_eth: f64,
-    #[serde(default)]
-    pub operator_secondary_sale_cost_usd: f64,
-    #[serde(default)]
-    pub operator_paid_mint_cost_eth: f64,
-    #[serde(default)]
-    pub operator_paid_mint_cost_usd: f64,
-    #[serde(default)]
-    pub operator_acquisition_total_eth: f64,
-    #[serde(default)]
-    pub operator_acquisition_total_usd: f64,
-    #[serde(default)]
-    pub operator_acquisition_address_count: i64,
-    #[serde(default)]
-    pub operator_acquisition_edge_count: i64,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub operator_level_stats: Vec<OperatorLevelStatsPayload>,
-    #[serde(default)]
-    pub stablecoin_erc20_value_usd: f64,
-    #[serde(default)]
-    pub stablecoin_erc20_edge_count: i64,
-    #[serde(default)]
-    pub value_flow_priced_edge_count: i64,
-    #[serde(default)]
-    pub value_flow_unpriced_edge_count: i64,
-    pub buy_asset_ratio_known_address_count: i64,
-    pub ratio_over_60_address_count: i64,
-    pub ratio_over_60_address_ratio: Option<f64>,
-    pub ratio_over_80_address_count: i64,
-    pub ratio_over_80_address_ratio: Option<f64>,
-    #[serde(alias = "stuck_honest_address_count")]
-    pub stuck_victim_address_count: i64,
-    #[serde(alias = "stuck_honest_address_ratio")]
-    pub stuck_victim_address_ratio: Option<f64>,
-    #[serde(alias = "corrupted_honest_address_count")]
-    pub corrupted_victim_address_count: i64,
-    pub avg_corrupted_address_holding_seconds: Option<f64>,
-    pub median_corrupted_address_holding_seconds: Option<f64>,
-    #[serde(
-        rename = "avg_deployment_to_neutral_holder_seconds",
-        alias = "avg_seconds_to_honest_holder",
-        alias = "avg_seconds_to_neutral_holder"
-    )]
-    pub avg_deployment_to_neutral_holder_seconds: Option<f64>,
-    #[serde(
-        rename = "median_deployment_to_neutral_holder_seconds",
-        alias = "median_seconds_to_honest_holder",
-        alias = "median_seconds_to_neutral_holder"
-    )]
-    pub median_deployment_to_neutral_holder_seconds: Option<f64>,
-    #[serde(
-        rename = "avg_deployment_to_first_transfer_seconds",
-        alias = "avg_mint_to_first_transfer_seconds"
-    )]
-    pub avg_deployment_to_first_transfer_seconds: Option<f64>,
-    #[serde(
-        rename = "median_deployment_to_first_transfer_seconds",
-        alias = "median_mint_to_first_transfer_seconds"
-    )]
-    pub median_deployment_to_first_transfer_seconds: Option<f64>,
-    pub avg_unique_receiver_count: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -445,7 +346,6 @@ pub struct AddressSignalPayload {
     pub unique_receiver_count: i64,
     pub cycle_edge_count: i64,
     pub star_distributor_count: i64,
-    #[serde(alias = "mint_to_first_transfer_seconds")]
     pub first_transfer_delay_seconds: i64,
     pub fast_spread: bool,
 }
@@ -459,31 +359,6 @@ pub struct VictimSignalPayload {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-pub struct HonestAddressStatsPayload {
-    #[serde(rename = "neutral_address_count", alias = "honest_address_count")]
-    pub honest_address_count: i64,
-    #[serde(
-        rename = "corrupted_victim_address_count",
-        alias = "corrupted_address_count"
-    )]
-    pub corrupted_address_count: i64,
-    pub victim_resale_count: i64,
-    pub median_holding_seconds: Option<f64>,
-    #[serde(
-        rename = "avg_deployment_to_neutral_holder_seconds",
-        alias = "avg_seconds_to_honest_holder",
-        alias = "avg_seconds_to_neutral_holder"
-    )]
-    pub avg_deployment_to_neutral_holder_seconds: Option<f64>,
-    #[serde(
-        default,
-        rename = "corrupted_victim_addresses",
-        alias = "corrupted_addresses"
-    )]
-    pub corrupted_addresses: Vec<String>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct HonestAddressPayload {
     pub contract_address: String,
     pub address: String,
@@ -491,14 +366,8 @@ pub struct HonestAddressPayload {
     pub currently_holding_token_count: i64,
     pub hold_duration_median_seconds: Option<f64>,
     pub hold_duration_count: i64,
-    #[serde(rename = "is_corrupted_victim", alias = "is_corrupted_address")]
     pub is_corrupted_address: bool,
     pub victim_resale_count: i64,
-    #[serde(
-        rename = "deployment_to_neutral_holder_seconds_samples",
-        alias = "mint_to_neutral_holder_seconds_samples",
-        alias = "mint_to_honest_seconds_samples"
-    )]
     pub deployment_to_neutral_holder_seconds_samples: Vec<i64>,
 }
 
@@ -513,19 +382,8 @@ pub struct SecondarySaleVictimAddressPayload {
     pub last_buy_amount_eth: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_buy_amount_usd: Option<f64>,
-    pub buy_before_eth_balance: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub buy_before_usd_balance: Option<f64>,
-    pub buy_asset_ratio: Option<f64>,
-    pub buy_asset_ratio_with_gas: Option<f64>,
     pub is_stuck: bool,
     pub last_buy_tx_hash: String,
-    #[serde(default = "default_ratio_status")]
-    pub ratio_status: String,
-}
-
-fn default_ratio_status() -> String {
-    "unavailable".into()
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -839,27 +697,6 @@ pub struct EarlyDetectionFeaturePayload {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-pub struct FraudTradeStatsPayload {
-    pub unique_buyers: i64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub usd_priced_sale_count: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub usd_priced_volume: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub eth_priced_sale_count: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub eth_priced_volume: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub native_eth_sale_count: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub native_eth_volume: Option<f64>,
-    pub stuck_wallet_count: i64,
-    pub stuck_cost_eth: f64,
-    #[serde(default)]
-    pub stuck_cost_usd: f64,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct OperatorLevelStatsPayload {
     pub level: i64,
     pub level_label: String,
@@ -873,10 +710,219 @@ pub struct OperatorLevelStatsPayload {
     pub acquisition_edge_count: i64,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PaperDuplicateScaleRowPayload {
+    pub category: String,
+    pub duplicate_nft_count: i64,
+    pub duplicate_nft_ratio: Option<f64>,
+    pub duplicate_nft_ratio_numerator: i64,
+    pub duplicate_nft_ratio_denominator: i64,
+    pub duplicate_contract_count: i64,
+    pub duplicate_contract_ratio: Option<f64>,
+    pub duplicate_contract_ratio_numerator: i64,
+    pub duplicate_contract_ratio_denominator: i64,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct OutputFilesPayload {
-    pub json: String,
-    pub markdown: String,
+pub struct PaperAddressClassificationPayload {
+    pub malicious_address_count: i64,
+    pub repeat_infringing_malicious_address_count: i64,
+    pub honest_address_count: i64,
+    pub total_address_count: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PaperWashTradingRowPayload {
+    pub cycle_id: String,
+    pub participant_node_count: i64,
+    pub token_gini: Option<f64>,
+    pub avg_cycle_blocks: Option<f64>,
+    pub fake_volume_eth: f64,
+    pub fake_volume_usd: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PaperPumpExitRowPayload {
+    pub cycle_id: String,
+    pub exit_delay_seconds: Option<i64>,
+    pub exit_price_premium: Option<f64>,
+    pub exit_ratio: Option<f64>,
+    pub exit_ratio_numerator: i64,
+    pub exit_ratio_denominator: i64,
+    pub linked_honest_buyer_count: i64,
+    pub linked_loss_eth: f64,
+    pub linked_loss_usd: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PaperStarBehaviorRowPayload {
+    pub behavior: String,
+    pub centers: i64,
+    pub edges: i64,
+    pub wallets: i64,
+    pub tokens: i64,
+    pub avg_fan_out: Option<f64>,
+    pub avg_fan_out_numerator: i64,
+    pub avg_fan_out_denominator: i64,
+    pub median_holding_seconds: Option<f64>,
+    pub total_value_eth: f64,
+    pub total_value_usd: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PaperLayeredTransferRowPayload {
+    pub path_id: String,
+    pub tokens: i64,
+    pub length: i64,
+    pub wallets: i64,
+    pub zero_or_low_value_hops: i64,
+    pub total_path_duration_seconds: Option<i64>,
+    pub total_value_eth: f64,
+    pub total_value_usd: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PaperInventoryConcentrationRowPayload {
+    pub hub_address: String,
+    pub source_wallets: i64,
+    pub inbound_txns: i64,
+    pub token_share: Option<f64>,
+    pub token_share_numerator: i64,
+    pub token_share_denominator: i64,
+    pub value_collected_eth: f64,
+    pub value_collected_usd: f64,
+    pub value_share: Option<f64>,
+    pub value_share_numerator: f64,
+    pub value_share_denominator: f64,
+    pub collection_window_seconds: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PaperHonestBuyerRowPayload {
+    pub honest_buyer: String,
+    pub fake_nft_bought: i64,
+    pub total_paid_eth: f64,
+    pub total_paid_usd: f64,
+    pub source_pattern: String,
+    pub time_to_purchase_seconds: Option<i64>,
+    pub still_holding: bool,
+    pub holding_seconds: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PaperContractBehaviorStatsPayload {
+    pub contract_address: String,
+    pub wash_trading: Vec<PaperWashTradingRowPayload>,
+    pub pump_and_exit: Vec<PaperPumpExitRowPayload>,
+    pub star_behaviors: Vec<PaperStarBehaviorRowPayload>,
+    pub layered_transfers: Vec<PaperLayeredTransferRowPayload>,
+    pub inventory_concentration: Vec<PaperInventoryConcentrationRowPayload>,
+    pub honest_buyers_top: Vec<PaperHonestBuyerRowPayload>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PaperBehaviorSummaryRowPayload {
+    pub behavior_type: String,
+    pub contract_count: i64,
+    pub contract_coverage_ratio: Option<f64>,
+    pub contract_coverage_numerator: i64,
+    pub contract_coverage_denominator: i64,
+    pub instance_count: i64,
+    pub instance_ratio: Option<f64>,
+    pub instance_ratio_numerator: i64,
+    pub instance_ratio_denominator: i64,
+    pub address_count: i64,
+    pub nft_count: i64,
+    pub linked_buyer_count: i64,
+    pub linked_loss_eth: f64,
+    pub linked_loss_usd: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PaperAttackerCostPayload {
+    pub setup_gas_eth: f64,
+    pub setup_gas_usd: f64,
+    pub lure_gas_eth: f64,
+    pub lure_gas_usd: f64,
+    pub exit_gas_eth: f64,
+    pub exit_gas_usd: f64,
+    pub total_gas_eth: f64,
+    pub total_gas_usd: f64,
+    pub top_contract_contribution_ratio: Option<f64>,
+    pub top_contract_contribution_numerator: f64,
+    pub top_contract_contribution_denominator: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PaperHonestLossPayload {
+    pub category: String,
+    pub stuck_nft_count: i64,
+    pub stuck_nft_ratio: Option<f64>,
+    pub stuck_nft_ratio_numerator: i64,
+    pub stuck_nft_ratio_denominator: i64,
+    pub stuck_time_ratio: Option<f64>,
+    pub stuck_time_ratio_numerator: f64,
+    pub stuck_time_ratio_denominator: f64,
+    pub secondary_sale_loss_eth: f64,
+    pub secondary_sale_loss_usd: f64,
+    pub paid_mint_loss_eth: f64,
+    pub paid_mint_loss_usd: f64,
+    pub total_loss_eth: f64,
+    pub total_loss_usd: f64,
+    pub top_contract_loss_contribution_ratio: Option<f64>,
+    pub top_contract_loss_contribution_numerator: f64,
+    pub top_contract_loss_contribution_denominator: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PaperDataQualityPayload {
+    pub sale_price_parseable_count: i64,
+    pub sale_price_total_count: i64,
+    pub sale_price_parseable_ratio: Option<f64>,
+    pub legit_duplicate_contract_count: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PaperStatsPayload {
+    pub duplicate_scale: Vec<PaperDuplicateScaleRowPayload>,
+    pub address_classification: PaperAddressClassificationPayload,
+    pub contract_behavior_stats: Vec<PaperContractBehaviorStatsPayload>,
+    pub malicious_behavior_summary: Vec<PaperBehaviorSummaryRowPayload>,
+    pub attacker_cost: PaperAttackerCostPayload,
+    pub honest_loss: Vec<PaperHonestLossPayload>,
+    pub data_quality: PaperDataQualityPayload,
+    #[serde(default, skip_serializing)]
+    pub malicious_addresses: Vec<String>,
+    #[serde(default, skip_serializing)]
+    pub honest_addresses: Vec<String>,
+    #[serde(default, skip_serializing)]
+    pub repeat_infringing_malicious_addresses: Vec<String>,
+    #[serde(default, skip_serializing)]
+    pub attacker_cost_by_contract_usd: BTreeMap<String, f64>,
+    #[serde(default, skip_serializing)]
+    pub honest_loss_by_contract_usd: BTreeMap<String, f64>,
+    #[serde(default, skip_serializing)]
+    pub stuck_time_numerator_by_contract: BTreeMap<String, f64>,
+    #[serde(default, skip_serializing)]
+    pub stuck_time_denominator_by_contract: BTreeMap<String, f64>,
+    #[serde(default, skip_serializing)]
+    pub behavior_contract_denominator: i64,
+    #[serde(default, skip_serializing)]
+    pub behavior_contract_denominator_keys: Vec<String>,
+    #[serde(default, skip_serializing)]
+    pub duplicate_nft_keys_by_category: BTreeMap<String, Vec<String>>,
+    #[serde(default, skip_serializing)]
+    pub duplicate_contract_keys_by_category: BTreeMap<String, Vec<String>>,
+    #[serde(default, skip_serializing)]
+    pub duplicate_contract_denominator_keys: Vec<String>,
+    #[serde(default, skip_serializing)]
+    pub behavior_contracts_by_type: BTreeMap<String, Vec<String>>,
+    #[serde(default, skip_serializing)]
+    pub behavior_addresses_by_type: BTreeMap<String, Vec<String>>,
+    #[serde(default, skip_serializing)]
+    pub behavior_nfts_by_type: BTreeMap<String, Vec<String>>,
+    #[serde(default, skip_serializing)]
+    pub behavior_buyers_by_type: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -887,7 +933,6 @@ pub struct ContractLevelSummaryPayload {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct MaliciousAddressPayload {
     pub address: String,
-    #[serde(rename = "mint_activity_observed", alias = "mint_role")]
     pub mint_activity_observed: bool,
     pub wash_cycle_count: i64,
     #[serde(default)]
@@ -1029,169 +1074,58 @@ pub struct NftPropagationPathPayload {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct SingleReportPayload {
     pub seed_contract: SeedContractPayload,
+    #[serde(default)]
+    pub paper_stats: PaperStatsPayload,
+    #[serde(skip_serializing)]
     pub seed_collection_stats: SeedCollectionStatsPayload,
     #[serde(skip_serializing, skip_deserializing, default)]
     pub duplicate_candidates: Vec<DuplicateCandidate>,
+    #[serde(skip_serializing)]
     pub contract_level_summary: BTreeMap<String, ContractLevelSummaryPayload>,
-    pub report_summary: ReportSummary,
+    #[serde(skip_serializing)]
     pub duplicate_contracts: Vec<DuplicateContractPayload>,
+    #[serde(skip_serializing)]
     pub legit_duplicates: Vec<DuplicateContractPayload>,
+    #[serde(skip_serializing)]
     pub address_signals: BTreeMap<String, AddressSignalPayload>,
+    #[serde(skip_serializing)]
     pub victim_signals: BTreeMap<String, VictimSignalPayload>,
+    #[serde(skip_serializing)]
     pub infringing_tokens: Vec<InfringingTokenRecord>,
+    #[serde(skip_serializing)]
     pub malicious_addresses: Vec<MaliciousAddressPayload>,
-    #[serde(rename = "neutral_addresses", alias = "honest_addresses")]
+    #[serde(skip_serializing)]
     pub honest_addresses: Vec<HonestAddressPayload>,
-    #[serde(rename = "neutral_address_stats", alias = "honest_address_stats")]
-    pub honest_address_stats: BTreeMap<String, HonestAddressStatsPayload>,
+    #[serde(skip_serializing)]
     pub secondary_sale_victim_addresses: Vec<SecondarySaleVictimAddressPayload>,
+    #[serde(skip_serializing)]
     pub victim_acquisition_addresses: Vec<VictimAcquisitionAddressPayload>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing)]
     pub address_attributions: Vec<AddressAttributionPayload>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub contract_lifecycle_events: Vec<ContractLifecycleEventPayload>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub address_evidence_features: Vec<AddressEvidenceFeaturePayload>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub value_flow_edges: Vec<ValueFlowEdgePayload>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub content_similarity_edges: Vec<ContentSimilarityEdgePayload>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub campaign_clusters: Vec<CampaignClusterPayload>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub lifecycle_metrics: Vec<ContractLifecycleMetricPayload>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub weak_supervision_labels: Vec<WeakSupervisionLabelPayload>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub early_detection_features: Vec<EarlyDetectionFeaturePayload>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub market_events: Vec<NftMarketEventRecord>,
-    pub fraud_trade_stats: BTreeMap<String, FraudTradeStatsPayload>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub nft_propagation_paths: BTreeMap<String, NftPropagationPathPayload>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-pub struct BatchReportSummary {
-    pub seed_report_count: i64,
-    pub chain: String,
-    pub chains: Vec<String>,
-    pub open_license_detected_count: i64,
-    pub candidate_contract_count_total: i64,
-    #[serde(default)]
-    pub implausible_candidate_contract_count_total: i64,
-    pub infringing_nft_count_total: i64,
-    pub malicious_address_count_total: i64,
-    #[serde(alias = "honest_address_count_total")]
-    pub neutral_address_count_total: i64,
-    pub repeat_infringing_address_count_total: i64,
-    pub repeat_infringing_address_count_global: i64,
-    pub legit_duplicate_contract_count_total: i64,
-    pub secondary_sale_victim_cost_eth_total: f64,
-    pub secondary_sale_victim_cost_usd_total: f64,
-    pub secondary_sale_victim_address_count_total: i64,
-    pub secondary_sale_stuck_cost_eth_total: f64,
-    pub secondary_sale_stuck_cost_usd_total: f64,
-    pub secondary_sale_stuck_cost_ratio_overall: Option<f64>,
-    pub paid_mint_victim_cost_eth_total: f64,
-    pub paid_mint_victim_cost_usd_total: f64,
-    pub paid_mint_victim_edge_count_total: i64,
-    pub paid_mint_victim_address_count_total: i64,
-    pub paid_mint_stuck_cost_eth_total: f64,
-    pub paid_mint_stuck_cost_usd_total: f64,
-    pub paid_mint_stuck_edge_count_total: i64,
-    pub paid_mint_stuck_token_count_total: i64,
-    pub victim_acquisition_total_eth_total: f64,
-    pub victim_acquisition_total_usd_total: f64,
-    pub victim_acquisition_stuck_cost_eth_total: f64,
-    pub victim_acquisition_stuck_cost_usd_total: f64,
-    pub victim_acquisition_stuck_cost_ratio_overall: Option<f64>,
-    pub victim_acquisition_address_count_total: i64,
-    #[serde(default)]
-    pub victim_acquisition_address_count_distinct: i64,
-    #[serde(default)]
-    pub operator_secondary_sale_cost_eth_total: f64,
-    #[serde(default)]
-    pub operator_secondary_sale_cost_usd_total: f64,
-    #[serde(default)]
-    pub operator_paid_mint_cost_eth_total: f64,
-    #[serde(default)]
-    pub operator_paid_mint_cost_usd_total: f64,
-    #[serde(default)]
-    pub operator_acquisition_total_eth_total: f64,
-    #[serde(default)]
-    pub operator_acquisition_total_usd_total: f64,
-    #[serde(default)]
-    pub operator_acquisition_address_count_total: i64,
-    #[serde(default)]
-    pub operator_acquisition_address_count_distinct: i64,
-    #[serde(default)]
-    pub operator_acquisition_edge_count_total: i64,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub operator_level_stats: Vec<OperatorLevelStatsPayload>,
-    #[serde(default)]
-    pub stablecoin_erc20_value_usd_total: f64,
-    #[serde(default)]
-    pub stablecoin_erc20_edge_count_total: i64,
-    #[serde(default)]
-    pub value_flow_priced_edge_count_total: i64,
-    #[serde(default)]
-    pub value_flow_unpriced_edge_count_total: i64,
-    pub buy_asset_ratio_known_address_count_total: i64,
-    pub ratio_over_60_address_count_total: i64,
-    pub ratio_over_60_address_ratio_overall: Option<f64>,
-    pub ratio_over_80_address_count_total: i64,
-    pub ratio_over_80_address_ratio_overall: Option<f64>,
-    #[serde(alias = "stuck_honest_address_count_total")]
-    pub stuck_victim_address_count_total: i64,
-    #[serde(alias = "stuck_honest_address_ratio_overall")]
-    pub stuck_victim_address_ratio_overall: Option<f64>,
-    #[serde(default)]
-    pub stuck_victim_address_count_distinct: i64,
-    #[serde(default)]
-    pub stuck_victim_address_ratio_distinct: Option<f64>,
-    #[serde(alias = "corrupted_honest_address_count_total")]
-    pub corrupted_victim_address_count_total: i64,
-    #[serde(default)]
-    pub corrupted_victim_address_count_distinct: i64,
-    pub avg_corrupted_address_holding_seconds_mean: Option<f64>,
-    pub median_corrupted_address_holding_seconds_median: Option<f64>,
-    #[serde(
-        rename = "avg_deployment_to_neutral_holder_seconds_mean",
-        alias = "avg_seconds_to_honest_holder_mean",
-        alias = "avg_seconds_to_neutral_holder_mean"
-    )]
-    pub avg_deployment_to_neutral_holder_seconds_mean: Option<f64>,
-    #[serde(
-        rename = "median_deployment_to_neutral_holder_seconds_median",
-        alias = "median_seconds_to_honest_holder_median",
-        alias = "median_seconds_to_neutral_holder_median"
-    )]
-    pub median_deployment_to_neutral_holder_seconds_median: Option<f64>,
-    #[serde(
-        rename = "avg_deployment_to_first_transfer_seconds_mean",
-        alias = "avg_mint_to_first_transfer_seconds_mean"
-    )]
-    pub avg_deployment_to_first_transfer_seconds_mean: Option<f64>,
-    #[serde(
-        rename = "median_deployment_to_first_transfer_seconds_median",
-        alias = "median_mint_to_first_transfer_seconds_median"
-    )]
-    pub median_deployment_to_first_transfer_seconds_median: Option<f64>,
-    pub avg_unique_receiver_count_mean: Option<f64>,
-    pub generated_at: String,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-pub struct BatchSeedReportPayload {
-    pub seed_contract: SeedContractPayload,
-    pub report_summary: ReportSummary,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_files: Option<OutputFilesPayload>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct BatchSummaryPayload {
-    pub batch_summary: BatchReportSummary,
-    pub seed_reports: Vec<BatchSeedReportPayload>,
+    #[serde(default)]
+    pub paper_stats: PaperStatsPayload,
 }

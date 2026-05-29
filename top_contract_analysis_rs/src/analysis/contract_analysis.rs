@@ -1,13 +1,12 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::error::AppError;
 use crate::models::{ContractMetadata, DuplicateCandidate, DuplicateContractPayload};
 
 use super::{
     address_records, analyze_victim_signals_from_active_sellers,
-    compute_mint_payment_edges_for_contract, compute_sale_metrics_for_contract,
-    map_address_signals, propagation, signals, AnalysisDeps, AnalysisOutputState, AnalyzeRequest,
-    ContractAnalysisResult,
+    compute_mint_payment_edges_for_contract, map_address_signals, propagation, signals,
+    AnalysisDeps, AnalysisOutputState, AnalyzeRequest, ContractAnalysisResult,
 };
 
 const CURRENT_SUPPLY_MISMATCH_MIN_CANDIDATES: usize = 20;
@@ -47,10 +46,6 @@ pub(super) fn merge_contract_analysis_result(
             .victim_signals
             .insert(result.contract_address.clone(), victim_signal);
     }
-    state
-        .honest_address_stats
-        .extend(result.honest_address_stats);
-    state.fraud_trade_stats.extend(result.fraud_trade_stats);
     state.infringing_tokens.extend(result.infringing_tokens);
     state.malicious_addresses.extend(result.malicious_addresses);
     state.honest_addresses.extend(result.honest_addresses);
@@ -122,12 +117,10 @@ pub(super) fn implausible_candidate_filtered_result(
         infringing_tokens: Vec::new(),
         malicious_addresses: Vec::new(),
         honest_addresses: Vec::new(),
-        honest_address_stats: BTreeMap::new(),
         secondary_sale_victim_addresses: Vec::new(),
         address_attributions: Vec::new(),
         market_events: Vec::new(),
         mint_payment_edges: Vec::new(),
-        fraud_trade_stats: BTreeMap::new(),
         nft_propagation_path: None,
     }
 }
@@ -299,12 +292,10 @@ pub(super) async fn analyze_duplicate_contract(
             infringing_tokens: vec![],
             malicious_addresses: vec![],
             honest_addresses: vec![],
-            honest_address_stats: BTreeMap::new(),
             secondary_sale_victim_addresses: vec![],
             address_attributions: vec![],
             market_events: vec![],
             mint_payment_edges: vec![],
-            fraud_trade_stats: BTreeMap::new(),
             nft_propagation_path: None,
         });
     }
@@ -329,7 +320,6 @@ pub(super) async fn analyze_duplicate_contract(
         contract_metadata.as_ref(),
     );
     let (sales, mint_payment_edges) = tokio::try_join!(sales_fut, mint_payment_edges_fut)?;
-    let sale_metrics_by_tx = compute_sale_metrics_for_contract(request, deps, &sales).await?;
 
     let contract_activity = address_records::prepare_contract_activity(&transfers, &sales, &owners);
     let contract_malicious = address_records::build_malicious_address_records_from_activity(
@@ -342,7 +332,6 @@ pub(super) async fn analyze_duplicate_contract(
         address_records::build_secondary_sale_victim_address_records_excluding_malicious_from_activity(
             contract_address,
             &contract_activity,
-            &sale_metrics_by_tx,
             &contract_malicious,
         );
     let contract_honest = address_records::build_honest_address_records_from_activity(
@@ -385,15 +374,6 @@ pub(super) async fn analyze_duplicate_contract(
         legit_duplicate: None,
         address_signal: Some(map_address_signals(&transfer_signals)),
         victim_signal: Some(victim_signal),
-        honest_address_stats: address_records::build_honest_address_stats(
-            contract_address,
-            &contract_honest,
-        ),
-        fraud_trade_stats: address_records::build_fraud_trade_stats(
-            contract_address,
-            &sales,
-            &contract_secondary_sale_victims,
-        ),
         infringing_tokens: contract_infringing,
         malicious_addresses: contract_malicious,
         honest_addresses: contract_honest,

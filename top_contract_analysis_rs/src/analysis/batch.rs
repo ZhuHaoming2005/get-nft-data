@@ -6,10 +6,10 @@ use futures::{stream, StreamExt};
 use tokio::sync::Semaphore;
 
 use crate::error::AppError;
-use crate::models::{BatchSummaryPayload, OutputFilesPayload, SingleReportPayload};
+use crate::models::BatchSummaryPayload;
 use crate::reporting::write_outputs_to_directory;
 
-use super::summary::{build_batch_report_summary, build_batch_seed_aggregate};
+use super::summary::build_batch_seed_aggregate;
 use super::{
     acquire_optional_limit, analyze_matched_contracts_parallel, build_candidate_plan_for_seed,
     fetch_seed_context, finalize_seed_report, prepare_seed_analysis_state, AnalysisDeps,
@@ -34,6 +34,7 @@ fn analyze_request_for_batch_seed(
         matched_contract_max_concurrency: request.matched_contract_max_concurrency,
         max_tokens_per_contract: request.max_tokens_per_contract,
         max_recall_rows: request.max_recall_rows,
+        paper_stats_config: request.paper_stats_config,
     }
 }
 
@@ -42,17 +43,8 @@ pub async fn run_batch(
     deps: &AnalysisDeps,
 ) -> Result<BatchSummaryPayload, AppError> {
     let seed_addresses = read_seed_addresses(&request.seed_file)?;
-    let cached_entries = load_cached_seed_entries(&request.output_dir, &request.chain)?;
     let mut seed_aggregates = Vec::new();
-    let mut pending_seeds = Vec::new();
-    for seed_address in seed_addresses.iter().cloned() {
-        if let Some(cached) = cached_entries.get(&seed_address) {
-            deps.batch_progress.on_seed_cached(&seed_address);
-            seed_aggregates.push(cached.clone());
-        } else {
-            pending_seeds.push(seed_address);
-        }
-    }
+    let pending_seeds = seed_addresses.clone();
 
     let seed_network_max_concurrency = request.seed_network_max_concurrency.max(1);
     let seed_cpu_max_concurrency = request.seed_cpu_max_concurrency.max(1);
@@ -65,6 +57,11 @@ pub async fn run_batch(
     let mut first_error: Option<AppError> = None;
     let output_dir = request.output_dir.clone();
     let pending_seed_count = pending_seeds.len().max(1);
+    let seed_pipeline_max_concurrency = seed_network_max_concurrency
+        .saturating_add(seed_cpu_max_concurrency)
+        .saturating_add(request.matched_contract_max_concurrency.max(1))
+        .min(pending_seed_count)
+        .max(1);
     let mut seed_tasks = stream::iter(pending_seeds.into_iter().map(|seed_address| {
         let per_seed_request = analyze_request_for_batch_seed(&request, seed_address.clone());
         let deps = deps.clone();
@@ -129,24 +126,12 @@ pub async fn run_batch(
                 }
             };
             batch_progress.on_seed_finished(&seed_address);
-            let (json_path, md_path) = write_outputs_to_directory(&payload, &output_dir)?;
-            let mut aggregate = build_batch_seed_aggregate(payload);
-            aggregate.report.output_files = Some(OutputFilesPayload {
-                json: json_path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned(),
-                markdown: md_path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned(),
-            });
+            write_outputs_to_directory(&payload, &output_dir)?;
+            let aggregate = build_batch_seed_aggregate(payload);
             Ok(aggregate)
         }
     }))
-    .buffer_unordered(pending_seed_count);
+    .buffer_unordered(seed_pipeline_max_concurrency);
     while let Some(entry) = seed_tasks.next().await {
         match entry {
             Ok(aggregate) => fresh_entries.push(aggregate),
@@ -164,25 +149,19 @@ pub async fn run_batch(
     }
     let mut aggregates_by_seed: BTreeMap<String, BatchSeedAggregate> = seed_aggregates
         .into_iter()
-        .map(|aggregate| {
-            (
-                aggregate.report.seed_contract.contract_address.clone(),
-                aggregate,
-            )
-        })
+        .map(|aggregate| (aggregate.seed_contract.contract_address.clone(), aggregate))
         .collect();
     let seed_aggregates: Vec<BatchSeedAggregate> = seed_addresses
         .iter()
         .filter_map(|seed| aggregates_by_seed.remove(seed))
         .collect();
-    let seed_reports = seed_aggregates
-        .iter()
-        .map(|aggregate| aggregate.report.clone())
-        .collect();
-
     Ok(BatchSummaryPayload {
-        batch_summary: build_batch_report_summary(&seed_aggregates),
-        seed_reports,
+        paper_stats: super::paper_stats::merge_paper_stats(
+            seed_aggregates
+                .iter()
+                .map(|aggregate| &aggregate.paper_stats),
+            request.paper_stats_config,
+        ),
     })
 }
 
@@ -194,97 +173,4 @@ pub fn read_seed_addresses(seed_file: &Path) -> Result<Vec<String>, AppError> {
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(|line| line.to_lowercase())
         .collect())
-}
-
-fn validate_cached_operator_levels(path: &Path, raw: &serde_json::Value) -> Result<(), AppError> {
-    let Some(rows) = raw
-        .get("malicious_addresses")
-        .and_then(serde_json::Value::as_array)
-    else {
-        return Ok(());
-    };
-
-    for (index, row) in rows.iter().enumerate() {
-        let address = row
-            .get("address")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .trim();
-        if address.is_empty() {
-            continue;
-        }
-        if matches!(
-            row.get("operator_level")
-                .and_then(serde_json::Value::as_i64),
-            Some(1..=3)
-        ) {
-            continue;
-        }
-        return Err(AppError::InvalidData(format!(
-            "cached seed report {} malicious_addresses[{index}] is missing a valid operator_level; delete or regenerate the cached report",
-            path.display()
-        )));
-    }
-
-    Ok(())
-}
-
-fn load_cached_seed_entries(
-    output_dir: &Path,
-    chain: &str,
-) -> Result<BTreeMap<String, BatchSeedAggregate>, AppError> {
-    let mut cached = BTreeMap::new();
-    if !output_dir.exists() {
-        return Ok(cached);
-    }
-
-    for entry in std::fs::read_dir(output_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-            continue;
-        }
-        let file_name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("");
-        if !file_name.starts_with("top_contract_analysis__")
-            || file_name == "top_contract_analysis__summary.json"
-        {
-            continue;
-        }
-
-        let raw: serde_json::Value = match serde_json::from_str(&std::fs::read_to_string(&path)?) {
-            Ok(payload) => payload,
-            Err(_) => continue,
-        };
-        validate_cached_operator_levels(&path, &raw)?;
-        let Ok(payload) = serde_json::from_value::<SingleReportPayload>(raw) else {
-            continue;
-        };
-        let mut aggregate = build_batch_seed_aggregate(payload);
-        if aggregate.report.seed_contract.chain.to_lowercase() != chain.to_lowercase() {
-            continue;
-        }
-        let contract_address = aggregate
-            .report
-            .seed_contract
-            .contract_address
-            .to_lowercase();
-        if contract_address.is_empty() {
-            continue;
-        }
-        aggregate.report.output_files = Some(OutputFilesPayload {
-            json: file_name.to_string(),
-            markdown: path
-                .with_extension("md")
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned(),
-        });
-        cached.insert(contract_address, aggregate);
-    }
-
-    Ok(cached)
 }

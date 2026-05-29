@@ -587,7 +587,6 @@ fn address_attribution_records_emit_multiscore_labels() {
         address: "0xbuyer".into(),
         last_buy_tx_hash: "0xsale".into(),
         is_stuck: true,
-        buy_asset_ratio: Some(0.72),
         ..SecondarySaleVictimAddressPayload::default()
     }];
     let honest = vec![HonestAddressPayload {

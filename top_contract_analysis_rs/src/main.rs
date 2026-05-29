@@ -4,6 +4,7 @@ use clap::Parser;
 #[cfg(feature = "export-snapshot")]
 use postgres::{Client, NoTls};
 use tokio::runtime::Runtime;
+use top_contract_analysis_rs::analysis::paper_stats::PaperStatsConfig;
 use top_contract_analysis_rs::analysis::{
     analyze_seed_contract, read_seed_addresses, run_batch, AnalysisDeps, AnalyzeRequest,
     BatchRequest, RealApi,
@@ -16,7 +17,7 @@ use top_contract_analysis_rs::progress::{
     create_batch_progress_reporter, create_single_seed_progress_reporter,
     NoopBatchProgressReporter, NoopProgressReporter,
 };
-use top_contract_analysis_rs::reporting::{write_batch_summary_outputs, write_default_outputs};
+use top_contract_analysis_rs::reporting::{write_batch_paper_stats_outputs, write_default_outputs};
 #[cfg(feature = "export-snapshot")]
 use top_contract_analysis_rs::store::export_chain_snapshot_to_parquet;
 use top_contract_analysis_rs::store::{DuckDbFeatureStore, DuckDbResourceOptions};
@@ -73,6 +74,13 @@ fn main() -> Result<(), AppError> {
                     matched_contract_max_concurrency: args.matched_contract_max_concurrency,
                     max_tokens_per_contract: args.max_tokens_per_contract,
                     max_recall_rows: args.max_recall_rows,
+                    paper_stats_config: PaperStatsConfig {
+                        min_cycle_size: args.paper_min_cycle_size,
+                        min_path_length: args.paper_min_path_length,
+                        center_fanout_threshold: args.paper_center_fanout_threshold,
+                        concentration_top_pct: args.paper_concentration_top_pct,
+                        ..PaperStatsConfig::default()
+                    },
                 },
                 &deps,
             )
@@ -131,11 +139,18 @@ fn main() -> Result<(), AppError> {
                     seed_cpu_max_concurrency: args.seed_cpu_max_concurrency,
                     max_tokens_per_contract: args.max_tokens_per_contract,
                     max_recall_rows: args.max_recall_rows,
+                    paper_stats_config: PaperStatsConfig {
+                        min_cycle_size: args.paper_min_cycle_size,
+                        min_path_length: args.paper_min_path_length,
+                        center_fanout_threshold: args.paper_center_fanout_threshold,
+                        concentration_top_pct: args.paper_concentration_top_pct,
+                        ..PaperStatsConfig::default()
+                    },
                 },
                 &deps,
             )
             .await?;
-            write_batch_summary_outputs(&payload, &output_dir)?;
+            write_batch_paper_stats_outputs(&payload, &output_dir)?;
             Ok(())
         }),
         #[cfg(feature = "export-snapshot")]

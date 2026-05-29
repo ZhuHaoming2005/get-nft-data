@@ -85,7 +85,7 @@ cargo run --release -- analyze \
   --max-recall-rows 30000000 \
   --alchemy-api-max-concurrency 16 \
   --other-api-max-concurrency 3 \
-  --matched-contract-max-concurrency 16 \
+  --matched-contract-max-concurrency 32 \
   --duckdb-memory-limit 50GB \
   --duckdb-threads 32
 ```
@@ -99,9 +99,13 @@ cargo run --release -- analyze \
 - `--max-tokens-per-contract 500`
 - `--max-recall-rows 100000`：单批 SQL recall 读取行数；`0` 表示单次读取全部。非 `0` 时会分批读取完整 recall 结果。
 - `--alchemy-api-max-concurrency 12`：Alchemy 请求全局并发上限。
-- `--other-api-max-concurrency 4`：OpenSea、Etherscan、ETH/USD 等非 Alchemy 请求的速率桶 burst 上限，默认 4；参数值优先。旧参数 `--api-max-concurrency` 仍作为兼容别名。
+- `--other-api-max-concurrency 4`：OpenSea、Etherscan、ETH/USD 等非 Alchemy 请求的速率桶 burst 上限，默认 4；参数值优先。
 - `--other-api-rate-limit-refill-ms 300`：非 Alchemy 请求速率桶补充间隔，默认每 300ms 补充 1 个请求 token。
 - `--matched-contract-max-concurrency 4`：matched contract 分析阶段的合约级全局并发上限。
+- `--paper-min-cycle-size 2`：Wash Trading SCC / cycle 的最小节点数。
+- `--paper-min-path-length 3`：Layered Transfer 的最小路径钱包数。
+- `--paper-center-fanout-threshold 3`：Sybil / Fraud / Poisoning 与 Inventory Concentration 的中心 fan-out 阈值。
+- `--paper-concentration-top-pct 0.1`：攻击投入和诚实损失集中度的前百分比合约口径。
 - `--duckdb-threads 0`：`0` 表示使用当前可用线程数
 - `--duckdb-memory-limit 80GB`
 - `--output ./result/azuki.json`
@@ -130,7 +134,7 @@ cargo run --release -- batch \
   --max-recall-rows 30000000 \
   --alchemy-api-max-concurrency 16 \
   --other-api-max-concurrency 3 \
-  --matched-contract-max-concurrency 16 \
+  --matched-contract-max-concurrency 32 \
   --seed-network-max-concurrency 1 \
   --seed-cpu-max-concurrency 1 \
   --duckdb-memory-limit 50GB
@@ -147,14 +151,36 @@ cargo run --release -- batch \
 - `--timeout 30`
 - `--seed-network-max-concurrency 4`：同时处于 seed context 网络 IO 阶段的 seed 合约数。
 - `--alchemy-api-max-concurrency 8`：Alchemy 请求全局并发上限。
-- `--other-api-max-concurrency 4`：OpenSea、Etherscan、ETH/USD 等非 Alchemy 请求的速率桶 burst 上限，默认 4；参数值优先。旧参数 `--api-max-concurrency` 仍作为兼容别名。
+- `--other-api-max-concurrency 4`：OpenSea、Etherscan、ETH/USD 等非 Alchemy 请求的速率桶 burst 上限，默认 4；参数值优先。
 - `--other-api-rate-limit-refill-ms 300`：非 Alchemy 请求速率桶补充间隔，默认每 300ms 补充 1 个请求 token。
 - `--matched-contract-max-concurrency 4`：matched contract 分析阶段的合约级全局并发上限，跨 seed 共享。
 - `--seed-cpu-max-concurrency 1`：同时处于 seed 级 CPU 密集阶段的 seed 合约数，覆盖 DuckDB recall / duplicate scoring。
+- `--paper-min-cycle-size 2`：Wash Trading SCC / cycle 的最小节点数。
+- `--paper-min-path-length 3`：Layered Transfer 的最小路径钱包数。
+- `--paper-center-fanout-threshold 3`：Sybil / Fraud / Poisoning 与 Inventory Concentration 的中心 fan-out 阈值。
+- `--paper-concentration-top-pct 0.1`：攻击投入和诚实损失集中度的前百分比合约口径。
 - `--duckdb-threads 0`
 - `--duckdb-memory-limit 80GB`
 - `--max-recall-rows 100000`：单批 SQL recall 读取行数；`0` 表示单次读取全部。非 `0` 时会分批读取完整 recall 结果，不作为总量截断。
 - `--max-tokens-per-contract 500`
+
+## 论文统计输出
+
+`analyze` 和 `batch` 的 JSON / Markdown 都以 `paper_stats` 为新版统计出口，不再输出旧版 `report_summary`、`batch_summary`、`seed_reports` 兼容结构。`paper_stats` 覆盖：
+
+- `duplicate_scale`：按 `token_uri`、`image_uri`、`metadata`、`name`、`total` 统计重复 NFT / 合约数量、比例、分子、分母。
+- `address_classification`：恶意地址、跨合约重复侵权恶意地址、诚实地址、地址总数。
+- `contract_behavior_stats`：逐合约输出 Wash Trading、Pump-and-Exit、Sybil/Fraud/Poisoning、Layered Transfer、Inventory Concentration、诚实买家明细。
+- `malicious_behavior_summary`：按行为类型汇总合约覆盖率、实例占比、涉及地址/NFT、关联买家和关联损失。
+- `attacker_cost`：Setup / Lure / Exit / Total gas 成本和前百分比合约成本集中度。
+- `honest_loss`：二级市场、付费 mint、total 三类诚实买家损失和集中度。
+- `data_quality`：销售价格可解析比例和官方参与型重复合约数。
+
+统计阶段不做代表合约或买家 top-k 截断，所有可识别的合约行为和诚实买家行都会导出。论文撰写时再按行为覆盖数、关联损失、虚假交易额、地址规模等指标选择代表案例。旧参数 `--paper-top-k` 已删除。
+
+Markdown 报告把合约行为明细和诚实买家明细这类大表放在最后输出。合约行为表按综合影响金额 USD、行为实例数、合约地址排序；诚实买家表按 paid USD、fake NFT 数、合约地址、买家地址排序。
+
+所有论文比例字段都保留可复核口径。重复规模、行为汇总、攻击投入、诚实损失已经输出对应的 numerator / denominator；单合约行为中的 `exit_ratio`、`avg_fan_out`、`token_share`、`value_share` 也分别导出对应分子和分母字段。
 
 ## 典型使用流程
 

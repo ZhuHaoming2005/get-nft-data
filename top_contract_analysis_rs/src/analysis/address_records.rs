@@ -1,28 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::models::{
-    AddressAttributionPayload, AddressEvidencePayload, DuplicateCandidate, FraudTradeStatsPayload,
-    HonestAddressPayload, HonestAddressStatsPayload, InfringingTokenRecord,
-    MaliciousAddressPayload, NftSaleRecord, OwnerBalance, SecondarySaleVictimAddressPayload,
-    TransferRecord, ValueFlowEdgePayload, VictimAcquisitionAddressPayload, ZERO_ADDRESS,
+    AddressAttributionPayload, AddressEvidencePayload, DuplicateCandidate, HonestAddressPayload,
+    InfringingTokenRecord, MaliciousAddressPayload, NftSaleRecord, OwnerBalance,
+    SecondarySaleVictimAddressPayload, TransferRecord, ValueFlowEdgePayload,
+    VictimAcquisitionAddressPayload, ZERO_ADDRESS,
 };
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct SaleMetricRecord {
-    pub buy_before_eth_balance: Option<f64>,
-    pub buy_before_usd_balance: Option<f64>,
-    pub buy_asset_ratio: Option<f64>,
-    pub buy_asset_ratio_with_gas: Option<f64>,
-    pub ratio_status: String,
-}
-
-pub(crate) fn sale_metric_key(tx_hash: &str, buyer_address: &str) -> String {
-    format!(
-        "{}|{}",
-        tx_hash.trim().to_lowercase(),
-        buyer_address.trim().to_lowercase()
-    )
-}
 
 pub(crate) struct PreparedContractActivity<'a> {
     owner_token_map: HashMap<String, HashSet<String>>,
@@ -59,28 +42,6 @@ fn median_i64(values: &[i64]) -> Option<f64> {
         Some(sorted[mid] as f64)
     } else {
         Some((sorted[mid - 1] as f64 + sorted[mid] as f64) / 2.0)
-    }
-}
-
-fn median_f64(values: &[f64]) -> Option<f64> {
-    if values.is_empty() {
-        return None;
-    }
-    let mut sorted = values.to_vec();
-    sorted.sort_by(|left, right| left.total_cmp(right));
-    let mid = sorted.len() / 2;
-    if sorted.len() % 2 == 1 {
-        Some(sorted[mid])
-    } else {
-        Some((sorted[mid - 1] + sorted[mid]) / 2.0)
-    }
-}
-
-fn mean_f64(values: &[f64]) -> Option<f64> {
-    if values.is_empty() {
-        None
-    } else {
-        Some(values.iter().sum::<f64>() / values.len() as f64)
     }
 }
 
@@ -1274,26 +1235,6 @@ pub fn build_address_attribution_records(
                 },
             );
         }
-        if item
-            .buy_asset_ratio
-            .map(|ratio| ratio >= 0.60)
-            .unwrap_or(false)
-        {
-            add_attribution_evidence(
-                &mut rows,
-                EvidenceInput {
-                    contract_address,
-                    address: &item.address,
-                    role: "high_exposure_buyer",
-                    evidence_type: "high_purchase_balance_ratio",
-                    token_id: "",
-                    tx_hash: &item.last_buy_tx_hash,
-                    weight: 0.15,
-                    detail: "purchase consumed a high share of the observed wallet balance",
-                    bucket: EvidenceBucket::Victim,
-                },
-            );
-        }
     }
 
     for item in honest_addresses {
@@ -1448,25 +1389,18 @@ pub fn build_secondary_sale_victim_address_records(
     sales: &[NftSaleRecord],
     transfers: &[TransferRecord],
     owners: &[OwnerBalance],
-    sale_metrics_by_tx: &BTreeMap<String, SaleMetricRecord>,
 ) -> Vec<SecondarySaleVictimAddressPayload> {
     let activity = prepare_contract_activity(transfers, sales, owners);
-    build_secondary_sale_victim_address_records_from_activity(
-        contract_address,
-        &activity,
-        sale_metrics_by_tx,
-    )
+    build_secondary_sale_victim_address_records_from_activity(contract_address, &activity)
 }
 
 pub(crate) fn build_secondary_sale_victim_address_records_from_activity(
     contract_address: &str,
     activity: &PreparedContractActivity<'_>,
-    sale_metrics_by_tx: &BTreeMap<String, SaleMetricRecord>,
 ) -> Vec<SecondarySaleVictimAddressPayload> {
     build_secondary_sale_victim_address_records_excluding_malicious_from_activity(
         contract_address,
         activity,
-        sale_metrics_by_tx,
         &[],
     )
 }
@@ -1474,7 +1408,6 @@ pub(crate) fn build_secondary_sale_victim_address_records_from_activity(
 pub(crate) fn build_secondary_sale_victim_address_records_excluding_malicious_from_activity(
     contract_address: &str,
     activity: &PreparedContractActivity<'_>,
-    sale_metrics_by_tx: &BTreeMap<String, SaleMetricRecord>,
     malicious_addresses: &[MaliciousAddressPayload],
 ) -> Vec<SecondarySaleVictimAddressPayload> {
     let malicious_buyers: HashSet<String> = malicious_addresses
@@ -1490,12 +1423,6 @@ pub(crate) fn build_secondary_sale_victim_address_records_excluding_malicious_fr
         if buyer_address.is_empty() || malicious_buyers.contains(&buyer_address) {
             continue;
         }
-        let metric_key = sale_metric_key(&sale.tx_hash, &sale.buyer_address);
-        let metrics = sale_metrics_by_tx
-            .get(&metric_key)
-            .or_else(|| sale_metrics_by_tx.get(&sale.tx_hash))
-            .cloned()
-            .unwrap_or_default();
         let later_transfer_out = activity
             .latest_outgoing
             .get(&(sale.buyer_address.clone(), sale.token_id.clone()))
@@ -1515,7 +1442,6 @@ pub(crate) fn build_secondary_sale_victim_address_records_excluding_malicious_fr
             .or_insert_with(|| SecondarySaleVictimAddressPayload {
                 contract_address: contract_address.to_string(),
                 address: sale.buyer_address.clone(),
-                ratio_status: "unavailable".into(),
                 ..SecondarySaleVictimAddressPayload::default()
             });
         entry.buy_tx_hashes.push(sale.tx_hash.clone());
@@ -1540,15 +1466,6 @@ pub(crate) fn build_secondary_sale_victim_address_records_excluding_malicious_fr
             entry.last_buy_tx_hash = sale.tx_hash.clone();
             entry.last_buy_amount_eth = sale.price_eth;
             entry.last_buy_amount_usd = sale_usd_value(sale);
-            entry.buy_before_eth_balance = metrics.buy_before_eth_balance;
-            entry.buy_before_usd_balance = metrics.buy_before_usd_balance;
-            entry.buy_asset_ratio = metrics.buy_asset_ratio;
-            entry.buy_asset_ratio_with_gas = metrics.buy_asset_ratio_with_gas;
-            entry.ratio_status = if metrics.ratio_status.is_empty() {
-                "unavailable".into()
-            } else {
-                metrics.ratio_status
-            };
         }
         entry.is_stuck = entry.is_stuck || is_stuck;
     }
@@ -1848,124 +1765,6 @@ pub(crate) fn build_honest_address_records_from_activity(
         .collect()
 }
 
-pub fn build_honest_address_stats(
-    contract_address: &str,
-    honest_addresses: &[HonestAddressPayload],
-) -> BTreeMap<String, HonestAddressStatsPayload> {
-    let corrupted_addresses: Vec<String> = honest_addresses
-        .iter()
-        .filter(|item| item.is_corrupted_address)
-        .map(|item| item.address.clone())
-        .collect();
-    let holding_medians: Vec<f64> = honest_addresses
-        .iter()
-        .filter_map(|item| item.hold_duration_median_seconds)
-        .collect();
-    let deployment_to_neutral_holder_samples: Vec<f64> = honest_addresses
-        .iter()
-        .flat_map(|item| {
-            item.deployment_to_neutral_holder_seconds_samples
-                .iter()
-                .filter_map(|sample| positive_seconds(*sample))
-        })
-        .collect();
-
-    BTreeMap::from([(
-        contract_address.to_string(),
-        HonestAddressStatsPayload {
-            honest_address_count: honest_addresses.len() as i64,
-            corrupted_address_count: corrupted_addresses.len() as i64,
-            victim_resale_count: honest_addresses
-                .iter()
-                .map(|item| item.victim_resale_count)
-                .sum(),
-            median_holding_seconds: median_f64(&holding_medians),
-            avg_deployment_to_neutral_holder_seconds: mean_f64(
-                &deployment_to_neutral_holder_samples,
-            ),
-            corrupted_addresses,
-        },
-    )])
-}
-
-fn positive_seconds(value: i64) -> Option<f64> {
-    (value > 0).then_some(value as f64)
-}
-
-pub fn build_fraud_trade_stats(
-    contract_address: &str,
-    sales: &[NftSaleRecord],
-    secondary_sale_victim_addresses: &[SecondarySaleVictimAddressPayload],
-) -> BTreeMap<String, FraudTradeStatsPayload> {
-    let contract_sales: Vec<&NftSaleRecord> = sales
-        .iter()
-        .filter(|sale| sale.contract_address.eq_ignore_ascii_case(contract_address))
-        .collect();
-    let native_sales: Vec<&NftSaleRecord> = contract_sales
-        .iter()
-        .copied()
-        .filter(|sale| sale.is_native_eth && sale.price_eth.is_some())
-        .collect();
-    let eth_priced_sales: Vec<&NftSaleRecord> = contract_sales
-        .iter()
-        .copied()
-        .filter(|sale| sale.price_eth.is_some())
-        .collect();
-    let usd_priced_sales: Vec<&NftSaleRecord> = contract_sales
-        .iter()
-        .copied()
-        .filter(|sale| sale_usd_value(sale).is_some())
-        .collect();
-
-    BTreeMap::from([(
-        contract_address.to_string(),
-        FraudTradeStatsPayload {
-            unique_buyers: sales
-                .iter()
-                .filter(|sale| sale.contract_address.eq_ignore_ascii_case(contract_address))
-                .filter(|sale| !sale.buyer_address.is_empty())
-                .map(|sale| sale.buyer_address.clone())
-                .collect::<BTreeSet<_>>()
-                .len() as i64,
-            native_eth_sale_count: Some(native_sales.len() as i64),
-            native_eth_volume: Some(
-                native_sales
-                    .iter()
-                    .map(|sale| sale.price_eth.unwrap_or(0.0))
-                    .sum(),
-            ),
-            usd_priced_sale_count: Some(usd_priced_sales.len() as i64),
-            usd_priced_volume: Some(
-                usd_priced_sales
-                    .iter()
-                    .map(|sale| sale_usd_value(sale).unwrap_or(0.0))
-                    .sum(),
-            ),
-            eth_priced_sale_count: Some(eth_priced_sales.len() as i64),
-            eth_priced_volume: Some(
-                eth_priced_sales
-                    .iter()
-                    .map(|sale| sale.price_eth.unwrap_or(0.0))
-                    .sum(),
-            ),
-            stuck_wallet_count: secondary_sale_victim_addresses
-                .iter()
-                .filter(|item| item.is_stuck)
-                .count() as i64,
-            stuck_cost_eth: secondary_sale_victim_addresses
-                .iter()
-                .filter(|item| item.is_stuck)
-                .map(|item| item.last_buy_amount_eth.unwrap_or(0.0))
-                .sum(),
-            stuck_cost_usd: secondary_sale_victim_addresses
-                .iter()
-                .filter(|item| item.is_stuck)
-                .map(|item| item.last_buy_amount_usd.unwrap_or(0.0))
-                .sum(),
-        },
-    )])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2104,51 +1903,6 @@ mod tests {
     }
 
     #[test]
-    fn fraud_trade_stats_include_weth_and_stablecoin_eth_equivalent_amounts() {
-        let sales = vec![sale("ETH", 1.0), sale("WETH", 2.0), sale("USDC", 0.05)];
-
-        let stats =
-            build_fraud_trade_stats("0xdup", &sales, &[] as &[SecondarySaleVictimAddressPayload]);
-        let stats = &stats["0xdup"];
-
-        assert_eq!(stats.native_eth_sale_count, Some(1));
-        assert_eq!(stats.native_eth_volume, Some(1.0));
-        assert_eq!(stats.eth_priced_sale_count, Some(3));
-        assert_eq!(stats.eth_priced_volume, Some(3.05));
-        assert_eq!(stats.usd_priced_sale_count, Some(3));
-        assert_eq!(stats.usd_priced_volume, Some(3.05));
-    }
-
-    #[test]
-    fn fraud_trade_stats_ignore_sales_from_other_contracts() {
-        let mut matching = sale("USDC", 5.0);
-        matching.contract_address = "0xdup".into();
-        let mut unrelated = sale("USDC", 7.0);
-        unrelated.contract_address = "0xother".into();
-
-        let stats = build_fraud_trade_stats("0xdup", &[matching, unrelated], &[]);
-        let stats = &stats["0xdup"];
-
-        assert_eq!(stats.unique_buyers, 1);
-        assert_eq!(stats.usd_priced_sale_count, Some(1));
-        assert_eq!(stats.usd_priced_volume, Some(5.0));
-    }
-
-    #[test]
-    fn fraud_trade_stats_do_not_count_eth_amounts_as_usd_when_rate_is_missing() {
-        let mut eth_sale = sale("ETH", 1.25);
-        eth_sale.price_usd = None;
-
-        let stats = build_fraud_trade_stats("0xdup", &[eth_sale], &[]);
-        let stats = &stats["0xdup"];
-
-        assert_eq!(stats.eth_priced_sale_count, Some(1));
-        assert_eq!(stats.eth_priced_volume, Some(1.25));
-        assert_eq!(stats.usd_priced_sale_count, Some(0));
-        assert_eq!(stats.usd_priced_volume, Some(0.0));
-    }
-
-    #[test]
     fn victim_records_do_not_count_eth_amounts_as_usd_when_rate_is_missing() {
         let mut eth_sale = sale("ETH", 1.25);
         eth_sale.price_usd = None;
@@ -2159,11 +1913,7 @@ mod tests {
         let sales = vec![eth_sale];
         let activity = prepare_contract_activity(&[], &sales, &owners);
 
-        let victims = build_secondary_sale_victim_address_records_from_activity(
-            "0xdup",
-            &activity,
-            &BTreeMap::new(),
-        );
+        let victims = build_secondary_sale_victim_address_records_from_activity("0xdup", &activity);
 
         assert_eq!(victims.len(), 1);
         assert_eq!(victims[0].buy_amount_eth, 1.25);
@@ -2181,11 +1931,7 @@ mod tests {
         }];
         let activity = prepare_contract_activity(&[], &sales, &owners);
 
-        let victims = build_secondary_sale_victim_address_records_from_activity(
-            "0xdup",
-            &activity,
-            &BTreeMap::new(),
-        );
+        let victims = build_secondary_sale_victim_address_records_from_activity("0xdup", &activity);
 
         assert_eq!(victims.len(), 1);
         assert_eq!(victims[0].buy_amount_eth, 0.1);
@@ -2216,7 +1962,6 @@ mod tests {
         let victims = build_secondary_sale_victim_address_records_excluding_malicious_from_activity(
             "0xdup",
             &activity,
-            &BTreeMap::new(),
             &[MaliciousAddressPayload {
                 address: "0xoperator".into(),
                 wash_cycle_count: 1,
@@ -2261,7 +2006,7 @@ mod tests {
         assert!(!victim.is_corrupted_address);
         assert_eq!(victim.victim_resale_count, 0);
         assert_eq!(
-            build_honest_address_stats("0xdup", &rows)["0xdup"].corrupted_address_count,
+            rows.iter().filter(|row| row.is_corrupted_address).count(),
             0
         );
     }
@@ -2301,7 +2046,7 @@ mod tests {
         assert!(victim.is_corrupted_address);
         assert_eq!(victim.victim_resale_count, 1);
         assert_eq!(
-            build_honest_address_stats("0xdup", &rows)["0xdup"].corrupted_address_count,
+            rows.iter().filter(|row| row.is_corrupted_address).count(),
             1
         );
     }
@@ -2746,7 +2491,7 @@ mod tests {
 
         assert!(rows.iter().all(|row| row.address != "0xoperator"));
         assert_eq!(
-            build_honest_address_stats("0xdup", &rows)["0xdup"].corrupted_address_count,
+            rows.iter().filter(|row| row.is_corrupted_address).count(),
             0
         );
     }

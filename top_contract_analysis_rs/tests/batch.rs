@@ -11,10 +11,10 @@ use top_contract_analysis_rs::analysis::{
 };
 use top_contract_analysis_rs::error::AppError;
 use top_contract_analysis_rs::models::{
-    AddressAttributionPayload, AddressSignalPayload, BatchReportSummary, BatchSeedReportPayload,
-    BatchSummaryPayload, ContractMetadata, DatabaseNftRecord, DatabaseSnapshot, EthTransferRecord,
-    HonestAddressPayload, InfringingTokenRecord, MaliciousAddressPayload, NftSaleRecord,
-    OutputFilesPayload, OwnerBalance, ReportSummary, SecondarySaleVictimAddressPayload,
+    AddressAttributionPayload, AddressSignalPayload, BatchSummaryPayload, ContractMetadata,
+    DatabaseNftRecord, DatabaseSnapshot, EthTransferRecord, HonestAddressPayload,
+    InfringingTokenRecord, MaliciousAddressPayload, NftSaleRecord, OwnerBalance,
+    PaperDuplicateScaleRowPayload, PaperStatsPayload, SecondarySaleVictimAddressPayload,
     SeedContractPayload, SeedNft, SingleReportPayload, TransactionReceiptRecord, TransferRecord,
     ValueFlowEdgePayload, VictimAcquisitionAddressPayload,
 };
@@ -22,7 +22,7 @@ use top_contract_analysis_rs::progress::{
     BatchProgressReporter, NoopBatchProgressReporter, NoopProgressReporter, SeedProgressReporter,
 };
 use top_contract_analysis_rs::reporting::{
-    render_batch_human_readable_report, write_batch_summary_outputs,
+    render_batch_human_readable_report, write_batch_paper_stats_outputs,
 };
 
 struct EmptyFeatureStore;
@@ -112,11 +112,11 @@ struct BatchPipelineProbe {
     holder_max_seen: AtomicUsize,
     expansion_current: AtomicUsize,
     expansion_max_seen: AtomicUsize,
-    sale_metric_active: AtomicBool,
-    sale_metric_finished: AtomicBool,
-    sale_metric_receipt_calls: AtomicUsize,
-    holder_started_before_sale_metric_finished: AtomicBool,
-    expansion_observed_sale_metric_active: AtomicBool,
+    obsolete_metric_active: AtomicBool,
+    obsolete_metric_finished: AtomicBool,
+    obsolete_metric_receipt_calls: AtomicUsize,
+    holder_started_before_obsolete_metric_finished: AtomicBool,
+    expansion_observed_obsolete_metric_active: AtomicBool,
     metadata_calls: AtomicUsize,
     metadata_current: AtomicUsize,
     metadata_max_seen: AtomicUsize,
@@ -374,10 +374,10 @@ impl AnalyzeApi for InstrumentedBatchApi {
         let current = self.probe.holder_current.fetch_add(1, Ordering::SeqCst) + 1;
         if self.emit_native_sale
             && request.candidate_contract_address.contains("seed2")
-            && !self.probe.sale_metric_finished.load(Ordering::SeqCst)
+            && !self.probe.obsolete_metric_finished.load(Ordering::SeqCst)
         {
             self.probe
-                .holder_started_before_sale_metric_finished
+                .holder_started_before_obsolete_metric_finished
                 .store(true, Ordering::SeqCst);
         }
         BatchPipelineProbe::record_max(&self.probe.holder_max_seen, current);
@@ -399,10 +399,10 @@ impl AnalyzeApi for InstrumentedBatchApi {
     ) -> Result<Vec<SeedNft>, AppError> {
         if self.emit_native_sale
             && contract_address.contains("seed2")
-            && self.probe.sale_metric_active.load(Ordering::SeqCst)
+            && self.probe.obsolete_metric_active.load(Ordering::SeqCst)
         {
             self.probe
-                .expansion_observed_sale_metric_active
+                .expansion_observed_obsolete_metric_active
                 .store(true, Ordering::SeqCst);
         }
         if !self.emit_native_sale && contract_address.contains("seed2") {
@@ -486,22 +486,26 @@ impl AnalyzeApi for InstrumentedBatchApi {
     ) -> Result<TransactionReceiptRecord, AppError> {
         if self.emit_native_sale {
             self.probe
-                .sale_metric_receipt_calls
+                .obsolete_metric_receipt_calls
                 .fetch_add(1, Ordering::SeqCst);
-            self.probe.sale_metric_active.store(true, Ordering::SeqCst);
+            self.probe
+                .obsolete_metric_active
+                .store(true, Ordering::SeqCst);
             let mut waited = 0;
             while !self
                 .probe
-                .expansion_observed_sale_metric_active
+                .expansion_observed_obsolete_metric_active
                 .load(Ordering::SeqCst)
                 && waited < 1000
             {
                 tokio::time::sleep(Duration::from_millis(1)).await;
                 waited += 1;
             }
-            self.probe.sale_metric_active.store(false, Ordering::SeqCst);
             self.probe
-                .sale_metric_finished
+                .obsolete_metric_active
+                .store(false, Ordering::SeqCst);
+            self.probe
+                .obsolete_metric_finished
                 .store(true, Ordering::SeqCst);
         }
         Ok(TransactionReceiptRecord::default())
@@ -539,7 +543,6 @@ impl AnalyzeApi for InstrumentedBatchApi {
 
 fn cached_single_report(
     seed_contract: SeedContractPayload,
-    report_summary: ReportSummary,
     infringing_tokens: Vec<InfringingTokenRecord>,
     malicious_addresses: Vec<MaliciousAddressPayload>,
     honest_addresses: Vec<HonestAddressPayload>,
@@ -569,7 +572,6 @@ fn cached_single_report(
 
     SingleReportPayload {
         seed_contract,
-        report_summary,
         infringing_tokens,
         malicious_addresses,
         honest_addresses,
@@ -698,183 +700,53 @@ impl AnalyzeApi for FakeBatchApi {
 }
 
 #[test]
-fn batch_seed_reports_serialize_narrow_index_shape() {
-    let payload = BatchSummaryPayload {
-        seed_reports: vec![BatchSeedReportPayload {
-            seed_contract: SeedContractPayload {
-                contract_address: "0xseed".into(),
-                ..Default::default()
-            },
-            report_summary: ReportSummary {
-                candidate_contract_count: 2,
-                ..Default::default()
-            },
-            output_files: Some(OutputFilesPayload {
-                json: "result/top_contract_analysis__seed.json".into(),
-                markdown: "result/top_contract_analysis__seed.md".into(),
-            }),
-        }],
-        ..Default::default()
-    };
+fn batch_serializes_paper_stats_index_shape() {
+    let payload = BatchSummaryPayload::default();
 
     let serialized = serde_json::to_value(&payload).unwrap();
-    let seed_report = serialized["seed_reports"][0].as_object().unwrap();
-    let keys: BTreeSet<_> = seed_report.keys().map(String::as_str).collect();
+    let object = serialized.as_object().unwrap();
+    let keys: BTreeSet<_> = object.keys().map(String::as_str).collect();
 
-    assert_eq!(
-        keys,
-        BTreeSet::from(["seed_contract", "report_summary", "output_files"])
-    );
-    assert!(!seed_report.contains_key("duplicate_candidates"));
-    assert!(!seed_report.contains_key("malicious_addresses"));
-    assert_eq!(
-        serialized["seed_reports"][0]["output_files"]["json"],
-        "result/top_contract_analysis__seed.json"
-    );
-    assert_eq!(
-        serialized["seed_reports"][0]["report_summary"]["candidate_contract_count"],
-        2
-    );
+    assert_eq!(keys, BTreeSet::from(["paper_stats"]));
+    assert!(!object.contains_key("seed_reports"));
+    assert!(!object.contains_key("batch_summary"));
 }
 
 #[test]
 fn batch_markdown_preserves_reference_summary_and_output_index_lines() {
     let payload = BatchSummaryPayload {
-        batch_summary: BatchReportSummary {
-            seed_report_count: 2,
-            chain: "ethereum".into(),
-            chains: vec!["ethereum".into()],
-            open_license_detected_count: 1,
-            candidate_contract_count_total: 10,
-            infringing_nft_count_total: 11,
-            malicious_address_count_total: 7,
-            neutral_address_count_total: 8,
-            repeat_infringing_address_count_total: 3,
-            repeat_infringing_address_count_global: 2,
-            legit_duplicate_contract_count_total: 1,
-            secondary_sale_victim_cost_eth_total: 12.5,
-            secondary_sale_victim_cost_usd_total: 12.5,
-            secondary_sale_victim_address_count_total: 5,
-            secondary_sale_stuck_cost_eth_total: 5.0,
-            secondary_sale_stuck_cost_usd_total: 5.0,
-            secondary_sale_stuck_cost_ratio_overall: Some(0.4),
-            paid_mint_victim_cost_eth_total: 2.5,
-            paid_mint_victim_cost_usd_total: 2.5,
-            paid_mint_victim_edge_count_total: 4,
-            paid_mint_victim_address_count_total: 3,
-            paid_mint_stuck_cost_eth_total: 1.0,
-            paid_mint_stuck_cost_usd_total: 1.0,
-            paid_mint_stuck_edge_count_total: 2,
-            paid_mint_stuck_token_count_total: 2,
-            victim_acquisition_total_eth_total: 15.0,
-            victim_acquisition_total_usd_total: 15.0,
-            victim_acquisition_stuck_cost_eth_total: 6.0,
-            victim_acquisition_stuck_cost_usd_total: 6.0,
-            victim_acquisition_stuck_cost_ratio_overall: Some(0.4),
-            victim_acquisition_address_count_total: 6,
-            victim_acquisition_address_count_distinct: 4,
-            buy_asset_ratio_known_address_count_total: 8,
-            ratio_over_60_address_count_total: 3,
-            ratio_over_60_address_ratio_overall: Some(0.375),
-            ratio_over_80_address_count_total: 1,
-            ratio_over_80_address_ratio_overall: Some(0.125),
-            stuck_victim_address_count_total: 2,
-            stuck_victim_address_ratio_overall: Some(0.25),
-            stuck_victim_address_count_distinct: 2,
-            stuck_victim_address_ratio_distinct: Some(0.5),
-            corrupted_victim_address_count_total: 1,
-            corrupted_victim_address_count_distinct: 1,
-            avg_deployment_to_neutral_holder_seconds_mean: Some(12.5),
-            median_deployment_to_neutral_holder_seconds_median: Some(10.0),
-            avg_deployment_to_first_transfer_seconds_mean: Some(8.0),
-            median_deployment_to_first_transfer_seconds_median: Some(7.0),
-            avg_unique_receiver_count_mean: Some(4.0),
-            generated_at: "2026-04-17T00:00:00+00:00".into(),
-            ..BatchReportSummary::default()
+        paper_stats: PaperStatsPayload {
+            duplicate_scale: vec![PaperDuplicateScaleRowPayload {
+                category: "token_uri".into(),
+                duplicate_nft_count: 4,
+                duplicate_nft_ratio: Some(0.4),
+                duplicate_nft_ratio_numerator: 4,
+                duplicate_nft_ratio_denominator: 10,
+                duplicate_contract_count: 2,
+                duplicate_contract_ratio: Some(0.5),
+                duplicate_contract_ratio_numerator: 2,
+                duplicate_contract_ratio_denominator: 4,
+            }],
+            ..PaperStatsPayload::default()
         },
-        seed_reports: vec![BatchSeedReportPayload {
-            seed_contract: SeedContractPayload {
-                name: "Azuki".into(),
-                contract_address: "0xseed".into(),
-                ..Default::default()
-            },
-            report_summary: ReportSummary {
-                candidate_contract_count: 5,
-                infringing_nft_count: 4,
-                malicious_address_count: 5,
-                neutral_address_count: 6,
-                repeat_infringing_address_count: 1,
-                legit_duplicate_contract_count: 1,
-                secondary_sale_victim_cost_eth: 7.5,
-                secondary_sale_victim_cost_usd: 7.5,
-                secondary_sale_stuck_cost_eth: 2.5,
-                secondary_sale_stuck_cost_usd: 2.5,
-                secondary_sale_stuck_cost_ratio: Some(1.0 / 3.0),
-                paid_mint_victim_cost_eth: 1.5,
-                paid_mint_victim_cost_usd: 1.5,
-                paid_mint_victim_edge_count: 2,
-                paid_mint_victim_address_count: 1,
-                paid_mint_stuck_cost_eth: 0.5,
-                paid_mint_stuck_cost_usd: 0.5,
-                paid_mint_stuck_edge_count: 1,
-                paid_mint_stuck_token_count: 1,
-                victim_acquisition_total_eth: 9.0,
-                victim_acquisition_total_usd: 9.0,
-                victim_acquisition_stuck_cost_eth: 3.0,
-                victim_acquisition_stuck_cost_usd: 3.0,
-                victim_acquisition_stuck_cost_ratio: Some(1.0 / 3.0),
-                ratio_over_60_address_count: 2,
-                ratio_over_60_address_ratio: Some(0.5),
-                stuck_victim_address_count: 1,
-                stuck_victim_address_ratio: Some(0.25),
-                corrupted_victim_address_count: 1,
-                avg_deployment_to_neutral_holder_seconds: Some(10.0),
-                median_deployment_to_neutral_holder_seconds: Some(9.0),
-                median_deployment_to_first_transfer_seconds: Some(8.0),
-                ..Default::default()
-            },
-            output_files: Some(OutputFilesPayload {
-                json: "result/top_contract_analysis__azuki.json".into(),
-                markdown: "result/top_contract_analysis__azuki.md".into(),
-            }),
-        }],
     };
 
     let markdown = render_batch_human_readable_report(&payload);
 
-    assert!(markdown.contains("# Top NFT 合约批量分析总报告"));
-    assert!(markdown.contains("- 检测到开放许可的 seed 数: 1"));
-    assert!(markdown.contains("- 疑似操作者地址数(全局去重): 7"));
-    assert!(markdown.contains("- 中性地址数(全局去重): 8"));
-    assert!(markdown.contains("- 受害者地址数(全局去重): 4"));
-    assert!(markdown.contains("- 受害者地址观测数(按 seed 求和): 6"));
-    assert!(markdown.contains("- 多次侵权地址观测数(与单 seed 口径一致，按 seed 求和): 3"));
-    assert!(markdown.contains("- 多次侵权地址数(与单 seed 口径一致，全局去重): 2"));
-    assert!(!markdown.contains("多次侵权地址总数(跨批次全局去重)"));
-    assert!(markdown.contains("- 受害者获取成本(USD)汇总: 15"));
-    assert!(markdown.contains("- 总套牢成本(USD)汇总: 6 / 40.00%"));
-    assert!(markdown.contains(
-        "- 二级市场获取成本(USD)汇总: 12.5 / 套牢成本(USD)=5 / 套牢占比=40.00% / addresses=5"
-    ));
-    assert!(markdown.contains(
-        "- 付费 mint 获取成本(USD)汇总: 2.5 / 套牢成本(USD)=1 / 套牢占比=40.00% / edges=4 / addresses=3 / stuck_edges=2 / stuck_tokens=2"
-    ));
-    assert!(
-        markdown.contains("- 获取成本占购买前 ETH 余额估算 >60% 的受害者数/总体占比: 3 / 37.50%")
-    );
-    assert!(markdown.contains("- 套牢受害者地址数(全局去重)/占比: 2 / 50.00%"));
-    assert!(markdown.contains("- 套牢受害者地址观测数(按 seed 求和)/占比: 2 / 25.00%"));
-    assert!(markdown.contains("- 被腐化受害者地址数(全局去重): 1"));
-    assert!(markdown.contains("- 被腐化受害者地址观测数(按 seed 求和): 1"));
-    assert!(markdown.contains("- 生成时间(UTC): 2026-04-17T00:00:00+00:00"));
-    assert!(markdown.contains("## Seed 报告索引"));
-    assert!(markdown.contains(
-        "- Azuki (0xseed) | 重复合约=5 | 侵权NFT=4 | 疑似操作者=5 | 中性地址=6 | 受害者=0 | 多次侵权地址=1 | 官方参与=1 | 受害者获取成本(USD)=9 | 二级获取(USD)=7.5 | 二级套牢(USD)=2.5/33.33% | 付费mint获取(USD)=1.5 | 付费mint套牢(USD)=0.5/33.33% | 总套牢(USD)=3/33.33% | >60%=2/50.00% | 套牢受害者=1/25.00% | 被腐化受害者=1 | 部署到中性接收平均=10秒 | 部署到中性接收中位=9秒 | 部署到首次转手中位=8秒 | JSON=result/top_contract_analysis__azuki.json | MD=result/top_contract_analysis__azuki.md"
-    ));
+    assert!(markdown.contains("# NFT 论文统计批量报告"));
+    assert!(markdown.contains("## 重复规模"));
+    assert!(markdown.contains("| token_uri | 4 | 40.00% (4/10) | 2 | 50.00% (2/4) |"));
+    assert!(markdown.contains("## 地址分类"));
+    assert!(markdown.contains("## 攻击者成本"));
+    assert!(markdown.contains("## 诚实买家损失"));
+    assert!(markdown.contains("## 数据质量"));
+    assert!(!markdown.contains("# Top NFT 合约批量分析总报告"));
+    assert!(!markdown.contains("## Seed 报告索引"));
+    assert!(!markdown.contains("- 检测到开放许可的 seed 数"));
 }
 
 #[tokio::test]
-async fn batch_skips_cached_seed_reports_in_output_directory() {
+async fn batch_ignores_cached_legacy_outputs_in_output_directory() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n").unwrap();
     let cached_report = cached_single_report(
@@ -883,10 +755,6 @@ async fn batch_skips_cached_seed_reports_in_output_directory() {
             contract_address: "0xseed1".into(),
             name: "Cached Seed".into(),
             ..SeedContractPayload::default()
-        },
-        ReportSummary {
-            candidate_contract_count: 1,
-            ..ReportSummary::default()
         },
         Vec::new(),
         Vec::new(),
@@ -924,30 +792,25 @@ async fn batch_skips_cached_seed_reports_in_output_directory() {
     .await
     .unwrap();
 
-    assert_eq!(summary.batch_summary.seed_report_count, 2);
-    assert_eq!(summary.seed_reports.len(), 2);
     assert_eq!(
-        summary.seed_reports[0].seed_contract.contract_address,
-        "0xseed1"
+        summary
+            .paper_stats
+            .address_classification
+            .malicious_address_count,
+        0
     );
-    assert_eq!(
-        summary.seed_reports[1].seed_contract.contract_address,
-        "0xseed2"
-    );
-    assert_eq!(
-        summary.seed_reports[0].output_files.as_ref().unwrap().json,
-        "top_contract_analysis__cached.json"
-    );
-    assert!(summary.seed_reports[1]
-        .output_files
-        .as_ref()
-        .unwrap()
-        .json
-        .starts_with("top_contract_analysis__"));
+    assert!(dir
+        .path()
+        .join("top_contract_analysis__seed_seed1.json")
+        .exists());
+    assert!(dir
+        .path()
+        .join("top_contract_analysis__seed_seed2.json")
+        .exists());
 }
 
 #[tokio::test]
-async fn batch_rejects_cached_seed_reports_without_operator_levels() {
+async fn batch_ignores_cached_legacy_outputs_without_paper_stats() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n").unwrap();
     let cached_report = cached_single_report(
@@ -956,11 +819,6 @@ async fn batch_rejects_cached_seed_reports_without_operator_levels() {
             contract_address: "0xseed1".into(),
             name: "Old Cached Seed".into(),
             ..SeedContractPayload::default()
-        },
-        ReportSummary {
-            candidate_contract_count: 1,
-            malicious_address_count: 1,
-            ..ReportSummary::default()
         },
         Vec::new(),
         vec![MaliciousAddressPayload {
@@ -989,7 +847,7 @@ async fn batch_rejects_cached_seed_reports_without_operator_levels() {
         batch_progress: Arc::new(NoopBatchProgressReporter),
     };
 
-    let err = run_batch(
+    let summary = run_batch(
         BatchRequest {
             chain: "ethereum".into(),
             seed_file: dir.path().join("seeds.txt"),
@@ -1000,9 +858,19 @@ async fn batch_rejects_cached_seed_reports_without_operator_levels() {
         &deps,
     )
     .await
-    .unwrap_err();
+    .unwrap();
 
-    assert!(err.to_string().contains("operator_level"));
+    assert_eq!(
+        summary
+            .paper_stats
+            .address_classification
+            .malicious_address_count,
+        0
+    );
+    assert!(dir
+        .path()
+        .join("top_contract_analysis__seed_seed1.json")
+        .exists());
 }
 
 #[tokio::test]
@@ -1053,10 +921,6 @@ async fn batch_repeat_infringing_count_does_not_recompute_cross_seed_minter_cont
             name: "Seed One".into(),
             ..SeedContractPayload::default()
         },
-        ReportSummary {
-            repeat_infringing_address_count: 0,
-            ..ReportSummary::default()
-        },
         vec![InfringingTokenRecord {
             contract_address: "0xc1".into(),
             token_id: "1".into(),
@@ -1085,10 +949,6 @@ async fn batch_repeat_infringing_count_does_not_recompute_cross_seed_minter_cont
             contract_address: "0xseed2".into(),
             name: "Seed Two".into(),
             ..SeedContractPayload::default()
-        },
-        ReportSummary {
-            repeat_infringing_address_count: 0,
-            ..ReportSummary::default()
         },
         vec![InfringingTokenRecord {
             contract_address: "0xc2".into(),
@@ -1133,17 +993,16 @@ async fn batch_repeat_infringing_count_does_not_recompute_cross_seed_minter_cont
     .unwrap();
 
     assert_eq!(
-        summary.batch_summary.repeat_infringing_address_count_total,
-        0
-    );
-    assert_eq!(
-        summary.batch_summary.repeat_infringing_address_count_global,
+        summary
+            .paper_stats
+            .address_classification
+            .repeat_infringing_malicious_address_count,
         0
     );
 }
 
 #[tokio::test]
-async fn batch_repeat_infringing_global_deduplicates_single_seed_repeat_addresses() {
+async fn batch_ignores_cached_repeat_infringing_addresses() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n").unwrap();
 
@@ -1153,10 +1012,6 @@ async fn batch_repeat_infringing_global_deduplicates_single_seed_repeat_addresse
             contract_address: "0xseed1".into(),
             name: "Seed One".into(),
             ..SeedContractPayload::default()
-        },
-        ReportSummary {
-            repeat_infringing_address_count: 1,
-            ..ReportSummary::default()
         },
         vec![
             InfringingTokenRecord {
@@ -1194,10 +1049,6 @@ async fn batch_repeat_infringing_global_deduplicates_single_seed_repeat_addresse
             contract_address: "0xseed2".into(),
             name: "Seed Two".into(),
             ..SeedContractPayload::default()
-        },
-        ReportSummary {
-            repeat_infringing_address_count: 1,
-            ..ReportSummary::default()
         },
         vec![
             InfringingTokenRecord {
@@ -1250,17 +1101,16 @@ async fn batch_repeat_infringing_global_deduplicates_single_seed_repeat_addresse
     .unwrap();
 
     assert_eq!(
-        summary.batch_summary.repeat_infringing_address_count_total,
-        2
-    );
-    assert_eq!(
-        summary.batch_summary.repeat_infringing_address_count_global,
-        1
+        summary
+            .paper_stats
+            .address_classification
+            .repeat_infringing_malicious_address_count,
+        0
     );
 }
 
 #[tokio::test]
-async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_payloads() {
+async fn batch_ignores_cached_seed_summary_and_global_metrics_from_full_payloads() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n").unwrap();
 
@@ -1270,35 +1120,6 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
             contract_address: "0xseed1".into(),
             name: "Seed One".into(),
             ..SeedContractPayload::default()
-        },
-        ReportSummary {
-            candidate_contract_count: 2,
-            infringing_nft_count: 2,
-            malicious_address_count: 2,
-            neutral_address_count: 1,
-            repeat_infringing_address_count: 1,
-            secondary_sale_victim_cost_eth: 10.0,
-            secondary_sale_victim_cost_usd: 10.0,
-            secondary_sale_stuck_cost_eth: 2.0,
-            secondary_sale_stuck_cost_usd: 2.0,
-            secondary_sale_stuck_cost_ratio: Some(0.2),
-            victim_acquisition_total_eth: 10.0,
-            victim_acquisition_total_usd: 10.0,
-            victim_acquisition_stuck_cost_eth: 2.0,
-            victim_acquisition_stuck_cost_usd: 2.0,
-            victim_acquisition_stuck_cost_ratio: Some(0.2),
-            victim_acquisition_address_count: 2,
-            buy_asset_ratio_known_address_count: 2,
-            ratio_over_60_address_count: 1,
-            ratio_over_80_address_count: 0,
-            stuck_victim_address_count: 1,
-            corrupted_victim_address_count: 1,
-            avg_deployment_to_neutral_holder_seconds: Some(12.0),
-            median_deployment_to_neutral_holder_seconds: Some(10.0),
-            avg_deployment_to_first_transfer_seconds: Some(8.0),
-            median_deployment_to_first_transfer_seconds: Some(7.0),
-            avg_unique_receiver_count: Some(2.0),
-            ..ReportSummary::default()
         },
         vec![
             InfringingTokenRecord {
@@ -1341,8 +1162,6 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
                 buy_amount_usd: 7.0,
                 last_buy_amount_eth: Some(2.0),
                 last_buy_amount_usd: Some(2.0),
-                buy_before_eth_balance: Some(10.0),
-                buy_before_usd_balance: Some(10.0),
                 is_stuck: true,
                 ..SecondarySaleVictimAddressPayload::default()
             },
@@ -1352,8 +1171,6 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
                 buy_amount_usd: 3.0,
                 last_buy_amount_eth: Some(4.0),
                 last_buy_amount_usd: Some(4.0),
-                buy_before_eth_balance: Some(10.0),
-                buy_before_usd_balance: Some(10.0),
                 is_stuck: false,
                 ..SecondarySaleVictimAddressPayload::default()
             },
@@ -1363,8 +1180,6 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
                 buy_amount_usd: 1_000.0,
                 last_buy_amount_eth: Some(1_000.0),
                 last_buy_amount_usd: Some(1_000.0),
-                buy_before_eth_balance: Some(1_000.0),
-                buy_before_usd_balance: Some(1_000.0),
                 is_stuck: true,
                 ..SecondarySaleVictimAddressPayload::default()
             },
@@ -1411,34 +1226,6 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
             name: "Seed Two".into(),
             ..SeedContractPayload::default()
         },
-        ReportSummary {
-            candidate_contract_count: 3,
-            infringing_nft_count: 1,
-            malicious_address_count: 2,
-            neutral_address_count: 2,
-            secondary_sale_victim_cost_eth: 5.0,
-            secondary_sale_victim_cost_usd: 5.0,
-            secondary_sale_stuck_cost_eth: 1.0,
-            secondary_sale_stuck_cost_usd: 1.0,
-            secondary_sale_stuck_cost_ratio: Some(0.2),
-            victim_acquisition_total_eth: 5.0,
-            victim_acquisition_total_usd: 5.0,
-            victim_acquisition_stuck_cost_eth: 1.0,
-            victim_acquisition_stuck_cost_usd: 1.0,
-            victim_acquisition_stuck_cost_ratio: Some(0.2),
-            victim_acquisition_address_count: 3,
-            buy_asset_ratio_known_address_count: 3,
-            ratio_over_60_address_count: 2,
-            ratio_over_80_address_count: 1,
-            stuck_victim_address_count: 1,
-            corrupted_victim_address_count: 1,
-            avg_deployment_to_neutral_holder_seconds: Some(18.0),
-            median_deployment_to_neutral_holder_seconds: Some(20.0),
-            avg_deployment_to_first_transfer_seconds: Some(14.0),
-            median_deployment_to_first_transfer_seconds: Some(20.0),
-            avg_unique_receiver_count: Some(4.0),
-            ..ReportSummary::default()
-        },
         vec![InfringingTokenRecord {
             contract_address: "0xc3".into(),
             token_id: "3".into(),
@@ -1477,8 +1264,6 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
                 buy_amount_usd: 1.0,
                 last_buy_amount_eth: Some(1.0),
                 last_buy_amount_usd: Some(1.0),
-                buy_before_eth_balance: Some(1.0),
-                buy_before_usd_balance: Some(1.0),
                 is_stuck: true,
                 ..SecondarySaleVictimAddressPayload::default()
             },
@@ -1486,16 +1271,12 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
                 address: "0xv3".into(),
                 buy_amount_eth: 3.0,
                 buy_amount_usd: 3.0,
-                buy_before_eth_balance: Some(4.0),
-                buy_before_usd_balance: Some(4.0),
                 ..SecondarySaleVictimAddressPayload::default()
             },
             SecondarySaleVictimAddressPayload {
                 address: "0xv4".into(),
                 buy_amount_eth: 1.0,
                 buy_amount_usd: 1.0,
-                buy_before_eth_balance: Some(10.0),
-                buy_before_usd_balance: Some(10.0),
                 ..SecondarySaleVictimAddressPayload::default()
             },
         ],
@@ -1545,232 +1326,38 @@ async fn batch_recomputes_cached_seed_summary_and_global_metrics_from_full_paylo
     .await
     .unwrap();
 
-    assert_eq!(summary.batch_summary.seed_report_count, 2);
-    assert_eq!(summary.batch_summary.candidate_contract_count_total, 5);
-    assert_eq!(summary.batch_summary.infringing_nft_count_total, 3);
-    assert_eq!(summary.batch_summary.malicious_address_count_total, 3);
-    assert_eq!(summary.batch_summary.neutral_address_count_total, 2);
-    assert_eq!(
-        summary.batch_summary.repeat_infringing_address_count_total,
-        1
-    );
-    assert_eq!(
-        summary.batch_summary.repeat_infringing_address_count_global,
-        1
-    );
-    assert_eq!(
-        summary.batch_summary.secondary_sale_victim_cost_eth_total,
-        15.0
-    );
-    assert_eq!(
-        summary.batch_summary.secondary_sale_stuck_cost_eth_total,
-        3.0
-    );
     assert_eq!(
         summary
-            .batch_summary
-            .secondary_sale_stuck_cost_ratio_overall,
-        Some(0.2)
-    );
-    assert_eq!(
-        summary.batch_summary.operator_secondary_sale_cost_eth_total,
-        1_050.0
-    );
-    assert_eq!(
-        summary.batch_summary.operator_acquisition_total_eth_total,
-        1_050.0
-    );
-    assert_eq!(
-        summary
-            .batch_summary
-            .operator_acquisition_address_count_total,
-        2
-    );
-    assert_eq!(
-        summary
-            .batch_summary
-            .operator_acquisition_address_count_distinct,
-        2
-    );
-    assert_eq!(
-        summary.batch_summary.operator_acquisition_edge_count_total,
-        2
-    );
-    assert_eq!(summary.batch_summary.operator_level_stats.len(), 3);
-    let l1_stats = summary
-        .batch_summary
-        .operator_level_stats
-        .iter()
-        .find(|item| item.level == 1)
-        .expect("L1 stats");
-    assert_eq!(l1_stats.address_count, 1);
-    assert_eq!(l1_stats.acquisition_total_eth, 1_000.0);
-    assert_eq!(l1_stats.acquisition_edge_count, 1);
-    let l2_stats = summary
-        .batch_summary
-        .operator_level_stats
-        .iter()
-        .find(|item| item.level == 2)
-        .expect("L2 stats");
-    assert_eq!(l2_stats.address_count, 1);
-    assert_eq!(l2_stats.acquisition_total_eth, 50.0);
-    assert_eq!(l2_stats.acquisition_edge_count, 1);
-    let l3_stats = summary
-        .batch_summary
-        .operator_level_stats
-        .iter()
-        .find(|item| item.level == 3)
-        .expect("L3 stats");
-    assert_eq!(l3_stats.address_count, 1);
-    assert_eq!(l3_stats.acquisition_total_eth, 0.0);
-    assert_eq!(
-        summary
-            .batch_summary
-            .buy_asset_ratio_known_address_count_total,
-        5
-    );
-    assert_eq!(summary.batch_summary.ratio_over_60_address_count_total, 3);
-    assert_eq!(
-        summary.batch_summary.ratio_over_60_address_ratio_overall,
-        Some(0.6)
-    );
-    assert_eq!(summary.batch_summary.ratio_over_80_address_count_total, 1);
-    assert_eq!(
-        summary.batch_summary.ratio_over_80_address_ratio_overall,
-        Some(0.2)
-    );
-    assert_eq!(summary.batch_summary.stuck_victim_address_count_total, 2);
-    let batch_summary_json = serde_json::to_value(&summary.batch_summary).unwrap();
-    assert_eq!(
-        batch_summary_json["victim_acquisition_address_count_distinct"],
-        4
-    );
-    assert_eq!(batch_summary_json["stuck_victim_address_count_distinct"], 2);
-    assert_eq!(
-        batch_summary_json["stuck_victim_address_ratio_distinct"],
-        0.5
-    );
-    assert_eq!(
-        summary.batch_summary.stuck_victim_address_ratio_overall,
-        Some(0.4)
-    );
-    assert_eq!(
-        summary.batch_summary.corrupted_victim_address_count_total,
-        2
-    );
-    assert_eq!(
-        batch_summary_json["corrupted_victim_address_count_distinct"],
-        1
-    );
-    assert_eq!(
-        summary
-            .batch_summary
-            .avg_deployment_to_neutral_holder_seconds_mean,
-        Some(15.0)
-    );
-    assert_eq!(
-        summary
-            .batch_summary
-            .median_deployment_to_neutral_holder_seconds_median,
-        Some(15.0)
-    );
-    assert_eq!(
-        summary
-            .batch_summary
-            .avg_deployment_to_first_transfer_seconds_mean,
-        Some(11.0)
-    );
-    assert_eq!(
-        summary
-            .batch_summary
-            .median_deployment_to_first_transfer_seconds_median,
-        Some(13.5)
-    );
-    assert_eq!(
-        summary.batch_summary.avg_unique_receiver_count_mean,
-        Some(3.0)
-    );
-
-    assert_eq!(
-        summary.seed_reports[0].report_summary.infringing_nft_count,
-        2
-    );
-    assert_eq!(
-        summary.seed_reports[0]
-            .report_summary
+            .paper_stats
+            .address_classification
             .malicious_address_count,
-        2
+        0
     );
     assert_eq!(
-        summary.seed_reports[0].report_summary.neutral_address_count,
-        1
+        summary
+            .paper_stats
+            .address_classification
+            .malicious_address_count,
+        0
     );
-    assert_eq!(
-        summary.seed_reports[0]
-            .report_summary
-            .repeat_infringing_address_count,
-        1
-    );
-    assert_eq!(
-        summary.seed_reports[0]
-            .report_summary
-            .secondary_sale_victim_cost_eth,
-        10.0
-    );
-    assert_eq!(
-        summary.seed_reports[0]
-            .report_summary
-            .secondary_sale_stuck_cost_eth,
-        2.0
-    );
-    assert_eq!(
-        summary.seed_reports[0]
-            .report_summary
-            .secondary_sale_stuck_cost_ratio,
-        Some(0.2)
-    );
-    assert_eq!(
-        summary.seed_reports[0]
-            .report_summary
-            .operator_acquisition_total_eth,
-        1_000.0
-    );
-    assert_eq!(
-        summary.seed_reports[0]
-            .report_summary
-            .median_deployment_to_neutral_holder_seconds,
-        Some(10.0)
-    );
-    assert_eq!(
-        summary.seed_reports[0]
-            .report_summary
-            .median_deployment_to_first_transfer_seconds,
-        Some(7.0)
-    );
+    assert!(dir
+        .path()
+        .join("top_contract_analysis__seed_seed1.json")
+        .exists());
+    assert!(dir
+        .path()
+        .join("top_contract_analysis__seed_seed2.json")
+        .exists());
 }
 
 #[tokio::test]
 async fn batch_writes_summary_files_with_existing_names() {
     let payload = BatchSummaryPayload {
-        batch_summary: BatchReportSummary {
-            seed_report_count: 1,
-            ..BatchReportSummary::default()
-        },
-        seed_reports: vec![BatchSeedReportPayload {
-            seed_contract: SeedContractPayload {
-                contract_address: "0xseed".into(),
-                ..SeedContractPayload::default()
-            },
-            report_summary: ReportSummary::default(),
-            output_files: Some(OutputFilesPayload {
-                json: "top_contract_analysis__seed.json".into(),
-                markdown: "top_contract_analysis__seed.md".into(),
-            }),
-        }],
+        paper_stats: PaperStatsPayload::default(),
     };
     let dir = tempdir().unwrap();
 
-    let (json_path, md_path) = write_batch_summary_outputs(&payload, dir.path()).unwrap();
+    let (json_path, md_path) = write_batch_paper_stats_outputs(&payload, dir.path()).unwrap();
 
     assert_eq!(
         json_path.file_name().unwrap().to_string_lossy(),
@@ -2126,6 +1713,42 @@ async fn batch_uses_seed_network_concurrency_for_uncached_seeds() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_bounds_in_flight_seed_futures_for_large_inputs() {
+    let dir = tempdir().unwrap();
+    let seeds = (1..=20)
+        .map(|index| format!("0xseed{index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(dir.path().join("seeds.txt"), seeds).unwrap();
+    let batch_progress = Arc::new(RecordingBatchProgressReporter::default());
+    let deps = AnalysisDeps {
+        api: Arc::new(SlowBatchApi::new()),
+        feature_store: Arc::new(EmptyFeatureStore),
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: batch_progress.clone(),
+    };
+    let request = BatchRequest {
+        chain: "ethereum".into(),
+        seed_file: dir.path().join("seeds.txt"),
+        output_dir: dir.path().to_path_buf(),
+        alchemy_api_key: "key".into(),
+        seed_network_max_concurrency: 2,
+        seed_cpu_max_concurrency: 1,
+        matched_contract_max_concurrency: 1,
+        ..BatchRequest::default()
+    };
+
+    let handle = tokio::spawn(async move { run_batch(request, &deps).await });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    assert!(
+        batch_progress.seed_events.lock().unwrap().len() <= 4,
+        "seed futures should be admitted in bounded batches"
+    );
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batch_continues_successful_seed_after_context_failure() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n").unwrap();
@@ -2377,7 +2000,7 @@ async fn batch_limits_contract_analysis_globally_across_seeds() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn batch_allows_match_contracts_from_different_seeds_to_overlap_sale_metrics() {
+async fn batch_does_not_run_obsolete_receipt_metrics_across_seeds() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n").unwrap();
     let probe = Arc::new(BatchPipelineProbe::default());
@@ -2412,21 +2035,10 @@ async fn batch_allows_match_contracts_from_different_seeds_to_overlap_sale_metri
     .await
     .unwrap();
 
-    assert!(
-        probe.sale_metric_receipt_calls.load(Ordering::SeqCst) > 0,
-        "expected seed1 native sale metrics to run"
-    );
-    assert!(
-        probe
-            .holder_started_before_sale_metric_finished
-            .load(Ordering::SeqCst),
-        "expected seed2 pre-analysis holder API check to start before seed1 sale metrics finished"
-    );
-    assert!(
-        probe
-            .expansion_observed_sale_metric_active
-            .load(Ordering::SeqCst),
-        "expected seed2 matched-contract expansion to overlap seed1 sale metrics under the global matched-contract limit"
+    assert_eq!(
+        probe.obsolete_metric_receipt_calls.load(Ordering::SeqCst),
+        0,
+        "removed receipt metric fetches are no longer part of the batch path"
     );
 }
 
@@ -2473,7 +2085,7 @@ async fn batch_progress_reporter_receives_seed_lifecycle_events() {
 }
 
 #[tokio::test]
-async fn batch_progress_reporter_counts_cached_seed_reports() {
+async fn batch_progress_reporter_does_not_count_ignored_cached_legacy_outputs() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n").unwrap();
     let cached_report = cached_single_report(
@@ -2482,10 +2094,6 @@ async fn batch_progress_reporter_counts_cached_seed_reports() {
             contract_address: "0xseed1".into(),
             name: "Cached Seed".into(),
             ..SeedContractPayload::default()
-        },
-        ReportSummary {
-            candidate_contract_count: 1,
-            ..ReportSummary::default()
         },
         Vec::new(),
         Vec::new(),
@@ -2525,17 +2133,14 @@ async fn batch_progress_reporter_counts_cached_seed_reports() {
     .await
     .unwrap();
 
-    assert_eq!(
-        batch_progress.cached.lock().unwrap().as_slice(),
-        ["0xseed1"]
-    );
+    assert!(batch_progress.cached.lock().unwrap().is_empty());
     assert_eq!(
         batch_progress.started.lock().unwrap().as_slice(),
-        ["0xseed2"]
+        ["0xseed1", "0xseed2"]
     );
     assert_eq!(
         batch_progress.finished.lock().unwrap().as_slice(),
-        ["0xseed2"]
+        ["0xseed1", "0xseed2"]
     );
     assert!(batch_progress.failed.lock().unwrap().is_empty());
 }

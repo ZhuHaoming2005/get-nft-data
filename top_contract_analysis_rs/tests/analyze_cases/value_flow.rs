@@ -169,27 +169,6 @@ async fn analyze_traces_multi_hop_cashout_and_classifies_known_destinations() {
         .evidence_flags
         .contains(&"cashout_destination:mixer".to_string()));
 
-    assert!(payload.contract_lifecycle_events.iter().any(|event| {
-        event.lifecycle_stage == "exit_or_cleanup"
-            && event.event_type == "cashout_hop"
-            && event
-                .counterparty_address
-                .eq_ignore_ascii_case(ARBITRUM_ONE_BRIDGE)
-    }));
-
-    let lifecycle_metric = payload
-        .lifecycle_metrics
-        .iter()
-        .find(|metric| metric.contract_address == "0xdup")
-        .expect("contract lifecycle metric");
-    assert!((lifecycle_metric.withdrawal_amount_eth - 0.8).abs() < 1e-9);
-    assert!(lifecycle_metric
-        .value_flow_coverage_gaps
-        .contains(&"later_withdrawals_not_exhaustive".to_string()));
-    assert!(lifecycle_metric
-        .value_flow_coverage_gaps
-        .contains(&"cashout_trace_same_block_value_constrained".to_string()));
-    assert!(lifecycle_metric
-        .value_flow_coverage_gaps
-        .contains(&"known_cex_bridge_mixer_labels_incomplete".to_string()));
+    assert!(payload.contract_lifecycle_events.is_empty());
+    assert!(payload.lifecycle_metrics.is_empty());
 }

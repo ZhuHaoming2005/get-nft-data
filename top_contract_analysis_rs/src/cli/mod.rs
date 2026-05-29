@@ -43,7 +43,6 @@ pub struct AnalyzeArgs {
     pub alchemy_api_max_concurrency: usize,
     #[arg(
         long = "other-api-max-concurrency",
-        alias = "api-max-concurrency",
         default_value_t = DEFAULT_OTHER_API_RATE_LIMIT_BURST
     )]
     pub other_api_max_concurrency: usize,
@@ -64,6 +63,14 @@ pub struct AnalyzeArgs {
     pub feature_parquet: String,
     #[arg(long, default_value = ":memory:")]
     pub feature_db: String,
+    #[arg(long, default_value_t = 2)]
+    pub paper_min_cycle_size: usize,
+    #[arg(long, default_value_t = 3)]
+    pub paper_min_path_length: usize,
+    #[arg(long, default_value_t = 3)]
+    pub paper_center_fanout_threshold: usize,
+    #[arg(long, default_value_t = 0.1)]
+    pub paper_concentration_top_pct: f64,
 }
 
 #[derive(Args, Debug)]
@@ -94,7 +101,6 @@ pub struct BatchArgs {
     pub alchemy_api_max_concurrency: usize,
     #[arg(
         long = "other-api-max-concurrency",
-        alias = "api-max-concurrency",
         default_value_t = DEFAULT_OTHER_API_RATE_LIMIT_BURST
     )]
     pub other_api_max_concurrency: usize,
@@ -119,6 +125,14 @@ pub struct BatchArgs {
     pub max_recall_rows: usize,
     #[arg(long, default_value_t = 0)]
     pub max_tokens_per_contract: usize,
+    #[arg(long, default_value_t = 2)]
+    pub paper_min_cycle_size: usize,
+    #[arg(long, default_value_t = 3)]
+    pub paper_min_path_length: usize,
+    #[arg(long, default_value_t = 3)]
+    pub paper_center_fanout_threshold: usize,
+    #[arg(long, default_value_t = 0.1)]
+    pub paper_concentration_top_pct: f64,
 }
 
 #[derive(Args, Debug)]

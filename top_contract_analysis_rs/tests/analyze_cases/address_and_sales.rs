@@ -49,30 +49,6 @@ async fn analyze_builds_address_profiles_and_trade_stats_for_duplicate_contracts
         1.5
     );
     assert!(!payload.secondary_sale_victim_addresses[0].is_stuck);
-    assert_eq!(
-        payload.honest_address_stats["0xdup"].honest_address_count,
-        2
-    );
-    assert_eq!(
-        payload.honest_address_stats["0xdup"].corrupted_address_count,
-        0
-    );
-    assert_eq!(payload.honest_address_stats["0xdup"].victim_resale_count, 0);
-    assert_eq!(
-        payload.honest_address_stats["0xdup"].avg_deployment_to_neutral_holder_seconds,
-        None
-    );
-    assert_eq!(payload.fraud_trade_stats["0xdup"].unique_buyers, 1);
-    assert_eq!(
-        payload.fraud_trade_stats["0xdup"].eth_priced_sale_count,
-        Some(1)
-    );
-    assert_eq!(
-        payload.fraud_trade_stats["0xdup"].eth_priced_volume,
-        Some(1.5)
-    );
-    assert_eq!(payload.fraud_trade_stats["0xdup"].stuck_wallet_count, 0);
-    assert_eq!(payload.report_summary.malicious_address_count, 1);
     let neutral_address_count = payload
         .address_attributions
         .iter()
@@ -80,12 +56,23 @@ async fn analyze_builds_address_profiles_and_trade_stats_for_duplicate_contracts
         .map(|item| item.address.as_str())
         .collect::<BTreeSet<_>>()
         .len() as i64;
+    assert_eq!(neutral_address_count, 1);
     assert_eq!(
-        payload.report_summary.neutral_address_count,
-        neutral_address_count
+        payload
+            .secondary_sale_victim_addresses
+            .iter()
+            .map(|item| item.buy_amount_eth)
+            .sum::<f64>(),
+        1.5
     );
-    assert_eq!(payload.report_summary.secondary_sale_victim_cost_eth, 1.5);
-    assert_eq!(payload.report_summary.corrupted_victim_address_count, 0);
+    assert_eq!(
+        payload
+            .honest_addresses
+            .iter()
+            .filter(|item| item.is_corrupted_address)
+            .count(),
+        0
+    );
 
     let propagation = &payload.nft_propagation_paths["0xdup"];
     assert_eq!(propagation.summary.token_count, 1);
@@ -157,9 +144,9 @@ async fn analyze_fetches_transfers_and_owners_on_each_run() {
 }
 
 #[tokio::test]
-async fn analyze_computes_native_eth_sale_metrics_for_secondary_sale_victim_addresses() {
+async fn analyze_records_secondary_sale_victims_without_balance_metric_fetches() {
     let deps = AnalysisDeps {
-        api: Arc::new(FakeSaleMetricApi),
+        api: Arc::new(SecondaryVictimApi),
         feature_store: Arc::new(FakeFeatureStore {
             snapshot: DatabaseSnapshot {
                 nft_rows: vec![DatabaseNftRecord {
@@ -197,35 +184,25 @@ async fn analyze_computes_native_eth_sale_metrics_for_secondary_sale_victim_addr
         payload.secondary_sale_victim_addresses[0].address,
         "0xvictim"
     );
+    let buy_ratio_values: Vec<f64> = payload
+        .victim_acquisition_addresses
+        .iter()
+        .filter_map(|item| item.buy_asset_ratio)
+        .collect();
+    assert!(buy_ratio_values.is_empty());
     assert_eq!(
-        payload.secondary_sale_victim_addresses[0].buy_before_eth_balance,
-        Some(3.0)
+        buy_ratio_values
+            .iter()
+            .filter(|value| **value > 0.6)
+            .count(),
+        0
     );
-    assert_eq!(
-        payload.secondary_sale_victim_addresses[0].buy_asset_ratio,
-        Some(0.5)
-    );
-    assert!(
-        payload.secondary_sale_victim_addresses[0]
-            .buy_asset_ratio_with_gas
-            .unwrap()
-            > 0.5
-    );
-    assert_eq!(
-        payload.secondary_sale_victim_addresses[0].ratio_status,
-        "ok"
-    );
-    assert_eq!(
-        payload.report_summary.buy_asset_ratio_known_address_count,
-        1
-    );
-    assert_eq!(payload.report_summary.ratio_over_60_address_count, 0);
 }
 
 #[tokio::test]
-async fn analyze_sale_metrics_are_keyed_by_transaction_and_buyer() {
+async fn analyze_groups_secondary_sale_victims_by_buyer() {
     let deps = AnalysisDeps {
-        api: Arc::new(MultiBuyerSameTxSaleMetricApi),
+        api: Arc::new(MultiBuyerSameTxApi),
         feature_store: Arc::new(FakeFeatureStore {
             snapshot: DatabaseSnapshot {
                 nft_rows: vec![
@@ -282,8 +259,6 @@ async fn analyze_sale_metrics_are_keyed_by_transaction_and_buyer() {
         .find(|row| row.address == "0xbuyer2")
         .expect("buyer2 victim row");
 
-    assert_eq!(buyer1.buy_before_eth_balance, Some(1.0));
-    assert_eq!(buyer1.buy_asset_ratio, Some(1.0));
-    assert_eq!(buyer2.buy_before_eth_balance, Some(10.0));
-    assert_eq!(buyer2.buy_asset_ratio, Some(0.2));
+    assert_eq!(buyer1.buy_tx_hashes, vec!["0xbundle"]);
+    assert_eq!(buyer2.buy_tx_hashes, vec!["0xbundle"]);
 }

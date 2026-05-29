@@ -7,12 +7,11 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::error::AppError;
 use crate::models::{
-    AddressAttributionPayload, AddressSignalPayload, BatchSeedReportPayload, ContractMetadata,
-    DatabaseSnapshot, DuplicateCandidate, DuplicateContractPayload, FraudTradeStatsPayload,
-    HonestAddressPayload, HonestAddressStatsPayload, InfringingTokenRecord,
+    AddressAttributionPayload, AddressSignalPayload, ContractMetadata, DatabaseSnapshot,
+    DuplicateCandidate, DuplicateContractPayload, HonestAddressPayload, InfringingTokenRecord,
     MaliciousAddressPayload, NftMarketEventRecord, NftPropagationPathPayload, OwnerBalance,
-    SecondarySaleVictimAddressPayload, SeedContractPayload, SeedNft, SingleReportPayload,
-    TransferRecord, ValueFlowEdgePayload, VictimSignalPayload,
+    PaperStatsPayload, SecondarySaleVictimAddressPayload, SeedContractPayload, SeedNft,
+    SingleReportPayload, TransferRecord, ValueFlowEdgePayload, VictimSignalPayload,
 };
 use crate::progress::{BatchProgressReporter, SeedProgressReporter};
 use crate::store::DuckDbFeatureStore;
@@ -24,8 +23,8 @@ mod candidate_filter;
 mod contract_analysis;
 pub mod duplicate;
 pub mod lifecycle;
+pub mod paper_stats;
 pub mod propagation;
-mod sale_metrics;
 pub mod scoring;
 pub mod signals;
 mod summary;
@@ -37,7 +36,6 @@ pub use candidate_filter::group_candidates_by_contract;
 
 use candidate_filter::*;
 use contract_analysis::*;
-use sale_metrics::*;
 use summary::*;
 use value_flow::*;
 
@@ -60,6 +58,7 @@ pub struct AnalyzeRequest {
     pub matched_contract_max_concurrency: usize,
     pub max_tokens_per_contract: usize,
     pub max_recall_rows: usize,
+    pub paper_stats_config: paper_stats::PaperStatsConfig,
 }
 
 impl Default for AnalyzeRequest {
@@ -78,6 +77,7 @@ impl Default for AnalyzeRequest {
             matched_contract_max_concurrency: 1,
             max_tokens_per_contract: 0,
             max_recall_rows: 0,
+            paper_stats_config: paper_stats::PaperStatsConfig::default(),
         }
     }
 }
@@ -210,15 +210,8 @@ async fn acquire_optional_limit(
 
 #[derive(Clone, Debug)]
 struct BatchSeedAggregate {
-    report: BatchSeedReportPayload,
-    malicious_addresses: BTreeSet<String>,
-    neutral_addresses: BTreeSet<String>,
-    victim_acquisition_addresses: BTreeSet<String>,
-    stuck_victim_addresses: BTreeSet<String>,
-    corrupted_victim_addresses: BTreeSet<String>,
-    repeat_infringing_addresses: BTreeSet<String>,
-    operator_acquisition_addresses: BTreeSet<String>,
-    operator_level_addresses: BTreeMap<i64, BTreeSet<String>>,
+    seed_contract: SeedContractPayload,
+    paper_stats: PaperStatsPayload,
 }
 
 struct ContractAnalysisResult {
@@ -231,12 +224,10 @@ struct ContractAnalysisResult {
     infringing_tokens: Vec<InfringingTokenRecord>,
     malicious_addresses: Vec<MaliciousAddressPayload>,
     honest_addresses: Vec<HonestAddressPayload>,
-    honest_address_stats: BTreeMap<String, HonestAddressStatsPayload>,
     secondary_sale_victim_addresses: Vec<SecondarySaleVictimAddressPayload>,
     address_attributions: Vec<AddressAttributionPayload>,
     market_events: Vec<NftMarketEventRecord>,
     mint_payment_edges: Vec<ValueFlowEdgePayload>,
-    fraud_trade_stats: BTreeMap<String, FraudTradeStatsPayload>,
     nft_propagation_path: Option<NftPropagationPathPayload>,
 }
 
@@ -249,12 +240,10 @@ struct AnalysisOutputState {
     infringing_tokens: Vec<InfringingTokenRecord>,
     malicious_addresses: Vec<MaliciousAddressPayload>,
     honest_addresses: Vec<HonestAddressPayload>,
-    honest_address_stats: BTreeMap<String, HonestAddressStatsPayload>,
     secondary_sale_victim_addresses: Vec<SecondarySaleVictimAddressPayload>,
     address_attributions: Vec<AddressAttributionPayload>,
     market_events: Vec<NftMarketEventRecord>,
     mint_payment_edges: Vec<ValueFlowEdgePayload>,
-    fraud_trade_stats: BTreeMap<String, FraudTradeStatsPayload>,
     nft_propagation_paths: BTreeMap<String, NftPropagationPathPayload>,
     candidate_contract_metadata: BTreeMap<String, ContractMetadata>,
     implausible_candidate_contracts: BTreeSet<String>,
@@ -309,6 +298,7 @@ pub struct BatchRequest {
     pub max_recall_rows: usize,
     pub seed_network_max_concurrency: usize,
     pub seed_cpu_max_concurrency: usize,
+    pub paper_stats_config: paper_stats::PaperStatsConfig,
 }
 
 impl Default for BatchRequest {
@@ -330,6 +320,7 @@ impl Default for BatchRequest {
             max_recall_rows: 0,
             seed_network_max_concurrency: 1,
             seed_cpu_max_concurrency: 1,
+            paper_stats_config: paper_stats::PaperStatsConfig::default(),
         }
     }
 }
@@ -739,12 +730,14 @@ async fn finalize_seed_report(
     progress: Arc<dyn SeedProgressReporter>,
 ) -> Result<SingleReportPayload, AppError> {
     let SeedAnalysisState {
+        request,
         seed_contract,
         seed_nfts,
         open_license,
         candidates,
         mut output_state,
         mut expanded_candidates_by_contract,
+        analysis_timestamp,
         ..
     } = state;
 
@@ -784,19 +777,6 @@ async fn finalize_seed_report(
         contract_deployer: seed_contract.contract_deployer,
         deployed_block_number: seed_contract.deployed_block_number,
     };
-    let lifecycle_contract_addresses: BTreeSet<String> = duplicate_contracts
-        .iter()
-        .map(|item| item.contract_address.clone())
-        .collect();
-    let lifecycle_candidates: Vec<DuplicateCandidate> = if open_license {
-        Vec::new()
-    } else {
-        candidates
-            .iter()
-            .filter(|candidate| lifecycle_contract_addresses.contains(&candidate.contract_address))
-            .cloned()
-            .collect()
-    };
     let output_candidates: Vec<DuplicateCandidate> =
         if output_state.implausible_candidate_contracts.is_empty() {
             candidates
@@ -820,62 +800,39 @@ async fn finalize_seed_report(
                 })
                 .collect()
         };
-    let summary_grouped = group_candidates_by_contract(&output_candidates);
-    let mut lifecycle_outputs =
-        lifecycle::build_lifecycle_model_outputs(lifecycle::LifecycleModelInput {
-            seed_contract: &seed_contract_payload,
-            duplicate_candidates: &lifecycle_candidates,
-            duplicate_contracts: &duplicate_contracts,
-            address_attributions: &output_state.address_attributions,
-            nft_propagation_paths: &output_state.nft_propagation_paths,
-            mint_payment_edges: &output_state.mint_payment_edges,
-            market_events: &output_state.market_events,
-        });
+    let value_flow_edges = output_state.mint_payment_edges.clone();
+    let seed_collection_stats = build_seed_collection_stats(&seed_nfts);
 
     let victim_acquisition_addresses = build_victim_acquisition_addresses_excluding_malicious(
         &output_state.secondary_sale_victim_addresses,
         &output_state.address_attributions,
-        &lifecycle_outputs.value_flow_edges,
+        &value_flow_edges,
         &output_state.nft_propagation_paths,
         &output_state.malicious_addresses,
     );
-    output_state.address_attributions =
-        address_records::add_acquisition_exposure_attribution_evidence(
-            output_state.address_attributions,
-            &victim_acquisition_addresses,
-        );
-    lifecycle_outputs = lifecycle::build_lifecycle_model_outputs(lifecycle::LifecycleModelInput {
-        seed_contract: &seed_contract_payload,
-        duplicate_candidates: &lifecycle_candidates,
+    let mut paper_stats_config = request.paper_stats_config;
+    if paper_stats_config.analysis_timestamp <= 0 {
+        paper_stats_config.analysis_timestamp = analysis_timestamp;
+    }
+    let paper_stats = paper_stats::build_paper_stats(paper_stats::PaperStatsInput {
+        config: paper_stats_config,
+        seed_collection_stats: &seed_collection_stats,
+        duplicate_candidates: &output_candidates,
         duplicate_contracts: &duplicate_contracts,
-        address_attributions: &output_state.address_attributions,
+        legit_duplicates: &output_state.legit_duplicates,
+        infringing_tokens: &output_state.infringing_tokens,
+        malicious_addresses: &output_state.malicious_addresses,
+        victim_acquisition_addresses: &victim_acquisition_addresses,
+        value_flow_edges: &value_flow_edges,
         nft_propagation_paths: &output_state.nft_propagation_paths,
-        mint_payment_edges: &output_state.mint_payment_edges,
-        market_events: &output_state.market_events,
     });
 
     let payload = SingleReportPayload {
         seed_contract: seed_contract_payload,
-        seed_collection_stats: build_seed_collection_stats(&seed_nfts),
+        paper_stats,
+        seed_collection_stats,
         duplicate_candidates: output_candidates,
         contract_level_summary: build_contract_level_summary(&expanded_candidates_by_contract),
-        report_summary: build_report_summary(ReportSummaryInput {
-            open_license,
-            grouped: &summary_grouped,
-            implausible_candidate_contract_count: output_state.implausible_candidate_contracts.len()
-                as i64,
-            legit_duplicates: &output_state.legit_duplicates,
-            infringing_tokens: &output_state.infringing_tokens,
-            malicious_addresses: &output_state.malicious_addresses,
-            honest_addresses: &output_state.honest_addresses,
-            secondary_sale_victim_addresses: &output_state.secondary_sale_victim_addresses,
-            victim_acquisition_addresses: &victim_acquisition_addresses,
-            address_signals: &output_state.address_signals,
-            address_attributions: &output_state.address_attributions,
-            value_flow_edges: &lifecycle_outputs.value_flow_edges,
-            propagation_paths: &output_state.nft_propagation_paths,
-            lifecycle_metrics: &lifecycle_outputs.lifecycle_metrics,
-        }),
         duplicate_contracts,
         legit_duplicates: output_state.legit_duplicates,
         address_signals: output_state.address_signals,
@@ -883,20 +840,18 @@ async fn finalize_seed_report(
         infringing_tokens: output_state.infringing_tokens,
         malicious_addresses: output_state.malicious_addresses,
         honest_addresses: output_state.honest_addresses,
-        honest_address_stats: output_state.honest_address_stats,
         secondary_sale_victim_addresses: output_state.secondary_sale_victim_addresses,
         victim_acquisition_addresses,
         address_attributions: output_state.address_attributions,
-        contract_lifecycle_events: lifecycle_outputs.contract_lifecycle_events,
-        address_evidence_features: lifecycle_outputs.address_evidence_features,
-        value_flow_edges: lifecycle_outputs.value_flow_edges,
-        content_similarity_edges: lifecycle_outputs.content_similarity_edges,
-        campaign_clusters: lifecycle_outputs.campaign_clusters,
-        lifecycle_metrics: lifecycle_outputs.lifecycle_metrics,
-        weak_supervision_labels: lifecycle_outputs.weak_supervision_labels,
-        early_detection_features: lifecycle_outputs.early_detection_features,
+        contract_lifecycle_events: Vec::new(),
+        address_evidence_features: Vec::new(),
+        value_flow_edges,
+        content_similarity_edges: Vec::new(),
+        campaign_clusters: Vec::new(),
+        lifecycle_metrics: Vec::new(),
+        weak_supervision_labels: Vec::new(),
+        early_detection_features: Vec::new(),
         market_events: output_state.market_events,
-        fraud_trade_stats: output_state.fraud_trade_stats,
         nft_propagation_paths: output_state.nft_propagation_paths,
     };
     progress.on_seed_stage("finalize_report").await;

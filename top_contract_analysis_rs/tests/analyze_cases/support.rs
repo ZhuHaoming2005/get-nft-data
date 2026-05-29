@@ -11,8 +11,7 @@ use top_contract_analysis_rs::analysis::{
 };
 use top_contract_analysis_rs::error::AppError;
 use top_contract_analysis_rs::models::{
-    AddressSignalPayload, DuplicateContractPayload, FraudTradeStatsPayload, HonestAddressPayload,
-    HonestAddressStatsPayload, MaliciousAddressPayload, ReportSummary,
+    AddressSignalPayload, DuplicateContractPayload, HonestAddressPayload, MaliciousAddressPayload,
     SecondarySaleVictimAddressPayload, SeedCollectionStatsPayload, SeedContractPayload,
     SingleReportPayload, VictimSignalPayload,
 };
@@ -2255,10 +2254,10 @@ impl AnalyzeApi for CountingApi {
     }
 }
 
-struct FakeSaleMetricApi;
+struct SecondaryVictimApi;
 
 #[async_trait]
-impl AnalyzeApi for FakeSaleMetricApi {
+impl AnalyzeApi for SecondaryVictimApi {
     async fn fetch_contract_metadata(
         &self,
         chain: &str,
@@ -2450,10 +2449,10 @@ impl AnalyzeApi for FakeSaleMetricApi {
     }
 }
 
-struct MultiBuyerSameTxSaleMetricApi;
+struct MultiBuyerSameTxApi;
 
 #[async_trait]
-impl AnalyzeApi for MultiBuyerSameTxSaleMetricApi {
+impl AnalyzeApi for MultiBuyerSameTxApi {
     async fn fetch_contract_metadata(
         &self,
         chain: &str,
@@ -2989,7 +2988,7 @@ impl AnalyzeApi for ConcurrentContractApi {
     }
 }
 
-struct ConcurrentSaleMetricApi {
+struct ObsoleteReceiptMetricProbeApi {
     active_receipts: AtomicUsize,
     max_receipts: AtomicUsize,
     duplicate_sale_tx: bool,
@@ -2999,7 +2998,7 @@ struct ConcurrentSaleMetricApi {
     same_block_transfer_calls: AtomicUsize,
 }
 
-impl ConcurrentSaleMetricApi {
+impl ObsoleteReceiptMetricProbeApi {
     fn new() -> Self {
         Self {
             active_receipts: AtomicUsize::new(0),
@@ -3802,7 +3801,7 @@ impl AnalyzeApi for DuplicateMintPaymentLookupApi {
 }
 
 #[async_trait]
-impl AnalyzeApi for ConcurrentSaleMetricApi {
+impl AnalyzeApi for ObsoleteReceiptMetricProbeApi {
     async fn fetch_contract_metadata(
         &self,
         chain: &str,

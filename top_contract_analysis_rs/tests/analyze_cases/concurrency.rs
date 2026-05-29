@@ -120,8 +120,8 @@ async fn analyze_allows_later_matched_contract_to_start_before_previous_finishes
 }
 
 #[tokio::test]
-async fn analyze_computes_sale_metrics_concurrently_within_a_contract() {
-    let api = Arc::new(ConcurrentSaleMetricApi::new());
+async fn analyze_does_not_fetch_obsolete_receipt_metrics_within_a_contract() {
+    let api = Arc::new(ObsoleteReceiptMetricProbeApi::new());
     let deps = AnalysisDeps {
         api: api.clone(),
         feature_store: Arc::new(FakeFeatureStore {
@@ -158,15 +158,16 @@ async fn analyze_computes_sale_metrics_concurrently_within_a_contract() {
     .unwrap();
 
     assert_eq!(payload.secondary_sale_victim_addresses.len(), 2);
-    assert!(
-        api.max_receipts.load(Ordering::SeqCst) >= 2,
-        "expected sale metric receipt fetches to overlap within one contract"
+    assert_eq!(
+        api.max_receipts.load(Ordering::SeqCst),
+        0,
+        "removed receipt metric fetches are no longer part of the analysis path"
     );
 }
 
 #[tokio::test]
-async fn analyze_prefetches_sale_metrics_per_buyer_with_shared_transaction_hash() {
-    let api = Arc::new(ConcurrentSaleMetricApi::with_duplicate_sale_tx());
+async fn analyze_does_not_prefetch_removed_metrics_per_buyer_with_shared_transaction_hash() {
+    let api = Arc::new(ObsoleteReceiptMetricProbeApi::with_duplicate_sale_tx());
     let deps = AnalysisDeps {
         api: api.clone(),
         feature_store: Arc::new(FakeFeatureStore {
@@ -203,14 +204,14 @@ async fn analyze_prefetches_sale_metrics_per_buyer_with_shared_transaction_hash(
     .unwrap();
 
     assert_eq!(payload.secondary_sale_victim_addresses.len(), 2);
-    assert_eq!(api.receipt_calls.load(Ordering::SeqCst), 2);
-    assert_eq!(api.balance_calls.load(Ordering::SeqCst), 2);
-    assert_eq!(api.same_block_transfer_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(api.receipt_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(api.balance_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(api.same_block_transfer_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
-async fn analyze_prefetches_sale_metrics_only_for_latest_buyer_purchase() {
-    let api = Arc::new(ConcurrentSaleMetricApi::with_same_buyer_history());
+async fn analyze_does_not_prefetch_removed_metrics_for_latest_buyer_purchase() {
+    let api = Arc::new(ObsoleteReceiptMetricProbeApi::with_same_buyer_history());
     let deps = AnalysisDeps {
         api: api.clone(),
         feature_store: Arc::new(FakeFeatureStore {
@@ -247,9 +248,9 @@ async fn analyze_prefetches_sale_metrics_only_for_latest_buyer_purchase() {
     .unwrap();
 
     assert_eq!(payload.secondary_sale_victim_addresses.len(), 1);
-    assert_eq!(api.receipt_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(api.balance_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(api.same_block_transfer_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(api.receipt_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(api.balance_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(api.same_block_transfer_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

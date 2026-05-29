@@ -1,34 +1,6 @@
 use super::*;
+use crate::models::EthTransferRecord;
 use crate::models::{AddressEvidencePayload, NftTokenPropagationPayload};
-use crate::models::{ContractLifecycleMetricPayload, EthTransferRecord};
-
-fn payload_median_deployment_to_neutral_holder_seconds(
-    payload: &SingleReportPayload,
-) -> Option<f64> {
-    let values: Vec<f64> = payload
-        .honest_addresses
-        .iter()
-        .flat_map(|item| {
-            item.deployment_to_neutral_holder_seconds_samples
-                .iter()
-                .copied()
-        })
-        .filter_map(positive_seconds)
-        .collect();
-    median_f64(&values)
-}
-
-fn payload_median_deployment_to_first_transfer_seconds(
-    payload: &SingleReportPayload,
-) -> Option<f64> {
-    let values: Vec<f64> = payload
-        .lifecycle_metrics
-        .iter()
-        .filter_map(|metric| metric.time_to_first_transfer_seconds)
-        .filter_map(positive_seconds)
-        .collect();
-    median_f64(&values)
-}
 
 #[test]
 fn seed_duplicate_matching_uses_single_contract_level_name() {
@@ -72,287 +44,7 @@ fn seed_duplicate_matching_uses_single_contract_level_name() {
 }
 
 #[test]
-fn report_summary_uses_deployment_to_first_transfer_samples() {
-    let lifecycle_metrics = vec![
-        ContractLifecycleMetricPayload {
-            contract_address: "0xdeployonly".into(),
-            time_to_first_transfer_seconds: Some(0),
-            ..ContractLifecycleMetricPayload::default()
-        },
-        ContractLifecycleMetricPayload {
-            contract_address: "0xfast".into(),
-            time_to_first_transfer_seconds: Some(8),
-            ..ContractLifecycleMetricPayload::default()
-        },
-        ContractLifecycleMetricPayload {
-            contract_address: "0xslow".into(),
-            time_to_first_transfer_seconds: Some(20),
-            ..ContractLifecycleMetricPayload::default()
-        },
-    ];
-
-    let summary = build_report_summary(ReportSummaryInput {
-        open_license: false,
-        grouped: &BTreeMap::new(),
-        implausible_candidate_contract_count: 0,
-        legit_duplicates: &[],
-        infringing_tokens: &[],
-        malicious_addresses: &[],
-        honest_addresses: &[],
-        secondary_sale_victim_addresses: &[],
-        victim_acquisition_addresses: &[],
-        address_signals: &BTreeMap::new(),
-        address_attributions: &[],
-        value_flow_edges: &[],
-        propagation_paths: &BTreeMap::new(),
-        lifecycle_metrics: &lifecycle_metrics,
-    });
-
-    assert_eq!(summary.avg_deployment_to_first_transfer_seconds, Some(14.0));
-    assert_eq!(
-        summary.median_deployment_to_first_transfer_seconds,
-        Some(14.0)
-    );
-}
-
-#[test]
-fn report_summary_splits_operator_used_funds_from_victim_acquisition_cost() {
-    let secondary_sale_victims = vec![SecondarySaleVictimAddressPayload {
-        contract_address: "0xdup".into(),
-        address: "0xvictim".into(),
-        buy_tx_hashes: vec!["0xvictimbuy".into()],
-        buy_amount_eth: 1.5,
-        buy_amount_usd: 3000.0,
-        ..SecondarySaleVictimAddressPayload::default()
-    }];
-    let malicious_addresses = vec![MaliciousAddressPayload {
-        address: "0xoperator".into(),
-        wash_cycle_count: 2,
-        operator_level: 2,
-        operator_level_label: "likely_behavioral_operator".into(),
-        ..MaliciousAddressPayload::default()
-    }];
-    let address_attributions = vec![AddressAttributionPayload {
-        contract_address: "0xdup".into(),
-        address: "0xvictim".into(),
-        attribution_label: "likely_victim".into(),
-        evidence: vec![AddressEvidencePayload {
-            evidence_type: "paid_mint_payment".into(),
-            contract_address: "0xdup".into(),
-            tx_hash: "0xvictimmint".into(),
-            ..AddressEvidencePayload::default()
-        }],
-        ..AddressAttributionPayload::default()
-    }];
-    let value_flow_edges = vec![
-        ValueFlowEdgePayload {
-            contract_address: "0xdup".into(),
-            from_address: "0xvictim".into(),
-            tx_hash: "0xvictimmint".into(),
-            value_eth: Some(0.2),
-            value_usd: Some(400.0),
-            channel: "mint_payment".into(),
-            ..ValueFlowEdgePayload::default()
-        },
-        ValueFlowEdgePayload {
-            contract_address: "0xdup".into(),
-            from_address: "0xoperator".into(),
-            tx_hash: "0xwashsale".into(),
-            value_eth: Some(10.0),
-            value_usd: Some(20_000.0),
-            channel: "sale_payment".into(),
-            ..ValueFlowEdgePayload::default()
-        },
-        ValueFlowEdgePayload {
-            contract_address: "0xdup".into(),
-            from_address: "0xoperator".into(),
-            tx_hash: "0xoperatormint".into(),
-            value_eth: Some(0.5),
-            value_usd: Some(1_000.0),
-            channel: "mint_payment".into(),
-            ..ValueFlowEdgePayload::default()
-        },
-    ];
-
-    let summary = build_report_summary(ReportSummaryInput {
-        open_license: false,
-        grouped: &BTreeMap::new(),
-        implausible_candidate_contract_count: 0,
-        legit_duplicates: &[],
-        infringing_tokens: &[],
-        malicious_addresses: &malicious_addresses,
-        honest_addresses: &[],
-        secondary_sale_victim_addresses: &secondary_sale_victims,
-        victim_acquisition_addresses: &[],
-        address_signals: &BTreeMap::new(),
-        address_attributions: &address_attributions,
-        value_flow_edges: &value_flow_edges,
-        propagation_paths: &BTreeMap::new(),
-        lifecycle_metrics: &[],
-    });
-
-    assert_eq!(summary.secondary_sale_victim_cost_eth, 1.5);
-    assert_eq!(summary.paid_mint_victim_cost_eth, 0.2);
-    assert_eq!(summary.victim_acquisition_total_eth, 1.7);
-    assert_eq!(summary.operator_secondary_sale_cost_eth, 10.0);
-    assert_eq!(summary.operator_paid_mint_cost_eth, 0.5);
-    assert_eq!(summary.operator_acquisition_total_eth, 10.5);
-    assert_eq!(summary.operator_acquisition_address_count, 1);
-    assert_eq!(summary.operator_acquisition_edge_count, 2);
-    assert_eq!(summary.operator_level_stats.len(), 3);
-    let l2_stats = summary
-        .operator_level_stats
-        .iter()
-        .find(|item| item.level == 2)
-        .expect("L2 stats");
-    assert_eq!(l2_stats.address_count, 1);
-    assert_eq!(l2_stats.secondary_sale_cost_eth, 10.0);
-    assert_eq!(l2_stats.paid_mint_cost_eth, 0.5);
-    assert_eq!(l2_stats.acquisition_total_eth, 10.5);
-    assert_eq!(l2_stats.acquisition_edge_count, 2);
-}
-
-#[test]
-fn report_summary_ignores_zero_deployment_to_neutral_holder_samples() {
-    let honest_addresses = vec![
-        HonestAddressPayload {
-            address: "0xmintvictim".into(),
-            deployment_to_neutral_holder_seconds_samples: vec![0],
-            ..HonestAddressPayload::default()
-        },
-        HonestAddressPayload {
-            address: "0xpropagated1".into(),
-            deployment_to_neutral_holder_seconds_samples: vec![12],
-            ..HonestAddressPayload::default()
-        },
-        HonestAddressPayload {
-            address: "0xpropagated2".into(),
-            deployment_to_neutral_holder_seconds_samples: vec![20],
-            ..HonestAddressPayload::default()
-        },
-    ];
-
-    let summary = build_report_summary(ReportSummaryInput {
-        open_license: false,
-        grouped: &BTreeMap::new(),
-        implausible_candidate_contract_count: 0,
-        legit_duplicates: &[],
-        infringing_tokens: &[],
-        malicious_addresses: &[],
-        honest_addresses: &honest_addresses,
-        secondary_sale_victim_addresses: &[],
-        victim_acquisition_addresses: &[],
-        address_signals: &BTreeMap::new(),
-        address_attributions: &[],
-        value_flow_edges: &[],
-        propagation_paths: &BTreeMap::new(),
-        lifecycle_metrics: &[],
-    });
-
-    assert_eq!(summary.avg_deployment_to_neutral_holder_seconds, Some(16.0));
-    assert_eq!(
-        summary.median_deployment_to_neutral_holder_seconds,
-        Some(16.0)
-    );
-}
-
-#[test]
-fn report_summary_tracks_corrupted_address_holding_duration_stats() {
-    let honest_addresses = vec![
-        HonestAddressPayload {
-            address: "0xcorrupted-fast".into(),
-            is_corrupted_address: true,
-            hold_duration_median_seconds: Some(12.0),
-            ..HonestAddressPayload::default()
-        },
-        HonestAddressPayload {
-            address: "0xcorrupted-slow".into(),
-            is_corrupted_address: true,
-            hold_duration_median_seconds: Some(30.0),
-            ..HonestAddressPayload::default()
-        },
-        HonestAddressPayload {
-            address: "0xvictim-no-duration".into(),
-            is_corrupted_address: true,
-            hold_duration_median_seconds: None,
-            ..HonestAddressPayload::default()
-        },
-        HonestAddressPayload {
-            address: "0xplain-victim".into(),
-            is_corrupted_address: false,
-            hold_duration_median_seconds: Some(100.0),
-            ..HonestAddressPayload::default()
-        },
-    ];
-
-    let summary = build_report_summary(ReportSummaryInput {
-        open_license: false,
-        grouped: &BTreeMap::new(),
-        implausible_candidate_contract_count: 0,
-        legit_duplicates: &[],
-        infringing_tokens: &[],
-        malicious_addresses: &[],
-        honest_addresses: &honest_addresses,
-        secondary_sale_victim_addresses: &[],
-        victim_acquisition_addresses: &[],
-        address_signals: &BTreeMap::new(),
-        address_attributions: &[],
-        value_flow_edges: &[],
-        propagation_paths: &BTreeMap::new(),
-        lifecycle_metrics: &[],
-    });
-
-    assert_eq!(summary.corrupted_victim_address_count, 3);
-    assert_eq!(summary.avg_corrupted_address_holding_seconds, Some(21.0));
-    assert_eq!(summary.median_corrupted_address_holding_seconds, Some(21.0));
-}
-
-#[test]
-fn cached_payload_median_ignores_zero_deployment_to_first_transfer_samples() {
-    let payload = SingleReportPayload {
-        lifecycle_metrics: vec![
-            ContractLifecycleMetricPayload {
-                time_to_first_transfer_seconds: Some(0),
-                ..ContractLifecycleMetricPayload::default()
-            },
-            ContractLifecycleMetricPayload {
-                time_to_first_transfer_seconds: Some(12),
-                ..ContractLifecycleMetricPayload::default()
-            },
-        ],
-        ..SingleReportPayload::default()
-    };
-
-    assert_eq!(
-        payload_median_deployment_to_first_transfer_seconds(&payload),
-        Some(12.0)
-    );
-}
-
-#[test]
-fn cached_payload_median_ignores_zero_deployment_to_neutral_holder_samples() {
-    let payload = SingleReportPayload {
-        honest_addresses: vec![
-            HonestAddressPayload {
-                deployment_to_neutral_holder_seconds_samples: vec![0],
-                ..HonestAddressPayload::default()
-            },
-            HonestAddressPayload {
-                deployment_to_neutral_holder_seconds_samples: vec![12, 20],
-                ..HonestAddressPayload::default()
-            },
-        ],
-        ..SingleReportPayload::default()
-    };
-
-    assert_eq!(
-        payload_median_deployment_to_neutral_holder_seconds(&payload),
-        Some(16.0)
-    );
-}
-
-#[test]
-fn report_summary_separates_secondary_sale_and_paid_mint_victim_costs() {
+fn victim_acquisition_separates_secondary_sale_and_paid_mint_costs() {
     let secondary_sale_victim_addresses = vec![SecondarySaleVictimAddressPayload {
         contract_address: "0xdup".into(),
         address: "0xsalevictim".into(),
@@ -418,32 +110,49 @@ fn report_summary_separates_secondary_sale_and_paid_mint_victim_costs() {
         &propagation_paths,
     );
 
-    let summary = build_report_summary(ReportSummaryInput {
-        open_license: false,
-        grouped: &BTreeMap::new(),
-        implausible_candidate_contract_count: 0,
-        legit_duplicates: &[],
-        infringing_tokens: &[],
-        malicious_addresses: &[],
-        honest_addresses: &[],
-        secondary_sale_victim_addresses: &secondary_sale_victim_addresses,
-        victim_acquisition_addresses: &victim_acquisition_addresses,
-        address_signals: &BTreeMap::new(),
-        address_attributions: &address_attributions,
-        value_flow_edges: &value_flow_edges,
-        propagation_paths: &propagation_paths,
-        lifecycle_metrics: &[],
-    });
-
-    assert_eq!(summary.secondary_sale_victim_cost_eth, 0.5);
-    assert_eq!(summary.secondary_sale_stuck_cost_eth, 0.25);
-    assert_eq!(summary.paid_mint_victim_cost_eth, 2.0);
-    assert_eq!(summary.paid_mint_victim_cost_usd, 4_000.0);
-    assert_eq!(summary.paid_mint_stuck_cost_eth, 1.0);
-    assert_eq!(summary.paid_mint_stuck_cost_usd, 2_000.0);
-    assert_eq!(summary.victim_acquisition_total_eth, 2.5);
-    assert_eq!(summary.victim_acquisition_stuck_cost_eth, 1.25);
-    assert_eq!(summary.victim_acquisition_address_count, 2);
+    assert_eq!(victim_acquisition_addresses.len(), 2);
+    assert_eq!(
+        victim_acquisition_addresses
+            .iter()
+            .map(|item| item.secondary_sale_cost_eth)
+            .sum::<f64>(),
+        0.5
+    );
+    assert_eq!(
+        victim_acquisition_addresses
+            .iter()
+            .map(|item| item.secondary_sale_stuck_cost_eth)
+            .sum::<f64>(),
+        0.25
+    );
+    assert_eq!(
+        victim_acquisition_addresses
+            .iter()
+            .map(|item| item.paid_mint_cost_eth)
+            .sum::<f64>(),
+        2.0
+    );
+    assert_eq!(
+        victim_acquisition_addresses
+            .iter()
+            .map(|item| item.paid_mint_cost_usd)
+            .sum::<f64>(),
+        4_000.0
+    );
+    assert_eq!(
+        victim_acquisition_addresses
+            .iter()
+            .map(|item| item.paid_mint_stuck_cost_eth)
+            .sum::<f64>(),
+        1.0
+    );
+    assert_eq!(
+        victim_acquisition_addresses
+            .iter()
+            .map(|item| item.paid_mint_stuck_cost_usd)
+            .sum::<f64>(),
+        2_000.0
+    );
 }
 
 #[test]
@@ -454,9 +163,6 @@ fn victim_acquisition_ratio_uses_total_cost_for_all_acquisition_channels() {
         buy_tx_hashes: vec!["0xbuy".into()],
         buy_amount_eth: 4.0,
         buy_amount_usd: 4_000.0,
-        buy_before_eth_balance: Some(10.0),
-        buy_before_usd_balance: Some(10_000.0),
-        buy_asset_ratio: Some(0.4),
         ..SecondarySaleVictimAddressPayload::default()
     }];
     let address_attributions = vec![AddressAttributionPayload {
@@ -481,6 +187,8 @@ fn victim_acquisition_ratio_uses_total_cost_for_all_acquisition_channels() {
         token_id: "1".into(),
         value_eth: Some(3.0),
         value_usd: Some(3_000.0),
+        from_before_eth_balance: Some(10.0),
+        from_before_usd_balance: Some(10_000.0),
         channel: "mint_payment".into(),
         ..ValueFlowEdgePayload::default()
     }];
@@ -498,40 +206,22 @@ fn victim_acquisition_ratio_uses_total_cost_for_all_acquisition_channels() {
     );
     assert_eq!(victim_acquisition_addresses[0].buy_asset_ratio, Some(0.7));
 
-    let summary = build_report_summary(ReportSummaryInput {
-        open_license: false,
-        grouped: &BTreeMap::new(),
-        implausible_candidate_contract_count: 0,
-        legit_duplicates: &[],
-        infringing_tokens: &[],
-        malicious_addresses: &[],
-        honest_addresses: &[],
-        secondary_sale_victim_addresses: &secondary_sale_victim_addresses,
-        victim_acquisition_addresses: &victim_acquisition_addresses,
-        address_signals: &BTreeMap::new(),
-        address_attributions: &address_attributions,
-        value_flow_edges: &value_flow_edges,
-        propagation_paths: &BTreeMap::new(),
-        lifecycle_metrics: &[],
-    });
-
-    assert_eq!(summary.buy_asset_ratio_known_address_count, 1);
-    assert_eq!(summary.ratio_over_60_address_count, 1);
-    assert_eq!(summary.ratio_over_60_address_ratio, Some(1.0));
+    let buy_ratios: Vec<f64> = victim_acquisition_addresses
+        .iter()
+        .filter_map(|item| item.buy_asset_ratio)
+        .collect();
+    assert_eq!(buy_ratios.len(), 1);
+    assert_eq!(buy_ratios.iter().filter(|value| **value > 0.6).count(), 1);
 }
 
 #[test]
-fn victim_acquisition_ratio_with_gas_preserves_secondary_sale_gas_delta() {
+fn victim_acquisition_ratio_with_gas_uses_paid_mint_gas_delta() {
     let secondary_sale_victim_addresses = vec![SecondarySaleVictimAddressPayload {
         contract_address: "0xdup".into(),
         address: "0xvictim".into(),
         buy_tx_hashes: vec!["0xbuy".into()],
         buy_amount_eth: 4.0,
         buy_amount_usd: 4_000.0,
-        buy_before_eth_balance: Some(10.0),
-        buy_before_usd_balance: Some(10_000.0),
-        buy_asset_ratio: Some(0.4),
-        buy_asset_ratio_with_gas: Some(0.45),
         ..SecondarySaleVictimAddressPayload::default()
     }];
     let address_attributions = vec![AddressAttributionPayload {
@@ -556,6 +246,10 @@ fn victim_acquisition_ratio_with_gas_preserves_secondary_sale_gas_delta() {
         token_id: "1".into(),
         value_eth: Some(3.0),
         value_usd: Some(3_000.0),
+        value_with_gas_eth: Some(3.5),
+        value_with_gas_usd: Some(3_500.0),
+        from_before_eth_balance: Some(10.0),
+        from_before_usd_balance: Some(10_000.0),
         channel: "mint_payment".into(),
         ..ValueFlowEdgePayload::default()
     }];
@@ -607,26 +301,22 @@ fn paid_mint_only_victim_ratio_uses_observed_pre_mint_eth_balance() {
         &value_flow_edges,
         &BTreeMap::new(),
     );
-    let summary = build_report_summary(ReportSummaryInput {
-        open_license: false,
-        grouped: &BTreeMap::new(),
-        implausible_candidate_contract_count: 0,
-        legit_duplicates: &[],
-        infringing_tokens: &[],
-        malicious_addresses: &[],
-        honest_addresses: &[],
-        secondary_sale_victim_addresses: &[],
-        victim_acquisition_addresses: &victim_acquisition_addresses,
-        address_signals: &BTreeMap::new(),
-        address_attributions: &address_attributions,
-        value_flow_edges: &value_flow_edges,
-        propagation_paths: &BTreeMap::new(),
-        lifecycle_metrics: &[],
-    });
-
     assert_eq!(victim_acquisition_addresses[0].buy_asset_ratio, Some(0.7));
-    assert_eq!(summary.buy_asset_ratio_known_address_count, 1);
-    assert_eq!(summary.ratio_over_60_address_count, 1);
+    assert_eq!(
+        victim_acquisition_addresses
+            .iter()
+            .filter(|item| item.buy_asset_ratio.is_some())
+            .count(),
+        1
+    );
+    assert_eq!(
+        victim_acquisition_addresses
+            .iter()
+            .filter_map(|item| item.buy_asset_ratio)
+            .filter(|value| *value > 0.6)
+            .count(),
+        1
+    );
 }
 
 #[test]

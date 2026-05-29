@@ -68,6 +68,79 @@ fn cli_accepts_custom_other_api_rate_limit_refill_ms() {
 }
 
 #[test]
+fn cli_accepts_paper_statistics_threshold_flags() {
+    let analyze = TopContractAnalysisCli::parse_from([
+        "top_contract_analysis_rs",
+        "analyze",
+        "--seed-contract-address",
+        "0xseed",
+        "--paper-min-cycle-size",
+        "3",
+        "--paper-min-path-length",
+        "4",
+        "--paper-center-fanout-threshold",
+        "5",
+        "--paper-concentration-top-pct",
+        "0.2",
+    ]);
+    let CliCommand::Analyze(analyze_args) = analyze.command else {
+        panic!("expected analyze command");
+    };
+    assert_eq!(analyze_args.paper_min_cycle_size, 3);
+    assert_eq!(analyze_args.paper_min_path_length, 4);
+    assert_eq!(analyze_args.paper_center_fanout_threshold, 5);
+    assert_eq!(analyze_args.paper_concentration_top_pct, 0.2);
+
+    let batch = TopContractAnalysisCli::parse_from([
+        "top_contract_analysis_rs",
+        "batch",
+        "--seed-file",
+        "seeds.txt",
+        "--paper-min-cycle-size",
+        "2",
+        "--paper-min-path-length",
+        "6",
+        "--paper-center-fanout-threshold",
+        "4",
+        "--paper-concentration-top-pct",
+        "0.15",
+    ]);
+    let CliCommand::Batch(batch_args) = batch.command else {
+        panic!("expected batch command");
+    };
+    assert_eq!(batch_args.paper_min_cycle_size, 2);
+    assert_eq!(batch_args.paper_min_path_length, 6);
+    assert_eq!(batch_args.paper_center_fanout_threshold, 4);
+    assert_eq!(batch_args.paper_concentration_top_pct, 0.15);
+}
+
+#[test]
+fn analyze_subcommand_rejects_removed_paper_top_k_flag() {
+    Command::cargo_bin("top_contract_analysis_rs")
+        .unwrap()
+        .args([
+            "analyze",
+            "--seed-contract-address",
+            "0xseed",
+            "--paper-top-k",
+            "7",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("unexpected argument"));
+}
+
+#[test]
+fn batch_subcommand_rejects_removed_paper_top_k_flag() {
+    Command::cargo_bin("top_contract_analysis_rs")
+        .unwrap()
+        .args(["batch", "--seed-file", "seeds.txt", "--paper-top-k", "7"])
+        .assert()
+        .failure()
+        .stderr(contains("unexpected argument"));
+}
+
+#[test]
 fn analyze_subcommand_accepts_existing_flag_names() {
     Command::cargo_bin("top_contract_analysis_rs")
         .unwrap()
@@ -178,7 +251,7 @@ fn batch_subcommand_rejects_removed_seed_metadata_concurrency_flag() {
 }
 
 #[test]
-fn batch_subcommand_rejects_removed_sale_metric_concurrency_flag() {
+fn batch_subcommand_rejects_removed_legacy_concurrency_flag() {
     Command::cargo_bin("top_contract_analysis_rs")
         .unwrap()
         .args([

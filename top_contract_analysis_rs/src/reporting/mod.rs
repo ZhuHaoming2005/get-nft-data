@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 
 use once_cell::sync::Lazy;
@@ -6,7 +6,10 @@ use regex::Regex;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::error::AppError;
-use crate::models::{BatchSummaryPayload, SingleReportPayload};
+use crate::models::{
+    BatchSummaryPayload, PaperContractBehaviorStatsPayload, PaperHonestBuyerRowPayload,
+    PaperStatsPayload, SingleReportPayload,
+};
 
 static SLUG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[^0-9a-zA-Z\u{4e00}-\u{9fff}]+").unwrap());
 
@@ -28,37 +31,15 @@ fn format_ratio(value: Option<f64>) -> String {
         .unwrap_or_else(|| "n/a".into())
 }
 
-fn cost_ratio(
-    stuck_cost_usd: f64,
-    acquisition_cost_usd: f64,
-    stuck_cost_eth: f64,
-    acquisition_cost_eth: f64,
-) -> Option<f64> {
-    if acquisition_cost_usd > 0.0 {
-        Some(stuck_cost_usd / acquisition_cost_usd)
-    } else if acquisition_cost_eth > 0.0 {
-        Some(stuck_cost_eth / acquisition_cost_eth)
-    } else {
-        None
+fn format_number(value: f64) -> String {
+    if value == 0.0 {
+        return "0".into();
     }
-}
-
-fn format_scalar(value: Option<f64>) -> String {
-    value
-        .map(|number| number.to_string())
-        .unwrap_or_else(|| "n/a".into())
-}
-
-fn format_reason_counts(reasons: BTreeMap<String, i64>) -> String {
-    if reasons.is_empty() {
-        "无".into()
-    } else {
-        reasons
-            .into_iter()
-            .map(|(reason, count)| format!("{reason}={count}"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
+    let formatted = format!("{value:.6}");
+    formatted
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
 }
 
 pub fn default_output_basename(payload: &SingleReportPayload) -> String {
@@ -115,7 +96,7 @@ pub fn write_outputs_to_directory(
     Ok((json_path, md_path))
 }
 
-pub fn write_batch_summary_outputs(
+pub fn write_batch_paper_stats_outputs(
     payload: &BatchSummaryPayload,
     output_dir: &Path,
 ) -> Result<(PathBuf, PathBuf), AppError> {
@@ -130,11 +111,9 @@ pub fn write_batch_summary_outputs(
 
 pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
     let seed = &payload.seed_contract;
-    let seed_stats = &payload.seed_collection_stats;
-    let summary = &payload.report_summary;
 
     let mut lines = vec![
-        "# Top NFT 合约重复样本分析报告".to_string(),
+        "# NFT 论文统计报告".to_string(),
         String::new(),
         "## 种子合约".to_string(),
         format!("- 链: {}", seed.chain),
@@ -151,478 +130,313 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
             }
         ),
         format!("- 部署区块: {}", seed.deployed_block_number),
-        String::new(),
-        "## 摘要".to_string(),
-        format!(
-            "- 检测到开放许可: {}",
-            if summary.open_license_detected {
-                "是"
-            } else {
-                "否"
-            }
-        ),
-        format!("- 重复候选合约数: {}", summary.candidate_contract_count),
-        format!(
-            "- 不合理候选合约数: {}",
-            summary.implausible_candidate_contract_count
-        ),
-        format!("- 疑似侵权 NFT 总数: {}", summary.infringing_nft_count),
-        format!("- 疑似操作者地址数: {}", summary.malicious_address_count),
-        format!("- 中性地址数: {}", summary.neutral_address_count),
-        format!("- 受害者数: {}", summary.victim_acquisition_address_count),
-        format!(
-            "- 多次侵权地址数: {}",
-            summary.repeat_infringing_address_count
-        ),
-        format!(
-            "- 归为官方参与型重复的合约数: {}",
-            summary.legit_duplicate_contract_count
-        ),
-        format!(
-            "- 候选侧开放许可 token 数: {}",
-            summary.candidate_open_license_token_count
-        ),
-        format!(
-            "- 候选侧开放许可合约数: {}",
-            summary.candidate_open_license_contract_count
-        ),
-        format!(
-            "- 受害者获取成本合计(USD): {}",
-            summary.victim_acquisition_total_usd
-        ),
-        format!(
-            "- 受害者套牢成本合计(USD): {} / {}",
-            summary.victim_acquisition_stuck_cost_usd,
-            format_ratio(summary.victim_acquisition_stuck_cost_ratio)
-        ),
-        format!(
-            "- 二级市场受害者成本(USD): {} / addresses={}",
-            summary.secondary_sale_victim_cost_usd, summary.secondary_sale_victim_address_count
-        ),
-        format!(
-            "- 二级市场套牢资金(USD): {} / {}",
-            summary.secondary_sale_stuck_cost_usd,
-            format_ratio(summary.secondary_sale_stuck_cost_ratio)
-        ),
-        format!(
-            "- 付费 mint 受害者成本(USD): {}",
-            summary.paid_mint_victim_cost_usd
-        ),
-        format!(
-            "- 操作者使用资金合计(USD): {} / addresses={} / edges={}",
-            summary.operator_acquisition_total_usd,
-            summary.operator_acquisition_address_count,
-            summary.operator_acquisition_edge_count
-        ),
-        format!(
-            "- 操作者二级市场使用资金(USD): {}",
-            summary.operator_secondary_sale_cost_usd
-        ),
-        format!(
-            "- 操作者付费 mint 使用资金(USD): {}",
-            summary.operator_paid_mint_cost_usd
-        ),
-        format!(
-            "- 付费 mint 套牢成本(USD): {} / edges={} / tokens={}",
-            summary.paid_mint_stuck_cost_usd,
-            summary.paid_mint_stuck_edge_count,
-            summary.paid_mint_stuck_token_count
-        ),
-        format!(
-            "- ERC20 稳定币有价资金流(USD): {} / edges={}",
-            summary.stablecoin_erc20_value_usd, summary.stablecoin_erc20_edge_count
-        ),
-        format!(
-            "- 有 USD 定价/仅 ETH 定价资金流边: {} / {}",
-            summary.value_flow_priced_edge_count, summary.value_flow_unpriced_edge_count
-        ),
-        format!(
-            "- 可计算获取成本占比的受害者数: {}",
-            summary.buy_asset_ratio_known_address_count
-        ),
-        format!(
-            "- 获取成本占购买前 ETH 余额估算 >60% 的受害者数/占比: {} / {}",
-            summary.ratio_over_60_address_count,
-            format_ratio(summary.ratio_over_60_address_ratio)
-        ),
-        format!(
-            "- 获取成本占购买前 ETH 余额估算 >80% 的受害者数/占比: {} / {}",
-            summary.ratio_over_80_address_count,
-            format_ratio(summary.ratio_over_80_address_ratio)
-        ),
-        format!(
-            "- 套牢受害者数/占比: {} / {}",
-            summary.stuck_victim_address_count,
-            format_ratio(summary.stuck_victim_address_ratio)
-        ),
-        format!(
-            "- 被腐化受害者数: {}",
-            summary.corrupted_victim_address_count
-        ),
-        format!(
-            "- 被腐化受害者持有时长平均数: {} 秒",
-            format_scalar(summary.avg_corrupted_address_holding_seconds)
-        ),
-        format!(
-            "- 被腐化受害者持有时长中位数: {} 秒",
-            format_scalar(summary.median_corrupted_address_holding_seconds)
-        ),
-        format!(
-            "- 部署到中性地址首次接收平均时间: {} 秒",
-            format_scalar(summary.avg_deployment_to_neutral_holder_seconds)
-        ),
-        format!(
-            "- 部署到中性地址首次接收中位数: {} 秒",
-            format_scalar(summary.median_deployment_to_neutral_holder_seconds)
-        ),
-        format!(
-            "- 部署到首次转手平均时间: {} 秒",
-            format_scalar(summary.avg_deployment_to_first_transfer_seconds)
-        ),
-        format!(
-            "- 部署到首次转手中位数: {} 秒",
-            format_scalar(summary.median_deployment_to_first_transfer_seconds)
-        ),
-        format!(
-            "- 候选合约平均唯一接收钱包数: {}",
-            format_scalar(summary.avg_unique_receiver_count)
-        ),
-        String::new(),
-        "## 种子集合统计".to_string(),
-        format!("- 拉取到的种子 NFT 数: {}", seed_stats.seed_nft_count),
-        format!("- 唯一 token URI 数: {}", seed_stats.unique_token_uri_count),
-        format!("- 唯一 image URI 数: {}", seed_stats.unique_image_uri_count),
-        format!("- 唯一规范化名称数: {}", seed_stats.unique_name_count),
-        format!("- 唯一规范化符号数: {}", seed_stats.unique_symbol_count),
     ];
 
-    let duplicate_candidate_total = payload
-        .duplicate_contracts
-        .iter()
-        .map(|item| item.candidate_count)
-        .sum::<i64>();
-    let legit_candidate_total = payload
-        .legit_duplicates
-        .iter()
-        .map(|item| item.candidate_count)
-        .sum::<i64>();
-    let mut match_reason_counts = BTreeMap::<String, i64>::new();
-    for item in &payload.duplicate_contracts {
-        for reason in &item.match_reasons {
-            *match_reason_counts.entry(reason.clone()).or_default() += 1;
-        }
-    }
-    let mut official_reason_counts = BTreeMap::<String, i64>::new();
-    for item in &payload.legit_duplicates {
-        if !item.mint_recipients.is_empty() {
-            *official_reason_counts
-                .entry("mint 接收地址命中官方地址规则".into())
-                .or_default() += 1;
-        }
-        for reason in &item.exclusion_reasons {
-            *official_reason_counts.entry(reason.clone()).or_default() += 1;
-        }
-    }
-    let total_usd_priced_sale_count = payload
-        .fraud_trade_stats
-        .values()
-        .map(|stats| stats.usd_priced_sale_count.unwrap_or_default())
-        .sum::<i64>();
-    let total_usd_priced_volume = payload
-        .fraud_trade_stats
-        .values()
-        .map(|stats| stats.usd_priced_volume.unwrap_or_default())
-        .sum::<f64>();
-    let total_unique_buyers = payload
-        .fraud_trade_stats
-        .values()
-        .map(|stats| stats.unique_buyers)
-        .sum::<i64>();
-
-    lines.extend([
-        String::new(),
-        "## 合约分类摘要".to_string(),
-        format!("- 疑似重复合约数: {}", payload.duplicate_contracts.len()),
-        format!("- 疑似重复 NFT 数: {}", duplicate_candidate_total),
-        format!(
-            "- 命中原因分布: {}",
-            format_reason_counts(match_reason_counts)
-        ),
-        format!("- 官方参与型重复合约数: {}", payload.legit_duplicates.len()),
-        format!("- 官方参与型重复 NFT 数: {}", legit_candidate_total),
-        format!(
-            "- 官方参与型判定原因分布: {}",
-            format_reason_counts(official_reason_counts)
-        ),
-        String::new(),
-        "## 资金与交易摘要".to_string(),
-        format!("- 有定价销售记录数: {}", total_usd_priced_sale_count),
-        format!("- 有定价销售额(USD): {}", total_usd_priced_volume),
-        format!(
-            "- 受害者获取成本合计(USD): {} / addresses={}",
-            summary.victim_acquisition_total_usd, summary.victim_acquisition_address_count
-        ),
-        format!(
-            "- 二级市场受害者成本(USD): {} / addresses={}",
-            summary.secondary_sale_victim_cost_usd, summary.secondary_sale_victim_address_count
-        ),
-        format!(
-            "- 付费 mint 受害者成本(USD): {} / edges={} / addresses={}",
-            summary.paid_mint_victim_cost_usd,
-            summary.paid_mint_victim_edge_count,
-            summary.paid_mint_victim_address_count
-        ),
-        format!("- 唯一买家计数合计: {}", total_unique_buyers),
-        format!("- 套牢受害者钱包数: {}", summary.stuck_victim_address_count),
-        format!(
-            "- 二级市场套牢资金(USD): {}",
-            summary.secondary_sale_stuck_cost_usd
-        ),
-        format!(
-            "- 总套牢成本(USD): {} / {}",
-            summary.victim_acquisition_stuck_cost_usd,
-            format_ratio(summary.victim_acquisition_stuck_cost_ratio)
-        ),
-    ]);
+    append_paper_stats_sections(&mut lines, &payload.paper_stats);
 
     lines.join("\n") + "\n"
 }
 
 pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> String {
-    let summary = &payload.batch_summary;
-    let paid_mint_stuck_cost_ratio_overall = cost_ratio(
-        summary.paid_mint_stuck_cost_usd_total,
-        summary.paid_mint_victim_cost_usd_total,
-        summary.paid_mint_stuck_cost_eth_total,
-        summary.paid_mint_victim_cost_eth_total,
-    );
-    let mut lines = vec![
-        "# Top NFT 合约批量分析总报告".to_string(),
-        String::new(),
-        "## 汇总".to_string(),
-        format!("- 种子合约报告数: {}", summary.seed_report_count),
-        format!(
-            "- 链: {}",
-            if !summary.chain.trim().is_empty() {
-                summary.chain.clone()
-            } else if !summary.chains.is_empty() {
-                summary.chains.join(", ")
-            } else {
-                "unknown".into()
-            }
-        ),
-        format!(
-            "- 检测到开放许可的 seed 数: {}",
-            summary.open_license_detected_count
-        ),
-        format!(
-            "- 重复候选合约总数: {}",
-            summary.candidate_contract_count_total
-        ),
-        format!(
-            "- 不合理候选合约总数: {}",
-            summary.implausible_candidate_contract_count_total
-        ),
-        format!(
-            "- 疑似侵权 NFT 总数: {}",
-            summary.infringing_nft_count_total
-        ),
-        format!(
-            "- 疑似操作者地址数(全局去重): {}",
-            summary.malicious_address_count_total
-        ),
-        format!(
-            "- 中性地址数(全局去重): {}",
-            summary.neutral_address_count_total
-        ),
-        format!(
-            "- 受害者地址数(全局去重): {}",
-            summary.victim_acquisition_address_count_distinct
-        ),
-        format!(
-            "- 受害者地址观测数(按 seed 求和): {}",
-            summary.victim_acquisition_address_count_total
-        ),
-        format!(
-            "- 多次侵权地址观测数(与单 seed 口径一致，按 seed 求和): {}",
-            summary.repeat_infringing_address_count_total
-        ),
-        format!(
-            "- 多次侵权地址数(与单 seed 口径一致，全局去重): {}",
-            summary.repeat_infringing_address_count_global
-        ),
-        format!(
-            "- 官方参与型重复合约总数: {}",
-            summary.legit_duplicate_contract_count_total
-        ),
-        format!(
-            "- 受害者获取成本(USD)汇总: {}",
-            summary.victim_acquisition_total_usd_total
-        ),
-        format!(
-            "- 总套牢成本(USD)汇总: {} / {}",
-            summary.victim_acquisition_stuck_cost_usd_total,
-            format_ratio(summary.victim_acquisition_stuck_cost_ratio_overall)
-        ),
-        format!(
-            "- 二级市场获取成本(USD)汇总: {} / 套牢成本(USD)={} / 套牢占比={} / addresses={}",
-            summary.secondary_sale_victim_cost_usd_total,
-            summary.secondary_sale_stuck_cost_usd_total,
-            format_ratio(summary.secondary_sale_stuck_cost_ratio_overall),
-            summary.secondary_sale_victim_address_count_total
-        ),
-        format!(
-            "- 付费 mint 获取成本(USD)汇总: {} / 套牢成本(USD)={} / 套牢占比={} / edges={} / addresses={} / stuck_edges={} / stuck_tokens={}",
-            summary.paid_mint_victim_cost_usd_total,
-            summary.paid_mint_stuck_cost_usd_total,
-            format_ratio(paid_mint_stuck_cost_ratio_overall),
-            summary.paid_mint_victim_edge_count_total,
-            summary.paid_mint_victim_address_count_total,
-            summary.paid_mint_stuck_edge_count_total,
-            summary.paid_mint_stuck_token_count_total
-        ),
-        format!(
-            "- 操作者使用资金(USD)汇总: {} / 全局地址={} / 观测地址={} / edges={}",
-            summary.operator_acquisition_total_usd_total,
-            summary.operator_acquisition_address_count_distinct,
-            summary.operator_acquisition_address_count_total,
-            summary.operator_acquisition_edge_count_total
-        ),
-        format!(
-            "- 操作者二级市场使用资金(USD)汇总: {}",
-            summary.operator_secondary_sale_cost_usd_total
-        ),
-        format!(
-            "- 操作者付费 mint 使用资金(USD)汇总: {}",
-            summary.operator_paid_mint_cost_usd_total
-        ),
-        format!(
-            "- ERC20 稳定币有价资金流(USD)汇总: {} / edges={}",
-            summary.stablecoin_erc20_value_usd_total, summary.stablecoin_erc20_edge_count_total
-        ),
-        format!(
-            "- 可计算获取成本占比的受害者总数: {}",
-            summary.buy_asset_ratio_known_address_count_total
-        ),
-        format!(
-            "- 获取成本占购买前 ETH 余额估算 >60% 的受害者数/总体占比: {} / {}",
-            summary.ratio_over_60_address_count_total,
-            format_ratio(summary.ratio_over_60_address_ratio_overall)
-        ),
-        format!(
-            "- 获取成本占购买前 ETH 余额估算 >80% 的受害者数/总体占比: {} / {}",
-            summary.ratio_over_80_address_count_total,
-            format_ratio(summary.ratio_over_80_address_ratio_overall)
-        ),
-        format!(
-            "- 套牢受害者地址数(全局去重)/占比: {} / {}",
-            summary.stuck_victim_address_count_distinct,
-            format_ratio(summary.stuck_victim_address_ratio_distinct)
-        ),
-        format!(
-            "- 套牢受害者地址观测数(按 seed 求和)/占比: {} / {}",
-            summary.stuck_victim_address_count_total,
-            format_ratio(summary.stuck_victim_address_ratio_overall)
-        ),
-        format!(
-            "- 被腐化受害者地址数(全局去重): {}",
-            summary.corrupted_victim_address_count_distinct
-        ),
-        format!(
-            "- 被腐化受害者地址观测数(按 seed 求和): {}",
-            summary.corrupted_victim_address_count_total
-        ),
-        format!(
-            "- 被腐化受害者持有时长平均数(跨 seed 均值): {} 秒",
-            format_scalar(summary.avg_corrupted_address_holding_seconds_mean)
-        ),
-        format!(
-            "- 被腐化受害者持有时长中位数(跨 seed 中位数): {} 秒",
-            format_scalar(summary.median_corrupted_address_holding_seconds_median)
-        ),
-        format!(
-            "- 部署到中性地址首次接收平均时间(跨 seed 均值): {} 秒",
-            format_scalar(summary.avg_deployment_to_neutral_holder_seconds_mean)
-        ),
-        format!(
-            "- 部署到中性地址首次接收中位数(跨 seed 中位数): {} 秒",
-            format_scalar(summary.median_deployment_to_neutral_holder_seconds_median)
-        ),
-        format!(
-            "- 部署到首次转手平均时间(跨 seed 均值): {} 秒",
-            format_scalar(summary.avg_deployment_to_first_transfer_seconds_mean)
-        ),
-        format!(
-            "- 部署到首次转手中位数(跨 seed 中位数): {} 秒",
-            format_scalar(summary.median_deployment_to_first_transfer_seconds_median)
-        ),
-        format!(
-            "- 候选合约平均唯一接收钱包数(跨 seed 均值): {}",
-            format_scalar(summary.avg_unique_receiver_count_mean)
-        ),
-        format!("- 生成时间(UTC): {}", summary.generated_at),
-        String::new(),
-        "## Seed 报告索引".to_string(),
-    ];
+    let mut lines = vec!["# NFT 论文统计批量报告".to_string(), String::new()];
 
-    if payload.seed_reports.is_empty() {
-        lines.push("- 无".to_string());
-    } else {
-        for item in &payload.seed_reports {
-            let seed = &item.seed_contract;
-            let report_summary = &item.report_summary;
-            let output_files = item.output_files.as_ref();
-            let seed_name = if seed.name.is_empty() {
-                if seed.contract_address.is_empty() {
-                    "unknown"
-                } else {
-                    &seed.contract_address
-                }
-            } else {
-                &seed.name
-            };
-            let paid_mint_stuck_cost_ratio = cost_ratio(
-                report_summary.paid_mint_stuck_cost_usd,
-                report_summary.paid_mint_victim_cost_usd,
-                report_summary.paid_mint_stuck_cost_eth,
-                report_summary.paid_mint_victim_cost_eth,
-            );
-
-            lines.push(format!(
-                "- {} ({}) | 重复合约={} | 侵权NFT={} | 疑似操作者={} | 中性地址={} | 受害者={} | 多次侵权地址={} | 官方参与={} | 受害者获取成本(USD)={} | 二级获取(USD)={} | 二级套牢(USD)={}/{} | 付费mint获取(USD)={} | 付费mint套牢(USD)={}/{} | 总套牢(USD)={}/{} | >60%={}/{} | 套牢受害者={}/{} | 被腐化受害者={} | 部署到中性接收平均={}秒 | 部署到中性接收中位={}秒 | 部署到首次转手中位={}秒 | JSON={} | MD={}",
-                seed_name,
-                seed.contract_address,
-                report_summary.candidate_contract_count,
-                report_summary.infringing_nft_count,
-                report_summary.malicious_address_count,
-                report_summary.neutral_address_count,
-                report_summary.victim_acquisition_address_count,
-                report_summary.repeat_infringing_address_count,
-                report_summary.legit_duplicate_contract_count,
-                report_summary.victim_acquisition_total_usd,
-                report_summary.secondary_sale_victim_cost_usd,
-                report_summary.secondary_sale_stuck_cost_usd,
-                format_ratio(report_summary.secondary_sale_stuck_cost_ratio),
-                report_summary.paid_mint_victim_cost_usd,
-                report_summary.paid_mint_stuck_cost_usd,
-                format_ratio(paid_mint_stuck_cost_ratio),
-                report_summary.victim_acquisition_stuck_cost_usd,
-                format_ratio(report_summary.victim_acquisition_stuck_cost_ratio),
-                report_summary.ratio_over_60_address_count,
-                format_ratio(report_summary.ratio_over_60_address_ratio),
-                report_summary.stuck_victim_address_count,
-                format_ratio(report_summary.stuck_victim_address_ratio),
-                report_summary.corrupted_victim_address_count,
-                format_scalar(report_summary.avg_deployment_to_neutral_holder_seconds),
-                format_scalar(report_summary.median_deployment_to_neutral_holder_seconds),
-                format_scalar(report_summary.median_deployment_to_first_transfer_seconds),
-                output_files.map(|files| files.json.as_str()).unwrap_or(""),
-                output_files
-                    .map(|files| files.markdown.as_str())
-                    .unwrap_or("")
-            ));
-        }
-    }
+    append_paper_stats_sections(&mut lines, &payload.paper_stats);
 
     lines.join("\n") + "\n"
+}
+
+fn append_paper_stats_sections(lines: &mut Vec<String>, stats: &PaperStatsPayload) {
+    append_duplicate_scale(lines, stats);
+    append_address_classification(lines, stats);
+    append_attacker_cost(lines, stats);
+    append_honest_loss(lines, stats);
+    append_behavior_summary(lines, stats);
+    append_data_quality(lines, stats);
+    append_contract_behavior_details(lines, stats);
+}
+
+fn append_duplicate_scale(lines: &mut Vec<String>, stats: &PaperStatsPayload) {
+    lines.extend([
+        String::new(),
+        "## 重复规模".to_string(),
+        "| 类别 | 重复 NFT 数 | NFT 占比 | 重复合约数 | 合约占比 |".to_string(),
+        "| --- | ---: | ---: | ---: | ---: |".to_string(),
+    ]);
+    for row in &stats.duplicate_scale {
+        lines.push(format!(
+            "| {} | {} | {} ({}/{}) | {} | {} ({}/{}) |",
+            row.category,
+            row.duplicate_nft_count,
+            format_ratio(row.duplicate_nft_ratio),
+            row.duplicate_nft_ratio_numerator,
+            row.duplicate_nft_ratio_denominator,
+            row.duplicate_contract_count,
+            format_ratio(row.duplicate_contract_ratio),
+            row.duplicate_contract_ratio_numerator,
+            row.duplicate_contract_ratio_denominator
+        ));
+    }
+}
+
+fn append_address_classification(lines: &mut Vec<String>, stats: &PaperStatsPayload) {
+    let address = &stats.address_classification;
+    lines.extend([
+        String::new(),
+        "## 地址分类".to_string(),
+        format!("- 恶意地址数: {}", address.malicious_address_count),
+        format!(
+            "- 跨合约重复侵权恶意地址数: {}",
+            address.repeat_infringing_malicious_address_count
+        ),
+        format!("- 诚实买家地址数: {}", address.honest_address_count),
+        format!("- 地址总数: {}", address.total_address_count),
+    ]);
+}
+
+fn append_attacker_cost(lines: &mut Vec<String>, stats: &PaperStatsPayload) {
+    let cost = &stats.attacker_cost;
+    lines.extend([
+        String::new(),
+        "## 攻击者成本".to_string(),
+        "| 阶段 | Gas ETH | Gas USD |".to_string(),
+        "| --- | ---: | ---: |".to_string(),
+        format!(
+            "| setup | {} | {} |",
+            format_number(cost.setup_gas_eth),
+            format_number(cost.setup_gas_usd)
+        ),
+        format!(
+            "| lure | {} | {} |",
+            format_number(cost.lure_gas_eth),
+            format_number(cost.lure_gas_usd)
+        ),
+        format!(
+            "| exit | {} | {} |",
+            format_number(cost.exit_gas_eth),
+            format_number(cost.exit_gas_usd)
+        ),
+        format!(
+            "| total | {} | {} |",
+            format_number(cost.total_gas_eth),
+            format_number(cost.total_gas_usd)
+        ),
+        format!(
+            "- Top 合约成本贡献占比: {} ({}/{})",
+            format_ratio(cost.top_contract_contribution_ratio),
+            format_number(cost.top_contract_contribution_numerator),
+            format_number(cost.top_contract_contribution_denominator)
+        ),
+    ]);
+}
+
+fn append_honest_loss(lines: &mut Vec<String>, stats: &PaperStatsPayload) {
+    lines.extend([
+        String::new(),
+        "## 诚实买家损失".to_string(),
+        "| 类别 | 套牢 NFT | NFT 套牢占比 | 二级市场损失 USD | 付费 mint 损失 USD | 总损失 USD |"
+            .to_string(),
+        "| --- | ---: | ---: | ---: | ---: | ---: |".to_string(),
+    ]);
+    for row in &stats.honest_loss {
+        lines.push(format!(
+            "| {} | {} | {} ({}/{}) | {} | {} | {} |",
+            row.category,
+            row.stuck_nft_count,
+            format_ratio(row.stuck_nft_ratio),
+            row.stuck_nft_ratio_numerator,
+            row.stuck_nft_ratio_denominator,
+            format_number(row.secondary_sale_loss_usd),
+            format_number(row.paid_mint_loss_usd),
+            format_number(row.total_loss_usd)
+        ));
+    }
+}
+
+fn append_behavior_summary(lines: &mut Vec<String>, stats: &PaperStatsPayload) {
+    lines.extend([
+        String::new(),
+        "## 恶意行为汇总".to_string(),
+        format!(
+            "- 有合约级行为统计的合约数: {}",
+            stats.contract_behavior_stats.len()
+        ),
+    ]);
+    if stats.malicious_behavior_summary.is_empty() {
+        lines.push("- 行为实例: 0".to_string());
+        return;
+    }
+
+    lines.extend([
+        "| 行为 | 合约数 | 覆盖率 | 实例数 | 地址数 | NFT 数 | 关联买家 | 关联损失 USD |"
+            .to_string(),
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |".to_string(),
+    ]);
+    for row in &stats.malicious_behavior_summary {
+        lines.push(format!(
+            "| {} | {} | {} ({}/{}) | {} | {} | {} | {} | {} |",
+            row.behavior_type,
+            row.contract_count,
+            format_ratio(row.contract_coverage_ratio),
+            row.contract_coverage_numerator,
+            row.contract_coverage_denominator,
+            row.instance_count,
+            row.address_count,
+            row.nft_count,
+            row.linked_buyer_count,
+            format_number(row.linked_loss_usd)
+        ));
+    }
+}
+
+fn append_contract_behavior_details(lines: &mut Vec<String>, stats: &PaperStatsPayload) {
+    if stats.contract_behavior_stats.is_empty() {
+        return;
+    }
+    let rows = sorted_contract_behavior_rows(stats);
+
+    lines.extend([
+        String::new(),
+        "## 合约行为明细".to_string(),
+        "| contract_address | Wash Trading | Pump-and-Exit | Star | Layered | Inventory | Honest buyers | Impact USD |".to_string(),
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |".to_string(),
+    ]);
+    for row in &rows {
+        lines.push(format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} |",
+            row.contract_address,
+            row.wash_trading.len(),
+            row.pump_and_exit.len(),
+            row.star_behaviors.len(),
+            row.layered_transfers.len(),
+            row.inventory_concentration.len(),
+            row.honest_buyers_top.len(),
+            format_number(contract_behavior_impact_usd(row))
+        ));
+    }
+
+    let buyers = sorted_honest_buyers(&rows);
+    if buyers.is_empty() {
+        return;
+    }
+
+    lines.extend([
+        String::new(),
+        "### 诚实买家".to_string(),
+        "| contract_address | buyer | source_pattern | fake NFT | paid USD | still holding |"
+            .to_string(),
+        "| --- | --- | --- | ---: | ---: | --- |".to_string(),
+    ]);
+    for (contract_address, buyer) in buyers {
+        lines.push(format!(
+            "| {} | {} | {} | {} | {} | {} |",
+            contract_address,
+            buyer.honest_buyer,
+            buyer.source_pattern,
+            buyer.fake_nft_bought,
+            format_number(buyer.total_paid_usd),
+            buyer.still_holding
+        ));
+    }
+}
+
+fn sorted_contract_behavior_rows(
+    stats: &PaperStatsPayload,
+) -> Vec<&PaperContractBehaviorStatsPayload> {
+    let mut rows = stats.contract_behavior_stats.iter().collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        compare_desc(
+            contract_behavior_impact_usd(left),
+            contract_behavior_impact_usd(right),
+        )
+        .then_with(|| {
+            contract_behavior_instance_count(right).cmp(&contract_behavior_instance_count(left))
+        })
+        .then_with(|| left.contract_address.cmp(&right.contract_address))
+    });
+    rows
+}
+
+fn sorted_honest_buyers<'a>(
+    rows: &[&'a PaperContractBehaviorStatsPayload],
+) -> Vec<(&'a str, &'a PaperHonestBuyerRowPayload)> {
+    let mut buyers = rows
+        .iter()
+        .flat_map(|row| {
+            row.honest_buyers_top
+                .iter()
+                .map(|buyer| (row.contract_address.as_str(), buyer))
+        })
+        .collect::<Vec<_>>();
+    buyers.sort_by(|(left_contract, left), (right_contract, right)| {
+        compare_desc(left.total_paid_usd, right.total_paid_usd)
+            .then_with(|| right.fake_nft_bought.cmp(&left.fake_nft_bought))
+            .then_with(|| left_contract.cmp(right_contract))
+            .then_with(|| left.honest_buyer.cmp(&right.honest_buyer))
+    });
+    buyers
+}
+
+fn contract_behavior_impact_usd(row: &PaperContractBehaviorStatsPayload) -> f64 {
+    let wash_volume: f64 = row
+        .wash_trading
+        .iter()
+        .map(|item| item.fake_volume_usd)
+        .sum();
+    let pump_loss: f64 = row
+        .pump_and_exit
+        .iter()
+        .map(|item| item.linked_loss_usd)
+        .sum();
+    let star_value: f64 = row
+        .star_behaviors
+        .iter()
+        .map(|item| item.total_value_usd)
+        .sum();
+    let layered_value: f64 = row
+        .layered_transfers
+        .iter()
+        .map(|item| item.total_value_usd)
+        .sum();
+    let inventory_value: f64 = row
+        .inventory_concentration
+        .iter()
+        .map(|item| item.value_collected_usd)
+        .sum();
+    let honest_paid: f64 = row
+        .honest_buyers_top
+        .iter()
+        .map(|item| item.total_paid_usd)
+        .sum();
+    wash_volume + pump_loss + star_value + layered_value + inventory_value + honest_paid
+}
+
+fn contract_behavior_instance_count(row: &PaperContractBehaviorStatsPayload) -> usize {
+    row.wash_trading.len()
+        + row.pump_and_exit.len()
+        + row.star_behaviors.len()
+        + row.layered_transfers.len()
+        + row.inventory_concentration.len()
+        + row.honest_buyers_top.len()
+}
+
+fn compare_desc(left: f64, right: f64) -> Ordering {
+    right.partial_cmp(&left).unwrap_or(Ordering::Equal)
+}
+
+fn append_data_quality(lines: &mut Vec<String>, stats: &PaperStatsPayload) {
+    let quality = &stats.data_quality;
+    lines.extend([
+        String::new(),
+        "## 数据质量".to_string(),
+        format!(
+            "- 可解析销售价格: {} / {} ({})",
+            quality.sale_price_parseable_count,
+            quality.sale_price_total_count,
+            format_ratio(quality.sale_price_parseable_ratio)
+        ),
+        format!(
+            "- 官方参与型重复合约数: {}",
+            quality.legit_duplicate_contract_count
+        ),
+    ]);
 }
