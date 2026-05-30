@@ -653,6 +653,127 @@ fn attacker_cost_excludes_honest_buyer_mint_gas_and_ignored_channels() {
 }
 
 #[test]
+fn concentration_uses_all_suspected_duplicate_contracts() {
+    let config = PaperStatsConfig {
+        concentration_top_pct: 0.5,
+        ..PaperStatsConfig::default()
+    };
+    let duplicate_contracts = (1..=6)
+        .map(|index| DuplicateContractPayload {
+            contract_address: format!("0xdup{index}"),
+            candidate_count: 1,
+            ..DuplicateContractPayload::default()
+        })
+        .collect::<Vec<_>>();
+    let value_flow_edges = [
+        ("0xdup1", 60.0),
+        ("0xdup2", 30.0),
+        ("0xdup3", 10.0),
+        ("0xdup4", 1.0),
+    ]
+    .into_iter()
+    .map(|(contract, gas_usd)| ValueFlowEdgePayload {
+        contract_address: contract.into(),
+        from_address: format!("{contract}deployer"),
+        channel: "contract_deploy".into(),
+        from_role: "contract_deployer".into(),
+        gas_usd: Some(gas_usd),
+        ..ValueFlowEdgePayload::default()
+    })
+    .collect::<Vec<_>>();
+    let victims = [
+        ("0xdup1", "0xbuyer1", 60.0),
+        ("0xdup2", "0xbuyer2", 30.0),
+        ("0xdup3", "0xbuyer3", 10.0),
+        ("0xdup4", "0xbuyer4", 1.0),
+    ]
+    .into_iter()
+    .map(
+        |(contract, buyer, loss_usd)| VictimAcquisitionAddressPayload {
+            address: buyer.into(),
+            contract_addresses: vec![contract.into()],
+            secondary_sale_count: 1,
+            secondary_sale_stuck_cost_usd: loss_usd,
+            total_stuck_cost_usd: loss_usd,
+            is_stuck: true,
+            ..VictimAcquisitionAddressPayload::default()
+        },
+    )
+    .collect::<Vec<_>>();
+
+    let stats = build_paper_stats(PaperStatsInput {
+        config,
+        seed_collection_stats: &SeedCollectionStatsPayload::default(),
+        duplicate_candidates: &[],
+        duplicate_contracts: &duplicate_contracts,
+        legit_duplicates: &[],
+        infringing_tokens: &[],
+        malicious_addresses: &[],
+        victim_acquisition_addresses: &victims,
+        value_flow_edges: &value_flow_edges,
+        nft_propagation_paths: &Default::default(),
+    });
+
+    assert_eq!(
+        stats.attacker_cost.top_contract_contribution_numerator,
+        100.0
+    );
+    assert_eq!(
+        stats.honest_loss.top_contract_loss_contribution_numerator,
+        100.0
+    );
+}
+
+#[test]
+fn malicious_mint_payment_gas_counts_as_lure_not_setup() {
+    let value_flow_edges = vec![
+        ValueFlowEdgePayload {
+            contract_address: "0xdup".into(),
+            from_address: "0xdeployer".into(),
+            tx_hash: "0xdeploy".into(),
+            channel: "contract_deploy".into(),
+            from_role: "contract_deployer".into(),
+            gas_usd: Some(3.0),
+            ..ValueFlowEdgePayload::default()
+        },
+        ValueFlowEdgePayload {
+            contract_address: "0xdup".into(),
+            from_address: "0xminter".into(),
+            tx_hash: "0xmint".into(),
+            channel: "mint_payment".into(),
+            from_role: "paid_minter".into(),
+            gas_usd: Some(5.0),
+            ..ValueFlowEdgePayload::default()
+        },
+    ];
+
+    let stats = build_paper_stats(PaperStatsInput {
+        config: PaperStatsConfig::default(),
+        seed_collection_stats: &SeedCollectionStatsPayload::default(),
+        duplicate_candidates: &[],
+        duplicate_contracts: &[],
+        legit_duplicates: &[],
+        infringing_tokens: &[],
+        malicious_addresses: &[MaliciousAddressPayload {
+            address: "0xminter".into(),
+            ..MaliciousAddressPayload::default()
+        }],
+        victim_acquisition_addresses: &[],
+        value_flow_edges: &value_flow_edges,
+        nft_propagation_paths: &Default::default(),
+    });
+
+    assert_eq!(stats.attacker_cost.setup_gas_usd, 3.0);
+    assert_eq!(stats.attacker_cost.lure_gas_usd, 5.0);
+    let mint_detail = stats
+        .attacker_cost_details
+        .iter()
+        .find(|detail| detail.tx_hash == "0xmint")
+        .unwrap();
+    assert_eq!(mint_detail.stage, "lure");
+}
+
+#[test]
 fn wash_trading_avg_cycle_blocks_uses_block_numbers_not_timestamps() {
     let path = NftPropagationPathPayload {
         contract_address: "0xdup".into(),
@@ -985,7 +1106,7 @@ fn attacker_cost_does_not_count_deployment_without_operator_evidence() {
 }
 
 #[test]
-fn markdown_includes_attacker_cost_detail_rows() {
+fn markdown_omits_attacker_cost_details_while_json_keeps_them() {
     let paper_stats = PaperStatsPayload {
         attacker_cost: top_contract_analysis_rs::models::PaperAttackerCostPayload {
             setup_gas_eth: 0.01,
@@ -1013,19 +1134,96 @@ fn markdown_includes_attacker_cost_detail_rows() {
         ],
         ..PaperStatsPayload::default()
     };
+    let json = serde_json::to_value(&SingleReportPayload {
+        paper_stats: paper_stats.clone(),
+        ..SingleReportPayload::default()
+    })
+    .unwrap();
 
     let markdown = render_human_readable_report(&SingleReportPayload {
         paper_stats,
         ..SingleReportPayload::default()
     });
 
-    assert!(markdown.contains("### 攻击者成本明细"));
-    assert!(markdown.contains(
+    assert_eq!(
+        json["paper_stats"]["attacker_cost_details"][0]["tx_hash"],
+        "0xdeploy"
+    );
+    assert!(markdown.contains("## 攻击者成本"));
+    assert!(markdown.contains("| gas | 0.01 / 20 | 0 / 0 | 0 / 0 | 0.01 / 20 | 100.00% (20/20) |"));
+    assert!(!markdown.contains("### 攻击者成本明细"));
+    assert!(!markdown.contains(
         "| contract_address | stage | channel | tx_hash | gas_payer | gas ETH/USD | from_role | to_role | evidence |"
     ));
-    assert!(markdown.contains(
+    assert!(!markdown.contains(
         "| 0xdup | setup | contract_deploy | 0xdeploy | 0xdeployer | 0.01 / 20 | contract_deployer | mint_contract | deployment_receipt_gas |"
     ));
+}
+
+#[test]
+fn paper_stats_json_keeps_audit_detail_fields() {
+    let paper_stats = PaperStatsPayload {
+        malicious_addresses: vec!["0xmalicious".into()],
+        honest_addresses: vec!["0xhonest".into()],
+        repeat_infringing_malicious_addresses: vec!["0xrepeat".into()],
+        attacker_cost_by_contract_usd: BTreeMap::from([("0xdup".into(), 20.0)]),
+        honest_loss_by_contract_usd: BTreeMap::from([("0xdup".into(), 30.0)]),
+        stuck_time_numerator_by_contract: BTreeMap::from([("0xdup".into(), 100.0)]),
+        stuck_time_denominator_by_contract: BTreeMap::from([("0xdup".into(), 10.0)]),
+        behavior_contract_denominator: 2,
+        behavior_contract_denominator_keys: vec!["0xdup".into()],
+        duplicate_nft_keys_by_category: BTreeMap::from([("total".into(), vec!["0xdup:1".into()])]),
+        duplicate_contract_keys_by_category: BTreeMap::from([(
+            "total".into(),
+            vec!["0xdup".into()],
+        )]),
+        duplicate_contract_denominator_keys: vec!["0xdup".into()],
+        behavior_contracts_by_type: BTreeMap::from([("Wash Trading".into(), vec!["0xdup".into()])]),
+        behavior_addresses_by_type: BTreeMap::from([(
+            "Wash Trading".into(),
+            vec!["0xmalicious".into()],
+        )]),
+        behavior_nfts_by_type: BTreeMap::from([("Wash Trading".into(), vec!["0xdup:1".into()])]),
+        behavior_buyers_by_type: BTreeMap::from([(
+            "Pump-and-Exit".into(),
+            vec!["0xhonest".into()],
+        )]),
+        ..PaperStatsPayload::default()
+    };
+
+    let json = serde_json::to_value(&paper_stats).unwrap();
+
+    assert_eq!(json["malicious_addresses"][0], "0xmalicious");
+    assert_eq!(json["honest_addresses"][0], "0xhonest");
+    assert_eq!(json["repeat_infringing_malicious_addresses"][0], "0xrepeat");
+    assert_eq!(json["attacker_cost_by_contract_usd"]["0xdup"], 20.0);
+    assert_eq!(json["honest_loss_by_contract_usd"]["0xdup"], 30.0);
+    assert_eq!(json["stuck_time_numerator_by_contract"]["0xdup"], 100.0);
+    assert_eq!(json["stuck_time_denominator_by_contract"]["0xdup"], 10.0);
+    assert_eq!(json["behavior_contract_denominator"], 2);
+    assert_eq!(json["behavior_contract_denominator_keys"][0], "0xdup");
+    assert_eq!(
+        json["duplicate_nft_keys_by_category"]["total"][0],
+        "0xdup:1"
+    );
+    assert_eq!(
+        json["duplicate_contract_keys_by_category"]["total"][0],
+        "0xdup"
+    );
+    assert_eq!(json["duplicate_contract_denominator_keys"][0], "0xdup");
+    assert_eq!(
+        json["behavior_contracts_by_type"]["Wash Trading"][0],
+        "0xdup"
+    );
+    assert_eq!(
+        json["behavior_addresses_by_type"]["Wash Trading"][0],
+        "0xmalicious"
+    );
+    assert_eq!(json["behavior_nfts_by_type"]["Wash Trading"][0], "0xdup:1");
+    assert_eq!(
+        json["behavior_buyers_by_type"]["Pump-and-Exit"][0],
+        "0xhonest"
+    );
 }
 
 #[test]
@@ -1743,7 +1941,7 @@ fn paper_stats_does_not_truncate_honest_buyer_rows() {
 }
 
 #[test]
-fn honest_buyer_fake_nft_count_and_loss_denominator_use_paid_mint_token_count() {
+fn honest_buyer_fake_nft_count_matches_stuck_nft_count() {
     let path = NftPropagationPathPayload {
         contract_address: "0xpaidmint".into(),
         ..NftPropagationPathPayload::default()
@@ -1779,7 +1977,7 @@ fn honest_buyer_fake_nft_count_and_loss_denominator_use_paid_mint_token_count() 
     assert_eq!(stats.honest_loss.stuck_nft_ratio_denominator, 4);
     assert_eq!(
         stats.contract_behavior_stats[0].honest_buyers[0].fake_nft_bought,
-        4
+        2
     );
 }
 

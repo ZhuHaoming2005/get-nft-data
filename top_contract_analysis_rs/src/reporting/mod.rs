@@ -155,7 +155,6 @@ fn append_paper_stats_sections(lines: &mut Vec<String>, stats: &PaperStatsPayloa
     append_duplicate_scale(lines, stats);
     append_address_classification(lines, stats);
     append_attacker_cost(lines, stats);
-    append_attacker_cost_details(lines, stats);
     append_honest_loss(lines, stats);
     append_behavior_summary(lines, stats);
     append_data_quality(lines, stats);
@@ -224,34 +223,6 @@ fn append_attacker_cost(lines: &mut Vec<String>, stats: &PaperStatsPayload) {
             format_number(cost.top_contract_contribution_denominator)
         ),
     ]);
-}
-
-fn append_attacker_cost_details(lines: &mut Vec<String>, stats: &PaperStatsPayload) {
-    if stats.attacker_cost_details.is_empty() {
-        return;
-    }
-    lines.extend([
-        String::new(),
-        "### 攻击者成本明细".to_string(),
-        "| contract_address | stage | channel | tx_hash | gas_payer | gas ETH/USD | from_role | to_role | evidence |"
-            .to_string(),
-        "| --- | --- | --- | --- | --- | ---: | --- | --- | --- |".to_string(),
-    ]);
-    for row in &stats.attacker_cost_details {
-        lines.push(format!(
-            "| {} | {} | {} | {} | {} | {} / {} | {} | {} | {} |",
-            row.contract_address,
-            row.stage,
-            row.channel,
-            row.tx_hash,
-            row.gas_payer_address,
-            format_number(row.gas_eth),
-            format_number(row.gas_usd),
-            row.from_role,
-            row.to_role,
-            row.evidence_type
-        ));
-    }
 }
 
 fn append_honest_loss(lines: &mut Vec<String>, stats: &PaperStatsPayload) {

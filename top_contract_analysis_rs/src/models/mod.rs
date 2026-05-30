@@ -948,37 +948,37 @@ pub struct PaperStatsPayload {
     pub attacker_cost_details: Vec<PaperAttackerCostDetailPayload>,
     pub honest_loss: PaperHonestLossPayload,
     pub data_quality: PaperDataQualityPayload,
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub malicious_addresses: Vec<String>,
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub honest_addresses: Vec<String>,
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub repeat_infringing_malicious_addresses: Vec<String>,
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub attacker_cost_by_contract_usd: BTreeMap<String, f64>,
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub honest_loss_by_contract_usd: BTreeMap<String, f64>,
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub stuck_time_numerator_by_contract: BTreeMap<String, f64>,
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub stuck_time_denominator_by_contract: BTreeMap<String, f64>,
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub behavior_contract_denominator: i64,
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub behavior_contract_denominator_keys: Vec<String>,
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub duplicate_nft_keys_by_category: BTreeMap<String, Vec<String>>,
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub duplicate_contract_keys_by_category: BTreeMap<String, Vec<String>>,
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub duplicate_contract_denominator_keys: Vec<String>,
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub behavior_contracts_by_type: BTreeMap<String, Vec<String>>,
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub behavior_addresses_by_type: BTreeMap<String, Vec<String>>,
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub behavior_nfts_by_type: BTreeMap<String, Vec<String>>,
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub behavior_buyers_by_type: BTreeMap<String, Vec<String>>,
 }
 
