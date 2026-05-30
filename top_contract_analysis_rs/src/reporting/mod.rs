@@ -31,6 +31,12 @@ fn format_ratio(value: Option<f64>) -> String {
         .unwrap_or_else(|| "n/a".into())
 }
 
+fn format_multiple(value: Option<f64>) -> String {
+    value
+        .map(|multiple| format!("{}x", format_number(multiple)))
+        .unwrap_or_else(|| "n/a".into())
+}
+
 fn format_number(value: f64) -> String {
     if value == 0.0 {
         return "0".into();
@@ -149,6 +155,7 @@ fn append_paper_stats_sections(lines: &mut Vec<String>, stats: &PaperStatsPayloa
     append_duplicate_scale(lines, stats);
     append_address_classification(lines, stats);
     append_attacker_cost(lines, stats);
+    append_attacker_cost_details(lines, stats);
     append_honest_loss(lines, stats);
     append_behavior_summary(lines, stats);
     append_data_quality(lines, stats);
@@ -219,11 +226,39 @@ fn append_attacker_cost(lines: &mut Vec<String>, stats: &PaperStatsPayload) {
     ]);
 }
 
+fn append_attacker_cost_details(lines: &mut Vec<String>, stats: &PaperStatsPayload) {
+    if stats.attacker_cost_details.is_empty() {
+        return;
+    }
+    lines.extend([
+        String::new(),
+        "### 攻击者成本明细".to_string(),
+        "| contract_address | stage | channel | tx_hash | gas_payer | gas ETH/USD | from_role | to_role | evidence |"
+            .to_string(),
+        "| --- | --- | --- | --- | --- | ---: | --- | --- | --- |".to_string(),
+    ]);
+    for row in &stats.attacker_cost_details {
+        lines.push(format!(
+            "| {} | {} | {} | {} | {} | {} / {} | {} | {} | {} |",
+            row.contract_address,
+            row.stage,
+            row.channel,
+            row.tx_hash,
+            row.gas_payer_address,
+            format_number(row.gas_eth),
+            format_number(row.gas_usd),
+            row.from_role,
+            row.to_role,
+            row.evidence_type
+        ));
+    }
+}
+
 fn append_honest_loss(lines: &mut Vec<String>, stats: &PaperStatsPayload) {
     lines.extend([
         String::new(),
         "## 诚实买家损失".to_string(),
-        "| 套牢 NFT | NFT 套牢占比 | 套牢时间比 | 二级市场损失 ETH/USD | 付费 mint 损失 ETH/USD | 总损失 ETH/USD | 损失集中度 |"
+        "| 套牢 NFT | NFT 套牢占比 | 套牢时间倍数 | 二级市场损失 ETH/USD | 付费 mint 损失 ETH/USD | 总损失 ETH/USD | 损失集中度 |"
             .to_string(),
         "| ---: | ---: | ---: | ---: | ---: | ---: | ---: |".to_string(),
     ]);
@@ -234,7 +269,7 @@ fn append_honest_loss(lines: &mut Vec<String>, stats: &PaperStatsPayload) {
         format_ratio(row.stuck_nft_ratio),
         row.stuck_nft_ratio_numerator,
         row.stuck_nft_ratio_denominator,
-        format_ratio(row.stuck_time_ratio),
+        format_multiple(row.stuck_time_ratio),
         format_number(row.stuck_time_ratio_numerator),
         format_number(row.stuck_time_ratio_denominator),
         format_number(row.secondary_sale_loss_eth),
@@ -607,6 +642,7 @@ fn sorted_honest_buyers<'a>(
         .flat_map(|row| {
             row.honest_buyers
                 .iter()
+                .filter(|buyer| buyer.source_pattern != "unattributed_sale")
                 .map(|buyer| (row.contract_address.as_str(), buyer))
         })
         .collect::<Vec<_>>();

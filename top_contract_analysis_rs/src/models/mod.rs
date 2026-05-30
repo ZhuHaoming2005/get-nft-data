@@ -887,6 +887,20 @@ pub struct PaperAttackerCostPayload {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PaperAttackerCostDetailPayload {
+    pub contract_address: String,
+    pub stage: String,
+    pub channel: String,
+    pub tx_hash: String,
+    pub gas_payer_address: String,
+    pub gas_eth: f64,
+    pub gas_usd: f64,
+    pub from_role: String,
+    pub to_role: String,
+    pub evidence_type: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct PaperHonestLossPayload {
     pub stuck_nft_count: i64,
     pub stuck_nft_ratio: Option<f64>,
@@ -931,6 +945,7 @@ pub struct PaperStatsPayload {
     pub contract_behavior_stats: Vec<PaperContractBehaviorStatsPayload>,
     pub malicious_behavior_summary: Vec<PaperBehaviorSummaryRowPayload>,
     pub attacker_cost: PaperAttackerCostPayload,
+    pub attacker_cost_details: Vec<PaperAttackerCostDetailPayload>,
     pub honest_loss: PaperHonestLossPayload,
     pub data_quality: PaperDataQualityPayload,
     #[serde(default, skip_serializing)]

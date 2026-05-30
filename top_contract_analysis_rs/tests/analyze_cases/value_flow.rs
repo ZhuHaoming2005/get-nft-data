@@ -223,6 +223,7 @@ async fn analyze_counts_deployment_and_malicious_sale_gas_in_attacker_cost() {
         .expect("deployment gas edge");
     assert_eq!(deploy_edge.gas_payer_address, "0xdeployer");
     assert_eq!(deploy_edge.gas_eth, Some(0.000042));
+    assert_eq!(deploy_edge.gas_usd, Some(0.0924));
 
     let lure_edge = payload
         .value_flow_edges
@@ -291,7 +292,9 @@ async fn analyze_counts_deployment_gas_when_deployment_time_is_missing() {
         .expect("deployment gas edge should not require deployment block time");
     assert_eq!(deploy_edge.block_time, 0);
     assert_eq!(deploy_edge.gas_eth, Some(0.000042));
+    assert_eq!(deploy_edge.gas_usd, Some(0.0924));
     assert_eq!(payload.paper_stats.attacker_cost.setup_gas_eth, 0.000042);
+    assert_eq!(payload.paper_stats.attacker_cost.setup_gas_usd, 0.0924);
 }
 
 struct AttackerCostGasApi;

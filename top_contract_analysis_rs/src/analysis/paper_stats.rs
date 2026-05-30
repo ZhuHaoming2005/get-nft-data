@@ -7,12 +7,12 @@ use rayon::prelude::*;
 use crate::models::{
     DuplicateCandidate, DuplicateContractPayload, InfringingTokenRecord, MaliciousAddressPayload,
     NftPropagationEdgePayload, NftPropagationPathPayload, PaperAddressClassificationPayload,
-    PaperAttackerCostPayload, PaperBehaviorSummaryRowPayload, PaperContractBehaviorStatsPayload,
-    PaperDataQualityPayload, PaperDuplicateScaleRowPayload, PaperHonestBuyerRowPayload,
-    PaperHonestLossPayload, PaperInventoryConcentrationRowPayload, PaperLayeredTransferRowPayload,
-    PaperPumpExitRowPayload, PaperStarBehaviorRowPayload, PaperStatsPayload,
-    PaperWashTradingRowPayload, SeedCollectionStatsPayload, ValueFlowEdgePayload,
-    VictimAcquisitionAddressPayload, ZERO_ADDRESS,
+    PaperAttackerCostDetailPayload, PaperAttackerCostPayload, PaperBehaviorSummaryRowPayload,
+    PaperContractBehaviorStatsPayload, PaperDataQualityPayload, PaperDuplicateScaleRowPayload,
+    PaperHonestBuyerRowPayload, PaperHonestLossPayload, PaperInventoryConcentrationRowPayload,
+    PaperLayeredTransferRowPayload, PaperPumpExitRowPayload, PaperStarBehaviorRowPayload,
+    PaperStatsPayload, PaperWashTradingRowPayload, SeedCollectionStatsPayload,
+    ValueFlowEdgePayload, VictimAcquisitionAddressPayload, ZERO_ADDRESS,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -115,6 +115,7 @@ struct AddressSets {
 #[derive(Default)]
 struct AttackerCostBuild {
     payload: PaperAttackerCostPayload,
+    details: Vec<PaperAttackerCostDetailPayload>,
     by_contract_usd: BTreeMap<String, f64>,
 }
 
@@ -253,6 +254,7 @@ pub fn build_paper_stats(input: PaperStatsInput<'_>) -> PaperStatsPayload {
         &address_sets,
         input.victim_acquisition_addresses,
         input.nft_propagation_paths,
+        total_duplicate_nft_count(&duplicate_scale),
     );
 
     PaperStatsPayload {
@@ -261,6 +263,7 @@ pub fn build_paper_stats(input: PaperStatsInput<'_>) -> PaperStatsPayload {
         contract_behavior_stats,
         malicious_behavior_summary,
         attacker_cost: attacker_cost.payload,
+        attacker_cost_details: attacker_cost.details,
         honest_loss: honest_loss.payload,
         data_quality: build_data_quality(&input),
         malicious_addresses: address_sets.malicious.into_iter().collect(),
@@ -366,6 +369,9 @@ pub fn merge_paper_stats<'a>(
         merged.attacker_cost.exit_gas_usd += stats.attacker_cost.exit_gas_usd;
         merged.attacker_cost.total_gas_eth += stats.attacker_cost.total_gas_eth;
         merged.attacker_cost.total_gas_usd += stats.attacker_cost.total_gas_usd;
+        merged
+            .attacker_cost_details
+            .extend(stats.attacker_cost_details.iter().cloned());
 
         merge_f64_map(
             &mut merged.attacker_cost_by_contract_usd,
@@ -470,14 +476,16 @@ pub fn merge_paper_stats<'a>(
     let total_loss_usd = honest_loss.secondary_sale_loss_usd + honest_loss.paid_mint_loss_usd;
     let top_loss_numerator =
         top_contribution_numerator(&merged.honest_loss_by_contract_usd, config);
+    let stuck_nft_denominator = if duplicate_nft_denominator > 0 {
+        duplicate_nft_denominator
+    } else {
+        honest_loss.stuck_nft_denominator
+    };
     merged.honest_loss = PaperHonestLossPayload {
         stuck_nft_count: honest_loss.stuck_nft_count,
-        stuck_nft_ratio: ratio_i64(
-            honest_loss.stuck_nft_count,
-            honest_loss.stuck_nft_denominator,
-        ),
+        stuck_nft_ratio: ratio_i64(honest_loss.stuck_nft_count, stuck_nft_denominator),
         stuck_nft_ratio_numerator: honest_loss.stuck_nft_count,
-        stuck_nft_ratio_denominator: honest_loss.stuck_nft_denominator,
+        stuck_nft_ratio_denominator: stuck_nft_denominator,
         stuck_time_ratio: ratio_f64(
             honest_loss.stuck_time_numerator,
             honest_loss.stuck_time_denominator,
@@ -502,6 +510,7 @@ pub fn merge_paper_stats<'a>(
         merged.attacker_cost.top_contract_contribution_numerator,
         merged.attacker_cost.top_contract_contribution_denominator,
     );
+    sort_attacker_cost_details(&mut merged.attacker_cost_details);
     merged.data_quality.sale_price_parseable_ratio = ratio_i64(
         merged.data_quality.sale_price_parseable_count,
         merged.data_quality.sale_price_total_count,
@@ -804,6 +813,15 @@ fn behavior_contract_denominator_keys(input: &PaperStatsInput<'_>) -> BTreeSet<S
     keys
 }
 
+fn total_duplicate_nft_count(duplicate_scale: &DuplicateScaleBuild) -> i64 {
+    duplicate_scale
+        .rows
+        .iter()
+        .find(|row| row.category == "total")
+        .map(|row| row.duplicate_nft_count)
+        .unwrap_or_default()
+}
+
 fn build_address_sets(input: &PaperStatsInput<'_>) -> AddressSets {
     let mut participants = BTreeSet::<String>::new();
     let mut honest_addresses = BTreeSet::<String>::new();
@@ -910,7 +928,6 @@ fn build_address_sets(input: &PaperStatsInput<'_>) -> AddressSets {
         for address in [
             normalized_address(&edge.from_address),
             normalized_address(&edge.to_address),
-            normalized_address(&edge.gas_payer_address),
         ] {
             if !is_participant_address(&address) {
                 continue;
@@ -1022,7 +1039,21 @@ fn build_attacker_cost(
             }
         }
         if gas_usd > 0.0 {
-            *build.by_contract_usd.entry(contract).or_default() += gas_usd;
+            *build.by_contract_usd.entry(contract.clone()).or_default() += gas_usd;
+        }
+        if gas_eth > 0.0 || gas_usd > 0.0 {
+            build.details.push(PaperAttackerCostDetailPayload {
+                contract_address: contract,
+                stage: attacker_cost_stage_label(stage).into(),
+                channel: edge.channel.clone(),
+                tx_hash: edge.tx_hash.to_lowercase(),
+                gas_payer_address: attacker_cost_payer(edge),
+                gas_eth,
+                gas_usd,
+                from_role: edge.from_role.clone(),
+                to_role: edge.to_role.clone(),
+                evidence_type: edge.evidence_type.clone(),
+            });
         }
     }
     build.payload.total_gas_eth =
@@ -1036,7 +1067,30 @@ fn build_attacker_cost(
         build.payload.top_contract_contribution_numerator,
         build.payload.top_contract_contribution_denominator,
     );
+    sort_attacker_cost_details(&mut build.details);
     build
+}
+
+fn attacker_cost_stage_label(stage: AttackerCostStage) -> &'static str {
+    match stage {
+        AttackerCostStage::Setup => "setup",
+        AttackerCostStage::Lure => "lure",
+        AttackerCostStage::Exit => "exit",
+    }
+}
+
+fn sort_attacker_cost_details(details: &mut [PaperAttackerCostDetailPayload]) {
+    details.sort_by(|left, right| {
+        compare_f64_desc(left.gas_usd, right.gas_usd)
+            .then_with(|| compare_f64_desc(left.gas_eth, right.gas_eth))
+            .then_with(|| left.stage.cmp(&right.stage))
+            .then_with(|| left.contract_address.cmp(&right.contract_address))
+            .then_with(|| left.tx_hash.cmp(&right.tx_hash))
+    });
+}
+
+fn compare_f64_desc(left: f64, right: f64) -> Ordering {
+    right.partial_cmp(&left).unwrap_or(Ordering::Equal)
 }
 
 fn attacker_cost_stage(
@@ -1045,7 +1099,10 @@ fn attacker_cost_stage(
     explicit_malicious_addresses: &BTreeSet<String>,
 ) -> Option<AttackerCostStage> {
     match edge.channel.as_str() {
-        "deployment" | "contract_deploy" => Some(AttackerCostStage::Setup),
+        "deployment" | "contract_deploy" => {
+            is_attacker_fee_payer(edge, address_sets, explicit_malicious_addresses)
+                .then_some(AttackerCostStage::Setup)
+        }
         "mint_payment" | "funding" => {
             is_attacker_fee_payer(edge, address_sets, explicit_malicious_addresses)
                 .then_some(AttackerCostStage::Setup)
@@ -1067,17 +1124,21 @@ fn is_attacker_fee_payer(
     address_sets: &AddressSets,
     explicit_malicious_addresses: &BTreeSet<String>,
 ) -> bool {
-    let payer = if edge.gas_payer_address.trim().is_empty() {
-        normalized_address(&edge.from_address)
-    } else {
-        normalized_address(&edge.gas_payer_address)
-    };
+    let payer = attacker_cost_payer(edge);
     if address_sets.honest.contains(&payer) {
         return false;
     }
-    address_sets.malicious.contains(&payer)
-        || explicit_malicious_addresses.contains(&payer)
-        || is_operator_role(&edge.from_role)
+    let from = normalized_address(&edge.from_address);
+    explicit_malicious_addresses.contains(&payer)
+        || (payer == from && is_operator_role(&edge.from_role))
+}
+
+fn attacker_cost_payer(edge: &ValueFlowEdgePayload) -> String {
+    if edge.gas_payer_address.trim().is_empty() {
+        normalized_address(&edge.from_address)
+    } else {
+        normalized_address(&edge.gas_payer_address)
+    }
 }
 
 fn is_operator_role(role: &str) -> bool {
@@ -1144,6 +1205,7 @@ fn build_honest_loss(
     address_sets: &AddressSets,
     victim_acquisition_addresses: &[VictimAcquisitionAddressPayload],
     nft_propagation_paths: &BTreeMap<String, NftPropagationPathPayload>,
+    all_fake_nft_count: i64,
 ) -> HonestLossBuild {
     let secondary_total_nft_count: i64 = victim_acquisition_addresses
         .iter()
@@ -1201,7 +1263,12 @@ fn build_honest_loss(
         (fallback_total_stuck_usd - total_secondary_usd).max(0.0)
     };
     let total_stuck_nft_count = secondary_stuck_nft_count + paid_mint_stuck_nft_count;
-    let total_nft_count = secondary_total_nft_count + paid_mint_total_nft_count;
+    let observed_victim_nft_count = secondary_total_nft_count + paid_mint_total_nft_count;
+    let total_nft_count = if all_fake_nft_count > 0 {
+        all_fake_nft_count
+    } else {
+        observed_victim_nft_count
+    };
 
     let total_loss_by_contract_usd = loss_by_contract(victim_acquisition_addresses, |item| {
         item.total_stuck_cost_usd
@@ -2327,18 +2394,6 @@ fn build_behavior_summary(
                         .filter(|row| row.behavior == behavior)
                         .map(|row| row.tokens)
                         .sum(),
-                    linked_loss_eth: stats
-                        .star_behaviors
-                        .iter()
-                        .filter(|row| row.behavior == behavior)
-                        .map(|row| row.total_value_eth)
-                        .sum(),
-                    linked_loss_usd: stats
-                        .star_behaviors
-                        .iter()
-                        .filter(|row| row.behavior == behavior)
-                        .map(|row| row.total_value_usd)
-                        .sum(),
                     ..BehaviorMeasure::default()
                 }
             })
@@ -2361,16 +2416,6 @@ fn build_behavior_summary(
             instance_count: stats.layered_transfers.len() as i64,
             address_count: stats.layered_transfers.iter().map(|row| row.wallets).sum(),
             nft_count: stats.layered_transfers.iter().map(|row| row.tokens).sum(),
-            linked_loss_eth: stats
-                .layered_transfers
-                .iter()
-                .map(|row| row.total_value_eth)
-                .sum(),
-            linked_loss_usd: stats
-                .layered_transfers
-                .iter()
-                .map(|row| row.total_value_usd)
-                .sum(),
             ..BehaviorMeasure::default()
         },
     ) {
@@ -2398,16 +2443,6 @@ fn build_behavior_summary(
                 .inventory_concentration
                 .iter()
                 .map(|row| row.inbound_txns)
-                .sum(),
-            linked_loss_eth: stats
-                .inventory_concentration
-                .iter()
-                .map(|row| row.value_collected_eth)
-                .sum(),
-            linked_loss_usd: stats
-                .inventory_concentration
-                .iter()
-                .map(|row| row.value_collected_usd)
                 .sum(),
             ..BehaviorMeasure::default()
         },
