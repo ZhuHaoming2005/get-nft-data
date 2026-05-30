@@ -387,6 +387,12 @@ pub fn merge_paper_stats<'a>(
         merged.data_quality.sale_price_parseable_count +=
             stats.data_quality.sale_price_parseable_count;
         merged.data_quality.sale_price_total_count += stats.data_quality.sale_price_total_count;
+        merged.data_quality.representative_candidate_count +=
+            stats.data_quality.representative_candidate_count;
+        merged.data_quality.candidate_contract_count += stats.data_quality.candidate_contract_count;
+        merged.data_quality.suspected_duplicate_contract_count +=
+            stats.data_quality.suspected_duplicate_contract_count;
+        merged.data_quality.infringing_nft_count += stats.data_quality.infringing_nft_count;
         merged.data_quality.legit_duplicate_contract_count +=
             stats.data_quality.legit_duplicate_contract_count;
     }
@@ -484,6 +490,13 @@ pub fn merge_paper_stats<'a>(
         merged.data_quality.sale_price_parseable_count,
         merged.data_quality.sale_price_total_count,
     );
+    if !duplicate_contract_denominator_keys.is_empty() {
+        merged.data_quality.suspected_duplicate_contract_count =
+            duplicate_contract_denominator_keys.len() as i64;
+    }
+    if let Some(total_duplicate_nft_keys) = duplicate_nft_keys.get("total") {
+        merged.data_quality.infringing_nft_count = total_duplicate_nft_keys.len() as i64;
+    }
     let behavior_contract_denominator = if !behavior_contract_denominator_keys.is_empty() {
         behavior_contract_denominator_keys.len()
     } else if merged.behavior_contract_denominator > 0 {
@@ -594,30 +607,102 @@ fn category_reason(category: &str) -> Option<&'static str> {
     }
 }
 
-fn candidate_matches_category(candidate: &DuplicateCandidate, category: &str) -> bool {
+fn match_reasons_match_category(match_reasons: &[String], category: &str) -> bool {
     category_reason(category)
-        .map(|reason| candidate.match_reasons.iter().any(|item| item == reason))
+        .map(|reason| match_reasons.iter().any(|item| item == reason))
         .unwrap_or(true)
 }
 
-fn build_duplicate_scale(input: &PaperStatsInput<'_>) -> DuplicateScaleBuild {
-    let categories = ["token_uri", "image_uri", "metadata", "name", "total"];
-    let seed_nft_count = input.seed_collection_stats.seed_nft_count.max(0);
-    let duplicate_contract_denominator = input.duplicate_contracts.len() as i64;
-    let contract_denominator_keys = input
+#[derive(Clone)]
+struct DuplicateEvidenceItem {
+    contract_address: String,
+    token_id: String,
+    match_reasons: Vec<String>,
+}
+
+fn duplicate_evidence_item(
+    contract_address: &str,
+    token_id: &str,
+    match_reasons: &[String],
+) -> Option<DuplicateEvidenceItem> {
+    let contract_address = normalized_contract(contract_address);
+    let token_id = token_id.trim();
+    if contract_address == "unknown" || token_id.is_empty() {
+        return None;
+    }
+    Some(DuplicateEvidenceItem {
+        contract_address,
+        token_id: token_id.to_string(),
+        match_reasons: match_reasons.to_vec(),
+    })
+}
+
+fn duplicate_evidence_items(input: &PaperStatsInput<'_>) -> Vec<DuplicateEvidenceItem> {
+    let infringing_items = input
+        .infringing_tokens
+        .iter()
+        .filter(|token| !token.official_or_legit_reissue)
+        .filter_map(|token| {
+            duplicate_evidence_item(
+                &token.contract_address,
+                &token.token_id,
+                &token.match_reasons,
+            )
+        })
+        .collect::<Vec<_>>();
+    if !infringing_items.is_empty() {
+        return infringing_items;
+    }
+
+    input
+        .duplicate_candidates
+        .iter()
+        .filter_map(|candidate| {
+            duplicate_evidence_item(
+                &candidate.contract_address,
+                &candidate.token_id,
+                &candidate.match_reasons,
+            )
+        })
+        .collect()
+}
+
+fn evidence_matches_category(item: &DuplicateEvidenceItem, category: &str) -> bool {
+    match_reasons_match_category(&item.match_reasons, category)
+}
+
+fn duplicate_contract_key_set(
+    input: &PaperStatsInput<'_>,
+    evidence_items: &[DuplicateEvidenceItem],
+) -> BTreeSet<String> {
+    let mut keys = input
         .duplicate_contracts
         .iter()
         .map(|contract| normalized_contract(&contract.contract_address))
         .filter(|contract| contract != "unknown")
         .collect::<BTreeSet<_>>();
+    keys.extend(
+        evidence_items
+            .iter()
+            .map(|item| item.contract_address.clone())
+            .filter(|contract| contract != "unknown"),
+    );
+    keys
+}
+
+fn build_duplicate_scale(input: &PaperStatsInput<'_>) -> DuplicateScaleBuild {
+    let categories = ["token_uri", "image_uri", "metadata", "name", "total"];
+    let seed_nft_count = input.seed_collection_stats.seed_nft_count.max(0);
+    let evidence_items = duplicate_evidence_items(input);
+    let contract_denominator_keys = duplicate_contract_key_set(input, &evidence_items);
+    let duplicate_contract_denominator = contract_denominator_keys.len() as i64;
 
     let rows = categories
         .par_iter()
         .map(|category| {
-            let nft_keys = input
-                .duplicate_candidates
+            let nft_keys = evidence_items
                 .iter()
-                .filter(|candidate| candidate_matches_category(candidate, category))
+                .filter(|item| evidence_matches_category(item, category))
                 .map(|candidate| {
                     format!(
                         "{}:{}",
@@ -629,11 +714,10 @@ fn build_duplicate_scale(input: &PaperStatsInput<'_>) -> DuplicateScaleBuild {
             let contract_keys = if *category == "total" {
                 contract_denominator_keys.clone()
             } else {
-                input
-                    .duplicate_candidates
+                evidence_items
                     .iter()
-                    .filter(|candidate| candidate_matches_category(candidate, category))
-                    .map(|candidate| normalized_contract(&candidate.contract_address))
+                    .filter(|item| evidence_matches_category(item, category))
+                    .map(|item| normalized_contract(&item.contract_address))
                     .filter(|contract| contract != "unknown")
                     .collect::<BTreeSet<_>>()
             };
@@ -2412,8 +2496,51 @@ fn build_data_quality(input: &PaperStatsInput<'_>) -> PaperDataQualityPayload {
             }
         }
     }
+    let representative_candidate_count = input
+        .duplicate_candidates
+        .iter()
+        .filter_map(|candidate| {
+            duplicate_evidence_item(
+                &candidate.contract_address,
+                &candidate.token_id,
+                &candidate.match_reasons,
+            )
+        })
+        .map(|item| format!("{}:{}", item.contract_address, item.token_id))
+        .collect::<BTreeSet<_>>()
+        .len() as i64;
+    let candidate_contract_count = input
+        .duplicate_candidates
+        .iter()
+        .map(|candidate| normalized_contract(&candidate.contract_address))
+        .filter(|contract| contract != "unknown")
+        .collect::<BTreeSet<_>>()
+        .len() as i64;
+    let infringing_items = input
+        .infringing_tokens
+        .iter()
+        .filter(|token| !token.official_or_legit_reissue)
+        .filter_map(|token| {
+            duplicate_evidence_item(
+                &token.contract_address,
+                &token.token_id,
+                &token.match_reasons,
+            )
+        })
+        .collect::<Vec<_>>();
+    let suspected_duplicate_contract_count =
+        duplicate_contract_key_set(input, &infringing_items).len() as i64;
+    let infringing_nft_count = infringing_items
+        .iter()
+        .map(|item| format!("{}:{}", item.contract_address, item.token_id))
+        .collect::<BTreeSet<_>>()
+        .len() as i64;
 
     PaperDataQualityPayload {
+        representative_candidate_count,
+        candidate_contract_count,
+        suspected_duplicate_contract_count,
+        infringing_nft_count,
         sale_price_parseable_count,
         sale_price_total_count,
         sale_price_parseable_ratio: ratio_i64(sale_price_parseable_count, sale_price_total_count),

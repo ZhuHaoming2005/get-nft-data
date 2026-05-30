@@ -828,6 +828,7 @@ async fn finalize_seed_report(
     });
 
     let payload = SingleReportPayload {
+        report_type: String::new(),
         seed_contract: seed_contract_payload,
         paper_stats,
         seed_collection_stats,

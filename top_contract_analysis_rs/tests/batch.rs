@@ -707,7 +707,8 @@ fn batch_serializes_paper_stats_index_shape() {
     let object = serialized.as_object().unwrap();
     let keys: BTreeSet<_> = object.keys().map(String::as_str).collect();
 
-    assert_eq!(keys, BTreeSet::from(["paper_stats"]));
+    assert_eq!(keys, BTreeSet::from(["report_type", "paper_stats"]));
+    assert_eq!(serialized["report_type"], "batch_summary");
     assert!(!object.contains_key("seed_reports"));
     assert!(!object.contains_key("batch_summary"));
 }
@@ -729,11 +730,12 @@ fn batch_markdown_preserves_reference_summary_and_output_index_lines() {
             }],
             ..PaperStatsPayload::default()
         },
+        ..BatchSummaryPayload::default()
     };
 
     let markdown = render_batch_human_readable_report(&payload);
 
-    assert!(markdown.contains("# NFT 论文统计批量报告"));
+    assert!(markdown.contains("# NFT 论文统计汇总报告"));
     assert!(markdown.contains("## 重复规模"));
     assert!(markdown.contains("| token_uri | 4 | 40.00% (4/10) | 2 | 50.00% (2/4) |"));
     assert!(markdown.contains("## 地址分类"));
@@ -1354,6 +1356,7 @@ async fn batch_ignores_cached_seed_summary_and_global_metrics_from_full_payloads
 async fn batch_writes_summary_files_with_existing_names() {
     let payload = BatchSummaryPayload {
         paper_stats: PaperStatsPayload::default(),
+        ..BatchSummaryPayload::default()
     };
     let dir = tempdir().unwrap();
 

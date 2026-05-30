@@ -113,7 +113,7 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
     let seed = &payload.seed_contract;
 
     let mut lines = vec![
-        "# NFT 论文统计报告".to_string(),
+        "# NFT 论文统计单合约报告".to_string(),
         String::new(),
         "## 种子合约".to_string(),
         format!("- 链: {}", seed.chain),
@@ -138,7 +138,7 @@ pub fn render_human_readable_report(payload: &SingleReportPayload) -> String {
 }
 
 pub fn render_batch_human_readable_report(payload: &BatchSummaryPayload) -> String {
-    let mut lines = vec!["# NFT 论文统计批量报告".to_string(), String::new()];
+    let mut lines = vec!["# NFT 论文统计汇总报告".to_string(), String::new()];
 
     append_paper_stats_sections(&mut lines, &payload.paper_stats);
 
@@ -428,6 +428,16 @@ fn append_data_quality(lines: &mut Vec<String>, stats: &PaperStatsPayload) {
     lines.extend([
         String::new(),
         "## 数据质量".to_string(),
+        format!(
+            "- 代表候选样本数: {}",
+            quality.representative_candidate_count
+        ),
+        format!("- 候选合约数: {}", quality.candidate_contract_count),
+        format!(
+            "- 疑似重复合约数: {}",
+            quality.suspected_duplicate_contract_count
+        ),
+        format!("- 疑似侵权 NFT 数: {}", quality.infringing_nft_count),
         format!(
             "- 可解析销售价格: {} / {} ({})",
             quality.sale_price_parseable_count,

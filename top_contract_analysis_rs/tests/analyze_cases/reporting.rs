@@ -83,7 +83,11 @@ fn single_report_payload_serializes_current_python_top_level_shape() {
     let object = serialized.as_object().unwrap();
     let keys: BTreeSet<_> = object.keys().map(String::as_str).collect();
 
-    assert_eq!(keys, BTreeSet::from(["seed_contract", "paper_stats"]));
+    assert_eq!(
+        keys,
+        BTreeSet::from(["report_type", "seed_contract", "paper_stats"])
+    );
+    assert_eq!(serialized["report_type"], "single_seed");
     assert_eq!(serialized["seed_contract"]["contract_address"], "0xseed");
     assert!(serialized["paper_stats"].is_object());
     assert!(!object.contains_key("output_files"));
@@ -180,7 +184,7 @@ fn single_report_markdown_preserves_summary_sections_only() {
 
     let markdown = render_human_readable_report(&payload);
 
-    assert!(markdown.contains("# NFT 论文统计报告"));
+    assert!(markdown.contains("# NFT 论文统计单合约报告"));
     assert!(markdown.contains("## 种子合约"));
     assert!(markdown.contains("- 合约地址: 0xseed"));
     assert!(markdown.contains("- 合约部署者: 0xdeployer"));

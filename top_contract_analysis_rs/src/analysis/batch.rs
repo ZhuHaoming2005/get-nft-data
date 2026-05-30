@@ -162,6 +162,7 @@ pub async fn run_batch(
                 .map(|aggregate| &aggregate.paper_stats),
             request.paper_stats_config,
         ),
+        ..BatchSummaryPayload::default()
     })
 }
 

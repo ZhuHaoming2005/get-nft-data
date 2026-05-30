@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
 fn default_aggregate_count() -> i64 {
     1
@@ -24,6 +24,28 @@ fn default_true() -> bool {
 
 fn is_true(value: &bool) -> bool {
     *value
+}
+
+fn single_seed_report_type() -> String {
+    "single_seed".into()
+}
+
+fn batch_summary_report_type() -> String {
+    "batch_summary".into()
+}
+
+fn serialize_single_seed_report_type<S>(_value: &String, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str("single_seed")
+}
+
+fn serialize_batch_summary_report_type<S>(_value: &String, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str("batch_summary")
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -876,6 +898,14 @@ pub struct PaperHonestLossPayload {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct PaperDataQualityPayload {
+    #[serde(default)]
+    pub representative_candidate_count: i64,
+    #[serde(default)]
+    pub candidate_contract_count: i64,
+    #[serde(default)]
+    pub suspected_duplicate_contract_count: i64,
+    #[serde(default)]
+    pub infringing_nft_count: i64,
     pub sale_price_parseable_count: i64,
     pub sale_price_total_count: i64,
     pub sale_price_parseable_ratio: Option<f64>,
@@ -1073,6 +1103,11 @@ pub struct NftPropagationPathPayload {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct SingleReportPayload {
+    #[serde(
+        default = "single_seed_report_type",
+        serialize_with = "serialize_single_seed_report_type"
+    )]
+    pub report_type: String,
     pub seed_contract: SeedContractPayload,
     #[serde(default)]
     pub paper_stats: PaperStatsPayload,
@@ -1126,6 +1161,11 @@ pub struct SingleReportPayload {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct BatchSummaryPayload {
+    #[serde(
+        default = "batch_summary_report_type",
+        serialize_with = "serialize_batch_summary_report_type"
+    )]
+    pub report_type: String,
     #[serde(default)]
     pub paper_stats: PaperStatsPayload,
 }

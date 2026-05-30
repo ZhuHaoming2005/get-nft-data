@@ -21,6 +21,7 @@ fn single_report_serializes_new_paper_stats_contract_without_legacy_summary() {
     let payload = SingleReportPayload::default();
     let json = serde_json::to_value(&payload).unwrap();
 
+    assert_eq!(json["report_type"], "single_seed");
     assert!(json.get("paper_stats").is_some());
     assert!(json.get("report_summary").is_none());
     assert!(json.get("neutral_addresses").is_none());
@@ -35,6 +36,7 @@ fn batch_report_serializes_new_paper_stats_contract_without_legacy_summary() {
     let payload = BatchSummaryPayload::default();
     let json = serde_json::to_value(&payload).unwrap();
 
+    assert_eq!(json["report_type"], "batch_summary");
     assert!(json.get("paper_stats").is_some());
     assert!(json.get("batch_summary").is_none());
     assert!(json.get("seed_reports").is_none());
@@ -60,7 +62,10 @@ fn markdown_reports_render_paper_stats_without_legacy_sections() {
         paper_stats: paper_stats.clone(),
         ..SingleReportPayload::default()
     };
-    let batch = BatchSummaryPayload { paper_stats };
+    let batch = BatchSummaryPayload {
+        paper_stats,
+        ..BatchSummaryPayload::default()
+    };
 
     let single_markdown = render_human_readable_report(&single);
     let batch_markdown = render_batch_human_readable_report(&batch);
@@ -70,10 +75,118 @@ fn markdown_reports_render_paper_stats_without_legacy_sections() {
     assert!(!single_markdown.contains("## Seed 报告索引"));
     assert!(!single_markdown.contains("report_summary"));
 
-    assert!(batch_markdown.contains("# NFT 论文统计批量报告"));
+    assert!(batch_markdown.contains("# NFT 论文统计汇总报告"));
     assert!(batch_markdown.contains("## 重复规模"));
     assert!(!batch_markdown.contains("## Seed 报告索引"));
     assert!(!batch_markdown.contains("batch_summary"));
+}
+
+#[test]
+fn duplicate_scale_uses_expanded_infringing_tokens_before_representative_candidates() {
+    let seed_stats = SeedCollectionStatsPayload {
+        seed_nft_count: 10_000,
+        ..SeedCollectionStatsPayload::default()
+    };
+    let duplicate_candidates = vec![
+        DuplicateCandidate {
+            contract_address: "0xdup1".into(),
+            token_id: "representative-1".into(),
+            match_reasons: vec!["token_uri_match".into()],
+            ..DuplicateCandidate::default()
+        },
+        DuplicateCandidate {
+            contract_address: "0xdup2".into(),
+            token_id: "representative-2".into(),
+            match_reasons: vec!["image_uri_match".into()],
+            ..DuplicateCandidate::default()
+        },
+    ];
+    let duplicate_contracts = vec![
+        DuplicateContractPayload {
+            contract_address: "0xdup1".into(),
+            candidate_count: 3,
+            ..DuplicateContractPayload::default()
+        },
+        DuplicateContractPayload {
+            contract_address: "0xdup2".into(),
+            candidate_count: 2,
+            ..DuplicateContractPayload::default()
+        },
+    ];
+    let infringing_tokens = vec![
+        InfringingTokenRecord {
+            contract_address: "0xdup1".into(),
+            token_id: "1".into(),
+            match_reasons: vec!["token_uri_match".into(), "name_match".into()],
+            ..InfringingTokenRecord::default()
+        },
+        InfringingTokenRecord {
+            contract_address: "0xdup1".into(),
+            token_id: "2".into(),
+            match_reasons: vec!["token_uri_match".into(), "name_match".into()],
+            ..InfringingTokenRecord::default()
+        },
+        InfringingTokenRecord {
+            contract_address: "0xdup1".into(),
+            token_id: "3".into(),
+            match_reasons: vec!["token_uri_match".into()],
+            ..InfringingTokenRecord::default()
+        },
+        InfringingTokenRecord {
+            contract_address: "0xdup2".into(),
+            token_id: "10".into(),
+            match_reasons: vec!["image_uri_match".into()],
+            ..InfringingTokenRecord::default()
+        },
+        InfringingTokenRecord {
+            contract_address: "0xdup2".into(),
+            token_id: "11".into(),
+            match_reasons: vec!["image_uri_match".into()],
+            ..InfringingTokenRecord::default()
+        },
+        InfringingTokenRecord {
+            contract_address: "0xlegit".into(),
+            token_id: "99".into(),
+            match_reasons: vec!["token_uri_match".into()],
+            official_or_legit_reissue: true,
+            ..InfringingTokenRecord::default()
+        },
+    ];
+
+    let stats = build_paper_stats(PaperStatsInput {
+        config: PaperStatsConfig::default(),
+        seed_collection_stats: &seed_stats,
+        duplicate_candidates: &duplicate_candidates,
+        duplicate_contracts: &duplicate_contracts,
+        legit_duplicates: &[],
+        infringing_tokens: &infringing_tokens,
+        malicious_addresses: &[],
+        victim_acquisition_addresses: &[],
+        value_flow_edges: &[],
+        nft_propagation_paths: &Default::default(),
+    });
+
+    let total = stats
+        .duplicate_scale
+        .iter()
+        .find(|row| row.category == "total")
+        .unwrap();
+    assert_eq!(total.duplicate_nft_count, 5);
+    assert_eq!(total.duplicate_contract_count, 2);
+
+    let token_uri = stats
+        .duplicate_scale
+        .iter()
+        .find(|row| row.category == "token_uri")
+        .unwrap();
+    assert_eq!(token_uri.duplicate_nft_count, 3);
+    assert_eq!(token_uri.duplicate_contract_count, 1);
+
+    let quality = &stats.data_quality;
+    assert_eq!(quality.representative_candidate_count, 2);
+    assert_eq!(quality.candidate_contract_count, 2);
+    assert_eq!(quality.suspected_duplicate_contract_count, 2);
+    assert_eq!(quality.infringing_nft_count, 5);
 }
 
 #[test]
@@ -98,7 +211,10 @@ fn markdown_reports_use_contract_address_without_extra_chain_identifiers() {
         }],
         ..PaperStatsPayload::default()
     };
-    let batch_markdown = render_batch_human_readable_report(&BatchSummaryPayload { paper_stats });
+    let batch_markdown = render_batch_human_readable_report(&BatchSummaryPayload {
+        paper_stats,
+        ..BatchSummaryPayload::default()
+    });
 
     assert!(batch_markdown.contains("## 合约行为明细"));
     assert!(batch_markdown.contains("contract_address"));
@@ -119,6 +235,7 @@ fn markdown_places_large_tables_last_and_sorts_by_key_metrics() {
             sale_price_total_count: 2,
             sale_price_parseable_ratio: Some(0.5),
             legit_duplicate_contract_count: 0,
+            ..PaperDataQualityPayload::default()
         },
         contract_behavior_stats: vec![
             PaperContractBehaviorStatsPayload {
@@ -153,7 +270,10 @@ fn markdown_places_large_tables_last_and_sorts_by_key_metrics() {
         ..PaperStatsPayload::default()
     };
 
-    let markdown = render_batch_human_readable_report(&BatchSummaryPayload { paper_stats });
+    let markdown = render_batch_human_readable_report(&BatchSummaryPayload {
+        paper_stats,
+        ..BatchSummaryPayload::default()
+    });
 
     assert!(markdown.find("## 数据质量").unwrap() < markdown.find("## 合约行为明细").unwrap());
     assert!(
@@ -231,12 +351,14 @@ fn paper_stats_tracks_ratio_numerators_and_address_roles() {
             contract_address: "0xdup1".into(),
             minter_address: "0xrepeat".into(),
             token_id: "1".into(),
+            match_reasons: vec!["token_uri_match".into()],
             ..InfringingTokenRecord::default()
         },
         InfringingTokenRecord {
             contract_address: "0xdup2".into(),
             minter_address: "0xrepeat".into(),
             token_id: "2".into(),
+            match_reasons: vec!["image_uri_match".into()],
             ..InfringingTokenRecord::default()
         },
     ];
@@ -269,7 +391,7 @@ fn paper_stats_tracks_ratio_numerators_and_address_roles() {
         .iter()
         .find(|row| row.category == "token_uri")
         .unwrap();
-    assert_eq!(token_uri.duplicate_nft_ratio_numerator, 2);
+    assert_eq!(token_uri.duplicate_nft_ratio_numerator, 1);
     assert_eq!(token_uri.duplicate_nft_ratio_denominator, 10);
     assert_eq!(token_uri.duplicate_contract_ratio_numerator, 1);
     assert_eq!(token_uri.duplicate_contract_ratio_denominator, 3);
@@ -854,6 +976,8 @@ fn paper_stats_merges_duplicate_scale_with_global_contract_token_deduplication()
     assert_eq!(token_uri.duplicate_nft_ratio_denominator, 22);
     assert_eq!(token_uri.duplicate_contract_count, 1);
     assert_eq!(token_uri.duplicate_contract_ratio_denominator, 1);
+    assert_eq!(merged.data_quality.suspected_duplicate_contract_count, 1);
+    assert_eq!(merged.data_quality.infringing_nft_count, 1);
 }
 
 #[test]
