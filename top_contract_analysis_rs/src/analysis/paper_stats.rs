@@ -415,6 +415,15 @@ pub fn merge_paper_stats<'a>(
             .len() as i64,
     };
 
+    let duplicate_nft_denominator = duplicate_nft_keys
+        .get("total")
+        .map(|keys| keys.len() as i64)
+        .or_else(|| {
+            duplicate_rows
+                .get("total")
+                .map(|row| row.duplicate_nft_count)
+        })
+        .unwrap_or_default();
     merged.duplicate_scale = duplicate_rows
         .into_iter()
         .map(|(category, row)| {
@@ -434,9 +443,9 @@ pub fn merge_paper_stats<'a>(
             PaperDuplicateScaleRowPayload {
                 category,
                 duplicate_nft_count,
-                duplicate_nft_ratio: ratio_i64(duplicate_nft_count, row.duplicate_nft_denominator),
+                duplicate_nft_ratio: ratio_i64(duplicate_nft_count, duplicate_nft_denominator),
                 duplicate_nft_ratio_numerator: duplicate_nft_count,
-                duplicate_nft_ratio_denominator: row.duplicate_nft_denominator,
+                duplicate_nft_ratio_denominator: duplicate_nft_denominator,
                 duplicate_contract_count,
                 duplicate_contract_ratio: ratio_i64(
                     duplicate_contract_count,
@@ -692,10 +701,14 @@ fn duplicate_contract_key_set(
 
 fn build_duplicate_scale(input: &PaperStatsInput<'_>) -> DuplicateScaleBuild {
     let categories = ["token_uri", "image_uri", "metadata", "name", "total"];
-    let seed_nft_count = input.seed_collection_stats.seed_nft_count.max(0);
     let evidence_items = duplicate_evidence_items(input);
     let contract_denominator_keys = duplicate_contract_key_set(input, &evidence_items);
     let duplicate_contract_denominator = contract_denominator_keys.len() as i64;
+    let duplicate_nft_denominator = evidence_items
+        .iter()
+        .map(|item| format!("{}:{}", item.contract_address, item.token_id.trim()))
+        .collect::<BTreeSet<_>>()
+        .len() as i64;
 
     let rows = categories
         .par_iter()
@@ -731,9 +744,9 @@ fn build_duplicate_scale(input: &PaperStatsInput<'_>) -> DuplicateScaleBuild {
                 PaperDuplicateScaleRowPayload {
                     category: (*category).to_string(),
                     duplicate_nft_count,
-                    duplicate_nft_ratio: ratio_i64(duplicate_nft_count, seed_nft_count),
+                    duplicate_nft_ratio: ratio_i64(duplicate_nft_count, duplicate_nft_denominator),
                     duplicate_nft_ratio_numerator: duplicate_nft_count,
-                    duplicate_nft_ratio_denominator: seed_nft_count,
+                    duplicate_nft_ratio_denominator: duplicate_nft_denominator,
                     duplicate_contract_count,
                     duplicate_contract_ratio: ratio_i64(
                         duplicate_contract_count,
@@ -2516,21 +2529,10 @@ fn build_data_quality(input: &PaperStatsInput<'_>) -> PaperDataQualityPayload {
         .filter(|contract| contract != "unknown")
         .collect::<BTreeSet<_>>()
         .len() as i64;
-    let infringing_items = input
-        .infringing_tokens
-        .iter()
-        .filter(|token| !token.official_or_legit_reissue)
-        .filter_map(|token| {
-            duplicate_evidence_item(
-                &token.contract_address,
-                &token.token_id,
-                &token.match_reasons,
-            )
-        })
-        .collect::<Vec<_>>();
+    let evidence_items = duplicate_evidence_items(input);
     let suspected_duplicate_contract_count =
-        duplicate_contract_key_set(input, &infringing_items).len() as i64;
-    let infringing_nft_count = infringing_items
+        duplicate_contract_key_set(input, &evidence_items).len() as i64;
+    let infringing_nft_count = evidence_items
         .iter()
         .map(|item| format!("{}:{}", item.contract_address, item.token_id))
         .collect::<BTreeSet<_>>()

@@ -297,20 +297,19 @@ fn append_contract_behavior_details(lines: &mut Vec<String>, stats: &PaperStatsP
     lines.extend([
         String::new(),
         "## 合约行为明细".to_string(),
-        "| contract_address | Wash Trading | Pump-and-Exit | Star | Layered | Inventory | Honest buyers | Impact USD |".to_string(),
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |".to_string(),
+        "| contract_address | Wash Trading | Pump-and-Exit | Star | Layered | Inventory | Honest buyers |".to_string(),
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |".to_string(),
     ]);
     for row in &rows {
         lines.push(format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} |",
             row.contract_address,
             row.wash_trading.len(),
             row.pump_and_exit.len(),
             row.star_behaviors.len(),
             row.layered_transfers.len(),
             row.inventory_concentration.len(),
-            row.honest_buyers_top.len(),
-            format_number(contract_behavior_impact_usd(row))
+            row.honest_buyers_top.len()
         ));
     }
 
