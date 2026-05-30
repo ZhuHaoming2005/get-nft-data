@@ -118,16 +118,22 @@ struct AttackerCostBuild {
     by_contract_usd: BTreeMap<String, f64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum AttackerCostStage {
+    Setup,
+    Lure,
+    Exit,
+}
+
 #[derive(Default)]
 struct HonestLossBuild {
-    rows: Vec<PaperHonestLossPayload>,
+    payload: PaperHonestLossPayload,
     total_loss_by_contract_usd: BTreeMap<String, f64>,
     stuck_time_numerator_by_contract: BTreeMap<String, f64>,
     stuck_time_denominator_by_contract: BTreeMap<String, f64>,
 }
 
-struct LossRowInput<'a> {
-    category: &'a str,
+struct LossRowInput {
     stuck_nft_count: i64,
     total_nft_count: i64,
     stuck_time_numerator: f64,
@@ -235,8 +241,14 @@ pub fn build_paper_stats(input: PaperStatsInput<'_>) -> PaperStatsPayload {
         &behavior_nfts_by_type,
         &behavior_buyers_by_type,
     );
-    let attacker_cost = build_attacker_cost(input.config, input.value_flow_edges);
-    let honest_loss = build_honest_loss_rows(
+    let explicit_malicious_addresses = explicit_malicious_address_set(input.malicious_addresses);
+    let attacker_cost = build_attacker_cost(
+        input.config,
+        input.value_flow_edges,
+        &address_sets,
+        &explicit_malicious_addresses,
+    );
+    let honest_loss = build_honest_loss(
         input.config,
         &address_sets,
         input.victim_acquisition_addresses,
@@ -249,7 +261,7 @@ pub fn build_paper_stats(input: PaperStatsInput<'_>) -> PaperStatsPayload {
         contract_behavior_stats,
         malicious_behavior_summary,
         attacker_cost: attacker_cost.payload,
-        honest_loss: honest_loss.rows,
+        honest_loss: honest_loss.payload,
         data_quality: build_data_quality(&input),
         malicious_addresses: address_sets.malicious.into_iter().collect(),
         honest_addresses: address_sets.honest.into_iter().collect(),
@@ -285,7 +297,7 @@ pub fn merge_paper_stats<'a>(
     config: PaperStatsConfig,
 ) -> PaperStatsPayload {
     let mut duplicate_rows = BTreeMap::<String, DuplicateScaleAccumulator>::new();
-    let mut honest_loss_rows = BTreeMap::<String, HonestLossAccumulator>::new();
+    let mut honest_loss = HonestLossAccumulator::default();
     let mut duplicate_nft_keys = BTreeMap::<String, BTreeSet<String>>::new();
     let mut duplicate_contract_keys = BTreeMap::<String, BTreeSet<String>>::new();
     let mut duplicate_contract_denominator_keys = BTreeSet::<String>::new();
@@ -372,17 +384,15 @@ pub fn merge_paper_stats<'a>(
             &stats.stuck_time_denominator_by_contract,
         );
 
-        for row in &stats.honest_loss {
-            let entry = honest_loss_rows.entry(row.category.clone()).or_default();
-            entry.stuck_nft_count += row.stuck_nft_count;
-            entry.stuck_nft_denominator += row.stuck_nft_ratio_denominator;
-            entry.stuck_time_numerator += row.stuck_time_ratio_numerator;
-            entry.stuck_time_denominator += row.stuck_time_ratio_denominator;
-            entry.secondary_sale_loss_eth += row.secondary_sale_loss_eth;
-            entry.secondary_sale_loss_usd += row.secondary_sale_loss_usd;
-            entry.paid_mint_loss_eth += row.paid_mint_loss_eth;
-            entry.paid_mint_loss_usd += row.paid_mint_loss_usd;
-        }
+        let row = &stats.honest_loss;
+        honest_loss.stuck_nft_count += row.stuck_nft_count;
+        honest_loss.stuck_nft_denominator += row.stuck_nft_ratio_denominator;
+        honest_loss.stuck_time_numerator += row.stuck_time_ratio_numerator;
+        honest_loss.stuck_time_denominator += row.stuck_time_ratio_denominator;
+        honest_loss.secondary_sale_loss_eth += row.secondary_sale_loss_eth;
+        honest_loss.secondary_sale_loss_usd += row.secondary_sale_loss_usd;
+        honest_loss.paid_mint_loss_eth += row.paid_mint_loss_eth;
+        honest_loss.paid_mint_loss_usd += row.paid_mint_loss_usd;
 
         merged.data_quality.sale_price_parseable_count +=
             stats.data_quality.sale_price_parseable_count;
@@ -457,36 +467,33 @@ pub fn merge_paper_stats<'a>(
         })
         .collect();
 
-    merged.honest_loss = honest_loss_rows
-        .into_iter()
-        .map(|(category, row)| {
-            let total_loss_usd = row.secondary_sale_loss_usd + row.paid_mint_loss_usd;
-            let top_loss_numerator = if category == "total" {
-                top_contribution_numerator(&merged.honest_loss_by_contract_usd, config)
-            } else {
-                total_loss_usd
-            };
-            PaperHonestLossPayload {
-                category,
-                stuck_nft_count: row.stuck_nft_count,
-                stuck_nft_ratio: ratio_i64(row.stuck_nft_count, row.stuck_nft_denominator),
-                stuck_nft_ratio_numerator: row.stuck_nft_count,
-                stuck_nft_ratio_denominator: row.stuck_nft_denominator,
-                stuck_time_ratio: ratio_f64(row.stuck_time_numerator, row.stuck_time_denominator),
-                stuck_time_ratio_numerator: row.stuck_time_numerator,
-                stuck_time_ratio_denominator: row.stuck_time_denominator,
-                secondary_sale_loss_eth: row.secondary_sale_loss_eth,
-                secondary_sale_loss_usd: row.secondary_sale_loss_usd,
-                paid_mint_loss_eth: row.paid_mint_loss_eth,
-                paid_mint_loss_usd: row.paid_mint_loss_usd,
-                total_loss_eth: row.secondary_sale_loss_eth + row.paid_mint_loss_eth,
-                total_loss_usd,
-                top_contract_loss_contribution_ratio: ratio_f64(top_loss_numerator, total_loss_usd),
-                top_contract_loss_contribution_numerator: top_loss_numerator,
-                top_contract_loss_contribution_denominator: total_loss_usd,
-            }
-        })
-        .collect();
+    let total_loss_usd = honest_loss.secondary_sale_loss_usd + honest_loss.paid_mint_loss_usd;
+    let top_loss_numerator =
+        top_contribution_numerator(&merged.honest_loss_by_contract_usd, config);
+    merged.honest_loss = PaperHonestLossPayload {
+        stuck_nft_count: honest_loss.stuck_nft_count,
+        stuck_nft_ratio: ratio_i64(
+            honest_loss.stuck_nft_count,
+            honest_loss.stuck_nft_denominator,
+        ),
+        stuck_nft_ratio_numerator: honest_loss.stuck_nft_count,
+        stuck_nft_ratio_denominator: honest_loss.stuck_nft_denominator,
+        stuck_time_ratio: ratio_f64(
+            honest_loss.stuck_time_numerator,
+            honest_loss.stuck_time_denominator,
+        ),
+        stuck_time_ratio_numerator: honest_loss.stuck_time_numerator,
+        stuck_time_ratio_denominator: honest_loss.stuck_time_denominator,
+        secondary_sale_loss_eth: honest_loss.secondary_sale_loss_eth,
+        secondary_sale_loss_usd: honest_loss.secondary_sale_loss_usd,
+        paid_mint_loss_eth: honest_loss.paid_mint_loss_eth,
+        paid_mint_loss_usd: honest_loss.paid_mint_loss_usd,
+        total_loss_eth: honest_loss.secondary_sale_loss_eth + honest_loss.paid_mint_loss_eth,
+        total_loss_usd,
+        top_contract_loss_contribution_ratio: ratio_f64(top_loss_numerator, total_loss_usd),
+        top_contract_loss_contribution_numerator: top_loss_numerator,
+        top_contract_loss_contribution_denominator: total_loss_usd,
+    };
 
     merged.attacker_cost.top_contract_contribution_numerator =
         top_contribution_numerator(&merged.attacker_cost_by_contract_usd, config);
@@ -499,6 +506,10 @@ pub fn merge_paper_stats<'a>(
         merged.data_quality.sale_price_parseable_count,
         merged.data_quality.sale_price_total_count,
     );
+    merged.data_quality.sale_price_parseable_ratio_numerator =
+        merged.data_quality.sale_price_parseable_count;
+    merged.data_quality.sale_price_parseable_ratio_denominator =
+        merged.data_quality.sale_price_total_count;
     if !duplicate_contract_denominator_keys.is_empty() {
         merged.data_quality.suspected_duplicate_contract_count =
             duplicate_contract_denominator_keys.len() as i64;
@@ -899,6 +910,7 @@ fn build_address_sets(input: &PaperStatsInput<'_>) -> AddressSets {
         for address in [
             normalized_address(&edge.from_address),
             normalized_address(&edge.to_address),
+            normalized_address(&edge.gas_payer_address),
         ] {
             if !is_participant_address(&address) {
                 continue;
@@ -951,38 +963,66 @@ fn build_address_classification(address_sets: &AddressSets) -> PaperAddressClass
     }
 }
 
+fn explicit_malicious_address_set(
+    malicious_addresses: &[MaliciousAddressPayload],
+) -> BTreeSet<String> {
+    malicious_addresses
+        .iter()
+        .map(|item| normalized_address(&item.address))
+        .filter(|address| is_participant_address(address))
+        .collect()
+}
+
 fn build_attacker_cost(
     config: PaperStatsConfig,
     value_flow_edges: &[ValueFlowEdgePayload],
+    address_sets: &AddressSets,
+    explicit_malicious_addresses: &BTreeSet<String>,
 ) -> AttackerCostBuild {
     let mut build = AttackerCostBuild::default();
+    let mut counted_gas_keys = BTreeSet::<(String, AttackerCostStage, String)>::new();
     for edge in value_flow_edges {
-        let gas_eth =
-            edge.value_with_gas_eth.unwrap_or_default() - edge.value_eth.unwrap_or_default();
-        let gas_usd =
-            edge.value_with_gas_usd.unwrap_or_default() - edge.value_usd.unwrap_or_default();
+        let gas_eth = edge.gas_eth.unwrap_or_else(|| {
+            edge.value_with_gas_eth.unwrap_or_default() - edge.value_eth.unwrap_or_default()
+        });
+        let gas_usd = edge.gas_usd.unwrap_or_else(|| {
+            edge.value_with_gas_usd.unwrap_or_default() - edge.value_usd.unwrap_or_default()
+        });
         let gas_eth = gas_eth.max(0.0);
         let gas_usd = gas_usd.max(0.0);
-        match edge.channel.as_str() {
-            "mint_payment" | "funding" | "deployment" | "contract_deploy" => {
+        let Some(stage) = attacker_cost_stage(edge, address_sets, explicit_malicious_addresses)
+        else {
+            continue;
+        };
+        let contract = normalized_contract(&edge.contract_address);
+        let gas_key = (
+            contract.clone(),
+            stage,
+            if edge.tx_hash.trim().is_empty() {
+                edge.edge_id.clone()
+            } else {
+                edge.tx_hash.to_lowercase()
+            },
+        );
+        if !counted_gas_keys.insert(gas_key) {
+            continue;
+        }
+        match stage {
+            AttackerCostStage::Setup => {
                 build.payload.setup_gas_eth += gas_eth;
                 build.payload.setup_gas_usd += gas_usd;
             }
-            "sale_payment" | "lure_payment" => {
+            AttackerCostStage::Lure => {
                 build.payload.lure_gas_eth += gas_eth;
                 build.payload.lure_gas_usd += gas_usd;
             }
-            "withdrawal" | "cashout_hop" | "exit_payment" => {
+            AttackerCostStage::Exit => {
                 build.payload.exit_gas_eth += gas_eth;
                 build.payload.exit_gas_usd += gas_usd;
             }
-            _ => {}
         }
         if gas_usd > 0.0 {
-            *build
-                .by_contract_usd
-                .entry(normalized_contract(&edge.contract_address))
-                .or_default() += gas_usd;
+            *build.by_contract_usd.entry(contract).or_default() += gas_usd;
         }
     }
     build.payload.total_gas_eth =
@@ -997,6 +1037,64 @@ fn build_attacker_cost(
         build.payload.top_contract_contribution_denominator,
     );
     build
+}
+
+fn attacker_cost_stage(
+    edge: &ValueFlowEdgePayload,
+    address_sets: &AddressSets,
+    explicit_malicious_addresses: &BTreeSet<String>,
+) -> Option<AttackerCostStage> {
+    match edge.channel.as_str() {
+        "deployment" | "contract_deploy" => Some(AttackerCostStage::Setup),
+        "mint_payment" | "funding" => {
+            is_attacker_fee_payer(edge, address_sets, explicit_malicious_addresses)
+                .then_some(AttackerCostStage::Setup)
+        }
+        "sale_payment" | "lure_payment" => {
+            is_attacker_fee_payer(edge, address_sets, explicit_malicious_addresses)
+                .then_some(AttackerCostStage::Lure)
+        }
+        "withdrawal" | "cashout_hop" | "exit_payment" => {
+            is_attacker_fee_payer(edge, address_sets, explicit_malicious_addresses)
+                .then_some(AttackerCostStage::Exit)
+        }
+        _ => None,
+    }
+}
+
+fn is_attacker_fee_payer(
+    edge: &ValueFlowEdgePayload,
+    address_sets: &AddressSets,
+    explicit_malicious_addresses: &BTreeSet<String>,
+) -> bool {
+    let payer = if edge.gas_payer_address.trim().is_empty() {
+        normalized_address(&edge.from_address)
+    } else {
+        normalized_address(&edge.gas_payer_address)
+    };
+    if address_sets.honest.contains(&payer) {
+        return false;
+    }
+    address_sets.malicious.contains(&payer)
+        || explicit_malicious_addresses.contains(&payer)
+        || is_operator_role(&edge.from_role)
+}
+
+fn is_operator_role(role: &str) -> bool {
+    matches!(
+        role,
+        "attacker"
+            | "malicious"
+            | "operator_wallet"
+            | "contract_deployer"
+            | "contract_owner"
+            | "contract_admin"
+            | "proxy_admin"
+            | "external_funder"
+            | "paid_minter"
+            | "mint_contract"
+            | "cashout_intermediate"
+    )
 }
 
 fn top_contribution_numerator(
@@ -1015,11 +1113,10 @@ fn top_contribution_numerator(
         .sum()
 }
 
-fn loss_row(input: LossRowInput<'_>) -> PaperHonestLossPayload {
+fn loss_row(input: LossRowInput) -> PaperHonestLossPayload {
     let total_loss_eth = input.secondary_sale_loss_eth + input.paid_mint_loss_eth;
     let total_loss_usd = input.secondary_sale_loss_usd + input.paid_mint_loss_usd;
     PaperHonestLossPayload {
-        category: input.category.to_string(),
         stuck_nft_count: input.stuck_nft_count,
         stuck_nft_ratio: ratio_i64(input.stuck_nft_count, input.total_nft_count),
         stuck_nft_ratio_numerator: input.stuck_nft_count,
@@ -1042,7 +1139,7 @@ fn loss_row(input: LossRowInput<'_>) -> PaperHonestLossPayload {
     }
 }
 
-fn build_honest_loss_rows(
+fn build_honest_loss(
     config: PaperStatsConfig,
     address_sets: &AddressSets,
     victim_acquisition_addresses: &[VictimAcquisitionAddressPayload],
@@ -1063,10 +1160,7 @@ fn build_honest_loss_rows(
         .sum();
     let paid_mint_total_nft_count: i64 = victim_acquisition_addresses
         .iter()
-        .map(|item| {
-            item.paid_mint_stuck_token_count
-                .max(item.paid_mint_edge_count)
-        })
+        .map(paid_mint_observed_token_count)
         .sum();
 
     let secondary_sale_loss_eth: f64 = victim_acquisition_addresses
@@ -1109,12 +1203,6 @@ fn build_honest_loss_rows(
     let total_stuck_nft_count = secondary_stuck_nft_count + paid_mint_stuck_nft_count;
     let total_nft_count = secondary_total_nft_count + paid_mint_total_nft_count;
 
-    let secondary_loss_by_contract_usd = loss_by_contract(victim_acquisition_addresses, |item| {
-        item.secondary_sale_stuck_cost_usd
-    });
-    let paid_mint_loss_by_contract_usd = loss_by_contract(victim_acquisition_addresses, |item| {
-        item.paid_mint_stuck_cost_usd
-    });
     let total_loss_by_contract_usd = loss_by_contract(victim_acquisition_addresses, |item| {
         item.total_stuck_cost_usd
     });
@@ -1125,53 +1213,18 @@ fn build_honest_loss_rows(
     let stuck_time_denominator: f64 = stuck_time_denominator_by_contract.values().sum();
 
     HonestLossBuild {
-        rows: vec![
-            loss_row(LossRowInput {
-                category: "secondary_sale",
-                stuck_nft_count: secondary_stuck_nft_count,
-                total_nft_count: secondary_total_nft_count,
-                stuck_time_numerator,
-                stuck_time_denominator,
-                secondary_sale_loss_eth,
-                secondary_sale_loss_usd,
-                paid_mint_loss_eth: 0.0,
-                paid_mint_loss_usd: 0.0,
-                top_loss_numerator: top_contribution_numerator(
-                    &secondary_loss_by_contract_usd,
-                    config,
-                ),
-                top_loss_denominator: secondary_sale_loss_usd,
-            }),
-            loss_row(LossRowInput {
-                category: "paid_mint",
-                stuck_nft_count: paid_mint_stuck_nft_count,
-                total_nft_count: paid_mint_total_nft_count,
-                stuck_time_numerator: 0.0,
-                stuck_time_denominator: 0.0,
-                secondary_sale_loss_eth: 0.0,
-                secondary_sale_loss_usd: 0.0,
-                paid_mint_loss_eth: total_paid_mint_eth,
-                paid_mint_loss_usd: total_paid_mint_usd,
-                top_loss_numerator: top_contribution_numerator(
-                    &paid_mint_loss_by_contract_usd,
-                    config,
-                ),
-                top_loss_denominator: total_paid_mint_usd,
-            }),
-            loss_row(LossRowInput {
-                category: "total",
-                stuck_nft_count: total_stuck_nft_count,
-                total_nft_count,
-                stuck_time_numerator,
-                stuck_time_denominator,
-                secondary_sale_loss_eth: total_secondary_eth,
-                secondary_sale_loss_usd: total_secondary_usd,
-                paid_mint_loss_eth: total_paid_mint_eth,
-                paid_mint_loss_usd: total_paid_mint_usd,
-                top_loss_numerator: top_contribution_numerator(&total_loss_by_contract_usd, config),
-                top_loss_denominator: total_secondary_usd + total_paid_mint_usd,
-            }),
-        ],
+        payload: loss_row(LossRowInput {
+            stuck_nft_count: total_stuck_nft_count,
+            total_nft_count,
+            stuck_time_numerator,
+            stuck_time_denominator,
+            secondary_sale_loss_eth: total_secondary_eth,
+            secondary_sale_loss_usd: total_secondary_usd,
+            paid_mint_loss_eth: total_paid_mint_eth,
+            paid_mint_loss_usd: total_paid_mint_usd,
+            top_loss_numerator: top_contribution_numerator(&total_loss_by_contract_usd, config),
+            top_loss_denominator: total_secondary_usd + total_paid_mint_usd,
+        }),
         total_loss_by_contract_usd,
         stuck_time_numerator_by_contract,
         stuck_time_denominator_by_contract,
@@ -1362,8 +1415,8 @@ fn build_contract_behavior_stats(
                 .iter()
                 .map(|pattern| pattern.row.clone())
                 .collect();
-            let honest_buyers_top =
-                honest_buyers_top(input, &contract_address, path, &source_patterns_by_buyer);
+            let honest_buyers =
+                honest_buyers(input, &contract_address, path, &source_patterns_by_buyer);
 
             let stats = PaperContractBehaviorStatsPayload {
                 contract_address,
@@ -1372,14 +1425,14 @@ fn build_contract_behavior_stats(
                 star_behaviors,
                 layered_transfers,
                 inventory_concentration,
-                honest_buyers_top,
+                honest_buyers,
             };
             (!stats.wash_trading.is_empty()
                 || !stats.pump_and_exit.is_empty()
                 || !stats.star_behaviors.is_empty()
                 || !stats.layered_transfers.is_empty()
                 || !stats.inventory_concentration.is_empty()
-                || !stats.honest_buyers_top.is_empty())
+                || !stats.honest_buyers.is_empty())
             .then_some(ContractBehaviorBuild {
                 stats,
                 behavior_contracts,
@@ -1460,6 +1513,11 @@ fn detect_wash_trading(
             .map(|edge| edge.block_time)
             .filter(|block_time| *block_time > 0)
             .collect::<Vec<_>>();
+        let block_numbers = all_edges
+            .iter()
+            .map(|edge| edge.block_number)
+            .filter(|block_number| *block_number > 0)
+            .collect::<Vec<_>>();
         let fake_volume_eth: f64 = all_edges
             .iter()
             .map(|edge| edge.price_eth.unwrap_or_default())
@@ -1478,7 +1536,7 @@ fn detect_wash_trading(
             },
         );
         let max_block_time = block_times.iter().max().copied().unwrap_or_default();
-        let avg_cycle_blocks = match (block_times.iter().min(), block_times.iter().max()) {
+        let avg_cycle_blocks = match (block_numbers.iter().min(), block_numbers.iter().max()) {
             (Some(first), Some(last)) => Some((*last - *first).max(0) as f64),
             _ => None,
         };
@@ -1664,24 +1722,18 @@ fn detect_pump_and_exit(
             .map(|edge| edge.block_time)
             .filter(|block_time| *block_time > 0)
             .min();
-        let exit_price_premium =
-            average_optional(exit_edges.iter().filter_map(|edge| edge.price_usd))
-                .and_then(|avg_exit| {
-                    cycle
-                        .avg_price_usd
-                        .filter(|value| *value > 0.0)
-                        .map(|avg| avg_exit / avg)
-                })
-                .or_else(|| {
-                    average_optional(exit_edges.iter().filter_map(|edge| edge.price_eth)).and_then(
-                        |avg_exit| {
-                            cycle
-                                .avg_price_eth
-                                .filter(|value| *value > 0.0)
-                                .map(|avg| avg_exit / avg)
-                        },
-                    )
-                });
+        let (exit_price_premium, exit_price_premium_numerator, exit_price_premium_denominator) =
+            price_premium_components(
+                average_optional(exit_edges.iter().filter_map(|edge| edge.price_usd)),
+                cycle.avg_price_usd,
+            )
+            .or_else(|| {
+                price_premium_components(
+                    average_optional(exit_edges.iter().filter_map(|edge| edge.price_eth)),
+                    cycle.avg_price_eth,
+                )
+            })
+            .unwrap_or((None, 0.0, 0.0));
         if exit_price_premium
             .filter(|premium| *premium > 1.0)
             .is_none()
@@ -1698,6 +1750,8 @@ fn detect_pump_and_exit(
                 exit_delay_seconds: first_exit_time
                     .map(|time| (time - cycle.max_block_time).max(0)),
                 exit_price_premium,
+                exit_price_premium_numerator,
+                exit_price_premium_denominator,
                 exit_ratio: ratio_i64(exit_tokens.len() as i64, cycle.token_ids.len() as i64),
                 exit_ratio_numerator: exit_tokens.len() as i64,
                 exit_ratio_denominator: cycle.token_ids.len() as i64,
@@ -2066,34 +2120,51 @@ fn detect_inventory_concentration(
     rows
 }
 
-fn honest_buyers_top(
+fn honest_buyers(
     input: &PaperStatsInput<'_>,
     contract_address: &str,
     path: &NftPropagationPathPayload,
     source_patterns_by_buyer: &BTreeMap<String, BTreeSet<String>>,
 ) -> Vec<PaperHonestBuyerRowPayload> {
-    let first_time = if path.summary.first_block_time > 0 {
-        path.summary.first_block_time
-    } else {
-        path.edges
-            .iter()
-            .filter_map(|edge| (edge.block_time > 0).then_some(edge.block_time))
-            .min()
-            .unwrap_or_default()
-    };
-    let first_sale_by_buyer = path
+    let mint_payment_times = input
+        .value_flow_edges
+        .iter()
+        .filter(|edge| {
+            edge.channel == "mint_payment"
+                && normalized_contract(&edge.contract_address) == contract_address
+                && edge.block_time > 0
+        })
+        .collect::<Vec<_>>();
+    let first_time = path
+        .summary
+        .first_block_time
+        .gt(&0)
+        .then_some(path.summary.first_block_time)
+        .or_else(|| {
+            path.edges
+                .iter()
+                .filter_map(|edge| (edge.block_time > 0).then_some(edge.block_time))
+                .chain(mint_payment_times.iter().map(|edge| edge.block_time))
+                .min()
+        })
+        .unwrap_or_default();
+    let mut first_acquisition_by_buyer = path
         .edges
         .iter()
         .filter(|edge| edge.channel == "sale")
         .fold(BTreeMap::<String, i64>::new(), |mut map, edge| {
             let buyer = normalized_address(&edge.to_address);
             if is_participant_address(&buyer) && edge.block_time > 0 {
-                map.entry(buyer)
-                    .and_modify(|time| *time = (*time).min(edge.block_time))
-                    .or_insert(edge.block_time);
+                insert_min_time(&mut map, buyer, edge.block_time);
             }
             map
         });
+    for edge in mint_payment_times {
+        let buyer = normalized_address(&edge.from_address);
+        if is_participant_address(&buyer) {
+            insert_min_time(&mut first_acquisition_by_buyer, buyer, edge.block_time);
+        }
+    }
 
     let mut rows = input
         .victim_acquisition_addresses
@@ -2109,7 +2180,7 @@ fn honest_buyers_top(
         })
         .map(|item| {
             let buyer = normalized_address(&item.address);
-            let first_buy_time = first_sale_by_buyer.get(&buyer).copied();
+            let first_buy_time = first_acquisition_by_buyer.get(&buyer).copied();
             let source_pattern = source_patterns_by_buyer
                 .get(&buyer)
                 .map(|patterns| patterns.iter().cloned().collect::<Vec<_>>().join("+"))
@@ -2117,7 +2188,7 @@ fn honest_buyers_top(
                 .unwrap_or_else(|| "unattributed_sale".into());
             PaperHonestBuyerRowPayload {
                 honest_buyer: buyer,
-                fake_nft_bought: item.secondary_sale_count + item.paid_mint_stuck_token_count,
+                fake_nft_bought: item.secondary_sale_count + paid_mint_observed_token_count(item),
                 total_paid_eth: item
                     .total_acquisition_cost_eth
                     .max(item.total_stuck_cost_eth),
@@ -2142,6 +2213,19 @@ fn honest_buyers_top(
             .unwrap_or(Ordering::Equal)
     });
     rows
+}
+
+fn insert_min_time(target: &mut BTreeMap<String, i64>, address: String, time: i64) {
+    target
+        .entry(address)
+        .and_modify(|existing| *existing = (*existing).min(time))
+        .or_insert(time);
+}
+
+fn paid_mint_observed_token_count(item: &VictimAcquisitionAddressPayload) -> i64 {
+    item.paid_mint_token_count
+        .max(item.paid_mint_stuck_token_count)
+        .max(item.paid_mint_edge_count)
 }
 
 fn build_behavior_summary(
@@ -2461,6 +2545,15 @@ fn average_optional(values: impl Iterator<Item = f64>) -> Option<f64> {
     (!values.is_empty()).then_some(values.iter().sum::<f64>() / values.len() as f64)
 }
 
+fn price_premium_components(
+    numerator: Option<f64>,
+    denominator: Option<f64>,
+) -> Option<(Option<f64>, f64, f64)> {
+    let numerator = numerator.filter(|value| *value > 0.0)?;
+    let denominator = denominator.filter(|value| *value > 0.0)?;
+    Some((Some(numerator / denominator), numerator, denominator))
+}
+
 fn gini(mut values: Vec<f64>) -> Option<f64> {
     if values.is_empty() {
         return None;
@@ -2546,6 +2639,8 @@ fn build_data_quality(input: &PaperStatsInput<'_>) -> PaperDataQualityPayload {
         sale_price_parseable_count,
         sale_price_total_count,
         sale_price_parseable_ratio: ratio_i64(sale_price_parseable_count, sale_price_total_count),
+        sale_price_parseable_ratio_numerator: sale_price_parseable_count,
+        sale_price_parseable_ratio_denominator: sale_price_total_count,
         legit_duplicate_contract_count: input.legit_duplicates.len() as i64,
     }
 }

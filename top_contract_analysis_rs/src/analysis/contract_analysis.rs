@@ -5,8 +5,9 @@ use crate::models::{ContractMetadata, DuplicateCandidate, DuplicateContractPaylo
 
 use super::{
     address_records, analyze_victim_signals_from_active_sellers,
-    compute_mint_payment_edges_for_contract, map_address_signals, propagation, signals,
-    AnalysisDeps, AnalysisOutputState, AnalyzeRequest, ContractAnalysisResult,
+    compute_attacker_cost_edges_for_contract, compute_mint_payment_edges_for_contract,
+    map_address_signals, propagation, signals, AnalysisDeps, AnalysisOutputState, AnalyzeRequest,
+    ContractAnalysisResult,
 };
 
 const CURRENT_SUPPLY_MISMATCH_MIN_CANDIDATES: usize = 20;
@@ -57,6 +58,7 @@ pub(super) fn merge_contract_analysis_result(
         .extend(result.address_attributions);
     state.market_events.extend(result.market_events);
     state.mint_payment_edges.extend(result.mint_payment_edges);
+    state.attacker_cost_edges.extend(result.attacker_cost_edges);
     if let Some(path) = result.nft_propagation_path {
         state
             .nft_propagation_paths
@@ -121,6 +123,7 @@ pub(super) fn implausible_candidate_filtered_result(
         address_attributions: Vec::new(),
         market_events: Vec::new(),
         mint_payment_edges: Vec::new(),
+        attacker_cost_edges: Vec::new(),
         nft_propagation_path: None,
     }
 }
@@ -296,6 +299,7 @@ pub(super) async fn analyze_duplicate_contract(
             address_attributions: vec![],
             market_events: vec![],
             mint_payment_edges: vec![],
+            attacker_cost_edges: vec![],
             nft_propagation_path: None,
         });
     }
@@ -366,6 +370,16 @@ pub(super) async fn analyze_duplicate_contract(
             honest_addresses: &contract_honest,
             secondary_sale_victim_addresses: &contract_secondary_sale_victims,
         });
+    let attacker_cost_edges = compute_attacker_cost_edges_for_contract(
+        request,
+        deps,
+        contract_address,
+        contract_metadata.as_ref(),
+        &sales,
+        &contract_malicious,
+        &contract_honest,
+    )
+    .await?;
 
     Ok(ContractAnalysisResult {
         contract_address: contract_address.to_string(),
@@ -381,6 +395,7 @@ pub(super) async fn analyze_duplicate_contract(
         address_attributions,
         market_events: Vec::new(),
         mint_payment_edges,
+        attacker_cost_edges,
         nft_propagation_path: Some(nft_propagation_path),
     })
 }

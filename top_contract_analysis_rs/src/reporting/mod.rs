@@ -183,13 +183,15 @@ fn append_address_classification(lines: &mut Vec<String>, stats: &PaperStatsPayl
     lines.extend([
         String::new(),
         "## 地址分类".to_string(),
-        format!("- 恶意地址数: {}", address.malicious_address_count),
+        "| 类别 | 恶意地址数量 | 多次侵权地址数 | 诚实地址数量 | 地址总数 |".to_string(),
+        "| --- | ---: | ---: | ---: | ---: |".to_string(),
         format!(
-            "- 跨合约重复侵权恶意地址数: {}",
-            address.repeat_infringing_malicious_address_count
+            "| all | {} | {} | {} | {} |",
+            address.malicious_address_count,
+            address.repeat_infringing_malicious_address_count,
+            address.honest_address_count,
+            address.total_address_count
         ),
-        format!("- 诚实买家地址数: {}", address.honest_address_count),
-        format!("- 地址总数: {}", address.total_address_count),
     ]);
 }
 
@@ -198,30 +200,18 @@ fn append_attacker_cost(lines: &mut Vec<String>, stats: &PaperStatsPayload) {
     lines.extend([
         String::new(),
         "## 攻击者成本".to_string(),
-        "| 阶段 | Gas ETH | Gas USD |".to_string(),
-        "| --- | ---: | ---: |".to_string(),
+        "| cost | Setup Gas ETH/USD | Lure Gas ETH/USD | Exit Gas ETH/USD | Total Gas ETH/USD | 攻击投入集中度 |".to_string(),
+        "| --- | ---: | ---: | ---: | ---: | ---: |".to_string(),
         format!(
-            "| setup | {} | {} |",
+            "| gas | {} / {} | {} / {} | {} / {} | {} / {} | {} ({}/{}) |",
             format_number(cost.setup_gas_eth),
-            format_number(cost.setup_gas_usd)
-        ),
-        format!(
-            "| lure | {} | {} |",
+            format_number(cost.setup_gas_usd),
             format_number(cost.lure_gas_eth),
-            format_number(cost.lure_gas_usd)
-        ),
-        format!(
-            "| exit | {} | {} |",
+            format_number(cost.lure_gas_usd),
             format_number(cost.exit_gas_eth),
-            format_number(cost.exit_gas_usd)
-        ),
-        format!(
-            "| total | {} | {} |",
+            format_number(cost.exit_gas_usd),
             format_number(cost.total_gas_eth),
-            format_number(cost.total_gas_usd)
-        ),
-        format!(
-            "- Top 合约成本贡献占比: {} ({}/{})",
+            format_number(cost.total_gas_usd),
             format_ratio(cost.top_contract_contribution_ratio),
             format_number(cost.top_contract_contribution_numerator),
             format_number(cost.top_contract_contribution_denominator)
@@ -233,23 +223,30 @@ fn append_honest_loss(lines: &mut Vec<String>, stats: &PaperStatsPayload) {
     lines.extend([
         String::new(),
         "## 诚实买家损失".to_string(),
-        "| 类别 | 套牢 NFT | NFT 套牢占比 | 二级市场损失 USD | 付费 mint 损失 USD | 总损失 USD |"
+        "| 套牢 NFT | NFT 套牢占比 | 套牢时间比 | 二级市场损失 ETH/USD | 付费 mint 损失 ETH/USD | 总损失 ETH/USD | 损失集中度 |"
             .to_string(),
-        "| --- | ---: | ---: | ---: | ---: | ---: |".to_string(),
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: |".to_string(),
     ]);
-    for row in &stats.honest_loss {
-        lines.push(format!(
-            "| {} | {} | {} ({}/{}) | {} | {} | {} |",
-            row.category,
-            row.stuck_nft_count,
-            format_ratio(row.stuck_nft_ratio),
-            row.stuck_nft_ratio_numerator,
-            row.stuck_nft_ratio_denominator,
-            format_number(row.secondary_sale_loss_usd),
-            format_number(row.paid_mint_loss_usd),
-            format_number(row.total_loss_usd)
-        ));
-    }
+    let row = &stats.honest_loss;
+    lines.push(format!(
+        "| {} | {} ({}/{}) | {} ({}/{}) | {} / {} | {} / {} | {} / {} | {} ({}/{}) |",
+        row.stuck_nft_count,
+        format_ratio(row.stuck_nft_ratio),
+        row.stuck_nft_ratio_numerator,
+        row.stuck_nft_ratio_denominator,
+        format_ratio(row.stuck_time_ratio),
+        format_number(row.stuck_time_ratio_numerator),
+        format_number(row.stuck_time_ratio_denominator),
+        format_number(row.secondary_sale_loss_eth),
+        format_number(row.secondary_sale_loss_usd),
+        format_number(row.paid_mint_loss_eth),
+        format_number(row.paid_mint_loss_usd),
+        format_number(row.total_loss_eth),
+        format_number(row.total_loss_usd),
+        format_ratio(row.top_contract_loss_contribution_ratio),
+        format_number(row.top_contract_loss_contribution_numerator),
+        format_number(row.top_contract_loss_contribution_denominator)
+    ));
 }
 
 fn append_behavior_summary(lines: &mut Vec<String>, stats: &PaperStatsPayload) {
@@ -267,19 +264,22 @@ fn append_behavior_summary(lines: &mut Vec<String>, stats: &PaperStatsPayload) {
     }
 
     lines.extend([
-        "| 行为 | 合约数 | 覆盖率 | 实例数 | 地址数 | NFT 数 | 关联买家 | 关联损失 USD |"
+        "| 行为 | 合约数 | 覆盖率 | 实例数 | 行为占比 | 地址数 | NFT 数 | 关联买家 | 关联损失 USD |"
             .to_string(),
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |".to_string(),
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |".to_string(),
     ]);
     for row in &stats.malicious_behavior_summary {
         lines.push(format!(
-            "| {} | {} | {} ({}/{}) | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} ({}/{}) | {} | {} ({}/{}) | {} | {} | {} | {} |",
             row.behavior_type,
             row.contract_count,
             format_ratio(row.contract_coverage_ratio),
             row.contract_coverage_numerator,
             row.contract_coverage_denominator,
             row.instance_count,
+            format_ratio(row.instance_ratio),
+            row.instance_ratio_numerator,
+            row.instance_ratio_denominator,
             row.address_count,
             row.nft_count,
             row.linked_buyer_count,
@@ -309,9 +309,15 @@ fn append_contract_behavior_details(lines: &mut Vec<String>, stats: &PaperStatsP
             row.star_behaviors.len(),
             row.layered_transfers.len(),
             row.inventory_concentration.len(),
-            row.honest_buyers_top.len()
+            row.honest_buyers.len()
         ));
     }
+
+    append_wash_trading_details(lines, &rows);
+    append_pump_exit_details(lines, &rows);
+    append_star_behavior_details(lines, &rows);
+    append_layered_transfer_details(lines, &rows);
+    append_inventory_concentration_details(lines, &rows);
 
     let buyers = sorted_honest_buyers(&rows);
     if buyers.is_empty() {
@@ -321,19 +327,257 @@ fn append_contract_behavior_details(lines: &mut Vec<String>, stats: &PaperStatsP
     lines.extend([
         String::new(),
         "### 诚实买家".to_string(),
-        "| contract_address | buyer | source_pattern | fake NFT | paid USD | still holding |"
+        "| contract_address | buyer | source_pattern | fake NFT | paid ETH/USD | time_to_purchase_seconds | still holding | holding_seconds |"
             .to_string(),
-        "| --- | --- | --- | ---: | ---: | --- |".to_string(),
+        "| --- | --- | --- | ---: | ---: | ---: | --- | ---: |".to_string(),
     ]);
     for (contract_address, buyer) in buyers {
         lines.push(format!(
-            "| {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} / {} | {} | {} | {} |",
             contract_address,
             buyer.honest_buyer,
             buyer.source_pattern,
             buyer.fake_nft_bought,
+            format_number(buyer.total_paid_eth),
             format_number(buyer.total_paid_usd),
-            buyer.still_holding
+            format_optional_i64(buyer.time_to_purchase_seconds),
+            buyer.still_holding,
+            format_optional_i64(buyer.holding_seconds)
+        ));
+    }
+}
+
+fn append_wash_trading_details(
+    lines: &mut Vec<String>,
+    rows: &[&PaperContractBehaviorStatsPayload],
+) {
+    let mut details = rows
+        .iter()
+        .flat_map(|row| {
+            row.wash_trading
+                .iter()
+                .map(|item| (row.contract_address.as_str(), item))
+        })
+        .collect::<Vec<_>>();
+    if details.is_empty() {
+        return;
+    }
+    details.sort_by(|(left_contract, left), (right_contract, right)| {
+        compare_desc(left.fake_volume_usd, right.fake_volume_usd)
+            .then_with(|| compare_desc(left.fake_volume_eth, right.fake_volume_eth))
+            .then_with(|| {
+                right
+                    .participant_node_count
+                    .cmp(&left.participant_node_count)
+            })
+            .then_with(|| left_contract.cmp(right_contract))
+            .then_with(|| left.cycle_id.cmp(&right.cycle_id))
+    });
+    lines.extend([
+        String::new(),
+        "### Wash Trading".to_string(),
+        "| contract_address | cycle_id | nodes | token_gini | avg_cycle_blocks | fake_volume ETH/USD |".to_string(),
+        "| --- | --- | ---: | ---: | ---: | ---: |".to_string(),
+    ]);
+    for (contract_address, row) in details {
+        lines.push(format!(
+            "| {} | {} | {} | {} | {} | {} / {} |",
+            contract_address,
+            row.cycle_id,
+            row.participant_node_count,
+            format_optional_f64(row.token_gini),
+            format_optional_f64(row.avg_cycle_blocks),
+            format_number(row.fake_volume_eth),
+            format_number(row.fake_volume_usd)
+        ));
+    }
+}
+
+fn append_pump_exit_details(lines: &mut Vec<String>, rows: &[&PaperContractBehaviorStatsPayload]) {
+    let mut details = rows
+        .iter()
+        .flat_map(|row| {
+            row.pump_and_exit
+                .iter()
+                .map(|item| (row.contract_address.as_str(), item))
+        })
+        .collect::<Vec<_>>();
+    if details.is_empty() {
+        return;
+    }
+    details.sort_by(|(left_contract, left), (right_contract, right)| {
+        compare_desc(left.linked_loss_usd, right.linked_loss_usd)
+            .then_with(|| {
+                compare_desc(
+                    left.exit_price_premium.unwrap_or_default(),
+                    right.exit_price_premium.unwrap_or_default(),
+                )
+            })
+            .then_with(|| {
+                right
+                    .linked_honest_buyer_count
+                    .cmp(&left.linked_honest_buyer_count)
+            })
+            .then_with(|| left_contract.cmp(right_contract))
+            .then_with(|| left.cycle_id.cmp(&right.cycle_id))
+    });
+    lines.extend([
+        String::new(),
+        "### Pump-and-Exit".to_string(),
+        "| contract_address | cycle_id | exit_delay_seconds | exit_price_premium | exit_ratio | linked_buyers | linked_loss ETH/USD |".to_string(),
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: |".to_string(),
+    ]);
+    for (contract_address, row) in details {
+        lines.push(format!(
+            "| {} | {} | {} | {} ({}/{}) | {} ({}/{}) | {} | {} / {} |",
+            contract_address,
+            row.cycle_id,
+            format_optional_i64(row.exit_delay_seconds),
+            format_optional_f64(row.exit_price_premium),
+            format_number(row.exit_price_premium_numerator),
+            format_number(row.exit_price_premium_denominator),
+            format_ratio(row.exit_ratio),
+            row.exit_ratio_numerator,
+            row.exit_ratio_denominator,
+            row.linked_honest_buyer_count,
+            format_number(row.linked_loss_eth),
+            format_number(row.linked_loss_usd)
+        ));
+    }
+}
+
+fn append_star_behavior_details(
+    lines: &mut Vec<String>,
+    rows: &[&PaperContractBehaviorStatsPayload],
+) {
+    let mut details = rows
+        .iter()
+        .flat_map(|row| {
+            row.star_behaviors
+                .iter()
+                .map(|item| (row.contract_address.as_str(), item))
+        })
+        .collect::<Vec<_>>();
+    if details.is_empty() {
+        return;
+    }
+    details.sort_by(|(left_contract, left), (right_contract, right)| {
+        compare_desc(left.total_value_usd, right.total_value_usd)
+            .then_with(|| right.edges.cmp(&left.edges))
+            .then_with(|| left.behavior.cmp(&right.behavior))
+            .then_with(|| left_contract.cmp(right_contract))
+    });
+    lines.extend([
+        String::new(),
+        "### Sybil/Fraud/Poisoning".to_string(),
+        "| contract_address | behavior | centers | edges | wallets | tokens | avg_fan_out | median_holding_seconds | total_value ETH/USD |".to_string(),
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |".to_string(),
+    ]);
+    for (contract_address, row) in details {
+        lines.push(format!(
+            "| {} | {} | {} | {} | {} | {} | {} ({}/{}) | {} | {} / {} |",
+            contract_address,
+            row.behavior,
+            row.centers,
+            row.edges,
+            row.wallets,
+            row.tokens,
+            format_optional_f64(row.avg_fan_out),
+            row.avg_fan_out_numerator,
+            row.avg_fan_out_denominator,
+            format_optional_f64(row.median_holding_seconds),
+            format_number(row.total_value_eth),
+            format_number(row.total_value_usd)
+        ));
+    }
+}
+
+fn append_layered_transfer_details(
+    lines: &mut Vec<String>,
+    rows: &[&PaperContractBehaviorStatsPayload],
+) {
+    let mut details = rows
+        .iter()
+        .flat_map(|row| {
+            row.layered_transfers
+                .iter()
+                .map(|item| (row.contract_address.as_str(), item))
+        })
+        .collect::<Vec<_>>();
+    if details.is_empty() {
+        return;
+    }
+    details.sort_by(|(left_contract, left), (right_contract, right)| {
+        compare_desc(left.total_value_usd, right.total_value_usd)
+            .then_with(|| right.length.cmp(&left.length))
+            .then_with(|| left_contract.cmp(right_contract))
+            .then_with(|| left.path_id.cmp(&right.path_id))
+    });
+    lines.extend([
+        String::new(),
+        "### Layered Transfer".to_string(),
+        "| contract_address | path_id | tokens | length | wallets | zero/low-value hops | duration_seconds | total_value ETH/USD |".to_string(),
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |".to_string(),
+    ]);
+    for (contract_address, row) in details {
+        lines.push(format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} / {} |",
+            contract_address,
+            row.path_id,
+            row.tokens,
+            row.length,
+            row.wallets,
+            row.zero_or_low_value_hops,
+            format_optional_i64(row.total_path_duration_seconds),
+            format_number(row.total_value_eth),
+            format_number(row.total_value_usd)
+        ));
+    }
+}
+
+fn append_inventory_concentration_details(
+    lines: &mut Vec<String>,
+    rows: &[&PaperContractBehaviorStatsPayload],
+) {
+    let mut details = rows
+        .iter()
+        .flat_map(|row| {
+            row.inventory_concentration
+                .iter()
+                .map(|item| (row.contract_address.as_str(), item))
+        })
+        .collect::<Vec<_>>();
+    if details.is_empty() {
+        return;
+    }
+    details.sort_by(|(left_contract, left), (right_contract, right)| {
+        compare_desc(left.value_collected_usd, right.value_collected_usd)
+            .then_with(|| right.inbound_txns.cmp(&left.inbound_txns))
+            .then_with(|| left_contract.cmp(right_contract))
+            .then_with(|| left.hub_address.cmp(&right.hub_address))
+    });
+    lines.extend([
+        String::new(),
+        "### Inventory Concentration".to_string(),
+        "| contract_address | hub_address | source_wallets | inbound_txns | token_share | value_collected ETH/USD | value_share | collection_window_seconds |".to_string(),
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |".to_string(),
+    ]);
+    for (contract_address, row) in details {
+        lines.push(format!(
+            "| {} | {} | {} | {} | {} ({}/{}) | {} / {} | {} ({}/{}) | {} |",
+            contract_address,
+            row.hub_address,
+            row.source_wallets,
+            row.inbound_txns,
+            format_ratio(row.token_share),
+            row.token_share_numerator,
+            row.token_share_denominator,
+            format_number(row.value_collected_eth),
+            format_number(row.value_collected_usd),
+            format_ratio(row.value_share),
+            format_number(row.value_share_numerator),
+            format_number(row.value_share_denominator),
+            format_optional_i64(row.collection_window_seconds)
         ));
     }
 }
@@ -361,7 +605,7 @@ fn sorted_honest_buyers<'a>(
     let mut buyers = rows
         .iter()
         .flat_map(|row| {
-            row.honest_buyers_top
+            row.honest_buyers
                 .iter()
                 .map(|buyer| (row.contract_address.as_str(), buyer))
         })
@@ -402,11 +646,19 @@ fn contract_behavior_impact_usd(row: &PaperContractBehaviorStatsPayload) -> f64 
         .map(|item| item.value_collected_usd)
         .sum();
     let honest_paid: f64 = row
-        .honest_buyers_top
+        .honest_buyers
         .iter()
         .map(|item| item.total_paid_usd)
         .sum();
     wash_volume + pump_loss + star_value + layered_value + inventory_value + honest_paid
+}
+
+fn format_optional_i64(value: Option<i64>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_default()
+}
+
+fn format_optional_f64(value: Option<f64>) -> String {
+    value.map(format_number).unwrap_or_default()
 }
 
 fn contract_behavior_instance_count(row: &PaperContractBehaviorStatsPayload) -> usize {
@@ -415,7 +667,7 @@ fn contract_behavior_instance_count(row: &PaperContractBehaviorStatsPayload) -> 
         + row.star_behaviors.len()
         + row.layered_transfers.len()
         + row.inventory_concentration.len()
-        + row.honest_buyers_top.len()
+        + row.honest_buyers.len()
 }
 
 fn compare_desc(left: f64, right: f64) -> Ordering {
@@ -439,8 +691,8 @@ fn append_data_quality(lines: &mut Vec<String>, stats: &PaperStatsPayload) {
         format!("- 疑似侵权 NFT 数: {}", quality.infringing_nft_count),
         format!(
             "- 可解析销售价格: {} / {} ({})",
-            quality.sale_price_parseable_count,
-            quality.sale_price_total_count,
+            quality.sale_price_parseable_ratio_numerator,
+            quality.sale_price_parseable_ratio_denominator,
             format_ratio(quality.sale_price_parseable_ratio)
         ),
         format!(

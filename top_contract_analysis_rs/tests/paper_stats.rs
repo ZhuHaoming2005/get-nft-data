@@ -8,7 +8,8 @@ use top_contract_analysis_rs::models::{
     MaliciousAddressPayload, NftPropagationEdgePayload, NftPropagationNodePayload,
     NftPropagationPathPayload, NftPropagationSummaryPayload, PaperContractBehaviorStatsPayload,
     PaperDataQualityPayload, PaperDuplicateScaleRowPayload, PaperHonestBuyerRowPayload,
-    PaperPumpExitRowPayload, PaperStatsPayload, PaperWashTradingRowPayload,
+    PaperInventoryConcentrationRowPayload, PaperLayeredTransferRowPayload, PaperPumpExitRowPayload,
+    PaperStarBehaviorRowPayload, PaperStatsPayload, PaperWashTradingRowPayload,
     SeedCollectionStatsPayload, SingleReportPayload, ValueFlowEdgePayload,
     VictimAcquisitionAddressPayload,
 };
@@ -266,11 +267,12 @@ fn markdown_reports_use_contract_address_without_extra_chain_identifiers() {
                 fake_volume_usd: 10.0,
                 ..PaperWashTradingRowPayload::default()
             }],
-            honest_buyers_top: vec![PaperHonestBuyerRowPayload {
+            honest_buyers: vec![PaperHonestBuyerRowPayload {
                 honest_buyer: "0xbuyer".into(),
                 total_paid_usd: 10.0,
                 source_pattern: "Pump-and-Exit".into(),
                 still_holding: true,
+                holding_seconds: Some(86_400),
                 ..PaperHonestBuyerRowPayload::default()
             }],
             ..PaperContractBehaviorStatsPayload::default()
@@ -294,7 +296,440 @@ fn markdown_reports_use_contract_address_without_extra_chain_identifiers() {
         "| contract_address | Wash Trading | Pump-and-Exit | Star | Layered | Inventory | Honest buyers |"
     ));
     assert!(batch_markdown.contains("| 0xcopy | 1 | 0 | 0 | 0 | 0 | 1 |"));
-    assert!(batch_markdown.contains("| 0xcopy | 0xbuyer | Pump-and-Exit |"));
+    assert!(batch_markdown.contains(
+        "| contract_address | buyer | source_pattern | fake NFT | paid ETH/USD | time_to_purchase_seconds | still holding | holding_seconds |"
+    ));
+    assert!(batch_markdown
+        .contains("| 0xcopy | 0xbuyer | Pump-and-Exit | 0 | 0 / 10 |  | true | 86400 |"));
+}
+
+#[test]
+fn honest_loss_exports_single_total_object_and_markdown_row_without_category() {
+    let victim = VictimAcquisitionAddressPayload {
+        address: "0xhonest".into(),
+        contract_addresses: vec!["0xdup".into()],
+        secondary_sale_count: 2,
+        secondary_sale_stuck_cost_eth: 0.03,
+        secondary_sale_stuck_cost_usd: 30.0,
+        paid_mint_edge_count: 3,
+        paid_mint_token_count: 3,
+        paid_mint_stuck_token_count: 2,
+        paid_mint_stuck_cost_eth: 0.04,
+        paid_mint_stuck_cost_usd: 40.0,
+        total_stuck_cost_eth: 0.07,
+        total_stuck_cost_usd: 70.0,
+        is_stuck: true,
+        ..VictimAcquisitionAddressPayload::default()
+    };
+    let stats = build_paper_stats(PaperStatsInput {
+        config: PaperStatsConfig::default(),
+        seed_collection_stats: &SeedCollectionStatsPayload::default(),
+        duplicate_candidates: &[],
+        duplicate_contracts: &[],
+        legit_duplicates: &[],
+        infringing_tokens: &[],
+        malicious_addresses: &[],
+        victim_acquisition_addresses: &[victim],
+        value_flow_edges: &[],
+        nft_propagation_paths: &Default::default(),
+    });
+
+    let json = serde_json::to_value(&stats).unwrap();
+    let honest_loss = json
+        .get("honest_loss")
+        .expect("honest_loss should be exported");
+    assert!(honest_loss.is_object());
+    assert!(honest_loss.get("category").is_none());
+    assert_eq!(honest_loss["stuck_nft_count"], 4);
+    assert_eq!(honest_loss["stuck_nft_ratio_numerator"], 4);
+    assert_eq!(honest_loss["stuck_nft_ratio_denominator"], 5);
+    assert_eq!(honest_loss["secondary_sale_loss_usd"], 30.0);
+    assert_eq!(honest_loss["paid_mint_loss_usd"], 40.0);
+    assert_eq!(honest_loss["total_loss_usd"], 70.0);
+
+    let markdown = render_human_readable_report(&SingleReportPayload {
+        paper_stats: stats,
+        ..SingleReportPayload::default()
+    });
+    assert!(markdown.contains(
+        "| 套牢 NFT | NFT 套牢占比 | 套牢时间比 | 二级市场损失 ETH/USD | 付费 mint 损失 ETH/USD | 总损失 ETH/USD | 损失集中度 |"
+    ));
+    assert!(!markdown.contains("| 类别 | 套牢 NFT |"));
+    assert!(markdown.contains(
+        "| 4 | 80.00% (4/5) | n/a (0/0) | 0.03 / 30 | 0.04 / 40 | 0.07 / 70 | 100.00% (70/70) |"
+    ));
+}
+
+#[test]
+fn markdown_summary_tables_include_experiment_fields() {
+    let stats = PaperStatsPayload {
+        address_classification:
+            top_contract_analysis_rs::models::PaperAddressClassificationPayload {
+                malicious_address_count: 3,
+                repeat_infringing_malicious_address_count: 1,
+                honest_address_count: 2,
+                total_address_count: 5,
+            },
+        attacker_cost: top_contract_analysis_rs::models::PaperAttackerCostPayload {
+            setup_gas_eth: 0.01,
+            setup_gas_usd: 20.0,
+            lure_gas_eth: 0.02,
+            lure_gas_usd: 40.0,
+            exit_gas_eth: 0.03,
+            exit_gas_usd: 60.0,
+            total_gas_eth: 0.06,
+            total_gas_usd: 120.0,
+            top_contract_contribution_ratio: Some(0.25),
+            top_contract_contribution_numerator: 30.0,
+            top_contract_contribution_denominator: 120.0,
+        },
+        honest_loss: top_contract_analysis_rs::models::PaperHonestLossPayload {
+            stuck_nft_count: 4,
+            stuck_nft_ratio: Some(0.8),
+            stuck_nft_ratio_numerator: 4,
+            stuck_nft_ratio_denominator: 5,
+            stuck_time_ratio: Some(2.0),
+            stuck_time_ratio_numerator: 20.0,
+            stuck_time_ratio_denominator: 10.0,
+            secondary_sale_loss_eth: 0.03,
+            secondary_sale_loss_usd: 30.0,
+            paid_mint_loss_eth: 0.04,
+            paid_mint_loss_usd: 40.0,
+            total_loss_eth: 0.07,
+            total_loss_usd: 70.0,
+            top_contract_loss_contribution_ratio: Some(0.5),
+            top_contract_loss_contribution_numerator: 35.0,
+            top_contract_loss_contribution_denominator: 70.0,
+        },
+        ..PaperStatsPayload::default()
+    };
+
+    let markdown = render_human_readable_report(&SingleReportPayload {
+        paper_stats: stats,
+        ..SingleReportPayload::default()
+    });
+
+    assert!(markdown.contains("| 类别 | 恶意地址数量 | 多次侵权地址数 | 诚实地址数量 | 地址总数 |"));
+    assert!(markdown.contains("| all | 3 | 1 | 2 | 5 |"));
+    assert!(markdown.contains(
+        "| cost | Setup Gas ETH/USD | Lure Gas ETH/USD | Exit Gas ETH/USD | Total Gas ETH/USD | 攻击投入集中度 |"
+    ));
+    assert!(markdown
+        .contains("| gas | 0.01 / 20 | 0.02 / 40 | 0.03 / 60 | 0.06 / 120 | 25.00% (30/120) |"));
+    assert!(markdown.contains(
+        "| 套牢 NFT | NFT 套牢占比 | 套牢时间比 | 二级市场损失 ETH/USD | 付费 mint 损失 ETH/USD | 总损失 ETH/USD | 损失集中度 |"
+    ));
+    assert!(markdown.contains(
+        "| 4 | 80.00% (4/5) | 200.00% (20/10) | 0.03 / 30 | 0.04 / 40 | 0.07 / 70 | 50.00% (35/70) |"
+    ));
+}
+
+#[test]
+fn attacker_cost_excludes_honest_buyer_mint_gas_and_ignored_channels() {
+    let victim = VictimAcquisitionAddressPayload {
+        address: "0xhonest".into(),
+        is_stuck: true,
+        ..VictimAcquisitionAddressPayload::default()
+    };
+    let value_flow_edges = vec![
+        ValueFlowEdgePayload {
+            contract_address: "0xdup".into(),
+            from_address: "0xhonest".into(),
+            channel: "mint_payment".into(),
+            value_usd: Some(100.0),
+            value_with_gas_usd: Some(600.0),
+            value_eth: Some(0.05),
+            value_with_gas_eth: Some(0.06),
+            ..ValueFlowEdgePayload::default()
+        },
+        ValueFlowEdgePayload {
+            contract_address: "0xignored".into(),
+            from_address: "0xhonest".into(),
+            channel: "unrelated_transfer".into(),
+            value_usd: Some(0.0),
+            value_with_gas_usd: Some(1_000.0),
+            value_eth: Some(0.0),
+            value_with_gas_eth: Some(1.0),
+            ..ValueFlowEdgePayload::default()
+        },
+        ValueFlowEdgePayload {
+            contract_address: "0xdup".into(),
+            from_address: "0xdeployer".into(),
+            channel: "contract_deploy".into(),
+            value_usd: Some(0.0),
+            value_with_gas_usd: Some(10.0),
+            value_eth: Some(0.0),
+            value_with_gas_eth: Some(0.01),
+            ..ValueFlowEdgePayload::default()
+        },
+    ];
+
+    let stats = build_paper_stats(PaperStatsInput {
+        config: PaperStatsConfig::default(),
+        seed_collection_stats: &SeedCollectionStatsPayload::default(),
+        duplicate_candidates: &[],
+        duplicate_contracts: &[],
+        legit_duplicates: &[],
+        infringing_tokens: &[],
+        malicious_addresses: &[],
+        victim_acquisition_addresses: &[victim],
+        value_flow_edges: &value_flow_edges,
+        nft_propagation_paths: &Default::default(),
+    });
+
+    assert_eq!(stats.attacker_cost.setup_gas_usd, 10.0);
+    assert_eq!(stats.attacker_cost.setup_gas_eth, 0.01);
+    assert_eq!(stats.attacker_cost.total_gas_usd, 10.0);
+    assert_eq!(
+        stats.attacker_cost.top_contract_contribution_numerator,
+        10.0
+    );
+    assert_eq!(
+        stats.attacker_cost.top_contract_contribution_denominator,
+        10.0
+    );
+    assert_eq!(
+        stats.attacker_cost.top_contract_contribution_ratio,
+        Some(1.0)
+    );
+}
+
+#[test]
+fn wash_trading_avg_cycle_blocks_uses_block_numbers_not_timestamps() {
+    let path = NftPropagationPathPayload {
+        contract_address: "0xdup".into(),
+        summary: NftPropagationSummaryPayload {
+            token_count: 1,
+            first_block_time: 1_000,
+            ..NftPropagationSummaryPayload::default()
+        },
+        edges: vec![
+            NftPropagationEdgePayload {
+                edge_id: "0xdup:0xa:0xb:1".into(),
+                contract_address: "0xdup".into(),
+                token_id: "1".into(),
+                from_address: "0xa".into(),
+                to_address: "0xb".into(),
+                tx_hash: "0xcycle1".into(),
+                block_number: 10,
+                block_time: 1_000,
+                channel: "sale".into(),
+                price_eth: Some(1.0),
+                price_usd: Some(2_000.0),
+                aggregate_count: 1,
+                token_ids: vec!["1".into()],
+                ..NftPropagationEdgePayload::default()
+            },
+            NftPropagationEdgePayload {
+                edge_id: "0xdup:0xb:0xa:1".into(),
+                contract_address: "0xdup".into(),
+                token_id: "1".into(),
+                from_address: "0xb".into(),
+                to_address: "0xa".into(),
+                tx_hash: "0xcycle2".into(),
+                block_number: 12,
+                block_time: 4_600,
+                channel: "sale".into(),
+                price_eth: Some(1.5),
+                price_usd: Some(3_000.0),
+                aggregate_count: 1,
+                token_ids: vec!["1".into()],
+                ..NftPropagationEdgePayload::default()
+            },
+        ],
+        ..NftPropagationPathPayload::default()
+    };
+
+    let stats = build_paper_stats(PaperStatsInput {
+        config: PaperStatsConfig::default(),
+        seed_collection_stats: &SeedCollectionStatsPayload::default(),
+        duplicate_candidates: &[],
+        duplicate_contracts: &[],
+        legit_duplicates: &[],
+        infringing_tokens: &[],
+        malicious_addresses: &[],
+        victim_acquisition_addresses: &[],
+        value_flow_edges: &[],
+        nft_propagation_paths: &BTreeMap::from([("0xdup".into(), path)]),
+    });
+
+    let wash = &stats.contract_behavior_stats[0].wash_trading[0];
+    assert_eq!(wash.avg_cycle_blocks, Some(2.0));
+}
+
+#[test]
+fn ratio_like_fields_export_reproducible_numerators_and_denominators() {
+    let path = NftPropagationPathPayload {
+        contract_address: "0xdup".into(),
+        summary: NftPropagationSummaryPayload {
+            token_count: 1,
+            first_block_time: 100,
+            ..NftPropagationSummaryPayload::default()
+        },
+        edges: vec![
+            propagation_edge(
+                ("0xdup", "0xa", "0xb"),
+                "1",
+                "sale",
+                100,
+                (Some(1.0), Some(100.0)),
+            ),
+            propagation_edge(
+                ("0xdup", "0xb", "0xa"),
+                "1",
+                "sale",
+                110,
+                (Some(1.0), Some(100.0)),
+            ),
+            propagation_edge(
+                ("0xdup", "0xa", "0xhonest"),
+                "1",
+                "sale",
+                130,
+                (Some(3.0), Some(300.0)),
+            ),
+            propagation_edge(("0xdup", "0xa", "0xpeer"), "1", "sale", 140, (None, None)),
+        ],
+        ..NftPropagationPathPayload::default()
+    };
+    let victim = VictimAcquisitionAddressPayload {
+        address: "0xhonest".into(),
+        contract_addresses: vec!["0xdup".into()],
+        secondary_sale_count: 1,
+        secondary_sale_stuck_cost_eth: 3.0,
+        secondary_sale_stuck_cost_usd: 300.0,
+        total_stuck_cost_eth: 3.0,
+        total_stuck_cost_usd: 300.0,
+        is_stuck: true,
+        ..VictimAcquisitionAddressPayload::default()
+    };
+
+    let stats = build_paper_stats(PaperStatsInput {
+        config: PaperStatsConfig::default(),
+        seed_collection_stats: &SeedCollectionStatsPayload::default(),
+        duplicate_candidates: &[],
+        duplicate_contracts: &[],
+        legit_duplicates: &[],
+        infringing_tokens: &[],
+        malicious_addresses: &[],
+        victim_acquisition_addresses: &[victim],
+        value_flow_edges: &[],
+        nft_propagation_paths: &BTreeMap::from([("0xdup".into(), path)]),
+    });
+    let json = serde_json::to_value(&stats).unwrap();
+    let pump = &json["contract_behavior_stats"][0]["pump_and_exit"][0];
+    assert_eq!(pump["exit_price_premium"], 3.0);
+    assert_eq!(pump["exit_price_premium_numerator"], 300.0);
+    assert_eq!(pump["exit_price_premium_denominator"], 100.0);
+    assert_eq!(json["data_quality"]["sale_price_parseable_ratio"], 0.75);
+    assert_eq!(
+        json["data_quality"]["sale_price_parseable_ratio_numerator"],
+        3
+    );
+    assert_eq!(
+        json["data_quality"]["sale_price_parseable_ratio_denominator"],
+        4
+    );
+}
+
+#[test]
+fn attacker_cost_counts_all_stages_from_malicious_gas_and_deduplicates_transactions() {
+    let victim = VictimAcquisitionAddressPayload {
+        address: "0xhonest".into(),
+        is_stuck: true,
+        ..VictimAcquisitionAddressPayload::default()
+    };
+    let value_flow_edges = vec![
+        ValueFlowEdgePayload {
+            contract_address: "0xdup".into(),
+            from_address: "0xfunder".into(),
+            tx_hash: "0xsetup".into(),
+            channel: "funding".into(),
+            from_role: "external_funder".into(),
+            value_usd: Some(100.0),
+            value_with_gas_usd: Some(103.0),
+            value_eth: Some(0.05),
+            value_with_gas_eth: Some(0.051),
+            ..ValueFlowEdgePayload::default()
+        },
+        ValueFlowEdgePayload {
+            contract_address: "0xdup".into(),
+            from_address: "0xbot".into(),
+            tx_hash: "0xlure".into(),
+            channel: "sale_payment".into(),
+            from_role: "buyer".into(),
+            value_usd: Some(200.0),
+            value_with_gas_usd: Some(205.0),
+            value_eth: Some(0.1),
+            value_with_gas_eth: Some(0.102),
+            ..ValueFlowEdgePayload::default()
+        },
+        ValueFlowEdgePayload {
+            contract_address: "0xdup".into(),
+            from_address: "0xbot".into(),
+            tx_hash: "0xlure".into(),
+            channel: "sale_payment".into(),
+            from_role: "buyer".into(),
+            value_usd: Some(1.0),
+            value_with_gas_usd: Some(6.0),
+            value_eth: Some(0.001),
+            value_with_gas_eth: Some(0.003),
+            ..ValueFlowEdgePayload::default()
+        },
+        ValueFlowEdgePayload {
+            contract_address: "0xdup".into(),
+            from_address: "0xdup".into(),
+            tx_hash: "0xexit".into(),
+            channel: "withdrawal".into(),
+            from_role: "mint_contract".into(),
+            value_usd: Some(50.0),
+            value_with_gas_usd: Some(57.0),
+            value_eth: Some(0.025),
+            value_with_gas_eth: Some(0.028),
+            ..ValueFlowEdgePayload::default()
+        },
+        ValueFlowEdgePayload {
+            contract_address: "0xdup".into(),
+            from_address: "0xhonest".into(),
+            tx_hash: "0xhonest-lure".into(),
+            channel: "sale_payment".into(),
+            from_role: "buyer".into(),
+            value_usd: Some(300.0),
+            value_with_gas_usd: Some(333.0),
+            value_eth: Some(0.15),
+            value_with_gas_eth: Some(0.16),
+            ..ValueFlowEdgePayload::default()
+        },
+    ];
+
+    let stats = build_paper_stats(PaperStatsInput {
+        config: PaperStatsConfig::default(),
+        seed_collection_stats: &SeedCollectionStatsPayload::default(),
+        duplicate_candidates: &[],
+        duplicate_contracts: &[],
+        legit_duplicates: &[],
+        infringing_tokens: &[],
+        malicious_addresses: &[MaliciousAddressPayload {
+            address: "0xbot".into(),
+            ..MaliciousAddressPayload::default()
+        }],
+        victim_acquisition_addresses: &[victim],
+        value_flow_edges: &value_flow_edges,
+        nft_propagation_paths: &Default::default(),
+    });
+
+    assert_eq!(stats.attacker_cost.setup_gas_usd, 3.0);
+    assert_eq!(stats.attacker_cost.lure_gas_usd, 5.0);
+    assert_eq!(stats.attacker_cost.exit_gas_usd, 7.0);
+    assert_eq!(stats.attacker_cost.total_gas_usd, 15.0);
+    assert_eq!(
+        stats.attacker_cost.top_contract_contribution_numerator,
+        15.0
+    );
+    assert_eq!(
+        stats.attacker_cost.top_contract_contribution_denominator,
+        15.0
+    );
 }
 
 #[test]
@@ -314,7 +749,7 @@ fn markdown_places_large_tables_last_and_sorts_by_key_metrics() {
                     fake_volume_usd: 10.0,
                     ..PaperWashTradingRowPayload::default()
                 }],
-                honest_buyers_top: vec![PaperHonestBuyerRowPayload {
+                honest_buyers: vec![PaperHonestBuyerRowPayload {
                     honest_buyer: "0xsmallbuyer".into(),
                     total_paid_usd: 50.0,
                     still_holding: true,
@@ -328,7 +763,7 @@ fn markdown_places_large_tables_last_and_sorts_by_key_metrics() {
                     linked_loss_usd: 2_000.0,
                     ..PaperPumpExitRowPayload::default()
                 }],
-                honest_buyers_top: vec![PaperHonestBuyerRowPayload {
+                honest_buyers: vec![PaperHonestBuyerRowPayload {
                     honest_buyer: "0xbigbuyer".into(),
                     total_paid_usd: 3_000.0,
                     still_holding: true,
@@ -356,6 +791,120 @@ fn markdown_places_large_tables_last_and_sorts_by_key_metrics() {
             < markdown.find("| 0xlow | 0xsmallbuyer |").unwrap(),
         "honest buyer rows should be sorted by descending paid USD"
     );
+}
+
+#[test]
+fn markdown_contract_behavior_details_include_experiment_rows() {
+    let paper_stats = PaperStatsPayload {
+        contract_behavior_stats: vec![PaperContractBehaviorStatsPayload {
+            contract_address: "0xcopy".into(),
+            wash_trading: vec![PaperWashTradingRowPayload {
+                cycle_id: "wash1".into(),
+                participant_node_count: 3,
+                token_gini: Some(0.4),
+                avg_cycle_blocks: Some(12.0),
+                fake_volume_eth: 1.2,
+                fake_volume_usd: 2_400.0,
+            }],
+            pump_and_exit: vec![PaperPumpExitRowPayload {
+                cycle_id: "pump1".into(),
+                exit_delay_seconds: Some(60),
+                exit_price_premium: Some(1.5),
+                exit_price_premium_numerator: 300.0,
+                exit_price_premium_denominator: 200.0,
+                exit_ratio: Some(0.5),
+                exit_ratio_numerator: 1,
+                exit_ratio_denominator: 2,
+                linked_honest_buyer_count: 2,
+                linked_loss_eth: 1.0,
+                linked_loss_usd: 2_000.0,
+            }],
+            star_behaviors: vec![PaperStarBehaviorRowPayload {
+                behavior: "Sybil Distribution".into(),
+                centers: 1,
+                edges: 6,
+                wallets: 7,
+                tokens: 4,
+                avg_fan_out: Some(3.0),
+                avg_fan_out_numerator: 6,
+                avg_fan_out_denominator: 2,
+                median_holding_seconds: Some(120.0),
+                total_value_eth: 0.6,
+                total_value_usd: 1_200.0,
+            }],
+            layered_transfers: vec![PaperLayeredTransferRowPayload {
+                path_id: "path1".into(),
+                tokens: 2,
+                length: 4,
+                wallets: 5,
+                zero_or_low_value_hops: 2,
+                total_path_duration_seconds: Some(3600),
+                total_value_eth: 0.4,
+                total_value_usd: 800.0,
+            }],
+            inventory_concentration: vec![PaperInventoryConcentrationRowPayload {
+                hub_address: "0xhub".into(),
+                source_wallets: 4,
+                inbound_txns: 9,
+                token_share: Some(0.25),
+                token_share_numerator: 5,
+                token_share_denominator: 20,
+                value_collected_eth: 0.3,
+                value_collected_usd: 600.0,
+                value_share: Some(0.4),
+                value_share_numerator: 600.0,
+                value_share_denominator: 1_500.0,
+                collection_window_seconds: Some(7200),
+            }],
+            honest_buyers: vec![PaperHonestBuyerRowPayload {
+                honest_buyer: "0xbuyer".into(),
+                fake_nft_bought: 2,
+                total_paid_eth: 0.7,
+                total_paid_usd: 1_400.0,
+                source_pattern: "Pump-and-Exit".into(),
+                time_to_purchase_seconds: Some(900),
+                still_holding: true,
+                holding_seconds: Some(86_400),
+            }],
+        }],
+        ..PaperStatsPayload::default()
+    };
+
+    let markdown = render_batch_human_readable_report(&BatchSummaryPayload {
+        paper_stats,
+        ..BatchSummaryPayload::default()
+    });
+
+    assert!(markdown.contains(
+        "| contract_address | cycle_id | nodes | token_gini | avg_cycle_blocks | fake_volume ETH/USD |"
+    ));
+    assert!(markdown.contains("| 0xcopy | wash1 | 3 | 0.4 | 12 | 1.2 / 2400 |"));
+    assert!(markdown.contains(
+        "| contract_address | cycle_id | exit_delay_seconds | exit_price_premium | exit_ratio | linked_buyers | linked_loss ETH/USD |"
+    ));
+    assert!(
+        markdown.contains("| 0xcopy | pump1 | 60 | 1.5 (300/200) | 50.00% (1/2) | 2 | 1 / 2000 |")
+    );
+    assert!(markdown.contains(
+        "| contract_address | behavior | centers | edges | wallets | tokens | avg_fan_out | median_holding_seconds | total_value ETH/USD |"
+    ));
+    assert!(markdown
+        .contains("| 0xcopy | Sybil Distribution | 1 | 6 | 7 | 4 | 3 (6/2) | 120 | 0.6 / 1200 |"));
+    assert!(markdown.contains(
+        "| contract_address | path_id | tokens | length | wallets | zero/low-value hops | duration_seconds | total_value ETH/USD |"
+    ));
+    assert!(markdown.contains("| 0xcopy | path1 | 2 | 4 | 5 | 2 | 3600 | 0.4 / 800 |"));
+    assert!(markdown.contains(
+        "| contract_address | hub_address | source_wallets | inbound_txns | token_share | value_collected ETH/USD | value_share | collection_window_seconds |"
+    ));
+    assert!(markdown.contains(
+        "| 0xcopy | 0xhub | 4 | 9 | 25.00% (5/20) | 0.3 / 600 | 40.00% (600/1500) | 7200 |"
+    ));
+    assert!(markdown.contains(
+        "| contract_address | buyer | source_pattern | fake NFT | paid ETH/USD | time_to_purchase_seconds | still holding | holding_seconds |"
+    ));
+    assert!(markdown
+        .contains("| 0xcopy | 0xbuyer | Pump-and-Exit | 2 | 0.7 / 1400 | 900 | true | 86400 |"));
 }
 
 #[test]
@@ -477,11 +1026,7 @@ fn paper_stats_tracks_ratio_numerators_and_address_roles() {
     assert_eq!(stats.address_classification.honest_address_count, 1);
     assert_eq!(stats.address_classification.total_address_count, 3);
 
-    let total_loss = stats
-        .honest_loss
-        .iter()
-        .find(|row| row.category == "total")
-        .unwrap();
+    let total_loss = &stats.honest_loss;
     assert_eq!(total_loss.stuck_nft_ratio_numerator, 2);
     assert_eq!(total_loss.stuck_nft_ratio_denominator, 2);
     assert_eq!(total_loss.total_loss_usd, 4_000.0);
@@ -677,7 +1222,7 @@ fn paper_stats_uses_participant_universe_and_extracts_behavior_patterns() {
         contract_stats.inventory_concentration[0].value_share_denominator,
         16_000.0
     );
-    assert_eq!(contract_stats.honest_buyers_top[0].honest_buyer, "0xhonest");
+    assert_eq!(contract_stats.honest_buyers[0].honest_buyer, "0xhonest");
     assert!(stats
         .malicious_behavior_summary
         .iter()
@@ -777,7 +1322,7 @@ fn paper_stats_detects_multi_node_wash_cycle_and_exit() {
     assert_eq!(contract_stats.pump_and_exit[0].exit_ratio_numerator, 1);
     assert_eq!(contract_stats.pump_and_exit[0].exit_ratio_denominator, 1);
     assert_eq!(
-        contract_stats.honest_buyers_top[0].source_pattern,
+        contract_stats.honest_buyers[0].source_pattern,
         "Pump-and-Exit"
     );
 }
@@ -891,7 +1436,109 @@ fn paper_stats_does_not_truncate_honest_buyer_rows() {
         .iter()
         .find(|row| row.contract_address == "0xallbuyers")
         .unwrap();
-    assert_eq!(contract_stats.honest_buyers_top.len(), 11);
+    assert_eq!(contract_stats.honest_buyers.len(), 11);
+    let json = serde_json::to_value(&stats).unwrap();
+    assert!(json["contract_behavior_stats"][0]
+        .get("honest_buyers")
+        .is_some());
+    assert!(json["contract_behavior_stats"][0]
+        .get("honest_buyers_top")
+        .is_none());
+}
+
+#[test]
+fn honest_buyer_fake_nft_count_and_loss_denominator_use_paid_mint_token_count() {
+    let path = NftPropagationPathPayload {
+        contract_address: "0xpaidmint".into(),
+        ..NftPropagationPathPayload::default()
+    };
+    let victim = VictimAcquisitionAddressPayload {
+        address: "0xbuyer".into(),
+        contract_addresses: vec!["0xpaidmint".into()],
+        paid_mint_edge_count: 1,
+        paid_mint_token_count: 4,
+        paid_mint_stuck_token_count: 2,
+        paid_mint_cost_usd: 400.0,
+        paid_mint_stuck_cost_usd: 200.0,
+        total_acquisition_cost_usd: 400.0,
+        total_stuck_cost_usd: 200.0,
+        is_stuck: true,
+        ..VictimAcquisitionAddressPayload::default()
+    };
+
+    let stats = build_paper_stats(PaperStatsInput {
+        config: PaperStatsConfig::default(),
+        seed_collection_stats: &SeedCollectionStatsPayload::default(),
+        duplicate_candidates: &[],
+        duplicate_contracts: &[],
+        legit_duplicates: &[],
+        infringing_tokens: &[],
+        malicious_addresses: &[],
+        victim_acquisition_addresses: &[victim],
+        value_flow_edges: &[],
+        nft_propagation_paths: &BTreeMap::from([("0xpaidmint".into(), path)]),
+    });
+
+    assert_eq!(stats.honest_loss.stuck_nft_ratio_numerator, 2);
+    assert_eq!(stats.honest_loss.stuck_nft_ratio_denominator, 4);
+    assert_eq!(
+        stats.contract_behavior_stats[0].honest_buyers[0].fake_nft_bought,
+        4
+    );
+}
+
+#[test]
+fn paid_mint_only_honest_buyer_uses_value_flow_time_for_holding_columns() {
+    let path = NftPropagationPathPayload {
+        contract_address: "0xpaidmint".into(),
+        summary: NftPropagationSummaryPayload {
+            first_block_time: 1_000,
+            ..NftPropagationSummaryPayload::default()
+        },
+        ..NftPropagationPathPayload::default()
+    };
+    let victim = VictimAcquisitionAddressPayload {
+        address: "0xbuyer".into(),
+        contract_addresses: vec!["0xpaidmint".into()],
+        paid_mint_edge_count: 1,
+        paid_mint_token_count: 1,
+        paid_mint_stuck_token_count: 1,
+        paid_mint_cost_usd: 100.0,
+        paid_mint_stuck_cost_usd: 100.0,
+        total_acquisition_cost_usd: 100.0,
+        total_stuck_cost_usd: 100.0,
+        is_stuck: true,
+        ..VictimAcquisitionAddressPayload::default()
+    };
+    let value_flow_edges = vec![ValueFlowEdgePayload {
+        contract_address: "0xpaidmint".into(),
+        from_address: "0xbuyer".into(),
+        tx_hash: "0xmint".into(),
+        block_time: 1_100,
+        channel: "mint_payment".into(),
+        value_usd: Some(100.0),
+        ..ValueFlowEdgePayload::default()
+    }];
+
+    let stats = build_paper_stats(PaperStatsInput {
+        config: PaperStatsConfig {
+            analysis_timestamp: 2_000,
+            ..PaperStatsConfig::default()
+        },
+        seed_collection_stats: &SeedCollectionStatsPayload::default(),
+        duplicate_candidates: &[],
+        duplicate_contracts: &[],
+        legit_duplicates: &[],
+        infringing_tokens: &[],
+        malicious_addresses: &[],
+        victim_acquisition_addresses: &[victim],
+        value_flow_edges: &value_flow_edges,
+        nft_propagation_paths: &BTreeMap::from([("0xpaidmint".into(), path)]),
+    });
+
+    let buyer = &stats.contract_behavior_stats[0].honest_buyers[0];
+    assert_eq!(buyer.time_to_purchase_seconds, Some(100));
+    assert_eq!(buyer.holding_seconds, Some(900));
 }
 
 #[test]
@@ -964,7 +1611,7 @@ fn paper_stats_requires_exit_price_premium_for_pump_and_exit() {
         .unwrap();
     assert!(contract_stats.pump_and_exit.is_empty());
     assert_eq!(
-        contract_stats.honest_buyers_top[0].source_pattern,
+        contract_stats.honest_buyers[0].source_pattern,
         "unattributed_sale"
     );
 }
@@ -1022,11 +1669,7 @@ fn paper_stats_computes_global_deduplication_and_concentration() {
         merged.attacker_cost.top_contract_contribution_ratio,
         Some(0.9)
     );
-    let total_loss = merged
-        .honest_loss
-        .iter()
-        .find(|row| row.category == "total")
-        .unwrap();
+    let total_loss = &merged.honest_loss;
     assert_eq!(total_loss.top_contract_loss_contribution_ratio, Some(0.9));
     assert_eq!(total_loss.stuck_time_ratio, Some(2.0));
 }
@@ -1270,6 +1913,7 @@ fn paper_stats_for_contract_loss_and_cost(
         victim_acquisition_addresses: &[victim],
         value_flow_edges: &[ValueFlowEdgePayload {
             contract_address: contract.into(),
+            from_address: malicious.into(),
             channel: "mint_payment".into(),
             value_usd: Some(0.0),
             value_with_gas_usd: Some(gas_usd),

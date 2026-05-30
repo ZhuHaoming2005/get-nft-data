@@ -814,6 +814,11 @@ pub async fn fetch_transaction_receipt(
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_lowercase(),
+        contract_address: result
+            .get("contractAddress")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_lowercase(),
         gas_used: parse_hex_or_decimal_i64(result.get("gasUsed")),
         effective_gas_price_wei: parse_hex_or_decimal_i64(result.get("effectiveGasPrice")),
     })
@@ -857,6 +862,11 @@ pub async fn fetch_transaction_receipts_for_block(
                 transaction_index: parse_hex_or_decimal_i64(item.get("transactionIndex")),
                 from_address: item
                     .get("from")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_lowercase(),
+                contract_address: item
+                    .get("contractAddress")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_lowercase(),

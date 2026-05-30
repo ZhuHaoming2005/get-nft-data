@@ -201,7 +201,7 @@ fn single_report_markdown_preserves_summary_sections_only() {
     assert!(!markdown.contains("## 地址行为信号"));
     assert!(!markdown.contains("## 受害者信号"));
     assert!(!markdown.contains("## 诚实地址画像"));
-    assert!(!markdown.contains("诚实地址数"));
+    assert!(!markdown.contains("- 诚实地址数"));
     assert!(!markdown.contains("诚实节点"));
     assert!(!markdown.contains("诚实购买"));
     assert!(!markdown.contains("## 被骗地址画像"));

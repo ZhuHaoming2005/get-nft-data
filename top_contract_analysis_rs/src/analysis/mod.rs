@@ -228,6 +228,7 @@ struct ContractAnalysisResult {
     address_attributions: Vec<AddressAttributionPayload>,
     market_events: Vec<NftMarketEventRecord>,
     mint_payment_edges: Vec<ValueFlowEdgePayload>,
+    attacker_cost_edges: Vec<ValueFlowEdgePayload>,
     nft_propagation_path: Option<NftPropagationPathPayload>,
 }
 
@@ -244,6 +245,7 @@ struct AnalysisOutputState {
     address_attributions: Vec<AddressAttributionPayload>,
     market_events: Vec<NftMarketEventRecord>,
     mint_payment_edges: Vec<ValueFlowEdgePayload>,
+    attacker_cost_edges: Vec<ValueFlowEdgePayload>,
     nft_propagation_paths: BTreeMap<String, NftPropagationPathPayload>,
     candidate_contract_metadata: BTreeMap<String, ContractMetadata>,
     implausible_candidate_contracts: BTreeSet<String>,
@@ -800,13 +802,14 @@ async fn finalize_seed_report(
                 })
                 .collect()
         };
-    let value_flow_edges = output_state.mint_payment_edges.clone();
+    let mut value_flow_edges = output_state.mint_payment_edges.clone();
+    value_flow_edges.extend(output_state.attacker_cost_edges.clone());
     let seed_collection_stats = build_seed_collection_stats(&seed_nfts);
 
     let victim_acquisition_addresses = build_victim_acquisition_addresses_excluding_malicious(
         &output_state.secondary_sale_victim_addresses,
         &output_state.address_attributions,
-        &value_flow_edges,
+        &output_state.mint_payment_edges,
         &output_state.nft_propagation_paths,
         &output_state.malicious_addresses,
     );

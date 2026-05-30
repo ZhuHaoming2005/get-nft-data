@@ -215,14 +215,8 @@ pub(super) fn build_victim_acquisition_addresses_excluding_malicious(
         if row.buy_before_usd_balance.is_none() {
             row.buy_before_usd_balance = edge.from_before_usd_balance;
         }
-        let value_with_gas_eth = edge
-            .value_with_gas_eth
-            .unwrap_or_else(|| edge.value_eth.unwrap_or_default());
-        let value_with_gas_usd = edge
-            .value_with_gas_usd
-            .unwrap_or_else(|| edge.value_usd.unwrap_or_default());
-        let gas_extra_eth = (value_with_gas_eth - edge.value_eth.unwrap_or_default()).max(0.0);
-        let gas_extra_usd = (value_with_gas_usd - edge.value_usd.unwrap_or_default()).max(0.0);
+        let gas_extra_eth = edge_sender_paid_gas_eth(edge);
+        let gas_extra_usd = edge_sender_paid_gas_usd(edge);
         if gas_extra_eth > 0.0 || gas_extra_usd > 0.0 {
             let entry = gas_extra_by_address
                 .entry(row.address.to_lowercase())
@@ -233,6 +227,7 @@ pub(super) fn build_victim_acquisition_addresses_excluding_malicious(
         row.paid_mint_edge_count += 1;
         let (stuck_token_count, total_token_count) =
             paid_mint_stuck_token_counts(edge, propagation_paths);
+        row.paid_mint_token_count += total_token_count as i64;
         if stuck_token_count > 0 && total_token_count > 0 {
             let stuck_fraction = stuck_token_count as f64 / total_token_count as f64;
             row.paid_mint_stuck_token_count += stuck_token_count as i64;
@@ -291,6 +286,37 @@ pub(super) fn acquisition_ratio(
         }
     }
     None
+}
+
+fn edge_sender_paid_gas(edge: &ValueFlowEdgePayload) -> bool {
+    edge.gas_payer_address.trim().is_empty()
+        || edge
+            .gas_payer_address
+            .eq_ignore_ascii_case(&edge.from_address)
+}
+
+fn edge_sender_paid_gas_eth(edge: &ValueFlowEdgePayload) -> f64 {
+    if !edge_sender_paid_gas(edge) {
+        return 0.0;
+    }
+    edge.gas_eth.unwrap_or_else(|| {
+        let value_with_gas = edge
+            .value_with_gas_eth
+            .unwrap_or_else(|| edge.value_eth.unwrap_or_default());
+        (value_with_gas - edge.value_eth.unwrap_or_default()).max(0.0)
+    })
+}
+
+fn edge_sender_paid_gas_usd(edge: &ValueFlowEdgePayload) -> f64 {
+    if !edge_sender_paid_gas(edge) {
+        return 0.0;
+    }
+    edge.gas_usd.unwrap_or_else(|| {
+        let value_with_gas = edge
+            .value_with_gas_usd
+            .unwrap_or_else(|| edge.value_usd.unwrap_or_default());
+        (value_with_gas - edge.value_usd.unwrap_or_default()).max(0.0)
+    })
 }
 
 pub(super) fn push_unique(values: &mut Vec<String>, value: &str) {

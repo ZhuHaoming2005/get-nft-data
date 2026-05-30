@@ -142,6 +142,13 @@ fn victim_acquisition_separates_secondary_sale_and_paid_mint_costs() {
     assert_eq!(
         victim_acquisition_addresses
             .iter()
+            .map(|item| item.paid_mint_token_count)
+            .sum::<i64>(),
+        2
+    );
+    assert_eq!(
+        victim_acquisition_addresses
+            .iter()
             .map(|item| item.paid_mint_stuck_cost_eth)
             .sum::<f64>(),
         1.0
@@ -263,6 +270,52 @@ fn victim_acquisition_ratio_with_gas_uses_paid_mint_gas_delta() {
 
     assert_eq!(rows[0].buy_asset_ratio, Some(0.7));
     assert_eq!(rows[0].buy_asset_ratio_with_gas, Some(0.75));
+}
+
+#[test]
+fn victim_acquisition_ratio_with_gas_excludes_third_party_paid_gas() {
+    let address_attributions = vec![AddressAttributionPayload {
+        contract_address: "0xdup".into(),
+        address: "0xvictim".into(),
+        attribution_label: "likely_victim".into(),
+        evidence: vec![AddressEvidencePayload {
+            evidence_type: "paid_mint_payment".into(),
+            contract_address: "0xdup".into(),
+            token_id: "1".into(),
+            tx_hash: "0xmint".into(),
+            weight: 0.45,
+            detail: "paid mint victim evidence".into(),
+        }],
+        ..AddressAttributionPayload::default()
+    }];
+    let value_flow_edges = vec![ValueFlowEdgePayload {
+        edge_id: "value:mint_payment:0xmint".into(),
+        contract_address: "0xdup".into(),
+        from_address: "0xvictim".into(),
+        tx_hash: "0xmint".into(),
+        token_id: "1".into(),
+        value_eth: Some(3.0),
+        value_usd: Some(3_000.0),
+        value_with_gas_eth: Some(3.5),
+        value_with_gas_usd: Some(3_500.0),
+        gas_payer_address: "0xrelayer".into(),
+        gas_eth: Some(0.5),
+        gas_usd: Some(500.0),
+        from_before_eth_balance: Some(10.0),
+        from_before_usd_balance: Some(10_000.0),
+        channel: "mint_payment".into(),
+        ..ValueFlowEdgePayload::default()
+    }];
+
+    let rows = build_victim_acquisition_addresses(
+        &[],
+        &address_attributions,
+        &value_flow_edges,
+        &BTreeMap::new(),
+    );
+
+    assert_eq!(rows[0].buy_asset_ratio, Some(0.3));
+    assert_eq!(rows[0].buy_asset_ratio_with_gas, Some(0.3));
 }
 
 #[test]

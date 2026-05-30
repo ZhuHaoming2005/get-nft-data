@@ -1881,6 +1881,7 @@ async fn fetch_transaction_receipt_parses_hex_receipt_fields() {
                     "blockNumber": "0x10",
                     "transactionIndex": "0x2",
                     "from": "0xbuyer",
+                    "contractAddress": "0xcreated",
                     "gasUsed": "0x5208",
                     "effectiveGasPrice": "0x3b9aca00"
                 }
@@ -1898,6 +1899,7 @@ async fn fetch_transaction_receipt_parses_hex_receipt_fields() {
     assert_eq!(receipt.block_number, 16);
     assert_eq!(receipt.transaction_index, 2);
     assert_eq!(receipt.from_address, "0xbuyer");
+    assert_eq!(receipt.contract_address, "0xcreated");
     assert_eq!(receipt.gas_used, 21000);
 }
 
@@ -1916,6 +1918,7 @@ async fn fetch_transaction_receipts_for_block_parses_receipt_map() {
                         "transactionHash": "0xprefund",
                         "transactionIndex": "0x1",
                         "from": "0xother",
+                        "contractAddress": "0xcreated",
                         "gasUsed": "0x0",
                         "effectiveGasPrice": "0x0"
                     }]
@@ -1932,6 +1935,7 @@ async fn fetch_transaction_receipts_for_block_parses_receipt_map() {
 
     assert_eq!(rows["0xprefund"].transaction_index, 1);
     assert_eq!(rows["0xprefund"].from_address, "0xother");
+    assert_eq!(rows["0xprefund"].contract_address, "0xcreated");
 }
 
 #[tokio::test]

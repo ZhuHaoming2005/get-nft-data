@@ -2396,6 +2396,7 @@ impl AnalyzeApi for SecondaryVictimApi {
             block_number: 2,
             transaction_index: 3,
             from_address: "0xvictim".into(),
+            contract_address: String::new(),
             gas_used: 21000,
             effective_gas_price_wei: 1_000_000_000,
         })
@@ -2414,6 +2415,7 @@ impl AnalyzeApi for SecondaryVictimApi {
                 block_number: 2,
                 transaction_index: 1,
                 from_address: "0xother".into(),
+                contract_address: String::new(),
                 gas_used: 0,
                 effective_gas_price_wei: 0,
             },
@@ -2632,6 +2634,7 @@ impl AnalyzeApi for MultiBuyerSameTxApi {
             block_number: 2,
             transaction_index: 3,
             from_address: "0xmarketplace".into(),
+            contract_address: String::new(),
             gas_used: 0,
             effective_gas_price_wei: 0,
         })
@@ -3419,6 +3422,7 @@ impl AnalyzeApi for CashoutTraceApi {
             block_number: 10,
             transaction_index: 1,
             from_address: "0xminter".into(),
+            contract_address: String::new(),
             gas_used: 21_000,
             effective_gas_price_wei: 1_000_000_000,
         })
@@ -3438,6 +3442,7 @@ impl AnalyzeApi for CashoutTraceApi {
                     block_number,
                     transaction_index: 1,
                     from_address: "0xminter".into(),
+                    contract_address: String::new(),
                     gas_used: 21_000,
                     effective_gas_price_wei: 1_000_000_000,
                 },
@@ -3449,6 +3454,7 @@ impl AnalyzeApi for CashoutTraceApi {
                     block_number,
                     transaction_index: 2,
                     from_address: "0xhop1".into(),
+                    contract_address: String::new(),
                     gas_used: 21_000,
                     effective_gas_price_wei: 1_000_000_000,
                 },
@@ -3719,6 +3725,7 @@ impl AnalyzeApi for DuplicateMintPaymentLookupApi {
             block_number: 1,
             transaction_index: 1,
             from_address: "0xminter".into(),
+            contract_address: String::new(),
             gas_used: 21000,
             effective_gas_price_wei: 1_000_000_000,
         })
@@ -3975,6 +3982,7 @@ impl AnalyzeApi for ObsoleteReceiptMetricProbeApi {
             block_number: 2,
             transaction_index: 1,
             from_address: "0xvictim".into(),
+            contract_address: String::new(),
             gas_used: 21000,
             effective_gas_price_wei: 1_000_000_000,
         })

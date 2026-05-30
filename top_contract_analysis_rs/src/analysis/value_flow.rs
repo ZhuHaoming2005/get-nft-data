@@ -2,10 +2,12 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use futures::{stream, StreamExt};
 
+use crate::currency::FALLBACK_ETH_USD_RATE;
 use crate::error::AppError;
 use crate::models::{
-    ContractMetadata, EthTransferRecord, InfringingTokenRecord, TransactionReceiptRecord,
-    TransferRecord, ValueFlowEdgePayload, ZERO_ADDRESS,
+    ContractMetadata, EthTransferRecord, HonestAddressPayload, InfringingTokenRecord,
+    MaliciousAddressPayload, NftSaleRecord, TransactionReceiptRecord, TransferRecord,
+    ValueFlowEdgePayload, ZERO_ADDRESS,
 };
 
 use super::{AnalysisDeps, AnalyzeRequest};
@@ -296,6 +298,259 @@ pub(super) async fn compute_mint_payment_edges_for_contract(
     Ok(rows.into_values().collect())
 }
 
+pub(super) async fn compute_attacker_cost_edges_for_contract(
+    request: &AnalyzeRequest,
+    deps: &AnalysisDeps,
+    contract_address: &str,
+    contract_metadata: Option<&ContractMetadata>,
+    sales: &[NftSaleRecord],
+    malicious_addresses: &[MaliciousAddressPayload],
+    honest_addresses: &[HonestAddressPayload],
+) -> Result<Vec<ValueFlowEdgePayload>, AppError> {
+    let malicious = malicious_addresses
+        .iter()
+        .map(|item| normalized_address(&item.address))
+        .filter(|address| is_nonzero_address(address))
+        .collect::<BTreeSet<_>>();
+    let honest = honest_addresses
+        .iter()
+        .map(|item| normalized_address(&item.address))
+        .filter(|address| is_nonzero_address(address))
+        .collect::<BTreeSet<_>>();
+
+    let (deployment_edge, sale_edges) = tokio::join!(
+        fetch_deployment_cost_edge(request, deps, contract_address, contract_metadata),
+        compute_malicious_sale_cost_edges(
+            request,
+            deps,
+            contract_address,
+            sales,
+            &malicious,
+            &honest
+        )
+    );
+
+    let mut rows = BTreeMap::<String, ValueFlowEdgePayload>::new();
+    if let Some(edge) = deployment_edge? {
+        rows.insert(edge.edge_id.clone(), edge);
+    }
+    for edge in sale_edges? {
+        rows.insert(edge.edge_id.clone(), edge);
+    }
+    Ok(rows.into_values().collect())
+}
+
+async fn fetch_deployment_cost_edge(
+    request: &AnalyzeRequest,
+    deps: &AnalysisDeps,
+    contract_address: &str,
+    contract_metadata: Option<&ContractMetadata>,
+) -> Result<Option<ValueFlowEdgePayload>, AppError> {
+    let Some(metadata) = contract_metadata else {
+        return Ok(None);
+    };
+    if metadata.deployed_block_number <= 0 {
+        return Ok(None);
+    }
+    let receipts = deps
+        .api
+        .fetch_transaction_receipts_for_block_on_chain(
+            &request.chain,
+            &request.alchemy_api_key,
+            request.alchemy_network.as_deref(),
+            metadata.deployed_block_number,
+        )
+        .await
+        .unwrap_or_default();
+    let receipt = deployment_receipt_for_contract(&receipts, contract_address, metadata);
+    let Some(receipt) = receipt else {
+        return Ok(None);
+    };
+    let Some(gas_eth) = receipt_gas_eth(receipt) else {
+        return Ok(None);
+    };
+    let gas_payer = if receipt.from_address.trim().is_empty() {
+        metadata.contract_deployer.clone()
+    } else {
+        receipt.from_address.clone()
+    };
+    if !is_nonzero_address(&normalized_address(&gas_payer)) {
+        return Ok(None);
+    }
+    Ok(Some(ValueFlowEdgePayload {
+        edge_id: format!(
+            "value:contract_deploy:{}:{}",
+            contract_address, receipt.tx_hash
+        ),
+        contract_address: contract_address.to_string(),
+        from_address: gas_payer.clone(),
+        to_address: contract_address.to_string(),
+        tx_hash: receipt.tx_hash.clone(),
+        block_number: metadata.deployed_block_number,
+        block_time: metadata.deployed_block_time,
+        token_id: String::new(),
+        value_eth: None,
+        value_usd: None,
+        value_with_gas_eth: Some(gas_eth),
+        value_with_gas_usd: Some(gas_eth * FALLBACK_ETH_USD_RATE),
+        gas_payer_address: gas_payer,
+        gas_eth: Some(gas_eth),
+        gas_usd: Some(gas_eth * FALLBACK_ETH_USD_RATE),
+        from_before_eth_balance: None,
+        from_before_usd_balance: None,
+        payment_token_symbol: "ETH".into(),
+        payment_token_address: ZERO_ADDRESS.into(),
+        channel: "contract_deploy".into(),
+        marketplace: String::new(),
+        evidence_type: "deployment_receipt_gas".into(),
+        from_role: "contract_deployer".into(),
+        to_role: "mint_contract".into(),
+        recipient_known: true,
+        evidence_flags: vec!["deployment_gas".into(), "receipt_gas".into()],
+    }))
+}
+
+fn deployment_receipt_for_contract<'a>(
+    receipts: &'a BTreeMap<String, TransactionReceiptRecord>,
+    contract_address: &str,
+    metadata: &ContractMetadata,
+) -> Option<&'a TransactionReceiptRecord> {
+    receipts
+        .values()
+        .find(|receipt| {
+            !receipt.contract_address.trim().is_empty()
+                && receipt
+                    .contract_address
+                    .eq_ignore_ascii_case(contract_address)
+        })
+        .or_else(|| {
+            let deployer = metadata.contract_deployer.trim();
+            if deployer.is_empty() {
+                return None;
+            }
+            receipts
+                .values()
+                .filter(|receipt| receipt.from_address.eq_ignore_ascii_case(deployer))
+                .min_by_key(|receipt| receipt.transaction_index)
+        })
+}
+
+async fn compute_malicious_sale_cost_edges(
+    request: &AnalyzeRequest,
+    deps: &AnalysisDeps,
+    contract_address: &str,
+    sales: &[NftSaleRecord],
+    malicious: &BTreeSet<String>,
+    honest: &BTreeSet<String>,
+) -> Result<Vec<ValueFlowEdgePayload>, AppError> {
+    let mut tx_hashes = BTreeSet::<String>::new();
+    for sale in sales {
+        if !sale.contract_address.eq_ignore_ascii_case(contract_address)
+            || sale.tx_hash.trim().is_empty()
+            || !sale_has_malicious_participant(sale, malicious)
+        {
+            continue;
+        }
+        tx_hashes.insert(sale.tx_hash.clone());
+    }
+    if tx_hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let receipts_by_tx = fetch_mint_payment_receipts(request, deps, tx_hashes).await?;
+    let mut rows = BTreeMap::<String, ValueFlowEdgePayload>::new();
+    for sale in sales {
+        if !sale.contract_address.eq_ignore_ascii_case(contract_address)
+            || !sale_has_malicious_participant(sale, malicious)
+        {
+            continue;
+        }
+        let Some(receipt) = receipts_by_tx.get(&sale.tx_hash) else {
+            continue;
+        };
+        let gas_payer = normalized_address(&receipt.from_address);
+        if honest.contains(&gas_payer) || !malicious.contains(&gas_payer) {
+            continue;
+        }
+        let Some(gas_eth) = receipt_gas_eth(receipt) else {
+            continue;
+        };
+        let gas_usd = gas_eth * sale_eth_usd_rate(sale).unwrap_or(FALLBACK_ETH_USD_RATE);
+        let channel = sale_attacker_cost_channel(sale, &gas_payer, malicious);
+        let edge = ValueFlowEdgePayload {
+            edge_id: format!(
+                "value:{}:{}:{}:{}:{}",
+                channel, sale.tx_hash, sale.log_index, sale.bundle_index, receipt.from_address
+            ),
+            contract_address: contract_address.to_string(),
+            from_address: receipt.from_address.clone(),
+            to_address: contract_address.to_string(),
+            tx_hash: sale.tx_hash.clone(),
+            block_number: sale.block_number,
+            block_time: 0,
+            token_id: sale.token_id.clone(),
+            value_eth: sale.price_eth.filter(|value| *value > 0.0),
+            value_usd: sale.price_usd.filter(|value| *value > 0.0),
+            value_with_gas_eth: sale.price_eth.map(|value| value + gas_eth),
+            value_with_gas_usd: sale.price_usd.map(|value| value + gas_usd),
+            gas_payer_address: receipt.from_address.clone(),
+            gas_eth: Some(gas_eth),
+            gas_usd: Some(gas_usd),
+            from_before_eth_balance: None,
+            from_before_usd_balance: None,
+            payment_token_symbol: if sale.payment_token_symbol.is_empty() {
+                "ETH".into()
+            } else {
+                sale.payment_token_symbol.clone()
+            },
+            payment_token_address: if sale.payment_token_address.is_empty() {
+                ZERO_ADDRESS.into()
+            } else {
+                sale.payment_token_address.clone()
+            },
+            channel,
+            marketplace: sale.marketplace.clone(),
+            evidence_type: "sale_receipt_gas".into(),
+            from_role: "attacker".into(),
+            to_role: "marketplace_sale".into(),
+            recipient_known: true,
+            evidence_flags: vec![
+                "attacker_sale_gas".into(),
+                "receipt_gas".into(),
+                format!("seller:{}", sale.seller_address),
+                format!("buyer:{}", sale.buyer_address),
+            ],
+        };
+        rows.insert(edge.edge_id.clone(), edge);
+    }
+    Ok(rows.into_values().collect())
+}
+
+fn sale_attacker_cost_channel(
+    sale: &NftSaleRecord,
+    gas_payer: &str,
+    malicious: &BTreeSet<String>,
+) -> String {
+    let buyer = normalized_address(&sale.buyer_address);
+    let seller = normalized_address(&sale.seller_address);
+    if seller == gas_payer && malicious.contains(&seller) && !malicious.contains(&buyer) {
+        "exit_payment".into()
+    } else {
+        "lure_payment".into()
+    }
+}
+
+fn sale_has_malicious_participant(sale: &NftSaleRecord, malicious: &BTreeSet<String>) -> bool {
+    malicious.contains(&normalized_address(&sale.buyer_address))
+        || malicious.contains(&normalized_address(&sale.seller_address))
+}
+
+fn sale_eth_usd_rate(sale: &NftSaleRecord) -> Option<f64> {
+    let eth = sale.price_eth?;
+    let usd = sale.price_usd?;
+    (eth > 0.0 && usd > 0.0).then_some(usd / eth)
+}
+
 fn mint_payment_receiver_addresses(
     contract_address: &str,
     contract_metadata: Option<&ContractMetadata>,
@@ -565,9 +820,16 @@ fn value_flow_edge_from_transfer(input: ValueFlowEdgeInput<'_>) -> ValueFlowEdge
         }
     }
 
+    let gas_eth = receipt.and_then(receipt_gas_eth);
+    let gas_usd = receipt.and_then(|receipt| receipt_gas_usd(transfer, receipt));
     ValueFlowEdgePayload {
         value_with_gas_eth: value_with_gas_eth(transfer, receipt),
         value_with_gas_usd: value_with_gas_usd(transfer, receipt),
+        gas_payer_address: receipt
+            .map(|receipt| receipt.from_address.clone())
+            .unwrap_or_default(),
+        gas_eth,
+        gas_usd,
         from_before_eth_balance: wallet_snapshot.before_eth_balance,
         from_before_usd_balance: wallet_snapshot.before_usd_balance,
         edge_id: format!(
@@ -1033,6 +1295,10 @@ fn normalized_address(address: &str) -> String {
     address.trim().to_lowercase()
 }
 
+fn is_nonzero_address(address: &str) -> bool {
+    !address.trim().is_empty() && !address.eq_ignore_ascii_case(ZERO_ADDRESS)
+}
+
 pub(super) fn mint_payment_wallet_snapshot(
     minter_address: &str,
     base_balance_eth: Option<f64>,
@@ -1082,12 +1348,8 @@ pub(super) fn value_with_gas_eth(
 ) -> Option<f64> {
     let value_eth = (transfer.value_eth > 0.0).then_some(transfer.value_eth)?;
     let gas_eth = receipt
-        .filter(|receipt| {
-            receipt
-                .from_address
-                .eq_ignore_ascii_case(&transfer.from_address)
-        })
-        .map(gas_eth_from_receipt)
+        .filter(|receipt| receipt_gas_paid_by_transfer_sender(transfer, receipt))
+        .and_then(receipt_gas_eth)
         .unwrap_or_default();
     Some(value_eth + gas_eth)
 }
@@ -1098,15 +1360,8 @@ pub(super) fn value_with_gas_usd(
 ) -> Option<f64> {
     let value_usd = transfer.value_usd?;
     let gas_usd = receipt
-        .filter(|receipt| {
-            receipt
-                .from_address
-                .eq_ignore_ascii_case(&transfer.from_address)
-        })
-        .and_then(|receipt| {
-            infer_eth_usd_rate_from_transfer(transfer)
-                .map(|rate| gas_eth_from_receipt(receipt) * rate)
-        })
+        .filter(|receipt| receipt_gas_paid_by_transfer_sender(transfer, receipt))
+        .and_then(|receipt| receipt_gas_usd(transfer, receipt))
         .unwrap_or_default();
     Some(value_usd + gas_usd)
 }
@@ -1114,6 +1369,30 @@ pub(super) fn value_with_gas_usd(
 pub(super) fn gas_eth_from_receipt(receipt: &TransactionReceiptRecord) -> f64 {
     (receipt.gas_used as f64 * receipt.effective_gas_price_wei as f64)
         / 1_000_000_000_000_000_000_f64
+}
+
+fn receipt_gas_eth(receipt: &TransactionReceiptRecord) -> Option<f64> {
+    let gas_eth = gas_eth_from_receipt(receipt);
+    (gas_eth > 0.0).then_some(gas_eth)
+}
+
+fn receipt_gas_usd(
+    transfer: &EthTransferRecord,
+    receipt: &TransactionReceiptRecord,
+) -> Option<f64> {
+    infer_eth_usd_rate_from_transfer(transfer).and_then(|rate| {
+        let gas_usd = gas_eth_from_receipt(receipt) * rate;
+        (gas_usd > 0.0).then_some(gas_usd)
+    })
+}
+
+fn receipt_gas_paid_by_transfer_sender(
+    transfer: &EthTransferRecord,
+    receipt: &TransactionReceiptRecord,
+) -> bool {
+    receipt
+        .from_address
+        .eq_ignore_ascii_case(&transfer.from_address)
 }
 
 pub(super) fn infer_eth_usd_rate_from_transfers(transfers: &[EthTransferRecord]) -> Option<f64> {

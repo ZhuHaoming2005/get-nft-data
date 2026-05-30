@@ -201,6 +201,8 @@ pub struct TransactionReceiptRecord {
     pub block_number: i64,
     pub transaction_index: i64,
     pub from_address: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub contract_address: String,
     pub gas_used: i64,
     pub effective_gas_price_wei: i64,
 }
@@ -425,6 +427,7 @@ pub struct VictimAcquisitionAddressPayload {
     pub paid_mint_stuck_cost_eth: f64,
     pub paid_mint_stuck_cost_usd: f64,
     pub paid_mint_edge_count: i64,
+    pub paid_mint_token_count: i64,
     pub paid_mint_stuck_token_count: i64,
     pub total_acquisition_cost_eth: f64,
     pub total_acquisition_cost_usd: f64,
@@ -538,6 +541,12 @@ pub struct ValueFlowEdgePayload {
     pub value_with_gas_eth: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_with_gas_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub gas_payer_address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gas_eth: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gas_usd: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_before_eth_balance: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -768,6 +777,8 @@ pub struct PaperPumpExitRowPayload {
     pub cycle_id: String,
     pub exit_delay_seconds: Option<i64>,
     pub exit_price_premium: Option<f64>,
+    pub exit_price_premium_numerator: f64,
+    pub exit_price_premium_denominator: f64,
     pub exit_ratio: Option<f64>,
     pub exit_ratio_numerator: i64,
     pub exit_ratio_denominator: i64,
@@ -839,7 +850,7 @@ pub struct PaperContractBehaviorStatsPayload {
     pub star_behaviors: Vec<PaperStarBehaviorRowPayload>,
     pub layered_transfers: Vec<PaperLayeredTransferRowPayload>,
     pub inventory_concentration: Vec<PaperInventoryConcentrationRowPayload>,
-    pub honest_buyers_top: Vec<PaperHonestBuyerRowPayload>,
+    pub honest_buyers: Vec<PaperHonestBuyerRowPayload>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -877,7 +888,6 @@ pub struct PaperAttackerCostPayload {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct PaperHonestLossPayload {
-    pub category: String,
     pub stuck_nft_count: i64,
     pub stuck_nft_ratio: Option<f64>,
     pub stuck_nft_ratio_numerator: i64,
@@ -909,6 +919,8 @@ pub struct PaperDataQualityPayload {
     pub sale_price_parseable_count: i64,
     pub sale_price_total_count: i64,
     pub sale_price_parseable_ratio: Option<f64>,
+    pub sale_price_parseable_ratio_numerator: i64,
+    pub sale_price_parseable_ratio_denominator: i64,
     pub legit_duplicate_contract_count: i64,
 }
 
@@ -919,7 +931,7 @@ pub struct PaperStatsPayload {
     pub contract_behavior_stats: Vec<PaperContractBehaviorStatsPayload>,
     pub malicious_behavior_summary: Vec<PaperBehaviorSummaryRowPayload>,
     pub attacker_cost: PaperAttackerCostPayload,
-    pub honest_loss: Vec<PaperHonestLossPayload>,
+    pub honest_loss: PaperHonestLossPayload,
     pub data_quality: PaperDataQualityPayload,
     #[serde(default, skip_serializing)]
     pub malicious_addresses: Vec<String>,

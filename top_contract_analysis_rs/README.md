@@ -172,15 +172,15 @@ cargo run --release -- batch \
 - `address_classification`：恶意地址、跨合约重复侵权恶意地址、诚实地址、地址总数。
 - `contract_behavior_stats`：逐合约输出 Wash Trading、Pump-and-Exit、Sybil/Fraud/Poisoning、Layered Transfer、Inventory Concentration、诚实买家明细。
 - `malicious_behavior_summary`：按行为类型汇总合约覆盖率、实例占比、涉及地址/NFT、关联买家和关联损失。
-- `attacker_cost`：Setup / Lure / Exit / Total gas 成本和前百分比合约成本集中度。
-- `honest_loss`：二级市场、付费 mint、total 三类诚实买家损失和集中度。
+- `attacker_cost`：Setup / Lure / Exit / Total gas 成本和前百分比合约成本集中度；Setup 统计复制合约部署、付费 mint 前置/准备交易等可归因 gas，Lure 统计攻击者刷量/诱导成交 gas，Exit 统计攻击者卖出、withdrawal、cashout 等退出 gas；同一合约同一阶段同一交易只计一次，不把诚实买家支付的 gas 计入攻击者成本。
+- `honest_loss`：单个总计对象，汇总二级市场损失、付费 mint 损失、总损失、套牢 NFT 和集中度，不再按类别拆成多行。
 - `data_quality`：销售价格可解析比例和官方参与型重复合约数。
 
 统计阶段不做代表合约或买家 top-k 截断，所有可识别的合约行为和诚实买家行都会导出。论文撰写时再按行为覆盖数、关联损失、虚假交易额、地址规模等指标选择代表案例。旧参数 `--paper-top-k` 已删除。
 
-Markdown 报告把合约行为明细和诚实买家明细这类大表放在最后输出。合约行为表按综合影响金额 USD、行为实例数、合约地址排序；诚实买家表按 paid USD、fake NFT 数、合约地址、买家地址排序。
+Markdown 报告把合约行为明细和诚实买家明细这类大表放在最后输出。合约行为表按综合影响金额 USD、行为实例数、合约地址排序；诚实买家表按 paid USD、fake NFT 数、合约地址、买家地址排序，并输出 `paid ETH/USD`、`time_to_purchase_seconds`、`holding_seconds`。
 
-所有论文比例字段都保留可复核口径。重复规模、行为汇总、攻击投入、诚实损失已经输出对应的 numerator / denominator；单合约行为中的 `exit_ratio`、`avg_fan_out`、`token_share`、`value_share` 也分别导出对应分子和分母字段。
+所有论文比例字段都保留可复核口径。重复规模、行为汇总、攻击投入、诚实损失、sale 价格可解析比例已经输出对应的 numerator / denominator；单合约行为中的 `exit_price_premium`、`exit_ratio`、`avg_fan_out`、`token_share`、`value_share` 也分别导出对应分子和分母字段。
 
 ## 典型使用流程
 
