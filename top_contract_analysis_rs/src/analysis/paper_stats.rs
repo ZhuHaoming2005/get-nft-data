@@ -8,11 +8,12 @@ use crate::models::{
     DuplicateCandidate, DuplicateContractPayload, InfringingTokenRecord, MaliciousAddressPayload,
     NftPropagationEdgePayload, NftPropagationPathPayload, PaperAddressClassificationPayload,
     PaperAttackerCostDetailPayload, PaperAttackerCostPayload, PaperBehaviorSummaryRowPayload,
-    PaperContractBehaviorStatsPayload, PaperDataQualityPayload, PaperDuplicateScaleRowPayload,
-    PaperHonestBuyerRowPayload, PaperHonestLossPayload, PaperInventoryConcentrationRowPayload,
-    PaperLayeredTransferRowPayload, PaperPumpExitRowPayload, PaperStarBehaviorRowPayload,
-    PaperStatsPayload, PaperWashTradingRowPayload, SeedCollectionStatsPayload,
-    ValueFlowEdgePayload, VictimAcquisitionAddressPayload, ZERO_ADDRESS,
+    PaperContractBehaviorStatsPayload, PaperContractWashCycleSizePayload, PaperDataQualityPayload,
+    PaperDuplicateScaleRowPayload, PaperHonestBuyerRowPayload, PaperHonestLossPayload,
+    PaperInventoryConcentrationRowPayload, PaperLayeredTransferRowPayload, PaperPumpExitRowPayload,
+    PaperStarBehaviorRowPayload, PaperStatsPayload, PaperWashCycleSizeRowPayload,
+    PaperWashTradingRowPayload, SeedCollectionStatsPayload, ValueFlowEdgePayload,
+    VictimAcquisitionAddressPayload, ZERO_ADDRESS,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -242,6 +243,9 @@ pub fn build_paper_stats(input: PaperStatsInput<'_>) -> PaperStatsPayload {
         &behavior_nfts_by_type,
         &behavior_buyers_by_type,
     );
+    let wash_cycle_size_distribution =
+        wash_cycle_size_distribution_for_contracts(&contract_behavior_stats);
+    let wash_cycle_size_by_contract = wash_cycle_size_by_contract(&input, &contract_behavior_stats);
     let explicit_malicious_addresses = explicit_malicious_address_set(input.malicious_addresses);
     let duplicate_contract_count = duplicate_scale.contract_denominator_keys.len();
     let attacker_cost = build_attacker_cost(
@@ -265,6 +269,8 @@ pub fn build_paper_stats(input: PaperStatsInput<'_>) -> PaperStatsPayload {
         address_classification: build_address_classification(&address_sets),
         contract_behavior_stats,
         malicious_behavior_summary,
+        wash_cycle_size_distribution,
+        wash_cycle_size_by_contract,
         attacker_cost: attacker_cost.payload,
         attacker_cost_details: attacker_cost.details,
         honest_loss: honest_loss.payload,
@@ -559,6 +565,10 @@ pub fn merge_paper_stats<'a>(
         &behavior_nfts,
         &behavior_buyers,
     );
+    merged.wash_cycle_size_distribution =
+        wash_cycle_size_distribution_for_contracts(&merged.contract_behavior_stats);
+    merged.wash_cycle_size_by_contract =
+        wash_cycle_size_by_contract_from_stats(&merged.contract_behavior_stats);
     merged.duplicate_nft_keys_by_category = sets_to_vecs(duplicate_nft_keys);
     merged.duplicate_contract_keys_by_category = sets_to_vecs(duplicate_contract_keys);
     merged.duplicate_contract_denominator_keys =
@@ -1428,7 +1438,9 @@ fn build_contract_behavior_stats(
                     cycle.token_ids.iter().cloned(),
                 );
             }
-            let wash_trading = cycles.iter().map(|cycle| cycle.row.clone()).collect();
+            let wash_trading: Vec<PaperWashTradingRowPayload> =
+                cycles.iter().map(|cycle| cycle.row.clone()).collect();
+            let wash_cycle_size_distribution = wash_cycle_size_distribution_for_rows(&wash_trading);
             let pump_and_exit_patterns = detect_pump_and_exit(path, address_sets, &cycles);
             let mut source_patterns_by_buyer = BTreeMap::<String, BTreeSet<String>>::new();
             for pattern in &pump_and_exit_patterns {
@@ -1513,6 +1525,7 @@ fn build_contract_behavior_stats(
             let stats = PaperContractBehaviorStatsPayload {
                 contract_address,
                 wash_trading,
+                wash_cycle_size_distribution,
                 pump_and_exit,
                 star_behaviors,
                 layered_transfers,
@@ -2327,6 +2340,118 @@ fn honest_buyer_stuck_nft_count(item: &VictimAcquisitionAddressPayload) -> i64 {
         0
     };
     secondary_stuck_count + item.paid_mint_stuck_token_count
+}
+
+fn wash_cycle_size_distribution_for_contracts(
+    contract_stats: &[PaperContractBehaviorStatsPayload],
+) -> Vec<PaperWashCycleSizeRowPayload> {
+    let rows = contract_stats
+        .iter()
+        .flat_map(|stats| stats.wash_trading.iter().cloned())
+        .collect::<Vec<_>>();
+    wash_cycle_size_distribution_for_rows(&rows)
+}
+
+fn wash_cycle_size_by_contract(
+    input: &PaperStatsInput<'_>,
+    contract_stats: &[PaperContractBehaviorStatsPayload],
+) -> Vec<PaperContractWashCycleSizePayload> {
+    let evidence_items = duplicate_evidence_items(input);
+    let mut contracts = duplicate_contract_key_set(input, &evidence_items);
+    for (contract_key, path) in input.nft_propagation_paths {
+        let contract = if path.contract_address.trim().is_empty() {
+            normalized_contract(contract_key)
+        } else {
+            normalized_contract(&path.contract_address)
+        };
+        if contract != "unknown" {
+            contracts.insert(contract);
+        }
+    }
+    if contracts.is_empty() {
+        contracts.extend(
+            contract_stats
+                .iter()
+                .map(|stats| normalized_contract(&stats.contract_address))
+                .filter(|contract| contract != "unknown"),
+        );
+    }
+    let distributions_by_contract = contract_stats
+        .iter()
+        .map(|stats| {
+            (
+                normalized_contract(&stats.contract_address),
+                if stats.wash_cycle_size_distribution.is_empty() {
+                    wash_cycle_size_distribution_for_rows(&stats.wash_trading)
+                } else {
+                    stats.wash_cycle_size_distribution.clone()
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    contracts
+        .into_iter()
+        .map(|contract| {
+            let distribution = distributions_by_contract
+                .get(&contract)
+                .cloned()
+                .unwrap_or_else(|| wash_cycle_size_distribution_for_rows(&[]));
+            PaperContractWashCycleSizePayload {
+                contract_address: contract,
+                distribution,
+            }
+        })
+        .collect()
+}
+
+fn wash_cycle_size_by_contract_from_stats(
+    contract_stats: &[PaperContractBehaviorStatsPayload],
+) -> Vec<PaperContractWashCycleSizePayload> {
+    contract_stats
+        .iter()
+        .map(|stats| PaperContractWashCycleSizePayload {
+            contract_address: normalized_contract(&stats.contract_address),
+            distribution: if stats.wash_cycle_size_distribution.is_empty() {
+                wash_cycle_size_distribution_for_rows(&stats.wash_trading)
+            } else {
+                stats.wash_cycle_size_distribution.clone()
+            },
+        })
+        .collect()
+}
+
+fn wash_cycle_size_distribution_for_rows(
+    rows: &[PaperWashTradingRowPayload],
+) -> Vec<PaperWashCycleSizeRowPayload> {
+    let mut two_node_count = 0;
+    let mut three_node_count = 0;
+    let mut four_node_count = 0;
+    let mut five_plus_node_count = 0;
+    for row in rows {
+        match row.participant_node_count {
+            2 => two_node_count += 1,
+            3 => three_node_count += 1,
+            4 => four_node_count += 1,
+            count if count >= 5 => five_plus_node_count += 1,
+            _ => {}
+        }
+    }
+    let total = two_node_count + three_node_count + four_node_count + five_plus_node_count;
+    [
+        ("2", two_node_count),
+        ("3", three_node_count),
+        ("4", four_node_count),
+        ("5+", five_plus_node_count),
+    ]
+    .into_iter()
+    .map(|(bucket, count)| PaperWashCycleSizeRowPayload {
+        node_count_bucket: bucket.to_string(),
+        cycle_count: count,
+        cycle_ratio: ratio_i64(count, total),
+        cycle_ratio_numerator: count,
+        cycle_ratio_denominator: total,
+    })
+    .collect()
 }
 
 fn build_behavior_summary(

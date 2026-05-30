@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize, Serializer};
 
 fn default_aggregate_count() -> i64 {
@@ -39,13 +40,6 @@ where
     S: Serializer,
 {
     serializer.serialize_str("single_seed")
-}
-
-fn serialize_batch_summary_report_type<S>(_value: &String, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    serializer.serialize_str("batch_summary")
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -773,6 +767,21 @@ pub struct PaperWashTradingRowPayload {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PaperWashCycleSizeRowPayload {
+    pub node_count_bucket: String,
+    pub cycle_count: i64,
+    pub cycle_ratio: Option<f64>,
+    pub cycle_ratio_numerator: i64,
+    pub cycle_ratio_denominator: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PaperContractWashCycleSizePayload {
+    pub contract_address: String,
+    pub distribution: Vec<PaperWashCycleSizeRowPayload>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct PaperPumpExitRowPayload {
     pub cycle_id: String,
     pub exit_delay_seconds: Option<i64>,
@@ -846,6 +855,8 @@ pub struct PaperHonestBuyerRowPayload {
 pub struct PaperContractBehaviorStatsPayload {
     pub contract_address: String,
     pub wash_trading: Vec<PaperWashTradingRowPayload>,
+    #[serde(default)]
+    pub wash_cycle_size_distribution: Vec<PaperWashCycleSizeRowPayload>,
     pub pump_and_exit: Vec<PaperPumpExitRowPayload>,
     pub star_behaviors: Vec<PaperStarBehaviorRowPayload>,
     pub layered_transfers: Vec<PaperLayeredTransferRowPayload>,
@@ -944,6 +955,10 @@ pub struct PaperStatsPayload {
     pub address_classification: PaperAddressClassificationPayload,
     pub contract_behavior_stats: Vec<PaperContractBehaviorStatsPayload>,
     pub malicious_behavior_summary: Vec<PaperBehaviorSummaryRowPayload>,
+    #[serde(default)]
+    pub wash_cycle_size_distribution: Vec<PaperWashCycleSizeRowPayload>,
+    #[serde(default)]
+    pub wash_cycle_size_by_contract: Vec<PaperContractWashCycleSizePayload>,
     pub attacker_cost: PaperAttackerCostPayload,
     pub attacker_cost_details: Vec<PaperAttackerCostDetailPayload>,
     pub honest_loss: PaperHonestLossPayload,
@@ -1186,13 +1201,50 @@ pub struct SingleReportPayload {
     pub nft_propagation_paths: BTreeMap<String, NftPropagationPathPayload>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct BatchSummaryPayload {
-    #[serde(
-        default = "batch_summary_report_type",
-        serialize_with = "serialize_batch_summary_report_type"
-    )]
+    #[serde(default = "batch_summary_report_type")]
     pub report_type: String,
     #[serde(default)]
     pub paper_stats: PaperStatsPayload,
+}
+
+impl Serialize for BatchSummaryPayload {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("BatchSummaryPayload", 2)?;
+        state.serialize_field("report_type", &batch_summary_report_type())?;
+        state.serialize_field(
+            "paper_stats",
+            &BatchPaperStatsSummaryPayload::from(&self.paper_stats),
+        )?;
+        state.end()
+    }
+}
+
+#[derive(Serialize)]
+struct BatchPaperStatsSummaryPayload<'a> {
+    duplicate_scale: &'a [PaperDuplicateScaleRowPayload],
+    address_classification: &'a PaperAddressClassificationPayload,
+    malicious_behavior_summary: &'a [PaperBehaviorSummaryRowPayload],
+    wash_cycle_size_distribution: &'a [PaperWashCycleSizeRowPayload],
+    attacker_cost: &'a PaperAttackerCostPayload,
+    honest_loss: &'a PaperHonestLossPayload,
+    data_quality: &'a PaperDataQualityPayload,
+}
+
+impl<'a> From<&'a PaperStatsPayload> for BatchPaperStatsSummaryPayload<'a> {
+    fn from(stats: &'a PaperStatsPayload) -> Self {
+        Self {
+            duplicate_scale: &stats.duplicate_scale,
+            address_classification: &stats.address_classification,
+            malicious_behavior_summary: &stats.malicious_behavior_summary,
+            wash_cycle_size_distribution: &stats.wash_cycle_size_distribution,
+            attacker_cost: &stats.attacker_cost,
+            honest_loss: &stats.honest_loss,
+            data_quality: &stats.data_quality,
+        }
+    }
 }

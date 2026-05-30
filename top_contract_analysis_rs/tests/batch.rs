@@ -749,6 +749,23 @@ fn batch_serializes_paper_stats_index_shape() {
     assert_eq!(serialized["report_type"], "batch_summary");
     assert!(!object.contains_key("seed_reports"));
     assert!(!object.contains_key("batch_summary"));
+    let paper_stats = serialized["paper_stats"].as_object().unwrap();
+    let paper_stats_keys: BTreeSet<_> = paper_stats.keys().map(String::as_str).collect();
+    assert_eq!(
+        paper_stats_keys,
+        BTreeSet::from([
+            "duplicate_scale",
+            "address_classification",
+            "malicious_behavior_summary",
+            "wash_cycle_size_distribution",
+            "attacker_cost",
+            "honest_loss",
+            "data_quality",
+        ])
+    );
+    assert!(!paper_stats.contains_key("contract_behavior_stats"));
+    assert!(!paper_stats.contains_key("attacker_cost_details"));
+    assert!(!paper_stats.contains_key("malicious_addresses"));
 }
 
 #[test]

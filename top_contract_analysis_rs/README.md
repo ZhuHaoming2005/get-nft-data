@@ -166,22 +166,24 @@ cargo run --release -- batch \
 
 ## 论文统计输出
 
-`analyze` 和 `batch` 的 JSON / Markdown 都以 `paper_stats` 为新版统计出口，不再输出旧版 `report_summary`、`batch_summary`、`seed_reports` 兼容结构。`paper_stats` 覆盖：
+`analyze` 单合约 JSON 以完整 `paper_stats` 为新版统计出口；`batch` 汇总 JSON 只保留论文汇总需要的统计对象，不导出逐合约、逐交易、逐地址明细。不再输出旧版 `report_summary`、`batch_summary`、`seed_reports` 兼容结构。完整 `paper_stats` 覆盖：
 
 - `duplicate_scale`：按 `token_uri`、`image_uri`、`metadata`、`name`、`total` 统计重复 NFT / 合约数量、比例、分子、分母。
 - `address_classification`：恶意地址、跨合约重复侵权恶意地址、诚实地址、地址总数。
-- `contract_behavior_stats`：逐合约输出 Wash Trading、Pump-and-Exit、Sybil/Fraud/Poisoning、Layered Transfer、Inventory Concentration、诚实买家明细。
+- `contract_behavior_stats`：单合约 JSON 逐合约输出 Wash Trading、Pump-and-Exit、Sybil/Fraud/Poisoning、Layered Transfer、Inventory Concentration、诚实买家明细，并在每个 match 合约内统计 2、3、4、5+ 节点 wash cycle 数量和比例；汇总 JSON 不包含逐合约明细。
 - `malicious_behavior_summary`：按行为类型汇总合约覆盖率、实例占比、涉及地址/NFT、关联买家和可归因买家损失；Sybil/Fraud/Poisoning、Layered、Inventory 这类未直接关联诚实买家的行为价值保留在合约行为明细的 `total_value` / `value_collected` 中，不写入 `linked_loss`。
+- `wash_cycle_size_distribution`：汇总统计 2、3、4、5+ 节点 wash cycle 数量、比例、分子和分母；单合约 JSON 和批量汇总 JSON 都导出。
+- `wash_cycle_size_by_contract`：单合约 JSON 按每个 match 合约统计同口径 wash cycle 节点规模；无循环合约也保留 0 值行，汇总 JSON 不导出该逐合约明细。
 - `attacker_cost`：Setup / Lure / Exit / Total gas 成本和前百分比合约成本集中度；Setup 统计复制合约部署和资金准备 gas，Lure 统计恶意地址付费 mint、刷量/诱导成交 gas，Exit 统计攻击者卖出、withdrawal、cashout 等退出 gas；同一合约同一阶段同一交易只计一次，不把诚实买家支付的 gas 计入攻击者成本；集中度的前百分比合约数按全部疑似重复合约计算，不按有正成本的合约计算。
 - `attacker_cost_details`：仅在 JSON 中逐交易输出攻击者成本明细，包括 `contract_address`、`stage`、`channel`、`tx_hash`、`gas_payer_address`、`gas_eth/usd`、`from_role`、`to_role`、`evidence_type`；gas payer 只有在显式恶意地址或交易发送方具备攻击者/运营者角色时才计入，不再因为只出现在 gas payer 字段就自动归为恶意；部署 gas 的 USD 仍使用固定 `2200 USD/ETH` fallback 汇率估算。
 - `honest_loss`：单个总计对象，汇总二级市场损失、付费 mint 损失、总损失、套牢 NFT 和集中度，不再按类别拆成多行；套牢比例分子为诚实地址当前持有的 fake NFT，分母为全部 fake NFT，套牢时间在 Markdown 中按倍数展示；诚实买家明细中的 `fake_nft_bought` 采用套牢 fake NFT 口径，与汇总套牢数保持一致。
 - `data_quality`：销售价格可解析比例和官方参与型重复合约数。
 
-统计阶段不做代表合约或买家 top-k 截断，所有可识别的合约行为、诚实买家行、攻击者成本明细、地址集合、分母 keys、按合约贡献和按行为去重集合都会导出到 JSON。论文撰写时再按行为覆盖数、关联损失、虚假交易额、地址规模等指标选择代表案例。旧参数 `--paper-top-k` 已删除。
+统计阶段不做代表合约或买家 top-k 截断，单合约 JSON 会导出所有可识别的合约行为、诚实买家行、攻击者成本明细、地址集合、分母 keys、按合约贡献和按行为去重集合。论文撰写时再按行为覆盖数、关联损失、虚假交易额、地址规模等指标选择代表案例。旧参数 `--paper-top-k` 已删除。
 
-Markdown 报告只保留论文阅读用的摘要和代表性大表，不展开攻击者成本逐交易明细；完整细节以 JSON 为准。合约行为明细和诚实买家明细这类大表放在最后输出。合约行为表按综合影响金额 USD、行为实例数、合约地址排序；诚实买家表按 paid USD、fake NFT 数、合约地址、买家地址排序，并输出 `paid ETH/USD`、`time_to_purchase_seconds`、`holding_seconds`；`source_pattern = unattributed_sale` 的行不进入 Markdown 明细表。
+Markdown 报告只保留论文阅读用摘要，不展开攻击者成本逐交易明细。`summary.md` 只输出汇总章节，不列举逐合约明细；单合约 Markdown 在最后输出按合约聚合的行为表和按合约 wash cycle 节点规模表，统计各行为实例数、诚实买家数、fake NFT、paid USD、行为价值、关联损失，以及每个 match 合约的 2、3、4、5+ 节点循环分布。合约表按综合影响金额 USD、行为实例数、合约地址排序；合约地址只作识别标签，过长时截断显示，不输出买家地址、hub 地址、交易 hash、cycle/path id 等地址级明细。完整细节以单合约 JSON 为准。
 
-所有论文比例字段都保留可复核口径。重复规模、行为汇总、攻击投入、诚实损失、sale 价格可解析比例已经输出对应的 numerator / denominator；单合约行为中的 `exit_price_premium`、`exit_ratio`、`avg_fan_out`、`token_share`、`value_share` 也分别导出对应分子和分母字段。
+所有论文比例字段都保留可复核口径。重复规模、行为汇总、wash cycle 节点规模、攻击投入、诚实损失、sale 价格可解析比例已经输出对应的 numerator / denominator；单合约行为中的 `exit_price_premium`、`exit_ratio`、`avg_fan_out`、`token_share`、`value_share` 也分别导出对应分子和分母字段。
 
 ## 典型使用流程
 

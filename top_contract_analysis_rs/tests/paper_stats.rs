@@ -9,9 +9,9 @@ use top_contract_analysis_rs::models::{
     NftPropagationPathPayload, NftPropagationSummaryPayload, PaperContractBehaviorStatsPayload,
     PaperDataQualityPayload, PaperDuplicateScaleRowPayload, PaperHonestBuyerRowPayload,
     PaperInventoryConcentrationRowPayload, PaperLayeredTransferRowPayload, PaperPumpExitRowPayload,
-    PaperStarBehaviorRowPayload, PaperStatsPayload, PaperWashTradingRowPayload,
-    SeedCollectionStatsPayload, SingleReportPayload, ValueFlowEdgePayload,
-    VictimAcquisitionAddressPayload,
+    PaperStarBehaviorRowPayload, PaperStatsPayload, PaperWashCycleSizeRowPayload,
+    PaperWashTradingRowPayload, SeedCollectionStatsPayload, SingleReportPayload,
+    ValueFlowEdgePayload, VictimAcquisitionAddressPayload,
 };
 use top_contract_analysis_rs::reporting::{
     render_batch_human_readable_report, render_human_readable_report,
@@ -280,31 +280,34 @@ fn markdown_reports_use_contract_address_without_extra_chain_identifiers() {
         ..PaperStatsPayload::default()
     };
     let batch_markdown = render_batch_human_readable_report(&BatchSummaryPayload {
-        paper_stats,
+        paper_stats: paper_stats.clone(),
         ..BatchSummaryPayload::default()
     });
+    let single_markdown = render_human_readable_report(&SingleReportPayload {
+        paper_stats,
+        ..SingleReportPayload::default()
+    });
 
-    assert!(batch_markdown.contains("## 合约行为明细"));
-    assert!(batch_markdown.contains("contract_address"));
+    assert!(!batch_markdown.contains("## 合约行为明细"));
+    assert!(!batch_markdown.contains("contract_address"));
+    assert!(!batch_markdown.contains("0xbuyer"));
+    assert!(single_markdown.contains("## 合约行为明细"));
+    assert!(single_markdown.contains("contract"));
+    assert!(single_markdown.contains("| 0xcopy | 1 | 0 | 0 | 0 | 0 | 1 | 0 | 10 | 10 | 0 |"));
     assert!(!batch_markdown.contains("Impact USD"));
-    assert!(batch_markdown.contains("### 诚实买家"));
-    assert!(!batch_markdown.contains("### 诚实买家 Top"));
+    assert!(!single_markdown.contains("### 诚实买家"));
+    assert!(!single_markdown.contains("### 诚实买家 Top"));
+    assert!(!single_markdown.contains("0xbuyer"));
     assert!(!batch_markdown.contains("chain_id"));
     assert!(!batch_markdown.contains("seed_contract_address"));
     assert!(!batch_markdown.contains("copy_contract_address"));
-    assert!(batch_markdown.contains(
-        "| contract_address | Wash Trading | Pump-and-Exit | Star | Layered | Inventory | Honest buyers |"
-    ));
-    assert!(batch_markdown.contains("| 0xcopy | 1 | 0 | 0 | 0 | 0 | 1 |"));
-    assert!(batch_markdown.contains(
-        "| contract_address | buyer | source_pattern | fake NFT | paid ETH/USD | time_to_purchase_seconds | still holding | holding_seconds |"
-    ));
-    assert!(batch_markdown
-        .contains("| 0xcopy | 0xbuyer | Pump-and-Exit | 0 | 0 / 10 |  | true | 86400 |"));
+    assert!(!single_markdown.contains("chain_id"));
+    assert!(!single_markdown.contains("seed_contract_address"));
+    assert!(!single_markdown.contains("copy_contract_address"));
 }
 
 #[test]
-fn markdown_honest_buyer_table_omits_unattributed_sales() {
+fn single_markdown_aggregates_honest_buyers_without_address_rows() {
     let paper_stats = PaperStatsPayload {
         contract_behavior_stats: vec![PaperContractBehaviorStatsPayload {
             contract_address: "0xcopy".into(),
@@ -334,10 +337,36 @@ fn markdown_honest_buyer_table_omits_unattributed_sales() {
         ..SingleReportPayload::default()
     });
 
-    assert!(markdown.contains("### 诚实买家"));
-    assert!(markdown.contains("| 0xcopy | 0xlinked | Pump-and-Exit |"));
+    assert!(markdown.contains("## 合约行为明细"));
+    assert!(markdown.contains("| 0xcopy | 0 | 0 | 0 | 0 | 0 | 2 | 0 | 150 | 0 | 0 |"));
+    assert!(!markdown.contains("### 诚实买家"));
+    assert!(!markdown.contains("0xlinked"));
     assert!(!markdown.contains("0xunattributed"));
     assert!(!markdown.contains("unattributed_sale"));
+}
+
+#[test]
+fn single_markdown_truncates_contract_address_labels_in_details() {
+    let long_contract = "0x1234567890abcdef1234567890abcdef12345678";
+    let paper_stats = PaperStatsPayload {
+        contract_behavior_stats: vec![PaperContractBehaviorStatsPayload {
+            contract_address: long_contract.into(),
+            wash_trading: vec![PaperWashTradingRowPayload {
+                fake_volume_usd: 10.0,
+                ..PaperWashTradingRowPayload::default()
+            }],
+            ..PaperContractBehaviorStatsPayload::default()
+        }],
+        ..PaperStatsPayload::default()
+    };
+
+    let markdown = render_human_readable_report(&SingleReportPayload {
+        paper_stats,
+        ..SingleReportPayload::default()
+    });
+
+    assert!(markdown.contains("0x1234...345678"));
+    assert!(!markdown.contains(long_contract));
 }
 
 #[test]
@@ -579,6 +608,142 @@ fn markdown_summary_tables_include_experiment_fields() {
     assert!(markdown.contains(
         "| 4 | 80.00% (4/5) | 2x (20/10) | 0.03 / 30 | 0.04 / 40 | 0.07 / 70 | 50.00% (35/70) |"
     ));
+}
+
+#[test]
+fn paper_stats_summarizes_wash_cycle_node_size_distribution() {
+    let contract = "0xcyclesizes";
+    let empty_contract = "0xemptycycles";
+    let mut edges = Vec::new();
+    edges.extend(cycle_edges(contract, "2", &["0x2a", "0x2b"], 100));
+    edges.extend(cycle_edges(contract, "3", &["0x3a", "0x3b", "0x3c"], 200));
+    edges.extend(cycle_edges(
+        contract,
+        "4",
+        &["0x4a", "0x4b", "0x4c", "0x4d"],
+        300,
+    ));
+    edges.extend(cycle_edges(
+        contract,
+        "5",
+        &["0x5a", "0x5b", "0x5c", "0x5d", "0x5e"],
+        400,
+    ));
+    edges.extend(cycle_edges(
+        contract,
+        "6",
+        &["0x6a", "0x6b", "0x6c", "0x6d", "0x6e", "0x6f"],
+        500,
+    ));
+    let path = NftPropagationPathPayload {
+        contract_address: contract.into(),
+        edges,
+        ..NftPropagationPathPayload::default()
+    };
+
+    let stats = build_paper_stats(PaperStatsInput {
+        config: PaperStatsConfig::default(),
+        seed_collection_stats: &SeedCollectionStatsPayload::default(),
+        duplicate_candidates: &[],
+        duplicate_contracts: &[
+            DuplicateContractPayload {
+                contract_address: contract.into(),
+                ..DuplicateContractPayload::default()
+            },
+            DuplicateContractPayload {
+                contract_address: empty_contract.into(),
+                ..DuplicateContractPayload::default()
+            },
+        ],
+        legit_duplicates: &[],
+        infringing_tokens: &[],
+        malicious_addresses: &[],
+        victim_acquisition_addresses: &[],
+        value_flow_edges: &[],
+        nft_propagation_paths: &BTreeMap::from([(contract.into(), path)]),
+    });
+
+    let rows = stats
+        .wash_cycle_size_distribution
+        .iter()
+        .map(|row| {
+            (
+                row.node_count_bucket.as_str(),
+                row.cycle_count,
+                row.cycle_ratio,
+                row.cycle_ratio_numerator,
+                row.cycle_ratio_denominator,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows,
+        vec![
+            ("2", 1, Some(0.2), 1, 5),
+            ("3", 1, Some(0.2), 1, 5),
+            ("4", 1, Some(0.2), 1, 5),
+            ("5+", 2, Some(0.4), 2, 5),
+        ]
+    );
+    let contract_rows = &stats.contract_behavior_stats[0].wash_cycle_size_distribution;
+    assert_eq!(&stats.wash_cycle_size_distribution, contract_rows);
+    assert_eq!(stats.wash_cycle_size_by_contract.len(), 2);
+    let empty_contract_row = stats
+        .wash_cycle_size_by_contract
+        .iter()
+        .find(|row| row.contract_address == empty_contract)
+        .unwrap();
+    assert_eq!(empty_contract_row.distribution[0].cycle_count, 0);
+    assert_eq!(
+        empty_contract_row.distribution[0].cycle_ratio_denominator,
+        0
+    );
+
+    let markdown = render_human_readable_report(&SingleReportPayload {
+        paper_stats: stats,
+        ..SingleReportPayload::default()
+    });
+    assert!(markdown.contains("## Wash Cycle 节点规模"));
+    assert!(markdown.contains("| 节点数 | 循环数 | 循环占比 |"));
+    assert!(markdown.contains("| 5+ | 2 | 40.00% (2/5) |"));
+    assert!(markdown.contains("## Wash Cycle 节点规模（按合约）"));
+    assert!(markdown.contains("| contract | 2 nodes | 3 nodes | 4 nodes | 5+ nodes | Total |"));
+    assert!(markdown
+        .contains("| 0xcyclesizes | 1 (20.00%) | 1 (20.00%) | 1 (20.00%) | 2 (40.00%) | 5 |"));
+    assert!(markdown.contains("| 0xemptycycles | 0 (n/a) | 0 (n/a) | 0 (n/a) | 0 (n/a) | 0 |"));
+}
+
+#[test]
+fn batch_markdown_renders_wash_cycle_size_distribution_summary() {
+    let stats = PaperStatsPayload {
+        wash_cycle_size_distribution: vec![
+            PaperWashCycleSizeRowPayload {
+                node_count_bucket: "2".into(),
+                cycle_count: 3,
+                cycle_ratio: Some(0.75),
+                cycle_ratio_numerator: 3,
+                cycle_ratio_denominator: 4,
+            },
+            PaperWashCycleSizeRowPayload {
+                node_count_bucket: "5+".into(),
+                cycle_count: 1,
+                cycle_ratio: Some(0.25),
+                cycle_ratio_numerator: 1,
+                cycle_ratio_denominator: 4,
+            },
+        ],
+        ..PaperStatsPayload::default()
+    };
+
+    let markdown = render_batch_human_readable_report(&BatchSummaryPayload {
+        paper_stats: stats,
+        ..BatchSummaryPayload::default()
+    });
+
+    assert!(markdown.contains("## Wash Cycle 节点规模"));
+    assert!(markdown.contains("| 2 | 3 | 75.00% (3/4) |"));
+    assert!(markdown.contains("| 5+ | 1 | 25.00% (1/4) |"));
+    assert!(!markdown.contains("## 合约行为明细"));
 }
 
 #[test]
@@ -1269,9 +1434,9 @@ fn markdown_places_large_tables_last_and_sorts_by_key_metrics() {
         ..PaperStatsPayload::default()
     };
 
-    let markdown = render_batch_human_readable_report(&BatchSummaryPayload {
+    let markdown = render_human_readable_report(&SingleReportPayload {
         paper_stats,
-        ..BatchSummaryPayload::default()
+        ..SingleReportPayload::default()
     });
 
     assert!(markdown.find("## 数据质量").unwrap() < markdown.find("## 合约行为明细").unwrap());
@@ -1280,11 +1445,8 @@ fn markdown_places_large_tables_last_and_sorts_by_key_metrics() {
         "contract behavior rows should be sorted by descending internal sort score"
     );
     assert!(!markdown.contains("Impact USD"));
-    assert!(
-        markdown.find("| 0xhigh | 0xbigbuyer |").unwrap()
-            < markdown.find("| 0xlow | 0xsmallbuyer |").unwrap(),
-        "honest buyer rows should be sorted by descending paid USD"
-    );
+    assert!(!markdown.contains("0xbigbuyer"));
+    assert!(!markdown.contains("0xsmallbuyer"));
 }
 
 #[test]
@@ -1300,6 +1462,7 @@ fn markdown_contract_behavior_details_include_experiment_rows() {
                 fake_volume_eth: 1.2,
                 fake_volume_usd: 2_400.0,
             }],
+            wash_cycle_size_distribution: vec![],
             pump_and_exit: vec![PaperPumpExitRowPayload {
                 cycle_id: "pump1".into(),
                 exit_delay_seconds: Some(60),
@@ -1364,41 +1527,22 @@ fn markdown_contract_behavior_details_include_experiment_rows() {
         ..PaperStatsPayload::default()
     };
 
-    let markdown = render_batch_human_readable_report(&BatchSummaryPayload {
+    let markdown = render_human_readable_report(&SingleReportPayload {
         paper_stats,
-        ..BatchSummaryPayload::default()
+        ..SingleReportPayload::default()
     });
 
     assert!(markdown.contains(
-        "| contract_address | cycle_id | nodes | token_gini | avg_cycle_blocks | fake_volume ETH/USD |"
+        "| contract | Wash | Pump-Exit | Star | Layered | Inventory | Honest buyers | Fake NFT | Paid USD | Behavior value USD | Linked loss USD |"
     ));
-    assert!(markdown.contains("| 0xcopy | wash1 | 3 | 0.4 | 12 | 1.2 / 2400 |"));
-    assert!(markdown.contains(
-        "| contract_address | cycle_id | exit_delay_seconds | exit_price_premium | exit_ratio | linked_buyers | linked_loss ETH/USD |"
-    ));
-    assert!(
-        markdown.contains("| 0xcopy | pump1 | 60 | 1.5 (300/200) | 50.00% (1/2) | 2 | 1 / 2000 |")
-    );
-    assert!(markdown.contains(
-        "| contract_address | behavior | centers | edges | wallets | tokens | avg_fan_out | median_holding_seconds | total_value ETH/USD |"
-    ));
-    assert!(markdown
-        .contains("| 0xcopy | Sybil Distribution | 1 | 6 | 7 | 4 | 3 (6/2) | 120 | 0.6 / 1200 |"));
-    assert!(markdown.contains(
-        "| contract_address | path_id | tokens | length | wallets | zero/low-value hops | duration_seconds | total_value ETH/USD |"
-    ));
-    assert!(markdown.contains("| 0xcopy | path1 | 2 | 4 | 5 | 2 | 3600 | 0.4 / 800 |"));
-    assert!(markdown.contains(
-        "| contract_address | hub_address | source_wallets | inbound_txns | token_share | value_collected ETH/USD | value_share | collection_window_seconds |"
-    ));
-    assert!(markdown.contains(
-        "| 0xcopy | 0xhub | 4 | 9 | 25.00% (5/20) | 0.3 / 600 | 40.00% (600/1500) | 7200 |"
-    ));
-    assert!(markdown.contains(
-        "| contract_address | buyer | source_pattern | fake NFT | paid ETH/USD | time_to_purchase_seconds | still holding | holding_seconds |"
-    ));
-    assert!(markdown
-        .contains("| 0xcopy | 0xbuyer | Pump-and-Exit | 2 | 0.7 / 1400 | 900 | true | 86400 |"));
+    assert!(markdown.contains("| 0xcopy | 1 | 1 | 1 | 1 | 1 | 1 | 2 | 1400 | 5000 | 2000 |"));
+    assert!(!markdown.contains("wash1"));
+    assert!(!markdown.contains("pump1"));
+    assert!(!markdown.contains("path1"));
+    assert!(!markdown.contains("0xhub"));
+    assert!(!markdown.contains("0xbuyer"));
+    assert!(!markdown.contains("hub_address"));
+    assert!(!markdown.contains("buyer |"));
 }
 
 #[test]
@@ -2442,4 +2586,26 @@ fn propagation_edge(
         token_ids: vec![token.into()],
         ..NftPropagationEdgePayload::default()
     }
+}
+
+fn cycle_edges(
+    contract: &str,
+    token: &str,
+    addresses: &[&str],
+    start_block_time: i64,
+) -> Vec<NftPropagationEdgePayload> {
+    addresses
+        .iter()
+        .enumerate()
+        .map(|(index, from)| {
+            let to = addresses[(index + 1) % addresses.len()];
+            propagation_edge(
+                (contract, from, to),
+                token,
+                "sale",
+                start_block_time + index as i64,
+                (Some(1.0), Some(2_000.0)),
+            )
+        })
+        .collect()
 }
