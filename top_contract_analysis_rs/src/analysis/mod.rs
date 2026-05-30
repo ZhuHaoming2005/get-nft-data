@@ -447,34 +447,40 @@ async fn build_candidate_plan_for_seed(
 
     progress.on_seed_stage("find_duplicate_candidates").await;
     tokio::task::spawn_blocking(move || {
-        let candidates =
-            if snapshot.duplicate_contract_rows.is_empty() && !snapshot.nft_rows.is_empty() {
-                duplicate::build_duplicate_candidates(
-                    &request.chain,
-                    &dedup_seed_nfts,
-                    &snapshot.nft_rows,
-                    request.name_threshold,
-                    request.metadata_threshold,
-                )
-            } else {
-                duplicate::build_duplicate_candidates_from_contract_rows(
-                    &request.chain,
-                    &dedup_seed_nfts,
-                    &snapshot.duplicate_contract_rows,
-                    request.name_threshold,
-                    request.metadata_threshold,
-                )
-            };
-        Ok::<_, AppError>((
-            context,
-            CandidatePlan {
-                snapshot,
-                candidates,
-            },
-        ))
+        let plan = build_candidate_plan_from_snapshot(&request, &dedup_seed_nfts, snapshot);
+        Ok::<_, AppError>((context, plan))
     })
     .await
     .map_err(|err| AppError::InvalidData(format!("candidate CPU task failed: {err}")))?
+}
+
+fn build_candidate_plan_from_snapshot(
+    request: &AnalyzeRequest,
+    dedup_seed_nfts: &[SeedNft],
+    snapshot: DatabaseSnapshot,
+) -> CandidatePlan {
+    let candidates = if snapshot.duplicate_contract_rows.is_empty() && !snapshot.nft_rows.is_empty()
+    {
+        duplicate::build_duplicate_candidates(
+            &request.chain,
+            dedup_seed_nfts,
+            &snapshot.nft_rows,
+            request.name_threshold,
+            request.metadata_threshold,
+        )
+    } else {
+        duplicate::build_duplicate_candidates_from_contract_rows(
+            &request.chain,
+            dedup_seed_nfts,
+            &snapshot.duplicate_contract_rows,
+            request.name_threshold,
+            request.metadata_threshold,
+        )
+    };
+    CandidatePlan {
+        snapshot,
+        candidates,
+    }
 }
 
 pub async fn analyze_seed_contract_with_progress(
@@ -686,23 +692,62 @@ async fn analyze_one_matched_contract(
             implausible_candidate_filtered_result(&contract_address, contract_metadata),
         )
     } else {
-        let contract_candidates = fetch_and_expand_contract_candidates(
-            &context.request,
-            &context.deps,
-            &contract_address,
-            &context.grouped,
-            &context.candidates,
-            &context.snapshot_token_index,
-        )
-        .await?;
-        let result = if current_supply_implausibly_smaller_than_candidates(
-            &context.request,
-            &context.deps,
+        let preliminary_candidate_count = context
+            .grouped
+            .get(&contract_address)
+            .map(Vec::len)
+            .unwrap_or_default()
+            .max(
+                context
+                    .snapshot_token_index
+                    .contract_token_count(&contract_address),
+            );
+        let (contract_candidates, current_total_supply) =
+            if should_check_current_supply_for_candidate_count(preliminary_candidate_count) {
+                let (contract_candidates, current_total_supply) = tokio::join!(
+                    fetch_and_expand_contract_candidates(
+                        &context.request,
+                        &context.deps,
+                        &contract_address,
+                        &context.grouped,
+                        &context.candidates,
+                        &context.snapshot_token_index,
+                    ),
+                    fetch_current_total_supply_for_candidate_filter(
+                        &context.request,
+                        &context.deps,
+                        &contract_address,
+                    )
+                );
+                (contract_candidates?, current_total_supply)
+            } else {
+                let contract_candidates = fetch_and_expand_contract_candidates(
+                    &context.request,
+                    &context.deps,
+                    &contract_address,
+                    &context.grouped,
+                    &context.candidates,
+                    &context.snapshot_token_index,
+                )
+                .await?;
+                let current_total_supply =
+                    if should_check_current_supply_for_candidate_count(contract_candidates.len()) {
+                        fetch_current_total_supply_for_candidate_filter(
+                            &context.request,
+                            &context.deps,
+                            &contract_address,
+                        )
+                        .await
+                    } else {
+                        None
+                    };
+                (contract_candidates, current_total_supply)
+            };
+        let result = if current_supply_implausibly_smaller_than_candidate_count(
             &contract_address,
             contract_candidates.len(),
-        )
-        .await
-        {
+            current_total_supply,
+        ) {
             implausible_candidate_filtered_result(&contract_address, contract_metadata)
         } else {
             analyze_duplicate_contract(DuplicateContractAnalysisInput {

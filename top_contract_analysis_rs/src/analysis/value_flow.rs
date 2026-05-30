@@ -1040,76 +1040,107 @@ async fn trace_withdrawal_cashout_edges(
     }
 
     let mut fetched_addresses = BTreeSet::<String>::new();
-    while let Some(node) = queue.pop_front() {
-        if node.depth >= MAX_WITHDRAWAL_TRACE_HOPS
-            || known_value_flow_entity(request.chain.as_str(), &node.address).is_some()
-            || !fetched_addresses.insert(node.address.clone())
-        {
+    let cashout_fetch_concurrency = request.api_max_concurrency.max(1);
+    while !queue.is_empty() {
+        let mut frontier = Vec::new();
+        while let Some(node) = queue.pop_front() {
+            if node.depth >= MAX_WITHDRAWAL_TRACE_HOPS
+                || known_value_flow_entity(request.chain.as_str(), &node.address).is_some()
+            {
+                continue;
+            }
+            if fetched_addresses.len() >= MAX_WITHDRAWAL_TRACE_FRONTIER {
+                queue.clear();
+                break;
+            }
+            if !fetched_addresses.insert(node.address.clone()) {
+                continue;
+            }
+            frontier.push(node);
+            if frontier.len() >= cashout_fetch_concurrency {
+                break;
+            }
+        }
+        if frontier.is_empty() {
             continue;
         }
-        if fetched_addresses.len() > MAX_WITHDRAWAL_TRACE_FRONTIER {
-            break;
-        }
 
-        let transfers =
-            fetch_cashout_trace_transfers(request, deps, lookup.block_number, &node.address)
-                .await?;
-        for transfer in transfers {
-            if !is_cashout_hop_transfer(&transfer, &node, lookup.block_number, block_receipts) {
-                continue;
-            }
-            let to_address = normalized_address(&transfer.to_address);
-            if node.path_addresses.contains(&to_address) {
-                continue;
-            }
-            let next_depth = node.depth + 1;
-            let value_ratio = cashout_value_ratio(&transfer, &node);
-            let receipt = receipt_for_transfer(&transfer, block_receipts);
-            let mut edge = value_flow_edge_from_transfer(ValueFlowEdgeInput {
-                chain: request.chain.as_str(),
-                contract_address,
-                lookup,
-                transfer: &transfer,
-                receipt,
-                wallet_snapshot: MintPaymentWalletSnapshot::default(),
-                channel: "cashout_hop".into(),
-                from_role: "cashout_intermediate".into(),
-                to_role: known_value_flow_entity(request.chain.as_str(), &transfer.to_address)
-                    .map(|entity| entity.role.to_string())
-                    .unwrap_or_else(|| "cashout_intermediate".into()),
-                evidence_type: format!("multi_hop_contract_cashout:{}", transfer.category),
-                evidence_flags: vec![
-                    "multi_hop_cashout".into(),
-                    "same_block_cashout_trace".into(),
-                    "value_constrained_cashout".into(),
-                    format!("cashout_hop:{next_depth}"),
-                    transfer.category.clone(),
-                ],
-            });
-            if let Some(ratio) = value_ratio {
-                push_unique_flag(
-                    &mut edge.evidence_flags,
-                    format!("cashout_value_ratio:{ratio:.4}"),
+        let mut fetched = stream::iter(frontier.into_iter().enumerate().map(
+            |(index, node)| async move {
+                let transfers = fetch_cashout_trace_transfers(
+                    request,
+                    deps,
+                    lookup.block_number,
+                    &node.address,
+                )
+                .await;
+                (index, node, transfers)
+            },
+        ))
+        .buffer_unordered(cashout_fetch_concurrency);
+        let mut fetched_frontier = Vec::new();
+        while let Some(result) = fetched.next().await {
+            fetched_frontier.push(result);
+        }
+        fetched_frontier.sort_by_key(|(index, _, _)| *index);
+        for (_, node, transfers) in fetched_frontier {
+            for transfer in transfers? {
+                if !is_cashout_hop_transfer(&transfer, &node, lookup.block_number, block_receipts) {
+                    continue;
+                }
+                let to_address = normalized_address(&transfer.to_address);
+                if node.path_addresses.contains(&to_address) {
+                    continue;
+                }
+                let next_depth = node.depth + 1;
+                let value_ratio = cashout_value_ratio(&transfer, &node);
+                let receipt = receipt_for_transfer(&transfer, block_receipts);
+                let mut edge = value_flow_edge_from_transfer(ValueFlowEdgeInput {
+                    chain: request.chain.as_str(),
+                    contract_address,
+                    lookup,
+                    transfer: &transfer,
+                    receipt,
+                    wallet_snapshot: MintPaymentWalletSnapshot::default(),
+                    channel: "cashout_hop".into(),
+                    from_role: "cashout_intermediate".into(),
+                    to_role: known_value_flow_entity(request.chain.as_str(), &transfer.to_address)
+                        .map(|entity| entity.role.to_string())
+                        .unwrap_or_else(|| "cashout_intermediate".into()),
+                    evidence_type: format!("multi_hop_contract_cashout:{}", transfer.category),
+                    evidence_flags: vec![
+                        "multi_hop_cashout".into(),
+                        "same_block_cashout_trace".into(),
+                        "value_constrained_cashout".into(),
+                        format!("cashout_hop:{next_depth}"),
+                        transfer.category.clone(),
+                    ],
+                });
+                if let Some(ratio) = value_ratio {
+                    push_unique_flag(
+                        &mut edge.evidence_flags,
+                        format!("cashout_value_ratio:{ratio:.4}"),
+                    );
+                }
+                edge.edge_id = format!(
+                    "value:cashout_hop:{}:{}:{}:{}",
+                    transfer.tx_hash, transfer.from_address, transfer.to_address, next_depth
                 );
+                if !seen_edge_ids.insert(edge.edge_id.clone()) {
+                    continue;
+                }
+                let mut next_path = node.path_addresses.clone();
+                next_path.insert(to_address);
+                enqueue_cashout_trace_node(
+                    &mut queue,
+                    request.chain.as_str(),
+                    &edge,
+                    next_depth,
+                    next_path,
+                    block_receipts,
+                );
+                rows.insert(edge.edge_id.clone(), edge);
             }
-            edge.edge_id = format!(
-                "value:cashout_hop:{}:{}:{}:{}",
-                transfer.tx_hash, transfer.from_address, transfer.to_address, next_depth
-            );
-            if !seen_edge_ids.insert(edge.edge_id.clone()) {
-                continue;
-            }
-            let mut next_path = node.path_addresses.clone();
-            next_path.insert(to_address);
-            enqueue_cashout_trace_node(
-                &mut queue,
-                request.chain.as_str(),
-                &edge,
-                next_depth,
-                next_path,
-                block_receipts,
-            );
-            rows.insert(edge.edge_id.clone(), edge);
         }
     }
 

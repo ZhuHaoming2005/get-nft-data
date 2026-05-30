@@ -1,3 +1,4 @@
+use futures::{stream, StreamExt};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT};
 use reqwest::Url;
 use serde_json::Value;
@@ -8,6 +9,8 @@ use crate::api::{ApiEndpoints, AsyncApiClient};
 use crate::currency::{is_native_eth_symbol, is_supported_priced_symbol, to_normalized_amount};
 use crate::error::AppError;
 use crate::models::{ContractMetadata, NftMarketEventRecord, NftSaleRecord, SeedNft};
+
+const ROYALTY_RECIPIENT_LOOKUP_BUFFER: usize = 64;
 
 fn normalize_token_id(raw: Option<&Value>) -> String {
     let Some(raw) = raw else {
@@ -1204,28 +1207,35 @@ async fn enrich_sales_with_royalty_recipient(
         return rows;
     }
 
+    let royalty_tokens = rows
+        .iter()
+        .filter(|sale| {
+            sale.royalty_recipient_address.trim().is_empty()
+                && (sale.royalty_fee_eth > 0.0 || sale.royalty_fee_usd > 0.0)
+                && !sale.token_id.trim().is_empty()
+        })
+        .map(|sale| sale.token_id.clone())
+        .collect::<BTreeSet<_>>();
     let mut royalty_by_token = BTreeMap::<String, String>::new();
+    let mut fetched = stream::iter(royalty_tokens.into_iter().map(|token_id| async move {
+        let recipient =
+            fetch_eip2981_royalty_recipient(alchemy_client, endpoints, contract_address, &token_id)
+                .await
+                .ok()
+                .flatten();
+        (token_id, recipient)
+    }))
+    .buffer_unordered(ROYALTY_RECIPIENT_LOOKUP_BUFFER);
+    while let Some((token_id, Some(recipient))) = fetched.next().await {
+        royalty_by_token.insert(token_id, recipient);
+    }
     for sale in &mut rows {
-        if !sale.royalty_recipient_address.trim().is_empty()
-            || (sale.royalty_fee_eth <= 0.0 && sale.royalty_fee_usd <= 0.0)
-            || sale.token_id.trim().is_empty()
+        if sale.royalty_recipient_address.trim().is_empty()
+            && (sale.royalty_fee_eth > 0.0 || sale.royalty_fee_usd > 0.0)
         {
-            continue;
-        }
-        if !royalty_by_token.contains_key(&sale.token_id) {
-            if let Ok(Some(recipient)) = fetch_eip2981_royalty_recipient(
-                alchemy_client,
-                endpoints,
-                contract_address,
-                &sale.token_id,
-            )
-            .await
-            {
-                royalty_by_token.insert(sale.token_id.clone(), recipient);
+            if let Some(recipient) = royalty_by_token.get(&sale.token_id) {
+                sale.royalty_recipient_address = recipient.clone();
             }
-        }
-        if let Some(recipient) = royalty_by_token.get(&sale.token_id) {
-            sale.royalty_recipient_address = recipient.clone();
         }
     }
 

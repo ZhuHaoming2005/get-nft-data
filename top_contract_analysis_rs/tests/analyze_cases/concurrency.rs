@@ -343,3 +343,94 @@ async fn analyze_fetches_sales_and_mint_value_flow_without_market_events() {
         "expected sales/mint value-flow fetches to overlap within one contract"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn analyze_overlaps_total_supply_check_with_candidate_expansion() {
+    let api = Arc::new(ConcurrentExpansionSupplyApi::with_expansion_count(20));
+    let deps = AnalysisDeps {
+        api: api.clone(),
+        feature_store: Arc::new(FakeFeatureStore {
+            snapshot: DatabaseSnapshot {
+                nft_rows: (1..=20)
+                    .map(|token_id| DatabaseNftRecord {
+                        contract_address: "0xdup".into(),
+                        token_id: token_id.to_string(),
+                        token_uri: format!("ipfs://seed/{token_id}"),
+                        image_uri: format!("ipfs://image/{token_id}.png"),
+                        name: format!("Azuki Mirror #{token_id}"),
+                        symbol: "AZUKI".into(),
+                        metadata_json: r#"{"description":"gold dragon"}"#.into(),
+                        metadata_recall_checked: false,
+                        metadata_recall_match: false,
+                    })
+                    .collect(),
+                ..DatabaseSnapshot::default()
+            },
+        }),
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    let payload = analyze_seed_contract(
+        AnalyzeRequest {
+            chain: "ethereum".into(),
+            seed_contract_address: "0xseed".into(),
+            alchemy_api_key: "key".into(),
+            ..AnalyzeRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(payload.duplicate_contracts.len(), 1);
+    assert!(
+        api.supply_observed_expansion_active.load(Ordering::SeqCst),
+        "expected totalSupply to be requested while NFT expansion is still in flight"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn analyze_skips_total_supply_check_for_small_expanded_candidate_set() {
+    let api = Arc::new(ConcurrentExpansionSupplyApi::new());
+    let deps = AnalysisDeps {
+        api: api.clone(),
+        feature_store: Arc::new(FakeFeatureStore {
+            snapshot: DatabaseSnapshot {
+                nft_rows: vec![DatabaseNftRecord {
+                    contract_address: "0xdup".into(),
+                    token_id: "1".into(),
+                    token_uri: "ipfs://seed/1".into(),
+                    image_uri: "ipfs://image/1.png".into(),
+                    name: "Azuki Mirror #1".into(),
+                    symbol: "AZUKI".into(),
+                    metadata_json: r#"{"description":"gold dragon"}"#.into(),
+                    metadata_recall_checked: false,
+                    metadata_recall_match: false,
+                }],
+                ..DatabaseSnapshot::default()
+            },
+        }),
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    let payload = analyze_seed_contract(
+        AnalyzeRequest {
+            chain: "ethereum".into(),
+            seed_contract_address: "0xseed".into(),
+            alchemy_api_key: "key".into(),
+            ..AnalyzeRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(payload.duplicate_contracts.len(), 1);
+    assert_eq!(
+        api.total_supply_calls.load(Ordering::SeqCst),
+        0,
+        "small candidate sets should not spend a totalSupply RPC that cannot affect filtering"
+    );
+}

@@ -132,6 +132,75 @@ async fn spawn_holding_json_server(
     (format!("http://{address}"), accepted_rx, handle)
 }
 
+async fn spawn_royalty_parallel_server(
+    royalty_request_count: usize,
+    hold_for: Duration,
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let active_rpc = Arc::new(AtomicUsize::new(0));
+    let max_active_rpc = Arc::new(AtomicUsize::new(0));
+    let max_active_for_return = max_active_rpc.clone();
+    let handle = tokio::spawn(async move {
+        let mut handlers = Vec::new();
+        for _ in 0..(royalty_request_count + 1) {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let active_rpc = active_rpc.clone();
+            let max_active_rpc = max_active_rpc.clone();
+            handlers.push(tokio::spawn(async move {
+                let mut buffer = vec![0_u8; 65536];
+                let read = stream.read(&mut buffer).await.unwrap();
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let request_line = request.lines().next().unwrap_or("");
+                let payload = if request_line.starts_with("GET /nft/v3/key/getNFTSales") {
+                    let sales = (1..=royalty_request_count)
+                        .map(|token_id| {
+                            format!(
+                                r#"{{
+                                    "marketplace":"seaport",
+                                    "contractAddress":"0xdup",
+                                    "tokenId":"{token_id}",
+                                    "buyerAddress":"0xbuyer{token_id}",
+                                    "sellerAddress":"0xseller{token_id}",
+                                    "sellerFee":{{"amount":"1000000000000000000","symbol":"ETH","decimals":18}},
+                                    "royaltyFee":{{"amount":"50000000000000000","symbol":"ETH","decimals":18}},
+                                    "blockNumber":10,
+                                    "logIndex":{token_id},
+                                    "bundleIndex":0,
+                                    "transactionHash":"0xsale{token_id}"
+                                }}"#
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!(r#"{{"nftSales":[{sales}]}}"#)
+                } else {
+                    assert!(
+                        request_line.starts_with("POST /v2/key"),
+                        "unexpected request line: {request_line}",
+                    );
+                    let active = active_rpc.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active_rpc.fetch_max(active, Ordering::SeqCst);
+                    tokio::time::sleep(hold_for).await;
+                    active_rpc.fetch_sub(1, Ordering::SeqCst);
+                    r#"{"result":"0x000000000000000000000000444444444444444444444444444444444444444400000000000000000000000000000000000000000000000000b1a2bc2ec50000"}"#.to_string()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }));
+        }
+        for handler in handlers {
+            handler.await.unwrap();
+        }
+    });
+    (format!("http://{address}"), max_active_for_return, handle)
+}
+
 #[tokio::test]
 async fn api_client_error_includes_status_and_response_body() {
     let server = MockServer::start_async().await;
@@ -1336,6 +1405,29 @@ async fn contract_sales_enrich_royalty_recipient_from_eip2981() {
     assert_eq!(
         rows[0].royalty_recipient_address,
         "0x4444444444444444444444444444444444444444"
+    );
+}
+
+#[tokio::test]
+async fn contract_sales_enrich_distinct_royalty_tokens_concurrently() {
+    let (base_url, max_active_rpc, server) =
+        spawn_royalty_parallel_server(3, Duration::from_millis(80)).await;
+    let client =
+        AsyncApiClient::new_with_retry_policy(5, 3, DEFAULT_API_RETRIES, Duration::ZERO).unwrap();
+    let endpoints = test_endpoints(&base_url);
+
+    let rows = fetch_contract_sales(&client, &endpoints, "ethereum", "0xdup", "", None)
+        .await
+        .unwrap();
+    server.await.unwrap();
+
+    assert_eq!(rows.len(), 3);
+    assert!(rows
+        .iter()
+        .all(|row| row.royalty_recipient_address == "0x4444444444444444444444444444444444444444"));
+    assert!(
+        max_active_rpc.load(Ordering::SeqCst) >= 2,
+        "expected distinct EIP-2981 royalty lookups to run concurrently"
     );
 }
 

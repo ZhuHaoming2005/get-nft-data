@@ -179,6 +179,99 @@ async fn analyze_traces_multi_hop_cashout_and_classifies_known_destinations() {
     assert!(payload.lifecycle_metrics.is_empty());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn analyze_fetches_cashout_trace_frontier_in_parallel() {
+    let api = Arc::new(CashoutTraceApi::with_parallel_branches());
+    let deps = AnalysisDeps {
+        api: api.clone(),
+        feature_store: Arc::new(FakeFeatureStore {
+            snapshot: DatabaseSnapshot {
+                nft_rows: vec![DatabaseNftRecord {
+                    contract_address: "0xdup".into(),
+                    token_id: "1".into(),
+                    token_uri: "ipfs://seed/1".into(),
+                    image_uri: "ipfs://image/1.png".into(),
+                    name: "Azuki Mirror #1".into(),
+                    symbol: "AZUKI".into(),
+                    metadata_json: r#"{"description":"gold dragon"}"#.into(),
+                    metadata_recall_checked: false,
+                    metadata_recall_match: false,
+                }],
+                ..DatabaseSnapshot::default()
+            },
+        }),
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    let payload = analyze_seed_contract(
+        AnalyzeRequest {
+            chain: "ethereum".into(),
+            seed_contract_address: "0xseed".into(),
+            alchemy_api_key: "key".into(),
+            api_max_concurrency: 2,
+            ..AnalyzeRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
+    assert!(payload
+        .value_flow_edges
+        .iter()
+        .any(|edge| edge.channel == "cashout_hop"));
+    assert!(
+        api.max_hop_fetches.load(Ordering::SeqCst) >= 2,
+        "expected same-depth cashout frontier wallets to be fetched concurrently"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn analyze_processes_parallel_cashout_frontier_in_queue_order() {
+    let api = Arc::new(CashoutTraceApi::with_ordered_frontier_probe());
+    let deps = AnalysisDeps {
+        api: api.clone(),
+        feature_store: Arc::new(FakeFeatureStore {
+            snapshot: DatabaseSnapshot {
+                nft_rows: vec![DatabaseNftRecord {
+                    contract_address: "0xdup".into(),
+                    token_id: "1".into(),
+                    token_uri: "ipfs://seed/1".into(),
+                    image_uri: "ipfs://image/1.png".into(),
+                    name: "Azuki Mirror #1".into(),
+                    symbol: "AZUKI".into(),
+                    metadata_json: r#"{"description":"gold dragon"}"#.into(),
+                    metadata_recall_checked: false,
+                    metadata_recall_match: false,
+                }],
+                ..DatabaseSnapshot::default()
+            },
+        }),
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    let _payload = analyze_seed_contract(
+        AnalyzeRequest {
+            chain: "ethereum".into(),
+            seed_contract_address: "0xseed".into(),
+            alchemy_api_key: "key".into(),
+            api_max_concurrency: 2,
+            ..AnalyzeRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        api.second_level_calls.lock().unwrap().as_slice(),
+        ["0xnext1", "0xnext2"],
+        "cashout tracing should fetch frontier nodes concurrently but enqueue their children in the original queue order"
+    );
+}
+
 #[tokio::test]
 async fn analyze_counts_deployment_and_malicious_sale_gas_in_attacker_cost() {
     let deps = AnalysisDeps {

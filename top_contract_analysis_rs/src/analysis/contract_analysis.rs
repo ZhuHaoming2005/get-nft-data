@@ -128,17 +128,12 @@ pub(super) fn implausible_candidate_filtered_result(
     }
 }
 
-pub(super) async fn current_supply_implausibly_smaller_than_candidates(
+pub(super) async fn fetch_current_total_supply_for_candidate_filter(
     request: &AnalyzeRequest,
     deps: &AnalysisDeps,
     contract_address: &str,
-    candidate_count: usize,
-) -> bool {
-    if candidate_count < CURRENT_SUPPLY_MISMATCH_MIN_CANDIDATES {
-        return false;
-    }
-
-    let current_total_supply = match deps
+) -> Option<u64> {
+    match deps
         .api
         .fetch_contract_total_supply(
             &request.chain,
@@ -148,16 +143,25 @@ pub(super) async fn current_supply_implausibly_smaller_than_candidates(
         )
         .await
     {
-        Ok(Some(current_total_supply)) => current_total_supply,
-        Ok(None) => return false,
+        Ok(Some(current_total_supply)) => Some(current_total_supply),
+        Ok(None) => None,
         Err(err) => {
             eprintln!(
                 "warning: totalSupply lookup failed for {contract_address}: {err}; continuing without current-supply hard exclusion"
             );
-            return false;
+            None
         }
-    };
+    }
+}
 
+pub(super) fn current_supply_implausibly_smaller_than_candidate_count(
+    contract_address: &str,
+    candidate_count: usize,
+    current_total_supply: Option<u64>,
+) -> bool {
+    let Some(current_total_supply) = current_total_supply else {
+        return false;
+    };
     if !candidate_count_exceeds_current_supply(candidate_count, current_total_supply) {
         return false;
     }
@@ -168,11 +172,15 @@ pub(super) async fn current_supply_implausibly_smaller_than_candidates(
     true
 }
 
+pub(super) fn should_check_current_supply_for_candidate_count(candidate_count: usize) -> bool {
+    candidate_count >= CURRENT_SUPPLY_MISMATCH_MIN_CANDIDATES
+}
+
 fn candidate_count_exceeds_current_supply(
     candidate_count: usize,
     current_total_supply: u64,
 ) -> bool {
-    if candidate_count < CURRENT_SUPPLY_MISMATCH_MIN_CANDIDATES {
+    if !should_check_current_supply_for_candidate_count(candidate_count) {
         return false;
     }
     if current_total_supply == 0 {

@@ -1,19 +1,22 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
 use futures::{stream, StreamExt};
+use serde::Deserialize;
 use tokio::sync::Semaphore;
 
 use crate::error::AppError;
-use crate::models::BatchSummaryPayload;
-use crate::reporting::write_outputs_to_directory;
+use crate::models::{BatchSummaryPayload, SingleReportPayload};
+use crate::progress::SeedProgressReporter;
+use crate::reporting::{default_output_basename, write_outputs_to_directory};
 
 use super::summary::build_batch_seed_aggregate;
 use super::{
-    acquire_optional_limit, analyze_matched_contracts_parallel, build_candidate_plan_for_seed,
-    fetch_seed_context, finalize_seed_report, prepare_seed_analysis_state, AnalysisDeps,
-    AnalyzeRequest, BatchRequest, BatchSeedAggregate,
+    acquire_optional_limit, analyze_matched_contracts_parallel, build_candidate_plan_from_snapshot,
+    fetch_seed_context, finalize_seed_report, prepare_seed_analysis_state,
+    seed_nfts_for_duplicate_matching, AnalysisDeps, AnalyzeRequest, BatchRequest,
+    BatchSeedAggregate, CandidatePlan, SeedContext,
 };
 
 fn analyze_request_for_batch_seed(
@@ -38,13 +41,153 @@ fn analyze_request_for_batch_seed(
     }
 }
 
+#[derive(Deserialize)]
+struct CachedSingleSeedReport {
+    seed_contract: crate::models::SeedContractPayload,
+    paper_stats: crate::models::PaperStatsPayload,
+}
+
+struct PreparedSeedContext {
+    seed_address: String,
+    request: AnalyzeRequest,
+    context: SeedContext,
+    seed_progress: Arc<dyn SeedProgressReporter>,
+}
+
+struct PreparedSeedPlan {
+    seed_address: String,
+    request: AnalyzeRequest,
+    context: SeedContext,
+    plan: CandidatePlan,
+    seed_progress: Arc<dyn SeedProgressReporter>,
+}
+
+fn load_cached_seed_entries(
+    seed_addresses: &[String],
+    chain: &str,
+    output_dir: &Path,
+) -> Result<BTreeMap<String, BatchSeedAggregate>, AppError> {
+    if !output_dir.exists() {
+        return Ok(BTreeMap::new());
+    }
+
+    let requested_seeds: BTreeSet<String> = seed_addresses.iter().cloned().collect();
+    let mut cached_entries = BTreeMap::new();
+    for entry in std::fs::read_dir(output_dir)? {
+        let path = entry?.path();
+        if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_none_or(|extension| !extension.eq_ignore_ascii_case("json"))
+        {
+            continue;
+        }
+
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        if value.get("report_type").and_then(|value| value.as_str()) != Some("single_seed") {
+            continue;
+        }
+        if value.get("paper_stats").is_none() {
+            continue;
+        }
+
+        let Ok(report) = serde_json::from_value::<CachedSingleSeedReport>(value) else {
+            continue;
+        };
+        let seed_address = report.seed_contract.contract_address.trim().to_lowercase();
+        if !requested_seeds.contains(&seed_address) {
+            continue;
+        }
+        let report_chain = report.seed_contract.chain.trim();
+        if !report_chain.is_empty() && !report_chain.eq_ignore_ascii_case(chain) {
+            continue;
+        }
+
+        let canonical_payload = SingleReportPayload {
+            seed_contract: report.seed_contract.clone(),
+            ..SingleReportPayload::default()
+        };
+        let canonical_name = format!("{}.json", default_output_basename(&canonical_payload));
+        if path.file_name().and_then(|name| name.to_str()) != Some(canonical_name.as_str()) {
+            continue;
+        }
+
+        let payload = SingleReportPayload {
+            seed_contract: report.seed_contract,
+            paper_stats: report.paper_stats,
+            ..SingleReportPayload::default()
+        };
+        cached_entries.insert(seed_address, build_batch_seed_aggregate(payload));
+    }
+    Ok(cached_entries)
+}
+
+async fn build_candidate_plan_for_prepared_seed(
+    prepared: PreparedSeedContext,
+    feature_store: Arc<dyn super::FeatureStoreReader>,
+    cpu_limit: Arc<Semaphore>,
+) -> Result<PreparedSeedPlan, AppError> {
+    let PreparedSeedContext {
+        seed_address,
+        request,
+        context,
+        seed_progress,
+    } = prepared;
+    let dedup_seed_nfts =
+        seed_nfts_for_duplicate_matching(&context.seed_nfts, &context.seed_contract);
+    let snapshot_seed_nfts = dedup_seed_nfts.clone();
+    let chain = request.chain.clone();
+    let name_threshold = request.name_threshold;
+    let metadata_threshold = request.metadata_threshold;
+    let max_tokens_per_contract = request.max_tokens_per_contract;
+    let max_recall_rows = request.max_recall_rows;
+    let _permit = acquire_optional_limit(&Some(cpu_limit)).await?;
+    let snapshot = tokio::task::spawn_blocking(move || {
+        feature_store.load_snapshot(
+            &chain,
+            &snapshot_seed_nfts,
+            name_threshold,
+            metadata_threshold,
+            max_tokens_per_contract,
+            max_recall_rows,
+        )
+    })
+    .await
+    .map_err(|err| AppError::InvalidData(format!("candidate CPU task failed: {err}")))??;
+    let plan = build_candidate_plan_from_snapshot(&request, &dedup_seed_nfts, snapshot);
+    Ok(PreparedSeedPlan {
+        seed_address,
+        request,
+        context,
+        plan,
+        seed_progress,
+    })
+}
+
 pub async fn run_batch(
     request: BatchRequest,
     deps: &AnalysisDeps,
 ) -> Result<BatchSummaryPayload, AppError> {
     let seed_addresses = read_seed_addresses(&request.seed_file)?;
     let mut seed_aggregates = Vec::new();
-    let pending_seeds = seed_addresses.clone();
+    let cached_entries =
+        load_cached_seed_entries(&seed_addresses, &request.chain, &request.output_dir)?;
+    for seed_address in &seed_addresses {
+        if let Some(aggregate) = cached_entries.get(seed_address).cloned() {
+            deps.batch_progress.on_seed_cached(seed_address);
+            seed_aggregates.push(aggregate);
+        }
+    }
+    let pending_seeds: Vec<String> = seed_addresses
+        .iter()
+        .filter(|seed_address| !cached_entries.contains_key(seed_address.as_str()))
+        .cloned()
+        .collect();
 
     let seed_network_max_concurrency = request.seed_network_max_concurrency.max(1);
     let seed_cpu_max_concurrency = request.seed_cpu_max_concurrency.max(1);
@@ -62,13 +205,10 @@ pub async fn run_batch(
         .saturating_add(request.matched_contract_max_concurrency.max(1))
         .min(pending_seed_count)
         .max(1);
-    let mut seed_tasks = stream::iter(pending_seeds.into_iter().map(|seed_address| {
+    let mut context_tasks = stream::iter(pending_seeds.into_iter().map(|seed_address| {
         let per_seed_request = analyze_request_for_batch_seed(&request, seed_address.clone());
         let deps = deps.clone();
         let seed_network_limit = seed_network_limit.clone();
-        let cpu_limit = cpu_limit.clone();
-        let matched_contract_limit = matched_contract_limit.clone();
-        let output_dir = output_dir.clone();
         async move {
             let batch_progress = deps.batch_progress.clone();
             let seed_progress = batch_progress.create_seed_reporter(&seed_address);
@@ -83,27 +223,155 @@ pub async fn run_batch(
                     }
                 }
             };
-            let (context, plan) = match build_candidate_plan_for_seed(
-                per_seed_request.clone(),
-                deps.feature_store.clone(),
+            Ok(PreparedSeedContext {
+                seed_address,
+                request: per_seed_request,
                 context,
-                Some(cpu_limit),
-                seed_progress.clone(),
-            )
-            .await
-            {
-                Ok(prepared) => prepared,
-                Err(err) => {
-                    batch_progress.on_seed_failed(&seed_address, &err.to_string());
-                    return Err(err);
+                seed_progress,
+            })
+        }
+    }))
+    .buffer_unordered(seed_network_max_concurrency);
+
+    let mut prepared_contexts = Vec::new();
+    while let Some(entry) = context_tasks.next().await {
+        match entry {
+            Ok(prepared) => prepared_contexts.push(prepared),
+            Err(err) => {
+                if first_error.is_none() {
+                    first_error = Some(err);
                 }
-            };
+            }
+        }
+    }
+
+    let prepared_plans = if prepared_contexts.is_empty() {
+        Vec::new()
+    } else {
+        let batch_feature_store = deps.feature_store.clone();
+        let chain = request.chain.clone();
+        let name_threshold = request.name_threshold;
+        let metadata_threshold = request.metadata_threshold;
+        let max_tokens_per_contract = request.max_tokens_per_contract;
+        let max_recall_rows = request.max_recall_rows;
+        let mut dedup_seed_nfts_by_seed = BTreeMap::new();
+        let seeds = prepared_contexts
+            .iter()
+            .map(|prepared| {
+                let dedup_seed_nfts = seed_nfts_for_duplicate_matching(
+                    &prepared.context.seed_nfts,
+                    &prepared.context.seed_contract,
+                );
+                dedup_seed_nfts_by_seed
+                    .insert(prepared.seed_address.clone(), dedup_seed_nfts.clone());
+                (prepared.seed_address.clone(), dedup_seed_nfts)
+            })
+            .collect::<Vec<_>>();
+        let result = {
+            let _permit = acquire_optional_limit(&Some(cpu_limit.clone())).await?;
+            tokio::task::spawn_blocking(move || {
+                batch_feature_store.load_snapshots(
+                    &chain,
+                    &seeds,
+                    name_threshold,
+                    metadata_threshold,
+                    max_tokens_per_contract,
+                    max_recall_rows,
+                )
+            })
+            .await
+            .map_err(|err| {
+                AppError::InvalidData(format!("batched snapshot CPU task failed: {err}"))
+            })
+            .and_then(|result| result)
+        };
+        match result {
+            Ok(mut snapshots) => {
+                let mut prepared_plans = Vec::with_capacity(prepared_contexts.len());
+                for prepared in prepared_contexts {
+                    let snapshot = snapshots.remove(&prepared.seed_address).ok_or_else(|| {
+                        AppError::InvalidData(format!(
+                            "feature store did not return a snapshot for seed {}",
+                            prepared.seed_address
+                        ))
+                    })?;
+                    let dedup_seed_nfts = dedup_seed_nfts_by_seed
+                        .remove(&prepared.seed_address)
+                        .ok_or_else(|| {
+                            AppError::InvalidData(format!(
+                                "missing deduplicated seed NFTs for seed {}",
+                                prepared.seed_address
+                            ))
+                        })?;
+                    let plan = build_candidate_plan_from_snapshot(
+                        &prepared.request,
+                        &dedup_seed_nfts,
+                        snapshot,
+                    );
+                    prepared_plans.push(PreparedSeedPlan {
+                        seed_address: prepared.seed_address,
+                        request: prepared.request,
+                        context: prepared.context,
+                        plan,
+                        seed_progress: prepared.seed_progress,
+                    });
+                }
+                prepared_plans
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: batched snapshot load failed: {err}; falling back to per-seed snapshot loads"
+                );
+                let mut fallback_tasks =
+                    stream::iter(prepared_contexts.into_iter().map(|prepared| {
+                        let seed_address = prepared.seed_address.clone();
+                        let feature_store = deps.feature_store.clone();
+                        let cpu_limit = cpu_limit.clone();
+                        async move {
+                            let result = build_candidate_plan_for_prepared_seed(
+                                prepared,
+                                feature_store,
+                                cpu_limit,
+                            )
+                            .await;
+                            (seed_address, result)
+                        }
+                    }))
+                    .buffer_unordered(seed_cpu_max_concurrency);
+                let mut prepared_plans = Vec::new();
+                while let Some((seed_address, result)) = fallback_tasks.next().await {
+                    match result {
+                        Ok(prepared_plan) => prepared_plans.push(prepared_plan),
+                        Err(err) => {
+                            deps.batch_progress
+                                .on_seed_failed(&seed_address, &err.to_string());
+                            if first_error.is_none() {
+                                first_error = Some(err);
+                            }
+                        }
+                    }
+                }
+                prepared_plans
+            }
+        }
+    };
+
+    let mut seed_tasks = stream::iter(prepared_plans.into_iter().map(|prepared| {
+        let deps = deps.clone();
+        let matched_contract_limit = matched_contract_limit.clone();
+        let output_dir = output_dir.clone();
+        async move {
+            let batch_progress = deps.batch_progress.clone();
+            let seed_progress = prepared.seed_progress;
+            seed_progress
+                .on_seed_stage("find_duplicate_candidates")
+                .await;
             let state = prepare_seed_analysis_state(
-                per_seed_request,
+                prepared.request,
                 &deps,
                 seed_progress.clone(),
                 None,
-                Some((context, plan)),
+                Some((prepared.context, prepared.plan)),
             )
             .await?;
             let mut state = state;
@@ -121,11 +389,11 @@ pub async fn run_batch(
             let payload = match result {
                 Ok(payload) => payload,
                 Err(err) => {
-                    batch_progress.on_seed_failed(&seed_address, &err.to_string());
+                    batch_progress.on_seed_failed(&prepared.seed_address, &err.to_string());
                     return Err(err);
                 }
             };
-            batch_progress.on_seed_finished(&seed_address);
+            batch_progress.on_seed_finished(&prepared.seed_address);
             write_outputs_to_directory(&payload, &output_dir)?;
             let aggregate = build_batch_seed_aggregate(payload);
             Ok(aggregate)

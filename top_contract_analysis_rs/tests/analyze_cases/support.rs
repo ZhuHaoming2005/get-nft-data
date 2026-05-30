@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -2702,6 +2702,205 @@ impl StaggeredExpansionApi {
     }
 }
 
+struct ConcurrentExpansionSupplyApi {
+    expansion_count: usize,
+    expansion_active: AtomicBool,
+    supply_observed_expansion_active: AtomicBool,
+    total_supply_calls: AtomicUsize,
+}
+
+impl ConcurrentExpansionSupplyApi {
+    fn new() -> Self {
+        Self::with_expansion_count(1)
+    }
+
+    fn with_expansion_count(expansion_count: usize) -> Self {
+        Self {
+            expansion_count,
+            expansion_active: AtomicBool::new(false),
+            supply_observed_expansion_active: AtomicBool::new(false),
+            total_supply_calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl AnalyzeApi for ConcurrentExpansionSupplyApi {
+    async fn fetch_contract_metadata(
+        &self,
+        chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _opensea_api_key: &str,
+        contract_address: &str,
+    ) -> Result<ContractMetadata, AppError> {
+        Ok(ContractMetadata {
+            chain: chain.to_string(),
+            contract_address: contract_address.to_string(),
+            token_type: "ERC721".into(),
+            contract_deployer: "0xcreator".into(),
+            deployed_block_number: if contract_address == "0xseed" {
+                100
+            } else {
+                200
+            },
+            deployed_block_time: 0,
+            owner_address: String::new(),
+            admin_address: String::new(),
+            proxy_admin_address: String::new(),
+            name: "Azuki".into(),
+            symbol: "AZUKI".into(),
+        })
+    }
+
+    async fn fetch_seed_contract_nfts(
+        &self,
+        chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        contract_address: &str,
+    ) -> Result<Vec<SeedNft>, AppError> {
+        Ok(vec![SeedNft {
+            chain: chain.to_string(),
+            contract_address: contract_address.to_string(),
+            token_id: "1".into(),
+            name: "Azuki #1".into(),
+            symbol: "AZUKI".into(),
+            token_uri: "ipfs://seed/1".into(),
+            image_uri: "ipfs://image/1.png".into(),
+            metadata_json: r#"{"name":"Azuki #1","description":"gold dragon"}"#.into(),
+        }])
+    }
+
+    async fn fetch_contract_nfts(
+        &self,
+        chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _etherscan_api_key: &str,
+        _opensea_api_key: &str,
+        contract_address: &str,
+    ) -> Result<Vec<SeedNft>, AppError> {
+        self.expansion_active.store(true, Ordering::SeqCst);
+        sleep(Duration::from_millis(80)).await;
+        self.expansion_active.store(false, Ordering::SeqCst);
+        Ok((1..=self.expansion_count)
+            .map(|token_id| SeedNft {
+                chain: chain.to_string(),
+                contract_address: contract_address.to_string(),
+                token_id: token_id.to_string(),
+                name: format!("Azuki Mirror #{token_id}"),
+                symbol: "AZUKI".into(),
+                token_uri: format!("ipfs://seed/{token_id}"),
+                image_uri: format!("ipfs://image/{token_id}.png"),
+                metadata_json: r#"{"description":"gold dragon"}"#.into(),
+            })
+            .collect())
+    }
+
+    async fn fetch_contract_total_supply(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _contract_address: &str,
+    ) -> Result<Option<u64>, AppError> {
+        self.total_supply_calls.fetch_add(1, Ordering::SeqCst);
+        let mut waited = 0;
+        while !self.expansion_active.load(Ordering::SeqCst) && waited < 100 {
+            sleep(Duration::from_millis(1)).await;
+            waited += 1;
+        }
+        if self.expansion_active.load(Ordering::SeqCst) {
+            self.supply_observed_expansion_active
+                .store(true, Ordering::SeqCst);
+        }
+        Ok(Some(100))
+    }
+
+    async fn fetch_contract_transfers(
+        &self,
+        _chain: &str,
+        _etherscan_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _alchemy_api_key: &str,
+        contract_address: &str,
+        _token_type: &str,
+    ) -> Result<Vec<TransferRecord>, AppError> {
+        Ok(vec![TransferRecord {
+            contract_address: contract_address.to_string(),
+            token_id: "1".into(),
+            tx_hash: "0xmint".into(),
+            log_index: 0,
+            block_number: 1,
+            block_time: 100,
+            from_address: ZERO_ADDRESS.into(),
+            to_address: "0xminter".into(),
+            event_type: "erc721".into(),
+            source: "alchemy".into(),
+        }])
+    }
+
+    async fn fetch_contract_owners(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _contract_address: &str,
+    ) -> Result<Vec<OwnerBalance>, AppError> {
+        Ok(vec![])
+    }
+
+    async fn fetch_contract_sales(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _contract_address: &str,
+        _opensea_api_key: &str,
+    ) -> Result<Vec<NftSaleRecord>, AppError> {
+        Ok(vec![])
+    }
+
+    async fn fetch_transaction_receipt(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _tx_hash: &str,
+    ) -> Result<TransactionReceiptRecord, AppError> {
+        Ok(TransactionReceiptRecord::default())
+    }
+
+    async fn fetch_transaction_receipts_for_block(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _block_number: i64,
+    ) -> Result<BTreeMap<String, TransactionReceiptRecord>, AppError> {
+        Ok(BTreeMap::new())
+    }
+
+    async fn fetch_eth_balance(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _address: &str,
+        _block_number: i64,
+    ) -> Result<f64, AppError> {
+        Ok(0.0)
+    }
+
+    async fn fetch_same_block_eth_transfers_for_address(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _block_number: i64,
+        _address: &str,
+    ) -> Result<Vec<EthTransferRecord>, AppError> {
+        Ok(vec![])
+    }
+}
+
 #[async_trait]
 impl AnalyzeApi for StaggeredExpansionApi {
     async fn fetch_contract_metadata(
@@ -3313,12 +3512,37 @@ const ARBITRUM_ONE_BRIDGE: &str = "0x8315177ab297ba92a06054ce80a67ed4dbd7ed3a";
 
 struct CashoutTraceApi {
     mint_transfer_calls: Mutex<Vec<(i64, String)>>,
+    second_level_calls: Mutex<Vec<String>>,
+    parallel_branches: bool,
+    ordered_frontier_probe: bool,
+    active_hop_fetches: AtomicUsize,
+    max_hop_fetches: AtomicUsize,
 }
 
 impl CashoutTraceApi {
     fn new() -> Self {
         Self {
             mint_transfer_calls: Mutex::new(Vec::new()),
+            second_level_calls: Mutex::new(Vec::new()),
+            parallel_branches: false,
+            ordered_frontier_probe: false,
+            active_hop_fetches: AtomicUsize::new(0),
+            max_hop_fetches: AtomicUsize::new(0),
+        }
+    }
+
+    fn with_parallel_branches() -> Self {
+        Self {
+            parallel_branches: true,
+            ..Self::new()
+        }
+    }
+
+    fn with_ordered_frontier_probe() -> Self {
+        Self {
+            parallel_branches: true,
+            ordered_frontier_probe: true,
+            ..Self::new()
         }
     }
 }
@@ -3494,6 +3718,22 @@ impl AnalyzeApi for CashoutTraceApi {
             .lock()
             .unwrap()
             .push((block_number, address.to_string()));
+        if address == "0xnext1" || address == "0xnext2" {
+            self.second_level_calls
+                .lock()
+                .unwrap()
+                .push(address.to_string());
+        }
+        if address == "0xhop1" || address == "0xhop2" {
+            let active = self.active_hop_fetches.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_hop_fetches.fetch_max(active, Ordering::SeqCst);
+            if self.ordered_frontier_probe && address == "0xhop1" {
+                sleep(Duration::from_millis(80)).await;
+            } else {
+                sleep(Duration::from_millis(40)).await;
+            }
+            self.active_hop_fetches.fetch_sub(1, Ordering::SeqCst);
+        }
         let transfers = match address {
             "0xminter" => vec![EthTransferRecord {
                 tx_hash: "0xmint".into(),
@@ -3506,8 +3746,8 @@ impl AnalyzeApi for CashoutTraceApi {
                 payment_token_address: ZERO_ADDRESS.into(),
                 category: "external".into(),
             }],
-            "0xdup" => vec![
-                EthTransferRecord {
+            "0xdup" => {
+                let mut rows = vec![EthTransferRecord {
                     tx_hash: "0xmint".into(),
                     block_number,
                     from_address: "0xdup".into(),
@@ -3517,8 +3757,22 @@ impl AnalyzeApi for CashoutTraceApi {
                     payment_token_symbol: "ETH".into(),
                     payment_token_address: ZERO_ADDRESS.into(),
                     category: "internal".into(),
-                },
-                EthTransferRecord {
+                }];
+                if self.parallel_branches {
+                    rows.push(EthTransferRecord {
+                        tx_hash: "0xmint".into(),
+                        block_number,
+                        from_address: "0xdup".into(),
+                        to_address: "0xhop2".into(),
+                        value_eth: 0.4,
+                        value_usd: Some(920.0),
+                        payment_token_symbol: "ETH".into(),
+                        payment_token_address: ZERO_ADDRESS.into(),
+                        category: "internal".into(),
+                    });
+                }
+                rows.extend([
+                    EthTransferRecord {
                     tx_hash: "0xmint".into(),
                     block_number,
                     from_address: "0xdup".into(),
@@ -3540,7 +3794,53 @@ impl AnalyzeApi for CashoutTraceApi {
                     payment_token_address: ZERO_ADDRESS.into(),
                     category: "external".into(),
                 },
-            ],
+                ]);
+                rows
+            }
+            "0xhop1" if self.ordered_frontier_probe => vec![EthTransferRecord {
+                tx_hash: "0xmint".into(),
+                block_number,
+                from_address: "0xhop1".into(),
+                to_address: "0xnext1".into(),
+                value_eth: 0.49,
+                value_usd: Some(1_127.0),
+                payment_token_symbol: "ETH".into(),
+                payment_token_address: ZERO_ADDRESS.into(),
+                category: "internal".into(),
+            }],
+            "0xhop2" if self.ordered_frontier_probe => vec![EthTransferRecord {
+                tx_hash: "0xmint".into(),
+                block_number,
+                from_address: "0xhop2".into(),
+                to_address: "0xnext2".into(),
+                value_eth: 0.39,
+                value_usd: Some(897.0),
+                payment_token_symbol: "ETH".into(),
+                payment_token_address: ZERO_ADDRESS.into(),
+                category: "internal".into(),
+            }],
+            "0xnext1" => vec![EthTransferRecord {
+                tx_hash: "0xmint".into(),
+                block_number,
+                from_address: "0xnext1".into(),
+                to_address: ARBITRUM_ONE_BRIDGE.into(),
+                value_eth: 0.48,
+                value_usd: Some(1_104.0),
+                payment_token_symbol: "ETH".into(),
+                payment_token_address: ZERO_ADDRESS.into(),
+                category: "external".into(),
+            }],
+            "0xnext2" => vec![EthTransferRecord {
+                tx_hash: "0xmint".into(),
+                block_number,
+                from_address: "0xnext2".into(),
+                to_address: BINANCE_HOT_WALLET.into(),
+                value_eth: 0.38,
+                value_usd: Some(874.0),
+                payment_token_symbol: "ETH".into(),
+                payment_token_address: ZERO_ADDRESS.into(),
+                category: "external".into(),
+            }],
             "0xhop1" => vec![
                 EthTransferRecord {
                     tx_hash: "0xbridge".into(),
@@ -3565,6 +3865,17 @@ impl AnalyzeApi for CashoutTraceApi {
                     category: "external".into(),
                 },
             ],
+            "0xhop2" => vec![EthTransferRecord {
+                tx_hash: "0xexit2".into(),
+                block_number,
+                from_address: "0xhop2".into(),
+                to_address: BINANCE_HOT_WALLET.into(),
+                value_eth: 0.39,
+                value_usd: Some(897.0),
+                payment_token_symbol: "ETH".into(),
+                payment_token_address: ZERO_ADDRESS.into(),
+                category: "external".into(),
+            }],
             _ => vec![],
         };
         Ok(transfers)

@@ -76,12 +76,16 @@ impl FeatureStoreReader for CapturingBatchFeatureStore {
         max_recall_rows: usize,
     ) -> Result<BTreeMap<String, DatabaseSnapshot>, AppError> {
         let mut snapshots = BTreeMap::new();
-        let mut captured_seed_names = self.captured_seed_names.lock().unwrap();
+        {
+            let mut captured_seed_names = self.captured_seed_names.lock().unwrap();
+            for (seed_address, seed_nfts) in seeds {
+                captured_seed_names.insert(
+                    seed_address.clone(),
+                    seed_nfts.iter().map(|item| item.name.clone()).collect(),
+                );
+            }
+        }
         for (seed_address, seed_nfts) in seeds {
-            captured_seed_names.insert(
-                seed_address.clone(),
-                seed_nfts.iter().map(|item| item.name.clone()).collect(),
-            );
             snapshots.insert(
                 seed_address.clone(),
                 self.load_snapshot(
@@ -227,6 +231,40 @@ impl FeatureStoreReader for InstrumentedFeatureStore {
             );
         }
         Ok(rows)
+    }
+}
+
+struct BatchSnapshotFailsFeatureStore {
+    probe: Arc<BatchPipelineProbe>,
+}
+
+impl FeatureStoreReader for BatchSnapshotFailsFeatureStore {
+    fn load_snapshot(
+        &self,
+        _chain: &str,
+        _seed_nfts: &[SeedNft],
+        _name_threshold: f64,
+        _metadata_threshold: f64,
+        _max_tokens_per_contract: usize,
+        _max_recall_rows: usize,
+    ) -> Result<DatabaseSnapshot, AppError> {
+        self.probe.snapshot_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(DatabaseSnapshot::default())
+    }
+
+    fn load_snapshots(
+        &self,
+        _chain: &str,
+        _seeds: &[(String, Vec<SeedNft>)],
+        _name_threshold: f64,
+        _metadata_threshold: f64,
+        _max_tokens_per_contract: usize,
+        _max_recall_rows: usize,
+    ) -> Result<BTreeMap<String, DatabaseSnapshot>, AppError> {
+        self.probe
+            .snapshot_batch_calls
+            .fetch_add(1, Ordering::SeqCst);
+        Err(AppError::InvalidData("batched snapshot failed".into()))
     }
 }
 
@@ -1796,7 +1834,77 @@ async fn batch_continues_successful_seed_after_context_failure() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn batch_prefetches_later_seed_context_while_earlier_seed_loads_snapshot() {
+async fn batch_reuses_existing_single_seed_report_and_analyzes_remaining_seeds() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n").unwrap();
+    let mut cached_report = cached_single_report(
+        SeedContractPayload {
+            chain: "ethereum".into(),
+            contract_address: "0xseed1".into(),
+            name: "Cached Seed".into(),
+            ..SeedContractPayload::default()
+        },
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        BTreeMap::new(),
+    );
+    cached_report.paper_stats = PaperStatsPayload {
+        malicious_addresses: vec!["0xcached".into()],
+        ..PaperStatsPayload::default()
+    };
+    std::fs::write(
+        dir.path().join("top_contract_analysis__cached_seed.json"),
+        serde_json::to_string(&cached_report).unwrap(),
+    )
+    .unwrap();
+    let batch_progress = Arc::new(RecordingBatchProgressReporter::default());
+    let deps = AnalysisDeps {
+        api: Arc::new(OneSeedFailsContextApi),
+        feature_store: Arc::new(EmptyFeatureStore),
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: batch_progress.clone(),
+    };
+
+    let summary = run_batch(
+        BatchRequest {
+            chain: "ethereum".into(),
+            seed_file: dir.path().join("seeds.txt"),
+            output_dir: dir.path().to_path_buf(),
+            alchemy_api_key: "key".into(),
+            seed_network_max_concurrency: 2,
+            ..BatchRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        batch_progress.cached.lock().unwrap().as_slice(),
+        ["0xseed1"]
+    );
+    assert_eq!(
+        batch_progress.started.lock().unwrap().as_slice(),
+        ["0xseed2"]
+    );
+    assert_eq!(
+        batch_progress.finished.lock().unwrap().as_slice(),
+        ["0xseed2"]
+    );
+    assert!(batch_progress.failed.lock().unwrap().is_empty());
+    assert_eq!(
+        summary
+            .paper_stats
+            .address_classification
+            .malicious_address_count,
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_fetches_seed_contexts_before_batched_snapshot_recall() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n").unwrap();
     let probe = Arc::new(BatchPipelineProbe::default());
@@ -1831,10 +1939,8 @@ async fn batch_prefetches_later_seed_context_while_earlier_seed_loads_snapshot()
     .unwrap();
 
     assert_eq!(probe.metadata_calls.load(Ordering::SeqCst), 2);
-    assert_eq!(probe.snapshot_batch_calls.load(Ordering::SeqCst), 0);
-    assert!(probe
-        .later_context_overlapped_snapshot
-        .load(Ordering::SeqCst));
+    assert_eq!(probe.snapshot_batch_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.snapshot_calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1877,7 +1983,7 @@ async fn batch_limits_cpu_stage_globally() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn batch_loads_snapshots_per_seed_without_seed_chunks() {
+async fn batch_loads_pending_seed_snapshots_in_one_feature_store_call() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n").unwrap();
     let probe = Arc::new(BatchPipelineProbe::default());
@@ -1911,9 +2017,49 @@ async fn batch_loads_snapshots_per_seed_without_seed_chunks() {
     .await
     .unwrap();
 
-    assert_eq!(probe.snapshot_batch_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(probe.snapshot_batch_calls.load(Ordering::SeqCst), 1);
     assert_eq!(probe.snapshot_calls.load(Ordering::SeqCst), 2);
     assert_eq!(probe.cpu_max_seen.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_falls_back_to_per_seed_snapshots_when_batched_snapshot_load_fails() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n").unwrap();
+    let probe = Arc::new(BatchPipelineProbe::default());
+    let batch_progress = Arc::new(RecordingBatchProgressReporter::default());
+    let deps = AnalysisDeps {
+        api: Arc::new(InstrumentedBatchApi {
+            probe: probe.clone(),
+            transfer_sleep_ms: 0,
+            emit_native_sale: false,
+        }),
+        feature_store: Arc::new(BatchSnapshotFailsFeatureStore {
+            probe: probe.clone(),
+        }),
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: batch_progress.clone(),
+    };
+
+    let _summary = run_batch(
+        BatchRequest {
+            chain: "ethereum".into(),
+            seed_file: dir.path().join("seeds.txt"),
+            output_dir: dir.path().to_path_buf(),
+            alchemy_api_key: "key".into(),
+            seed_network_max_concurrency: 2,
+            seed_cpu_max_concurrency: 2,
+            ..BatchRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(probe.snapshot_batch_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.snapshot_calls.load(Ordering::SeqCst), 2);
+    assert!(batch_progress.failed.lock().unwrap().is_empty());
+    assert_eq!(batch_progress.finished.lock().unwrap().len(), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

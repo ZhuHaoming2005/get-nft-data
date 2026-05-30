@@ -286,6 +286,13 @@ impl<'a> SnapshotTokenIndex<'a> {
             rows,
         )
     }
+
+    pub(super) fn contract_token_count(&self, contract_address: &str) -> usize {
+        self.rows_by_contract
+            .get(&contract_address.to_lowercase())
+            .map(Vec::len)
+            .unwrap_or_default()
+    }
 }
 
 pub(super) async fn fetch_and_expand_contract_candidates(
