@@ -171,7 +171,7 @@ cargo run --release -- batch \
 - `duplicate_scale`：按 `token_uri`、`image_uri`、`metadata`、`name`、`total` 统计重复 NFT / 合约数量、比例、分子、分母。
 - `address_classification`：恶意地址、跨合约重复侵权恶意地址、诚实地址、地址总数。
 - `contract_behavior_stats`：单合约 JSON 逐合约输出 Wash Trading、Pump-and-Exit、Sybil/Fraud/Poisoning、Layered Transfer、Inventory Concentration、诚实买家明细，并在每个 match 合约内统计 2、3、4、5+ 节点 wash cycle 数量和比例；汇总 JSON 不包含逐合约明细。
-- `malicious_behavior_summary`：按行为类型汇总合约覆盖率、实例占比、涉及地址/NFT、关联买家和可归因买家损失；Sybil/Fraud/Poisoning、Layered、Inventory 这类未直接关联诚实买家的行为价值保留在合约行为明细的 `total_value` / `value_collected` 中，不写入 `linked_loss`。
+- `malicious_behavior_summary`：按行为类型汇总合约覆盖率、实例占比、涉及地址/NFT、关联买家和可归因买家损失；Pump-and-Exit 以及直接 sale 给诚实买家的星型 Sybil/Fraud/Poisoning 行为会写入 `linked_buyer_count` / `linked_loss`，Layered、Inventory 等未直接关联诚实买家的行为价值保留在合约行为明细的 `total_value` / `value_collected` 中。
 - `wash_cycle_size_distribution`：汇总统计 2、3、4、5+ 节点 wash cycle 数量、比例、分子和分母；单合约 JSON 和批量汇总 JSON 都导出。
 - `wash_cycle_size_by_contract`：单合约 JSON 按每个 match 合约统计同口径 wash cycle 节点规模；无循环合约也保留 0 值行，汇总 JSON 不导出该逐合约明细。
 - `attacker_cost`：Setup / Lure / Exit / Total gas 成本和前百分比合约成本集中度；Setup 统计复制合约部署和资金准备 gas，Lure 统计恶意地址付费 mint、刷量/诱导成交 gas，Exit 统计攻击者卖出、withdrawal、cashout 等退出 gas；同一合约同一交易只计一次，跨阶段重复时按 Exit / Lure / Setup 优先级归入更具体阶段，不把诚实买家支付的 gas 计入攻击者成本；集中度的前百分比合约数按全部疑似重复合约计算，不按有正成本的合约计算。

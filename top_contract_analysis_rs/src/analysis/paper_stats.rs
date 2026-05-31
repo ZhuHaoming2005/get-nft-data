@@ -191,6 +191,7 @@ struct StarBehaviorPattern {
     row: PaperStarBehaviorRowPayload,
     addresses: BTreeSet<String>,
     token_ids: BTreeSet<String>,
+    buyers: BTreeSet<String>,
 }
 
 #[derive(Default)]
@@ -202,6 +203,9 @@ struct StarBehaviorBuild {
     fanout_total: usize,
     total_value_eth: f64,
     total_value_usd: f64,
+    buyers: BTreeSet<String>,
+    linked_loss_eth: f64,
+    linked_loss_usd: f64,
 }
 
 struct LayeredTransferPattern {
@@ -1430,7 +1434,7 @@ fn compare_output_input_ratio_rows(
 }
 
 fn output_input_sort_ratio(row: &PaperOutputInputRatioRowPayload) -> f64 {
-    row.output_input_ratio.unwrap_or_else(|| {
+    row.output_input_ratio.unwrap_or({
         if row.output_usd > 0.0 {
             f64::INFINITY
         } else {
@@ -1961,6 +1965,17 @@ fn build_contract_behavior_stats(
                     pattern.addresses.iter().cloned(),
                     pattern.token_ids.iter().cloned(),
                 );
+                insert_behavior_buyers(
+                    &mut behavior_buyers,
+                    &pattern.row.behavior,
+                    pattern.buyers.iter().cloned(),
+                );
+                for buyer in &pattern.buyers {
+                    source_patterns_by_buyer
+                        .entry(buyer.clone())
+                        .or_default()
+                        .insert(pattern.row.behavior.clone());
+                }
             }
             let star_behaviors = star_behavior_patterns
                 .iter()
@@ -2452,6 +2467,12 @@ fn detect_star_behaviors(
             entry.wallets.extend(components[target].iter().cloned());
         }
         for edge in edges {
+            let buyer = normalized_address(&edge.to_address);
+            if edge.channel == "sale" && address_sets.honest.contains(&buyer) {
+                entry.buyers.insert(buyer);
+                entry.linked_loss_eth += edge.price_eth.unwrap_or_default();
+                entry.linked_loss_usd += edge.price_usd.unwrap_or_default();
+            }
             entry.token_ids.extend(edge_token_ids(edge));
             entry.total_value_eth += edge.price_eth.unwrap_or_default();
             entry.total_value_usd += edge.price_usd.unwrap_or_default();
@@ -2473,9 +2494,13 @@ fn detect_star_behaviors(
                 median_holding_seconds: None,
                 total_value_eth: build.total_value_eth,
                 total_value_usd: build.total_value_usd,
+                linked_honest_buyer_count: build.buyers.len() as i64,
+                linked_loss_eth: build.linked_loss_eth,
+                linked_loss_usd: build.linked_loss_usd,
             },
             addresses: build.wallets,
             token_ids: build.token_ids,
+            buyers: build.buyers,
         })
         .collect()
 }
@@ -3034,7 +3059,24 @@ fn build_behavior_summary(
                         .filter(|row| row.behavior == behavior)
                         .map(|row| row.tokens)
                         .sum(),
-                    ..BehaviorMeasure::default()
+                    buyer_count: stats
+                        .star_behaviors
+                        .iter()
+                        .filter(|row| row.behavior == behavior)
+                        .map(|row| row.linked_honest_buyer_count)
+                        .sum(),
+                    linked_loss_eth: stats
+                        .star_behaviors
+                        .iter()
+                        .filter(|row| row.behavior == behavior)
+                        .map(|row| row.linked_loss_eth)
+                        .sum(),
+                    linked_loss_usd: stats
+                        .star_behaviors
+                        .iter()
+                        .filter(|row| row.behavior == behavior)
+                        .map(|row| row.linked_loss_usd)
+                        .sum(),
                 }
             })
         {

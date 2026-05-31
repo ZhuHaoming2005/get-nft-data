@@ -59,12 +59,6 @@ fn format_seconds_i64(value: Option<i64>) -> String {
         .unwrap_or_else(|| "n/a".into())
 }
 
-fn format_seconds_f64(value: Option<f64>) -> String {
-    value
-        .map(|seconds| format!("{}s", format_number(seconds)))
-        .unwrap_or_else(|| "n/a".into())
-}
-
 fn format_bool(value: bool) -> &'static str {
     if value {
         "是"
@@ -530,13 +524,13 @@ fn append_match_contract_star_behaviors(
     lines.extend([
         String::new(),
         "#### 星型行为".to_string(),
-        "| behavior | centers | edges | wallets | tokens | avg fan-out | median holding time | total value ETH/USD |"
+        "| behavior | centers | edges | wallets | tokens | avg fan-out | total value ETH/USD |"
             .to_string(),
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |".to_string(),
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |".to_string(),
     ]);
     for item in rows {
         lines.push(format!(
-            "| {} | {} | {} | {} | {} | {} ({}/{}) | {} | {} / {} |",
+            "| {} | {} | {} | {} | {} | {} ({}/{}) | {} / {} |",
             markdown_cell(&item.behavior),
             item.centers,
             item.edges,
@@ -545,7 +539,6 @@ fn append_match_contract_star_behaviors(
             format_optional_number(item.avg_fan_out),
             item.avg_fan_out_numerator,
             item.avg_fan_out_denominator,
-            format_seconds_f64(item.median_holding_seconds),
             format_number(item.total_value_eth),
             format_number(item.total_value_usd)
         ));

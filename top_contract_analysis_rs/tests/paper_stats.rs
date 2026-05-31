@@ -464,6 +464,95 @@ fn behavior_summary_only_counts_loss_when_buyers_are_linked() {
 }
 
 #[test]
+fn paper_stats_attributes_direct_star_sale_to_honest_buyer() {
+    let path = NftPropagationPathPayload {
+        contract_address: "0xfraud".into(),
+        nodes: BTreeMap::from([
+            ("0xcenter".into(), NftPropagationNodePayload::default()),
+            ("0xleaf".into(), NftPropagationNodePayload::default()),
+            (
+                "0xhonest".into(),
+                NftPropagationNodePayload {
+                    roles: vec!["victim_buyer".into()],
+                    current_holding_token_count: 1,
+                    is_stuck_victim: true,
+                    ..NftPropagationNodePayload::default()
+                },
+            ),
+        ]),
+        edges: vec![
+            propagation_edge(
+                ("0xfraud", "0xcenter", "0xhonest"),
+                "1",
+                "sale",
+                100,
+                (Some(1.0), Some(2_000.0)),
+            ),
+            propagation_edge(
+                ("0xfraud", "0xcenter", "0xleaf"),
+                "2",
+                "sale",
+                101,
+                (Some(0.5), Some(1_000.0)),
+            ),
+        ],
+        ..NftPropagationPathPayload::default()
+    };
+    let victim = VictimAcquisitionAddressPayload {
+        address: "0xhonest".into(),
+        contract_addresses: vec!["0xfraud".into()],
+        secondary_sale_count: 1,
+        total_acquisition_cost_eth: 2.5,
+        total_acquisition_cost_usd: 5_000.0,
+        secondary_sale_stuck_cost_eth: 1.0,
+        secondary_sale_stuck_cost_usd: 2_000.0,
+        total_stuck_cost_eth: 2.5,
+        total_stuck_cost_usd: 5_000.0,
+        is_stuck: true,
+        ..VictimAcquisitionAddressPayload::default()
+    };
+
+    let stats = build_paper_stats(PaperStatsInput {
+        config: PaperStatsConfig {
+            center_fanout_threshold: 2,
+            ..PaperStatsConfig::default()
+        },
+        seed_collection_stats: &SeedCollectionStatsPayload::default(),
+        duplicate_candidates: &[],
+        duplicate_contracts: &[],
+        legit_duplicates: &[],
+        infringing_tokens: &[],
+        malicious_addresses: &[],
+        victim_acquisition_addresses: &[victim],
+        value_flow_edges: &[],
+        nft_propagation_paths: &BTreeMap::from([("0xfraud".into(), path)]),
+    });
+
+    let contract_stats = stats
+        .contract_behavior_stats
+        .iter()
+        .find(|row| row.contract_address == "0xfraud")
+        .unwrap();
+    assert_eq!(
+        contract_stats.honest_buyers[0].source_pattern,
+        "Fraud Revenue"
+    );
+
+    let fraud = stats
+        .malicious_behavior_summary
+        .iter()
+        .find(|row| row.behavior_type == "Fraud Revenue")
+        .unwrap();
+    assert_eq!(fraud.linked_buyer_count, 1);
+    assert_eq!(fraud.linked_loss_eth, 1.0);
+    assert_eq!(fraud.linked_loss_usd, 2_000.0);
+    assert_eq!(
+        stats.behavior_buyers_by_type["Fraud Revenue"][0],
+        "0xhonest"
+    );
+}
+
+#[test]
 fn markdown_honest_loss_renders_stuck_time_as_multiple() {
     let paper_stats = PaperStatsPayload {
         honest_loss: top_contract_analysis_rs::models::PaperHonestLossPayload {
@@ -1678,6 +1767,7 @@ fn markdown_contract_behavior_details_include_experiment_rows() {
                 median_holding_seconds: Some(120.0),
                 total_value_eth: 0.6,
                 total_value_usd: 1_200.0,
+                ..PaperStarBehaviorRowPayload::default()
             }],
             layered_transfers: vec![PaperLayeredTransferRowPayload {
                 path_id: "path1".into(),
@@ -1728,9 +1818,9 @@ fn markdown_contract_behavior_details_include_experiment_rows() {
     assert!(markdown.contains("#### Pump-and-Exit"));
     assert!(markdown.contains("| pump1 | 60s | 1.5x (300/200) | 50.00% (1/2) | 2 | 1 / 2000 |"));
     assert!(markdown.contains("#### 星型行为"));
-    assert!(
-        markdown.contains("| Sybil Distribution | 1 | 6 | 7 | 4 | 3 (6/2) | 120s | 0.6 / 1200 |")
-    );
+    assert!(markdown.contains("| Sybil Distribution | 1 | 6 | 7 | 4 | 3 (6/2) | 0.6 / 1200 |"));
+    assert!(!markdown.contains("median holding time"));
+    assert!(!markdown.contains("| Sybil Distribution | 1 | 6 | 7 | 4 | 3 (6/2) | 120s |"));
     assert!(markdown.contains("#### Layered Transfer"));
     assert!(markdown.contains("| path1 | 2 | 4 | 5 | 2 | 3600s | 0.4 / 800 |"));
     assert!(markdown.contains("#### Inventory Concentration"));

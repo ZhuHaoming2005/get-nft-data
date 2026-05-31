@@ -809,6 +809,9 @@ pub struct PaperStarBehaviorRowPayload {
     pub median_holding_seconds: Option<f64>,
     pub total_value_eth: f64,
     pub total_value_usd: f64,
+    pub linked_honest_buyer_count: i64,
+    pub linked_loss_eth: f64,
+    pub linked_loss_usd: f64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
