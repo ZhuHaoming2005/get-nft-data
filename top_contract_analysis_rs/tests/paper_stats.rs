@@ -1370,7 +1370,7 @@ fn attacker_cost_does_not_count_deployment_without_operator_evidence() {
 fn paper_stats_builds_output_input_ratio_rows_and_skips_zero_output_contracts() {
     let stats = build_output_input_ratio_stats();
 
-    assert_eq!(stats.output_input_ratio_by_contract.len(), 2);
+    assert_eq!(stats.output_input_ratio_by_contract.len(), 3);
     let profit = stats
         .output_input_ratio_by_contract
         .iter()
@@ -1391,15 +1391,24 @@ fn paper_stats_builds_output_input_ratio_rows_and_skips_zero_output_contracts() 
     assert_eq!(loss.input_usd, 20.0);
     assert_eq!(loss.output_input_ratio, Some(0.5));
 
+    let no_input = stats
+        .output_input_ratio_by_contract
+        .iter()
+        .find(|row| row.contract_address == "0xnoinput")
+        .expect("positive-output zero-input contract ratio row");
+    assert_eq!(no_input.output_usd, 7.0);
+    assert_eq!(no_input.input_usd, 0.0);
+    assert_eq!(no_input.output_input_ratio, None);
+
     assert!(!stats
         .output_input_ratio_by_contract
         .iter()
         .any(|row| row.contract_address == "0xzero"));
-    assert_eq!(stats.output_input_summary.total_output_usd, 110.0);
+    assert_eq!(stats.output_input_summary.total_output_usd, 117.0);
     assert_eq!(stats.output_input_summary.total_input_usd, 45.0);
     assert_eq!(
         stats.output_input_summary.total_output_input_ratio,
-        Some(110.0 / 45.0)
+        Some(117.0 / 45.0)
     );
     assert_eq!(stats.output_input_summary.ratio_gte_one_count, 1);
     assert_eq!(stats.output_input_summary.ratio_gte_one_ratio, Some(0.5));
@@ -1411,11 +1420,15 @@ fn paper_stats_builds_output_input_ratio_rows_and_skips_zero_output_contracts() 
 fn paper_stats_merge_recomputes_output_input_ratio_summary() {
     let first = output_input_ratio_stats_for_contract("0xprofit", 100.0, 25.0);
     let second = output_input_ratio_stats_for_contract("0xloss", 10.0, 20.0);
+    let no_input = output_input_ratio_stats_for_contract("0xnoinput", 7.0, 0.0);
     let zero_output = output_input_ratio_stats_for_contract("0xzero", 0.0, 40.0);
 
-    let merged = merge_paper_stats([&first, &second, &zero_output], PaperStatsConfig::default());
+    let merged = merge_paper_stats(
+        [&first, &second, &no_input, &zero_output],
+        PaperStatsConfig::default(),
+    );
 
-    assert_eq!(merged.output_input_ratio_by_contract.len(), 2);
+    assert_eq!(merged.output_input_ratio_by_contract.len(), 3);
     assert!(merged
         .output_input_ratio_by_contract
         .iter()
@@ -1424,15 +1437,21 @@ fn paper_stats_merge_recomputes_output_input_ratio_summary() {
         .output_input_ratio_by_contract
         .iter()
         .any(|row| row.contract_address == "0xloss" && row.output_input_ratio == Some(0.5)));
+    assert!(merged
+        .output_input_ratio_by_contract
+        .iter()
+        .any(|row| row.contract_address == "0xnoinput"
+            && row.input_usd == 0.0
+            && row.output_input_ratio.is_none()));
     assert!(!merged
         .output_input_ratio_by_contract
         .iter()
         .any(|row| row.contract_address == "0xzero"));
-    assert_eq!(merged.output_input_summary.total_output_usd, 110.0);
+    assert_eq!(merged.output_input_summary.total_output_usd, 117.0);
     assert_eq!(merged.output_input_summary.total_input_usd, 45.0);
     assert_eq!(
         merged.output_input_summary.total_output_input_ratio,
-        Some(110.0 / 45.0)
+        Some(117.0 / 45.0)
     );
     assert_eq!(merged.output_input_summary.ratio_gte_one_count, 1);
     assert_eq!(merged.output_input_summary.ratio_gte_one_ratio, Some(0.5));
@@ -2774,6 +2793,7 @@ fn build_output_input_ratio_stats() -> PaperStatsPayload {
     let contracts = [
         duplicate_contract("0xprofit", 1),
         duplicate_contract("0xloss", 1),
+        duplicate_contract("0xnoinput", 1),
         duplicate_contract("0xzero", 1),
     ];
     let value_flow_edges = vec![
@@ -2781,6 +2801,7 @@ fn build_output_input_ratio_stats() -> PaperStatsPayload {
         attacker_input_edge("0xprofit", "0xprofit_deploy", 25.0),
         operator_output_edge("0xloss", "0xloss_mint", 10.0),
         attacker_input_edge("0xloss", "0xloss_deploy", 20.0),
+        operator_output_edge("0xnoinput", "0xnoinput_mint", 7.0),
         operator_output_edge("0xzero", "0xzero_mint", 0.0),
         attacker_input_edge("0xzero", "0xzero_deploy", 40.0),
     ];

@@ -1378,7 +1378,7 @@ fn build_output_input_ratio(
 
     let total_output_usd = rows.iter().map(|row| row.output_usd).sum::<f64>();
     let total_input_usd = rows.iter().map(|row| row.input_usd).sum::<f64>();
-    let ratio_denominator = rows.len() as i64;
+    let ratio_denominator = rows.iter().filter(|row| row.input_usd > 0.0).count() as i64;
     let ratio_gte_one_count = rows
         .iter()
         .filter(|row| output_input_ratio_gte_one(row))
@@ -1409,7 +1409,7 @@ fn build_output_input_ratio(
 }
 
 fn output_input_ratio_gte_one(row: &PaperOutputInputRatioRowPayload) -> bool {
-    row.output_usd > 0.0 && (row.input_usd <= 0.0 || row.output_usd >= row.input_usd)
+    row.input_usd > 0.0 && row.output_usd >= row.input_usd
 }
 
 fn output_input_ratio_lt_one(row: &PaperOutputInputRatioRowPayload) -> bool {
