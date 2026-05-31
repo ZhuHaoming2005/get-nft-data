@@ -4,13 +4,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rayon::prelude::*;
 
+use crate::currency::FALLBACK_ETH_USD_RATE;
 use crate::models::{
     DuplicateCandidate, DuplicateContractPayload, InfringingTokenRecord, MaliciousAddressPayload,
     NftPropagationEdgePayload, NftPropagationPathPayload, PaperAddressClassificationPayload,
     PaperAttackerCostDetailPayload, PaperAttackerCostPayload, PaperBehaviorSummaryRowPayload,
     PaperContractBehaviorStatsPayload, PaperContractWashCycleSizePayload, PaperDataQualityPayload,
     PaperDuplicateScaleRowPayload, PaperHonestBuyerRowPayload, PaperHonestLossPayload,
-    PaperInventoryConcentrationRowPayload, PaperLayeredTransferRowPayload, PaperPumpExitRowPayload,
+    PaperInventoryConcentrationRowPayload, PaperLayeredTransferRowPayload,
+    PaperOutputInputRatioRowPayload, PaperOutputInputSummaryPayload, PaperPumpExitRowPayload,
     PaperStarBehaviorRowPayload, PaperStatsPayload, PaperWashCycleSizeRowPayload,
     PaperWashTradingRowPayload, SeedCollectionStatsPayload, ValueFlowEdgePayload,
     VictimAcquisitionAddressPayload, ZERO_ADDRESS,
@@ -120,6 +122,11 @@ struct AttackerCostBuild {
     by_contract_usd: BTreeMap<String, f64>,
 }
 
+struct AttackerCostCandidate {
+    stage: AttackerCostStage,
+    detail: PaperAttackerCostDetailPayload,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum AttackerCostStage {
     Setup,
@@ -133,6 +140,12 @@ struct HonestLossBuild {
     total_loss_by_contract_usd: BTreeMap<String, f64>,
     stuck_time_numerator_by_contract: BTreeMap<String, f64>,
     stuck_time_denominator_by_contract: BTreeMap<String, f64>,
+}
+
+#[derive(Default)]
+struct OutputInputRatioBuild {
+    summary: PaperOutputInputSummaryPayload,
+    rows: Vec<PaperOutputInputRatioRowPayload>,
 }
 
 struct LossRowInput {
@@ -263,6 +276,11 @@ pub fn build_paper_stats(input: PaperStatsInput<'_>) -> PaperStatsPayload {
         total_duplicate_nft_count(&duplicate_scale),
         duplicate_contract_count,
     );
+    let operator_output_by_contract_usd = build_operator_output_by_contract(input.value_flow_edges);
+    let output_input_ratio = build_output_input_ratio(
+        &operator_output_by_contract_usd,
+        &attacker_cost.by_contract_usd,
+    );
 
     PaperStatsPayload {
         duplicate_scale: duplicate_scale.rows,
@@ -274,6 +292,8 @@ pub fn build_paper_stats(input: PaperStatsInput<'_>) -> PaperStatsPayload {
         attacker_cost: attacker_cost.payload,
         attacker_cost_details: attacker_cost.details,
         honest_loss: honest_loss.payload,
+        output_input_summary: output_input_ratio.summary,
+        output_input_ratio_by_contract: output_input_ratio.rows,
         data_quality: build_data_quality(&input),
         malicious_addresses: address_sets.malicious.into_iter().collect(),
         honest_addresses: address_sets.honest.into_iter().collect(),
@@ -282,6 +302,7 @@ pub fn build_paper_stats(input: PaperStatsInput<'_>) -> PaperStatsPayload {
             .into_iter()
             .collect(),
         attacker_cost_by_contract_usd: attacker_cost.by_contract_usd,
+        operator_output_by_contract_usd,
         honest_loss_by_contract_usd: honest_loss.total_loss_by_contract_usd,
         stuck_time_numerator_by_contract: honest_loss.stuck_time_numerator_by_contract,
         stuck_time_denominator_by_contract: honest_loss.stuck_time_denominator_by_contract,
@@ -319,6 +340,9 @@ pub fn merge_paper_stats<'a>(
     let mut behavior_buyers = BTreeMap::<String, BTreeSet<String>>::new();
     let mut behavior_contract_denominator_keys = BTreeSet::<String>::new();
     let mut merged = PaperStatsPayload::default();
+    let mut has_positive_attacker_cost_without_details = false;
+    let mut legacy_attacker_cost = PaperAttackerCostPayload::default();
+    let mut legacy_attacker_cost_by_contract_usd = BTreeMap::<String, f64>::new();
 
     for stats in seed_stats {
         for row in &stats.duplicate_scale {
@@ -378,6 +402,16 @@ pub fn merge_paper_stats<'a>(
         merged.attacker_cost.exit_gas_usd += stats.attacker_cost.exit_gas_usd;
         merged.attacker_cost.total_gas_eth += stats.attacker_cost.total_gas_eth;
         merged.attacker_cost.total_gas_usd += stats.attacker_cost.total_gas_usd;
+        let has_legacy_attacker_cost = stats.attacker_cost_details.is_empty()
+            && (stats.attacker_cost.total_gas_eth > 0.0 || stats.attacker_cost.total_gas_usd > 0.0);
+        if has_legacy_attacker_cost {
+            has_positive_attacker_cost_without_details = true;
+            add_attacker_cost_payload(&mut legacy_attacker_cost, &stats.attacker_cost);
+            merge_f64_map(
+                &mut legacy_attacker_cost_by_contract_usd,
+                &stats.attacker_cost_by_contract_usd,
+            );
+        }
         merged
             .attacker_cost_details
             .extend(stats.attacker_cost_details.iter().cloned());
@@ -386,6 +420,21 @@ pub fn merge_paper_stats<'a>(
             &mut merged.attacker_cost_by_contract_usd,
             &stats.attacker_cost_by_contract_usd,
         );
+        if stats.operator_output_by_contract_usd.is_empty() {
+            for row in &stats.output_input_ratio_by_contract {
+                if row.output_usd > 0.0 {
+                    *merged
+                        .operator_output_by_contract_usd
+                        .entry(normalized_contract(&row.contract_address))
+                        .or_default() += row.output_usd;
+                }
+            }
+        } else {
+            merge_f64_map(
+                &mut merged.operator_output_by_contract_usd,
+                &stats.operator_output_by_contract_usd,
+            );
+        }
         merge_f64_map(
             &mut merged.honest_loss_by_contract_usd,
             &stats.honest_loss_by_contract_usd,
@@ -523,17 +572,45 @@ pub fn merge_paper_stats<'a>(
         top_contract_loss_contribution_denominator: total_loss_usd,
     };
 
-    merged.attacker_cost.top_contract_contribution_numerator = top_contribution_numerator(
+    if !merged.attacker_cost_details.is_empty() {
+        let mut attacker_cost = build_attacker_cost_from_details(
+            config,
+            &merged.attacker_cost_details,
+            contribution_contract_count,
+        );
+        if has_positive_attacker_cost_without_details {
+            add_legacy_attacker_cost_summary(
+                &mut attacker_cost,
+                &legacy_attacker_cost,
+                &legacy_attacker_cost_by_contract_usd,
+                config,
+                contribution_contract_count,
+            );
+        }
+        merged.attacker_cost = attacker_cost.payload;
+        merged.attacker_cost_details = attacker_cost.details;
+        merged.attacker_cost_by_contract_usd = attacker_cost.by_contract_usd;
+    } else {
+        merged.attacker_cost.top_contract_contribution_numerator = top_contribution_numerator(
+            &merged.attacker_cost_by_contract_usd,
+            config,
+            contribution_contract_count,
+        );
+        merged.attacker_cost.top_contract_contribution_denominator =
+            merged.attacker_cost.total_gas_usd;
+        merged.attacker_cost.top_contract_contribution_ratio = ratio_f64(
+            merged.attacker_cost.top_contract_contribution_numerator,
+            merged.attacker_cost.top_contract_contribution_denominator,
+        );
+        sort_attacker_cost_details(&mut merged.attacker_cost_details);
+    }
+    let output_input_ratio = build_output_input_ratio(
+        &merged.operator_output_by_contract_usd,
         &merged.attacker_cost_by_contract_usd,
-        config,
-        contribution_contract_count,
     );
-    merged.attacker_cost.top_contract_contribution_denominator = merged.attacker_cost.total_gas_usd;
-    merged.attacker_cost.top_contract_contribution_ratio = ratio_f64(
-        merged.attacker_cost.top_contract_contribution_numerator,
-        merged.attacker_cost.top_contract_contribution_denominator,
-    );
-    sort_attacker_cost_details(&mut merged.attacker_cost_details);
+    merged.output_input_summary = output_input_ratio.summary;
+    merged.output_input_ratio_by_contract = output_input_ratio.rows;
+
     merged.data_quality.sale_price_parseable_ratio = ratio_i64(
         merged.data_quality.sale_price_parseable_count,
         merged.data_quality.sale_price_total_count,
@@ -587,6 +664,20 @@ fn merge_f64_map(target: &mut BTreeMap<String, f64>, source: &BTreeMap<String, f
     for (key, value) in source {
         *target.entry(key.clone()).or_default() += value;
     }
+}
+
+fn add_attacker_cost_payload(
+    target: &mut PaperAttackerCostPayload,
+    source: &PaperAttackerCostPayload,
+) {
+    target.setup_gas_eth += source.setup_gas_eth;
+    target.setup_gas_usd += source.setup_gas_usd;
+    target.lure_gas_eth += source.lure_gas_eth;
+    target.lure_gas_usd += source.lure_gas_usd;
+    target.exit_gas_eth += source.exit_gas_eth;
+    target.exit_gas_usd += source.exit_gas_usd;
+    target.total_gas_eth += source.total_gas_eth;
+    target.total_gas_usd += source.total_gas_usd;
 }
 
 fn merge_set_maps(
@@ -1024,8 +1115,7 @@ fn build_attacker_cost(
     explicit_malicious_addresses: &BTreeSet<String>,
     contribution_contract_count: usize,
 ) -> AttackerCostBuild {
-    let mut build = AttackerCostBuild::default();
-    let mut counted_gas_keys = BTreeSet::<(String, AttackerCostStage, String)>::new();
+    let mut candidates = BTreeMap::<(String, String), AttackerCostCandidate>::new();
     for edge in value_flow_edges {
         let gas_eth = edge.gas_eth.unwrap_or_else(|| {
             edge.value_with_gas_eth.unwrap_or_default() - edge.value_eth.unwrap_or_default()
@@ -1040,19 +1130,53 @@ fn build_attacker_cost(
             continue;
         };
         let contract = normalized_contract(&edge.contract_address);
-        let gas_key = (
-            contract.clone(),
-            stage,
-            if edge.tx_hash.trim().is_empty() {
-                edge.edge_id.clone()
-            } else {
-                edge.tx_hash.to_lowercase()
-            },
+        let detail = PaperAttackerCostDetailPayload {
+            contract_address: contract.clone(),
+            stage: attacker_cost_stage_label(stage).into(),
+            channel: edge.channel.clone(),
+            tx_hash: edge.tx_hash.trim().to_lowercase(),
+            gas_payer_address: attacker_cost_payer(edge),
+            gas_eth,
+            gas_usd,
+            from_role: edge.from_role.clone(),
+            to_role: edge.to_role.clone(),
+            evidence_type: edge.evidence_type.clone(),
+        };
+        let key = attacker_cost_edge_key(&contract, edge, stage, gas_eth, gas_usd);
+        merge_attacker_cost_candidate(
+            &mut candidates,
+            key,
+            AttackerCostCandidate { stage, detail },
         );
-        if !counted_gas_keys.insert(gas_key) {
+    }
+    finalize_attacker_cost_build(config, candidates, contribution_contract_count)
+}
+
+fn build_attacker_cost_from_details(
+    config: PaperStatsConfig,
+    details: &[PaperAttackerCostDetailPayload],
+    contribution_contract_count: usize,
+) -> AttackerCostBuild {
+    let mut candidates = BTreeMap::<(String, String), AttackerCostCandidate>::new();
+    for detail in details {
+        let Some((key, candidate)) = attacker_cost_candidate_from_detail(detail) else {
             continue;
-        }
-        match stage {
+        };
+        merge_attacker_cost_candidate(&mut candidates, key, candidate);
+    }
+    finalize_attacker_cost_build(config, candidates, contribution_contract_count)
+}
+
+fn finalize_attacker_cost_build(
+    config: PaperStatsConfig,
+    candidates: BTreeMap<(String, String), AttackerCostCandidate>,
+    contribution_contract_count: usize,
+) -> AttackerCostBuild {
+    let mut build = AttackerCostBuild::default();
+    for candidate in candidates.into_values() {
+        let gas_eth = candidate.detail.gas_eth.max(0.0);
+        let gas_usd = candidate.detail.gas_usd.max(0.0);
+        match candidate.stage {
             AttackerCostStage::Setup => {
                 build.payload.setup_gas_eth += gas_eth;
                 build.payload.setup_gas_usd += gas_usd;
@@ -1067,21 +1191,13 @@ fn build_attacker_cost(
             }
         }
         if gas_usd > 0.0 {
-            *build.by_contract_usd.entry(contract.clone()).or_default() += gas_usd;
+            *build
+                .by_contract_usd
+                .entry(candidate.detail.contract_address.clone())
+                .or_default() += gas_usd;
         }
         if gas_eth > 0.0 || gas_usd > 0.0 {
-            build.details.push(PaperAttackerCostDetailPayload {
-                contract_address: contract,
-                stage: attacker_cost_stage_label(stage).into(),
-                channel: edge.channel.clone(),
-                tx_hash: edge.tx_hash.to_lowercase(),
-                gas_payer_address: attacker_cost_payer(edge),
-                gas_eth,
-                gas_usd,
-                from_role: edge.from_role.clone(),
-                to_role: edge.to_role.clone(),
-                evidence_type: edge.evidence_type.clone(),
-            });
+            build.details.push(candidate.detail);
         }
     }
     build.payload.total_gas_eth =
@@ -1097,6 +1213,371 @@ fn build_attacker_cost(
     );
     sort_attacker_cost_details(&mut build.details);
     build
+}
+
+fn add_legacy_attacker_cost_summary(
+    build: &mut AttackerCostBuild,
+    legacy_payload: &PaperAttackerCostPayload,
+    legacy_by_contract_usd: &BTreeMap<String, f64>,
+    config: PaperStatsConfig,
+    contribution_contract_count: usize,
+) {
+    add_attacker_cost_payload(&mut build.payload, legacy_payload);
+    merge_f64_map(&mut build.by_contract_usd, legacy_by_contract_usd);
+    build.payload.top_contract_contribution_denominator = build.payload.total_gas_usd;
+    build.payload.top_contract_contribution_numerator =
+        top_contribution_numerator(&build.by_contract_usd, config, contribution_contract_count);
+    build.payload.top_contract_contribution_ratio = ratio_f64(
+        build.payload.top_contract_contribution_numerator,
+        build.payload.top_contract_contribution_denominator,
+    );
+}
+
+fn build_operator_output_by_contract(
+    value_flow_edges: &[ValueFlowEdgePayload],
+) -> BTreeMap<String, f64> {
+    let mut by_edge = BTreeMap::<(String, String), f64>::new();
+    for edge in value_flow_edges {
+        let contract = normalized_contract(&edge.contract_address);
+        if contract == "unknown" {
+            continue;
+        }
+        let Some(output_usd) = operator_output_usd(edge) else {
+            continue;
+        };
+        let key = operator_output_edge_key(&contract, edge, output_usd);
+        by_edge
+            .entry(key)
+            .and_modify(|existing| *existing = existing.max(output_usd))
+            .or_insert(output_usd);
+    }
+
+    let mut by_contract = BTreeMap::<String, f64>::new();
+    for ((contract, _), output_usd) in by_edge {
+        *by_contract.entry(contract).or_default() += output_usd;
+    }
+    by_contract
+}
+
+fn operator_output_usd(edge: &ValueFlowEdgePayload) -> Option<f64> {
+    if !is_operator_output_edge(edge) {
+        return None;
+    }
+    let output_usd = edge
+        .value_usd
+        .filter(|value| *value > 0.0)
+        .or_else(|| {
+            edge.value_eth
+                .filter(|value| *value > 0.0)
+                .map(|value| value * FALLBACK_ETH_USD_RATE)
+        })
+        .unwrap_or_default()
+        .max(0.0);
+    (output_usd > 0.0).then_some(output_usd)
+}
+
+fn is_operator_output_edge(edge: &ValueFlowEdgePayload) -> bool {
+    match edge.channel.as_str() {
+        "mint_payment" => is_operator_output_recipient(edge),
+        "sale_payment" | "royalty_fee" => {
+            edge.recipient_known && is_operator_output_recipient(edge)
+        }
+        "exit_payment" => is_operator_output_sender(edge),
+        _ => false,
+    }
+}
+
+fn is_operator_output_recipient(edge: &ValueFlowEdgePayload) -> bool {
+    normalized_address(&edge.to_address) == normalized_contract(&edge.contract_address)
+        || is_operator_revenue_role(&edge.to_role)
+}
+
+fn is_operator_output_sender(edge: &ValueFlowEdgePayload) -> bool {
+    is_operator_revenue_role(&edge.from_role)
+}
+
+fn is_operator_revenue_role(role: &str) -> bool {
+    matches!(
+        role,
+        "attacker"
+            | "malicious"
+            | "operator_wallet"
+            | "contract_deployer"
+            | "contract_owner"
+            | "contract_admin"
+            | "proxy_admin"
+            | "mint_contract"
+    )
+}
+
+fn operator_output_edge_key(
+    contract: &str,
+    edge: &ValueFlowEdgePayload,
+    output_usd: f64,
+) -> (String, String) {
+    let edge_id = edge.edge_id.trim();
+    if !edge_id.is_empty() {
+        return (
+            contract.to_string(),
+            format!("edge:{}", edge_id.to_lowercase()),
+        );
+    }
+    let tx_hash = edge.tx_hash.trim();
+    if !tx_hash.is_empty() {
+        return (
+            contract.to_string(),
+            format!(
+                "tx:{}:{}:{}:{}:{:.6}",
+                edge.channel.trim().to_lowercase(),
+                tx_hash.to_lowercase(),
+                normalized_address(&edge.from_address),
+                normalized_address(&edge.to_address),
+                output_usd
+            ),
+        );
+    }
+    (
+        contract.to_string(),
+        format!(
+            "synthetic:{}:{}:{}:{:.6}",
+            edge.channel.trim().to_lowercase(),
+            normalized_address(&edge.from_address),
+            normalized_address(&edge.to_address),
+            output_usd
+        ),
+    )
+}
+
+fn build_output_input_ratio(
+    output_by_contract_usd: &BTreeMap<String, f64>,
+    input_by_contract_usd: &BTreeMap<String, f64>,
+) -> OutputInputRatioBuild {
+    let mut rows = output_by_contract_usd
+        .iter()
+        .filter_map(|(contract, output_usd)| {
+            let output_usd = output_usd.max(0.0);
+            if output_usd <= 0.0 {
+                return None;
+            }
+            let input_usd = input_by_contract_usd
+                .get(contract)
+                .copied()
+                .unwrap_or_default()
+                .max(0.0);
+            Some(PaperOutputInputRatioRowPayload {
+                contract_address: contract.clone(),
+                output_usd,
+                input_usd,
+                output_input_ratio: ratio_f64(output_usd, input_usd),
+                output_input_ratio_numerator: output_usd,
+                output_input_ratio_denominator: input_usd,
+            })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(compare_output_input_ratio_rows);
+
+    let total_output_usd = rows.iter().map(|row| row.output_usd).sum::<f64>();
+    let total_input_usd = rows.iter().map(|row| row.input_usd).sum::<f64>();
+    let ratio_denominator = rows.len() as i64;
+    let ratio_gte_one_count = rows
+        .iter()
+        .filter(|row| output_input_ratio_gte_one(row))
+        .count() as i64;
+    let ratio_lt_one_count = rows
+        .iter()
+        .filter(|row| output_input_ratio_lt_one(row))
+        .count() as i64;
+
+    OutputInputRatioBuild {
+        summary: PaperOutputInputSummaryPayload {
+            total_output_usd,
+            total_input_usd,
+            total_output_input_ratio: ratio_f64(total_output_usd, total_input_usd),
+            total_output_input_ratio_numerator: total_output_usd,
+            total_output_input_ratio_denominator: total_input_usd,
+            ratio_gte_one_count,
+            ratio_gte_one_ratio: ratio_i64(ratio_gte_one_count, ratio_denominator),
+            ratio_gte_one_ratio_numerator: ratio_gte_one_count,
+            ratio_gte_one_ratio_denominator: ratio_denominator,
+            ratio_lt_one_count,
+            ratio_lt_one_ratio: ratio_i64(ratio_lt_one_count, ratio_denominator),
+            ratio_lt_one_ratio_numerator: ratio_lt_one_count,
+            ratio_lt_one_ratio_denominator: ratio_denominator,
+        },
+        rows,
+    }
+}
+
+fn output_input_ratio_gte_one(row: &PaperOutputInputRatioRowPayload) -> bool {
+    row.output_usd > 0.0 && (row.input_usd <= 0.0 || row.output_usd >= row.input_usd)
+}
+
+fn output_input_ratio_lt_one(row: &PaperOutputInputRatioRowPayload) -> bool {
+    row.input_usd > 0.0 && row.output_usd < row.input_usd
+}
+
+fn compare_output_input_ratio_rows(
+    left: &PaperOutputInputRatioRowPayload,
+    right: &PaperOutputInputRatioRowPayload,
+) -> Ordering {
+    compare_f64_desc(
+        output_input_sort_ratio(left),
+        output_input_sort_ratio(right),
+    )
+    .then_with(|| compare_f64_desc(left.output_usd, right.output_usd))
+    .then_with(|| compare_f64_desc(left.input_usd, right.input_usd))
+    .then_with(|| left.contract_address.cmp(&right.contract_address))
+}
+
+fn output_input_sort_ratio(row: &PaperOutputInputRatioRowPayload) -> f64 {
+    row.output_input_ratio.unwrap_or_else(|| {
+        if row.output_usd > 0.0 {
+            f64::INFINITY
+        } else {
+            0.0
+        }
+    })
+}
+
+fn merge_attacker_cost_candidate(
+    candidates: &mut BTreeMap<(String, String), AttackerCostCandidate>,
+    key: (String, String),
+    mut candidate: AttackerCostCandidate,
+) {
+    if let Some(existing) = candidates.get_mut(&key) {
+        let gas_eth = existing.detail.gas_eth.max(candidate.detail.gas_eth);
+        let gas_usd = existing.detail.gas_usd.max(candidate.detail.gas_usd);
+        if attacker_cost_candidate_preferred(&candidate, existing) {
+            candidate.detail.gas_eth = gas_eth;
+            candidate.detail.gas_usd = gas_usd;
+            *existing = candidate;
+        } else {
+            existing.detail.gas_eth = gas_eth;
+            existing.detail.gas_usd = gas_usd;
+        }
+    } else {
+        candidates.insert(key, candidate);
+    }
+}
+
+fn attacker_cost_candidate_preferred(
+    candidate: &AttackerCostCandidate,
+    existing: &AttackerCostCandidate,
+) -> bool {
+    attacker_cost_stage_priority(candidate.stage)
+        .cmp(&attacker_cost_stage_priority(existing.stage))
+        .then_with(|| {
+            candidate
+                .detail
+                .gas_usd
+                .partial_cmp(&existing.detail.gas_usd)
+                .unwrap_or(Ordering::Equal)
+        })
+        .then_with(|| {
+            candidate
+                .detail
+                .gas_eth
+                .partial_cmp(&existing.detail.gas_eth)
+                .unwrap_or(Ordering::Equal)
+        })
+        == Ordering::Greater
+}
+
+fn attacker_cost_stage_priority(stage: AttackerCostStage) -> i32 {
+    match stage {
+        AttackerCostStage::Setup => 0,
+        AttackerCostStage::Lure => 1,
+        AttackerCostStage::Exit => 2,
+    }
+}
+
+fn attacker_cost_edge_key(
+    contract: &str,
+    edge: &ValueFlowEdgePayload,
+    stage: AttackerCostStage,
+    gas_eth: f64,
+    gas_usd: f64,
+) -> (String, String) {
+    let tx_hash = edge.tx_hash.trim();
+    if !tx_hash.is_empty() {
+        return (
+            contract.to_string(),
+            format!("tx:{}", tx_hash.to_lowercase()),
+        );
+    }
+    let edge_id = edge.edge_id.trim();
+    if !edge_id.is_empty() {
+        return (
+            contract.to_string(),
+            format!("edge:{}", edge_id.to_lowercase()),
+        );
+    }
+    (
+        contract.to_string(),
+        format!(
+            "synthetic:{}:{}:{}:{}:{}:{:.18}:{:.6}",
+            attacker_cost_stage_label(stage),
+            edge.channel.trim().to_lowercase(),
+            normalized_address(&edge.from_address),
+            normalized_address(&edge.to_address),
+            attacker_cost_payer(edge),
+            gas_eth,
+            gas_usd
+        ),
+    )
+}
+
+fn attacker_cost_candidate_from_detail(
+    detail: &PaperAttackerCostDetailPayload,
+) -> Option<((String, String), AttackerCostCandidate)> {
+    let stage = attacker_cost_stage_from_label(&detail.stage)?;
+    let contract = normalized_contract(&detail.contract_address);
+    let mut detail = detail.clone();
+    detail.contract_address = contract.clone();
+    detail.stage = attacker_cost_stage_label(stage).into();
+    detail.tx_hash = detail.tx_hash.trim().to_lowercase();
+    detail.gas_payer_address = normalized_address(&detail.gas_payer_address);
+    detail.gas_eth = detail.gas_eth.max(0.0);
+    detail.gas_usd = detail.gas_usd.max(0.0);
+    let key = attacker_cost_detail_key(&contract, &detail, stage);
+    Some((key, AttackerCostCandidate { stage, detail }))
+}
+
+fn attacker_cost_detail_key(
+    contract: &str,
+    detail: &PaperAttackerCostDetailPayload,
+    stage: AttackerCostStage,
+) -> (String, String) {
+    if !detail.tx_hash.trim().is_empty() {
+        return (
+            contract.to_string(),
+            format!("tx:{}", detail.tx_hash.trim().to_lowercase()),
+        );
+    }
+    (
+        contract.to_string(),
+        format!(
+            "detail:{}:{}:{}:{}:{}:{}:{:.18}:{:.6}",
+            attacker_cost_stage_label(stage),
+            detail.channel.trim().to_lowercase(),
+            detail.gas_payer_address.trim().to_lowercase(),
+            detail.from_role.trim().to_lowercase(),
+            detail.to_role.trim().to_lowercase(),
+            detail.evidence_type.trim().to_lowercase(),
+            detail.gas_eth,
+            detail.gas_usd
+        ),
+    )
+}
+
+fn attacker_cost_stage_from_label(stage: &str) -> Option<AttackerCostStage> {
+    let stage = stage.trim().to_lowercase();
+    match stage.as_str() {
+        "setup" => Some(AttackerCostStage::Setup),
+        "lure" => Some(AttackerCostStage::Lure),
+        "exit" => Some(AttackerCostStage::Exit),
+        _ => None,
+    }
 }
 
 fn attacker_cost_stage_label(stage: AttackerCostStage) -> &'static str {

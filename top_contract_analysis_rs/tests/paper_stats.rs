@@ -292,12 +292,15 @@ fn markdown_reports_use_contract_address_without_extra_chain_identifiers() {
     assert!(!batch_markdown.contains("contract_address"));
     assert!(!batch_markdown.contains("0xbuyer"));
     assert!(single_markdown.contains("## 合约行为明细"));
-    assert!(single_markdown.contains("contract"));
-    assert!(single_markdown.contains("| 0xcopy | 1 | 0 | 0 | 0 | 0 | 1 | 0 | 10 | 10 | 0 |"));
+    assert!(single_markdown.contains("### Match 合约 0xcopy"));
+    assert!(single_markdown.contains("#### Wash Trading"));
+    assert!(single_markdown.contains("| 0xcopy:wash:1 | 2 | n/a | n/a | 0 / 10 |"));
+    assert!(single_markdown.contains("#### 诚实买家"));
+    assert!(
+        single_markdown.contains("| 0xbuyer | 0 | 0 / 10 | Pump-and-Exit | n/a | 是 | 86400s |")
+    );
     assert!(!batch_markdown.contains("Impact USD"));
-    assert!(!single_markdown.contains("### 诚实买家"));
     assert!(!single_markdown.contains("### 诚实买家 Top"));
-    assert!(!single_markdown.contains("0xbuyer"));
     assert!(!batch_markdown.contains("chain_id"));
     assert!(!batch_markdown.contains("seed_contract_address"));
     assert!(!batch_markdown.contains("copy_contract_address"));
@@ -307,7 +310,7 @@ fn markdown_reports_use_contract_address_without_extra_chain_identifiers() {
 }
 
 #[test]
-fn single_markdown_aggregates_honest_buyers_without_address_rows() {
+fn single_markdown_lists_attributed_honest_buyers_per_match_contract() {
     let paper_stats = PaperStatsPayload {
         contract_behavior_stats: vec![PaperContractBehaviorStatsPayload {
             contract_address: "0xcopy".into(),
@@ -338,9 +341,10 @@ fn single_markdown_aggregates_honest_buyers_without_address_rows() {
     });
 
     assert!(markdown.contains("## 合约行为明细"));
-    assert!(markdown.contains("| 0xcopy | 0 | 0 | 0 | 0 | 0 | 2 | 0 | 150 | 0 | 0 |"));
-    assert!(!markdown.contains("### 诚实买家"));
-    assert!(!markdown.contains("0xlinked"));
+    assert!(markdown.contains("### Match 合约 0xcopy"));
+    assert!(markdown.contains("#### 诚实买家"));
+    assert!(markdown.contains("| 0xlinked | 0 | 0 / 50 | Pump-and-Exit | n/a | 是 | n/a |"));
+    assert!(markdown.contains("0xlinked"));
     assert!(!markdown.contains("0xunattributed"));
     assert!(!markdown.contains("unattributed_sale"));
 }
@@ -706,11 +710,12 @@ fn paper_stats_summarizes_wash_cycle_node_size_distribution() {
     assert!(markdown.contains("## Wash Cycle 节点规模"));
     assert!(markdown.contains("| 节点数 | 循环数 | 循环占比 |"));
     assert!(markdown.contains("| 5+ | 2 | 40.00% (2/5) |"));
-    assert!(markdown.contains("## Wash Cycle 节点规模（按合约）"));
-    assert!(markdown.contains("| contract | 2 nodes | 3 nodes | 4 nodes | 5+ nodes | Total |"));
-    assert!(markdown
-        .contains("| 0xcyclesizes | 1 (20.00%) | 1 (20.00%) | 1 (20.00%) | 2 (40.00%) | 5 |"));
-    assert!(markdown.contains("| 0xemptycycles | 0 (n/a) | 0 (n/a) | 0 (n/a) | 0 (n/a) | 0 |"));
+    assert!(markdown.contains("### Match 合约 0xcyclesizes"));
+    assert!(markdown.contains("#### Wash Cycle 节点规模"));
+    assert!(markdown.contains("| 2 | 1 | 20.00% (1/5) |"));
+    assert!(markdown.contains("| 5+ | 2 | 40.00% (2/5) |"));
+    assert!(markdown.contains("### Match 合约 0xemptycycles"));
+    assert!(markdown.contains("- 无可展示行为明细"));
 }
 
 #[test]
@@ -1189,6 +1194,97 @@ fn attacker_cost_counts_all_stages_from_malicious_gas_and_deduplicates_transacti
 }
 
 #[test]
+fn attacker_cost_counts_same_transaction_gas_once_across_stages() {
+    let value_flow_edges = vec![
+        ValueFlowEdgePayload {
+            contract_address: "0xdup".into(),
+            from_address: "0xfunder".into(),
+            gas_payer_address: "0xminter".into(),
+            tx_hash: "0xmint".into(),
+            channel: "funding".into(),
+            from_role: "external_funder".into(),
+            gas_eth: Some(0.002),
+            gas_usd: Some(4.0),
+            ..ValueFlowEdgePayload::default()
+        },
+        ValueFlowEdgePayload {
+            contract_address: "0xdup".into(),
+            from_address: "0xminter".into(),
+            gas_payer_address: "0xminter".into(),
+            tx_hash: "0xmint".into(),
+            channel: "mint_payment".into(),
+            from_role: "paid_minter".into(),
+            gas_eth: Some(0.002),
+            gas_usd: Some(4.0),
+            ..ValueFlowEdgePayload::default()
+        },
+    ];
+
+    let stats = build_paper_stats(PaperStatsInput {
+        config: PaperStatsConfig::default(),
+        seed_collection_stats: &SeedCollectionStatsPayload::default(),
+        duplicate_candidates: &[],
+        duplicate_contracts: &[],
+        legit_duplicates: &[],
+        infringing_tokens: &[],
+        malicious_addresses: &[MaliciousAddressPayload {
+            address: "0xminter".into(),
+            ..MaliciousAddressPayload::default()
+        }],
+        victim_acquisition_addresses: &[],
+        value_flow_edges: &value_flow_edges,
+        nft_propagation_paths: &Default::default(),
+    });
+
+    assert_eq!(stats.attacker_cost.setup_gas_usd, 0.0);
+    assert_eq!(stats.attacker_cost.lure_gas_usd, 4.0);
+    assert_eq!(stats.attacker_cost.total_gas_usd, 4.0);
+    assert_eq!(stats.attacker_cost_details.len(), 1);
+    assert_eq!(stats.attacker_cost_details[0].stage, "lure");
+    assert_eq!(stats.attacker_cost_details[0].channel, "mint_payment");
+}
+
+#[test]
+fn paper_stats_merge_deduplicates_attacker_cost_details_by_contract_transaction() {
+    let first = paper_stats_for_attacker_gas_transaction("0xdup", "0xattacker", "0xgas", 5.0);
+    let second = paper_stats_for_attacker_gas_transaction("0xdup", "0xattacker", "0xgas", 5.0);
+
+    let merged = merge_paper_stats([&first, &second], PaperStatsConfig::default());
+
+    assert_eq!(merged.attacker_cost.lure_gas_usd, 5.0);
+    assert_eq!(merged.attacker_cost.total_gas_usd, 5.0);
+    assert_eq!(
+        merged.attacker_cost_by_contract_usd.get("0xdup"),
+        Some(&5.0)
+    );
+    assert_eq!(merged.attacker_cost_details.len(), 1);
+    assert_eq!(merged.attacker_cost_details[0].tx_hash, "0xgas");
+}
+
+#[test]
+fn paper_stats_merge_deduplicates_current_attacker_cost_when_legacy_cost_has_no_details() {
+    let first = paper_stats_for_attacker_gas_transaction("0xdup", "0xattacker", "0xgas", 5.0);
+    let second = paper_stats_for_attacker_gas_transaction("0xdup", "0xattacker", "0xgas", 5.0);
+    let legacy = legacy_attacker_cost_without_details("0xlegacy", 2.0);
+
+    let merged = merge_paper_stats([&first, &second, &legacy], PaperStatsConfig::default());
+
+    assert_eq!(merged.attacker_cost.setup_gas_usd, 2.0);
+    assert_eq!(merged.attacker_cost.lure_gas_usd, 5.0);
+    assert_eq!(merged.attacker_cost.total_gas_usd, 7.0);
+    assert_eq!(
+        merged.attacker_cost_by_contract_usd.get("0xdup"),
+        Some(&5.0)
+    );
+    assert_eq!(
+        merged.attacker_cost_by_contract_usd.get("0xlegacy"),
+        Some(&2.0)
+    );
+    assert_eq!(merged.attacker_cost_details.len(), 1);
+    assert_eq!(merged.attacker_cost_details[0].tx_hash, "0xgas");
+}
+
+#[test]
 fn attacker_cost_does_not_count_gas_payer_without_attacker_evidence() {
     let value_flow_edges = vec![
         ValueFlowEdgePayload {
@@ -1268,6 +1364,80 @@ fn attacker_cost_does_not_count_deployment_without_operator_evidence() {
     assert_eq!(stats.attacker_cost.total_gas_eth, 0.0);
     assert_eq!(stats.attacker_cost.total_gas_usd, 0.0);
     assert!(stats.attacker_cost_details.is_empty());
+}
+
+#[test]
+fn paper_stats_builds_output_input_ratio_rows_and_skips_zero_output_contracts() {
+    let stats = build_output_input_ratio_stats();
+
+    assert_eq!(stats.output_input_ratio_by_contract.len(), 2);
+    let profit = stats
+        .output_input_ratio_by_contract
+        .iter()
+        .find(|row| row.contract_address == "0xprofit")
+        .expect("profit contract ratio row");
+    assert_eq!(profit.output_usd, 100.0);
+    assert_eq!(profit.input_usd, 25.0);
+    assert_eq!(profit.output_input_ratio, Some(4.0));
+    assert_eq!(profit.output_input_ratio_numerator, 100.0);
+    assert_eq!(profit.output_input_ratio_denominator, 25.0);
+
+    let loss = stats
+        .output_input_ratio_by_contract
+        .iter()
+        .find(|row| row.contract_address == "0xloss")
+        .expect("loss contract ratio row");
+    assert_eq!(loss.output_usd, 10.0);
+    assert_eq!(loss.input_usd, 20.0);
+    assert_eq!(loss.output_input_ratio, Some(0.5));
+
+    assert!(!stats
+        .output_input_ratio_by_contract
+        .iter()
+        .any(|row| row.contract_address == "0xzero"));
+    assert_eq!(stats.output_input_summary.total_output_usd, 110.0);
+    assert_eq!(stats.output_input_summary.total_input_usd, 45.0);
+    assert_eq!(
+        stats.output_input_summary.total_output_input_ratio,
+        Some(110.0 / 45.0)
+    );
+    assert_eq!(stats.output_input_summary.ratio_gte_one_count, 1);
+    assert_eq!(stats.output_input_summary.ratio_gte_one_ratio, Some(0.5));
+    assert_eq!(stats.output_input_summary.ratio_lt_one_count, 1);
+    assert_eq!(stats.output_input_summary.ratio_lt_one_ratio, Some(0.5));
+}
+
+#[test]
+fn paper_stats_merge_recomputes_output_input_ratio_summary() {
+    let first = output_input_ratio_stats_for_contract("0xprofit", 100.0, 25.0);
+    let second = output_input_ratio_stats_for_contract("0xloss", 10.0, 20.0);
+    let zero_output = output_input_ratio_stats_for_contract("0xzero", 0.0, 40.0);
+
+    let merged = merge_paper_stats([&first, &second, &zero_output], PaperStatsConfig::default());
+
+    assert_eq!(merged.output_input_ratio_by_contract.len(), 2);
+    assert!(merged
+        .output_input_ratio_by_contract
+        .iter()
+        .any(|row| row.contract_address == "0xprofit" && row.output_input_ratio == Some(4.0)));
+    assert!(merged
+        .output_input_ratio_by_contract
+        .iter()
+        .any(|row| row.contract_address == "0xloss" && row.output_input_ratio == Some(0.5)));
+    assert!(!merged
+        .output_input_ratio_by_contract
+        .iter()
+        .any(|row| row.contract_address == "0xzero"));
+    assert_eq!(merged.output_input_summary.total_output_usd, 110.0);
+    assert_eq!(merged.output_input_summary.total_input_usd, 45.0);
+    assert_eq!(
+        merged.output_input_summary.total_output_input_ratio,
+        Some(110.0 / 45.0)
+    );
+    assert_eq!(merged.output_input_summary.ratio_gte_one_count, 1);
+    assert_eq!(merged.output_input_summary.ratio_gte_one_ratio, Some(0.5));
+    assert_eq!(merged.output_input_summary.ratio_lt_one_count, 1);
+    assert_eq!(merged.output_input_summary.ratio_lt_one_ratio, Some(0.5));
 }
 
 #[test]
@@ -1441,12 +1611,13 @@ fn markdown_places_large_tables_last_and_sorts_by_key_metrics() {
 
     assert!(markdown.find("## 数据质量").unwrap() < markdown.find("## 合约行为明细").unwrap());
     assert!(
-        markdown.find("| 0xhigh |").unwrap() < markdown.find("| 0xlow |").unwrap(),
-        "contract behavior rows should be sorted by descending internal sort score"
+        markdown.find("### Match 合约 0xhigh").unwrap()
+            < markdown.find("### Match 合约 0xlow").unwrap(),
+        "match contract groups should be sorted by descending internal sort score"
     );
     assert!(!markdown.contains("Impact USD"));
-    assert!(!markdown.contains("0xbigbuyer"));
-    assert!(!markdown.contains("0xsmallbuyer"));
+    assert!(markdown.contains("0xbigbuyer"));
+    assert!(markdown.contains("0xsmallbuyer"));
 }
 
 #[test]
@@ -1532,17 +1703,23 @@ fn markdown_contract_behavior_details_include_experiment_rows() {
         ..SingleReportPayload::default()
     });
 
-    assert!(markdown.contains(
-        "| contract | Wash | Pump-Exit | Star | Layered | Inventory | Honest buyers | Fake NFT | Paid USD | Behavior value USD | Linked loss USD |"
-    ));
-    assert!(markdown.contains("| 0xcopy | 1 | 1 | 1 | 1 | 1 | 1 | 2 | 1400 | 5000 | 2000 |"));
-    assert!(!markdown.contains("wash1"));
-    assert!(!markdown.contains("pump1"));
-    assert!(!markdown.contains("path1"));
-    assert!(!markdown.contains("0xhub"));
-    assert!(!markdown.contains("0xbuyer"));
+    assert!(markdown.contains("### Match 合约 0xcopy"));
+    assert!(markdown.contains("#### Wash Trading"));
+    assert!(markdown.contains("| wash1 | 3 | 0.4 | 12 | 1.2 / 2400 |"));
+    assert!(markdown.contains("#### Pump-and-Exit"));
+    assert!(markdown.contains("| pump1 | 60s | 1.5x (300/200) | 50.00% (1/2) | 2 | 1 / 2000 |"));
+    assert!(markdown.contains("#### 星型行为"));
+    assert!(
+        markdown.contains("| Sybil Distribution | 1 | 6 | 7 | 4 | 3 (6/2) | 120s | 0.6 / 1200 |")
+    );
+    assert!(markdown.contains("#### Layered Transfer"));
+    assert!(markdown.contains("| path1 | 2 | 4 | 5 | 2 | 3600s | 0.4 / 800 |"));
+    assert!(markdown.contains("#### Inventory Concentration"));
+    assert!(markdown
+        .contains("| 0xhub | 4 | 9 | 25.00% (5/20) | 0.3 / 600 | 40.00% (600/1500) | 7200s |"));
+    assert!(markdown.contains("#### 诚实买家"));
+    assert!(markdown.contains("| 0xbuyer | 2 | 0.7 / 1400 | Pump-and-Exit | 900s | 是 | 86400s |"));
     assert!(!markdown.contains("hub_address"));
-    assert!(!markdown.contains("buyer |"));
 }
 
 #[test]
@@ -2559,6 +2736,149 @@ fn paper_stats_for_contract_loss_and_cost(
         }],
         nft_propagation_paths: &BTreeMap::from([(contract.into(), path)]),
     })
+}
+
+fn paper_stats_for_attacker_gas_transaction(
+    contract: &str,
+    malicious: &str,
+    tx_hash: &str,
+    gas_usd: f64,
+) -> PaperStatsPayload {
+    build_paper_stats(PaperStatsInput {
+        config: PaperStatsConfig::default(),
+        seed_collection_stats: &SeedCollectionStatsPayload::default(),
+        duplicate_candidates: &[],
+        duplicate_contracts: &[],
+        legit_duplicates: &[],
+        infringing_tokens: &[],
+        malicious_addresses: &[MaliciousAddressPayload {
+            address: malicious.into(),
+            ..MaliciousAddressPayload::default()
+        }],
+        victim_acquisition_addresses: &[],
+        value_flow_edges: &[ValueFlowEdgePayload {
+            contract_address: contract.into(),
+            from_address: malicious.into(),
+            gas_payer_address: malicious.into(),
+            tx_hash: tx_hash.into(),
+            channel: "mint_payment".into(),
+            from_role: "paid_minter".into(),
+            gas_usd: Some(gas_usd),
+            ..ValueFlowEdgePayload::default()
+        }],
+        nft_propagation_paths: &BTreeMap::new(),
+    })
+}
+
+fn build_output_input_ratio_stats() -> PaperStatsPayload {
+    let contracts = [
+        duplicate_contract("0xprofit", 1),
+        duplicate_contract("0xloss", 1),
+        duplicate_contract("0xzero", 1),
+    ];
+    let value_flow_edges = vec![
+        operator_output_edge("0xprofit", "0xprofit_mint", 100.0),
+        attacker_input_edge("0xprofit", "0xprofit_deploy", 25.0),
+        operator_output_edge("0xloss", "0xloss_mint", 10.0),
+        attacker_input_edge("0xloss", "0xloss_deploy", 20.0),
+        operator_output_edge("0xzero", "0xzero_mint", 0.0),
+        attacker_input_edge("0xzero", "0xzero_deploy", 40.0),
+    ];
+
+    build_paper_stats(PaperStatsInput {
+        config: PaperStatsConfig::default(),
+        seed_collection_stats: &SeedCollectionStatsPayload::default(),
+        duplicate_candidates: &[],
+        duplicate_contracts: &contracts,
+        legit_duplicates: &[],
+        infringing_tokens: &[],
+        malicious_addresses: &[],
+        victim_acquisition_addresses: &[],
+        value_flow_edges: &value_flow_edges,
+        nft_propagation_paths: &BTreeMap::new(),
+    })
+}
+
+fn output_input_ratio_stats_for_contract(
+    contract: &str,
+    output_usd: f64,
+    input_usd: f64,
+) -> PaperStatsPayload {
+    let contracts = [duplicate_contract(contract, 1)];
+    let value_flow_edges = vec![
+        operator_output_edge(contract, &format!("{contract}_mint"), output_usd),
+        attacker_input_edge(contract, &format!("{contract}_deploy"), input_usd),
+    ];
+
+    build_paper_stats(PaperStatsInput {
+        config: PaperStatsConfig::default(),
+        seed_collection_stats: &SeedCollectionStatsPayload::default(),
+        duplicate_candidates: &[],
+        duplicate_contracts: &contracts,
+        legit_duplicates: &[],
+        infringing_tokens: &[],
+        malicious_addresses: &[],
+        victim_acquisition_addresses: &[],
+        value_flow_edges: &value_flow_edges,
+        nft_propagation_paths: &BTreeMap::new(),
+    })
+}
+
+fn operator_output_edge(contract: &str, tx_hash: &str, output_usd: f64) -> ValueFlowEdgePayload {
+    ValueFlowEdgePayload {
+        edge_id: format!("value:mint_payment:{tx_hash}:0xbuyer:{contract}"),
+        contract_address: contract.into(),
+        from_address: "0xbuyer".into(),
+        to_address: contract.into(),
+        tx_hash: tx_hash.into(),
+        value_usd: Some(output_usd),
+        channel: "mint_payment".into(),
+        from_role: "paid_minter".into(),
+        to_role: "mint_contract".into(),
+        recipient_known: true,
+        ..ValueFlowEdgePayload::default()
+    }
+}
+
+fn attacker_input_edge(contract: &str, tx_hash: &str, gas_usd: f64) -> ValueFlowEdgePayload {
+    ValueFlowEdgePayload {
+        edge_id: format!("value:contract_deploy:{contract}:{tx_hash}"),
+        contract_address: contract.into(),
+        from_address: "0xoperator".into(),
+        to_address: contract.into(),
+        tx_hash: tx_hash.into(),
+        gas_payer_address: "0xoperator".into(),
+        gas_usd: Some(gas_usd),
+        channel: "contract_deploy".into(),
+        from_role: "contract_deployer".into(),
+        to_role: "mint_contract".into(),
+        ..ValueFlowEdgePayload::default()
+    }
+}
+
+fn duplicate_contract(contract: &str, candidate_count: i64) -> DuplicateContractPayload {
+    DuplicateContractPayload {
+        contract_address: contract.into(),
+        candidate_count,
+        match_reasons: vec!["metadata_match".into()],
+        ..DuplicateContractPayload::default()
+    }
+}
+
+fn legacy_attacker_cost_without_details(contract: &str, gas_usd: f64) -> PaperStatsPayload {
+    PaperStatsPayload {
+        attacker_cost: top_contract_analysis_rs::models::PaperAttackerCostPayload {
+            setup_gas_usd: gas_usd,
+            total_gas_usd: gas_usd,
+            top_contract_contribution_numerator: gas_usd,
+            top_contract_contribution_denominator: gas_usd,
+            top_contract_contribution_ratio: Some(1.0),
+            ..top_contract_analysis_rs::models::PaperAttackerCostPayload::default()
+        },
+        attacker_cost_by_contract_usd: BTreeMap::from([(contract.into(), gas_usd)]),
+        attacker_cost_details: vec![],
+        ..PaperStatsPayload::default()
+    }
 }
 
 fn propagation_edge(

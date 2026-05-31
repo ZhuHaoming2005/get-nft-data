@@ -146,6 +146,7 @@ async fn build_candidate_plan_for_prepared_seed(
     let metadata_threshold = request.metadata_threshold;
     let max_tokens_per_contract = request.max_tokens_per_contract;
     let max_recall_rows = request.max_recall_rows;
+    seed_progress.on_seed_stage("load_snapshot").await;
     let _permit = acquire_optional_limit(&Some(cpu_limit)).await?;
     let snapshot = tokio::task::spawn_blocking(move || {
         feature_store.load_snapshot(
@@ -159,7 +160,15 @@ async fn build_candidate_plan_for_prepared_seed(
     })
     .await
     .map_err(|err| AppError::InvalidData(format!("candidate CPU task failed: {err}")))??;
-    let plan = build_candidate_plan_from_snapshot(&request, &dedup_seed_nfts, snapshot);
+    seed_progress
+        .on_seed_stage("find_duplicate_candidates")
+        .await;
+    let (request, plan) = tokio::task::spawn_blocking(move || {
+        let plan = build_candidate_plan_from_snapshot(&request, &dedup_seed_nfts, snapshot);
+        (request, plan)
+    })
+    .await
+    .map_err(|err| AppError::InvalidData(format!("candidate CPU task failed: {err}")))?;
     Ok(PreparedSeedPlan {
         seed_address,
         request,
@@ -205,10 +214,13 @@ pub async fn run_batch(
         .saturating_add(request.matched_contract_max_concurrency.max(1))
         .min(pending_seed_count)
         .max(1);
-    let mut context_tasks = stream::iter(pending_seeds.into_iter().map(|seed_address| {
+    let mut seed_tasks = stream::iter(pending_seeds.into_iter().map(|seed_address| {
         let per_seed_request = analyze_request_for_batch_seed(&request, seed_address.clone());
         let deps = deps.clone();
         let seed_network_limit = seed_network_limit.clone();
+        let cpu_limit = cpu_limit.clone();
+        let matched_contract_limit = matched_contract_limit.clone();
+        let output_dir = output_dir.clone();
         async move {
             let batch_progress = deps.batch_progress.clone();
             let seed_progress = batch_progress.create_seed_reporter(&seed_address);
@@ -223,149 +235,27 @@ pub async fn run_batch(
                     }
                 }
             };
-            Ok(PreparedSeedContext {
+            let prepared_context = PreparedSeedContext {
                 seed_address,
                 request: per_seed_request,
                 context,
                 seed_progress,
-            })
-        }
-    }))
-    .buffer_unordered(seed_network_max_concurrency);
-
-    let mut prepared_contexts = Vec::new();
-    while let Some(entry) = context_tasks.next().await {
-        match entry {
-            Ok(prepared) => prepared_contexts.push(prepared),
-            Err(err) => {
-                if first_error.is_none() {
-                    first_error = Some(err);
-                }
-            }
-        }
-    }
-
-    let prepared_plans = if prepared_contexts.is_empty() {
-        Vec::new()
-    } else {
-        let batch_feature_store = deps.feature_store.clone();
-        let chain = request.chain.clone();
-        let name_threshold = request.name_threshold;
-        let metadata_threshold = request.metadata_threshold;
-        let max_tokens_per_contract = request.max_tokens_per_contract;
-        let max_recall_rows = request.max_recall_rows;
-        let mut dedup_seed_nfts_by_seed = BTreeMap::new();
-        let seeds = prepared_contexts
-            .iter()
-            .map(|prepared| {
-                let dedup_seed_nfts = seed_nfts_for_duplicate_matching(
-                    &prepared.context.seed_nfts,
-                    &prepared.context.seed_contract,
-                );
-                dedup_seed_nfts_by_seed
-                    .insert(prepared.seed_address.clone(), dedup_seed_nfts.clone());
-                (prepared.seed_address.clone(), dedup_seed_nfts)
-            })
-            .collect::<Vec<_>>();
-        let result = {
-            let _permit = acquire_optional_limit(&Some(cpu_limit.clone())).await?;
-            tokio::task::spawn_blocking(move || {
-                batch_feature_store.load_snapshots(
-                    &chain,
-                    &seeds,
-                    name_threshold,
-                    metadata_threshold,
-                    max_tokens_per_contract,
-                    max_recall_rows,
-                )
-            })
+            };
+            let seed_address = prepared_context.seed_address.clone();
+            let prepared = match build_candidate_plan_for_prepared_seed(
+                prepared_context,
+                deps.feature_store.clone(),
+                cpu_limit,
+            )
             .await
-            .map_err(|err| {
-                AppError::InvalidData(format!("batched snapshot CPU task failed: {err}"))
-            })
-            .and_then(|result| result)
-        };
-        match result {
-            Ok(mut snapshots) => {
-                let mut prepared_plans = Vec::with_capacity(prepared_contexts.len());
-                for prepared in prepared_contexts {
-                    let snapshot = snapshots.remove(&prepared.seed_address).ok_or_else(|| {
-                        AppError::InvalidData(format!(
-                            "feature store did not return a snapshot for seed {}",
-                            prepared.seed_address
-                        ))
-                    })?;
-                    let dedup_seed_nfts = dedup_seed_nfts_by_seed
-                        .remove(&prepared.seed_address)
-                        .ok_or_else(|| {
-                            AppError::InvalidData(format!(
-                                "missing deduplicated seed NFTs for seed {}",
-                                prepared.seed_address
-                            ))
-                        })?;
-                    let plan = build_candidate_plan_from_snapshot(
-                        &prepared.request,
-                        &dedup_seed_nfts,
-                        snapshot,
-                    );
-                    prepared_plans.push(PreparedSeedPlan {
-                        seed_address: prepared.seed_address,
-                        request: prepared.request,
-                        context: prepared.context,
-                        plan,
-                        seed_progress: prepared.seed_progress,
-                    });
+            {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    batch_progress.on_seed_failed(&seed_address, &err.to_string());
+                    return Err(err);
                 }
-                prepared_plans
-            }
-            Err(err) => {
-                eprintln!(
-                    "warning: batched snapshot load failed: {err}; falling back to per-seed snapshot loads"
-                );
-                let mut fallback_tasks =
-                    stream::iter(prepared_contexts.into_iter().map(|prepared| {
-                        let seed_address = prepared.seed_address.clone();
-                        let feature_store = deps.feature_store.clone();
-                        let cpu_limit = cpu_limit.clone();
-                        async move {
-                            let result = build_candidate_plan_for_prepared_seed(
-                                prepared,
-                                feature_store,
-                                cpu_limit,
-                            )
-                            .await;
-                            (seed_address, result)
-                        }
-                    }))
-                    .buffer_unordered(seed_cpu_max_concurrency);
-                let mut prepared_plans = Vec::new();
-                while let Some((seed_address, result)) = fallback_tasks.next().await {
-                    match result {
-                        Ok(prepared_plan) => prepared_plans.push(prepared_plan),
-                        Err(err) => {
-                            deps.batch_progress
-                                .on_seed_failed(&seed_address, &err.to_string());
-                            if first_error.is_none() {
-                                first_error = Some(err);
-                            }
-                        }
-                    }
-                }
-                prepared_plans
-            }
-        }
-    };
-
-    let mut seed_tasks = stream::iter(prepared_plans.into_iter().map(|prepared| {
-        let deps = deps.clone();
-        let matched_contract_limit = matched_contract_limit.clone();
-        let output_dir = output_dir.clone();
-        async move {
-            let batch_progress = deps.batch_progress.clone();
-            let seed_progress = prepared.seed_progress;
-            seed_progress
-                .on_seed_stage("find_duplicate_candidates")
-                .await;
+            };
+            let seed_progress = prepared.seed_progress.clone();
             let state = prepare_seed_analysis_state(
                 prepared.request,
                 &deps,

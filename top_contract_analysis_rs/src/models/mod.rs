@@ -932,6 +932,33 @@ pub struct PaperHonestLossPayload {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PaperOutputInputRatioRowPayload {
+    pub contract_address: String,
+    pub output_usd: f64,
+    pub input_usd: f64,
+    pub output_input_ratio: Option<f64>,
+    pub output_input_ratio_numerator: f64,
+    pub output_input_ratio_denominator: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PaperOutputInputSummaryPayload {
+    pub total_output_usd: f64,
+    pub total_input_usd: f64,
+    pub total_output_input_ratio: Option<f64>,
+    pub total_output_input_ratio_numerator: f64,
+    pub total_output_input_ratio_denominator: f64,
+    pub ratio_gte_one_count: i64,
+    pub ratio_gte_one_ratio: Option<f64>,
+    pub ratio_gte_one_ratio_numerator: i64,
+    pub ratio_gte_one_ratio_denominator: i64,
+    pub ratio_lt_one_count: i64,
+    pub ratio_lt_one_ratio: Option<f64>,
+    pub ratio_lt_one_ratio_numerator: i64,
+    pub ratio_lt_one_ratio_denominator: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct PaperDataQualityPayload {
     #[serde(default)]
     pub representative_candidate_count: i64,
@@ -962,6 +989,10 @@ pub struct PaperStatsPayload {
     pub attacker_cost: PaperAttackerCostPayload,
     pub attacker_cost_details: Vec<PaperAttackerCostDetailPayload>,
     pub honest_loss: PaperHonestLossPayload,
+    #[serde(default)]
+    pub output_input_summary: PaperOutputInputSummaryPayload,
+    #[serde(default)]
+    pub output_input_ratio_by_contract: Vec<PaperOutputInputRatioRowPayload>,
     pub data_quality: PaperDataQualityPayload,
     #[serde(default)]
     pub malicious_addresses: Vec<String>,
@@ -971,6 +1002,8 @@ pub struct PaperStatsPayload {
     pub repeat_infringing_malicious_addresses: Vec<String>,
     #[serde(default)]
     pub attacker_cost_by_contract_usd: BTreeMap<String, f64>,
+    #[serde(default)]
+    pub operator_output_by_contract_usd: BTreeMap<String, f64>,
     #[serde(default)]
     pub honest_loss_by_contract_usd: BTreeMap<String, f64>,
     #[serde(default)]
