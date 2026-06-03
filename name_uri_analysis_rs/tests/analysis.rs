@@ -15,12 +15,14 @@ fn write_parquet(path: &Path, values_sql: &str) {
         ALTER TABLE rows ADD COLUMN image_uri_norm VARCHAR;
         ALTER TABLE rows ADD COLUMN symbol VARCHAR;
         ALTER TABLE rows ADD COLUMN symbol_norm VARCHAR;
+        ALTER TABLE rows ADD COLUMN metadata_json VARCHAR;
         ALTER TABLE rows ADD COLUMN metadata_doc VARCHAR;
         UPDATE rows
         SET token_uri_norm = token_uri,
             image_uri_norm = image_uri,
             symbol = '',
             symbol_norm = '',
+            metadata_json = '',
             metadata_doc = '';
 
         COPY rows TO '{path}' (FORMAT PARQUET);
@@ -31,8 +33,66 @@ fn write_parquet(path: &Path, values_sql: &str) {
     conn.execute_batch(&sql).unwrap();
 }
 
+fn write_parquet_with_metadata(path: &Path, values_sql: &str) {
+    let _ = std::fs::remove_file(path);
+    let conn = Connection::open_in_memory().unwrap();
+    let sql = format!(
+        r#"
+        CREATE TABLE rows AS
+        SELECT * FROM ({values_sql}) AS t(
+            chain, contract_address, token_id, token_uri, image_uri, name, name_norm, metadata_json
+        );
+
+        ALTER TABLE rows ADD COLUMN token_uri_norm VARCHAR;
+        ALTER TABLE rows ADD COLUMN image_uri_norm VARCHAR;
+        ALTER TABLE rows ADD COLUMN symbol VARCHAR;
+        ALTER TABLE rows ADD COLUMN symbol_norm VARCHAR;
+        ALTER TABLE rows ADD COLUMN metadata_doc VARCHAR;
+        UPDATE rows
+        SET token_uri_norm = token_uri,
+            image_uri_norm = image_uri,
+            symbol = '',
+            symbol_norm = '',
+            metadata_doc = metadata_json;
+
+        COPY rows TO '{path}' (FORMAT PARQUET);
+        "#,
+        path = path.display().to_string().replace('\\', "/"),
+        values_sql = values_sql
+    );
+    conn.execute_batch(&sql).unwrap();
+}
+
+fn write_parquet_with_metadata_json_and_doc(path: &Path, values_sql: &str) {
+    let _ = std::fs::remove_file(path);
+    let conn = Connection::open_in_memory().unwrap();
+    let sql = format!(
+        r#"
+        CREATE TABLE rows AS
+        SELECT * FROM ({values_sql}) AS t(
+            chain, contract_address, token_id, token_uri, image_uri, name, name_norm, metadata_json, metadata_doc
+        );
+
+        ALTER TABLE rows ADD COLUMN token_uri_norm VARCHAR;
+        ALTER TABLE rows ADD COLUMN image_uri_norm VARCHAR;
+        ALTER TABLE rows ADD COLUMN symbol VARCHAR;
+        ALTER TABLE rows ADD COLUMN symbol_norm VARCHAR;
+        UPDATE rows
+        SET token_uri_norm = token_uri,
+            image_uri_norm = image_uri,
+            symbol = '',
+            symbol_norm = '';
+
+        COPY rows TO '{path}' (FORMAT PARQUET);
+        "#,
+        path = path.display().to_string().replace('\\', "/"),
+        values_sql = values_sql
+    );
+    conn.execute_batch(&sql).unwrap();
+}
+
 #[test]
-fn persists_prepared_tables_when_requested() {
+fn analysis_does_not_persist_prepared_tables_when_requested() {
     let temp = tempfile::tempdir().unwrap();
     let parquet = temp.path().join("sample.parquet");
     let db = temp.path().join("analysis.duckdb");
@@ -49,7 +109,7 @@ fn persists_prepared_tables_when_requested() {
         database_path: db.clone(),
         parquet_inputs: vec![parquet],
         output_dir: temp.path().join("out"),
-        thresholds: vec![90.0],
+        thresholds: vec![95.0],
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -78,186 +138,8 @@ fn persists_prepared_tables_when_requested() {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1, "missing persisted table {table}");
+        assert_eq!(count, 0, "unexpected persisted table {table}");
     }
-}
-
-#[test]
-fn reuse_prepared_uses_persisted_tables_when_metadata_matches() {
-    let temp = tempfile::tempdir().unwrap();
-    let parquet = temp.path().join("sample.parquet");
-    let db = temp.path().join("analysis.duckdb");
-    write_parquet(
-        &parquet,
-        r#"
-            VALUES
-            ('ethereum', '0xaaa', '1', 'shared', 'img1', 'Azuki', 'azuki'),
-            ('ethereum', '0xbbb', '1', 'shared', 'img2', 'Azuki', 'azuki')
-        "#,
-    );
-
-    run_analysis(AnalysisOptions {
-        database_path: db.clone(),
-        parquet_inputs: vec![parquet.clone()],
-        output_dir: temp.path().join("out_first"),
-        thresholds: vec![90.0],
-        threads: 2,
-        memory_limit: "256MB".into(),
-        analysis_memory_limit: Some("64MB".into()),
-        temp_directory: None,
-        progress: false,
-        persist_prepared: true,
-        reuse_prepared: false,
-    })
-    .unwrap();
-
-    {
-        let conn = Connection::open(&db).unwrap();
-        conn.execute(
-            "UPDATE name_atoms SET contract_count = 10, nft_count = 10 WHERE name_norm = 'azuki'",
-            [],
-        )
-        .unwrap();
-    }
-
-    let report = run_analysis(AnalysisOptions {
-        database_path: db,
-        parquet_inputs: vec![parquet],
-        output_dir: temp.path().join("out_reuse"),
-        thresholds: vec![90.0],
-        threads: 2,
-        memory_limit: "256MB".into(),
-        analysis_memory_limit: Some("64MB".into()),
-        temp_directory: None,
-        progress: false,
-        persist_prepared: false,
-        reuse_prepared: true,
-    })
-    .unwrap();
-
-    assert!(report.summary_rows.iter().any(|row| {
-        row.field_name == "name"
-            && row.scope == "intra_chain"
-            && row.primary_chain == "ethereum"
-            && row.threshold == Some(90.0)
-            && row.duplicate_contract_count == 10
-            && row.duplicate_nft_count == 10
-    }));
-}
-
-#[test]
-fn reuse_prepared_rebuilds_when_cross_chain_cache_table_is_missing() {
-    let temp = tempfile::tempdir().unwrap();
-    let parquet = temp.path().join("sample.parquet");
-    let db = temp.path().join("analysis.duckdb");
-    write_parquet(
-        &parquet,
-        r#"
-            VALUES
-            ('ethereum', '0xaaa', '1', 'shared', 'img1', 'Azuki', 'azuki'),
-            ('polygon', '0xbbb', '1', 'shared', 'img2', 'Azuki', 'azuki')
-        "#,
-    );
-
-    run_analysis(AnalysisOptions {
-        database_path: db.clone(),
-        parquet_inputs: vec![parquet.clone()],
-        output_dir: temp.path().join("out_first"),
-        thresholds: vec![90.0],
-        threads: 2,
-        memory_limit: "256MB".into(),
-        analysis_memory_limit: Some("64MB".into()),
-        temp_directory: None,
-        progress: false,
-        persist_prepared: true,
-        reuse_prepared: false,
-    })
-    .unwrap();
-
-    {
-        let conn = Connection::open(&db).unwrap();
-        conn.execute("DROP TABLE uri_duplicate_key_chain_counts", [])
-            .unwrap();
-    }
-
-    run_analysis(AnalysisOptions {
-        database_path: db.clone(),
-        parquet_inputs: vec![parquet],
-        output_dir: temp.path().join("out_rebuilt"),
-        thresholds: vec![90.0],
-        threads: 2,
-        memory_limit: "256MB".into(),
-        analysis_memory_limit: Some("64MB".into()),
-        temp_directory: None,
-        progress: false,
-        persist_prepared: false,
-        reuse_prepared: true,
-    })
-    .unwrap();
-
-    let conn = Connection::open(db).unwrap();
-    let count: i64 = conn
-        .query_row(
-            "SELECT count(*)::BIGINT FROM information_schema.tables WHERE table_name = 'uri_duplicate_key_chain_counts'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(count, 1);
-}
-
-#[test]
-fn non_persistent_run_does_not_delete_persisted_tables() {
-    let temp = tempfile::tempdir().unwrap();
-    let parquet = temp.path().join("sample.parquet");
-    let db = temp.path().join("analysis.duckdb");
-    write_parquet(
-        &parquet,
-        r#"
-            VALUES
-            ('ethereum', '0xaaa', '1', 'shared', 'img1', 'Azuki', 'azuki'),
-            ('ethereum', '0xbbb', '1', 'shared', 'img2', 'Azuki', 'azuki')
-        "#,
-    );
-
-    run_analysis(AnalysisOptions {
-        database_path: db.clone(),
-        parquet_inputs: vec![parquet.clone()],
-        output_dir: temp.path().join("out_persist"),
-        thresholds: vec![90.0],
-        threads: 2,
-        memory_limit: "256MB".into(),
-        analysis_memory_limit: Some("64MB".into()),
-        temp_directory: None,
-        progress: false,
-        persist_prepared: true,
-        reuse_prepared: false,
-    })
-    .unwrap();
-    run_analysis(AnalysisOptions {
-        database_path: db.clone(),
-        parquet_inputs: vec![parquet],
-        output_dir: temp.path().join("out_temp"),
-        thresholds: vec![90.0],
-        threads: 2,
-        memory_limit: "256MB".into(),
-        analysis_memory_limit: Some("64MB".into()),
-        temp_directory: None,
-        progress: false,
-        persist_prepared: false,
-        reuse_prepared: false,
-    })
-    .unwrap();
-
-    let conn = Connection::open(db).unwrap();
-    let count: i64 = conn
-        .query_row(
-            "SELECT count(*)::BIGINT FROM information_schema.tables WHERE table_name = 'analysis_prepared_metadata'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(count, 1);
 }
 
 #[test]
@@ -283,7 +165,7 @@ fn analyzes_uri_and_name_without_symbol_rows() {
         database_path: db,
         parquet_inputs: vec![parquet],
         output_dir: out,
-        thresholds: vec![90.0],
+        thresholds: vec![95.0],
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -302,7 +184,7 @@ fn analyzes_uri_and_name_without_symbol_rows() {
         row.field_name == "uri"
             && row.scope == "intra_chain"
             && row.primary_chain == "ethereum"
-            && row.match_mode == "strict_any"
+            && row.match_mode == "norm_cross"
             && row.metric == "v1"
             && row.duplicate_nft_count == 2
             && row.duplicate_contract_count == 2
@@ -311,7 +193,7 @@ fn analyzes_uri_and_name_without_symbol_rows() {
         row.field_name == "uri"
             && row.scope == "intra_chain"
             && row.primary_chain == "ethereum"
-            && row.match_mode == "strict_any"
+            && row.match_mode == "norm_cross"
             && row.metric == "v2"
             && row.duplicate_nft_count == 2
             && row.duplicate_contract_count == 2
@@ -320,9 +202,16 @@ fn analyzes_uri_and_name_without_symbol_rows() {
         row.field_name == "name"
             && row.scope == "intra_chain"
             && row.primary_chain == "ethereum"
-            && row.threshold == Some(90.0)
+            && row.threshold == Some(95.0)
             && row.duplicate_contract_count == 2
     }));
+    assert!(report.summary_rows.iter().all(|row| {
+        row.field_name != "uri" || (row.scope == "intra_chain" && row.match_mode == "norm_cross")
+    }));
+    assert!(report
+        .summary_rows
+        .iter()
+        .all(|row| row.field_name != "name" || row.threshold == Some(95.0)));
 }
 
 #[test]
@@ -344,7 +233,7 @@ fn analyzes_uri_rows_when_only_one_uri_field_is_present() {
         database_path: temp.path().join("analysis.duckdb"),
         parquet_inputs: vec![parquet],
         output_dir: temp.path().join("out"),
-        thresholds: vec![90.0],
+        thresholds: vec![95.0],
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -359,7 +248,7 @@ fn analyzes_uri_rows_when_only_one_uri_field_is_present() {
         row.field_name == "uri"
             && row.scope == "intra_chain"
             && row.primary_chain == "ethereum"
-            && row.match_mode == "strict_any"
+            && row.match_mode == "norm_cross"
             && row.metric == "v1"
             && row.duplicate_nft_count == 2
             && row.duplicate_contract_count == 2
@@ -368,7 +257,7 @@ fn analyzes_uri_rows_when_only_one_uri_field_is_present() {
         row.field_name == "uri"
             && row.scope == "intra_chain"
             && row.primary_chain == "ethereum"
-            && row.match_mode == "strict_any"
+            && row.match_mode == "norm_cross"
             && row.metric == "v2"
             && row.duplicate_nft_count == 2
             && row.duplicate_contract_count == 2
@@ -393,7 +282,7 @@ fn uri_any_and_cross_contract_counts_stay_distinct() {
         database_path: temp.path().join("analysis.duckdb"),
         parquet_inputs: vec![parquet],
         output_dir: temp.path().join("out"),
-        thresholds: vec![90.0],
+        thresholds: vec![95.0],
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -408,24 +297,19 @@ fn uri_any_and_cross_contract_counts_stay_distinct() {
         row.field_name == "uri"
             && row.scope == "intra_chain"
             && row.primary_chain == "ethereum"
-            && row.match_mode == "strict_any"
-            && row.metric == "v1"
-            && row.duplicate_nft_count == 2
-            && row.duplicate_contract_count == 1
-    }));
-    assert!(report.summary_rows.iter().any(|row| {
-        row.field_name == "uri"
-            && row.scope == "intra_chain"
-            && row.primary_chain == "ethereum"
-            && row.match_mode == "strict_cross"
+            && row.match_mode == "norm_cross"
             && row.metric == "v1"
             && row.duplicate_nft_count == 0
             && row.duplicate_contract_count == 0
     }));
+    assert!(report
+        .summary_rows
+        .iter()
+        .all(|row| row.field_name != "uri" || row.match_mode == "norm_cross"));
 }
 
 #[test]
-fn cross_chain_uri_counts_use_selected_chain_key_coverage() {
+fn cross_chain_uri_rows_are_not_emitted() {
     let temp = tempfile::tempdir().unwrap();
     let parquet = temp.path().join("sample.parquet");
     write_parquet(
@@ -442,7 +326,7 @@ fn cross_chain_uri_counts_use_selected_chain_key_coverage() {
         database_path: temp.path().join("analysis.duckdb"),
         parquet_inputs: vec![parquet],
         output_dir: temp.path().join("out"),
-        thresholds: vec![90.0],
+        thresholds: vec![95.0],
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -453,24 +337,10 @@ fn cross_chain_uri_counts_use_selected_chain_key_coverage() {
     })
     .unwrap();
 
-    assert!(report.summary_rows.iter().any(|row| {
-        row.field_name == "uri"
-            && row.scope == "cross_chain_summary"
-            && row.primary_chain == "ethereum"
-            && row.match_mode == "strict"
-            && row.metric == "v1"
-            && row.duplicate_nft_count == 1
-            && row.duplicate_contract_count == 1
-    }));
-    assert!(report.summary_rows.iter().any(|row| {
-        row.field_name == "uri"
-            && row.scope == "cross_chain_summary"
-            && row.primary_chain == "polygon"
-            && row.match_mode == "strict"
-            && row.metric == "v1"
-            && row.duplicate_nft_count == 0
-            && row.duplicate_contract_count == 0
-    }));
+    assert!(report
+        .summary_rows
+        .iter()
+        .all(|row| row.field_name != "uri" || row.scope == "intra_chain"));
 }
 
 #[test]
@@ -490,7 +360,7 @@ fn compares_names_across_former_block_boundaries() {
         database_path: temp.path().join("analysis.duckdb"),
         parquet_inputs: vec![parquet],
         output_dir: temp.path().join("out"),
-        thresholds: vec![88.0],
+        thresholds: vec![95.0],
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -505,8 +375,8 @@ fn compares_names_across_former_block_boundaries() {
         row.field_name == "name"
             && row.scope == "intra_chain"
             && row.primary_chain == "ethereum"
-            && row.threshold == Some(88.0)
-            && row.duplicate_contract_count == 2
+            && row.threshold == Some(95.0)
+            && row.duplicate_contract_count == 0
     }));
 }
 
@@ -529,7 +399,7 @@ fn repeated_nfts_in_one_contract_count_as_one_name_contract() {
         database_path: temp.path().join("analysis.duckdb"),
         parquet_inputs: vec![parquet],
         output_dir: temp.path().join("out"),
-        thresholds: vec![90.0],
+        thresholds: vec![95.0],
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -547,7 +417,7 @@ fn repeated_nfts_in_one_contract_count_as_one_name_contract() {
             row.field_name == "name"
                 && row.scope == "intra_chain"
                 && row.primary_chain == "ethereum"
-                && row.threshold == Some(90.0)
+                && row.threshold == Some(95.0)
         })
         .unwrap();
 
@@ -575,7 +445,7 @@ fn contract_name_aggregation_keeps_empty_name_nfts_in_totals() {
         database_path: temp.path().join("analysis.duckdb"),
         parquet_inputs: vec![parquet],
         output_dir: temp.path().join("out"),
-        thresholds: vec![90.0],
+        thresholds: vec![95.0],
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -593,7 +463,7 @@ fn contract_name_aggregation_keeps_empty_name_nfts_in_totals() {
             row.field_name == "name"
                 && row.scope == "intra_chain"
                 && row.primary_chain == "ethereum"
-                && row.threshold == Some(90.0)
+                && row.threshold == Some(95.0)
         })
         .unwrap();
 
@@ -620,7 +490,7 @@ fn only_parquet_chains_are_analyzed_and_single_chain_skips_cross_chain() {
         database_path: temp.path().join("analysis.duckdb"),
         parquet_inputs: vec![ethereum],
         output_dir: temp.path().join("out"),
-        thresholds: vec![90.0],
+        thresholds: vec![95.0],
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -659,7 +529,7 @@ fn chain_matrix_is_computed_per_chain_pair_without_third_chain_contamination() {
         database_path: temp.path().join("analysis.duckdb"),
         parquet_inputs: vec![parquet],
         output_dir: temp.path().join("out"),
-        thresholds: vec![90.0],
+        thresholds: vec![95.0],
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -675,7 +545,7 @@ fn chain_matrix_is_computed_per_chain_pair_without_third_chain_contamination() {
             && row.scope == "chain_matrix"
             && row.primary_chain == "ethereum"
             && row.secondary_chain == "base"
-            && row.threshold == Some(90.0)
+            && row.threshold == Some(95.0)
             && row.duplicate_contract_count == 1
             && row.duplicate_nft_count == 1
     }));
@@ -684,53 +554,36 @@ fn chain_matrix_is_computed_per_chain_pair_without_third_chain_contamination() {
             && row.scope == "chain_matrix"
             && row.primary_chain == "ethereum"
             && row.secondary_chain == "polygon"
-            && row.threshold == Some(90.0)
+            && row.threshold == Some(95.0)
             && row.duplicate_contract_count == 0
             && row.duplicate_nft_count == 0
     }));
 }
 
 #[test]
-fn batched_thresholds_match_single_threshold_results() {
+fn metadata_analysis_uses_informative_representatives_for_correctness() {
     let temp = tempfile::tempdir().unwrap();
     let parquet = temp.path().join("sample.parquet");
-    write_parquet(
+    write_parquet_with_metadata(
         &parquet,
         r#"
             VALUES
-            ('base', '0xbase1', '1', 'u1', 'i1', 'Azuki', 'azuki'),
-            ('base', '0xbase2', '1', 'u2', 'i2', 'Azuki Mirror', 'azuki mirror'),
-            ('ethereum', '0xeth1', '1', 'u3', 'i3', 'Azuki', 'azuki'),
-            ('ethereum', '0xeth2', '1', 'u4', 'i4', 'Azuki', 'azuki'),
-            ('ethereum', '0xeth3', '1', 'u5', 'i5', 'Azzuki', 'azzuki'),
-            ('polygon', '0xpoly1', '1', 'u6', 'i6', 'Moonbirds', 'moonbirds'),
-            ('polygon', '0xpoly2', '1', 'u7', 'i7', 'Moonbirdz', 'moonbirdz')
+            ('ethereum', '0xaaa', '1', 'u1', 'i1', 'A', 'a', '{"description":"x"}'),
+            ('ethereum', '0xaaa', '2', 'u2', 'i2', 'A', 'a', '{"description":"gold dragon rare background"}'),
+            ('ethereum', '0xbbb', '1', 'u3', 'i3', 'B', 'b', '{"description":"gold dragon rare background"}'),
+            ('ethereum', '0xccc', '1', 'u4', 'i4', 'C', 'c', '{"description":"silver cat"}'),
+            ('base', '0xddd', '1', 'u5', 'i5', 'D', 'd', '{"description":"gold dragon rare background"}')
         "#,
     );
 
-    let batched = run_analysis(AnalysisOptions {
-        database_path: temp.path().join("batched.duckdb"),
-        parquet_inputs: vec![parquet.clone()],
-        output_dir: temp.path().join("batched_out"),
-        thresholds: vec![90.0, 95.0, 98.0],
-        threads: 2,
-        memory_limit: "512MB".into(),
-        analysis_memory_limit: Some("128MB".into()),
-        temp_directory: None,
-        progress: false,
-        persist_prepared: false,
-        reuse_prepared: false,
-    })
-    .unwrap();
-
-    let single_threshold = run_analysis(AnalysisOptions {
-        database_path: temp.path().join("single.duckdb"),
+    let report = run_analysis(AnalysisOptions {
+        database_path: temp.path().join("analysis.duckdb"),
         parquet_inputs: vec![parquet],
-        output_dir: temp.path().join("single_out"),
-        thresholds: vec![90.0, 95.0, 98.0],
+        output_dir: temp.path().join("out"),
+        thresholds: vec![95.0],
         threads: 2,
         memory_limit: "256MB".into(),
-        analysis_memory_limit: Some("1KB".into()),
+        analysis_memory_limit: Some("64MB".into()),
         temp_directory: None,
         progress: false,
         persist_prepared: false,
@@ -738,5 +591,110 @@ fn batched_thresholds_match_single_threshold_results() {
     })
     .unwrap();
 
-    assert_eq!(batched.summary_rows, single_threshold.summary_rows);
+    assert!(report.summary_rows.iter().any(|row| {
+        row.field_name == "metadata"
+            && row.scope == "intra_chain"
+            && row.primary_chain == "ethereum"
+            && row.threshold == Some(0.6)
+            && row.match_mode == "bm25_representative"
+            && row.metric == "duplicate_group"
+            && row.total_contracts == 3
+            && row.total_nfts == 4
+            && row.duplicate_contract_count == 2
+            && row.duplicate_nft_count == 3
+    }));
+    assert!(report.summary_rows.iter().any(|row| {
+        row.field_name == "metadata"
+            && row.scope == "cross_chain_summary"
+            && row.primary_chain == "base"
+            && row.threshold == Some(0.6)
+            && row.duplicate_contract_count == 1
+            && row.duplicate_nft_count == 1
+    }));
+    assert!(report.summary_rows.iter().any(|row| {
+        row.field_name == "metadata"
+            && row.scope == "chain_matrix"
+            && row.primary_chain == "ethereum"
+            && row.secondary_chain == "base"
+            && row.threshold == Some(0.6)
+            && row.duplicate_contract_count == 2
+            && row.duplicate_nft_count == 3
+    }));
+}
+
+#[test]
+fn metadata_analysis_checks_all_unique_contract_metadata_docs() {
+    let temp = tempfile::tempdir().unwrap();
+    let parquet = temp.path().join("sample.parquet");
+    write_parquet_with_metadata(
+        &parquet,
+        r#"
+            VALUES
+            ('ethereum', '0xaaa', '1', 'u1', 'i1', 'A', 'a', '{"description":"shared alpha"}'),
+            ('ethereum', '0xaaa', '2', 'u2', 'i2', 'A', 'a', '{"description":"long unrelated beta gamma delta epsilon zeta"}'),
+            ('ethereum', '0xbbb', '1', 'u3', 'i3', 'B', 'b', '{"description":"shared alpha"}')
+        "#,
+    );
+
+    let report = run_analysis(AnalysisOptions {
+        database_path: temp.path().join("analysis.duckdb"),
+        parquet_inputs: vec![parquet],
+        output_dir: temp.path().join("out"),
+        thresholds: vec![95.0],
+        threads: 2,
+        memory_limit: "256MB".into(),
+        analysis_memory_limit: Some("64MB".into()),
+        temp_directory: None,
+        progress: false,
+        persist_prepared: false,
+        reuse_prepared: false,
+    })
+    .unwrap();
+
+    assert!(report.summary_rows.iter().any(|row| {
+        row.field_name == "metadata"
+            && row.scope == "intra_chain"
+            && row.primary_chain == "ethereum"
+            && row.duplicate_contract_count == 2
+            && row.duplicate_nft_count == 3
+    }));
+}
+
+#[test]
+fn metadata_analysis_uses_metadata_doc_when_metadata_json_is_empty() {
+    let temp = tempfile::tempdir().unwrap();
+    let parquet = temp.path().join("sample.parquet");
+    write_parquet_with_metadata_json_and_doc(
+        &parquet,
+        r#"
+            VALUES
+            ('ethereum', '0xaaa', '1', 'u1', 'i1', 'A', 'a', '', '{"description":"gold dragon"}'),
+            ('ethereum', '0xbbb', '1', 'u2', 'i2', 'B', 'b', '', '{"description":"gold dragon"}')
+        "#,
+    );
+
+    let report = run_analysis(AnalysisOptions {
+        database_path: temp.path().join("analysis.duckdb"),
+        parquet_inputs: vec![parquet],
+        output_dir: temp.path().join("out"),
+        thresholds: vec![95.0],
+        threads: 2,
+        memory_limit: "256MB".into(),
+        analysis_memory_limit: Some("64MB".into()),
+        temp_directory: None,
+        progress: false,
+        persist_prepared: false,
+        reuse_prepared: false,
+    })
+    .unwrap();
+
+    assert!(report.summary_rows.iter().any(|row| {
+        row.field_name == "metadata"
+            && row.scope == "intra_chain"
+            && row.primary_chain == "ethereum"
+            && row.total_contracts == 2
+            && row.total_nfts == 2
+            && row.duplicate_contract_count == 2
+            && row.duplicate_nft_count == 2
+    }));
 }

@@ -91,12 +91,6 @@ struct UriCounts {
     v3_contracts: i64,
 }
 
-#[derive(Clone, Copy)]
-struct UriIntraCounts {
-    any: UriCounts,
-    cross_contract: UriCounts,
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct GroupSummary {
     group_count: i64,

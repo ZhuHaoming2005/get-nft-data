@@ -4,72 +4,22 @@ fn run_uri_analysis(
     progress: &ProgressTracker,
 ) -> Result<Vec<SummaryRow>, AnalysisError> {
     let mut rows = Vec::new();
-    let uri_steps = chains
-        .len()
-        .saturating_mul(if chains.len() > 1 { 4 } else { 2 });
+    let uri_steps = chains.len();
     progress.start_phase("analyzing URI duplicates", uri_steps as u64);
     for chain in chains {
-        for match_prefix in ["strict", "norm"] {
-            let counts = query_uri_intra_counts(conn, chain, match_prefix)?;
-            push_uri_rows(
-                &mut rows,
-                "intra_chain",
-                chain,
-                "",
-                &format!("{match_prefix}_any"),
-                counts.any,
-            );
-            push_uri_rows(
-                &mut rows,
-                "intra_chain",
-                chain,
-                "",
-                &format!("{match_prefix}_cross"),
-                counts.cross_contract,
-            );
-            progress.step(format!("URI intra {chain} {match_prefix}"));
-        }
-
-        if chains.len() > 1 {
-            for match_mode in ["strict", "norm"] {
-                let counts = query_uri_cross_counts(conn, chain, match_mode)?;
-                push_uri_rows(
-                    &mut rows,
-                    "cross_chain_summary",
-                    chain,
-                    "",
-                    match_mode,
-                    counts,
-                );
-                progress.step(format!("URI cross {chain} {match_mode}"));
-            }
-        }
+        let counts = uri_counts_from_contract_flags(conn, chain, "norm_contract")?;
+        push_uri_rows(
+            &mut rows,
+            "intra_chain",
+            chain,
+            "",
+            "norm_cross",
+            counts,
+        );
+        progress.step(format!("URI intra {chain} norm_cross"));
     }
     progress.finish_phase("URI analysis complete");
     Ok(rows)
-}
-
-fn query_uri_intra_counts(
-    conn: &Connection,
-    chain: &str,
-    match_prefix: &str,
-) -> Result<UriIntraCounts, AnalysisError> {
-    Ok(UriIntraCounts {
-        any: uri_counts_from_contract_flags(conn, chain, &format!("{match_prefix}_any"))?,
-        cross_contract: uri_counts_from_contract_flags(
-            conn,
-            chain,
-            &format!("{match_prefix}_contract"),
-        )?,
-    })
-}
-
-fn query_uri_cross_counts(
-    conn: &Connection,
-    chain: &str,
-    match_prefix: &str,
-) -> Result<UriCounts, AnalysisError> {
-    uri_counts_from_contract_flags(conn, chain, &format!("{match_prefix}_chain"))
 }
 
 fn uri_counts_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<UriCounts> {
@@ -118,4 +68,3 @@ fn push_uri_rows(
         ));
     }
 }
-

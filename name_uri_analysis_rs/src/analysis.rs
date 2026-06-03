@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 
 use duckdb::{params, Connection};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -27,13 +26,18 @@ pub fn run_analysis(options: AnalysisOptions) -> Result<AnalysisReport, Analysis
             "at least one name threshold is required".to_string(),
         ));
     }
+    if options.thresholds.len() != 1 {
+        return Err(AnalysisError::InvalidData(
+            "exactly one name threshold is supported; the default is 95".to_string(),
+        ));
+    }
 
     if let Some(parent) = options.database_path.parent() {
         fs::create_dir_all(parent)?;
     }
     fs::create_dir_all(&options.output_dir)?;
 
-    let progress = ProgressTracker::new(5, options.progress);
+    let progress = ProgressTracker::new(6, options.progress);
     progress.start_phase("configuring DuckDB", 1);
     let conn = Connection::open(&options.database_path)?;
     configure_duckdb(&conn, &options)?;
@@ -50,6 +54,12 @@ pub fn run_analysis(options: AnalysisOptions) -> Result<AnalysisReport, Analysis
         options.threads,
         &options.memory_limit,
         options.analysis_memory_limit.as_deref(),
+        &progress,
+    )?);
+    summary_rows.extend(run_metadata_analysis(
+        &conn,
+        &selected_chains,
+        options.threads,
         &progress,
     )?);
 
@@ -86,6 +96,7 @@ pub fn run_analysis(options: AnalysisOptions) -> Result<AnalysisReport, Analysis
 include!("analysis/duckdb_prep.rs");
 include!("analysis/uri.rs");
 include!("analysis/name.rs");
+include!("analysis/metadata.rs");
 include!("analysis/name_scoring.rs");
 include!("analysis/chain_matrix.rs");
 include!("analysis/components.rs");

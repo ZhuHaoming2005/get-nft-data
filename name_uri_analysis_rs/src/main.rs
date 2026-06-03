@@ -15,7 +15,7 @@ struct Args {
     #[arg(long, default_value = "name_uri_analysis_output")]
     output_dir: PathBuf,
 
-    #[arg(long, value_delimiter = ',', default_value = "90,95,98")]
+    #[arg(long, value_delimiter = ',', default_value = "95")]
     thresholds: Vec<f64>,
 
     #[arg(long, default_value_t = 32)]
@@ -37,13 +37,10 @@ struct Args {
     #[arg(long)]
     temp_directory: Option<PathBuf>,
 
-    #[arg(long, help = "Persist prepared DuckDB tables for later reuse")]
+    #[arg(long, hide = true)]
     persist_prepared: bool,
 
-    #[arg(
-        long,
-        help = "Reuse persisted prepared DuckDB tables when parquet metadata matches; implies --persist-prepared"
-    )]
+    #[arg(long, hide = true)]
     reuse_prepared: bool,
 
     #[arg(long, help = "Disable terminal progress bars")]

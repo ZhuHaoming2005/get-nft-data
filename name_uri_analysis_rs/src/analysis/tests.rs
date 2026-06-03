@@ -217,12 +217,9 @@ mod tests {
     #[test]
     fn uri_duplicate_sql_skips_full_stats_tables() {
         let duplicate_sql = build_uri_duplicate_key_stats_sql(false);
-        let cross_sql = build_uri_duplicate_key_chain_counts_sql(false);
 
         assert!(!duplicate_sql.contains("uri_key_stats"));
-        assert!(!cross_sql.contains("uri_key_chain_counts"));
         assert!(duplicate_sql.contains("HAVING"));
-        assert!(cross_sql.contains("HAVING"));
     }
 
     #[test]
@@ -231,6 +228,9 @@ mod tests {
 
         assert_eq!(sql.matches("analysis_rows").count(), 1);
         assert!(sql.contains("CROSS JOIN LATERAL"));
+        assert!(sql.contains("norm_token"));
+        assert!(sql.contains("norm_image"));
+        assert!(!sql.contains("strict_token"));
     }
 
     #[test]
@@ -240,6 +240,7 @@ mod tests {
         assert!(!sql.contains("uri_key_chain_counts"));
         assert!(!sql.contains("uri_duplicate_key_chain_counts"));
         assert!(!sql.contains("_chain"));
+        assert!(sql.contains("norm_contract_v1_nfts"));
     }
 
     #[test]
