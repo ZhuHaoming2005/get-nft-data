@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashSet};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use unicode_normalization::UnicodeNormalization;
@@ -18,6 +19,7 @@ struct RawMetadataRow {
     contract_address: String,
     metadata_json: String,
     nft_count: i64,
+    metadata_count: i64,
 }
 
 #[derive(Debug)]
@@ -25,6 +27,7 @@ struct IndexedMetadataRow {
     chain_index: usize,
     contract_address: String,
     nft_count: i64,
+    metadata_count: i64,
     doc: MetadataBm25Document,
     doc_key: MetadataDocKey,
 }
@@ -94,10 +97,16 @@ struct PreparedInternedMetadataQuery {
 }
 
 #[derive(Debug)]
+struct PreparedInternedMetadataDoc {
+    token_weights: Vec<(usize, f64)>,
+}
+
+#[derive(Debug)]
 struct InternedMetadataIndex {
     docs: Vec<InternedMetadataDoc>,
     corpus: InternedMetadataCorpus,
     queries: Vec<PreparedInternedMetadataQuery>,
+    prepared_docs: Vec<PreparedInternedMetadataDoc>,
     postings: Vec<Vec<usize>>,
     #[cfg(test)]
     token_ids: HashMap<String, usize>,
@@ -295,11 +304,13 @@ fn load_metadata_data(
             contract_address: row.get::<_, String>(1)?,
             metadata_json: row.get::<_, String>(2)?,
             nft_count: row.get::<_, i64>(3)?,
+            metadata_count: row.get::<_, i64>(4)?,
         })
     })?;
 
     let mut builder = MetadataDataBuilder::new(chains.len());
     let mut raw_rows = Vec::with_capacity(METADATA_LOAD_CHUNK_ROWS);
+    let mut indexed_rows = Vec::new();
 
     for row in rows {
         raw_rows.push(row?);
@@ -308,16 +319,15 @@ fn load_metadata_data(
                 &mut raw_rows,
                 Vec::with_capacity(METADATA_LOAD_CHUNK_ROWS),
             );
-            let indexed_rows = pool.install(|| index_metadata_raw_row_chunk(chunk, &chain_indexes));
-            builder.merge_indexed_rows(indexed_rows);
+            indexed_rows.extend(pool.install(|| index_metadata_raw_row_chunk(chunk, &chain_indexes)));
         }
     }
 
     if !raw_rows.is_empty() {
-        let indexed_rows = pool.install(|| index_metadata_raw_row_chunk(raw_rows, &chain_indexes));
-        builder.merge_indexed_rows(indexed_rows);
+        indexed_rows.extend(pool.install(|| index_metadata_raw_row_chunk(raw_rows, &chain_indexes)));
     }
 
+    builder.merge_indexed_rows(select_metadata_representative_rows(indexed_rows));
     Ok(builder.finish())
 }
 
@@ -333,7 +343,8 @@ fn metadata_raw_rows_sql() -> String {
             eligible_metadata AS (
                 SELECT chain,
                        contract_address,
-                       metadata_json
+                       metadata_json,
+                       count(*)::BIGINT AS metadata_count
                 FROM analysis_rows
                 WHERE contract_address <> ''
                   AND metadata_json <> ''
@@ -347,7 +358,8 @@ fn metadata_raw_rows_sql() -> String {
             SELECT m.chain,
                    m.contract_address,
                    m.metadata_json,
-                   t.nft_count
+                   t.nft_count,
+                   m.metadata_count
             FROM eligible_metadata m
             JOIN totals t
               ON t.chain = m.chain
@@ -374,11 +386,83 @@ fn index_metadata_raw_row_chunk(
                 chain_index,
                 contract_address: row.contract_address,
                 nft_count: row.nft_count,
+                metadata_count: row.metadata_count,
                 doc,
                 doc_key,
             })
         })
         .collect()
+}
+
+fn select_metadata_representative_rows(
+    indexed_rows: Vec<IndexedMetadataRow>,
+) -> Vec<IndexedMetadataRow> {
+    let indexed_rows = aggregate_metadata_rows_by_contract_doc_key(indexed_rows);
+    let mut representatives = HashMap::<(usize, String), IndexedMetadataRow>::new();
+    for row in indexed_rows {
+        let contract_key = (row.chain_index, row.contract_address.clone());
+        match representatives.get(&contract_key) {
+            Some(current) if !metadata_representative_row_is_better(&row, current) => {}
+            _ => {
+                representatives.insert(contract_key, row);
+            }
+        }
+    }
+
+    let mut rows = representatives.into_values().collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        left.chain_index
+            .cmp(&right.chain_index)
+            .then_with(|| left.contract_address.cmp(&right.contract_address))
+    });
+    rows
+}
+
+fn aggregate_metadata_rows_by_contract_doc_key(
+    indexed_rows: Vec<IndexedMetadataRow>,
+) -> Vec<IndexedMetadataRow> {
+    let mut rows_by_doc_key = HashMap::<(usize, String, MetadataDocKey), IndexedMetadataRow>::new();
+    for row in indexed_rows {
+        let key = (
+            row.chain_index,
+            row.contract_address.clone(),
+            row.doc_key.clone(),
+        );
+        if let Some(current) = rows_by_doc_key.get_mut(&key) {
+            current.metadata_count = current.metadata_count.saturating_add(row.metadata_count);
+            current.nft_count = current.nft_count.max(row.nft_count);
+        } else {
+            rows_by_doc_key.insert(key, row);
+        }
+    }
+
+    rows_by_doc_key.into_values().collect()
+}
+
+fn metadata_representative_row_is_better(
+    candidate: &IndexedMetadataRow,
+    current: &IndexedMetadataRow,
+) -> bool {
+    let candidate_rank = metadata_representative_rank(candidate);
+    let current_rank = metadata_representative_rank(current);
+    candidate_rank > current_rank
+        || (candidate_rank == current_rank && candidate.doc_key < current.doc_key)
+}
+
+fn metadata_representative_rank(row: &IndexedMetadataRow) -> (i64, usize, usize, usize) {
+    (
+        row.metadata_count,
+        metadata_informative_token_count(&row.doc),
+        row.doc.tokens.len(),
+        row.doc.unique_tokens.len(),
+    )
+}
+
+fn metadata_informative_token_count(doc: &MetadataBm25Document) -> usize {
+    doc.unique_tokens
+        .iter()
+        .filter(|token| !is_metadata_prefilter_key_token(token))
+        .count()
 }
 
 fn metadata_document_key(doc: &MetadataBm25Document) -> MetadataDocKey {
@@ -464,31 +548,35 @@ fn union_metadata_pairs(
     }
 
     let scoring_left_count = data.docs.len().saturating_sub(1);
-    let total_candidate_pairs = count_metadata_candidate_pairs(&index.docs, &index.postings);
+    progress.set_message("building metadata candidate plan");
+    let candidate_plan = build_metadata_candidate_plan(&index.docs, &index.postings);
+    let total_candidate_pairs = candidate_plan.total_pairs;
     let mut scored_candidate_pairs = 0u64;
     let mut matched_doc_pairs = 0u64;
+    let progress_start = Instant::now();
     progress.add_work(total_candidate_pairs);
     progress.set_message(metadata_pair_progress_message(
-        total_candidate_pairs,
+        scored_candidate_pairs,
         total_candidate_pairs,
         matched_doc_pairs,
+        progress_start.elapsed(),
     ));
     for left_start in (0..scoring_left_count).step_by(METADATA_PAIR_LEFT_CHUNK_SIZE) {
         let left_end = (left_start + METADATA_PAIR_LEFT_CHUNK_SIZE).min(scoring_left_count);
         let batch = collect_metadata_doc_pair_hits_for_left_range(
             left_start..left_end,
-            &index.docs,
+            &candidate_plan.candidates_by_left,
             &index.queries,
-            &index.corpus,
-            &index.postings,
+            &index.prepared_docs,
         );
         scored_candidate_pairs = scored_candidate_pairs.saturating_add(batch.candidate_pairs);
         matched_doc_pairs = matched_doc_pairs.saturating_add(batch.hits.len() as u64);
         progress.inc(batch.candidate_pairs);
         progress.set_message(metadata_pair_progress_message(
-            total_candidate_pairs.saturating_sub(scored_candidate_pairs),
+            scored_candidate_pairs,
             total_candidate_pairs,
             matched_doc_pairs,
+            progress_start.elapsed(),
         ));
         for (left, right) in batch.hits {
             apply_metadata_doc_pair_union(data, chain_count, state, left, right);
@@ -502,69 +590,128 @@ struct MetadataDocPairBatch {
     candidate_pairs: u64,
 }
 
-fn count_metadata_candidate_pairs(docs: &[InternedMetadataDoc], postings: &[Vec<usize>]) -> u64 {
+#[derive(Debug, PartialEq, Eq)]
+struct MetadataCandidatePlan {
+    candidates_by_left: Vec<Vec<usize>>,
+    total_pairs: u64,
+}
+
+fn build_metadata_candidate_plan(
+    docs: &[InternedMetadataDoc],
+    postings: &[Vec<usize>],
+) -> MetadataCandidatePlan {
     if docs.len() < 2 {
-        return 0;
+        return MetadataCandidatePlan {
+            candidates_by_left: Vec::new(),
+            total_pairs: 0,
+        };
     }
-    (0..docs.len() - 1)
+
+    let candidates_by_left = (0..docs.len() - 1)
         .into_par_iter()
-        .fold(
-            || (MetadataCandidateScratch::new(docs.len()), 0u64),
-            |(mut scratch, mut total), left| {
-                let candidate_count = metadata_candidate_indices_for_left_with_scratch(
+        .map_init(
+            || MetadataCandidateScratch::new(docs.len()),
+            |scratch, left| {
+                metadata_candidate_indices_for_left_with_scratch(
                     left,
                     &docs[left],
                     postings,
-                    &mut scratch,
+                    scratch,
                 )
-                .len() as u64;
-                total = total.saturating_add(candidate_count);
-                (scratch, total)
+                .to_vec()
             },
         )
-        .map(|(_scratch, total)| total)
-        .reduce(|| 0, u64::saturating_add)
+        .collect::<Vec<_>>();
+    let total_pairs = candidates_by_left
+        .iter()
+        .map(|candidates| candidates.len() as u64)
+        .fold(0u64, u64::saturating_add);
+    MetadataCandidatePlan {
+        candidates_by_left,
+        total_pairs,
+    }
 }
 
 fn metadata_pair_progress_message(
-    remaining_pairs: u64,
+    scored_pairs: u64,
     total_pairs: u64,
     matched_pairs: u64,
+    elapsed: Duration,
 ) -> String {
+    let remaining_pairs = total_pairs.saturating_sub(scored_pairs);
+    let throughput = format_metadata_pair_throughput(scored_pairs, elapsed);
+    let eta = format_metadata_pair_eta(remaining_pairs, scored_pairs, elapsed);
     format!(
-        "metadata candidate pairs remaining {remaining_pairs}/{total_pairs}; matched doc pairs {matched_pairs}"
+        "metadata candidate pairs scored {scored_pairs}/{total_pairs}; remaining {remaining_pairs}; throughput {throughput}; ETA {eta}; matched doc pairs {matched_pairs}"
     )
+}
+
+fn format_metadata_pair_throughput(scored_pairs: u64, elapsed: Duration) -> String {
+    let Some(pairs_per_second) = metadata_pairs_per_second(scored_pairs, elapsed) else {
+        return "n/a".to_string();
+    };
+    format!("{pairs_per_second:.1} pairs/s")
+}
+
+fn format_metadata_pair_eta(remaining_pairs: u64, scored_pairs: u64, elapsed: Duration) -> String {
+    if remaining_pairs == 0 {
+        return "0s".to_string();
+    }
+    let Some(pairs_per_second) = metadata_pairs_per_second(scored_pairs, elapsed) else {
+        return "n/a".to_string();
+    };
+    format_metadata_duration(Duration::from_secs_f64(
+        (remaining_pairs as f64 / pairs_per_second).ceil(),
+    ))
+}
+
+fn metadata_pairs_per_second(scored_pairs: u64, elapsed: Duration) -> Option<f64> {
+    if scored_pairs == 0 {
+        return None;
+    }
+    let elapsed_seconds = elapsed.as_secs_f64();
+    if elapsed_seconds <= 0.0 {
+        return None;
+    }
+    Some(scored_pairs as f64 / elapsed_seconds)
+}
+
+fn format_metadata_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds / 60;
+    let remaining_seconds = seconds % 60;
+    if minutes < 60 {
+        return format!("{minutes}m {remaining_seconds:02}s");
+    }
+    let hours = minutes / 60;
+    let remaining_minutes = minutes % 60;
+    format!("{hours}h {remaining_minutes:02}m")
 }
 
 fn collect_metadata_doc_pair_hits_for_left_range(
     left_range: std::ops::Range<usize>,
-    docs: &[InternedMetadataDoc],
+    candidates_by_left: &[Vec<usize>],
     queries: &[PreparedInternedMetadataQuery],
-    corpus: &InternedMetadataCorpus,
-    postings: &[Vec<usize>],
+    prepared_docs: &[PreparedInternedMetadataDoc],
 ) -> MetadataDocPairBatch {
     let (mut hits, candidate_pairs) = left_range
         .into_par_iter()
         .fold(
-            || (Vec::new(), 0u64, MetadataCandidateScratch::new(docs.len())),
-            |(mut local_hits, mut local_candidate_pairs, mut scratch), left| {
-                let candidates = metadata_candidate_indices_for_left_with_scratch(
-                    left,
-                    &docs[left],
-                    postings,
-                    &mut scratch,
-                );
+            || (Vec::new(), 0u64),
+            |(mut local_hits, mut local_candidate_pairs), left| {
+                let candidates = candidates_by_left[left].as_slice();
                 local_candidate_pairs = local_candidate_pairs.saturating_add(candidates.len() as u64);
                 for &right in candidates {
-                    if metadata_pair_score(left, right, docs, queries, corpus) >= METADATA_THRESHOLD
-                    {
+                    if metadata_pair_score(left, right, queries, prepared_docs) >= METADATA_THRESHOLD {
                         local_hits.push((left, right));
                     }
                 }
-                (local_hits, local_candidate_pairs, scratch)
+                (local_hits, local_candidate_pairs)
             },
         )
-        .map(|(hits, candidate_pairs, _scratch)| (hits, candidate_pairs))
         .reduce(
             || (Vec::new(), 0u64),
             |(mut left_hits, left_candidate_pairs), (mut right_hits, right_candidate_pairs)| {
@@ -605,15 +752,14 @@ fn metadata_candidate_indices_for_left_with_scratch<'a>(
 fn metadata_pair_score(
     left: usize,
     right: usize,
-    docs: &[InternedMetadataDoc],
     queries: &[PreparedInternedMetadataQuery],
-    corpus: &InternedMetadataCorpus,
+    prepared_docs: &[PreparedInternedMetadataDoc],
 ) -> f64 {
-    let left_to_right = score_metadata_with_query(&queries[left], &docs[right], corpus);
+    let left_to_right = score_metadata_with_prepared_doc(&queries[left], &prepared_docs[right]);
     if left_to_right >= METADATA_THRESHOLD {
         return left_to_right;
     }
-    score_metadata_with_query(&queries[right], &docs[left], corpus)
+    score_metadata_with_prepared_doc(&queries[right], &prepared_docs[left])
 }
 
 
@@ -1200,11 +1346,34 @@ impl PreparedInternedMetadataQuery {
         let denominator = if self_score > 0.0 { self_score } else { 1.0 };
         Self { terms, denominator }
     }
+}
 
-    fn has_term_overlap(&self, document: &InternedMetadataDoc) -> bool {
-        self.terms
+impl PreparedInternedMetadataDoc {
+    fn new(doc: &InternedMetadataDoc, corpus: &InternedMetadataCorpus) -> Self {
+        if doc.len() == 0 || corpus.total_docs == 0 || corpus.avg_doc_len <= 0.0 {
+            return Self {
+                token_weights: Vec::new(),
+            };
+        }
+
+        let doc_len = doc.len() as f64;
+        let norm = METADATA_BM25_K1
+            * (1.0 - METADATA_BM25_B + METADATA_BM25_B * doc_len / corpus.avg_doc_len);
+        let token_weights = doc
+            .unique_tokens()
             .iter()
-            .any(|(token, _)| document.term_frequency(*token) > 0)
+            .filter_map(|&token| {
+                let tf = doc.term_frequency(token) as f64;
+                if tf == 0.0 {
+                    return None;
+                }
+                let df = corpus.doc_freqs.get(token).copied().unwrap_or(0) as f64;
+                let idf = ((corpus.total_docs as f64 - df + 0.5) / (df + 0.5) + 1.0).ln();
+                let weight = idf * (tf * (METADATA_BM25_K1 + 1.0)) / (tf + norm);
+                Some((token, weight))
+            })
+            .collect();
+        Self { token_weights }
     }
 }
 
@@ -1229,6 +1398,10 @@ impl InternedMetadataIndex {
             indices.dedup();
         }
         let corpus = InternedMetadataCorpus::from_doc_entries(entries, &docs, token_ids.len());
+        let prepared_docs = docs
+            .par_iter()
+            .map(|doc| PreparedInternedMetadataDoc::new(doc, &corpus))
+            .collect::<Vec<_>>();
         let queries = docs
             .par_iter()
             .map(|doc| PreparedInternedMetadataQuery::new(doc, &corpus))
@@ -1237,6 +1410,7 @@ impl InternedMetadataIndex {
             docs,
             corpus,
             queries,
+            prepared_docs,
             postings,
             #[cfg(test)]
             token_ids,
@@ -1249,15 +1423,38 @@ impl InternedMetadataIndex {
     }
 }
 
-fn score_metadata_with_query(
+fn score_metadata_with_prepared_doc(
     query: &PreparedInternedMetadataQuery,
-    right: &InternedMetadataDoc,
-    corpus: &InternedMetadataCorpus,
+    right: &PreparedInternedMetadataDoc,
 ) -> f64 {
-    if !query.has_term_overlap(right) {
+    if query.terms.is_empty() || right.token_weights.is_empty() {
         return 0.0;
     }
-    (bm25_score_terms(&query.terms, right, corpus) / query.denominator).clamp(0.0, 1.0)
+    (bm25_score_prepared_terms(&query.terms, &right.token_weights) / query.denominator)
+        .clamp(0.0, 1.0)
+}
+
+fn bm25_score_prepared_terms(
+    query_terms: &[(usize, usize)],
+    doc_token_weights: &[(usize, f64)],
+) -> f64 {
+    let mut score = 0.0;
+    let mut query_index = 0usize;
+    let mut doc_index = 0usize;
+    while query_index < query_terms.len() && doc_index < doc_token_weights.len() {
+        let (query_token, query_tf) = query_terms[query_index];
+        let (doc_token, doc_weight) = doc_token_weights[doc_index];
+        match query_token.cmp(&doc_token) {
+            std::cmp::Ordering::Less => query_index += 1,
+            std::cmp::Ordering::Greater => doc_index += 1,
+            std::cmp::Ordering::Equal => {
+                score += query_tf as f64 * doc_weight;
+                query_index += 1;
+                doc_index += 1;
+            }
+        }
+    }
+    score
 }
 
 fn query_terms_from_token_ids(query_tokens: &[usize]) -> Vec<(usize, usize)> {
@@ -1538,13 +1735,13 @@ mod metadata_tests {
             metadata_doc_entry("gold dragon"),
         ];
         let index = InternedMetadataIndex::from_doc_entries(&docs);
+        let candidate_plan = build_metadata_candidate_plan(&index.docs, &index.postings);
 
         let batch = collect_metadata_doc_pair_hits_for_left_range(
             1..3,
-            &index.docs,
+            &candidate_plan.candidates_by_left,
             &index.queries,
-            &index.corpus,
-            &index.postings,
+            &index.prepared_docs,
         );
 
         assert_eq!(
@@ -1554,18 +1751,31 @@ mod metadata_tests {
                 candidate_pairs: 1,
             }
         );
+        assert_eq!(candidate_plan.total_pairs, 3);
+    }
+
+    #[test]
+    fn metadata_pair_progress_message_shows_throughput_and_eta() {
         assert_eq!(
-            count_metadata_candidate_pairs(&index.docs, &index.postings),
-            3
+            metadata_pair_progress_message(333, 1_000, 7, std::time::Duration::from_secs(2)),
+            "metadata candidate pairs scored 333/1000; remaining 667; throughput 166.5 pairs/s; ETA 5s; matched doc pairs 7"
         );
     }
 
     #[test]
-    fn metadata_pair_progress_message_shows_exact_remaining_pairs() {
-        assert_eq!(
-            metadata_pair_progress_message(123, 456, 7),
-            "metadata candidate pairs remaining 123/456; matched doc pairs 7"
-        );
+    fn metadata_candidate_plan_materializes_candidates_and_counts_total_pairs() {
+        let docs = vec![
+            metadata_doc_entry("gold dragon"),
+            metadata_doc_entry("dragon gold"),
+            metadata_doc_entry("gold cat"),
+            metadata_doc_entry("silver dog"),
+        ];
+        let index = InternedMetadataIndex::from_doc_entries(&docs);
+
+        let plan = build_metadata_candidate_plan(&index.docs, &index.postings);
+
+        assert_eq!(plan.total_pairs, 3);
+        assert_eq!(plan.candidates_by_left, vec![vec![1, 2], vec![2], vec![]]);
     }
 
     #[test]
@@ -1633,6 +1843,22 @@ mod metadata_tests {
     }
 
     #[test]
+    fn prepared_metadata_doc_score_matches_bm25_terms() {
+        let docs = vec![
+            metadata_doc_entry("gold dragon gold rare"),
+            metadata_doc_entry("gold dragon rare shiny"),
+        ];
+        let index = InternedMetadataIndex::from_doc_entries(&docs);
+        let expected = (bm25_score_terms(&index.queries[0].terms, &index.docs[1], &index.corpus)
+            / index.queries[0].denominator)
+            .clamp(0.0, 1.0);
+
+        let actual = score_metadata_with_prepared_doc(&index.queries[0], &index.prepared_docs[1]);
+
+        assert!((actual - expected).abs() < 1e-12);
+    }
+
+    #[test]
     fn metadata_data_builder_moves_bm25_documents_into_interned_index() {
         let mut builder = MetadataDataBuilder::new(1);
         let doc = MetadataBm25Document::from_text("gold dragon").unwrap();
@@ -1641,6 +1867,7 @@ mod metadata_tests {
             chain_index: 0,
             contract_address: "0xaaa".to_string(),
             nft_count: 2,
+            metadata_count: 1,
             doc,
             doc_key,
         });
@@ -1666,18 +1893,21 @@ mod metadata_tests {
                 contract_address: "0xaaa".into(),
                 metadata_json: r#"{"description":"gold dragon"}"#.into(),
                 nft_count: 2,
+                metadata_count: 1,
             },
             RawMetadataRow {
                 chain: "missing".into(),
                 contract_address: "0xbbb".into(),
                 metadata_json: r#"{"description":"gold dragon"}"#.into(),
                 nft_count: 1,
+                metadata_count: 1,
             },
             RawMetadataRow {
                 chain: "base".into(),
                 contract_address: "0xccc".into(),
                 metadata_json: "not json".into(),
                 nft_count: 1,
+                metadata_count: 1,
             },
         ];
 
@@ -1687,5 +1917,84 @@ mod metadata_tests {
         assert_eq!(indexed[0].chain_index, 0);
         assert_eq!(indexed[0].contract_address, "0xaaa");
         assert_eq!(indexed[0].nft_count, 2);
+    }
+
+    #[test]
+    fn metadata_representatives_keep_one_best_template_per_contract() {
+        let shared = MetadataBm25Document::from_text("shared alpha").unwrap();
+        let rare_long = MetadataBm25Document::from_text("long unrelated beta gamma").unwrap();
+        let other = MetadataBm25Document::from_text("shared alpha").unwrap();
+        let rows = vec![
+            IndexedMetadataRow {
+                chain_index: 0,
+                contract_address: "0xaaa".into(),
+                nft_count: 3,
+                metadata_count: 2,
+                doc_key: metadata_document_key(&shared),
+                doc: shared,
+            },
+            IndexedMetadataRow {
+                chain_index: 0,
+                contract_address: "0xaaa".into(),
+                nft_count: 3,
+                metadata_count: 1,
+                doc_key: metadata_document_key(&rare_long),
+                doc: rare_long,
+            },
+            IndexedMetadataRow {
+                chain_index: 0,
+                contract_address: "0xbbb".into(),
+                nft_count: 1,
+                metadata_count: 1,
+                doc_key: metadata_document_key(&other),
+                doc: other,
+            },
+        ];
+
+        let representatives = select_metadata_representative_rows(rows);
+
+        assert_eq!(representatives.len(), 2);
+        assert_eq!(representatives[0].contract_address, "0xaaa");
+        assert_eq!(representatives[0].doc_key, vec![("alpha".into(), 1), ("shared".into(), 1)]);
+        assert_eq!(representatives[1].contract_address, "0xbbb");
+    }
+
+    #[test]
+    fn metadata_representatives_merge_counts_by_doc_key_before_selecting() {
+        let shared_left = MetadataBm25Document::from_text("shared alpha").unwrap();
+        let shared_right = MetadataBm25Document::from_text("alpha shared").unwrap();
+        let rare_long = MetadataBm25Document::from_text("long unrelated beta gamma").unwrap();
+        let rows = vec![
+            IndexedMetadataRow {
+                chain_index: 0,
+                contract_address: "0xaaa".into(),
+                nft_count: 3,
+                metadata_count: 1,
+                doc_key: metadata_document_key(&shared_left),
+                doc: shared_left,
+            },
+            IndexedMetadataRow {
+                chain_index: 0,
+                contract_address: "0xaaa".into(),
+                nft_count: 3,
+                metadata_count: 1,
+                doc_key: metadata_document_key(&shared_right),
+                doc: shared_right,
+            },
+            IndexedMetadataRow {
+                chain_index: 0,
+                contract_address: "0xaaa".into(),
+                nft_count: 3,
+                metadata_count: 1,
+                doc_key: metadata_document_key(&rare_long),
+                doc: rare_long,
+            },
+        ];
+
+        let representatives = select_metadata_representative_rows(rows);
+
+        assert_eq!(representatives.len(), 1);
+        assert_eq!(representatives[0].metadata_count, 2);
+        assert_eq!(representatives[0].doc_key, vec![("alpha".into(), 1), ("shared".into(), 1)]);
     }
 }

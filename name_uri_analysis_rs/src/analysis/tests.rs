@@ -303,6 +303,7 @@ mod tests {
         let sql = metadata_raw_rows_sql();
 
         assert!(sql.contains("GROUP BY chain, contract_address, metadata_json"));
+        assert!(sql.contains("count(*)::BIGINT AS metadata_count"));
         assert!(!sql.contains("rowid"));
     }
 

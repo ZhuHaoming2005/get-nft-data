@@ -691,7 +691,7 @@ fn metadata_analysis_uses_informative_representatives_for_correctness() {
 }
 
 #[test]
-fn metadata_analysis_checks_all_unique_contract_metadata_docs() {
+fn metadata_analysis_uses_one_representative_metadata_doc_per_contract() {
     let temp = tempfile::tempdir().unwrap();
     let parquet = temp.path().join("sample.parquet");
     write_parquet_with_metadata(
@@ -723,8 +723,10 @@ fn metadata_analysis_checks_all_unique_contract_metadata_docs() {
         row.field_name == "metadata"
             && row.scope == "intra_chain"
             && row.primary_chain == "ethereum"
-            && row.duplicate_contract_count == 2
-            && row.duplicate_nft_count == 3
+            && row.total_contracts == 2
+            && row.total_nfts == 3
+            && row.duplicate_contract_count == 0
+            && row.duplicate_nft_count == 0
     }));
 }
 
