@@ -629,15 +629,15 @@ fn chain_matrix_is_computed_per_chain_pair_without_third_chain_contamination() {
 }
 
 #[test]
-fn metadata_analysis_uses_informative_representatives_for_correctness() {
+fn metadata_analysis_uses_first_available_representatives_for_correctness() {
     let temp = tempfile::tempdir().unwrap();
     let parquet = temp.path().join("sample.parquet");
     write_parquet_with_metadata(
         &parquet,
         r#"
             VALUES
-            ('ethereum', '0xaaa', '1', 'u1', 'i1', 'A', 'a', '{"description":"x"}'),
-            ('ethereum', '0xaaa', '2', 'u2', 'i2', 'A', 'a', '{"description":"gold dragon rare background"}'),
+            ('ethereum', '0xaaa', '1', 'u1', 'i1', 'A', 'a', '{"description":"gold dragon rare background"}'),
+            ('ethereum', '0xaaa', '2', 'u2', 'i2', 'A', 'a', '{"description":"x"}'),
             ('ethereum', '0xbbb', '1', 'u3', 'i3', 'B', 'b', '{"description":"gold dragon rare background"}'),
             ('ethereum', '0xccc', '1', 'u4', 'i4', 'C', 'c', '{"description":"silver cat"}'),
             ('base', '0xddd', '1', 'u5', 'i5', 'D', 'd', '{"description":"gold dragon rare background"}')
@@ -691,7 +691,7 @@ fn metadata_analysis_uses_informative_representatives_for_correctness() {
 }
 
 #[test]
-fn metadata_analysis_uses_one_representative_metadata_doc_per_contract() {
+fn metadata_analysis_uses_first_available_metadata_doc_per_contract() {
     let temp = tempfile::tempdir().unwrap();
     let parquet = temp.path().join("sample.parquet");
     write_parquet_with_metadata(
@@ -725,8 +725,8 @@ fn metadata_analysis_uses_one_representative_metadata_doc_per_contract() {
             && row.primary_chain == "ethereum"
             && row.total_contracts == 2
             && row.total_nfts == 3
-            && row.duplicate_contract_count == 0
-            && row.duplicate_nft_count == 0
+            && row.duplicate_contract_count == 2
+            && row.duplicate_nft_count == 3
     }));
 }
 

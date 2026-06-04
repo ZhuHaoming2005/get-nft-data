@@ -299,12 +299,60 @@ mod tests {
     }
 
     #[test]
-    fn metadata_raw_rows_sql_groups_unique_contract_documents() {
+    fn metadata_raw_rows_sql_selects_one_representative_per_contract() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+                CREATE TEMP TABLE analysis_rows AS
+                SELECT * FROM (
+                    VALUES
+                    ('ethereum', '0xaaa', '{"description":"first available"}'),
+                    ('ethereum', '0xaaa', '{"description":"later repeated"}'),
+                    ('ethereum', '0xaaa', '{"description":"later repeated"}'),
+                    ('ethereum', '0xbbb', ''),
+                    ('ethereum', '0xbbb', '{"description":"first usable for b"}'),
+                    ('ethereum', '0xbbb', '{"description":"later b"}')
+                ) AS t(chain, contract_address, metadata_json);
+            "#,
+        )
+        .unwrap();
+
+        let sql = metadata_raw_rows_sql();
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|(contract, metadata, metadata_count)| {
+            contract == "0xaaa"
+                && metadata == r#"{"description":"first available"}"#
+                && *metadata_count == 3
+        }));
+        assert!(rows.iter().any(|(contract, metadata, metadata_count)| {
+            contract == "0xbbb"
+                && metadata == r#"{"description":"first usable for b"}"#
+                && *metadata_count == 2
+        }));
+    }
+
+    #[test]
+    fn metadata_raw_rows_sql_groups_unique_contract_documents_before_ranking() {
         let sql = metadata_raw_rows_sql();
 
-        assert!(sql.contains("GROUP BY chain, contract_address, metadata_json"));
+        assert!(!sql.contains("GROUP BY chain, contract_address, metadata_json"));
+        assert!(sql.contains("GROUP BY chain, contract_address"));
+        assert!(sql.contains("min(metadata_row_id)"));
         assert!(sql.contains("count(*)::BIGINT AS metadata_count"));
-        assert!(!sql.contains("rowid"));
+        assert!(sql.contains("rowid AS metadata_row_id"));
     }
 
     #[test]

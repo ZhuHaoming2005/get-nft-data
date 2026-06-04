@@ -21,7 +21,6 @@ struct RawMetadataRow {
     contract_address: String,
     metadata_json: String,
     nft_count: i64,
-    metadata_count: i64,
 }
 
 #[derive(Debug)]
@@ -29,22 +28,8 @@ struct IndexedMetadataRow {
     chain_index: usize,
     contract_address: String,
     nft_count: i64,
-    metadata_count: i64,
     doc: MetadataBm25Document,
     doc_key: MetadataDocKey,
-}
-
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct MetadataAggregateKey {
-    chain_index: usize,
-    contract_address: String,
-    doc_key: MetadataDocKey,
-}
-
-struct AggregatedMetadataRow {
-    nft_count: i64,
-    metadata_count: i64,
-    doc: MetadataBm25Document,
 }
 
 #[derive(Clone, Debug)]
@@ -81,11 +66,6 @@ struct MetadataDataBuilder {
     docs: Vec<SourceMetadataDocEntry>,
     doc_index_by_key: HashMap<MetadataDocKey, usize>,
     chain_count: usize,
-}
-
-#[derive(Default)]
-struct MetadataRepresentativeSelector {
-    rows_by_doc_key: HashMap<MetadataAggregateKey, AggregatedMetadataRow>,
 }
 
 #[derive(Debug, Clone)]
@@ -236,45 +216,6 @@ impl MetadataDataBuilder {
     }
 }
 
-impl MetadataRepresentativeSelector {
-    fn new() -> Self {
-        Self {
-            rows_by_doc_key: HashMap::new(),
-        }
-    }
-
-    fn merge_indexed_rows(&mut self, indexed_rows: Vec<IndexedMetadataRow>) {
-        for row in indexed_rows {
-            self.merge_indexed_row(row);
-        }
-    }
-
-    fn merge_indexed_row(&mut self, row: IndexedMetadataRow) {
-        let key = MetadataAggregateKey {
-            chain_index: row.chain_index,
-            contract_address: row.contract_address,
-            doc_key: row.doc_key,
-        };
-        if let Some(current) = self.rows_by_doc_key.get_mut(&key) {
-            current.metadata_count = current.metadata_count.saturating_add(row.metadata_count);
-            current.nft_count = current.nft_count.max(row.nft_count);
-        } else {
-            self.rows_by_doc_key.insert(
-                key,
-                AggregatedMetadataRow {
-                    nft_count: row.nft_count,
-                    metadata_count: row.metadata_count,
-                    doc: row.doc,
-                },
-            );
-        }
-    }
-
-    fn into_representative_rows(self) -> Vec<IndexedMetadataRow> {
-        select_metadata_representatives_from_aggregates(self.rows_by_doc_key)
-    }
-}
-
 impl MetadataCandidateScratch {
     fn new(doc_count: usize) -> Self {
         Self {
@@ -385,12 +326,10 @@ fn load_metadata_data(
             contract_address: row.get::<_, String>(1)?,
             metadata_json: row.get::<_, String>(2)?,
             nft_count: row.get::<_, i64>(3)?,
-            metadata_count: row.get::<_, i64>(4)?,
         })
     })?;
 
     let mut builder = MetadataDataBuilder::new(chains.len());
-    let mut selector = MetadataRepresentativeSelector::new();
     let mut raw_rows = Vec::with_capacity(METADATA_LOAD_CHUNK_ROWS);
 
     for row in rows {
@@ -400,19 +339,18 @@ fn load_metadata_data(
                 &mut raw_rows,
                 Vec::with_capacity(METADATA_LOAD_CHUNK_ROWS),
             );
-            selector.merge_indexed_rows(pool.install(|| {
+            builder.merge_indexed_rows(pool.install(|| {
                 index_metadata_raw_row_chunk(chunk, &chain_indexes)
             }));
         }
     }
 
     if !raw_rows.is_empty() {
-        selector.merge_indexed_rows(pool.install(|| {
+        builder.merge_indexed_rows(pool.install(|| {
             index_metadata_raw_row_chunk(raw_rows, &chain_indexes)
         }));
     }
 
-    builder.merge_indexed_rows(selector.into_representative_rows());
     Ok(builder.finish())
 }
 
@@ -426,10 +364,10 @@ fn metadata_raw_rows_sql() -> String {
                 GROUP BY chain, contract_address
             ),
             eligible_metadata AS (
-                SELECT chain,
+                SELECT rowid AS metadata_row_id,
+                       chain,
                        contract_address,
-                       metadata_json,
-                       count(*)::BIGINT AS metadata_count
+                       metadata_json
                 FROM analysis_rows
                 WHERE contract_address <> ''
                   AND metadata_json <> ''
@@ -438,14 +376,25 @@ fn metadata_raw_rows_sql() -> String {
                       starts_with(metadata_json, '{{')
                       OR starts_with(metadata_json, '[')
                   )
-                GROUP BY chain, contract_address, metadata_json
+            ),
+            first_metadata AS (
+                SELECT chain,
+                       contract_address,
+                       min(metadata_row_id) AS metadata_row_id,
+                       count(*)::BIGINT AS metadata_count
+                FROM eligible_metadata
+                GROUP BY chain, contract_address
             )
             SELECT m.chain,
                    m.contract_address,
                    m.metadata_json,
                    t.nft_count,
-                   m.metadata_count
-            FROM eligible_metadata m
+                   f.metadata_count
+            FROM first_metadata f
+            JOIN eligible_metadata m
+              ON m.chain = f.chain
+             AND m.contract_address = f.contract_address
+             AND m.metadata_row_id = f.metadata_row_id
             JOIN totals t
               ON t.chain = m.chain
              AND t.contract_address = m.contract_address
@@ -471,81 +420,11 @@ fn index_metadata_raw_row_chunk(
                 chain_index,
                 contract_address: row.contract_address,
                 nft_count: row.nft_count,
-                metadata_count: row.metadata_count,
                 doc,
                 doc_key,
             })
         })
         .collect()
-}
-
-#[cfg(test)]
-fn select_metadata_representative_rows(
-    indexed_rows: Vec<IndexedMetadataRow>,
-) -> Vec<IndexedMetadataRow> {
-    let mut selector = MetadataRepresentativeSelector::new();
-    selector.merge_indexed_rows(indexed_rows);
-    selector.into_representative_rows()
-}
-
-fn select_metadata_representatives_from_aggregates(
-    rows_by_doc_key: HashMap<MetadataAggregateKey, AggregatedMetadataRow>,
-) -> Vec<IndexedMetadataRow> {
-    let mut representatives = HashMap::<(usize, String), IndexedMetadataRow>::new();
-    for (key, row) in rows_by_doc_key {
-        let representative = IndexedMetadataRow {
-            chain_index: key.chain_index,
-            contract_address: key.contract_address,
-            nft_count: row.nft_count,
-            metadata_count: row.metadata_count,
-            doc: row.doc,
-            doc_key: key.doc_key,
-        };
-        let contract_key = (
-            representative.chain_index,
-            representative.contract_address.clone(),
-        );
-        match representatives.get(&contract_key) {
-            Some(current) if !metadata_representative_row_is_better(&representative, current) => {}
-            _ => {
-                representatives.insert(contract_key, representative);
-            }
-        }
-    }
-
-    let mut rows = representatives.into_values().collect::<Vec<_>>();
-    rows.sort_by(|left, right| {
-        left.chain_index
-            .cmp(&right.chain_index)
-            .then_with(|| left.contract_address.cmp(&right.contract_address))
-    });
-    rows
-}
-
-fn metadata_representative_row_is_better(
-    candidate: &IndexedMetadataRow,
-    current: &IndexedMetadataRow,
-) -> bool {
-    let candidate_rank = metadata_representative_rank(candidate);
-    let current_rank = metadata_representative_rank(current);
-    candidate_rank > current_rank
-        || (candidate_rank == current_rank && candidate.doc_key < current.doc_key)
-}
-
-fn metadata_representative_rank(row: &IndexedMetadataRow) -> (i64, usize, usize, usize) {
-    (
-        row.metadata_count,
-        metadata_informative_token_count(&row.doc),
-        row.doc.tokens.len(),
-        row.doc.unique_tokens.len(),
-    )
-}
-
-fn metadata_informative_token_count(doc: &MetadataBm25Document) -> usize {
-    doc.unique_tokens
-        .iter()
-        .filter(|token| !is_metadata_schema_key_token(token))
-        .count()
 }
 
 fn metadata_document_key(doc: &MetadataBm25Document) -> MetadataDocKey {
@@ -2062,7 +1941,6 @@ mod metadata_tests {
             chain_index: 0,
             contract_address: "0xaaa".to_string(),
             nft_count: 2,
-            metadata_count: 1,
             doc,
             doc_key,
         });
@@ -2083,7 +1961,6 @@ mod metadata_tests {
             chain_index: 0,
             contract_address: "0xaaa".to_string(),
             nft_count: 2,
-            metadata_count: 1,
             doc,
             doc_key,
         });
@@ -2133,21 +2010,18 @@ mod metadata_tests {
                 contract_address: "0xaaa".into(),
                 metadata_json: r#"{"description":"gold dragon"}"#.into(),
                 nft_count: 2,
-                metadata_count: 1,
             },
             RawMetadataRow {
                 chain: "missing".into(),
                 contract_address: "0xbbb".into(),
                 metadata_json: r#"{"description":"gold dragon"}"#.into(),
                 nft_count: 1,
-                metadata_count: 1,
             },
             RawMetadataRow {
                 chain: "base".into(),
                 contract_address: "0xccc".into(),
                 metadata_json: "not json".into(),
                 nft_count: 1,
-                metadata_count: 1,
             },
         ];
 
@@ -2159,123 +2033,4 @@ mod metadata_tests {
         assert_eq!(indexed[0].nft_count, 2);
     }
 
-    #[test]
-    fn metadata_representatives_keep_one_best_template_per_contract() {
-        let shared = MetadataBm25Document::from_text("shared alpha").unwrap();
-        let rare_long = MetadataBm25Document::from_text("long unrelated beta gamma").unwrap();
-        let other = MetadataBm25Document::from_text("shared alpha").unwrap();
-        let rows = vec![
-            IndexedMetadataRow {
-                chain_index: 0,
-                contract_address: "0xaaa".into(),
-                nft_count: 3,
-                metadata_count: 2,
-                doc_key: metadata_document_key(&shared),
-                doc: shared,
-            },
-            IndexedMetadataRow {
-                chain_index: 0,
-                contract_address: "0xaaa".into(),
-                nft_count: 3,
-                metadata_count: 1,
-                doc_key: metadata_document_key(&rare_long),
-                doc: rare_long,
-            },
-            IndexedMetadataRow {
-                chain_index: 0,
-                contract_address: "0xbbb".into(),
-                nft_count: 1,
-                metadata_count: 1,
-                doc_key: metadata_document_key(&other),
-                doc: other,
-            },
-        ];
-
-        let representatives = select_metadata_representative_rows(rows);
-
-        assert_eq!(representatives.len(), 2);
-        assert_eq!(representatives[0].contract_address, "0xaaa");
-        assert_eq!(representatives[0].doc_key, vec![("alpha".into(), 1), ("shared".into(), 1)]);
-        assert_eq!(representatives[1].contract_address, "0xbbb");
-    }
-
-    #[test]
-    fn metadata_representatives_merge_counts_by_doc_key_before_selecting() {
-        let shared_left = MetadataBm25Document::from_text("shared alpha").unwrap();
-        let shared_right = MetadataBm25Document::from_text("alpha shared").unwrap();
-        let rare_long = MetadataBm25Document::from_text("long unrelated beta gamma").unwrap();
-        let rows = vec![
-            IndexedMetadataRow {
-                chain_index: 0,
-                contract_address: "0xaaa".into(),
-                nft_count: 3,
-                metadata_count: 1,
-                doc_key: metadata_document_key(&shared_left),
-                doc: shared_left,
-            },
-            IndexedMetadataRow {
-                chain_index: 0,
-                contract_address: "0xaaa".into(),
-                nft_count: 3,
-                metadata_count: 1,
-                doc_key: metadata_document_key(&shared_right),
-                doc: shared_right,
-            },
-            IndexedMetadataRow {
-                chain_index: 0,
-                contract_address: "0xaaa".into(),
-                nft_count: 3,
-                metadata_count: 1,
-                doc_key: metadata_document_key(&rare_long),
-                doc: rare_long,
-            },
-        ];
-
-        let representatives = select_metadata_representative_rows(rows);
-
-        assert_eq!(representatives.len(), 1);
-        assert_eq!(representatives[0].metadata_count, 2);
-        assert_eq!(representatives[0].doc_key, vec![("alpha".into(), 1), ("shared".into(), 1)]);
-    }
-
-    #[test]
-    fn metadata_representative_selector_merges_counts_across_chunks() {
-        let shared_left = MetadataBm25Document::from_text("shared alpha").unwrap();
-        let shared_right = MetadataBm25Document::from_text("alpha shared").unwrap();
-        let rare_long = MetadataBm25Document::from_text("long unrelated beta gamma").unwrap();
-        let mut selector = MetadataRepresentativeSelector::new();
-
-        selector.merge_indexed_rows(vec![IndexedMetadataRow {
-            chain_index: 0,
-            contract_address: "0xaaa".into(),
-            nft_count: 3,
-            metadata_count: 1,
-            doc_key: metadata_document_key(&shared_left),
-            doc: shared_left,
-        }]);
-        selector.merge_indexed_rows(vec![
-            IndexedMetadataRow {
-                chain_index: 0,
-                contract_address: "0xaaa".into(),
-                nft_count: 3,
-                metadata_count: 1,
-                doc_key: metadata_document_key(&rare_long),
-                doc: rare_long,
-            },
-            IndexedMetadataRow {
-                chain_index: 0,
-                contract_address: "0xaaa".into(),
-                nft_count: 3,
-                metadata_count: 1,
-                doc_key: metadata_document_key(&shared_right),
-                doc: shared_right,
-            },
-        ]);
-
-        let representatives = selector.into_representative_rows();
-
-        assert_eq!(representatives.len(), 1);
-        assert_eq!(representatives[0].metadata_count, 2);
-        assert_eq!(representatives[0].doc_key, vec![("alpha".into(), 1), ("shared".into(), 1)]);
-    }
 }
