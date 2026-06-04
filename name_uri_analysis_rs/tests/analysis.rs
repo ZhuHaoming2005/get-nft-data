@@ -731,6 +731,45 @@ fn metadata_analysis_uses_one_representative_metadata_doc_per_contract() {
 }
 
 #[test]
+fn metadata_analysis_does_not_match_same_schema_with_different_content_values() {
+    let temp = tempfile::tempdir().unwrap();
+    let parquet = temp.path().join("sample.parquet");
+    write_parquet_with_metadata(
+        &parquet,
+        r#"
+            VALUES
+            ('ethereum', '0xaaa', '1', 'u1', 'i1', 'A', 'a', '{"name":"Alpha #1","image":"ipfs://alpha/1.png","attributes":[{"trait_type":"Background","value":"Blue"}]}'),
+            ('ethereum', '0xbbb', '1', 'u2', 'i2', 'B', 'b', '{"name":"Beta #9","image":"ipfs://beta/9.png","attributes":[{"trait_type":"Background","value":"Red"}]}')
+        "#,
+    );
+
+    let report = run_analysis(AnalysisOptions {
+        database_path: temp.path().join("analysis.duckdb"),
+        parquet_inputs: vec![parquet],
+        output_dir: temp.path().join("out"),
+        thresholds: vec![95.0],
+        threads: 2,
+        memory_limit: "256MB".into(),
+        analysis_memory_limit: Some("64MB".into()),
+        temp_directory: None,
+        progress: false,
+        persist_prepared: false,
+        reuse_prepared: false,
+    })
+    .unwrap();
+
+    assert!(report.summary_rows.iter().any(|row| {
+        row.field_name == "metadata"
+            && row.scope == "intra_chain"
+            && row.primary_chain == "ethereum"
+            && row.total_contracts == 2
+            && row.total_nfts == 2
+            && row.duplicate_contract_count == 0
+            && row.duplicate_nft_count == 0
+    }));
+}
+
+#[test]
 fn metadata_analysis_uses_metadata_doc_when_metadata_json_is_empty() {
     let temp = tempfile::tempdir().unwrap();
     let parquet = temp.path().join("sample.parquet");

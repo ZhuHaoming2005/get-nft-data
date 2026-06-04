@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -11,7 +10,7 @@ const MAX_METADATA_BYTES_FOR_DEDUP: usize = 64 * 1024;
 const METADATA_BM25_K1: f64 = 1.2;
 const METADATA_BM25_B: f64 = 0.75;
 const METADATA_LOAD_CHUNK_ROWS: usize = 16 * 1024;
-const METADATA_PAIR_LEFT_CHUNK_SIZE: usize = 256;
+const METADATA_PAIR_LEFT_CHUNK_SIZE: usize = 512;
 type MetadataDocKey = Vec<(String, usize)>;
 type MetadataContractIndex = u32;
 type MetadataDocIndex = u32;
@@ -545,7 +544,7 @@ fn metadata_representative_rank(row: &IndexedMetadataRow) -> (i64, usize, usize,
 fn metadata_informative_token_count(doc: &MetadataBm25Document) -> usize {
     doc.unique_tokens
         .iter()
-        .filter(|token| !is_metadata_prefilter_key_token(token))
+        .filter(|token| !is_metadata_schema_key_token(token))
         .count()
 }
 
@@ -559,10 +558,10 @@ fn metadata_document_key(doc: &MetadataBm25Document) -> MetadataDocKey {
 fn metadata_document_has_informative_token(doc: &MetadataBm25Document) -> bool {
     doc.unique_tokens
         .iter()
-        .any(|token| !is_metadata_prefilter_key_token(token))
+        .any(|token| !is_metadata_schema_key_token(token))
 }
 
-fn is_metadata_prefilter_key_token(token: &str) -> bool {
+fn is_metadata_schema_key_token(token: &str) -> bool {
     matches!(
         token,
         "about"
@@ -584,6 +583,7 @@ fn is_metadata_prefilter_key_token(token: &str) -> bool {
             | "license"
             | "lore"
             | "marketplace"
+            | "name"
             | "royalties"
             | "royalty"
             | "seller_fee_basis_points"
@@ -637,6 +637,7 @@ fn union_metadata_pairs(
     let mut matched_doc_pairs = 0u64;
     let progress_start = Instant::now();
     let scratch_pool = MetadataCandidateScratchPool::new(index.docs.len());
+    progress.add_work(metadata_scoring_progress_units(scoring_left_count));
     progress.set_message(metadata_pair_progress_message(
         scored_candidate_pairs,
         scored_left_docs,
@@ -657,8 +658,7 @@ fn union_metadata_pairs(
         scored_candidate_pairs = scored_candidate_pairs.saturating_add(batch.candidate_pairs);
         scored_left_docs = left_end;
         matched_doc_pairs = matched_doc_pairs.saturating_add(batch.hits.len() as u64);
-        progress.add_work(batch.candidate_pairs);
-        progress.inc(batch.candidate_pairs);
+        progress.inc(metadata_scoring_batch_progress_units(left_start, left_end));
         progress.set_message(metadata_pair_progress_message(
             scored_candidate_pairs,
             scored_left_docs,
@@ -676,6 +676,14 @@ fn union_metadata_pairs(
 struct MetadataDocPairBatch {
     hits: Vec<(usize, usize)>,
     candidate_pairs: u64,
+}
+
+fn metadata_scoring_progress_units(scoring_left_count: usize) -> u64 {
+    scoring_left_count as u64
+}
+
+fn metadata_scoring_batch_progress_units(left_start: usize, left_end: usize) -> u64 {
+    left_end.saturating_sub(left_start) as u64
 }
 
 fn metadata_pair_progress_message(
@@ -1660,9 +1668,9 @@ fn metadata_document_from_json(raw: &str) -> String {
     }
     match serde_json::from_str::<Value>(raw) {
         Ok(value) => {
-            let mut parts = BTreeSet::new();
-            collect_metadata_prefilter_parts(&value, &mut parts);
-            parts.into_iter().collect::<Vec<_>>().join(" ")
+            let mut parts = Vec::new();
+            flatten_metadata_content_values(&value, &mut parts);
+            normalize_metadata_text(&parts.join(" "))
         }
         Err(_) => normalize_metadata_text(raw),
     }
@@ -1675,7 +1683,7 @@ fn metadata_is_dedup_eligible(raw: &str) -> bool {
         && matches!(raw.chars().next(), Some('{') | Some('['))
 }
 
-fn collect_metadata_prefilter_parts(value: &Value, parts: &mut BTreeSet<String>) {
+fn flatten_metadata_content_values(value: &Value, parts: &mut Vec<String>) {
     match value {
         Value::Object(map) => {
             for (key, item) in map {
@@ -1683,88 +1691,43 @@ fn collect_metadata_prefilter_parts(value: &Value, parts: &mut BTreeSet<String>)
                 if key_norm.is_empty() {
                     continue;
                 }
-                if is_structure_wrapper_key(&key_norm) {
-                    collect_metadata_prefilter_parts(item, parts);
-                } else if key_norm == "trait_type" {
-                    push_metadata_prefilter_part(parts, &key_norm);
-                    if let Some(text) = item.as_str() {
-                        push_metadata_prefilter_part(parts, text);
-                    }
-                } else if metadata_prefilter_includes_value(&key_norm) {
-                    push_metadata_prefilter_part(parts, &key_norm);
-                    collect_metadata_prefilter_values(item, parts);
-                } else {
-                    push_metadata_prefilter_part(parts, &key_norm);
-                    collect_metadata_prefilter_parts(item, parts);
+                if metadata_content_key_includes_value(&key_norm) {
+                    flatten_metadata_content_values(item, parts);
                 }
             }
         }
         Value::Array(items) => {
             for item in items {
-                collect_metadata_prefilter_parts(item, parts);
+                flatten_metadata_content_values(item, parts);
             }
         }
-        _ => {}
+        Value::String(text) if !text.trim().is_empty() => parts.push(text.trim().to_string()),
+        Value::Number(number) => parts.push(number.to_string()),
+        Value::Bool(value) => parts.push(value.to_string()),
+        Value::String(_) | Value::Null => {}
     }
 }
 
-fn collect_metadata_prefilter_values(value: &Value, parts: &mut BTreeSet<String>) {
-    match value {
-        Value::String(text) => push_metadata_prefilter_part(parts, text),
-        Value::Number(number) => push_metadata_prefilter_part(parts, &number.to_string()),
-        Value::Bool(value) => push_metadata_prefilter_part(parts, &value.to_string()),
-        Value::Array(items) => {
-            for item in items {
-                collect_metadata_prefilter_values(item, parts);
-            }
-        }
-        Value::Object(map) => {
-            for (key, item) in map {
-                push_metadata_prefilter_part(parts, key);
-                collect_metadata_prefilter_values(item, parts);
-            }
-        }
-        Value::Null => {}
-    }
-}
-
-fn metadata_prefilter_includes_value(key: &str) -> bool {
-    is_description_key(key) || is_platform_key(key)
-}
-
-fn push_metadata_prefilter_part(parts: &mut BTreeSet<String>, raw: &str) {
-    let text = normalize_metadata_text(raw);
-    if !text.is_empty() {
-        parts.insert(text);
-    }
-}
-
-fn is_structure_wrapper_key(key: &str) -> bool {
-    matches!(key, "metadata" | "rawmetadata" | "raw")
-}
-
-fn is_description_key(key: &str) -> bool {
+fn metadata_content_key_includes_value(key: &str) -> bool {
     matches!(
         key,
-        "description" | "bio" | "story" | "lore" | "summary" | "about"
-    )
-}
-
-fn is_platform_key(key: &str) -> bool {
-    matches!(
-        key,
-        "seller_fee_basis_points"
-            | "fee_recipient"
-            | "royalty"
-            | "royalties"
-            | "creator"
-            | "creators"
-            | "compiler"
-            | "license"
-            | "collection"
-            | "marketplace"
-            | "contract"
-            | "chain"
+        "about"
+            | "animation_url"
+            | "attributes"
+            | "bio"
+            | "description"
+            | "display_type"
+            | "external_url"
+            | "image"
+            | "image_url"
+            | "lore"
+            | "metadata"
+            | "raw"
+            | "rawmetadata"
+            | "story"
+            | "summary"
+            | "trait_type"
+            | "value"
     )
 }
 
@@ -1818,7 +1781,7 @@ mod metadata_tests {
     }
 
     #[test]
-    fn metadata_document_uses_top_contract_prefilter_parts() {
+    fn metadata_document_uses_top_contract_content_values() {
         let document = metadata_document_from_json(
             r#"{
                 "description": "Gold Dragon",
@@ -1832,9 +1795,42 @@ mod metadata_tests {
             }"#,
         );
 
-        assert_eq!(
-            document,
-            "500 attributes background description eyes gold dragon irrelevant seller_fee_basis_points trait_type value"
+        assert!(document.contains("gold dragon"));
+        assert!(document.contains("background"));
+        assert!(document.contains("eyes"));
+        assert!(document.contains("laser"));
+        assert!(!document.contains("seller_fee_basis_points"));
+        assert!(!document.contains("hidden lore"));
+    }
+
+    #[test]
+    fn metadata_document_preserves_content_values_for_final_matching() {
+        let left = metadata_document_from_json(
+            r#"{
+                "name": "Alpha #1",
+                "image": "ipfs://alpha/1.png",
+                "attributes": [
+                    {"trait_type": "Background", "value": "Blue"}
+                ]
+            }"#,
+        );
+        let right = metadata_document_from_json(
+            r#"{
+                "name": "Beta #9",
+                "image": "ipfs://beta/9.png",
+                "attributes": [
+                    {"trait_type": "Background", "value": "Red"}
+                ]
+            }"#,
+        );
+
+        assert!(left.contains("alpha"));
+        assert!(left.contains("blue"));
+        assert!(right.contains("beta"));
+        assert!(right.contains("red"));
+        assert_ne!(
+            metadata_document_key(&MetadataBm25Document::from_text(&left).unwrap()),
+            metadata_document_key(&MetadataBm25Document::from_text(&right).unwrap())
         );
     }
 
@@ -1850,16 +1846,16 @@ mod metadata_tests {
     }
 
     #[test]
-    fn metadata_document_normalizes_nfkc_like_top_contract_prefilter() {
+    fn metadata_document_normalizes_nfkc_content_values() {
         let document = metadata_document_from_json(
             r#"{"description":"\uFF27\uFF4F\uFF4C\uFF44\u3000Dragon"}"#,
         );
 
-        assert_eq!(document, "description gold dragon");
+        assert_eq!(document, "gold dragon");
     }
 
     #[test]
-    fn metadata_document_requires_informative_prefilter_token_for_indexing() {
+    fn metadata_document_requires_informative_content_token_for_indexing() {
         let key_only = MetadataBm25Document::from_text("description").unwrap();
         let informative = MetadataBm25Document::from_text("description gold dragon").unwrap();
 
@@ -1936,6 +1932,12 @@ mod metadata_tests {
             metadata_pair_progress_message(0, 0, 6, 0, std::time::Duration::from_secs(0)),
             "metadata candidate pairs scored 0; left docs 0/6; estimated remaining 0; throughput n/a; ETA n/a; matched doc pairs 0"
         );
+    }
+
+    #[test]
+    fn metadata_scoring_progress_units_track_left_docs_not_candidate_pairs() {
+        assert_eq!(metadata_scoring_progress_units(10), 10);
+        assert_eq!(metadata_scoring_batch_progress_units(2, 7), 5);
     }
 
     #[test]
