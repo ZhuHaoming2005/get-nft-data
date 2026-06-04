@@ -31,10 +31,8 @@ fn run_name_analysis(
         atom_bytes,
         chain_matrix_state_bytes,
     )?;
-    set_duckdb_memory_limit(conn, memory_plan.duckdb_bytes)?;
     progress.step(format!(
-        "balanced memory: DuckDB {}, Rust {}",
-        format_byte_size(memory_plan.duckdb_bytes),
+        "Rust analysis memory budget {}",
         format_byte_size(memory_plan.analysis_bytes)
     ));
     let thresholds = unique_thresholds(thresholds);
@@ -75,7 +73,11 @@ fn run_name_analysis(
                 "fallback"
             }
         ));
-        progress.add_work(full_name_chunk_count(atoms.len()));
+        let min_threshold = threshold_batch
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min);
+        progress.add_work(candidate_name_chunk_count(&atoms, min_threshold));
         let mut states = threshold_batch
             .iter()
             .copied()
@@ -187,6 +189,12 @@ fn load_all_name_atoms(
             });
         }
     }
+    atoms.sort_by(|left, right| {
+        left.char_len
+            .cmp(&right.char_len)
+            .then_with(|| left.chain_index.cmp(&right.chain_index))
+            .then_with(|| left.name_norm.cmp(&right.name_norm))
+    });
     Ok(atoms)
 }
 
@@ -392,6 +400,7 @@ fn adaptive_threshold_batch_size(
     capacity.min(headroom_capacity)
 }
 
+#[cfg(test)]
 fn full_name_chunk_count(atom_count: usize) -> u64 {
     if atom_count < 2 {
         return 0;
@@ -399,6 +408,20 @@ fn full_name_chunk_count(atom_count: usize) -> u64 {
     triangular_chunk_count(atom_count - 1)
 }
 
+fn candidate_name_chunk_count(atoms: &[NameAtom], threshold: f64) -> u64 {
+    if atoms.len() < 2 {
+        return 0;
+    }
+    (0..atoms.len() - 1)
+        .map(|left| {
+            right_name_range_end_for_left(atoms, left, threshold)
+                .saturating_sub(left + 1)
+                .div_ceil(RIGHT_SCORE_CHUNK_SIZE) as u64
+        })
+        .sum()
+}
+
+#[cfg(test)]
 fn triangular_chunk_count(max_right_count: usize) -> u64 {
     let chunk = RIGHT_SCORE_CHUNK_SIZE as u128;
     let count = max_right_count as u128;
@@ -412,6 +435,7 @@ fn triangular_chunk_count(max_right_count: usize) -> u64 {
     total.min(u64::MAX as u128) as u64
 }
 
+#[cfg(test)]
 fn chain_pair_chunk_count(left_count: usize, right_count: usize) -> u64 {
     if left_count == 0 || right_count == 0 {
         return 0;

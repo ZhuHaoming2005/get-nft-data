@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use duckdb::Connection;
 use name_uri_analysis_rs::analysis::{run_analysis, AnalysisOptions};
@@ -89,6 +89,74 @@ fn write_parquet_with_metadata_json_and_doc(path: &Path, values_sql: &str) {
         values_sql = values_sql
     );
     conn.execute_batch(&sql).unwrap();
+}
+
+#[test]
+fn analyzes_with_duckdb_memory_database() {
+    let temp = tempfile::tempdir().unwrap();
+    let parquet = temp.path().join("sample.parquet");
+    write_parquet(
+        &parquet,
+        r#"
+            VALUES
+            ('ethereum', '0xaaa', '1', 'shared', 'img1', 'Azuki', 'azuki'),
+            ('ethereum', '0xbbb', '1', 'shared', 'img2', 'Azuki', 'azuki')
+        "#,
+    );
+
+    let report = run_analysis(AnalysisOptions {
+        database_path: PathBuf::from(":memory:"),
+        parquet_inputs: vec![parquet],
+        output_dir: temp.path().join("out"),
+        thresholds: vec![95.0],
+        threads: 2,
+        memory_limit: "256MB".into(),
+        analysis_memory_limit: Some("64MB".into()),
+        temp_directory: None,
+        progress: false,
+        persist_prepared: false,
+        reuse_prepared: false,
+    })
+    .unwrap();
+
+    assert!(report.summary_rows.iter().any(|row| {
+        row.field_name == "uri"
+            && row.scope == "intra_chain"
+            && row.primary_chain == "ethereum"
+            && row.duplicate_contract_count == 2
+    }));
+}
+
+#[test]
+fn duckdb_database_path_is_ignored_for_memory_mode() {
+    let temp = tempfile::tempdir().unwrap();
+    let parquet = temp.path().join("sample.parquet");
+    let db = temp.path().join("analysis.duckdb");
+    write_parquet(
+        &parquet,
+        r#"
+            VALUES
+            ('ethereum', '0xaaa', '1', 'shared', 'img1', 'Azuki', 'azuki'),
+            ('ethereum', '0xbbb', '1', 'shared', 'img2', 'Azuki', 'azuki')
+        "#,
+    );
+
+    run_analysis(AnalysisOptions {
+        database_path: db.clone(),
+        parquet_inputs: vec![parquet],
+        output_dir: temp.path().join("out"),
+        thresholds: vec![95.0],
+        threads: 2,
+        memory_limit: "256MB".into(),
+        analysis_memory_limit: Some("64MB".into()),
+        temp_directory: None,
+        progress: false,
+        persist_prepared: false,
+        reuse_prepared: false,
+    })
+    .unwrap();
+
+    assert!(!db.exists());
 }
 
 #[test]

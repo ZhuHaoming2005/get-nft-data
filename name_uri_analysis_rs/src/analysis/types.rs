@@ -1,7 +1,5 @@
 #[derive(Debug, Error)]
 pub enum AnalysisError {
-    #[error("database_path must be a disk path, not :memory:")]
-    MemoryDatabaseDisabled,
     #[error("at least one parquet input is required")]
     MissingParquetInput,
     #[error("invalid data: {0}")]

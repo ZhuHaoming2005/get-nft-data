@@ -1,10 +1,7 @@
 #[derive(Debug)]
 struct MemoryPlan {
-    duckdb_bytes: usize,
     analysis_bytes: usize,
 }
-
-const DUCKDB_MIN_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
 struct MemoryGuard {
     total_budget: usize,
@@ -45,55 +42,6 @@ impl MemoryGuard {
             current_rss,
         )
     }
-}
-
-fn set_duckdb_memory_limit(conn: &Connection, bytes: usize) -> Result<(), AnalysisError> {
-    let bytes = duckdb_effective_memory_limit_bytes(bytes);
-    conn.execute(
-        &format!(
-            "PRAGMA memory_limit='{}'",
-            sql_string(&format_byte_size(bytes))
-        ),
-        [],
-    )?;
-    Ok(())
-}
-
-fn duckdb_effective_memory_limit_bytes(bytes: usize) -> usize {
-    if bytes == 0 {
-        DUCKDB_MIN_MEMORY_LIMIT_BYTES
-    } else {
-        bytes
-    }
-}
-
-fn set_duckdb_memory_limit_for_process_budget(
-    conn: &Connection,
-    memory_guard: &mut MemoryGuard,
-    desired_duckdb_bytes: usize,
-) -> Result<(), AnalysisError> {
-    let current_rss = memory_guard.current_rss_bytes().unwrap_or(0);
-    let bytes = duckdb_memory_limit_from_process_budget(
-        memory_guard.total_budget,
-        current_rss,
-        desired_duckdb_bytes,
-    )?;
-    set_duckdb_memory_limit(conn, bytes)
-}
-
-fn duckdb_memory_limit_from_process_budget(
-    total_budget: usize,
-    current_rss: usize,
-    desired_duckdb_bytes: usize,
-) -> Result<usize, AnalysisError> {
-    if total_budget <= current_rss {
-        return Err(AnalysisError::InvalidData(format!(
-            "process RSS {} already reached --memory-limit {}; cannot safely start another DuckDB batch",
-            format_byte_size(current_rss),
-            format_byte_size(total_budget)
-        )));
-    }
-    Ok(desired_duckdb_bytes.min(total_budget - current_rss))
 }
 
 fn name_analysis_memory_plan(
@@ -153,18 +101,17 @@ fn explicit_analysis_memory_plan(
     }
 
     Ok(MemoryPlan {
-        duckdb_bytes: total_budget.saturating_sub(requested_analysis),
         analysis_bytes: requested_analysis,
     })
 }
 
 fn auto_balanced_memory_plan(
     total_budget: usize,
-    threshold_count: usize,
-    atom_count: usize,
-    chain_count: usize,
+    _threshold_count: usize,
+    _atom_count: usize,
+    _chain_count: usize,
     resident_analysis_bytes: usize,
-    chain_matrix_reuse_bytes: usize,
+    _chain_matrix_reuse_bytes: usize,
 ) -> Result<MemoryPlan, AnalysisError> {
     if resident_analysis_bytes > total_budget {
         return Err(AnalysisError::InvalidData(format!(
@@ -173,32 +120,9 @@ fn auto_balanced_memory_plan(
             format_byte_size(total_budget)
         )));
     }
-    let desired_analysis = desired_analysis_budget(
-        threshold_count,
-        atom_count,
-        chain_count,
-        resident_analysis_bytes,
-        chain_matrix_reuse_bytes,
-    );
-    let duckdb_bytes = total_budget.saturating_sub(desired_analysis.min(total_budget));
-
     Ok(MemoryPlan {
-        duckdb_bytes,
         analysis_bytes: total_budget,
     })
-}
-
-fn desired_analysis_budget(
-    threshold_count: usize,
-    atom_count: usize,
-    chain_count: usize,
-    resident_analysis_bytes: usize,
-    chain_matrix_reuse_bytes: usize,
-) -> usize {
-    let thresholds = threshold_count.max(1);
-    let per_threshold_bytes =
-        threshold_state_bytes(atom_count, chain_count).saturating_add(chain_matrix_reuse_bytes);
-    resident_analysis_bytes.saturating_add(per_threshold_bytes.saturating_mul(thresholds))
 }
 
 fn total_memory_budget_bytes(value: &str) -> Result<usize, AnalysisError> {

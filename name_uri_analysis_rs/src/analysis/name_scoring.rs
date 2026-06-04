@@ -14,8 +14,9 @@ fn union_full_name_pairs(
 
     let mut pending_progress = 0;
     for left in 0..atoms.len() - 1 {
-        for chunk_start in (left + 1..atoms.len()).step_by(RIGHT_SCORE_CHUNK_SIZE) {
-            let chunk_end = (chunk_start + RIGHT_SCORE_CHUNK_SIZE).min(atoms.len());
+        let right_end = right_name_range_end_for_left(atoms, left, min_threshold);
+        for chunk_start in (left + 1..right_end).step_by(RIGHT_SCORE_CHUNK_SIZE) {
+            let chunk_end = (chunk_start + RIGHT_SCORE_CHUNK_SIZE).min(right_end);
             let matching_rights =
                 score_name_pairs_for_left_chunk(atoms, left, chunk_start, chunk_end, min_threshold);
             apply_matching_name_pairs(atoms, states, left, &matching_rights, chain_count);
@@ -24,6 +25,25 @@ fn union_full_name_pairs(
         }
     }
     flush_remaining_progress(progress, &mut pending_progress);
+}
+
+fn right_name_range_end_for_left(atoms: &[NameAtom], left: usize, threshold: f64) -> usize {
+    if left + 1 >= atoms.len() {
+        return atoms.len();
+    }
+
+    let left_len = atoms[left].char_len;
+    let mut low = left + 1;
+    let mut high = atoms.len();
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if name_pair_lengths_can_reach_threshold(left_len, atoms[middle].char_len, threshold) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    low
 }
 
 fn score_name_pairs_for_left_chunk(

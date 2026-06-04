@@ -5,9 +5,6 @@ fn configure_duckdb(conn: &Connection, options: &AnalysisOptions) -> Result<(), 
         ",
     )?;
     conn.execute(&format!("PRAGMA threads={}", options.threads.max(1)), [])?;
-    let total_budget = total_memory_budget_bytes(&options.memory_limit)?;
-    let mut memory_guard = MemoryGuard::new(total_budget);
-    set_duckdb_memory_limit_for_process_budget(conn, &mut memory_guard, total_budget)?;
     if let Some(temp_directory) = &options.temp_directory {
         fs::create_dir_all(temp_directory)?;
         conn.execute(
@@ -29,34 +26,12 @@ fn prepare_base_tables(
     let inputs = parquet_input_sql(&options.parquet_inputs);
     let input_columns = parquet_input_columns(conn, &inputs)?;
     let metadata_json_expr = metadata_json_projection_expr(&input_columns);
-    let total_budget = total_memory_budget_bytes(&options.memory_limit)?;
-    let mut memory_guard = MemoryGuard::new(total_budget);
     progress.start_phase("preparing DuckDB tables", 7);
     execute_duckdb_progress_batch(
         conn,
-        &format!(
-            "
-            CREATE TEMP TABLE analysis_rows AS
-            SELECT lower(trim(CAST(chain AS VARCHAR))) AS chain,
-                   lower(trim(CAST(contract_address AS VARCHAR))) AS contract_address,
-                   trim(coalesce(CAST(token_id AS VARCHAR), '')) AS token_id,
-                   trim(coalesce(CAST(token_uri AS VARCHAR), '')) AS token_uri,
-                   trim(coalesce(CAST(image_uri AS VARCHAR), '')) AS image_uri,
-                   coalesce(CAST(token_uri_norm AS VARCHAR), '') AS token_uri_norm,
-                   coalesce(CAST(image_uri_norm AS VARCHAR), '') AS image_uri_norm,
-                   trim(coalesce(CAST(name_norm AS VARCHAR), '')) AS name_norm,
-                   trim(coalesce({metadata_json_expr}, '')) AS metadata_json
-            FROM read_parquet({inputs})
-            WHERE chain IS NOT NULL
-              AND trim(CAST(chain AS VARCHAR)) <> '';
-            ",
-            inputs = inputs,
-            metadata_json_expr = metadata_json_expr,
-        ),
+        &build_analysis_rows_sql(&inputs, &metadata_json_expr),
         progress,
         "materialized DuckDB working projection",
-        &mut memory_guard,
-        total_budget,
     )?;
     execute_duckdb_progress_batch(
         conn,
@@ -68,27 +43,11 @@ fn prepare_base_tables(
         ",
         progress,
         "loaded selected chains",
-        &mut memory_guard,
-        total_budget,
     )?;
     let chains = load_selected_chains(conn)?;
     let include_cross_chain = chains.len() > 1;
-    build_uri_key_stats(
-        conn,
-        progress,
-        &mut memory_guard,
-        total_budget,
-        include_cross_chain,
-        false,
-    )?;
-    build_uri_contract_flags(
-        conn,
-        progress,
-        &mut memory_guard,
-        total_budget,
-        include_cross_chain,
-        false,
-    )?;
+    build_uri_key_stats(conn, progress, include_cross_chain, false)?;
+    build_uri_contract_flags(conn, progress, include_cross_chain, false)?;
     execute_duckdb_progress_batch(
         conn,
         "
@@ -104,8 +63,6 @@ fn prepare_base_tables(
         ",
         progress,
         "materialized contract names",
-        &mut memory_guard,
-        total_budget,
     )?;
     execute_duckdb_progress_batch(
         conn,
@@ -125,11 +82,28 @@ fn prepare_base_tables(
         ",
         progress,
         "built name atoms",
-        &mut memory_guard,
-        total_budget,
     )?;
     progress.finish_phase("DuckDB tables ready");
     Ok(chains)
+}
+
+fn build_analysis_rows_sql(inputs: &str, metadata_json_expr: &str) -> String {
+    format!(
+        "
+            CREATE TEMP TABLE analysis_rows AS
+            SELECT lower(trim(CAST(chain AS VARCHAR))) AS chain,
+                   lower(trim(CAST(contract_address AS VARCHAR))) AS contract_address,
+                   coalesce(CAST(token_uri_norm AS VARCHAR), '') AS token_uri_norm,
+                   coalesce(CAST(image_uri_norm AS VARCHAR), '') AS image_uri_norm,
+                   trim(coalesce(CAST(name_norm AS VARCHAR), '')) AS name_norm,
+                   trim(coalesce({metadata_json_expr}, '')) AS metadata_json
+            FROM read_parquet({inputs})
+            WHERE chain IS NOT NULL
+              AND trim(CAST(chain AS VARCHAR)) <> '';
+            ",
+        inputs = inputs,
+        metadata_json_expr = metadata_json_expr,
+    )
 }
 
 fn execute_progress_batch(
@@ -149,10 +123,7 @@ fn execute_duckdb_progress_batch(
     sql: &str,
     progress: &ProgressTracker,
     message: &str,
-    memory_guard: &mut MemoryGuard,
-    desired_duckdb_bytes: usize,
 ) -> Result<(), AnalysisError> {
-    set_duckdb_memory_limit_for_process_budget(conn, memory_guard, desired_duckdb_bytes)?;
     execute_progress_batch(conn, sql, progress, message)
 }
 
@@ -197,8 +168,6 @@ fn prepared_table_scope(persist_prepared: bool) -> &'static str {
 fn build_uri_key_stats(
     conn: &Connection,
     progress: &ProgressTracker,
-    memory_guard: &mut MemoryGuard,
-    desired_duckdb_bytes: usize,
     _include_cross_chain: bool,
     persist_prepared: bool,
 ) -> Result<(), AnalysisError> {
@@ -207,8 +176,6 @@ fn build_uri_key_stats(
         &build_uri_key_contracts_sql(persist_prepared),
         progress,
         "built URI key contracts",
-        memory_guard,
-        desired_duckdb_bytes,
     )?;
 
     execute_duckdb_progress_batch(
@@ -216,8 +183,6 @@ fn build_uri_key_stats(
         &build_uri_duplicate_key_stats_sql(persist_prepared),
         progress,
         "built duplicate-only URI key stats",
-        memory_guard,
-        desired_duckdb_bytes,
     )?;
     Ok(())
 }
@@ -266,8 +231,6 @@ fn build_uri_duplicate_key_stats_sql(persist_prepared: bool) -> String {
 fn build_uri_contract_flags(
     conn: &Connection,
     progress: &ProgressTracker,
-    memory_guard: &mut MemoryGuard,
-    desired_duckdb_bytes: usize,
     _include_cross_chain: bool,
     persist_prepared: bool,
 ) -> Result<(), AnalysisError> {
@@ -276,8 +239,6 @@ fn build_uri_contract_flags(
         &build_uri_contract_flags_sql(false, persist_prepared),
         progress,
         "built compact URI contract flags",
-        memory_guard,
-        desired_duckdb_bytes,
     )
 }
 

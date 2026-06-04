@@ -87,15 +87,17 @@ mod tests {
     }
 
     #[test]
-    fn auto_memory_plan_reserves_duckdb_only_after_chain_matrix_reuse_need() {
+    fn auto_memory_plan_uses_full_budget_without_duckdb_reservation() {
         let atoms_by_chain = vec![vec![0; 10_000], vec![0; 10_000], vec![0; 10_000]];
         let atom_count = atoms_by_chain.iter().map(Vec::len).sum();
-        let threshold_count = 3;
         let global_bytes = threshold_state_bytes(atom_count, atoms_by_chain.len());
         let matrix_bytes = chain_matrix_reuse_state_bytes(&atoms_by_chain);
-        let state_need = global_bytes.saturating_add(matrix_bytes);
-        let total_budget = state_need.saturating_mul(threshold_count).saturating_mul(2);
+        let total_budget = global_bytes
+            .saturating_add(matrix_bytes)
+            .saturating_mul(3)
+            .saturating_mul(2);
         let memory_limit = format_byte_size(total_budget);
+        let parsed_budget = total_memory_budget_bytes(&memory_limit).unwrap();
 
         let plan = name_analysis_memory_plan(
             &[90.0, 95.0, 98.0],
@@ -108,11 +110,11 @@ mod tests {
         )
         .unwrap();
 
-        assert!(plan.duckdb_bytes <= total_budget.saturating_sub(state_need * threshold_count));
+        assert_eq!(plan.analysis_bytes, parsed_budget);
     }
 
     #[test]
-    fn default_memory_budget_is_auto_balanced_between_duckdb_and_rust() {
+    fn default_memory_budget_is_fully_available_to_rust_batching() {
         let small =
             name_analysis_memory_plan(&[90.0, 95.0, 98.0], 1_000, 1, "10GB", None, 0, 0).unwrap();
         let large =
@@ -121,7 +123,6 @@ mod tests {
 
         assert_eq!(small.analysis_bytes, 10 * 1024 * 1024 * 1024);
         assert_eq!(large.analysis_bytes, 10 * 1024 * 1024 * 1024);
-        assert!(large.duckdb_bytes < small.duckdb_bytes);
     }
 
     #[test]
@@ -130,7 +131,6 @@ mod tests {
             name_analysis_memory_plan(&[90.0, 95.0, 98.0], 1_000, 2, "10GB", Some("16KB"), 0, 0)
                 .unwrap();
 
-        assert!(plan.duckdb_bytes < 10 * 1024 * 1024 * 1024);
         assert_eq!(plan.analysis_bytes, 16 * 1024);
     }
 
@@ -150,8 +150,27 @@ mod tests {
             name_analysis_memory_plan(&[90.0, 95.0, 98.0], 10_000, 2, "4GB", Some("auto"), 0, 0)
                 .unwrap();
 
-        assert_eq!(auto_plan.duckdb_bytes, default_plan.duckdb_bytes);
         assert_eq!(auto_plan.analysis_bytes, default_plan.analysis_bytes);
+    }
+
+    #[test]
+    fn duckdb_configuration_does_not_parse_memory_limit() {
+        let conn = Connection::open_in_memory().unwrap();
+        let options = AnalysisOptions {
+            database_path: PathBuf::from(":memory:"),
+            parquet_inputs: Vec::new(),
+            output_dir: PathBuf::from("unused"),
+            thresholds: vec![95.0],
+            threads: 1,
+            memory_limit: "not-a-size".into(),
+            analysis_memory_limit: None,
+            temp_directory: None,
+            progress: false,
+            persist_prepared: false,
+            reuse_prepared: false,
+        };
+
+        configure_duckdb(&conn, &options).unwrap();
     }
 
     #[test]
@@ -176,29 +195,6 @@ mod tests {
     }
 
     #[test]
-    fn duckdb_limit_is_capped_by_process_headroom() {
-        let limit = duckdb_memory_limit_from_process_budget(10_000, 4_000, 9_000).unwrap();
-
-        assert_eq!(limit, 6_000);
-    }
-
-    #[test]
-    fn duckdb_limit_rejects_exhausted_process_budget() {
-        let error = duckdb_memory_limit_from_process_budget(10_000, 10_000, 9_000).unwrap_err();
-
-        assert!(error.to_string().contains("process RSS"));
-    }
-
-    #[test]
-    fn duckdb_effective_limit_keeps_zero_from_becoming_noop() {
-        assert_eq!(
-            duckdb_effective_memory_limit_bytes(0),
-            DUCKDB_MIN_MEMORY_LIMIT_BYTES
-        );
-        assert_eq!(duckdb_effective_memory_limit_bytes(1), 1);
-    }
-
-    #[test]
     fn jaro_winkler_upper_bound_filters_impossible_thresholds() {
         let upper_bound = jaro_winkler_upper_bound("azuki", "a-very-long-unrelated-name");
 
@@ -212,6 +208,102 @@ mod tests {
 
         assert_eq!(upper_bound, jaro_winkler_upper_bound("azuki", "a-very-long-unrelated-name"));
         assert!(name_pair_lengths_can_reach_threshold(5, 6, 90.0));
+    }
+
+    #[test]
+    fn sorted_name_lengths_bound_candidate_chunks() {
+        let atoms = vec![
+            NameAtom {
+                chain_index: 0,
+                name_norm: "azuki".into(),
+                char_len: 5,
+                contract_count: 1,
+                nft_count: 1,
+            },
+            NameAtom {
+                chain_index: 0,
+                name_norm: "azukis".into(),
+                char_len: 6,
+                contract_count: 1,
+                nft_count: 1,
+            },
+            NameAtom {
+                chain_index: 0,
+                name_norm: "a-very-long-unrelated-name".into(),
+                char_len: 26,
+                contract_count: 1,
+                nft_count: 1,
+            },
+        ];
+
+        assert_eq!(right_name_range_end_for_left(&atoms, 0, 95.0), 2);
+        assert_eq!(candidate_name_chunk_count(&atoms, 95.0), 1);
+        assert_eq!(full_name_chunk_count(atoms.len()), 2);
+    }
+
+    #[test]
+    fn chain_pair_length_window_excludes_unreachable_right_atoms() {
+        let atoms = vec![
+            NameAtom {
+                chain_index: 1,
+                name_norm: "cat".into(),
+                char_len: 3,
+                contract_count: 1,
+                nft_count: 1,
+            },
+            NameAtom {
+                chain_index: 0,
+                name_norm: "azuki".into(),
+                char_len: 5,
+                contract_count: 1,
+                nft_count: 1,
+            },
+            NameAtom {
+                chain_index: 1,
+                name_norm: "azukis".into(),
+                char_len: 6,
+                contract_count: 1,
+                nft_count: 1,
+            },
+            NameAtom {
+                chain_index: 1,
+                name_norm: "a-very-long-unrelated-name".into(),
+                char_len: 26,
+                contract_count: 1,
+                nft_count: 1,
+            },
+        ];
+        let left_atoms = vec![1];
+        let right_atoms = vec![0, 2, 3];
+
+        assert_eq!(
+            right_atom_range_for_left(&atoms, &right_atoms, left_atoms[0], 95.0),
+            1..2
+        );
+        assert_eq!(
+            chain_pair_candidate_chunk_count(&atoms, &left_atoms, &right_atoms, 95.0),
+            1
+        );
+    }
+
+    #[test]
+    fn analysis_rows_projection_omits_unused_raw_uri_columns() {
+        let sql = build_analysis_rows_sql("'sample.parquet'", "metadata_json");
+
+        assert!(!sql.contains(" AS token_id,"));
+        assert!(!sql.contains(" AS token_uri,"));
+        assert!(!sql.contains(" AS image_uri,"));
+        assert!(sql.contains("token_uri_norm"));
+        assert!(sql.contains("image_uri_norm"));
+        assert!(sql.contains("metadata_json"));
+    }
+
+    #[test]
+    fn metadata_raw_rows_sql_groups_unique_contract_documents() {
+        let sql = metadata_raw_rows_sql();
+
+        assert!(sql.contains("GROUP BY chain, contract_address, metadata_json"));
+        assert!(!sql.contains("rowid"));
     }
 
     #[test]

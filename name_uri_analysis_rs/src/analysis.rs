@@ -15,9 +15,6 @@ include!("analysis/types.rs");
 include!("analysis/progress.rs");
 
 pub fn run_analysis(options: AnalysisOptions) -> Result<AnalysisReport, AnalysisError> {
-    if options.database_path.to_string_lossy() == ":memory:" {
-        return Err(AnalysisError::MemoryDatabaseDisabled);
-    }
     if options.parquet_inputs.is_empty() {
         return Err(AnalysisError::MissingParquetInput);
     }
@@ -32,14 +29,11 @@ pub fn run_analysis(options: AnalysisOptions) -> Result<AnalysisReport, Analysis
         ));
     }
 
-    if let Some(parent) = options.database_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     fs::create_dir_all(&options.output_dir)?;
 
     let progress = ProgressTracker::new(6, options.progress);
     progress.start_phase("configuring DuckDB", 1);
-    let conn = Connection::open(&options.database_path)?;
+    let conn = Connection::open_in_memory()?;
     configure_duckdb(&conn, &options)?;
     progress.step("DuckDB configured");
     progress.finish_phase("DuckDB configured");

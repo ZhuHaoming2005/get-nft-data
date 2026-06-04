@@ -1,6 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use serde_json::Value;
+use unicode_normalization::UnicodeNormalization;
 
 const METADATA_THRESHOLD: f64 = 0.6;
 const METADATA_MATCH_MODE: &str = "bm25_representative";
@@ -34,25 +35,32 @@ struct MetadataContract {
     nft_count: i64,
 }
 
-#[derive(Clone, Debug)]
-struct MetadataDocEntry {
+#[derive(Debug)]
+struct SourceMetadataDocEntry {
     doc: MetadataBm25Document,
     contracts: Vec<usize>,
     contracts_by_chain: Vec<Vec<usize>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
+struct MetadataDocEntry {
+    contracts: Vec<usize>,
+    contracts_by_chain: Vec<Vec<usize>>,
+}
+
+#[derive(Debug)]
 struct MetadataData {
     contracts: Vec<MetadataContract>,
     contracts_by_chain: Vec<Vec<usize>>,
     docs: Vec<MetadataDocEntry>,
+    metadata_index: InternedMetadataIndex,
 }
 
 struct MetadataDataBuilder {
     contracts: Vec<MetadataContract>,
     contracts_by_chain: Vec<Vec<usize>>,
     contract_index_by_key: HashMap<(usize, String), usize>,
-    docs: Vec<MetadataDocEntry>,
+    docs: Vec<SourceMetadataDocEntry>,
     doc_index_by_key: HashMap<MetadataDocKey, usize>,
     doc_contract_memberships: HashSet<(usize, usize)>,
     chain_count: usize,
@@ -66,16 +74,39 @@ struct MetadataBm25Document {
 }
 
 #[derive(Debug)]
-struct MetadataBm25Corpus {
-    total_docs: usize,
-    avg_doc_len: f64,
-    doc_freqs: HashMap<String, usize>,
+struct InternedMetadataDoc {
+    tokens: Vec<usize>,
+    term_freqs: HashMap<usize, usize>,
+    unique_tokens: Vec<usize>,
 }
 
 #[derive(Debug)]
-struct PreparedMetadataQuery {
-    terms: Vec<(String, usize)>,
+struct InternedMetadataCorpus {
+    total_docs: usize,
+    avg_doc_len: f64,
+    doc_freqs: Vec<usize>,
+}
+
+#[derive(Debug)]
+struct PreparedInternedMetadataQuery {
+    terms: Vec<(usize, usize)>,
     denominator: f64,
+}
+
+#[derive(Debug)]
+struct InternedMetadataIndex {
+    docs: Vec<InternedMetadataDoc>,
+    corpus: InternedMetadataCorpus,
+    queries: Vec<PreparedInternedMetadataQuery>,
+    postings: Vec<Vec<usize>>,
+    #[cfg(test)]
+    token_ids: HashMap<String, usize>,
+}
+
+struct MetadataCandidateScratch {
+    seen_generation: Vec<u32>,
+    generation: u32,
+    candidates: Vec<usize>,
 }
 
 struct MetadataUnionState {
@@ -142,7 +173,7 @@ impl MetadataDataBuilder {
             None => {
                 let index = self.docs.len();
                 self.doc_index_by_key.insert(row.doc_key, index);
-                self.docs.push(MetadataDocEntry {
+                self.docs.push(SourceMetadataDocEntry {
                     doc: row.doc,
                     contracts: Vec::new(),
                     contracts_by_chain: vec![Vec::new(); self.chain_count],
@@ -161,11 +192,48 @@ impl MetadataDataBuilder {
     }
 
     fn finish(self) -> MetadataData {
+        let metadata_index = InternedMetadataIndex::from_doc_entries(&self.docs);
+        let docs = self
+            .docs
+            .into_iter()
+            .map(|entry| MetadataDocEntry {
+                contracts: entry.contracts,
+                contracts_by_chain: entry.contracts_by_chain,
+            })
+            .collect();
         MetadataData {
             contracts: self.contracts,
             contracts_by_chain: self.contracts_by_chain,
-            docs: self.docs,
+            docs,
+            metadata_index,
         }
+    }
+}
+
+impl MetadataCandidateScratch {
+    fn new(doc_count: usize) -> Self {
+        Self {
+            seen_generation: vec![0; doc_count],
+            generation: 0,
+            candidates: Vec::new(),
+        }
+    }
+
+    fn clear_for_next_left(&mut self) {
+        self.candidates.clear();
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.seen_generation.fill(0);
+            self.generation = 1;
+        }
+    }
+
+    fn push_once(&mut self, index: usize) {
+        if self.seen_generation[index] == self.generation {
+            return;
+        }
+        self.seen_generation[index] = self.generation;
+        self.candidates.push(index);
     }
 }
 
@@ -220,34 +288,7 @@ fn load_metadata_data(
         .enumerate()
         .map(|(index, chain)| (chain.as_str(), index))
         .collect::<HashMap<_, _>>();
-    let mut stmt = conn.prepare(
-        &format!(
-            "
-            WITH totals AS (
-                SELECT chain, contract_address, count(*)::BIGINT AS nft_count
-                FROM analysis_rows
-                WHERE contract_address <> ''
-                GROUP BY chain, contract_address
-            )
-            SELECT r.chain,
-                   r.contract_address,
-                   r.metadata_json,
-                   t.nft_count
-            FROM analysis_rows r
-            JOIN totals t
-              ON t.chain = r.chain
-             AND t.contract_address = r.contract_address
-            WHERE r.contract_address <> ''
-              AND r.metadata_json <> ''
-              AND length(r.metadata_json) <= {MAX_METADATA_BYTES_FOR_DEDUP}
-              AND (
-                  starts_with(r.metadata_json, '{{')
-                  OR starts_with(r.metadata_json, '[')
-              )
-            ORDER BY r.chain, r.contract_address, r.rowid
-            "
-        ),
-    )?;
+    let mut stmt = conn.prepare(&metadata_raw_rows_sql())?;
     let rows = stmt.query_map([], |row| {
         Ok(RawMetadataRow {
             chain: row.get::<_, String>(0)?,
@@ -280,6 +321,41 @@ fn load_metadata_data(
     Ok(builder.finish())
 }
 
+fn metadata_raw_rows_sql() -> String {
+    format!(
+        "
+            WITH totals AS (
+                SELECT chain, contract_address, count(*)::BIGINT AS nft_count
+                FROM analysis_rows
+                WHERE contract_address <> ''
+                GROUP BY chain, contract_address
+            ),
+            eligible_metadata AS (
+                SELECT chain,
+                       contract_address,
+                       metadata_json
+                FROM analysis_rows
+                WHERE contract_address <> ''
+                  AND metadata_json <> ''
+                  AND length(metadata_json) <= {MAX_METADATA_BYTES_FOR_DEDUP}
+                  AND (
+                      starts_with(metadata_json, '{{')
+                      OR starts_with(metadata_json, '[')
+                  )
+                GROUP BY chain, contract_address, metadata_json
+            )
+            SELECT m.chain,
+                   m.contract_address,
+                   m.metadata_json,
+                   t.nft_count
+            FROM eligible_metadata m
+            JOIN totals t
+              ON t.chain = m.chain
+             AND t.contract_address = m.contract_address
+            "
+    )
+}
+
 fn index_metadata_raw_row_chunk(
     raw_rows: Vec<RawMetadataRow>,
     chain_indexes: &HashMap<&str, usize>,
@@ -290,6 +366,9 @@ fn index_metadata_raw_row_chunk(
             let chain_index = chain_indexes.get(row.chain.as_str()).copied()?;
             let document = metadata_document_from_json(&row.metadata_json);
             let doc = MetadataBm25Document::from_text(&document)?;
+            if !metadata_document_has_informative_token(&doc) {
+                return None;
+            }
             let doc_key = metadata_document_key(&doc);
             Some(IndexedMetadataRow {
                 chain_index,
@@ -307,6 +386,44 @@ fn metadata_document_key(doc: &MetadataBm25Document) -> MetadataDocKey {
         .iter()
         .map(|token| (token.clone(), doc.term_frequency(token)))
         .collect()
+}
+
+fn metadata_document_has_informative_token(doc: &MetadataBm25Document) -> bool {
+    doc.unique_tokens
+        .iter()
+        .any(|token| !is_metadata_prefilter_key_token(token))
+}
+
+fn is_metadata_prefilter_key_token(token: &str) -> bool {
+    matches!(
+        token,
+        "about"
+            | "animation_url"
+            | "attributes"
+            | "bio"
+            | "chain"
+            | "collection"
+            | "compiler"
+            | "contract"
+            | "creator"
+            | "creators"
+            | "description"
+            | "display_type"
+            | "external_url"
+            | "fee_recipient"
+            | "image"
+            | "image_url"
+            | "license"
+            | "lore"
+            | "marketplace"
+            | "royalties"
+            | "royalty"
+            | "seller_fee_basis_points"
+            | "story"
+            | "summary"
+            | "trait_type"
+            | "value"
+    )
 }
 
 fn metadata_totals(data: &MetadataData, chains: &[String]) -> HashMap<String, NameTotals> {
@@ -333,29 +450,23 @@ fn metadata_totals(data: &MetadataData, chains: &[String]) -> HashMap<String, Na
 }
 
 fn union_metadata_pairs(data: &MetadataData, chain_count: usize, state: &mut MetadataUnionState) {
-    let corpus = MetadataBm25Corpus::from_doc_entries(&data.docs);
-    if corpus.total_docs == 0 {
+    let index = &data.metadata_index;
+    if index.corpus.total_docs == 0 {
         return;
     }
     for doc_index in 0..data.docs.len() {
         apply_metadata_exact_doc_unions(data, chain_count, state, doc_index);
     }
 
-    let queries = data
-        .docs
-        .par_iter()
-        .map(|entry| PreparedMetadataQuery::new(&entry.doc, &corpus))
-        .collect::<Vec<_>>();
-    let postings = metadata_token_postings(&data.docs);
     let scoring_left_count = data.docs.len().saturating_sub(1);
     for left_start in (0..scoring_left_count).step_by(METADATA_PAIR_LEFT_CHUNK_SIZE) {
         let left_end = (left_start + METADATA_PAIR_LEFT_CHUNK_SIZE).min(scoring_left_count);
         let hits = collect_metadata_doc_pair_hits_for_left_range(
             left_start..left_end,
-            &data.docs,
-            &queries,
-            &corpus,
-            &postings,
+            &index.docs,
+            &index.queries,
+            &index.corpus,
+            &index.postings,
         );
         for (left, right) in hits {
             apply_metadata_doc_pair_union(data, chain_count, state, left, right);
@@ -365,22 +476,32 @@ fn union_metadata_pairs(data: &MetadataData, chain_count: usize, state: &mut Met
 
 fn collect_metadata_doc_pair_hits_for_left_range(
     left_range: std::ops::Range<usize>,
-    docs: &[MetadataDocEntry],
-    queries: &[PreparedMetadataQuery],
-    corpus: &MetadataBm25Corpus,
-    postings: &HashMap<String, Vec<usize>>,
+    docs: &[InternedMetadataDoc],
+    queries: &[PreparedInternedMetadataQuery],
+    corpus: &InternedMetadataCorpus,
+    postings: &[Vec<usize>],
 ) -> Vec<(usize, usize)> {
     let mut hits = left_range
         .into_par_iter()
-        .fold(Vec::new, |mut local_hits, left| {
-            let candidates = metadata_candidate_indices_for_left(left, &docs[left].doc, postings);
-            for right in candidates {
-                if metadata_pair_score(left, right, docs, queries, corpus) >= METADATA_THRESHOLD {
-                    local_hits.push((left, right));
+        .fold(
+            || (Vec::new(), MetadataCandidateScratch::new(docs.len())),
+            |(mut local_hits, mut scratch), left| {
+                let candidates = metadata_candidate_indices_for_left_with_scratch(
+                    left,
+                    &docs[left],
+                    postings,
+                    &mut scratch,
+                );
+                for &right in candidates {
+                    if metadata_pair_score(left, right, docs, queries, corpus) >= METADATA_THRESHOLD
+                    {
+                        local_hits.push((left, right));
+                    }
                 }
-            }
-            local_hits
-        })
+                (local_hits, scratch)
+            },
+        )
+        .map(|(hits, _scratch)| hits)
         .reduce(Vec::new, |mut left, mut right| {
             left.append(&mut right);
             left
@@ -390,63 +511,39 @@ fn collect_metadata_doc_pair_hits_for_left_range(
     hits
 }
 
+fn metadata_candidate_indices_for_left_with_scratch<'a>(
+    left: usize,
+    doc: &InternedMetadataDoc,
+    postings: &[Vec<usize>],
+    scratch: &'a mut MetadataCandidateScratch,
+) -> &'a [usize] {
+    scratch.clear_for_next_left();
+    for token in doc.unique_tokens() {
+        let Some(indices) = postings.get(*token) else {
+            continue;
+        };
+        let start = indices.partition_point(|&right| right <= left);
+        for &right in &indices[start..] {
+            scratch.push_once(right);
+        }
+    }
+    &scratch.candidates
+}
+
 fn metadata_pair_score(
     left: usize,
     right: usize,
-    docs: &[MetadataDocEntry],
-    queries: &[PreparedMetadataQuery],
-    corpus: &MetadataBm25Corpus,
+    docs: &[InternedMetadataDoc],
+    queries: &[PreparedInternedMetadataQuery],
+    corpus: &InternedMetadataCorpus,
 ) -> f64 {
-    let left_to_right = score_metadata_with_query(&queries[left], &docs[right].doc, corpus);
+    let left_to_right = score_metadata_with_query(&queries[left], &docs[right], corpus);
     if left_to_right >= METADATA_THRESHOLD {
         return left_to_right;
     }
-    score_metadata_with_query(&queries[right], &docs[left].doc, corpus)
+    score_metadata_with_query(&queries[right], &docs[left], corpus)
 }
 
-fn metadata_token_postings(docs: &[MetadataDocEntry]) -> HashMap<String, Vec<usize>> {
-    let mut postings = docs
-        .par_iter()
-        .enumerate()
-        .fold(HashMap::<String, Vec<usize>>::new, |mut local, (index, entry)| {
-            for token in entry.doc.unique_tokens() {
-                local.entry(token.clone()).or_default().push(index);
-            }
-            local
-        })
-        .reduce(HashMap::<String, Vec<usize>>::new, |mut left, right| {
-            for (token, mut indices) in right {
-                left.entry(token).or_default().append(&mut indices);
-            }
-            left
-        });
-    for indices in postings.values_mut() {
-        indices.sort_unstable();
-    }
-    postings
-}
-
-fn metadata_candidate_indices_for_left(
-    left: usize,
-    doc: &MetadataBm25Document,
-    postings: &HashMap<String, Vec<usize>>,
-) -> Vec<usize> {
-    let mut candidates = Vec::new();
-    for token in doc.unique_tokens() {
-        let Some(indices) = postings.get(token) else {
-            continue;
-        };
-        for &right in indices {
-            if right <= left {
-                continue;
-            }
-            candidates.push(right);
-        }
-    }
-    candidates.sort_unstable();
-    candidates.dedup();
-    candidates
-}
 
 fn apply_metadata_exact_doc_unions(
     data: &MetadataData,
@@ -927,33 +1024,88 @@ impl MetadataBm25Document {
         })
     }
 
+    fn term_frequency(&self, token: &str) -> usize {
+        *self.term_freqs.get(token).unwrap_or(&0)
+    }
+}
+
+impl InternedMetadataDoc {
+    fn from_metadata_doc(
+        doc: &MetadataBm25Document,
+        token_ids: &HashMap<String, usize>,
+        postings: &mut [Vec<usize>],
+        doc_index: usize,
+    ) -> Self {
+        let mut tokens = Vec::with_capacity(doc.tokens.len());
+        let mut term_freqs = HashMap::new();
+        for token in &doc.tokens {
+            let token_id = metadata_token_id(token, token_ids);
+            tokens.push(token_id);
+            *term_freqs.entry(token_id).or_insert(0usize) += 1;
+        }
+        let mut unique_tokens = term_freqs.keys().copied().collect::<Vec<_>>();
+        unique_tokens.sort_unstable();
+        for &token_id in &unique_tokens {
+            postings[token_id].push(doc_index);
+        }
+        Self {
+            tokens,
+            term_freqs,
+            unique_tokens,
+        }
+    }
+
     fn len(&self) -> usize {
         self.tokens.len()
     }
 
-    fn term_frequency(&self, token: &str) -> usize {
-        *self.term_freqs.get(token).unwrap_or(&0)
+    fn term_frequency(&self, token: usize) -> usize {
+        *self.term_freqs.get(&token).unwrap_or(&0)
     }
 
-    fn unique_tokens(&self) -> &[String] {
+    fn unique_tokens(&self) -> &[usize] {
         &self.unique_tokens
     }
 }
 
-impl MetadataBm25Corpus {
-    fn from_doc_entries(entries: &[MetadataDocEntry]) -> Self {
+fn lexical_metadata_token_ids(entries: &[SourceMetadataDocEntry]) -> HashMap<String, usize> {
+    let mut tokens = entries
+        .iter()
+        .flat_map(|entry| entry.doc.unique_tokens.iter().cloned())
+        .collect::<Vec<_>>();
+    tokens.sort_unstable();
+    tokens.dedup();
+    tokens
+        .into_iter()
+        .enumerate()
+        .map(|(token_id, token)| (token, token_id))
+        .collect()
+}
+
+fn metadata_token_id(token: &str, token_ids: &HashMap<String, usize>) -> usize {
+    *token_ids
+        .get(token)
+        .expect("metadata token must be present in the lexical token id map")
+}
+
+impl InternedMetadataCorpus {
+    fn from_doc_entries(
+        entries: &[SourceMetadataDocEntry],
+        docs: &[InternedMetadataDoc],
+        token_count: usize,
+    ) -> Self {
         let mut total_docs = 0usize;
         let mut total_terms = 0usize;
-        let mut doc_freqs = HashMap::new();
-        for entry in entries {
+        let mut doc_freqs = vec![0; token_count];
+        for (entry, doc) in entries.iter().zip(docs) {
             let weight = entry.contracts.len();
             if weight == 0 {
                 continue;
             }
             total_docs += weight;
-            total_terms += entry.doc.len() * weight;
-            for token in entry.doc.term_freqs.keys() {
-                *doc_freqs.entry(token.clone()).or_insert(0usize) += weight;
+            total_terms += doc.len() * weight;
+            for &token in doc.unique_tokens() {
+                doc_freqs[token] += weight;
             }
         }
         let avg_doc_len = if total_docs == 0 {
@@ -969,25 +1121,66 @@ impl MetadataBm25Corpus {
     }
 }
 
-impl PreparedMetadataQuery {
-    fn new(query: &MetadataBm25Document, corpus: &MetadataBm25Corpus) -> Self {
-        let terms = query_terms_from_tokens(&query.tokens);
+impl PreparedInternedMetadataQuery {
+    fn new(query: &InternedMetadataDoc, corpus: &InternedMetadataCorpus) -> Self {
+        let terms = query_terms_from_token_ids(&query.tokens);
         let self_score = bm25_score_terms(&terms, query, corpus);
         let denominator = if self_score > 0.0 { self_score } else { 1.0 };
         Self { terms, denominator }
     }
 
-    fn has_term_overlap(&self, document: &MetadataBm25Document) -> bool {
+    fn has_term_overlap(&self, document: &InternedMetadataDoc) -> bool {
         self.terms
             .iter()
-            .any(|(token, _)| document.term_frequency(token) > 0)
+            .any(|(token, _)| document.term_frequency(*token) > 0)
+    }
+}
+
+impl InternedMetadataIndex {
+    fn from_doc_entries(entries: &[SourceMetadataDocEntry]) -> Self {
+        let token_ids = lexical_metadata_token_ids(entries);
+        let mut postings = vec![Vec::new(); token_ids.len()];
+        let docs = entries
+            .iter()
+            .enumerate()
+            .map(|(doc_index, entry)| {
+                InternedMetadataDoc::from_metadata_doc(
+                    &entry.doc,
+                    &token_ids,
+                    &mut postings,
+                    doc_index,
+                )
+            })
+            .collect::<Vec<_>>();
+        for indices in &mut postings {
+            indices.sort_unstable();
+            indices.dedup();
+        }
+        let corpus = InternedMetadataCorpus::from_doc_entries(entries, &docs, token_ids.len());
+        let queries = docs
+            .par_iter()
+            .map(|doc| PreparedInternedMetadataQuery::new(doc, &corpus))
+            .collect::<Vec<_>>();
+        Self {
+            docs,
+            corpus,
+            queries,
+            postings,
+            #[cfg(test)]
+            token_ids,
+        }
+    }
+
+    #[cfg(test)]
+    fn token_id(&self, token: &str) -> Option<usize> {
+        self.token_ids.get(token).copied()
     }
 }
 
 fn score_metadata_with_query(
-    query: &PreparedMetadataQuery,
-    right: &MetadataBm25Document,
-    corpus: &MetadataBm25Corpus,
+    query: &PreparedInternedMetadataQuery,
+    right: &InternedMetadataDoc,
+    corpus: &InternedMetadataCorpus,
 ) -> f64 {
     if !query.has_term_overlap(right) {
         return 0.0;
@@ -995,20 +1188,35 @@ fn score_metadata_with_query(
     (bm25_score_terms(&query.terms, right, corpus) / query.denominator).clamp(0.0, 1.0)
 }
 
-fn query_terms_from_tokens(query_tokens: &[String]) -> Vec<(String, usize)> {
-    let mut query_terms = HashMap::<String, usize>::new();
-    for token in query_tokens {
-        *query_terms.entry(token.clone()).or_insert(0) += 1;
+fn query_terms_from_token_ids(query_tokens: &[usize]) -> Vec<(usize, usize)> {
+    if query_tokens.is_empty() {
+        return Vec::new();
     }
-    let mut query_terms = query_terms.into_iter().collect::<Vec<_>>();
-    query_terms.sort_by(|left, right| left.0.cmp(&right.0));
-    query_terms
+    let mut tokens = query_tokens.to_vec();
+    tokens.sort_unstable();
+    let mut terms = Vec::new();
+    let mut iter = tokens.into_iter();
+    let Some(mut current) = iter.next() else {
+        return Vec::new();
+    };
+    let mut count = 1usize;
+    for token in iter {
+        if token == current {
+            count += 1;
+        } else {
+            terms.push((current, count));
+            current = token;
+            count = 1;
+        }
+    }
+    terms.push((current, count));
+    terms
 }
 
 fn bm25_score_terms(
-    query_terms: &[(String, usize)],
-    doc: &MetadataBm25Document,
-    corpus: &MetadataBm25Corpus,
+    query_terms: &[(usize, usize)],
+    doc: &InternedMetadataDoc,
+    corpus: &InternedMetadataCorpus,
 ) -> f64 {
     if query_terms.is_empty()
         || doc.len() == 0
@@ -1025,11 +1233,11 @@ fn bm25_score_terms(
     query_terms
         .iter()
         .map(|(token, query_tf)| {
-            let tf = doc.term_frequency(token) as f64;
+            let tf = doc.term_frequency(*token) as f64;
             if tf == 0.0 {
                 return 0.0;
             }
-            let df = *corpus.doc_freqs.get(token).unwrap_or(&0) as f64;
+            let df = corpus.doc_freqs.get(*token).copied().unwrap_or(0) as f64;
             let idf = ((corpus.total_docs as f64 - df + 0.5) / (df + 0.5) + 1.0).ln();
             *query_tf as f64 * idf * (tf * (METADATA_BM25_K1 + 1.0)) / (tf + norm)
         })
@@ -1042,9 +1250,9 @@ fn metadata_document_from_json(raw: &str) -> String {
     }
     match serde_json::from_str::<Value>(raw) {
         Ok(value) => {
-            let mut parts = Vec::new();
-            flatten_metadata(&value, &mut parts);
-            normalize_metadata_text(&parts.join(" "))
+            let mut parts = BTreeSet::new();
+            collect_metadata_prefilter_parts(&value, &mut parts);
+            parts.into_iter().collect::<Vec<_>>().join(" ")
         }
         Err(_) => normalize_metadata_text(raw),
     }
@@ -1057,42 +1265,103 @@ fn metadata_is_dedup_eligible(raw: &str) -> bool {
         && matches!(raw.chars().next(), Some('{') | Some('['))
 }
 
-fn flatten_metadata(value: &Value, parts: &mut Vec<String>) {
+fn collect_metadata_prefilter_parts(value: &Value, parts: &mut BTreeSet<String>) {
     match value {
         Value::Object(map) => {
             for (key, item) in map {
-                let key = key.to_lowercase();
-                if matches!(
-                    key.as_str(),
-                    "description"
-                        | "trait_type"
-                        | "value"
-                        | "display_type"
-                        | "image"
-                        | "image_url"
-                        | "animation_url"
-                        | "external_url"
-                        | "attributes"
-                        | "metadata"
-                        | "rawmetadata"
-                        | "raw"
-                ) {
-                    flatten_metadata(item, parts);
+                let key_norm = normalize_metadata_text(key);
+                if key_norm.is_empty() {
+                    continue;
+                }
+                if is_structure_wrapper_key(&key_norm) {
+                    collect_metadata_prefilter_parts(item, parts);
+                } else if key_norm == "trait_type" {
+                    push_metadata_prefilter_part(parts, &key_norm);
+                    if let Some(text) = item.as_str() {
+                        push_metadata_prefilter_part(parts, text);
+                    }
+                } else if metadata_prefilter_includes_value(&key_norm) {
+                    push_metadata_prefilter_part(parts, &key_norm);
+                    collect_metadata_prefilter_values(item, parts);
+                } else {
+                    push_metadata_prefilter_part(parts, &key_norm);
+                    collect_metadata_prefilter_parts(item, parts);
                 }
             }
         }
         Value::Array(items) => {
             for item in items {
-                flatten_metadata(item, parts);
+                collect_metadata_prefilter_parts(item, parts);
             }
         }
-        Value::String(text) if !text.trim().is_empty() => parts.push(text.trim().to_string()),
         _ => {}
     }
 }
 
+fn collect_metadata_prefilter_values(value: &Value, parts: &mut BTreeSet<String>) {
+    match value {
+        Value::String(text) => push_metadata_prefilter_part(parts, text),
+        Value::Number(number) => push_metadata_prefilter_part(parts, &number.to_string()),
+        Value::Bool(value) => push_metadata_prefilter_part(parts, &value.to_string()),
+        Value::Array(items) => {
+            for item in items {
+                collect_metadata_prefilter_values(item, parts);
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map {
+                push_metadata_prefilter_part(parts, key);
+                collect_metadata_prefilter_values(item, parts);
+            }
+        }
+        Value::Null => {}
+    }
+}
+
+fn metadata_prefilter_includes_value(key: &str) -> bool {
+    is_description_key(key) || is_platform_key(key)
+}
+
+fn push_metadata_prefilter_part(parts: &mut BTreeSet<String>, raw: &str) {
+    let text = normalize_metadata_text(raw);
+    if !text.is_empty() {
+        parts.insert(text);
+    }
+}
+
+fn is_structure_wrapper_key(key: &str) -> bool {
+    matches!(key, "metadata" | "rawmetadata" | "raw")
+}
+
+fn is_description_key(key: &str) -> bool {
+    matches!(
+        key,
+        "description" | "bio" | "story" | "lore" | "summary" | "about"
+    )
+}
+
+fn is_platform_key(key: &str) -> bool {
+    matches!(
+        key,
+        "seller_fee_basis_points"
+            | "fee_recipient"
+            | "royalty"
+            | "royalties"
+            | "creator"
+            | "creators"
+            | "compiler"
+            | "license"
+            | "collection"
+            | "marketplace"
+            | "contract"
+            | "chain"
+    )
+}
+
 fn normalize_metadata_text(raw: &str) -> String {
-    raw.to_lowercase()
+    raw.nfkc()
+        .collect::<String>()
+        .to_lowercase()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -1122,8 +1391,8 @@ fn metadata_bm25_tokens(document: &str) -> Vec<String> {
 mod metadata_tests {
     use super::*;
 
-    fn metadata_doc_entry(text: &str) -> MetadataDocEntry {
-        MetadataDocEntry {
+    fn metadata_doc_entry(text: &str) -> SourceMetadataDocEntry {
+        SourceMetadataDocEntry {
             doc: MetadataBm25Document::from_text(text).unwrap(),
             contracts: vec![0],
             contracts_by_chain: vec![vec![0]],
@@ -1139,6 +1408,56 @@ mod metadata_tests {
     }
 
     #[test]
+    fn metadata_document_uses_top_contract_prefilter_parts() {
+        let document = metadata_document_from_json(
+            r#"{
+                "description": "Gold Dragon",
+                "attributes": [
+                    {"trait_type": "Background", "value": "Gold"},
+                    {"trait_type": "Background", "value": "Gold"},
+                    {"trait_type": "Eyes", "value": "Laser"}
+                ],
+                "seller_fee_basis_points": 500,
+                "irrelevant": "Hidden Lore"
+            }"#,
+        );
+
+        assert_eq!(
+            document,
+            "500 attributes background description eyes gold dragon irrelevant seller_fee_basis_points trait_type value"
+        );
+    }
+
+    #[test]
+    fn metadata_document_rejects_non_json_and_overlong_raw_metadata() {
+        assert_eq!(metadata_document_from_json("not json metadata"), "");
+        let overlong = format!(
+            "{{\"description\":\"{}\"}}",
+            "x".repeat(MAX_METADATA_BYTES_FOR_DEDUP)
+        );
+
+        assert_eq!(metadata_document_from_json(&overlong), "");
+    }
+
+    #[test]
+    fn metadata_document_normalizes_nfkc_like_top_contract_prefilter() {
+        let document = metadata_document_from_json(
+            r#"{"description":"\uFF27\uFF4F\uFF4C\uFF44\u3000Dragon"}"#,
+        );
+
+        assert_eq!(document, "description gold dragon");
+    }
+
+    #[test]
+    fn metadata_document_requires_informative_prefilter_token_for_indexing() {
+        let key_only = MetadataBm25Document::from_text("description").unwrap();
+        let informative = MetadataBm25Document::from_text("description gold dragon").unwrap();
+
+        assert!(!metadata_document_has_informative_token(&key_only));
+        assert!(metadata_document_has_informative_token(&informative));
+    }
+
+    #[test]
     fn metadata_doc_pair_hits_are_collected_for_left_range() {
         let docs = vec![
             metadata_doc_entry("gold dragon"),
@@ -1146,17 +1465,101 @@ mod metadata_tests {
             metadata_doc_entry("silver cat"),
             metadata_doc_entry("gold dragon"),
         ];
-        let corpus = MetadataBm25Corpus::from_doc_entries(&docs);
-        let queries = docs
-            .iter()
-            .map(|entry| PreparedMetadataQuery::new(&entry.doc, &corpus))
-            .collect::<Vec<_>>();
-        let postings = metadata_token_postings(&docs);
+        let index = InternedMetadataIndex::from_doc_entries(&docs);
 
-        let hits =
-            collect_metadata_doc_pair_hits_for_left_range(1..3, &docs, &queries, &corpus, &postings);
+        let hits = collect_metadata_doc_pair_hits_for_left_range(
+            1..3,
+            &index.docs,
+            &index.queries,
+            &index.corpus,
+            &index.postings,
+        );
 
         assert_eq!(hits, vec![(1, 3)]);
+    }
+
+    #[test]
+    fn metadata_candidate_scratch_deduplicates_posting_hits() {
+        let docs = vec![
+            metadata_doc_entry("gold dragon"),
+            metadata_doc_entry("dragon gold"),
+            metadata_doc_entry("gold cat"),
+        ];
+        let index = InternedMetadataIndex::from_doc_entries(&docs);
+        let mut scratch = MetadataCandidateScratch::new(3);
+
+        let first = metadata_candidate_indices_for_left_with_scratch(
+            0,
+            &index.docs[0],
+            &index.postings,
+            &mut scratch,
+        )
+        .to_vec();
+        let second = metadata_candidate_indices_for_left_with_scratch(
+            1,
+            &index.docs[1],
+            &index.postings,
+            &mut scratch,
+        )
+        .to_vec();
+
+        assert_eq!(first, vec![1, 2]);
+        assert_eq!(second, vec![2]);
+    }
+
+    #[test]
+    fn metadata_bm25_index_interns_tokens_and_integer_postings() {
+        let docs = vec![
+            metadata_doc_entry("gold dragon"),
+            metadata_doc_entry("dragon gold"),
+            metadata_doc_entry("silver cat"),
+        ];
+        let index = InternedMetadataIndex::from_doc_entries(&docs);
+        let gold = index.token_id("gold").unwrap();
+        let dragon = index.token_id("dragon").unwrap();
+
+        assert_eq!(index.postings[gold], vec![0, 1]);
+        assert_eq!(index.postings[dragon], vec![0, 1]);
+        assert_eq!(index.docs[0].term_frequency(gold), 1);
+        assert!(index.queries[0].terms.iter().any(|(token, tf)| {
+            *token == gold && *tf == 1
+        }));
+    }
+
+    #[test]
+    fn metadata_bm25_index_assigns_lexical_token_ids_for_stable_score_order() {
+        let docs = vec![
+            metadata_doc_entry("gold dragon"),
+            metadata_doc_entry("silver cat"),
+        ];
+        let index = InternedMetadataIndex::from_doc_entries(&docs);
+
+        assert!(
+            index.token_id("cat").unwrap()
+                < index.token_id("dragon").unwrap()
+                && index.token_id("dragon").unwrap() < index.token_id("gold").unwrap()
+                && index.token_id("gold").unwrap() < index.token_id("silver").unwrap()
+        );
+    }
+
+    #[test]
+    fn metadata_data_builder_moves_bm25_documents_into_interned_index() {
+        let mut builder = MetadataDataBuilder::new(1);
+        let doc = MetadataBm25Document::from_text("gold dragon").unwrap();
+        let doc_key = metadata_document_key(&doc);
+        builder.merge_indexed_row(IndexedMetadataRow {
+            chain_index: 0,
+            contract_address: "0xaaa".to_string(),
+            nft_count: 2,
+            doc,
+            doc_key,
+        });
+
+        let data = builder.finish();
+
+        assert_eq!(data.docs[0].contracts, vec![0]);
+        assert_eq!(data.metadata_index.docs.len(), 1);
+        assert!(data.metadata_index.token_id("gold").is_some());
     }
 
     #[test]

@@ -9,7 +9,7 @@ struct Args {
     #[arg(long = "parquet", required = true)]
     parquet_inputs: Vec<PathBuf>,
 
-    #[arg(long, default_value = "name_uri_analysis.duckdb")]
+    #[arg(long, default_value = ":memory:", hide = true)]
     database: PathBuf,
 
     #[arg(long, default_value = "name_uri_analysis_output")]
@@ -23,14 +23,14 @@ struct Args {
 
     #[arg(
         long,
-        default_value = "8GB",
-        help = "Total memory budget; DuckDB and Rust analysis share this budget"
+        default_value = "auto",
+        help = "Rust name-analysis adaptive batching budget; DuckDB is left unrestricted"
     )]
     memory_limit: String,
 
     #[arg(
         long,
-        help = "Optional Rust name-analysis budget inside --memory-limit; omit or use auto for balanced allocation"
+        help = "Optional Rust name-analysis budget inside --memory-limit; DuckDB is left unrestricted"
     )]
     analysis_memory_limit: Option<String>,
 
