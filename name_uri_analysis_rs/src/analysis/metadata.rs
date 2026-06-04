@@ -8,8 +8,8 @@ const METADATA_MATCH_MODE: &str = "bm25_representative";
 const MAX_METADATA_BYTES_FOR_DEDUP: usize = 64 * 1024;
 const METADATA_BM25_K1: f64 = 1.2;
 const METADATA_BM25_B: f64 = 0.75;
-const METADATA_LOAD_CHUNK_ROWS: usize = 1024;
-const METADATA_PAIR_LEFT_CHUNK_SIZE: usize = 64;
+const METADATA_LOAD_CHUNK_ROWS: usize = 16 * 1024;
+const METADATA_PAIR_LEFT_CHUNK_SIZE: usize = 2048;
 type MetadataDocKey = Vec<(String, usize)>;
 
 #[derive(Debug)]
@@ -270,7 +270,7 @@ fn run_metadata_analysis(
         chain_matrix: (chains.len() > 1)
             .then(|| new_chain_matrix_reuse_states(chain_pair_count(chains.len()))),
     };
-    pool.install(|| union_metadata_pairs(&data, chains.len(), &mut state));
+    pool.install(|| union_metadata_pairs(&data, chains.len(), &mut state, progress));
     progress.step("metadata documents scored");
     push_metadata_summary_rows(&mut rows, &data, chains, &totals, &mut state);
     progress.step("metadata rows summarized");
@@ -449,7 +449,12 @@ fn metadata_totals(data: &MetadataData, chains: &[String]) -> HashMap<String, Na
     totals
 }
 
-fn union_metadata_pairs(data: &MetadataData, chain_count: usize, state: &mut MetadataUnionState) {
+fn union_metadata_pairs(
+    data: &MetadataData,
+    chain_count: usize,
+    state: &mut MetadataUnionState,
+    progress: &ProgressTracker,
+) {
     let index = &data.metadata_index;
     if index.corpus.total_docs == 0 {
         return;
@@ -459,19 +464,76 @@ fn union_metadata_pairs(data: &MetadataData, chain_count: usize, state: &mut Met
     }
 
     let scoring_left_count = data.docs.len().saturating_sub(1);
+    let total_candidate_pairs = count_metadata_candidate_pairs(&index.docs, &index.postings);
+    let mut scored_candidate_pairs = 0u64;
+    let mut matched_doc_pairs = 0u64;
+    progress.add_work(total_candidate_pairs);
+    progress.set_message(metadata_pair_progress_message(
+        total_candidate_pairs,
+        total_candidate_pairs,
+        matched_doc_pairs,
+    ));
     for left_start in (0..scoring_left_count).step_by(METADATA_PAIR_LEFT_CHUNK_SIZE) {
         let left_end = (left_start + METADATA_PAIR_LEFT_CHUNK_SIZE).min(scoring_left_count);
-        let hits = collect_metadata_doc_pair_hits_for_left_range(
+        let batch = collect_metadata_doc_pair_hits_for_left_range(
             left_start..left_end,
             &index.docs,
             &index.queries,
             &index.corpus,
             &index.postings,
         );
-        for (left, right) in hits {
+        scored_candidate_pairs = scored_candidate_pairs.saturating_add(batch.candidate_pairs);
+        matched_doc_pairs = matched_doc_pairs.saturating_add(batch.hits.len() as u64);
+        progress.inc(batch.candidate_pairs);
+        progress.set_message(metadata_pair_progress_message(
+            total_candidate_pairs.saturating_sub(scored_candidate_pairs),
+            total_candidate_pairs,
+            matched_doc_pairs,
+        ));
+        for (left, right) in batch.hits {
             apply_metadata_doc_pair_union(data, chain_count, state, left, right);
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct MetadataDocPairBatch {
+    hits: Vec<(usize, usize)>,
+    candidate_pairs: u64,
+}
+
+fn count_metadata_candidate_pairs(docs: &[InternedMetadataDoc], postings: &[Vec<usize>]) -> u64 {
+    if docs.len() < 2 {
+        return 0;
+    }
+    (0..docs.len() - 1)
+        .into_par_iter()
+        .fold(
+            || (MetadataCandidateScratch::new(docs.len()), 0u64),
+            |(mut scratch, mut total), left| {
+                let candidate_count = metadata_candidate_indices_for_left_with_scratch(
+                    left,
+                    &docs[left],
+                    postings,
+                    &mut scratch,
+                )
+                .len() as u64;
+                total = total.saturating_add(candidate_count);
+                (scratch, total)
+            },
+        )
+        .map(|(_scratch, total)| total)
+        .reduce(|| 0, u64::saturating_add)
+}
+
+fn metadata_pair_progress_message(
+    remaining_pairs: u64,
+    total_pairs: u64,
+    matched_pairs: u64,
+) -> String {
+    format!(
+        "metadata candidate pairs remaining {remaining_pairs}/{total_pairs}; matched doc pairs {matched_pairs}"
+    )
 }
 
 fn collect_metadata_doc_pair_hits_for_left_range(
@@ -480,35 +542,45 @@ fn collect_metadata_doc_pair_hits_for_left_range(
     queries: &[PreparedInternedMetadataQuery],
     corpus: &InternedMetadataCorpus,
     postings: &[Vec<usize>],
-) -> Vec<(usize, usize)> {
-    let mut hits = left_range
+) -> MetadataDocPairBatch {
+    let (mut hits, candidate_pairs) = left_range
         .into_par_iter()
         .fold(
-            || (Vec::new(), MetadataCandidateScratch::new(docs.len())),
-            |(mut local_hits, mut scratch), left| {
+            || (Vec::new(), 0u64, MetadataCandidateScratch::new(docs.len())),
+            |(mut local_hits, mut local_candidate_pairs, mut scratch), left| {
                 let candidates = metadata_candidate_indices_for_left_with_scratch(
                     left,
                     &docs[left],
                     postings,
                     &mut scratch,
                 );
+                local_candidate_pairs = local_candidate_pairs.saturating_add(candidates.len() as u64);
                 for &right in candidates {
                     if metadata_pair_score(left, right, docs, queries, corpus) >= METADATA_THRESHOLD
                     {
                         local_hits.push((left, right));
                     }
                 }
-                (local_hits, scratch)
+                (local_hits, local_candidate_pairs, scratch)
             },
         )
-        .map(|(hits, _scratch)| hits)
-        .reduce(Vec::new, |mut left, mut right| {
-            left.append(&mut right);
-            left
-        });
+        .map(|(hits, candidate_pairs, _scratch)| (hits, candidate_pairs))
+        .reduce(
+            || (Vec::new(), 0u64),
+            |(mut left_hits, left_candidate_pairs), (mut right_hits, right_candidate_pairs)| {
+                left_hits.append(&mut right_hits);
+                (
+                    left_hits,
+                    left_candidate_pairs.saturating_add(right_candidate_pairs),
+                )
+            },
+        );
     hits.sort_unstable();
     hits.dedup();
-    hits
+    MetadataDocPairBatch {
+        hits,
+        candidate_pairs,
+    }
 }
 
 fn metadata_candidate_indices_for_left_with_scratch<'a>(
@@ -1467,7 +1539,7 @@ mod metadata_tests {
         ];
         let index = InternedMetadataIndex::from_doc_entries(&docs);
 
-        let hits = collect_metadata_doc_pair_hits_for_left_range(
+        let batch = collect_metadata_doc_pair_hits_for_left_range(
             1..3,
             &index.docs,
             &index.queries,
@@ -1475,7 +1547,25 @@ mod metadata_tests {
             &index.postings,
         );
 
-        assert_eq!(hits, vec![(1, 3)]);
+        assert_eq!(
+            batch,
+            MetadataDocPairBatch {
+                hits: vec![(1, 3)],
+                candidate_pairs: 1,
+            }
+        );
+        assert_eq!(
+            count_metadata_candidate_pairs(&index.docs, &index.postings),
+            3
+        );
+    }
+
+    #[test]
+    fn metadata_pair_progress_message_shows_exact_remaining_pairs() {
+        assert_eq!(
+            metadata_pair_progress_message(123, 456, 7),
+            "metadata candidate pairs remaining 123/456; matched doc pairs 7"
+        );
     }
 
     #[test]

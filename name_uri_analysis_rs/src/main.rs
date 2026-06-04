@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use clap::Parser;
 use name_uri_analysis_rs::analysis::{run_analysis, AnalysisOptions};
 
+const DEFAULT_THREADS: usize = 64;
+
 #[derive(Debug, Parser)]
 #[command(version, about = "Rust + DuckDB NFT name/URI duplicate analysis")]
 struct Args {
@@ -18,7 +20,7 @@ struct Args {
     #[arg(long, value_delimiter = ',', default_value = "95")]
     thresholds: Vec<f64>,
 
-    #[arg(long, default_value_t = 32)]
+    #[arg(long, default_value_t = DEFAULT_THREADS)]
     threads: usize,
 
     #[arg(
