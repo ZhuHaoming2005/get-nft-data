@@ -10,7 +10,7 @@ const MAX_METADATA_BYTES_FOR_DEDUP: usize = 64 * 1024;
 const METADATA_BM25_K1: f64 = 1.2;
 const METADATA_BM25_B: f64 = 0.75;
 const METADATA_LOAD_CHUNK_ROWS: usize = 16 * 1024;
-const METADATA_PAIR_LEFT_CHUNK_SIZE: usize = 1024;
+const METADATA_PAIR_LEFT_CHUNK_SIZE: usize = 256;
 type MetadataDocKey = Vec<(String, usize)>;
 
 #[derive(Debug)]
@@ -592,49 +592,6 @@ struct MetadataDocPairBatch {
     candidate_pairs: u64,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct MetadataCandidateBatch {
-    candidates_by_left: Vec<Vec<usize>>,
-    candidate_pairs: u64,
-}
-
-fn build_metadata_candidate_batch(
-    left_range: std::ops::Range<usize>,
-    docs: &[InternedMetadataDoc],
-    postings: &[Vec<usize>],
-) -> MetadataCandidateBatch {
-    if docs.len() < 2 || left_range.is_empty() {
-        return MetadataCandidateBatch {
-            candidates_by_left: Vec::new(),
-            candidate_pairs: 0,
-        };
-    }
-
-    let candidates_by_left = left_range
-        .into_par_iter()
-        .map_init(
-            || MetadataCandidateScratch::new(docs.len()),
-            |scratch, left| {
-                metadata_candidate_indices_for_left_with_scratch(
-                    left,
-                    &docs[left],
-                    postings,
-                    scratch,
-                )
-                .to_vec()
-            },
-        )
-        .collect::<Vec<_>>();
-    let candidate_pairs = candidates_by_left
-        .iter()
-        .map(|candidates| candidates.len() as u64)
-        .fold(0u64, u64::saturating_add);
-    MetadataCandidateBatch {
-        candidates_by_left,
-        candidate_pairs,
-    }
-}
-
 fn metadata_pair_progress_message(
     scored_pairs: u64,
     scored_left_docs: usize,
@@ -724,35 +681,61 @@ fn collect_metadata_doc_pair_hits_for_left_range(
     queries: &[PreparedInternedMetadataQuery],
     prepared_docs: &[PreparedInternedMetadataDoc],
 ) -> MetadataDocPairBatch {
-    let left_start = left_range.start;
-    let candidate_batch = build_metadata_candidate_batch(left_range, docs, postings);
-    let mut hits = candidate_batch
-        .candidates_by_left
-        .par_iter()
-        .enumerate()
+    let (mut hits, candidate_pairs) = left_range
+        .into_par_iter()
         .fold(
-            Vec::new,
-            |mut local_hits, (left_offset, candidates)| {
-                let left = left_start + left_offset;
-                for &right in candidates {
-                    if metadata_pair_score(left, right, queries, prepared_docs) >= METADATA_THRESHOLD
-                    {
-                        local_hits.push((left, right));
-                    }
-                }
-                local_hits
+            || (MetadataCandidateScratch::new(docs.len()), Vec::new(), 0u64),
+            |(mut scratch, mut local_hits, mut local_candidate_pairs), left| {
+                local_candidate_pairs = local_candidate_pairs.saturating_add(
+                    collect_metadata_doc_pair_hits_for_left_with_scratch(
+                        left,
+                        docs,
+                        postings,
+                        queries,
+                        prepared_docs,
+                        &mut scratch,
+                        &mut local_hits,
+                    ),
+                );
+                (scratch, local_hits, local_candidate_pairs)
             },
         )
-        .reduce(Vec::new, |mut left_hits, mut right_hits| {
-            left_hits.append(&mut right_hits);
-            left_hits
-        });
+        .map(|(_, local_hits, local_candidate_pairs)| (local_hits, local_candidate_pairs))
+        .reduce(
+            || (Vec::new(), 0u64),
+            |(mut left_hits, left_candidate_pairs), (mut right_hits, right_candidate_pairs)| {
+                left_hits.append(&mut right_hits);
+                (
+                    left_hits,
+                    left_candidate_pairs.saturating_add(right_candidate_pairs),
+                )
+            },
+        );
     hits.sort_unstable();
     hits.dedup();
     MetadataDocPairBatch {
         hits,
-        candidate_pairs: candidate_batch.candidate_pairs,
+        candidate_pairs,
     }
+}
+
+fn collect_metadata_doc_pair_hits_for_left_with_scratch(
+    left: usize,
+    docs: &[InternedMetadataDoc],
+    postings: &[Vec<usize>],
+    queries: &[PreparedInternedMetadataQuery],
+    prepared_docs: &[PreparedInternedMetadataDoc],
+    scratch: &mut MetadataCandidateScratch,
+    hits: &mut Vec<(usize, usize)>,
+) -> u64 {
+    let candidates =
+        metadata_candidate_indices_for_left_with_scratch(left, &docs[left], postings, scratch);
+    for &right in candidates {
+        if metadata_pair_score(left, right, queries, prepared_docs) >= METADATA_THRESHOLD {
+            hits.push((left, right));
+        }
+    }
+    candidates.len() as u64
 }
 
 fn metadata_candidate_indices_for_left_with_scratch<'a>(
@@ -1779,6 +1762,32 @@ mod metadata_tests {
     }
 
     #[test]
+    fn metadata_doc_pair_hits_score_one_left_with_reused_scratch() {
+        let docs = vec![
+            metadata_doc_entry("gold dragon"),
+            metadata_doc_entry("dragon gold"),
+            metadata_doc_entry("silver cat"),
+            metadata_doc_entry("gold dragon"),
+        ];
+        let index = InternedMetadataIndex::from_doc_entries(&docs);
+        let mut scratch = MetadataCandidateScratch::new(index.docs.len());
+        let mut hits = Vec::new();
+
+        let candidate_pairs = collect_metadata_doc_pair_hits_for_left_with_scratch(
+            0,
+            &index.docs,
+            &index.postings,
+            &index.queries,
+            &index.prepared_docs,
+            &mut scratch,
+            &mut hits,
+        );
+
+        assert_eq!(candidate_pairs, 2);
+        assert_eq!(hits, vec![(0, 1), (0, 3)]);
+    }
+
+    #[test]
     fn metadata_pair_progress_message_shows_throughput_and_eta() {
         assert_eq!(
             metadata_pair_progress_message(333, 2, 6, 7, std::time::Duration::from_secs(2)),
@@ -1792,38 +1801,6 @@ mod metadata_tests {
             metadata_pair_progress_message(0, 0, 6, 0, std::time::Duration::from_secs(0)),
             "metadata candidate pairs scored 0; left docs 0/6; estimated remaining 0; throughput n/a; ETA n/a; matched doc pairs 0"
         );
-    }
-
-    #[test]
-    fn metadata_candidate_batch_materializes_candidates_and_counts_range_pairs() {
-        let docs = vec![
-            metadata_doc_entry("gold dragon"),
-            metadata_doc_entry("dragon gold"),
-            metadata_doc_entry("gold cat"),
-            metadata_doc_entry("silver dog"),
-        ];
-        let index = InternedMetadataIndex::from_doc_entries(&docs);
-
-        let batch = build_metadata_candidate_batch(0..3, &index.docs, &index.postings);
-
-        assert_eq!(batch.candidate_pairs, 3);
-        assert_eq!(batch.candidates_by_left, vec![vec![1, 2], vec![2], vec![]]);
-    }
-
-    #[test]
-    fn metadata_candidate_batch_materializes_only_requested_left_range() {
-        let docs = vec![
-            metadata_doc_entry("gold dragon"),
-            metadata_doc_entry("dragon gold"),
-            metadata_doc_entry("gold cat"),
-            metadata_doc_entry("silver dog"),
-        ];
-        let index = InternedMetadataIndex::from_doc_entries(&docs);
-
-        let batch = build_metadata_candidate_batch(1..3, &index.docs, &index.postings);
-
-        assert_eq!(batch.candidate_pairs, 1);
-        assert_eq!(batch.candidates_by_left, vec![vec![2], vec![]]);
     }
 
     #[test]

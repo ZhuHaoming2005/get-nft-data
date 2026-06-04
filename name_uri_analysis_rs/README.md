@@ -11,7 +11,7 @@ Rust + DuckDB 一体分析脚本，读取 `top_contract_analysis_rs export-snaps
   - `v2`: `token_uri` 未命中但 `image_uri` 命中
   - `v3`: 任一 URI 命中
   - 不输出 URI 任意重复、严格串重复、跨链 URI 汇总。
-- `metadata` 使用 BM25 文档查重，阈值为 `0.6`；每个合约保留可查重的唯一 metadata 文档，先并行解析 metadata 并按全局唯一文档去重，再并行构建倒排索引、BM25 query 和候选文档对评分，命中后在合约层合并重复组。metadata 评分按 left-doc chunk 临时生成候选对，进度条消息显示已评分候选对数、基于已处理 left-doc 的剩余候选估算、吞吐、ETA 和已命中文档对数。
+- `metadata` 使用 BM25 文档查重，阈值为 `0.6`；每个合约保留可查重的唯一 metadata 文档，先并行解析 metadata 并按全局唯一文档去重，再并行构建倒排索引、BM25 query 和候选文档对评分，命中后在合约层合并重复组。metadata 评分在每个 worker 内按 left-doc 临时生成候选、立即评分并释放，进度条消息显示已评分候选对数、基于已处理 left-doc 的剩余候选估算、吞吐、ETA 和已命中文档对数。
 - DuckDB 使用 `:memory:` 内存数据库，不再设置 DuckDB `memory_limit`；兼容旧命令保留的 `--database` 参数不再用于打开磁盘库。准备阶段只生成本次运行的临时工作投影，不做持久化 prepared-table 缓存。
 
 运行示例：
@@ -40,4 +40,4 @@ cargo run --release -- \
 - CLI 默认显示进度条；批处理、日志重定向或作为库嵌入时可用 `--no-progress` 关闭。
 - name 只维护一个阈值 state，默认 `95`；仍会对传入 Parquet 中的唯一规范名做完整 Jaro-Winkler 比较，并用长度上界跳过不可能达标的 pair。
 - `chain_matrix` 会优先在内存预算允许时复用全局跨链 name 打分结果；预算不足时回退到按链对逐个计算，并只为命中的 name pair 建稀疏 union-find。
-- metadata 解析批次为 16K 行，metadata BM25 评分按 1024 个 left-doc 一批调度，适配 96 核机器并限制候选缓存峰值。
+- metadata 解析批次为 16K 行，metadata BM25 评分按 256 个 left-doc 一批调度；候选 right-doc 不做 chunk 级缓存，而是在 worker 内随生成随评分，适配 96 核机器并限制候选缓存峰值。
