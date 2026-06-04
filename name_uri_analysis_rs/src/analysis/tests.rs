@@ -345,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_raw_rows_sql_groups_unique_contract_documents_before_ranking() {
+    fn metadata_raw_rows_sql_groups_contracts_before_selecting_first_metadata() {
         let sql = metadata_raw_rows_sql();
 
         assert!(!sql.contains("GROUP BY chain, contract_address, metadata_json"));
