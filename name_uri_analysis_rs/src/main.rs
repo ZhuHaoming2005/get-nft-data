@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use name_uri_analysis_rs::analysis::{run_analysis, AnalysisOptions};
 
-const DEFAULT_THREADS: usize = 64;
+const DEFAULT_THREADS: usize = 96;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Rust + DuckDB NFT name/URI duplicate analysis")]
