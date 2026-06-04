@@ -1,17 +1,16 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
 use unicode_normalization::UnicodeNormalization;
 
 const METADATA_THRESHOLD: f64 = 0.6;
-const METADATA_MATCH_MODE: &str = "bm25_representative";
+const METADATA_MATCH_MODE: &str = "exact_direct";
 const MAX_METADATA_BYTES_FOR_DEDUP: usize = 64 * 1024;
 const METADATA_BM25_K1: f64 = 1.2;
 const METADATA_BM25_B: f64 = 0.75;
 const METADATA_LOAD_CHUNK_ROWS: usize = 16 * 1024;
-const METADATA_PAIR_LEFT_CHUNK_SIZE: usize = 512;
-type MetadataDocKey = Vec<(String, usize)>;
+const METADATA_PAIR_LEFT_CHUNK_SIZE: usize = 256;
+type MetadataDocKey = String;
 type MetadataContractIndex = u32;
 type MetadataDocIndex = u32;
 
@@ -71,7 +70,6 @@ struct MetadataDataBuilder {
 #[derive(Debug, Clone)]
 struct MetadataBm25Document {
     tokens: Vec<String>,
-    term_freqs: HashMap<String, usize>,
     unique_tokens: Vec<String>,
 }
 
@@ -289,7 +287,7 @@ fn run_metadata_analysis(
     let mut rows = Vec::new();
     if data.contracts.len() < 2 || data.docs.is_empty() {
         push_empty_metadata_rows(&mut rows, chains, &totals);
-        progress.step("metadata scoring skipped");
+        progress.step("metadata comparison skipped");
         progress.step("metadata rows summarized");
         progress.finish_phase("metadata analysis complete");
         return Ok(rows);
@@ -302,7 +300,7 @@ fn run_metadata_analysis(
             .then(|| new_chain_matrix_reuse_states(chain_pair_count(chains.len()))),
     };
     pool.install(|| union_metadata_pairs(&data, chains.len(), &mut state, progress));
-    progress.step("metadata documents scored");
+    progress.step("metadata documents compared");
     push_metadata_summary_rows(&mut rows, &data, chains, &totals, &mut state);
     progress.step("metadata rows summarized");
     progress.finish_phase("metadata analysis complete");
@@ -415,7 +413,7 @@ fn index_metadata_raw_row_chunk(
             if !metadata_document_has_informative_token(&doc) {
                 return None;
             }
-            let doc_key = metadata_document_key(&doc);
+            let doc_key = metadata_document_key(&document);
             Some(IndexedMetadataRow {
                 chain_index,
                 contract_address: row.contract_address,
@@ -427,11 +425,8 @@ fn index_metadata_raw_row_chunk(
         .collect()
 }
 
-fn metadata_document_key(doc: &MetadataBm25Document) -> MetadataDocKey {
-    doc.unique_tokens
-        .iter()
-        .map(|token| (token.clone(), doc.term_frequency(token)))
-        .collect()
+fn metadata_document_key(document: &str) -> MetadataDocKey {
+    document.to_string()
 }
 
 fn metadata_document_has_informative_token(doc: &MetadataBm25Document) -> bool {
@@ -502,14 +497,17 @@ fn union_metadata_pairs(
     state: &mut MetadataUnionState,
     progress: &ProgressTracker,
 ) {
+    for doc_index in 0..data.docs.len() {
+        apply_metadata_exact_doc_unions(data, chain_count, state, doc_index);
+    }
+    if !metadata_bm25_similarity_enabled() {
+        return;
+    }
+
     let index = &data.metadata_index;
     if index.corpus.total_docs == 0 {
         return;
     }
-    for doc_index in 0..data.docs.len() {
-        apply_metadata_exact_doc_unions(data, chain_count, state, doc_index);
-    }
-
     let scoring_left_count = data.docs.len().saturating_sub(1);
     let mut scored_candidate_pairs = 0u64;
     let mut scored_left_docs = 0usize;
@@ -549,6 +547,10 @@ fn union_metadata_pairs(
             apply_metadata_doc_pair_union(data, chain_count, state, left, right);
         }
     }
+}
+
+fn metadata_bm25_similarity_enabled() -> bool {
+    false
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1199,7 +1201,7 @@ fn metadata_summary_row(
             scope,
             primary_chain,
             secondary_chain,
-            threshold: Some(METADATA_THRESHOLD),
+            threshold: None,
             match_mode: METADATA_MATCH_MODE,
             metric: "duplicate_group",
             total_contracts: total.contracts,
@@ -1215,21 +1217,13 @@ impl MetadataBm25Document {
         if tokens.is_empty() {
             return None;
         }
-        let mut term_freqs = HashMap::new();
-        for token in &tokens {
-            *term_freqs.entry(token.clone()).or_insert(0usize) += 1;
-        }
-        let mut unique_tokens = term_freqs.keys().cloned().collect::<Vec<_>>();
+        let mut unique_tokens = tokens.clone();
         unique_tokens.sort_unstable();
+        unique_tokens.dedup();
         Some(Self {
             tokens,
-            term_freqs,
             unique_tokens,
         })
-    }
-
-    fn term_frequency(&self, token: &str) -> usize {
-        *self.term_freqs.get(token).unwrap_or(&0)
     }
 }
 
@@ -1545,14 +1539,7 @@ fn metadata_document_from_json(raw: &str) -> String {
     if !metadata_is_dedup_eligible(raw) {
         return String::new();
     }
-    match serde_json::from_str::<Value>(raw) {
-        Ok(value) => {
-            let mut parts = Vec::new();
-            flatten_metadata_content_values(&value, &mut parts);
-            normalize_metadata_text(&parts.join(" "))
-        }
-        Err(_) => normalize_metadata_text(raw),
-    }
+    normalize_metadata_text(raw.trim())
 }
 
 fn metadata_is_dedup_eligible(raw: &str) -> bool {
@@ -1560,54 +1547,6 @@ fn metadata_is_dedup_eligible(raw: &str) -> bool {
     !raw.is_empty()
         && raw.len() <= MAX_METADATA_BYTES_FOR_DEDUP
         && matches!(raw.chars().next(), Some('{') | Some('['))
-}
-
-fn flatten_metadata_content_values(value: &Value, parts: &mut Vec<String>) {
-    match value {
-        Value::Object(map) => {
-            for (key, item) in map {
-                let key_norm = normalize_metadata_text(key);
-                if key_norm.is_empty() {
-                    continue;
-                }
-                if metadata_content_key_includes_value(&key_norm) {
-                    flatten_metadata_content_values(item, parts);
-                }
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                flatten_metadata_content_values(item, parts);
-            }
-        }
-        Value::String(text) if !text.trim().is_empty() => parts.push(text.trim().to_string()),
-        Value::Number(number) => parts.push(number.to_string()),
-        Value::Bool(value) => parts.push(value.to_string()),
-        Value::String(_) | Value::Null => {}
-    }
-}
-
-fn metadata_content_key_includes_value(key: &str) -> bool {
-    matches!(
-        key,
-        "about"
-            | "animation_url"
-            | "attributes"
-            | "bio"
-            | "description"
-            | "display_type"
-            | "external_url"
-            | "image"
-            | "image_url"
-            | "lore"
-            | "metadata"
-            | "raw"
-            | "rawmetadata"
-            | "story"
-            | "summary"
-            | "trait_type"
-            | "value"
-    )
 }
 
 fn normalize_metadata_text(raw: &str) -> String {
@@ -1652,15 +1591,15 @@ mod metadata_tests {
     }
 
     #[test]
-    fn metadata_document_key_deduplicates_reordered_token_multisets() {
-        let left = MetadataBm25Document::from_text("gold dragon gold").unwrap();
-        let right = MetadataBm25Document::from_text("dragon gold gold").unwrap();
+    fn metadata_document_key_uses_direct_document_text() {
+        let left = "gold dragon gold";
+        let right = "dragon gold gold";
 
-        assert_eq!(metadata_document_key(&left), metadata_document_key(&right));
+        assert_ne!(metadata_document_key(left), metadata_document_key(right));
     }
 
     #[test]
-    fn metadata_document_uses_top_contract_content_values() {
+    fn metadata_document_uses_full_raw_metadata_for_direct_matching() {
         let document = metadata_document_from_json(
             r#"{
                 "description": "Gold Dragon",
@@ -1678,12 +1617,12 @@ mod metadata_tests {
         assert!(document.contains("background"));
         assert!(document.contains("eyes"));
         assert!(document.contains("laser"));
-        assert!(!document.contains("seller_fee_basis_points"));
-        assert!(!document.contains("hidden lore"));
+        assert!(document.contains("seller_fee_basis_points"));
+        assert!(document.contains("hidden lore"));
     }
 
     #[test]
-    fn metadata_document_preserves_content_values_for_final_matching() {
+    fn metadata_document_preserves_raw_values_for_direct_matching() {
         let left = metadata_document_from_json(
             r#"{
                 "name": "Alpha #1",
@@ -1707,10 +1646,7 @@ mod metadata_tests {
         assert!(left.contains("blue"));
         assert!(right.contains("beta"));
         assert!(right.contains("red"));
-        assert_ne!(
-            metadata_document_key(&MetadataBm25Document::from_text(&left).unwrap()),
-            metadata_document_key(&MetadataBm25Document::from_text(&right).unwrap())
-        );
+        assert_ne!(metadata_document_key(&left), metadata_document_key(&right));
     }
 
     #[test]
@@ -1725,16 +1661,16 @@ mod metadata_tests {
     }
 
     #[test]
-    fn metadata_document_normalizes_nfkc_content_values() {
+    fn metadata_document_preserves_raw_unicode_escapes_for_direct_matching() {
         let document = metadata_document_from_json(
             r#"{"description":"\uFF27\uFF4F\uFF4C\uFF44\u3000Dragon"}"#,
         );
 
-        assert_eq!(document, "gold dragon");
+        assert!(document.contains(r#""description":"\uff27\uff4f\uff4c\uff44\u3000dragon""#));
     }
 
     #[test]
-    fn metadata_document_requires_informative_content_token_for_indexing() {
+    fn metadata_document_requires_informative_token_for_indexing() {
         let key_only = MetadataBm25Document::from_text("description").unwrap();
         let informative = MetadataBm25Document::from_text("description gold dragon").unwrap();
 
@@ -1936,7 +1872,7 @@ mod metadata_tests {
     fn metadata_data_builder_moves_bm25_documents_into_interned_index() {
         let mut builder = MetadataDataBuilder::new(1);
         let doc = MetadataBm25Document::from_text("gold dragon").unwrap();
-        let doc_key = metadata_document_key(&doc);
+        let doc_key = metadata_document_key("gold dragon");
         builder.merge_indexed_row(IndexedMetadataRow {
             chain_index: 0,
             contract_address: "0xaaa".to_string(),
@@ -1956,7 +1892,7 @@ mod metadata_tests {
     fn metadata_memberships_use_compact_contract_indexes() {
         let mut builder = MetadataDataBuilder::new(1);
         let doc = MetadataBm25Document::from_text("gold dragon").unwrap();
-        let doc_key = metadata_document_key(&doc);
+        let doc_key = metadata_document_key("gold dragon");
         builder.merge_indexed_row(IndexedMetadataRow {
             chain_index: 0,
             contract_address: "0xaaa".to_string(),
