@@ -40,4 +40,4 @@ cargo run --release -- \
 - CLI 默认显示进度条；批处理、日志重定向或作为库嵌入时可用 `--no-progress` 关闭。
 - name 只维护一个阈值 state，默认 `95`；仍会对传入 Parquet 中的唯一规范名做完整 Jaro-Winkler 比较，并用长度上界跳过不可能达标的 pair。
 - `chain_matrix` 会优先在内存预算允许时复用全局跨链 name 打分结果；预算不足时回退到按链对逐个计算，并只为命中的 name pair 建稀疏 union-find。
-- metadata 解析批次为 16K 行，metadata BM25 评分按 256 个 left-doc 一批调度；候选 right-doc 不做 chunk 级缓存，而是在 worker 内随生成随评分，适配 96 核机器并限制候选缓存峰值。
+- metadata 解析批次为 16K 行，metadata BM25 评分按 256 个 left-doc 一批调度；候选 right-doc 不做 chunk 级缓存，而是在 worker 内随生成随评分，并通过 scratch pool 复用候选去重数组；postings、候选列表和 metadata contract membership 使用紧凑 `u32` 编号，BM25 预处理后常驻候选 doc 只保留唯一 token，适配 96 核机器并限制候选缓存峰值。
