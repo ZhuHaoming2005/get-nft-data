@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use unicode_normalization::UnicodeNormalization;
 
 const METADATA_THRESHOLD: f64 = 0.6;
-const METADATA_MATCH_MODE: &str = "exact_direct";
+const METADATA_MATCH_MODE: &str = "bm25_representative";
 const MAX_METADATA_BYTES_FOR_DEDUP: usize = 64 * 1024;
 const METADATA_BM25_K1: f64 = 1.2;
 const METADATA_BM25_B: f64 = 0.75;
@@ -287,7 +287,7 @@ fn run_metadata_analysis(
     let mut rows = Vec::new();
     if data.contracts.len() < 2 || data.docs.is_empty() {
         push_empty_metadata_rows(&mut rows, chains, &totals);
-        progress.step("metadata comparison skipped");
+        progress.step("metadata scoring skipped");
         progress.step("metadata rows summarized");
         progress.finish_phase("metadata analysis complete");
         return Ok(rows);
@@ -300,7 +300,7 @@ fn run_metadata_analysis(
             .then(|| new_chain_matrix_reuse_states(chain_pair_count(chains.len()))),
     };
     pool.install(|| union_metadata_pairs(&data, chains.len(), &mut state, progress));
-    progress.step("metadata documents compared");
+    progress.step("metadata documents scored");
     push_metadata_summary_rows(&mut rows, &data, chains, &totals, &mut state);
     progress.step("metadata rows summarized");
     progress.finish_phase("metadata analysis complete");
@@ -500,9 +500,6 @@ fn union_metadata_pairs(
     for doc_index in 0..data.docs.len() {
         apply_metadata_exact_doc_unions(data, chain_count, state, doc_index);
     }
-    if !metadata_bm25_similarity_enabled() {
-        return;
-    }
 
     let index = &data.metadata_index;
     if index.corpus.total_docs == 0 {
@@ -547,10 +544,6 @@ fn union_metadata_pairs(
             apply_metadata_doc_pair_union(data, chain_count, state, left, right);
         }
     }
-}
-
-fn metadata_bm25_similarity_enabled() -> bool {
-    false
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1201,7 +1194,7 @@ fn metadata_summary_row(
             scope,
             primary_chain,
             secondary_chain,
-            threshold: None,
+            threshold: Some(METADATA_THRESHOLD),
             match_mode: METADATA_MATCH_MODE,
             metric: "duplicate_group",
             total_contracts: total.contracts,
@@ -1642,10 +1635,12 @@ mod metadata_tests {
             }"#,
         );
 
-        assert!(left.contains("alpha"));
-        assert!(left.contains("blue"));
-        assert!(right.contains("beta"));
-        assert!(right.contains("red"));
+        assert!(left.contains(r#""name": "alpha #1""#));
+        assert!(left.contains(r#""image": "ipfs://alpha/1.png""#));
+        assert!(left.contains(r#""value": "blue""#));
+        assert!(right.contains(r#""name": "beta #9""#));
+        assert!(right.contains(r#""image": "ipfs://beta/9.png""#));
+        assert!(right.contains(r#""value": "red""#));
         assert_ne!(metadata_document_key(&left), metadata_document_key(&right));
     }
 
@@ -1869,7 +1864,7 @@ mod metadata_tests {
     }
 
     #[test]
-    fn metadata_data_builder_moves_bm25_documents_into_interned_index() {
+    fn metadata_data_builder_builds_bm25_index_for_raw_representative_matching() {
         let mut builder = MetadataDataBuilder::new(1);
         let doc = MetadataBm25Document::from_text("gold dragon").unwrap();
         let doc_key = metadata_document_key("gold dragon");

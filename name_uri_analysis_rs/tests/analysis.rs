@@ -663,8 +663,8 @@ fn metadata_analysis_uses_first_available_representatives_for_correctness() {
         row.field_name == "metadata"
             && row.scope == "intra_chain"
             && row.primary_chain == "ethereum"
-            && row.threshold.is_none()
-            && row.match_mode == "exact_direct"
+            && row.threshold == Some(0.6)
+            && row.match_mode == "bm25_representative"
             && row.metric == "duplicate_group"
             && row.total_contracts == 3
             && row.total_nfts == 4
@@ -675,7 +675,7 @@ fn metadata_analysis_uses_first_available_representatives_for_correctness() {
         row.field_name == "metadata"
             && row.scope == "cross_chain_summary"
             && row.primary_chain == "base"
-            && row.threshold.is_none()
+            && row.threshold == Some(0.6)
             && row.duplicate_contract_count == 1
             && row.duplicate_nft_count == 1
     }));
@@ -684,7 +684,7 @@ fn metadata_analysis_uses_first_available_representatives_for_correctness() {
             && row.scope == "chain_matrix"
             && row.primary_chain == "ethereum"
             && row.secondary_chain == "base"
-            && row.threshold.is_none()
+            && row.threshold == Some(0.6)
             && row.duplicate_contract_count == 2
             && row.duplicate_nft_count == 3
     }));
@@ -770,7 +770,7 @@ fn metadata_analysis_does_not_match_same_schema_with_different_content_values() 
 }
 
 #[test]
-fn metadata_analysis_requires_exact_direct_metadata_match() {
+fn metadata_analysis_uses_raw_representatives_for_bm25_matching() {
     let temp = tempfile::tempdir().unwrap();
     let parquet = temp.path().join("sample.parquet");
     write_parquet_with_metadata(
@@ -804,8 +804,8 @@ fn metadata_analysis_requires_exact_direct_metadata_match() {
             && row.primary_chain == "ethereum"
             && row.total_contracts == 3
             && row.total_nfts == 3
-            && row.duplicate_contract_count == 2
-            && row.duplicate_nft_count == 2
+            && row.duplicate_contract_count == 3
+            && row.duplicate_nft_count == 3
     }));
 }
 

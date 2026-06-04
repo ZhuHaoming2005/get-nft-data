@@ -11,7 +11,7 @@ Rust + DuckDB 一体分析脚本，读取 `top_contract_analysis_rs export-snaps
   - `v2`: `token_uri` 未命中但 `image_uri` 命中
   - `v3`: 任一 URI 命中
   - 不输出 URI 任意重复、严格串重复、跨链 URI 汇总。
-- `metadata` 使用完整 metadata 直接查重；每个合约只取第一条可用 metadata 作为代表文档，不再抽取字段模板，也不再做 BM25 相似合并。脚本先在 DuckDB 中按合约筛出代表 metadata，再对完整 raw metadata 做 Unicode 规范化、大小写和空白规范化；只有规范化后的完整 metadata 文本一致时，才在合约层合并重复组。
+- `metadata` 使用 BM25 文档查重，阈值为 `0.6`；每个合约只取第一条可用 metadata 作为代表文档，不再抽取字段模板。脚本先在 DuckDB 中按合约筛出代表 metadata，再对完整 raw metadata 做 Unicode 规范化、大小写和空白规范化；规范化后的完整代表文档进入全局去重、倒排索引和 BM25 相似评分，命中后在合约层合并重复组。
 - DuckDB 使用 `:memory:` 内存数据库，不再设置 DuckDB `memory_limit`；兼容旧命令保留的 `--database` 参数不再用于打开磁盘库。准备阶段只生成本次运行的临时工作投影，不做持久化 prepared-table 缓存。
 
 运行示例：
@@ -40,4 +40,4 @@ cargo run --release -- \
 - CLI 默认显示进度条；批处理、日志重定向或作为库嵌入时可用 `--no-progress` 关闭。
 - name 只维护一个阈值 state，默认 `95`；仍会对传入 Parquet 中的唯一规范名做完整 Jaro-Winkler 比较，并用长度上界跳过不可能达标的 pair。
 - `chain_matrix` 会优先在内存预算允许时复用全局跨链 name 打分结果；预算不足时回退到按链对逐个计算，并只为命中的 name pair 建稀疏 union-find。
-- metadata 解析批次为 16K 条合约级代表行；metadata 直接查重依赖规范化后的完整代表文档 key 和合约 membership，不再生成 metadata 候选相似对，适配 96 核机器并限制误判和候选缓存峰值。
+- metadata 解析批次为 16K 条合约级代表行，metadata BM25 评分按 256 个 left-doc 一批调度；候选 right-doc 在 worker 内随生成随评分，并通过 scratch pool 复用候选去重数组；postings、候选列表和 metadata contract membership 使用紧凑 `u32` 编号，适配 96 核机器并限制候选缓存峰值。
