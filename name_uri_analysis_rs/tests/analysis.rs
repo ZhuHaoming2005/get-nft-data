@@ -770,16 +770,16 @@ fn metadata_analysis_does_not_match_same_schema_with_different_content_values() 
 }
 
 #[test]
-fn metadata_analysis_uses_raw_representatives_for_bm25_matching() {
+fn metadata_analysis_requires_rare_anchor_for_representative_bm25_matching() {
     let temp = tempfile::tempdir().unwrap();
     let parquet = temp.path().join("sample.parquet");
     write_parquet_with_metadata(
         &parquet,
         r#"
             VALUES
-            ('ethereum', '0xaaa', '1', 'u1', 'i1', 'A', 'a', '{"description":"gold dragon rare background","image":"ipfs://alpha/1.png"}'),
-            ('ethereum', '0xbbb', '1', 'u2', 'i2', 'B', 'b', '{"description":"gold dragon rare background","image":"ipfs://beta/1.png"}'),
-            ('ethereum', '0xccc', '1', 'u3', 'i3', 'C', 'c', '{"description":"gold dragon rare background","image":"ipfs://alpha/1.png"}')
+            ('ethereum', '0xaaa', '1', 'u1', 'i1', 'A', 'a', '{"description":"gold dragon rare background shine","image":"ipfs://alpha/1.png"}'),
+            ('ethereum', '0xbbb', '1', 'u2', 'i2', 'B', 'b', '{"description":"gold dragon rare background shine","image":"ipfs://alpha/2.png"}'),
+            ('ethereum', '0xccc', '1', 'u3', 'i3', 'C', 'c', '{"description":"gold dragon rare background shine","image":"ipfs://beta/1.png"}')
         "#,
     );
 
@@ -804,8 +804,8 @@ fn metadata_analysis_uses_raw_representatives_for_bm25_matching() {
             && row.primary_chain == "ethereum"
             && row.total_contracts == 3
             && row.total_nfts == 3
-            && row.duplicate_contract_count == 3
-            && row.duplicate_nft_count == 3
+            && row.duplicate_contract_count == 2
+            && row.duplicate_nft_count == 2
     }));
 }
 

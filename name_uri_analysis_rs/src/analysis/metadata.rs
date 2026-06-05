@@ -1,6 +1,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use serde_json::Value;
 use unicode_normalization::UnicodeNormalization;
 
 const METADATA_THRESHOLD: f64 = 0.6;
@@ -123,6 +124,14 @@ struct MetadataCandidateScratch {
 struct MetadataCandidateScratchPool {
     doc_count: usize,
     scratches: Mutex<Vec<MetadataCandidateScratch>>,
+}
+
+struct MetadataPairScoringContext<'a> {
+    docs: &'a [InternedMetadataDoc],
+    corpus: &'a InternedMetadataCorpus,
+    postings: &'a [Vec<MetadataDocIndex>],
+    queries: &'a [PreparedInternedMetadataQuery],
+    prepared_docs: &'a [PreparedInternedMetadataDoc],
 }
 
 struct MetadataUnionState {
@@ -523,10 +532,13 @@ fn union_metadata_pairs(
         let left_end = (left_start + METADATA_PAIR_LEFT_CHUNK_SIZE).min(scoring_left_count);
         let batch = collect_metadata_doc_pair_hits_for_left_range(
             left_start..left_end,
-            &index.docs,
-            &index.postings,
-            &index.queries,
-            &index.prepared_docs,
+            MetadataPairScoringContext {
+                docs: &index.docs,
+                corpus: &index.corpus,
+                postings: &index.postings,
+                queries: &index.queries,
+                prepared_docs: &index.prepared_docs,
+            },
             &scratch_pool,
         );
         scored_candidate_pairs = scored_candidate_pairs.saturating_add(batch.candidate_pairs);
@@ -644,12 +656,10 @@ fn format_metadata_duration(duration: Duration) -> String {
 
 fn collect_metadata_doc_pair_hits_for_left_range(
     left_range: std::ops::Range<usize>,
-    docs: &[InternedMetadataDoc],
-    postings: &[Vec<MetadataDocIndex>],
-    queries: &[PreparedInternedMetadataQuery],
-    prepared_docs: &[PreparedInternedMetadataDoc],
+    context: MetadataPairScoringContext<'_>,
     scratch_pool: &MetadataCandidateScratchPool,
 ) -> MetadataDocPairBatch {
+    let context = &context;
     let (mut hits, candidate_pairs) = left_range
         .into_par_iter()
         .map(|left| {
@@ -657,10 +667,7 @@ fn collect_metadata_doc_pair_hits_for_left_range(
             let mut local_hits = Vec::new();
             let local_candidate_pairs = collect_metadata_doc_pair_hits_for_left_with_scratch(
                 left,
-                docs,
-                postings,
-                queries,
-                prepared_docs,
+                context,
                 &mut scratch,
                 &mut local_hits,
             );
@@ -687,18 +694,22 @@ fn collect_metadata_doc_pair_hits_for_left_range(
 
 fn collect_metadata_doc_pair_hits_for_left_with_scratch(
     left: usize,
-    docs: &[InternedMetadataDoc],
-    postings: &[Vec<MetadataDocIndex>],
-    queries: &[PreparedInternedMetadataQuery],
-    prepared_docs: &[PreparedInternedMetadataDoc],
+    context: &MetadataPairScoringContext<'_>,
     scratch: &mut MetadataCandidateScratch,
     hits: &mut Vec<(usize, usize)>,
 ) -> u64 {
-    let candidates =
-        metadata_candidate_indices_for_left_with_scratch(left, &docs[left], postings, scratch);
+    let candidates = metadata_candidate_indices_for_left_with_scratch(
+        left,
+        &context.docs[left],
+        context.postings,
+        scratch,
+    );
     for &right in candidates {
         let right = metadata_doc_index_to_usize(right);
-        if metadata_pair_score(left, right, queries, prepared_docs) >= METADATA_THRESHOLD {
+        if metadata_pair_has_rare_anchor(left, right, context.docs, context.corpus)
+            && metadata_pair_score(left, right, context.queries, context.prepared_docs)
+                >= METADATA_THRESHOLD
+        {
             hits.push((left, right));
         }
     }
@@ -736,6 +747,42 @@ fn metadata_pair_score(
         return left_to_right;
     }
     score_metadata_with_prepared_doc(&queries[right], &prepared_docs[left])
+}
+
+fn metadata_pair_has_rare_anchor(
+    left: usize,
+    right: usize,
+    docs: &[InternedMetadataDoc],
+    corpus: &InternedMetadataCorpus,
+) -> bool {
+    let max_doc_freq = metadata_rare_anchor_max_doc_freq(corpus.total_docs);
+    let left_tokens = docs[left].unique_tokens();
+    let right_tokens = docs[right].unique_tokens();
+    let mut left_index = 0usize;
+    let mut right_index = 0usize;
+    while left_index < left_tokens.len() && right_index < right_tokens.len() {
+        match left_tokens[left_index].cmp(&right_tokens[right_index]) {
+            std::cmp::Ordering::Less => left_index += 1,
+            std::cmp::Ordering::Greater => right_index += 1,
+            std::cmp::Ordering::Equal => {
+                let token = left_tokens[left_index];
+                if corpus
+                    .doc_freqs
+                    .get(token)
+                    .is_some_and(|doc_freq| *doc_freq <= max_doc_freq)
+                {
+                    return true;
+                }
+                left_index += 1;
+                right_index += 1;
+            }
+        }
+    }
+    false
+}
+
+fn metadata_rare_anchor_max_doc_freq(total_docs: usize) -> usize {
+    total_docs.div_ceil(200).max(2)
 }
 
 
@@ -1532,7 +1579,14 @@ fn metadata_document_from_json(raw: &str) -> String {
     if !metadata_is_dedup_eligible(raw) {
         return String::new();
     }
-    normalize_metadata_text(raw.trim())
+    match serde_json::from_str::<Value>(raw) {
+        Ok(value) => {
+            let mut parts = Vec::new();
+            flatten_metadata_content_values(&value, &mut parts);
+            normalize_metadata_text(&parts.join(" "))
+        }
+        Err(_) => normalize_metadata_text(raw),
+    }
 }
 
 fn metadata_is_dedup_eligible(raw: &str) -> bool {
@@ -1540,6 +1594,44 @@ fn metadata_is_dedup_eligible(raw: &str) -> bool {
     !raw.is_empty()
         && raw.len() <= MAX_METADATA_BYTES_FOR_DEDUP
         && matches!(raw.chars().next(), Some('{') | Some('['))
+}
+
+fn flatten_metadata_content_values(value: &Value, parts: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, item) in map {
+                let key_norm = normalize_metadata_text(key);
+                if metadata_content_key_includes_value(&key_norm) {
+                    flatten_metadata_content_values(item, parts);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                flatten_metadata_content_values(item, parts);
+            }
+        }
+        Value::String(text) if !text.trim().is_empty() => parts.push(text.trim().to_string()),
+        Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null => {}
+    }
+}
+
+fn metadata_content_key_includes_value(key: &str) -> bool {
+    matches!(
+        key,
+        "description"
+            | "trait_type"
+            | "value"
+            | "display_type"
+            | "image"
+            | "image_url"
+            | "animation_url"
+            | "external_url"
+            | "attributes"
+            | "metadata"
+            | "rawmetadata"
+            | "raw"
+    )
 }
 
 fn normalize_metadata_text(raw: &str) -> String {
@@ -1592,7 +1684,7 @@ mod metadata_tests {
     }
 
     #[test]
-    fn metadata_document_uses_full_raw_metadata_for_direct_matching() {
+    fn metadata_document_uses_top_contract_content_values_for_global_matching() {
         let document = metadata_document_from_json(
             r#"{
                 "description": "Gold Dragon",
@@ -1610,12 +1702,12 @@ mod metadata_tests {
         assert!(document.contains("background"));
         assert!(document.contains("eyes"));
         assert!(document.contains("laser"));
-        assert!(document.contains("seller_fee_basis_points"));
-        assert!(document.contains("hidden lore"));
+        assert!(!document.contains("seller_fee_basis_points"));
+        assert!(!document.contains("hidden lore"));
     }
 
     #[test]
-    fn metadata_document_preserves_raw_values_for_direct_matching() {
+    fn metadata_document_preserves_content_values_for_representative_matching() {
         let left = metadata_document_from_json(
             r#"{
                 "name": "Alpha #1",
@@ -1635,12 +1727,10 @@ mod metadata_tests {
             }"#,
         );
 
-        assert!(left.contains(r#""name": "alpha #1""#));
-        assert!(left.contains(r#""image": "ipfs://alpha/1.png""#));
-        assert!(left.contains(r#""value": "blue""#));
-        assert!(right.contains(r#""name": "beta #9""#));
-        assert!(right.contains(r#""image": "ipfs://beta/9.png""#));
-        assert!(right.contains(r#""value": "red""#));
+        assert!(left.contains("alpha"));
+        assert!(left.contains("blue"));
+        assert!(right.contains("beta"));
+        assert!(right.contains("red"));
         assert_ne!(metadata_document_key(&left), metadata_document_key(&right));
     }
 
@@ -1656,12 +1746,12 @@ mod metadata_tests {
     }
 
     #[test]
-    fn metadata_document_preserves_raw_unicode_escapes_for_direct_matching() {
+    fn metadata_document_normalizes_nfkc_content_values() {
         let document = metadata_document_from_json(
             r#"{"description":"\uFF27\uFF4F\uFF4C\uFF44\u3000Dragon"}"#,
         );
 
-        assert!(document.contains(r#""description":"\uff27\uff4f\uff4c\uff44\u3000dragon""#));
+        assert_eq!(document, "gold dragon");
     }
 
     #[test]
@@ -1676,20 +1766,23 @@ mod metadata_tests {
     #[test]
     fn metadata_doc_pair_hits_are_collected_for_left_range() {
         let docs = vec![
-            metadata_doc_entry("gold dragon"),
-            metadata_doc_entry("dragon gold"),
+            metadata_doc_entry("gold dragon alpha"),
+            metadata_doc_entry("dragon gold beta"),
             metadata_doc_entry("silver cat"),
-            metadata_doc_entry("gold dragon"),
+            metadata_doc_entry("gold dragon beta"),
         ];
         let (index, _) = InternedMetadataIndex::from_source_doc_entries(docs);
         let scratch_pool = MetadataCandidateScratchPool::new(index.docs.len());
 
         let batch = collect_metadata_doc_pair_hits_for_left_range(
             1..3,
-            &index.docs,
-            &index.postings,
-            &index.queries,
-            &index.prepared_docs,
+            MetadataPairScoringContext {
+                docs: &index.docs,
+                corpus: &index.corpus,
+                postings: &index.postings,
+                queries: &index.queries,
+                prepared_docs: &index.prepared_docs,
+            },
             &scratch_pool,
         );
 
@@ -1705,10 +1798,10 @@ mod metadata_tests {
     #[test]
     fn metadata_doc_pair_hits_score_one_left_with_reused_scratch() {
         let docs = vec![
-            metadata_doc_entry("gold dragon"),
-            metadata_doc_entry("dragon gold"),
+            metadata_doc_entry("gold dragon alpha omega"),
+            metadata_doc_entry("dragon gold alpha"),
             metadata_doc_entry("silver cat"),
-            metadata_doc_entry("gold dragon"),
+            metadata_doc_entry("gold dragon omega"),
         ];
         let (index, _) = InternedMetadataIndex::from_source_doc_entries(docs);
         let mut scratch = MetadataCandidateScratch::new(index.docs.len());
@@ -1716,10 +1809,13 @@ mod metadata_tests {
 
         let candidate_pairs = collect_metadata_doc_pair_hits_for_left_with_scratch(
             0,
-            &index.docs,
-            &index.postings,
-            &index.queries,
-            &index.prepared_docs,
+            &MetadataPairScoringContext {
+                docs: &index.docs,
+                corpus: &index.corpus,
+                postings: &index.postings,
+                queries: &index.queries,
+                prepared_docs: &index.prepared_docs,
+            },
             &mut scratch,
             &mut hits,
         );
@@ -1864,7 +1960,7 @@ mod metadata_tests {
     }
 
     #[test]
-    fn metadata_data_builder_builds_bm25_index_for_raw_representative_matching() {
+    fn metadata_data_builder_builds_bm25_index_for_content_representative_matching() {
         let mut builder = MetadataDataBuilder::new(1);
         let doc = MetadataBm25Document::from_text("gold dragon").unwrap();
         let doc_key = metadata_document_key("gold dragon");
