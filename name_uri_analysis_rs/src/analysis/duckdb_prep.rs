@@ -314,9 +314,7 @@ fn uri_counts_from_contract_flags(
 ) -> Result<UriCounts, AnalysisError> {
     let sql = format!(
         "
-        SELECT coalesce(sum(total_nfts), 0)::BIGINT,
-               count(*)::BIGINT,
-               coalesce(sum({prefix}_v1_nfts), 0)::BIGINT,
+        SELECT coalesce(sum({prefix}_v1_nfts), 0)::BIGINT,
                coalesce(sum({prefix}_v1_contracts), 0)::BIGINT,
                coalesce(sum({prefix}_v2_nfts), 0)::BIGINT,
                coalesce(sum({prefix}_v2_contracts), 0)::BIGINT,
@@ -343,4 +341,30 @@ fn load_selected_chains(conn: &Connection) -> Result<Vec<String>, AnalysisError>
         ));
     }
     Ok(chains)
+}
+
+fn load_chain_totals(
+    conn: &Connection,
+    chains: &[String],
+) -> Result<HashMap<String, NameTotals>, AnalysisError> {
+    let mut totals = HashMap::new();
+    let mut stmt = conn.prepare(
+        "
+        SELECT count(DISTINCT contract_address)::BIGINT,
+               count(*)::BIGINT
+        FROM analysis_rows
+        WHERE chain = ?
+          AND contract_address <> ''
+        ",
+    )?;
+    for chain in chains {
+        let total = stmt.query_row(params![chain], |row| {
+            Ok(NameTotals {
+                contracts: row.get(0)?,
+                nfts: row.get(1)?,
+            })
+        })?;
+        totals.insert(chain.clone(), total);
+    }
+    Ok(totals)
 }

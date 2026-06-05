@@ -38,21 +38,31 @@ pub fn run_analysis(options: AnalysisOptions) -> Result<AnalysisReport, Analysis
     progress.step("DuckDB configured");
     progress.finish_phase("DuckDB configured");
     let selected_chains = prepare_base_tables(&conn, &options, &progress)?;
+    let chain_totals = load_chain_totals(&conn, &selected_chains)?;
 
     let mut summary_rows = Vec::new();
-    summary_rows.extend(run_uri_analysis(&conn, &selected_chains, &progress)?);
-    summary_rows.extend(run_name_analysis(
+    summary_rows.extend(run_uri_analysis(
         &conn,
         &selected_chains,
-        &options.thresholds,
-        options.threads,
-        &options.memory_limit,
-        options.analysis_memory_limit.as_deref(),
+        &chain_totals,
+        &progress,
+    )?);
+    summary_rows.extend(run_name_analysis(
+        &conn,
+        NameAnalysisSpec {
+            chains: &selected_chains,
+            totals: &chain_totals,
+            thresholds: &options.thresholds,
+            threads: options.threads,
+            memory_limit: &options.memory_limit,
+            analysis_memory_limit: options.analysis_memory_limit.as_deref(),
+        },
         &progress,
     )?);
     summary_rows.extend(run_metadata_analysis(
         &conn,
         &selected_chains,
+        &chain_totals,
         options.threads,
         &progress,
     )?);

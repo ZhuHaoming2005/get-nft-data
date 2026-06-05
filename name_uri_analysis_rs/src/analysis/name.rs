@@ -1,19 +1,26 @@
+struct NameAnalysisSpec<'a> {
+    chains: &'a [String],
+    totals: &'a HashMap<String, NameTotals>,
+    thresholds: &'a [f64],
+    threads: usize,
+    memory_limit: &'a str,
+    analysis_memory_limit: Option<&'a str>,
+}
+
 fn run_name_analysis(
     conn: &Connection,
-    chains: &[String],
-    thresholds: &[f64],
-    threads: usize,
-    memory_limit: &str,
-    analysis_memory_limit: Option<&str>,
+    spec: NameAnalysisSpec<'_>,
     progress: &ProgressTracker,
 ) -> Result<Vec<SummaryRow>, AnalysisError> {
+    let chains = spec.chains;
+    let totals = spec.totals;
+    let thresholds = spec.thresholds;
     progress.start_phase("analyzing name duplicates", 3);
-    let totals = load_name_totals(conn, chains)?;
     progress.step("loaded name totals");
     let atoms = load_all_name_atoms(conn, chains)?;
     progress.step(format!("loaded {} name atoms", atoms.len()));
     let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads.max(1))
+        .num_threads(spec.threads.max(1))
         .build()
         .map_err(|err| AnalysisError::InvalidData(err.to_string()))?;
 
@@ -21,13 +28,13 @@ fn run_name_analysis(
     let atom_bytes = name_atoms_memory_bytes(&atoms);
     let atoms_by_chain = atoms_by_chain(&atoms, chains.len());
     let chain_matrix_state_bytes = chain_matrix_reuse_state_bytes(&atoms_by_chain);
-    let total_memory_budget = total_memory_budget_bytes(memory_limit)?;
+    let total_memory_budget = total_memory_budget_bytes(spec.memory_limit)?;
     let memory_plan = name_analysis_memory_plan(
         thresholds,
         atoms.len(),
         chains.len(),
-        memory_limit,
-        analysis_memory_limit,
+        spec.memory_limit,
+        spec.analysis_memory_limit,
         atom_bytes,
         chain_matrix_state_bytes,
     )?;
@@ -100,10 +107,10 @@ fn run_name_analysis(
         };
         progress.add_work(states.len() as u64 * chains.len() as u64 + chain_matrix_summary_work);
         for state in &mut states {
-            push_name_summary_rows(&mut rows, &atoms, &atoms_by_chain, chains, &totals, state);
+            push_name_summary_rows(&mut rows, &atoms, &atoms_by_chain, chains, totals, state);
             progress.inc(chains.len() as u64);
             if chain_matrix_reuse.is_some() {
-                push_reused_chain_matrix_rows(&mut rows, &atoms, chains, &totals, state);
+                push_reused_chain_matrix_rows(&mut rows, &atoms, chains, totals, state);
                 progress.inc(chain_pair_count(chains.len()) as u64 * 2);
             }
         }
@@ -117,7 +124,7 @@ fn run_name_analysis(
                 thresholds: &thresholds,
                 analysis_budget: analysis_work_budget,
                 total_memory_budget,
-                totals: &totals,
+                totals,
             },
             &pool,
             progress,
@@ -125,30 +132,6 @@ fn run_name_analysis(
     }
     progress.finish_phase("name analysis complete");
     Ok(rows)
-}
-
-fn load_name_totals(
-    conn: &Connection,
-    chains: &[String],
-) -> Result<HashMap<String, NameTotals>, AnalysisError> {
-    let mut totals = HashMap::new();
-    let mut stmt = conn.prepare(
-        "
-        SELECT count(*)::BIGINT, coalesce(sum(nft_count), 0)::BIGINT
-        FROM contract_names
-        WHERE chain = ?
-        ",
-    )?;
-    for chain in chains {
-        let total = stmt.query_row(params![chain], |row| {
-            Ok(NameTotals {
-                contracts: row.get(0)?,
-                nfts: row.get(1)?,
-            })
-        })?;
-        totals.insert(chain.clone(), total);
-    }
-    Ok(totals)
 }
 
 fn load_all_name_atoms(

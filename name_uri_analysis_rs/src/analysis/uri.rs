@@ -1,6 +1,7 @@
 fn run_uri_analysis(
     conn: &Connection,
     chains: &[String],
+    totals: &HashMap<String, NameTotals>,
     progress: &ProgressTracker,
 ) -> Result<Vec<SummaryRow>, AnalysisError> {
     let mut rows = Vec::new();
@@ -8,12 +9,17 @@ fn run_uri_analysis(
     progress.start_phase("analyzing URI duplicates", uri_steps as u64);
     for chain in chains {
         let counts = uri_counts_from_contract_flags(conn, chain, "norm_contract")?;
+        let total = totals.get(chain).copied().unwrap_or(NameTotals {
+            contracts: 0,
+            nfts: 0,
+        });
         push_uri_rows(
             &mut rows,
             "intra_chain",
             chain,
             "",
             "norm_cross",
+            total,
             counts,
         );
         progress.step(format!("URI intra {chain} norm_cross"));
@@ -24,14 +30,12 @@ fn run_uri_analysis(
 
 fn uri_counts_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<UriCounts> {
     Ok(UriCounts {
-        total_nfts: row.get(0)?,
-        total_contracts: row.get(1)?,
-        v1_nfts: row.get(2)?,
-        v1_contracts: row.get(3)?,
-        v2_nfts: row.get(4)?,
-        v2_contracts: row.get(5)?,
-        v3_nfts: row.get(6)?,
-        v3_contracts: row.get(7)?,
+        v1_nfts: row.get(0)?,
+        v1_contracts: row.get(1)?,
+        v2_nfts: row.get(2)?,
+        v2_contracts: row.get(3)?,
+        v3_nfts: row.get(4)?,
+        v3_contracts: row.get(5)?,
     })
 }
 
@@ -41,6 +45,7 @@ fn push_uri_rows(
     primary_chain: &str,
     secondary_chain: &str,
     match_mode: &str,
+    total: NameTotals,
     counts: UriCounts,
 ) {
     for (metric, duplicate_nfts, duplicate_contracts) in [
@@ -57,8 +62,8 @@ fn push_uri_rows(
                 threshold: None,
                 match_mode,
                 metric,
-                total_contracts: counts.total_contracts,
-                total_nfts: counts.total_nfts,
+                total_contracts: total.contracts,
+                total_nfts: total.nfts,
             },
             GroupSummary {
                 duplicate_contract_count: duplicate_contracts,

@@ -278,6 +278,7 @@ impl MetadataCandidateScratchPool {
 fn run_metadata_analysis(
     conn: &Connection,
     chains: &[String],
+    totals: &HashMap<String, NameTotals>,
     threads: usize,
     progress: &ProgressTracker,
 ) -> Result<Vec<SummaryRow>, AnalysisError> {
@@ -292,10 +293,9 @@ fn run_metadata_analysis(
         data.docs.len(),
         data.contracts.len()
     ));
-    let totals = metadata_totals(&data, chains);
     let mut rows = Vec::new();
     if data.contracts.len() < 2 || data.docs.is_empty() {
-        push_empty_metadata_rows(&mut rows, chains, &totals);
+        push_empty_metadata_rows(&mut rows, chains, totals);
         progress.step("metadata scoring skipped");
         progress.step("metadata rows summarized");
         progress.finish_phase("metadata analysis complete");
@@ -310,7 +310,7 @@ fn run_metadata_analysis(
     };
     pool.install(|| union_metadata_pairs(&data, chains.len(), &mut state, progress));
     progress.step("metadata documents scored");
-    push_metadata_summary_rows(&mut rows, &data, chains, &totals, &mut state);
+    push_metadata_summary_rows(&mut rows, &data, chains, totals, &mut state);
     progress.step("metadata rows summarized");
     progress.finish_phase("metadata analysis complete");
     Ok(rows)
@@ -475,29 +475,6 @@ fn is_metadata_schema_key_token(token: &str) -> bool {
             | "trait_type"
             | "value"
     )
-}
-
-fn metadata_totals(data: &MetadataData, chains: &[String]) -> HashMap<String, NameTotals> {
-    let mut totals = chains
-        .iter()
-        .map(|chain| {
-            (
-                chain.clone(),
-                NameTotals {
-                    contracts: 0,
-                    nfts: 0,
-                },
-            )
-        })
-        .collect::<HashMap<_, _>>();
-    for contract in &data.contracts {
-        let Some(total) = totals.get_mut(&chains[contract.chain_index]) else {
-            continue;
-        };
-        total.contracts += 1;
-        total.nfts += contract.nft_count;
-    }
-    totals
 }
 
 fn union_metadata_pairs(

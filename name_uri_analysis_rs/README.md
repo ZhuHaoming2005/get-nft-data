@@ -12,6 +12,7 @@ Rust + DuckDB 一体分析脚本，读取 `top_contract_analysis_rs export-snaps
   - `v3`: 任一 URI 命中
   - 不输出 URI 任意重复、严格串重复、跨链 URI 汇总。
 - `metadata` 使用 BM25 文档查重，阈值为 `0.6`；每个合约只取第一条可用 metadata 作为代表文档。脚本先在 DuckDB 中按合约筛出代表 metadata，再按 `top_contract_analysis_rs` 的 final metadata 语义提取 `description`、`attributes.trait_type/value`、`image`、`external_url` 等内容值，不把完整 raw JSON 或通用 schema 字段名作为重复依据。BM25 命中还必须共享全局低频内容锚点，降低全局连通分量桥接造成的误判。
+- `duplicate_contract_ratio` / `duplicate_nft_ratio` 的分母统一使用每条链在 `analysis_rows` 中的全量非空合约地址数和 NFT 行数；name、URI、metadata 不再分别使用各自可分析子集作为分母。
 - DuckDB 使用 `:memory:` 内存数据库，不再设置 DuckDB `memory_limit`；兼容旧命令保留的 `--database` 参数不再用于打开磁盘库。准备阶段只生成本次运行的临时工作投影，不做持久化 prepared-table 缓存。
 
 运行示例：

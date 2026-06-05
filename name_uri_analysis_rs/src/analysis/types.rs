@@ -79,8 +79,6 @@ struct NameTotals {
 
 #[derive(Clone, Copy)]
 struct UriCounts {
-    total_nfts: i64,
-    total_contracts: i64,
     v1_nfts: i64,
     v1_contracts: i64,
     v2_nfts: i64,

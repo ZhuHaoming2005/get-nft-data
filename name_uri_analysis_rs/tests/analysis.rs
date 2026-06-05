@@ -770,6 +770,61 @@ fn metadata_analysis_does_not_match_same_schema_with_different_content_values() 
 }
 
 #[test]
+fn summary_rows_use_chain_totals_as_common_denominators() {
+    let temp = tempfile::tempdir().unwrap();
+    let parquet = temp.path().join("sample.parquet");
+    write_parquet_with_metadata(
+        &parquet,
+        r#"
+            VALUES
+            ('ethereum', '0xaaa', '1', 'shared-uri', 'img1', 'Azuki', 'azuki', '{"description":"gold dragon alpha"}'),
+            ('ethereum', '0xbbb', '1', 'shared-uri', 'img2', 'Azuki', 'azuki', '{"description":"gold dragon alpha"}'),
+            ('ethereum', '0xccc', '1', '', '', '', '', ''),
+            ('ethereum', '0xccc', '2', '', '', '', '', '')
+        "#,
+    );
+
+    let report = run_analysis(AnalysisOptions {
+        database_path: temp.path().join("analysis.duckdb"),
+        parquet_inputs: vec![parquet],
+        output_dir: temp.path().join("out"),
+        thresholds: vec![95.0],
+        threads: 2,
+        memory_limit: "256MB".into(),
+        analysis_memory_limit: Some("64MB".into()),
+        temp_directory: None,
+        progress: false,
+        persist_prepared: false,
+        reuse_prepared: false,
+    })
+    .unwrap();
+
+    for (field_name, metric) in [
+        ("metadata", "duplicate_group"),
+        ("name", "duplicate_group"),
+        ("uri", "v1"),
+    ] {
+        let row = report
+            .summary_rows
+            .iter()
+            .find(|row| {
+                row.field_name == field_name
+                    && row.scope == "intra_chain"
+                    && row.primary_chain == "ethereum"
+                    && row.metric == metric
+            })
+            .unwrap();
+
+        assert_eq!(row.total_contracts, 3, "{field_name}");
+        assert_eq!(row.total_nfts, 4, "{field_name}");
+        assert_eq!(row.duplicate_contract_count, 2, "{field_name}");
+        assert_eq!(row.duplicate_nft_count, 2, "{field_name}");
+        assert_eq!(row.duplicate_contract_ratio, 200.0 / 3.0, "{field_name}");
+        assert_eq!(row.duplicate_nft_ratio, 50.0, "{field_name}");
+    }
+}
+
+#[test]
 fn metadata_analysis_requires_rare_anchor_for_representative_bm25_matching() {
     let temp = tempfile::tempdir().unwrap();
     let parquet = temp.path().join("sample.parquet");
