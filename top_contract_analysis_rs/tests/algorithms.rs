@@ -20,7 +20,7 @@ use top_contract_analysis_rs::analysis::scoring::{
 use top_contract_analysis_rs::analysis::signals::analyze_transfer_signals;
 use top_contract_analysis_rs::models::{
     AddressAttributionPayload, AddressEvidencePayload, DatabaseNftRecord, DuplicateCandidate,
-    DuplicateContractPayload, HonestAddressPayload, InfringingTokenRecord, NftMarketEventRecord,
+    DuplicateContractPayload, HonestAddressPayload, InfringingTokenRecord,
     NftPropagationPathPayload, NftSaleRecord, OwnerBalance, SecondarySaleVictimAddressPayload,
     SeedContractPayload, SeedNft, TransferRecord, ValueFlowEdgePayload, ZERO_ADDRESS,
 };
@@ -909,36 +909,6 @@ fn lifecycle_model_outputs_expose_research_graph_payloads() {
         secondary_sale_victim_addresses: &victims,
     });
     let propagation_paths = BTreeMap::from([("0xdup".to_string(), path)]);
-    let market_events = vec![
-        NftMarketEventRecord {
-            contract_address: "0xdup".into(),
-            token_id: "1".into(),
-            event_type: "order".into(),
-            order_type: "listing".into(),
-            order_hash: "0xorder".into(),
-            event_timestamp: 120,
-            actor_address: "0xseller".into(),
-            maker_address: "0xseller".into(),
-            price_eth: Some(2.0),
-            price_usd: Some(6000.0),
-            marketplace: "opensea".into(),
-            source: "opensea".into(),
-            ..NftMarketEventRecord::default()
-        },
-        NftMarketEventRecord {
-            contract_address: "0xdup".into(),
-            token_id: "1".into(),
-            event_type: "cancel".into(),
-            order_type: "listing".into(),
-            order_hash: "0xorder".into(),
-            event_timestamp: 220,
-            actor_address: "0xseller".into(),
-            maker_address: "0xseller".into(),
-            marketplace: "opensea".into(),
-            source: "opensea".into(),
-            ..NftMarketEventRecord::default()
-        },
-    ];
     let mint_payment_edges = vec![
         ValueFlowEdgePayload {
             edge_id: "value:mint_payment:0xmint:0xseller:0xdup".into(),
@@ -1033,7 +1003,6 @@ fn lifecycle_model_outputs_expose_research_graph_payloads() {
         address_attributions: &attributions,
         nft_propagation_paths: &propagation_paths,
         mint_payment_edges: &mint_payment_edges,
-        market_events: &market_events,
     });
 
     assert!(outputs
@@ -1044,10 +1013,6 @@ fn lifecycle_model_outputs_expose_research_graph_payloads() {
         .contract_lifecycle_events
         .iter()
         .any(|event| event.lifecycle_stage == "monetization"));
-    assert!(outputs
-        .contract_lifecycle_events
-        .iter()
-        .any(|event| event.lifecycle_stage == "market_exposure"));
     assert!(outputs.contract_lifecycle_events.iter().any(|event| {
         event.lifecycle_stage == "primary_monetization"
             && event.event_type == "mint_payment"
@@ -1136,11 +1101,9 @@ fn lifecycle_model_outputs_expose_research_graph_payloads() {
         .iter()
         .find(|metric| metric.contract_address == "0xdup")
         .expect("contract lifecycle metric");
-    assert_eq!(metric.time_to_first_listing_seconds, Some(40));
     assert_eq!(metric.time_to_first_sale_seconds, Some(100));
     assert_eq!(metric.first_victim_time, 100);
     assert_eq!(metric.time_to_first_victim_seconds, Some(20));
-    assert_eq!(metric.market_event_count, 2);
     assert!((metric.gross_revenue_eth - 1.58).abs() < 1e-9);
     assert!((metric.operator_revenue_eth - 0.08).abs() < 1e-9);
     assert_eq!(metric.marketplace_fee_eth, 0.1);
@@ -1250,7 +1213,6 @@ fn lifecycle_metrics_handle_proxy_admin_and_usd_only_top_recipient() {
         address_attributions: &[],
         nft_propagation_paths: &propagation_paths,
         mint_payment_edges: &value_edges,
-        market_events: &[],
     });
 
     let metric = outputs
@@ -1346,7 +1308,6 @@ fn early_detection_features_do_not_treat_undated_sales_as_window_observed() {
         address_attributions: &[],
         nft_propagation_paths: &BTreeMap::from([("0xdup".to_string(), path)]),
         mint_payment_edges: &unknown_time_value_edges,
-        market_events: &[],
     });
 
     let metric = outputs
@@ -1458,7 +1419,6 @@ fn campaign_clusters_use_funding_source_not_paid_minter_as_shared_evidence() {
         address_attributions: &[],
         nft_propagation_paths: &BTreeMap::new(),
         mint_payment_edges: &same_minter_edges,
-        market_events: &[],
     });
     assert_eq!(same_minter_outputs.campaign_clusters.len(), 2);
 
@@ -1469,7 +1429,6 @@ fn campaign_clusters_use_funding_source_not_paid_minter_as_shared_evidence() {
         address_attributions: &[],
         nft_propagation_paths: &BTreeMap::new(),
         mint_payment_edges: &shared_funder_edges,
-        market_events: &[],
     });
     assert_eq!(shared_funder_outputs.campaign_clusters.len(), 1);
     assert!(shared_funder_outputs.campaign_clusters[0]
@@ -1552,7 +1511,6 @@ fn campaign_clusters_do_not_use_aggregation_attribution_as_shared_operator_evide
         address_attributions: &address_attributions,
         nft_propagation_paths: &BTreeMap::new(),
         mint_payment_edges: &[],
-        market_events: &[],
     });
 
     assert_eq!(outputs.campaign_clusters.len(), 2);
@@ -1615,7 +1573,6 @@ fn campaign_clusters_do_not_merge_unrelated_contracts_without_shared_evidence() 
         address_attributions: &[],
         nft_propagation_paths: &BTreeMap::new(),
         mint_payment_edges: &[],
-        market_events: &[],
     });
 
     assert_eq!(outputs.campaign_clusters.len(), 2);
@@ -1760,7 +1717,6 @@ fn campaign_clusters_do_not_merge_contracts_only_because_they_share_sale_seller(
         address_attributions: &attributions,
         nft_propagation_paths: &propagation_paths,
         mint_payment_edges: &[],
-        market_events: &[],
     });
 
     assert_eq!(outputs.campaign_clusters.len(), 2);
@@ -1825,18 +1781,17 @@ fn lifecycle_stage_transitions_do_not_move_backward_in_time() {
             secondary_sale_victim_addresses: &[],
         }),
     )]);
-    let market_events = vec![NftMarketEventRecord {
+    let early_monetization_edges = vec![ValueFlowEdgePayload {
+        edge_id: "value:royalty_fee:0xroyalty:0xbuyer:0xroyalty".into(),
         contract_address: "0xdup".into(),
-        token_id: "1".into(),
-        event_type: "order".into(),
-        order_type: "listing".into(),
-        event_timestamp: 100,
+        tx_hash: "0xroyalty".into(),
         block_number: 10,
         block_time: 100,
-        actor_address: "0xminter".into(),
-        marketplace: "opensea".into(),
-        source: "opensea".into(),
-        ..NftMarketEventRecord::default()
+        token_id: "1".into(),
+        channel: "royalty_fee".into(),
+        evidence_type: "marketplace_royalty_fee".into(),
+        evidence_flags: vec!["sale".into()],
+        ..ValueFlowEdgePayload::default()
     }];
 
     let outputs = build_lifecycle_model_outputs(LifecycleModelInput {
@@ -1845,12 +1800,11 @@ fn lifecycle_stage_transitions_do_not_move_backward_in_time() {
         duplicate_contracts: &duplicate_contracts,
         address_attributions: &[],
         nft_propagation_paths: &propagation_paths,
-        mint_payment_edges: &[],
-        market_events: &market_events,
+        mint_payment_edges: &early_monetization_edges,
     });
 
     assert!(!outputs.contract_lifecycle_events.iter().any(|event| {
         event.lifecycle_stage == "stage_transition"
-            && event.event_type == "replica_mint_to_market_exposure"
+            && event.event_type == "replica_mint_to_monetization"
     }));
 }

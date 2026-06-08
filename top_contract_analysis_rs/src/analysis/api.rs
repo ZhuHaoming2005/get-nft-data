@@ -10,16 +10,16 @@ use crate::api::{
     fetch_contract_nfts_with_fallback_clients, fetch_contract_owners,
     fetch_contract_sales_with_clients, fetch_contract_total_supply,
     fetch_contract_transfers_with_etherscan_fallback, fetch_eth_balance, fetch_license_sample,
-    fetch_opensea_contract_market_events, fetch_same_block_eth_transfers_for_address,
-    fetch_same_block_value_transfers_for_address, fetch_same_block_value_transfers_to_address,
-    fetch_seed_contract_nfts, fetch_transaction_receipt, fetch_transaction_receipts_for_block,
-    is_open_license_payload, ApiEndpoints, AsyncApiClient, OpenSeaAccountFallback,
+    fetch_same_block_eth_transfers_for_address, fetch_same_block_value_transfers_for_address,
+    fetch_same_block_value_transfers_to_address, fetch_seed_contract_nfts,
+    fetch_transaction_receipt, fetch_transaction_receipts_for_block, is_open_license_payload,
+    ApiEndpoints, AsyncApiClient, OpenSeaAccountFallback,
 };
 use crate::currency::FALLBACK_ETH_USD_RATE;
 use crate::error::AppError;
 use crate::models::{
-    ContractMetadata, EthTransferRecord, NftMarketEventRecord, NftSaleRecord, OwnerBalance,
-    SeedNft, TransactionReceiptRecord, TransferRecord,
+    ContractMetadata, EthTransferRecord, NftSaleRecord, OwnerBalance, SeedNft,
+    TransactionReceiptRecord, TransferRecord,
 };
 
 #[derive(Clone, Copy)]
@@ -149,17 +149,6 @@ pub trait AnalyzeApi: Send + Sync {
         contract_address: &str,
         opensea_api_key: &str,
     ) -> Result<Vec<NftSaleRecord>, AppError>;
-
-    async fn fetch_contract_market_events(
-        &self,
-        _chain: &str,
-        _alchemy_api_key: &str,
-        _alchemy_network: Option<&str>,
-        _contract_address: &str,
-        _opensea_api_key: &str,
-    ) -> Result<Vec<NftMarketEventRecord>, AppError> {
-        Ok(Vec::new())
-    }
 
     async fn fetch_transaction_receipt(
         &self,
@@ -552,71 +541,6 @@ impl AnalyzeApi for RealApi {
             eth_usd_rate,
         )
         .await
-    }
-
-    async fn fetch_contract_market_events(
-        &self,
-        chain: &str,
-        alchemy_api_key: &str,
-        alchemy_network: Option<&str>,
-        contract_address: &str,
-        opensea_api_key: &str,
-    ) -> Result<Vec<NftMarketEventRecord>, AppError> {
-        if opensea_api_key.trim().is_empty() {
-            return Ok(Vec::new());
-        }
-        let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
-        let eth_usd_rate = match self.current_eth_usd_rate(Some(alchemy_api_key)).await {
-            Ok(rate) => Some(rate),
-            Err(err) => {
-                if !self
-                    .eth_usd_rate_warning_emitted
-                    .swap(true, Ordering::Relaxed)
-                {
-                    eprintln!(
-                        "warning: failed to fetch current ETH/USD rate for {contract_address}: {err}; market events will not be USD-normalized"
-                    );
-                }
-                None
-            }
-        };
-        let collection_slug = match fetch_contract_collection_slug_alchemy_first(
-            &self.alchemy_client,
-            &self.other_client,
-            &endpoints,
-            chain,
-            contract_address,
-            opensea_api_key,
-        )
-        .await
-        {
-            Ok(collection_slug) => collection_slug,
-            Err(err) => {
-                eprintln!(
-                    "warning: OpenSea market events collection lookup failed for {contract_address}: {err}; continuing without market events"
-                );
-                None
-            }
-        };
-        match fetch_opensea_contract_market_events(
-            &self.other_client,
-            &endpoints.opensea_base,
-            chain,
-            contract_address,
-            collection_slug.as_deref(),
-            opensea_api_key,
-            eth_usd_rate,
-        )
-        .await
-        {
-            Ok(rows) => Ok(rows),
-            Err(err) => {
-                eprintln!(
-                    "warning: OpenSea market events failed for {contract_address}: {err}; continuing without market events"
-                );
-                Ok(Vec::new())
-            }
-        }
     }
 
     async fn fetch_transaction_receipt(

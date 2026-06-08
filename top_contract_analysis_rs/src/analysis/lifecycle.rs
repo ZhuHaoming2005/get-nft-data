@@ -4,8 +4,8 @@ use crate::models::{
     AddressAttributionPayload, AddressEvidenceFeaturePayload, CampaignClusterPayload,
     ContentSimilarityEdgePayload, ContractLifecycleEventPayload, ContractLifecycleMetricPayload,
     DuplicateCandidate, DuplicateContractPayload, EarlyDetectionFeaturePayload,
-    NftMarketEventRecord, NftPropagationEdgePayload, NftPropagationPathPayload,
-    SeedContractPayload, ValueFlowEdgePayload, WeakSupervisionLabelPayload,
+    NftPropagationEdgePayload, NftPropagationPathPayload, SeedContractPayload,
+    ValueFlowEdgePayload, WeakSupervisionLabelPayload,
 };
 
 const VALUE_FLOW_COVERAGE_SCOPE: &str =
@@ -23,7 +23,6 @@ pub struct LifecycleModelInput<'a> {
     pub address_attributions: &'a [AddressAttributionPayload],
     pub nft_propagation_paths: &'a BTreeMap<String, NftPropagationPathPayload>,
     pub mint_payment_edges: &'a [ValueFlowEdgePayload],
-    pub market_events: &'a [NftMarketEventRecord],
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -51,12 +50,10 @@ pub fn build_lifecycle_model_outputs(input: LifecycleModelInput<'_>) -> Lifecycl
         &address_evidence_features,
         input.nft_propagation_paths,
         &value_flow_edges,
-        input.market_events,
     );
     let lifecycle_metrics = build_lifecycle_metrics(
         input.seed_contract,
         input.nft_propagation_paths,
-        input.market_events,
         &address_evidence_features,
         &value_flow_edges,
         &contract_lifecycle_events,
@@ -352,7 +349,6 @@ fn build_contract_lifecycle_events(
     address_evidence_features: &[AddressEvidenceFeaturePayload],
     propagation_paths: &BTreeMap<String, NftPropagationPathPayload>,
     value_flow_edges: &[ValueFlowEdgePayload],
-    market_events: &[NftMarketEventRecord],
 ) -> Vec<ContractLifecycleEventPayload> {
     let victim_addresses: BTreeSet<String> = address_evidence_features
         .iter()
@@ -470,9 +466,6 @@ fn build_contract_lifecycle_events(
             rows.push(value_flow_lifecycle_event(edge));
         }
     }
-    for event in market_events {
-        rows.push(market_lifecycle_event(event));
-    }
     let transition_events = build_stage_transition_events(&rows);
     rows.extend(transition_events);
 
@@ -505,7 +498,6 @@ fn build_stage_transition_events(
         "replica_deployment",
         "replica_mint",
         "primary_monetization",
-        "market_exposure",
         "victimization",
         "monetization",
         "exit_or_cleanup",
@@ -622,8 +614,6 @@ fn transition_confidence(evidence_flags: &[String]) -> &'static str {
         "sale",
         "marketplace_purchase",
         "paid_mint",
-        "opensea_order",
-        "opensea_cancel",
     ]
     .iter()
     .filter(|flag| evidence_flags.iter().any(|item| item.contains(**flag)))
@@ -702,101 +692,14 @@ fn value_flow_lifecycle_event(edge: &ValueFlowEdgePayload) -> ContractLifecycleE
     }
 }
 
-fn market_lifecycle_event(event: &NftMarketEventRecord) -> ContractLifecycleEventPayload {
-    let (stage, event_type, confidence, detail) = match event.event_type.as_str() {
-        "order" | "listing" | "item_listed" => (
-            "market_exposure",
-            if event.order_type.is_empty() {
-                "market_listing"
-            } else {
-                event.order_type.as_str()
-            },
-            "medium",
-            "OpenSea order event for copied NFT",
-        ),
-        "cancel" | "order_cancelled" | "item_cancelled" => (
-            "exit_or_cleanup",
-            "order_cancel",
-            "medium",
-            "OpenSea cancellation event for copied NFT order",
-        ),
-        "transfer" => (
-            "distribution",
-            "market_transfer",
-            "medium",
-            "OpenSea observed NFT transfer event",
-        ),
-        "sale" => (
-            "monetization",
-            "sale",
-            "high",
-            "OpenSea observed sale event",
-        ),
-        other => (
-            "market_activity",
-            other,
-            "low",
-            "OpenSea market activity event",
-        ),
-    };
-    let block_time = if event.block_time > 0 {
-        event.block_time
-    } else {
-        event.event_timestamp
-    };
-
-    ContractLifecycleEventPayload {
-        event_id: format!(
-            "market:{}:{}:{}:{}",
-            stage, event.contract_address, event.token_id, event.order_hash
-        ),
-        contract_address: event.contract_address.clone(),
-        lifecycle_stage: stage.into(),
-        event_type: event_type.into(),
-        block_number: event.block_number,
-        block_time,
-        tx_hash: event.tx_hash.clone(),
-        actor_address: event.actor_address.clone(),
-        counterparty_address: if event.to_address.is_empty() {
-            event.taker_address.clone()
-        } else {
-            event.to_address.clone()
-        },
-        token_id: event.token_id.clone(),
-        value_eth: event.price_eth,
-        value_usd: event.price_usd,
-        evidence_type: format!("opensea_{}", event.event_type),
-        evidence_flags: market_event_flags(event),
-        confidence: confidence.into(),
-        detail: detail.into(),
-    }
-}
-
-fn market_event_flags(event: &NftMarketEventRecord) -> Vec<String> {
-    let mut flags = vec![format!("opensea_{}", event.event_type)];
-    if !event.order_type.is_empty() {
-        flags.push(format!("order_type:{}", event.order_type));
-    }
-    if !event.marketplace.is_empty() {
-        flags.push(format!("marketplace:{}", event.marketplace));
-    }
-    flags
-}
-
 fn build_lifecycle_metrics(
     seed_contract: &SeedContractPayload,
     propagation_paths: &BTreeMap<String, NftPropagationPathPayload>,
-    market_events: &[NftMarketEventRecord],
     address_evidence_features: &[AddressEvidenceFeaturePayload],
     value_flow_edges: &[ValueFlowEdgePayload],
     lifecycle_events: &[ContractLifecycleEventPayload],
 ) -> Vec<ContractLifecycleMetricPayload> {
     let mut contracts: BTreeSet<String> = propagation_paths.keys().cloned().collect();
-    contracts.extend(
-        market_events
-            .iter()
-            .map(|event| event.contract_address.clone()),
-    );
     contracts.extend(
         lifecycle_events
             .iter()
@@ -816,8 +719,6 @@ fn build_lifecycle_metrics(
                 first_stage_time(lifecycle_events, &contract, "distribution"),
                 first_stage_time(lifecycle_events, &contract, "monetization"),
             );
-            let first_listing_time =
-                first_stage_time(lifecycle_events, &contract, "market_exposure");
             let first_sale_time = first_stage_time(lifecycle_events, &contract, "monetization");
             let first_victim_time = earliest_positive_time(
                 first_stage_time(lifecycle_events, &contract, "victimization"),
@@ -851,11 +752,9 @@ fn build_lifecycle_metrics(
                 deployment_time,
                 first_mint_time,
                 first_transfer_time,
-                first_listing_time,
                 first_sale_time,
                 first_victim_time,
                 time_to_first_transfer_seconds: elapsed(deployment_time, first_transfer_time),
-                time_to_first_listing_seconds: elapsed(deployment_time, first_listing_time),
                 time_to_first_sale_seconds: elapsed(deployment_time, first_sale_time),
                 time_to_first_victim_seconds: elapsed(deployment_time, first_victim_time),
                 cascade_node_count: path_summary.map(|summary| summary.node_count).unwrap_or(0),
@@ -864,10 +763,6 @@ fn build_lifecycle_metrics(
                 sale_count: path_summary
                     .map(|summary| summary.sale_edge_count)
                     .unwrap_or(0),
-                market_event_count: market_events
-                    .iter()
-                    .filter(|event| event.contract_address == contract)
-                    .count() as i64,
                 gross_revenue_eth: revenue.gross_eth,
                 gross_revenue_usd: revenue.gross_usd,
                 operator_revenue_eth: revenue.operator_eth,
@@ -1349,10 +1244,6 @@ fn build_early_detection_features(
                 mint_event_count: contract_events
                     .iter()
                     .filter(|event| event.event_type == "mint")
-                    .count() as i64,
-                market_event_count: contract_events
-                    .iter()
-                    .filter(|event| event.lifecycle_stage == "market_exposure")
                     .count() as i64,
                 value_flow_count: contract_value_edges.len() as i64,
                 funding_edge_count: contract_value_edges
@@ -1900,7 +1791,6 @@ mod tests {
             &BTreeMap::new(),
             &[],
             &[],
-            &[],
             &lifecycle_events,
         );
         let metric = metrics
@@ -1948,7 +1838,6 @@ mod tests {
         let metrics = build_lifecycle_metrics(
             &seed_contract,
             &BTreeMap::new(),
-            &[],
             &[],
             &value_flow_edges,
             &lifecycle_events,
@@ -2054,7 +1943,6 @@ mod tests {
         let metrics = build_lifecycle_metrics(
             &seed_contract,
             &BTreeMap::new(),
-            &[],
             &[],
             &[],
             &lifecycle_events,

@@ -17,8 +17,7 @@ use top_contract_analysis_rs::models::{
 };
 use top_contract_analysis_rs::models::{
     ContractMetadata, ContractNameRecord, DatabaseNftRecord, DatabaseSnapshot, EthTransferRecord,
-    NftMarketEventRecord, NftSaleRecord, OwnerBalance, SeedNft, TransactionReceiptRecord,
-    TransferRecord, ZERO_ADDRESS,
+    NftSaleRecord, OwnerBalance, SeedNft, TransactionReceiptRecord, TransferRecord, ZERO_ADDRESS,
 };
 use top_contract_analysis_rs::progress::{NoopBatchProgressReporter, NoopProgressReporter};
 use top_contract_analysis_rs::reporting::{
@@ -3233,7 +3232,6 @@ struct ConcurrentSingleContractFetchApi {
     max_fetches: AtomicUsize,
     active_post_signal_fetches: AtomicUsize,
     max_post_signal_fetches: AtomicUsize,
-    market_event_fetch_count: AtomicUsize,
 }
 
 impl ConcurrentSingleContractFetchApi {
@@ -3243,7 +3241,6 @@ impl ConcurrentSingleContractFetchApi {
             max_fetches: AtomicUsize::new(0),
             active_post_signal_fetches: AtomicUsize::new(0),
             max_post_signal_fetches: AtomicUsize::new(0),
-            market_event_fetch_count: AtomicUsize::new(0),
         }
     }
 
@@ -3379,25 +3376,6 @@ impl AnalyzeApi for ConcurrentSingleContractFetchApi {
             royalty_recipient_address: String::new(),
             source: "opensea".into(),
             is_native_eth: false,
-        }])
-    }
-
-    async fn fetch_contract_market_events(
-        &self,
-        _chain: &str,
-        _alchemy_api_key: &str,
-        _alchemy_network: Option<&str>,
-        contract_address: &str,
-        _opensea_api_key: &str,
-    ) -> Result<Vec<NftMarketEventRecord>, AppError> {
-        self.market_event_fetch_count.fetch_add(1, Ordering::SeqCst);
-        self.post_signal_overlap_delay().await;
-        Ok(vec![NftMarketEventRecord {
-            contract_address: contract_address.to_string(),
-            token_id: "1".into(),
-            event_type: "listing".into(),
-            source: "opensea".into(),
-            ..NftMarketEventRecord::default()
         }])
     }
 

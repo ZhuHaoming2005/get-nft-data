@@ -8,7 +8,7 @@ use crate::api::alchemy::fetch_eip2981_royalty_recipient;
 use crate::api::{fetch_contract_collection_slug_alchemy_first, ApiEndpoints, AsyncApiClient};
 use crate::currency::{is_native_eth_symbol, is_supported_priced_symbol, to_normalized_amount};
 use crate::error::AppError;
-use crate::models::{ContractMetadata, NftMarketEventRecord, NftSaleRecord, SeedNft};
+use crate::models::{ContractMetadata, NftSaleRecord, SeedNft};
 
 const ROYALTY_RECIPIENT_LOOKUP_BUFFER: usize = 64;
 
@@ -134,27 +134,6 @@ fn int_field(value: &Value, names: &[&str]) -> i64 {
         .unwrap_or(0)
 }
 
-fn event_timestamp_field(value: &Value) -> i64 {
-    for name in ["event_timestamp", "timestamp", "created_date", "created_at"] {
-        let Some(raw) = value.get(name) else {
-            continue;
-        };
-        if let Some(number) = raw.as_i64() {
-            return number;
-        }
-        if let Some(text) = raw.as_str() {
-            let trimmed = text.trim();
-            if let Ok(number) = trimmed.parse::<i64>() {
-                return number;
-            }
-            if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(trimmed) {
-                return parsed.timestamp();
-            }
-        }
-    }
-    0
-}
-
 fn decode_fee_eth(
     payload: Option<&Value>,
     eth_usd_rate: Option<f64>,
@@ -247,60 +226,6 @@ fn royalty_recipient_address(item: &Value) -> String {
             "creator_fee_recipient",
         ],
     )
-}
-
-fn decode_event_payment(
-    item: &Value,
-    eth_usd_rate: Option<f64>,
-) -> (Option<f64>, Option<f64>, String, String) {
-    let payment = item
-        .get("payment")
-        .or_else(|| item.get("payment_token"))
-        .or_else(|| item.get("price"))
-        .unwrap_or(&Value::Null);
-    let nested_current = payment.get("current").unwrap_or(&Value::Null);
-    let symbol = payment
-        .get("symbol")
-        .or_else(|| payment.get("currency"))
-        .or_else(|| nested_current.get("currency"))
-        .or_else(|| item.get("payment_token_symbol"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_uppercase();
-    let token_address = payment
-        .get("address")
-        .or_else(|| payment.get("token_address"))
-        .or_else(|| payment.get("tokenAddress"))
-        .or_else(|| payment.get("token"))
-        .or_else(|| payment.get("contract"))
-        .and_then(address_like_field)
-        .unwrap_or("")
-        .to_lowercase();
-    let raw_value = numeric_value(
-        item.get("payment_quantity")
-            .or_else(|| payment.get("quantity"))
-            .or_else(|| payment.get("amount"))
-            .or_else(|| payment.get("value"))
-            .or_else(|| nested_current.get("quantity"))
-            .or_else(|| nested_current.get("amount"))
-            .or_else(|| nested_current.get("value")),
-    )
-    .unwrap_or(0.0);
-    let decimals = payment
-        .get("decimals")
-        .or_else(|| nested_current.get("decimals"))
-        .and_then(Value::as_i64)
-        .or_else(|| {
-            payment
-                .get("decimals")
-                .or_else(|| nested_current.get("decimals"))
-                .and_then(Value::as_str)
-                .and_then(|text| text.parse::<i64>().ok())
-        })
-        .unwrap_or(18)
-        .max(0) as i32;
-    let normalized = to_normalized_amount(raw_value / 10f64.powi(decimals), &symbol, eth_usd_rate);
-    (normalized.eth, normalized.usd, symbol, token_address)
 }
 
 pub async fn fetch_alchemy_nft_sales(
@@ -690,172 +615,6 @@ async fn fetch_opensea_nft_events_with_collection_slug(
     }
 }
 
-pub async fn fetch_opensea_contract_market_events(
-    client: &AsyncApiClient,
-    base_url: &str,
-    _chain: &str,
-    contract_address: &str,
-    collection_slug: Option<&str>,
-    opensea_api_key: &str,
-    eth_usd_rate: Option<f64>,
-) -> Result<Vec<NftMarketEventRecord>, AppError> {
-    if opensea_api_key.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    let Some(collection_slug) = collection_slug
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(Vec::new());
-    };
-
-    let mut headers = HeaderMap::new();
-    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-    headers.insert(
-        "x-api-key",
-        HeaderValue::from_str(opensea_api_key).map_err(|err| AppError::Http(err.to_string()))?,
-    );
-
-    let mut rows = Vec::new();
-    let mut next: Option<String> = None;
-    let mut seen_cursors = BTreeSet::new();
-    loop {
-        let mut url = Url::parse(&format!(
-            "{base_url}/api/v2/events/collection/{collection_slug}"
-        ))
-        .map_err(|err| AppError::Http(err.to_string()))?;
-        url.query_pairs_mut()
-            .append_pair("event_type", "all")
-            .append_pair("limit", "200");
-        if let Some(cursor) = next.as_deref() {
-            url.query_pairs_mut().append_pair("next", cursor);
-        }
-        let payload: Value = client
-            .get_json_with_headers(url.as_str(), headers.clone())
-            .await?;
-        let events = payload
-            .get("asset_events")
-            .or_else(|| payload.get("events"))
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-
-        for item in events {
-            let event_type = item
-                .get("event_type")
-                .or_else(|| item.get("eventType"))
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_lowercase();
-            if event_type.is_empty() {
-                continue;
-            }
-            let nft = item
-                .get("nft")
-                .or_else(|| item.get("asset"))
-                .unwrap_or(&Value::Null);
-            let token_id = normalize_token_id(
-                nft.get("identifier")
-                    .or_else(|| nft.get("token_id"))
-                    .or_else(|| item.get("token_id"))
-                    .or_else(|| item.get("tokenId")),
-            );
-            let maker_address = string_or_nested_field(
-                &item,
-                &["maker", "maker_address", "makerAddress", "from_account"],
-            )
-            .to_lowercase();
-            let taker_address = string_or_nested_field(
-                &item,
-                &["taker", "taker_address", "takerAddress", "to_account"],
-            )
-            .to_lowercase();
-            let from_address =
-                string_or_nested_field(&item, &["from_account", "from_address", "fromAddress"])
-                    .to_lowercase();
-            let to_address =
-                string_or_nested_field(&item, &["to_account", "to_address", "toAddress"])
-                    .to_lowercase();
-            let actor_address = match event_type.as_str() {
-                "order" | "listing" | "item_listed" | "cancel" | "order_cancelled"
-                | "item_cancelled" => maker_address.clone(),
-                "transfer" => from_address.clone(),
-                _ => maker_address.clone(),
-            };
-            let (price_eth, price_usd, payment_symbol, payment_token_address) =
-                decode_event_payment(&item, eth_usd_rate);
-            let parsed_contract_address = nft
-                .get("contract")
-                .or_else(|| nft.get("contract_address"))
-                .or_else(|| item.get("asset_contract_address"))
-                .and_then(address_like_field)
-                .unwrap_or("")
-                .to_lowercase();
-            if !parsed_contract_address.is_empty()
-                && !parsed_contract_address.eq_ignore_ascii_case(contract_address)
-            {
-                continue;
-            }
-            rows.push(NftMarketEventRecord {
-                contract_address: if parsed_contract_address.is_empty() {
-                    contract_address.to_lowercase()
-                } else {
-                    parsed_contract_address
-                },
-                token_id,
-                event_type,
-                order_type: item
-                    .get("order_type")
-                    .or_else(|| item.get("orderType"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_lowercase(),
-                tx_hash: item
-                    .get("transaction")
-                    .or_else(|| item.get("transaction_hash"))
-                    .and_then(|value| {
-                        value
-                            .as_str()
-                            .or_else(|| value.get("hash").and_then(Value::as_str))
-                    })
-                    .unwrap_or("")
-                    .to_lowercase(),
-                order_hash: item
-                    .get("order_hash")
-                    .or_else(|| item.get("orderHash"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_lowercase(),
-                block_number: integer_field(&item, &["block_number", "blockNumber"]),
-                block_time: integer_field(&item, &["block_time", "blockTime"]),
-                event_timestamp: event_timestamp_field(&item),
-                actor_address,
-                from_address,
-                to_address,
-                maker_address,
-                taker_address,
-                marketplace: "opensea".into(),
-                payment_token_symbol: payment_symbol,
-                payment_token_address,
-                price_eth,
-                price_usd,
-                source: "opensea".into(),
-            });
-        }
-
-        let next_cursor = payload.get("next").and_then(Value::as_str).unwrap_or("");
-        if next_cursor.is_empty() {
-            return Ok(rows);
-        }
-        if !seen_cursors.insert(next_cursor.to_string()) {
-            return Err(AppError::Http(format!(
-                "opensea market events pagination stalled on repeated next cursor: {next_cursor}"
-            )));
-        }
-        next = Some(next_cursor.to_string());
-    }
-}
-
 pub async fn fetch_opensea_contract_metadata(
     client: &AsyncApiClient,
     base_url: &str,
@@ -1149,83 +908,10 @@ pub async fn fetch_opensea_account_holds_contract_nft(
     }
 }
 
-async fn fetch_opensea_creator_fee_recipient(
-    client: &AsyncApiClient,
-    base_url: &str,
-    collection_slug: &str,
-    opensea_api_key: &str,
-) -> Result<Option<String>, AppError> {
-    if collection_slug.trim().is_empty() {
-        return Ok(None);
-    }
-
-    let mut headers = HeaderMap::new();
-    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-    headers.insert(
-        "x-api-key",
-        HeaderValue::from_str(opensea_api_key).map_err(|err| AppError::Http(err.to_string()))?,
-    );
-    let url = format!("{base_url}/api/v2/collections/{}", collection_slug.trim());
-    let payload: Value = client.get_json_with_headers(&url, headers).await?;
-    Ok(creator_fee_recipient_from_collection_payload(&payload))
-}
-
-fn creator_fee_recipient_from_collection_payload(payload: &Value) -> Option<String> {
-    let fees = payload
-        .get("fees")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .chain(
-            payload
-                .get("collection")
-                .and_then(|collection| collection.get("fees"))
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten(),
-        );
-    let mut recipients = BTreeSet::new();
-    for fee in fees {
-        let required = fee
-            .get("required")
-            .and_then(Value::as_bool)
-            .or_else(|| {
-                fee.get("required")
-                    .and_then(Value::as_str)
-                    .map(|text| text.eq_ignore_ascii_case("true"))
-            })
-            .unwrap_or(false);
-        let fee_kind = string_field(
-            fee,
-            &[
-                "type", "fee_type", "feeType", "kind", "name", "label", "category",
-            ],
-        )
-        .to_lowercase();
-        let creator_like =
-            !required || fee_kind.contains("creator") || fee_kind.contains("royalty");
-        if !creator_like {
-            continue;
-        }
-        let recipient = nested_address_field(fee, &["recipient", "recipientAddress", "address"]);
-        if !recipient.is_empty() {
-            recipients.insert(recipient);
-        }
-    }
-    if recipients.len() == 1 {
-        recipients.into_iter().next()
-    } else {
-        None
-    }
-}
-
 async fn enrich_sales_with_royalty_recipient(
     alchemy_client: &AsyncApiClient,
-    other_client: &AsyncApiClient,
     endpoints: &ApiEndpoints,
-    chain: &str,
     contract_address: &str,
-    opensea_api_key: &str,
     mut rows: Vec<NftSaleRecord>,
 ) -> Vec<NftSaleRecord> {
     if rows.iter().all(|sale| {
@@ -1267,58 +953,6 @@ async fn enrich_sales_with_royalty_recipient(
         }
     }
 
-    if opensea_api_key.trim().is_empty()
-        || rows.iter().all(|sale| {
-            !sale.royalty_recipient_address.trim().is_empty()
-                || (sale.royalty_fee_eth <= 0.0 && sale.royalty_fee_usd <= 0.0)
-        })
-    {
-        return rows;
-    }
-
-    let collection_slug = match fetch_contract_collection_slug_alchemy_first(
-        alchemy_client,
-        other_client,
-        endpoints,
-        chain,
-        contract_address,
-        opensea_api_key,
-    )
-    .await
-    {
-        Ok(Some(slug)) => slug,
-        Ok(None) => return rows,
-        Err(err) => {
-            eprintln!(
-                "warning: OpenSea creator fee recipient collection lookup failed for {contract_address}: {err}; royalty value flow recipient remains unknown"
-            );
-            return rows;
-        }
-    };
-    match fetch_opensea_creator_fee_recipient(
-        other_client,
-        &endpoints.opensea_base,
-        &collection_slug,
-        opensea_api_key,
-    )
-    .await
-    {
-        Ok(Some(recipient)) => {
-            for sale in &mut rows {
-                if sale.royalty_recipient_address.trim().is_empty()
-                    && (sale.royalty_fee_eth > 0.0 || sale.royalty_fee_usd > 0.0)
-                {
-                    sale.royalty_recipient_address = recipient.clone();
-                }
-            }
-        }
-        Ok(None) => {}
-        Err(err) => {
-            eprintln!(
-                "warning: OpenSea creator fee recipient lookup failed for {contract_address}: {err}; royalty value flow recipient remains unknown"
-            );
-        }
-    }
     rows
 }
 
@@ -1364,11 +998,8 @@ pub async fn fetch_contract_sales_with_clients(
         Ok(rows) => {
             return Ok(enrich_sales_with_royalty_recipient(
                 alchemy_client,
-                other_client,
                 endpoints,
-                chain,
                 contract_address,
-                opensea_api_key,
                 rows,
             )
             .await);
@@ -1422,11 +1053,8 @@ pub async fn fetch_contract_sales_with_clients(
             let rows = filter_sales_for_contract(rows, contract_address);
             Ok(enrich_sales_with_royalty_recipient(
                 alchemy_client,
-                other_client,
                 endpoints,
-                chain,
                 contract_address,
-                opensea_api_key,
                 rows,
             )
             .await)

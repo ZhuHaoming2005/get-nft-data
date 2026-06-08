@@ -56,7 +56,6 @@ pub(super) fn merge_contract_analysis_result(
     state
         .address_attributions
         .extend(result.address_attributions);
-    state.market_events.extend(result.market_events);
     state.mint_payment_edges.extend(result.mint_payment_edges);
     state.attacker_cost_edges.extend(result.attacker_cost_edges);
     if let Some(path) = result.nft_propagation_path {
@@ -121,7 +120,6 @@ pub(super) fn implausible_candidate_filtered_result(
         honest_addresses: Vec::new(),
         secondary_sale_victim_addresses: Vec::new(),
         address_attributions: Vec::new(),
-        market_events: Vec::new(),
         mint_payment_edges: Vec::new(),
         attacker_cost_edges: Vec::new(),
         nft_propagation_path: None,
@@ -305,7 +303,6 @@ pub(super) async fn analyze_duplicate_contract(
             honest_addresses: vec![],
             secondary_sale_victim_addresses: vec![],
             address_attributions: vec![],
-            market_events: vec![],
             mint_payment_edges: vec![],
             attacker_cost_edges: vec![],
             nft_propagation_path: None,
@@ -401,7 +398,6 @@ pub(super) async fn analyze_duplicate_contract(
         honest_addresses: contract_honest,
         secondary_sale_victim_addresses: contract_secondary_sale_victims,
         address_attributions,
-        market_events: Vec::new(),
         mint_payment_edges,
         attacker_cost_edges,
         nft_propagation_path: Some(nft_propagation_path),

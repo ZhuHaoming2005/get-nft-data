@@ -217,32 +217,6 @@ pub struct EthTransferRecord {
     pub category: String,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-pub struct NftMarketEventRecord {
-    pub contract_address: String,
-    pub token_id: String,
-    pub event_type: String,
-    pub order_type: String,
-    pub tx_hash: String,
-    pub order_hash: String,
-    pub block_number: i64,
-    pub block_time: i64,
-    pub event_timestamp: i64,
-    pub actor_address: String,
-    pub from_address: String,
-    pub to_address: String,
-    pub maker_address: String,
-    pub taker_address: String,
-    pub marketplace: String,
-    pub payment_token_symbol: String,
-    pub payment_token_address: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub price_eth: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub price_usd: Option<f64>,
-    pub source: String,
-}
-
 impl TransferRecord {
     pub fn mint(
         contract_address: impl Into<String>,
@@ -632,13 +606,10 @@ pub struct ContractLifecycleMetricPayload {
     pub first_mint_time: i64,
     #[serde(default)]
     pub first_transfer_time: i64,
-    pub first_listing_time: i64,
     pub first_sale_time: i64,
     pub first_victim_time: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_to_first_transfer_seconds: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub time_to_first_listing_seconds: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_to_first_sale_seconds: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -647,7 +618,6 @@ pub struct ContractLifecycleMetricPayload {
     pub cascade_edge_count: i64,
     pub victim_count: i64,
     pub sale_count: i64,
-    pub market_event_count: i64,
     pub gross_revenue_eth: f64,
     pub gross_revenue_usd: f64,
     #[serde(default)]
@@ -711,7 +681,6 @@ pub struct EarlyDetectionFeaturePayload {
     pub window_end_time: i64,
     pub content_similarity_count: i64,
     pub mint_event_count: i64,
-    pub market_event_count: i64,
     pub value_flow_count: i64,
     pub funding_edge_count: i64,
     pub withdrawal_edge_count: i64,
@@ -1231,8 +1200,6 @@ pub struct SingleReportPayload {
     pub weak_supervision_labels: Vec<WeakSupervisionLabelPayload>,
     #[serde(default, skip_serializing)]
     pub early_detection_features: Vec<EarlyDetectionFeaturePayload>,
-    #[serde(default, skip_serializing)]
-    pub market_events: Vec<NftMarketEventRecord>,
     #[serde(default, skip_serializing)]
     pub nft_propagation_paths: BTreeMap<String, NftPropagationPathPayload>,
 }

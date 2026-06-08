@@ -333,8 +333,7 @@ pub use etherscan::fetch_etherscan_contract_transfers;
 pub use opensea::{
     fetch_contract_sales, fetch_contract_sales_with_clients,
     fetch_opensea_account_holds_contract_nft, fetch_opensea_contract_collection_slug,
-    fetch_opensea_contract_market_events, fetch_opensea_contract_metadata,
-    fetch_opensea_contract_nfts,
+    fetch_opensea_contract_metadata, fetch_opensea_contract_nfts,
 };
 
 pub async fn fetch_contract_metadata_with_opensea_fallback(

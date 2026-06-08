@@ -12,11 +12,10 @@ use top_contract_analysis_rs::api::{
     fetch_contract_sales_with_clients, fetch_contract_total_supply, fetch_contract_transfers,
     fetch_eth_balance, fetch_is_holder_of_contract, fetch_license_sample,
     fetch_opensea_account_holds_contract_nft, fetch_opensea_contract_collection_slug,
-    fetch_opensea_contract_market_events, fetch_opensea_contract_metadata,
-    fetch_opensea_contract_nfts, fetch_same_block_eth_transfers_for_address,
-    fetch_seed_contract_nfts, fetch_transaction_receipt, fetch_transaction_receipts_for_block,
-    is_open_license_payload, ApiEndpoints, AsyncApiClient, OpenSeaAccountFallback,
-    DEFAULT_API_RETRIES,
+    fetch_opensea_contract_metadata, fetch_opensea_contract_nfts,
+    fetch_same_block_eth_transfers_for_address, fetch_seed_contract_nfts,
+    fetch_transaction_receipt, fetch_transaction_receipts_for_block, is_open_license_payload,
+    ApiEndpoints, AsyncApiClient, OpenSeaAccountFallback, DEFAULT_API_RETRIES,
 };
 use top_contract_analysis_rs::models::SeedNft;
 
@@ -1511,87 +1510,6 @@ async fn contract_sales_use_alchemy_before_opensea_when_available() {
 }
 
 #[tokio::test]
-async fn contract_sales_enrich_alchemy_sales_with_opensea_creator_fee_recipient() {
-    let alchemy_server = MockServer::start_async().await;
-    alchemy_server
-        .mock_async(|when, then| {
-            when.method(GET).path("/nft/v3/key/getNFTSales");
-            then.status(200).json_body_obj(&serde_json::json!({
-                "nftSales": [{
-                    "marketplace": "seaport",
-                    "contractAddress": "0xdup",
-                    "tokenId": "1",
-                    "buyerAddress": "0xbuyer",
-                    "sellerAddress": "0xseller",
-                    "sellerFee": {"amount": "1000000000000000000", "symbol": "ETH", "decimals": 18},
-                    "protocolFee": {"amount": "0", "symbol": "ETH", "decimals": 18},
-                    "royaltyFee": {"amount": "50000000000000000", "symbol": "ETH", "decimals": 18},
-                    "transactionHash": "0xalchemy",
-                    "blockNumber": 11,
-                    "logIndex": 1,
-                    "bundleIndex": 0
-                }]
-            }));
-        })
-        .await;
-    alchemy_server
-        .mock_async(|when, then| {
-            when.method(GET)
-                .path("/nft/v3/key/getNFTsForContract")
-                .query_param("contractAddress", "0xdup")
-                .query_param("withMetadata", "true")
-                .query_param("limit", "1");
-            then.status(200).json_body_obj(&serde_json::json!({
-                "nfts": [{
-                    "contract": {"address": "0xdup"},
-                    "tokenId": "1",
-                    "collection": {"slug": "dup-collection"}
-                }]
-            }));
-        })
-        .await;
-    let opensea_server = MockServer::start_async().await;
-    let opensea_lookup = opensea_server
-        .mock_async(|when, then| {
-            when.method(GET)
-                .path("/api/v2/chain/ethereum/contract/0xdup")
-                .header("x-api-key", "opensea");
-            then.status(500)
-                .body("opensea slug lookup should not be called first");
-        })
-        .await;
-    opensea_server
-        .mock_async(|when, then| {
-            when.method(GET)
-                .path("/api/v2/collections/dup-collection")
-                .header("x-api-key", "opensea");
-            then.status(200).json_body_obj(&serde_json::json!({
-                "fees": [
-                    {"fee": 1.0, "recipient": "0x0000a26b00c1f0df003000390027140000faa719", "required": true},
-                    {"fee": 5.0, "recipient": "0xCreatorRoyalty", "required": false}
-                ]
-            }));
-        })
-        .await;
-
-    let client = test_client();
-    let endpoints = ApiEndpoints {
-        alchemy_nft_v2_base: format!("{}/nft/v2/key", alchemy_server.base_url()),
-        alchemy_nft_v3_base: format!("{}/nft/v3/key", alchemy_server.base_url()),
-        alchemy_rpc_base: format!("{}/v2/key", alchemy_server.base_url()),
-        etherscan_base: alchemy_server.base_url(),
-        opensea_base: opensea_server.base_url(),
-    };
-    let rows = fetch_contract_sales(&client, &endpoints, "ethereum", "0xdup", "opensea", None)
-        .await
-        .unwrap();
-
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].royalty_recipient_address, "0xcreatorroyalty");
-    assert_eq!(opensea_lookup.hits_async().await, 0);
-}
-
-#[tokio::test]
 async fn contract_sales_paginates_opensea_events_with_next_cursor() {
     let alchemy_server = MockServer::start_async().await;
     alchemy_server
@@ -1753,82 +1671,87 @@ async fn contract_sales_opensea_fallback_uses_alchemy_slug_before_opensea_lookup
 }
 
 #[tokio::test]
-async fn opensea_market_events_parse_order_cancel_and_transfer_events() {
-    let (opensea_base_url, server) = spawn_sequential_json_server(vec![(
-        "/api/v2/events/collection/dup-collection?event_type=all&limit=200".to_string(),
-        serde_json::json!({
-            "events": [
-                {
-                    "event_type": "order",
-                    "order_type": "listing",
-                    "order_hash": "0xorder",
-                    "event_timestamp": 1710000000,
-                    "nft": {"identifier": "1", "contract": {"address": "0xDup"}},
-                    "maker": {"address": "0xseller"},
-                    "payment": {
-                        "symbol": "ETH",
-                        "decimals": 18,
-                        "quantity": "1000000000000000000",
-                        "token": {"address": "0x0000000000000000000000000000000000000000"}
+async fn contract_sales_do_not_call_opensea_creator_fee_when_alchemy_sales_succeed() {
+    let alchemy_server = MockServer::start_async().await;
+    alchemy_server
+        .mock_async(|when, then| {
+            when.method(GET).path("/nft/v3/key/getNFTSales");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "nftSales": [{
+                    "marketplace": "seaport",
+                    "contractAddress": "0xdup",
+                    "tokenId": "1",
+                    "buyerAddress": "0xbuyer",
+                    "sellerAddress": "0xseller",
+                    "sellerFee": {"amount": "1000000000000000000", "symbol": "ETH", "decimals": 18},
+                    "royaltyFee": {"amount": "50000000000000000", "symbol": "ETH", "decimals": 18},
+                    "blockNumber": 10,
+                    "logIndex": 1,
+                    "bundleIndex": 0,
+                    "transactionHash": "0xsale"
+                }]
+            }));
+        })
+        .await;
+    alchemy_server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/v2/key")
+                .body_contains("eth_call")
+                .body_contains("2a55205a");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "result": "0x"
+            }));
+        })
+        .await;
+    alchemy_server
+        .mock_async(|when, then| {
+            when.method(GET).path("/nft/v3/key/getNFTsForContract");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "nfts": [{
+                    "collection": {
+                        "slug": "dup-collection"
                     }
-                },
-                {
-                    "event_type": "cancel",
-                    "order_type": "listing",
-                    "order_hash": "0xorder",
-                    "event_timestamp": 1710000100,
-                    "nft": {"identifier": "1", "contract": "0xDup"},
-                    "maker": "0xseller"
-                },
-                {
-                    "event_type": "transfer",
-                    "event_timestamp": 1710000200,
-                    "transaction": {"hash": "0xmove"},
-                    "block_number": "0x20",
-                    "nft": {"identifier": "2", "contract": "0xDup"},
-                    "from_account": {"address": "0xfrom"},
-                    "to_account": {"address": "0xto"}
-                },
-                {
-                    "event_type": "order",
-                    "order_type": "listing",
-                    "event_timestamp": 1710000300,
-                    "nft": {"identifier": "99", "contract": "0xOther"},
-                    "maker": {"address": "0xother"}
-                }
-            ],
-            "next": ""
-        }),
-    )])
-    .await;
+                }]
+            }));
+        })
+        .await;
 
+    let opensea_server = MockServer::start_async().await;
+    let creator_fee_lookup = opensea_server
+        .mock_async(|when, then| {
+            when.method(GET).path("/api/v2/collections/dup-collection");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "fees": [{
+                    "type": "creator",
+                    "recipient": "0xcreatorroyalty"
+                }]
+            }));
+        })
+        .await;
+
+    let endpoints = ApiEndpoints {
+        alchemy_nft_v2_base: format!("{}/nft/v2/key", alchemy_server.base_url()),
+        alchemy_nft_v3_base: format!("{}/nft/v3/key", alchemy_server.base_url()),
+        alchemy_rpc_base: format!("{}/v2/key", alchemy_server.base_url()),
+        etherscan_base: alchemy_server.base_url(),
+        opensea_base: opensea_server.base_url(),
+    };
     let client = test_client();
-    let rows = fetch_opensea_contract_market_events(
+    let rows = fetch_contract_sales(
         &client,
-        &opensea_base_url,
+        &endpoints,
         "ethereum",
         "0xdup",
-        Some("dup-collection"),
-        "opensea",
-        Some(3000.0),
+        "opensea-key",
+        None,
     )
     .await
     .unwrap();
-    server.await.unwrap();
 
-    assert_eq!(rows.len(), 3);
-    assert_eq!(rows[0].event_type, "order");
-    assert_eq!(rows[0].order_type, "listing");
-    assert_eq!(rows[0].actor_address, "0xseller");
-    assert_eq!(rows[0].price_eth, Some(1.0));
-    assert_eq!(rows[0].price_usd, Some(3000.0));
-    assert_eq!(rows[1].event_type, "cancel");
-    assert_eq!(rows[1].order_hash, "0xorder");
-    assert_eq!(rows[2].event_type, "transfer");
-    assert_eq!(rows[2].tx_hash, "0xmove");
-    assert_eq!(rows[2].block_number, 32);
-    assert_eq!(rows[2].from_address, "0xfrom");
-    assert_eq!(rows[2].to_address, "0xto");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].royalty_recipient_address, "");
+    assert_eq!(creator_fee_lookup.hits_async().await, 0);
 }
 
 #[tokio::test]

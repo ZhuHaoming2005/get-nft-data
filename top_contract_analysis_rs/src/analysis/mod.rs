@@ -9,9 +9,9 @@ use crate::error::AppError;
 use crate::models::{
     AddressAttributionPayload, AddressSignalPayload, ContractMetadata, DatabaseSnapshot,
     DuplicateCandidate, DuplicateContractPayload, HonestAddressPayload, InfringingTokenRecord,
-    MaliciousAddressPayload, NftMarketEventRecord, NftPropagationPathPayload, OwnerBalance,
-    PaperStatsPayload, SecondarySaleVictimAddressPayload, SeedContractPayload, SeedNft,
-    SingleReportPayload, TransferRecord, ValueFlowEdgePayload, VictimSignalPayload,
+    MaliciousAddressPayload, NftPropagationPathPayload, OwnerBalance, PaperStatsPayload,
+    SecondarySaleVictimAddressPayload, SeedContractPayload, SeedNft, SingleReportPayload,
+    TransferRecord, ValueFlowEdgePayload, VictimSignalPayload,
 };
 use crate::progress::{BatchProgressReporter, SeedProgressReporter};
 use crate::store::DuckDbFeatureStore;
@@ -226,7 +226,6 @@ struct ContractAnalysisResult {
     honest_addresses: Vec<HonestAddressPayload>,
     secondary_sale_victim_addresses: Vec<SecondarySaleVictimAddressPayload>,
     address_attributions: Vec<AddressAttributionPayload>,
-    market_events: Vec<NftMarketEventRecord>,
     mint_payment_edges: Vec<ValueFlowEdgePayload>,
     attacker_cost_edges: Vec<ValueFlowEdgePayload>,
     nft_propagation_path: Option<NftPropagationPathPayload>,
@@ -243,7 +242,6 @@ struct AnalysisOutputState {
     honest_addresses: Vec<HonestAddressPayload>,
     secondary_sale_victim_addresses: Vec<SecondarySaleVictimAddressPayload>,
     address_attributions: Vec<AddressAttributionPayload>,
-    market_events: Vec<NftMarketEventRecord>,
     mint_payment_edges: Vec<ValueFlowEdgePayload>,
     attacker_cost_edges: Vec<ValueFlowEdgePayload>,
     nft_propagation_paths: BTreeMap<String, NftPropagationPathPayload>,
@@ -900,7 +898,6 @@ async fn finalize_seed_report(
         lifecycle_metrics: Vec::new(),
         weak_supervision_labels: Vec::new(),
         early_detection_features: Vec::new(),
-        market_events: output_state.market_events,
         nft_propagation_paths: output_state.nft_propagation_paths,
     };
     progress.on_seed_stage("finalize_report").await;

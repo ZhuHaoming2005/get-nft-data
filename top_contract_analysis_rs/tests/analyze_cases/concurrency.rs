@@ -298,7 +298,7 @@ async fn analyze_fetches_contract_inputs_concurrently_within_one_contract() {
 }
 
 #[tokio::test]
-async fn analyze_fetches_sales_and_mint_value_flow_without_market_events() {
+async fn analyze_fetches_sales_and_mint_value_flow_concurrently() {
     let api = Arc::new(ConcurrentSingleContractFetchApi::new());
     let deps = AnalysisDeps {
         api: api.clone(),
@@ -336,8 +336,6 @@ async fn analyze_fetches_sales_and_mint_value_flow_without_market_events() {
     .unwrap();
 
     assert_eq!(payload.duplicate_contracts.len(), 1);
-    assert!(payload.market_events.is_empty());
-    assert_eq!(api.market_event_fetch_count.load(Ordering::SeqCst), 0);
     assert!(
         api.max_post_signal_fetches.load(Ordering::SeqCst) >= 2,
         "expected sales/mint value-flow fetches to overlap within one contract"
