@@ -6,14 +6,16 @@ use httpmock::prelude::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use top_contract_analysis_rs::api::{
-    fetch_contract_metadata, fetch_contract_metadata_with_opensea_fallback, fetch_contract_owners,
-    fetch_contract_sales, fetch_contract_sales_with_clients, fetch_contract_total_supply,
-    fetch_contract_transfers, fetch_eth_balance, fetch_is_holder_of_contract, fetch_license_sample,
-    fetch_opensea_account_holds_contract_nft, fetch_opensea_contract_collection_slug,
-    fetch_opensea_contract_market_events, fetch_opensea_contract_metadata,
-    fetch_opensea_contract_nfts, fetch_same_block_eth_transfers_for_address,
-    fetch_seed_contract_nfts, fetch_transaction_receipt, fetch_transaction_receipts_for_block,
-    is_open_license_payload, ApiEndpoints, AsyncApiClient, DEFAULT_API_RETRIES,
+    fetch_account_holds_contract_alchemy_first, fetch_contract_metadata,
+    fetch_contract_metadata_with_opensea_fallback, fetch_contract_nfts_with_fallback_clients,
+    fetch_contract_owners, fetch_contract_sales, fetch_contract_sales_with_clients,
+    fetch_contract_total_supply, fetch_contract_transfers, fetch_eth_balance,
+    fetch_is_holder_of_contract, fetch_license_sample, fetch_opensea_account_holds_contract_nft,
+    fetch_opensea_contract_collection_slug, fetch_opensea_contract_market_events,
+    fetch_opensea_contract_metadata, fetch_opensea_contract_nfts,
+    fetch_same_block_eth_transfers_for_address, fetch_seed_contract_nfts,
+    fetch_transaction_receipt, fetch_transaction_receipts_for_block, is_open_license_payload,
+    ApiEndpoints, AsyncApiClient, OpenSeaAccountFallback, DEFAULT_API_RETRIES,
 };
 use top_contract_analysis_rs::models::SeedNft;
 
@@ -66,6 +68,41 @@ async fn spawn_retry_status_server(
         }
     });
     (format!("http://{address}"), attempts, handle)
+}
+
+async fn spawn_retry_after_server() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        for (status, retry_after) in [(429_u16, Some("1")), (200_u16, None)] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0_u8; 8192];
+            let read = stream.read(&mut buffer).await.unwrap();
+            let request = String::from_utf8_lossy(&buffer[..read]);
+            let request_line = request.lines().next().unwrap_or("");
+            assert!(
+                request_line.starts_with("GET /retry-after HTTP/1.1"),
+                "unexpected request line: {request_line}",
+            );
+
+            let (reason, payload) = if status == 200 {
+                ("OK", r#"{"ok":true}"#)
+            } else {
+                ("Too Many Requests", r#"{"error":"slow down"}"#)
+            };
+            let retry_after_header = retry_after
+                .map(|value| format!("retry-after: {value}\r\n"))
+                .unwrap_or_default();
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\n{retry_after_header}content-length: {}\r\nconnection: close\r\n\r\n{}",
+                payload.len(),
+                payload
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+    });
+    (format!("http://{address}"), handle)
 }
 
 async fn spawn_fixed_json_server(
@@ -320,6 +357,44 @@ async fn api_client_defaults_retry_retryable_failures_five_times_with_delay() {
     );
 }
 
+#[tokio::test]
+async fn api_client_honors_retry_after_header_for_retryable_status() {
+    let (base_url, server) = spawn_retry_after_server().await;
+    let client = AsyncApiClient::new_with_retry_policy(5, 1, 2, Duration::from_millis(1)).unwrap();
+
+    let started = Instant::now();
+    let value = client
+        .get_json::<serde_json::Value>(&format!("{base_url}/retry-after"))
+        .await
+        .unwrap();
+    server.await.unwrap();
+
+    assert_eq!(value["ok"], true);
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "Retry-After should control the retry delay"
+    );
+}
+
+#[tokio::test]
+async fn api_client_uses_exponential_retry_delay_without_retry_after() {
+    let (base_url, _attempts, server) = spawn_retry_status_server(vec![500, 500, 200]).await;
+    let client = AsyncApiClient::new_with_retry_policy(5, 1, 3, Duration::from_millis(30)).unwrap();
+
+    let started = Instant::now();
+    let value = client
+        .get_json::<serde_json::Value>(&format!("{base_url}/retry"))
+        .await
+        .unwrap();
+    server.await.unwrap();
+
+    assert_eq!(value["ok"], true);
+    assert!(
+        started.elapsed() >= Duration::from_millis(80),
+        "expected exponential delay across the first two retries"
+    );
+}
+
 #[test]
 fn alchemy_endpoints_embed_api_key_in_rest_and_rpc_urls() {
     let endpoints = ApiEndpoints::for_alchemy("eth-mainnet", "live-key");
@@ -536,6 +611,110 @@ async fn fetch_is_holder_of_contract_calls_alchemy_lightweight_holder_endpoint()
 }
 
 #[tokio::test]
+async fn account_holds_contract_uses_alchemy_before_opensea_when_available() {
+    let alchemy_server = MockServer::start_async().await;
+    alchemy_server
+        .mock_async(|when, then| {
+            when.method(GET)
+                .path("/nft/v3/key/isHolderOfContract")
+                .query_param("wallet", "0xwrapped")
+                .query_param("contractAddress", "0xseed");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "isHolderOfContract": true
+            }));
+        })
+        .await;
+    let opensea_server = MockServer::start_async().await;
+    let opensea_lookup = opensea_server
+        .mock_async(|when, then| {
+            when.method(GET)
+                .path("/api/v2/chain/ethereum/account/0xwrapped/nfts")
+                .header("x-api-key", "opensea");
+            then.status(500).body("opensea should not be called first");
+        })
+        .await;
+
+    let client = test_client();
+    let endpoints = ApiEndpoints {
+        alchemy_nft_v2_base: format!("{}/nft/v2/key", alchemy_server.base_url()),
+        alchemy_nft_v3_base: format!("{}/nft/v3/key", alchemy_server.base_url()),
+        alchemy_rpc_base: format!("{}/v2/key", alchemy_server.base_url()),
+        etherscan_base: alchemy_server.base_url(),
+        opensea_base: opensea_server.base_url(),
+    };
+    let is_holder = fetch_account_holds_contract_alchemy_first(
+        &client,
+        &client,
+        &endpoints,
+        "ethereum",
+        "0xwrapped",
+        "0xseed",
+        OpenSeaAccountFallback {
+            api_key: "opensea",
+            collection_slug: Some("pudgy-penguins"),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(is_holder);
+    assert_eq!(opensea_lookup.hits_async().await, 0);
+}
+
+#[tokio::test]
+async fn account_holds_contract_falls_back_to_opensea_when_alchemy_fails() {
+    let alchemy_server = MockServer::start_async().await;
+    alchemy_server
+        .mock_async(|when, then| {
+            when.method(GET).path("/nft/v3/key/isHolderOfContract");
+            then.status(500).body("alchemy unavailable");
+        })
+        .await;
+    let opensea_server = MockServer::start_async().await;
+    opensea_server
+        .mock_async(|when, then| {
+            when.method(GET)
+                .path("/api/v2/chain/ethereum/account/0xwrapped/nfts")
+                .query_param("limit", "200")
+                .query_param("collection", "pudgy-penguins")
+                .header("x-api-key", "opensea");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "nfts": [{
+                    "identifier": "8888",
+                    "contract": "0xSeed",
+                    "name": "Seed #8888"
+                }]
+            }));
+        })
+        .await;
+
+    let client = AsyncApiClient::new_with_retry_policy(5, 4, 1, Duration::ZERO).unwrap();
+    let endpoints = ApiEndpoints {
+        alchemy_nft_v2_base: format!("{}/nft/v2/key", alchemy_server.base_url()),
+        alchemy_nft_v3_base: format!("{}/nft/v3/key", alchemy_server.base_url()),
+        alchemy_rpc_base: format!("{}/v2/key", alchemy_server.base_url()),
+        etherscan_base: alchemy_server.base_url(),
+        opensea_base: opensea_server.base_url(),
+    };
+    let is_holder = fetch_account_holds_contract_alchemy_first(
+        &client,
+        &client,
+        &endpoints,
+        "ethereum",
+        "0xwrapped",
+        "0xseed",
+        OpenSeaAccountFallback {
+            api_key: "opensea",
+            collection_slug: Some("pudgy-penguins"),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(is_holder);
+}
+
+#[tokio::test]
 async fn fetch_seed_contract_nfts_paginates_until_page_key_is_empty() {
     let (base_url, server) = spawn_sequential_json_server(vec![
         (
@@ -619,6 +798,106 @@ async fn fetch_seed_contract_nfts_reads_current_v3_top_level_token_id() {
     assert_eq!(rows[0].token_id, "44");
     assert_eq!(rows[0].token_uri, "ipfs://seed/44");
     assert_eq!(rows[1].token_id, "45");
+}
+
+#[tokio::test]
+async fn contract_nfts_use_alchemy_before_opensea_when_available() {
+    let alchemy_server = MockServer::start_async().await;
+    alchemy_server
+        .mock_async(|when, then| {
+            when.method(GET)
+                .path("/nft/v3/key/getNFTsForContract")
+                .query_param("contractAddress", "0xdup")
+                .query_param("withMetadata", "true");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "nfts": [{
+                    "contract": {"address": "0xDup"},
+                    "tokenId": "1",
+                    "name": "Alchemy #1",
+                    "contractMetadata": {"symbol": "ALCH"},
+                    "tokenUri": {"raw": "ipfs://alchemy/1"},
+                    "image": {"originalUrl": "ipfs://alchemy/1.png"}
+                }]
+            }));
+        })
+        .await;
+    let opensea_server = MockServer::start_async().await;
+    let opensea_lookup = opensea_server
+        .mock_async(|when, then| {
+            when.method(GET)
+                .path("/api/v2/chain/ethereum/contract/0xdup/nfts")
+                .header("x-api-key", "opensea");
+            then.status(500).body("opensea should not be called first");
+        })
+        .await;
+
+    let client = test_client();
+    let endpoints = ApiEndpoints {
+        alchemy_nft_v2_base: format!("{}/nft/v2/key", alchemy_server.base_url()),
+        alchemy_nft_v3_base: format!("{}/nft/v3/key", alchemy_server.base_url()),
+        alchemy_rpc_base: format!("{}/v2/key", alchemy_server.base_url()),
+        etherscan_base: alchemy_server.base_url(),
+        opensea_base: opensea_server.base_url(),
+    };
+    let rows = fetch_contract_nfts_with_fallback_clients(
+        &client, &client, &endpoints, "ethereum", "0xdup", "", "opensea",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].contract_address, "0xdup");
+    assert_eq!(rows[0].token_id, "1");
+    assert_eq!(rows[0].name, "Alchemy #1");
+    assert_eq!(opensea_lookup.hits_async().await, 0);
+}
+
+#[tokio::test]
+async fn contract_nfts_fall_back_to_opensea_when_alchemy_fails() {
+    let alchemy_server = MockServer::start_async().await;
+    alchemy_server
+        .mock_async(|when, then| {
+            when.method(GET).path("/nft/v3/key/getNFTsForContract");
+            then.status(500).body("alchemy unavailable");
+        })
+        .await;
+    let opensea_server = MockServer::start_async().await;
+    opensea_server
+        .mock_async(|when, then| {
+            when.method(GET)
+                .path("/api/v2/chain/ethereum/contract/0xdup/nfts")
+                .query_param("limit", "200")
+                .header("x-api-key", "opensea");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "nfts": [{
+                    "identifier": "2",
+                    "contract": "0xDup",
+                    "name": "OpenSea #2",
+                    "metadata_url": "ipfs://opensea/2",
+                    "image_url": "ipfs://opensea/2.png"
+                }]
+            }));
+        })
+        .await;
+
+    let client = AsyncApiClient::new_with_retry_policy(5, 4, 1, Duration::ZERO).unwrap();
+    let endpoints = ApiEndpoints {
+        alchemy_nft_v2_base: format!("{}/nft/v2/key", alchemy_server.base_url()),
+        alchemy_nft_v3_base: format!("{}/nft/v3/key", alchemy_server.base_url()),
+        alchemy_rpc_base: format!("{}/v2/key", alchemy_server.base_url()),
+        etherscan_base: alchemy_server.base_url(),
+        opensea_base: opensea_server.base_url(),
+    };
+    let rows = fetch_contract_nfts_with_fallback_clients(
+        &client, &client, &endpoints, "ethereum", "0xdup", "", "opensea",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].contract_address, "0xdup");
+    assert_eq!(rows[0].token_id, "2");
+    assert_eq!(rows[0].name, "OpenSea #2");
 }
 
 #[tokio::test]

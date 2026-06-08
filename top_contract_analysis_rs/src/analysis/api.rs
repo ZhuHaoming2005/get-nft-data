@@ -1,20 +1,20 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 
 use crate::api::{
-    fetch_contract_metadata_with_opensea_fallback_clients, fetch_contract_owners,
+    fetch_account_holds_contract_alchemy_first,
+    fetch_contract_metadata_with_opensea_fallback_clients,
+    fetch_contract_nfts_with_fallback_clients, fetch_contract_owners,
     fetch_contract_sales_with_clients, fetch_contract_total_supply,
-    fetch_contract_transfers_with_etherscan_fallback, fetch_eth_balance,
-    fetch_etherscan_contract_transfers, fetch_is_holder_of_contract, fetch_license_sample,
-    fetch_opensea_account_holds_contract_nft, fetch_opensea_contract_collection_slug,
-    fetch_opensea_contract_market_events, fetch_opensea_contract_nfts,
+    fetch_contract_transfers_with_etherscan_fallback, fetch_eth_balance, fetch_license_sample,
+    fetch_opensea_contract_collection_slug, fetch_opensea_contract_market_events,
     fetch_same_block_eth_transfers_for_address, fetch_same_block_value_transfers_for_address,
     fetch_same_block_value_transfers_to_address, fetch_seed_contract_nfts,
     fetch_transaction_receipt, fetch_transaction_receipts_for_block, is_open_license_payload,
-    ApiEndpoints, AsyncApiClient,
+    ApiEndpoints, AsyncApiClient, OpenSeaAccountFallback,
 };
 use crate::currency::FALLBACK_ETH_USD_RATE;
 use crate::error::AppError;
@@ -383,60 +383,16 @@ impl AnalyzeApi for RealApi {
         contract_address: &str,
     ) -> Result<Vec<SeedNft>, AppError> {
         let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
-        if !opensea_api_key.trim().is_empty() {
-            match fetch_opensea_contract_nfts(
-                &self.other_client,
-                &endpoints.opensea_base,
-                chain,
-                contract_address,
-                opensea_api_key,
-            )
-            .await
-            {
-                Ok(rows) if !rows.is_empty() => return Ok(rows),
-                Ok(_) => {}
-                Err(err) => {
-                    eprintln!(
-                        "warning: OpenSea NFT expansion failed for {contract_address}: {err}; falling back to Alchemy"
-                    );
-                }
-            }
-        }
-        let alchemy_result =
-            fetch_seed_contract_nfts(&self.alchemy_client, &endpoints, chain, contract_address)
-                .await;
-        match alchemy_result {
-            Ok(rows) => Ok(rows),
-            Err(alchemy_err) if etherscan_api_key.trim().is_empty() => Err(alchemy_err),
-            Err(alchemy_err) => {
-                eprintln!(
-                    "warning: Alchemy NFT expansion failed for {contract_address}: {alchemy_err}; falling back to Etherscan transfers"
-                );
-                let transfers = fetch_etherscan_contract_transfers(
-                    &self.other_client,
-                    &endpoints.etherscan_base,
-                    etherscan_api_key,
-                    chain,
-                    contract_address,
-                    "ERC721",
-                )
-                .await?;
-                let mut seen = BTreeSet::new();
-                let mut rows = Vec::new();
-                for transfer in transfers {
-                    if transfer.token_id.is_empty() || !seen.insert(transfer.token_id.clone()) {
-                        continue;
-                    }
-                    rows.push(SeedNft {
-                        chain: chain.to_string(),
-                        contract_address: contract_address.to_lowercase(),
-                        token_id: transfer.token_id,
-                        ..SeedNft::default()
-                    });
-                }
-                Ok(rows)
-            }
-        }
+        fetch_contract_nfts_with_fallback_clients(
+            &self.alchemy_client,
+            &self.other_client,
+            &endpoints,
+            chain,
+            contract_address,
+            etherscan_api_key,
+            opensea_api_key,
+        )
+        .await
     }
 
     async fn fetch_contract_total_supply(
@@ -504,35 +460,17 @@ impl AnalyzeApi for RealApi {
             request.alchemy_network,
             request.alchemy_api_key,
         );
-        if !request.opensea_api_key.trim().is_empty() {
-            if let Some(seed_collection_slug) = request.seed_collection_slug {
-                match fetch_opensea_account_holds_contract_nft(
-                    &self.other_client,
-                    &endpoints.opensea_base,
-                    request.chain,
-                    request.candidate_contract_address,
-                    request.seed_contract_address,
-                    request.opensea_api_key,
-                    Some(seed_collection_slug),
-                )
-                .await
-                {
-                    Ok(holds_seed_nft) => return Ok(Some(holds_seed_nft)),
-                    Err(err) => {
-                        eprintln!(
-                            "warning: OpenSea account NFT lookup failed for {}: {err}; falling back to Alchemy isHolderOfContract",
-                            request.candidate_contract_address
-                        );
-                    }
-                }
-            }
-        }
-
-        fetch_is_holder_of_contract(
+        fetch_account_holds_contract_alchemy_first(
             &self.alchemy_client,
+            &self.other_client,
             &endpoints,
+            request.chain,
             request.candidate_contract_address,
             request.seed_contract_address,
+            OpenSeaAccountFallback {
+                api_key: request.opensea_api_key,
+                collection_slug: request.seed_collection_slug,
+            },
         )
         .await
         .map(Some)

@@ -105,7 +105,6 @@ impl FeatureStoreReader for CapturingBatchFeatureStore {
 #[derive(Default)]
 struct BatchPipelineProbe {
     snapshot_active: AtomicUsize,
-    later_context_overlapped_snapshot: AtomicBool,
     cpu_current: AtomicUsize,
     cpu_max_seen: AtomicUsize,
     transfer_current: AtomicUsize,
@@ -265,6 +264,367 @@ impl FeatureStoreReader for BatchSnapshotFailsFeatureStore {
             .snapshot_batch_calls
             .fetch_add(1, Ordering::SeqCst);
         Err(AppError::InvalidData("batched snapshot failed".into()))
+    }
+}
+
+struct SlowFirstSeedContextApi {
+    slow_context_finished: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl AnalyzeApi for SlowFirstSeedContextApi {
+    async fn fetch_contract_metadata(
+        &self,
+        chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _opensea_api_key: &str,
+        contract_address: &str,
+    ) -> Result<ContractMetadata, AppError> {
+        if contract_address == "0xseed1" {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            self.slow_context_finished.store(true, Ordering::SeqCst);
+        }
+        Ok(ContractMetadata {
+            chain: chain.to_string(),
+            contract_address: contract_address.to_string(),
+            token_type: "ERC721".into(),
+            contract_deployer: "0xcreator".into(),
+            deployed_block_number: 1,
+            deployed_block_time: 0,
+            name: format!("Seed {}", contract_address.trim_start_matches("0x")),
+            symbol: "SEED".into(),
+            ..ContractMetadata::default()
+        })
+    }
+
+    async fn fetch_seed_contract_nfts(
+        &self,
+        chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        contract_address: &str,
+    ) -> Result<Vec<SeedNft>, AppError> {
+        Ok(vec![SeedNft {
+            chain: chain.to_string(),
+            contract_address: contract_address.to_string(),
+            token_id: "1".into(),
+            name: format!("Token {}", contract_address.trim_start_matches("0x")),
+            symbol: "SEED".into(),
+            ..SeedNft::default()
+        }])
+    }
+
+    async fn fetch_contract_transfers(
+        &self,
+        _chain: &str,
+        _etherscan_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _alchemy_api_key: &str,
+        _contract_address: &str,
+        _token_type: &str,
+    ) -> Result<Vec<TransferRecord>, AppError> {
+        Ok(vec![])
+    }
+
+    async fn fetch_contract_owners(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _contract_address: &str,
+    ) -> Result<Vec<OwnerBalance>, AppError> {
+        Ok(vec![])
+    }
+
+    async fn fetch_contract_sales(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _contract_address: &str,
+        _opensea_api_key: &str,
+    ) -> Result<Vec<NftSaleRecord>, AppError> {
+        Ok(vec![])
+    }
+
+    async fn fetch_transaction_receipt(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _tx_hash: &str,
+    ) -> Result<TransactionReceiptRecord, AppError> {
+        Ok(TransactionReceiptRecord::default())
+    }
+
+    async fn fetch_transaction_receipts_for_block(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _block_number: i64,
+    ) -> Result<BTreeMap<String, TransactionReceiptRecord>, AppError> {
+        Ok(BTreeMap::new())
+    }
+
+    async fn fetch_eth_balance(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _address: &str,
+        _block_number: i64,
+    ) -> Result<f64, AppError> {
+        Ok(0.0)
+    }
+
+    async fn fetch_same_block_eth_transfers_for_address(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _block_number: i64,
+        _address: &str,
+    ) -> Result<Vec<EthTransferRecord>, AppError> {
+        Ok(vec![])
+    }
+}
+
+struct SnapshotBeforeSlowContextFeatureStore {
+    slow_context_finished: Arc<AtomicBool>,
+    snapshot_started_before_slow_context_finished: Arc<AtomicBool>,
+}
+
+impl SnapshotBeforeSlowContextFeatureStore {
+    fn record_snapshot_start(&self) {
+        if !self.slow_context_finished.load(Ordering::SeqCst) {
+            self.snapshot_started_before_slow_context_finished
+                .store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+impl FeatureStoreReader for SnapshotBeforeSlowContextFeatureStore {
+    fn load_snapshot(
+        &self,
+        _chain: &str,
+        _seed_nfts: &[SeedNft],
+        _name_threshold: f64,
+        _metadata_threshold: f64,
+        _max_tokens_per_contract: usize,
+        _max_recall_rows: usize,
+    ) -> Result<DatabaseSnapshot, AppError> {
+        self.record_snapshot_start();
+        Ok(DatabaseSnapshot::default())
+    }
+
+    fn load_snapshots(
+        &self,
+        _chain: &str,
+        seeds: &[(String, Vec<SeedNft>)],
+        _name_threshold: f64,
+        _metadata_threshold: f64,
+        _max_tokens_per_contract: usize,
+        _max_recall_rows: usize,
+    ) -> Result<BTreeMap<String, DatabaseSnapshot>, AppError> {
+        self.record_snapshot_start();
+        Ok(seeds
+            .iter()
+            .map(|(seed_address, _)| (seed_address.clone(), DatabaseSnapshot::default()))
+            .collect())
+    }
+}
+
+struct SeedContextBackpressureApi {
+    completed_contexts: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl AnalyzeApi for SeedContextBackpressureApi {
+    async fn fetch_contract_metadata(
+        &self,
+        chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _opensea_api_key: &str,
+        contract_address: &str,
+    ) -> Result<ContractMetadata, AppError> {
+        Ok(ContractMetadata {
+            chain: chain.to_string(),
+            contract_address: contract_address.to_string(),
+            token_type: "ERC721".into(),
+            contract_deployer: "0xcreator".into(),
+            deployed_block_number: 1,
+            deployed_block_time: 0,
+            name: format!("Seed {}", contract_address.trim_start_matches("0x")),
+            symbol: "SEED".into(),
+            ..ContractMetadata::default()
+        })
+    }
+
+    async fn fetch_seed_contract_nfts(
+        &self,
+        chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        contract_address: &str,
+    ) -> Result<Vec<SeedNft>, AppError> {
+        Ok(vec![SeedNft {
+            chain: chain.to_string(),
+            contract_address: contract_address.to_string(),
+            token_id: "1".into(),
+            name: format!("Token {}", contract_address.trim_start_matches("0x")),
+            symbol: "SEED".into(),
+            ..SeedNft::default()
+        }])
+    }
+
+    async fn fetch_license_sample(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _seed_nfts: &[SeedNft],
+    ) -> Result<bool, AppError> {
+        self.completed_contexts.fetch_add(1, Ordering::SeqCst);
+        Ok(false)
+    }
+
+    async fn fetch_contract_transfers(
+        &self,
+        _chain: &str,
+        _etherscan_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _alchemy_api_key: &str,
+        _contract_address: &str,
+        _token_type: &str,
+    ) -> Result<Vec<TransferRecord>, AppError> {
+        Ok(vec![])
+    }
+
+    async fn fetch_contract_owners(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _contract_address: &str,
+    ) -> Result<Vec<OwnerBalance>, AppError> {
+        Ok(vec![])
+    }
+
+    async fn fetch_contract_sales(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _contract_address: &str,
+        _opensea_api_key: &str,
+    ) -> Result<Vec<NftSaleRecord>, AppError> {
+        Ok(vec![])
+    }
+
+    async fn fetch_transaction_receipt(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _tx_hash: &str,
+    ) -> Result<TransactionReceiptRecord, AppError> {
+        Ok(TransactionReceiptRecord::default())
+    }
+
+    async fn fetch_transaction_receipts_for_block(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _block_number: i64,
+    ) -> Result<BTreeMap<String, TransactionReceiptRecord>, AppError> {
+        Ok(BTreeMap::new())
+    }
+
+    async fn fetch_eth_balance(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _address: &str,
+        _block_number: i64,
+    ) -> Result<f64, AppError> {
+        Ok(0.0)
+    }
+
+    async fn fetch_same_block_eth_transfers_for_address(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _block_number: i64,
+        _address: &str,
+    ) -> Result<Vec<EthTransferRecord>, AppError> {
+        Ok(vec![])
+    }
+}
+
+struct BlockingSnapshotFeatureStore {
+    snapshot_started: Arc<AtomicBool>,
+    sleep_ms: u64,
+}
+
+impl FeatureStoreReader for BlockingSnapshotFeatureStore {
+    fn load_snapshot(
+        &self,
+        _chain: &str,
+        _seed_nfts: &[SeedNft],
+        _name_threshold: f64,
+        _metadata_threshold: f64,
+        _max_tokens_per_contract: usize,
+        _max_recall_rows: usize,
+    ) -> Result<DatabaseSnapshot, AppError> {
+        self.snapshot_started.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(self.sleep_ms));
+        Ok(DatabaseSnapshot::default())
+    }
+
+    fn load_snapshots(
+        &self,
+        _chain: &str,
+        seeds: &[(String, Vec<SeedNft>)],
+        _name_threshold: f64,
+        _metadata_threshold: f64,
+        _max_tokens_per_contract: usize,
+        _max_recall_rows: usize,
+    ) -> Result<BTreeMap<String, DatabaseSnapshot>, AppError> {
+        self.snapshot_started.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(self.sleep_ms));
+        Ok(seeds
+            .iter()
+            .map(|(seed_address, _)| (seed_address.clone(), DatabaseSnapshot::default()))
+            .collect())
+    }
+}
+
+#[derive(Clone)]
+struct StageOrderRecorder {
+    events: Arc<Mutex<Vec<String>>>,
+}
+
+impl StageOrderRecorder {
+    fn push(&self, event: impl Into<String>) {
+        self.events.lock().unwrap().push(event.into());
+    }
+}
+
+struct StageOrderFeatureStore {
+    recorder: StageOrderRecorder,
+}
+
+impl FeatureStoreReader for StageOrderFeatureStore {
+    fn load_snapshot(
+        &self,
+        _chain: &str,
+        _seed_nfts: &[SeedNft],
+        _name_threshold: f64,
+        _metadata_threshold: f64,
+        _max_tokens_per_contract: usize,
+        _max_recall_rows: usize,
+    ) -> Result<DatabaseSnapshot, AppError> {
+        self.recorder.push("snapshot:start");
+        self.recorder.push("snapshot:finish");
+        Ok(DatabaseSnapshot::default())
     }
 }
 
@@ -459,12 +819,8 @@ impl AnalyzeApi for InstrumentedBatchApi {
         contract_address: &str,
     ) -> Result<ContractMetadata, AppError> {
         let is_seed_contract = contract_address.starts_with("0xseed");
-        let seed_metadata_call_index = if is_seed_contract {
-            Some(self.probe.metadata_calls.fetch_add(1, Ordering::SeqCst))
-        } else {
-            None
-        };
         if is_seed_contract {
+            self.probe.metadata_calls.fetch_add(1, Ordering::SeqCst);
             let current = self.probe.metadata_current.fetch_add(1, Ordering::SeqCst) + 1;
             BatchPipelineProbe::record_max(&self.probe.metadata_max_seen, current);
         } else {
@@ -484,18 +840,6 @@ impl AnalyzeApi for InstrumentedBatchApi {
                     tokio::time::sleep(Duration::from_millis(1)).await;
                     waited += 1;
                 }
-            }
-        }
-        if seed_metadata_call_index.is_some_and(|index| index > 0) {
-            let mut waited = 0;
-            while self.probe.snapshot_active.load(Ordering::SeqCst) == 0 && waited < 100 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-                waited += 1;
-            }
-            if self.probe.snapshot_active.load(Ordering::SeqCst) > 0 {
-                self.probe
-                    .later_context_overlapped_snapshot
-                    .store(true, Ordering::SeqCst);
             }
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1915,6 +2259,37 @@ impl BatchProgressReporter for RecordingBatchProgressReporter {
     }
 }
 
+struct StageOrderSeedProgressReporter {
+    recorder: StageOrderRecorder,
+}
+
+#[async_trait]
+impl SeedProgressReporter for StageOrderSeedProgressReporter {
+    async fn on_seed_stage(&self, stage: &str) {
+        self.recorder.push(format!("stage:{stage}"));
+    }
+}
+
+struct StageOrderBatchProgressReporter {
+    recorder: StageOrderRecorder,
+}
+
+impl BatchProgressReporter for StageOrderBatchProgressReporter {
+    fn on_seed_cached(&self, _seed_address: &str) {}
+
+    fn on_seed_started(&self, _seed_address: &str) {}
+
+    fn on_seed_finished(&self, _seed_address: &str) {}
+
+    fn on_seed_failed(&self, _seed_address: &str, _error: &str) {}
+
+    fn create_seed_reporter(&self, _seed_address: &str) -> Arc<dyn SeedProgressReporter> {
+        Arc::new(StageOrderSeedProgressReporter {
+            recorder: self.recorder.clone(),
+        })
+    }
+}
+
 #[tokio::test]
 async fn batch_uses_seed_network_concurrency_for_uncached_seeds() {
     let dir = tempdir().unwrap();
@@ -2095,7 +2470,127 @@ async fn batch_reuses_existing_single_seed_report_and_analyzes_remaining_seeds()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn batch_loads_seed_snapshots_per_seed() {
+async fn batch_reusing_written_single_seed_reports_matches_direct_batch_summary() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n").unwrap();
+    let direct_probe = Arc::new(BatchPipelineProbe::default());
+    let direct_deps = AnalysisDeps {
+        api: Arc::new(InstrumentedBatchApi {
+            probe: direct_probe.clone(),
+            transfer_sleep_ms: 0,
+            emit_native_sale: false,
+        }),
+        feature_store: Arc::new(InstrumentedFeatureStore {
+            probe: direct_probe,
+            sleep_ms: 0,
+            wait_for_transfer_before_seed_two_snapshot: false,
+        }),
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    let request = BatchRequest {
+        chain: "ethereum".into(),
+        seed_file: dir.path().join("seeds.txt"),
+        output_dir: dir.path().to_path_buf(),
+        alchemy_api_key: "key".into(),
+        seed_network_max_concurrency: 2,
+        seed_cpu_max_concurrency: 1,
+        matched_contract_max_concurrency: 1,
+        ..BatchRequest::default()
+    };
+    let direct_summary = run_batch(request.clone(), &direct_deps).await.unwrap();
+    assert!(
+        direct_summary
+            .paper_stats
+            .data_quality
+            .candidate_contract_count
+            > 0,
+        "direct batch fixture should exercise non-empty paper_stats"
+    );
+
+    let cached_progress = Arc::new(RecordingBatchProgressReporter::default());
+    let cached_deps = AnalysisDeps {
+        api: Arc::new(OneSeedFailsContextApi),
+        feature_store: Arc::new(EmptyFeatureStore),
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: cached_progress.clone(),
+    };
+
+    let cached_summary = run_batch(request, &cached_deps).await.unwrap();
+
+    assert_eq!(cached_summary, direct_summary);
+    assert_eq!(
+        cached_progress.cached.lock().unwrap().as_slice(),
+        ["0xseed1", "0xseed2"]
+    );
+    assert!(cached_progress.started.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_reuses_mixed_case_cached_single_seed_report_without_dropping_summary_entry() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n").unwrap();
+    let mut cached_report = cached_single_report(
+        SeedContractPayload {
+            chain: "ethereum".into(),
+            contract_address: "0xSeed1".into(),
+            name: "Cached Seed".into(),
+            ..SeedContractPayload::default()
+        },
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        BTreeMap::new(),
+    );
+    cached_report.paper_stats = PaperStatsPayload {
+        malicious_addresses: vec!["0xcached".into()],
+        ..PaperStatsPayload::default()
+    };
+    std::fs::write(
+        dir.path().join("top_contract_analysis__cached_seed.json"),
+        serde_json::to_string(&cached_report).unwrap(),
+    )
+    .unwrap();
+    let batch_progress = Arc::new(RecordingBatchProgressReporter::default());
+    let deps = AnalysisDeps {
+        api: Arc::new(OneSeedFailsContextApi),
+        feature_store: Arc::new(EmptyFeatureStore),
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: batch_progress.clone(),
+    };
+
+    let summary = run_batch(
+        BatchRequest {
+            chain: "ethereum".into(),
+            seed_file: dir.path().join("seeds.txt"),
+            output_dir: dir.path().to_path_buf(),
+            alchemy_api_key: "key".into(),
+            seed_network_max_concurrency: 1,
+            ..BatchRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        batch_progress.cached.lock().unwrap().as_slice(),
+        ["0xseed1"]
+    );
+    assert!(batch_progress.started.lock().unwrap().is_empty());
+    assert_eq!(
+        summary
+            .paper_stats
+            .address_classification
+            .malicious_address_count,
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_loads_seed_snapshots_in_batches() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n").unwrap();
     let probe = Arc::new(BatchPipelineProbe::default());
@@ -2130,12 +2625,12 @@ async fn batch_loads_seed_snapshots_per_seed() {
     .unwrap();
 
     assert_eq!(probe.metadata_calls.load(Ordering::SeqCst), 2);
-    assert_eq!(probe.snapshot_batch_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(probe.snapshot_batch_calls.load(Ordering::SeqCst), 1);
     assert_eq!(probe.snapshot_calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn batch_streams_later_seed_context_while_earlier_seed_loads_snapshot() {
+async fn batch_fetches_ready_seed_contexts_before_batched_snapshot() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n").unwrap();
     let probe = Arc::new(BatchPipelineProbe::default());
@@ -2170,11 +2665,161 @@ async fn batch_streams_later_seed_context_while_earlier_seed_loads_snapshot() {
     .await
     .unwrap();
 
+    assert_eq!(probe.metadata_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(probe.snapshot_batch_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_flushes_ready_seed_context_before_slow_context_finishes() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n").unwrap();
+    let slow_context_finished = Arc::new(AtomicBool::new(false));
+    let snapshot_started_before_slow_context_finished = Arc::new(AtomicBool::new(false));
+    let deps = AnalysisDeps {
+        api: Arc::new(SlowFirstSeedContextApi {
+            slow_context_finished: slow_context_finished.clone(),
+        }),
+        feature_store: Arc::new(SnapshotBeforeSlowContextFeatureStore {
+            slow_context_finished,
+            snapshot_started_before_slow_context_finished:
+                snapshot_started_before_slow_context_finished.clone(),
+        }),
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    run_batch(
+        BatchRequest {
+            chain: "ethereum".into(),
+            seed_file: dir.path().join("seeds.txt"),
+            output_dir: dir.path().to_path_buf(),
+            alchemy_api_key: "key".into(),
+            seed_network_max_concurrency: 2,
+            seed_cpu_max_concurrency: 1,
+            matched_contract_max_concurrency: 1,
+            ..BatchRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
     assert!(
-        probe
-            .later_context_overlapped_snapshot
-            .load(Ordering::SeqCst),
-        "seed2 context should start while seed1 is already loading its snapshot"
+        snapshot_started_before_slow_context_finished.load(Ordering::SeqCst),
+        "ready seed context should enter snapshot loading without waiting for a slower seed context"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_backpressures_seed_context_fetches_while_snapshot_is_blocked() {
+    let dir = tempdir().unwrap();
+    let seed_count = 12;
+    let seed_network_max_concurrency = 1;
+    let seed_cpu_max_concurrency = 1;
+    let matched_contract_max_concurrency = 1;
+    let seed_pipeline_max_concurrency =
+        seed_network_max_concurrency + seed_cpu_max_concurrency + matched_contract_max_concurrency;
+    let max_completed_without_unbounded_buffer =
+        seed_pipeline_max_concurrency * 2 + seed_network_max_concurrency;
+    let seeds = (1..=seed_count)
+        .map(|index| format!("0xseed{index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(dir.path().join("seeds.txt"), format!("{seeds}\n")).unwrap();
+    let completed_contexts = Arc::new(AtomicUsize::new(0));
+    let snapshot_started = Arc::new(AtomicBool::new(false));
+    let deps = AnalysisDeps {
+        api: Arc::new(SeedContextBackpressureApi {
+            completed_contexts: completed_contexts.clone(),
+        }),
+        feature_store: Arc::new(BlockingSnapshotFeatureStore {
+            snapshot_started: snapshot_started.clone(),
+            sleep_ms: 300,
+        }),
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    let request = BatchRequest {
+        chain: "ethereum".into(),
+        seed_file: dir.path().join("seeds.txt"),
+        output_dir: dir.path().to_path_buf(),
+        alchemy_api_key: "key".into(),
+        seed_network_max_concurrency,
+        seed_cpu_max_concurrency,
+        matched_contract_max_concurrency,
+        ..BatchRequest::default()
+    };
+    let handle = tokio::spawn(async move { run_batch(request, &deps).await });
+
+    for _ in 0..100 {
+        if snapshot_started.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        snapshot_started.load(Ordering::SeqCst),
+        "snapshot processing should start before checking context backpressure"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let completed_while_snapshot_blocked = completed_contexts.load(Ordering::SeqCst);
+    assert!(
+        completed_while_snapshot_blocked <= max_completed_without_unbounded_buffer,
+        "seed context fetches should be bounded by the active batch plus bounded queue while snapshot is blocked; completed={completed_while_snapshot_blocked}"
+    );
+
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn batch_reports_find_duplicate_candidates_after_snapshot_load_finishes() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n").unwrap();
+    let recorder = StageOrderRecorder {
+        events: Arc::new(Mutex::new(Vec::new())),
+    };
+    let deps = AnalysisDeps {
+        api: Arc::new(FakeBatchApi),
+        feature_store: Arc::new(StageOrderFeatureStore {
+            recorder: recorder.clone(),
+        }),
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(StageOrderBatchProgressReporter {
+            recorder: recorder.clone(),
+        }),
+    };
+
+    run_batch(
+        BatchRequest {
+            chain: "ethereum".into(),
+            seed_file: dir.path().join("seeds.txt"),
+            output_dir: dir.path().to_path_buf(),
+            alchemy_api_key: "key".into(),
+            seed_network_max_concurrency: 1,
+            seed_cpu_max_concurrency: 1,
+            matched_contract_max_concurrency: 1,
+            ..BatchRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
+    let events = recorder.events.lock().unwrap().clone();
+    let snapshot_finish = events
+        .iter()
+        .position(|event| event == "snapshot:finish")
+        .expect("snapshot should finish");
+    let find_candidates = events
+        .iter()
+        .position(|event| event == "stage:find_duplicate_candidates")
+        .expect("find_duplicate_candidates stage should be reported");
+
+    assert!(
+        snapshot_finish < find_candidates,
+        "find_duplicate_candidates should be reported after snapshot load; events={events:?}"
     );
 }
 
@@ -2277,11 +2922,12 @@ async fn batch_limits_cpu_stage_globally() {
     .unwrap();
 
     assert_eq!(probe.cpu_max_seen.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.snapshot_batch_calls.load(Ordering::SeqCst), 1);
     assert_eq!(probe.snapshot_calls.load(Ordering::SeqCst), 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn batch_loads_pending_seed_snapshots_per_seed_under_cpu_limit() {
+async fn batch_loads_pending_seed_snapshots_in_one_cpu_limited_batch() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n").unwrap();
     let probe = Arc::new(BatchPipelineProbe::default());
@@ -2315,13 +2961,13 @@ async fn batch_loads_pending_seed_snapshots_per_seed_under_cpu_limit() {
     .await
     .unwrap();
 
-    assert_eq!(probe.snapshot_batch_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(probe.snapshot_batch_calls.load(Ordering::SeqCst), 1);
     assert_eq!(probe.snapshot_calls.load(Ordering::SeqCst), 2);
     assert_eq!(probe.cpu_max_seen.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn batch_uses_per_seed_snapshots_without_batched_snapshot_fallback() {
+async fn batch_falls_back_to_per_seed_snapshots_when_batched_snapshot_fails() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("seeds.txt"), "0xseed1\n0xseed2\n").unwrap();
     let probe = Arc::new(BatchPipelineProbe::default());
@@ -2354,7 +3000,7 @@ async fn batch_uses_per_seed_snapshots_without_batched_snapshot_fallback() {
     .await
     .unwrap();
 
-    assert_eq!(probe.snapshot_batch_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(probe.snapshot_batch_calls.load(Ordering::SeqCst), 1);
     assert_eq!(probe.snapshot_calls.load(Ordering::SeqCst), 2);
     assert!(batch_progress.failed.lock().unwrap().is_empty());
     assert_eq!(batch_progress.finished.lock().unwrap().len(), 2);
