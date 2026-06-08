@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
 
 use crate::api::AsyncApiClient;
 use crate::error::AppError;
@@ -10,8 +11,11 @@ use crate::error::AppError;
 pub const ETH_USD_PRICE_URL: &str =
     "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd";
 pub const COINBASE_ETH_USD_SPOT_URL: &str = "https://api.coinbase.com/v2/prices/ETH-USD/spot";
+pub const ALCHEMY_ETH_USD_PRICE_URL_PREFIX: &str = "https://api.g.alchemy.com/prices/v1";
 pub const FALLBACK_ETH_USD_RATE: f64 = 2200.0;
 const DEFAULT_ETH_USD_RATE_ATTEMPTS: usize = 2;
+const DEFAULT_ALCHEMY_ETH_USD_RATE_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_PUBLIC_ETH_USD_RATE_TIMEOUT: Duration = Duration::from_secs(5);
 
 const ETH_LIKE_SYMBOLS: &[&str] = &["ETH", "WETH"];
 const STABLECOIN_SYMBOLS: &[&str] = &[
@@ -181,6 +185,7 @@ impl EthUsdRateCache {
 
 #[derive(Clone, Copy)]
 pub(crate) enum EthUsdPriceParser {
+    AlchemyBySymbol,
     CoinGecko,
     CoinbaseSpot,
 }
@@ -191,6 +196,13 @@ pub(crate) struct EthUsdPriceSource {
 }
 
 impl EthUsdPriceSource {
+    pub(crate) fn alchemy_by_symbol(url: &str) -> Self {
+        Self {
+            url: url.to_string(),
+            parser: EthUsdPriceParser::AlchemyBySymbol,
+        }
+    }
+
     pub(crate) fn coin_gecko(url: &str) -> Self {
         Self {
             url: url.to_string(),
@@ -204,6 +216,34 @@ impl EthUsdPriceSource {
             parser: EthUsdPriceParser::CoinbaseSpot,
         }
     }
+}
+
+fn parse_alchemy_eth_usd(payload: &Value) -> Option<f64> {
+    payload
+        .get("data")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|item| {
+            item.get("symbol")
+                .and_then(Value::as_str)
+                .is_some_and(|symbol| symbol.eq_ignore_ascii_case("ETH"))
+        })?
+        .get("prices")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|price| {
+            price
+                .get("currency")
+                .and_then(Value::as_str)
+                .is_some_and(|currency| currency.eq_ignore_ascii_case("usd"))
+        })?
+        .get("value")
+        .and_then(|value| {
+            value
+                .as_f64()
+                .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
+        })
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
 }
 
 fn parse_coingecko_eth_usd(payload: &Value) -> Option<f64> {
@@ -276,6 +316,7 @@ pub(crate) async fn fetch_current_eth_usd_rate_from_urls_with_retries(
                 }
             };
             let rate = match source.parser {
+                EthUsdPriceParser::AlchemyBySymbol => parse_alchemy_eth_usd(&payload),
                 EthUsdPriceParser::CoinGecko => parse_coingecko_eth_usd(&payload),
                 EthUsdPriceParser::CoinbaseSpot => parse_coinbase_spot_eth_usd(&payload),
             };
@@ -295,14 +336,98 @@ pub(crate) async fn fetch_current_eth_usd_rate_from_urls_with_retries(
 }
 
 pub async fn fetch_current_eth_usd_rate(client: &AsyncApiClient) -> Result<f64, AppError> {
-    fetch_current_eth_usd_rate_from_urls(
-        client,
-        &[
-            EthUsdPriceSource::coin_gecko(ETH_USD_PRICE_URL),
-            EthUsdPriceSource::coinbase_spot(COINBASE_ETH_USD_SPOT_URL),
-        ],
+    let sources = public_eth_usd_price_sources();
+    fetch_current_eth_usd_rate_from_urls(client, &sources).await
+}
+
+fn public_eth_usd_price_sources() -> [EthUsdPriceSource; 2] {
+    [
+        EthUsdPriceSource::coin_gecko(ETH_USD_PRICE_URL),
+        EthUsdPriceSource::coinbase_spot(COINBASE_ETH_USD_SPOT_URL),
+    ]
+}
+
+pub(crate) async fn fetch_current_eth_usd_rate_alchemy_first_from_sources_with_timeouts(
+    alchemy_client: &AsyncApiClient,
+    fallback_client: &AsyncApiClient,
+    alchemy_sources: &[EthUsdPriceSource],
+    fallback_sources: &[EthUsdPriceSource],
+    alchemy_timeout: Duration,
+    fallback_timeout: Duration,
+) -> Result<f64, AppError> {
+    if !alchemy_sources.is_empty() {
+        if let Ok(Ok(rate)) = tokio::time::timeout(
+            alchemy_timeout,
+            fetch_current_eth_usd_rate_from_urls(alchemy_client, alchemy_sources),
+        )
+        .await
+        {
+            return Ok(rate);
+        }
+    }
+
+    match tokio::time::timeout(
+        fallback_timeout,
+        fetch_current_eth_usd_rate_from_urls(fallback_client, fallback_sources),
     )
     .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(AppError::InvalidData(
+            "ETH/USD public fallback rate fetch timed out".to_string(),
+        )),
+    }
+}
+
+pub async fn fetch_current_eth_usd_rate_with_timeout(
+    client: &AsyncApiClient,
+    timeout: Duration,
+) -> Result<f64, AppError> {
+    let sources = public_eth_usd_price_sources();
+    match tokio::time::timeout(
+        timeout,
+        fetch_current_eth_usd_rate_from_urls(client, &sources),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(AppError::InvalidData(
+            "ETH/USD rate fetch timed out".to_string(),
+        )),
+    }
+}
+
+pub async fn fetch_current_eth_usd_rate_alchemy_first(
+    alchemy_client: &AsyncApiClient,
+    fallback_client: &AsyncApiClient,
+    alchemy_api_key: &str,
+) -> Result<f64, AppError> {
+    let alchemy_api_key = alchemy_api_key.trim();
+    let alchemy_sources = if alchemy_api_key.is_empty() {
+        Vec::new()
+    } else {
+        vec![EthUsdPriceSource::alchemy_by_symbol(
+            &alchemy_eth_usd_price_url(alchemy_api_key),
+        )]
+    };
+    let fallback_sources = public_eth_usd_price_sources();
+    fetch_current_eth_usd_rate_alchemy_first_from_sources_with_timeouts(
+        alchemy_client,
+        fallback_client,
+        &alchemy_sources,
+        &fallback_sources,
+        DEFAULT_ALCHEMY_ETH_USD_RATE_TIMEOUT,
+        DEFAULT_PUBLIC_ETH_USD_RATE_TIMEOUT,
+    )
+    .await
+}
+
+fn alchemy_eth_usd_price_url(api_key: &str) -> String {
+    format!(
+        "{}/{}/tokens/by-symbol?symbols=ETH",
+        ALCHEMY_ETH_USD_PRICE_URL_PREFIX,
+        api_key.trim()
+    )
 }
 
 #[cfg(test)]
@@ -380,6 +505,96 @@ mod tests {
         .unwrap();
 
         assert_eq!(rate, 3123.45);
+    }
+
+    #[tokio::test]
+    async fn price_fetch_reads_alchemy_symbol_price_before_public_fallbacks() {
+        let server = MockServer::start_async().await;
+        let alchemy_price = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/alchemy")
+                    .query_param("symbols", "ETH");
+                then.status(200).json_body_obj(&serde_json::json!({
+                    "data": [{
+                        "symbol": "ETH",
+                        "prices": [{
+                            "currency": "usd",
+                            "value": "3333.21",
+                            "lastUpdatedAt": "2026-06-08T00:00:00Z"
+                        }]
+                    }]
+                }));
+            })
+            .await;
+        let public_fallback = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/coingecko");
+                then.status(500).json_body_obj(&serde_json::json!({
+                    "error": "public fallback should not be called"
+                }));
+            })
+            .await;
+
+        let client = AsyncApiClient::new(5, 4).unwrap();
+        let rate = fetch_current_eth_usd_rate_from_urls(
+            &client,
+            &[
+                EthUsdPriceSource::alchemy_by_symbol(&format!(
+                    "{}/alchemy?symbols=ETH",
+                    server.base_url()
+                )),
+                EthUsdPriceSource::coin_gecko(&format!("{}/coingecko", server.base_url())),
+            ],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rate, 3333.21);
+        assert_eq!(alchemy_price.hits_async().await, 1);
+        assert_eq!(public_fallback.hits_async().await, 0);
+    }
+
+    #[tokio::test]
+    async fn alchemy_first_price_fetch_times_out_slow_alchemy_and_uses_public_fallback() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let alchemy_url = format!("http://{}?symbols=ETH", listener.local_addr().unwrap());
+        let slow_alchemy = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0_u8; 4096];
+            let _ = stream.read(&mut buffer).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+
+        let public_server = MockServer::start_async().await;
+        let public_price = public_server
+            .mock_async(|when, then| {
+                when.method(GET).path("/coingecko");
+                then.status(200).json_body_obj(&serde_json::json!({
+                    "ethereum": {"usd": 3456.78}
+                }));
+            })
+            .await;
+
+        let alchemy_client = AsyncApiClient::new(5, 4).unwrap();
+        let fallback_client = AsyncApiClient::new(5, 4).unwrap();
+        let rate = fetch_current_eth_usd_rate_alchemy_first_from_sources_with_timeouts(
+            &alchemy_client,
+            &fallback_client,
+            &[EthUsdPriceSource::alchemy_by_symbol(&alchemy_url)],
+            &[EthUsdPriceSource::coin_gecko(&format!(
+                "{}/coingecko",
+                public_server.base_url()
+            ))],
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rate, 3456.78);
+        assert_eq!(public_price.hits_async().await, 1);
+        slow_alchemy.abort();
     }
 
     async fn spawn_sequential_status_server(

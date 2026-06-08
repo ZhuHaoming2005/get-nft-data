@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::api::alchemy::fetch_eip2981_royalty_recipient;
-use crate::api::{ApiEndpoints, AsyncApiClient};
+use crate::api::{fetch_contract_collection_slug_alchemy_first, ApiEndpoints, AsyncApiClient};
 use crate::currency::{is_native_eth_symbol, is_supported_priced_symbol, to_normalized_amount};
 use crate::error::AppError;
 use crate::models::{ContractMetadata, NftMarketEventRecord, NftSaleRecord, SeedNft};
@@ -450,36 +450,73 @@ pub async fn fetch_opensea_nft_events(
     opensea_api_key: &str,
     eth_usd_rate: Option<f64>,
 ) -> Result<Vec<NftSaleRecord>, AppError> {
+    let collection_slug = if token_id.filter(|value| !value.is_empty()).is_some() {
+        None
+    } else {
+        fetch_opensea_contract_collection_slug(
+            client,
+            base_url,
+            chain,
+            contract_address,
+            opensea_api_key,
+        )
+        .await?
+    };
+    fetch_opensea_nft_events_with_collection_slug(
+        client,
+        base_url,
+        OpenSeaNftEventLookup {
+            chain,
+            contract_address,
+            token_id,
+            collection_slug: collection_slug.as_deref(),
+        },
+        opensea_api_key,
+        eth_usd_rate,
+    )
+    .await
+}
+
+struct OpenSeaNftEventLookup<'a> {
+    chain: &'a str,
+    contract_address: &'a str,
+    token_id: Option<&'a str>,
+    collection_slug: Option<&'a str>,
+}
+
+async fn fetch_opensea_nft_events_with_collection_slug(
+    client: &AsyncApiClient,
+    base_url: &str,
+    lookup: OpenSeaNftEventLookup<'_>,
+    opensea_api_key: &str,
+    eth_usd_rate: Option<f64>,
+) -> Result<Vec<NftSaleRecord>, AppError> {
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
     headers.insert(
         "x-api-key",
         HeaderValue::from_str(opensea_api_key).map_err(|err| AppError::Http(err.to_string()))?,
     );
-    let requested_chain = chain;
-    let chain = opensea_chain(chain);
-    let mut base_events_url = if let Some(token_id) = token_id.filter(|value| !value.is_empty()) {
-        Url::parse(&format!(
-            "{base_url}/api/v2/events/chain/{chain}/contract/{contract_address}/nfts/{token_id}"
-        ))
-        .map_err(|err| AppError::Http(err.to_string()))?
-    } else {
-        let Some(collection_slug) = fetch_opensea_contract_collection_slug(
-            client,
-            base_url,
-            requested_chain,
-            contract_address,
-            opensea_api_key,
-        )
-        .await?
-        else {
-            return Ok(Vec::new());
+    let chain = opensea_chain(lookup.chain);
+    let mut base_events_url =
+        if let Some(token_id) = lookup.token_id.filter(|value| !value.is_empty()) {
+            Url::parse(&format!(
+                "{base_url}/api/v2/events/chain/{chain}/contract/{}/nfts/{token_id}",
+                lookup.contract_address
+            ))
+            .map_err(|err| AppError::Http(err.to_string()))?
+        } else {
+            let Some(collection_slug) = lookup
+                .collection_slug
+                .filter(|value| !value.trim().is_empty())
+            else {
+                return Ok(Vec::new());
+            };
+            Url::parse(&format!(
+                "{base_url}/api/v2/events/collection/{collection_slug}"
+            ))
+            .map_err(|err| AppError::Http(err.to_string()))?
         };
-        Url::parse(&format!(
-            "{base_url}/api/v2/events/collection/{collection_slug}"
-        ))
-        .map_err(|err| AppError::Http(err.to_string()))?
-    };
     base_events_url
         .query_pairs_mut()
         .append_pair("event_type", "sale")
@@ -547,7 +584,7 @@ pub async fn fetch_opensea_nft_events(
                 .get("identifier")
                 .or_else(|| nft.get("token_id"))
                 .and_then(Value::as_str)
-                .unwrap_or_else(|| token_id.unwrap_or(""));
+                .unwrap_or_else(|| lookup.token_id.unwrap_or(""));
             let normalized = to_normalized_amount(
                 raw_value / 10f64.powi(payment_decimals),
                 &payment_symbol,
@@ -562,13 +599,13 @@ pub async fn fetch_opensea_nft_events(
                 .unwrap_or("")
                 .to_lowercase();
             if !parsed_contract_address.is_empty()
-                && !parsed_contract_address.eq_ignore_ascii_case(contract_address)
+                && !parsed_contract_address.eq_ignore_ascii_case(lookup.contract_address)
             {
                 continue;
             }
             rows.push(NftSaleRecord {
                 contract_address: if parsed_contract_address.is_empty() {
-                    contract_address.to_lowercase()
+                    lookup.contract_address.to_lowercase()
                 } else {
                     parsed_contract_address
                 },
@@ -1115,21 +1152,12 @@ pub async fn fetch_opensea_account_holds_contract_nft(
 async fn fetch_opensea_creator_fee_recipient(
     client: &AsyncApiClient,
     base_url: &str,
-    chain: &str,
-    contract_address: &str,
+    collection_slug: &str,
     opensea_api_key: &str,
 ) -> Result<Option<String>, AppError> {
-    let Some(collection_slug) = fetch_opensea_contract_collection_slug(
-        client,
-        base_url,
-        chain,
-        contract_address,
-        opensea_api_key,
-    )
-    .await?
-    else {
+    if collection_slug.trim().is_empty() {
         return Ok(None);
-    };
+    }
 
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
@@ -1137,7 +1165,7 @@ async fn fetch_opensea_creator_fee_recipient(
         "x-api-key",
         HeaderValue::from_str(opensea_api_key).map_err(|err| AppError::Http(err.to_string()))?,
     );
-    let url = format!("{base_url}/api/v2/collections/{collection_slug}");
+    let url = format!("{base_url}/api/v2/collections/{}", collection_slug.trim());
     let payload: Value = client.get_json_with_headers(&url, headers).await?;
     Ok(creator_fee_recipient_from_collection_payload(&payload))
 }
@@ -1248,11 +1276,29 @@ async fn enrich_sales_with_royalty_recipient(
         return rows;
     }
 
+    let collection_slug = match fetch_contract_collection_slug_alchemy_first(
+        alchemy_client,
+        other_client,
+        endpoints,
+        chain,
+        contract_address,
+        opensea_api_key,
+    )
+    .await
+    {
+        Ok(Some(slug)) => slug,
+        Ok(None) => return rows,
+        Err(err) => {
+            eprintln!(
+                "warning: OpenSea creator fee recipient collection lookup failed for {contract_address}: {err}; royalty value flow recipient remains unknown"
+            );
+            return rows;
+        }
+    };
     match fetch_opensea_creator_fee_recipient(
         other_client,
         &endpoints.opensea_base,
-        chain,
-        contract_address,
+        &collection_slug,
         opensea_api_key,
     )
     .await
@@ -1340,12 +1386,33 @@ pub async fn fetch_contract_sales_with_clients(
         }
     }
 
-    match fetch_opensea_nft_events(
+    let collection_slug = match fetch_contract_collection_slug_alchemy_first(
+        alchemy_client,
         other_client,
-        &endpoints.opensea_base,
+        endpoints,
         chain,
         contract_address,
-        None,
+        opensea_api_key,
+    )
+    .await
+    {
+        Ok(slug) => slug,
+        Err(err) => {
+            eprintln!(
+                "warning: OpenSea contract sales collection lookup failed for {contract_address}: {err}; continuing without contract sales"
+            );
+            return Ok(Vec::new());
+        }
+    };
+    match fetch_opensea_nft_events_with_collection_slug(
+        other_client,
+        &endpoints.opensea_base,
+        OpenSeaNftEventLookup {
+            chain,
+            contract_address,
+            token_id: None,
+            collection_slug: collection_slug.as_deref(),
+        },
         opensea_api_key,
         eth_usd_rate,
     )

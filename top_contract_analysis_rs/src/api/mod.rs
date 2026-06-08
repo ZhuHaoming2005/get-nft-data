@@ -321,8 +321,9 @@ fn response_body_excerpt(body: &str) -> String {
 }
 
 pub use alchemy::{
-    fetch_contract_metadata, fetch_contract_owners, fetch_contract_total_supply,
-    fetch_contract_transfers, fetch_contract_transfers_with_etherscan_fallback, fetch_eth_balance,
+    fetch_alchemy_contract_collection_slug, fetch_contract_metadata, fetch_contract_owners,
+    fetch_contract_total_supply, fetch_contract_transfers,
+    fetch_contract_transfers_with_etherscan_fallback, fetch_eth_balance,
     fetch_is_holder_of_contract, fetch_license_sample, fetch_same_block_eth_transfers_for_address,
     fetch_same_block_value_transfers_for_address, fetch_same_block_value_transfers_to_address,
     fetch_seed_contract_nfts, fetch_transaction_receipt, fetch_transaction_receipts_for_block,
@@ -468,6 +469,50 @@ pub async fn fetch_contract_nfts_with_fallback_clients(
                 });
             }
             Ok(rows)
+        }
+    }
+}
+
+pub async fn fetch_contract_collection_slug_alchemy_first(
+    alchemy_client: &AsyncApiClient,
+    other_client: &AsyncApiClient,
+    endpoints: &ApiEndpoints,
+    chain: &str,
+    contract_address: &str,
+    opensea_api_key: &str,
+) -> Result<Option<String>, AppError> {
+    match fetch_alchemy_contract_collection_slug(alchemy_client, endpoints, contract_address).await
+    {
+        Ok(Some(slug)) => Ok(Some(slug)),
+        Ok(None) if opensea_api_key.trim().is_empty() => Ok(None),
+        Ok(None) => {
+            fetch_opensea_contract_collection_slug(
+                other_client,
+                &endpoints.opensea_base,
+                chain,
+                contract_address,
+                opensea_api_key,
+            )
+            .await
+        }
+        Err(err) if opensea_api_key.trim().is_empty() => {
+            eprintln!(
+                "warning: Alchemy collection slug lookup failed for {contract_address}: {err}; continuing without collection slug"
+            );
+            Ok(None)
+        }
+        Err(err) => {
+            eprintln!(
+                "warning: Alchemy collection slug lookup failed for {contract_address}: {err}; falling back to OpenSea"
+            );
+            fetch_opensea_contract_collection_slug(
+                other_client,
+                &endpoints.opensea_base,
+                chain,
+                contract_address,
+                opensea_api_key,
+            )
+            .await
         }
     }
 }

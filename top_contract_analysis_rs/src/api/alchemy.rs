@@ -224,6 +224,37 @@ pub async fn fetch_license_sample(
     client.get_json(url.as_str()).await
 }
 
+pub async fn fetch_alchemy_contract_collection_slug(
+    client: &AsyncApiClient,
+    endpoints: &ApiEndpoints,
+    contract_address: &str,
+) -> Result<Option<String>, AppError> {
+    let mut url = Url::parse(&format!(
+        "{}/getNFTsForContract",
+        endpoints.alchemy_nft_v3_base
+    ))
+    .map_err(|err| AppError::Http(err.to_string()))?;
+    url.query_pairs_mut()
+        .append_pair("contractAddress", contract_address)
+        .append_pair("withMetadata", "true")
+        .append_pair("limit", "1");
+    let payload: Value = client.get_json(url.as_str()).await?;
+    let slug = payload
+        .get("nfts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find_map(|nft| {
+            nft.get("collection")
+                .and_then(|collection| collection.get("slug"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|slug| !slug.is_empty())
+                .map(ToString::to_string)
+        });
+    Ok(slug)
+}
+
 pub fn is_open_license_payload(payload: &Value) -> bool {
     fn collect_strings(value: &Value, texts: &mut Vec<String>) {
         match value {

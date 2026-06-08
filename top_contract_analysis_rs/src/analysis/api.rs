@@ -5,16 +5,15 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::api::{
-    fetch_account_holds_contract_alchemy_first,
+    fetch_account_holds_contract_alchemy_first, fetch_contract_collection_slug_alchemy_first,
     fetch_contract_metadata_with_opensea_fallback_clients,
     fetch_contract_nfts_with_fallback_clients, fetch_contract_owners,
     fetch_contract_sales_with_clients, fetch_contract_total_supply,
     fetch_contract_transfers_with_etherscan_fallback, fetch_eth_balance, fetch_license_sample,
-    fetch_opensea_contract_collection_slug, fetch_opensea_contract_market_events,
-    fetch_same_block_eth_transfers_for_address, fetch_same_block_value_transfers_for_address,
-    fetch_same_block_value_transfers_to_address, fetch_seed_contract_nfts,
-    fetch_transaction_receipt, fetch_transaction_receipts_for_block, is_open_license_payload,
-    ApiEndpoints, AsyncApiClient, OpenSeaAccountFallback,
+    fetch_opensea_contract_market_events, fetch_same_block_eth_transfers_for_address,
+    fetch_same_block_value_transfers_for_address, fetch_same_block_value_transfers_to_address,
+    fetch_seed_contract_nfts, fetch_transaction_receipt, fetch_transaction_receipts_for_block,
+    is_open_license_payload, ApiEndpoints, AsyncApiClient, OpenSeaAccountFallback,
 };
 use crate::currency::FALLBACK_ETH_USD_RATE;
 use crate::error::AppError;
@@ -314,20 +313,26 @@ impl RealApi {
         ApiEndpoints::for_alchemy(&normalize_network(chain, explicit_network), api_key)
     }
 
-    async fn current_eth_usd_rate(&self) -> Result<f64, AppError> {
+    async fn current_eth_usd_rate(&self, alchemy_api_key: Option<&str>) -> Result<f64, AppError> {
         self.eth_usd_rate
             .get_or_try_init_or_fallback(
                 || async {
-                    match tokio::time::timeout(
-                        Duration::from_secs(5),
-                        crate::currency::fetch_current_eth_usd_rate(&self.other_client),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => Err(AppError::InvalidData(
-                            "ETH/USD rate fetch timed out".to_string(),
-                        )),
+                    match alchemy_api_key.filter(|key| !key.trim().is_empty()) {
+                        Some(alchemy_api_key) => {
+                            crate::currency::fetch_current_eth_usd_rate_alchemy_first(
+                                &self.alchemy_client,
+                                &self.other_client,
+                                alchemy_api_key,
+                            )
+                            .await
+                        }
+                        None => {
+                            crate::currency::fetch_current_eth_usd_rate_with_timeout(
+                                &self.other_client,
+                                Duration::from_secs(5),
+                            )
+                            .await
+                        }
                     }
                 },
                 FALLBACK_ETH_USD_RATE,
@@ -339,7 +344,7 @@ impl RealApi {
 #[async_trait]
 impl AnalyzeApi for RealApi {
     async fn warm_eth_usd_rate(&self) -> Result<(), AppError> {
-        self.current_eth_usd_rate().await.map(|_| ())
+        self.current_eth_usd_rate(None).await.map(|_| ())
     }
 
     async fn fetch_contract_metadata(
@@ -502,13 +507,11 @@ impl AnalyzeApi for RealApi {
         opensea_api_key: &str,
         contract_address: &str,
     ) -> Result<Option<String>, AppError> {
-        if opensea_api_key.trim().is_empty() {
-            return Ok(None);
-        }
         let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
-        fetch_opensea_contract_collection_slug(
+        fetch_contract_collection_slug_alchemy_first(
+            &self.alchemy_client,
             &self.other_client,
-            &endpoints.opensea_base,
+            &endpoints,
             chain,
             contract_address,
             opensea_api_key,
@@ -525,7 +528,7 @@ impl AnalyzeApi for RealApi {
         opensea_api_key: &str,
     ) -> Result<Vec<NftSaleRecord>, AppError> {
         let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
-        let eth_usd_rate = match self.current_eth_usd_rate().await {
+        let eth_usd_rate = match self.current_eth_usd_rate(Some(alchemy_api_key)).await {
             Ok(rate) => Some(rate),
             Err(err) => {
                 if !self
@@ -563,7 +566,7 @@ impl AnalyzeApi for RealApi {
             return Ok(Vec::new());
         }
         let endpoints = self.endpoints(chain, alchemy_network, alchemy_api_key);
-        let eth_usd_rate = match self.current_eth_usd_rate().await {
+        let eth_usd_rate = match self.current_eth_usd_rate(Some(alchemy_api_key)).await {
             Ok(rate) => Some(rate),
             Err(err) => {
                 if !self
@@ -577,9 +580,10 @@ impl AnalyzeApi for RealApi {
                 None
             }
         };
-        let collection_slug = match fetch_opensea_contract_collection_slug(
+        let collection_slug = match fetch_contract_collection_slug_alchemy_first(
+            &self.alchemy_client,
             &self.other_client,
-            &endpoints.opensea_base,
+            &endpoints,
             chain,
             contract_address,
             opensea_api_key,
@@ -723,7 +727,7 @@ impl AnalyzeApi for RealApi {
         block_number: i64,
         address: &str,
     ) -> Result<Vec<EthTransferRecord>, AppError> {
-        let eth_usd_rate = match self.current_eth_usd_rate().await {
+        let eth_usd_rate = match self.current_eth_usd_rate(Some(alchemy_api_key)).await {
             Ok(rate) => Some(rate),
             Err(err) => {
                 if !self
@@ -756,7 +760,7 @@ impl AnalyzeApi for RealApi {
         block_number: i64,
         address: &str,
     ) -> Result<Vec<EthTransferRecord>, AppError> {
-        let eth_usd_rate = match self.current_eth_usd_rate().await {
+        let eth_usd_rate = match self.current_eth_usd_rate(Some(alchemy_api_key)).await {
             Ok(rate) => Some(rate),
             Err(err) => {
                 if !self
