@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::{stream, StreamExt};
 use serde::Deserialize;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinHandle;
 
 use crate::error::AppError;
 use crate::models::{BatchSummaryPayload, SingleReportPayload};
@@ -20,6 +21,9 @@ use super::{
 };
 
 const SNAPSHOT_BATCH_DEBOUNCE_MS: u64 = 50;
+const MAX_SEED_PIPELINE_BACKLOG: usize = 8;
+
+type Stage3SeedHandle = JoinHandle<Result<BatchSeedAggregate, AppError>>;
 
 fn analyze_request_for_batch_seed(
     request: &BatchRequest,
@@ -62,6 +66,7 @@ struct PreparedSeedPlan {
     context: SeedContext,
     plan: CandidatePlan,
     seed_progress: Arc<dyn SeedProgressReporter>,
+    stage3_permit: OwnedSemaphorePermit,
 }
 
 struct PreparedSeedPlanFailure {
@@ -75,6 +80,7 @@ struct SnapshotPlanInput {
     context: SeedContext,
     dedup_seed_nfts: Vec<crate::models::SeedNft>,
     seed_progress: Arc<dyn SeedProgressReporter>,
+    stage3_permit: OwnedSemaphorePermit,
 }
 
 fn load_cached_seed_entries(
@@ -148,6 +154,7 @@ async fn build_candidate_plans_for_prepared_seeds(
     prepared: Vec<PreparedSeedContext>,
     feature_store: Arc<dyn super::FeatureStoreReader>,
     cpu_limit: Arc<Semaphore>,
+    stage3_seed_limit: Arc<Semaphore>,
 ) -> Result<Vec<Result<PreparedSeedPlan, PreparedSeedPlanFailure>>, AppError> {
     if prepared.is_empty() {
         return Ok(Vec::new());
@@ -163,6 +170,11 @@ async fn build_candidate_plans_for_prepared_seeds(
         } = prepared;
         let dedup_seed_nfts =
             seed_nfts_for_duplicate_matching(&context.seed_nfts, &context.seed_contract);
+        let stage3_permit = stage3_seed_limit
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|err| AppError::InvalidData(format!("stage3 seed limit closed: {err}")))?;
         seed_progress.on_seed_stage("load_snapshot").await;
         inputs.push(SnapshotPlanInput {
             seed_address,
@@ -170,6 +182,7 @@ async fn build_candidate_plans_for_prepared_seeds(
             context,
             dedup_seed_nfts,
             seed_progress,
+            stage3_permit,
         });
     }
 
@@ -287,6 +300,7 @@ async fn build_candidate_plans_for_prepared_seeds(
                     context: input.context,
                     plan,
                     seed_progress: input.seed_progress,
+                    stage3_permit: input.stage3_permit,
                 })
             })
             .collect::<Vec<_>>()
@@ -297,60 +311,48 @@ async fn build_candidate_plans_for_prepared_seeds(
     Ok(plans)
 }
 
-async fn run_prepared_seed_plans(
-    successful_plans: Vec<PreparedSeedPlan>,
-    deps: &AnalysisDeps,
+fn spawn_prepared_seed_plan(
+    prepared: PreparedSeedPlan,
+    deps: AnalysisDeps,
     matched_contract_limit: Arc<Semaphore>,
-    output_dir: &Path,
-    max_concurrency: usize,
-) -> Vec<Result<BatchSeedAggregate, AppError>> {
-    let mut seed_tasks = stream::iter(successful_plans.into_iter().map(|prepared| {
-        let deps = deps.clone();
-        let matched_contract_limit = matched_contract_limit.clone();
-        let output_dir = output_dir.to_path_buf();
-        async move {
-            let seed_progress = prepared.seed_progress.clone();
-            let state = prepare_seed_analysis_state(
-                prepared.request,
-                &deps,
-                seed_progress.clone(),
-                None,
-                Some((prepared.context, prepared.plan)),
-            )
-            .await?;
-            let mut state = state;
-            let result = match analyze_matched_contracts_parallel(
-                &mut state,
-                &deps,
-                seed_progress.clone(),
-                matched_contract_limit,
-            )
-            .await
-            {
-                Ok(()) => finalize_seed_report(state, seed_progress).await,
-                Err(err) => Err(err),
-            };
-            let payload = match result {
-                Ok(payload) => payload,
-                Err(err) => {
-                    deps.batch_progress
-                        .on_seed_failed(&prepared.seed_address, &err.to_string());
-                    return Err(err);
-                }
-            };
-            deps.batch_progress.on_seed_finished(&prepared.seed_address);
-            write_outputs_to_directory(&payload, &output_dir)?;
-            let aggregate = build_batch_seed_aggregate(payload);
-            Ok(aggregate)
-        }
-    }))
-    .buffer_unordered(max_concurrency);
-
-    let mut results = Vec::new();
-    while let Some(entry) = seed_tasks.next().await {
-        results.push(entry);
-    }
-    results
+    output_dir: PathBuf,
+) -> Stage3SeedHandle {
+    tokio::spawn(async move {
+        let seed_progress = prepared.seed_progress.clone();
+        let _stage3_seed_permit = prepared.stage3_permit;
+        let state = prepare_seed_analysis_state(
+            prepared.request,
+            &deps,
+            seed_progress.clone(),
+            None,
+            Some((prepared.context, prepared.plan)),
+        )
+        .await?;
+        let mut state = state;
+        let result = match analyze_matched_contracts_parallel(
+            &mut state,
+            &deps,
+            seed_progress.clone(),
+            matched_contract_limit,
+        )
+        .await
+        {
+            Ok(()) => finalize_seed_report(state, seed_progress).await,
+            Err(err) => Err(err),
+        };
+        let payload = match result {
+            Ok(payload) => payload,
+            Err(err) => {
+                deps.batch_progress
+                    .on_seed_failed(&prepared.seed_address, &err.to_string());
+                return Err(err);
+            }
+        };
+        deps.batch_progress.on_seed_finished(&prepared.seed_address);
+        write_outputs_to_directory(&payload, &output_dir)?;
+        let aggregate = build_batch_seed_aggregate(payload);
+        Ok(aggregate)
+    })
 }
 
 async fn process_prepared_context_batch(
@@ -359,8 +361,8 @@ async fn process_prepared_context_batch(
     cpu_limit: Arc<Semaphore>,
     matched_contract_limit: Arc<Semaphore>,
     output_dir: &Path,
-    seed_pipeline_max_concurrency: usize,
-) -> Result<(Vec<BatchSeedAggregate>, Option<AppError>), AppError> {
+    stage3_seed_limit: Arc<Semaphore>,
+) -> Result<(Vec<Stage3SeedHandle>, Option<AppError>), AppError> {
     if ready_contexts.is_empty() {
         return Ok((Vec::new(), None));
     }
@@ -370,6 +372,7 @@ async fn process_prepared_context_batch(
         prepared_contexts,
         deps.feature_store.clone(),
         cpu_limit,
+        stage3_seed_limit.clone(),
     )
     .await?;
     let mut successful_plans = Vec::new();
@@ -387,27 +390,24 @@ async fn process_prepared_context_batch(
         }
     }
 
-    let mut fresh_entries = Vec::new();
-    for result in run_prepared_seed_plans(
-        successful_plans,
-        deps,
-        matched_contract_limit,
-        output_dir,
-        seed_pipeline_max_concurrency,
-    )
-    .await
-    {
-        match result {
-            Ok(aggregate) => fresh_entries.push(aggregate),
-            Err(err) => {
-                if first_error.is_none() {
-                    first_error = Some(err);
-                }
-            }
-        }
+    let mut stage3_handles = Vec::new();
+    for prepared in successful_plans {
+        stage3_handles.push(spawn_prepared_seed_plan(
+            prepared,
+            deps.clone(),
+            matched_contract_limit.clone(),
+            output_dir.to_path_buf(),
+        ));
     }
 
-    Ok((fresh_entries, first_error))
+    Ok((stage3_handles, first_error))
+}
+
+async fn abort_stage3_seed_tasks(stage3_handles: &mut Vec<Stage3SeedHandle>) {
+    for handle in stage3_handles.drain(..) {
+        handle.abort();
+        let _ = handle.await;
+    }
 }
 
 pub async fn run_batch(
@@ -438,6 +438,7 @@ pub async fn run_batch(
         request.matched_contract_max_concurrency.max(1),
     ));
     let mut fresh_entries = Vec::new();
+    let mut stage3_handles = Vec::new();
     let mut first_error: Option<AppError> = None;
     let output_dir = request.output_dir.clone();
     let pending_seed_count = pending_seeds.len().max(1);
@@ -445,7 +446,9 @@ pub async fn run_batch(
         .saturating_add(seed_cpu_max_concurrency)
         .saturating_add(request.matched_contract_max_concurrency.max(1))
         .min(pending_seed_count)
+        .min(MAX_SEED_PIPELINE_BACKLOG)
         .max(1);
+    let stage3_seed_limit = Arc::new(Semaphore::new(seed_pipeline_max_concurrency));
     let (context_tx, mut context_rx) =
         mpsc::channel::<Result<PreparedSeedContext, AppError>>(seed_pipeline_max_concurrency);
     let context_request = request.clone();
@@ -493,16 +496,25 @@ pub async fn run_batch(
             match tokio::time::timeout(snapshot_batch_debounce, context_rx.recv()).await {
                 Ok(entry) => entry,
                 Err(_) => {
-                    let (entries, err) = process_prepared_context_batch(
+                    let batch_result = process_prepared_context_batch(
                         &mut ready_contexts,
                         deps,
                         cpu_limit.clone(),
                         matched_contract_limit.clone(),
                         &output_dir,
-                        seed_pipeline_max_concurrency,
+                        stage3_seed_limit.clone(),
                     )
-                    .await?;
-                    fresh_entries.extend(entries);
+                    .await;
+                    let (handles, err) = match batch_result {
+                        Ok(result) => result,
+                        Err(err) => {
+                            context_handle.abort();
+                            abort_stage3_seed_tasks(&mut stage3_handles).await;
+                            let _ = context_handle.await;
+                            return Err(err);
+                        }
+                    };
+                    stage3_handles.extend(handles);
                     if first_error.is_none() {
                         first_error = err;
                     }
@@ -515,16 +527,25 @@ pub async fn run_batch(
             Some(Ok(prepared)) => {
                 ready_contexts.push(prepared);
                 if ready_contexts.len() >= seed_pipeline_max_concurrency {
-                    let (entries, err) = process_prepared_context_batch(
+                    let batch_result = process_prepared_context_batch(
                         &mut ready_contexts,
                         deps,
                         cpu_limit.clone(),
                         matched_contract_limit.clone(),
                         &output_dir,
-                        seed_pipeline_max_concurrency,
+                        stage3_seed_limit.clone(),
                     )
-                    .await?;
-                    fresh_entries.extend(entries);
+                    .await;
+                    let (handles, err) = match batch_result {
+                        Ok(result) => result,
+                        Err(err) => {
+                            context_handle.abort();
+                            abort_stage3_seed_tasks(&mut stage3_handles).await;
+                            let _ = context_handle.await;
+                            return Err(err);
+                        }
+                    };
+                    stage3_handles.extend(handles);
                     if first_error.is_none() {
                         first_error = err;
                     }
@@ -539,16 +560,25 @@ pub async fn run_batch(
         }
     }
 
-    let (entries, err) = process_prepared_context_batch(
+    let batch_result = process_prepared_context_batch(
         &mut ready_contexts,
         deps,
         cpu_limit.clone(),
         matched_contract_limit.clone(),
         &output_dir,
-        seed_pipeline_max_concurrency,
+        stage3_seed_limit.clone(),
     )
-    .await?;
-    fresh_entries.extend(entries);
+    .await;
+    let (handles, err) = match batch_result {
+        Ok(result) => result,
+        Err(err) => {
+            context_handle.abort();
+            abort_stage3_seed_tasks(&mut stage3_handles).await;
+            let _ = context_handle.await;
+            return Err(err);
+        }
+    };
+    stage3_handles.extend(handles);
     if first_error.is_none() {
         first_error = err;
     }
@@ -557,6 +587,23 @@ pub async fn run_batch(
         let app_error = AppError::InvalidData(format!("seed context task failed: {err}"));
         if first_error.is_none() {
             first_error = Some(app_error);
+        }
+    }
+
+    for handle in stage3_handles {
+        match handle.await {
+            Ok(Ok(aggregate)) => fresh_entries.push(aggregate),
+            Ok(Err(err)) => {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+            Err(err) => {
+                let app_error = AppError::InvalidData(format!("stage3 seed task failed: {err}"));
+                if first_error.is_none() {
+                    first_error = Some(app_error);
+                }
+            }
         }
     }
 

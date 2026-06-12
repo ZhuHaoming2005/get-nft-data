@@ -885,9 +885,9 @@ async fn fetch_seed_contract_nfts_stops_after_max_seed_nft_limit() {
         .unwrap();
     server.await.unwrap();
 
-    assert_eq!(rows.len(), 99_999);
+    assert_eq!(rows.len(), 100_000);
     assert_eq!(rows[0].token_id, "1");
-    assert_eq!(rows[99_998].token_id, "99999");
+    assert_eq!(rows[99_999].token_id, "100000");
 }
 
 #[tokio::test]
