@@ -859,6 +859,38 @@ async fn fetch_seed_contract_nfts_paginates_until_page_key_is_empty() {
 }
 
 #[tokio::test]
+async fn fetch_seed_contract_nfts_stops_after_max_seed_nft_limit() {
+    let nfts = (1..=100_000)
+        .map(|token_id| {
+            serde_json::json!({
+                "contract": {"address": "0xseed"},
+                "tokenId": token_id.to_string(),
+                "name": format!("Seed #{token_id}")
+            })
+        })
+        .collect::<Vec<_>>();
+    let (base_url, server) = spawn_sequential_json_server(vec![(
+        "/nft/v3/key/getNFTsForContract?contractAddress=0xseed&withMetadata=true".to_string(),
+        serde_json::json!({
+            "nfts": nfts,
+            "pageKey": "next-page"
+        }),
+    )])
+    .await;
+
+    let client = test_client();
+    let endpoints = test_endpoints(&base_url);
+    let rows = fetch_seed_contract_nfts(&client, &endpoints, "ethereum", "0xseed")
+        .await
+        .unwrap();
+    server.await.unwrap();
+
+    assert_eq!(rows.len(), 99_999);
+    assert_eq!(rows[0].token_id, "1");
+    assert_eq!(rows[99_998].token_id, "99999");
+}
+
+#[tokio::test]
 async fn fetch_seed_contract_nfts_reads_current_v3_top_level_token_id() {
     let (base_url, server) = spawn_sequential_json_server(vec![(
         "/nft/v3/key/getNFTsForContract?contractAddress=0xseed&withMetadata=true".to_string(),

@@ -13,6 +13,8 @@ use crate::normalize::build_nft_metadata_json;
 
 use super::etherscan::fetch_etherscan_contract_transfers;
 
+const MAX_SEED_CONTRACT_NFTS: usize = 100_000;
+
 fn normalize_token_id(raw: Option<&Value>) -> String {
     let Some(raw) = raw else {
         return String::new();
@@ -137,6 +139,9 @@ pub async fn fetch_seed_contract_nfts(
             .into_iter()
             .flatten()
         {
+            if rows.len() >= MAX_SEED_CONTRACT_NFTS {
+                return Ok(rows);
+            }
             let token_uri = raw
                 .get("tokenUri")
                 .and_then(|value| {
@@ -195,6 +200,9 @@ pub async fn fetch_seed_contract_nfts(
                 image_uri,
                 metadata_json,
             });
+        }
+        if rows.len() >= MAX_SEED_CONTRACT_NFTS {
+            return Ok(rows);
         }
         page_key = advance_page_key(
             &mut seen_page_keys,
