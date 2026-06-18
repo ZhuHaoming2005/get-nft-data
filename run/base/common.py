@@ -75,6 +75,10 @@ START_BLOCK      = int(os.getenv("START_BLOCK", "0"))
 END_BLOCK        = int(os.getenv("END_BLOCK", "0"))
 BLOCK_BATCH_SIZE = int(os.getenv("BLOCK_BATCH_SIZE", "2000"))
 REQUEST_DELAY    = float(os.getenv("REQUEST_DELAY", "0.1"))
+REQUEST_STARTUP_STAGGER_SECONDS = max(
+    0.0,
+    float(os.getenv("REQUEST_STARTUP_STAGGER_SECONDS", "0")),
+)
 
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = int(os.getenv("DB_PORT", "5432"))
@@ -150,6 +154,19 @@ def load_blacklist() -> Set[str]:
         a = part.strip()
         if a.startswith("0x"):
             out.add(a.lower())
+    try:
+        with open(".env", "r", encoding="utf-8") as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped.startswith("DEFI_BLACKLIST="):
+                    continue
+                for part in stripped[len("DEFI_BLACKLIST="):].split(","):
+                    a = part.strip()
+                    if a.startswith("0x"):
+                        out.add(a.lower())
+                break
+    except FileNotFoundError:
+        pass
     return out
 
 
@@ -475,8 +492,9 @@ def delete_temp_nfts(conn, chain_name: str, ids: List[int]) -> int:
     if not ids:
         return 0
     tmp = _temp_table_name(chain_name)
+    ordered_ids = sorted(set(ids))
     with conn.cursor() as cur:
-        cur.execute(f"DELETE FROM {tmp} WHERE id = ANY(%s)", (ids,))
+        cur.execute(f"DELETE FROM {tmp} WHERE id = ANY(%s)", (ordered_ids,))
         deleted = cur.rowcount
     conn.commit()
     return deleted
@@ -502,7 +520,11 @@ def release_temp_claims(conn, chain_name: str, ids: List[int], worker_id: str) -
 
 
 def delete_contract_nfts(
-    conn, chain_name: str, contract_addrs: Set[str]
+    conn,
+    chain_name: str,
+    contract_addrs: Set[str],
+    *,
+    skip_temp_ids: Optional[List[int]] = None,
 ) -> Tuple[int, int]:
     """
     从主表和临时表中删除指定合约的全部记录（按合约地址批量删除）。
@@ -517,7 +539,39 @@ def delete_contract_nfts(
     with conn.cursor() as cur:
         cur.execute(f"DELETE FROM {tbl} WHERE contract_address = ANY(%s)", (addrs,))
         main_del = cur.rowcount
-        cur.execute(f"DELETE FROM {tmp} WHERE contract_address = ANY(%s)", (addrs,))
+        if skip_temp_ids:
+            cur.execute(
+                f"""
+                WITH locked_rows AS (
+                    SELECT id
+                    FROM {tmp}
+                    WHERE contract_address = ANY(%s)
+                      AND id <> ALL(%s)
+                    ORDER BY id
+                    FOR UPDATE SKIP LOCKED
+                )
+                DELETE FROM {tmp} AS t
+                USING locked_rows
+                WHERE t.id = locked_rows.id
+                """,
+                (addrs, sorted(set(skip_temp_ids))),
+            )
+        else:
+            cur.execute(
+                f"""
+                WITH locked_rows AS (
+                    SELECT id
+                    FROM {tmp}
+                    WHERE contract_address = ANY(%s)
+                    ORDER BY id
+                    FOR UPDATE SKIP LOCKED
+                )
+                DELETE FROM {tmp} AS t
+                USING locked_rows
+                WHERE t.id = locked_rows.id
+                """,
+                (addrs,),
+            )
         temp_del = cur.rowcount
     conn.commit()
     return main_del, temp_del
@@ -684,6 +738,8 @@ async def fetch_alchemy_batch(
     session: aiohttp.ClientSession,
     sem: asyncio.Semaphore,
     tokens: List[Tuple[str, int, str]],
+    *,
+    startup_delay_seconds: float = 0.0,
 ) -> List[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[Any]]]:
     """
     调用 Alchemy getNFTMetadataBatch，批量获取 NFT 元数据。
@@ -716,28 +772,30 @@ async def fetch_alchemy_batch(
     )
 
     max_retries = 3
-    async with sem:
-        data = None
-        for attempt in range(1, max_retries + 1):
-            try:
+    data = None
+    if startup_delay_seconds > 0:
+        await asyncio.sleep(startup_delay_seconds)
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with sem:
                 async with session.post(url, json=payload, timeout=timeout) as resp:
                     resp.raise_for_status()
                     data = await resp.json(content_type=None)
-                break
-            except Exception as exc:
-                if attempt < max_retries:
-                    wait = 2 ** (attempt - 1)  # 1s, 2s
-                    logger.warning(
-                        "Alchemy batch 第 %d/%d 次失败 %d tokens: [%s] %s，%.0fs 后重试",
-                        attempt, max_retries, len(tokens), type(exc).__name__, exc, wait,
-                    )
-                    await asyncio.sleep(wait)
-                else:
-                    logger.info(
-                        "Alchemy batch 全部重试失败（%d 次）%d tokens: [%s] %s",
-                        max_retries, len(tokens), type(exc).__name__, exc,
-                    )
-                    return [(None, None, None, None, None)] * len(tokens)
+            break
+        except Exception as exc:
+            if attempt < max_retries:
+                wait = 2 ** (attempt - 1)  # 1s, 2s
+                logger.warning(
+                    "Alchemy batch 第 %d/%d 次失败 %d tokens: [%s] %s，%.0fs 后重试",
+                    attempt, max_retries, len(tokens), type(exc).__name__, exc, wait,
+                )
+                await asyncio.sleep(wait)
+            else:
+                logger.info(
+                    "Alchemy batch 全部重试失败（%d 次）%d tokens: [%s] %s",
+                    max_retries, len(tokens), type(exc).__name__, exc,
+                )
+                return [(None, None, None, None, None)] * len(tokens)
 
     nft_list = data if isinstance(data, list) else data.get("nfts", [])
     results: List[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[Any]]] = []
@@ -835,6 +893,8 @@ async def fetch_token_uri_batch(
     rpc_url: str,
     sem: asyncio.Semaphore,
     tokens: List[Tuple[str, int, str]],
+    *,
+    startup_delay_seconds: float = 0.0,
 ) -> List[Optional[str]]:
     """通过单次 JSON-RPC batch eth_call 批量获取 tokenURI/uri。"""
     if not tokens:
@@ -860,30 +920,32 @@ async def fetch_token_uri_batch(
     )
 
     max_retries = 3
-    async with sem:
-        data = None
-        for attempt in range(1, max_retries + 1):
-            try:
+    data = None
+    if startup_delay_seconds > 0:
+        await asyncio.sleep(startup_delay_seconds)
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with sem:
                 async with session.post(rpc_url, json=payload, timeout=timeout) as resp:
                     resp.raise_for_status()
                     data = await resp.json(content_type=None)
                 if not isinstance(data, list):
                     raise ValueError("RPC batch response is not a list")
-                break
-            except Exception as exc:
-                if attempt < max_retries:
-                    wait = 2 ** (attempt - 1)
-                    logger.warning(
-                        "RPC batch 第 %d/%d 次失败 %d tokens: [%s] %s，%.0fs 后重试",
-                        attempt, max_retries, len(tokens), type(exc).__name__, exc, wait,
-                    )
-                    await asyncio.sleep(wait)
-                else:
-                    logger.info(
-                        "RPC batch 全部重试失败（%d 次）%d tokens: [%s] %s",
-                        max_retries, len(tokens), type(exc).__name__, exc,
-                    )
-                    return [None] * len(tokens)
+            break
+        except Exception as exc:
+            if attempt < max_retries:
+                wait = 2 ** (attempt - 1)
+                logger.warning(
+                    "RPC batch 第 %d/%d 次失败 %d tokens: [%s] %s，%.0fs 后重试",
+                    attempt, max_retries, len(tokens), type(exc).__name__, exc, wait,
+                )
+                await asyncio.sleep(wait)
+            else:
+                logger.info(
+                    "RPC batch 全部重试失败（%d 次）%d tokens: [%s] %s",
+                    max_retries, len(tokens), type(exc).__name__, exc,
+                )
+                return [None] * len(tokens)
 
     results: List[Optional[str]] = [None] * len(tokens)
     for item in data:
@@ -1037,12 +1099,16 @@ async def fetch_logs_http(
     rpc_url: str,
     from_block: int,
     to_block: int,
+    *,
+    startup_delay_seconds: float = 0.0,
 ) -> list:
     """
     直接通过 aiohttp 并发请求三种 topic 的 eth_getLogs。
     与 fetch_logs（依赖 web3.py AsyncHTTPProvider）相比，
     此函数中每个 topic 请求独占连接池中的一条连接，HTTP 层真正并发。
     """
+    if startup_delay_seconds > 0:
+        await asyncio.sleep(startup_delay_seconds)
     results = await asyncio.gather(*[
         _fetch_logs_one_topic_http(
             session, rpc_url, from_block, to_block, topic, _TOPIC_LABEL[topic]
