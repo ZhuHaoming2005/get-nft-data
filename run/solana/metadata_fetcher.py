@@ -24,7 +24,7 @@
 
 import asyncio
 import sys
-from typing import List, Optional, Set, Tuple
+from typing import Any, List, Optional, Set, Tuple
 
 import aiohttp
 
@@ -81,16 +81,17 @@ async def _process_batch(
         for chunk in chunks
     ]))
 
-    # 每项结果为 (token_uri, image_url, name, symbol) 4-元组
-    results: List[Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]] = [
+    # 每项结果为 (token_uri, image_url, name, symbol, metadata) 5-元组
+    results: List[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[Any]]] = [
         item for chunk in chunk_results for item in chunk
     ]
 
-    # 组装有效记录（包含 name / symbol）
+    # 组装有效记录（包含 name / symbol / metadata），顺序与 EVM batch_insert_main 对齐
     inserts: List[Tuple] = []
-    for (_, mint, token_id, std, first_seen_slot), (token_uri, image_url, name, symbol) in zip(
-        pending, results
-    ):
+    for (
+        (_, mint, token_id, std, first_seen_slot),
+        (token_uri, image_url, name, symbol, metadata),
+    ) in zip(pending, results):
         if not isinstance(image_url, str):
             continue
         if image_url and image_url.startswith("data:image"):
@@ -99,7 +100,7 @@ async def _process_batch(
             continue
         inserts.append((
             mint, token_id, token_uri, image_url,
-            name, symbol,
+            name, symbol, metadata,
             std or "Metaplex", first_seen_slot,
         ))
 

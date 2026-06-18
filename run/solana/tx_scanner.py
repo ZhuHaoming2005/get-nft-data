@@ -155,7 +155,7 @@ async def main() -> None:
         total_pages += 1
 
         # ── 处理本页 mint ─────────────────────────────────────────────────
-        records: List[Tuple] = [(mint, "1", "Metaplex", 0) for mint in mints]
+        records: List[Tuple] = [(mint, 1, "Metaplex", 0) for mint in mints]
 
         # ── 写库（线程池，不阻塞事件循环）───────────────────────────────────
         inserted = await asyncio.to_thread(
