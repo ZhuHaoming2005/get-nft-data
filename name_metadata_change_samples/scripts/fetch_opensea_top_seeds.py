@@ -16,9 +16,9 @@ from urllib.request import Request, urlopen
 
 
 DEFAULT_TRENDING_COLLECTIONS_URL = (
-    "https://api.opensea.io/api/v2/collections/top"
+    "https://api.opensea.io/api/v2/collections/trending"
 )
-DEFAULT_TIMEFRAME = "thirty_days_volume"
+DEFAULT_TIMEFRAME = "thirty_days"
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 COLLECTION_KEYS = ("collections", "top_collections", "data", "results")
 CONTRACT_LIST_KEYS = ("contracts", "primary_asset_contracts", "asset_contracts")
