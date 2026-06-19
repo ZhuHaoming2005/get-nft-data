@@ -160,28 +160,6 @@ def _batch_startup_delay(batch_index: int) -> float:
     return REQUEST_STARTUP_STAGGER_SECONDS * max(batch_index - 1, 0)
 
 
-async def _gather_all_or_raise(awaitables):
-    tasks = [asyncio.create_task(awaitable) for awaitable in awaitables]
-    if not tasks:
-        return []
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    for result in results:
-        if isinstance(result, BaseException):
-            raise result
-    return results
-
-
-def _worker_concurrency_limit(total_limit: int, worker_index: int, worker_count: int) -> int:
-    total_limit = max(int(total_limit), 1)
-    worker_count = max(int(worker_count), 1)
-    worker_index = max(int(worker_index), 1)
-    if total_limit < worker_count:
-        return 1 if worker_index <= total_limit else 0
-    base = total_limit // worker_count
-    remainder = total_limit % worker_count
-    return base + (1 if worker_index <= remainder else 0)
-
-
 async def _process_batch(
     session: aiohttp.ClientSession,
     w3: AsyncWeb3,
@@ -207,7 +185,7 @@ async def _process_batch(
         tokens[i: i + ALCHEMY_BATCH_SIZE]
         for i in range(0, len(tokens), ALCHEMY_BATCH_SIZE)
     ]
-    chunk_results = await _gather_all_or_raise([
+    chunk_results = await asyncio.gather(*[
         fetch_alchemy_batch(
             session,
             alchemy_sem,
@@ -231,7 +209,7 @@ async def _process_batch(
             fallback_tokens[i: i + RPC_BATCH_SIZE]
             for i in range(0, len(fallback_tokens), RPC_BATCH_SIZE)
         ]
-        chunk_uris = await _gather_all_or_raise([
+        chunk_uris = await asyncio.gather(*[
             fetch_token_uri_batch(
                 session,
                 RPC_URL,
@@ -245,7 +223,7 @@ async def _process_batch(
 
         missing_positions = [pos for pos, uri in enumerate(fallback_uris) if not uri]
         if missing_positions:
-            legacy_uris: List[Optional[str]] = list(await _gather_all_or_raise([
+            legacy_uris: List[Optional[str]] = list(await asyncio.gather(*[
                 fetch_token_uri(
                     w3,
                     uri_sem,
@@ -339,28 +317,6 @@ async def _worker_main(worker_index: int, stop_event=None) -> None:
         FETCH_CLAIM_BATCH_SIZE,
         CLAIM_RETRY_AFTER_SECONDS,
     )
-    worker_count = FETCHER_WORKERS if FETCHER_WORKERS > 1 else 1
-    alchemy_limit = _worker_concurrency_limit(
-        CONCURRENT_ALCHEMY,
-        worker_index,
-        worker_count,
-    )
-    rpc_limit = _worker_concurrency_limit(
-        CONCURRENT_RPC,
-        worker_index,
-        worker_count,
-    )
-    logger.info(
-        "worker=%s 有效并发: Alchemy=%d/%d, RPC=%d/%d",
-        worker_id,
-        alchemy_limit,
-        CONCURRENT_ALCHEMY,
-        rpc_limit,
-        CONCURRENT_RPC,
-    )
-    if alchemy_limit <= 0 or rpc_limit <= 0:
-        logger.info("worker=%s 无有效 API 并发配额，退出", worker_id)
-        return
 
     conn = None
     pending_ids: List[int] = []
@@ -378,9 +334,9 @@ async def _worker_main(worker_index: int, stop_event=None) -> None:
             logger.info("历史记录 {id} 占位符修复完成，共更新 %d 条", fixed)
 
         total_inserted = total_deleted = 0
-        alchemy_sem = asyncio.Semaphore(alchemy_limit)
-        uri_sem = asyncio.Semaphore(rpc_limit)
-        connector = aiohttp.TCPConnector(limit=max((alchemy_limit + rpc_limit) * 2, 20), ttl_dns_cache=300)
+        alchemy_sem = asyncio.Semaphore(CONCURRENT_ALCHEMY)
+        uri_sem = asyncio.Semaphore(CONCURRENT_RPC)
+        connector = aiohttp.TCPConnector(limit=max(CONCURRENT_ALCHEMY * 2, 20), ttl_dns_cache=300)
 
         async with aiohttp.ClientSession(
             trust_env=True,

@@ -6,12 +6,9 @@
 
 import asyncio
 import base64
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 import json as _json
 import logging
 import os
-import random
 import re
 import sys
 from typing import Any, List, Optional, Set, Tuple
@@ -82,19 +79,6 @@ REQUEST_STARTUP_STAGGER_SECONDS = max(
     0.0,
     float(os.getenv("REQUEST_STARTUP_STAGGER_SECONDS", "0")),
 )
-API_MAX_RETRIES = max(1, int(os.getenv("API_MAX_RETRIES", "3")))
-API_RETRY_BASE_DELAY_SECONDS = max(
-    0.0,
-    float(os.getenv("API_RETRY_BASE_DELAY_SECONDS", "1")),
-)
-API_RETRY_MAX_DELAY_SECONDS = max(
-    API_RETRY_BASE_DELAY_SECONDS,
-    float(os.getenv("API_RETRY_MAX_DELAY_SECONDS", "30")),
-)
-API_RETRY_JITTER_SECONDS = max(
-    0.0,
-    float(os.getenv("API_RETRY_JITTER_SECONDS", "0.25")),
-)
 
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = int(os.getenv("DB_PORT", "5432"))
@@ -126,69 +110,6 @@ FETCH_IDLE_WAIT  = int(os.getenv("FETCH_IDLE_WAIT", "30"))
 _ERC721_TOKEN_URI_SELECTOR = "c87b56dd"
 _ERC1155_URI_SELECTOR = "0e89341c"
 DB_INSERT_PAGE_SIZE = int(os.getenv("DB_INSERT_PAGE_SIZE", "1000"))
-
-
-class ApiRequestError(RuntimeError):
-    """Raised when an upstream API/RPC request failed and must not be treated as empty data."""
-
-    def __init__(self, message: str, *, retry_after_seconds: Optional[float] = None):
-        super().__init__(message)
-        self.retry_after_seconds = retry_after_seconds
-
-
-def _parse_retry_after_seconds(value: Optional[str]) -> Optional[float]:
-    if not value:
-        return None
-    text = value.strip()
-    if not text:
-        return None
-    try:
-        return max(0.0, float(text))
-    except ValueError:
-        pass
-    try:
-        parsed = parsedate_to_datetime(text)
-    except (TypeError, ValueError):
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds())
-
-
-def _response_retry_after_seconds(resp) -> Optional[float]:
-    headers = getattr(resp, "headers", None)
-    if not headers:
-        return None
-    getter = getattr(headers, "get", None)
-    return _parse_retry_after_seconds(getter("Retry-After") if callable(getter) else None)
-
-
-def _raise_for_bad_response(resp, label: str) -> None:
-    status = getattr(resp, "status", None)
-    if isinstance(status, int) and status >= 400:
-        raise ApiRequestError(
-            f"{label} HTTP {status}",
-            retry_after_seconds=_response_retry_after_seconds(resp),
-        )
-    raise_for_status = getattr(resp, "raise_for_status", None)
-    if callable(raise_for_status):
-        try:
-            raise_for_status()
-        except Exception as exc:
-            raise ApiRequestError(f"{label} HTTP request failed: {exc}") from exc
-
-
-def _retry_delay_seconds(attempt: int, exc: Exception) -> float:
-    retry_after = getattr(exc, "retry_after_seconds", None)
-    if retry_after is not None:
-        return float(retry_after)
-    delay = min(
-        API_RETRY_MAX_DELAY_SECONDS,
-        API_RETRY_BASE_DELAY_SECONDS * (2 ** max(attempt - 1, 0)),
-    )
-    if API_RETRY_JITTER_SECONDS > 0:
-        delay += random.uniform(0.0, API_RETRY_JITTER_SECONDS)
-    return delay
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -850,7 +771,7 @@ async def fetch_alchemy_batch(
         total=METADATA_TIMEOUT, connect=METADATA_CONNECT_TIMEOUT
     )
 
-    max_retries = API_MAX_RETRIES
+    max_retries = 3
     data = None
     if startup_delay_seconds > 0:
         await asyncio.sleep(startup_delay_seconds)
@@ -858,25 +779,23 @@ async def fetch_alchemy_batch(
         try:
             async with sem:
                 async with session.post(url, json=payload, timeout=timeout) as resp:
-                    _raise_for_bad_response(resp, "Alchemy batch")
+                    resp.raise_for_status()
                     data = await resp.json(content_type=None)
             break
         except Exception as exc:
             if attempt < max_retries:
-                wait = _retry_delay_seconds(attempt, exc)
+                wait = 2 ** (attempt - 1)  # 1s, 2s
                 logger.warning(
                     "Alchemy batch 第 %d/%d 次失败 %d tokens: [%s] %s，%.0fs 后重试",
                     attempt, max_retries, len(tokens), type(exc).__name__, exc, wait,
                 )
                 await asyncio.sleep(wait)
             else:
-                logger.warning(
+                logger.info(
                     "Alchemy batch 全部重试失败（%d 次）%d tokens: [%s] %s",
                     max_retries, len(tokens), type(exc).__name__, exc,
                 )
-                raise ApiRequestError(
-                    f"Alchemy batch failed after {max_retries} attempts for {len(tokens)} tokens: {exc}"
-                ) from exc
+                return [(None, None, None, None, None)] * len(tokens)
 
     nft_list = data if isinstance(data, list) else data.get("nfts", [])
     results: List[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[Any]]] = []
@@ -920,45 +839,20 @@ async def fetch_token_uri(
     standard: str,
 ) -> Optional[str]:
     """异步调用链上合约获取 tokenURI（ERC-721）或 uri（ERC-1155）。"""
-    for attempt in range(1, API_MAX_RETRIES + 1):
+    async with sem:
         try:
-            async with sem:
-                addr = AsyncWeb3.to_checksum_address(contract_address)
-                if standard == "ERC-721":
-                    contract = w3.eth.contract(address=addr, abi=ERC721_ABI)
-                    uri = await contract.functions.tokenURI(token_id).call()
-                else:
-                    contract = w3.eth.contract(address=addr, abi=ERC1155_ABI)
-                    uri = await contract.functions.uri(token_id).call()
-            if uri and "{id}" in uri:
-                uri = replace_token_id_placeholder(uri, token_id)
-            return uri
-        except Exception as exc:
-            if attempt < API_MAX_RETRIES:
-                wait = _retry_delay_seconds(attempt, exc)
-                logger.warning(
-                    "RPC legacy call 第 %d/%d 次失败 %s:%s [%s] %s，%.0fs 后重试",
-                    attempt,
-                    API_MAX_RETRIES,
-                    contract_address,
-                    token_id,
-                    type(exc).__name__,
-                    exc,
-                    wait,
-                )
-                await asyncio.sleep(wait)
+            addr = AsyncWeb3.to_checksum_address(contract_address)
+            if standard == "ERC-721":
+                contract = w3.eth.contract(address=addr, abi=ERC721_ABI)
+                uri = await contract.functions.tokenURI(token_id).call()
             else:
-                logger.warning(
-                    "RPC legacy call 全部重试失败（%d 次）%s:%s [%s] %s",
-                    API_MAX_RETRIES,
-                    contract_address,
-                    token_id,
-                    type(exc).__name__,
-                    exc,
-                )
-                raise ApiRequestError(
-                    f"RPC legacy call failed after {API_MAX_RETRIES} attempts for {contract_address}:{token_id}: {exc}"
-                ) from exc
+                contract = w3.eth.contract(address=addr, abi=ERC1155_ABI)
+                uri = await contract.functions.uri(token_id).call()
+            if uri and "{id}" in uri:
+                uri = uri.replace("{id}", str(token_id))
+            return uri
+        except Exception:
+            return None
 
 
 def _build_token_uri_call_data(token_id: int, standard: str) -> str:
@@ -1025,7 +919,7 @@ async def fetch_token_uri_batch(
         total=METADATA_TIMEOUT, connect=METADATA_CONNECT_TIMEOUT
     )
 
-    max_retries = API_MAX_RETRIES
+    max_retries = 3
     data = None
     if startup_delay_seconds > 0:
         await asyncio.sleep(startup_delay_seconds)
@@ -1033,27 +927,25 @@ async def fetch_token_uri_batch(
         try:
             async with sem:
                 async with session.post(rpc_url, json=payload, timeout=timeout) as resp:
-                    _raise_for_bad_response(resp, "RPC batch")
+                    resp.raise_for_status()
                     data = await resp.json(content_type=None)
                 if not isinstance(data, list):
                     raise ValueError("RPC batch response is not a list")
             break
         except Exception as exc:
             if attempt < max_retries:
-                wait = _retry_delay_seconds(attempt, exc)
+                wait = 2 ** (attempt - 1)
                 logger.warning(
                     "RPC batch 第 %d/%d 次失败 %d tokens: [%s] %s，%.0fs 后重试",
                     attempt, max_retries, len(tokens), type(exc).__name__, exc, wait,
                 )
                 await asyncio.sleep(wait)
             else:
-                logger.warning(
+                logger.info(
                     "RPC batch 全部重试失败（%d 次）%d tokens: [%s] %s",
                     max_retries, len(tokens), type(exc).__name__, exc,
                 )
-                raise ApiRequestError(
-                    f"RPC batch failed after {max_retries} attempts for {len(tokens)} tokens: {exc}"
-                ) from exc
+                return [None] * len(tokens)
 
     results: List[Optional[str]] = [None] * len(tokens)
     for item in data:
@@ -1067,7 +959,7 @@ async def fetch_token_uri_batch(
 
         uri = _decode_abi_string_result(item.get("result"))
         if uri and "{id}" in uri:
-            uri = replace_token_id_placeholder(uri, tokens[idx][1])
+            uri = uri.replace("{id}", str(tokens[idx][1]))
         results[idx] = uri
     return results
 
@@ -1176,31 +1068,17 @@ async def _fetch_logs_one_topic_http(
         "id":      1,
     }
     timeout = aiohttp.ClientTimeout(total=120)
-    body = None
-    for attempt in range(1, API_MAX_RETRIES + 1):
-        try:
-            async with session.post(rpc_url, json=payload, timeout=timeout) as resp:
-                _raise_for_bad_response(resp, f"{label.strip()} eth_getLogs")
-                body = await resp.json(content_type=None)
-            if "error" in body:
-                raise ApiRequestError(f"{label.strip()} eth_getLogs RPC error: {body['error']}")
-            break
-        except Exception as exc:
-            if attempt < API_MAX_RETRIES:
-                wait = _retry_delay_seconds(attempt, exc)
-                logger.warning(
-                    "    %s → eth_getLogs 第 %d/%d 次失败: %s，%.0fs 后重试",
-                    label, attempt, API_MAX_RETRIES, exc, wait,
-                )
-                await asyncio.sleep(wait)
-            else:
-                logger.warning(
-                    "    %s → eth_getLogs 全部重试失败（%d 次）: %s",
-                    label, API_MAX_RETRIES, exc,
-                )
-                raise ApiRequestError(
-                    f"{label.strip()} eth_getLogs failed after {API_MAX_RETRIES} attempts: {exc}"
-                ) from exc
+    try:
+        async with session.post(rpc_url, json=payload, timeout=timeout) as resp:
+            resp.raise_for_status()
+            body = await resp.json(content_type=None)
+    except Exception as exc:
+        logger.warning("    %s → eth_getLogs 失败: %s", label, exc)
+        return []
+
+    if "error" in body:
+        logger.warning("    %s → RPC 错误: %s", label, body["error"])
+        return []
 
     raw_logs = body.get("result") or []
     logs = [_parse_raw_log(r) for r in raw_logs]
