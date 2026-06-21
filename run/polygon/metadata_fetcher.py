@@ -4,11 +4,11 @@
 
 持续从临时表（temp_{chain}）读取扫描阶段原始记录，通过 Alchemy API 批量获取元数据：
   - 获取成功（token_uri 非空且合法）→ 写入主表 nft_assets_{chain}
-  - 获取失败（Alchemy 空 + 链上合约也为空）→ 不写主表
+  - 获取失败（Alchemy 返回 token_uri 为空或非法）→ 不写主表
   - 无论结果如何，处理完的记录全部从临时表删除
   - 临时表记录不足 100 条时等待 FETCH_IDLE_WAIT 秒后重试
 
-全程使用异步加速网络 IO（Alchemy 批量 + RPC 并发）。
+全程使用异步加速 Alchemy 批量网络 IO。
 """
 
 import asyncio
@@ -23,16 +23,11 @@ from contextlib import contextmanager
 from typing import List, Optional, Set, Tuple
 
 import aiohttp
-from web3 import AsyncWeb3
-from web3.providers import AsyncHTTPProvider
 
 from common import (
     CHAIN_NAME,
-    RPC_URL,
     ALCHEMY_BATCH_SIZE,
     CONCURRENT_ALCHEMY,
-    CONCURRENT_RPC,
-    RPC_BATCH_SIZE,
     FETCH_IDLE_WAIT,
     FETCH_CLAIM_BATCH_SIZE,
     CLAIM_RETRY_AFTER_SECONDS,
@@ -48,8 +43,6 @@ from common import (
     append_blacklist_env,
     load_blacklist,
     fetch_alchemy_batch,
-    fetch_token_uri_batch,
-    fetch_token_uri,
     _decode_inline_image,
     replace_token_id_placeholder,
     fix_token_id_placeholders,
@@ -162,9 +155,7 @@ def _batch_startup_delay(batch_index: int) -> float:
 
 async def _process_batch(
     session: aiohttp.ClientSession,
-    w3: AsyncWeb3,
     alchemy_sem: asyncio.Semaphore,
-    uri_sem: asyncio.Semaphore,
     pending: List[Tuple],
 ) -> Tuple[List[Tuple], List[int], Set[str]]:
     """
@@ -201,49 +192,10 @@ async def _process_batch(
         item for chunk in chunk_results for item in chunk
     ]
 
-    # ── 步骤2：tokenUri 为空时 fallback 到链上合约（异步并发）──────────────────
-    fallback_indices = [i for i, (uri, _, _, _, _) in enumerate(alchemy_results) if not uri]
-    if fallback_indices:
-        fallback_tokens = [tokens[i] for i in fallback_indices]
-        rpc_chunks = [
-            fallback_tokens[i: i + RPC_BATCH_SIZE]
-            for i in range(0, len(fallback_tokens), RPC_BATCH_SIZE)
-        ]
-        chunk_uris = await asyncio.gather(*[
-            fetch_token_uri_batch(
-                session,
-                RPC_URL,
-                uri_sem,
-                chunk,
-                startup_delay_seconds=_batch_startup_delay(batch_index),
-            )
-            for batch_index, chunk in enumerate(rpc_chunks, start=1)
-        ])
-        fallback_uris = [uri for chunk in chunk_uris for uri in chunk]
-
-        missing_positions = [pos for pos, uri in enumerate(fallback_uris) if not uri]
-        if missing_positions:
-            legacy_uris: List[Optional[str]] = list(await asyncio.gather(*[
-                fetch_token_uri(
-                    w3,
-                    uri_sem,
-                    fallback_tokens[pos][0],
-                    fallback_tokens[pos][1],
-                    fallback_tokens[pos][2],
-                )
-                for pos in missing_positions
-            ]))
-            for pos, uri in zip(missing_positions, legacy_uris):
-                fallback_uris[pos] = uri
-
-        for idx, chain_uri in zip(fallback_indices, fallback_uris):
-            _, img, name, symbol, metadata = alchemy_results[idx]
-            alchemy_results[idx] = (chain_uri, img, name, symbol, metadata)
-
-    # ── 步骤2.5：解码链上内嵌 data URI，提取 image_url ──────────────────────────
-    # token_uri 为 data:application/... 格式时（链上存储的 JSON 元数据），
+    # ── 步骤2：解码内嵌 data URI，提取 image_url ──────────────────────────────
+    # Alchemy token_uri 为 data:application/... 格式时（链上存储的 JSON 元数据），
     # base64 解码后提取 image 字段写回 alchemy_results，
-    # 供后续步骤3统一检测 data:image 链上图像并加入黑名单。
+    # 供后续步骤统一检测 data:image 链上图像并加入黑名单。
     for i, (token_uri, image_url, name, symbol, metadata) in enumerate(alchemy_results):
         if image_url is not None and not isinstance(image_url, str):
             image_url = None
@@ -253,9 +205,8 @@ async def _process_batch(
             if decoded_img:
                 alchemy_results[i] = (token_uri, decoded_img, name, symbol, metadata)
 
-    # ── 步骤3：检测链上存储图像（data:image）的 DeFi 合约 ───────────────────────
-    # 若某合约任意 token 的 image_url 以 'data:image' 开头（无论来自 Alchemy
-    # 直接返回，还是步骤2.5从链上 JSON 元数据解码所得），均说明该合约将图像
+    # ── 步骤3：检测链上存储图像（data:image）的 DeFi 合约 ─────────────────────
+    # 若某合约任意 token 的 image_url 以 'data:image' 开头，均说明该合约将图像
     # 直接编码在链上，属于 DeFi/功能性合约，整体加入黑名单。
     onchain_image_contracts: Set[str] = set()
     for (_, addr, _, _, _), (_, image_url, _, _, _) in zip(pending, alchemy_results):
@@ -310,10 +261,9 @@ async def _worker_main(worker_index: int, stop_event=None) -> None:
     await _maybe_wait_worker_startup(worker_index, stop_event)
     worker_id = _build_worker_id(worker_index)
     logger.info(
-        "═══ Metadata 获取器启动 ═══  链: %s | worker=%s | RPC: %s | claim_batch=%d | reclaim_after=%ds",
+        "═══ Metadata 获取器启动 ═══  链: %s | worker=%s | claim_batch=%d | reclaim_after=%ds",
         CHAIN_NAME,
         worker_id,
-        RPC_URL,
         FETCH_CLAIM_BATCH_SIZE,
         CLAIM_RETRY_AFTER_SECONDS,
     )
@@ -321,12 +271,6 @@ async def _worker_main(worker_index: int, stop_event=None) -> None:
     conn = None
     pending_ids: List[int] = []
     try:
-        w3 = AsyncWeb3(AsyncHTTPProvider(RPC_URL, request_kwargs={"timeout": 30}))
-        if not await w3.is_connected():
-            logger.error("无法连接 RPC 节点，请检查 RPC_URL")
-            sys.exit(1)
-        logger.info("RPC 节点连接成功")
-
         conn = get_conn()
 
         fixed = fix_token_id_placeholders(conn, CHAIN_NAME)
@@ -335,7 +279,6 @@ async def _worker_main(worker_index: int, stop_event=None) -> None:
 
         total_inserted = total_deleted = 0
         alchemy_sem = asyncio.Semaphore(CONCURRENT_ALCHEMY)
-        uri_sem = asyncio.Semaphore(CONCURRENT_RPC)
         connector = aiohttp.TCPConnector(limit=max(CONCURRENT_ALCHEMY * 2, 20), ttl_dns_cache=300)
 
         async with aiohttp.ClientSession(
@@ -370,9 +313,7 @@ async def _worker_main(worker_index: int, stop_event=None) -> None:
                 try:
                     inserts, all_ids, onchain_image_contracts = await _process_batch(
                         session,
-                        w3,
                         alchemy_sem,
-                        uri_sem,
                         pending,
                     )
                 except Exception:
@@ -503,10 +444,9 @@ def main() -> None:
             return
 
         logger.info(
-            "启动 %d 个 metadata worker 进程；每进程并发: Alchemy=%d, RPC=%d",
+            "启动 %d 个 metadata worker 进程；每进程并发: Alchemy=%d",
             FETCHER_WORKERS,
             CONCURRENT_ALCHEMY,
-            CONCURRENT_RPC,
         )
         workers = [
             multiprocessing.Process(

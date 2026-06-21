@@ -181,13 +181,6 @@ class MetadataFetcherStartupJitterTests(unittest.IsolatedAsyncioTestCase):
 
 class MetadataFetcherShutdownTests(unittest.IsolatedAsyncioTestCase):
     async def test_worker_releases_claimed_rows_when_interrupted_mid_batch(self):
-        class _FakeAsyncWeb3:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            async def is_connected(self):
-                return True
-
         class _FakeSession:
             async def __aenter__(self):
                 return self
@@ -210,8 +203,6 @@ class MetadataFetcherShutdownTests(unittest.IsolatedAsyncioTestCase):
             raise KeyboardInterrupt()
 
         with patch.object(fetcher, "_maybe_wait_worker_startup"), \
-             patch.object(fetcher, "AsyncWeb3", _FakeAsyncWeb3), \
-             patch.object(fetcher, "AsyncHTTPProvider", lambda *args, **kwargs: object()), \
              patch.object(fetcher, "get_conn", return_value=conn), \
              patch.object(fetcher, "fix_token_id_placeholders", return_value=0), \
              patch.object(fetcher, "claim_pending_nfts", side_effect=[pending]), \
