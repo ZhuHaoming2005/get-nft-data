@@ -17,18 +17,21 @@
   - dataSlice {offset:33, length:32}：只传 mint 字段的 32 字节，节省约 95% 带宽
   - memcmp filter {offset:0, bytes:"5"}：只返回 key=4（MetadataV1）的账户
   - paginationKey 游标：分页拉取，支持断点续扫
-  - changedSinceSlot：全量扫描完成后，后续只拉增量变化账户（极快）
+  - changedSinceSlot：全量扫描完成后，后续只拉增量变化账户，并支持分页断点续扫
   - 流水线：DB 写入与下一页 HTTP 请求并发执行，消除等待空档
 
 配置参数（.env）：
   HELIUS_API_KEY : Helius API Key（必填，getProgramAccountsV2 是 Helius 私有方法）
   GPA_PAGE_SIZE  : 每页账户数（默认 1000，最大 10000）
-  GPA_SINCE_SLOT : 增量起始 Slot（0 = 全量；首次运行留 0，之后由脚本自动管理）
+  GPA_SINCE_SLOT : 增量起始 Slot（0 = 全量/自动；>0 = 指定增量起点）
 """
 
 import asyncio
+import signal
 import sys
-from typing import List, Optional, Tuple
+import threading
+from contextlib import contextmanager
+from typing import List, NamedTuple, Optional, Tuple
 
 import aiohttp
 
@@ -48,7 +51,115 @@ from common import (
 )
 
 
-async def main() -> None:
+class _ScanState(NamedTuple):
+    since_slot: int
+    resume_key: Optional[str]
+    total_pages_base: int
+    mode: str
+
+
+def _is_stop_requested(stop_event) -> bool:
+    return bool(stop_event is not None and stop_event.is_set())
+
+
+@contextmanager
+def _install_stop_signal_handlers(stop_event):
+    handlers = {}
+
+    def _handle_stop(signum, frame):
+        if not _is_stop_requested(stop_event):
+            logger.info("收到停止信号，停止领取新 GPA 页，当前页处理并保存断点后退出...")
+        stop_event.set()
+
+    for sig in (signal.SIGINT, getattr(signal, "SIGTERM", None)):
+        if sig is None:
+            continue
+        try:
+            handlers[sig] = signal.getsignal(sig)
+            signal.signal(sig, _handle_stop)
+        except (OSError, RuntimeError, ValueError):
+            continue
+    try:
+        yield
+    finally:
+        for sig, previous in handlers.items():
+            try:
+                signal.signal(sig, previous)
+            except (OSError, RuntimeError, ValueError):
+                continue
+
+
+def _resolve_scan_state(
+    *,
+    env_since: int,
+    saved_key: Optional[str],
+    saved_since_slot: int,
+    saved_pages: int,
+) -> _ScanState:
+    if env_since > 0:
+        if saved_since_slot > env_since:
+            if saved_key is not None:
+                return _ScanState(
+                    saved_since_slot,
+                    saved_key,
+                    saved_pages,
+                    f"增量断点续扫（DB since={saved_since_slot}，忽略旧 .env since={env_since}）",
+                )
+            return _ScanState(
+                saved_since_slot,
+                None,
+                0,
+                f"增量（DB 记录 since={saved_since_slot}，忽略旧 .env since={env_since}）",
+            )
+        if saved_key is not None and saved_since_slot == env_since:
+            return _ScanState(
+                env_since,
+                saved_key,
+                saved_pages,
+                f"增量断点续扫（since={env_since}）",
+            )
+        return _ScanState(
+            env_since,
+            None,
+            0,
+            f"增量（.env 指定 since={env_since}）",
+        )
+
+    if saved_key is not None:
+        since_slot = saved_since_slot or 0
+        mode = (
+            f"增量断点续扫（since={since_slot}）"
+            if since_slot > 0
+            else "全量断点续扫"
+        )
+        return _ScanState(since_slot, saved_key, saved_pages, mode)
+
+    if saved_since_slot > 0:
+        return _ScanState(
+            saved_since_slot,
+            None,
+            0,
+            f"增量（DB 记录 since={saved_since_slot}）",
+        )
+
+    return _ScanState(0, None, 0, "全量")
+
+
+def _progress_since_slot(
+    *,
+    current_since_slot: int,
+    latest_slot: int,
+    next_key: Optional[str],
+) -> int:
+    if next_key is not None:
+        return current_since_slot
+    if latest_slot > 0:
+        return latest_slot
+    return current_since_slot
+
+
+async def main(stop_event=None) -> None:
+    stop_event = stop_event or threading.Event()
     logger.info("═══ Solana NFT 发现器（GPA）启动 ═══  链: %s", CHAIN_NAME)
 
     # ── 前置检查 ──────────────────────────────────────────────────────────────
@@ -70,36 +181,16 @@ async def main() -> None:
     # ── 读取断点 / 增量起始 Slot ──────────────────────────────────────────────
     saved_key, saved_since_slot, saved_pages = get_gpa_progress(conn, CHAIN_NAME)
 
-    # 优先级：.env GPA_SINCE_SLOT > DB 保存的 since_slot
-    # GPA_SINCE_SLOT=0 且 DB 有记录时，说明上次已完成全量，走增量模式
-    env_since = GPA_SINCE_SLOT  # 来自 .env，0 = 不强制指定
-    if env_since > 0:
-        # .env 显式指定了增量起点，忽略 DB 保存值
-        since_slot       = env_since
-        resume_key       = None      # 增量模式不使用游标断点
-        total_pages_base = 0
-        logger.info("增量模式（.env 指定）: changedSinceSlot=%d", since_slot)
-    elif saved_key is not None:
-        # 上次中断，从游标断点继续全量扫描
-        since_slot       = 0
-        resume_key       = saved_key
-        total_pages_base = saved_pages
-        logger.info(
-            "断点续扫：从 paginationKey 继续全量扫描（已完成 %d 页）",
-            total_pages_base,
-        )
-    elif saved_since_slot > 0:
-        # 上次全量已完成，进入增量模式
-        since_slot       = saved_since_slot
-        resume_key       = None
-        total_pages_base = 0
-        logger.info("增量模式（DB 记录）: changedSinceSlot=%d", since_slot)
-    else:
-        # 首次运行，全量扫描
-        since_slot       = 0
-        resume_key       = None
-        total_pages_base = 0
-        logger.info("首次运行：开始全量扫描")
+    scan_state = _resolve_scan_state(
+        env_since=GPA_SINCE_SLOT,
+        saved_key=saved_key,
+        saved_since_slot=saved_since_slot,
+        saved_pages=saved_pages,
+    )
+    since_slot       = scan_state.since_slot
+    resume_key       = scan_state.resume_key
+    total_pages_base = scan_state.total_pages_base
+    logger.info("扫描起点: %s", scan_state.mode)
 
     # ── 获取当前最新 Slot（全量完成后存入 since_slot 供下次增量用）──────────
     connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300, enable_cleanup_closed=True)
@@ -169,7 +260,11 @@ async def main() -> None:
                 save_gpa_progress,
                 write_conn, CHAIN_NAME,
                 next_key,       # None 表示全量已完成
-                latest_slot if next_key is None else 0,
+                _progress_since_slot(
+                    current_since_slot=since_slot,
+                    latest_slot=latest_slot,
+                    next_key=next_key,
+                ),
                 total_pages,
             )
 
@@ -183,6 +278,12 @@ async def main() -> None:
 
             # ── 判断是否到最后一页 ────────────────────────────────────────────
             if next_key is None:
+                break
+            if _is_stop_requested(stop_event):
+                logger.info(
+                    "═══ 扫描中断退出 ═══  当前页已落库并保存 paginationKey=%s",
+                    next_key,
+                )
                 break
 
             current_key = next_key
@@ -204,8 +305,9 @@ async def main() -> None:
                 total_pages, total_new,
             )
     finally:
-        if prefetch_task is not None and not prefetch_task.done():
-            prefetch_task.cancel()
+        if prefetch_task is not None:
+            if not prefetch_task.done():
+                prefetch_task.cancel()
             await asyncio.gather(prefetch_task, return_exceptions=True)
         await session.close()
         await connector.close()
@@ -216,4 +318,6 @@ async def main() -> None:
 if __name__ == "__main__":
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    asyncio.run(main())
+    _stop_event = threading.Event()
+    with _install_stop_signal_handlers(_stop_event):
+        asyncio.run(main(stop_event=_stop_event))

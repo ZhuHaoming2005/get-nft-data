@@ -10,8 +10,7 @@ NFT 发现策略（tx_scanner.py）：
   → 直接枚举全链 Metaplex MetadataV1 账户 → mint 地址
 
 元数据获取策略（metadata_fetcher.py）：
-  1. 优先：Helius DAS API getAssetBatch（单批 1000 mint）
-  2. 回退：链上 getMultipleAccounts → borsh 解码 → HTTP 拉取 JSON
+  Helius DAS API getAssetBatch（单批 1000 mint）；不再使用链上 fallback 补全。
 """
 
 import asyncio
@@ -47,8 +46,6 @@ SYSTEM_PROGRAM_ID         = "11111111111111111111111111111111"
 
 # ─── 配置（优先读取 .env）──────────────────────────────────────────────────────
 CHAIN_NAME = os.getenv("CHAIN_NAME", "solana")
-RPC_URL    = os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com")
-
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = int(os.getenv("DB_PORT", "5432"))
 DB_NAME = os.getenv("DB_NAME", "nft_data")
@@ -66,8 +63,6 @@ METADATA_CONNECT_TIMEOUT = int(os.getenv("METADATA_CONNECT_TIMEOUT", "30"))
 # 同时在途的 getAssetBatch HTTP 请求数
 # 5 并发 × 1000 mint/请求 = 每轮 5000 条，远超 Alchemy 单条并发模式
 CONCURRENT_HELIUS = int(os.getenv("CONCURRENT_HELIUS", "5"))
-CONCURRENT_RPC    = int(os.getenv("CONCURRENT_RPC", "10"))
-CONCURRENT_IMAGE  = int(os.getenv("CONCURRENT_IMAGE", "50"))
 FETCH_IDLE_WAIT   = int(os.getenv("FETCH_IDLE_WAIT", "30"))
 FETCH_CLAIM_BATCH_SIZE = int(os.getenv("FETCH_CLAIM_BATCH_SIZE", "5000"))
 CLAIM_RETRY_AFTER_SECONDS = int(os.getenv("CLAIM_RETRY_AFTER_SECONDS", "1800"))
@@ -556,7 +551,7 @@ def save_gpa_progress(
     """
     保存 GPA 扫描进度。
       pagination_key : 当前页游标（None 表示本次全量已扫完）
-      since_slot     : 全量扫完后记录的链上最新 Slot，供下次增量扫描使用
+      since_slot     : 分页未完成时为当前 changedSinceSlot；扫完后为链上最新 Slot
       total_pages    : 已处理页数（累加）
     """
     with conn.cursor() as cur:
@@ -952,168 +947,19 @@ async def fetch_helius_metadata_batch(
     return [item for chunk in chunk_results for item in chunk]
 
 
-async def fetch_onchain_metadata_batch(
-    session: aiohttp.ClientSession,
-    rpc_sem: asyncio.Semaphore,
-    image_sem: asyncio.Semaphore,
-    mints: List[str],
-) -> List[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[Any]]]:
-    """
-    链上元数据批量获取（getMultipleAccounts + borsh 解码 + HTTP 拉取 JSON）。
-
-    关键优化：
-      1. PDA 计算（CPU密集）放到线程池，不阻塞事件循环
-      2. 每个 100-mint chunk 独立持有 rpc_sem，而非整个函数锁定信号量
-      3. 图片 HTTP 请求由 image_sem 限流，避免同时发出几千个请求
-
-    返回 [(collection_address, token_uri, image_url, name, symbol, metadata), ...] 与 mints 同序。
-    """
-    if not mints:
-        return []
-
-    # ── 步骤1：PDA 计算（CPU密集，放入线程池）────────────────────────────────
-    def _compute_pdas() -> List[Optional[str]]:
-        result = []
-        for mint in mints:
-            try:
-                result.append(get_metadata_pda(mint))
-            except Exception:
-                result.append(None)
-        return result
-
-    pda_list: List[Optional[str]] = await asyncio.to_thread(_compute_pdas)
-
-    # ── 步骤2：并发 getMultipleAccounts（per-chunk，sem 只包住 HTTP 调用）────
-    chunk_size  = 100
-    chunks      = [pda_list[i: i + chunk_size] for i in range(0, len(pda_list),  chunk_size)]
-    mint_chunks = [mints[i: i + chunk_size]     for i in range(0, len(mints),     chunk_size)]
-    # uri_map[mint] = (uri, name, symbol, collection)；name/symbol/collection 来自链上解码
-    uri_map: Dict[str, Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]] = {}
-    rpc_timeout = aiohttp.ClientTimeout(total=30)
-
-    async def _fetch_chunk(ci: int, chunk: List[Optional[str]], mint_chunk: List[str]) -> None:
-        valid_pdas = [p for p in chunk if p]
-        if not valid_pdas:
-            for m in mint_chunk:
-                uri_map[m] = (None, None, None, None)
-            return
-
-        payload = {
-            "jsonrpc": "2.0",
-            "id": ci,
-            "method": "getMultipleAccounts",
-            "params": [valid_pdas, {"encoding": "base64", "commitment": "finalized"}],
-        }
-        body: Optional[Dict] = None
-        for attempt in range(1, 4):
-            try:
-                async with rpc_sem:
-                    async with session.post(RPC_URL, json=payload, timeout=rpc_timeout) as resp:
-                        if resp.status == 429:
-                            raise aiohttp.ClientResponseError(
-                                resp.request_info, resp.history, status=429
-                            )
-                        resp.raise_for_status()
-                        body = await resp.json(content_type=None)
-                break
-            except Exception:
-                if attempt < 3:
-                    await asyncio.sleep(2 ** (attempt - 1))
-
-        accs = ((body or {}).get("result") or {}).get("value") or []
-        pda_idx = 0
-        for mint, pda in zip(mint_chunk, chunk):
-            if pda is None:
-                uri_map[mint] = (None, None, None, None)
-                continue
-            acc = accs[pda_idx] if pda_idx < len(accs) else None
-            pda_idx += 1
-            if not acc or not acc.get("data"):
-                uri_map[mint] = (None, None, None, None)
-                continue
-            try:
-                raw_data = base64.b64decode(acc["data"][0])
-                parsed   = parse_metadata_account(raw_data)
-                if parsed:
-                    uri_map[mint] = (
-                        parsed.get("uri")    or None,
-                        parsed.get("name")   or None,
-                        parsed.get("symbol") or None,
-                        parsed.get("collection") or None,
-                    )
-                else:
-                    uri_map[mint] = (None, None, None, None)
-            except Exception:
-                uri_map[mint] = (None, None, None, None)
-
-    await asyncio.gather(*[
-        _fetch_chunk(ci, chunk, mint_chunk)
-        for ci, (chunk, mint_chunk) in enumerate(zip(chunks, mint_chunks))
-    ])
-
-    # ── 步骤3：并发 HTTP 拉取 metadata JSON → 提取 image_url（image_sem 限流）
-    http_timeout = aiohttp.ClientTimeout(total=METADATA_TIMEOUT)
-
-    async def _fetch_image(
-        mint: str,
-    ) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[Any]]:
-        entry = uri_map.get(mint, (None, None, None, None))
-        uri, on_name, on_symbol, collection_address = entry
-        if not uri:
-            return collection_address, None, None, on_name, on_symbol, None
-        async with image_sem:
-            try:
-                async with session.get(uri, timeout=http_timeout, allow_redirects=True) as resp:
-                    if resp.status != 200:
-                        return collection_address, uri, None, on_name, on_symbol, None
-                    ct = resp.headers.get("Content-Type", "")
-                    if "json" not in ct and not uri.endswith(".json"):
-                        return collection_address, uri, None, on_name, on_symbol, None
-                    meta_json = await resp.json(content_type=None)
-                    if not isinstance(meta_json, dict):
-                        return collection_address, uri, None, on_name, on_symbol, None
-                    image = (
-                        meta_json.get("image")
-                        or meta_json.get("image_url")
-                        or meta_json.get("imageUrl")
-                    )
-                    # JSON 中的 name/symbol 作为补充（链上值优先）
-                    name   = on_name   or meta_json.get("name")   or None
-                    symbol = on_symbol or meta_json.get("symbol") or None
-                    return (
-                        collection_address,
-                        uri,
-                        (image.strip() if isinstance(image, str) else None),
-                        name,
-                        symbol,
-                        meta_json,
-                    )
-            except Exception:
-                return collection_address, uri, None, on_name, on_symbol, None
-
-    return list(await asyncio.gather(*[_fetch_image(mint) for mint in mints]))
-
-
 async def fetch_metadata_batch(
     session: aiohttp.ClientSession,
     helius_sem: asyncio.Semaphore,
-    rpc_sem: asyncio.Semaphore,
     mints: List[str],
-    image_sem: Optional[asyncio.Semaphore] = None,
 ) -> List[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[Any]]]:
     """
     元数据获取主入口，返回 [(collection_address, token_uri, image_url, name, symbol, metadata), ...] 与 mints 同序。
 
-      1. 优先 Helius DAS API getAssetBatch（配置了 HELIUS_API_KEY 时）
-         - 单批 1000 mint，直接返回 collection / token_uri / image_url / name / symbol / metadata
-      2. Helius 未命中（token_uri=None）或未配置 key → 回退链上：
-         getMultipleAccounts → borsh 解码（含 name/symbol）→ HTTP 拉取 JSON
+      - 仅使用 Helius DAS API getAssetBatch（配置了 HELIUS_API_KEY 时）
+      - Helius 未命中或字段缺失不再调用链上 fallback 补全；由上层决定是否跳过
 
     helius_sem : 控制同时在途的 getAssetBatch 请求数
-    rpc_sem    : 控制链上 getMultipleAccounts 并发数
-    image_sem  : 限流链上路径的图片 HTTP 请求（未传则用 CONCURRENT_IMAGE 新建）
     """
-    _img_sem = image_sem or asyncio.Semaphore(CONCURRENT_IMAGE)
     _empty: Tuple[
         Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[Any]
     ] = (
@@ -1124,40 +970,7 @@ async def fetch_metadata_batch(
     ] = [_empty] * len(mints)
 
     if HELIUS_API_KEY:
-        helius_results = await fetch_helius_metadata_batch(session, helius_sem, mints)
-        results = list(helius_results)
-
-        # token_uri / image_url 缺失时触发链上回退。collection 缺失本身不回退；
-        # 无 collection 的资产由 metadata_fetcher 用 mint 作为 singleton collection。
-        # 链上路径会通过 getMultipleAccounts + borsh 解码 + HTTP 拉 JSON
-        # 补全 Helius 未能返回的字段（partial miss 也能覆盖）
-        fallback_indices = [
-            i for i, (_collection, uri, img, *_) in enumerate(results)
-            if not uri or not img
-        ]
-        if fallback_indices:
-            fallback_mints = [mints[i] for i in fallback_indices]
-            onchain = await fetch_onchain_metadata_batch(
-                session, rpc_sem, _img_sem, fallback_mints
-            )
-            # 字段级合并：Helius 已有的字段保留，缺失字段由链上结果补充
-            for idx, (o_collection, o_uri, o_img, o_name, o_symbol, o_metadata) in zip(
-                fallback_indices, onchain
-            ):
-                h_collection, h_uri, h_img, h_name, h_symbol, h_metadata = results[idx]
-                results[idx] = (
-                    h_collection or o_collection,
-                    h_uri    or o_uri,
-                    h_img    or o_img,
-                    h_name   or o_name,
-                    h_symbol or o_symbol,
-                    h_metadata or o_metadata,
-                )
-    else:
-        # 无 Helius key：全量走链上
-        results = await fetch_onchain_metadata_batch(
-            session, rpc_sem, _img_sem, mints
-        )
+        results = list(await fetch_helius_metadata_batch(session, helius_sem, mints))
 
     return results
 

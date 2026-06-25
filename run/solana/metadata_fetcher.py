@@ -7,17 +7,11 @@
 性能优化点：
   1. CONCURRENT_HELIUS=5  — 同时在途的 getAssetBatch 请求数（每批 1000 mint）
   2. 所有就绪批次一轮并发投入 _process_batch，helius_sem 在内部统一限流
-  3. 流水线：DB写[N] 作为后台 Task，与 DB读 + HTTP获取[N+1] 完全重叠（隐藏写延迟）
-  4. sem 仅持有 HTTP 调用期间，重试 sleep 期间释放，吞吐量 ≈ 并发数 / 平均延迟
-  5. PDA 计算（CPU密集）放入线程池，不阻塞事件循环
-  6. getMultipleAccounts per-chunk 并发，rpc_sem 控制同时在途的 RPC 请求数
-  7. image_sem 限制图片 HTTP 并发（CONCURRENT_IMAGE=50），避免 CDN 限速
-  8. 双 DB 连接（conn_insert / conn_delete）并发写库，insert 与 delete 互不阻塞
-  9. TCPConnector(limit=0) 不限连接数，由信号量在应用层统一控流
+  3. sem 仅持有 HTTP 调用期间，重试 sleep 期间释放，吞吐量 ≈ 并发数 / 平均延迟
+  4. TCPConnector(limit=0) 不限连接数，由信号量在应用层统一控流
 
 获取策略：
-  1. 优先：Helius DAS API getAssetBatch（HELIUS_API_KEY 配置时启用，单批 1000 mint）
-  2. 回退：链上 getMultipleAccounts → borsh 解码 → HTTP 拉 JSON
+  1. 仅使用 Helius DAS API getAssetBatch（HELIUS_API_KEY 配置时启用，单批 1000 mint）
   - token_uri 非空 → 写主表；为空 → 不写但仍从临时表删除
   - 无 collection 的 mint → 以 mint 自身作为 singleton collection，避免错误聚合
   - data:image 开头的链上图像 mint → 不写主表，但仍从临时表删除
@@ -38,11 +32,8 @@ import aiohttp
 
 from common import (
     CHAIN_NAME,
-    RPC_URL,
     HELIUS_BATCH_SIZE,
     CONCURRENT_HELIUS,
-    CONCURRENT_RPC,
-    CONCURRENT_IMAGE,
     FETCH_IDLE_WAIT,
     FETCH_CLAIM_BATCH_SIZE,
     CLAIM_RETRY_AFTER_SECONDS,
@@ -129,8 +120,6 @@ async def _maybe_wait_worker_startup(worker_index: int, stop_event=None) -> None
 async def _process_batch(
     session: aiohttp.ClientSession,
     helius_sem: asyncio.Semaphore,
-    rpc_sem: asyncio.Semaphore,
-    image_sem: asyncio.Semaphore,
     pending: List[Tuple],
 ) -> Tuple[List[Tuple], List[int]]:
     """
@@ -146,7 +135,7 @@ async def _process_batch(
     chunks = [mints[i: i + chunk_size] for i in range(0, len(mints), chunk_size)]
 
     chunk_results = list(await asyncio.gather(*[
-        fetch_metadata_batch(session, helius_sem, rpc_sem, chunk, image_sem)
+        fetch_metadata_batch(session, helius_sem, chunk)
         for chunk in chunks
     ]))
 
@@ -182,8 +171,6 @@ async def _process_batch(
 async def _fetch_all(
     session: aiohttp.ClientSession,
     helius_sem: asyncio.Semaphore,
-    rpc_sem: asyncio.Semaphore,
-    image_sem: asyncio.Semaphore,
     batches: List[List[Tuple]],
     forced: bool = False,
 ) -> Tuple[List[Tuple], List[int], int, int]:
@@ -197,7 +184,7 @@ async def _fetch_all(
 
     all_results: List[Tuple[List[Tuple], List[int]]] = list(
         await asyncio.gather(*[
-            _process_batch(session, helius_sem, rpc_sem, image_sem, batch)
+            _process_batch(session, helius_sem, batch)
             for batch in batches
         ])
     )
@@ -235,12 +222,11 @@ async def _worker_main(worker_index: int, stop_event=None) -> None:
     worker_id = _build_worker_id(worker_index)
     logger.info(
         "═══ Solana Metadata 获取器启动 ═══  链: %s | worker=%s | "
-        "claim_batch=%d | reclaim_after=%ds | RPC: %s",
+        "claim_batch=%d | reclaim_after=%ds",
         CHAIN_NAME,
         worker_id,
         FETCH_CLAIM_BATCH_SIZE,
         CLAIM_RETRY_AFTER_SECONDS,
-        RPC_URL,
     )
 
     conn_claim = conn_insert = conn_delete = None
@@ -252,10 +238,8 @@ async def _worker_main(worker_index: int, stop_event=None) -> None:
 
         total_inserted = total_deleted = 0
         helius_sem = asyncio.Semaphore(CONCURRENT_HELIUS)
-        rpc_sem    = asyncio.Semaphore(CONCURRENT_RPC)
-        image_sem  = asyncio.Semaphore(CONCURRENT_IMAGE)
         connector = aiohttp.TCPConnector(
-            limit=max((CONCURRENT_HELIUS + CONCURRENT_RPC + CONCURRENT_IMAGE) * 2, 20),
+            limit=max(CONCURRENT_HELIUS * 2, 20),
             ttl_dns_cache=300,
             enable_cleanup_closed=True,
         )
@@ -293,8 +277,6 @@ async def _worker_main(worker_index: int, stop_event=None) -> None:
                     all_inserts, all_ids, total_raw, n_inserts = await _fetch_all(
                         session,
                         helius_sem,
-                        rpc_sem,
-                        image_sem,
                         [pending],
                     )
                     ins, del_ = await _do_write(
@@ -393,11 +375,9 @@ def main() -> None:
             return
 
         logger.info(
-            "启动 %d 个 Solana metadata worker 进程；每进程并发: Helius=%d RPC=%d image=%d",
+            "启动 %d 个 Solana metadata worker 进程；每进程并发: Helius=%d",
             FETCHER_WORKERS,
             CONCURRENT_HELIUS,
-            CONCURRENT_RPC,
-            CONCURRENT_IMAGE,
         )
         workers = [
             multiprocessing.Process(

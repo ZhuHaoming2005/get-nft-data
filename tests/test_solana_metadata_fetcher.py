@@ -45,11 +45,8 @@ class SolanaMetadataFetcherFormatTests(unittest.IsolatedAsyncioTestCase):
     def _fake_common(self, fetch_metadata_batch=None):
         fake_common = types.ModuleType("common")
         fake_common.CHAIN_NAME = "solana"
-        fake_common.RPC_URL = "https://rpc.example"
         fake_common.HELIUS_BATCH_SIZE = 1000
         fake_common.CONCURRENT_HELIUS = 1
-        fake_common.CONCURRENT_RPC = 1
-        fake_common.CONCURRENT_IMAGE = 1
         fake_common.FETCH_IDLE_WAIT = 30
         fake_common.FETCH_CLAIM_BATCH_SIZE = 5000
         fake_common.CLAIM_RETRY_AFTER_SECONDS = 1800
@@ -75,7 +72,7 @@ class SolanaMetadataFetcherFormatTests(unittest.IsolatedAsyncioTestCase):
     async def test_process_batch_builds_evm_compatible_insert_tuple_with_metadata(self):
         metadata = {"name": "Asset #1", "image": "https://image.example/1.png"}
 
-        async def _fetch_metadata_batch(_session, _helius_sem, _rpc_sem, mints, _image_sem):
+        async def _fetch_metadata_batch(_session, _helius_sem, mints):
             self.assertEqual(mints, ["Mint111"])
             return [
                 (
@@ -94,8 +91,6 @@ class SolanaMetadataFetcherFormatTests(unittest.IsolatedAsyncioTestCase):
 
         inserts, ids = await fetcher._process_batch(
             object(),
-            asyncio.Semaphore(1),
-            asyncio.Semaphore(1),
             asyncio.Semaphore(1),
             [(7, "Mint111", "Metaplex", 123456)],
         )
@@ -121,7 +116,7 @@ class SolanaMetadataFetcherFormatTests(unittest.IsolatedAsyncioTestCase):
     async def test_process_batch_uses_mint_as_singleton_collection_when_collection_missing(self):
         metadata = {"name": "Ungrouped #1"}
 
-        async def _fetch_metadata_batch(_session, _helius_sem, _rpc_sem, mints, _image_sem):
+        async def _fetch_metadata_batch(_session, _helius_sem, mints):
             self.assertEqual(mints, ["Mint111"])
             return [
                 (
@@ -140,8 +135,6 @@ class SolanaMetadataFetcherFormatTests(unittest.IsolatedAsyncioTestCase):
 
         inserts, ids = await fetcher._process_batch(
             object(),
-            asyncio.Semaphore(1),
-            asyncio.Semaphore(1),
             asyncio.Semaphore(1),
             [(7, "Mint111", "Metaplex", 123456)],
         )

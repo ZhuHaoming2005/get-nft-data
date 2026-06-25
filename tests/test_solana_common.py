@@ -132,6 +132,48 @@ class _FakeSession:
         return _FakePostContext(self.payload)
 
 
+class _FailingPostResponse:
+    status = 500
+
+    def raise_for_status(self):
+        raise RuntimeError("HTTP 500")
+
+    async def json(self, content_type=None):
+        return {}
+
+
+class _FailingPostContext:
+    async def __aenter__(self):
+        return _FailingPostResponse()
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FlakyThenSuccessPostContext:
+    def __init__(self, session):
+        self.session = session
+
+    async def __aenter__(self):
+        if self.session.post_count < self.session.succeed_on:
+            return _FailingPostResponse()
+        return _FakeHttpResponse(200, self.session.payload)
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FlakyThenSuccessPostSession:
+    def __init__(self, succeed_on, payload):
+        self.succeed_on = succeed_on
+        self.payload = payload
+        self.post_count = 0
+
+    def post(self, url, json=None, timeout=None):
+        self.post_count += 1
+        return _FlakyThenSuccessPostContext(self)
+
+
 class SolanaCommonDbFormatTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -374,9 +416,7 @@ class SolanaHeliusMetadataTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_fetch_metadata_batch_does_not_fallback_when_only_collection_is_missing(self):
         self.common.HELIUS_API_KEY = "test-key"
-        fallback_calls = []
         original_helius = self.common.fetch_helius_metadata_batch
-        original_onchain = self.common.fetch_onchain_metadata_batch
 
         async def _helius(*_args, **_kwargs):
             return [
@@ -390,37 +430,108 @@ class SolanaHeliusMetadataTests(unittest.IsolatedAsyncioTestCase):
                 )
             ]
 
-        async def _onchain(*_args, **_kwargs):
-            fallback_calls.append(True)
-            return [
-                (
-                    "CollectionShouldNotBeFetched",
-                    "ipfs://token/1",
-                    "https://image.example/1.png",
-                    "Ungrouped #1",
-                    "UNG",
-                    {"name": "Ungrouped #1"},
-                )
-            ]
-
         self.common.fetch_helius_metadata_batch = _helius
-        self.common.fetch_onchain_metadata_batch = _onchain
         try:
             result = await self.common.fetch_metadata_batch(
                 object(),
                 asyncio.Semaphore(1),
-                asyncio.Semaphore(1),
                 ["Mint111"],
-                asyncio.Semaphore(1),
             )
         finally:
             self.common.fetch_helius_metadata_batch = original_helius
-            self.common.fetch_onchain_metadata_batch = original_onchain
 
-        self.assertEqual(fallback_calls, [])
         self.assertEqual(result[0][0], None)
         self.assertEqual(result[0][1], "ipfs://token/1")
         self.assertEqual(result[0][2], "https://image.example/1.png")
+
+    async def test_fetch_metadata_batch_uses_helius_only_when_uri_or_image_missing(self):
+        self.common.HELIUS_API_KEY = "test-key"
+        original_helius = self.common.fetch_helius_metadata_batch
+
+        async def _helius(*_args, **_kwargs):
+            return [
+                (
+                    "Collection1111111111111111111111111111111111",
+                    None,
+                    None,
+                    "Partial #1",
+                    "PAR",
+                    {"name": "Partial #1"},
+                )
+            ]
+
+        self.common.fetch_helius_metadata_batch = _helius
+        try:
+            result = await self.common.fetch_metadata_batch(
+                object(),
+                asyncio.Semaphore(1),
+                ["Mint111"],
+            )
+        finally:
+            self.common.fetch_helius_metadata_batch = original_helius
+
+        self.assertEqual(
+            result,
+            [
+                (
+                    "Collection1111111111111111111111111111111111",
+                    None,
+                    None,
+                    "Partial #1",
+                    "PAR",
+                    {"name": "Partial #1"},
+                )
+            ],
+        )
+
+    async def test_fetch_metadata_batch_without_helius_key_returns_empty_without_onchain_fallback(self):
+        self.common.HELIUS_API_KEY = ""
+        result = await self.common.fetch_metadata_batch(
+            object(),
+            asyncio.Semaphore(1),
+            ["Mint111"],
+        )
+
+        self.assertEqual(result, [(None, None, None, None, None, None)])
+
+    async def test_fetch_helius_metadata_batch_retries_failed_request_before_success(self):
+        self.common.HELIUS_API_KEY = "test-key"
+        session = _FlakyThenSuccessPostSession(
+            3,
+            {
+                "result": [
+                    {
+                        "id": "Mint111",
+                        "content": {
+                            "json_uri": "ipfs://token/1",
+                            "links": {"image": "https://image.example/1.png"},
+                            "metadata": {"name": "Retry #1", "symbol": "TRY"},
+                        },
+                    }
+                ]
+            },
+        )
+
+        result = await self.common.fetch_helius_metadata_batch(
+            session,
+            asyncio.Semaphore(1),
+            ["Mint111"],
+        )
+
+        self.assertEqual(session.post_count, 3)
+        self.assertEqual(
+            result,
+            [
+                (
+                    None,
+                    "ipfs://token/1",
+                    "https://image.example/1.png",
+                    "Retry #1",
+                    "TRY",
+                    {"name": "Retry #1", "symbol": "TRY"},
+                )
+            ],
+        )
 
 
 class SolanaOnchainMetadataParsingTests(unittest.TestCase):
