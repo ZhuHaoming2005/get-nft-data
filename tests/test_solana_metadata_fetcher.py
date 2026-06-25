@@ -48,6 +48,7 @@ class SolanaMetadataFetcherFormatTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(mints, ["Mint111"])
             return [
                 (
+                    "Collection1111111111111111111111111111111111",
                     "ipfs://token/1",
                     "https://image.example/1.png",
                     "Asset #1",
@@ -83,7 +84,71 @@ class SolanaMetadataFetcherFormatTests(unittest.IsolatedAsyncioTestCase):
             asyncio.Semaphore(1),
             asyncio.Semaphore(1),
             asyncio.Semaphore(1),
-            [(7, "Mint111", 1, "Metaplex", 123456)],
+            [(7, "Mint111", "Metaplex", 123456)],
+        )
+
+        self.assertEqual(ids, [7])
+        self.assertEqual(
+            inserts,
+            [
+                (
+                    "Collection1111111111111111111111111111111111",
+                    "Mint111",
+                    "ipfs://token/1",
+                    "https://image.example/1.png",
+                    "Asset #1",
+                    "AST",
+                    metadata,
+                    "Metaplex",
+                    123456,
+                )
+            ],
+        )
+
+    async def test_process_batch_uses_mint_as_singleton_collection_when_collection_missing(self):
+        metadata = {"name": "Ungrouped #1"}
+
+        async def _fetch_metadata_batch(_session, _helius_sem, _rpc_sem, mints, _image_sem):
+            self.assertEqual(mints, ["Mint111"])
+            return [
+                (
+                    None,
+                    "ipfs://token/1",
+                    "https://image.example/1.png",
+                    "Ungrouped #1",
+                    "UNG",
+                    metadata,
+                )
+            ]
+
+        fake_common = types.ModuleType("common")
+        fake_common.CHAIN_NAME = "solana"
+        fake_common.RPC_URL = "https://rpc.example"
+        fake_common.HELIUS_BATCH_SIZE = 1000
+        fake_common.CONCURRENT_HELIUS = 1
+        fake_common.CONCURRENT_RPC = 1
+        fake_common.CONCURRENT_IMAGE = 1
+        fake_common.FETCH_IDLE_WAIT = 30
+        fake_common.logger = types.SimpleNamespace(
+            info=lambda *args, **kwargs: None,
+            warning=lambda *args, **kwargs: None,
+            error=lambda *args, **kwargs: None,
+        )
+        fake_common.get_conn = lambda: None
+        fake_common.init_db = lambda *args, **kwargs: None
+        fake_common.load_pending_nfts = lambda *args, **kwargs: []
+        fake_common.batch_insert_main = lambda *args, **kwargs: 0
+        fake_common.delete_temp_nfts = lambda *args, **kwargs: 0
+        fake_common.fetch_metadata_batch = _fetch_metadata_batch
+
+        fetcher = _load_fetcher(fake_common)
+
+        inserts, ids = await fetcher._process_batch(
+            object(),
+            asyncio.Semaphore(1),
+            asyncio.Semaphore(1),
+            asyncio.Semaphore(1),
+            [(7, "Mint111", "Metaplex", 123456)],
         )
 
         self.assertEqual(ids, [7])
@@ -92,11 +157,11 @@ class SolanaMetadataFetcherFormatTests(unittest.IsolatedAsyncioTestCase):
             [
                 (
                     "Mint111",
-                    1,
+                    "Mint111",
                     "ipfs://token/1",
                     "https://image.example/1.png",
-                    "Asset #1",
-                    "AST",
+                    "Ungrouped #1",
+                    "UNG",
                     metadata,
                     "Metaplex",
                     123456,

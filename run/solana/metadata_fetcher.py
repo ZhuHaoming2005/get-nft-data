@@ -19,6 +19,7 @@
   1. 优先：Helius DAS API getAssetBatch（HELIUS_API_KEY 配置时启用，单批 1000 mint）
   2. 回退：链上 getMultipleAccounts → borsh 解码 → HTTP 拉 JSON
   - token_uri 非空 → 写主表；为空 → 不写但仍从临时表删除
+  - 无 collection 的 mint → 以 mint 自身作为 singleton collection，避免错误聚合
   - data:image 开头的链上图像 mint → 不写主表，但仍从临时表删除
 """
 
@@ -81,16 +82,18 @@ async def _process_batch(
         for chunk in chunks
     ]))
 
-    # 每项结果为 (token_uri, image_url, name, symbol, metadata) 5-元组
-    results: List[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[Any]]] = [
+    # 每项结果为 (collection, token_uri, image_url, name, symbol, metadata) 6-元组
+    results: List[
+        Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[Any]]
+    ] = [
         item for chunk in chunk_results for item in chunk
     ]
 
     # 组装有效记录（包含 name / symbol / metadata），顺序与 EVM batch_insert_main 对齐
     inserts: List[Tuple] = []
     for (
-        (_, mint, token_id, std, first_seen_slot),
-        (token_uri, image_url, name, symbol, metadata),
+        (_, mint, std, first_seen_slot),
+        (collection_address, token_uri, image_url, name, symbol, metadata),
     ) in zip(pending, results):
         if not isinstance(image_url, str):
             continue
@@ -98,8 +101,9 @@ async def _process_batch(
             continue
         if not token_uri or any(token_uri.startswith(p) for p in _INVALID_URI_PREFIXES):
             continue
+        contract_address = collection_address or mint
         inserts.append((
-            mint, token_id, token_uri, image_url,
+            contract_address, mint, token_uri, image_url,
             name, symbol, metadata,
             std or "Metaplex", first_seen_slot,
         ))
@@ -176,7 +180,7 @@ async def main() -> None:
     total_inserted = total_deleted = 0
 
     # ── 缓冲区：跨轮次积累，凑满 HELIUS_BATCH_SIZE 再触发请求 ──────────────────
-    buf: List[Tuple] = []       # 待处理行（(id, mint, token_id, std, slot)）
+    buf: List[Tuple] = []       # 待处理行（(id, mint, std, slot)）
     buf_ids: Set[int] = set()   # 已在 buf 中的 DB id，用于跨轮去重
     idle_rounds = 0             # 连续读不到新数据的轮次计数
 

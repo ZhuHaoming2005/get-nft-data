@@ -217,7 +217,7 @@ def parse_metadata_account(data: bytes) -> Optional[Dict]:
       1  byte  : creators option flag（0/1）
       ...后续字段忽略
 
-    返回包含 name / symbol / uri 的字典，解析失败返回 None。
+    返回包含 name / symbol / uri / collection 的字典，解析失败返回 None。
     """
     try:
         if not data or len(data) < 70:
@@ -236,9 +236,87 @@ def parse_metadata_account(data: bytes) -> Optional[Dict]:
         symbol, pos = _read_string(data, pos)
         uri,    pos = _read_string(data, pos)
 
-        return {"mint": mint_b58, "name": name, "symbol": symbol, "uri": uri}
+        if pos + 2 > len(data):
+            return {"mint": mint_b58, "name": name, "symbol": symbol, "uri": uri, "collection": None}
+        pos += 2  # seller_fee_basis_points
+
+        # 跳过 Data.creators，可选字段布局：option u8 + len u32 + creator[34]。
+        if pos < len(data):
+            creators_present = data[pos]
+            pos += 1
+            if creators_present and pos + 4 <= len(data):
+                creator_count = struct.unpack_from("<I", data, pos)[0]
+                pos += 4 + creator_count * 34
+
+        # primary_sale_happened + is_mutable
+        if pos < len(data):
+            pos += 1
+        if pos < len(data):
+            pos += 1
+
+        # edition_nonce: option u8 + value u8
+        if pos < len(data):
+            edition_nonce_present = data[pos]
+            pos += 1
+            if edition_nonce_present and pos < len(data):
+                pos += 1
+
+        # token_standard: option u8 + enum u8
+        if pos < len(data):
+            token_standard_present = data[pos]
+            pos += 1
+            if token_standard_present and pos < len(data):
+                pos += 1
+
+        collection = None
+        if pos < len(data):
+            collection_present = data[pos]
+            pos += 1
+            if collection_present and pos + 33 <= len(data):
+                pos += 1  # verified bool
+                collection = b58encode(bytes(data[pos: pos + 32]))
+
+        return {
+            "mint": mint_b58,
+            "name": name,
+            "symbol": symbol,
+            "uri": uri,
+            "collection": collection,
+        }
     except Exception:
         return None
+
+
+def _normalize_solana_address(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if 32 <= len(value) <= 44:
+        return value
+    return None
+
+
+def _extract_collection_address(asset: Dict) -> Optional[str]:
+    grouping = asset.get("grouping")
+    if isinstance(grouping, list):
+        for group in grouping:
+            if not isinstance(group, dict):
+                continue
+            if group.get("group_key") != "collection":
+                continue
+            collection = _normalize_solana_address(group.get("group_value"))
+            if collection:
+                return collection
+
+    content = asset.get("content") if isinstance(asset.get("content"), dict) else {}
+    metadata = content.get("metadata") if isinstance(content.get("metadata"), dict) else {}
+    collection_value = metadata.get("collection")
+    if isinstance(collection_value, dict):
+        for key in ("key", "address", "id", "mint"):
+            collection = _normalize_solana_address(collection_value.get(key))
+            if collection:
+                return collection
+    return _normalize_solana_address(collection_value)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -255,10 +333,13 @@ def _temp_table_name(chain_name: str) -> str:
     return f"temp_{safe}"
 
 
-def _ensure_contract_token_unique_constraint_sql(
+def _ensure_unique_constraint_sql(
     table_name: str,
     constraint_name: str,
+    columns: Tuple[str, ...],
 ) -> str:
+    column_list = ", ".join(columns)
+    column_array = "ARRAY[" + ", ".join(f"'{column}'" for column in columns) + "]"
     return f"""
             DO $$
             BEGIN
@@ -276,11 +357,11 @@ def _ensure_contract_token_unique_constraint_sql(
                           JOIN pg_attribute a
                             ON a.attrelid = c.conrelid
                            AND a.attnum = k.attnum
-                      ) = ARRAY['contract_address', 'token_id']
+                      ) = {column_array}
                 ) THEN
                     ALTER TABLE {table_name}
                         ADD CONSTRAINT {constraint_name}
-                        UNIQUE (contract_address, token_id);
+                        UNIQUE ({column_list});
                 END IF;
             END $$;
         """
@@ -296,25 +377,25 @@ def get_conn() -> psycopg2.extensions.connection:
 def init_db(conn, chain_name: str) -> None:
     """
     建表（幂等）：
-      - nft_assets_{chain}    : 主表，存储已获取 token_uri 的有效 NFT
-      - temp_{chain}          : 临时表，扫描阶段写入，由 metadata_fetcher 消费
+      - nft_assets_{chain}    : 主表，contract_address 存 collection，token_id 存 mint
+      - temp_{chain}          : 临时表，扫描阶段仅写入待处理 mint
       - scan_progress_gpa     : GPA 扫描进度（分页游标 + 增量 slot）
     """
     tbl = _nft_table_name(chain_name)
     tmp = _temp_table_name(chain_name)
     with conn.cursor() as cur:
-        # 主表：contract_address 存 mint address（base58，最长 44 字符）
+        # 主表：contract_address 存 collection address；token_id 是 mint surrogate。
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS {tbl} (
                 id               BIGSERIAL    PRIMARY KEY,
                 contract_address VARCHAR(44)  NOT NULL,
-                token_id         NUMERIC      NOT NULL DEFAULT 1,
+                token_id         VARCHAR(44)  NOT NULL,
                 token_uri        TEXT,
                 image_uri        TEXT,
                 name             TEXT,
                 symbol           TEXT,
                 metadata         JSONB,
-                token_standard   VARCHAR(10),
+                token_standard   VARCHAR(20),
                 first_seen_block BIGINT,
                 created_at       TIMESTAMPTZ  DEFAULT NOW(),
                 CONSTRAINT {tbl}_contract_token_key UNIQUE (contract_address, token_id)
@@ -327,16 +408,17 @@ def init_db(conn, chain_name: str) -> None:
         cur.execute(f"ALTER TABLE {tbl} ALTER COLUMN name TYPE TEXT")
         cur.execute(f"ALTER TABLE {tbl} ALTER COLUMN symbol TYPE TEXT")
         cur.execute(
-            f"ALTER TABLE {tbl} ALTER COLUMN token_id TYPE NUMERIC USING token_id::numeric"
+            f"ALTER TABLE {tbl} ALTER COLUMN token_id TYPE VARCHAR(44) USING token_id::text"
         )
-        cur.execute(f"ALTER TABLE {tbl} ALTER COLUMN token_id SET DEFAULT 1")
-        cur.execute(f"ALTER TABLE {tbl} ALTER COLUMN token_standard TYPE VARCHAR(10)")
+        cur.execute(f"ALTER TABLE {tbl} ALTER COLUMN token_id DROP DEFAULT")
+        cur.execute(f"ALTER TABLE {tbl} ALTER COLUMN token_standard TYPE VARCHAR(20)")
         cur.execute(f"ALTER TABLE {tbl} DROP CONSTRAINT IF EXISTS {tbl}_contract_address_key")
         cur.execute("DROP INDEX IF EXISTS idx_sol_nft_contract_token")
         cur.execute(
-            _ensure_contract_token_unique_constraint_sql(
+            _ensure_unique_constraint_sql(
                 tbl,
                 f"{tbl}_contract_token_key",
+                ("contract_address", "token_id"),
             )
         )
         cur.execute(
@@ -347,30 +429,50 @@ def init_db(conn, chain_name: str) -> None:
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS {tmp} (
                 id               BIGSERIAL   PRIMARY KEY,
-                contract_address VARCHAR(44) NOT NULL,
-                token_id         NUMERIC     NOT NULL DEFAULT 1,
-                token_standard   VARCHAR(10),
+                mint_address     VARCHAR(44) NOT NULL,
+                token_standard   VARCHAR(20),
                 first_seen_block BIGINT,
                 created_at       TIMESTAMPTZ DEFAULT NOW(),
-                CONSTRAINT {tmp}_contract_token_key UNIQUE (contract_address, token_id)
+                CONSTRAINT {tmp}_mint_key UNIQUE (mint_address)
             )
         """)
+        cur.execute(f"ALTER TABLE {tmp} ADD COLUMN IF NOT EXISTS mint_address VARCHAR(44)")
         cur.execute(
-            f"ALTER TABLE {tmp} ALTER COLUMN token_id TYPE NUMERIC USING token_id::numeric"
+            f"""
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_name = '{tmp}'
+                      AND column_name = 'contract_address'
+                ) THEN
+                    UPDATE {tmp}
+                    SET mint_address = contract_address
+                    WHERE mint_address IS NULL
+                      AND contract_address IS NOT NULL;
+                END IF;
+            END $$;
+            """
         )
-        cur.execute(f"ALTER TABLE {tmp} ALTER COLUMN token_id SET DEFAULT 1")
-        cur.execute(f"ALTER TABLE {tmp} ALTER COLUMN token_standard TYPE VARCHAR(10)")
+        cur.execute(f"DELETE FROM {tmp} WHERE mint_address IS NULL")
+        cur.execute(f"ALTER TABLE {tmp} ALTER COLUMN mint_address SET NOT NULL")
+        cur.execute(f"ALTER TABLE {tmp} ALTER COLUMN token_standard TYPE VARCHAR(20)")
         cur.execute(f"ALTER TABLE {tmp} DROP CONSTRAINT IF EXISTS {tmp}_contract_address_key")
+        cur.execute(f"ALTER TABLE {tmp} DROP CONSTRAINT IF EXISTS {tmp}_contract_token_key")
         cur.execute("DROP INDEX IF EXISTS idx_sol_temp_contract_token")
         cur.execute(
-            _ensure_contract_token_unique_constraint_sql(
+            _ensure_unique_constraint_sql(
                 tmp,
-                f"{tmp}_contract_token_key",
+                f"{tmp}_mint_key",
+                ("mint_address",),
             )
         )
+        cur.execute(f"ALTER TABLE {tmp} DROP COLUMN IF EXISTS contract_address")
+        cur.execute(f"ALTER TABLE {tmp} DROP COLUMN IF EXISTS token_id")
         cur.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_sol_temp_contract"
-            f" ON {tmp} (contract_address)"
+            f"CREATE INDEX IF NOT EXISTS idx_sol_temp_mint"
+            f" ON {tmp} (mint_address)"
         )
         # GPA 扫描进度表（getProgramAccountsV2 游标分页断点续扫）
         cur.execute("""
@@ -440,19 +542,31 @@ def save_gpa_progress(
 def batch_insert_temp(conn, chain_name: str, records: List[Tuple]) -> int:
     """
     tx_scanner 专用：批量写入扫描原始记录到临时表。
-    records: [(mint_address, 1, token_standard, slot), ...]
+    records: [(mint_address, token_standard, slot), ...]
     """
     if not records:
         return 0
     tmp = _temp_table_name(chain_name)
+    normalized_records = []
+    for rec in records:
+        if len(rec) == 3:
+            mint_address, token_standard, first_seen_block = rec
+        elif len(rec) == 4:
+            mint_address, _legacy_token_id, token_standard, first_seen_block = rec
+        else:
+            raise ValueError(
+                "Solana temp records must be (mint_address, token_standard, first_seen_block)"
+            )
+        normalized_records.append((mint_address, token_standard, first_seen_block))
+
     with conn.cursor() as cur:
-        placeholders = ", ".join(["(%s, %s, %s, %s)"] * len(records))
-        flat = [item for rec in records for item in rec]
+        placeholders = ", ".join(["(%s, %s, %s)"] * len(normalized_records))
+        flat = [item for rec in normalized_records for item in rec]
         cur.execute(
             f"""
-            INSERT INTO {tmp} (contract_address, token_id, token_standard, first_seen_block)
+            INSERT INTO {tmp} (mint_address, token_standard, first_seen_block)
             VALUES {placeholders}
-            ON CONFLICT (contract_address, token_id) DO NOTHING
+            ON CONFLICT (mint_address) DO NOTHING
             """,
             flat,
         )
@@ -464,7 +578,7 @@ def batch_insert_temp(conn, chain_name: str, records: List[Tuple]) -> int:
 def load_pending_nfts(conn, chain_name: str, limit: int = 5000) -> List[Tuple]:
     """
     metadata_fetcher 专用：从临时表读取待处理记录。
-    返回 [(id, mint_address, token_id, token_standard, first_seen_slot), ...]
+    返回 [(id, mint_address, token_standard, first_seen_slot), ...]
 
     limit 建议设为 HELIUS_BATCH_SIZE × CONCURRENT_HELIUS × 若干倍，
     确保单次读取能覆盖多个完整的 getAssetBatch 请求。
@@ -473,14 +587,14 @@ def load_pending_nfts(conn, chain_name: str, limit: int = 5000) -> List[Tuple]:
     with conn.cursor() as cur:
         cur.execute(
             f"""
-            SELECT id, contract_address, token_id, token_standard, first_seen_block
+            SELECT id, mint_address, token_standard, first_seen_block
             FROM {tmp}
             ORDER BY id
             LIMIT %s
             """,
             (limit,),
         )
-        result = [(row[0], row[1], int(row[2]), row[3], row[4]) for row in cur.fetchall()]
+        result = [(row[0], row[1], row[2], row[3]) for row in cur.fetchall()]
     conn.commit()
     return result
 
@@ -490,7 +604,7 @@ def batch_insert_main(conn, chain_name: str, records: List[Tuple]) -> int:
     metadata_fetcher 专用：将有效 NFT 写入主表。
     records: [
         (
-            mint, 1, token_uri, image_uri,
+            collection_address, mint_address, token_uri, image_uri,
             name, symbol, metadata, token_standard, first_seen_slot,
         ),
         ...
@@ -594,7 +708,7 @@ async def fetch_helius_metadata_batch(
     session: aiohttp.ClientSession,
     sem: asyncio.Semaphore,
     mints: List[str],
-) -> List[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[Any]]]:
+) -> List[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[Any]]]:
     """
     通过 Helius DAS API（getAssetBatch）批量获取 NFT 元数据。
 
@@ -608,7 +722,7 @@ async def fetch_helius_metadata_batch(
       https://docs.helius.dev/compression-and-das-api/digital-asset-standard-das-api/get-assets
     """
     if not HELIUS_API_KEY:
-        return [(None, None, None, None, None)] * len(mints)
+        return [(None, None, None, None, None, None)] * len(mints)
 
     helius_url = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
     timeout = aiohttp.ClientTimeout(
@@ -617,7 +731,7 @@ async def fetch_helius_metadata_batch(
 
     async def _fetch_chunk(
         ci: int, chunk: List[str]
-    ) -> List[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[Any]]]:
+    ) -> List[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[Any]]]:
         payload = {
             "jsonrpc": "2.0",
             "id": f"helius-batch-{ci}",
@@ -657,24 +771,24 @@ async def fetch_helius_metadata_batch(
                     await asyncio.sleep(wait)
                 else:
                     logger.warning("Helius getAssetBatch 全部重试失败（%d mint）", len(chunk))
-                    return [(None, None, None, None, None)] * len(chunk)
+                    return [(None, None, None, None, None, None)] * len(chunk)
             except Exception as exc:
                 if attempt < max_retries:
                     await asyncio.sleep(2 ** (attempt - 1))
                 else:
                     logger.warning("Helius getAssetBatch 请求失败: %s", exc)
-                    return [(None, None, None, None, None)] * len(chunk)
+                    return [(None, None, None, None, None, None)] * len(chunk)
 
         if body is None:
-            return [(None, None, None, None, None)] * len(chunk)
+            return [(None, None, None, None, None, None)] * len(chunk)
 
         assets = body.get("result") or []
 
-        # 构建 mint → (token_uri, image_url, name, symbol, metadata) 映射
+        # 构建 mint → (collection, token_uri, image_url, name, symbol, metadata) 映射
         # getAssetBatch 结果顺序不保证与输入一致，用 id 字段对齐
         asset_map: Dict[
             str,
-            Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[Any]],
+            Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[Any]],
         ] = {}
         for asset in (assets if isinstance(assets, list) else []):
             mint = asset.get("id")
@@ -685,6 +799,7 @@ async def fetch_helius_metadata_batch(
             token_uri = content.get("json_uri") or None
             meta_raw  = content.get("metadata")
             meta      = meta_raw if isinstance(meta_raw, dict) else {}
+            collection_address = _extract_collection_address(asset)
 
             # name / symbol 直接来自 Helius DAS metadata 字段（链上权威值）
             name:   Optional[str] = meta.get("name")   or None
@@ -705,6 +820,7 @@ async def fetch_helius_metadata_batch(
                         break
 
             asset_map[mint] = (
+                collection_address,
                 token_uri or None,
                 image_url or None,
                 name,
@@ -712,7 +828,7 @@ async def fetch_helius_metadata_batch(
                 meta_raw if isinstance(meta_raw, dict) else None,
             )
 
-        return [asset_map.get(m, (None, None, None, None, None)) for m in chunk]
+        return [asset_map.get(m, (None, None, None, None, None, None)) for m in chunk]
 
     # 按 HELIUS_BATCH_SIZE 分块后全部并发，sem 在 _fetch_chunk 内控流
     chunk_size = HELIUS_BATCH_SIZE
@@ -728,7 +844,7 @@ async def fetch_onchain_metadata_batch(
     rpc_sem: asyncio.Semaphore,
     image_sem: asyncio.Semaphore,
     mints: List[str],
-) -> List[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[Any]]]:
+) -> List[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[Any]]]:
     """
     链上元数据批量获取（getMultipleAccounts + borsh 解码 + HTTP 拉取 JSON）。
 
@@ -737,7 +853,7 @@ async def fetch_onchain_metadata_batch(
       2. 每个 100-mint chunk 独立持有 rpc_sem，而非整个函数锁定信号量
       3. 图片 HTTP 请求由 image_sem 限流，避免同时发出几千个请求
 
-    返回 [(token_uri, image_url, name, symbol, metadata), ...] 与 mints 同序。
+    返回 [(collection_address, token_uri, image_url, name, symbol, metadata), ...] 与 mints 同序。
     """
     if not mints:
         return []
@@ -758,15 +874,15 @@ async def fetch_onchain_metadata_batch(
     chunk_size  = 100
     chunks      = [pda_list[i: i + chunk_size] for i in range(0, len(pda_list),  chunk_size)]
     mint_chunks = [mints[i: i + chunk_size]     for i in range(0, len(mints),     chunk_size)]
-    # uri_map[mint] = (uri, name, symbol)  ← 三元组，name/symbol 来自链上 borsh 解码
-    uri_map: Dict[str, Tuple[Optional[str], Optional[str], Optional[str]]] = {}
+    # uri_map[mint] = (uri, name, symbol, collection)；name/symbol/collection 来自链上解码
+    uri_map: Dict[str, Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]] = {}
     rpc_timeout = aiohttp.ClientTimeout(total=30)
 
     async def _fetch_chunk(ci: int, chunk: List[Optional[str]], mint_chunk: List[str]) -> None:
         valid_pdas = [p for p in chunk if p]
         if not valid_pdas:
             for m in mint_chunk:
-                uri_map[m] = (None, None, None)
+                uri_map[m] = (None, None, None, None)
             return
 
         payload = {
@@ -795,12 +911,12 @@ async def fetch_onchain_metadata_batch(
         pda_idx = 0
         for mint, pda in zip(mint_chunk, chunk):
             if pda is None:
-                uri_map[mint] = (None, None, None)
+                uri_map[mint] = (None, None, None, None)
                 continue
             acc = accs[pda_idx] if pda_idx < len(accs) else None
             pda_idx += 1
             if not acc or not acc.get("data"):
-                uri_map[mint] = (None, None, None)
+                uri_map[mint] = (None, None, None, None)
                 continue
             try:
                 raw_data = base64.b64decode(acc["data"][0])
@@ -810,11 +926,12 @@ async def fetch_onchain_metadata_batch(
                         parsed.get("uri")    or None,
                         parsed.get("name")   or None,
                         parsed.get("symbol") or None,
+                        parsed.get("collection") or None,
                     )
                 else:
-                    uri_map[mint] = (None, None, None)
+                    uri_map[mint] = (None, None, None, None)
             except Exception:
-                uri_map[mint] = (None, None, None)
+                uri_map[mint] = (None, None, None, None)
 
     await asyncio.gather(*[
         _fetch_chunk(ci, chunk, mint_chunk)
@@ -826,22 +943,22 @@ async def fetch_onchain_metadata_batch(
 
     async def _fetch_image(
         mint: str,
-    ) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[Any]]:
-        entry = uri_map.get(mint, (None, None, None))
-        uri, on_name, on_symbol = entry
+    ) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[Any]]:
+        entry = uri_map.get(mint, (None, None, None, None))
+        uri, on_name, on_symbol, collection_address = entry
         if not uri:
-            return None, None, on_name, on_symbol, None
+            return collection_address, None, None, on_name, on_symbol, None
         async with image_sem:
             try:
                 async with session.get(uri, timeout=http_timeout, allow_redirects=True) as resp:
                     if resp.status != 200:
-                        return uri, None, on_name, on_symbol, None
+                        return collection_address, uri, None, on_name, on_symbol, None
                     ct = resp.headers.get("Content-Type", "")
                     if "json" not in ct and not uri.endswith(".json"):
-                        return uri, None, on_name, on_symbol, None
+                        return collection_address, uri, None, on_name, on_symbol, None
                     meta_json = await resp.json(content_type=None)
                     if not isinstance(meta_json, dict):
-                        return uri, None, on_name, on_symbol, None
+                        return collection_address, uri, None, on_name, on_symbol, None
                     image = (
                         meta_json.get("image")
                         or meta_json.get("image_url")
@@ -851,6 +968,7 @@ async def fetch_onchain_metadata_batch(
                     name   = on_name   or meta_json.get("name")   or None
                     symbol = on_symbol or meta_json.get("symbol") or None
                     return (
+                        collection_address,
                         uri,
                         (image.strip() if isinstance(image, str) else None),
                         name,
@@ -858,7 +976,7 @@ async def fetch_onchain_metadata_batch(
                         meta_json,
                     )
             except Exception:
-                return uri, None, on_name, on_symbol, None
+                return collection_address, uri, None, on_name, on_symbol, None
 
     return list(await asyncio.gather(*[_fetch_image(mint) for mint in mints]))
 
@@ -869,12 +987,12 @@ async def fetch_metadata_batch(
     rpc_sem: asyncio.Semaphore,
     mints: List[str],
     image_sem: Optional[asyncio.Semaphore] = None,
-) -> List[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[Any]]]:
+) -> List[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[Any]]]:
     """
-    元数据获取主入口，返回 [(token_uri, image_url, name, symbol, metadata), ...] 与 mints 同序。
+    元数据获取主入口，返回 [(collection_address, token_uri, image_url, name, symbol, metadata), ...] 与 mints 同序。
 
       1. 优先 Helius DAS API getAssetBatch（配置了 HELIUS_API_KEY 时）
-         - 单批 1000 mint，直接返回 token_uri / image_url / name / symbol / metadata
+         - 单批 1000 mint，直接返回 collection / token_uri / image_url / name / symbol / metadata
       2. Helius 未命中（token_uri=None）或未配置 key → 回退链上：
          getMultipleAccounts → borsh 解码（含 name/symbol）→ HTTP 拉取 JSON
 
@@ -883,23 +1001,25 @@ async def fetch_metadata_batch(
     image_sem  : 限流链上路径的图片 HTTP 请求（未传则用 CONCURRENT_IMAGE 新建）
     """
     _img_sem = image_sem or asyncio.Semaphore(CONCURRENT_IMAGE)
-    _empty: Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[Any]] = (
-        None, None, None, None, None
+    _empty: Tuple[
+        Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[Any]
+    ] = (
+        None, None, None, None, None, None
     )
     results: List[
-        Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[Any]]
+        Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[Any]]
     ] = [_empty] * len(mints)
 
     if HELIUS_API_KEY:
         helius_results = await fetch_helius_metadata_batch(session, helius_sem, mints)
         results = list(helius_results)
 
-        # token_uri 或 image_url 任意一个缺失，均触发链上回退
+        # collection / token_uri / image_url 任意一个缺失，均触发链上回退
         # 链上路径会通过 getMultipleAccounts + borsh 解码 + HTTP 拉 JSON
         # 补全 Helius 未能返回的字段（partial miss 也能覆盖）
         fallback_indices = [
-            i for i, (uri, img, *_) in enumerate(results)
-            if not uri or not img
+            i for i, (collection, uri, img, *_) in enumerate(results)
+            if not collection or not uri or not img
         ]
         if fallback_indices:
             fallback_mints = [mints[i] for i in fallback_indices]
@@ -907,11 +1027,12 @@ async def fetch_metadata_batch(
                 session, rpc_sem, _img_sem, fallback_mints
             )
             # 字段级合并：Helius 已有的字段保留，缺失字段由链上结果补充
-            for idx, (o_uri, o_img, o_name, o_symbol, o_metadata) in zip(
+            for idx, (o_collection, o_uri, o_img, o_name, o_symbol, o_metadata) in zip(
                 fallback_indices, onchain
             ):
-                h_uri, h_img, h_name, h_symbol, h_metadata = results[idx]
+                h_collection, h_uri, h_img, h_name, h_symbol, h_metadata = results[idx]
                 results[idx] = (
+                    h_collection or o_collection,
                     h_uri    or o_uri,
                     h_img    or o_img,
                     h_name   or o_name,

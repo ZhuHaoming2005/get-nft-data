@@ -1,6 +1,7 @@
 import asyncio
 import importlib.util
 import json
+import struct
 import sys
 import types
 import unittest
@@ -126,21 +127,54 @@ class SolanaCommonDbFormatTests(unittest.TestCase):
     def setUpClass(cls):
         cls.common = _load_solana_common()
 
-    def test_init_db_creates_evm_compatible_asset_shape(self):
+    def test_init_db_creates_collection_asset_shape_for_snapshot_export(self):
         conn = _RecordingConn()
 
         self.common.init_db(conn, "solana")
 
         all_sql = "\n".join(sql for sql, _params in conn.cursor_obj.executed)
-        self.assertIn("token_id         NUMERIC", all_sql)
+        self.assertIn("contract_address VARCHAR(44)  NOT NULL", all_sql)
+        self.assertIn("token_id         VARCHAR(44)  NOT NULL", all_sql)
+        self.assertIn("mint_address     VARCHAR(44) NOT NULL", all_sql)
         self.assertIn("metadata         JSONB", all_sql)
         self.assertIn("UNIQUE (contract_address, token_id)", all_sql)
+        self.assertIn("UNIQUE (mint_address)", all_sql)
         self.assertIn("ADD CONSTRAINT nft_assets_solana_contract_token_key", all_sql)
-        self.assertIn("ADD CONSTRAINT temp_solana_contract_token_key", all_sql)
+        self.assertIn("ADD CONSTRAINT temp_solana_mint_key", all_sql)
+        self.assertNotIn("ALTER COLUMN token_id TYPE NUMERIC", all_sql)
+        self.assertNotIn("ALTER COLUMN token_id SET DEFAULT 1", all_sql)
         self.assertNotIn("CREATE UNIQUE INDEX IF NOT EXISTS idx_sol_nft_contract_token", all_sql)
         self.assertNotIn("CREATE UNIQUE INDEX IF NOT EXISTS idx_sol_temp_contract_token", all_sql)
 
-    def test_batch_insert_main_serializes_metadata_and_conflicts_on_contract_token(self):
+    def test_batch_insert_temp_records_pending_mints_without_token_ids(self):
+        conn = _RecordingConn()
+
+        inserted = self.common.batch_insert_temp(
+            conn,
+            "solana",
+            [
+                (
+                    "Mint111111111111111111111111111111111111111",
+                    "Metaplex",
+                    123456,
+                )
+            ],
+        )
+
+        self.assertEqual(inserted, 1)
+        insert_sql, params = conn.cursor_obj.executed[-1]
+        self.assertIn("INSERT INTO temp_solana (mint_address, token_standard, first_seen_block)", insert_sql)
+        self.assertIn("ON CONFLICT (mint_address)", insert_sql)
+        self.assertEqual(
+            params,
+            [
+                "Mint111111111111111111111111111111111111111",
+                "Metaplex",
+                123456,
+            ],
+        )
+
+    def test_batch_insert_main_serializes_metadata_and_uses_collection_plus_mint(self):
         conn = _RecordingConn()
         metadata = {"name": "NFT\x00 #1", "attributes": [{"trait_type": "rank\x00"}]}
 
@@ -149,8 +183,8 @@ class SolanaCommonDbFormatTests(unittest.TestCase):
             "solana",
             [
                 (
+                    "Collection1111111111111111111111111111111111",
                     "Mint111111111111111111111111111111111111111",
-                    1,
                     "ipfs://token/1",
                     "https://image.example/1.png",
                     "NFT\x00 #1",
@@ -167,6 +201,8 @@ class SolanaCommonDbFormatTests(unittest.TestCase):
         self.assertIn("metadata", insert_sql)
         self.assertIn("%s::jsonb", insert_sql)
         self.assertIn("ON CONFLICT (contract_address, token_id)", insert_sql)
+        self.assertEqual(params[0], "Collection1111111111111111111111111111111111")
+        self.assertEqual(params[1], "Mint111111111111111111111111111111111111111")
         self.assertEqual(params[4], "NFT #1")
         self.assertEqual(json.loads(params[6]), {"name": "NFT #1", "attributes": [{"trait_type": "rank"}]})
 
@@ -191,6 +227,12 @@ class SolanaHeliusMetadataTests(unittest.IsolatedAsyncioTestCase):
                             "attributes": [{"trait_type": "rank", "value": "1"}],
                         },
                     },
+                    "grouping": [
+                        {
+                            "group_key": "collection",
+                            "group_value": "Collection1111111111111111111111111111111111",
+                        }
+                    ],
                 }
             ]
         }
@@ -205,6 +247,7 @@ class SolanaHeliusMetadataTests(unittest.IsolatedAsyncioTestCase):
             result,
             [
                 (
+                    "Collection1111111111111111111111111111111111",
                     "ipfs://token/1",
                     "https://image.example/1.png",
                     "Collection #1",
@@ -217,6 +260,47 @@ class SolanaHeliusMetadataTests(unittest.IsolatedAsyncioTestCase):
                 )
             ],
         )
+
+
+class SolanaOnchainMetadataParsingTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.common = _load_solana_common()
+
+    def test_parse_metadata_account_extracts_collection_after_seller_fee(self):
+        mint_bytes = bytes([1]) * 32
+        collection_bytes = bytes([2]) * 32
+        mint_address = self.common.b58encode(mint_bytes)
+        collection_address = self.common.b58encode(collection_bytes)
+
+        def _borsh_string(value):
+            raw = value.encode("utf-8")
+            return struct.pack("<I", len(raw)) + raw
+
+        data = b"".join(
+            [
+                b"\x04",
+                bytes([9]) * 32,
+                mint_bytes,
+                _borsh_string("Onchain Name"),
+                _borsh_string("OCN"),
+                _borsh_string("https://metadata.example/1.json"),
+                struct.pack("<H", 500),
+                b"\x00",
+                b"\x00",
+                b"\x01",
+                b"\x00",
+                b"\x01\x00",
+                b"\x01\x01",
+                collection_bytes,
+            ]
+        )
+
+        parsed = self.common.parse_metadata_account(data)
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["mint"], mint_address)
+        self.assertEqual(parsed["collection"], collection_address)
 
 
 if __name__ == "__main__":
