@@ -24,8 +24,15 @@
 """
 
 import asyncio
+import multiprocessing
+import os
+import signal
+import socket
 import sys
-from typing import Any, List, Optional, Set, Tuple
+import threading
+import time
+from contextlib import contextmanager
+from typing import Any, List, Optional, Tuple
 
 import aiohttp
 
@@ -37,12 +44,16 @@ from common import (
     CONCURRENT_RPC,
     CONCURRENT_IMAGE,
     FETCH_IDLE_WAIT,
+    FETCH_CLAIM_BATCH_SIZE,
+    CLAIM_RETRY_AFTER_SECONDS,
+    REQUEST_STARTUP_STAGGER_SECONDS,
     logger,
     get_conn,
     init_db,
-    load_pending_nfts,
+    claim_pending_nfts,
     batch_insert_main,
     delete_temp_nfts,
+    release_temp_claims,
     fetch_metadata_batch,
 )
 
@@ -54,8 +65,65 @@ _INVALID_URI_PREFIXES = (
     "data:application/json",
 )
 
-# 连续 N 轮从 DB 读不到新数据时，将缓冲区中的不足-1000 的尾部强制刷出
-_DRAIN_AFTER_IDLE = 3
+FETCHER_WORKERS = max(int(os.getenv("FETCHER_WORKERS", "1")), 1)
+WORKER_STARTUP_DELAY_SECONDS = max(
+    0.0,
+    float(os.getenv("WORKER_STARTUP_DELAY_SECONDS", str(REQUEST_STARTUP_STAGGER_SECONDS))),
+)
+WORKER_SHUTDOWN_GRACE_SECONDS = max(
+    1.0,
+    float(os.getenv("WORKER_SHUTDOWN_GRACE_SECONDS", "5")),
+)
+
+
+def _is_stop_requested(stop_event) -> bool:
+    return bool(stop_event is not None and stop_event.is_set())
+
+
+@contextmanager
+def _install_stop_signal_handlers(stop_event):
+    handlers = {}
+
+    def _handle_stop(signum, frame):
+        if not _is_stop_requested(stop_event):
+            logger.info("收到停止信号，停止认领新记录，等待当前批次和善后完成...")
+        stop_event.set()
+
+    for sig in (signal.SIGINT, getattr(signal, "SIGTERM", None)):
+        if sig is None:
+            continue
+        try:
+            handlers[sig] = signal.getsignal(sig)
+            signal.signal(sig, _handle_stop)
+        except (OSError, RuntimeError, ValueError):
+            continue
+    try:
+        yield
+    finally:
+        for sig, previous in handlers.items():
+            try:
+                signal.signal(sig, previous)
+            except (OSError, RuntimeError, ValueError):
+                continue
+
+
+async def _sleep_interruptibly(delay: float, stop_event=None, *, interval: float = 0.5) -> bool:
+    remaining = max(0.0, delay)
+    while remaining > 0:
+        if _is_stop_requested(stop_event):
+            return True
+        step = min(interval, remaining)
+        await asyncio.sleep(step)
+        remaining -= step
+    return _is_stop_requested(stop_event)
+
+
+async def _maybe_wait_worker_startup(worker_index: int, stop_event=None) -> None:
+    delay = WORKER_STARTUP_DELAY_SECONDS * max(worker_index - 1, 0)
+    if delay <= 0:
+        return
+    logger.info("worker-%d 启动延迟 %.2f 秒，避免冷启动洪流", worker_index, delay)
+    await _sleep_interruptibly(delay, stop_event)
 
 
 async def _process_batch(
@@ -147,162 +215,207 @@ async def _do_write(
     all_inserts: List[Tuple],
     all_ids: List[int],
 ) -> Tuple[int, int]:
-    """并发写库（两个独立连接，insert / delete 互不阻塞）。"""
-    return await asyncio.gather(
-        asyncio.to_thread(batch_insert_main, conn_insert, CHAIN_NAME, all_inserts),
-        asyncio.to_thread(delete_temp_nfts,  conn_delete, CHAIN_NAME, all_ids),
+    """先写主表，成功后再删临时表；插入失败时保留临时表记录以便重试。"""
+    inserted = await asyncio.to_thread(
+        batch_insert_main, conn_insert, CHAIN_NAME, all_inserts
     )
+    deleted = await asyncio.to_thread(
+        delete_temp_nfts, conn_delete, CHAIN_NAME, all_ids
+    )
+    return inserted, deleted
 
 
-async def main() -> None:
+def _build_worker_id(worker_index: int) -> str:
+    return f"{socket.gethostname()}:{os.getpid()}:worker-{worker_index}"
+
+
+async def _worker_main(worker_index: int, stop_event=None) -> None:
+    stop_event = stop_event or threading.Event()
+    await _maybe_wait_worker_startup(worker_index, stop_event)
+    worker_id = _build_worker_id(worker_index)
     logger.info(
-        "═══ Solana Metadata 获取器启动 ═══  链: %s | RPC: %s",
-        CHAIN_NAME, RPC_URL,
+        "═══ Solana Metadata 获取器启动 ═══  链: %s | worker=%s | "
+        "claim_batch=%d | reclaim_after=%ds | RPC: %s",
+        CHAIN_NAME,
+        worker_id,
+        FETCH_CLAIM_BATCH_SIZE,
+        CLAIM_RETRY_AFTER_SECONDS,
+        RPC_URL,
     )
 
-    conn        = get_conn()   # 用于读临时表 + init_db
-    conn_insert = get_conn()   # 专用写主表连接
-    conn_delete = get_conn()   # 专用删临时表连接
-    init_db(conn, CHAIN_NAME)
+    conn_claim = conn_insert = conn_delete = None
+    pending_ids: List[int] = []
+    try:
+        conn_claim = get_conn()
+        conn_insert = get_conn()
+        conn_delete = get_conn()
 
-    # 信号量（全局复用，跨批次共享，避免每批重建）
-    helius_sem = asyncio.Semaphore(CONCURRENT_HELIUS)
-    rpc_sem    = asyncio.Semaphore(CONCURRENT_RPC)
-    image_sem  = asyncio.Semaphore(CONCURRENT_IMAGE)
+        total_inserted = total_deleted = 0
+        helius_sem = asyncio.Semaphore(CONCURRENT_HELIUS)
+        rpc_sem    = asyncio.Semaphore(CONCURRENT_RPC)
+        image_sem  = asyncio.Semaphore(CONCURRENT_IMAGE)
+        connector = aiohttp.TCPConnector(
+            limit=max((CONCURRENT_HELIUS + CONCURRENT_RPC + CONCURRENT_IMAGE) * 2, 20),
+            ttl_dns_cache=300,
+            enable_cleanup_closed=True,
+        )
 
-    # TCPConnector：不限总连接数，由信号量在应用层统一控流
-    connector = aiohttp.TCPConnector(
-        limit=0,
-        ttl_dns_cache=300,
-        enable_cleanup_closed=True,
-    )
-
-    total_inserted = total_deleted = 0
-
-    # ── 缓冲区：跨轮次积累，凑满 HELIUS_BATCH_SIZE 再触发请求 ──────────────────
-    buf: List[Tuple] = []       # 待处理行（(id, mint, std, slot)）
-    buf_ids: Set[int] = set()   # 已在 buf 中的 DB id，用于跨轮去重
-    idle_rounds = 0             # 连续读不到新数据的轮次计数
-
-    # ── 流水线状态：后台写库任务（与下一轮 HTTP 获取重叠）──────────────────────
-    # 时序：HTTP获取[N] → 启动写库Task[N] → continue → DB读 + HTTP获取[N+1]
-    #                                        → await写库Task[N]（通常已完成）→ 启动写库Task[N+1]
-    pending_write: Optional[asyncio.Task] = None  # 上一轮的写库后台任务
-    pw_total_raw:  int = 0   # 上一轮批次的原始记录数（用于日志）
-    pw_n_inserts:  int = 0   # 上一轮批次的有效记录数（用于日志）
-
-    async with aiohttp.ClientSession(
-        connector=connector,
-        trust_env=True,
-        connector_owner=True,
-    ) as session:
-
-        while True:
-            # 每轮读取足够多的记录，确保能填满若干个完整批次
-            load_limit = HELIUS_BATCH_SIZE * max(CONCURRENT_HELIUS * 3, 10)
-            pending = load_pending_nfts(conn, CHAIN_NAME, limit=load_limit)
-
-            # 将 DB 新行合并进缓冲区（按 DB id 去重，避免重复处理）
-            added = 0
-            for row in pending:
-                if row[0] not in buf_ids:
-                    buf.append(row)
-                    buf_ids.add(row[0])
-                    added += 1
-
-            if added > 0:
-                idle_rounds = 0
-                logger.info(
-                    "从临时表新增 %d 条，缓冲区共 %d 条",
-                    added, len(buf),
+        async with aiohttp.ClientSession(
+            connector=connector,
+            trust_env=True,
+            connector_owner=True,
+        ) as session:
+            while not _is_stop_requested(stop_event):
+                pending = claim_pending_nfts(
+                    conn_claim,
+                    CHAIN_NAME,
+                    worker_id=worker_id,
+                    batch_size=FETCH_CLAIM_BATCH_SIZE,
+                    reclaim_after_seconds=CLAIM_RETRY_AFTER_SECONDS,
                 )
+                pending_ids = [row[0] for row in pending]
 
-            # ── 并发获取所有就绪批次，流水线化写库 ──────────────────────────────
-            ready_batches: List[List[Tuple]] = []
-            while len(buf) >= HELIUS_BATCH_SIZE:
-                batch = buf[:HELIUS_BATCH_SIZE]
-                buf   = buf[HELIUS_BATCH_SIZE:]
-                buf_ids -= {row[0] for row in batch}
-                ready_batches.append(batch)
+                if _is_stop_requested(stop_event):
+                    break
 
-            if ready_batches:
-                # HTTP 获取（此时 pending_write 可能仍在后台运行 → 两者重叠）
-                all_inserts, all_ids, total_raw, n_inserts = await _fetch_all(
-                    session, helius_sem, rpc_sem, image_sem, ready_batches
-                )
-
-                # 获取完成后，结清上一轮写库（通常已结束，等待时间趋近于零）
-                if pending_write:
-                    ins, del_ = await pending_write
-                    total_inserted += ins
-                    total_deleted  += del_
+                if not pending:
                     logger.info(
-                        "  写入 %d，删除 %d（无效 %d）| 累计写入 %d 删除 %d",
-                        ins, del_, pw_total_raw - pw_n_inserts,
-                        total_inserted, total_deleted,
+                        "worker=%s 未认领到记录，等待 %d 秒后重试...",
+                        worker_id,
+                        FETCH_IDLE_WAIT,
                     )
-                    pending_write = None
+                    if await _sleep_interruptibly(FETCH_IDLE_WAIT, stop_event):
+                        break
+                    continue
 
-                # 本轮写库作为后台任务启动，立即 continue 进入下一轮读取+获取
-                pending_write = asyncio.create_task(
-                    _do_write(conn_insert, conn_delete, all_inserts, all_ids)
-                )
-                pw_total_raw = total_raw
-                pw_n_inserts = n_inserts
+                logger.info("► worker=%s 认领并处理临时表 %d 条记录", worker_id, len(pending))
+                try:
+                    all_inserts, all_ids, total_raw, n_inserts = await _fetch_all(
+                        session,
+                        helius_sem,
+                        rpc_sem,
+                        image_sem,
+                        [pending],
+                    )
+                    ins, del_ = await _do_write(
+                        conn_insert,
+                        conn_delete,
+                        all_inserts,
+                        all_ids,
+                    )
+                    pending_ids = []
+                except Exception:
+                    released = release_temp_claims(
+                        conn_claim,
+                        CHAIN_NAME,
+                        pending_ids,
+                        worker_id,
+                    )
+                    pending_ids = []
+                    logger.exception(
+                        "worker=%s 批次处理失败，已释放 %d 条认领记录等待重试",
+                        worker_id,
+                        released,
+                    )
+                    if await _sleep_interruptibly(1, stop_event):
+                        break
+                    continue
 
-                continue  # 立即再读，填满下一批（与 pending_write 并行）
-
-            # ── 无完整批次：先结清写库，再处理空闲 ──────────────────────────────
-            if pending_write:
-                ins, del_ = await pending_write
                 total_inserted += ins
                 total_deleted  += del_
                 logger.info(
-                    "  写入 %d，删除 %d（无效 %d）| 累计写入 %d 删除 %d",
-                    ins, del_, pw_total_raw - pw_n_inserts,
-                    total_inserted, total_deleted,
+                    "  worker=%s 本批: 写入主表 %d，从临时表删除 %d（无效丢弃 %d）"
+                    " | 累计写入 %d，累计删除 %d",
+                    worker_id,
+                    ins,
+                    del_,
+                    total_raw - n_inserts,
+                    total_inserted,
+                    total_deleted,
                 )
-                pending_write = None
 
-            if not buf:
-                logger.info(
-                    "临时表与缓冲区均为空，等待扫描器产出（%d 秒）...",
-                    FETCH_IDLE_WAIT,
-                )
-                await asyncio.sleep(FETCH_IDLE_WAIT)
+        if _is_stop_requested(stop_event):
+            logger.info("worker=%s 已停止认领新记录，当前批次和善后已完成", worker_id)
+    finally:
+        if pending_ids and conn_claim is not None:
+            try:
+                released = release_temp_claims(conn_claim, CHAIN_NAME, pending_ids, worker_id)
+                logger.info("worker=%s 退出前释放 %d 条未完成认领记录", worker_id, released)
+            except Exception:
+                logger.exception("worker=%s 退出释放认领记录失败", worker_id)
+        for conn in (conn_delete, conn_insert, conn_claim):
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
-            elif idle_rounds >= _DRAIN_AFTER_IDLE:
-                # 连续多轮无新数据 → 扫描器可能已停止，强制刷出尾部
-                logger.info(
-                    "缓冲区剩余 %d 条（<%d），连续 %d 轮无新增，强制刷出",
-                    len(buf), HELIUS_BATCH_SIZE, idle_rounds,
-                )
-                all_inserts, all_ids, total_raw, n_inserts = await _fetch_all(
-                    session, helius_sem, rpc_sem, image_sem, [buf], forced=True
-                )
-                ins, del_ = await _do_write(conn_insert, conn_delete, all_inserts, all_ids)
-                total_inserted += ins
-                total_deleted  += del_
-                logger.info(
-                    "  写入 %d，删除 %d（无效 %d）| 累计写入 %d 删除 %d",
-                    ins, del_, total_raw - n_inserts,
-                    total_inserted, total_deleted,
-                )
-                buf.clear()
-                buf_ids.clear()
-                idle_rounds = 0
 
-            else:
-                idle_rounds += 1
-                logger.info(
-                    "缓冲区 %d 条（<%d），等待更多数据（%d/%d 轮，%d 秒后重试）...",
-                    len(buf), HELIUS_BATCH_SIZE,
-                    idle_rounds, _DRAIN_AFTER_IDLE, FETCH_IDLE_WAIT,
-                )
-                await asyncio.sleep(FETCH_IDLE_WAIT)
+def _run_worker_process(worker_index: int, stop_event=None) -> None:
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    local_stop_event = stop_event or threading.Event()
+    with _install_stop_signal_handlers(local_stop_event):
+        asyncio.run(_worker_main(worker_index, stop_event=local_stop_event))
+
+
+def _wait_for_workers(workers: List[multiprocessing.Process], stop_event) -> None:
+    deadline: Optional[float] = None
+    while any(proc.is_alive() for proc in workers):
+        for proc in workers:
+            proc.join(timeout=0.2)
+        if _is_stop_requested(stop_event):
+            if deadline is None:
+                deadline = time.monotonic() + WORKER_SHUTDOWN_GRACE_SECONDS
+            elif time.monotonic() >= deadline:
+                break
+
+    lingering = [proc for proc in workers if proc.is_alive()]
+    if lingering:
+        logger.info("仍有 %d 个 metadata worker 未在宽限期内退出，执行强制停止", len(lingering))
+        for proc in lingering:
+            proc.terminate()
+        for proc in lingering:
+            proc.join(timeout=1)
+
+
+def main() -> None:
+    conn = get_conn()
+    try:
+        init_db(conn, CHAIN_NAME)
+    finally:
+        conn.close()
+
+    stop_event = multiprocessing.Event()
+    with _install_stop_signal_handlers(stop_event):
+        if FETCHER_WORKERS <= 1:
+            _run_worker_process(1, stop_event)
+            return
+
+        logger.info(
+            "启动 %d 个 Solana metadata worker 进程；每进程并发: Helius=%d RPC=%d image=%d",
+            FETCHER_WORKERS,
+            CONCURRENT_HELIUS,
+            CONCURRENT_RPC,
+            CONCURRENT_IMAGE,
+        )
+        workers = [
+            multiprocessing.Process(
+                target=_run_worker_process,
+                args=(index, stop_event),
+                name=f"{CHAIN_NAME}-metadata-{index}",
+            )
+            for index in range(1, FETCHER_WORKERS + 1)
+        ]
+        for proc in workers:
+            proc.start()
+
+        try:
+            _wait_for_workers(workers, stop_event)
+        except KeyboardInterrupt:
+            stop_event.set()
+            _wait_for_workers(workers, stop_event)
 
 
 if __name__ == "__main__":
-    if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    asyncio.run(main())
+    main()

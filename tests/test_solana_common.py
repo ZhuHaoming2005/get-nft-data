@@ -11,6 +11,15 @@ from pathlib import Path
 def _load_solana_common():
     psycopg2 = types.ModuleType("psycopg2")
     psycopg2.extensions = types.SimpleNamespace(connection=object)
+    psycopg2.extras = types.ModuleType("psycopg2.extras")
+
+    def _execute_values(cur, sql, page, template=None, page_size=None):
+        flat = [item for rec in page for item in rec]
+        recorded_sql = f"{sql}\n{template or ''}"
+        cur.execute(recorded_sql, flat)
+        cur.rowcount = len(page)
+
+    psycopg2.extras.execute_values = _execute_values
 
     dotenv = types.ModuleType("dotenv")
     dotenv.load_dotenv = lambda *args, **kwargs: None
@@ -35,6 +44,7 @@ def _load_solana_common():
 
     injected = {
         "psycopg2": psycopg2,
+        "psycopg2.extras": psycopg2.extras,
         "dotenv": dotenv,
         "aiohttp": aiohttp,
     }
@@ -141,6 +151,9 @@ class SolanaCommonDbFormatTests(unittest.TestCase):
         self.assertIn("UNIQUE (mint_address)", all_sql)
         self.assertIn("ADD CONSTRAINT nft_assets_solana_contract_token_key", all_sql)
         self.assertIn("ADD CONSTRAINT temp_solana_mint_key", all_sql)
+        self.assertIn("claimed_at       TIMESTAMPTZ", all_sql)
+        self.assertIn("claimed_by       TEXT", all_sql)
+        self.assertIn("idx_sol_temp_claimed_at", all_sql)
         self.assertNotIn("ALTER COLUMN token_id TYPE NUMERIC", all_sql)
         self.assertNotIn("ALTER COLUMN token_id SET DEFAULT 1", all_sql)
         self.assertNotIn("CREATE UNIQUE INDEX IF NOT EXISTS idx_sol_nft_contract_token", all_sql)
@@ -206,6 +219,93 @@ class SolanaCommonDbFormatTests(unittest.TestCase):
         self.assertEqual(params[4], "NFT #1")
         self.assertEqual(json.loads(params[6]), {"name": "NFT #1", "attributes": [{"trait_type": "rank"}]})
 
+    def test_batch_insert_main_uses_paged_execute_values(self):
+        conn = _RecordingConn()
+        calls = []
+        original_execute_values = self.common.execute_values
+        original_page_size = self.common.DB_INSERT_PAGE_SIZE
+        self.common.DB_INSERT_PAGE_SIZE = 2
+
+        def _fake_execute_values(cur, sql, page, template=None, page_size=None):
+            calls.append((sql, list(page), template, page_size))
+            cur.rowcount = len(page)
+
+        self.common.execute_values = _fake_execute_values
+        try:
+            inserted = self.common.batch_insert_main(
+                conn,
+                "solana",
+                [
+                    (
+                        "Collection1111111111111111111111111111111111",
+                        f"Mint{i:041d}",
+                        f"ipfs://token/{i}",
+                        f"https://image.example/{i}.png",
+                        f"NFT #{i}",
+                        "SYM",
+                        {"rank": i},
+                        "Metaplex",
+                        123456,
+                    )
+                    for i in range(5)
+                ],
+            )
+        finally:
+            self.common.execute_values = original_execute_values
+            self.common.DB_INSERT_PAGE_SIZE = original_page_size
+
+        self.assertEqual(inserted, 5)
+        self.assertEqual([len(call[1]) for call in calls], [2, 2, 1])
+        self.assertTrue(all(call[3] == len(call[1]) for call in calls))
+        self.assertTrue(all("%s::jsonb" in call[2] for call in calls))
+
+    def test_claim_pending_nfts_uses_skip_locked_and_marks_worker(self):
+        class _ClaimCursor(_RecordingCursor):
+            def __init__(self):
+                super().__init__()
+                self.rowcount = 1
+
+            def fetchall(self):
+                return [(7, "Mint111", "Metaplex", 123456)]
+
+        class _ClaimConn(_RecordingConn):
+            def __init__(self):
+                self.cursor_obj = _ClaimCursor()
+                self.commit_count = 0
+
+        conn = _ClaimConn()
+
+        claimed = self.common.claim_pending_nfts(
+            conn,
+            "solana",
+            worker_id="host:123:worker-1",
+            batch_size=500,
+            reclaim_after_seconds=1800,
+        )
+
+        sql, params = conn.cursor_obj.executed[-1]
+        self.assertIn("FOR UPDATE SKIP LOCKED", sql)
+        self.assertIn("SET claimed_at = NOW(), claimed_by = %s", sql)
+        self.assertEqual(params, ("1800 seconds", 500, "host:123:worker-1"))
+        self.assertEqual(claimed, [(7, "Mint111", "Metaplex", 123456)])
+
+    def test_release_temp_claims_clears_only_current_worker_claims(self):
+        conn = _RecordingConn()
+        conn.cursor_obj.rowcount = 2
+
+        released = self.common.release_temp_claims(
+            conn,
+            "solana",
+            [7, 8],
+            "host:123:worker-1",
+        )
+
+        sql, params = conn.cursor_obj.executed[-1]
+        self.assertIn("SET claimed_at = NULL, claimed_by = NULL", sql)
+        self.assertIn("WHERE id = ANY(%s) AND claimed_by = %s", sql)
+        self.assertEqual(params, ([7, 8], "host:123:worker-1"))
+        self.assertEqual(released, 2)
+
 
 class SolanaHeliusMetadataTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
@@ -260,6 +360,67 @@ class SolanaHeliusMetadataTests(unittest.IsolatedAsyncioTestCase):
                 )
             ],
         )
+
+    async def test_fetch_gpa_page_raises_on_rpc_error_instead_of_marking_complete(self):
+        payload = {"error": {"code": -32005, "message": "upstream unavailable"}}
+
+        with self.assertRaisesRegex(RuntimeError, "GPA RPC"):
+            await self.common.fetch_gpa_page(
+                _FakeSession(payload),
+                "https://rpc.example",
+                page_size=1000,
+                pagination_key=None,
+            )
+
+    async def test_fetch_metadata_batch_does_not_fallback_when_only_collection_is_missing(self):
+        self.common.HELIUS_API_KEY = "test-key"
+        fallback_calls = []
+        original_helius = self.common.fetch_helius_metadata_batch
+        original_onchain = self.common.fetch_onchain_metadata_batch
+
+        async def _helius(*_args, **_kwargs):
+            return [
+                (
+                    None,
+                    "ipfs://token/1",
+                    "https://image.example/1.png",
+                    "Ungrouped #1",
+                    "UNG",
+                    {"name": "Ungrouped #1"},
+                )
+            ]
+
+        async def _onchain(*_args, **_kwargs):
+            fallback_calls.append(True)
+            return [
+                (
+                    "CollectionShouldNotBeFetched",
+                    "ipfs://token/1",
+                    "https://image.example/1.png",
+                    "Ungrouped #1",
+                    "UNG",
+                    {"name": "Ungrouped #1"},
+                )
+            ]
+
+        self.common.fetch_helius_metadata_batch = _helius
+        self.common.fetch_onchain_metadata_batch = _onchain
+        try:
+            result = await self.common.fetch_metadata_batch(
+                object(),
+                asyncio.Semaphore(1),
+                asyncio.Semaphore(1),
+                ["Mint111"],
+                asyncio.Semaphore(1),
+            )
+        finally:
+            self.common.fetch_helius_metadata_batch = original_helius
+            self.common.fetch_onchain_metadata_batch = original_onchain
+
+        self.assertEqual(fallback_calls, [])
+        self.assertEqual(result[0][0], None)
+        self.assertEqual(result[0][1], "ipfs://token/1")
+        self.assertEqual(result[0][2], "https://image.example/1.png")
 
 
 class SolanaOnchainMetadataParsingTests(unittest.TestCase):

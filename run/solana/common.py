@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 import psycopg2
+from psycopg2.extras import execute_values
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -68,6 +69,13 @@ CONCURRENT_HELIUS = int(os.getenv("CONCURRENT_HELIUS", "5"))
 CONCURRENT_RPC    = int(os.getenv("CONCURRENT_RPC", "10"))
 CONCURRENT_IMAGE  = int(os.getenv("CONCURRENT_IMAGE", "50"))
 FETCH_IDLE_WAIT   = int(os.getenv("FETCH_IDLE_WAIT", "30"))
+FETCH_CLAIM_BATCH_SIZE = int(os.getenv("FETCH_CLAIM_BATCH_SIZE", "5000"))
+CLAIM_RETRY_AFTER_SECONDS = int(os.getenv("CLAIM_RETRY_AFTER_SECONDS", "1800"))
+REQUEST_STARTUP_STAGGER_SECONDS = max(
+    0.0,
+    float(os.getenv("REQUEST_STARTUP_STAGGER_SECONDS", "0")),
+)
+DB_INSERT_PAGE_SIZE = int(os.getenv("DB_INSERT_PAGE_SIZE", "1000"))
 
 # ── getProgramAccountsV2 配置 ──────────────────────────────────────────────────
 # Helius 专属 RPC URL（getProgramAccountsV2 是 Helius 私有方法，需要 Helius 节点）
@@ -432,6 +440,8 @@ def init_db(conn, chain_name: str) -> None:
                 mint_address     VARCHAR(44) NOT NULL,
                 token_standard   VARCHAR(20),
                 first_seen_block BIGINT,
+                claimed_at       TIMESTAMPTZ,
+                claimed_by       TEXT,
                 created_at       TIMESTAMPTZ DEFAULT NOW(),
                 CONSTRAINT {tmp}_mint_key UNIQUE (mint_address)
             )
@@ -474,6 +484,12 @@ def init_db(conn, chain_name: str) -> None:
             f"CREATE INDEX IF NOT EXISTS idx_sol_temp_mint"
             f" ON {tmp} (mint_address)"
         )
+        cur.execute(f"ALTER TABLE {tmp} ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ")
+        cur.execute(f"ALTER TABLE {tmp} ADD COLUMN IF NOT EXISTS claimed_by TEXT")
+        cur.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_sol_temp_claimed_at"
+            f" ON {tmp} (claimed_at, id)"
+        )
         # GPA 扫描进度表（getProgramAccountsV2 游标分页断点续扫）
         cur.execute("""
             CREATE TABLE IF NOT EXISTS scan_progress_gpa (
@@ -486,6 +502,27 @@ def init_db(conn, chain_name: str) -> None:
         """)
     conn.commit()
     logger.info("数据库表初始化完成: 主表=%s  临时表=%s", tbl, tmp)
+
+
+def ensure_temp_table_claim_columns(conn, chain_name: str) -> None:
+    """确保临时表认领列存在；供 metadata_fetcher 多实例安全消费。"""
+    tmp = _temp_table_name(chain_name)
+    with conn.cursor() as cur:
+        cur.execute(f"ALTER TABLE {tmp} ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ")
+        cur.execute(f"ALTER TABLE {tmp} ADD COLUMN IF NOT EXISTS claimed_by TEXT")
+        cur.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_sol_temp_claimed_at"
+            f" ON {tmp} (claimed_at, id)"
+        )
+    conn.commit()
+    logger.info("临时表认领列检查完成: %s (claimed_at, claimed_by)", tmp)
+
+
+def _is_missing_claim_column_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    if getattr(exc, "pgcode", None) != "42703" and "does not exist" not in message:
+        return False
+    return "claimed_at" in message or "claimed_by" in message
 
 
 def get_gpa_progress(conn, chain_name: str) -> Tuple[Optional[str], int, int]:
@@ -599,6 +636,58 @@ def load_pending_nfts(conn, chain_name: str, limit: int = 5000) -> List[Tuple]:
     return result
 
 
+def claim_pending_nfts(
+    conn,
+    chain_name: str,
+    worker_id: str,
+    batch_size: int = FETCH_CLAIM_BATCH_SIZE,
+    reclaim_after_seconds: int = CLAIM_RETRY_AFTER_SECONDS,
+) -> List[Tuple]:
+    """
+    metadata_fetcher 专用：原子认领一批临时表记录，供多实例安全并行消费。
+    返回 [(id, mint_address, token_standard, first_seen_slot), ...]
+    """
+    tmp = _temp_table_name(chain_name)
+    params = (f"{reclaim_after_seconds} seconds", batch_size, worker_id)
+
+    def _claim_once() -> List[Tuple]:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                WITH candidates AS (
+                    SELECT id
+                    FROM {tmp}
+                    WHERE claimed_at IS NULL
+                       OR claimed_at < NOW() - %s::interval
+                    ORDER BY id
+                    LIMIT %s
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE {tmp} AS t
+                SET claimed_at = NOW(), claimed_by = %s
+                FROM candidates
+                WHERE t.id = candidates.id
+                RETURNING t.id, t.mint_address, t.token_standard, t.first_seen_block
+                """,
+                params,
+            )
+            return [(row[0], row[1], row[2], row[3]) for row in cur.fetchall()]
+
+    try:
+        result = _claim_once()
+    except Exception as exc:
+        if not _is_missing_claim_column_error(exc):
+            raise
+        if hasattr(conn, "rollback"):
+            conn.rollback()
+        logger.warning("临时表缺少认领列，自动补列后重试: %s", tmp)
+        ensure_temp_table_claim_columns(conn, chain_name)
+        result = _claim_once()
+
+    conn.commit()
+    return result
+
+
 def batch_insert_main(conn, chain_name: str, records: List[Tuple]) -> int:
     """
     metadata_fetcher 专用：将有效 NFT 写入主表。
@@ -637,17 +726,11 @@ def batch_insert_main(conn, chain_name: str, records: List[Tuple]) -> int:
             metadata = _json.dumps(metadata, ensure_ascii=False)
         normalized_records.append(cleaned[:6] + (metadata,) + cleaned[7:])
 
-    with conn.cursor() as cur:
-        placeholders = ", ".join(
-            ["(%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)"] * len(normalized_records)
-        )
-        flat = [item for rec in normalized_records for item in rec]
-        cur.execute(
-            f"""
+    sql = f"""
             INSERT INTO {tbl}
                 (contract_address, token_id, token_uri, image_uri,
                  name, symbol, metadata, token_standard, first_seen_block)
-            VALUES {placeholders}
+            VALUES %s
             ON CONFLICT (contract_address, token_id) DO UPDATE SET
                 token_uri        = COALESCE(EXCLUDED.token_uri,  {tbl}.token_uri),
                 image_uri        = COALESCE(EXCLUDED.image_uri,  {tbl}.image_uri),
@@ -655,10 +738,20 @@ def batch_insert_main(conn, chain_name: str, records: List[Tuple]) -> int:
                 symbol           = COALESCE(EXCLUDED.symbol,     {tbl}.symbol),
                 metadata         = COALESCE(EXCLUDED.metadata,   {tbl}.metadata),
                 token_standard   = COALESCE(EXCLUDED.token_standard, {tbl}.token_standard)
-            """,
-            flat,
-        )
-        inserted = cur.rowcount
+            """
+
+    inserted = 0
+    with conn.cursor() as cur:
+        for start in range(0, len(normalized_records), DB_INSERT_PAGE_SIZE):
+            page = normalized_records[start: start + DB_INSERT_PAGE_SIZE]
+            execute_values(
+                cur,
+                sql,
+                page,
+                template="(%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)",
+                page_size=len(page),
+            )
+            inserted += max(cur.rowcount, 0)
     conn.commit()
     return inserted
 
@@ -672,6 +765,26 @@ def delete_temp_nfts(conn, chain_name: str, ids: List[int]) -> int:
         deleted = cur.rowcount
     conn.commit()
     return deleted
+
+
+def release_temp_claims(conn, chain_name: str, ids: List[int], worker_id: str) -> int:
+    """metadata_fetcher 专用：释放当前 worker 尚未完成的认领，便于快速重试。"""
+    if not ids:
+        return 0
+    tmp = _temp_table_name(chain_name)
+    ordered_ids = sorted(set(ids))
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            UPDATE {tmp}
+            SET claimed_at = NULL, claimed_by = NULL
+            WHERE id = ANY(%s) AND claimed_by = %s
+            """,
+            (ordered_ids, worker_id),
+        )
+        released = cur.rowcount
+    conn.commit()
+    return released
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1014,12 +1127,13 @@ async def fetch_metadata_batch(
         helius_results = await fetch_helius_metadata_batch(session, helius_sem, mints)
         results = list(helius_results)
 
-        # collection / token_uri / image_url 任意一个缺失，均触发链上回退
+        # token_uri / image_url 缺失时触发链上回退。collection 缺失本身不回退；
+        # 无 collection 的资产由 metadata_fetcher 用 mint 作为 singleton collection。
         # 链上路径会通过 getMultipleAccounts + borsh 解码 + HTTP 拉 JSON
         # 补全 Helius 未能返回的字段（partial miss 也能覆盖）
         fallback_indices = [
-            i for i, (collection, uri, img, *_) in enumerate(results)
-            if not collection or not uri or not img
+            i for i, (_collection, uri, img, *_) in enumerate(results)
+            if not uri or not img
         ]
         if fallback_indices:
             fallback_mints = [mints[i] for i in fallback_indices]
@@ -1051,6 +1165,11 @@ async def fetch_metadata_batch(
 # ══════════════════════════════════════════════════════════════════════════════
 # Helius getProgramAccountsV2：全链 NFT Mint 发现
 # ══════════════════════════════════════════════════════════════════════════════
+
+
+class GpaPageFetchError(RuntimeError):
+    """Raised when a GPA page cannot be fetched without corrupting scan progress."""
+
 
 async def fetch_gpa_page(
     session: aiohttp.ClientSession,
@@ -1124,12 +1243,14 @@ async def fetch_gpa_page(
             await asyncio.sleep(wait)
 
     if body is None:
-        logger.error("GPA 全部重试失败，跳过本页")
-        return [], pagination_key  # 返回原 key，上层可重试
+        message = f"GPA 全部重试失败，paginationKey={pagination_key!r}"
+        logger.error(message)
+        raise GpaPageFetchError(message)
 
     if body.get("error"):
-        logger.error("GPA RPC 错误: %s", body["error"])
-        return [], pagination_key
+        message = f"GPA RPC 错误: {body['error']}"
+        logger.error(message)
+        raise GpaPageFetchError(message)
 
     result   = body.get("result") or {}
     accounts = result.get("accounts") or []

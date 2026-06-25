@@ -104,108 +104,113 @@ async def main() -> None:
     # ── 获取当前最新 Slot（全量完成后存入 since_slot 供下次增量用）──────────
     connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300, enable_cleanup_closed=True)
     session   = aiohttp.ClientSession(connector=connector, trust_env=True)
+    prefetch_task: Optional[asyncio.Task] = None
 
-    latest_slot = await get_latest_slot(session, HELIUS_RPC_URL)
-    if latest_slot == 0:
-        logger.warning("无法获取最新 Slot，将在全量扫描完成后以 0 存入 since_slot")
+    try:
+        latest_slot = await get_latest_slot(session, HELIUS_RPC_URL)
+        if latest_slot == 0:
+            logger.warning("无法获取最新 Slot，将在全量扫描完成后以 0 存入 since_slot")
 
-    mode_str = (
-        f"增量（since={since_slot}）" if since_slot > 0
-        else "全量"
-    )
-    logger.info("扫描模式: %s | 当前最新 Slot: %d", mode_str, latest_slot)
-
-    # ── 流水线主循环 ──────────────────────────────────────────────────────────
-    #
-    # 由于 GPA 分页是串行的（下一页 key 来自上一页响应），
-    # 无法真正并行；但可以流水线：
-    #   拉取第 N+1 页（HTTP）与处理第 N 页（去重 + 写库）并发执行。
-    #
-    #   时间线：
-    #     HTTP[0] → await → process[0] + HTTP[1] 并发 → await HTTP[1]
-    #                       → process[1] + HTTP[2] 并发 → ...
-    #
-    total_new    = 0
-    total_pages  = total_pages_base
-    current_key  = resume_key
-
-    # 启动第一页的预取任务
-    prefetch_task: asyncio.Task = asyncio.create_task(
-        fetch_gpa_page(
-            session, HELIUS_RPC_URL, GPA_PAGE_SIZE,
-            pagination_key=current_key,
-            changed_since_slot=since_slot or None,
+        mode_str = (
+            f"增量（since={since_slot}）" if since_slot > 0
+            else "全量"
         )
-    )
+        logger.info("扫描模式: %s | 当前最新 Slot: %d", mode_str, latest_slot)
 
-    while True:
-        # 等待当前页数据就绪
-        mints, next_key = await prefetch_task
+        # ── 流水线主循环 ──────────────────────────────────────────────────────────
+        #
+        # 由于 GPA 分页是串行的（下一页 key 来自上一页响应），
+        # 无法真正并行；但可以流水线：
+        #   拉取第 N+1 页（HTTP）与处理第 N 页（去重 + 写库）并发执行。
+        #
+        #   时间线：
+        #     HTTP[0] → await → process[0] + HTTP[1] 并发 → await HTTP[1]
+        #                       → process[1] + HTTP[2] 并发 → ...
+        #
+        total_new    = 0
+        total_pages  = total_pages_base
+        current_key  = resume_key
 
-        # 立即启动下一页的预取（与本页处理并发）
-        if next_key is not None:
-            prefetch_task = asyncio.create_task(
-                fetch_gpa_page(
-                    session, HELIUS_RPC_URL, GPA_PAGE_SIZE,
-                    pagination_key=next_key,
-                    changed_since_slot=since_slot or None,
+        # 启动第一页的预取任务
+        prefetch_task = asyncio.create_task(
+            fetch_gpa_page(
+                session, HELIUS_RPC_URL, GPA_PAGE_SIZE,
+                pagination_key=current_key,
+                changed_since_slot=since_slot or None,
+            )
+        )
+
+        while True:
+            # 等待当前页数据就绪；异常会退出进程且不会保存伪完成进度。
+            mints, next_key = await prefetch_task
+
+            # 立即启动下一页的预取（与本页处理并发）
+            if next_key is not None:
+                prefetch_task = asyncio.create_task(
+                    fetch_gpa_page(
+                        session, HELIUS_RPC_URL, GPA_PAGE_SIZE,
+                        pagination_key=next_key,
+                        changed_since_slot=since_slot or None,
+                    )
                 )
+
+            total_pages += 1
+
+            # ── 处理本页 mint ─────────────────────────────────────────────────
+            records: List[Tuple] = [(mint, "Metaplex", 0) for mint in mints]
+
+            # ── 写库（线程池，不阻塞事件循环）───────────────────────────────────
+            inserted = await asyncio.to_thread(
+                batch_insert_temp, write_conn, CHAIN_NAME, records
             )
 
-        total_pages += 1
+            # 保存断点：若未到最后一页，记录 next_key 用于意外中断后续扫
+            await asyncio.to_thread(
+                save_gpa_progress,
+                write_conn, CHAIN_NAME,
+                next_key,       # None 表示全量已完成
+                latest_slot if next_key is None else 0,
+                total_pages,
+            )
 
-        # ── 处理本页 mint ─────────────────────────────────────────────────
-        records: List[Tuple] = [(mint, "Metaplex", 0) for mint in mints]
+            del records
 
-        # ── 写库（线程池，不阻塞事件循环）───────────────────────────────────
-        inserted = await asyncio.to_thread(
-            batch_insert_temp, write_conn, CHAIN_NAME, records
-        )
+            total_new += inserted
+            logger.info(
+                "  第%d页：本页 %d 个 mint，落库 %d | 累计新增 %d",
+                total_pages, len(mints), inserted, total_new,
+            )
 
-        # 保存断点：若未到最后一页，记录 next_key 用于意外中断后续扫
-        await asyncio.to_thread(
-            save_gpa_progress,
-            write_conn, CHAIN_NAME,
-            next_key,       # None 表示全量已完成
-            latest_slot if next_key is None else 0,
-            total_pages,
-        )
+            # ── 判断是否到最后一页 ────────────────────────────────────────────
+            if next_key is None:
+                break
 
-        del records
+            current_key = next_key
 
-        total_new += inserted
-        logger.info(
-            "  第%d页：本页 %d 个 mint，落库 %d | 累计新增 %d",
-            total_pages, len(mints), inserted, total_new,
-        )
-
-        # ── 判断是否到最后一页 ────────────────────────────────────────────
-        if next_key is None:
-            break
-
-        current_key = next_key
-
-    # ── 全量扫描完成后的日志提示 ──────────────────────────────────────────────
-    if since_slot == 0 and latest_slot > 0:
-        logger.info(
-            "═══ 全量扫描完成 ═══  共处理 %d 页，本次新增 %d 条 mint",
-            total_pages, total_new,
-        )
-        logger.info(
-            "已将 since_slot=%d 写入 DB。下次运行将自动切换为增量模式，"
-            "只拉取该 Slot 之后新增/变化的账户。",
-            latest_slot,
-        )
-    else:
-        logger.info(
-            "═══ 扫描完成 ═══  共处理 %d 页，本次新增 %d 条 mint",
-            total_pages, total_new,
-        )
-
-    await session.close()
-    await connector.close()
-    write_conn.close()
-    conn.close()
+        # ── 全量扫描完成后的日志提示 ──────────────────────────────────────────────
+        if since_slot == 0 and latest_slot > 0:
+            logger.info(
+                "═══ 全量扫描完成 ═══  共处理 %d 页，本次新增 %d 条 mint",
+                total_pages, total_new,
+            )
+            logger.info(
+                "已将 since_slot=%d 写入 DB。下次运行将自动切换为增量模式，"
+                "只拉取该 Slot 之后新增/变化的账户。",
+                latest_slot,
+            )
+        else:
+            logger.info(
+                "═══ 扫描完成 ═══  共处理 %d 页，本次新增 %d 条 mint",
+                total_pages, total_new,
+            )
+    finally:
+        if prefetch_task is not None and not prefetch_task.done():
+            prefetch_task.cancel()
+            await asyncio.gather(prefetch_task, return_exceptions=True)
+        await session.close()
+        await connector.close()
+        write_conn.close()
+        conn.close()
 
 
 if __name__ == "__main__":
