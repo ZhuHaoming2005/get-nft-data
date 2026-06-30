@@ -300,6 +300,25 @@ fn export_snapshot_subcommand_is_exposed() {
 }
 
 #[test]
+fn export_snapshot_accepts_optional_block_bounds() {
+    let cli = TopContractAnalysisCli::parse_from([
+        "top_contract_analysis_rs",
+        "export-snapshot",
+        "--output",
+        "snapshot.parquet",
+        "--start-block",
+        "10",
+        "--end-block",
+        "20",
+    ]);
+    let CliCommand::ExportSnapshot(args) = cli.command else {
+        panic!("expected export-snapshot command");
+    };
+    assert_eq!(args.start_block, Some(10));
+    assert_eq!(args.end_block, Some(20));
+}
+
+#[test]
 fn export_snapshot_rejects_removed_keep_metadata_json_flag() {
     Command::cargo_bin("top_contract_analysis_rs")
         .unwrap()

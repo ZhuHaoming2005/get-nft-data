@@ -24,19 +24,97 @@ pub struct SnapshotExportRow {
     pub metadata_json: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SnapshotBlockRange {
+    pub start: Option<i64>,
+    pub end: Option<i64>,
+}
+
+impl SnapshotBlockRange {
+    pub fn new(start: Option<i64>, end: Option<i64>) -> Result<Self, AppError> {
+        if start.is_some_and(|value| value < 0) || end.is_some_and(|value| value < 0) {
+            return Err(AppError::InvalidData(
+                "snapshot block bounds must be non-negative".to_string(),
+            ));
+        }
+        if matches!((start, end), (Some(start), Some(end)) if start > end) {
+            return Err(AppError::InvalidData(
+                "snapshot start block must not exceed end block".to_string(),
+            ));
+        }
+        Ok(Self { start, end })
+    }
+
+    pub fn validate_for_chain(self, chain: &str) -> Result<Self, AppError> {
+        if chain.eq_ignore_ascii_case("solana") && (self.start.is_some() || self.end.is_some()) {
+            return Err(AppError::InvalidData(
+                "Solana block filtering is unavailable because current rows use first_seen_block = 0"
+                    .to_string(),
+            ));
+        }
+        Ok(self)
+    }
+}
+
+struct SnapshotQuery {
+    sql: String,
+    params: Vec<i64>,
+}
+
+fn canonical_contract_address(chain: &str, address: &str) -> String {
+    let trimmed = address.trim();
+    if chain.eq_ignore_ascii_case("solana") {
+        trimmed.to_string()
+    } else {
+        trimmed.to_lowercase()
+    }
+}
+
 fn chain_to_table(chain: &str) -> Result<String, AppError> {
-    let safe: String = chain
-        .trim()
-        .to_lowercase()
-        .chars()
-        .filter(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || *ch == '_')
-        .collect();
-    if safe.is_empty() {
+    let normalized = chain.trim().to_lowercase();
+    if normalized.is_empty()
+        || !normalized
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+    {
         return Err(AppError::InvalidData(format!(
             "illegal chain name: {chain:?}"
         )));
     }
-    Ok(format!("nft_assets_{safe}"))
+    Ok(format!("nft_assets_{normalized}"))
+}
+
+fn build_snapshot_query(
+    table: &str,
+    metadata_column: &str,
+    block_range: SnapshotBlockRange,
+) -> SnapshotQuery {
+    let mut predicates = Vec::new();
+    let mut params = Vec::new();
+    if let Some(start) = block_range.start {
+        params.push(start);
+        predicates.push(format!("first_seen_block >= ${}", params.len()));
+    }
+    if let Some(end) = block_range.end {
+        params.push(end);
+        predicates.push(format!("first_seen_block <= ${}", params.len()));
+    }
+    let where_clause = if predicates.is_empty() {
+        String::new()
+    } else {
+        format!("\n        WHERE {}", predicates.join(" AND "))
+    };
+    SnapshotQuery {
+        sql: format!(
+            "
+        SELECT contract_address, token_id::text, coalesce(token_uri, ''), coalesce(image_uri, ''),
+               coalesce(name, ''), coalesce(symbol, ''), coalesce({metadata_column}::text, '')
+        FROM {table}{where_clause}
+        ORDER BY id
+        "
+        ),
+        params,
+    }
 }
 
 fn snapshot_schema() -> Arc<Schema> {
@@ -61,7 +139,7 @@ fn snapshot_batch(chain: &str, rows: &[SnapshotExportRow]) -> Result<RecordBatch
     let chain_values: Vec<String> = rows.iter().map(|_| chain.to_string()).collect();
     let contract_address_values: Vec<String> = rows
         .iter()
-        .map(|row| row.contract_address.to_lowercase())
+        .map(|row| canonical_contract_address(chain, &row.contract_address))
         .collect();
     let token_id_values: Vec<String> = rows.iter().map(|row| row.token_id.clone()).collect();
     let token_uri_values: Vec<String> = rows.iter().map(|row| row.token_uri.clone()).collect();
@@ -137,7 +215,9 @@ pub fn export_chain_snapshot_to_parquet(
     chain: &str,
     output_path: &Path,
     fetch_size: usize,
+    block_range: SnapshotBlockRange,
 ) -> Result<(), AppError> {
+    let block_range = block_range.validate_for_chain(chain)?;
     let table = chain_to_table(chain)?;
     let metadata_row = conn.query_opt(
         "
@@ -154,16 +234,13 @@ pub fn export_chain_snapshot_to_parquet(
         .and_then(|row| row.try_get::<_, String>(0).ok())
         .unwrap_or_else(|| "metadata".to_string());
 
-    let query = format!(
-        "
-        SELECT lower(contract_address), token_id::text, coalesce(token_uri, ''), coalesce(image_uri, ''),
-               coalesce(name, ''), coalesce(symbol, ''), coalesce({metadata_column}::text, '')
-        FROM {table}
-        ORDER BY id
-        "
-    );
+    let query = build_snapshot_query(&table, &metadata_column, block_range);
     let mut writer = open_snapshot_writer(output_path)?;
-    let mut rows = conn.query_raw(&query, std::iter::empty::<&(dyn ToSql + Sync)>())?;
+    let params = query
+        .params
+        .iter()
+        .map(|value| value as &(dyn ToSql + Sync));
+    let mut rows = conn.query_raw(&query.sql, params)?;
     let batch_size = fetch_size.max(1);
     let mut buffer: Vec<SnapshotExportRow> = Vec::with_capacity(batch_size);
     while let Some(row) = rows.next()? {
@@ -194,4 +271,53 @@ pub fn export_chain_snapshot_to_parquet(
         .close()
         .map_err(|err| AppError::InvalidData(err.to_string()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_range_rejects_negative_reversed_and_solana_bounds() {
+        assert!(SnapshotBlockRange::new(Some(-1), None).is_err());
+        assert!(SnapshotBlockRange::new(Some(20), Some(10)).is_err());
+
+        let range = SnapshotBlockRange::new(Some(10), Some(20)).unwrap();
+        let error = range.validate_for_chain("solana").unwrap_err();
+        assert!(error.to_string().contains("first_seen_block = 0"));
+    }
+
+    #[test]
+    fn chain_table_rejects_unsafe_names() {
+        assert!(chain_to_table("").is_err());
+        assert!(chain_to_table("eth;drop").is_err());
+    }
+
+    #[test]
+    fn snapshot_query_uses_inclusive_optional_bounds() {
+        let lower = build_snapshot_query(
+            "nft_assets_ethereum",
+            "metadata",
+            SnapshotBlockRange::new(Some(10), None).unwrap(),
+        );
+        assert!(lower.sql.contains("first_seen_block >= $1"));
+        assert_eq!(lower.params, vec![10]);
+
+        let upper = build_snapshot_query(
+            "nft_assets_ethereum",
+            "metadata",
+            SnapshotBlockRange::new(None, Some(20)).unwrap(),
+        );
+        assert!(upper.sql.contains("first_seen_block <= $1"));
+        assert_eq!(upper.params, vec![20]);
+
+        let bounded = build_snapshot_query(
+            "nft_assets_ethereum",
+            "metadata",
+            SnapshotBlockRange::new(Some(10), Some(20)).unwrap(),
+        );
+        assert!(bounded.sql.contains("first_seen_block >= $1"));
+        assert!(bounded.sql.contains("first_seen_block <= $2"));
+        assert_eq!(bounded.params, vec![10, 20]);
+    }
 }

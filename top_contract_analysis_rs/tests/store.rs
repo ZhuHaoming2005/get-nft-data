@@ -1425,3 +1425,62 @@ fn snapshot_export_writes_current_precomputed_columns_without_legacy_fields() {
     assert!(!column_names.contains(&"name_prefix8".to_string()));
     assert!(!column_names.contains(&"metadata_keywords_arr".to_string()));
 }
+
+#[cfg(feature = "export-snapshot")]
+#[test]
+fn snapshot_export_lowercases_evm_contract_addresses() {
+    let dir = tempdir().unwrap();
+    let parquet_path = dir.path().join("ethereum.parquet");
+    write_snapshot_rows_to_parquet(
+        "ethereum",
+        &[SnapshotExportRow {
+            contract_address: "0xAbCd".into(),
+            token_id: "1".into(),
+            ..Default::default()
+        }],
+        &parquet_path,
+    )
+    .unwrap();
+
+    let conn = Connection::open_in_memory().unwrap();
+    let path = parquet_path_literal(&parquet_path);
+    let address: String = conn
+        .query_row(
+            &format!("SELECT contract_address FROM read_parquet('{path}')"),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(address, "0xabcd");
+}
+
+#[cfg(feature = "export-snapshot")]
+#[test]
+fn snapshot_export_preserves_solana_contract_address_case() {
+    let dir = tempdir().unwrap();
+    let parquet_path = dir.path().join("solana.parquet");
+    let address = "SoLanaCaseSensitive111111111111111111111111";
+    write_snapshot_rows_to_parquet(
+        "solana",
+        &[SnapshotExportRow {
+            contract_address: address.into(),
+            token_id: "MintCaseSensitive11111111111111111111111111".into(),
+            ..Default::default()
+        }],
+        &parquet_path,
+    )
+    .unwrap();
+
+    let conn = Connection::open_in_memory().unwrap();
+    let path = parquet_path_literal(&parquet_path);
+    let actual: String = conn
+        .query_row(
+            &format!("SELECT contract_address FROM read_parquet('{path}')"),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(actual, address);
+}

@@ -19,7 +19,7 @@ use top_contract_analysis_rs::progress::{
 };
 use top_contract_analysis_rs::reporting::{write_batch_paper_stats_outputs, write_default_outputs};
 #[cfg(feature = "export-snapshot")]
-use top_contract_analysis_rs::store::export_chain_snapshot_to_parquet;
+use top_contract_analysis_rs::store::{export_chain_snapshot_to_parquet, SnapshotBlockRange};
 use top_contract_analysis_rs::store::{DuckDbFeatureStore, DuckDbResourceOptions};
 
 #[cfg(feature = "export-snapshot")]
@@ -155,12 +155,15 @@ fn main() -> Result<(), AppError> {
         }),
         #[cfg(feature = "export-snapshot")]
         Command::ExportSnapshot(args) => {
+            let block_range = SnapshotBlockRange::new(args.start_block, args.end_block)?
+                .validate_for_chain(&args.chain)?;
             let mut conn = connect_postgres_from_constants()?;
             export_chain_snapshot_to_parquet(
                 &mut conn,
                 &args.chain,
                 std::path::Path::new(&args.output),
                 args.fetch_size,
+                block_range,
             )?;
             Ok(())
         }
