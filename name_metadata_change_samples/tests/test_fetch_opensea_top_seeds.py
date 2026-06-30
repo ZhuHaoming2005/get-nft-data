@@ -84,16 +84,102 @@ class FetchOpenSeaTopSeedsTest(unittest.TestCase):
 
         self.assertIn("cursor=abc", url)
 
-    def test_format_seeds_writes_one_lowercase_address_per_line(self):
+    def test_format_seeds_lowercases_evm_addresses(self):
         self.assertEqual(
             fetch_opensea_top_seeds.format_seeds(
                 [
                     "0xABCDEFabcdefABCDEFabcdefABCDEFabcdefABCD",
                     "0x1111111111111111111111111111111111111111",
-                ]
+                ],
+                "ethereum",
             ),
             "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd\n"
             "0x1111111111111111111111111111111111111111\n",
+        )
+
+    def test_format_seeds_preserves_solana_address_case(self):
+        address = "So11111111111111111111111111111111111111112"
+
+        self.assertEqual(
+            fetch_opensea_top_seeds.format_seeds([address], "solana"),
+            f"{address}\n",
+        )
+
+    def test_normalize_contract_address_preserves_valid_solana_case(self):
+        address = "So11111111111111111111111111111111111111112"
+
+        self.assertEqual(
+            fetch_opensea_top_seeds.normalize_contract_address(address, "solana"),
+            address,
+        )
+        self.assertIsNone(
+            fetch_opensea_top_seeds.normalize_contract_address(
+                "O0not-base58", "solana"
+            )
+        )
+
+    def test_normalize_contract_address_lowercases_evm(self):
+        address = "0xABCDEFabcdefABCDEFabcdefABCDEFabcdefABCD"
+
+        self.assertEqual(
+            fetch_opensea_top_seeds.normalize_contract_address(address, "base"),
+            address.lower(),
+        )
+
+    def test_default_chains_cover_all_four_datasets(self):
+        args = fetch_opensea_top_seeds.parse_args([])
+
+        self.assertEqual(
+            args.chains,
+            ["ethereum", "base", "polygon", "solana"],
+        )
+
+    def test_legacy_single_chain_argument_is_preserved(self):
+        args = fetch_opensea_top_seeds.parse_args(
+            ["--chain", "polygon", "--output", "polygon.txt"]
+        )
+
+        self.assertEqual(args.chains, ["polygon"])
+        self.assertEqual(args.output, Path("polygon.txt"))
+
+    def test_collect_seed_addresses_by_chain_calls_each_chain_independently(self):
+        calls = []
+
+        def collector(**kwargs):
+            calls.append(kwargs["chain"])
+            return [kwargs["chain"]]
+
+        result = fetch_opensea_top_seeds.collect_seed_addresses_by_chain(
+            chains=["ethereum", "base", "polygon", "solana"],
+            collector=collector,
+            api_key="key",
+            limit=1,
+            page_size=1,
+            trending_collections_url="https://example.test/trending",
+            timeframe="thirty_days",
+            timeout=1.0,
+        )
+
+        self.assertEqual(calls, ["ethereum", "base", "polygon", "solana"])
+        self.assertEqual(
+            result,
+            {
+                "ethereum": ["ethereum"],
+                "base": ["base"],
+                "polygon": ["polygon"],
+                "solana": ["solana"],
+            },
+        )
+
+    def test_seed_output_path_uses_chain_specific_file_for_multi_chain_run(self):
+        self.assertEqual(
+            fetch_opensea_top_seeds.seed_output_path(
+                chain="solana",
+                selected_chains=["ethereum", "base", "polygon", "solana"],
+                output=None,
+                output_dir=Path("seeds"),
+            ),
+            Path("seeds/solana.seeds.txt"),
         )
 
     def test_parse_json_response_accepts_bytes_json(self):
