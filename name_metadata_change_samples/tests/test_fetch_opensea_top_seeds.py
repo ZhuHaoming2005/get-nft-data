@@ -133,6 +133,7 @@ class FetchOpenSeaTopSeedsTest(unittest.TestCase):
             args.chains,
             ["ethereum", "base", "polygon", "solana"],
         )
+        self.assertIsNone(args.api_key)
 
     def test_legacy_single_chain_argument_is_preserved(self):
         args = fetch_opensea_top_seeds.parse_args(

@@ -25,6 +25,23 @@ cargo run --release -- \
   --temp-directory ./data/duckdb-temp
 ```
 
+同时分析 Ethereum、Base、Polygon 和 Solana：
+
+```bash
+cargo run --release -- \
+  --parquet ./data/ethereum.parquet \
+  --parquet ./data/base.parquet \
+  --parquet ./data/polygon.parquet \
+  --parquet ./data/solana.parquet \
+  --output-dir ./output \
+  --threads 96 \
+  --temp-directory ./data/duckdb-temp
+```
+
+EVM 合约地址按小写规范化后聚合；Solana collection 地址按 Base58 原值聚合，
+不会把仅大小写不同的 Solana 标识符合并。`token_id` 在分析输入中统一按字符串处理，
+因此既兼容 EVM 数字 token ID，也兼容 Solana mint 地址。
+
 输出：
 
 - `summary.json`

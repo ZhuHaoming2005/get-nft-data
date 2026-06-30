@@ -20,14 +20,31 @@ cargo run --release -- \
   --output ./result.md
 ```
 
-如需从 OpenSea 当前 Top NFT collections 按 30 日交易量生成 seed 输入文件：
+如需从 OpenSea trending collections 生成 Ethereum、Base、Polygon 和 Solana
+四条链各自的 seed 输入文件：
 
 ```powershell
 $env:OPENSEA_API_KEY="..."
-python .\scripts\fetch_opensea_top_seeds.py --output .\seeds.txt --limit 100 --chain ethereum
+python .\scripts\fetch_opensea_top_seeds.py --output-dir .\seeds --limit 100
 ```
 
-脚本只调用官方 API `GET https://api.opensea.io/api/v2/collections/top`，默认使用 `sort_by=thirty_days_volume`、`chains=ethereum`，从响应的 `collections[].contracts[].address` 提取合约地址，最终按一行一个小写合约地址写入 `seeds.txt`。默认读取 `OPENSEA_API_KEY`，也可用 `--api-key` 显式传入。
+默认输出 `ethereum.seeds.txt`、`base.seeds.txt`、`polygon.seeds.txt` 和
+`solana.seeds.txt`。脚本逐链调用
+`GET https://api.opensea.io/api/v2/collections/trending`，从响应中的合约地址字段提取
+collection 地址。EVM 地址输出为小写；Solana 地址必须是可解码为 32 字节的 Base58
+值并保留原始大小写。默认读取 `OPENSEA_API_KEY`，也可用 `--api-key` 显式传入。
+
+兼容原来的单链文件用法：
+
+```powershell
+python .\scripts\fetch_opensea_top_seeds.py `
+  --chain ethereum `
+  --output .\seeds.txt `
+  --limit 100
+```
+
+也可以用 `--chains ethereum base polygon solana` 显式选择链集合。该 Python 脚本
+只负责下载和验证 seed 文件，不会启动 EVM 行为分析或 Solana transfer/gas 分析。
 
 常用参数：
 

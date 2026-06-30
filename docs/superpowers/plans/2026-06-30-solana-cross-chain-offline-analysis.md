@@ -1,5 +1,10 @@
 # Solana Cross-Chain Offline Analysis Implementation Plan
 
+> Execution scope amendment: the user subsequently excluded the
+> `name_metadata_change_samples` Rust crate. Task 4 and the analyzer-invocation
+> portion of Task 5 are superseded. Task 5 is limited to four-chain seed
+> fetching, and final verification excludes that Rust crate.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Export and analyze Ethereum, Base, Polygon, and Solana NFT snapshots without corrupting Solana identifiers, with optional EVM block-range selection and four-chain top-seed orchestration.

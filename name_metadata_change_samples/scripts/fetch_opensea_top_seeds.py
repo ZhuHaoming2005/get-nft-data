@@ -246,7 +246,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_TRENDING_COLLECTIONS_URL,
         help="OpenSea trending collections API URL",
     )
-    parser.add_argument("--api-key", default="2d17a25e68714720883ac996f5459b17")
+    parser.add_argument("--api-key")
     parser.add_argument("--api-key-env", default="OPENSEA_API_KEY")
     parser.add_argument("--timeout", type=float, default=30.0)
     args = parser.parse_args(argv)

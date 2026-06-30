@@ -1,5 +1,12 @@
 # Solana and Cross-Chain Offline Analysis Design
 
+> Execution scope amendment: the user subsequently excluded the
+> `name_metadata_change_samples` Rust crate. The direct-Parquet sample-analyzer
+> work and Python subprocess orchestration described below were not
+> implemented. The named Python script remains in scope for four-chain seed
+> fetching only; the supported Solana analysis flow is snapshot export into
+> `name_uri_analysis_rs`.
+
 ## Goal
 
 Make the existing PostgreSQL-to-Parquet analysis path handle Ethereum, Base,

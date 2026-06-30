@@ -61,6 +61,23 @@ cargo run --release --features export-snapshot -- export-snapshot \
 可选参数：
 
 - `--fetch-size 100000`
+- `--start-block 19000000`：仅导出 `first_seen_block >= 19000000` 的记录（包含边界）
+- `--end-block 20000000`：仅导出 `first_seen_block <= 20000000` 的记录（包含边界）
+
+例如，导出一个闭区间内的 Ethereum 快照：
+
+```bash
+cargo run --release --features export-snapshot -- export-snapshot \
+  --chain ethereum \
+  --start-block 19000000 \
+  --end-block 20000000 \
+  --output ../output/top_contract_analysis/ethereum-19000000-20000000.parquet
+```
+
+`--start-block` / `--end-block` 目前只适用于 EVM 链。当前 Solana 采集记录的
+`first_seen_block` 是占位值 `0`，因此 Solana 导出在传入任一范围参数时会明确报错；
+不传范围参数时可正常导出完整 `nft_assets_solana` 快照。Solana collection 和 mint
+地址在 Parquet 中保留 Base58 大小写，EVM 合约地址仍规范化为小写。
 
 ### 2. 分析单个 Seed 合约
 
