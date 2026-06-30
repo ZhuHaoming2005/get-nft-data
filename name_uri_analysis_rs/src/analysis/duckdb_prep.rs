@@ -92,7 +92,11 @@ fn build_analysis_rows_sql(inputs: &str, metadata_json_expr: &str) -> String {
         "
             CREATE TEMP TABLE analysis_rows AS
             SELECT lower(trim(CAST(chain AS VARCHAR))) AS chain,
-                   lower(trim(CAST(contract_address AS VARCHAR))) AS contract_address,
+                   CASE
+                       WHEN lower(trim(CAST(chain AS VARCHAR))) = 'solana'
+                           THEN trim(CAST(contract_address AS VARCHAR))
+                       ELSE lower(trim(CAST(contract_address AS VARCHAR)))
+                   END AS contract_address,
                    coalesce(CAST(token_uri_norm AS VARCHAR), '') AS token_uri_norm,
                    coalesce(CAST(image_uri_norm AS VARCHAR), '') AS image_uri_norm,
                    trim(coalesce(CAST(name_norm AS VARCHAR), '')) AS name_norm,

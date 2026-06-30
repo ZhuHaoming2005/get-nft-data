@@ -299,6 +299,15 @@ mod tests {
     }
 
     #[test]
+    fn analysis_rows_projection_preserves_solana_case_only() {
+        let sql = build_analysis_rows_sql("'sample.parquet'", "metadata_json");
+
+        assert!(sql.contains("WHEN lower(trim(CAST(chain AS VARCHAR))) = 'solana'"));
+        assert!(sql.contains("THEN trim(CAST(contract_address AS VARCHAR))"));
+        assert!(sql.contains("ELSE lower(trim(CAST(contract_address AS VARCHAR)))"));
+    }
+
+    #[test]
     fn metadata_raw_rows_sql_selects_one_representative_per_contract() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
         conn.execute_batch(

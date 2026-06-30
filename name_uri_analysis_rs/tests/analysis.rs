@@ -691,6 +691,63 @@ fn metadata_analysis_uses_first_available_representatives_for_correctness() {
 }
 
 #[test]
+fn four_chain_analysis_uses_chain_aware_contract_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let parquet = temp.path().join("four-chains.parquet");
+    write_parquet(
+        &parquet,
+        r#"
+            VALUES
+            ('ethereum', '0xAbC', '1', 'eth-1', 'eth-img-1', 'Eth One', 'eth one'),
+            ('ethereum', '0xabc', '2', 'eth-2', 'eth-img-2', 'Eth Two', 'eth two'),
+            ('base', '0xBase', '1', 'base-1', 'base-img-1', 'Base', 'base'),
+            ('polygon', '0xPoly', '1', 'poly-1', 'poly-img-1', 'Polygon', 'polygon'),
+            ('solana', 'Abc111111111111111111111111111111111111111', 'Mint1', 'sol-1', 'sol-img-1', 'Sol One', 'sol one'),
+            ('solana', 'abc111111111111111111111111111111111111111', 'Mint2', 'sol-2', 'sol-img-2', 'Sol Two', 'sol two')
+        "#,
+    );
+
+    let report = run_analysis(AnalysisOptions {
+        database_path: PathBuf::from(":memory:"),
+        parquet_inputs: vec![parquet],
+        output_dir: temp.path().join("out"),
+        thresholds: vec![95.0],
+        threads: 2,
+        memory_limit: "256MB".into(),
+        analysis_memory_limit: Some("64MB".into()),
+        temp_directory: None,
+        progress: false,
+        persist_prepared: false,
+        reuse_prepared: false,
+    })
+    .unwrap();
+
+    let ethereum = report
+        .summary_rows
+        .iter()
+        .find(|row| {
+            row.field_name == "name"
+                && row.scope == "intra_chain"
+                && row.primary_chain == "ethereum"
+        })
+        .unwrap();
+    let solana = report
+        .summary_rows
+        .iter()
+        .find(|row| {
+            row.field_name == "name" && row.scope == "intra_chain" && row.primary_chain == "solana"
+        })
+        .unwrap();
+
+    assert_eq!(ethereum.total_contracts, 1);
+    assert_eq!(solana.total_contracts, 2);
+    assert!(report
+        .summary_rows
+        .iter()
+        .any(|row| row.scope == "chain_matrix"));
+}
+
+#[test]
 fn metadata_analysis_uses_first_available_metadata_doc_per_contract() {
     let temp = tempfile::tempdir().unwrap();
     let parquet = temp.path().join("sample.parquet");
