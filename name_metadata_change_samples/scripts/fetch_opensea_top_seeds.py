@@ -359,6 +359,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.contracts_output or args.output_dir / "top_contracts.csv"
     )
     args.audit_output = args.audit_output or args.output_dir / "top_collections.json"
+    contracts_path = os.path.normcase(os.path.abspath(args.contracts_output))
+    audit_path = os.path.normcase(os.path.abspath(args.audit_output))
+    if contracts_path == audit_path:
+        parser.error(
+            "--contracts-output and --audit-output must identify different files"
+        )
     return args
 
 

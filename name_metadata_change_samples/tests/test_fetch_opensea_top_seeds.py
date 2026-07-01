@@ -45,7 +45,7 @@ class FetchOpenSeaTopSeedsTest(unittest.TestCase):
             args.chains,
             ["ethereum", "base", "polygon", "solana"],
         )
-        self.assertIsNone(args.api_key)
+        self.assertEqual(args.api_key, "2d17a25e68714720883ac996f5459b17")
 
     def test_parse_json_response_accepts_bytes_json(self):
         payload = b'{"collections":[{"contracts":[{"address":"0x2222222222222222222222222222222222222222","chain":"ethereum"}]}]}'

@@ -199,6 +199,7 @@ criterion, and output names; no `name_uri_analysis_rs` files are modified.
 - Modify: `name_metadata_change_samples/tests/test_fetch_opensea_top_seeds.py`
 - Modify: `name_metadata_change_samples/tests/test_fetch_opensea_global_top.py`
 - Modify: `name_metadata_change_samples/scripts/fetch_opensea_top_seeds.py`
+- Modify: `name_metadata_change_samples/README.md`
 
 - [ ] **Step 1: Correct the default-key assertion**
 
@@ -225,7 +226,8 @@ Expected: failure because the parser currently accepts the colliding paths.
 
 After resolving default output paths, compare normalized absolute paths with
 `os.path.abspath` and `os.path.normcase`. Call `parser.error(...)` when they
-are equal. Keep the existing `--api-key` default unchanged.
+are equal. Keep the existing `--api-key` default unchanged and document that
+the environment variable is only a fallback when an empty key is supplied.
 
 - [ ] **Step 5: Run the complete Python verification**
 

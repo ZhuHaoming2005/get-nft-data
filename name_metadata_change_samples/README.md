@@ -41,8 +41,9 @@ Top 100 并集。默认输出：
 
 一个 collection 可以展开为多个 `(chain,address)`，所以 CSV 行数可以超过
 collection limit；同一地址出现在不同链时保留为不同二元组。EVM 地址输出为小写；
-Solana 地址必须可解码为 32 字节 Base58 并保留大小写。默认读取
-`OPENSEA_API_KEY`，也可用 `--api-key` 显式传入。脚本不会启动 Rust 分析器。
+Solana 地址必须可解码为 32 字节 Base58 并保留大小写。默认使用脚本内置的
+OpenSea API key；可用 `--api-key` 显式覆盖。若显式传入空值，
+则回退读取 `OPENSEA_API_KEY`。脚本不会启动 Rust 分析器。
 
 常用参数：
 

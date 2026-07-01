@@ -4,6 +4,7 @@ import io
 import json
 import sys
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -278,6 +279,21 @@ class FetchOpenSeaGlobalTopTest(unittest.TestCase):
         )
         self.assertEqual(args.contracts_output, Path("../seeds/top_contracts.csv"))
         self.assertEqual(args.audit_output, Path("../seeds/top_collections.json"))
+
+    def test_parse_args_rejects_colliding_output_paths(self):
+        stderr = io.StringIO()
+
+        with redirect_stderr(stderr), self.assertRaises(SystemExit):
+            fetch_opensea_top_seeds.parse_args(
+                [
+                    "--contracts-output",
+                    "same-output.json",
+                    "--audit-output",
+                    "./same-output.json",
+                ]
+            )
+
+        self.assertIn("must identify different files", stderr.getvalue())
 
 
 if __name__ == "__main__":
