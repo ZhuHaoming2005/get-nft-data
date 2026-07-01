@@ -20,31 +20,29 @@ cargo run --release -- \
   --output ./result.md
 ```
 
-如需从 OpenSea trending collections 生成 Ethereum、Base、Polygon 和 Solana
-四条链各自的 seed 输入文件：
+如需下载 Ethereum、Base、Polygon 和 Solana 四条链共同参与排序的 Top
+collection 合约清单：
 
 ```powershell
 $env:OPENSEA_API_KEY="..."
-python .\scripts\fetch_opensea_top_seeds.py --output-dir .\seeds --limit 100
-```
-
-默认输出 `ethereum.seeds.txt`、`base.seeds.txt`、`polygon.seeds.txt` 和
-`solana.seeds.txt`。脚本逐链调用
-`GET https://api.opensea.io/api/v2/collections/trending`，从响应中的合约地址字段提取
-collection 地址。EVM 地址输出为小写；Solana 地址必须是可解码为 32 字节的 Base58
-值并保留原始大小写。默认读取 `OPENSEA_API_KEY`，也可用 `--api-key` 显式传入。
-
-兼容原来的单链文件用法：
-
-```powershell
 python .\scripts\fetch_opensea_top_seeds.py `
-  --chain ethereum `
-  --output .\seeds.txt `
-  --limit 100
+  --chains ethereum base polygon solana `
+  --limit 100 `
+  --output-dir .\seeds
 ```
 
-也可以用 `--chains ethereum base polygon solana` 显式选择链集合。该 Python 脚本
-只负责下载和验证 seed 文件，不会启动 EVM 行为分析或 Solana transfer/gas 分析。
+脚本只建立一个分页序列，请求
+`GET /api/v2/collections/top?sort_by=thirty_days_volume&chains=ethereum,base,polygon,solana`，
+因此 `--limit 100` 表示四条链共享的全局 Top 100 collection，而不是四个独立的
+Top 100 并集。默认输出：
+
+- `seeds/top_contracts.csv`：为后续 Top 专用分析预留，列严格为 `chain,address`；
+- `seeds/top_collections.json`：保留全局排名、名称、排序值和 collection 到合约二元组的审计信息。
+
+一个 collection 可以展开为多个 `(chain,address)`，所以 CSV 行数可以超过
+collection limit；同一地址出现在不同链时保留为不同二元组。EVM 地址输出为小写；
+Solana 地址必须可解码为 32 字节 Base58 并保留大小写。默认读取
+`OPENSEA_API_KEY`，也可用 `--api-key` 显式传入。脚本不会启动 Rust 分析器。
 
 常用参数：
 

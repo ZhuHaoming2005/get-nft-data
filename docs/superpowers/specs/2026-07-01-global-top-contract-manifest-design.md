@@ -4,9 +4,8 @@
 
 Replace the current union of four independent per-chain rankings with one
 global OpenSea Top collection ranking over Ethereum, Base, Polygon, and Solana.
-Export the selected contracts as `(chain, address)` pairs and make
-`name_uri_analysis_rs` calculate all denominators, intra-chain results, and
-cross-chain matrices only from that shared ranked population.
+Export the selected contracts as `(chain, address)` pairs. Do not connect this
+manifest to an analyzer in this change.
 
 ## Terminology
 
@@ -14,7 +13,7 @@ cross-chain matrices only from that shared ranked population.
   one OpenSea response sequence ordered by 30-day volume across all four
   selected chains.
 - **Contract pair**: `(chain, address)`. This is the only contract identity
-  used for deduplication, filtering, or joins.
+  used for manifest deduplication and export.
 - **Analyzable collection**: a ranked collection containing at least one valid
   contract pair on the selected chains.
 - **Expanded contract manifest**: all valid contract pairs belonging to the
@@ -36,15 +35,15 @@ Although EVM and Solana address formats differ in most cases, address-only
 identity is insufficient for a cross-chain experiment and cannot safely drive
 a relational filter.
 
-`name_uri_analysis_rs` currently analyzes every row in the supplied Parquet
-files. It has no contract-manifest input, so downloading a Top list does not
-change its analysis population.
+`name_uri_analysis_rs` intentionally analyzes every row in the supplied
+block/slot-bounded Parquet snapshots. The common Top manifest must not change
+that full-snapshot experiment population.
 
 ## Chosen Architecture
 
 ```text
 OpenSea /collections/top
-  one request sequence, four repeated chains parameters
+  one request sequence, one comma-separated four-chain parameter
   30-day-volume ordering, one cursor, global collection limit
                  |
                  v
@@ -52,25 +51,14 @@ OpenSea /collections/top
           |                 |
           v                 v
  top_contracts.csv    top_collections.json
- exact pair input     ranking audit record
-          |
-          v
- name_uri_analysis_rs --contracts top_contracts.csv
-          |
-          v
- selected_contracts temp table
-          |
-          v
- four Parquet inputs joined by (chain, canonical address)
-          |
-          v
- summary.json + summary.csv for the shared Top population
+ exact pair output    ranking audit record
 ```
 
-The PostgreSQL snapshot exporter remains unchanged. It can continue exporting
-complete per-chain Parquet snapshots, optionally with the already implemented
-EVM block bounds. Filtering belongs in the analysis projection so one snapshot
-can be reused with different ranked populations.
+The PostgreSQL snapshot exporter and all Rust analyzers remain unchanged.
+`name_uri_analysis_rs` continues to run large-scale full-data deduplication over
+all rows in the supplied snapshots. A future Top-contract-specific integration
+must use a separate entry point and define comparable Solana/EVM metrics before
+consuming this manifest.
 
 ## OpenSea Ranking Contract
 
@@ -80,16 +68,17 @@ The fetcher changes its default endpoint from
 The request has these semantics:
 
 - one request sequence for all selected chains;
-- repeated `chains` query parameters encoded with `urlencode(..., doseq=True)`;
-- 30-day volume ordering;
+- one comma-separated `chains=ethereum,base,polygon,solana` query parameter;
+- `sort_by=thirty_days_volume`;
 - one pagination cursor shared by the global ranking;
 - `--limit` counts analyzable ranked collections globally.
 
-The exact accepted query parameter name for the 30-day sort and the
-multi-chain array encoding must be verified against a live OpenSea response
-during implementation. The official public documentation distinguishes Top
-collections from Trending collections but does not currently expose a complete
-parameter schema for the Top endpoint.
+OpenSea's current official OpenAPI description defines `sort_by` and describes
+`chains` as a comma-separated list. The implementation tests lock that exact
+encoding. A live run is still required to verify that the authenticated
+response contains the documented collection list, contracts, and pagination
+cursor before replacing local outputs. The ranking value is recorded when the
+response includes it.
 
 The script must fail explicitly if OpenSea rejects the multi-chain Top request
 or if the response does not contain enough information to establish one server
@@ -128,7 +117,7 @@ A collection with no valid selected-chain pair does not consume one of the
 
 ## Output Contracts
 
-### Analysis manifest
+### Contract pair manifest
 
 Default path: `top_contracts.csv`.
 
@@ -171,59 +160,18 @@ review how the pair manifest was derived.
 Both output files are produced from one in-memory result and replaced only
 after both serializations succeed.
 
-## Analyzer Interface
+## Analysis Boundary
 
-`name_uri_analysis_rs` gains a required-for-ranked-analysis option:
+This change stops after writing `top_contracts.csv` and
+`top_collections.json`. It does not add a `--contracts` option, filtered
+DuckDB projection, or coverage report to `name_uri_analysis_rs`.
 
-```text
---contracts ./top_contracts.csv
-```
+The two populations remain explicit:
 
-The existing no-manifest behavior remains available for full-dataset analysis.
-When the option is present:
-
-1. parse the CSV before creating analysis tables;
-2. reject missing headers, extra columns, empty values, unsupported chains, or
-   invalid addresses;
-3. canonicalize pairs with the same chain-specific rules as the exporter;
-4. reject duplicate pairs in the input rather than silently counting them;
-5. load pairs into a DuckDB temporary table with a unique
-   `(chain, contract_address)` key;
-6. build `analysis_rows` by joining each Parquet row to that table on canonical
-   chain and canonical contract address.
-
-The manifest filter is applied before:
-
-- selected-chain discovery;
-- chain totals;
-- URI grouping;
-- name atoms;
-- metadata representatives;
-- chain-matrix analysis.
-
-Consequently, all reported denominators and ratios refer only to NFT rows and
-contracts selected by the common Top manifest.
-
-## Missing-Pair Accounting
-
-After preparing `analysis_rows`, the analyzer compares the selected manifest
-with the distinct pairs found in the Parquet inputs.
-
-It writes `manifest_coverage.json` containing:
-
-- requested pair count;
-- matched pair count;
-- missing pair count;
-- missing pairs grouped by chain;
-- matched NFT row count by chain.
-
-Default behavior is to complete the analysis when some pairs are missing but
-print a warning and persist the coverage report. A new
-`--require-all-contracts` flag turns any missing pair into an error.
-
-If no manifest pair matches any Parquet row, analysis fails regardless of the
-flag. If fewer than two chains remain after filtering, intra-chain analysis
-continues and cross-chain rows are omitted using the existing behavior.
+- `name_uri_analysis_rs`: every NFT row in the selected exported snapshot
+  range;
+- common Top manifest: a ranked `(chain,address)` artifact reserved for a
+  future Top-contract-specific analysis flow.
 
 ## Error Handling
 
@@ -231,18 +179,15 @@ continues and cross-chain rows are omitted using the existing behavior.
 - Reject a repeated OpenSea pagination cursor.
 - Reject a multi-chain request that the endpoint does not support.
 - Reject malformed EVM and Solana addresses.
-- Reject manifest duplicate pairs and schema drift.
 - Never deduplicate by address alone.
 - Never infer a missing chain from address format.
 - Never reuse partially written outputs after a failed fetch.
-- Make incomplete Parquet coverage visible through
-  `manifest_coverage.json`.
 
 ## Testing
 
 ### Fetcher unit tests
 
-- one URL contains all four repeated `chains` values;
+- one URL contains one comma-separated `chains` value with all four chains;
 - the endpoint is `/collections/top`, not `/collections/trending`;
 - 30-day-volume ordering is requested;
 - one cursor drives pagination globally;
@@ -255,20 +200,6 @@ continues and cross-chain rows are omitted using the existing behavior.
 - CSV contains exactly `chain,address`;
 - CSV and JSON writes are atomic.
 
-### Analyzer unit and integration tests
-
-- valid pair manifests parse and canonicalize correctly;
-- malformed headers, duplicate pairs, and invalid addresses fail;
-- an unselected contract present in Parquet does not enter
-  `analysis_rows`;
-- a selected Solana address matches case-sensitively;
-- EVM case variants match the canonical manifest pair;
-- totals and duplicate ratios use only selected rows;
-- four-chain fixture produces chain-matrix rows from the selected population;
-- missing pairs appear in `manifest_coverage.json`;
-- `--require-all-contracts` rejects incomplete coverage;
-- zero matched pairs always fails.
-
 ## Non-Goals
 
 - Equal per-chain quotas.
@@ -277,15 +208,19 @@ continues and cross-chain rows are omitted using the existing behavior.
 - Solana transfer, sale, ownership, gas, or lifecycle analysis.
 - Changing PostgreSQL schemas or Solana ingestion.
 - Reintroducing `name_metadata_change_samples` into this analysis flow.
+- Connecting `top_contracts.csv` to `name_uri_analysis_rs` or changing its
+  full-snapshot denominators.
+- Defining or implementing the future Top-contract-specific cross-chain
+  analyzer.
 
 ## Success Criteria
 
-Given four complete snapshot Parquet files and a requested Global Top N:
+Given a requested Global Top N:
 
 1. the fetcher performs one globally ordered multi-chain request sequence;
 2. `top_contracts.csv` contains unique `(chain, address)` pairs derived from
    exactly the first `N` analyzable ranked collections;
-3. the analyzer includes only those pairs;
-4. all totals and cross-chain results are computed from that selected
-   population;
-5. missing snapshot coverage is explicitly measurable.
+3. `top_collections.json` preserves enough ranking and collection-to-pair
+   information to audit the CSV;
+4. `name_uri_analysis_rs` remains a full-snapshot analyzer and does not read
+   either output.
