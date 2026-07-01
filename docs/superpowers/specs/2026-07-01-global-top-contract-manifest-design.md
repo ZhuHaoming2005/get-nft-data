@@ -178,6 +178,10 @@ The two populations remain explicit:
 - Reject a response that lacks a collection list.
 - Reject a repeated OpenSea pagination cursor.
 - Reject a multi-chain request that the endpoint does not support.
+- Keep the existing built-in OpenSea API key as the `--api-key` default.
+- Reject `--contracts-output` and `--audit-output` when their normalized
+  absolute paths identify the same destination, before creating temporary
+  output files.
 - Reject malformed EVM and Solana addresses.
 - Never deduplicate by address alone.
 - Never infer a missing chain from address format.

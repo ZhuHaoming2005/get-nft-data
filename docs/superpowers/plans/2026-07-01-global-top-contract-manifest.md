@@ -192,3 +192,48 @@ git status --short
 
 Expected: documentation and implementation use the same endpoint, ranking
 criterion, and output names; no `name_uri_analysis_rs` files are modified.
+
+### Task 4: Preserve the default API key and reject colliding outputs
+
+**Files:**
+- Modify: `name_metadata_change_samples/tests/test_fetch_opensea_top_seeds.py`
+- Modify: `name_metadata_change_samples/tests/test_fetch_opensea_global_top.py`
+- Modify: `name_metadata_change_samples/scripts/fetch_opensea_top_seeds.py`
+
+- [ ] **Step 1: Correct the default-key assertion**
+
+Assert that `parse_args([]).api_key` equals the existing built-in default
+instead of asserting that it is `None`.
+
+- [ ] **Step 2: Add a failing output-collision test**
+
+Parse arguments that point `--contracts-output` and `--audit-output` at the
+same file. Assert that parsing exits with an error whose stderr contains
+`must identify different files`.
+
+- [ ] **Step 3: Run the collision test and verify RED**
+
+Run:
+
+```powershell
+python -m unittest name_metadata_change_samples.tests.test_fetch_opensea_global_top.FetchOpenSeaGlobalTopTest.test_parse_args_rejects_colliding_output_paths -v
+```
+
+Expected: failure because the parser currently accepts the colliding paths.
+
+- [ ] **Step 4: Implement normalized path validation**
+
+After resolving default output paths, compare normalized absolute paths with
+`os.path.abspath` and `os.path.normcase`. Call `parser.error(...)` when they
+are equal. Keep the existing `--api-key` default unchanged.
+
+- [ ] **Step 5: Run the complete Python verification**
+
+Run:
+
+```powershell
+python -m unittest discover -s name_metadata_change_samples\tests -p "test_fetch_opensea*.py" -v
+python -c "import ast, pathlib; ast.parse(pathlib.Path(r'name_metadata_change_samples/scripts/fetch_opensea_top_seeds.py').read_text(encoding='utf-8'))"
+```
+
+Expected: 14 tests pass and AST parsing succeeds.
