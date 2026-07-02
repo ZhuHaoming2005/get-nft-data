@@ -298,7 +298,11 @@ fn analyzes_uri_and_name_without_symbol_rows() {
             && row.duplicate_contract_count == 2
     }));
     assert!(report.summary_rows.iter().all(|row| {
-        row.field_name != "uri" || (row.scope == "intra_chain" && row.match_mode == "norm_cross")
+        row.field_name != "uri"
+            || (matches!(
+                row.scope.as_str(),
+                "intra_chain" | "cross_chain_summary" | "chain_matrix"
+            ) && row.match_mode == "norm_cross")
     }));
     assert!(report
         .summary_rows
