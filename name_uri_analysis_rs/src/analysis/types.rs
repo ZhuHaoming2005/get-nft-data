@@ -77,7 +77,7 @@ struct NameTotals {
     nfts: i64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct UriCounts {
     v1_nfts: i64,
     v1_contracts: i64,
@@ -85,6 +85,12 @@ struct UriCounts {
     v2_contracts: i64,
     v3_nfts: i64,
     v3_contracts: i64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct UriContractCounts {
+    intra_chain: UriCounts,
+    cross_chain: UriCounts,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

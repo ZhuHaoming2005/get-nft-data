@@ -412,8 +412,8 @@ fn cross_chain_uri_rows_emit_summary_and_isolated_pair_matrix() {
         &parquet,
         r#"
             VALUES
-            ('ethereum', '0xeth-token', '1', 'shared-token', 'eth-image', 'A', 'a'),
-            ('base', '0xbase-token', '1', 'shared-token', 'base-image', 'B', 'b'),
+            ('ethereum', '0xeth-token', '1', 'shared-token', 'shared-token-image', 'A', 'a'),
+            ('base', '0xbase-token', '1', 'shared-token', 'shared-token-image', 'B', 'b'),
             ('ethereum', '0xeth-image', '2', 'eth-only', 'shared-image', 'C', 'c'),
             ('polygon', '0xpoly-image', '1', 'poly-only', 'shared-image', 'D', 'd'),
             ('solana', 'So11111111111111111111111111111111111111112',

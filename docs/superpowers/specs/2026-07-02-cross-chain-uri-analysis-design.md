@@ -51,7 +51,7 @@ The existing `analysis_rows` and `uri_key_contracts` tables remain the source
 of truth. URI matching continues to use the precomputed normalized values
 `token_uri_norm` and `image_uri_norm`.
 
-Preparation adds two compact structures:
+Preparation adds three compact structures:
 
 1. `uri_cross_chain_keys`
    - one row per `(key_kind, key_value)` present on at least two distinct
@@ -59,17 +59,25 @@ Preparation adds two compact structures:
    - used to add cross-chain-any flags to `uri_contract_flags`;
    - supports `cross_chain_summary` without multiplying rows by chain count.
 
-2. `uri_chain_pair_contract_flags`
+2. `uri_key_chain_presence`
+   - contains only keys already proven to occur on at least two chains;
+   - avoids retaining the much larger set of single-chain-only URI keys.
+
+3. `uri_chain_pair_contract_flags`
    - one row per directed
-     `(primary_chain, secondary_chain, contract_address)`;
-   - created from primary rows and URI-key presence on the selected secondary
-     chain;
+     `(primary_chain, secondary_chain, contract_address)` that has at least one
+     URI match;
+   - created by sparse inner joins from primary token/image keys to URI-key
+     presence on matching secondary chains;
    - stores the same `v1/v2/v3` NFT and contract flag columns as the existing
      intra-chain table.
 
 The matrix path uses key-presence joins rather than a full NFT-to-NFT
-self-join. With four selected chains, each source row is considered against
-three secondary chains, which is bounded and avoids pairwise NFT explosion.
+self-join or a dense source-row-to-chain cross join. Token and image hits are
+merged by source row before computing V1/V2/V3, preserving V2 exclusion while
+materializing only actual cross-chain hits. All directed pair totals are then
+loaded with one grouped query; missing pairs are emitted as zero-valued rows in
+Rust.
 
 ## Aggregation and Output
 
@@ -81,6 +89,9 @@ three secondary chains, which is bounded and avoids pairwise NFT explosion.
 3. one `chain_matrix` row set per ordered pair of distinct selected chains.
 
 Each row set contains `v1`, `v2`, and `v3`.
+The per-chain intra-chain and cross-chain-any contract totals are loaded
+together with one `GROUP BY chain` query rather than rescanning
+`uri_contract_flags` once per chain and scope.
 
 For four selected chains:
 

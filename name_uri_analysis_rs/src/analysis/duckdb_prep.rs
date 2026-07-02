@@ -266,8 +266,11 @@ fn build_uri_key_chain_presence_sql(persist_prepared: bool) -> String {
     format!(
         "
         CREATE {table_scope}TABLE uri_key_chain_presence AS
-        SELECT DISTINCT chain, key_kind, key_value
-        FROM uri_key_contracts;
+        SELECT DISTINCT keys.chain, keys.key_kind, keys.key_value
+        FROM uri_key_contracts keys
+        INNER JOIN uri_cross_chain_keys cross_keys
+          ON cross_keys.key_kind = keys.key_kind
+         AND cross_keys.key_value = keys.key_value;
         ",
         table_scope = prepared_table_scope(persist_prepared),
     )
@@ -393,7 +396,8 @@ fn build_uri_chain_pair_contract_flags_sql(persist_prepared: bool) -> String {
         "
         CREATE {table_scope}TABLE uri_chain_pair_contract_flags AS
         WITH rows AS (
-            SELECT chain,
+            SELECT rowid AS uri_row_id,
+                   chain AS primary_chain,
                    contract_address,
                    token_uri_norm,
                    image_uri_norm
@@ -401,28 +405,49 @@ fn build_uri_chain_pair_contract_flags_sql(persist_prepared: bool) -> String {
             WHERE contract_address <> ''
               AND (token_uri_norm <> '' OR image_uri_norm <> '')
         ),
-        keyed AS (
-            SELECT r.chain AS primary_chain,
-                   secondary.chain AS secondary_chain,
+        token_hits AS (
+            SELECT r.uri_row_id,
+                   r.primary_chain,
+                   presence.chain AS secondary_chain,
                    r.contract_address,
-                   coalesce(nt.key_value IS NOT NULL, false) AS norm_token_chain,
-                   coalesce(ni.key_value IS NOT NULL, false) AS norm_image_chain
+                   true AS norm_token_chain,
+                   false AS norm_image_chain
             FROM rows r
-            CROSS JOIN selected_chains secondary
-            LEFT JOIN uri_key_chain_presence nt
-              ON nt.chain = secondary.chain
-             AND nt.key_kind = 'norm_token'
-             AND nt.key_value = r.token_uri_norm
-            LEFT JOIN uri_key_chain_presence ni
-              ON ni.chain = secondary.chain
-             AND ni.key_kind = 'norm_image'
-             AND ni.key_value = r.image_uri_norm
-            WHERE secondary.chain <> r.chain
+            INNER JOIN uri_key_chain_presence presence
+              ON presence.key_kind = 'norm_token'
+             AND presence.key_value = r.token_uri_norm
+             AND presence.chain <> r.primary_chain
+        ),
+        image_hits AS (
+            SELECT r.uri_row_id,
+                   r.primary_chain,
+                   presence.chain AS secondary_chain,
+                   r.contract_address,
+                   false AS norm_token_chain,
+                   true AS norm_image_chain
+            FROM rows r
+            INNER JOIN uri_key_chain_presence presence
+              ON presence.key_kind = 'norm_image'
+             AND presence.key_value = r.image_uri_norm
+             AND presence.chain <> r.primary_chain
+        ),
+        keyed AS (
+            SELECT uri_row_id,
+                   primary_chain,
+                   secondary_chain,
+                   contract_address,
+                   bool_or(norm_token_chain) AS norm_token_chain,
+                   bool_or(norm_image_chain) AS norm_image_chain
+            FROM (
+                SELECT * FROM token_hits
+                UNION ALL
+                SELECT * FROM image_hits
+            ) hits
+            GROUP BY uri_row_id, primary_chain, secondary_chain, contract_address
         )
         SELECT primary_chain,
                secondary_chain,
                contract_address,
-               count(*)::BIGINT AS total_nfts,
                {metric_columns}
         FROM keyed
         GROUP BY primary_chain, secondary_chain, contract_address;
@@ -433,48 +458,106 @@ fn build_uri_chain_pair_contract_flags_sql(persist_prepared: bool) -> String {
     )
 }
 
-fn uri_counts_from_contract_flags(
-    conn: &Connection,
-    chain: &str,
-    prefix: &str,
-) -> Result<UriCounts, AnalysisError> {
-    let sql = format!(
-        "
-        SELECT coalesce(sum({prefix}_v1_nfts), 0)::BIGINT,
+fn uri_count_sum_columns(prefix: &str) -> String {
+    format!(
+        "coalesce(sum({prefix}_v1_nfts), 0)::BIGINT,
                coalesce(sum({prefix}_v1_contracts), 0)::BIGINT,
                coalesce(sum({prefix}_v2_nfts), 0)::BIGINT,
                coalesce(sum({prefix}_v2_contracts), 0)::BIGINT,
                coalesce(sum({prefix}_v3_nfts), 0)::BIGINT,
-               coalesce(sum({prefix}_v3_contracts), 0)::BIGINT
-        FROM uri_contract_flags
-        WHERE chain = ?
-        "
-    );
-    conn.query_row(&sql, params![chain], uri_counts_from_row)
-        .map_err(AnalysisError::from)
+               coalesce(sum({prefix}_v3_contracts), 0)::BIGINT"
+    )
 }
 
-fn uri_counts_from_chain_pair_flags(
-    conn: &Connection,
-    primary_chain: &str,
-    secondary_chain: &str,
-) -> Result<UriCounts, AnalysisError> {
-    conn.query_row(
+fn uri_contract_counts_sql(include_cross_chain: bool) -> String {
+    let cross_columns = if include_cross_chain {
+        format!(",\n               {}", uri_count_sum_columns("norm_cross_chain"))
+    } else {
+        String::new()
+    };
+    format!(
         "
-        SELECT coalesce(sum(norm_chain_v1_nfts), 0)::BIGINT,
+        SELECT chain,
+               {intra_columns}{cross_columns}
+        FROM uri_contract_flags
+        GROUP BY chain
+        ",
+        intra_columns = uri_count_sum_columns("norm_contract"),
+    )
+}
+
+fn uri_counts_from_row_at(row: &duckdb::Row<'_>, start: usize) -> duckdb::Result<UriCounts> {
+    Ok(UriCounts {
+        v1_nfts: row.get(start)?,
+        v1_contracts: row.get(start + 1)?,
+        v2_nfts: row.get(start + 2)?,
+        v2_contracts: row.get(start + 3)?,
+        v3_nfts: row.get(start + 4)?,
+        v3_contracts: row.get(start + 5)?,
+    })
+}
+
+fn load_uri_contract_counts(
+    conn: &Connection,
+    include_cross_chain: bool,
+) -> Result<HashMap<String, UriContractCounts>, AnalysisError> {
+    let mut stmt = conn.prepare(&uri_contract_counts_sql(include_cross_chain))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            UriContractCounts {
+                intra_chain: uri_counts_from_row_at(row, 1)?,
+                cross_chain: if include_cross_chain {
+                    uri_counts_from_row_at(row, 7)?
+                } else {
+                    UriCounts::default()
+                },
+            },
+        ))
+    })?;
+    let mut counts_by_chain = HashMap::new();
+    for row in rows {
+        let (chain, counts) = row?;
+        counts_by_chain.insert(chain, counts);
+    }
+    Ok(counts_by_chain)
+}
+
+fn uri_chain_pair_counts_sql() -> &'static str {
+    "
+        SELECT primary_chain,
+               secondary_chain,
+               coalesce(sum(norm_chain_v1_nfts), 0)::BIGINT,
                coalesce(sum(norm_chain_v1_contracts), 0)::BIGINT,
                coalesce(sum(norm_chain_v2_nfts), 0)::BIGINT,
                coalesce(sum(norm_chain_v2_contracts), 0)::BIGINT,
                coalesce(sum(norm_chain_v3_nfts), 0)::BIGINT,
                coalesce(sum(norm_chain_v3_contracts), 0)::BIGINT
         FROM uri_chain_pair_contract_flags
-        WHERE primary_chain = ?
-          AND secondary_chain = ?
-        ",
-        params![primary_chain, secondary_chain],
-        uri_counts_from_row,
-    )
-    .map_err(AnalysisError::from)
+        GROUP BY primary_chain, secondary_chain
+        "
+}
+
+fn load_uri_chain_pair_counts(
+    conn: &Connection,
+) -> Result<HashMap<String, HashMap<String, UriCounts>>, AnalysisError> {
+    let mut stmt = conn.prepare(uri_chain_pair_counts_sql())?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            uri_counts_from_row_at(row, 2)?,
+        ))
+    })?;
+    let mut counts_by_pair = HashMap::<String, HashMap<String, UriCounts>>::new();
+    for row in rows {
+        let (primary_chain, secondary_chain, counts) = row?;
+        counts_by_pair
+            .entry(primary_chain)
+            .or_default()
+            .insert(secondary_chain, counts);
+    }
+    Ok(counts_by_pair)
 }
 
 fn load_selected_chains(conn: &Connection) -> Result<Vec<String>, AnalysisError> {

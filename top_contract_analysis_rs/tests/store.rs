@@ -1484,3 +1484,34 @@ fn snapshot_export_preserves_solana_contract_address_case() {
 
     assert_eq!(actual, address);
 }
+
+#[cfg(feature = "export-snapshot")]
+#[test]
+fn snapshot_export_normalizes_solana_chain_before_preserving_address() {
+    let dir = tempdir().unwrap();
+    let parquet_path = dir.path().join("solana-normalized.parquet");
+    let address = "SoLanaCaseSensitive111111111111111111111111";
+    write_snapshot_rows_to_parquet(
+        " Solana ",
+        &[SnapshotExportRow {
+            contract_address: address.into(),
+            token_id: "MintCaseSensitive11111111111111111111111111".into(),
+            ..Default::default()
+        }],
+        &parquet_path,
+    )
+    .unwrap();
+
+    let conn = Connection::open_in_memory().unwrap();
+    let path = parquet_path_literal(&parquet_path);
+    let (chain, actual): (String, String) = conn
+        .query_row(
+            &format!("SELECT chain, contract_address FROM read_parquet('{path}')"),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+
+    assert_eq!(chain, "solana");
+    assert_eq!(actual, address);
+}

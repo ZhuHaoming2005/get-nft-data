@@ -30,6 +30,14 @@ pub struct SnapshotBlockRange {
     pub end: Option<i64>,
 }
 
+fn normalized_chain(chain: &str) -> String {
+    chain.trim().to_lowercase()
+}
+
+fn is_solana_chain(chain: &str) -> bool {
+    chain.trim().eq_ignore_ascii_case("solana")
+}
+
 impl SnapshotBlockRange {
     pub fn new(start: Option<i64>, end: Option<i64>) -> Result<Self, AppError> {
         if start.is_some_and(|value| value < 0) || end.is_some_and(|value| value < 0) {
@@ -46,7 +54,7 @@ impl SnapshotBlockRange {
     }
 
     pub fn validate_for_chain(self, chain: &str) -> Result<Self, AppError> {
-        if chain.eq_ignore_ascii_case("solana") && (self.start.is_some() || self.end.is_some()) {
+        if is_solana_chain(chain) && (self.start.is_some() || self.end.is_some()) {
             return Err(AppError::InvalidData(
                 "Solana block filtering is unavailable because current rows use first_seen_block = 0"
                     .to_string(),
@@ -63,7 +71,7 @@ struct SnapshotQuery {
 
 fn canonical_contract_address(chain: &str, address: &str) -> String {
     let trimmed = address.trim();
-    if chain.eq_ignore_ascii_case("solana") {
+    if is_solana_chain(chain) {
         trimmed.to_string()
     } else {
         trimmed.to_lowercase()
@@ -71,7 +79,7 @@ fn canonical_contract_address(chain: &str, address: &str) -> String {
 }
 
 fn chain_to_table(chain: &str) -> Result<String, AppError> {
-    let normalized = chain.trim().to_lowercase();
+    let normalized = normalized_chain(chain);
     if normalized.is_empty()
         || !normalized
             .chars()
@@ -136,10 +144,11 @@ fn snapshot_schema() -> Arc<Schema> {
 
 fn snapshot_batch(chain: &str, rows: &[SnapshotExportRow]) -> Result<RecordBatch, AppError> {
     let schema = snapshot_schema();
-    let chain_values: Vec<String> = rows.iter().map(|_| chain.to_string()).collect();
+    let chain = normalized_chain(chain);
+    let chain_values: Vec<String> = rows.iter().map(|_| chain.clone()).collect();
     let contract_address_values: Vec<String> = rows
         .iter()
-        .map(|row| canonical_contract_address(chain, &row.contract_address))
+        .map(|row| canonical_contract_address(&chain, &row.contract_address))
         .collect();
     let token_id_values: Vec<String> = rows.iter().map(|row| row.token_id.clone()).collect();
     let token_uri_values: Vec<String> = rows.iter().map(|row| row.token_uri.clone()).collect();
@@ -285,6 +294,7 @@ mod tests {
         let range = SnapshotBlockRange::new(Some(10), Some(20)).unwrap();
         let error = range.validate_for_chain("solana").unwrap_err();
         assert!(error.to_string().contains("first_seen_block = 0"));
+        assert!(range.validate_for_chain(" Solana ").is_err());
     }
 
     #[test]

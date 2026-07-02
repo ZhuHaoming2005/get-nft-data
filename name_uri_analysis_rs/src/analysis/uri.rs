@@ -18,9 +18,15 @@ fn run_uri_analysis(
             nfts: 0,
         })
     };
+    let include_cross_chain = chains.len() > 1;
+    let contract_counts = load_uri_contract_counts(conn, include_cross_chain)?;
 
     for chain in chains {
-        let counts = uri_counts_from_contract_flags(conn, chain, "norm_contract")?;
+        let counts = contract_counts
+            .get(chain)
+            .copied()
+            .unwrap_or_default()
+            .intra_chain;
         push_uri_rows(
             &mut rows,
             "intra_chain",
@@ -33,10 +39,13 @@ fn run_uri_analysis(
         progress.step(format!("URI intra {chain} norm_cross"));
     }
 
-    if chains.len() > 1 {
+    if include_cross_chain {
         for chain in chains {
-            let counts =
-                uri_counts_from_contract_flags(conn, chain, "norm_cross_chain")?;
+            let counts = contract_counts
+                .get(chain)
+                .copied()
+                .unwrap_or_default()
+                .cross_chain;
             push_uri_rows(
                 &mut rows,
                 "cross_chain_summary",
@@ -49,13 +58,17 @@ fn run_uri_analysis(
             progress.step(format!("URI cross-chain summary {chain}"));
         }
 
+        let pair_counts = load_uri_chain_pair_counts(conn)?;
         for primary in chains {
             for secondary in chains {
                 if primary == secondary {
                     continue;
                 }
-                let counts =
-                    uri_counts_from_chain_pair_flags(conn, primary, secondary)?;
+                let counts = pair_counts
+                    .get(primary)
+                    .and_then(|secondary_counts| secondary_counts.get(secondary))
+                    .copied()
+                    .unwrap_or_default();
                 push_uri_rows(
                     &mut rows,
                     "chain_matrix",
@@ -72,17 +85,6 @@ fn run_uri_analysis(
 
     progress.finish_phase("URI analysis complete");
     Ok(rows)
-}
-
-fn uri_counts_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<UriCounts> {
-    Ok(UriCounts {
-        v1_nfts: row.get(0)?,
-        v1_contracts: row.get(1)?,
-        v2_nfts: row.get(2)?,
-        v2_contracts: row.get(3)?,
-        v3_nfts: row.get(4)?,
-        v3_contracts: row.get(5)?,
-    })
 }
 
 fn push_uri_rows(

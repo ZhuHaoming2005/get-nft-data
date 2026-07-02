@@ -398,16 +398,40 @@ mod tests {
     #[test]
     fn multi_chain_uri_flags_include_cross_chain_tables_and_metrics() {
         let key_sql = build_uri_cross_chain_keys_sql(false);
+        let presence_sql = build_uri_key_chain_presence_sql(false);
         let flags_sql = build_uri_contract_flags_sql(true, false);
         let pair_sql = build_uri_chain_pair_contract_flags_sql(false);
 
         assert!(key_sql.contains("count(DISTINCT chain) >= 2"));
+        assert!(presence_sql.contains("JOIN uri_cross_chain_keys"));
         assert!(flags_sql.contains("uri_cross_chain_keys"));
         assert!(flags_sql.contains("norm_cross_chain_v1_nfts"));
         assert!(pair_sql.contains("uri_key_chain_presence"));
         assert!(pair_sql.contains("primary_chain"));
         assert!(pair_sql.contains("secondary_chain"));
         assert!(pair_sql.contains("norm_chain_v3_contracts"));
+        assert!(pair_sql.contains("rowid AS uri_row_id"));
+        assert!(pair_sql.contains("UNION ALL"));
+        assert!(!pair_sql.contains("CROSS JOIN selected_chains"));
+        assert!(!pair_sql.contains("count(*)::BIGINT AS total_nfts"));
+    }
+
+    #[test]
+    fn chain_pair_count_query_aggregates_all_pairs_at_once() {
+        let sql = uri_chain_pair_counts_sql();
+
+        assert!(sql.contains("GROUP BY primary_chain, secondary_chain"));
+        assert!(!sql.contains('?'));
+    }
+
+    #[test]
+    fn contract_count_query_aggregates_all_chains_and_scopes_at_once() {
+        let sql = uri_contract_counts_sql(true);
+
+        assert!(sql.contains("GROUP BY chain"));
+        assert!(sql.contains("norm_contract_v1_nfts"));
+        assert!(sql.contains("norm_cross_chain_v1_nfts"));
+        assert!(!sql.contains('?'));
     }
 
     #[test]

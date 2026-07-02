@@ -4,7 +4,7 @@
 
 **Goal:** Add `cross_chain_summary` and directed `chain_matrix` output for normalized token/image URI reuse while preserving the existing `uri` `v1/v2/v3` report contract.
 
-**Architecture:** Extend DuckDB preparation with compact cross-chain key-presence and directed chain-pair contract-flag tables. Reuse the existing `UriCounts` and `push_uri_rows` aggregation path so URI output uses the same primary-chain denominators and scope structure as name and metadata without a full NFT-pair self-join.
+**Architecture:** Extend DuckDB preparation with cross-chain-only key presence and sparse directed chain-pair contract flags. Reuse the existing `UriCounts` and `push_uri_rows` aggregation path so URI output uses the same primary-chain denominators and scope structure as name and metadata without a full NFT-pair self-join or dense row-to-chain expansion. Load every directed pair total with one grouped query.
 
 **Tech Stack:** Rust 2021, DuckDB SQL, Cargo tests, existing Parquet integration fixtures.
 
@@ -98,8 +98,11 @@ fn build_uri_key_chain_presence_sql(persist_prepared: bool) -> String {
     format!(
         "
         CREATE {table_scope}TABLE uri_key_chain_presence AS
-        SELECT DISTINCT chain, key_kind, key_value
-        FROM uri_key_contracts;
+        SELECT DISTINCT keys.chain, keys.key_kind, keys.key_value
+        FROM uri_key_contracts keys
+        INNER JOIN uri_cross_chain_keys cross_keys
+          ON cross_keys.key_kind = keys.key_kind
+         AND cross_keys.key_value = keys.key_value;
         ",
         table_scope = prepared_table_scope(persist_prepared),
     )
@@ -178,65 +181,20 @@ if include_cross_chain {
 Add `build_uri_chain_pair_contract_flags_sql`. It must:
 
 1. select non-empty URI rows from `analysis_rows`;
-2. cross join `selected_chains` as the secondary chain;
-3. exclude `secondary.chain = row.chain`;
-4. left join `uri_key_chain_presence` separately for token and image keys on
-   the selected secondary chain;
-5. group by `(primary_chain, secondary_chain, contract_address)`;
+2. assign each source row a stable `uri_row_id`;
+3. inner join `uri_key_chain_presence` separately for token and image keys,
+   excluding the source chain;
+4. union and merge token/image hits by source row and secondary chain;
+5. group the sparse hits by
+   `(primary_chain, secondary_chain, contract_address)`;
 6. emit `norm_chain_v1/v2/v3_{nfts,contracts}` through
    `uri_contract_metric_sql`.
 
-Use this complete builder:
-
-```rust
-fn build_uri_chain_pair_contract_flags_sql(persist_prepared: bool) -> String {
-    format!(
-        "
-        CREATE {table_scope}TABLE uri_chain_pair_contract_flags AS
-        WITH rows AS (
-            SELECT chain,
-                   contract_address,
-                   token_uri_norm,
-                   image_uri_norm
-            FROM analysis_rows
-            WHERE contract_address <> ''
-              AND (token_uri_norm <> '' OR image_uri_norm <> '')
-        ),
-        keyed AS (
-            SELECT r.chain AS primary_chain,
-                   secondary.chain AS secondary_chain,
-                   r.contract_address,
-                   coalesce(nt.key_value IS NOT NULL, false) AS norm_token_chain,
-                   coalesce(ni.key_value IS NOT NULL, false) AS norm_image_chain
-            FROM rows r
-            CROSS JOIN selected_chains secondary
-            LEFT JOIN uri_key_chain_presence nt
-              ON nt.chain = secondary.chain
-             AND nt.key_kind = 'norm_token'
-             AND nt.key_value = r.token_uri_norm
-            LEFT JOIN uri_key_chain_presence ni
-              ON ni.chain = secondary.chain
-             AND ni.key_kind = 'norm_image'
-             AND ni.key_value = r.image_uri_norm
-            WHERE secondary.chain <> r.chain
-        )
-        SELECT primary_chain,
-               secondary_chain,
-               contract_address,
-               count(*)::BIGINT AS total_nfts,
-               {metric_columns}
-        FROM keyed
-        GROUP BY primary_chain, secondary_chain, contract_address;
-        ",
-        table_scope = prepared_table_scope(persist_prepared),
-        metric_columns = uri_contract_metric_sql(
-            "norm_chain",
-            "norm_token_chain",
-            "norm_image_chain",
-        ),
-    )
-}
-```
+The builder uses `rows`, `token_hits`, `image_hits`, and `keyed` CTEs.
+`token_hits` and `image_hits` use inner joins, while `keyed` combines them with
+`UNION ALL` and `bool_or` grouped by source row and directed chain pair. The
+final table contains only matching contract-pair rows and does not retain an
+unused `total_nfts` column.
 
 Execute it from `build_uri_contract_flags` only when
 `include_cross_chain` is true.
@@ -246,17 +204,15 @@ Execute it from `build_uri_contract_flags` only when
 Add:
 
 ```rust
-fn uri_counts_from_chain_pair_flags(
+fn load_uri_chain_pair_counts(
     conn: &Connection,
-    primary_chain: &str,
-    secondary_chain: &str,
-) -> Result<UriCounts, AnalysisError>
+) -> Result<HashMap<String, HashMap<String, UriCounts>>, AnalysisError>
 ```
 
 Query and sum `norm_chain_v1/v2/v3_{nfts,contracts}` from
-`uri_chain_pair_contract_flags` with both chain predicates. Use
-`coalesce(sum(norm_chain_v1_nfts), 0)` and the corresponding five contract/NFT
-columns so every requested pair can emit zero-valued rows.
+`uri_chain_pair_contract_flags`, grouping once by both chain columns. Load the
+result into a nested map and emit zero-valued rows for requested pairs absent
+from the sparse table.
 
 - [ ] **Step 7: Run SQL unit tests and verify GREEN**
 
@@ -368,10 +324,14 @@ let total_for = |chain: &str| {
         nfts: 0,
     })
 };
+let contract_counts = load_uri_contract_counts(conn, true)?;
 
 for chain in chains {
-    let counts =
-        uri_counts_from_contract_flags(conn, chain, "norm_cross_chain")?;
+    let counts = contract_counts
+        .get(chain)
+        .copied()
+        .unwrap_or_default()
+        .cross_chain;
     push_uri_rows(
         &mut rows,
         "cross_chain_summary",
@@ -383,13 +343,17 @@ for chain in chains {
     );
 }
 
+let pair_counts = load_uri_chain_pair_counts(conn)?;
 for primary in chains {
     for secondary in chains {
         if primary == secondary {
             continue;
         }
-        let counts =
-            uri_counts_from_chain_pair_flags(conn, primary, secondary)?;
+        let counts = pair_counts
+            .get(primary)
+            .and_then(|secondary_counts| secondary_counts.get(secondary))
+            .copied()
+            .unwrap_or_default();
         push_uri_rows(
             &mut rows,
             "chain_matrix",
