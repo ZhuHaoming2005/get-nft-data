@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use duckdb::Connection;
-use name_uri_analysis_rs::analysis::{run_analysis, AnalysisOptions};
+use name_uri_analysis_rs::analysis::{run_analysis, AnalysisOptions, AnalysisReport};
 
 fn write_parquet(path: &Path, values_sql: &str) {
     let _ = std::fs::remove_file(path);
@@ -89,6 +89,30 @@ fn write_parquet_with_metadata_json_and_doc(path: &Path, values_sql: &str) {
         values_sql = values_sql
     );
     conn.execute_batch(&sql).unwrap();
+}
+
+fn assert_uri_row(
+    report: &AnalysisReport,
+    scope: &str,
+    primary_chain: &str,
+    secondary_chain: &str,
+    metric: &str,
+    duplicate_nfts: i64,
+    duplicate_contracts: i64,
+) {
+    let row = report
+        .summary_rows
+        .iter()
+        .find(|row| {
+            row.field_name == "uri"
+                && row.scope == scope
+                && row.primary_chain == primary_chain
+                && row.secondary_chain == secondary_chain
+                && row.metric == metric
+        })
+        .expect("expected URI summary row");
+    assert_eq!(row.duplicate_nft_count, duplicate_nfts);
+    assert_eq!(row.duplicate_contract_count, duplicate_contracts);
 }
 
 #[test]
@@ -377,16 +401,19 @@ fn uri_any_and_cross_contract_counts_stay_distinct() {
 }
 
 #[test]
-fn cross_chain_uri_rows_are_not_emitted() {
+fn cross_chain_uri_rows_emit_summary_and_isolated_pair_matrix() {
     let temp = tempfile::tempdir().unwrap();
     let parquet = temp.path().join("sample.parquet");
     write_parquet(
         &parquet,
         r#"
             VALUES
-            ('ethereum', '0xaaa', '1', 'ipfs://shared-cross', 'img-eth', 'A', 'a'),
-            ('base', '0xbbb', '1', 'ipfs://shared-cross', 'img-base', 'B', 'b'),
-            ('polygon', '0xccc', '1', 'ipfs://polygon-only', 'img-poly', 'C', 'c')
+            ('ethereum', '0xeth-token', '1', 'shared-token', 'eth-image', 'A', 'a'),
+            ('base', '0xbase-token', '1', 'shared-token', 'base-image', 'B', 'b'),
+            ('ethereum', '0xeth-image', '2', 'eth-only', 'shared-image', 'C', 'c'),
+            ('polygon', '0xpoly-image', '1', 'poly-only', 'shared-image', 'D', 'd'),
+            ('solana', 'So11111111111111111111111111111111111111112',
+             'Mint111111111111111111111111111111111111111', 'sol-only', 'sol-image', 'E', 'e')
         "#,
     );
 
@@ -405,10 +432,15 @@ fn cross_chain_uri_rows_are_not_emitted() {
     })
     .unwrap();
 
-    assert!(report
-        .summary_rows
-        .iter()
-        .all(|row| row.field_name != "uri" || row.scope == "intra_chain"));
+    assert_uri_row(&report, "cross_chain_summary", "ethereum", "", "v1", 1, 1);
+    assert_uri_row(&report, "cross_chain_summary", "ethereum", "", "v2", 1, 1);
+    assert_uri_row(&report, "cross_chain_summary", "ethereum", "", "v3", 2, 2);
+
+    assert_uri_row(&report, "chain_matrix", "ethereum", "base", "v1", 1, 1);
+    assert_uri_row(&report, "chain_matrix", "ethereum", "base", "v2", 0, 0);
+    assert_uri_row(&report, "chain_matrix", "ethereum", "polygon", "v2", 1, 1);
+    assert_uri_row(&report, "chain_matrix", "ethereum", "solana", "v3", 0, 0);
+    assert_uri_row(&report, "chain_matrix", "base", "polygon", "v3", 0, 0);
 }
 
 #[test]
