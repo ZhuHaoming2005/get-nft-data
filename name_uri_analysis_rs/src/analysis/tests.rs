@@ -389,8 +389,25 @@ mod tests {
 
         assert!(!sql.contains("uri_key_chain_counts"));
         assert!(!sql.contains("uri_duplicate_key_chain_counts"));
+        assert!(!sql.contains("uri_cross_chain_keys"));
+        assert!(!sql.contains("norm_cross_chain"));
         assert!(!sql.contains("_chain"));
         assert!(sql.contains("norm_contract_v1_nfts"));
+    }
+
+    #[test]
+    fn multi_chain_uri_flags_include_cross_chain_tables_and_metrics() {
+        let key_sql = build_uri_cross_chain_keys_sql(false);
+        let flags_sql = build_uri_contract_flags_sql(true, false);
+        let pair_sql = build_uri_chain_pair_contract_flags_sql(false);
+
+        assert!(key_sql.contains("count(DISTINCT chain) >= 2"));
+        assert!(flags_sql.contains("uri_cross_chain_keys"));
+        assert!(flags_sql.contains("norm_cross_chain_v1_nfts"));
+        assert!(pair_sql.contains("uri_key_chain_presence"));
+        assert!(pair_sql.contains("primary_chain"));
+        assert!(pair_sql.contains("secondary_chain"));
+        assert!(pair_sql.contains("norm_chain_v3_contracts"));
     }
 
     #[test]
