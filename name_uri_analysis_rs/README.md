@@ -4,14 +4,17 @@ Rust + DuckDB 一体分析脚本，读取 `top_contract_analysis_rs export-snaps
 
 功能：
 
-- `name` 使用 Jaro-Winkler，单阈值运行，CLI 默认阈值为 `95`。
+- `name` 使用 Jaro-Winkler，单阈值运行，CLI 默认阈值为 `95`；多链输入时同时输出跨链汇总和定向链对矩阵。
 - 分析链集合来自传入的 Parquet 文件；未传入的链不会参与统计，只有一条链时不输出跨链结果。
-- `token_uri` / `image_uri` 只输出单链内规范化 URI 的跨合约重复，即 `norm_cross`：
+- `token_uri` / `image_uri` 使用规范化 URI 的 `norm_cross` 口径，输出范围包括：
+  - `intra_chain`：同一链内的跨合约重复；
+  - `cross_chain_summary`：主链 NFT 与任意其它输入链发生 URI 重复；
+  - `chain_matrix`：主链 NFT 与指定目标链发生 URI 重复，按方向分别输出。
+- 每个 URI 范围均包含：
   - `v1`: `token_uri` 命中
   - `v2`: `token_uri` 未命中但 `image_uri` 命中
   - `v3`: 任一 URI 命中
-  - 不输出 URI 任意重复、严格串重复、跨链 URI 汇总。
-- `metadata` 使用 BM25 文档查重，阈值为 `0.6`；每个合约只取第一条可用 metadata 作为代表文档。脚本先在 DuckDB 中按合约筛出代表 metadata，再按 `top_contract_analysis_rs` 的 final metadata 语义提取 `description`、`attributes.trait_type/value`、`image`、`external_url` 等内容值，不把完整 raw JSON 或通用 schema 字段名作为重复依据。BM25 命中还必须共享全局低频内容锚点，降低全局连通分量桥接造成的误判。
+- `metadata` 使用 BM25 文档查重，阈值为 `0.6`，多链输入时输出跨链汇总和定向链对矩阵；每个合约只取第一条可用 metadata 作为代表文档。脚本先在 DuckDB 中按合约筛出代表 metadata，再按 `top_contract_analysis_rs` 的 final metadata 语义提取 `description`、`attributes.trait_type/value`、`image`、`external_url` 等内容值，不把完整 raw JSON 或通用 schema 字段名作为重复依据。BM25 命中还必须共享全局低频内容锚点，降低全局连通分量桥接造成的误判。
 - `duplicate_contract_ratio` / `duplicate_nft_ratio` 的分母统一使用每条链在 `analysis_rows` 中的全量非空合约地址数和 NFT 行数；name、URI、metadata 不再分别使用各自可分析子集作为分母。
 - DuckDB 使用 `:memory:` 内存数据库，不再设置 DuckDB `memory_limit`；兼容旧命令保留的 `--database` 参数不再用于打开磁盘库。准备阶段只生成本次运行的临时工作投影，不做持久化 prepared-table 缓存。
 
