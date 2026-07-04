@@ -287,10 +287,10 @@ mod tests {
     }
 
     #[test]
-    fn analysis_rows_projection_omits_unused_raw_uri_columns() {
+    fn analysis_rows_projection_keeps_token_id_for_metadata_verification() {
         let sql = build_analysis_rows_sql("'sample.parquet'", "metadata_json");
 
-        assert!(!sql.contains(" AS token_id,"));
+        assert!(sql.contains(" AS token_id,"));
         assert!(!sql.contains(" AS token_uri,"));
         assert!(!sql.contains(" AS image_uri,"));
         assert!(sql.contains("token_uri_norm"));
@@ -315,13 +315,13 @@ mod tests {
                 CREATE TEMP TABLE analysis_rows AS
                 SELECT * FROM (
                     VALUES
-                    ('ethereum', '0xaaa', '{"description":"first available"}'),
-                    ('ethereum', '0xaaa', '{"description":"later repeated"}'),
-                    ('ethereum', '0xaaa', '{"description":"later repeated"}'),
-                    ('ethereum', '0xbbb', ''),
-                    ('ethereum', '0xbbb', '{"description":"first usable for b"}'),
-                    ('ethereum', '0xbbb', '{"description":"later b"}')
-                ) AS t(chain, contract_address, metadata_json);
+                    ('ethereum', '0xaaa', '1', '{"description":"first available"}'),
+                    ('ethereum', '0xaaa', '2', '{"description":"later repeated"}'),
+                    ('ethereum', '0xaaa', '3', '{"description":"later repeated"}'),
+                    ('ethereum', '0xbbb', '0', ''),
+                    ('ethereum', '0xbbb', '1', '{"description":"first usable for b"}'),
+                    ('ethereum', '0xbbb', '2', '{"description":"later b"}')
+                ) AS t(chain, contract_address, token_id, metadata_json);
             "#,
         )
         .unwrap();
@@ -354,14 +354,38 @@ mod tests {
     }
 
     #[test]
-    fn metadata_raw_rows_sql_groups_contracts_before_selecting_first_metadata() {
+    fn metadata_raw_rows_sql_ranks_contract_representatives_by_token_id() {
         let sql = metadata_raw_rows_sql();
 
         assert!(!sql.contains("GROUP BY chain, contract_address, metadata_json"));
         assert!(sql.contains("GROUP BY chain, contract_address"));
-        assert!(sql.contains("min(metadata_row_id)"));
-        assert!(sql.contains("count(*)::BIGINT AS metadata_count"));
+        assert!(sql.contains("PARTITION BY chain, contract_address"));
+        assert!(sql.contains("ORDER BY token_id, metadata_row_id"));
+        assert!(sql.contains("count(*) OVER"));
         assert!(sql.contains("rowid AS metadata_row_id"));
+    }
+
+    #[test]
+    fn metadata_raw_rows_sql_selects_lowest_token_id_representative() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+                CREATE TEMP TABLE analysis_rows AS
+                SELECT * FROM (
+                    VALUES
+                    ('ethereum', '0xaaa', '2', '{"description":"rowid first"}'),
+                    ('ethereum', '0xaaa', '1', '{"description":"token id first"}')
+                ) AS t(chain, contract_address, token_id, metadata_json);
+            "#,
+        )
+        .unwrap();
+
+        let sql = metadata_raw_rows_sql();
+        let metadata = conn
+            .query_row(&sql, [], |row| row.get::<_, String>(2))
+            .unwrap();
+
+        assert_eq!(metadata, r#"{"description":"token id first"}"#);
     }
 
     #[test]
@@ -473,6 +497,18 @@ mod tests {
         assert_eq!(first.duplicate_contract_count, 2);
         assert_eq!(first.duplicate_nft_count, 5);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn sparse_union_find_reports_only_existing_connections() {
+        let mut union_find = SparseUnionFind::default();
+
+        assert!(!union_find.connected(1, 2));
+        assert_eq!(union_find.atom_count(), 0);
+        union_find.union(1, 2);
+        assert!(union_find.connected(1, 2));
+        assert!(!union_find.connected(1, 3));
+        assert_eq!(union_find.atom_count(), 2);
     }
 
     #[test]

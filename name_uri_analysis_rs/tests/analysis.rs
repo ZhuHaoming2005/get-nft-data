@@ -115,6 +115,33 @@ fn assert_uri_row(
     assert_eq!(row.duplicate_contract_count, duplicate_contracts);
 }
 
+fn assert_nft_scope(
+    report: &AnalysisReport,
+    field_name: &str,
+    metric: &str,
+    scope: &str,
+    primary_chain: &str,
+    secondary_chain: &str,
+    total_nfts: i64,
+    duplicate_nfts: i64,
+    duplicate_ratio: f64,
+) {
+    let row = report
+        .summary_rows
+        .iter()
+        .find(|row| {
+            row.field_name == field_name
+                && row.metric == metric
+                && row.scope == scope
+                && row.primary_chain == primary_chain
+                && row.secondary_chain == secondary_chain
+        })
+        .expect("expected three-scope summary row");
+    assert_eq!(row.total_nfts, total_nfts);
+    assert_eq!(row.duplicate_nft_count, duplicate_nfts);
+    assert!((row.duplicate_nft_ratio - duplicate_ratio).abs() < 1e-9);
+}
+
 #[test]
 fn analyzes_with_duckdb_memory_database() {
     let temp = tempfile::tempdir().unwrap();
@@ -665,7 +692,7 @@ fn chain_matrix_is_computed_per_chain_pair_without_third_chain_contamination() {
 }
 
 #[test]
-fn metadata_analysis_uses_first_available_representatives_for_correctness() {
+fn metadata_analysis_uses_deterministic_representatives_for_correctness() {
     let temp = tempfile::tempdir().unwrap();
     let parquet = temp.path().join("sample.parquet");
     write_parquet_with_metadata(
@@ -700,7 +727,7 @@ fn metadata_analysis_uses_first_available_representatives_for_correctness() {
             && row.scope == "intra_chain"
             && row.primary_chain == "ethereum"
             && row.threshold == Some(0.6)
-            && row.match_mode == "bm25_representative"
+            && row.match_mode == "template_recall_hybrid_verify"
             && row.metric == "duplicate_group"
             && row.total_contracts == 3
             && row.total_nfts == 4
@@ -784,7 +811,7 @@ fn four_chain_analysis_uses_chain_aware_contract_identity() {
 }
 
 #[test]
-fn metadata_analysis_uses_first_available_metadata_doc_per_contract() {
+fn metadata_analysis_uses_lowest_token_metadata_per_contract() {
     let temp = tempfile::tempdir().unwrap();
     let parquet = temp.path().join("sample.parquet");
     write_parquet_with_metadata(
@@ -863,6 +890,84 @@ fn metadata_analysis_does_not_match_same_schema_with_different_content_values() 
 }
 
 #[test]
+fn metadata_analysis_accepts_any_matching_overlapping_token_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let parquet = temp.path().join("sample.parquet");
+    write_parquet_with_metadata(
+        &parquet,
+        r#"
+            VALUES
+            ('ethereum', '0xaaa', '1', 'u1', 'i1', 'A', 'a', '{"name":"Alpha","image":"ipfs://alpha"}'),
+            ('ethereum', '0xaaa', '2', 'u2', 'i2', 'A', 'a', '{"description":"gold dragon"}'),
+            ('ethereum', '0xbbb', '1', 'u3', 'i3', 'B', 'b', '{"name":"Beta","image":"ar://beta"}'),
+            ('ethereum', '0xbbb', '2', 'u4', 'i4', 'B', 'b', '{"description":"gold dragon"}')
+        "#,
+    );
+
+    let report = run_analysis(AnalysisOptions {
+        database_path: temp.path().join("analysis.duckdb"),
+        parquet_inputs: vec![parquet],
+        output_dir: temp.path().join("out"),
+        thresholds: vec![95.0],
+        threads: 2,
+        memory_limit: "256MB".into(),
+        analysis_memory_limit: Some("64MB".into()),
+        temp_directory: None,
+        progress: false,
+        persist_prepared: false,
+        reuse_prepared: false,
+    })
+    .unwrap();
+
+    assert!(report.summary_rows.iter().any(|row| {
+        row.field_name == "metadata"
+            && row.scope == "intra_chain"
+            && row.primary_chain == "ethereum"
+            && row.duplicate_contract_count == 2
+            && row.duplicate_nft_count == 4
+    }));
+}
+
+#[test]
+fn metadata_analysis_falls_back_to_representatives_without_common_token_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let parquet = temp.path().join("sample.parquet");
+    write_parquet_with_metadata(
+        &parquet,
+        r#"
+            VALUES
+            ('ethereum', '0xaaa', '1', 'u1', 'i1', 'A', 'a', '{"description":"gold dragon"}'),
+            ('solana', 'Collection111', 'Mint111', 'u2', 'i2', 'B', 'b', '{"description":"gold dragon"}')
+        "#,
+    );
+
+    let report = run_analysis(AnalysisOptions {
+        database_path: temp.path().join("analysis.duckdb"),
+        parquet_inputs: vec![parquet],
+        output_dir: temp.path().join("out"),
+        thresholds: vec![95.0],
+        threads: 2,
+        memory_limit: "256MB".into(),
+        analysis_memory_limit: Some("64MB".into()),
+        temp_directory: None,
+        progress: false,
+        persist_prepared: false,
+        reuse_prepared: false,
+    })
+    .unwrap();
+
+    assert!(report.summary_rows.iter().any(|row| {
+        row.field_name == "metadata"
+            && row.scope == "chain_matrix"
+            && row.primary_chain == "ethereum"
+            && row.secondary_chain == "solana"
+            && row.match_mode == "template_recall_hybrid_verify"
+            && row.duplicate_contract_count == 1
+            && row.duplicate_nft_count == 1
+    }));
+}
+
+#[test]
 fn summary_rows_use_chain_totals_as_common_denominators() {
     let temp = tempfile::tempdir().unwrap();
     let parquet = temp.path().join("sample.parquet");
@@ -918,7 +1023,7 @@ fn summary_rows_use_chain_totals_as_common_denominators() {
 }
 
 #[test]
-fn metadata_analysis_requires_rare_anchor_for_representative_bm25_matching() {
+fn metadata_analysis_uses_template_recall_before_content_verification() {
     let temp = tempfile::tempdir().unwrap();
     let parquet = temp.path().join("sample.parquet");
     write_parquet_with_metadata(
@@ -994,4 +1099,150 @@ fn metadata_analysis_uses_metadata_doc_when_metadata_json_is_empty() {
             && row.duplicate_contract_count == 2
             && row.duplicate_nft_count == 2
     }));
+}
+
+#[test]
+fn three_scope_reporting_keeps_pools_isolated_and_uses_primary_chain_totals() {
+    let temp = tempfile::tempdir().unwrap();
+    let parquet = temp.path().join("sample.parquet");
+    write_parquet_with_metadata(
+        &parquet,
+        r#"
+            VALUES
+            ('ethereum', '0xeth-token-cross', '1', 'shared-token-cross', 'img-eth-token-cross',
+             'TokenCross', 'tokencross', '{"description":"token cross alpha"}'),
+            ('base', '0xbase-token-cross', '1', 'shared-token-cross', 'img-base-token-cross',
+             'TokenCross', 'tokencross', '{"description":"token cross alpha"}'),
+            ('polygon', '0xpoly-token-cross', '1', 'shared-token-cross', 'img-poly-token-cross',
+             'TokenCross', 'tokencross', '{"description":"token cross alpha"}'),
+            ('ethereum', '0xeth-image-cross', '1', 'token-eth-image-cross', 'shared-image-cross',
+             'ImageCross', 'imagecross', '{"description":"image cross beta"}'),
+            ('base', '0xbase-image-cross', '1', 'token-base-image-cross', 'shared-image-cross',
+             'ImageCross', 'imagecross', '{"description":"image cross beta"}'),
+            ('polygon', '0xpoly-image-cross', '1', 'token-poly-image-cross', 'shared-image-cross',
+             'ImageCross', 'imagecross', '{"description":"image cross beta"}'),
+            ('ethereum', '0xeth-token-intra-a', '1', 'eth-token-intra', 'img-eth-token-intra-a',
+             'TokenIntra', 'tokenintra', '{"description":"ethereum token intra gamma"}'),
+            ('ethereum', '0xeth-token-intra-b', '1', 'eth-token-intra', 'img-eth-token-intra-b',
+             'TokenIntra', 'tokenintra', '{"description":"ethereum token intra gamma"}'),
+            ('ethereum', '0xeth-image-intra-a', '1', 'token-eth-image-intra-a', 'eth-image-intra',
+             'ImageIntra', 'imageintra', '{"description":"ethereum image intra delta"}'),
+            ('ethereum', '0xeth-image-intra-b', '1', 'token-eth-image-intra-b', 'eth-image-intra',
+             'ImageIntra', 'imageintra', '{"description":"ethereum image intra delta"}'),
+            ('solana', 'SolOnly111', 'MintOnly111', 'sol-only', 'img-sol-only',
+             'SolOnly', 'solonly', '{"description":"solana only beta"}')
+        "#,
+    );
+
+    let report = run_analysis(AnalysisOptions {
+        database_path: temp.path().join("analysis.duckdb"),
+        parquet_inputs: vec![parquet],
+        output_dir: temp.path().join("out"),
+        thresholds: vec![95.0],
+        threads: 2,
+        memory_limit: "256MB".into(),
+        analysis_memory_limit: Some("64MB".into()),
+        temp_directory: None,
+        progress: false,
+        persist_prepared: false,
+        reuse_prepared: false,
+    })
+    .unwrap();
+
+    for (field, metric, cross_duplicate_nfts, intra_duplicate_nfts) in [
+        ("name", "duplicate_group", 2, 4),
+        ("uri", "v1", 1, 2),
+        ("uri", "v2", 1, 2),
+        ("uri", "v3", 2, 4),
+        ("metadata", "duplicate_group", 2, 4),
+    ] {
+        assert_nft_scope(
+            &report,
+            field,
+            metric,
+            "chain_matrix",
+            "ethereum",
+            "base",
+            6,
+            cross_duplicate_nfts,
+            cross_duplicate_nfts as f64 * 100.0 / 6.0,
+        );
+        assert_nft_scope(
+            &report,
+            field,
+            metric,
+            "chain_matrix",
+            "base",
+            "ethereum",
+            2,
+            cross_duplicate_nfts,
+            cross_duplicate_nfts as f64 * 100.0 / 2.0,
+        );
+        assert_nft_scope(
+            &report,
+            field,
+            metric,
+            "chain_matrix",
+            "base",
+            "polygon",
+            2,
+            cross_duplicate_nfts,
+            cross_duplicate_nfts as f64 * 100.0 / 2.0,
+        );
+        assert_nft_scope(
+            &report,
+            field,
+            metric,
+            "chain_matrix",
+            "polygon",
+            "base",
+            2,
+            cross_duplicate_nfts,
+            cross_duplicate_nfts as f64 * 100.0 / 2.0,
+        );
+        assert_nft_scope(
+            &report,
+            field,
+            metric,
+            "chain_matrix",
+            "ethereum",
+            "solana",
+            6,
+            0,
+            0.0,
+        );
+        assert_nft_scope(
+            &report,
+            field,
+            metric,
+            "chain_matrix",
+            "solana",
+            "ethereum",
+            1,
+            0,
+            0.0,
+        );
+        assert_nft_scope(
+            &report,
+            field,
+            metric,
+            "cross_chain_summary",
+            "ethereum",
+            "",
+            6,
+            cross_duplicate_nfts,
+            cross_duplicate_nfts as f64 * 100.0 / 6.0,
+        );
+        assert_nft_scope(
+            &report,
+            field,
+            metric,
+            "intra_chain",
+            "ethereum",
+            "",
+            6,
+            intra_duplicate_nfts,
+            intra_duplicate_nfts as f64 * 100.0 / 6.0,
+        );
+    }
 }

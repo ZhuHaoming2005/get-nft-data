@@ -247,6 +247,16 @@ impl SparseUnionFind {
         }
     }
 
+    fn connected(&mut self, left: usize, right: usize) -> bool {
+        let Some(left) = self.index_by_atom.get(&left).copied() else {
+            return false;
+        };
+        let Some(right) = self.index_by_atom.get(&right).copied() else {
+            return false;
+        };
+        self.find_local(left) == self.find_local(right)
+    }
+
     fn atom_count(&self) -> usize {
         self.atoms.len()
     }
