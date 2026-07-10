@@ -1,6 +1,9 @@
-fn run_chain_matrix_analysis(
+use super::*;
+
+pub(crate) fn run_chain_matrix_analysis(
     atoms: &[NameAtom],
     atoms_by_chain: &[Vec<usize>],
+    candidate_index: &NameCandidateIndex,
     chains: &[String],
     spec: ChainMatrixAnalysisSpec<'_>,
     pool: &rayon::ThreadPool,
@@ -39,16 +42,7 @@ fn run_chain_matrix_analysis(
                         .map(format_byte_size)
                         .unwrap_or_else(|| "unknown".to_string())
                 ));
-                let min_threshold = threshold_batch
-                    .iter()
-                    .copied()
-                    .fold(f64::INFINITY, f64::min);
-                progress.add_work(chain_pair_candidate_chunk_count(
-                    atoms,
-                    &atoms_by_chain[left_chain],
-                    &atoms_by_chain[right_chain],
-                    min_threshold,
-                ));
+                progress.add_work(atoms_by_chain[left_chain].len() as u64);
                 let mut states = threshold_batch
                     .iter()
                     .copied()
@@ -63,6 +57,8 @@ fn run_chain_matrix_analysis(
                         atoms,
                         &atoms_by_chain[left_chain],
                         &atoms_by_chain[right_chain],
+                        candidate_index,
+                        spec.scratch_mode,
                         &mut states,
                         progress,
                     )
@@ -90,7 +86,7 @@ fn run_chain_matrix_analysis(
     Ok(rows)
 }
 
-fn atoms_by_chain(atoms: &[NameAtom], chain_count: usize) -> Vec<Vec<usize>> {
+pub(crate) fn atoms_by_chain(atoms: &[NameAtom], chain_count: usize) -> Vec<Vec<usize>> {
     let mut indexes = vec![Vec::new(); chain_count];
     for (index, atom) in atoms.iter().enumerate() {
         indexes[atom.chain_index].push(index);
@@ -98,7 +94,8 @@ fn atoms_by_chain(atoms: &[NameAtom], chain_count: usize) -> Vec<Vec<usize>> {
     indexes
 }
 
-fn chain_pair_candidate_chunk_count(
+#[cfg(test)]
+pub(crate) fn chain_pair_candidate_chunk_count(
     atoms: &[NameAtom],
     left_atoms: &[usize],
     right_atoms: &[usize],
@@ -117,7 +114,7 @@ fn chain_pair_candidate_chunk_count(
         .sum()
 }
 
-fn right_atom_range_for_left(
+pub(crate) fn right_atom_range_for_left(
     atoms: &[NameAtom],
     right_atoms: &[usize],
     left: usize,
@@ -138,7 +135,7 @@ fn right_atom_range_for_left(
     start..end
 }
 
-fn right_length_window_for_threshold(
+pub(crate) fn right_length_window_for_threshold(
     left_len: usize,
     max_right_len: usize,
     threshold: f64,
@@ -179,7 +176,7 @@ fn right_length_window_for_threshold(
     Some((min_len, max_len))
 }
 
-fn lower_bound_right_atom_len(atoms: &[NameAtom], right_atoms: &[usize], min_len: usize) -> usize {
+pub(crate) fn lower_bound_right_atom_len(atoms: &[NameAtom], right_atoms: &[usize], min_len: usize) -> usize {
     let mut low = 0usize;
     let mut high = right_atoms.len();
     while low < high {
@@ -193,7 +190,7 @@ fn lower_bound_right_atom_len(atoms: &[NameAtom], right_atoms: &[usize], min_len
     low
 }
 
-fn upper_bound_right_atom_len(atoms: &[NameAtom], right_atoms: &[usize], max_len: usize) -> usize {
+pub(crate) fn upper_bound_right_atom_len(atoms: &[NameAtom], right_atoms: &[usize], max_len: usize) -> usize {
     let mut low = 0usize;
     let mut high = right_atoms.len();
     while low < high {
@@ -207,10 +204,12 @@ fn upper_bound_right_atom_len(atoms: &[NameAtom], right_atoms: &[usize], max_len
     low
 }
 
-fn union_chain_pair_name_pairs(
+pub(crate) fn union_chain_pair_name_pairs(
     atoms: &[NameAtom],
     left_atoms: &[usize],
     right_atoms: &[usize],
+    candidate_index: &NameCandidateIndex,
+    scratch_mode: NameScratchMode,
     states: &mut [MatrixUnionState],
     progress: &ProgressTracker,
 ) {
@@ -223,26 +222,39 @@ fn union_chain_pair_name_pairs(
         .fold(f64::INFINITY, f64::min);
 
     let mut pending_progress = 0;
-    for &left in left_atoms {
-        let right_range = right_atom_range_for_left(atoms, right_atoms, left, min_threshold);
-        for right_chunk in right_atoms[right_range].chunks(RIGHT_SCORE_CHUNK_SIZE) {
-            let matching_rights: Vec<ScoredRight> = right_chunk
-                .par_iter()
-                .copied()
-                .filter_map(|right| {
-                    if !name_pair_lengths_can_reach_threshold(
-                        atoms[left].char_len,
-                        atoms[right].char_len,
-                        min_threshold,
-                    ) {
-                        return None;
-                    }
-                    let left_name = atoms[left].name_norm.as_str();
-                    let right_name = atoms[right].name_norm.as_str();
-                    let score = name_pair_score_from_names(left_name, right_name);
-                    (score >= min_threshold).then_some(ScoredRight { right, score })
-                })
-                .collect();
+    for left_batch in left_atoms.chunks(LEFT_SCORE_BATCH_SIZE) {
+        let scored_lefts = left_batch
+            .par_iter()
+            .copied()
+            .map_init(
+                || NameCandidateScratch::with_mode(atoms.len(), scratch_mode),
+                |scratch, left| {
+                    let right_range =
+                        right_atom_range_for_left(atoms, right_atoms, left, min_threshold);
+                    let right_min_len = if right_range.is_empty() {
+                        None
+                    } else {
+                        Some(atoms[right_atoms[right_range.start]].char_len)
+                    };
+                    let right_candidates = &right_atoms[right_range];
+                    let query = PreparedNameQuery::new(&atoms[left].name_norm);
+                    let matching_rights = candidate_index
+                        .candidates_for_left(atoms, left, right_min_len, min_threshold, scratch)
+                        .iter()
+                        .map(|&right| right as usize)
+                        .filter(|right| right_candidates.binary_search(right).is_ok())
+                        .filter_map(|right| {
+                            let right_name = atoms[right].name_norm.as_str();
+                            query
+                                .score_percent(right_name, min_threshold)
+                                .map(|score| ScoredRight { right, score })
+                        })
+                        .collect::<Vec<_>>();
+                    (left, matching_rights)
+                },
+            )
+            .collect::<Vec<_>>();
+        for (left, matching_rights) in scored_lefts {
             for hit in matching_rights {
                 for state in states.iter_mut() {
                     if hit.score < state.threshold {
@@ -258,20 +270,20 @@ fn union_chain_pair_name_pairs(
     flush_remaining_progress(progress, &mut pending_progress);
 }
 
-fn flush_chunk_progress(progress: &ProgressTracker, pending: &mut u64) {
+pub(crate) fn flush_chunk_progress(progress: &ProgressTracker, pending: &mut u64) {
     if *pending >= PROGRESS_FLUSH_CHUNKS {
         flush_remaining_progress(progress, pending);
     }
 }
 
-fn flush_remaining_progress(progress: &ProgressTracker, pending: &mut u64) {
+pub(crate) fn flush_remaining_progress(progress: &ProgressTracker, pending: &mut u64) {
     if *pending > 0 {
         progress.inc(*pending);
         *pending = 0;
     }
 }
 
-fn push_reused_chain_matrix_rows(
+pub(crate) fn push_reused_chain_matrix_rows(
     rows: &mut Vec<SummaryRow>,
     atoms: &[NameAtom],
     chains: &[String],
@@ -298,7 +310,7 @@ fn push_reused_chain_matrix_rows(
     }
 }
 
-fn push_chain_matrix_rows(
+pub(crate) fn push_chain_matrix_rows(
     rows: &mut Vec<SummaryRow>,
     atoms: &[NameAtom],
     spec: ChainMatrixRowSpec<'_>,
@@ -326,7 +338,7 @@ fn push_chain_matrix_rows(
     );
 }
 
-fn push_chain_matrix_summary_row(
+pub(crate) fn push_chain_matrix_summary_row(
     rows: &mut Vec<SummaryRow>,
     spec: &ChainMatrixRowSpec<'_>,
     primary_index: usize,

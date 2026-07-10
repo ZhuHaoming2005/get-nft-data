@@ -1,4 +1,6 @@
-enum ProgressTracker {
+use super::*;
+
+pub(crate) enum ProgressTracker {
     Enabled {
         _multi: MultiProgress,
         overall: ProgressBar,
@@ -8,7 +10,7 @@ enum ProgressTracker {
 }
 
 impl ProgressTracker {
-    fn new(total_phases: u64, enabled: bool) -> Self {
+    pub(crate) fn new(total_phases: u64, enabled: bool) -> Self {
         if !enabled {
             return Self::Disabled;
         }
@@ -36,7 +38,7 @@ impl ProgressTracker {
         }
     }
 
-    fn start_phase(&self, message: impl Into<String>, work_units: u64) {
+    pub(crate) fn start_phase(&self, message: impl Into<String>, work_units: u64) {
         let Self::Enabled {
             overall, detail, ..
         } = self
@@ -51,32 +53,32 @@ impl ProgressTracker {
         detail.set_message(message);
     }
 
-    fn add_work(&self, units: u64) {
+    pub(crate) fn add_work(&self, units: u64) {
         if let Self::Enabled { detail, .. } = self {
             detail.inc_length(units);
         }
     }
 
-    fn step(&self, message: impl Into<String>) {
+    pub(crate) fn step(&self, message: impl Into<String>) {
         if let Self::Enabled { detail, .. } = self {
             detail.set_message(message.into());
             detail.inc(1);
         }
     }
 
-    fn inc(&self, units: u64) {
+    pub(crate) fn inc(&self, units: u64) {
         if let Self::Enabled { detail, .. } = self {
             detail.inc(units);
         }
     }
 
-    fn set_message(&self, message: impl Into<String>) {
+    pub(crate) fn set_message(&self, message: impl Into<String>) {
         if let Self::Enabled { detail, .. } = self {
             detail.set_message(message.into());
         }
     }
 
-    fn finish_phase(&self, message: impl Into<String>) {
+    pub(crate) fn finish_phase(&self, message: impl Into<String>) {
         let Self::Enabled {
             overall, detail, ..
         } = self
@@ -89,7 +91,7 @@ impl ProgressTracker {
         overall.set_message(message);
     }
 
-    fn finish(&self) {
+    pub(crate) fn finish(&self) {
         if let Self::Enabled {
             overall, detail, ..
         } = self

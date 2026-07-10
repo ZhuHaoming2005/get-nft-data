@@ -446,8 +446,7 @@ pub async fn run_batch(
         .saturating_add(seed_cpu_max_concurrency)
         .saturating_add(request.matched_contract_max_concurrency.max(1))
         .min(pending_seed_count)
-        .min(MAX_SEED_PIPELINE_BACKLOG)
-        .max(1);
+        .clamp(1, MAX_SEED_PIPELINE_BACKLOG);
     let stage3_seed_limit = Arc::new(Semaphore::new(seed_pipeline_max_concurrency));
     let (context_tx, mut context_rx) =
         mpsc::channel::<Result<PreparedSeedContext, AppError>>(seed_pipeline_max_concurrency);

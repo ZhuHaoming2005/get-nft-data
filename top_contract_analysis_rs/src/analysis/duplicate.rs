@@ -3,22 +3,26 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use rayon::prelude::*;
 
 use crate::analysis::scoring::{
-    metadata_bm25_tokens, metadata_document_from_json, metadata_is_dedup_eligible,
-    metadata_prefilter_document_from_json, score_metadata_indexed_pair_with_query,
-    score_normalized_name_pair, MetadataBm25Corpus, MetadataBm25CorpusBuilder,
-    MetadataBm25Document, MetadataBm25Query, MetadataBm25SingleDocumentQuery,
+    metadata_documents_from_json, metadata_is_dedup_eligible,
+    score_compact_metadata_indexed_pair_with_query, CompactMetadataBm25Corpus,
+    CompactMetadataBm25CorpusBuilder, CompactMetadataBm25Document, CompactMetadataBm25Query,
+    MetadataBm25Document, PreparedNameQuery,
 };
 use crate::models::{ContractDuplicateRecord, DatabaseNftRecord, DuplicateCandidate, SeedNft};
 use crate::normalize::{normalize_name, normalize_url};
 use crate::platform_infrastructure::is_platform_infrastructure_contract_blacklisted;
 
-fn has_name_match(row_name_norm: &str, name_threshold: f64, seed_name_norms: &[String]) -> bool {
+fn has_name_match(
+    row_name_norm: &str,
+    name_threshold: f64,
+    seed_name_queries: &[PreparedNameQuery],
+) -> bool {
     if row_name_norm.is_empty() {
         return false;
     }
-    seed_name_norms
+    seed_name_queries
         .iter()
-        .any(|candidate| score_normalized_name_pair(row_name_norm, candidate) >= name_threshold)
+        .any(|query| query.score_percent(row_name_norm, name_threshold).is_some())
 }
 
 fn build_contract_name_match_index(
@@ -29,6 +33,10 @@ fn build_contract_name_match_index(
     if seed_name_norms.is_empty() || name_threshold > 100.0 {
         return vec![false; contract_rows.len()];
     }
+    let seed_name_queries = seed_name_norms
+        .iter()
+        .map(|name| PreparedNameQuery::new(name))
+        .collect::<Vec<_>>();
 
     let mut contract_indices_by_name = HashMap::<String, Vec<usize>>::new();
     for (contract_index, row) in contract_rows.iter().enumerate() {
@@ -45,7 +53,8 @@ fn build_contract_name_match_index(
     let matching_contract_indices: HashSet<usize> = contract_indices_by_name
         .into_par_iter()
         .filter_map(|(name_norm, contract_indices)| {
-            has_name_match(&name_norm, name_threshold, seed_name_norms).then_some(contract_indices)
+            has_name_match(&name_norm, name_threshold, &seed_name_queries)
+                .then_some(contract_indices)
         })
         .flatten()
         .collect();
@@ -59,43 +68,89 @@ fn build_contract_name_match_index(
     matches
 }
 
-fn record_metadata_text(metadata_json: &str) -> String {
-    if !metadata_is_dedup_eligible(metadata_json) {
-        return String::new();
+struct SeedMetadataCache {
+    representative_docs: Vec<MetadataBm25Document>,
+    final_queries_by_token: BTreeMap<String, MetadataBm25Document>,
+}
+
+#[derive(Default)]
+struct ContractMetadataCache {
+    prefilter_doc: Option<MetadataBm25Document>,
+    final_docs: Vec<Option<MetadataBm25Document>>,
+}
+
+fn metadata_source_rows(row: &ContractDuplicateRecord) -> &[DatabaseNftRecord] {
+    if row.metadata_token_rows.is_empty() {
+        std::slice::from_ref(&row.representative)
+    } else {
+        row.metadata_token_rows.as_slice()
     }
-    metadata_document_from_json(metadata_json)
 }
 
-fn record_metadata_prefilter_text(metadata_json: &str) -> String {
-    if !metadata_is_dedup_eligible(metadata_json) {
-        return String::new();
+fn build_seed_metadata_cache(seed_nfts: &[SeedNft]) -> SeedMetadataCache {
+    let mut representative_doc = None;
+    let mut final_queries_by_token = BTreeMap::new();
+    for item in seed_nfts {
+        if !metadata_is_dedup_eligible(&item.metadata_json) {
+            continue;
+        }
+        let documents = metadata_documents_from_json(&item.metadata_json);
+        if representative_doc.is_none() {
+            representative_doc = MetadataBm25Document::from_text(&documents.prefilter);
+        }
+        if item.token_id.trim().is_empty() {
+            continue;
+        }
+        let Some(document) = MetadataBm25Document::from_text(&documents.content) else {
+            continue;
+        };
+        final_queries_by_token
+            .entry(item.token_id.clone())
+            .or_insert(document);
     }
-    metadata_prefilter_document_from_json(metadata_json)
+    SeedMetadataCache {
+        representative_docs: representative_doc.into_iter().collect(),
+        final_queries_by_token,
+    }
 }
 
-fn record_metadata_text_from_record(row: &DatabaseNftRecord) -> String {
-    record_metadata_text(&row.metadata_json)
-}
-
-fn record_metadata_prefilter_text_from_record(row: &DatabaseNftRecord) -> String {
-    record_metadata_prefilter_text(&row.metadata_json)
-}
-
-fn seed_metadata_representative_doc(seed_nfts: &[SeedNft]) -> Option<MetadataBm25Document> {
-    seed_nfts.iter().find_map(|item| {
-        let seed_text = record_metadata_prefilter_text(&item.metadata_json);
-        MetadataBm25Document::from_text(&seed_text)
-    })
+fn build_contract_metadata_cache(row: &ContractDuplicateRecord) -> ContractMetadataCache {
+    let representative_documents = metadata_is_dedup_eligible(&row.representative.metadata_json)
+        .then(|| metadata_documents_from_json(&row.representative.metadata_json));
+    let prefilter_doc = representative_documents
+        .as_ref()
+        .and_then(|documents| MetadataBm25Document::from_text(&documents.prefilter));
+    let final_docs = metadata_source_rows(row)
+        .iter()
+        .map(|source_row| {
+            if source_row.token_id == row.representative.token_id
+                && source_row.metadata_json == row.representative.metadata_json
+            {
+                return representative_documents
+                    .as_ref()
+                    .and_then(|documents| MetadataBm25Document::from_text(&documents.content));
+            }
+            if !metadata_is_dedup_eligible(&source_row.metadata_json) {
+                return None;
+            }
+            let documents = metadata_documents_from_json(&source_row.metadata_json);
+            MetadataBm25Document::from_text(&documents.content)
+        })
+        .collect();
+    ContractMetadataCache {
+        prefilter_doc,
+        final_docs,
+    }
 }
 
 struct MetadataBm25Index {
-    corpus: MetadataBm25Corpus,
-    docs: Vec<MetadataBm25Document>,
+    corpus: CompactMetadataBm25Corpus,
+    docs: Vec<CompactMetadataBm25Document>,
     candidate_doc_indices: Vec<Option<usize>>,
 }
 
 impl MetadataBm25Index {
-    fn candidate_doc(&self, contract_index: usize) -> Option<&MetadataBm25Document> {
+    fn candidate_doc(&self, contract_index: usize) -> Option<&CompactMetadataBm25Document> {
         self.candidate_doc_indices
             .get(contract_index)
             .and_then(|index| *index)
@@ -119,81 +174,67 @@ fn should_recheck_metadata(
     should_score_metadata(row, has_metadata_recall_flags) || has_non_metadata_reason
 }
 
-fn seed_metadata_queries_by_token(
-    seed_nfts: &[SeedNft],
-) -> BTreeMap<String, MetadataBm25SingleDocumentQuery> {
-    let mut docs = BTreeMap::new();
-    for item in seed_nfts {
-        if item.token_id.trim().is_empty() {
-            continue;
-        }
-        let metadata_text = record_metadata_text(&item.metadata_json);
-        let Some(doc) = MetadataBm25Document::from_text(&metadata_text) else {
-            continue;
-        };
-        docs.entry(item.token_id.clone())
-            .or_insert_with(|| MetadataBm25SingleDocumentQuery::new(doc));
-    }
-    docs
-}
-
 fn first_overlapping_metadata_match<'a>(
-    seed_queries_by_token: &BTreeMap<String, MetadataBm25SingleDocumentQuery>,
+    seed_queries_by_token: &BTreeMap<String, MetadataBm25Document>,
     row: &'a ContractDuplicateRecord,
+    cache: &ContractMetadataCache,
     metadata_threshold: f64,
 ) -> Option<&'a DatabaseNftRecord> {
-    let source_rows = if row.metadata_token_rows.is_empty() {
-        std::slice::from_ref(&row.representative)
-    } else {
-        row.metadata_token_rows.as_slice()
-    };
+    let source_rows = metadata_source_rows(row);
     let mut candidate_rows = Vec::new();
     let mut candidate_docs = Vec::new();
-    for candidate_row in source_rows {
+    for (candidate_row, candidate_doc) in source_rows.iter().zip(cache.final_docs.iter()) {
         if !seed_queries_by_token.contains_key(&candidate_row.token_id) {
             continue;
         }
-        let metadata_text = record_metadata_text_from_record(candidate_row);
-        let Some(doc) = MetadataBm25Document::from_text(&metadata_text) else {
+        let Some(doc) = candidate_doc.as_ref() else {
             continue;
         };
         candidate_rows.push(candidate_row);
-        candidate_docs.push(doc);
+        candidate_docs.push(doc.clone());
     }
     if candidate_docs.is_empty() {
         return None;
     }
 
+    let (corpus, compact_candidate_docs) =
+        CompactMetadataBm25Corpus::from_indexed_documents(&candidate_docs);
     if candidate_docs.len() == 1 {
         let candidate_row = candidate_rows[0];
-        let candidate_doc = &candidate_docs[0];
+        let candidate_doc = &compact_candidate_docs[0];
         let seed_query = seed_queries_by_token.get(&candidate_row.token_id)?;
-        return (seed_query.has_term_overlap(candidate_doc)
-            && seed_query.score(candidate_doc) >= metadata_threshold)
+        let compact_query = CompactMetadataBm25Query::new(seed_query, &corpus);
+        return (compact_query.has_term_overlap(candidate_doc)
+            && score_compact_metadata_indexed_pair_with_query(&compact_query, candidate_doc)
+                >= metadata_threshold)
             .then_some(candidate_row);
     }
 
-    let has_any_term_overlap =
-        candidate_rows
-            .iter()
-            .zip(candidate_docs.iter())
-            .any(|(candidate_row, candidate_doc)| {
-                seed_queries_by_token
-                    .get(&candidate_row.token_id)
-                    .is_some_and(|seed_query| seed_query.has_term_overlap(candidate_doc))
-            });
+    let has_any_term_overlap = candidate_rows
+        .iter()
+        .zip(compact_candidate_docs.iter())
+        .any(|(candidate_row, candidate_doc)| {
+            seed_queries_by_token
+                .get(&candidate_row.token_id)
+                .is_some_and(|seed_query| {
+                    CompactMetadataBm25Query::new(seed_query, &corpus)
+                        .has_term_overlap(candidate_doc)
+                })
+        });
     if !has_any_term_overlap {
         return None;
     }
 
-    let corpus = MetadataBm25Corpus::from_indexed_documents(&candidate_docs);
-    let mut prepared_queries_by_token = BTreeMap::<&str, MetadataBm25Query<'_>>::new();
-    for (candidate_row, candidate_doc) in candidate_rows.into_iter().zip(candidate_docs.iter()) {
+    let mut prepared_queries_by_token = BTreeMap::<&str, CompactMetadataBm25Query<'_>>::new();
+    for (candidate_row, candidate_doc) in candidate_rows
+        .into_iter()
+        .zip(compact_candidate_docs.iter())
+    {
         if !prepared_queries_by_token.contains_key(candidate_row.token_id.as_str()) {
             if let Some(seed_query) = seed_queries_by_token.get(&candidate_row.token_id) {
                 prepared_queries_by_token.insert(
                     candidate_row.token_id.as_str(),
-                    MetadataBm25Query::new(seed_query.document(), &corpus),
+                    CompactMetadataBm25Query::new(seed_query, &corpus),
                 );
             }
         }
@@ -204,7 +245,9 @@ fn first_overlapping_metadata_match<'a>(
         if !seed_query.has_term_overlap(candidate_doc) {
             continue;
         }
-        if score_metadata_indexed_pair_with_query(seed_query, candidate_doc) >= metadata_threshold {
+        if score_compact_metadata_indexed_pair_with_query(seed_query, candidate_doc)
+            >= metadata_threshold
+        {
             return Some(candidate_row);
         }
     }
@@ -222,7 +265,11 @@ fn new_contract_duplicate_record(row: &DatabaseNftRecord) -> ContractDuplicateRe
 }
 
 fn push_metadata_token_row(record: &mut ContractDuplicateRecord, row: &DatabaseNftRecord) {
-    if record_metadata_text_from_record(row).is_empty() {
+    if !metadata_is_dedup_eligible(&row.metadata_json)
+        || metadata_documents_from_json(&row.metadata_json)
+            .content
+            .is_empty()
+    {
         return;
     }
     if record
@@ -286,6 +333,7 @@ fn aggregate_contract_rows(
 fn build_metadata_bm25_index(
     seed_metadata_docs: &[MetadataBm25Document],
     contract_rows: &[&ContractDuplicateRecord],
+    metadata_caches: &[ContractMetadataCache],
     has_metadata_recall_flags: bool,
 ) -> MetadataBm25Index {
     let query_tokens: HashSet<String> = seed_metadata_docs
@@ -294,7 +342,7 @@ fn build_metadata_bm25_index(
         .collect();
     if query_tokens.is_empty() {
         return MetadataBm25Index {
-            corpus: MetadataBm25Corpus::from_indexed_documents(&[]),
+            corpus: CompactMetadataBm25CorpusBuilder::default().finish(),
             docs: Vec::new(),
             candidate_doc_indices: vec![None; contract_rows.len()],
         };
@@ -307,20 +355,16 @@ fn build_metadata_bm25_index(
     }
 
     let mut indexed_tokens = contract_rows
-        .par_iter()
+        .iter()
+        .zip(metadata_caches.iter())
         .enumerate()
-        .filter_map(|(contract_index, row)| {
+        .filter_map(|(contract_index, (row, cache))| {
             let row = *row;
             if !should_score_metadata(row, has_metadata_recall_flags) {
                 return None;
             }
 
-            let metadata_text = record_metadata_prefilter_text_from_record(&row.representative);
-            if metadata_text.is_empty() {
-                return None;
-            }
-
-            let tokens = metadata_bm25_tokens(&metadata_text);
+            let tokens = cache.prefilter_doc.as_ref()?.tokens().to_vec();
             let has_query_overlap = tokens.iter().any(|token| query_tokens.contains(token));
             Some(IndexedMetadataTokens {
                 contract_index,
@@ -331,9 +375,9 @@ fn build_metadata_bm25_index(
         .collect::<Vec<_>>();
     indexed_tokens.sort_by_key(|indexed| indexed.contract_index);
 
-    let mut docs = Vec::new();
+    let mut candidate_docs = Vec::new();
     let mut candidate_doc_indices = vec![None; contract_rows.len()];
-    let mut corpus_builder = MetadataBm25CorpusBuilder::default();
+    let mut corpus_builder = CompactMetadataBm25CorpusBuilder::default();
 
     for indexed in indexed_tokens {
         corpus_builder.add_tokens(&indexed.tokens);
@@ -347,13 +391,18 @@ fn build_metadata_bm25_index(
         let Some(indexed_doc) = MetadataBm25Document::from_tokens(indexed.tokens) else {
             continue;
         };
-        let doc_index = docs.len();
+        let doc_index = candidate_docs.len();
         candidate_doc_indices[indexed.contract_index] = Some(doc_index);
-        docs.push(indexed_doc);
+        candidate_docs.push(indexed_doc);
     }
+    let corpus = corpus_builder.finish();
+    let docs = candidate_docs
+        .iter()
+        .map(|document| corpus.compact_document(document))
+        .collect();
 
     MetadataBm25Index {
-        corpus: corpus_builder.finish(),
+        corpus,
         docs,
         candidate_doc_indices,
     }
@@ -421,22 +470,44 @@ pub fn build_duplicate_candidates_from_contract_rows(
         .filter(|name| !name.is_empty())
         .collect();
 
-    let seed_metadata_docs: Vec<MetadataBm25Document> = seed_metadata_representative_doc(seed_nfts)
-        .into_iter()
-        .collect();
-    let seed_final_metadata_queries_by_token = seed_metadata_queries_by_token(seed_nfts);
+    let seed_metadata_cache = build_seed_metadata_cache(seed_nfts);
+    let seed_metadata_docs = &seed_metadata_cache.representative_docs;
+    let seed_final_metadata_queries_by_token = &seed_metadata_cache.final_queries_by_token;
 
     let name_match_contracts =
         build_contract_name_match_index(&contract_rows, name_threshold, &seed_name_norms);
     let has_metadata_recall_flags = contract_rows.iter().any(|row| row.metadata_recall_checked);
+    let has_seed_metadata =
+        !seed_metadata_docs.is_empty() || !seed_final_metadata_queries_by_token.is_empty();
+    let metadata_caches = contract_rows
+        .par_iter()
+        .enumerate()
+        .map(|(contract_index, row)| {
+            let has_name_match = name_match_contracts
+                .get(contract_index)
+                .copied()
+                .unwrap_or(false);
+            let needs_metadata = should_recheck_metadata(
+                row,
+                has_metadata_recall_flags,
+                has_non_metadata_reason(row, has_name_match),
+            );
+            if has_seed_metadata && needs_metadata {
+                build_contract_metadata_cache(row)
+            } else {
+                ContractMetadataCache::default()
+            }
+        })
+        .collect::<Vec<_>>();
     let metadata_index = build_metadata_bm25_index(
-        &seed_metadata_docs,
+        seed_metadata_docs,
         &contract_rows,
+        &metadata_caches,
         has_metadata_recall_flags,
     );
     let metadata_queries = seed_metadata_docs
         .iter()
-        .map(|seed_doc| MetadataBm25Query::new(seed_doc, &metadata_index.corpus))
+        .map(|seed_doc| CompactMetadataBm25Query::new(seed_doc, &metadata_index.corpus))
         .collect::<Vec<_>>();
 
     let mut rows: Vec<DuplicateCandidate> = contract_rows
@@ -466,14 +537,15 @@ pub fn build_duplicate_candidates_from_contract_rows(
                     .is_some_and(|row_doc| {
                         metadata_queries.iter().any(|query| {
                             query.has_term_overlap(row_doc)
-                                && score_metadata_indexed_pair_with_query(query, row_doc)
+                                && score_compact_metadata_indexed_pair_with_query(query, row_doc)
                                     >= metadata_threshold
                         })
                     });
                 if has_non_metadata_reason || representative_prefilter_match {
                     metadata_match_row = first_overlapping_metadata_match(
-                        &seed_final_metadata_queries_by_token,
+                        seed_final_metadata_queries_by_token,
                         row,
+                        &metadata_caches[contract_index],
                         metadata_threshold,
                     );
                 }
@@ -562,7 +634,11 @@ mod tests {
         let contract_rows =
             aggregate_contract_rows("ethereum", &seed_contracts, &empty, &empty, &snapshot_rows);
         let contract_row_refs: Vec<_> = contract_rows.iter().collect();
-        let index = build_metadata_bm25_index(&seed_docs, &contract_row_refs, false);
+        let caches = contract_row_refs
+            .iter()
+            .map(|row| build_contract_metadata_cache(row))
+            .collect::<Vec<_>>();
+        let index = build_metadata_bm25_index(&seed_docs, &contract_row_refs, &caches, false);
 
         let gold_index = contract_rows
             .iter()

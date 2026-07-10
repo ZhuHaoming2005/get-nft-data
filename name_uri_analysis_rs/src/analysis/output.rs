@@ -1,4 +1,6 @@
-fn summary_row(spec: SummarySpec<'_>, groups: GroupSummary) -> SummaryRow {
+use super::*;
+
+pub(crate) fn summary_row(spec: SummarySpec<'_>, groups: GroupSummary) -> SummaryRow {
     SummaryRow {
         field_name: spec.field_name.to_string(),
         scope: spec.scope.to_string(),
@@ -19,7 +21,7 @@ fn summary_row(spec: SummarySpec<'_>, groups: GroupSummary) -> SummaryRow {
     }
 }
 
-fn write_outputs(report: &AnalysisReport, output_dir: &Path) -> Result<(), AnalysisError> {
+pub(crate) fn write_outputs(report: &AnalysisReport, output_dir: &Path) -> Result<(), AnalysisError> {
     let json_path = output_dir.join("summary.json");
     let json_file = fs::File::create(&json_path)?;
     serde_json::to_writer_pretty(json_file, report)?;
@@ -57,7 +59,7 @@ fn write_outputs(report: &AnalysisReport, output_dir: &Path) -> Result<(), Analy
     Ok(())
 }
 
-fn pct(part: i64, total: i64) -> f64 {
+pub(crate) fn pct(part: i64, total: i64) -> f64 {
     if total == 0 {
         0.0
     } else {
@@ -65,7 +67,7 @@ fn pct(part: i64, total: i64) -> f64 {
     }
 }
 
-fn parquet_input_sql(paths: &[PathBuf]) -> String {
+pub(crate) fn parquet_input_sql(paths: &[PathBuf]) -> String {
     if paths.len() == 1 {
         format!(
             "'{}'",
@@ -86,11 +88,11 @@ fn parquet_input_sql(paths: &[PathBuf]) -> String {
     }
 }
 
-fn sql_string(value: &str) -> String {
+pub(crate) fn sql_string(value: &str) -> String {
     value.replace('\'', "''")
 }
 
-fn csv_cell(value: &str) -> String {
+pub(crate) fn csv_cell(value: &str) -> String {
     if value.contains(',') || value.contains('"') || value.contains('\n') {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {

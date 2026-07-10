@@ -1,4 +1,6 @@
-fn run_uri_analysis(
+use super::*;
+
+pub(crate) fn run_uri_analysis(
     conn: &Connection,
     chains: &[String],
     totals: &HashMap<String, NameTotals>,
@@ -87,7 +89,7 @@ fn run_uri_analysis(
     Ok(rows)
 }
 
-fn push_uri_rows(
+pub(crate) fn push_uri_rows(
     rows: &mut Vec<SummaryRow>,
     scope: &str,
     primary_chain: &str,

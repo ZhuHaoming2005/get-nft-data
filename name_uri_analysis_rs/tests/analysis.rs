@@ -115,6 +115,7 @@ fn assert_uri_row(
     assert_eq!(row.duplicate_contract_count, duplicate_contracts);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn assert_nft_scope(
     report: &AnalysisReport,
     field_name: &str,
@@ -163,6 +164,7 @@ fn analyzes_with_duckdb_memory_database() {
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
+        duckdb_memory_limit: "256MB".into(),
         temp_directory: None,
         progress: false,
         persist_prepared: false,
@@ -200,6 +202,7 @@ fn duckdb_database_path_is_ignored_for_memory_mode() {
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
+        duckdb_memory_limit: "256MB".into(),
         temp_directory: None,
         progress: false,
         persist_prepared: false,
@@ -232,6 +235,7 @@ fn analysis_does_not_persist_prepared_tables_when_requested() {
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
+        duckdb_memory_limit: "256MB".into(),
         temp_directory: None,
         progress: false,
         persist_prepared: true,
@@ -246,9 +250,8 @@ fn analysis_does_not_persist_prepared_tables_when_requested() {
         "uri_key_contracts",
         "uri_duplicate_key_stats",
         "uri_contract_flags",
-        "contract_names",
+        "analysis_contracts",
         "name_atoms",
-        "analysis_prepared_metadata",
     ] {
         let count: i64 = conn
             .query_row(
@@ -288,6 +291,7 @@ fn analyzes_uri_and_name_without_symbol_rows() {
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
+        duckdb_memory_limit: "256MB".into(),
         temp_directory: None,
         progress: false,
         persist_prepared: false,
@@ -360,6 +364,7 @@ fn analyzes_uri_rows_when_only_one_uri_field_is_present() {
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
+        duckdb_memory_limit: "256MB".into(),
         temp_directory: None,
         progress: false,
         persist_prepared: false,
@@ -409,6 +414,7 @@ fn uri_any_and_cross_contract_counts_stay_distinct() {
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
+        duckdb_memory_limit: "256MB".into(),
         temp_directory: None,
         progress: false,
         persist_prepared: false,
@@ -456,6 +462,7 @@ fn cross_chain_uri_rows_emit_summary_and_isolated_pair_matrix() {
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
+        duckdb_memory_limit: "256MB".into(),
         temp_directory: None,
         progress: false,
         persist_prepared: false,
@@ -495,6 +502,7 @@ fn compares_names_across_former_block_boundaries() {
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
+        duckdb_memory_limit: "256MB".into(),
         temp_directory: None,
         progress: false,
         persist_prepared: false,
@@ -534,6 +542,7 @@ fn repeated_nfts_in_one_contract_count_as_one_name_contract() {
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
+        duckdb_memory_limit: "256MB".into(),
         temp_directory: None,
         progress: false,
         persist_prepared: false,
@@ -580,6 +589,7 @@ fn contract_name_aggregation_keeps_empty_name_nfts_in_totals() {
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
+        duckdb_memory_limit: "256MB".into(),
         temp_directory: None,
         progress: false,
         persist_prepared: false,
@@ -625,6 +635,7 @@ fn only_parquet_chains_are_analyzed_and_single_chain_skips_cross_chain() {
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
+        duckdb_memory_limit: "256MB".into(),
         temp_directory: None,
         progress: false,
         persist_prepared: false,
@@ -664,6 +675,7 @@ fn chain_matrix_is_computed_per_chain_pair_without_third_chain_contamination() {
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
+        duckdb_memory_limit: "256MB".into(),
         temp_directory: None,
         progress: false,
         persist_prepared: false,
@@ -715,6 +727,7 @@ fn metadata_analysis_uses_deterministic_representatives_for_correctness() {
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
+        duckdb_memory_limit: "256MB".into(),
         temp_directory: None,
         progress: false,
         persist_prepared: false,
@@ -778,6 +791,7 @@ fn four_chain_analysis_uses_chain_aware_contract_identity() {
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
+        duckdb_memory_limit: "256MB".into(),
         temp_directory: None,
         progress: false,
         persist_prepared: false,
@@ -832,6 +846,7 @@ fn metadata_analysis_uses_lowest_token_metadata_per_contract() {
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
+        duckdb_memory_limit: "256MB".into(),
         temp_directory: None,
         progress: false,
         persist_prepared: false,
@@ -847,6 +862,93 @@ fn metadata_analysis_uses_lowest_token_metadata_per_contract() {
             && row.total_nfts == 3
             && row.duplicate_contract_count == 2
             && row.duplicate_nft_count == 3
+    }));
+}
+
+#[test]
+fn metadata_analysis_skips_empty_lowest_token_metadata_representative() {
+    let temp = tempfile::tempdir().unwrap();
+    let parquet = temp.path().join("sample.parquet");
+    write_parquet_with_metadata(
+        &parquet,
+        r#"
+            VALUES
+            ('ethereum', '0xaaa', '1', 'u1', 'i1', 'A', 'a', '{}'),
+            ('ethereum', '0xaaa', '2', 'u2', 'i2', 'A', 'a', '{"description":"shared alpha"}'),
+            ('ethereum', '0xbbb', '3', 'u3', 'i3', 'B', 'b', '{"description":"shared alpha"}')
+        "#,
+    );
+
+    let report = run_analysis(AnalysisOptions {
+        database_path: temp.path().join("analysis.duckdb"),
+        parquet_inputs: vec![parquet],
+        output_dir: temp.path().join("out"),
+        thresholds: vec![95.0],
+        threads: 2,
+        memory_limit: "256MB".into(),
+        analysis_memory_limit: Some("64MB".into()),
+        duckdb_memory_limit: "256MB".into(),
+        temp_directory: None,
+        progress: false,
+        persist_prepared: false,
+        reuse_prepared: false,
+    })
+    .unwrap();
+
+    assert!(report.summary_rows.iter().any(|row| {
+        row.field_name == "metadata"
+            && row.scope == "intra_chain"
+            && row.primary_chain == "ethereum"
+            && row.duplicate_contract_count == 2
+            && row.duplicate_nft_count == 3
+    }));
+}
+
+#[test]
+fn metadata_analysis_fallback_picks_lowest_token_id_survivor_deterministically() {
+    // Contract 0xaaa has three metadata rows: token_id=1 (`{}`, which yields no
+    // BM25 document and is skipped), plus two survivors with *different*
+    // content (token_id=2 "shared alpha", token_id=3 "completely different
+    // zeta"). The arg_min representative is token_id=1, so 0xaaa is resolved via
+    // the fallback path, which must deterministically keep the lowest-(token_id,
+    // rowid) survivor — token_id=2 — and therefore match 0xbbb ("shared alpha").
+    // A non-deterministic fallback that kept token_id=3 would instead produce
+    // zero duplicates.
+    let temp = tempfile::tempdir().unwrap();
+    let parquet = temp.path().join("sample.parquet");
+    write_parquet_with_metadata(
+        &parquet,
+        r#"
+            VALUES
+            ('ethereum', '0xaaa', '1', 'u1', 'i1', 'A', 'a', '{}'),
+            ('ethereum', '0xaaa', '2', 'u2', 'i2', 'A', 'a', '{"description":"shared alpha"}'),
+            ('ethereum', '0xaaa', '3', 'u3', 'i3', 'A', 'a', '{"description":"completely different zeta"}'),
+            ('ethereum', '0xbbb', '4', 'u4', 'i4', 'B', 'b', '{"description":"shared alpha"}')
+        "#,
+    );
+
+    let report = run_analysis(AnalysisOptions {
+        database_path: temp.path().join("analysis.duckdb"),
+        parquet_inputs: vec![parquet],
+        output_dir: temp.path().join("out"),
+        thresholds: vec![95.0],
+        threads: 2,
+        memory_limit: "256MB".into(),
+        analysis_memory_limit: Some("64MB".into()),
+        duckdb_memory_limit: "256MB".into(),
+        temp_directory: None,
+        progress: false,
+        persist_prepared: false,
+        reuse_prepared: false,
+    })
+    .unwrap();
+
+    assert!(report.summary_rows.iter().any(|row| {
+        row.field_name == "metadata"
+            && row.scope == "intra_chain"
+            && row.primary_chain == "ethereum"
+            && row.duplicate_contract_count == 2
+            && row.duplicate_nft_count == 4
     }));
 }
 
@@ -871,6 +973,7 @@ fn metadata_analysis_does_not_match_same_schema_with_different_content_values() 
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
+        duckdb_memory_limit: "256MB".into(),
         temp_directory: None,
         progress: false,
         persist_prepared: false,
@@ -912,6 +1015,7 @@ fn metadata_analysis_accepts_any_matching_overlapping_token_id() {
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
+        duckdb_memory_limit: "256MB".into(),
         temp_directory: None,
         progress: false,
         persist_prepared: false,
@@ -949,6 +1053,7 @@ fn metadata_analysis_falls_back_to_representatives_without_common_token_id() {
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
+        duckdb_memory_limit: "256MB".into(),
         temp_directory: None,
         progress: false,
         persist_prepared: false,
@@ -990,6 +1095,7 @@ fn summary_rows_use_chain_totals_as_common_denominators() {
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
+        duckdb_memory_limit: "256MB".into(),
         temp_directory: None,
         progress: false,
         persist_prepared: false,
@@ -1044,6 +1150,7 @@ fn metadata_analysis_uses_template_recall_before_content_verification() {
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
+        duckdb_memory_limit: "256MB".into(),
         temp_directory: None,
         progress: false,
         persist_prepared: false,
@@ -1083,6 +1190,7 @@ fn metadata_analysis_uses_metadata_doc_when_metadata_json_is_empty() {
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
+        duckdb_memory_limit: "256MB".into(),
         temp_directory: None,
         progress: false,
         persist_prepared: false,
@@ -1142,6 +1250,7 @@ fn three_scope_reporting_keeps_pools_isolated_and_uses_primary_chain_totals() {
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
+        duckdb_memory_limit: "256MB".into(),
         temp_directory: None,
         progress: false,
         persist_prepared: false,

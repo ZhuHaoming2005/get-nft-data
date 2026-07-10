@@ -1,13 +1,15 @@
-struct NameAnalysisSpec<'a> {
-    chains: &'a [String],
-    totals: &'a HashMap<String, NameTotals>,
-    thresholds: &'a [f64],
-    threads: usize,
-    memory_limit: &'a str,
-    analysis_memory_limit: Option<&'a str>,
+use super::*;
+
+pub(crate) struct NameAnalysisSpec<'a> {
+    pub(crate) chains: &'a [String],
+    pub(crate) totals: &'a HashMap<String, NameTotals>,
+    pub(crate) thresholds: &'a [f64],
+    pub(crate) threads: usize,
+    pub(crate) memory_limit: &'a str,
+    pub(crate) analysis_memory_limit: Option<&'a str>,
 }
 
-fn run_name_analysis(
+pub(crate) fn run_name_analysis(
     conn: &Connection,
     spec: NameAnalysisSpec<'_>,
     progress: &ProgressTracker,
@@ -23,12 +25,31 @@ fn run_name_analysis(
         .num_threads(spec.threads.max(1))
         .build()
         .map_err(|err| AnalysisError::InvalidData(err.to_string()))?;
+    let candidate_index = pool.install(|| NameCandidateIndex::new(&atoms));
 
     let mut rows = Vec::new();
-    let atom_bytes = name_atoms_memory_bytes(&atoms);
+    let base_atom_bytes =
+        name_atoms_memory_bytes(&atoms).saturating_add(candidate_index.memory_bytes());
     let atoms_by_chain = atoms_by_chain(&atoms, chains.len());
     let chain_matrix_state_bytes = chain_matrix_reuse_state_bytes(&atoms_by_chain);
     let total_memory_budget = total_memory_budget_bytes(spec.memory_limit)?;
+    let initial_memory_plan = name_analysis_memory_plan(
+        thresholds,
+        atoms.len(),
+        chains.len(),
+        spec.memory_limit,
+        spec.analysis_memory_limit,
+        base_atom_bytes,
+        chain_matrix_state_bytes,
+    )?;
+    let scratch_plan = name_scratch_plan(
+        atoms.len(),
+        spec.threads,
+        initial_memory_plan
+            .analysis_bytes
+            .saturating_sub(base_atom_bytes),
+    );
+    let atom_bytes = base_atom_bytes.saturating_add(scratch_plan.reserved_bytes);
     let memory_plan = name_analysis_memory_plan(
         thresholds,
         atoms.len(),
@@ -80,11 +101,7 @@ fn run_name_analysis(
                 "fallback"
             }
         ));
-        let min_threshold = threshold_batch
-            .iter()
-            .copied()
-            .fold(f64::INFINITY, f64::min);
-        progress.add_work(candidate_name_chunk_count(&atoms, min_threshold));
+        progress.add_work(atoms.len().saturating_sub(1) as u64);
         let mut states = threshold_batch
             .iter()
             .copied()
@@ -98,7 +115,16 @@ fn run_name_analysis(
             })
             .collect::<Vec<_>>();
         sort_threshold_states_for_apply(&mut states);
-        pool.install(|| union_full_name_pairs(&atoms, &mut states, chains.len(), progress));
+        pool.install(|| {
+            union_full_name_pairs(
+                &atoms,
+                &candidate_index,
+                scratch_plan.mode,
+                &mut states,
+                chains.len(),
+                progress,
+            )
+        });
 
         let chain_matrix_summary_work = if chain_matrix_reuse.is_some() {
             states.len() as u64 * chain_pair_count(chains.len()) as u64 * 2
@@ -119,12 +145,14 @@ fn run_name_analysis(
         rows.extend(run_chain_matrix_analysis(
             &atoms,
             &atoms_by_chain,
+            &candidate_index,
             chains,
             ChainMatrixAnalysisSpec {
                 thresholds: &thresholds,
                 analysis_budget: analysis_work_budget,
                 total_memory_budget,
                 totals,
+                scratch_mode: scratch_plan.mode,
             },
             &pool,
             progress,
@@ -134,7 +162,7 @@ fn run_name_analysis(
     Ok(rows)
 }
 
-fn load_all_name_atoms(
+pub(crate) fn load_all_name_atoms(
     conn: &Connection,
     chains: &[String],
 ) -> Result<Vec<NameAtom>, AnalysisError> {
@@ -181,7 +209,7 @@ fn load_all_name_atoms(
     Ok(atoms)
 }
 
-fn push_name_summary_rows(
+pub(crate) fn push_name_summary_rows(
     rows: &mut Vec<SummaryRow>,
     atoms: &[NameAtom],
     atoms_by_chain: &[Vec<usize>],
@@ -236,14 +264,14 @@ fn push_name_summary_rows(
     }
 }
 
-fn unique_thresholds(thresholds: &[f64]) -> Vec<f64> {
+pub(crate) fn unique_thresholds(thresholds: &[f64]) -> Vec<f64> {
     let mut unique = thresholds.to_vec();
     unique.sort_by(|left, right| right.partial_cmp(left).unwrap_or(std::cmp::Ordering::Equal));
     unique.dedup_by(|left, right| left.to_bits() == right.to_bits());
     unique
 }
 
-fn sort_threshold_states_for_apply(states: &mut [ThresholdUnionState]) {
+pub(crate) fn sort_threshold_states_for_apply(states: &mut [ThresholdUnionState]) {
     states.sort_by(|left, right| {
         left.threshold
             .partial_cmp(&right.threshold)
@@ -251,7 +279,7 @@ fn sort_threshold_states_for_apply(states: &mut [ThresholdUnionState]) {
     });
 }
 
-fn sort_matrix_states_for_apply(states: &mut [MatrixUnionState]) {
+pub(crate) fn sort_matrix_states_for_apply(states: &mut [MatrixUnionState]) {
     states.sort_by(|left, right| {
         left.threshold
             .partial_cmp(&right.threshold)
@@ -259,7 +287,7 @@ fn sort_matrix_states_for_apply(states: &mut [MatrixUnionState]) {
     });
 }
 
-fn chain_matrix_reuse_plan(
+pub(crate) fn chain_matrix_reuse_plan(
     atoms_by_chain: &[Vec<usize>],
     analysis_work_budget: usize,
     global_per_threshold_bytes: usize,
@@ -279,7 +307,7 @@ fn chain_matrix_reuse_plan(
     })
 }
 
-fn chain_matrix_reuse_state_bytes(atoms_by_chain: &[Vec<usize>]) -> usize {
+pub(crate) fn chain_matrix_reuse_state_bytes(atoms_by_chain: &[Vec<usize>]) -> usize {
     let mut bytes = 0usize;
     for left in 0..atoms_by_chain.len() {
         for right in left + 1..atoms_by_chain.len() {
@@ -291,22 +319,22 @@ fn chain_matrix_reuse_state_bytes(atoms_by_chain: &[Vec<usize>]) -> usize {
     bytes
 }
 
-fn new_chain_matrix_reuse_states(pair_count: usize) -> Vec<SparseUnionFind> {
+pub(crate) fn new_chain_matrix_reuse_states(pair_count: usize) -> Vec<SparseUnionFind> {
     std::iter::repeat_with(SparseUnionFind::default)
         .take(pair_count)
         .collect()
 }
 
-fn chain_pair_count(chain_count: usize) -> usize {
+pub(crate) fn chain_pair_count(chain_count: usize) -> usize {
     chain_count.saturating_mul(chain_count.saturating_sub(1)) / 2
 }
 
-fn chain_pair_index(left: usize, right: usize, chain_count: usize) -> usize {
+pub(crate) fn chain_pair_index(left: usize, right: usize, chain_count: usize) -> usize {
     debug_assert!(left < right);
     left * (2 * chain_count - left - 1) / 2 + (right - left - 1)
 }
 
-fn chain_pair_from_index(mut index: usize, chain_count: usize) -> (usize, usize) {
+pub(crate) fn chain_pair_from_index(mut index: usize, chain_count: usize) -> (usize, usize) {
     for left in 0..chain_count {
         let row_width = chain_count - left - 1;
         if index < row_width {
@@ -318,7 +346,7 @@ fn chain_pair_from_index(mut index: usize, chain_count: usize) -> (usize, usize)
 }
 
 #[cfg(test)]
-fn threshold_batches(
+pub(crate) fn threshold_batches(
     thresholds: &[f64],
     atom_count: usize,
     chain_count: usize,
@@ -331,7 +359,7 @@ fn threshold_batches(
 }
 
 #[cfg(test)]
-fn threshold_batch_capacity(
+pub(crate) fn threshold_batch_capacity(
     threshold_count: usize,
     atom_count: usize,
     chain_count: usize,
@@ -341,7 +369,7 @@ fn threshold_batch_capacity(
     threshold_batch_capacity_for_state_bytes(threshold_count, state_bytes, analysis_budget)
 }
 
-fn matrix_threshold_batch_capacity(
+pub(crate) fn matrix_threshold_batch_capacity(
     threshold_count: usize,
     atom_count: usize,
     analysis_budget: usize,
@@ -350,7 +378,7 @@ fn matrix_threshold_batch_capacity(
     threshold_batch_capacity_for_state_bytes(threshold_count, state_bytes, analysis_budget)
 }
 
-fn threshold_batch_capacity_for_state_bytes(
+pub(crate) fn threshold_batch_capacity_for_state_bytes(
     threshold_count: usize,
     state_bytes: usize,
     analysis_budget: usize,
@@ -360,7 +388,7 @@ fn threshold_batch_capacity_for_state_bytes(
         .min(threshold_count.max(1))
 }
 
-fn adaptive_threshold_batch_size(
+pub(crate) fn adaptive_threshold_batch_size(
     remaining_thresholds: usize,
     budget_capacity: usize,
     per_threshold_bytes: usize,
@@ -384,28 +412,40 @@ fn adaptive_threshold_batch_size(
 }
 
 #[cfg(test)]
-fn full_name_chunk_count(atom_count: usize) -> u64 {
+pub(crate) fn full_name_chunk_count(atom_count: usize) -> u64 {
     if atom_count < 2 {
         return 0;
     }
     triangular_chunk_count(atom_count - 1)
 }
 
-fn candidate_name_chunk_count(atoms: &[NameAtom], threshold: f64) -> u64 {
-    if atoms.len() < 2 {
-        return 0;
-    }
-    (0..atoms.len() - 1)
+#[cfg(test)]
+pub(crate) fn candidate_name_chunk_count(atoms: &[NameAtom], threshold: f64) -> u64 {
+    let candidate_index = NameCandidateIndex::new(atoms);
+    let mut scratch = NameCandidateScratch::new(atoms.len());
+    (0..atoms.len().saturating_sub(1))
         .map(|left| {
-            right_name_range_end_for_left(atoms, left, threshold)
-                .saturating_sub(left + 1)
+            let right_end = right_name_range_end_for_left(atoms, left, threshold);
+            let right_min_len = if left + 1 < right_end {
+                Some(atoms[left + 1].char_len)
+            } else {
+                None
+            };
+            candidate_index
+                .candidates_for_left(atoms, left, right_min_len, threshold, &mut scratch)
+                .iter()
+                .filter(|&&right| {
+                    let right = right as usize;
+                    right > left && right < right_end
+                })
+                .count()
                 .div_ceil(RIGHT_SCORE_CHUNK_SIZE) as u64
         })
         .sum()
 }
 
 #[cfg(test)]
-fn triangular_chunk_count(max_right_count: usize) -> u64 {
+pub(crate) fn triangular_chunk_count(max_right_count: usize) -> u64 {
     let chunk = RIGHT_SCORE_CHUNK_SIZE as u128;
     let count = max_right_count as u128;
     let full_groups = count / chunk;
@@ -419,7 +459,7 @@ fn triangular_chunk_count(max_right_count: usize) -> u64 {
 }
 
 #[cfg(test)]
-fn chain_pair_chunk_count(left_count: usize, right_count: usize) -> u64 {
+pub(crate) fn chain_pair_chunk_count(left_count: usize, right_count: usize) -> u64 {
     if left_count == 0 || right_count == 0 {
         return 0;
     }
@@ -427,7 +467,7 @@ fn chain_pair_chunk_count(left_count: usize, right_count: usize) -> u64 {
     (left_count as u64).saturating_mul(chunks_per_left as u64)
 }
 
-fn threshold_state_bytes(atom_count: usize, chain_count: usize) -> usize {
+pub(crate) fn threshold_state_bytes(atom_count: usize, chain_count: usize) -> usize {
     let dense = dense_union_find_bytes(atom_count);
     if chain_count > 1 {
         dense.saturating_add(sparse_union_find_bytes(atom_count))
@@ -436,15 +476,15 @@ fn threshold_state_bytes(atom_count: usize, chain_count: usize) -> usize {
     }
 }
 
-fn dense_union_find_bytes(atom_count: usize) -> usize {
+pub(crate) fn dense_union_find_bytes(atom_count: usize) -> usize {
     atom_count.saturating_mul(std::mem::size_of::<usize>() + std::mem::size_of::<u8>())
 }
 
-fn sparse_union_find_bytes(atom_count: usize) -> usize {
+pub(crate) fn sparse_union_find_bytes(atom_count: usize) -> usize {
     atom_count.saturating_mul(SPARSE_UNION_NODE_BYTES)
 }
 
-fn name_atoms_memory_bytes(atoms: &[NameAtom]) -> usize {
+pub(crate) fn name_atoms_memory_bytes(atoms: &[NameAtom]) -> usize {
     let struct_bytes = atoms.len().saturating_mul(std::mem::size_of::<NameAtom>());
     let string_bytes = atoms
         .iter()

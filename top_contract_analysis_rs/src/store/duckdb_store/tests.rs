@@ -377,6 +377,86 @@ fn replace_chain_rows_populates_contract_representatives() {
 }
 
 #[test]
+fn contract_representative_skips_metadata_without_bm25_terms() {
+    let store = DuckDbFeatureStore::new(":memory:").unwrap();
+    store
+        .replace_chain_rows(
+            "ethereum",
+            &[
+                DatabaseNftRecord {
+                    contract_address: "0xdup".into(),
+                    token_id: "1".into(),
+                    name: "Alpha Clone".into(),
+                    metadata_json: "{}".into(),
+                    ..Default::default()
+                },
+                DatabaseNftRecord {
+                    contract_address: "0xdup".into(),
+                    token_id: "2".into(),
+                    name: "Alpha Clone".into(),
+                    metadata_json: r#"{"description":"gold dragon"}"#.into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+
+    let conn = store.conn().unwrap();
+    let metadata_token_id: String = conn
+        .query_row(
+            "
+                SELECT metadata_row.token_id
+                FROM nft_contract_representatives r
+                JOIN nft_features metadata_row ON metadata_row.rowid = r.metadata_feature_rowid
+                WHERE r.chain = 'ethereum'
+                ",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(metadata_token_id, "2");
+}
+
+#[test]
+fn contract_representatives_use_one_grouped_arg_min_query() {
+    let sql = DuckDbFeatureStore::contract_representatives_insert_sql();
+
+    assert_eq!(sql.matches("FROM nft_features").count(), 1);
+    assert!(sql.contains("GROUP BY chain, contract_address"));
+    assert!(sql.contains("arg_min("));
+    assert!(sql.contains("FILTER"));
+    assert!(!sql.contains("row_number() OVER"));
+    assert!(!sql.contains("FULL OUTER JOIN"));
+}
+
+#[test]
+fn arrow_columns_preserve_utf8_integers_nulls_and_order() {
+    let conn = Connection::open_in_memory().unwrap();
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT * FROM (
+                VALUES
+                    (0::BIGINT, '金色 dragon'::VARCHAR),
+                    (1::BIGINT, NULL::VARCHAR)
+            ) rows(row_index, text_value)
+            ORDER BY row_index
+            ",
+        )
+        .unwrap();
+    let batches = stmt.query_arrow([]).unwrap().collect::<Vec<_>>();
+
+    let batch = &batches[0];
+    let indexes = arrow_i64_column(batch, 0, "row_index").unwrap();
+    let texts = arrow_string_column(batch, 1, "text_value").unwrap();
+    assert_eq!(indexes.value(0), 0);
+    assert_eq!(indexes.value(1), 1);
+    assert_eq!(texts.value(0), "金色 dragon");
+    assert!(duckdb::arrow::array::Array::is_null(texts, 1));
+}
+
+#[test]
 fn load_snapshot_reuses_and_invalidates_metadata_recall_index_cache() {
     let store = DuckDbFeatureStore::new(":memory:").unwrap();
     store
@@ -779,6 +859,31 @@ fn metadata_sketch_source_match_allows_wider_simhash_prefilter_window() {
         &candidate,
         METADATA_SKETCH_SOURCE_HAMMING_THRESHOLD
     ));
+}
+
+#[test]
+fn compact_corpus_metadata_sketch_matches_string_doc_frequency_reference() {
+    let documents = [
+        MetadataBm25Document::from_text("gold dragon rare").unwrap(),
+        MetadataBm25Document::from_text("gold cat").unwrap(),
+        MetadataBm25Document::from_text("silver bird").unwrap(),
+    ];
+    let mut builder = CompactMetadataBm25CorpusBuilder::default();
+    let mut doc_freqs = HashMap::new();
+    for document in &documents {
+        builder.add_tokens(document.tokens());
+        for token in document.tokens().iter().collect::<HashSet<_>>() {
+            *doc_freqs.entry((*token).clone()).or_insert(0) += 1;
+        }
+    }
+    let corpus = builder.finish();
+
+    for document in &documents {
+        let reference = metadata_sketch_from_document(document, documents.len(), &doc_freqs);
+        let compact = metadata_sketch_from_compact_corpus(document, &corpus);
+        assert_eq!(compact.simhash, reference.simhash);
+        assert_eq!(compact.anchors, reference.anchors);
+    }
 }
 
 #[test]

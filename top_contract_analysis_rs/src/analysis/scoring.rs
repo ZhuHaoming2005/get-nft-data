@@ -1,13 +1,16 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
+#[cfg(test)]
+use std::collections::HashSet;
 
 use once_cell::sync::Lazy;
+use rapidfuzz::distance::jaro_winkler;
 use regex::Regex;
 use serde_json::Value;
-use strsim::jaro_winkler;
 use thiserror::Error;
 
 use crate::normalize::{normalize_name, normalize_text};
 
+// Keep in sync with name_uri_analysis_rs metadata TOKEN_RE / metadata_bm25_tokens
 static TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\p{L}\p{N}_]+").unwrap());
 pub const MAX_METADATA_BYTES_FOR_DEDUP: usize = 64 * 1024;
 
@@ -15,6 +18,36 @@ pub const MAX_METADATA_BYTES_FOR_DEDUP: usize = 64 * 1024;
 pub enum ScoringError {
     #[error("left and right sequences must have identical lengths")]
     MismatchedInputLengths,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct MetadataDocuments {
+    pub(crate) prefilter: String,
+    pub(crate) content: String,
+}
+
+// Keep in sync with name_uri_analysis_rs::analysis::name_scoring::PreparedNameQuery
+// (rapidfuzz Jaro–Winkler BatchComparator + score_cutoff percent API).
+pub(crate) struct PreparedNameQuery {
+    scorer: jaro_winkler::BatchComparator<char>,
+}
+
+impl PreparedNameQuery {
+    pub(crate) fn new(name: &str) -> Self {
+        Self {
+            scorer: jaro_winkler::BatchComparator::new(name.chars()),
+        }
+    }
+
+    pub(crate) fn score_percent(&self, right: &str, threshold: f64) -> Option<f64> {
+        if threshold.is_nan() || threshold > 100.0 {
+            return None;
+        }
+        let args = jaro_winkler::Args::default().score_cutoff((threshold / 100.0).clamp(0.0, 1.0));
+        self.scorer
+            .normalized_similarity_with_args(right.chars(), &args)
+            .map(|score| score * 100.0)
+    }
 }
 
 fn flatten_metadata(value: &Value, parts: &mut Vec<String>) {
@@ -51,34 +84,41 @@ fn flatten_metadata(value: &Value, parts: &mut Vec<String>) {
     }
 }
 
-fn metadata_document(raw: &str) -> String {
+pub(crate) fn metadata_documents_from_json(raw: &str) -> MetadataDocuments {
     if raw.trim().is_empty() {
-        return String::new();
+        return MetadataDocuments::default();
     }
 
     match serde_json::from_str::<Value>(raw) {
         Ok(value) => {
-            let mut parts = Vec::new();
-            flatten_metadata(&value, &mut parts);
-            normalize_text(&parts.join(" "))
+            let mut prefilter_parts = BTreeSet::new();
+            collect_metadata_prefilter_parts(&value, &mut prefilter_parts);
+            let prefilter = prefilter_parts.into_iter().collect::<Vec<_>>().join(" ");
+            let content = if metadata_is_dedup_eligible(raw) {
+                let mut content_parts = Vec::new();
+                flatten_metadata(&value, &mut content_parts);
+                normalize_text(&content_parts.join(" "))
+            } else {
+                String::new()
+            };
+            MetadataDocuments { prefilter, content }
         }
-        Err(_) => normalize_text(raw),
+        Err(_) => {
+            let normalized = normalize_text(raw);
+            MetadataDocuments {
+                prefilter: normalized.clone(),
+                content: if metadata_is_dedup_eligible(raw) {
+                    normalized
+                } else {
+                    String::new()
+                },
+            }
+        }
     }
 }
 
 pub fn metadata_prefilter_document_from_json(raw: &str) -> String {
-    if raw.trim().is_empty() {
-        return String::new();
-    }
-
-    match serde_json::from_str::<Value>(raw) {
-        Ok(value) => {
-            let mut parts = BTreeSet::new();
-            collect_metadata_prefilter_parts(&value, &mut parts);
-            parts.into_iter().collect::<Vec<_>>().join(" ")
-        }
-        Err(_) => normalize_text(raw),
-    }
+    metadata_documents_from_json(raw).prefilter
 }
 
 pub fn metadata_recall_document(metadata_json: &str) -> String {
@@ -89,6 +129,9 @@ pub fn metadata_recall_document(metadata_json: &str) -> String {
 }
 
 pub fn metadata_is_dedup_eligible(metadata_json: &str) -> bool {
+    // Keep in sync with name_uri_analysis_rs metadata_is_dedup_eligible
+    // and sql_metadata_json_eligible_predicate / metadata_json_eligible_predicate:
+    // trim, non-empty, len<=64KiB, starts with { or [
     let metadata_json = metadata_json.trim();
     !metadata_json.is_empty()
         && metadata_json.len() <= MAX_METADATA_BYTES_FOR_DEDUP
@@ -200,6 +243,17 @@ pub fn metadata_bm25_tokens(document: &str) -> Vec<String> {
     tokenize(&normalize_text(document))
 }
 
+pub(crate) fn metadata_bm25_has_terms(document: &str) -> bool {
+    // Normalize like `metadata_bm25_tokens`/`MetadataBm25Document::from_text` so
+    // `has_terms(x) == from_text(x).is_some()` for *any* input, not only
+    // pre-normalized text. NFKC can change byte lengths (e.g. "²" -> "2"), which
+    // would otherwise make a length>=2 check disagree with `from_text`.
+    let normalized = normalize_text(document);
+    TOKEN_RE
+        .find_iter(&normalized)
+        .any(|token| token.as_str().len() >= 2)
+}
+
 pub const METADATA_BM25_K1: f64 = 1.2;
 pub const METADATA_BM25_B: f64 = 0.75;
 
@@ -245,10 +299,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn metadata_is_dedup_eligible_accepts_leading_whitespace_json() {
+        assert!(metadata_is_dedup_eligible("  {\"a\":1}"));
+        assert!(metadata_is_dedup_eligible("\n[1]"));
+        assert!(!metadata_is_dedup_eligible("  x{}"));
+    }
+
+    #[test]
     fn normalized_name_pair_scoring_assumes_inputs_are_already_normalized() {
         assert_eq!(score_normalized_name_pair("azuki", "azuki"), 100.0);
         assert_eq!(score_name_pair("Azuki #123", "azuki"), 100.0);
         assert!(score_normalized_name_pair("Azuki #123", "azuki") < 100.0);
+    }
+
+    #[test]
+    fn prepared_name_query_preserves_unicode_scores_and_cutoff() {
+        let query = PreparedNameQuery::new("金色 dragon");
+
+        assert_eq!(query.score_percent("金色 dragon", 95.0), Some(100.0));
+        assert_eq!(query.score_percent("silver cat", 95.0), None);
+        assert_eq!(query.score_percent("金色 dragon", 101.0), None);
+
+        let expected = score_normalized_name_pair("金色 dragon", "金色 dragons");
+        let actual = query
+            .score_percent("金色 dragons", 0.0)
+            .expect("zero cutoff must return a score");
+        assert!((actual - expected).abs() < 1e-9);
     }
 
     #[test]
@@ -280,6 +356,27 @@ mod tests {
         let indexed_score = score_metadata_indexed_pair_with_corpus(&query, &doc, &corpus);
 
         assert!((prepared_score - indexed_score).abs() < 1e-9);
+    }
+
+    #[test]
+    fn compact_metadata_bm25_matches_string_reference_with_unknown_query_terms() {
+        let query = MetadataBm25Document::from_text("gold dragon gold unknown_seed_term").unwrap();
+        let documents = vec![
+            MetadataBm25Document::from_text("rare gold dragon").unwrap(),
+            MetadataBm25Document::from_text("silver cat").unwrap(),
+        ];
+        let string_corpus = MetadataBm25Corpus::from_indexed_documents(&documents);
+        let (compact_corpus, compact_documents) =
+            CompactMetadataBm25Corpus::from_indexed_documents(&documents);
+        let compact_query = CompactMetadataBm25Query::new(&query, &compact_corpus);
+
+        for (string_document, compact_document) in documents.iter().zip(compact_documents.iter()) {
+            let expected =
+                score_metadata_indexed_pair_with_corpus(&query, string_document, &string_corpus);
+            let actual =
+                score_compact_metadata_indexed_pair_with_query(&compact_query, compact_document);
+            assert!((actual - expected).abs() < 1e-9);
+        }
     }
 
     #[test]
@@ -370,8 +467,49 @@ mod tests {
         );
         assert_eq!(metadata_recall_document(&overlong_json), "");
     }
+
+    #[test]
+    fn metadata_bm25_has_terms_matches_from_text_eligibility() {
+        // has_terms must agree with MetadataBm25Document::from_text (which
+        // tokenizes normalized text) for arbitrary input, not only pre-normalized
+        // text. NFKC can change byte lengths (e.g. "²" -> "2"), so has_terms must
+        // normalize exactly like from_text does.
+        for raw in [
+            "",
+            "  ",
+            "a b c",
+            "x",
+            "gold dragon",
+            "GOLD  Dragon!!",
+            "{}",
+            "²",
+            "ﬃ",
+            "金色",
+        ] {
+            let has_terms = metadata_bm25_has_terms(raw);
+            let from_text_some = MetadataBm25Document::from_text(raw).is_some();
+            assert_eq!(has_terms, from_text_some, "raw={raw:?}");
+        }
+    }
+
+    #[test]
+    fn metadata_documents_parse_once_and_preserve_both_semantics() {
+        let raw = r#"{"name":"Seed #1","description":"Gold Dragon","attributes":[{"trait_type":"Background","value":"Red"}],"image":"ipfs://seed/1.png"}"#;
+
+        let documents = metadata_documents_from_json(raw);
+
+        assert_eq!(
+            documents.prefilter,
+            metadata_prefilter_document_from_json(raw)
+        );
+        assert_eq!(documents.content, metadata_document_from_json(raw));
+        assert!(documents.prefilter.contains("description"));
+        assert!(documents.content.contains("gold dragon"));
+    }
 }
 
+// String-keyed BM25 corpus/query path is a test-only oracle for Compact*.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct MetadataBm25Corpus {
     total_docs: usize,
@@ -379,6 +517,36 @@ pub struct MetadataBm25Corpus {
     doc_freqs: HashMap<String, usize>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct CompactMetadataBm25Document {
+    len: usize,
+    terms: Vec<(u32, usize)>,
+}
+
+#[derive(Debug)]
+pub(crate) struct CompactMetadataBm25Corpus {
+    token_ids: HashMap<String, u32>,
+    total_docs: usize,
+    avg_doc_len: f64,
+    doc_freqs: Vec<usize>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct CompactMetadataBm25CorpusBuilder {
+    token_ids: HashMap<String, u32>,
+    total_docs: usize,
+    total_terms: usize,
+    doc_freqs: Vec<usize>,
+}
+
+#[derive(Debug)]
+pub(crate) struct CompactMetadataBm25Query<'a> {
+    terms: Vec<(Option<u32>, usize)>,
+    denominator: f64,
+    corpus: &'a CompactMetadataBm25Corpus,
+}
+
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct MetadataBm25Query<'a> {
     terms: Vec<(String, usize)>,
@@ -386,12 +554,14 @@ pub(crate) struct MetadataBm25Query<'a> {
     corpus: &'a MetadataBm25Corpus,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct MetadataBm25SingleDocumentQuery {
     document: MetadataBm25Document,
     terms: Vec<(String, usize)>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub(crate) struct MetadataBm25CorpusBuilder {
     total_docs: usize,
@@ -399,6 +569,7 @@ pub(crate) struct MetadataBm25CorpusBuilder {
     doc_freqs: HashMap<String, usize>,
 }
 
+#[cfg(test)]
 impl MetadataBm25CorpusBuilder {
     pub(crate) fn add_tokens(&mut self, tokens: &[String]) {
         if tokens.is_empty() {
@@ -426,6 +597,124 @@ impl MetadataBm25CorpusBuilder {
     }
 }
 
+impl CompactMetadataBm25CorpusBuilder {
+    pub(crate) fn add_tokens(&mut self, tokens: &[String]) {
+        if tokens.is_empty() {
+            return;
+        }
+        self.total_docs += 1;
+        self.total_terms += tokens.len();
+        let mut unique_ids = Vec::with_capacity(tokens.len());
+        for token in tokens {
+            let token_id = match self.token_ids.get(token).copied() {
+                Some(token_id) => token_id,
+                None => {
+                    let token_id = u32::try_from(self.token_ids.len())
+                        .expect("metadata token dictionary exceeds u32 indexes");
+                    self.token_ids.insert(token.clone(), token_id);
+                    self.doc_freqs.push(0);
+                    token_id
+                }
+            };
+            unique_ids.push(token_id);
+        }
+        unique_ids.sort_unstable();
+        unique_ids.dedup();
+        for token_id in unique_ids {
+            self.doc_freqs[token_id as usize] += 1;
+        }
+    }
+
+    pub(crate) fn finish(self) -> CompactMetadataBm25Corpus {
+        let avg_doc_len = if self.total_docs == 0 {
+            0.0
+        } else {
+            self.total_terms as f64 / self.total_docs as f64
+        };
+        CompactMetadataBm25Corpus {
+            token_ids: self.token_ids,
+            total_docs: self.total_docs,
+            avg_doc_len,
+            doc_freqs: self.doc_freqs,
+        }
+    }
+}
+
+impl CompactMetadataBm25Corpus {
+    pub(crate) fn from_indexed_documents(
+        documents: &[MetadataBm25Document],
+    ) -> (Self, Vec<CompactMetadataBm25Document>) {
+        let mut builder = CompactMetadataBm25CorpusBuilder::default();
+        for document in documents {
+            builder.add_tokens(document.tokens());
+        }
+        let corpus = builder.finish();
+        let compact_documents = documents
+            .iter()
+            .map(|document| corpus.compact_document(document))
+            .collect();
+        (corpus, compact_documents)
+    }
+
+    pub(crate) fn compact_document(
+        &self,
+        document: &MetadataBm25Document,
+    ) -> CompactMetadataBm25Document {
+        let mut terms = document
+            .term_freqs
+            .iter()
+            .filter_map(|(token, term_frequency)| {
+                self.token_ids
+                    .get(token)
+                    .copied()
+                    .map(|token_id| (token_id, *term_frequency))
+            })
+            .collect::<Vec<_>>();
+        terms.sort_unstable_by_key(|(token_id, _)| *token_id);
+        CompactMetadataBm25Document {
+            len: document.len(),
+            terms,
+        }
+    }
+
+    pub(crate) fn total_docs(&self) -> usize {
+        self.total_docs
+    }
+
+    pub(crate) fn token_doc_freq(&self, token: &str) -> Option<usize> {
+        self.token_ids
+            .get(token)
+            .map(|token_id| self.doc_freqs[*token_id as usize])
+    }
+
+    pub(crate) fn contains_token(&self, token: &str) -> bool {
+        self.token_ids.contains_key(token)
+    }
+}
+
+impl<'a> CompactMetadataBm25Query<'a> {
+    pub(crate) fn new(query: &MetadataBm25Document, corpus: &'a CompactMetadataBm25Corpus) -> Self {
+        let terms = query_terms_from_tokens(query.tokens())
+            .into_iter()
+            .map(|(token, term_frequency)| (corpus.token_ids.get(&token).copied(), term_frequency))
+            .collect::<Vec<_>>();
+        let self_score = compact_bm25_query_self_score(&terms, query.len(), corpus);
+        let denominator = if self_score > 0.0 { self_score } else { 1.0 };
+        Self {
+            terms,
+            denominator,
+            corpus,
+        }
+    }
+
+    pub(crate) fn has_term_overlap(&self, document: &CompactMetadataBm25Document) -> bool {
+        self.terms.iter().any(|(token_id, _)| {
+            token_id.is_some_and(|token_id| compact_term_frequency(document, token_id) > 0)
+        })
+    }
+}
+
+#[cfg(test)]
 impl MetadataBm25Corpus {
     pub fn from_documents(documents: &[String]) -> Self {
         let indexed_documents: Vec<_> = documents
@@ -442,13 +731,85 @@ impl MetadataBm25Corpus {
         }
         builder.finish()
     }
-
-    #[cfg(test)]
-    pub(crate) fn total_docs(&self) -> usize {
-        self.total_docs
-    }
 }
 
+fn compact_term_frequency(document: &CompactMetadataBm25Document, token_id: u32) -> usize {
+    document
+        .terms
+        .binary_search_by_key(&token_id, |(document_token_id, _)| *document_token_id)
+        .ok()
+        .map_or(0, |index| document.terms[index].1)
+}
+
+fn compact_bm25_query_self_score(
+    query_terms: &[(Option<u32>, usize)],
+    query_len: usize,
+    corpus: &CompactMetadataBm25Corpus,
+) -> f64 {
+    if query_terms.is_empty()
+        || query_len == 0
+        || corpus.total_docs == 0
+        || corpus.avg_doc_len <= 0.0
+    {
+        return 0.0;
+    }
+    let doc_len = query_len as f64;
+    let norm =
+        METADATA_BM25_K1 * (1.0 - METADATA_BM25_B + METADATA_BM25_B * doc_len / corpus.avg_doc_len);
+    query_terms
+        .iter()
+        .map(|(token_id, query_tf)| {
+            let tf = *query_tf as f64;
+            let df = token_id
+                .map(|token_id| corpus.doc_freqs[token_id as usize])
+                .unwrap_or(0) as f64;
+            let idf = ((corpus.total_docs as f64 - df + 0.5) / (df + 0.5) + 1.0).ln();
+            *query_tf as f64 * idf * (tf * (METADATA_BM25_K1 + 1.0)) / (tf + norm)
+        })
+        .sum()
+}
+
+fn compact_bm25_score_terms(
+    query_terms: &[(Option<u32>, usize)],
+    document: &CompactMetadataBm25Document,
+    corpus: &CompactMetadataBm25Corpus,
+) -> f64 {
+    if query_terms.is_empty()
+        || document.len == 0
+        || corpus.total_docs == 0
+        || corpus.avg_doc_len <= 0.0
+    {
+        return 0.0;
+    }
+    let doc_len = document.len as f64;
+    let norm =
+        METADATA_BM25_K1 * (1.0 - METADATA_BM25_B + METADATA_BM25_B * doc_len / corpus.avg_doc_len);
+    query_terms
+        .iter()
+        .map(|(token_id, query_tf)| {
+            let Some(token_id) = token_id else {
+                return 0.0;
+            };
+            let tf = compact_term_frequency(document, *token_id) as f64;
+            if tf == 0.0 {
+                return 0.0;
+            }
+            let df = corpus.doc_freqs[*token_id as usize] as f64;
+            let idf = ((corpus.total_docs as f64 - df + 0.5) / (df + 0.5) + 1.0).ln();
+            *query_tf as f64 * idf * (tf * (METADATA_BM25_K1 + 1.0)) / (tf + norm)
+        })
+        .sum()
+}
+
+pub(crate) fn score_compact_metadata_indexed_pair_with_query(
+    query: &CompactMetadataBm25Query<'_>,
+    document: &CompactMetadataBm25Document,
+) -> f64 {
+    (compact_bm25_score_terms(&query.terms, document, query.corpus) / query.denominator)
+        .clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
 impl<'a> MetadataBm25Query<'a> {
     pub(crate) fn new(query: &MetadataBm25Document, corpus: &'a MetadataBm25Corpus) -> Self {
         let terms = query_terms_from_tokens(query.tokens());
@@ -466,14 +827,11 @@ impl<'a> MetadataBm25Query<'a> {
     }
 }
 
+#[cfg(test)]
 impl MetadataBm25SingleDocumentQuery {
     pub(crate) fn new(document: MetadataBm25Document) -> Self {
         let terms = query_terms_from_tokens(document.tokens());
         Self { document, terms }
-    }
-
-    pub(crate) fn document(&self) -> &MetadataBm25Document {
-        &self.document
     }
 
     pub(crate) fn score(&self, right: &MetadataBm25Document) -> f64 {
@@ -499,6 +857,7 @@ fn query_terms_from_tokens(query_tokens: &[String]) -> Vec<(String, usize)> {
     query_terms
 }
 
+#[cfg(test)]
 fn query_terms_overlap_document(
     query_terms: &[(String, usize)],
     document: &MetadataBm25Document,
@@ -508,6 +867,7 @@ fn query_terms_overlap_document(
         .any(|(token, _)| document.term_frequency(token) > 0)
 }
 
+#[cfg(test)]
 fn bm25_score_terms(
     query_terms: &[(String, usize)],
     doc: &MetadataBm25Document,
@@ -539,6 +899,7 @@ fn bm25_score_terms(
         .sum()
 }
 
+#[cfg(test)]
 fn bm25_score_terms_with_single_document_corpus(
     query_terms: &[(String, usize)],
     doc: &MetadataBm25Document,
@@ -570,6 +931,7 @@ fn bm25_score_terms_with_single_document_corpus(
         .sum()
 }
 
+#[cfg(test)]
 pub(crate) fn score_metadata_indexed_pair_with_query(
     query: &MetadataBm25Query<'_>,
     right: &MetadataBm25Document,
@@ -585,6 +947,7 @@ pub(crate) fn score_metadata_single_document_pair(
     MetadataBm25SingleDocumentQuery::new(left.clone()).score(right)
 }
 
+#[cfg(test)]
 pub fn score_metadata_indexed_pair_with_corpus(
     left: &MetadataBm25Document,
     right: &MetadataBm25Document,
@@ -594,6 +957,7 @@ pub fn score_metadata_indexed_pair_with_corpus(
     score_metadata_indexed_pair_with_query(&query, right)
 }
 
+#[cfg(test)]
 fn metadata_bm25_score_from_documents(left: &str, right: &str, corpus: &MetadataBm25Corpus) -> f64 {
     let Some(left_doc) = MetadataBm25Document::from_text(left) else {
         return 0.0;
@@ -605,7 +969,7 @@ fn metadata_bm25_score_from_documents(left: &str, right: &str, corpus: &Metadata
 }
 
 pub fn metadata_document_from_json(raw: &str) -> String {
-    metadata_document(raw)
+    metadata_documents_from_json(raw).content
 }
 
 pub fn score_name_pair(left: &str, right: &str) -> f64 {
@@ -620,7 +984,7 @@ pub fn score_normalized_name_pair(left_norm: &str, right_norm: &str) -> f64 {
     } else if left_norm == right_norm {
         100.0
     } else {
-        jaro_winkler(left_norm, right_norm) * 100.0
+        jaro_winkler::normalized_similarity(left_norm.chars(), right_norm.chars()) * 100.0
     }
 }
 
@@ -635,11 +999,15 @@ pub fn score_name_pairs(left: &[String], right: &[String]) -> Result<Vec<f64>, S
         .collect())
 }
 
+/// Thin public wrapper over CompactMetadataBm25Corpus (string BM25 is test-only).
 pub fn score_metadata_document_pair(left: &str, right: &str) -> f64 {
-    let corpus = MetadataBm25Corpus::from_documents(&[right.to_string()]);
-    metadata_bm25_score_from_documents(left, right, &corpus)
+    match score_metadata_documents(&[left.to_string()], &[right.to_string()]) {
+        Ok(scores) => scores.into_iter().next().unwrap_or(0.0),
+        Err(_) => 0.0,
+    }
 }
 
+#[cfg(test)]
 pub fn score_metadata_document_pair_with_corpus(
     left: &str,
     right: &str,
@@ -648,6 +1016,7 @@ pub fn score_metadata_document_pair_with_corpus(
     metadata_bm25_score_from_documents(left, right, corpus)
 }
 
+/// Public batch API implemented via CompactMetadataBm25Corpus.
 pub fn score_metadata_documents(
     left: &[String],
     right: &[String],
@@ -665,7 +1034,8 @@ pub fn score_metadata_documents(
             right_doc_indexes.push(None);
         }
     }
-    let corpus = MetadataBm25Corpus::from_indexed_documents(&corpus_docs);
+    let (compact_corpus, compact_documents) =
+        CompactMetadataBm25Corpus::from_indexed_documents(&corpus_docs);
     Ok(left
         .iter()
         .zip(right_doc_indexes.iter())
@@ -676,8 +1046,11 @@ pub fn score_metadata_documents(
             let Some(right_doc_index) = right_doc_index else {
                 return 0.0;
             };
-            let right_doc = &corpus_docs[*right_doc_index];
-            score_metadata_indexed_pair_with_corpus(&left_doc, right_doc, &corpus)
+            let compact_query = CompactMetadataBm25Query::new(&left_doc, &compact_corpus);
+            score_compact_metadata_indexed_pair_with_query(
+                &compact_query,
+                &compact_documents[*right_doc_index],
+            )
         })
         .collect())
 }

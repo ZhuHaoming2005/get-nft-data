@@ -1,10 +1,17 @@
-fn configure_duckdb(conn: &Connection, options: &AnalysisOptions) -> Result<(), AnalysisError> {
+use super::*;
+
+pub(crate) fn configure_duckdb(conn: &Connection, options: &AnalysisOptions) -> Result<(), AnalysisError> {
     conn.execute_batch(
         "
         PRAGMA preserve_insertion_order=false;
         ",
     )?;
     conn.execute(&format!("PRAGMA threads={}", options.threads.max(1)), [])?;
+    let memory_limit = resolve_duckdb_memory_limit(&options.duckdb_memory_limit)?;
+    conn.execute(
+        &format!("PRAGMA memory_limit='{}'", sql_string(&memory_limit)),
+        [],
+    )?;
     if let Some(temp_directory) = &options.temp_directory {
         fs::create_dir_all(temp_directory)?;
         conn.execute(
@@ -18,7 +25,25 @@ fn configure_duckdb(conn: &Connection, options: &AnalysisOptions) -> Result<(), 
     Ok(())
 }
 
-fn prepare_base_tables(
+/// Resolve the DuckDB `memory_limit` PRAGMA value. `auto` derives ~75% of
+/// available memory so DuckDB and the Rust analysis structures can coexist in
+/// one process; any other value is validated as a byte size and passed through.
+pub(crate) fn resolve_duckdb_memory_limit(value: &str) -> Result<String, AnalysisError> {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("auto") {
+        let mut system = System::new();
+        system.refresh_memory();
+        let available = system.available_memory() as usize;
+        let duckdb = available.saturating_mul(3).saturating_div(4);
+        let mib = 1024usize * 1024;
+        Ok(format!("{}MB", duckdb / mib))
+    } else {
+        parse_byte_size(trimmed)?;
+        Ok(trimmed.to_string())
+    }
+}
+
+pub(crate) fn prepare_base_tables(
     conn: &Connection,
     options: &AnalysisOptions,
     progress: &ProgressTracker,
@@ -27,13 +52,13 @@ fn prepare_base_tables(
     let input_columns = parquet_input_columns(conn, &inputs)?;
     let metadata_json_expr = metadata_json_projection_expr(&input_columns);
     progress.start_phase("preparing DuckDB tables", 7);
-    execute_duckdb_progress_batch(
+    execute_progress_batch(
         conn,
         &build_analysis_rows_sql(&inputs, &metadata_json_expr),
         progress,
         "materialized DuckDB working projection",
     )?;
-    execute_duckdb_progress_batch(
+    execute_progress_batch(
         conn,
         "
             CREATE TEMP TABLE selected_chains AS
@@ -49,25 +74,15 @@ fn prepare_base_tables(
     if include_cross_chain {
         progress.add_work(3);
     }
+    execute_progress_batch(
+        conn,
+        &analysis_contracts_sql(),
+        progress,
+        "materialized contract statistics",
+    )?;
     build_uri_key_stats(conn, progress, include_cross_chain, false)?;
     build_uri_contract_flags(conn, progress, include_cross_chain, false)?;
-    execute_duckdb_progress_batch(
-        conn,
-        "
-            CREATE TEMP TABLE contract_names AS
-            SELECT chain,
-                   contract_address,
-                   count(*)::BIGINT AS nft_count,
-                   min(nullif(name_norm, '')) AS name_norm
-            FROM analysis_rows
-            WHERE contract_address <> ''
-            GROUP BY chain, contract_address
-            HAVING min(nullif(name_norm, '')) IS NOT NULL;
-        ",
-        progress,
-        "materialized contract names",
-    )?;
-    execute_duckdb_progress_batch(
+    execute_progress_batch(
         conn,
         "
             CREATE TEMP TABLE name_atoms AS
@@ -76,7 +91,8 @@ fn prepare_base_tables(
                        name_norm,
                        count(*)::BIGINT AS contract_count,
                        coalesce(sum(nft_count), 0)::BIGINT AS nft_count
-                FROM contract_names
+                FROM analysis_contracts
+                WHERE name_norm IS NOT NULL
                 GROUP BY chain, name_norm
             )
             SELECT row_number() OVER ()::BIGINT AS atom_id, *
@@ -90,7 +106,66 @@ fn prepare_base_tables(
     Ok(chains)
 }
 
-fn build_analysis_rows_sql(inputs: &str, metadata_json_expr: &str) -> String {
+pub(super) fn analysis_contracts_sql() -> String {
+    format!(
+        "
+        CREATE TEMP TABLE analysis_contracts AS
+        WITH contract_stats AS (
+            SELECT chain,
+                   contract_address,
+                   count(*)::BIGINT AS nft_count,
+                   min(nullif(name_norm, '')) AS name_norm,
+                   arg_min(
+                       rowid,
+                       row(token_id, rowid)
+                   ) FILTER (WHERE {metadata_eligible}) AS metadata_row_id,
+                   arg_min(
+                       metadata_json,
+                       row(token_id, rowid)
+                   ) FILTER (WHERE {metadata_eligible}) AS metadata_json
+            FROM analysis_rows
+            WHERE contract_address <> ''
+            GROUP BY chain, contract_address
+        ),
+        indexed_contracts AS (
+            SELECT *,
+                   CASE
+                       WHEN metadata_row_id IS NULL THEN NULL
+                       ELSE count(*) FILTER (WHERE metadata_row_id IS NOT NULL) OVER (
+                           ORDER BY chain, contract_address
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                       ) - 1
+                   END AS metadata_contract_index
+            FROM contract_stats
+        )
+        SELECT chain,
+               contract_address,
+               nft_count,
+               name_norm,
+               metadata_row_id,
+               metadata_json,
+               metadata_contract_index
+        FROM indexed_contracts;
+        ",
+        metadata_eligible = metadata_json_eligible_predicate("metadata_json"),
+    )
+}
+
+pub(crate) fn metadata_json_eligible_predicate(column: &str) -> String {
+    // Keep in sync with top_contract_analysis_rs::DuckDbFeatureStore::sql_metadata_json_eligible_predicate
+    // and metadata_is_dedup_eligible: trim, non-empty, len<=64KiB, starts with { or [
+    let trimmed = format!("trim(coalesce(CAST({column} AS VARCHAR), ''))");
+    format!(
+        "{trimmed} <> ''
+         AND length({trimmed}) <= {MAX_METADATA_BYTES_FOR_DEDUP}
+         AND (
+             starts_with({trimmed}, '{{')
+             OR starts_with({trimmed}, '[')
+         )"
+    )
+}
+
+pub(crate) fn build_analysis_rows_sql(inputs: &str, metadata_json_expr: &str) -> String {
     format!(
         "
             CREATE TEMP TABLE analysis_rows AS
@@ -114,7 +189,7 @@ fn build_analysis_rows_sql(inputs: &str, metadata_json_expr: &str) -> String {
     )
 }
 
-fn execute_progress_batch(
+pub(crate) fn execute_progress_batch(
     conn: &Connection,
     sql: &str,
     progress: &ProgressTracker,
@@ -126,16 +201,71 @@ fn execute_progress_batch(
     Ok(())
 }
 
-fn execute_duckdb_progress_batch(
-    conn: &Connection,
-    sql: &str,
-    progress: &ProgressTracker,
-    message: &str,
+/// Verify that the Arrow column at `index` is named `name`. Reads bind columns
+/// positionally; every SELECT feeding these helpers names its columns to match,
+/// so a mismatch means the SQL and reader have desynced. Fail fast with a clear
+/// error instead of silently reading the wrong column.
+pub(crate) fn arrow_verify_column_name(
+    batch: &duckdb::arrow::record_batch::RecordBatch,
+    index: usize,
+    name: &str,
 ) -> Result<(), AnalysisError> {
-    execute_progress_batch(conn, sql, progress, message)
+    let schema = batch.schema();
+    match schema.fields().get(index) {
+        Some(field) if field.name() == name => Ok(()),
+        Some(field) => Err(AnalysisError::InvalidData(format!(
+            "DuckDB Arrow column at index {index} is {:?}, expected {name}",
+            field.name()
+        ))),
+        None => Err(AnalysisError::InvalidData(format!(
+            "DuckDB Arrow column {name} is missing at index {index}"
+        ))),
+    }
 }
 
-fn parquet_input_columns(
+pub(crate) fn arrow_i64_column<'a>(
+    batch: &'a duckdb::arrow::record_batch::RecordBatch,
+    index: usize,
+    name: &str,
+) -> Result<&'a duckdb::arrow::array::Int64Array, AnalysisError> {
+    arrow_verify_column_name(batch, index, name)?;
+    batch
+        .columns()
+        .get(index)
+        .and_then(|column| {
+            column
+                .as_any()
+                .downcast_ref::<duckdb::arrow::array::Int64Array>()
+        })
+        .ok_or_else(|| {
+            AnalysisError::InvalidData(format!(
+                "DuckDB Arrow column {name} is missing or is not BIGINT"
+            ))
+        })
+}
+
+pub(crate) fn arrow_string_column<'a>(
+    batch: &'a duckdb::arrow::record_batch::RecordBatch,
+    index: usize,
+    name: &str,
+) -> Result<&'a duckdb::arrow::array::StringArray, AnalysisError> {
+    arrow_verify_column_name(batch, index, name)?;
+    batch
+        .columns()
+        .get(index)
+        .and_then(|column| {
+            column
+                .as_any()
+                .downcast_ref::<duckdb::arrow::array::StringArray>()
+        })
+        .ok_or_else(|| {
+            AnalysisError::InvalidData(format!(
+                "DuckDB Arrow column {name} is missing or is not VARCHAR"
+            ))
+        })
+}
+
+pub(crate) fn parquet_input_columns(
     conn: &Connection,
     inputs_sql: &str,
 ) -> Result<std::collections::HashSet<String>, AnalysisError> {
@@ -150,7 +280,7 @@ fn parquet_input_columns(
     Ok(columns)
 }
 
-fn metadata_json_projection_expr(columns: &std::collections::HashSet<String>) -> String {
+pub(crate) fn metadata_json_projection_expr(columns: &std::collections::HashSet<String>) -> String {
     match (
         columns.contains("metadata_json"),
         columns.contains("metadata_doc"),
@@ -165,7 +295,7 @@ fn metadata_json_projection_expr(columns: &std::collections::HashSet<String>) ->
     }
 }
 
-fn prepared_table_scope(persist_prepared: bool) -> &'static str {
+pub(crate) fn prepared_table_scope(persist_prepared: bool) -> &'static str {
     if persist_prepared {
         ""
     } else {
@@ -173,33 +303,33 @@ fn prepared_table_scope(persist_prepared: bool) -> &'static str {
     }
 }
 
-fn build_uri_key_stats(
+pub(crate) fn build_uri_key_stats(
     conn: &Connection,
     progress: &ProgressTracker,
     include_cross_chain: bool,
     persist_prepared: bool,
 ) -> Result<(), AnalysisError> {
-    execute_duckdb_progress_batch(
+    execute_progress_batch(
         conn,
         &build_uri_key_contracts_sql(persist_prepared),
         progress,
         "built URI key contracts",
     )?;
 
-    execute_duckdb_progress_batch(
+    execute_progress_batch(
         conn,
         &build_uri_duplicate_key_stats_sql(persist_prepared),
         progress,
         "built duplicate-only URI key stats",
     )?;
     if include_cross_chain {
-        execute_duckdb_progress_batch(
+        execute_progress_batch(
             conn,
             &build_uri_cross_chain_keys_sql(persist_prepared),
             progress,
             "built cross-chain URI keys",
         )?;
-        execute_duckdb_progress_batch(
+        execute_progress_batch(
             conn,
             &build_uri_key_chain_presence_sql(persist_prepared),
             progress,
@@ -209,7 +339,7 @@ fn build_uri_key_stats(
     Ok(())
 }
 
-fn build_uri_key_contracts_sql(persist_prepared: bool) -> String {
+pub(crate) fn build_uri_key_contracts_sql(persist_prepared: bool) -> String {
     format!(
         "
         CREATE {table_scope}TABLE uri_key_contracts AS
@@ -232,7 +362,7 @@ fn build_uri_key_contracts_sql(persist_prepared: bool) -> String {
     )
 }
 
-fn build_uri_duplicate_key_stats_sql(persist_prepared: bool) -> String {
+pub(crate) fn build_uri_duplicate_key_stats_sql(persist_prepared: bool) -> String {
     format!(
         "
         CREATE {table_scope}TABLE uri_duplicate_key_stats AS
@@ -250,7 +380,7 @@ fn build_uri_duplicate_key_stats_sql(persist_prepared: bool) -> String {
     )
 }
 
-fn build_uri_cross_chain_keys_sql(persist_prepared: bool) -> String {
+pub(crate) fn build_uri_cross_chain_keys_sql(persist_prepared: bool) -> String {
     format!(
         "
         CREATE {table_scope}TABLE uri_cross_chain_keys AS
@@ -263,7 +393,7 @@ fn build_uri_cross_chain_keys_sql(persist_prepared: bool) -> String {
     )
 }
 
-fn build_uri_key_chain_presence_sql(persist_prepared: bool) -> String {
+pub(crate) fn build_uri_key_chain_presence_sql(persist_prepared: bool) -> String {
     format!(
         "
         CREATE {table_scope}TABLE uri_key_chain_presence AS
@@ -277,20 +407,20 @@ fn build_uri_key_chain_presence_sql(persist_prepared: bool) -> String {
     )
 }
 
-fn build_uri_contract_flags(
+pub(crate) fn build_uri_contract_flags(
     conn: &Connection,
     progress: &ProgressTracker,
     include_cross_chain: bool,
     persist_prepared: bool,
 ) -> Result<(), AnalysisError> {
-    execute_duckdb_progress_batch(
+    execute_progress_batch(
         conn,
         &build_uri_contract_flags_sql(include_cross_chain, persist_prepared),
         progress,
         "built compact URI contract flags",
     )?;
     if include_cross_chain {
-        execute_duckdb_progress_batch(
+        execute_progress_batch(
             conn,
             &build_uri_chain_pair_contract_flags_sql(persist_prepared),
             progress,
@@ -300,7 +430,7 @@ fn build_uri_contract_flags(
     Ok(())
 }
 
-fn build_uri_contract_flags_sql(include_cross_chain: bool, persist_prepared: bool) -> String {
+pub(crate) fn build_uri_contract_flags_sql(include_cross_chain: bool, persist_prepared: bool) -> String {
     let (cross_key_columns, cross_key_joins) = if include_cross_chain {
         (
             ",
@@ -364,7 +494,7 @@ fn build_uri_contract_flags_sql(include_cross_chain: bool, persist_prepared: boo
     )
 }
 
-fn uri_contract_metric_columns(include_cross_chain: bool) -> String {
+pub(crate) fn uri_contract_metric_columns(include_cross_chain: bool) -> String {
     let mut columns = uri_contract_metric_sql(
         "norm_contract",
         "norm_token_contract",
@@ -381,7 +511,7 @@ fn uri_contract_metric_columns(include_cross_chain: bool) -> String {
     columns
 }
 
-fn uri_contract_metric_sql(prefix: &str, token_flag: &str, image_flag: &str) -> String {
+pub(crate) fn uri_contract_metric_sql(prefix: &str, token_flag: &str, image_flag: &str) -> String {
     format!(
         "coalesce(sum(CASE WHEN {token_flag} THEN 1 ELSE 0 END), 0)::BIGINT AS {prefix}_v1_nfts,
                    max(CASE WHEN {token_flag} THEN 1 ELSE 0 END)::BIGINT AS {prefix}_v1_contracts,
@@ -392,7 +522,7 @@ fn uri_contract_metric_sql(prefix: &str, token_flag: &str, image_flag: &str) -> 
     )
 }
 
-fn build_uri_chain_pair_contract_flags_sql(persist_prepared: bool) -> String {
+pub(crate) fn build_uri_chain_pair_contract_flags_sql(persist_prepared: bool) -> String {
     format!(
         "
         CREATE {table_scope}TABLE uri_chain_pair_contract_flags AS
@@ -459,7 +589,7 @@ fn build_uri_chain_pair_contract_flags_sql(persist_prepared: bool) -> String {
     )
 }
 
-fn uri_count_sum_columns(prefix: &str) -> String {
+pub(crate) fn uri_count_sum_columns(prefix: &str) -> String {
     format!(
         "coalesce(sum({prefix}_v1_nfts), 0)::BIGINT,
                coalesce(sum({prefix}_v1_contracts), 0)::BIGINT,
@@ -470,7 +600,7 @@ fn uri_count_sum_columns(prefix: &str) -> String {
     )
 }
 
-fn uri_contract_counts_sql(include_cross_chain: bool) -> String {
+pub(crate) fn uri_contract_counts_sql(include_cross_chain: bool) -> String {
     let cross_columns = if include_cross_chain {
         format!(",\n               {}", uri_count_sum_columns("norm_cross_chain"))
     } else {
@@ -487,7 +617,7 @@ fn uri_contract_counts_sql(include_cross_chain: bool) -> String {
     )
 }
 
-fn uri_counts_from_row_at(row: &duckdb::Row<'_>, start: usize) -> duckdb::Result<UriCounts> {
+pub(crate) fn uri_counts_from_row_at(row: &duckdb::Row<'_>, start: usize) -> duckdb::Result<UriCounts> {
     Ok(UriCounts {
         v1_nfts: row.get(start)?,
         v1_contracts: row.get(start + 1)?,
@@ -498,7 +628,7 @@ fn uri_counts_from_row_at(row: &duckdb::Row<'_>, start: usize) -> duckdb::Result
     })
 }
 
-fn load_uri_contract_counts(
+pub(crate) fn load_uri_contract_counts(
     conn: &Connection,
     include_cross_chain: bool,
 ) -> Result<HashMap<String, UriContractCounts>, AnalysisError> {
@@ -524,7 +654,7 @@ fn load_uri_contract_counts(
     Ok(counts_by_chain)
 }
 
-fn uri_chain_pair_counts_sql() -> &'static str {
+pub(crate) fn uri_chain_pair_counts_sql() -> &'static str {
     "
         SELECT primary_chain,
                secondary_chain,
@@ -539,7 +669,7 @@ fn uri_chain_pair_counts_sql() -> &'static str {
         "
 }
 
-fn load_uri_chain_pair_counts(
+pub(crate) fn load_uri_chain_pair_counts(
     conn: &Connection,
 ) -> Result<HashMap<String, HashMap<String, UriCounts>>, AnalysisError> {
     let mut stmt = conn.prepare(uri_chain_pair_counts_sql())?;
@@ -561,7 +691,7 @@ fn load_uri_chain_pair_counts(
     Ok(counts_by_pair)
 }
 
-fn load_selected_chains(conn: &Connection) -> Result<Vec<String>, AnalysisError> {
+pub(crate) fn load_selected_chains(conn: &Connection) -> Result<Vec<String>, AnalysisError> {
     let mut stmt = conn.prepare("SELECT chain FROM selected_chains ORDER BY chain")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     let mut chains = Vec::new();
@@ -576,28 +706,31 @@ fn load_selected_chains(conn: &Connection) -> Result<Vec<String>, AnalysisError>
     Ok(chains)
 }
 
-fn load_chain_totals(
-    conn: &Connection,
-    chains: &[String],
-) -> Result<HashMap<String, NameTotals>, AnalysisError> {
+pub(crate) fn load_chain_totals(conn: &Connection) -> Result<HashMap<String, NameTotals>, AnalysisError> {
     let mut totals = HashMap::new();
-    let mut stmt = conn.prepare(
-        "
-        SELECT count(DISTINCT contract_address)::BIGINT,
-               count(*)::BIGINT
-        FROM analysis_rows
-        WHERE chain = ?
-          AND contract_address <> ''
-        ",
-    )?;
-    for chain in chains {
-        let total = stmt.query_row(params![chain], |row| {
-            Ok(NameTotals {
-                contracts: row.get(0)?,
-                nfts: row.get(1)?,
-            })
-        })?;
-        totals.insert(chain.clone(), total);
+    let mut stmt = conn.prepare(chain_totals_sql())?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            NameTotals {
+                contracts: row.get(1)?,
+                nfts: row.get(2)?,
+            },
+        ))
+    })?;
+    for row in rows {
+        let (chain, total) = row?;
+        totals.insert(chain, total);
     }
     Ok(totals)
+}
+
+pub(crate) fn chain_totals_sql() -> &'static str {
+    "
+        SELECT chain,
+               count(*)::BIGINT AS contract_count,
+               coalesce(sum(nft_count), 0)::BIGINT AS nft_count
+        FROM analysis_contracts
+        GROUP BY chain
+    "
 }

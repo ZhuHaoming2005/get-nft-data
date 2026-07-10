@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::analysis::scoring::{
     metadata_document_from_json, metadata_is_dedup_eligible, metadata_recall_document,
-    MetadataBm25Corpus, MetadataBm25Document,
+    CompactMetadataBm25Corpus, CompactMetadataBm25Document, MetadataBm25Document,
+    PreparedNameQuery,
 };
 use crate::models::{
     ContractDuplicateRecord, ContractNameRecord, ContractSignal, DatabaseNftRecord,
@@ -33,6 +34,7 @@ pub(super) struct SeedRecallProfile {
     pub(super) exact_token_keys: HashSet<String>,
     pub(super) exact_image_keys: HashSet<String>,
     pub(super) seed_name_norms: Vec<String>,
+    pub(super) seed_name_queries: Vec<PreparedNameQuery>,
     pub(super) seed_metadata_doc: Option<MetadataBm25Document>,
 }
 
@@ -81,7 +83,6 @@ pub(super) struct MetadataSketch {
 #[derive(Clone)]
 pub(super) struct MetadataRecallCandidate {
     pub(super) row: RecallRow,
-    pub(super) doc: MetadataBm25Document,
     pub(super) sketch: MetadataSketch,
 }
 
@@ -93,8 +94,8 @@ pub(super) struct MetadataSourceIndex {
 
 pub(super) struct MetadataRecallIndex {
     pub(super) candidates: Vec<MetadataRecallCandidate>,
-    pub(super) corpus: MetadataBm25Corpus,
-    pub(super) doc_freqs: HashMap<String, usize>,
+    pub(super) compact_corpus: CompactMetadataBm25Corpus,
+    pub(super) compact_documents: Vec<CompactMetadataBm25Document>,
     pub(super) source_index: MetadataSourceIndex,
 }
 
@@ -121,6 +122,15 @@ pub(super) fn seed_metadata_representative_doc(
 
 impl SeedRecallProfile {
     pub(super) fn new(seed_address: String, seed_nfts: &[SeedNft]) -> Self {
+        let seed_name_norms = seed_nfts
+            .iter()
+            .map(|item| normalize_name(&item.name))
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        let seed_name_queries = seed_name_norms
+            .iter()
+            .map(|name| PreparedNameQuery::new(name))
+            .collect();
         Self {
             seed_address,
             seed_contracts: seed_nfts
@@ -140,11 +150,8 @@ impl SeedRecallProfile {
                 .iter()
                 .filter_map(|item| normalize_url(&item.image_uri))
                 .collect(),
-            seed_name_norms: seed_nfts
-                .iter()
-                .map(|item| normalize_name(&item.name))
-                .filter(|value| !value.is_empty())
-                .collect(),
+            seed_name_norms,
+            seed_name_queries,
             seed_metadata_doc: seed_metadata_representative_doc(seed_nfts),
         }
     }
@@ -407,16 +414,36 @@ pub(super) fn push_metadata_anchor_candidate(
     }
 }
 
+#[cfg(test)]
 pub(super) fn metadata_sketch_from_document(
     document: &MetadataBm25Document,
     total_docs: usize,
     doc_freqs: &HashMap<String, usize>,
 ) -> MetadataSketch {
+    metadata_sketch_from_document_with_lookup(document, total_docs, |token| {
+        doc_freqs.get(token).copied().unwrap_or(0)
+    })
+}
+
+pub(super) fn metadata_sketch_from_compact_corpus(
+    document: &MetadataBm25Document,
+    corpus: &CompactMetadataBm25Corpus,
+) -> MetadataSketch {
+    metadata_sketch_from_document_with_lookup(document, corpus.total_docs(), |token| {
+        corpus.token_doc_freq(token).unwrap_or(0)
+    })
+}
+
+fn metadata_sketch_from_document_with_lookup(
+    document: &MetadataBm25Document,
+    total_docs: usize,
+    mut doc_freq: impl FnMut(&str) -> usize,
+) -> MetadataSketch {
     let mut weights = [0.0f64; 64];
     let mut anchors = Vec::<(String, f64)>::new();
     let unique_tokens = document.tokens().iter().collect::<BTreeSet<_>>();
     for token in unique_tokens {
-        let df = doc_freqs.get(token).copied().unwrap_or(0);
+        let df = doc_freq(token);
         let idf = metadata_token_idf(total_docs, df);
         let token_hash = stable_token_hash(token);
         for (bit, weight) in weights.iter_mut().enumerate() {
@@ -486,7 +513,7 @@ pub(super) fn metadata_seed_doc_for_index(
     let tokens = seed_doc
         .tokens()
         .iter()
-        .filter(|token| metadata_index.doc_freqs.contains_key(*token))
+        .filter(|token| metadata_index.compact_corpus.contains_token(token))
         .cloned()
         .collect::<Vec<_>>();
     MetadataBm25Document::from_tokens(tokens)

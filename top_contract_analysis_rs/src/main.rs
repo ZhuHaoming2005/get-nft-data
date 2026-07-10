@@ -28,12 +28,36 @@ fn connect_postgres_from_constants() -> Result<Client, AppError> {
     Client::connect(&config, NoTls).map_err(AppError::from)
 }
 
+/// Resolve the shared DuckDB/Rayon thread count from `--physical-cores` /
+/// `--duckdb-threads`. `--physical-cores` wins when set; otherwise 0 means
+/// SMT (all logical cores, the Rayon/DuckDB default). When an explicit count
+/// is given, also pin the global Rayon pool to it so DuckDB and Rayon share a
+/// single thread budget rather than both racing to fill every logical core.
+fn resolve_resource_threads(physical_cores: usize, duckdb_threads: usize) -> usize {
+    let effective = if physical_cores > 0 {
+        physical_cores
+    } else {
+        duckdb_threads
+    };
+    if effective > 0 {
+        // Best-effort: if the global pool was already initialized this errors,
+        // in which case Rayon keeps its default. Called once at startup before
+        // any `par_iter`, so it normally succeeds.
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(effective)
+            .build_global();
+    }
+    effective
+}
+
 fn main() -> Result<(), AppError> {
     let command = TopContractAnalysisCli::parse();
     match command.command {
         Command::Analyze(args) => Runtime::new()?.block_on(async move {
+            let duckdb_threads =
+                resolve_resource_threads(args.physical_cores, args.duckdb_threads);
             let duckdb_options =
-                DuckDbResourceOptions::from_cli(args.duckdb_threads, &args.duckdb_memory_limit)?;
+                DuckDbResourceOptions::from_cli(duckdb_threads, &args.duckdb_memory_limit)?;
             let feature_store =
                 DuckDbFeatureStore::new_with_options(&args.feature_db, duckdb_options)?;
             if !args.feature_parquet.trim().is_empty() {
@@ -90,8 +114,10 @@ fn main() -> Result<(), AppError> {
         }),
         Command::Batch(args) => Runtime::new()?.block_on(async move {
             let seed_addresses = read_seed_addresses(std::path::Path::new(&args.seed_file))?;
+            let duckdb_threads =
+                resolve_resource_threads(args.physical_cores, args.duckdb_threads);
             let duckdb_options =
-                DuckDbResourceOptions::from_cli(args.duckdb_threads, &args.duckdb_memory_limit)?;
+                DuckDbResourceOptions::from_cli(duckdb_threads, &args.duckdb_memory_limit)?;
             let feature_store =
                 DuckDbFeatureStore::new_with_options(&args.feature_db, duckdb_options)?;
             if !args.feature_parquet.trim().is_empty() {

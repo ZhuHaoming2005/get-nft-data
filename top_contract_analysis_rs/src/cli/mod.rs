@@ -39,7 +39,7 @@ pub struct AnalyzeArgs {
     pub max_tokens_per_contract: usize,
     #[arg(long, default_value_t = 0)]
     pub max_recall_rows: usize,
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 16)]
     pub alchemy_api_max_concurrency: usize,
     #[arg(
         long = "other-api-max-concurrency",
@@ -51,11 +51,18 @@ pub struct AnalyzeArgs {
         default_value_t = DEFAULT_OTHER_API_RATE_LIMIT_INTERVAL_MS
     )]
     pub other_api_rate_limit_refill_ms: u64,
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 4)]
     pub matched_contract_max_concurrency: usize,
+    /// DuckDB worker threads. 0 = auto = SMT (all logical cores). On a
+    /// 32-physical-core SMT host this defaults to 64; pass `--physical-cores
+    /// 32` to pin DuckDB + Rayon to physical cores for the recall hash joins.
     #[arg(long, default_value_t = 0)]
     pub duckdb_threads: usize,
-    #[arg(long, default_value = "80GB")]
+    /// Physical core count. When set, overrides `--duckdb-threads` and pins
+    /// DuckDB + Rayon to N threads.
+    #[arg(long, default_value_t = 0)]
+    pub physical_cores: usize,
+    #[arg(long, default_value = "150GB")]
     pub duckdb_memory_limit: String,
     #[arg(long, default_value = "")]
     pub output: String,
@@ -95,9 +102,9 @@ pub struct BatchArgs {
     pub timeout: u64,
     #[arg(long, default_value = "../result")]
     pub output_dir: String,
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 2)]
     pub seed_network_max_concurrency: usize,
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 16)]
     pub alchemy_api_max_concurrency: usize,
     #[arg(
         long = "other-api-max-concurrency",
@@ -109,13 +116,20 @@ pub struct BatchArgs {
         default_value_t = DEFAULT_OTHER_API_RATE_LIMIT_INTERVAL_MS
     )]
     pub other_api_rate_limit_refill_ms: u64,
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 4)]
     pub matched_contract_max_concurrency: usize,
     #[arg(long, default_value_t = 1)]
     pub seed_cpu_max_concurrency: usize,
+    /// DuckDB worker threads. 0 = auto = SMT (all logical cores). On a
+    /// 32-physical-core SMT host this defaults to 64; pass `--physical-cores
+    /// 32` to pin DuckDB + Rayon to physical cores for the recall hash joins.
     #[arg(long, default_value_t = 0)]
     pub duckdb_threads: usize,
-    #[arg(long, default_value = "80GB")]
+    /// Physical core count. When set, overrides `--duckdb-threads` and pins
+    /// DuckDB + Rayon to N threads.
+    #[arg(long, default_value_t = 0)]
+    pub physical_cores: usize,
+    #[arg(long, default_value = "150GB")]
     pub duckdb_memory_limit: String,
     #[arg(long, default_value = "")]
     pub feature_parquet: String,

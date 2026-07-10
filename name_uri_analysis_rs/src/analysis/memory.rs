@@ -1,16 +1,18 @@
+use super::*;
+
 #[derive(Debug)]
-struct MemoryPlan {
-    analysis_bytes: usize,
+pub(crate) struct MemoryPlan {
+    pub(crate) analysis_bytes: usize,
 }
 
-struct MemoryGuard {
+pub(crate) struct MemoryGuard {
     total_budget: usize,
     pid: Option<Pid>,
     system: System,
 }
 
 impl MemoryGuard {
-    fn new(total_budget: usize) -> Self {
+    pub(crate) fn new(total_budget: usize) -> Self {
         Self {
             total_budget,
             pid: get_current_pid().ok(),
@@ -18,7 +20,7 @@ impl MemoryGuard {
         }
     }
 
-    fn current_rss_bytes(&mut self) -> Option<usize> {
+    pub(crate) fn current_rss_bytes(&mut self) -> Option<usize> {
         let pid = self.pid?;
         self.system
             .refresh_processes(ProcessesToUpdate::Some(&[pid]), false);
@@ -27,7 +29,7 @@ impl MemoryGuard {
             .map(|process| process.memory() as usize)
     }
 
-    fn next_threshold_batch_size(
+    pub(crate) fn next_threshold_batch_size(
         &mut self,
         remaining_thresholds: usize,
         budget_capacity: usize,
@@ -44,7 +46,7 @@ impl MemoryGuard {
     }
 }
 
-fn name_analysis_memory_plan(
+pub(crate) fn name_analysis_memory_plan(
     thresholds: &[f64],
     atom_count: usize,
     chain_count: usize,
@@ -86,7 +88,7 @@ fn name_analysis_memory_plan(
     )
 }
 
-fn explicit_analysis_memory_plan(
+pub(crate) fn explicit_analysis_memory_plan(
     total_budget: usize,
     analysis_bytes: usize,
     resident_analysis_bytes: usize,
@@ -105,7 +107,7 @@ fn explicit_analysis_memory_plan(
     })
 }
 
-fn auto_balanced_memory_plan(
+pub(crate) fn auto_balanced_memory_plan(
     total_budget: usize,
     _threshold_count: usize,
     _atom_count: usize,
@@ -125,7 +127,7 @@ fn auto_balanced_memory_plan(
     })
 }
 
-fn total_memory_budget_bytes(value: &str) -> Result<usize, AnalysisError> {
+pub(crate) fn total_memory_budget_bytes(value: &str) -> Result<usize, AnalysisError> {
     let value = value.trim();
     if value.eq_ignore_ascii_case("auto") {
         Ok(auto_memory_budget_bytes())
@@ -134,13 +136,13 @@ fn total_memory_budget_bytes(value: &str) -> Result<usize, AnalysisError> {
     }
 }
 
-fn auto_memory_budget_bytes() -> usize {
+pub(crate) fn auto_memory_budget_bytes() -> usize {
     let mut system = System::new();
     system.refresh_memory();
     system.available_memory() as usize
 }
 
-fn format_byte_size(bytes: usize) -> String {
+pub(crate) fn format_byte_size(bytes: usize) -> String {
     let mib = 1024usize * 1024;
     if bytes >= mib {
         format!("{}MB", bytes / mib)
@@ -149,7 +151,7 @@ fn format_byte_size(bytes: usize) -> String {
     }
 }
 
-fn parse_byte_size(value: &str) -> Result<usize, AnalysisError> {
+pub(crate) fn parse_byte_size(value: &str) -> Result<usize, AnalysisError> {
     let trimmed = value.trim();
     let split_at = trimmed
         .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))

@@ -1,18 +1,41 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use duckdb::{params, Connection};
+use duckdb::Connection;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use serde::Serialize;
-use strsim::jaro_winkler;
 use sysinfo::{get_current_pid, Pid, ProcessesToUpdate, System};
 use thiserror::Error;
 
-include!("analysis/types.rs");
-include!("analysis/progress.rs");
+mod chain_matrix;
+mod components;
+mod duckdb_prep;
+mod memory;
+mod metadata;
+mod name;
+mod name_scoring;
+mod output;
+mod progress;
+mod types;
+mod uri;
+
+pub use types::{AnalysisError, AnalysisOptions, AnalysisReport, SummaryRow};
+use chain_matrix::*;
+use components::*;
+use duckdb_prep::*;
+use memory::*;
+use metadata::{run_metadata_analysis, MAX_METADATA_BYTES_FOR_DEDUP};
+use name::*;
+use name_scoring::*;
+use output::*;
+use progress::*;
+use types::*;
+use uri::*;
+#[cfg(test)]
+use metadata::metadata_raw_rows_sql;
 
 pub fn run_analysis(options: AnalysisOptions) -> Result<AnalysisReport, AnalysisError> {
     if options.parquet_inputs.is_empty() {
@@ -38,7 +61,7 @@ pub fn run_analysis(options: AnalysisOptions) -> Result<AnalysisReport, Analysis
     progress.step("DuckDB configured");
     progress.finish_phase("DuckDB configured");
     let selected_chains = prepare_base_tables(&conn, &options, &progress)?;
-    let chain_totals = load_chain_totals(&conn, &selected_chains)?;
+    let chain_totals = load_chain_totals(&conn)?;
 
     let mut summary_rows = Vec::new();
     summary_rows.extend(run_uri_analysis(
@@ -97,13 +120,5 @@ pub fn run_analysis(options: AnalysisOptions) -> Result<AnalysisReport, Analysis
     Ok(report)
 }
 
-include!("analysis/duckdb_prep.rs");
-include!("analysis/uri.rs");
-include!("analysis/name.rs");
-include!("analysis/metadata.rs");
-include!("analysis/name_scoring.rs");
-include!("analysis/chain_matrix.rs");
-include!("analysis/components.rs");
-include!("analysis/memory.rs");
-include!("analysis/output.rs");
-include!("analysis/tests.rs");
+#[cfg(test)]
+mod tests;

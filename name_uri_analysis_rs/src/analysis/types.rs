@@ -1,3 +1,5 @@
+use super::*;
+
 #[derive(Debug, Error)]
 pub enum AnalysisError {
     #[error("at least one parquet input is required")]
@@ -21,6 +23,7 @@ pub struct AnalysisOptions {
     pub threads: usize,
     pub memory_limit: String,
     pub analysis_memory_limit: Option<String>,
+    pub duckdb_memory_limit: String,
     pub temp_directory: Option<PathBuf>,
     pub progress: bool,
     pub persist_prepared: bool,
@@ -53,115 +56,118 @@ pub struct AnalysisReport {
 }
 
 #[derive(Clone, Debug)]
-struct NameAtom {
-    chain_index: usize,
-    name_norm: String,
-    char_len: usize,
-    contract_count: i64,
-    nft_count: i64,
+pub(crate) struct NameAtom {
+    pub(crate) chain_index: usize,
+    pub(crate) name_norm: String,
+    pub(crate) char_len: usize,
+    pub(crate) contract_count: i64,
+    pub(crate) nft_count: i64,
 }
 
-const RIGHT_SCORE_CHUNK_SIZE: usize = 8192;
-const SPARSE_UNION_NODE_BYTES: usize = 96;
-const PROGRESS_FLUSH_CHUNKS: u64 = 128;
+#[cfg(test)]
+pub(crate) const RIGHT_SCORE_CHUNK_SIZE: usize = 8192;
+pub(crate) const LEFT_SCORE_BATCH_SIZE: usize = 1024;
+pub(crate) const SPARSE_UNION_NODE_BYTES: usize = 96;
+pub(crate) const PROGRESS_FLUSH_CHUNKS: u64 = 128;
 
 #[derive(Clone, Copy)]
-struct ScoredRight {
-    right: usize,
-    score: f64,
+pub(crate) struct ScoredRight {
+    pub(crate) right: usize,
+    pub(crate) score: f64,
 }
 
 #[derive(Clone, Copy)]
-struct NameTotals {
-    contracts: i64,
-    nfts: i64,
+pub(crate) struct NameTotals {
+    pub(crate) contracts: i64,
+    pub(crate) nfts: i64,
 }
 
 #[derive(Clone, Copy, Default)]
-struct UriCounts {
-    v1_nfts: i64,
-    v1_contracts: i64,
-    v2_nfts: i64,
-    v2_contracts: i64,
-    v3_nfts: i64,
-    v3_contracts: i64,
+pub(crate) struct UriCounts {
+    pub(crate) v1_nfts: i64,
+    pub(crate) v1_contracts: i64,
+    pub(crate) v2_nfts: i64,
+    pub(crate) v2_contracts: i64,
+    pub(crate) v3_nfts: i64,
+    pub(crate) v3_contracts: i64,
 }
 
 #[derive(Clone, Copy, Default)]
-struct UriContractCounts {
-    intra_chain: UriCounts,
-    cross_chain: UriCounts,
+pub(crate) struct UriContractCounts {
+    pub(crate) intra_chain: UriCounts,
+    pub(crate) cross_chain: UriCounts,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct GroupSummary {
-    group_count: i64,
-    duplicate_contract_count: i64,
-    duplicate_nft_count: i64,
-    group_size_ge_2_count: i64,
-    group_size_gt_2_count: i64,
+pub(crate) struct GroupSummary {
+    pub(crate) group_count: i64,
+    pub(crate) duplicate_contract_count: i64,
+    pub(crate) duplicate_nft_count: i64,
+    pub(crate) group_size_ge_2_count: i64,
+    pub(crate) group_size_gt_2_count: i64,
 }
 
-struct SummarySpec<'a> {
-    field_name: &'a str,
-    scope: &'a str,
-    primary_chain: &'a str,
-    secondary_chain: &'a str,
-    threshold: Option<f64>,
-    match_mode: &'a str,
-    metric: &'a str,
-    total_contracts: i64,
-    total_nfts: i64,
+pub(crate) struct SummarySpec<'a> {
+    pub(crate) field_name: &'a str,
+    pub(crate) scope: &'a str,
+    pub(crate) primary_chain: &'a str,
+    pub(crate) secondary_chain: &'a str,
+    pub(crate) threshold: Option<f64>,
+    pub(crate) match_mode: &'a str,
+    pub(crate) metric: &'a str,
+    pub(crate) total_contracts: i64,
+    pub(crate) total_nfts: i64,
 }
 
-struct ChainMatrixRowSpec<'a> {
-    chains: &'a [String],
-    totals: &'a HashMap<String, NameTotals>,
-    primary_index: usize,
-    secondary_index: usize,
-    threshold: f64,
+pub(crate) struct ChainMatrixRowSpec<'a> {
+    pub(crate) chains: &'a [String],
+    pub(crate) totals: &'a HashMap<String, NameTotals>,
+    pub(crate) primary_index: usize,
+    pub(crate) secondary_index: usize,
+    pub(crate) threshold: f64,
 }
 
-struct ChainMatrixAnalysisSpec<'a> {
-    thresholds: &'a [f64],
-    analysis_budget: usize,
-    total_memory_budget: usize,
-    totals: &'a HashMap<String, NameTotals>,
+pub(crate) struct ChainMatrixAnalysisSpec<'a> {
+    pub(crate) thresholds: &'a [f64],
+    pub(crate) analysis_budget: usize,
+    pub(crate) total_memory_budget: usize,
+    pub(crate) totals: &'a HashMap<String, NameTotals>,
+    pub(crate) scratch_mode: NameScratchMode,
 }
 
-struct MatrixUnionState {
-    threshold: f64,
-    union_find: SparseUnionFind,
+pub(crate) struct MatrixUnionState {
+    pub(crate) threshold: f64,
+    pub(crate) union_find: SparseUnionFind,
 }
 
-struct ChainMatrixReusePlan {
-    per_threshold_bytes: usize,
-    pair_count: usize,
+pub(crate) struct ChainMatrixReusePlan {
+    pub(crate) per_threshold_bytes: usize,
+    pub(crate) pair_count: usize,
 }
 
 #[derive(Clone, Copy, Default)]
-struct PairComponentAccumulator {
-    left_contract_count: i64,
-    left_nft_count: i64,
-    right_contract_count: i64,
-    right_nft_count: i64,
-    total_contract_count: i64,
+pub(crate) struct PairComponentAccumulator {
+    pub(crate) left_contract_count: i64,
+    pub(crate) left_nft_count: i64,
+    pub(crate) right_contract_count: i64,
+    pub(crate) right_nft_count: i64,
+    pub(crate) total_contract_count: i64,
 }
 
-struct UnionFind {
-    parent: Vec<usize>,
-    rank: Vec<u8>,
+pub(crate) struct UnionFind {
+    pub(crate) parent: Vec<usize>,
+    pub(crate) rank: Vec<u8>,
 }
 
 impl UnionFind {
-    fn new(size: usize) -> Self {
+    pub(crate) fn new(size: usize) -> Self {
         Self {
             parent: (0..size).collect(),
             rank: vec![0; size],
         }
     }
 
-    fn find(&mut self, node: usize) -> usize {
+    pub(crate) fn find(&mut self, node: usize) -> usize {
         let parent = self.parent[node];
         if parent != node {
             let root = self.find(parent);
@@ -170,7 +176,7 @@ impl UnionFind {
         self.parent[node]
     }
 
-    fn union(&mut self, left: usize, right: usize) {
+    pub(crate) fn union(&mut self, left: usize, right: usize) {
         let left_root = self.find(left);
         let right_root = self.find(right);
         if left_root == right_root {
@@ -187,23 +193,23 @@ impl UnionFind {
     }
 }
 
-struct ThresholdUnionState {
-    threshold: f64,
-    intra: UnionFind,
-    cross: Option<SparseUnionFind>,
-    chain_matrix: Option<Vec<SparseUnionFind>>,
+pub(crate) struct ThresholdUnionState {
+    pub(crate) threshold: f64,
+    pub(crate) intra: UnionFind,
+    pub(crate) cross: Option<SparseUnionFind>,
+    pub(crate) chain_matrix: Option<Vec<SparseUnionFind>>,
 }
 
 #[derive(Default)]
-struct SparseUnionFind {
-    index_by_atom: HashMap<usize, usize>,
-    atoms: Vec<usize>,
-    parent: Vec<usize>,
-    rank: Vec<u8>,
+pub(crate) struct SparseUnionFind {
+    pub(crate) index_by_atom: HashMap<usize, usize>,
+    pub(crate) atoms: Vec<usize>,
+    pub(crate) parent: Vec<usize>,
+    pub(crate) rank: Vec<u8>,
 }
 
 impl SparseUnionFind {
-    fn get_or_insert(&mut self, atom: usize) -> usize {
+    pub(crate) fn get_or_insert(&mut self, atom: usize) -> usize {
         if let Some(index) = self.index_by_atom.get(&atom).copied() {
             return index;
         }
@@ -216,7 +222,7 @@ impl SparseUnionFind {
         index
     }
 
-    fn find_local(&mut self, node: usize) -> usize {
+    pub(crate) fn find_local(&mut self, node: usize) -> usize {
         let parent = self.parent[node];
         if parent != node {
             let root = self.find_local(parent);
@@ -225,7 +231,7 @@ impl SparseUnionFind {
         self.parent[node]
     }
 
-    fn union(&mut self, left: usize, right: usize) {
+    pub(crate) fn union(&mut self, left: usize, right: usize) {
         let left = self.get_or_insert(left);
         let right = self.get_or_insert(right);
 
@@ -247,7 +253,7 @@ impl SparseUnionFind {
         }
     }
 
-    fn connected(&mut self, left: usize, right: usize) -> bool {
+    pub(crate) fn connected(&mut self, left: usize, right: usize) -> bool {
         let Some(left) = self.index_by_atom.get(&left).copied() else {
             return false;
         };
@@ -257,11 +263,11 @@ impl SparseUnionFind {
         self.find_local(left) == self.find_local(right)
     }
 
-    fn atom_count(&self) -> usize {
+    pub(crate) fn atom_count(&self) -> usize {
         self.atoms.len()
     }
 
-    fn atom_at(&self, local_index: usize) -> usize {
+    pub(crate) fn atom_at(&self, local_index: usize) -> usize {
         self.atoms[local_index]
     }
 }

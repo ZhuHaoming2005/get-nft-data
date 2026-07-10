@@ -1,5 +1,7 @@
+use super::*;
+
 #[derive(Default)]
-struct ComponentAccumulator {
+pub(crate) struct ComponentAccumulator {
     primary_contract_count: i64,
     primary_nft_count: i64,
     total_contract_count: i64,
@@ -8,13 +10,13 @@ struct ComponentAccumulator {
     has_secondary: bool,
 }
 
-struct DenseComponentScratch {
+pub(crate) struct DenseComponentScratch {
     components: Vec<ComponentAccumulator>,
     touched_roots: Vec<usize>,
 }
 
 impl DenseComponentScratch {
-    fn new(size: usize) -> Self {
+    pub(crate) fn new(size: usize) -> Self {
         let mut components = Vec::with_capacity(size);
         components.resize_with(size, ComponentAccumulator::default);
         Self {
@@ -23,14 +25,14 @@ impl DenseComponentScratch {
         }
     }
 
-    fn clear_touched(&mut self) {
+    pub(crate) fn clear_touched(&mut self) {
         for root in self.touched_roots.drain(..) {
             self.components[root] = ComponentAccumulator::default();
         }
     }
 }
 
-fn summarize_components_for_primary_with_scratch(
+pub(crate) fn summarize_components_for_primary_with_scratch(
     atoms: &[NameAtom],
     primary_atoms: &[usize],
     union_find: &mut UnionFind,
@@ -64,7 +66,7 @@ fn summarize_components_for_primary_with_scratch(
     summary
 }
 
-fn summarize_sparse_components_for_chain_pair(
+pub(crate) fn summarize_sparse_components_for_chain_pair(
     atoms: &[NameAtom],
     union_find: &mut SparseUnionFind,
     left_chain: usize,
@@ -107,7 +109,7 @@ fn summarize_sparse_components_for_chain_pair(
     (left_summary, right_summary)
 }
 
-fn accumulate_pair_component_summary(
+pub(crate) fn accumulate_pair_component_summary(
     summary: &mut GroupSummary,
     primary_contract_count: i64,
     primary_nft_count: i64,
@@ -124,7 +126,7 @@ fn accumulate_pair_component_summary(
     summary.group_size_gt_2_count += i64::from(total_contract_count > 2);
 }
 
-fn summarize_sparse_components_for_primary(
+pub(crate) fn summarize_sparse_components_for_primary(
     atoms: &[NameAtom],
     union_find: &mut SparseUnionFind,
     primary: usize,
