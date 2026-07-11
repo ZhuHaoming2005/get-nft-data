@@ -163,7 +163,11 @@ impl DuckDbFeatureStore {
         })
     }
 
-    pub(super) fn chain_row_count(conn: &Connection, table_name: &str, chain: &str) -> Result<i64, AppError> {
+    pub(super) fn chain_row_count(
+        conn: &Connection,
+        table_name: &str,
+        chain: &str,
+    ) -> Result<i64, AppError> {
         if !Self::table_exists(conn, table_name)? {
             return Ok(0);
         }

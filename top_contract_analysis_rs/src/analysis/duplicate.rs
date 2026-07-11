@@ -8,7 +8,10 @@ use crate::analysis::scoring::{
     CompactMetadataBm25CorpusBuilder, CompactMetadataBm25Document, CompactMetadataBm25Query,
     MetadataBm25Document, PreparedNameQuery,
 };
-use crate::models::{ContractDuplicateRecord, DatabaseNftRecord, DuplicateCandidate, SeedNft};
+use crate::models::{
+    normalize_chain_identity, ContractDuplicateRecord, DatabaseNftRecord, DuplicateCandidate,
+    SeedNft,
+};
 use crate::normalize::{normalize_name, normalize_url};
 use crate::platform_infrastructure::is_platform_infrastructure_contract_blacklisted;
 
@@ -291,7 +294,7 @@ fn aggregate_contract_rows(
 ) -> Vec<ContractDuplicateRecord> {
     let mut rows_by_contract = HashMap::<String, ContractDuplicateRecord>::new();
     for row in snapshot_rows {
-        let contract_key = row.contract_address.to_lowercase();
+        let contract_key = normalize_chain_identity(&row.contract_address);
         if seed_contracts.contains(&contract_key) {
             continue;
         }
@@ -417,7 +420,7 @@ pub fn build_duplicate_candidates(
 ) -> Vec<DuplicateCandidate> {
     let seed_contracts: HashSet<String> = seed_nfts
         .iter()
-        .map(|item| item.contract_address.to_lowercase())
+        .map(|item| normalize_chain_identity(&item.contract_address))
         .collect();
     let seed_token_uri_keys: HashSet<String> = seed_nfts
         .iter()
@@ -453,12 +456,12 @@ pub fn build_duplicate_candidates_from_contract_rows(
 ) -> Vec<DuplicateCandidate> {
     let seed_contracts: HashSet<String> = seed_nfts
         .iter()
-        .map(|item| item.contract_address.to_lowercase())
+        .map(|item| normalize_chain_identity(&item.contract_address))
         .collect();
     let contract_rows: Vec<&ContractDuplicateRecord> = contract_rows
         .iter()
         .filter(|row| {
-            let contract_key = row.contract_address.to_lowercase();
+            let contract_key = normalize_chain_identity(&row.contract_address);
             !seed_contracts.contains(&contract_key)
                 && !is_platform_infrastructure_contract_blacklisted(chain, &row.contract_address)
         })

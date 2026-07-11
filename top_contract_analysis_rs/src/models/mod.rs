@@ -1,7 +1,162 @@
 use std::collections::BTreeMap;
+use std::fmt;
+use std::str::FromStr;
 
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize, Serializer};
+
+use crate::error::AppError;
+
+#[derive(
+    Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Chain {
+    #[default]
+    Ethereum,
+    Base,
+    Polygon,
+    Solana,
+}
+
+impl Chain {
+    pub const ALL: [Self; 4] = [Self::Ethereum, Self::Base, Self::Polygon, Self::Solana];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ethereum => "ethereum",
+            Self::Base => "base",
+            Self::Polygon => "polygon",
+            Self::Solana => "solana",
+        }
+    }
+
+    pub fn is_evm(self) -> bool {
+        !matches!(self, Self::Solana)
+    }
+
+    pub fn native_symbol(self) -> &'static str {
+        match self {
+            Self::Ethereum | Self::Base => "ETH",
+            Self::Polygon => "POL",
+            Self::Solana => "SOL",
+        }
+    }
+
+    pub fn normalize_identity(self, value: &str) -> String {
+        if self.is_evm() {
+            value.trim().to_ascii_lowercase()
+        } else {
+            value.trim().to_string()
+        }
+    }
+
+    pub fn identities_equal(self, left: &str, right: &str) -> bool {
+        if self.is_evm() {
+            left.trim().eq_ignore_ascii_case(right.trim())
+        } else {
+            left.trim() == right.trim()
+        }
+    }
+}
+
+/// Normalizes an address, mint, token identifier, or transaction hash when the
+/// caller does not carry an explicit chain. Supported EVM identities are 0x
+/// prefixed; Solana Base58 identities must retain their original casing.
+pub fn normalize_chain_identity(value: &str) -> String {
+    let value = value.trim();
+    if value.starts_with("0x") || value.starts_with("0X") {
+        value.to_ascii_lowercase()
+    } else {
+        value.to_string()
+    }
+}
+
+impl fmt::Display for Chain {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for Chain {
+    type Err = AppError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ethereum" => Ok(Self::Ethereum),
+            "base" => Ok(Self::Base),
+            "polygon" => Ok(Self::Polygon),
+            "solana" => Ok(Self::Solana),
+            other => Err(AppError::InvalidData(format!("unsupported chain: {other}"))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ContractId {
+    pub chain: Chain,
+    pub address: String,
+}
+
+impl ContractId {
+    pub fn new(chain: Chain, address: impl AsRef<str>) -> Result<Self, AppError> {
+        let address = normalize_contract_address(chain, address.as_ref())?;
+        Ok(Self { chain, address })
+    }
+}
+
+impl fmt::Display for ContractId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}:{}", self.chain, self.address)
+    }
+}
+
+fn normalize_contract_address(chain: Chain, value: &str) -> Result<String, AppError> {
+    let address = value.trim();
+    if chain.is_evm() {
+        let normalized = address.to_ascii_lowercase();
+        if normalized.len() == 42
+            && normalized.starts_with("0x")
+            && normalized[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Ok(normalized);
+        }
+    } else if decode_base58(address).is_some_and(|decoded| decoded.len() == 32) {
+        return Ok(address.to_string());
+    }
+    Err(AppError::InvalidData(format!(
+        "invalid {chain} contract address: {address}"
+    )))
+}
+
+fn decode_base58(value: &str) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    if value.is_empty() {
+        return None;
+    }
+    let mut decoded = vec![0_u8];
+    for byte in value.bytes() {
+        let digit = ALPHABET.iter().position(|candidate| *candidate == byte)? as u32;
+        let mut carry = digit;
+        for item in decoded.iter_mut().rev() {
+            let next = u32::from(*item) * 58 + carry;
+            *item = (next & 0xff) as u8;
+            carry = next >> 8;
+        }
+        while carry > 0 {
+            decoded.insert(0, (carry & 0xff) as u8);
+            carry >>= 8;
+        }
+    }
+    let leading_zeroes = value.bytes().take_while(|byte| *byte == b'1').count();
+    let first_nonzero = decoded
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(decoded.len());
+    let mut result = vec![0_u8; leading_zeroes];
+    result.extend_from_slice(&decoded[first_nonzero..]);
+    Some(result)
+}
 
 fn default_aggregate_count() -> i64 {
     1
@@ -33,13 +188,6 @@ fn single_seed_report_type() -> String {
 
 fn batch_summary_report_type() -> String {
     "batch_summary".into()
-}
-
-fn serialize_single_seed_report_type<S>(_value: &String, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    serializer.serialize_str("single_seed")
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -189,7 +337,7 @@ pub struct NftSaleRecord {
     pub is_native_eth: bool,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct TransactionReceiptRecord {
     pub tx_hash: String,
     pub block_number: i64,
@@ -199,6 +347,10 @@ pub struct TransactionReceiptRecord {
     pub contract_address: String,
     pub gas_used: i64,
     pub effective_gas_price_wei: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_native: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_usd: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -329,6 +481,23 @@ pub struct DuplicateContractPayload {
     pub name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub symbol: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ProviderDataQualityPayload {
+    pub asset_listing_analyzed_count: i64,
+    pub asset_listing_total_count: i64,
+    pub asset_listing_truncated_contract_count: i64,
+    pub history_failed_asset_count: i64,
+    pub history_requested_asset_count: i64,
+    pub history_successful_asset_count: i64,
+    pub history_truncated_asset_count: i64,
+    pub history_fetched_transaction_count: i64,
+    pub history_reported_transaction_count: i64,
+    pub history_failed_transaction_count: i64,
+    pub history_unattributed_sol_transaction_count: i64,
+    pub history_unresolved_compressed_mint_count: i64,
+    pub supplemental_provider_failure_count: i64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -717,6 +886,30 @@ pub struct PaperDuplicateScaleRowPayload {
     pub duplicate_contract_ratio_denominator: i64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChainTotalsPayload {
+    pub total_nfts: i64,
+    pub total_contracts: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ScopedDuplicateScaleRowPayload {
+    pub scope: String,
+    pub primary_chain: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub secondary_chain: String,
+    pub aggregation: String,
+    pub category: String,
+    pub duplicate_nft_count: i64,
+    pub duplicate_nft_ratio: Option<f64>,
+    pub duplicate_nft_ratio_numerator: i64,
+    pub duplicate_nft_ratio_denominator: i64,
+    pub duplicate_contract_count: i64,
+    pub duplicate_contract_ratio: Option<f64>,
+    pub duplicate_contract_ratio_numerator: i64,
+    pub duplicate_contract_ratio_denominator: i64,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PaperAddressClassificationPayload {
     pub malicious_address_count: i64,
@@ -946,6 +1139,38 @@ pub struct PaperDataQualityPayload {
     pub sale_price_parseable_ratio_numerator: i64,
     pub sale_price_parseable_ratio_denominator: i64,
     pub legit_duplicate_contract_count: i64,
+    #[serde(default)]
+    pub asset_listing_analyzed_count: i64,
+    #[serde(default)]
+    pub asset_listing_total_count: i64,
+    #[serde(default)]
+    pub asset_listing_truncated_contract_count: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_listing_coverage_ratio: Option<f64>,
+    #[serde(default)]
+    pub history_failed_asset_count: i64,
+    #[serde(default)]
+    pub history_requested_asset_count: i64,
+    #[serde(default)]
+    pub history_successful_asset_count: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_asset_coverage_ratio: Option<f64>,
+    #[serde(default)]
+    pub history_truncated_asset_count: i64,
+    #[serde(default)]
+    pub history_fetched_transaction_count: i64,
+    #[serde(default)]
+    pub history_reported_transaction_count: i64,
+    #[serde(default)]
+    pub history_failed_transaction_count: i64,
+    #[serde(default)]
+    pub history_unattributed_sol_transaction_count: i64,
+    #[serde(default)]
+    pub history_unresolved_compressed_mint_count: i64,
+    #[serde(default)]
+    pub supplemental_provider_failure_count: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_transaction_coverage_ratio: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -1148,12 +1373,9 @@ pub struct NftPropagationPathPayload {
     pub token_paths: Vec<NftTokenPropagationPayload>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct SingleReportPayload {
-    #[serde(
-        default = "single_seed_report_type",
-        serialize_with = "serialize_single_seed_report_type"
-    )]
+    #[serde(default = "single_seed_report_type")]
     pub report_type: String,
     pub seed_contract: SeedContractPayload,
     #[serde(default)]
@@ -1204,6 +1426,86 @@ pub struct SingleReportPayload {
     pub nft_propagation_paths: BTreeMap<String, NftPropagationPathPayload>,
 }
 
+pub(crate) fn rename_native_amount_keys(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let keys = map.keys().cloned().collect::<Vec<_>>();
+            for key in keys {
+                let Some(mut child) = map.remove(&key) else {
+                    continue;
+                };
+                rename_native_amount_keys(&mut child);
+                let renamed = if key == "is_native_eth" {
+                    "is_native_payment".to_string()
+                } else if let Some(prefix) = key.strip_suffix("_eth") {
+                    format!("{prefix}_native")
+                } else {
+                    key
+                };
+                map.insert(renamed, child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                rename_native_amount_keys(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn restore_internal_native_amount_keys(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let keys = map.keys().cloned().collect::<Vec<_>>();
+            for key in keys {
+                let Some(mut child) = map.remove(&key) else {
+                    continue;
+                };
+                restore_internal_native_amount_keys(&mut child);
+                let restored = if key == "is_native_payment" {
+                    "is_native_eth".to_string()
+                } else if let Some(prefix) = key.strip_suffix("_native") {
+                    format!("{prefix}_eth")
+                } else {
+                    key
+                };
+                map.insert(restored, child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                restore_internal_native_amount_keys(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+impl Serialize for SingleReportPayload {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("SingleReportPayload", 5)?;
+        state.serialize_field("schema_version", &2_u32)?;
+        state.serialize_field("report_type", "single_seed")?;
+        state.serialize_field("seed_contract", &self.seed_contract)?;
+        let native_symbol = self
+            .seed_contract
+            .chain
+            .parse::<Chain>()
+            .map(Chain::native_symbol)
+            .unwrap_or("");
+        state.serialize_field("native_symbol", native_symbol)?;
+        let mut paper_stats =
+            serde_json::to_value(&self.paper_stats).map_err(serde::ser::Error::custom)?;
+        rename_native_amount_keys(&mut paper_stats);
+        state.serialize_field("paper_stats", &paper_stats)?;
+        state.end()
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct BatchSummaryPayload {
     #[serde(default = "batch_summary_report_type")]
@@ -1217,12 +1519,14 @@ impl Serialize for BatchSummaryPayload {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("BatchSummaryPayload", 2)?;
+        let mut state = serializer.serialize_struct("BatchSummaryPayload", 3)?;
+        state.serialize_field("schema_version", &2_u32)?;
         state.serialize_field("report_type", &batch_summary_report_type())?;
-        state.serialize_field(
-            "paper_stats",
-            &BatchPaperStatsSummaryPayload::from(&self.paper_stats),
-        )?;
+        let mut paper_stats =
+            serde_json::to_value(BatchPaperStatsSummaryPayload::from(&self.paper_stats))
+                .map_err(serde::ser::Error::custom)?;
+        rename_native_amount_keys(&mut paper_stats);
+        state.serialize_field("paper_stats", &paper_stats)?;
         state.end()
     }
 }

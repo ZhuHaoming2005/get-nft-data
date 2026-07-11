@@ -68,6 +68,86 @@ fn cli_accepts_custom_other_api_rate_limit_refill_ms() {
 }
 
 #[test]
+fn batch_cli_accepts_multichain_inputs_and_helius_limits() {
+    let batch = TopContractAnalysisCli::parse_from([
+        "top_contract_analysis_rs",
+        "batch",
+        "--seed-file",
+        "seeds.csv",
+        "--feature-parquet",
+        "ethereum.parquet",
+        "--feature-parquet",
+        "solana.parquet",
+        "--alchemy-network",
+        "ethereum=eth-mainnet",
+        "--alchemy-network",
+        "base=base-mainnet",
+        "--helius-api-key",
+        "helius-key",
+        "--helius-api-max-concurrency",
+        "7",
+        "--helius-rate-limit-refill-ms",
+        "125",
+        "--max-history-transactions-per-asset",
+        "500",
+        "--max-history-transactions-per-collection",
+        "20000",
+        "--seed-network-max-concurrency",
+        "5",
+        "--seed-cpu-max-concurrency",
+        "2",
+    ]);
+    let CliCommand::Batch(args) = batch.command else {
+        panic!("expected batch command");
+    };
+
+    assert_eq!(args.feature_parquet, ["ethereum.parquet", "solana.parquet"]);
+    assert_eq!(
+        args.alchemy_network,
+        ["ethereum=eth-mainnet", "base=base-mainnet"]
+    );
+    assert_eq!(args.helius_api_key, "helius-key");
+    assert_eq!(args.helius_api_max_concurrency, 7);
+    assert_eq!(args.helius_rate_limit_refill_ms, 125);
+    assert_eq!(args.max_history_transactions_per_asset, 500);
+    assert_eq!(args.max_history_transactions_per_collection, 20_000);
+    assert_eq!(args.seed_network_max_concurrency, 5);
+    assert_eq!(args.seed_cpu_max_concurrency, 2);
+}
+
+#[test]
+fn batch_cli_accepts_helius_refill_argument() {
+    let command = TopContractAnalysisCli::try_parse_from([
+        "top_contract_analysis_rs",
+        "batch",
+        "--seed-file",
+        "seeds.csv",
+        "--helius-rate-limit-refill-ms",
+        "125",
+    ])
+    .unwrap();
+    let CliCommand::Batch(args) = command.command else {
+        panic!("expected batch command");
+    };
+    assert_eq!(args.helius_rate_limit_refill_ms, 125);
+}
+
+#[test]
+fn batch_cli_rejects_removed_global_chain_argument() {
+    let error = TopContractAnalysisCli::try_parse_from([
+        "top_contract_analysis_rs",
+        "batch",
+        "--seed-file",
+        "seeds.csv",
+        "--chain",
+        "ethereum",
+    ])
+    .unwrap_err();
+
+    assert!(error.to_string().contains("unexpected argument '--chain'"));
+}
+
+#[test]
 fn cli_accepts_paper_statistics_threshold_flags() {
     let analyze = TopContractAnalysisCli::parse_from([
         "top_contract_analysis_rs",

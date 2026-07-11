@@ -38,6 +38,7 @@ fn default_output_basename_casefolds_non_ascii_more_like_python() {
 fn single_report_payload_serializes_current_python_top_level_shape() {
     let payload = SingleReportPayload {
         seed_contract: SeedContractPayload {
+            chain: "ethereum".into(),
             contract_address: "0xseed".into(),
             ..Default::default()
         },
@@ -85,9 +86,17 @@ fn single_report_payload_serializes_current_python_top_level_shape() {
 
     assert_eq!(
         keys,
-        BTreeSet::from(["report_type", "seed_contract", "paper_stats"])
+        BTreeSet::from([
+            "schema_version",
+            "report_type",
+            "native_symbol",
+            "seed_contract",
+            "paper_stats",
+        ])
     );
+    assert_eq!(serialized["schema_version"], 2);
     assert_eq!(serialized["report_type"], "single_seed");
+    assert_eq!(serialized["native_symbol"], "ETH");
     assert_eq!(serialized["seed_contract"]["contract_address"], "0xseed");
     assert!(serialized["paper_stats"].is_object());
     assert!(!object.contains_key("output_files"));

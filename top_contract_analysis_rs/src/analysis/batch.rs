@@ -8,7 +8,10 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::error::AppError;
-use crate::models::{BatchSummaryPayload, SingleReportPayload};
+use crate::models::{
+    restore_internal_native_amount_keys, BatchSummaryPayload, SingleReportPayload,
+};
+use crate::models::{Chain, ContractId};
 use crate::progress::SeedProgressReporter;
 use crate::reporting::{default_output_basename, write_outputs_to_directory};
 
@@ -107,14 +110,21 @@ fn load_cached_seed_entries(
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&text) else {
             continue;
         };
+        if value.get("schema_version").and_then(|value| value.as_u64()) != Some(2) {
+            continue;
+        }
         if value.get("report_type").and_then(|value| value.as_str()) != Some("single_seed") {
             continue;
         }
         if value.get("paper_stats").is_none() {
             continue;
+        }
+
+        if let Some(paper_stats) = value.get_mut("paper_stats") {
+            restore_internal_native_amount_keys(paper_stats);
         }
 
         let Ok(report) = serde_json::from_value::<CachedSingleSeedReport>(value) else {
@@ -646,4 +656,49 @@ pub fn read_seed_addresses(seed_file: &Path) -> Result<Vec<String>, AppError> {
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(|line| line.to_lowercase())
         .collect())
+}
+
+pub fn read_seed_contracts(seed_file: &Path) -> Result<Vec<ContractId>, AppError> {
+    let content = std::fs::read_to_string(seed_file)?;
+    let mut lines = content.lines();
+    let header = lines
+        .next()
+        .map(str::trim)
+        .ok_or_else(|| AppError::InvalidData("seed CSV is empty".to_string()))?;
+    if header != "chain,address" {
+        return Err(AppError::InvalidData(
+            "seed CSV header must be exactly chain,address".to_string(),
+        ));
+    }
+
+    let mut seeds = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (index, raw_line) in lines.enumerate() {
+        let line_number = index + 2;
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split(',');
+        let chain = fields.next().unwrap_or_default();
+        let address = fields.next().unwrap_or_default();
+        if fields.next().is_some() || chain.trim().is_empty() || address.trim().is_empty() {
+            return Err(AppError::InvalidData(format!(
+                "invalid seed CSV row {line_number}: expected chain,address"
+            )));
+        }
+        let seed = ContractId::new(chain.parse::<Chain>()?, address)?;
+        if !seen.insert(seed.clone()) {
+            return Err(AppError::InvalidData(format!(
+                "duplicate seed contract at row {line_number}: {seed}"
+            )));
+        }
+        seeds.push(seed);
+    }
+    if seeds.is_empty() {
+        return Err(AppError::InvalidData(
+            "seed CSV does not contain any contracts".to_string(),
+        ));
+    }
+    Ok(seeds)
 }

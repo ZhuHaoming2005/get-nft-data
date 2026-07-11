@@ -2398,6 +2398,8 @@ impl AnalyzeApi for SecondaryVictimApi {
             contract_address: String::new(),
             gas_used: 21000,
             effective_gas_price_wei: 1_000_000_000,
+            fee_native: None,
+            fee_usd: None,
         })
     }
 
@@ -2417,6 +2419,8 @@ impl AnalyzeApi for SecondaryVictimApi {
                 contract_address: String::new(),
                 gas_used: 0,
                 effective_gas_price_wei: 0,
+                fee_native: None,
+                fee_usd: None,
             },
         )]))
     }
@@ -2636,6 +2640,8 @@ impl AnalyzeApi for MultiBuyerSameTxApi {
             contract_address: String::new(),
             gas_used: 0,
             effective_gas_price_wei: 0,
+            fee_native: None,
+            fee_usd: None,
         })
     }
 
@@ -3627,6 +3633,8 @@ impl AnalyzeApi for CashoutTraceApi {
             contract_address: String::new(),
             gas_used: 21_000,
             effective_gas_price_wei: 1_000_000_000,
+            fee_native: None,
+            fee_usd: None,
         })
     }
 
@@ -3647,6 +3655,8 @@ impl AnalyzeApi for CashoutTraceApi {
                     contract_address: String::new(),
                     gas_used: 21_000,
                     effective_gas_price_wei: 1_000_000_000,
+                    fee_native: None,
+                    fee_usd: None,
                 },
             ),
             (
@@ -3659,6 +3669,8 @@ impl AnalyzeApi for CashoutTraceApi {
                     contract_address: String::new(),
                     gas_used: 21_000,
                     effective_gas_price_wei: 1_000_000_000,
+                    fee_native: None,
+                    fee_usd: None,
                 },
             ),
         ]))
@@ -4017,6 +4029,8 @@ impl AnalyzeApi for DuplicateMintPaymentLookupApi {
             contract_address: String::new(),
             gas_used: 21000,
             effective_gas_price_wei: 1_000_000_000,
+            fee_native: None,
+            fee_usd: None,
         })
     }
 
@@ -4274,6 +4288,8 @@ impl AnalyzeApi for ObsoleteReceiptMetricProbeApi {
             contract_address: String::new(),
             gas_used: 21000,
             effective_gas_price_wei: 1_000_000_000,
+            fee_native: None,
+            fee_usd: None,
         })
     }
 
@@ -4309,4 +4325,3 @@ impl AnalyzeApi for ObsoleteReceiptMetricProbeApi {
         Ok(vec![])
     }
 }
-

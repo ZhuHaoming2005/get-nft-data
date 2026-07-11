@@ -54,7 +54,10 @@ impl DuckDbFeatureStore {
         Ok(())
     }
 
-    pub(super) fn replace_selected_recall_rowids(conn: &Connection, rowids: &[i64]) -> Result<(), AppError> {
+    pub(super) fn replace_selected_recall_rowids(
+        conn: &Connection,
+        rowids: &[i64],
+    ) -> Result<(), AppError> {
         conn.execute(&format!("DELETE FROM {SELECTED_RECALL_ROWID_TABLE}"), [])?;
         let unique_rowids = rowids.iter().copied().collect::<BTreeSet<_>>();
         for chunk in unique_rowids
@@ -838,27 +841,42 @@ impl DuckDbFeatureStore {
             return Ok(());
         }
         Self::prepare_seed_value_table(conn, SEED_TOKEN_ID_TABLE, seed_token_ids)?;
-        let contract_key_by_lower = rows_by_contract
+        let preserve_case = chain.trim().eq_ignore_ascii_case("solana");
+        let contract_key_by_normalized = rows_by_contract
             .keys()
-            .map(|key| (key.to_lowercase(), key.clone()))
+            .map(|key| {
+                (
+                    if preserve_case {
+                        key.trim().to_string()
+                    } else {
+                        key.trim().to_lowercase()
+                    },
+                    key.clone(),
+                )
+            })
             .collect::<BTreeMap<_, _>>();
-        let contract_keys = contract_key_by_lower
+        let contract_keys = contract_key_by_normalized
             .keys()
             .cloned()
             .collect::<HashSet<_>>();
         Self::prepare_seed_value_table(conn, CANDIDATE_CONTRACT_TABLE, &contract_keys)?;
 
+        let contract_key_sql = if preserve_case {
+            "trim(f.contract_address)"
+        } else {
+            "lower(trim(f.contract_address))"
+        };
         let sql = format!(
             "
             SELECT contract_key, contract_address, token_id, token_uri, image_uri, name, symbol,
                    metadata_json
             FROM (
-                SELECT lower(f.contract_address) AS contract_key,
+                SELECT {contract_key_sql} AS contract_key,
                        f.contract_address, f.token_id, coalesce(f.token_uri, '') AS token_uri,
                        coalesce(f.image_uri, '') AS image_uri, coalesce(f.name, '') AS name,
                        coalesce(f.symbol, '') AS symbol, coalesce(f.metadata_json, '') AS metadata_json,
                        row_number() OVER (
-                           PARTITION BY lower(f.contract_address)
+                           PARTITION BY {contract_key_sql}
                            ORDER BY CASE
                                WHEN trim(coalesce(CAST(f.metadata_json AS VARCHAR), '')) LIKE '{{%'
                                     OR trim(coalesce(CAST(f.metadata_json AS VARCHAR), '')) LIKE '[%' THEN 0
@@ -869,7 +887,7 @@ impl DuckDbFeatureStore {
                        ) AS overlap_rank
                 FROM nft_features f
                 JOIN {CANDIDATE_CONTRACT_TABLE} c
-                  ON c.value = lower(f.contract_address)
+                  ON c.value = {contract_key_sql}
                 WHERE f.chain = ?
                   AND CAST(f.token_id AS VARCHAR) IN (SELECT value FROM {SEED_TOKEN_ID_TABLE})
                   AND length(trim(coalesce(CAST(f.metadata_json AS VARCHAR), ''))) <= {MAX_METADATA_BYTES_FOR_DEDUP}
@@ -894,7 +912,7 @@ impl DuckDbFeatureStore {
             let metadata_column = arrow_string_column(&batch, 7, "metadata_json")?;
             for row_index in 0..batch.num_rows() {
                 let Some(original_key) =
-                    contract_key_by_lower.get(contract_key_column.value(row_index))
+                    contract_key_by_normalized.get(contract_key_column.value(row_index))
                 else {
                     continue;
                 };
@@ -917,5 +935,4 @@ impl DuckDbFeatureStore {
         }
         Ok(())
     }
-
 }

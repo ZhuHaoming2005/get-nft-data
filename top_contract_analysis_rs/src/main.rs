@@ -4,20 +4,23 @@ use clap::Parser;
 #[cfg(feature = "export-snapshot")]
 use postgres::{Client, NoTls};
 use tokio::runtime::Runtime;
+use top_contract_analysis_rs::analysis::multichain::parse_alchemy_networks;
 use top_contract_analysis_rs::analysis::paper_stats::PaperStatsConfig;
+use top_contract_analysis_rs::analysis::read_seed_contracts;
 use top_contract_analysis_rs::analysis::{
-    analyze_seed_contract, read_seed_addresses, run_batch, AnalysisDeps, AnalyzeRequest,
-    BatchRequest, RealApi,
+    analyze_seed_contract, run_multichain_batch, AnalysisDeps, AnalyzeRequest, HeliusApiConfig,
+    MultiChainBatchRequest, RealApi,
 };
 use top_contract_analysis_rs::cli::{Command, TopContractAnalysisCli};
 #[cfg(feature = "export-snapshot")]
 use top_contract_analysis_rs::config::postgres_connection_config;
 use top_contract_analysis_rs::error::AppError;
+use top_contract_analysis_rs::models::Chain;
 use top_contract_analysis_rs::progress::{
     create_batch_progress_reporter, create_single_seed_progress_reporter,
     NoopBatchProgressReporter, NoopProgressReporter,
 };
-use top_contract_analysis_rs::reporting::{write_batch_paper_stats_outputs, write_default_outputs};
+use top_contract_analysis_rs::reporting::write_default_outputs;
 #[cfg(feature = "export-snapshot")]
 use top_contract_analysis_rs::store::{export_chain_snapshot_to_parquet, SnapshotBlockRange};
 use top_contract_analysis_rs::store::{DuckDbFeatureStore, DuckDbResourceOptions};
@@ -54,21 +57,32 @@ fn main() -> Result<(), AppError> {
     let command = TopContractAnalysisCli::parse();
     match command.command {
         Command::Analyze(args) => Runtime::new()?.block_on(async move {
-            let duckdb_threads =
-                resolve_resource_threads(args.physical_cores, args.duckdb_threads);
+            let analyze_chain = args.chain.parse::<Chain>()?;
+            let duckdb_threads = resolve_resource_threads(args.physical_cores, args.duckdb_threads);
             let duckdb_options =
                 DuckDbResourceOptions::from_cli(duckdb_threads, &args.duckdb_memory_limit)?;
             let feature_store =
                 DuckDbFeatureStore::new_with_options(&args.feature_db, duckdb_options)?;
             if !args.feature_parquet.trim().is_empty() {
-                feature_store
-                    .load_parquet_dataset_if_chain_missing(&args.chain, &args.feature_parquet)?;
+                feature_store.load_parquet_dataset_if_chain_missing(
+                    analyze_chain.as_str(),
+                    &args.feature_parquet,
+                )?;
             }
-            let api = RealApi::new(
+            let api = RealApi::new_with_helius(
                 args.timeout,
                 args.alchemy_api_max_concurrency,
                 args.other_api_max_concurrency,
                 args.other_api_rate_limit_refill_ms,
+                HeliusApiConfig {
+                    max_concurrency: args.helius_api_max_concurrency,
+                    rate_limit_refill_ms: args.helius_rate_limit_refill_ms,
+                    api_key: &args.helius_api_key,
+                    max_history_transactions_per_asset: args.max_history_transactions_per_asset,
+                    max_history_transactions_per_collection: args
+                        .max_history_transactions_per_collection,
+                    max_assets_per_collection: args.max_helius_assets_per_collection,
+                },
             )?;
             let deps = AnalysisDeps {
                 api: Arc::new(api),
@@ -78,8 +92,9 @@ fn main() -> Result<(), AppError> {
             };
             let payload = analyze_seed_contract(
                 AnalyzeRequest {
-                    chain: args.chain,
-                    seed_contract_address: args.seed_contract_address.to_lowercase(),
+                    chain: analyze_chain.to_string(),
+                    seed_contract_address: analyze_chain
+                        .normalize_identity(&args.seed_contract_address),
                     alchemy_api_key: args.alchemy_api_key,
                     alchemy_network: if args.alchemy_network.trim().is_empty() {
                         None
@@ -113,44 +128,55 @@ fn main() -> Result<(), AppError> {
             Ok(())
         }),
         Command::Batch(args) => Runtime::new()?.block_on(async move {
-            let seed_addresses = read_seed_addresses(std::path::Path::new(&args.seed_file))?;
-            let duckdb_threads =
-                resolve_resource_threads(args.physical_cores, args.duckdb_threads);
+            let seed_contracts = read_seed_contracts(std::path::Path::new(&args.seed_file))?;
+            let seed_labels = seed_contracts
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            let duckdb_threads = resolve_resource_threads(args.physical_cores, args.duckdb_threads);
             let duckdb_options =
                 DuckDbResourceOptions::from_cli(duckdb_threads, &args.duckdb_memory_limit)?;
             let feature_store =
                 DuckDbFeatureStore::new_with_options(&args.feature_db, duckdb_options)?;
-            if !args.feature_parquet.trim().is_empty() {
-                feature_store
-                    .load_parquet_dataset_if_chain_missing(&args.chain, &args.feature_parquet)?;
+            feature_store.load_parquet_datasets_auto(&args.feature_parquet)?;
+            for chain in Chain::ALL {
+                if !feature_store.has_chain_rows(chain.as_str())? {
+                    return Err(AppError::InvalidData(format!(
+                        "feature store does not contain required cross-chain snapshot for {chain}"
+                    )));
+                }
             }
-            let api = RealApi::new(
+            let api = RealApi::new_with_helius(
                 args.timeout,
                 args.alchemy_api_max_concurrency,
                 args.other_api_max_concurrency,
                 args.other_api_rate_limit_refill_ms,
+                HeliusApiConfig {
+                    max_concurrency: args.helius_api_max_concurrency,
+                    rate_limit_refill_ms: args.helius_rate_limit_refill_ms,
+                    api_key: &args.helius_api_key,
+                    max_history_transactions_per_asset: args.max_history_transactions_per_asset,
+                    max_history_transactions_per_collection: args
+                        .max_history_transactions_per_collection,
+                    max_assets_per_collection: args.max_helius_assets_per_collection,
+                },
             )?;
             let deps = AnalysisDeps {
                 api: Arc::new(api),
                 feature_store: Arc::new(feature_store),
                 progress: Arc::new(NoopProgressReporter),
                 batch_progress: create_batch_progress_reporter(
-                    &seed_addresses,
+                    &seed_labels,
                     args.seed_network_max_concurrency,
                 ),
             };
             let output_dir = std::path::PathBuf::from(&args.output_dir);
-            let payload = run_batch(
-                BatchRequest {
-                    chain: args.chain,
+            let payload = run_multichain_batch(
+                MultiChainBatchRequest {
                     seed_file: std::path::PathBuf::from(args.seed_file),
                     output_dir: output_dir.clone(),
                     alchemy_api_key: args.alchemy_api_key,
-                    alchemy_network: if args.alchemy_network.trim().is_empty() {
-                        None
-                    } else {
-                        Some(args.alchemy_network)
-                    },
+                    alchemy_networks: parse_alchemy_networks(&args.alchemy_network)?,
                     etherscan_api_key: args.etherscan_api_key,
                     opensea_api_key: args.opensea_api_key,
                     name_threshold: args.name_threshold,
@@ -176,7 +202,13 @@ fn main() -> Result<(), AppError> {
                 &deps,
             )
             .await?;
-            write_batch_paper_stats_outputs(&payload, &output_dir)?;
+            if !payload.failures.is_empty() {
+                return Err(AppError::InvalidData(format!(
+                    "multi-chain batch completed with {} failed work units; see {}",
+                    payload.failures.len(),
+                    output_dir.join("failures.json").display()
+                )));
+            }
             Ok(())
         }),
         #[cfg(feature = "export-snapshot")]

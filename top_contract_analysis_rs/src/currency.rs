@@ -13,6 +13,7 @@ pub const ETH_USD_PRICE_URL: &str =
 pub const COINBASE_ETH_USD_SPOT_URL: &str = "https://api.coinbase.com/v2/prices/ETH-USD/spot";
 pub const ALCHEMY_ETH_USD_PRICE_URL_PREFIX: &str = "https://api.g.alchemy.com/prices/v1";
 pub const FALLBACK_ETH_USD_RATE: f64 = 2200.0;
+const COINGECKO_SIMPLE_PRICE_URL: &str = "https://api.coingecko.com/api/v3/simple/price";
 const DEFAULT_ETH_USD_RATE_ATTEMPTS: usize = 2;
 const DEFAULT_ALCHEMY_ETH_USD_RATE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_PUBLIC_ETH_USD_RATE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -24,7 +25,9 @@ const STABLECOIN_SYMBOLS: &[&str] = &[
 ];
 
 pub fn is_native_eth_symbol(symbol: &str) -> bool {
-    symbol.trim().eq_ignore_ascii_case("ETH")
+    ["ETH", "POL", "MATIC", "SOL"]
+        .iter()
+        .any(|native| symbol.trim().eq_ignore_ascii_case(native))
 }
 
 pub fn is_eth_like_symbol(symbol: &str) -> bool {
@@ -68,6 +71,48 @@ pub fn to_normalized_amount(
     if is_stablecoin_symbol(symbol) {
         return NormalizedCurrencyAmount {
             eth: eth_usd_rate
+                .filter(|rate| rate.is_finite() && *rate > 0.0)
+                .map(|rate| amount / rate),
+            usd: Some(amount),
+        };
+    }
+    NormalizedCurrencyAmount::default()
+}
+
+pub fn is_chain_native_symbol(chain: &str, symbol: &str) -> bool {
+    let symbol = symbol.trim();
+    let candidates: &[&str] = match chain.trim().to_ascii_lowercase().as_str() {
+        "ethereum" | "base" => &["ETH", "WETH"],
+        // MATIC/WMATIC remain accepted for historical marketplace records.
+        "polygon" => &["POL", "WPOL", "MATIC", "WMATIC"],
+        "solana" => &["SOL", "WSOL"],
+        _ => &[],
+    };
+    candidates
+        .iter()
+        .any(|candidate| !candidate.is_empty() && symbol.eq_ignore_ascii_case(candidate))
+}
+
+pub fn to_chain_normalized_amount(
+    chain: &str,
+    amount: f64,
+    symbol: &str,
+    native_usd_rate: Option<f64>,
+) -> NormalizedCurrencyAmount {
+    if !amount.is_finite() || amount < 0.0 {
+        return NormalizedCurrencyAmount::default();
+    }
+    if is_chain_native_symbol(chain, symbol) {
+        return NormalizedCurrencyAmount {
+            eth: Some(amount),
+            usd: native_usd_rate
+                .filter(|rate| rate.is_finite() && *rate > 0.0)
+                .map(|rate| amount * rate),
+        };
+    }
+    if is_stablecoin_symbol(symbol) {
+        return NormalizedCurrencyAmount {
+            eth: native_usd_rate
                 .filter(|rate| rate.is_finite() && *rate > 0.0)
                 .map(|rate| amount / rate),
             usd: Some(amount),
@@ -340,6 +385,42 @@ pub async fn fetch_current_eth_usd_rate(client: &AsyncApiClient) -> Result<f64, 
     fetch_current_eth_usd_rate_from_urls(client, &sources).await
 }
 
+pub(crate) async fn fetch_native_usd_rate_from_url(
+    client: &AsyncApiClient,
+    url: &str,
+    coin_id: &str,
+) -> Result<f64, AppError> {
+    let payload: Value = client
+        .get_json_with_headers(url, price_request_headers()?)
+        .await?;
+    payload
+        .get(coin_id)
+        .and_then(|coin| coin.get("usd"))
+        .and_then(Value::as_f64)
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+        .ok_or_else(|| {
+            AppError::InvalidData(format!("invalid {coin_id}/USD price response: {payload}"))
+        })
+}
+
+pub(crate) async fn fetch_current_native_usd_rate(
+    client: &AsyncApiClient,
+    chain: &str,
+) -> Result<f64, AppError> {
+    let coin_id = match chain.trim().to_ascii_lowercase().as_str() {
+        "ethereum" | "base" => "ethereum",
+        "polygon" => "polygon-ecosystem-token",
+        "solana" => "solana",
+        other => {
+            return Err(AppError::InvalidData(format!(
+                "unsupported chain for native/USD rate: {other}"
+            )))
+        }
+    };
+    let url = format!("{COINGECKO_SIMPLE_PRICE_URL}?ids={coin_id}&vs_currencies=usd");
+    fetch_native_usd_rate_from_url(client, &url, coin_id).await
+}
+
 fn public_eth_usd_price_sources() -> [EthUsdPriceSource; 2] {
     [
         EthUsdPriceSource::coin_gecko(ETH_USD_PRICE_URL),
@@ -472,6 +553,32 @@ mod tests {
         assert_eq!(to_normalized_amount(150.0, "USDT", None).usd, Some(150.0));
     }
 
+    #[test]
+    fn converts_solana_and_polygon_native_symbols() {
+        assert_eq!(
+            to_chain_normalized_amount("solana", 2.0, "SOL", Some(100.0)),
+            NormalizedCurrencyAmount {
+                eth: Some(2.0),
+                usd: Some(200.0),
+            }
+        );
+        assert_eq!(
+            to_chain_normalized_amount("polygon", 3.0, "WPOL", Some(0.5)),
+            NormalizedCurrencyAmount {
+                eth: Some(3.0),
+                usd: Some(1.5),
+            }
+        );
+        assert_eq!(
+            to_chain_normalized_amount("polygon", 3.0, "WETH", Some(0.5)),
+            NormalizedCurrencyAmount::default()
+        );
+        assert_eq!(
+            to_chain_normalized_amount("solana", 2.0, "SOL", Some(100.0)).usd,
+            Some(200.0)
+        );
+    }
+
     #[tokio::test]
     async fn price_fetch_falls_back_to_coinbase_when_coingecko_is_forbidden() {
         let server = MockServer::start_async().await;
@@ -505,6 +612,30 @@ mod tests {
         .unwrap();
 
         assert_eq!(rate, 3123.45);
+    }
+
+    #[tokio::test]
+    async fn fetches_chain_native_usd_rate_from_coingecko_shape() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/native");
+                then.status(200).json_body_obj(&serde_json::json!({
+                    "solana": {"usd": 150.25}
+                }));
+            })
+            .await;
+        let client = AsyncApiClient::new(5, 2).unwrap();
+
+        let rate = fetch_native_usd_rate_from_url(
+            &client,
+            &format!("{}/native", server.base_url()),
+            "solana",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rate, 150.25);
     }
 
     #[tokio::test]

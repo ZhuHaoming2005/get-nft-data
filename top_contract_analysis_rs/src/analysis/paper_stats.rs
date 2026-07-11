@@ -6,16 +6,17 @@ use rayon::prelude::*;
 
 use crate::currency::FALLBACK_ETH_USD_RATE;
 use crate::models::{
-    DuplicateCandidate, DuplicateContractPayload, InfringingTokenRecord, MaliciousAddressPayload,
-    NftPropagationEdgePayload, NftPropagationPathPayload, PaperAddressClassificationPayload,
-    PaperAttackerCostDetailPayload, PaperAttackerCostPayload, PaperBehaviorSummaryRowPayload,
-    PaperContractBehaviorStatsPayload, PaperContractWashCycleSizePayload, PaperDataQualityPayload,
-    PaperDuplicateScaleRowPayload, PaperHonestBuyerRowPayload, PaperHonestLossPayload,
-    PaperInventoryConcentrationRowPayload, PaperLayeredTransferRowPayload,
-    PaperOutputInputRatioRowPayload, PaperOutputInputSummaryPayload, PaperPumpExitRowPayload,
-    PaperStarBehaviorRowPayload, PaperStatsPayload, PaperWashCycleSizeRowPayload,
-    PaperWashTradingRowPayload, SeedCollectionStatsPayload, ValueFlowEdgePayload,
-    VictimAcquisitionAddressPayload, ZERO_ADDRESS,
+    normalize_chain_identity, DuplicateCandidate, DuplicateContractPayload, InfringingTokenRecord,
+    MaliciousAddressPayload, NftPropagationEdgePayload, NftPropagationPathPayload,
+    PaperAddressClassificationPayload, PaperAttackerCostDetailPayload, PaperAttackerCostPayload,
+    PaperBehaviorSummaryRowPayload, PaperContractBehaviorStatsPayload,
+    PaperContractWashCycleSizePayload, PaperDataQualityPayload, PaperDuplicateScaleRowPayload,
+    PaperHonestBuyerRowPayload, PaperHonestLossPayload, PaperInventoryConcentrationRowPayload,
+    PaperLayeredTransferRowPayload, PaperOutputInputRatioRowPayload,
+    PaperOutputInputSummaryPayload, PaperPumpExitRowPayload, PaperStarBehaviorRowPayload,
+    PaperStatsPayload, PaperWashCycleSizeRowPayload, PaperWashTradingRowPayload,
+    SeedCollectionStatsPayload, ValueFlowEdgePayload, VictimAcquisitionAddressPayload,
+    ZERO_ADDRESS,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -473,6 +474,35 @@ pub fn merge_paper_stats<'a>(
         merged.data_quality.infringing_nft_count += stats.data_quality.infringing_nft_count;
         merged.data_quality.legit_duplicate_contract_count +=
             stats.data_quality.legit_duplicate_contract_count;
+        merged.data_quality.asset_listing_analyzed_count +=
+            stats.data_quality.asset_listing_analyzed_count;
+        merged.data_quality.asset_listing_total_count +=
+            stats.data_quality.asset_listing_total_count;
+        merged.data_quality.asset_listing_truncated_contract_count +=
+            stats.data_quality.asset_listing_truncated_contract_count;
+        merged.data_quality.history_failed_asset_count +=
+            stats.data_quality.history_failed_asset_count;
+        merged.data_quality.history_requested_asset_count +=
+            stats.data_quality.history_requested_asset_count;
+        merged.data_quality.history_successful_asset_count +=
+            stats.data_quality.history_successful_asset_count;
+        merged.data_quality.history_truncated_asset_count +=
+            stats.data_quality.history_truncated_asset_count;
+        merged.data_quality.history_fetched_transaction_count +=
+            stats.data_quality.history_fetched_transaction_count;
+        merged.data_quality.history_reported_transaction_count +=
+            stats.data_quality.history_reported_transaction_count;
+        merged.data_quality.history_failed_transaction_count +=
+            stats.data_quality.history_failed_transaction_count;
+        merged
+            .data_quality
+            .history_unattributed_sol_transaction_count += stats
+            .data_quality
+            .history_unattributed_sol_transaction_count;
+        merged.data_quality.history_unresolved_compressed_mint_count +=
+            stats.data_quality.history_unresolved_compressed_mint_count;
+        merged.data_quality.supplemental_provider_failure_count +=
+            stats.data_quality.supplemental_provider_failure_count;
     }
 
     merged.malicious_addresses = dedup_strings(merged.malicious_addresses);
@@ -623,6 +653,23 @@ pub fn merge_paper_stats<'a>(
         merged.data_quality.sale_price_parseable_count;
     merged.data_quality.sale_price_parseable_ratio_denominator =
         merged.data_quality.sale_price_total_count;
+    merged.data_quality.asset_listing_coverage_ratio = ratio_i64(
+        merged.data_quality.asset_listing_analyzed_count,
+        merged.data_quality.asset_listing_total_count,
+    );
+    merged.data_quality.history_asset_coverage_ratio = ratio_i64(
+        merged.data_quality.history_successful_asset_count,
+        merged.data_quality.history_requested_asset_count,
+    );
+    merged.data_quality.history_transaction_coverage_ratio =
+        (merged.data_quality.history_failed_asset_count == 0)
+            .then(|| {
+                ratio_i64(
+                    merged.data_quality.history_fetched_transaction_count,
+                    merged.data_quality.history_reported_transaction_count,
+                )
+            })
+            .flatten();
     if !duplicate_contract_denominator_keys.is_empty() {
         merged.data_quality.suspected_duplicate_contract_count =
             duplicate_contract_denominator_keys.len() as i64;
@@ -731,7 +778,7 @@ fn ratio_f64(numerator: f64, denominator: f64) -> Option<f64> {
 }
 
 fn normalized_address(address: &str) -> String {
-    address.trim().to_lowercase()
+    normalize_chain_identity(address)
 }
 
 fn normalized_contract(contract: &str) -> String {
@@ -1138,7 +1185,7 @@ fn build_attacker_cost(
             contract_address: contract.clone(),
             stage: attacker_cost_stage_label(stage).into(),
             channel: edge.channel.clone(),
-            tx_hash: edge.tx_hash.trim().to_lowercase(),
+            tx_hash: normalize_chain_identity(&edge.tx_hash),
             gas_payer_address: attacker_cost_payer(edge),
             gas_eth,
             gas_usd,
@@ -1333,7 +1380,7 @@ fn operator_output_edge_key(
             format!(
                 "tx:{}:{}:{}:{}:{:.6}",
                 edge.channel.trim().to_lowercase(),
-                tx_hash.to_lowercase(),
+                normalize_chain_identity(tx_hash),
                 normalized_address(&edge.from_address),
                 normalized_address(&edge.to_address),
                 output_usd
@@ -1506,7 +1553,7 @@ fn attacker_cost_edge_key(
     if !tx_hash.is_empty() {
         return (
             contract.to_string(),
-            format!("tx:{}", tx_hash.to_lowercase()),
+            format!("tx:{}", normalize_chain_identity(tx_hash)),
         );
     }
     let edge_id = edge.edge_id.trim();
@@ -1539,7 +1586,7 @@ fn attacker_cost_candidate_from_detail(
     let mut detail = detail.clone();
     detail.contract_address = contract.clone();
     detail.stage = attacker_cost_stage_label(stage).into();
-    detail.tx_hash = detail.tx_hash.trim().to_lowercase();
+    detail.tx_hash = normalize_chain_identity(&detail.tx_hash);
     detail.gas_payer_address = normalized_address(&detail.gas_payer_address);
     detail.gas_eth = detail.gas_eth.max(0.0);
     detail.gas_usd = detail.gas_usd.max(0.0);
@@ -1555,7 +1602,7 @@ fn attacker_cost_detail_key(
     if !detail.tx_hash.trim().is_empty() {
         return (
             contract.to_string(),
-            format!("tx:{}", detail.tx_hash.trim().to_lowercase()),
+            format!("tx:{}", normalize_chain_identity(&detail.tx_hash)),
         );
     }
     (
@@ -1564,7 +1611,7 @@ fn attacker_cost_detail_key(
             "detail:{}:{}:{}:{}:{}:{}:{:.18}:{:.6}",
             attacker_cost_stage_label(stage),
             detail.channel.trim().to_lowercase(),
-            detail.gas_payer_address.trim().to_lowercase(),
+            normalize_chain_identity(&detail.gas_payer_address),
             detail.from_role.trim().to_lowercase(),
             detail.to_role.trim().to_lowercase(),
             detail.evidence_type.trim().to_lowercase(),
@@ -3359,5 +3406,6 @@ fn build_data_quality(input: &PaperStatsInput<'_>) -> PaperDataQualityPayload {
         sale_price_parseable_ratio_numerator: sale_price_parseable_count,
         sale_price_parseable_ratio_denominator: sale_price_total_count,
         legit_duplicate_contract_count: input.legit_duplicates.len() as i64,
+        ..PaperDataQualityPayload::default()
     }
 }

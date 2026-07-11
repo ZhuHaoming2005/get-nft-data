@@ -12,6 +12,7 @@ use crate::models::{ContractMetadata, SeedNft};
 
 pub mod alchemy;
 pub mod etherscan;
+pub mod helius;
 pub mod opensea;
 
 pub const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
@@ -52,6 +53,7 @@ enum RequestLimitMode {
 pub struct AsyncApiClient {
     pub http: reqwest::Client,
     pub request_limit: Arc<Semaphore>,
+    in_flight_limit: Option<Arc<Semaphore>>,
     limit_mode: RequestLimitMode,
     retries: usize,
     retry_delay: Duration,
@@ -79,6 +81,7 @@ impl AsyncApiClient {
         Ok(Self {
             http,
             request_limit: Arc::new(Semaphore::new(max_concurrency.max(1))),
+            in_flight_limit: None,
             limit_mode: RequestLimitMode::InFlight,
             retries: retries.max(1),
             retry_delay,
@@ -111,10 +114,28 @@ impl AsyncApiClient {
         Ok(Self {
             http,
             request_limit,
+            in_flight_limit: None,
             limit_mode: RequestLimitMode::Rate,
             retries: retries.max(1),
             retry_delay,
         })
+    }
+
+    pub fn new_rate_limited_with_in_flight_limit(
+        timeout_seconds: u64,
+        max_concurrency: usize,
+        max_burst: usize,
+        refill_interval: Duration,
+    ) -> Result<Self, AppError> {
+        let mut client = Self::new_rate_limited_with_retry_policy(
+            timeout_seconds,
+            max_burst,
+            refill_interval,
+            DEFAULT_API_RETRIES,
+            Duration::from_millis(DEFAULT_API_RETRY_DELAY_MS),
+        )?;
+        client.in_flight_limit = Some(Arc::new(Semaphore::new(max_concurrency.max(1))));
+        Ok(client)
     }
 
     async fn request_json<T, B>(
@@ -150,6 +171,16 @@ impl AsyncApiClient {
                         None
                     }
                 };
+                let _in_flight_permit = match &self.in_flight_limit {
+                    Some(limit) => Some(
+                        limit
+                            .clone()
+                            .acquire_owned()
+                            .await
+                            .map_err(|err| AppError::Http(err.to_string()))?,
+                    ),
+                    None => None,
+                };
                 let mut builder = self.http.request(method.clone(), url);
                 if let Some(headers) = headers.clone() {
                     builder = builder.headers(headers);
@@ -161,7 +192,10 @@ impl AsyncApiClient {
                     Ok(response) => {
                         let status = response.status();
                         if status.is_success() {
-                            return Ok(response.json::<T>().await?);
+                            return response
+                                .json::<T>()
+                                .await
+                                .map_err(|err| AppError::Http(err.without_url().to_string()));
                         }
                         let retry_after = retry_after_delay(response.headers());
                         let body = response.text().await.unwrap_or_else(|err| {
@@ -175,8 +209,9 @@ impl AsyncApiClient {
                             "unexpected status"
                         };
                         let message = format!(
-                            "HTTP status {status_kind} ({status}) for url ({url}); response body: {}",
-                            response_body_excerpt(&body)
+                            "HTTP status {status_kind} ({status}) for url ({}); response body: {}",
+                            redact_sensitive_url(url),
+                            response_body_excerpt(&redact_sensitive_text(&body, url))
                         );
                         if should_retry_status(status) {
                             (message, retry_after)
@@ -184,7 +219,7 @@ impl AsyncApiClient {
                             return Err(AppError::Http(message));
                         }
                     }
-                    Err(err) => (err.to_string(), None),
+                    Err(err) => (err.without_url().to_string(), None),
                 }
             };
             last_error = Some(attempt_error);
@@ -320,6 +355,85 @@ fn response_body_excerpt(body: &str) -> String {
     }
 }
 
+fn redact_sensitive_url(value: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(value) else {
+        return "<redacted-url>".to_string();
+    };
+    if url
+        .host_str()
+        .is_some_and(|host| host.ends_with(".g.alchemy.com"))
+    {
+        let segments = url
+            .path_segments()
+            .map(|segments| segments.map(str::to_string).collect::<Vec<_>>())
+            .unwrap_or_default();
+        if segments.len() >= 2
+            && matches!(segments[segments.len() - 2].as_str(), "v1" | "v2" | "v3")
+        {
+            let mut redacted = segments;
+            if let Some(last) = redacted.last_mut() {
+                *last = "REDACTED".to_string();
+            }
+            url.set_path(&redacted.join("/"));
+        }
+    }
+    let pairs = url
+        .query_pairs()
+        .map(|(key, value)| {
+            let sensitive = matches!(
+                key.to_ascii_lowercase().as_str(),
+                "api-key" | "apikey" | "api_key" | "key" | "token"
+            );
+            (
+                key.into_owned(),
+                if sensitive {
+                    "REDACTED".into()
+                } else {
+                    value.into_owned()
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    if !pairs.is_empty() {
+        url.query_pairs_mut().clear().extend_pairs(pairs);
+    }
+    url.to_string()
+}
+
+fn redact_sensitive_text(value: &str, request_url: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(request_url) else {
+        return value.replace(request_url, "<redacted-url>");
+    };
+    let mut secrets = url
+        .query_pairs()
+        .filter(|(key, _)| {
+            matches!(
+                key.to_ascii_lowercase().as_str(),
+                "api-key" | "apikey" | "api_key" | "key" | "token"
+            )
+        })
+        .map(|(_, secret)| secret.into_owned())
+        .collect::<Vec<_>>();
+    if url
+        .host_str()
+        .is_some_and(|host| host.ends_with(".g.alchemy.com"))
+    {
+        let segments = url
+            .path_segments()
+            .map(|segments| segments.collect::<Vec<_>>())
+            .unwrap_or_default();
+        if segments.len() >= 2 && matches!(segments[segments.len() - 2], "v1" | "v2" | "v3") {
+            secrets.push(segments[segments.len() - 1].to_string());
+        }
+    }
+    secrets
+        .into_iter()
+        .filter(|secret| !secret.is_empty())
+        .fold(value.to_string(), |redacted, secret| {
+            redacted.replace(&secret, "REDACTED")
+        })
+}
+
 pub use alchemy::{
     fetch_alchemy_contract_collection_slug, fetch_contract_metadata, fetch_contract_owners,
     fetch_contract_total_supply, fetch_contract_transfers,
@@ -330,6 +444,13 @@ pub use alchemy::{
     is_open_license_payload,
 };
 pub use etherscan::fetch_etherscan_contract_transfers;
+pub use helius::{
+    fetch_helius_asset_transfers, fetch_helius_assets_history,
+    fetch_helius_assets_history_with_budget, fetch_helius_assets_transfers,
+    fetch_helius_block_details, fetch_helius_collection_assets, fetch_helius_collection_snapshot,
+    fetch_helius_collection_transfers, fetch_helius_transaction_details, HeliusCollectionAsset,
+    HeliusCollectionHistory, HeliusCollectionSnapshot, HeliusTransactionDetails,
+};
 pub use opensea::{
     fetch_contract_sales, fetch_contract_sales_with_clients,
     fetch_opensea_account_holds_contract_nft, fetch_opensea_contract_collection_slug,
@@ -556,5 +677,29 @@ pub async fn fetch_account_holds_contract_alchemy_first(
             )
             .await
         }
+    }
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::{redact_sensitive_text, redact_sensitive_url};
+
+    #[test]
+    fn http_error_url_redacts_api_keys_in_query_and_path() {
+        assert_eq!(
+            redact_sensitive_url("https://mainnet.helius-rpc.com/?api-key=secret-value"),
+            "https://mainnet.helius-rpc.com/?api-key=REDACTED"
+        );
+        assert_eq!(
+            redact_sensitive_url("https://eth-mainnet.g.alchemy.com/v2/secret-value"),
+            "https://eth-mainnet.g.alchemy.com/v2/REDACTED"
+        );
+        assert_eq!(
+            redact_sensitive_text(
+                "proxy echoed https://mainnet.helius-rpc.com/?api-key=secret-value",
+                "https://mainnet.helius-rpc.com/?api-key=secret-value",
+            ),
+            "proxy echoed https://mainnet.helius-rpc.com/?api-key=REDACTED"
+        );
     }
 }

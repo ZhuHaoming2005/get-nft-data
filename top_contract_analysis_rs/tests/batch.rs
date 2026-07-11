@@ -1481,7 +1481,11 @@ fn batch_serializes_paper_stats_index_shape() {
     let object = serialized.as_object().unwrap();
     let keys: BTreeSet<_> = object.keys().map(String::as_str).collect();
 
-    assert_eq!(keys, BTreeSet::from(["report_type", "paper_stats"]));
+    assert_eq!(
+        keys,
+        BTreeSet::from(["schema_version", "report_type", "paper_stats"])
+    );
+    assert_eq!(serialized["schema_version"], 2);
     assert_eq!(serialized["report_type"], "batch_summary");
     assert!(!object.contains_key("seed_reports"));
     assert!(!object.contains_key("batch_summary"));

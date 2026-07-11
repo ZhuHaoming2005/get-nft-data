@@ -733,6 +733,8 @@ impl AnalyzeApi for AttackerCostGasApi {
             contract_address: String::new(),
             gas_used: 21_000,
             effective_gas_price_wei: 1_000_000_000,
+            fee_native: None,
+            fee_usd: None,
         })
     }
 
@@ -755,6 +757,8 @@ impl AnalyzeApi for AttackerCostGasApi {
                 contract_address: "0xdup".into(),
                 gas_used: 42_000,
                 effective_gas_price_wei: 1_000_000_000,
+                fee_native: None,
+                fee_usd: None,
             },
         )]))
     }

@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::models::{
-    AddressAttributionPayload, AddressEvidencePayload, DuplicateCandidate, HonestAddressPayload,
-    InfringingTokenRecord, MaliciousAddressPayload, NftSaleRecord, OwnerBalance,
-    SecondarySaleVictimAddressPayload, TransferRecord, ValueFlowEdgePayload,
-    VictimAcquisitionAddressPayload, ZERO_ADDRESS,
+    normalize_chain_identity, AddressAttributionPayload, AddressEvidencePayload,
+    DuplicateCandidate, HonestAddressPayload, InfringingTokenRecord, MaliciousAddressPayload,
+    NftSaleRecord, OwnerBalance, SecondarySaleVictimAddressPayload, TransferRecord,
+    ValueFlowEdgePayload, VictimAcquisitionAddressPayload, ZERO_ADDRESS,
 };
 
 pub(crate) struct PreparedContractActivity<'a> {
@@ -53,6 +53,10 @@ fn sale_has_positive_value(sale: &NftSaleRecord) -> bool {
     sale.price_eth.unwrap_or_default() > 0.0 || sale.price_usd.unwrap_or_default() > 0.0
 }
 
+fn identities_equal(left: &str, right: &str) -> bool {
+    normalize_chain_identity(left) == normalize_chain_identity(right)
+}
+
 fn value_flow_has_positive_value(edge: &ValueFlowEdgePayload) -> bool {
     edge.value_eth.unwrap_or_default() > 0.0 || edge.value_usd.unwrap_or_default() > 0.0
 }
@@ -95,10 +99,10 @@ struct WashCycleTransferScope {
 impl WashCycleTransferScope {
     fn from_transfer(transfer: &TransferRecord) -> Self {
         Self {
-            token_id: transfer.token_id.trim().to_lowercase(),
-            tx_hash: transfer.tx_hash.trim().to_lowercase(),
-            from_address: transfer.from_address.trim().to_lowercase(),
-            to_address: transfer.to_address.trim().to_lowercase(),
+            token_id: normalize_chain_identity(&transfer.token_id),
+            tx_hash: normalize_chain_identity(&transfer.tx_hash),
+            from_address: normalize_chain_identity(&transfer.from_address),
+            to_address: normalize_chain_identity(&transfer.to_address),
         }
     }
 }
@@ -199,9 +203,9 @@ fn nft_transfer_key(
 ) -> (String, String, String, String) {
     (
         token_id.trim().to_string(),
-        tx_hash.trim().to_lowercase(),
-        from_address.trim().to_lowercase(),
-        to_address.trim().to_lowercase(),
+        normalize_chain_identity(tx_hash),
+        normalize_chain_identity(from_address),
+        normalize_chain_identity(to_address),
     )
 }
 
@@ -209,7 +213,7 @@ fn value_flow_scope_matches(
     edge: &ValueFlowEdgePayload,
     wash_cycle_scope: &WashCycleScope,
 ) -> bool {
-    let tx_hash = edge.tx_hash.trim().to_lowercase();
+    let tx_hash = normalize_chain_identity(&edge.tx_hash);
     if !wash_cycle_scope.tx_hashes.contains(&tx_hash) {
         return false;
     }
@@ -218,24 +222,24 @@ fn value_flow_scope_matches(
         .any(|token_id| wash_cycle_scope.token_ids.contains(token_id))
         && (wash_cycle_scope
             .participants
-            .contains(&edge.from_address.trim().to_lowercase())
+            .contains(&normalize_chain_identity(&edge.from_address))
             || wash_cycle_scope
                 .participants
-                .contains(&edge.to_address.trim().to_lowercase()))
+                .contains(&normalize_chain_identity(&edge.to_address)))
 }
 
 fn sale_scope_matches(sale: &NftSaleRecord, wash_cycle_scope: &WashCycleScope) -> bool {
-    let tx_hash = sale.tx_hash.trim().to_lowercase();
+    let tx_hash = normalize_chain_identity(&sale.tx_hash);
     wash_cycle_scope.tx_hashes.contains(&tx_hash)
         && wash_cycle_scope
             .token_ids
-            .contains(&sale.token_id.trim().to_lowercase())
+            .contains(&normalize_chain_identity(&sale.token_id))
         && (wash_cycle_scope
             .participants
-            .contains(&sale.seller_address.trim().to_lowercase())
+            .contains(&normalize_chain_identity(&sale.seller_address))
             || wash_cycle_scope
                 .participants
-                .contains(&sale.buyer_address.trim().to_lowercase()))
+                .contains(&normalize_chain_identity(&sale.buyer_address)))
 }
 
 fn wash_cycle_value_for_address(
@@ -244,7 +248,7 @@ fn wash_cycle_value_for_address(
     activity: &PreparedContractActivity<'_>,
     value_flow_edges: &[ValueFlowEdgePayload],
 ) -> (f64, f64, bool) {
-    let address = address.trim().to_lowercase();
+    let address = normalize_chain_identity(address);
     let mut value_eth = 0.0;
     let mut value_usd = 0.0;
     let mut has_usd = false;
@@ -252,8 +256,8 @@ fn wash_cycle_value_for_address(
     for sale in &activity.sorted_sales {
         if !sale_has_positive_value(sale)
             || !sale_scope_matches(sale, wash_cycle_scope)
-            || (!sale.seller_address.eq_ignore_ascii_case(&address)
-                && !sale.buyer_address.eq_ignore_ascii_case(&address))
+            || (!identities_equal(&sale.seller_address, &address)
+                && !identities_equal(&sale.buyer_address, &address))
         {
             continue;
         }
@@ -277,16 +281,16 @@ fn wash_cycle_value_for_address(
     for edge in value_flow_edges {
         if !value_flow_has_positive_value(edge)
             || !value_flow_scope_matches(edge, wash_cycle_scope)
-            || (!edge.from_address.eq_ignore_ascii_case(&address)
-                && !edge.to_address.eq_ignore_ascii_case(&address))
+            || (!identities_equal(&edge.from_address, &address)
+                && !identities_equal(&edge.to_address, &address))
         {
             continue;
         }
         let key = (
-            edge.tx_hash.trim().to_lowercase(),
-            edge.token_id.trim().to_lowercase(),
-            edge.from_address.trim().to_lowercase(),
-            edge.to_address.trim().to_lowercase(),
+            normalize_chain_identity(&edge.tx_hash),
+            normalize_chain_identity(&edge.token_id),
+            normalize_chain_identity(&edge.from_address),
+            normalize_chain_identity(&edge.to_address),
             edge.channel.trim().to_lowercase(),
         );
         if !seen_edges.insert(key) {
@@ -313,8 +317,8 @@ fn value_flow_operator_address(
 ) -> Option<String> {
     let address = address.trim();
     if address.is_empty()
-        || address.eq_ignore_ascii_case(ZERO_ADDRESS)
-        || address.eq_ignore_ascii_case(contract_address)
+        || identities_equal(address, ZERO_ADDRESS)
+        || identities_equal(address, contract_address)
         || is_service_value_flow_role(role)
     {
         None
@@ -547,7 +551,7 @@ pub(crate) fn build_malicious_address_records_from_activity(
         .iter()
         .filter(|edge| {
             edge.channel == "mint_payment"
-                && edge.contract_address.eq_ignore_ascii_case(contract_address)
+                && identities_equal(&edge.contract_address, contract_address)
                 && value_flow_has_positive_value(edge)
         })
         .map(|edge| edge.from_address.clone())
@@ -685,7 +689,7 @@ pub(crate) fn build_malicious_address_records_from_activity(
     let mut withdrawal_edge_counts: HashMap<String, i64> = HashMap::new();
     let mut cashout_edge_counts: HashMap<String, i64> = HashMap::new();
     for edge in mint_payment_edges {
-        if !edge.contract_address.eq_ignore_ascii_case(contract_address)
+        if !identities_equal(&edge.contract_address, contract_address)
             || !value_flow_has_positive_value(edge)
         {
             continue;
@@ -831,7 +835,7 @@ fn attribution_entry<'a>(
     rows: &'a mut BTreeMap<String, AttributionAccumulator>,
     address: &str,
 ) -> Option<&'a mut AttributionAccumulator> {
-    let address = address.trim().to_lowercase();
+    let address = normalize_chain_identity(address);
     if address.is_empty() || address == ZERO_ADDRESS {
         return None;
     }
@@ -999,7 +1003,7 @@ pub fn build_address_attribution_records(
 
     for edge in mint_payment_edges {
         if edge.channel != "mint_payment"
-            || !edge.contract_address.eq_ignore_ascii_case(contract_address)
+            || !identities_equal(&edge.contract_address, contract_address)
             || edge.from_address.is_empty()
             || (edge.value_eth.unwrap_or(0.0) <= 0.0 && edge.value_usd.unwrap_or(0.0) <= 0.0)
         {
@@ -1014,7 +1018,7 @@ pub fn build_address_attribution_records(
                     | "contract_admin"
                     | "proxy_admin"
                     | "operator_wallet"
-            ) || edge.to_address.eq_ignore_ascii_case(contract_address);
+            ) || identities_equal(&edge.to_address, contract_address);
         if !paid_to_controlled_recipient {
             continue;
         }
@@ -1138,13 +1142,13 @@ pub fn build_address_attribution_records(
     }
 
     for sale in sales {
-        if !sale.contract_address.eq_ignore_ascii_case(contract_address) {
+        if !identities_equal(&sale.contract_address, contract_address) {
             continue;
         }
         if !relevant_token_ids.is_empty() && !relevant_token_ids.contains(&sale.token_id) {
             continue;
         }
-        let seller_key = sale.seller_address.trim().to_lowercase();
+        let seller_key = normalize_chain_identity(&sale.seller_address);
         let seller_context = rows.get(&seller_key).map(|entry| {
             if entry.operator_score > 0.0 {
                 Some(EvidenceBucket::Operator)
@@ -1309,8 +1313,8 @@ pub fn add_acquisition_exposure_attribution_evidence(
         .map(|item| {
             (
                 (
-                    item.contract_address.to_lowercase(),
-                    item.address.to_lowercase(),
+                    normalize_chain_identity(&item.contract_address),
+                    normalize_chain_identity(&item.address),
                 ),
                 item,
             )
@@ -1326,8 +1330,8 @@ pub fn add_acquisition_exposure_attribution_evidence(
             continue;
         }
         for contract_address in &acquisition.contract_addresses {
-            let contract_address = contract_address.trim().to_lowercase();
-            let address = acquisition.address.trim().to_lowercase();
+            let contract_address = normalize_chain_identity(contract_address);
+            let address = normalize_chain_identity(&acquisition.address);
             if contract_address.is_empty() || address.is_empty() || address == ZERO_ADDRESS {
                 continue;
             }
@@ -1412,14 +1416,14 @@ pub(crate) fn build_secondary_sale_victim_address_records_excluding_malicious_fr
 ) -> Vec<SecondarySaleVictimAddressPayload> {
     let malicious_buyers: HashSet<String> = malicious_addresses
         .iter()
-        .map(|item| item.address.trim().to_lowercase())
+        .map(|item| normalize_chain_identity(&item.address))
         .filter(|value| !value.is_empty())
         .collect();
     let mut grouped: BTreeMap<String, SecondarySaleVictimAddressPayload> = BTreeMap::new();
     let mut last_buy_key: HashMap<String, (i64, i64, i64, String)> = HashMap::new();
 
     for sale in &activity.sorted_sales {
-        let buyer_address = sale.buyer_address.trim().to_lowercase();
+        let buyer_address = normalize_chain_identity(&sale.buyer_address);
         if buyer_address.is_empty() || malicious_buyers.contains(&buyer_address) {
             continue;
         }
@@ -1627,7 +1631,7 @@ pub(crate) fn build_honest_address_records_from_activity(
     > = HashMap::new();
     for edge in mint_payment_edges {
         if edge.channel != "mint_payment"
-            || !edge.contract_address.eq_ignore_ascii_case(contract_address)
+            || !identities_equal(&edge.contract_address, contract_address)
             || !value_flow_has_positive_value(edge)
         {
             continue;

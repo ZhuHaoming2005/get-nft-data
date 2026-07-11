@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Fetch one global OpenSea Top collection ranking as chain/address pairs."""
+"""Fetch an independent OpenSea Top-100 contract ranking for each chain."""
 
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import io
 import json
 import os
+import shutil
 import re
+import secrets
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -22,6 +26,8 @@ DEFAULT_TOP_COLLECTIONS_URL = "https://api.opensea.io/api/v2/collections/top"
 DEFAULT_SORT_BY = "thirty_days_volume"
 DEFAULT_CHAINS = ("ethereum", "base", "polygon", "solana")
 EVM_CHAINS = frozenset({"ethereum", "base", "polygon"})
+OPENSEA_CHAIN_NAMES = {"polygon": "matic"}
+INTERNAL_CHAIN_NAMES = {"matic": "polygon"}
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 BASE58_INDEX = {char: index for index, char in enumerate(BASE58_ALPHABET)}
@@ -37,12 +43,15 @@ class ContractPair:
 
 
 @dataclass(frozen=True)
-class RankedCollection:
-    global_rank: int
+class RankedContract:
+    chain: str
+    address: str
+    chain_contract_rank: int
+    collection_rank: int
     slug: str
     name: str | None
     ranking_value: Any
-    contract_pairs: tuple[ContractPair, ...]
+    raw_chain: str | None = None
 
 
 def parse_json_response(raw: bytes) -> dict[str, Any]:
@@ -72,7 +81,7 @@ def contract_pair_from_value(
     if not isinstance(raw_chain_value, str):
         return None
     raw_chain_value = raw_chain_value.strip()
-    chain = raw_chain_value.lower()
+    chain = INTERNAL_CHAIN_NAMES.get(raw_chain_value.lower(), raw_chain_value.lower())
     if chain not in selected_chains:
         return None
     for key in ("address", "contract_address", "contractAddress"):
@@ -81,7 +90,7 @@ def contract_pair_from_value(
             return ContractPair(
                 chain=chain,
                 address=address,
-                raw_chain=raw_chain_value if raw_chain_value != chain else None,
+                raw_chain=raw_chain_value,
             )
     return None
 
@@ -156,7 +165,7 @@ def build_top_collections_url(
     cursor: str | None,
 ) -> str:
     query: dict[str, str | int] = {
-        "chains": ",".join(chains),
+        "chains": ",".join(OPENSEA_CHAIN_NAMES.get(chain, chain) for chain in chains),
         "limit": page_size,
         "sort_by": DEFAULT_SORT_BY,
     }
@@ -178,141 +187,205 @@ def fetch_bytes(url: str, api_key: str, timeout: float) -> bytes:
         return response.read()
 
 
-def collect_ranked_collections(
+def collect_ranked_contracts_for_chain(
     *,
     api_key: str,
-    chains: list[str],
+    chain: str,
     limit: int,
     page_size: int,
     top_collections_url: str,
     timeout: float,
     fetcher=fetch_bytes,
-) -> list[RankedCollection]:
-    ranked: list[RankedCollection] = []
-    selected_chains = set(chains)
+) -> list[RankedContract]:
+    ranked: list[RankedContract] = []
+    seen_addresses: set[str] = set()
     cursor: str | None = None
     seen_cursors: set[str] = set()
+    collection_rank = 0
 
     while len(ranked) < limit:
         url = build_top_collections_url(
             top_collections_url,
-            chains=chains,
-            page_size=min(page_size, limit - len(ranked)),
+            chains=[chain],
+            page_size=page_size,
             cursor=cursor,
         )
         payload = parse_json_response(
             fetcher(url, api_key=api_key, timeout=timeout)
         )
         for collection in collection_items(payload):
-            pairs = collection_contract_pairs(collection, selected_chains)
-            if not pairs:
-                continue
-            ranked.append(
-                RankedCollection(
-                    global_rank=len(ranked) + 1,
-                    slug=str(collection.get("collection") or ""),
-                    name=(
-                        str(collection["name"])
-                        if collection.get("name") is not None
-                        else None
-                    ),
-                    ranking_value=collection_ranking_value(collection),
-                    contract_pairs=pairs,
+            collection_rank += 1
+            for pair in collection_contract_pairs(collection, {chain}):
+                if pair.address in seen_addresses:
+                    continue
+                seen_addresses.add(pair.address)
+                ranked.append(
+                    RankedContract(
+                        chain=chain,
+                        address=pair.address,
+                        chain_contract_rank=len(ranked) + 1,
+                        collection_rank=collection_rank,
+                        slug=str(collection.get("collection") or ""),
+                        name=(
+                            str(collection["name"])
+                            if collection.get("name") is not None
+                            else None
+                        ),
+                        ranking_value=collection_ranking_value(collection),
+                        raw_chain=pair.raw_chain,
+                    )
                 )
-            )
+                if len(ranked) == limit:
+                    break
             if len(ranked) == limit:
                 break
 
-        next_value = next_cursor(payload)
         if len(ranked) == limit:
             break
+        next_value = next_cursor(payload)
         if not next_value:
             break
         if next_value in seen_cursors:
-            raise ValueError(f"repeated pagination cursor: {next_value}")
+            raise ValueError(f"repeated pagination cursor for {chain}: {next_value}")
         seen_cursors.add(next_value)
         cursor = next_value
 
     if len(ranked) != limit:
         raise ValueError(
-            f"requested {limit} analyzable collections but collected {len(ranked)}"
+            f"requested {limit} contract addresses for {chain} but collected "
+            f"{len(ranked)}"
         )
     return ranked
 
 
-def manifest_pairs(ranked: list[RankedCollection]) -> list[ContractPair]:
-    pairs: list[ContractPair] = []
-    seen: set[ContractPair] = set()
-    for collection in ranked:
-        for pair in collection.contract_pairs:
-            if pair not in seen:
-                seen.add(pair)
-                pairs.append(pair)
-    return pairs
-
-
-def render_manifest_csv(ranked: list[RankedCollection]) -> str:
+def render_contract_manifest_csv(ranked: list[RankedContract]) -> str:
     handle = io.StringIO(newline="")
     writer = csv.writer(handle, lineterminator="\n")
     writer.writerow(["chain", "address"])
-    writer.writerows(
-        (pair.chain, pair.address) for pair in manifest_pairs(ranked)
-    )
+    writer.writerows((item.chain, item.address) for item in ranked)
     return handle.getvalue()
 
 
-def audit_payload(
-    ranked: list[RankedCollection],
+def contract_audit_payload(
+    ranked: list[RankedContract],
     chains: list[str],
-    requested_limit: int,
+    requested_limit_per_chain: int,
+    *,
+    generation_id: str = "",
+    contracts_csv_sha256: str = "",
 ) -> dict[str, Any]:
-    collections = []
+    contracts = []
     for item in ranked:
-        contract_pairs = []
-        for pair in item.contract_pairs:
-            value = {"chain": pair.chain, "address": pair.address}
-            if pair.raw_chain is not None:
-                value["raw_chain"] = pair.raw_chain
-            contract_pairs.append(value)
-        collections.append(
-            {
-                "global_rank": item.global_rank,
-                "slug": item.slug,
-                "name": item.name,
-                "ranking_criterion": DEFAULT_SORT_BY,
-                "ranking_value": item.ranking_value,
-                "contract_pairs": contract_pairs,
-            }
-        )
-    return {
+        value = {
+            "chain": item.chain,
+            "address": item.address,
+            "chain_contract_rank": item.chain_contract_rank,
+            "collection_rank": item.collection_rank,
+            "slug": item.slug,
+            "name": item.name,
+            "ranking_criterion": DEFAULT_SORT_BY,
+            "ranking_value": item.ranking_value,
+        }
+        value["raw_chain"] = item.raw_chain or item.chain
+        contracts.append(value)
+    payload = {
         "ranking_criterion": DEFAULT_SORT_BY,
         "chains": chains,
-        "requested_collection_limit": requested_limit,
-        "collections": collections,
+        "requested_contract_limit_per_chain": requested_limit_per_chain,
+        "contracts": contracts,
     }
+    if generation_id:
+        payload["generation_id"] = generation_id
+    if contracts_csv_sha256:
+        payload["contracts_csv_sha256"] = contracts_csv_sha256
+    return payload
 
 
-def write_rank_outputs(
+@contextmanager
+def exclusive_output_lock(lock_path: Path):
+    """Serialize writers; readers can validate the committed CSV hash in the audit JSON."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def write_contract_rank_outputs(
     *,
     csv_path: Path,
     audit_path: Path,
-    ranked: list[RankedCollection],
+    ranked: list[RankedContract],
     chains: list[str],
-    requested_limit: int,
+    requested_limit_per_chain: int,
+) -> None:
+    lock_path = csv_path.with_name(f".{csv_path.name}.output.lock")
+    with exclusive_output_lock(lock_path):
+        _write_contract_rank_outputs_locked(
+            csv_path=csv_path,
+            audit_path=audit_path,
+            ranked=ranked,
+            chains=chains,
+            requested_limit_per_chain=requested_limit_per_chain,
+        )
+
+
+def _write_contract_rank_outputs_locked(
+    *,
+    csv_path: Path,
+    audit_path: Path,
+    ranked: list[RankedContract],
+    chains: list[str],
+    requested_limit_per_chain: int,
 ) -> None:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     audit_path.parent.mkdir(parents=True, exist_ok=True)
+    recover_output_transaction(csv_path, audit_path)
     csv_tmp = csv_path.with_name(f".{csv_path.name}.{os.getpid()}.tmp")
     audit_tmp = audit_path.with_name(f".{audit_path.name}.{os.getpid()}.tmp")
+    csv_backup = csv_path.with_name(f".{csv_path.name}.txn.bak")
+    audit_backup = audit_path.with_name(f".{audit_path.name}.txn.bak")
+    journal = csv_path.with_name(f".{csv_path.name}.output-transaction.json")
+    journal_tmp = journal.with_name(f".{journal.name}.{os.getpid()}.tmp")
+    csv_existed = csv_path.exists()
+    audit_existed = audit_path.exists()
     try:
+        csv_contents = render_contract_manifest_csv(ranked)
+        generation_id = secrets.token_hex(16)
         csv_tmp.write_text(
-            render_manifest_csv(ranked),
+            csv_contents,
             encoding="utf-8",
             newline="\n",
         )
         audit_tmp.write_text(
             json.dumps(
-                audit_payload(ranked, chains, requested_limit),
+                contract_audit_payload(
+                    ranked,
+                    chains,
+                    requested_limit_per_chain,
+                    generation_id=generation_id,
+                    contracts_csv_sha256=hashlib.sha256(
+                        csv_contents.encode("utf-8")
+                    ).hexdigest(),
+                ),
                 ensure_ascii=False,
                 indent=2,
             )
@@ -320,18 +393,88 @@ def write_rank_outputs(
             encoding="utf-8",
             newline="\n",
         )
-        os.replace(csv_tmp, csv_path)
-        os.replace(audit_tmp, audit_path)
+        if csv_existed:
+            shutil.copy2(csv_path, csv_backup)
+        if audit_existed:
+            shutil.copy2(audit_path, audit_backup)
+        journal_tmp.write_text(
+            json.dumps(
+                {
+                    "csv_path": str(csv_path.resolve()),
+                    "audit_path": str(audit_path.resolve()),
+                    "csv_backup": str(csv_backup.resolve()),
+                    "audit_backup": str(audit_backup.resolve()),
+                    "csv_existed": csv_existed,
+                    "audit_existed": audit_existed,
+                }
+            ),
+            encoding="utf-8",
+        )
+        os.replace(journal_tmp, journal)
+        try:
+            os.replace(csv_tmp, csv_path)
+            os.replace(audit_tmp, audit_path)
+            validate_output_pair(csv_path, audit_path)
+        except BaseException:
+            if csv_existed and csv_backup.exists():
+                os.replace(csv_backup, csv_path)
+            elif not csv_existed:
+                csv_path.unlink(missing_ok=True)
+            if audit_existed and audit_backup.exists():
+                os.replace(audit_backup, audit_path)
+            elif not audit_existed:
+                audit_path.unlink(missing_ok=True)
+            journal.unlink(missing_ok=True)
+            raise
+        journal.unlink(missing_ok=True)
     finally:
         csv_tmp.unlink(missing_ok=True)
         audit_tmp.unlink(missing_ok=True)
+        journal_tmp.unlink(missing_ok=True)
+        csv_backup.unlink(missing_ok=True)
+        audit_backup.unlink(missing_ok=True)
+
+
+def validate_output_pair(csv_path: Path, audit_path: Path) -> None:
+    payload = json.loads(audit_path.read_text(encoding="utf-8"))
+    expected = payload.get("contracts_csv_sha256", "")
+    if not expected:
+        return
+    actual = hashlib.sha256(csv_path.read_bytes()).hexdigest()
+    if actual != expected:
+        raise OSError(
+            f"OpenSea seed CSV/audit generation mismatch: expected {expected}, got {actual}"
+        )
+
+
+def recover_output_transaction(csv_path: Path, audit_path: Path) -> None:
+    journal = csv_path.with_name(f".{csv_path.name}.output-transaction.json")
+    if not journal.exists():
+        return
+    payload = json.loads(journal.read_text(encoding="utf-8"))
+    recorded_csv = Path(payload["csv_path"]).resolve()
+    recorded_audit = Path(payload["audit_path"]).resolve()
+    if recorded_csv != csv_path.resolve() or recorded_audit != audit_path.resolve():
+        raise ValueError(f"output transaction journal does not match requested outputs: {journal}")
+    for path, backup_key, existed_key in (
+        (csv_path, "csv_backup", "csv_existed"),
+        (audit_path, "audit_backup", "audit_existed"),
+    ):
+        backup = Path(payload[backup_key])
+        if payload[existed_key]:
+            if not backup.exists():
+                raise OSError(f"cannot recover interrupted output transaction; missing {backup}")
+            os.replace(backup, path)
+        else:
+            path.unlink(missing_ok=True)
+    journal.unlink(missing_ok=True)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Fetch one globally ranked OpenSea Top collection population "
-            "and export chain/address contract pairs"
+            "Fetch each chain's independent OpenSea Top contract ranking "
+            "and export chain/address pairs"
         )
     )
     parser.add_argument("--chains", nargs="+", default=list(DEFAULT_CHAINS))
@@ -343,9 +486,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--top-collections-url",
         default=DEFAULT_TOP_COLLECTIONS_URL,
-        help="OpenSea globally ranked collections API URL",
+        help="OpenSea Top collections API URL (called once per chain/cursor)",
     )
-    parser.add_argument("--api-key", default="2d17a25e68714720883ac996f5459b17")
+    parser.add_argument("--api-key", default="")
     parser.add_argument("--api-key-env", default="OPENSEA_API_KEY")
     parser.add_argument("--timeout", type=float, default=30.0)
     args = parser.parse_args(argv)
@@ -380,14 +523,18 @@ def main(argv: list[str] | None = None) -> int:
             f"missing OpenSea API key; pass --api-key or set {args.api_key_env}"
         )
     try:
-        ranked = collect_ranked_collections(
-            api_key=api_key,
-            chains=args.chains,
-            limit=args.limit,
-            page_size=args.page_size,
-            top_collections_url=args.top_collections_url,
-            timeout=args.timeout,
-        )
+        ranked = []
+        for chain in args.chains:
+            ranked.extend(
+                collect_ranked_contracts_for_chain(
+                    api_key=api_key,
+                    chain=chain,
+                    limit=args.limit,
+                    page_size=args.page_size,
+                    top_collections_url=args.top_collections_url,
+                    timeout=args.timeout,
+                )
+            )
     except HTTPError as exc:
         print(f"OpenSea HTTP error {exc.code}: {exc.reason}", file=sys.stderr)
         return 1
@@ -395,16 +542,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"OpenSea request failed: {exc}", file=sys.stderr)
         return 1
 
-    write_rank_outputs(
+    write_contract_rank_outputs(
         csv_path=args.contracts_output,
         audit_path=args.audit_output,
         ranked=ranked,
         chains=args.chains,
-        requested_limit=args.limit,
+        requested_limit_per_chain=args.limit,
     )
     print(
-        f"wrote {len(manifest_pairs(ranked))} contract pairs from "
-        f"{len(ranked)} ranked collections to {args.contracts_output}"
+        f"wrote {len(ranked)} ranked contract pairs across "
+        f"{len(args.chains)} chains to {args.contracts_output}"
     )
     print(f"wrote ranking audit to {args.audit_output}")
     return 0

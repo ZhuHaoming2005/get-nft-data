@@ -23,6 +23,7 @@ mod candidate_filter;
 mod contract_analysis;
 pub mod duplicate;
 pub mod lifecycle;
+pub mod multichain;
 pub mod paper_stats;
 pub mod propagation;
 pub mod scoring;
@@ -30,9 +31,10 @@ pub mod signals;
 mod summary;
 mod value_flow;
 
-pub use api::{AnalyzeApi, CandidateSeedHolderRequest, RealApi};
-pub use batch::{read_seed_addresses, run_batch};
+pub use api::{AnalyzeApi, CandidateSeedHolderRequest, HeliusApiConfig, RealApi};
+pub use batch::{read_seed_addresses, read_seed_contracts, run_batch};
 pub use candidate_filter::group_candidates_by_contract;
+pub use multichain::{run_multichain_batch, MultiChainBatchRequest, MultiChainBatchResult};
 
 use candidate_filter::*;
 use contract_analysis::*;
@@ -118,6 +120,12 @@ pub trait FeatureStoreReader: Send + Sync {
         }
         Ok(snapshots)
     }
+
+    fn chain_totals(&self, _chain: &str) -> Result<crate::models::ChainTotalsPayload, AppError> {
+        Err(AppError::InvalidData(
+            "feature store does not expose chain totals".to_string(),
+        ))
+    }
 }
 
 #[derive(Clone)]
@@ -128,6 +136,7 @@ pub struct AnalysisDeps {
     pub batch_progress: Arc<dyn BatchProgressReporter>,
 }
 
+#[derive(Clone)]
 struct SeedContext {
     seed_contract: ContractMetadata,
     seed_nfts: Vec<SeedNft>,
@@ -278,6 +287,7 @@ struct SeedAnalysisState {
     output_state: AnalysisOutputState,
     expanded_candidates_by_contract: BTreeMap<String, Vec<DuplicateCandidate>>,
     analysis_timestamp: i64,
+    provider_data_quality: crate::models::ProviderDataQualityPayload,
 }
 
 #[derive(Clone, Debug)]
@@ -364,6 +374,10 @@ impl FeatureStoreReader for DuckDbFeatureStore {
             max_tokens_per_contract,
             max_recall_rows,
         )
+    }
+
+    fn chain_totals(&self, chain: &str) -> Result<crate::models::ChainTotalsPayload, AppError> {
+        DuckDbFeatureStore::chain_totals(self, chain)
     }
 }
 
@@ -486,7 +500,7 @@ pub async fn analyze_seed_contract_with_progress(
     deps: &AnalysisDeps,
     progress: Arc<dyn SeedProgressReporter>,
 ) -> Result<SingleReportPayload, AppError> {
-    analyze_seed_contract_with_limits(request, deps, progress, None, None).await
+    analyze_seed_contract_with_limits(request, deps, progress, None, None, None).await
 }
 
 async fn analyze_seed_contract_with_limits(
@@ -495,14 +509,92 @@ async fn analyze_seed_contract_with_limits(
     progress: Arc<dyn SeedProgressReporter>,
     cpu_limit: Option<Arc<Semaphore>>,
     prepared: Option<(SeedContext, CandidatePlan)>,
+    matched_contract_limit: Option<Arc<Semaphore>>,
 ) -> Result<SingleReportPayload, AppError> {
-    let matched_contract_limit = Arc::new(Semaphore::new(
-        request.matched_contract_max_concurrency.max(1),
-    ));
+    let matched_contract_limit = matched_contract_limit.unwrap_or_else(|| {
+        Arc::new(Semaphore::new(
+            request.matched_contract_max_concurrency.max(1),
+        ))
+    });
     let mut state =
         prepare_seed_analysis_state(request, deps, progress.clone(), cpu_limit, prepared).await?;
     analyze_matched_contracts_parallel(&mut state, deps, progress.clone(), matched_contract_limit)
         .await?;
+    let mut quality_contracts = state
+        .output_state
+        .candidate_contract_metadata
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if state
+        .seed_contract
+        .chain
+        .eq_ignore_ascii_case(&state.request.chain)
+    {
+        quality_contracts.insert(state.seed_contract.contract_address.clone());
+    }
+    let quality_api = deps.api.clone();
+    let quality_chain = state.request.chain.clone();
+    let mut quality_results =
+        stream::iter(quality_contracts.into_iter().map(move |contract_address| {
+            let api = quality_api.clone();
+            let chain = quality_chain.clone();
+            async move {
+                let result = api
+                    .fetch_provider_data_quality(&chain, &contract_address)
+                    .await;
+                (contract_address, result)
+            }
+        }))
+        .buffer_unordered(state.request.api_max_concurrency.max(1));
+    while let Some((contract_address, quality)) = quality_results.next().await {
+        let quality = match quality {
+            Ok(quality) => quality,
+            Err(error) => {
+                eprintln!(
+                    "warning: provider data-quality lookup failed for {contract_address}: {error}; preserving the completed analysis with degraded quality metadata"
+                );
+                state
+                    .provider_data_quality
+                    .supplemental_provider_failure_count += 1;
+                continue;
+            }
+        };
+        state.provider_data_quality.asset_listing_analyzed_count +=
+            quality.asset_listing_analyzed_count;
+        state.provider_data_quality.asset_listing_total_count += quality.asset_listing_total_count;
+        state
+            .provider_data_quality
+            .asset_listing_truncated_contract_count +=
+            quality.asset_listing_truncated_contract_count;
+        state.provider_data_quality.history_failed_asset_count +=
+            quality.history_failed_asset_count;
+        state.provider_data_quality.history_requested_asset_count +=
+            quality.history_requested_asset_count;
+        state.provider_data_quality.history_successful_asset_count +=
+            quality.history_successful_asset_count;
+        state.provider_data_quality.history_truncated_asset_count +=
+            quality.history_truncated_asset_count;
+        state
+            .provider_data_quality
+            .history_fetched_transaction_count += quality.history_fetched_transaction_count;
+        state
+            .provider_data_quality
+            .history_reported_transaction_count += quality.history_reported_transaction_count;
+        state.provider_data_quality.history_failed_transaction_count +=
+            quality.history_failed_transaction_count;
+        state
+            .provider_data_quality
+            .history_unattributed_sol_transaction_count +=
+            quality.history_unattributed_sol_transaction_count;
+        state
+            .provider_data_quality
+            .history_unresolved_compressed_mint_count +=
+            quality.history_unresolved_compressed_mint_count;
+        state
+            .provider_data_quality
+            .supplemental_provider_failure_count += quality.supplemental_provider_failure_count;
+    }
     finalize_seed_report(state, progress).await
 }
 
@@ -539,14 +631,21 @@ async fn prepare_seed_analysis_state(
     let CandidateContractFilterResult {
         candidates,
         seed_related_legit_duplicates,
-    } = filter_seed_related_candidate_contracts(
-        &request,
-        deps,
-        candidates,
-        token_type.as_str(),
-        request.api_max_concurrency.max(1),
-    )
-    .await;
+    } = if seed_contract.chain.eq_ignore_ascii_case(&request.chain) {
+        filter_seed_related_candidate_contracts(
+            &request,
+            deps,
+            candidates,
+            token_type.as_str(),
+            request.api_max_concurrency.max(1),
+        )
+        .await
+    } else {
+        CandidateContractFilterResult {
+            candidates,
+            seed_related_legit_duplicates: Vec::new(),
+        }
+    };
     let grouped = group_candidates_by_contract(&candidates);
 
     let contracts_to_analyze: Vec<String> = grouped.keys().cloned().collect();
@@ -596,6 +695,7 @@ async fn prepare_seed_analysis_state(
         output_state,
         expanded_candidates_by_contract,
         analysis_timestamp,
+        provider_data_quality: crate::models::ProviderDataQualityPayload::default(),
     })
 }
 
@@ -783,6 +883,7 @@ async fn finalize_seed_report(
         mut output_state,
         mut expanded_candidates_by_contract,
         analysis_timestamp,
+        provider_data_quality,
         ..
     } = state;
 
@@ -860,7 +961,7 @@ async fn finalize_seed_report(
     if paper_stats_config.analysis_timestamp <= 0 {
         paper_stats_config.analysis_timestamp = analysis_timestamp;
     }
-    let paper_stats = paper_stats::build_paper_stats(paper_stats::PaperStatsInput {
+    let mut paper_stats = paper_stats::build_paper_stats(paper_stats::PaperStatsInput {
         config: paper_stats_config,
         seed_collection_stats: &seed_collection_stats,
         duplicate_candidates: &output_candidates,
@@ -872,6 +973,55 @@ async fn finalize_seed_report(
         value_flow_edges: &value_flow_edges,
         nft_propagation_paths: &output_state.nft_propagation_paths,
     });
+    paper_stats.data_quality.asset_listing_analyzed_count =
+        provider_data_quality.asset_listing_analyzed_count;
+    paper_stats.data_quality.asset_listing_total_count =
+        provider_data_quality.asset_listing_total_count;
+    paper_stats
+        .data_quality
+        .asset_listing_truncated_contract_count =
+        provider_data_quality.asset_listing_truncated_contract_count;
+    paper_stats.data_quality.asset_listing_coverage_ratio =
+        (provider_data_quality.asset_listing_total_count > 0).then_some(
+            provider_data_quality.asset_listing_analyzed_count as f64
+                / provider_data_quality.asset_listing_total_count as f64,
+        );
+    paper_stats.data_quality.history_failed_asset_count =
+        provider_data_quality.history_failed_asset_count;
+    paper_stats.data_quality.history_requested_asset_count =
+        provider_data_quality.history_requested_asset_count;
+    paper_stats.data_quality.history_successful_asset_count =
+        provider_data_quality.history_successful_asset_count;
+    paper_stats.data_quality.history_asset_coverage_ratio =
+        (provider_data_quality.history_requested_asset_count > 0).then_some(
+            provider_data_quality.history_successful_asset_count as f64
+                / provider_data_quality.history_requested_asset_count as f64,
+        );
+    paper_stats.data_quality.history_truncated_asset_count =
+        provider_data_quality.history_truncated_asset_count;
+    paper_stats.data_quality.history_fetched_transaction_count =
+        provider_data_quality.history_fetched_transaction_count;
+    paper_stats.data_quality.history_reported_transaction_count =
+        provider_data_quality.history_reported_transaction_count;
+    paper_stats.data_quality.history_failed_transaction_count =
+        provider_data_quality.history_failed_transaction_count;
+    paper_stats
+        .data_quality
+        .history_unattributed_sol_transaction_count =
+        provider_data_quality.history_unattributed_sol_transaction_count;
+    paper_stats
+        .data_quality
+        .history_unresolved_compressed_mint_count =
+        provider_data_quality.history_unresolved_compressed_mint_count;
+    paper_stats.data_quality.supplemental_provider_failure_count =
+        provider_data_quality.supplemental_provider_failure_count;
+    paper_stats.data_quality.history_transaction_coverage_ratio =
+        (provider_data_quality.history_reported_transaction_count > 0
+            && provider_data_quality.history_failed_asset_count == 0)
+            .then_some(
+                provider_data_quality.history_fetched_transaction_count as f64
+                    / provider_data_quality.history_reported_transaction_count as f64,
+            );
 
     let payload = SingleReportPayload {
         report_type: String::new(),

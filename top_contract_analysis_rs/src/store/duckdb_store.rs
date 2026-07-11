@@ -44,7 +44,10 @@ const METADATA_SIMHASH_BAND_VALUES: usize = 1 << METADATA_SIMHASH_BAND_BITS;
 const METADATA_SKETCH_HIGH_FREQ_MIN_DOCS: usize = 32;
 const METADATA_SKETCH_HIGH_FREQ_DIVISOR: usize = 5;
 
-const REQUIRED_SNAPSHOT_COLUMNS: [&str; 4] = [
+const REQUIRED_SNAPSHOT_COLUMNS: [&str; 7] = [
+    "chain",
+    "contract_address",
+    "token_id",
     "metadata_json",
     "token_uri_norm",
     "image_uri_norm",
@@ -409,9 +412,9 @@ impl DuckDbFeatureStore {
     }
 }
 
-mod schema;
-mod prepared;
 mod loading;
 mod metadata_recall;
+mod prepared;
 mod recall;
+mod schema;
 mod snapshot;

@@ -8,8 +8,9 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::error::AppError;
 use crate::models::{
-    BatchSummaryPayload, PaperContractBehaviorStatsPayload, PaperOutputInputRatioRowPayload,
-    PaperStatsPayload, PaperWashCycleSizeRowPayload, SingleReportPayload,
+    normalize_chain_identity, BatchSummaryPayload, PaperContractBehaviorStatsPayload,
+    PaperOutputInputRatioRowPayload, PaperStatsPayload, PaperWashCycleSizeRowPayload,
+    SingleReportPayload,
 };
 
 static SLUG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[^0-9a-zA-Z\u{4e00}-\u{9fff}]+").unwrap());
@@ -754,10 +755,10 @@ fn output_input_ratio_for_contract<'a>(
     stats: &'a PaperStatsPayload,
     contract_address: &str,
 ) -> Option<&'a PaperOutputInputRatioRowPayload> {
-    stats
-        .output_input_ratio_by_contract
-        .iter()
-        .find(|row| row.contract_address.eq_ignore_ascii_case(contract_address))
+    stats.output_input_ratio_by_contract.iter().find(|row| {
+        normalize_chain_identity(&row.contract_address)
+            == normalize_chain_identity(contract_address)
+    })
 }
 
 fn output_input_impact_usd(

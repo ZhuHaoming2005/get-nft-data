@@ -1,7 +1,9 @@
 use super::*;
 
 impl DuckDbFeatureStore {
-    pub(super) fn build_metadata_source_index(candidates: &[MetadataRecallCandidate]) -> MetadataSourceIndex {
+    pub(super) fn build_metadata_source_index(
+        candidates: &[MetadataRecallCandidate],
+    ) -> MetadataSourceIndex {
         let new_index = || MetadataSourceIndex {
             anchor_indices: HashMap::new(),
             simhash_band_indices: vec![
@@ -316,5 +318,4 @@ impl DuckDbFeatureStore {
             output.push(index);
         }
     }
-
 }

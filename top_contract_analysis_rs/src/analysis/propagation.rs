@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::models::{
-    HonestAddressPayload, InfringingTokenRecord, MaliciousAddressPayload,
+    normalize_chain_identity, HonestAddressPayload, InfringingTokenRecord, MaliciousAddressPayload,
     NftPropagationEdgePayload, NftPropagationNodePayload, NftPropagationPathPayload,
     NftPropagationSummaryPayload, NftSaleRecord, NftTokenPropagationPayload, OwnerBalance,
     SecondarySaleVictimAddressPayload, TransferRecord, ZERO_ADDRESS,
@@ -162,7 +162,7 @@ fn sale_transfer_key(
     from_address: &str,
     to_address: &str,
 ) -> Option<(String, String, String, String)> {
-    let tx_hash = tx_hash.trim().to_lowercase();
+    let tx_hash = normalize_chain_identity(tx_hash);
     let token_id = token_id.trim().to_string();
     let from_address = canonical_address(from_address);
     let to_address = canonical_address(to_address);
@@ -367,9 +367,8 @@ pub fn build_nft_propagation_path(input: NftPropagationInput<'_>) -> NftPropagat
     let mut sorted_transfers: Vec<&TransferRecord> = transfers
         .iter()
         .filter(|transfer| {
-            transfer
-                .contract_address
-                .eq_ignore_ascii_case(contract_address)
+            normalize_chain_identity(&transfer.contract_address)
+                == normalize_chain_identity(contract_address)
                 && relevant_token_ids.contains(&transfer.token_id)
         })
         .collect();
@@ -461,7 +460,8 @@ pub fn build_nft_propagation_path(input: NftPropagationInput<'_>) -> NftPropagat
     let mut sorted_sales: Vec<&NftSaleRecord> = sales
         .iter()
         .filter(|sale| {
-            sale.contract_address.eq_ignore_ascii_case(contract_address)
+            normalize_chain_identity(&sale.contract_address)
+                == normalize_chain_identity(contract_address)
                 && relevant_token_ids.contains(&sale.token_id)
         })
         .collect();
@@ -660,5 +660,19 @@ pub fn build_nft_propagation_path(input: NftPropagationInput<'_>) -> NftPropagat
         nodes,
         edges,
         token_paths,
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::sale_transfer_key;
+
+    #[test]
+    fn sale_transfer_key_preserves_case_sensitive_solana_signature() {
+        let mixed = sale_transfer_key("AbCSignature", "mint", "Seller", "Buyer").unwrap();
+        let lower = sale_transfer_key("abcsignature", "mint", "Seller", "Buyer").unwrap();
+
+        assert_eq!(mixed.0, "AbCSignature");
+        assert_ne!(mixed, lower);
     }
 }

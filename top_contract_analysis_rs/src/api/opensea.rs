@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::api::alchemy::fetch_eip2981_royalty_recipient;
 use crate::api::{fetch_contract_collection_slug_alchemy_first, ApiEndpoints, AsyncApiClient};
-use crate::currency::{is_native_eth_symbol, is_supported_priced_symbol, to_normalized_amount};
+use crate::currency::{is_chain_native_symbol, is_stablecoin_symbol, to_chain_normalized_amount};
 use crate::error::AppError;
 use crate::models::{ContractMetadata, NftSaleRecord, SeedNft};
 
@@ -38,12 +38,29 @@ fn opensea_chain(chain: &str) -> &str {
         "polygon" => "matic",
         "ethereum" => "ethereum",
         "base" => "base",
+        "solana" => "solana",
         "arbitrum" => "arbitrum",
         "optimism" => "optimism",
         "avalanche" => "avalanche",
         "zora" => "zora",
         "blast" => "blast",
         _ => "ethereum",
+    }
+}
+
+fn normalize_opensea_identity(chain: &str, value: &str) -> String {
+    if chain.trim().eq_ignore_ascii_case("solana") {
+        value.trim().to_string()
+    } else {
+        value.trim().to_ascii_lowercase()
+    }
+}
+
+fn opensea_identities_equal(chain: &str, left: &str, right: &str) -> bool {
+    if chain.trim().eq_ignore_ascii_case("solana") {
+        left.trim() == right.trim()
+    } else {
+        left.trim().eq_ignore_ascii_case(right.trim())
     }
 }
 
@@ -136,6 +153,7 @@ fn int_field(value: &Value, names: &[&str]) -> i64 {
 
 fn decode_fee_eth(
     payload: Option<&Value>,
+    chain: &str,
     eth_usd_rate: Option<f64>,
 ) -> (Option<f64>, Option<f64>, String, String) {
     let payload = payload.unwrap_or(&Value::Null);
@@ -181,7 +199,7 @@ fn decode_fee_eth(
             usd: Some(0.0),
         }
     } else {
-        to_normalized_amount(token_amount, &symbol, eth_usd_rate)
+        to_chain_normalized_amount(chain, token_amount, &symbol, eth_usd_rate)
     };
     (normalized.eth, normalized.usd, symbol, token_address)
 }
@@ -231,6 +249,7 @@ fn royalty_recipient_address(item: &Value) -> String {
 pub async fn fetch_alchemy_nft_sales(
     client: &AsyncApiClient,
     endpoints: &ApiEndpoints,
+    chain: &str,
     contract_address: &str,
     token_id: Option<&str>,
     eth_usd_rate: Option<f64>,
@@ -260,11 +279,11 @@ pub async fn fetch_alchemy_nft_sales(
             .flatten()
         {
             let (seller_fee_eth, seller_fee_usd, fee_symbol, fee_token_address) =
-                decode_fee_eth(item.get("sellerFee"), eth_usd_rate);
+                decode_fee_eth(item.get("sellerFee"), chain, eth_usd_rate);
             let (protocol_fee_eth, protocol_fee_usd, protocol_symbol, protocol_token_address) =
-                decode_fee_eth(item.get("protocolFee"), eth_usd_rate);
+                decode_fee_eth(item.get("protocolFee"), chain, eth_usd_rate);
             let (royalty_fee_eth, royalty_fee_usd, royalty_symbol, royalty_token_address) =
-                decode_fee_eth(item.get("royaltyFee"), eth_usd_rate);
+                decode_fee_eth(item.get("royaltyFee"), chain, eth_usd_rate);
             let symbols: std::collections::BTreeSet<String> = [
                 fee_symbol.clone(),
                 protocol_symbol.clone(),
@@ -276,11 +295,12 @@ pub async fn fetch_alchemy_nft_sales(
             let native_eth = !symbols.is_empty()
                 && symbols
                     .iter()
-                    .all(|value| is_native_eth_symbol(value.as_str()));
+                    .all(|value| is_chain_native_symbol(chain, value.as_str()));
             let eth_priced = !symbols.is_empty()
-                && symbols
-                    .iter()
-                    .all(|value| is_supported_priced_symbol(value.as_str()));
+                && symbols.iter().all(|value| {
+                    is_chain_native_symbol(chain, value.as_str())
+                        || is_stablecoin_symbol(value.as_str())
+                });
             let price_eth = if eth_priced {
                 seller_fee_eth
                     .zip(protocol_fee_eth)
@@ -510,8 +530,10 @@ async fn fetch_opensea_nft_events_with_collection_slug(
                 .or_else(|| nft.get("token_id"))
                 .and_then(Value::as_str)
                 .unwrap_or_else(|| lookup.token_id.unwrap_or(""));
-            let normalized = to_normalized_amount(
-                raw_value / 10f64.powi(payment_decimals),
+            let token_amount = raw_value / 10f64.powi(payment_decimals);
+            let normalized = to_chain_normalized_amount(
+                lookup.chain,
+                token_amount,
                 &payment_symbol,
                 eth_usd_rate,
             );
@@ -521,16 +543,21 @@ async fn fetch_opensea_nft_events_with_collection_slug(
                 .or_else(|| nft.get("asset_contract"))
                 .or_else(|| item.get("asset_contract_address"))
                 .and_then(address_like_field)
-                .unwrap_or("")
-                .to_lowercase();
+                .unwrap_or("");
+            let parsed_contract_address =
+                normalize_opensea_identity(lookup.chain, parsed_contract_address);
             if !parsed_contract_address.is_empty()
-                && !parsed_contract_address.eq_ignore_ascii_case(lookup.contract_address)
+                && !opensea_identities_equal(
+                    lookup.chain,
+                    &parsed_contract_address,
+                    lookup.contract_address,
+                )
             {
                 continue;
             }
             rows.push(NftSaleRecord {
                 contract_address: if parsed_contract_address.is_empty() {
-                    lookup.contract_address.to_lowercase()
+                    normalize_opensea_identity(lookup.chain, lookup.contract_address)
                 } else {
                     parsed_contract_address
                 },
@@ -545,33 +572,38 @@ async fn fetch_opensea_nft_events_with_collection_slug(
                             .or_else(|| value.get("hash").and_then(Value::as_str))
                     })
                     .unwrap_or("")
-                    .to_lowercase(),
+                    .trim()
+                    .to_string(),
                 block_number: integer_field(&item, &["block_number", "blockNumber"]),
                 log_index: integer_field(&item, &["event_index", "log_index", "logIndex"]),
                 bundle_index: integer_field(&item, &["bundle_index", "bundleIndex"]),
-                buyer_address: string_or_nested_field(
-                    &item,
-                    &[
-                        "to_account",
-                        "winner_account",
-                        "buyer",
-                        "buyer_address",
-                        "buyerAddress",
-                        "to_address",
-                    ],
-                )
-                .to_lowercase(),
-                seller_address: string_or_nested_field(
-                    &item,
-                    &[
-                        "from_account",
-                        "seller",
-                        "seller_address",
-                        "sellerAddress",
-                        "from_address",
-                    ],
-                )
-                .to_lowercase(),
+                buyer_address: normalize_opensea_identity(
+                    lookup.chain,
+                    string_or_nested_field(
+                        &item,
+                        &[
+                            "to_account",
+                            "winner_account",
+                            "buyer",
+                            "buyer_address",
+                            "buyerAddress",
+                            "to_address",
+                        ],
+                    ),
+                ),
+                seller_address: normalize_opensea_identity(
+                    lookup.chain,
+                    string_or_nested_field(
+                        &item,
+                        &[
+                            "from_account",
+                            "seller",
+                            "seller_address",
+                            "sellerAddress",
+                            "from_address",
+                        ],
+                    ),
+                ),
                 marketplace: "opensea".to_string(),
                 taker: item
                     .get("taker")
@@ -579,15 +611,17 @@ async fn fetch_opensea_nft_events_with_collection_slug(
                     .unwrap_or("")
                     .to_string(),
                 payment_token_symbol: payment_symbol.clone(),
-                payment_token_address: payment
-                    .get("address")
-                    .or_else(|| payment.get("token_address"))
-                    .or_else(|| payment.get("tokenAddress"))
-                    .or_else(|| payment.get("token"))
-                    .or_else(|| payment.get("contract"))
-                    .and_then(address_like_field)
-                    .unwrap_or("")
-                    .to_lowercase(),
+                payment_token_address: normalize_opensea_identity(
+                    lookup.chain,
+                    payment
+                        .get("address")
+                        .or_else(|| payment.get("token_address"))
+                        .or_else(|| payment.get("tokenAddress"))
+                        .or_else(|| payment.get("token"))
+                        .or_else(|| payment.get("contract"))
+                        .and_then(address_like_field)
+                        .unwrap_or(""),
+                ),
                 price_eth: normalized.eth,
                 price_usd: normalized.usd,
                 seller_fee_eth: normalized.eth.unwrap_or(0.0),
@@ -598,7 +632,7 @@ async fn fetch_opensea_nft_events_with_collection_slug(
                 royalty_fee_usd: 0.0,
                 royalty_recipient_address: royalty_recipient_address(&item),
                 source: "opensea".to_string(),
-                is_native_eth: is_native_eth_symbol(&payment_symbol),
+                is_native_eth: is_chain_native_symbol(lookup.chain, &payment_symbol),
             });
         }
 
@@ -645,42 +679,47 @@ pub async fn fetch_opensea_contract_metadata(
         string_field(&payload, &["contract_standard", "token_type", "tokenType"]).to_uppercase();
     Ok(ContractMetadata {
         chain: chain.to_string(),
-        contract_address: string_field(&payload, &["address", "contract_address"])
-            .trim()
-            .to_lowercase()
-            .if_empty_then(contract_address.to_lowercase()),
+        contract_address: normalize_opensea_identity(
+            chain,
+            string_field(&payload, &["address", "contract_address"]),
+        )
+        .if_empty_then(normalize_opensea_identity(chain, contract_address)),
         token_type,
-        contract_deployer: string_field(&payload, &["contract_deployer", "deployer"])
-            .trim()
-            .to_lowercase(),
+        contract_deployer: normalize_opensea_identity(
+            chain,
+            string_field(&payload, &["contract_deployer", "deployer"]),
+        ),
         deployed_block_number: int_field(
             &payload,
             &["deployed_block_number", "deployedBlockNumber"],
         ),
         deployed_block_time: int_field(&payload, &["deployed_block_time", "deployedBlockTime"]),
-        owner_address: string_field(
-            &payload,
-            &["owner_address", "ownerAddress", "owner", "contract_owner"],
-        )
-        .trim()
-        .to_lowercase(),
-        admin_address: string_field(
-            &payload,
-            &["admin_address", "adminAddress", "admin", "contract_admin"],
-        )
-        .trim()
-        .to_lowercase(),
-        proxy_admin_address: string_field(
-            &payload,
-            &[
-                "proxy_admin_address",
-                "proxyAdminAddress",
-                "proxy_admin",
-                "proxyAdmin",
-            ],
-        )
-        .trim()
-        .to_lowercase(),
+        owner_address: normalize_opensea_identity(
+            chain,
+            string_field(
+                &payload,
+                &["owner_address", "ownerAddress", "owner", "contract_owner"],
+            ),
+        ),
+        admin_address: normalize_opensea_identity(
+            chain,
+            string_field(
+                &payload,
+                &["admin_address", "adminAddress", "admin", "contract_admin"],
+            ),
+        ),
+        proxy_admin_address: normalize_opensea_identity(
+            chain,
+            string_field(
+                &payload,
+                &[
+                    "proxy_admin_address",
+                    "proxyAdminAddress",
+                    "proxy_admin",
+                    "proxyAdmin",
+                ],
+            ),
+        ),
         name: string_field(&payload, &["name", "contract_name"])
             .to_string()
             .if_empty_then(string_field(collection, &["name", "collection_name"]).to_string()),
@@ -804,12 +843,13 @@ pub async fn fetch_opensea_contract_nfts(
                 .unwrap_or_default();
             rows.push(SeedNft {
                 chain: chain.to_string(),
-                contract_address: raw
-                    .get("contract")
-                    .or_else(|| raw.get("contract_address"))
-                    .and_then(Value::as_str)
-                    .unwrap_or(contract_address)
-                    .to_lowercase(),
+                contract_address: normalize_opensea_identity(
+                    chain,
+                    raw.get("contract")
+                        .or_else(|| raw.get("contract_address"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(contract_address),
+                ),
                 token_id,
                 name: string_field(raw, &["name", "title"]).to_string(),
                 symbol: String::new(),
@@ -852,7 +892,7 @@ pub async fn fetch_opensea_account_holds_contract_nft(
         HeaderValue::from_str(opensea_api_key).map_err(|err| AppError::Http(err.to_string()))?,
     );
 
-    let contract_key = contract_address.trim().to_lowercase();
+    let contract_key = normalize_opensea_identity(chain, contract_address);
     let mut next: Option<String> = None;
     let mut seen_cursors = BTreeSet::new();
     loop {
@@ -887,9 +927,8 @@ pub async fn fetch_opensea_account_holds_contract_nft(
                 .or_else(|| raw.get("contract_address"))
                 .or_else(|| raw.get("asset_contract"))
                 .and_then(address_like_field)
-                .unwrap_or("")
-                .trim()
-                .to_lowercase();
+                .unwrap_or("");
+            let nft_contract = normalize_opensea_identity(chain, nft_contract);
             if !nft_contract.is_empty() && nft_contract == contract_key {
                 return Ok(true);
             }
@@ -985,15 +1024,32 @@ pub async fn fetch_contract_sales_with_clients(
     opensea_api_key: &str,
     eth_usd_rate: Option<f64>,
 ) -> Result<Vec<NftSaleRecord>, AppError> {
+    if chain.trim().eq_ignore_ascii_case("solana") {
+        if opensea_api_key.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        return fetch_opensea_nft_events(
+            other_client,
+            &endpoints.opensea_base,
+            chain,
+            contract_address,
+            None,
+            opensea_api_key,
+            eth_usd_rate,
+        )
+        .await
+        .map(|rows| filter_sales_for_contract(rows, chain, contract_address));
+    }
     let alchemy_result = fetch_alchemy_nft_sales(
         alchemy_client,
         endpoints,
+        chain,
         contract_address,
         None,
         eth_usd_rate,
     )
     .await
-    .map(|rows| filter_sales_for_contract(rows, contract_address));
+    .map(|rows| filter_sales_for_contract(rows, chain, contract_address));
     match alchemy_result {
         Ok(rows) => {
             return Ok(enrich_sales_with_royalty_recipient(
@@ -1050,7 +1106,7 @@ pub async fn fetch_contract_sales_with_clients(
     .await
     {
         Ok(rows) => {
-            let rows = filter_sales_for_contract(rows, contract_address);
+            let rows = filter_sales_for_contract(rows, chain, contract_address);
             Ok(enrich_sales_with_royalty_recipient(
                 alchemy_client,
                 endpoints,
@@ -1070,9 +1126,10 @@ pub async fn fetch_contract_sales_with_clients(
 
 fn filter_sales_for_contract(
     rows: Vec<NftSaleRecord>,
+    chain: &str,
     contract_address: &str,
 ) -> Vec<NftSaleRecord> {
     rows.into_iter()
-        .filter(|sale| sale.contract_address.eq_ignore_ascii_case(contract_address))
+        .filter(|sale| opensea_identities_equal(chain, &sale.contract_address, contract_address))
         .collect()
 }

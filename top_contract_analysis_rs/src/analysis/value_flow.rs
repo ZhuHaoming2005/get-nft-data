@@ -5,9 +5,9 @@ use futures::{stream, StreamExt};
 use crate::currency::FALLBACK_ETH_USD_RATE;
 use crate::error::AppError;
 use crate::models::{
-    ContractMetadata, EthTransferRecord, HonestAddressPayload, InfringingTokenRecord,
-    MaliciousAddressPayload, NftSaleRecord, TransactionReceiptRecord, TransferRecord,
-    ValueFlowEdgePayload, ZERO_ADDRESS,
+    normalize_chain_identity, Chain, ContractMetadata, EthTransferRecord, HonestAddressPayload,
+    InfringingTokenRecord, MaliciousAddressPayload, NftSaleRecord, TransactionReceiptRecord,
+    TransferRecord, ValueFlowEdgePayload, ZERO_ADDRESS,
 };
 
 use super::{AnalysisDeps, AnalyzeRequest};
@@ -168,7 +168,7 @@ pub(super) async fn compute_mint_payment_edges_for_contract(
 
     let mut inputs = Vec::with_capacity(lookups.len());
     let mut receipt_tx_hashes = BTreeSet::<String>::new();
-    let mut balance_requests = BTreeSet::<(String, i64)>::new();
+    let mut balance_requests = BTreeSet::<(String, i64, String)>::new();
     let mut block_receipt_requests = BTreeSet::<i64>::new();
     let mut contract_transfer_requests = BTreeSet::<i64>::new();
     for lookup in lookups {
@@ -189,9 +189,19 @@ pub(super) async fn compute_mint_payment_edges_for_contract(
         });
         if has_mint_payment_transfer {
             receipt_tx_hashes.insert(lookup.tx_hash.clone());
-            balance_requests.insert((lookup.minter_address.clone(), lookup.block_number - 1));
-            block_receipt_requests.insert(lookup.block_number);
-            contract_transfer_requests.insert(lookup.block_number);
+            balance_requests.insert((
+                lookup.minter_address.clone(),
+                lookup.block_number - 1,
+                if request.chain.eq_ignore_ascii_case("solana") {
+                    lookup.tx_hash.clone()
+                } else {
+                    String::new()
+                },
+            ));
+            if !request.chain.eq_ignore_ascii_case("solana") {
+                block_receipt_requests.insert(lookup.block_number);
+                contract_transfer_requests.insert(lookup.block_number);
+            }
         }
         inputs.push(MintPaymentInputs {
             lookup,
@@ -227,6 +237,11 @@ pub(super) async fn compute_mint_payment_edges_for_contract(
             .get(&(
                 inputs.lookup.minter_address.clone(),
                 inputs.lookup.block_number - 1,
+                if request.chain.eq_ignore_ascii_case("solana") {
+                    inputs.lookup.tx_hash.clone()
+                } else {
+                    String::new()
+                },
             ))
             .copied();
         inputs.block_receipts = block_receipts_by_block
@@ -369,6 +384,10 @@ async fn fetch_deployment_cost_edge(
     let Some(gas_eth) = receipt_gas_eth(receipt) else {
         return Ok(None);
     };
+    let chain = request.chain.parse::<Chain>().unwrap_or_default();
+    let gas_usd = receipt.fee_usd.or_else(|| {
+        matches!(chain, Chain::Ethereum | Chain::Base).then_some(gas_eth * FALLBACK_ETH_USD_RATE)
+    });
     let gas_payer = if receipt.from_address.trim().is_empty() {
         metadata.contract_deployer.clone()
     } else {
@@ -392,13 +411,13 @@ async fn fetch_deployment_cost_edge(
         value_eth: None,
         value_usd: None,
         value_with_gas_eth: Some(gas_eth),
-        value_with_gas_usd: Some(gas_eth * FALLBACK_ETH_USD_RATE),
+        value_with_gas_usd: gas_usd,
         gas_payer_address: gas_payer,
         gas_eth: Some(gas_eth),
-        gas_usd: Some(gas_eth * FALLBACK_ETH_USD_RATE),
+        gas_usd,
         from_before_eth_balance: None,
         from_before_usd_balance: None,
-        payment_token_symbol: "ETH".into(),
+        payment_token_symbol: chain.native_symbol().into(),
         payment_token_address: ZERO_ADDRESS.into(),
         channel: "contract_deploy".into(),
         marketplace: String::new(),
@@ -419,9 +438,7 @@ fn deployment_receipt_for_contract<'a>(
         .values()
         .find(|receipt| {
             !receipt.contract_address.trim().is_empty()
-                && receipt
-                    .contract_address
-                    .eq_ignore_ascii_case(contract_address)
+                && identities_equal(&receipt.contract_address, contract_address)
         })
         .or_else(|| {
             let deployer = metadata.contract_deployer.trim();
@@ -430,7 +447,7 @@ fn deployment_receipt_for_contract<'a>(
             }
             receipts
                 .values()
-                .filter(|receipt| receipt.from_address.eq_ignore_ascii_case(deployer))
+                .filter(|receipt| identities_equal(&receipt.from_address, deployer))
                 .min_by_key(|receipt| receipt.transaction_index)
         })
 }
@@ -445,7 +462,7 @@ async fn compute_malicious_sale_cost_edges(
 ) -> Result<Vec<ValueFlowEdgePayload>, AppError> {
     let mut tx_hashes = BTreeSet::<String>::new();
     for sale in sales {
-        if !sale.contract_address.eq_ignore_ascii_case(contract_address)
+        if !identities_equal(&sale.contract_address, contract_address)
             || sale.tx_hash.trim().is_empty()
             || !sale_has_malicious_participant(sale, malicious)
         {
@@ -460,7 +477,7 @@ async fn compute_malicious_sale_cost_edges(
     let receipts_by_tx = fetch_mint_payment_receipts(request, deps, tx_hashes).await?;
     let mut rows = BTreeMap::<String, ValueFlowEdgePayload>::new();
     for sale in sales {
-        if !sale.contract_address.eq_ignore_ascii_case(contract_address)
+        if !identities_equal(&sale.contract_address, contract_address)
             || !sale_has_malicious_participant(sale, malicious)
         {
             continue;
@@ -475,7 +492,15 @@ async fn compute_malicious_sale_cost_edges(
         let Some(gas_eth) = receipt_gas_eth(receipt) else {
             continue;
         };
-        let gas_usd = gas_eth * sale_eth_usd_rate(sale).unwrap_or(FALLBACK_ETH_USD_RATE);
+        let chain = request.chain.parse::<Chain>().unwrap_or_default();
+        let gas_usd = receipt.fee_usd.or_else(|| {
+            sale_eth_usd_rate(sale)
+                .map(|rate| gas_eth * rate)
+                .or_else(|| {
+                    matches!(chain, Chain::Ethereum | Chain::Base)
+                        .then_some(gas_eth * FALLBACK_ETH_USD_RATE)
+                })
+        });
         let channel = sale_attacker_cost_channel(sale, &gas_payer, malicious);
         let edge = ValueFlowEdgePayload {
             edge_id: format!(
@@ -492,14 +517,14 @@ async fn compute_malicious_sale_cost_edges(
             value_eth: sale.price_eth.filter(|value| *value > 0.0),
             value_usd: sale.price_usd.filter(|value| *value > 0.0),
             value_with_gas_eth: sale.price_eth.map(|value| value + gas_eth),
-            value_with_gas_usd: sale.price_usd.map(|value| value + gas_usd),
+            value_with_gas_usd: sale.price_usd.zip(gas_usd).map(|(value, gas)| value + gas),
             gas_payer_address: receipt.from_address.clone(),
             gas_eth: Some(gas_eth),
-            gas_usd: Some(gas_usd),
+            gas_usd,
             from_before_eth_balance: None,
             from_before_usd_balance: None,
             payment_token_symbol: if sale.payment_token_symbol.is_empty() {
-                "ETH".into()
+                chain.native_symbol().into()
             } else {
                 sale.payment_token_symbol.clone()
             },
@@ -577,36 +602,46 @@ async fn fetch_mint_payment_transfers_for_lookups(
     contract_address: &str,
     lookups: &[MintPaymentLookup],
     contract_metadata: Option<&ContractMetadata>,
-) -> Result<BTreeMap<(i64, String), Vec<EthTransferRecord>>, AppError> {
-    let mut requests = BTreeMap::<(i64, String), String>::new();
+) -> Result<BTreeMap<(i64, String, String), Vec<EthTransferRecord>>, AppError> {
+    let mut requests = BTreeMap::<(i64, String, String), String>::new();
     let receiver_addresses = mint_payment_receiver_addresses(contract_address, contract_metadata);
     for lookup in lookups {
+        let transaction_scope = if request.chain.eq_ignore_ascii_case("solana") {
+            lookup.tx_hash.clone()
+        } else {
+            String::new()
+        };
         for address in &receiver_addresses {
             requests
-                .entry((lookup.block_number, address.to_lowercase()))
+                .entry((
+                    lookup.block_number,
+                    transaction_scope.clone(),
+                    normalize_chain_identity(address),
+                ))
                 .or_insert_with(|| address.clone());
         }
     }
 
     let mut fetched = stream::iter(requests.into_iter().map(
-        |((block_number, address_key), address)| async move {
+        |((block_number, tx_hash, address_key), address)| async move {
             let result = deps
                 .api
-                .fetch_mint_payment_eth_transfers_to_address_on_chain(
+                .fetch_transaction_value_transfers_to_address_on_chain(
                     &request.chain,
                     &request.alchemy_api_key,
                     request.alchemy_network.as_deref(),
+                    &tx_hash,
                     block_number,
                     &address,
                 )
                 .await;
             match result {
-                Ok(rows) => Ok::<_, AppError>(((block_number, address_key), rows)),
+                Ok(rows) => Ok::<_, AppError>(((block_number, tx_hash, address_key), rows)),
                 Err(err) => {
                     eprintln!(
                         "warning: mint value-flow transfer lookup failed for {address} at block {block_number}: {err}; continuing without this value-flow evidence"
                     );
-                    Ok::<_, AppError>(((block_number, address_key), Vec::new()))
+                    Ok::<_, AppError>(((block_number, tx_hash, address_key), Vec::new()))
                 }
             }
         },
@@ -625,12 +660,21 @@ fn mint_payment_transfers_for_lookup(
     lookup: &MintPaymentLookup,
     contract_address: &str,
     contract_metadata: Option<&ContractMetadata>,
-    transfer_rows_by_request: &BTreeMap<(i64, String), Vec<EthTransferRecord>>,
+    transfer_rows_by_request: &BTreeMap<(i64, String, String), Vec<EthTransferRecord>>,
 ) -> Vec<EthTransferRecord> {
     let mut transfers = Vec::new();
+    let transaction_scope = lookup.tx_hash.clone();
     for address in mint_payment_receiver_addresses(contract_address, contract_metadata) {
-        if let Some(rows) =
-            transfer_rows_by_request.get(&(lookup.block_number, address.to_lowercase()))
+        let address_key = normalize_chain_identity(&address);
+        if let Some(rows) = transfer_rows_by_request
+            .get(&(
+                lookup.block_number,
+                transaction_scope.clone(),
+                address_key.clone(),
+            ))
+            .or_else(|| {
+                transfer_rows_by_request.get(&(lookup.block_number, String::new(), address_key))
+            })
         {
             transfers.extend(rows.iter().cloned());
         }
@@ -670,22 +714,23 @@ async fn fetch_mint_payment_receipts(
 async fn fetch_mint_payment_balances(
     request: &AnalyzeRequest,
     deps: &AnalysisDeps,
-    balance_requests: BTreeSet<(String, i64)>,
-) -> Result<BTreeMap<(String, i64), f64>, AppError> {
+    balance_requests: BTreeSet<(String, i64, String)>,
+) -> Result<BTreeMap<(String, i64, String), f64>, AppError> {
     let mut fetched = stream::iter(balance_requests.into_iter().map(
-        |(address, block_number)| async move {
+        |(address, block_number, tx_hash)| async move {
             let balance = deps
                 .api
-                .fetch_eth_balance_on_chain(
+                .fetch_pre_transaction_native_balance_on_chain(
                     &request.chain,
                     &request.alchemy_api_key,
                     request.alchemy_network.as_deref(),
+                    &tx_hash,
                     &address,
                     block_number,
                 )
                 .await
                 .ok();
-            ((address, block_number), balance)
+            ((address, block_number, tx_hash), balance)
         },
     ))
     .buffer_unordered(request.api_max_concurrency.max(1));
@@ -909,13 +954,9 @@ pub(super) fn classify_mint_value_flow_transfer(
             ],
         ));
     }
-    if transfer
-        .to_address
-        .eq_ignore_ascii_case(&lookup.minter_address)
-        && !transfer
-            .from_address
-            .eq_ignore_ascii_case(&lookup.minter_address)
-        && !transfer.from_address.eq_ignore_ascii_case(ZERO_ADDRESS)
+    if identities_equal(&transfer.to_address, &lookup.minter_address)
+        && !identities_equal(&transfer.from_address, &lookup.minter_address)
+        && !identities_equal(&transfer.from_address, ZERO_ADDRESS)
         && transfer.category != "erc20"
     {
         return Some((
@@ -930,11 +971,9 @@ pub(super) fn classify_mint_value_flow_transfer(
             ],
         ));
     }
-    if transfer.from_address.eq_ignore_ascii_case(contract_address)
-        && !transfer
-            .to_address
-            .eq_ignore_ascii_case(&lookup.minter_address)
-        && !transfer.to_address.eq_ignore_ascii_case(ZERO_ADDRESS)
+    if identities_equal(&transfer.from_address, contract_address)
+        && !identities_equal(&transfer.to_address, &lookup.minter_address)
+        && !identities_equal(&transfer.to_address, ZERO_ADDRESS)
     {
         let to_role =
             contract_control_role(&transfer.to_address, contract_address, contract_metadata)
@@ -969,6 +1008,11 @@ async fn trace_withdrawal_cashout_edges(
         mint_receipt,
         block_receipts,
     } = input;
+    if request.chain.eq_ignore_ascii_case("solana") {
+        // Solana cashout expansion previously required full-slot getBlock scans.
+        // Preserve direct transaction evidence and omit speculative later hops.
+        return Ok(Vec::new());
+    }
     let mut rows = BTreeMap::<String, ValueFlowEdgePayload>::new();
     let mut seen_edge_ids: BTreeSet<String> = direct_withdrawal_edges
         .iter()
@@ -1210,11 +1254,9 @@ fn is_contract_withdrawal_transfer(
 ) -> bool {
     transfer.block_number == lookup.block_number
         && transfer_value_positive(transfer)
-        && transfer.from_address.eq_ignore_ascii_case(contract_address)
-        && !transfer
-            .to_address
-            .eq_ignore_ascii_case(&lookup.minter_address)
-        && !transfer.to_address.eq_ignore_ascii_case(ZERO_ADDRESS)
+        && identities_equal(&transfer.from_address, contract_address)
+        && !identities_equal(&transfer.to_address, &lookup.minter_address)
+        && !identities_equal(&transfer.to_address, ZERO_ADDRESS)
 }
 
 fn transfer_is_at_or_after_mint(
@@ -1242,9 +1284,9 @@ fn is_cashout_hop_transfer(
 ) -> bool {
     if transfer.block_number != block_number
         || !transfer_value_positive(transfer)
-        || !transfer.from_address.eq_ignore_ascii_case(&node.address)
-        || transfer.to_address.eq_ignore_ascii_case(&node.address)
-        || transfer.to_address.eq_ignore_ascii_case(ZERO_ADDRESS)
+        || !identities_equal(&transfer.from_address, &node.address)
+        || identities_equal(&transfer.to_address, &node.address)
+        || identities_equal(&transfer.to_address, ZERO_ADDRESS)
     {
         return false;
     }
@@ -1301,7 +1343,7 @@ fn normalized_payment_token(symbol: &str, address: &str) -> (String, String) {
     let address = if address.trim().is_empty() {
         ZERO_ADDRESS.to_string()
     } else {
-        address.trim().to_lowercase()
+        normalize_chain_identity(address)
     };
     (symbol, address)
 }
@@ -1310,7 +1352,7 @@ fn receipt_for_transfer<'a>(
     transfer: &EthTransferRecord,
     block_receipts: &'a BTreeMap<String, TransactionReceiptRecord>,
 ) -> Option<&'a TransactionReceiptRecord> {
-    block_receipts.get(&transfer.tx_hash.to_lowercase())
+    block_receipts.get(&normalize_chain_identity(&transfer.tx_hash))
 }
 
 fn receipt_index_for_tx(
@@ -1318,12 +1360,16 @@ fn receipt_index_for_tx(
     block_receipts: &BTreeMap<String, TransactionReceiptRecord>,
 ) -> Option<i64> {
     block_receipts
-        .get(&tx_hash.to_lowercase())
+        .get(&normalize_chain_identity(tx_hash))
         .map(|receipt| receipt.transaction_index)
 }
 
 fn normalized_address(address: &str) -> String {
-    address.trim().to_lowercase()
+    normalize_chain_identity(address)
+}
+
+fn identities_equal(left: &str, right: &str) -> bool {
+    normalized_address(left) == normalized_address(right)
 }
 
 fn is_nonzero_address(address: &str) -> bool {
@@ -1351,9 +1397,9 @@ pub(super) fn mint_payment_wallet_snapshot(
             if transfer_receipt.transaction_index >= receipt.transaction_index {
                 continue;
             }
-            let sign = if transfer.to_address.eq_ignore_ascii_case(minter_address) {
+            let sign = if identities_equal(&transfer.to_address, minter_address) {
                 1.0
-            } else if transfer.from_address.eq_ignore_ascii_case(minter_address) {
+            } else if identities_equal(&transfer.from_address, minter_address) {
                 -1.0
             } else {
                 continue;
@@ -1398,6 +1444,9 @@ pub(super) fn value_with_gas_usd(
 }
 
 pub(super) fn gas_eth_from_receipt(receipt: &TransactionReceiptRecord) -> f64 {
+    if let Some(fee_native) = receipt.fee_native {
+        return fee_native.max(0.0);
+    }
     (receipt.gas_used as f64 * receipt.effective_gas_price_wei as f64)
         / 1_000_000_000_000_000_000_f64
 }
@@ -1411,6 +1460,9 @@ fn receipt_gas_usd(
     transfer: &EthTransferRecord,
     receipt: &TransactionReceiptRecord,
 ) -> Option<f64> {
+    if let Some(fee_usd) = receipt.fee_usd {
+        return Some(fee_usd.max(0.0));
+    }
     infer_eth_usd_rate_from_transfer(transfer).and_then(|rate| {
         let gas_usd = gas_eth_from_receipt(receipt) * rate;
         (gas_usd > 0.0).then_some(gas_usd)
@@ -1421,9 +1473,7 @@ fn receipt_gas_paid_by_transfer_sender(
     transfer: &EthTransferRecord,
     receipt: &TransactionReceiptRecord,
 ) -> bool {
-    receipt
-        .from_address
-        .eq_ignore_ascii_case(&transfer.from_address)
+    identities_equal(&receipt.from_address, &transfer.from_address)
 }
 
 pub(super) fn infer_eth_usd_rate_from_transfers(transfers: &[EthTransferRecord]) -> Option<f64> {
@@ -1451,23 +1501,23 @@ pub(super) fn contract_control_role<'a>(
     contract_address: &str,
     metadata: Option<&'a ContractMetadata>,
 ) -> Option<&'a str> {
-    if address.eq_ignore_ascii_case(contract_address) {
+    if identities_equal(address, contract_address) {
         return Some("mint_contract");
     }
     let metadata = metadata?;
     if !metadata.contract_deployer.is_empty()
-        && address.eq_ignore_ascii_case(&metadata.contract_deployer)
+        && identities_equal(address, &metadata.contract_deployer)
     {
         return Some("contract_deployer");
     }
-    if !metadata.owner_address.is_empty() && address.eq_ignore_ascii_case(&metadata.owner_address) {
+    if !metadata.owner_address.is_empty() && identities_equal(address, &metadata.owner_address) {
         return Some("contract_owner");
     }
-    if !metadata.admin_address.is_empty() && address.eq_ignore_ascii_case(&metadata.admin_address) {
+    if !metadata.admin_address.is_empty() && identities_equal(address, &metadata.admin_address) {
         return Some("contract_admin");
     }
     if !metadata.proxy_admin_address.is_empty()
-        && address.eq_ignore_ascii_case(&metadata.proxy_admin_address)
+        && identities_equal(address, &metadata.proxy_admin_address)
     {
         return Some("proxy_admin");
     }
@@ -1483,26 +1533,21 @@ pub(super) fn is_matching_mint_payment_transfer(
 ) -> bool {
     transfer.tx_hash == lookup.tx_hash
         && transfer_value_positive(transfer)
-        && transfer
-            .from_address
-            .eq_ignore_ascii_case(&lookup.minter_address)
-        && (transfer.to_address.eq_ignore_ascii_case(contract_address)
+        && identities_equal(&transfer.from_address, &lookup.minter_address)
+        && (identities_equal(&transfer.to_address, contract_address)
             || (!contract_deployer.is_empty()
-                && transfer.to_address.eq_ignore_ascii_case(contract_deployer))
+                && identities_equal(&transfer.to_address, contract_deployer))
             || contract_metadata
                 .map(|metadata| {
                     (!metadata.owner_address.is_empty()
-                        && transfer
-                            .to_address
-                            .eq_ignore_ascii_case(&metadata.owner_address))
+                        && identities_equal(&transfer.to_address, &metadata.owner_address))
                         || (!metadata.admin_address.is_empty()
-                            && transfer
-                                .to_address
-                                .eq_ignore_ascii_case(&metadata.admin_address))
+                            && identities_equal(&transfer.to_address, &metadata.admin_address))
                         || (!metadata.proxy_admin_address.is_empty()
-                            && transfer
-                                .to_address
-                                .eq_ignore_ascii_case(&metadata.proxy_admin_address))
+                            && identities_equal(
+                                &transfer.to_address,
+                                &metadata.proxy_admin_address,
+                            ))
                 })
                 .unwrap_or(false))
 }

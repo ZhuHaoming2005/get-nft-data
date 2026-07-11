@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::models::{
-    AddressAttributionPayload, AddressEvidenceFeaturePayload, CampaignClusterPayload,
-    ContentSimilarityEdgePayload, ContractLifecycleEventPayload, ContractLifecycleMetricPayload,
-    DuplicateCandidate, DuplicateContractPayload, EarlyDetectionFeaturePayload,
-    NftPropagationEdgePayload, NftPropagationPathPayload, SeedContractPayload,
-    ValueFlowEdgePayload, WeakSupervisionLabelPayload,
+    normalize_chain_identity, AddressAttributionPayload, AddressEvidenceFeaturePayload,
+    CampaignClusterPayload, ContentSimilarityEdgePayload, ContractLifecycleEventPayload,
+    ContractLifecycleMetricPayload, DuplicateCandidate, DuplicateContractPayload,
+    EarlyDetectionFeaturePayload, NftPropagationEdgePayload, NftPropagationPathPayload,
+    SeedContractPayload, ValueFlowEdgePayload, WeakSupervisionLabelPayload,
 };
 
 const VALUE_FLOW_COVERAGE_SCOPE: &str =
@@ -941,9 +941,8 @@ fn is_operator_revenue_edge(
                     | "contract_owner"
                     | "contract_admin"
                     | "proxy_admin"
-            ) || edge
-                .to_address
-                .eq_ignore_ascii_case(edge.contract_address.as_str())
+            ) || normalize_chain_identity(&edge.to_address)
+                == normalize_chain_identity(&edge.contract_address)
         }
         "sale_payment" | "royalty_fee" => {
             edge.recipient_known
@@ -1021,10 +1020,9 @@ fn has_strong_operator_address_evidence(
     address: &str,
 ) -> bool {
     features.iter().any(|feature| {
-        feature
-            .contract_address
-            .eq_ignore_ascii_case(contract_address)
-            && feature.address.eq_ignore_ascii_case(address)
+        normalize_chain_identity(&feature.contract_address)
+            == normalize_chain_identity(contract_address)
+            && normalize_chain_identity(&feature.address) == normalize_chain_identity(address)
             && matches!(
                 feature.attribution_label.as_str(),
                 "suspected_operator" | "suspected_colluder" | "corrupted_victim"

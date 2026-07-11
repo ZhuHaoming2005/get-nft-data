@@ -1,7 +1,10 @@
 use super::*;
 
 impl DuckDbFeatureStore {
-    pub(super) fn feature_chain_stats(conn: &Connection, chain: &str) -> Result<FeatureChainStats, AppError> {
+    pub(super) fn feature_chain_stats(
+        conn: &Connection,
+        chain: &str,
+    ) -> Result<FeatureChainStats, AppError> {
         conn.query_row(
             "
             SELECT
@@ -72,7 +75,9 @@ impl DuckDbFeatureStore {
             )
             WITH feature_rows AS (
                 SELECT chain,
-                       lower(CAST(contract_address AS VARCHAR)) AS contract_address,
+                       CASE WHEN lower(trim(CAST(chain AS VARCHAR))) = 'solana'
+                            THEN trim(CAST(contract_address AS VARCHAR))
+                            ELSE lower(trim(CAST(contract_address AS VARCHAR))) END AS contract_address,
                        rowid AS feature_rowid,
                        CAST(token_id AS VARCHAR) AS token_id,
                        trim(coalesce(CAST(name AS VARCHAR), '')) AS name_sort,
@@ -125,7 +130,9 @@ impl DuckDbFeatureStore {
             SELECT
                 chain,
                 rowid AS feature_rowid,
-                lower(CAST(contract_address AS VARCHAR)) AS contract_address,
+                CASE WHEN lower(trim(CAST(chain AS VARCHAR))) = 'solana'
+                     THEN trim(CAST(contract_address AS VARCHAR))
+                     ELSE lower(trim(CAST(contract_address AS VARCHAR))) END AS contract_address,
                 CAST(token_id AS VARCHAR) AS token_id,
                 coalesce(CAST(token_uri_norm AS VARCHAR), '') AS token_uri_norm,
                 coalesce(CAST(image_uri_norm AS VARCHAR), '') AS image_uri_norm,
@@ -153,7 +160,9 @@ impl DuckDbFeatureStore {
             let sql = format!(
                 "
                 SELECT f.rowid AS feature_rowid,
-                       lower(CAST(f.contract_address AS VARCHAR)) AS contract_address,
+                       CASE WHEN lower(trim(CAST(f.chain AS VARCHAR))) = 'solana'
+                            THEN trim(CAST(f.contract_address AS VARCHAR))
+                            ELSE lower(trim(CAST(f.contract_address AS VARCHAR))) END AS contract_address,
                        CAST(f.token_id AS VARCHAR) AS token_id,
                        coalesce(CAST(f.token_uri_norm AS VARCHAR), '') AS token_uri_norm,
                        coalesce(CAST(f.image_uri_norm AS VARCHAR), '') AS image_uri_norm,
@@ -295,7 +304,9 @@ impl DuckDbFeatureStore {
         let sql = format!(
             "
             SELECT f.rowid AS feature_rowid,
-                   lower(CAST(f.contract_address AS VARCHAR)) AS contract_address,
+                   CASE WHEN lower(trim(CAST(f.chain AS VARCHAR))) = 'solana'
+                        THEN trim(CAST(f.contract_address AS VARCHAR))
+                        ELSE lower(trim(CAST(f.contract_address AS VARCHAR))) END AS contract_address,
                    CAST(f.token_id AS VARCHAR) AS token_id,
                    coalesce(CAST(f.token_uri_norm AS VARCHAR), '') AS token_uri_norm,
                    coalesce(CAST(f.image_uri_norm AS VARCHAR), '') AS image_uri_norm,
@@ -303,7 +314,9 @@ impl DuckDbFeatureStore {
                    coalesce(CAST(f.metadata_json AS VARCHAR), '') AS metadata_json
             FROM nft_features f
             JOIN {UNUSABLE_METADATA_CONTRACT_TABLE} u
-              ON u.contract_address = lower(CAST(f.contract_address AS VARCHAR))
+              ON u.contract_address = CASE WHEN lower(trim(CAST(f.chain AS VARCHAR))) = 'solana'
+                                           THEN trim(CAST(f.contract_address AS VARCHAR))
+                                           ELSE lower(trim(CAST(f.contract_address AS VARCHAR))) END
             WHERE f.chain = ?
               AND {}
             ORDER BY contract_address, token_id, f.rowid

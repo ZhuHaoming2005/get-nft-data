@@ -3,7 +3,6 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::api::{ApiEndpoints, AsyncApiClient};
-use crate::currency::{is_supported_priced_symbol, to_normalized_amount};
 use crate::error::AppError;
 use crate::models::{
     ContractMetadata, EthTransferRecord, OwnerBalance, SeedNft, TransactionReceiptRecord,
@@ -860,6 +859,8 @@ pub async fn fetch_transaction_receipt(
             .to_lowercase(),
         gas_used: parse_hex_or_decimal_i64(result.get("gasUsed")),
         effective_gas_price_wei: parse_hex_or_decimal_i64(result.get("effectiveGasPrice")),
+        fee_native: None,
+        fee_usd: None,
     })
 }
 
@@ -911,6 +912,8 @@ pub async fn fetch_transaction_receipts_for_block(
                     .to_lowercase(),
                 gas_used: parse_hex_or_decimal_i64(item.get("gasUsed")),
                 effective_gas_price_wei: parse_hex_or_decimal_i64(item.get("effectiveGasPrice")),
+                fee_native: None,
+                fee_usd: None,
             },
         );
     }
@@ -946,6 +949,7 @@ pub async fn fetch_eth_balance(
 async fn fetch_address_eth_transfers(
     client: &AsyncApiClient,
     endpoints: &ApiEndpoints,
+    chain: &str,
     block_number: i64,
     address: &str,
     direction: &str,
@@ -985,11 +989,8 @@ async fn fetch_address_eth_transfers(
         let symbol = transfer_asset_symbol(item);
         let token_address = transfer_token_address(item);
         let amount = parse_transfer_amount(item);
-        let normalized = if is_supported_priced_symbol(&symbol) {
-            to_normalized_amount(amount, &symbol, eth_usd_rate)
-        } else {
-            Default::default()
-        };
+        let normalized =
+            crate::currency::to_chain_normalized_amount(chain, amount, &symbol, eth_usd_rate);
         rows.push(EthTransferRecord {
             tx_hash: item
                 .get("hash")
@@ -1027,13 +1028,21 @@ pub async fn fetch_same_block_eth_transfers_for_address(
     block_number: i64,
     address: &str,
 ) -> Result<Vec<EthTransferRecord>, AppError> {
-    fetch_same_block_value_transfers_for_address(client, endpoints, block_number, address, None)
-        .await
+    fetch_same_block_value_transfers_for_address(
+        client,
+        endpoints,
+        "ethereum",
+        block_number,
+        address,
+        None,
+    )
+    .await
 }
 
 pub async fn fetch_same_block_value_transfers_for_address(
     client: &AsyncApiClient,
     endpoints: &ApiEndpoints,
+    chain: &str,
     block_number: i64,
     address: &str,
     eth_usd_rate: Option<f64>,
@@ -1042,12 +1051,21 @@ pub async fn fetch_same_block_value_transfers_for_address(
         fetch_address_eth_transfers(
             client,
             endpoints,
+            chain,
             block_number,
             address,
             "from",
             eth_usd_rate
         ),
-        fetch_address_eth_transfers(client, endpoints, block_number, address, "to", eth_usd_rate)
+        fetch_address_eth_transfers(
+            client,
+            endpoints,
+            chain,
+            block_number,
+            address,
+            "to",
+            eth_usd_rate
+        )
     );
     let mut rows = from_rows?;
     rows.extend(to_rows?);
@@ -1057,13 +1075,21 @@ pub async fn fetch_same_block_value_transfers_for_address(
 pub async fn fetch_same_block_value_transfers_to_address(
     client: &AsyncApiClient,
     endpoints: &ApiEndpoints,
+    chain: &str,
     block_number: i64,
     address: &str,
     eth_usd_rate: Option<f64>,
 ) -> Result<Vec<EthTransferRecord>, AppError> {
-    let rows =
-        fetch_address_eth_transfers(client, endpoints, block_number, address, "to", eth_usd_rate)
-            .await?;
+    let rows = fetch_address_eth_transfers(
+        client,
+        endpoints,
+        chain,
+        block_number,
+        address,
+        "to",
+        eth_usd_rate,
+    )
+    .await?;
     Ok(deduplicate_eth_transfer_rows(rows))
 }
 

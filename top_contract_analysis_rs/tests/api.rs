@@ -13,9 +13,10 @@ use top_contract_analysis_rs::api::{
     fetch_eth_balance, fetch_is_holder_of_contract, fetch_license_sample,
     fetch_opensea_account_holds_contract_nft, fetch_opensea_contract_collection_slug,
     fetch_opensea_contract_metadata, fetch_opensea_contract_nfts,
-    fetch_same_block_eth_transfers_for_address, fetch_seed_contract_nfts,
-    fetch_transaction_receipt, fetch_transaction_receipts_for_block, is_open_license_payload,
-    ApiEndpoints, AsyncApiClient, OpenSeaAccountFallback, DEFAULT_API_RETRIES,
+    fetch_same_block_eth_transfers_for_address, fetch_same_block_value_transfers_for_address,
+    fetch_seed_contract_nfts, fetch_transaction_receipt, fetch_transaction_receipts_for_block,
+    is_open_license_payload, ApiEndpoints, AsyncApiClient, OpenSeaAccountFallback,
+    DEFAULT_API_RETRIES,
 };
 use top_contract_analysis_rs::models::SeedNft;
 
@@ -2024,6 +2025,112 @@ async fn contract_sales_parse_opensea_fallback_sale_event_shape() {
 }
 
 #[tokio::test]
+async fn solana_opensea_sales_use_solana_chain_and_preserve_base58_case() {
+    let server = MockServer::start_async().await;
+    let contract = "So11111111111111111111111111111111111111112";
+    let buyer = "Vote111111111111111111111111111111111111111";
+    server
+        .mock_async(|when, then| {
+            when.method(GET)
+                .path(format!("/api/v2/chain/solana/contract/{contract}"));
+            then.status(200)
+                .json_body_obj(&serde_json::json!({"collection": {"slug": "sol-collection"}}));
+        })
+        .await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET)
+                .path("/api/v2/events/collection/sol-collection");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "asset_events": [{
+                    "event_type": "sale",
+                    "nft": {"identifier": "MintCase", "contract": {"address": contract}},
+                    "payment": {"symbol": "SOL", "decimals": 9, "quantity": "2000000000"},
+                    "transaction": {"hash": "SignatureCaseSensitive"},
+                    "to_address": buyer,
+                    "from_address": "SellerCaseSensitive"
+                }],
+                "next": ""
+            }));
+        })
+        .await;
+    let client = test_client();
+    let endpoints = ApiEndpoints {
+        alchemy_nft_v2_base: server.base_url(),
+        alchemy_nft_v3_base: server.base_url(),
+        alchemy_rpc_base: server.base_url(),
+        etherscan_base: server.base_url(),
+        opensea_base: server.base_url(),
+    };
+
+    let rows = fetch_contract_sales(&client, &endpoints, "solana", contract, "key", Some(100.0))
+        .await
+        .unwrap();
+
+    assert_eq!(rows[0].contract_address, contract);
+    assert_eq!(rows[0].buyer_address, buyer);
+    assert_eq!(rows[0].tx_hash, "SignatureCaseSensitive");
+    assert_eq!(rows[0].price_eth, Some(2.0));
+    assert_eq!(rows[0].price_usd, Some(200.0));
+}
+
+#[tokio::test]
+async fn solana_opensea_nfts_preserve_base58_contract_case() {
+    let server = MockServer::start_async().await;
+    let contract = "CaseSensitiveCollection111111111111111111111111";
+    server
+        .mock_async(|when, then| {
+            when.method(GET)
+                .path(format!("/api/v2/chain/solana/contract/{contract}/nfts"));
+            then.status(200).json_body_obj(&serde_json::json!({
+                "nfts": [{"identifier": "MintOne", "contract": contract}],
+                "next": ""
+            }));
+        })
+        .await;
+    let client = test_client();
+
+    let rows = fetch_opensea_contract_nfts(&client, &server.base_url(), "solana", contract, "key")
+        .await
+        .unwrap();
+
+    assert_eq!(rows[0].contract_address, contract);
+}
+
+#[tokio::test]
+async fn solana_opensea_supplement_failure_is_not_indistinguishable_from_no_sales() {
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET)
+                .path("/api/v2/chain/solana/contract/CollectionCase");
+            then.status(500).body("provider unavailable");
+        })
+        .await;
+    let endpoints = ApiEndpoints {
+        alchemy_nft_v2_base: server.base_url(),
+        alchemy_nft_v3_base: server.base_url(),
+        alchemy_rpc_base: server.base_url(),
+        etherscan_base: server.base_url(),
+        opensea_base: server.base_url(),
+    };
+    let client = test_client();
+
+    let result = fetch_contract_sales_with_clients(
+        &client,
+        &client,
+        &endpoints,
+        "solana",
+        "CollectionCase",
+        "key",
+        None,
+    )
+    .await;
+
+    assert!(result.is_err());
+}
+
+#[tokio::test]
 async fn contract_sales_do_not_treat_opensea_maker_taker_as_buyer_seller() {
     let alchemy_server = MockServer::start_async().await;
     alchemy_server
@@ -2315,6 +2422,41 @@ async fn contract_sales_convert_alchemy_stablecoin_amounts_to_usd_primary_amount
 }
 
 #[tokio::test]
+async fn polygon_alchemy_sales_price_pol_as_chain_native_currency() {
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/nft/v3/key/getNFTSales");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "nftSales": [{
+                    "marketplace": "seaport",
+                    "contractAddress": "0xdup",
+                    "tokenId": "1",
+                    "buyerAddress": "0xbuyer",
+                    "sellerAddress": "0xseller",
+                    "sellerFee": {"amount": "1250000000000000000", "symbol": "POL", "decimals": 18},
+                    "blockNumber": 10,
+                    "transactionHash": "0xpol"
+                }]
+            }));
+        })
+        .await;
+    let client = test_client();
+    let endpoints = test_endpoints(&server.base_url());
+
+    let rows = fetch_contract_sales(&client, &endpoints, "polygon", "0xdup", "", Some(0.5))
+        .await
+        .unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].payment_token_symbol, "POL");
+    assert_eq!(rows[0].price_eth, Some(1.25));
+    assert_eq!(rows[0].price_usd, Some(0.625));
+    assert_eq!(rows[0].seller_fee_eth, 1.25);
+    assert!(rows[0].is_native_eth);
+}
+
+#[tokio::test]
 async fn contract_sales_convert_opensea_stablecoin_amounts_to_usd_primary_amount() {
     let alchemy_server = MockServer::start_async().await;
     alchemy_server
@@ -2522,4 +2664,39 @@ async fn fetch_eth_balance_and_same_block_transfers_parse_rpc_payloads() {
     assert_eq!(transfers[0].block_number, 2);
     assert!(transfers.iter().any(|row| row.value_eth == 1.0));
     assert!(transfers.iter().any(|row| row.value_eth == 2.5));
+}
+
+#[tokio::test]
+async fn same_block_transfers_use_explicit_chain_with_custom_rpc_hostname() {
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/custom-rpc")
+                .body_contains("alchemy_getAssetTransfers");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "result": {"transfers": [{
+                    "hash": "0xpol", "from": "0xbuyer", "to": "0xseller",
+                    "value": 3.0, "asset": "POL", "category": "external"
+                }]}
+            }));
+        })
+        .await;
+    let client = test_client();
+    let mut endpoints = test_endpoints(&server.base_url());
+    endpoints.alchemy_rpc_base = format!("{}/custom-rpc", server.base_url());
+
+    let rows = fetch_same_block_value_transfers_for_address(
+        &client,
+        &endpoints,
+        "polygon",
+        2,
+        "0xbuyer",
+        Some(0.5),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(rows[0].value_eth, 3.0);
+    assert_eq!(rows[0].value_usd, Some(1.5));
 }

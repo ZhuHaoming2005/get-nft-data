@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::models::{
-    AddressAttributionPayload, ContractLevelSummaryPayload, ContractMetadata, DuplicateCandidate,
-    DuplicateContractPayload, MaliciousAddressPayload, NftPropagationPathPayload,
-    SecondarySaleVictimAddressPayload, SeedCollectionStatsPayload, SeedNft, SingleReportPayload,
-    ValueFlowEdgePayload, VictimAcquisitionAddressPayload,
+    normalize_chain_identity, AddressAttributionPayload, ContractLevelSummaryPayload,
+    ContractMetadata, DuplicateCandidate, DuplicateContractPayload, MaliciousAddressPayload,
+    NftPropagationPathPayload, SecondarySaleVictimAddressPayload, SeedCollectionStatsPayload,
+    SeedNft, SingleReportPayload, ValueFlowEdgePayload, VictimAcquisitionAddressPayload,
 };
 use crate::normalize::{normalize_name, normalize_symbol, normalize_url};
 
@@ -219,7 +219,7 @@ pub(super) fn build_victim_acquisition_addresses_excluding_malicious(
         let gas_extra_usd = edge_sender_paid_gas_usd(edge);
         if gas_extra_eth > 0.0 || gas_extra_usd > 0.0 {
             let entry = gas_extra_by_address
-                .entry(row.address.to_lowercase())
+                .entry(normalize_chain_identity(&row.address))
                 .or_default();
             entry.0 += gas_extra_eth;
             entry.1 += gas_extra_usd;
@@ -290,9 +290,7 @@ pub(super) fn acquisition_ratio(
 
 fn edge_sender_paid_gas(edge: &ValueFlowEdgePayload) -> bool {
     edge.gas_payer_address.trim().is_empty()
-        || edge
-            .gas_payer_address
-            .eq_ignore_ascii_case(&edge.from_address)
+        || normalized_address(&edge.gas_payer_address) == normalized_address(&edge.from_address)
 }
 
 fn edge_sender_paid_gas_eth(edge: &ValueFlowEdgePayload) -> f64 {
@@ -338,7 +336,7 @@ pub(super) fn is_victim_attribution_label(label: &str) -> bool {
 }
 
 pub(super) fn normalized_address(address: &str) -> String {
-    address.trim().to_lowercase()
+    normalize_chain_identity(address)
 }
 
 pub(super) fn paid_mint_stuck_token_counts(
@@ -351,8 +349,7 @@ pub(super) fn paid_mint_stuck_token_counts(
     }
     let Some(path) = propagation_paths.get(&edge.contract_address).or_else(|| {
         propagation_paths.values().find(|path| {
-            path.contract_address
-                .eq_ignore_ascii_case(&edge.contract_address)
+            normalized_address(&path.contract_address) == normalized_address(&edge.contract_address)
         })
     }) else {
         return (0, token_ids.len());

@@ -3,7 +3,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use futures::{stream, StreamExt};
 
 use crate::error::AppError;
-use crate::models::{DatabaseNftRecord, DuplicateCandidate, DuplicateContractPayload, SeedNft};
+use crate::models::{
+    normalize_chain_identity, DatabaseNftRecord, DuplicateCandidate, DuplicateContractPayload,
+    SeedNft,
+};
 
 use super::{
     AnalysisDeps, AnalyzeRequest, CandidateContractFilterResult, CandidateSeedHolderRequest,
@@ -45,7 +48,7 @@ pub(super) async fn filter_seed_related_candidate_contracts(
         .iter()
         .map(|candidate| {
             (
-                candidate.contract_address.to_lowercase(),
+                normalize_chain_identity(&candidate.contract_address),
                 candidate.contract_address.clone(),
             )
         })
@@ -139,7 +142,7 @@ pub(super) async fn filter_seed_related_candidate_contracts(
     .buffer_unordered(concurrency.max(1));
 
     while let Some((contract_address, check)) = holder_checks.next().await {
-        let contract_key = contract_address.to_lowercase();
+        let contract_key = normalize_chain_identity(&contract_address);
         match check {
             CandidateSeedRelationCheck::Exclude(reason) => {
                 exclusion_reasons_by_contract
@@ -183,14 +186,14 @@ pub(super) async fn filter_seed_related_candidate_contracts(
         {
             Ok(seed_transfers) => {
                 for transfer in seed_transfers {
-                    let to_address = transfer.to_address.to_lowercase();
+                    let to_address = normalize_chain_identity(&transfer.to_address);
                     if remaining_contracts.contains(&to_address) {
                         exclusion_reasons_by_contract
                             .entry(to_address)
                             .or_default()
                             .insert("链上历史 Transfer 显示接收过 seed 合约 NFT".to_string());
                     }
-                    let from_address = transfer.from_address.to_lowercase();
+                    let from_address = normalize_chain_identity(&transfer.from_address);
                     if remaining_contracts.contains(&from_address) {
                         exclusion_reasons_by_contract
                             .entry(from_address)
@@ -213,7 +216,8 @@ pub(super) async fn filter_seed_related_candidate_contracts(
     let candidates = candidates
         .into_iter()
         .filter(|candidate| {
-            !exclusion_reasons_by_contract.contains_key(&candidate.contract_address.to_lowercase())
+            !exclusion_reasons_by_contract
+                .contains_key(&normalize_chain_identity(&candidate.contract_address))
         })
         .collect();
 
@@ -232,7 +236,9 @@ pub(super) fn build_seed_related_legit_duplicate_payloads(
         .filter_map(|(contract_key, reasons)| {
             let contract_candidates: Vec<&DuplicateCandidate> = candidates
                 .iter()
-                .filter(|candidate| candidate.contract_address.to_lowercase() == *contract_key)
+                .filter(|candidate| {
+                    normalize_chain_identity(&candidate.contract_address) == *contract_key
+                })
                 .collect();
             if contract_candidates.is_empty() {
                 return None;
@@ -261,7 +267,7 @@ impl<'a> SnapshotTokenIndex<'a> {
         let mut rows_by_contract = HashMap::<String, Vec<&'a DatabaseNftRecord>>::new();
         for row in snapshot_rows {
             rows_by_contract
-                .entry(row.contract_address.to_lowercase())
+                .entry(normalize_chain_identity(&row.contract_address))
                 .or_default()
                 .push(row);
         }
@@ -276,7 +282,7 @@ impl<'a> SnapshotTokenIndex<'a> {
     ) -> Vec<DuplicateCandidate> {
         let rows = self
             .rows_by_contract
-            .get(&contract_address.to_lowercase())
+            .get(&normalize_chain_identity(contract_address))
             .into_iter()
             .flat_map(|rows| rows.iter().copied());
         expand_candidate_indexes_to_contract_tokens(
@@ -289,7 +295,7 @@ impl<'a> SnapshotTokenIndex<'a> {
 
     pub(super) fn contract_token_count(&self, contract_address: &str) -> usize {
         self.rows_by_contract
-            .get(&contract_address.to_lowercase())
+            .get(&normalize_chain_identity(contract_address))
             .map(Vec::len)
             .unwrap_or_default()
     }
@@ -432,11 +438,11 @@ where
             contract_address: contract_address.to_string(),
             ..DuplicateCandidate::default()
         });
-    let contract_key = contract_address.to_lowercase();
+    let contract_key = normalize_chain_identity(contract_address);
     let mut seen_tokens = BTreeSet::new();
     let mut expanded: Vec<DuplicateCandidate> = contract_tokens
         .into_iter()
-        .filter(|row| row.contract_address().to_lowercase() == contract_key)
+        .filter(|row| normalize_chain_identity(row.contract_address()) == contract_key)
         .filter_map(|row| {
             let token_id = row.token_id().trim();
             if token_id.is_empty() || !seen_tokens.insert(token_id.to_string()) {
@@ -492,5 +498,36 @@ mod tests {
         assert_eq!(expanded.len(), 1);
         assert_eq!(expanded[0].token_id, "2");
         assert_eq!(expanded[0].match_reasons, vec!["token_uri_match"]);
+    }
+
+    #[test]
+    fn contract_token_expansion_preserves_case_sensitive_solana_identity() {
+        let candidates = vec![DuplicateCandidate {
+            contract_address: "CaseSensitiveSolanaAddress".into(),
+            token_id: "1".into(),
+            ..DuplicateCandidate::default()
+        }];
+        let tokens = vec![
+            SeedNft {
+                contract_address: "CaseSensitiveSolanaAddress".into(),
+                token_id: "1".into(),
+                ..SeedNft::default()
+            },
+            SeedNft {
+                contract_address: "casesensitivesolanaaddress".into(),
+                token_id: "2".into(),
+                ..SeedNft::default()
+            },
+        ];
+
+        let expanded = expand_candidate_indexes_to_contract_tokens(
+            "CaseSensitiveSolanaAddress",
+            &[0],
+            &candidates,
+            tokens,
+        );
+
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(expanded[0].token_id, "1");
     }
 }

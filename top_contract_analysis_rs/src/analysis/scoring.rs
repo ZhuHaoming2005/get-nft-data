@@ -1,6 +1,6 @@
-use std::collections::{BTreeSet, HashMap};
 #[cfg(test)]
 use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap};
 
 use once_cell::sync::Lazy;
 use rapidfuzz::distance::jaro_winkler;

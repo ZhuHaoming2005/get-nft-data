@@ -70,6 +70,18 @@ pub struct AnalyzeArgs {
     pub feature_parquet: String,
     #[arg(long, default_value = ":memory:")]
     pub feature_db: String,
+    #[arg(long, default_value = "")]
+    pub helius_api_key: String,
+    #[arg(long, default_value_t = 4)]
+    pub helius_api_max_concurrency: usize,
+    #[arg(long, default_value_t = 100)]
+    pub helius_rate_limit_refill_ms: u64,
+    #[arg(long, default_value_t = 100)]
+    pub max_history_transactions_per_asset: usize,
+    #[arg(long, default_value_t = 10_000)]
+    pub max_history_transactions_per_collection: usize,
+    #[arg(long, default_value_t = 10_000)]
+    pub max_helius_assets_per_collection: usize,
     #[arg(long, default_value_t = 2)]
     pub paper_min_cycle_size: usize,
     #[arg(long, default_value_t = 3)]
@@ -82,14 +94,12 @@ pub struct AnalyzeArgs {
 
 #[derive(Args, Debug)]
 pub struct BatchArgs {
-    #[arg(long, default_value = "ethereum")]
-    pub chain: String,
     #[arg(long)]
     pub seed_file: String,
     #[arg(long, default_value = "")]
     pub alchemy_api_key: String,
-    #[arg(long, default_value = "")]
-    pub alchemy_network: String,
+    #[arg(long)]
+    pub alchemy_network: Vec<String>,
     #[arg(long, default_value = "")]
     pub etherscan_api_key: String,
     #[arg(long, default_value = "")]
@@ -131,10 +141,22 @@ pub struct BatchArgs {
     pub physical_cores: usize,
     #[arg(long, default_value = "150GB")]
     pub duckdb_memory_limit: String,
-    #[arg(long, default_value = "")]
-    pub feature_parquet: String,
+    #[arg(long)]
+    pub feature_parquet: Vec<String>,
     #[arg(long, default_value = ":memory:")]
     pub feature_db: String,
+    #[arg(long, default_value = "")]
+    pub helius_api_key: String,
+    #[arg(long, default_value_t = 4)]
+    pub helius_api_max_concurrency: usize,
+    #[arg(long, default_value_t = 100)]
+    pub helius_rate_limit_refill_ms: u64,
+    #[arg(long, default_value_t = 100)]
+    pub max_history_transactions_per_asset: usize,
+    #[arg(long, default_value_t = 10_000)]
+    pub max_history_transactions_per_collection: usize,
+    #[arg(long, default_value_t = 10_000)]
+    pub max_helius_assets_per_collection: usize,
     #[arg(long, default_value_t = 0)]
     pub max_recall_rows: usize,
     #[arg(long, default_value_t = 0)]
