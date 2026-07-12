@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = [
+    "name_uri_analysis_rs",
+    "top_contract_analysis_rs",
+]
+
+[profile.test]
+debug = 0

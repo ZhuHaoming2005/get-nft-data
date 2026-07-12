@@ -5,6 +5,10 @@ edition = "2021"
 
 [features]
 default = []
+api-tests = []
+cli-tests = []
+db-tests = []
+expensive-tests = ["api-tests", "cli-tests", "db-tests"]
 export-snapshot = ["dep:arrow-array", "dep:arrow-schema", "dep:parquet", "dep:postgres"]
 
 [dependencies]
@@ -36,3 +40,35 @@ httpmock = "0.7"
 predicates = "3.1"
 strsim = "0.11"
 tempfile = "3.27"
+
+[[test]]
+name = "analyze"
+required-features = ["api-tests"]
+
+[[test]]
+name = "api"
+required-features = ["api-tests"]
+
+[[test]]
+name = "cli_smoke"
+required-features = ["cli-tests"]
+
+[[test]]
+name = "helius"
+required-features = ["api-tests"]
+
+[[test]]
+name = "multichain"
+required-features = ["api-tests"]
+
+[[test]]
+name = "multichain_batch"
+required-features = ["api-tests"]
+
+[[test]]
+name = "paper_stats"
+required-features = ["db-tests"]
+
+[[test]]
+name = "store"
+required-features = ["db-tests"]
