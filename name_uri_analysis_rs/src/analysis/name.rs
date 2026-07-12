@@ -3,163 +3,217 @@ use super::*;
 pub(crate) struct NameAnalysisSpec<'a> {
     pub(crate) chains: &'a [String],
     pub(crate) totals: &'a HashMap<String, NameTotals>,
-    pub(crate) thresholds: &'a [f64],
+    pub(crate) threshold: f64,
     pub(crate) threads: usize,
     pub(crate) memory_limit: &'a str,
     pub(crate) analysis_memory_limit: Option<&'a str>,
+}
+
+pub(crate) struct CanonicalNameValues {
+    pub(crate) atoms: Vec<NameAtom>,
+    pub(crate) members: Vec<Vec<usize>>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct NameAlgorithmMetrics {
+    input_atoms: u64,
+    canonical_names: u64,
+    candidate_pairs: u64,
+    scored_pairs: u64,
+    matched_pairs: u64,
+    candidate_index_bytes: u64,
+    scratch_and_queue_bytes: u64,
+    dsu_and_chain_state_bytes: u64,
+}
+
+pub(crate) struct NameAnalysisResult {
+    pub(crate) rows: Vec<SummaryRow>,
+    pub(crate) metrics: NameAlgorithmMetrics,
+}
+
+pub(crate) fn canonical_name_values(atoms: &[NameAtom]) -> CanonicalNameValues {
+    let mut index_by_name = HashMap::<&str, usize>::new();
+    let mut canonical_atoms = Vec::<NameAtom>::new();
+    let mut members = Vec::<Vec<usize>>::new();
+    for (atom_index, atom) in atoms.iter().enumerate() {
+        if let Some(&canonical_index) = index_by_name.get(atom.name_norm.as_str()) {
+            let canonical = &mut canonical_atoms[canonical_index];
+            canonical.contract_count = canonical.contract_count.saturating_add(atom.contract_count);
+            canonical.nft_count = canonical.nft_count.saturating_add(atom.nft_count);
+            members[canonical_index].push(atom_index);
+            continue;
+        }
+        let canonical_index = canonical_atoms.len();
+        index_by_name.insert(atom.name_norm.as_str(), canonical_index);
+        canonical_atoms.push(NameAtom {
+            chain_index: atom.chain_index,
+            name_norm: atom.name_norm.clone(),
+            char_len: atom.char_len,
+            contract_count: atom.contract_count,
+            nft_count: atom.nft_count,
+        });
+        members.push(vec![atom_index]);
+    }
+    CanonicalNameValues {
+        atoms: canonical_atoms,
+        members,
+    }
 }
 
 pub(crate) fn run_name_analysis(
     conn: &Connection,
     spec: NameAnalysisSpec<'_>,
     progress: &ProgressTracker,
-) -> Result<Vec<SummaryRow>, AnalysisError> {
+) -> Result<NameAnalysisResult, AnalysisError> {
     let chains = spec.chains;
     let totals = spec.totals;
-    let thresholds = spec.thresholds;
+    let threshold = spec.threshold;
     progress.start_phase("analyzing name duplicates", 3);
     progress.step("loaded name totals");
     let atoms = load_all_name_atoms(conn, chains)?;
+    if atoms.len() > u32::MAX as usize {
+        return Err(AnalysisError::InvalidData(
+            "name atom count exceeds compact u32 indexes".to_string(),
+        ));
+    }
     progress.step(format!("loaded {} name atoms", atoms.len()));
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(spec.threads.max(1))
         .build()
         .map_err(|err| AnalysisError::InvalidData(err.to_string()))?;
-    let candidate_index = pool.install(|| NameCandidateIndex::new(&atoms));
-
-    let mut rows = Vec::new();
-    let base_atom_bytes =
-        name_atoms_memory_bytes(&atoms).saturating_add(candidate_index.memory_bytes());
-    let atoms_by_chain = atoms_by_chain(&atoms, chains.len());
-    let chain_matrix_state_bytes = chain_matrix_reuse_state_bytes(&atoms_by_chain);
-    let total_memory_budget = total_memory_budget_bytes(spec.memory_limit)?;
-    let initial_memory_plan = name_analysis_memory_plan(
-        thresholds,
+    let canonical = canonical_name_values(&atoms);
+    let canonical_name_count = canonical.atoms.len();
+    progress.set_message(format!(
+        "collapsed {} chain/name atoms to {} canonical names",
         atoms.len(),
-        chains.len(),
+        canonical.atoms.len()
+    ));
+    let canonical_members_bytes = canonical
+        .members
+        .capacity()
+        .saturating_mul(std::mem::size_of::<Vec<usize>>())
+        .saturating_add(
+            canonical
+                .members
+                .iter()
+                .map(|members| {
+                    members
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<usize>())
+                })
+                .sum::<usize>(),
+        );
+    let atoms_by_chain = atoms_by_chain(&atoms, chains.len());
+    let atoms_by_chain_bytes = atoms_by_chain
+        .capacity()
+        .saturating_mul(std::mem::size_of::<Vec<usize>>())
+        .saturating_add(
+            atoms_by_chain
+                .iter()
+                .map(|indexes| {
+                    indexes
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<usize>())
+                })
+                .fold(0usize, usize::saturating_add),
+        );
+    let base_atom_bytes = name_atoms_memory_bytes(&atoms)
+        .saturating_add(name_atoms_memory_bytes(&canonical.atoms))
+        .saturating_add(canonical_members_bytes)
+        .saturating_add(atoms_by_chain_bytes);
+    let index_estimate = estimate_name_candidate_index_bytes(&canonical.atoms);
+    let chain_matrix_state_bytes = chain_matrix_reuse_state_bytes(&atoms_by_chain);
+    let state_bytes =
+        threshold_state_bytes(atoms.len(), chains.len()).saturating_add(chain_matrix_state_bytes);
+    let initial_memory_plan = name_analysis_memory_plan(
         spec.memory_limit,
         spec.analysis_memory_limit,
-        base_atom_bytes,
-        chain_matrix_state_bytes,
+        base_atom_bytes.saturating_add(index_estimate.peak_build_bytes),
     )?;
+    let scoring_resident_bytes = base_atom_bytes
+        .saturating_add(index_estimate.resident_bytes)
+        .saturating_add(state_bytes);
     let scratch_plan = name_scratch_plan(
-        atoms.len(),
+        canonical.atoms.len(),
         spec.threads,
         initial_memory_plan
             .analysis_bytes
-            .saturating_sub(base_atom_bytes),
+            .saturating_sub(scoring_resident_bytes),
     );
-    let atom_bytes = base_atom_bytes.saturating_add(scratch_plan.reserved_bytes);
+    let scoring_peak_bytes = scoring_resident_bytes.saturating_add(scratch_plan.reserved_bytes);
     let memory_plan = name_analysis_memory_plan(
-        thresholds,
-        atoms.len(),
-        chains.len(),
         spec.memory_limit,
         spec.analysis_memory_limit,
-        atom_bytes,
-        chain_matrix_state_bytes,
+        scoring_peak_bytes,
     )?;
     progress.step(format!(
         "Rust analysis memory budget {}",
         format_byte_size(memory_plan.analysis_bytes)
     ));
-    let thresholds = unique_thresholds(thresholds);
-    let analysis_work_budget = memory_plan.analysis_bytes.saturating_sub(atom_bytes);
-    let per_threshold_bytes = threshold_state_bytes(atoms.len(), chains.len());
-    let chain_matrix_reuse =
-        chain_matrix_reuse_plan(&atoms_by_chain, analysis_work_budget, per_threshold_bytes);
-    let scoring_per_threshold_bytes = per_threshold_bytes.saturating_add(
-        chain_matrix_reuse
-            .as_ref()
-            .map_or(0, |plan| plan.per_threshold_bytes),
-    );
-    let threshold_budget_capacity = threshold_batch_capacity_for_state_bytes(
-        thresholds.len(),
-        scoring_per_threshold_bytes.max(1),
-        analysis_work_budget,
-    );
-    let mut memory_guard = MemoryGuard::new(total_memory_budget);
-    let mut threshold_start = 0;
-    while threshold_start < thresholds.len() {
-        let batch_size = memory_guard.next_threshold_batch_size(
-            thresholds.len() - threshold_start,
-            threshold_budget_capacity,
-            scoring_per_threshold_bytes,
-        );
-        let threshold_batch = thresholds[threshold_start..threshold_start + batch_size].to_vec();
-        threshold_start += batch_size;
-        progress.set_message(format!(
-            "name threshold batch {} threshold(s), RSS {}, chain_matrix {}",
-            threshold_batch.len(),
-            memory_guard
-                .current_rss_bytes()
-                .map(format_byte_size)
-                .unwrap_or_else(|| "unknown".to_string()),
-            if chain_matrix_reuse.is_some() {
-                "reuse"
-            } else {
-                "fallback"
-            }
-        ));
-        progress.add_work(atoms.len().saturating_sub(1) as u64);
-        let mut states = threshold_batch
-            .iter()
-            .copied()
-            .map(|threshold| ThresholdUnionState {
-                threshold,
-                intra: UnionFind::new(atoms.len()),
-                cross: (chains.len() > 1).then(SparseUnionFind::default),
-                chain_matrix: chain_matrix_reuse
-                    .as_ref()
-                    .map(|plan| new_chain_matrix_reuse_states(plan.pair_count)),
-            })
-            .collect::<Vec<_>>();
-        sort_threshold_states_for_apply(&mut states);
-        pool.install(|| {
-            union_full_name_pairs(
-                &atoms,
-                &candidate_index,
-                scratch_plan.mode,
-                &mut states,
-                chains.len(),
-                progress,
-            )
-        });
-
-        let chain_matrix_summary_work = if chain_matrix_reuse.is_some() {
-            states.len() as u64 * chain_pair_count(chains.len()) as u64 * 2
-        } else {
-            0
-        };
-        progress.add_work(states.len() as u64 * chains.len() as u64 + chain_matrix_summary_work);
-        for state in &mut states {
-            push_name_summary_rows(&mut rows, &atoms, &atoms_by_chain, chains, totals, state);
-            progress.inc(chains.len() as u64);
-            if chain_matrix_reuse.is_some() {
-                push_reused_chain_matrix_rows(&mut rows, &atoms, chains, totals, state);
-                progress.inc(chain_pair_count(chains.len()) as u64 * 2);
-            }
-        }
+    let candidate_index = pool.install(|| NameCandidateIndex::new(&canonical.atoms));
+    let actual_index_bytes = candidate_index.memory_bytes();
+    if actual_index_bytes > index_estimate.resident_bytes {
+        return Err(AnalysisError::InvalidData(format!(
+            "name candidate index used {}, exceeding conservative preflight estimate {}",
+            format_byte_size(actual_index_bytes),
+            format_byte_size(index_estimate.resident_bytes)
+        )));
     }
-    if chains.len() > 1 && chain_matrix_reuse.is_none() {
-        rows.extend(run_chain_matrix_analysis(
+    let mut rows = Vec::new();
+    progress.set_message("name single-threshold global scoring with chain-matrix reuse");
+    progress.add_work(canonical.atoms.len().saturating_sub(1) as u64);
+    let mut state = ThresholdUnionState {
+        threshold,
+        intra: UnionFind::new(atoms.len()),
+        cross: (chains.len() > 1).then(SparseUnionFind::default),
+        chain_matrix: (chains.len() > 1)
+            .then(|| new_chain_matrix_reuse_states(chain_pair_count(chains.len()))),
+    };
+    let scoring = pool.install(|| {
+        union_canonical_name_pairs(
             &atoms,
-            &atoms_by_chain,
+            &canonical,
             &candidate_index,
-            chains,
-            ChainMatrixAnalysisSpec {
-                thresholds: &thresholds,
-                analysis_budget: analysis_work_budget,
-                total_memory_budget,
-                totals,
-                scratch_mode: scratch_plan.mode,
-            },
-            &pool,
+            scratch_plan.mode,
+            &mut state,
+            chains.len(),
             progress,
-        )?);
+        )
+    });
+    drop(candidate_index);
+    drop(canonical);
+    drop(pool);
+    progress.add_work(chains.len() as u64 + chain_pair_count(chains.len()) as u64 * 2);
+    push_name_summary_rows(
+        &mut rows,
+        &atoms,
+        &atoms_by_chain,
+        chains,
+        totals,
+        &mut state,
+    );
+    progress.inc(chains.len() as u64);
+    drop(atoms_by_chain);
+    state.intra = UnionFind::new(0);
+    state.cross = None;
+    if chains.len() > 1 {
+        push_reused_chain_matrix_rows(&mut rows, &atoms, chains, totals, &mut state);
+        progress.inc(chain_pair_count(chains.len()) as u64 * 2);
     }
     progress.finish_phase("name analysis complete");
-    Ok(rows)
+    Ok(NameAnalysisResult {
+        rows,
+        metrics: NameAlgorithmMetrics {
+            input_atoms: atoms.len() as u64,
+            canonical_names: canonical_name_count as u64,
+            candidate_pairs: scoring.candidate_pairs,
+            scored_pairs: scoring.scored_pairs,
+            matched_pairs: scoring.matched_pairs,
+            candidate_index_bytes: actual_index_bytes as u64,
+            scratch_and_queue_bytes: scratch_plan.reserved_bytes as u64,
+            dsu_and_chain_state_bytes: state_bytes as u64,
+        },
+    })
 }
 
 pub(crate) fn load_all_name_atoms(
@@ -264,49 +318,6 @@ pub(crate) fn push_name_summary_rows(
     }
 }
 
-pub(crate) fn unique_thresholds(thresholds: &[f64]) -> Vec<f64> {
-    let mut unique = thresholds.to_vec();
-    unique.sort_by(|left, right| right.partial_cmp(left).unwrap_or(std::cmp::Ordering::Equal));
-    unique.dedup_by(|left, right| left.to_bits() == right.to_bits());
-    unique
-}
-
-pub(crate) fn sort_threshold_states_for_apply(states: &mut [ThresholdUnionState]) {
-    states.sort_by(|left, right| {
-        left.threshold
-            .partial_cmp(&right.threshold)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-}
-
-pub(crate) fn sort_matrix_states_for_apply(states: &mut [MatrixUnionState]) {
-    states.sort_by(|left, right| {
-        left.threshold
-            .partial_cmp(&right.threshold)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-}
-
-pub(crate) fn chain_matrix_reuse_plan(
-    atoms_by_chain: &[Vec<usize>],
-    analysis_work_budget: usize,
-    global_per_threshold_bytes: usize,
-) -> Option<ChainMatrixReusePlan> {
-    let pair_count = chain_pair_count(atoms_by_chain.len());
-    if pair_count == 0 {
-        return None;
-    }
-    let per_threshold_bytes = chain_matrix_reuse_state_bytes(atoms_by_chain);
-    if per_threshold_bytes == 0 {
-        return None;
-    }
-    let combined_threshold_bytes = global_per_threshold_bytes.saturating_add(per_threshold_bytes);
-    (combined_threshold_bytes <= analysis_work_budget).then_some(ChainMatrixReusePlan {
-        per_threshold_bytes,
-        pair_count,
-    })
-}
-
 pub(crate) fn chain_matrix_reuse_state_bytes(atoms_by_chain: &[Vec<usize>]) -> usize {
     let mut bytes = 0usize;
     for left in 0..atoms_by_chain.len() {
@@ -346,72 +357,6 @@ pub(crate) fn chain_pair_from_index(mut index: usize, chain_count: usize) -> (us
 }
 
 #[cfg(test)]
-pub(crate) fn threshold_batches(
-    thresholds: &[f64],
-    atom_count: usize,
-    chain_count: usize,
-    analysis_budget: usize,
-) -> Vec<Vec<f64>> {
-    let thresholds = unique_thresholds(thresholds);
-    let batch_size =
-        threshold_batch_capacity(thresholds.len(), atom_count, chain_count, analysis_budget);
-    thresholds.chunks(batch_size).map(<[f64]>::to_vec).collect()
-}
-
-#[cfg(test)]
-pub(crate) fn threshold_batch_capacity(
-    threshold_count: usize,
-    atom_count: usize,
-    chain_count: usize,
-    analysis_budget: usize,
-) -> usize {
-    let state_bytes = threshold_state_bytes(atom_count, chain_count).max(1);
-    threshold_batch_capacity_for_state_bytes(threshold_count, state_bytes, analysis_budget)
-}
-
-pub(crate) fn matrix_threshold_batch_capacity(
-    threshold_count: usize,
-    atom_count: usize,
-    analysis_budget: usize,
-) -> usize {
-    let state_bytes = sparse_union_find_bytes(atom_count).max(1);
-    threshold_batch_capacity_for_state_bytes(threshold_count, state_bytes, analysis_budget)
-}
-
-pub(crate) fn threshold_batch_capacity_for_state_bytes(
-    threshold_count: usize,
-    state_bytes: usize,
-    analysis_budget: usize,
-) -> usize {
-    (analysis_budget / state_bytes)
-        .max(1)
-        .min(threshold_count.max(1))
-}
-
-pub(crate) fn adaptive_threshold_batch_size(
-    remaining_thresholds: usize,
-    budget_capacity: usize,
-    per_threshold_bytes: usize,
-    total_budget: usize,
-    current_rss: usize,
-) -> usize {
-    let capacity = remaining_thresholds.max(1).min(budget_capacity.max(1));
-    if current_rss == 0 || total_budget == 0 {
-        return capacity;
-    }
-
-    let headroom_capacity = if per_threshold_bytes == 0 {
-        capacity
-    } else {
-        total_budget
-            .saturating_sub(current_rss)
-            .saturating_div(per_threshold_bytes)
-            .max(1)
-    };
-    capacity.min(headroom_capacity)
-}
-
-#[cfg(test)]
 pub(crate) fn full_name_chunk_count(atom_count: usize) -> u64 {
     if atom_count < 2 {
         return 0;
@@ -426,18 +371,9 @@ pub(crate) fn candidate_name_chunk_count(atoms: &[NameAtom], threshold: f64) -> 
     (0..atoms.len().saturating_sub(1))
         .map(|left| {
             let right_end = right_name_range_end_for_left(atoms, left, threshold);
-            let right_min_len = if left + 1 < right_end {
-                Some(atoms[left + 1].char_len)
-            } else {
-                None
-            };
             candidate_index
-                .candidates_for_left(atoms, left, right_min_len, threshold, &mut scratch)
+                .candidates_for_left(atoms, left, left + 1..right_end, threshold, &mut scratch)
                 .iter()
-                .filter(|&&right| {
-                    let right = right as usize;
-                    right > left && right < right_end
-                })
                 .count()
                 .div_ceil(RIGHT_SCORE_CHUNK_SIZE) as u64
         })
@@ -484,8 +420,10 @@ pub(crate) fn sparse_union_find_bytes(atom_count: usize) -> usize {
     atom_count.saturating_mul(SPARSE_UNION_NODE_BYTES)
 }
 
-pub(crate) fn name_atoms_memory_bytes(atoms: &[NameAtom]) -> usize {
-    let struct_bytes = atoms.len().saturating_mul(std::mem::size_of::<NameAtom>());
+pub(crate) fn name_atoms_memory_bytes(atoms: &Vec<NameAtom>) -> usize {
+    let struct_bytes = atoms
+        .capacity()
+        .saturating_mul(std::mem::size_of::<NameAtom>());
     let string_bytes = atoms
         .iter()
         .map(|atom| atom.name_norm.capacity().max(atom.name_norm.len()))

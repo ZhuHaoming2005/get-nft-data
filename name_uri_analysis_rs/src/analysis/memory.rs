@@ -5,55 +5,10 @@ pub(crate) struct MemoryPlan {
     pub(crate) analysis_bytes: usize,
 }
 
-pub(crate) struct MemoryGuard {
-    total_budget: usize,
-    pid: Option<Pid>,
-    system: System,
-}
-
-impl MemoryGuard {
-    pub(crate) fn new(total_budget: usize) -> Self {
-        Self {
-            total_budget,
-            pid: get_current_pid().ok(),
-            system: System::new(),
-        }
-    }
-
-    pub(crate) fn current_rss_bytes(&mut self) -> Option<usize> {
-        let pid = self.pid?;
-        self.system
-            .refresh_processes(ProcessesToUpdate::Some(&[pid]), false);
-        self.system
-            .process(pid)
-            .map(|process| process.memory() as usize)
-    }
-
-    pub(crate) fn next_threshold_batch_size(
-        &mut self,
-        remaining_thresholds: usize,
-        budget_capacity: usize,
-        per_threshold_bytes: usize,
-    ) -> usize {
-        let current_rss = self.current_rss_bytes().unwrap_or(0);
-        adaptive_threshold_batch_size(
-            remaining_thresholds,
-            budget_capacity,
-            per_threshold_bytes,
-            self.total_budget,
-            current_rss,
-        )
-    }
-}
-
 pub(crate) fn name_analysis_memory_plan(
-    thresholds: &[f64],
-    atom_count: usize,
-    chain_count: usize,
     memory_limit: &str,
     analysis_memory_limit: Option<&str>,
     resident_analysis_bytes: usize,
-    chain_matrix_reuse_bytes: usize,
 ) -> Result<MemoryPlan, AnalysisError> {
     let total_budget = total_memory_budget_bytes(memory_limit)?;
     if let Some(value) = analysis_memory_limit
@@ -61,14 +16,7 @@ pub(crate) fn name_analysis_memory_plan(
         .filter(|value| !value.is_empty())
     {
         if value.eq_ignore_ascii_case("auto") {
-            return auto_balanced_memory_plan(
-                total_budget,
-                thresholds.len(),
-                atom_count,
-                chain_count,
-                resident_analysis_bytes,
-                chain_matrix_reuse_bytes,
-            );
+            return auto_balanced_memory_plan(total_budget, resident_analysis_bytes);
         }
         let analysis_bytes = parse_byte_size(value)?;
         return explicit_analysis_memory_plan(
@@ -78,14 +26,7 @@ pub(crate) fn name_analysis_memory_plan(
         );
     }
 
-    auto_balanced_memory_plan(
-        total_budget,
-        thresholds.len(),
-        atom_count,
-        chain_count,
-        resident_analysis_bytes,
-        chain_matrix_reuse_bytes,
-    )
+    auto_balanced_memory_plan(total_budget, resident_analysis_bytes)
 }
 
 pub(crate) fn explicit_analysis_memory_plan(
@@ -93,27 +34,27 @@ pub(crate) fn explicit_analysis_memory_plan(
     analysis_bytes: usize,
     resident_analysis_bytes: usize,
 ) -> Result<MemoryPlan, AnalysisError> {
-    let requested_analysis = analysis_bytes.max(resident_analysis_bytes);
-    if requested_analysis > total_budget {
+    if analysis_bytes > total_budget {
         return Err(AnalysisError::InvalidData(format!(
             "--analysis-memory-limit {} exceeds total --memory-limit {}",
             format_byte_size(analysis_bytes),
             format_byte_size(total_budget)
         )));
     }
+    if resident_analysis_bytes > analysis_bytes {
+        return Err(AnalysisError::InvalidData(format!(
+            "resident name state needs about {}, exceeding --analysis-memory-limit {}",
+            format_byte_size(resident_analysis_bytes),
+            format_byte_size(analysis_bytes)
+        )));
+    }
 
-    Ok(MemoryPlan {
-        analysis_bytes: requested_analysis,
-    })
+    Ok(MemoryPlan { analysis_bytes })
 }
 
 pub(crate) fn auto_balanced_memory_plan(
     total_budget: usize,
-    _threshold_count: usize,
-    _atom_count: usize,
-    _chain_count: usize,
     resident_analysis_bytes: usize,
-    _chain_matrix_reuse_bytes: usize,
 ) -> Result<MemoryPlan, AnalysisError> {
     if resident_analysis_bytes > total_budget {
         return Err(AnalysisError::InvalidData(format!(

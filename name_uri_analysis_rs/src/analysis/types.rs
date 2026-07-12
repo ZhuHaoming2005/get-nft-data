@@ -14,23 +14,21 @@ pub enum AnalysisError {
     Serde(#[from] serde_json::Error),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize, PartialEq)]
 pub struct AnalysisOptions {
     pub database_path: PathBuf,
     pub parquet_inputs: Vec<PathBuf>,
     pub output_dir: PathBuf,
-    pub thresholds: Vec<f64>,
+    pub name_threshold: f64,
     pub threads: usize,
     pub memory_limit: String,
     pub analysis_memory_limit: Option<String>,
     pub duckdb_memory_limit: String,
     pub temp_directory: Option<PathBuf>,
     pub progress: bool,
-    pub persist_prepared: bool,
-    pub reuse_prepared: bool,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize, PartialEq)]
 pub struct SummaryRow {
     pub field_name: String,
     pub scope: String,
@@ -50,7 +48,7 @@ pub struct SummaryRow {
     pub group_size_gt_2_count: i64,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize, PartialEq)]
 pub struct AnalysisReport {
     pub summary_rows: Vec<SummaryRow>,
 }
@@ -66,8 +64,10 @@ pub(crate) struct NameAtom {
 
 #[cfg(test)]
 pub(crate) const RIGHT_SCORE_CHUNK_SIZE: usize = 8192;
+#[cfg(test)]
 pub(crate) const LEFT_SCORE_BATCH_SIZE: usize = 1024;
 pub(crate) const SPARSE_UNION_NODE_BYTES: usize = 96;
+#[cfg(test)]
 pub(crate) const PROGRESS_FLUSH_CHUNKS: u64 = 128;
 
 #[derive(Clone, Copy)]
@@ -125,24 +125,6 @@ pub(crate) struct ChainMatrixRowSpec<'a> {
     pub(crate) primary_index: usize,
     pub(crate) secondary_index: usize,
     pub(crate) threshold: f64,
-}
-
-pub(crate) struct ChainMatrixAnalysisSpec<'a> {
-    pub(crate) thresholds: &'a [f64],
-    pub(crate) analysis_budget: usize,
-    pub(crate) total_memory_budget: usize,
-    pub(crate) totals: &'a HashMap<String, NameTotals>,
-    pub(crate) scratch_mode: NameScratchMode,
-}
-
-pub(crate) struct MatrixUnionState {
-    pub(crate) threshold: f64,
-    pub(crate) union_find: SparseUnionFind,
-}
-
-pub(crate) struct ChainMatrixReusePlan {
-    pub(crate) per_threshold_bytes: usize,
-    pub(crate) pair_count: usize,
 }
 
 #[derive(Clone, Copy, Default)]

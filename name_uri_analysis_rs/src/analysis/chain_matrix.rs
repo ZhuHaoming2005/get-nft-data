@@ -1,91 +1,5 @@
 use super::*;
 
-pub(crate) fn run_chain_matrix_analysis(
-    atoms: &[NameAtom],
-    atoms_by_chain: &[Vec<usize>],
-    candidate_index: &NameCandidateIndex,
-    chains: &[String],
-    spec: ChainMatrixAnalysisSpec<'_>,
-    pool: &rayon::ThreadPool,
-    progress: &ProgressTracker,
-) -> Result<Vec<SummaryRow>, AnalysisError> {
-    let mut memory_guard = MemoryGuard::new(spec.total_memory_budget);
-    let mut rows = Vec::new();
-
-    for left_chain in 0..chains.len() {
-        for right_chain in left_chain + 1..chains.len() {
-            let pair_atom_count =
-                atoms_by_chain[left_chain].len() + atoms_by_chain[right_chain].len();
-            let per_threshold_bytes = sparse_union_find_bytes(pair_atom_count);
-            let pair_capacity = matrix_threshold_batch_capacity(
-                spec.thresholds.len(),
-                pair_atom_count,
-                spec.analysis_budget,
-            );
-            let mut threshold_start = 0;
-            while threshold_start < spec.thresholds.len() {
-                let batch_size = memory_guard.next_threshold_batch_size(
-                    spec.thresholds.len() - threshold_start,
-                    pair_capacity,
-                    per_threshold_bytes,
-                );
-                let threshold_batch =
-                    spec.thresholds[threshold_start..threshold_start + batch_size].to_vec();
-                threshold_start += batch_size;
-                progress.set_message(format!(
-                    "chain matrix {}-{} batch {} threshold(s), RSS {}",
-                    chains[left_chain],
-                    chains[right_chain],
-                    threshold_batch.len(),
-                    memory_guard
-                        .current_rss_bytes()
-                        .map(format_byte_size)
-                        .unwrap_or_else(|| "unknown".to_string())
-                ));
-                progress.add_work(atoms_by_chain[left_chain].len() as u64);
-                let mut states = threshold_batch
-                    .iter()
-                    .copied()
-                    .map(|threshold| MatrixUnionState {
-                        threshold,
-                        union_find: SparseUnionFind::default(),
-                    })
-                    .collect::<Vec<_>>();
-                sort_matrix_states_for_apply(&mut states);
-                pool.install(|| {
-                    union_chain_pair_name_pairs(
-                        atoms,
-                        &atoms_by_chain[left_chain],
-                        &atoms_by_chain[right_chain],
-                        candidate_index,
-                        spec.scratch_mode,
-                        &mut states,
-                        progress,
-                    )
-                });
-                progress.add_work(states.len() as u64 * 2);
-                for state in &mut states {
-                    push_chain_matrix_rows(
-                        &mut rows,
-                        atoms,
-                        ChainMatrixRowSpec {
-                            chains,
-                            totals: spec.totals,
-                            primary_index: left_chain,
-                            secondary_index: right_chain,
-                            threshold: state.threshold,
-                        },
-                        &mut state.union_find,
-                    );
-                    progress.inc(2);
-                }
-            }
-        }
-    }
-
-    Ok(rows)
-}
-
 pub(crate) fn atoms_by_chain(atoms: &[NameAtom], chain_count: usize) -> Vec<Vec<usize>> {
     let mut indexes = vec![Vec::new(); chain_count];
     for (index, atom) in atoms.iter().enumerate() {
@@ -114,6 +28,7 @@ pub(crate) fn chain_pair_candidate_chunk_count(
         .sum()
 }
 
+#[cfg(test)]
 pub(crate) fn right_atom_range_for_left(
     atoms: &[NameAtom],
     right_atoms: &[usize],
@@ -135,6 +50,7 @@ pub(crate) fn right_atom_range_for_left(
     start..end
 }
 
+#[cfg(test)]
 pub(crate) fn right_length_window_for_threshold(
     left_len: usize,
     max_right_len: usize,
@@ -176,7 +92,12 @@ pub(crate) fn right_length_window_for_threshold(
     Some((min_len, max_len))
 }
 
-pub(crate) fn lower_bound_right_atom_len(atoms: &[NameAtom], right_atoms: &[usize], min_len: usize) -> usize {
+#[cfg(test)]
+pub(crate) fn lower_bound_right_atom_len(
+    atoms: &[NameAtom],
+    right_atoms: &[usize],
+    min_len: usize,
+) -> usize {
     let mut low = 0usize;
     let mut high = right_atoms.len();
     while low < high {
@@ -190,7 +111,12 @@ pub(crate) fn lower_bound_right_atom_len(atoms: &[NameAtom], right_atoms: &[usiz
     low
 }
 
-pub(crate) fn upper_bound_right_atom_len(atoms: &[NameAtom], right_atoms: &[usize], max_len: usize) -> usize {
+#[cfg(test)]
+pub(crate) fn upper_bound_right_atom_len(
+    atoms: &[NameAtom],
+    right_atoms: &[usize],
+    max_len: usize,
+) -> usize {
     let mut low = 0usize;
     let mut high = right_atoms.len();
     while low < high {
@@ -204,78 +130,14 @@ pub(crate) fn upper_bound_right_atom_len(atoms: &[NameAtom], right_atoms: &[usiz
     low
 }
 
-pub(crate) fn union_chain_pair_name_pairs(
-    atoms: &[NameAtom],
-    left_atoms: &[usize],
-    right_atoms: &[usize],
-    candidate_index: &NameCandidateIndex,
-    scratch_mode: NameScratchMode,
-    states: &mut [MatrixUnionState],
-    progress: &ProgressTracker,
-) {
-    if left_atoms.is_empty() || right_atoms.is_empty() || states.is_empty() {
-        return;
-    }
-    let min_threshold = states
-        .iter()
-        .map(|state| state.threshold)
-        .fold(f64::INFINITY, f64::min);
-
-    let mut pending_progress = 0;
-    for left_batch in left_atoms.chunks(LEFT_SCORE_BATCH_SIZE) {
-        let scored_lefts = left_batch
-            .par_iter()
-            .copied()
-            .map_init(
-                || NameCandidateScratch::with_mode(atoms.len(), scratch_mode),
-                |scratch, left| {
-                    let right_range =
-                        right_atom_range_for_left(atoms, right_atoms, left, min_threshold);
-                    let right_min_len = if right_range.is_empty() {
-                        None
-                    } else {
-                        Some(atoms[right_atoms[right_range.start]].char_len)
-                    };
-                    let right_candidates = &right_atoms[right_range];
-                    let query = PreparedNameQuery::new(&atoms[left].name_norm);
-                    let matching_rights = candidate_index
-                        .candidates_for_left(atoms, left, right_min_len, min_threshold, scratch)
-                        .iter()
-                        .map(|&right| right as usize)
-                        .filter(|right| right_candidates.binary_search(right).is_ok())
-                        .filter_map(|right| {
-                            let right_name = atoms[right].name_norm.as_str();
-                            query
-                                .score_percent(right_name, min_threshold)
-                                .map(|score| ScoredRight { right, score })
-                        })
-                        .collect::<Vec<_>>();
-                    (left, matching_rights)
-                },
-            )
-            .collect::<Vec<_>>();
-        for (left, matching_rights) in scored_lefts {
-            for hit in matching_rights {
-                for state in states.iter_mut() {
-                    if hit.score < state.threshold {
-                        break;
-                    }
-                    state.union_find.union(left, hit.right);
-                }
-            }
-            pending_progress += 1;
-            flush_chunk_progress(progress, &mut pending_progress);
-        }
-    }
-    flush_remaining_progress(progress, &mut pending_progress);
-}
-
+#[cfg(test)]
 pub(crate) fn flush_chunk_progress(progress: &ProgressTracker, pending: &mut u64) {
     if *pending >= PROGRESS_FLUSH_CHUNKS {
         flush_remaining_progress(progress, pending);
     }
 }
 
+#[cfg(test)]
 pub(crate) fn flush_remaining_progress(progress: &ProgressTracker, pending: &mut u64) {
     if *pending > 0 {
         progress.inc(*pending);

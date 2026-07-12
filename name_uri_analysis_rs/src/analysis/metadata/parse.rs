@@ -25,10 +25,7 @@ pub(super) fn metadata_documents_from_json(raw: &str) -> MetadataDocuments {
         Ok(value) => {
             let mut prefilter_parts = BTreeSet::new();
             collect_metadata_prefilter_parts(&value, &mut prefilter_parts);
-            let prefilter = prefilter_parts
-                .into_iter()
-                .collect::<Vec<_>>()
-                .join(" ");
+            let prefilter = prefilter_parts.into_iter().collect::<Vec<_>>().join(" ");
             let content = if metadata_is_dedup_eligible(raw) {
                 let mut content_parts = Vec::new();
                 flatten_metadata_content_values(&value, &mut content_parts);
@@ -210,4 +207,3 @@ pub(super) fn metadata_bm25_tokens(document: &str) -> Vec<String> {
         .filter(|token| token.len() >= 2)
         .collect()
 }
-

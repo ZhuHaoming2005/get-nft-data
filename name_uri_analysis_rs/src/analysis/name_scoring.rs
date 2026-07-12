@@ -1,5 +1,30 @@
 use super::*;
 
+pub(crate) const NAME_EDGE_CHUNK_SIZE: usize = 8 * 1024;
+const NAME_PROGRESS_LEFT_CHUNK: u64 = 64;
+const SPARSE_HASH_ENTRY_BUDGET_BYTES: usize = 24;
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct NameScoringStats {
+    pub(crate) candidate_pairs: u64,
+    pub(crate) scored_pairs: u64,
+    pub(crate) matched_pairs: u64,
+}
+
+struct NameEdgeBatch {
+    edges: Vec<(usize, ScoredRight)>,
+    processed_lefts: u64,
+}
+
+struct SequentialCanonicalScoreSpec<'a> {
+    original_atoms: &'a [NameAtom],
+    canonical: &'a CanonicalNameValues,
+    candidate_index: &'a NameCandidateIndex,
+    scratch_mode: NameScratchMode,
+    chain_count: usize,
+    threshold: f64,
+}
+
 use rapidfuzz::distance::jaro_winkler;
 
 pub(crate) type NameTokenId = u32;
@@ -13,6 +38,77 @@ pub(crate) struct IndexedNameDocument {
 pub(crate) struct NameCandidateIndex {
     pub(crate) documents: Vec<IndexedNameDocument>,
     pub(crate) postings: Vec<Vec<NameAtomIndex>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NameCandidateIndexEstimate {
+    pub(crate) resident_bytes: usize,
+    pub(crate) peak_build_bytes: usize,
+}
+
+/// Conservative capacity-based estimate used before allocating the candidate
+/// index. Postings and hash-table allocations are intentionally overestimated
+/// so the analysis budget remains a hard preflight guard at production scale.
+pub(crate) fn estimate_name_candidate_index_bytes(
+    atoms: &[NameAtom],
+) -> NameCandidateIndexEstimate {
+    let token_occurrences = atoms
+        .iter()
+        .map(|atom| atom.char_len)
+        .fold(0usize, usize::saturating_add);
+    let mut posting_lengths = HashMap::<(char, u32), usize>::new();
+    let mut longest_distinct_name = 0usize;
+    for atom in atoms {
+        let mut occurrences = HashMap::<char, u32>::new();
+        for character in atom.name_norm.chars() {
+            let occurrence = occurrences.entry(character).or_default();
+            let token_key = (character, *occurrence);
+            *occurrence = occurrence.saturating_add(1);
+            posting_lengths
+                .entry(token_key)
+                .and_modify(|length| *length = length.saturating_add(1))
+                .or_insert(1);
+        }
+        longest_distinct_name = longest_distinct_name.max(occurrences.len());
+    }
+    let token_count = posting_lengths.len();
+    let document_headers =
+        pushed_vec_capacity(atoms.len()).saturating_mul(std::mem::size_of::<IndexedNameDocument>());
+    let document_tokens = token_occurrences
+        .saturating_mul(2)
+        .saturating_mul(std::mem::size_of::<NameTokenId>());
+    let posting_headers =
+        pushed_vec_capacity(token_count).saturating_mul(std::mem::size_of::<Vec<NameAtomIndex>>());
+    let posting_values = posting_lengths
+        .values()
+        .copied()
+        .map(pushed_vec_capacity)
+        .fold(0usize, usize::saturating_add)
+        .saturating_mul(std::mem::size_of::<NameAtomIndex>());
+    let resident_bytes = document_headers
+        .saturating_add(document_tokens)
+        .saturating_add(posting_headers)
+        .saturating_add(posting_values);
+    let build_only_bytes = token_count
+        .saturating_mul(48)
+        .saturating_add(
+            atoms
+                .len()
+                .saturating_mul(std::mem::size_of::<Vec<NameTokenId>>()),
+        )
+        .saturating_add(longest_distinct_name.saturating_mul(32));
+    NameCandidateIndexEstimate {
+        resident_bytes,
+        peak_build_bytes: resident_bytes.saturating_add(build_only_bytes),
+    }
+}
+
+fn pushed_vec_capacity(length: usize) -> usize {
+    if length == 0 {
+        0
+    } else {
+        length.max(4).next_power_of_two()
+    }
 }
 
 /// Per-worker scratch space for candidate generation. The dedup backend is
@@ -67,9 +163,20 @@ pub(crate) fn name_scratch_plan(
     available_bytes: usize,
 ) -> NameScratchPlan {
     let worker_count = threads.max(1).min(atom_count.saturating_sub(1));
-    let dense_bytes = atom_count
-        .saturating_mul(std::mem::size_of::<u32>())
+    let candidate_and_hit_bytes = atom_count
+        .saturating_mul(
+            std::mem::size_of::<NameAtomIndex>().saturating_add(std::mem::size_of::<ScoredRight>()),
+        )
         .saturating_mul(worker_count);
+    let edge_pipeline_bytes = NAME_EDGE_CHUNK_SIZE
+        .saturating_mul(std::mem::size_of::<(usize, ScoredRight)>())
+        .saturating_mul(worker_count.saturating_mul(3));
+    let common_bytes = candidate_and_hit_bytes.saturating_add(edge_pipeline_bytes);
+    let dense_bytes = common_bytes.saturating_add(
+        atom_count
+            .saturating_mul(std::mem::size_of::<u32>())
+            .saturating_mul(worker_count),
+    );
     if atom_count <= SPARSE_DEDUP_ATOM_THRESHOLD && dense_bytes <= available_bytes {
         NameScratchPlan {
             mode: NameScratchMode::Dense,
@@ -78,7 +185,11 @@ pub(crate) fn name_scratch_plan(
     } else {
         NameScratchPlan {
             mode: NameScratchMode::Sparse,
-            reserved_bytes: 0,
+            reserved_bytes: common_bytes.saturating_add(
+                atom_count
+                    .saturating_mul(SPARSE_HASH_ENTRY_BUDGET_BYTES)
+                    .saturating_mul(worker_count),
+            ),
         }
     }
 }
@@ -216,11 +327,11 @@ impl NameCandidateIndex {
             )
             .saturating_add(
                 self.documents
-            .iter()
-            .map(|document| {
-                document.prefix_tokens.capacity() * std::mem::size_of::<NameTokenId>()
-                    + document.sorted_tokens.capacity() * std::mem::size_of::<NameTokenId>()
-            })
+                    .iter()
+                    .map(|document| {
+                        document.prefix_tokens.capacity() * std::mem::size_of::<NameTokenId>()
+                            + document.sorted_tokens.capacity() * std::mem::size_of::<NameTokenId>()
+                    })
                     .sum::<usize>(),
             )
             .saturating_add(
@@ -235,12 +346,17 @@ impl NameCandidateIndex {
         &self,
         atoms: &[NameAtom],
         left: usize,
-        right_min_len: Option<usize>,
+        right_range: std::ops::Range<usize>,
         threshold: f64,
         scratch: &'a mut NameCandidateScratch,
     ) -> &'a [NameAtomIndex] {
         scratch.clear();
-        // `right_min_len` is the char length of the shortest atom in the
+        let right_end = right_range.end.min(atoms.len());
+        if right_range.start >= right_end {
+            return &scratch.candidates;
+        }
+        let right_range = right_range.start..right_end;
+        // The first atom in `right_range` is the shortest atom in the
         // caller's right-set (atoms are length-sorted, so the first in-range
         // right is the shortest). `minimum_name_char_overlap` is non-decreasing
         // in right_len for right_len >= left_len, so the shortest right yields
@@ -250,13 +366,11 @@ impl NameCandidateIndex {
         // last in `prefix_tokens`) are probed less often. It stays a valid
         // prefix-filter lower bound: every in-range true match has
         // `overlap >= required_overlap(left, right) >= this bound`.
-        let Some(right_min_len) = right_min_len else {
-            return &scratch.candidates;
-        };
+        let right_min_len = atoms[right_range.start].char_len;
         let minimum_overlap =
             minimum_name_char_overlap(atoms[left].char_len, right_min_len, threshold);
         if minimum_overlap == 0 {
-            for atom_index in 0..atoms.len() {
+            for atom_index in right_range.clone() {
                 if atom_index != left {
                     scratch.push_once(
                         u32::try_from(atom_index).expect("name atom index exceeds u32 indexes"),
@@ -265,6 +379,10 @@ impl NameCandidateIndex {
             }
         } else {
             let document = &self.documents[left];
+            let compact_right_start =
+                u32::try_from(right_range.start).expect("name candidate range exceeds u32 indexes");
+            let compact_right_end =
+                u32::try_from(right_range.end).expect("name candidate range exceeds u32 indexes");
             let prefix_len = document
                 .prefix_tokens
                 .len()
@@ -272,7 +390,12 @@ impl NameCandidateIndex {
                 .saturating_add(1)
                 .min(document.prefix_tokens.len());
             for &token_id in &document.prefix_tokens[..prefix_len] {
-                for &atom_index in &self.postings[token_id as usize] {
+                let posting = &self.postings[token_id as usize];
+                let posting_start =
+                    posting.partition_point(|&atom_index| atom_index < compact_right_start);
+                let posting_end =
+                    posting.partition_point(|&atom_index| atom_index < compact_right_end);
+                for &atom_index in &posting[posting_start..posting_end] {
                     if atom_index as usize != left {
                         scratch.push_once(atom_index);
                     }
@@ -284,16 +407,11 @@ impl NameCandidateIndex {
         let left_document = &self.documents[left].sorted_tokens;
         scratch.candidates.retain(|&right| {
             let right = right as usize;
-            let required_overlap = minimum_name_char_overlap(
-                atoms[left].char_len,
-                atoms[right].char_len,
-                threshold,
-            );
+            let required_overlap =
+                minimum_name_char_overlap(atoms[left].char_len, atoms[right].char_len, threshold);
             required_overlap <= atoms[left].char_len.min(atoms[right].char_len)
-                && sorted_name_token_overlap(
-                    left_document,
-                    &self.documents[right].sorted_tokens,
-                ) >= required_overlap
+                && sorted_name_token_overlap(left_document, &self.documents[right].sorted_tokens)
+                    >= required_overlap
         });
         &scratch.candidates
     }
@@ -310,31 +428,28 @@ impl PreparedNameQuery {
         if threshold.is_nan() || threshold > 100.0 {
             return None;
         }
-        let args =
-            jaro_winkler::Args::default().score_cutoff((threshold / 100.0).clamp(0.0, 1.0));
+        let args = jaro_winkler::Args::default().score_cutoff((threshold / 100.0).clamp(0.0, 1.0));
         self.scorer
             .normalized_similarity_with_args(right.chars(), &args)
             .map(|score| score * 100.0)
     }
 }
 
+#[cfg(test)]
 pub(crate) fn union_full_name_pairs(
     atoms: &[NameAtom],
     candidate_index: &NameCandidateIndex,
     scratch_mode: NameScratchMode,
-    states: &mut [ThresholdUnionState],
+    state: &mut ThresholdUnionState,
     chain_count: usize,
     progress: &ProgressTracker,
 ) {
-    if atoms.len() < 2 || states.is_empty() {
+    if atoms.len() < 2 {
         return;
     }
-    let min_threshold = states
-        .iter()
-        .map(|state| state.threshold)
-        .fold(f64::INFINITY, f64::min);
+    let min_threshold = state.threshold;
 
-    let mut pending_progress = 0;
+    let mut pending_progress = 0u64;
     for left_batch_start in (0..atoms.len() - 1).step_by(LEFT_SCORE_BATCH_SIZE) {
         let left_batch_end = (left_batch_start + LEFT_SCORE_BATCH_SIZE).min(atoms.len() - 1);
         let scored_lefts = (left_batch_start..left_batch_end)
@@ -356,7 +471,7 @@ pub(crate) fn union_full_name_pairs(
             )
             .collect::<Vec<_>>();
         for (left, matching_rights) in scored_lefts {
-            apply_matching_name_pairs(atoms, states, left, &matching_rights, chain_count);
+            apply_matching_name_pairs(atoms, state, left, &matching_rights, chain_count);
             pending_progress += 1;
             flush_chunk_progress(progress, &mut pending_progress);
         }
@@ -364,7 +479,221 @@ pub(crate) fn union_full_name_pairs(
     flush_remaining_progress(progress, &mut pending_progress);
 }
 
-pub(crate) fn right_name_range_end_for_left(atoms: &[NameAtom], left: usize, threshold: f64) -> usize {
+pub(crate) fn union_canonical_name_pairs(
+    original_atoms: &[NameAtom],
+    canonical: &CanonicalNameValues,
+    candidate_index: &NameCandidateIndex,
+    scratch_mode: NameScratchMode,
+    state: &mut ThresholdUnionState,
+    chain_count: usize,
+    progress: &ProgressTracker,
+) -> NameScoringStats {
+    if canonical.atoms.is_empty() {
+        return NameScoringStats::default();
+    }
+
+    for members in &canonical.members {
+        for (left_position, &left) in members.iter().enumerate() {
+            for &right in &members[left_position + 1..] {
+                apply_matching_name_pairs(
+                    original_atoms,
+                    state,
+                    left,
+                    &[ScoredRight {
+                        right,
+                        score: 100.0,
+                    }],
+                    chain_count,
+                );
+            }
+        }
+    }
+    if canonical.atoms.len() < 2 {
+        return NameScoringStats::default();
+    }
+
+    let min_threshold = state.threshold;
+    if rayon::current_num_threads() == 1 {
+        return score_canonical_names_sequential(
+            SequentialCanonicalScoreSpec {
+                original_atoms,
+                canonical,
+                candidate_index,
+                scratch_mode,
+                chain_count,
+                threshold: min_threshold,
+            },
+            state,
+            progress,
+        );
+    }
+
+    let candidate_pairs = std::sync::atomic::AtomicU64::new(0);
+    let matched_pairs = std::sync::atomic::AtomicU64::new(0);
+    let candidate_pairs_counter = &candidate_pairs;
+    let matched_pairs_counter = &matched_pairs;
+    let queue_capacity = rayon::current_num_threads().saturating_mul(2).max(1);
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<NameEdgeBatch>(queue_capacity);
+    rayon::scope(|scope| {
+        let producer = sender.clone();
+        scope.spawn(move |_| {
+            (0..canonical.atoms.len() - 1)
+                .into_par_iter()
+                .fold(
+                    || {
+                        (
+                            NameCandidateScratch::with_mode(canonical.atoms.len(), scratch_mode),
+                            Vec::<ScoredRight>::new(),
+                            Vec::<(usize, ScoredRight)>::with_capacity(NAME_EDGE_CHUNK_SIZE),
+                            0u64,
+                        )
+                    },
+                    |(mut scratch, mut hits, mut edges, mut processed), left| {
+                        let right_end =
+                            right_name_range_end_for_left(&canonical.atoms, left, min_threshold);
+                        hits.clear();
+                        let scored_pairs = append_indexed_name_pairs_for_left(
+                            &canonical.atoms,
+                            candidate_index,
+                            left,
+                            left + 1..right_end,
+                            min_threshold,
+                            &mut scratch,
+                            &mut hits,
+                        );
+                        candidate_pairs_counter
+                            .fetch_add(scored_pairs, std::sync::atomic::Ordering::Relaxed);
+                        matched_pairs_counter
+                            .fetch_add(hits.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                        for hit in hits.iter().copied() {
+                            edges.push((left, hit));
+                            if edges.len() >= NAME_EDGE_CHUNK_SIZE {
+                                producer
+                                    .send(NameEdgeBatch {
+                                        edges: std::mem::replace(
+                                            &mut edges,
+                                            Vec::with_capacity(NAME_EDGE_CHUNK_SIZE),
+                                        ),
+                                        processed_lefts: processed,
+                                    })
+                                    .expect("name edge consumer must remain alive");
+                                processed = 0;
+                            }
+                        }
+                        processed += 1;
+                        if processed >= NAME_PROGRESS_LEFT_CHUNK && edges.is_empty() {
+                            producer
+                                .send(NameEdgeBatch {
+                                    edges: Vec::new(),
+                                    processed_lefts: processed,
+                                })
+                                .expect("name edge consumer must remain alive");
+                            processed = 0;
+                        }
+                        (scratch, hits, edges, processed)
+                    },
+                )
+                .for_each(|(_, _, edges, processed_lefts)| {
+                    if !edges.is_empty() || processed_lefts > 0 {
+                        producer
+                            .send(NameEdgeBatch {
+                                edges,
+                                processed_lefts,
+                            })
+                            .expect("name edge consumer must remain alive");
+                    }
+                });
+            drop(producer);
+        });
+        drop(sender);
+        for batch in receiver {
+            apply_canonical_edge_batch(original_atoms, canonical, state, chain_count, batch.edges);
+            progress.inc(batch.processed_lefts);
+        }
+    });
+    let candidate_pairs = candidate_pairs.load(std::sync::atomic::Ordering::Relaxed);
+    NameScoringStats {
+        candidate_pairs,
+        scored_pairs: candidate_pairs,
+        matched_pairs: matched_pairs.load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+fn apply_canonical_edge_batch(
+    original_atoms: &[NameAtom],
+    canonical: &CanonicalNameValues,
+    state: &mut ThresholdUnionState,
+    chain_count: usize,
+    edges: Vec<(usize, ScoredRight)>,
+) {
+    for (canonical_left, matching) in edges {
+        for &original_left in &canonical.members[canonical_left] {
+            for &original_right in &canonical.members[matching.right] {
+                apply_matching_name_pairs(
+                    original_atoms,
+                    state,
+                    original_left,
+                    &[ScoredRight {
+                        right: original_right,
+                        score: matching.score,
+                    }],
+                    chain_count,
+                );
+            }
+        }
+    }
+}
+
+fn score_canonical_names_sequential(
+    spec: SequentialCanonicalScoreSpec<'_>,
+    state: &mut ThresholdUnionState,
+    progress: &ProgressTracker,
+) -> NameScoringStats {
+    let mut scratch =
+        NameCandidateScratch::with_mode(spec.canonical.atoms.len(), spec.scratch_mode);
+    let mut hits = Vec::new();
+    let mut stats = NameScoringStats::default();
+    for left in 0..spec.canonical.atoms.len() - 1 {
+        hits.clear();
+        let right_end = right_name_range_end_for_left(&spec.canonical.atoms, left, spec.threshold);
+        let scored_pairs = append_indexed_name_pairs_for_left(
+            &spec.canonical.atoms,
+            spec.candidate_index,
+            left,
+            left + 1..right_end,
+            spec.threshold,
+            &mut scratch,
+            &mut hits,
+        );
+        stats.candidate_pairs = stats.candidate_pairs.saturating_add(scored_pairs);
+        stats.scored_pairs = stats.scored_pairs.saturating_add(scored_pairs);
+        stats.matched_pairs = stats.matched_pairs.saturating_add(hits.len() as u64);
+        for hit in hits.iter().copied() {
+            for &original_left in &spec.canonical.members[left] {
+                for &original_right in &spec.canonical.members[hit.right] {
+                    apply_matching_name_pairs(
+                        spec.original_atoms,
+                        state,
+                        original_left,
+                        &[ScoredRight {
+                            right: original_right,
+                            score: hit.score,
+                        }],
+                        spec.chain_count,
+                    );
+                }
+            }
+        }
+        progress.inc(1);
+    }
+    stats
+}
+
+pub(crate) fn right_name_range_end_for_left(
+    atoms: &[NameAtom],
+    left: usize,
+    threshold: f64,
+) -> usize {
     if left + 1 >= atoms.len() {
         return atoms.len();
     }
@@ -383,6 +712,7 @@ pub(crate) fn right_name_range_end_for_left(atoms: &[NameAtom], left: usize, thr
     low
 }
 
+#[cfg(test)]
 pub(crate) fn score_indexed_name_pairs_for_left(
     atoms: &[NameAtom],
     candidate_index: &NameCandidateIndex,
@@ -391,24 +721,42 @@ pub(crate) fn score_indexed_name_pairs_for_left(
     threshold: f64,
     scratch: &mut NameCandidateScratch,
 ) -> Vec<ScoredRight> {
+    let mut matches = Vec::new();
+    append_indexed_name_pairs_for_left(
+        atoms,
+        candidate_index,
+        left,
+        right_range,
+        threshold,
+        scratch,
+        &mut matches,
+    );
+    matches
+}
+
+pub(crate) fn append_indexed_name_pairs_for_left(
+    atoms: &[NameAtom],
+    candidate_index: &NameCandidateIndex,
+    left: usize,
+    right_range: std::ops::Range<usize>,
+    threshold: f64,
+    scratch: &mut NameCandidateScratch,
+    matches: &mut Vec<ScoredRight>,
+) -> u64 {
     let query = PreparedNameQuery::new(&atoms[left].name_norm);
-    let right_min_len = if right_range.is_empty() {
-        None
-    } else {
-        Some(atoms[right_range.start].char_len)
-    };
-    candidate_index
-        .candidates_for_left(atoms, left, right_min_len, threshold, scratch)
+    let mut scored_pairs = 0u64;
+    for right in candidate_index
+        .candidates_for_left(atoms, left, right_range, threshold, scratch)
         .iter()
         .map(|&right| right as usize)
-        .filter(|right| right_range.contains(right))
-        .filter_map(|right| {
-            let right_name = atoms[right].name_norm.as_str();
-            query
-                .score_percent(right_name, threshold)
-                .map(|score| ScoredRight { right, score })
-        })
-        .collect()
+    {
+        scored_pairs = scored_pairs.saturating_add(1);
+        let right_name = atoms[right].name_norm.as_str();
+        if let Some(score) = query.score_percent(right_name, threshold) {
+            matches.push(ScoredRight { right, score });
+        }
+    }
+    scored_pairs
 }
 
 #[cfg(test)]
@@ -431,7 +779,11 @@ pub(crate) fn score_name_pairs_for_left_chunk(
     )
 }
 
-pub(crate) fn minimum_name_char_overlap(left_len: usize, right_len: usize, threshold: f64) -> usize {
+pub(crate) fn minimum_name_char_overlap(
+    left_len: usize,
+    right_len: usize,
+    threshold: f64,
+) -> usize {
     if threshold.is_nan() || threshold > 100.0 {
         return left_len.min(right_len).saturating_add(1);
     }
@@ -461,8 +813,7 @@ pub(crate) fn optimistic_jaro_winkler_from_overlap(
         return 0.0;
     }
     let overlap = overlap.min(left_len).min(right_len) as f64;
-    let jaro =
-        (overlap / left_len as f64 + overlap / right_len as f64 + 1.0) / 3.0;
+    let jaro = (overlap / left_len as f64 + overlap / right_len as f64 + 1.0) / 3.0;
     let prefix = overlap.min(left_len.min(right_len).min(4) as f64);
     let similarity = if jaro > 0.7 {
         jaro + 0.1 * prefix * (1.0 - jaro)
@@ -498,7 +849,11 @@ pub(crate) fn name_pair_score_from_names(left_name: &str, right_name: &str) -> f
 }
 
 #[cfg(test)]
-pub(crate) fn name_pair_can_reach_threshold(left_name: &str, right_name: &str, threshold: f64) -> bool {
+pub(crate) fn name_pair_can_reach_threshold(
+    left_name: &str,
+    right_name: &str,
+    threshold: f64,
+) -> bool {
     left_name == right_name
         || name_pair_lengths_can_reach_threshold(
             left_name.chars().count(),
@@ -535,7 +890,7 @@ pub(crate) fn jaro_winkler_upper_bound_from_lengths(left_len: usize, right_len: 
 
 pub(crate) fn apply_matching_name_pairs(
     atoms: &[NameAtom],
-    states: &mut [ThresholdUnionState],
+    state: &mut ThresholdUnionState,
     left: usize,
     matching_rights: &[ScoredRight],
     chain_count: usize,
@@ -543,10 +898,7 @@ pub(crate) fn apply_matching_name_pairs(
     let left_chain = atoms[left].chain_index;
     for hit in matching_rights {
         let right_chain = atoms[hit.right].chain_index;
-        for state in states.iter_mut() {
-            if hit.score < state.threshold {
-                break;
-            }
+        if hit.score >= state.threshold {
             if left_chain == right_chain {
                 state.intra.union(left, hit.right);
             } else {
