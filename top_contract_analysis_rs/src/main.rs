@@ -8,8 +8,8 @@ use top_contract_analysis_rs::analysis::multichain::parse_alchemy_networks;
 use top_contract_analysis_rs::analysis::paper_stats::PaperStatsConfig;
 use top_contract_analysis_rs::analysis::read_seed_contracts;
 use top_contract_analysis_rs::analysis::{
-    analyze_seed_contract, run_multichain_batch, AnalysisDeps, AnalyzeRequest, HeliusApiConfig,
-    MultiChainBatchRequest, RealApi,
+    acquire_batch_output_lock, analyze_seed_contract, run_multichain_batch_with_lock, AnalysisDeps,
+    AnalyzeRequest, HeliusApiConfig, MultiChainBatchRequest, RealApi,
 };
 use top_contract_analysis_rs::cli::{Command, TopContractAnalysisCli};
 #[cfg(feature = "export-snapshot")]
@@ -82,6 +82,7 @@ fn main() -> Result<(), AppError> {
                     max_history_transactions_per_collection: args
                         .max_history_transactions_per_collection,
                     max_assets_per_collection: args.max_helius_assets_per_collection,
+                    matched_contract_max_concurrency: args.matched_contract_max_concurrency,
                 },
             )?;
             let deps = AnalysisDeps {
@@ -118,7 +119,7 @@ fn main() -> Result<(), AppError> {
                         min_path_length: args.paper_min_path_length,
                         center_fanout_threshold: args.paper_center_fanout_threshold,
                         concentration_top_pct: args.paper_concentration_top_pct,
-                        ..PaperStatsConfig::default()
+                        analysis_timestamp: args.paper_analysis_timestamp,
                     },
                 },
                 &deps,
@@ -128,6 +129,8 @@ fn main() -> Result<(), AppError> {
             Ok(())
         }),
         Command::Batch(args) => Runtime::new()?.block_on(async move {
+            let output_dir = std::path::PathBuf::from(&args.output_dir);
+            let output_lock = acquire_batch_output_lock(&output_dir)?;
             let seed_contracts = read_seed_contracts(std::path::Path::new(&args.seed_file))?;
             let seed_labels = seed_contracts
                 .iter()
@@ -159,6 +162,7 @@ fn main() -> Result<(), AppError> {
                     max_history_transactions_per_collection: args
                         .max_history_transactions_per_collection,
                     max_assets_per_collection: args.max_helius_assets_per_collection,
+                    matched_contract_max_concurrency: args.matched_contract_max_concurrency,
                 },
             )?;
             let deps = AnalysisDeps {
@@ -170,8 +174,7 @@ fn main() -> Result<(), AppError> {
                     args.seed_network_max_concurrency,
                 ),
             };
-            let output_dir = std::path::PathBuf::from(&args.output_dir);
-            let payload = run_multichain_batch(
+            let payload = run_multichain_batch_with_lock(
                 MultiChainBatchRequest {
                     seed_file: std::path::PathBuf::from(args.seed_file),
                     output_dir: output_dir.clone(),
@@ -191,15 +194,21 @@ fn main() -> Result<(), AppError> {
                     seed_cpu_max_concurrency: args.seed_cpu_max_concurrency,
                     max_tokens_per_contract: args.max_tokens_per_contract,
                     max_recall_rows: args.max_recall_rows,
+                    max_history_transactions_per_asset: args.max_history_transactions_per_asset,
+                    max_history_transactions_per_collection: args
+                        .max_history_transactions_per_collection,
+                    max_helius_assets_per_collection: args.max_helius_assets_per_collection,
                     paper_stats_config: PaperStatsConfig {
                         min_cycle_size: args.paper_min_cycle_size,
                         min_path_length: args.paper_min_path_length,
                         center_fanout_threshold: args.paper_center_fanout_threshold,
                         concentration_top_pct: args.paper_concentration_top_pct,
-                        ..PaperStatsConfig::default()
+                        analysis_timestamp: args.paper_analysis_timestamp,
                     },
+                    refresh_scoped_cache: args.refresh_scoped_cache,
                 },
                 &deps,
+                output_lock,
             )
             .await?;
             if !payload.failures.is_empty() {

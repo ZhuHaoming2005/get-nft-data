@@ -1,6 +1,110 @@
 use super::*;
 
 #[tokio::test]
+async fn quality_failure_preserves_the_completed_main_report() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let deps = AnalysisDeps {
+        api: Arc::new(QualityApi {
+            quality_calls: calls.clone(),
+            fail_quality: true,
+        }),
+        feature_store: Arc::new(FakeFeatureStore {
+            snapshot: DatabaseSnapshot::default(),
+        }),
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    let report = analyze_seed_contract(
+        AnalyzeRequest {
+            chain: "solana".into(),
+            seed_contract_address: "SeedCollection1111111111111111111111111111111".into(),
+            ..AnalyzeRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        report.seed_contract.contract_address,
+        "SeedCollection1111111111111111111111111111111"
+    );
+    assert_eq!(
+        report
+            .paper_stats
+            .data_quality
+            .supplemental_provider_failure_count,
+        1
+    );
+    assert_eq!(
+        report
+            .paper_stats
+            .data_quality
+            .provider_quality_lookup_failure_count,
+        1
+    );
+    assert!(!report.paper_stats.data_quality.history_complete);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn quality_aggregation_includes_more_than_sixteen_solana_candidates() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let nft_rows = (0..17)
+        .map(|index| DatabaseNftRecord {
+            contract_address: format!("CandidateCollection{index:02}111111111111111111111111111"),
+            token_id: "1".into(),
+            token_uri: "ipfs://seed/1".into(),
+            image_uri: "ipfs://image/1.png".into(),
+            name: format!("Azuki Mirror #{index}"),
+            symbol: "AZUKI".into(),
+            metadata_json: r#"{"description":"gold dragon"}"#.into(),
+            ..DatabaseNftRecord::default()
+        })
+        .collect();
+    let deps = AnalysisDeps {
+        api: Arc::new(QualityApi {
+            quality_calls: calls.clone(),
+            fail_quality: false,
+        }),
+        feature_store: Arc::new(FakeFeatureStore {
+            snapshot: DatabaseSnapshot {
+                nft_rows,
+                ..DatabaseSnapshot::default()
+            },
+        }),
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    let report = analyze_seed_contract(
+        AnalyzeRequest {
+            chain: "solana".into(),
+            seed_contract_address: "SeedCollection1111111111111111111111111111111".into(),
+            api_max_concurrency: 4,
+            matched_contract_max_concurrency: 4,
+            ..AnalyzeRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.duplicate_contracts.len(), 17);
+    assert_eq!(calls.load(Ordering::SeqCst), 18);
+    assert_eq!(
+        report.paper_stats.data_quality.asset_listing_analyzed_count,
+        18
+    );
+    assert_eq!(
+        report.paper_stats.data_quality.history_complete_asset_count,
+        18
+    );
+    assert!(report.paper_stats.data_quality.history_complete);
+}
+
+#[tokio::test]
 async fn analyze_processes_duplicate_contracts_within_a_seed_in_parallel() {
     let api = Arc::new(ConcurrentContractApi::new());
     let deps = AnalysisDeps {

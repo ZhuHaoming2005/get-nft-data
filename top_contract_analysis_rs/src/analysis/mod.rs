@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures::{stream, StreamExt};
@@ -9,7 +8,7 @@ use crate::error::AppError;
 use crate::models::{
     AddressAttributionPayload, AddressSignalPayload, ContractMetadata, DatabaseSnapshot,
     DuplicateCandidate, DuplicateContractPayload, HonestAddressPayload, InfringingTokenRecord,
-    MaliciousAddressPayload, NftPropagationPathPayload, OwnerBalance, PaperStatsPayload,
+    MaliciousAddressPayload, NftPropagationPathPayload, OwnerBalance, ProviderDataQualityPayload,
     SecondarySaleVictimAddressPayload, SeedContractPayload, SeedNft, SingleReportPayload,
     TransferRecord, ValueFlowEdgePayload, VictimSignalPayload,
 };
@@ -18,7 +17,6 @@ use crate::store::DuckDbFeatureStore;
 
 pub mod address_records;
 mod api;
-mod batch;
 mod candidate_filter;
 mod contract_analysis;
 pub mod duplicate;
@@ -32,9 +30,11 @@ mod summary;
 mod value_flow;
 
 pub use api::{AnalyzeApi, CandidateSeedHolderRequest, HeliusApiConfig, RealApi};
-pub use batch::{read_seed_addresses, read_seed_contracts, run_batch};
 pub use candidate_filter::group_candidates_by_contract;
-pub use multichain::{run_multichain_batch, MultiChainBatchRequest, MultiChainBatchResult};
+pub use multichain::{
+    acquire_batch_output_lock, read_seed_contracts, run_multichain_batch,
+    run_multichain_batch_with_lock, BatchOutputLock, MultiChainBatchRequest, MultiChainBatchResult,
+};
 
 use candidate_filter::*;
 use contract_analysis::*;
@@ -126,6 +126,11 @@ pub trait FeatureStoreReader: Send + Sync {
             "feature store does not expose chain totals".to_string(),
         ))
     }
+
+    fn snapshot_identity(&self, chain: &str) -> Result<String, AppError> {
+        let totals = self.chain_totals(chain)?;
+        Ok(format!("{}:{}", totals.total_nfts, totals.total_contracts))
+    }
 }
 
 #[derive(Clone)]
@@ -137,13 +142,13 @@ pub struct AnalysisDeps {
 }
 
 #[derive(Clone)]
-struct SeedContext {
+pub(super) struct SeedContext {
     seed_contract: ContractMetadata,
     seed_nfts: Vec<SeedNft>,
     open_license: bool,
 }
 
-struct CandidatePlan {
+pub(super) struct CandidatePlan {
     snapshot: DatabaseSnapshot,
     candidates: Vec<DuplicateCandidate>,
 }
@@ -172,7 +177,7 @@ struct MatchedContractAnalysisContext<'a> {
     analysis_timestamp: i64,
 }
 
-fn seed_nfts_for_duplicate_matching(
+pub(super) fn seed_nfts_for_duplicate_matching(
     seed_nfts: &[SeedNft],
     seed_contract: &ContractMetadata,
 ) -> Vec<SeedNft> {
@@ -217,12 +222,6 @@ async fn acquire_optional_limit(
     }
 }
 
-#[derive(Clone, Debug)]
-struct BatchSeedAggregate {
-    seed_contract: SeedContractPayload,
-    paper_stats: PaperStatsPayload,
-}
-
 struct ContractAnalysisResult {
     contract_address: String,
     contract_metadata: Option<ContractMetadata>,
@@ -238,6 +237,7 @@ struct ContractAnalysisResult {
     mint_payment_edges: Vec<ValueFlowEdgePayload>,
     attacker_cost_edges: Vec<ValueFlowEdgePayload>,
     nft_propagation_path: Option<NftPropagationPathPayload>,
+    provider_data_quality: ProviderDataQualityPayload,
 }
 
 #[derive(Default)]
@@ -290,51 +290,6 @@ struct SeedAnalysisState {
     provider_data_quality: crate::models::ProviderDataQualityPayload,
 }
 
-#[derive(Clone, Debug)]
-pub struct BatchRequest {
-    pub chain: String,
-    pub seed_file: PathBuf,
-    pub output_dir: PathBuf,
-    pub alchemy_api_key: String,
-    pub alchemy_network: Option<String>,
-    pub etherscan_api_key: String,
-    pub opensea_api_key: String,
-    pub name_threshold: f64,
-    pub metadata_threshold: f64,
-    pub timeout_seconds: u64,
-    pub api_max_concurrency: usize,
-    pub matched_contract_max_concurrency: usize,
-    pub max_tokens_per_contract: usize,
-    pub max_recall_rows: usize,
-    pub seed_network_max_concurrency: usize,
-    pub seed_cpu_max_concurrency: usize,
-    pub paper_stats_config: paper_stats::PaperStatsConfig,
-}
-
-impl Default for BatchRequest {
-    fn default() -> Self {
-        Self {
-            chain: "ethereum".into(),
-            seed_file: PathBuf::new(),
-            output_dir: PathBuf::from("result"),
-            alchemy_api_key: String::new(),
-            alchemy_network: None,
-            etherscan_api_key: String::new(),
-            opensea_api_key: String::new(),
-            name_threshold: DEFAULT_NAME_THRESHOLD,
-            metadata_threshold: DEFAULT_METADATA_THRESHOLD,
-            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
-            api_max_concurrency: 8,
-            matched_contract_max_concurrency: 1,
-            max_tokens_per_contract: 0,
-            max_recall_rows: 0,
-            seed_network_max_concurrency: 1,
-            seed_cpu_max_concurrency: 1,
-            paper_stats_config: paper_stats::PaperStatsConfig::default(),
-        }
-    }
-}
-
 impl FeatureStoreReader for DuckDbFeatureStore {
     fn load_snapshot(
         &self,
@@ -378,6 +333,10 @@ impl FeatureStoreReader for DuckDbFeatureStore {
 
     fn chain_totals(&self, chain: &str) -> Result<crate::models::ChainTotalsPayload, AppError> {
         DuckDbFeatureStore::chain_totals(self, chain)
+    }
+
+    fn snapshot_identity(&self, chain: &str) -> Result<String, AppError> {
+        DuckDbFeatureStore::snapshot_identity(self, chain)
     }
 }
 
@@ -457,6 +416,16 @@ async fn build_candidate_plan_for_seed(
     .await
     .map_err(|err| AppError::InvalidData(format!("snapshot CPU task failed: {err}")))??;
 
+    build_candidate_plan_with_snapshot(request, context, snapshot, dedup_seed_nfts, progress).await
+}
+
+pub(super) async fn build_candidate_plan_with_snapshot(
+    request: AnalyzeRequest,
+    context: SeedContext,
+    snapshot: DatabaseSnapshot,
+    dedup_seed_nfts: Vec<SeedNft>,
+    progress: Arc<dyn SeedProgressReporter>,
+) -> Result<(SeedContext, CandidatePlan), AppError> {
     progress.on_seed_stage("find_duplicate_candidates").await;
     tokio::task::spawn_blocking(move || {
         let plan = build_candidate_plan_from_snapshot(&request, &dedup_seed_nfts, snapshot);
@@ -503,7 +472,55 @@ pub async fn analyze_seed_contract_with_progress(
     analyze_seed_contract_with_limits(request, deps, progress, None, None, None).await
 }
 
+pub(crate) struct ProviderEvidencePin<'a> {
+    api: &'a dyn AnalyzeApi,
+    chain: String,
+    contract_address: String,
+}
+
+impl<'a> ProviderEvidencePin<'a> {
+    pub(crate) fn new(api: &'a dyn AnalyzeApi, chain: &str, contract_address: &str) -> Self {
+        api.set_provider_evidence_active(chain, contract_address, true);
+        Self {
+            api,
+            chain: chain.to_string(),
+            contract_address: contract_address.to_string(),
+        }
+    }
+}
+
+impl Drop for ProviderEvidencePin<'_> {
+    fn drop(&mut self) {
+        self.api
+            .set_provider_evidence_active(&self.chain, &self.contract_address, false);
+    }
+}
+
 async fn analyze_seed_contract_with_limits(
+    request: AnalyzeRequest,
+    deps: &AnalysisDeps,
+    progress: Arc<dyn SeedProgressReporter>,
+    cpu_limit: Option<Arc<Semaphore>>,
+    prepared: Option<(SeedContext, CandidatePlan)>,
+    matched_contract_limit: Option<Arc<Semaphore>>,
+) -> Result<SingleReportPayload, AppError> {
+    let _evidence_pin = ProviderEvidencePin::new(
+        deps.api.as_ref(),
+        &request.chain,
+        &request.seed_contract_address,
+    );
+    analyze_seed_contract_with_limits_pinned(
+        request,
+        deps,
+        progress,
+        cpu_limit,
+        prepared,
+        matched_contract_limit,
+    )
+    .await
+}
+
+async fn analyze_seed_contract_with_limits_pinned(
     request: AnalyzeRequest,
     deps: &AnalysisDeps,
     progress: Arc<dyn SeedProgressReporter>,
@@ -520,82 +537,92 @@ async fn analyze_seed_contract_with_limits(
         prepare_seed_analysis_state(request, deps, progress.clone(), cpu_limit, prepared).await?;
     analyze_matched_contracts_parallel(&mut state, deps, progress.clone(), matched_contract_limit)
         .await?;
-    let mut quality_contracts = state
-        .output_state
-        .candidate_contract_metadata
-        .keys()
-        .cloned()
-        .collect::<BTreeSet<_>>();
     if state
         .seed_contract
         .chain
         .eq_ignore_ascii_case(&state.request.chain)
     {
-        quality_contracts.insert(state.seed_contract.contract_address.clone());
-    }
-    let quality_api = deps.api.clone();
-    let quality_chain = state.request.chain.clone();
-    let mut quality_results =
-        stream::iter(quality_contracts.into_iter().map(move |contract_address| {
-            let api = quality_api.clone();
-            let chain = quality_chain.clone();
-            async move {
-                let result = api
-                    .fetch_provider_data_quality(&chain, &contract_address)
-                    .await;
-                (contract_address, result)
-            }
-        }))
-        .buffer_unordered(state.request.api_max_concurrency.max(1));
-    while let Some((contract_address, quality)) = quality_results.next().await {
-        let quality = match quality {
-            Ok(quality) => quality,
-            Err(error) => {
-                eprintln!(
-                    "warning: provider data-quality lookup failed for {contract_address}: {error}; preserving the completed analysis with degraded quality metadata"
-                );
-                state
-                    .provider_data_quality
-                    .supplemental_provider_failure_count += 1;
-                continue;
-            }
-        };
-        state.provider_data_quality.asset_listing_analyzed_count +=
-            quality.asset_listing_analyzed_count;
-        state.provider_data_quality.asset_listing_total_count += quality.asset_listing_total_count;
-        state
-            .provider_data_quality
-            .asset_listing_truncated_contract_count +=
-            quality.asset_listing_truncated_contract_count;
-        state.provider_data_quality.history_failed_asset_count +=
-            quality.history_failed_asset_count;
-        state.provider_data_quality.history_requested_asset_count +=
-            quality.history_requested_asset_count;
-        state.provider_data_quality.history_successful_asset_count +=
-            quality.history_successful_asset_count;
-        state.provider_data_quality.history_truncated_asset_count +=
-            quality.history_truncated_asset_count;
-        state
-            .provider_data_quality
-            .history_fetched_transaction_count += quality.history_fetched_transaction_count;
-        state
-            .provider_data_quality
-            .history_reported_transaction_count += quality.history_reported_transaction_count;
-        state.provider_data_quality.history_failed_transaction_count +=
-            quality.history_failed_transaction_count;
-        state
-            .provider_data_quality
-            .history_unattributed_sol_transaction_count +=
-            quality.history_unattributed_sol_transaction_count;
-        state
-            .provider_data_quality
-            .history_unresolved_compressed_mint_count +=
-            quality.history_unresolved_compressed_mint_count;
-        state
-            .provider_data_quality
-            .supplemental_provider_failure_count += quality.supplemental_provider_failure_count;
+        let seed_quality = fetch_provider_quality_or_failure(
+            deps.api.as_ref(),
+            &state.request.chain,
+            &state.seed_contract.contract_address,
+        )
+        .await;
+        merge_provider_data_quality(&mut state.provider_data_quality, seed_quality);
     }
     finalize_seed_report(state, progress).await
+}
+
+async fn fetch_provider_quality_or_failure(
+    api: &dyn AnalyzeApi,
+    chain: &str,
+    contract_address: &str,
+) -> ProviderDataQualityPayload {
+    match api
+        .fetch_provider_data_quality(chain, contract_address)
+        .await
+    {
+        Ok(quality) => quality,
+        Err(error) => {
+            eprintln!(
+                "warning: provider data-quality lookup failed for {contract_address}: {error}; preserving the completed analysis with degraded quality metadata"
+            );
+            ProviderDataQualityPayload {
+                supplemental_provider_failure_count: 1,
+                provider_quality_lookup_failure_count: 1,
+                ..ProviderDataQualityPayload::default()
+            }
+        }
+    }
+}
+
+fn merge_provider_data_quality(
+    target: &mut ProviderDataQualityPayload,
+    source: ProviderDataQualityPayload,
+) {
+    let target_has_history =
+        target.asset_listing_analyzed_count > 0 || target.history_requested_asset_count > 0;
+    let source_has_history =
+        source.asset_listing_analyzed_count > 0 || source.history_requested_asset_count > 0;
+    if source_has_history {
+        target.history_complete = if target_has_history {
+            target.history_complete && source.history_complete
+        } else {
+            source.history_complete
+        };
+    }
+    let has_unknown_quality = target.provider_quality_lookup_failure_count > 0
+        || source.provider_quality_lookup_failure_count > 0;
+    target.asset_listing_analyzed_count += source.asset_listing_analyzed_count;
+    target.asset_listing_total_count += source.asset_listing_total_count;
+    target.asset_listing_truncated_contract_count += source.asset_listing_truncated_contract_count;
+    target.asset_listing_unknown_total_contract_count +=
+        source.asset_listing_unknown_total_contract_count;
+    target.asset_listing_coverage_ratio = None;
+    target.history_failed_asset_count += source.history_failed_asset_count;
+    target.history_requested_asset_count += source.history_requested_asset_count;
+    target.history_successful_asset_count += source.history_successful_asset_count;
+    target.history_complete_asset_count += source.history_complete_asset_count;
+    target.history_unrequested_asset_count += source.history_unrequested_asset_count;
+    target.history_truncated_asset_count += source.history_truncated_asset_count;
+    target.history_fetched_transaction_count += source.history_fetched_transaction_count;
+    target.history_reported_transaction_count += source.history_reported_transaction_count;
+    target.history_failed_transaction_count += source.history_failed_transaction_count;
+    target.history_signature_discovery_failure_count +=
+        source.history_signature_discovery_failure_count;
+    target.history_transaction_detail_failure_count +=
+        source.history_transaction_detail_failure_count;
+    target.history_unattributed_sol_transaction_count +=
+        source.history_unattributed_sol_transaction_count;
+    target.history_unresolved_compressed_mint_count +=
+        source.history_unresolved_compressed_mint_count;
+    target.mint_pre_balance_unavailable_count += source.mint_pre_balance_unavailable_count;
+    target.collection_authority_missing_count += source.collection_authority_missing_count;
+    target.supplemental_provider_failure_count += source.supplemental_provider_failure_count;
+    target.provider_quality_lookup_failure_count += source.provider_quality_lookup_failure_count;
+    if has_unknown_quality {
+        target.history_complete = false;
+    }
 }
 
 async fn prepare_seed_analysis_state(
@@ -678,7 +705,11 @@ async fn prepare_seed_analysis_state(
     let output_state =
         AnalysisOutputState::with_seed_related_legit_duplicates(seed_related_legit_duplicates);
     let expanded_candidates_by_contract = BTreeMap::new();
-    let analysis_timestamp = chrono::Utc::now().timestamp();
+    let analysis_timestamp = if request.paper_stats_config.analysis_timestamp > 0 {
+        request.paper_stats_config.analysis_timestamp
+    } else {
+        chrono::Utc::now().timestamp()
+    };
 
     Ok(SeedAnalysisState {
         request,
@@ -769,12 +800,27 @@ async fn analyze_matched_contracts_parallel(
         state
             .expanded_candidates_by_contract
             .insert(contract_address.clone(), output.contract_candidates);
-        merge_contract_analysis_result(output.result, &mut state.output_state);
+        let mut result = output.result;
+        let quality = std::mem::take(&mut result.provider_data_quality);
+        merge_contract_analysis_result(result, &mut state.output_state);
+        merge_provider_data_quality(&mut state.provider_data_quality, quality);
     }
     Ok(())
 }
 
 async fn analyze_one_matched_contract(
+    context: Arc<MatchedContractAnalysisContext<'_>>,
+    contract_address: String,
+) -> Result<MatchedContractAnalysisOutput, AppError> {
+    let _evidence_pin = ProviderEvidencePin::new(
+        context.deps.api.as_ref(),
+        &context.request.chain,
+        &contract_address,
+    );
+    analyze_one_matched_contract_pinned(Arc::clone(&context), contract_address).await
+}
+
+async fn analyze_one_matched_contract_pinned(
     context: Arc<MatchedContractAnalysisContext<'_>>,
     contract_address: String,
 ) -> Result<MatchedContractAnalysisOutput, AppError> {
@@ -863,6 +909,13 @@ async fn analyze_one_matched_contract(
         };
         (contract_candidates, result)
     };
+    let mut result = result;
+    result.provider_data_quality = fetch_provider_quality_or_failure(
+        context.deps.api.as_ref(),
+        &context.request.chain,
+        &contract_address,
+    )
+    .await;
     Ok(MatchedContractAnalysisOutput {
         contract_address,
         contract_candidates,
@@ -883,7 +936,7 @@ async fn finalize_seed_report(
         mut output_state,
         mut expanded_candidates_by_contract,
         analysis_timestamp,
-        provider_data_quality,
+        mut provider_data_quality,
         ..
     } = state;
 
@@ -948,6 +1001,10 @@ async fn finalize_seed_report(
         };
     let mut value_flow_edges = output_state.mint_payment_edges.clone();
     value_flow_edges.extend(output_state.attacker_cost_edges.clone());
+    if request.chain.eq_ignore_ascii_case("solana") {
+        provider_data_quality.mint_pre_balance_unavailable_count =
+            count_missing_mint_pre_balances(&value_flow_edges);
+    }
     let seed_collection_stats = build_seed_collection_stats(&seed_nfts);
 
     let victim_acquisition_addresses = build_victim_acquisition_addresses_excluding_malicious(
@@ -981,17 +1038,27 @@ async fn finalize_seed_report(
         .data_quality
         .asset_listing_truncated_contract_count =
         provider_data_quality.asset_listing_truncated_contract_count;
+    paper_stats
+        .data_quality
+        .asset_listing_unknown_total_contract_count =
+        provider_data_quality.asset_listing_unknown_total_contract_count;
     paper_stats.data_quality.asset_listing_coverage_ratio =
-        (provider_data_quality.asset_listing_total_count > 0).then_some(
-            provider_data_quality.asset_listing_analyzed_count as f64
-                / provider_data_quality.asset_listing_total_count as f64,
-        );
+        (provider_data_quality.asset_listing_unknown_total_contract_count == 0
+            && provider_data_quality.asset_listing_total_count > 0)
+            .then_some(
+                provider_data_quality.asset_listing_analyzed_count as f64
+                    / provider_data_quality.asset_listing_total_count as f64,
+            );
     paper_stats.data_quality.history_failed_asset_count =
         provider_data_quality.history_failed_asset_count;
     paper_stats.data_quality.history_requested_asset_count =
         provider_data_quality.history_requested_asset_count;
     paper_stats.data_quality.history_successful_asset_count =
         provider_data_quality.history_successful_asset_count;
+    paper_stats.data_quality.history_complete_asset_count =
+        provider_data_quality.history_complete_asset_count;
+    paper_stats.data_quality.history_unrequested_asset_count =
+        provider_data_quality.history_unrequested_asset_count;
     paper_stats.data_quality.history_asset_coverage_ratio =
         (provider_data_quality.history_requested_asset_count > 0).then_some(
             provider_data_quality.history_successful_asset_count as f64
@@ -1007,17 +1074,34 @@ async fn finalize_seed_report(
         provider_data_quality.history_failed_transaction_count;
     paper_stats
         .data_quality
+        .history_signature_discovery_failure_count =
+        provider_data_quality.history_signature_discovery_failure_count;
+    paper_stats
+        .data_quality
+        .history_transaction_detail_failure_count =
+        provider_data_quality.history_transaction_detail_failure_count;
+    paper_stats
+        .data_quality
         .history_unattributed_sol_transaction_count =
         provider_data_quality.history_unattributed_sol_transaction_count;
     paper_stats
         .data_quality
         .history_unresolved_compressed_mint_count =
         provider_data_quality.history_unresolved_compressed_mint_count;
+    paper_stats.data_quality.mint_pre_balance_unavailable_count =
+        provider_data_quality.mint_pre_balance_unavailable_count;
+    paper_stats.data_quality.collection_authority_missing_count =
+        provider_data_quality.collection_authority_missing_count;
+    paper_stats.data_quality.history_complete = provider_data_quality.history_complete;
     paper_stats.data_quality.supplemental_provider_failure_count =
         provider_data_quality.supplemental_provider_failure_count;
+    paper_stats
+        .data_quality
+        .provider_quality_lookup_failure_count =
+        provider_data_quality.provider_quality_lookup_failure_count;
     paper_stats.data_quality.history_transaction_coverage_ratio =
-        (provider_data_quality.history_reported_transaction_count > 0
-            && provider_data_quality.history_failed_asset_count == 0)
+        (provider_data_quality.history_failed_asset_count == 0
+            && provider_data_quality.history_reported_transaction_count > 0)
             .then_some(
                 provider_data_quality.history_fetched_transaction_count as f64
                     / provider_data_quality.history_reported_transaction_count as f64,
@@ -1053,6 +1137,15 @@ async fn finalize_seed_report(
     progress.on_seed_stage("finalize_report").await;
     progress.on_seed_completed().await;
     Ok(payload)
+}
+
+fn count_missing_mint_pre_balances(value_flow_edges: &[ValueFlowEdgePayload]) -> i64 {
+    value_flow_edges
+        .iter()
+        .filter(|edge| edge.channel == "mint_payment" && edge.from_before_eth_balance.is_none())
+        .map(|edge| (edge.tx_hash.as_str(), edge.from_address.as_str()))
+        .collect::<HashSet<_>>()
+        .len() as i64
 }
 
 fn is_candidate_open_license(metadata_json: &str) -> bool {

@@ -330,10 +330,11 @@ pub fn build_paper_stats(input: PaperStatsInput<'_>) -> PaperStatsPayload {
     }
 }
 
-pub fn merge_paper_stats<'a>(
-    seed_stats: impl IntoIterator<Item = &'a PaperStatsPayload>,
-    config: PaperStatsConfig,
-) -> PaperStatsPayload {
+pub fn merge_paper_stats<I, S>(seed_stats: I, config: PaperStatsConfig) -> PaperStatsPayload
+where
+    I: IntoIterator<Item = S>,
+    S: std::borrow::Borrow<PaperStatsPayload>,
+{
     let mut duplicate_rows = BTreeMap::<String, DuplicateScaleAccumulator>::new();
     let mut honest_loss = HonestLossAccumulator::default();
     let mut duplicate_nft_keys = BTreeMap::<String, BTreeSet<String>>::new();
@@ -348,8 +349,11 @@ pub fn merge_paper_stats<'a>(
     let mut has_positive_attacker_cost_without_details = false;
     let mut legacy_attacker_cost = PaperAttackerCostPayload::default();
     let mut legacy_attacker_cost_by_contract_usd = BTreeMap::<String, f64>::new();
+    let mut saw_history_quality = false;
+    let mut history_complete = true;
 
     for stats in seed_stats {
+        let stats = stats.borrow();
         for row in &stats.duplicate_scale {
             let entry = duplicate_rows.entry(row.category.clone()).or_default();
             entry.duplicate_nft_count += row.duplicate_nft_count;
@@ -480,12 +484,21 @@ pub fn merge_paper_stats<'a>(
             stats.data_quality.asset_listing_total_count;
         merged.data_quality.asset_listing_truncated_contract_count +=
             stats.data_quality.asset_listing_truncated_contract_count;
+        merged
+            .data_quality
+            .asset_listing_unknown_total_contract_count += stats
+            .data_quality
+            .asset_listing_unknown_total_contract_count;
         merged.data_quality.history_failed_asset_count +=
             stats.data_quality.history_failed_asset_count;
         merged.data_quality.history_requested_asset_count +=
             stats.data_quality.history_requested_asset_count;
         merged.data_quality.history_successful_asset_count +=
             stats.data_quality.history_successful_asset_count;
+        merged.data_quality.history_complete_asset_count +=
+            stats.data_quality.history_complete_asset_count;
+        merged.data_quality.history_unrequested_asset_count +=
+            stats.data_quality.history_unrequested_asset_count;
         merged.data_quality.history_truncated_asset_count +=
             stats.data_quality.history_truncated_asset_count;
         merged.data_quality.history_fetched_transaction_count +=
@@ -496,13 +509,31 @@ pub fn merge_paper_stats<'a>(
             stats.data_quality.history_failed_transaction_count;
         merged
             .data_quality
+            .history_signature_discovery_failure_count +=
+            stats.data_quality.history_signature_discovery_failure_count;
+        merged.data_quality.history_transaction_detail_failure_count +=
+            stats.data_quality.history_transaction_detail_failure_count;
+        merged
+            .data_quality
             .history_unattributed_sol_transaction_count += stats
             .data_quality
             .history_unattributed_sol_transaction_count;
         merged.data_quality.history_unresolved_compressed_mint_count +=
             stats.data_quality.history_unresolved_compressed_mint_count;
+        merged.data_quality.mint_pre_balance_unavailable_count +=
+            stats.data_quality.mint_pre_balance_unavailable_count;
+        merged.data_quality.collection_authority_missing_count +=
+            stats.data_quality.collection_authority_missing_count;
+        if stats.data_quality.asset_listing_analyzed_count > 0
+            || stats.data_quality.history_requested_asset_count > 0
+        {
+            saw_history_quality = true;
+            history_complete &= stats.data_quality.history_complete;
+        }
         merged.data_quality.supplemental_provider_failure_count +=
             stats.data_quality.supplemental_provider_failure_count;
+        merged.data_quality.provider_quality_lookup_failure_count +=
+            stats.data_quality.provider_quality_lookup_failure_count;
     }
 
     merged.malicious_addresses = dedup_strings(merged.malicious_addresses);
@@ -653,14 +684,24 @@ pub fn merge_paper_stats<'a>(
         merged.data_quality.sale_price_parseable_count;
     merged.data_quality.sale_price_parseable_ratio_denominator =
         merged.data_quality.sale_price_total_count;
-    merged.data_quality.asset_listing_coverage_ratio = ratio_i64(
-        merged.data_quality.asset_listing_analyzed_count,
-        merged.data_quality.asset_listing_total_count,
-    );
+    merged.data_quality.asset_listing_coverage_ratio = (merged
+        .data_quality
+        .asset_listing_unknown_total_contract_count
+        == 0)
+        .then(|| {
+            ratio_i64(
+                merged.data_quality.asset_listing_analyzed_count,
+                merged.data_quality.asset_listing_total_count,
+            )
+        })
+        .flatten();
     merged.data_quality.history_asset_coverage_ratio = ratio_i64(
         merged.data_quality.history_successful_asset_count,
         merged.data_quality.history_requested_asset_count,
     );
+    merged.data_quality.history_complete = saw_history_quality
+        && history_complete
+        && merged.data_quality.provider_quality_lookup_failure_count == 0;
     merged.data_quality.history_transaction_coverage_ratio =
         (merged.data_quality.history_failed_asset_count == 0)
             .then(|| {

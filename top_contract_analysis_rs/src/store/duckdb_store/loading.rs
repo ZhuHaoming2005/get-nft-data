@@ -52,6 +52,42 @@ impl DuckDbFeatureStore {
         })
     }
 
+    pub fn snapshot_identity(&self, chain: &str) -> Result<String, AppError> {
+        if let Some(identity) = self
+            .snapshot_identity_cache
+            .lock()
+            .map_err(|err| {
+                AppError::DuckDb(format!("snapshot identity cache lock poisoned: {err}"))
+            })?
+            .get(chain)
+            .cloned()
+        {
+            return Ok(identity);
+        }
+        let conn = self.conn()?;
+        let identity = conn.query_row(
+            "SELECT concat(
+                 CAST(count(*) AS VARCHAR), ':',
+                 CAST(count(DISTINCT contract_address) AS VARCHAR), ':',
+                 coalesce(CAST(bit_xor(hash(
+                     contract_address, token_id, token_uri, image_uri, name, symbol,
+                     metadata_json, token_uri_norm, image_uri_norm, name_norm
+                 )) AS VARCHAR), '0')
+             )
+             FROM nft_features WHERE chain = ?",
+            params![chain],
+            |row| row.get::<_, String>(0),
+        )?;
+        drop(conn);
+        self.snapshot_identity_cache
+            .lock()
+            .map_err(|err| {
+                AppError::DuckDb(format!("snapshot identity cache lock poisoned: {err}"))
+            })?
+            .insert(chain.to_string(), identity.clone());
+        Ok(identity)
+    }
+
     pub fn replace_chain_rows(
         &self,
         chain: &str,

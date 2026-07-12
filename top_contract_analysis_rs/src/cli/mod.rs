@@ -90,6 +90,9 @@ pub struct AnalyzeArgs {
     pub paper_center_fanout_threshold: usize,
     #[arg(long, default_value_t = 0.1)]
     pub paper_concentration_top_pct: f64,
+    /// Unix timestamp used for time-dependent paper metrics. 0 = current run time.
+    #[arg(long, default_value_t = 0)]
+    pub paper_analysis_timestamp: i64,
 }
 
 #[derive(Args, Debug)]
@@ -112,6 +115,9 @@ pub struct BatchArgs {
     pub timeout: u64,
     #[arg(long, default_value = "../result")]
     pub output_dir: String,
+    /// Start a fresh run even when a matching incomplete run manifest exists.
+    #[arg(long)]
+    pub refresh_scoped_cache: bool,
     #[arg(long, default_value_t = 2)]
     pub seed_network_max_concurrency: usize,
     #[arg(long, default_value_t = 16)]
@@ -169,6 +175,9 @@ pub struct BatchArgs {
     pub paper_center_fanout_threshold: usize,
     #[arg(long, default_value_t = 0.1)]
     pub paper_concentration_top_pct: f64,
+    /// Unix timestamp used for time-dependent paper metrics and cache identity. 0 = current run time.
+    #[arg(long, default_value_t = 0)]
+    pub paper_analysis_timestamp: i64,
 }
 
 #[derive(Args, Debug)]

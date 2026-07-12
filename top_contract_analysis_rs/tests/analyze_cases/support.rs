@@ -17,7 +17,8 @@ use top_contract_analysis_rs::models::{
 };
 use top_contract_analysis_rs::models::{
     ContractMetadata, ContractNameRecord, DatabaseNftRecord, DatabaseSnapshot, EthTransferRecord,
-    NftSaleRecord, OwnerBalance, SeedNft, TransactionReceiptRecord, TransferRecord, ZERO_ADDRESS,
+    NftSaleRecord, OwnerBalance, ProviderDataQualityPayload, SeedNft, TransactionReceiptRecord,
+    TransferRecord, ZERO_ADDRESS,
 };
 use top_contract_analysis_rs::progress::{NoopBatchProgressReporter, NoopProgressReporter};
 use top_contract_analysis_rs::reporting::{
@@ -180,6 +181,136 @@ impl AnalyzeApi for FakeApi {
         _address: &str,
     ) -> Result<Vec<EthTransferRecord>, AppError> {
         Ok(vec![])
+    }
+}
+
+struct QualityApi {
+    quality_calls: Arc<AtomicUsize>,
+    fail_quality: bool,
+}
+
+#[async_trait]
+impl AnalyzeApi for QualityApi {
+    async fn fetch_contract_metadata(
+        &self,
+        chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        opensea_api_key: &str,
+        contract_address: &str,
+    ) -> Result<ContractMetadata, AppError> {
+        FakeApi
+            .fetch_contract_metadata(
+                chain,
+                alchemy_api_key,
+                alchemy_network,
+                opensea_api_key,
+                contract_address,
+            )
+            .await
+    }
+
+    async fn fetch_seed_contract_nfts(
+        &self,
+        chain: &str,
+        alchemy_api_key: &str,
+        alchemy_network: Option<&str>,
+        contract_address: &str,
+    ) -> Result<Vec<SeedNft>, AppError> {
+        FakeApi
+            .fetch_seed_contract_nfts(chain, alchemy_api_key, alchemy_network, contract_address)
+            .await
+    }
+
+    async fn fetch_contract_transfers(
+        &self,
+        _chain: &str,
+        _etherscan_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _alchemy_api_key: &str,
+        _contract_address: &str,
+        _token_type: &str,
+    ) -> Result<Vec<TransferRecord>, AppError> {
+        Ok(Vec::new())
+    }
+
+    async fn fetch_contract_owners(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _contract_address: &str,
+    ) -> Result<Vec<OwnerBalance>, AppError> {
+        Ok(Vec::new())
+    }
+
+    async fn fetch_contract_sales(
+        &self,
+        _chain: &str,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _contract_address: &str,
+        _opensea_api_key: &str,
+    ) -> Result<Vec<NftSaleRecord>, AppError> {
+        Ok(Vec::new())
+    }
+
+    async fn fetch_transaction_receipt(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _tx_hash: &str,
+    ) -> Result<TransactionReceiptRecord, AppError> {
+        Ok(TransactionReceiptRecord::default())
+    }
+
+    async fn fetch_transaction_receipts_for_block(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _block_number: i64,
+    ) -> Result<BTreeMap<String, TransactionReceiptRecord>, AppError> {
+        Ok(BTreeMap::new())
+    }
+
+    async fn fetch_eth_balance(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _address: &str,
+        _block_number: i64,
+    ) -> Result<f64, AppError> {
+        Ok(0.0)
+    }
+
+    async fn fetch_same_block_eth_transfers_for_address(
+        &self,
+        _alchemy_api_key: &str,
+        _alchemy_network: Option<&str>,
+        _block_number: i64,
+        _address: &str,
+    ) -> Result<Vec<EthTransferRecord>, AppError> {
+        Ok(Vec::new())
+    }
+
+    async fn fetch_provider_data_quality(
+        &self,
+        _chain: &str,
+        _contract_address: &str,
+    ) -> Result<ProviderDataQualityPayload, AppError> {
+        self.quality_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_quality {
+            return Err(AppError::InvalidData("quality fixture failure".into()));
+        }
+        Ok(ProviderDataQualityPayload {
+            asset_listing_analyzed_count: 1,
+            asset_listing_total_count: 1,
+            history_requested_asset_count: 1,
+            history_successful_asset_count: 1,
+            history_complete_asset_count: 1,
+            history_complete: true,
+            ..ProviderDataQualityPayload::default()
+        })
     }
 }
 

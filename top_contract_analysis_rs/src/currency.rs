@@ -24,12 +24,6 @@ const STABLECOIN_SYMBOLS: &[&str] = &[
     "SUSD", "FRAX",
 ];
 
-pub fn is_native_eth_symbol(symbol: &str) -> bool {
-    ["ETH", "POL", "MATIC", "SOL"]
-        .iter()
-        .any(|native| symbol.trim().eq_ignore_ascii_case(native))
-}
-
 pub fn is_eth_like_symbol(symbol: &str) -> bool {
     ETH_LIKE_SYMBOLS
         .iter()

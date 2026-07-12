@@ -488,16 +488,27 @@ pub struct ProviderDataQualityPayload {
     pub asset_listing_analyzed_count: i64,
     pub asset_listing_total_count: i64,
     pub asset_listing_truncated_contract_count: i64,
+    pub asset_listing_unknown_total_contract_count: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_listing_coverage_ratio: Option<f64>,
     pub history_failed_asset_count: i64,
     pub history_requested_asset_count: i64,
     pub history_successful_asset_count: i64,
+    pub history_complete_asset_count: i64,
+    pub history_unrequested_asset_count: i64,
     pub history_truncated_asset_count: i64,
     pub history_fetched_transaction_count: i64,
     pub history_reported_transaction_count: i64,
     pub history_failed_transaction_count: i64,
+    pub history_signature_discovery_failure_count: i64,
+    pub history_transaction_detail_failure_count: i64,
     pub history_unattributed_sol_transaction_count: i64,
     pub history_unresolved_compressed_mint_count: i64,
+    pub mint_pre_balance_unavailable_count: i64,
+    pub collection_authority_missing_count: i64,
+    pub history_complete: bool,
     pub supplemental_provider_failure_count: i64,
+    pub provider_quality_lookup_failure_count: i64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -924,6 +935,7 @@ pub struct PaperWashTradingRowPayload {
     pub participant_node_count: i64,
     pub token_gini: Option<f64>,
     pub avg_cycle_blocks: Option<f64>,
+    #[serde(rename = "fake_volume_native", alias = "fake_volume_eth")]
     pub fake_volume_eth: f64,
     pub fake_volume_usd: f64,
 }
@@ -954,6 +966,7 @@ pub struct PaperPumpExitRowPayload {
     pub exit_ratio_numerator: i64,
     pub exit_ratio_denominator: i64,
     pub linked_honest_buyer_count: i64,
+    #[serde(rename = "linked_loss_native", alias = "linked_loss_eth")]
     pub linked_loss_eth: f64,
     pub linked_loss_usd: f64,
 }
@@ -969,9 +982,11 @@ pub struct PaperStarBehaviorRowPayload {
     pub avg_fan_out_numerator: i64,
     pub avg_fan_out_denominator: i64,
     pub median_holding_seconds: Option<f64>,
+    #[serde(rename = "total_value_native", alias = "total_value_eth")]
     pub total_value_eth: f64,
     pub total_value_usd: f64,
     pub linked_honest_buyer_count: i64,
+    #[serde(rename = "linked_loss_native", alias = "linked_loss_eth")]
     pub linked_loss_eth: f64,
     pub linked_loss_usd: f64,
 }
@@ -984,6 +999,7 @@ pub struct PaperLayeredTransferRowPayload {
     pub wallets: i64,
     pub zero_or_low_value_hops: i64,
     pub total_path_duration_seconds: Option<i64>,
+    #[serde(rename = "total_value_native", alias = "total_value_eth")]
     pub total_value_eth: f64,
     pub total_value_usd: f64,
 }
@@ -996,6 +1012,7 @@ pub struct PaperInventoryConcentrationRowPayload {
     pub token_share: Option<f64>,
     pub token_share_numerator: i64,
     pub token_share_denominator: i64,
+    #[serde(rename = "value_collected_native", alias = "value_collected_eth")]
     pub value_collected_eth: f64,
     pub value_collected_usd: f64,
     pub value_share: Option<f64>,
@@ -1008,6 +1025,7 @@ pub struct PaperInventoryConcentrationRowPayload {
 pub struct PaperHonestBuyerRowPayload {
     pub honest_buyer: String,
     pub fake_nft_bought: i64,
+    #[serde(rename = "total_paid_native", alias = "total_paid_eth")]
     pub total_paid_eth: f64,
     pub total_paid_usd: f64,
     pub source_pattern: String,
@@ -1043,18 +1061,23 @@ pub struct PaperBehaviorSummaryRowPayload {
     pub address_count: i64,
     pub nft_count: i64,
     pub linked_buyer_count: i64,
+    #[serde(rename = "linked_loss_native", alias = "linked_loss_eth")]
     pub linked_loss_eth: f64,
     pub linked_loss_usd: f64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct PaperAttackerCostPayload {
+    #[serde(rename = "setup_gas_native", alias = "setup_gas_eth")]
     pub setup_gas_eth: f64,
     pub setup_gas_usd: f64,
+    #[serde(rename = "lure_gas_native", alias = "lure_gas_eth")]
     pub lure_gas_eth: f64,
     pub lure_gas_usd: f64,
+    #[serde(rename = "exit_gas_native", alias = "exit_gas_eth")]
     pub exit_gas_eth: f64,
     pub exit_gas_usd: f64,
+    #[serde(rename = "total_gas_native", alias = "total_gas_eth")]
     pub total_gas_eth: f64,
     pub total_gas_usd: f64,
     pub top_contract_contribution_ratio: Option<f64>,
@@ -1069,6 +1092,7 @@ pub struct PaperAttackerCostDetailPayload {
     pub channel: String,
     pub tx_hash: String,
     pub gas_payer_address: String,
+    #[serde(rename = "gas_native", alias = "gas_eth")]
     pub gas_eth: f64,
     pub gas_usd: f64,
     pub from_role: String,
@@ -1085,10 +1109,16 @@ pub struct PaperHonestLossPayload {
     pub stuck_time_ratio: Option<f64>,
     pub stuck_time_ratio_numerator: f64,
     pub stuck_time_ratio_denominator: f64,
+    #[serde(
+        rename = "secondary_sale_loss_native",
+        alias = "secondary_sale_loss_eth"
+    )]
     pub secondary_sale_loss_eth: f64,
     pub secondary_sale_loss_usd: f64,
+    #[serde(rename = "paid_mint_loss_native", alias = "paid_mint_loss_eth")]
     pub paid_mint_loss_eth: f64,
     pub paid_mint_loss_usd: f64,
+    #[serde(rename = "total_loss_native", alias = "total_loss_eth")]
     pub total_loss_eth: f64,
     pub total_loss_usd: f64,
     pub top_contract_loss_contribution_ratio: Option<f64>,
@@ -1145,6 +1175,8 @@ pub struct PaperDataQualityPayload {
     pub asset_listing_total_count: i64,
     #[serde(default)]
     pub asset_listing_truncated_contract_count: i64,
+    #[serde(default)]
+    pub asset_listing_unknown_total_contract_count: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asset_listing_coverage_ratio: Option<f64>,
     #[serde(default)]
@@ -1153,6 +1185,10 @@ pub struct PaperDataQualityPayload {
     pub history_requested_asset_count: i64,
     #[serde(default)]
     pub history_successful_asset_count: i64,
+    #[serde(default)]
+    pub history_complete_asset_count: i64,
+    #[serde(default)]
+    pub history_unrequested_asset_count: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_asset_coverage_ratio: Option<f64>,
     #[serde(default)]
@@ -1164,11 +1200,23 @@ pub struct PaperDataQualityPayload {
     #[serde(default)]
     pub history_failed_transaction_count: i64,
     #[serde(default)]
+    pub history_signature_discovery_failure_count: i64,
+    #[serde(default)]
+    pub history_transaction_detail_failure_count: i64,
+    #[serde(default)]
     pub history_unattributed_sol_transaction_count: i64,
     #[serde(default)]
     pub history_unresolved_compressed_mint_count: i64,
     #[serde(default)]
+    pub mint_pre_balance_unavailable_count: i64,
+    #[serde(default)]
+    pub collection_authority_missing_count: i64,
+    #[serde(default)]
+    pub history_complete: bool,
+    #[serde(default)]
     pub supplemental_provider_failure_count: i64,
+    #[serde(default)]
+    pub provider_quality_lookup_failure_count: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_transaction_coverage_ratio: Option<f64>,
 }
@@ -1426,62 +1474,6 @@ pub struct SingleReportPayload {
     pub nft_propagation_paths: BTreeMap<String, NftPropagationPathPayload>,
 }
 
-pub(crate) fn rename_native_amount_keys(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Object(map) => {
-            let keys = map.keys().cloned().collect::<Vec<_>>();
-            for key in keys {
-                let Some(mut child) = map.remove(&key) else {
-                    continue;
-                };
-                rename_native_amount_keys(&mut child);
-                let renamed = if key == "is_native_eth" {
-                    "is_native_payment".to_string()
-                } else if let Some(prefix) = key.strip_suffix("_eth") {
-                    format!("{prefix}_native")
-                } else {
-                    key
-                };
-                map.insert(renamed, child);
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                rename_native_amount_keys(item);
-            }
-        }
-        _ => {}
-    }
-}
-
-pub(crate) fn restore_internal_native_amount_keys(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Object(map) => {
-            let keys = map.keys().cloned().collect::<Vec<_>>();
-            for key in keys {
-                let Some(mut child) = map.remove(&key) else {
-                    continue;
-                };
-                restore_internal_native_amount_keys(&mut child);
-                let restored = if key == "is_native_payment" {
-                    "is_native_eth".to_string()
-                } else if let Some(prefix) = key.strip_suffix("_native") {
-                    format!("{prefix}_eth")
-                } else {
-                    key
-                };
-                map.insert(restored, child);
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                restore_internal_native_amount_keys(item);
-            }
-        }
-        _ => {}
-    }
-}
-
 impl Serialize for SingleReportPayload {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -1498,10 +1490,7 @@ impl Serialize for SingleReportPayload {
             .map(Chain::native_symbol)
             .unwrap_or("");
         state.serialize_field("native_symbol", native_symbol)?;
-        let mut paper_stats =
-            serde_json::to_value(&self.paper_stats).map_err(serde::ser::Error::custom)?;
-        rename_native_amount_keys(&mut paper_stats);
-        state.serialize_field("paper_stats", &paper_stats)?;
+        state.serialize_field("paper_stats", &self.paper_stats)?;
         state.end()
     }
 }
@@ -1522,11 +1511,10 @@ impl Serialize for BatchSummaryPayload {
         let mut state = serializer.serialize_struct("BatchSummaryPayload", 3)?;
         state.serialize_field("schema_version", &2_u32)?;
         state.serialize_field("report_type", &batch_summary_report_type())?;
-        let mut paper_stats =
-            serde_json::to_value(BatchPaperStatsSummaryPayload::from(&self.paper_stats))
-                .map_err(serde::ser::Error::custom)?;
-        rename_native_amount_keys(&mut paper_stats);
-        state.serialize_field("paper_stats", &paper_stats)?;
+        state.serialize_field(
+            "paper_stats",
+            &BatchPaperStatsSummaryPayload::from(&self.paper_stats),
+        )?;
         state.end()
     }
 }

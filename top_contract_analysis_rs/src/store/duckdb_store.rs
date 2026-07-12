@@ -62,6 +62,7 @@ pub struct DuckDbFeatureStore {
     conn: Mutex<Connection>,
     resource_options: DuckDbResourceOptions,
     metadata_recall_index_cache: Mutex<HashMap<String, Arc<MetadataRecallIndex>>>,
+    snapshot_identity_cache: Mutex<HashMap<String, String>>,
     writable: bool,
 }
 
@@ -352,6 +353,7 @@ impl DuckDbFeatureStore {
             conn: Mutex::new(conn),
             resource_options,
             metadata_recall_index_cache: Mutex::new(HashMap::new()),
+            snapshot_identity_cache: Mutex::new(HashMap::new()),
             writable: true,
         })
     }
@@ -376,6 +378,7 @@ impl DuckDbFeatureStore {
             conn: Mutex::new(conn),
             resource_options,
             metadata_recall_index_cache: Mutex::new(HashMap::new()),
+            snapshot_identity_cache: Mutex::new(HashMap::new()),
             writable: false,
         })
     }
@@ -408,6 +411,12 @@ impl DuckDbFeatureStore {
 
     fn invalidate_metadata_recall_index(&self, chain: &str) -> Result<(), AppError> {
         self.metadata_recall_index_cache()?.remove(chain);
+        self.snapshot_identity_cache
+            .lock()
+            .map_err(|err| {
+                AppError::DuckDb(format!("snapshot identity cache lock poisoned: {err}"))
+            })?
+            .remove(chain);
         Ok(())
     }
 }

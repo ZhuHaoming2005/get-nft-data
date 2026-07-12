@@ -108,6 +108,52 @@ fn solana_feature_rows_preserve_base58_case() {
 }
 
 #[test]
+fn solana_recall_excludes_the_case_sensitive_seed_contract_before_row_budgeting() {
+    let store = DuckDbFeatureStore::new(":memory:").unwrap();
+    let seed = "SeedCaseSensitive111111111111111111111111111";
+    let candidate = "ZandidateCaseSensitive1111111111111111111111111";
+    store
+        .replace_chain_rows(
+            "solana",
+            &[
+                DatabaseNftRecord {
+                    contract_address: seed.into(),
+                    token_id: "seed-copy".into(),
+                    token_uri: "ipfs://shared".into(),
+                    ..DatabaseNftRecord::default()
+                },
+                DatabaseNftRecord {
+                    contract_address: candidate.into(),
+                    token_id: "candidate".into(),
+                    token_uri: "ipfs://shared".into(),
+                    ..DatabaseNftRecord::default()
+                },
+            ],
+        )
+        .unwrap();
+
+    let snapshot = store
+        .load_snapshot(
+            "solana",
+            &[SeedNft {
+                chain: "solana".into(),
+                contract_address: seed.into(),
+                token_id: "original".into(),
+                token_uri: "ipfs://shared".into(),
+                ..SeedNft::default()
+            }],
+            95.0,
+            0.6,
+            0,
+            1,
+        )
+        .unwrap();
+
+    assert_eq!(snapshot.nft_rows.len(), 1);
+    assert_eq!(snapshot.nft_rows[0].contract_address, candidate);
+}
+
+#[test]
 fn parquet_auto_loader_imports_each_embedded_chain() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("mixed.parquet");

@@ -3,6 +3,27 @@ use crate::models::EthTransferRecord;
 use crate::models::{AddressEvidencePayload, NftTokenPropagationPayload};
 
 #[test]
+fn missing_mint_pre_balance_quality_count_deduplicates_transaction_wallet_pairs() {
+    let missing = ValueFlowEdgePayload {
+        channel: "mint_payment".into(),
+        tx_hash: "signature".into(),
+        from_address: "wallet".into(),
+        from_before_eth_balance: None,
+        ..ValueFlowEdgePayload::default()
+    };
+    let available = ValueFlowEdgePayload {
+        tx_hash: "other".into(),
+        from_before_eth_balance: Some(1.0),
+        ..missing.clone()
+    };
+
+    assert_eq!(
+        count_missing_mint_pre_balances(&[missing.clone(), missing, available]),
+        1
+    );
+}
+
+#[test]
 fn seed_duplicate_matching_uses_single_contract_level_name() {
     let seed_contract = ContractMetadata {
         chain: "ethereum".into(),

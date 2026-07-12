@@ -96,6 +96,7 @@ fn batch_cli_accepts_multichain_inputs_and_helius_limits() {
         "5",
         "--seed-cpu-max-concurrency",
         "2",
+        "--refresh-scoped-cache",
     ]);
     let CliCommand::Batch(args) = batch.command else {
         panic!("expected batch command");
@@ -113,6 +114,7 @@ fn batch_cli_accepts_multichain_inputs_and_helius_limits() {
     assert_eq!(args.max_history_transactions_per_collection, 20_000);
     assert_eq!(args.seed_network_max_concurrency, 5);
     assert_eq!(args.seed_cpu_max_concurrency, 2);
+    assert!(args.refresh_scoped_cache);
 }
 
 #[test]

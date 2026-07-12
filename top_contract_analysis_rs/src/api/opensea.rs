@@ -1050,7 +1050,7 @@ pub async fn fetch_contract_sales_with_clients(
     )
     .await
     .map(|rows| filter_sales_for_contract(rows, chain, contract_address));
-    match alchemy_result {
+    let alchemy_error = match alchemy_result {
         Ok(rows) => {
             return Ok(enrich_sales_with_royalty_recipient(
                 alchemy_client,
@@ -1061,17 +1061,17 @@ pub async fn fetch_contract_sales_with_clients(
             .await);
         }
         Err(err) if opensea_api_key.trim().is_empty() => {
-            eprintln!(
-                "warning: Alchemy contract sales failed for {contract_address}: {err}; continuing without contract sales"
-            );
-            return Ok(Vec::new());
+            return Err(AppError::Http(format!(
+                "contract sales lookup failed for {chain}:{contract_address}: Alchemy: {err}"
+            )));
         }
         Err(err) => {
             eprintln!(
                 "warning: Alchemy contract sales failed for {contract_address}: {err}; falling back to OpenSea"
             );
+            err
         }
-    }
+    };
 
     let collection_slug = match fetch_contract_collection_slug_alchemy_first(
         alchemy_client,
@@ -1085,10 +1085,9 @@ pub async fn fetch_contract_sales_with_clients(
     {
         Ok(slug) => slug,
         Err(err) => {
-            eprintln!(
-                "warning: OpenSea contract sales collection lookup failed for {contract_address}: {err}; continuing without contract sales"
-            );
-            return Ok(Vec::new());
+            return Err(AppError::Http(format!(
+                "contract sales lookup failed for {chain}:{contract_address}: Alchemy: {alchemy_error}; OpenSea collection lookup: {err}"
+            )));
         }
     };
     match fetch_opensea_nft_events_with_collection_slug(
@@ -1116,10 +1115,9 @@ pub async fn fetch_contract_sales_with_clients(
             .await)
         }
         Err(err) => {
-            eprintln!(
-                "warning: OpenSea contract sales failed for {contract_address}: {err}; continuing without contract sales"
-            );
-            Ok(Vec::new())
+            Err(AppError::Http(format!(
+                "contract sales lookup failed for {chain}:{contract_address}: Alchemy: {alchemy_error}; OpenSea events: {err}"
+            )))
         }
     }
 }

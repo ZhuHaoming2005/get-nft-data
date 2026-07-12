@@ -2,11 +2,107 @@ use httpmock::prelude::*;
 use top_contract_analysis_rs::analysis::{AnalyzeApi, RealApi};
 use top_contract_analysis_rs::api::{
     fetch_helius_asset_transfers, fetch_helius_assets_history,
-    fetch_helius_assets_history_with_budget, fetch_helius_block_details,
-    fetch_helius_collection_assets, fetch_helius_collection_snapshot, AsyncApiClient,
+    fetch_helius_assets_history_with_budget, fetch_helius_collection_assets,
+    fetch_helius_collection_snapshot, fetch_helius_transaction_details, AsyncApiClient,
     HeliusCollectionAsset,
 };
 use top_contract_analysis_rs::models::SeedNft;
+
+#[tokio::test]
+async fn provider_quality_lookup_does_not_start_collection_or_history_fetches() {
+    let server = MockServer::start_async().await;
+    let assets = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/")
+                .body_contains("getAssetsByGroup");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "jsonrpc": "2.0", "result": {"total": 0, "items": []}
+            }));
+        })
+        .await;
+    let signatures = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/")
+                .body_contains("getSignaturesForAsset");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "jsonrpc": "2.0", "result": {"total": 0, "items": []}
+            }));
+        })
+        .await;
+    let api = RealApi::new_with_helius_endpoint(
+        5,
+        2,
+        2,
+        10,
+        2,
+        format!("{}/?api-key=test", server.base_url()),
+    )
+    .unwrap();
+
+    let quality = api
+        .fetch_provider_data_quality("solana", "Collection")
+        .await
+        .unwrap();
+
+    assert_eq!(assets.hits_async().await, 0);
+    assert_eq!(signatures.hits_async().await, 0);
+    assert_eq!(quality.provider_quality_lookup_failure_count, 1);
+    assert!(!quality.history_complete);
+}
+
+#[tokio::test]
+async fn provider_quality_counts_snapshot_assets_when_history_was_not_requested() {
+    let server = MockServer::start_async().await;
+    let assets = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/")
+                .body_contains("getAssetsByGroup");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "jsonrpc": "2.0", "result": {"total": 2, "items": [
+                    {"id": "AssetA", "content": {"metadata": {}}},
+                    {"id": "AssetB", "content": {"metadata": {}}}
+                ]}
+            }));
+        })
+        .await;
+    let signatures = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/")
+                .body_contains("getSignaturesForAsset");
+            then.status(500);
+        })
+        .await;
+    let api = RealApi::new_with_helius_endpoint(
+        5,
+        2,
+        2,
+        10,
+        2,
+        format!("{}/?api-key=test", server.base_url()),
+    )
+    .unwrap();
+
+    let listed = api
+        .fetch_seed_contract_nfts("solana", "", None, "Collection")
+        .await
+        .unwrap();
+    let quality = api
+        .fetch_provider_data_quality("solana", "Collection")
+        .await
+        .unwrap();
+
+    assert_eq!(listed.len(), 2);
+    assert_eq!(quality.history_requested_asset_count, 0);
+    assert_eq!(quality.history_unrequested_asset_count, 2);
+    assert_eq!(quality.provider_quality_lookup_failure_count, 1);
+    assert!(!quality.history_complete);
+    assets.assert_hits_async(1).await;
+    signatures.assert_hits_async(0).await;
+}
 
 #[tokio::test]
 async fn helius_collection_assets_paginate_and_preserve_solana_addresses() {
@@ -191,6 +287,76 @@ async fn solana_pre_transaction_balance_uses_target_transaction_not_full_block()
 }
 
 #[tokio::test]
+async fn solana_target_transaction_evidence_is_fetched_once_across_consumers() {
+    let server = MockServer::start_async().await;
+    let transaction = server
+        .mock_async(|when, then| {
+            when.method(POST).path("/").body_contains("getTransaction");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "result": {
+                    "slot": 42,
+                    "transaction": {
+                        "signatures": ["shared-signature"],
+                        "message": {
+                            "accountKeys": ["payer", "receiver"],
+                            "instructions": [{"parsed": {"type": "transfer", "info": {
+                                "source": "payer",
+                                "destination": "receiver",
+                                "lamports": 1_000_000_000_u64
+                            }}}]
+                        }
+                    },
+                    "meta": {
+                        "err": null,
+                        "fee": 5000,
+                        "preBalances": [2_000_000_000_u64, 0],
+                        "postBalances": [999_995_000_u64, 1_000_000_000_u64]
+                    }
+                }
+            }));
+        })
+        .await;
+    let api = RealApi::new_with_helius_endpoint(
+        5,
+        2,
+        2,
+        10,
+        2,
+        format!("{}/?api-key=test", server.base_url()),
+    )
+    .unwrap();
+
+    api.fetch_transaction_receipt_on_chain("solana", "", None, "shared-signature")
+        .await
+        .unwrap();
+    api.fetch_pre_transaction_native_balance_on_chain(
+        "solana",
+        "",
+        None,
+        "shared-signature",
+        "payer",
+        42,
+    )
+    .await
+    .unwrap();
+    let transfers = api
+        .fetch_transaction_value_transfers_to_address_on_chain(
+            "solana",
+            "",
+            None,
+            "shared-signature",
+            42,
+            "receiver",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(transfers.len(), 1);
+    assert_eq!(transaction.hits_async().await, 1);
+}
+
+#[tokio::test]
 async fn real_api_builds_solana_metadata_and_owner_balances_from_das() {
     let server = MockServer::start_async().await;
     server
@@ -206,11 +372,15 @@ async fn real_api_builds_solana_metadata_and_owner_balances_from_das() {
                         {
                             "id": "So11111111111111111111111111111111111111112",
                             "content": {"metadata": {"name": "Collection", "symbol": "COL"}},
-                            "authorities": [{"address": "AuthorityCaseSensitive", "scopes": ["full"]}],
+                            "authorities": [{"address": "WrongAssetAuthority", "scopes": ["full"]}],
                             "grouping": [{
                                 "group_key": "collection",
                                 "group_value": "Collection111111111111111111111111111111111",
-                                "collection_metadata": {"name": "Collection", "symbol": "COL"}
+                                "collection_metadata": {
+                                    "name": "Collection",
+                                    "symbol": "COL",
+                                    "update_authority": "CollectionAuthorityCaseSensitive"
+                                }
                             }],
                             "ownership": {"owner": "Vote111111111111111111111111111111111111111"}
                         },
@@ -248,7 +418,7 @@ async fn real_api_builds_solana_metadata_and_owner_balances_from_das() {
     assert_eq!(metadata.contract_address, collection);
     assert_eq!(metadata.name, "Collection");
     assert_eq!(metadata.symbol, "COL");
-    assert_eq!(metadata.owner_address, "AuthorityCaseSensitive");
+    assert_eq!(metadata.owner_address, "CollectionAuthorityCaseSensitive");
     assert_eq!(owners.len(), 1);
     assert_eq!(owners[0].token_balances.len(), 2);
 }
@@ -328,6 +498,44 @@ async fn helius_collection_snapshot_marks_unknown_total_as_truncated_at_asset_ca
     assert_eq!(snapshot.total, 1);
     assert!(snapshot.truncated);
     assert_eq!(snapshot.coverage_ratio, None);
+}
+
+#[tokio::test]
+async fn helius_collection_snapshot_stops_on_repeated_full_page_and_deduplicates_mints() {
+    let server = MockServer::start_async().await;
+    let pages = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/")
+                .body_contains("getAssetsByGroup");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "result": {
+                    "items": [{"id": "RepeatedMint", "content": {"metadata": {}}}]
+                }
+            }));
+        })
+        .await;
+    let client = AsyncApiClient::new(5, 2).unwrap();
+
+    let snapshot = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        fetch_helius_collection_snapshot(
+            &client,
+            &format!("{}/?api-key=test", server.base_url()),
+            "Collection",
+            1,
+            3,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(snapshot.assets.len(), 1);
+    assert_eq!(snapshot.assets[0].nft.token_id, "RepeatedMint");
+    assert!(snapshot.truncated);
+    assert_eq!(pages.hits_async().await, 2);
 }
 
 #[tokio::test]
@@ -588,7 +796,7 @@ async fn real_api_reads_solana_license_from_das_metadata_without_alchemy() {
 }
 
 #[tokio::test]
-async fn solana_transaction_and_block_adapters_parse_fee_balance_and_sol_flow() {
+async fn solana_transaction_adapter_parses_fee_balance_and_sol_flow() {
     let server = MockServer::start_async().await;
     let transaction = serde_json::json!({
         "slot": 42,
@@ -657,16 +865,6 @@ async fn solana_transaction_and_block_adapters_parse_fee_balance_and_sol_flow() 
             }));
         })
         .await;
-    let block_transaction = transaction.clone();
-    let block_mock = server
-        .mock_async(move |when, then| {
-            when.method(POST).path("/").body_contains("getBlock");
-            then.status(200).json_body_obj(&serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": {"blockTime": 123, "transactions": [block_transaction]}
-            }));
-        })
-        .await;
     let api = RealApi::new_with_helius_endpoint(
         5,
         2,
@@ -689,19 +887,31 @@ async fn solana_transaction_and_block_adapters_parse_fee_balance_and_sol_flow() 
     assert_eq!(receipt.fee_native, Some(0.000005));
 
     let client = AsyncApiClient::new(5, 2).unwrap();
-    let block = fetch_helius_block_details(
+    let details = fetch_helius_transaction_details(
         &client,
         &format!("{}/?api-key=test", server.base_url()),
-        42,
+        "signature",
         Some(100.0),
     )
     .await
+    .unwrap()
     .unwrap();
-    assert_eq!(block[0].pre_balances_native["payer"], 5.0);
-    assert_eq!(block[0].native_transfers[0].value_eth, 2.0);
-    assert_eq!(block[0].native_transfers[0].value_usd, Some(200.0));
-    assert_eq!(block[0].native_transfers[0].payment_token_symbol, "SOL");
-    let usdc = block[0]
+    assert_eq!(details.pre_balances_native["payer"], 5.0);
+    assert_eq!(
+        details.account_keys,
+        [
+            "payer",
+            "receiver",
+            "payer-usdc",
+            "receiver-usdc",
+            "payer-other",
+            "receiver-other"
+        ]
+    );
+    assert_eq!(details.native_transfers[0].value_eth, 2.0);
+    assert_eq!(details.native_transfers[0].value_usd, Some(200.0));
+    assert_eq!(details.native_transfers[0].payment_token_symbol, "SOL");
+    let usdc = details
         .native_transfers
         .iter()
         .find(|transfer| transfer.payment_token_symbol == "USDC")
@@ -710,7 +920,7 @@ async fn solana_transaction_and_block_adapters_parse_fee_balance_and_sol_flow() 
     assert_eq!(usdc.to_address, "receiver");
     assert_eq!(usdc.value_usd, Some(2.5));
     assert_eq!(usdc.value_eth, 0.025);
-    let other = block[0]
+    let other = details
         .native_transfers
         .iter()
         .find(|transfer| {
@@ -720,75 +930,7 @@ async fn solana_transaction_and_block_adapters_parse_fee_balance_and_sol_flow() 
     assert_eq!(other.from_address, "payer");
     assert_eq!(other.to_address, "receiver");
     assert_eq!(other.payment_token_symbol, "SPL");
-    transaction_mock.assert_async().await;
-    block_mock.assert_async().await;
-}
-
-#[tokio::test]
-async fn helius_block_adapter_excludes_failed_transactions() {
-    let server = MockServer::start_async().await;
-    let failed = serde_json::json!({
-        "slot": 42,
-        "transaction": {
-            "signatures": ["failed-signature"],
-            "message": {
-                "accountKeys": ["payer", "receiver"],
-                "instructions": [{"parsed": {"type": "transfer", "info": {
-                    "source": "payer", "destination": "receiver", "lamports": 1_000_000_000_u64
-                }}}]
-            }
-        },
-        "meta": {"err": {"InstructionError": [0, "Custom"]}, "fee": 5000}
-    });
-    server
-        .mock_async(move |when, then| {
-            when.method(POST).path("/").body_contains("getBlock");
-            then.status(200).json_body_obj(&serde_json::json!({
-                "jsonrpc": "2.0", "result": {"transactions": [failed]}
-            }));
-        })
-        .await;
-    let client = AsyncApiClient::new(5, 2).unwrap();
-
-    let rows = fetch_helius_block_details(
-        &client,
-        &format!("{}/?api-key=test", server.base_url()),
-        42,
-        Some(100.0),
-    )
-    .await
-    .unwrap();
-
-    assert!(rows.is_empty());
-}
-
-#[tokio::test]
-async fn helius_block_adapter_preserves_original_transaction_index() {
-    let server = MockServer::start_async().await;
-    server
-        .mock_async(|when, then| {
-            when.method(POST).path("/").body_contains("getBlock");
-            then.status(200).json_body_obj(&serde_json::json!({
-                "jsonrpc": "2.0", "result": {"transactions": [
-                    {"transaction": {"signatures": ["failed"], "message": {"accountKeys": []}}, "meta": {"err": {"InstructionError": [0, "Custom"]}}},
-                    {"transaction": {"signatures": ["ok"], "message": {"accountKeys": [], "instructions": []}}, "meta": {"err": null}}
-                ]}
-            }));
-        })
-        .await;
-    let client = AsyncApiClient::new(5, 2).unwrap();
-
-    let rows = fetch_helius_block_details(
-        &client,
-        &format!("{}/?api-key=test", server.base_url()),
-        42,
-        None,
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].receipt.transaction_index, 1);
+    assert_eq!(transaction_mock.hits_async().await, 2);
 }
 
 #[tokio::test]
@@ -1152,6 +1294,7 @@ async fn solana_collection_history_fetches_shared_transaction_once_across_assets
 
     assert_eq!(transaction.hits_async().await, 1);
     assert_eq!(signatures.hits_async().await, 2);
+    assert_eq!(history.parsed_transaction_count, 1);
     assert_eq!(history.sales.len(), 2);
     assert!(history.sales.iter().all(|sale| sale.price_usd.is_none()));
 }
@@ -1211,7 +1354,7 @@ async fn solana_collection_history_enforces_total_transaction_budget() {
 }
 
 #[tokio::test]
-async fn solana_collection_history_budget_is_consumed_by_empty_signature_plan() {
+async fn solana_collection_history_empty_plans_do_not_consume_signature_budget() {
     let server = MockServer::start_async().await;
     let signatures = server
         .mock_async(|when, then| {
@@ -1248,21 +1391,42 @@ async fn solana_collection_history_budget_is_consumed_by_empty_signature_plan() 
     .await
     .unwrap();
 
-    assert_eq!(signatures.hits_async().await, 1);
-    assert_eq!(history.requested_asset_count, 1);
-    assert_eq!(history.successful_asset_count, 1);
-    assert!(history.truncated_asset_history_count > 0);
+    assert_eq!(signatures.hits_async().await, 2);
+    assert_eq!(history.requested_asset_count, 2);
+    assert_eq!(history.successful_asset_count, 2);
+    assert_eq!(history.truncated_asset_history_count, 0);
 }
 
 #[tokio::test]
-async fn solana_collection_history_budget_is_consumed_by_failed_signature_plan() {
+async fn solana_collection_history_failed_plans_do_not_consume_signature_budget() {
     let server = MockServer::start_async().await;
-    let signatures = server
+    let failed_signatures = server
         .mock_async(|when, then| {
             when.method(POST)
                 .path("/")
-                .body_contains("getSignaturesForAsset");
-            then.status(500);
+                .body_contains("getSignaturesForAsset")
+                .body_contains("AssetOne");
+            then.status(400);
+        })
+        .await;
+    let successful_signatures = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/")
+                .body_contains("getSignaturesForAsset")
+                .body_contains("AssetTwo");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "result": {"total": 1, "items": [["second-signature", "Transfer"]]}
+            }));
+        })
+        .await;
+    let transaction = server
+        .mock_async(|when, then| {
+            when.method(POST).path("/").body_contains("getTransaction");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "jsonrpc": "2.0", "result": null
+            }));
         })
         .await;
     let assets = ["AssetOne", "AssetTwo"]
@@ -1276,7 +1440,7 @@ async fn solana_collection_history_budget_is_consumed_by_failed_signature_plan()
             compressed: false,
         })
         .collect::<Vec<_>>();
-    let client = AsyncApiClient::new(0, 1).unwrap();
+    let client = AsyncApiClient::new(5, 1).unwrap();
 
     let history = fetch_helius_assets_history_with_budget(
         &client,
@@ -1289,10 +1453,67 @@ async fn solana_collection_history_budget_is_consumed_by_failed_signature_plan()
     .await
     .unwrap();
 
-    assert_eq!(signatures.hits_async().await, 1);
-    assert_eq!(history.requested_asset_count, 1);
+    assert_eq!(failed_signatures.hits_async().await, 1);
+    assert_eq!(successful_signatures.hits_async().await, 1);
+    assert_eq!(transaction.hits_async().await, 1);
+    assert_eq!(history.requested_asset_count, 2);
     assert_eq!(history.failed_asset_count, 1);
-    assert!(history.truncated_asset_history_count > 0);
+    assert_eq!(history.successful_asset_count, 1);
+    assert_eq!(history.truncated_asset_history_count, 0);
+}
+
+#[tokio::test]
+async fn solana_collection_history_allocates_budget_across_assets_and_downstreams_limit() {
+    let server = MockServer::start_async().await;
+    let signatures = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/")
+                .body_contains("getSignaturesForAsset")
+                .body_contains("\"limit\":1");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "result": {"total": 1, "items": [["shared-signature", "Transfer"]]}
+            }));
+        })
+        .await;
+    let transaction = server
+        .mock_async(|when, then| {
+            when.method(POST).path("/").body_contains("getTransaction");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "jsonrpc": "2.0", "result": null
+            }));
+        })
+        .await;
+    let assets = ["AssetOne", "AssetTwo", "AssetThree"]
+        .into_iter()
+        .map(|token_id| HeliusCollectionAsset {
+            nft: SeedNft {
+                token_id: token_id.into(),
+                ..SeedNft::default()
+            },
+            owner_address: String::new(),
+            compressed: false,
+        })
+        .collect::<Vec<_>>();
+    let client = AsyncApiClient::new(5, 4).unwrap();
+
+    let history = fetch_helius_assets_history_with_budget(
+        &client,
+        &format!("{}/?api-key=test", server.base_url()),
+        "Collection",
+        &assets,
+        100,
+        3,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(signatures.hits_async().await, 3);
+    assert_eq!(transaction.hits_async().await, 1);
+    assert_eq!(history.requested_asset_count, 3);
+    assert_eq!(history.successful_asset_count, 3);
+    assert_eq!(history.truncated_asset_history_count, 0);
 }
 
 #[tokio::test]
@@ -1422,6 +1643,74 @@ async fn compressed_mint_history_uses_bubblegum_leaf_owner_evidence() {
     assert_eq!(history.unresolved_compressed_mint_count, 0);
     assert_eq!(history.transfers.len(), 1);
     assert_eq!(history.transfers[0].event_type, "mint");
+    assert_eq!(
+        history.transfers[0].to_address,
+        "HistoricalOwnerCaseSensitive"
+    );
+}
+
+#[tokio::test]
+async fn compressed_mint_history_continues_after_incomplete_bubblegum_instruction() {
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/")
+                .body_contains("getSignaturesForAsset");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "result": {"total": 1, "items": [["mint-signature", "MintToCollectionV1"]]}
+            }));
+        })
+        .await;
+    server
+        .mock_async(|when, then| {
+            when.method(POST).path("/").body_contains("getTransaction");
+            then.status(200).json_body_obj(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "result": {
+                    "slot": 2,
+                    "transaction": {"signatures": ["mint-signature"], "message": {
+                        "accountKeys": ["tree", "HistoricalOwnerCaseSensitive"],
+                        "instructions": [
+                            {
+                                "programId": "BGUMAp9Gq7iTEuizy4pqaxsTyUCBK68MDfK752saRPUY",
+                                "accounts": [0],
+                                "data": "Sc11WcT5qXc"
+                            },
+                            {
+                                "programId": "BGUMAp9Gq7iTEuizy4pqaxsTyUCBK68MDfK752saRPUY",
+                                "accounts": [0, 1],
+                                "data": "Sc11WcT5qXc"
+                            }
+                        ]
+                    }},
+                    "meta": {"err": null, "preTokenBalances": [], "postTokenBalances": []}
+                }
+            }));
+        })
+        .await;
+    let client = AsyncApiClient::new(5, 2).unwrap();
+    let assets = vec![HeliusCollectionAsset {
+        nft: SeedNft {
+            token_id: "CompressedAsset".into(),
+            ..SeedNft::default()
+        },
+        owner_address: String::new(),
+        compressed: true,
+    }];
+
+    let history = fetch_helius_assets_history(
+        &client,
+        &format!("{}/?api-key=test", server.base_url()),
+        "Collection",
+        &assets,
+        100,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(history.transfers.len(), 1);
     assert_eq!(
         history.transfers[0].to_address,
         "HistoricalOwnerCaseSensitive"

@@ -123,6 +123,7 @@ pub(super) fn implausible_candidate_filtered_result(
         mint_payment_edges: Vec::new(),
         attacker_cost_edges: Vec::new(),
         nft_propagation_path: None,
+        provider_data_quality: Default::default(),
     }
 }
 
@@ -306,6 +307,7 @@ pub(super) async fn analyze_duplicate_contract(
             mint_payment_edges: vec![],
             attacker_cost_edges: vec![],
             nft_propagation_path: None,
+            provider_data_quality: Default::default(),
         });
     }
 
@@ -401,5 +403,6 @@ pub(super) async fn analyze_duplicate_contract(
         mint_payment_edges,
         attacker_cost_edges,
         nft_propagation_path: Some(nft_propagation_path),
+        provider_data_quality: Default::default(),
     })
 }

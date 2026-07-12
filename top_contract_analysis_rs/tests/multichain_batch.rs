@@ -9,13 +9,93 @@ use top_contract_analysis_rs::analysis::{
 };
 use top_contract_analysis_rs::error::AppError;
 use top_contract_analysis_rs::models::{
-    ChainTotalsPayload, ContractMetadata, DatabaseSnapshot, EthTransferRecord, NftSaleRecord,
-    OwnerBalance, SeedNft, TransactionReceiptRecord, TransferRecord,
+    Chain, ChainTotalsPayload, ContractMetadata, DatabaseSnapshot, EthTransferRecord,
+    NftSaleRecord, OwnerBalance, SeedNft, TransactionReceiptRecord, TransferRecord,
 };
 use top_contract_analysis_rs::progress::{NoopBatchProgressReporter, NoopProgressReporter};
 
 struct EmptyCrossChainStore {
     chains: Arc<Mutex<Vec<String>>>,
+}
+
+struct BulkOnlyStore {
+    bulk_calls: Arc<AtomicUsize>,
+}
+
+impl FeatureStoreReader for BulkOnlyStore {
+    fn load_snapshot(
+        &self,
+        _chain: &str,
+        _seed_nfts: &[SeedNft],
+        _name_threshold: f64,
+        _metadata_threshold: f64,
+        _max_tokens_per_contract: usize,
+        _max_recall_rows: usize,
+    ) -> Result<DatabaseSnapshot, AppError> {
+        panic!("batch path must use load_snapshots")
+    }
+
+    fn load_snapshots(
+        &self,
+        _chain: &str,
+        seeds: &[(String, Vec<SeedNft>)],
+        _name_threshold: f64,
+        _metadata_threshold: f64,
+        _max_tokens_per_contract: usize,
+        _max_recall_rows: usize,
+    ) -> Result<std::collections::BTreeMap<String, DatabaseSnapshot>, AppError> {
+        self.bulk_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(seeds
+            .iter()
+            .map(|(address, _)| (address.clone(), DatabaseSnapshot::default()))
+            .collect())
+    }
+
+    fn chain_totals(&self, _chain: &str) -> Result<ChainTotalsPayload, AppError> {
+        Ok(ChainTotalsPayload {
+            total_nfts: 1_000,
+            total_contracts: 100,
+        })
+    }
+}
+
+#[tokio::test]
+async fn batch_uses_bulk_snapshot_loading_for_multiple_seeds() {
+    let dir = tempdir().unwrap();
+    let seed_file = dir.path().join("seeds.csv");
+    std::fs::write(
+        &seed_file,
+        concat!(
+            "chain,address\n",
+            "ethereum,0x1111111111111111111111111111111111111111\n",
+            "ethereum,0x2222222222222222222222222222222222222222\n",
+        ),
+    )
+    .unwrap();
+    let bulk_calls = Arc::new(AtomicUsize::new(0));
+
+    let result = run_multichain_batch(
+        MultiChainBatchRequest {
+            seed_file,
+            output_dir: dir.path().join("output"),
+            ..MultiChainBatchRequest::default()
+        },
+        &AnalysisDeps {
+            api: Arc::new(SeedOnlyApi {
+                metadata_calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            feature_store: Arc::new(BulkOnlyStore {
+                bulk_calls: bulk_calls.clone(),
+            }),
+            progress: Arc::new(NoopProgressReporter),
+            batch_progress: Arc::new(NoopBatchProgressReporter),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(result.failures.is_empty());
+    assert!(bulk_calls.load(Ordering::SeqCst) > 0);
 }
 
 impl FeatureStoreReader for EmptyCrossChainStore {
@@ -468,7 +548,7 @@ async fn mixed_batch_analyzes_each_seed_against_all_four_chains() {
 }
 
 #[tokio::test]
-async fn second_multichain_run_reuses_complete_v2_seed_cache() {
+async fn completed_manifest_starts_a_fresh_run_instead_of_reusing_cache() {
     let dir = tempdir().unwrap();
     let seed_file = dir.path().join("seeds.csv");
     std::fs::write(
@@ -490,13 +570,22 @@ async fn second_multichain_run_reuses_complete_v2_seed_cache() {
     let request = MultiChainBatchRequest {
         seed_file,
         output_dir: dir.path().join("output"),
+        paper_stats_config: top_contract_analysis_rs::analysis::paper_stats::PaperStatsConfig {
+            analysis_timestamp: 1_700_000_000,
+            ..Default::default()
+        },
         ..MultiChainBatchRequest::default()
     };
 
     run_multichain_batch(request.clone(), &deps).await.unwrap();
     run_multichain_batch(request, &deps).await.unwrap();
 
-    assert_eq!(metadata_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(metadata_calls.load(Ordering::SeqCst), 2);
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(dir.path().join("output").join("run-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["status"], "complete");
 }
 
 struct SelectivelyFailingStore {
@@ -530,7 +619,7 @@ impl FeatureStoreReader for SelectivelyFailingStore {
 }
 
 #[tokio::test]
-async fn partial_failure_keeps_successful_v2_cache_and_retries_only_failed_chain() {
+async fn partial_failure_keeps_successful_v3_cache_and_retries_only_failed_chain() {
     let dir = tempdir().unwrap();
     let seed_file = dir.path().join("seeds.csv");
     std::fs::write(
@@ -564,6 +653,11 @@ async fn partial_failure_keeps_successful_v2_cache_and_retries_only_failed_chain
     assert_eq!(first.failures.len(), 1);
     assert_eq!(first.failures[0].secondary_chain, "solana");
     assert!(output_dir.join("failures.json").exists());
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output_dir.join("run-manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["status"], "incomplete");
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
 
     let retry_seen = Arc::new(Mutex::new(Vec::new()));
     let second = run_multichain_batch(
@@ -587,6 +681,210 @@ async fn partial_failure_keeps_successful_v2_cache_and_retries_only_failed_chain
 
     assert!(second.failures.is_empty());
     assert_eq!(*retry_seen.lock().unwrap(), ["solana"]);
+}
+
+struct CountingIdentityStore {
+    identity_calls: Arc<AtomicUsize>,
+}
+
+impl FeatureStoreReader for CountingIdentityStore {
+    fn load_snapshot(
+        &self,
+        _chain: &str,
+        _seed_nfts: &[SeedNft],
+        _name_threshold: f64,
+        _metadata_threshold: f64,
+        _max_tokens_per_contract: usize,
+        _max_recall_rows: usize,
+    ) -> Result<DatabaseSnapshot, AppError> {
+        Ok(DatabaseSnapshot::default())
+    }
+
+    fn chain_totals(&self, _chain: &str) -> Result<ChainTotalsPayload, AppError> {
+        Ok(ChainTotalsPayload {
+            total_nfts: 1_000,
+            total_contracts: 100,
+        })
+    }
+
+    fn snapshot_identity(&self, chain: &str) -> Result<String, AppError> {
+        self.identity_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(format!("{chain}:snapshot"))
+    }
+}
+
+#[tokio::test]
+async fn snapshot_identity_is_computed_once_per_chain_before_seed_tasks() {
+    let dir = tempdir().unwrap();
+    let seed_file = dir.path().join("seeds.csv");
+    std::fs::write(
+        &seed_file,
+        concat!(
+            "chain,address\n",
+            "ethereum,0x1111111111111111111111111111111111111111\n",
+            "ethereum,0x2222222222222222222222222222222222222222\n",
+            "ethereum,0x3333333333333333333333333333333333333333\n",
+        ),
+    )
+    .unwrap();
+    let identity_calls = Arc::new(AtomicUsize::new(0));
+
+    run_multichain_batch(
+        MultiChainBatchRequest {
+            seed_file,
+            output_dir: dir.path().join("output"),
+            ..MultiChainBatchRequest::default()
+        },
+        &AnalysisDeps {
+            api: Arc::new(SeedOnlyApi {
+                metadata_calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            feature_store: Arc::new(CountingIdentityStore {
+                identity_calls: identity_calls.clone(),
+            }),
+            progress: Arc::new(NoopProgressReporter),
+            batch_progress: Arc::new(NoopBatchProgressReporter),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(identity_calls.load(Ordering::SeqCst), Chain::ALL.len());
+}
+
+struct VersionedSnapshotStore {
+    identity: String,
+}
+
+impl FeatureStoreReader for VersionedSnapshotStore {
+    fn load_snapshot(
+        &self,
+        _chain: &str,
+        _seed_nfts: &[SeedNft],
+        _name_threshold: f64,
+        _metadata_threshold: f64,
+        _max_tokens_per_contract: usize,
+        _max_recall_rows: usize,
+    ) -> Result<DatabaseSnapshot, AppError> {
+        Ok(DatabaseSnapshot::default())
+    }
+
+    fn chain_totals(&self, _chain: &str) -> Result<ChainTotalsPayload, AppError> {
+        Ok(ChainTotalsPayload {
+            total_nfts: 1_000,
+            total_contracts: 100,
+        })
+    }
+
+    fn snapshot_identity(&self, chain: &str) -> Result<String, AppError> {
+        Ok(format!("{chain}:{}", self.identity))
+    }
+}
+
+#[tokio::test]
+async fn cache_is_invalidated_when_snapshot_identity_or_analysis_config_changes() {
+    let dir = tempdir().unwrap();
+    let seed_file = dir.path().join("seeds.csv");
+    std::fs::write(
+        &seed_file,
+        "chain,address\nethereum,0x1111111111111111111111111111111111111111\n",
+    )
+    .unwrap();
+    let metadata_calls = Arc::new(AtomicUsize::new(0));
+    let api = Arc::new(SeedOnlyApi {
+        metadata_calls: metadata_calls.clone(),
+    });
+    let request = MultiChainBatchRequest {
+        seed_file,
+        output_dir: dir.path().join("output"),
+        paper_stats_config: top_contract_analysis_rs::analysis::paper_stats::PaperStatsConfig {
+            analysis_timestamp: 1_700_000_000,
+            ..Default::default()
+        },
+        ..MultiChainBatchRequest::default()
+    };
+
+    for identity in ["snapshot-a", "snapshot-b"] {
+        run_multichain_batch(
+            request.clone(),
+            &AnalysisDeps {
+                api: api.clone(),
+                feature_store: Arc::new(VersionedSnapshotStore {
+                    identity: identity.into(),
+                }),
+                progress: Arc::new(NoopProgressReporter),
+                batch_progress: Arc::new(NoopBatchProgressReporter),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    run_multichain_batch(
+        MultiChainBatchRequest {
+            max_history_transactions_per_asset: 101,
+            ..request
+        },
+        &AnalysisDeps {
+            api,
+            feature_store: Arc::new(VersionedSnapshotStore {
+                identity: "snapshot-b".into(),
+            }),
+            progress: Arc::new(NoopProgressReporter),
+            batch_progress: Arc::new(NoopBatchProgressReporter),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(metadata_calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn solana_cache_filenames_are_case_safe_and_collision_free() {
+    let dir = tempdir().unwrap();
+    let seed_file = dir.path().join("seeds.csv");
+    std::fs::write(
+        &seed_file,
+        concat!(
+            "chain,address\n",
+            "solana,So11111111111111111111111111111111111111112\n",
+            "solana,so11111111111111111111111111111111111111112\n",
+        ),
+    )
+    .unwrap();
+    let output_dir = dir.path().join("output");
+    run_multichain_batch(
+        MultiChainBatchRequest {
+            seed_file,
+            output_dir: output_dir.clone(),
+            ..MultiChainBatchRequest::default()
+        },
+        &AnalysisDeps {
+            api: Arc::new(SeedOnlyApi {
+                metadata_calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            feature_store: Arc::new(EmptyCrossChainStore {
+                chains: Arc::new(Mutex::new(Vec::new())),
+            }),
+            progress: Arc::new(NoopProgressReporter),
+            batch_progress: Arc::new(NoopBatchProgressReporter),
+        },
+    )
+    .await
+    .unwrap();
+
+    let cache_names = std::fs::read_dir(output_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.contains("__vs__"))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(cache_names.len(), 8);
+    assert!(cache_names
+        .iter()
+        .all(|name| name == &name.to_ascii_lowercase()));
+    assert!(cache_names.iter().all(|name| !name.contains("So111")));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -749,4 +1047,47 @@ async fn multichain_batch_shares_matched_contract_limit_across_seeds() {
     .unwrap();
 
     assert_eq!(matched_max_seen.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 12)]
+async fn multichain_batch_caps_large_seed_pipeline_backlog_at_eight() {
+    let dir = tempdir().unwrap();
+    let seed_file = dir.path().join("seeds.csv");
+    let mut csv = String::from("chain,address\n");
+    for index in 1..=12 {
+        csv.push_str(&format!("ethereum,0x{index:040x}\n"));
+    }
+    std::fs::write(&seed_file, csv).unwrap();
+    let max_seen = Arc::new(AtomicUsize::new(0));
+    let deps = AnalysisDeps {
+        api: Arc::new(ConcurrentSeedApi {
+            metadata_current: Arc::new(AtomicUsize::new(0)),
+            metadata_max_seen: max_seen.clone(),
+            wait_for_snapshot_address: None,
+            snapshot_started: Arc::new(AtomicUsize::new(0)),
+            matched_current: Arc::new(AtomicUsize::new(0)),
+            matched_max_seen: Arc::new(AtomicUsize::new(0)),
+        }),
+        feature_store: Arc::new(EmptyCrossChainStore {
+            chains: Arc::new(Mutex::new(Vec::new())),
+        }),
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+
+    run_multichain_batch(
+        MultiChainBatchRequest {
+            seed_file,
+            output_dir: dir.path().join("output"),
+            seed_network_max_concurrency: 100,
+            seed_cpu_max_concurrency: 100,
+            matched_contract_max_concurrency: 100,
+            ..MultiChainBatchRequest::default()
+        },
+        &deps,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(max_seen.load(Ordering::SeqCst), 8);
 }

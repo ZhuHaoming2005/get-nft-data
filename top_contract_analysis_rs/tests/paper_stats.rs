@@ -18,6 +18,50 @@ use top_contract_analysis_rs::reporting::{
 };
 
 #[test]
+fn merged_quality_preserves_legacy_coverage_semantics_and_marks_unknown_quality_incomplete() {
+    let complete = PaperStatsPayload {
+        data_quality: PaperDataQualityPayload {
+            asset_listing_analyzed_count: 10,
+            asset_listing_total_count: 10,
+            history_requested_asset_count: 2,
+            history_successful_asset_count: 1,
+            history_complete_asset_count: 1,
+            history_fetched_transaction_count: 5,
+            history_reported_transaction_count: 10,
+            history_complete: true,
+            ..PaperDataQualityPayload::default()
+        },
+        ..PaperStatsPayload::default()
+    };
+    let unknown = PaperStatsPayload {
+        data_quality: PaperDataQualityPayload {
+            asset_listing_analyzed_count: 1,
+            asset_listing_unknown_total_contract_count: 1,
+            provider_quality_lookup_failure_count: 1,
+            ..PaperDataQualityPayload::default()
+        },
+        ..PaperStatsPayload::default()
+    };
+
+    let merged = merge_paper_stats([&complete, &unknown], PaperStatsConfig::default());
+
+    assert_eq!(merged.data_quality.history_asset_coverage_ratio, Some(0.5));
+    assert_eq!(merged.data_quality.asset_listing_coverage_ratio, None);
+    assert_eq!(
+        merged
+            .data_quality
+            .asset_listing_unknown_total_contract_count,
+        1
+    );
+    assert_eq!(
+        merged.data_quality.history_transaction_coverage_ratio,
+        Some(0.5)
+    );
+    assert_eq!(merged.data_quality.provider_quality_lookup_failure_count, 1);
+    assert!(!merged.data_quality.history_complete);
+}
+
+#[test]
 fn single_report_serializes_new_paper_stats_contract_without_legacy_summary() {
     let payload = SingleReportPayload::default();
     let json = serde_json::to_value(&payload).unwrap();

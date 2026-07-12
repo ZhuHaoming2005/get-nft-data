@@ -2291,7 +2291,7 @@ async fn contract_sales_fall_back_to_alchemy_when_opensea_fails() {
 }
 
 #[tokio::test]
-async fn contract_sales_return_empty_when_alchemy_and_opensea_fail() {
+async fn contract_sales_report_failure_when_alchemy_and_opensea_fail() {
     let alchemy_server = MockServer::start_async().await;
     alchemy_server
         .mock_async(|when, then| {
@@ -2317,11 +2317,11 @@ async fn contract_sales_return_empty_when_alchemy_and_opensea_fail() {
         opensea_base: opensea_server.base_url(),
     };
 
-    let rows = fetch_contract_sales(&client, &endpoints, "ethereum", "0xdup", "opensea", None)
+    let error = fetch_contract_sales(&client, &endpoints, "ethereum", "0xdup", "opensea", None)
         .await
-        .unwrap();
+        .unwrap_err();
 
-    assert!(rows.is_empty());
+    assert!(error.to_string().contains("contract sales"));
 }
 
 #[tokio::test]

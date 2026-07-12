@@ -361,6 +361,9 @@ async fn fetch_deployment_cost_edge(
     contract_address: &str,
     contract_metadata: Option<&ContractMetadata>,
 ) -> Result<Option<ValueFlowEdgePayload>, AppError> {
+    if request.chain.eq_ignore_ascii_case("solana") {
+        return Ok(None);
+    }
     let Some(metadata) = contract_metadata else {
         return Ok(None);
     };
@@ -494,12 +497,11 @@ async fn compute_malicious_sale_cost_edges(
         };
         let chain = request.chain.parse::<Chain>().unwrap_or_default();
         let gas_usd = receipt.fee_usd.or_else(|| {
-            sale_eth_usd_rate(sale)
-                .map(|rate| gas_eth * rate)
-                .or_else(|| {
-                    matches!(chain, Chain::Ethereum | Chain::Base)
-                        .then_some(gas_eth * FALLBACK_ETH_USD_RATE)
-                })
+            matches!(chain, Chain::Ethereum | Chain::Base).then(|| {
+                sale_eth_usd_rate(sale)
+                    .map(|rate| gas_eth * rate)
+                    .unwrap_or(gas_eth * FALLBACK_ETH_USD_RATE)
+            })
         });
         let channel = sale_attacker_cost_channel(sale, &gas_payer, malicious);
         let edge = ValueFlowEdgePayload {
@@ -1463,6 +1465,9 @@ fn receipt_gas_usd(
     if let Some(fee_usd) = receipt.fee_usd {
         return Some(fee_usd.max(0.0));
     }
+    if receipt.fee_native.is_some() {
+        return None;
+    }
     infer_eth_usd_rate_from_transfer(transfer).and_then(|rate| {
         let gas_usd = gas_eth_from_receipt(receipt) * rate;
         (gas_usd > 0.0).then_some(gas_usd)
@@ -1604,4 +1609,25 @@ pub(super) fn build_mint_payment_lookups(
             },
         )
         .collect()
+}
+
+#[cfg(test)]
+mod currency_regression_tests {
+    use super::receipt_gas_usd;
+    use crate::models::{EthTransferRecord, TransactionReceiptRecord};
+
+    #[test]
+    fn receipt_gas_usd_does_not_infer_a_native_rate_from_transfer_values() {
+        let transfer = EthTransferRecord {
+            value_eth: 2.0,
+            value_usd: Some(6_000.0),
+            ..EthTransferRecord::default()
+        };
+        let receipt = TransactionReceiptRecord {
+            fee_native: Some(0.5),
+            ..TransactionReceiptRecord::default()
+        };
+
+        assert_eq!(receipt_gas_usd(&transfer, &receipt), None);
+    }
 }

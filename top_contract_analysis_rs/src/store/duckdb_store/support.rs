@@ -6,8 +6,8 @@ use crate::analysis::scoring::{
     PreparedNameQuery,
 };
 use crate::models::{
-    ContractDuplicateRecord, ContractNameRecord, ContractSignal, DatabaseNftRecord,
-    DatabaseSnapshot, SeedNft,
+    normalize_chain_identity, ContractDuplicateRecord, ContractNameRecord, ContractSignal,
+    DatabaseNftRecord, DatabaseSnapshot, SeedNft,
 };
 use crate::normalize::{normalize_name, normalize_url};
 
@@ -135,7 +135,7 @@ impl SeedRecallProfile {
             seed_address,
             seed_contracts: seed_nfts
                 .iter()
-                .map(|item| item.contract_address.to_lowercase())
+                .map(|item| normalize_chain_identity(&item.contract_address))
                 .collect(),
             seed_token_ids: seed_nfts
                 .iter()

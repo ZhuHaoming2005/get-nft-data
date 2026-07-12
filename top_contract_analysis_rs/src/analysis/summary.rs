@@ -4,11 +4,11 @@ use crate::models::{
     normalize_chain_identity, AddressAttributionPayload, ContractLevelSummaryPayload,
     ContractMetadata, DuplicateCandidate, DuplicateContractPayload, MaliciousAddressPayload,
     NftPropagationPathPayload, SecondarySaleVictimAddressPayload, SeedCollectionStatsPayload,
-    SeedNft, SingleReportPayload, ValueFlowEdgePayload, VictimAcquisitionAddressPayload,
+    SeedNft, ValueFlowEdgePayload, VictimAcquisitionAddressPayload,
 };
 use crate::normalize::{normalize_name, normalize_symbol, normalize_url};
 
-use super::{enrich_duplicate_contract_payload_with_metadata, BatchSeedAggregate};
+use super::enrich_duplicate_contract_payload_with_metadata;
 
 pub(super) fn build_contract_payload(
     contract_address: &str,
@@ -386,11 +386,4 @@ pub(super) fn value_flow_token_ids(edge: &ValueFlowEdgePayload) -> Vec<String> {
     token_ids.sort();
     token_ids.dedup();
     token_ids
-}
-
-pub(super) fn build_batch_seed_aggregate(payload: SingleReportPayload) -> BatchSeedAggregate {
-    BatchSeedAggregate {
-        seed_contract: payload.seed_contract,
-        paper_stats: payload.paper_stats,
-    }
 }

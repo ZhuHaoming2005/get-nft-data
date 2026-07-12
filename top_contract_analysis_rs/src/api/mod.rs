@@ -363,18 +363,13 @@ fn redact_sensitive_url(value: &str) -> String {
         .host_str()
         .is_some_and(|host| host.ends_with(".g.alchemy.com"))
     {
-        let segments = url
+        let mut segments = url
             .path_segments()
             .map(|segments| segments.map(str::to_string).collect::<Vec<_>>())
             .unwrap_or_default();
-        if segments.len() >= 2
-            && matches!(segments[segments.len() - 2].as_str(), "v1" | "v2" | "v3")
-        {
-            let mut redacted = segments;
-            if let Some(last) = redacted.last_mut() {
-                *last = "REDACTED".to_string();
-            }
-            url.set_path(&redacted.join("/"));
+        if let Some(key_index) = alchemy_key_segment_index(&segments) {
+            segments[key_index] = "REDACTED".to_string();
+            url.set_path(&segments.join("/"));
         }
     }
     let pairs = url
@@ -422,8 +417,8 @@ fn redact_sensitive_text(value: &str, request_url: &str) -> String {
             .path_segments()
             .map(|segments| segments.collect::<Vec<_>>())
             .unwrap_or_default();
-        if segments.len() >= 2 && matches!(segments[segments.len() - 2], "v1" | "v2" | "v3") {
-            secrets.push(segments[segments.len() - 1].to_string());
+        if let Some(key_index) = alchemy_key_segment_index(&segments) {
+            secrets.push(segments[key_index].to_string());
         }
     }
     secrets
@@ -432,6 +427,13 @@ fn redact_sensitive_text(value: &str, request_url: &str) -> String {
         .fold(value.to_string(), |redacted, secret| {
             redacted.replace(&secret, "REDACTED")
         })
+}
+
+fn alchemy_key_segment_index(segments: &[impl AsRef<str>]) -> Option<usize> {
+    segments
+        .windows(2)
+        .position(|pair| matches!(pair[0].as_ref(), "v1" | "v2" | "v3"))
+        .map(|version_index| version_index + 1)
 }
 
 pub use alchemy::{
@@ -447,7 +449,7 @@ pub use etherscan::fetch_etherscan_contract_transfers;
 pub use helius::{
     fetch_helius_asset_transfers, fetch_helius_assets_history,
     fetch_helius_assets_history_with_budget, fetch_helius_assets_transfers,
-    fetch_helius_block_details, fetch_helius_collection_assets, fetch_helius_collection_snapshot,
+    fetch_helius_collection_assets, fetch_helius_collection_snapshot,
     fetch_helius_collection_transfers, fetch_helius_transaction_details, HeliusCollectionAsset,
     HeliusCollectionHistory, HeliusCollectionSnapshot, HeliusTransactionDetails,
 };
@@ -695,11 +697,37 @@ mod security_tests {
             "https://eth-mainnet.g.alchemy.com/v2/REDACTED"
         );
         assert_eq!(
+            redact_sensitive_url(
+                "https://eth-mainnet.g.alchemy.com/nft/v3/secret-value/getNFTsForContract"
+            ),
+            "https://eth-mainnet.g.alchemy.com/nft/v3/REDACTED/getNFTsForContract"
+        );
+        assert_eq!(
+            redact_sensitive_url(
+                "https://api.g.alchemy.com/prices/v1/secret-value/tokens/by-symbol"
+            ),
+            "https://api.g.alchemy.com/prices/v1/REDACTED/tokens/by-symbol"
+        );
+        assert_eq!(
             redact_sensitive_text(
                 "proxy echoed https://mainnet.helius-rpc.com/?api-key=secret-value",
                 "https://mainnet.helius-rpc.com/?api-key=secret-value",
             ),
             "proxy echoed https://mainnet.helius-rpc.com/?api-key=REDACTED"
+        );
+        assert_eq!(
+            redact_sensitive_text(
+                "proxy echoed https://eth-mainnet.g.alchemy.com/nft/v3/secret-value/getNFTsForContract",
+                "https://eth-mainnet.g.alchemy.com/nft/v3/secret-value/getNFTsForContract",
+            ),
+            "proxy echoed https://eth-mainnet.g.alchemy.com/nft/v3/REDACTED/getNFTsForContract"
+        );
+        assert_eq!(
+            redact_sensitive_text(
+                "prices key secret-value failed",
+                "https://api.g.alchemy.com/prices/v1/secret-value/tokens/by-symbol",
+            ),
+            "prices key REDACTED failed"
         );
     }
 }
