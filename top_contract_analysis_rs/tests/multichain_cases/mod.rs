@@ -207,7 +207,7 @@ fn parquet_auto_loader_imports_each_embedded_chain() {
 }
 
 #[test]
-fn parquet_auto_loader_appends_same_chain_shards_without_duplicates() {
+fn parquet_auto_loader_replaces_each_chain_with_the_complete_authoritative_snapshot() {
     let dir = tempdir().unwrap();
     let first = dir.path().join("ethereum-1.parquet");
     let second = dir.path().join("ethereum-2.parquet");
@@ -230,13 +230,10 @@ fn parquet_auto_loader_appends_same_chain_shards_without_duplicates() {
     let store = DuckDbFeatureStore::new(":memory:").unwrap();
 
     store
-        .load_parquet_dataset_auto(first.to_str().unwrap())
-        .unwrap();
-    store
-        .load_parquet_dataset_auto(second.to_str().unwrap())
-        .unwrap();
-    store
-        .load_parquet_dataset_auto(first.to_str().unwrap())
+        .load_parquet_datasets_auto(&[
+            first.to_string_lossy().into_owned(),
+            second.to_string_lossy().into_owned(),
+        ])
         .unwrap();
 
     assert_eq!(
@@ -246,6 +243,67 @@ fn parquet_auto_loader_appends_same_chain_shards_without_duplicates() {
             total_contracts: 2,
         }
     );
+
+    store
+        .load_parquet_dataset_auto(second.to_str().unwrap())
+        .unwrap();
+
+    assert_eq!(
+        store.chain_totals("ethereum").unwrap(),
+        ChainTotalsPayload {
+            total_nfts: 1,
+            total_contracts: 1,
+        }
+    );
+}
+
+#[test]
+fn parquet_bulk_loader_deduplication_is_independent_of_input_order() {
+    let dir = tempdir().unwrap();
+    let first = dir.path().join("first.parquet");
+    let second = dir.path().join("second.parquet");
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    for (path, symbol) in [(&first, "AAA"), (&second, "ZZZ")] {
+        let path_sql = path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .replace('\'', "''");
+        conn.execute_batch(&format!(
+            "COPY (SELECT * FROM (VALUES ('ethereum', '0x1111111111111111111111111111111111111111', '1', 'ipfs://same', 'ipfs://same/image', 'Same', '{symbol}', '{{\"same\":true}}', 'ipfs:same', 'ipfs:same/image', 'same'))
+             AS t(chain, contract_address, token_id, token_uri, image_uri, name, symbol, metadata_json, token_uri_norm, image_uri_norm, name_norm))
+             TO '{path_sql}' (FORMAT PARQUET)"
+        ))
+        .unwrap();
+    }
+
+    let read_symbol = |database: &std::path::Path, paths: &[String]| {
+        {
+            let store = DuckDbFeatureStore::new(database.to_str().unwrap()).unwrap();
+            store.load_parquet_datasets_auto(paths).unwrap();
+        }
+        duckdb::Connection::open(database)
+            .unwrap()
+            .query_row("SELECT symbol FROM nft_features", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap()
+    };
+    let forward = read_symbol(
+        &dir.path().join("forward.duckdb"),
+        &[
+            first.to_string_lossy().into_owned(),
+            second.to_string_lossy().into_owned(),
+        ],
+    );
+    let reverse = read_symbol(
+        &dir.path().join("reverse.duckdb"),
+        &[
+            second.to_string_lossy().into_owned(),
+            first.to_string_lossy().into_owned(),
+        ],
+    );
+
+    assert_eq!(forward, reverse);
 }
 
 #[test]

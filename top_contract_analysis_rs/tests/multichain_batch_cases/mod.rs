@@ -1,9 +1,10 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use tempfile::tempdir;
+use tokio::sync::Semaphore;
 use top_contract_analysis_rs::analysis::{
     run_multichain_batch, AnalysisDeps, AnalyzeApi, FeatureStoreReader, MultiChainBatchRequest,
 };
@@ -20,6 +21,8 @@ struct EmptyCrossChainStore {
 
 struct BulkOnlyStore {
     bulk_calls: Arc<AtomicUsize>,
+    max_batch_size: Arc<AtomicUsize>,
+    loaded_seed_scopes: Arc<AtomicUsize>,
 }
 
 impl FeatureStoreReader for BulkOnlyStore {
@@ -45,6 +48,9 @@ impl FeatureStoreReader for BulkOnlyStore {
         _max_recall_rows: usize,
     ) -> Result<std::collections::BTreeMap<String, DatabaseSnapshot>, AppError> {
         self.bulk_calls.fetch_add(1, Ordering::SeqCst);
+        record_max(&self.max_batch_size, seeds.len());
+        self.loaded_seed_scopes
+            .fetch_add(seeds.len(), Ordering::SeqCst);
         Ok(seeds
             .iter()
             .map(|(address, _)| (address.clone(), DatabaseSnapshot::default()))
@@ -69,10 +75,14 @@ async fn batch_uses_bulk_snapshot_loading_for_multiple_seeds() {
             "chain,address\n",
             "ethereum,0x1111111111111111111111111111111111111111\n",
             "ethereum,0x2222222222222222222222222222222222222222\n",
+            "ethereum,0x3333333333333333333333333333333333333333\n",
+            "ethereum,0x4444444444444444444444444444444444444444\n",
         ),
     )
     .unwrap();
     let bulk_calls = Arc::new(AtomicUsize::new(0));
+    let max_batch_size = Arc::new(AtomicUsize::new(0));
+    let loaded_seed_scopes = Arc::new(AtomicUsize::new(0));
 
     let result = run_multichain_batch(
         MultiChainBatchRequest {
@@ -86,6 +96,8 @@ async fn batch_uses_bulk_snapshot_loading_for_multiple_seeds() {
             }),
             feature_store: Arc::new(BulkOnlyStore {
                 bulk_calls: bulk_calls.clone(),
+                max_batch_size: max_batch_size.clone(),
+                loaded_seed_scopes,
             }),
             progress: Arc::new(NoopProgressReporter),
             batch_progress: Arc::new(NoopBatchProgressReporter),
@@ -96,6 +108,121 @@ async fn batch_uses_bulk_snapshot_loading_for_multiple_seeds() {
 
     assert!(result.failures.is_empty());
     assert!(bulk_calls.load(Ordering::SeqCst) > 0);
+    assert_eq!(max_batch_size.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn batch_releases_full_snapshot_slots_before_provider_analysis() {
+    let dir = tempdir().unwrap();
+    let seed_file = dir.path().join("seeds.csv");
+    std::fs::write(
+        &seed_file,
+        concat!(
+            "chain,address\n",
+            "ethereum,0x1111111111111111111111111111111111111111\n",
+            "ethereum,0x2222222222222222222222222222222222222222\n",
+            "ethereum,0x3333333333333333333333333333333333333333\n",
+            "ethereum,0x4444444444444444444444444444444444444444\n",
+        ),
+    )
+    .unwrap();
+    let loaded_seed_scopes = Arc::new(AtomicUsize::new(0));
+    let quality_started = Arc::new(AtomicUsize::new(0));
+    let quality_release = Arc::new(Semaphore::new(0));
+    let request = MultiChainBatchRequest {
+        seed_file,
+        output_dir: dir.path().join("output"),
+        seed_network_max_concurrency: 8,
+        seed_cpu_max_concurrency: 100,
+        matched_contract_max_concurrency: 100,
+        ..MultiChainBatchRequest::default()
+    };
+    let deps = AnalysisDeps {
+        api: Arc::new(ConcurrentSeedApi {
+            metadata_current: Arc::new(AtomicUsize::new(0)),
+            metadata_max_seen: Arc::new(AtomicUsize::new(0)),
+            wait_for_snapshot_address: None,
+            snapshot_started: Arc::new(AtomicUsize::new(0)),
+            matched_current: Arc::new(AtomicUsize::new(0)),
+            matched_max_seen: Arc::new(AtomicUsize::new(0)),
+            quality_started: quality_started.clone(),
+            quality_release: Some(quality_release.clone()),
+        }),
+        feature_store: Arc::new(BulkOnlyStore {
+            bulk_calls: Arc::new(AtomicUsize::new(0)),
+            max_batch_size: Arc::new(AtomicUsize::new(0)),
+            loaded_seed_scopes: loaded_seed_scopes.clone(),
+        }),
+        progress: Arc::new(NoopProgressReporter),
+        batch_progress: Arc::new(NoopBatchProgressReporter),
+    };
+    let batch = tokio::spawn(async move { run_multichain_batch(request, &deps).await });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while quality_started.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("two snapshots should reach analysis");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let loaded_before_release = loaded_seed_scopes.load(Ordering::SeqCst);
+    quality_release.add_permits(100);
+
+    let result = batch.await.unwrap().unwrap();
+    assert!(result.failures.is_empty());
+    assert_eq!(
+        loaded_before_release, 4,
+        "provider stalls must retain only compact plans and allow bounded full-snapshot loading to continue"
+    );
+}
+
+#[tokio::test]
+async fn cancelled_batch_stops_before_new_seed_work_and_keeps_manifest_incomplete() {
+    let dir = tempdir().unwrap();
+    let seed_file = dir.path().join("seeds.csv");
+    std::fs::write(
+        &seed_file,
+        "chain,address\nethereum,0x1111111111111111111111111111111111111111\n",
+    )
+    .unwrap();
+    let bulk_calls = Arc::new(AtomicUsize::new(0));
+    let cancellation_requested = Arc::new(AtomicBool::new(true));
+    let output_dir = dir.path().join("output");
+
+    let error = run_multichain_batch(
+        MultiChainBatchRequest {
+            seed_file,
+            output_dir: output_dir.clone(),
+            cancellation_requested,
+            ..MultiChainBatchRequest::default()
+        },
+        &AnalysisDeps {
+            api: Arc::new(SeedOnlyApi {
+                metadata_calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            feature_store: Arc::new(BulkOnlyStore {
+                bulk_calls: bulk_calls.clone(),
+                max_batch_size: Arc::new(AtomicUsize::new(0)),
+                loaded_seed_scopes: Arc::new(AtomicUsize::new(0)),
+            }),
+            progress: Arc::new(NoopProgressReporter),
+            batch_progress: Arc::new(NoopBatchProgressReporter),
+        },
+    )
+    .await
+    .unwrap_err();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output_dir.join("run-manifest.json")).unwrap())
+            .unwrap();
+
+    assert!(matches!(error, AppError::Interrupted(_)), "{error}");
+    assert_eq!(bulk_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(manifest["status"], "incomplete");
+    let metrics = std::fs::read_to_string(output_dir.join("run-metrics.jsonl")).unwrap();
+    let metric: serde_json::Value = serde_json::from_str(metrics.trim()).unwrap();
+    assert_eq!(metric["event"], "seed_finished");
+    assert_eq!(metric["cancelled"], true);
 }
 
 impl FeatureStoreReader for EmptyCrossChainStore {
@@ -141,6 +268,8 @@ struct ConcurrentSeedApi {
     snapshot_started: Arc<AtomicUsize>,
     matched_current: Arc<AtomicUsize>,
     matched_max_seen: Arc<AtomicUsize>,
+    quality_started: Arc<AtomicUsize>,
+    quality_release: Option<Arc<Semaphore>>,
 }
 
 #[async_trait]
@@ -282,6 +411,22 @@ impl AnalyzeApi for ConcurrentSeedApi {
         _address: &str,
     ) -> Result<Vec<EthTransferRecord>, AppError> {
         Ok(Vec::new())
+    }
+
+    async fn fetch_provider_data_quality(
+        &self,
+        _chain: &str,
+        _contract_address: &str,
+    ) -> Result<top_contract_analysis_rs::models::ProviderDataQualityPayload, AppError> {
+        if let Some(release) = &self.quality_release {
+            self.quality_started.fetch_add(1, Ordering::SeqCst);
+            release
+                .acquire()
+                .await
+                .expect("test quality gate remains open")
+                .forget();
+        }
+        Ok(top_contract_analysis_rs::models::ProviderDataQualityPayload::default())
     }
 }
 
@@ -619,7 +764,7 @@ impl FeatureStoreReader for SelectivelyFailingStore {
 }
 
 #[tokio::test]
-async fn partial_failure_keeps_successful_v3_cache_and_retries_only_failed_chain() {
+async fn partial_failure_recomputes_all_four_scopes_at_the_whole_seed_boundary() {
     let dir = tempdir().unwrap();
     let seed_file = dir.path().join("seeds.csv");
     std::fs::write(
@@ -680,7 +825,10 @@ async fn partial_failure_keeps_successful_v3_cache_and_retries_only_failed_chain
     .unwrap();
 
     assert!(second.failures.is_empty());
-    assert_eq!(*retry_seen.lock().unwrap(), ["solana"]);
+    assert_eq!(
+        *retry_seen.lock().unwrap(),
+        ["ethereum", "base", "polygon", "solana"]
+    );
 }
 
 struct CountingIdentityStore {
@@ -911,6 +1059,8 @@ async fn multichain_batch_overlaps_seed_contexts_up_to_default_network_limit() {
             snapshot_started: Arc::new(AtomicUsize::new(0)),
             matched_current: Arc::new(AtomicUsize::new(0)),
             matched_max_seen: Arc::new(AtomicUsize::new(0)),
+            quality_started: Arc::new(AtomicUsize::new(0)),
+            quality_release: None,
         }),
         feature_store: Arc::new(EmptyCrossChainStore {
             chains: Arc::new(Mutex::new(Vec::new())),
@@ -959,6 +1109,8 @@ async fn multichain_batch_limits_cpu_stage_and_overlaps_pipeline_without_paralle
             snapshot_started: snapshot_started.clone(),
             matched_current: Arc::new(AtomicUsize::new(0)),
             matched_max_seen: Arc::new(AtomicUsize::new(0)),
+            quality_started: Arc::new(AtomicUsize::new(0)),
+            quality_release: None,
         }),
         feature_store: Arc::new(ConcurrentSnapshotStore {
             current: Arc::new(AtomicUsize::new(0)),
@@ -1017,6 +1169,8 @@ async fn multichain_batch_shares_matched_contract_limit_across_seeds() {
             snapshot_started: snapshot_started.clone(),
             matched_current,
             matched_max_seen: matched_max_seen.clone(),
+            quality_started: Arc::new(AtomicUsize::new(0)),
+            quality_release: None,
         }),
         feature_store: Arc::new(ConcurrentSnapshotStore {
             current: Arc::new(AtomicUsize::new(0)),
@@ -1067,6 +1221,8 @@ async fn multichain_batch_caps_large_seed_pipeline_backlog_at_eight() {
             snapshot_started: Arc::new(AtomicUsize::new(0)),
             matched_current: Arc::new(AtomicUsize::new(0)),
             matched_max_seen: Arc::new(AtomicUsize::new(0)),
+            quality_started: Arc::new(AtomicUsize::new(0)),
+            quality_release: None,
         }),
         feature_store: Arc::new(EmptyCrossChainStore {
             chains: Arc::new(Mutex::new(Vec::new())),

@@ -187,11 +187,12 @@ The selection order cannot depend on DuckDB physical row ID, input order, worker
 The 512 GiB host has about 550 GB in decimal units. Default read-only allocation is:
 
 - DuckDB total memory: 96 GB;
-- managed Rust memory: 324 GB;
+- managed Rust memory: 372 GB;
   - resident Name and Metadata indexes: at most 260 GB;
   - two seed snapshots: at most 24 GB each, 48 GB total;
+  - compact candidate plans retained during provider analysis: at most 48 GB;
   - Name/Metadata scratch: at most 16 GB;
-- about 130 GB remains for Arrow, allocator overhead, API responses, stacks, page cache, and the OS.
+- about 82 GB remains for Arrow, allocator overhead, API responses, stacks, page cache, and the OS. Runtime validation reserves 48 GiB and rejects CLI combinations whose explicit envelope exceeds the resulting safe limit.
 
 Prepare retains 96 DuckDB threads and a 300 GB DuckDB memory limit.
 

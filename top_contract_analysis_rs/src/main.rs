@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use clap::Parser;
@@ -31,44 +32,75 @@ fn connect_postgres_from_constants() -> Result<Client, AppError> {
     Client::connect(&config, NoTls).map_err(AppError::from)
 }
 
-/// Resolve the shared DuckDB/Rayon thread count from `--physical-cores` /
-/// `--duckdb-threads`. `--physical-cores` wins when set; otherwise 0 means
-/// SMT (all logical cores, the Rayon/DuckDB default). When an explicit count
-/// is given, also pin the global Rayon pool to it so DuckDB and Rayon share a
-/// single thread budget rather than both racing to fill every logical core.
-fn resolve_resource_threads(physical_cores: usize, duckdb_threads: usize) -> usize {
-    let effective = if physical_cores > 0 {
-        physical_cores
+/// Keep DuckDB query workers and Rayon scoring workers independent. An explicit
+/// physical-core count caps DuckDB and intentionally pins Rayon to physical
+/// cores, avoiding accidental SMT oversubscription on machines where it is set.
+fn resolve_resource_threads(
+    physical_cores: usize,
+    duckdb_threads: usize,
+    rayon_threads: usize,
+) -> (usize, usize) {
+    if physical_cores > 0 {
+        (duckdb_threads.min(physical_cores), physical_cores)
     } else {
-        duckdb_threads
-    };
-    if effective > 0 {
-        // Best-effort: if the global pool was already initialized this errors,
-        // in which case Rayon keeps its default. Called once at startup before
-        // any `par_iter`, so it normally succeeds.
-        let _ = rayon::ThreadPoolBuilder::new()
-            .num_threads(effective)
-            .build_global();
+        (duckdb_threads, rayon_threads)
     }
-    effective
+}
+
+fn configure_rayon_threads(rayon_threads: usize) -> Result<(), AppError> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(rayon_threads)
+        .build_global()
+        .map_err(|error| {
+            AppError::InvalidData(format!(
+                "failed to configure the global Rayon pool with {rayon_threads} workers: {error}"
+            ))
+        })
 }
 
 fn main() -> Result<(), AppError> {
     let command = TopContractAnalysisCli::parse();
     match command.command {
         Command::Analyze(args) => Runtime::new()?.block_on(async move {
-            let analyze_chain = args.chain.parse::<Chain>()?;
-            let duckdb_threads = resolve_resource_threads(args.physical_cores, args.duckdb_threads);
-            let duckdb_options =
-                DuckDbResourceOptions::from_cli(duckdb_threads, &args.duckdb_memory_limit)?;
-            let feature_store =
-                DuckDbFeatureStore::new_with_options(&args.feature_db, duckdb_options)?;
             if !args.feature_parquet.trim().is_empty() {
-                feature_store.load_parquet_dataset_if_chain_missing(
-                    analyze_chain.as_str(),
-                    &args.feature_parquet,
-                )?;
+                return Err(AppError::InvalidData(
+                    "analyze does not import Parquet; run prepare-features first".to_string(),
+                ));
             }
+            let analyze_chain = args.chain.parse::<Chain>()?;
+            let (duckdb_threads, rayon_threads) = resolve_resource_threads(
+                args.physical_cores,
+                args.duckdb_threads,
+                args.rayon_threads,
+            );
+            configure_rayon_threads(rayon_threads)?;
+            let duckdb_options = DuckDbResourceOptions::from_analysis_cli(
+                duckdb_threads,
+                &args.duckdb_memory_limit,
+                &args.recall_index_memory_limit,
+                args.duckdb_read_connections,
+                &args.max_snapshot_bytes_per_seed,
+                args.max_candidate_contracts_per_seed,
+                args.max_selected_rows_per_seed,
+            )?;
+            eprintln!(
+                "analyze: duckdb_threads={}, rayon_threads={}, duckdb_read_connections={}, duckdb_memory_limit={}, recall_index_memory_limit={}, feature_db={}, max_tokens_per_contract={}, max_candidate_contracts_per_seed={}, max_selected_rows_per_seed={}, max_snapshot_bytes_per_seed={}",
+                duckdb_options.threads,
+                rayon_threads,
+                duckdb_options.read_connections,
+                duckdb_options.memory_limit,
+                args.recall_index_memory_limit,
+                args.feature_db,
+                args.max_tokens_per_contract,
+                args.max_candidate_contracts_per_seed,
+                args.max_selected_rows_per_seed,
+                args.max_snapshot_bytes_per_seed,
+            );
+            let feature_store = DuckDbFeatureStore::open_read_only_with_options(
+                &args.feature_db,
+                duckdb_options,
+            )?;
+            feature_store.require_prepared_for_chains(&[analyze_chain])?;
             let api = RealApi::new_with_helius(
                 args.timeout,
                 args.alchemy_api_max_concurrency,
@@ -129,6 +161,11 @@ fn main() -> Result<(), AppError> {
             Ok(())
         }),
         Command::Batch(args) => Runtime::new()?.block_on(async move {
+            if !args.feature_parquet.is_empty() {
+                return Err(AppError::InvalidData(
+                    "batch does not import Parquet; run prepare-features first".to_string(),
+                ));
+            }
             let output_dir = std::path::PathBuf::from(&args.output_dir);
             let output_lock = acquire_batch_output_lock(&output_dir)?;
             let seed_contracts = read_seed_contracts(std::path::Path::new(&args.seed_file))?;
@@ -136,12 +173,40 @@ fn main() -> Result<(), AppError> {
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>();
-            let duckdb_threads = resolve_resource_threads(args.physical_cores, args.duckdb_threads);
-            let duckdb_options =
-                DuckDbResourceOptions::from_cli(duckdb_threads, &args.duckdb_memory_limit)?;
-            let feature_store =
-                DuckDbFeatureStore::new_with_options(&args.feature_db, duckdb_options)?;
-            feature_store.load_parquet_datasets_auto(&args.feature_parquet)?;
+            let (duckdb_threads, rayon_threads) = resolve_resource_threads(
+                args.physical_cores,
+                args.duckdb_threads,
+                args.rayon_threads,
+            );
+            configure_rayon_threads(rayon_threads)?;
+            let duckdb_options = DuckDbResourceOptions::from_analysis_cli(
+                duckdb_threads,
+                &args.duckdb_memory_limit,
+                &args.recall_index_memory_limit,
+                args.duckdb_read_connections,
+                &args.max_snapshot_bytes_per_seed,
+                args.max_candidate_contracts_per_seed,
+                args.max_selected_rows_per_seed,
+            )?;
+            eprintln!(
+                "batch: duckdb_threads={}, rayon_threads={}, duckdb_read_connections={}, duckdb_memory_limit={}, recall_index_memory_limit={}, feature_db={}, seed_cpu_max_concurrency={}, max_tokens_per_contract={}, max_candidate_contracts_per_seed={}, max_selected_rows_per_seed={}, max_snapshot_bytes_per_seed={}",
+                duckdb_options.threads,
+                rayon_threads,
+                duckdb_options.read_connections,
+                duckdb_options.memory_limit,
+                args.recall_index_memory_limit,
+                args.feature_db,
+                args.seed_cpu_max_concurrency,
+                args.max_tokens_per_contract,
+                args.max_candidate_contracts_per_seed,
+                args.max_selected_rows_per_seed,
+                args.max_snapshot_bytes_per_seed,
+            );
+            let feature_store = DuckDbFeatureStore::open_read_only_with_options(
+                &args.feature_db,
+                duckdb_options,
+            )?;
+            feature_store.require_prepared_for_chains(&Chain::ALL)?;
             for chain in Chain::ALL {
                 if !feature_store.has_chain_rows(chain.as_str())? {
                     return Err(AppError::InvalidData(format!(
@@ -174,7 +239,8 @@ fn main() -> Result<(), AppError> {
                     args.seed_network_max_concurrency,
                 ),
             };
-            let payload = run_multichain_batch_with_lock(
+            let cancellation_requested = Arc::new(AtomicBool::new(false));
+            let batch = run_multichain_batch_with_lock(
                 MultiChainBatchRequest {
                     seed_file: std::path::PathBuf::from(args.seed_file),
                     output_dir: output_dir.clone(),
@@ -206,11 +272,40 @@ fn main() -> Result<(), AppError> {
                         analysis_timestamp: args.paper_analysis_timestamp,
                     },
                     refresh_scoped_cache: args.refresh_scoped_cache,
+                    cancellation_requested: cancellation_requested.clone(),
                 },
                 &deps,
                 output_lock,
-            )
-            .await?;
+            );
+            tokio::pin!(batch);
+            let payload = tokio::select! {
+                result = &mut batch => result?,
+                signal = tokio::signal::ctrl_c() => {
+                    signal?;
+                    cancellation_requested.store(true, Ordering::Release);
+                    eprintln!(
+                        "interrupt requested: stopping at a whole-seed recovery boundary; press Ctrl+C again for immediate exit"
+                    );
+                    tokio::select! {
+                        result = &mut batch => match result {
+                            Err(AppError::Interrupted(message)) => {
+                                eprintln!("interrupted: {message}");
+                                // Do not drop the runtime and wait indefinitely
+                                // for uncancellable DuckDB spawn_blocking work.
+                                // The batch has already synced its incomplete
+                                // manifest and every report is atomically written.
+                                std::process::exit(130);
+                            }
+                            result => result?,
+                        },
+                        second_signal = tokio::signal::ctrl_c() => {
+                            second_signal?;
+                            eprintln!("second interrupt received: exiting immediately");
+                            std::process::exit(130);
+                        }
+                    }
+                }
+            };
             if !payload.failures.is_empty() {
                 return Err(AppError::InvalidData(format!(
                     "multi-chain batch completed with {} failed work units; see {}",
@@ -220,6 +315,55 @@ fn main() -> Result<(), AppError> {
             }
             Ok(())
         }),
+        Command::PrepareFeatures(args) => {
+            if args.feature_db == ":memory:" && !args.allow_in_memory_feature_db {
+                return Err(AppError::InvalidData(
+                    "in-memory feature preparation requires --allow-in-memory-feature-db"
+                        .to_string(),
+                ));
+            }
+            let (duckdb_threads, rayon_threads) = resolve_resource_threads(
+                args.physical_cores,
+                args.duckdb_threads,
+                args.rayon_threads,
+            );
+            configure_rayon_threads(rayon_threads)?;
+            let duckdb_options =
+                DuckDbResourceOptions::from_cli(duckdb_threads, &args.duckdb_memory_limit)?;
+            eprintln!(
+                "prepare-features: duckdb_threads={}, rayon_threads={}, memory_limit={}, feature_db={}, parquet_files={}, prepare_only={}, restart_prepare={}",
+                duckdb_options.threads,
+                rayon_threads,
+                duckdb_options.memory_limit,
+                args.feature_db,
+                args.feature_parquet.len(),
+                args.prepare_only,
+                args.restart_prepare
+            );
+            let feature_store =
+                DuckDbFeatureStore::new_with_options(&args.feature_db, duckdb_options)?;
+            let chains = if args.prepare_only {
+                if !args.feature_parquet.is_empty() {
+                    return Err(AppError::InvalidData(
+                        "--prepare-only cannot be combined with --feature-parquet".to_string(),
+                    ));
+                }
+                feature_store.resume_authoritative_prepare()?
+            } else {
+                if args.feature_parquet.is_empty() {
+                    return Err(AppError::InvalidData(
+                        "prepare-features requires --feature-parquet unless --prepare-only is used"
+                            .to_string(),
+                    ));
+                }
+                feature_store.import_authoritative_parquet_snapshot(
+                    &args.feature_parquet,
+                    args.restart_prepare,
+                )?
+            };
+            feature_store.prepare_recall_for_chains(&chains)?;
+            Ok(())
+        }
         #[cfg(feature = "export-snapshot")]
         Command::ExportSnapshot(args) => {
             let block_range = SnapshotBlockRange::new(args.start_block, args.end_block)?
@@ -238,5 +382,17 @@ fn main() -> Result<(), AppError> {
         Command::ExportSnapshot(_) => Err(AppError::InvalidData(
             "export-snapshot requires building with --features export-snapshot".to_string(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_resource_threads;
+
+    #[test]
+    fn resource_threads_keep_duckdb_and_rayon_budgets_independent() {
+        assert_eq!(resolve_resource_threads(0, 64, 96), (64, 96));
+        assert_eq!(resolve_resource_threads(64, 96, 96), (64, 64));
+        assert_eq!(resolve_resource_threads(128, 64, 96), (64, 128));
     }
 }

@@ -76,8 +76,8 @@ impl Default for AnalyzeRequest {
             metadata_threshold: DEFAULT_METADATA_THRESHOLD,
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
             api_max_concurrency: 8,
-            matched_contract_max_concurrency: 1,
-            max_tokens_per_contract: 0,
+            matched_contract_max_concurrency: 8,
+            max_tokens_per_contract: 200,
             max_recall_rows: 0,
             paper_stats_config: paper_stats::PaperStatsConfig::default(),
         }
@@ -151,6 +151,14 @@ pub(super) struct SeedContext {
 pub(super) struct CandidatePlan {
     snapshot: DatabaseSnapshot,
     candidates: Vec<DuplicateCandidate>,
+    candidate_open_license_by_token: HashMap<(String, String), bool>,
+    estimated_memory_bytes: usize,
+}
+
+impl CandidatePlan {
+    pub(super) fn estimated_memory_bytes(&self) -> usize {
+        self.estimated_memory_bytes
+    }
 }
 
 struct CandidateContractFilterResult {
@@ -278,12 +286,12 @@ struct SeedAnalysisState {
     seed_nfts: Vec<SeedNft>,
     open_license: bool,
     snapshot: DatabaseSnapshot,
-    candidates: Vec<DuplicateCandidate>,
+    candidates: Arc<Vec<DuplicateCandidate>>,
     token_type: String,
-    grouped: BTreeMap<String, Vec<usize>>,
+    grouped: Arc<BTreeMap<String, Vec<usize>>>,
     contracts_to_analyze: Vec<String>,
-    candidate_open_license_by_token: HashMap<(String, String), bool>,
-    official_addresses: HashSet<String>,
+    candidate_open_license_by_token: Arc<HashMap<(String, String), bool>>,
+    official_addresses: Arc<HashSet<String>>,
     output_state: AnalysisOutputState,
     expanded_candidates_by_contract: BTreeMap<String, Vec<DuplicateCandidate>>,
     analysis_timestamp: i64,
@@ -438,7 +446,7 @@ pub(super) async fn build_candidate_plan_with_snapshot(
 fn build_candidate_plan_from_snapshot(
     request: &AnalyzeRequest,
     dedup_seed_nfts: &[SeedNft],
-    snapshot: DatabaseSnapshot,
+    mut snapshot: DatabaseSnapshot,
 ) -> CandidatePlan {
     let candidates = if snapshot.duplicate_contract_rows.is_empty() && !snapshot.nft_rows.is_empty()
     {
@@ -458,10 +466,118 @@ fn build_candidate_plan_from_snapshot(
             request.metadata_threshold,
         )
     };
+    let candidate_contracts = candidates
+        .iter()
+        .map(|candidate| crate::models::normalize_chain_identity(&candidate.contract_address))
+        .collect::<HashSet<_>>();
+    snapshot.nft_rows.retain(|row| {
+        candidate_contracts.contains(&crate::models::normalize_chain_identity(
+            &row.contract_address,
+        ))
+    });
+    let candidate_open_license_by_token = snapshot
+        .nft_rows
+        .iter()
+        .map(|row| {
+            (
+                (row.contract_address.clone(), row.token_id.clone()),
+                is_candidate_open_license(&row.metadata_json),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    // Candidate generation and license extraction are the only consumers of
+    // the large metadata payload and prepared projections. Keep only the token
+    // fields needed for provider-failure fallback before entering async API
+    // analysis.
+    for row in &mut snapshot.nft_rows {
+        row.metadata_json = String::new();
+    }
+    snapshot.duplicate_contract_rows = Vec::new();
+    snapshot.contract_names = Vec::new();
+    snapshot.contract_signals = BTreeMap::new();
+    let estimated_memory_bytes = estimate_compact_candidate_plan_bytes(
+        &snapshot,
+        &candidates,
+        &candidate_open_license_by_token,
+    );
     CandidatePlan {
         snapshot,
         candidates,
+        candidate_open_license_by_token,
+        estimated_memory_bytes,
     }
+}
+
+fn estimate_compact_candidate_plan_bytes(
+    snapshot: &DatabaseSnapshot,
+    candidates: &[DuplicateCandidate],
+    licenses: &HashMap<(String, String), bool>,
+) -> usize {
+    let snapshot_bytes = snapshot
+        .nft_rows
+        .iter()
+        .map(|row| {
+            std::mem::size_of_val(row)
+                .saturating_add(row.contract_address.capacity())
+                .saturating_add(row.token_id.capacity())
+                .saturating_add(row.token_uri.capacity())
+                .saturating_add(row.image_uri.capacity())
+                .saturating_add(row.name.capacity())
+                .saturating_add(row.symbol.capacity())
+        })
+        .sum::<usize>()
+        .saturating_add(
+            snapshot
+                .nft_rows
+                .capacity()
+                .saturating_mul(std::mem::size_of::<crate::models::DatabaseNftRecord>()),
+        );
+    let candidate_bytes = candidates
+        .iter()
+        .map(|candidate| {
+            std::mem::size_of_val(candidate)
+                .saturating_add(candidate.contract_address.capacity())
+                .saturating_add(candidate.token_id.capacity())
+                .saturating_add(candidate.confidence.capacity())
+                .saturating_add(candidate.token_uri.capacity())
+                .saturating_add(candidate.image_uri.capacity())
+                .saturating_add(candidate.name.capacity())
+                .saturating_add(candidate.symbol.capacity())
+                .saturating_add(
+                    candidate
+                        .match_reasons
+                        .iter()
+                        .map(|reason| reason.capacity())
+                        .sum::<usize>(),
+                )
+        })
+        .sum::<usize>()
+        .saturating_add(
+            candidates
+                .len()
+                .saturating_mul(std::mem::size_of::<DuplicateCandidate>()),
+        );
+    let license_bytes = licenses
+        .iter()
+        .map(|((contract, token_id), _)| {
+            contract
+                .capacity()
+                .saturating_add(token_id.capacity())
+                .saturating_add(std::mem::size_of::<((String, String), bool)>())
+        })
+        .sum::<usize>()
+        .saturating_add(
+            licenses
+                .capacity()
+                .saturating_mul(std::mem::size_of::<((String, String), bool)>()),
+        );
+    // Downstream grouping/token indexes duplicate keys and vector headers.
+    // Reserve 2x plus fixed allocator/runtime slack rather than under-account.
+    snapshot_bytes
+        .saturating_add(candidate_bytes)
+        .saturating_add(license_bytes)
+        .saturating_mul(2)
+        .saturating_add(64_000_000)
 }
 
 pub async fn analyze_seed_contract_with_progress(
@@ -653,6 +769,8 @@ async fn prepare_seed_analysis_state(
     let CandidatePlan {
         snapshot,
         candidates,
+        candidate_open_license_by_token,
+        estimated_memory_bytes: _,
     } = plan;
     let token_type = payload_token_type(&seed_contract);
     let CandidateContractFilterResult {
@@ -676,25 +794,6 @@ async fn prepare_seed_analysis_state(
     let grouped = group_candidates_by_contract(&candidates);
 
     let contracts_to_analyze: Vec<String> = grouped.keys().cloned().collect();
-    let snapshot_rows_by_key: HashMap<(String, String), _> = snapshot
-        .nft_rows
-        .iter()
-        .map(|row| ((row.contract_address.clone(), row.token_id.clone()), row))
-        .collect();
-    let candidate_open_license_by_token: HashMap<(String, String), bool> = candidates
-        .iter()
-        .map(|candidate| {
-            let key = (
-                candidate.contract_address.clone(),
-                candidate.token_id.clone(),
-            );
-            let is_open = snapshot_rows_by_key
-                .get(&key)
-                .map(|row| is_candidate_open_license(&row.metadata_json))
-                .unwrap_or(false);
-            (key, is_open)
-        })
-        .collect();
     let official_addresses: HashSet<String> = [
         seed_contract.contract_deployer.clone(),
         seed_contract.contract_address.clone(),
@@ -717,12 +816,12 @@ async fn prepare_seed_analysis_state(
         seed_nfts,
         open_license,
         snapshot,
-        candidates,
+        candidates: Arc::new(candidates),
         token_type,
-        grouped,
+        grouped: Arc::new(grouped),
         contracts_to_analyze,
-        candidate_open_license_by_token,
-        official_addresses,
+        candidate_open_license_by_token: Arc::new(candidate_open_license_by_token),
+        official_addresses: Arc::new(official_addresses),
         output_state,
         expanded_candidates_by_contract,
         analysis_timestamp,
@@ -739,8 +838,10 @@ async fn analyze_matched_contracts_parallel(
     if state.open_license {
         return Ok(());
     }
+    let contracts_to_analyze = std::mem::take(&mut state.contracts_to_analyze);
+    let contract_count = contracts_to_analyze.len();
     progress
-        .on_duplicate_contracts_started(state.contracts_to_analyze.len())
+        .on_duplicate_contracts_started(contract_count)
         .await;
 
     let mut completed_contracts = 0;
@@ -750,17 +851,15 @@ async fn analyze_matched_contracts_parallel(
             request: state.request.clone(),
             deps: deps.clone(),
             token_type: state.token_type.clone(),
-            grouped: Arc::new(state.grouped.clone()),
-            candidates: Arc::new(state.candidates.clone()),
+            grouped: Arc::clone(&state.grouped),
+            candidates: Arc::clone(&state.candidates),
             snapshot_token_index: Arc::new(snapshot_token_index),
-            official_addresses: Arc::new(state.official_addresses.clone()),
-            candidate_open_license_by_token: Arc::new(
-                state.candidate_open_license_by_token.clone(),
-            ),
+            official_addresses: Arc::clone(&state.official_addresses),
+            candidate_open_license_by_token: Arc::clone(&state.candidate_open_license_by_token),
             seed_deployed_block_number: state.seed_contract.deployed_block_number,
             analysis_timestamp: state.analysis_timestamp,
         });
-        let mut tasks = stream::iter(state.contracts_to_analyze.clone().into_iter().map(
+        let mut tasks = stream::iter(contracts_to_analyze.iter().cloned().map(
             |contract_address| {
                 let context = Arc::clone(&context);
                 let matched_contract_limit = Arc::clone(&matched_contract_limit);
@@ -785,7 +884,7 @@ async fn analyze_matched_contracts_parallel(
                 .on_duplicate_contract_completed(
                     &output.contract_address,
                     completed_contracts,
-                    state.contracts_to_analyze.len(),
+                    contract_count,
                 )
                 .await;
             outputs.insert(output.contract_address.clone(), output);
@@ -793,7 +892,7 @@ async fn analyze_matched_contracts_parallel(
         outputs
     };
 
-    for contract_address in &state.contracts_to_analyze {
+    for contract_address in &contracts_to_analyze {
         let Some(output) = outputs.remove(contract_address) else {
             continue;
         };
@@ -939,6 +1038,7 @@ async fn finalize_seed_report(
         mut provider_data_quality,
         ..
     } = state;
+    let candidates = Arc::try_unwrap(candidates).unwrap_or_else(|shared| (*shared).clone());
 
     expanded_candidates_by_contract.retain(|contract, _| {
         !output_state

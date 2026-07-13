@@ -1,6 +1,11 @@
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
+#[cfg(unix)]
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -14,6 +19,45 @@ use crate::models::{
 };
 
 static SLUG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[^0-9a-zA-Z\u{4e00}-\u{9fff}]+").unwrap());
+static ATOMIC_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn write_bytes_atomic(path: &Path, contents: &[u8]) -> Result<(), AppError> {
+    let sequence = ATOMIC_WRITE_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
+    let temp = path.with_extension(format!("{}.{}.tmp", std::process::id(), sequence));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, path)?;
+        sync_parent_directory(path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<(), AppError> {
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(_path: &Path) -> Result<(), AppError> {
+    // The file contents are flushed before the atomic replacement. Rust's
+    // portable filesystem API does not expose a durable directory flush on
+    // Windows, so crash consistency of the directory entry remains subject to
+    // the underlying filesystem while process-interruption atomicity is kept.
+    Ok(())
+}
 
 fn slugify(value: &str) -> String {
     let normalized = value.nfkc().collect::<String>();
@@ -89,7 +133,7 @@ pub fn default_output_basename(payload: &SingleReportPayload) -> String {
 
 pub fn dump_results(payload: &SingleReportPayload, output_path: &Path) -> Result<(), AppError> {
     let text = serde_json::to_string_pretty(payload)?;
-    std::fs::write(output_path, text)?;
+    write_bytes_atomic(output_path, text.as_bytes())?;
     Ok(())
 }
 
@@ -108,8 +152,8 @@ pub fn write_default_outputs(
             }
         }
         let md_path = json_path.with_extension("md");
+        write_bytes_atomic(&md_path, render_human_readable_report(payload).as_bytes())?;
         dump_results(payload, &json_path)?;
-        std::fs::write(&md_path, render_human_readable_report(payload))?;
         Ok((json_path, md_path))
     }
 }
@@ -121,8 +165,8 @@ pub fn write_outputs_to_directory(
     std::fs::create_dir_all(output_dir)?;
     let json_path = output_dir.join(format!("{}.json", default_output_basename(payload)));
     let md_path = json_path.with_extension("md");
+    write_bytes_atomic(&md_path, render_human_readable_report(payload).as_bytes())?;
     dump_results(payload, &json_path)?;
-    std::fs::write(&md_path, render_human_readable_report(payload))?;
     Ok((json_path, md_path))
 }
 
@@ -134,8 +178,11 @@ pub fn write_batch_paper_stats_outputs(
     let json_path = output_dir.join("top_contract_analysis__summary.json");
     let md_path = output_dir.join("top_contract_analysis__summary.md");
     let text = serde_json::to_string_pretty(payload)?;
-    std::fs::write(&json_path, text)?;
-    std::fs::write(&md_path, render_batch_human_readable_report(payload))?;
+    write_bytes_atomic(
+        &md_path,
+        render_batch_human_readable_report(payload).as_bytes(),
+    )?;
+    write_bytes_atomic(&json_path, text.as_bytes())?;
     Ok((json_path, md_path))
 }
 
@@ -919,4 +966,21 @@ fn append_data_quality(lines: &mut Vec<String>, stats: &PaperStatsPayload) {
             quality.legit_duplicate_contract_count
         ),
     ]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_bytes_atomic;
+
+    #[test]
+    fn atomic_output_replaces_existing_file_without_leaving_temporary_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.json");
+        std::fs::write(&path, b"old").unwrap();
+
+        write_bytes_atomic(&path, b"new").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 }

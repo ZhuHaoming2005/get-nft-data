@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -15,6 +17,8 @@ use crate::models::{
     SingleReportPayload,
 };
 use crate::progress::NoopProgressReporter;
+use crate::reporting::write_bytes_atomic;
+use crate::store::duckdb_store::ANALYSIS_COMPACT_PLAN_MEMORY_BUDGET_BYTES;
 
 use super::paper_stats::{merge_paper_stats, PaperStatsConfig};
 use super::{
@@ -24,7 +28,11 @@ use super::{
 };
 
 const MAX_MULTICHAIN_SEED_PIPELINE_BACKLOG: usize = 8;
+const MAX_SNAPSHOT_SEEDS_PER_BULK: usize = 2;
+const COMPACT_PLAN_MEMORY_UNIT_BYTES: usize = 1_000_000_000;
 const RUN_MANIFEST_SCHEMA_VERSION: u32 = 1;
+const SCOPED_SEED_REPORT_SCHEMA_VERSION: u32 = 4;
+const SEED_COMPLETION_SCHEMA_VERSION: u32 = 1;
 
 pub fn read_seed_contracts(seed_file: &Path) -> Result<Vec<ContractId>, crate::error::AppError> {
     let content = std::fs::read_to_string(seed_file)?;
@@ -94,6 +102,8 @@ pub struct MultiChainBatchRequest {
     pub paper_stats_config: PaperStatsConfig,
     /// Ignore an unfinished run manifest and begin a fresh provider-backed run.
     pub refresh_scoped_cache: bool,
+    /// Shared cooperative cancellation set by the CLI's first interrupt.
+    pub cancellation_requested: Arc<AtomicBool>,
 }
 
 impl Default for MultiChainBatchRequest {
@@ -109,16 +119,17 @@ impl Default for MultiChainBatchRequest {
             metadata_threshold: 0.6,
             timeout_seconds: 60,
             api_max_concurrency: 8,
-            matched_contract_max_concurrency: 4,
+            matched_contract_max_concurrency: 8,
             seed_network_max_concurrency: 2,
-            seed_cpu_max_concurrency: 1,
-            max_tokens_per_contract: 0,
+            seed_cpu_max_concurrency: 2,
+            max_tokens_per_contract: 200,
             max_recall_rows: 0,
             max_history_transactions_per_asset: 100,
             max_history_transactions_per_collection: 10_000,
             max_helius_assets_per_collection: 10_000,
             paper_stats_config: PaperStatsConfig::default(),
             refresh_scoped_cache: false,
+            cancellation_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -159,6 +170,7 @@ pub struct ScopedPaperStatsPayload {
 struct ScopedSeedReport<'a> {
     schema_version: u32,
     analysis_fingerprint: &'a str,
+    seed_attempt_id: &'a str,
     scope: &'static str,
     primary_chain: String,
     secondary_chain: String,
@@ -169,9 +181,20 @@ struct ScopedSeedReport<'a> {
 struct CachedScopedSeedReport {
     schema_version: u32,
     analysis_fingerprint: String,
+    seed_attempt_id: String,
     primary_chain: String,
     secondary_chain: String,
     report: CachedSingleSeedReport,
+}
+
+#[derive(Deserialize, Serialize)]
+struct SeedCompletionMarker {
+    schema_version: u32,
+    run_id: String,
+    seed_attempt_id: String,
+    primary_chain: String,
+    seed_address: String,
+    scope_fingerprints: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -201,12 +224,36 @@ struct RunManifest {
 }
 
 struct SeedPipelineOutput {
+    seed: String,
     failures: Vec<BatchFailurePayload>,
+    cancelled: bool,
+    cached: bool,
+    elapsed_ms: u64,
+}
+
+impl SeedPipelineOutput {
+    fn new(
+        seed: &ContractId,
+        failures: Vec<BatchFailurePayload>,
+        cancelled: bool,
+        cached: bool,
+        started: Instant,
+    ) -> Self {
+        Self {
+            seed: seed.to_string(),
+            failures,
+            cancelled,
+            cached,
+            elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        }
+    }
 }
 
 struct SeedPipelineLimits {
     network: Arc<Semaphore>,
     cpu: Arc<Semaphore>,
+    snapshot_resident: Arc<Semaphore>,
+    compact_plan_memory: Arc<Semaphore>,
     matched_contract: Arc<Semaphore>,
 }
 
@@ -226,9 +273,11 @@ impl SnapshotBatcher {
     fn spawn(
         feature_store: Arc<dyn FeatureStoreReader>,
         request: &MultiChainBatchRequest,
+        channel_capacity: usize,
         max_batch_size: usize,
     ) -> Self {
-        let capacity = max_batch_size.max(1);
+        let capacity = channel_capacity.max(1);
+        let max_batch_size = max_batch_size.max(1).min(capacity);
         let (sender, mut receiver) = mpsc::channel::<SnapshotBatchRequest>(capacity);
         let name_threshold = request.name_threshold;
         let metadata_threshold = request.metadata_threshold;
@@ -239,7 +288,7 @@ impl SnapshotBatcher {
             while let Some(first) = receiver.recv().await {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                 let mut batch = vec![first];
-                while batch.len() < capacity {
+                while batch.len() < max_batch_size {
                     match receiver.try_recv() {
                         Ok(request) => batch.push(request),
                         Err(_) => break,
@@ -260,10 +309,14 @@ impl SnapshotBatcher {
                             .acquire_owned()
                             .await
                             .expect("snapshot batch semaphore remains open");
+                        let mut requests = requests;
                         let seeds = requests
-                            .iter()
+                            .iter_mut()
                             .map(|request| {
-                                (request.seed_address.clone(), request.seed_nfts.clone())
+                                (
+                                    request.seed_address.clone(),
+                                    std::mem::take(&mut request.seed_nfts),
+                                )
                             })
                             .collect::<Vec<_>>();
                         let chain_for_load = chain.clone();
@@ -432,9 +485,16 @@ pub async fn run_multichain_batch_with_lock(
     write_run_manifest(&request.output_dir, &manifest)?;
     let mut failures = Vec::new();
     let pending_seed_count = seeds.len().max(1);
+    let resident_snapshot_limit = request
+        .seed_cpu_max_concurrency
+        .clamp(1, MAX_SNAPSHOT_SEEDS_PER_BULK);
     let pipeline_limits = Arc::new(SeedPipelineLimits {
         network: Arc::new(Semaphore::new(request.seed_network_max_concurrency.max(1))),
         cpu: Arc::new(Semaphore::new(request.seed_cpu_max_concurrency.max(1))),
+        snapshot_resident: Arc::new(Semaphore::new(resident_snapshot_limit)),
+        compact_plan_memory: Arc::new(Semaphore::new(
+            ANALYSIS_COMPACT_PLAN_MEMORY_BUDGET_BYTES / COMPACT_PLAN_MEMORY_UNIT_BYTES,
+        )),
         matched_contract: Arc::new(Semaphore::new(
             request.matched_contract_max_concurrency.max(1),
         )),
@@ -446,8 +506,12 @@ pub async fn run_multichain_batch_with_lock(
         .saturating_add(request.matched_contract_max_concurrency.max(1))
         .min(pending_seed_count)
         .clamp(1, MAX_MULTICHAIN_SEED_PIPELINE_BACKLOG);
-    let snapshot_batcher =
-        SnapshotBatcher::spawn(deps.feature_store.clone(), &request, pipeline_backlog);
+    let snapshot_batcher = SnapshotBatcher::spawn(
+        deps.feature_store.clone(),
+        &request,
+        pipeline_backlog,
+        resident_snapshot_limit,
+    );
     let request = Arc::new(request);
     let run_id = Arc::new(manifest.run_id.clone());
     let aggregation_seeds = seeds.clone();
@@ -468,14 +532,37 @@ pub async fn run_multichain_batch_with_lock(
             .await
         }
     }))
-    .buffered(pipeline_backlog);
+    .buffer_unordered(pipeline_backlog);
+    let mut interrupted = false;
     while let Some(output) = seed_tasks.next().await {
         let output = output?;
+        append_seed_run_metric(&request.output_dir, &run_id, &output)?;
+        let cancelled = output.cancelled;
         failures.extend(output.failures);
+        if cancelled || request.cancellation_requested.load(Ordering::Acquire) {
+            interrupted = true;
+            break;
+        }
+    }
+    drop(seed_tasks);
+    if interrupted {
+        manifest.updated_at = chrono::Utc::now().timestamp();
+        write_run_manifest(&request.output_dir, &manifest)?;
+        return Err(crate::error::AppError::Interrupted(
+            "batch stopped at a whole-seed recovery boundary; rerun the same command to resume"
+                .to_string(),
+        ));
     }
 
     let mut scoped_duplicate_scale = Vec::new();
     let mut scoped_paper_stats = Vec::new();
+    let committed_attempts = aggregation_seeds
+        .iter()
+        .filter_map(|seed| {
+            committed_seed_attempt(&request.output_dir, seed, &run_id)
+                .map(|attempt_id| (seed.clone(), attempt_id))
+        })
+        .collect::<BTreeMap<_, _>>();
     for primary_chain in Chain::ALL {
         let mut analyses = Vec::new();
         for secondary_chain in Chain::ALL {
@@ -483,12 +570,14 @@ pub async fn run_multichain_batch_with_lock(
                 .iter()
                 .filter(|seed| seed.chain == primary_chain)
                 .filter_map(|seed| {
+                    let attempt_id = committed_attempts.get(seed)?;
                     let fingerprint = analysis_fingerprint(&run_id, seed, secondary_chain);
                     load_cached_seed_report(
                         &request.output_dir,
                         seed,
                         secondary_chain,
                         &fingerprint,
+                        attempt_id,
                     )
                 })
                 .peekable();
@@ -552,6 +641,24 @@ pub async fn run_multichain_batch_with_lock(
         }
     }
 
+    failures.sort_by(|left, right| {
+        (
+            left.primary_chain.as_str(),
+            left.seed_address.as_str(),
+            left.secondary_chain.as_str(),
+            left.stage.as_str(),
+            left.provider.as_str(),
+            left.error.as_str(),
+        )
+            .cmp(&(
+                right.primary_chain.as_str(),
+                right.seed_address.as_str(),
+                right.secondary_chain.as_str(),
+                right.stage.as_str(),
+                right.provider.as_str(),
+                right.error.as_str(),
+            ))
+    });
     let result = MultiChainBatchResult {
         schema_version: 2,
         report_type: "multi_chain_batch_summary".to_string(),
@@ -598,19 +705,22 @@ async fn process_seed_pipeline_pinned(
     run_id: Arc<String>,
     snapshot_batcher: SnapshotBatcher,
 ) -> Result<SeedPipelineOutput, crate::error::AppError> {
+    let started = Instant::now();
     let mut failures = Vec::new();
-    let mut missing_chains = Vec::new();
-    for secondary_chain in Chain::ALL {
-        let fingerprint = analysis_fingerprint(&run_id, &seed, secondary_chain);
-        match load_cached_seed_report(&request.output_dir, &seed, secondary_chain, &fingerprint) {
-            Some(_) => {}
-            None => missing_chains.push((secondary_chain, fingerprint)),
-        }
+    if request.cancellation_requested.load(Ordering::Acquire) {
+        return Ok(SeedPipelineOutput::new(
+            &seed, failures, true, false, started,
+        ));
     }
+    let missing_chains = seed_scopes_to_process(&request.output_dir, &seed, &run_id);
     if missing_chains.is_empty() {
         deps.batch_progress.on_seed_cached(&seed.to_string());
-        return Ok(SeedPipelineOutput { failures });
+        return Ok(SeedPipelineOutput::new(
+            &seed, failures, false, true, started,
+        ));
     }
+    invalidate_seed_completion_marker(&request.output_dir, &seed)?;
+    let seed_attempt_id = new_seed_attempt_id(&run_id, &seed);
 
     let primary_request = analyze_request(&request, &seed, seed.chain);
     let progress = deps.batch_progress.create_seed_reporter(&seed.to_string());
@@ -630,14 +740,38 @@ async fn process_seed_pipeline_pinned(
             deps.batch_progress
                 .on_seed_failed(&seed.to_string(), &error.to_string());
             failures.push(failure(&seed, None, "fetch_seed_context", &error));
-            return Ok(SeedPipelineOutput { failures });
+            return Ok(SeedPipelineOutput::new(
+                &seed,
+                failures,
+                request.cancellation_requested.load(Ordering::Acquire),
+                false,
+                started,
+            ));
         }
     };
     drop(network_permit);
 
-    let mut seed_succeeded = false;
+    let mut completed_chains = BTreeSet::new();
     for (secondary_chain, fingerprint) in missing_chains {
+        if request.cancellation_requested.load(Ordering::Acquire) {
+            return Ok(SeedPipelineOutput::new(
+                &seed, failures, true, false, started,
+            ));
+        }
         let candidate_request = analyze_request(&request, &seed, secondary_chain);
+        // This permit covers the complete lifetime of a potentially large
+        // snapshot. Limiting only DuckDB loading allows completed snapshots to
+        // pile up behind candidate analysis and defeats the memory envelope.
+        let snapshot_resident_permit = limits
+            .snapshot_resident
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| {
+                crate::error::AppError::InvalidData(format!(
+                    "snapshot resident limit closed: {error}"
+                ))
+            })?;
         let dedup_seed_nfts =
             seed_nfts_for_duplicate_matching(&context.seed_nfts, &context.seed_contract);
         let snapshot = snapshot_batcher
@@ -674,9 +808,47 @@ async fn process_seed_pipeline_pinned(
                     "load_snapshot",
                     &error,
                 ));
+                drop(snapshot_resident_permit);
                 continue;
             }
         };
+        let compact_plan_bytes = plan.estimated_memory_bytes();
+        if compact_plan_bytes > ANALYSIS_COMPACT_PLAN_MEMORY_BUDGET_BYTES {
+            let error = crate::error::AppError::ResourceLimit(format!(
+                "compact candidate plan for {}:{} -> {secondary_chain} is estimated at {compact_plan_bytes} bytes, exceeding the global {ANALYSIS_COMPACT_PLAN_MEMORY_BUDGET_BYTES}-byte compact-plan budget",
+                seed.chain, seed.address
+            ));
+            failures.push(failure(
+                &seed,
+                Some(secondary_chain),
+                "compact_candidate_plan",
+                &error,
+            ));
+            drop(snapshot_resident_permit);
+            continue;
+        }
+        let compact_plan_units = compact_plan_bytes
+            .div_ceil(COMPACT_PLAN_MEMORY_UNIT_BYTES)
+            .max(1);
+        let compact_plan_units = u32::try_from(compact_plan_units).map_err(|_| {
+            crate::error::AppError::ResourceLimit(format!(
+                "compact candidate plan admission units overflow for {compact_plan_bytes} bytes"
+            ))
+        })?;
+        let compact_plan_permit = limits
+            .compact_plan_memory
+            .clone()
+            .acquire_many_owned(compact_plan_units)
+            .await
+            .map_err(|error| {
+                crate::error::AppError::InvalidData(format!(
+                    "compact candidate plan memory limit closed: {error}"
+                ))
+            })?;
+        // The plan now contains only provider-fallback token fields and the
+        // extracted license flags. Release the much larger full-snapshot slot
+        // before any provider calls so recall can overlap slow networks.
+        drop(snapshot_resident_permit);
         match analyze_seed_contract_with_limits(
             candidate_request,
             deps,
@@ -693,10 +865,11 @@ async fn process_seed_pipeline_pinned(
                     &seed,
                     secondary_chain,
                     &fingerprint,
+                    &seed_attempt_id,
                     &report,
                 ) {
                     Ok(()) => {
-                        seed_succeeded = true;
+                        completed_chains.insert(secondary_chain);
                     }
                     Err(error) => failures.push(failure(
                         &seed,
@@ -713,14 +886,52 @@ async fn process_seed_pipeline_pinned(
                 &error,
             )),
         }
+        drop(compact_plan_permit);
+    }
+    let mut seed_succeeded = false;
+    if failures.is_empty()
+        && completed_chains.len() == Chain::ALL.len()
+        && !request.cancellation_requested.load(Ordering::Acquire)
+    {
+        match write_seed_completion_marker(&request.output_dir, &seed, &run_id, &seed_attempt_id) {
+            Ok(()) => seed_succeeded = true,
+            Err(error) => failures.push(failure(&seed, None, "commit_seed_attempt", &error)),
+        }
     }
     if seed_succeeded {
         deps.batch_progress.on_seed_finished(&seed.to_string());
     } else {
-        deps.batch_progress
-            .on_seed_failed(&seed.to_string(), "all candidate-chain analyses failed");
+        deps.batch_progress.on_seed_failed(
+            &seed.to_string(),
+            "whole-seed attempt did not commit all four scopes",
+        );
     }
-    Ok(SeedPipelineOutput { failures })
+    Ok(SeedPipelineOutput::new(
+        &seed,
+        failures,
+        request.cancellation_requested.load(Ordering::Acquire),
+        false,
+        started,
+    ))
+}
+
+fn seed_scopes_to_process(
+    output_dir: &Path,
+    seed: &ContractId,
+    run_id: &str,
+) -> Vec<(Chain, String)> {
+    let scopes = Chain::ALL
+        .into_iter()
+        .map(|secondary_chain| {
+            let fingerprint = analysis_fingerprint(run_id, seed, secondary_chain);
+            (secondary_chain, fingerprint)
+        })
+        .collect::<Vec<_>>();
+    if committed_seed_attempt(output_dir, seed, run_id).is_some() {
+        Vec::new()
+    } else {
+        scopes
+    }
 }
 
 fn analyze_request(
@@ -775,6 +986,7 @@ fn write_scoped_seed_report(
     seed: &ContractId,
     secondary_chain: Chain,
     analysis_fingerprint: &str,
+    seed_attempt_id: &str,
     report: &SingleReportPayload,
 ) -> Result<(), crate::error::AppError> {
     let scope = if seed.chain == secondary_chain {
@@ -783,8 +995,9 @@ fn write_scoped_seed_report(
         "chain_matrix"
     };
     let payload = ScopedSeedReport {
-        schema_version: 3,
+        schema_version: SCOPED_SEED_REPORT_SCHEMA_VERSION,
         analysis_fingerprint,
+        seed_attempt_id,
         scope,
         primary_chain: seed.chain.to_string(),
         secondary_chain: secondary_chain.to_string(),
@@ -812,12 +1025,14 @@ fn load_cached_seed_report(
     seed: &ContractId,
     secondary_chain: Chain,
     analysis_fingerprint: &str,
+    seed_attempt_id: &str,
 ) -> Option<PaperStatsPayload> {
     let path = scoped_seed_report_path(output_dir, seed, secondary_chain);
     let bytes = std::fs::read(path).ok()?;
     let cached = serde_json::from_slice::<CachedScopedSeedReport>(&bytes).ok()?;
-    if cached.schema_version != 3
+    if cached.schema_version != SCOPED_SEED_REPORT_SCHEMA_VERSION
         || cached.analysis_fingerprint != analysis_fingerprint
+        || cached.seed_attempt_id != seed_attempt_id
         || cached.primary_chain != seed.chain.as_str()
         || cached.secondary_chain != secondary_chain.as_str()
         || !cached
@@ -832,9 +1047,113 @@ fn load_cached_seed_report(
     Some(cached.report.paper_stats)
 }
 
+fn seed_completion_marker_path(output_dir: &Path, seed: &ContractId) -> PathBuf {
+    output_dir.join(format!(
+        "{}__{}__complete.json",
+        seed.chain,
+        lowercase_hex(seed.address.as_bytes())
+    ))
+}
+
+fn invalidate_seed_completion_marker(
+    output_dir: &Path,
+    seed: &ContractId,
+) -> Result<(), crate::error::AppError> {
+    let path = seed_completion_marker_path(output_dir, seed);
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn expected_scope_fingerprints(run_id: &str, seed: &ContractId) -> BTreeMap<String, String> {
+    Chain::ALL
+        .into_iter()
+        .map(|chain| (chain.to_string(), analysis_fingerprint(run_id, seed, chain)))
+        .collect()
+}
+
+fn write_seed_completion_marker(
+    output_dir: &Path,
+    seed: &ContractId,
+    run_id: &str,
+    seed_attempt_id: &str,
+) -> Result<(), crate::error::AppError> {
+    let scope_fingerprints = expected_scope_fingerprints(run_id, seed);
+    for secondary_chain in Chain::ALL {
+        let fingerprint = &scope_fingerprints[secondary_chain.as_str()];
+        if load_cached_seed_report(
+            output_dir,
+            seed,
+            secondary_chain,
+            fingerprint,
+            seed_attempt_id,
+        )
+        .is_none()
+        {
+            return Err(crate::error::AppError::InvalidData(format!(
+                "cannot commit seed attempt {seed_attempt_id}: scope {}:{} -> {secondary_chain} is missing, stale, or belongs to another attempt",
+                seed.chain, seed.address
+            )));
+        }
+    }
+    let marker = SeedCompletionMarker {
+        schema_version: SEED_COMPLETION_SCHEMA_VERSION,
+        run_id: run_id.to_string(),
+        seed_attempt_id: seed_attempt_id.to_string(),
+        primary_chain: seed.chain.to_string(),
+        seed_address: seed.address.clone(),
+        scope_fingerprints,
+    };
+    write_json_atomic(
+        &seed_completion_marker_path(output_dir, seed),
+        &serde_json::to_vec_pretty(&marker)?,
+    )
+}
+
+fn committed_seed_attempt(output_dir: &Path, seed: &ContractId, run_id: &str) -> Option<String> {
+    let marker = serde_json::from_slice::<SeedCompletionMarker>(
+        &std::fs::read(seed_completion_marker_path(output_dir, seed)).ok()?,
+    )
+    .ok()?;
+    let expected_fingerprints = expected_scope_fingerprints(run_id, seed);
+    if marker.schema_version != SEED_COMPLETION_SCHEMA_VERSION
+        || marker.run_id != run_id
+        || marker.primary_chain != seed.chain.as_str()
+        || marker.seed_address != seed.address
+        || marker.seed_attempt_id.is_empty()
+        || marker.scope_fingerprints != expected_fingerprints
+    {
+        return None;
+    }
+    for secondary_chain in Chain::ALL {
+        let fingerprint = &expected_fingerprints[secondary_chain.as_str()];
+        load_cached_seed_report(
+            output_dir,
+            seed,
+            secondary_chain,
+            fingerprint,
+            &marker.seed_attempt_id,
+        )?;
+    }
+    Some(marker.seed_attempt_id)
+}
+
+fn new_seed_attempt_id(run_id: &str, seed: &ContractId) -> String {
+    let nonce = format!(
+        "v1|{run_id}|{}|{}|{}|{}",
+        seed.chain,
+        seed.address,
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        std::process::id()
+    );
+    lowercase_hex(&Sha256::digest(nonce.as_bytes()))
+}
+
 fn analysis_fingerprint(run_id: &str, seed: &ContractId, secondary_chain: Chain) -> String {
     let canonical = format!(
-        "v4|{run_id}|{}|{}|{}",
+        "v5|{run_id}|{}|{}|{}",
         seed.chain, seed.address, secondary_chain,
     );
     lowercase_hex(&Sha256::digest(canonical.as_bytes()))
@@ -944,6 +1263,32 @@ fn write_run_manifest(
         &output_dir.join("run-manifest.json"),
         &serde_json::to_vec_pretty(manifest)?,
     )
+}
+
+fn append_seed_run_metric(
+    output_dir: &Path,
+    run_id: &str,
+    output: &SeedPipelineOutput,
+) -> Result<(), crate::error::AppError> {
+    let metric = serde_json::json!({
+        "schema_version": 1,
+        "event": "seed_finished",
+        "run_id": run_id,
+        "seed": output.seed,
+        "cached": output.cached,
+        "cancelled": output.cancelled,
+        "elapsed_ms": output.elapsed_ms,
+        "failure_count": output.failures.len(),
+        "recorded_at": chrono::Utc::now().timestamp(),
+    });
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(output_dir.join("run-metrics.jsonl"))?;
+    file.write_all(&serde_json::to_vec(&metric)?)?;
+    file.write_all(b"\n")?;
+    file.sync_data()?;
+    Ok(())
 }
 
 fn lowercase_hex(bytes: &[u8]) -> String {
@@ -1098,10 +1443,7 @@ fn write_json_atomic(
     path: &std::path::Path,
     contents: &[u8],
 ) -> Result<(), crate::error::AppError> {
-    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
-    std::fs::write(&temp, contents)?;
-    std::fs::rename(&temp, path)?;
-    Ok(())
+    write_bytes_atomic(path, contents)
 }
 
 pub fn build_scoped_duplicate_scale(
@@ -1226,11 +1568,14 @@ fn ratio(numerator: i64, denominator: i64) -> Option<f64> {
 
 #[cfg(test)]
 mod native_field_tests {
+    use std::sync::atomic::Ordering;
+
     use super::{
-        batch_config_fingerprint, remove_internal_native_amounts, seed_set_identity,
-        BatchOutputLock, MultiChainBatchRequest,
+        analysis_fingerprint, batch_config_fingerprint, remove_internal_native_amounts,
+        seed_scopes_to_process, seed_set_identity, write_json_atomic, write_scoped_seed_report,
+        write_seed_completion_marker, BatchOutputLock, MultiChainBatchRequest,
     };
-    use crate::models::ContractId;
+    use crate::models::{Chain, ContractId, SingleReportPayload};
     use tempfile::tempdir;
 
     #[test]
@@ -1281,5 +1626,123 @@ mod native_field_tests {
         let _first = BatchOutputLock::acquire(directory.path()).unwrap();
 
         assert!(BatchOutputLock::acquire(directory.path()).is_err());
+    }
+
+    #[test]
+    fn batch_cancellation_defaults_to_not_requested() {
+        let request = MultiChainBatchRequest::default();
+
+        assert!(!request.cancellation_requested.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn incomplete_seed_cache_recomputes_all_four_chain_scopes() {
+        let directory = tempdir().unwrap();
+        let seed = ContractId::new(
+            Chain::Ethereum,
+            "0x1111111111111111111111111111111111111111",
+        )
+        .unwrap();
+        let run_id = "same-provider-context";
+        let mut report = SingleReportPayload::default();
+        report.seed_contract.chain = seed.chain.to_string();
+        report.seed_contract.contract_address = seed.address.clone();
+        let attempt_id = "attempt-one";
+        for chain in Chain::ALL.into_iter().take(3) {
+            let fingerprint = analysis_fingerprint(run_id, &seed, chain);
+            write_scoped_seed_report(
+                directory.path(),
+                &seed,
+                chain,
+                &fingerprint,
+                attempt_id,
+                &report,
+            )
+            .unwrap();
+        }
+
+        let missing_one = seed_scopes_to_process(directory.path(), &seed, run_id);
+        assert_eq!(missing_one.len(), Chain::ALL.len());
+
+        let final_chain = Chain::ALL[3];
+        let fingerprint = analysis_fingerprint(run_id, &seed, final_chain);
+        write_scoped_seed_report(
+            directory.path(),
+            &seed,
+            final_chain,
+            &fingerprint,
+            attempt_id,
+            &report,
+        )
+        .unwrap();
+        assert_eq!(
+            seed_scopes_to_process(directory.path(), &seed, run_id).len(),
+            Chain::ALL.len()
+        );
+        write_seed_completion_marker(directory.path(), &seed, run_id, attempt_id).unwrap();
+        assert!(seed_scopes_to_process(directory.path(), &seed, run_id).is_empty());
+    }
+
+    #[test]
+    fn mixed_seed_attempts_cannot_publish_a_completion_marker() {
+        let directory = tempdir().unwrap();
+        let seed = ContractId::new(
+            Chain::Ethereum,
+            "0x1111111111111111111111111111111111111111",
+        )
+        .unwrap();
+        let run_id = "same-provider-context";
+        let mut report = SingleReportPayload::default();
+        report.seed_contract.chain = seed.chain.to_string();
+        report.seed_contract.contract_address = seed.address.clone();
+
+        for chain in Chain::ALL.into_iter().take(3) {
+            let fingerprint = analysis_fingerprint(run_id, &seed, chain);
+            write_scoped_seed_report(
+                directory.path(),
+                &seed,
+                chain,
+                &fingerprint,
+                "attempt-one",
+                &report,
+            )
+            .unwrap();
+        }
+        for chain in Chain::ALL.into_iter().skip(1) {
+            let fingerprint = analysis_fingerprint(run_id, &seed, chain);
+            write_scoped_seed_report(
+                directory.path(),
+                &seed,
+                chain,
+                &fingerprint,
+                "attempt-two",
+                &report,
+            )
+            .unwrap();
+        }
+
+        let error = write_seed_completion_marker(directory.path(), &seed, run_id, "attempt-two")
+            .unwrap_err();
+        assert!(error.to_string().contains("another attempt"), "{error}");
+        assert_eq!(
+            seed_scopes_to_process(directory.path(), &seed, run_id).len(),
+            Chain::ALL.len()
+        );
+    }
+
+    #[test]
+    fn atomic_json_write_durably_replaces_an_existing_file() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("report.json");
+        write_json_atomic(&path, br#"{"version":1}"#).unwrap();
+
+        write_json_atomic(&path, br#"{"version":2}"#).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), br#"{"version":2}"#);
+        assert!(!directory.path().read_dir().unwrap().any(|entry| entry
+            .unwrap()
+            .path()
+            .extension()
+            == Some("tmp".as_ref())));
     }
 }

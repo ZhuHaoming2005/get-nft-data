@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn load_snapshot_recalls_metadata_from_only_one_seed_example() {
+fn snapshot_identity_reads_generation_catalog_without_scanning_feature_rows() {
     let store = DuckDbFeatureStore::new(":memory:").unwrap();
     store
         .replace_chain_rows(
@@ -9,268 +9,183 @@ fn load_snapshot_recalls_metadata_from_only_one_seed_example() {
             &[DatabaseNftRecord {
                 contract_address: "0xcandidate".into(),
                 token_id: "1".into(),
-                metadata_json: r#"{"second_unique":"silver cat"}"#.into(),
                 ..Default::default()
             }],
         )
         .unwrap();
-    let seed_nfts = vec![
-        SeedNft {
-            contract_address: "0xseed".into(),
-            token_id: "1".into(),
-            metadata_json: r#"{"first_unique":"gold dragon"}"#.into(),
-            ..Default::default()
-        },
-        SeedNft {
-            contract_address: "0xseed".into(),
-            token_id: "2".into(),
-            metadata_json: r#"{"second_unique":"silver cat"}"#.into(),
-            ..Default::default()
-        },
-    ];
-
-    let snapshot = store
-        .load_snapshot("ethereum", &seed_nfts, 95.0, 0.6, 0, 0)
-        .unwrap();
-
-    assert!(snapshot.nft_rows.is_empty());
-}
-
-#[test]
-fn load_snapshot_marks_rows_that_were_recalled_by_metadata() {
-    let store = DuckDbFeatureStore::new(":memory:").unwrap();
-    store
-        .replace_chain_rows(
-            "ethereum",
-            &[
-                DatabaseNftRecord {
-                    contract_address: "0xmetadata".into(),
-                    token_id: "1".into(),
-                    metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                    ..Default::default()
-                },
-                DatabaseNftRecord {
-                    contract_address: "0ximage".into(),
-                    token_id: "1".into(),
-                    image_uri: "ipfs://seed-image.png".into(),
-                    ..Default::default()
-                },
-            ],
-        )
-        .unwrap();
-    let seed_nfts = vec![SeedNft {
-        contract_address: "0xseed".into(),
-        token_id: "1".into(),
-        image_uri: "ipfs://seed-image.png".into(),
-        metadata_json: r#"{"description":"gold dragon"}"#.into(),
-        ..Default::default()
-    }];
-
-    let snapshot = store
-        .load_snapshot("ethereum", &seed_nfts, 95.0, 0.6, 0, 0)
-        .unwrap();
-    let by_contract: BTreeMap<_, _> = snapshot
-        .nft_rows
-        .iter()
-        .map(|row| (row.contract_address.as_str(), row))
-        .collect();
-
-    assert!(by_contract["0xmetadata"].metadata_recall_checked);
-    assert!(by_contract["0xmetadata"].metadata_recall_match);
-    assert!(by_contract["0ximage"].metadata_recall_checked);
-    assert!(!by_contract["0ximage"].metadata_recall_match);
-}
-
-#[test]
-fn load_snapshot_uses_max_recall_rows_as_batch_size_not_total_limit() {
-    let store = DuckDbFeatureStore::new(":memory:").unwrap();
-    store
-        .replace_chain_rows(
-            "ethereum",
-            &[
-                DatabaseNftRecord {
-                    contract_address: "0xcandidate_a".into(),
-                    token_id: "1".into(),
-                    token_uri: "ipfs://shared/1".into(),
-                    ..Default::default()
-                },
-                DatabaseNftRecord {
-                    contract_address: "0xcandidate_b".into(),
-                    token_id: "1".into(),
-                    token_uri: "ipfs://shared/1".into(),
-                    ..Default::default()
-                },
-            ],
-        )
-        .unwrap();
-    let seed_nfts = vec![SeedNft {
-        contract_address: "0xseed".into(),
-        token_id: "1".into(),
-        token_uri: "ipfs://shared/1".into(),
-        ..Default::default()
-    }];
-
-    let snapshot = store
-        .load_snapshot("ethereum", &seed_nfts, 95.0, 0.6, 0, 1)
-        .unwrap();
-    let contracts: Vec<_> = snapshot
-        .nft_rows
-        .iter()
-        .map(|row| row.contract_address.as_str())
-        .collect();
-
-    assert_eq!(contracts, vec!["0xcandidate_a", "0xcandidate_b"]);
-}
-
-#[test]
-fn duplicate_contract_row_uses_precomputed_name_pair_uniqueness() {
-    let record = DatabaseNftRecord {
-        contract_address: "0xcandidate".into(),
-        token_id: "1".into(),
-        ..Default::default()
-    };
-    let mut rows_by_contract = HashMap::new();
-
-    update_duplicate_contract_row(
-        &mut rows_by_contract,
-        &record,
-        false,
-        false,
-        "azuki",
-        true,
-        false,
-    );
-    update_duplicate_contract_row(
-        &mut rows_by_contract,
-        &record,
-        false,
-        false,
-        "azuki",
-        false,
-        false,
-    );
-
-    assert_eq!(
-        rows_by_contract["0xcandidate"].name_norms,
-        vec!["azuki".to_string()]
-    );
-}
-
-#[test]
-fn load_snapshot_recalls_metadata_without_persistent_keyword_index() {
-    let store = DuckDbFeatureStore::new(":memory:").unwrap();
-    store
-        .replace_chain_rows(
-            "ethereum",
-            &[DatabaseNftRecord {
-                contract_address: "0xcandidate".into(),
-                token_id: "1".into(),
-                metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                ..Default::default()
-            }],
-        )
-        .unwrap();
-
     let conn = store.conn().unwrap();
-    let has_persistent_index = conn
-        .query_row(
-            "
-                SELECT EXISTS(
-                    SELECT 1
-                    FROM information_schema.tables
-                    WHERE table_name = 'metadata_keyword_index'
-                )
-                ",
-            [],
-            |row| row.get::<_, bool>(0),
-        )
+    conn.execute_batch("ALTER TABLE nft_features RENAME TO hidden_nft_features")
         .unwrap();
     drop(conn);
-    let snapshot = store
-        .load_snapshot(
-            "ethereum",
-            &[SeedNft {
-                contract_address: "0xseed".into(),
-                token_id: "1".into(),
-                metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                ..Default::default()
-            }],
-            95.0,
-            0.6,
-            0,
-            0,
-        )
-        .unwrap();
 
-    assert!(!has_persistent_index);
-    assert_eq!(snapshot.duplicate_contract_rows.len(), 1);
-    assert!(snapshot.contract_signals["0xcandidate"].keyword_match);
+    let identity = store.snapshot_identity("ethereum").unwrap();
+
+    assert!(!identity.is_empty());
 }
 
 #[test]
-fn opening_existing_feature_db_does_not_backfill_persistent_metadata_keyword_index() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("features.duckdb");
-    {
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-                "
-                CREATE TABLE nft_features (
-                    chain VARCHAR NOT NULL,
-                    contract_address VARCHAR NOT NULL,
-                    token_id VARCHAR NOT NULL,
-                    token_uri VARCHAR,
-                    image_uri VARCHAR,
-                    name VARCHAR,
-                    symbol VARCHAR,
-                    metadata_json VARCHAR,
-                    token_uri_norm VARCHAR,
-                    image_uri_norm VARCHAR,
-                    name_norm VARCHAR
-                );
-                INSERT INTO nft_features VALUES (
-                    'ethereum', '0xcandidate', '1', '', '', '', '', '{\"description\":\"gold dragon\"}',
-                    '', '', ''
-                );
-                ",
+fn chain_totals_read_generation_catalog_without_scanning_feature_rows() {
+    let store = DuckDbFeatureStore::new(":memory:").unwrap();
+    store
+        .replace_chain_rows(
+            "ethereum",
+            &[DatabaseNftRecord {
+                contract_address: "0xcandidate".into(),
+                token_id: "1".into(),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+    let conn = store.conn().unwrap();
+    conn.execute_batch("ALTER TABLE nft_features RENAME TO hidden_nft_features")
+        .unwrap();
+    drop(conn);
+
+    let totals = store.chain_totals("ethereum").unwrap();
+
+    assert_eq!(totals.total_nfts, 1);
+    assert_eq!(totals.total_contracts, 1);
+}
+
+#[test]
+fn prepared_readiness_reads_generation_catalog_without_scanning_feature_rows() {
+    let store = DuckDbFeatureStore::new(":memory:").unwrap();
+    store
+        .replace_chain_rows(
+            "ethereum",
+            &[DatabaseNftRecord {
+                contract_address: "0xcandidate".into(),
+                token_id: "1".into(),
+                token_uri: "ipfs://candidate/1".into(),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+    let conn = store.conn().unwrap();
+    conn.execute_batch("ALTER TABLE nft_features RENAME TO hidden_nft_features")
+        .unwrap();
+    drop(conn);
+
+    store
+        .require_prepared_for_chains(&[crate::models::Chain::Ethereum])
+        .unwrap();
+}
+
+#[test]
+fn prepared_readiness_rejects_every_version_identity_mismatch() {
+    let store = DuckDbFeatureStore::new(":memory:").unwrap();
+    store
+        .replace_chain_rows(
+            "ethereum",
+            &[DatabaseNftRecord {
+                contract_address: "0xcandidate".into(),
+                token_id: "1".into(),
+                token_uri: "ipfs://candidate/1".into(),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+    let versions = [
+        ("prepared_format_version", PREPARED_FORMAT_VERSION),
+        ("normalization_version", NORMALIZATION_VERSION),
+        ("recall_algorithm_version", RECALL_ALGORITHM_VERSION),
+        ("report_schema_version", REPORT_SCHEMA_VERSION),
+        ("build_fingerprint", BUILD_FINGERPRINT),
+    ];
+
+    for (column, current) in versions {
+        {
+            let conn = store.conn().unwrap();
+            conn.execute(
+                &format!(
+                    "UPDATE {PREPARED_RECALL_CHAIN_TABLE} SET {column} = 'stale' WHERE chain = 'ethereum'"
+                ),
+                [],
+            )
+            .unwrap();
+        }
+        let error = store
+            .require_prepared_for_chains(&[crate::models::Chain::Ethereum])
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("prepare-features"),
+            "{column}: {error}"
+        );
+        store
+            .conn()
+            .unwrap()
+            .execute(
+                &format!(
+                    "UPDATE {PREPARED_RECALL_CHAIN_TABLE} SET {column} = ? WHERE chain = 'ethereum'"
+                ),
+                params![current],
             )
             .unwrap();
     }
+}
 
-    let store = DuckDbFeatureStore::new(&db_path.to_string_lossy()).unwrap();
-    let conn = store.conn().unwrap();
-    let has_persistent_index = conn
-        .query_row(
-            "
-                SELECT EXISTS(
-                    SELECT 1
-                    FROM information_schema.tables
-                    WHERE table_name = 'metadata_keyword_index'
-                )
-                ",
+#[test]
+fn authoritative_prepared_readiness_requires_the_global_ready_phase() {
+    let (_dir, store, chains) = prepared_authoritative_store();
+    for phase in [
+        "fingerprinted",
+        "imported",
+        "prepared:ethereum",
+        "indexes_built",
+    ] {
+        store
+            .conn()
+            .unwrap()
+            .execute(
+                &format!("UPDATE {PREPARE_JOURNAL_TABLE} SET phase = ? WHERE journal_id = 1"),
+                params![phase],
+            )
+            .unwrap();
+        let error = store.require_prepared_for_chains(&chains).unwrap_err();
+        assert!(error.to_string().contains("ready"), "{phase}: {error}");
+    }
+    store
+        .conn()
+        .unwrap()
+        .execute(
+            &format!("UPDATE {PREPARE_JOURNAL_TABLE} SET phase = 'ready' WHERE journal_id = 1"),
             [],
-            |row| row.get::<_, bool>(0),
+        )
+        .unwrap();
+    store.require_prepared_for_chains(&chains).unwrap();
+}
+
+#[test]
+fn resume_from_indexes_built_preserves_or_rebuilds_both_global_indexes() {
+    let (_dir, store, chains) = prepared_authoritative_store();
+    store
+        .conn()
+        .unwrap()
+        .execute(
+            &format!(
+                "UPDATE {PREPARE_JOURNAL_TABLE} SET phase = 'indexes_built' WHERE journal_id = 1"
+            ),
+            [],
+        )
+        .unwrap();
+
+    store.prepare_recall_for_chains(&chains).unwrap();
+
+    let conn = store.conn().unwrap();
+    let index_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM duckdb_indexes()
+             WHERE index_name IN ('nft_uri_recall_posting_idx', 'nft_contract_metadata_cursor_idx')",
+            [],
+            |row| row.get(0),
         )
         .unwrap();
     drop(conn);
-    let snapshot = store
-        .load_snapshot(
-            "ethereum",
-            &[SeedNft {
-                contract_address: "0xseed".into(),
-                token_id: "1".into(),
-                metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                ..Default::default()
-            }],
-            95.0,
-            0.6,
-            0,
-            0,
-        )
-        .unwrap();
-
-    assert!(!has_persistent_index);
-    assert_eq!(snapshot.duplicate_contract_rows.len(), 1);
+    assert_eq!(index_count, 2);
+    assert_eq!(
+        store.prepare_journal_phase().unwrap().as_deref(),
+        Some("ready")
+    );
 }
 
 #[test]
@@ -431,78 +346,6 @@ fn contract_representatives_use_one_grouped_arg_min_query() {
 }
 
 #[test]
-fn arrow_columns_preserve_utf8_integers_nulls_and_order() {
-    let conn = Connection::open_in_memory().unwrap();
-    let mut stmt = conn
-        .prepare(
-            "
-            SELECT * FROM (
-                VALUES
-                    (0::BIGINT, '金色 dragon'::VARCHAR),
-                    (1::BIGINT, NULL::VARCHAR)
-            ) rows(row_index, text_value)
-            ORDER BY row_index
-            ",
-        )
-        .unwrap();
-    let batches = stmt.query_arrow([]).unwrap().collect::<Vec<_>>();
-
-    let batch = &batches[0];
-    let indexes = arrow_i64_column(batch, 0, "row_index").unwrap();
-    let texts = arrow_string_column(batch, 1, "text_value").unwrap();
-    assert_eq!(indexes.value(0), 0);
-    assert_eq!(indexes.value(1), 1);
-    assert_eq!(texts.value(0), "金色 dragon");
-    assert!(duckdb::arrow::array::Array::is_null(texts, 1));
-}
-
-#[test]
-fn load_snapshot_reuses_and_invalidates_metadata_recall_index_cache() {
-    let store = DuckDbFeatureStore::new(":memory:").unwrap();
-    store
-        .replace_chain_rows(
-            "ethereum",
-            &[DatabaseNftRecord {
-                contract_address: "0xdup".into(),
-                token_id: "1".into(),
-                metadata_json: r#"{"description":"gold dragon"}"#.into(),
-                ..Default::default()
-            }],
-        )
-        .unwrap();
-    let seed = vec![SeedNft {
-        chain: "ethereum".into(),
-        contract_address: "0xseed".into(),
-        token_id: "1".into(),
-        metadata_json: r#"{"description":"gold dragon"}"#.into(),
-        ..Default::default()
-    }];
-
-    assert_eq!(store.metadata_recall_index_cache_len(), 0);
-    store
-        .load_snapshot("ethereum", &seed, 101.0, 0.6, 0, 0)
-        .unwrap();
-    assert_eq!(store.metadata_recall_index_cache_len(), 1);
-    store
-        .load_snapshot("ethereum", &seed, 101.0, 0.6, 0, 0)
-        .unwrap();
-    assert_eq!(store.metadata_recall_index_cache_len(), 1);
-
-    store
-        .replace_chain_rows(
-            "ethereum",
-            &[DatabaseNftRecord {
-                contract_address: "0xother".into(),
-                token_id: "1".into(),
-                metadata_json: r#"{"description":"silver cat"}"#.into(),
-                ..Default::default()
-            }],
-        )
-        .unwrap();
-    assert_eq!(store.metadata_recall_index_cache_len(), 0);
-}
-
-#[test]
 fn replace_chain_rows_populates_prepared_recall_tables() {
     let store = DuckDbFeatureStore::new(":memory:").unwrap();
     store
@@ -534,7 +377,7 @@ fn replace_chain_rows_populates_prepared_recall_tables() {
     let conn = store.conn().unwrap();
     let recall_count: i64 = conn
         .query_row(
-            "SELECT count(*) FROM nft_feature_recall_rows WHERE chain = 'ethereum'",
+            "SELECT count(*) FROM nft_uri_recall_postings WHERE chain = 'ethereum'",
             [],
             |row| row.get(0),
         )
@@ -543,8 +386,9 @@ fn replace_chain_rows_populates_prepared_recall_tables() {
         .query_row(
             "
                 SELECT token_id, recall_doc
-                FROM nft_metadata_recall_docs
-                WHERE chain = 'ethereum'
+                FROM nft_metadata_recall_docs d
+                JOIN nft_features f ON f.rowid = d.feature_rowid
+                WHERE d.chain = 'ethereum'
                 ",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -558,7 +402,7 @@ fn replace_chain_rows_populates_prepared_recall_tables() {
         )
         .unwrap();
 
-    assert_eq!(recall_count, 2);
+    assert_eq!(recall_count, 4);
     assert_eq!(token_id, "1");
     assert_eq!(recall_doc, "description gold dragon");
     assert!(prepared);
@@ -616,7 +460,7 @@ fn load_snapshot_backfills_prepared_recall_tables_for_existing_writable_db() {
         .unwrap();
     let recall_count: i64 = conn
         .query_row(
-            "SELECT count(*) FROM nft_feature_recall_rows WHERE chain = 'ethereum'",
+            "SELECT count(*) FROM nft_uri_recall_postings WHERE chain = 'ethereum'",
             [],
             |row| row.get(0),
         )
@@ -655,6 +499,7 @@ fn load_snapshot_refreshes_stale_prepared_recall_tables() {
             params![normalize_url("ipfs://shared/1")],
         )
         .unwrap();
+        DuckDbFeatureStore::record_feature_generation(&conn, "ethereum").unwrap();
     }
 
     let seed_nfts = vec![SeedNft {
@@ -713,6 +558,7 @@ fn load_snapshot_invalidates_cached_metadata_index_when_prepared_tables_refresh(
             [],
         )
         .unwrap();
+        DuckDbFeatureStore::record_feature_generation(&conn, "ethereum").unwrap();
     }
 
     let snapshot = store
@@ -771,172 +617,4 @@ fn opening_writable_feature_db_drops_obsolete_metadata_columns() {
     assert!(!columns.contains("name_prefix8"));
     assert!(!columns.contains("metadata_keywords_arr"));
     assert_eq!(row_count, 1);
-}
-
-#[test]
-fn feature_store_configures_bulk_import_checkpoint_limits() {
-    let store = DuckDbFeatureStore::new(":memory:").unwrap();
-    let conn = store.conn().unwrap();
-    let checkpoint_threshold: String = conn
-        .query_row(
-            "SELECT current_setting('checkpoint_threshold')",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let skip_wal_threshold: u64 = conn
-        .query_row(
-            "SELECT current_setting('auto_checkpoint_skip_wal_threshold')",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let write_buffer_row_group_count: u64 = conn
-        .query_row(
-            "SELECT current_setting('write_buffer_row_group_count')",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-
-    assert!(checkpoint_threshold.contains("GiB"));
-    assert_eq!(skip_wal_threshold, BULK_IMPORT_SKIP_WAL_THRESHOLD_BYTES);
-    assert_eq!(write_buffer_row_group_count, 1);
-}
-
-#[test]
-fn metadata_source_bucket_hit_estimate_deduplicates_candidates() {
-    let seed = MetadataSketch {
-        simhash: 0,
-        anchors: vec!["gold".into()],
-    };
-    let source_index = MetadataSourceIndex {
-        anchor_indices: HashMap::from([("gold".to_string(), vec![0, 1, 1])]),
-        simhash_band_indices: vec![vec![0, 1]; METADATA_SIMHASH_BAND_COUNT],
-    };
-
-    assert_eq!(
-        DuckDbFeatureStore::estimate_metadata_source_bucket_hits(
-            &seed,
-            &source_index,
-            METADATA_SKETCH_SOURCE_HAMMING_THRESHOLD,
-            2,
-        ),
-        2
-    );
-}
-
-#[test]
-fn metadata_sketch_keeps_more_low_frequency_anchor_terms_for_prefilter_recall() {
-    let doc = MetadataBm25Document::from_text(
-        "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa",
-    )
-    .unwrap();
-    let doc_freqs = doc
-        .tokens()
-        .iter()
-        .map(|token| (token.clone(), 1usize))
-        .collect::<HashMap<_, _>>();
-
-    let sketch = metadata_sketch_from_document(&doc, 100, &doc_freqs);
-
-    assert_eq!(sketch.anchors.len(), 16);
-}
-
-#[test]
-fn metadata_sketch_source_match_allows_wider_simhash_prefilter_window() {
-    let seed = MetadataSketch {
-        simhash: u64::MAX,
-        anchors: vec![],
-    };
-    let candidate = MetadataSketch {
-        simhash: u64::MAX ^ ((1u64 << 32) - 1),
-        anchors: vec![],
-    };
-
-    assert!(metadata_sketch_source_match(
-        &seed,
-        &candidate,
-        METADATA_SKETCH_SOURCE_HAMMING_THRESHOLD
-    ));
-}
-
-#[test]
-fn compact_corpus_metadata_sketch_matches_string_doc_frequency_reference() {
-    let documents = [
-        MetadataBm25Document::from_text("gold dragon rare").unwrap(),
-        MetadataBm25Document::from_text("gold cat").unwrap(),
-        MetadataBm25Document::from_text("silver bird").unwrap(),
-    ];
-    let mut builder = CompactMetadataBm25CorpusBuilder::default();
-    let mut doc_freqs = HashMap::new();
-    for document in &documents {
-        builder.add_tokens(document.tokens());
-        for token in document.tokens().iter().collect::<HashSet<_>>() {
-            *doc_freqs.entry((*token).clone()).or_insert(0) += 1;
-        }
-    }
-    let corpus = builder.finish();
-
-    for document in &documents {
-        let reference = metadata_sketch_from_document(document, documents.len(), &doc_freqs);
-        let compact = metadata_sketch_from_compact_corpus(document, &corpus);
-        assert_eq!(compact.simhash, reference.simhash);
-        assert_eq!(compact.anchors, reference.anchors);
-    }
-}
-
-#[test]
-fn selected_recall_rowid_table_is_reusable_across_fetches() {
-    let store = DuckDbFeatureStore::new(":memory:").unwrap();
-    store
-        .replace_chain_rows(
-            "ethereum",
-            &[
-                DatabaseNftRecord {
-                    contract_address: "0xa".into(),
-                    token_id: "1".into(),
-                    ..Default::default()
-                },
-                DatabaseNftRecord {
-                    contract_address: "0xb".into(),
-                    token_id: "2".into(),
-                    ..Default::default()
-                },
-            ],
-        )
-        .unwrap();
-    let conn = store.conn().unwrap();
-    DuckDbFeatureStore::create_selected_recall_rowid_table(&conn).unwrap();
-
-    let first = DuckDbFeatureStore::fetch_records_by_feature_rowid(&conn, &[0]).unwrap();
-    let second = DuckDbFeatureStore::fetch_records_by_feature_rowid(&conn, &[1]).unwrap();
-    let table_still_exists =
-        DuckDbFeatureStore::table_exists(&conn, SELECTED_RECALL_ROWID_TABLE).unwrap();
-    DuckDbFeatureStore::drop_seed_temp_tables(&conn).unwrap();
-
-    assert_eq!(first[&0].contract_address, "0xa");
-    assert_eq!(second[&1].contract_address, "0xb");
-    assert!(table_still_exists);
-}
-
-#[test]
-fn selected_recall_rowid_table_deduplicates_bulk_rowids() {
-    let store = DuckDbFeatureStore::new(":memory:").unwrap();
-    let conn = store.conn().unwrap();
-    DuckDbFeatureStore::create_selected_recall_rowid_table(&conn).unwrap();
-
-    DuckDbFeatureStore::replace_selected_recall_rowids(&conn, &[3, 1, 3, 2, 1]).unwrap();
-    let rowids = conn
-        .prepare(&format!(
-            "SELECT feature_rowid FROM {SELECTED_RECALL_ROWID_TABLE} ORDER BY feature_rowid"
-        ))
-        .unwrap()
-        .query_map([], |row| row.get::<_, i64>(0))
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    DuckDbFeatureStore::drop_seed_temp_tables(&conn).unwrap();
-
-    assert_eq!(rowids, vec![1, 2, 3]);
 }
