@@ -292,6 +292,7 @@ impl CompactMetadataScoring {
             .map(|position| self.query_frequencies.posting(index)[position])
     }
 
+    #[cfg(test)]
     pub(super) fn score(&self, query: usize, right: usize) -> f64 {
         let query_tokens = self.query_tokens.posting(query);
         let query_frequencies = self.query_frequencies.posting(query);
@@ -315,6 +316,44 @@ impl CompactMetadataScoring {
             }
         }
         (score / f64_slice(&self.query_denominators)[query]).clamp(0.0, 1.0)
+    }
+
+    /// Compute both directional normalized BM25 scores with one merge of the
+    /// compact sorted term arrays. This preserves the accumulation order of
+    /// two independent `score` calls while avoiding a second token walk for
+    /// the overwhelmingly common bidirectional rejection path.
+    pub(super) fn score_bidirectional(&self, left: usize, right: usize) -> (f64, f64) {
+        let left_tokens = self.query_tokens.posting(left);
+        let left_frequencies = self.query_frequencies.posting(left);
+        let left_weights = self.prepared_weights.posting(left);
+        let right_tokens = self.query_tokens.posting(right);
+        let right_frequencies = self.query_frequencies.posting(right);
+        let right_weights = self.prepared_weights.posting(right);
+        if left_tokens.is_empty() || right_tokens.is_empty() {
+            return (0.0, 0.0);
+        }
+
+        let mut left_score = 0.0;
+        let mut right_score = 0.0;
+        let mut left_index = 0;
+        let mut right_index = 0;
+        while left_index < left_tokens.len() && right_index < right_tokens.len() {
+            match left_tokens[left_index].cmp(&right_tokens[right_index]) {
+                std::cmp::Ordering::Equal => {
+                    left_score += left_frequencies[left_index] as f64 * right_weights[right_index];
+                    right_score += right_frequencies[right_index] as f64 * left_weights[left_index];
+                    left_index += 1;
+                    right_index += 1;
+                }
+                std::cmp::Ordering::Less => left_index += 1,
+                std::cmp::Ordering::Greater => right_index += 1,
+            }
+        }
+        let denominators = f64_slice(&self.query_denominators);
+        (
+            (left_score / denominators[left]).clamp(0.0, 1.0),
+            (right_score / denominators[right]).clamp(0.0, 1.0),
+        )
     }
 
     pub(super) fn persist_and_remap(self, directory: &Path) -> io::Result<Self> {

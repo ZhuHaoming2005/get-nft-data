@@ -5,7 +5,9 @@ use std::sync::Arc;
 use duckdb::Connection;
 use rayon::prelude::*;
 
-use super::super::{arrow_i64_column, arrow_string_column, AnalysisError};
+use super::super::{
+    arrow_i64_column, arrow_string_column, AnalysisError, ProgressCounters, ProgressTracker,
+};
 use super::bm25::MetadataBm25Document;
 use super::parse::{
     metadata_documents_from_json, metadata_is_dedup_eligible, MAX_METADATA_BYTES_FOR_DEDUP,
@@ -414,12 +416,77 @@ fn reused_metadata_document_payload_bytes(
         .saturating_add(content_bytes)
 }
 
+pub(super) fn reused_metadata_load_row_transient_bytes(raw: &str) -> usize {
+    let fixed_bytes = std::mem::size_of::<String>()
+        .saturating_add(std::mem::size_of::<(String, ReusedMetadataDocument)>());
+    metadata_uncached_parse_transient_bytes(raw.len(), fixed_bytes)
+}
+
+fn parse_reused_metadata_documents(
+    raw_documents: Vec<String>,
+    pool: &rayon::ThreadPool,
+) -> Vec<(String, ReusedMetadataDocument)> {
+    pool.install(|| {
+        raw_documents
+            .into_par_iter()
+            .map(|raw| {
+                let documents = metadata_documents_from_json(&raw);
+                let prefilter =
+                    MetadataBm25Document::from_normalized_text(&documents.prefilter).map(Arc::new);
+                let content =
+                    MetadataBm25Document::from_normalized_text(&documents.content).map(Arc::new);
+                let cached = ReusedMetadataDocument {
+                    prefilter,
+                    content,
+                    doc_key: metadata_document_key(&documents.prefilter),
+                };
+                (raw, cached)
+            })
+            .collect()
+    })
+}
+
+fn append_reused_metadata_documents(
+    documents: &mut ReusedMetadataDocuments,
+    retained_payload_bytes: &mut usize,
+    parsed: Vec<(String, ReusedMetadataDocument)>,
+    maximum_cache_bytes: Option<usize>,
+) -> Result<bool, AnalysisError> {
+    for (raw, cached) in parsed {
+        let candidate_payload_bytes =
+            reused_metadata_document_payload_bytes(raw.capacity(), &cached);
+        if let Some(maximum) = maximum_cache_bytes {
+            documents.try_reserve(1).map_err(|_| {
+                AnalysisError::InvalidData(
+                    "unable to reserve bounded reused metadata cache".to_string(),
+                )
+            })?;
+            let projected_bytes = hash_table_allocation_bytes(
+                documents.capacity(),
+                std::mem::size_of::<(String, ReusedMetadataDocument)>(),
+            )
+            .saturating_add(*retained_payload_bytes)
+            .saturating_add(candidate_payload_bytes);
+            if projected_bytes > maximum {
+                documents.shrink_to_fit();
+                return Ok(false);
+            }
+        }
+        let previous = documents.insert(raw, cached);
+        debug_assert!(previous.is_none());
+        *retained_payload_bytes = retained_payload_bytes.saturating_add(candidate_payload_bytes);
+    }
+    Ok(true)
+}
+
 pub(super) fn load_reused_metadata_documents(
     conn: &Connection,
     pool: &rayon::ThreadPool,
-    max_raw_bytes: Option<usize>,
+    maximum_cache_bytes: Option<usize>,
+    maximum_transient_bytes: usize,
+    progress: Option<&ProgressTracker>,
 ) -> Result<ReusedMetadataDocuments, AnalysisError> {
-    if max_raw_bytes == Some(0) {
+    if maximum_cache_bytes == Some(0) || maximum_transient_bytes == 0 {
         return Ok(ReusedMetadataDocuments::new());
     }
     let mut stmt = conn.prepare(reused_metadata_documents_sql())?;
@@ -428,56 +495,47 @@ pub(super) fn load_reused_metadata_documents(
     // scalar. Recomputing it by walking the whole cache before every insert
     // makes loading N reused documents O(N^2).
     let mut retained_payload_bytes = 0usize;
+    let mut raw_documents = Vec::with_capacity(METADATA_LOAD_CHUNK_ROWS);
+    let mut chunk_transient_bytes = 0usize;
     for batch in stmt.query_arrow([])? {
         let metadata = arrow_string_column(&batch, 0, "metadata_json")?;
-        let mut raw_documents = Vec::with_capacity(batch.num_rows());
         for row_index in 0..batch.num_rows() {
-            raw_documents.push(metadata.value(row_index).to_owned());
-        }
-        let parsed = pool.install(|| {
-            raw_documents
-                .into_par_iter()
-                .map(|raw| {
-                    let documents = metadata_documents_from_json(&raw);
-                    let prefilter =
-                        MetadataBm25Document::from_normalized_text(&documents.prefilter)
-                            .map(Arc::new);
-                    let content = MetadataBm25Document::from_normalized_text(&documents.content)
-                        .map(Arc::new);
-                    let cached = ReusedMetadataDocument {
-                        prefilter,
-                        content,
-                        doc_key: metadata_document_key(&documents.prefilter),
-                    };
-                    (raw, cached)
-                })
-                .collect::<Vec<_>>()
-        });
-        for (raw, cached) in parsed {
-            let candidate_payload_bytes =
-                reused_metadata_document_payload_bytes(raw.capacity(), &cached);
-            if let Some(maximum) = max_raw_bytes {
-                documents.try_reserve(1).map_err(|_| {
-                    AnalysisError::InvalidData(
-                        "unable to reserve bounded reused metadata cache".to_string(),
-                    )
-                })?;
-                let projected_bytes = hash_table_allocation_bytes(
-                    documents.capacity(),
-                    std::mem::size_of::<(String, ReusedMetadataDocument)>(),
-                )
-                .saturating_add(retained_payload_bytes)
-                .saturating_add(candidate_payload_bytes);
-                if projected_bytes > maximum {
-                    documents.shrink_to_fit();
+            let raw = metadata.value(row_index);
+            let row_transient_bytes = reused_metadata_load_row_transient_bytes(raw);
+            if row_transient_bytes > maximum_transient_bytes {
+                continue;
+            }
+            if !raw_documents.is_empty()
+                && (raw_documents.len() >= METADATA_LOAD_CHUNK_ROWS
+                    || chunk_transient_bytes.saturating_add(row_transient_bytes)
+                        > maximum_transient_bytes)
+            {
+                let parsed =
+                    parse_reused_metadata_documents(std::mem::take(&mut raw_documents), pool);
+                chunk_transient_bytes = 0;
+                if !append_reused_metadata_documents(
+                    &mut documents,
+                    &mut retained_payload_bytes,
+                    parsed,
+                    maximum_cache_bytes,
+                )? {
                     return Ok(documents);
                 }
             }
-            let previous = documents.insert(raw, cached);
-            debug_assert!(previous.is_none());
-            retained_payload_bytes = retained_payload_bytes.saturating_add(candidate_payload_bytes);
+            raw_documents.push(raw.to_owned());
+            chunk_transient_bytes = chunk_transient_bytes.saturating_add(row_transient_bytes);
+        }
+        if let Some(progress) = progress {
+            progress.advance_task(batch.num_rows() as u64, ProgressCounters::default());
         }
     }
+    let parsed = parse_reused_metadata_documents(raw_documents, pool);
+    append_reused_metadata_documents(
+        &mut documents,
+        &mut retained_payload_bytes,
+        parsed,
+        maximum_cache_bytes,
+    )?;
     Ok(documents)
 }
 
@@ -487,6 +545,7 @@ pub(super) fn load_metadata_data(
     pool: &rayon::ThreadPool,
     reused_documents: ReusedMetadataDocuments,
     budgets: MetadataLoadBudgets,
+    progress: Option<&ProgressTracker>,
 ) -> Result<MetadataData, AnalysisError> {
     let chain_indexes = chains
         .iter()
@@ -541,6 +600,9 @@ pub(super) fn load_metadata_data(
                     ));
                 }
             }
+        }
+        if let Some(progress) = progress {
+            progress.advance_task(batch.num_rows() as u64, ProgressCounters::default());
         }
     }
 
@@ -859,7 +921,7 @@ pub(super) fn metadata_contract_token_rows_sql() -> &'static str {
 
         CREATE TEMP TABLE metadata_retained_tokens AS
         SELECT token_id,
-               (row_number() OVER () - 1)::BIGINT AS token_index
+               (row_number() OVER (ORDER BY token_id) - 1)::BIGINT AS token_index
         FROM metadata_token_frequencies
         WHERE contract_frequency >= 2;
 
@@ -881,6 +943,7 @@ pub(super) fn load_metadata_contract_tokens(
     conn: &Connection,
     data: &MetadataData,
     pool: &rayon::ThreadPool,
+    progress: Option<&ProgressTracker>,
 ) -> Result<CompactContractTokens, AnalysisError> {
     let contract_count = data.contracts.len();
     // One u32 per compact contract serves first as the row count and then as
@@ -915,6 +978,9 @@ pub(super) fn load_metadata_contract_tokens(
                                 .to_string(),
                         )
                     })?;
+            }
+            if let Some(progress) = progress {
+                progress.advance_task(batch.num_rows() as u64, ProgressCounters::default());
             }
         }
     }
@@ -981,6 +1047,9 @@ pub(super) fn load_metadata_contract_tokens(
                         "one metadata contract has more than u32::MAX shared tokens".to_string(),
                     )
                 })?;
+            }
+            if let Some(progress) = progress {
+                progress.advance_task(batch.num_rows() as u64, ProgressCounters::default());
             }
         }
     }

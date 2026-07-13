@@ -4,7 +4,6 @@ use std::hash::BuildHasher;
 use std::path::Path;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-#[cfg(test)]
 use std::sync::Mutex;
 #[cfg(test)]
 use std::time::Duration;
@@ -36,8 +35,14 @@ use super::{MetadataDocPair, MetadataTemplateMatches, METADATA_PAIR_LEFT_CHUNK_S
 
 pub(super) const METADATA_RAW_GROUP_CHUNK_SIZE: usize = 1024;
 const METADATA_TOKEN_GROUP_BATCH_MULTIPLIER: usize = 4;
+const METADATA_PARALLEL_LEFT_WAVE_MULTIPLIER: usize = 2;
+pub(super) const METADATA_DENSE_INTERSECTION_MIN_SCAN_COST: usize = 4 * 1024;
+const METADATA_DENSE_INTERSECTION_MAX_COST_RATIO: usize = 8;
+const METADATA_TEMPLATE_COMPACTION_SAMPLE_SIZE: usize = 512;
+const METADATA_TEMPLATE_COMPACTION_MIN_DUPLICATE_DENOMINATOR: usize = 8;
 const NO_METADATA_ATOM: usize = usize::MAX;
-const METADATA_TEMPLATE_SCORE_CACHE_SLOTS: usize = 256;
+pub(super) const METADATA_TEMPLATE_SCORE_CACHE_SLOTS: usize = 256 * 1024;
+pub(super) const METADATA_TEMPLATE_SCORE_CACHE_WAYS: usize = 4;
 const METADATA_DIRECT_ATOM_GROUP_SIZE: usize = 2;
 
 pub(super) struct MetadataContentAtom {
@@ -58,9 +63,36 @@ pub(super) struct MetadataContentCandidateIndex {
     posting_atoms: Vec<MetadataDocIndex>,
 }
 
+struct MetadataSparseCandidatePostings {
+    token_ids: Vec<u32>,
+    posting_offsets: Vec<u64>,
+    posting_atoms: Vec<MetadataDocIndex>,
+}
+
 pub(super) struct MetadataTemplateCandidateIndex {
-    full_entries: Vec<(u32, MetadataDocIndex)>,
-    prefix_entries: Vec<(u32, MetadataDocIndex)>,
+    full: MetadataSparseCandidatePostings,
+    prefix: MetadataSparseCandidatePostings,
+}
+
+#[derive(Clone, Copy)]
+struct MetadataPostingRange {
+    start: usize,
+    end: usize,
+}
+
+#[derive(Default)]
+struct MetadataCandidatePostingPlan {
+    content: Vec<MetadataPostingRange>,
+    template_full: Vec<MetadataPostingRange>,
+    template_prefix: Vec<MetadataPostingRange>,
+}
+
+impl MetadataCandidatePostingPlan {
+    fn clear(&mut self) {
+        self.content.clear();
+        self.template_full.clear();
+        self.template_prefix.clear();
+    }
 }
 
 pub(super) enum MetadataLocalCandidateIndex {
@@ -76,6 +108,7 @@ pub(super) enum MetadataLocalCandidateIndex {
 pub(super) enum MetadataLocalCandidateBasis {
     Template,
     Content,
+    Intersection,
 }
 
 #[derive(Default)]
@@ -129,6 +162,11 @@ pub(super) struct MetadataCandidateScratch {
     pub(super) seen_generation: Vec<u16>,
     generation: u16,
     pub(super) candidates: Vec<MetadataDocIndex>,
+    secondary_seen_generation: Vec<u16>,
+    secondary_generation: u16,
+    secondary_candidates: Vec<MetadataDocIndex>,
+    posting_plan: MetadataCandidatePostingPlan,
+    raw_candidate_count: usize,
 }
 
 #[cfg(test)]
@@ -211,18 +249,35 @@ pub(super) struct MetadataUnionState {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct MetadataContentUnionStats {
     pub(super) atom_count: usize,
+    pub(super) raw_candidate_pairs: u64,
+    pub(super) dimension_rejected_pairs: u64,
     pub(super) candidate_pairs: u64,
+    pub(super) already_connected_pairs: u64,
     pub(super) scored_pairs: u64,
     pub(super) matched_pairs: u64,
     pub(super) template_candidate_pairs: u64,
     pub(super) template_scored_pairs: u64,
     pub(super) template_matched_pairs: u64,
+    pub(super) template_rejected_pairs: u64,
+    pub(super) template_cache_hits: u64,
+    pub(super) template_cache_misses: u64,
+    pub(super) template_batch_unique_pairs: u64,
+    pub(super) template_batch_reused_pairs: u64,
 }
 
 impl MetadataContentUnionStats {
     pub(super) fn accumulate(&mut self, other: Self) {
         self.atom_count = self.atom_count.saturating_add(other.atom_count);
+        self.raw_candidate_pairs = self
+            .raw_candidate_pairs
+            .saturating_add(other.raw_candidate_pairs);
+        self.dimension_rejected_pairs = self
+            .dimension_rejected_pairs
+            .saturating_add(other.dimension_rejected_pairs);
         self.candidate_pairs = self.candidate_pairs.saturating_add(other.candidate_pairs);
+        self.already_connected_pairs = self
+            .already_connected_pairs
+            .saturating_add(other.already_connected_pairs);
         self.scored_pairs = self.scored_pairs.saturating_add(other.scored_pairs);
         self.matched_pairs = self.matched_pairs.saturating_add(other.matched_pairs);
         self.template_candidate_pairs = self
@@ -234,9 +289,24 @@ impl MetadataContentUnionStats {
         self.template_matched_pairs = self
             .template_matched_pairs
             .saturating_add(other.template_matched_pairs);
+        self.template_rejected_pairs = self
+            .template_rejected_pairs
+            .saturating_add(other.template_rejected_pairs);
+        self.template_cache_hits = self
+            .template_cache_hits
+            .saturating_add(other.template_cache_hits);
+        self.template_cache_misses = self
+            .template_cache_misses
+            .saturating_add(other.template_cache_misses);
+        self.template_batch_unique_pairs = self
+            .template_batch_unique_pairs
+            .saturating_add(other.template_batch_unique_pairs);
+        self.template_batch_reused_pairs = self
+            .template_batch_reused_pairs
+            .saturating_add(other.template_batch_reused_pairs);
     }
 
-    fn accumulate_pair_scoring(&mut self, other: MetadataPairScoringStats) {
+    pub(super) fn accumulate_pair_scoring(&mut self, other: MetadataPairScoringStats) {
         self.scored_pairs = self.scored_pairs.saturating_add(other.content_scored_pairs);
         self.matched_pairs = self
             .matched_pairs
@@ -250,6 +320,50 @@ impl MetadataContentUnionStats {
         self.template_matched_pairs = self
             .template_matched_pairs
             .saturating_add(other.template_matched_pairs);
+        self.template_rejected_pairs = self
+            .template_rejected_pairs
+            .saturating_add(other.template_rejected_pairs);
+        self.template_cache_hits = self
+            .template_cache_hits
+            .saturating_add(other.template_cache_hits);
+        self.template_cache_misses = self
+            .template_cache_misses
+            .saturating_add(other.template_cache_misses);
+        self.template_batch_unique_pairs = self
+            .template_batch_unique_pairs
+            .saturating_add(other.template_batch_unique_pairs);
+        self.template_batch_reused_pairs = self
+            .template_batch_reused_pairs
+            .saturating_add(other.template_batch_reused_pairs);
+    }
+}
+
+pub(super) fn metadata_shared_token_group_progress_counters(
+    completed_groups: u64,
+    base: ProgressCounters,
+    live: &MetadataContentUnionStats,
+) -> ProgressCounters {
+    ProgressCounters {
+        groups: completed_groups,
+        candidates: base.candidates.saturating_add(live.candidate_pairs),
+        scored: base.scored.saturating_add(live.scored_pairs),
+        matched: base.matched.saturating_add(live.matched_pairs),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MetadataSharedTokenGroupProgress<'a> {
+    tracker: &'a ProgressTracker,
+    completed_groups: u64,
+    base: ProgressCounters,
+}
+
+impl MetadataSharedTokenGroupProgress<'_> {
+    fn update(self, live: &MetadataContentUnionStats) {
+        self.tracker.advance_task(
+            0,
+            metadata_shared_token_group_progress_counters(self.completed_groups, self.base, live),
+        );
     }
 }
 
@@ -262,10 +376,11 @@ impl<'a> MetadataTemplateCompatibility<'a> {
             Self::Scored(scoring) => {
                 let left = metadata_doc_index_to_usize(left);
                 let right = metadata_doc_index_to_usize(right);
-                if scoring.score(left, right) >= METADATA_THRESHOLD {
+                let (left_score, right_score) = scoring.score_bidirectional(left, right);
+                if left_score >= METADATA_THRESHOLD {
                     (true, 1)
                 } else {
-                    (scoring.score(right, left) >= METADATA_THRESHOLD, 2)
+                    (right_score >= METADATA_THRESHOLD, 2)
                 }
             }
             #[cfg(test)]
@@ -307,6 +422,7 @@ impl<'a> MetadataTemplateCompatibility<'a> {
 #[derive(Clone, Copy)]
 struct MetadataTemplateScoreCacheEntry {
     key: u64,
+    score_count: u8,
     matched: bool,
     valid: bool,
 }
@@ -314,30 +430,60 @@ struct MetadataTemplateScoreCacheEntry {
 impl MetadataTemplateScoreCacheEntry {
     const EMPTY: Self = Self {
         key: 0,
+        score_count: 0,
         matched: false,
         valid: false,
     };
 }
 
 pub(super) struct MetadataTemplateScoreCache {
-    entries: [MetadataTemplateScoreCacheEntry; METADATA_TEMPLATE_SCORE_CACHE_SLOTS],
+    entries: Box<[MetadataTemplateScoreCacheEntry]>,
+}
+
+#[derive(Default)]
+pub(super) struct MetadataTemplateScoreCachePool {
+    caches: Mutex<Vec<MetadataTemplateScoreCache>>,
+}
+
+struct MetadataTemplateScoreCacheLease<'a> {
+    pool: &'a MetadataTemplateScoreCachePool,
+    cache: Option<MetadataTemplateScoreCache>,
 }
 
 impl Default for MetadataTemplateScoreCache {
     fn default() -> Self {
         Self {
-            entries: [MetadataTemplateScoreCacheEntry::EMPTY; METADATA_TEMPLATE_SCORE_CACHE_SLOTS],
+            entries: vec![
+                MetadataTemplateScoreCacheEntry::EMPTY;
+                METADATA_TEMPLATE_SCORE_CACHE_SLOTS
+            ]
+            .into_boxed_slice(),
         }
     }
 }
 
 impl MetadataTemplateScoreCache {
-    fn slot(key: u64) -> usize {
+    pub(super) const fn memory_bytes() -> usize {
+        std::mem::size_of::<Self>().saturating_add(
+            METADATA_TEMPLATE_SCORE_CACHE_SLOTS
+                .saturating_mul(std::mem::size_of::<MetadataTemplateScoreCacheEntry>()),
+        )
+    }
+
+    fn mixed_key(key: u64) -> u64 {
+        key.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            .wrapping_add(key.rotate_right(29))
+    }
+
+    fn set_start(key: u64) -> usize {
         debug_assert!(METADATA_TEMPLATE_SCORE_CACHE_SLOTS.is_power_of_two());
-        let mixed = key
-            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
-            .wrapping_add(key.rotate_right(29));
-        mixed as usize & (METADATA_TEMPLATE_SCORE_CACHE_SLOTS - 1)
+        debug_assert!(METADATA_TEMPLATE_SCORE_CACHE_WAYS.is_power_of_two());
+        debug_assert_eq!(
+            METADATA_TEMPLATE_SCORE_CACHE_SLOTS % METADATA_TEMPLATE_SCORE_CACHE_WAYS,
+            0
+        );
+        let set_count = METADATA_TEMPLATE_SCORE_CACHE_SLOTS / METADATA_TEMPLATE_SCORE_CACHE_WAYS;
+        (Self::mixed_key(key) as usize & (set_count - 1)) * METADATA_TEMPLATE_SCORE_CACHE_WAYS
     }
 
     pub(super) fn evaluate(
@@ -345,9 +491,9 @@ impl MetadataTemplateScoreCache {
         left: MetadataDocIndex,
         right: MetadataDocIndex,
         compatibility: MetadataTemplateCompatibility<'_>,
-    ) -> (bool, u64) {
+    ) -> (bool, u64, bool) {
         if left == right {
-            return (true, 0);
+            return (true, 0, false);
         }
         let (left, right) = if left < right {
             (left, right)
@@ -355,18 +501,75 @@ impl MetadataTemplateScoreCache {
             (right, left)
         };
         let key = (u64::from(left) << 32) | u64::from(right);
-        let slot = Self::slot(key);
-        let cached = self.entries[slot];
-        if cached.valid && cached.key == key {
-            return (cached.matched, 0);
+        let set_start = Self::set_start(key);
+        let set_end = set_start + METADATA_TEMPLATE_SCORE_CACHE_WAYS;
+        for cached in &self.entries[set_start..set_end] {
+            if cached.valid && cached.key == key {
+                return (cached.matched, u64::from(cached.score_count), true);
+            }
         }
         let (matched, scores) = compatibility.evaluate(left, right);
+        let slot = self.entries[set_start..set_end]
+            .iter()
+            .position(|entry| !entry.valid)
+            .map(|offset| set_start + offset)
+            .unwrap_or_else(|| {
+                let mixed = Self::mixed_key(key);
+                set_start + ((mixed >> 32) as usize & (METADATA_TEMPLATE_SCORE_CACHE_WAYS - 1))
+            });
         self.entries[slot] = MetadataTemplateScoreCacheEntry {
             key,
+            score_count: scores as u8,
             matched,
             valid: true,
         };
-        (matched, scores)
+        (matched, scores, false)
+    }
+}
+
+impl MetadataTemplateScoreCachePool {
+    fn take(&self) -> MetadataTemplateScoreCacheLease<'_> {
+        let cache = self
+            .caches
+            .lock()
+            .expect("metadata template score cache pool lock poisoned")
+            .pop()
+            .unwrap_or_default();
+        MetadataTemplateScoreCacheLease {
+            pool: self,
+            cache: Some(cache),
+        }
+    }
+}
+
+impl std::ops::Deref for MetadataTemplateScoreCacheLease<'_> {
+    type Target = MetadataTemplateScoreCache;
+
+    fn deref(&self) -> &Self::Target {
+        self.cache
+            .as_ref()
+            .expect("metadata template score cache lease is empty")
+    }
+}
+
+impl std::ops::DerefMut for MetadataTemplateScoreCacheLease<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.cache
+            .as_mut()
+            .expect("metadata template score cache lease is empty")
+    }
+}
+
+impl Drop for MetadataTemplateScoreCacheLease<'_> {
+    fn drop(&mut self) {
+        let Some(cache) = self.cache.take() else {
+            return;
+        };
+        self.pool
+            .caches
+            .lock()
+            .expect("metadata template score cache pool lock poisoned")
+            .push(cache);
     }
 }
 
@@ -441,27 +644,53 @@ impl CompactMetadataContentGroupBuilder {
         if self.atoms.is_empty() {
             return 0;
         }
-        let candidate_entry_bytes = std::mem::size_of::<(u32, MetadataDocIndex)>();
+        let sparse_template_entry_upper_bytes = std::mem::size_of::<MetadataDocIndex>()
+            .saturating_add(std::mem::size_of::<u32>())
+            .saturating_add(std::mem::size_of::<u64>());
         let content_candidate_index =
             Self::vec_bytes_upper(self.term_count, std::mem::size_of::<MetadataDocIndex>())
                 .saturating_add(Self::vec_bytes_upper(
                     self.token_ids.len().saturating_add(1),
                     2usize.saturating_mul(std::mem::size_of::<u64>()),
                 ));
-        let template_candidate_index =
-            Self::vec_bytes_upper(self.template_candidate_term_count, candidate_entry_bytes)
-                .saturating_add(4usize.saturating_mul(candidate_entry_bytes));
+        let template_candidate_index = Self::vec_bytes_upper(
+            self.template_candidate_term_count,
+            sparse_template_entry_upper_bytes,
+        )
+        .saturating_add(4usize.saturating_mul(sparse_template_entry_upper_bytes));
+        let template_candidate_flat_build = Self::vec_bytes_upper(
+            self.template_candidate_term_count,
+            std::mem::size_of::<(u32, MetadataDocIndex)>(),
+        );
         let uses_adaptive_index = self.atoms.len() > METADATA_DIRECT_ATOM_GROUP_SIZE;
         let candidate_index = if uses_adaptive_index {
-            content_candidate_index.saturating_add(template_candidate_index)
+            content_candidate_index
+                .saturating_add(template_candidate_index)
+                .saturating_add(template_candidate_flat_build)
         } else {
             0
         };
         let candidate_scratch = if uses_adaptive_index {
-            self.atoms.len().saturating_mul(
-                std::mem::size_of::<u16>()
-                    .saturating_add(2 * std::mem::size_of::<MetadataDocIndex>()),
-            )
+            self.atoms
+                .len()
+                .saturating_mul(
+                    2usize
+                        .saturating_mul(std::mem::size_of::<u16>())
+                        .saturating_add(3 * std::mem::size_of::<MetadataDocIndex>()),
+                )
+                .saturating_mul(scoring_workers.max(1))
+        } else {
+            0
+        };
+        // Each parallel wave retains its filtered right-hand candidates until
+        // the serial DSU consumer applies them in original left-atom order.
+        // This deliberately spends bounded memory to parallelize the dominant
+        // posting scans without changing union or scoring order.
+        let candidate_wave = if uses_adaptive_index {
+            Self::vec_bytes_upper(self.atoms.len(), std::mem::size_of::<MetadataDocIndex>())
+                .saturating_mul(scoring_workers.max(1))
+                .saturating_mul(METADATA_PARALLEL_LEFT_WAVE_MULTIPLIER)
+                .saturating_mul(2)
         } else {
             0
         };
@@ -470,9 +699,14 @@ impl CompactMetadataContentGroupBuilder {
         } else {
             usize::from(self.atoms.len() == METADATA_DIRECT_ATOM_GROUP_SIZE)
         };
-        let pair_batches = pair_batch_capacity
+        let pair_batch_bytes = 2usize
             .saturating_mul(std::mem::size_of::<(usize, MetadataDocIndex)>())
-            .saturating_mul(2);
+            .saturating_add(std::mem::size_of::<(u64, usize)>())
+            .saturating_add(std::mem::size_of::<u64>())
+            .saturating_add(
+                2usize.saturating_mul(std::mem::size_of::<MetadataTemplatePairEvaluation>()),
+            );
+        let pair_batches = pair_batch_capacity.saturating_mul(pair_batch_bytes);
         // A parallel fold and its reduce-side accumulator can coexist for
         // every worker, so reserve both fixed-size template caches.
         let template_cache_count = if uses_adaptive_index {
@@ -481,7 +715,7 @@ impl CompactMetadataContentGroupBuilder {
             pair_batch_capacity
         };
         let template_score_caches =
-            template_cache_count.saturating_mul(std::mem::size_of::<MetadataTemplateScoreCache>());
+            template_cache_count.saturating_mul(MetadataTemplateScoreCache::memory_bytes());
         let union_scratch = self.member_count.saturating_mul(
             2usize
                 .saturating_mul(std::mem::size_of::<usize>())
@@ -491,6 +725,7 @@ impl CompactMetadataContentGroupBuilder {
             .atomized_memory_bytes()
             .saturating_add(candidate_index)
             .saturating_add(candidate_scratch)
+            .saturating_add(candidate_wave)
             .saturating_add(pair_batches)
             .saturating_add(template_score_caches)
             .saturating_add(union_scratch);
@@ -835,7 +1070,8 @@ impl MetadataRawTokenGroup {
         context: &MetadataContentUnionContext<'_>,
         state: &mut MetadataUnionState,
     ) -> MetadataContentUnionStats {
-        self.union_with_budget(context, state, usize::MAX)
+        let template_cache_pool = MetadataTemplateScoreCachePool::default();
+        self.union_with_budget(context, state, usize::MAX, &template_cache_pool, None)
             .expect("unbounded metadata test group must fit memory")
     }
 
@@ -844,6 +1080,8 @@ impl MetadataRawTokenGroup {
         context: &MetadataContentUnionContext<'_>,
         state: &mut MetadataUnionState,
         maximum_bytes: usize,
+        template_cache_pool: &MetadataTemplateScoreCachePool,
+        progress: Option<MetadataSharedTokenGroupProgress<'_>>,
     ) -> Result<MetadataContentUnionStats, AnalysisError> {
         if self.raw_record_count < 2 {
             return Ok(MetadataContentUnionStats::default());
@@ -857,7 +1095,12 @@ impl MetadataRawTokenGroup {
         )?;
         let (atoms, docs) = self.compact.into_atomized_parts();
         Ok(union_metadata_shared_token_atom_core(
-            atoms, &docs, context, state,
+            atoms,
+            &docs,
+            context,
+            state,
+            template_cache_pool,
+            progress,
         ))
     }
 
@@ -891,6 +1134,7 @@ fn prepare_metadata_token_group_batch(
     context: &MetadataContentUnionContext<'_>,
     state: &mut MetadataUnionState,
     maximum_working_bytes: usize,
+    template_cache_pool: &MetadataTemplateScoreCachePool,
 ) -> Result<MetadataContentUnionStats, AnalysisError> {
     if groups.len() > 1 {
         context.pool.install(|| {
@@ -914,7 +1158,13 @@ fn prepare_metadata_token_group_batch(
         remaining_prepared_bytes =
             remaining_prepared_bytes.saturating_sub(group.parallel_prepare_bytes());
         let group_working_bytes = maximum_working_bytes.saturating_sub(remaining_prepared_bytes);
-        stats.accumulate(group.union_with_budget(context, state, group_working_bytes)?);
+        stats.accumulate(group.union_with_budget(
+            context,
+            state,
+            group_working_bytes,
+            template_cache_pool,
+            None,
+        )?);
     }
     Ok(stats)
 }
@@ -988,41 +1238,63 @@ impl MetadataContentCandidateIndex {
         Self::from_atoms(docs, atoms)
     }
 
+    #[cfg(test)]
     pub(super) fn append_candidates_after(
         &self,
         record_index: usize,
         document: &CompactMetadataContentDocument,
         scratch: &mut MetadataCandidateScratch,
     ) {
+        let mut plan = MetadataCandidatePostingPlan::default();
+        self.plan_candidates_after(record_index, document, &mut plan);
+        self.append_planned_candidates(&plan, scratch);
+    }
+
+    fn plan_candidates_after(
+        &self,
+        record_index: usize,
+        document: &CompactMetadataContentDocument,
+        plan: &mut MetadataCandidatePostingPlan,
+    ) -> usize {
         let compact_record_index = metadata_doc_index_from_usize(record_index);
         for &(token_id, _) in &document.terms {
-            for &right in self.posting_after(token_id, compact_record_index) {
+            plan.content
+                .push(self.posting_range_after(token_id, compact_record_index));
+        }
+        plan.content.iter().fold(0usize, |cost, range| {
+            cost.saturating_add(range.end.saturating_sub(range.start))
+        })
+    }
+
+    fn append_planned_candidates(
+        &self,
+        plan: &MetadataCandidatePostingPlan,
+        scratch: &mut MetadataCandidateScratch,
+    ) {
+        for range in &plan.content {
+            for &right in &self.posting_atoms[range.start..range.end] {
                 scratch.push_once(right);
             }
         }
     }
 
-    fn scan_cost_after(
+    fn posting_range_after(
         &self,
-        record_index: usize,
-        document: &CompactMetadataContentDocument,
-    ) -> usize {
-        let compact_record_index = metadata_doc_index_from_usize(record_index);
-        document.terms.iter().fold(0usize, |cost, &(token_id, _)| {
-            cost.saturating_add(self.posting_after(token_id, compact_record_index).len())
-        })
-    }
-
-    fn posting_after(&self, token_id: u32, record_index: MetadataDocIndex) -> &[MetadataDocIndex] {
+        token_id: u32,
+        record_index: MetadataDocIndex,
+    ) -> MetadataPostingRange {
         let token_index = token_id as usize;
         if token_index + 1 >= self.posting_offsets.len() {
-            return &self.posting_atoms[..0];
+            return MetadataPostingRange { start: 0, end: 0 };
         }
         let posting_start = self.posting_offsets[token_index] as usize;
         let posting_end = self.posting_offsets[token_index + 1] as usize;
         let posting = &self.posting_atoms[posting_start..posting_end];
-        let start = posting.partition_point(|&right| right <= record_index);
-        &posting[start..]
+        let relative_start = posting.partition_point(|&right| right <= record_index);
+        MetadataPostingRange {
+            start: posting_start + relative_start,
+            end: posting_end,
+        }
     }
 
     #[cfg(test)]
@@ -1048,26 +1320,54 @@ impl MetadataContentCandidateIndex {
     }
 }
 
-fn flat_candidate_posting_after(
-    entries: &[(u32, MetadataDocIndex)],
-    token_id: u32,
-    record_index: MetadataDocIndex,
-) -> &[(u32, MetadataDocIndex)] {
-    let posting_start = entries.partition_point(|&(token, _)| token < token_id);
-    let posting_end = entries.partition_point(|&(token, _)| token <= token_id);
-    let posting = &entries[posting_start..posting_end];
-    let start = posting.partition_point(|&(_, right)| right <= record_index);
-    &posting[start..]
-}
+impl MetadataSparseCandidatePostings {
+    fn from_sorted_entries(entries: Vec<(u32, MetadataDocIndex)>) -> Self {
+        let mut token_ids = Vec::new();
+        let mut posting_offsets = Vec::new();
+        let mut posting_atoms = Vec::with_capacity(entries.len());
+        for (token_id, atom) in entries {
+            if token_ids.last().copied() != Some(token_id) {
+                token_ids.push(token_id);
+                posting_offsets.push(posting_atoms.len() as u64);
+            }
+            posting_atoms.push(atom);
+        }
+        posting_offsets.push(posting_atoms.len() as u64);
+        Self {
+            token_ids,
+            posting_offsets,
+            posting_atoms,
+        }
+    }
 
-fn append_flat_candidate_posting_after(
-    entries: &[(u32, MetadataDocIndex)],
-    token_id: u32,
-    record_index: MetadataDocIndex,
-    scratch: &mut MetadataCandidateScratch,
-) {
-    for &(_, right) in flat_candidate_posting_after(entries, token_id, record_index) {
-        scratch.push_once(right);
+    fn posting_range_after(
+        &self,
+        token_id: u32,
+        record_index: MetadataDocIndex,
+    ) -> MetadataPostingRange {
+        let Ok(token_index) = self.token_ids.binary_search(&token_id) else {
+            return MetadataPostingRange { start: 0, end: 0 };
+        };
+        let posting_start = self.posting_offsets[token_index] as usize;
+        let posting_end = self.posting_offsets[token_index + 1] as usize;
+        let posting = &self.posting_atoms[posting_start..posting_end];
+        let relative_start = posting.partition_point(|&right| right <= record_index);
+        MetadataPostingRange {
+            start: posting_start + relative_start,
+            end: posting_end,
+        }
+    }
+
+    fn append_planned_candidates(
+        &self,
+        ranges: &[MetadataPostingRange],
+        scratch: &mut MetadataCandidateScratch,
+    ) {
+        for range in ranges {
+            for &right in &self.posting_atoms[range.start..range.end] {
+                scratch.push_once(right);
+            }
+        }
     }
 }
 
@@ -1111,8 +1411,8 @@ impl MetadataTemplateCandidateIndex {
         full_entries.sort_unstable();
         prefix_entries.sort_unstable();
         Self {
-            full_entries,
-            prefix_entries,
+            full: MetadataSparseCandidatePostings::from_sorted_entries(full_entries),
+            prefix: MetadataSparseCandidatePostings::from_sorted_entries(prefix_entries),
         }
     }
 
@@ -1127,11 +1427,12 @@ impl MetadataTemplateCandidateIndex {
             || prefix_entries.par_sort_unstable(),
         );
         Self {
-            full_entries,
-            prefix_entries,
+            full: MetadataSparseCandidatePostings::from_sorted_entries(full_entries),
+            prefix: MetadataSparseCandidatePostings::from_sorted_entries(prefix_entries),
         }
     }
 
+    #[cfg(test)]
     pub(super) fn append_candidates_after(
         &self,
         atom_index: usize,
@@ -1139,53 +1440,45 @@ impl MetadataTemplateCandidateIndex {
         scoring: &CompactMetadataScoring,
         scratch: &mut MetadataCandidateScratch,
     ) {
-        let compact_atom_index = metadata_doc_index_from_usize(atom_index);
-        let template = metadata_doc_index_to_usize(atom.template_doc_index);
-        for &token in scoring.candidate_tokens(template) {
-            append_flat_candidate_posting_after(
-                &self.full_entries,
-                token,
-                compact_atom_index,
-                scratch,
-            );
-        }
-        for &token in scoring.query_tokens(template) {
-            append_flat_candidate_posting_after(
-                &self.prefix_entries,
-                token,
-                compact_atom_index,
-                scratch,
-            );
-        }
+        let mut plan = MetadataCandidatePostingPlan::default();
+        self.plan_candidates_after(atom_index, atom, scoring, &mut plan);
+        self.append_planned_candidates(&plan, scratch);
     }
 
-    fn scan_cost_after(
+    fn plan_candidates_after(
         &self,
         atom_index: usize,
         atom: &MetadataContentAtom,
         scoring: &CompactMetadataScoring,
+        plan: &mut MetadataCandidatePostingPlan,
     ) -> usize {
         let compact_atom_index = metadata_doc_index_from_usize(atom_index);
         let template = metadata_doc_index_to_usize(atom.template_doc_index);
-        let prefix_to_full =
-            scoring
-                .candidate_tokens(template)
-                .iter()
-                .fold(0usize, |cost, &token| {
-                    cost.saturating_add(
-                        flat_candidate_posting_after(&self.full_entries, token, compact_atom_index)
-                            .len(),
-                    )
-                });
-        scoring
-            .query_tokens(template)
+        for &token in scoring.candidate_tokens(template) {
+            plan.template_full
+                .push(self.full.posting_range_after(token, compact_atom_index));
+        }
+        for &token in scoring.query_tokens(template) {
+            plan.template_prefix
+                .push(self.prefix.posting_range_after(token, compact_atom_index));
+        }
+        plan.template_full
             .iter()
-            .fold(prefix_to_full, |cost, &token| {
-                cost.saturating_add(
-                    flat_candidate_posting_after(&self.prefix_entries, token, compact_atom_index)
-                        .len(),
-                )
+            .chain(&plan.template_prefix)
+            .fold(0usize, |cost, range| {
+                cost.saturating_add(range.end.saturating_sub(range.start))
             })
+    }
+
+    fn append_planned_candidates(
+        &self,
+        plan: &MetadataCandidatePostingPlan,
+        scratch: &mut MetadataCandidateScratch,
+    ) {
+        self.full
+            .append_planned_candidates(&plan.template_full, scratch);
+        self.prefix
+            .append_planned_candidates(&plan.template_prefix, scratch);
     }
 }
 
@@ -1236,19 +1529,46 @@ impl MetadataLocalCandidateIndex {
                 let scoring = compatibility
                     .scoring()
                     .expect("template candidate index requires scored compatibility");
-                let template_cost = template.scan_cost_after(atom_index, atom, scoring);
-                let content_cost = content.scan_cost_after(atom_index, document);
-                if content_cost < template_cost {
-                    content.append_candidates_after(atom_index, document, scratch);
+                let mut posting_plan = std::mem::take(&mut scratch.posting_plan);
+                posting_plan.clear();
+                let template_cost =
+                    template.plan_candidates_after(atom_index, atom, scoring, &mut posting_plan);
+                let content_cost =
+                    content.plan_candidates_after(atom_index, document, &mut posting_plan);
+                let minimum_cost = template_cost.min(content_cost);
+                let maximum_cost = template_cost.max(content_cost);
+                let basis = if minimum_cost >= METADATA_DENSE_INTERSECTION_MIN_SCAN_COST
+                    && maximum_cost
+                        <= minimum_cost.saturating_mul(METADATA_DENSE_INTERSECTION_MAX_COST_RATIO)
+                {
+                    if content_cost < template_cost {
+                        template.append_planned_candidates(&posting_plan, scratch);
+                        scratch.prepare_secondary_generation();
+                        content.append_planned_candidates(&posting_plan, scratch);
+                    } else {
+                        content.append_planned_candidates(&posting_plan, scratch);
+                        scratch.prepare_secondary_generation();
+                        template.append_planned_candidates(&posting_plan, scratch);
+                    }
+                    scratch.raw_candidate_count = scratch.candidates.len();
+                    scratch.retain_secondary_intersection();
+                    MetadataLocalCandidateBasis::Intersection
+                } else if content_cost < template_cost {
+                    content.append_planned_candidates(&posting_plan, scratch);
+                    scratch.raw_candidate_count = scratch.candidates.len();
                     MetadataLocalCandidateBasis::Content
                 } else {
-                    template.append_candidates_after(atom_index, atom, scoring, scratch);
+                    template.append_planned_candidates(&posting_plan, scratch);
+                    scratch.raw_candidate_count = scratch.candidates.len();
                     MetadataLocalCandidateBasis::Template
-                }
+                };
+                scratch.posting_plan = posting_plan;
+                basis
             }
             #[cfg(test)]
             Self::ContentOnly(index) => {
                 index.append_candidates_after(atom_index, document, scratch);
+                scratch.raw_candidate_count = scratch.candidates.len();
                 MetadataLocalCandidateBasis::Content
             }
         }
@@ -1261,11 +1581,17 @@ impl MetadataCandidateScratch {
             seen_generation: vec![0; doc_count],
             generation: 0,
             candidates: Vec::new(),
+            secondary_seen_generation: vec![0; doc_count],
+            secondary_generation: 0,
+            secondary_candidates: Vec::new(),
+            posting_plan: MetadataCandidatePostingPlan::default(),
+            raw_candidate_count: 0,
         }
     }
 
     pub(super) fn clear_for_next_left(&mut self) {
         self.candidates.clear();
+        self.raw_candidate_count = 0;
         self.generation = self.generation.wrapping_add(1);
         if self.generation == 0 {
             self.seen_generation.fill(0);
@@ -1280,6 +1606,24 @@ impl MetadataCandidateScratch {
         }
         self.seen_generation[index_usize] = self.generation;
         self.candidates.push(index);
+    }
+
+    fn prepare_secondary_generation(&mut self) {
+        std::mem::swap(
+            &mut self.seen_generation,
+            &mut self.secondary_seen_generation,
+        );
+        std::mem::swap(&mut self.generation, &mut self.secondary_generation);
+        std::mem::swap(&mut self.candidates, &mut self.secondary_candidates);
+        self.clear_for_next_left();
+    }
+
+    fn retain_secondary_intersection(&mut self) {
+        let secondary_generation = self.secondary_generation;
+        let secondary_seen_generation = &self.secondary_seen_generation;
+        self.candidates.retain(|&index| {
+            secondary_seen_generation[metadata_doc_index_to_usize(index)] == secondary_generation
+        });
     }
 }
 
@@ -1361,6 +1705,7 @@ pub(super) fn union_metadata_token_content_matches(
     progress: &ProgressTracker,
 ) -> Result<MetadataContentUnionStats, AnalysisError> {
     let mut stmt = conn.prepare(metadata_token_content_rows_sql())?;
+    let template_cache_pool = MetadataTemplateScoreCachePool::default();
     let mut current_token = None;
     let mut group = MetadataRawTokenGroup::default();
     let mut pending_groups = Vec::new();
@@ -1405,12 +1750,25 @@ pub(super) fn union_metadata_token_content_matches(
                         context,
                         state,
                         maximum_working_bytes,
+                        &template_cache_pool,
                     )?);
                     pending_prepare_bytes = 0;
+                    let group_progress = MetadataSharedTokenGroupProgress {
+                        tracker: progress,
+                        completed_groups,
+                        base: ProgressCounters {
+                            groups: completed_groups,
+                            candidates: stats.candidate_pairs,
+                            scored: stats.scored_pairs,
+                            matched: stats.matched_pairs,
+                        },
+                    };
                     stats.accumulate(completed.union_with_budget(
                         context,
                         state,
                         maximum_working_bytes,
+                        &template_cache_pool,
+                        Some(group_progress),
                     )?);
                 } else {
                     if pending_groups.len() >= maximum_pending_groups
@@ -1422,6 +1780,7 @@ pub(super) fn union_metadata_token_content_matches(
                             context,
                             state,
                             maximum_working_bytes,
+                            &template_cache_pool,
                         )?);
                         pending_prepare_bytes = 0;
                     }
@@ -1450,6 +1809,7 @@ pub(super) fn union_metadata_token_content_matches(
                     context,
                     state,
                     maximum_working_bytes,
+                    &template_cache_pool,
                 )?);
                 pending_prepare_bytes = 0;
             }
@@ -1501,8 +1861,25 @@ pub(super) fn union_metadata_token_content_matches(
                 context,
                 state,
                 maximum_working_bytes,
+                &template_cache_pool,
             )?);
-            stats.accumulate(group.union_with_budget(context, state, maximum_working_bytes)?);
+            let group_progress = MetadataSharedTokenGroupProgress {
+                tracker: progress,
+                completed_groups,
+                base: ProgressCounters {
+                    groups: completed_groups,
+                    candidates: stats.candidate_pairs,
+                    scored: stats.scored_pairs,
+                    matched: stats.matched_pairs,
+                },
+            };
+            stats.accumulate(group.union_with_budget(
+                context,
+                state,
+                maximum_working_bytes,
+                &template_cache_pool,
+                Some(group_progress),
+            )?);
         }
     }
     stats.accumulate(prepare_metadata_token_group_batch(
@@ -1510,6 +1887,7 @@ pub(super) fn union_metadata_token_content_matches(
         context,
         state,
         maximum_working_bytes,
+        &template_cache_pool,
     )?);
     progress.advance_task(
         0,
@@ -1537,7 +1915,11 @@ pub(super) fn metadata_token_content_rows_sql() -> &'static str {
         JOIN metadata_rows a
           ON a.source_file = t.metadata_source_file
          AND a.source_row_number = t.metadata_source_row_number
-        ORDER BY t.token_index, t.contract_index
+        ORDER BY count(*) OVER (PARTITION BY t.token_index),
+                 t.token_index,
+                 t.contract_index,
+                 t.metadata_source_file,
+                 t.metadata_source_row_number
     "
 }
 
@@ -2257,7 +2639,7 @@ pub(super) fn metadata_content_atom_pair_matches(
     )
 }
 
-fn metadata_content_atoms_share_token(
+pub(super) fn metadata_content_atoms_share_token(
     left: usize,
     right: MetadataDocIndex,
     atoms: &[MetadataContentAtom],
@@ -2279,7 +2661,7 @@ fn metadata_prefix_intersects_sorted_terms(prefix: &[u32], terms: &[u32]) -> boo
         .any(|token| terms.binary_search(token).is_ok())
 }
 
-fn metadata_template_atoms_share_safe_prefix(
+pub(super) fn metadata_template_atoms_share_safe_prefix(
     left: usize,
     right: MetadataDocIndex,
     atoms: &[MetadataContentAtom],
@@ -2317,6 +2699,7 @@ fn metadata_candidate_intersects_both_dimensions(
         MetadataLocalCandidateBasis::Content => {
             metadata_template_atoms_share_safe_prefix(left, right, atoms, compatibility)
         }
+        MetadataLocalCandidateBasis::Intersection => true,
     }
 }
 
@@ -2346,40 +2729,212 @@ pub(super) fn collect_metadata_content_atom_pair_hits(
 
 #[derive(Default)]
 pub(super) struct MetadataPairScoringStats {
-    template_candidate_pairs: u64,
-    template_scored_pairs: u64,
-    template_matched_pairs: u64,
-    content_scored_pairs: u64,
-    content_matched_pairs: u64,
+    pub(super) template_candidate_pairs: u64,
+    pub(super) template_scored_pairs: u64,
+    pub(super) template_matched_pairs: u64,
+    pub(super) content_scored_pairs: u64,
+    pub(super) content_matched_pairs: u64,
+    pub(super) template_cache_hits: u64,
+    pub(super) template_cache_misses: u64,
+    pub(super) template_rejected_pairs: u64,
+    pub(super) template_batch_unique_pairs: u64,
+    pub(super) template_batch_reused_pairs: u64,
+}
+
+#[derive(Clone, Copy)]
+struct MetadataTemplatePairEvaluation {
+    matched: bool,
+    score_count: u64,
+    cache_hit: bool,
+}
+
+fn metadata_template_pair_key(left: MetadataDocIndex, right: MetadataDocIndex) -> u64 {
+    let (left, right) = if left < right {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    (u64::from(left) << 32) | u64::from(right)
+}
+
+fn should_compact_metadata_template_pairs(
+    candidate_pairs: &[(usize, MetadataDocIndex)],
+    atoms: &[MetadataContentAtom],
+) -> bool {
+    if candidate_pairs.len() < METADATA_CONTENT_PARALLEL_MIN_RECORDS {
+        return false;
+    }
+    let sample_len = candidate_pairs
+        .len()
+        .min(METADATA_TEMPLATE_COMPACTION_SAMPLE_SIZE);
+    let mut sample_keys = candidate_pairs[..sample_len]
+        .iter()
+        .map(|&(left, right)| {
+            metadata_template_pair_key(
+                atoms[left].template_doc_index,
+                atoms[metadata_doc_index_to_usize(right)].template_doc_index,
+            )
+        })
+        .collect::<Vec<_>>();
+    sample_keys.sort_unstable();
+    let duplicate_count = sample_keys
+        .windows(2)
+        .filter(|keys| keys[0] == keys[1])
+        .count();
+    duplicate_count.saturating_mul(METADATA_TEMPLATE_COMPACTION_MIN_DUPLICATE_DENOMINATOR)
+        >= sample_len
+}
+
+fn collect_metadata_template_pair_evaluations(
+    candidate_pairs: &[(usize, MetadataDocIndex)],
+    atoms: &[MetadataContentAtom],
+    compatibility: MetadataTemplateCompatibility<'_>,
+    pool: &rayon::ThreadPool,
+    template_cache_pool: &MetadataTemplateScoreCachePool,
+) -> (
+    Vec<MetadataTemplatePairEvaluation>,
+    MetadataPairScoringStats,
+) {
+    if candidate_pairs.is_empty() {
+        return (Vec::new(), MetadataPairScoringStats::default());
+    }
+    let mut pair_order = candidate_pairs
+        .iter()
+        .enumerate()
+        .map(|(pair_index, &(left, right))| {
+            let left_template = atoms[left].template_doc_index;
+            let right_template = atoms[metadata_doc_index_to_usize(right)].template_doc_index;
+            (
+                metadata_template_pair_key(left_template, right_template),
+                pair_index,
+            )
+        })
+        .collect::<Vec<_>>();
+    if pair_order.len() >= METADATA_CONTENT_PARALLEL_MIN_RECORDS {
+        pool.install(|| pair_order.par_sort_unstable_by_key(|&(key, _)| key));
+    } else {
+        pair_order.sort_unstable_by_key(|&(key, _)| key);
+    }
+    let mut unique_keys = Vec::with_capacity(pair_order.len());
+    for &(key, _) in &pair_order {
+        if unique_keys.last().copied() != Some(key) {
+            unique_keys.push(key);
+        }
+    }
+    let evaluate_key = |key: u64, cache: &mut MetadataTemplateScoreCache| {
+        let left = (key >> 32) as MetadataDocIndex;
+        let right = key as MetadataDocIndex;
+        let (matched, score_count, cache_hit) = cache.evaluate(left, right, compatibility);
+        MetadataTemplatePairEvaluation {
+            matched,
+            score_count,
+            cache_hit,
+        }
+    };
+    let unique_evaluations = if unique_keys.len() >= METADATA_CONTENT_PARALLEL_MIN_RECORDS {
+        pool.install(|| {
+            unique_keys
+                .par_iter()
+                .map_init(
+                    || template_cache_pool.take(),
+                    |cache, &key| evaluate_key(key, cache),
+                )
+                .collect::<Vec<_>>()
+        })
+    } else {
+        let mut cache = template_cache_pool.take();
+        unique_keys
+            .iter()
+            .map(|&key| evaluate_key(key, &mut cache))
+            .collect()
+    };
+    let mut pair_evaluations = vec![
+        MetadataTemplatePairEvaluation {
+            matched: false,
+            score_count: 0,
+            cache_hit: false,
+        };
+        candidate_pairs.len()
+    ];
+    let mut unique_index = 0usize;
+    for &(key, pair_index) in &pair_order {
+        while unique_keys[unique_index] != key {
+            unique_index += 1;
+        }
+        pair_evaluations[pair_index] = unique_evaluations[unique_index];
+    }
+    let cache_hits = unique_evaluations
+        .iter()
+        .filter(|evaluation| evaluation.cache_hit)
+        .count() as u64;
+    let cache_misses = unique_evaluations
+        .iter()
+        .filter(|evaluation| !evaluation.cache_hit && evaluation.score_count > 0)
+        .count() as u64;
+    (
+        pair_evaluations,
+        MetadataPairScoringStats {
+            template_batch_unique_pairs: unique_keys.len() as u64,
+            template_batch_reused_pairs: candidate_pairs.len().saturating_sub(unique_keys.len())
+                as u64,
+            template_cache_hits: cache_hits,
+            template_cache_misses: cache_misses,
+            ..MetadataPairScoringStats::default()
+        },
+    )
 }
 
 #[derive(Default)]
-struct MetadataValidatedPairBatch {
-    hits: Vec<(usize, MetadataDocIndex)>,
-    stats: MetadataPairScoringStats,
-    template_cache: MetadataTemplateScoreCache,
+pub(super) struct MetadataValidatedPairBatch {
+    pub(super) hits: Vec<(usize, MetadataDocIndex)>,
+    pub(super) stats: MetadataPairScoringStats,
 }
 
 impl MetadataValidatedPairBatch {
-    fn score_pair(
+    fn score_pair_with_cache(
         &mut self,
         pair: (usize, MetadataDocIndex),
         atoms: &[MetadataContentAtom],
         compact_docs: &[CompactMetadataContentDocument],
-        template_compatibility: MetadataTemplateCompatibility<'_>,
+        compatibility: MetadataTemplateCompatibility<'_>,
+        cache: &mut MetadataTemplateScoreCache,
     ) {
-        let (left, right) = pair;
-        let left_template = atoms[left].template_doc_index;
-        let right_template = atoms[metadata_doc_index_to_usize(right)].template_doc_index;
-        let (template_matches, template_scores) =
-            self.template_cache
-                .evaluate(left_template, right_template, template_compatibility);
+        let left_template = atoms[pair.0].template_doc_index;
+        let right_template = atoms[metadata_doc_index_to_usize(pair.1)].template_doc_index;
+        let (matched, score_count, cache_hit) =
+            cache.evaluate(left_template, right_template, compatibility);
+        if cache_hit {
+            self.stats.template_cache_hits = self.stats.template_cache_hits.saturating_add(1);
+        } else if score_count > 0 {
+            self.stats.template_cache_misses = self.stats.template_cache_misses.saturating_add(1);
+        }
+        self.score_pair(
+            pair,
+            MetadataTemplatePairEvaluation {
+                matched,
+                score_count,
+                cache_hit,
+            },
+            atoms,
+            compact_docs,
+        );
+    }
+
+    fn score_pair(
+        &mut self,
+        pair: (usize, MetadataDocIndex),
+        template_evaluation: MetadataTemplatePairEvaluation,
+        atoms: &[MetadataContentAtom],
+        compact_docs: &[CompactMetadataContentDocument],
+    ) {
         self.stats.template_candidate_pairs = self.stats.template_candidate_pairs.saturating_add(1);
         self.stats.template_scored_pairs = self
             .stats
             .template_scored_pairs
-            .saturating_add(template_scores);
-        if !template_matches {
+            .saturating_add(template_evaluation.score_count);
+        if !template_evaluation.matched {
+            self.stats.template_rejected_pairs =
+                self.stats.template_rejected_pairs.saturating_add(1);
             return;
         }
         self.stats.template_matched_pairs = self.stats.template_matched_pairs.saturating_add(1);
@@ -2412,24 +2967,95 @@ impl MetadataValidatedPairBatch {
             .stats
             .content_matched_pairs
             .saturating_add(other.stats.content_matched_pairs);
+        self.stats.template_cache_hits = self
+            .stats
+            .template_cache_hits
+            .saturating_add(other.stats.template_cache_hits);
+        self.stats.template_cache_misses = self
+            .stats
+            .template_cache_misses
+            .saturating_add(other.stats.template_cache_misses);
+        self.stats.template_rejected_pairs = self
+            .stats
+            .template_rejected_pairs
+            .saturating_add(other.stats.template_rejected_pairs);
+        self.stats.template_batch_unique_pairs = self
+            .stats
+            .template_batch_unique_pairs
+            .saturating_add(other.stats.template_batch_unique_pairs);
+        self.stats.template_batch_reused_pairs = self
+            .stats
+            .template_batch_reused_pairs
+            .saturating_add(other.stats.template_batch_reused_pairs);
         self
     }
 }
 
-fn collect_metadata_validated_atom_pair_hits(
+pub(super) fn collect_metadata_validated_atom_pair_hits(
     candidate_pairs: &[(usize, MetadataDocIndex)],
     atoms: &[MetadataContentAtom],
     compact_docs: &[CompactMetadataContentDocument],
     template_compatibility: MetadataTemplateCompatibility<'_>,
     pool: &rayon::ThreadPool,
+    template_cache_pool: &MetadataTemplateScoreCachePool,
 ) -> MetadataValidatedPairBatch {
-    if candidate_pairs.len() >= METADATA_CONTENT_PARALLEL_MIN_RECORDS {
+    if !should_compact_metadata_template_pairs(candidate_pairs, atoms) {
+        if candidate_pairs.len() >= METADATA_CONTENT_PARALLEL_MIN_RECORDS {
+            return pool.install(|| {
+                candidate_pairs
+                    .par_chunks(METADATA_CONTENT_PARALLEL_MIN_RECORDS)
+                    .map_init(
+                        || template_cache_pool.take(),
+                        |cache, pairs| {
+                            let mut batch = MetadataValidatedPairBatch::default();
+                            for &pair in pairs {
+                                batch.score_pair_with_cache(
+                                    pair,
+                                    atoms,
+                                    compact_docs,
+                                    template_compatibility,
+                                    cache,
+                                );
+                            }
+                            batch
+                        },
+                    )
+                    .reduce(
+                        MetadataValidatedPairBatch::default,
+                        MetadataValidatedPairBatch::merge,
+                    )
+            });
+        }
+        let mut cache = template_cache_pool.take();
+        let mut batch = MetadataValidatedPairBatch::default();
+        for &pair in candidate_pairs {
+            batch.score_pair_with_cache(
+                pair,
+                atoms,
+                compact_docs,
+                template_compatibility,
+                &mut cache,
+            );
+        }
+        return batch;
+    }
+    let (template_evaluations, template_stats) = collect_metadata_template_pair_evaluations(
+        candidate_pairs,
+        atoms,
+        template_compatibility,
+        pool,
+        template_cache_pool,
+    );
+    let mut batch = if candidate_pairs.len() >= METADATA_CONTENT_PARALLEL_MIN_RECORDS {
         pool.install(|| {
             candidate_pairs
-                .par_iter()
-                .copied()
-                .fold(MetadataValidatedPairBatch::default, |mut batch, pair| {
-                    batch.score_pair(pair, atoms, compact_docs, template_compatibility);
+                .par_chunks(METADATA_CONTENT_PARALLEL_MIN_RECORDS)
+                .zip(template_evaluations.par_chunks(METADATA_CONTENT_PARALLEL_MIN_RECORDS))
+                .map(|(pairs, evaluations)| {
+                    let mut batch = MetadataValidatedPairBatch::default();
+                    for (&pair, &evaluation) in pairs.iter().zip(evaluations) {
+                        batch.score_pair(pair, evaluation, atoms, compact_docs);
+                    }
                     batch
                 })
                 .reduce(
@@ -2439,11 +3065,28 @@ fn collect_metadata_validated_atom_pair_hits(
         })
     } else {
         let mut batch = MetadataValidatedPairBatch::default();
-        for &pair in candidate_pairs {
-            batch.score_pair(pair, atoms, compact_docs, template_compatibility);
+        for (&pair, &evaluation) in candidate_pairs.iter().zip(&template_evaluations) {
+            batch.score_pair(pair, evaluation, atoms, compact_docs);
         }
         batch
-    }
+    };
+    batch.stats.template_batch_unique_pairs = batch
+        .stats
+        .template_batch_unique_pairs
+        .saturating_add(template_stats.template_batch_unique_pairs);
+    batch.stats.template_batch_reused_pairs = batch
+        .stats
+        .template_batch_reused_pairs
+        .saturating_add(template_stats.template_batch_reused_pairs);
+    batch.stats.template_cache_hits = batch
+        .stats
+        .template_cache_hits
+        .saturating_add(template_stats.template_cache_hits);
+    batch.stats.template_cache_misses = batch
+        .stats
+        .template_cache_misses
+        .saturating_add(template_stats.template_cache_misses);
+    batch
 }
 
 pub(super) fn score_and_apply_metadata_atom_pair_batch(
@@ -2452,6 +3095,7 @@ pub(super) fn score_and_apply_metadata_atom_pair_batch(
     compact_docs: &[CompactMetadataContentDocument],
     context: &MetadataContentUnionContext<'_>,
     state: &mut MetadataUnionState,
+    template_cache_pool: &MetadataTemplateScoreCachePool,
 ) -> MetadataPairScoringStats {
     if candidate_pairs.is_empty() {
         return MetadataPairScoringStats::default();
@@ -2462,6 +3106,7 @@ pub(super) fn score_and_apply_metadata_atom_pair_batch(
         compact_docs,
         context.template_compatibility,
         context.pool,
+        template_cache_pool,
     );
     candidate_pairs.clear();
     for (left, right) in batch.hits {
@@ -2484,6 +3129,7 @@ pub(super) fn score_and_apply_metadata_fallback_atom_pair_batch(
     compact_docs: &[CompactMetadataContentDocument],
     context: &MetadataContentUnionContext<'_>,
     state: &mut MetadataUnionState,
+    template_cache_pool: &MetadataTemplateScoreCachePool,
 ) -> MetadataPairScoringStats {
     if candidate_pairs.is_empty() {
         return MetadataPairScoringStats::default();
@@ -2494,6 +3140,7 @@ pub(super) fn score_and_apply_metadata_fallback_atom_pair_batch(
         compact_docs,
         context.template_compatibility,
         context.pool,
+        template_cache_pool,
     );
     candidate_pairs.clear();
     for (left, right) in batch.hits {
@@ -2545,7 +3192,162 @@ pub(super) fn union_metadata_shared_token_atoms(
     state: &mut MetadataUnionState,
 ) -> MetadataContentUnionStats {
     let atoms = build_metadata_content_atoms(records, compact_docs, context.data);
-    union_metadata_shared_token_atom_core(atoms, compact_docs, context, state)
+    let template_cache_pool = MetadataTemplateScoreCachePool::default();
+    union_metadata_shared_token_atom_core(
+        atoms,
+        compact_docs,
+        context,
+        state,
+        &template_cache_pool,
+        None,
+    )
+}
+
+struct MetadataLeftCandidateBatch {
+    left: usize,
+    candidates: Vec<MetadataDocIndex>,
+    raw_candidate_pairs: u64,
+    dimension_rejected_pairs: u64,
+}
+
+fn collect_metadata_left_candidate_batch(
+    left: usize,
+    atoms: &[MetadataContentAtom],
+    compact_docs: &[CompactMetadataContentDocument],
+    candidate_index: &MetadataLocalCandidateIndex,
+    compatibility: MetadataTemplateCompatibility<'_>,
+    scratch: &mut MetadataCandidateScratch,
+) -> MetadataLeftCandidateBatch {
+    let left_atom = &atoms[left];
+    let left_record_index = metadata_doc_index_to_usize(left_atom.representative_record_index);
+    scratch.clear_for_next_left();
+    let candidate_basis = candidate_index.append_candidates_after(
+        left,
+        left_atom,
+        &compact_docs[left_record_index],
+        compatibility,
+        scratch,
+    );
+    let raw_candidate_pairs = scratch.raw_candidate_count as u64;
+    let candidates = scratch
+        .candidates
+        .iter()
+        .copied()
+        .filter(|&right| {
+            metadata_candidate_intersects_both_dimensions(
+                candidate_basis,
+                left,
+                right,
+                atoms,
+                compact_docs,
+                compatibility,
+            )
+        })
+        .collect::<Vec<_>>();
+    let dimension_rejected_pairs = raw_candidate_pairs.saturating_sub(candidates.len() as u64);
+    MetadataLeftCandidateBatch {
+        left,
+        candidates,
+        raw_candidate_pairs,
+        dimension_rejected_pairs,
+    }
+}
+
+fn collect_metadata_left_candidate_wave(
+    wave_start: usize,
+    wave_end: usize,
+    atoms: &[MetadataContentAtom],
+    compact_docs: &[CompactMetadataContentDocument],
+    candidate_index: &MetadataLocalCandidateIndex,
+    compatibility: MetadataTemplateCompatibility<'_>,
+) -> Vec<MetadataLeftCandidateBatch> {
+    (wave_start..wave_end)
+        .into_par_iter()
+        .map_init(
+            || MetadataCandidateScratch::new(atoms.len()),
+            |scratch, left| {
+                collect_metadata_left_candidate_batch(
+                    left,
+                    atoms,
+                    compact_docs,
+                    candidate_index,
+                    compatibility,
+                    scratch,
+                )
+            },
+        )
+        .collect()
+}
+
+fn consume_metadata_left_candidate_wave(
+    left_batches: Vec<MetadataLeftCandidateBatch>,
+    mut consumer: MetadataLeftCandidateBatchConsumer<'_, '_>,
+) {
+    for left_batch in left_batches {
+        consumer.apply(left_batch);
+    }
+}
+
+struct MetadataLeftCandidateBatchConsumer<'a, 'context> {
+    atoms: &'a [MetadataContentAtom],
+    compact_docs: &'a [CompactMetadataContentDocument],
+    context: &'a MetadataContentUnionContext<'context>,
+    state: &'a mut MetadataUnionState,
+    stats: &'a mut MetadataContentUnionStats,
+    candidate_pairs: &'a mut Vec<(usize, MetadataDocIndex)>,
+    template_cache_pool: &'a MetadataTemplateScoreCachePool,
+}
+
+impl MetadataLeftCandidateBatchConsumer<'_, '_> {
+    fn apply(&mut self, left_batch: MetadataLeftCandidateBatch) {
+        let left = left_batch.left;
+        self.stats.raw_candidate_pairs = self
+            .stats
+            .raw_candidate_pairs
+            .saturating_add(left_batch.raw_candidate_pairs);
+        self.stats.dimension_rejected_pairs = self
+            .stats
+            .dimension_rejected_pairs
+            .saturating_add(left_batch.dimension_rejected_pairs);
+        let left_atom = &self.atoms[left];
+        let left_contract_index = metadata_contract_index_to_usize(left_atom.members[0]);
+        debug_assert_eq!(
+            self.context.data.contracts[left_contract_index].chain_index,
+            left_atom.chain_index
+        );
+        for right in left_batch.candidates {
+            self.stats.candidate_pairs = self.stats.candidate_pairs.saturating_add(1);
+            let right_atom = &self.atoms[metadata_doc_index_to_usize(right)];
+            let right_contract_index = metadata_contract_index_to_usize(right_atom.members[0]);
+            let singleton_pair = left_atom.members.len() == 1 && right_atom.members.len() == 1;
+            let same_chain = left_atom.chain_index == right_atom.chain_index;
+            if (singleton_pair || same_chain)
+                && metadata_pair_already_connected(
+                    self.context.data,
+                    self.context.chain_count,
+                    self.state,
+                    left_contract_index,
+                    right_contract_index,
+                )
+            {
+                self.stats.already_connected_pairs =
+                    self.stats.already_connected_pairs.saturating_add(1);
+                continue;
+            }
+            self.candidate_pairs.push((left, right));
+            if self.candidate_pairs.len() >= METADATA_CONTENT_SCORE_BATCH_PAIRS {
+                let batch_stats = score_and_apply_metadata_atom_pair_batch(
+                    self.candidate_pairs,
+                    self.atoms,
+                    self.compact_docs,
+                    self.context,
+                    self.state,
+                    self.template_cache_pool,
+                );
+                self.stats.accumulate_pair_scoring(batch_stats);
+            }
+        }
+    }
 }
 
 fn union_metadata_shared_token_atom_core(
@@ -2553,6 +3355,8 @@ fn union_metadata_shared_token_atom_core(
     compact_docs: &[CompactMetadataContentDocument],
     context: &MetadataContentUnionContext<'_>,
     state: &mut MetadataUnionState,
+    template_cache_pool: &MetadataTemplateScoreCachePool,
+    progress: Option<MetadataSharedTokenGroupProgress<'_>>,
 ) -> MetadataContentUnionStats {
     let mut stats = MetadataContentUnionStats {
         atom_count: atoms.len(),
@@ -2567,11 +3371,15 @@ fn union_metadata_shared_token_atom_core(
         );
     }
     if atoms.len() < 2 {
+        if let Some(progress) = progress {
+            progress.update(&stats);
+        }
         return stats;
     }
     if atoms.len() == METADATA_DIRECT_ATOM_GROUP_SIZE {
         let left = 0usize;
         let right = metadata_doc_index_from_usize(1);
+        stats.raw_candidate_pairs = 1;
         if !metadata_content_atoms_share_token(left, right, &atoms, compact_docs)
             || !metadata_template_atoms_share_safe_prefix(
                 left,
@@ -2580,6 +3388,7 @@ fn union_metadata_shared_token_atom_core(
                 context.template_compatibility,
             )
         {
+            stats.dimension_rejected_pairs = 1;
             return stats;
         }
         stats.candidate_pairs = 1;
@@ -2598,6 +3407,7 @@ fn union_metadata_shared_token_atom_core(
                 right_contract_index,
             )
         {
+            stats.already_connected_pairs = 1;
             return stats;
         }
         let mut candidate_pairs = vec![(left, right)];
@@ -2607,8 +3417,12 @@ fn union_metadata_shared_token_atom_core(
             compact_docs,
             context,
             state,
+            template_cache_pool,
         );
         stats.accumulate_pair_scoring(pair_stats);
+        if let Some(progress) = progress {
+            progress.update(&stats);
+        }
         return stats;
     }
     let parallel = atoms.len() >= METADATA_CONTENT_PARALLEL_MIN_RECORDS;
@@ -2629,61 +3443,106 @@ fn union_metadata_shared_token_atom_core(
             false,
         )
     };
-    let mut scratch = MetadataCandidateScratch::new(atoms.len());
     let mut candidate_pairs = Vec::with_capacity(METADATA_CONTENT_SCORE_BATCH_PAIRS);
-    for left in 0..atoms.len().saturating_sub(1) {
-        let left_atom = &atoms[left];
-        let left_record_index = metadata_doc_index_to_usize(left_atom.representative_record_index);
-        let left_contract_index = metadata_contract_index_to_usize(left_atom.members[0]);
-        debug_assert_eq!(
-            context.data.contracts[left_contract_index].chain_index,
-            left_atom.chain_index
-        );
-        scratch.clear_for_next_left();
-        let candidate_basis = candidate_index.append_candidates_after(
-            left,
-            left_atom,
-            &compact_docs[left_record_index],
-            context.template_compatibility,
-            &mut scratch,
-        );
-        for &right in &scratch.candidates {
-            if !metadata_candidate_intersects_both_dimensions(
-                candidate_basis,
-                left,
-                right,
+    let left_count = atoms.len().saturating_sub(1);
+    if parallel {
+        let wave_size = context
+            .pool
+            .current_num_threads()
+            .max(1)
+            .saturating_mul(METADATA_PARALLEL_LEFT_WAVE_MULTIPLIER);
+        let first_wave_end = wave_size.min(left_count);
+        let mut left_batches = context.pool.install(|| {
+            collect_metadata_left_candidate_wave(
+                0,
+                first_wave_end,
                 &atoms,
                 compact_docs,
+                &candidate_index,
                 context.template_compatibility,
-            ) {
-                continue;
-            }
-            stats.candidate_pairs = stats.candidate_pairs.saturating_add(1);
-            let right_atom = &atoms[metadata_doc_index_to_usize(right)];
-            let right_contract_index = metadata_contract_index_to_usize(right_atom.members[0]);
-            let singleton_pair = left_atom.members.len() == 1 && right_atom.members.len() == 1;
-            let same_chain = left_atom.chain_index == right_atom.chain_index;
-            if (singleton_pair || same_chain)
-                && metadata_pair_already_connected(
-                    context.data,
-                    context.chain_count,
-                    state,
-                    left_contract_index,
-                    right_contract_index,
+            )
+        });
+        let mut wave_end = first_wave_end;
+        while wave_end < left_count {
+            let next_wave_end = wave_end.saturating_add(wave_size).min(left_count);
+            let current_left_batches = std::mem::take(&mut left_batches);
+            let (next_left_batches, ()) = context.pool.install(|| {
+                rayon::join(
+                    || {
+                        collect_metadata_left_candidate_wave(
+                            wave_end,
+                            next_wave_end,
+                            &atoms,
+                            compact_docs,
+                            &candidate_index,
+                            context.template_compatibility,
+                        )
+                    },
+                    || {
+                        consume_metadata_left_candidate_wave(
+                            current_left_batches,
+                            MetadataLeftCandidateBatchConsumer {
+                                atoms: &atoms,
+                                compact_docs,
+                                context,
+                                state,
+                                stats: &mut stats,
+                                candidate_pairs: &mut candidate_pairs,
+                                template_cache_pool,
+                            },
+                        );
+                    },
                 )
-            {
-                continue;
+            });
+            left_batches = next_left_batches;
+            if let Some(progress) = progress {
+                progress.update(&stats);
             }
-            candidate_pairs.push((left, right));
-            if candidate_pairs.len() >= METADATA_CONTENT_SCORE_BATCH_PAIRS {
-                let batch_stats = score_and_apply_metadata_atom_pair_batch(
-                    &mut candidate_pairs,
-                    &atoms,
-                    compact_docs,
-                    context,
-                    state,
-                );
-                stats.accumulate_pair_scoring(batch_stats);
+            wave_end = next_wave_end;
+        }
+        consume_metadata_left_candidate_wave(
+            left_batches,
+            MetadataLeftCandidateBatchConsumer {
+                atoms: &atoms,
+                compact_docs,
+                context,
+                state,
+                stats: &mut stats,
+                candidate_pairs: &mut candidate_pairs,
+                template_cache_pool,
+            },
+        );
+        if let Some(progress) = progress {
+            progress.update(&stats);
+        }
+    } else {
+        let mut scratch = MetadataCandidateScratch::new(atoms.len());
+        let mut pending_progress = 0usize;
+        for left in 0..left_count {
+            let left_batch = collect_metadata_left_candidate_batch(
+                left,
+                &atoms,
+                compact_docs,
+                &candidate_index,
+                context.template_compatibility,
+                &mut scratch,
+            );
+            MetadataLeftCandidateBatchConsumer {
+                atoms: &atoms,
+                compact_docs,
+                context,
+                state,
+                stats: &mut stats,
+                candidate_pairs: &mut candidate_pairs,
+                template_cache_pool,
+            }
+            .apply(left_batch);
+            pending_progress = pending_progress.saturating_add(1);
+            if pending_progress >= 256 {
+                if let Some(progress) = progress {
+                    progress.update(&stats);
+                }
+                pending_progress = 0;
             }
         }
     }
@@ -2693,8 +3552,12 @@ fn union_metadata_shared_token_atom_core(
         compact_docs,
         context,
         state,
+        template_cache_pool,
     );
     stats.accumulate_pair_scoring(batch_stats);
+    if let Some(progress) = progress {
+        progress.update(&stats);
+    }
     stats
 }
 
@@ -2727,9 +3590,11 @@ fn union_metadata_no_common_atom_core(
     if atoms.len() < 2 {
         return stats;
     }
+    let template_cache_pool = MetadataTemplateScoreCachePool::default();
     if atoms.len() == METADATA_DIRECT_ATOM_GROUP_SIZE {
         let left = 0usize;
         let right = metadata_doc_index_from_usize(1);
+        stats.raw_candidate_pairs = 1;
         if !metadata_content_atoms_share_token(left, right, &atoms, compact_docs)
             || !metadata_template_atoms_share_safe_prefix(
                 left,
@@ -2738,6 +3603,7 @@ fn union_metadata_no_common_atom_core(
                 context.template_compatibility,
             )
         {
+            stats.dimension_rejected_pairs = 1;
             return stats;
         }
         stats.candidate_pairs = 1;
@@ -2755,6 +3621,7 @@ fn union_metadata_no_common_atom_core(
                 right_contract_index,
             )
         {
+            stats.already_connected_pairs = 1;
             return stats;
         }
         if !metadata_fallback_atoms_have_disjoint_token_groups(
@@ -2771,6 +3638,7 @@ fn union_metadata_no_common_atom_core(
             compact_docs,
             context,
             state,
+            &template_cache_pool,
         );
         stats.accumulate_pair_scoring(pair_stats);
         return stats;
@@ -2807,6 +3675,14 @@ fn union_metadata_no_common_atom_core(
             context.template_compatibility,
             &mut scratch,
         );
+        stats.raw_candidate_pairs = stats
+            .raw_candidate_pairs
+            .saturating_add(scratch.raw_candidate_count as u64);
+        stats.dimension_rejected_pairs = stats.dimension_rejected_pairs.saturating_add(
+            scratch
+                .raw_candidate_count
+                .saturating_sub(scratch.candidates.len()) as u64,
+        );
         let left_contract_index = metadata_contract_index_to_usize(left_atom.members[0]);
         for &right in &scratch.candidates {
             if !metadata_candidate_intersects_both_dimensions(
@@ -2817,6 +3693,7 @@ fn union_metadata_no_common_atom_core(
                 compact_docs,
                 context.template_compatibility,
             ) {
+                stats.dimension_rejected_pairs = stats.dimension_rejected_pairs.saturating_add(1);
                 continue;
             }
             stats.candidate_pairs = stats.candidate_pairs.saturating_add(1);
@@ -2832,6 +3709,7 @@ fn union_metadata_no_common_atom_core(
                     right_index,
                 )
             {
+                stats.already_connected_pairs = stats.already_connected_pairs.saturating_add(1);
                 continue;
             }
             if metadata_fallback_atoms_have_disjoint_token_groups(
@@ -2847,6 +3725,7 @@ fn union_metadata_no_common_atom_core(
                         compact_docs,
                         context,
                         state,
+                        &template_cache_pool,
                     );
                     stats.accumulate_pair_scoring(batch_stats);
                 }
@@ -2874,6 +3753,7 @@ fn union_metadata_no_common_atom_core(
         compact_docs,
         context,
         state,
+        &template_cache_pool,
     );
     stats.accumulate_pair_scoring(batch_stats);
     if let Some(progress) = progress {
@@ -2924,6 +3804,9 @@ pub(super) fn metadata_pair_already_connected(
         .cross
         .as_mut()
         .is_some_and(|cross| cross.connected(left, right));
+    if !cross_connected {
+        return false;
+    }
     let (primary_chain, secondary_chain) = if left_chain < right_chain {
         (left_chain, right_chain)
     } else {

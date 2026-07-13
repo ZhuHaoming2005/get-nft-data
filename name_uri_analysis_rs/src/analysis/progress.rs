@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 use super::*;
 
 const PIPELINE_STAGE_COUNT: u64 = 4;
-const PROGRESS_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+pub(crate) const PROGRESS_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
+const PROGRESS_REFRESH_HZ: u8 = 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PipelineStage {
@@ -77,6 +78,7 @@ pub(crate) enum ProgressTracker {
         pipeline: ProgressBar,
         stage: ProgressBar,
         task: ProgressBar,
+        metrics: ProgressBar,
         task_state: Box<Mutex<Option<TaskProgressState>>>,
     },
     Disabled,
@@ -109,30 +111,31 @@ impl ProgressTracker {
         if !enabled {
             return Self::Disabled;
         }
-        let multi = MultiProgress::new();
+        let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr_with_hz(
+            PROGRESS_REFRESH_HZ,
+        ));
         let pipeline = multi.add(ProgressBar::new(total_phases));
         pipeline.set_style(
-            ProgressStyle::with_template(
-                "{spinner:.green} pipeline [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} {msg}",
-            )
-            .unwrap()
-            .progress_chars("#>-"),
+            ProgressStyle::with_template(pipeline_bar_template())
+                .unwrap()
+                .progress_chars("#>-"),
         );
         let stage = multi.add(ProgressBar::new(0));
         stage.set_style(
-            ProgressStyle::with_template(
-                "  {spinner:.blue} stage [{elapsed_precise}] [{wide_bar:.magenta/blue}] {pos}/{len} {percent}% {msg}",
-            )
-            .unwrap()
-            .progress_chars("#>-"),
+            ProgressStyle::with_template(stage_bar_template())
+                .unwrap()
+                .progress_chars("#>-"),
         );
         let task = multi.add(ProgressBar::new_spinner());
         task.set_style(task_spinner_style());
+        let metrics = multi.add(ProgressBar::new_spinner());
+        metrics.set_style(ProgressStyle::with_template(metrics_template()).unwrap());
         Self::Enabled {
             _multi: multi,
             pipeline,
             stage,
             task,
+            metrics,
             task_state: Box::new(Mutex::new(None)),
         }
     }
@@ -156,9 +159,16 @@ impl ProgressTracker {
     }
 
     pub(crate) fn finish_stage(&self, message: impl Into<String>) {
-        if let Self::Enabled { stage, task, .. } = self {
+        if let Self::Enabled {
+            stage,
+            task,
+            metrics,
+            ..
+        } = self
+        {
             let message = message.into();
             task.finish_and_clear();
+            metrics.finish_and_clear();
             stage.finish_with_message(message);
         }
     }
@@ -177,7 +187,10 @@ impl ProgressTracker {
         unit: impl Into<String>,
     ) {
         let Self::Enabled {
-            task, task_state, ..
+            task,
+            metrics,
+            task_state,
+            ..
         } = self
         else {
             return;
@@ -194,6 +207,10 @@ impl ProgressTracker {
         }
         task.set_position(0);
         task.set_message(label.clone());
+        task.enable_steady_tick(PROGRESS_REFRESH_INTERVAL);
+        metrics.reset();
+        metrics.set_message("waiting for progress sample");
+        metrics.enable_steady_tick(PROGRESS_REFRESH_INTERVAL);
         *task_state.lock().expect("task progress mutex poisoned") = Some(TaskProgressState {
             label,
             total,
@@ -209,6 +226,7 @@ impl ProgressTracker {
         let Self::Enabled {
             stage,
             task,
+            metrics,
             task_state,
             ..
         } = self
@@ -230,7 +248,7 @@ impl ProgressTracker {
             return;
         }
         state.last_refresh = Some(now);
-        task.set_message(format_task_progress_message(&TaskProgressSnapshot {
+        metrics.set_message(format_task_progress_message(&TaskProgressSnapshot {
             label: &state.label,
             position: state.position,
             total: state.total,
@@ -242,11 +260,15 @@ impl ProgressTracker {
 
     pub(crate) fn finish_task(&self, message: impl Into<String>) {
         let Self::Enabled {
-            task, task_state, ..
+            task,
+            metrics,
+            task_state,
+            ..
         } = self
         else {
             return;
         };
+        let final_message = message.into();
         if let Some(state) = task_state
             .lock()
             .expect("task progress mutex poisoned")
@@ -255,8 +277,11 @@ impl ProgressTracker {
             if let Some(total) = state.total {
                 task.set_position(total);
             }
+            task.finish_with_message(state.label);
+        } else {
+            task.finish_and_clear();
         }
-        task.finish_with_message(message.into());
+        metrics.finish_with_message(final_message);
     }
 
     // Compatibility methods for the existing stage-level progress call sites.
@@ -300,11 +325,13 @@ impl ProgressTracker {
             pipeline,
             stage,
             task,
+            metrics,
             ..
         } = self
         {
             let message = message.into();
             task.finish_and_clear();
+            metrics.finish_and_clear();
             stage.finish_and_clear();
             pipeline.finish_with_message(message);
         }
@@ -315,11 +342,13 @@ impl ProgressTracker {
             pipeline,
             stage,
             task,
+            metrics,
             ..
         } = self
         {
             let message = format!("FAILED: {}", message.into());
             task.abandon_with_message(message.clone());
+            metrics.abandon_with_message(message.clone());
             stage.abandon_with_message(message.clone());
             pipeline.abandon_with_message(message);
         }
@@ -386,13 +415,27 @@ fn format_progress_duration(duration: Duration) -> String {
 }
 
 fn task_bar_style() -> ProgressStyle {
-    ProgressStyle::with_template(
-        "    {spinner:.yellow} task [{elapsed_precise}] [{wide_bar:.yellow/blue}] {pos}/{len} {percent}% {msg}",
-    )
-    .unwrap()
-    .progress_chars("#>-")
+    ProgressStyle::with_template(task_bar_template())
+        .unwrap()
+        .progress_chars("#>-")
 }
 
 fn task_spinner_style() -> ProgressStyle {
     ProgressStyle::with_template("    {spinner:.yellow} task [{elapsed_precise}] {msg}").unwrap()
+}
+
+pub(crate) const fn pipeline_bar_template() -> &'static str {
+    "{spinner:.green} pipeline [{elapsed_precise}] [{bar:24.cyan/blue}] {pos}/{len} {msg}"
+}
+
+pub(crate) const fn stage_bar_template() -> &'static str {
+    "  {spinner:.blue} stage [{elapsed_precise}] [{bar:28.magenta/blue}] {pos}/{len} {percent:>3}% {msg}"
+}
+
+pub(crate) const fn task_bar_template() -> &'static str {
+    "    {spinner:.yellow} task [{elapsed_precise}] [{bar:32.yellow/blue}] {pos}/{len} {percent:>3}% {msg}"
+}
+
+pub(crate) const fn metrics_template() -> &'static str {
+    "      {spinner:.white} metrics {msg}"
 }

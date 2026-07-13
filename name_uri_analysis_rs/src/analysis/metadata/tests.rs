@@ -245,6 +245,314 @@ fn metadata_shared_token_groups_prepare_in_bounded_parallel_batches() {
 }
 
 #[test]
+fn large_shared_token_groups_generate_candidates_in_bounded_parallel_waves() {
+    let source = include_str!("index.rs");
+    let collector_start = source
+        .find("fn collect_metadata_left_candidate_wave")
+        .unwrap();
+    let collector_end = source[collector_start..]
+        .find("fn consume_metadata_left_candidate_wave")
+        .map(|offset| collector_start + offset)
+        .unwrap();
+    let collector = &source[collector_start..collector_end];
+    assert!(collector.contains("into_par_iter()"));
+    assert!(collector.contains("map_init("));
+
+    let core_start = source
+        .find("fn union_metadata_shared_token_atom_core")
+        .unwrap();
+    let core_end = source[core_start..]
+        .find("pub(super) fn union_metadata_no_common_content_candidates")
+        .map(|offset| core_start + offset)
+        .unwrap();
+    let core = &source[core_start..core_end];
+    assert!(core.contains("METADATA_PARALLEL_LEFT_WAVE_MULTIPLIER"));
+    assert!(core.contains("collect_metadata_left_candidate_wave"));
+    assert!(core.contains("consume_metadata_left_candidate_wave"));
+}
+
+#[test]
+fn parallel_shared_token_waves_preserve_single_thread_results_and_stats() {
+    let record_count = METADATA_CONTENT_PARALLEL_MIN_RECORDS + 17;
+    let mut builder = MetadataDataBuilder::new(2);
+    let mut records = Vec::with_capacity(record_count);
+    for index in 0..record_count {
+        let content = format!("shared dragon collection unique{index}");
+        let template = format!("shared template collection variant{}", index % 4);
+        builder.merge_indexed_row(IndexedMetadataRow {
+            chain_index: index % 2,
+            nft_count: 1,
+            content_doc: MetadataBm25Document::from_text(&content).map(Arc::new),
+            doc: MetadataBm25Document::from_text(&template).unwrap().into(),
+            doc_key: metadata_document_key(&template),
+        });
+        records.push(MetadataContentRecord {
+            contract_index: metadata_contract_index_from_usize(index),
+            doc: MetadataBm25Document::from_text(&content).unwrap().into(),
+        });
+    }
+    let data = builder.finish();
+    let contract_tokens = CompactContractTokens::from_nested(vec![vec![1]; record_count]);
+
+    let run = |threads| {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        let context = MetadataContentUnionContext {
+            data: &data,
+            template_compatibility: MetadataTemplateCompatibility::Scored(
+                &data.metadata_index.scoring,
+            ),
+            contract_tokens: &contract_tokens,
+            chain_count: 2,
+            pool: &pool,
+        };
+        let mut state = MetadataUnionState {
+            intra: UnionFind::new(record_count),
+            cross: Some(SparseUnionFind::default()),
+            chain_matrix: Some(vec![SparseUnionFind::default()]),
+        };
+        let stats = union_metadata_content_candidates(
+            &records,
+            MetadataContentScope::SharedToken,
+            &context,
+            &mut state,
+        );
+        let intra = (0..record_count)
+            .map(|index| state.intra.find(index))
+            .collect::<Vec<_>>();
+        let cross = (0..record_count)
+            .flat_map(|left| (left + 1..record_count).map(move |right| (left, right)))
+            .map(|(left, right)| state.cross.as_mut().unwrap().connected(left, right))
+            .collect::<Vec<_>>();
+        let matrix = (0..record_count)
+            .flat_map(|left| (left + 1..record_count).map(move |right| (left, right)))
+            .map(|(left, right)| state.chain_matrix.as_mut().unwrap()[0].connected(left, right))
+            .collect::<Vec<_>>();
+        (stats, intra, cross, matrix)
+    };
+
+    assert_eq!(run(1), run(4));
+}
+
+#[test]
+fn shared_token_group_progress_combines_prior_and_live_counters() {
+    let base = ProgressCounters {
+        groups: 2,
+        candidates: 100,
+        scored: 50,
+        matched: 4,
+    };
+    let live = MetadataContentUnionStats {
+        atom_count: 10,
+        candidate_pairs: 25,
+        scored_pairs: 8,
+        matched_pairs: 2,
+        template_candidate_pairs: 0,
+        template_scored_pairs: 0,
+        template_matched_pairs: 0,
+        ..MetadataContentUnionStats::default()
+    };
+
+    assert_eq!(
+        metadata_shared_token_group_progress_counters(3, base, &live),
+        ProgressCounters {
+            groups: 3,
+            candidates: 125,
+            scored: 58,
+            matched: 6,
+        }
+    );
+}
+
+#[test]
+fn metadata_union_stats_preserve_candidate_filter_and_cache_diagnostics() {
+    let mut stats = MetadataContentUnionStats {
+        raw_candidate_pairs: 20,
+        dimension_rejected_pairs: 8,
+        already_connected_pairs: 3,
+        ..MetadataContentUnionStats::default()
+    };
+    stats.accumulate_pair_scoring(MetadataPairScoringStats {
+        template_candidate_pairs: 9,
+        template_scored_pairs: 12,
+        template_matched_pairs: 4,
+        content_scored_pairs: 4,
+        content_matched_pairs: 1,
+        template_cache_hits: 5,
+        template_cache_misses: 4,
+        template_rejected_pairs: 5,
+        ..MetadataPairScoringStats::default()
+    });
+
+    assert_eq!(stats.raw_candidate_pairs, 20);
+    assert_eq!(stats.dimension_rejected_pairs, 8);
+    assert_eq!(stats.already_connected_pairs, 3);
+    assert_eq!(stats.template_cache_hits, 5);
+    assert_eq!(stats.template_cache_misses, 4);
+    assert_eq!(stats.template_rejected_pairs, 5);
+}
+
+#[test]
+fn shared_token_groups_are_processed_smallest_first_with_stable_ties() {
+    let sql = metadata_token_content_rows_sql();
+    let normalized = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    assert!(normalized.contains(
+        "ORDER BY count(*) OVER (PARTITION BY t.token_index), t.token_index, t.contract_index"
+    ));
+    let prepare_sql = metadata_contract_token_rows_sql()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(prepare_sql.contains("row_number() OVER (ORDER BY token_id)"));
+}
+
+#[test]
+fn template_score_cache_uses_available_memory_for_cross_batch_reuse() {
+    let slots = std::hint::black_box(METADATA_TEMPLATE_SCORE_CACHE_SLOTS);
+    let ways = std::hint::black_box(METADATA_TEMPLATE_SCORE_CACHE_WAYS);
+    assert!(slots >= 256 * 1024);
+    assert!(ways >= 4);
+    assert_eq!(slots % ways, 0);
+    assert!(MetadataTemplateScoreCache::memory_bytes() >= 128 * 1024);
+    assert!(
+        std::mem::size_of::<MetadataTemplateScoreCache>()
+            < MetadataTemplateScoreCache::memory_bytes()
+    );
+}
+
+#[test]
+fn template_score_cache_is_reused_across_content_score_batches() {
+    let index = InternedMetadataIndex::from_source_doc_entries(vec![
+        metadata_doc_entry("gold dragon collection"),
+        metadata_doc_entry("gold dragon collection variant"),
+    ]);
+    let records = (0..2)
+        .map(|contract_index| MetadataContentRecord {
+            contract_index,
+            doc: MetadataBm25Document::from_text("gold dragon")
+                .unwrap()
+                .into(),
+        })
+        .collect::<Vec<_>>();
+    let compact = CompactMetadataContentSet::from_records(&records);
+    let atoms = (0..2)
+        .map(|index| MetadataContentAtom {
+            chain_index: 0,
+            template_doc_index: metadata_doc_index_from_usize(index),
+            representative_record_index: metadata_doc_index_from_usize(index),
+            members: vec![metadata_contract_index_from_usize(index)],
+            fallback_token_groups: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let pairs = vec![(0, metadata_doc_index_from_usize(1))];
+    let rayon_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    let cache_pool = MetadataTemplateScoreCachePool::default();
+
+    let first = collect_metadata_validated_atom_pair_hits(
+        &pairs,
+        &atoms,
+        &compact.docs,
+        MetadataTemplateCompatibility::Scored(&index.scoring),
+        &rayon_pool,
+        &cache_pool,
+    );
+    let second = collect_metadata_validated_atom_pair_hits(
+        &pairs,
+        &atoms,
+        &compact.docs,
+        MetadataTemplateCompatibility::Scored(&index.scoring),
+        &rayon_pool,
+        &cache_pool,
+    );
+
+    assert!(first.stats.template_scored_pairs > 0);
+    assert_eq!(first.stats.template_cache_misses, 1);
+    assert_eq!(first.stats.template_cache_hits, 0);
+    assert_eq!(second.stats.template_cache_misses, 0);
+    assert_eq!(second.stats.template_cache_hits, 1);
+    assert_eq!(
+        second.stats.template_scored_pairs,
+        first.stats.template_scored_pairs
+    );
+    assert_eq!(first.hits, second.hits);
+}
+
+#[test]
+fn compact_template_bidirectional_score_matches_two_directional_scores() {
+    let index = InternedMetadataIndex::from_source_doc_entries(vec![
+        metadata_doc_entry("gold dragon alpha omega"),
+        metadata_doc_entry("dragon gold alpha"),
+        metadata_doc_entry("silver dragon alpha beta gamma"),
+        metadata_doc_entry("unrelated isolated metadata"),
+    ]);
+
+    for left in 0..index.doc_count() {
+        for right in 0..index.doc_count() {
+            let expected = (
+                index.scoring.score(left, right),
+                index.scoring.score(right, left),
+            );
+            let actual = index.scoring.score_bidirectional(left, right);
+            assert_eq!(actual, expected, "template pair {left}-{right}");
+        }
+    }
+
+    let source = include_str!("index.rs");
+    let start = source
+        .find("impl<'a> MetadataTemplateCompatibility<'a>")
+        .unwrap();
+    let end = source[start..]
+        .find("\n}\n")
+        .map(|offset| start + offset)
+        .unwrap();
+    let implementation = &source[start..end];
+    assert!(implementation.contains("score_bidirectional"));
+    assert!(!implementation.contains("scoring.score(left, right)"));
+    assert!(!implementation.contains("scoring.score(right, left)"));
+}
+
+#[test]
+fn metadata_cross_connection_check_short_circuits_before_matrix_lookup() {
+    let source = include_str!("index.rs");
+    let start = source
+        .find("pub(super) fn metadata_pair_already_connected")
+        .unwrap();
+    let end = source[start..]
+        .find("pub(super) fn lexical_metadata_token_ids")
+        .map(|offset| start + offset)
+        .unwrap();
+    let implementation = &source[start..end];
+    let cross = implementation.find("let cross_connected").unwrap();
+    let early_return = implementation
+        .find("if !cross_connected")
+        .expect("cross=false early return");
+    let matrix = implementation.find("let matrix_connected").unwrap();
+    assert!(cross < early_return && early_return < matrix);
+}
+
+#[test]
+fn shared_token_candidate_generation_overlaps_the_next_wave_with_consumption() {
+    let source = include_str!("index.rs");
+    let start = source
+        .find("fn union_metadata_shared_token_atom_core")
+        .unwrap();
+    let end = source[start..]
+        .find("pub(super) fn union_metadata_no_common_content_candidates")
+        .map(|offset| start + offset)
+        .unwrap();
+    let implementation = &source[start..end];
+
+    assert!(implementation.contains("rayon::join"));
+    assert!(implementation.contains("next_left_batches"));
+}
+
+#[test]
 fn production_metadata_path_does_not_materialize_global_template_match_pairs() {
     let source = include_str!("mod.rs");
     let analysis_start = source.find("pub(super) fn run_metadata_analysis").unwrap();
@@ -317,6 +625,28 @@ fn production_shared_atom_unions_do_not_merge_member_vectors() {
 }
 
 #[test]
+fn template_score_cache_pool_is_reused_across_shared_token_groups() {
+    let source = include_str!("index.rs");
+    let stream_start = source
+        .find("pub(super) fn union_metadata_token_content_matches")
+        .unwrap();
+    let stream_end = source[stream_start..]
+        .find("pub(super) fn metadata_token_content_rows_sql")
+        .map(|offset| stream_start + offset)
+        .unwrap();
+    assert!(source[stream_start..stream_end].contains("MetadataTemplateScoreCachePool::default()"));
+
+    let core_start = source
+        .find("fn union_metadata_shared_token_atom_core")
+        .unwrap();
+    let core_end = source[core_start..]
+        .find("fn union_metadata_no_common_atom_core")
+        .map(|offset| core_start + offset)
+        .unwrap();
+    assert!(!source[core_start..core_end].contains("MetadataTemplateScoreCachePool::default()"));
+}
+
+#[test]
 fn template_score_cache_is_symmetric_and_avoids_repeat_bm25_calls() {
     let index = InternedMetadataIndex::from_source_doc_entries(vec![
         metadata_doc_entry("gold dragon rare"),
@@ -331,19 +661,214 @@ fn template_score_cache_is_symmetric_and_avoids_repeat_bm25_calls() {
     let identical = cache.evaluate(0, 0, compatibility);
 
     assert!(first.1 > 0);
-    assert_eq!(repeated, (first.0, 0));
-    assert_eq!(reversed, (first.0, 0));
-    assert_eq!(identical, (true, 0));
+    assert!(!first.2);
+    assert_eq!(repeated, (first.0, first.1, true));
+    assert_eq!(reversed, (first.0, first.1, true));
+    assert_eq!(identical, (true, 0, false));
 
     let source = include_str!("index.rs");
-    let batch_start = source.find("impl MetadataValidatedPairBatch").unwrap();
-    let batch_end = source[batch_start..]
-        .find("fn collect_metadata_validated_atom_pair_hits")
-        .map(|offset| batch_start + offset)
+    let evaluation_start = source
+        .find("fn collect_metadata_template_pair_evaluations")
         .unwrap();
-    let batch = &source[batch_start..batch_end];
-    assert!(batch.contains("self.template_cache"));
-    assert!(batch.contains(".evaluate("));
+    let evaluation_end = source[evaluation_start..]
+        .find("impl MetadataValidatedPairBatch")
+        .map(|offset| evaluation_start + offset)
+        .unwrap();
+    let evaluation = &source[evaluation_start..evaluation_end];
+    assert!(evaluation.contains("cache.evaluate"));
+    assert!(evaluation.contains("template_cache_pool.take()"));
+    let collect_start = source
+        .find("fn collect_metadata_validated_atom_pair_hits")
+        .unwrap();
+    let collect_end = source[collect_start..]
+        .find("pub(super) fn score_and_apply_metadata_atom_pair_batch")
+        .map(|offset| collect_start + offset)
+        .unwrap();
+    assert!(source[collect_start..collect_end].contains("template_evaluations"));
+}
+
+#[test]
+fn score_batch_compacts_repeated_template_pairs_before_bm25() {
+    let index = InternedMetadataIndex::from_source_doc_entries(vec![
+        metadata_doc_entry("gold dragon collection"),
+        metadata_doc_entry("gold dragon collection variant"),
+    ]);
+    let pair_count = METADATA_CONTENT_PARALLEL_MIN_RECORDS * 4;
+    let mut atoms = Vec::with_capacity(pair_count * 2);
+    let mut records = Vec::with_capacity(pair_count * 2);
+    let mut pairs = Vec::with_capacity(pair_count);
+    for pair_index in 0..pair_count {
+        let left = atoms.len();
+        for template_doc_index in [0usize, 1usize] {
+            records.push(MetadataContentRecord {
+                contract_index: metadata_contract_index_from_usize(atoms.len()),
+                doc: MetadataBm25Document::from_text("gold dragon content")
+                    .unwrap()
+                    .into(),
+            });
+            atoms.push(MetadataContentAtom {
+                chain_index: 0,
+                template_doc_index: metadata_doc_index_from_usize(template_doc_index),
+                representative_record_index: metadata_doc_index_from_usize(atoms.len()),
+                members: vec![metadata_contract_index_from_usize(atoms.len())],
+                fallback_token_groups: Vec::new(),
+            });
+        }
+        pairs.push((left, metadata_doc_index_from_usize(left + 1)));
+        assert_eq!(pairs.len(), pair_index + 1);
+    }
+    let compact = CompactMetadataContentSet::from_records(&records);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let cache_pool = MetadataTemplateScoreCachePool::default();
+
+    let batch = collect_metadata_validated_atom_pair_hits(
+        &pairs,
+        &atoms,
+        &compact.docs,
+        MetadataTemplateCompatibility::Scored(&index.scoring),
+        &pool,
+        &cache_pool,
+    );
+
+    assert_eq!(batch.stats.template_batch_unique_pairs, 1);
+    assert_eq!(
+        batch.stats.template_batch_reused_pairs,
+        (pair_count - 1) as u64
+    );
+    assert_eq!(batch.stats.template_cache_misses, 1);
+}
+
+#[test]
+fn score_batch_skips_template_pair_sort_for_unique_heavy_batches() {
+    let pair_count = METADATA_CONTENT_PARALLEL_MIN_RECORDS * 4;
+    let entries = (0..pair_count * 2)
+        .map(|index| metadata_doc_entry(&format!("unique template identity {index}")))
+        .collect();
+    let index = InternedMetadataIndex::from_source_doc_entries(entries);
+    let mut atoms = Vec::with_capacity(pair_count * 2);
+    let mut records = Vec::with_capacity(pair_count * 2);
+    let mut pairs = Vec::with_capacity(pair_count);
+    for pair_index in 0..pair_count {
+        let left = atoms.len();
+        for template_doc_index in [left, left + 1] {
+            records.push(MetadataContentRecord {
+                contract_index: metadata_contract_index_from_usize(atoms.len()),
+                doc: MetadataBm25Document::from_text("shared content")
+                    .unwrap()
+                    .into(),
+            });
+            atoms.push(MetadataContentAtom {
+                chain_index: 0,
+                template_doc_index: metadata_doc_index_from_usize(template_doc_index),
+                representative_record_index: metadata_doc_index_from_usize(atoms.len()),
+                members: vec![metadata_contract_index_from_usize(atoms.len())],
+                fallback_token_groups: Vec::new(),
+            });
+        }
+        pairs.push((left, metadata_doc_index_from_usize(left + 1)));
+        assert_eq!(pairs.len(), pair_index + 1);
+    }
+    let compact = CompactMetadataContentSet::from_records(&records);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let cache_pool = MetadataTemplateScoreCachePool::default();
+
+    let batch = collect_metadata_validated_atom_pair_hits(
+        &pairs,
+        &atoms,
+        &compact.docs,
+        MetadataTemplateCompatibility::Scored(&index.scoring),
+        &pool,
+        &cache_pool,
+    );
+
+    assert_eq!(batch.stats.template_batch_unique_pairs, 0);
+    assert_eq!(batch.stats.template_batch_reused_pairs, 0);
+    assert!(batch.stats.template_cache_misses > 0);
+}
+
+#[test]
+fn dense_candidate_intersection_keeps_the_exact_two_dimension_pair_set() {
+    let atom_count = METADATA_DENSE_INTERSECTION_MIN_SCAN_COST + 2;
+    let mut builder = MetadataDataBuilder::new(1);
+    let mut records = Vec::with_capacity(atom_count);
+    for index in 0..atom_count {
+        let content = format!("shared content{index}");
+        builder.merge_indexed_row(IndexedMetadataRow {
+            chain_index: 0,
+            nft_count: 1,
+            content_doc: MetadataBm25Document::from_text(&content).map(Arc::new),
+            doc: MetadataBm25Document::from_text("shared template identity")
+                .unwrap()
+                .into(),
+            doc_key: metadata_document_key("shared template identity"),
+        });
+        records.push(MetadataContentRecord {
+            contract_index: metadata_contract_index_from_usize(index),
+            doc: MetadataBm25Document::from_text(&content).unwrap().into(),
+        });
+    }
+    let data = builder.finish();
+    let compact = CompactMetadataContentSet::from_records(&records);
+    let atoms = build_metadata_content_atoms(&records, &compact.docs, &data);
+    let compatibility = MetadataTemplateCompatibility::Scored(&data.metadata_index.scoring);
+    let candidate_index =
+        MetadataLocalCandidateIndex::from_atoms(&compact.docs, &atoms, compatibility, false);
+    let mut scratch = MetadataCandidateScratch::new(atoms.len());
+    scratch.clear_for_next_left();
+
+    let basis = candidate_index.append_candidates_after(
+        0,
+        &atoms[0],
+        &compact.docs[0],
+        compatibility,
+        &mut scratch,
+    );
+    let actual = scratch
+        .candidates
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let expected = (1..atoms.len())
+        .map(metadata_doc_index_from_usize)
+        .filter(|&right| {
+            metadata_content_atoms_share_token(0, right, &atoms, &compact.docs)
+                && metadata_template_atoms_share_safe_prefix(0, right, &atoms, compatibility)
+        })
+        .collect::<std::collections::HashSet<_>>();
+
+    assert_eq!(basis, MetadataLocalCandidateBasis::Intersection);
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn template_candidate_postings_use_sparse_csr_and_reuse_planned_ranges() {
+    let source = include_str!("index.rs");
+    let declaration_start = source
+        .find("pub(super) struct MetadataTemplateCandidateIndex")
+        .unwrap();
+    let declaration_end = source[declaration_start..]
+        .find("\n}")
+        .map(|offset| declaration_start + offset)
+        .unwrap();
+    let declaration = &source[declaration_start..declaration_end];
+    assert!(declaration.contains("MetadataSparseCandidatePostings"));
+    assert!(!declaration.contains("Vec<(u32, MetadataDocIndex)>"));
+
+    let implementation_start = source.find("impl MetadataLocalCandidateIndex").unwrap();
+    let implementation_end = source[implementation_start..]
+        .find("impl MetadataCandidateScratch")
+        .map(|offset| implementation_start + offset)
+        .unwrap();
+    let implementation = &source[implementation_start..implementation_end];
+    assert!(implementation.contains("plan_candidates_after"));
+    assert!(implementation.contains("append_planned_candidates"));
+    assert!(!implementation.contains("scan_cost_after"));
 }
 
 #[test]
@@ -803,7 +1328,7 @@ fn compact_contract_token_loader_maps_sources_and_sorts_unique_rows() {
         .build()
         .unwrap();
 
-    let tokens = load_metadata_contract_tokens(&conn, &data, &pool).unwrap();
+    let tokens = load_metadata_contract_tokens(&conn, &data, &pool, None).unwrap();
 
     assert_eq!(tokens.len(), 2);
     assert_eq!(tokens.tokens(0), &[2, 9]);
@@ -848,7 +1373,7 @@ fn compact_token_index_keeps_only_cross_contract_tokens() {
         .num_threads(2)
         .build()
         .unwrap();
-    let contract_tokens = load_metadata_contract_tokens(&conn, &data, &pool).unwrap();
+    let contract_tokens = load_metadata_contract_tokens(&conn, &data, &pool, None).unwrap();
     assert_eq!(contract_tokens.tokens(0), &[0]);
     assert_eq!(contract_tokens.tokens(1), &[0]);
 }
@@ -883,7 +1408,7 @@ fn reused_metadata_cache_contains_only_documents_used_by_multiple_sources() {
         .build()
         .unwrap();
 
-    let cache = load_reused_metadata_documents(&conn, &pool, None).unwrap();
+    let cache = load_reused_metadata_documents(&conn, &pool, None, usize::MAX, None).unwrap();
 
     assert_eq!(cache.len(), 1);
     assert!(cache.contains_key(r#"{"description":"shared"}"#));
@@ -930,7 +1455,8 @@ fn reused_metadata_cache_contains_only_documents_used_by_multiple_sources() {
         &chain_indexes,
     );
     assert!(uncached[0].1.doc.is_owned());
-    let bounded_cache = load_reused_metadata_documents(&conn, &pool, Some(1)).unwrap();
+    let bounded_cache =
+        load_reused_metadata_documents(&conn, &pool, Some(1), usize::MAX, None).unwrap();
     assert!(bounded_cache.is_empty());
     assert!(reused_metadata_documents_memory_bytes(&bounded_cache) <= 1);
 }
@@ -967,22 +1493,68 @@ fn reused_metadata_cache_respects_actual_parsed_memory_budget() {
         .num_threads(2)
         .build()
         .unwrap();
-    let unbounded = load_reused_metadata_documents(&conn, &pool, None).unwrap();
+    let unbounded = load_reused_metadata_documents(&conn, &pool, None, usize::MAX, None).unwrap();
     let exact_bytes = reused_metadata_documents_memory_bytes(&unbounded);
     assert!(exact_bytes > 1);
 
-    let bounded =
-        load_reused_metadata_documents(&conn, &pool, Some(exact_bytes.saturating_sub(1))).unwrap();
+    let bounded = load_reused_metadata_documents(
+        &conn,
+        &pool,
+        Some(exact_bytes.saturating_sub(1)),
+        usize::MAX,
+        None,
+    )
+    .unwrap();
 
     assert!(reused_metadata_documents_memory_bytes(&bounded) < exact_bytes);
 }
 
 #[test]
+fn reused_metadata_cache_skips_rows_larger_than_its_transient_parse_budget() {
+    let conn = Connection::open_in_memory().unwrap();
+    let large = format!(r#"{{"description":"{}"}}"#, "dragon ".repeat(10_000));
+    let small = r#"{"description":"shared gold dragon"}"#;
+    conn.execute_batch(&format!(
+        r#"
+        CREATE TEMP TABLE metadata_rows AS
+        SELECT *, 0::UINTEGER AS source_file,
+               row_number() OVER ()::UBIGINT AS source_row_number,
+               true AS metadata_eligible
+        FROM (VALUES
+            (0::UINTEGER, '1', '{large}'),
+            (1::UINTEGER, '1', '{large}'),
+            (2::UINTEGER, '1', '{small}'),
+            (3::UINTEGER, '1', '{small}')
+        ) rows(contract_id, token_id, metadata_json);
+        CREATE TEMP TABLE analysis_contracts AS
+        SELECT contract_id,
+               contract_id::BIGINT AS metadata_contract_index,
+               min(source_file)::UINTEGER AS metadata_source_file,
+               min(source_row_number)::UBIGINT AS metadata_source_row_number
+        FROM metadata_rows
+        GROUP BY contract_id;
+        CREATE TEMP TABLE metadata_contract_token_rows AS
+        SELECT metadata_contract_index, metadata_source_file, metadata_source_row_number
+        FROM analysis_contracts;
+        "#
+    ))
+    .unwrap();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    let transient_budget = reused_metadata_load_row_transient_bytes(small);
+
+    let cache = load_reused_metadata_documents(&conn, &pool, None, transient_budget, None).unwrap();
+
+    assert!(cache.contains_key(small));
+    assert!(!cache.contains_key(&large));
+}
+
+#[test]
 fn reused_metadata_cache_budget_does_not_rescan_all_entries_per_insert() {
     let source = include_str!("load.rs");
-    let start = source
-        .find("pub(super) fn load_reused_metadata_documents(")
-        .unwrap();
+    let start = source.find("fn append_reused_metadata_documents(").unwrap();
     let end = source[start..]
         .find("pub(super) fn load_metadata_data(")
         .map(|offset| start + offset)
@@ -996,11 +1568,9 @@ fn reused_metadata_cache_budget_does_not_rescan_all_entries_per_insert() {
     assert!(!loader.contains("reused_metadata_documents_memory_bytes(&documents)"));
     assert!(loader.contains("retained_payload_bytes"));
     assert!(!loader.contains("budget_exhausted"));
-    assert!(
-        normalized.contains("ifmax_raw_bytes==Some(0){returnOk(ReusedMetadataDocuments::new());}")
-    );
+    assert!(normalized.contains("ifmaximum_cache_bytes==Some(0)||maximum_transient_bytes==0"));
     assert!(normalized
-        .contains("ifprojected_bytes>maximum{documents.shrink_to_fit();returnOk(documents);}"));
+        .contains("ifprojected_bytes>maximum{documents.shrink_to_fit();returnOk(false);}"));
 }
 
 #[test]
@@ -1082,10 +1652,11 @@ fn skipped_metadata_documents_preserve_source_to_compact_contract_mapping() {
         &pool,
         ReusedMetadataDocuments::new(),
         MetadataLoadBudgets::new(usize::MAX, usize::MAX),
+        None,
     )
     .unwrap();
     prepare_metadata_contract_token_rows(&conn).unwrap();
-    let contract_tokens = load_metadata_contract_tokens(&conn, &data, &pool).unwrap();
+    let contract_tokens = load_metadata_contract_tokens(&conn, &data, &pool, None).unwrap();
 
     assert_eq!(data.contracts.len(), 2);
     assert_eq!(data.compact_contract_index_for_source(0), Some(0));
@@ -1139,7 +1710,7 @@ fn token_content_groups_union_matches_without_contract_pair_table() {
         .num_threads(2)
         .build()
         .unwrap();
-    let contract_tokens = load_metadata_contract_tokens(&conn, &data, &pool).unwrap();
+    let contract_tokens = load_metadata_contract_tokens(&conn, &data, &pool, None).unwrap();
     let mut state = MetadataUnionState {
         intra: UnionFind::new(2),
         cross: None,
@@ -1197,9 +1768,10 @@ fn token_content_fast_path_does_not_substitute_a_fallback_document() {
         &pool,
         ReusedMetadataDocuments::new(),
         MetadataLoadBudgets::new(usize::MAX, usize::MAX),
+        None,
     )
     .unwrap();
-    let contract_tokens = load_metadata_contract_tokens(&conn, &data, &pool).unwrap();
+    let contract_tokens = load_metadata_contract_tokens(&conn, &data, &pool, None).unwrap();
     let mut state = MetadataUnionState {
         intra: UnionFind::new(2),
         cross: None,
@@ -3427,6 +3999,17 @@ fn metadata_builder_budget_excludes_load_transient_reserve() {
 }
 
 #[test]
+fn metadata_runtime_reserve_includes_each_worker_stack() {
+    let one_worker = metadata_runtime_reserve_bytes(100, 1_000, 3, 1);
+    let four_workers = metadata_runtime_reserve_bytes(100, 1_000, 3, 4);
+
+    assert_eq!(
+        four_workers.saturating_sub(one_worker),
+        3 * METADATA_ANALYSIS_WORKER_STACK_BYTES
+    );
+}
+
+#[test]
 fn metadata_load_transient_reserve_is_capped_to_preserve_resident_index_memory() {
     let gib = 1024usize * 1024 * 1024;
     let reserve = metadata_load_transient_reserve_bytes(
@@ -3458,10 +4041,39 @@ fn metadata_index_is_bounded_before_contract_tokens_are_loaded() {
         .find("metadata_pre_token_resident_budget_bytes(")
         .unwrap();
     let load_tokens = source
-        .find("load_metadata_contract_tokens(conn, &data, &pool)")
+        .find("load_metadata_contract_tokens(conn, &data, &pool, Some(progress))")
         .unwrap();
 
     assert!(reserve < pre_token_check && pre_token_check < load_tokens);
+}
+
+#[test]
+fn long_metadata_loaders_report_progress_for_each_arrow_batch() {
+    let source = include_str!("load.rs");
+    for (start_marker, end_marker) in [
+        (
+            "pub(super) fn load_reused_metadata_documents(",
+            "pub(super) fn load_metadata_data(",
+        ),
+        (
+            "pub(super) fn load_metadata_data(",
+            "fn index_metadata_load_chunk(",
+        ),
+        (
+            "pub(super) fn load_metadata_contract_tokens(",
+            "const CONTRACT_TOKEN_SORT_LEAF_CONTRACTS",
+        ),
+    ] {
+        let start = source.find(start_marker).unwrap();
+        let end = source[start..]
+            .find(end_marker)
+            .map(|offset| start + offset)
+            .unwrap();
+        let loader = &source[start..end];
+        assert!(loader.contains("progress"));
+        assert!(loader.contains("batch.num_rows() as u64"));
+        assert!(loader.contains("advance_task"));
+    }
 }
 
 #[test]
@@ -3750,6 +4362,7 @@ fn metadata_index_build_uses_configured_rayon_pool() {
         &pool,
         ReusedMetadataDocuments::new(),
         MetadataLoadBudgets::new(usize::MAX, usize::MAX),
+        None,
     )
     .unwrap();
 

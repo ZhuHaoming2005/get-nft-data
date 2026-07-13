@@ -1,5 +1,13 @@
 use super::*;
 
+pub(crate) const NAME_ANALYSIS_WORKER_STACK_BYTES: usize = 4 * 1024 * 1024;
+
+pub(crate) fn name_worker_stack_reserve_bytes(threads: usize) -> usize {
+    threads
+        .max(1)
+        .saturating_mul(NAME_ANALYSIS_WORKER_STACK_BYTES)
+}
+
 pub(crate) struct NameAnalysisSpec<'a> {
     pub(crate) chains: &'a [String],
     pub(crate) totals: &'a HashMap<String, NameTotals>,
@@ -80,10 +88,6 @@ pub(crate) fn run_name_analysis(
     progress.advance_task(atoms.len() as u64, ProgressCounters::default());
     progress.finish_task(format!("loaded {} name atoms", atoms.len()));
     progress.step_stage(format!("loaded {} name atoms", atoms.len()));
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(spec.threads.max(1))
-        .build()
-        .map_err(|err| AnalysisError::InvalidData(err.to_string()))?;
     let canonical = canonical_name_values(&atoms);
     let canonical_name_count = canonical.atoms.len();
     progress.set_message(format!(
@@ -128,14 +132,18 @@ pub(crate) fn run_name_analysis(
     let chain_matrix_state_bytes = chain_matrix_reuse_state_bytes(&atoms_by_chain);
     let state_bytes =
         threshold_state_bytes(atoms.len(), chains.len()).saturating_add(chain_matrix_state_bytes);
+    let worker_stack_bytes = name_worker_stack_reserve_bytes(spec.threads);
     let initial_memory_plan = name_analysis_memory_plan(
         spec.memory_limit,
         spec.analysis_memory_limit,
-        base_atom_bytes.saturating_add(index_estimate.peak_build_bytes),
+        base_atom_bytes
+            .saturating_add(index_estimate.peak_build_bytes)
+            .saturating_add(worker_stack_bytes),
     )?;
     let scoring_resident_bytes = base_atom_bytes
         .saturating_add(index_estimate.resident_bytes)
-        .saturating_add(state_bytes);
+        .saturating_add(state_bytes)
+        .saturating_add(worker_stack_bytes);
     let scratch_plan = name_scratch_plan(
         canonical.atoms.len(),
         spec.threads,
@@ -153,6 +161,12 @@ pub(crate) fn run_name_analysis(
         "Rust analysis memory budget {}",
         format_byte_size(memory_plan.analysis_bytes)
     ));
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(spec.threads.max(1))
+        .thread_name(|index| format!("name-{index}"))
+        .stack_size(NAME_ANALYSIS_WORKER_STACK_BYTES)
+        .build()
+        .map_err(|err| AnalysisError::InvalidData(err.to_string()))?;
     progress.start_task(
         format!(
             "building candidate index for {} canonical names",

@@ -172,7 +172,10 @@ pub(crate) fn name_scratch_plan(
         .saturating_mul(worker_count);
     let edge_pipeline_bytes = NAME_EDGE_CHUNK_SIZE
         .saturating_mul(std::mem::size_of::<(usize, ScoredRight)>())
-        .saturating_mul(worker_count.saturating_mul(3));
+        // One batch can be actively filled, one can be executing, one can be
+        // blocked in the bounded channel, and Rayon may already have created
+        // the replacement batch for the worker.
+        .saturating_mul(worker_count.saturating_mul(4));
     let common_bytes = candidate_bytes.saturating_add(edge_pipeline_bytes);
     let dense_bytes = common_bytes.saturating_add(
         atom_count

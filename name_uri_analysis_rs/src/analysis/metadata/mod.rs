@@ -170,8 +170,16 @@ pub(crate) struct MetadataAlgorithmMetrics {
     template_scored_pairs: u64,
     template_matched_pairs: u64,
     content_atoms: u64,
+    content_raw_candidate_pairs: u64,
+    content_dimension_rejected_pairs: u64,
     content_candidate_pairs: u64,
+    content_already_connected_pairs: u64,
     content_scored_pairs: u64,
+    template_rejected_pairs: u64,
+    template_cache_hits: u64,
+    template_cache_misses: u64,
+    template_batch_unique_pairs: u64,
+    template_batch_reused_pairs: u64,
     mmap_bytes: u64,
     dsu_bytes: u64,
 }
@@ -624,6 +632,7 @@ pub(super) fn run_metadata_analysis(
         selected_source_count,
         retained_contract_token_count,
         chains.len(),
+        threads,
     );
     if runtime_reserve_bytes >= analysis_memory_bytes {
         return Err(AnalysisError::InvalidData(format!(
@@ -652,8 +661,13 @@ pub(super) fn run_metadata_analysis(
         .min(analysis_memory_bytes.saturating_sub(runtime_reserve_bytes))
         .min(analysis_memory_bytes.saturating_sub(concurrent_load_reserve_bytes));
     progress.start_task("loading reused metadata documents", None, "documents");
-    let reused_documents = load_reused_metadata_documents(conn, &pool, Some(cache_budget_bytes))?;
-    progress.advance_task(reused_documents.len() as u64, ProgressCounters::default());
+    let reused_documents = load_reused_metadata_documents(
+        conn,
+        &pool,
+        Some(cache_budget_bytes),
+        load_transient_reserve_bytes,
+        Some(progress),
+    )?;
     progress.finish_task(format!(
         "loaded {} reused metadata documents",
         reused_documents.len()
@@ -678,8 +692,8 @@ pub(super) fn run_metadata_analysis(
         &pool,
         reused_documents,
         MetadataLoadBudgets::new(builder_peak_budget_bytes, load_transient_reserve_bytes),
+        Some(progress),
     )?;
-    progress.advance_task(data.contracts.len() as u64, ProgressCounters::default());
     let contract_token_reserve_bytes =
         metadata_contract_token_reserve_bytes(data.contracts.len(), retained_contract_token_count);
     let pre_token_resident_budget = metadata_pre_token_resident_budget_bytes(
@@ -709,14 +723,10 @@ pub(super) fn run_metadata_analysis(
     progress.step_stage("loaded metadata document index");
     progress.start_task(
         "loading contract-token CSR in two passes",
-        None,
+        Some(retained_contract_token_rows.saturating_mul(2)),
         "memberships",
     );
-    let contract_tokens = load_metadata_contract_tokens(conn, &data, &pool)?;
-    progress.advance_task(
-        retained_contract_token_rows.saturating_mul(2),
-        ProgressCounters::default(),
-    );
+    let contract_tokens = load_metadata_contract_tokens(conn, &data, &pool, Some(progress))?;
     progress.finish_task(format!(
         "loaded {retained_contract_token_rows} shared-token memberships in two passes"
     ));
@@ -764,8 +774,16 @@ pub(super) fn run_metadata_analysis(
                 template_scored_pairs: 0,
                 template_matched_pairs: 0,
                 content_atoms: 0,
+                content_raw_candidate_pairs: 0,
+                content_dimension_rejected_pairs: 0,
                 content_candidate_pairs: 0,
+                content_already_connected_pairs: 0,
                 content_scored_pairs: 0,
+                template_rejected_pairs: 0,
+                template_cache_hits: 0,
+                template_cache_misses: 0,
+                template_batch_unique_pairs: 0,
+                template_batch_reused_pairs: 0,
                 mmap_bytes: mapped_index_bytes,
                 dsu_bytes: 0,
             },
@@ -805,8 +823,18 @@ pub(super) fn run_metadata_analysis(
         content_stats.accumulate(shared_stats);
     }
     progress.finish_task(format!(
-        "shared-token matching complete; candidates {}; scored {}; matched {}",
-        content_stats.candidate_pairs, content_stats.scored_pairs, content_stats.matched_pairs
+        "shared-token matching complete; raw {}; dimension-rejected {}; candidates {}; connected-skips {}; template batch unique/reused {}/{}; template-rejected {}; cache {}/{} hit/miss; content-scored {}; matched {}",
+        content_stats.raw_candidate_pairs,
+        content_stats.dimension_rejected_pairs,
+        content_stats.candidate_pairs,
+        content_stats.already_connected_pairs,
+        content_stats.template_batch_unique_pairs,
+        content_stats.template_batch_reused_pairs,
+        content_stats.template_rejected_pairs,
+        content_stats.template_cache_hits,
+        content_stats.template_cache_misses,
+        content_stats.scored_pairs,
+        content_stats.matched_pairs
     ));
     progress.step_stage("matched shared-token metadata groups");
     drop(std::mem::take(&mut data.reused_documents));
@@ -875,8 +903,16 @@ pub(super) fn run_metadata_analysis(
             template_scored_pairs: content_stats.template_scored_pairs,
             template_matched_pairs: content_stats.template_matched_pairs,
             content_atoms: content_stats.atom_count as u64,
+            content_raw_candidate_pairs: content_stats.raw_candidate_pairs,
+            content_dimension_rejected_pairs: content_stats.dimension_rejected_pairs,
             content_candidate_pairs: content_stats.candidate_pairs,
+            content_already_connected_pairs: content_stats.already_connected_pairs,
             content_scored_pairs: content_stats.scored_pairs,
+            template_rejected_pairs: content_stats.template_rejected_pairs,
+            template_cache_hits: content_stats.template_cache_hits,
+            template_cache_misses: content_stats.template_cache_misses,
+            template_batch_unique_pairs: content_stats.template_batch_unique_pairs,
+            template_batch_reused_pairs: content_stats.template_batch_reused_pairs,
             mmap_bytes: mapped_index_bytes,
             dsu_bytes,
         },
@@ -966,6 +1002,7 @@ fn metadata_runtime_reserve_bytes(
     contract_count: usize,
     retained_contract_token_rows: usize,
     chain_count: usize,
+    threads: usize,
 ) -> usize {
     let contract_tokens =
         metadata_contract_token_resident_bytes(contract_count, retained_contract_token_rows);
@@ -981,7 +1018,13 @@ fn metadata_runtime_reserve_bytes(
         .saturating_add(source_mapping)
         .saturating_add(dense_dsu)
         .saturating_add(sparse_dsu);
-    reserve.saturating_add(reserve.saturating_div(8))
+    reserve
+        .saturating_add(reserve.saturating_div(8))
+        .saturating_add(
+            threads
+                .max(1)
+                .saturating_mul(METADATA_ANALYSIS_WORKER_STACK_BYTES),
+        )
 }
 
 fn metadata_contract_token_resident_bytes(

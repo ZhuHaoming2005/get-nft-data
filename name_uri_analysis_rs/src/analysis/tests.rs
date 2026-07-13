@@ -205,7 +205,7 @@ fn name_scratch_plan_uses_dense_mode_only_when_all_workers_fit() {
     let workers = threads.min(atom_count - 1);
     let candidate_capacity = atom_count.max(4).next_power_of_two();
     let common_bytes = candidate_capacity * std::mem::size_of::<NameAtomIndex>() * workers
-        + NAME_EDGE_CHUNK_SIZE * std::mem::size_of::<(usize, ScoredRight)>() * workers * 3;
+        + NAME_EDGE_CHUNK_SIZE * std::mem::size_of::<(usize, ScoredRight)>() * workers * 4;
     let dense_bytes = common_bytes + atom_count * std::mem::size_of::<u16>() * workers;
 
     let dense = name_scratch_plan(atom_count, threads, dense_bytes);
@@ -231,7 +231,7 @@ fn name_scratch_plan_reserves_the_candidate_vectors_actual_worst_capacity() {
     let workers = 1usize;
     let candidate_capacity = atom_count.max(4).next_power_of_two();
     let expected = candidate_capacity * std::mem::size_of::<NameAtomIndex>() * workers
-        + NAME_EDGE_CHUNK_SIZE * std::mem::size_of::<(usize, ScoredRight)>() * workers * 3
+        + NAME_EDGE_CHUNK_SIZE * std::mem::size_of::<(usize, ScoredRight)>() * workers * 4
         + atom_count * std::mem::size_of::<u16>() * workers;
 
     let plan = name_scratch_plan(atom_count, workers, usize::MAX);
@@ -1244,6 +1244,7 @@ fn hierarchical_progress_tracks_pipeline_stage_and_task_independently() {
         pipeline,
         stage,
         task,
+        metrics,
         ..
     } = &progress
     else {
@@ -1271,15 +1272,49 @@ fn hierarchical_progress_tracks_pipeline_stage_and_task_independently() {
     );
     assert_eq!(task.length(), Some(100));
     assert_eq!(task.position(), 25);
-    assert!(task.message().contains("groups 2"));
-    assert!(task.message().contains("candidates 300"));
-    assert!(task.message().contains("scored 40"));
-    assert!(task.message().contains("matched 7"));
+    assert_eq!(task.message(), "shared-token memberships");
+    assert!(metrics.message().contains("groups 2"));
+    assert!(metrics.message().contains("candidates 300"));
+    assert!(metrics.message().contains("scored 40"));
+    assert!(metrics.message().contains("matched 7"));
 
     progress.finish_task("shared-token matching complete");
     progress.finish_stage("metadata complete");
     progress.finish_pipeline_stage("metadata complete");
     assert_eq!(pipeline.position(), 3);
+}
+
+#[test]
+fn progress_layout_keeps_fixed_bars_separate_from_long_metrics() {
+    assert!(pipeline_bar_template().contains("{bar:24"));
+    assert!(stage_bar_template().contains("{bar:28"));
+    assert!(task_bar_template().contains("{bar:32"));
+    assert!(!pipeline_bar_template().contains("wide_bar"));
+    assert!(!stage_bar_template().contains("wide_bar"));
+    assert!(!task_bar_template().contains("wide_bar"));
+    assert!(metrics_template().contains("metrics"));
+}
+
+#[test]
+fn progress_text_refreshes_at_least_twenty_times_per_second() {
+    assert!(PROGRESS_REFRESH_INTERVAL <= std::time::Duration::from_millis(50));
+    let source = include_str!("progress.rs");
+    assert!(source.contains("enable_steady_tick(PROGRESS_REFRESH_INTERVAL)"));
+}
+
+#[test]
+fn name_worker_stacks_are_reserved_inside_the_analysis_budget() {
+    assert_eq!(
+        name_worker_stack_reserve_bytes(4) - name_worker_stack_reserve_bytes(1),
+        3 * NAME_ANALYSIS_WORKER_STACK_BYTES
+    );
+    let source = include_str!("name.rs");
+    let final_plan = source
+        .rfind("let memory_plan = name_analysis_memory_plan")
+        .unwrap();
+    let pool_build = source.find("rayon::ThreadPoolBuilder::new()").unwrap();
+    assert!(final_plan < pool_build);
+    assert!(source.contains(".stack_size(NAME_ANALYSIS_WORKER_STACK_BYTES)"));
 }
 
 #[test]
@@ -1344,6 +1379,7 @@ fn hierarchical_progress_finishes_all_levels_with_failure_context() {
         pipeline,
         stage,
         task,
+        metrics,
         ..
     } = &progress
     else {
@@ -1352,6 +1388,7 @@ fn hierarchical_progress_finishes_all_levels_with_failure_context() {
     assert!(pipeline.is_finished());
     assert!(stage.is_finished());
     assert!(task.is_finished());
+    assert!(metrics.is_finished());
     assert!(pipeline.message().contains("FAILED"));
     assert!(pipeline.message().contains("metadata query failed"));
 }
