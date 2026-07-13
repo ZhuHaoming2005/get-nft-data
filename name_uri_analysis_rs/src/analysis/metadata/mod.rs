@@ -50,6 +50,10 @@ pub(super) const METADATA_PAIR_LEFT_CHUNK_SIZE: usize = 256;
 pub(super) const METADATA_CONTENT_PARALLEL_MIN_RECORDS: usize = 64;
 pub(super) const METADATA_CONTENT_SCORE_BATCH_PAIRS: usize = 16 * 1024;
 const METADATA_REUSE_CACHE_BUDGET_DIVISOR: usize = 16;
+// Debug builds retain substantially larger Rayon/JSON/scoring frames than
+// optimized builds. The explicit worker stack prevents data-dependent aborts;
+// Linux commits these stack pages on demand rather than eagerly.
+const METADATA_ANALYSIS_WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
 pub(super) type MetadataDocKey = String;
 pub(super) type MetadataContractIndex = u32;
 pub(super) type MetadataDocIndex = u32;
@@ -523,6 +527,8 @@ pub(super) fn run_metadata_analysis(
     progress.start_phase("analyzing metadata duplicates", 3);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads.max(1))
+        .thread_name(|index| format!("metadata-{index}"))
+        .stack_size(METADATA_ANALYSIS_WORKER_STACK_BYTES)
         .build()
         .map_err(|err| AnalysisError::InvalidData(err.to_string()))?;
     let eligible_rows = scalar_u64(conn, "SELECT count(*)::UBIGINT FROM metadata_rows")?;

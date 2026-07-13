@@ -178,6 +178,23 @@ fn production_metadata_path_does_not_materialize_global_template_match_pairs() {
 }
 
 #[test]
+fn metadata_analysis_workers_have_an_explicit_production_stack_budget() {
+    let source = include_str!("mod.rs");
+    let analysis_start = source.find("pub(super) fn run_metadata_analysis").unwrap();
+    let analysis_end = source[analysis_start..]
+        .find("fn scalar_u64")
+        .map(|offset| analysis_start + offset)
+        .unwrap();
+    let analysis = &source[analysis_start..analysis_end];
+
+    assert!(
+        source.contains("const METADATA_ANALYSIS_WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;")
+    );
+    assert!(analysis.contains(".stack_size(METADATA_ANALYSIS_WORKER_STACK_BYTES)"));
+    assert!(analysis.contains(".thread_name(|index| format!(\"metadata-{index}\"))"));
+}
+
+#[test]
 fn template_compatibility_is_scored_inside_parallel_content_batches() {
     let source = include_str!("index.rs");
     let shared_start = source
