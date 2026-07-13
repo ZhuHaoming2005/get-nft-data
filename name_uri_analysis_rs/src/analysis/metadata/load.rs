@@ -10,7 +10,10 @@ use super::bm25::MetadataBm25Document;
 use super::parse::{
     metadata_documents_from_json, metadata_is_dedup_eligible, MAX_METADATA_BYTES_FOR_DEDUP,
 };
-use super::{metadata_contract_index_to_usize, MetadataData, MetadataDataBuilder, MetadataDocKey};
+use super::{
+    metadata_contract_index_to_usize, MetadataData, MetadataDataBuilder, MetadataDocKey,
+    MetadataTemplateDocument,
+};
 
 pub(super) const METADATA_LOAD_CHUNK_ROWS: usize = 16 * 1024;
 pub(super) const METADATA_FALLBACK_SOURCE_TABLE: &str = "__metadata_fallback_source_indexes";
@@ -50,13 +53,13 @@ pub(crate) struct IndexedMetadataRow {
     pub(super) chain_index: usize,
     pub(super) nft_count: i64,
     pub(super) content_doc: Option<Arc<MetadataBm25Document>>,
-    pub(super) doc: MetadataBm25Document,
+    pub(super) doc: MetadataTemplateDocument,
     pub(super) doc_key: MetadataDocKey,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct ReusedMetadataDocument {
-    pub(super) prefilter: Option<MetadataBm25Document>,
+    pub(super) prefilter: Option<Arc<MetadataBm25Document>>,
     pub(super) content: Option<Arc<MetadataBm25Document>>,
     pub(super) doc_key: MetadataDocKey,
 }
@@ -171,9 +174,7 @@ fn metadata_load_row_transient_bytes_for_capacities(
         document
             .prefilter
             .as_ref()
-            .map_or(0, |prefilter| {
-                std::mem::size_of::<MetadataBm25Document>().saturating_add(prefilter.memory_bytes())
-            })
+            .map_or(0, |_| std::mem::size_of::<Arc<MetadataBm25Document>>())
             .saturating_add(std::mem::size_of::<MetadataDocKey>())
             .saturating_add(document.doc_key.capacity())
             .saturating_add(std::mem::size_of::<Arc<MetadataBm25Document>>())
@@ -384,7 +385,7 @@ pub(super) fn reused_metadata_documents_non_content_memory_bytes(
                 document
                     .prefilter
                     .as_ref()
-                    .map_or(0, MetadataBm25Document::memory_bytes),
+                    .map_or(0, metadata_content_arc_memory_bytes),
             )
     })
 }
@@ -402,7 +403,7 @@ fn reused_metadata_document_payload_bytes(
     let prefilter_bytes = document
         .prefilter
         .as_ref()
-        .map_or(0, MetadataBm25Document::memory_bytes);
+        .map_or(0, metadata_content_arc_memory_bytes);
     let content_bytes = document
         .content
         .as_ref()
@@ -439,7 +440,8 @@ pub(super) fn load_reused_metadata_documents(
                 .map(|raw| {
                     let documents = metadata_documents_from_json(&raw);
                     let prefilter =
-                        MetadataBm25Document::from_normalized_text(&documents.prefilter);
+                        MetadataBm25Document::from_normalized_text(&documents.prefilter)
+                            .map(Arc::new);
                     let content = MetadataBm25Document::from_normalized_text(&documents.content)
                         .map(Arc::new);
                     let cached = ReusedMetadataDocument {
@@ -603,7 +605,7 @@ fn merge_metadata_load_chunk(
         reused_documents,
         maximum_builder_bytes,
     )?;
-    builder.merge_indexed_rows(indexed_rows);
+    builder.merge_indexed_rows(indexed_rows, true);
     builder.ensure_within_memory_budget(maximum_builder_bytes)
 }
 
@@ -740,7 +742,7 @@ fn merge_metadata_fallback_load_chunk(
             first_rows.push((source_contract_index, row));
         }
     }
-    builder.merge_indexed_rows(first_rows);
+    builder.merge_indexed_rows(first_rows, false);
     builder.ensure_within_memory_budget(maximum_builder_bytes)
 }
 
@@ -784,13 +786,13 @@ pub(super) fn index_metadata_raw_row_chunk_with_cache(
                 reused_documents.get(&row.metadata_json)
             {
                 (
-                    cached.prefilter.clone()?,
+                    cached.prefilter.clone()?.into(),
                     cached.content.clone(),
                     cached.doc_key.clone(),
                 )
             } else {
                 let documents = metadata_documents_from_json(&row.metadata_json);
-                let doc = MetadataBm25Document::from_normalized_text(&documents.prefilter)?;
+                let doc = MetadataBm25Document::from_normalized_text(&documents.prefilter)?.into();
                 let doc_key = metadata_document_key(&documents.prefilter);
                 let content_doc =
                     MetadataBm25Document::from_normalized_text(&documents.content).map(Arc::new);
@@ -855,17 +857,23 @@ pub(super) fn metadata_contract_token_rows_sql() -> &'static str {
                    AS retained_shared_token_count
         FROM metadata_token_frequencies;
 
+        CREATE TEMP TABLE metadata_retained_tokens AS
+        SELECT token_id,
+               (row_number() OVER () - 1)::BIGINT AS token_index
+        FROM metadata_token_frequencies
+        WHERE contract_frequency >= 2;
+
         CREATE TABLE metadata_contract_token_rows AS
         SELECT metadata.contract_index,
-               (dense_rank() OVER (ORDER BY metadata.token_id) - 1)::BIGINT AS token_index,
+               retained.token_index,
                metadata.metadata_source.file_id::UINTEGER AS metadata_source_file,
                metadata.metadata_source.row_number::UBIGINT AS metadata_source_row_number
         FROM metadata_unique_contract_tokens metadata
-        INNER JOIN metadata_token_frequencies frequencies USING (token_id)
-        WHERE frequencies.contract_frequency >= 2;
+        INNER JOIN metadata_retained_tokens retained USING (token_id);
 
         DROP TABLE metadata_unique_contract_tokens;
         DROP TABLE metadata_token_frequencies;
+        DROP TABLE metadata_retained_tokens;
     "
 }
 

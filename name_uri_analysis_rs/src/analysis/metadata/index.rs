@@ -35,6 +35,7 @@ use super::{
 use super::{MetadataDocPair, MetadataTemplateMatches, METADATA_PAIR_LEFT_CHUNK_SIZE};
 
 pub(super) const METADATA_RAW_GROUP_CHUNK_SIZE: usize = 1024;
+const METADATA_TOKEN_GROUP_BATCH_MULTIPLIER: usize = 4;
 const NO_METADATA_ATOM: usize = usize::MAX;
 const METADATA_TEMPLATE_SCORE_CACHE_SLOTS: usize = 256;
 const METADATA_DIRECT_ATOM_GROUP_SIZE: usize = 2;
@@ -53,7 +54,8 @@ pub(super) struct MetadataFallbackTokenGroup {
 }
 
 pub(super) struct MetadataContentCandidateIndex {
-    entries: Vec<(u32, MetadataDocIndex)>,
+    posting_offsets: Vec<u64>,
+    posting_atoms: Vec<MetadataDocIndex>,
 }
 
 pub(super) struct MetadataTemplateCandidateIndex {
@@ -435,7 +437,12 @@ impl CompactMetadataContentGroupBuilder {
             return 0;
         }
         let candidate_entry_bytes = std::mem::size_of::<(u32, MetadataDocIndex)>();
-        let content_candidate_index = Self::vec_bytes_upper(self.term_count, candidate_entry_bytes);
+        let content_candidate_index =
+            Self::vec_bytes_upper(self.term_count, std::mem::size_of::<MetadataDocIndex>())
+                .saturating_add(Self::vec_bytes_upper(
+                    self.token_ids.len().saturating_add(1),
+                    2usize.saturating_mul(std::mem::size_of::<u64>()),
+                ));
         let template_candidate_index =
             Self::vec_bytes_upper(self.template_candidate_term_count, candidate_entry_bytes)
                 .saturating_add(4usize.saturating_mul(candidate_entry_bytes));
@@ -656,7 +663,6 @@ impl CompactMetadataContentGroupBuilder {
 }
 
 impl MetadataRawTokenGroup {
-    #[cfg(test)]
     pub(super) fn raw_parse_reserve_bytes(&self) -> usize {
         let raw_bytes = self
             .raw_records
@@ -667,6 +673,16 @@ impl MetadataRawTokenGroup {
         // metadata loader. JSON normalization, token strings, term-frequency
         // maps and Rayon result buffers coexist before online atomization.
         super::load::metadata_uncached_parse_transient_bytes(raw_bytes, 0)
+    }
+
+    fn parallel_prepare_bytes(&self) -> usize {
+        self.compact
+            .builder_memory_bytes()
+            .saturating_add(self.raw_parse_reserve_bytes())
+    }
+
+    fn record_count(&self) -> usize {
+        self.raw_record_count
     }
 
     fn reserve_raw_record(&mut self) -> Result<(), AnalysisError> {
@@ -737,6 +753,29 @@ impl MetadataRawTokenGroup {
         }
         if self.raw_records.len() >= METADATA_RAW_GROUP_CHUNK_SIZE {
             self.flush_raw(context, maximum_bytes)?;
+        }
+        Ok(())
+    }
+
+    fn push_loaded_representative_with_budget(
+        &mut self,
+        contract_index: MetadataContractIndex,
+        context: &MetadataContentUnionContext<'_>,
+        maximum_bytes: usize,
+    ) -> Result<(), AnalysisError> {
+        self.raw_record_count = self.raw_record_count.saturating_add(1);
+        if let Some(document) = context.data.contracts
+            [metadata_contract_index_to_usize(contract_index)]
+        .content_doc
+        .as_deref()
+        {
+            self.compact
+                .push_document(contract_index, document, context.data, None);
+            self.compact.ensure_within_memory_budget(
+                self.projected_raw_parse_reserve_bytes(0),
+                maximum_bytes,
+                context.pool.current_num_threads(),
+            )?;
         }
         Ok(())
     }
@@ -842,60 +881,106 @@ impl MetadataRawTokenGroup {
     }
 }
 
+fn prepare_metadata_token_group_batch(
+    groups: &mut Vec<MetadataRawTokenGroup>,
+    context: &MetadataContentUnionContext<'_>,
+    state: &mut MetadataUnionState,
+    maximum_working_bytes: usize,
+) -> Result<MetadataContentUnionStats, AnalysisError> {
+    if groups.len() > 1 {
+        context.pool.install(|| {
+            groups
+                .par_iter_mut()
+                .try_for_each(|group| group.flush_raw(context, maximum_working_bytes))
+        })?;
+    }
+    let mut remaining_prepared_bytes = groups.iter().fold(0usize, |bytes, group| {
+        bytes.saturating_add(group.parallel_prepare_bytes())
+    });
+    if remaining_prepared_bytes > maximum_working_bytes {
+        return Err(AnalysisError::InvalidData(format!(
+            "prepared metadata token groups need about {}, exceeding remaining analysis budget {}",
+            super::super::format_byte_size(remaining_prepared_bytes),
+            super::super::format_byte_size(maximum_working_bytes)
+        )));
+    }
+    let mut stats = MetadataContentUnionStats::default();
+    for group in groups.drain(..) {
+        remaining_prepared_bytes =
+            remaining_prepared_bytes.saturating_sub(group.parallel_prepare_bytes());
+        let group_working_bytes = maximum_working_bytes.saturating_sub(remaining_prepared_bytes);
+        stats.accumulate(group.union_with_budget(context, state, group_working_bytes)?);
+    }
+    Ok(stats)
+}
+
 impl MetadataContentCandidateIndex {
-    #[cfg(test)]
-    pub(super) fn new(docs: &[CompactMetadataContentDocument]) -> Self {
-        let mut entries = Vec::with_capacity(docs.iter().map(|doc| doc.terms.len()).sum());
-        for (record_index, doc) in docs.iter().enumerate() {
-            let record_index = metadata_doc_index_from_usize(record_index);
-            for &(token_id, _) in &doc.terms {
-                entries.push((token_id, record_index));
+    fn from_document_iter<'a, I>(documents: I) -> Self
+    where
+        I: Clone + Iterator<Item = (usize, &'a CompactMetadataContentDocument)>,
+    {
+        let token_count = documents
+            .clone()
+            .flat_map(|(_, doc)| doc.terms.iter().map(|&(token_id, _)| token_id as usize + 1))
+            .max()
+            .unwrap_or(0);
+        let posting_count = documents
+            .clone()
+            .map(|(_, doc)| doc.terms.len())
+            .sum::<usize>();
+        let mut posting_offsets = vec![0u64; token_count.saturating_add(1)];
+        for (_, document) in documents.clone() {
+            for &(token_id, _) in &document.terms {
+                posting_offsets[token_id as usize + 1] =
+                    posting_offsets[token_id as usize + 1].saturating_add(1);
             }
         }
-        entries.sort_unstable();
-        Self { entries }
+        for token_index in 0..token_count {
+            posting_offsets[token_index + 1] =
+                posting_offsets[token_index + 1].saturating_add(posting_offsets[token_index]);
+        }
+
+        let mut cursors = posting_offsets[..token_count].to_vec();
+        let mut posting_atoms = vec![0; posting_count];
+        for (atom_index, document) in documents {
+            let compact_atom_index = metadata_doc_index_from_usize(atom_index);
+            for &(token_id, _) in &document.terms {
+                let cursor = &mut cursors[token_id as usize];
+                posting_atoms[*cursor as usize] = compact_atom_index;
+                *cursor = cursor.saturating_add(1);
+            }
+        }
+        Self {
+            posting_offsets,
+            posting_atoms,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn new(docs: &[CompactMetadataContentDocument]) -> Self {
+        Self::from_document_iter(docs.iter().enumerate())
     }
 
     pub(super) fn from_atoms(
         docs: &[CompactMetadataContentDocument],
         atoms: &[MetadataContentAtom],
     ) -> Self {
-        let mut entries = Self::atom_entries(docs, atoms);
-        entries.sort_unstable();
-        Self { entries }
-    }
-
-    fn atom_entries(
-        docs: &[CompactMetadataContentDocument],
-        atoms: &[MetadataContentAtom],
-    ) -> Vec<(u32, MetadataDocIndex)> {
-        let mut entries = Vec::with_capacity(
-            atoms
-                .iter()
-                .map(|atom| {
-                    docs[metadata_doc_index_to_usize(atom.representative_record_index)]
-                        .terms
-                        .len()
-                })
-                .sum(),
-        );
-        for (atom_index, atom) in atoms.iter().enumerate() {
-            let compact_atom_index = metadata_doc_index_from_usize(atom_index);
-            let doc = &docs[metadata_doc_index_to_usize(atom.representative_record_index)];
-            for &(token_id, _) in &doc.terms {
-                entries.push((token_id, compact_atom_index));
-            }
-        }
-        entries
+        Self::from_document_iter(atoms.iter().enumerate().map(|(atom_index, atom)| {
+            (
+                atom_index,
+                &docs[metadata_doc_index_to_usize(atom.representative_record_index)],
+            )
+        }))
     }
 
     pub(super) fn from_atoms_parallel(
         docs: &[CompactMetadataContentDocument],
         atoms: &[MetadataContentAtom],
     ) -> Self {
-        let mut entries = Self::atom_entries(docs, atoms);
-        entries.par_sort_unstable();
-        Self { entries }
+        // CSR construction is linear and writes each posting exactly once;
+        // comparison sorting costs more than this memory-bandwidth pass. The
+        // caller already builds the independent template index concurrently.
+        Self::from_atoms(docs, atoms)
     }
 
     pub(super) fn append_candidates_after(
@@ -906,12 +991,9 @@ impl MetadataContentCandidateIndex {
     ) {
         let compact_record_index = metadata_doc_index_from_usize(record_index);
         for &(token_id, _) in &document.terms {
-            append_flat_candidate_posting_after(
-                &self.entries,
-                token_id,
-                compact_record_index,
-                scratch,
-            );
+            for &right in self.posting_after(token_id, compact_record_index) {
+                scratch.push_once(right);
+            }
         }
     }
 
@@ -922,22 +1004,42 @@ impl MetadataContentCandidateIndex {
     ) -> usize {
         let compact_record_index = metadata_doc_index_from_usize(record_index);
         document.terms.iter().fold(0usize, |cost, &(token_id, _)| {
-            cost.saturating_add(
-                flat_candidate_posting_after(&self.entries, token_id, compact_record_index).len(),
-            )
+            cost.saturating_add(self.posting_after(token_id, compact_record_index).len())
         })
+    }
+
+    fn posting_after(&self, token_id: u32, record_index: MetadataDocIndex) -> &[MetadataDocIndex] {
+        let token_index = token_id as usize;
+        if token_index + 1 >= self.posting_offsets.len() {
+            return &self.posting_atoms[..0];
+        }
+        let posting_start = self.posting_offsets[token_index] as usize;
+        let posting_end = self.posting_offsets[token_index + 1] as usize;
+        let posting = &self.posting_atoms[posting_start..posting_end];
+        let start = posting.partition_point(|&right| right <= record_index);
+        &posting[start..]
     }
 
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
-        self.entries.len()
+        self.posting_atoms.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn offset_count(&self) -> usize {
+        self.posting_offsets.len()
     }
 
     #[cfg(test)]
     pub(super) fn memory_bytes(&self) -> usize {
-        self.entries
+        self.posting_atoms
             .capacity()
-            .saturating_mul(std::mem::size_of::<(u32, MetadataDocIndex)>())
+            .saturating_mul(std::mem::size_of::<MetadataDocIndex>())
+            .saturating_add(
+                self.posting_offsets
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u64>()),
+            )
     }
 }
 
@@ -1252,23 +1354,30 @@ pub(super) fn union_metadata_token_content_matches(
     state: &mut MetadataUnionState,
     maximum_working_bytes: usize,
 ) -> Result<MetadataContentUnionStats, AnalysisError> {
-    let mut stmt = conn.prepare(
-        "
-        SELECT t.token_index, t.contract_index, a.metadata_json
-        FROM metadata_contract_token_rows t
-        JOIN metadata_rows a
-          ON a.source_file = t.metadata_source_file
-         AND a.source_row_number = t.metadata_source_row_number
-        ORDER BY t.token_index, t.contract_index
-        ",
-    )?;
+    let mut stmt = conn.prepare(metadata_token_content_rows_sql())?;
     let mut current_token = None;
     let mut group = MetadataRawTokenGroup::default();
+    let mut pending_groups = Vec::new();
+    let mut pending_prepare_bytes = 0usize;
+    let small_group_reserve_bytes = super::load::metadata_uncached_parse_transient_bytes(
+        METADATA_CONTENT_PARALLEL_MIN_RECORDS
+            .saturating_mul(super::parse::MAX_METADATA_BYTES_FOR_DEDUP),
+        0,
+    )
+    .saturating_mul(2)
+    .min(maximum_working_bytes);
+    let pending_batch_budget = maximum_working_bytes.saturating_sub(small_group_reserve_bytes);
+    let maximum_pending_groups = context
+        .pool
+        .current_num_threads()
+        .max(1)
+        .saturating_mul(METADATA_TOKEN_GROUP_BATCH_MULTIPLIER);
     let mut stats = MetadataContentUnionStats::default();
     for batch in stmt.query_arrow([])? {
         let token_column = arrow_i64_column(&batch, 0, "token_index")?;
         let contract_column = arrow_i64_column(&batch, 1, "contract_index")?;
-        let metadata_column = arrow_string_column(&batch, 2, "metadata_json")?;
+        let representative_column = arrow_i64_column(&batch, 2, "uses_loaded_representative")?;
+        let metadata_column = arrow_string_column(&batch, 3, "metadata_json")?;
         for row_index in 0..batch.num_rows() {
             let token_index = u32::try_from(token_column.value(row_index)).map_err(|_| {
                 AnalysisError::InvalidData(
@@ -1276,11 +1385,41 @@ pub(super) fn union_metadata_token_content_matches(
                 )
             })?;
             if current_token.is_some_and(|current| current != token_index) {
-                stats.accumulate(std::mem::take(&mut group).union_with_budget(
-                    context,
-                    state,
-                    maximum_working_bytes,
-                )?);
+                let completed = std::mem::take(&mut group);
+                let prepare_bytes = completed.parallel_prepare_bytes();
+                let can_prepare_in_small_batch = completed.record_count()
+                    < METADATA_CONTENT_PARALLEL_MIN_RECORDS
+                    && prepare_bytes <= small_group_reserve_bytes
+                    && prepare_bytes <= pending_batch_budget;
+                if !can_prepare_in_small_batch {
+                    stats.accumulate(prepare_metadata_token_group_batch(
+                        &mut pending_groups,
+                        context,
+                        state,
+                        maximum_working_bytes,
+                    )?);
+                    pending_prepare_bytes = 0;
+                    stats.accumulate(completed.union_with_budget(
+                        context,
+                        state,
+                        maximum_working_bytes,
+                    )?);
+                } else {
+                    if pending_groups.len() >= maximum_pending_groups
+                        || pending_prepare_bytes.saturating_add(prepare_bytes)
+                            > pending_batch_budget
+                    {
+                        stats.accumulate(prepare_metadata_token_group_batch(
+                            &mut pending_groups,
+                            context,
+                            state,
+                            maximum_working_bytes,
+                        )?);
+                        pending_prepare_bytes = 0;
+                    }
+                    pending_prepare_bytes = pending_prepare_bytes.saturating_add(prepare_bytes);
+                    pending_groups.push(completed);
+                }
             }
             current_token = Some(token_index);
             let source_contract_index =
@@ -1295,18 +1434,84 @@ pub(super) fn union_metadata_token_content_matches(
             else {
                 continue;
             };
-            group.push_raw_with_budget(
-                contract_index,
-                metadata_column.value(row_index).to_owned(),
-                context,
-                maximum_working_bytes,
-            )?;
+            if !pending_groups.is_empty()
+                && group.record_count() >= METADATA_CONTENT_PARALLEL_MIN_RECORDS
+            {
+                stats.accumulate(prepare_metadata_token_group_batch(
+                    &mut pending_groups,
+                    context,
+                    state,
+                    maximum_working_bytes,
+                )?);
+                pending_prepare_bytes = 0;
+            }
+            let current_group_budget = maximum_working_bytes.saturating_sub(pending_prepare_bytes);
+            let uses_loaded_representative = representative_column.value(row_index) != 0
+                && context.data.contracts[metadata_contract_index_to_usize(contract_index)]
+                    .uses_declared_metadata_source;
+            if uses_loaded_representative {
+                group.push_loaded_representative_with_budget(
+                    contract_index,
+                    context,
+                    current_group_budget,
+                )?;
+            } else {
+                if duckdb::arrow::array::Array::is_null(metadata_column, row_index) {
+                    return Err(AnalysisError::InvalidData(
+                        "non-representative metadata token row is missing JSON".to_string(),
+                    ));
+                }
+                group.push_raw_with_budget(
+                    contract_index,
+                    metadata_column.value(row_index).to_owned(),
+                    context,
+                    current_group_budget,
+                )?;
+            }
         }
     }
     if current_token.is_some() {
-        stats.accumulate(group.union_with_budget(context, state, maximum_working_bytes)?);
+        let prepare_bytes = group.parallel_prepare_bytes();
+        if group.record_count() < METADATA_CONTENT_PARALLEL_MIN_RECORDS
+            && prepare_bytes <= small_group_reserve_bytes
+            && pending_prepare_bytes.saturating_add(prepare_bytes) <= pending_batch_budget
+        {
+            pending_groups.push(group);
+        } else {
+            stats.accumulate(prepare_metadata_token_group_batch(
+                &mut pending_groups,
+                context,
+                state,
+                maximum_working_bytes,
+            )?);
+            stats.accumulate(group.union_with_budget(context, state, maximum_working_bytes)?);
+        }
     }
+    stats.accumulate(prepare_metadata_token_group_batch(
+        &mut pending_groups,
+        context,
+        state,
+        maximum_working_bytes,
+    )?);
     Ok(stats)
+}
+
+pub(super) fn metadata_token_content_rows_sql() -> &'static str {
+    "
+        SELECT t.token_index,
+               t.contract_index,
+               (t.metadata_source_file = c.metadata_source_file
+                   AND t.metadata_source_row_number = c.metadata_source_row_number)::BIGINT
+                   AS uses_loaded_representative,
+               a.metadata_json
+        FROM metadata_contract_token_rows t
+        JOIN analysis_contracts c
+          ON c.metadata_contract_index = t.contract_index
+        JOIN metadata_rows a
+          ON a.source_file = t.metadata_source_file
+         AND a.source_row_number = t.metadata_source_row_number
+        ORDER BY t.token_index, t.contract_index
+    "
 }
 
 pub(super) fn metadata_content_document<'a>(

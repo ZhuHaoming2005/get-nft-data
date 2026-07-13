@@ -60,17 +60,71 @@ pub(super) type MetadataDocIndex = u32;
 #[cfg(test)]
 pub(super) type MetadataDocPair = (MetadataDocIndex, MetadataDocIndex);
 
+#[derive(Debug)]
+pub(crate) enum MetadataTemplateDocument {
+    Owned(MetadataBm25Document),
+    Shared(Arc<MetadataBm25Document>),
+}
+
+impl MetadataTemplateDocument {
+    fn owned_payload_bytes(&self) -> usize {
+        match self {
+            Self::Owned(document) => document.memory_bytes(),
+            Self::Shared(_) => 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn is_owned(&self) -> bool {
+        matches!(self, Self::Owned(_))
+    }
+
+    #[cfg(test)]
+    fn is_shared(&self) -> bool {
+        matches!(self, Self::Shared(_))
+    }
+
+    #[cfg(test)]
+    fn shares_allocation_with(&self, other: &Self) -> bool {
+        matches!((self, other), (Self::Shared(left), Self::Shared(right)) if Arc::ptr_eq(left, right))
+    }
+}
+
+impl std::ops::Deref for MetadataTemplateDocument {
+    type Target = MetadataBm25Document;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(document) => document,
+            Self::Shared(document) => document,
+        }
+    }
+}
+
+impl From<MetadataBm25Document> for MetadataTemplateDocument {
+    fn from(document: MetadataBm25Document) -> Self {
+        Self::Owned(document)
+    }
+}
+
+impl From<Arc<MetadataBm25Document>> for MetadataTemplateDocument {
+    fn from(document: Arc<MetadataBm25Document>) -> Self {
+        Self::Shared(document)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct MetadataContract {
     pub(super) chain_index: usize,
     pub(super) nft_count: i64,
     pub(super) content_doc: Option<Arc<MetadataBm25Document>>,
     pub(super) template_doc_index: MetadataDocIndex,
+    pub(super) uses_declared_metadata_source: bool,
 }
 
 #[derive(Debug)]
 pub(super) struct SourceMetadataDocEntry {
-    pub(super) doc: MetadataBm25Document,
+    pub(super) doc: MetadataTemplateDocument,
     pub(super) contracts: Vec<MetadataContractIndex>,
 }
 
@@ -233,9 +287,17 @@ impl MetadataDataBuilder {
         }
     }
 
-    pub(super) fn merge_indexed_rows(&mut self, indexed_rows: Vec<(u32, IndexedMetadataRow)>) {
+    pub(super) fn merge_indexed_rows(
+        &mut self,
+        indexed_rows: Vec<(u32, IndexedMetadataRow)>,
+        uses_declared_metadata_source: bool,
+    ) {
         for (source_contract_index, row) in indexed_rows {
-            self.merge_source_indexed_row(source_contract_index, row);
+            self.merge_source_indexed_row(
+                source_contract_index,
+                row,
+                uses_declared_metadata_source,
+            );
         }
     }
 
@@ -375,10 +437,15 @@ impl MetadataDataBuilder {
     fn merge_indexed_row(&mut self, row: IndexedMetadataRow) {
         let source_contract_index = u32::try_from(self.source_contract_indexes.len())
             .expect("metadata source contract index exceeds u32 indexes");
-        self.merge_source_indexed_row(source_contract_index, row);
+        self.merge_source_indexed_row(source_contract_index, row, true);
     }
 
-    fn merge_source_indexed_row(&mut self, source_contract_index: u32, row: IndexedMetadataRow) {
+    fn merge_source_indexed_row(
+        &mut self,
+        source_contract_index: u32,
+        row: IndexedMetadataRow,
+        uses_declared_metadata_source: bool,
+    ) {
         if let Some(content_doc) = row.content_doc.as_ref() {
             let pointer = Arc::as_ptr(content_doc) as usize;
             if self.seen_content_docs.insert(pointer) && Arc::strong_count(content_doc) == 1 {
@@ -396,7 +463,7 @@ impl MetadataDataBuilder {
                     .saturating_add(row.doc.unique_len());
                 self.document_payload_bytes = self
                     .document_payload_bytes
-                    .saturating_add(MetadataBm25Document::memory_bytes(&row.doc));
+                    .saturating_add(row.doc.owned_payload_bytes());
                 self.doc_key_bytes = self.doc_key_bytes.saturating_add(row.doc_key.capacity());
                 self.doc_index_by_key.insert(row.doc_key, index);
                 self.docs.push(SourceMetadataDocEntry {
@@ -413,6 +480,7 @@ impl MetadataDataBuilder {
             nft_count: row.nft_count,
             content_doc: row.content_doc,
             template_doc_index: compact_doc_index,
+            uses_declared_metadata_source,
         });
         self.contracts_by_chain[row.chain_index]
             .push(metadata_contract_index_from_usize(contract_index));

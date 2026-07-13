@@ -136,6 +136,58 @@ fn metadata_token_rows_reuse_precomputed_eligibility() {
     assert!(!sql.contains("length("));
     assert_eq!(sql.matches("arg_min(").count(), 1);
     assert!(sql.contains("struct_pack("));
+    assert!(!sql.contains("dense_rank()"));
+    assert!(!sql.contains("ORDER BY metadata.token_id"));
+    assert!(sql.contains("metadata_retained_tokens"));
+}
+
+#[test]
+fn metadata_token_content_stream_marks_loaded_representative_without_changing_payload() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE analysis_contracts AS
+        SELECT 0::BIGINT AS metadata_contract_index,
+               7::UINTEGER AS metadata_source_file,
+               11::UBIGINT AS metadata_source_row_number;
+        CREATE TABLE metadata_contract_token_rows AS
+        SELECT * FROM (VALUES
+            (3::BIGINT, 0::BIGINT, 7::UINTEGER, 11::UBIGINT),
+            (4::BIGINT, 0::BIGINT, 7::UINTEGER, 12::UBIGINT)
+        ) rows(token_index, contract_index, metadata_source_file, metadata_source_row_number);
+        CREATE TABLE metadata_rows AS
+        SELECT * FROM (VALUES
+            (7::UINTEGER, 11::UBIGINT, '{"description":"representative"}'),
+            (7::UINTEGER, 12::UBIGINT, '{"description":"alternate"}')
+        ) rows(source_file, source_row_number, metadata_json);
+        "#,
+    )
+    .unwrap();
+
+    let mut stmt = conn.prepare(metadata_token_content_rows_sql()).unwrap();
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![
+            (
+                3,
+                1,
+                Some(r#"{"description":"representative"}"#.to_string())
+            ),
+            (4, 0, Some(r#"{"description":"alternate"}"#.to_string())),
+        ]
+    );
 }
 
 #[test]
@@ -160,6 +212,35 @@ fn retained_metadata_tokens_use_csr_without_a_global_sql_sort() {
         .map(|offset| union_start + offset)
         .unwrap();
     assert!(!index_source[union_start..union_end].contains("WITH shared_tokens"));
+}
+
+#[test]
+fn metadata_shared_token_groups_prepare_in_bounded_parallel_batches() {
+    let source = include_str!("index.rs");
+    let prepare_start = source
+        .find("fn prepare_metadata_token_group_batch")
+        .expect("parallel token-group preparation helper");
+    let prepare_end = source[prepare_start..]
+        .find("pub(super) fn union_metadata_token_content_matches")
+        .map(|offset| prepare_start + offset)
+        .expect("token-group stream follows preparation helper");
+    let prepare = &source[prepare_start..prepare_end];
+
+    assert!(prepare.contains("par_iter_mut()"));
+    assert!(prepare.contains("flush_raw(context"));
+    assert!(prepare.contains("for group in groups.drain(..)"));
+    assert!(prepare.contains("group.union_with_budget"));
+    assert!(prepare.contains("remaining_prepared_bytes"));
+    assert!(prepare.contains("saturating_sub(remaining_prepared_bytes)"));
+
+    let stream_start = prepare_end;
+    let stream_end = source[stream_start..]
+        .find("pub(super) fn metadata_token_content_rows_sql")
+        .map(|offset| stream_start + offset)
+        .expect("token content SQL follows stream");
+    let stream = &source[stream_start..stream_end];
+    assert!(stream.contains("METADATA_TOKEN_GROUP_BATCH_MULTIPLIER"));
+    assert!(stream.contains("parallel_prepare_bytes"));
 }
 
 #[test]
@@ -284,7 +365,7 @@ fn production_candidates_prune_incompatible_templates_before_content_pairs() {
             chain_index: 0,
             nft_count: 1,
             content_doc: MetadataBm25Document::from_text(content).map(Arc::new),
-            doc: MetadataBm25Document::from_text(template).unwrap(),
+            doc: MetadataBm25Document::from_text(template).unwrap().into(),
             doc_key: metadata_document_key(template),
         });
     }
@@ -342,7 +423,9 @@ fn local_candidate_index_uses_cheaper_content_postings_for_identical_templates()
             chain_index: 0,
             nft_count: 1,
             content_doc: MetadataBm25Document::from_text(content).map(Arc::new),
-            doc: MetadataBm25Document::from_text("shared template identity").unwrap(),
+            doc: MetadataBm25Document::from_text("shared template identity")
+                .unwrap()
+                .into(),
             doc_key: metadata_document_key("shared template identity"),
         });
     }
@@ -707,9 +790,10 @@ fn compact_contract_token_loader_maps_sources_and_sorts_unique_rows() {
                 chain_index: 0,
                 nft_count: 1,
                 content_doc: MetadataBm25Document::from_text(document).map(Arc::new),
-                doc: MetadataBm25Document::from_text(document).unwrap(),
+                doc: MetadataBm25Document::from_text(document).unwrap().into(),
                 doc_key: document.to_string(),
             },
+            true,
         );
     }
     let data = builder.finish();
@@ -753,7 +837,7 @@ fn compact_token_index_keeps_only_cross_contract_tokens() {
             chain_index: 0,
             nft_count: 2,
             content_doc: MetadataBm25Document::from_text("shared token").map(Arc::new),
-            doc: MetadataBm25Document::from_text(&prefilter).unwrap(),
+            doc: MetadataBm25Document::from_text(&prefilter).unwrap().into(),
             doc_key: prefilter,
         });
     }
@@ -831,6 +915,20 @@ fn reused_metadata_cache_contains_only_documents_used_by_multiple_sources() {
         indexed[0].1.content_doc.as_ref().unwrap(),
         indexed[1].1.content_doc.as_ref().unwrap()
     ));
+    assert!(indexed[0].1.doc.is_shared());
+    assert!(indexed[0].1.doc.shares_allocation_with(&indexed[1].1.doc));
+    let uncached = index_metadata_raw_row_chunk(
+        vec![(
+            2,
+            RawMetadataRow {
+                chain: "ethereum".to_string(),
+                metadata_json: r#"{"description":"unique template"}"#.to_string(),
+                nft_count: 1,
+            },
+        )],
+        &chain_indexes,
+    );
+    assert!(uncached[0].1.doc.is_owned());
     let bounded_cache = load_reused_metadata_documents(&conn, &pool, Some(1)).unwrap();
     assert!(bounded_cache.is_empty());
     assert!(reused_metadata_documents_memory_bytes(&bounded_cache) <= 1);
@@ -910,7 +1008,7 @@ fn reused_metadata_cache_incremental_accounting_matches_a_full_scan() {
     let raw = String::from(r#"{"description":"shared gold dragon"}"#);
     let parsed = metadata_documents_from_json(&raw);
     let cached = ReusedMetadataDocument {
-        prefilter: MetadataBm25Document::from_text(&parsed.prefilter),
+        prefilter: MetadataBm25Document::from_text(&parsed.prefilter).map(Arc::new),
         content: MetadataBm25Document::from_text(&parsed.content).map(Arc::new),
         doc_key: metadata_document_key(&parsed.prefilter),
     };
@@ -922,7 +1020,7 @@ fn reused_metadata_cache_incremental_accounting_matches_a_full_scan() {
             cached
                 .prefilter
                 .as_ref()
-                .map_or(0, MetadataBm25Document::memory_bytes),
+                .map_or(0, metadata_content_arc_memory_bytes),
         )
         .saturating_add(
             cached
@@ -1011,8 +1109,14 @@ fn token_content_groups_union_matches_without_contract_pair_table() {
             (1::UINTEGER, '2', '{"description":"gold dragon"}')
         ) AS t(contract_id, token_id, metadata_json);
         CREATE TEMP TABLE analysis_contracts AS
-        SELECT contract_id, contract_id::BIGINT AS metadata_contract_index
-        FROM (VALUES (0::UINTEGER), (1::UINTEGER)) contracts(contract_id);
+        SELECT contract_id,
+               contract_id::BIGINT AS metadata_contract_index,
+               arg_min(source_file, row(token_id, source_file, source_row_number))::UINTEGER
+                   AS metadata_source_file,
+               arg_min(source_row_number, row(token_id, source_file, source_row_number))::UBIGINT
+                   AS metadata_source_row_number
+        FROM metadata_rows
+        GROUP BY contract_id;
         "#,
     )
     .unwrap();
@@ -1022,7 +1126,9 @@ fn token_content_groups_union_matches_without_contract_pair_table() {
             chain_index: 0,
             nft_count: 2,
             content_doc: MetadataBm25Document::from_text("gold dragon").map(Arc::new),
-            doc: MetadataBm25Document::from_text("shared template").unwrap(),
+            doc: MetadataBm25Document::from_text("shared template")
+                .unwrap()
+                .into(),
             doc_key: metadata_document_key("shared template"),
         });
     }
@@ -1053,6 +1159,58 @@ fn token_content_groups_union_matches_without_contract_pair_table() {
 }
 
 #[test]
+fn token_content_fast_path_does_not_substitute_a_fallback_document() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE metadata_rows AS
+        SELECT * FROM (VALUES
+            (0::UINTEGER, '1', '{}', 0::UINTEGER, 1::UBIGINT, true),
+            (0::UINTEGER, '2', '{"description":"gold dragon"}', 0::UINTEGER, 2::UBIGINT, true),
+            (1::UINTEGER, '1', '{"description":"gold dragon"}', 0::UINTEGER, 3::UBIGINT, true)
+        ) rows(contract_id, token_id, metadata_json, source_file, source_row_number, metadata_eligible);
+        CREATE TABLE analysis_contracts AS
+        SELECT * FROM (VALUES
+            (0::UINTEGER, 'ethereum', 1::BIGINT, 0::UINTEGER, 1::UBIGINT, 0::BIGINT),
+            (1::UINTEGER, 'ethereum', 1::BIGINT, 0::UINTEGER, 3::UBIGINT, 1::BIGINT)
+        ) rows(contract_id, chain, nft_count, metadata_source_file,
+               metadata_source_row_number, metadata_contract_index);
+        "#,
+    )
+    .unwrap();
+    prepare_metadata_contract_token_rows(&conn).unwrap();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    let data = load_metadata_data(
+        &conn,
+        &["ethereum".to_string()],
+        &pool,
+        ReusedMetadataDocuments::new(),
+        MetadataLoadBudgets::new(usize::MAX, usize::MAX),
+    )
+    .unwrap();
+    let contract_tokens = load_metadata_contract_tokens(&conn, &data, &pool).unwrap();
+    let mut state = MetadataUnionState {
+        intra: UnionFind::new(2),
+        cross: None,
+        chain_matrix: None,
+    };
+    let context = MetadataContentUnionContext {
+        data: &data,
+        template_compatibility: MetadataTemplateCompatibility::Scored(&data.metadata_index.scoring),
+        contract_tokens: &contract_tokens,
+        chain_count: 1,
+        pool: &pool,
+    };
+
+    union_metadata_token_content_matches(&conn, &context, &mut state, usize::MAX).unwrap();
+
+    assert_ne!(state.intra.find(0), state.intra.find(1));
+}
+
+#[test]
 fn bounded_metadata_raw_group_matches_owned_record_path() {
     let raw_documents = [
         r#"{"description":"gold dragon alpha"}"#,
@@ -1066,7 +1224,9 @@ fn bounded_metadata_raw_group_matches_owned_record_path() {
             chain_index: contract_index % 2,
             nft_count: 1,
             content_doc: None,
-            doc: MetadataBm25Document::from_text("shared template").unwrap(),
+            doc: MetadataBm25Document::from_text("shared template")
+                .unwrap()
+                .into(),
             doc_key: metadata_document_key("shared template"),
         });
     }
@@ -1155,7 +1315,9 @@ fn metadata_raw_group_never_buffers_more_than_one_chunk() {
         chain_index: 0,
         nft_count: 1,
         content_doc: None,
-        doc: MetadataBm25Document::from_text("shared template").unwrap(),
+        doc: MetadataBm25Document::from_text("shared template")
+            .unwrap()
+            .into(),
         doc_key: metadata_document_key("shared template"),
     });
     let data = builder.finish();
@@ -1225,7 +1387,9 @@ fn metadata_raw_group_flushes_a_fitting_chunk_before_accepting_the_next_row() {
         chain_index: 0,
         nft_count: 1,
         content_doc: None,
-        doc: MetadataBm25Document::from_text("shared template").unwrap(),
+        doc: MetadataBm25Document::from_text("shared template")
+            .unwrap()
+            .into(),
         doc_key: metadata_document_key("shared template"),
     });
     let data = builder.finish();
@@ -1284,7 +1448,7 @@ fn shared_token_parser_borrows_cached_document_without_cloning_arc() {
 
 fn metadata_doc_entry(text: &str) -> SourceMetadataDocEntry {
     SourceMetadataDocEntry {
-        doc: MetadataBm25Document::from_text(text).unwrap(),
+        doc: MetadataBm25Document::from_text(text).unwrap().into(),
         contracts: vec![0],
     }
 }
@@ -1605,7 +1769,7 @@ fn metadata_content_inverted_index_partitions_shared_terms_by_compatible_templat
 }
 
 #[test]
-fn metadata_content_candidate_index_uses_one_flat_sorted_entry_per_atom_term() {
+fn metadata_content_candidate_index_uses_compact_csr_postings() {
     let records = vec![
         MetadataContentRecord {
             contract_index: 0,
@@ -1625,9 +1789,28 @@ fn metadata_content_candidate_index_uses_one_flat_sorted_entry_per_atom_term() {
         .iter()
         .map(|doc| doc.terms.len())
         .sum::<usize>();
+    let token_count = compact
+        .docs
+        .iter()
+        .flat_map(|doc| doc.terms.iter().map(|&(token_id, _)| token_id as usize + 1))
+        .max()
+        .unwrap_or(0);
 
     assert_eq!(index.len(), entry_count);
-    assert!(index.memory_bytes() <= entry_count * std::mem::size_of::<(u32, MetadataDocIndex)>());
+    assert_eq!(index.offset_count(), token_count + 1);
+    assert!(
+        index.memory_bytes()
+            <= entry_count * std::mem::size_of::<MetadataDocIndex>()
+                + (token_count + 1) * std::mem::size_of::<u64>()
+    );
+
+    let source = include_str!("index.rs");
+    let scoring_peak = source
+        .split("fn scoring_peak_bytes")
+        .nth(1)
+        .and_then(|tail| tail.split("fn ensure_within_memory_budget").next())
+        .expect("metadata scoring peak implementation");
+    assert!(scoring_peak.contains("2usize.saturating_mul(std::mem::size_of::<u64>())"));
 }
 
 #[test]
@@ -1683,7 +1866,9 @@ fn metadata_content_candidates_accept_matching_later_common_token() {
             chain_index: 0,
             nft_count: 1,
             content_doc: MetadataBm25Document::from_text("gold dragon").map(Arc::new),
-            doc: MetadataBm25Document::from_text("shared template").unwrap(),
+            doc: MetadataBm25Document::from_text("shared template")
+                .unwrap()
+                .into(),
             doc_key: metadata_document_key("shared template"),
         });
     }
@@ -1753,7 +1938,9 @@ fn metadata_content_union_collapses_identical_dense_component_to_one_atom() {
             chain_index: 0,
             nft_count: 1,
             content_doc: MetadataBm25Document::from_text("gold dragon").map(Arc::new),
-            doc: MetadataBm25Document::from_text("shared template").unwrap(),
+            doc: MetadataBm25Document::from_text("shared template")
+                .unwrap()
+                .into(),
             doc_key: metadata_document_key("shared template"),
         });
     }
@@ -1807,7 +1994,9 @@ fn metadata_content_atoms_ignore_bm25_token_order() {
             chain_index: 0,
             nft_count: 1,
             content_doc: MetadataBm25Document::from_text("gold dragon rare").map(Arc::new),
-            doc: MetadataBm25Document::from_text("shared template").unwrap(),
+            doc: MetadataBm25Document::from_text("shared template")
+                .unwrap()
+                .into(),
             doc_key: metadata_document_key("shared template"),
         });
     }
@@ -1870,7 +2059,9 @@ fn metadata_content_atoms_preserve_cross_chain_matrix_membership() {
             chain_index,
             nft_count: 1,
             content_doc: MetadataBm25Document::from_text("gold dragon").map(Arc::new),
-            doc: MetadataBm25Document::from_text("shared template").unwrap(),
+            doc: MetadataBm25Document::from_text("shared template")
+                .unwrap()
+                .into(),
             doc_key: metadata_document_key("shared template"),
         });
     }
@@ -1936,7 +2127,9 @@ fn metadata_content_atoms_expand_members_when_representatives_are_preconnected()
             chain_index,
             nft_count: 1,
             content_doc: MetadataBm25Document::from_text("gold dragon").map(Arc::new),
-            doc: MetadataBm25Document::from_text("shared template").unwrap(),
+            doc: MetadataBm25Document::from_text("shared template")
+                .unwrap()
+                .into(),
             doc_key: metadata_document_key("shared template"),
         });
     }
@@ -1999,7 +2192,9 @@ fn metadata_representative_fallback_unions_only_without_common_token() {
             chain_index: 0,
             nft_count: 1,
             content_doc: MetadataBm25Document::from_text(content).map(Arc::new),
-            doc: MetadataBm25Document::from_text("shared template").unwrap(),
+            doc: MetadataBm25Document::from_text("shared template")
+                .unwrap()
+                .into(),
             doc_key: metadata_document_key("shared template"),
         });
     }
@@ -2053,7 +2248,7 @@ fn scored_adaptive_fallback_preserves_disjoint_token_group_semantics() {
             chain_index: 0,
             nft_count: 1,
             content_doc: MetadataBm25Document::from_text(content).map(Arc::new),
-            doc: MetadataBm25Document::from_text(template).unwrap(),
+            doc: MetadataBm25Document::from_text(template).unwrap().into(),
             doc_key: metadata_document_key(template),
         });
     }
@@ -2108,7 +2303,9 @@ fn online_representative_fallback_matches_owned_record_path() {
             chain_index: contract_index % 2,
             nft_count: 1,
             content_doc: MetadataBm25Document::from_text(content).map(Arc::new),
-            doc: MetadataBm25Document::from_text("shared template").unwrap(),
+            doc: MetadataBm25Document::from_text("shared template")
+                .unwrap()
+                .into(),
             doc_key: metadata_document_key("shared template"),
         });
     }
@@ -2217,7 +2414,9 @@ fn metadata_fallback_atoms_collapse_identical_nonempty_token_sets_without_unioni
             chain_index: 0,
             nft_count: 1,
             content_doc: MetadataBm25Document::from_text("gold dragon").map(Arc::new),
-            doc: MetadataBm25Document::from_text("shared template").unwrap(),
+            doc: MetadataBm25Document::from_text("shared template")
+                .unwrap()
+                .into(),
             doc_key: metadata_document_key("shared template"),
         });
     }
@@ -2270,7 +2469,9 @@ fn metadata_fallback_atoms_union_identical_members_without_token_ids() {
             chain_index: 0,
             nft_count: 1,
             content_doc: MetadataBm25Document::from_text("gold dragon").map(Arc::new),
-            doc: MetadataBm25Document::from_text("shared template").unwrap(),
+            doc: MetadataBm25Document::from_text("shared template")
+                .unwrap()
+                .into(),
             doc_key: metadata_document_key("shared template"),
         });
     }
@@ -2324,7 +2525,9 @@ fn metadata_fallback_atoms_avoid_quadratic_pairs_for_disjoint_token_sets() {
             chain_index: 0,
             nft_count: 1,
             content_doc: MetadataBm25Document::from_text("gold dragon").map(Arc::new),
-            doc: MetadataBm25Document::from_text("shared template").unwrap(),
+            doc: MetadataBm25Document::from_text("shared template")
+                .unwrap()
+                .into(),
             doc_key: metadata_document_key("shared template"),
         });
     }
@@ -2391,7 +2594,9 @@ fn metadata_fallback_atoms_match_brute_force_connectivity() {
             chain_index: *chain_index,
             nft_count: 1,
             content_doc: MetadataBm25Document::from_text(content).map(Arc::new),
-            doc: MetadataBm25Document::from_text("shared template").unwrap(),
+            doc: MetadataBm25Document::from_text("shared template")
+                .unwrap()
+                .into(),
             doc_key: metadata_document_key("shared template"),
         });
     }
@@ -2824,7 +3029,9 @@ fn mapped_metadata_index_remains_charged_to_the_resident_budget() {
         chain_index: 0,
         nft_count: 1,
         content_doc: MetadataBm25Document::from_text("gold dragon details").map(Arc::new),
-        doc: MetadataBm25Document::from_text("gold dragon rare").unwrap(),
+        doc: MetadataBm25Document::from_text("gold dragon rare")
+            .unwrap()
+            .into(),
         doc_key: metadata_document_key("gold dragon rare"),
     });
     let mut data = builder.finish();
@@ -2866,7 +3073,7 @@ fn releasing_reuse_cache_recomputes_a_larger_fallback_working_allowance() {
     reused.insert(
         raw,
         ReusedMetadataDocument {
-            prefilter: MetadataBm25Document::from_text(&"template ".repeat(1024)),
+            prefilter: MetadataBm25Document::from_text(&"template ".repeat(1024)).map(Arc::new),
             content: Some(shared_content.clone()),
             doc_key: "cached-template".to_string(),
         },
@@ -2876,7 +3083,9 @@ fn releasing_reuse_cache_recomputes_a_larger_fallback_working_allowance() {
         chain_index: 0,
         nft_count: 1,
         content_doc: Some(shared_content),
-        doc: MetadataBm25Document::from_text("gold dragon template").unwrap(),
+        doc: MetadataBm25Document::from_text("gold dragon template")
+            .unwrap()
+            .into(),
         doc_key: metadata_document_key("gold dragon template"),
     });
     let mut data = builder.finish_with_reused_documents(reused);
@@ -2957,7 +3166,7 @@ fn metadata_memory_is_guarded_during_build_and_counts_contract_tokens() {
         chain_index: 0,
         nft_count: 2,
         content_doc: MetadataBm25Document::from_text("gold dragon details").map(Arc::new),
-        doc: MetadataBm25Document::from_text(&prefilter).unwrap(),
+        doc: MetadataBm25Document::from_text(&prefilter).unwrap().into(),
         doc_key: prefilter,
     });
     let loaded_bytes = builder.memory_bytes();
@@ -3033,7 +3242,7 @@ fn metadata_load_chunk_rejects_one_oversized_row_before_storing_it() {
 fn metadata_load_transient_estimate_covers_cached_prefilter_and_key_clones() {
     let metadata_json = "{}";
     let cached = ReusedMetadataDocument {
-        prefilter: MetadataBm25Document::from_text(&"gold dragon ".repeat(1_024)),
+        prefilter: MetadataBm25Document::from_text(&"gold dragon ".repeat(1_024)).map(Arc::new),
         content: None,
         doc_key: "cached-template-key".repeat(1_024),
     };
@@ -3234,7 +3443,7 @@ fn metadata_builder_does_not_double_count_cache_owned_content_arc() {
         chain_index: 0,
         nft_count: 1,
         content_doc: Some(shared.clone()),
-        doc: MetadataBm25Document::from_text(&prefilter).unwrap(),
+        doc: MetadataBm25Document::from_text(&prefilter).unwrap().into(),
         doc_key: prefilter.clone(),
     });
     assert_eq!(cached_builder.content_doc_bytes, 0);
@@ -3244,10 +3453,36 @@ fn metadata_builder_does_not_double_count_cache_owned_content_arc() {
         chain_index: 0,
         nft_count: 1,
         content_doc: MetadataBm25Document::from_text("unique content").map(Arc::new),
-        doc: MetadataBm25Document::from_text(&prefilter).unwrap(),
+        doc: MetadataBm25Document::from_text(&prefilter).unwrap().into(),
         doc_key: prefilter,
     });
     assert!(unique_builder.content_doc_bytes > 0);
+}
+
+#[test]
+fn metadata_builder_does_not_double_count_cache_owned_template_arc() {
+    let shared = Arc::new(MetadataBm25Document::from_text("shared template").unwrap());
+    let mut cached_builder = MetadataDataBuilder::new(1);
+    cached_builder.merge_indexed_row(IndexedMetadataRow {
+        chain_index: 0,
+        nft_count: 1,
+        content_doc: None,
+        doc: shared.clone().into(),
+        doc_key: "shared template".to_string(),
+    });
+    assert_eq!(cached_builder.document_payload_bytes, 0);
+
+    let mut unique_builder = MetadataDataBuilder::new(1);
+    unique_builder.merge_indexed_row(IndexedMetadataRow {
+        chain_index: 0,
+        nft_count: 1,
+        content_doc: None,
+        doc: MetadataBm25Document::from_text("unique template")
+            .unwrap()
+            .into(),
+        doc_key: "unique template".to_string(),
+    });
+    assert!(unique_builder.document_payload_bytes > 0);
 }
 
 #[test]
@@ -3277,7 +3512,7 @@ fn metadata_scoring_state_is_released_before_summary_scratch() {
         chain_index: 0,
         nft_count: 2,
         content_doc: MetadataBm25Document::from_text("gold dragon details").map(Arc::new),
-        doc: MetadataBm25Document::from_text(&prefilter).unwrap(),
+        doc: MetadataBm25Document::from_text(&prefilter).unwrap().into(),
         doc_key: prefilter,
     });
     let mut data = builder.finish();
@@ -3329,7 +3564,7 @@ fn metadata_data_builder_builds_bm25_index_for_content_representative_matching()
         chain_index: 0,
         nft_count: 2,
         content_doc: MetadataBm25Document::from_text("gold dragon").map(Arc::new),
-        doc,
+        doc: doc.into(),
         doc_key,
     });
 
@@ -3348,7 +3583,7 @@ fn metadata_memberships_use_compact_contract_indexes() {
         chain_index: 0,
         nft_count: 2,
         content_doc: MetadataBm25Document::from_text("gold dragon").map(Arc::new),
-        doc,
+        doc: doc.into(),
         doc_key,
     });
 
@@ -3369,7 +3604,7 @@ fn metadata_contracts_keep_their_template_document_index() {
             chain_index: 0,
             nft_count: 1,
             content_doc: MetadataBm25Document::from_text(document).map(Arc::new),
-            doc: MetadataBm25Document::from_text(document).unwrap(),
+            doc: MetadataBm25Document::from_text(document).unwrap().into(),
             doc_key: metadata_document_key(document),
         });
     }
