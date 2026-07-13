@@ -12,8 +12,8 @@ use clap::{Parser, ValueEnum};
 use duckdb::Connection;
 use name_uri_analysis_rs::analysis::{
     finalize_analysis_phases, run_analysis_phase, validate_output_generation,
-    validate_static_memory_options, AnalysisOptions, AnalysisPhase, DUCKDB_THREAD_CAP,
-    SUMMARY_MANIFEST_FILE_NAME,
+    validate_static_memory_options, AnalysisOptions, AnalysisPhase, MetadataRecallMode,
+    DUCKDB_THREAD_CAP, SUMMARY_MANIFEST_FILE_NAME,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -27,7 +27,7 @@ const PIPELINE_SCHEMA_VERSION: u32 = 2;
 // the controller invalidates only the affected checkpoint and its dependents.
 const PREPARE_STAGE_REVISION: u32 = 1;
 const NAME_STAGE_REVISION: u32 = 1;
-const METADATA_STAGE_REVISION: u32 = 1;
+const METADATA_STAGE_REVISION: u32 = 2;
 const FINALIZER_STAGE_REVISION: u32 = 1;
 const PARENT_LIVENESS_ENV: &str = "NAME_URI_ANALYSIS_PARENT_LIVENESS_PIPE";
 const PHASE_GENERATION_ENV: &str = "NAME_URI_ANALYSIS_PHASE_GENERATION";
@@ -80,6 +80,9 @@ struct Args {
 
     #[arg(long, default_value_t = 95.0)]
     name_threshold: f64,
+
+    #[arg(long, value_enum, default_value_t = MetadataRecallMode::Conservative)]
+    metadata_recall_mode: MetadataRecallMode,
 
     /// Rayon worker ceiling; DuckDB is separately capped at 64 physical-core workers.
     #[arg(long, default_value_t = 128, value_parser = parse_positive_usize)]
@@ -242,6 +245,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         parquet_inputs: canonical_inputs,
         output_dir: output_directory,
         name_threshold: args.name_threshold,
+        metadata_recall_mode: args.metadata_recall_mode,
         threads: effective_threads,
         memory_limit: args.analysis_memory_limit.clone(),
         analysis_memory_limit: Some(args.analysis_memory_limit),
@@ -899,12 +903,19 @@ fn prepare_work_directory(
         if !manifests_have_same_inputs_and_options(&existing, &manifest) {
             return Err("resume rejected: input fingerprint or analysis options changed".into());
         }
+        let metadata_recall_mode_changed =
+            existing.options.metadata_recall_mode != manifest.options.metadata_recall_mode;
+        if metadata_recall_mode_changed {
+            invalidate_stage_checkpoints(&mut existing, &["metadata_complete", "finalized"]);
+            remove_ready_checkpoints(work_directory, &["metadata"])?;
+        }
         let revisions_changed = invalidate_changed_stage_revisions(
             &mut existing,
             manifest.stage_revisions,
             work_directory,
         )?;
-        if revisions_changed
+        if metadata_recall_mode_changed
+            || revisions_changed
             || existing.binary_version != manifest.binary_version
             || existing.options != manifest.options
         {
@@ -1469,6 +1480,7 @@ mod tests {
                 parquet_inputs: vec![root.join("input.parquet")],
                 output_dir: root.join("output"),
                 name_threshold: 95.0,
+                metadata_recall_mode: MetadataRecallMode::Conservative,
                 threads: 32,
                 memory_limit: "192GiB".to_string(),
                 analysis_memory_limit: Some("192GiB".to_string()),
@@ -1548,6 +1560,26 @@ mod tests {
             Args::try_parse_from(["name_uri_analysis_rs", "--parquet", "input.parquet"]).unwrap();
 
         assert_eq!(args.threads, 128);
+    }
+
+    #[test]
+    fn cli_defaults_to_conservative_metadata_recall_and_allows_exact() {
+        let defaults =
+            Args::try_parse_from(["name_uri_analysis_rs", "--parquet", "input.parquet"]).unwrap();
+        let exact = Args::try_parse_from([
+            "name_uri_analysis_rs",
+            "--parquet",
+            "input.parquet",
+            "--metadata-recall-mode",
+            "exact",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            defaults.metadata_recall_mode,
+            MetadataRecallMode::Conservative
+        );
+        assert_eq!(exact.metadata_recall_mode, MetadataRecallMode::Exact);
     }
 
     #[test]
@@ -2078,6 +2110,32 @@ mod tests {
     }
 
     #[test]
+    fn changing_metadata_recall_mode_invalidates_only_metadata_and_finalizer() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        fs::create_dir_all(&work).unwrap();
+        let mut existing = sample_manifest(&work);
+        existing.options.metadata_recall_mode = MetadataRecallMode::Exact;
+        for checkpoint in existing.stages.values_mut() {
+            checkpoint.complete = true;
+        }
+        fs::write(
+            work.join("manifest.json"),
+            serde_json::to_vec(&existing).unwrap(),
+        )
+        .unwrap();
+        let mut expected = existing.clone();
+        expected.options.metadata_recall_mode = MetadataRecallMode::Conservative;
+
+        let (_, resumed) = prepare_work_directory(&work, expected, true).unwrap();
+
+        assert!(resumed.stages["prepare_complete"].complete);
+        assert!(resumed.stages["name_complete"].complete);
+        assert!(!resumed.stages["metadata_complete"].complete);
+        assert!(!resumed.stages["finalized"].complete);
+    }
+
+    #[test]
     fn resume_stage_revision_changes_follow_the_dependency_graph() {
         struct Case {
             revisions: serde_json::Value,
@@ -2090,7 +2148,7 @@ mod tests {
                 revisions: serde_json::json!({
                     "prepare": 0,
                     "name": 1,
-                    "metadata": 1,
+                    "metadata": 2,
                     "finalizer": 1,
                 }),
                 invalidated_stages: &[
@@ -2108,7 +2166,7 @@ mod tests {
                 revisions: serde_json::json!({
                     "prepare": 1,
                     "name": 0,
-                    "metadata": 1,
+                    "metadata": 2,
                     "finalizer": 1,
                 }),
                 invalidated_stages: &["name_complete", "finalized"],
@@ -2118,7 +2176,7 @@ mod tests {
                 revisions: serde_json::json!({
                     "prepare": 1,
                     "name": 1,
-                    "metadata": 0,
+                    "metadata": 1,
                     "finalizer": 1,
                 }),
                 invalidated_stages: &["metadata_complete", "finalized"],
@@ -2128,7 +2186,7 @@ mod tests {
                 revisions: serde_json::json!({
                     "prepare": 1,
                     "name": 1,
-                    "metadata": 1,
+                    "metadata": 2,
                     "finalizer": 0,
                 }),
                 invalidated_stages: &["finalized"],

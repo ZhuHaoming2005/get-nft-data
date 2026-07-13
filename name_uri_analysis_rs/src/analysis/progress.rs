@@ -258,6 +258,19 @@ impl ProgressTracker {
         }));
     }
 
+    pub(crate) fn update_task_label(&self, label: impl Into<String>) {
+        let Self::Enabled { task_state, .. } = self else {
+            return;
+        };
+        if let Some(state) = task_state
+            .lock()
+            .expect("task progress mutex poisoned")
+            .as_mut()
+        {
+            state.label = label.into();
+        }
+    }
+
     pub(crate) fn finish_task(&self, message: impl Into<String>) {
         let Self::Enabled {
             task,
@@ -438,4 +451,35 @@ pub(crate) const fn task_bar_template() -> &'static str {
 
 pub(crate) const fn metrics_template() -> &'static str {
     "      {spinner:.white} metrics {msg}"
+}
+
+#[cfg(test)]
+mod throttle_tests {
+    use super::*;
+
+    #[test]
+    fn task_label_updates_preserve_the_refresh_throttle() {
+        let tracker = ProgressTracker::new(1, true);
+        tracker.start_task("initial", Some(1), "items");
+        tracker.advance_task(0, ProgressCounters::default());
+        let before = match &tracker {
+            ProgressTracker::Enabled { task_state, .. } => {
+                task_state.lock().unwrap().as_ref().unwrap().last_refresh
+            }
+            ProgressTracker::Disabled => panic!("progress must be enabled"),
+        };
+
+        tracker.update_task_label("changed");
+
+        let (label, after) = match &tracker {
+            ProgressTracker::Enabled { task_state, .. } => {
+                let guard = task_state.lock().unwrap();
+                let state = guard.as_ref().unwrap();
+                (state.label.clone(), state.last_refresh)
+            }
+            ProgressTracker::Disabled => panic!("progress must be enabled"),
+        };
+        assert_eq!(label, "changed");
+        assert_eq!(after, before);
+    }
 }

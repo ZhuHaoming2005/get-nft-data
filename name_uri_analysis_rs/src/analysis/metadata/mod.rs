@@ -7,8 +7,9 @@ use duckdb::Connection;
 use super::{
     accumulate_pair_component_summary, chain_pair_count, chain_pair_from_index,
     execute_progress_batch, format_byte_size, new_chain_matrix_reuse_states, summary_row,
-    total_memory_budget_bytes, AnalysisError, GroupSummary, NameTotals, ProgressCounters,
-    ProgressTracker, SparseUnionFind, SummaryRow, SummarySpec, UnionFind, SPARSE_UNION_NODE_BYTES,
+    total_memory_budget_bytes, AnalysisError, GroupSummary, MetadataRecallMode, NameTotals,
+    ProgressCounters, ProgressTracker, SparseUnionFind, SummaryRow, SummarySpec, UnionFind,
+    SPARSE_UNION_NODE_BYTES,
 };
 
 mod bm25;
@@ -159,6 +160,7 @@ pub(super) struct MetadataDataBuilder {
 
 #[derive(Debug, serde::Serialize)]
 pub(crate) struct MetadataAlgorithmMetrics {
+    recall_mode: MetadataRecallMode,
     eligible_rows: u64,
     selected_sources: u64,
     reused_raw_json_cache_entries: u64,
@@ -180,6 +182,17 @@ pub(crate) struct MetadataAlgorithmMetrics {
     template_cache_misses: u64,
     template_batch_unique_pairs: u64,
     template_batch_reused_pairs: u64,
+    conservative_groups: u64,
+    exact_fallback_groups: u64,
+    recall_sampled_left_atoms: u64,
+    recall_exact_candidate_pairs: u64,
+    recall_conservative_candidate_pairs: u64,
+    recall_exact_matched_pairs: u64,
+    recall_missed_matched_pairs: u64,
+    recall_exact_duplicate_contract_members: u64,
+    recall_missed_duplicate_contract_members: u64,
+    recall_exact_component_members: u64,
+    recall_shifted_component_members: u64,
     mmap_bytes: u64,
     dsu_bytes: u64,
 }
@@ -187,6 +200,13 @@ pub(crate) struct MetadataAlgorithmMetrics {
 pub(crate) struct MetadataAnalysisResult {
     pub(crate) rows: Vec<SummaryRow>,
     pub(crate) metrics: MetadataAlgorithmMetrics,
+}
+
+pub(super) struct MetadataAnalysisSpec<'a> {
+    pub(super) threads: usize,
+    pub(super) recall_mode: MetadataRecallMode,
+    pub(super) memory_limit: &'a str,
+    pub(super) artifact_directory: Option<&'a Path>,
 }
 
 #[derive(Default)]
@@ -595,12 +615,19 @@ pub(super) fn run_metadata_analysis(
     conn: &Connection,
     chains: &[String],
     totals: &HashMap<String, NameTotals>,
-    threads: usize,
-    analysis_memory_limit: &str,
-    artifact_directory: Option<&Path>,
+    spec: MetadataAnalysisSpec<'_>,
     progress: &ProgressTracker,
 ) -> Result<MetadataAnalysisResult, AnalysisError> {
+    let MetadataAnalysisSpec {
+        threads,
+        recall_mode: metadata_recall_mode,
+        memory_limit: analysis_memory_limit,
+        artifact_directory,
+    } = spec;
     progress.start_stage("analyzing metadata duplicates", 7);
+    let total_analysis_memory_bytes = metadata_memory_budget_bytes(analysis_memory_limit)?;
+    let analysis_memory_bytes =
+        metadata_structure_memory_budget_bytes(total_analysis_memory_bytes, threads)?;
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads.max(1))
         .thread_name(|index| format!("metadata-{index}"))
@@ -620,7 +647,6 @@ pub(super) fn run_metadata_analysis(
         [],
         |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
     )?;
-    let analysis_memory_bytes = metadata_memory_budget_bytes(analysis_memory_limit)?;
     let retained_contract_token_rows = scalar_u64(
         conn,
         "SELECT count(*)::UBIGINT FROM metadata_contract_token_rows",
@@ -632,7 +658,6 @@ pub(super) fn run_metadata_analysis(
         selected_source_count,
         retained_contract_token_count,
         chains.len(),
-        threads,
     );
     if runtime_reserve_bytes >= analysis_memory_bytes {
         return Err(AnalysisError::InvalidData(format!(
@@ -763,6 +788,7 @@ pub(super) fn run_metadata_analysis(
         return Ok(MetadataAnalysisResult {
             rows,
             metrics: MetadataAlgorithmMetrics {
+                recall_mode: metadata_recall_mode,
                 eligible_rows,
                 selected_sources,
                 reused_raw_json_cache_entries,
@@ -784,6 +810,17 @@ pub(super) fn run_metadata_analysis(
                 template_cache_misses: 0,
                 template_batch_unique_pairs: 0,
                 template_batch_reused_pairs: 0,
+                conservative_groups: 0,
+                exact_fallback_groups: 0,
+                recall_sampled_left_atoms: 0,
+                recall_exact_candidate_pairs: 0,
+                recall_conservative_candidate_pairs: 0,
+                recall_exact_matched_pairs: 0,
+                recall_missed_matched_pairs: 0,
+                recall_exact_duplicate_contract_members: 0,
+                recall_missed_duplicate_contract_members: 0,
+                recall_exact_component_members: 0,
+                recall_shifted_component_members: 0,
                 mmap_bytes: mapped_index_bytes,
                 dsu_bytes: 0,
             },
@@ -812,18 +849,47 @@ pub(super) fn run_metadata_analysis(
             contract_tokens: &contract_tokens,
             chain_count: chains.len(),
             pool: &pool,
+            recall_mode: metadata_recall_mode,
         };
         let shared_stats = union_metadata_token_content_matches(
             conn,
             &content_context,
             &mut state,
             maximum_shared_working_bytes,
+            metadata_recall_mode,
             progress,
         )?;
         content_stats.accumulate(shared_stats);
     }
+    let contract_drift_percent = if content_stats
+        .recall_calibration
+        .exact_duplicate_contract_members
+        == 0
+    {
+        0.0
+    } else {
+        content_stats
+            .recall_calibration
+            .missed_duplicate_contract_members as f64
+            * 100.0
+            / content_stats
+                .recall_calibration
+                .exact_duplicate_contract_members as f64
+    };
+    let component_drift_percent = if content_stats.recall_calibration.exact_component_members == 0 {
+        0.0
+    } else {
+        content_stats.recall_calibration.shifted_component_members as f64 * 100.0
+            / content_stats.recall_calibration.exact_component_members as f64
+    };
     progress.finish_task(format!(
-        "shared-token matching complete; raw {}; dimension-rejected {}; candidates {}; connected-skips {}; template batch unique/reused {}/{}; template-rejected {}; cache {}/{} hit/miss; content-scored {}; matched {}",
+        "shared-token matching complete; mode {:?}; calibrated-lefts {}; sample drift before fallback contracts/components {:.3}%/{:.3}%; conservative/fallback groups {}/{}; raw {}; dimension-rejected {}; candidates {}; connected-skips {}; template batch unique/reused {}/{}; template-rejected {}; cache {}/{} hit/miss; content-scored {}; matched {}",
+        metadata_recall_mode,
+        content_stats.recall_calibration.sampled_left_atoms,
+        contract_drift_percent,
+        component_drift_percent,
+        content_stats.conservative_groups,
+        content_stats.exact_fallback_groups,
         content_stats.raw_candidate_pairs,
         content_stats.dimension_rejected_pairs,
         content_stats.candidate_pairs,
@@ -857,6 +923,7 @@ pub(super) fn run_metadata_analysis(
             contract_tokens: &contract_tokens,
             chain_count: chains.len(),
             pool: &pool,
+            recall_mode: MetadataRecallMode::Exact,
         };
         content_stats.accumulate(union_metadata_representative_content_fallback(
             &content_context,
@@ -892,6 +959,7 @@ pub(super) fn run_metadata_analysis(
     Ok(MetadataAnalysisResult {
         rows,
         metrics: MetadataAlgorithmMetrics {
+            recall_mode: metadata_recall_mode,
             eligible_rows,
             selected_sources,
             reused_raw_json_cache_entries,
@@ -913,6 +981,27 @@ pub(super) fn run_metadata_analysis(
             template_cache_misses: content_stats.template_cache_misses,
             template_batch_unique_pairs: content_stats.template_batch_unique_pairs,
             template_batch_reused_pairs: content_stats.template_batch_reused_pairs,
+            conservative_groups: content_stats.conservative_groups,
+            exact_fallback_groups: content_stats.exact_fallback_groups,
+            recall_sampled_left_atoms: content_stats.recall_calibration.sampled_left_atoms,
+            recall_exact_candidate_pairs: content_stats.recall_calibration.exact_candidate_pairs,
+            recall_conservative_candidate_pairs: content_stats
+                .recall_calibration
+                .conservative_candidate_pairs,
+            recall_exact_matched_pairs: content_stats.recall_calibration.exact_matched_pairs,
+            recall_missed_matched_pairs: content_stats.recall_calibration.missed_matched_pairs,
+            recall_exact_duplicate_contract_members: content_stats
+                .recall_calibration
+                .exact_duplicate_contract_members,
+            recall_missed_duplicate_contract_members: content_stats
+                .recall_calibration
+                .missed_duplicate_contract_members,
+            recall_exact_component_members: content_stats
+                .recall_calibration
+                .exact_component_members,
+            recall_shifted_component_members: content_stats
+                .recall_calibration
+                .shifted_component_members,
             mmap_bytes: mapped_index_bytes,
             dsu_bytes,
         },
@@ -1002,7 +1091,6 @@ fn metadata_runtime_reserve_bytes(
     contract_count: usize,
     retained_contract_token_rows: usize,
     chain_count: usize,
-    threads: usize,
 ) -> usize {
     let contract_tokens =
         metadata_contract_token_resident_bytes(contract_count, retained_contract_token_rows);
@@ -1018,13 +1106,28 @@ fn metadata_runtime_reserve_bytes(
         .saturating_add(source_mapping)
         .saturating_add(dense_dsu)
         .saturating_add(sparse_dsu);
-    reserve
-        .saturating_add(reserve.saturating_div(8))
-        .saturating_add(
-            threads
-                .max(1)
-                .saturating_mul(METADATA_ANALYSIS_WORKER_STACK_BYTES),
-        )
+    reserve.saturating_add(reserve.saturating_div(8))
+}
+
+fn metadata_worker_stack_reserve_bytes(threads: usize) -> usize {
+    threads
+        .max(1)
+        .saturating_mul(METADATA_ANALYSIS_WORKER_STACK_BYTES)
+}
+
+fn metadata_structure_memory_budget_bytes(
+    total_analysis_memory_bytes: usize,
+    threads: usize,
+) -> Result<usize, AnalysisError> {
+    let worker_stack_reserve_bytes = metadata_worker_stack_reserve_bytes(threads);
+    if worker_stack_reserve_bytes >= total_analysis_memory_bytes {
+        return Err(AnalysisError::InvalidData(format!(
+            "metadata worker stacks need about {}, exceeding analysis budget {}",
+            format_byte_size(worker_stack_reserve_bytes),
+            format_byte_size(total_analysis_memory_bytes)
+        )));
+    }
+    Ok(total_analysis_memory_bytes - worker_stack_reserve_bytes)
 }
 
 fn metadata_contract_token_resident_bytes(

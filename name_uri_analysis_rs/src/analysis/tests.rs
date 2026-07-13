@@ -386,6 +386,16 @@ fn diagnostic_environment_flag_is_explicit() {
 }
 
 #[test]
+fn metadata_recall_mode_is_forwarded_to_both_analysis_entry_paths() {
+    let source = include_str!("../analysis.rs");
+    assert_eq!(
+        source.matches("options.metadata_recall_mode").count(),
+        2,
+        "isolated and in-process metadata phases must use the configured mode"
+    );
+}
+
+#[test]
 fn duckdb_configuration_does_not_parse_memory_limit() {
     let conn = Connection::open_in_memory().unwrap();
     let options = AnalysisOptions {
@@ -393,6 +403,7 @@ fn duckdb_configuration_does_not_parse_memory_limit() {
         parquet_inputs: Vec::new(),
         output_dir: PathBuf::from("unused"),
         name_threshold: 95.0,
+        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 1,
         memory_limit: "not-a-size".into(),
         analysis_memory_limit: None,
@@ -412,6 +423,7 @@ fn duckdb_threads_are_capped_at_the_64_physical_core_target() {
         parquet_inputs: Vec::new(),
         output_dir: PathBuf::from("unused"),
         name_threshold: 95.0,
+        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 128,
         memory_limit: "384GiB".into(),
         analysis_memory_limit: Some("384GiB".into()),
@@ -473,6 +485,7 @@ fn rust_heavy_phases_clamp_duckdb_without_raising_smaller_limits() {
         parquet_inputs: Vec::new(),
         output_dir: PathBuf::from("unused"),
         name_threshold: 95.0,
+        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 1,
         memory_limit: "192GiB".into(),
         analysis_memory_limit: Some("192GiB".into()),

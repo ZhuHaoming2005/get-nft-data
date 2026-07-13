@@ -20,12 +20,24 @@ pub struct AnalysisOptions {
     pub parquet_inputs: Vec<PathBuf>,
     pub output_dir: PathBuf,
     pub name_threshold: f64,
+    #[serde(default)]
+    pub metadata_recall_mode: MetadataRecallMode,
     pub threads: usize,
     pub memory_limit: String,
     pub analysis_memory_limit: Option<String>,
     pub duckdb_memory_limit: String,
     pub temp_directory: Option<PathBuf>,
     pub progress: bool,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, Serialize, serde::Deserialize, PartialEq, Eq, clap::ValueEnum,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataRecallMode {
+    Exact,
+    #[default]
+    Conservative,
 }
 
 #[derive(Clone, Debug, Serialize, serde::Deserialize, PartialEq)]

@@ -307,6 +307,7 @@ fn parallel_shared_token_waves_preserve_single_thread_results_and_stats() {
             contract_tokens: &contract_tokens,
             chain_count: 2,
             pool: &pool,
+            recall_mode: MetadataRecallMode::Exact,
         };
         let mut state = MetadataUnionState {
             intra: UnionFind::new(record_count),
@@ -872,6 +873,362 @@ fn template_candidate_postings_use_sparse_csr_and_reuse_planned_ranges() {
 }
 
 #[test]
+fn conservative_dimension_index_recalls_shared_idf_anchor_candidates() {
+    let mut builder = MetadataDataBuilder::new(1);
+    let contents = [
+        "rareone sharedalpha",
+        "raretwo sharedalpha",
+        "unrelated isolated",
+    ];
+    let mut records = Vec::new();
+    for (index, content) in contents.into_iter().enumerate() {
+        builder.merge_indexed_row(IndexedMetadataRow {
+            chain_index: 0,
+            nft_count: 1,
+            content_doc: MetadataBm25Document::from_text(content).map(Arc::new),
+            doc: MetadataBm25Document::from_text(&format!("template {index}"))
+                .unwrap()
+                .into(),
+            doc_key: metadata_document_key(&format!("template {index}")),
+        });
+        records.push(MetadataContentRecord {
+            contract_index: metadata_contract_index_from_usize(index),
+            doc: MetadataBm25Document::from_text(content).unwrap().into(),
+        });
+    }
+    let data = builder.finish();
+    let compact = CompactMetadataContentSet::from_records(&records);
+    let atoms = build_metadata_content_atoms(&records, &compact.docs, &data);
+    let index = MetadataConservativeDimensionIndex::from_content_docs(&compact.docs, &atoms, false);
+    let mut scratch = MetadataCandidateScratch::new(atoms.len());
+    scratch.clear_for_next_left();
+
+    index.append_candidates_after(0, &mut scratch);
+
+    assert!(scratch
+        .candidates
+        .contains(&metadata_doc_index_from_usize(1)));
+    assert!(index.matches(0, 1));
+    assert!(index.memory_bytes() > 0);
+}
+
+#[test]
+fn conservative_local_index_requires_both_sketch_dimensions() {
+    let mut builder = MetadataDataBuilder::new(1);
+    let contents = [
+        "rareone sharedalpha",
+        "raretwo sharedalpha",
+        "unrelated isolated",
+    ];
+    let templates = [
+        "collection sharedtemplate",
+        "collection sharedtemplate",
+        "different isolatedtemplate",
+    ];
+    let mut records = Vec::new();
+    for (index, (content, template)) in contents.into_iter().zip(templates).enumerate() {
+        builder.merge_indexed_row(IndexedMetadataRow {
+            chain_index: 0,
+            nft_count: 1,
+            content_doc: MetadataBm25Document::from_text(content).map(Arc::new),
+            doc: MetadataBm25Document::from_text(template).unwrap().into(),
+            doc_key: metadata_document_key(template),
+        });
+        records.push(MetadataContentRecord {
+            contract_index: metadata_contract_index_from_usize(index),
+            doc: MetadataBm25Document::from_text(content).unwrap().into(),
+        });
+    }
+    let data = builder.finish();
+    let compact = CompactMetadataContentSet::from_records(&records);
+    let atoms = build_metadata_content_atoms(&records, &compact.docs, &data);
+    let compatibility = MetadataTemplateCompatibility::Scored(&data.metadata_index.scoring);
+    let index = MetadataLocalCandidateIndex::from_atoms_with_mode(
+        &compact.docs,
+        &atoms,
+        compatibility,
+        false,
+        MetadataRecallMode::Conservative,
+    );
+    let mut scratch = MetadataCandidateScratch::new(atoms.len());
+    scratch.clear_for_next_left();
+
+    let basis =
+        index.append_candidates_after(0, &atoms[0], &compact.docs[0], compatibility, &mut scratch);
+
+    assert_eq!(basis, MetadataLocalCandidateBasis::ConservativeIntersection);
+    assert!(scratch
+        .candidates
+        .contains(&metadata_doc_index_from_usize(1)));
+    assert!(!scratch
+        .candidates
+        .contains(&metadata_doc_index_from_usize(2)));
+    assert!(!metadata_candidate_intersects_both_dimensions(
+        MetadataLocalCandidateBasis::ConservativeIntersection,
+        0,
+        metadata_doc_index_from_usize(2),
+        &atoms,
+        &compact.docs,
+        compatibility,
+    ));
+}
+
+#[test]
+fn conservative_calibration_falls_back_only_above_drift_limits() {
+    let within_limits = MetadataRecallCalibrationStats {
+        exact_duplicate_contract_members: 200,
+        missed_duplicate_contract_members: 1,
+        exact_component_members: 500,
+        shifted_component_members: 1,
+        ..MetadataRecallCalibrationStats::default()
+    };
+    assert!(!within_limits.requires_exact_fallback());
+
+    let contract_drift_above_limit = MetadataRecallCalibrationStats {
+        exact_duplicate_contract_members: 199,
+        missed_duplicate_contract_members: 1,
+        ..MetadataRecallCalibrationStats::default()
+    };
+    assert!(contract_drift_above_limit.requires_exact_fallback());
+
+    let component_drift_above_limit = MetadataRecallCalibrationStats {
+        exact_component_members: 499,
+        shifted_component_members: 1,
+        ..MetadataRecallCalibrationStats::default()
+    };
+    assert!(component_drift_above_limit.requires_exact_fallback());
+}
+
+#[test]
+fn conservative_large_group_runs_deterministic_calibration_before_union() {
+    let record_count = 256usize;
+    let mut builder = MetadataDataBuilder::new(1);
+    let mut records = Vec::with_capacity(record_count);
+    for index in 0..record_count {
+        let pair = index / 2;
+        let side = if index % 2 == 0 {
+            "sidealpha"
+        } else {
+            "sidebeta"
+        };
+        let content = format!(
+            "pair{pair} sharedone sharedtwo sharedthree sharedfour sharedfive sharedsix sharedseven shared eight {side}"
+        );
+        let template = format!("collection pair{pair} shared template identity");
+        builder.merge_indexed_row(IndexedMetadataRow {
+            chain_index: 0,
+            nft_count: 1,
+            content_doc: MetadataBm25Document::from_text(&content).map(Arc::new),
+            doc: MetadataBm25Document::from_text(&template).unwrap().into(),
+            doc_key: metadata_document_key(&template),
+        });
+        records.push(MetadataContentRecord {
+            contract_index: metadata_contract_index_from_usize(index),
+            doc: MetadataBm25Document::from_text(&content).unwrap().into(),
+        });
+    }
+    let data = builder.finish();
+    let compact = CompactMetadataContentSet::from_records(&records);
+    let contract_tokens = CompactContractTokens::from_nested(vec![vec![1]; record_count]);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let context = MetadataContentUnionContext {
+        data: &data,
+        template_compatibility: MetadataTemplateCompatibility::Scored(&data.metadata_index.scoring),
+        contract_tokens: &contract_tokens,
+        chain_count: 1,
+        pool: &pool,
+        recall_mode: MetadataRecallMode::Conservative,
+    };
+    let mut state = MetadataUnionState {
+        intra: UnionFind::new(record_count),
+        cross: None,
+        chain_matrix: None,
+    };
+
+    let stats = union_metadata_shared_token_atoms_with_mode(
+        &records,
+        &compact.docs,
+        &context,
+        &mut state,
+        MetadataRecallMode::Conservative,
+    );
+    let mut exact_state = MetadataUnionState {
+        intra: UnionFind::new(record_count),
+        cross: None,
+        chain_matrix: None,
+    };
+    union_metadata_shared_token_atoms_with_mode(
+        &records,
+        &compact.docs,
+        &context,
+        &mut exact_state,
+        MetadataRecallMode::Exact,
+    );
+    let canonical_components = |union: &mut UnionFind| {
+        let mut minimum_by_root = HashMap::new();
+        for contract in 0..record_count {
+            let root = union.find(contract);
+            minimum_by_root
+                .entry(root)
+                .and_modify(|minimum: &mut usize| *minimum = (*minimum).min(contract))
+                .or_insert(contract);
+        }
+        (0..record_count)
+            .map(|contract| {
+                let root = union.find(contract);
+                minimum_by_root[&root]
+            })
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(stats.atom_count, record_count);
+    assert_eq!(stats.conservative_groups, 1);
+    assert!(stats.recall_calibration.sampled_left_atoms >= 2);
+    assert_eq!(stats.exact_fallback_groups, 0);
+    assert_eq!(stats.recall_calibration.missed_matched_pairs, 0);
+    assert_eq!(
+        canonical_components(&mut state.intra),
+        canonical_components(&mut exact_state.intra)
+    );
+
+    let single_thread_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    let single_thread_context = MetadataContentUnionContext {
+        data: &data,
+        template_compatibility: MetadataTemplateCompatibility::Scored(&data.metadata_index.scoring),
+        contract_tokens: &contract_tokens,
+        chain_count: 1,
+        pool: &single_thread_pool,
+        recall_mode: MetadataRecallMode::Conservative,
+    };
+    let mut single_thread_state = MetadataUnionState {
+        intra: UnionFind::new(record_count),
+        cross: None,
+        chain_matrix: None,
+    };
+    let single_thread_stats = union_metadata_shared_token_atoms_with_mode(
+        &records,
+        &compact.docs,
+        &single_thread_context,
+        &mut single_thread_state,
+        MetadataRecallMode::Conservative,
+    );
+    assert_eq!(
+        single_thread_stats.recall_calibration,
+        stats.recall_calibration
+    );
+    assert_eq!(
+        canonical_components(&mut single_thread_state.intra),
+        canonical_components(&mut exact_state.intra)
+    );
+
+    let mut below_threshold_state = MetadataUnionState {
+        intra: UnionFind::new(record_count),
+        cross: None,
+        chain_matrix: None,
+    };
+    let below_threshold = union_metadata_shared_token_atoms_with_mode(
+        &records[..record_count - 1],
+        &compact.docs[..record_count - 1],
+        &context,
+        &mut below_threshold_state,
+        MetadataRecallMode::Conservative,
+    );
+    assert_eq!(below_threshold.atom_count, record_count - 1);
+    assert_eq!(below_threshold.conservative_groups, 0);
+}
+
+#[test]
+fn conservative_calibration_fallback_preserves_exact_components() {
+    let record_count = 256usize;
+    let shared_content = (0..20)
+        .map(|token| format!("ubiquitous{token}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut builder = MetadataDataBuilder::new(1);
+    let mut records = Vec::with_capacity(record_count);
+    for index in 0..record_count {
+        let pair = index / 2;
+        let content = format!("{shared_content} contentunique{index}");
+        let template = format!("collection pair{pair} stable template identity");
+        builder.merge_indexed_row(IndexedMetadataRow {
+            chain_index: 0,
+            nft_count: 1,
+            content_doc: MetadataBm25Document::from_text(&content).map(Arc::new),
+            doc: MetadataBm25Document::from_text(&template).unwrap().into(),
+            doc_key: metadata_document_key(&template),
+        });
+        records.push(MetadataContentRecord {
+            contract_index: metadata_contract_index_from_usize(index),
+            doc: MetadataBm25Document::from_text(&content).unwrap().into(),
+        });
+    }
+    let data = builder.finish();
+    let compact = CompactMetadataContentSet::from_records(&records);
+    assert!(
+        compact_metadata_content_pair_score(&compact.docs[0], &compact.docs[1])
+            >= METADATA_THRESHOLD
+    );
+    let contract_tokens = CompactContractTokens::from_nested(vec![vec![1]; record_count]);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let context = MetadataContentUnionContext {
+        data: &data,
+        template_compatibility: MetadataTemplateCompatibility::Scored(&data.metadata_index.scoring),
+        contract_tokens: &contract_tokens,
+        chain_count: 1,
+        pool: &pool,
+        recall_mode: MetadataRecallMode::Conservative,
+    };
+    let mut conservative_state = MetadataUnionState {
+        intra: UnionFind::new(record_count),
+        cross: None,
+        chain_matrix: None,
+    };
+    let mut exact_state = MetadataUnionState {
+        intra: UnionFind::new(record_count),
+        cross: None,
+        chain_matrix: None,
+    };
+
+    let stats = union_metadata_shared_token_atoms_with_mode(
+        &records,
+        &compact.docs,
+        &context,
+        &mut conservative_state,
+        MetadataRecallMode::Conservative,
+    );
+    union_metadata_shared_token_atoms_with_mode(
+        &records,
+        &compact.docs,
+        &context,
+        &mut exact_state,
+        MetadataRecallMode::Exact,
+    );
+
+    assert_eq!(stats.conservative_groups, 1);
+    assert!(stats.recall_calibration.exact_matched_pairs > 0);
+    assert!(stats.recall_calibration.missed_matched_pairs > 0);
+    assert_eq!(stats.exact_fallback_groups, 1);
+    for left in 0..record_count {
+        for right in 0..record_count {
+            assert_eq!(
+                conservative_state.intra.find(left) == conservative_state.intra.find(right),
+                exact_state.intra.find(left) == exact_state.intra.find(right),
+                "component mismatch for {left}/{right}"
+            );
+        }
+    }
+}
+
+#[test]
 fn production_candidates_prune_incompatible_templates_before_content_pairs() {
     let templates = [
         "alphaone uniquexa",
@@ -915,6 +1272,7 @@ fn production_candidates_prune_incompatible_templates_before_content_pairs() {
         contract_tokens: &contract_tokens,
         chain_count: 1,
         pool: &pool,
+        recall_mode: MetadataRecallMode::Exact,
     };
     let mut state = MetadataUnionState {
         intra: UnionFind::new(records.len()),
@@ -1723,12 +2081,20 @@ fn token_content_groups_union_matches_without_contract_pair_table() {
         contract_tokens: &contract_tokens,
         chain_count: 1,
         pool: &pool,
+        recall_mode: MetadataRecallMode::Exact,
     };
     let progress = ProgressTracker::for_pipeline_stage(PipelineStage::Metadata, true);
     progress.start_task("shared-token memberships", Some(2), "memberships");
 
-    union_metadata_token_content_matches(&conn, &context, &mut state, usize::MAX, &progress)
-        .unwrap();
+    union_metadata_token_content_matches(
+        &conn,
+        &context,
+        &mut state,
+        usize::MAX,
+        MetadataRecallMode::Exact,
+        &progress,
+    )
+    .unwrap();
 
     assert_eq!(state.intra.find(0), state.intra.find(1));
     let ProgressTracker::Enabled { task, .. } = &progress else {
@@ -1783,6 +2149,7 @@ fn token_content_fast_path_does_not_substitute_a_fallback_document() {
         contract_tokens: &contract_tokens,
         chain_count: 1,
         pool: &pool,
+        recall_mode: MetadataRecallMode::Exact,
     };
 
     union_metadata_token_content_matches(
@@ -1790,6 +2157,7 @@ fn token_content_fast_path_does_not_substitute_a_fallback_document() {
         &context,
         &mut state,
         usize::MAX,
+        MetadataRecallMode::Exact,
         &ProgressTracker::Disabled,
     )
     .unwrap();
@@ -1830,6 +2198,7 @@ fn bounded_metadata_raw_group_matches_owned_record_path() {
         contract_tokens: &contract_tokens,
         chain_count: 2,
         pool: &pool,
+        recall_mode: MetadataRecallMode::Exact,
     };
 
     let records = raw_documents
@@ -1920,6 +2289,7 @@ fn metadata_raw_group_never_buffers_more_than_one_chunk() {
         contract_tokens: &contract_tokens,
         chain_count: 1,
         pool: &pool,
+        recall_mode: MetadataRecallMode::Exact,
     };
     let mut group = MetadataRawTokenGroup::default();
 
@@ -1952,6 +2322,7 @@ fn metadata_raw_group_rejects_content_working_set_before_unbounded_growth() {
         contract_tokens: &contract_tokens,
         chain_count: 1,
         pool: &pool,
+        recall_mode: MetadataRecallMode::Exact,
     };
     let mut group = MetadataRawTokenGroup::default();
 
@@ -1992,6 +2363,7 @@ fn metadata_raw_group_flushes_a_fitting_chunk_before_accepting_the_next_row() {
         contract_tokens: &contract_tokens,
         chain_count: 1,
         pool: &pool,
+        recall_mode: MetadataRecallMode::Exact,
     };
     let metadata_json = format!(r#"{{"description":"{}"}}"#, "x".repeat(60 * 1024));
     let mut one_row = MetadataRawTokenGroup::default();
@@ -2504,6 +2876,7 @@ fn metadata_content_candidates_accept_matching_later_common_token() {
         contract_tokens: &contract_tokens,
         chain_count: 1,
         pool: &pool,
+        recall_mode: MetadataRecallMode::Exact,
     };
 
     union_metadata_content_candidates(
@@ -2558,6 +2931,7 @@ fn metadata_content_union_collapses_identical_dense_component_to_one_atom() {
         contract_tokens: &contract_tokens,
         chain_count: 1,
         pool: &pool,
+        recall_mode: MetadataRecallMode::Exact,
     };
 
     let stats = union_metadata_content_candidates(
@@ -2619,6 +2993,7 @@ fn metadata_content_atoms_ignore_bm25_token_order() {
         contract_tokens: &contract_tokens,
         chain_count: 1,
         pool: &pool,
+        recall_mode: MetadataRecallMode::Exact,
     };
 
     let stats = union_metadata_content_candidates(
@@ -2679,6 +3054,7 @@ fn metadata_content_atoms_preserve_cross_chain_matrix_membership() {
         contract_tokens: &contract_tokens,
         chain_count: 2,
         pool: &pool,
+        recall_mode: MetadataRecallMode::Exact,
     };
 
     let stats = union_metadata_content_candidates(
@@ -2748,6 +3124,7 @@ fn metadata_content_atoms_expand_members_when_representatives_are_preconnected()
         contract_tokens: &contract_tokens,
         chain_count: 2,
         pool: &pool,
+        recall_mode: MetadataRecallMode::Exact,
     };
 
     let stats = union_metadata_content_candidates(
@@ -2804,6 +3181,7 @@ fn metadata_representative_fallback_unions_only_without_common_token() {
         contract_tokens: &contract_tokens,
         chain_count: 1,
         pool: &pool,
+        recall_mode: MetadataRecallMode::Exact,
     };
 
     union_metadata_representative_content_fallback(
@@ -2866,6 +3244,7 @@ fn scored_adaptive_fallback_preserves_disjoint_token_group_semantics() {
         contract_tokens: &contract_tokens,
         chain_count: 1,
         pool: &pool,
+        recall_mode: MetadataRecallMode::Exact,
     };
     let mut state = MetadataUnionState {
         intra: UnionFind::new(templates_and_contents.len()),
@@ -2921,6 +3300,7 @@ fn online_representative_fallback_matches_owned_record_path() {
         contract_tokens: &contract_tokens,
         chain_count: 2,
         pool: &pool,
+        recall_mode: MetadataRecallMode::Exact,
     };
     let records = data
         .contracts
@@ -3004,7 +3384,7 @@ fn representative_fallback_builds_compact_atoms_without_owned_record_vector() {
         .filter(|character| !character.is_whitespace())
         .collect::<String>();
     assert!(normalized.contains(
-        "builder.push_document(metadata_contract_index_from_usize(contract_index),document.as_ref(),context.data,Some(context.contract_tokens),);builder.ensure_within_memory_budget(0,maximum_working_bytes,context.pool.current_num_threads(),)?;"
+        "builder.push_document(metadata_contract_index_from_usize(contract_index),document.as_ref(),context.data,Some(context.contract_tokens),);builder.ensure_within_memory_budget(0,maximum_working_bytes,context.pool.current_num_threads(),context.recall_mode,)?;"
     ));
 }
 
@@ -3048,6 +3428,7 @@ fn metadata_fallback_atoms_collapse_identical_nonempty_token_sets_without_unioni
         contract_tokens: &contract_tokens,
         chain_count: 1,
         pool: &pool,
+        recall_mode: MetadataRecallMode::Exact,
     };
 
     let stats = union_metadata_content_candidates(
@@ -3103,6 +3484,7 @@ fn metadata_fallback_atoms_union_identical_members_without_token_ids() {
         contract_tokens: &contract_tokens,
         chain_count: 1,
         pool: &pool,
+        recall_mode: MetadataRecallMode::Exact,
     };
 
     let stats = union_metadata_content_candidates(
@@ -3163,6 +3545,7 @@ fn metadata_fallback_atoms_avoid_quadratic_pairs_for_disjoint_token_sets() {
         contract_tokens: &contract_tokens,
         chain_count: 1,
         pool: &pool,
+        recall_mode: MetadataRecallMode::Exact,
     };
 
     let stats = union_metadata_content_candidates(
@@ -3230,6 +3613,7 @@ fn metadata_fallback_atoms_match_brute_force_connectivity() {
         contract_tokens: &contract_tokens,
         chain_count: 2,
         pool: &pool,
+        recall_mode: MetadataRecallMode::Exact,
     };
     let new_state = || MetadataUnionState {
         intra: UnionFind::new(fixtures.len()),
@@ -3388,6 +3772,47 @@ fn metadata_candidate_scratch_pool_reuses_state_across_batches() {
     assert_eq!(second.seen_generation.len(), 3);
     assert!(second.candidates.is_empty());
     assert_eq!(first_allocation, second_allocation);
+}
+
+#[test]
+fn metadata_candidate_scratch_pool_releases_lock_before_cold_allocation() {
+    let source = include_str!("index.rs");
+    let take_start = source
+        .find("pub(super) fn take(&self) -> MetadataCandidateScratchLease<'_>")
+        .unwrap();
+    let take_end = source[take_start..]
+        .find("impl std::ops::Deref for MetadataCandidateScratchLease")
+        .map(|offset| take_start + offset)
+        .unwrap();
+    let take = &source[take_start..take_end];
+
+    let pop = take.find(".pop()").unwrap();
+    let cold_allocation = take.find("MetadataCandidateScratch::new").unwrap();
+    assert!(take[pop..cold_allocation].contains("};"));
+}
+
+#[test]
+fn parallel_left_waves_reuse_candidate_scratch_pool_across_calls() {
+    let source = include_str!("index.rs");
+    let wave_start = source
+        .find("fn collect_metadata_left_candidate_wave")
+        .unwrap();
+    let wave_end = source[wave_start..]
+        .find("fn consume_metadata_left_candidate_wave")
+        .map(|offset| wave_start + offset)
+        .unwrap();
+    let wave = &source[wave_start..wave_end];
+    assert!(wave.contains("scratch_pool: &MetadataCandidateScratchPool"));
+    assert!(wave.contains("|| scratch_pool.take()"));
+    assert!(!wave.contains("MetadataCandidateScratch::new(atoms.len())"));
+
+    let core_start = source
+        .find("fn union_metadata_shared_token_atom_core")
+        .unwrap();
+    let core = &source[core_start..];
+    assert!(core
+        .contains("let candidate_scratch_pool = MetadataCandidateScratchPool::new(atoms.len())"));
+    assert!(core.matches("&candidate_scratch_pool").count() >= 2);
 }
 
 #[test]
@@ -3949,6 +4374,7 @@ fn metadata_raw_group_parse_reserve_covers_high_cardinality_content_document() {
         contract_tokens: &contract_tokens,
         chain_count: 1,
         pool: &pool,
+        recall_mode: MetadataRecallMode::Exact,
     };
     let mut group = MetadataRawTokenGroup::default();
     group.push_raw(0, metadata_json, &context);
@@ -3999,14 +4425,52 @@ fn metadata_builder_budget_excludes_load_transient_reserve() {
 }
 
 #[test]
-fn metadata_runtime_reserve_includes_each_worker_stack() {
-    let one_worker = metadata_runtime_reserve_bytes(100, 1_000, 3, 1);
-    let four_workers = metadata_runtime_reserve_bytes(100, 1_000, 3, 4);
+fn metadata_structure_budget_subtracts_each_worker_stack() {
+    let total = 8 * METADATA_ANALYSIS_WORKER_STACK_BYTES;
+    let one_worker = metadata_structure_memory_budget_bytes(total, 1).unwrap();
+    let four_workers = metadata_structure_memory_budget_bytes(total, 4).unwrap();
 
     assert_eq!(
-        four_workers.saturating_sub(one_worker),
+        one_worker.saturating_sub(four_workers),
         3 * METADATA_ANALYSIS_WORKER_STACK_BYTES
     );
+    assert!(
+        metadata_structure_memory_budget_bytes(4 * METADATA_ANALYSIS_WORKER_STACK_BYTES, 4)
+            .is_err()
+    );
+}
+
+#[test]
+fn metadata_worker_stack_is_subtracted_before_pool_and_working_budgets() {
+    let source = include_str!("mod.rs");
+    let analysis_start = source.find("pub(super) fn run_metadata_analysis").unwrap();
+    let analysis_end = source[analysis_start..]
+        .find("fn scalar_u64")
+        .map(|offset| analysis_start + offset)
+        .unwrap();
+    let analysis = &source[analysis_start..analysis_end];
+    let structure_budget = analysis
+        .find("metadata_structure_memory_budget_bytes")
+        .expect("worker stacks must be subtracted into one structural budget");
+    let pool_build = analysis.find("rayon::ThreadPoolBuilder::new()").unwrap();
+
+    assert!(structure_budget < pool_build);
+    assert!(analysis.contains("let analysis_memory_bytes ="));
+    assert!(analysis
+        .contains("metadata_structure_memory_budget_bytes(total_analysis_memory_bytes, threads)?"));
+    assert!(analysis
+        .contains("let maximum_shared_working_bytes = analysis_memory_bytes - resident_bytes"));
+    assert!(analysis.contains(
+        "let maximum_fallback_working_bytes = analysis_memory_bytes - fallback_resident_bytes"
+    ));
+}
+
+#[test]
+fn metadata_completion_labels_drift_as_a_pre_fallback_sample() {
+    let source = include_str!("mod.rs");
+
+    assert!(source.contains("sample drift before fallback contracts/components"));
+    assert!(!source.contains("; drift contracts/components"));
 }
 
 #[test]

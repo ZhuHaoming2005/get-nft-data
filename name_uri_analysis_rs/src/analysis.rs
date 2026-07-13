@@ -30,14 +30,14 @@ use duckdb_prep::*;
 use memory::*;
 #[cfg(test)]
 use metadata::metadata_raw_rows_sql;
-use metadata::{run_metadata_analysis, MAX_METADATA_BYTES_FOR_DEDUP};
+use metadata::{run_metadata_analysis, MetadataAnalysisSpec, MAX_METADATA_BYTES_FOR_DEDUP};
 use name::*;
 use name_scoring::*;
 use output::*;
 pub use output::{validate_output_generation, SUMMARY_MANIFEST_FILE_NAME};
 use progress::*;
 use types::*;
-pub use types::{AnalysisError, AnalysisOptions, AnalysisReport, SummaryRow};
+pub use types::{AnalysisError, AnalysisOptions, AnalysisReport, MetadataRecallMode, SummaryRow};
 use uri::*;
 
 const NAME_DUCKDB_MEMORY_CAP: &str = "8GiB";
@@ -153,12 +153,15 @@ pub fn run_analysis_phase(
                     &conn,
                     &chains,
                     &totals,
-                    options.threads,
-                    options
-                        .analysis_memory_limit
-                        .as_deref()
-                        .unwrap_or(&options.memory_limit),
-                    Some(&work_directory.join("artifacts/metadata")),
+                    MetadataAnalysisSpec {
+                        threads: options.threads,
+                        recall_mode: options.metadata_recall_mode,
+                        memory_limit: options
+                            .analysis_memory_limit
+                            .as_deref()
+                            .unwrap_or(&options.memory_limit),
+                        artifact_directory: Some(&work_directory.join("artifacts/metadata")),
+                    },
                     &progress,
                 )?;
                 if diagnostics {
@@ -458,12 +461,15 @@ pub fn run_analysis(options: AnalysisOptions) -> Result<AnalysisReport, Analysis
                 &conn,
                 &selected_chains,
                 &chain_totals,
-                options.threads,
-                options
-                    .analysis_memory_limit
-                    .as_deref()
-                    .unwrap_or(&options.memory_limit),
-                None,
+                MetadataAnalysisSpec {
+                    threads: options.threads,
+                    recall_mode: options.metadata_recall_mode,
+                    memory_limit: options
+                        .analysis_memory_limit
+                        .as_deref()
+                        .unwrap_or(&options.memory_limit),
+                    artifact_directory: None,
+                },
                 &progress,
             )?
             .rows,
