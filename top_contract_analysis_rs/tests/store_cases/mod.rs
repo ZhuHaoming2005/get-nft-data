@@ -258,6 +258,47 @@ fn feature_store_marks_name_rows_that_also_pass_metadata_recall() {
 }
 
 #[test]
+fn feature_store_name_recall_matches_any_distinct_name_in_a_contract() {
+    let rows = vec![
+        DatabaseNftRecord {
+            contract_address: "0xdup".into(),
+            token_id: "1".into(),
+            name: "Aardvark".into(),
+            ..Default::default()
+        },
+        DatabaseNftRecord {
+            contract_address: "0xdup".into(),
+            token_id: "2".into(),
+            name: "Target Collection #2".into(),
+            ..Default::default()
+        },
+    ];
+    let seed_nfts = vec![SeedNft {
+        chain: "ethereum".into(),
+        contract_address: "0xseed".into(),
+        token_id: "999".into(),
+        name: "Target Collection #999".into(),
+        ..Default::default()
+    }];
+
+    for rows in [rows.clone(), rows.into_iter().rev().collect()] {
+        let store = DuckDbFeatureStore::new(":memory:").unwrap();
+        store.replace_chain_rows("ethereum", &rows).unwrap();
+        let snapshot = store
+            .load_snapshot("ethereum", &seed_nfts, 100.0, 2.0, 0, 0)
+            .unwrap();
+
+        assert!(
+            snapshot
+                .duplicate_contract_rows
+                .iter()
+                .any(|row| row.contract_address == "0xdup"),
+            "name recall must not depend on the single representative name or input order"
+        );
+    }
+}
+
+#[test]
 fn feature_store_keeps_one_overlapping_metadata_row_for_final_duplicate_recheck() {
     let store = DuckDbFeatureStore::new(":memory:").unwrap();
     store
@@ -861,6 +902,7 @@ fn feature_store_applies_duckdb_resource_options() {
     let options = DuckDbResourceOptions {
         threads: 2,
         memory_limit: "2GB".into(),
+        ..Default::default()
     };
     let store = DuckDbFeatureStore::new_with_options(":memory:", options.clone()).unwrap();
 

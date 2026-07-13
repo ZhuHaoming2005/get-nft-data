@@ -257,6 +257,17 @@ pub(crate) fn metadata_bm25_has_terms(document: &str) -> bool {
 pub const METADATA_BM25_K1: f64 = 1.2;
 pub const METADATA_BM25_B: f64 = 0.75;
 
+pub(crate) fn stable_metadata_token_hash(token: &str) -> u64 {
+    let mut value = 0xcbf2_9ce4_8422_2325u64;
+    for byte in token.as_bytes() {
+        value ^= u64::from(*byte);
+        value = value.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
 #[derive(Debug, Clone)]
 pub struct MetadataBm25Document {
     tokens: Vec<String>,
@@ -526,6 +537,8 @@ pub(crate) struct CompactMetadataBm25Document {
 #[derive(Debug)]
 pub(crate) struct CompactMetadataBm25Corpus {
     token_ids: HashMap<String, u32>,
+    token_hashes: Vec<u64>,
+    token_lexical_ranks: Vec<u32>,
     total_docs: usize,
     avg_doc_len: f64,
     doc_freqs: Vec<usize>,
@@ -534,6 +547,8 @@ pub(crate) struct CompactMetadataBm25Corpus {
 #[derive(Debug, Default)]
 pub(crate) struct CompactMetadataBm25CorpusBuilder {
     token_ids: HashMap<String, u32>,
+    token_hashes: Vec<u64>,
+    owned_token_bytes: usize,
     total_docs: usize,
     total_terms: usize,
     doc_freqs: Vec<usize>,
@@ -598,6 +613,19 @@ impl MetadataBm25CorpusBuilder {
 }
 
 impl CompactMetadataBm25CorpusBuilder {
+    fn intern_token(&mut self, token: &str) -> u32 {
+        if let Some(token_id) = self.token_ids.get(token).copied() {
+            return token_id;
+        }
+        let token_id = u32::try_from(self.token_ids.len())
+            .expect("metadata token dictionary exceeds u32 indexes");
+        self.owned_token_bytes = self.owned_token_bytes.saturating_add(token.len());
+        self.token_ids.insert(token.to_string(), token_id);
+        self.token_hashes.push(stable_metadata_token_hash(token));
+        self.doc_freqs.push(0);
+        token_id
+    }
+
     pub(crate) fn add_tokens(&mut self, tokens: &[String]) {
         if tokens.is_empty() {
             return;
@@ -606,22 +634,31 @@ impl CompactMetadataBm25CorpusBuilder {
         self.total_terms += tokens.len();
         let mut unique_ids = Vec::with_capacity(tokens.len());
         for token in tokens {
-            let token_id = match self.token_ids.get(token).copied() {
-                Some(token_id) => token_id,
-                None => {
-                    let token_id = u32::try_from(self.token_ids.len())
-                        .expect("metadata token dictionary exceeds u32 indexes");
-                    self.token_ids.insert(token.clone(), token_id);
-                    self.doc_freqs.push(0);
-                    token_id
-                }
-            };
-            unique_ids.push(token_id);
+            unique_ids.push(self.intern_token(token));
         }
         unique_ids.sort_unstable();
         unique_ids.dedup();
         for token_id in unique_ids {
             self.doc_freqs[token_id as usize] += 1;
+        }
+    }
+
+    pub(crate) fn add_document(
+        &mut self,
+        document: &MetadataBm25Document,
+    ) -> CompactMetadataBm25Document {
+        self.total_docs += 1;
+        self.total_terms += document.len();
+        let mut terms = Vec::with_capacity(document.term_freqs.len());
+        for (token, term_frequency) in &document.term_freqs {
+            let token_id = self.intern_token(token);
+            self.doc_freqs[token_id as usize] += 1;
+            terms.push((token_id, *term_frequency));
+        }
+        terms.sort_unstable_by_key(|(token_id, _)| *token_id);
+        CompactMetadataBm25Document {
+            len: document.len(),
+            terms,
         }
     }
 
@@ -631,12 +668,49 @@ impl CompactMetadataBm25CorpusBuilder {
         } else {
             self.total_terms as f64 / self.total_docs as f64
         };
+        let mut lexical_tokens = self
+            .token_ids
+            .iter()
+            .map(|(token, token_id)| (token.as_str(), *token_id))
+            .collect::<Vec<_>>();
+        lexical_tokens.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        let mut token_lexical_ranks = vec![0; self.token_ids.len()];
+        for (rank, (_, token_id)) in lexical_tokens.into_iter().enumerate() {
+            token_lexical_ranks[token_id as usize] =
+                u32::try_from(rank).expect("metadata token dictionary exceeds u32 indexes");
+        }
         CompactMetadataBm25Corpus {
             token_ids: self.token_ids,
+            token_hashes: self.token_hashes,
+            token_lexical_ranks,
             total_docs: self.total_docs,
             avg_doc_len,
             doc_freqs: self.doc_freqs,
         }
+    }
+
+    pub(crate) fn memory_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                self.token_ids
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(String, u32)>()),
+            )
+            .saturating_add(self.owned_token_bytes)
+            .saturating_add(
+                self.token_hashes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u64>()),
+            )
+            .saturating_add(
+                self.doc_freqs
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<usize>()),
+            )
+    }
+
+    pub(crate) fn token_count(&self) -> usize {
+        self.token_ids.len()
     }
 }
 
@@ -645,14 +719,11 @@ impl CompactMetadataBm25Corpus {
         documents: &[MetadataBm25Document],
     ) -> (Self, Vec<CompactMetadataBm25Document>) {
         let mut builder = CompactMetadataBm25CorpusBuilder::default();
-        for document in documents {
-            builder.add_tokens(document.tokens());
-        }
-        let corpus = builder.finish();
         let compact_documents = documents
             .iter()
-            .map(|document| corpus.compact_document(document))
+            .map(|document| builder.add_document(document))
             .collect();
+        let corpus = builder.finish();
         (corpus, compact_documents)
     }
 
@@ -677,18 +748,75 @@ impl CompactMetadataBm25Corpus {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn total_docs(&self) -> usize {
         self.total_docs
     }
 
-    pub(crate) fn token_doc_freq(&self, token: &str) -> Option<usize> {
-        self.token_ids
-            .get(token)
-            .map(|token_id| self.doc_freqs[*token_id as usize])
+    pub(crate) fn token_id(&self, token: &str) -> Option<u32> {
+        self.token_ids.get(token).copied()
     }
 
-    pub(crate) fn contains_token(&self, token: &str) -> bool {
-        self.token_ids.contains_key(token)
+    pub(crate) fn token_count(&self) -> usize {
+        self.token_ids.len()
+    }
+
+    pub(crate) fn token_doc_freq_by_id(&self, token_id: u32) -> usize {
+        self.doc_freqs[token_id as usize]
+    }
+
+    #[cfg(test)]
+    pub(crate) fn token_hash(&self, token_id: u32) -> u64 {
+        self.token_hashes[token_id as usize]
+    }
+
+    #[cfg(test)]
+    pub(crate) fn token_lexical_rank(&self, token_id: u32) -> u32 {
+        self.token_lexical_ranks[token_id as usize]
+    }
+
+    pub(crate) fn memory_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                self.token_ids
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(String, u32)>()),
+            )
+            .saturating_add(
+                self.token_ids
+                    .keys()
+                    .map(|token| token.capacity())
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.token_hashes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u64>()),
+            )
+            .saturating_add(
+                self.token_lexical_ranks
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+            .saturating_add(
+                self.doc_freqs
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<usize>()),
+            )
+    }
+}
+
+impl CompactMetadataBm25Document {
+    pub(crate) fn terms(&self) -> &[(u32, usize)] {
+        &self.terms
+    }
+
+    pub(crate) fn memory_bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(
+            self.terms
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(u32, usize)>()),
+        )
     }
 }
 

@@ -1,6 +1,55 @@
 use super::*;
 
 impl DuckDbFeatureStore {
+    pub(super) fn prepare_seed_uri_tables(
+        conn: &Connection,
+        profiles: &[SeedRecallProfile],
+    ) -> Result<(), AppError> {
+        conn.execute_batch(&format!(
+            "DROP TABLE IF EXISTS {SEED_TOKEN_URI_TABLE};
+             DROP TABLE IF EXISTS {SEED_IMAGE_URI_TABLE};
+             DROP TABLE IF EXISTS {SEED_CONTRACT_TABLE};
+             DROP TABLE IF EXISTS {URI_SELECTED_MATCH_TABLE};
+             CREATE TEMP TABLE {SEED_TOKEN_URI_TABLE} (
+                 seed_index UINTEGER NOT NULL, value VARCHAR NOT NULL
+             );
+             CREATE TEMP TABLE {SEED_IMAGE_URI_TABLE} (
+                 seed_index UINTEGER NOT NULL, value VARCHAR NOT NULL
+             );
+             CREATE TEMP TABLE {SEED_CONTRACT_TABLE} (
+                 seed_index UINTEGER NOT NULL, contract_address VARCHAR NOT NULL
+             );"
+        ))?;
+        let mut token_stmt =
+            conn.prepare(&format!("INSERT INTO {SEED_TOKEN_URI_TABLE} VALUES (?, ?)"))?;
+        let mut image_stmt =
+            conn.prepare(&format!("INSERT INTO {SEED_IMAGE_URI_TABLE} VALUES (?, ?)"))?;
+        let mut contract_stmt =
+            conn.prepare(&format!("INSERT INTO {SEED_CONTRACT_TABLE} VALUES (?, ?)"))?;
+        for (seed_index, profile) in profiles.iter().enumerate() {
+            let seed_index = u32::try_from(seed_index).map_err(|_| {
+                AppError::ResourceLimit(
+                    "seed profile count exceeds the supported u32 candidate-staging space"
+                        .to_string(),
+                )
+            })?;
+            for value in profile.exact_token_keys.iter().collect::<BTreeSet<_>>() {
+                if !value.is_empty() {
+                    token_stmt.execute(params![seed_index, value])?;
+                }
+            }
+            for value in profile.exact_image_keys.iter().collect::<BTreeSet<_>>() {
+                if !value.is_empty() {
+                    image_stmt.execute(params![seed_index, value])?;
+                }
+            }
+            for contract in profile.seed_contracts.iter().collect::<BTreeSet<_>>() {
+                contract_stmt.execute(params![seed_index, contract])?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn prepare_seed_value_table(
         conn: &Connection,
         table_name: &str,
@@ -35,7 +84,10 @@ impl DuckDbFeatureStore {
             DROP TABLE IF EXISTS {SEED_TOKEN_URI_TABLE};
             DROP TABLE IF EXISTS {SEED_IMAGE_URI_TABLE};
             DROP TABLE IF EXISTS {SEED_TOKEN_ID_TABLE};
+            DROP TABLE IF EXISTS {SEED_CONTRACT_TABLE};
             DROP TABLE IF EXISTS {CANDIDATE_CONTRACT_TABLE};
+            DROP TABLE IF EXISTS {CANDIDATE_MATCH_TABLE};
+            DROP TABLE IF EXISTS {URI_SELECTED_MATCH_TABLE};
             DROP TABLE IF EXISTS {SELECTED_RECALL_ROWID_TABLE};
             "
         ))?;
@@ -48,6 +100,12 @@ impl DuckDbFeatureStore {
             DROP TABLE IF EXISTS {SELECTED_RECALL_ROWID_TABLE};
             CREATE TEMP TABLE {SELECTED_RECALL_ROWID_TABLE} (
                 feature_rowid BIGINT NOT NULL
+            );
+            DROP TABLE IF EXISTS {CANDIDATE_MATCH_TABLE};
+            CREATE TEMP TABLE {CANDIDATE_MATCH_TABLE} (
+                seed_index UINTEGER NOT NULL,
+                feature_rowid BIGINT NOT NULL,
+                reason_bits UTINYINT NOT NULL
             );
             "
         ))?;
@@ -100,263 +158,6 @@ impl DuckDbFeatureStore {
             name_prefix_match: !row.name_norm.is_empty() && name_match,
             metadata_recall_match,
         }
-    }
-
-    pub(super) fn can_select_recall_row(
-        seed_index: usize,
-        profile: &SeedRecallProfile,
-        row: &RecallRow,
-        accumulators: &BTreeMap<String, SnapshotAccumulator>,
-        pending_contract_counts: &HashMap<(usize, String), usize>,
-        max_tokens_per_contract: usize,
-    ) -> bool {
-        if profile.seed_contracts.contains(&row.contract_address) {
-            return false;
-        }
-        let Some(accumulator) = accumulators.get(&profile.seed_address) else {
-            return false;
-        };
-        if accumulator.seen_feature_rowids.contains(&row.feature_rowid) {
-            return false;
-        }
-        if max_tokens_per_contract == 0 {
-            return true;
-        }
-        let accepted = accumulator
-            .per_contract_counts
-            .get(&row.contract_address)
-            .copied()
-            .unwrap_or_default();
-        let pending = pending_contract_counts
-            .get(&(seed_index, row.contract_address.clone()))
-            .copied()
-            .unwrap_or_default();
-        accepted + pending < max_tokens_per_contract
-    }
-
-    pub(super) fn note_pending_recall_row(
-        seed_index: usize,
-        row: &RecallRow,
-        pending_contract_counts: &mut HashMap<(usize, String), usize>,
-    ) {
-        *pending_contract_counts
-            .entry((seed_index, row.contract_address.clone()))
-            .or_default() += 1;
-    }
-
-    pub(super) fn can_stage_metadata_recall_row(
-        profile: &SeedRecallProfile,
-        row: &RecallRow,
-        accumulators: &BTreeMap<String, SnapshotAccumulator>,
-        max_tokens_per_contract: usize,
-    ) -> bool {
-        if profile.seed_contracts.contains(&row.contract_address) {
-            return false;
-        }
-        let Some(accumulator) = accumulators.get(&profile.seed_address) else {
-            return false;
-        };
-        if accumulator.seen_feature_rowids.contains(&row.feature_rowid) {
-            return false;
-        }
-        let accepted = accumulator
-            .per_contract_counts
-            .get(&row.contract_address)
-            .copied()
-            .unwrap_or_default();
-        accepted < max_tokens_per_contract
-    }
-
-    pub(super) fn stage_metadata_recall_row(
-        pending_rows: &mut HashMap<(usize, String), Vec<PendingMetadataRecallRow>>,
-        seed_index: usize,
-        row: &RecallRow,
-        row_match: SeedRowMatch,
-        max_tokens_per_contract: usize,
-    ) {
-        if max_tokens_per_contract == 0 {
-            return;
-        }
-        let entry = pending_rows
-            .entry((seed_index, row.contract_address.clone()))
-            .or_default();
-        if entry
-            .iter()
-            .any(|pending| pending.row.feature_rowid == row.feature_rowid)
-        {
-            return;
-        }
-        entry.push(PendingMetadataRecallRow {
-            seed_index,
-            row: row.clone(),
-            row_match,
-        });
-        entry.sort_by(|left, right| {
-            (&left.row.token_id, left.row.feature_rowid)
-                .cmp(&(&right.row.token_id, right.row.feature_rowid))
-        });
-        entry.truncate(max_tokens_per_contract);
-    }
-
-    pub(super) fn drain_selected_recall_rows(
-        conn: &Connection,
-        profiles: &[SeedRecallProfile],
-        batch_rows: &[RecallRow],
-        selected_rows: &mut Vec<SelectedRecallRow>,
-        accumulators: &mut BTreeMap<String, SnapshotAccumulator>,
-        max_tokens_per_contract: usize,
-    ) -> Result<(), AppError> {
-        if selected_rows.is_empty() {
-            return Ok(());
-        }
-
-        let selected_rowids = selected_rows
-            .iter()
-            .map(|selected| batch_rows[selected.row_index].feature_rowid)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let full_records_by_rowid = Self::fetch_records_by_feature_rowid(conn, &selected_rowids)?;
-
-        for selected in selected_rows.drain(..) {
-            let Some(row) = batch_rows.get(selected.row_index) else {
-                continue;
-            };
-            let Some(record) = full_records_by_rowid.get(&row.feature_rowid) else {
-                continue;
-            };
-            let Some(profile) = profiles.get(selected.seed_index) else {
-                continue;
-            };
-            let Some(accumulator) = accumulators.get_mut(&profile.seed_address) else {
-                continue;
-            };
-            accumulator.push_recall_row(
-                profile,
-                row,
-                record.clone(),
-                &selected.row_match,
-                max_tokens_per_contract,
-            );
-        }
-
-        Ok(())
-    }
-
-    pub(super) fn drain_pending_metadata_recall_rows(
-        conn: &Connection,
-        profiles: &[SeedRecallProfile],
-        pending_rows: &mut HashMap<(usize, String), Vec<PendingMetadataRecallRow>>,
-        accumulators: &mut BTreeMap<String, SnapshotAccumulator>,
-        max_tokens_per_contract: usize,
-    ) -> Result<(), AppError> {
-        if pending_rows.is_empty() {
-            return Ok(());
-        }
-
-        let mut rows = pending_rows
-            .drain()
-            .flat_map(|(_, rows)| rows)
-            .collect::<Vec<_>>();
-        rows.sort_by(|left, right| {
-            (
-                left.seed_index,
-                &left.row.contract_address,
-                &left.row.token_id,
-                left.row.feature_rowid,
-            )
-                .cmp(&(
-                    right.seed_index,
-                    &right.row.contract_address,
-                    &right.row.token_id,
-                    right.row.feature_rowid,
-                ))
-        });
-
-        for chunk in rows.chunks(SELECTED_RECALL_ROWID_CHUNK_SIZE) {
-            let rowids = chunk
-                .iter()
-                .map(|pending| pending.row.feature_rowid)
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>();
-            let full_records_by_rowid = Self::fetch_records_by_feature_rowid(conn, &rowids)?;
-            for pending in chunk {
-                let Some(record) = full_records_by_rowid.get(&pending.row.feature_rowid) else {
-                    continue;
-                };
-                let Some(profile) = profiles.get(pending.seed_index) else {
-                    continue;
-                };
-                let Some(accumulator) = accumulators.get_mut(&profile.seed_address) else {
-                    continue;
-                };
-                accumulator.push_recall_row(
-                    profile,
-                    &pending.row,
-                    record.clone(),
-                    &pending.row_match,
-                    max_tokens_per_contract,
-                );
-            }
-        }
-
-        Ok(())
-    }
-
-    pub(super) fn drain_owned_recall_rows(
-        conn: &Connection,
-        profiles: &[SeedRecallProfile],
-        rows: &mut Vec<PendingMetadataRecallRow>,
-        accumulators: &mut BTreeMap<String, SnapshotAccumulator>,
-        max_tokens_per_contract: usize,
-    ) -> Result<(), AppError> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-        rows.sort_by(|left, right| {
-            (
-                left.seed_index,
-                &left.row.contract_address,
-                &left.row.token_id,
-                left.row.feature_rowid,
-            )
-                .cmp(&(
-                    right.seed_index,
-                    &right.row.contract_address,
-                    &right.row.token_id,
-                    right.row.feature_rowid,
-                ))
-        });
-        for chunk in rows.chunks(SELECTED_RECALL_ROWID_CHUNK_SIZE) {
-            let rowids = chunk
-                .iter()
-                .map(|pending| pending.row.feature_rowid)
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>();
-            let full_records_by_rowid = Self::fetch_records_by_feature_rowid(conn, &rowids)?;
-            for pending in chunk {
-                let Some(record) = full_records_by_rowid.get(&pending.row.feature_rowid) else {
-                    continue;
-                };
-                let Some(profile) = profiles.get(pending.seed_index) else {
-                    continue;
-                };
-                let Some(accumulator) = accumulators.get_mut(&profile.seed_address) else {
-                    continue;
-                };
-                accumulator.push_recall_row(
-                    profile,
-                    &pending.row,
-                    record.clone(),
-                    &pending.row_match,
-                    max_tokens_per_contract,
-                );
-            }
-        }
-        rows.clear();
-        Ok(())
     }
 
     pub(super) fn fetch_records_by_feature_rowid(
@@ -419,20 +220,53 @@ impl DuckDbFeatureStore {
         Ok(records)
     }
 
+    pub(super) fn fetch_recall_rows_by_feature_rowid(
+        conn: &Connection,
+        rowids: &[i64],
+    ) -> Result<HashMap<i64, RecallRow>, AppError> {
+        if rowids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut rows = HashMap::new();
+        for chunk in rowids.chunks(SELECTED_RECALL_ROWID_CHUNK_SIZE) {
+            Self::replace_selected_recall_rowids(conn, chunk)?;
+            let sql = format!(
+                "
+                SELECT f.rowid AS feature_rowid,
+                       CASE WHEN lower(trim(CAST(f.chain AS VARCHAR))) = 'solana'
+                            THEN trim(CAST(f.contract_address AS VARCHAR))
+                            ELSE lower(trim(CAST(f.contract_address AS VARCHAR))) END AS contract_address,
+                       CAST(f.token_id AS VARCHAR) AS token_id,
+                       coalesce(CAST(f.token_uri_norm AS VARCHAR), '') AS token_uri_norm,
+                       coalesce(CAST(f.image_uri_norm AS VARCHAR), '') AS image_uri_norm,
+                       coalesce(CAST(f.name_norm AS VARCHAR), '') AS name_norm
+                FROM nft_features f
+                JOIN {SELECTED_RECALL_ROWID_TABLE} selected
+                  ON selected.feature_rowid = f.rowid
+                ORDER BY f.rowid
+                "
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            for batch in stmt.query_arrow([])? {
+                let mut batch_rows = Vec::new();
+                append_recall_rows_from_arrow_batch(&batch, &mut batch_rows)?;
+                rows.extend(batch_rows.into_iter().map(|row| (row.feature_rowid, row)));
+            }
+        }
+        Ok(rows)
+    }
+
     pub(super) fn append_exact_uri_recall_rows(
+        &self,
         conn: &Connection,
         input: ExactUriRecallInput<'_>,
-        accumulators: &mut BTreeMap<String, SnapshotAccumulator>,
+        _accumulators: &mut BTreeMap<String, SnapshotAccumulator>,
     ) -> Result<(), AppError> {
         let ExactUriRecallInput {
             chain,
             profiles,
-            profile_index,
             all_token_keys,
             all_image_keys,
-            name_threshold,
-            max_tokens_per_contract,
-            max_recall_rows,
             prepared_recall_state,
         } = input;
         if !prepared_recall_state.ready {
@@ -442,133 +276,119 @@ impl DuckDbFeatureStore {
             return Ok(());
         }
 
-        Self::prepare_seed_value_table(conn, SEED_TOKEN_URI_TABLE, all_token_keys)?;
-        Self::prepare_seed_value_table(conn, SEED_IMAGE_URI_TABLE, all_image_keys)?;
+        Self::prepare_seed_uri_tables(conn, profiles)?;
 
-        let token_uri_match_expr = if all_token_keys.is_empty() {
-            "FALSE".to_string()
-        } else {
-            format!("token_uri_norm IN (SELECT value FROM {SEED_TOKEN_URI_TABLE})")
-        };
-        let image_uri_match_expr = if all_image_keys.is_empty() {
-            "FALSE".to_string()
-        } else {
-            format!("image_uri_norm IN (SELECT value FROM {SEED_IMAGE_URI_TABLE})")
-        };
-        let exact_uri_predicate = format!("({token_uri_match_expr}) OR ({image_uri_match_expr})");
-        let recall_batch_size = if max_recall_rows == 0 {
-            DEFAULT_RECALL_BATCH_SIZE
-        } else {
-            max_recall_rows
-        };
+        // Stage only fixed-width candidate identities. Full normalized URI
+        // equality is checked here so hash collisions never become matches.
+        // Cardinality admission and per-contract ranking happen before any
+        // token/image/name/metadata payload is loaded into Rust.
+        let stage_sql = format!(
+            "
+            INSERT INTO {CANDIDATE_MATCH_TABLE} (seed_index, feature_rowid, reason_bits)
+            SELECT seed_index, feature_rowid, bit_or(reason_bits)::UTINYINT
+            FROM (
+                SELECT seed.seed_index, posting.feature_rowid, {TOKEN_URI_REASON}::UTINYINT AS reason_bits
+                FROM {URI_RECALL_POSTING_TABLE} posting
+                JOIN {SEED_TOKEN_URI_TABLE} seed
+                  ON posting.uri_hash = md5_number_lower(seed.value)
+                JOIN nft_features feature ON feature.rowid = posting.feature_rowid
+                LEFT JOIN {SEED_CONTRACT_TABLE} own
+                  ON own.seed_index = seed.seed_index
+                 AND own.contract_address = feature.contract_address
+                WHERE posting.chain = ? AND posting.uri_kind = 1
+                  AND feature.token_uri_norm = seed.value
+                  AND own.contract_address IS NULL
+                UNION ALL
+                SELECT seed.seed_index, posting.feature_rowid, {IMAGE_URI_REASON}::UTINYINT AS reason_bits
+                FROM {URI_RECALL_POSTING_TABLE} posting
+                JOIN {SEED_IMAGE_URI_TABLE} seed
+                  ON posting.uri_hash = md5_number_lower(seed.value)
+                JOIN nft_features feature ON feature.rowid = posting.feature_rowid
+                LEFT JOIN {SEED_CONTRACT_TABLE} own
+                  ON own.seed_index = seed.seed_index
+                 AND own.contract_address = feature.contract_address
+                WHERE posting.chain = ? AND posting.uri_kind = 2
+                  AND feature.image_uri_norm = seed.value
+                  AND own.contract_address IS NULL
+            ) raw_matches
+            GROUP BY seed_index, feature_rowid
+            "
+        );
+        conn.execute(&stage_sql, params![chain, chain])?;
 
-        let mut last_feature_rowid = -1_i64;
-        loop {
-            let select_sql = format!(
-                "
-                    SELECT feature_rowid,
-                           contract_address,
-                           token_id,
-                           coalesce(token_uri_norm, '') AS token_uri_norm,
-                           coalesce(image_uri_norm, '') AS image_uri_norm,
-                           coalesce(name_norm, '') AS name_norm
-                    FROM {FEATURE_RECALL_TABLE}
-                    WHERE chain = ?
-                      AND ({exact_uri_predicate})
-                      AND feature_rowid > {last_feature_rowid}
-                    ORDER BY feature_rowid
-                    LIMIT {recall_batch_size}
-                    "
-            );
-            let mut stmt = conn.prepare(&select_sql)?;
-            let mut batch_rows = Vec::new();
-            for batch in stmt.query_arrow(params![chain])? {
-                append_recall_rows_from_arrow_batch(&batch, false, &mut batch_rows)?;
-            }
-            let fetched_rows = batch_rows.len();
-            let last_seen_feature_rowid = batch_rows
-                .last()
-                .map_or(last_feature_rowid, |row| row.feature_rowid);
-            drop(stmt);
-
-            batch_rows.sort_by(|left, right| {
-                (&left.contract_address, &left.token_id, left.feature_rowid).cmp(&(
-                    &right.contract_address,
-                    &right.token_id,
-                    right.feature_rowid,
+        let mut stats_stmt = conn.prepare(&format!(
+            "SELECT candidate.seed_index,
+                    CAST(count(DISTINCT feature.contract_address) AS UBIGINT),
+                    CAST(count(*) AS UBIGINT)
+             FROM {CANDIDATE_MATCH_TABLE} candidate
+             JOIN nft_features feature ON feature.rowid = candidate.feature_rowid
+             GROUP BY candidate.seed_index ORDER BY candidate.seed_index"
+        ))?;
+        let stats = stats_stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, u32>(0)? as usize,
+                    row.get::<_, u64>(1)? as usize,
+                    row.get::<_, u64>(2)? as usize,
                 ))
-            });
-
-            let mut selected_rows = Vec::with_capacity(SELECTED_RECALL_ROWID_CHUNK_SIZE);
-            let mut pending_contract_counts = HashMap::new();
-            for (row_index, row) in batch_rows.iter().enumerate() {
-                let mut seed_indices = profile_index.strong_match_profiles(row);
-                seed_indices.sort_unstable();
-                for seed_index in seed_indices {
-                    let Some(profile) = profiles.get(seed_index) else {
-                        continue;
-                    };
-                    let row_match = Self::seed_row_match(profile, row, name_threshold, false);
-                    if !(row_match.token_uri_match || row_match.image_uri_match) {
-                        continue;
-                    }
-                    if !Self::can_select_recall_row(
-                        seed_index,
-                        profile,
-                        row,
-                        accumulators,
-                        &pending_contract_counts,
-                        max_tokens_per_contract,
-                    ) {
-                        continue;
-                    }
-
-                    selected_rows.push(SelectedRecallRow {
-                        seed_index,
-                        row_index,
-                        row_match,
-                    });
-                    Self::note_pending_recall_row(seed_index, row, &mut pending_contract_counts);
-                    if selected_rows.len() >= SELECTED_RECALL_ROWID_CHUNK_SIZE {
-                        Self::drain_selected_recall_rows(
-                            conn,
-                            profiles,
-                            &batch_rows,
-                            &mut selected_rows,
-                            accumulators,
-                            max_tokens_per_contract,
-                        )?;
-                        pending_contract_counts.clear();
-                    }
-                }
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stats_stmt);
+        for (seed_index, contract_count, row_count) in stats {
+            if contract_count > self.resource_options.max_candidate_contracts_per_seed {
+                let seed = profiles
+                    .get(seed_index)
+                    .map(|profile| profile.seed_address.as_str())
+                    .unwrap_or("<unknown>");
+                return Err(AppError::ResourceLimit(format!(
+                    "chain {chain:?}, seed {seed:?} URI recall matched {contract_count} candidate contracts and {row_count} rows, exceeding max_candidate_contracts_per_seed={} before payload loading",
+                    self.resource_options.max_candidate_contracts_per_seed
+                )));
             }
-            Self::drain_selected_recall_rows(
-                conn,
-                profiles,
-                &batch_rows,
-                &mut selected_rows,
-                accumulators,
-                max_tokens_per_contract,
-            )?;
-
-            if fetched_rows < recall_batch_size {
-                break;
-            }
-            last_feature_rowid = last_seen_feature_rowid;
         }
 
         Ok(())
     }
 
-    pub(super) fn append_name_recall_rows(
+    pub(super) fn append_staged_candidate_rows(
         conn: &Connection,
-        chain: &str,
-        profiles: &[SeedRecallProfile],
-        name_threshold: f64,
-        accumulators: &mut BTreeMap<String, SnapshotAccumulator>,
-        max_tokens_per_contract: usize,
-        prepared_recall_state: PreparedRecallState,
+        rows: &[(usize, i64, u8)],
     ) -> Result<(), AppError> {
+        for chunk in rows.chunks(SELECTED_RECALL_ROWID_VALUES_CHUNK_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let values = chunk
+                .iter()
+                .map(|(seed_index, feature_rowid, reason_bits)| {
+                    format!("({seed_index}, {feature_rowid}, {reason_bits})")
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            conn.execute(
+                &format!(
+                    "INSERT INTO {CANDIDATE_MATCH_TABLE} (
+                         seed_index, feature_rowid, reason_bits
+                     ) VALUES {values}"
+                ),
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn append_name_recall_rows(
+        &self,
+        conn: &Connection,
+        input: NameRecallInput<'_>,
+        _accumulators: &mut BTreeMap<String, SnapshotAccumulator>,
+    ) -> Result<(), AppError> {
+        let NameRecallInput {
+            chain,
+            profiles,
+            name_threshold,
+            prepared_recall_state,
+        } = input;
         if !prepared_recall_state.ready {
             return Ok(());
         }
@@ -579,106 +399,51 @@ impl DuckDbFeatureStore {
         {
             return Ok(());
         }
-        let sql = format!(
-            "
-                SELECT rr.feature_rowid,
-                       rr.contract_address,
-                       rr.token_id,
-                       coalesce(rr.token_uri_norm, '') AS token_uri_norm,
-                       coalesce(rr.image_uri_norm, '') AS image_uri_norm,
-                       coalesce(rr.name_norm, '') AS name_norm
-                FROM {CONTRACT_REPRESENTATIVE_TABLE} r
-                JOIN {FEATURE_RECALL_TABLE} rr
-                  ON rr.chain = r.chain
-                 AND rr.feature_rowid = r.name_feature_rowid
-                WHERE r.chain = ?
-                  AND r.name_feature_rowid IS NOT NULL
-                  AND trim(coalesce(rr.name_norm, '')) <> ''
-                ORDER BY rr.feature_rowid
-                "
-        );
-        let mut stmt = conn.prepare(&sql)?;
-
-        let mut selected_rows = Vec::new();
-        let mut pending_contract_counts = HashMap::new();
-        let mut batch_rows = Vec::with_capacity(SELECTED_RECALL_ROWID_CHUNK_SIZE);
-        {
-            let mut append_state = NameRecallAppendState {
-                conn,
-                profiles,
-                selected_rows: &mut selected_rows,
-                pending_contract_counts: &mut pending_contract_counts,
-                accumulators,
-                max_tokens_per_contract,
-            };
-            for batch in stmt.query_arrow(params![chain])? {
-                append_recall_rows_from_arrow_batch(&batch, false, &mut batch_rows)?;
-                while batch_rows.len() >= SELECTED_RECALL_ROWID_CHUNK_SIZE {
-                    let remaining = batch_rows.split_off(SELECTED_RECALL_ROWID_CHUNK_SIZE);
-                    Self::append_scored_name_recall_rows(
-                        &mut append_state,
-                        &batch_rows,
-                        name_threshold,
-                    )?;
-                    batch_rows = remaining;
-                }
+        let index = self.cached_name_recall_index(conn, chain, prepared_recall_state)?;
+        let dense_scratch_bytes = index
+            .rows
+            .len()
+            .saturating_mul(std::mem::size_of::<u16>())
+            .saturating_mul(2);
+        let use_dense_scratch = dense_scratch_bytes <= NAME_CANDIDATE_SCRATCH_BUDGET_BYTES;
+        for (seed_index, profile) in profiles.iter().enumerate() {
+            let matched_rows =
+                Self::score_name_recall_profile(profile, &index, name_threshold, use_dense_scratch);
+            // The exact index retains every distinct normalized name. Collapse
+            // multiple matching names from one contract to a deterministic
+            // feature row before applying contract guardrails and staging.
+            let matched_contracts = matched_rows
+                .into_iter()
+                .filter_map(|row_index| index.rows.get(row_index))
+                .fold(BTreeMap::<&str, i64>::new(), |mut rows, row| {
+                    rows.entry(row.contract_address.as_str())
+                        .and_modify(|feature_rowid| {
+                            *feature_rowid = (*feature_rowid).min(row.feature_rowid);
+                        })
+                        .or_insert(row.feature_rowid);
+                    rows
+                });
+            if matched_contracts.len() > self.resource_options.max_candidate_contracts_per_seed {
+                return Err(AppError::ResourceLimit(format!(
+                    "chain {chain:?}, seed {:?} name recall alone matched {} unique candidate contracts, exceeding max_candidate_contracts_per_seed={} before candidate staging",
+                    profile.seed_address,
+                    matched_contracts.len(),
+                    self.resource_options.max_candidate_contracts_per_seed
+                )));
             }
-            Self::append_scored_name_recall_rows(&mut append_state, &batch_rows, name_threshold)?;
-        }
-        Self::drain_owned_recall_rows(
-            conn,
-            profiles,
-            &mut selected_rows,
-            accumulators,
-            max_tokens_per_contract,
-        )
-    }
-
-    pub(super) fn append_scored_name_recall_rows(
-        state: &mut NameRecallAppendState<'_>,
-        batch_rows: &[RecallRow],
-        name_threshold: f64,
-    ) -> Result<(), AppError> {
-        if batch_rows.is_empty() {
-            return Ok(());
-        }
-        for matched in Self::score_name_recall_batch(state.profiles, batch_rows, name_threshold) {
-            let row = &batch_rows[matched.row_index];
-            let profile = &state.profiles[matched.seed_index];
-            if !Self::can_select_recall_row(
-                matched.seed_index,
-                profile,
-                row,
-                &*state.accumulators,
-                &*state.pending_contract_counts,
-                state.max_tokens_per_contract,
-            ) {
-                continue;
-            }
-            state.selected_rows.push(PendingMetadataRecallRow {
-                seed_index: matched.seed_index,
-                row: row.clone(),
-                row_match: matched.row_match,
-            });
-            Self::note_pending_recall_row(
-                matched.seed_index,
-                row,
-                &mut *state.pending_contract_counts,
-            );
-            if state.selected_rows.len() >= SELECTED_RECALL_ROWID_CHUNK_SIZE {
-                Self::drain_owned_recall_rows(
-                    state.conn,
-                    state.profiles,
-                    &mut *state.selected_rows,
-                    &mut *state.accumulators,
-                    state.max_tokens_per_contract,
-                )?;
-                state.pending_contract_counts.clear();
+            let matched_feature_rowids = matched_contracts.into_values().collect::<Vec<_>>();
+            for matched_chunk in matched_feature_rowids.chunks(SELECTED_RECALL_ROWID_CHUNK_SIZE) {
+                let staged_rows = matched_chunk
+                    .iter()
+                    .map(|feature_rowid| (seed_index, *feature_rowid, NAME_REASON))
+                    .collect::<Vec<_>>();
+                Self::append_staged_candidate_rows(conn, &staged_rows)?;
             }
         }
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn score_name_recall_batch(
         profiles: &[SeedRecallProfile],
         batch_rows: &[RecallRow],
@@ -702,12 +467,6 @@ impl DuckDbFeatureStore {
                     row_matches.push(NameRecallMatch {
                         row_index,
                         seed_index,
-                        row_match: SeedRowMatch {
-                            token_uri_match: profile.exact_token_keys.contains(&row.token_uri_norm),
-                            image_uri_match: profile.exact_image_keys.contains(&row.image_uri_norm),
-                            name_prefix_match: true,
-                            metadata_recall_match: false,
-                        },
                     });
                 }
                 row_matches
@@ -719,116 +478,315 @@ impl DuckDbFeatureStore {
     }
 
     pub(super) fn append_metadata_recall_rows(
+        &self,
         conn: &Connection,
         profiles: &[SeedRecallProfile],
         metadata_threshold: f64,
         metadata_index: &MetadataRecallIndex,
-        accumulators: &mut BTreeMap<String, SnapshotAccumulator>,
-        max_tokens_per_contract: usize,
+        _accumulators: &mut BTreeMap<String, SnapshotAccumulator>,
+        _max_tokens_per_contract: usize,
     ) -> Result<(), AppError> {
         if metadata_index.candidates.is_empty() {
             return Ok(());
         }
-        let mut pending_metadata_rows = HashMap::new();
-        let mut selected_rows = Vec::new();
+        let mut matched_candidates = Vec::new();
+        let mut metadata_candidate_scratch =
+            MetadataCandidateScratch::new(metadata_index.candidates.len());
         for (seed_index, profile) in profiles.iter().enumerate() {
             let Some(seed_doc) = profile.seed_metadata_doc.as_ref() else {
                 continue;
             };
-            let Some(seed_doc) = metadata_seed_doc_for_index(seed_doc, metadata_index) else {
-                continue;
-            };
-            let seed_sketch =
-                metadata_sketch_from_compact_corpus(&seed_doc, &metadata_index.compact_corpus);
             let seed_query =
-                CompactMetadataBm25Query::new(&seed_doc, &metadata_index.compact_corpus);
-            let candidate_indices = Self::metadata_source_candidate_indices(
-                &seed_sketch,
+                CompactMetadataBm25Query::new(seed_doc, &metadata_index.compact_corpus);
+            let candidate_indices = Self::metadata_term_candidate_indices(
+                seed_doc,
                 metadata_index,
                 &profile.seed_contracts,
+                &mut metadata_candidate_scratch,
             );
-            let mut matched_rows = candidate_indices
-                .par_iter()
-                .filter_map(|candidate_index| {
-                    let candidate = metadata_index.candidates.get(*candidate_index)?;
-                    let compact_document =
-                        metadata_index.compact_documents.get(*candidate_index)?;
-                    if !seed_query.has_term_overlap(compact_document)
-                        || score_compact_metadata_indexed_pair_with_query(
-                            &seed_query,
-                            compact_document,
-                        ) < metadata_threshold
-                    {
-                        return None;
-                    }
-                    let mut row = candidate.row.clone();
-                    row.metadata_recall_match = true;
-                    let row_match = Self::seed_row_match(profile, &row, 101.0, true);
-                    Some((*candidate_index, row, row_match))
-                })
-                .collect::<Vec<_>>();
-            matched_rows.sort_by_key(|(candidate_index, _, _)| *candidate_index);
-
-            for (_, row, row_match) in matched_rows {
-                if let Some(accumulator) = accumulators.get_mut(&profile.seed_address) {
-                    if accumulator.mark_selected_metadata_recall(&row) {
-                        continue;
-                    }
+            let mut metadata_match_count = 0usize;
+            for candidate_chunk in candidate_indices.chunks(METADATA_MATCH_PAIR_CHUNK_SIZE) {
+                let mut matched_indices = candidate_chunk
+                    .par_iter()
+                    .filter_map(|candidate_index| {
+                        let candidate_index = *candidate_index as usize;
+                        let compact_document =
+                            metadata_index.compact_documents.get(candidate_index)?;
+                        if !seed_query.has_term_overlap(compact_document)
+                            || score_compact_metadata_indexed_pair_with_query(
+                                &seed_query,
+                                compact_document,
+                            ) < metadata_threshold
+                        {
+                            return None;
+                        }
+                        Some(candidate_index)
+                    })
+                    .collect::<Vec<_>>();
+                metadata_match_count = metadata_match_count.saturating_add(matched_indices.len());
+                if metadata_match_count > self.resource_options.max_candidate_contracts_per_seed {
+                    return Err(AppError::ResourceLimit(format!(
+                        "seed {:?} metadata recall alone matched at least {metadata_match_count} unique candidate contracts, exceeding max_candidate_contracts_per_seed={} before completing candidate staging",
+                        profile.seed_address,
+                        self.resource_options.max_candidate_contracts_per_seed
+                    )));
                 }
-                let strong_match = row_match.token_uri_match
-                    || row_match.image_uri_match
-                    || row_match.name_prefix_match;
-                if strong_match {
-                    continue;
-                }
-                if max_tokens_per_contract > 0 {
-                    if !Self::can_stage_metadata_recall_row(
-                        profile,
-                        &row,
-                        accumulators,
-                        max_tokens_per_contract,
-                    ) {
-                        continue;
+                matched_indices.sort_unstable();
+                for candidate_index in matched_indices {
+                    matched_candidates.push((seed_index, candidate_index));
+                    if matched_candidates.len() >= METADATA_MATCH_PAIR_CHUNK_SIZE {
+                        Self::drain_metadata_candidate_matches(
+                            conn,
+                            metadata_index,
+                            &mut matched_candidates,
+                        )?;
                     }
-                    Self::stage_metadata_recall_row(
-                        &mut pending_metadata_rows,
-                        seed_index,
-                        &row,
-                        row_match,
-                        max_tokens_per_contract,
-                    );
-                    continue;
-                }
-                selected_rows.push(PendingMetadataRecallRow {
-                    seed_index,
-                    row,
-                    row_match,
-                });
-                if selected_rows.len() >= SELECTED_RECALL_ROWID_CHUNK_SIZE {
-                    Self::drain_owned_recall_rows(
-                        conn,
-                        profiles,
-                        &mut selected_rows,
-                        accumulators,
-                        max_tokens_per_contract,
-                    )?;
                 }
             }
         }
-        Self::drain_owned_recall_rows(
-            conn,
+        Self::drain_metadata_candidate_matches(conn, metadata_index, &mut matched_candidates)?;
+        Ok(())
+    }
+
+    pub(super) fn drain_metadata_candidate_matches(
+        conn: &Connection,
+        metadata_index: &MetadataRecallIndex,
+        matched_candidates: &mut Vec<(usize, usize)>,
+    ) -> Result<(), AppError> {
+        if matched_candidates.is_empty() {
+            return Ok(());
+        }
+        let staged_rows = matched_candidates
+            .drain(..)
+            .filter_map(|(seed_index, candidate_index)| {
+                metadata_index
+                    .candidates
+                    .get(candidate_index)
+                    .map(|candidate| (seed_index, candidate.feature_rowid, METADATA_REASON))
+            })
+            .collect::<Vec<_>>();
+        Self::append_staged_candidate_rows(conn, &staged_rows)
+    }
+
+    pub(super) fn materialize_staged_recall_rows(
+        &self,
+        conn: &Connection,
+        input: MaterializeRecallInput<'_>,
+        accumulators: &mut BTreeMap<String, SnapshotAccumulator>,
+    ) -> Result<(), AppError> {
+        let MaterializeRecallInput {
+            chain,
             profiles,
-            &mut selected_rows,
-            accumulators,
+            name_threshold,
             max_tokens_per_contract,
-        )?;
-        Self::drain_pending_metadata_recall_rows(
-            conn,
-            profiles,
-            &mut pending_metadata_rows,
-            accumulators,
-            max_tokens_per_contract,
-        )
+            max_recall_rows,
+        } = input;
+        let aggregated = format!(
+            "SELECT seed_index, feature_rowid, bit_or(reason_bits)::UTINYINT AS reason_bits
+             FROM {CANDIDATE_MATCH_TABLE}
+             GROUP BY seed_index, feature_rowid"
+        );
+        let mut stats_stmt = conn.prepare(&format!(
+            "SELECT candidate.seed_index,
+                    CAST(count(DISTINCT feature.contract_address) AS UBIGINT),
+                    CAST(count(*) AS UBIGINT)
+             FROM ({aggregated}) candidate
+             JOIN nft_features feature ON feature.rowid = candidate.feature_rowid
+             GROUP BY candidate.seed_index ORDER BY candidate.seed_index"
+        ))?;
+        for row in stats_stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, u32>(0)? as usize,
+                row.get::<_, u64>(1)? as usize,
+                row.get::<_, u64>(2)? as usize,
+            ))
+        })? {
+            let (seed_index, contract_count, row_count) = row?;
+            if contract_count > self.resource_options.max_candidate_contracts_per_seed {
+                let seed = profiles
+                    .get(seed_index)
+                    .map(|profile| profile.seed_address.as_str())
+                    .unwrap_or("<unknown>");
+                return Err(AppError::ResourceLimit(format!(
+                    "chain {chain:?}, seed {seed:?} recall matched {contract_count} candidate contracts and {row_count} rows, exceeding max_candidate_contracts_per_seed={} before payload loading",
+                    self.resource_options.max_candidate_contracts_per_seed
+                )));
+            }
+        }
+        drop(stats_stmt);
+
+        let token_cap_predicate = if max_tokens_per_contract == 0 {
+            "TRUE".to_string()
+        } else {
+            format!("contract_rank <= {max_tokens_per_contract}")
+        };
+        conn.execute_batch(&format!(
+            "DROP TABLE IF EXISTS {URI_SELECTED_MATCH_TABLE};
+             CREATE TEMP TABLE {URI_SELECTED_MATCH_TABLE} AS
+             SELECT seed_index, feature_rowid, reason_bits
+             FROM (
+                 SELECT candidate.seed_index, candidate.feature_rowid, candidate.reason_bits,
+                        row_number() OVER (
+                            PARTITION BY candidate.seed_index, feature.contract_address
+                            ORDER BY
+                                CASE WHEN (candidate.reason_bits & 3) <> 0 THEN 0 ELSE 1 END,
+                                CASE WHEN (candidate.reason_bits & {NAME_REASON}) <> 0 THEN 0 ELSE 1 END,
+                                CASE WHEN (candidate.reason_bits & {METADATA_REASON}) <> 0 THEN 0 ELSE 1 END,
+                                CAST(feature.token_id AS VARCHAR)
+                        ) AS contract_rank
+                 FROM ({aggregated}) candidate
+                 JOIN nft_features feature ON feature.rowid = candidate.feature_rowid
+             ) ranked
+             WHERE {token_cap_predicate}"
+        ))?;
+        let mut selected_stats = conn.prepare(&format!(
+            "SELECT seed_index, CAST(count(*) AS UBIGINT)
+             FROM {URI_SELECTED_MATCH_TABLE} GROUP BY seed_index ORDER BY seed_index"
+        ))?;
+        for row in selected_stats.query_map([], |row| {
+            Ok((
+                row.get::<_, u32>(0)? as usize,
+                row.get::<_, u64>(1)? as usize,
+            ))
+        })? {
+            let (seed_index, selected_count) = row?;
+            if selected_count > self.resource_options.max_selected_rows_per_seed {
+                let seed = profiles
+                    .get(seed_index)
+                    .map(|profile| profile.seed_address.as_str())
+                    .unwrap_or("<unknown>");
+                return Err(AppError::ResourceLimit(format!(
+                    "chain {chain:?}, seed {seed:?} selected {selected_count} rows after deterministic per-contract ranking, exceeding max_selected_rows_per_seed={} before payload loading",
+                    self.resource_options.max_selected_rows_per_seed
+                )));
+            }
+        }
+        drop(selected_stats);
+
+        // Reject oversized snapshots before Arrow or Rust owns any large
+        // VARCHAR payload. DuckDB's encode + octet_length measures persisted
+        // UTF-8 bytes exactly; the multipliers mirror the retained snapshot's
+        // duplicate projections and normalized-key copies conservatively.
+        let mut payload_stats = conn.prepare(&format!(
+            "SELECT selected.seed_index,
+                    CAST(count(*) AS UBIGINT),
+                    CAST(coalesce(sum(
+                        octet_length(encode(coalesce(CAST(feature.contract_address AS VARCHAR), ''))) +
+                        octet_length(encode(coalesce(CAST(feature.token_id AS VARCHAR), ''))) +
+                        octet_length(encode(coalesce(CAST(feature.token_uri AS VARCHAR), ''))) +
+                        octet_length(encode(coalesce(CAST(feature.image_uri AS VARCHAR), ''))) +
+                        octet_length(encode(coalesce(CAST(feature.name AS VARCHAR), ''))) +
+                        octet_length(encode(coalesce(CAST(feature.symbol AS VARCHAR), ''))) +
+                        octet_length(encode(coalesce(CAST(feature.metadata_json AS VARCHAR), '')))
+                    ), 0) AS UBIGINT),
+                    CAST(coalesce(sum(
+                        octet_length(encode(coalesce(CAST(feature.contract_address AS VARCHAR), ''))) +
+                        octet_length(encode(coalesce(CAST(feature.token_id AS VARCHAR), ''))) +
+                        octet_length(encode(coalesce(CAST(feature.token_uri_norm AS VARCHAR), ''))) +
+                        octet_length(encode(coalesce(CAST(feature.image_uri_norm AS VARCHAR), ''))) +
+                        octet_length(encode(coalesce(CAST(feature.name_norm AS VARCHAR), '')))
+                    ), 0) AS UBIGINT)
+             FROM {URI_SELECTED_MATCH_TABLE} selected
+             JOIN nft_features feature ON feature.rowid = selected.feature_rowid
+             GROUP BY selected.seed_index ORDER BY selected.seed_index"
+        ))?;
+        for row in payload_stats.query_map([], |row| {
+            Ok((
+                row.get::<_, u32>(0)? as usize,
+                row.get::<_, u64>(1)? as usize,
+                row.get::<_, u64>(2)? as usize,
+                row.get::<_, u64>(3)? as usize,
+            ))
+        })? {
+            let (seed_index, selected_count, payload_bytes, normalized_bytes) = row?;
+            let estimated_bytes = payload_bytes
+                .saturating_mul(4)
+                .saturating_add(normalized_bytes.saturating_mul(3))
+                .saturating_add(
+                    selected_count.saturating_mul(SNAPSHOT_PREPAYLOAD_ROW_OVERHEAD_BYTES),
+                );
+            if estimated_bytes > self.resource_options.max_snapshot_bytes_per_seed {
+                let seed = profiles
+                    .get(seed_index)
+                    .map(|profile| profile.seed_address.as_str())
+                    .unwrap_or("<unknown>");
+                return Err(AppError::ResourceLimit(format!(
+                    "chain {chain:?}, seed {seed:?} selected payload is conservatively estimated at {estimated_bytes} bytes, exceeding max_snapshot_bytes_per_seed={} before payload loading",
+                    self.resource_options.max_snapshot_bytes_per_seed
+                )));
+            }
+        }
+        drop(payload_stats);
+
+        let mut stmt = conn.prepare(&format!(
+            "SELECT selected.seed_index, selected.feature_rowid, selected.reason_bits
+             FROM {URI_SELECTED_MATCH_TABLE} selected
+             JOIN nft_features feature ON feature.rowid = selected.feature_rowid
+             ORDER BY selected.seed_index, feature.contract_address,
+                      CAST(feature.token_id AS VARCHAR)"
+        ))?;
+        for batch in stmt.query_arrow([])? {
+            let seed_column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<duckdb::arrow::array::UInt32Array>()
+                .ok_or_else(|| AppError::InvalidData("seed_index is not UINTEGER".to_string()))?;
+            let rowid_column = arrow_i64_column(&batch, 1, "feature_rowid")?;
+            let reason_column = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<duckdb::arrow::array::UInt8Array>()
+                .ok_or_else(|| AppError::InvalidData("reason_bits is not UTINYINT".to_string()))?;
+            let selected = (0..batch.num_rows())
+                .map(|row_index| {
+                    (
+                        seed_column.value(row_index) as usize,
+                        rowid_column.value(row_index),
+                        reason_column.value(row_index),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let recall_batch_size = if max_recall_rows == 0 {
+                DEFAULT_RECALL_BATCH_SIZE
+            } else {
+                max_recall_rows
+            };
+            for selected_chunk in selected.chunks(recall_batch_size) {
+                let rowids = selected_chunk
+                    .iter()
+                    .map(|(_, feature_rowid, _)| *feature_rowid)
+                    .collect::<Vec<_>>();
+                let recall_rows = Self::fetch_recall_rows_by_feature_rowid(conn, &rowids)?;
+                let records = Self::fetch_records_by_feature_rowid(conn, &rowids)?;
+                for &(seed_index, feature_rowid, reason_bits) in selected_chunk {
+                    let Some(profile) = profiles.get(seed_index) else {
+                        continue;
+                    };
+                    let Some(row) = recall_rows.get(&feature_rowid) else {
+                        continue;
+                    };
+                    let Some(record) = records.get(&feature_rowid) else {
+                        continue;
+                    };
+                    let row_match = Self::seed_row_match(
+                        profile,
+                        row,
+                        name_threshold,
+                        reason_bits & METADATA_REASON != 0,
+                    );
+                    if let Some(accumulator) = accumulators.get_mut(&profile.seed_address) {
+                        accumulator.push_recall_row(
+                            profile,
+                            row,
+                            record.clone(),
+                            &row_match,
+                            max_tokens_per_contract,
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn append_overlapping_metadata_token_rows(

@@ -14,6 +14,10 @@ pub enum AppError {
     Json(String),
     #[error("invalid data: {0}")]
     InvalidData(String),
+    #[error("resource limit exceeded: {0}")]
+    ResourceLimit(String),
+    #[error("interrupted: {0}")]
+    Interrupted(String),
     #[error("not implemented: {0}")]
     NotImplemented(String),
 }
