@@ -1,5 +1,9 @@
 use super::*;
 
+use std::io::Write;
+
+use crate::replace_file_atomically;
+
 pub const SUMMARY_MANIFEST_FILE_NAME: &str = "summary.manifest.json";
 const OUTPUT_GENERATION_SCHEMA_VERSION: u32 = 1;
 const OUTPUT_HASH_BUFFER_BYTES: usize = 1024 * 1024;
@@ -154,20 +158,8 @@ pub fn validate_output_generation(output_dir: &Path) -> Result<(), AnalysisError
 }
 
 fn fingerprint_output_artifact(path: &Path) -> Result<OutputArtifactFingerprint, AnalysisError> {
-    let mut file = fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0u8; OUTPUT_HASH_BUFFER_BYTES];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(OutputArtifactFingerprint {
-        size: file.metadata()?.len(),
-        sha256: sha256_hex(hasher.finalize().as_ref()),
-    })
+    let (size, sha256) = crate::sha256_file(path, OUTPUT_HASH_BUFFER_BYTES)?;
+    Ok(OutputArtifactFingerprint { size, sha256 })
 }
 
 pub(crate) fn pct(part: i64, total: i64) -> f64 {
@@ -180,23 +172,24 @@ pub(crate) fn pct(part: i64, total: i64) -> f64 {
 
 pub(crate) fn parquet_input_sql(paths: &[PathBuf]) -> String {
     if paths.len() == 1 {
-        format!(
-            "'{}'",
-            sql_string(&paths[0].display().to_string().replace('\\', "/"))
-        )
+        parquet_sql_literal(&paths[0])
     } else {
         let values = paths
             .iter()
-            .map(|path| {
-                format!(
-                    "'{}'",
-                    sql_string(&path.display().to_string().replace('\\', "/"))
-                )
-            })
+            .map(|path| parquet_sql_literal(path))
             .collect::<Vec<_>>()
             .join(", ");
         format!("[{values}]")
     }
+}
+
+/// Quote a filesystem path as a single-file DuckDB/Parquet SQL string literal.
+/// Backslashes become `/`; single quotes are doubled for SQL escaping.
+pub fn parquet_sql_literal(path: &Path) -> String {
+    format!(
+        "'{}'",
+        sql_string(&path.display().to_string().replace('\\', "/"))
+    )
 }
 
 pub(crate) fn sql_string(value: &str) -> String {

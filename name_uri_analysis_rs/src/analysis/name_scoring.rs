@@ -201,11 +201,6 @@ pub(crate) fn name_scratch_plan(
 }
 
 impl NameCandidateScratch {
-    #[cfg(test)]
-    pub(crate) fn new(atom_count: usize) -> Self {
-        Self::with_mode(atom_count, NameScratchMode::Dense)
-    }
-
     pub(crate) fn with_mode(atom_count: usize, mode: NameScratchMode) -> Self {
         let dedup = match mode {
             NameScratchMode::Dense => NameDedup::Dense {
@@ -434,50 +429,6 @@ impl PreparedNameQuery {
             .normalized_similarity_with_args(right.chars(), &args)
             .map(|score| score * 100.0)
     }
-}
-
-#[cfg(test)]
-pub(crate) fn union_full_name_pairs(
-    atoms: &[NameAtom],
-    candidate_index: &NameCandidateIndex,
-    scratch_mode: NameScratchMode,
-    state: &mut ThresholdUnionState,
-    chain_count: usize,
-    progress: &ProgressTracker,
-) {
-    if atoms.len() < 2 {
-        return;
-    }
-    let min_threshold = state.threshold;
-
-    let mut pending_progress = 0u64;
-    for left_batch_start in (0..atoms.len() - 1).step_by(LEFT_SCORE_BATCH_SIZE) {
-        let left_batch_end = (left_batch_start + LEFT_SCORE_BATCH_SIZE).min(atoms.len() - 1);
-        let scored_lefts = (left_batch_start..left_batch_end)
-            .into_par_iter()
-            .map_init(
-                || NameCandidateScratch::with_mode(atoms.len(), scratch_mode),
-                |scratch, left| {
-                    let right_end = right_name_range_end_for_left(atoms, left, min_threshold);
-                    let matching_rights = score_indexed_name_pairs_for_left(
-                        atoms,
-                        candidate_index,
-                        left,
-                        left + 1..right_end,
-                        min_threshold,
-                        scratch,
-                    );
-                    (left, matching_rights)
-                },
-            )
-            .collect::<Vec<_>>();
-        for (left, matching_rights) in scored_lefts {
-            apply_matching_name_pairs(atoms, state, left, &matching_rights, chain_count);
-            pending_progress += 1;
-            flush_chunk_progress(progress, &mut pending_progress);
-        }
-    }
-    flush_remaining_progress(progress, &mut pending_progress);
 }
 
 pub(crate) fn union_canonical_name_pairs(
@@ -727,28 +678,6 @@ pub(crate) fn right_name_range_end_for_left(
     low
 }
 
-#[cfg(test)]
-pub(crate) fn score_indexed_name_pairs_for_left(
-    atoms: &[NameAtom],
-    candidate_index: &NameCandidateIndex,
-    left: usize,
-    right_range: std::ops::Range<usize>,
-    threshold: f64,
-    scratch: &mut NameCandidateScratch,
-) -> Vec<ScoredRight> {
-    let mut matches = Vec::new();
-    visit_indexed_name_pairs_for_left(
-        atoms,
-        candidate_index,
-        left,
-        right_range,
-        threshold,
-        scratch,
-        |matching| matches.push(matching),
-    );
-    matches
-}
-
 fn visit_indexed_name_pairs_for_left(
     atoms: &[NameAtom],
     candidate_index: &NameCandidateIndex,
@@ -778,26 +707,6 @@ fn visit_indexed_name_pairs_for_left(
         scored_pairs,
         matched_pairs,
     }
-}
-
-#[cfg(test)]
-pub(crate) fn score_name_pairs_for_left_chunk(
-    atoms: &[NameAtom],
-    left: usize,
-    chunk_start: usize,
-    chunk_end: usize,
-    threshold: f64,
-) -> Vec<ScoredRight> {
-    let candidate_index = NameCandidateIndex::new(atoms);
-    let mut scratch = NameCandidateScratch::new(atoms.len());
-    score_indexed_name_pairs_for_left(
-        atoms,
-        &candidate_index,
-        left,
-        chunk_start..chunk_end,
-        threshold,
-        &mut scratch,
-    )
 }
 
 pub(crate) fn minimum_name_char_overlap(
@@ -860,32 +769,6 @@ pub(crate) fn sorted_name_token_overlap(left: &[NameTokenId], right: &[NameToken
         }
     }
     overlap
-}
-
-#[cfg(test)]
-pub(crate) fn name_pair_score_from_names(left_name: &str, right_name: &str) -> f64 {
-    PreparedNameQuery::new(left_name)
-        .score_percent(right_name, 0.0)
-        .expect("zero cutoff must return a Jaro-Winkler score")
-}
-
-#[cfg(test)]
-pub(crate) fn name_pair_can_reach_threshold(
-    left_name: &str,
-    right_name: &str,
-    threshold: f64,
-) -> bool {
-    left_name == right_name
-        || name_pair_lengths_can_reach_threshold(
-            left_name.chars().count(),
-            right_name.chars().count(),
-            threshold,
-        )
-}
-
-#[cfg(test)]
-pub(crate) fn jaro_winkler_upper_bound(left_name: &str, right_name: &str) -> f64 {
-    jaro_winkler_upper_bound_from_lengths(left_name.chars().count(), right_name.chars().count())
 }
 
 pub(crate) fn name_pair_lengths_can_reach_threshold(

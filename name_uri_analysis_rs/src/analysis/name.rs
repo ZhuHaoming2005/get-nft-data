@@ -402,53 +402,6 @@ pub(crate) fn chain_pair_from_index(mut index: usize, chain_count: usize) -> (us
     unreachable!("chain pair index out of range")
 }
 
-#[cfg(test)]
-pub(crate) fn full_name_chunk_count(atom_count: usize) -> u64 {
-    if atom_count < 2 {
-        return 0;
-    }
-    triangular_chunk_count(atom_count - 1)
-}
-
-#[cfg(test)]
-pub(crate) fn candidate_name_chunk_count(atoms: &[NameAtom], threshold: f64) -> u64 {
-    let candidate_index = NameCandidateIndex::new(atoms);
-    let mut scratch = NameCandidateScratch::new(atoms.len());
-    (0..atoms.len().saturating_sub(1))
-        .map(|left| {
-            let right_end = right_name_range_end_for_left(atoms, left, threshold);
-            candidate_index
-                .candidates_for_left(atoms, left, left + 1..right_end, threshold, &mut scratch)
-                .iter()
-                .count()
-                .div_ceil(RIGHT_SCORE_CHUNK_SIZE) as u64
-        })
-        .sum()
-}
-
-#[cfg(test)]
-pub(crate) fn triangular_chunk_count(max_right_count: usize) -> u64 {
-    let chunk = RIGHT_SCORE_CHUNK_SIZE as u128;
-    let count = max_right_count as u128;
-    let full_groups = count / chunk;
-    let remainder = count % chunk;
-    let total = chunk
-        .saturating_mul(full_groups)
-        .saturating_mul(full_groups + 1)
-        .saturating_div(2)
-        .saturating_add(remainder.saturating_mul(full_groups + 1));
-    total.min(u64::MAX as u128) as u64
-}
-
-#[cfg(test)]
-pub(crate) fn chain_pair_chunk_count(left_count: usize, right_count: usize) -> u64 {
-    if left_count == 0 || right_count == 0 {
-        return 0;
-    }
-    let chunks_per_left = right_count.div_ceil(RIGHT_SCORE_CHUNK_SIZE);
-    (left_count as u64).saturating_mul(chunks_per_left as u64)
-}
-
 pub(crate) fn threshold_state_bytes(atom_count: usize, chain_count: usize) -> usize {
     let dense = dense_union_find_bytes(atom_count);
     if chain_count > 1 {

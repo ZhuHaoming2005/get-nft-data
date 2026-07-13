@@ -7,12 +7,6 @@ pub(crate) fn run_uri_analysis(
     progress: &ProgressTracker,
 ) -> Result<Vec<SummaryRow>, AnalysisError> {
     let mut rows = Vec::new();
-    let cross_chain_steps = if chains.len() > 1 {
-        chains.len() + chains.len() * (chains.len() - 1)
-    } else {
-        0
-    };
-    let uri_steps = chains.len() + cross_chain_steps;
     let stage_steps = if chains.len() > 1 { 3 } else { 2 };
     progress.start_stage("analyzing URI duplicates", stage_steps);
     let total_for = |chain: &str| {
@@ -111,7 +105,14 @@ pub(crate) fn run_uri_analysis(
     }
 
     debug_assert_eq!(
-        uri_steps,
+        {
+            let cross_chain_steps = if chains.len() > 1 {
+                chains.len() + chains.len() * (chains.len() - 1)
+            } else {
+                0
+            };
+            chains.len() + cross_chain_steps
+        },
         summary_units
             + if include_cross_chain {
                 chains.len() * (chains.len() - 1)

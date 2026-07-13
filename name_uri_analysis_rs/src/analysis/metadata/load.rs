@@ -206,8 +206,10 @@ pub(super) fn metadata_load_transient_reserve_bytes(
     let full_chunk = single_maximum_row.saturating_mul(METADATA_LOAD_CHUNK_ROWS);
     let allowance = analysis_memory_bytes
         .saturating_div(METADATA_LOAD_TRANSIENT_BUDGET_DIVISOR)
+        .max(single_maximum_row)
         .min(METADATA_LOAD_TRANSIENT_MAX_BYTES)
-        .min(full_chunk);
+        .min(full_chunk)
+        .min(analysis_memory_bytes);
     if allowance < single_maximum_row {
         return Err(AnalysisError::InvalidData(format!(
             "metadata load needs at least {} bytes of transient parse budget for one maximum-size row, only {} bytes are available",

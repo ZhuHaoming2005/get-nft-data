@@ -1,9 +1,23 @@
-use std::io;
+use std::io::{self, Write};
 use std::path::Path;
+
+use serde::Serialize;
+
+/// Pretty-print `value` to `destination` via a `.json.partial` sibling, flushing
+/// and syncing before an atomic replace.
+pub fn write_json_atomically<T: Serialize>(value: &T, destination: &Path) -> io::Result<()> {
+    let partial = destination.with_extension("json.partial");
+    let mut file = std::fs::File::create(&partial)?;
+    serde_json::to_writer_pretty(&mut file, value).map_err(io::Error::other)?;
+    file.flush()?;
+    file.sync_all()?;
+    drop(file);
+    replace_file_atomically(&partial, destination)
+}
 
 /// Replace `destination` with the already-flushed `partial` file without first
 /// unlinking the last durable copy. Both paths must be on the same filesystem.
-pub(crate) fn replace_file_atomically(partial: &Path, destination: &Path) -> io::Result<()> {
+pub fn replace_file_atomically(partial: &Path, destination: &Path) -> io::Result<()> {
     #[cfg(windows)]
     replace_file_windows(partial, destination)?;
     #[cfg(not(windows))]

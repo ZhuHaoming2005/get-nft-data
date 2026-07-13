@@ -23,7 +23,10 @@ pub struct AnalysisOptions {
     #[serde(default)]
     pub metadata_recall_mode: MetadataRecallMode,
     pub threads: usize,
+    /// Total analysis memory budget string (DuckDB-oriented / overall planning).
     pub memory_limit: String,
+    /// Optional hard Rust-side analysis cap. The CLI sets both this and
+    /// `memory_limit` to the same `--analysis-memory-limit` value.
     pub analysis_memory_limit: Option<String>,
     pub duckdb_memory_limit: String,
     pub temp_directory: Option<PathBuf>,
@@ -74,13 +77,7 @@ pub(crate) struct NameAtom {
     pub(crate) nft_count: i64,
 }
 
-#[cfg(test)]
-pub(crate) const RIGHT_SCORE_CHUNK_SIZE: usize = 8192;
-#[cfg(test)]
-pub(crate) const LEFT_SCORE_BATCH_SIZE: usize = 1024;
 pub(crate) const SPARSE_UNION_NODE_BYTES: usize = 96;
-#[cfg(test)]
-pub(crate) const PROGRESS_FLUSH_CHUNKS: u64 = 128;
 
 #[derive(Clone, Copy)]
 pub(crate) struct ScoredRight {

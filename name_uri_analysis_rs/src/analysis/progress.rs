@@ -85,15 +85,6 @@ pub(crate) enum ProgressTracker {
 }
 
 impl ProgressTracker {
-    #[cfg(test)]
-    pub(crate) fn new(total_phases: u64, enabled: bool) -> Self {
-        let tracker = Self::build(total_phases, enabled);
-        if let Self::Enabled { pipeline, .. } = &tracker {
-            pipeline.set_message("analysis");
-        }
-        tracker
-    }
-
     pub(crate) fn for_pipeline_stage(stage: PipelineStage, enabled: bool) -> Self {
         let tracker = Self::build(PIPELINE_STAGE_COUNT, enabled);
         tracker.set_pipeline_stage(stage);
@@ -298,24 +289,9 @@ impl ProgressTracker {
     }
 
     // Compatibility methods for the existing stage-level progress call sites.
-    pub(crate) fn start_phase(&self, message: impl Into<String>, work_units: u64) {
-        self.start_stage(message, work_units);
-    }
-
     pub(crate) fn add_work(&self, units: u64) {
         if let Self::Enabled { stage, .. } = self {
             stage.inc_length(units);
-        }
-    }
-
-    pub(crate) fn step(&self, message: impl Into<String>) {
-        self.step_stage(message);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn inc(&self, units: u64) {
-        if let Self::Enabled { stage, .. } = self {
-            stage.inc(units);
         }
     }
 
@@ -323,10 +299,6 @@ impl ProgressTracker {
         if let Self::Enabled { stage, .. } = self {
             stage.set_message(message.into());
         }
-    }
-
-    pub(crate) fn finish_phase(&self, message: impl Into<String>) {
-        self.finish_stage(message);
     }
 
     pub(crate) fn finish(&self) {
@@ -459,7 +431,7 @@ mod throttle_tests {
 
     #[test]
     fn task_label_updates_preserve_the_refresh_throttle() {
-        let tracker = ProgressTracker::new(1, true);
+        let tracker = ProgressTracker::for_pipeline_stage(PipelineStage::Name, true);
         tracker.start_task("initial", Some(1), "items");
         tracker.advance_task(0, ProgressCounters::default());
         let before = match &tracker {

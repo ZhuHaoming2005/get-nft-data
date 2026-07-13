@@ -1,13 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use duckdb::Connection;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use sysinfo::System;
 use thiserror::Error;
 
@@ -23,7 +21,7 @@ mod progress;
 mod types;
 mod uri;
 
-use crate::atomic_file::replace_file_atomically;
+use crate::{sha256_file, write_json_atomically};
 use chain_matrix::*;
 use components::*;
 use duckdb_prep::*;
@@ -34,7 +32,7 @@ use metadata::{run_metadata_analysis, MetadataAnalysisSpec, MAX_METADATA_BYTES_F
 use name::*;
 use name_scoring::*;
 use output::*;
-pub use output::{validate_output_generation, SUMMARY_MANIFEST_FILE_NAME};
+pub use output::{parquet_sql_literal, validate_output_generation, SUMMARY_MANIFEST_FILE_NAME};
 use progress::*;
 use types::*;
 pub use types::{AnalysisError, AnalysisOptions, AnalysisReport, MetadataRecallMode, SummaryRow};
@@ -125,14 +123,7 @@ pub fn run_analysis_phase(
                 let totals = load_chain_totals(&conn)?;
                 let result = run_name_analysis(
                     &conn,
-                    NameAnalysisSpec {
-                        chains: &chains,
-                        totals: &totals,
-                        threshold: options.name_threshold,
-                        threads: options.threads,
-                        memory_limit: &options.memory_limit,
-                        analysis_memory_limit: options.analysis_memory_limit.as_deref(),
-                    },
+                    name_analysis_spec(options, &chains, &totals),
                     &progress,
                 )?;
                 if diagnostics {
@@ -141,7 +132,8 @@ pub fn run_analysis_phase(
                         write_json_atomically(
                             &result.metrics,
                             &work_directory.join("metrics/name-algorithm.json"),
-                        ),
+                        )
+                        .map_err(AnalysisError::from),
                     );
                 }
                 result.rows
@@ -153,15 +145,10 @@ pub fn run_analysis_phase(
                     &conn,
                     &chains,
                     &totals,
-                    MetadataAnalysisSpec {
-                        threads: options.threads,
-                        recall_mode: options.metadata_recall_mode,
-                        memory_limit: options
-                            .analysis_memory_limit
-                            .as_deref()
-                            .unwrap_or(&options.memory_limit),
-                        artifact_directory: Some(&work_directory.join("artifacts/metadata")),
-                    },
+                    metadata_analysis_spec(
+                        options,
+                        Some(&work_directory.join("artifacts/metadata")),
+                    ),
                     &progress,
                 )?;
                 if diagnostics {
@@ -170,7 +157,8 @@ pub fn run_analysis_phase(
                         write_json_atomically(
                             &result.metrics,
                             &work_directory.join("metrics/metadata-algorithm.json"),
-                        ),
+                        )
+                        .map_err(AnalysisError::from),
                     );
                 }
                 result.rows
@@ -274,34 +262,17 @@ fn write_phase_ready(work_directory: &Path, phase: AnalysisPhase) -> Result<(), 
     };
     let partial_file = phase.partial_file_name();
     let partial_path = work_directory.join("partial").join(partial_file);
-    let mut file = fs::File::open(&partial_path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0u8; 1024 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
+    let (size, sha256) = sha256_file(&partial_path, 1024 * 1024)?;
     let ready = PhaseReady {
         phase: phase_name,
         partial_file,
-        size: file.metadata()?.len(),
-        sha256: sha256_hex(hasher.finalize().as_ref()),
+        size,
+        sha256,
     };
     let directory = work_directory.join("checkpoints");
     fs::create_dir_all(&directory)?;
     write_json_atomically(&ready, &directory.join(format!("{phase_name}.ready.json")))
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    output
+        .map_err(AnalysisError::from)
 }
 
 pub fn finalize_analysis_phases(
@@ -346,17 +317,6 @@ pub fn finalize_analysis_phases(
     result
 }
 
-fn write_json_atomically<T: Serialize>(value: &T, destination: &Path) -> Result<(), AnalysisError> {
-    let partial = destination.with_extension("json.partial");
-    let mut file = fs::File::create(&partial)?;
-    serde_json::to_writer_pretty(&mut file, value)?;
-    file.flush()?;
-    file.sync_all()?;
-    drop(file);
-    replace_file_atomically(&partial, destination)?;
-    Ok(())
-}
-
 /// Validate every user-supplied memory limit without opening DuckDB or reading
 /// Parquet. The controller calls this before input fingerprinting so malformed
 /// limits fail before any expensive work starts.
@@ -369,6 +329,36 @@ pub fn validate_static_memory_options(
     let duckdb_limit = resolve_duckdb_memory_limit(duckdb_memory_limit)?;
     parse_byte_size(&duckdb_limit)?;
     Ok(())
+}
+
+fn name_analysis_spec<'a>(
+    options: &'a AnalysisOptions,
+    chains: &'a [String],
+    totals: &'a HashMap<String, NameTotals>,
+) -> NameAnalysisSpec<'a> {
+    NameAnalysisSpec {
+        chains,
+        totals,
+        threshold: options.name_threshold,
+        threads: options.threads,
+        memory_limit: &options.memory_limit,
+        analysis_memory_limit: options.analysis_memory_limit.as_deref(),
+    }
+}
+
+fn metadata_analysis_spec<'a>(
+    options: &'a AnalysisOptions,
+    artifact_directory: Option<&'a Path>,
+) -> MetadataAnalysisSpec<'a> {
+    MetadataAnalysisSpec {
+        threads: options.threads,
+        recall_mode: options.metadata_recall_mode,
+        memory_limit: options
+            .analysis_memory_limit
+            .as_deref()
+            .unwrap_or(&options.memory_limit),
+        artifact_directory,
+    }
 }
 
 fn validate_options(options: &AnalysisOptions) -> Result<(), AnalysisError> {
@@ -418,11 +408,11 @@ pub fn run_analysis(options: AnalysisOptions) -> Result<AnalysisReport, Analysis
 
     let progress = ProgressTracker::for_pipeline_stage(PipelineStage::Prepare, options.progress);
     let result: Result<AnalysisReport, AnalysisError> = (|| {
-        progress.start_phase("configuring DuckDB", 1);
+        progress.start_stage("configuring DuckDB", 1);
         let conn = open_analysis_connection(&options.database_path)?;
         configure_duckdb(&conn, &options)?;
-        progress.step("DuckDB configured");
-        progress.finish_phase("DuckDB configured");
+        progress.step_stage("DuckDB configured");
+        progress.finish_stage("DuckDB configured");
         let selected_chains = prepare_base_tables(&conn, &options, &progress)?;
         let chain_totals = load_chain_totals(&conn)?;
 
@@ -441,14 +431,7 @@ pub fn run_analysis(options: AnalysisOptions) -> Result<AnalysisReport, Analysis
         summary_rows.extend(
             run_name_analysis(
                 &conn,
-                NameAnalysisSpec {
-                    chains: &selected_chains,
-                    totals: &chain_totals,
-                    threshold: options.name_threshold,
-                    threads: options.threads,
-                    memory_limit: &options.memory_limit,
-                    analysis_memory_limit: options.analysis_memory_limit.as_deref(),
-                },
+                name_analysis_spec(&options, &selected_chains, &chain_totals),
                 &progress,
             )?
             .rows,
@@ -461,15 +444,7 @@ pub fn run_analysis(options: AnalysisOptions) -> Result<AnalysisReport, Analysis
                 &conn,
                 &selected_chains,
                 &chain_totals,
-                MetadataAnalysisSpec {
-                    threads: options.threads,
-                    recall_mode: options.metadata_recall_mode,
-                    memory_limit: options
-                        .analysis_memory_limit
-                        .as_deref()
-                        .unwrap_or(&options.memory_limit),
-                    artifact_directory: None,
-                },
+                metadata_analysis_spec(&options, None),
                 &progress,
             )?
             .rows,

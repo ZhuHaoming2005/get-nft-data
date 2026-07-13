@@ -5,8 +5,6 @@ pub(crate) struct ComponentAccumulator {
     primary_contract_count: i64,
     primary_nft_count: i64,
     total_contract_count: i64,
-    first_chain: Option<usize>,
-    multiple_chains: bool,
     has_secondary: bool,
 }
 
@@ -138,11 +136,6 @@ pub(crate) fn summarize_sparse_components_for_primary(
         let root = union_find.find_local(local_index);
         let component = components.entry(root).or_default();
         component.total_contract_count += atom.contract_count;
-        match component.first_chain {
-            Some(first) if first != atom.chain_index => component.multiple_chains = true,
-            None => component.first_chain = Some(atom.chain_index),
-            _ => {}
-        }
         if atom.chain_index != primary {
             component.has_secondary = true;
         } else {

@@ -1,5 +1,9 @@
 use super::*;
 
+use std::io::Write;
+
+use crate::replace_file_atomically;
+
 static DUCKDB_PROFILE_SEQUENCE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -117,7 +121,7 @@ pub(crate) fn prepare_base_tables(
     let input_columns = parquet_input_columns(conn, &inputs)?;
     let metadata_json_expr = metadata_json_projection_expr(&input_columns);
     let source_file_id_expr = source_file_id_projection_expr(&options.parquet_inputs);
-    progress.start_phase("preparing DuckDB tables", 9);
+    progress.start_stage("preparing DuckDB tables", 9);
     execute_progress_batch(
         conn,
         &build_core_rows_sql(&inputs),
@@ -186,7 +190,7 @@ pub(crate) fn prepare_base_tables(
         progress,
         "built name atoms",
     )?;
-    progress.finish_phase("DuckDB tables ready");
+    progress.finish_stage("DuckDB tables ready");
     Ok(chains)
 }
 
