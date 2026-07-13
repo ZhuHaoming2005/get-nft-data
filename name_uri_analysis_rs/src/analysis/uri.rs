@@ -13,7 +13,8 @@ pub(crate) fn run_uri_analysis(
         0
     };
     let uri_steps = chains.len() + cross_chain_steps;
-    progress.start_phase("analyzing URI duplicates", uri_steps as u64);
+    let stage_steps = if chains.len() > 1 { 3 } else { 2 };
+    progress.start_stage("analyzing URI duplicates", stage_steps);
     let total_for = |chain: &str| {
         totals.get(chain).copied().unwrap_or(NameTotals {
             contracts: 0,
@@ -21,7 +22,18 @@ pub(crate) fn run_uri_analysis(
         })
     };
     let include_cross_chain = chains.len() > 1;
+    progress.start_task("loading URI contract counts", None, "rows");
     let contract_counts = load_uri_contract_counts(conn, include_cross_chain)?;
+    progress.advance_task(contract_counts.len() as u64, ProgressCounters::default());
+    progress.finish_task("URI contract counts loaded");
+    progress.step_stage("loaded URI contract counts");
+
+    let summary_units = chains.len() + if include_cross_chain { chains.len() } else { 0 };
+    progress.start_task(
+        "building URI chain summaries",
+        Some(summary_units as u64),
+        "summaries",
+    );
 
     for chain in chains {
         let counts = contract_counts
@@ -38,7 +50,7 @@ pub(crate) fn run_uri_analysis(
             total_for(chain),
             counts,
         );
-        progress.step(format!("URI intra {chain} norm_cross"));
+        progress.advance_task(1, ProgressCounters::default());
     }
 
     if include_cross_chain {
@@ -57,9 +69,17 @@ pub(crate) fn run_uri_analysis(
                 total_for(chain),
                 counts,
             );
-            progress.step(format!("URI cross-chain summary {chain}"));
+            progress.advance_task(1, ProgressCounters::default());
         }
 
+        progress.finish_task("URI chain summaries ready");
+        progress.step_stage("built URI chain summaries");
+
+        progress.start_task(
+            "building URI directed chain matrix",
+            Some((chains.len() * (chains.len() - 1)) as u64),
+            "pairs",
+        );
         let pair_counts = load_uri_chain_pair_counts(conn)?;
         for primary in chains {
             for secondary in chains {
@@ -80,12 +100,26 @@ pub(crate) fn run_uri_analysis(
                     total_for(primary),
                     counts,
                 );
-                progress.step(format!("URI chain matrix {primary}->{secondary}"));
+                progress.advance_task(1, ProgressCounters::default());
             }
         }
+        progress.finish_task("URI directed chain matrix ready");
+        progress.step_stage("built URI directed chain matrix");
+    } else {
+        progress.finish_task("URI chain summaries ready");
+        progress.step_stage("built URI chain summaries");
     }
 
-    progress.finish_phase("URI analysis complete");
+    debug_assert_eq!(
+        uri_steps,
+        summary_units
+            + if include_cross_chain {
+                chains.len() * (chains.len() - 1)
+            } else {
+                0
+            }
+    );
+    progress.finish_stage("URI analysis complete");
     Ok(rows)
 }
 

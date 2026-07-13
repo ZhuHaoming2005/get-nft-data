@@ -68,15 +68,18 @@ pub(crate) fn run_name_analysis(
     let chains = spec.chains;
     let totals = spec.totals;
     let threshold = spec.threshold;
-    progress.start_phase("analyzing name duplicates", 3);
-    progress.step("loaded name totals");
+    progress.start_stage("analyzing name duplicates", 6);
+    progress.step_stage("loaded name totals");
+    progress.start_task("loading name atoms", None, "atoms");
     let atoms = load_all_name_atoms(conn, chains)?;
     if atoms.len() > u32::MAX as usize {
         return Err(AnalysisError::InvalidData(
             "name atom count exceeds compact u32 indexes".to_string(),
         ));
     }
-    progress.step(format!("loaded {} name atoms", atoms.len()));
+    progress.advance_task(atoms.len() as u64, ProgressCounters::default());
+    progress.finish_task(format!("loaded {} name atoms", atoms.len()));
+    progress.step_stage(format!("loaded {} name atoms", atoms.len()));
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(spec.threads.max(1))
         .build()
@@ -146,11 +149,22 @@ pub(crate) fn run_name_analysis(
         spec.analysis_memory_limit,
         scoring_peak_bytes,
     )?;
-    progress.step(format!(
+    progress.step_stage(format!(
         "Rust analysis memory budget {}",
         format_byte_size(memory_plan.analysis_bytes)
     ));
+    progress.start_task(
+        format!(
+            "building candidate index for {} canonical names",
+            canonical.atoms.len()
+        ),
+        None,
+        "names",
+    );
     let candidate_index = pool.install(|| NameCandidateIndex::new(&canonical.atoms));
+    progress.advance_task(canonical.atoms.len() as u64, ProgressCounters::default());
+    progress.finish_task("name candidate index ready");
+    progress.step_stage("built name candidate index");
     let actual_index_bytes = candidate_index.memory_bytes();
     if actual_index_bytes > index_estimate.resident_bytes {
         return Err(AnalysisError::InvalidData(format!(
@@ -160,8 +174,11 @@ pub(crate) fn run_name_analysis(
         )));
     }
     let mut rows = Vec::new();
-    progress.set_message("name single-threshold global scoring with chain-matrix reuse");
-    progress.add_work(canonical.atoms.len().saturating_sub(1) as u64);
+    progress.start_task(
+        "scoring canonical name left nodes",
+        Some(canonical.atoms.len().saturating_sub(1) as u64),
+        "names",
+    );
     let mut state = ThresholdUnionState {
         threshold,
         intra: UnionFind::new(atoms.len()),
@@ -180,10 +197,20 @@ pub(crate) fn run_name_analysis(
             progress,
         )
     });
+    progress.finish_task(format!(
+        "name scoring complete; candidates {}; scored {}; matched {}",
+        scoring.candidate_pairs, scoring.scored_pairs, scoring.matched_pairs
+    ));
+    progress.step_stage("scored canonical names");
     drop(candidate_index);
     drop(canonical);
     drop(pool);
-    progress.add_work(chains.len() as u64 + chain_pair_count(chains.len()) as u64 * 2);
+    let summary_units = chains.len() as u64 + chain_pair_count(chains.len()) as u64 * 2;
+    progress.start_task(
+        "summarizing name components",
+        Some(summary_units),
+        "summaries",
+    );
     push_name_summary_rows(
         &mut rows,
         &atoms,
@@ -192,15 +219,20 @@ pub(crate) fn run_name_analysis(
         totals,
         &mut state,
     );
-    progress.inc(chains.len() as u64);
+    progress.advance_task(chains.len() as u64, ProgressCounters::default());
     drop(atoms_by_chain);
     state.intra = UnionFind::new(0);
     state.cross = None;
     if chains.len() > 1 {
         push_reused_chain_matrix_rows(&mut rows, &atoms, chains, totals, &mut state);
-        progress.inc(chain_pair_count(chains.len()) as u64 * 2);
+        progress.advance_task(
+            chain_pair_count(chains.len()) as u64 * 2,
+            ProgressCounters::default(),
+        );
     }
-    progress.finish_phase("name analysis complete");
+    progress.finish_task("name component summaries ready");
+    progress.step_stage("summarized name components");
+    progress.finish_stage("name analysis complete");
     Ok(NameAnalysisResult {
         rows,
         metrics: NameAlgorithmMetrics {

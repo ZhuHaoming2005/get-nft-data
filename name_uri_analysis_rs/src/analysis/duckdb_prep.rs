@@ -405,10 +405,11 @@ pub(crate) fn execute_progress_batch(
     progress: &ProgressTracker,
     message: &str,
 ) -> Result<(), AnalysisError> {
-    progress.set_message(message);
+    progress.start_task(message, None, "rows");
     conn.execute_batch(sql)?;
     persist_last_duckdb_profile(conn, message)?;
-    progress.step(message);
+    progress.finish_task(message);
+    progress.step_stage(message);
     Ok(())
 }
 

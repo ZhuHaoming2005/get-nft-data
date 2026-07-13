@@ -601,8 +601,16 @@ pub(crate) fn union_canonical_name_pairs(
         drop(sender);
         for batch in receiver {
             apply_canonical_edge_batch(original_atoms, canonical, state, chain_count, batch.edges);
-            progress.inc(batch.processed_lefts);
             scoring_stats.merge(batch.stats);
+            progress.advance_task(
+                batch.processed_lefts,
+                ProgressCounters {
+                    candidates: scoring_stats.candidate_pairs,
+                    scored: scoring_stats.scored_pairs,
+                    matched: scoring_stats.matched_pairs,
+                    ..ProgressCounters::default()
+                },
+            );
         }
     });
     scoring_stats
@@ -680,7 +688,15 @@ fn score_canonical_names_sequential(
             },
         );
         stats.merge(left_stats);
-        progress.inc(1);
+        progress.advance_task(
+            1,
+            ProgressCounters {
+                candidates: stats.candidate_pairs,
+                scored: stats.scored_pairs,
+                matched: stats.matched_pairs,
+                ..ProgressCounters::default()
+            },
+        );
     }
     stats
 }

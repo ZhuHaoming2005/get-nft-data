@@ -87,106 +87,114 @@ pub fn run_analysis_phase(
             fs::create_dir_all(work_directory.join("metrics")).map_err(AnalysisError::from),
         );
     }
-    let progress = ProgressTracker::new(1, options.progress);
-    let conn = open_analysis_connection(&options.database_path)?;
-    configure_duckdb(&conn, options)?;
-    match phase {
-        AnalysisPhase::Prepare => {}
-        AnalysisPhase::Name => {
-            set_phase_duckdb_memory_limit(&conn, options, NAME_DUCKDB_MEMORY_CAP)?
+    let pipeline_stage = PipelineStage::from(phase);
+    let progress = ProgressTracker::for_pipeline_stage(pipeline_stage, options.progress);
+    let result: Result<(), AnalysisError> = (|| {
+        let conn = open_analysis_connection(&options.database_path)?;
+        configure_duckdb(&conn, options)?;
+        match phase {
+            AnalysisPhase::Prepare => {}
+            AnalysisPhase::Name => {
+                set_phase_duckdb_memory_limit(&conn, options, NAME_DUCKDB_MEMORY_CAP)?
+            }
+            AnalysisPhase::Metadata => {
+                set_phase_duckdb_memory_limit(&conn, options, METADATA_DUCKDB_MEMORY_CAP)?
+            }
         }
-        AnalysisPhase::Metadata => {
-            set_phase_duckdb_memory_limit(&conn, options, METADATA_DUCKDB_MEMORY_CAP)?
-        }
-    }
-    if matches!(phase, AnalysisPhase::Prepare) {
-        if diagnostics {
-            record_diagnostic_result(
-                "DuckDB prepare profiling",
-                enable_prepare_profiling(&conn, &work_directory.join("metrics/duckdb-prepare")),
-            );
-        }
-        conn.execute_batch("BEGIN TRANSACTION")?;
-    }
-
-    let rows = match phase {
-        AnalysisPhase::Prepare => {
-            let chains = prepare_base_tables(&conn, options, &progress)?;
-            let totals = load_chain_totals(&conn)?;
-            let rows = run_uri_analysis(&conn, &chains, &totals, &progress)?;
-            drop_prepare_only_uri_tables(&conn)?;
-            metadata::prepare_metadata_compact_tables(&conn, &progress)?;
-            rows
-        }
-        AnalysisPhase::Name => {
-            let chains = load_selected_chains(&conn)?;
-            let totals = load_chain_totals(&conn)?;
-            let result = run_name_analysis(
-                &conn,
-                NameAnalysisSpec {
-                    chains: &chains,
-                    totals: &totals,
-                    threshold: options.name_threshold,
-                    threads: options.threads,
-                    memory_limit: &options.memory_limit,
-                    analysis_memory_limit: options.analysis_memory_limit.as_deref(),
-                },
-                &progress,
-            )?;
+        if matches!(phase, AnalysisPhase::Prepare) {
             if diagnostics {
                 record_diagnostic_result(
-                    "name algorithm metrics",
-                    write_json_atomically(
-                        &result.metrics,
-                        &work_directory.join("metrics/name-algorithm.json"),
-                    ),
+                    "DuckDB prepare profiling",
+                    enable_prepare_profiling(&conn, &work_directory.join("metrics/duckdb-prepare")),
                 );
             }
-            result.rows
+            conn.execute_batch("BEGIN TRANSACTION")?;
         }
-        AnalysisPhase::Metadata => {
-            let chains = load_selected_chains(&conn)?;
-            let totals = load_chain_totals(&conn)?;
-            let result = run_metadata_analysis(
-                &conn,
-                &chains,
-                &totals,
-                options.threads,
-                options
-                    .analysis_memory_limit
-                    .as_deref()
-                    .unwrap_or(&options.memory_limit),
-                Some(&work_directory.join("artifacts/metadata")),
-                &progress,
-            )?;
-            if diagnostics {
-                record_diagnostic_result(
-                    "metadata algorithm metrics",
-                    write_json_atomically(
-                        &result.metrics,
-                        &work_directory.join("metrics/metadata-algorithm.json"),
-                    ),
-                );
-            }
-            result.rows
-        }
-    };
-    if matches!(phase, AnalysisPhase::Prepare) {
-        conn.execute_batch("COMMIT")?;
-    }
 
-    let partial_dir = work_directory.join("partial");
-    fs::create_dir_all(&partial_dir)?;
-    write_json_atomically(
-        &AnalysisReport { summary_rows: rows },
-        &partial_dir.join(phase.partial_file_name()),
-    )?;
-    // The result becomes resumable before the controller updates its manifest.
-    // Stage tables are left intact for diagnostics/resume; the controller
-    // removes the complete work directory after a normal one-shot run.
-    write_phase_ready(work_directory, phase)?;
-    progress.finish();
-    Ok(())
+        let rows = match phase {
+            AnalysisPhase::Prepare => {
+                let chains = prepare_base_tables(&conn, options, &progress)?;
+                let totals = load_chain_totals(&conn)?;
+                let rows = run_uri_analysis(&conn, &chains, &totals, &progress)?;
+                drop_prepare_only_uri_tables(&conn)?;
+                metadata::prepare_metadata_compact_tables(&conn, &progress)?;
+                rows
+            }
+            AnalysisPhase::Name => {
+                let chains = load_selected_chains(&conn)?;
+                let totals = load_chain_totals(&conn)?;
+                let result = run_name_analysis(
+                    &conn,
+                    NameAnalysisSpec {
+                        chains: &chains,
+                        totals: &totals,
+                        threshold: options.name_threshold,
+                        threads: options.threads,
+                        memory_limit: &options.memory_limit,
+                        analysis_memory_limit: options.analysis_memory_limit.as_deref(),
+                    },
+                    &progress,
+                )?;
+                if diagnostics {
+                    record_diagnostic_result(
+                        "name algorithm metrics",
+                        write_json_atomically(
+                            &result.metrics,
+                            &work_directory.join("metrics/name-algorithm.json"),
+                        ),
+                    );
+                }
+                result.rows
+            }
+            AnalysisPhase::Metadata => {
+                let chains = load_selected_chains(&conn)?;
+                let totals = load_chain_totals(&conn)?;
+                let result = run_metadata_analysis(
+                    &conn,
+                    &chains,
+                    &totals,
+                    options.threads,
+                    options
+                        .analysis_memory_limit
+                        .as_deref()
+                        .unwrap_or(&options.memory_limit),
+                    Some(&work_directory.join("artifacts/metadata")),
+                    &progress,
+                )?;
+                if diagnostics {
+                    record_diagnostic_result(
+                        "metadata algorithm metrics",
+                        write_json_atomically(
+                            &result.metrics,
+                            &work_directory.join("metrics/metadata-algorithm.json"),
+                        ),
+                    );
+                }
+                result.rows
+            }
+        };
+        if matches!(phase, AnalysisPhase::Prepare) {
+            conn.execute_batch("COMMIT")?;
+        }
+
+        let partial_dir = work_directory.join("partial");
+        fs::create_dir_all(&partial_dir)?;
+        write_json_atomically(
+            &AnalysisReport { summary_rows: rows },
+            &partial_dir.join(phase.partial_file_name()),
+        )?;
+        // The result becomes resumable before the controller updates its manifest.
+        // Stage tables are left intact for diagnostics/resume; the controller
+        // removes the complete work directory after a normal one-shot run.
+        write_phase_ready(work_directory, phase)?;
+        progress.finish_pipeline_stage(format!("{} complete", pipeline_stage.label()));
+        progress.finish_display(format!("{} phase complete", pipeline_stage.label()));
+        Ok(())
+    })();
+    if let Err(error) = &result {
+        progress.fail(error.to_string());
+    }
+    result
 }
 
 fn diagnostics_enabled() -> bool {
@@ -297,25 +305,42 @@ pub fn finalize_analysis_phases(
     options: &AnalysisOptions,
     work_directory: &Path,
 ) -> Result<AnalysisReport, AnalysisError> {
-    fs::create_dir_all(&options.output_dir)?;
-    let mut summary_rows = Vec::new();
-    for phase in [
-        AnalysisPhase::Prepare,
-        AnalysisPhase::Name,
-        AnalysisPhase::Metadata,
-    ] {
-        let bytes = fs::read(
-            work_directory
-                .join("partial")
-                .join(phase.partial_file_name()),
-        )?;
-        let report: AnalysisReport = serde_json::from_slice(&bytes)?;
-        summary_rows.extend(report.summary_rows);
+    let progress = ProgressTracker::for_pipeline_stage(PipelineStage::Finalize, options.progress);
+    let result: Result<AnalysisReport, AnalysisError> = (|| {
+        progress.start_stage("finalizing outputs", 5);
+        fs::create_dir_all(&options.output_dir)?;
+        let mut summary_rows = Vec::new();
+        for phase in [
+            AnalysisPhase::Prepare,
+            AnalysisPhase::Name,
+            AnalysisPhase::Metadata,
+        ] {
+            let bytes = fs::read(
+                work_directory
+                    .join("partial")
+                    .join(phase.partial_file_name()),
+            )?;
+            let report: AnalysisReport = serde_json::from_slice(&bytes)?;
+            summary_rows.extend(report.summary_rows);
+            progress.step_stage(format!(
+                "loaded {} partial summary",
+                phase.partial_file_name()
+            ));
+        }
+        sort_summary_rows(&mut summary_rows);
+        progress.step_stage("sorted summary rows");
+        let report = AnalysisReport { summary_rows };
+        write_outputs(&report, &options.output_dir)?;
+        progress.step_stage("wrote and verified output generation");
+        progress.finish_stage("outputs finalized");
+        progress.finish_pipeline_stage("finalize outputs complete");
+        progress.finish_display("analysis complete; outputs finalized");
+        Ok(report)
+    })();
+    if let Err(error) = &result {
+        progress.fail(error.to_string());
     }
-    sort_summary_rows(&mut summary_rows);
-    let report = AnalysisReport { summary_rows };
-    write_outputs(&report, &options.output_dir)?;
-    Ok(report)
+    result
 }
 
 fn write_json_atomically<T: Serialize>(value: &T, destination: &Path) -> Result<(), AnalysisError> {
@@ -388,62 +413,68 @@ pub fn run_analysis(options: AnalysisOptions) -> Result<AnalysisReport, Analysis
 
     fs::create_dir_all(&options.output_dir)?;
 
-    let progress = ProgressTracker::new(6, options.progress);
-    progress.start_phase("configuring DuckDB", 1);
-    let conn = open_analysis_connection(&options.database_path)?;
-    configure_duckdb(&conn, &options)?;
-    progress.step("DuckDB configured");
-    progress.finish_phase("DuckDB configured");
-    let selected_chains = prepare_base_tables(&conn, &options, &progress)?;
-    let chain_totals = load_chain_totals(&conn)?;
+    let progress = ProgressTracker::for_pipeline_stage(PipelineStage::Prepare, options.progress);
+    let result: Result<AnalysisReport, AnalysisError> = (|| {
+        progress.start_phase("configuring DuckDB", 1);
+        let conn = open_analysis_connection(&options.database_path)?;
+        configure_duckdb(&conn, &options)?;
+        progress.step("DuckDB configured");
+        progress.finish_phase("DuckDB configured");
+        let selected_chains = prepare_base_tables(&conn, &options, &progress)?;
+        let chain_totals = load_chain_totals(&conn)?;
 
-    let mut summary_rows = Vec::new();
-    summary_rows.extend(run_uri_analysis(
-        &conn,
-        &selected_chains,
-        &chain_totals,
-        &progress,
-    )?);
-    drop_prepare_only_uri_tables(&conn)?;
-    metadata::prepare_metadata_compact_tables(&conn, &progress)?;
-    set_phase_duckdb_memory_limit(&conn, &options, NAME_DUCKDB_MEMORY_CAP)?;
-    summary_rows.extend(
-        run_name_analysis(
-            &conn,
-            NameAnalysisSpec {
-                chains: &selected_chains,
-                totals: &chain_totals,
-                threshold: options.name_threshold,
-                threads: options.threads,
-                memory_limit: &options.memory_limit,
-                analysis_memory_limit: options.analysis_memory_limit.as_deref(),
-            },
-            &progress,
-        )?
-        .rows,
-    );
-    set_phase_duckdb_memory_limit(&conn, &options, METADATA_DUCKDB_MEMORY_CAP)?;
-    summary_rows.extend(
-        run_metadata_analysis(
+        let mut summary_rows = Vec::new();
+        summary_rows.extend(run_uri_analysis(
             &conn,
             &selected_chains,
             &chain_totals,
-            options.threads,
-            options
-                .analysis_memory_limit
-                .as_deref()
-                .unwrap_or(&options.memory_limit),
-            None,
             &progress,
-        )?
-        .rows,
-    );
+        )?);
+        drop_prepare_only_uri_tables(&conn)?;
+        metadata::prepare_metadata_compact_tables(&conn, &progress)?;
+        progress.finish_pipeline_stage("prepare + URI complete");
+        progress.set_pipeline_stage(PipelineStage::Name);
+        set_phase_duckdb_memory_limit(&conn, &options, NAME_DUCKDB_MEMORY_CAP)?;
+        summary_rows.extend(
+            run_name_analysis(
+                &conn,
+                NameAnalysisSpec {
+                    chains: &selected_chains,
+                    totals: &chain_totals,
+                    threshold: options.name_threshold,
+                    threads: options.threads,
+                    memory_limit: &options.memory_limit,
+                    analysis_memory_limit: options.analysis_memory_limit.as_deref(),
+                },
+                &progress,
+            )?
+            .rows,
+        );
+        progress.finish_pipeline_stage("name complete");
+        progress.set_pipeline_stage(PipelineStage::Metadata);
+        set_phase_duckdb_memory_limit(&conn, &options, METADATA_DUCKDB_MEMORY_CAP)?;
+        summary_rows.extend(
+            run_metadata_analysis(
+                &conn,
+                &selected_chains,
+                &chain_totals,
+                options.threads,
+                options
+                    .analysis_memory_limit
+                    .as_deref()
+                    .unwrap_or(&options.memory_limit),
+                None,
+                &progress,
+            )?
+            .rows,
+        );
+        progress.finish_pipeline_stage("metadata complete");
 
-    // `run_analysis` remains the in-process library compatibility path. Its
-    // prepared state is never a public cache, so do not leave large staging
-    // tables behind in a caller-supplied database.
-    conn.execute_batch(
-        "DROP TABLE IF EXISTS core_rows;
+        // `run_analysis` remains the in-process library compatibility path. Its
+        // prepared state is never a public cache, so do not leave large staging
+        // tables behind in a caller-supplied database.
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS core_rows;
          DROP TABLE IF EXISTS contract_dim;
          DROP TABLE IF EXISTS uri_rows;
          DROP TABLE IF EXISTS metadata_rows;
@@ -453,17 +484,24 @@ pub fn run_analysis(options: AnalysisOptions) -> Result<AnalysisReport, Analysis
          DROP TABLE IF EXISTS analysis_contracts;
          DROP TABLE IF EXISTS name_atoms;
          CHECKPOINT;",
-    )?;
+        )?;
 
-    sort_summary_rows(&mut summary_rows);
+        sort_summary_rows(&mut summary_rows);
 
-    let report = AnalysisReport { summary_rows };
-    progress.start_phase("writing outputs", 1);
-    write_outputs(&report, &options.output_dir)?;
-    progress.step("outputs written");
-    progress.finish_phase("outputs written");
-    progress.finish();
-    Ok(report)
+        let report = AnalysisReport { summary_rows };
+        progress.set_pipeline_stage(PipelineStage::Finalize);
+        progress.start_stage("writing outputs", 1);
+        write_outputs(&report, &options.output_dir)?;
+        progress.step_stage("outputs written");
+        progress.finish_stage("outputs written");
+        progress.finish_pipeline_stage("finalize outputs complete");
+        progress.finish();
+        Ok(report)
+    })();
+    if let Err(error) = &result {
+        progress.fail(error.to_string());
+    }
+    result
 }
 
 #[cfg(test)]

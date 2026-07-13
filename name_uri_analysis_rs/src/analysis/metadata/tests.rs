@@ -1,6 +1,7 @@
 use super::super::analysis_contracts_sql;
 use super::parse::*;
 use super::*;
+use crate::analysis::PipelineStage;
 
 #[test]
 fn metadata_bm25_tokens_use_unicode_letter_number_regex() {
@@ -1152,10 +1153,17 @@ fn token_content_groups_union_matches_without_contract_pair_table() {
         chain_count: 1,
         pool: &pool,
     };
+    let progress = ProgressTracker::for_pipeline_stage(PipelineStage::Metadata, true);
+    progress.start_task("shared-token memberships", Some(2), "memberships");
 
-    union_metadata_token_content_matches(&conn, &context, &mut state, usize::MAX).unwrap();
+    union_metadata_token_content_matches(&conn, &context, &mut state, usize::MAX, &progress)
+        .unwrap();
 
     assert_eq!(state.intra.find(0), state.intra.find(1));
+    let ProgressTracker::Enabled { task, .. } = &progress else {
+        panic!("progress must be enabled");
+    };
+    assert_eq!(task.position(), 2);
 }
 
 #[test]
@@ -1205,7 +1213,14 @@ fn token_content_fast_path_does_not_substitute_a_fallback_document() {
         pool: &pool,
     };
 
-    union_metadata_token_content_matches(&conn, &context, &mut state, usize::MAX).unwrap();
+    union_metadata_token_content_matches(
+        &conn,
+        &context,
+        &mut state,
+        usize::MAX,
+        &ProgressTracker::Disabled,
+    )
+    .unwrap();
 
     assert_ne!(state.intra.find(0), state.intra.find(1));
 }
@@ -2219,7 +2234,13 @@ fn metadata_representative_fallback_unions_only_without_common_token() {
         pool: &pool,
     };
 
-    union_metadata_representative_content_fallback(&context, &mut state, usize::MAX).unwrap();
+    union_metadata_representative_content_fallback(
+        &context,
+        &mut state,
+        usize::MAX,
+        &ProgressTracker::Disabled,
+    )
+    .unwrap();
 
     assert_eq!(state.intra.find(0), state.intra.find(1));
     assert_ne!(state.intra.find(2), state.intra.find(3));
@@ -2280,8 +2301,13 @@ fn scored_adaptive_fallback_preserves_disjoint_token_group_semantics() {
         chain_matrix: None,
     };
 
-    let stats =
-        union_metadata_representative_content_fallback(&context, &mut state, usize::MAX).unwrap();
+    let stats = union_metadata_representative_content_fallback(
+        &context,
+        &mut state,
+        usize::MAX,
+        &ProgressTracker::Disabled,
+    )
+    .unwrap();
 
     assert_eq!(stats.atom_count, 4);
     assert!(stats.template_scored_pairs > 0);
@@ -2355,9 +2381,13 @@ fn online_representative_fallback_matches_owned_record_path() {
         chain_matrix: Some(new_chain_matrix_reuse_states(1)),
     };
 
-    let actual =
-        union_metadata_representative_content_fallback(&context, &mut actual_state, usize::MAX)
-            .unwrap();
+    let actual = union_metadata_representative_content_fallback(
+        &context,
+        &mut actual_state,
+        usize::MAX,
+        &ProgressTracker::Disabled,
+    )
+    .unwrap();
 
     assert_eq!(actual, expected);
     for left in 0..contents.len() {

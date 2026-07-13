@@ -13,8 +13,8 @@ use duckdb::Connection;
 use rayon::prelude::*;
 
 use super::super::{
-    arrow_i64_column, arrow_string_column, chain_pair_index, AnalysisError, SparseUnionFind,
-    UnionFind,
+    arrow_i64_column, arrow_string_column, chain_pair_index, AnalysisError, ProgressCounters,
+    ProgressTracker, SparseUnionFind, UnionFind,
 };
 use super::bm25::{
     compact_metadata_content_docs_share_token, compact_metadata_content_pair_score,
@@ -213,6 +213,7 @@ pub(super) struct MetadataContentUnionStats {
     pub(super) atom_count: usize,
     pub(super) candidate_pairs: u64,
     pub(super) scored_pairs: u64,
+    pub(super) matched_pairs: u64,
     pub(super) template_candidate_pairs: u64,
     pub(super) template_scored_pairs: u64,
     pub(super) template_matched_pairs: u64,
@@ -223,6 +224,7 @@ impl MetadataContentUnionStats {
         self.atom_count = self.atom_count.saturating_add(other.atom_count);
         self.candidate_pairs = self.candidate_pairs.saturating_add(other.candidate_pairs);
         self.scored_pairs = self.scored_pairs.saturating_add(other.scored_pairs);
+        self.matched_pairs = self.matched_pairs.saturating_add(other.matched_pairs);
         self.template_candidate_pairs = self
             .template_candidate_pairs
             .saturating_add(other.template_candidate_pairs);
@@ -236,6 +238,9 @@ impl MetadataContentUnionStats {
 
     fn accumulate_pair_scoring(&mut self, other: MetadataPairScoringStats) {
         self.scored_pairs = self.scored_pairs.saturating_add(other.content_scored_pairs);
+        self.matched_pairs = self
+            .matched_pairs
+            .saturating_add(other.content_matched_pairs);
         self.template_candidate_pairs = self
             .template_candidate_pairs
             .saturating_add(other.template_candidate_pairs);
@@ -1353,6 +1358,7 @@ pub(super) fn union_metadata_token_content_matches(
     context: &MetadataContentUnionContext<'_>,
     state: &mut MetadataUnionState,
     maximum_working_bytes: usize,
+    progress: &ProgressTracker,
 ) -> Result<MetadataContentUnionStats, AnalysisError> {
     let mut stmt = conn.prepare(metadata_token_content_rows_sql())?;
     let mut current_token = None;
@@ -1373,6 +1379,7 @@ pub(super) fn union_metadata_token_content_matches(
         .max(1)
         .saturating_mul(METADATA_TOKEN_GROUP_BATCH_MULTIPLIER);
     let mut stats = MetadataContentUnionStats::default();
+    let mut completed_groups = 0u64;
     for batch in stmt.query_arrow([])? {
         let token_column = arrow_i64_column(&batch, 0, "token_index")?;
         let contract_column = arrow_i64_column(&batch, 1, "contract_index")?;
@@ -1386,6 +1393,7 @@ pub(super) fn union_metadata_token_content_matches(
             })?;
             if current_token.is_some_and(|current| current != token_index) {
                 let completed = std::mem::take(&mut group);
+                completed_groups = completed_groups.saturating_add(1);
                 let prepare_bytes = completed.parallel_prepare_bytes();
                 let can_prepare_in_small_batch = completed.record_count()
                     < METADATA_CONTENT_PARALLEL_MIN_RECORDS
@@ -1469,8 +1477,18 @@ pub(super) fn union_metadata_token_content_matches(
                 )?;
             }
         }
+        progress.advance_task(
+            batch.num_rows() as u64,
+            ProgressCounters {
+                groups: completed_groups,
+                candidates: stats.candidate_pairs,
+                scored: stats.scored_pairs,
+                matched: stats.matched_pairs,
+            },
+        );
     }
     if current_token.is_some() {
+        completed_groups = completed_groups.saturating_add(1);
         let prepare_bytes = group.parallel_prepare_bytes();
         if group.record_count() < METADATA_CONTENT_PARALLEL_MIN_RECORDS
             && prepare_bytes <= small_group_reserve_bytes
@@ -1493,6 +1511,15 @@ pub(super) fn union_metadata_token_content_matches(
         state,
         maximum_working_bytes,
     )?);
+    progress.advance_task(
+        0,
+        ProgressCounters {
+            groups: completed_groups,
+            candidates: stats.candidate_pairs,
+            scored: stats.scored_pairs,
+            matched: stats.matched_pairs,
+        },
+    );
     Ok(stats)
 }
 
@@ -1532,8 +1559,15 @@ pub(super) fn union_metadata_representative_content_fallback(
     context: &MetadataContentUnionContext<'_>,
     state: &mut MetadataUnionState,
     maximum_working_bytes: usize,
+    progress: &ProgressTracker,
 ) -> Result<MetadataContentUnionStats, AnalysisError> {
+    progress.start_task(
+        "building representative fallback atoms",
+        Some(context.data.contracts.len() as u64),
+        "contracts",
+    );
     let mut builder = CompactMetadataContentGroupBuilder::default();
+    let mut pending_progress = 0u64;
     for (contract_index, contract) in context.data.contracts.iter().enumerate() {
         if let Some(document) = &contract.content_doc {
             builder.push_document(
@@ -1548,16 +1582,31 @@ pub(super) fn union_metadata_representative_content_fallback(
                 context.pool.current_num_threads(),
             )?;
         }
+        pending_progress = pending_progress.saturating_add(1);
+        if pending_progress >= 4_096 {
+            progress.advance_task(pending_progress, ProgressCounters::default());
+            pending_progress = 0;
+        }
     }
+    progress.advance_task(pending_progress, ProgressCounters::default());
+    progress.finish_task("representative fallback atoms ready");
     builder.ensure_within_memory_budget(
         0,
         maximum_working_bytes,
         context.pool.current_num_threads(),
     )?;
     let (atoms, docs) = builder.into_atomized_parts();
-    Ok(union_metadata_no_common_atom_core(
-        atoms, &docs, context, state,
-    ))
+    progress.start_task(
+        "scoring representative fallback left atoms",
+        Some(atoms.len().saturating_sub(1) as u64),
+        "atoms",
+    );
+    let stats = union_metadata_no_common_atom_core(atoms, &docs, context, state, Some(progress));
+    progress.finish_task(format!(
+        "representative fallback complete; candidates {}; scored {}; matched {}",
+        stats.candidate_pairs, stats.scored_pairs, stats.matched_pairs
+    ));
+    Ok(stats)
 }
 
 pub(super) fn apply_metadata_contract_pair_union(
@@ -2301,6 +2350,7 @@ pub(super) struct MetadataPairScoringStats {
     template_scored_pairs: u64,
     template_matched_pairs: u64,
     content_scored_pairs: u64,
+    content_matched_pairs: u64,
 }
 
 #[derive(Default)]
@@ -2335,6 +2385,7 @@ impl MetadataValidatedPairBatch {
         self.stats.template_matched_pairs = self.stats.template_matched_pairs.saturating_add(1);
         self.stats.content_scored_pairs = self.stats.content_scored_pairs.saturating_add(1);
         if metadata_content_atom_pair_matches(pair, atoms, compact_docs) {
+            self.stats.content_matched_pairs = self.stats.content_matched_pairs.saturating_add(1);
             self.hits.push(pair);
         }
     }
@@ -2357,6 +2408,10 @@ impl MetadataValidatedPairBatch {
             .stats
             .content_scored_pairs
             .saturating_add(other.stats.content_scored_pairs);
+        self.stats.content_matched_pairs = self
+            .stats
+            .content_matched_pairs
+            .saturating_add(other.stats.content_matched_pairs);
         self
     }
 }
@@ -2652,7 +2707,7 @@ pub(super) fn union_metadata_no_common_content_candidates(
 ) -> MetadataContentUnionStats {
     let atoms =
         build_metadata_fallback_atoms(records, compact_docs, context.data, context.contract_tokens);
-    union_metadata_no_common_atom_core(atoms, compact_docs, context, state)
+    union_metadata_no_common_atom_core(atoms, compact_docs, context, state, None)
 }
 
 fn union_metadata_no_common_atom_core(
@@ -2660,6 +2715,7 @@ fn union_metadata_no_common_atom_core(
     compact_docs: &[CompactMetadataContentDocument],
     context: &MetadataContentUnionContext<'_>,
     state: &mut MetadataUnionState,
+    progress: Option<&ProgressTracker>,
 ) -> MetadataContentUnionStats {
     let mut stats = MetadataContentUnionStats {
         atom_count: atoms.len(),
@@ -2739,6 +2795,7 @@ fn union_metadata_no_common_atom_core(
     };
     let mut scratch = MetadataCandidateScratch::new(atoms.len());
     let mut candidate_pairs = Vec::with_capacity(METADATA_CONTENT_SCORE_BATCH_PAIRS);
+    let mut pending_progress = 0u64;
     for left in 0..atoms.len().saturating_sub(1) {
         let left_atom = &atoms[left];
         let left_record_index = metadata_doc_index_to_usize(left_atom.representative_record_index);
@@ -2795,6 +2852,21 @@ fn union_metadata_no_common_atom_core(
                 }
             }
         }
+        pending_progress = pending_progress.saturating_add(1);
+        if pending_progress >= 256 {
+            if let Some(progress) = progress {
+                progress.advance_task(
+                    pending_progress,
+                    ProgressCounters {
+                        candidates: stats.candidate_pairs,
+                        scored: stats.scored_pairs,
+                        matched: stats.matched_pairs,
+                        ..ProgressCounters::default()
+                    },
+                );
+            }
+            pending_progress = 0;
+        }
     }
     let batch_stats = score_and_apply_metadata_fallback_atom_pair_batch(
         &mut candidate_pairs,
@@ -2804,6 +2876,17 @@ fn union_metadata_no_common_atom_core(
         state,
     );
     stats.accumulate_pair_scoring(batch_stats);
+    if let Some(progress) = progress {
+        progress.advance_task(
+            pending_progress,
+            ProgressCounters {
+                candidates: stats.candidate_pairs,
+                scored: stats.scored_pairs,
+                matched: stats.matched_pairs,
+                ..ProgressCounters::default()
+            },
+        );
+    }
     stats
 }
 

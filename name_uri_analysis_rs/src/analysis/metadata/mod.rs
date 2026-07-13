@@ -7,8 +7,8 @@ use duckdb::Connection;
 use super::{
     accumulate_pair_component_summary, chain_pair_count, chain_pair_from_index,
     execute_progress_batch, format_byte_size, new_chain_matrix_reuse_states, summary_row,
-    total_memory_budget_bytes, AnalysisError, GroupSummary, NameTotals, ProgressTracker,
-    SparseUnionFind, SummaryRow, SummarySpec, UnionFind, SPARSE_UNION_NODE_BYTES,
+    total_memory_budget_bytes, AnalysisError, GroupSummary, NameTotals, ProgressCounters,
+    ProgressTracker, SparseUnionFind, SummaryRow, SummarySpec, UnionFind, SPARSE_UNION_NODE_BYTES,
 };
 
 mod bm25;
@@ -592,7 +592,7 @@ pub(super) fn run_metadata_analysis(
     artifact_directory: Option<&Path>,
     progress: &ProgressTracker,
 ) -> Result<MetadataAnalysisResult, AnalysisError> {
-    progress.start_phase("analyzing metadata duplicates", 3);
+    progress.start_stage("analyzing metadata duplicates", 7);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads.max(1))
         .thread_name(|index| format!("metadata-{index}"))
@@ -644,11 +644,21 @@ pub(super) fn run_metadata_analysis(
             format_byte_size(analysis_memory_bytes)
         )));
     }
+    progress.step_stage(format!(
+        "planned metadata memory for {selected_sources} sources and {retained_contract_token_rows} shared-token memberships"
+    ));
     let cache_budget_bytes = analysis_memory_bytes
         .saturating_div(METADATA_REUSE_CACHE_BUDGET_DIVISOR)
         .min(analysis_memory_bytes.saturating_sub(runtime_reserve_bytes))
         .min(analysis_memory_bytes.saturating_sub(concurrent_load_reserve_bytes));
+    progress.start_task("loading reused metadata documents", None, "documents");
     let reused_documents = load_reused_metadata_documents(conn, &pool, Some(cache_budget_bytes))?;
+    progress.advance_task(reused_documents.len() as u64, ProgressCounters::default());
+    progress.finish_task(format!(
+        "loaded {} reused metadata documents",
+        reused_documents.len()
+    ));
+    progress.step_stage("loaded reused metadata cache");
     let reused_cache_bytes = reused_metadata_documents_memory_bytes(&reused_documents);
     let reused_raw_json_cache_entries = reused_documents.len() as u64;
     let builder_peak_budget_bytes = metadata_builder_peak_budget_bytes(
@@ -657,6 +667,11 @@ pub(super) fn run_metadata_analysis(
         reused_cache_bytes,
         load_transient_reserve_bytes,
     )?;
+    progress.start_task(
+        "loading and interning metadata documents",
+        None,
+        "contracts",
+    );
     let mut data = load_metadata_data(
         conn,
         chains,
@@ -664,6 +679,7 @@ pub(super) fn run_metadata_analysis(
         reused_documents,
         MetadataLoadBudgets::new(builder_peak_budget_bytes, load_transient_reserve_bytes),
     )?;
+    progress.advance_task(data.contracts.len() as u64, ProgressCounters::default());
     let contract_token_reserve_bytes =
         metadata_contract_token_reserve_bytes(data.contracts.len(), retained_contract_token_count);
     let pre_token_resident_budget = metadata_pre_token_resident_budget_bytes(
@@ -685,7 +701,26 @@ pub(super) fn run_metadata_analysis(
             format_byte_size(analysis_memory_bytes)
         )));
     }
+    progress.finish_task(format!(
+        "loaded {} metadata documents for {} contracts",
+        data.metadata_index.doc_count(),
+        data.contracts.len()
+    ));
+    progress.step_stage("loaded metadata document index");
+    progress.start_task(
+        "loading contract-token CSR in two passes",
+        None,
+        "memberships",
+    );
     let contract_tokens = load_metadata_contract_tokens(conn, &data, &pool)?;
+    progress.advance_task(
+        retained_contract_token_rows.saturating_mul(2),
+        ProgressCounters::default(),
+    );
+    progress.finish_task(format!(
+        "loaded {retained_contract_token_rows} shared-token memberships in two passes"
+    ));
+    progress.step_stage("loaded contract-token CSR");
     let template_document_count = data.metadata_index.doc_count() as u64;
     let content_document_count = data
         .contracts
@@ -708,17 +743,13 @@ pub(super) fn run_metadata_analysis(
         )));
     }
     let mapped_index_bytes = u64::try_from(data.metadata_index.mapped_bytes()).unwrap_or(u64::MAX);
-    progress.step(format!(
-        "loaded {} metadata documents for {} contracts",
-        data.metadata_index.doc_count(),
-        data.contracts.len()
-    ));
     let mut rows = Vec::new();
     if data.contracts.len() < 2 || data.metadata_index.is_empty() {
         push_empty_metadata_rows(&mut rows, chains, totals);
-        progress.step("metadata scoring skipped");
-        progress.step("metadata rows summarized");
-        progress.finish_phase("metadata analysis complete");
+        progress.step_stage("shared-token scoring skipped");
+        progress.step_stage("representative fallback skipped");
+        progress.step_stage("metadata rows summarized");
+        progress.finish_stage("metadata analysis complete");
         return Ok(MetadataAnalysisResult {
             rows,
             metrics: MetadataAlgorithmMetrics {
@@ -749,6 +780,11 @@ pub(super) fn run_metadata_analysis(
     };
     let maximum_shared_working_bytes = analysis_memory_bytes - resident_bytes;
     let mut content_stats = MetadataContentUnionStats::default();
+    progress.start_task(
+        "matching shared-token memberships",
+        Some(retained_contract_token_rows),
+        "memberships",
+    );
     {
         let content_context = MetadataContentUnionContext {
             data: &data,
@@ -764,9 +800,15 @@ pub(super) fn run_metadata_analysis(
             &content_context,
             &mut state,
             maximum_shared_working_bytes,
+            progress,
         )?;
         content_stats.accumulate(shared_stats);
     }
+    progress.finish_task(format!(
+        "shared-token matching complete; candidates {}; scored {}; matched {}",
+        content_stats.candidate_pairs, content_stats.scored_pairs, content_stats.matched_pairs
+    ));
+    progress.step_stage("matched shared-token metadata groups");
     drop(std::mem::take(&mut data.reused_documents));
     let fallback_resident_bytes =
         metadata_resident_memory_bytes(&data, Some(&contract_tokens), chains.len());
@@ -792,9 +834,10 @@ pub(super) fn run_metadata_analysis(
             &content_context,
             &mut state,
             maximum_fallback_working_bytes,
+            progress,
         )?);
     }
-    progress.step("metadata documents scored");
+    progress.step_stage("matched representative metadata fallback");
     drop(contract_tokens);
     drop(pool);
     release_metadata_scoring_state(&mut data);
@@ -806,9 +849,17 @@ pub(super) fn run_metadata_analysis(
             format_byte_size(analysis_memory_bytes)
         )));
     }
+    let summary_units = chains.len() as u64 + chain_pair_count(chains.len()) as u64 * 2;
+    progress.start_task(
+        "summarizing metadata components",
+        Some(summary_units),
+        "summaries",
+    );
     push_metadata_summary_rows(&mut rows, &data, chains, totals, &mut state);
-    progress.step("metadata rows summarized");
-    progress.finish_phase("metadata analysis complete");
+    progress.advance_task(summary_units, ProgressCounters::default());
+    progress.finish_task("metadata component summaries ready");
+    progress.step_stage("metadata rows summarized");
+    progress.finish_stage("metadata analysis complete");
     let dsu_bytes = metadata_union_state_bytes(&state);
     Ok(MetadataAnalysisResult {
         rows,
