@@ -12,7 +12,8 @@ use clap::{Parser, ValueEnum};
 use duckdb::Connection;
 use name_uri_analysis_rs::analysis::{
     finalize_analysis_phases, run_analysis_phase, validate_output_generation,
-    validate_static_memory_options, AnalysisOptions, AnalysisPhase, SUMMARY_MANIFEST_FILE_NAME,
+    validate_static_memory_options, AnalysisOptions, AnalysisPhase, DUCKDB_THREAD_CAP,
+    SUMMARY_MANIFEST_FILE_NAME,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -22,6 +23,12 @@ mod atomic_file;
 use atomic_file::replace_file_atomically;
 
 const PIPELINE_SCHEMA_VERSION: u32 = 2;
+// Any semantic change to a resumable stage must bump that stage's revision;
+// the controller invalidates only the affected checkpoint and its dependents.
+const PREPARE_STAGE_REVISION: u32 = 1;
+const NAME_STAGE_REVISION: u32 = 1;
+const METADATA_STAGE_REVISION: u32 = 1;
+const FINALIZER_STAGE_REVISION: u32 = 1;
 const PARENT_LIVENESS_ENV: &str = "NAME_URI_ANALYSIS_PARENT_LIVENESS_PIPE";
 const PHASE_GENERATION_ENV: &str = "NAME_URI_ANALYSIS_PHASE_GENERATION";
 
@@ -74,19 +81,19 @@ struct Args {
     #[arg(long, default_value_t = 95.0)]
     name_threshold: f64,
 
-    /// Worker thread count shared by DuckDB and Rayon.
-    #[arg(long, default_value_t = 32, value_parser = parse_positive_usize)]
+    /// Rayon worker ceiling; DuckDB is separately capped at 64 physical-core workers.
+    #[arg(long, default_value_t = 128, value_parser = parse_positive_usize)]
     threads: usize,
 
     #[arg(
         long,
-        default_value = "192GiB",
+        default_value = "384GiB",
         help = "Hard budget for Rust analysis structures"
     )]
     analysis_memory_limit: String,
 
     /// DuckDB buffer-manager limit. Keep headroom for non-buffer allocations.
-    #[arg(long, default_value = "160GiB")]
+    #[arg(long, default_value = "320GiB")]
     duckdb_memory_limit: String,
 
     #[arg(
@@ -131,10 +138,32 @@ struct InputFingerprint {
 struct PipelineManifest {
     schema_version: u32,
     binary_version: String,
+    #[serde(default)]
+    stage_revisions: StageRevisions,
     inputs: Vec<InputFingerprint>,
     chains: Vec<String>,
     options: AnalysisOptions,
     stages: BTreeMap<String, StageCheckpoint>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+struct StageRevisions {
+    prepare: u32,
+    name: u32,
+    metadata: u32,
+    finalizer: u32,
+}
+
+impl StageRevisions {
+    const fn current() -> Self {
+        Self {
+            prepare: PREPARE_STAGE_REVISION,
+            name: NAME_STAGE_REVISION,
+            metadata: METADATA_STAGE_REVISION,
+            finalizer: FINALIZER_STAGE_REVISION,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -200,7 +229,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _controller_lock = ControllerLock::acquire(&work_directory)?;
     let mut phase_lease = ControllerPhaseLease::acquire(&work_directory)?;
     let inputs = fingerprint_inputs(&args.parquet_inputs)?;
-    warn_for_suboptimal_row_groups(&inputs, effective_threads);
+    warn_for_suboptimal_row_groups(
+        &inputs,
+        duckdb_threads_for_row_group_warning(effective_threads),
+    );
     let canonical_inputs = inputs
         .iter()
         .map(|input| input.path.clone())
@@ -220,6 +252,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let expected_manifest = PipelineManifest {
         schema_version: PIPELINE_SCHEMA_VERSION,
         binary_version: binary_identity()?,
+        stage_revisions: StageRevisions::current(),
         inputs,
         // `selected_chains` is derived once by the prepare phase. Keeping this
         // legacy manifest field empty avoids a redundant full Parquet column
@@ -807,6 +840,10 @@ fn row_group_parallelism_warning(
     None
 }
 
+fn duckdb_threads_for_row_group_warning(effective_threads: usize) -> usize {
+    effective_threads.clamp(1, DUCKDB_THREAD_CAP)
+}
+
 fn warn_for_suboptimal_row_groups(inputs: &[InputFingerprint], effective_threads: usize) {
     if let Some(warning) = row_group_parallelism_warning(inputs, effective_threads) {
         eprintln!("warning: {warning}");
@@ -855,12 +892,25 @@ fn prepare_work_directory(
 ) -> Result<(PathBuf, PipelineManifest), Box<dyn std::error::Error>> {
     let config_path = work_directory.join("manifest.json");
     if resume {
-        let existing: PipelineManifest =
+        let mut existing: PipelineManifest =
             serde_json::from_slice(&fs::read(&config_path).map_err(|error| {
                 format!("cannot resume without {}: {error}", config_path.display())
             })?)?;
         if !manifests_have_same_inputs_and_options(&existing, &manifest) {
             return Err("resume rejected: input fingerprint or analysis options changed".into());
+        }
+        let revisions_changed = invalidate_changed_stage_revisions(
+            &mut existing,
+            manifest.stage_revisions,
+            work_directory,
+        )?;
+        if revisions_changed
+            || existing.binary_version != manifest.binary_version
+            || existing.options != manifest.options
+        {
+            existing.binary_version = manifest.binary_version;
+            existing.options = manifest.options;
+            write_manifest_atomically(&config_path, &existing)?;
         }
         return Ok((config_path, existing));
     }
@@ -876,6 +926,79 @@ fn prepare_work_directory(
     fs::create_dir_all(work_directory.join("duckdb-temp"))?;
     write_manifest_atomically(&config_path, &manifest)?;
     Ok((config_path, manifest))
+}
+
+fn invalidate_changed_stage_revisions(
+    manifest: &mut PipelineManifest,
+    expected: StageRevisions,
+    work_directory: &Path,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let previous = manifest.stage_revisions;
+    if previous == expected {
+        return Ok(false);
+    }
+
+    if previous.prepare != expected.prepare {
+        invalidate_stage_checkpoints(
+            manifest,
+            &[
+                "contracts_ready",
+                "uri_complete",
+                "metadata_compact_ready",
+                "prepare_complete",
+                "name_complete",
+                "metadata_complete",
+                "finalized",
+            ],
+        );
+        remove_ready_checkpoints(work_directory, &["prepare", "name", "metadata"])?;
+    } else {
+        if previous.name != expected.name {
+            invalidate_stage_checkpoints(manifest, &["name_complete", "finalized"]);
+            remove_ready_checkpoints(work_directory, &["name"])?;
+        }
+        if previous.metadata != expected.metadata {
+            invalidate_stage_checkpoints(manifest, &["metadata_complete", "finalized"]);
+            remove_ready_checkpoints(work_directory, &["metadata"])?;
+        }
+        if previous.finalizer != expected.finalizer {
+            invalidate_stage_checkpoints(manifest, &["finalized"]);
+        }
+    }
+
+    manifest.stage_revisions = expected;
+    Ok(true)
+}
+
+fn invalidate_stage_checkpoints(manifest: &mut PipelineManifest, stages: &[&str]) {
+    for stage in stages {
+        manifest
+            .stages
+            .insert((*stage).to_string(), StageCheckpoint::default());
+    }
+}
+
+fn remove_ready_checkpoints(
+    work_directory: &Path,
+    phases: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for phase in phases {
+        let path = work_directory
+            .join("checkpoints")
+            .join(format!("{phase}.ready.json"));
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "could not invalidate stale ready checkpoint {}: {error}",
+                    path.display()
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn initial_stage_checkpoints() -> BTreeMap<String, StageCheckpoint> {
@@ -907,10 +1030,12 @@ fn manifests_have_same_inputs_and_options(
     expected: &PipelineManifest,
 ) -> bool {
     existing.schema_version == expected.schema_version
-        && existing.binary_version == expected.binary_version
         && existing.inputs == expected.inputs
         && existing.chains == expected.chains
-        && existing.options == expected.options
+        && existing.options.database_path == expected.options.database_path
+        && existing.options.parquet_inputs == expected.options.parquet_inputs
+        && existing.options.output_dir == expected.options.output_dir
+        && existing.options.name_threshold == expected.options.name_threshold
 }
 
 fn fingerprint_artifact(path: &Path) -> Result<ArtifactFingerprint, Box<dyn std::error::Error>> {
@@ -1326,6 +1451,7 @@ mod tests {
         PipelineManifest {
             schema_version: PIPELINE_SCHEMA_VERSION,
             binary_version: env!("CARGO_PKG_VERSION").to_string(),
+            stage_revisions: StageRevisions::current(),
             inputs: vec![InputFingerprint {
                 file_id: 0,
                 path: root.join("input.parquet"),
@@ -1417,11 +1543,11 @@ mod tests {
     }
 
     #[test]
-    fn cli_defaults_to_32_worker_threads() {
+    fn cli_defaults_to_128_worker_threads() {
         let args =
             Args::try_parse_from(["name_uri_analysis_rs", "--parquet", "input.parquet"]).unwrap();
 
-        assert_eq!(args.threads, 32);
+        assert_eq!(args.threads, 128);
     }
 
     #[test]
@@ -1457,8 +1583,8 @@ mod tests {
         let args =
             Args::try_parse_from(["name_uri_analysis_rs", "--parquet", "input.parquet"]).unwrap();
 
-        assert_eq!(args.duckdb_memory_limit, "160GiB");
-        assert_eq!(args.analysis_memory_limit, "192GiB");
+        assert_eq!(args.duckdb_memory_limit, "320GiB");
+        assert_eq!(args.analysis_memory_limit, "384GiB");
     }
 
     #[test]
@@ -1529,6 +1655,13 @@ mod tests {
         let warning = row_group_parallelism_warning(&[input], 4).unwrap();
         assert!(warning.contains("2 Parquet row groups"));
         assert!(warning.contains("4 workers"));
+    }
+
+    #[test]
+    fn row_group_warning_caps_parallelism_at_duckdb_worker_limit() {
+        assert_eq!(duckdb_threads_for_row_group_warning(1), 1);
+        assert_eq!(duckdb_threads_for_row_group_warning(64), 64);
+        assert_eq!(duckdb_threads_for_row_group_warning(128), 64);
     }
 
     #[test]
@@ -1882,11 +2015,20 @@ mod tests {
     }
 
     #[test]
-    fn manifest_compatibility_ignores_checkpoints_but_not_inputs_or_options() {
+    fn manifest_compatibility_allows_resource_tuning_but_not_semantic_changes() {
         let temp = tempfile::tempdir().unwrap();
         let expected = sample_manifest(temp.path());
         let mut existing = expected.clone();
         existing.stages.get_mut("name_complete").unwrap().complete = true;
+        assert!(manifests_have_same_inputs_and_options(&existing, &expected));
+
+        existing.binary_version = "new-compatible-binary".to_string();
+        assert!(manifests_have_same_inputs_and_options(&existing, &expected));
+
+        existing.options.threads = 128;
+        existing.options.memory_limit = "384GiB".to_string();
+        existing.options.analysis_memory_limit = Some("384GiB".to_string());
+        existing.options.duckdb_memory_limit = "320GiB".to_string();
         assert!(manifests_have_same_inputs_and_options(&existing, &expected));
 
         existing.inputs[0].row_count += 1;
@@ -1898,6 +2040,183 @@ mod tests {
         assert!(!manifests_have_same_inputs_and_options(
             &existing, &expected
         ));
+    }
+
+    #[test]
+    fn resume_rebinds_a_stage_compatible_manifest_to_the_current_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        fs::create_dir_all(&work).unwrap();
+        let mut existing = sample_manifest(&work);
+        existing.binary_version = "old-binary".to_string();
+        existing
+            .stages
+            .get_mut("prepare_complete")
+            .unwrap()
+            .complete = true;
+        let manifest_path = work.join("manifest.json");
+        fs::write(&manifest_path, serde_json::to_vec(&existing).unwrap()).unwrap();
+        let mut expected = existing.clone();
+        expected.binary_version = "new-binary".to_string();
+        expected.options.threads = 128;
+        expected.options.memory_limit = "384GiB".to_string();
+        expected.options.analysis_memory_limit = Some("384GiB".to_string());
+        expected.options.duckdb_memory_limit = "320GiB".to_string();
+
+        let (_, rebound) = prepare_work_directory(&work, expected, true).unwrap();
+        let persisted: PipelineManifest =
+            serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
+
+        assert_eq!(rebound.binary_version, "new-binary");
+        assert_eq!(persisted.binary_version, "new-binary");
+        assert_eq!(persisted.options.threads, 128);
+        assert_eq!(
+            persisted.options.analysis_memory_limit.as_deref(),
+            Some("384GiB")
+        );
+        assert!(persisted.stages["prepare_complete"].complete);
+    }
+
+    #[test]
+    fn resume_stage_revision_changes_follow_the_dependency_graph() {
+        struct Case {
+            revisions: serde_json::Value,
+            invalidated_stages: &'static [&'static str],
+            invalidated_ready_phases: &'static [&'static str],
+        }
+
+        let cases = [
+            Case {
+                revisions: serde_json::json!({
+                    "prepare": 0,
+                    "name": 1,
+                    "metadata": 1,
+                    "finalizer": 1,
+                }),
+                invalidated_stages: &[
+                    "contracts_ready",
+                    "uri_complete",
+                    "metadata_compact_ready",
+                    "prepare_complete",
+                    "name_complete",
+                    "metadata_complete",
+                    "finalized",
+                ],
+                invalidated_ready_phases: &["prepare", "name", "metadata"],
+            },
+            Case {
+                revisions: serde_json::json!({
+                    "prepare": 1,
+                    "name": 0,
+                    "metadata": 1,
+                    "finalizer": 1,
+                }),
+                invalidated_stages: &["name_complete", "finalized"],
+                invalidated_ready_phases: &["name"],
+            },
+            Case {
+                revisions: serde_json::json!({
+                    "prepare": 1,
+                    "name": 1,
+                    "metadata": 0,
+                    "finalizer": 1,
+                }),
+                invalidated_stages: &["metadata_complete", "finalized"],
+                invalidated_ready_phases: &["metadata"],
+            },
+            Case {
+                revisions: serde_json::json!({
+                    "prepare": 1,
+                    "name": 1,
+                    "metadata": 1,
+                    "finalizer": 0,
+                }),
+                invalidated_stages: &["finalized"],
+                invalidated_ready_phases: &[],
+            },
+        ];
+
+        for (case_index, case) in cases.into_iter().enumerate() {
+            let temp = tempfile::tempdir().unwrap();
+            let work = temp.path().join(format!("work-{case_index}"));
+            let checkpoints = work.join("checkpoints");
+            fs::create_dir_all(&checkpoints).unwrap();
+            let mut existing = sample_manifest(&work);
+            for checkpoint in existing.stages.values_mut() {
+                checkpoint.complete = true;
+            }
+            let mut serialized = serde_json::to_value(existing).unwrap();
+            serialized["stage_revisions"] = case.revisions;
+            fs::write(
+                work.join("manifest.json"),
+                serde_json::to_vec(&serialized).unwrap(),
+            )
+            .unwrap();
+            for phase in ["prepare", "name", "metadata"] {
+                fs::write(
+                    checkpoints.join(format!("{phase}.ready.json")),
+                    b"stale-ready",
+                )
+                .unwrap();
+            }
+
+            let (_, rebound) = prepare_work_directory(&work, sample_manifest(&work), true).unwrap();
+
+            for (stage, checkpoint) in &rebound.stages {
+                let should_be_complete = !case.invalidated_stages.contains(&stage.as_str());
+                assert_eq!(
+                    checkpoint.complete, should_be_complete,
+                    "unexpected {stage:?} state for case {case_index}"
+                );
+                if !should_be_complete {
+                    assert!(checkpoint.artifacts.is_empty());
+                }
+            }
+            for phase in ["prepare", "name", "metadata"] {
+                let should_exist = !case.invalidated_ready_phases.contains(&phase);
+                assert_eq!(
+                    checkpoints.join(format!("{phase}.ready.json")).exists(),
+                    should_exist,
+                    "unexpected {phase:?} ready checkpoint state for case {case_index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_manifest_without_stage_revisions_is_safely_invalidated_and_upgraded() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        fs::create_dir_all(&work).unwrap();
+        let mut legacy = sample_manifest(&work);
+        for checkpoint in legacy.stages.values_mut() {
+            checkpoint.complete = true;
+        }
+        let mut serialized = serde_json::to_value(legacy).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("stage_revisions");
+        let manifest_path = work.join("manifest.json");
+        fs::write(&manifest_path, serde_json::to_vec(&serialized).unwrap()).unwrap();
+
+        let (_, rebound) = prepare_work_directory(&work, sample_manifest(&work), true).unwrap();
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
+
+        assert!(rebound.stages["input_validated"].complete);
+        for stage in [
+            "contracts_ready",
+            "uri_complete",
+            "metadata_compact_ready",
+            "prepare_complete",
+            "name_complete",
+            "metadata_complete",
+            "finalized",
+        ] {
+            assert!(!rebound.stages[stage].complete, "legacy stage {stage:?}");
+        }
+        assert!(persisted["stage_revisions"].is_object());
     }
 
     #[test]

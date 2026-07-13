@@ -438,8 +438,10 @@ pub(super) fn load_reused_metadata_documents(
                 .into_par_iter()
                 .map(|raw| {
                     let documents = metadata_documents_from_json(&raw);
-                    let prefilter = MetadataBm25Document::from_text(&documents.prefilter);
-                    let content = MetadataBm25Document::from_text(&documents.content).map(Arc::new);
+                    let prefilter =
+                        MetadataBm25Document::from_normalized_text(&documents.prefilter);
+                    let content = MetadataBm25Document::from_normalized_text(&documents.content)
+                        .map(Arc::new);
                     let cached = ReusedMetadataDocument {
                         prefilter,
                         content,
@@ -788,9 +790,10 @@ pub(super) fn index_metadata_raw_row_chunk_with_cache(
                 )
             } else {
                 let documents = metadata_documents_from_json(&row.metadata_json);
-                let doc = MetadataBm25Document::from_text(&documents.prefilter)?;
+                let doc = MetadataBm25Document::from_normalized_text(&documents.prefilter)?;
                 let doc_key = metadata_document_key(&documents.prefilter);
-                let content_doc = MetadataBm25Document::from_text(&documents.content).map(Arc::new);
+                let content_doc =
+                    MetadataBm25Document::from_normalized_text(&documents.content).map(Arc::new);
                 (doc, content_doc, doc_key)
             };
             Some((

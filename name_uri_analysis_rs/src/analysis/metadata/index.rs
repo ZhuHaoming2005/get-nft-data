@@ -2,35 +2,42 @@ use std::borrow::Cow;
 use std::collections::{hash_map::RandomState, HashMap};
 use std::hash::BuildHasher;
 use std::path::Path;
+#[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(test)]
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::Duration;
 
 use duckdb::Connection;
 use rayon::prelude::*;
 
 use super::super::{
-    arrow_i64_column, arrow_string_column, chain_pair_index, AnalysisError, ProgressTracker,
-    SparseUnionFind, UnionFind,
+    arrow_i64_column, arrow_string_column, chain_pair_index, AnalysisError, SparseUnionFind,
+    UnionFind,
 };
 use super::bm25::{
-    compact_metadata_content_pair_score, CompactMetadataContentDocument, CompactMetadataPostings,
-    CompactMetadataScoring, InternedMetadataCorpus, InternedMetadataSourceDoc,
-    MetadataBm25Document, PreparedInternedMetadataDoc, PreparedInternedMetadataQuery,
+    compact_metadata_content_docs_share_token, compact_metadata_content_pair_score,
+    CompactMetadataContentDocument, CompactMetadataScoring, InternedMetadataCorpus,
+    InternedMetadataSourceDoc, MetadataBm25Document, PreparedInternedMetadataDoc,
+    PreparedInternedMetadataQuery,
 };
 #[cfg(test)]
-use super::bm25::{CompactMetadataContentSet, MetadataContentRecord};
+use super::bm25::{CompactMetadataContentSet, CompactMetadataPostings, MetadataContentRecord};
 use super::parse::metadata_document_from_json;
 use super::{
     metadata_contract_index_from_usize, metadata_contract_index_to_usize,
     metadata_doc_index_from_usize, metadata_doc_index_to_usize, CompactContractTokens,
-    MetadataContractIndex, MetadataData, MetadataDocIndex, MetadataDocPair,
-    MetadataTemplateMatches, SourceMetadataDocEntry, METADATA_CONTENT_PARALLEL_MIN_RECORDS,
-    METADATA_CONTENT_SCORE_BATCH_PAIRS, METADATA_PAIR_LEFT_CHUNK_SIZE, METADATA_THRESHOLD,
+    MetadataContractIndex, MetadataData, MetadataDocIndex, SourceMetadataDocEntry,
+    METADATA_CONTENT_PARALLEL_MIN_RECORDS, METADATA_CONTENT_SCORE_BATCH_PAIRS, METADATA_THRESHOLD,
 };
+#[cfg(test)]
+use super::{MetadataDocPair, MetadataTemplateMatches, METADATA_PAIR_LEFT_CHUNK_SIZE};
 
 pub(super) const METADATA_RAW_GROUP_CHUNK_SIZE: usize = 1024;
 const NO_METADATA_ATOM: usize = usize::MAX;
+const METADATA_TEMPLATE_SCORE_CACHE_SLOTS: usize = 256;
+const METADATA_DIRECT_ATOM_GROUP_SIZE: usize = 2;
 
 pub(super) struct MetadataContentAtom {
     pub(super) chain_index: usize,
@@ -46,7 +53,27 @@ pub(super) struct MetadataFallbackTokenGroup {
 }
 
 pub(super) struct MetadataContentCandidateIndex {
-    entries: Vec<(u32, MetadataDocIndex, MetadataDocIndex)>,
+    entries: Vec<(u32, MetadataDocIndex)>,
+}
+
+pub(super) struct MetadataTemplateCandidateIndex {
+    full_entries: Vec<(u32, MetadataDocIndex)>,
+    prefix_entries: Vec<(u32, MetadataDocIndex)>,
+}
+
+pub(super) enum MetadataLocalCandidateIndex {
+    Adaptive {
+        template: MetadataTemplateCandidateIndex,
+        content: MetadataContentCandidateIndex,
+    },
+    #[cfg(test)]
+    ContentOnly(MetadataContentCandidateIndex),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MetadataLocalCandidateBasis {
+    Template,
+    Content,
 }
 
 #[derive(Default)]
@@ -61,6 +88,7 @@ struct CompactMetadataContentGroupBuilder {
     atoms: Vec<MetadataContentAtom>,
     token_key_bytes: usize,
     term_count: usize,
+    template_candidate_term_count: usize,
     member_count: usize,
     fallback_group_count: usize,
     fallback_member_count: usize,
@@ -86,8 +114,8 @@ pub(super) enum MetadataContentScope {
 #[derive(Debug)]
 pub(crate) struct InternedMetadataIndex {
     doc_count: usize,
-    pub(super) total_docs: usize,
     pub(super) scoring: CompactMetadataScoring,
+    #[cfg(test)]
     pub(super) postings: CompactMetadataPostings,
     #[cfg(test)]
     pub(super) token_ids: HashMap<String, usize>,
@@ -101,26 +129,31 @@ pub(super) struct MetadataCandidateScratch {
     pub(super) candidates: Vec<MetadataDocIndex>,
 }
 
+#[cfg(test)]
 pub(super) struct MetadataCandidateScratchPool {
     pub(super) doc_count: usize,
     scratches: Mutex<Vec<MetadataCandidateScratch>>,
 }
 
+#[cfg(test)]
 pub(super) struct MetadataCandidateScratchLease<'a> {
     pool: &'a MetadataCandidateScratchPool,
     scratch: Option<MetadataCandidateScratch>,
 }
 
+#[cfg(test)]
 pub(super) struct MetadataPairScoringContext<'a> {
     pub(super) postings: &'a CompactMetadataPostings,
     pub(super) scoring: &'a CompactMetadataScoring,
 }
 
+#[cfg(test)]
 struct MetadataHitPermits {
     remaining: AtomicUsize,
     exceeded: AtomicBool,
 }
 
+#[cfg(test)]
 impl MetadataHitPermits {
     fn new(remaining: usize) -> Self {
         Self {
@@ -154,10 +187,17 @@ impl MetadataHitPermits {
 
 pub(super) struct MetadataContentUnionContext<'a> {
     pub(super) data: &'a MetadataData,
-    pub(super) template_matches: &'a MetadataTemplateMatches,
+    pub(super) template_compatibility: MetadataTemplateCompatibility<'a>,
     pub(super) contract_tokens: &'a CompactContractTokens,
     pub(super) chain_count: usize,
     pub(super) pool: &'a rayon::ThreadPool,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum MetadataTemplateCompatibility<'a> {
+    Scored(&'a CompactMetadataScoring),
+    #[cfg(test)]
+    Precomputed(&'a MetadataTemplateMatches),
 }
 
 pub(super) struct MetadataUnionState {
@@ -171,6 +211,9 @@ pub(super) struct MetadataContentUnionStats {
     pub(super) atom_count: usize,
     pub(super) candidate_pairs: u64,
     pub(super) scored_pairs: u64,
+    pub(super) template_candidate_pairs: u64,
+    pub(super) template_scored_pairs: u64,
+    pub(super) template_matched_pairs: u64,
 }
 
 impl MetadataContentUnionStats {
@@ -178,6 +221,145 @@ impl MetadataContentUnionStats {
         self.atom_count = self.atom_count.saturating_add(other.atom_count);
         self.candidate_pairs = self.candidate_pairs.saturating_add(other.candidate_pairs);
         self.scored_pairs = self.scored_pairs.saturating_add(other.scored_pairs);
+        self.template_candidate_pairs = self
+            .template_candidate_pairs
+            .saturating_add(other.template_candidate_pairs);
+        self.template_scored_pairs = self
+            .template_scored_pairs
+            .saturating_add(other.template_scored_pairs);
+        self.template_matched_pairs = self
+            .template_matched_pairs
+            .saturating_add(other.template_matched_pairs);
+    }
+
+    fn accumulate_pair_scoring(&mut self, other: MetadataPairScoringStats) {
+        self.scored_pairs = self.scored_pairs.saturating_add(other.content_scored_pairs);
+        self.template_candidate_pairs = self
+            .template_candidate_pairs
+            .saturating_add(other.template_candidate_pairs);
+        self.template_scored_pairs = self
+            .template_scored_pairs
+            .saturating_add(other.template_scored_pairs);
+        self.template_matched_pairs = self
+            .template_matched_pairs
+            .saturating_add(other.template_matched_pairs);
+    }
+}
+
+impl<'a> MetadataTemplateCompatibility<'a> {
+    pub(super) fn evaluate(self, left: MetadataDocIndex, right: MetadataDocIndex) -> (bool, u64) {
+        if left == right {
+            return (true, 0);
+        }
+        match self {
+            Self::Scored(scoring) => {
+                let left = metadata_doc_index_to_usize(left);
+                let right = metadata_doc_index_to_usize(right);
+                if scoring.score(left, right) >= METADATA_THRESHOLD {
+                    (true, 1)
+                } else {
+                    (scoring.score(right, left) >= METADATA_THRESHOLD, 2)
+                }
+            }
+            #[cfg(test)]
+            Self::Precomputed(matches) => (
+                matches.matches(
+                    metadata_doc_index_to_usize(left),
+                    metadata_doc_index_to_usize(right),
+                ),
+                0,
+            ),
+        }
+    }
+
+    fn scoring(self) -> Option<&'a CompactMetadataScoring> {
+        match self {
+            Self::Scored(scoring) => Some(scoring),
+            #[cfg(test)]
+            Self::Precomputed(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn matches(
+        self,
+        left: MetadataDocIndex,
+        right: MetadataDocIndex,
+        stats: &mut MetadataContentUnionStats,
+    ) -> bool {
+        let (matched, scored) = self.evaluate(left, right);
+        stats.template_candidate_pairs = stats.template_candidate_pairs.saturating_add(1);
+        stats.template_scored_pairs = stats.template_scored_pairs.saturating_add(scored);
+        if matched {
+            stats.template_matched_pairs = stats.template_matched_pairs.saturating_add(1);
+        }
+        matched
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MetadataTemplateScoreCacheEntry {
+    key: u64,
+    matched: bool,
+    valid: bool,
+}
+
+impl MetadataTemplateScoreCacheEntry {
+    const EMPTY: Self = Self {
+        key: 0,
+        matched: false,
+        valid: false,
+    };
+}
+
+pub(super) struct MetadataTemplateScoreCache {
+    entries: [MetadataTemplateScoreCacheEntry; METADATA_TEMPLATE_SCORE_CACHE_SLOTS],
+}
+
+impl Default for MetadataTemplateScoreCache {
+    fn default() -> Self {
+        Self {
+            entries: [MetadataTemplateScoreCacheEntry::EMPTY; METADATA_TEMPLATE_SCORE_CACHE_SLOTS],
+        }
+    }
+}
+
+impl MetadataTemplateScoreCache {
+    fn slot(key: u64) -> usize {
+        debug_assert!(METADATA_TEMPLATE_SCORE_CACHE_SLOTS.is_power_of_two());
+        let mixed = key
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            .wrapping_add(key.rotate_right(29));
+        mixed as usize & (METADATA_TEMPLATE_SCORE_CACHE_SLOTS - 1)
+    }
+
+    pub(super) fn evaluate(
+        &mut self,
+        left: MetadataDocIndex,
+        right: MetadataDocIndex,
+        compatibility: MetadataTemplateCompatibility<'_>,
+    ) -> (bool, u64) {
+        if left == right {
+            return (true, 0);
+        }
+        let (left, right) = if left < right {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        let key = (u64::from(left) << 32) | u64::from(right);
+        let slot = Self::slot(key);
+        let cached = self.entries[slot];
+        if cached.valid && cached.key == key {
+            return (cached.matched, 0);
+        }
+        let (matched, scores) = compatibility.evaluate(left, right);
+        self.entries[slot] = MetadataTemplateScoreCacheEntry {
+            key,
+            matched,
+            valid: true,
+        };
+        (matched, scores)
     }
 }
 
@@ -203,7 +385,7 @@ impl CompactMetadataContentGroupBuilder {
         ))
         .saturating_add(Self::vec_bytes_upper(
             self.term_count,
-            std::mem::size_of::<(u32, usize)>(),
+            std::mem::size_of::<(u32, u32)>(),
         ))
         .saturating_add(Self::vec_bytes_upper(
             self.member_count,
@@ -248,20 +430,46 @@ impl CompactMetadataContentGroupBuilder {
             ))
     }
 
-    fn scoring_peak_bytes(&self) -> usize {
+    fn scoring_peak_bytes(&self, scoring_workers: usize) -> usize {
         if self.atoms.is_empty() {
             return 0;
         }
-        let candidate_index = Self::vec_bytes_upper(
-            self.term_count,
-            std::mem::size_of::<(u32, MetadataDocIndex, MetadataDocIndex)>(),
-        );
-        let candidate_scratch = self.atoms.len().saturating_mul(
-            std::mem::size_of::<u16>().saturating_add(2 * std::mem::size_of::<MetadataDocIndex>()),
-        );
-        let pair_batches = METADATA_CONTENT_SCORE_BATCH_PAIRS
+        let candidate_entry_bytes = std::mem::size_of::<(u32, MetadataDocIndex)>();
+        let content_candidate_index = Self::vec_bytes_upper(self.term_count, candidate_entry_bytes);
+        let template_candidate_index =
+            Self::vec_bytes_upper(self.template_candidate_term_count, candidate_entry_bytes)
+                .saturating_add(4usize.saturating_mul(candidate_entry_bytes));
+        let uses_adaptive_index = self.atoms.len() > METADATA_DIRECT_ATOM_GROUP_SIZE;
+        let candidate_index = if uses_adaptive_index {
+            content_candidate_index.saturating_add(template_candidate_index)
+        } else {
+            0
+        };
+        let candidate_scratch = if uses_adaptive_index {
+            self.atoms.len().saturating_mul(
+                std::mem::size_of::<u16>()
+                    .saturating_add(2 * std::mem::size_of::<MetadataDocIndex>()),
+            )
+        } else {
+            0
+        };
+        let pair_batch_capacity = if uses_adaptive_index {
+            METADATA_CONTENT_SCORE_BATCH_PAIRS
+        } else {
+            usize::from(self.atoms.len() == METADATA_DIRECT_ATOM_GROUP_SIZE)
+        };
+        let pair_batches = pair_batch_capacity
             .saturating_mul(std::mem::size_of::<(usize, MetadataDocIndex)>())
             .saturating_mul(2);
+        // A parallel fold and its reduce-side accumulator can coexist for
+        // every worker, so reserve both fixed-size template caches.
+        let template_cache_count = if uses_adaptive_index {
+            scoring_workers.max(1).saturating_mul(2)
+        } else {
+            pair_batch_capacity
+        };
+        let template_score_caches =
+            template_cache_count.saturating_mul(std::mem::size_of::<MetadataTemplateScoreCache>());
         let union_scratch = self.member_count.saturating_mul(
             2usize
                 .saturating_mul(std::mem::size_of::<usize>())
@@ -272,6 +480,7 @@ impl CompactMetadataContentGroupBuilder {
             .saturating_add(candidate_index)
             .saturating_add(candidate_scratch)
             .saturating_add(pair_batches)
+            .saturating_add(template_score_caches)
             .saturating_add(union_scratch);
         peak.saturating_add(peak.saturating_div(4))
     }
@@ -280,11 +489,12 @@ impl CompactMetadataContentGroupBuilder {
         &self,
         raw_parse_reserve_bytes: usize,
         maximum_bytes: usize,
+        scoring_workers: usize,
     ) -> Result<(), AnalysisError> {
         let build_peak = self
             .builder_memory_bytes()
             .saturating_add(raw_parse_reserve_bytes);
-        let peak = build_peak.max(self.scoring_peak_bytes());
+        let peak = build_peak.max(self.scoring_peak_bytes(scoring_workers));
         if peak > maximum_bytes {
             return Err(AnalysisError::InvalidData(format!(
                 "metadata content working set needs about {}, exceeding remaining analysis budget {}",
@@ -303,7 +513,7 @@ impl CompactMetadataContentGroupBuilder {
         contract_tokens: Option<&CompactContractTokens>,
     ) {
         let mut terms = Vec::with_capacity(document.unique_len());
-        for token in &document.unique_tokens {
+        for (token, term_frequency) in document.terms() {
             let token_id = if let Some(&token_id) = self.token_ids.get(token.as_str()) {
                 token_id
             } else {
@@ -314,12 +524,11 @@ impl CompactMetadataContentGroupBuilder {
                 self.token_ids.insert(token, token_id);
                 token_id
             };
-            let term_frequency = document
-                .term_freqs
-                .get(token)
-                .copied()
-                .expect("unique metadata token must have a term frequency");
-            terms.push((token_id, term_frequency));
+            terms.push((
+                token_id,
+                u32::try_from(*term_frequency)
+                    .expect("metadata content term frequency exceeds u32"),
+            ));
         }
         terms.sort_unstable_by_key(|(token_id, _)| *token_id);
         self.member_count = self.member_count.saturating_add(1);
@@ -362,6 +571,21 @@ impl CompactMetadataContentGroupBuilder {
                 members: vec![contract_index],
                 fallback_token_groups: Vec::new(),
             });
+            let template_doc_index = metadata_doc_index_to_usize(contract.template_doc_index);
+            self.template_candidate_term_count = self
+                .template_candidate_term_count
+                .saturating_add(
+                    data.metadata_index
+                        .scoring
+                        .query_tokens(template_doc_index)
+                        .len(),
+                )
+                .saturating_add(
+                    data.metadata_index
+                        .scoring
+                        .candidate_tokens(template_doc_index)
+                        .len(),
+                );
             let previous_atom = self
                 .atom_index_by_hash
                 .insert(atom_hash, atom_index)
@@ -487,7 +711,11 @@ impl MetadataRawTokenGroup {
         if !self.raw_records.is_empty()
             && self
                 .compact
-                .ensure_within_memory_budget(projected_reserve, maximum_bytes)
+                .ensure_within_memory_budget(
+                    projected_reserve,
+                    maximum_bytes,
+                    context.pool.current_num_threads(),
+                )
                 .is_err()
         {
             self.flush_raw(context, maximum_bytes)?;
@@ -496,6 +724,7 @@ impl MetadataRawTokenGroup {
         self.compact.ensure_within_memory_budget(
             self.projected_raw_parse_reserve_bytes(candidate_payload_bytes),
             maximum_bytes,
+            context.pool.current_num_threads(),
         )?;
         self.raw_payload_bytes = self
             .raw_payload_bytes
@@ -548,7 +777,11 @@ impl MetadataRawTokenGroup {
                 }
             }
         }
-        self.compact.ensure_within_memory_budget(0, maximum_bytes)?;
+        self.compact.ensure_within_memory_budget(
+            0,
+            maximum_bytes,
+            context.pool.current_num_threads(),
+        )?;
         Ok(())
     }
 
@@ -573,7 +806,11 @@ impl MetadataRawTokenGroup {
         }
         self.flush_raw(context, maximum_bytes)?;
         drop(self.raw_records);
-        self.compact.ensure_within_memory_budget(0, maximum_bytes)?;
+        self.compact.ensure_within_memory_budget(
+            0,
+            maximum_bytes,
+            context.pool.current_num_threads(),
+        )?;
         let (atoms, docs) = self.compact.into_atomized_parts();
         Ok(union_metadata_shared_token_atom_core(
             atoms, &docs, context, state,
@@ -605,25 +842,14 @@ impl MetadataRawTokenGroup {
     }
 }
 
-#[derive(Debug, Default)]
-pub(super) struct MetadataTemplateScoringStats {
-    pub(super) candidate_pairs: u64,
-    pub(super) scored_pairs: u64,
-    pub(super) matched_pairs: u64,
-}
-
 impl MetadataContentCandidateIndex {
     #[cfg(test)]
-    pub(super) fn new(
-        docs: &[CompactMetadataContentDocument],
-        template_docs: &[MetadataDocIndex],
-    ) -> Self {
-        debug_assert_eq!(docs.len(), template_docs.len());
+    pub(super) fn new(docs: &[CompactMetadataContentDocument]) -> Self {
         let mut entries = Vec::with_capacity(docs.iter().map(|doc| doc.terms.len()).sum());
-        for (record_index, (doc, &template_doc)) in docs.iter().zip(template_docs).enumerate() {
+        for (record_index, doc) in docs.iter().enumerate() {
             let record_index = metadata_doc_index_from_usize(record_index);
             for &(token_id, _) in &doc.terms {
-                entries.push((token_id, template_doc, record_index));
+                entries.push((token_id, record_index));
             }
         }
         entries.sort_unstable();
@@ -642,7 +868,7 @@ impl MetadataContentCandidateIndex {
     fn atom_entries(
         docs: &[CompactMetadataContentDocument],
         atoms: &[MetadataContentAtom],
-    ) -> Vec<(u32, MetadataDocIndex, MetadataDocIndex)> {
+    ) -> Vec<(u32, MetadataDocIndex)> {
         let mut entries = Vec::with_capacity(
             atoms
                 .iter()
@@ -657,7 +883,7 @@ impl MetadataContentCandidateIndex {
             let compact_atom_index = metadata_doc_index_from_usize(atom_index);
             let doc = &docs[metadata_doc_index_to_usize(atom.representative_record_index)];
             for &(token_id, _) in &doc.terms {
-                entries.push((token_id, atom.template_doc_index, compact_atom_index));
+                entries.push((token_id, compact_atom_index));
             }
         }
         entries
@@ -676,38 +902,30 @@ impl MetadataContentCandidateIndex {
         &self,
         record_index: usize,
         document: &CompactMetadataContentDocument,
-        template_doc: MetadataDocIndex,
-        template_matches: &MetadataTemplateMatches,
         scratch: &mut MetadataCandidateScratch,
     ) {
         let compact_record_index = metadata_doc_index_from_usize(record_index);
         for &(token_id, _) in &document.terms {
-            self.append_posting_after(token_id, template_doc, compact_record_index, scratch);
-            for &compatible_doc in template_matches.compatible_docs(template_doc) {
-                self.append_posting_after(token_id, compatible_doc, compact_record_index, scratch);
-            }
+            append_flat_candidate_posting_after(
+                &self.entries,
+                token_id,
+                compact_record_index,
+                scratch,
+            );
         }
     }
 
-    fn append_posting_after(
+    fn scan_cost_after(
         &self,
-        token_id: u32,
-        template_doc: MetadataDocIndex,
-        record_index: MetadataDocIndex,
-        scratch: &mut MetadataCandidateScratch,
-    ) {
-        let key = (token_id, template_doc);
-        let posting_start = self
-            .entries
-            .partition_point(|&(token, template, _)| (token, template) < key);
-        let posting_end = self
-            .entries
-            .partition_point(|&(token, template, _)| (token, template) <= key);
-        let posting = &self.entries[posting_start..posting_end];
-        let start = posting.partition_point(|&(_, _, right)| right <= record_index);
-        for &(_, _, right) in &posting[start..] {
-            scratch.push_once(right);
-        }
+        record_index: usize,
+        document: &CompactMetadataContentDocument,
+    ) -> usize {
+        let compact_record_index = metadata_doc_index_from_usize(record_index);
+        document.terms.iter().fold(0usize, |cost, &(token_id, _)| {
+            cost.saturating_add(
+                flat_candidate_posting_after(&self.entries, token_id, compact_record_index).len(),
+            )
+        })
     }
 
     #[cfg(test)]
@@ -717,11 +935,216 @@ impl MetadataContentCandidateIndex {
 
     #[cfg(test)]
     pub(super) fn memory_bytes(&self) -> usize {
-        self.entries.capacity().saturating_mul(std::mem::size_of::<(
-            u32,
-            MetadataDocIndex,
-            MetadataDocIndex,
-        )>())
+        self.entries
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(u32, MetadataDocIndex)>())
+    }
+}
+
+fn flat_candidate_posting_after(
+    entries: &[(u32, MetadataDocIndex)],
+    token_id: u32,
+    record_index: MetadataDocIndex,
+) -> &[(u32, MetadataDocIndex)] {
+    let posting_start = entries.partition_point(|&(token, _)| token < token_id);
+    let posting_end = entries.partition_point(|&(token, _)| token <= token_id);
+    let posting = &entries[posting_start..posting_end];
+    let start = posting.partition_point(|&(_, right)| right <= record_index);
+    &posting[start..]
+}
+
+fn append_flat_candidate_posting_after(
+    entries: &[(u32, MetadataDocIndex)],
+    token_id: u32,
+    record_index: MetadataDocIndex,
+    scratch: &mut MetadataCandidateScratch,
+) {
+    for &(_, right) in flat_candidate_posting_after(entries, token_id, record_index) {
+        scratch.push_once(right);
+    }
+}
+
+impl MetadataTemplateCandidateIndex {
+    fn atom_entries(
+        scoring: &CompactMetadataScoring,
+        atoms: &[MetadataContentAtom],
+        prefix: bool,
+    ) -> Vec<(u32, MetadataDocIndex)> {
+        let token_count = atoms
+            .iter()
+            .map(|atom| {
+                let template = metadata_doc_index_to_usize(atom.template_doc_index);
+                if prefix {
+                    scoring.candidate_tokens(template).len()
+                } else {
+                    scoring.query_tokens(template).len()
+                }
+            })
+            .sum();
+        let mut entries = Vec::with_capacity(token_count);
+        for (atom_index, atom) in atoms.iter().enumerate() {
+            let atom_index = metadata_doc_index_from_usize(atom_index);
+            let template = metadata_doc_index_to_usize(atom.template_doc_index);
+            let tokens = if prefix {
+                scoring.candidate_tokens(template)
+            } else {
+                scoring.query_tokens(template)
+            };
+            entries.extend(tokens.iter().map(|&token| (token, atom_index)));
+        }
+        entries
+    }
+
+    pub(super) fn from_atoms(
+        scoring: &CompactMetadataScoring,
+        atoms: &[MetadataContentAtom],
+    ) -> Self {
+        let mut full_entries = Self::atom_entries(scoring, atoms, false);
+        let mut prefix_entries = Self::atom_entries(scoring, atoms, true);
+        full_entries.sort_unstable();
+        prefix_entries.sort_unstable();
+        Self {
+            full_entries,
+            prefix_entries,
+        }
+    }
+
+    pub(super) fn from_atoms_parallel(
+        scoring: &CompactMetadataScoring,
+        atoms: &[MetadataContentAtom],
+    ) -> Self {
+        let mut full_entries = Self::atom_entries(scoring, atoms, false);
+        let mut prefix_entries = Self::atom_entries(scoring, atoms, true);
+        rayon::join(
+            || full_entries.par_sort_unstable(),
+            || prefix_entries.par_sort_unstable(),
+        );
+        Self {
+            full_entries,
+            prefix_entries,
+        }
+    }
+
+    pub(super) fn append_candidates_after(
+        &self,
+        atom_index: usize,
+        atom: &MetadataContentAtom,
+        scoring: &CompactMetadataScoring,
+        scratch: &mut MetadataCandidateScratch,
+    ) {
+        let compact_atom_index = metadata_doc_index_from_usize(atom_index);
+        let template = metadata_doc_index_to_usize(atom.template_doc_index);
+        for &token in scoring.candidate_tokens(template) {
+            append_flat_candidate_posting_after(
+                &self.full_entries,
+                token,
+                compact_atom_index,
+                scratch,
+            );
+        }
+        for &token in scoring.query_tokens(template) {
+            append_flat_candidate_posting_after(
+                &self.prefix_entries,
+                token,
+                compact_atom_index,
+                scratch,
+            );
+        }
+    }
+
+    fn scan_cost_after(
+        &self,
+        atom_index: usize,
+        atom: &MetadataContentAtom,
+        scoring: &CompactMetadataScoring,
+    ) -> usize {
+        let compact_atom_index = metadata_doc_index_from_usize(atom_index);
+        let template = metadata_doc_index_to_usize(atom.template_doc_index);
+        let prefix_to_full =
+            scoring
+                .candidate_tokens(template)
+                .iter()
+                .fold(0usize, |cost, &token| {
+                    cost.saturating_add(
+                        flat_candidate_posting_after(&self.full_entries, token, compact_atom_index)
+                            .len(),
+                    )
+                });
+        scoring
+            .query_tokens(template)
+            .iter()
+            .fold(prefix_to_full, |cost, &token| {
+                cost.saturating_add(
+                    flat_candidate_posting_after(&self.prefix_entries, token, compact_atom_index)
+                        .len(),
+                )
+            })
+    }
+}
+
+impl MetadataLocalCandidateIndex {
+    pub(super) fn from_atoms(
+        docs: &[CompactMetadataContentDocument],
+        atoms: &[MetadataContentAtom],
+        compatibility: MetadataTemplateCompatibility<'_>,
+        parallel: bool,
+    ) -> Self {
+        match compatibility {
+            MetadataTemplateCompatibility::Scored(scoring) => {
+                let (template, content) = if parallel {
+                    rayon::join(
+                        || MetadataTemplateCandidateIndex::from_atoms_parallel(scoring, atoms),
+                        || MetadataContentCandidateIndex::from_atoms_parallel(docs, atoms),
+                    )
+                } else {
+                    (
+                        MetadataTemplateCandidateIndex::from_atoms(scoring, atoms),
+                        MetadataContentCandidateIndex::from_atoms(docs, atoms),
+                    )
+                };
+                Self::Adaptive { template, content }
+            }
+            #[cfg(test)]
+            MetadataTemplateCompatibility::Precomputed(_) => {
+                let index = if parallel {
+                    MetadataContentCandidateIndex::from_atoms_parallel(docs, atoms)
+                } else {
+                    MetadataContentCandidateIndex::from_atoms(docs, atoms)
+                };
+                Self::ContentOnly(index)
+            }
+        }
+    }
+
+    pub(super) fn append_candidates_after(
+        &self,
+        atom_index: usize,
+        atom: &MetadataContentAtom,
+        document: &CompactMetadataContentDocument,
+        compatibility: MetadataTemplateCompatibility<'_>,
+        scratch: &mut MetadataCandidateScratch,
+    ) -> MetadataLocalCandidateBasis {
+        match self {
+            Self::Adaptive { template, content } => {
+                let scoring = compatibility
+                    .scoring()
+                    .expect("template candidate index requires scored compatibility");
+                let template_cost = template.scan_cost_after(atom_index, atom, scoring);
+                let content_cost = content.scan_cost_after(atom_index, document);
+                if content_cost < template_cost {
+                    content.append_candidates_after(atom_index, document, scratch);
+                    MetadataLocalCandidateBasis::Content
+                } else {
+                    template.append_candidates_after(atom_index, atom, scoring, scratch);
+                    MetadataLocalCandidateBasis::Template
+                }
+            }
+            #[cfg(test)]
+            Self::ContentOnly(index) => {
+                index.append_candidates_after(atom_index, document, scratch);
+                MetadataLocalCandidateBasis::Content
+            }
+        }
     }
 }
 
@@ -753,6 +1176,7 @@ impl MetadataCandidateScratch {
     }
 }
 
+#[cfg(test)]
 impl MetadataCandidateScratchPool {
     pub(super) fn new(doc_count: usize) -> Self {
         Self {
@@ -775,6 +1199,7 @@ impl MetadataCandidateScratchPool {
     }
 }
 
+#[cfg(test)]
 impl std::ops::Deref for MetadataCandidateScratchLease<'_> {
     type Target = MetadataCandidateScratch;
 
@@ -785,6 +1210,7 @@ impl std::ops::Deref for MetadataCandidateScratchLease<'_> {
     }
 }
 
+#[cfg(test)]
 impl std::ops::DerefMut for MetadataCandidateScratchLease<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.scratch
@@ -793,6 +1219,7 @@ impl std::ops::DerefMut for MetadataCandidateScratchLease<'_> {
     }
 }
 
+#[cfg(test)]
 impl Drop for MetadataCandidateScratchLease<'_> {
     fn drop(&mut self) {
         let Some(scratch) = self.scratch.take() else {
@@ -804,82 +1231,6 @@ impl Drop for MetadataCandidateScratchLease<'_> {
             .expect("metadata candidate scratch pool lock poisoned")
             .push(scratch);
     }
-}
-
-pub(super) fn collect_metadata_template_matches(
-    data: &MetadataData,
-    progress: &ProgressTracker,
-    max_match_pairs: u64,
-) -> Result<(MetadataTemplateMatches, MetadataTemplateScoringStats), AnalysisError> {
-    let index = &data.metadata_index;
-    if index.total_docs == 0 {
-        return Ok((
-            MetadataTemplateMatches::default(),
-            MetadataTemplateScoringStats::default(),
-        ));
-    }
-    let scoring_left_count = index.doc_count();
-    let mut scored_candidate_pairs = 0u64;
-    let mut scored_left_docs = 0usize;
-    let mut matched_doc_pairs = 0u64;
-    let mut matched_docs = Vec::new();
-    let progress_start = Instant::now();
-    let scratch_pool = MetadataCandidateScratchPool::new(index.doc_count());
-    progress.add_work(metadata_scoring_progress_units(scoring_left_count));
-    progress.set_message(metadata_pair_progress_message(
-        scored_candidate_pairs,
-        scored_left_docs,
-        scoring_left_count,
-        matched_doc_pairs,
-        progress_start.elapsed(),
-    ));
-    let mut left_start = 0usize;
-    while left_start < scoring_left_count {
-        let remaining_match_pairs = max_match_pairs.saturating_sub(matched_doc_pairs);
-        let left_chunk_size =
-            metadata_pair_left_chunk_size(scoring_left_count, remaining_match_pairs);
-        let left_end = left_start
-            .saturating_add(left_chunk_size)
-            .min(scoring_left_count);
-        let batch = collect_metadata_doc_pair_hits_for_left_range_bounded(
-            left_start..left_end,
-            MetadataPairScoringContext {
-                postings: &index.postings,
-                scoring: &index.scoring,
-            },
-            &scratch_pool,
-            usize::try_from(remaining_match_pairs).unwrap_or(usize::MAX),
-        )
-        .map_err(|_| {
-            AnalysisError::InvalidData(format!(
-                "metadata template matches exceed the analysis-memory pair budget ({max_match_pairs})"
-            ))
-        })?;
-        scored_candidate_pairs = scored_candidate_pairs.saturating_add(batch.candidate_pairs);
-        scored_left_docs = left_end;
-        matched_doc_pairs = matched_doc_pairs.saturating_add(batch.hits.len() as u64);
-        debug_assert!(matched_doc_pairs <= max_match_pairs);
-        progress.inc(metadata_scoring_batch_progress_units(left_start, left_end));
-        progress.set_message(metadata_pair_progress_message(
-            scored_candidate_pairs,
-            scored_left_docs,
-            scoring_left_count,
-            matched_doc_pairs,
-            progress_start.elapsed(),
-        ));
-        matched_docs.extend(batch.hits);
-        left_start = left_end;
-    }
-    matched_docs.sort_unstable();
-    matched_docs.dedup();
-    Ok((
-        MetadataTemplateMatches::from_pairs(scoring_left_count, matched_docs),
-        MetadataTemplateScoringStats {
-            candidate_pairs: scored_candidate_pairs,
-            scored_pairs: scored_candidate_pairs,
-            matched_pairs: matched_doc_pairs,
-        },
-    ))
 }
 
 pub(super) fn lowest_common_metadata_token(left: &[u32], right: &[u32]) -> Option<u32> {
@@ -967,7 +1318,8 @@ pub(super) fn metadata_content_document<'a>(
         .and_then(|cached| cached.content.as_deref())
         .map(Cow::Borrowed)
         .or_else(|| {
-            MetadataBm25Document::from_text(&metadata_document_from_json(raw)).map(Cow::Owned)
+            MetadataBm25Document::from_normalized_text(&metadata_document_from_json(raw))
+                .map(Cow::Owned)
         })
 }
 
@@ -985,10 +1337,18 @@ pub(super) fn union_metadata_representative_content_fallback(
                 context.data,
                 Some(context.contract_tokens),
             );
-            builder.ensure_within_memory_budget(0, maximum_working_bytes)?;
+            builder.ensure_within_memory_budget(
+                0,
+                maximum_working_bytes,
+                context.pool.current_num_threads(),
+            )?;
         }
     }
-    builder.ensure_within_memory_budget(0, maximum_working_bytes)?;
+    builder.ensure_within_memory_budget(
+        0,
+        maximum_working_bytes,
+        context.pool.current_num_threads(),
+    )?;
     let (atoms, docs) = builder.into_atomized_parts();
     Ok(union_metadata_no_common_atom_core(
         atoms, &docs, context, state,
@@ -1022,44 +1382,21 @@ pub(super) fn apply_metadata_contract_pair_union(
     }
 }
 
-pub(super) fn apply_metadata_complete_match_group_union(
+pub(super) fn apply_metadata_same_chain_group_union(
     data: &MetadataData,
     chain_count: usize,
     state: &mut MetadataUnionState,
     members: &[MetadataContractIndex],
 ) {
-    if members.len() < 2 {
+    let Some((&anchor, rest)) = members.split_first() else {
         return;
-    }
-    let mut members_by_chain = vec![Vec::<usize>::new(); chain_count];
-    for &member in members {
+    };
+    let anchor = metadata_contract_index_to_usize(anchor);
+    let anchor_chain = data.contracts[anchor].chain_index;
+    for &member in rest {
         let member = metadata_contract_index_to_usize(member);
-        members_by_chain[data.contracts[member].chain_index].push(member);
-    }
-    for chain_members in &members_by_chain {
-        let Some((&anchor, rest)) = chain_members.split_first() else {
-            continue;
-        };
-        for &member in rest {
-            apply_metadata_contract_pair_union(data, chain_count, state, anchor, member);
-        }
-    }
-    for left_chain in 0..chain_count {
-        let Some((&left_anchor, left_rest)) = members_by_chain[left_chain].split_first() else {
-            continue;
-        };
-        for right_members in members_by_chain.iter().skip(left_chain + 1) {
-            let Some((&right_anchor, right_rest)) = right_members.split_first() else {
-                continue;
-            };
-            apply_metadata_contract_pair_union(data, chain_count, state, left_anchor, right_anchor);
-            for &right in right_rest {
-                apply_metadata_contract_pair_union(data, chain_count, state, left_anchor, right);
-            }
-            for &left in left_rest {
-                apply_metadata_contract_pair_union(data, chain_count, state, left, right_anchor);
-            }
-        }
+        debug_assert_eq!(data.contracts[member].chain_index, anchor_chain);
+        apply_metadata_contract_pair_union(data, chain_count, state, anchor, member);
     }
 }
 
@@ -1103,6 +1440,34 @@ pub(super) fn apply_metadata_complete_bipartite_group_union(
     }
 }
 
+pub(super) fn apply_metadata_atom_pair_union(
+    data: &MetadataData,
+    chain_count: usize,
+    state: &mut MetadataUnionState,
+    left: &MetadataContentAtom,
+    right: &MetadataContentAtom,
+) {
+    debug_assert!(!left.members.is_empty());
+    debug_assert!(!right.members.is_empty());
+    if left.chain_index == right.chain_index {
+        apply_metadata_contract_pair_union(
+            data,
+            chain_count,
+            state,
+            metadata_contract_index_to_usize(left.members[0]),
+            metadata_contract_index_to_usize(right.members[0]),
+        );
+    } else {
+        apply_metadata_complete_bipartite_group_union(
+            data,
+            chain_count,
+            state,
+            &left.members,
+            &right.members,
+        );
+    }
+}
+
 pub(super) fn metadata_fallback_token_group_tokens<'a>(
     group: &MetadataFallbackTokenGroup,
     contract_tokens: &'a CompactContractTokens,
@@ -1130,7 +1495,7 @@ pub(super) fn apply_metadata_fallback_atom_internal_unions(
 ) {
     for group in &atom.fallback_token_groups {
         if metadata_fallback_token_group_tokens(group, context.contract_tokens).is_empty() {
-            apply_metadata_complete_match_group_union(
+            apply_metadata_same_chain_group_union(
                 context.data,
                 context.chain_count,
                 state,
@@ -1235,27 +1600,32 @@ pub(super) fn apply_metadata_fallback_atom_pair_union(
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct MetadataDocPairBatch {
     pub(super) hits: Vec<MetadataDocPair>,
     pub(super) candidate_pairs: u64,
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct MetadataHitLimitExceeded {
     pub(super) retained_hits: usize,
 }
 
+#[cfg(test)]
 pub(super) fn metadata_scoring_progress_units(scoring_left_count: usize) -> u64 {
     scoring_left_count as u64
 }
 
+#[cfg(test)]
 pub(super) fn metadata_pair_left_chunk_size(doc_count: usize, max_match_pairs: u64) -> usize {
     let doc_count = u64::try_from(doc_count.max(1)).unwrap_or(u64::MAX);
     let budgeted_chunk = max_match_pairs / doc_count;
     budgeted_chunk.clamp(1, METADATA_PAIR_LEFT_CHUNK_SIZE as u64) as usize
 }
 
+#[cfg(test)]
 pub(super) fn metadata_template_match_pair_budget(available_bytes: usize, doc_count: usize) -> u64 {
     let fixed_offsets_and_cursors = doc_count.saturating_mul(2 * std::mem::size_of::<u64>());
     let pairs = available_bytes
@@ -1268,10 +1638,12 @@ pub(super) fn metadata_template_match_pair_budget(available_bytes: usize, doc_co
     u64::try_from(pairs).unwrap_or(u64::MAX)
 }
 
+#[cfg(test)]
 pub(super) fn metadata_scoring_batch_progress_units(left_start: usize, left_end: usize) -> u64 {
     left_end.saturating_sub(left_start) as u64
 }
 
+#[cfg(test)]
 pub(super) fn metadata_pair_progress_message(
     scored_pairs: u64,
     scored_left_docs: usize,
@@ -1292,6 +1664,7 @@ pub(super) fn metadata_pair_progress_message(
     )
 }
 
+#[cfg(test)]
 pub(super) fn estimate_remaining_metadata_candidate_pairs(
     scored_pairs: u64,
     scored_left_docs: usize,
@@ -1306,6 +1679,7 @@ pub(super) fn estimate_remaining_metadata_candidate_pairs(
     estimated.min(u64::MAX as u128) as u64
 }
 
+#[cfg(test)]
 pub(super) fn format_metadata_pair_throughput(scored_pairs: u64, elapsed: Duration) -> String {
     let Some(pairs_per_second) = metadata_pairs_per_second(scored_pairs, elapsed) else {
         return "n/a".to_string();
@@ -1313,6 +1687,7 @@ pub(super) fn format_metadata_pair_throughput(scored_pairs: u64, elapsed: Durati
     format!("{pairs_per_second:.1} pairs/s")
 }
 
+#[cfg(test)]
 pub(super) fn format_metadata_pair_eta(
     remaining_pairs: u64,
     scored_pairs: u64,
@@ -1332,6 +1707,7 @@ pub(super) fn format_metadata_pair_eta(
     ))
 }
 
+#[cfg(test)]
 pub(super) fn metadata_pairs_per_second(scored_pairs: u64, elapsed: Duration) -> Option<f64> {
     if scored_pairs == 0 {
         return None;
@@ -1343,6 +1719,7 @@ pub(super) fn metadata_pairs_per_second(scored_pairs: u64, elapsed: Duration) ->
     Some(scored_pairs as f64 / elapsed_seconds)
 }
 
+#[cfg(test)]
 pub(super) fn format_metadata_duration(duration: Duration) -> String {
     let seconds = duration.as_secs();
     if seconds < 60 {
@@ -1373,6 +1750,7 @@ pub(super) fn collect_metadata_doc_pair_hits_for_left_range(
     .expect("an unbounded metadata hit collector cannot exhaust pair permits")
 }
 
+#[cfg(test)]
 pub(super) fn collect_metadata_doc_pair_hits_for_left_range_bounded(
     left_range: std::ops::Range<usize>,
     context: MetadataPairScoringContext<'_>,
@@ -1431,6 +1809,7 @@ pub(super) fn collect_metadata_doc_pair_hits_for_left_with_scratch(
     collect_metadata_doc_pair_hits_for_left_with_scratch_bounded(left, context, scratch, hits, None)
 }
 
+#[cfg(test)]
 fn collect_metadata_doc_pair_hits_for_left_with_scratch_bounded(
     left: usize,
     context: &MetadataPairScoringContext<'_>,
@@ -1456,6 +1835,7 @@ fn collect_metadata_doc_pair_hits_for_left_with_scratch_bounded(
     scored_candidates
 }
 
+#[cfg(test)]
 pub(super) fn metadata_candidate_indices_for_left_with_scratch<'a>(
     left: usize,
     context: &MetadataPairScoringContext<'_>,
@@ -1474,6 +1854,7 @@ pub(super) fn metadata_candidate_indices_for_left_with_scratch<'a>(
     &scratch.candidates
 }
 
+#[cfg(test)]
 pub(super) fn append_metadata_posting_except(
     posting: &[MetadataDocIndex],
     excluded: MetadataDocIndex,
@@ -1486,6 +1867,7 @@ pub(super) fn append_metadata_posting_except(
     }
 }
 
+#[cfg(test)]
 pub(super) fn ordered_metadata_doc_pair(left: usize, right: usize) -> MetadataDocPair {
     let left = metadata_doc_index_from_usize(left);
     let right = metadata_doc_index_from_usize(right);
@@ -1523,7 +1905,7 @@ fn build_metadata_content_atoms_core(
     mut contract_index_at: impl FnMut(usize) -> MetadataContractIndex,
 ) -> Vec<MetadataContentAtom> {
     debug_assert_eq!(record_count, compact_docs.len());
-    let mut atom_index_by_key = HashMap::<(usize, MetadataDocIndex, &[(u32, usize)]), usize>::new();
+    let mut atom_index_by_key = HashMap::<(usize, MetadataDocIndex, &[(u32, u32)]), usize>::new();
     let mut atoms = Vec::<MetadataContentAtom>::new();
     for (record_index, document) in compact_docs.iter().enumerate() {
         let compact_contract_index = contract_index_at(record_index);
@@ -1558,7 +1940,7 @@ pub(super) fn build_metadata_fallback_atoms(
     data: &MetadataData,
     contract_tokens: &CompactContractTokens,
 ) -> Vec<MetadataContentAtom> {
-    let mut atom_index_by_key = HashMap::<(usize, MetadataDocIndex, &[(u32, usize)]), usize>::new();
+    let mut atom_index_by_key = HashMap::<(usize, MetadataDocIndex, &[(u32, u32)]), usize>::new();
     let mut token_group_index_by_atom = Vec::<HashMap<&[u32], usize>>::new();
     let mut atoms = Vec::<MetadataContentAtom>::new();
     for (record_index, record) in records.iter().enumerate() {
@@ -1621,6 +2003,70 @@ pub(super) fn metadata_content_atom_pair_matches(
     )
 }
 
+fn metadata_content_atoms_share_token(
+    left: usize,
+    right: MetadataDocIndex,
+    atoms: &[MetadataContentAtom],
+    compact_docs: &[CompactMetadataContentDocument],
+) -> bool {
+    let left_record = metadata_doc_index_to_usize(atoms[left].representative_record_index);
+    let right_record = metadata_doc_index_to_usize(
+        atoms[metadata_doc_index_to_usize(right)].representative_record_index,
+    );
+    compact_metadata_content_docs_share_token(
+        &compact_docs[left_record],
+        &compact_docs[right_record],
+    )
+}
+
+fn metadata_prefix_intersects_sorted_terms(prefix: &[u32], terms: &[u32]) -> bool {
+    prefix
+        .iter()
+        .any(|token| terms.binary_search(token).is_ok())
+}
+
+fn metadata_template_atoms_share_safe_prefix(
+    left: usize,
+    right: MetadataDocIndex,
+    atoms: &[MetadataContentAtom],
+    compatibility: MetadataTemplateCompatibility<'_>,
+) -> bool {
+    let Some(scoring) = compatibility.scoring() else {
+        // Test-only precomputed compatibility performs the exact lookup in the
+        // scoring batch and has no compact prefix arrays.
+        return true;
+    };
+    let left_template = metadata_doc_index_to_usize(atoms[left].template_doc_index);
+    let right_template =
+        metadata_doc_index_to_usize(atoms[metadata_doc_index_to_usize(right)].template_doc_index);
+    metadata_prefix_intersects_sorted_terms(
+        scoring.candidate_tokens(left_template),
+        scoring.query_tokens(right_template),
+    ) || metadata_prefix_intersects_sorted_terms(
+        scoring.candidate_tokens(right_template),
+        scoring.query_tokens(left_template),
+    )
+}
+
+fn metadata_candidate_intersects_both_dimensions(
+    basis: MetadataLocalCandidateBasis,
+    left: usize,
+    right: MetadataDocIndex,
+    atoms: &[MetadataContentAtom],
+    compact_docs: &[CompactMetadataContentDocument],
+    compatibility: MetadataTemplateCompatibility<'_>,
+) -> bool {
+    match basis {
+        MetadataLocalCandidateBasis::Template => {
+            metadata_content_atoms_share_token(left, right, atoms, compact_docs)
+        }
+        MetadataLocalCandidateBasis::Content => {
+            metadata_template_atoms_share_safe_prefix(left, right, atoms, compatibility)
+        }
+    }
+}
+
+#[cfg(test)]
 pub(super) fn collect_metadata_content_atom_pair_hits(
     candidate_pairs: &[(usize, MetadataDocIndex)],
     atoms: &[MetadataContentAtom],
@@ -1644,34 +2090,132 @@ pub(super) fn collect_metadata_content_atom_pair_hits(
     }
 }
 
+#[derive(Default)]
+pub(super) struct MetadataPairScoringStats {
+    template_candidate_pairs: u64,
+    template_scored_pairs: u64,
+    template_matched_pairs: u64,
+    content_scored_pairs: u64,
+}
+
+#[derive(Default)]
+struct MetadataValidatedPairBatch {
+    hits: Vec<(usize, MetadataDocIndex)>,
+    stats: MetadataPairScoringStats,
+    template_cache: MetadataTemplateScoreCache,
+}
+
+impl MetadataValidatedPairBatch {
+    fn score_pair(
+        &mut self,
+        pair: (usize, MetadataDocIndex),
+        atoms: &[MetadataContentAtom],
+        compact_docs: &[CompactMetadataContentDocument],
+        template_compatibility: MetadataTemplateCompatibility<'_>,
+    ) {
+        let (left, right) = pair;
+        let left_template = atoms[left].template_doc_index;
+        let right_template = atoms[metadata_doc_index_to_usize(right)].template_doc_index;
+        let (template_matches, template_scores) =
+            self.template_cache
+                .evaluate(left_template, right_template, template_compatibility);
+        self.stats.template_candidate_pairs = self.stats.template_candidate_pairs.saturating_add(1);
+        self.stats.template_scored_pairs = self
+            .stats
+            .template_scored_pairs
+            .saturating_add(template_scores);
+        if !template_matches {
+            return;
+        }
+        self.stats.template_matched_pairs = self.stats.template_matched_pairs.saturating_add(1);
+        self.stats.content_scored_pairs = self.stats.content_scored_pairs.saturating_add(1);
+        if metadata_content_atom_pair_matches(pair, atoms, compact_docs) {
+            self.hits.push(pair);
+        }
+    }
+
+    fn merge(mut self, mut other: Self) -> Self {
+        self.hits.append(&mut other.hits);
+        self.stats.template_candidate_pairs = self
+            .stats
+            .template_candidate_pairs
+            .saturating_add(other.stats.template_candidate_pairs);
+        self.stats.template_scored_pairs = self
+            .stats
+            .template_scored_pairs
+            .saturating_add(other.stats.template_scored_pairs);
+        self.stats.template_matched_pairs = self
+            .stats
+            .template_matched_pairs
+            .saturating_add(other.stats.template_matched_pairs);
+        self.stats.content_scored_pairs = self
+            .stats
+            .content_scored_pairs
+            .saturating_add(other.stats.content_scored_pairs);
+        self
+    }
+}
+
+fn collect_metadata_validated_atom_pair_hits(
+    candidate_pairs: &[(usize, MetadataDocIndex)],
+    atoms: &[MetadataContentAtom],
+    compact_docs: &[CompactMetadataContentDocument],
+    template_compatibility: MetadataTemplateCompatibility<'_>,
+    pool: &rayon::ThreadPool,
+) -> MetadataValidatedPairBatch {
+    if candidate_pairs.len() >= METADATA_CONTENT_PARALLEL_MIN_RECORDS {
+        pool.install(|| {
+            candidate_pairs
+                .par_iter()
+                .copied()
+                .fold(MetadataValidatedPairBatch::default, |mut batch, pair| {
+                    batch.score_pair(pair, atoms, compact_docs, template_compatibility);
+                    batch
+                })
+                .reduce(
+                    MetadataValidatedPairBatch::default,
+                    MetadataValidatedPairBatch::merge,
+                )
+        })
+    } else {
+        let mut batch = MetadataValidatedPairBatch::default();
+        for &pair in candidate_pairs {
+            batch.score_pair(pair, atoms, compact_docs, template_compatibility);
+        }
+        batch
+    }
+}
+
 pub(super) fn score_and_apply_metadata_atom_pair_batch(
     candidate_pairs: &mut Vec<(usize, MetadataDocIndex)>,
     atoms: &[MetadataContentAtom],
     compact_docs: &[CompactMetadataContentDocument],
     context: &MetadataContentUnionContext<'_>,
     state: &mut MetadataUnionState,
-) -> u64 {
+) -> MetadataPairScoringStats {
     if candidate_pairs.is_empty() {
-        return 0;
+        return MetadataPairScoringStats::default();
     }
-    let scored_pairs = candidate_pairs.len() as u64;
-    let hits =
-        collect_metadata_content_atom_pair_hits(candidate_pairs, atoms, compact_docs, context.pool);
+    let batch = collect_metadata_validated_atom_pair_hits(
+        candidate_pairs,
+        atoms,
+        compact_docs,
+        context.template_compatibility,
+        context.pool,
+    );
     candidate_pairs.clear();
-    for (left, right) in hits {
+    for (left, right) in batch.hits {
         let left_atom = &atoms[left];
         let right_atom = &atoms[metadata_doc_index_to_usize(right)];
-        let mut members = Vec::with_capacity(left_atom.members.len() + right_atom.members.len());
-        members.extend_from_slice(&left_atom.members);
-        members.extend_from_slice(&right_atom.members);
-        apply_metadata_complete_match_group_union(
+        apply_metadata_atom_pair_union(
             context.data,
             context.chain_count,
             state,
-            &members,
+            left_atom,
+            right_atom,
         );
     }
-    scored_pairs
+    batch.stats
 }
 
 pub(super) fn score_and_apply_metadata_fallback_atom_pair_batch(
@@ -1680,15 +2224,19 @@ pub(super) fn score_and_apply_metadata_fallback_atom_pair_batch(
     compact_docs: &[CompactMetadataContentDocument],
     context: &MetadataContentUnionContext<'_>,
     state: &mut MetadataUnionState,
-) -> u64 {
+) -> MetadataPairScoringStats {
     if candidate_pairs.is_empty() {
-        return 0;
+        return MetadataPairScoringStats::default();
     }
-    let scored_pairs = candidate_pairs.len() as u64;
-    let hits =
-        collect_metadata_content_atom_pair_hits(candidate_pairs, atoms, compact_docs, context.pool);
+    let batch = collect_metadata_validated_atom_pair_hits(
+        candidate_pairs,
+        atoms,
+        compact_docs,
+        context.template_compatibility,
+        context.pool,
+    );
     candidate_pairs.clear();
-    for (left, right) in hits {
+    for (left, right) in batch.hits {
         apply_metadata_fallback_atom_pair_union(
             &atoms[left],
             &atoms[metadata_doc_index_to_usize(right)],
@@ -1696,7 +2244,7 @@ pub(super) fn score_and_apply_metadata_fallback_atom_pair_batch(
             state,
         );
     }
-    scored_pairs
+    batch.stats
 }
 
 #[cfg(test)]
@@ -1706,22 +2254,22 @@ pub(super) fn collect_metadata_content_candidate_pairs(
     template_matches: &MetadataTemplateMatches,
 ) -> Vec<(MetadataContractIndex, MetadataContractIndex)> {
     let compact = CompactMetadataContentSet::from_records(records);
-    let index = MetadataContentCandidateIndex::new(&compact.docs, template_docs);
+    let index = MetadataContentCandidateIndex::new(&compact.docs);
     let mut scratch = MetadataCandidateScratch::new(records.len());
+    let mut stats = MetadataContentUnionStats::default();
+    let compatibility = MetadataTemplateCompatibility::Precomputed(template_matches);
     let mut pairs = Vec::new();
     for left in 0..records.len().saturating_sub(1) {
         scratch.clear_for_next_left();
-        index.append_candidates_after(
-            left,
-            &compact.docs[left],
-            template_docs[left],
-            template_matches,
-            &mut scratch,
-        );
+        index.append_candidates_after(left, &compact.docs[left], &mut scratch);
         for &right in &scratch.candidates {
+            let right_index = metadata_doc_index_to_usize(right);
+            if !compatibility.matches(template_docs[left], template_docs[right_index], &mut stats) {
+                continue;
+            }
             pairs.push((
                 records[left].contract_index,
-                records[metadata_doc_index_to_usize(right)].contract_index,
+                records[right_index].contract_index,
             ));
         }
     }
@@ -1751,7 +2299,7 @@ fn union_metadata_shared_token_atom_core(
         ..MetadataContentUnionStats::default()
     };
     for atom in &atoms {
-        apply_metadata_complete_match_group_union(
+        apply_metadata_same_chain_group_union(
             context.data,
             context.chain_count,
             state,
@@ -1761,12 +2309,65 @@ fn union_metadata_shared_token_atom_core(
     if atoms.len() < 2 {
         return stats;
     }
-    let candidate_index = if atoms.len() >= METADATA_CONTENT_PARALLEL_MIN_RECORDS {
-        context
-            .pool
-            .install(|| MetadataContentCandidateIndex::from_atoms_parallel(compact_docs, &atoms))
+    if atoms.len() == METADATA_DIRECT_ATOM_GROUP_SIZE {
+        let left = 0usize;
+        let right = metadata_doc_index_from_usize(1);
+        if !metadata_content_atoms_share_token(left, right, &atoms, compact_docs)
+            || !metadata_template_atoms_share_safe_prefix(
+                left,
+                right,
+                &atoms,
+                context.template_compatibility,
+            )
+        {
+            return stats;
+        }
+        stats.candidate_pairs = 1;
+        let left_atom = &atoms[left];
+        let right_atom = &atoms[1];
+        let left_contract_index = metadata_contract_index_to_usize(left_atom.members[0]);
+        let right_contract_index = metadata_contract_index_to_usize(right_atom.members[0]);
+        let singleton_pair = left_atom.members.len() == 1 && right_atom.members.len() == 1;
+        let same_chain = left_atom.chain_index == right_atom.chain_index;
+        if (singleton_pair || same_chain)
+            && metadata_pair_already_connected(
+                context.data,
+                context.chain_count,
+                state,
+                left_contract_index,
+                right_contract_index,
+            )
+        {
+            return stats;
+        }
+        let mut candidate_pairs = vec![(left, right)];
+        let pair_stats = score_and_apply_metadata_atom_pair_batch(
+            &mut candidate_pairs,
+            &atoms,
+            compact_docs,
+            context,
+            state,
+        );
+        stats.accumulate_pair_scoring(pair_stats);
+        return stats;
+    }
+    let parallel = atoms.len() >= METADATA_CONTENT_PARALLEL_MIN_RECORDS;
+    let candidate_index = if parallel {
+        context.pool.install(|| {
+            MetadataLocalCandidateIndex::from_atoms(
+                compact_docs,
+                &atoms,
+                context.template_compatibility,
+                true,
+            )
+        })
     } else {
-        MetadataContentCandidateIndex::from_atoms(compact_docs, &atoms)
+        MetadataLocalCandidateIndex::from_atoms(
+            compact_docs,
+            &atoms,
+            context.template_compatibility,
+            false,
+        )
     };
     let mut scratch = MetadataCandidateScratch::new(atoms.len());
     let mut candidate_pairs = Vec::with_capacity(METADATA_CONTENT_SCORE_BATCH_PAIRS);
@@ -1779,26 +2380,31 @@ fn union_metadata_shared_token_atom_core(
             left_atom.chain_index
         );
         scratch.clear_for_next_left();
-        candidate_index.append_candidates_after(
+        let candidate_basis = candidate_index.append_candidates_after(
             left,
+            left_atom,
             &compact_docs[left_record_index],
-            left_atom.template_doc_index,
-            context.template_matches,
+            context.template_compatibility,
             &mut scratch,
         );
-        stats.candidate_pairs = stats
-            .candidate_pairs
-            .saturating_add(scratch.candidates.len() as u64);
         for &right in &scratch.candidates {
+            if !metadata_candidate_intersects_both_dimensions(
+                candidate_basis,
+                left,
+                right,
+                &atoms,
+                compact_docs,
+                context.template_compatibility,
+            ) {
+                continue;
+            }
+            stats.candidate_pairs = stats.candidate_pairs.saturating_add(1);
             let right_atom = &atoms[metadata_doc_index_to_usize(right)];
             let right_contract_index = metadata_contract_index_to_usize(right_atom.members[0]);
-            debug_assert!(context.template_matches.matches(
-                metadata_doc_index_to_usize(left_atom.template_doc_index),
-                metadata_doc_index_to_usize(right_atom.template_doc_index),
-            ));
             let singleton_pair = left_atom.members.len() == 1 && right_atom.members.len() == 1;
-            if !singleton_pair
-                || !metadata_pair_already_connected(
+            let same_chain = left_atom.chain_index == right_atom.chain_index;
+            if (singleton_pair || same_chain)
+                && metadata_pair_already_connected(
                     context.data,
                     context.chain_count,
                     state,
@@ -1806,31 +2412,29 @@ fn union_metadata_shared_token_atom_core(
                     right_contract_index,
                 )
             {
-                candidate_pairs.push((left, right));
-                if candidate_pairs.len() >= METADATA_CONTENT_SCORE_BATCH_PAIRS {
-                    stats.scored_pairs = stats.scored_pairs.saturating_add(
-                        score_and_apply_metadata_atom_pair_batch(
-                            &mut candidate_pairs,
-                            &atoms,
-                            compact_docs,
-                            context,
-                            state,
-                        ),
-                    );
-                }
+                continue;
+            }
+            candidate_pairs.push((left, right));
+            if candidate_pairs.len() >= METADATA_CONTENT_SCORE_BATCH_PAIRS {
+                let batch_stats = score_and_apply_metadata_atom_pair_batch(
+                    &mut candidate_pairs,
+                    &atoms,
+                    compact_docs,
+                    context,
+                    state,
+                );
+                stats.accumulate_pair_scoring(batch_stats);
             }
         }
     }
-    stats.scored_pairs =
-        stats
-            .scored_pairs
-            .saturating_add(score_and_apply_metadata_atom_pair_batch(
-                &mut candidate_pairs,
-                &atoms,
-                compact_docs,
-                context,
-                state,
-            ));
+    let batch_stats = score_and_apply_metadata_atom_pair_batch(
+        &mut candidate_pairs,
+        &atoms,
+        compact_docs,
+        context,
+        state,
+    );
+    stats.accumulate_pair_scoring(batch_stats);
     stats
 }
 
@@ -1862,12 +2466,71 @@ fn union_metadata_no_common_atom_core(
     if atoms.len() < 2 {
         return stats;
     }
-    let candidate_index = if atoms.len() >= METADATA_CONTENT_PARALLEL_MIN_RECORDS {
-        context
-            .pool
-            .install(|| MetadataContentCandidateIndex::from_atoms_parallel(compact_docs, &atoms))
+    if atoms.len() == METADATA_DIRECT_ATOM_GROUP_SIZE {
+        let left = 0usize;
+        let right = metadata_doc_index_from_usize(1);
+        if !metadata_content_atoms_share_token(left, right, &atoms, compact_docs)
+            || !metadata_template_atoms_share_safe_prefix(
+                left,
+                right,
+                &atoms,
+                context.template_compatibility,
+            )
+        {
+            return stats;
+        }
+        stats.candidate_pairs = 1;
+        let left_atom = &atoms[left];
+        let right_atom = &atoms[1];
+        let left_contract_index = metadata_contract_index_to_usize(left_atom.members[0]);
+        let right_contract_index = metadata_contract_index_to_usize(right_atom.members[0]);
+        let singleton_pair = left_atom.members.len() == 1 && right_atom.members.len() == 1;
+        if singleton_pair
+            && metadata_pair_already_connected(
+                context.data,
+                context.chain_count,
+                state,
+                left_contract_index,
+                right_contract_index,
+            )
+        {
+            return stats;
+        }
+        if !metadata_fallback_atoms_have_disjoint_token_groups(
+            left_atom,
+            right_atom,
+            context.contract_tokens,
+        ) {
+            return stats;
+        }
+        let mut candidate_pairs = vec![(left, right)];
+        let pair_stats = score_and_apply_metadata_fallback_atom_pair_batch(
+            &mut candidate_pairs,
+            &atoms,
+            compact_docs,
+            context,
+            state,
+        );
+        stats.accumulate_pair_scoring(pair_stats);
+        return stats;
+    }
+    let parallel = atoms.len() >= METADATA_CONTENT_PARALLEL_MIN_RECORDS;
+    let candidate_index = if parallel {
+        context.pool.install(|| {
+            MetadataLocalCandidateIndex::from_atoms(
+                compact_docs,
+                &atoms,
+                context.template_compatibility,
+                true,
+            )
+        })
     } else {
-        MetadataContentCandidateIndex::from_atoms(compact_docs, &atoms)
+        MetadataLocalCandidateIndex::from_atoms(
+            compact_docs,
+            &atoms,
+            context.template_compatibility,
+            false,
+        )
     };
     let mut scratch = MetadataCandidateScratch::new(atoms.len());
     let mut candidate_pairs = Vec::with_capacity(METADATA_CONTENT_SCORE_BATCH_PAIRS);
@@ -1875,24 +2538,28 @@ fn union_metadata_no_common_atom_core(
         let left_atom = &atoms[left];
         let left_record_index = metadata_doc_index_to_usize(left_atom.representative_record_index);
         scratch.clear_for_next_left();
-        candidate_index.append_candidates_after(
+        let candidate_basis = candidate_index.append_candidates_after(
             left,
+            left_atom,
             &compact_docs[left_record_index],
-            left_atom.template_doc_index,
-            context.template_matches,
+            context.template_compatibility,
             &mut scratch,
         );
-        stats.candidate_pairs = stats
-            .candidate_pairs
-            .saturating_add(scratch.candidates.len() as u64);
         let left_contract_index = metadata_contract_index_to_usize(left_atom.members[0]);
         for &right in &scratch.candidates {
+            if !metadata_candidate_intersects_both_dimensions(
+                candidate_basis,
+                left,
+                right,
+                &atoms,
+                compact_docs,
+                context.template_compatibility,
+            ) {
+                continue;
+            }
+            stats.candidate_pairs = stats.candidate_pairs.saturating_add(1);
             let right_atom = &atoms[metadata_doc_index_to_usize(right)];
             let right_index = metadata_contract_index_to_usize(right_atom.members[0]);
-            debug_assert!(context.template_matches.matches(
-                metadata_doc_index_to_usize(left_atom.template_doc_index),
-                metadata_doc_index_to_usize(right_atom.template_doc_index),
-            ));
             let singleton_pair = left_atom.members.len() == 1 && right_atom.members.len() == 1;
             if singleton_pair
                 && metadata_pair_already_connected(
@@ -1912,29 +2579,26 @@ fn union_metadata_no_common_atom_core(
             ) {
                 candidate_pairs.push((left, right));
                 if candidate_pairs.len() >= METADATA_CONTENT_SCORE_BATCH_PAIRS {
-                    stats.scored_pairs = stats.scored_pairs.saturating_add(
-                        score_and_apply_metadata_fallback_atom_pair_batch(
-                            &mut candidate_pairs,
-                            &atoms,
-                            compact_docs,
-                            context,
-                            state,
-                        ),
+                    let batch_stats = score_and_apply_metadata_fallback_atom_pair_batch(
+                        &mut candidate_pairs,
+                        &atoms,
+                        compact_docs,
+                        context,
+                        state,
                     );
+                    stats.accumulate_pair_scoring(batch_stats);
                 }
             }
         }
     }
-    stats.scored_pairs =
-        stats
-            .scored_pairs
-            .saturating_add(score_and_apply_metadata_fallback_atom_pair_batch(
-                &mut candidate_pairs,
-                &atoms,
-                compact_docs,
-                context,
-                state,
-            ));
+    let batch_stats = score_and_apply_metadata_fallback_atom_pair_batch(
+        &mut candidate_pairs,
+        &atoms,
+        compact_docs,
+        context,
+        state,
+    );
+    stats.accumulate_pair_scoring(batch_stats);
     stats
 }
 
@@ -1988,7 +2652,7 @@ pub(super) fn lexical_metadata_token_ids(
 ) -> HashMap<&str, usize> {
     let mut tokens = entries
         .iter()
-        .flat_map(|entry| entry.doc.unique_tokens.iter().map(String::as_str))
+        .flat_map(|entry| entry.doc.terms().iter().map(|(token, _)| token.as_str()))
         .collect::<Vec<_>>();
     tokens.par_sort_unstable();
     tokens.dedup();
@@ -2009,9 +2673,24 @@ impl InternedMetadataIndex {
     }
 
     pub(super) fn owned_memory_bytes(&self) -> usize {
-        self.scoring
-            .owned_memory_bytes()
-            .saturating_add(self.postings.owned_memory_bytes())
+        let bytes = self.scoring.owned_memory_bytes();
+        #[cfg(test)]
+        let bytes = bytes.saturating_add(self.postings.owned_memory_bytes());
+        bytes
+    }
+
+    pub(super) fn logical_memory_bytes(&self) -> usize {
+        let bytes = self.scoring.logical_memory_bytes();
+        #[cfg(test)]
+        let bytes = bytes.saturating_add(self.postings.logical_memory_bytes());
+        bytes
+    }
+
+    pub(super) fn mapped_bytes(&self) -> usize {
+        let bytes = self.scoring.mapped_bytes();
+        #[cfg(test)]
+        let bytes = bytes.saturating_add(self.postings.mapped_bytes());
+        bytes
     }
 
     pub(super) fn remap_if_over_budget(
@@ -2027,11 +2706,14 @@ impl InternedMetadataIndex {
     }
 
     pub(super) fn remap_postings(&mut self, directory: &Path) -> std::io::Result<()> {
-        let postings = std::mem::replace(
-            &mut self.postings,
-            CompactMetadataPostings::from_nested(Vec::new()),
-        );
-        self.postings = postings.persist_and_remap(directory)?;
+        #[cfg(test)]
+        {
+            let postings = std::mem::replace(
+                &mut self.postings,
+                CompactMetadataPostings::from_nested(Vec::new()),
+            );
+            self.postings = postings.persist_and_remap(directory)?;
+        }
         let scoring = std::mem::replace(
             &mut self.scoring,
             CompactMetadataScoring::from_nested(Vec::new(), Vec::new()),
@@ -2044,10 +2726,8 @@ impl InternedMetadataIndex {
         let token_ids = lexical_metadata_token_ids(&entries);
         let token_count = token_ids.len();
 
-        // Phase 1 (parallel): build per-doc source docs and weights. Each doc
-        // does its own tokenization + term-frequency HashMap + unique-token
-        // sort, which is the expensive per-doc work; `unzip` preserves
-        // doc-index order.
+        // Phase 1 (parallel): intern each already-normalized compact term list
+        // into token-ID source docs and weights; `unzip` preserves doc order.
         let (doc_weights, source_docs): (Vec<usize>, Vec<InternedMetadataSourceDoc>) = entries
             .par_iter()
             .map(|entry| {
@@ -2066,20 +2746,24 @@ impl InternedMetadataIndex {
         drop(token_ids);
         drop(entries);
 
-        // Phase 2: fill postings from the prebuilt source docs. This is plain
-        // Vec pushes (no per-doc HashMap), so it stays serial and cheap.
-        let mut postings = vec![Vec::new(); token_count];
-        for (doc_index, doc) in source_docs.iter().enumerate() {
-            let compact_doc_index = metadata_doc_index_from_usize(doc_index);
-            for &token_id in &doc.unique_tokens {
-                postings[token_id].push(compact_doc_index);
+        #[cfg(test)]
+        let postings = {
+            // Test-only global-recall index retained for the candidate-prefix
+            // equivalence tests. Production scores templates lazily only for
+            // content candidates and does not allocate this global posting set.
+            let mut postings = vec![Vec::new(); token_count];
+            for (doc_index, doc) in source_docs.iter().enumerate() {
+                let compact_doc_index = metadata_doc_index_from_usize(doc_index);
+                for &(token_id, _) in doc.terms() {
+                    postings[token_id as usize].push(compact_doc_index);
+                }
             }
-        }
-        // Phase 3 (parallel): sort + dedup each posting independently.
-        postings.par_iter_mut().for_each(|indices| {
-            indices.sort_unstable();
-            indices.dedup();
-        });
+            postings.par_iter_mut().for_each(|indices| {
+                indices.sort_unstable();
+                indices.dedup();
+            });
+            CompactMetadataPostings::from_nested(postings)
+        };
         let corpus =
             InternedMetadataCorpus::from_doc_weights(&doc_weights, &source_docs, token_count);
         drop(doc_weights);
@@ -2087,29 +2771,27 @@ impl InternedMetadataIndex {
             .par_iter()
             .map(|doc| PreparedInternedMetadataDoc::new(doc, &corpus))
             .collect::<Vec<_>>();
-        let mut max_token_weights = vec![0.0f64; token_count];
-        for doc in &prepared_docs {
-            for &(token, weight) in &doc.token_weights {
-                max_token_weights[token] = max_token_weights[token].max(weight);
+        let max_token_weights = {
+            let mut max_token_weights = vec![0.0f64; token_count];
+            for prepared in &prepared_docs {
+                for &(token, weight) in &prepared.token_weights {
+                    max_token_weights[token] = max_token_weights[token].max(weight);
+                }
             }
-        }
-        let postings = CompactMetadataPostings::from_nested(postings);
+            max_token_weights
+        };
         let queries = source_docs
             .par_iter()
-            .map(|doc| {
-                PreparedInternedMetadataQuery::new(doc, &corpus, &max_token_weights, &postings)
-            })
+            .map(|doc| PreparedInternedMetadataQuery::new_direct(doc, &corpus, &max_token_weights))
             .collect::<Vec<_>>();
         let doc_count = source_docs.len();
-        let total_docs = corpus.total_docs;
         drop(source_docs);
         drop(corpus);
-        drop(max_token_weights);
         let scoring = CompactMetadataScoring::from_nested(queries, prepared_docs);
         Self {
             doc_count,
-            total_docs,
             scoring,
+            #[cfg(test)]
             postings,
             #[cfg(test)]
             token_ids: test_token_ids,

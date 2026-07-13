@@ -199,10 +199,18 @@ pub(super) fn normalize_metadata_text(raw: &str) -> String {
         .join(" ")
 }
 
+#[cfg(test)]
 pub(super) fn metadata_bm25_tokens(document: &str) -> Vec<String> {
     // Keep in sync with top_contract_analysis_rs::analysis::scoring::tokenize / TOKEN_RE
+    let normalized = normalize_metadata_text(document);
+    metadata_bm25_tokens_from_normalized(&normalized)
+}
+
+pub(super) fn metadata_bm25_tokens_from_normalized(document: &str) -> Vec<String> {
+    // The caller guarantees NFKC + lowercase + collapsed whitespace. Keeping
+    // this path separate avoids repeating that full scan for parsed metadata.
     TOKEN_RE
-        .find_iter(&normalize_metadata_text(document))
+        .find_iter(document)
         .map(|m| m.as_str().to_string())
         .filter(|token| token.len() >= 2)
         .collect()

@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -46,6 +45,7 @@ pub(super) fn metadata_memory_budget_bytes(value: &str) -> Result<usize, Analysi
 
 pub(super) const METADATA_THRESHOLD: f64 = 0.6;
 const METADATA_MATCH_MODE: &str = "template_recall_hybrid_verify";
+#[cfg(test)]
 pub(super) const METADATA_PAIR_LEFT_CHUNK_SIZE: usize = 256;
 pub(super) const METADATA_CONTENT_PARALLEL_MIN_RECORDS: usize = 64;
 pub(super) const METADATA_CONTENT_SCORE_BATCH_PAIRS: usize = 16 * 1024;
@@ -53,6 +53,7 @@ const METADATA_REUSE_CACHE_BUDGET_DIVISOR: usize = 16;
 pub(super) type MetadataDocKey = String;
 pub(super) type MetadataContractIndex = u32;
 pub(super) type MetadataDocIndex = u32;
+#[cfg(test)]
 pub(super) type MetadataDocPair = (MetadataDocIndex, MetadataDocIndex);
 
 #[derive(Clone, Debug)]
@@ -78,6 +79,7 @@ pub(super) struct MetadataData {
     pub(super) reused_documents: ReusedMetadataDocuments,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(super) struct MetadataTemplateMatches {
     compatible_docs: CompactMetadataPostings,
@@ -94,7 +96,6 @@ pub(super) struct MetadataDataBuilder {
     doc_key_bytes: usize,
     content_doc_bytes: usize,
     seen_content_docs: HashSet<usize>,
-    template_token_occurrences: usize,
     template_unique_terms: usize,
 }
 
@@ -140,6 +141,7 @@ struct MetadataPairComponentAccumulator {
     total_contract_count: i64,
 }
 
+#[cfg(test)]
 impl MetadataTemplateMatches {
     pub(super) fn from_pairs(doc_count: usize, mut pairs: Vec<MetadataDocPair>) -> Self {
         for (left, right) in &mut pairs {
@@ -201,6 +203,7 @@ impl MetadataTemplateMatches {
     }
 }
 
+#[cfg(test)]
 impl Default for MetadataTemplateMatches {
     fn default() -> Self {
         Self {
@@ -222,7 +225,6 @@ impl MetadataDataBuilder {
             doc_key_bytes: 0,
             content_doc_bytes: 0,
             seen_content_docs: HashSet::new(),
-            template_token_occurrences: 0,
             template_unique_terms: 0,
         }
     }
@@ -294,11 +296,11 @@ impl MetadataDataBuilder {
     /// Conservative peak for converting the loaded string documents into the
     /// compact BM25 arrays. The lookup maps are dropped before this conversion;
     /// the estimate covers the overlapping lexical dictionary, source docs,
-    /// postings, prepared queries/docs and final flat arrays, plus 25% allocator
-    /// and HashMap slack.
+    /// prepared queries/docs and final flat arrays, plus 25% allocator and
+    /// HashMap slack. No global template-pair graph is materialized; compact
+    /// per-document safe-prefix tokens are included in the flat arrays.
     pub(super) fn estimated_finish_peak_memory_bytes(&self) -> usize {
         let document_count = self.docs.len();
-        let occurrences = self.template_token_occurrences;
         let unique_terms = self.template_unique_terms;
 
         let lexical_dictionary = unique_terms.saturating_mul(
@@ -308,26 +310,7 @@ impl MetadataDataBuilder {
         );
         let source_documents = document_count
             .saturating_mul(std::mem::size_of::<InternedMetadataSourceDoc>())
-            .saturating_add(occurrences.saturating_mul(std::mem::size_of::<usize>()))
-            .saturating_add(
-                unique_terms.saturating_mul(
-                    std::mem::size_of::<usize>()
-                        .saturating_add(std::mem::size_of::<(usize, usize)>())
-                        .saturating_add(1),
-                ),
-            );
-        // In the worst lexical distribution every document term is a distinct
-        // corpus token, so the nested posting headers and flat postings overlap.
-        let postings_peak = unique_terms
-            .saturating_mul(std::mem::size_of::<Vec<MetadataDocIndex>>())
-            .saturating_add(
-                unique_terms.saturating_mul(2 * std::mem::size_of::<MetadataDocIndex>()),
-            )
-            .saturating_add(
-                unique_terms
-                    .saturating_add(1)
-                    .saturating_mul(std::mem::size_of::<u64>()),
-            );
+            .saturating_add(unique_terms.saturating_mul(std::mem::size_of::<(u32, u32)>()));
         let prepared_and_queries = document_count
             .saturating_mul(
                 std::mem::size_of::<usize>()
@@ -336,18 +319,18 @@ impl MetadataDataBuilder {
             )
             .saturating_add(
                 unique_terms.saturating_mul(
-                    5usize
+                    4usize
                         .saturating_mul(std::mem::size_of::<usize>())
                         .saturating_add(2 * std::mem::size_of::<f64>()),
                 ),
             );
         let compact_scoring = document_count
             .saturating_add(1)
-            .saturating_mul(5 * std::mem::size_of::<u64>())
+            .saturating_mul(4 * std::mem::size_of::<u64>())
             .saturating_add(document_count.saturating_mul(std::mem::size_of::<f64>()))
             .saturating_add(
                 unique_terms.saturating_mul(
-                    4usize
+                    3usize
                         .saturating_mul(std::mem::size_of::<u32>())
                         .saturating_add(std::mem::size_of::<f64>()),
                 ),
@@ -357,7 +340,6 @@ impl MetadataDataBuilder {
             .saturating_add(std::mem::size_of::<InternedMetadataCorpus>());
         let conversion_working_bytes = lexical_dictionary
             .saturating_add(source_documents)
-            .saturating_add(postings_peak)
             .saturating_add(prepared_and_queries)
             .saturating_add(compact_scoring)
             .saturating_add(corpus);
@@ -405,9 +387,6 @@ impl MetadataDataBuilder {
             Some(index) => index,
             None => {
                 let index = self.docs.len();
-                self.template_token_occurrences = self
-                    .template_token_occurrences
-                    .saturating_add(row.doc.len());
                 self.template_unique_terms = self
                     .template_unique_terms
                     .saturating_add(row.doc.unique_len());
@@ -617,8 +596,7 @@ pub(super) fn run_metadata_analysis(
         analysis_memory_bytes,
         contract_token_reserve_bytes,
     )?;
-    let mut pre_token_resident_bytes =
-        metadata_resident_memory_bytes(&data, None, chains.len(), threads);
+    let mut pre_token_resident_bytes = metadata_resident_memory_bytes(&data, None, chains.len());
     pre_token_resident_bytes = remap_metadata_index_for_resident_budget(
         &mut data,
         pre_token_resident_bytes,
@@ -641,7 +619,7 @@ pub(super) fn run_metadata_analysis(
         .filter(|contract| contract.content_doc.is_some())
         .count() as u64;
     let mut resident_bytes =
-        metadata_resident_memory_bytes(&data, Some(&contract_tokens), chains.len(), threads);
+        metadata_resident_memory_bytes(&data, Some(&contract_tokens), chains.len());
     resident_bytes = remap_metadata_index_for_resident_budget(
         &mut data,
         resident_bytes,
@@ -655,10 +633,7 @@ pub(super) fn run_metadata_analysis(
             format_byte_size(analysis_memory_bytes)
         )));
     }
-    let max_template_match_pairs = metadata_template_match_pair_budget(
-        analysis_memory_bytes.saturating_sub(resident_bytes),
-        data.metadata_index.doc_count(),
-    );
+    let mapped_index_bytes = u64::try_from(data.metadata_index.mapped_bytes()).unwrap_or(u64::MAX);
     progress.step(format!(
         "loaded {} metadata documents for {} contracts",
         data.metadata_index.doc_count(),
@@ -686,7 +661,7 @@ pub(super) fn run_metadata_analysis(
                 content_atoms: 0,
                 content_candidate_pairs: 0,
                 content_scored_pairs: 0,
-                mmap_bytes: artifact_directory.map_or(0, directory_bytes),
+                mmap_bytes: mapped_index_bytes,
                 dsu_bytes: 0,
             },
         });
@@ -698,30 +673,14 @@ pub(super) fn run_metadata_analysis(
         chain_matrix: (chains.len() > 1)
             .then(|| new_chain_matrix_reuse_states(chain_pair_count(chains.len()))),
     };
-    let (mut template_matches, template_stats) = pool
-        .install(|| collect_metadata_template_matches(&data, progress, max_template_match_pairs))?;
-    let maximum_template_match_bytes = analysis_memory_bytes.saturating_sub(resident_bytes);
-    if let Some(directory) = artifact_directory {
-        template_matches.remap_if_over_budget(directory, maximum_template_match_bytes)?;
-    }
-    if template_matches.owned_memory_bytes() > maximum_template_match_bytes {
-        return Err(AnalysisError::InvalidData(format!(
-            "metadata template matches need about {}, exceeding remaining analysis budget {}",
-            format_byte_size(template_matches.owned_memory_bytes()),
-            format_byte_size(maximum_template_match_bytes)
-        )));
-    }
-    let template_scratch_bytes =
-        metadata_template_scoring_scratch_bytes(data.metadata_index.doc_count(), threads);
-    let content_base_bytes = resident_bytes
-        .saturating_sub(template_scratch_bytes)
-        .saturating_add(template_matches.owned_memory_bytes());
-    let maximum_content_working_bytes = analysis_memory_bytes.saturating_sub(content_base_bytes);
+    let maximum_shared_working_bytes = analysis_memory_bytes - resident_bytes;
     let mut content_stats = MetadataContentUnionStats::default();
     {
         let content_context = MetadataContentUnionContext {
             data: &data,
-            template_matches: &template_matches,
+            template_compatibility: MetadataTemplateCompatibility::Scored(
+                &data.metadata_index.scoring,
+            ),
             contract_tokens: &contract_tokens,
             chain_count: chains.len(),
             pool: &pool,
@@ -730,16 +689,27 @@ pub(super) fn run_metadata_analysis(
             conn,
             &content_context,
             &mut state,
-            maximum_content_working_bytes,
+            maximum_shared_working_bytes,
         )?;
         content_stats.accumulate(shared_stats);
     }
-    data.reused_documents.clear();
-    data.reused_documents.shrink_to_fit();
+    drop(std::mem::take(&mut data.reused_documents));
+    let fallback_resident_bytes =
+        metadata_resident_memory_bytes(&data, Some(&contract_tokens), chains.len());
+    if fallback_resident_bytes > analysis_memory_bytes {
+        return Err(AnalysisError::InvalidData(format!(
+            "metadata resident state needs about {} after releasing the reuse cache, exceeding analysis budget {}",
+            format_byte_size(fallback_resident_bytes),
+            format_byte_size(analysis_memory_bytes)
+        )));
+    }
+    let maximum_fallback_working_bytes = analysis_memory_bytes - fallback_resident_bytes;
     {
         let content_context = MetadataContentUnionContext {
             data: &data,
-            template_matches: &template_matches,
+            template_compatibility: MetadataTemplateCompatibility::Scored(
+                &data.metadata_index.scoring,
+            ),
             contract_tokens: &contract_tokens,
             chain_count: chains.len(),
             pool: &pool,
@@ -747,12 +717,11 @@ pub(super) fn run_metadata_analysis(
         content_stats.accumulate(union_metadata_representative_content_fallback(
             &content_context,
             &mut state,
-            maximum_content_working_bytes,
+            maximum_fallback_working_bytes,
         )?);
     }
     progress.step("metadata documents scored");
     drop(contract_tokens);
-    drop(template_matches);
     drop(pool);
     release_metadata_scoring_state(&mut data);
     let summary_peak_bytes = metadata_summary_peak_memory_bytes(&data, &state);
@@ -777,13 +746,13 @@ pub(super) fn run_metadata_analysis(
             retained_shared_tokens,
             template_documents: template_document_count,
             content_documents: content_document_count,
-            template_candidate_pairs: template_stats.candidate_pairs,
-            template_scored_pairs: template_stats.scored_pairs,
-            template_matched_pairs: template_stats.matched_pairs,
+            template_candidate_pairs: content_stats.template_candidate_pairs,
+            template_scored_pairs: content_stats.template_scored_pairs,
+            template_matched_pairs: content_stats.template_matched_pairs,
             content_atoms: content_stats.atom_count as u64,
             content_candidate_pairs: content_stats.candidate_pairs,
             content_scored_pairs: content_stats.scored_pairs,
-            mmap_bytes: artifact_directory.map_or(0, directory_bytes),
+            mmap_bytes: mapped_index_bytes,
             dsu_bytes,
         },
     })
@@ -791,23 +760,6 @@ pub(super) fn run_metadata_analysis(
 
 fn scalar_u64(conn: &Connection, sql: &str) -> Result<u64, AnalysisError> {
     Ok(conn.query_row(sql, [], |row| row.get(0))?)
-}
-
-fn directory_bytes(path: &Path) -> u64 {
-    fs::read_dir(path)
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .map(|entry| {
-            let path = entry.path();
-            if path.is_dir() {
-                directory_bytes(&path)
-            } else {
-                entry.metadata().map(|value| value.len()).unwrap_or(0)
-            }
-        })
-        .fold(0u64, u64::saturating_add)
 }
 
 fn metadata_union_state_bytes(state: &MetadataUnionState) -> u64 {
@@ -988,19 +940,18 @@ fn remap_metadata_index_for_resident_budget(
     let Some(directory) = artifact_directory else {
         return Ok(resident_bytes);
     };
-    let owned_index_bytes = data.metadata_index.owned_memory_bytes();
-    let non_index_bytes = resident_bytes.saturating_sub(owned_index_bytes);
+    let logical_index_bytes = data.metadata_index.logical_memory_bytes();
+    let non_index_bytes = resident_bytes.saturating_sub(logical_index_bytes);
     let maximum_owned_index_bytes = maximum_resident_bytes.saturating_sub(non_index_bytes);
     data.metadata_index
         .remap_if_over_budget(directory, maximum_owned_index_bytes)?;
-    Ok(non_index_bytes.saturating_add(data.metadata_index.owned_memory_bytes()))
+    Ok(non_index_bytes.saturating_add(data.metadata_index.logical_memory_bytes()))
 }
 
 fn metadata_resident_memory_bytes(
     data: &MetadataData,
     contract_tokens: Option<&CompactContractTokens>,
     chain_count: usize,
-    threads: usize,
 ) -> usize {
     let content_doc_bytes = data
         .contracts
@@ -1044,8 +995,6 @@ fn metadata_resident_memory_bytes(
         tokens.memory_bytes()
     });
     let reused_bytes = reused_metadata_documents_non_content_memory_bytes(&data.reused_documents);
-    let doc_count = data.metadata_index.doc_count();
-    let scratch_bytes = metadata_template_scoring_scratch_bytes(doc_count, threads);
     let contract_count = data.contracts.len();
     let dense_dsu_bytes = contract_count
         .saturating_mul(std::mem::size_of::<usize>().saturating_add(std::mem::size_of::<u8>()));
@@ -1057,19 +1006,10 @@ fn metadata_resident_memory_bytes(
         .saturating_add(chain_bytes)
         .saturating_add(mapping_bytes)
         .saturating_add(contract_token_bytes)
-        .saturating_add(data.metadata_index.owned_memory_bytes())
+        .saturating_add(data.metadata_index.logical_memory_bytes())
         .saturating_add(reused_bytes)
-        .saturating_add(scratch_bytes)
         .saturating_add(dense_dsu_bytes)
         .saturating_add(sparse_dsu_bytes)
-}
-
-fn metadata_template_scoring_scratch_bytes(doc_count: usize, threads: usize) -> usize {
-    doc_count
-        .saturating_mul(
-            std::mem::size_of::<u16>().saturating_add(std::mem::size_of::<MetadataDocIndex>()),
-        )
-        .saturating_mul(threads.max(1))
 }
 
 fn push_empty_metadata_rows(

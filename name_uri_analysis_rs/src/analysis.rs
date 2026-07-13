@@ -42,6 +42,7 @@ use uri::*;
 
 const NAME_DUCKDB_MEMORY_CAP: &str = "8GiB";
 const METADATA_DUCKDB_MEMORY_CAP: &str = "32GiB";
+pub const DUCKDB_THREAD_CAP: usize = 64;
 
 fn open_analysis_connection(path: &Path) -> Result<Connection, AnalysisError> {
     if path != Path::new(":memory:") {

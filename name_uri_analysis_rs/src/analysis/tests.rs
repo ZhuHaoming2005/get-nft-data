@@ -200,14 +200,13 @@ fn name_candidate_index_is_budgeted_before_construction() {
 
 #[test]
 fn name_scratch_plan_uses_dense_mode_only_when_all_workers_fit() {
-    let atom_count = 1_000_000;
+    let atom_count = 1_000_000usize;
     let threads = 96;
     let workers = threads.min(atom_count - 1);
-    let common_bytes = atom_count
-        * (std::mem::size_of::<NameAtomIndex>() + std::mem::size_of::<ScoredRight>())
-        * workers
+    let candidate_capacity = atom_count.max(4).next_power_of_two();
+    let common_bytes = candidate_capacity * std::mem::size_of::<NameAtomIndex>() * workers
         + NAME_EDGE_CHUNK_SIZE * std::mem::size_of::<(usize, ScoredRight)>() * workers * 3;
-    let dense_bytes = common_bytes + atom_count * std::mem::size_of::<u32>() * workers;
+    let dense_bytes = common_bytes + atom_count * std::mem::size_of::<u16>() * workers;
 
     let dense = name_scratch_plan(atom_count, threads, dense_bytes);
     let sparse = name_scratch_plan(atom_count, threads, dense_bytes - 1);
@@ -216,6 +215,60 @@ fn name_scratch_plan_uses_dense_mode_only_when_all_workers_fit() {
     assert_eq!(dense.reserved_bytes, dense_bytes);
     assert_eq!(sparse.mode, NameScratchMode::Sparse);
     assert!(sparse.reserved_bytes > common_bytes);
+}
+
+#[test]
+fn name_scratch_plan_prefers_budgeted_dense_mode_above_the_old_atom_threshold() {
+    let atom_count = (1 << 20) + 1;
+    let plan = name_scratch_plan(atom_count, 2, usize::MAX);
+
+    assert_eq!(plan.mode, NameScratchMode::Dense);
+}
+
+#[test]
+fn name_scratch_plan_reserves_the_candidate_vectors_actual_worst_capacity() {
+    let atom_count = 5usize;
+    let workers = 1usize;
+    let candidate_capacity = atom_count.max(4).next_power_of_two();
+    let expected = candidate_capacity * std::mem::size_of::<NameAtomIndex>() * workers
+        + NAME_EDGE_CHUNK_SIZE * std::mem::size_of::<(usize, ScoredRight)>() * workers * 3
+        + atom_count * std::mem::size_of::<u16>() * workers;
+
+    let plan = name_scratch_plan(atom_count, workers, usize::MAX);
+
+    assert_eq!(plan.mode, NameScratchMode::Dense);
+    assert_eq!(plan.reserved_bytes, expected);
+}
+
+#[test]
+fn dense_name_scratch_uses_u16_generations_and_resets_after_wrap() {
+    let source = include_str!("name_scoring.rs");
+    assert!(source.contains("seen_generation: Vec<u16>"));
+    assert!(source.contains("generation: u16"));
+
+    let atoms = vec![
+        NameAtom {
+            chain_index: 0,
+            name_norm: "azuki".into(),
+            char_len: 5,
+            contract_count: 1,
+            nft_count: 1,
+        },
+        NameAtom {
+            chain_index: 1,
+            name_norm: "azuki".into(),
+            char_len: 5,
+            contract_count: 1,
+            nft_count: 1,
+        },
+    ];
+    let index = NameCandidateIndex::new(&atoms);
+    let mut scratch = NameCandidateScratch::with_mode(2, NameScratchMode::Dense);
+
+    for _ in 0..=u16::MAX {
+        let candidates = index.candidates_for_left(&atoms, 0, 1..2, 90.0, &mut scratch);
+        assert_eq!(candidates, [1]);
+    }
 }
 
 #[test]
@@ -349,6 +402,32 @@ fn duckdb_configuration_does_not_parse_memory_limit() {
     };
 
     configure_duckdb(&conn, &options).unwrap();
+}
+
+#[test]
+fn duckdb_threads_are_capped_at_the_64_physical_core_target() {
+    let conn = Connection::open_in_memory().unwrap();
+    let options = AnalysisOptions {
+        database_path: PathBuf::from(":memory:"),
+        parquet_inputs: Vec::new(),
+        output_dir: PathBuf::from("unused"),
+        name_threshold: 95.0,
+        threads: 128,
+        memory_limit: "384GiB".into(),
+        analysis_memory_limit: Some("384GiB".into()),
+        duckdb_memory_limit: "320GiB".into(),
+        temp_directory: None,
+        progress: false,
+    };
+
+    configure_duckdb(&conn, &options).unwrap();
+
+    let threads = conn
+        .query_row("SELECT current_setting('threads')::UBIGINT", [], |row| {
+            row.get::<_, u64>(0)
+        })
+        .unwrap();
+    assert_eq!(threads, 64);
 }
 
 #[test]
@@ -1421,60 +1500,125 @@ fn canonical_name_scoring_expands_matches_to_original_atoms() {
         chain_matrix: Some(new_chain_matrix_reuse_states(1)),
     }];
 
-    union_canonical_name_pairs(
-        &atoms,
-        &canonical,
-        &index,
-        NameScratchMode::Dense,
-        &mut states[0],
-        2,
-        &ProgressTracker::new(1, false),
-    );
+    let progress = ProgressTracker::new(1, true);
+    progress.start_phase("canonical name scoring", 0);
+    progress.add_work(canonical.atoms.len().saturating_sub(1) as u64);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let stats = pool.install(|| {
+        union_canonical_name_pairs(
+            &atoms,
+            &canonical,
+            &index,
+            NameScratchMode::Dense,
+            &mut states[0],
+            2,
+            &progress,
+        )
+    });
 
+    assert_eq!(stats.candidate_pairs, 1);
+    assert_eq!(stats.scored_pairs, 1);
+    assert_eq!(stats.matched_pairs, 1);
+    let ProgressTracker::Enabled { detail, .. } = &progress else {
+        panic!("progress must be enabled");
+    };
+    assert_eq!(detail.position(), 1);
     assert_eq!(states[0].intra.find(1), states[0].intra.find(2));
     assert!(states[0].cross.as_mut().unwrap().connected(0, 1));
     assert!(states[0].cross.as_mut().unwrap().connected(0, 2));
 }
 
 #[test]
-fn indexed_name_scoring_appends_into_reusable_worker_buffer() {
-    let atoms = ["azuki", "azukii", "unrelated"]
-        .into_iter()
-        .map(|name| NameAtom {
+fn canonical_name_progress_and_stats_include_unmatched_candidates() {
+    let atoms = vec![
+        NameAtom {
             chain_index: 0,
-            name_norm: name.into(),
-            char_len: name.chars().count(),
+            name_norm: "abcd".into(),
+            char_len: 4,
             contract_count: 1,
             nft_count: 1,
-        })
-        .collect::<Vec<_>>();
-    let index = NameCandidateIndex::new(&atoms);
-    let mut scratch = NameCandidateScratch::new(atoms.len());
-    let mut hits = Vec::with_capacity(8);
+        },
+        NameAtom {
+            chain_index: 0,
+            name_norm: "abdc".into(),
+            char_len: 4,
+            contract_count: 1,
+            nft_count: 1,
+        },
+    ];
+    let canonical = canonical_name_values(&atoms);
+    let index = NameCandidateIndex::new(&canonical.atoms);
+    let mut state = ThresholdUnionState {
+        threshold: 95.0,
+        intra: UnionFind::new(atoms.len()),
+        cross: None,
+        chain_matrix: None,
+    };
+    let progress = ProgressTracker::new(1, true);
+    progress.start_phase("canonical name scoring", 0);
+    progress.add_work(1);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
 
-    append_indexed_name_pairs_for_left(
-        &atoms,
-        &index,
-        0,
-        1..atoms.len(),
-        80.0,
-        &mut scratch,
-        &mut hits,
-    );
-    let capacity = hits.capacity();
-    hits.clear();
-    append_indexed_name_pairs_for_left(
-        &atoms,
-        &index,
-        0,
-        1..atoms.len(),
-        80.0,
-        &mut scratch,
-        &mut hits,
-    );
+    let stats = pool.install(|| {
+        union_canonical_name_pairs(
+            &atoms,
+            &canonical,
+            &index,
+            NameScratchMode::Dense,
+            &mut state,
+            1,
+            &progress,
+        )
+    });
 
-    assert_eq!(hits.capacity(), capacity);
-    assert_eq!(hits.len(), 1);
+    assert_eq!(stats.candidate_pairs, 1);
+    assert_eq!(stats.scored_pairs, 1);
+    assert_eq!(stats.matched_pairs, 0);
+    let ProgressTracker::Enabled { detail, .. } = &progress else {
+        panic!("progress must be enabled");
+    };
+    assert_eq!(detail.position(), 1);
+    assert_ne!(state.intra.find(0), state.intra.find(1));
+}
+
+#[test]
+fn production_name_scoring_streams_matches_into_bounded_edge_batches() {
+    let source = include_str!("name_scoring.rs");
+    let start = source
+        .find("pub(crate) fn union_canonical_name_pairs(")
+        .unwrap();
+    let end = source[start..]
+        .find("pub(crate) fn right_name_range_end_for_left(")
+        .map(|offset| start + offset)
+        .unwrap();
+    let production_scoring = &source[start..end];
+
+    assert!(!production_scoring.contains("Vec::<ScoredRight>::new()"));
+    assert!(!production_scoring.contains("let mut hits"));
+    assert!(production_scoring.contains("visit_indexed_name_pairs_for_left("));
+}
+
+#[test]
+fn parallel_name_scoring_reduces_fold_local_stats_without_shared_atomics() {
+    let source = include_str!("name_scoring.rs");
+    let start = source
+        .find("pub(crate) fn union_canonical_name_pairs(")
+        .unwrap();
+    let end = source[start..]
+        .find("fn apply_canonical_edge_batch(")
+        .map(|offset| start + offset)
+        .unwrap();
+    let parallel_scoring = &source[start..end];
+
+    assert!(!parallel_scoring.contains("AtomicU64"));
+    assert!(!parallel_scoring.contains("fetch_add"));
+    assert!(source.contains("stats: NameScoringStats"));
 }
 
 #[test]
@@ -1511,9 +1655,7 @@ fn name_candidate_scratch_dense_and_sparse_backends_agree() {
             let dense_cands = candidate_index
                 .candidates_for_left(&atoms, left, right_range.clone(), threshold, &mut dense)
                 .to_vec();
-            // Force the sparse HashSet backend without allocating a huge
-            // dense array: an atom_count above the threshold selects Sparse.
-            let mut sparse = NameCandidateScratch::new(SPARSE_DEDUP_ATOM_THRESHOLD + 1);
+            let mut sparse = NameCandidateScratch::with_mode(atoms.len(), NameScratchMode::Sparse);
             let sparse_cands = candidate_index
                 .candidates_for_left(&atoms, left, right_range, threshold, &mut sparse)
                 .to_vec();

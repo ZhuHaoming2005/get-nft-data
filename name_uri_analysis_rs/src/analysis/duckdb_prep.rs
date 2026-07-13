@@ -70,7 +70,8 @@ pub(crate) fn configure_duckdb(
         SET parquet_metadata_cache=true;
         ",
     )?;
-    conn.execute(&format!("PRAGMA threads={}", options.threads.max(1)), [])?;
+    let duckdb_threads = options.threads.clamp(1, DUCKDB_THREAD_CAP);
+    conn.execute(&format!("PRAGMA threads={duckdb_threads}"), [])?;
     let memory_limit = resolve_duckdb_memory_limit(&options.duckdb_memory_limit)?;
     conn.execute(
         &format!("PRAGMA memory_limit='{}'", sql_string(&memory_limit)),
