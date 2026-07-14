@@ -997,6 +997,7 @@ impl MetadataLeftCandidateBatchConsumer<'_, '_> {
             self.context.data.contracts[left_contract_index].chain_index,
             left_atom.chain_index
         );
+        let mut intra_left_root = None;
         for right in left_batch.candidates.iter() {
             self.stats.candidate_pairs = self.stats.candidate_pairs.saturating_add(1);
             let right_atom = &self.atoms[metadata_doc_index_to_usize(right)];
@@ -1007,15 +1008,23 @@ impl MetadataLeftCandidateBatchConsumer<'_, '_> {
                 MetadataCandidateUnionScope::SharedToken => singleton_pair || same_chain,
                 MetadataCandidateUnionScope::Fallback => singleton_pair,
             };
-            if should_check_connected
-                && metadata_pair_already_connected(
-                    self.context.data,
-                    self.context.chain_count,
-                    self.state,
-                    left_contract_index,
-                    right_contract_index,
-                )
-            {
+            let already_connected = should_check_connected
+                && if same_chain {
+                    self.state.intra.connected_with_left_root(
+                        left_contract_index,
+                        right_contract_index,
+                        &mut intra_left_root,
+                    )
+                } else {
+                    metadata_pair_already_connected(
+                        self.context.data,
+                        self.context.chain_count,
+                        self.state,
+                        left_contract_index,
+                        right_contract_index,
+                    )
+                };
+            if already_connected {
                 self.stats.already_connected_pairs =
                     self.stats.already_connected_pairs.saturating_add(1);
                 continue;
@@ -1045,6 +1054,7 @@ impl MetadataLeftCandidateBatchConsumer<'_, '_> {
                     }
                 };
                 self.stats.accumulate_pair_scoring(batch_stats);
+                intra_left_root = None;
             }
         }
     }

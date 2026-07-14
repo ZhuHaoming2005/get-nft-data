@@ -646,9 +646,32 @@ fn metadata_scoring_peak_accounts_for_fallback_acceleration_buffers() {
     assert!(scoring_peak.contains("fallback_exclusion_index"));
     assert!(scoring_peak.contains("fallback_exclusion_scratch"));
     assert!(scoring_peak.contains("joint_candidate_index"));
+    assert!(scoring_peak.contains("family_positions"));
     assert!(scoring_peak.contains("difficult_first_order"));
     assert!(scoring_peak.contains("calibration_graph_scratch"));
     assert!(scoring_peak.contains("exact_rescue_mask"));
+}
+
+#[test]
+fn joint_band_base_probe_uses_direct_per_atom_posting_positions() {
+    let source = INDEX_SOURCE;
+
+    assert!(source.contains("posting_positions_by_atom"));
+    assert!(source.contains("posting_range_after_own_bucket"));
+    assert!(source.contains("template_probe == template_value"));
+    assert!(source.contains("content_probe == content_value"));
+}
+
+#[test]
+fn metadata_left_root_cache_is_invalidated_after_each_union_batch() {
+    let source = INDEX_SOURCE;
+    let start = source
+        .find("impl MetadataLeftCandidateBatchConsumer")
+        .expect("metadata left candidate consumer");
+    let consumer = &source[start..];
+
+    assert!(consumer.contains("connected_with_left_root"));
+    assert!(consumer.contains("intra_left_root = None"));
 }
 
 #[test]

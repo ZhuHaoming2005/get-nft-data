@@ -68,6 +68,23 @@ fn dense_union_find_positive_cache_never_caches_a_stale_negative() {
 }
 
 #[test]
+fn dense_union_find_reuses_a_left_root_until_a_union_batch_mutates_it() {
+    let mut union_find = UnionFind::new_with_connected_cache(5);
+    union_find.union(0, 1);
+    union_find.union(1, 4);
+    union_find.union(2, 3);
+
+    let mut left_root = None;
+    assert!(union_find.connected_with_left_root(0, 4, &mut left_root));
+    assert!(left_root.is_some());
+    assert!(!union_find.connected_with_left_root(0, 2, &mut left_root));
+
+    union_find.union(1, 2);
+    left_root = None;
+    assert!(union_find.connected_with_left_root(0, 3, &mut left_root));
+}
+
+#[test]
 fn chain_pair_indexes_round_trip() {
     let chain_count = 5;
     let mut seen = Vec::new();

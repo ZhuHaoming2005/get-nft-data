@@ -1,5 +1,3 @@
-#[cfg(test)]
-use std::collections::HashSet;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 
 use rayon::prelude::*;
@@ -220,6 +218,7 @@ impl MetadataConservativeJointBandFamily {
         let mut cursors = posting_offsets[..METADATA_CONSERVATIVE_JOINT_BAND_BUCKETS].to_vec();
         let posting_count = posting_offsets.last().copied().unwrap_or(0) as usize;
         let mut posting_atoms = vec![0; posting_count];
+        let mut posting_positions_by_atom = vec![MetadataDocIndex::MAX; template.sketches.len()];
         for (atom_index, (template_sketch, content_sketch)) in
             template.sketches.iter().zip(&content.sketches).enumerate()
         {
@@ -234,11 +233,13 @@ impl MetadataConservativeJointBandFamily {
                 | usize::from(content_value);
             let cursor = &mut cursors[bucket];
             posting_atoms[*cursor as usize] = metadata_doc_index_from_usize(atom_index);
+            posting_positions_by_atom[atom_index] = metadata_doc_index_from_usize(*cursor as usize);
             *cursor = cursor.saturating_add(1);
         }
         Self {
             posting_offsets,
             posting_atoms,
+            posting_positions_by_atom,
         }
     }
 
@@ -253,6 +254,25 @@ impl MetadataConservativeJointBandFamily {
         let relative_start = posting.partition_point(|&right| right <= atom_index);
         MetadataPostingRange {
             start: posting_start + relative_start,
+            end: posting_end,
+        }
+    }
+
+    fn posting_range_after_own_bucket(
+        &self,
+        bucket: usize,
+        atom_index: usize,
+    ) -> MetadataPostingRange {
+        let position = metadata_doc_index_to_usize(self.posting_positions_by_atom[atom_index]);
+        let posting_start = self.posting_offsets[bucket] as usize;
+        let posting_end = self.posting_offsets[bucket + 1] as usize;
+        debug_assert!(position >= posting_start && position < posting_end);
+        debug_assert_eq!(
+            self.posting_atoms[position],
+            metadata_doc_index_from_usize(atom_index)
+        );
+        MetadataPostingRange {
+            start: position.saturating_add(1),
             end: posting_end,
         }
     }
@@ -313,7 +333,12 @@ impl MetadataConservativeJointBandIndex {
                         let bucket = (usize::from(template_probe)
                             << METADATA_CONSERVATIVE_SIMHASH_BAND_BITS)
                             | usize::from(content_probe);
-                        let range = family.posting_range_after(bucket, compact_atom_index);
+                        let range =
+                            if template_probe == template_value && content_probe == content_value {
+                                family.posting_range_after_own_bucket(bucket, atom_index)
+                            } else {
+                                family.posting_range_after(bucket, compact_atom_index)
+                            };
                         visit(family, range);
                     }
                 }
@@ -815,55 +840,6 @@ pub(in super::super) fn metadata_conservative_calibration_sample_positions(
         .collect()
 }
 
-#[cfg(test)]
-pub(in super::super) fn select_metadata_calibration_work_items(
-    items: &[MetadataCalibrationWorkItem],
-    minimum_lefts: usize,
-    maximum_posting_visits: u64,
-) -> Result<Vec<usize>, AnalysisError> {
-    let mut mandatory_strata = HashSet::new();
-    let mut selected = vec![false; items.len()];
-    let mut selected_count = 0usize;
-    let mut used_work = 0u64;
-    for (item_index, item) in items.iter().enumerate() {
-        let posting_visits = item.estimated_posting_visits.max(1);
-        let cost_bucket = 63u32.saturating_sub(posting_visits.leading_zeros());
-        if mandatory_strata.insert((item.chain_index, cost_bucket)) {
-            used_work = used_work.saturating_add(posting_visits);
-            if used_work > maximum_posting_visits {
-                return Err(AnalysisError::InvalidData(format!(
-                    "metadata conservative calibration work budget {maximum_posting_visits} cannot cover mandatory chain/cost strata; needs at least {used_work} estimated posting visits"
-                )));
-            }
-            selected[item_index] = true;
-            selected_count = selected_count.saturating_add(1);
-        }
-    }
-    for (item_index, item) in items.iter().enumerate() {
-        if selected[item_index] {
-            continue;
-        }
-        let posting_visits = item.estimated_posting_visits.max(1);
-        if used_work.saturating_add(posting_visits) > maximum_posting_visits {
-            continue;
-        }
-        used_work = used_work.saturating_add(posting_visits);
-        selected[item_index] = true;
-        selected_count = selected_count.saturating_add(1);
-    }
-    let required = minimum_lefts.min(items.len());
-    if selected_count < required {
-        return Err(AnalysisError::InvalidData(format!(
-            "metadata conservative calibration work budget {maximum_posting_visits} covers only {selected_count} sampled left atoms, below required {required}"
-        )));
-    }
-    Ok(items
-        .iter()
-        .zip(selected)
-        .filter_map(|(item, selected)| selected.then_some(item.left))
-        .collect())
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct MetadataCalibrationReservoirEntry {
     priority: u64,
@@ -911,8 +887,15 @@ pub(in super::super) fn plan_metadata_bounded_exact_rescue(
     atoms: &[MetadataContentAtom],
     exact_posting_visits_by_left: &[u64],
     risk_strata: &[(usize, u32)],
+    recall_risk_exceeded: bool,
     maximum_posting_visits: u64,
 ) -> MetadataExactRescuePlan {
+    if !recall_risk_exceeded {
+        return MetadataExactRescuePlan {
+            exact_recall_by_left: vec![false; exact_posting_visits_by_left.len()],
+            ..MetadataExactRescuePlan::default()
+        };
+    }
     let risk_strata = risk_strata.iter().copied().collect::<BTreeSet<_>>();
     let mut lefts_by_stratum = BTreeMap::<(usize, u32), (u64, Vec<usize>)>::new();
     for (left, &posting_visits) in exact_posting_visits_by_left.iter().enumerate() {
@@ -1050,15 +1033,10 @@ fn plan_metadata_calibration_work_items_with_estimates(
             estimated_total_posting_visits,
             estimated_sample_posting_visits: 0,
             retained_calibration_candidates: 0,
+            uncovered_calibration_strata: Vec::new(),
         });
     }
     let maximum_lefts = maximum_lefts.min(item_count);
-    if maximum_lefts < strata.len() {
-        return Err(AnalysisError::InvalidData(format!(
-            "metadata conservative calibration left budget {maximum_lefts} cannot cover {} mandatory chain/cost strata",
-            strata.len()
-        )));
-    }
     for entry in global_reservoir {
         let posting_visits = entry.item.estimated_posting_visits.max(1);
         let cost_bucket = 63u32.saturating_sub(posting_visits.leading_zeros());
@@ -1121,23 +1099,33 @@ fn plan_metadata_calibration_work_items_with_estimates(
         })
         .collect::<Vec<_>>();
 
+    let mut mandatory_order = (0..selection.len()).collect::<Vec<_>>();
+    mandatory_order.sort_unstable_by_key(|&index| {
+        let stratum = &selection[index];
+        (
+            stratum.candidates[0].estimated_posting_visits.max(1),
+            stratum.chain_index,
+            stratum.cost_bucket,
+        )
+    });
     let mut estimated_sample_posting_visits = 0u64;
-    for stratum in &mut selection {
-        let item = stratum
-            .candidates
-            .first()
-            .expect("non-empty calibration stratum must retain a sample");
-        estimated_sample_posting_visits =
-            estimated_sample_posting_visits.saturating_add(item.estimated_posting_visits.max(1));
-        if estimated_sample_posting_visits > maximum_posting_visits {
-            return Err(AnalysisError::InvalidData(format!(
-                "metadata conservative calibration work budget {maximum_posting_visits} cannot cover mandatory chain/cost strata; needs at least {estimated_sample_posting_visits} estimated posting visits"
-            )));
+    let mut selected_count = 0usize;
+    let mut uncovered_calibration_strata = Vec::new();
+    for index in mandatory_order {
+        let stratum = &mut selection[index];
+        let item_work = stratum.candidates[0].estimated_posting_visits.max(1);
+        if selected_count >= maximum_lefts
+            || estimated_sample_posting_visits.saturating_add(item_work) > maximum_posting_visits
+        {
+            stratum.blocked = true;
+            uncovered_calibration_strata.push((stratum.chain_index, stratum.cost_bucket));
+            continue;
         }
+        estimated_sample_posting_visits = estimated_sample_posting_visits.saturating_add(item_work);
         stratum.selected = 1;
+        selected_count = selected_count.saturating_add(1);
     }
-
-    let mut selected_count = selection.len();
+    uncovered_calibration_strata.sort_unstable();
     while selected_count < maximum_lefts {
         let mut best: Option<usize> = None;
         for index in 0..selection.len() {
@@ -1185,13 +1173,18 @@ fn plan_metadata_calibration_work_items_with_estimates(
         stratum.selected = stratum.selected.saturating_add(1);
         selected_count = selected_count.saturating_add(1);
     }
-
     let required = minimum_lefts.min(item_count);
     if selected_count < required {
-        return Err(AnalysisError::InvalidData(format!(
-            "metadata conservative calibration work budget {maximum_posting_visits} covers only {selected_count} sampled left atoms, below required {required}"
-        )));
+        uncovered_calibration_strata.extend(
+            selection
+                .iter()
+                .filter(|stratum| stratum.blocked || (stratum.selected as u64) < stratum.population)
+                .map(|stratum| (stratum.chain_index, stratum.cost_bucket)),
+        );
+        uncovered_calibration_strata.sort_unstable();
+        uncovered_calibration_strata.dedup();
     }
+
     let mut samples = Vec::with_capacity(selected_count);
     for stratum in selection {
         let stratum_sample_count = stratum.selected as u64;
@@ -1225,6 +1218,7 @@ fn plan_metadata_calibration_work_items_with_estimates(
         estimated_total_posting_visits,
         estimated_sample_posting_visits,
         retained_calibration_candidates,
+        uncovered_calibration_strata,
     })
 }
 

@@ -173,11 +173,16 @@ impl CompactMetadataContentGroupBuilder {
                 .atoms
                 .len()
                 .saturating_mul(METADATA_CONSERVATIVE_JOINT_BAND_FAMILIES);
+            let family_positions = family_postings;
             let family_offsets = METADATA_CONSERVATIVE_JOINT_BAND_FAMILIES
                 .saturating_mul(METADATA_CONSERVATIVE_JOINT_BAND_BUCKETS.saturating_add(1));
             let build_cursors = METADATA_CONSERVATIVE_JOINT_BAND_FAMILIES
                 .saturating_mul(METADATA_CONSERVATIVE_JOINT_BAND_BUCKETS);
             Self::vec_bytes_upper(family_postings, std::mem::size_of::<MetadataDocIndex>())
+                .saturating_add(Self::vec_bytes_upper(
+                    family_positions,
+                    std::mem::size_of::<MetadataDocIndex>(),
+                ))
                 .saturating_add(Self::vec_bytes_upper(
                     family_offsets,
                     std::mem::size_of::<u64>(),
@@ -359,6 +364,10 @@ impl CompactMetadataContentGroupBuilder {
                 .saturating_add(calibration_samples)
                 .saturating_add(calibration_reservoir)
                 .saturating_add(calibration_strata)
+                .saturating_add(Self::vec_bytes_upper(
+                    stratum_count_upper,
+                    std::mem::size_of::<(usize, u32)>(),
+                ))
         } else {
             0
         };

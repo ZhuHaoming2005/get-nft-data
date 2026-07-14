@@ -728,17 +728,23 @@ pub(in super::super) fn union_metadata_shared_token_atom_core(
                 candidate_buffer_pool: Some(&candidate_buffer_pool),
                 progress,
             });
+        let recall_risk_exceeded = calibration.stats.requires_exact_fallback();
         let rescue = plan_metadata_bounded_exact_rescue(
             &atoms,
             &calibration_plan.estimated_posting_visits_by_left,
             &calibration.risk_strata,
+            recall_risk_exceeded,
             METADATA_CONSERVATIVE_RESCUE_MAX_POSTING_VISITS,
         );
-        stats.recall_risk_exceeded_groups = u64::from(calibration.stats.requires_exact_fallback());
+        stats.recall_risk_exceeded_groups = u64::from(
+            recall_risk_exceeded || !calibration_plan.uncovered_calibration_strata.is_empty(),
+        );
         stats.recall_calibration = calibration.stats;
         stats.exact_rescue_left_atoms = rescue.exact_left_atoms;
         stats.exact_rescue_estimated_posting_visits = rescue.estimated_exact_posting_visits;
-        stats.unrescued_recall_risk_strata = rescue.unrescued_risk_strata;
+        stats.unrescued_recall_risk_strata = rescue
+            .unrescued_risk_strata
+            .saturating_add(calibration_plan.uncovered_calibration_strata.len() as u64);
         if let Some(progress) = progress {
             progress.finish_calibration();
             progress.update(&stats);
@@ -1033,18 +1039,23 @@ pub(in super::super) fn union_metadata_no_common_atom_core(
                 candidate_buffer_pool: Some(&candidate_buffer_pool),
                 progress: None,
             });
+        let recall_risk_exceeded = calibration.stats.representative_recall_risk_exceeded();
         let rescue = plan_metadata_bounded_exact_rescue(
             &atoms,
             &calibration_plan.estimated_posting_visits_by_left,
             &calibration.risk_strata,
+            recall_risk_exceeded,
             METADATA_CONSERVATIVE_RESCUE_MAX_POSTING_VISITS,
         );
-        stats.recall_risk_exceeded_groups =
-            u64::from(calibration.stats.representative_recall_risk_exceeded());
+        stats.recall_risk_exceeded_groups = u64::from(
+            recall_risk_exceeded || !calibration_plan.uncovered_calibration_strata.is_empty(),
+        );
         stats.recall_calibration = calibration.stats;
         stats.exact_rescue_left_atoms = rescue.exact_left_atoms;
         stats.exact_rescue_estimated_posting_visits = rescue.estimated_exact_posting_visits;
-        stats.unrescued_recall_risk_strata = rescue.unrescued_risk_strata;
+        stats.unrescued_recall_risk_strata = rescue
+            .unrescued_risk_strata
+            .saturating_add(calibration_plan.uncovered_calibration_strata.len() as u64);
         (false, rescue)
     } else {
         (true, MetadataExactRescuePlan::default())

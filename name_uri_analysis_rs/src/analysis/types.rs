@@ -258,6 +258,23 @@ impl UnionFind {
         connected
     }
 
+    pub(crate) fn connected_with_left_root(
+        &mut self,
+        left: usize,
+        right: usize,
+        left_root: &mut Option<usize>,
+    ) -> bool {
+        if left == right || self.connected_pair_is_cached(left, right) {
+            return true;
+        }
+        let left_root = *left_root.get_or_insert_with(|| self.find(left));
+        let connected = left_root == self.find(right);
+        if connected {
+            self.cache_connected_pair(left, right);
+        }
+        connected
+    }
+
     #[cfg(test)]
     pub(crate) fn connected_cache_contains(&self, left: usize, right: usize) -> bool {
         self.connected_pair_is_cached(left, right)

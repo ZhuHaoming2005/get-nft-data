@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn metadata_stage_revision_tracks_conservative_fallback_semantics() {
-    assert_eq!(StageRevisions::current().metadata, 3);
+    assert_eq!(StageRevisions::current().metadata, 4);
     assert_eq!(StageRevisions::current().prepare, 1);
     assert_eq!(StageRevisions::current().name, 1);
 }
@@ -295,7 +295,7 @@ fn resume_stage_revision_changes_follow_the_dependency_graph() {
             revisions: serde_json::json!({
                 "prepare": 0,
                 "name": 1,
-                "metadata": 3,
+                "metadata": 4,
                 "finalizer": 1,
             }),
             invalidated_stages: &[
@@ -313,7 +313,7 @@ fn resume_stage_revision_changes_follow_the_dependency_graph() {
             revisions: serde_json::json!({
                 "prepare": 1,
                 "name": 0,
-                "metadata": 3,
+                "metadata": 4,
                 "finalizer": 1,
             }),
             invalidated_stages: &["name_complete", "finalized"],
@@ -323,7 +323,7 @@ fn resume_stage_revision_changes_follow_the_dependency_graph() {
             revisions: serde_json::json!({
                 "prepare": 1,
                 "name": 1,
-                "metadata": 2,
+                "metadata": 3,
                 "finalizer": 1,
             }),
             invalidated_stages: &["metadata_complete", "finalized"],
@@ -333,7 +333,7 @@ fn resume_stage_revision_changes_follow_the_dependency_graph() {
             revisions: serde_json::json!({
                 "prepare": 1,
                 "name": 1,
-                "metadata": 3,
+                "metadata": 4,
                 "finalizer": 0,
             }),
             invalidated_stages: &["finalized"],

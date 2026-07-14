@@ -18,7 +18,7 @@ fn conservative_calibration_positions_are_deterministic_and_bounded() {
 }
 
 #[test]
-fn conservative_calibration_work_budget_preserves_cost_strata_or_fails() {
+fn conservative_calibration_work_budget_records_uncovered_strata_instead_of_failing() {
     let items = [
         MetadataCalibrationWorkItem {
             left: 0,
@@ -42,17 +42,20 @@ fn conservative_calibration_work_budget_preserves_cost_strata_or_fails() {
         },
     ];
 
-    let selected = select_metadata_calibration_work_items(&items, 3, 1_020).unwrap();
-    assert_eq!(selected, vec![0, 2, 3]);
-    let used = items
-        .iter()
-        .filter(|item| selected.contains(&item.left))
-        .map(|item| item.estimated_posting_visits)
-        .sum::<u64>();
-    assert!(used <= 1_020);
+    let covered = plan_metadata_calibration_work_items(items, 3, 3, 1_021).unwrap();
+    assert_eq!(covered.samples.len(), 3);
+    assert!(covered.uncovered_calibration_strata.is_empty());
+    assert!(covered.estimated_sample_posting_visits <= 1_021);
 
-    let error = select_metadata_calibration_work_items(&items, 3, 1_019).unwrap_err();
-    assert!(error.to_string().contains("calibration work budget"));
+    let bounded = plan_metadata_calibration_work_items(items, 3, 3, 1_020).unwrap();
+    assert_eq!(bounded.samples.len(), 2);
+    assert_eq!(bounded.uncovered_calibration_strata, vec![(0, 3), (0, 9)]);
+    assert!(bounded.estimated_sample_posting_visits <= 1_020);
+
+    let underpowered =
+        plan_metadata_calibration_work_items(items[..2].iter().copied(), 2, 2, 11).unwrap();
+    assert_eq!(underpowered.samples.len(), 1);
+    assert_eq!(underpowered.uncovered_calibration_strata, vec![(0, 3)]);
 }
 
 #[test]
@@ -714,8 +717,15 @@ fn bounded_exact_rescue_selects_whole_risk_strata_without_exceeding_work_budget(
     };
     let atoms = vec![atom(0), atom(0), atom(1), atom(1)];
     let exact_estimates = vec![8, 4, 16];
+    let below_limit =
+        plan_metadata_bounded_exact_rescue(&atoms, &exact_estimates, &[(0, 3), (1, 4)], false, 10);
+    assert_eq!(below_limit.exact_recall_by_left, vec![false; 3]);
+    assert_eq!(below_limit.exact_left_atoms, 0);
+    assert_eq!(below_limit.estimated_exact_posting_visits, 0);
+    assert_eq!(below_limit.unrescued_risk_strata, 0);
+
     let rescue =
-        plan_metadata_bounded_exact_rescue(&atoms, &exact_estimates, &[(0, 3), (1, 4)], 10);
+        plan_metadata_bounded_exact_rescue(&atoms, &exact_estimates, &[(0, 3), (1, 4)], true, 10);
 
     assert_eq!(rescue.exact_recall_by_left, vec![true, false, false]);
     assert_eq!(rescue.exact_left_atoms, 1);

@@ -207,6 +207,7 @@ pub(super) struct MetadataConservativeDimensionIndex {
 pub(super) struct MetadataConservativeJointBandFamily {
     pub(super) posting_offsets: Vec<u64>,
     pub(super) posting_atoms: Vec<MetadataDocIndex>,
+    pub(super) posting_positions_by_atom: Vec<MetadataDocIndex>,
 }
 
 pub(super) struct MetadataConservativeJointBandIndex {
@@ -253,6 +254,7 @@ pub(super) struct MetadataCalibrationPlan {
     pub(super) estimated_total_posting_visits: u64,
     pub(super) estimated_sample_posting_visits: u64,
     pub(super) retained_calibration_candidates: usize,
+    pub(super) uncovered_calibration_strata: Vec<(usize, u32)>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
