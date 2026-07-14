@@ -165,11 +165,40 @@ impl CompactMetadataContentGroupBuilder {
         } else {
             0
         };
+        let joint_candidate_index = if uses_adaptive_index
+            && recall_mode == MetadataRecallMode::Conservative
+            && self.atoms.len() >= METADATA_CONSERVATIVE_JOINT_MIN_ATOMS
+        {
+            let family_postings = self
+                .atoms
+                .len()
+                .saturating_mul(METADATA_CONSERVATIVE_JOINT_BAND_FAMILIES);
+            let family_offsets = METADATA_CONSERVATIVE_JOINT_BAND_FAMILIES
+                .saturating_mul(METADATA_CONSERVATIVE_JOINT_BAND_BUCKETS.saturating_add(1));
+            let build_cursors = METADATA_CONSERVATIVE_JOINT_BAND_FAMILIES
+                .saturating_mul(METADATA_CONSERVATIVE_JOINT_BAND_BUCKETS);
+            Self::vec_bytes_upper(family_postings, std::mem::size_of::<MetadataDocIndex>())
+                .saturating_add(Self::vec_bytes_upper(
+                    family_offsets,
+                    std::mem::size_of::<u64>(),
+                ))
+                .saturating_add(Self::vec_bytes_upper(
+                    build_cursors,
+                    std::mem::size_of::<u64>(),
+                ))
+                .saturating_add(Self::vec_bytes_upper(
+                    METADATA_CONSERVATIVE_JOINT_BAND_FAMILIES,
+                    std::mem::size_of::<MetadataConservativeJointBandFamily>(),
+                ))
+        } else {
+            0
+        };
         let candidate_index = if uses_adaptive_index {
             content_candidate_index
                 .saturating_add(template_candidate_index)
                 .saturating_add(template_candidate_flat_build)
                 .saturating_add(conservative_candidate_index)
+                .saturating_add(joint_candidate_index)
         } else {
             0
         };
@@ -216,6 +245,14 @@ impl CompactMetadataContentGroupBuilder {
             Self::vec_bytes_upper(self.atoms.len(), std::mem::size_of::<u64>()).saturating_add(
                 Self::vec_bytes_upper(self.atoms.len(), std::mem::size_of::<usize>()),
             )
+        } else {
+            0
+        };
+        let exact_rescue_mask = if uses_adaptive_index
+            && recall_mode == MetadataRecallMode::Conservative
+            && self.atoms.len() >= METADATA_CONSERVATIVE_MIN_ATOMS
+        {
+            Self::vec_bytes_upper(self.atoms.len(), std::mem::size_of::<bool>())
         } else {
             0
         };
@@ -331,6 +368,7 @@ impl CompactMetadataContentGroupBuilder {
             .saturating_add(fallback_exclusion_index)
             .saturating_add(fallback_exclusion_scratch)
             .saturating_add(difficult_first_order)
+            .saturating_add(exact_rescue_mask)
             .saturating_add(candidate_scratch)
             .saturating_add(candidate_wave)
             .saturating_add(pair_batches)
@@ -878,22 +916,78 @@ impl MetadataFallbackTokenExclusionIndex {
         atoms: &[MetadataContentAtom],
         contract_tokens: &CompactContractTokens,
         scratch: &mut MetadataFallbackTokenExclusionScratch,
-    ) {
+    ) -> usize {
         scratch.clear();
         let [group] = atoms[left].fallback_token_groups.as_slice() else {
-            return;
+            return 0;
         };
         scratch.prepared_single_group = true;
+        let compact_left = metadata_doc_index_from_usize(left);
+        let mut posting_visits = 0usize;
         for &token in metadata_fallback_token_group_tokens(group, contract_tokens) {
-            let Ok(token_index) = self.postings.token_ids.binary_search(&token) else {
-                continue;
-            };
-            let start = self.postings.posting_offsets[token_index] as usize;
-            let end = self.postings.posting_offsets[token_index + 1] as usize;
-            for &right in &self.postings.posting_atoms[start..end] {
+            let range = self.postings.posting_range_after(token, compact_left);
+            posting_visits = posting_visits.saturating_add(range.end.saturating_sub(range.start));
+            for &right in &self.postings.posting_atoms[range.start..range.end] {
                 scratch.insert(metadata_doc_index_to_usize(right));
             }
         }
+        posting_visits
+    }
+
+    pub(in super::super) fn estimate_left_suffix_visits(
+        &self,
+        left: usize,
+        atoms: &[MetadataContentAtom],
+        contract_tokens: &CompactContractTokens,
+    ) -> usize {
+        let [group] = atoms[left].fallback_token_groups.as_slice() else {
+            return 0;
+        };
+        let compact_left = metadata_doc_index_from_usize(left);
+        metadata_fallback_token_group_tokens(group, contract_tokens)
+            .iter()
+            .copied()
+            .map(|token| {
+                let range = self.postings.posting_range_after(token, compact_left);
+                range.end.saturating_sub(range.start)
+            })
+            .fold(0usize, usize::saturating_add)
+    }
+
+    pub(in super::super) fn prepare_left_if_cheaper(
+        &self,
+        left: usize,
+        candidates: &[MetadataDocIndex],
+        atoms: &[MetadataContentAtom],
+        contract_tokens: &CompactContractTokens,
+        scratch: &mut MetadataFallbackTokenExclusionScratch,
+    ) -> usize {
+        scratch.clear();
+        let [left_group] = atoms[left].fallback_token_groups.as_slice() else {
+            return 0;
+        };
+        let left_token_count =
+            metadata_fallback_token_group_tokens(left_group, contract_tokens).len();
+        let scalar_token_visits = candidates
+            .iter()
+            .copied()
+            .filter_map(|right| {
+                let [right_group] = atoms[metadata_doc_index_to_usize(right)]
+                    .fallback_token_groups
+                    .as_slice()
+                else {
+                    return None;
+                };
+                Some(left_token_count.saturating_add(
+                    metadata_fallback_token_group_tokens(right_group, contract_tokens).len(),
+                ))
+            })
+            .fold(0usize, usize::saturating_add);
+        let posting_visits = self.estimate_left_suffix_visits(left, atoms, contract_tokens);
+        if posting_visits >= scalar_token_visits {
+            return 0;
+        }
+        self.prepare_left(left, atoms, contract_tokens, scratch)
     }
 
     pub(in super::super) fn atoms_have_disjoint_token_groups(

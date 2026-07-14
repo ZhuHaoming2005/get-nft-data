@@ -187,6 +187,7 @@ fn scored_adaptive_fallback_preserves_disjoint_token_group_semantics() {
     );
     assert_eq!(stats.dimension_rejected_pairs, 0);
     assert_eq!(stats.token_overlap_rejected_pairs, 1);
+    assert_eq!(stats.token_exclusion_posting_visits, 1);
     assert_eq!(state.intra.find(0), state.intra.find(1));
     assert_ne!(state.intra.find(2), state.intra.find(3));
 }
@@ -224,9 +225,11 @@ fn fallback_single_group_exclusion_bitmap_matches_scalar_multi_group_semantics()
     let index = MetadataFallbackTokenExclusionIndex::from_atoms(&atoms, &contract_tokens);
     let mut scratch = MetadataFallbackTokenExclusionScratch::new(atoms.len());
 
+    let expected_suffix_visits = [1, 0, 0, 0];
     for left in 0..atoms.len() {
-        index.prepare_left(left, &atoms, &contract_tokens, &mut scratch);
-        for right in 0..atoms.len() {
+        let visits = index.prepare_left(left, &atoms, &contract_tokens, &mut scratch);
+        assert_eq!(visits, expected_suffix_visits[left]);
+        for right in left + 1..atoms.len() {
             let expected = metadata_fallback_atoms_have_disjoint_token_groups(
                 &atoms[left],
                 &atoms[right],
@@ -245,6 +248,43 @@ fn fallback_single_group_exclusion_bitmap_matches_scalar_multi_group_semantics()
             );
         }
     }
+}
+
+#[test]
+fn fallback_token_exclusion_uses_scalar_checks_for_sparse_candidate_sets() {
+    let contract_tokens = CompactContractTokens::from_nested(vec![vec![7]; 4]);
+    let atom = |member: usize| MetadataContentAtom {
+        chain_index: 0,
+        template_doc_index: metadata_doc_index_from_usize(0),
+        representative_record_index: metadata_doc_index_from_usize(0),
+        members: vec![metadata_contract_index_from_usize(member)],
+        fallback_token_groups: vec![MetadataFallbackTokenGroup {
+            members: vec![metadata_contract_index_from_usize(member)],
+        }],
+    };
+    let atoms = (0..4).map(atom).collect::<Vec<_>>();
+    let index = MetadataFallbackTokenExclusionIndex::from_atoms(&atoms, &contract_tokens);
+    let mut scratch = MetadataFallbackTokenExclusionScratch::new(atoms.len());
+
+    let sparse_candidates = vec![metadata_doc_index_from_usize(3)];
+    let sparse_visits = index.prepare_left_if_cheaper(
+        0,
+        &sparse_candidates,
+        &atoms,
+        &contract_tokens,
+        &mut scratch,
+    );
+    assert_eq!(sparse_visits, 0);
+    assert!(!scratch.prepared_single_group);
+    assert!(!index.atoms_have_disjoint_token_groups(0, 3, &atoms, &contract_tokens, &scratch,));
+
+    let dense_candidates = (1..4)
+        .map(metadata_doc_index_from_usize)
+        .collect::<Vec<_>>();
+    let dense_visits =
+        index.prepare_left_if_cheaper(0, &dense_candidates, &atoms, &contract_tokens, &mut scratch);
+    assert_eq!(dense_visits, 3);
+    assert!(scratch.prepared_single_group);
 }
 
 #[test]

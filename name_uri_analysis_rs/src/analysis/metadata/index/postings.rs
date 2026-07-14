@@ -356,6 +356,26 @@ impl MetadataTemplateCandidateIndex {
 }
 
 impl MetadataLocalCandidateIndex {
+    pub(in super::super) fn estimate_production_posting_visits(
+        &self,
+        atom_index: usize,
+        atom: &MetadataContentAtom,
+        document: &CompactMetadataContentDocument,
+        compatibility: MetadataTemplateCompatibility<'_>,
+        posting_plan: &mut MetadataCandidatePostingPlan,
+    ) -> usize {
+        match self {
+            Self::Conservative(index) => index.estimate_posting_visits_after(atom_index),
+            _ => self.estimate_exact_posting_visits(
+                atom_index,
+                atom,
+                document,
+                compatibility,
+                posting_plan,
+            ),
+        }
+    }
+
     pub(in super::super) fn estimate_exact_posting_visits(
         &self,
         atom_index: usize,
@@ -475,11 +495,18 @@ impl MetadataLocalCandidateIndex {
                             ),
                         )
                     };
+                    let joint_bands =
+                        (atoms.len() >= METADATA_CONSERVATIVE_JOINT_MIN_ATOMS).then(|| {
+                            MetadataConservativeJointBandIndex::from_dimensions(
+                                &template, &content, parallel,
+                            )
+                        });
                     return Self::Conservative(Box::new(MetadataConservativeCandidateIndex {
                         exact_template: Some(exact_template),
                         exact_content: Some(exact_content),
                         template,
                         content,
+                        joint_bands,
                         profile: MetadataConservativeRecallProfile::Base,
                     }));
                 }
@@ -518,20 +545,7 @@ impl MetadataLocalCandidateIndex {
     ) -> MetadataLocalCandidateBasis {
         match self {
             Self::Conservative(index) => {
-                index
-                    .template
-                    .append_candidates_after(atom_index, index.profile, scratch);
-                scratch.prepare_secondary_generation();
-                index
-                    .content
-                    .append_candidates_after(atom_index, index.profile, scratch);
-                scratch.raw_candidate_count = scratch.secondary_candidates.len();
-                scratch.retain_secondary_intersection();
-                scratch.candidates.retain(|&right| {
-                    let right = metadata_doc_index_to_usize(right);
-                    index.template.matches(atom_index, right)
-                        && index.content.matches(atom_index, right)
-                });
+                index.append_candidates_after(atom_index, scratch);
                 MetadataLocalCandidateBasis::ConservativeIntersection
             }
             Self::Adaptive { template, content } => Self::append_exact_index_candidates_after(
@@ -628,7 +642,11 @@ impl MetadataLocalCandidateIndex {
         }
     }
 
-    pub(in super::super) fn into_effective_recall(self, exact_recall: bool) -> Self {
+    pub(in super::super) fn into_effective_recall(
+        self,
+        exact_recall: bool,
+        retain_exact_rescue_indexes: bool,
+    ) -> Self {
         match self {
             Self::Conservative(mut index) if exact_recall => Self::Adaptive {
                 template: index
@@ -640,21 +658,13 @@ impl MetadataLocalCandidateIndex {
                     .take()
                     .expect("exact metadata calibration index already released"),
             },
+            Self::Conservative(index) if retain_exact_rescue_indexes => Self::Conservative(index),
             Self::Conservative(mut index) => {
                 index.exact_template = None;
                 index.exact_content = None;
                 Self::Conservative(index)
             }
             index => index,
-        }
-    }
-
-    pub(in super::super) fn set_conservative_profile(
-        &mut self,
-        profile: MetadataConservativeRecallProfile,
-    ) {
-        if let Self::Conservative(index) = self {
-            index.profile = profile;
         }
     }
 }

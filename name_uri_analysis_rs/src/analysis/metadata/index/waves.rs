@@ -463,6 +463,13 @@ pub(in super::super) fn collect_metadata_template_pair_evaluations(
 }
 
 impl MetadataValidatedPairBatch {
+    pub(in super::super) fn with_hit_capacity(capacity: usize) -> Self {
+        Self {
+            hits: Vec::with_capacity(capacity),
+            stats: MetadataPairScoringStats::default(),
+        }
+    }
+
     pub(in super::super) fn score_pair_with_cache(
         &mut self,
         pair: (usize, MetadataDocIndex),
@@ -579,7 +586,8 @@ pub(in super::super) fn collect_metadata_validated_atom_pair_hits(
                     .map_init(
                         || template_cache_pool.take(),
                         |cache, pairs| {
-                            let mut batch = MetadataValidatedPairBatch::default();
+                            let mut batch =
+                                MetadataValidatedPairBatch::with_hit_capacity(pairs.len());
                             for &pair in pairs {
                                 batch.score_pair_with_cache(
                                     pair,
@@ -599,7 +607,7 @@ pub(in super::super) fn collect_metadata_validated_atom_pair_hits(
             });
         }
         let mut cache = template_cache_pool.take();
-        let mut batch = MetadataValidatedPairBatch::default();
+        let mut batch = MetadataValidatedPairBatch::with_hit_capacity(candidate_pairs.len());
         for &pair in candidate_pairs {
             batch.score_pair_with_cache(
                 pair,
@@ -624,7 +632,7 @@ pub(in super::super) fn collect_metadata_validated_atom_pair_hits(
                 .par_chunks(METADATA_CONTENT_PARALLEL_MIN_RECORDS)
                 .zip(template_evaluations.par_chunks(METADATA_CONTENT_PARALLEL_MIN_RECORDS))
                 .map(|(pairs, evaluations)| {
-                    let mut batch = MetadataValidatedPairBatch::default();
+                    let mut batch = MetadataValidatedPairBatch::with_hit_capacity(pairs.len());
                     for (&pair, &evaluation) in pairs.iter().zip(evaluations) {
                         batch.score_pair(pair, evaluation, atoms, compact_docs);
                     }
@@ -636,7 +644,7 @@ pub(in super::super) fn collect_metadata_validated_atom_pair_hits(
                 )
         })
     } else {
-        let mut batch = MetadataValidatedPairBatch::default();
+        let mut batch = MetadataValidatedPairBatch::with_hit_capacity(candidate_pairs.len());
         for (&pair, &evaluation) in candidate_pairs.iter().zip(&template_evaluations) {
             batch.score_pair(pair, evaluation, atoms, compact_docs);
         }
@@ -821,7 +829,13 @@ pub(in super::super) fn collect_metadata_left_candidate_batch(
             scratch.posting_plan = posting_plan;
             estimated as u64
         });
-    let candidate_basis = if collection.exact_recall {
+    let exact_recall = collection.exact_recall
+        || collection
+            .exact_recall_by_left
+            .and_then(|exact_by_left| exact_by_left.get(left))
+            .copied()
+            .unwrap_or(false);
+    let candidate_basis = if exact_recall {
         collection.candidate_index.append_exact_candidates_after(
             left,
             left_atom,
@@ -839,21 +853,11 @@ pub(in super::super) fn collect_metadata_left_candidate_batch(
         )
     };
     let raw_candidate_pairs = scratch.raw_candidate_count as u64;
-    if let Some(exclusion_index) = collection.fallback_token_exclusion_index {
-        exclusion_index.prepare_left(
-            left,
-            atoms,
-            collection.contract_tokens,
-            &mut scratch.fallback_token_exclusion,
-        );
-    }
     let mut candidates = collection
         .candidate_buffer_pool
         .map(|pool| pool.take_sparse())
         .unwrap_or_default();
     candidates.reserve(scratch.candidates.len());
-    let mut dimension_accepted_pairs = 0u64;
-    let mut token_overlap_rejected_pairs = 0u64;
     for right in scratch.candidates.iter().copied() {
         if !metadata_candidate_intersects_both_dimensions(
             candidate_basis,
@@ -865,8 +869,24 @@ pub(in super::super) fn collect_metadata_left_candidate_batch(
         ) {
             continue;
         }
-        dimension_accepted_pairs = dimension_accepted_pairs.saturating_add(1);
-        if matches!(collection.scope, MetadataCandidateUnionScope::Fallback) {
+        candidates.push(right);
+    }
+    let dimension_accepted_pairs = candidates.len() as u64;
+    let mut token_overlap_rejected_pairs = 0u64;
+    let mut token_exclusion_posting_visits = 0u64;
+    if matches!(collection.scope, MetadataCandidateUnionScope::Fallback) {
+        if !candidates.is_empty() {
+            if let Some(exclusion_index) = collection.fallback_token_exclusion_index {
+                token_exclusion_posting_visits = exclusion_index.prepare_left_if_cheaper(
+                    left,
+                    &candidates,
+                    atoms,
+                    collection.contract_tokens,
+                    &mut scratch.fallback_token_exclusion,
+                ) as u64;
+            }
+        }
+        candidates.retain(|&right| {
             let right_index = metadata_doc_index_to_usize(right);
             let has_disjoint_token_groups = collection
                 .fallback_token_exclusion_index
@@ -888,10 +908,9 @@ pub(in super::super) fn collect_metadata_left_candidate_batch(
                 });
             if !has_disjoint_token_groups {
                 token_overlap_rejected_pairs = token_overlap_rejected_pairs.saturating_add(1);
-                continue;
             }
-        }
-        candidates.push(right);
+            has_disjoint_token_groups
+        });
     }
     let dimension_rejected_pairs = raw_candidate_pairs.saturating_sub(dimension_accepted_pairs);
     let candidates = match collection.candidate_buffer_pool {
@@ -912,6 +931,7 @@ pub(in super::super) fn collect_metadata_left_candidate_batch(
         token_overlap_rejected_pairs,
         estimated_posting_visits,
         visited_posting_entries: scratch.visited_posting_entries,
+        token_exclusion_posting_visits,
     }
 }
 
@@ -951,6 +971,10 @@ impl MetadataLeftCandidateBatchConsumer<'_, '_> {
             .stats
             .visited_posting_entries
             .saturating_add(left_batch.visited_posting_entries);
+        self.stats.token_exclusion_posting_visits = self
+            .stats
+            .token_exclusion_posting_visits
+            .saturating_add(left_batch.token_exclusion_posting_visits);
         self.stats.dense_candidate_promotions = self
             .stats
             .dense_candidate_promotions

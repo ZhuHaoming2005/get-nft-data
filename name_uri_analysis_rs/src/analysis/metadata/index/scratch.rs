@@ -115,28 +115,26 @@ impl MetadataCandidateBufferPool {
 
     pub(in super::super) fn take_sparse(&self) -> Vec<MetadataDocIndex> {
         self.sparse
-            .lock()
-            .expect("metadata candidate sparse buffer pool lock poisoned")
-            .pop()
+            .try_lock()
+            .ok()
+            .and_then(|mut buffers| buffers.pop())
             .unwrap_or_default()
     }
 
     pub(in super::super) fn release_sparse(&self, mut candidates: Vec<MetadataDocIndex>) {
         candidates.clear();
-        let mut buffers = self
-            .sparse
-            .lock()
-            .expect("metadata candidate sparse buffer pool lock poisoned");
-        if buffers.len() < self.maximum_retained {
-            buffers.push(candidates);
+        if let Ok(mut buffers) = self.sparse.try_lock() {
+            if buffers.len() < self.maximum_retained {
+                buffers.push(candidates);
+            }
         }
     }
 
     pub(in super::super) fn take_dense(&self) -> (Vec<u64>, Vec<usize>) {
         self.dense
-            .lock()
-            .expect("metadata candidate dense buffer pool lock poisoned")
-            .pop()
+            .try_lock()
+            .ok()
+            .and_then(|mut buffers| buffers.pop())
             .unwrap_or_else(|| {
                 (
                     vec![0; self.universe_len.saturating_add(63) / 64],
@@ -148,12 +146,10 @@ impl MetadataCandidateBufferPool {
     fn release_dense(&self, words: Vec<u64>, mut touched_words: Vec<usize>) {
         debug_assert!(touched_words.iter().all(|&index| words[index] == 0));
         touched_words.clear();
-        let mut buffers = self
-            .dense
-            .lock()
-            .expect("metadata candidate dense buffer pool lock poisoned");
-        if buffers.len() < self.maximum_retained {
-            buffers.push((words, touched_words));
+        if let Ok(mut buffers) = self.dense.try_lock() {
+            if buffers.len() < self.maximum_retained {
+                buffers.push((words, touched_words));
+            }
         }
     }
 }

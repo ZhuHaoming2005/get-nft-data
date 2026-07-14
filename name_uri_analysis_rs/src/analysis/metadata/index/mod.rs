@@ -36,6 +36,11 @@ pub(super) const METADATA_TEMPLATE_COMPACTION_MIN_DUPLICATE_DENOMINATOR: usize =
 pub(super) const METADATA_CONSERVATIVE_ANCHOR_COUNT: usize = 16;
 pub(super) const METADATA_CONSERVATIVE_SIMHASH_BANDS: usize = 8;
 pub(super) const METADATA_CONSERVATIVE_SIMHASH_BAND_BITS: usize = 8;
+pub(super) const METADATA_CONSERVATIVE_JOINT_BAND_FAMILIES: usize =
+    METADATA_CONSERVATIVE_SIMHASH_BANDS * METADATA_CONSERVATIVE_SIMHASH_BANDS;
+pub(super) const METADATA_CONSERVATIVE_JOINT_BAND_BUCKETS: usize =
+    1 << (2 * METADATA_CONSERVATIVE_SIMHASH_BAND_BITS);
+pub(super) const METADATA_CONSERVATIVE_JOINT_MIN_ATOMS: usize = 128 * 1024;
 pub(super) const METADATA_CONSERVATIVE_SIMHASH_HAMMING_THRESHOLD: u32 = 32;
 pub(super) const METADATA_CONSERVATIVE_HIGH_FREQUENCY_MIN_DOCS: usize = 32;
 pub(super) const METADATA_CONSERVATIVE_HIGH_FREQUENCY_DIVISOR: usize = 5;
@@ -45,6 +50,7 @@ pub(super) const METADATA_CONSERVATIVE_CALIBRATION_DIVISOR: u64 = 100;
 pub(super) const METADATA_CONSERVATIVE_CALIBRATION_MIN_LEFTS: usize = 256;
 pub(super) const METADATA_CONSERVATIVE_CALIBRATION_MAX_LEFTS: usize = 4 * 1024;
 pub(super) const METADATA_CONSERVATIVE_CALIBRATION_MAX_POSTING_VISITS: u64 = 1_000_000_000;
+pub(super) const METADATA_CONSERVATIVE_RESCUE_MAX_POSTING_VISITS: u64 = 1_000_000_000;
 pub(super) const METADATA_CONSERVATIVE_CONTRACT_DRIFT_PER_MILLE: u64 = 5;
 pub(super) const METADATA_CONSERVATIVE_COMPONENT_DRIFT_PER_MILLE: u64 = 2;
 pub(super) const METADATA_CONSERVATIVE_PAIR_DRIFT_MAX_RATE: f64 = 0.005;
@@ -198,11 +204,21 @@ pub(super) struct MetadataConservativeDimensionIndex {
     pub(super) simhash_band_postings: MetadataSparseCandidatePostings,
 }
 
+pub(super) struct MetadataConservativeJointBandFamily {
+    pub(super) posting_offsets: Vec<u64>,
+    pub(super) posting_atoms: Vec<MetadataDocIndex>,
+}
+
+pub(super) struct MetadataConservativeJointBandIndex {
+    pub(super) families: Vec<MetadataConservativeJointBandFamily>,
+}
+
 pub(super) struct MetadataConservativeCandidateIndex {
     pub(super) exact_template: Option<MetadataTemplateCandidateIndex>,
     pub(super) exact_content: Option<MetadataContentCandidateIndex>,
     pub(super) template: MetadataConservativeDimensionIndex,
     pub(super) content: MetadataConservativeDimensionIndex,
+    pub(super) joint_bands: Option<MetadataConservativeJointBandIndex>,
     pub(super) profile: MetadataConservativeRecallProfile,
 }
 
@@ -237,6 +253,19 @@ pub(super) struct MetadataCalibrationPlan {
     pub(super) estimated_total_posting_visits: u64,
     pub(super) estimated_sample_posting_visits: u64,
     pub(super) retained_calibration_candidates: usize,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct MetadataExactRescuePlan {
+    pub(super) exact_recall_by_left: Vec<bool>,
+    pub(super) exact_left_atoms: u64,
+    pub(super) estimated_exact_posting_visits: u64,
+    pub(super) unrescued_risk_strata: u64,
+}
+
+pub(super) struct MetadataRecallCalibrationOutcome {
+    pub(super) stats: MetadataRecallCalibrationStats,
+    pub(super) risk_strata: Vec<(usize, u32)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -385,6 +414,7 @@ pub(super) struct MetadataLeftCandidateBatch {
     pub(super) token_overlap_rejected_pairs: u64,
     pub(super) estimated_posting_visits: u64,
     pub(super) visited_posting_entries: u64,
+    pub(super) token_exclusion_posting_visits: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -394,6 +424,7 @@ pub(super) struct MetadataCandidateCollectionContext<'a> {
     pub(super) candidate_index: &'a MetadataLocalCandidateIndex,
     pub(super) compatibility: MetadataTemplateCompatibility<'a>,
     pub(super) exact_recall: bool,
+    pub(super) exact_recall_by_left: Option<&'a [bool]>,
     pub(super) scope: MetadataCandidateUnionScope,
     pub(super) contract_tokens: &'a CompactContractTokens,
     pub(super) fallback_token_exclusion_index: Option<&'a MetadataFallbackTokenExclusionIndex>,
@@ -477,6 +508,7 @@ pub(super) struct MetadataContentUnionStats {
     pub(super) processed_left_atoms: u64,
     pub(super) estimated_posting_visits: u64,
     pub(super) visited_posting_entries: u64,
+    pub(super) token_exclusion_posting_visits: u64,
     pub(super) dense_candidate_promotions: u64,
     pub(super) raw_candidate_pairs: u64,
     pub(super) dimension_rejected_pairs: u64,
@@ -496,6 +528,10 @@ pub(super) struct MetadataContentUnionStats {
     pub(super) recall_calibration: MetadataRecallCalibrationStats,
     pub(super) conservative_groups: u64,
     pub(super) exact_fallback_groups: u64,
+    pub(super) exact_rescue_left_atoms: u64,
+    pub(super) exact_rescue_estimated_posting_visits: u64,
+    pub(super) unrescued_recall_risk_strata: u64,
+    pub(super) recall_risk_exceeded_groups: u64,
 }
 
 #[derive(Clone, Copy)]

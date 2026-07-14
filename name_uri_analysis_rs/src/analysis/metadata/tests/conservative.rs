@@ -202,13 +202,14 @@ fn exact_posting_visit_estimate_bounds_calibration_candidate_enumeration() {
         &mut plan,
     );
     let mut scratch = MetadataCandidateScratch::new(atoms.len());
-    let contract_tokens = CompactContractTokens::from_nested(vec![Vec::new(); atoms.len()]);
+    let contract_tokens = CompactContractTokens::from_nested(vec![vec![7], vec![7], vec![8]]);
     let collection = MetadataCandidateCollectionContext {
         atoms: &atoms,
         compact_docs: &compact.docs,
         candidate_index: &index,
         compatibility,
         exact_recall: true,
+        exact_recall_by_left: None,
         scope: MetadataCandidateUnionScope::SharedToken,
         contract_tokens: &contract_tokens,
         fallback_token_exclusion_index: None,
@@ -216,11 +217,102 @@ fn exact_posting_visit_estimate_bounds_calibration_candidate_enumeration() {
         estimated_posting_visits_by_left: None,
     };
     let exact = collect_metadata_left_candidate_batch(0, &collection, &mut scratch);
+    let exact_candidates = exact.candidates.iter().collect::<Vec<_>>();
 
     assert!(estimated > 0);
     assert!(estimated >= exact.raw_candidate_pairs as usize);
     assert_eq!(exact.estimated_posting_visits, estimated as u64);
     assert!(exact.visited_posting_entries > 0);
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    let production_plan = metadata_production_work_plan(
+        &atoms,
+        &compact.docs,
+        &index,
+        compatibility,
+        &pool,
+        None,
+        None,
+    )
+    .unwrap();
+    let fallback_atoms =
+        build_metadata_fallback_atoms(&records, &compact.docs, &data, &contract_tokens);
+    let fallback_candidate_index = MetadataLocalCandidateIndex::from_atoms_with_mode(
+        &compact.docs,
+        &fallback_atoms,
+        compatibility,
+        false,
+        MetadataRecallMode::Conservative,
+    );
+    let fallback_candidate_plan = metadata_production_work_plan(
+        &fallback_atoms,
+        &compact.docs,
+        &fallback_candidate_index,
+        compatibility,
+        &pool,
+        None,
+        None,
+    )
+    .unwrap();
+    let exclusion_index =
+        MetadataFallbackTokenExclusionIndex::from_atoms(&fallback_atoms, &contract_tokens);
+    let fallback_plan = metadata_production_work_plan(
+        &fallback_atoms,
+        &compact.docs,
+        &fallback_candidate_index,
+        compatibility,
+        &pool,
+        None,
+        Some((&exclusion_index, &contract_tokens)),
+    )
+    .unwrap();
+    assert_eq!(
+        fallback_plan.estimated_posting_visits_by_left[0],
+        fallback_candidate_plan.estimated_posting_visits_by_left[0] + 1
+    );
+    let conservative_collection = MetadataCandidateCollectionContext {
+        exact_recall: false,
+        estimated_posting_visits_by_left: Some(&production_plan.estimated_posting_visits_by_left),
+        ..collection
+    };
+    let conservative =
+        collect_metadata_left_candidate_batch(0, &conservative_collection, &mut scratch);
+
+    assert_eq!(
+        conservative.visited_posting_entries,
+        production_plan.estimated_posting_visits_by_left[0]
+    );
+
+    let exact_recall_by_left = vec![true; atoms.len().saturating_sub(1)];
+    let mixed_plan = metadata_production_work_plan(
+        &atoms,
+        &compact.docs,
+        &index,
+        compatibility,
+        &pool,
+        Some(&exact_recall_by_left),
+        None,
+    )
+    .unwrap();
+    let mixed_collection = MetadataCandidateCollectionContext {
+        exact_recall: false,
+        exact_recall_by_left: Some(&exact_recall_by_left),
+        estimated_posting_visits_by_left: Some(&mixed_plan.estimated_posting_visits_by_left),
+        ..collection
+    };
+    let mixed = collect_metadata_left_candidate_batch(0, &mixed_collection, &mut scratch);
+    assert_eq!(
+        mixed.candidates.iter().collect::<Vec<_>>(),
+        exact_candidates
+    );
+    assert_eq!(mixed.visited_posting_entries, estimated as u64);
+    assert_eq!(
+        mixed_plan.estimated_posting_visits_by_left[0],
+        estimated as u64
+    );
 }
 
 #[test]
@@ -327,6 +419,191 @@ fn widened_conservative_profile_recalls_one_bit_neighbor_bands() {
 }
 
 #[test]
+fn widened_band_probes_do_not_cover_the_full_conservative_hamming_predicate() {
+    let four_bits_per_band = (0..METADATA_CONSERVATIVE_SIMHASH_BANDS)
+        .fold(0u64, |value, band| value | (0x0fu64 << (band * 8)));
+    let index = conservative_dimension_from_simhashes(&[0, four_bits_per_band]);
+    let mut scratch = MetadataCandidateScratch::new(2);
+    scratch.clear_for_next_left();
+    index.append_candidates_after(0, MetadataConservativeRecallProfile::Widened, &mut scratch);
+
+    assert_eq!(four_bits_per_band.count_ones(), 32);
+    assert!(index.matches(0, 1));
+    assert!(scratch.candidates.is_empty());
+}
+
+fn conservative_dimension_from_simhashes(simhashes: &[u64]) -> MetadataConservativeDimensionIndex {
+    let sketches = simhashes
+        .iter()
+        .copied()
+        .map(|simhash| MetadataConservativeSketch {
+            simhash,
+            anchors: [0; METADATA_CONSERVATIVE_ANCHOR_COUNT],
+            anchor_len: 0,
+            has_terms: true,
+        })
+        .collect::<Vec<_>>();
+    let band_entries = sketches
+        .iter()
+        .enumerate()
+        .flat_map(|(atom_index, sketch)| {
+            (0..METADATA_CONSERVATIVE_SIMHASH_BANDS).map(move |band_index| {
+                (
+                    metadata_recall_simhash_band_key(sketch.simhash, band_index),
+                    metadata_doc_index_from_usize(atom_index),
+                )
+            })
+        })
+        .collect();
+    MetadataConservativeDimensionIndex {
+        sketches,
+        anchor_postings: MetadataSparseCandidatePostings::from_sorted_entries(Vec::new()),
+        simhash_band_postings: MetadataSparseCandidatePostings::from_bounded_unsorted_entries(
+            band_entries,
+            METADATA_CONSERVATIVE_SIMHASH_BANDS << METADATA_CONSERVATIVE_SIMHASH_BAND_BITS,
+        ),
+    }
+}
+
+fn conservative_dimension_with_anchors(
+    simhashes: &[u64],
+    anchors_by_atom: &[&[u32]],
+) -> MetadataConservativeDimensionIndex {
+    let mut dimension = conservative_dimension_from_simhashes(simhashes);
+    let mut anchor_entries = Vec::new();
+    for (atom_index, anchors) in anchors_by_atom.iter().enumerate() {
+        let sketch = &mut dimension.sketches[atom_index];
+        sketch.anchor_len = anchors.len() as u8;
+        sketch.anchors[..anchors.len()].copy_from_slice(anchors);
+        anchor_entries.extend(
+            anchors
+                .iter()
+                .copied()
+                .map(|anchor| (anchor, metadata_doc_index_from_usize(atom_index))),
+        );
+    }
+    anchor_entries.sort_unstable();
+    dimension.anchor_postings =
+        MetadataSparseCandidatePostings::from_sorted_entries(anchor_entries);
+    dimension
+}
+
+#[test]
+fn joint_conservative_band_index_pushes_dimension_intersection_into_postings() {
+    let one_bit_per_band = (0..METADATA_CONSERVATIVE_SIMHASH_BANDS)
+        .fold(0u64, |value, band| value | (1u64 << (band * 8)));
+    let template = conservative_dimension_from_simhashes(&[0, 0, 0, one_bit_per_band]);
+    let content =
+        conservative_dimension_from_simhashes(&[0, 0, one_bit_per_band, one_bit_per_band]);
+    let joint = MetadataConservativeJointBandIndex::from_dimensions(&template, &content, false);
+
+    let mut base_scratch = MetadataCandidateScratch::new(4);
+    base_scratch.clear_for_next_left();
+    let base_estimate = joint.estimate_posting_visits_after(
+        0,
+        template.sketches[0].simhash,
+        content.sketches[0].simhash,
+        MetadataConservativeRecallProfile::Base,
+    );
+    joint.append_candidates_after(
+        0,
+        template.sketches[0].simhash,
+        content.sketches[0].simhash,
+        MetadataConservativeRecallProfile::Base,
+        &mut base_scratch,
+    );
+    assert_eq!(base_scratch.visited_posting_entries, base_estimate as u64);
+    assert_eq!(
+        base_scratch.candidates,
+        vec![metadata_doc_index_from_usize(1)]
+    );
+
+    let mut widened_scratch = MetadataCandidateScratch::new(4);
+    widened_scratch.clear_for_next_left();
+    joint.append_candidates_after(
+        0,
+        template.sketches[0].simhash,
+        content.sketches[0].simhash,
+        MetadataConservativeRecallProfile::Widened,
+        &mut widened_scratch,
+    );
+    widened_scratch.candidates.sort_unstable();
+    assert_eq!(
+        widened_scratch.candidates,
+        vec![
+            metadata_doc_index_from_usize(1),
+            metadata_doc_index_from_usize(2),
+            metadata_doc_index_from_usize(3),
+        ]
+    );
+
+    let conservative = MetadataConservativeCandidateIndex {
+        exact_template: None,
+        exact_content: None,
+        template,
+        content,
+        joint_bands: Some(joint),
+        profile: MetadataConservativeRecallProfile::Base,
+    };
+    let estimated = conservative.estimate_posting_visits_after(0);
+    let mut production_scratch = MetadataCandidateScratch::new(4);
+    production_scratch.clear_for_next_left();
+    conservative.append_candidates_after(0, &mut production_scratch);
+    assert_eq!(production_scratch.visited_posting_entries, estimated as u64);
+}
+
+#[test]
+fn joint_conservative_index_preserves_anchor_and_band_cross_product_candidates() {
+    let far = u64::MAX;
+    let template = conservative_dimension_with_anchors(
+        &[0, far, 0, far, far, 0],
+        &[&[10], &[10], &[], &[10], &[10], &[]],
+    );
+    let content = conservative_dimension_with_anchors(
+        &[0, 0, far, far, far, far],
+        &[&[20], &[], &[20], &[20], &[], &[]],
+    );
+    let joint = MetadataConservativeJointBandIndex::from_dimensions(&template, &content, false);
+    let legacy = MetadataConservativeCandidateIndex {
+        exact_template: None,
+        exact_content: None,
+        template: conservative_dimension_with_anchors(
+            &[0, far, 0, far, far, 0],
+            &[&[10], &[10], &[], &[10], &[10], &[]],
+        ),
+        content: conservative_dimension_with_anchors(
+            &[0, 0, far, far, far, far],
+            &[&[20], &[], &[20], &[20], &[], &[]],
+        ),
+        joint_bands: None,
+        profile: MetadataConservativeRecallProfile::Base,
+    };
+    let indexed = MetadataConservativeCandidateIndex {
+        exact_template: None,
+        exact_content: None,
+        template,
+        content,
+        joint_bands: Some(joint),
+        profile: MetadataConservativeRecallProfile::Base,
+    };
+    let collect = |index: &MetadataConservativeCandidateIndex| {
+        let mut scratch = MetadataCandidateScratch::new(6);
+        scratch.clear_for_next_left();
+        index.append_candidates_after(0, &mut scratch);
+        scratch.candidates.sort_unstable();
+        scratch.candidates
+    };
+
+    let expected = vec![
+        metadata_doc_index_from_usize(1),
+        metadata_doc_index_from_usize(2),
+        metadata_doc_index_from_usize(3),
+    ];
+    assert_eq!(collect(&legacy), expected);
+    assert_eq!(collect(&indexed), expected);
+}
+
+#[test]
 fn conservative_local_index_requires_both_sketch_dimensions() {
     let mut builder = MetadataDataBuilder::new(1);
     let contents = [
@@ -364,6 +641,10 @@ fn conservative_local_index_requires_both_sketch_dimensions() {
         false,
         MetadataRecallMode::Conservative,
     );
+    let MetadataLocalCandidateIndex::Conservative(conservative) = &index else {
+        panic!("conservative recall must build a conservative candidate index");
+    };
+    assert!(conservative.joint_bands.is_none());
     let mut scratch = MetadataCandidateScratch::new(atoms.len());
     scratch.clear_for_next_left();
 
@@ -420,6 +701,26 @@ fn conservative_calibration_falls_back_only_above_drift_limits() {
         ..MetadataRecallCalibrationStats::default()
     };
     assert!(weighted_tail_drift_above_limit.requires_exact_fallback());
+}
+
+#[test]
+fn bounded_exact_rescue_selects_whole_risk_strata_without_exceeding_work_budget() {
+    let atom = |chain_index| MetadataContentAtom {
+        chain_index,
+        template_doc_index: metadata_doc_index_from_usize(0),
+        representative_record_index: metadata_doc_index_from_usize(0),
+        members: vec![metadata_contract_index_from_usize(0)],
+        fallback_token_groups: Vec::new(),
+    };
+    let atoms = vec![atom(0), atom(0), atom(1), atom(1)];
+    let exact_estimates = vec![8, 4, 16];
+    let rescue =
+        plan_metadata_bounded_exact_rescue(&atoms, &exact_estimates, &[(0, 3), (1, 4)], 10);
+
+    assert_eq!(rescue.exact_recall_by_left, vec![true, false, false]);
+    assert_eq!(rescue.exact_left_atoms, 1);
+    assert_eq!(rescue.estimated_exact_posting_visits, 8);
+    assert_eq!(rescue.unrescued_risk_strata, 1);
 }
 
 #[test]

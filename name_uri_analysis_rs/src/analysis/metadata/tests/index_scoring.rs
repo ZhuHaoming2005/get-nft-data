@@ -62,6 +62,15 @@ fn metadata_candidate_buffer_pool_reuses_sparse_and_cleared_dense_storage() {
 }
 
 #[test]
+fn metadata_validated_pair_batch_reserves_hot_chunk_hit_capacity() {
+    let batch = MetadataValidatedPairBatch::with_hit_capacity(257);
+
+    assert!(batch.hits.capacity() >= 257);
+    assert_eq!(batch.stats.template_candidate_pairs, 0);
+    assert_eq!(batch.stats.content_matched_pairs, 0);
+}
+
+#[test]
 fn secondary_candidate_generation_preserves_posting_visit_accounting() {
     let mut scratch = MetadataCandidateScratch::new(8);
     scratch.clear_for_next_left();

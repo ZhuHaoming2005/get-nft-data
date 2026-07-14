@@ -30,6 +30,9 @@ impl MetadataContentUnionStats {
         self.visited_posting_entries = self
             .visited_posting_entries
             .saturating_add(other.visited_posting_entries);
+        self.token_exclusion_posting_visits = self
+            .token_exclusion_posting_visits
+            .saturating_add(other.token_exclusion_posting_visits);
         self.dense_candidate_promotions = self
             .dense_candidate_promotions
             .saturating_add(other.dense_candidate_promotions);
@@ -42,6 +45,18 @@ impl MetadataContentUnionStats {
         self.token_overlap_rejected_pairs = self
             .token_overlap_rejected_pairs
             .saturating_add(other.token_overlap_rejected_pairs);
+        self.exact_rescue_left_atoms = self
+            .exact_rescue_left_atoms
+            .saturating_add(other.exact_rescue_left_atoms);
+        self.exact_rescue_estimated_posting_visits = self
+            .exact_rescue_estimated_posting_visits
+            .saturating_add(other.exact_rescue_estimated_posting_visits);
+        self.unrescued_recall_risk_strata = self
+            .unrescued_recall_risk_strata
+            .saturating_add(other.unrescued_recall_risk_strata);
+        self.recall_risk_exceeded_groups = self
+            .recall_risk_exceeded_groups
+            .saturating_add(other.recall_risk_exceeded_groups);
         self.candidate_pairs = self.candidate_pairs.saturating_add(other.candidate_pairs);
         self.already_connected_pairs = self
             .already_connected_pairs
@@ -440,10 +455,15 @@ pub(in super::super) fn union_metadata_representative_content_fallback(
     );
     let stats = union_metadata_no_common_atom_core(atoms, &docs, context, state, Some(progress))?;
     progress.finish_task(format!(
-        "representative fallback complete; lefts {}; estimated/visited postings {}/{}; dense-promotions {}; raw {}; dimension-rejected {}; token-overlap-rejected {}; candidates {}; connected-skips {}; scored {}; matched {}",
+        "representative fallback complete; lefts {}; planned-total/candidate-visited/exclusion-visited postings {}/{}/{}; exact-rescue lefts/work {}/{}; recall-risk-groups/unrescued-strata {}/{}; dense-promotions {}; raw {}; dimension-rejected {}; token-overlap-rejected {}; candidates {}; connected-skips {}; scored {}; matched {}",
         stats.processed_left_atoms,
         stats.estimated_posting_visits,
         stats.visited_posting_entries,
+        stats.token_exclusion_posting_visits,
+        stats.exact_rescue_left_atoms,
+        stats.exact_rescue_estimated_posting_visits,
+        stats.recall_risk_exceeded_groups,
+        stats.unrescued_recall_risk_strata,
         stats.dense_candidate_promotions,
         stats.raw_candidate_pairs,
         stats.dimension_rejected_pairs,
@@ -653,7 +673,7 @@ pub(in super::super) fn union_metadata_shared_token_atom_core(
     } else {
         MetadataRecallMode::Exact
     };
-    let mut candidate_index = if parallel {
+    let candidate_index = if parallel {
         context.pool.install(|| {
             MetadataLocalCandidateIndex::from_atoms_with_mode(
                 compact_docs,
@@ -680,7 +700,7 @@ pub(in super::super) fn union_metadata_shared_token_atom_core(
             .max(1)
             .saturating_mul(METADATA_PARALLEL_LEFT_WAVE_MULTIPLIER),
     ));
-    let work_plan = if conservative_group {
+    let calibration_plan = if conservative_group {
         metadata_conservative_calibration_plan_with_work_budget(
             &atoms,
             compact_docs,
@@ -689,23 +709,18 @@ pub(in super::super) fn union_metadata_shared_token_atom_core(
             context.pool,
         )?
     } else {
-        metadata_exact_work_plan(
-            &atoms,
-            compact_docs,
-            &candidate_index,
-            context.template_compatibility,
-            context.pool,
-        )?
+        MetadataCalibrationPlan::default()
     };
-    let exact_recall = if conservative_group {
+    let (exact_recall, exact_rescue) = if conservative_group {
         stats.conservative_groups = 1;
-        let mut calibration =
+        let calibration =
             calibrate_metadata_conservative_recall(MetadataRecallCalibrationRequest {
                 atoms: &atoms,
                 compact_docs,
                 candidate_index: &candidate_index,
-                samples: work_plan.samples.clone(),
-                estimated_posting_visits_by_left: &work_plan.estimated_posting_visits_by_left,
+                samples: calibration_plan.samples.clone(),
+                estimated_posting_visits_by_left: &calibration_plan
+                    .estimated_posting_visits_by_left,
                 context,
                 template_cache_pool,
                 scope: MetadataCandidateUnionScope::SharedToken,
@@ -713,49 +728,45 @@ pub(in super::super) fn union_metadata_shared_token_atom_core(
                 candidate_buffer_pool: Some(&candidate_buffer_pool),
                 progress,
             });
-        if calibration.requires_exact_fallback() {
-            candidate_index.set_conservative_profile(MetadataConservativeRecallProfile::Widened);
-            calibration =
-                calibrate_metadata_conservative_recall(MetadataRecallCalibrationRequest {
-                    atoms: &atoms,
-                    compact_docs,
-                    candidate_index: &candidate_index,
-                    samples: work_plan.samples,
-                    estimated_posting_visits_by_left: &work_plan.estimated_posting_visits_by_left,
-                    context,
-                    template_cache_pool,
-                    scope: MetadataCandidateUnionScope::SharedToken,
-                    fallback_token_exclusion_index: None,
-                    candidate_buffer_pool: Some(&candidate_buffer_pool),
-                    progress,
-                });
-        }
-        let recall_risk_exceeded = calibration.requires_exact_fallback();
-        stats.recall_calibration = calibration;
-        if recall_risk_exceeded {
-            return Err(AnalysisError::InvalidData(format!(
-                "metadata shared-token conservative recall drift exceeds limits: missed duplicate members {}/{}, shifted component members {}/{}; refusing an unbounded whole-group Exact fallback",
-                stats.recall_calibration.missed_duplicate_contract_members,
-                stats.recall_calibration.exact_duplicate_contract_members,
-                stats.recall_calibration.shifted_component_members,
-                stats.recall_calibration.exact_component_members,
-            )));
-        }
+        let rescue = plan_metadata_bounded_exact_rescue(
+            &atoms,
+            &calibration_plan.estimated_posting_visits_by_left,
+            &calibration.risk_strata,
+            METADATA_CONSERVATIVE_RESCUE_MAX_POSTING_VISITS,
+        );
+        stats.recall_risk_exceeded_groups = u64::from(calibration.stats.requires_exact_fallback());
+        stats.recall_calibration = calibration.stats;
+        stats.exact_rescue_left_atoms = rescue.exact_left_atoms;
+        stats.exact_rescue_estimated_posting_visits = rescue.estimated_exact_posting_visits;
+        stats.unrescued_recall_risk_strata = rescue.unrescued_risk_strata;
         if let Some(progress) = progress {
             progress.finish_calibration();
             progress.update(&stats);
         }
-        false
+        (false, rescue)
     } else {
-        true
+        (true, MetadataExactRescuePlan::default())
     };
-    let candidate_index = candidate_index.into_effective_recall(exact_recall);
+    let exact_recall_by_left =
+        (exact_rescue.exact_left_atoms > 0).then_some(exact_rescue.exact_recall_by_left.as_slice());
+    let candidate_index =
+        candidate_index.into_effective_recall(exact_recall, exact_recall_by_left.is_some());
+    let work_plan = metadata_production_work_plan(
+        &atoms,
+        compact_docs,
+        &candidate_index,
+        context.template_compatibility,
+        context.pool,
+        exact_recall_by_left,
+        None,
+    )?;
     let candidate_collection = MetadataCandidateCollectionContext {
         atoms: &atoms,
         compact_docs,
         candidate_index: &candidate_index,
         compatibility: context.template_compatibility,
         exact_recall,
+        exact_recall_by_left,
         scope: MetadataCandidateUnionScope::SharedToken,
         contract_tokens: context.contract_tokens,
         fallback_token_exclusion_index: None,
@@ -965,7 +976,7 @@ pub(in super::super) fn union_metadata_no_common_atom_core(
     } else {
         MetadataRecallMode::Exact
     };
-    let mut candidate_index = if parallel {
+    let candidate_index = if parallel {
         context.pool.install(|| {
             MetadataLocalCandidateIndex::from_atoms_with_mode(
                 compact_docs,
@@ -994,7 +1005,7 @@ pub(in super::super) fn union_metadata_no_common_atom_core(
             .max(1)
             .saturating_mul(METADATA_PARALLEL_LEFT_WAVE_MULTIPLIER),
     ));
-    let work_plan = if conservative_group {
+    let calibration_plan = if conservative_group {
         metadata_conservative_calibration_plan_with_work_budget(
             &atoms,
             compact_docs,
@@ -1003,23 +1014,18 @@ pub(in super::super) fn union_metadata_no_common_atom_core(
             context.pool,
         )?
     } else {
-        metadata_exact_work_plan(
-            &atoms,
-            compact_docs,
-            &candidate_index,
-            context.template_compatibility,
-            context.pool,
-        )?
+        MetadataCalibrationPlan::default()
     };
-    let exact_recall = if conservative_group {
+    let (exact_recall, exact_rescue) = if conservative_group {
         stats.conservative_groups = 1;
-        let mut calibration =
+        let calibration =
             calibrate_metadata_conservative_recall(MetadataRecallCalibrationRequest {
                 atoms: &atoms,
                 compact_docs,
                 candidate_index: &candidate_index,
-                samples: work_plan.samples.clone(),
-                estimated_posting_visits_by_left: &work_plan.estimated_posting_visits_by_left,
+                samples: calibration_plan.samples.clone(),
+                estimated_posting_visits_by_left: &calibration_plan
+                    .estimated_posting_visits_by_left,
                 context,
                 template_cache_pool: &template_cache_pool,
                 scope: MetadataCandidateUnionScope::Fallback,
@@ -1027,40 +1033,35 @@ pub(in super::super) fn union_metadata_no_common_atom_core(
                 candidate_buffer_pool: Some(&candidate_buffer_pool),
                 progress: None,
             });
-        if calibration.representative_recall_risk_exceeded() {
-            candidate_index.set_conservative_profile(MetadataConservativeRecallProfile::Widened);
-            calibration =
-                calibrate_metadata_conservative_recall(MetadataRecallCalibrationRequest {
-                    atoms: &atoms,
-                    compact_docs,
-                    candidate_index: &candidate_index,
-                    samples: work_plan.samples,
-                    estimated_posting_visits_by_left: &work_plan.estimated_posting_visits_by_left,
-                    context,
-                    template_cache_pool: &template_cache_pool,
-                    scope: MetadataCandidateUnionScope::Fallback,
-                    fallback_token_exclusion_index: Some(&fallback_token_exclusion_index),
-                    candidate_buffer_pool: Some(&candidate_buffer_pool),
-                    progress: None,
-                });
-        }
-        let requires_exact_fallback = calibration.representative_recall_risk_exceeded();
-        stats.recall_calibration = calibration;
-        if requires_exact_fallback {
-            stats.exact_fallback_groups = 1;
-            return Err(AnalysisError::InvalidData(format!(
-                "metadata representative conservative recall drift exceeds limits: missed duplicate members {}/{}, shifted component members {}/{}; rerun with --metadata-recall-mode exact only if the estimated global fallback work is acceptable",
-                stats.recall_calibration.missed_duplicate_contract_members,
-                stats.recall_calibration.exact_duplicate_contract_members,
-                stats.recall_calibration.shifted_component_members,
-                stats.recall_calibration.exact_component_members,
-            )));
-        }
-        requires_exact_fallback
+        let rescue = plan_metadata_bounded_exact_rescue(
+            &atoms,
+            &calibration_plan.estimated_posting_visits_by_left,
+            &calibration.risk_strata,
+            METADATA_CONSERVATIVE_RESCUE_MAX_POSTING_VISITS,
+        );
+        stats.recall_risk_exceeded_groups =
+            u64::from(calibration.stats.representative_recall_risk_exceeded());
+        stats.recall_calibration = calibration.stats;
+        stats.exact_rescue_left_atoms = rescue.exact_left_atoms;
+        stats.exact_rescue_estimated_posting_visits = rescue.estimated_exact_posting_visits;
+        stats.unrescued_recall_risk_strata = rescue.unrescued_risk_strata;
+        (false, rescue)
     } else {
-        true
+        (true, MetadataExactRescuePlan::default())
     };
-    let candidate_index = candidate_index.into_effective_recall(exact_recall);
+    let exact_recall_by_left =
+        (exact_rescue.exact_left_atoms > 0).then_some(exact_rescue.exact_recall_by_left.as_slice());
+    let candidate_index =
+        candidate_index.into_effective_recall(exact_recall, exact_recall_by_left.is_some());
+    let work_plan = metadata_production_work_plan(
+        &atoms,
+        compact_docs,
+        &candidate_index,
+        context.template_compatibility,
+        context.pool,
+        exact_recall_by_left,
+        Some((&fallback_token_exclusion_index, context.contract_tokens)),
+    )?;
     if let Some(progress) = progress {
         progress.start_task(
             "scoring representative fallback posting work",
@@ -1074,6 +1075,7 @@ pub(in super::super) fn union_metadata_no_common_atom_core(
         candidate_index: &candidate_index,
         compatibility: context.template_compatibility,
         exact_recall,
+        exact_recall_by_left,
         scope: MetadataCandidateUnionScope::Fallback,
         contract_tokens: context.contract_tokens,
         fallback_token_exclusion_index: Some(&fallback_token_exclusion_index),
@@ -1260,7 +1262,7 @@ pub(in super::super) fn metadata_pair_already_connected(
     let left_chain = data.contracts[left].chain_index;
     let right_chain = data.contracts[right].chain_index;
     if left_chain == right_chain {
-        return state.intra.find(left) == state.intra.find(right);
+        return state.intra.connected(left, right);
     }
     let cross_connected = state
         .cross

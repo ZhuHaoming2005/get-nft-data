@@ -181,7 +181,8 @@ pub(super) fn metadata_resident_memory_bytes(
     let reused_bytes = reused_metadata_documents_non_content_memory_bytes(&data.reused_documents);
     let contract_count = data.contracts.len();
     let dense_dsu_bytes = contract_count
-        .saturating_mul(std::mem::size_of::<usize>().saturating_add(std::mem::size_of::<u8>()));
+        .saturating_mul(std::mem::size_of::<usize>().saturating_add(std::mem::size_of::<u8>()))
+        .saturating_add(UnionFind::connected_cache_capacity_bytes());
     let sparse_state_count = metadata_sparse_membership_factor(chain_count);
     let sparse_dsu_bytes = contract_count
         .saturating_mul(SPARSE_UNION_NODE_BYTES)

@@ -148,14 +148,76 @@ pub(crate) struct PairComponentAccumulator {
 pub(crate) struct UnionFind {
     pub(crate) parent: Vec<usize>,
     pub(crate) rank: Vec<u8>,
+    connected_pair_cache: Option<Box<[u64]>>,
 }
 
 impl UnionFind {
+    const CONNECTED_PAIR_CACHE_SLOTS: usize = 4 * 1024;
+    const EMPTY_CONNECTED_PAIR_KEY: u64 = u64::MAX;
+
     pub(crate) fn new(size: usize) -> Self {
         Self {
             parent: (0..size).collect(),
             rank: vec![0; size],
+            connected_pair_cache: None,
         }
+    }
+
+    pub(crate) fn new_with_connected_cache(size: usize) -> Self {
+        assert!(
+            size <= u32::MAX as usize,
+            "connected-pair cache requires 32-bit node indexes"
+        );
+        let mut union = Self::new(size);
+        union.connected_pair_cache = Some(
+            vec![Self::EMPTY_CONNECTED_PAIR_KEY; Self::CONNECTED_PAIR_CACHE_SLOTS]
+                .into_boxed_slice(),
+        );
+        union
+    }
+
+    pub(crate) const fn connected_cache_capacity_bytes() -> usize {
+        Self::CONNECTED_PAIR_CACHE_SLOTS * std::mem::size_of::<u64>()
+    }
+
+    pub(crate) fn connected_cache_memory_bytes(&self) -> usize {
+        self.connected_pair_cache
+            .as_ref()
+            .map_or(0, |cache| cache.len() * std::mem::size_of::<u64>())
+    }
+
+    fn connected_pair_key(left: usize, right: usize) -> u64 {
+        let (left, right) = if left < right {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        debug_assert!(left <= u32::MAX as usize && right <= u32::MAX as usize);
+        ((left as u64) << 32) | right as u64
+    }
+
+    fn connected_pair_cache_slot(key: u64) -> usize {
+        debug_assert!(Self::CONNECTED_PAIR_CACHE_SLOTS.is_power_of_two());
+        let mixed = key
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            .wrapping_add(key.rotate_right(29));
+        mixed as usize & (Self::CONNECTED_PAIR_CACHE_SLOTS - 1)
+    }
+
+    fn connected_pair_is_cached(&self, left: usize, right: usize) -> bool {
+        let Some(cache) = &self.connected_pair_cache else {
+            return false;
+        };
+        let key = Self::connected_pair_key(left, right);
+        cache[Self::connected_pair_cache_slot(key)] == key
+    }
+
+    fn cache_connected_pair(&mut self, left: usize, right: usize) {
+        let Some(cache) = &mut self.connected_pair_cache else {
+            return;
+        };
+        let key = Self::connected_pair_key(left, right);
+        cache[Self::connected_pair_cache_slot(key)] = key;
     }
 
     pub(crate) fn find(&mut self, node: usize) -> usize {
@@ -171,6 +233,7 @@ impl UnionFind {
         let left_root = self.find(left);
         let right_root = self.find(right);
         if left_root == right_root {
+            self.cache_connected_pair(left, right);
             return;
         }
         if self.rank[left_root] < self.rank[right_root] {
@@ -181,6 +244,23 @@ impl UnionFind {
             self.parent[right_root] = left_root;
             self.rank[left_root] += 1;
         }
+        self.cache_connected_pair(left, right);
+    }
+
+    pub(crate) fn connected(&mut self, left: usize, right: usize) -> bool {
+        if left == right || self.connected_pair_is_cached(left, right) {
+            return true;
+        }
+        let connected = self.find(left) == self.find(right);
+        if connected {
+            self.cache_connected_pair(left, right);
+        }
+        connected
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connected_cache_contains(&self, left: usize, right: usize) -> bool {
+        self.connected_pair_is_cached(left, right)
     }
 }
 

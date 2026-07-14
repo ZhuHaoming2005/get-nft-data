@@ -325,7 +325,8 @@ pub(super) fn metadata_union_state_bytes(state: &MetadataUnionState) -> u64 {
         .parent
         .capacity()
         .saturating_mul(std::mem::size_of::<usize>())
-        .saturating_add(state.intra.rank.capacity());
+        .saturating_add(state.intra.rank.capacity())
+        .saturating_add(state.intra.connected_cache_memory_bytes());
     let sparse = state
         .cross
         .iter()

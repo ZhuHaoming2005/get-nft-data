@@ -253,6 +253,7 @@ pub(super) fn run_metadata_analysis(
                 content_processed_left_atoms: 0,
                 content_estimated_posting_visits: 0,
                 content_visited_posting_entries: 0,
+                content_token_exclusion_posting_visits: 0,
                 content_dense_candidate_promotions: 0,
                 content_raw_candidate_pairs: 0,
                 content_dimension_rejected_pairs: 0,
@@ -267,6 +268,10 @@ pub(super) fn run_metadata_analysis(
                 template_batch_reused_pairs: 0,
                 conservative_groups: 0,
                 exact_fallback_groups: 0,
+                exact_rescue_left_atoms: 0,
+                exact_rescue_estimated_posting_visits: 0,
+                unrescued_recall_risk_strata: 0,
+                recall_risk_exceeded_groups: 0,
                 recall_sampled_left_atoms: 0,
                 recall_exact_candidate_pairs: 0,
                 recall_conservative_candidate_pairs: 0,
@@ -289,7 +294,7 @@ pub(super) fn run_metadata_analysis(
     }
 
     let mut state = MetadataUnionState {
-        intra: UnionFind::new(data.contracts.len()),
+        intra: UnionFind::new_with_connected_cache(data.contracts.len()),
         cross: (chains.len() > 1).then(SparseUnionFind::default),
         chain_matrix: (chains.len() > 1)
             .then(|| new_chain_matrix_reuse_states(chain_pair_count(chains.len()))),
@@ -344,16 +349,21 @@ pub(super) fn run_metadata_analysis(
             / content_stats.recall_calibration.exact_component_members as f64
     };
     progress.finish_task(format!(
-        "shared-token matching complete; mode {:?}; calibrated-lefts {}; sample drift before fallback contracts/components {:.3}%/{:.3}%; conservative/fallback groups {}/{}; lefts {}; estimated/visited postings {}/{}; dense-promotions {}; raw {}; dimension-rejected {}; token-overlap-rejected {}; candidates {}; connected-skips {}; template batch unique/reused {}/{}; template-rejected {}; cache {}/{} hit/miss; content-scored {}; matched {}",
+        "shared-token matching complete; mode {:?}; calibrated-lefts {}; sample drift before rescue contracts/components {:.3}%/{:.3}%; conservative/fallback groups {}/{}; exact-rescue lefts/work {}/{}; recall-risk-groups/unrescued-strata {}/{}; lefts {}; planned-total/candidate-visited/exclusion-visited postings {}/{}/{}; dense-promotions {}; raw {}; dimension-rejected {}; token-overlap-rejected {}; candidates {}; connected-skips {}; template batch unique/reused {}/{}; template-rejected {}; cache {}/{} hit/miss; content-scored {}; matched {}",
         metadata_recall_mode,
         content_stats.recall_calibration.sampled_left_atoms,
         contract_drift_percent,
         component_drift_percent,
         content_stats.conservative_groups,
         content_stats.exact_fallback_groups,
+        content_stats.exact_rescue_left_atoms,
+        content_stats.exact_rescue_estimated_posting_visits,
+        content_stats.recall_risk_exceeded_groups,
+        content_stats.unrescued_recall_risk_strata,
         content_stats.processed_left_atoms,
         content_stats.estimated_posting_visits,
         content_stats.visited_posting_entries,
+        content_stats.token_exclusion_posting_visits,
         content_stats.dense_candidate_promotions,
         content_stats.raw_candidate_pairs,
         content_stats.dimension_rejected_pairs,
@@ -440,6 +450,7 @@ pub(super) fn run_metadata_analysis(
             content_processed_left_atoms: content_stats.processed_left_atoms,
             content_estimated_posting_visits: content_stats.estimated_posting_visits,
             content_visited_posting_entries: content_stats.visited_posting_entries,
+            content_token_exclusion_posting_visits: content_stats.token_exclusion_posting_visits,
             content_dense_candidate_promotions: content_stats.dense_candidate_promotions,
             content_raw_candidate_pairs: content_stats.raw_candidate_pairs,
             content_dimension_rejected_pairs: content_stats.dimension_rejected_pairs,
@@ -454,6 +465,11 @@ pub(super) fn run_metadata_analysis(
             template_batch_reused_pairs: content_stats.template_batch_reused_pairs,
             conservative_groups: content_stats.conservative_groups,
             exact_fallback_groups: content_stats.exact_fallback_groups,
+            exact_rescue_left_atoms: content_stats.exact_rescue_left_atoms,
+            exact_rescue_estimated_posting_visits: content_stats
+                .exact_rescue_estimated_posting_visits,
+            unrescued_recall_risk_strata: content_stats.unrescued_recall_risk_strata,
+            recall_risk_exceeded_groups: content_stats.recall_risk_exceeded_groups,
             recall_sampled_left_atoms: content_stats.recall_calibration.sampled_left_atoms,
             recall_exact_candidate_pairs: content_stats.recall_calibration.exact_candidate_pairs,
             recall_conservative_candidate_pairs: content_stats

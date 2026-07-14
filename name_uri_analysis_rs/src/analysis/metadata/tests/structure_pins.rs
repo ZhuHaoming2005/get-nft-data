@@ -228,6 +228,8 @@ fn metadata_cross_connection_check_short_circuits_before_matrix_lookup() {
         .map(|offset| start + offset)
         .unwrap();
     let implementation = &source[start..end];
+    assert!(implementation.contains("state.intra.connected(left, right)"));
+    assert!(!implementation.contains("state.intra.find(left) == state.intra.find(right)"));
     let cross = implementation.find("let cross_connected").unwrap();
     let early_return = implementation
         .find("if !cross_connected")
@@ -385,6 +387,22 @@ fn template_score_cache_is_symmetric_and_avoids_repeat_bm25_calls() {
         .map(|offset| collect_start + offset)
         .unwrap();
     assert!(source[collect_start..collect_end].contains("template_evaluations"));
+}
+
+#[test]
+fn hot_candidate_buffer_pool_never_waits_on_a_contended_lock() {
+    let source = INDEX_SOURCE;
+    let start = source
+        .find("impl MetadataCandidateBufferPool")
+        .expect("candidate buffer pool implementation");
+    let end = source[start..]
+        .find("impl Drop for MetadataSparseCandidateBuffer")
+        .map(|offset| start + offset)
+        .expect("candidate buffer pool implementation end");
+    let implementation = &source[start..end];
+
+    assert!(implementation.contains("try_lock()"));
+    assert!(!implementation.contains(".lock()"));
 }
 
 #[test]
@@ -627,8 +645,10 @@ fn metadata_scoring_peak_accounts_for_fallback_acceleration_buffers() {
 
     assert!(scoring_peak.contains("fallback_exclusion_index"));
     assert!(scoring_peak.contains("fallback_exclusion_scratch"));
+    assert!(scoring_peak.contains("joint_candidate_index"));
     assert!(scoring_peak.contains("difficult_first_order"));
     assert!(scoring_peak.contains("calibration_graph_scratch"));
+    assert!(scoring_peak.contains("exact_rescue_mask"));
 }
 
 #[test]
@@ -712,6 +732,27 @@ fn shared_token_collection_skips_fallback_token_group_filter_entirely() {
 }
 
 #[test]
+fn fallback_exclusion_bitmap_is_prepared_only_after_dimension_filtering() {
+    let source = INDEX_SOURCE;
+    let start = source
+        .find("fn collect_metadata_left_candidate_batch")
+        .expect("candidate collector");
+    let end = source[start..]
+        .find("fn collect_metadata_left_candidate_wave")
+        .map(|offset| start + offset)
+        .expect("candidate collector end");
+    let collector = &source[start..end];
+    let dimension_filter = collector
+        .find("metadata_candidate_intersects_both_dimensions")
+        .expect("dimension filter");
+    let exclusion_prepare = collector
+        .find("prepare_left")
+        .expect("fallback exclusion preparation");
+
+    assert!(dimension_filter < exclusion_prepare);
+}
+
+#[test]
 fn representative_fallback_reuses_bounded_parallel_left_waves() {
     let source = INDEX_SOURCE;
     let start = source
@@ -749,13 +790,24 @@ fn representative_fallback_calibration_is_posting_work_bounded() {
 }
 
 #[test]
+fn conservative_production_order_uses_effective_candidate_index_work() {
+    assert_eq!(
+        INDEX_SOURCE
+            .matches("metadata_production_work_plan(")
+            .count(),
+        3,
+        "the planner definition and both shared-token/fallback production paths must use effective-index work"
+    );
+}
+
+#[test]
 fn metadata_full_work_estimates_fill_the_retained_vector_in_parallel() {
     let source = INDEX_SOURCE;
     let start = source
         .find("fn metadata_exact_posting_visit_estimates")
         .expect("parallel posting work estimator");
     let end = source[start..]
-        .find("fn metadata_exact_work_plan")
+        .find("fn metadata_production_posting_visit_estimates")
         .map(|offset| start + offset)
         .expect("parallel posting work estimator end");
     let estimator = &source[start..end];
@@ -777,7 +829,7 @@ fn metadata_full_work_estimates_fill_the_retained_vector_in_parallel() {
 }
 
 #[test]
-fn representative_fallback_widens_conservative_recall_before_failing_drift() {
+fn representative_fallback_uses_single_calibration_then_bounded_exact_rescue() {
     let source = INDEX_SOURCE;
     let start = source
         .find("fn union_metadata_no_common_atom_core")
@@ -788,19 +840,28 @@ fn representative_fallback_widens_conservative_recall_before_failing_drift() {
         .expect("representative fallback core end");
     let core = &source[start..end];
 
-    assert!(core.contains("set_conservative_profile(MetadataConservativeRecallProfile::Widened)"));
-    assert!(
+    assert_eq!(
         core.matches("calibrate_metadata_conservative_recall")
-            .count()
-            >= 2
+            .count(),
+        1
     );
-    let widened = core
-        .find("MetadataConservativeRecallProfile::Widened")
-        .expect("widened profile");
-    let drift_error = core
-        .find("conservative recall drift exceeds limits")
-        .expect("drift error");
-    assert!(widened < drift_error);
+    let calibration = core
+        .find("calibrate_metadata_conservative_recall")
+        .expect("recall calibration");
+    let rescue = core
+        .find("plan_metadata_bounded_exact_rescue")
+        .expect("bounded exact rescue");
+    assert!(calibration < rescue);
+    assert!(!core.contains("MetadataConservativeRecallProfile::Widened"));
+}
+
+#[test]
+fn conservative_drift_uses_bounded_per_left_exact_rescue_instead_of_aborting() {
+    let source = INDEX_SOURCE;
+    assert!(source.contains("plan_metadata_bounded_exact_rescue"));
+    assert!(source.matches("exact_recall_by_left").count() >= 2);
+    assert!(!source.contains("metadata shared-token conservative recall drift exceeds limits"));
+    assert!(!source.contains("metadata representative conservative recall drift exceeds limits"));
 }
 
 #[test]
@@ -945,10 +1006,10 @@ fn metadata_worker_stack_is_subtracted_before_pool_and_working_budgets() {
 }
 
 #[test]
-fn metadata_completion_labels_drift_as_a_pre_fallback_sample() {
+fn metadata_completion_labels_drift_as_a_pre_rescue_sample() {
     let source = include_str!("../mod.rs");
 
-    assert!(source.contains("sample drift before fallback contracts/components"));
+    assert!(source.contains("sample drift before rescue contracts/components"));
     assert!(!source.contains("; drift contracts/components"));
 }
 
