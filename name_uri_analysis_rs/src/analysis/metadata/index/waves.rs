@@ -3,6 +3,8 @@ use std::time::Duration;
 
 use rayon::prelude::*;
 
+#[cfg(test)]
+use super::super::super::AnalysisError;
 use super::super::bm25::CompactMetadataContentDocument;
 #[cfg(test)]
 use super::super::bm25::{CompactMetadataContentSet, MetadataContentRecord};
@@ -768,6 +770,7 @@ pub(in super::super) fn union_metadata_shared_token_atoms(
         state,
         MetadataRecallMode::Exact,
     )
+    .expect("exact shared-token atom union must complete")
 }
 
 #[cfg(test)]
@@ -777,7 +780,7 @@ pub(in super::super) fn union_metadata_shared_token_atoms_with_mode(
     context: &MetadataContentUnionContext<'_>,
     state: &mut MetadataUnionState,
     recall_mode: MetadataRecallMode,
-) -> MetadataContentUnionStats {
+) -> Result<MetadataContentUnionStats, AnalysisError> {
     let atoms = build_metadata_content_atoms(records, compact_docs, context.data);
     let template_cache_pool = MetadataTemplateScoreCachePool::default();
     union_metadata_shared_token_atom_core(
@@ -793,18 +796,33 @@ pub(in super::super) fn union_metadata_shared_token_atoms_with_mode(
 
 pub(in super::super) fn collect_metadata_left_candidate_batch(
     left: usize,
-    atoms: &[MetadataContentAtom],
-    compact_docs: &[CompactMetadataContentDocument],
-    candidate_index: &MetadataLocalCandidateIndex,
-    compatibility: MetadataTemplateCompatibility<'_>,
-    exact_recall: bool,
+    collection: &MetadataCandidateCollectionContext<'_>,
     scratch: &mut MetadataCandidateScratch,
 ) -> MetadataLeftCandidateBatch {
+    let atoms = collection.atoms;
+    let compact_docs = collection.compact_docs;
+    let compatibility = collection.compatibility;
     let left_atom = &atoms[left];
     let left_record_index = metadata_doc_index_to_usize(left_atom.representative_record_index);
     scratch.clear_for_next_left();
-    let candidate_basis = if exact_recall {
-        candidate_index.append_exact_candidates_after(
+    let estimated_posting_visits = collection
+        .estimated_posting_visits_by_left
+        .and_then(|work| work.get(left).copied())
+        .unwrap_or_else(|| {
+            let mut posting_plan = std::mem::take(&mut scratch.posting_plan);
+            posting_plan.clear();
+            let estimated = collection.candidate_index.estimate_exact_posting_visits(
+                left,
+                left_atom,
+                &compact_docs[left_record_index],
+                compatibility,
+                &mut posting_plan,
+            );
+            scratch.posting_plan = posting_plan;
+            estimated as u64
+        });
+    let candidate_basis = if collection.exact_recall {
+        collection.candidate_index.append_exact_candidates_after(
             left,
             left_atom,
             &compact_docs[left_record_index],
@@ -812,7 +830,7 @@ pub(in super::super) fn collect_metadata_left_candidate_batch(
             scratch,
         )
     } else {
-        candidate_index.append_candidates_after(
+        collection.candidate_index.append_candidates_after(
             left,
             left_atom,
             &compact_docs[left_record_index],
@@ -821,54 +839,93 @@ pub(in super::super) fn collect_metadata_left_candidate_batch(
         )
     };
     let raw_candidate_pairs = scratch.raw_candidate_count as u64;
-    let candidates = scratch
-        .candidates
-        .iter()
-        .copied()
-        .filter(|&right| {
-            metadata_candidate_intersects_both_dimensions(
-                candidate_basis,
-                left,
-                right,
-                atoms,
-                compact_docs,
-                compatibility,
-            )
-        })
-        .collect::<Vec<_>>();
-    let dimension_rejected_pairs = raw_candidate_pairs.saturating_sub(candidates.len() as u64);
+    if let Some(exclusion_index) = collection.fallback_token_exclusion_index {
+        exclusion_index.prepare_left(
+            left,
+            atoms,
+            collection.contract_tokens,
+            &mut scratch.fallback_token_exclusion,
+        );
+    }
+    let mut candidates = collection
+        .candidate_buffer_pool
+        .map(|pool| pool.take_sparse())
+        .unwrap_or_default();
+    candidates.reserve(scratch.candidates.len());
+    let mut dimension_accepted_pairs = 0u64;
+    let mut token_overlap_rejected_pairs = 0u64;
+    for right in scratch.candidates.iter().copied() {
+        if !metadata_candidate_intersects_both_dimensions(
+            candidate_basis,
+            left,
+            right,
+            atoms,
+            compact_docs,
+            compatibility,
+        ) {
+            continue;
+        }
+        dimension_accepted_pairs = dimension_accepted_pairs.saturating_add(1);
+        if matches!(collection.scope, MetadataCandidateUnionScope::Fallback) {
+            let right_index = metadata_doc_index_to_usize(right);
+            let has_disjoint_token_groups = collection
+                .fallback_token_exclusion_index
+                .map(|exclusion_index| {
+                    exclusion_index.atoms_have_disjoint_token_groups(
+                        left,
+                        right_index,
+                        atoms,
+                        collection.contract_tokens,
+                        &scratch.fallback_token_exclusion,
+                    )
+                })
+                .unwrap_or_else(|| {
+                    metadata_fallback_atoms_have_disjoint_token_groups(
+                        left_atom,
+                        &atoms[right_index],
+                        collection.contract_tokens,
+                    )
+                });
+            if !has_disjoint_token_groups {
+                token_overlap_rejected_pairs = token_overlap_rejected_pairs.saturating_add(1);
+                continue;
+            }
+        }
+        candidates.push(right);
+    }
+    let dimension_rejected_pairs = raw_candidate_pairs.saturating_sub(dimension_accepted_pairs);
+    let candidates = match collection.candidate_buffer_pool {
+        Some(pool) => {
+            MetadataCandidateSet::from_pooled_sparse(candidates, atoms.len(), Arc::clone(pool))
+        }
+        None => MetadataCandidateSet::from_sparse(candidates, atoms.len()),
+    };
+    debug_assert_eq!(
+        candidates.len() as u64,
+        dimension_accepted_pairs.saturating_sub(token_overlap_rejected_pairs)
+    );
     MetadataLeftCandidateBatch {
         left,
         candidates,
         raw_candidate_pairs,
         dimension_rejected_pairs,
+        token_overlap_rejected_pairs,
+        estimated_posting_visits,
+        visited_posting_entries: scratch.visited_posting_entries,
     }
 }
 
 pub(in super::super) fn collect_metadata_left_candidate_wave(
-    left_range: std::ops::Range<usize>,
-    atoms: &[MetadataContentAtom],
-    compact_docs: &[CompactMetadataContentDocument],
-    candidate_index: &MetadataLocalCandidateIndex,
-    compatibility: MetadataTemplateCompatibility<'_>,
-    exact_recall: bool,
+    lefts: &[usize],
+    collection: &MetadataCandidateCollectionContext<'_>,
     scratch_pool: &MetadataCandidateScratchPool,
 ) -> Vec<MetadataLeftCandidateBatch> {
-    left_range
-        .into_par_iter()
+    lefts
+        .par_iter()
+        .copied()
         .map_init(
             || scratch_pool.take(),
-            |scratch, left| {
-                collect_metadata_left_candidate_batch(
-                    left,
-                    atoms,
-                    compact_docs,
-                    candidate_index,
-                    compatibility,
-                    exact_recall,
-                    scratch,
-                )
-            },
+            |scratch, left| collect_metadata_left_candidate_batch(left, collection, scratch),
         )
         .collect()
 }
@@ -885,6 +942,19 @@ pub(in super::super) fn consume_metadata_left_candidate_wave(
 impl MetadataLeftCandidateBatchConsumer<'_, '_> {
     pub(in super::super) fn apply(&mut self, left_batch: MetadataLeftCandidateBatch) {
         let left = left_batch.left;
+        self.stats.processed_left_atoms = self.stats.processed_left_atoms.saturating_add(1);
+        self.stats.estimated_posting_visits = self
+            .stats
+            .estimated_posting_visits
+            .saturating_add(left_batch.estimated_posting_visits);
+        self.stats.visited_posting_entries = self
+            .stats
+            .visited_posting_entries
+            .saturating_add(left_batch.visited_posting_entries);
+        self.stats.dense_candidate_promotions = self
+            .stats
+            .dense_candidate_promotions
+            .saturating_add(u64::from(left_batch.candidates.is_dense()));
         self.stats.raw_candidate_pairs = self
             .stats
             .raw_candidate_pairs
@@ -893,19 +963,27 @@ impl MetadataLeftCandidateBatchConsumer<'_, '_> {
             .stats
             .dimension_rejected_pairs
             .saturating_add(left_batch.dimension_rejected_pairs);
+        self.stats.token_overlap_rejected_pairs = self
+            .stats
+            .token_overlap_rejected_pairs
+            .saturating_add(left_batch.token_overlap_rejected_pairs);
         let left_atom = &self.atoms[left];
         let left_contract_index = metadata_contract_index_to_usize(left_atom.members[0]);
         debug_assert_eq!(
             self.context.data.contracts[left_contract_index].chain_index,
             left_atom.chain_index
         );
-        for right in left_batch.candidates {
+        for right in left_batch.candidates.iter() {
             self.stats.candidate_pairs = self.stats.candidate_pairs.saturating_add(1);
             let right_atom = &self.atoms[metadata_doc_index_to_usize(right)];
             let right_contract_index = metadata_contract_index_to_usize(right_atom.members[0]);
             let singleton_pair = left_atom.members.len() == 1 && right_atom.members.len() == 1;
             let same_chain = left_atom.chain_index == right_atom.chain_index;
-            if (singleton_pair || same_chain)
+            let should_check_connected = match self.scope {
+                MetadataCandidateUnionScope::SharedToken => singleton_pair || same_chain,
+                MetadataCandidateUnionScope::Fallback => singleton_pair,
+            };
+            if should_check_connected
                 && metadata_pair_already_connected(
                     self.context.data,
                     self.context.chain_count,
@@ -920,14 +998,28 @@ impl MetadataLeftCandidateBatchConsumer<'_, '_> {
             }
             self.candidate_pairs.push((left, right));
             if self.candidate_pairs.len() >= METADATA_CONTENT_SCORE_BATCH_PAIRS {
-                let batch_stats = score_and_apply_metadata_atom_pair_batch(
-                    self.candidate_pairs,
-                    self.atoms,
-                    self.compact_docs,
-                    self.context,
-                    self.state,
-                    self.template_cache_pool,
-                );
+                let batch_stats = match self.scope {
+                    MetadataCandidateUnionScope::SharedToken => {
+                        score_and_apply_metadata_atom_pair_batch(
+                            self.candidate_pairs,
+                            self.atoms,
+                            self.compact_docs,
+                            self.context,
+                            self.state,
+                            self.template_cache_pool,
+                        )
+                    }
+                    MetadataCandidateUnionScope::Fallback => {
+                        score_and_apply_metadata_fallback_atom_pair_batch(
+                            self.candidate_pairs,
+                            self.atoms,
+                            self.compact_docs,
+                            self.context,
+                            self.state,
+                            self.template_cache_pool,
+                        )
+                    }
+                };
                 self.stats.accumulate_pair_scoring(batch_stats);
             }
         }

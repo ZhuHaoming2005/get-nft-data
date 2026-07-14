@@ -1,6 +1,22 @@
 use super::*;
 
 #[test]
+fn representative_fallback_uses_requested_recall_mode() {
+    let source = include_str!("../mod.rs");
+    let start = source
+        .find("let maximum_fallback_working_bytes")
+        .expect("representative fallback setup");
+    let end = source[start..]
+        .find("progress.step_stage(\"matched representative metadata fallback\")")
+        .map(|offset| start + offset)
+        .expect("representative fallback completion");
+    let fallback = &source[start..end];
+
+    assert!(fallback.contains("recall_mode: metadata_recall_mode"));
+    assert!(!fallback.contains("recall_mode: MetadataRecallMode::Exact"));
+}
+
+#[test]
 fn normalized_metadata_bm25_path_skips_redundant_normalization() {
     let raw = "  ＧＯＬＤ\tDragon  gold ";
     let normalized = normalize_metadata_text(raw);
@@ -150,7 +166,8 @@ fn large_shared_token_groups_generate_candidates_in_bounded_parallel_waves() {
         .map(|offset| collector_start + offset)
         .unwrap();
     let collector = &source[collector_start..collector_end];
-    assert!(collector.contains("into_par_iter()"));
+    assert!(collector.contains("par_iter()"));
+    assert!(collector.contains(".copied()"));
     assert!(collector.contains("map_init("));
 
     let core_start = source
@@ -600,6 +617,21 @@ fn representative_fallback_builds_compact_atoms_without_owned_record_vector() {
 }
 
 #[test]
+fn metadata_scoring_peak_accounts_for_fallback_acceleration_buffers() {
+    let source = INDEX_SOURCE;
+    let scoring_peak = source
+        .split("fn scoring_peak_bytes")
+        .nth(1)
+        .and_then(|tail| tail.split("fn ensure_within_memory_budget").next())
+        .expect("metadata scoring peak implementation");
+
+    assert!(scoring_peak.contains("fallback_exclusion_index"));
+    assert!(scoring_peak.contains("fallback_exclusion_scratch"));
+    assert!(scoring_peak.contains("difficult_first_order"));
+    assert!(scoring_peak.contains("calibration_graph_scratch"));
+}
+
+#[test]
 fn metadata_candidate_scratch_pool_releases_lock_before_cold_allocation() {
     let source = INDEX_SOURCE;
     let take_start = source
@@ -638,6 +670,137 @@ fn parallel_left_waves_reuse_candidate_scratch_pool_across_calls() {
     assert!(core
         .contains("let candidate_scratch_pool = MetadataCandidateScratchPool::new(atoms.len())"));
     assert!(core.matches("&candidate_scratch_pool").count() >= 2);
+}
+
+#[test]
+fn conservative_calibration_streams_candidate_sets_into_one_reused_score_batch() {
+    let source = INDEX_SOURCE;
+    let start = source
+        .find("fn calibrate_metadata_conservative_recall")
+        .expect("conservative calibration implementation");
+    let end = source[start..]
+        .find("impl MetadataSharedTokenGroupProgress")
+        .map(|offset| start + offset)
+        .expect("conservative calibration implementation end");
+    let implementation = &source[start..end];
+
+    assert!(!implementation.contains("candidates.iter().collect::<Vec<_>>()"));
+    assert!(!implementation.contains("estimated_posting_visits_by_left: None"));
+    assert!(implementation.contains("let mut score_pairs = Vec::with_capacity"));
+    assert!(implementation.matches("&mut score_pairs").count() >= 2);
+}
+
+#[test]
+fn shared_token_collection_skips_fallback_token_group_filter_entirely() {
+    let source = INDEX_SOURCE;
+    let start = source
+        .find("fn collect_metadata_left_candidate_batch")
+        .expect("candidate collector");
+    let end = source[start..]
+        .find("fn collect_metadata_left_candidate_wave")
+        .map(|offset| start + offset)
+        .expect("candidate collector end");
+    let collector = &source[start..end];
+    let fallback_guard = collector
+        .find("if matches!(collection.scope, MetadataCandidateUnionScope::Fallback)")
+        .expect("fallback scope guard");
+    let token_group_filter = collector
+        .find("atoms_have_disjoint_token_groups")
+        .expect("token group filter");
+
+    assert!(fallback_guard < token_group_filter);
+}
+
+#[test]
+fn representative_fallback_reuses_bounded_parallel_left_waves() {
+    let source = INDEX_SOURCE;
+    let start = source
+        .find("fn union_metadata_no_common_atom_core")
+        .expect("representative fallback core");
+    let end = source[start..]
+        .find("pub(in super::super) fn union_metadata_content_candidates")
+        .map(|offset| start + offset)
+        .expect("representative fallback core end");
+    let core = &source[start..end];
+
+    assert!(core.contains("MetadataCandidateScratchPool::new(atoms.len())"));
+    assert!(core.contains("collect_metadata_left_candidate_wave"));
+    assert!(core.contains("consume_metadata_left_candidate_wave"));
+    assert!(core.contains("METADATA_PARALLEL_LEFT_WAVE_MULTIPLIER"));
+}
+
+#[test]
+fn representative_fallback_calibration_is_posting_work_bounded() {
+    let source = INDEX_SOURCE;
+    assert!(source.contains("fn metadata_conservative_calibration_plan_with_work_budget"));
+    assert!(source.contains("estimate_exact_posting_visits"));
+    assert!(source.contains("plan_metadata_calibration_work_items"));
+    assert!(source.contains("METADATA_CONSERVATIVE_CALIBRATION_MAX_POSTING_VISITS"));
+
+    let start = source
+        .find("fn union_metadata_no_common_atom_core")
+        .expect("representative fallback core");
+    let end = source[start..]
+        .find("pub(in super::super) fn union_metadata_content_candidates")
+        .map(|offset| start + offset)
+        .expect("representative fallback core end");
+    let core = &source[start..end];
+    assert!(core.contains("metadata_conservative_calibration_plan_with_work_budget"));
+}
+
+#[test]
+fn metadata_full_work_estimates_fill_the_retained_vector_in_parallel() {
+    let source = INDEX_SOURCE;
+    let start = source
+        .find("fn metadata_exact_posting_visit_estimates")
+        .expect("parallel posting work estimator");
+    let end = source[start..]
+        .find("fn metadata_exact_work_plan")
+        .map(|offset| start + offset)
+        .expect("parallel posting work estimator end");
+    let estimator = &source[start..end];
+
+    assert!(estimator.contains("pool.install"));
+    assert!(estimator.contains("par_iter_mut()"));
+    assert!(estimator.contains("map_init"));
+
+    let order_start = source
+        .find("fn metadata_difficult_first_left_order_with_pool")
+        .expect("parallel difficult-first sorter");
+    let order_end = source[order_start..]
+        .find("fn plan_metadata_calibration_work_items")
+        .map(|offset| order_start + offset)
+        .expect("parallel difficult-first sorter end");
+    let order = &source[order_start..order_end];
+    assert!(order.contains("pool.install"));
+    assert!(order.contains("par_sort_unstable_by"));
+}
+
+#[test]
+fn representative_fallback_widens_conservative_recall_before_failing_drift() {
+    let source = INDEX_SOURCE;
+    let start = source
+        .find("fn union_metadata_no_common_atom_core")
+        .expect("representative fallback core");
+    let end = source[start..]
+        .find("pub(in super::super) fn union_metadata_content_candidates")
+        .map(|offset| start + offset)
+        .expect("representative fallback core end");
+    let core = &source[start..end];
+
+    assert!(core.contains("set_conservative_profile(MetadataConservativeRecallProfile::Widened)"));
+    assert!(
+        core.matches("calibrate_metadata_conservative_recall")
+            .count()
+            >= 2
+    );
+    let widened = core
+        .find("MetadataConservativeRecallProfile::Widened")
+        .expect("widened profile");
+    let drift_error = core
+        .find("conservative recall drift exceeds limits")
+        .expect("drift error");
+    assert!(widened < drift_error);
 }
 
 #[test]

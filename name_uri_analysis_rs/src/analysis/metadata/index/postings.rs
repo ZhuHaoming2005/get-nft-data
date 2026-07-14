@@ -117,6 +117,7 @@ impl MetadataContentCandidateIndex {
         scratch: &mut MetadataCandidateScratch,
     ) {
         for range in &plan.content {
+            scratch.record_posting_visits(range.end.saturating_sub(range.start));
             for &right in &self.posting_atoms[range.start..range.end] {
                 scratch.push_once(right);
             }
@@ -235,6 +236,7 @@ impl MetadataSparseCandidatePostings {
         scratch: &mut MetadataCandidateScratch,
     ) {
         for range in ranges {
+            scratch.record_posting_visits(range.end.saturating_sub(range.start));
             for &right in &self.posting_atoms[range.start..range.end] {
                 scratch.push_once(right);
             }
@@ -354,6 +356,63 @@ impl MetadataTemplateCandidateIndex {
 }
 
 impl MetadataLocalCandidateIndex {
+    pub(in super::super) fn estimate_exact_posting_visits(
+        &self,
+        atom_index: usize,
+        atom: &MetadataContentAtom,
+        document: &CompactMetadataContentDocument,
+        compatibility: MetadataTemplateCompatibility<'_>,
+        posting_plan: &mut MetadataCandidatePostingPlan,
+    ) -> usize {
+        posting_plan.clear();
+        match self {
+            Self::Conservative(index) => {
+                let scoring = compatibility
+                    .scoring()
+                    .expect("template candidate index requires scored compatibility");
+                let template_cost = index
+                    .exact_template
+                    .as_ref()
+                    .expect("exact metadata calibration index already released")
+                    .plan_candidates_after(atom_index, atom, scoring, posting_plan);
+                let content_cost = index
+                    .exact_content
+                    .as_ref()
+                    .expect("exact metadata calibration index already released")
+                    .plan_candidates_after(atom_index, document, posting_plan);
+                Self::planned_exact_posting_visits(template_cost, content_cost)
+            }
+            Self::Adaptive { template, content } => {
+                let scoring = compatibility
+                    .scoring()
+                    .expect("template candidate index requires scored compatibility");
+                let template_cost =
+                    template.plan_candidates_after(atom_index, atom, scoring, posting_plan);
+                let content_cost =
+                    content.plan_candidates_after(atom_index, document, posting_plan);
+                Self::planned_exact_posting_visits(template_cost, content_cost)
+            }
+            #[cfg(test)]
+            Self::ContentOnly(index) => {
+                index.plan_candidates_after(atom_index, document, posting_plan)
+            }
+        }
+    }
+
+    fn planned_exact_posting_visits(template_cost: usize, content_cost: usize) -> usize {
+        let minimum_cost = template_cost.min(content_cost);
+        let maximum_cost = template_cost.max(content_cost);
+        if minimum_cost >= METADATA_DENSE_INTERSECTION_MIN_SCAN_COST
+            && maximum_cost
+                <= minimum_cost.saturating_mul(METADATA_DENSE_INTERSECTION_MAX_COST_RATIO)
+        {
+            template_cost.saturating_add(content_cost)
+        } else {
+            minimum_cost
+        }
+    }
+
+    #[cfg(test)]
     pub(in super::super) fn from_atoms(
         docs: &[CompactMetadataContentDocument],
         atoms: &[MetadataContentAtom],
@@ -421,6 +480,7 @@ impl MetadataLocalCandidateIndex {
                         exact_content: Some(exact_content),
                         template,
                         content,
+                        profile: MetadataConservativeRecallProfile::Base,
                     }));
                 }
                 let (template, content) = if parallel {
@@ -458,9 +518,13 @@ impl MetadataLocalCandidateIndex {
     ) -> MetadataLocalCandidateBasis {
         match self {
             Self::Conservative(index) => {
-                index.template.append_candidates_after(atom_index, scratch);
+                index
+                    .template
+                    .append_candidates_after(atom_index, index.profile, scratch);
                 scratch.prepare_secondary_generation();
-                index.content.append_candidates_after(atom_index, scratch);
+                index
+                    .content
+                    .append_candidates_after(atom_index, index.profile, scratch);
                 scratch.raw_candidate_count = scratch.secondary_candidates.len();
                 scratch.retain_secondary_intersection();
                 scratch.candidates.retain(|&right| {
@@ -582,6 +646,15 @@ impl MetadataLocalCandidateIndex {
                 Self::Conservative(index)
             }
             index => index,
+        }
+    }
+
+    pub(in super::super) fn set_conservative_profile(
+        &mut self,
+        profile: MetadataConservativeRecallProfile,
+    ) {
+        if let Self::Conservative(index) = self {
+            index.profile = profile;
         }
     }
 }

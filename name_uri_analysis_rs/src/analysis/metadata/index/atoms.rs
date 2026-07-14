@@ -173,6 +173,52 @@ impl CompactMetadataContentGroupBuilder {
         } else {
             0
         };
+        let worker_count = scoring_workers.max(1);
+        let fallback_bitmap_word_count = self.atoms.len().saturating_add(63) / 64;
+        // The fallback token exclusion index is built from a temporary sorted
+        // (token, atom) vector and then retained as sparse CSR postings. Both
+        // representations can coexist while the conversion is in progress.
+        let fallback_exclusion_index =
+            if uses_adaptive_index && self.fallback_token_posting_count > 0 {
+                Self::vec_bytes_upper(
+                    self.fallback_token_posting_count,
+                    std::mem::size_of::<(u32, MetadataDocIndex)>(),
+                )
+                .saturating_add(Self::vec_bytes_upper(
+                    self.fallback_token_posting_count,
+                    std::mem::size_of::<MetadataDocIndex>(),
+                ))
+                .saturating_add(Self::vec_bytes_upper(
+                    self.fallback_token_posting_count,
+                    std::mem::size_of::<u32>(),
+                ))
+                .saturating_add(Self::vec_bytes_upper(
+                    self.fallback_token_posting_count.saturating_add(1),
+                    std::mem::size_of::<u64>(),
+                ))
+            } else {
+                0
+            };
+        let fallback_exclusion_scratch = if uses_adaptive_index {
+            Self::vec_bytes_upper(fallback_bitmap_word_count, std::mem::size_of::<u64>())
+                .saturating_add(Self::vec_bytes_upper(
+                    fallback_bitmap_word_count,
+                    std::mem::size_of::<usize>(),
+                ))
+                .saturating_mul(worker_count)
+        } else {
+            0
+        };
+        // Full-work planning retains one cost estimate and one difficult-first
+        // atom index per left. This is the intentional space-for-time tradeoff
+        // that avoids re-estimation and makes progress proportional to work.
+        let difficult_first_order = if uses_adaptive_index {
+            Self::vec_bytes_upper(self.atoms.len(), std::mem::size_of::<u64>()).saturating_add(
+                Self::vec_bytes_upper(self.atoms.len(), std::mem::size_of::<usize>()),
+            )
+        } else {
+            0
+        };
         let candidate_scratch = if uses_adaptive_index {
             self.atoms
                 .len()
@@ -181,17 +227,18 @@ impl CompactMetadataContentGroupBuilder {
                         .saturating_mul(std::mem::size_of::<u16>())
                         .saturating_add(3 * std::mem::size_of::<MetadataDocIndex>()),
                 )
-                .saturating_mul(scoring_workers.max(1))
+                .saturating_mul(worker_count)
         } else {
             0
         };
         // Each parallel wave retains its filtered right-hand candidates until
-        // the serial DSU consumer applies them in original left-atom order.
+        // the serial DSU consumer applies them in deterministic difficult-first
+        // order.
         // This deliberately spends bounded memory to parallelize the dominant
         // posting scans without changing union or scoring order.
         let candidate_wave = if uses_adaptive_index {
             Self::vec_bytes_upper(self.atoms.len(), std::mem::size_of::<MetadataDocIndex>())
-                .saturating_mul(scoring_workers.max(1))
+                .saturating_mul(worker_count)
                 .saturating_mul(METADATA_PARALLEL_LEFT_WAVE_MULTIPLIER)
                 .saturating_mul(2)
         } else {
@@ -213,7 +260,7 @@ impl CompactMetadataContentGroupBuilder {
         // A parallel fold and its reduce-side accumulator can coexist for
         // every worker, so reserve both fixed-size template caches.
         let template_cache_count = if uses_adaptive_index {
-            scoring_workers.max(1).saturating_mul(2)
+            worker_count.saturating_mul(2)
         } else {
             pair_batch_capacity
         };
@@ -224,14 +271,72 @@ impl CompactMetadataContentGroupBuilder {
                 .saturating_mul(std::mem::size_of::<usize>())
                 .saturating_add(std::mem::size_of::<MetadataContractIndex>()),
         );
+        let calibration_graph_scratch = if uses_adaptive_index
+            && recall_mode == MetadataRecallMode::Conservative
+            && self.atoms.len() >= METADATA_CONSERVATIVE_MIN_ATOMS
+        {
+            let atom_count = self.atoms.len();
+            let chain_count = self
+                .atoms
+                .iter()
+                .map(|atom| atom.chain_index)
+                .max()
+                .map_or(0, |maximum| maximum.saturating_add(1));
+            let stratum_count_upper = atom_count.min(chain_count.saturating_mul(64));
+            let retained_sample_candidates = atom_count.min(
+                METADATA_CONSERVATIVE_CALIBRATION_MAX_LEFTS.saturating_add(stratum_count_upper),
+            );
+            let calibration_vectors = Self::vec_bytes_upper(
+                atom_count,
+                2usize
+                    .saturating_mul(std::mem::size_of::<bool>())
+                    .saturating_add(std::mem::size_of::<u16>())
+                    .saturating_add(2usize.saturating_mul(
+                        std::mem::size_of::<usize>().saturating_add(std::mem::size_of::<u8>()),
+                    ))
+                    .saturating_add(std::mem::size_of::<u64>()),
+            );
+            let calibration_maps =
+                4usize.saturating_mul(super::super::load::hash_table_allocation_for_len_upper(
+                    atom_count,
+                    std::mem::size_of::<((usize, usize), u128)>(),
+                ));
+            let calibration_samples = 2usize.saturating_mul(Self::vec_bytes_upper(
+                METADATA_CONSERVATIVE_CALIBRATION_MAX_LEFTS.min(atom_count),
+                std::mem::size_of::<MetadataCalibrationSample>(),
+            ));
+            let calibration_reservoir = 2usize.saturating_mul(Self::vec_bytes_upper(
+                retained_sample_candidates,
+                std::mem::size_of::<(u64, MetadataCalibrationWorkItem)>(),
+            ));
+            let calibration_strata = stratum_count_upper.saturating_mul(
+                std::mem::size_of::<(
+                    u64,
+                    Option<(u64, MetadataCalibrationWorkItem)>,
+                    Vec<(u64, MetadataCalibrationWorkItem)>,
+                )>()
+                .saturating_add(4usize.saturating_mul(std::mem::size_of::<usize>())),
+            );
+            calibration_vectors
+                .saturating_add(calibration_maps)
+                .saturating_add(calibration_samples)
+                .saturating_add(calibration_reservoir)
+                .saturating_add(calibration_strata)
+        } else {
+            0
+        };
         let peak = self
             .atomized_memory_bytes()
             .saturating_add(candidate_index)
+            .saturating_add(fallback_exclusion_index)
+            .saturating_add(fallback_exclusion_scratch)
+            .saturating_add(difficult_first_order)
             .saturating_add(candidate_scratch)
             .saturating_add(candidate_wave)
             .saturating_add(pair_batches)
             .saturating_add(template_score_caches)
-            .saturating_add(union_scratch);
+            .saturating_add(union_scratch)
+            .saturating_add(calibration_graph_scratch);
         peak.saturating_add(peak.saturating_div(4))
     }
 
@@ -383,6 +488,9 @@ impl CompactMetadataContentGroupBuilder {
         }
         let group_index = self.atoms[atom_index].fallback_token_groups.len();
         self.fallback_group_count = self.fallback_group_count.saturating_add(1);
+        self.fallback_token_posting_count = self
+            .fallback_token_posting_count
+            .saturating_add(tokens.len());
         self.atoms[atom_index]
             .fallback_token_groups
             .push(MetadataFallbackTokenGroup {
@@ -614,7 +722,7 @@ impl MetadataRawTokenGroup {
             recall_mode,
         )?;
         let (atoms, docs) = self.compact.into_atomized_parts();
-        Ok(union_metadata_shared_token_atom_core(
+        union_metadata_shared_token_atom_core(
             atoms,
             &docs,
             context,
@@ -622,7 +730,7 @@ impl MetadataRawTokenGroup {
             template_cache_pool,
             recall_mode,
             progress,
-        ))
+        )
     }
 
     #[cfg(test)]
@@ -737,6 +845,106 @@ pub(in super::super) fn metadata_fallback_token_groups_are_disjoint(
         metadata_fallback_token_group_tokens(right, contract_tokens),
     )
     .is_none()
+}
+
+impl MetadataFallbackTokenExclusionIndex {
+    pub(in super::super) fn from_atoms(
+        atoms: &[MetadataContentAtom],
+        contract_tokens: &CompactContractTokens,
+    ) -> Self {
+        let mut entries = Vec::new();
+        for (atom_index, atom) in atoms.iter().enumerate() {
+            let [group] = atom.fallback_token_groups.as_slice() else {
+                continue;
+            };
+            let atom_index = metadata_doc_index_from_usize(atom_index);
+            entries.extend(
+                metadata_fallback_token_group_tokens(group, contract_tokens)
+                    .iter()
+                    .copied()
+                    .map(|token| (token, atom_index)),
+            );
+        }
+        entries.par_sort_unstable();
+        entries.dedup();
+        Self {
+            postings: MetadataSparseCandidatePostings::from_sorted_entries(entries),
+        }
+    }
+
+    pub(in super::super) fn prepare_left(
+        &self,
+        left: usize,
+        atoms: &[MetadataContentAtom],
+        contract_tokens: &CompactContractTokens,
+        scratch: &mut MetadataFallbackTokenExclusionScratch,
+    ) {
+        scratch.clear();
+        let [group] = atoms[left].fallback_token_groups.as_slice() else {
+            return;
+        };
+        scratch.prepared_single_group = true;
+        for &token in metadata_fallback_token_group_tokens(group, contract_tokens) {
+            let Ok(token_index) = self.postings.token_ids.binary_search(&token) else {
+                continue;
+            };
+            let start = self.postings.posting_offsets[token_index] as usize;
+            let end = self.postings.posting_offsets[token_index + 1] as usize;
+            for &right in &self.postings.posting_atoms[start..end] {
+                scratch.insert(metadata_doc_index_to_usize(right));
+            }
+        }
+    }
+
+    pub(in super::super) fn atoms_have_disjoint_token_groups(
+        &self,
+        left: usize,
+        right: usize,
+        atoms: &[MetadataContentAtom],
+        contract_tokens: &CompactContractTokens,
+        scratch: &MetadataFallbackTokenExclusionScratch,
+    ) -> bool {
+        if scratch.prepared_single_group && atoms[right].fallback_token_groups.len() == 1 {
+            return !scratch.contains(right);
+        }
+        metadata_fallback_atoms_have_disjoint_token_groups(
+            &atoms[left],
+            &atoms[right],
+            contract_tokens,
+        )
+    }
+}
+
+impl MetadataFallbackTokenExclusionScratch {
+    pub(in super::super) fn new(atom_count: usize) -> Self {
+        Self {
+            words: vec![0; atom_count.saturating_add(63) / 64],
+            touched_words: Vec::new(),
+            prepared_single_group: false,
+        }
+    }
+
+    fn clear(&mut self) {
+        for word_index in self.touched_words.drain(..) {
+            self.words[word_index] = 0;
+        }
+        self.prepared_single_group = false;
+    }
+
+    fn insert(&mut self, atom_index: usize) {
+        let word_index = atom_index / 64;
+        let word = &mut self.words[word_index];
+        if *word == 0 {
+            self.touched_words.push(word_index);
+        }
+        *word |= 1u64 << (atom_index % 64);
+    }
+
+    fn contains(&self, atom_index: usize) -> bool {
+        self.words
+            .get(atom_index / 64)
+            .is_some_and(|word| word & (1u64 << (atom_index % 64)) != 0)
+    }
 }
 
 pub(in super::super) fn apply_metadata_fallback_atom_internal_unions(

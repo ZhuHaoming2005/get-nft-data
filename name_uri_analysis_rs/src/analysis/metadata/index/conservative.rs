@@ -1,8 +1,10 @@
-use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 
 use rayon::prelude::*;
 
-use super::super::super::UnionFind;
+use super::super::super::{AnalysisError, UnionFind};
 use super::super::bm25::{CompactMetadataContentDocument, CompactMetadataScoring};
 use super::super::{
     metadata_doc_index_from_usize, metadata_doc_index_to_usize, MetadataDocIndex,
@@ -33,17 +35,65 @@ pub(in super::super) fn insert_metadata_conservative_anchor(
 
 impl MetadataRecallCalibrationStats {
     pub(in super::super) fn requires_exact_fallback(&self) -> bool {
-        let contract_drift_exceeded = self.exact_duplicate_contract_members > 0
-            && self.missed_duplicate_contract_members.saturating_mul(1_000)
-                > self
-                    .exact_duplicate_contract_members
-                    .saturating_mul(METADATA_CONSERVATIVE_CONTRACT_DRIFT_PER_MILLE);
-        let component_drift_exceeded = self.exact_component_members > 0
-            && self.shifted_component_members.saturating_mul(1_000)
-                > self
-                    .exact_component_members
-                    .saturating_mul(METADATA_CONSERVATIVE_COMPONENT_DRIFT_PER_MILLE);
+        let (exact_contract_members, missed_contract_members) =
+            if self.weighted_exact_duplicate_contract_members > 0 {
+                (
+                    self.weighted_exact_duplicate_contract_members,
+                    self.weighted_missed_duplicate_contract_members,
+                )
+            } else {
+                (
+                    u128::from(self.exact_duplicate_contract_members),
+                    u128::from(self.missed_duplicate_contract_members),
+                )
+            };
+        let (exact_component_members, shifted_component_members) =
+            if self.weighted_exact_component_members > 0 {
+                (
+                    self.weighted_exact_component_members,
+                    self.weighted_shifted_component_members,
+                )
+            } else {
+                (
+                    u128::from(self.exact_component_members),
+                    u128::from(self.shifted_component_members),
+                )
+            };
+        let contract_drift_exceeded = exact_contract_members > 0
+            && missed_contract_members.saturating_mul(1_000)
+                > exact_contract_members
+                    .saturating_mul(u128::from(METADATA_CONSERVATIVE_CONTRACT_DRIFT_PER_MILLE));
+        let component_drift_exceeded = exact_component_members > 0
+            && shifted_component_members.saturating_mul(1_000)
+                > exact_component_members
+                    .saturating_mul(u128::from(METADATA_CONSERVATIVE_COMPONENT_DRIFT_PER_MILLE));
         contract_drift_exceeded || component_drift_exceeded
+    }
+
+    pub(in super::super) fn representative_recall_risk_exceeded(&self) -> bool {
+        if self.requires_exact_fallback() {
+            return true;
+        }
+        if self.exact_matched_pairs < METADATA_CONSERVATIVE_PAIR_WILSON_MIN_MATCHES {
+            return false;
+        }
+
+        const WILSON_Z_SQUARED_95_PERCENT: f64 = 3.841_458_820_694_124;
+        let samples = self.exact_matched_pairs as f64;
+        let observed_rate = if self.weighted_exact_matched_pairs > 0 {
+            self.weighted_missed_matched_pairs
+                .min(self.weighted_exact_matched_pairs) as f64
+                / self.weighted_exact_matched_pairs as f64
+        } else {
+            self.missed_matched_pairs.min(self.exact_matched_pairs) as f64 / samples
+        };
+        let center = observed_rate + WILSON_Z_SQUARED_95_PERCENT / (2.0 * samples);
+        let radius = WILSON_Z_SQUARED_95_PERCENT.sqrt()
+            * (observed_rate * (1.0 - observed_rate) / samples
+                + WILSON_Z_SQUARED_95_PERCENT / (4.0 * samples * samples))
+                .sqrt();
+        let upper_bound = (center + radius) / (1.0 + WILSON_Z_SQUARED_95_PERCENT / samples);
+        upper_bound > METADATA_CONSERVATIVE_PAIR_DRIFT_MAX_RATE
     }
 
     pub(in super::super) fn accumulate(&mut self, other: Self) {
@@ -74,6 +124,36 @@ impl MetadataRecallCalibrationStats {
         self.shifted_component_members = self
             .shifted_component_members
             .saturating_add(other.shifted_component_members);
+        self.weighted_exact_matched_pairs = self
+            .weighted_exact_matched_pairs
+            .saturating_add(other.weighted_exact_matched_pairs);
+        self.weighted_missed_matched_pairs = self
+            .weighted_missed_matched_pairs
+            .saturating_add(other.weighted_missed_matched_pairs);
+        self.weighted_exact_duplicate_contract_members = self
+            .weighted_exact_duplicate_contract_members
+            .saturating_add(other.weighted_exact_duplicate_contract_members);
+        self.weighted_missed_duplicate_contract_members = self
+            .weighted_missed_duplicate_contract_members
+            .saturating_add(other.weighted_missed_duplicate_contract_members);
+        self.weighted_exact_component_members = self
+            .weighted_exact_component_members
+            .saturating_add(other.weighted_exact_component_members);
+        self.weighted_shifted_component_members = self
+            .weighted_shifted_component_members
+            .saturating_add(other.weighted_shifted_component_members);
+    }
+}
+
+impl MetadataCalibrationSample {
+    fn population_weight_units(&self) -> u64 {
+        let numerator = u128::from(self.stratum_population)
+            .saturating_mul(u128::from(METADATA_CALIBRATION_WEIGHT_SCALE));
+        let denominator = u128::from(self.stratum_sample_count.max(1));
+        let rounded = numerator
+            .saturating_add(denominator / 2)
+            .saturating_div(denominator);
+        u64::try_from(rounded).unwrap_or(u64::MAX)
     }
 }
 
@@ -228,6 +308,7 @@ impl MetadataConservativeDimensionIndex {
     pub(in super::super) fn append_candidates_after(
         &self,
         atom_index: usize,
+        profile: MetadataConservativeRecallProfile,
         scratch: &mut MetadataCandidateScratch,
     ) {
         let compact_atom_index = metadata_doc_index_from_usize(atom_index);
@@ -236,6 +317,7 @@ impl MetadataConservativeDimensionIndex {
             let range = self
                 .anchor_postings
                 .posting_range_after(anchor, compact_atom_index);
+            scratch.record_posting_visits(range.end.saturating_sub(range.start));
             for &right in &self.anchor_postings.posting_atoms[range.start..range.end] {
                 scratch.push_once(right);
             }
@@ -246,8 +328,23 @@ impl MetadataConservativeDimensionIndex {
                 let range = self
                     .simhash_band_postings
                     .posting_range_after(key, compact_atom_index);
+                scratch.record_posting_visits(range.end.saturating_sub(range.start));
                 for &right in &self.simhash_band_postings.posting_atoms[range.start..range.end] {
                     scratch.push_once(right);
+                }
+                if profile == MetadataConservativeRecallProfile::Widened {
+                    for bit in 0..METADATA_CONSERVATIVE_SIMHASH_BAND_BITS {
+                        let neighbor_key = key ^ (1u32 << bit);
+                        let range = self
+                            .simhash_band_postings
+                            .posting_range_after(neighbor_key, compact_atom_index);
+                        scratch.record_posting_visits(range.end.saturating_sub(range.start));
+                        for &right in
+                            &self.simhash_band_postings.posting_atoms[range.start..range.end]
+                        {
+                            scratch.push_once(right);
+                        }
+                    }
                 }
             }
         }
@@ -313,72 +410,590 @@ impl MetadataConservativeDimensionIndex {
     }
 }
 
-pub(in super::super) fn metadata_conservative_calibration_lefts(
-    atoms: &[MetadataContentAtom],
+#[cfg(test)]
+pub(in super::super) fn metadata_conservative_calibration_sample_positions(
+    left_count: usize,
+    seed: u64,
 ) -> Vec<usize> {
-    let left_count = atoms.len().saturating_sub(1);
     if left_count == 0 {
         return Vec::new();
     }
-    let seed = atoms
-        .first()
-        .and_then(|atom| atom.members.first())
-        .copied()
-        .map(stable_metadata_recall_token_hash)
-        .unwrap_or(0);
-    let folded_seed = seed as u32 ^ (seed >> 32) as u32;
-    let mut sampled = (0..left_count)
-        .filter(|&left| {
-            let contract = atoms[left].members.first().copied().unwrap_or_default();
-            stable_metadata_recall_token_hash(contract ^ folded_seed)
-                .is_multiple_of(METADATA_CONSERVATIVE_CALIBRATION_DIVISOR)
-        })
-        .collect::<Vec<_>>();
-    if sampled.is_empty() {
-        sampled.push(seed as usize % left_count);
+    let minimum = left_count.min(METADATA_CONSERVATIVE_CALIBRATION_MIN_LEFTS);
+    let maximum = left_count.min(METADATA_CONSERVATIVE_CALIBRATION_MAX_LEFTS);
+    let one_percent = left_count
+        .saturating_add(METADATA_CONSERVATIVE_CALIBRATION_DIVISOR as usize - 1)
+        / METADATA_CONSERVATIVE_CALIBRATION_DIVISOR as usize;
+    let sample_count = one_percent.clamp(minimum, maximum);
+    if sample_count == left_count {
+        return (0..left_count).collect();
     }
-    sampled
+    let folded_seed = seed as u32 ^ (seed >> 32) as u32;
+    (0..sample_count)
+        .map(|sample_index| {
+            let bucket_start = sample_index.saturating_mul(left_count) / sample_count;
+            let bucket_end =
+                sample_index.saturating_add(1).saturating_mul(left_count) / sample_count;
+            let bucket_width = bucket_end.saturating_sub(bucket_start).max(1);
+            let hash = stable_metadata_recall_token_hash(
+                u32::try_from(sample_index).unwrap_or(u32::MAX) ^ folded_seed,
+            );
+            bucket_start.saturating_add(hash as usize % bucket_width)
+        })
+        .collect()
 }
 
-pub(in super::super) fn for_each_metadata_calibration_hit(
-    left: usize,
-    candidates: &[MetadataDocIndex],
+#[cfg(test)]
+pub(in super::super) fn select_metadata_calibration_work_items(
+    items: &[MetadataCalibrationWorkItem],
+    minimum_lefts: usize,
+    maximum_posting_visits: u64,
+) -> Result<Vec<usize>, AnalysisError> {
+    let mut mandatory_strata = HashSet::new();
+    let mut selected = vec![false; items.len()];
+    let mut selected_count = 0usize;
+    let mut used_work = 0u64;
+    for (item_index, item) in items.iter().enumerate() {
+        let posting_visits = item.estimated_posting_visits.max(1);
+        let cost_bucket = 63u32.saturating_sub(posting_visits.leading_zeros());
+        if mandatory_strata.insert((item.chain_index, cost_bucket)) {
+            used_work = used_work.saturating_add(posting_visits);
+            if used_work > maximum_posting_visits {
+                return Err(AnalysisError::InvalidData(format!(
+                    "metadata conservative calibration work budget {maximum_posting_visits} cannot cover mandatory chain/cost strata; needs at least {used_work} estimated posting visits"
+                )));
+            }
+            selected[item_index] = true;
+            selected_count = selected_count.saturating_add(1);
+        }
+    }
+    for (item_index, item) in items.iter().enumerate() {
+        if selected[item_index] {
+            continue;
+        }
+        let posting_visits = item.estimated_posting_visits.max(1);
+        if used_work.saturating_add(posting_visits) > maximum_posting_visits {
+            continue;
+        }
+        used_work = used_work.saturating_add(posting_visits);
+        selected[item_index] = true;
+        selected_count = selected_count.saturating_add(1);
+    }
+    let required = minimum_lefts.min(items.len());
+    if selected_count < required {
+        return Err(AnalysisError::InvalidData(format!(
+            "metadata conservative calibration work budget {maximum_posting_visits} covers only {selected_count} sampled left atoms, below required {required}"
+        )));
+    }
+    Ok(items
+        .iter()
+        .zip(selected)
+        .filter_map(|(item, selected)| selected.then_some(item.left))
+        .collect())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct MetadataCalibrationReservoirEntry {
+    priority: u64,
+    item: MetadataCalibrationWorkItem,
+}
+
+#[derive(Default)]
+struct MetadataCalibrationStratum {
+    population: u64,
+    mandatory: Option<MetadataCalibrationReservoirEntry>,
+    candidates: Vec<MetadataCalibrationReservoirEntry>,
+}
+
+fn metadata_calibration_sample_priority(left: usize) -> u64 {
+    let folded = left as u32 ^ ((left >> 32) as u32).rotate_left(13);
+    stable_metadata_recall_token_hash(folded)
+}
+
+#[cfg(test)]
+pub(in super::super) fn metadata_difficult_first_left_order(
+    estimated_posting_visits_by_left: &[u64],
+) -> Vec<usize> {
+    metadata_difficult_first_left_order_with_pool(estimated_posting_visits_by_left, None)
+}
+
+fn metadata_difficult_first_left_order_with_pool(
+    estimated_posting_visits_by_left: &[u64],
+    pool: Option<&rayon::ThreadPool>,
+) -> Vec<usize> {
+    let mut lefts = (0..estimated_posting_visits_by_left.len()).collect::<Vec<_>>();
+    let compare = |&left: &usize, &right: &usize| {
+        estimated_posting_visits_by_left[right]
+            .cmp(&estimated_posting_visits_by_left[left])
+            .then_with(|| left.cmp(&right))
+    };
+    if let Some(pool) = pool.filter(|_| lefts.len() >= METADATA_CONSERVATIVE_MIN_ATOMS) {
+        pool.install(|| lefts.par_sort_unstable_by(compare));
+    } else {
+        lefts.sort_unstable_by(compare);
+    }
+    lefts
+}
+
+#[cfg(test)]
+pub(in super::super) fn plan_metadata_calibration_work_items(
+    items: impl IntoIterator<Item = MetadataCalibrationWorkItem>,
+    minimum_lefts: usize,
+    maximum_lefts: usize,
+    maximum_posting_visits: u64,
+) -> Result<MetadataCalibrationPlan, AnalysisError> {
+    plan_metadata_calibration_work_items_with_estimates(
+        items,
+        Vec::new(),
+        false,
+        None,
+        minimum_lefts,
+        maximum_lefts,
+        maximum_posting_visits,
+    )
+}
+
+fn plan_metadata_calibration_work_items_with_estimates(
+    items: impl IntoIterator<Item = MetadataCalibrationWorkItem>,
+    mut estimated_posting_visits_by_left: Vec<u64>,
+    estimates_are_precomputed: bool,
+    pool: Option<&rayon::ThreadPool>,
+    minimum_lefts: usize,
+    maximum_lefts: usize,
+    maximum_posting_visits: u64,
+) -> Result<MetadataCalibrationPlan, AnalysisError> {
+    let mut strata = BTreeMap::<(usize, u32), MetadataCalibrationStratum>::new();
+    let mut item_count = 0usize;
+    let mut estimated_total_posting_visits = 0u64;
+    let mut global_reservoir = BinaryHeap::<MetadataCalibrationReservoirEntry>::new();
+    for mut item in items {
+        item_count = item_count.saturating_add(1);
+        let posting_visits = if estimates_are_precomputed {
+            estimated_posting_visits_by_left
+                .get(item.left)
+                .copied()
+                .ok_or_else(|| {
+                    AnalysisError::InvalidData(format!(
+                        "metadata posting work estimate missing for left atom {}",
+                        item.left
+                    ))
+                })?
+                .max(1)
+        } else {
+            item.estimated_posting_visits.max(1)
+        };
+        item.estimated_posting_visits = posting_visits;
+        estimated_total_posting_visits =
+            estimated_total_posting_visits.saturating_add(posting_visits);
+        if estimated_posting_visits_by_left.len() <= item.left {
+            estimated_posting_visits_by_left.resize(item.left.saturating_add(1), 0);
+        }
+        estimated_posting_visits_by_left[item.left] = posting_visits;
+        if maximum_lefts == 0 {
+            continue;
+        }
+        let cost_bucket = 63u32.saturating_sub(posting_visits.leading_zeros());
+        let stratum = strata.entry((item.chain_index, cost_bucket)).or_default();
+        stratum.population = stratum.population.saturating_add(1);
+        let priority = metadata_calibration_sample_priority(item.left);
+        let mandatory = MetadataCalibrationReservoirEntry { priority, item };
+        if stratum.mandatory.is_none_or(|current| mandatory < current) {
+            stratum.mandatory = Some(mandatory);
+        }
+        let entry = MetadataCalibrationReservoirEntry {
+            priority: priority / u64::from(cost_bucket.saturating_add(1)),
+            item,
+        };
+        if global_reservoir.len() < maximum_lefts {
+            global_reservoir.push(entry);
+        } else if global_reservoir
+            .peek()
+            .is_some_and(|largest| entry < *largest)
+        {
+            global_reservoir.pop();
+            global_reservoir.push(entry);
+        }
+    }
+    if item_count == 0 {
+        return Ok(MetadataCalibrationPlan::default());
+    }
+    if maximum_lefts == 0 {
+        return Ok(MetadataCalibrationPlan {
+            samples: Vec::new(),
+            difficult_first_lefts: metadata_difficult_first_left_order_with_pool(
+                &estimated_posting_visits_by_left,
+                pool,
+            ),
+            estimated_posting_visits_by_left,
+            estimated_total_posting_visits,
+            estimated_sample_posting_visits: 0,
+            retained_calibration_candidates: 0,
+        });
+    }
+    let maximum_lefts = maximum_lefts.min(item_count);
+    if maximum_lefts < strata.len() {
+        return Err(AnalysisError::InvalidData(format!(
+            "metadata conservative calibration left budget {maximum_lefts} cannot cover {} mandatory chain/cost strata",
+            strata.len()
+        )));
+    }
+    for entry in global_reservoir {
+        let posting_visits = entry.item.estimated_posting_visits.max(1);
+        let cost_bucket = 63u32.saturating_sub(posting_visits.leading_zeros());
+        strata
+            .get_mut(&(entry.item.chain_index, cost_bucket))
+            .expect("global calibration sample must have an observed stratum")
+            .candidates
+            .push(entry);
+    }
+    let mut retained_calibration_candidates = 0usize;
+
+    struct SelectionState {
+        chain_index: usize,
+        cost_bucket: u32,
+        population: u64,
+        candidates: Vec<MetadataCalibrationWorkItem>,
+        selected: usize,
+        blocked: bool,
+    }
+    let mut selection = strata
+        .into_iter()
+        .map(|((chain_index, cost_bucket), mut stratum)| {
+            let mandatory = stratum
+                .mandatory
+                .expect("observed calibration stratum must retain one mandatory sample");
+            if !stratum
+                .candidates
+                .iter()
+                .any(|entry| entry.item.left == mandatory.item.left)
+            {
+                stratum.candidates.push(MetadataCalibrationReservoirEntry {
+                    priority: 0,
+                    item: mandatory.item,
+                });
+            } else if let Some(entry) = stratum
+                .candidates
+                .iter_mut()
+                .find(|entry| entry.item.left == mandatory.item.left)
+            {
+                entry.priority = 0;
+            }
+            stratum
+                .candidates
+                .sort_unstable_by_key(|entry| (entry.priority, entry.item.left));
+            stratum.candidates.dedup_by_key(|entry| entry.item.left);
+            retained_calibration_candidates =
+                retained_calibration_candidates.saturating_add(stratum.candidates.len());
+            SelectionState {
+                chain_index,
+                cost_bucket,
+                population: stratum.population,
+                candidates: stratum
+                    .candidates
+                    .into_iter()
+                    .map(|entry| entry.item)
+                    .collect(),
+                selected: 0,
+                blocked: false,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut estimated_sample_posting_visits = 0u64;
+    for stratum in &mut selection {
+        let item = stratum
+            .candidates
+            .first()
+            .expect("non-empty calibration stratum must retain a sample");
+        estimated_sample_posting_visits =
+            estimated_sample_posting_visits.saturating_add(item.estimated_posting_visits.max(1));
+        if estimated_sample_posting_visits > maximum_posting_visits {
+            return Err(AnalysisError::InvalidData(format!(
+                "metadata conservative calibration work budget {maximum_posting_visits} cannot cover mandatory chain/cost strata; needs at least {estimated_sample_posting_visits} estimated posting visits"
+            )));
+        }
+        stratum.selected = 1;
+    }
+
+    let mut selected_count = selection.len();
+    while selected_count < maximum_lefts {
+        let mut best: Option<usize> = None;
+        for index in 0..selection.len() {
+            if selection[index].blocked
+                || selection[index].selected >= selection[index].candidates.len()
+            {
+                continue;
+            }
+            let next_work = selection[index].candidates[selection[index].selected]
+                .estimated_posting_visits
+                .max(1);
+            if estimated_sample_posting_visits.saturating_add(next_work) > maximum_posting_visits {
+                selection[index].blocked = true;
+                continue;
+            }
+            let stratum = &selection[index];
+            let Some(current_best) = best else {
+                best = Some(index);
+                continue;
+            };
+            let current = &selection[current_best];
+            let candidate_mass = u128::from(stratum.population)
+                .saturating_mul(u128::from(stratum.cost_bucket).saturating_add(1));
+            let current_mass = u128::from(current.population)
+                .saturating_mul(u128::from(current.cost_bucket).saturating_add(1));
+            let candidate_score =
+                candidate_mass.saturating_mul(current.selected.saturating_add(1) as u128);
+            let current_score =
+                current_mass.saturating_mul(stratum.selected.saturating_add(1) as u128);
+            if candidate_score > current_score
+                || (candidate_score == current_score
+                    && (stratum.chain_index, stratum.cost_bucket)
+                        > (current.chain_index, current.cost_bucket))
+            {
+                best = Some(index);
+            }
+        }
+        let Some(best) = best else {
+            break;
+        };
+        let stratum = &mut selection[best];
+        let item = stratum.candidates[stratum.selected];
+        estimated_sample_posting_visits =
+            estimated_sample_posting_visits.saturating_add(item.estimated_posting_visits.max(1));
+        stratum.selected = stratum.selected.saturating_add(1);
+        selected_count = selected_count.saturating_add(1);
+    }
+
+    let required = minimum_lefts.min(item_count);
+    if selected_count < required {
+        return Err(AnalysisError::InvalidData(format!(
+            "metadata conservative calibration work budget {maximum_posting_visits} covers only {selected_count} sampled left atoms, below required {required}"
+        )));
+    }
+    let mut samples = Vec::with_capacity(selected_count);
+    for stratum in selection {
+        let stratum_sample_count = stratum.selected as u64;
+        samples.extend(
+            stratum
+                .candidates
+                .into_iter()
+                .take(stratum.selected)
+                .map(|item| MetadataCalibrationSample {
+                    left: item.left,
+                    chain_index: stratum.chain_index,
+                    cost_bucket: stratum.cost_bucket,
+                    estimated_posting_visits: item.estimated_posting_visits.max(1),
+                    stratum_population: stratum.population,
+                    stratum_sample_count,
+                }),
+        );
+    }
+    samples.sort_unstable_by(|left, right| {
+        right
+            .estimated_posting_visits
+            .cmp(&left.estimated_posting_visits)
+            .then_with(|| left.left.cmp(&right.left))
+    });
+    let difficult_first_lefts =
+        metadata_difficult_first_left_order_with_pool(&estimated_posting_visits_by_left, pool);
+    Ok(MetadataCalibrationPlan {
+        samples,
+        estimated_posting_visits_by_left,
+        difficult_first_lefts,
+        estimated_total_posting_visits,
+        estimated_sample_posting_visits,
+        retained_calibration_candidates,
+    })
+}
+
+fn metadata_exact_posting_visit_estimates(
     atoms: &[MetadataContentAtom],
     compact_docs: &[CompactMetadataContentDocument],
-    context: &MetadataContentUnionContext<'_>,
-    template_cache_pool: &MetadataTemplateScoreCachePool,
+    candidate_index: &MetadataLocalCandidateIndex,
+    compatibility: MetadataTemplateCompatibility<'_>,
+    pool: &rayon::ThreadPool,
+) -> Vec<u64> {
+    let mut estimates = vec![0u64; atoms.len().saturating_sub(1)];
+    if estimates.len() >= METADATA_CONSERVATIVE_MIN_ATOMS {
+        pool.install(|| {
+            estimates
+                .par_iter_mut()
+                .enumerate()
+                .map_init(
+                    MetadataCandidatePostingPlan::default,
+                    |posting_plan, (left, estimate)| {
+                        let atom = &atoms[left];
+                        let document = &compact_docs
+                            [metadata_doc_index_to_usize(atom.representative_record_index)];
+                        *estimate = candidate_index
+                            .estimate_exact_posting_visits(
+                                left,
+                                atom,
+                                document,
+                                compatibility,
+                                posting_plan,
+                            )
+                            .max(1) as u64;
+                    },
+                )
+                .for_each(drop);
+        });
+    } else {
+        let mut posting_plan = MetadataCandidatePostingPlan::default();
+        for (left, estimate) in estimates.iter_mut().enumerate() {
+            let atom = &atoms[left];
+            let document =
+                &compact_docs[metadata_doc_index_to_usize(atom.representative_record_index)];
+            *estimate = candidate_index
+                .estimate_exact_posting_visits(
+                    left,
+                    atom,
+                    document,
+                    compatibility,
+                    &mut posting_plan,
+                )
+                .max(1) as u64;
+        }
+    }
+    estimates
+}
+
+pub(in super::super) fn metadata_exact_work_plan(
+    atoms: &[MetadataContentAtom],
+    compact_docs: &[CompactMetadataContentDocument],
+    candidate_index: &MetadataLocalCandidateIndex,
+    compatibility: MetadataTemplateCompatibility<'_>,
+    pool: &rayon::ThreadPool,
+) -> Result<MetadataCalibrationPlan, AnalysisError> {
+    let estimates = metadata_exact_posting_visit_estimates(
+        atoms,
+        compact_docs,
+        candidate_index,
+        compatibility,
+        pool,
+    );
+    let work_items = atoms
+        .iter()
+        .take(estimates.len())
+        .enumerate()
+        .map(|(left, atom)| MetadataCalibrationWorkItem {
+            left,
+            chain_index: atom.chain_index,
+            estimated_posting_visits: 0,
+        });
+    plan_metadata_calibration_work_items_with_estimates(
+        work_items,
+        estimates,
+        true,
+        Some(pool),
+        0,
+        0,
+        u64::MAX,
+    )
+}
+
+pub(in super::super) fn metadata_conservative_calibration_plan_with_work_budget(
+    atoms: &[MetadataContentAtom],
+    compact_docs: &[CompactMetadataContentDocument],
+    candidate_index: &MetadataLocalCandidateIndex,
+    compatibility: MetadataTemplateCompatibility<'_>,
+    pool: &rayon::ThreadPool,
+) -> Result<MetadataCalibrationPlan, AnalysisError> {
+    let estimates = metadata_exact_posting_visit_estimates(
+        atoms,
+        compact_docs,
+        candidate_index,
+        compatibility,
+        pool,
+    );
+    let left_count = estimates.len();
+    let work_items = atoms
+        .iter()
+        .take(left_count)
+        .enumerate()
+        .map(|(left, atom)| MetadataCalibrationWorkItem {
+            left,
+            chain_index: atom.chain_index,
+            estimated_posting_visits: 0,
+        });
+    plan_metadata_calibration_work_items_with_estimates(
+        work_items,
+        estimates,
+        true,
+        Some(pool),
+        METADATA_CONSERVATIVE_CALIBRATION_MIN_LEFTS.min(left_count),
+        METADATA_CONSERVATIVE_CALIBRATION_MAX_LEFTS.min(left_count),
+        METADATA_CONSERVATIVE_CALIBRATION_MAX_POSTING_VISITS,
+    )
+}
+
+struct MetadataCalibrationScoringContext<'a, 'context> {
+    atoms: &'a [MetadataContentAtom],
+    compact_docs: &'a [CompactMetadataContentDocument],
+    union: &'a MetadataContentUnionContext<'context>,
+    template_cache_pool: &'a MetadataTemplateScoreCachePool,
+}
+
+fn for_each_metadata_calibration_hit(
+    left: usize,
+    candidates: &MetadataCandidateSet,
+    pairs: &mut Vec<(usize, MetadataDocIndex)>,
+    scoring: &MetadataCalibrationScoringContext<'_, '_>,
     mut on_hit: impl FnMut(MetadataDocIndex),
 ) {
-    let mut pairs = Vec::with_capacity(METADATA_CONTENT_SCORE_BATCH_PAIRS);
-    for chunk in candidates.chunks(METADATA_CONTENT_SCORE_BATCH_PAIRS) {
-        pairs.clear();
-        pairs.extend(chunk.iter().copied().map(|right| (left, right)));
+    pairs.clear();
+    for right in candidates.iter() {
+        pairs.push((left, right));
+        if pairs.len() < METADATA_CONTENT_SCORE_BATCH_PAIRS {
+            continue;
+        }
         let batch = collect_metadata_validated_atom_pair_hits(
-            &pairs,
-            atoms,
-            compact_docs,
-            context.template_compatibility,
-            context.pool,
-            template_cache_pool,
+            pairs,
+            scoring.atoms,
+            scoring.compact_docs,
+            scoring.union.template_compatibility,
+            scoring.union.pool,
+            scoring.template_cache_pool,
         );
         for (_, right) in batch.hits {
             on_hit(right);
         }
+        pairs.clear();
+    }
+    if !pairs.is_empty() {
+        let batch = collect_metadata_validated_atom_pair_hits(
+            pairs,
+            scoring.atoms,
+            scoring.compact_docs,
+            scoring.union.template_compatibility,
+            scoring.union.pool,
+            scoring.template_cache_pool,
+        );
+        for (_, right) in batch.hits {
+            on_hit(right);
+        }
+        pairs.clear();
     }
 }
 
 pub(in super::super) fn calibrate_metadata_conservative_recall(
-    atoms: &[MetadataContentAtom],
-    compact_docs: &[CompactMetadataContentDocument],
-    candidate_index: &MetadataLocalCandidateIndex,
-    context: &MetadataContentUnionContext<'_>,
-    template_cache_pool: &MetadataTemplateScoreCachePool,
-    progress: Option<MetadataSharedTokenGroupProgress<'_>>,
+    request: MetadataRecallCalibrationRequest<'_, '_>,
 ) -> MetadataRecallCalibrationStats {
-    let lefts = metadata_conservative_calibration_lefts(atoms);
-    let total_lefts = lefts.len();
+    let MetadataRecallCalibrationRequest {
+        atoms,
+        compact_docs,
+        candidate_index,
+        samples,
+        estimated_posting_visits_by_left,
+        context,
+        template_cache_pool,
+        scope,
+        fallback_token_exclusion_index,
+        candidate_buffer_pool,
+        progress,
+    } = request;
+    let total_lefts = samples.len();
     let mut calibration = MetadataRecallCalibrationStats {
-        sampled_left_atoms: lefts.len() as u64,
+        sampled_left_atoms: samples.len() as u64,
         ..MetadataRecallCalibrationStats::default()
     };
     let mut scratch = MetadataCandidateScratch::new(atoms.len());
@@ -388,31 +1003,44 @@ pub(in super::super) fn calibrate_metadata_conservative_recall(
     let mut conservative_hit_generation = 0u16;
     let mut exact_components = UnionFind::new(atoms.len());
     let mut conservative_components = UnionFind::new(atoms.len());
-    for (sample_index, left) in lefts.into_iter().enumerate() {
+    let mut atom_weight_units = vec![0u64; atoms.len()];
+    let mut score_pairs = Vec::with_capacity(METADATA_CONTENT_SCORE_BATCH_PAIRS);
+    let scoring = MetadataCalibrationScoringContext {
+        atoms,
+        compact_docs,
+        union: context,
+        template_cache_pool,
+    };
+    for (sample_index, sample) in samples.into_iter().enumerate() {
+        let left = sample.left;
+        let population_weight_units = sample.population_weight_units();
         conservative_hit_generation = conservative_hit_generation.wrapping_add(1);
         if conservative_hit_generation == 0 {
             conservative_hit_generations.fill(0);
             conservative_hit_generation = 1;
         }
-        let conservative_batch = collect_metadata_left_candidate_batch(
-            left,
+        let conservative_collection = MetadataCandidateCollectionContext {
             atoms,
             compact_docs,
             candidate_index,
-            context.template_compatibility,
-            false,
-            &mut scratch,
-        );
+            compatibility: context.template_compatibility,
+            exact_recall: false,
+            scope,
+            contract_tokens: context.contract_tokens,
+            fallback_token_exclusion_index,
+            candidate_buffer_pool,
+            estimated_posting_visits_by_left: Some(estimated_posting_visits_by_left),
+        };
+        let conservative_batch =
+            collect_metadata_left_candidate_batch(left, &conservative_collection, &mut scratch);
         calibration.conservative_candidate_pairs = calibration
             .conservative_candidate_pairs
             .saturating_add(conservative_batch.candidates.len() as u64);
         for_each_metadata_calibration_hit(
             left,
             &conservative_batch.candidates,
-            atoms,
-            compact_docs,
-            context,
-            template_cache_pool,
+            &mut score_pairs,
+            &scoring,
             |right| {
                 let right = metadata_doc_index_to_usize(right);
                 conservative_hit_generations[right] = conservative_hit_generation;
@@ -421,36 +1049,45 @@ pub(in super::super) fn calibrate_metadata_conservative_recall(
                 conservative_components.union(left, right);
             },
         );
-        drop(conservative_batch);
-
-        let exact_batch = collect_metadata_left_candidate_batch(
-            left,
+        let exact_collection = MetadataCandidateCollectionContext {
             atoms,
             compact_docs,
             candidate_index,
-            context.template_compatibility,
-            true,
-            &mut scratch,
-        );
+            compatibility: context.template_compatibility,
+            exact_recall: true,
+            scope,
+            contract_tokens: context.contract_tokens,
+            fallback_token_exclusion_index,
+            candidate_buffer_pool,
+            estimated_posting_visits_by_left: Some(estimated_posting_visits_by_left),
+        };
+        let exact_batch =
+            collect_metadata_left_candidate_batch(left, &exact_collection, &mut scratch);
         calibration.exact_candidate_pairs = calibration
             .exact_candidate_pairs
             .saturating_add(exact_batch.candidates.len() as u64);
         for_each_metadata_calibration_hit(
             left,
             &exact_batch.candidates,
-            atoms,
-            compact_docs,
-            context,
-            template_cache_pool,
+            &mut score_pairs,
+            &scoring,
             |right| {
                 calibration.exact_matched_pairs = calibration.exact_matched_pairs.saturating_add(1);
+                calibration.weighted_exact_matched_pairs = calibration
+                    .weighted_exact_matched_pairs
+                    .saturating_add(u128::from(population_weight_units));
                 if conservative_hit_generations[metadata_doc_index_to_usize(right)]
                     != conservative_hit_generation
                 {
                     calibration.missed_matched_pairs =
                         calibration.missed_matched_pairs.saturating_add(1);
+                    calibration.weighted_missed_matched_pairs = calibration
+                        .weighted_missed_matched_pairs
+                        .saturating_add(u128::from(population_weight_units));
                 }
                 let right = metadata_doc_index_to_usize(right);
+                atom_weight_units[left] = atom_weight_units[left].max(population_weight_units);
+                atom_weight_units[right] = atom_weight_units[right].max(population_weight_units);
                 exact_duplicate_atoms[left] = true;
                 exact_duplicate_atoms[right] = true;
                 exact_components.union(left, right);
@@ -463,6 +1100,8 @@ pub(in super::super) fn calibrate_metadata_conservative_recall(
 
     let mut exact_component_weights = HashMap::<usize, u64>::new();
     let mut conservative_partition_weights = HashMap::<(usize, usize), u64>::new();
+    let mut weighted_exact_component_weights = HashMap::<usize, u128>::new();
+    let mut weighted_conservative_partition_weights = HashMap::<(usize, usize), u128>::new();
     let mut exact_duplicate_contract_members = 0u64;
     let mut missed_duplicate_contract_members = 0u64;
     for atom_index in 0..atoms.len() {
@@ -470,10 +1109,19 @@ pub(in super::super) fn calibrate_metadata_conservative_recall(
             continue;
         }
         let weight = atoms[atom_index].members.len() as u64;
+        let weighted = u128::from(weight).saturating_mul(u128::from(
+            atom_weight_units[atom_index].max(METADATA_CALIBRATION_WEIGHT_SCALE),
+        ));
         exact_duplicate_contract_members = exact_duplicate_contract_members.saturating_add(weight);
+        calibration.weighted_exact_duplicate_contract_members = calibration
+            .weighted_exact_duplicate_contract_members
+            .saturating_add(weighted);
         if !conservative_duplicate_atoms[atom_index] {
             missed_duplicate_contract_members =
                 missed_duplicate_contract_members.saturating_add(weight);
+            calibration.weighted_missed_duplicate_contract_members = calibration
+                .weighted_missed_duplicate_contract_members
+                .saturating_add(weighted);
         }
         let exact_root = exact_components.find(atom_index);
         let conservative_root = conservative_components.find(atom_index);
@@ -483,6 +1131,14 @@ pub(in super::super) fn calibrate_metadata_conservative_recall(
             .entry((exact_root, conservative_root))
             .or_default();
         *partition_weight = partition_weight.saturating_add(weight);
+        let weighted_exact_weight = weighted_exact_component_weights
+            .entry(exact_root)
+            .or_default();
+        *weighted_exact_weight = weighted_exact_weight.saturating_add(weighted);
+        let weighted_partition_weight = weighted_conservative_partition_weights
+            .entry((exact_root, conservative_root))
+            .or_default();
+        *weighted_partition_weight = weighted_partition_weight.saturating_add(weighted);
     }
     let mut largest_partition_by_exact_component = HashMap::<usize, u64>::new();
     for ((exact_root, _), weight) in conservative_partition_weights {
@@ -506,6 +1162,28 @@ pub(in super::super) fn calibrate_metadata_conservative_recall(
             )
         })
         .fold(0u64, u64::saturating_add);
+    let mut weighted_largest_partition_by_exact_component = HashMap::<usize, u128>::new();
+    for ((exact_root, _), weight) in weighted_conservative_partition_weights {
+        let largest = weighted_largest_partition_by_exact_component
+            .entry(exact_root)
+            .or_default();
+        *largest = (*largest).max(weight);
+    }
+    calibration.weighted_exact_component_members = weighted_exact_component_weights
+        .values()
+        .copied()
+        .fold(0u128, u128::saturating_add);
+    calibration.weighted_shifted_component_members = weighted_exact_component_weights
+        .into_iter()
+        .map(|(root, weight)| {
+            weight.saturating_sub(
+                weighted_largest_partition_by_exact_component
+                    .get(&root)
+                    .copied()
+                    .unwrap_or(0),
+            )
+        })
+        .fold(0u128, u128::saturating_add);
     calibration.exact_duplicate_contract_members = exact_duplicate_contract_members;
     calibration.missed_duplicate_contract_members = missed_duplicate_contract_members;
     calibration.exact_component_members = exact_component_members;

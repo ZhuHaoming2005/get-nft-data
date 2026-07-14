@@ -2,7 +2,7 @@ use std::collections::{hash_map::RandomState, HashMap};
 use std::path::Path;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicUsize};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use rayon::prelude::*;
 
@@ -27,6 +27,8 @@ use super::{MetadataDocPair, MetadataTemplateMatches};
 pub(super) const METADATA_RAW_GROUP_CHUNK_SIZE: usize = 1024;
 pub(super) const METADATA_TOKEN_GROUP_BATCH_MULTIPLIER: usize = 4;
 pub(super) const METADATA_PARALLEL_LEFT_WAVE_MULTIPLIER: usize = 2;
+pub(super) const METADATA_DENSE_CANDIDATE_MIN_COUNT: usize = 65_536;
+pub(super) const METADATA_DENSE_CANDIDATE_UNIVERSE_DIVISOR: usize = 32;
 pub(super) const METADATA_DENSE_INTERSECTION_MIN_SCAN_COST: usize = 4 * 1024;
 pub(super) const METADATA_DENSE_INTERSECTION_MAX_COST_RATIO: usize = 8;
 pub(super) const METADATA_TEMPLATE_COMPACTION_SAMPLE_SIZE: usize = 512;
@@ -38,9 +40,16 @@ pub(super) const METADATA_CONSERVATIVE_SIMHASH_HAMMING_THRESHOLD: u32 = 32;
 pub(super) const METADATA_CONSERVATIVE_HIGH_FREQUENCY_MIN_DOCS: usize = 32;
 pub(super) const METADATA_CONSERVATIVE_HIGH_FREQUENCY_DIVISOR: usize = 5;
 pub(super) const METADATA_CONSERVATIVE_MIN_ATOMS: usize = 256;
+#[cfg(test)]
 pub(super) const METADATA_CONSERVATIVE_CALIBRATION_DIVISOR: u64 = 100;
+pub(super) const METADATA_CONSERVATIVE_CALIBRATION_MIN_LEFTS: usize = 256;
+pub(super) const METADATA_CONSERVATIVE_CALIBRATION_MAX_LEFTS: usize = 4 * 1024;
+pub(super) const METADATA_CONSERVATIVE_CALIBRATION_MAX_POSTING_VISITS: u64 = 1_000_000_000;
 pub(super) const METADATA_CONSERVATIVE_CONTRACT_DRIFT_PER_MILLE: u64 = 5;
 pub(super) const METADATA_CONSERVATIVE_COMPONENT_DRIFT_PER_MILLE: u64 = 2;
+pub(super) const METADATA_CONSERVATIVE_PAIR_DRIFT_MAX_RATE: f64 = 0.005;
+pub(super) const METADATA_CONSERVATIVE_PAIR_WILSON_MIN_MATCHES: u64 = 768;
+pub(super) const METADATA_CALIBRATION_WEIGHT_SCALE: u64 = 1_000_000;
 pub(super) const NO_METADATA_ATOM: usize = usize::MAX;
 pub(super) const METADATA_TEMPLATE_SCORE_CACHE_SLOTS: usize = 256 * 1024;
 pub(super) const METADATA_TEMPLATE_SCORE_CACHE_WAYS: usize = 4;
@@ -72,6 +81,16 @@ pub(super) struct MetadataFallbackTokenGroup {
     pub(super) members: Vec<MetadataContractIndex>,
 }
 
+pub(super) struct MetadataFallbackTokenExclusionIndex {
+    pub(super) postings: MetadataSparseCandidatePostings,
+}
+
+pub(super) struct MetadataFallbackTokenExclusionScratch {
+    pub(super) words: Vec<u64>,
+    pub(super) touched_words: Vec<usize>,
+    pub(super) prepared_single_group: bool,
+}
+
 #[derive(Default)]
 pub(super) struct CompactMetadataContentGroupBuilder {
     pub(super) token_ids: HashMap<String, u32>,
@@ -88,6 +107,7 @@ pub(super) struct CompactMetadataContentGroupBuilder {
     pub(super) member_count: usize,
     pub(super) fallback_group_count: usize,
     pub(super) fallback_member_count: usize,
+    pub(super) fallback_token_posting_count: usize,
 }
 
 #[derive(Default)]
@@ -183,6 +203,40 @@ pub(super) struct MetadataConservativeCandidateIndex {
     pub(super) exact_content: Option<MetadataContentCandidateIndex>,
     pub(super) template: MetadataConservativeDimensionIndex,
     pub(super) content: MetadataConservativeDimensionIndex,
+    pub(super) profile: MetadataConservativeRecallProfile,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MetadataConservativeRecallProfile {
+    Base,
+    Widened,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct MetadataCalibrationWorkItem {
+    pub(super) left: usize,
+    pub(super) chain_index: usize,
+    pub(super) estimated_posting_visits: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct MetadataCalibrationSample {
+    pub(super) left: usize,
+    pub(super) chain_index: usize,
+    pub(super) cost_bucket: u32,
+    pub(super) estimated_posting_visits: u64,
+    pub(super) stratum_population: u64,
+    pub(super) stratum_sample_count: u64,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct MetadataCalibrationPlan {
+    pub(super) samples: Vec<MetadataCalibrationSample>,
+    pub(super) estimated_posting_visits_by_left: Vec<u64>,
+    pub(super) difficult_first_lefts: Vec<usize>,
+    pub(super) estimated_total_posting_visits: u64,
+    pub(super) estimated_sample_posting_visits: u64,
+    pub(super) retained_calibration_candidates: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -196,6 +250,12 @@ pub(super) struct MetadataRecallCalibrationStats {
     pub(super) missed_duplicate_contract_members: u64,
     pub(super) exact_component_members: u64,
     pub(super) shifted_component_members: u64,
+    pub(super) weighted_exact_matched_pairs: u128,
+    pub(super) weighted_missed_matched_pairs: u128,
+    pub(super) weighted_exact_duplicate_contract_members: u128,
+    pub(super) weighted_missed_duplicate_contract_members: u128,
+    pub(super) weighted_exact_component_members: u128,
+    pub(super) weighted_shifted_component_members: u128,
 }
 
 // types from template_cache
@@ -238,6 +298,8 @@ pub(super) struct MetadataCandidateScratch {
     pub(super) secondary_candidates: Vec<MetadataDocIndex>,
     pub(super) posting_plan: MetadataCandidatePostingPlan,
     pub(super) raw_candidate_count: usize,
+    pub(super) visited_posting_entries: u64,
+    pub(super) fallback_token_exclusion: MetadataFallbackTokenExclusionScratch,
 }
 
 pub(super) struct MetadataCandidateScratchPool {
@@ -248,6 +310,18 @@ pub(super) struct MetadataCandidateScratchPool {
 pub(super) struct MetadataCandidateScratchLease<'a> {
     pub(super) pool: &'a MetadataCandidateScratchPool,
     pub(super) scratch: Option<MetadataCandidateScratch>,
+}
+
+pub(super) struct MetadataCandidateBufferPool {
+    pub(super) universe_len: usize,
+    pub(super) maximum_retained: usize,
+    pub(super) sparse: Mutex<Vec<Vec<MetadataDocIndex>>>,
+    pub(super) dense: Mutex<Vec<(Vec<u64>, Vec<usize>)>>,
+}
+
+pub(super) struct MetadataSparseCandidateBuffer {
+    pub(super) candidates: Vec<MetadataDocIndex>,
+    pub(super) pool: Option<Arc<MetadataCandidateBufferPool>>,
 }
 
 #[cfg(test)]
@@ -305,9 +379,69 @@ pub(super) struct MetadataValidatedPairBatch {
 
 pub(super) struct MetadataLeftCandidateBatch {
     pub(super) left: usize,
-    pub(super) candidates: Vec<MetadataDocIndex>,
+    pub(super) candidates: MetadataCandidateSet,
     pub(super) raw_candidate_pairs: u64,
     pub(super) dimension_rejected_pairs: u64,
+    pub(super) token_overlap_rejected_pairs: u64,
+    pub(super) estimated_posting_visits: u64,
+    pub(super) visited_posting_entries: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct MetadataCandidateCollectionContext<'a> {
+    pub(super) atoms: &'a [MetadataContentAtom],
+    pub(super) compact_docs: &'a [CompactMetadataContentDocument],
+    pub(super) candidate_index: &'a MetadataLocalCandidateIndex,
+    pub(super) compatibility: MetadataTemplateCompatibility<'a>,
+    pub(super) exact_recall: bool,
+    pub(super) scope: MetadataCandidateUnionScope,
+    pub(super) contract_tokens: &'a CompactContractTokens,
+    pub(super) fallback_token_exclusion_index: Option<&'a MetadataFallbackTokenExclusionIndex>,
+    pub(super) candidate_buffer_pool: Option<&'a Arc<MetadataCandidateBufferPool>>,
+    pub(super) estimated_posting_visits_by_left: Option<&'a [u64]>,
+}
+
+pub(super) struct MetadataRecallCalibrationRequest<'a, 'context> {
+    pub(super) atoms: &'a [MetadataContentAtom],
+    pub(super) compact_docs: &'a [CompactMetadataContentDocument],
+    pub(super) candidate_index: &'a MetadataLocalCandidateIndex,
+    pub(super) samples: Vec<MetadataCalibrationSample>,
+    pub(super) estimated_posting_visits_by_left: &'a [u64],
+    pub(super) context: &'a MetadataContentUnionContext<'context>,
+    pub(super) template_cache_pool: &'a MetadataTemplateScoreCachePool,
+    pub(super) scope: MetadataCandidateUnionScope,
+    pub(super) fallback_token_exclusion_index: Option<&'a MetadataFallbackTokenExclusionIndex>,
+    pub(super) candidate_buffer_pool: Option<&'a Arc<MetadataCandidateBufferPool>>,
+    pub(super) progress: Option<MetadataSharedTokenGroupProgress<'a>>,
+}
+
+pub(super) enum MetadataCandidateSet {
+    Sparse(MetadataSparseCandidateBuffer),
+    Dense(MetadataDenseCandidateBitmap),
+}
+
+pub(super) struct MetadataDenseCandidateBitmap {
+    pub(super) words: Vec<u64>,
+    pub(super) touched_words: Vec<usize>,
+    pub(super) len: usize,
+    pub(super) pool: Option<Arc<MetadataCandidateBufferPool>>,
+}
+
+pub(super) enum MetadataCandidateSetIter<'a> {
+    Sparse(std::iter::Copied<std::slice::Iter<'a, MetadataDocIndex>>),
+    Dense(MetadataDenseCandidateBitmapIter<'a>),
+}
+
+pub(super) struct MetadataDenseCandidateBitmapIter<'a> {
+    pub(super) words: &'a [u64],
+    pub(super) word_index: usize,
+    pub(super) remaining_word: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum MetadataCandidateUnionScope {
+    SharedToken,
+    Fallback,
 }
 
 pub(super) struct MetadataLeftCandidateBatchConsumer<'a, 'context> {
@@ -318,6 +452,7 @@ pub(super) struct MetadataLeftCandidateBatchConsumer<'a, 'context> {
     pub(super) stats: &'a mut MetadataContentUnionStats,
     pub(super) candidate_pairs: &'a mut Vec<(usize, MetadataDocIndex)>,
     pub(super) template_cache_pool: &'a MetadataTemplateScoreCachePool,
+    pub(super) scope: MetadataCandidateUnionScope,
 }
 
 // types from union
@@ -339,8 +474,13 @@ pub(super) struct MetadataUnionState {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct MetadataContentUnionStats {
     pub(super) atom_count: usize,
+    pub(super) processed_left_atoms: u64,
+    pub(super) estimated_posting_visits: u64,
+    pub(super) visited_posting_entries: u64,
+    pub(super) dense_candidate_promotions: u64,
     pub(super) raw_candidate_pairs: u64,
     pub(super) dimension_rejected_pairs: u64,
+    pub(super) token_overlap_rejected_pairs: u64,
     pub(super) candidate_pairs: u64,
     pub(super) already_connected_pairs: u64,
     pub(super) scored_pairs: u64,

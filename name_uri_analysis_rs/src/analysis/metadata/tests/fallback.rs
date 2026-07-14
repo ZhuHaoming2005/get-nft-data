@@ -181,8 +181,134 @@ fn scored_adaptive_fallback_preserves_disjoint_token_group_semantics() {
 
     assert_eq!(stats.atom_count, 4);
     assert!(stats.template_scored_pairs > 0);
+    assert_eq!(
+        stats.candidate_pairs, stats.scored_pairs,
+        "fallback candidate accounting must exclude shared-token pairs before consumption"
+    );
+    assert_eq!(stats.dimension_rejected_pairs, 0);
+    assert_eq!(stats.token_overlap_rejected_pairs, 1);
     assert_eq!(state.intra.find(0), state.intra.find(1));
     assert_ne!(state.intra.find(2), state.intra.find(3));
+}
+
+#[test]
+fn fallback_single_group_exclusion_bitmap_matches_scalar_multi_group_semantics() {
+    let contract_tokens =
+        CompactContractTokens::from_nested(vec![vec![1, 2], vec![2, 3], vec![4], vec![2], vec![5]]);
+    let atom = |members: &[usize], groups: &[&[usize]]| MetadataContentAtom {
+        chain_index: 0,
+        template_doc_index: metadata_doc_index_from_usize(0),
+        representative_record_index: metadata_doc_index_from_usize(0),
+        members: members
+            .iter()
+            .copied()
+            .map(metadata_contract_index_from_usize)
+            .collect(),
+        fallback_token_groups: groups
+            .iter()
+            .map(|members| MetadataFallbackTokenGroup {
+                members: members
+                    .iter()
+                    .copied()
+                    .map(metadata_contract_index_from_usize)
+                    .collect(),
+            })
+            .collect(),
+    };
+    let atoms = vec![
+        atom(&[0], &[&[0]]),
+        atom(&[1], &[&[1]]),
+        atom(&[2], &[&[2]]),
+        atom(&[3, 4], &[&[3], &[4]]),
+    ];
+    let index = MetadataFallbackTokenExclusionIndex::from_atoms(&atoms, &contract_tokens);
+    let mut scratch = MetadataFallbackTokenExclusionScratch::new(atoms.len());
+
+    for left in 0..atoms.len() {
+        index.prepare_left(left, &atoms, &contract_tokens, &mut scratch);
+        for right in 0..atoms.len() {
+            let expected = metadata_fallback_atoms_have_disjoint_token_groups(
+                &atoms[left],
+                &atoms[right],
+                &contract_tokens,
+            );
+            assert_eq!(
+                index.atoms_have_disjoint_token_groups(
+                    left,
+                    right,
+                    &atoms,
+                    &contract_tokens,
+                    &scratch,
+                ),
+                expected,
+                "left/right {left}/{right}"
+            );
+        }
+    }
+}
+
+#[test]
+fn two_atom_fallback_filters_token_overlap_before_connected_accounting() {
+    let templates_and_contents = [
+        (
+            "shared template gold collection",
+            "gold dragon rare collection",
+        ),
+        (
+            "shared template gold collection variant",
+            "gold dragon rare collection variantgold",
+        ),
+    ];
+    let mut builder = MetadataDataBuilder::new(1);
+    let mut records = Vec::new();
+    for (contract_index, (template, content)) in templates_and_contents.into_iter().enumerate() {
+        builder.merge_indexed_row(IndexedMetadataRow {
+            chain_index: 0,
+            nft_count: 1,
+            content_doc: MetadataBm25Document::from_text(content).map(Arc::new),
+            doc: MetadataBm25Document::from_text(template).unwrap().into(),
+            doc_key: metadata_document_key(template),
+        });
+        records.push(MetadataContentRecord {
+            contract_index: metadata_contract_index_from_usize(contract_index),
+            doc: MetadataBm25Document::from_text(content).unwrap().into(),
+        });
+    }
+    let data = builder.finish();
+    let contract_tokens = CompactContractTokens::from_nested(vec![vec![10], vec![10]]);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    let context = MetadataContentUnionContext {
+        data: &data,
+        template_compatibility: MetadataTemplateCompatibility::Scored(&data.metadata_index.scoring),
+        contract_tokens: &contract_tokens,
+        chain_count: 1,
+        pool: &pool,
+        recall_mode: MetadataRecallMode::Exact,
+    };
+    let mut state = MetadataUnionState {
+        intra: UnionFind::new(2),
+        cross: None,
+        chain_matrix: None,
+    };
+    state.intra.union(0, 1);
+
+    let stats = union_metadata_content_candidates(
+        &records,
+        MetadataContentScope::NoCommonToken,
+        &context,
+        &mut state,
+    );
+
+    assert_eq!(stats.atom_count, 2);
+    assert_eq!(stats.raw_candidate_pairs, 1);
+    assert_eq!(stats.dimension_rejected_pairs, 0);
+    assert_eq!(stats.token_overlap_rejected_pairs, 1);
+    assert_eq!(stats.candidate_pairs, 0);
+    assert_eq!(stats.already_connected_pairs, 0);
+    assert_eq!(stats.scored_pairs, 0);
 }
 
 #[test]

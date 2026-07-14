@@ -250,8 +250,13 @@ pub(super) fn run_metadata_analysis(
                 template_scored_pairs: 0,
                 template_matched_pairs: 0,
                 content_atoms: 0,
+                content_processed_left_atoms: 0,
+                content_estimated_posting_visits: 0,
+                content_visited_posting_entries: 0,
+                content_dense_candidate_promotions: 0,
                 content_raw_candidate_pairs: 0,
                 content_dimension_rejected_pairs: 0,
+                content_token_overlap_rejected_pairs: 0,
                 content_candidate_pairs: 0,
                 content_already_connected_pairs: 0,
                 content_scored_pairs: 0,
@@ -271,6 +276,12 @@ pub(super) fn run_metadata_analysis(
                 recall_missed_duplicate_contract_members: 0,
                 recall_exact_component_members: 0,
                 recall_shifted_component_members: 0,
+                recall_weighted_exact_matched_pairs: 0,
+                recall_weighted_missed_matched_pairs: 0,
+                recall_weighted_exact_duplicate_contract_members: 0,
+                recall_weighted_missed_duplicate_contract_members: 0,
+                recall_weighted_exact_component_members: 0,
+                recall_weighted_shifted_component_members: 0,
                 mmap_bytes: mapped_index_bytes,
                 dsu_bytes: 0,
             },
@@ -333,15 +344,20 @@ pub(super) fn run_metadata_analysis(
             / content_stats.recall_calibration.exact_component_members as f64
     };
     progress.finish_task(format!(
-        "shared-token matching complete; mode {:?}; calibrated-lefts {}; sample drift before fallback contracts/components {:.3}%/{:.3}%; conservative/fallback groups {}/{}; raw {}; dimension-rejected {}; candidates {}; connected-skips {}; template batch unique/reused {}/{}; template-rejected {}; cache {}/{} hit/miss; content-scored {}; matched {}",
+        "shared-token matching complete; mode {:?}; calibrated-lefts {}; sample drift before fallback contracts/components {:.3}%/{:.3}%; conservative/fallback groups {}/{}; lefts {}; estimated/visited postings {}/{}; dense-promotions {}; raw {}; dimension-rejected {}; token-overlap-rejected {}; candidates {}; connected-skips {}; template batch unique/reused {}/{}; template-rejected {}; cache {}/{} hit/miss; content-scored {}; matched {}",
         metadata_recall_mode,
         content_stats.recall_calibration.sampled_left_atoms,
         contract_drift_percent,
         component_drift_percent,
         content_stats.conservative_groups,
         content_stats.exact_fallback_groups,
+        content_stats.processed_left_atoms,
+        content_stats.estimated_posting_visits,
+        content_stats.visited_posting_entries,
+        content_stats.dense_candidate_promotions,
         content_stats.raw_candidate_pairs,
         content_stats.dimension_rejected_pairs,
+        content_stats.token_overlap_rejected_pairs,
         content_stats.candidate_pairs,
         content_stats.already_connected_pairs,
         content_stats.template_batch_unique_pairs,
@@ -373,7 +389,7 @@ pub(super) fn run_metadata_analysis(
             contract_tokens: &contract_tokens,
             chain_count: chains.len(),
             pool: &pool,
-            recall_mode: MetadataRecallMode::Exact,
+            recall_mode: metadata_recall_mode,
         };
         content_stats.accumulate(union_metadata_representative_content_fallback(
             &content_context,
@@ -421,8 +437,13 @@ pub(super) fn run_metadata_analysis(
             template_scored_pairs: content_stats.template_scored_pairs,
             template_matched_pairs: content_stats.template_matched_pairs,
             content_atoms: content_stats.atom_count as u64,
+            content_processed_left_atoms: content_stats.processed_left_atoms,
+            content_estimated_posting_visits: content_stats.estimated_posting_visits,
+            content_visited_posting_entries: content_stats.visited_posting_entries,
+            content_dense_candidate_promotions: content_stats.dense_candidate_promotions,
             content_raw_candidate_pairs: content_stats.raw_candidate_pairs,
             content_dimension_rejected_pairs: content_stats.dimension_rejected_pairs,
+            content_token_overlap_rejected_pairs: content_stats.token_overlap_rejected_pairs,
             content_candidate_pairs: content_stats.candidate_pairs,
             content_already_connected_pairs: content_stats.already_connected_pairs,
             content_scored_pairs: content_stats.scored_pairs,
@@ -452,6 +473,24 @@ pub(super) fn run_metadata_analysis(
             recall_shifted_component_members: content_stats
                 .recall_calibration
                 .shifted_component_members,
+            recall_weighted_exact_matched_pairs: content_stats
+                .recall_calibration
+                .weighted_exact_matched_pairs,
+            recall_weighted_missed_matched_pairs: content_stats
+                .recall_calibration
+                .weighted_missed_matched_pairs,
+            recall_weighted_exact_duplicate_contract_members: content_stats
+                .recall_calibration
+                .weighted_exact_duplicate_contract_members,
+            recall_weighted_missed_duplicate_contract_members: content_stats
+                .recall_calibration
+                .weighted_missed_duplicate_contract_members,
+            recall_weighted_exact_component_members: content_stats
+                .recall_calibration
+                .weighted_exact_component_members,
+            recall_weighted_shifted_component_members: content_stats
+                .recall_calibration
+                .weighted_shifted_component_members,
             mmap_bytes: mapped_index_bytes,
             dsu_bytes,
         },

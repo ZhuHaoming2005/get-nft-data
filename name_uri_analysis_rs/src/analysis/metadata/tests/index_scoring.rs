@@ -1,6 +1,79 @@
 use super::*;
 
 #[test]
+fn metadata_candidate_set_promotes_dense_without_changing_membership() {
+    let sparse_members = vec![
+        metadata_doc_index_from_usize(3),
+        metadata_doc_index_from_usize(1),
+    ];
+    let sparse =
+        MetadataCandidateSet::from_sparse_with_threshold(sparse_members.clone(), 8, usize::MAX);
+    assert!(matches!(sparse, MetadataCandidateSet::Sparse(_)));
+    assert_eq!(sparse.iter().collect::<Vec<_>>(), sparse_members);
+
+    let dense = MetadataCandidateSet::from_sparse_with_threshold(
+        vec![
+            metadata_doc_index_from_usize(3),
+            metadata_doc_index_from_usize(1),
+            metadata_doc_index_from_usize(7),
+        ],
+        8,
+        2,
+    );
+    assert!(matches!(dense, MetadataCandidateSet::Dense(_)));
+    assert_eq!(
+        dense.iter().collect::<Vec<_>>(),
+        vec![
+            metadata_doc_index_from_usize(1),
+            metadata_doc_index_from_usize(3),
+            metadata_doc_index_from_usize(7),
+        ]
+    );
+}
+
+#[test]
+fn metadata_candidate_buffer_pool_reuses_sparse_and_cleared_dense_storage() {
+    let pool = Arc::new(MetadataCandidateBufferPool::new(256, 2));
+    let mut sparse_buffer = pool.take_sparse();
+    sparse_buffer.reserve(128);
+    sparse_buffer.extend((0..64).map(metadata_doc_index_from_usize));
+    let sparse_capacity = sparse_buffer.capacity();
+    drop(MetadataCandidateSet::from_pooled_sparse_with_threshold(
+        sparse_buffer,
+        256,
+        usize::MAX,
+        Arc::clone(&pool),
+    ));
+    let reused_sparse = pool.take_sparse();
+    assert!(reused_sparse.capacity() >= sparse_capacity);
+    pool.release_sparse(reused_sparse);
+
+    let dense = MetadataCandidateSet::from_pooled_sparse_with_threshold(
+        (0..128).map(metadata_doc_index_from_usize).collect(),
+        256,
+        1,
+        Arc::clone(&pool),
+    );
+    assert_eq!(dense.len(), 128);
+    drop(dense);
+    let (dense_words, _) = pool.take_dense();
+    assert_eq!(dense_words.len(), 4);
+    assert!(dense_words.iter().all(|word| *word == 0));
+}
+
+#[test]
+fn secondary_candidate_generation_preserves_posting_visit_accounting() {
+    let mut scratch = MetadataCandidateScratch::new(8);
+    scratch.clear_for_next_left();
+    scratch.record_posting_visits(7);
+
+    scratch.prepare_secondary_generation();
+    scratch.record_posting_visits(11);
+
+    assert_eq!(scratch.visited_posting_entries, 18);
+}
+
+#[test]
 fn parallel_shared_token_waves_preserve_single_thread_results_and_stats() {
     let record_count = METADATA_CONTENT_PARALLEL_MIN_RECORDS + 17;
     let mut builder = MetadataDataBuilder::new(2);

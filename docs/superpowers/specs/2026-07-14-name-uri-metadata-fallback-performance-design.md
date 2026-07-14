@@ -90,7 +90,7 @@ fallback atoms / compact docs
             |
             v
   OrderedFallbackConsumer
-  - 按原 left 顺序消费
+  - 按预计 posting 工作量从高到低消费，同成本按 left index
   - connected skip
   - 并行 batch scoring
   - 串行确定性 DSU union
@@ -230,16 +230,16 @@ postings，再从候选位图中执行 AND-NOT。不得为每个 token 常驻一
 
 fallback 复用 shared-token 路径的并行波次模型：
 
-1. 一次 wave 包含连续的 left atom 范围；
+1. 一次 wave 包含 difficult-first 顺序中的连续切片；
 2. Rayon 动态调度每个 left，重成本 left 不得固定绑定到单个 worker；
 3. 每个 worker 从 `MetadataCandidateScratchPool` 获取 scratch；
 4. collector 完成 postings 扫描、双维度候选交集和 token-group 过滤；
-5. wave 结果按 left index 收集；
+5. wave 结果按输入的 difficult-first 顺序收集；
 6. 生成下一 wave 与消费当前 wave 可通过 `rayon::join` 重叠。
 
 ### 6.2 ordered consumer
 
-consumer 必须按原 left index 处理候选。同一 left 内，Sparse 保持 collector 的
+consumer 必须按预计 posting 工作量从高到低处理候选，同成本按 left index 稳定排序。同一 left 内，Sparse 保持 collector 的
 稳定生成顺序，Dense 按递增 bit index 遍历；两者都不得依赖线程调度：
 
 1. 查询当前 DSU，跳过已连接 pair；
