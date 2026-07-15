@@ -1006,48 +1006,27 @@ fn prepare_template_scoring_soa(
     } else {
         total_terms as f64 / total_docs as f64
     };
-    let query_denominators = (0..payloads.payload_count())
+    let payload_norms = (0..payloads.payload_count())
         .into_par_iter()
         .map(|payload_id| {
             let len = payload_lengths[payload_id];
-            let norm = if avg_doc_len > 0.0 {
+            if avg_doc_len > 0.0 {
                 K1 * (1.0 - B + B * len as f64 / avg_doc_len)
             } else {
                 K1
-            };
-            let mut denominator = 0.0;
-            for (&term, &frequency) in payloads
-                .template_term_ids(payload_id)
-                .iter()
-                .zip(payloads.template_freqs(payload_id))
-            {
-                let weight = prepared_term_weight(term, frequency, norm, total_docs, &doc_freqs);
-                denominator += f64::from(frequency) * weight;
-            }
-            if denominator > 0.0 {
-                denominator
-            } else {
-                1.0
             }
         })
         .collect::<Vec<_>>();
-    let doc_freqs_slice = doc_freqs.as_slice();
-    let prepared_weights = (0..payloads.payload_count())
-        .into_par_iter()
-        .flat_map_iter(|payload_id| {
-            let len = payload_lengths[payload_id];
-            let norm = if avg_doc_len > 0.0 {
-                K1 * (1.0 - B + B * len as f64 / avg_doc_len)
-            } else {
-                K1
-            };
-            let terms = payloads.template_term_ids(payload_id).to_vec();
-            let freqs = payloads.template_freqs(payload_id).to_vec();
-            terms.into_iter().zip(freqs).map(move |(term, frequency)| {
-                prepared_term_weight(term, frequency, norm, total_docs, doc_freqs_slice)
-            })
-        })
-        .collect::<Vec<_>>();
+    drop(payload_lengths);
+    const PREPARED_WEIGHT_CHUNK_TERMS: usize = 64 * 1024;
+    let (prepared_weights, query_denominators) =
+        prepared_weights_and_query_denominators_flat_parallel(
+            payloads,
+            &payload_norms,
+            total_docs,
+            &doc_freqs,
+            PREPARED_WEIGHT_CHUNK_TERMS,
+        );
     Ok(PreparedTemplateScoring {
         payload_document_weights,
         total_docs,
@@ -1055,6 +1034,79 @@ fn prepare_template_scoring_soa(
         query_denominators,
         prepared_weights,
     })
+}
+
+fn prepared_weights_and_query_denominators_flat_parallel(
+    payloads: &PayloadTermSoA,
+    payload_norms: &[f64],
+    total_docs: u64,
+    doc_freqs: &[u64],
+    chunk_terms: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    let prepared_weights =
+        prepared_weights_flat_parallel(payloads, payload_norms, total_docs, doc_freqs, chunk_terms);
+    let query_denominators = (0..payloads.payload_count())
+        .into_par_iter()
+        .map(|payload_id| {
+            let start = payloads.template_offsets[payload_id] as usize;
+            let end = payloads.template_offsets[payload_id + 1] as usize;
+            let denominator = payloads.template_freqs[payload_id_range(payloads, payload_id)]
+                .iter()
+                .zip(&prepared_weights[start..end])
+                .map(|(&frequency, &weight)| f64::from(frequency) * weight)
+                .sum::<f64>();
+            if denominator > 0.0 {
+                denominator
+            } else {
+                1.0
+            }
+        })
+        .collect();
+    (prepared_weights, query_denominators)
+}
+
+fn payload_id_range(payloads: &PayloadTermSoA, payload_id: usize) -> std::ops::Range<usize> {
+    payloads.template_offsets[payload_id] as usize
+        ..payloads.template_offsets[payload_id + 1] as usize
+}
+
+fn prepared_weights_flat_parallel(
+    payloads: &PayloadTermSoA,
+    payload_norms: &[f64],
+    total_docs: u64,
+    doc_freqs: &[u64],
+    chunk_terms: usize,
+) -> Vec<f64> {
+    debug_assert_eq!(payload_norms.len(), payloads.payload_count());
+    debug_assert_eq!(payloads.template_terms.len(), payloads.template_freqs.len());
+    let chunk_terms = chunk_terms.max(1);
+    let mut prepared_weights = vec![0.0; payloads.template_terms.len()];
+    prepared_weights
+        .par_chunks_mut(chunk_terms)
+        .enumerate()
+        .for_each(|(chunk_index, output)| {
+            let chunk_start = chunk_index.saturating_mul(chunk_terms);
+            let mut payload = payloads
+                .template_offsets
+                .partition_point(|&offset| offset <= chunk_start as u64)
+                .saturating_sub(1);
+            for (local, weight) in output.iter_mut().enumerate() {
+                let flat_index = chunk_start + local;
+                while payload + 1 < payloads.template_offsets.len()
+                    && flat_index as u64 >= payloads.template_offsets[payload + 1]
+                {
+                    payload += 1;
+                }
+                *weight = prepared_term_weight(
+                    payloads.template_terms[flat_index],
+                    payloads.template_freqs[flat_index],
+                    payload_norms[payload],
+                    total_docs,
+                    doc_freqs,
+                );
+            }
+        });
+    prepared_weights
 }
 
 fn prepared_term_weight(
@@ -1298,6 +1350,82 @@ impl FeatureView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flat_prepared_weights_match_row_reference_across_empty_rows_and_chunks() {
+        let payloads = PayloadTermSoA::from_term_lists_owned(vec![
+            (vec![], vec![]),
+            (vec![(0, 2), (2, 1), (4, 3)], vec![]),
+            (vec![], vec![]),
+            (vec![(1, 4), (3, 2)], vec![]),
+        ])
+        .unwrap();
+        let norms = [1.0, 1.5, 1.0, 2.0];
+        let doc_freqs = [2, 4, 1, 3, 1];
+        let expected = (0..payloads.payload_count())
+            .flat_map(|payload| {
+                payloads
+                    .template_term_ids(payload)
+                    .iter()
+                    .copied()
+                    .zip(payloads.template_freqs(payload).iter().copied())
+                    .map(move |(term, frequency)| {
+                        prepared_term_weight(term, frequency, norms[payload], 10, &doc_freqs)
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        let actual = prepared_weights_flat_parallel(&payloads, &norms, 10, &doc_freqs, 2);
+
+        assert_eq!(
+            actual
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn flat_prepared_weights_and_denominators_share_one_weight_pass() {
+        let payloads = PayloadTermSoA::from_term_lists_owned(vec![
+            (vec![], vec![]),
+            (vec![(0, 2), (2, 1), (4, 3)], vec![]),
+            (vec![(1, 4), (3, 2)], vec![]),
+        ])
+        .unwrap();
+        let norms = [1.0, 1.5, 2.0];
+        let doc_freqs = [2, 4, 1, 3, 1];
+
+        let (weights, denominators) = prepared_weights_and_query_denominators_flat_parallel(
+            &payloads, &norms, 10, &doc_freqs, 2,
+        );
+
+        let expected_denominators = (0..payloads.payload_count())
+            .map(|payload| {
+                let denominator = payloads
+                    .template_freqs(payload)
+                    .iter()
+                    .zip(
+                        weights[payloads.template_offsets[payload] as usize
+                            ..payloads.template_offsets[payload + 1] as usize]
+                            .iter(),
+                    )
+                    .map(|(&frequency, &weight)| f64::from(frequency) * weight)
+                    .sum::<f64>();
+                if denominator > 0.0 {
+                    denominator
+                } else {
+                    1.0
+                }
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(denominators, expected_denominators);
+    }
 
     #[test]
     fn owned_term_list_pack_preserves_offsets_and_empty_payloads() {

@@ -16,11 +16,13 @@ fn analysis_connection_uses_persistent_work_database() {
 
 #[test]
 fn metadata_projection_keeps_token_id_for_verification() {
-    let sql = build_metadata_rows_sql("'sample.parquet'", "metadata_json");
+    let sql = build_uri_metadata_stream_sql(
+        "'sample.parquet'",
+        "metadata_json",
+        "CAST(filename AS VARCHAR)",
+    );
 
     assert!(sql.contains(" AS token_id,"));
-    assert!(!sql.contains("token_uri_norm"));
-    assert!(!sql.contains("image_uri_norm"));
     assert!(sql.contains("metadata_json"));
     assert!(sql.contains("filename = true"));
     assert!(sql.contains("file_row_number = true"));
@@ -49,8 +51,11 @@ fn core_rows_assign_unordered_dense_contract_ids() {
 fn domain_projections_preserve_solana_case_only() {
     let projections = [
         build_core_rows_sql("'sample.parquet'"),
-        build_uri_rows_sql("'sample.parquet'"),
-        build_metadata_rows_sql("'sample.parquet'", "metadata_json"),
+        build_uri_metadata_stream_sql(
+            "'sample.parquet'",
+            "metadata_json",
+            "CAST(filename AS VARCHAR)",
+        ),
     ];
 
     for sql in projections {
@@ -63,23 +68,42 @@ fn domain_projections_preserve_solana_case_only() {
 #[test]
 fn domain_projections_do_not_materialize_a_wide_analysis_table() {
     let core = build_core_rows_sql("'sample.parquet'");
-    let uri = build_uri_rows_sql("'sample.parquet'");
-    let metadata = build_metadata_rows_sql("'sample.parquet'", "metadata_json");
+    let stream = build_uri_metadata_stream_sql(
+        "'sample.parquet'",
+        "metadata_json",
+        "CAST(filename AS VARCHAR)",
+    );
 
     assert!(!core.contains("metadata_json"));
     assert!(!core.contains("token_uri_norm"));
-    assert!(!uri.contains("metadata_json"));
-    assert!(!uri.contains("name_norm"));
-    assert!(!metadata.contains("token_uri_norm"));
-    assert!(!metadata.contains("name_norm"));
+    assert!(!stream.contains("name_norm"));
+    assert!(!stream.to_ascii_uppercase().contains("CREATE TABLE"));
     assert!(!analysis_contracts_sql().contains("analysis_rows"));
     assert!(core.contains("CREATE OR REPLACE TEMP TABLE contract_dim"));
-    assert!(uri.contains("CREATE OR REPLACE TEMP TABLE uri_rows"));
+}
+
+#[test]
+fn uri_and_metadata_stream_share_one_parquet_scan_without_a_wide_table() {
+    let sql = build_uri_metadata_stream_sql(
+        "'sample.parquet'",
+        "metadata_json",
+        "CAST(filename AS VARCHAR)",
+    );
+
+    assert_eq!(sql.matches("read_parquet(").count(), 1);
+    assert!(sql.contains("token_uri_norm"));
+    assert!(sql.contains("image_uri_norm"));
+    assert!(sql.contains("metadata_json"));
+    assert!(!sql.to_ascii_uppercase().contains("CREATE TABLE"));
 }
 
 #[test]
 fn metadata_rows_materialize_eligibility_once() {
-    let sql = build_metadata_rows_sql("'sample.parquet'", "metadata_json");
+    let sql = build_uri_metadata_stream_sql(
+        "'sample.parquet'",
+        "metadata_json",
+        "CAST(filename AS VARCHAR)",
+    );
 
     assert!(sql.contains("AS metadata_eligible"));
     assert!(analysis_contracts_sql().contains("WHERE metadata_eligible"));

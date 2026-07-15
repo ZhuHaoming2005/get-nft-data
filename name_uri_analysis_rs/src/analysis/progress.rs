@@ -518,6 +518,13 @@ pub(crate) fn format_task_progress_message_with_match_forecast(
     match_elapsed: Duration,
 ) -> String {
     let mut message = snapshot.label.to_string();
+    if snapshot.total_kind == metadata_engine::progress::TotalKind::Exact
+        && snapshot.total == Some(0)
+        && snapshot.position == 0
+    {
+        message.push_str(&format!("; skipped (0 {})", snapshot.unit));
+        return message;
+    }
     match snapshot.total {
         Some(total) => message.push_str(&format!(
             "; {}/{} {}",

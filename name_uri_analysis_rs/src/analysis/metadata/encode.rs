@@ -12,10 +12,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use duckdb::arrow::array::{
-    Array, BooleanArray, Int64Array, StringArray, StringViewArray, UInt32Array, UInt64Array,
+    Array, Int64Array, StringArray, StringViewArray, UInt32Array, UInt64Array,
 };
-use duckdb::arrow::datatypes::{DataType, Field, Schema};
 use duckdb::arrow::record_batch::RecordBatch;
+use duckdb::types::Value;
 use duckdb::Connection;
 use metadata_engine::blocking::{
     build_base_equivalent_atom_sketches_from_soa_parallel,
@@ -56,9 +56,6 @@ const HASH_BUCKET_OVERHEAD_BYTES: usize = 16;
 /// `metadata_max_json_bytes` (25%).
 const TOKEN_JSON_ADMISSION_NUM: u64 = 5;
 const TOKEN_JSON_ADMISSION_DEN: u64 = 4;
-const COLLECT_TOKEN_SOURCE_STEPS: u64 = 2;
-const RESOLVE_TOKEN_MEMBERSHIP_STEPS: u64 = 2;
-const FALLBACK_PREPARE_STEPS: u64 = 2;
 /// Bound unique-payload parse scratch: parse → intern → drop before the next
 /// batch so arena bodies and ParsedMetadataDocuments never fully coexist.
 const ENCODE_UNIQUE_PARSE_BATCH_LEN: usize = 4_096;
@@ -598,6 +595,20 @@ struct TokenSourceRecord {
     payload_ref: PayloadRef,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct SourceCoordinate {
+    source_file: u32,
+    source_row_number: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SelectedTokenSource {
+    contract_index: u32,
+    token_index: u32,
+    coordinate: SourceCoordinate,
+    payload_ref: PayloadRef,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct ResolvedTokenMembership {
     contract_index: u32,
@@ -666,8 +677,12 @@ fn planned_token_relation_peak(
         .checked_mul(TOKEN_JSON_ADMISSION_NUM)
         .map(|bytes| bytes / TOKEN_JSON_ADMISSION_DEN)
         .ok_or_else(|| AnalysisError::InvalidData("token-source JSON admission overflow".into()))?;
+    // Peak construction keeps the selected rows, coordinate/payload sort
+    // copy, source records, source-id hash table, and memberships alive at
+    // once. 192 bytes/retained token conservatively includes Vec spare
+    // capacity, hash buckets, and alignment; the returned relation is smaller.
     token_rows
-        .checked_mul(48)
+        .checked_mul(192)
         .and_then(|bytes| representative_rows.checked_mul(8)?.checked_add(bytes))
         .and_then(|bytes| admitted_json_bytes.checked_add(bytes))
         .and_then(|bytes| bytes.checked_add(64 * 1024 * 1024))
@@ -1557,6 +1572,22 @@ fn materialize_global_pending_contracts(
 /// presence hit inserts JSON into the arena immediately and records a
 /// [`PayloadRef`]; later rows for the same contract are skipped without
 /// copying JSON. Memory is admitted per selected row only.
+pub(super) fn fallback_contract_candidates_sql() -> &'static str {
+    "SELECT fallback.contract_index::UINTEGER AS contract_index,
+                rows.metadata_json,
+                rows.source_file::UINTEGER AS source_file,
+                rows.source_row_number::UBIGINT AS source_row_number
+         FROM unnest(?::UINTEGER[]) AS fallback(contract_index)
+         JOIN analysis_contracts contracts
+           ON contracts.metadata_contract_index = fallback.contract_index
+         JOIN metadata_rows rows ON rows.contract_id = contracts.contract_id
+         WHERE rows.metadata_eligible
+         ORDER BY fallback.contract_index,
+                  rows.token_id,
+                  rows.source_file,
+                  rows.source_row_number"
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_pending_fallback_contracts(
     conn: &Connection,
@@ -1571,52 +1602,17 @@ fn resolve_pending_fallback_contracts(
     parse_pool: &rayon::ThreadPool,
     progress: &mut impl FnMut(ProgressEvent),
 ) -> Result<u64, AnalysisError> {
-    conn.execute_batch(
-        "DROP TABLE IF EXISTS encode_fallback_contracts;
-         CREATE TEMP TABLE encode_fallback_contracts(contract_index UINTEGER PRIMARY KEY);",
-    )?;
-    {
-        let mut appender = conn.appender("encode_fallback_contracts")?;
-        appender.append_rows(
-            pending_fallbacks
-                .keys()
-                .copied()
-                .map(|contract_index| [contract_index]),
-        )?;
-    }
-    let fallback_total: u64 = conn.query_row(
-        "SELECT count(*)::UBIGINT
-         FROM encode_fallback_contracts fallback
-         JOIN analysis_contracts contracts
-           ON contracts.metadata_contract_index = fallback.contract_index
-         JOIN metadata_rows rows ON rows.contract_id = contracts.contract_id
-         WHERE rows.metadata_eligible",
-        [],
-        |row| row.get(0),
-    )?;
-    progress(ProgressEvent::determinate(
+    let mut fallback_ids = pending_fallbacks.keys().copied().collect::<Vec<_>>();
+    fallback_ids.sort_unstable();
+    let fallback_ids = Value::List(fallback_ids.into_iter().map(Value::UInt).collect());
+    progress(ProgressEvent::indeterminate(
         ProgressPhase::EncodeFallbackSources,
         0,
-        fallback_total,
         WorkUnit::Items,
         EngineCounters::default(),
     ));
-    let mut stmt = conn.prepare(
-        "SELECT fallback.contract_index::UINTEGER AS contract_index,
-                rows.metadata_json,
-                rows.source_file::UINTEGER AS source_file,
-                rows.source_row_number::UBIGINT AS source_row_number
-         FROM encode_fallback_contracts fallback
-         JOIN analysis_contracts contracts
-           ON contracts.metadata_contract_index = fallback.contract_index
-         JOIN metadata_rows rows ON rows.contract_id = contracts.contract_id
-         WHERE rows.metadata_eligible
-         ORDER BY fallback.contract_index,
-                  rows.token_id,
-                  rows.source_file,
-                  rows.source_row_number",
-    )?;
-    let batches = stmt.query_arrow([])?;
+    let mut stmt = conn.prepare(fallback_contract_candidates_sql())?;
+    let batches = stmt.query_arrow([fallback_ids])?;
 
     progress(ProgressEvent::indeterminate(
         ProgressPhase::EncodeResolveFallbacks,
@@ -1664,11 +1660,10 @@ fn resolve_pending_fallback_contracts(
         for (index, &has_tokens) in presence.iter().enumerate() {
             let contract_index = contract_indexes.value(index);
             scanned = scanned.saturating_add(1);
-            emit_encode_progress(
+            emit_encode_indeterminate_progress(
                 progress,
                 ProgressPhase::EncodeFallbackSources,
                 scanned,
-                fallback_total,
             );
             if Some(contract_index) != current_contract {
                 if let Some(chosen) = selected.take() {
@@ -1729,13 +1724,12 @@ fn resolve_pending_fallback_contracts(
         WorkUnit::Items,
         EngineCounters::default(),
     ));
-    emit_encode_progress(
-        progress,
+    progress(ProgressEvent::indeterminate(
         ProgressPhase::EncodeFallbackSources,
-        fallback_total,
-        fallback_total,
-    );
-    conn.execute_batch("DROP TABLE encode_fallback_contracts")?;
+        scanned,
+        WorkUnit::Items,
+        EngineCounters::default(),
+    ));
     Ok(columns_resident_bytes)
 }
 
@@ -1937,6 +1931,27 @@ fn load_encode_chain_totals(conn: &Connection) -> Result<Vec<EncodeChainTotal>, 
         .map_err(AnalysisError::from)
 }
 
+pub(super) fn retained_token_candidates_sql() -> &'static str {
+    "SELECT token_rows.contract_index::UINTEGER AS contract_index,
+            token_rows.token_index::UINTEGER AS token_index,
+            rows.source_file::UINTEGER AS source_file,
+            rows.source_row_number::UBIGINT AS source_row_number,
+            rows.metadata_json
+     FROM metadata_contract_token_rows token_rows
+     JOIN analysis_contracts contracts
+       ON contracts.metadata_contract_index = token_rows.contract_index
+     JOIN metadata_token_dictionary dictionary
+       ON dictionary.token_index = token_rows.token_index
+     JOIN metadata_rows rows
+       ON rows.contract_id = contracts.contract_id
+      AND rows.token_id = dictionary.token_id
+     WHERE rows.metadata_eligible
+     ORDER BY token_rows.contract_index,
+              token_rows.token_index,
+              rows.source_file,
+              rows.source_row_number"
+}
+
 fn build_retained_token_source_relation(
     conn: &Connection,
     contract_count: u32,
@@ -1947,7 +1962,7 @@ fn build_retained_token_source_relation(
     progress(ProgressEvent::determinate(
         ProgressPhase::EncodeCollectTokenSources,
         0,
-        COLLECT_TOKEN_SOURCE_STEPS,
+        1,
         WorkUnit::Work,
         EngineCounters::default(),
     ));
@@ -1959,8 +1974,8 @@ fn build_retained_token_source_relation(
     if !exists {
         progress(ProgressEvent::determinate(
             ProgressPhase::EncodeCollectTokenSources,
-            COLLECT_TOKEN_SOURCE_STEPS,
-            COLLECT_TOKEN_SOURCE_STEPS,
+            1,
+            1,
             WorkUnit::Work,
             EngineCounters::default(),
         ));
@@ -1972,231 +1987,170 @@ fn build_retained_token_source_relation(
         });
     }
 
-    conn.execute_batch(
-        "DROP TABLE IF EXISTS encode_token_source_candidates;
-         DROP TABLE IF EXISTS encode_resolved_token_sources;
-         DROP TABLE IF EXISTS encode_source_keys;
-         DROP TABLE IF EXISTS encode_source_catalog;
-         DROP TABLE IF EXISTS encode_fallback_candidates;
-         DROP TABLE IF EXISTS encode_fallback_source_keys;
-         DROP TABLE IF EXISTS encode_fallback_source_catalog;
-         DROP TABLE IF EXISTS encode_source_dictionary;
-         DROP TABLE IF EXISTS encode_source_usability;
-         DROP TABLE IF EXISTS encode_fallback_source_usability;
-         CREATE TEMP TABLE encode_source_keys AS
-         SELECT DISTINCT token_rows.metadata_source_file::UINTEGER AS source_file,
-                         token_rows.metadata_source_row_number::UBIGINT AS source_row_number
-         FROM metadata_contract_token_rows token_rows;",
-    )?;
     progress(ProgressEvent::determinate(
         ProgressPhase::EncodeCollectTokenSources,
         1,
-        COLLECT_TOKEN_SOURCE_STEPS,
+        1,
         WorkUnit::Work,
         EngineCounters::default(),
     ));
-    conn.execute_batch(
-        "CREATE TEMP TABLE encode_source_catalog AS
-         SELECT keys.source_file,
-                keys.source_row_number,
-                metadata_rows.metadata_json
-         FROM encode_source_keys keys
-         JOIN metadata_rows
-           ON metadata_rows.source_file = keys.source_file
-          AND metadata_rows.source_row_number = keys.source_row_number;
-         CREATE TEMP TABLE encode_source_usability(
-             source_file UINTEGER,
-             source_row_number UBIGINT,
-             usable BOOLEAN
-         );",
-    )?;
-    progress(ProgressEvent::determinate(
-        ProgressPhase::EncodeCollectTokenSources,
-        COLLECT_TOKEN_SOURCE_STEPS,
-        COLLECT_TOKEN_SOURCE_STEPS,
-        WorkUnit::Work,
-        EngineCounters::default(),
-    ));
-    classify_source_catalog(
-        conn,
-        "encode_source_catalog",
-        "encode_source_usability",
+    let mut statement = conn.prepare(retained_token_candidates_sql())?;
+    let batches = statement.query_arrow([])?;
+    let mut selected = Vec::<SelectedTokenSource>::new();
+    let mut current_group = None;
+    let mut group_selected = false;
+    let mut scanned = 0u64;
+    progress(ProgressEvent::indeterminate(
         ProgressPhase::EncodeTokenSources,
-        parse_pool,
-        progress,
-    )?;
-
-    progress(ProgressEvent::determinate(
-        ProgressPhase::EncodeResolveTokenMemberships,
         0,
-        RESOLVE_TOKEN_MEMBERSHIP_STEPS,
-        WorkUnit::Work,
+        WorkUnit::Items,
         EngineCounters::default(),
     ));
-    conn.execute_batch(
-        "CREATE TEMP TABLE encode_token_source_candidates AS
-         SELECT token_rows.contract_index::UINTEGER AS contract_index,
-                token_rows.token_index::UINTEGER AS token_index,
-                token_rows.metadata_source_file AS source_file,
-                token_rows.metadata_source_row_number AS source_row_number,
-                usability.usable
-         FROM metadata_contract_token_rows token_rows
-         JOIN encode_source_usability usability
-           ON usability.source_file = token_rows.metadata_source_file
-          AND usability.source_row_number = token_rows.metadata_source_row_number;",
-    )?;
-    progress(ProgressEvent::determinate(
-        ProgressPhase::EncodeResolveTokenMemberships,
-        1,
-        RESOLVE_TOKEN_MEMBERSHIP_STEPS,
-        WorkUnit::Work,
-        EngineCounters::default(),
-    ));
-    conn.execute_batch(
-        "CREATE TEMP TABLE encode_resolved_token_sources AS
-         SELECT contract_index, token_index, source_file, source_row_number
-         FROM encode_token_source_candidates
-         WHERE usable;",
-    )?;
-    progress(ProgressEvent::determinate(
-        ProgressPhase::EncodeResolveTokenMemberships,
-        RESOLVE_TOKEN_MEMBERSHIP_STEPS,
-        RESOLVE_TOKEN_MEMBERSHIP_STEPS,
-        WorkUnit::Work,
-        EngineCounters::default(),
-    ));
-
-    progress(ProgressEvent::determinate(
+    for batch in batches {
+        let contracts = required_arrow_column::<UInt32Array>(&batch, 0, "contract_index")?;
+        let tokens = required_arrow_column::<UInt32Array>(&batch, 1, "token_index")?;
+        let source_files = required_arrow_column::<UInt32Array>(&batch, 2, "source_file")?;
+        let source_rows = required_arrow_column::<UInt64Array>(&batch, 3, "source_row_number")?;
+        let json = batch.column(4).as_ref();
+        let usable = parse_pool.install(|| {
+            (0..batch.num_rows())
+                .into_par_iter()
+                .map(|index| {
+                    if contracts.is_null(index)
+                        || tokens.is_null(index)
+                        || source_files.is_null(index)
+                        || source_rows.is_null(index)
+                        || json.is_null(index)
+                    {
+                        return Err(AnalysisError::InvalidData(
+                            "retained-token candidate contains NULL".into(),
+                        ));
+                    }
+                    Ok(metadata_has_prefilter_tokens(required_arrow_string(
+                        json, index,
+                    )?))
+                })
+                .collect::<Result<Vec<_>, AnalysisError>>()
+        })?;
+        for (index, &is_usable) in usable.iter().enumerate() {
+            let group = (contracts.value(index), tokens.value(index));
+            if current_group != Some(group) {
+                current_group = Some(group);
+                group_selected = false;
+            }
+            scanned = scanned.saturating_add(1);
+            if group_selected || !is_usable {
+                continue;
+            }
+            let payload_ref = arena
+                .insert(required_arrow_string(json, index)?.as_bytes())
+                .map_err(encode_err)?;
+            selected.push(SelectedTokenSource {
+                contract_index: group.0,
+                token_index: group.1,
+                coordinate: SourceCoordinate {
+                    source_file: source_files.value(index),
+                    source_row_number: source_rows.value(index),
+                },
+                payload_ref,
+            });
+            group_selected = true;
+        }
+        progress(ProgressEvent::indeterminate(
+            ProgressPhase::EncodeTokenSources,
+            scanned,
+            WorkUnit::Items,
+            EngineCounters {
+                matched: selected.len() as u64,
+                ..EngineCounters::default()
+            },
+        ));
+    }
+    for phase in [
         ProgressPhase::EncodePrepareFallbackTokenSources,
-        0,
-        FALLBACK_PREPARE_STEPS,
-        WorkUnit::Work,
-        EngineCounters::default(),
-    ));
-    conn.execute_batch(
-        "CREATE TEMP TABLE encode_fallback_candidates AS
-         SELECT fallback.contract_index,
-                fallback.token_index,
-                rows.source_file::UINTEGER AS source_file,
-                rows.source_row_number::UBIGINT AS source_row_number
-         FROM encode_token_source_candidates fallback
-         JOIN analysis_contracts contracts
-           ON contracts.metadata_contract_index = fallback.contract_index
-         JOIN metadata_token_dictionary dictionary
-           ON dictionary.token_index = fallback.token_index
-         JOIN metadata_rows rows
-           ON rows.contract_id = contracts.contract_id
-          AND rows.token_id = dictionary.token_id
-         WHERE NOT fallback.usable
-           AND rows.metadata_eligible;
-         CREATE TEMP TABLE encode_fallback_source_keys AS
-         SELECT DISTINCT candidates.source_file,
-                         candidates.source_row_number
-         FROM encode_fallback_candidates candidates;
-         CREATE TEMP TABLE encode_fallback_source_usability(
-             source_file UINTEGER,
-             source_row_number UBIGINT,
-             usable BOOLEAN
-         );
-         INSERT INTO encode_fallback_source_usability
-         SELECT keys.source_file,
-                keys.source_row_number,
-                primary_usability.usable
-         FROM encode_fallback_source_keys keys
-         JOIN encode_source_usability primary_usability
-           ON primary_usability.source_file = keys.source_file
-          AND primary_usability.source_row_number = keys.source_row_number;
-         CREATE TEMP TABLE encode_fallback_source_catalog AS
-         SELECT keys.source_file,
-                keys.source_row_number,
-                metadata_rows.metadata_json
-         FROM encode_fallback_source_keys keys
-         JOIN metadata_rows
-           ON metadata_rows.source_file = keys.source_file
-          AND metadata_rows.source_row_number = keys.source_row_number
-         WHERE NOT EXISTS (
-             SELECT 1
-             FROM encode_source_usability primary_usability
-             WHERE primary_usability.source_file = keys.source_file
-               AND primary_usability.source_row_number = keys.source_row_number
-         );",
-    )?;
-    progress(ProgressEvent::determinate(
-        ProgressPhase::EncodePrepareFallbackTokenSources,
-        1,
-        FALLBACK_PREPARE_STEPS,
-        WorkUnit::Work,
-        EngineCounters::default(),
-    ));
-    classify_source_catalog(
-        conn,
-        "encode_fallback_source_catalog",
-        "encode_fallback_source_usability",
         ProgressPhase::EncodeTokenFallbackSources,
-        parse_pool,
-        progress,
-    )?;
-    conn.execute_batch(
-        "INSERT INTO encode_resolved_token_sources
-         SELECT contract_index, token_index, source_file, source_row_number
-         FROM (
-             SELECT candidates.contract_index,
-                    candidates.token_index,
-                    candidates.source_file,
-                    candidates.source_row_number,
-                    row_number() OVER (
-                        PARTITION BY candidates.contract_index, candidates.token_index
-                        ORDER BY candidates.source_file, candidates.source_row_number
-                    ) AS source_rank
-             FROM encode_fallback_candidates candidates
-             JOIN encode_fallback_source_usability usability
-               ON usability.source_file = candidates.source_file
-              AND usability.source_row_number = candidates.source_row_number
-             WHERE usability.usable
-         ) ranked
-         WHERE source_rank = 1;",
-    )?;
+    ] {
+        progress(ProgressEvent::determinate(
+            phase,
+            0,
+            0,
+            WorkUnit::Items,
+            EngineCounters::default(),
+        ));
+    }
+
+    let mut source_rows = selected
+        .iter()
+        .map(|row| (row.coordinate, row.payload_ref))
+        .collect::<Vec<_>>();
     progress(ProgressEvent::determinate(
-        ProgressPhase::EncodePrepareFallbackTokenSources,
-        FALLBACK_PREPARE_STEPS,
-        FALLBACK_PREPARE_STEPS,
-        WorkUnit::Work,
+        ProgressPhase::EncodeResolveTokenMemberships,
+        0,
+        selected.len() as u64,
+        WorkUnit::Items,
         EngineCounters::default(),
     ));
-
-    conn.execute_batch(
-        "DROP TABLE IF EXISTS encode_source_dictionary;
-         CREATE TEMP TABLE encode_source_dictionary AS
-         SELECT (row_number() OVER (
-                    ORDER BY coords.source_file, coords.source_row_number
-                ) - 1)::UINTEGER AS source_id,
-                coords.source_file,
-                coords.source_row_number,
-                metadata_rows.metadata_json
-         FROM (
-             SELECT DISTINCT resolved.source_file,
-                             resolved.source_row_number
-             FROM encode_resolved_token_sources resolved
-         ) coords
-         JOIN metadata_rows
-           ON metadata_rows.source_file = coords.source_file
-          AND metadata_rows.source_row_number = coords.source_row_number;",
-    )?;
-    let source_count: u64 = conn.query_row(
-        "SELECT count(*)::UBIGINT FROM encode_source_dictionary",
-        [],
-        |row| row.get(0),
-    )?;
-    let membership_count: u64 = conn.query_row(
-        "SELECT count(*)::UBIGINT FROM encode_resolved_token_sources",
-        [],
-        |row| row.get(0),
-    )?;
-    let source_count = u32::try_from(source_count).map_err(|_| {
+    source_rows.par_sort_unstable_by_key(|(coordinate, _)| *coordinate);
+    source_rows.dedup_by_key(|(coordinate, _)| *coordinate);
+    let source_count = u32::try_from(source_rows.len()).map_err(|_| {
         AnalysisError::InvalidData("token source dictionary exceeds u32 identity space".into())
     })?;
-    let sources = load_token_source_records(conn, source_count, arena, parse_pool, progress)?;
-    let mut memberships = load_token_memberships(conn, membership_count, parse_pool, progress)?;
+    let sources = source_rows
+        .iter()
+        .map(|(coordinate, payload_ref)| TokenSourceRecord {
+            source_file: coordinate.source_file,
+            source_row_number: coordinate.source_row_number,
+            payload_ref: *payload_ref,
+        })
+        .collect::<Vec<_>>();
+    progress(ProgressEvent::determinate(
+        ProgressPhase::EncodeLoadTokenSources,
+        sources.len() as u64,
+        sources.len() as u64,
+        WorkUnit::Items,
+        EngineCounters::default(),
+    ));
+    let source_ids = source_rows
+        .iter()
+        .enumerate()
+        .map(|(source_id, (coordinate, _))| {
+            Ok((
+                *coordinate,
+                u32::try_from(source_id).map_err(|_| {
+                    AnalysisError::InvalidData("token source dictionary exceeds u32".into())
+                })?,
+            ))
+        })
+        .collect::<Result<HashMap<_, _>, AnalysisError>>()?;
+    let mut memberships = selected
+        .iter()
+        .map(|row| {
+            Ok(ResolvedTokenMembership {
+                contract_index: row.contract_index,
+                token_id: row.token_index,
+                source_id: *source_ids.get(&row.coordinate).ok_or_else(|| {
+                    AnalysisError::InvalidData(
+                        "selected token source is absent from dictionary".into(),
+                    )
+                })?,
+            })
+        })
+        .collect::<Result<Vec<_>, AnalysisError>>()?;
+    let membership_count = memberships.len() as u64;
+    progress(ProgressEvent::determinate(
+        ProgressPhase::EncodeResolveTokenMemberships,
+        membership_count,
+        membership_count,
+        WorkUnit::Items,
+        EngineCounters::default(),
+    ));
+    progress(ProgressEvent::determinate(
+        ProgressPhase::EncodeLoadTokenMemberships,
+        membership_count,
+        membership_count,
+        WorkUnit::Items,
+        EngineCounters::default(),
+    ));
     progress(ProgressEvent::indeterminate(
         ProgressPhase::EncodeSortTokenMemberships,
         0,
@@ -2212,18 +2166,6 @@ fn build_retained_token_source_relation(
         EngineCounters::default(),
     ));
     let contract_offsets = token_membership_offsets(&memberships, contract_count)?;
-    conn.execute_batch(
-        "DROP TABLE encode_token_source_candidates;
-         DROP TABLE encode_resolved_token_sources;
-         DROP TABLE encode_source_dictionary;
-         DROP TABLE encode_source_keys;
-         DROP TABLE encode_source_catalog;
-         DROP TABLE encode_fallback_candidates;
-         DROP TABLE encode_fallback_source_keys;
-         DROP TABLE encode_fallback_source_catalog;
-         DROP TABLE encode_source_usability;
-         DROP TABLE encode_fallback_source_usability;",
-    )?;
     // JSON bodies live only in the arena; relation retains coords + PayloadRef.
     let logical_bytes = capacity_bytes::<TokenSourceRecord>(sources.capacity())?
         .checked_add(capacity_bytes::<ResolvedTokenMembership>(
@@ -2239,230 +2181,6 @@ fn build_retained_token_source_relation(
         contract_offsets,
         logical_bytes,
     })
-}
-
-fn classify_source_catalog(
-    conn: &Connection,
-    catalog_table: &str,
-    output_table: &str,
-    phase: ProgressPhase,
-    parse_pool: &rayon::ThreadPool,
-    progress: &mut impl FnMut(ProgressEvent),
-) -> Result<u64, AnalysisError> {
-    let total: u64 = conn.query_row(
-        &format!("SELECT count(*)::UBIGINT FROM {catalog_table}"),
-        [],
-        |row| row.get(0),
-    )?;
-    progress(ProgressEvent::determinate(
-        phase,
-        0,
-        total,
-        WorkUnit::Items,
-        EngineCounters::default(),
-    ));
-    let mut statement = conn.prepare(&format!(
-        "SELECT source_file, source_row_number, metadata_json FROM {catalog_table}"
-    ))?;
-    let batches = statement.query_arrow([])?;
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("source_file", DataType::UInt32, false),
-        Field::new("source_row_number", DataType::UInt64, false),
-        Field::new("usable", DataType::Boolean, false),
-    ]));
-    let mut appender = conn.appender(output_table)?;
-    let mut completed = 0u64;
-    for batch in batches {
-        let source_files = required_arrow_column::<UInt32Array>(&batch, 0, "source_file")?;
-        let source_rows = required_arrow_column::<UInt64Array>(&batch, 1, "source_row_number")?;
-        let json = batch.column(2).as_ref();
-        let usable = parse_pool.install(|| {
-            (0..batch.num_rows())
-                .into_par_iter()
-                .map(|index| {
-                    if source_files.is_null(index)
-                        || source_rows.is_null(index)
-                        || json.is_null(index)
-                    {
-                        return Err(AnalysisError::InvalidData(
-                            "token-source catalog contains NULL".into(),
-                        ));
-                    }
-                    Ok(metadata_has_prefilter_tokens(required_arrow_string(
-                        json, index,
-                    )?))
-                })
-                .collect::<Result<Vec<_>, AnalysisError>>()
-        })?;
-        let output = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                batch.column(0).clone(),
-                batch.column(1).clone(),
-                Arc::new(BooleanArray::from(usable)),
-            ],
-        )
-        .map_err(|error| AnalysisError::InvalidData(format!("source usability batch: {error}")))?;
-        appender.append_record_batch(output)?;
-        completed = completed.saturating_add(batch.num_rows() as u64);
-        progress(ProgressEvent::determinate(
-            phase,
-            completed,
-            total,
-            WorkUnit::Items,
-            EngineCounters::default(),
-        ));
-    }
-    if completed != total {
-        return Err(AnalysisError::InvalidData(format!(
-            "source usability count differs from catalog ({completed} != {total})"
-        )));
-    }
-    Ok(total)
-}
-
-fn load_token_source_records(
-    conn: &Connection,
-    source_count: u32,
-    arena: &ShardedPayloadArena,
-    parse_pool: &rayon::ThreadPool,
-    progress: &mut impl FnMut(ProgressEvent),
-) -> Result<Vec<TokenSourceRecord>, AnalysisError> {
-    let total = u64::from(source_count);
-    progress(ProgressEvent::determinate(
-        ProgressPhase::EncodeLoadTokenSources,
-        0,
-        total,
-        WorkUnit::Items,
-        EngineCounters::default(),
-    ));
-    let mut statement = conn.prepare(
-        "SELECT dictionary.source_id,
-                dictionary.source_file,
-                dictionary.source_row_number,
-                dictionary.metadata_json
-         FROM encode_source_dictionary dictionary
-         ORDER BY dictionary.source_id",
-    )?;
-    let batches = statement.query_arrow([])?;
-    let mut sources = Vec::with_capacity(source_count as usize);
-    for batch in batches {
-        let source_ids = required_arrow_column::<UInt32Array>(&batch, 0, "source_id")?;
-        let source_files = required_arrow_column::<UInt32Array>(&batch, 1, "source_file")?;
-        let source_rows = required_arrow_column::<UInt64Array>(&batch, 2, "source_row_number")?;
-        let json = batch.column(3).as_ref();
-        let first_id = sources.len();
-        let batch_sources = parse_pool.install(|| {
-            (0..batch.num_rows())
-                .into_par_iter()
-                .map(|index| {
-                    if source_ids.is_null(index)
-                        || source_files.is_null(index)
-                        || source_rows.is_null(index)
-                        || json.is_null(index)
-                    {
-                        return Err(AnalysisError::InvalidData(
-                            "token-source dictionary contains NULL".into(),
-                        ));
-                    }
-                    let expected = u32::try_from(first_id + index).map_err(|_| {
-                        AnalysisError::InvalidData("token-source dictionary exceeds u32".into())
-                    })?;
-                    if source_ids.value(index) != expected {
-                        return Err(AnalysisError::InvalidData(
-                            "token-source dictionary IDs are not dense".into(),
-                        ));
-                    }
-                    let json = required_arrow_string(json, index)?;
-                    let payload_ref = arena.insert(json.as_bytes()).map_err(encode_err)?;
-                    Ok(TokenSourceRecord {
-                        source_file: source_files.value(index),
-                        source_row_number: source_rows.value(index),
-                        payload_ref,
-                    })
-                })
-                .collect::<Result<Vec<_>, AnalysisError>>()
-        })?;
-        sources.extend(batch_sources);
-        progress(ProgressEvent::determinate(
-            ProgressPhase::EncodeLoadTokenSources,
-            sources.len() as u64,
-            total,
-            WorkUnit::Items,
-            EngineCounters::default(),
-        ));
-    }
-    if sources.len() != source_count as usize {
-        return Err(AnalysisError::InvalidData(
-            "token-source dictionary count differs from plan".into(),
-        ));
-    }
-    Ok(sources)
-}
-
-fn load_token_memberships(
-    conn: &Connection,
-    membership_count: u64,
-    parse_pool: &rayon::ThreadPool,
-    progress: &mut impl FnMut(ProgressEvent),
-) -> Result<Vec<ResolvedTokenMembership>, AnalysisError> {
-    let capacity = usize::try_from(membership_count).map_err(|_| {
-        AnalysisError::InvalidData("token membership count exceeds addressable memory".into())
-    })?;
-    progress(ProgressEvent::determinate(
-        ProgressPhase::EncodeLoadTokenMemberships,
-        0,
-        membership_count,
-        WorkUnit::Items,
-        EngineCounters::default(),
-    ));
-    let mut statement = conn.prepare(
-        "SELECT resolved.contract_index::UINTEGER,
-                resolved.token_index::UINTEGER,
-                dictionary.source_id
-         FROM encode_resolved_token_sources resolved
-         JOIN encode_source_dictionary dictionary
-           ON dictionary.source_file = resolved.source_file
-          AND dictionary.source_row_number = resolved.source_row_number",
-    )?;
-    let batches = statement.query_arrow([])?;
-    let mut memberships = Vec::with_capacity(capacity);
-    for batch in batches {
-        let contracts = required_arrow_column::<UInt32Array>(&batch, 0, "contract_index")?;
-        let tokens = required_arrow_column::<UInt32Array>(&batch, 1, "token_index")?;
-        let sources = required_arrow_column::<UInt32Array>(&batch, 2, "source_id")?;
-        let batch_memberships = parse_pool.install(|| {
-            (0..batch.num_rows())
-                .into_par_iter()
-                .map(|index| {
-                    if contracts.is_null(index) || tokens.is_null(index) || sources.is_null(index) {
-                        return Err(AnalysisError::InvalidData(
-                            "resolved token membership contains NULL".into(),
-                        ));
-                    }
-                    Ok(ResolvedTokenMembership {
-                        contract_index: contracts.value(index),
-                        source_id: sources.value(index),
-                        token_id: tokens.value(index),
-                    })
-                })
-                .collect::<Result<Vec<_>, AnalysisError>>()
-        })?;
-        memberships.extend(batch_memberships);
-        progress(ProgressEvent::determinate(
-            ProgressPhase::EncodeLoadTokenMemberships,
-            memberships.len() as u64,
-            membership_count,
-            WorkUnit::Items,
-            EngineCounters::default(),
-        ));
-    }
-    if memberships.len() != capacity {
-        return Err(AnalysisError::InvalidData(
-            "resolved token membership count differs from plan".into(),
-        ));
-    }
-    Ok(memberships)
 }
 
 fn required_arrow_column<'a, T: Array + 'static>(
@@ -2543,6 +2261,21 @@ fn emit_encode_progress(
             phase,
             completed,
             total,
+            WorkUnit::Items,
+            EngineCounters::default(),
+        ));
+    }
+}
+
+fn emit_encode_indeterminate_progress(
+    progress: &mut impl FnMut(ProgressEvent),
+    phase: ProgressPhase,
+    completed: u64,
+) {
+    if completed.is_multiple_of(16_384) {
+        progress(ProgressEvent::indeterminate(
+            phase,
+            completed,
             WorkUnit::Items,
             EngineCounters::default(),
         ));
@@ -3254,7 +2987,7 @@ mod memory_dedup_tests {
 
         assert_eq!(
             planned_token_relation_peak(rows, rows, distinct_json).unwrap(),
-            rows * 48 + rows * 8 + admitted_json + 64 * 1024 * 1024
+            rows * 192 + rows * 8 + admitted_json + 64 * 1024 * 1024
         );
     }
 }

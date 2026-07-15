@@ -150,17 +150,12 @@ pub(crate) fn prepare_base_tables(
     if include_cross_chain {
         progress.add_work(2);
     }
-    execute_progress_batch(
+    materialize_uri_metadata_rows(
         conn,
-        &build_uri_rows_sql(&inputs),
+        &inputs,
+        &metadata_json_expr,
+        &source_file_id_expr,
         progress,
-        "materialized URI projection",
-    )?;
-    execute_progress_batch(
-        conn,
-        &build_metadata_rows_sql_with_source(&inputs, &metadata_json_expr, &source_file_id_expr),
-        progress,
-        "materialized eligible metadata projection",
     )?;
     execute_progress_batch(
         conn,
@@ -306,46 +301,6 @@ pub(crate) fn build_core_rows_sql(inputs: &str) -> String {
     )
 }
 
-pub(crate) fn build_uri_rows_sql(inputs: &str) -> String {
-    format!(
-        "
-        CREATE OR REPLACE TEMP TABLE uri_rows AS
-        WITH normalized AS (
-            SELECT lower(trim(CAST(chain AS VARCHAR))) AS chain,
-                   CASE
-                       WHEN lower(trim(CAST(chain AS VARCHAR))) = 'solana'
-                           THEN trim(CAST(contract_address AS VARCHAR))
-                       ELSE lower(trim(CAST(contract_address AS VARCHAR)))
-                   END AS contract_address,
-                   coalesce(CAST(token_uri_norm AS VARCHAR), '') AS token_uri_norm,
-                   coalesce(CAST(image_uri_norm AS VARCHAR), '') AS image_uri_norm
-            FROM read_parquet({inputs})
-            WHERE chain IS NOT NULL
-              AND trim(CAST(chain AS VARCHAR)) <> ''
-              AND (
-                  coalesce(CAST(token_uri_norm AS VARCHAR), '') <> ''
-                  OR coalesce(CAST(image_uri_norm AS VARCHAR), '') <> ''
-              )
-        )
-        SELECT chains.chain_index,
-               contracts.contract_id,
-               rows.token_uri_norm,
-               rows.image_uri_norm
-        FROM normalized rows
-        INNER JOIN contract_dim contracts
-          ON contracts.chain = rows.chain
-         AND contracts.contract_address = rows.contract_address
-        INNER JOIN selected_chains chains
-          ON chains.chain = contracts.chain;
-        "
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn build_metadata_rows_sql(inputs: &str, metadata_json_expr: &str) -> String {
-    build_metadata_rows_sql_with_source(inputs, metadata_json_expr, "CAST(filename AS VARCHAR)")
-}
-
 pub(crate) fn source_file_id_projection_expr(paths: &[PathBuf]) -> String {
     let branches = paths
         .iter()
@@ -367,45 +322,238 @@ pub(crate) fn source_file_id_projection_expr(paths: &[PathBuf]) -> String {
     )
 }
 
-pub(crate) fn build_metadata_rows_sql_with_source(
+pub(crate) fn build_uri_metadata_stream_sql(
     inputs: &str,
     metadata_json_expr: &str,
     source_file_expr: &str,
 ) -> String {
     format!(
-        "
-        CREATE OR REPLACE TABLE metadata_rows AS
-        WITH projected AS (
-            SELECT lower(trim(CAST(chain AS VARCHAR))) AS chain,
-                   CASE
-                       WHEN lower(trim(CAST(chain AS VARCHAR))) = 'solana'
-                           THEN trim(CAST(contract_address AS VARCHAR))
-                       ELSE lower(trim(CAST(contract_address AS VARCHAR)))
-                   END AS contract_address,
-                   trim(coalesce(CAST(token_id AS VARCHAR), '')) AS token_id,
-                   trim(coalesce({metadata_json_expr}, '')) AS metadata_json,
-                   {source_file_expr} AS source_file,
-                   file_row_number::UBIGINT AS source_row_number
-            FROM read_parquet({inputs}, filename = true, file_row_number = true)
-            WHERE chain IS NOT NULL
-              AND trim(CAST(chain AS VARCHAR)) <> ''
-        )
-        SELECT contracts.contract_id,
-               projected.token_id,
-               projected.metadata_json,
-               projected.source_file,
-               projected.source_row_number,
-               true AS metadata_eligible
-        FROM projected
-        INNER JOIN contract_dim contracts
-          ON contracts.chain = projected.chain
-         AND contracts.contract_address = projected.contract_address
-        WHERE {metadata_eligible};
-        ",
-        metadata_json_expr = metadata_json_expr,
-        source_file_expr = source_file_expr,
+        "WITH projected AS (
+             SELECT lower(trim(CAST(chain AS VARCHAR))) AS chain,
+                    CASE
+                        WHEN lower(trim(CAST(chain AS VARCHAR))) = 'solana'
+                            THEN trim(CAST(contract_address AS VARCHAR))
+                        ELSE lower(trim(CAST(contract_address AS VARCHAR)))
+                    END AS contract_address,
+                    coalesce(CAST(token_uri_norm AS VARCHAR), '') AS token_uri_norm,
+                    coalesce(CAST(image_uri_norm AS VARCHAR), '') AS image_uri_norm,
+                    trim(coalesce(CAST(token_id AS VARCHAR), '')) AS token_id,
+                    trim(coalesce({metadata_json_expr}, '')) AS metadata_json,
+                    {source_file_expr} AS source_file,
+                    file_row_number::UBIGINT AS source_row_number
+             FROM read_parquet({inputs}, filename = true, file_row_number = true)
+             WHERE chain IS NOT NULL
+               AND trim(CAST(chain AS VARCHAR)) <> ''
+         )
+         SELECT chains.chain_index::UINTEGER AS chain_index,
+                contracts.contract_id::UINTEGER AS contract_id,
+                projected.token_uri_norm,
+                projected.image_uri_norm,
+                projected.token_id,
+                projected.metadata_json,
+                projected.source_file::UINTEGER AS source_file,
+                projected.source_row_number,
+                ({metadata_eligible}) AS metadata_eligible
+         FROM projected
+         JOIN contract_dim contracts
+           ON contracts.chain = projected.chain
+          AND contracts.contract_address = projected.contract_address
+         JOIN selected_chains chains ON chains.chain = contracts.chain
+         WHERE projected.token_uri_norm <> ''
+            OR projected.image_uri_norm <> ''
+            OR ({metadata_eligible})",
         metadata_eligible = normalized_metadata_json_eligible_predicate("metadata_json"),
     )
+}
+
+fn materialize_uri_metadata_rows(
+    conn: &Connection,
+    inputs: &str,
+    metadata_json_expr: &str,
+    source_file_expr: &str,
+    progress: &ProgressTracker,
+) -> Result<(), AnalysisError> {
+    use duckdb::arrow::array::{
+        Array, ArrayRef, BooleanArray, StringArray, UInt32Array, UInt64Array,
+    };
+    use duckdb::arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    conn.execute_batch(
+        "CREATE OR REPLACE TEMP TABLE uri_rows(
+             chain_index UINTEGER,
+             contract_id UINTEGER,
+             token_uri_norm VARCHAR,
+             image_uri_norm VARCHAR
+         );
+         CREATE OR REPLACE TABLE metadata_rows(
+             contract_id UINTEGER,
+             token_id VARCHAR,
+             metadata_json VARCHAR,
+             source_file UINTEGER,
+             source_row_number UBIGINT,
+             metadata_eligible BOOLEAN
+         );",
+    )?;
+    progress.start_task("streaming URI + metadata projection", None, "rows");
+    let sql = build_uri_metadata_stream_sql(inputs, metadata_json_expr, source_file_expr);
+    let mut statement = conn.prepare(&sql)?;
+    let batches = statement.query_arrow([])?;
+    let mut uri_appender = conn.appender("uri_rows")?;
+    let mut metadata_appender = conn.appender("metadata_rows")?;
+    let mut completed = 0u64;
+    for batch in batches {
+        let chain_indexes = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| AnalysisError::InvalidData("chain_index is not UINTEGER".into()))?;
+        let contract_ids = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| AnalysisError::InvalidData("contract_id is not UINTEGER".into()))?;
+        let source_files = batch
+            .column(6)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| AnalysisError::InvalidData("source_file is not UINTEGER".into()))?;
+        let source_rows = batch
+            .column(7)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| AnalysisError::InvalidData("source_row_number is not UBIGINT".into()))?;
+        let eligible = batch
+            .column(8)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| AnalysisError::InvalidData("metadata_eligible is not BOOLEAN".into()))?;
+        let mut uri_chain = Vec::new();
+        let mut uri_contract = Vec::new();
+        let mut token_uris = Vec::new();
+        let mut image_uris = Vec::new();
+        let mut metadata_contract = Vec::new();
+        let mut token_ids = Vec::new();
+        let mut metadata_json = Vec::new();
+        let mut metadata_files = Vec::new();
+        let mut metadata_rows = Vec::new();
+        for index in 0..batch.num_rows() {
+            if chain_indexes.is_null(index)
+                || contract_ids.is_null(index)
+                || source_files.is_null(index)
+                || source_rows.is_null(index)
+                || eligible.is_null(index)
+            {
+                return Err(AnalysisError::InvalidData(
+                    "URI/metadata projection contains NULL identity columns".into(),
+                ));
+            }
+            let token_uri = arrow_string_value(batch.column(2).as_ref(), index)?;
+            let image_uri = arrow_string_value(batch.column(3).as_ref(), index)?;
+            if !token_uri.is_empty() || !image_uri.is_empty() {
+                uri_chain.push(chain_indexes.value(index));
+                uri_contract.push(contract_ids.value(index));
+                token_uris.push(token_uri.to_owned());
+                image_uris.push(image_uri.to_owned());
+            }
+            if eligible.value(index) {
+                metadata_contract.push(contract_ids.value(index));
+                token_ids.push(arrow_string_value(batch.column(4).as_ref(), index)?.to_owned());
+                metadata_json.push(arrow_string_value(batch.column(5).as_ref(), index)?.to_owned());
+                metadata_files.push(source_files.value(index));
+                metadata_rows.push(source_rows.value(index));
+            }
+        }
+        if !uri_chain.is_empty() {
+            let uri_batch = RecordBatch::try_from_iter(vec![
+                (
+                    "chain_index",
+                    Arc::new(UInt32Array::from(uri_chain)) as ArrayRef,
+                ),
+                (
+                    "contract_id",
+                    Arc::new(UInt32Array::from(uri_contract)) as ArrayRef,
+                ),
+                (
+                    "token_uri_norm",
+                    Arc::new(StringArray::from(token_uris)) as ArrayRef,
+                ),
+                (
+                    "image_uri_norm",
+                    Arc::new(StringArray::from(image_uris)) as ArrayRef,
+                ),
+            ])
+            .map_err(|error| {
+                AnalysisError::InvalidData(format!("cannot build URI Arrow batch: {error}"))
+            })?;
+            uri_appender.append_record_batch(uri_batch)?;
+        }
+        if !metadata_contract.is_empty() {
+            let count = metadata_contract.len();
+            let metadata_batch = RecordBatch::try_from_iter(vec![
+                (
+                    "contract_id",
+                    Arc::new(UInt32Array::from(metadata_contract)) as ArrayRef,
+                ),
+                (
+                    "token_id",
+                    Arc::new(StringArray::from(token_ids)) as ArrayRef,
+                ),
+                (
+                    "metadata_json",
+                    Arc::new(StringArray::from(metadata_json)) as ArrayRef,
+                ),
+                (
+                    "source_file",
+                    Arc::new(UInt32Array::from(metadata_files)) as ArrayRef,
+                ),
+                (
+                    "source_row_number",
+                    Arc::new(UInt64Array::from(metadata_rows)) as ArrayRef,
+                ),
+                (
+                    "metadata_eligible",
+                    Arc::new(BooleanArray::from(vec![true; count])) as ArrayRef,
+                ),
+            ])
+            .map_err(|error| {
+                AnalysisError::InvalidData(format!("cannot build metadata Arrow batch: {error}"))
+            })?;
+            metadata_appender.append_record_batch(metadata_batch)?;
+        }
+        let batch_rows = batch.num_rows() as u64;
+        completed = completed.saturating_add(batch_rows);
+        progress.advance_task(batch_rows, ProgressCounters::default());
+    }
+    drop(metadata_appender);
+    drop(uri_appender);
+    persist_last_duckdb_profile(conn, "streamed URI + metadata projection")?;
+    progress.finish_task("URI + metadata projection ready");
+    progress.step_stage("materialized URI projection");
+    progress.step_stage("materialized eligible metadata projection");
+    Ok(())
+}
+
+fn arrow_string_value(
+    array: &dyn duckdb::arrow::array::Array,
+    index: usize,
+) -> Result<&str, AnalysisError> {
+    use duckdb::arrow::array::{StringArray, StringViewArray};
+
+    if array.is_null(index) {
+        return Err(AnalysisError::InvalidData(
+            "URI/metadata projection contains NULL string".into(),
+        ));
+    }
+    if let Some(strings) = array.as_any().downcast_ref::<StringArray>() {
+        return Ok(strings.value(index));
+    }
+    if let Some(strings) = array.as_any().downcast_ref::<StringViewArray>() {
+        return Ok(strings.value(index));
+    }
+    Err(AnalysisError::InvalidData(
+        "URI/metadata projection string has wrong Arrow type".into(),
+    ))
 }
 
 pub(crate) fn execute_progress_batch(

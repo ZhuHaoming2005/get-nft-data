@@ -1,4 +1,4 @@
-﻿use std::fs;
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 
@@ -108,10 +108,22 @@ fn public_controller_runs_all_children_and_resumes_finalized_pipeline() {
         work.join("artifacts/metadata/production-readiness.json"),
         work.join("artifacts/metadata/encode-3/features.ready"),
         work.join("artifacts/metadata/blocking-3/blocking.ready"),
-        work.join("artifacts/metadata/match-1/index-1/index.ready"),
+        work.join("artifacts/metadata/match-1/component-snapshots/intra/component-chain.ready"),
         work.join("artifacts/metadata/match-1/metadata-summary-1/metadata-summary.ready"),
     ] {
         assert!(path.is_file(), "missing {}", path.display());
+    }
+    for recovery_only in [
+        "index-1",
+        "exact-islands",
+        "rescue-plan-1",
+        "recall-plan-1",
+        "connectivity-runs",
+    ] {
+        assert!(!work
+            .join("artifacts/metadata/match-1")
+            .join(recovery_only)
+            .exists());
     }
     let readiness: serde_json::Value = serde_json::from_slice(
         &fs::read(output.join("advisory/metadata-production-readiness.json")).unwrap(),

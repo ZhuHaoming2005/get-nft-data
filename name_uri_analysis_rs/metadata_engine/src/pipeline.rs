@@ -26,16 +26,16 @@ use crate::exact_islands::{
 use crate::index::{ConservativeIndex, IndexMetrics};
 use crate::progress::{ProgressCounters, ProgressEvent, ProgressPhase, WorkClass, WorkUnit};
 use crate::reduce::{
-    commit_component_snapshot_chain, open_component_snapshot_chain, recover_component_snapshots,
-    reduce_components_with_progress, ComponentSnapshot, ComponentSnapshotIdentity, Edge,
-    EdgeBudget, EdgeCollector, ForestRun,
+    commit_component_roots, open_component_snapshot_chain, recover_component_snapshots,
+    reduce_components_with_progress, ComponentSnapshotIdentity, Edge, EdgeBudget, EdgeCollector,
+    ForestRun,
 };
 use crate::resource::MemoryBroker;
 use crate::scheduler::{
     estimate_catalog_contract_pair_work, RecallPlan, UniverseBudget, WorkCatalog,
 };
 use crate::snapshot::{MetadataSnapshot, SnapshotError};
-use crate::storage::{ArtifactClass, ArtifactRegistration, StorageBroker};
+use crate::storage::{ArtifactClass, ArtifactRegistration, EvictionPlan, StorageBroker};
 
 pub const DEFAULT_MAX_CANDIDATE_PAIR_VISITS: u64 = 200_000_000_000;
 pub const DEFAULT_EXACT_SAMPLE_LEFTS: u64 = 1_024;
@@ -156,7 +156,6 @@ struct ComponentScopePlan {
     runs: Vec<ForestRun>,
     roots: Option<Vec<u32>>,
     needs_rebuild: bool,
-    rebuilt_snapshots: Option<Vec<ComponentSnapshot>>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MetadataSummaryRow {
@@ -502,30 +501,51 @@ fn compact_catalog_scope_batch(
     edges: Vec<Edge>,
     scratch: &mut ScopeCompactionScratch,
 ) -> CompactedCatalogEdges {
+    compact_catalog_scope_batch_by_chain(&features.contract_chain, chain_count, edges, scratch)
+}
+
+fn compact_catalog_scope_batch_by_chain(
+    contract_chain: &[u32],
+    chain_count: usize,
+    edges: Vec<Edge>,
+    scratch: &mut ScopeCompactionScratch,
+) -> CompactedCatalogEdges {
     let accepted_edges = edges.len() as u64;
     let mut intra = Vec::new();
-    let mut cross = Vec::new();
     let mut chain_pairs = BTreeMap::<usize, Vec<Edge>>::new();
     for edge in edges {
-        let left_chain = features.contract_chain[edge.left as usize] as usize;
-        let right_chain = features.contract_chain[edge.right as usize] as usize;
+        let left_chain = contract_chain[edge.left as usize] as usize;
+        let right_chain = contract_chain[edge.right as usize] as usize;
         if left_chain == right_chain {
             intra.push(edge);
         } else {
-            cross.push(edge);
             chain_pairs
                 .entry(chain_pair_index(left_chain, right_chain, chain_count))
                 .or_default()
                 .push(edge);
         }
     }
+    let intra = compact_scope_edges_with_scratch(intra, scratch);
+    let mut compacted_pairs = Vec::with_capacity(chain_pairs.len());
+    for (pair, pair_edges) in chain_pairs {
+        let pair_edges = compact_scope_edges_with_scratch(pair_edges, scratch);
+        compacted_pairs.push((pair, pair_edges));
+    }
+    let cross_candidate_count = compacted_pairs
+        .iter()
+        .map(|(_, edges)| edges.len())
+        .sum::<usize>();
+    let cross = compact_scope_edge_iter_with_scratch(
+        compacted_pairs
+            .iter()
+            .flat_map(|(_, edges)| edges.iter().copied()),
+        cross_candidate_count,
+        scratch,
+    );
     CompactedCatalogEdges {
-        intra: compact_scope_edges_with_scratch(intra, scratch),
-        cross: compact_scope_edges_with_scratch(cross, scratch),
-        chain_pairs: chain_pairs
-            .into_iter()
-            .map(|(pair, edges)| (pair, compact_scope_edges_with_scratch(edges, scratch)))
-            .collect(),
+        intra,
+        cross,
+        chain_pairs: compacted_pairs,
         accepted_edges,
     }
 }
@@ -630,6 +650,26 @@ fn compact_scope_edges_with_scratch(
     }
     edges.truncate(written);
     edges
+}
+
+fn compact_scope_edge_iter_with_scratch(
+    edges: impl IntoIterator<Item = Edge>,
+    candidate_count: usize,
+    scratch: &mut ScopeCompactionScratch,
+) -> Vec<Edge> {
+    scratch.begin_scope(candidate_count);
+    let mut forest = Vec::with_capacity(candidate_count.min(scratch.parent.len()));
+    for edge in edges {
+        let left = scratch.identity(edge.left);
+        let right = scratch.identity(edge.right);
+        let left_root = sparse_find(&mut scratch.parent, left);
+        let right_root = sparse_find(&mut scratch.parent, right);
+        if left_root != right_root {
+            scratch.parent[right_root] = left_root;
+            forest.push(edge);
+        }
+    }
+    forest
 }
 
 fn sparse_find(parent: &mut [usize], node: usize) -> usize {
@@ -880,7 +920,36 @@ pub fn run_metadata_pipeline(
     out: &Path,
     config: &MetadataPipelineConfig,
 ) -> Result<MetadataPipelineResult, PipelineError> {
-    run_metadata_pipeline_with_progress(features, blocking, out, config, |_| {})
+    run_metadata_pipeline_with_progress_and_persistence(
+        features,
+        blocking,
+        out,
+        config,
+        MatchPersistence::MemoryFirst,
+        |_| {},
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchPersistence {
+    MemoryFirst,
+    Durable,
+}
+
+pub fn run_metadata_pipeline_durable(
+    features: &Path,
+    blocking: &Path,
+    out: &Path,
+    config: &MetadataPipelineConfig,
+) -> Result<MetadataPipelineResult, PipelineError> {
+    run_metadata_pipeline_with_progress_and_persistence(
+        features,
+        blocking,
+        out,
+        config,
+        MatchPersistence::Durable,
+        |_| {},
+    )
 }
 
 pub fn run_metadata_pipeline_with_progress(
@@ -888,6 +957,24 @@ pub fn run_metadata_pipeline_with_progress(
     blocking: &Path,
     out: &Path,
     config: &MetadataPipelineConfig,
+    progress: impl FnMut(ProgressEvent),
+) -> Result<MetadataPipelineResult, PipelineError> {
+    run_metadata_pipeline_with_progress_and_persistence(
+        features,
+        blocking,
+        out,
+        config,
+        MatchPersistence::MemoryFirst,
+        progress,
+    )
+}
+
+pub fn run_metadata_pipeline_with_progress_and_persistence(
+    features: &Path,
+    blocking: &Path,
+    out: &Path,
+    config: &MetadataPipelineConfig,
+    persistence: MatchPersistence,
     mut progress: impl FnMut(ProgressEvent),
 ) -> Result<MetadataPipelineResult, PipelineError> {
     let started = Instant::now();
@@ -958,10 +1045,16 @@ pub fn run_metadata_pipeline_with_progress(
         .checked_mul(std::mem::size_of::<u32>() as u64)
         .and_then(|bytes| bytes.checked_mul(chain_pair_count.saturating_add(2) as u64))
         .ok_or(crate::resource::MemoryError::Overflow)?;
-    let component_history_bytes = component_bytes
-        .checked_mul(8)
-        .ok_or(crate::resource::MemoryError::Overflow)?;
     let scope_count = chain_pair_count.saturating_add(2) as u64;
+    const COMPONENT_MANIFEST_ALLOWANCE_PER_SCOPE: u64 = 8 * 1024;
+    let component_artifact_bytes = scope_count
+        .checked_mul(COMPONENT_MANIFEST_ALLOWANCE_PER_SCOPE)
+        .and_then(|metadata| metadata.checked_add(component_bytes))
+        .ok_or(crate::resource::MemoryError::Overflow)?;
+    let component_partial_peak_bytes = (snapshot.contract_count() as u64)
+        .checked_mul(std::mem::size_of::<u32>() as u64)
+        .and_then(|bytes| bytes.checked_add(COMPONENT_MANIFEST_ALLOWANCE_PER_SCOPE))
+        .ok_or(crate::resource::MemoryError::Overflow)?;
     let forest_upper_bytes = (snapshot.contract_count() as u64)
         .saturating_sub(1)
         .checked_mul(scope_count)
@@ -974,31 +1067,40 @@ pub fn run_metadata_pipeline_with_progress(
         .ok_or(crate::resource::MemoryError::Overflow)?;
     let mut storage = StorageBroker::open(&config.storage_work_directory)?;
     storage.retire_checkpoint_artifacts("metadata_complete", "superseded metadata checkpoint")?;
-    let storage_leases = vec![
-        storage.reserve(
-            ArtifactClass::Index,
-            catalog_bytes,
-            catalog_bytes.min(64 << 20),
-        )?,
-        storage.reserve(ArtifactClass::ExactEvidence, edge_bytes, edge_bytes / 2)?,
-        storage.reserve(ArtifactClass::ConnectivityRun, edge_bytes, edge_bytes)?,
+    std::fs::create_dir_all(out)?;
+    if persistence == MatchPersistence::MemoryFirst {
+        clear_prior_match_artifacts_for_memory_first(&mut storage, out)?;
+    }
+    let mut storage_leases = vec![
         storage.reserve(
             ArtifactClass::ComponentSnapshot,
-            component_history_bytes,
-            component_history_bytes,
+            component_artifact_bytes,
+            component_partial_peak_bytes,
         )?,
         storage.reserve(ArtifactClass::Summary, 16 << 20, 16 << 20)?,
     ];
+    if persistence == MatchPersistence::Durable {
+        storage_leases.extend([
+            storage.reserve(
+                ArtifactClass::Index,
+                catalog_bytes,
+                catalog_bytes.min(64 << 20),
+            )?,
+            storage.reserve(ArtifactClass::ExactEvidence, edge_bytes, edge_bytes / 2)?,
+            storage.reserve(ArtifactClass::ConnectivityRun, edge_bytes, edge_bytes)?,
+        ]);
+    }
     let _catalog_mem = memory.reserve(
         config
             .max_catalog_jobs
             .saturating_mul(std::mem::size_of::<crate::scheduler::JobDescriptor>() as u64),
     )?;
     let catalog_blocks = snapshot.blocking().block_kinds.len() as u64;
-    std::fs::create_dir_all(out)?;
     let index_dir = out.join("index-1");
-    std::fs::create_dir_all(&index_dir)?;
     let catalog_dir = index_dir.join("catalog");
+    if persistence == MatchPersistence::Durable {
+        std::fs::create_dir_all(&index_dir)?;
+    }
     progress(ProgressEvent::determinate(
         ProgressPhase::BuildCatalog,
         0,
@@ -1006,30 +1108,41 @@ pub fn run_metadata_pipeline_with_progress(
         WorkUnit::Items,
         ProgressCounters::default(),
     ));
-    let catalog = WorkCatalog::open_or_rebuild_with_progress(
-        &catalog_dir,
-        &snapshot,
-        UniverseBudget {
-            max_jobs: config.max_catalog_jobs,
-            max_catalog_bytes: config
-                .max_catalog_jobs
-                .saturating_mul(std::mem::size_of::<crate::scheduler::JobDescriptor>() as u64),
-            cold_members_per_job: 262_144,
-        },
-        crate::blocking::DEFAULT_MAX_ROUTING_BLOCK_MEMBERS as u64,
-        |completed, total, groups| {
-            progress(ProgressEvent::determinate(
-                ProgressPhase::BuildCatalog,
-                completed,
-                total,
-                WorkUnit::Items,
-                ProgressCounters {
-                    groups,
-                    ..ProgressCounters::default()
-                },
-            ));
-        },
-    )?;
+    let catalog_budget = UniverseBudget {
+        max_jobs: config.max_catalog_jobs,
+        max_catalog_bytes: config
+            .max_catalog_jobs
+            .saturating_mul(std::mem::size_of::<crate::scheduler::JobDescriptor>() as u64),
+        cold_members_per_job: 262_144,
+    };
+    let catalog_progress = |completed, total, groups| {
+        progress(ProgressEvent::determinate(
+            ProgressPhase::BuildCatalog,
+            completed,
+            total,
+            WorkUnit::Items,
+            ProgressCounters {
+                groups,
+                ..ProgressCounters::default()
+            },
+        ));
+    };
+    let catalog = if persistence == MatchPersistence::Durable {
+        WorkCatalog::open_or_rebuild_with_progress(
+            &catalog_dir,
+            &snapshot,
+            catalog_budget,
+            crate::blocking::DEFAULT_MAX_ROUTING_BLOCK_MEMBERS as u64,
+            catalog_progress,
+        )?
+    } else {
+        WorkCatalog::build_with_progress(
+            &snapshot,
+            catalog_budget,
+            crate::blocking::DEFAULT_MAX_ROUTING_BLOCK_MEMBERS as u64,
+            catalog_progress,
+        )?
+    };
     progress(ProgressEvent::determinate(
         ProgressPhase::BuildCatalog,
         catalog_blocks,
@@ -1037,8 +1150,10 @@ pub fn run_metadata_pipeline_with_progress(
         WorkUnit::Items,
         ProgressCounters::default(),
     ));
-    let index_manifest=serde_json::json!({"index_revision":1,"profile":"base_equivalent","job_count":catalog.jobs.len(),"exact_full_build_bytes":0,"exact_full_mmap_bytes":0}).to_string();
-    crate::format::commit_ready(&index_dir, "index.ready", &index_manifest)?;
+    if persistence == MatchPersistence::Durable {
+        let index_manifest=serde_json::json!({"index_revision":1,"profile":"base_equivalent","job_count":catalog.jobs.len(),"exact_full_build_bytes":0,"exact_full_mmap_bytes":0}).to_string();
+        crate::format::commit_ready(&index_dir, "index.ready", &index_manifest)?;
+    }
     let exact_plan = plan_exact_evidence(
         snapshot.atom_count() as u64,
         config.exact_sample_lefts,
@@ -1057,7 +1172,12 @@ pub fn run_metadata_pipeline_with_progress(
         .collect::<Vec<_>>();
     let exact_root = out.join("exact-islands");
     let exact_dir = exact_root.join("pair-calibration-1");
-    let exact = if let Some(evidence) = open_pair_exact_evidence(&exact_dir, &snapshot, &samples)? {
+    let exact = if persistence == MatchPersistence::Durable {
+        open_pair_exact_evidence(&exact_dir, &snapshot, &samples)?
+    } else {
+        None
+    };
+    let exact = if let Some(evidence) = exact {
         progress(ProgressEvent::determinate(
             ProgressPhase::PairExactIsland,
             evidence.pair_work,
@@ -1082,14 +1202,17 @@ pub fn run_metadata_pipeline_with_progress(
                 max_artifact_bytes: edge_bytes / 3,
                 max_lanes: config.threads.max(1),
             },
-            Some(&exact_dir),
+            (persistence == MatchPersistence::Durable).then_some(exact_dir.as_path()),
             &mut progress,
         )?
     };
     let holdout_dir = exact_root.join("pair-holdout-1");
-    let pair_holdout_evidence = if let Some(evidence) =
-        open_pair_exact_evidence(&holdout_dir, &snapshot, &holdout_samples)?
+    let pair_holdout_evidence = if let Some(evidence) = if persistence == MatchPersistence::Durable
     {
+        open_pair_exact_evidence(&holdout_dir, &snapshot, &holdout_samples)?
+    } else {
+        None
+    } {
         progress(ProgressEvent::determinate(
             ProgressPhase::PairExactHoldout,
             evidence.pair_work,
@@ -1114,7 +1237,7 @@ pub fn run_metadata_pipeline_with_progress(
                 max_artifact_bytes: edge_bytes / 3,
                 max_lanes: config.threads.max(1),
             },
-            Some(&holdout_dir),
+            (persistence == MatchPersistence::Durable).then_some(holdout_dir.as_path()),
             |mut event| {
                 event.phase = match event.phase {
                     ProgressPhase::PairExactIsland => ProgressPhase::PairExactHoldout,
@@ -1136,12 +1259,17 @@ pub fn run_metadata_pipeline_with_progress(
         exact_plan.remaining_pair_work,
     )?;
     let shared_dir = out.join("exact-islands/shared-token-1");
-    let shared_token_exact_evidence = if let Some(evidence) = open_shared_token_exact_evidence(
-        &shared_dir,
-        &snapshot,
-        &shared_plan.calibration_tokens,
-        &shared_plan.holdout_tokens,
-    )? {
+    let shared_token_exact_evidence = if let Some(evidence) =
+        if persistence == MatchPersistence::Durable {
+            open_shared_token_exact_evidence(
+                &shared_dir,
+                &snapshot,
+                &shared_plan.calibration_tokens,
+                &shared_plan.holdout_tokens,
+            )?
+        } else {
+            None
+        } {
         progress(ProgressEvent::determinate(
             ProgressPhase::SharedTokenExactIsland,
             evidence.pair_work,
@@ -1173,7 +1301,7 @@ pub fn run_metadata_pipeline_with_progress(
                 max_artifact_bytes: edge_bytes / 3,
                 max_lanes: config.threads.max(1),
             },
-            Some(&shared_dir),
+            (persistence == MatchPersistence::Durable).then_some(shared_dir.as_path()),
             &mut progress,
         )?
     };
@@ -1188,11 +1316,13 @@ pub fn run_metadata_pipeline_with_progress(
         "snapshot_fingerprint": catalog.snapshot_fingerprint,
         "plan": rescue_plan,
     }))?;
-    crate::format::commit_ready(
-        &out.join("rescue-plan-1"),
-        "rescue-plan.ready",
-        &rescue_json,
-    )?;
+    if persistence == MatchPersistence::Durable {
+        crate::format::commit_ready(
+            &out.join("rescue-plan-1"),
+            "rescue-plan.ready",
+            &rescue_json,
+        )?;
+    }
     let evidence_gate_report = evaluate_holdout(
         HoldoutEvidence {
             evaluated_pair_work: pair_holdout_evidence
@@ -1235,7 +1365,9 @@ pub fn run_metadata_pipeline_with_progress(
         Vec::new(),
         rescue_plan.pair_atoms.clone(),
     );
-    recall.commit(&out.join("recall-plan-1"))?;
+    if persistence == MatchPersistence::Durable {
+        recall.commit(&out.join("recall-plan-1"))?;
+    }
     let _edge_memory = memory.reserve(edge_bytes)?;
     let max_edge_count = edge_bytes / (std::mem::size_of::<Edge>() as u64);
     let scope_count = scope_count.max(1);
@@ -1253,12 +1385,16 @@ pub fn run_metadata_pipeline_with_progress(
     let _component_memory = memory.reserve(component_peak_bytes)?;
     let node_count = snapshot.contract_count() as u32;
     let runs_dir = out.join("connectivity-runs");
-    let recovered = open_connectivity_runs(
-        &runs_dir,
-        &catalog.snapshot_fingerprint,
-        &connectivity_plan_digest,
-        chain_count,
-    )?;
+    let recovered = if persistence == MatchPersistence::Durable {
+        open_connectivity_runs(
+            &runs_dir,
+            &catalog.snapshot_fingerprint,
+            &connectivity_plan_digest,
+            chain_count,
+        )?
+    } else {
+        None
+    };
     if let Some(recovered) = &recovered {
         if recovered.candidate_pair_visits > config.max_candidate_pair_visits {
             return Err(crate::reduce::ReduceError::Budget {
@@ -1483,21 +1619,23 @@ pub fn run_metadata_pipeline_with_progress(
             let accepted_edge_count = collectors.accepted_edges;
             let (intra_runs, cross_runs, pair_runs) =
                 collectors.finish_with_progress(&mut progress)?;
-            commit_connectivity_runs(
-                &runs_dir,
-                ConnectivityCommit {
-                    snapshot_fingerprint: &catalog.snapshot_fingerprint,
-                    connectivity_plan_digest: &connectivity_plan_digest,
-                    chain_count,
-                    intra: &intra_runs,
-                    cross: &cross_runs,
-                    pairs: &pair_runs,
-                    index_metrics: &metrics,
-                    candidate_pair_visits,
-                    accepted_edge_count,
-                },
-                &mut progress,
-            )?;
+            if persistence == MatchPersistence::Durable {
+                commit_connectivity_runs(
+                    &runs_dir,
+                    ConnectivityCommit {
+                        snapshot_fingerprint: &catalog.snapshot_fingerprint,
+                        connectivity_plan_digest: &connectivity_plan_digest,
+                        chain_count,
+                        intra: &intra_runs,
+                        cross: &cross_runs,
+                        pairs: &pair_runs,
+                        index_metrics: &metrics,
+                        candidate_pair_visits,
+                        accepted_edge_count,
+                    },
+                    &mut progress,
+                )?;
+            }
             progress(ProgressEvent::determinate(
                 ProgressPhase::EdgeDispatch,
                 accepted_edge_count,
@@ -1533,34 +1671,38 @@ pub fn run_metadata_pipeline_with_progress(
     }
     let component_root = out.join("component-snapshots");
     let mut scopes = Vec::with_capacity(pair_runs.len().saturating_add(2));
-    let mut push_scope =
-        |kind: ComponentScopeKind, runs: Vec<ForestRun>| -> Result<(), PipelineError> {
-            let directory = component_root.join(kind.directory_name());
-            let identity = ComponentSnapshotIdentity {
-                schema_revision: crate::scoring::MATCH_SEMANTICS_REVISION,
-                snapshot_fingerprint: catalog.snapshot_fingerprint.clone(),
-                connectivity_revision: CONNECTIVITY_RUN_REVISION,
-                connectivity_plan_digest: connectivity_plan_digest.clone(),
-                scope_identity: kind.identity(),
-                node_count,
-            };
-            let roots = open_component_snapshot_chain(&directory, &identity)?
+    let mut push_scope = |kind: ComponentScopeKind,
+                          runs: Vec<ForestRun>|
+     -> Result<(), PipelineError> {
+        let directory = component_root.join(kind.directory_name());
+        let identity = ComponentSnapshotIdentity {
+            schema_revision: crate::scoring::MATCH_SEMANTICS_REVISION,
+            snapshot_fingerprint: catalog.snapshot_fingerprint.clone(),
+            connectivity_revision: CONNECTIVITY_RUN_REVISION,
+            connectivity_plan_digest: connectivity_plan_digest.clone(),
+            scope_identity: kind.identity(),
+            node_count,
+        };
+        let roots = if persistence == MatchPersistence::Durable {
+            open_component_snapshot_chain(&directory, &identity)?
                 .map(|snapshots| {
                     recover_component_snapshots(&snapshots).map(|snapshot| snapshot.roots.clone())
                 })
-                .transpose()?;
-            let needs_rebuild = roots.is_none();
-            scopes.push(ComponentScopePlan {
-                kind,
-                directory,
-                identity,
-                runs,
-                roots,
-                needs_rebuild,
-                rebuilt_snapshots: None,
-            });
-            Ok(())
+                .transpose()?
+        } else {
+            None
         };
+        let needs_rebuild = roots.is_none();
+        scopes.push(ComponentScopePlan {
+            kind,
+            directory,
+            identity,
+            runs,
+            roots,
+            needs_rebuild,
+        });
+        Ok(())
+    };
     push_scope(ComponentScopeKind::Intra, intra_runs)?;
     push_scope(ComponentScopeKind::Cross, cross_runs)?;
     let mut pair_runs = pair_runs.into_iter();
@@ -1627,8 +1769,13 @@ pub fn run_metadata_pipeline_with_progress(
         }
     }
     let recovery_total = scopes.len() as u64;
+    let finalize_phase = if persistence == MatchPersistence::Durable {
+        ProgressPhase::BuildRecoveryChain
+    } else {
+        ProgressPhase::FinalizeComponents
+    };
     progress(ProgressEvent::determinate(
-        ProgressPhase::BuildRecoveryChain,
+        finalize_phase,
         0,
         recovery_total,
         WorkUnit::Items,
@@ -1638,20 +1785,15 @@ pub fn run_metadata_pipeline_with_progress(
     let mut rebuilt_scopes = 0u64;
     for (index, scope) in scopes.iter_mut().enumerate() {
         if scope.needs_rebuild {
-            let snapshots = vec![crate::reduce::ComponentSnapshot::from_reduced_roots(
-                0,
-                scope
-                    .roots
-                    .clone()
-                    .ok_or_else(|| PipelineError::Invariant("missing reduced roots".into()))?,
-            )?];
-            scope.rebuilt_snapshots = Some(snapshots);
+            if scope.roots.is_none() {
+                return Err(PipelineError::Invariant("missing reduced roots".into()));
+            }
             rebuilt_scopes = rebuilt_scopes.saturating_add(1);
         } else {
             reused_scopes = reused_scopes.saturating_add(1);
         }
         progress(ProgressEvent::determinate(
-            ProgressPhase::BuildRecoveryChain,
+            finalize_phase,
             index as u64 + 1,
             recovery_total,
             WorkUnit::Items,
@@ -1664,9 +1806,9 @@ pub fn run_metadata_pipeline_with_progress(
     }
     let component_total = scopes
         .iter()
-        .filter_map(|scope| scope.rebuilt_snapshots.as_ref())
-        .map(|snapshots| snapshots.len().saturating_add(1))
-        .sum::<usize>() as u64;
+        .filter(|scope| scope.needs_rebuild)
+        .count()
+        .saturating_mul(2) as u64;
     progress(ProgressEvent::determinate(
         ProgressPhase::CommitComponents,
         0,
@@ -1676,8 +1818,12 @@ pub fn run_metadata_pipeline_with_progress(
     ));
     let mut committed = 0u64;
     for scope in &scopes {
-        if let Some(snapshots) = &scope.rebuilt_snapshots {
-            commit_component_snapshot_chain(&scope.directory, &scope.identity, snapshots, || {
+        if scope.needs_rebuild {
+            let roots = scope
+                .roots
+                .as_deref()
+                .ok_or_else(|| PipelineError::Invariant("missing reduced roots".into()))?;
+            commit_component_roots(&scope.directory, &scope.identity, roots, || {
                 committed = committed.saturating_add(1);
                 progress(ProgressEvent::determinate(
                     ProgressPhase::CommitComponents,
@@ -1768,18 +1914,28 @@ pub fn run_metadata_pipeline_with_progress(
     ));
     crate::format::commit_ready(&summary_dir, "metadata-summary.ready", &json)?;
     drop(storage_leases);
-    register_match_artifacts(
-        &mut storage,
-        features,
-        blocking,
-        &index_dir,
-        &exact_root,
-        &out.join("rescue-plan-1"),
-        &out.join("recall-plan-1"),
-        &runs_dir,
-        &out.join("component-snapshots"),
-        &summary_dir,
-    )?;
+    if persistence == MatchPersistence::Durable {
+        register_match_artifacts(
+            &mut storage,
+            features,
+            blocking,
+            &index_dir,
+            &exact_root,
+            &out.join("rescue-plan-1"),
+            &out.join("recall-plan-1"),
+            &runs_dir,
+            &out.join("component-snapshots"),
+            &summary_dir,
+        )?;
+    } else {
+        register_memory_first_match_artifacts(
+            &mut storage,
+            features,
+            blocking,
+            &out.join("component-snapshots"),
+            &summary_dir,
+        )?;
+    }
     progress(ProgressEvent::determinate(
         ProgressPhase::CommitArtifacts,
         1,
@@ -1788,6 +1944,79 @@ pub fn run_metadata_pipeline_with_progress(
         ProgressCounters::default(),
     ));
     Ok(result)
+}
+
+fn clear_prior_match_artifacts_for_memory_first(
+    storage: &mut StorageBroker,
+    out: &Path,
+) -> Result<(), PipelineError> {
+    // Dependency order matters: remove consumers before their inputs so the
+    // ledger can safely retire every artifact from a prior Durable run.
+    let paths = [
+        "metadata-summary-1",
+        "component-snapshots",
+        "connectivity-runs",
+        "recall-plan-1",
+        "rescue-plan-1",
+        "exact-islands",
+        "index-1",
+    ]
+    .into_iter()
+    .map(|relative| out.join(relative))
+    .collect::<Vec<_>>();
+    storage.commit_evict(&EvictionPlan {
+        paths: paths.clone(),
+    })?;
+    // Old/unregistered artifacts are not represented in the ledger but must
+    // not survive into a memory-first result.
+    for path in paths {
+        if path.is_dir() {
+            std::fs::remove_dir_all(path)?;
+        } else if path.is_file() {
+            std::fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+fn register_memory_first_match_artifacts(
+    storage: &mut StorageBroker,
+    features: &Path,
+    blocking: &Path,
+    components: &Path,
+    summary: &Path,
+) -> Result<(), PipelineError> {
+    let mut snapshot_files = Vec::new();
+    collect_top_level_files(features, &mut snapshot_files)?;
+    collect_top_level_files(blocking, &mut snapshot_files)?;
+    let snapshot_dependencies = snapshot_files
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let components_key = components.to_string_lossy().into_owned();
+    storage.register_batch(vec![
+        ArtifactRegistration::new(
+            components.to_path_buf(),
+            ArtifactClass::ComponentSnapshot,
+            directory_bytes(components)?,
+            0,
+            snapshot_dependencies,
+        ),
+        ArtifactRegistration::new(
+            summary.to_path_buf(),
+            ArtifactClass::Summary,
+            directory_bytes(summary)?,
+            0,
+            vec![components_key],
+        ),
+    ])?;
+    for lease in storage.pin_batch(
+        &[components.to_path_buf(), summary.to_path_buf()],
+        "metadata_complete",
+    )? {
+        lease.persist()?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3263,6 +3492,122 @@ mod tests {
     };
     use crate::evidence::SharedRescueSeed;
     use crate::format::commit_ready;
+
+    fn canonical_edge_components(node_count: usize, edges: &[Edge]) -> Vec<Vec<u32>> {
+        let mut parent = (0..node_count).collect::<Vec<_>>();
+        let mut touched = vec![false; node_count];
+        for edge in edges {
+            let left = edge.left as usize;
+            let right = edge.right as usize;
+            touched[left] = true;
+            touched[right] = true;
+            let left_root = sparse_find(&mut parent, left);
+            let right_root = sparse_find(&mut parent, right);
+            if left_root != right_root {
+                parent[right_root] = left_root;
+            }
+        }
+        let mut groups = BTreeMap::<usize, Vec<u32>>::new();
+        for (node, &is_touched) in touched.iter().enumerate() {
+            if is_touched {
+                groups
+                    .entry(sparse_find(&mut parent, node))
+                    .or_default()
+                    .push(node as u32);
+            }
+        }
+        let mut groups = groups.into_values().collect::<Vec<_>>();
+        groups.sort();
+        groups
+    }
+
+    #[test]
+    fn pair_first_cross_compaction_preserves_pair_and_global_connectivity() {
+        let contract_chain = [0, 0, 1, 1, 2, 2];
+        let edges = vec![
+            Edge::new(0, 1),
+            Edge::new(2, 3),
+            Edge::new(0, 2),
+            Edge::new(1, 3),
+            Edge::new(0, 3),
+            Edge::new(0, 2),
+            Edge::new(2, 4),
+            Edge::new(3, 5),
+            Edge::new(2, 5),
+            Edge::new(1, 4),
+        ];
+        let mut scratch = ScopeCompactionScratch::new(contract_chain.len(), usize::MAX);
+
+        let compacted =
+            compact_catalog_scope_batch_by_chain(&contract_chain, 3, edges.clone(), &mut scratch);
+
+        let expected_intra = edges
+            .iter()
+            .copied()
+            .filter(|edge| {
+                contract_chain[edge.left as usize] == contract_chain[edge.right as usize]
+            })
+            .collect::<Vec<_>>();
+        let expected_cross = edges
+            .iter()
+            .copied()
+            .filter(|edge| {
+                contract_chain[edge.left as usize] != contract_chain[edge.right as usize]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(compacted.accepted_edges, edges.len() as u64);
+        assert_eq!(
+            canonical_edge_components(contract_chain.len(), &compacted.intra),
+            canonical_edge_components(contract_chain.len(), &expected_intra)
+        );
+        assert_eq!(
+            canonical_edge_components(contract_chain.len(), &compacted.cross),
+            canonical_edge_components(contract_chain.len(), &expected_cross)
+        );
+        let expected_pairs = expected_cross.iter().copied().fold(
+            BTreeMap::<usize, Vec<Edge>>::new(),
+            |mut pairs, edge| {
+                pairs
+                    .entry(chain_pair_index(
+                        contract_chain[edge.left as usize] as usize,
+                        contract_chain[edge.right as usize] as usize,
+                        3,
+                    ))
+                    .or_default()
+                    .push(edge);
+                pairs
+            },
+        );
+        assert_eq!(compacted.chain_pairs.len(), expected_pairs.len());
+        for (pair, pair_edges) in compacted.chain_pairs {
+            let expected = &expected_pairs[&pair];
+            assert_eq!(
+                canonical_edge_components(contract_chain.len(), &pair_edges),
+                canonical_edge_components(contract_chain.len(), expected)
+            );
+        }
+    }
+
+    #[test]
+    fn iterator_scope_compaction_builds_a_forest_without_a_candidate_copy() {
+        let groups = [
+            vec![Edge::new(0, 2), Edge::new(1, 3), Edge::new(0, 3)],
+            vec![Edge::new(2, 4), Edge::new(3, 5), Edge::new(2, 5)],
+        ];
+        let expected = groups.iter().flatten().copied().collect::<Vec<_>>();
+        let mut scratch = ScopeCompactionScratch::new(6, usize::MAX);
+
+        let compacted = compact_scope_edge_iter_with_scratch(
+            groups.iter().flatten().copied(),
+            expected.len(),
+            &mut scratch,
+        );
+
+        assert_eq!(
+            canonical_edge_components(6, &compacted),
+            canonical_edge_components(6, &expected)
+        );
+    }
 
     #[test]
     fn lane_local_scope_compaction_preserves_connectivity() {

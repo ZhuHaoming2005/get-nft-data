@@ -1,5 +1,7 @@
 //! Bounded connectivity forest runs and deterministic component reduction.
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::path::Path;
 
 use rayon::prelude::*;
@@ -439,27 +441,13 @@ impl ComponentSnapshot {
     }
 
     pub fn commit(&self, dir: &Path) -> Result<(), ReduceError> {
-        std::fs::create_dir_all(dir)?;
-        let roots_name = format!("component-roots-{:06}.u32", self.epoch);
-        crate::format::write_u32_array(
-            &dir.join(&roots_name),
-            crate::format::ArrayKind::U32,
-            &self.roots,
-        )?;
-        let ready = serde_json::json!({
-            "revision": self.revision,
-            "epoch": self.epoch,
-            "base_epoch": self.base_epoch,
-            "roots_file": roots_name,
-            "node_count": self.roots.len()
-        })
-        .to_string();
-        crate::format::commit_ready(
+        commit_component_snapshot_files(
             dir,
-            &format!("component-snapshot-{:06}.ready", self.epoch),
-            &ready,
-        )?;
-        Ok(())
+            self.revision,
+            self.epoch,
+            self.base_epoch,
+            &self.roots,
+        )
     }
 
     pub fn open(dir: &Path, epoch: u32) -> Result<Self, ReduceError> {
@@ -468,7 +456,12 @@ impl ComponentSnapshot {
             revision: u32,
             epoch: u32,
             base_epoch: Option<u32>,
-            roots_file: String,
+            #[serde(default)]
+            roots_file: Option<String>,
+            #[serde(default)]
+            root_nodes_file: Option<String>,
+            #[serde(default)]
+            root_values_file: Option<String>,
             node_count: usize,
         }
         let ready: Ready = serde_json::from_slice(&std::fs::read(
@@ -479,7 +472,44 @@ impl ComponentSnapshot {
                 "component snapshot revision/epoch mismatch".into(),
             ));
         }
-        let roots = crate::format::map_u32_array(&dir.join(ready.roots_file))?;
+        let roots = match (
+            ready.roots_file,
+            ready.root_nodes_file,
+            ready.root_values_file,
+        ) {
+            (Some(roots_file), None, None) => {
+                crate::format::map_u32_array(&dir.join(roots_file))?.to_vec()
+            }
+            (None, Some(nodes_file), Some(values_file)) => {
+                let nodes = crate::format::map_u32_array(&dir.join(nodes_file))?;
+                let values = crate::format::map_u32_array(&dir.join(values_file))?;
+                if nodes.len() != values.len() {
+                    return Err(ReduceError::SnapshotChain(
+                        "sparse component roots have mismatched columns".into(),
+                    ));
+                }
+                let mut roots = (0..ready.node_count as u32).collect::<Vec<_>>();
+                let mut previous = None;
+                for (&node, &root) in nodes.iter().zip(values.iter()) {
+                    if node as usize >= ready.node_count
+                        || root as usize >= ready.node_count
+                        || previous.is_some_and(|last| node <= last)
+                    {
+                        return Err(ReduceError::SnapshotChain(
+                            "sparse component roots are invalid".into(),
+                        ));
+                    }
+                    roots[node as usize] = root;
+                    previous = Some(node);
+                }
+                roots
+            }
+            _ => {
+                return Err(ReduceError::SnapshotChain(
+                    "component snapshot root storage is invalid".into(),
+                ));
+            }
+        };
         if roots.len() != ready.node_count
             || roots.iter().any(|&root| root as usize >= ready.node_count)
         {
@@ -491,7 +521,7 @@ impl ComponentSnapshot {
             revision: ready.revision,
             epoch,
             base_epoch: ready.base_epoch,
-            roots: roots.to_vec(),
+            roots,
         })
     }
 }
@@ -505,6 +535,10 @@ pub fn commit_component_snapshot_chain(
     mut on_committed: impl FnMut(),
 ) -> Result<(), ReduceError> {
     validate_component_snapshot_chain(identity, snapshots)?;
+    // Epoch filenames are reused. Invalidate the old identity binding before
+    // replacing them so interruption yields a cache miss, never old identity
+    // metadata silently bound to new component roots.
+    remove_if_exists(&dir.join("component-chain.ready"))?;
     for snapshot in snapshots {
         snapshot.commit(dir)?;
         on_committed();
@@ -521,6 +555,128 @@ pub fn commit_component_snapshot_chain(
     )?;
     on_committed();
     Ok(())
+}
+
+/// Commit a single full component snapshot directly from the final result
+/// roots. This keeps the caller's vector available without cloning it solely
+/// for persistence.
+pub fn commit_component_roots(
+    dir: &Path,
+    identity: &ComponentSnapshotIdentity,
+    roots: &[u32],
+    mut on_committed: impl FnMut(),
+) -> Result<(), ReduceError> {
+    if roots.len() != identity.node_count as usize
+        || roots.iter().any(|&root| root as usize >= roots.len())
+    {
+        return Err(ReduceError::SnapshotChain(
+            "component roots do not match snapshot identity".into(),
+        ));
+    }
+    std::fs::create_dir_all(dir)?;
+    remove_if_exists(&dir.join("component-chain.ready"))?;
+    commit_component_snapshot_files(dir, 1, 0, None, roots)?;
+    on_committed();
+    let manifest = ComponentSnapshotChainManifest {
+        revision: COMPONENT_SNAPSHOT_CHAIN_REVISION,
+        identity: identity.clone(),
+        epochs: vec![0],
+    };
+    crate::format::commit_ready(
+        dir,
+        "component-chain.ready",
+        &serde_json::to_string_pretty(&manifest)?,
+    )?;
+    on_committed();
+    Ok(())
+}
+
+fn commit_component_snapshot_files(
+    dir: &Path,
+    revision: u32,
+    epoch: u32,
+    base_epoch: Option<u32>,
+    roots: &[u32],
+) -> Result<(), ReduceError> {
+    std::fs::create_dir_all(dir)?;
+    let dense_name = format!("component-roots-{epoch:06}.u32");
+    let nodes_name = format!("component-root-nodes-{epoch:06}.u32");
+    let values_name = format!("component-root-values-{epoch:06}.u32");
+    let non_identity = roots
+        .iter()
+        .enumerate()
+        .filter(|(node, root)| **root != *node as u32)
+        .count();
+    // Sparse storage uses two typed-array files instead of one. Each file has
+    // a 32-byte padded header and 32-byte checksum, so the extra file costs
+    // the equivalent of sixteen u32 values before payload bytes are counted.
+    let sparse = non_identity
+        .checked_mul(2)
+        .and_then(|values| values.checked_add(16))
+        .is_some_and(|values| values < roots.len());
+    let ready = if sparse {
+        let mut nodes = Vec::with_capacity(non_identity);
+        let mut values = Vec::with_capacity(non_identity);
+        for (node, &root) in roots.iter().enumerate() {
+            if root != node as u32 {
+                nodes.push(node as u32);
+                values.push(root);
+            }
+        }
+        crate::format::write_u32_array(
+            &dir.join(&nodes_name),
+            crate::format::ArrayKind::U32,
+            &nodes,
+        )?;
+        crate::format::write_u32_array(
+            &dir.join(&values_name),
+            crate::format::ArrayKind::U32,
+            &values,
+        )?;
+        serde_json::json!({
+            "revision": revision,
+            "epoch": epoch,
+            "base_epoch": base_epoch,
+            "root_nodes_file": nodes_name,
+            "root_values_file": values_name,
+            "node_count": roots.len(),
+        })
+    } else {
+        crate::format::write_u32_array(
+            &dir.join(&dense_name),
+            crate::format::ArrayKind::U32,
+            roots,
+        )?;
+        serde_json::json!({
+            "revision": revision,
+            "epoch": epoch,
+            "base_epoch": base_epoch,
+            "roots_file": dense_name,
+            "node_count": roots.len(),
+        })
+    };
+    crate::format::commit_ready(
+        dir,
+        &format!("component-snapshot-{epoch:06}.ready"),
+        &ready.to_string(),
+    )?;
+    // Publish the new manifest before retiring files referenced by the old
+    // one, preserving a complete prior snapshot across interruption.
+    if sparse {
+        remove_if_exists(&dir.join(&dense_name))?;
+    } else {
+        remove_if_exists(&dir.join(&nodes_name))?;
+        remove_if_exists(&dir.join(&values_name))?;
+    }
+    Ok(())
+}
+
+fn remove_if_exists(path: &Path) -> Result<(), std::io::Error> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Open a component chain when its complete identity matches.  Missing or
@@ -625,9 +781,42 @@ pub fn reduce_components(runs: &[ForestRun], node_count: u32) -> Result<Vec<u32>
 
 pub fn planned_reduce_work(edge_work: u64, node_count: u32) -> Result<u64, ReduceError> {
     edge_work
-        .checked_mul(3)
-        .and_then(|work| work.checked_add(u64::from(node_count)))
+        .checked_add(u64::from(node_count))
         .ok_or(ReduceError::WorkOverflow)
+}
+
+struct SortedForestEdges<'a> {
+    runs: &'a [ForestRun],
+    heap: BinaryHeap<Reverse<(Edge, usize, usize)>>,
+}
+
+impl<'a> SortedForestEdges<'a> {
+    fn new(runs: &'a [ForestRun]) -> Self {
+        let heap = runs
+            .iter()
+            .enumerate()
+            .filter_map(|(run_index, run)| {
+                run.edges
+                    .first()
+                    .copied()
+                    .map(|edge| Reverse((edge, run_index, 0)))
+            })
+            .collect();
+        Self { runs, heap }
+    }
+}
+
+impl Iterator for SortedForestEdges<'_> {
+    type Item = Edge;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let Reverse((edge, run_index, edge_index)) = self.heap.pop()?;
+        let next_index = edge_index + 1;
+        if let Some(&next) = self.runs[run_index].edges.get(next_index) {
+            self.heap.push(Reverse((next, run_index, next_index)));
+        }
+        Some(edge)
+    }
 }
 
 pub fn reduce_components_with_progress(
@@ -639,7 +828,6 @@ pub fn reduce_components_with_progress(
     let edge_work = runs.iter().map(|run| run.edges.len() as u64).sum::<u64>();
     let total = planned_reduce_work(edge_work, node_count)?;
     progress(0, total);
-    let mut edges = Vec::new();
     for run in runs {
         if run.node_count != node_count {
             return Err(ReduceError::Endpoint {
@@ -647,39 +835,26 @@ pub fn reduce_components_with_progress(
                 node_count,
             });
         }
-        edges.extend(run.edges.iter().copied());
     }
-    progress(edge_work, total);
-    if edges.len() >= 16_384 {
-        edges.par_sort_unstable();
-    } else {
-        edges.sort_unstable();
-    }
-    progress(edge_work.saturating_mul(2), total);
     let mut dsu = Dsu::new(node_count as usize);
     let mut previous = None;
-    for (chunk_index, chunk) in edges.chunks(CHUNK).enumerate() {
-        for &edge in chunk {
-            if previous != Some(edge) {
-                dsu.union(edge.left, edge.right);
-                previous = Some(edge);
-            }
+    let mut processed = 0u64;
+    for edge in SortedForestEdges::new(runs) {
+        if previous != Some(edge) {
+            dsu.union(edge.left, edge.right);
+            previous = Some(edge);
         }
-        let processed = chunk_index
-            .saturating_add(1)
-            .saturating_mul(CHUNK)
-            .min(edges.len()) as u64;
-        progress(edge_work.saturating_mul(2).saturating_add(processed), total);
+        processed = processed.saturating_add(1);
+        if processed.is_multiple_of(CHUNK as u64) {
+            progress(processed, total);
+        }
     }
-    drop(edges);
+    progress(edge_work, total);
     let mut roots = Vec::with_capacity(node_count as usize);
     for begin in (0..node_count as usize).step_by(CHUNK) {
         let end = begin.saturating_add(CHUNK).min(node_count as usize);
         roots.extend((begin..end).map(|index| dsu.find(index as u32)));
-        progress(
-            edge_work.saturating_mul(3).saturating_add(end as u64),
-            total,
-        );
+        progress(edge_work.saturating_add(end as u64), total);
     }
     Ok(roots)
 }
@@ -726,5 +901,136 @@ impl Dsu {
         let (lo, hi) = (x.min(y), x.max(y));
         self.parent[hi as usize] = lo;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sorted_forest_edges_merge_runs_without_materializing_all_edges() {
+        let runs = vec![
+            ForestRun {
+                node_count: 6,
+                edges: vec![Edge::new(0, 1), Edge::new(3, 4)],
+            },
+            ForestRun {
+                node_count: 6,
+                edges: vec![Edge::new(0, 1), Edge::new(1, 2), Edge::new(4, 5)],
+            },
+        ];
+
+        let merged = SortedForestEdges::new(&runs).collect::<Vec<_>>();
+
+        assert_eq!(
+            merged,
+            vec![
+                Edge::new(0, 1),
+                Edge::new(0, 1),
+                Edge::new(1, 2),
+                Edge::new(3, 4),
+                Edge::new(4, 5),
+            ]
+        );
+    }
+
+    #[test]
+    fn borrowed_component_roots_commit_without_transferring_the_result_vector() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = ComponentSnapshotIdentity {
+            schema_revision: 1,
+            snapshot_fingerprint: "snapshot".into(),
+            connectivity_revision: 1,
+            connectivity_plan_digest: "plan".into(),
+            scope_identity: "intra".into(),
+            node_count: 4,
+        };
+        let roots = vec![0, 0, 2, 2];
+        let mut committed = 0;
+
+        commit_component_roots(dir.path(), &identity, &roots, || committed += 1).unwrap();
+
+        assert_eq!(roots, vec![0, 0, 2, 2]);
+        assert_eq!(committed, 2);
+        let chain = open_component_snapshot_chain(dir.path(), &identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recover_component_snapshots(&chain).unwrap().roots, roots);
+    }
+
+    #[test]
+    fn component_root_republish_invalidates_old_identity_before_reusing_epoch_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = ComponentSnapshotIdentity {
+            schema_revision: 1,
+            snapshot_fingerprint: "snapshot".into(),
+            connectivity_revision: 1,
+            connectivity_plan_digest: "plan".into(),
+            scope_identity: "intra".into(),
+            node_count: 4,
+        };
+        commit_component_roots(dir.path(), &identity, &[0, 0, 2, 3], || {}).unwrap();
+        assert!(dir.path().join("component-chain.ready").is_file());
+        let mut commits = 0;
+
+        commit_component_roots(dir.path(), &identity, &[0, 1, 2, 2], || {
+            commits += 1;
+            if commits == 1 {
+                assert!(!dir.path().join("component-chain.ready").exists());
+            }
+        })
+        .unwrap();
+
+        let chain = open_component_snapshot_chain(dir.path(), &identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recover_component_snapshots(&chain).unwrap().roots,
+            vec![0, 1, 2, 2]
+        );
+    }
+
+    #[test]
+    fn sparse_component_roots_roundtrip_identity_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = ComponentSnapshotIdentity {
+            schema_revision: 1,
+            snapshot_fingerprint: "snapshot".into(),
+            connectivity_revision: 1,
+            connectivity_plan_digest: "plan".into(),
+            scope_identity: "pair-0-1".into(),
+            node_count: 64,
+        };
+        let mut roots = (0..64).collect::<Vec<_>>();
+        roots[1] = 0;
+
+        commit_component_roots(dir.path(), &identity, &roots, || {}).unwrap();
+
+        assert!(dir.path().join("component-root-nodes-000000.u32").is_file());
+        assert!(dir
+            .path()
+            .join("component-root-values-000000.u32")
+            .is_file());
+        assert!(!dir.path().join("component-roots-000000.u32").exists());
+        let chain = open_component_snapshot_chain(dir.path(), &identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recover_component_snapshots(&chain).unwrap().roots, roots);
+    }
+
+    #[test]
+    fn tiny_component_snapshot_stays_dense_when_two_sparse_headers_cost_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let roots = vec![0, 0, 2, 3, 4, 5, 6, 7];
+
+        ComponentSnapshot::from_reduced_roots(0, roots.clone())
+            .unwrap()
+            .commit(dir.path())
+            .unwrap();
+
+        assert!(dir.path().join("component-roots-000000.u32").is_file());
+        assert!(!dir.path().join("component-root-nodes-000000.u32").exists());
+        assert_eq!(ComponentSnapshot::open(dir.path(), 0).unwrap().roots, roots);
     }
 }

@@ -133,6 +133,31 @@ fn task_progress_message_keeps_unknown_work_indeterminate() {
 }
 
 #[test]
+fn empty_exact_phase_is_reported_as_skipped_without_rate_or_eta_noise() {
+    let message = format_task_progress_message_with_match_forecast(
+        &TaskProgressSnapshot {
+            label: "commit connectivity runs",
+            position: 0,
+            total: Some(0),
+            unit: "files",
+            counters: ProgressCounters::default(),
+            rate: None,
+            show_match_eta: true,
+            total_kind: metadata_engine::progress::TotalKind::Exact,
+        },
+        Some(&MatchEtaForecast {
+            schema_version: 1,
+            sample_count: 8,
+            lower_total_millis: Some(10_000),
+            upper_total_millis: Some(20_000),
+        }),
+        std::time::Duration::from_secs(4),
+    );
+
+    assert_eq!(message, "commit connectivity runs; skipped (0 files)");
+}
+
+#[test]
 fn task_rate_estimator_waits_for_warmup_and_ignores_zero_delta_refreshes() {
     let mut estimator = TaskRateEstimator::default();
     assert_eq!(estimator.sample(0, std::time::Duration::ZERO), None);

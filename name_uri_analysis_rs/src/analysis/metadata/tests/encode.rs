@@ -1,4 +1,5 @@
-﻿use std::fs;
+use std::collections::HashMap;
+use std::fs;
 use std::path::Path;
 
 use duckdb::Connection;
@@ -11,8 +12,8 @@ use metadata_engine::resource::{MemoryBroker, GIB};
 use metadata_engine::storage::StorageBroker;
 
 use super::super::encode::{
-    estimate_encode_storage_bytes, open_prepare_for_encode, resolve_fallback_contracts,
-    stream_encode_inputs_with_progress,
+    estimate_encode_storage_bytes, fallback_contract_candidates_sql, open_prepare_for_encode,
+    resolve_fallback_contracts, retained_token_candidates_sql, stream_encode_inputs_with_progress,
 };
 
 #[test]
@@ -41,6 +42,24 @@ fn fallback_resolution_checks_presence_only_until_its_first_usable_row() {
         3,
         "resolution must short-circuit per contract without a full parse"
     );
+}
+
+#[test]
+fn retained_token_sources_use_one_streaming_query_without_encode_temp_tables() {
+    let sql = retained_token_candidates_sql();
+
+    assert!(sql.contains("metadata_contract_token_rows"));
+    assert!(sql.contains("ORDER BY token_rows.contract_index"));
+    assert!(!sql.to_ascii_uppercase().contains("CREATE TEMP TABLE"));
+}
+
+#[test]
+fn fallback_contract_filter_is_a_bound_in_memory_list() {
+    let sql = fallback_contract_candidates_sql();
+
+    assert!(sql.contains("unnest(?::UINTEGER[])"));
+    assert!(!sql.contains("arrow("));
+    assert!(!sql.to_ascii_uppercase().contains("CREATE TEMP TABLE"));
 }
 
 fn write_tiny_metadata_parquet(path: &Path) {
@@ -314,7 +333,7 @@ fn encode_admission_freezes_row_totals_for_progress_before_streaming() {
     let admitted_token_json_bytes = token_json_bytes * 5 / 4;
     assert_eq!(
         estimate.token_relation_peak_bytes,
-        token_rows * 48 + representative_rows * 8 + admitted_token_json_bytes + 64 * 1024 * 1024
+        token_rows * 192 + representative_rows * 8 + admitted_token_json_bytes + 64 * 1024 * 1024
     );
     assert_eq!(estimate.partial_peak_bytes, 64 * 1024 * 1024);
     let representative_json_bytes: u64 = conn
@@ -470,13 +489,13 @@ fn encode_stream_reports_frozen_row_totals_and_terminal_completion() {
         .collect::<Vec<_>>();
     assert!(
         !prepare_fallback.is_empty(),
-        "missing fallback SQL-prepare progress"
+        "missing in-memory fallback-prepare progress"
     );
     assert_phase_progress_monotonic(&prepare_fallback);
-    assert_eq!(prepare_fallback[0].total, Some(2));
+    assert_eq!(prepare_fallback[0].total, Some(0));
     assert_eq!(
         prepare_fallback[0].unit,
-        metadata_engine::progress::WorkUnit::Work
+        metadata_engine::progress::WorkUnit::Items
     );
 
     let classify_fallback = events
@@ -497,8 +516,8 @@ fn encode_stream_reports_frozen_row_totals_and_terminal_completion() {
         .iter()
         .rfind(|event| event.phase == ProgressPhase::EncodeTokenSources)
         .unwrap();
-    assert!(source_terminal.total.unwrap() > 0);
-    assert_eq!(source_terminal.completed, source_terminal.total.unwrap());
+    assert_eq!(source_terminal.total, None);
+    assert!(source_terminal.completed > 0);
 
     let read_events = events
         .iter()
@@ -816,11 +835,36 @@ fn encode_preserves_token_specific_metadata_sources() {
     let features = bundle.feature_view();
     assert_eq!(&*features.contract_source, &[0, 2]);
     assert_eq!(&*features.token_member_offsets, &[0, 2, 4]);
-    assert_eq!(&*features.token_member_sources, &[0, 2, 1, 3]);
-    assert_ne!(
-        features.source_to_payload[0], features.source_to_payload[1],
-        "token-two membership must score its own metadata payload"
-    );
+    let prepared = Connection::open(&options.database_path).unwrap();
+    let mut statement = prepared
+        .prepare("SELECT token_index::UINTEGER, token_id FROM metadata_token_dictionary")
+        .unwrap();
+    let token_ids = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<Result<HashMap<_, _>, _>>()
+        .unwrap();
+    for token_index in 0..features.token_member_offsets.len() - 1 {
+        let token_id = token_ids.get(&(token_index as u32)).unwrap();
+        let begin = features.token_member_offsets[token_index] as usize;
+        let end = features.token_member_offsets[token_index + 1] as usize;
+        for member in begin..end {
+            let contract = features.token_member_contracts[member] as usize;
+            let source = features.token_member_sources[member] as usize;
+            let representative = features.contract_source[contract] as usize;
+            if token_id == "1" {
+                assert_eq!(source, representative);
+            } else {
+                assert_eq!(token_id, "2");
+                assert_ne!(
+                    features.source_to_payload[source], features.source_to_payload[representative],
+                    "token-two membership must score its own metadata payload"
+                );
+            }
+        }
+    }
     assert_eq!(&*features.fallback_atom_offsets, &[0, 2]);
     assert_eq!(&*features.fallback_atom_contracts, &[0, 1]);
 }

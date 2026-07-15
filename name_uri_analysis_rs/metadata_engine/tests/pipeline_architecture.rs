@@ -1,4 +1,4 @@
-﻿use metadata_engine::blocking::{compile_base_equivalent, AtomSketch, BlockingCompileConfig};
+use metadata_engine::blocking::{compile_base_equivalent, AtomSketch, BlockingCompileConfig};
 use metadata_engine::encode::{
     write_encode_artifacts, write_encode_artifacts_with_contracts,
     write_encode_artifacts_with_contracts_and_atoms, EncodeContractRow, EncodePayloadRow,
@@ -740,9 +740,9 @@ fn component_reduce_reports_chunk_progress_inside_a_scope() {
     assert_eq!(roots, vec![0; 20_000]);
     assert!(observed.len() > 2);
     let edge_work = 19_999u64;
-    assert_eq!(observed[1].0, edge_work);
-    assert_eq!(observed[1].1, edge_work.saturating_mul(3) + 20_000);
-    assert!(observed[1].0.saturating_mul(2) < observed[1].1);
+    assert_eq!(observed[1].0, 16_384);
+    assert_eq!(observed[1].1, edge_work + 20_000);
+    assert!(observed.windows(2).all(|pair| pair[0].0 <= pair[1].0));
     assert_eq!(observed.last().unwrap().0, observed.last().unwrap().1);
 }
 
@@ -1625,9 +1625,10 @@ fn stale_exact_evidence_identity_is_retired_and_recomputed() {
         evidence_gate_policy: EvidenceGatePolicy::permissive(),
         edge_bytes: 1_000_000,
     };
-    let first =
-        metadata_engine::pipeline::run_metadata_pipeline(&features, &blocking, &out, &config)
-            .unwrap();
+    let first = metadata_engine::pipeline::run_metadata_pipeline_durable(
+        &features, &blocking, &out, &config,
+    )
+    .unwrap();
     let ready = out.join("exact-islands/pair-calibration-1/ready");
     let mut json: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&ready).unwrap()).unwrap();
@@ -1639,9 +1640,10 @@ fn stale_exact_evidence_identity_is_retired_and_recomputed() {
     std::fs::remove_dir_all(out.join("component-snapshots")).unwrap();
     std::fs::remove_dir_all(out.join("metadata-summary-1")).unwrap();
 
-    let rerun =
-        metadata_engine::pipeline::run_metadata_pipeline(&features, &blocking, &out, &config)
-            .unwrap();
+    let rerun = metadata_engine::pipeline::run_metadata_pipeline_durable(
+        &features, &blocking, &out, &config,
+    )
+    .unwrap();
 
     assert_eq!(
         rerun.exact_evidence.pair_work,
@@ -1654,7 +1656,7 @@ fn stale_exact_evidence_identity_is_retired_and_recomputed() {
 fn snapshot_only_pipeline_commits_recoverable_products() {
     let (dir, features, blocking) = snapshot_fixture();
     let out = dir.path().join("match");
-    let result = metadata_engine::pipeline::run_metadata_pipeline(
+    let result = metadata_engine::pipeline::run_metadata_pipeline_durable(
         &features,
         &blocking,
         &out,
@@ -1730,18 +1732,20 @@ fn committed_connectivity_runs_resume_without_rescoring_candidates() {
         evidence_gate_policy: EvidenceGatePolicy::permissive(),
         edge_bytes: 1_000_000,
     };
-    let first =
-        metadata_engine::pipeline::run_metadata_pipeline(&features, &blocking, &out, &config)
-            .unwrap();
+    let first = metadata_engine::pipeline::run_metadata_pipeline_durable(
+        &features, &blocking, &out, &config,
+    )
+    .unwrap();
     std::fs::remove_dir_all(out.join("component-snapshots")).unwrap();
     std::fs::remove_dir_all(out.join("metadata-summary-1")).unwrap();
 
     let mut events = Vec::new();
-    let resumed = metadata_engine::pipeline::run_metadata_pipeline_with_progress(
+    let resumed = metadata_engine::pipeline::run_metadata_pipeline_with_progress_and_persistence(
         &features,
         &blocking,
         &out,
         &config,
+        metadata_engine::pipeline::MatchPersistence::Durable,
         |event| events.push(event),
     )
     .unwrap();
@@ -1760,6 +1764,64 @@ fn committed_connectivity_runs_resume_without_rescoring_candidates() {
 }
 
 #[test]
+fn default_pipeline_persists_only_final_grouping_and_summary_artifacts() {
+    let (dir, features, blocking) = snapshot_fixture();
+    let out = dir.path().join("memory-first-match");
+    let config = metadata_engine::pipeline::MetadataPipelineConfig {
+        storage_work_directory: dir.path().to_path_buf(),
+        memory_hard_top: MATCH_HARD_TOP,
+        host_total_memory: 512 * GIB,
+        threads: 1,
+        max_catalog_jobs: 100,
+        max_candidate_pair_visits: 1_000_000,
+        exact_sample_lefts: 1,
+        exact_pair_work: 10,
+        evidence_gate_policy: EvidenceGatePolicy::permissive(),
+        edge_bytes: 1_000_000,
+    };
+
+    metadata_engine::pipeline::run_metadata_pipeline_durable(&features, &blocking, &out, &config)
+        .unwrap();
+    assert!(out.join("index-1/index.ready").is_file());
+
+    let mut events = Vec::new();
+    metadata_engine::pipeline::run_metadata_pipeline_with_progress(
+        &features,
+        &blocking,
+        &out,
+        &config,
+        |event| events.push(event),
+    )
+    .unwrap();
+
+    assert!(out
+        .join("metadata-summary-1/metadata-summary.ready")
+        .is_file());
+    assert!(out.join("component-snapshots").is_dir());
+    for recovery_only in [
+        "index-1",
+        "exact-islands",
+        "rescue-plan-1",
+        "recall-plan-1",
+        "connectivity-runs",
+    ] {
+        assert!(
+            !out.join(recovery_only).exists(),
+            "default memory-first Match must not persist {recovery_only}"
+        );
+    }
+    assert!(events
+        .iter()
+        .all(|event| event.phase != ProgressPhase::CommitConnectivityRuns));
+    assert!(events
+        .iter()
+        .all(|event| event.phase != ProgressPhase::BuildRecoveryChain));
+    assert!(events
+        .iter()
+        .any(|event| event.phase == ProgressPhase::FinalizeComponents));
+}
+
+#[test]
 fn committed_component_chains_resume_without_reducing_or_rewriting_scopes() {
     let (dir, features, blocking) = snapshot_fixture();
     let out = dir.path().join("resume-components");
@@ -1775,17 +1837,19 @@ fn committed_component_chains_resume_without_reducing_or_rewriting_scopes() {
         evidence_gate_policy: EvidenceGatePolicy::permissive(),
         edge_bytes: 1_000_000,
     };
-    let first =
-        metadata_engine::pipeline::run_metadata_pipeline(&features, &blocking, &out, &config)
-            .unwrap();
+    let first = metadata_engine::pipeline::run_metadata_pipeline_durable(
+        &features, &blocking, &out, &config,
+    )
+    .unwrap();
     std::fs::remove_dir_all(out.join("metadata-summary-1")).unwrap();
 
     let mut events = Vec::new();
-    let resumed = metadata_engine::pipeline::run_metadata_pipeline_with_progress(
+    let resumed = metadata_engine::pipeline::run_metadata_pipeline_with_progress_and_persistence(
         &features,
         &blocking,
         &out,
         &config,
+        metadata_engine::pipeline::MatchPersistence::Durable,
         |event| events.push(event),
     )
     .unwrap();
@@ -1832,9 +1896,10 @@ fn stale_component_identity_rebuilds_only_that_scope() {
         evidence_gate_policy: EvidenceGatePolicy::permissive(),
         edge_bytes: 1_000_000,
     };
-    let first =
-        metadata_engine::pipeline::run_metadata_pipeline(&features, &blocking, &out, &config)
-            .unwrap();
+    let first = metadata_engine::pipeline::run_metadata_pipeline_durable(
+        &features, &blocking, &out, &config,
+    )
+    .unwrap();
     std::fs::remove_dir_all(out.join("metadata-summary-1")).unwrap();
     let ready = out.join("component-snapshots/cross/component-chain.ready");
     let mut manifest: serde_json::Value =
@@ -1843,11 +1908,12 @@ fn stale_component_identity_rebuilds_only_that_scope() {
     std::fs::write(&ready, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
 
     let mut events = Vec::new();
-    let resumed = metadata_engine::pipeline::run_metadata_pipeline_with_progress(
+    let resumed = metadata_engine::pipeline::run_metadata_pipeline_with_progress_and_persistence(
         &features,
         &blocking,
         &out,
         &config,
+        metadata_engine::pipeline::MatchPersistence::Durable,
         |event| events.push(event),
     )
     .unwrap();
@@ -1898,7 +1964,8 @@ fn matching_component_chain_corruption_fails_the_pipeline_closed() {
         evidence_gate_policy: EvidenceGatePolicy::permissive(),
         edge_bytes: 1_000_000,
     };
-    metadata_engine::pipeline::run_metadata_pipeline(&features, &blocking, &out, &config).unwrap();
+    metadata_engine::pipeline::run_metadata_pipeline_durable(&features, &blocking, &out, &config)
+        .unwrap();
     std::fs::remove_dir_all(out.join("metadata-summary-1")).unwrap();
     std::fs::write(
         out.join("component-snapshots/intra/component-roots-000000.u32"),
@@ -1906,9 +1973,10 @@ fn matching_component_chain_corruption_fails_the_pipeline_closed() {
     )
     .unwrap();
 
-    let error =
-        metadata_engine::pipeline::run_metadata_pipeline(&features, &blocking, &out, &config)
-            .unwrap_err();
+    let error = metadata_engine::pipeline::run_metadata_pipeline_durable(
+        &features, &blocking, &out, &config,
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("component snapshot"), "{error}");
     assert!(!out
         .join("metadata-summary-1/metadata-summary.ready")
@@ -1987,14 +2055,16 @@ fn recovered_connectivity_is_rejected_under_a_lower_candidate_cap() {
         evidence_gate_policy: EvidenceGatePolicy::permissive(),
         edge_bytes: 1_000_000,
     };
-    metadata_engine::pipeline::run_metadata_pipeline(&features, &blocking, &out, &config).unwrap();
+    metadata_engine::pipeline::run_metadata_pipeline_durable(&features, &blocking, &out, &config)
+        .unwrap();
     std::fs::remove_dir_all(out.join("component-snapshots")).unwrap();
     std::fs::remove_dir_all(out.join("metadata-summary-1")).unwrap();
     config.max_candidate_pair_visits = 5;
 
-    let error =
-        metadata_engine::pipeline::run_metadata_pipeline(&features, &blocking, &out, &config)
-            .unwrap_err();
+    let error = metadata_engine::pipeline::run_metadata_pipeline_durable(
+        &features, &blocking, &out, &config,
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("candidate_pair_visits"));
 }
 
@@ -2158,7 +2228,7 @@ fn pipeline_reports_monotonic_pair_work_with_exact_terminal_totals() {
     }
     let recovery = events
         .iter()
-        .filter(|event| event.phase == ProgressPhase::BuildRecoveryChain)
+        .filter(|event| event.phase == ProgressPhase::FinalizeComponents)
         .collect::<Vec<_>>();
     assert!(!recovery.is_empty());
     assert!(recovery.iter().all(|event| event.total.is_some()));
@@ -2185,9 +2255,9 @@ fn pipeline_reports_monotonic_pair_work_with_exact_terminal_totals() {
         ProgressPhase::CatalogPairs,
         ProgressPhase::SharedTokenPairs,
         ProgressPhase::FinalizeEdgeCollectors,
-        ProgressPhase::CommitConnectivityRuns,
         ProgressPhase::EdgeDispatch,
         ProgressPhase::ReduceScopes,
+        ProgressPhase::FinalizeComponents,
         ProgressPhase::CommitArtifacts,
     ] {
         let phase_events = events
@@ -2213,15 +2283,14 @@ fn pipeline_reports_monotonic_pair_work_with_exact_terminal_totals() {
         .iter()
         .rposition(|event| event.phase == ProgressPhase::FinalizeEdgeCollectors)
         .unwrap();
-    let commit_index = events
-        .iter()
-        .rposition(|event| event.phase == ProgressPhase::CommitConnectivityRuns)
-        .unwrap();
     let dispatch_index = events
         .iter()
         .rposition(|event| event.phase == ProgressPhase::EdgeDispatch)
         .unwrap();
-    assert!(finalizer_index < commit_index && commit_index < dispatch_index);
+    assert!(finalizer_index < dispatch_index);
+    assert!(events
+        .iter()
+        .all(|event| event.phase != ProgressPhase::CommitConnectivityRuns));
 }
 
 #[test]
@@ -2352,7 +2421,7 @@ fn catalog_progress_counts_routing_pairs_not_conditional_contract_products() {
 fn zero_edge_run_still_commits_and_registers_empty_connectivity() {
     let (dir, features, blocking) = snapshot_fixture();
     let out = dir.path().join("zero-edge-match");
-    let result = metadata_engine::pipeline::run_metadata_pipeline(
+    let result = metadata_engine::pipeline::run_metadata_pipeline_durable(
         &features,
         &blocking,
         &out,
