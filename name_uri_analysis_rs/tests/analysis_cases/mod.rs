@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use duckdb::Connection;
 use name_uri_analysis_rs::analysis::{
     finalize_analysis_phases, run_analysis, run_analysis_phase, AnalysisOptions, AnalysisPhase,
-    AnalysisReport, MetadataRecallMode,
+    AnalysisReport,
 };
 
 fn write_parquet(path: &Path, values_sql: &str) {
@@ -56,7 +56,6 @@ fn isolated_process_phases_match_the_in_process_report() {
         parquet_inputs: vec![parquet.clone()],
         output_dir: temp.path().join("phase-output"),
         name_threshold: 95.0,
-        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -66,20 +65,15 @@ fn isolated_process_phases_match_the_in_process_report() {
     };
     for phase in [
         AnalysisPhase::Prepare,
+        AnalysisPhase::MetadataEncode,
         AnalysisPhase::Name,
-        AnalysisPhase::Metadata,
+        AnalysisPhase::MetadataMatch,
     ] {
         run_analysis_phase(&phase_options, phase, &phase_work).unwrap();
     }
-    let metadata_artifacts = phase_work.join("artifacts/metadata");
-    assert!(
-        !metadata_artifacts.exists()
-            || std::fs::read_dir(&metadata_artifacts)
-                .unwrap()
-                .next()
-                .is_none(),
-        "small metadata index should remain in memory without mmap artifacts"
-    );
+    assert!(phase_work
+        .join("artifacts/metadata/match-1/metadata-summary-1/metadata-summary.ready")
+        .is_file());
     let phased = finalize_analysis_phases(&phase_options, &phase_work).unwrap();
 
     let mut in_process_options = phase_options.clone();
@@ -139,7 +133,6 @@ fn metadata_phase_rejects_state_above_the_hard_analysis_budget() {
         parquet_inputs: vec![parquet],
         output_dir: temp.path().join("output"),
         name_threshold: 95.0,
-        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("1B".into()),
@@ -148,11 +141,12 @@ fn metadata_phase_rejects_state_above_the_hard_analysis_budget() {
         progress: false,
     };
     run_analysis_phase(&options, AnalysisPhase::Prepare, &work).unwrap();
+    run_analysis_phase(&options, AnalysisPhase::MetadataEncode, &work).unwrap();
 
-    let error = run_analysis_phase(&options, AnalysisPhase::Metadata, &work).unwrap_err();
+    let error = run_analysis_phase(&options, AnalysisPhase::MetadataMatch, &work).unwrap_err();
 
     let message = error.to_string();
-    assert!(message.contains("exceeding analysis budget"), "{message}");
+    assert!(message.contains("memory budget exceeded"), "{message}");
 }
 
 #[test]
@@ -183,7 +177,6 @@ fn completed_name_result_does_not_depend_on_destructive_cleanup() {
         parquet_inputs: vec![temp.path().join("unused.parquet")],
         output_dir: temp.path().join("output"),
         name_threshold: 95.0,
-        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 1,
         memory_limit: "64MiB".into(),
         analysis_memory_limit: Some("64MiB".into()),
@@ -311,7 +304,6 @@ fn analyzes_with_duckdb_memory_database() {
         parquet_inputs: vec![parquet],
         output_dir: temp.path().join("out"),
         name_threshold: 95.0,
-        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -330,7 +322,7 @@ fn analyzes_with_duckdb_memory_database() {
 }
 
 #[test]
-fn duckdb_database_path_is_used_for_persistent_work_mode() {
+fn compatibility_entry_keeps_staging_out_of_the_caller_database_path() {
     let temp = tempfile::tempdir().unwrap();
     let parquet = temp.path().join("sample.parquet");
     let db = temp.path().join("analysis.duckdb");
@@ -348,7 +340,6 @@ fn duckdb_database_path_is_used_for_persistent_work_mode() {
         parquet_inputs: vec![parquet],
         output_dir: temp.path().join("out"),
         name_threshold: 95.0,
-        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -358,57 +349,15 @@ fn duckdb_database_path_is_used_for_persistent_work_mode() {
     })
     .unwrap();
 
-    assert!(db.exists());
-}
-
-#[test]
-fn in_process_analysis_cleans_prepared_tables() {
-    let temp = tempfile::tempdir().unwrap();
-    let parquet = temp.path().join("sample.parquet");
-    let db = temp.path().join("analysis.duckdb");
-    write_parquet(
-        &parquet,
-        r#"
-            VALUES
-            ('ethereum', '0xaaa', '1', 'shared', 'img1', 'Azuki', 'azuki'),
-            ('ethereum', '0xbbb', '1', 'shared', 'img2', 'Azuki', 'azuki')
-        "#,
-    );
-
-    run_analysis(AnalysisOptions {
-        database_path: db.clone(),
-        parquet_inputs: vec![parquet],
-        output_dir: temp.path().join("out"),
-        name_threshold: 95.0,
-        metadata_recall_mode: MetadataRecallMode::Conservative,
-        threads: 2,
-        memory_limit: "256MB".into(),
-        analysis_memory_limit: Some("64MB".into()),
-        duckdb_memory_limit: "256MB".into(),
-        temp_directory: None,
-        progress: false,
-    })
-    .unwrap();
-
-    let conn = Connection::open(db).unwrap();
-    for table in [
-        "analysis_rows",
-        "selected_chains",
-        "uri_key_contracts",
-        "uri_duplicate_key_stats",
-        "uri_contract_flags",
-        "analysis_contracts",
-        "name_atoms",
-    ] {
-        let count: i64 = conn
-            .query_row(
-                "SELECT count(*)::BIGINT FROM information_schema.tables WHERE table_name = ?",
-                [table],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 0, "unexpected persisted table {table}");
-    }
+    assert!(!db.exists());
+    assert!(temp.path().join("out/summary.manifest.json").is_file());
+    assert!(!std::fs::read_dir(temp.path()).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("metadata-work")
+    }));
 }
 
 #[test]
@@ -435,7 +384,6 @@ fn analyzes_uri_and_name_without_symbol_rows() {
         parquet_inputs: vec![parquet],
         output_dir: out,
         name_threshold: 95.0,
-        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -507,7 +455,6 @@ fn analyzes_uri_rows_when_only_one_uri_field_is_present() {
         parquet_inputs: vec![parquet],
         output_dir: temp.path().join("out"),
         name_threshold: 95.0,
-        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -556,7 +503,6 @@ fn uri_any_and_cross_contract_counts_stay_distinct() {
         parquet_inputs: vec![parquet],
         output_dir: temp.path().join("out"),
         name_threshold: 95.0,
-        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -603,7 +549,6 @@ fn cross_chain_uri_rows_emit_summary_and_isolated_pair_matrix() {
         parquet_inputs: vec![parquet],
         output_dir: temp.path().join("out"),
         name_threshold: 95.0,
-        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -642,7 +587,6 @@ fn compares_names_across_former_block_boundaries() {
         parquet_inputs: vec![parquet],
         output_dir: temp.path().join("out"),
         name_threshold: 95.0,
-        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -681,7 +625,6 @@ fn repeated_nfts_in_one_contract_count_as_one_name_contract() {
         parquet_inputs: vec![parquet],
         output_dir: temp.path().join("out"),
         name_threshold: 95.0,
-        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -727,7 +670,6 @@ fn contract_name_aggregation_keeps_empty_name_nfts_in_totals() {
         parquet_inputs: vec![parquet],
         output_dir: temp.path().join("out"),
         name_threshold: 95.0,
-        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -772,7 +714,6 @@ fn only_parquet_chains_are_analyzed_and_single_chain_skips_cross_chain() {
         parquet_inputs: vec![ethereum],
         output_dir: temp.path().join("out"),
         name_threshold: 95.0,
-        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -811,7 +752,6 @@ fn chain_matrix_is_computed_per_chain_pair_without_third_chain_contamination() {
         parquet_inputs: vec![parquet],
         output_dir: temp.path().join("out"),
         name_threshold: 95.0,
-        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -862,7 +802,6 @@ fn metadata_analysis_uses_deterministic_representatives_for_correctness() {
         parquet_inputs: vec![parquet],
         output_dir: temp.path().join("out"),
         name_threshold: 95.0,
-        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -925,7 +864,6 @@ fn four_chain_analysis_uses_chain_aware_contract_identity() {
         parquet_inputs: vec![parquet],
         output_dir: temp.path().join("out"),
         name_threshold: 95.0,
-        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -979,7 +917,6 @@ fn metadata_analysis_uses_lowest_token_metadata_per_contract() {
         parquet_inputs: vec![parquet],
         output_dir: temp.path().join("out"),
         name_threshold: 95.0,
-        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -1019,7 +956,6 @@ fn metadata_analysis_skips_empty_lowest_token_metadata_representative() {
         parquet_inputs: vec![parquet],
         output_dir: temp.path().join("out"),
         name_threshold: 95.0,
-        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -1066,7 +1002,6 @@ fn metadata_analysis_fallback_picks_lowest_token_id_survivor_deterministically()
         parquet_inputs: vec![parquet],
         output_dir: temp.path().join("out"),
         name_threshold: 95.0,
-        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -1103,7 +1038,6 @@ fn metadata_analysis_does_not_match_same_schema_with_different_content_values() 
         parquet_inputs: vec![parquet],
         output_dir: temp.path().join("out"),
         name_threshold: 95.0,
-        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -1144,7 +1078,6 @@ fn metadata_analysis_accepts_any_matching_overlapping_token_id() {
         parquet_inputs: vec![parquet],
         output_dir: temp.path().join("out"),
         name_threshold: 95.0,
-        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -1160,6 +1093,45 @@ fn metadata_analysis_accepts_any_matching_overlapping_token_id() {
             && row.primary_chain == "ethereum"
             && row.duplicate_contract_count == 2
             && row.duplicate_nft_count == 4
+    }));
+}
+
+#[test]
+fn metadata_analysis_skips_empty_lowest_shared_token_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let parquet = temp.path().join("sample.parquet");
+    write_parquet_with_metadata(
+        &parquet,
+        r#"
+            VALUES
+            ('ethereum', '0xaaa', '0', 'u0a', 'i0a', 'A', 'a', '{"description":"alpha only"}'),
+            ('ethereum', '0xaaa', '1', 'u1a', 'i1a', 'A', 'a', '{}'),
+            ('ethereum', '0xaaa', '1', 'u1b', 'i1b', 'A', 'a', '{"description":"shared gold"}'),
+            ('ethereum', '0xbbb', '0', 'u0b', 'i0b', 'B', 'b', '{"description":"beta only"}'),
+            ('ethereum', '0xbbb', '1', 'u1c', 'i1c', 'B', 'b', '{"description":"shared gold"}')
+        "#,
+    );
+
+    let report = run_analysis(AnalysisOptions {
+        database_path: temp.path().join("analysis.duckdb"),
+        parquet_inputs: vec![parquet],
+        output_dir: temp.path().join("out"),
+        name_threshold: 95.0,
+        threads: 2,
+        memory_limit: "256MB".into(),
+        analysis_memory_limit: Some("64MB".into()),
+        duckdb_memory_limit: "256MB".into(),
+        temp_directory: None,
+        progress: false,
+    })
+    .unwrap();
+
+    assert!(report.summary_rows.iter().any(|row| {
+        row.field_name == "metadata"
+            && row.scope == "intra_chain"
+            && row.primary_chain == "ethereum"
+            && row.duplicate_contract_count == 2
+            && row.duplicate_nft_count == 5
     }));
 }
 
@@ -1181,7 +1153,6 @@ fn metadata_analysis_falls_back_to_representatives_without_common_token_id() {
         parquet_inputs: vec![parquet],
         output_dir: temp.path().join("out"),
         name_threshold: 95.0,
-        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -1222,7 +1193,6 @@ fn summary_rows_use_chain_totals_as_common_denominators() {
         parquet_inputs: vec![parquet],
         output_dir: temp.path().join("out"),
         name_threshold: 95.0,
-        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -1276,7 +1246,6 @@ fn metadata_analysis_uses_template_recall_before_content_verification() {
         parquet_inputs: vec![parquet],
         output_dir: temp.path().join("out"),
         name_threshold: 95.0,
-        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -1315,7 +1284,6 @@ fn metadata_analysis_uses_metadata_doc_when_metadata_json_is_empty() {
         parquet_inputs: vec![parquet],
         output_dir: temp.path().join("out"),
         name_threshold: 95.0,
-        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),
@@ -1374,7 +1342,6 @@ fn three_scope_reporting_keeps_pools_isolated_and_uses_primary_chain_totals() {
         parquet_inputs: vec![parquet],
         output_dir: temp.path().join("out"),
         name_threshold: 95.0,
-        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 2,
         memory_limit: "256MB".into(),
         analysis_memory_limit: Some("64MB".into()),

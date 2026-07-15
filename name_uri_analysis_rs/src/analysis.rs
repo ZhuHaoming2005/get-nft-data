@@ -17,6 +17,7 @@ mod metadata;
 mod name;
 mod name_scoring;
 mod output;
+mod production;
 mod progress;
 mod types;
 mod uri;
@@ -26,21 +27,23 @@ use chain_matrix::*;
 use components::*;
 use duckdb_prep::*;
 use memory::*;
-#[cfg(test)]
-use metadata::metadata_raw_rows_sql;
-use metadata::{run_metadata_analysis, MetadataAnalysisSpec, MAX_METADATA_BYTES_FOR_DEDUP};
+use metadata::MAX_METADATA_BYTES_FOR_DEDUP;
 use name::*;
 use name_scoring::*;
 use output::*;
 pub use output::{parquet_sql_literal, validate_output_generation, SUMMARY_MANIFEST_FILE_NAME};
+pub use production::refresh_metadata_production_readiness;
+use production::{publish_metadata_production_readiness, write_metadata_production_readiness};
 use progress::*;
 use types::*;
-pub use types::{AnalysisError, AnalysisOptions, AnalysisReport, MetadataRecallMode, SummaryRow};
+pub use types::{AnalysisError, AnalysisOptions, AnalysisReport, SummaryRow};
 use uri::*;
 
 const NAME_DUCKDB_MEMORY_CAP: &str = "8GiB";
-const METADATA_DUCKDB_MEMORY_CAP: &str = "32GiB";
 pub const DUCKDB_THREAD_CAP: usize = 64;
+/// Controller-to-Match child contract for an advisory, schema-bound ETA model.
+/// Invalid or absent values are ignored; ETA history must never affect results.
+pub const MATCH_ETA_FORECAST_ENV: &str = "NAME_URI_ANALYSIS_MATCH_ETA_FORECAST_V1";
 
 fn open_analysis_connection(path: &Path) -> Result<Connection, AnalysisError> {
     if path != Path::new(":memory:") {
@@ -51,19 +54,21 @@ fn open_analysis_connection(path: &Path) -> Result<Connection, AnalysisError> {
     Ok(Connection::open(path)?)
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnalysisPhase {
     Prepare,
+    MetadataEncode,
     Name,
-    Metadata,
+    MetadataMatch,
 }
 
 impl AnalysisPhase {
     fn partial_file_name(self) -> &'static str {
         match self {
             Self::Prepare => "uri-summary.json",
+            Self::MetadataEncode => "metadata-encode-summary.json",
             Self::Name => "name-summary.json",
-            Self::Metadata => "metadata-summary.json",
+            Self::MetadataMatch => "metadata-summary.json",
         }
     }
 }
@@ -78,6 +83,11 @@ pub fn run_analysis_phase(
     work_directory: &Path,
 ) -> Result<(), AnalysisError> {
     validate_options(options)?;
+    // MetadataEncode reads Prepare's DuckDB state without mutating Prepare/Name
+    // tables. Match remains the sole owner of production metadata summary rows.
+    if matches!(phase, AnalysisPhase::MetadataEncode) {
+        return metadata::run_metadata_encode(options, work_directory);
+    }
     let diagnostics = diagnostics_enabled();
     if diagnostics {
         record_diagnostic_result(
@@ -88,85 +98,72 @@ pub fn run_analysis_phase(
     let pipeline_stage = PipelineStage::from(phase);
     let progress = ProgressTracker::for_pipeline_stage(pipeline_stage, options.progress);
     let result: Result<(), AnalysisError> = (|| {
-        let conn = open_analysis_connection(&options.database_path)?;
-        configure_duckdb(&conn, options)?;
-        match phase {
-            AnalysisPhase::Prepare => {}
-            AnalysisPhase::Name => {
-                set_phase_duckdb_memory_limit(&conn, options, NAME_DUCKDB_MEMORY_CAP)?
-            }
-            AnalysisPhase::Metadata => {
-                set_phase_duckdb_memory_limit(&conn, options, METADATA_DUCKDB_MEMORY_CAP)?
-            }
+        if matches!(phase, AnalysisPhase::MetadataMatch) && !metadata_inputs_ready(work_directory) {
+            return Err(AnalysisError::InvalidData(
+                "metadata match requires completed encode and blocking artifacts".into(),
+            ));
         }
-        if matches!(phase, AnalysisPhase::Prepare) {
-            if diagnostics {
-                record_diagnostic_result(
-                    "DuckDB prepare profiling",
-                    enable_prepare_profiling(&conn, &work_directory.join("metrics/duckdb-prepare")),
-                );
+        let rows = if matches!(phase, AnalysisPhase::MetadataMatch) {
+            // Match owns only immutable encoded artifacts. Keeping this branch
+            // ahead of connection setup prevents accidental DuckDB coupling.
+            run_metadata_pipeline(options, work_directory, &progress)?
+        } else {
+            let conn = open_analysis_connection(&options.database_path)?;
+            configure_duckdb(&conn, options)?;
+            if matches!(phase, AnalysisPhase::Name) {
+                set_phase_duckdb_memory_limit(&conn, options, NAME_DUCKDB_MEMORY_CAP)?;
             }
-            conn.execute_batch("BEGIN TRANSACTION")?;
-        }
+            if matches!(phase, AnalysisPhase::Prepare) {
+                if diagnostics {
+                    record_diagnostic_result(
+                        "DuckDB prepare profiling",
+                        enable_prepare_profiling(
+                            &conn,
+                            &work_directory.join("metrics/duckdb-prepare"),
+                        ),
+                    );
+                }
+                conn.execute_batch("BEGIN TRANSACTION")?;
+            }
 
-        let rows = match phase {
-            AnalysisPhase::Prepare => {
-                let chains = prepare_base_tables(&conn, options, &progress)?;
-                let totals = load_chain_totals(&conn)?;
-                let rows = run_uri_analysis(&conn, &chains, &totals, &progress)?;
-                drop_prepare_only_uri_tables(&conn)?;
-                metadata::prepare_metadata_compact_tables(&conn, &progress)?;
-                rows
-            }
-            AnalysisPhase::Name => {
-                let chains = load_selected_chains(&conn)?;
-                let totals = load_chain_totals(&conn)?;
-                let result = run_name_analysis(
-                    &conn,
-                    name_analysis_spec(options, &chains, &totals),
-                    &progress,
-                )?;
-                if diagnostics {
-                    record_diagnostic_result(
-                        "name algorithm metrics",
-                        write_json_atomically(
-                            &result.metrics,
-                            &work_directory.join("metrics/name-algorithm.json"),
-                        )
-                        .map_err(AnalysisError::from),
-                    );
+            let rows = match phase {
+                AnalysisPhase::Prepare => {
+                    let chains = prepare_base_tables(&conn, options, &progress)?;
+                    let totals = load_chain_totals(&conn)?;
+                    let rows = run_uri_analysis(&conn, &chains, &totals, &progress)?;
+                    drop_prepare_only_uri_tables(&conn)?;
+                    metadata::prepare_metadata_compact_tables(&conn, &progress)?;
+                    rows
                 }
-                result.rows
-            }
-            AnalysisPhase::Metadata => {
-                let chains = load_selected_chains(&conn)?;
-                let totals = load_chain_totals(&conn)?;
-                let result = run_metadata_analysis(
-                    &conn,
-                    &chains,
-                    &totals,
-                    metadata_analysis_spec(
-                        options,
-                        Some(&work_directory.join("artifacts/metadata")),
-                    ),
-                    &progress,
-                )?;
-                if diagnostics {
-                    record_diagnostic_result(
-                        "metadata algorithm metrics",
-                        write_json_atomically(
-                            &result.metrics,
-                            &work_directory.join("metrics/metadata-algorithm.json"),
-                        )
-                        .map_err(AnalysisError::from),
-                    );
+                AnalysisPhase::Name => {
+                    let chains = load_selected_chains(&conn)?;
+                    let totals = load_chain_totals(&conn)?;
+                    let result = run_name_analysis(
+                        &conn,
+                        name_analysis_spec(options, &chains, &totals),
+                        &progress,
+                    )?;
+                    if diagnostics {
+                        record_diagnostic_result(
+                            "name algorithm metrics",
+                            write_json_atomically(
+                                &result.metrics,
+                                &work_directory.join("metrics/name-algorithm.json"),
+                            )
+                            .map_err(AnalysisError::from),
+                        );
+                    }
+                    result.rows
                 }
-                result.rows
+                AnalysisPhase::MetadataEncode | AnalysisPhase::MetadataMatch => {
+                    unreachable!("metadata phases are handled before DuckDB setup")
+                }
+            };
+            if matches!(phase, AnalysisPhase::Prepare) {
+                conn.execute_batch("COMMIT")?;
             }
+            rows
         };
-        if matches!(phase, AnalysisPhase::Prepare) {
-            conn.execute_batch("COMMIT")?;
-        }
 
         let partial_dir = work_directory.join("partial");
         fs::create_dir_all(&partial_dir)?;
@@ -186,6 +183,114 @@ pub fn run_analysis_phase(
         progress.fail(error.to_string());
     }
     result
+}
+
+fn metadata_inputs_ready(work_directory: &Path) -> bool {
+    let layout = metadata_engine::artifacts::MetadataArtifactLayout::new(work_directory);
+    layout.encode_dir().join("features.ready").is_file()
+        && layout.blocking_dir().join("blocking.ready").is_file()
+}
+
+fn run_metadata_pipeline(
+    options: &AnalysisOptions,
+    work_directory: &Path,
+    progress: &ProgressTracker,
+) -> Result<Vec<SummaryRow>, AnalysisError> {
+    use metadata_engine::resource::{GIB, MATCH_HARD_TOP};
+    let layout = metadata_engine::artifacts::MetadataArtifactLayout::new(work_directory);
+    let features = layout.encode_dir();
+    let blocking = layout.blocking_dir();
+    let out = metadata_engine::pipeline::default_output_dir(work_directory);
+    let analysis_bytes = name_analysis_memory_plan(
+        &options.memory_limit,
+        options.analysis_memory_limit.as_deref(),
+        0,
+    )?
+    .analysis_bytes as u64;
+    let host_total_memory = physical_memory_bytes();
+    let memory_hard_top =
+        engine_memory_hard_top_bytes(analysis_bytes as usize, MATCH_HARD_TOP, host_total_memory)?;
+    // The engine shrinks this ceiling to the exact per-scope forest upper
+    // bound. A larger production ceiling avoids the old 4 GiB artificial
+    // failure mode while keeping at least fifteen sixteenths of the admitted
+    // Match memory available for snapshots, scorers and reduction scratch.
+    let edge_bytes = (memory_hard_top / 16).clamp(64 * 1024, 32 * GIB);
+    let config = metadata_engine::pipeline::MetadataPipelineConfig {
+        storage_work_directory: work_directory.to_path_buf(),
+        memory_hard_top,
+        host_total_memory,
+        threads: options.threads,
+        max_catalog_jobs: 1_000_000,
+        max_candidate_pair_visits: metadata_engine::pipeline::DEFAULT_MAX_CANDIDATE_PAIR_VISITS,
+        exact_sample_lefts: metadata_engine::pipeline::DEFAULT_EXACT_SAMPLE_LEFTS,
+        exact_pair_work: metadata_engine::pipeline::DEFAULT_EXACT_PAIR_WORK,
+        evidence_gate_policy: metadata_engine::evidence::EvidenceGatePolicy::production(),
+        edge_bytes,
+    };
+    let result = metadata_engine::pipeline::run_metadata_pipeline_with_progress(
+        &features,
+        &blocking,
+        &out,
+        &config,
+        |event| progress.observe_engine_event(event),
+    )
+    .map_err(|err| AnalysisError::InvalidData(format!("metadata pipeline: {err}")))?;
+    record_diagnostic_result(
+        "metadata production advisory",
+        write_metadata_production_readiness(work_directory, &result),
+    );
+    complete_metadata_payload_independence(&features, work_directory)?;
+    let rows = result
+        .summary_rows
+        .into_iter()
+        .map(|row| SummaryRow {
+            field_name: "metadata".into(),
+            scope: row.scope,
+            primary_chain: row.primary_chain,
+            secondary_chain: row.secondary_chain,
+            threshold: Some(metadata_engine::scoring::METADATA_THRESHOLD),
+            match_mode: "template_recall_hybrid_verify".into(),
+            metric: "duplicate_group".into(),
+            total_contracts: row.total_contracts,
+            total_nfts: row.total_nfts,
+            group_count: row.group_count,
+            duplicate_contract_count: row.duplicate_contract_count,
+            duplicate_nft_count: row.duplicate_nft_count,
+            duplicate_contract_ratio: pct(row.duplicate_contract_count, row.total_contracts),
+            duplicate_nft_ratio: pct(row.duplicate_nft_count, row.total_nfts),
+            group_size_ge_2_count: row.group_size_ge_2_count,
+            group_size_gt_2_count: row.group_size_gt_2_count,
+        })
+        .collect();
+    Ok(rows)
+}
+
+fn complete_metadata_payload_independence(
+    features: &Path,
+    work_directory: &Path,
+) -> Result<(), AnalysisError> {
+    let payload_cas = features.join("payload_blobs");
+    if !payload_cas.exists() {
+        // A completed Match may be rerun after its transient CAS has already
+        // been collected (for example after a Match-only revision bump).
+        return Ok(());
+    }
+    let payload_cas = payload_cas.canonicalize()?;
+    let mut storage = metadata_engine::storage::StorageBroker::open(work_directory)
+        .map_err(|err| AnalysisError::InvalidData(format!("metadata storage: {err}")))?;
+    storage
+        .declare_match_independence(&payload_cas)
+        .and_then(|_| storage.release_pin(&payload_cas, "metadata_encode_complete"))
+        .and_then(|_| {
+            storage.mark_evictable(&payload_cas, "metadata snapshot is payload independent")
+        })
+        .and_then(|_| {
+            storage.commit_evict(&metadata_engine::storage::EvictionPlan {
+                paths: vec![payload_cas],
+            })
+        })
+        .map_err(|err| AnalysisError::InvalidData(format!("metadata storage: {err}")))?;
+    Ok(())
 }
 
 fn diagnostics_enabled() -> bool {
@@ -252,13 +357,15 @@ struct PhaseReady<'a> {
     partial_file: &'a str,
     size: u64,
     sha256: String,
+    artifacts: Vec<serde_json::Value>,
 }
 
 fn write_phase_ready(work_directory: &Path, phase: AnalysisPhase) -> Result<(), AnalysisError> {
     let phase_name = match phase {
         AnalysisPhase::Prepare => "prepare",
+        AnalysisPhase::MetadataEncode => "metadata-encode",
         AnalysisPhase::Name => "name",
-        AnalysisPhase::Metadata => "metadata",
+        AnalysisPhase::MetadataMatch => "metadata-match",
     };
     let partial_file = phase.partial_file_name();
     let partial_path = work_directory.join("partial").join(partial_file);
@@ -268,6 +375,7 @@ fn write_phase_ready(work_directory: &Path, phase: AnalysisPhase) -> Result<(), 
         partial_file,
         size,
         sha256,
+        artifacts: Vec::new(),
     };
     let directory = work_directory.join("checkpoints");
     fs::create_dir_all(&directory)?;
@@ -284,10 +392,12 @@ pub fn finalize_analysis_phases(
         progress.start_stage("finalizing outputs", 5);
         fs::create_dir_all(&options.output_dir)?;
         let mut summary_rows = Vec::new();
+        // Encode owns artifacts only; production summary comes from Prepare,
+        // Name, and Match.
         for phase in [
             AnalysisPhase::Prepare,
             AnalysisPhase::Name,
-            AnalysisPhase::Metadata,
+            AnalysisPhase::MetadataMatch,
         ] {
             let bytes = fs::read(
                 work_directory
@@ -305,6 +415,10 @@ pub fn finalize_analysis_phases(
         progress.step_stage("sorted summary rows");
         let report = AnalysisReport { summary_rows };
         write_outputs(&report, &options.output_dir)?;
+        record_diagnostic_result(
+            "metadata production advisory",
+            publish_metadata_production_readiness(work_directory, &options.output_dir),
+        );
         progress.step_stage("wrote and verified output generation");
         progress.finish_stage("outputs finalized");
         progress.finish_pipeline_stage("finalize outputs complete");
@@ -343,21 +457,6 @@ fn name_analysis_spec<'a>(
         threads: options.threads,
         memory_limit: &options.memory_limit,
         analysis_memory_limit: options.analysis_memory_limit.as_deref(),
-    }
-}
-
-fn metadata_analysis_spec<'a>(
-    options: &'a AnalysisOptions,
-    artifact_directory: Option<&'a Path>,
-) -> MetadataAnalysisSpec<'a> {
-    MetadataAnalysisSpec {
-        threads: options.threads,
-        recall_mode: options.metadata_recall_mode,
-        memory_limit: options
-            .analysis_memory_limit
-            .as_deref()
-            .unwrap_or(&options.memory_limit),
-        artifact_directory,
     }
 }
 
@@ -403,86 +502,69 @@ fn sort_summary_rows(summary_rows: &mut [SummaryRow]) {
 
 pub fn run_analysis(options: AnalysisOptions) -> Result<AnalysisReport, AnalysisError> {
     validate_options(&options)?;
-
     fs::create_dir_all(&options.output_dir)?;
-
-    let progress = ProgressTracker::for_pipeline_stage(PipelineStage::Prepare, options.progress);
-    let result: Result<AnalysisReport, AnalysisError> = (|| {
-        progress.start_stage("configuring DuckDB", 1);
-        let conn = open_analysis_connection(&options.database_path)?;
-        configure_duckdb(&conn, &options)?;
-        progress.step_stage("DuckDB configured");
-        progress.finish_stage("DuckDB configured");
-        let selected_chains = prepare_base_tables(&conn, &options, &progress)?;
-        let chain_totals = load_chain_totals(&conn)?;
-
-        let mut summary_rows = Vec::new();
-        summary_rows.extend(run_uri_analysis(
-            &conn,
-            &selected_chains,
-            &chain_totals,
-            &progress,
-        )?);
-        drop_prepare_only_uri_tables(&conn)?;
-        metadata::prepare_metadata_compact_tables(&conn, &progress)?;
-        progress.finish_pipeline_stage("prepare + URI complete");
-        progress.set_pipeline_stage(PipelineStage::Name);
-        set_phase_duckdb_memory_limit(&conn, &options, NAME_DUCKDB_MEMORY_CAP)?;
-        summary_rows.extend(
-            run_name_analysis(
-                &conn,
-                name_analysis_spec(&options, &selected_chains, &chain_totals),
-                &progress,
-            )?
-            .rows,
-        );
-        progress.finish_pipeline_stage("name complete");
-        progress.set_pipeline_stage(PipelineStage::Metadata);
-        set_phase_duckdb_memory_limit(&conn, &options, METADATA_DUCKDB_MEMORY_CAP)?;
-        summary_rows.extend(
-            run_metadata_analysis(
-                &conn,
-                &selected_chains,
-                &chain_totals,
-                metadata_analysis_spec(&options, None),
-                &progress,
-            )?
-            .rows,
-        );
-        progress.finish_pipeline_stage("metadata complete");
-
-        // `run_analysis` remains the in-process library compatibility path. Its
-        // prepared state is never a public cache, so do not leave large staging
-        // tables behind in a caller-supplied database.
-        conn.execute_batch(
-            "DROP TABLE IF EXISTS core_rows;
-         DROP TABLE IF EXISTS contract_dim;
-         DROP TABLE IF EXISTS uri_rows;
-         DROP TABLE IF EXISTS metadata_rows;
-         DROP TABLE IF EXISTS metadata_contract_token_rows;
-         DROP TABLE IF EXISTS metadata_token_stats;
-         DROP TABLE IF EXISTS selected_chains;
-         DROP TABLE IF EXISTS analysis_contracts;
-         DROP TABLE IF EXISTS name_atoms;
-         CHECKPOINT;",
-        )?;
-
-        sort_summary_rows(&mut summary_rows);
-
-        let report = AnalysisReport { summary_rows };
-        progress.set_pipeline_stage(PipelineStage::Finalize);
-        progress.start_stage("writing outputs", 1);
-        write_outputs(&report, &options.output_dir)?;
-        progress.step_stage("outputs written");
-        progress.finish_stage("outputs written");
-        progress.finish_pipeline_stage("finalize outputs complete");
-        progress.finish();
-        Ok(report)
-    })();
-    if let Err(error) = &result {
-        progress.fail(error.to_string());
+    let work = CompatibilityWorkDirectory::create(&options.output_dir)?;
+    let mut phase_options = options;
+    phase_options.database_path = work.path().join("stage.duckdb");
+    phase_options.temp_directory = Some(work.path().join("duckdb-temp"));
+    for phase in [
+        AnalysisPhase::Prepare,
+        AnalysisPhase::MetadataEncode,
+        AnalysisPhase::Name,
+        AnalysisPhase::MetadataMatch,
+    ] {
+        run_analysis_phase(&phase_options, phase, work.path())?;
     }
-    result
+    finalize_analysis_phases(&phase_options, work.path())
+}
+
+struct CompatibilityWorkDirectory(PathBuf);
+
+impl CompatibilityWorkDirectory {
+    fn create(output_directory: &Path) -> Result<Self, AnalysisError> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NONCE: AtomicU64 = AtomicU64::new(0);
+
+        let parent = output_directory
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        let stem = output_directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("name-uri-analysis");
+        for _ in 0..1_000 {
+            let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
+            let path = parent.join(format!(
+                ".{stem}.metadata-work-{}-{nonce}",
+                std::process::id()
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(AnalysisError::InvalidData(
+            "could not allocate a unique metadata compatibility work directory".into(),
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for CompatibilityWorkDirectory {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.0) {
+            eprintln!(
+                "warning: could not remove compatibility work directory {}: {error}",
+                self.0.display()
+            );
+        }
+    }
 }
 
 #[cfg(test)]

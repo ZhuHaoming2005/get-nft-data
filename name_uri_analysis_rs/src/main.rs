@@ -10,8 +10,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
 use name_uri_analysis_rs::analysis::{
-    finalize_analysis_phases, validate_output_generation, validate_static_memory_options,
-    AnalysisOptions, AnalysisPhase, MetadataRecallMode, SUMMARY_MANIFEST_FILE_NAME,
+    finalize_analysis_phases, refresh_metadata_production_readiness, validate_output_generation,
+    validate_static_memory_options, AnalysisOptions, AnalysisPhase, SUMMARY_MANIFEST_FILE_NAME,
 };
 
 use controller_child::{remove_work_directory_after_success, run_child_phase, run_internal_phase};
@@ -38,8 +38,9 @@ use controller_layout::path_is_same_or_descendant;
 use controller_locks::{validate_phase_generation, watch_parent_liveness, PhaseLock};
 #[cfg(test)]
 use controller_manifest::{
-    manifests_have_same_inputs_and_options, record_phase_metric, write_metric_atomically,
-    PhaseMetric, PhaseReady,
+    load_match_eta_forecast, manifests_have_same_inputs_and_options, match_observation_key,
+    record_match_observation, record_phase_metric, write_metric_atomically, MatchExecutionKind,
+    MatchObservation, MatchOutcome, MatchSampledResources, PhaseMetric, PhaseReady,
 };
 #[cfg(test)]
 use duckdb::Connection;
@@ -71,27 +72,69 @@ fn resolve_worker_threads(requested: usize) -> usize {
     requested.min(available).max(1)
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum InternalPhase {
     Prepare,
+    #[value(name = "metadata-encode")]
+    MetadataEncode,
     Name,
-    Metadata,
+    #[value(name = "metadata-match")]
+    MetadataMatch,
+}
+
+impl InternalPhase {
+    const fn cli_name(self) -> &'static str {
+        match self {
+            Self::Prepare => "prepare",
+            Self::MetadataEncode => "metadata-encode",
+            Self::Name => "name",
+            Self::MetadataMatch => "metadata-match",
+        }
+    }
 }
 
 impl From<InternalPhase> for AnalysisPhase {
     fn from(value: InternalPhase) -> Self {
         match value {
             InternalPhase::Prepare => Self::Prepare,
+            InternalPhase::MetadataEncode => Self::MetadataEncode,
             InternalPhase::Name => Self::Name,
-            InternalPhase::Metadata => Self::Metadata,
+            InternalPhase::MetadataMatch => Self::MetadataMatch,
         }
     }
+}
+
+/// Serial controller schedule: Prepare unlocks Name and Encode; Encode unlocks
+/// Match; Finalize needs Name + Match. Encode runs before Name so Name stays
+/// independent of encode revision bumps.
+fn scheduled_phases() -> &'static [(InternalPhase, &'static str, &'static str)] {
+    &[
+        (
+            InternalPhase::Prepare,
+            "prepare_complete",
+            "uri-summary.json",
+        ),
+        (
+            InternalPhase::MetadataEncode,
+            "metadata_encode_complete",
+            "metadata-encode-summary.json",
+        ),
+        (InternalPhase::Name, "name_complete", "name-summary.json"),
+        (
+            InternalPhase::MetadataMatch,
+            "metadata_match_complete",
+            "metadata-summary.json",
+        ),
+    ]
 }
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Rust + DuckDB NFT name/URI duplicate analysis")]
 struct Args {
-    #[arg(long = "parquet", required_unless_present = "internal_phase")]
+    #[arg(
+        long = "parquet",
+        required_unless_present_any = ["internal_phase", "refresh_production_readiness"]
+    )]
     parquet_inputs: Vec<PathBuf>,
 
     #[arg(long, default_value = "name_uri_analysis_output")]
@@ -102,9 +145,6 @@ struct Args {
 
     #[arg(long, default_value_t = 95.0)]
     name_threshold: f64,
-
-    #[arg(long, value_enum, default_value_t = MetadataRecallMode::Conservative)]
-    metadata_recall_mode: MetadataRecallMode,
 
     /// Rayon worker ceiling; DuckDB is separately capped at 64 physical-core workers.
     #[arg(long, default_value_t = 128, value_parser = parse_positive_usize)]
@@ -135,6 +175,13 @@ struct Args {
 
     #[arg(
         long,
+        conflicts_with_all = ["parquet_inputs", "internal_phase", "resume"],
+        help = "Recompute the advisory production readiness from output-owned evidence"
+    )]
+    refresh_production_readiness: bool,
+
+    #[arg(
+        long,
         help = "Collect detailed profiling and resource metrics (adds monitoring overhead)"
     )]
     diagnostics: bool,
@@ -154,6 +201,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .as_deref()
             .ok_or("--internal-config is required for internal phases")?;
         return run_internal_phase(config, phase);
+    }
+    if args.refresh_production_readiness {
+        refresh_metadata_production_readiness(&args.output_dir)?;
+        println!(
+            "refreshed metadata production readiness in {}",
+            args.output_dir.display()
+        );
+        return Ok(());
     }
 
     validate_static_memory_options(
@@ -184,7 +239,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         parquet_inputs: canonical_inputs,
         output_dir: output_directory,
         name_threshold: args.name_threshold,
-        metadata_recall_mode: args.metadata_recall_mode,
         threads: effective_threads,
         memory_limit: args.analysis_memory_limit.clone(),
         analysis_memory_limit: Some(args.analysis_memory_limit),
@@ -197,9 +251,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         binary_version: binary_identity()?,
         stage_revisions: StageRevisions::current(),
         inputs,
-        // `selected_chains` is derived once by the prepare phase. Keeping this
-        // legacy manifest field empty avoids a redundant full Parquet column
-        // scan before the actual pipeline starts.
+        // Prepare derives `selected_chains`; the controller avoids a duplicate
+        // Parquet scan by leaving this field empty until then.
         chains: Vec::new(),
         options,
         stages: initial_stage_checkpoints(),
@@ -207,19 +260,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (config_path, mut manifest) =
         prepare_work_directory(&work_directory, expected_manifest, args.resume)?;
 
-    for (phase, stage, partial) in [
-        (
-            InternalPhase::Prepare,
-            "prepare_complete",
-            "uri-summary.json",
-        ),
-        (InternalPhase::Name, "name_complete", "name-summary.json"),
-        (
-            InternalPhase::Metadata,
-            "metadata_complete",
-            "metadata-summary.json",
-        ),
-    ] {
+    for &(phase, stage, partial) in scheduled_phases() {
         if args.resume && checkpoint_is_complete_and_valid(&manifest, stage, &work_directory)? {
             validate_resume_database_for_downstream(&manifest, stage)?;
             continue;
@@ -229,7 +270,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             validate_resume_database_for_downstream(&manifest, stage)?;
             continue;
         }
-        run_child_phase(phase, &config_path, args.diagnostics, &mut phase_lease)?;
+        run_child_phase(
+            phase,
+            &config_path,
+            args.diagnostics,
+            args.resume,
+            &mut phase_lease,
+        )?;
         if !promote_ready_phase(&mut manifest, phase, partial, &work_directory)? {
             return Err(format!("{stage} child exited without a durable ready checkpoint").into());
         }
@@ -238,6 +285,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.resume && checkpoint_is_complete_and_valid(&manifest, "finalized", &work_directory)? {
         validate_output_generation(&manifest.options.output_dir)?;
+        if let Err(error) = refresh_metadata_production_readiness(&manifest.options.output_dir) {
+            eprintln!("warning: could not refresh metadata production advisory: {error}");
+        }
         let report: serde_json::Value =
             serde_json::from_slice(&fs::read(manifest.options.output_dir.join("summary.json"))?)?;
         let row_count = report["summary_rows"]

@@ -184,7 +184,7 @@ fn analysis_contracts_aggregates_only_the_representative_row_id() {
     assert!(sql.contains("metadata_source.file_id"));
     assert!(sql.contains("metadata_source.row_number"));
     assert!(sql.contains("indexed_metadata_sources"));
-    assert!(!sql.contains("row_number() OVER (ORDER BY contract_id)"));
+    assert!(sql.contains("row_number() OVER (ORDER BY contract_id)"));
     assert!(!sql.contains("count(*) FILTER"));
     assert!(!sql.contains("representative.metadata_json"));
     assert!(!sql.contains("JOIN metadata_rows representative"));
@@ -228,19 +228,6 @@ fn output_generation_rejects_a_mixed_summary_pair() {
 
     let error = validate_output_generation(directory.path()).unwrap_err();
     assert!(error.to_string().contains("summary.json"));
-}
-
-#[test]
-fn metadata_raw_rows_read_precomputed_contract_rows() {
-    let sql = metadata_raw_rows_sql();
-
-    assert_eq!(sql.matches("analysis_contracts").count(), 1);
-    assert_eq!(sql.matches("metadata_rows").count(), 1);
-    assert!(sql.contains("rows.source_file = contracts.metadata_source_file"));
-    assert!(sql.contains("rows.source_row_number = contracts.metadata_source_row_number"));
-    assert_eq!(sql.matches("analysis_rows").count(), 0);
-    assert!(!sql.contains("GROUP BY"));
-    assert!(!sql.contains("arg_min("));
 }
 
 #[test]

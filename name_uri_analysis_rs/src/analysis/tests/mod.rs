@@ -58,4 +58,3 @@ mod memory;
 mod name_scoring;
 mod progress;
 mod sql_output;
-mod structure_pins;

@@ -5,6 +5,44 @@ pub(crate) struct MemoryPlan {
     pub(crate) analysis_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EncodeProcessMemoryPlan {
+    pub(crate) envelope_bytes: u64,
+    pub(crate) duckdb_bytes: u64,
+    pub(crate) rust_hard_top_bytes: u64,
+}
+
+pub(crate) fn encode_process_memory_plan(
+    duckdb_memory_limit: &str,
+    rust_user_budget: usize,
+    estimated_rust_resident: u64,
+    host_total: u64,
+) -> Result<EncodeProcessMemoryPlan, AnalysisError> {
+    use metadata_engine::resource::{required_host_headroom, ENCODE_HARD_TOP, GIB};
+
+    let envelope_bytes = host_total.saturating_sub(required_host_headroom(host_total));
+    let configured_duckdb =
+        parse_byte_size(&resolve_duckdb_memory_limit(duckdb_memory_limit)?)? as u64;
+    let desired_rust = estimated_rust_resident
+        .saturating_add(64 * GIB)
+        .clamp(128 * GIB, ENCODE_HARD_TOP)
+        .min(rust_user_budget as u64);
+    if desired_rust == 0 || desired_rust > envelope_bytes {
+        return Err(AnalysisError::InvalidData(
+            "Encode has no resident memory inside the shared process envelope".into(),
+        ));
+    }
+    let duckdb_bytes = configured_duckdb.min(envelope_bytes.saturating_sub(desired_rust));
+    let rust_hard_top_bytes = (rust_user_budget as u64)
+        .min(ENCODE_HARD_TOP)
+        .min(envelope_bytes.saturating_sub(duckdb_bytes));
+    Ok(EncodeProcessMemoryPlan {
+        envelope_bytes,
+        duckdb_bytes,
+        rust_hard_top_bytes,
+    })
+}
+
 pub(crate) fn name_analysis_memory_plan(
     memory_limit: &str,
     analysis_memory_limit: Option<&str>,
@@ -81,6 +119,29 @@ pub(crate) fn auto_memory_budget_bytes() -> usize {
     let mut system = System::new();
     system.refresh_memory();
     system.available_memory() as usize
+}
+
+pub(crate) fn physical_memory_bytes() -> u64 {
+    let mut system = System::new();
+    system.refresh_memory();
+    system.total_memory()
+}
+
+pub(crate) fn engine_memory_hard_top_bytes(
+    user_budget: usize,
+    engine_cap: u64,
+    host_total: u64,
+) -> Result<u64, AnalysisError> {
+    let host_capacity = host_total.saturating_sub(
+        metadata_engine::resource::required_host_headroom(host_total),
+    );
+    let hard_top = (user_budget as u64).min(engine_cap).min(host_capacity);
+    if hard_top == 0 {
+        return Err(AnalysisError::InvalidData(
+            "no memory remains after reserving physical host headroom".into(),
+        ));
+    }
+    Ok(hard_top)
 }
 
 pub(crate) fn format_byte_size(bytes: usize) -> String {

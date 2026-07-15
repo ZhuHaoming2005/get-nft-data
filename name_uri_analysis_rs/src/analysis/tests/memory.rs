@@ -1,4 +1,5 @@
 use super::*;
+use metadata_engine::resource::GIB;
 
 #[test]
 fn explicit_analysis_memory_limit_stays_inside_total_budget() {
@@ -54,6 +55,50 @@ fn controller_memory_validation_accepts_auto_and_rejects_invalid_static_limits()
 }
 
 #[test]
+fn engine_memory_limit_uses_real_host_headroom_and_user_cap() {
+    let hard_top = engine_memory_hard_top_bytes(64 * GIB as usize, 384 * GIB, 64 * GIB).unwrap();
+    assert_eq!(hard_top, 56 * GIB);
+    let user_limited = engine_memory_hard_top_bytes(8 * GIB as usize, 384 * GIB, 64 * GIB).unwrap();
+    assert_eq!(user_limited, 8 * GIB);
+}
+
+#[test]
+fn encode_memory_plan_shares_the_448_gib_target_envelope() {
+    let plan = encode_process_memory_plan(
+        "320GiB",
+        384 * metadata_engine::resource::GIB as usize,
+        64 * metadata_engine::resource::GIB,
+        512 * metadata_engine::resource::GIB,
+    )
+    .unwrap();
+
+    assert_eq!(plan.envelope_bytes, 448 * metadata_engine::resource::GIB);
+    assert_eq!(plan.duckdb_bytes, 320 * metadata_engine::resource::GIB);
+    assert_eq!(
+        plan.rust_hard_top_bytes,
+        128 * metadata_engine::resource::GIB
+    );
+    assert!(plan.duckdb_bytes + plan.rust_hard_top_bytes <= plan.envelope_bytes);
+}
+
+#[test]
+fn encode_memory_plan_moves_capacity_from_duckdb_to_large_rust_estimates() {
+    let plan = encode_process_memory_plan(
+        "320GiB",
+        384 * metadata_engine::resource::GIB as usize,
+        200 * metadata_engine::resource::GIB,
+        512 * metadata_engine::resource::GIB,
+    )
+    .unwrap();
+
+    assert_eq!(
+        plan.rust_hard_top_bytes,
+        264 * metadata_engine::resource::GIB
+    );
+    assert_eq!(plan.duckdb_bytes, 184 * metadata_engine::resource::GIB);
+}
+
+#[test]
 fn diagnostic_environment_flag_is_explicit() {
     assert!(!diagnostics_requested(None));
     assert!(!diagnostics_requested(Some(std::ffi::OsStr::new("0"))));
@@ -69,7 +114,6 @@ fn duckdb_configuration_does_not_parse_memory_limit() {
         parquet_inputs: Vec::new(),
         output_dir: PathBuf::from("unused"),
         name_threshold: 95.0,
-        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 1,
         memory_limit: "not-a-size".into(),
         analysis_memory_limit: None,
@@ -89,7 +133,6 @@ fn duckdb_threads_are_capped_at_the_64_physical_core_target() {
         parquet_inputs: Vec::new(),
         output_dir: PathBuf::from("unused"),
         name_threshold: 95.0,
-        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 128,
         memory_limit: "384GiB".into(),
         analysis_memory_limit: Some("384GiB".into()),
@@ -145,13 +188,12 @@ fn prepare_only_uri_tables_are_released_before_metadata_compaction() {
 }
 
 #[test]
-fn rust_heavy_phases_clamp_duckdb_without_raising_smaller_limits() {
+fn name_phase_clamps_duckdb_without_raising_smaller_limits() {
     let mut options = AnalysisOptions {
         database_path: PathBuf::from(":memory:"),
         parquet_inputs: Vec::new(),
         output_dir: PathBuf::from("unused"),
         name_threshold: 95.0,
-        metadata_recall_mode: MetadataRecallMode::Conservative,
         threads: 1,
         memory_limit: "192GiB".into(),
         analysis_memory_limit: Some("192GiB".into()),
@@ -163,11 +205,6 @@ fn rust_heavy_phases_clamp_duckdb_without_raising_smaller_limits() {
         phase_duckdb_memory_limit(&options, NAME_DUCKDB_MEMORY_CAP).unwrap(),
         "8GiB"
     );
-    assert_eq!(
-        phase_duckdb_memory_limit(&options, METADATA_DUCKDB_MEMORY_CAP).unwrap(),
-        "32GiB"
-    );
-
     options.duckdb_memory_limit = "4GiB".to_string();
     assert_eq!(
         phase_duckdb_memory_limit(&options, NAME_DUCKDB_MEMORY_CAP).unwrap(),

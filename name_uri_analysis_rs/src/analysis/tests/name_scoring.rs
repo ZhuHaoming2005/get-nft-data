@@ -58,6 +58,46 @@ fn name_candidate_index_memory_includes_vector_headers() {
 }
 
 #[test]
+fn name_candidate_index_estimate_covers_resident_allocation() {
+    let atoms = vec![
+        NameAtom {
+            chain_index: 0,
+            name_norm: "alpha".into(),
+            char_len: 5,
+            contract_count: 1,
+            nft_count: 1,
+        },
+        NameAtom {
+            chain_index: 0,
+            name_norm: "alphabet".into(),
+            char_len: 8,
+            contract_count: 1,
+            nft_count: 1,
+        },
+        NameAtom {
+            chain_index: 1,
+            name_norm: "金色dragon".into(),
+            char_len: 8,
+            contract_count: 1,
+            nft_count: 1,
+        },
+    ];
+    let estimate = estimate_name_candidate_index_bytes(&atoms);
+    let actual = NameCandidateIndex::new(&atoms).memory_bytes();
+
+    assert!(estimate.resident_bytes >= actual);
+    assert!(estimate.peak_build_bytes >= estimate.resident_bytes);
+}
+
+#[test]
+fn name_worker_stack_reservation_scales_per_worker() {
+    assert_eq!(
+        name_worker_stack_reserve_bytes(4) - name_worker_stack_reserve_bytes(1),
+        3 * NAME_ANALYSIS_WORKER_STACK_BYTES
+    );
+}
+
+#[test]
 fn name_atom_memory_counts_reserved_vector_capacity() {
     let mut atoms = Vec::with_capacity(32);
     atoms.push(NameAtom {
@@ -140,10 +180,6 @@ fn name_scratch_plan_reserves_the_candidate_vectors_actual_worst_capacity() {
 
 #[test]
 fn dense_name_scratch_uses_u16_generations_and_resets_after_wrap() {
-    let source = include_str!("../name_scoring.rs");
-    assert!(source.contains("seen_generation: Vec<u16>"));
-    assert!(source.contains("generation: u16"));
-
     let atoms = vec![
         NameAtom {
             chain_index: 0,

@@ -1,10 +1,28 @@
 use super::*;
 
 #[test]
-fn metadata_stage_revision_tracks_conservative_fallback_semantics() {
-    assert_eq!(StageRevisions::current().metadata, 4);
-    assert_eq!(StageRevisions::current().prepare, 1);
+fn metadata_stage_revision_tracks_encode_and_match_semantics() {
+    assert_eq!(StageRevisions::current().metadata_encode, 3);
+    assert_eq!(StageRevisions::current().metadata_match, 11);
+    assert_eq!(StageRevisions::current().prepare, 2);
     assert_eq!(StageRevisions::current().name, 1);
+}
+
+#[test]
+fn controller_runs_encode_before_name_then_match() {
+    let phases = scheduled_phases()
+        .iter()
+        .map(|(phase, _, _)| *phase)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        phases,
+        [
+            InternalPhase::Prepare,
+            InternalPhase::MetadataEncode,
+            InternalPhase::Name,
+            InternalPhase::MetadataMatch,
+        ]
+    );
 }
 
 #[test]
@@ -257,85 +275,112 @@ fn resume_rebinds_a_stage_compatible_manifest_to_the_current_binary() {
 }
 
 #[test]
-fn changing_metadata_recall_mode_invalidates_only_metadata_and_finalizer() {
+fn encode_revision_bump_does_not_clear_name_complete() {
     let temp = tempfile::tempdir().unwrap();
     let work = temp.path().join("work");
-    fs::create_dir_all(&work).unwrap();
+    let checkpoints = work.join("checkpoints");
+    fs::create_dir_all(&checkpoints).unwrap();
     let mut existing = sample_manifest(&work);
-    existing.options.metadata_recall_mode = MetadataRecallMode::Exact;
     for checkpoint in existing.stages.values_mut() {
         checkpoint.complete = true;
     }
+    existing.stage_revisions.metadata_encode = 0;
     fs::write(
         work.join("manifest.json"),
         serde_json::to_vec(&existing).unwrap(),
     )
     .unwrap();
-    let mut expected = existing.clone();
-    expected.options.metadata_recall_mode = MetadataRecallMode::Conservative;
+    for phase in ["prepare", "metadata-encode", "name", "metadata-match"] {
+        fs::write(
+            checkpoints.join(format!("{phase}.ready.json")),
+            b"stale-ready",
+        )
+        .unwrap();
+    }
 
-    let (_, resumed) = prepare_work_directory(&work, expected, true).unwrap();
+    let (_, rebound) = prepare_work_directory(&work, sample_manifest(&work), true).unwrap();
 
-    assert!(resumed.stages["prepare_complete"].complete);
-    assert!(resumed.stages["name_complete"].complete);
-    assert!(!resumed.stages["metadata_complete"].complete);
-    assert!(!resumed.stages["finalized"].complete);
+    assert!(rebound.stages["prepare_complete"].complete);
+    assert!(rebound.stages["name_complete"].complete);
+    assert!(!rebound.stages["metadata_encode_complete"].complete);
+    assert!(!rebound.stages["metadata_match_complete"].complete);
+    assert!(!rebound.stages["finalized"].complete);
+    assert!(checkpoints.join("name.ready.json").exists());
+    assert!(!checkpoints.join("metadata-encode.ready.json").exists());
+    assert!(!checkpoints.join("metadata-match.ready.json").exists());
+}
+
+#[test]
+fn incompatible_manifest_schema_is_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    let work = temp.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    let mut manifest = sample_manifest(&work);
+    manifest.schema_version = PIPELINE_SCHEMA_VERSION - 1;
+    fs::write(
+        work.join("manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let error = prepare_work_directory(&work, sample_manifest(&work), true).unwrap_err();
+    assert!(error.to_string().contains("incompatible"));
+    assert!(error.to_string().contains("re-run without --resume"));
 }
 
 #[test]
 fn resume_stage_revision_changes_follow_the_dependency_graph() {
+    #[derive(Clone, Copy)]
+    enum ChangedRevision {
+        Prepare,
+        Name,
+        MetadataEncode,
+        MetadataMatch,
+        Finalizer,
+    }
+
     struct Case {
-        revisions: serde_json::Value,
+        changed_revision: ChangedRevision,
         invalidated_stages: &'static [&'static str],
         invalidated_ready_phases: &'static [&'static str],
     }
 
     let cases = [
         Case {
-            revisions: serde_json::json!({
-                "prepare": 0,
-                "name": 1,
-                "metadata": 4,
-                "finalizer": 1,
-            }),
+            changed_revision: ChangedRevision::Prepare,
             invalidated_stages: &[
                 "contracts_ready",
                 "uri_complete",
                 "metadata_compact_ready",
                 "prepare_complete",
+                "metadata_encode_complete",
                 "name_complete",
-                "metadata_complete",
+                "metadata_match_complete",
                 "finalized",
             ],
-            invalidated_ready_phases: &["prepare", "name", "metadata"],
+            invalidated_ready_phases: &["prepare", "metadata-encode", "name", "metadata-match"],
         },
         Case {
-            revisions: serde_json::json!({
-                "prepare": 1,
-                "name": 0,
-                "metadata": 4,
-                "finalizer": 1,
-            }),
+            changed_revision: ChangedRevision::Name,
             invalidated_stages: &["name_complete", "finalized"],
             invalidated_ready_phases: &["name"],
         },
         Case {
-            revisions: serde_json::json!({
-                "prepare": 1,
-                "name": 1,
-                "metadata": 3,
-                "finalizer": 1,
-            }),
-            invalidated_stages: &["metadata_complete", "finalized"],
-            invalidated_ready_phases: &["metadata"],
+            changed_revision: ChangedRevision::MetadataEncode,
+            invalidated_stages: &[
+                "metadata_encode_complete",
+                "metadata_match_complete",
+                "finalized",
+            ],
+            invalidated_ready_phases: &["metadata-encode", "metadata-match"],
         },
         Case {
-            revisions: serde_json::json!({
-                "prepare": 1,
-                "name": 1,
-                "metadata": 4,
-                "finalizer": 0,
-            }),
+            changed_revision: ChangedRevision::MetadataMatch,
+            invalidated_stages: &["metadata_match_complete", "finalized"],
+            invalidated_ready_phases: &["metadata-match"],
+        },
+        Case {
+            changed_revision: ChangedRevision::Finalizer,
             invalidated_stages: &["finalized"],
             invalidated_ready_phases: &[],
         },
@@ -350,14 +395,22 @@ fn resume_stage_revision_changes_follow_the_dependency_graph() {
         for checkpoint in existing.stages.values_mut() {
             checkpoint.complete = true;
         }
+        let mut revisions = StageRevisions::current();
+        match case.changed_revision {
+            ChangedRevision::Prepare => revisions.prepare = 0,
+            ChangedRevision::Name => revisions.name = 0,
+            ChangedRevision::MetadataEncode => revisions.metadata_encode = 0,
+            ChangedRevision::MetadataMatch => revisions.metadata_match = 0,
+            ChangedRevision::Finalizer => revisions.finalizer = 0,
+        }
         let mut serialized = serde_json::to_value(existing).unwrap();
-        serialized["stage_revisions"] = case.revisions;
+        serialized["stage_revisions"] = serde_json::to_value(revisions).unwrap();
         fs::write(
             work.join("manifest.json"),
             serde_json::to_vec(&serialized).unwrap(),
         )
         .unwrap();
-        for phase in ["prepare", "name", "metadata"] {
+        for phase in ["prepare", "metadata-encode", "name", "metadata-match"] {
             fs::write(
                 checkpoints.join(format!("{phase}.ready.json")),
                 b"stale-ready",
@@ -377,7 +430,7 @@ fn resume_stage_revision_changes_follow_the_dependency_graph() {
                 assert!(checkpoint.artifacts.is_empty());
             }
         }
-        for phase in ["prepare", "name", "metadata"] {
+        for phase in ["prepare", "metadata-encode", "name", "metadata-match"] {
             let should_exist = !case.invalidated_ready_phases.contains(&phase);
             assert_eq!(
                 checkpoints.join(format!("{phase}.ready.json")).exists(),
@@ -389,15 +442,15 @@ fn resume_stage_revision_changes_follow_the_dependency_graph() {
 }
 
 #[test]
-fn legacy_manifest_without_stage_revisions_is_safely_invalidated_and_upgraded() {
+fn manifest_without_stage_revisions_is_safely_invalidated_and_upgraded() {
     let temp = tempfile::tempdir().unwrap();
     let work = temp.path().join("work");
     fs::create_dir_all(&work).unwrap();
-    let mut legacy = sample_manifest(&work);
-    for checkpoint in legacy.stages.values_mut() {
+    let mut manifest = sample_manifest(&work);
+    for checkpoint in manifest.stages.values_mut() {
         checkpoint.complete = true;
     }
-    let mut serialized = serde_json::to_value(legacy).unwrap();
+    let mut serialized = serde_json::to_value(manifest).unwrap();
     serialized
         .as_object_mut()
         .unwrap()
@@ -415,13 +468,16 @@ fn legacy_manifest_without_stage_revisions_is_safely_invalidated_and_upgraded() 
         "uri_complete",
         "metadata_compact_ready",
         "prepare_complete",
+        "metadata_encode_complete",
         "name_complete",
-        "metadata_complete",
+        "metadata_match_complete",
         "finalized",
     ] {
-        assert!(!rebound.stages[stage].complete, "legacy stage {stage:?}");
+        assert!(!rebound.stages[stage].complete, "stale stage {stage:?}");
     }
     assert!(persisted["stage_revisions"].is_object());
+    assert!(persisted["stage_revisions"]["metadata_encode"].is_number());
+    assert!(persisted["stage_revisions"]["metadata_match"].is_number());
 }
 
 #[test]
@@ -460,6 +516,7 @@ fn resume_rejects_missing_database_table_needed_by_next_phase() {
          CREATE TABLE metadata_rows(id INTEGER);
          CREATE TABLE metadata_contract_token_rows(id INTEGER);
          CREATE TABLE metadata_token_stats(id INTEGER);
+         CREATE TABLE metadata_token_dictionary(id INTEGER);
          CREATE TABLE selected_chains(chain VARCHAR);",
     )
     .unwrap();
@@ -468,6 +525,28 @@ fn resume_rejects_missing_database_table_needed_by_next_phase() {
     let error = validate_resume_database_for_downstream(&manifest, "prepare_complete").unwrap_err();
 
     assert!(error.to_string().contains("name_atoms"));
+}
+
+#[test]
+fn resume_does_not_require_database_when_only_metadata_match_remains() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut manifest = sample_manifest(temp.path());
+    for stage in [
+        "prepare_complete",
+        "metadata_encode_complete",
+        "name_complete",
+    ] {
+        manifest.stages.get_mut(stage).unwrap().complete = true;
+    }
+    assert!(!manifest.options.database_path.exists());
+
+    for completed_stage in [
+        "prepare_complete",
+        "metadata_encode_complete",
+        "name_complete",
+    ] {
+        validate_resume_database_for_downstream(&manifest, completed_stage).unwrap();
+    }
 }
 
 #[test]
@@ -483,6 +562,7 @@ fn ready_checkpoint_promotes_phase_after_controller_restart() {
         partial_file: "name-summary.json".to_string(),
         size: fingerprint.size,
         sha256: fingerprint.sha256,
+        artifacts: Vec::new(),
     };
     fs::write(
         temp.path().join("checkpoints/name.ready.json"),
@@ -501,4 +581,105 @@ fn ready_checkpoint_promotes_phase_after_controller_restart() {
     let checkpoint = manifest.stages.get("name_complete").unwrap();
     assert!(checkpoint.complete);
     assert_eq!(checkpoint.artifacts.len(), 1);
+}
+
+#[test]
+fn metadata_encode_ready_rejects_a_missing_feature_dependency() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir_all(temp.path().join("partial")).unwrap();
+    fs::create_dir_all(temp.path().join("checkpoints")).unwrap();
+    fs::create_dir_all(temp.path().join("artifacts/metadata/encode-1")).unwrap();
+    let partial = temp.path().join("partial/metadata-encode-summary.json");
+    fs::write(&partial, br#"{"summary_rows":[]}"#).unwrap();
+    let partial_fingerprint = fingerprint_artifact(&partial).unwrap();
+    let feature = temp
+        .path()
+        .join("artifacts/metadata/encode-1/source_to_payload.u32");
+    fs::write(&feature, b"feature").unwrap();
+    let feature_fingerprint = fingerprint_artifact(&feature).unwrap();
+    let ready = PhaseReady {
+        phase: "metadata-encode".to_string(),
+        partial_file: "metadata-encode-summary.json".to_string(),
+        size: partial_fingerprint.size,
+        sha256: partial_fingerprint.sha256,
+        artifacts: vec![feature_fingerprint],
+    };
+    fs::write(
+        temp.path().join("checkpoints/metadata-encode.ready.json"),
+        serde_json::to_vec(&ready).unwrap(),
+    )
+    .unwrap();
+    fs::remove_file(feature).unwrap();
+    let mut manifest = sample_manifest(temp.path());
+
+    let error = promote_ready_phase(
+        &mut manifest,
+        InternalPhase::MetadataEncode,
+        "metadata-encode-summary.json",
+        temp.path(),
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("artifact dependency"));
+    assert!(!manifest.stages["metadata_encode_complete"].complete);
+}
+
+#[test]
+fn match_revision_upgrade_prunes_transient_cas_without_invalidating_encode() {
+    let temp = tempfile::tempdir().unwrap();
+    let work = temp.path().join("work");
+    let checkpoints = work.join("checkpoints");
+    let feature = work.join("artifacts/metadata/encode-1/source_to_payload.u32");
+    let cas = work.join("artifacts/metadata/encode-1/payload_blobs/pack-000.bin");
+    fs::create_dir_all(feature.parent().unwrap()).unwrap();
+    fs::create_dir_all(cas.parent().unwrap()).unwrap();
+    fs::create_dir_all(&checkpoints).unwrap();
+    fs::write(&feature, b"feature").unwrap();
+    fs::write(&cas, b"cas").unwrap();
+    let feature_fingerprint = fingerprint_artifact(&feature).unwrap();
+    let cas_fingerprint = fingerprint_artifact(&cas).unwrap();
+
+    let mut manifest = sample_manifest(&work);
+    manifest.stage_revisions.metadata_match = 9;
+    manifest.stages.insert(
+        "metadata_encode_complete".to_string(),
+        StageCheckpoint {
+            complete: true,
+            artifacts: vec![feature_fingerprint.clone(), cas_fingerprint.clone()],
+        },
+    );
+    let partial = work.join("partial/metadata-encode-summary.json");
+    fs::create_dir_all(partial.parent().unwrap()).unwrap();
+    fs::write(&partial, br#"{"summary_rows":[]}"#).unwrap();
+    let partial_fingerprint = fingerprint_artifact(&partial).unwrap();
+    let ready = PhaseReady {
+        phase: "metadata-encode".to_string(),
+        partial_file: "metadata-encode-summary.json".to_string(),
+        size: partial_fingerprint.size,
+        sha256: partial_fingerprint.sha256,
+        artifacts: vec![feature_fingerprint.clone(), cas_fingerprint],
+    };
+    fs::write(
+        checkpoints.join("metadata-encode.ready.json"),
+        serde_json::to_vec(&ready).unwrap(),
+    )
+    .unwrap();
+
+    assert!(
+        crate::controller_manifest::invalidate_changed_stage_revisions(
+            &mut manifest,
+            StageRevisions::current(),
+            &work,
+        )
+        .unwrap()
+    );
+
+    let encode = &manifest.stages["metadata_encode_complete"];
+    assert!(encode.complete);
+    assert_eq!(encode.artifacts, vec![feature_fingerprint.clone()]);
+    let migrated: PhaseReady =
+        serde_json::from_slice(&fs::read(checkpoints.join("metadata-encode.ready.json")).unwrap())
+            .unwrap();
+    assert_eq!(migrated.artifacts, vec![feature_fingerprint]);
+    assert!(cas.exists(), "Match owns CAS collection after upgrade");
 }

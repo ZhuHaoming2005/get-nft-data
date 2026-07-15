@@ -216,7 +216,9 @@ pub(super) fn analysis_contracts_sql() -> String {
                            row_number := source_row_number
                        ),
                        row(token_id, source_file, source_row_number)
-                   ) AS metadata_source
+                   ) AS metadata_source,
+                   max(octet_length(encode(metadata_json)))::UBIGINT
+                       AS metadata_max_json_bytes
             FROM metadata_rows
             WHERE {metadata_eligible}
             GROUP BY contract_id
@@ -225,10 +227,11 @@ pub(super) fn analysis_contracts_sql() -> String {
             SELECT contract_id,
                    metadata_source.file_id AS metadata_source_file,
                    metadata_source.row_number AS metadata_source_row_number,
-                   -- Internal dense ID only: stable SourceId columns above
-                   -- carry every cross-process semantic tie-break. Avoid a
-                   -- global contract sort on this multi-million-row group.
-                   row_number() OVER () - 1 AS metadata_contract_index
+                   metadata_max_json_bytes,
+                   -- Dense IDs are serialized into the immutable Encode
+                   -- snapshot, so their assignment must not depend on the
+                   -- parallel hash-aggregate output order.
+                   row_number() OVER (ORDER BY contract_id) - 1 AS metadata_contract_index
             FROM metadata_sources
         )
         SELECT contracts.contract_id,
@@ -238,7 +241,8 @@ pub(super) fn analysis_contracts_sql() -> String {
                contracts.name_norm,
                metadata.metadata_source_file,
                metadata.metadata_source_row_number,
-               metadata.metadata_contract_index
+               metadata.metadata_contract_index,
+               metadata.metadata_max_json_bytes
         FROM contract_dim contracts
         LEFT JOIN indexed_metadata_sources metadata
           ON metadata.contract_id = contracts.contract_id
@@ -295,7 +299,8 @@ pub(crate) fn build_core_rows_sql(inputs: &str) -> String {
             WHERE contract_address <> ''
             GROUP BY chain, contract_address
         )
-        SELECT (row_number() OVER () - 1)::UINTEGER AS contract_id, *
+        SELECT (row_number() OVER (ORDER BY chain, contract_address) - 1)::UINTEGER AS contract_id,
+               *
         FROM aggregated;
         "
     )
@@ -421,6 +426,7 @@ pub(crate) fn execute_progress_batch(
 /// positionally; every SELECT feeding these helpers names its columns to match,
 /// so a mismatch means the SQL and reader have desynced. Fail fast with a clear
 /// error instead of silently reading the wrong column.
+#[cfg(test)]
 pub(crate) fn arrow_verify_column_name(
     batch: &duckdb::arrow::record_batch::RecordBatch,
     index: usize,
@@ -439,6 +445,7 @@ pub(crate) fn arrow_verify_column_name(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn arrow_i64_column<'a>(
     batch: &'a duckdb::arrow::record_batch::RecordBatch,
     index: usize,
@@ -460,6 +467,7 @@ pub(crate) fn arrow_i64_column<'a>(
         })
 }
 
+#[cfg(test)]
 pub(crate) fn arrow_string_column<'a>(
     batch: &'a duckdb::arrow::record_batch::RecordBatch,
     index: usize,

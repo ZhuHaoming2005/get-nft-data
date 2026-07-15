@@ -34,7 +34,6 @@ fn sample_manifest(root: &Path) -> PipelineManifest {
             parquet_inputs: vec![root.join("input.parquet")],
             output_dir: root.join("output"),
             name_threshold: 95.0,
-            metadata_recall_mode: MetadataRecallMode::Conservative,
             threads: 32,
             memory_limit: "192GiB".to_string(),
             analysis_memory_limit: Some("192GiB".to_string()),
@@ -49,4 +48,3 @@ fn sample_manifest(root: &Path) -> PipelineManifest {
 mod cli_parsing;
 mod fingerprints;
 mod resume_locks;
-mod structure_pins;

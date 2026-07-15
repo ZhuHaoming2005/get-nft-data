@@ -89,18 +89,96 @@ fn public_controller_runs_all_children_and_resumes_finalized_pipeline() {
         output.join("summary.json"),
         output.join("summary.csv"),
         output.join("summary.manifest.json"),
+        output.join("advisory/metadata-readiness-input.json"),
+        output.join("advisory/metadata-production-readiness.json"),
         work.join("manifest.json"),
         work.join("metrics/prepare-phase.json"),
+        work.join("metrics/metadata-encode-phase.json"),
         work.join("metrics/name-phase.json"),
-        work.join("metrics/metadata-phase.json"),
+        work.join("metrics/metadata-match-phase.json"),
         work.join("metrics/name-algorithm.json"),
-        work.join("metrics/metadata-algorithm.json"),
+        work.join("metrics/metadata-encode.json"),
         work.join("checkpoints/prepare.ready.json"),
+        work.join("checkpoints/metadata-encode.ready.json"),
         work.join("checkpoints/name.ready.json"),
-        work.join("checkpoints/metadata.ready.json"),
+        work.join("checkpoints/metadata-match.ready.json"),
+        work.join("partial/metadata-encode-summary.json"),
+        work.join("partial/metadata-summary.json"),
+        work.join("artifacts/metadata/readiness-input.json"),
+        work.join("artifacts/metadata/production-readiness.json"),
+        work.join("artifacts/metadata/encode-1/features.ready"),
+        work.join("artifacts/metadata/blocking-1/blocking.ready"),
+        work.join("artifacts/metadata/match-1/index-1/index.ready"),
+        work.join("artifacts/metadata/match-1/metadata-summary-1/metadata-summary.ready"),
     ] {
         assert!(path.is_file(), "missing {}", path.display());
     }
+    let readiness: serde_json::Value = serde_json::from_slice(
+        &fs::read(output.join("advisory/metadata-production-readiness.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(readiness["production_ready"], false);
+
+    let summary_manifest_before = fs::read(output.join("summary.manifest.json")).unwrap();
+    fs::create_dir_all(output.join("production-evidence")).unwrap();
+    fs::write(
+        output.join("production-evidence/metadata-v2.json"),
+        b"{not valid json",
+    )
+    .unwrap();
+    let refreshed = Command::new(binary)
+        .args([
+            "--refresh-production-readiness",
+            "--output-dir",
+            output.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        refreshed.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&refreshed.stdout),
+        String::from_utf8_lossy(&refreshed.stderr)
+    );
+    let refreshed_readiness: serde_json::Value = serde_json::from_slice(
+        &fs::read(output.join("advisory/metadata-production-readiness.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(refreshed_readiness["production_ready"], false);
+    assert!(refreshed_readiness["blockers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|blocker| blocker
+            .as_str()
+            .is_some_and(|text| text.contains("invalid"))));
+    assert_eq!(
+        fs::read(output.join("summary.manifest.json")).unwrap(),
+        summary_manifest_before,
+        "advisory refresh must not mutate the summary generation"
+    );
+    let encode_partial: serde_json::Value = serde_json::from_slice(
+        &fs::read(work.join("partial/metadata-encode-summary.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        encode_partial["summary_rows"].as_array().unwrap().len(),
+        0,
+        "Encode must not emit production summary rows"
+    );
+    let encode_metrics: serde_json::Value =
+        serde_json::from_slice(&fs::read(work.join("metrics/metadata-encode.json")).unwrap())
+            .unwrap();
+    assert_eq!(encode_metrics["schema_version"], 3);
+    assert!(encode_metrics["encode_wall_millis"].as_u64().is_some());
+    assert!(encode_metrics["blocking_wall_millis"].as_u64().is_some());
+    assert!(encode_metrics["token_membership_count"].as_u64().is_some());
+    assert!(encode_metrics["routing_membership_count"]
+        .as_u64()
+        .is_some());
+    assert!(encode_metrics["admitted_resident_peak_bytes"]
+        .as_u64()
+        .is_some());
     assert!(fs::read_dir(work.join("metrics/duckdb-prepare"))
         .unwrap()
         .any(|entry| entry
@@ -108,6 +186,19 @@ fn public_controller_runs_all_children_and_resumes_finalized_pipeline() {
             .path()
             .extension()
             .is_some_and(|ext| ext == "json")));
+
+    let metadata_ready: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            work.join("artifacts/metadata/match-1/metadata-summary-1/metadata-summary.ready"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        metadata_ready["schema_revision"],
+        metadata_engine::scoring::MATCH_SEMANTICS_REVISION
+    );
+    assert!(metadata_ready["summary_rows"].as_array().is_some());
 
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(work.join("manifest.json")).unwrap()).unwrap();
@@ -124,6 +215,7 @@ fn public_controller_runs_all_children_and_resumes_finalized_pipeline() {
     assert_eq!(manifest["inputs"][0]["file_id"], 0);
     assert_eq!(manifest["inputs"][0]["row_count"], 3);
 
+    fs::remove_file(output.join("production-evidence/metadata-v2.json")).unwrap();
     let resumed = Command::new(binary)
         .args(common_args)
         .arg("--resume")
@@ -136,4 +228,15 @@ fn public_controller_runs_all_children_and_resumes_finalized_pipeline() {
         String::from_utf8_lossy(&resumed.stderr)
     );
     assert!(String::from_utf8_lossy(&resumed.stdout).contains("reused"));
+    let resumed_readiness: serde_json::Value = serde_json::from_slice(
+        &fs::read(output.join("advisory/metadata-production-readiness.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(resumed_readiness["blockers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|blocker| blocker
+            .as_str()
+            .is_some_and(|text| text.contains("missing"))));
 }
