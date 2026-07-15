@@ -11,6 +11,7 @@ pub use base_equivalent::{
     BlockingCompileConfig, BlockingError, RoutingStatus, ANCHOR_COUNT, BANDS, BAND_BITS,
     JOINT_BAND_FAMILIES,
 };
+pub(crate) use local::LocalRoutingPlan;
 pub use local::{for_each_local_base_equivalent_pair, for_each_local_base_equivalent_pair_while};
 pub use sketch::{
     build_base_equivalent_atom_sketches, build_base_equivalent_atom_sketches_from_soa_parallel,

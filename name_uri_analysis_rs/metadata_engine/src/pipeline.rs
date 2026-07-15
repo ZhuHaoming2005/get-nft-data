@@ -10,8 +10,7 @@ use std::time::Instant;
 use thiserror::Error;
 
 use crate::blocking::{
-    build_base_equivalent_atom_sketches, for_each_local_base_equivalent_pair_while,
-    BaseEquivalentAtomInput,
+    build_base_equivalent_atom_sketches, BaseEquivalentAtomInput, LocalRoutingPlan,
 };
 use crate::cascade::{score_pair, PairScoreDecision};
 use crate::evidence::{
@@ -34,9 +33,7 @@ use crate::reduce::{
     ForestRun,
 };
 use crate::resource::MemoryBroker;
-use crate::scheduler::{
-    estimate_catalog_contract_pair_work, RecallPlan, UniverseBudget, WorkCatalog,
-};
+use crate::scheduler::{RecallPlan, UniverseBudget, WorkCatalog};
 use crate::snapshot::{MetadataSnapshot, SnapshotError};
 use crate::storage::{ArtifactClass, ArtifactRegistration, EvictionPlan, StorageBroker};
 
@@ -44,7 +41,7 @@ pub const DEFAULT_MAX_CANDIDATE_PAIR_VISITS: u64 = 200_000_000_000;
 pub const DEFAULT_EXACT_SAMPLE_LEFTS: u64 = 1_024;
 pub const DEFAULT_EXACT_PAIR_WORK: u64 = 20_000_000_000;
 
-const CONNECTIVITY_RUN_REVISION: u32 = 2;
+const CONNECTIVITY_RUN_REVISION: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct MetadataPipelineConfig {
@@ -115,13 +112,13 @@ struct ConnectivityCommit<'a> {
     candidate_pair_visits: u64,
     accepted_edge_count: u64,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScopeComponents {
     pub intra_roots: Vec<u32>,
     pub cross_roots: Vec<u32>,
     pub chain_pair_roots: Vec<ChainPairRoots>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChainPairRoots {
     pub left_chain: u32,
     pub right_chain: u32,
@@ -263,169 +260,310 @@ impl DenseSummaryScratch {
     }
 }
 
-struct ScopeEdgeCollectors {
-    intra: EdgeCollector,
-    cross: EdgeCollector,
-    chain_pairs: Vec<EdgeCollector>,
-    max_retained_bytes: u64,
-    accepted_edges: u64,
-}
-
 type ScopeForestRuns = (Vec<ForestRun>, Vec<ForestRun>, Vec<Vec<ForestRun>>);
 
-impl ScopeEdgeCollectors {
+enum ScopeSinkMessage {
+    Edges { scope: usize, edges: Vec<Edge> },
+    Stop,
+}
+
+/// Bounded scope-sharded admission for MetadataMatch forest edges.
+///
+/// Each logical scope is assigned to exactly one sink worker. The collectors
+/// remain individually owned behind a mutex only so rare global retained-byte
+/// compaction can stop the world without copying their dense degree arrays.
+struct ScopeCollectorBroker {
+    collectors: Vec<Arc<std::sync::Mutex<Option<EdgeCollector>>>>,
+    senders: Vec<std::sync::mpsc::SyncSender<ScopeSinkMessage>>,
+    handles: Vec<std::thread::JoinHandle<()>>,
+    accepted_edges: Arc<std::sync::atomic::AtomicU64>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    first_error: Arc<std::sync::Mutex<Option<crate::reduce::ReduceError>>>,
+    retained: Arc<ScopeRetainedBudget>,
+    scorer_lanes: usize,
+}
+
+struct ScopeRetainedBudget {
+    max_bytes: u64,
+    by_scope: Vec<std::sync::atomic::AtomicU64>,
+    total: std::sync::atomic::AtomicU64,
+    gate: std::sync::RwLock<()>,
+}
+
+impl ScopeCollectorBroker {
     fn new(
         node_count: u32,
         chain_pair_count: usize,
         budget: EdgeBudget,
         max_retained_bytes: u64,
-        worker_pool: Arc<rayon::ThreadPool>,
-    ) -> Self {
-        Self {
-            intra: EdgeCollector::new_with_pool(node_count, budget, 1_048_576, worker_pool.clone()),
-            cross: EdgeCollector::new_with_pool(node_count, budget, 1_048_576, worker_pool.clone()),
-            chain_pairs: (0..chain_pair_count)
-                .map(|_| {
-                    EdgeCollector::new_with_pool(node_count, budget, 1_048_576, worker_pool.clone())
-                })
-                .collect(),
-            max_retained_bytes,
-            accepted_edges: 0,
-        }
-    }
-
-    fn push(
-        &mut self,
-        features: &crate::encode::FeatureView,
-        chain_count: usize,
-        edge: Edge,
-    ) -> Result<(), crate::reduce::ReduceError> {
-        let left_chain = features.contract_chain[edge.left as usize] as usize;
-        let right_chain = features.contract_chain[edge.right as usize] as usize;
-        if left_chain == right_chain {
-            self.intra.push(edge)?;
+        threads: usize,
+    ) -> Result<Self, PipelineError> {
+        let scope_count = chain_pair_count.saturating_add(2);
+        let active_sink_workers = if threads <= 1 {
+            0
         } else {
-            self.cross.push(edge)?;
-            self.chain_pairs[chain_pair_index(left_chain, right_chain, chain_count)].push(edge)?;
+            let sink_cap = (threads / 4).max(2).min(threads.saturating_sub(1));
+            scope_count.min(sink_cap)
+        };
+        let scorer_lanes = threads.saturating_sub(active_sink_workers).max(1);
+        let collectors = (0..scope_count)
+            .map(|_| {
+                Arc::new(std::sync::Mutex::new(Some(EdgeCollector::new_serial(
+                    node_count, budget, 1_048_576,
+                ))))
+            })
+            .collect::<Vec<_>>();
+        let accepted_edges = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_error = Arc::new(std::sync::Mutex::new(None));
+        let retained = Arc::new(ScopeRetainedBudget {
+            max_bytes: max_retained_bytes,
+            by_scope: (0..scope_count)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+            total: std::sync::atomic::AtomicU64::new(0),
+            gate: std::sync::RwLock::new(()),
+        });
+        let mut senders = Vec::with_capacity(active_sink_workers);
+        let mut handles = Vec::with_capacity(active_sink_workers);
+        for worker in 0..active_sink_workers {
+            let (sender, receiver) = std::sync::mpsc::sync_channel::<ScopeSinkMessage>(2);
+            senders.push(sender);
+            let worker_collectors = collectors.clone();
+            let worker_cancelled = cancelled.clone();
+            let worker_error = first_error.clone();
+            let worker_retained = retained.clone();
+            let handle = std::thread::Builder::new()
+                .name(format!("metadata-scope-sink-{worker}"))
+                .spawn(move || {
+                    while let Ok(message) = receiver.recv() {
+                        match message {
+                            ScopeSinkMessage::Stop => break,
+                            ScopeSinkMessage::Edges { scope, edges } => {
+                                if worker_cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                                    continue;
+                                }
+                                let result = (|| {
+                                    let over_budget = {
+                                        let _admission =
+                                            worker_retained.gate.read().map_err(|_| {
+                                                crate::reduce::ReduceError::WorkOverflow
+                                            })?;
+                                        let collector = worker_collectors
+                                            .get(scope)
+                                            .ok_or(crate::reduce::ReduceError::WorkOverflow)?;
+                                        let mut guard = collector.lock().map_err(|_| {
+                                            crate::reduce::ReduceError::WorkOverflow
+                                        })?;
+                                        let collector = guard
+                                            .as_mut()
+                                            .ok_or(crate::reduce::ReduceError::WorkOverflow)?;
+                                        for edge in edges {
+                                            collector.push(edge)?;
+                                        }
+                                        drop(guard);
+                                        record_broker_retained_bytes(
+                                            &worker_collectors,
+                                            scope,
+                                            &worker_retained,
+                                        )?
+                                    };
+                                    if over_budget {
+                                        compact_broker_retained_budget(
+                                            &worker_collectors,
+                                            &worker_retained,
+                                        )?;
+                                    }
+                                    Ok(())
+                                })();
+                                if let Err(error) = result {
+                                    worker_cancelled
+                                        .store(true, std::sync::atomic::Ordering::Release);
+                                    if let Ok(mut first) = worker_error.lock() {
+                                        if first.is_none() {
+                                            *first = Some(error);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                })
+                .map_err(|error| PipelineError::Parallel(error.to_string()))?;
+            handles.push(handle);
         }
-        self.accepted_edges = self.accepted_edges.saturating_add(1);
-        self.enforce_retained_budget()
+        Ok(Self {
+            collectors,
+            senders,
+            handles,
+            accepted_edges,
+            cancelled,
+            first_error,
+            retained,
+            scorer_lanes,
+        })
     }
 
-    fn push_compacted_catalog_batch(
-        &mut self,
-        batch: CompactedCatalogEdges,
-    ) -> Result<(), crate::reduce::ReduceError> {
-        for edge in batch.intra {
-            self.intra.push(edge)?;
-        }
-        for edge in batch.cross {
-            self.cross.push(edge)?;
-        }
-        for (pair, edges) in batch.chain_pairs {
-            let Some(collector) = self.chain_pairs.get_mut(pair) else {
-                return Err(crate::reduce::ReduceError::WorkOverflow);
-            };
-            for edge in edges {
-                collector.push(edge)?;
-            }
-        }
-        self.accepted_edges = self.accepted_edges.saturating_add(batch.accepted_edges);
-        self.enforce_retained_budget()
+    #[cfg(test)]
+    fn active_sink_workers(&self) -> usize {
+        self.senders.len()
     }
 
-    fn enforce_retained_budget(&mut self) -> Result<(), crate::reduce::ReduceError> {
-        let mut retained = self.retained_bytes();
-        if retained > self.max_retained_bytes {
-            self.intra.compact_retained()?;
-            self.cross.compact_retained()?;
-            for collector in &mut self.chain_pairs {
-                collector.compact_retained()?;
-            }
-            retained = self.retained_bytes();
-            if retained > self.max_retained_bytes {
-                return Err(crate::reduce::ReduceError::Budget {
-                    resource: "scope_forest_bytes",
-                    requested: retained,
-                    limit: self.max_retained_bytes,
-                });
+    fn scorer_lanes(&self) -> usize {
+        self.scorer_lanes
+    }
+
+    fn accepted_edges(&self) -> u64 {
+        self.accepted_edges
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn push_edges_by_chain(
+        &self,
+        contract_chain: &[u32],
+        chain_count: usize,
+        edges: Vec<Edge>,
+    ) -> Result<(), PipelineError> {
+        let accepted = edges.len() as u64;
+        let mut by_scope = BTreeMap::<usize, Vec<Edge>>::new();
+        for edge in edges {
+            let left_chain = contract_chain[edge.left as usize] as usize;
+            let right_chain = contract_chain[edge.right as usize] as usize;
+            if left_chain == right_chain {
+                by_scope.entry(0).or_default().push(edge);
+            } else {
+                by_scope.entry(1).or_default().push(edge);
+                by_scope
+                    .entry(2 + chain_pair_index(left_chain, right_chain, chain_count))
+                    .or_default()
+                    .push(edge);
             }
         }
+        for (scope, edges) in by_scope {
+            self.submit_scope(scope, edges)?;
+        }
+        self.accepted_edges
+            .fetch_add(accepted, std::sync::atomic::Ordering::AcqRel);
         Ok(())
     }
 
-    fn retained_bytes(&self) -> u64 {
-        self.intra
-            .retained_bytes()
-            .saturating_add(self.cross.retained_bytes())
-            .saturating_add(
-                self.chain_pairs
-                    .iter()
-                    .map(EdgeCollector::retained_bytes)
-                    .sum::<u64>(),
-            )
+    fn submit_compacted_catalog_batch(
+        &self,
+        batch: CompactedCatalogEdges,
+    ) -> Result<(), PipelineError> {
+        self.submit_scope(0, batch.intra)?;
+        self.submit_scope(1, batch.cross)?;
+        for (pair, edges) in batch.chain_pairs {
+            self.submit_scope(pair.saturating_add(2), edges)?;
+        }
+        self.accepted_edges
+            .fetch_add(batch.accepted_edges, std::sync::atomic::Ordering::AcqRel);
+        Ok(())
     }
 
-    fn use_serial_compaction(&mut self) {
-        self.intra.use_serial_sort();
-        self.cross.use_serial_sort();
-        for collector in &mut self.chain_pairs {
-            collector.use_serial_sort();
+    fn submit_scope(&self, scope: usize, edges: Vec<Edge>) -> Result<(), PipelineError> {
+        if edges.is_empty() {
+            return Ok(());
+        }
+        if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(PipelineError::Parallel(
+                "scope collector broker cancelled".into(),
+            ));
+        }
+        if self.senders.is_empty() {
+            let _admission = self
+                .retained
+                .gate
+                .read()
+                .map_err(|_| PipelineError::Parallel("scope budget lock poisoned".into()))?;
+            let collector = self
+                .collectors
+                .get(scope)
+                .ok_or_else(|| PipelineError::Invariant("invalid collector scope".into()))?;
+            let mut guard = collector
+                .lock()
+                .map_err(|_| PipelineError::Parallel("scope collector lock poisoned".into()))?;
+            let collector = guard
+                .as_mut()
+                .ok_or_else(|| PipelineError::Invariant("collector already finished".into()))?;
+            for edge in edges {
+                collector.push(edge)?;
+            }
+            drop(guard);
+            let over_budget =
+                record_broker_retained_bytes(&self.collectors, scope, &self.retained)?;
+            drop(_admission);
+            if over_budget {
+                compact_broker_retained_budget(&self.collectors, &self.retained)?;
+            }
+            return Ok(());
+        }
+        let worker = scope % self.senders.len();
+        self.senders[worker]
+            .send(ScopeSinkMessage::Edges { scope, edges })
+            .map_err(|_| PipelineError::Parallel("scope collector sink disconnected".into()))
+    }
+
+    fn shutdown(&mut self) -> Result<(), PipelineError> {
+        for sender in &self.senders {
+            let _ = sender.send(ScopeSinkMessage::Stop);
+        }
+        self.senders.clear();
+        let mut panicked = false;
+        for handle in self.handles.drain(..) {
+            panicked |= handle.join().is_err();
+        }
+        if panicked {
+            Err(PipelineError::Parallel(
+                "scope collector sink panicked".into(),
+            ))
+        } else {
+            Ok(())
         }
     }
 
-    fn use_worker_pool(&mut self, worker_pool: Arc<rayon::ThreadPool>) {
-        self.intra.use_worker_pool(worker_pool.clone());
-        self.cross.use_worker_pool(worker_pool.clone());
-        for collector in &mut self.chain_pairs {
-            collector.use_worker_pool(worker_pool.clone());
+    fn finish(mut self) -> Result<ScopeForestRuns, PipelineError> {
+        self.shutdown()?;
+        if let Some(error) = self
+            .first_error
+            .lock()
+            .map_err(|_| PipelineError::Parallel("scope collector error lock poisoned".into()))?
+            .take()
+        {
+            return Err(error.into());
         }
+        let mut runs = Vec::with_capacity(self.collectors.len());
+        for collector in self.collectors.drain(..) {
+            let collector = Arc::try_unwrap(collector)
+                .map_err(|_| PipelineError::Parallel("scope collector still shared".into()))?
+                .into_inner()
+                .map_err(|_| PipelineError::Parallel("scope collector lock poisoned".into()))?
+                .ok_or_else(|| PipelineError::Invariant("collector already finished".into()))?;
+            runs.push(collector.finish()?);
+        }
+        let mut runs = runs.into_iter();
+        let intra = runs.next().unwrap_or_default();
+        let cross = runs.next().unwrap_or_default();
+        Ok((intra, cross, runs.collect()))
     }
 
     fn finish_with_progress(
         self,
         progress: &mut impl FnMut(ProgressEvent),
     ) -> Result<ScopeForestRuns, PipelineError> {
-        let total = self.chain_pairs.len().saturating_add(2) as u64;
-        let mut completed = 0u64;
+        let total = self.collectors.len() as u64;
         progress(
             ProgressEvent::determinate(
                 ProgressPhase::FinalizeEdgeCollectors,
-                completed,
+                0,
                 total,
                 WorkUnit::Items,
                 ProgressCounters::default(),
             )
-            .with_plan(WorkClass::ReduceItems, crate::progress::TotalKind::Exact),
+            .with_plan(WorkClass::ReduceItems, TotalKind::Exact),
         );
-        let intra = self.intra.finish()?;
-        completed += 1;
-        progress(
-            ProgressEvent::determinate(
-                ProgressPhase::FinalizeEdgeCollectors,
-                completed,
-                total,
-                WorkUnit::Items,
-                ProgressCounters::default(),
-            )
-            .with_plan(WorkClass::ReduceItems, crate::progress::TotalKind::Exact),
-        );
-        let cross = self.cross.finish()?;
-        completed += 1;
-        progress(
-            ProgressEvent::determinate(
-                ProgressPhase::FinalizeEdgeCollectors,
-                completed,
-                total,
-                WorkUnit::Items,
-                ProgressCounters::default(),
-            )
-            .with_plan(WorkClass::ReduceItems, crate::progress::TotalKind::Exact),
-        );
-        let mut chain_pairs = Vec::with_capacity(self.chain_pairs.len());
-        for collector in self.chain_pairs {
-            chain_pairs.push(collector.finish()?);
-            completed += 1;
+        let runs = self.finish()?;
+        for completed in 1..=total {
             progress(
                 ProgressEvent::determinate(
                     ProgressPhase::FinalizeEdgeCollectors,
@@ -434,13 +572,103 @@ impl ScopeEdgeCollectors {
                     WorkUnit::Items,
                     ProgressCounters::default(),
                 )
-                .with_plan(WorkClass::ReduceItems, crate::progress::TotalKind::Exact),
+                .with_plan(WorkClass::ReduceItems, TotalKind::Exact),
             );
         }
-        Ok((intra, cross, chain_pairs))
+        Ok(runs)
     }
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+
+impl Drop for ScopeCollectorBroker {
+    fn drop(&mut self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        let _ = self.shutdown();
+    }
+}
+
+fn record_broker_retained_bytes(
+    collectors: &[Arc<std::sync::Mutex<Option<EdgeCollector>>>],
+    scope: usize,
+    retained_budget: &ScopeRetainedBudget,
+) -> Result<bool, crate::reduce::ReduceError> {
+    let retained = collectors
+        .get(scope)
+        .ok_or(crate::reduce::ReduceError::WorkOverflow)?
+        .lock()
+        .map_err(|_| crate::reduce::ReduceError::WorkOverflow)?
+        .as_ref()
+        .ok_or(crate::reduce::ReduceError::WorkOverflow)?
+        .retained_bytes();
+    let previous =
+        retained_budget.by_scope[scope].swap(retained, std::sync::atomic::Ordering::AcqRel);
+    let total = if retained >= previous {
+        let delta = retained - previous;
+        retained_budget
+            .total
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |total| total.checked_add(delta),
+            )
+            .map_err(|_| crate::reduce::ReduceError::WorkOverflow)?
+            .saturating_add(delta)
+    } else {
+        retained_budget
+            .total
+            .fetch_sub(previous - retained, std::sync::atomic::Ordering::AcqRel)
+            .saturating_sub(previous - retained)
+    };
+    Ok(total > retained_budget.max_bytes)
+}
+
+fn compact_broker_retained_budget(
+    collectors: &[Arc<std::sync::Mutex<Option<EdgeCollector>>>],
+    retained_budget: &ScopeRetainedBudget,
+) -> Result<(), crate::reduce::ReduceError> {
+    let _gate = retained_budget
+        .gate
+        .write()
+        .map_err(|_| crate::reduce::ReduceError::WorkOverflow)?;
+    if retained_budget
+        .total
+        .load(std::sync::atomic::Ordering::Acquire)
+        <= retained_budget.max_bytes
+    {
+        return Ok(());
+    }
+    let mut compacted_total = 0u64;
+    for (scope, collector) in collectors.iter().enumerate() {
+        let mut guard = collector
+            .lock()
+            .map_err(|_| crate::reduce::ReduceError::WorkOverflow)?;
+        guard
+            .as_mut()
+            .ok_or(crate::reduce::ReduceError::WorkOverflow)?
+            .compact_retained()?;
+        let retained = guard
+            .as_ref()
+            .ok_or(crate::reduce::ReduceError::WorkOverflow)?
+            .retained_bytes();
+        retained_budget.by_scope[scope].store(retained, std::sync::atomic::Ordering::Release);
+        compacted_total = compacted_total
+            .checked_add(retained)
+            .ok_or(crate::reduce::ReduceError::WorkOverflow)?;
+    }
+    retained_budget
+        .total
+        .store(compacted_total, std::sync::atomic::Ordering::Release);
+    if compacted_total > retained_budget.max_bytes {
+        return Err(crate::reduce::ReduceError::Budget {
+            resource: "scope_forest_bytes",
+            requested: compacted_total,
+            limit: retained_budget.max_bytes,
+        });
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SerializableIndexMetrics {
     pub block_pair_visits: u64,
     pub contract_pair_visits: u64,
@@ -512,7 +740,6 @@ fn build_metadata_worker_pool(threads: usize) -> Result<Arc<rayon::ThreadPool>, 
 }
 
 enum CatalogMessage {
-    CompactedEdges(CompactedCatalogEdges),
     RoutingWork(u64),
     ExpansionWork(u64),
     Error(PipelineError),
@@ -718,8 +945,8 @@ fn sparse_find(parent: &mut [usize], node: usize) -> usize {
 }
 
 enum SharedMessage {
-    Edges(Vec<Edge>),
     Work { pairs: u64, groups: u64 },
+    Error(PipelineError),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -774,7 +1001,7 @@ fn next_fallback_pair_task(
 fn append_fallback_atom_edges_parallel(
     snapshot: &MetadataSnapshot,
     worker_pool: &rayon::ThreadPool,
-    collectors: &mut ScopeEdgeCollectors,
+    collectors: &ScopeCollectorBroker,
     chain_count: usize,
     progress: &mut impl FnMut(ProgressEvent),
 ) -> Result<u64, PipelineError> {
@@ -828,9 +1055,11 @@ fn append_fallback_atom_edges_parallel(
         });
         for (work, edges) in batches {
             completed = completed.saturating_add(work as u64);
-            for edge in edges {
-                collectors.push(snapshot.features(), chain_count, edge)?;
-            }
+            collectors.push_edges_by_chain(
+                &snapshot.features().contract_chain,
+                chain_count,
+                edges,
+            )?;
         }
         progress(ProgressEvent::determinate(
             ProgressPhase::FallbackPairs,
@@ -838,7 +1067,7 @@ fn append_fallback_atom_edges_parallel(
             total,
             WorkUnit::Pairs,
             ProgressCounters {
-                matched: collectors.accepted_edges,
+                matched: collectors.accepted_edges(),
                 ..ProgressCounters::default()
             },
         ));
@@ -851,15 +1080,26 @@ fn append_fallback_atom_edges_parallel(
     Ok(completed)
 }
 
+#[derive(Clone, Copy)]
+struct CatalogExecutionConfig {
+    lanes: usize,
+    max_pair_visits: u64,
+    chain_count: usize,
+}
+
 fn score_catalog_parallel(
     snapshot: &MetadataSnapshot,
     catalog: &WorkCatalog,
     plan: &RecallPlan,
-    lanes: usize,
-    collectors: &mut ScopeEdgeCollectors,
-    chain_count: usize,
+    execution: CatalogExecutionConfig,
+    collectors: &ScopeCollectorBroker,
     progress: &mut impl FnMut(ProgressEvent),
-) -> Result<IndexMetrics, PipelineError> {
+) -> Result<(IndexMetrics, u64), PipelineError> {
+    let CatalogExecutionConfig {
+        lanes,
+        max_pair_visits,
+        chain_count,
+    } = execution;
     const EDGE_BATCH: usize = 32_768;
     let routing_total = catalog.jobs.iter().try_fold(0u64, |total, job| {
         let first = job.first_block as usize;
@@ -897,8 +1137,12 @@ fn score_catalog_parallel(
         .map_err(|error| PipelineError::Parallel(error.to_string()))?;
     let index = ConservativeIndex::open(snapshot);
     let (sender, receiver) = std::sync::mpsc::sync_channel::<CatalogMessage>(lanes.max(1) * 2);
-    std::thread::scope(|scope| -> Result<IndexMetrics, PipelineError> {
+    let reserved_pair_visits = std::sync::atomic::AtomicU64::new(0);
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| -> Result<(IndexMetrics, u64), PipelineError> {
         let producer_sender = sender.clone();
+        let producer_reserved_pair_visits = &reserved_pair_visits;
+        let producer_cancelled = &cancelled;
         let producer = scope.spawn(move || {
             pool.install(|| {
                 const DENSE_COMPACTION_SCRATCH_BYTES: usize = 4 * 1024 * 1024;
@@ -910,20 +1154,46 @@ fn score_catalog_parallel(
                         )
                     },
                     |compaction_scratch, &job_id| {
+                        if producer_cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                            return;
+                        }
                         let Some(job) = catalog.jobs.get(job_id as usize) else {
                             return;
                         };
                         let mut batch = Vec::with_capacity(EDGE_BATCH);
                         let send_failed = std::cell::Cell::new(false);
                         let mut pending_expansion = 0u64;
-                        let metrics = index.for_each_job_candidate_with_work(
+                        let metrics = index.for_each_job_candidate_with_work_while(
                             job,
                             |a, b| {
-                                if send_failed.get() {
+                                if send_failed.get()
+                                    || producer_cancelled.load(std::sync::atomic::Ordering::Acquire)
+                                {
                                     return;
                                 }
-                                let work =
-                                    match expand_catalog_atom_pair(snapshot, a, b, |left, right| {
+                                let work = match expand_catalog_atom_pair_with_budget(
+                                    snapshot,
+                                    a,
+                                    b,
+                                    |work| {
+                                        try_reserve_pair_visits(
+                                            producer_reserved_pair_visits,
+                                            work,
+                                            max_pair_visits,
+                                        )
+                                        .map_err(
+                                            |requested| {
+                                                PipelineError::from(
+                                                    crate::reduce::ReduceError::Budget {
+                                                        resource: "catalog_candidate_pair_visits",
+                                                        requested,
+                                                        limit: max_pair_visits,
+                                                    },
+                                                )
+                                            },
+                                        )
+                                    },
+                                    |left, right| {
                                         batch.push(Edge::new(left, right));
                                         if batch.len() == EDGE_BATCH {
                                             let ready = std::mem::replace(
@@ -936,22 +1206,29 @@ fn score_catalog_parallel(
                                                 ready,
                                                 compaction_scratch,
                                             );
-                                            if producer_sender
-                                                .send(CatalogMessage::CompactedEdges(ready))
-                                                .is_err()
+                                            if let Err(error) =
+                                                collectors.submit_compacted_catalog_batch(ready)
                                             {
+                                                let _ = producer_sender
+                                                    .send(CatalogMessage::Error(error));
                                                 send_failed.set(true);
+                                                producer_cancelled.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::Release,
+                                                );
                                             }
                                         }
-                                    }) {
-                                        Ok(work) => work,
-                                        Err(error) => {
-                                            let _ =
-                                                producer_sender.send(CatalogMessage::Error(error));
-                                            send_failed.set(true);
-                                            return;
-                                        }
-                                    };
+                                    },
+                                ) {
+                                    Ok(work) => work,
+                                    Err(error) => {
+                                        let _ = producer_sender.send(CatalogMessage::Error(error));
+                                        send_failed.set(true);
+                                        producer_cancelled
+                                            .store(true, std::sync::atomic::Ordering::Release);
+                                        return;
+                                    }
+                                };
                                 pending_expansion = pending_expansion.saturating_add(work);
                                 if pending_expansion >= 100_000 {
                                     if producer_sender
@@ -973,6 +1250,11 @@ fn score_catalog_parallel(
                                     send_failed.set(true);
                                 }
                             },
+                            || {
+                                !send_failed.get()
+                                    && !producer_cancelled
+                                        .load(std::sync::atomic::Ordering::Acquire)
+                            },
                         );
                         if !batch.is_empty() {
                             let batch = compact_catalog_scope_batch(
@@ -981,10 +1263,10 @@ fn score_catalog_parallel(
                                 batch,
                                 compaction_scratch,
                             );
-                            if producer_sender
-                                .send(CatalogMessage::CompactedEdges(batch))
-                                .is_err()
-                            {
+                            if let Err(error) = collectors.submit_compacted_catalog_batch(batch) {
+                                let _ = producer_sender.send(CatalogMessage::Error(error));
+                                producer_cancelled
+                                    .store(true, std::sync::atomic::Ordering::Release);
                                 return;
                             }
                         }
@@ -1004,16 +1286,8 @@ fn score_catalog_parallel(
         let mut completed = 0u64;
         let mut expanded = 0u64;
         let mut metrics = IndexMetrics::default();
-        let mut collection_error = None;
         for message in receiver {
             match message {
-                CatalogMessage::CompactedEdges(edges) => {
-                    if collection_error.is_none() {
-                        if let Err(error) = collectors.push_compacted_catalog_batch(edges) {
-                            collection_error = Some(error);
-                        }
-                    }
-                }
                 CatalogMessage::RoutingWork(work) => {
                     completed = completed.saturating_add(work);
                     progress(
@@ -1026,7 +1300,7 @@ fn score_catalog_parallel(
                                 candidates: metrics.routed_pairs,
                                 scored: metrics.routed_pairs,
                                 expanded,
-                                matched: collectors.accepted_edges,
+                                matched: collectors.accepted_edges(),
                                 ..ProgressCounters::default()
                             },
                         )
@@ -1045,7 +1319,7 @@ fn score_catalog_parallel(
                                 candidates: metrics.routed_pairs,
                                 scored: metrics.routed_pairs,
                                 expanded,
-                                matched: collectors.accepted_edges,
+                                matched: collectors.accepted_edges(),
                                 ..ProgressCounters::default()
                             },
                         )
@@ -1053,9 +1327,7 @@ fn score_catalog_parallel(
                     );
                 }
                 CatalogMessage::Error(error) => {
-                    if collection_error.is_none() {
-                        return Err(error);
-                    }
+                    return Err(error);
                 }
                 CatalogMessage::JobDone(job_metrics) => {
                     metrics.add(job_metrics);
@@ -1069,7 +1341,7 @@ fn score_catalog_parallel(
                                 candidates: metrics.routed_pairs,
                                 scored: metrics.routed_pairs,
                                 expanded,
-                                matched: collectors.accepted_edges,
+                                matched: collectors.accepted_edges(),
                                 ..ProgressCounters::default()
                             },
                         )
@@ -1081,9 +1353,6 @@ fn score_catalog_parallel(
         producer
             .join()
             .map_err(|_| PipelineError::Parallel("worker panicked".into()))?;
-        if let Some(error) = collection_error {
-            return Err(error.into());
-        }
         if completed != routing_total {
             return Err(PipelineError::Invariant(format!(
                 "catalog routing progress mismatch: completed={completed}, planned={routing_total}"
@@ -1107,13 +1376,16 @@ fn score_catalog_parallel(
                     candidates: metrics.routed_pairs,
                     scored: metrics.routed_pairs,
                     expanded,
-                    matched: collectors.accepted_edges,
+                    matched: collectors.accepted_edges(),
                     ..ProgressCounters::default()
                 },
             )
             .with_plan(WorkClass::Generic, TotalKind::UpperBound),
         );
-        Ok(metrics)
+        Ok((
+            metrics,
+            reserved_pair_visits.load(std::sync::atomic::Ordering::Acquire),
+        ))
     })
 }
 
@@ -1227,7 +1499,11 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
         WorkUnit::Bytes,
         ProgressCounters::default(),
     ));
-    let base_candidate_pair_visits = planned_candidate_contract_pair_visits(&snapshot)?;
+    // Catalog blocking memberships deliberately overlap. Their raw contract
+    // product is only a progress upper bound, not executed candidate work.
+    // Admit exact fallback work here and reserve owner-routed catalog work
+    // atomically while it executes below.
+    let base_candidate_pair_visits = planned_fallback_contract_pair_visits(&snapshot)?;
     if base_candidate_pair_visits > config.max_candidate_pair_visits {
         return Err(crate::reduce::ReduceError::Budget {
             resource: "candidate_pair_visits",
@@ -1695,44 +1971,49 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
                 }
                 .into());
             }
-            let mut collectors = ScopeEdgeCollectors::new(
+            let collectors = ScopeCollectorBroker::new(
                 node_count,
                 chain_pair_count,
                 budget,
                 edge_bytes,
-                worker_pool.clone(),
-            );
+                config.threads,
+            )?;
+            let match_pool = build_metadata_worker_pool(collectors.scorer_lanes())?;
             // A representative fallback atom is chain-local and scoring-equivalent.
             // Enumerate token-disjoint pairs in bounded deterministic waves: scoring
             // runs in parallel, while edge admission retains lexicographic task order.
             append_fallback_atom_edges_parallel(
                 &snapshot,
-                &worker_pool,
-                &mut collectors,
+                &match_pool,
+                &collectors,
                 chain_count,
                 &mut progress,
             )?;
             const CATALOG_LANE_BYTES: u64 = 8 * 1024 * 1024;
             let lanes = memory
-                .active_lanes(config.threads.max(1), 0, CATALOG_LANE_BYTES)
+                .active_lanes(collectors.scorer_lanes(), 0, CATALOG_LANE_BYTES)
                 .max(1);
             let _scorer_memory =
                 memory.reserve((lanes as u64).saturating_mul(CATALOG_LANE_BYTES))?;
-            // The catalog producer owns its configured Rayon lanes. Keep
-            // receiver-side forest compaction serial so a flush cannot activate
-            // the general worker pool concurrently and exceed --threads.
-            collectors.use_serial_compaction();
             let catalog_result = score_catalog_parallel(
                 &snapshot,
                 &catalog,
                 &recall,
-                lanes,
-                &mut collectors,
-                chain_count,
+                CatalogExecutionConfig {
+                    lanes,
+                    max_pair_visits: config
+                        .max_candidate_pair_visits
+                        .saturating_sub(admitted_pair_visits),
+                    chain_count,
+                },
+                &collectors,
                 &mut progress,
             );
-            collectors.use_worker_pool(worker_pool.clone());
-            let metrics: SerializableIndexMetrics = catalog_result?.into();
+            let (catalog_metrics, catalog_pair_visits) = catalog_result?;
+            let metrics: SerializableIndexMetrics = catalog_metrics.into();
+            let catalog_admitted_pair_visits = admitted_pair_visits
+                .checked_add(catalog_pair_visits)
+                .ok_or(crate::resource::MemoryError::Overflow)?;
             drop(_scorer_memory);
             // Large shared-token scopes use group-local BaseEquivalent routing
             // while remaining source-context isolated.
@@ -1740,34 +2021,33 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
                 max_shared_group_index_bytes_with_progress(&snapshot, &mut progress)?;
             let shared_lane_bytes = shared_index_bytes.saturating_add(CATALOG_LANE_BYTES).max(1);
             let shared_lanes = memory
-                .active_lanes(config.threads.max(1), 0, shared_lane_bytes)
+                .active_lanes(collectors.scorer_lanes(), 0, shared_lane_bytes)
                 .max(1);
             let _shared_index_mem =
                 memory.reserve((shared_lanes as u64).saturating_mul(shared_lane_bytes))?;
-            collectors.use_serial_compaction();
             let shared_result = append_shared_token_edges(
                 &snapshot,
                 shared_lanes,
                 config
                     .max_candidate_pair_visits
-                    .saturating_sub(admitted_pair_visits),
-                &mut collectors,
+                    .saturating_sub(catalog_admitted_pair_visits),
+                &collectors,
                 chain_count,
                 &mut progress,
             );
-            collectors.use_worker_pool(worker_pool.clone());
             let shared_pair_visits = shared_result?;
-            let candidate_pair_visits = admitted_pair_visits
+            let candidate_pair_visits = catalog_admitted_pair_visits
                 .checked_add(shared_pair_visits)
                 .ok_or(crate::resource::MemoryError::Overflow)?;
             append_rescue_edges(
                 &snapshot,
                 &rescue_execution_plan,
-                &mut collectors,
+                &match_pool,
+                &collectors,
                 chain_count,
                 &mut progress,
             )?;
-            let accepted_edge_count = collectors.accepted_edges;
+            let accepted_edge_count = collectors.accepted_edges();
             let (intra_runs, cross_runs, pair_runs) =
                 collectors.finish_with_progress(&mut progress)?;
             if persistence == MatchPersistence::Durable {
@@ -2488,7 +2768,7 @@ fn open_connectivity_runs(
     }
     let manifest: ConnectivityRunManifest = serde_json::from_slice(&std::fs::read(ready)?)?;
     let expected_pairs = chain_count.saturating_mul(chain_count.saturating_sub(1)) / 2;
-    if manifest.revision != 2
+    if manifest.revision != CONNECTIVITY_RUN_REVISION
         || manifest.schema_revision != crate::scoring::MATCH_SEMANTICS_REVISION
         || manifest.snapshot_fingerprint != snapshot_fingerprint
         || manifest.connectivity_plan_digest != connectivity_plan_digest
@@ -2576,7 +2856,7 @@ fn commit_connectivity_runs(
         }
     }
     let manifest = ConnectivityRunManifest {
-        revision: 2,
+        revision: CONNECTIVITY_RUN_REVISION,
         schema_revision: crate::scoring::MATCH_SEMANTICS_REVISION,
         snapshot_fingerprint: commit.snapshot_fingerprint.to_owned(),
         connectivity_plan_digest: commit.connectivity_plan_digest.to_owned(),
@@ -2619,10 +2899,10 @@ fn connectivity_plan_digest(rescue: &RescuePlan) -> Result<String, serde_json::E
         .collect())
 }
 
-fn planned_candidate_contract_pair_visits(
+fn planned_fallback_contract_pair_visits(
     snapshot: &MetadataSnapshot,
 ) -> Result<u64, PipelineError> {
-    let mut total = estimate_catalog_contract_pair_work(snapshot)?;
+    let mut total = 0u64;
     for window in snapshot.features().fallback_atom_offsets.windows(2) {
         total = checked_add_pairs(total, window[1] - window[0])?;
     }
@@ -2747,12 +3027,24 @@ fn catalog_atom_score(snapshot: &MetadataSnapshot, left_atom: u32, right_atom: u
     ) == PairScoreDecision::ExactMatch
 }
 
+#[cfg(test)]
 fn expand_catalog_atom_pair(
     snapshot: &MetadataSnapshot,
     left_atom: u32,
     right_atom: u32,
+    emit: impl FnMut(u32, u32),
+) -> Result<u64, PipelineError> {
+    expand_catalog_atom_pair_with_budget(snapshot, left_atom, right_atom, |_| Ok(()), emit)
+}
+
+fn expand_catalog_atom_pair_with_budget(
+    snapshot: &MetadataSnapshot,
+    left_atom: u32,
+    right_atom: u32,
+    mut reserve: impl FnMut(u64) -> Result<(), PipelineError>,
     mut emit: impl FnMut(u32, u32),
 ) -> Result<u64, PipelineError> {
+    reserve(1)?;
     let left_contracts = atom_contracts(snapshot, left_atom);
     let right_contracts = atom_contracts(snapshot, right_atom);
     if !catalog_atom_score(snapshot, left_atom, right_atom) {
@@ -2761,6 +3053,7 @@ fn expand_catalog_atom_pair(
     let work = (left_contracts.len() as u64)
         .checked_mul(right_contracts.len() as u64)
         .ok_or(crate::resource::MemoryError::Overflow)?;
+    reserve(work)?;
     for &left in left_contracts {
         for &right in right_contracts {
             if left != right && !contracts_share_retained_token(snapshot.features(), left, right) {
@@ -2769,6 +3062,31 @@ fn expand_catalog_atom_pair(
         }
     }
     Ok(work)
+}
+
+fn try_reserve_pair_visits(
+    reserved: &std::sync::atomic::AtomicU64,
+    work: u64,
+    limit: u64,
+) -> Result<(), u64> {
+    let mut current = reserved.load(std::sync::atomic::Ordering::Acquire);
+    loop {
+        let Some(next) = current.checked_add(work) else {
+            return Err(u64::MAX);
+        };
+        if next > limit {
+            return Err(next);
+        }
+        match reserved.compare_exchange_weak(
+            current,
+            next,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3047,13 +3365,54 @@ fn build_rescue_execution_plan(
     })
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RescueExpansionTile {
+    left_begin: usize,
+    left_end: usize,
+    right_begin: usize,
+    right_end: usize,
+}
+
+#[cfg(test)]
+fn rescue_expansion_tiles(
+    dimensions: &[(usize, usize)],
+    tile_side: usize,
+) -> Vec<RescueExpansionTile> {
+    let tile_side = tile_side.max(1);
+    let mut tiles = Vec::new();
+    for &(left_count, right_count) in dimensions {
+        for left_begin in (0..left_count).step_by(tile_side) {
+            let left_end = left_begin.saturating_add(tile_side).min(left_count);
+            for right_begin in (0..right_count).step_by(tile_side) {
+                let right_end = right_begin.saturating_add(tile_side).min(right_count);
+                tiles.push(RescueExpansionTile {
+                    left_begin,
+                    left_end,
+                    right_begin,
+                    right_end,
+                });
+            }
+        }
+    }
+    tiles
+}
+
+enum RescueExpansionMessage {
+    Work(u64),
+    Error(PipelineError),
+}
+
 fn append_rescue_edges(
     snapshot: &MetadataSnapshot,
     plan: &RescueExecutionPlan,
-    collectors: &mut ScopeEdgeCollectors,
+    worker_pool: &rayon::ThreadPool,
+    collectors: &ScopeCollectorBroker,
     chain_count: usize,
     progress: &mut impl FnMut(ProgressEvent),
 ) -> Result<(), PipelineError> {
+    const TILE_SIDE: usize = 256;
+    const EDGE_BATCH: usize = 4_096;
     let total = plan.execution_work();
     progress(ProgressEvent::determinate(
         ProgressPhase::RescuePairs,
@@ -3062,64 +3421,165 @@ fn append_rescue_edges(
         WorkUnit::Pairs,
         ProgressCounters::default(),
     ));
-    let mut completed = 0u64;
-    let mut pending = 0u64;
-    for &(left_atom, right_atom) in &plan.matched_atom_pairs {
-        for &left in atom_contracts(snapshot, left_atom) {
-            for &right in atom_contracts(snapshot, right_atom) {
-                completed = completed.saturating_add(1);
-                pending = pending.saturating_add(1);
-                if left != right
-                    && !contracts_share_retained_token(snapshot.features(), left, right)
-                {
-                    collectors.push(snapshot.features(), chain_count, Edge::new(left, right))?;
+    let features = snapshot.features();
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<RescueExpansionMessage>(
+        worker_pool.current_num_threads().max(1) * 2,
+    );
+    std::thread::scope(|scope| -> Result<(), PipelineError> {
+        let producer_sender = sender.clone();
+        let producer_cancelled = &cancelled;
+        let producer = scope.spawn(move || {
+            worker_pool.install(|| {
+                rayon::join(
+                    || {
+                        plan.matched_atom_pairs
+                            .par_iter()
+                            .for_each(|&(left_atom, right_atom)| {
+                                if producer_cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                                    return;
+                                }
+                                let left_contracts = atom_contracts(snapshot, left_atom);
+                                let right_contracts = atom_contracts(snapshot, right_atom);
+                                let left_tiles = left_contracts.len().div_ceil(TILE_SIDE);
+                                let right_tiles = right_contracts.len().div_ceil(TILE_SIDE);
+                                let tile_count = left_tiles.saturating_mul(right_tiles);
+                                (0..tile_count).into_par_iter().for_each(|tile| {
+                                    if producer_cancelled.load(std::sync::atomic::Ordering::Acquire)
+                                    {
+                                        return;
+                                    }
+                                    let left_tile = tile / right_tiles.max(1);
+                                    let right_tile = tile % right_tiles.max(1);
+                                    let left_begin = left_tile * TILE_SIDE;
+                                    let right_begin = right_tile * TILE_SIDE;
+                                    let left_end = left_begin
+                                        .saturating_add(TILE_SIDE)
+                                        .min(left_contracts.len());
+                                    let right_end = right_begin
+                                        .saturating_add(TILE_SIDE)
+                                        .min(right_contracts.len());
+                                    let mut edges = Vec::with_capacity(EDGE_BATCH);
+                                    for &left in &left_contracts[left_begin..left_end] {
+                                        for &right in &right_contracts[right_begin..right_end] {
+                                            if left != right
+                                                && !contracts_share_retained_token(
+                                                    features, left, right,
+                                                )
+                                            {
+                                                edges.push(Edge::new(left, right));
+                                            }
+                                        }
+                                    }
+                                    if !edges.is_empty() {
+                                        if let Err(error) = collectors.push_edges_by_chain(
+                                            &features.contract_chain,
+                                            chain_count,
+                                            edges,
+                                        ) {
+                                            let _ = producer_sender
+                                                .send(RescueExpansionMessage::Error(error));
+                                            producer_cancelled
+                                                .store(true, std::sync::atomic::Ordering::Release);
+                                            return;
+                                        }
+                                    }
+                                    let work = (left_end - left_begin)
+                                        .saturating_mul(right_end - right_begin)
+                                        as u64;
+                                    if producer_sender
+                                        .send(RescueExpansionMessage::Work(work))
+                                        .is_err()
+                                    {
+                                        producer_cancelled
+                                            .store(true, std::sync::atomic::Ordering::Release);
+                                    }
+                                });
+                            });
+                    },
+                    || {
+                        plan.matched_shared_edges
+                            .par_chunks(EDGE_BATCH)
+                            .for_each(|chunk| {
+                                if producer_cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                                    return;
+                                }
+                                let edges = chunk
+                                    .iter()
+                                    .map(|&(left, right)| Edge::new(left, right))
+                                    .collect::<Vec<_>>();
+                                if let Err(error) = collectors.push_edges_by_chain(
+                                    &features.contract_chain,
+                                    chain_count,
+                                    edges,
+                                ) {
+                                    let _ =
+                                        producer_sender.send(RescueExpansionMessage::Error(error));
+                                    producer_cancelled
+                                        .store(true, std::sync::atomic::Ordering::Release);
+                                    return;
+                                }
+                                if producer_sender
+                                    .send(RescueExpansionMessage::Work(chunk.len() as u64))
+                                    .is_err()
+                                {
+                                    producer_cancelled
+                                        .store(true, std::sync::atomic::Ordering::Release);
+                                }
+                            });
+                    },
+                );
+            });
+        });
+        drop(sender);
+        let mut completed = 0u64;
+        let mut first_error = None;
+        for message in receiver {
+            match message {
+                RescueExpansionMessage::Work(work) => {
+                    completed = completed.saturating_add(work);
                 }
-                if pending >= 65_536 {
-                    progress(ProgressEvent::determinate(
-                        ProgressPhase::RescuePairs,
-                        completed,
-                        total,
-                        WorkUnit::Pairs,
-                        ProgressCounters {
-                            matched: collectors.accepted_edges,
-                            ..ProgressCounters::default()
-                        },
-                    ));
-                    pending = 0;
+                RescueExpansionMessage::Error(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    cancelled.store(true, std::sync::atomic::Ordering::Release);
                 }
             }
-        }
-    }
-    let features = snapshot.features();
-    for &(left, right) in &plan.matched_shared_edges {
-        collectors.push(features, chain_count, Edge::new(left, right))?;
-        completed = completed.saturating_add(1);
-        pending = pending.saturating_add(1);
-        if pending >= 65_536 {
             progress(ProgressEvent::determinate(
                 ProgressPhase::RescuePairs,
                 completed,
                 total,
                 WorkUnit::Pairs,
                 ProgressCounters {
-                    matched: collectors.accepted_edges,
+                    matched: collectors.accepted_edges(),
                     ..ProgressCounters::default()
                 },
             ));
-            pending = 0;
         }
-    }
-    progress(ProgressEvent::determinate(
-        ProgressPhase::RescuePairs,
-        total,
-        total,
-        WorkUnit::Pairs,
-        ProgressCounters {
-            matched: collectors.accepted_edges,
-            ..ProgressCounters::default()
-        },
-    ));
-    Ok(())
+        producer
+            .join()
+            .map_err(|_| PipelineError::Parallel("rescue expansion worker panicked".into()))?;
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        if completed != total {
+            return Err(PipelineError::Invariant(format!(
+                "rescue expansion progress mismatch: completed={completed}, planned={total}"
+            )));
+        }
+        progress(ProgressEvent::determinate(
+            ProgressPhase::RescuePairs,
+            total,
+            total,
+            WorkUnit::Pairs,
+            ProgressCounters {
+                matched: collectors.accepted_edges(),
+                ..ProgressCounters::default()
+            },
+        ));
+        Ok(())
+    })
 }
 
 fn contracts_share_retained_token(
@@ -3147,7 +3607,7 @@ fn append_shared_token_edges(
     s: &MetadataSnapshot,
     lanes: usize,
     max_pair_visits: u64,
-    collectors: &mut ScopeEdgeCollectors,
+    collectors: &ScopeCollectorBroker,
     chain_count: usize,
     progress: &mut impl FnMut(ProgressEvent),
 ) -> Result<u64, PipelineError> {
@@ -3207,6 +3667,112 @@ fn append_shared_token_edges(
                     let end = f.token_member_offsets[token + 1] as usize;
                     let contracts = &f.token_member_contracts[begin..end];
                     let sources = &f.token_member_sources[begin..end];
+                    if contracts.len() >= 256 {
+                        const LOCAL_TILE_MEMBERS: usize = 256;
+                        let sketches = shared_group_sketches(f, sources);
+                        let plan = LocalRoutingPlan::build(&sketches);
+                        plan.tiles(LOCAL_TILE_MEMBERS)
+                            .par_bridge()
+                            .for_each(|tile| {
+                                if producer_cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                                    return;
+                                }
+                                let mut edges = Vec::with_capacity(EDGE_BATCH);
+                                let mut pending_work = 0u64;
+                                let mut failed = false;
+                                let _ = plan.visit_tile(&sketches, &tile, |i, j| {
+                                    if failed
+                                        || producer_cancelled
+                                            .load(std::sync::atomic::Ordering::Acquire)
+                                    {
+                                        return false;
+                                    }
+                                    if !reserve_shared_pair_visit(
+                                        producer_reserved_pair_visits,
+                                        max_pair_visits,
+                                        producer_overflow_requested,
+                                    ) {
+                                        producer_cancelled
+                                            .store(true, std::sync::atomic::Ordering::Release);
+                                        return false;
+                                    }
+                                    pending_work = pending_work.saturating_add(1);
+                                    if let Some(edge) = shared_pair_edge(
+                                        f, contracts, sources, i as usize, j as usize,
+                                    ) {
+                                        edges.push(edge);
+                                        if edges.len() == EDGE_BATCH {
+                                            let ready = std::mem::replace(
+                                                &mut edges,
+                                                Vec::with_capacity(EDGE_BATCH),
+                                            );
+                                            if let Err(error) = collectors.push_edges_by_chain(
+                                                &f.contract_chain,
+                                                chain_count,
+                                                ready,
+                                            ) {
+                                                let _ =
+                                                    worker_sender.send(SharedMessage::Error(error));
+                                                failed = true;
+                                                producer_cancelled.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::Release,
+                                                );
+                                                return false;
+                                            }
+                                        }
+                                    }
+                                    if pending_work >= WORK_BATCH {
+                                        if worker_sender
+                                            .send(SharedMessage::Work {
+                                                pairs: pending_work,
+                                                groups: 0,
+                                            })
+                                            .is_err()
+                                        {
+                                            failed = true;
+                                            producer_cancelled
+                                                .store(true, std::sync::atomic::Ordering::Release);
+                                            return false;
+                                        }
+                                        pending_work = 0;
+                                    }
+                                    true
+                                });
+                                if !edges.is_empty()
+                                    && !failed
+                                    && collectors
+                                        .push_edges_by_chain(&f.contract_chain, chain_count, edges)
+                                        .map_err(|error| {
+                                            let _ = worker_sender.send(SharedMessage::Error(error));
+                                            producer_cancelled
+                                                .store(true, std::sync::atomic::Ordering::Release);
+                                        })
+                                        .is_err()
+                                {
+                                    failed = true;
+                                }
+                                if pending_work > 0
+                                    && !failed
+                                    && worker_sender
+                                        .send(SharedMessage::Work {
+                                            pairs: pending_work,
+                                            groups: 0,
+                                        })
+                                        .is_err()
+                                {
+                                    producer_cancelled
+                                        .store(true, std::sync::atomic::Ordering::Release);
+                                }
+                            });
+                        if !producer_cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                            let _ = worker_sender.send(SharedMessage::Work {
+                                pairs: 0,
+                                groups: 1,
+                            });
+                        }
+                        return;
+                    }
                     let mut edges = Vec::with_capacity(EDGE_BATCH);
                     let mut pending_work = 0u64;
                     let mut failed = false;
@@ -3220,8 +3786,13 @@ fn append_shared_token_edges(
                             if edges.len() == EDGE_BATCH {
                                 let ready =
                                     std::mem::replace(&mut edges, Vec::with_capacity(EDGE_BATCH));
-                                failed = worker_sender.send(SharedMessage::Edges(ready)).is_err();
-                                if failed {
+                                if let Err(error) = collectors.push_edges_by_chain(
+                                    &f.contract_chain,
+                                    chain_count,
+                                    ready,
+                                ) {
+                                    let _ = worker_sender.send(SharedMessage::Error(error));
+                                    failed = true;
                                     producer_cancelled
                                         .store(true, std::sync::atomic::Ordering::Release);
                                 }
@@ -3241,34 +3812,19 @@ fn append_shared_token_edges(
                             pending_work = 0;
                         }
                     };
-                    if contracts.len() < 256 {
-                        for i in 0..contracts.len() {
-                            for j in i + 1..contracts.len() {
-                                visit(i, j);
-                            }
+                    for i in 0..contracts.len() {
+                        for j in i + 1..contracts.len() {
+                            visit(i, j);
                         }
-                    } else {
-                        let sketches = shared_group_sketches(f, sources);
-                        let _ = for_each_local_base_equivalent_pair_while(&sketches, |i, j| {
-                            if producer_cancelled.load(std::sync::atomic::Ordering::Acquire) {
-                                return false;
-                            }
-                            if reserve_shared_pair_visit(
-                                producer_reserved_pair_visits,
-                                max_pair_visits,
-                                producer_overflow_requested,
-                            ) {
-                                visit(i as usize, j as usize);
-                                !producer_cancelled.load(std::sync::atomic::Ordering::Acquire)
-                            } else {
-                                producer_cancelled
-                                    .store(true, std::sync::atomic::Ordering::Release);
-                                false
-                            }
-                        });
                     }
                     if !edges.is_empty() && !failed {
-                        failed = worker_sender.send(SharedMessage::Edges(edges)).is_err();
+                        if let Err(error) =
+                            collectors.push_edges_by_chain(&f.contract_chain, chain_count, edges)
+                        {
+                            let _ = worker_sender.send(SharedMessage::Error(error));
+                            failed = true;
+                            producer_cancelled.store(true, std::sync::atomic::Ordering::Release);
+                        }
                     }
                     if !failed {
                         let _ = worker_sender.send(SharedMessage::Work {
@@ -3285,15 +3841,6 @@ fn append_shared_token_edges(
         let mut collection_error = None;
         for message in receiver {
             match message {
-                SharedMessage::Edges(edges) if collection_error.is_none() => {
-                    for edge in edges {
-                        if let Err(error) = collectors.push(f, chain_count, edge) {
-                            collection_error = Some(PipelineError::from(error));
-                            cancelled.store(true, std::sync::atomic::Ordering::Release);
-                            break;
-                        }
-                    }
-                }
                 SharedMessage::Work {
                     pairs,
                     groups: finished,
@@ -3308,14 +3855,19 @@ fn append_shared_token_edges(
                             WorkUnit::Pairs,
                             ProgressCounters {
                                 groups,
-                                matched: collectors.accepted_edges,
+                                matched: collectors.accepted_edges(),
                                 ..ProgressCounters::default()
                             },
                         )
                         .with_plan(WorkClass::SharedScores, TotalKind::UpperBound),
                     );
                 }
-                SharedMessage::Edges(_) => {}
+                SharedMessage::Error(error) => {
+                    if collection_error.is_none() {
+                        collection_error = Some(error);
+                    }
+                    cancelled.store(true, std::sync::atomic::Ordering::Release);
+                }
             }
         }
         producer
@@ -3340,7 +3892,7 @@ fn append_shared_token_edges(
                 WorkUnit::Pairs,
                 ProgressCounters {
                     groups,
-                    matched: collectors.accepted_edges,
+                    matched: collectors.accepted_edges(),
                     ..ProgressCounters::default()
                 },
             )
@@ -3708,6 +4260,79 @@ mod tests {
     }
 
     #[test]
+    fn scope_collector_broker_shards_scopes_within_thread_ceiling() {
+        let budget = EdgeBudget {
+            max_buffer_bytes: u64::MAX,
+            max_run_edges: u64::MAX,
+            max_total_bytes: u64::MAX,
+        };
+        let contract_chain = [0, 0, 1, 1, 2, 2];
+        let broker = ScopeCollectorBroker::new(6, 3, budget, u64::MAX, 4).unwrap();
+
+        assert_eq!(broker.active_sink_workers(), 2);
+        assert_eq!(broker.scorer_lanes(), 2);
+        broker
+            .push_edges_by_chain(
+                &contract_chain,
+                3,
+                vec![Edge::new(0, 1), Edge::new(0, 2), Edge::new(2, 4)],
+            )
+            .unwrap();
+        let accepted = broker.accepted_edges();
+        let (intra, cross, pairs) = broker.finish().unwrap();
+
+        assert_eq!(accepted, 3);
+        assert_eq!(
+            canonical_edge_components(6, &intra[0].edges),
+            vec![vec![0, 1]]
+        );
+        assert_eq!(
+            canonical_edge_components(6, &cross[0].edges),
+            vec![vec![0, 2, 4]]
+        );
+        assert_eq!(
+            canonical_edge_components(6, &pairs[0][0].edges),
+            vec![vec![0, 2]]
+        );
+        assert_eq!(
+            canonical_edge_components(6, &pairs[2][0].edges),
+            vec![vec![2, 4]]
+        );
+        assert!(pairs[1].is_empty());
+    }
+
+    #[test]
+    fn scope_collector_broker_fails_closed_on_retained_budget_overflow() {
+        let budget = EdgeBudget {
+            max_buffer_bytes: u64::MAX,
+            max_run_edges: u64::MAX,
+            max_total_bytes: u64::MAX,
+        };
+        let broker = ScopeCollectorBroker::new(2, 0, budget, 0, 2).unwrap();
+
+        broker
+            .push_edges_by_chain(&[0, 0], 1, vec![Edge::new(0, 1)])
+            .unwrap();
+        let error = broker.finish().unwrap_err();
+
+        assert!(error.to_string().contains("scope_forest_bytes"));
+    }
+
+    #[test]
+    fn scope_collector_broker_preserves_scorer_capacity_with_many_scopes() {
+        let budget = EdgeBudget {
+            max_buffer_bytes: u64::MAX,
+            max_run_edges: u64::MAX,
+            max_total_bytes: u64::MAX,
+        };
+        let broker = ScopeCollectorBroker::new(1, 120, budget, u64::MAX, 128).unwrap();
+
+        assert_eq!(broker.active_sink_workers(), 32);
+        assert_eq!(broker.scorer_lanes(), 96);
+        broker.finish().unwrap();
+    }
+
+    #[test]
     fn fallback_pair_tasks_cover_each_pair_once_in_stable_order() {
         let member_counts = [0usize, 1, 4, 3];
         let mut cursor = FallbackPairCursor::default();
@@ -3732,6 +4357,27 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(pairs, expected);
+    }
+
+    #[test]
+    fn rescue_expansion_tiles_cover_each_cartesian_visit_once() {
+        let tiles = rescue_expansion_tiles(&[(3, 5)], 2);
+        let mut visits = Vec::new();
+        for tile in tiles {
+            for left in tile.left_begin..tile.left_end {
+                for right in tile.right_begin..tile.right_end {
+                    visits.push((left, right));
+                }
+            }
+        }
+        visits.sort_unstable();
+
+        assert_eq!(
+            visits,
+            (0..3)
+                .flat_map(|left| (0..5).map(move |right| (left, right)))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

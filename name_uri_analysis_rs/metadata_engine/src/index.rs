@@ -148,19 +148,76 @@ impl<'a> ConservativeIndex<'a> {
         mut visit: impl FnMut(u32, u32),
         mut work: impl FnMut(u64),
     ) -> IndexMetrics {
+        self.for_each_job_candidate_with_work_while(job, &mut visit, &mut work, || true)
+    }
+
+    /// Execute one catalog job, stopping pair traversal as soon as
+    /// `keep_going` becomes false. Work reports only fully visited pairs.
+    pub fn for_each_job_candidate_with_work_while(
+        &self,
+        job: &JobDescriptor,
+        mut visit: impl FnMut(u32, u32),
+        mut work: impl FnMut(u64),
+        mut keep_going: impl FnMut() -> bool,
+    ) -> IndexMetrics {
         let blocks = job.first_block as usize..(job.first_block + job.block_count) as usize;
         match job.shape {
-            JobShape::MicroBatch => self.visit_blocks_with_work(blocks, &mut visit, &mut work),
+            JobShape::MicroBatch => {
+                let blocking = self.snapshot.blocking();
+                let mut metrics = IndexMetrics::default();
+                for block in blocks {
+                    let start = blocking.block_atom_offsets[block] as usize;
+                    let end = blocking.block_atom_offsets[block + 1] as usize;
+                    let members = &blocking.block_atoms[start..end];
+                    let before = metrics.block_pair_visits;
+                    for i in 0..members.len() {
+                        for &right in &members[i + 1..] {
+                            if !keep_going() {
+                                work(metrics.block_pair_visits.saturating_sub(before));
+                                return metrics;
+                            }
+                            metrics.block_pair_visits = metrics.block_pair_visits.saturating_add(1);
+                            self.route_pair(block, members[i], right, &mut metrics, &mut visit);
+                        }
+                    }
+                    work(metrics.block_pair_visits.saturating_sub(before));
+                }
+                metrics
+            }
             JobShape::LeftTileFanout => {
                 let mut metrics = IndexMetrics::default();
                 for block in blocks {
-                    metrics.add(self.visit_hot_tile_with_work(
-                        block,
-                        job.tile_row as usize,
-                        job.tile_col as usize,
-                        &mut visit,
-                        &mut work,
-                    ));
+                    let b = self.snapshot.blocking();
+                    let start = b.block_atom_offsets[block] as usize;
+                    let end = b.block_atom_offsets[block + 1] as usize;
+                    let members = &b.block_atoms[start..end];
+                    let a0 = (job.tile_row as usize).saturating_mul(HOT_BLOCK_TILE);
+                    let a1 = (a0 + HOT_BLOCK_TILE).min(members.len());
+                    let b0 = (job.tile_col as usize).saturating_mul(HOT_BLOCK_TILE);
+                    let b1 = (b0 + HOT_BLOCK_TILE).min(members.len());
+                    let before = metrics.block_pair_visits;
+                    for i in a0..a1 {
+                        let j0 = if job.tile_row == job.tile_col {
+                            (i + 1).max(b0)
+                        } else {
+                            b0
+                        };
+                        for j in j0..b1 {
+                            if !keep_going() {
+                                work(metrics.block_pair_visits.saturating_sub(before));
+                                return metrics;
+                            }
+                            metrics.block_pair_visits = metrics.block_pair_visits.saturating_add(1);
+                            self.route_pair(
+                                block,
+                                members[i],
+                                members[j],
+                                &mut metrics,
+                                &mut visit,
+                            );
+                        }
+                    }
+                    work(metrics.block_pair_visits.saturating_sub(before));
                 }
                 metrics
             }

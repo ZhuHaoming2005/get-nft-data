@@ -446,6 +446,37 @@ fn catalog_budget_is_contract_expanded_while_progress_counts_routing_pairs() {
 }
 
 #[test]
+fn catalog_job_traversal_honors_global_cancellation_predicate() {
+    let (_dir, features, blocking) = expanded_atom_snapshot_fixture();
+    let snapshot = MetadataSnapshot::open(&features, &blocking).unwrap();
+    let catalog = WorkCatalog::build(
+        &snapshot,
+        UniverseBudget {
+            max_jobs: 100,
+            max_catalog_bytes: 100_000,
+            cold_members_per_job: 100,
+        },
+        100,
+    )
+    .unwrap();
+    let mut checks = 0u64;
+    let mut reported = 0u64;
+
+    let metrics = ConservativeIndex::open(&snapshot).for_each_job_candidate_with_work_while(
+        &catalog.jobs[0],
+        |_, _| {},
+        |work| reported = reported.saturating_add(work),
+        || {
+            checks = checks.saturating_add(1);
+            checks <= 2
+        },
+    );
+
+    assert_eq!(metrics.block_pair_visits, 2);
+    assert_eq!(reported, 2);
+}
+
+#[test]
 fn forest_runs_preserve_components_and_minimum_roots() {
     let b = EdgeBudget {
         max_buffer_bytes: 1024,
@@ -1424,6 +1455,10 @@ fn catalog_parallelism_preserves_deterministic_components_and_metrics() {
     };
     let serial = run("serial-match", 1);
     let parallel = run("parallel-match", 4);
+    let visible_threads = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(4);
+    let visible_max = run("visible-max-match", visible_threads);
 
     assert_eq!(
         serial.scope_components.intra_roots,
@@ -1441,6 +1476,54 @@ fn catalog_parallelism_preserves_deterministic_components_and_metrics() {
         serial.index_metrics.routed_pairs,
         parallel.index_metrics.routed_pairs
     );
+    assert_eq!(serial.scope_components, visible_max.scope_components);
+    assert_eq!(serial.summary_rows, visible_max.summary_rows);
+    assert_eq!(serial.index_metrics, visible_max.index_metrics);
+}
+
+#[test]
+fn catalog_duplicate_route_upper_bound_does_not_reject_actual_work_budget() {
+    let (dir, features, blocking) = expanded_atom_snapshot_fixture();
+    let result = metadata_engine::pipeline::run_metadata_pipeline(
+        &features,
+        &blocking,
+        &dir.path().join("dynamic-catalog-budget"),
+        &metadata_engine::pipeline::MetadataPipelineConfig {
+            storage_work_directory: dir.path().to_path_buf(),
+            memory_hard_top: MATCH_HARD_TOP,
+            host_total_memory: 512 * GIB,
+            threads: 4,
+            max_catalog_jobs: 100,
+            max_candidate_pair_visits: 10,
+            exact_sample_lefts: 0,
+            exact_pair_work: 0,
+            evidence_gate_policy: EvidenceGatePolicy::permissive(),
+            edge_bytes: 1_000_000,
+        },
+    )
+    .unwrap();
+
+    assert!(result.planned_candidate_pair_visits <= 10);
+
+    let error = metadata_engine::pipeline::run_metadata_pipeline(
+        &features,
+        &blocking,
+        &dir.path().join("dynamic-catalog-budget-rejected"),
+        &metadata_engine::pipeline::MetadataPipelineConfig {
+            storage_work_directory: dir.path().to_path_buf(),
+            memory_hard_top: MATCH_HARD_TOP,
+            host_total_memory: 512 * GIB,
+            threads: 4,
+            max_catalog_jobs: 100,
+            max_candidate_pair_visits: 6,
+            exact_sample_lefts: 0,
+            exact_pair_work: 0,
+            evidence_gate_policy: EvidenceGatePolicy::permissive(),
+            edge_bytes: 1_000_000,
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("catalog_candidate_pair_visits"));
 }
 
 #[test]

@@ -3,7 +3,6 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::path::Path;
-use std::sync::Arc;
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -65,7 +64,6 @@ pub struct ForestRun {
 /// Bounded collector that compacts on byte or per-contract degree triggers.
 enum EdgeSortPolicy {
     Global,
-    Pool(Arc<rayon::ThreadPool>),
     Serial,
 }
 
@@ -96,23 +94,10 @@ impl EdgeCollector {
         }
     }
 
-    pub(crate) fn new_with_pool(
-        node_count: u32,
-        budget: EdgeBudget,
-        degree_trigger: u32,
-        worker_pool: Arc<rayon::ThreadPool>,
-    ) -> Self {
+    pub(crate) fn new_serial(node_count: u32, budget: EdgeBudget, degree_trigger: u32) -> Self {
         let mut collector = Self::new(node_count, budget, degree_trigger);
-        collector.sort_policy = EdgeSortPolicy::Pool(worker_pool);
+        collector.sort_policy = EdgeSortPolicy::Serial;
         collector
-    }
-
-    pub(crate) fn use_serial_sort(&mut self) {
-        self.sort_policy = EdgeSortPolicy::Serial;
-    }
-
-    pub(crate) fn use_worker_pool(&mut self, worker_pool: Arc<rayon::ThreadPool>) {
-        self.sort_policy = EdgeSortPolicy::Pool(worker_pool);
     }
     pub fn push(&mut self, edge: Edge) -> Result<(), ReduceError> {
         let next_bytes = (self.buffer.len().saturating_add(1) * std::mem::size_of::<Edge>()) as u64;
@@ -169,9 +154,6 @@ impl EdgeCollector {
         let node_count = self.node_count;
         let run = match &self.sort_policy {
             EdgeSortPolicy::Global => ForestRun::from_edges(node_count, edges, budget),
-            EdgeSortPolicy::Pool(pool) => {
-                pool.install(move || ForestRun::from_edges(node_count, edges, budget))
-            }
             EdgeSortPolicy::Serial => ForestRun::from_edges_serial(node_count, edges, budget),
         }?;
         let bytes = (run.edges.len() * std::mem::size_of::<Edge>()) as u64;
@@ -200,9 +182,6 @@ impl EdgeCollector {
         let node_count = self.node_count;
         let merged = match &self.sort_policy {
             EdgeSortPolicy::Global => ForestRun::from_edges(node_count, retained, budget),
-            EdgeSortPolicy::Pool(pool) => {
-                pool.install(move || ForestRun::from_edges(node_count, retained, budget))
-            }
             EdgeSortPolicy::Serial => ForestRun::from_edges_serial(node_count, retained, budget),
         }?;
         self.compacted_bytes = (merged.edges.len() * std::mem::size_of::<Edge>()) as u64;
