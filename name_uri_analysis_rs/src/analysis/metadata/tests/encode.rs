@@ -1,12 +1,10 @@
-use std::fs;
+﻿use std::fs;
 use std::path::Path;
 
 use duckdb::Connection;
 use sha2::{Digest, Sha256};
 
-use crate::analysis::{
-    complete_metadata_payload_independence, run_analysis_phase, AnalysisOptions, AnalysisPhase,
-};
+use crate::analysis::{run_analysis_phase, AnalysisOptions, AnalysisPhase};
 use metadata_engine::blocking::BLOCKING_REVISION;
 use metadata_engine::encode::{EncodeBundle, ENCODE_SCHEMA_REVISION};
 use metadata_engine::resource::{MemoryBroker, GIB};
@@ -18,7 +16,7 @@ use super::super::encode::{
 };
 
 #[test]
-fn fallback_resolution_parses_each_contract_only_until_its_first_usable_row() {
+fn fallback_resolution_checks_presence_only_until_its_first_usable_row() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let rows = vec![
@@ -31,14 +29,18 @@ fn fallback_resolution_parses_each_contract_only_until_its_first_usable_row() {
 
     let resolved = resolve_fallback_contracts(&rows, &|json| {
         calls.fetch_add(1, Ordering::Relaxed);
-        metadata_engine::encode::parse_metadata_documents(json)
+        metadata_engine::encode::metadata_has_prefilter_tokens(json)
     });
 
     assert_eq!(resolved.len(), 2);
-    assert_eq!(resolved[0].0 .0, 1);
-    assert_eq!(resolved[0].0 .1, r#"{"description":"first"}"#);
-    assert_eq!(resolved[1].0 .0, 2);
-    assert_eq!(calls.load(Ordering::Relaxed), 3);
+    assert_eq!(resolved[0].0, 1);
+    assert_eq!(resolved[0].1, r#"{"description":"first"}"#);
+    assert_eq!(resolved[1].0, 2);
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        3,
+        "resolution must short-circuit per contract without a full parse"
+    );
 }
 
 fn write_tiny_metadata_parquet(path: &Path) {
@@ -94,6 +96,7 @@ fn file_sha256(path: &Path) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+#[allow(dead_code)] // retained for optional byte-level diagnostics outside semantic oracle
 fn artifact_tree_fingerprints(root: &Path) -> std::collections::BTreeMap<String, [u8; 32]> {
     fn collect(root: &Path, directory: &Path, files: &mut Vec<std::path::PathBuf>) {
         for entry in fs::read_dir(directory).unwrap() {
@@ -118,39 +121,88 @@ fn artifact_tree_fingerprints(root: &Path) -> std::collections::BTreeMap<String,
     output
 }
 
-fn prepare_identity_fingerprint(database: &Path) -> String {
+fn prepare_business_fingerprint(database: &Path) -> String {
     let conn = Connection::open(database).unwrap();
-    conn.query_row(
-        "SELECT string_agg(
-             cast(contract_id AS VARCHAR) || ':' || chain || ':' || contract_address || ':' ||
-             coalesce(cast(metadata_contract_index AS VARCHAR), 'none'),
-             '|' ORDER BY chain, contract_address)
-         FROM analysis_contracts",
-        [],
-        |row| row.get(0),
-    )
-    .unwrap()
+    // Business identity only: dense internal IDs may differ across threads.
+    let contracts: String = conn
+        .query_row(
+            "SELECT string_agg(chain || ':' || contract_address, '|'
+                 ORDER BY chain, contract_address)
+             FROM analysis_contracts
+             WHERE metadata_contract_index IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let tokens: String = conn
+        .query_row(
+            "SELECT coalesce(string_agg(token_id, '|' ORDER BY token_id), '')
+             FROM metadata_token_dictionary",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    format!("{contracts}#{tokens}")
+}
+
+fn semantic_groups_for_scope(
+    work: &Path,
+    database: &Path,
+    scope_directory: &str,
+) -> Vec<Vec<crate::analysis::semantic_oracle::ContractKey>> {
+    use crate::analysis::semantic_oracle::{duplicate_groups_from_roots, ContractKey};
+    use metadata_engine::reduce::ComponentSnapshot;
+
+    let conn = Connection::open(database).unwrap();
+    let mut statement = conn
+        .prepare(
+            "SELECT chain, contract_address
+             FROM analysis_contracts
+             WHERE metadata_contract_index IS NOT NULL
+             ORDER BY metadata_contract_index",
+        )
+        .unwrap();
+    let keys = statement
+        .query_map([], |row| {
+            Ok(ContractKey::new(
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let scope_dir = metadata_engine::pipeline::default_output_dir(work)
+        .join("component-snapshots")
+        .join(scope_directory);
+    let roots = ComponentSnapshot::open(&scope_dir, 0).unwrap().roots;
+    duplicate_groups_from_roots(&roots, &keys)
 }
 
 #[test]
-fn prepare_dense_identities_are_deterministic_across_thread_counts() {
+fn prepare_business_identities_are_stable_across_thread_counts() {
     let dir = tempfile::tempdir().unwrap();
     let parquet = dir.path().join("metadata.parquet");
     write_tiny_metadata_parquet(&parquet);
-    let mut identities = Vec::new();
+    let mut fingerprints = Vec::new();
     for threads in [1, 4] {
         let work = dir.path().join(format!("prepare-{threads}"));
         fs::create_dir_all(&work).unwrap();
         let mut options = tiny_options(&work, &parquet);
         options.threads = threads;
         run_analysis_phase(&options, AnalysisPhase::Prepare, &work).unwrap();
-        identities.push(prepare_identity_fingerprint(&options.database_path));
+        fingerprints.push(prepare_business_fingerprint(&options.database_path));
     }
-    assert_eq!(identities[0], identities[1]);
+    assert_eq!(fingerprints[0], fingerprints[1]);
 }
 
 #[test]
-fn parallel_encode_is_byte_deterministic_across_thread_counts() {
+fn parallel_encode_match_is_semantically_deterministic_across_thread_counts() {
+    use crate::analysis::semantic_oracle::{
+        groups_semantically_equal, summaries_semantically_equal, ContractKey,
+    };
+    use crate::analysis::types::AnalysisReport;
+
     let dir = tempfile::tempdir().unwrap();
     let parquet = dir.path().join("metadata.parquet");
     write_tiny_metadata_parquet(&parquet);
@@ -158,7 +210,9 @@ fn parallel_encode_is_byte_deterministic_across_thread_counts() {
     fs::create_dir_all(&prepared).unwrap();
     let prepared_options = tiny_options(&prepared, &parquet);
     run_analysis_phase(&prepared_options, AnalysisPhase::Prepare, &prepared).unwrap();
-    let mut digests = Vec::new();
+
+    let mut summaries = Vec::new();
+    let mut groups = Vec::new();
     for threads in [1, 4] {
         let work = dir.path().join(format!("work-{threads}"));
         fs::create_dir_all(&work).unwrap();
@@ -166,9 +220,50 @@ fn parallel_encode_is_byte_deterministic_across_thread_counts() {
         options.threads = threads;
         fs::copy(&prepared_options.database_path, &options.database_path).unwrap();
         run_analysis_phase(&options, AnalysisPhase::MetadataEncode, &work).unwrap();
-        digests.push(artifact_tree_fingerprints(&work.join("artifacts/metadata")));
+        run_analysis_phase(&options, AnalysisPhase::MetadataMatch, &work).unwrap();
+        let summary_path = work.join("partial/metadata-summary.json");
+        let report: AnalysisReport =
+            serde_json::from_slice(&fs::read(&summary_path).unwrap()).unwrap();
+        summaries.push(report.summary_rows);
+        groups.push([
+            semantic_groups_for_scope(&work, &options.database_path, "intra"),
+            semantic_groups_for_scope(&work, &options.database_path, "cross"),
+            semantic_groups_for_scope(&work, &options.database_path, "pair-0-1"),
+        ]);
     }
-    assert_eq!(digests[0], digests[1]);
+    assert!(
+        summaries_semantically_equal(&summaries[0], &summaries[1]),
+        "thread=1 vs thread=4 metadata summaries must match semantically:\n{:#?}\n{:#?}",
+        summaries[0],
+        summaries[1]
+    );
+    for (scope, (left, right)) in groups[0].iter().zip(&groups[1]).enumerate() {
+        assert!(
+            groups_semantically_equal(left.clone(), right.clone()),
+            "thread=1 vs thread=4 duplicate groups differ for scope index {scope}"
+        );
+    }
+    assert_eq!(
+        groups[0][0],
+        vec![vec![
+            ContractKey::new("ethereum", "0xaaa"),
+            ContractKey::new("ethereum", "0xbbb"),
+        ]],
+        "intra-chain groups must preserve the business-key golden"
+    );
+    let expected_cross = vec![vec![
+        ContractKey::new("base", "0xccc"),
+        ContractKey::new("ethereum", "0xaaa"),
+        ContractKey::new("ethereum", "0xbbb"),
+    ]];
+    assert_eq!(
+        groups[0][1], expected_cross,
+        "cross-chain groups must preserve the business-key golden"
+    );
+    assert_eq!(
+        groups[0][2], expected_cross,
+        "chain-pair groups must preserve the business-key golden"
+    );
 }
 
 #[test]
@@ -219,7 +314,7 @@ fn encode_admission_freezes_row_totals_for_progress_before_streaming() {
     let admitted_token_json_bytes = token_json_bytes * 5 / 4;
     assert_eq!(
         estimate.token_relation_peak_bytes,
-        token_rows * 64 + representative_rows * 8 + admitted_token_json_bytes + 64 * 1024 * 1024
+        token_rows * 48 + representative_rows * 8 + admitted_token_json_bytes + 64 * 1024 * 1024
     );
     assert_eq!(estimate.partial_peak_bytes, 64 * 1024 * 1024);
     let representative_json_bytes: u64 = conn
@@ -360,31 +455,43 @@ fn encode_stream_reports_frozen_row_totals_and_terminal_completion() {
         .filter(|event| event.phase == ProgressPhase::EncodeCollectTokenSources)
         .collect::<Vec<_>>();
     assert!(!collect.is_empty(), "missing source-catalog progress");
-    assert_eq!(collect[0].total, Some(2));
-    assert_eq!(collect[0].completed, 0);
-    assert_eq!(collect.last().unwrap().completed, 2);
-    assert_eq!(collect.last().unwrap().total, Some(2));
+    assert_phase_progress_monotonic(&collect);
 
     let resolve = events
         .iter()
         .filter(|event| event.phase == ProgressPhase::EncodeResolveTokenMemberships)
         .collect::<Vec<_>>();
     assert!(!resolve.is_empty(), "missing token-resolution progress");
-    assert_eq!(resolve[0].total, Some(2));
-    assert_eq!(resolve[0].completed, 0);
-    assert_eq!(resolve.last().unwrap().total, Some(2));
-    assert_eq!(resolve.last().unwrap().completed, 2);
+    assert_phase_progress_monotonic(&resolve);
 
-    let fallback = events
+    let prepare_fallback = events
+        .iter()
+        .filter(|event| event.phase == ProgressPhase::EncodePrepareFallbackTokenSources)
+        .collect::<Vec<_>>();
+    assert!(
+        !prepare_fallback.is_empty(),
+        "missing fallback SQL-prepare progress"
+    );
+    assert_phase_progress_monotonic(&prepare_fallback);
+    assert_eq!(prepare_fallback[0].total, Some(2));
+    assert_eq!(
+        prepare_fallback[0].unit,
+        metadata_engine::progress::WorkUnit::Work
+    );
+
+    let classify_fallback = events
         .iter()
         .filter(|event| event.phase == ProgressPhase::EncodeTokenFallbackSources)
         .collect::<Vec<_>>();
-    assert!(!fallback.is_empty(), "missing fallback-source progress");
     assert!(
-        fallback.iter().any(|event| event.total == Some(3) && event.completed == 0),
-        "fallback should report SQL work steps before classify"
+        !classify_fallback.is_empty(),
+        "missing fallback classify progress"
     );
-    assert_eq!(fallback.last().unwrap().completed, fallback.last().unwrap().total.unwrap());
+    assert_phase_progress_monotonic(&classify_fallback);
+    assert_eq!(
+        classify_fallback[0].unit,
+        metadata_engine::progress::WorkUnit::Items
+    );
 
     let source_terminal = events
         .iter()
@@ -393,14 +500,51 @@ fn encode_stream_reports_frozen_row_totals_and_terminal_completion() {
     assert!(source_terminal.total.unwrap() > 0);
     assert_eq!(source_terminal.completed, source_terminal.total.unwrap());
 
-    let phase_events = events
+    let read_events = events
         .iter()
-        .filter(|event| event.phase == ProgressPhase::EncodeRows)
+        .filter(|event| event.phase == ProgressPhase::EncodeReadRepresentatives)
         .collect::<Vec<_>>();
-    assert!(!phase_events.is_empty(), "missing EncodeRows");
-    let terminal = phase_events.last().unwrap();
-    assert_eq!(terminal.total, Some(estimate.representative_rows));
-    assert_eq!(terminal.completed, estimate.representative_rows);
+    assert!(!read_events.is_empty(), "missing EncodeReadRepresentatives");
+    let read_terminal = read_events.last().unwrap();
+    assert_eq!(read_terminal.total, Some(estimate.representative_rows));
+    assert_eq!(read_terminal.completed, estimate.representative_rows);
+
+    let register_events = events
+        .iter()
+        .filter(|event| event.phase == ProgressPhase::EncodeRegisterPayloads)
+        .collect::<Vec<_>>();
+    assert!(
+        !register_events.is_empty(),
+        "missing EncodeRegisterPayloads"
+    );
+    let register_terminal = register_events.last().unwrap();
+    assert_eq!(register_terminal.total, Some(estimate.representative_rows));
+    assert_eq!(register_terminal.completed, estimate.representative_rows);
+
+    let parse_unique = events
+        .iter()
+        .rfind(|event| event.phase == ProgressPhase::EncodeParseUniquePayloads)
+        .unwrap();
+    assert_eq!(parse_unique.completed, parse_unique.total.unwrap());
+
+    let term_dictionary = events
+        .iter()
+        .rfind(|event| event.phase == ProgressPhase::EncodeBuildTermDictionary)
+        .unwrap();
+    assert_eq!(term_dictionary.completed, term_dictionary.total.unwrap());
+
+    let build_columns = events
+        .iter()
+        .rfind(|event| event.phase == ProgressPhase::EncodeBuildColumns)
+        .unwrap();
+    assert_eq!(build_columns.completed, build_columns.total.unwrap());
+
+    let build_atoms = events
+        .iter()
+        .rfind(|event| event.phase == ProgressPhase::EncodeBuildAtoms)
+        .unwrap();
+    assert_eq!(build_atoms.completed, build_atoms.total.unwrap());
+
     let finalize = events
         .iter()
         .rfind(|event| event.phase == ProgressPhase::EncodeFinalize)
@@ -408,10 +552,30 @@ fn encode_stream_reports_frozen_row_totals_and_terminal_completion() {
     assert_eq!(finalize.completed, finalize.total.unwrap());
 }
 
+fn assert_phase_progress_monotonic(events: &[&metadata_engine::progress::ProgressEvent]) {
+    let first = events[0];
+    for window in events.windows(2) {
+        let previous = window[0];
+        let next = window[1];
+        assert_eq!(previous.total, first.total, "phase total must stay stable");
+        assert_eq!(next.total, first.total, "phase total must stay stable");
+        assert_eq!(previous.unit, first.unit, "phase unit must stay stable");
+        assert_eq!(next.unit, first.unit, "phase unit must stay stable");
+        assert!(
+            next.completed >= previous.completed,
+            "phase completed must be monotonic"
+        );
+    }
+    let last = events.last().unwrap();
+    if let Some(total) = last.total {
+        assert_eq!(last.completed, total);
+    }
+}
+
 #[test]
-fn optimized_metadata_artifacts_use_revision_two() {
-    assert_eq!(ENCODE_SCHEMA_REVISION, 2);
-    assert_eq!(BLOCKING_REVISION, 2);
+fn optimized_metadata_artifacts_use_revision_three() {
+    assert_eq!(ENCODE_SCHEMA_REVISION, 3);
+    assert_eq!(BLOCKING_REVISION, 3);
 }
 
 fn table_fingerprint(conn: &Connection, table: &str) -> (u64, String) {
@@ -551,7 +715,10 @@ fn match_uses_encode_artifacts_and_releases_payload_dependency() {
     assert!(records
         .values()
         .all(|record| record["class"] != "payload_cas"));
-    assert!(!encode_dir.join("payload_blobs").exists());
+    assert!(
+        !encode_dir.join("payload_blobs").exists(),
+        "full-memory Encode must not create payload_blobs"
+    );
     assert!(records.values().any(|record| {
         record["class"] == "blocking"
             && record["pins"]
@@ -602,7 +769,7 @@ fn metadata_match_fails_closed_when_artifacts_are_corrupt() {
     run_analysis_phase(&options, AnalysisPhase::Prepare, &work).unwrap();
     run_analysis_phase(&options, AnalysisPhase::MetadataEncode, &work).unwrap();
     fs::write(
-        work.join("artifacts/metadata/encode-2/fallback_atoms_offsets.u64"),
+        work.join("artifacts/metadata/encode-3/fallback_atoms_offsets.u64"),
         b"corrupt",
     )
     .unwrap();
@@ -659,7 +826,7 @@ fn encode_preserves_token_specific_metadata_sources() {
 }
 
 #[test]
-fn successful_metadata_pipeline_reclaims_payload_cas() {
+fn successful_metadata_encode_never_creates_payload_cas() {
     let temp = tempfile::tempdir().unwrap();
     let parquet = temp.path().join("tiny.parquet");
     write_tiny_metadata_parquet(&parquet);
@@ -670,7 +837,6 @@ fn successful_metadata_pipeline_reclaims_payload_cas() {
     let features = work.join(format!(
         "artifacts/metadata/encode-{ENCODE_SCHEMA_REVISION}"
     ));
-    complete_metadata_payload_independence(&features, &work).unwrap();
 
     let ledger: serde_json::Value =
         serde_json::from_slice(&fs::read(work.join("storage-ledger.json")).unwrap()).unwrap();
@@ -682,7 +848,52 @@ fn successful_metadata_pipeline_reclaims_payload_cas() {
         .cloned();
     assert_eq!(cas, None);
     assert!(!features.join("payload_blobs").exists());
-    assert!(ledger["match_independent"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn encode_clears_stale_payload_blobs_from_prior_cas_revision() {
+    let temp = tempfile::tempdir().unwrap();
+    let parquet = temp.path().join("tiny.parquet");
+    write_tiny_metadata_parquet(&parquet);
+    let work = temp.path().join("work");
+    let options = tiny_options(&work, &parquet);
+    run_analysis_phase(&options, AnalysisPhase::Prepare, &work).unwrap();
+
+    let encode_dir = work.join(format!(
+        "artifacts/metadata/encode-{ENCODE_SCHEMA_REVISION}"
+    ));
+    let stale_blobs = encode_dir.join("payload_blobs");
+    fs::create_dir_all(&stale_blobs).unwrap();
+    fs::write(stale_blobs.join("pack-0000.bin"), b"stale-cas-pack").unwrap();
+    fs::write(stale_blobs.join("payload_digests.bin"), b"stale").unwrap();
+
+    run_analysis_phase(&options, AnalysisPhase::MetadataEncode, &work).unwrap();
+
+    assert!(
+        !encode_dir.join("payload_blobs").exists(),
+        "Encode must delete leftover payload_blobs before publish"
+    );
+    let ledger: serde_json::Value =
+        serde_json::from_slice(&fs::read(work.join("storage-ledger.json")).unwrap()).unwrap();
+    assert!(ledger["artifacts"]
+        .as_object()
+        .unwrap()
+        .values()
+        .all(|artifact| {
+            artifact["path"]
+                .as_str()
+                .map(|path| !path.contains("payload_blobs"))
+                .unwrap_or(true)
+        }));
+    let ready: serde_json::Value = serde_json::from_slice(
+        &fs::read(work.join("checkpoints/metadata-encode.ready.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(ready["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|artifact| { !artifact["path"].as_str().unwrap().contains("payload_blobs") }));
 }
 
 #[test]

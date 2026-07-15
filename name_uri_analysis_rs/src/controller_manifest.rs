@@ -14,7 +14,9 @@ use crate::controller_constants::{
     FINALIZER_STAGE_REVISION, METADATA_ENCODE_STAGE_REVISION, METADATA_MATCH_STAGE_REVISION,
     NAME_STAGE_REVISION, PIPELINE_SCHEMA_VERSION, PREPARE_STAGE_REVISION,
 };
-use crate::controller_fingerprint::{fingerprint_artifact, ArtifactFingerprint, InputFingerprint};
+use crate::controller_fingerprint::{
+    fingerprint_artifact, fingerprint_artifact_for_expected, ArtifactFingerprint, InputFingerprint,
+};
 use crate::InternalPhase;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -511,7 +513,6 @@ pub(crate) fn invalidate_changed_stage_revisions(
         broker.release_checkpoint_pins("metadata_match_complete")?;
         broker.retire_checkpoint_artifacts("metadata_complete", "invalidated metadata revision")?;
     } else if previous.metadata_match != expected.metadata_match {
-        prune_transient_payload_cas_from_encode_checkpoint(manifest, work_directory)?;
         let mut broker = metadata_engine::storage::StorageBroker::open(work_directory)?;
         broker.release_checkpoint_pins("metadata_match_complete")?;
         broker.retire_checkpoint_artifacts("metadata_complete", "invalidated metadata revision")?;
@@ -563,43 +564,6 @@ pub(crate) fn invalidate_changed_stage_revisions(
 
     manifest.stage_revisions = expected;
     Ok(true)
-}
-
-fn prune_transient_payload_cas_from_encode_checkpoint(
-    manifest: &mut PipelineManifest,
-    work_directory: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let is_payload_cas = |artifact: &ArtifactFingerprint| {
-        artifact
-            .path
-            .components()
-            .any(|component| component.as_os_str() == "payload_blobs")
-    };
-
-    if let Some(checkpoint) = manifest.stages.get_mut("metadata_encode_complete") {
-        checkpoint
-            .artifacts
-            .retain(|artifact| !is_payload_cas(artifact));
-    }
-
-    let ready_path = work_directory
-        .join("checkpoints")
-        .join("metadata-encode.ready.json");
-    if !ready_path.exists() {
-        return Ok(());
-    }
-    let bytes = fs::read(&ready_path)?;
-    let Ok(mut ready) = serde_json::from_slice::<PhaseReady>(&bytes) else {
-        // Normal checkpoint validation owns malformed-marker rejection. A
-        // Match-only revision bump must not turn it into an eager Encode error.
-        return Ok(());
-    };
-    let artifact_count = ready.artifacts.len();
-    ready.artifacts.retain(|artifact| !is_payload_cas(artifact));
-    if ready.artifacts.len() != artifact_count {
-        write_json_atomically(&ready, &ready_path)?;
-    }
-    Ok(())
 }
 
 pub(crate) fn invalidate_stage_checkpoints(manifest: &mut PipelineManifest, stages: &[&str]) {
@@ -683,12 +647,14 @@ pub(crate) fn checkpoint_is_complete_and_valid(
         return Ok(false);
     }
     for expected in &checkpoint.artifacts {
-        let actual = fingerprint_artifact(&expected.path).map_err(|error| {
-            format!(
-                "resume rejected: artifact for stage {stage:?} is unavailable ({}): {error}",
-                expected.path.display()
-            )
-        })?;
+        let actual = fingerprint_artifact_for_expected(&expected.path, &expected.sha256).map_err(
+            |error| {
+                format!(
+                    "resume rejected: artifact for stage {stage:?} is unavailable ({}): {error}",
+                    expected.path.display()
+                )
+            },
+        )?;
         if actual != *expected {
             return Err(format!(
                 "resume rejected: artifact for stage {stage:?} changed: {}",
@@ -833,7 +799,7 @@ pub(crate) fn promote_ready_phase(
             )
             .into());
         }
-        let actual = fingerprint_artifact(&expected.path)?;
+        let actual = fingerprint_artifact_for_expected(&expected.path, &expected.sha256)?;
         if actual.size != expected.size || actual.sha256 != expected.sha256 {
             return Err(format!(
                 "resume rejected: artifact dependency hash does not match {}",

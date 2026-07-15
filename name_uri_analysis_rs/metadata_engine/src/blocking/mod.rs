@@ -13,13 +13,13 @@ pub use base_equivalent::{
 };
 pub use local::{for_each_local_base_equivalent_pair, for_each_local_base_equivalent_pair_while};
 pub use sketch::{
-    build_base_equivalent_atom_sketches, build_base_equivalent_atom_sketches_parallel,
-    BaseEquivalentAtomInput,
+    build_base_equivalent_atom_sketches, build_base_equivalent_atom_sketches_from_soa_parallel,
+    build_base_equivalent_atom_sketches_parallel, BaseEquivalentAtomInput,
 };
 pub use stats::{BlockStats, HotBlockPlan, HotBlockTile};
 
 /// Blocking artifact schema revision for BaseEquivalent.
-pub const BLOCKING_REVISION: u32 = 2;
+pub const BLOCKING_REVISION: u32 = 3;
 
 /// Membership threshold shared by Blocking compilation and Match scheduling.
 pub const DEFAULT_MAX_ROUTING_BLOCK_MEMBERS: usize = 1_000_000;

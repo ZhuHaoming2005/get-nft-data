@@ -5,7 +5,7 @@ mod checksum;
 mod header;
 
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
@@ -18,6 +18,7 @@ pub use header::ArrayHeader;
 
 /// Schema revision for on-disk typed-array files.
 pub const FORMAT_SCHEMA_REVISION: u32 = 1;
+pub const TYPED_ARRAY_CHECKSUM_PREFIX: &str = "typed-array-v1:";
 
 /// Element kind stored in a typed-array file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +40,16 @@ impl ArrayKind {
             ArrayKind::U8 => 1,
             ArrayKind::U32 => 4,
             ArrayKind::U64 | ArrayKind::F64 => 8,
+        }
+    }
+
+    fn from_u32(value: u32) -> Result<Self, FormatError> {
+        match value {
+            1 => Ok(Self::U32),
+            2 => Ok(Self::U64),
+            3 => Ok(Self::F64),
+            4 => Ok(Self::U8),
+            _ => Err(FormatError::InvalidHeader),
         }
     }
 }
@@ -178,6 +189,76 @@ impl Deref for MappedF64Array {
 fn payload_prefix_len() -> usize {
     let pad = (8 - (header::HEADER_SIZE % 8)) % 8;
     header::HEADER_SIZE + pad
+}
+
+fn checksum_hex(checksum: &[u8]) -> String {
+    let mut output = String::with_capacity(checksum.len() * 2);
+    for byte in checksum {
+        use std::fmt::Write as _;
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+fn validate_dynamic_header(header: ArrayHeader, file_size: u64) -> Result<(), FormatError> {
+    let kind = ArrayKind::from_u32(header.kind)?;
+    header.validate_for_kind(kind)?;
+    let expected = (payload_prefix_len() as u64)
+        .checked_add(header.payload_bytes)
+        .and_then(|size| size.checked_add(checksum::CHECKSUM_SIZE as u64))
+        .ok_or(FormatError::InvalidHeader)?;
+    if file_size != expected {
+        return Err(FormatError::Truncated {
+            expected: usize::try_from(expected).unwrap_or(usize::MAX),
+            actual: usize::try_from(file_size).unwrap_or(usize::MAX),
+        });
+    }
+    Ok(())
+}
+
+/// Read and structurally validate a typed-array footer without scanning its payload.
+/// Returns `None` when the file is not a typed array.
+pub fn typed_array_footer_fingerprint(path: &Path) -> Result<Option<(u64, String)>, FormatError> {
+    let mut file = File::open(path)?;
+    let size = file.metadata()?.len();
+    if size < header::HEADER_SIZE as u64 {
+        return Ok(None);
+    }
+    let mut header_bytes = [0u8; header::HEADER_SIZE];
+    file.read_exact(&mut header_bytes)?;
+    if header_bytes[..4] != header::MAGIC {
+        return Ok(None);
+    }
+    let header = ArrayHeader::decode(&header_bytes)?;
+    validate_dynamic_header(header, size)?;
+    file.seek(SeekFrom::End(-(checksum::CHECKSUM_SIZE as i64)))?;
+    let mut footer = [0u8; checksum::CHECKSUM_SIZE];
+    file.read_exact(&mut footer)?;
+    Ok(Some((size, checksum_hex(&footer))))
+}
+
+/// Fully verify a typed-array payload and return its footer identity.
+pub fn verify_typed_array_fingerprint(path: &Path) -> Result<(u64, String), FormatError> {
+    let file = File::open(path)?;
+    let mmap = unsafe { Mmap::map(&file)? };
+    let size = mmap.len() as u64;
+    if mmap.len() < header::HEADER_SIZE {
+        return Err(FormatError::Truncated {
+            expected: header::HEADER_SIZE,
+            actual: mmap.len(),
+        });
+    }
+    let header_bytes = &mmap[..header::HEADER_SIZE];
+    let header = ArrayHeader::decode(header_bytes)?;
+    validate_dynamic_header(header, size)?;
+    let payload_offset = payload_prefix_len();
+    let payload_end = payload_offset
+        .checked_add(header.payload_bytes as usize)
+        .ok_or(FormatError::InvalidHeader)?;
+    let payload = &mmap[payload_offset..payload_end];
+    let footer = &mmap[payload_end..];
+    checksum::verify_checksum(header_bytes, payload, footer)?;
+    Ok((size, checksum_hex(footer)))
 }
 
 fn write_typed_array_file(
@@ -404,11 +485,35 @@ pub fn write_u32_iter_with_progress(
 }
 
 pub fn write_u8_array(path: &Path, values: &[u8]) -> Result<(), FormatError> {
-    let header = ArrayHeader::new(ArrayKind::U8, values.len() as u64, values.len() as u64);
-    write_typed_array_file(path, &header.encode(), |file, hasher| {
-        file.write_all(values)?;
-        hasher.update(values);
-        Ok(())
+    write_u8_iter(path, values.len() as u64, values.iter().copied())
+}
+
+/// Stream a known-length `u8` iterator without materializing a column-sized buffer.
+pub fn write_u8_iter(
+    path: &Path,
+    element_count: u64,
+    values: impl IntoIterator<Item = u8>,
+) -> Result<(), FormatError> {
+    write_u8_iter_with_progress(path, element_count, values, |_| {})
+}
+
+pub fn write_u8_iter_with_progress(
+    path: &Path,
+    element_count: u64,
+    values: impl IntoIterator<Item = u8>,
+    on_payload_bytes: impl FnMut(u64),
+) -> Result<(), FormatError> {
+    let header = iterator_header(ArrayKind::U8, element_count)?;
+    let header_bytes = header.encode();
+    write_typed_array_file(path, &header_bytes, |file, hasher| {
+        write_little_endian_iter(
+            file,
+            hasher,
+            values,
+            element_count,
+            |value| [value],
+            on_payload_bytes,
+        )
     })
 }
 

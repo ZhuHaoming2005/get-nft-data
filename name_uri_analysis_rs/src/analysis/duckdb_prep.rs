@@ -228,10 +228,10 @@ pub(super) fn analysis_contracts_sql() -> String {
                    metadata_source.file_id AS metadata_source_file,
                    metadata_source.row_number AS metadata_source_row_number,
                    metadata_max_json_bytes,
-                   -- Dense IDs are serialized into the immutable Encode
-                   -- snapshot, so their assignment must not depend on the
-                   -- parallel hash-aggregate output order.
-                   row_number() OVER (ORDER BY contract_id) - 1 AS metadata_contract_index
+                   -- Dense IDs need only be unique within this Prepare run.
+                   -- Global sort-by-contract_id is intentionally omitted so
+                   -- assignment can follow unordered hash-aggregate output.
+                   row_number() OVER () - 1 AS metadata_contract_index
             FROM metadata_sources
         )
         SELECT contracts.contract_id,
@@ -299,7 +299,7 @@ pub(crate) fn build_core_rows_sql(inputs: &str) -> String {
             WHERE contract_address <> ''
             GROUP BY chain, contract_address
         )
-        SELECT (row_number() OVER (ORDER BY chain, contract_address) - 1)::UINTEGER AS contract_id,
+        SELECT (row_number() OVER () - 1)::UINTEGER AS contract_id,
                *
         FROM aggregated;
         "

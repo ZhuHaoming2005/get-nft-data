@@ -80,6 +80,21 @@ fn prefilter_presence_matches_full_parse() {
             "prefilter presence mismatch for fixture: {raw}"
         );
     }
+    // Proven key may appear before a large ignored sibling; last-wins still keeps it.
+    let proven_then_duplicate =
+        r#"{"description":"gold","description":"silver","padding":{"a":1,"b":2}}"#;
+    assert_eq!(
+        metadata_has_prefilter_tokens(proven_then_duplicate),
+        !parse_metadata_documents(proven_then_duplicate)
+            .prefilter_tokens
+            .is_empty()
+    );
+    // Passthrough keys must not prove presence from the key name alone.
+    let passthrough_only = r#"{"metadata":{},"raw":{},"rawMetadata":{}}"#;
+    assert!(!metadata_has_prefilter_tokens(passthrough_only));
+    assert!(parse_metadata_documents(passthrough_only)
+        .prefilter_tokens
+        .is_empty());
 }
 
 #[test]

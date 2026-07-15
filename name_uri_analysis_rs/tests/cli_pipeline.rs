@@ -1,4 +1,4 @@
-use std::fs;
+﻿use std::fs;
 use std::path::Path;
 use std::process::Command;
 
@@ -106,8 +106,8 @@ fn public_controller_runs_all_children_and_resumes_finalized_pipeline() {
         work.join("partial/metadata-summary.json"),
         work.join("artifacts/metadata/readiness-input.json"),
         work.join("artifacts/metadata/production-readiness.json"),
-        work.join("artifacts/metadata/encode-2/features.ready"),
-        work.join("artifacts/metadata/blocking-2/blocking.ready"),
+        work.join("artifacts/metadata/encode-3/features.ready"),
+        work.join("artifacts/metadata/blocking-3/blocking.ready"),
         work.join("artifacts/metadata/match-1/index-1/index.ready"),
         work.join("artifacts/metadata/match-1/metadata-summary-1/metadata-summary.ready"),
     ] {

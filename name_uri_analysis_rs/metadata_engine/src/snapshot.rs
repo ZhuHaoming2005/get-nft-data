@@ -18,6 +18,8 @@ struct FeatureReady {
     schema_revision: u32,
     source_count: usize,
     payload_count: usize,
+    #[serde(default)]
+    artifact_run_id: Option<String>,
     chains: Vec<String>,
     chain_totals: Vec<ChainTotal>,
 }
@@ -33,6 +35,8 @@ pub struct ChainTotal {
 struct BlockingReady {
     blocking_revision: u32,
     atom_count: usize,
+    #[serde(default)]
+    artifact_run_id: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -263,6 +267,11 @@ impl MetadataSnapshot {
             blocking_ready.blocking_revision,
             BLOCKING_REVISION,
         )?;
+        if feature_ready.artifact_run_id != blocking_ready.artifact_run_id {
+            return Err(SnapshotError::Invariant(
+                "encode and blocking publish generation mismatch".into(),
+            ));
+        }
 
         let encode = EncodeBundle::open_with_progress(features_dir, &mut progress)?;
         let features = encode.feature_view();
@@ -515,6 +524,9 @@ fn validate_feature_view(view: &FeatureView, ready: &FeatureReady) -> Result<(),
         || view.prepared_weight_offsets.last().copied() != Some(view.prepared_weights.len() as u64)
         || view.prepared_weight_offsets.windows(2).any(|w| w[0] > w[1])
         || view.prepared_weights.len() != view.payload_template_terms.len()
+        || view.payload_template_sigs.len()
+            != payload_count * crate::cascade::PAYLOAD_TERM_SIG_BYTES
+        || view.payload_content_sigs.len() != payload_count * crate::cascade::PAYLOAD_TERM_SIG_BYTES
         || view.contract_source.len() != view.contract_payload.len()
         || view.contract_source.len() != view.contract_chain.len()
         || view.contract_source.len() != view.contract_weight.len()

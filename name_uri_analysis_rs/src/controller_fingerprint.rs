@@ -170,6 +170,33 @@ pub(crate) fn fingerprint_artifact(
     })
 }
 
+pub(crate) fn fingerprint_artifact_for_expected(
+    path: &Path,
+    expected_sha256: &str,
+) -> Result<ArtifactFingerprint, Box<dyn std::error::Error>> {
+    let Some(expected_checksum) =
+        expected_sha256.strip_prefix(metadata_engine::format::TYPED_ARRAY_CHECKSUM_PREFIX)
+    else {
+        return fingerprint_artifact(path);
+    };
+    let canonical_path = path.canonicalize()?;
+    let (size, checksum) =
+        metadata_engine::format::verify_typed_array_fingerprint(&canonical_path)?;
+    if checksum != expected_checksum {
+        return Err(format!("typed-array footer changed: {}", canonical_path.display()).into());
+    }
+    Ok(ArtifactFingerprint {
+        path: canonical_path,
+        size,
+        row_count: artifact_row_count(path),
+        sha256: format!(
+            "{}{}",
+            metadata_engine::format::TYPED_ARRAY_CHECKSUM_PREFIX,
+            checksum
+        ),
+    })
+}
+
 pub(crate) fn artifact_row_count(path: &Path) -> Option<u64> {
     match path.extension().and_then(|extension| extension.to_str()) {
         Some("json") => fs::read(path)

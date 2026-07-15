@@ -66,7 +66,7 @@ pub(super) fn metadata_contract_token_rows_sql() -> &'static str {
 
         CREATE TABLE metadata_token_dictionary AS
         SELECT token_id,
-               (row_number() OVER (ORDER BY token_id) - 1)::BIGINT AS token_index
+               (row_number() OVER () - 1)::BIGINT AS token_index
         FROM metadata_token_frequencies
         WHERE contract_frequency >= 2;
 
@@ -110,5 +110,10 @@ mod tests {
         assert!(!sql.contains("rowid"));
         assert!(sql.contains("metadata_source_file"));
         assert!(sql.contains("metadata_source_row_number"));
+        assert!(
+            sql.contains("(row_number() OVER () - 1)::BIGINT AS token_index"),
+            "token_index must be unordered dense, not ORDER BY token_id"
+        );
+        assert!(!sql.contains("ORDER BY token_id"));
     }
 }

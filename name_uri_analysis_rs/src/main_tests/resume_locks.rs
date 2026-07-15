@@ -1,9 +1,9 @@
-use super::*;
+﻿use super::*;
 
 #[test]
 fn metadata_stage_revision_tracks_encode_and_match_semantics() {
-    assert_eq!(StageRevisions::current().metadata_encode, 3);
-    assert_eq!(StageRevisions::current().metadata_match, 11);
+    assert_eq!(StageRevisions::current().metadata_encode, 5);
+    assert_eq!(StageRevisions::current().metadata_match, 12);
     assert_eq!(StageRevisions::current().prepare, 2);
     assert_eq!(StageRevisions::current().name, 1);
 }
@@ -588,13 +588,13 @@ fn metadata_encode_ready_rejects_a_missing_feature_dependency() {
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir_all(temp.path().join("partial")).unwrap();
     fs::create_dir_all(temp.path().join("checkpoints")).unwrap();
-    fs::create_dir_all(temp.path().join("artifacts/metadata/encode-2")).unwrap();
+    fs::create_dir_all(temp.path().join("artifacts/metadata/encode-3")).unwrap();
     let partial = temp.path().join("partial/metadata-encode-summary.json");
     fs::write(&partial, br#"{"summary_rows":[]}"#).unwrap();
     let partial_fingerprint = fingerprint_artifact(&partial).unwrap();
     let feature = temp
         .path()
-        .join("artifacts/metadata/encode-2/source_to_payload.u32");
+        .join("artifacts/metadata/encode-3/source_to_payload.u32");
     fs::write(&feature, b"feature").unwrap();
     let feature_fingerprint = fingerprint_artifact(&feature).unwrap();
     let ready = PhaseReady {
@@ -625,19 +625,15 @@ fn metadata_encode_ready_rejects_a_missing_feature_dependency() {
 }
 
 #[test]
-fn match_revision_upgrade_prunes_transient_cas_without_invalidating_encode() {
+fn match_revision_upgrade_keeps_encode_checkpoint() {
     let temp = tempfile::tempdir().unwrap();
     let work = temp.path().join("work");
     let checkpoints = work.join("checkpoints");
-    let feature = work.join("artifacts/metadata/encode-2/source_to_payload.u32");
-    let cas = work.join("artifacts/metadata/encode-2/payload_blobs/pack-000.bin");
+    let feature = work.join("artifacts/metadata/encode-3/source_to_payload.u32");
     fs::create_dir_all(feature.parent().unwrap()).unwrap();
-    fs::create_dir_all(cas.parent().unwrap()).unwrap();
     fs::create_dir_all(&checkpoints).unwrap();
     fs::write(&feature, b"feature").unwrap();
-    fs::write(&cas, b"cas").unwrap();
     let feature_fingerprint = fingerprint_artifact(&feature).unwrap();
-    let cas_fingerprint = fingerprint_artifact(&cas).unwrap();
 
     let mut manifest = sample_manifest(&work);
     manifest.stage_revisions.metadata_match = 9;
@@ -645,7 +641,7 @@ fn match_revision_upgrade_prunes_transient_cas_without_invalidating_encode() {
         "metadata_encode_complete".to_string(),
         StageCheckpoint {
             complete: true,
-            artifacts: vec![feature_fingerprint.clone(), cas_fingerprint.clone()],
+            artifacts: vec![feature_fingerprint.clone()],
         },
     );
     let partial = work.join("partial/metadata-encode-summary.json");
@@ -657,7 +653,7 @@ fn match_revision_upgrade_prunes_transient_cas_without_invalidating_encode() {
         partial_file: "metadata-encode-summary.json".to_string(),
         size: partial_fingerprint.size,
         sha256: partial_fingerprint.sha256,
-        artifacts: vec![feature_fingerprint.clone(), cas_fingerprint],
+        artifacts: vec![feature_fingerprint.clone()],
     };
     fs::write(
         checkpoints.join("metadata-encode.ready.json"),
@@ -681,5 +677,4 @@ fn match_revision_upgrade_prunes_transient_cas_without_invalidating_encode() {
         serde_json::from_slice(&fs::read(checkpoints.join("metadata-encode.ready.json")).unwrap())
             .unwrap();
     assert_eq!(migrated.artifacts, vec![feature_fingerprint]);
-    assert!(cas.exists(), "Match owns CAS collection after upgrade");
 }

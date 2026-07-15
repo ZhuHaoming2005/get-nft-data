@@ -158,7 +158,7 @@ struct ComponentScopePlan {
     needs_rebuild: bool,
     rebuilt_snapshots: Option<Vec<ComponentSnapshot>>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MetadataSummaryRow {
     pub scope: String,
     pub primary_chain: String,
@@ -500,6 +500,7 @@ fn compact_catalog_scope_batch(
     features: &crate::encode::FeatureView,
     chain_count: usize,
     edges: Vec<Edge>,
+    scratch: &mut ScopeCompactionScratch,
 ) -> CompactedCatalogEdges {
     let accepted_edges = edges.len() as u64;
     let mut intra = Vec::new();
@@ -519,41 +520,116 @@ fn compact_catalog_scope_batch(
         }
     }
     CompactedCatalogEdges {
-        intra: compact_scope_edges(intra),
-        cross: compact_scope_edges(cross),
+        intra: compact_scope_edges_with_scratch(intra, scratch),
+        cross: compact_scope_edges_with_scratch(cross, scratch),
         chain_pairs: chain_pairs
             .into_iter()
-            .map(|(pair, edges)| (pair, compact_scope_edges(edges)))
+            .map(|(pair, edges)| (pair, compact_scope_edges_with_scratch(edges, scratch)))
             .collect(),
         accepted_edges,
     }
 }
 
-fn compact_scope_edges(mut edges: Vec<Edge>) -> Vec<Edge> {
-    edges.sort_unstable();
-    edges.dedup();
-    let mut identities = HashMap::<u32, usize>::new();
-    let mut parent = Vec::<usize>::new();
-    let mut forest = Vec::new();
-    for edge in edges {
-        let left = *identities.entry(edge.left).or_insert_with(|| {
-            let id = parent.len();
-            parent.push(id);
-            id
-        });
-        let right = *identities.entry(edge.right).or_insert_with(|| {
-            let id = parent.len();
-            parent.push(id);
-            id
-        });
-        let left_root = sparse_find(&mut parent, left);
-        let right_root = sparse_find(&mut parent, right);
-        if left_root != right_root {
-            parent[right_root] = left_root;
-            forest.push(edge);
+struct ScopeCompactionScratch {
+    sparse_identities: HashMap<u32, usize>,
+    dense_local_ids: Vec<u32>,
+    dense_generations: Vec<u32>,
+    generation: u32,
+    parent: Vec<usize>,
+}
+
+impl ScopeCompactionScratch {
+    fn new(contract_count: usize, dense_budget_bytes: usize) -> Self {
+        let dense_bytes = contract_count.saturating_mul(2 * std::mem::size_of::<u32>());
+        let dense = dense_bytes <= dense_budget_bytes;
+        Self {
+            sparse_identities: HashMap::new(),
+            dense_local_ids: if dense {
+                vec![0; contract_count]
+            } else {
+                Vec::new()
+            },
+            dense_generations: if dense {
+                vec![0; contract_count]
+            } else {
+                Vec::new()
+            },
+            generation: 0,
+            parent: Vec::new(),
         }
     }
-    forest
+
+    fn begin_scope(&mut self, edge_count: usize) {
+        self.parent.clear();
+        self.parent.reserve(edge_count.saturating_mul(2));
+        if self.dense_generations.is_empty() {
+            self.sparse_identities.clear();
+            self.sparse_identities.reserve(edge_count.saturating_mul(2));
+            return;
+        }
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.dense_generations.fill(0);
+            self.generation = 1;
+        }
+    }
+
+    fn identity(&mut self, contract_id: u32) -> usize {
+        if self.dense_generations.is_empty() {
+            if let Some(&identity) = self.sparse_identities.get(&contract_id) {
+                return identity;
+            }
+            let identity = self.parent.len();
+            self.parent.push(identity);
+            self.sparse_identities.insert(contract_id, identity);
+            return identity;
+        }
+        let slot = contract_id as usize;
+        debug_assert!(slot < self.dense_generations.len());
+        if self.dense_generations[slot] == self.generation {
+            return self.dense_local_ids[slot] as usize;
+        }
+        let identity = self.parent.len();
+        self.parent.push(identity);
+        self.dense_generations[slot] = self.generation;
+        self.dense_local_ids[slot] = identity as u32;
+        identity
+    }
+}
+
+#[cfg(test)]
+fn compact_scope_edges(edges: Vec<Edge>) -> Vec<Edge> {
+    let contract_count = edges
+        .iter()
+        .flat_map(|edge| [edge.left, edge.right])
+        .max()
+        .map_or(0, |maximum| maximum as usize + 1);
+    let mut scratch = ScopeCompactionScratch::new(contract_count, usize::MAX);
+    compact_scope_edges_with_scratch(edges, &mut scratch)
+}
+
+fn compact_scope_edges_with_scratch(
+    mut edges: Vec<Edge>,
+    scratch: &mut ScopeCompactionScratch,
+) -> Vec<Edge> {
+    // Forest connectivity is order-independent; skip global sort/dedup and let
+    // union-find ignore duplicate and cyclic edges.
+    scratch.begin_scope(edges.len());
+    let mut written = 0usize;
+    for read in 0..edges.len() {
+        let edge = edges[read];
+        let left = scratch.identity(edge.left);
+        let right = scratch.identity(edge.right);
+        let left_root = sparse_find(&mut scratch.parent, left);
+        let right_root = sparse_find(&mut scratch.parent, right);
+        if left_root != right_root {
+            scratch.parent[right_root] = left_root;
+            edges[written] = edge;
+            written += 1;
+        }
+    }
+    edges.truncate(written);
+    edges
 }
 
 fn sparse_find(parent: &mut [usize], node: usize) -> usize {
@@ -618,88 +694,103 @@ fn score_catalog_parallel(
         let producer_sender = sender.clone();
         let producer = scope.spawn(move || {
             pool.install(|| {
-                plan.ordered_job_ids.par_iter().for_each(|&job_id| {
-                    let Some(job) = catalog.jobs.get(job_id as usize) else {
-                        return;
-                    };
-                    let mut batch = Vec::with_capacity(EDGE_BATCH);
-                    let send_failed = std::cell::Cell::new(false);
-                    let mut pending_expansion = 0u64;
-                    let metrics = index.for_each_job_candidate_with_work(
-                        job,
-                        |a, b| {
-                            if send_failed.get() {
-                                return;
-                            }
-                            let work =
-                                match expand_catalog_atom_pair(snapshot, a, b, |left, right| {
-                                    batch.push(Edge::new(left, right));
-                                    if batch.len() == EDGE_BATCH {
-                                        let ready = std::mem::replace(
-                                            &mut batch,
-                                            Vec::with_capacity(EDGE_BATCH),
-                                        );
-                                        let ready = compact_catalog_scope_batch(
-                                            snapshot.features(),
-                                            chain_count,
-                                            ready,
-                                        );
-                                        if producer_sender
-                                            .send(CatalogMessage::CompactedEdges(ready))
-                                            .is_err()
-                                        {
-                                            send_failed.set(true);
+                const DENSE_COMPACTION_SCRATCH_BYTES: usize = 4 * 1024 * 1024;
+                plan.ordered_job_ids.par_iter().for_each_init(
+                    || {
+                        ScopeCompactionScratch::new(
+                            snapshot.features().contract_chain.len(),
+                            DENSE_COMPACTION_SCRATCH_BYTES,
+                        )
+                    },
+                    |compaction_scratch, &job_id| {
+                        let Some(job) = catalog.jobs.get(job_id as usize) else {
+                            return;
+                        };
+                        let mut batch = Vec::with_capacity(EDGE_BATCH);
+                        let send_failed = std::cell::Cell::new(false);
+                        let mut pending_expansion = 0u64;
+                        let metrics = index.for_each_job_candidate_with_work(
+                            job,
+                            |a, b| {
+                                if send_failed.get() {
+                                    return;
+                                }
+                                let work =
+                                    match expand_catalog_atom_pair(snapshot, a, b, |left, right| {
+                                        batch.push(Edge::new(left, right));
+                                        if batch.len() == EDGE_BATCH {
+                                            let ready = std::mem::replace(
+                                                &mut batch,
+                                                Vec::with_capacity(EDGE_BATCH),
+                                            );
+                                            let ready = compact_catalog_scope_batch(
+                                                snapshot.features(),
+                                                chain_count,
+                                                ready,
+                                                compaction_scratch,
+                                            );
+                                            if producer_sender
+                                                .send(CatalogMessage::CompactedEdges(ready))
+                                                .is_err()
+                                            {
+                                                send_failed.set(true);
+                                            }
                                         }
-                                    }
-                                }) {
-                                    Ok(work) => work,
-                                    Err(error) => {
-                                        let _ = producer_sender.send(CatalogMessage::Error(error));
+                                    }) {
+                                        Ok(work) => work,
+                                        Err(error) => {
+                                            let _ =
+                                                producer_sender.send(CatalogMessage::Error(error));
+                                            send_failed.set(true);
+                                            return;
+                                        }
+                                    };
+                                pending_expansion = pending_expansion.saturating_add(work);
+                                if pending_expansion >= 100_000 {
+                                    if producer_sender
+                                        .send(CatalogMessage::ExpansionWork(pending_expansion))
+                                        .is_err()
+                                    {
                                         send_failed.set(true);
                                         return;
                                     }
-                                };
-                            pending_expansion = pending_expansion.saturating_add(work);
-                            if pending_expansion >= 100_000 {
-                                if producer_sender
-                                    .send(CatalogMessage::ExpansionWork(pending_expansion))
-                                    .is_err()
+                                    pending_expansion = 0;
+                                }
+                            },
+                            |work| {
+                                if work > 0
+                                    && producer_sender
+                                        .send(CatalogMessage::RoutingWork(work))
+                                        .is_err()
                                 {
                                     send_failed.set(true);
-                                    return;
                                 }
-                                pending_expansion = 0;
-                            }
-                        },
-                        |work| {
-                            if work > 0
-                                && producer_sender
-                                    .send(CatalogMessage::RoutingWork(work))
-                                    .is_err()
+                            },
+                        );
+                        if !batch.is_empty() {
+                            let batch = compact_catalog_scope_batch(
+                                snapshot.features(),
+                                chain_count,
+                                batch,
+                                compaction_scratch,
+                            );
+                            if producer_sender
+                                .send(CatalogMessage::CompactedEdges(batch))
+                                .is_err()
                             {
-                                send_failed.set(true);
+                                return;
                             }
-                        },
-                    );
-                    if !batch.is_empty() {
-                        let batch =
-                            compact_catalog_scope_batch(snapshot.features(), chain_count, batch);
-                        if producer_sender
-                            .send(CatalogMessage::CompactedEdges(batch))
-                            .is_err()
+                        }
+                        if pending_expansion > 0
+                            && producer_sender
+                                .send(CatalogMessage::ExpansionWork(pending_expansion))
+                                .is_err()
                         {
                             return;
                         }
-                    }
-                    if pending_expansion > 0
-                        && producer_sender
-                            .send(CatalogMessage::ExpansionWork(pending_expansion))
-                            .is_err()
-                    {
-                        return;
-                    }
-                    let _ = producer_sender.send(CatalogMessage::JobDone(metrics));
-                });
+                        let _ = producer_sender.send(CatalogMessage::JobDone(metrics));
+                    },
+                );
             });
         });
         drop(sender);
@@ -3182,7 +3273,18 @@ mod tests {
             Edge::new(0, 1),
         ]);
 
-        assert_eq!(compacted, vec![Edge::new(0, 1), Edge::new(0, 2)]);
+        assert_eq!(compacted.len(), 2);
+        let mut parent = [0usize, 1, 2];
+        for edge in &compacted {
+            let left = sparse_find(&mut parent, edge.left as usize);
+            let right = sparse_find(&mut parent, edge.right as usize);
+            if left != right {
+                parent[right] = left;
+            }
+        }
+        let roots: std::collections::BTreeSet<_> =
+            (0..3).map(|node| sparse_find(&mut parent, node)).collect();
+        assert_eq!(roots.len(), 1);
     }
 
     #[test]
@@ -3265,13 +3367,13 @@ mod tests {
         commit_ready(
             &features,
             "features.ready",
-            r#"{"schema_revision":2,"source_count":4,"payload_count":2,"chains":["x"],"chain_totals":[{"name":"x","contracts":4,"nfts":4}]}"#,
+            r#"{"schema_revision":3,"source_count":4,"payload_count":2,"chains":["x"],"chain_totals":[{"name":"x","contracts":4,"nfts":4}]}"#,
         )
         .unwrap();
         commit_ready(
             &blocking,
             "blocking.ready",
-            r#"{"blocking_revision":2,"atom_count":2}"#,
+            r#"{"blocking_revision":3,"atom_count":2}"#,
         )
         .unwrap();
         let snapshot = MetadataSnapshot::open(&features, &blocking).unwrap();
@@ -3336,13 +3438,13 @@ mod tests {
         commit_ready(
             &features,
             "features.ready",
-            r#"{"schema_revision":2,"source_count":3,"payload_count":3,"chains":["x"],"chain_totals":[{"name":"x","contracts":3,"nfts":3}]}"#,
+            r#"{"schema_revision":3,"source_count":3,"payload_count":3,"chains":["x"],"chain_totals":[{"name":"x","contracts":3,"nfts":3}]}"#,
         )
         .unwrap();
         commit_ready(
             &blocking,
             "blocking.ready",
-            r#"{"blocking_revision":2,"atom_count":3}"#,
+            r#"{"blocking_revision":3,"atom_count":3}"#,
         )
         .unwrap();
         let snapshot = MetadataSnapshot::open(&features, &blocking).unwrap();
@@ -3414,13 +3516,13 @@ mod tests {
         commit_ready(
             &features,
             "features.ready",
-            r#"{"schema_revision":2,"source_count":3,"payload_count":3,"chains":["x"],"chain_totals":[{"name":"x","contracts":3,"nfts":3}]}"#,
+            r#"{"schema_revision":3,"source_count":3,"payload_count":3,"chains":["x"],"chain_totals":[{"name":"x","contracts":3,"nfts":3}]}"#,
         )
         .unwrap();
         commit_ready(
             &blocking,
             "blocking.ready",
-            r#"{"blocking_revision":2,"atom_count":3}"#,
+            r#"{"blocking_revision":3,"atom_count":3}"#,
         )
         .unwrap();
         let snapshot = MetadataSnapshot::open(&features, &blocking).unwrap();
@@ -3561,13 +3663,13 @@ mod tests {
         commit_ready(
             &features,
             "features.ready",
-            r#"{"schema_revision":2,"source_count":3,"payload_count":2,"chains":["x"],"chain_totals":[{"name":"x","contracts":3,"nfts":3}]}"#,
+            r#"{"schema_revision":3,"source_count":3,"payload_count":2,"chains":["x"],"chain_totals":[{"name":"x","contracts":3,"nfts":3}]}"#,
         )
         .unwrap();
         commit_ready(
             &blocking,
             "blocking.ready",
-            r#"{"blocking_revision":2,"atom_count":2}"#,
+            r#"{"blocking_revision":3,"atom_count":2}"#,
         )
         .unwrap();
         let snapshot = MetadataSnapshot::open(&features, &blocking).unwrap();

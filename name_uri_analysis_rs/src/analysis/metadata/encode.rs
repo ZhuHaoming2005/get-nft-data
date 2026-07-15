@@ -3,29 +3,33 @@
 //! Writes feature/blocking artifacts under `artifacts/metadata/`.
 //! Never mutates Prepare/Name tables and never produces production summary rows.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use duckdb::arrow::array::{
-    Array, BooleanArray, StringArray, StringViewArray, UInt32Array, UInt64Array,
+    Array, BooleanArray, Int64Array, StringArray, StringViewArray, UInt32Array, UInt64Array,
 };
 use duckdb::arrow::datatypes::{DataType, Field, Schema};
 use duckdb::arrow::record_batch::RecordBatch;
 use duckdb::Connection;
 use metadata_engine::blocking::{
-    build_base_equivalent_atom_sketches_parallel, compile_base_equivalent_parallel_with_progress,
-    AtomSketch, BaseEquivalentAtomInput, BlockingCompileConfig, BLOCKING_REVISION,
-    DEFAULT_MAX_ROUTING_BLOCK_MEMBERS,
+    build_base_equivalent_atom_sketches_from_soa_parallel,
+    compile_base_equivalent_parallel_with_progress, AtomSketch, BlockingCompileConfig,
+    BLOCKING_REVISION, DEFAULT_MAX_ROUTING_BLOCK_MEMBERS,
 };
+#[cfg(test)]
+use metadata_engine::encode::PayloadArena;
 use metadata_engine::encode::{
     metadata_has_prefilter_tokens, parse_metadata_documents,
-    write_encode_artifacts_with_contracts_and_atoms_with_progress, EncodeContractRow,
-    EncodePayloadRow, EncodeSourceRow, ParsedMetadataDocuments, PayloadCasWriter,
-    DEFAULT_MAX_PACK_BYTES, ENCODE_SCHEMA_REVISION,
+    write_encode_artifacts_soa_with_progress, EncodeContractRow, EncodeContractSoA,
+    EncodePayloadRow, EncodeSourceRow, EncodeSourceSoA, FallbackAtomCsr, ParsedMetadataDocuments,
+    PayloadRef, PayloadTermListBatch, PayloadTermLists, PayloadTermSoA, ShardedPayloadArena,
+    DEFAULT_ARENA_CHUNK_BYTES, DEFAULT_PAYLOAD_SHARD_COUNT, ENCODE_SCHEMA_REVISION,
 };
 use metadata_engine::format::commit_ready;
 use metadata_engine::progress::{
@@ -46,8 +50,6 @@ use super::super::{
 };
 use super::prepare::metadata_is_dedup_eligible;
 
-const ENCODE_PARSE_BATCHES_PER_LANE: usize = 8;
-const MAX_ENCODE_PARSE_BATCH_ROWS: usize = 4_096;
 const ENCODE_RESIDENT_FIXED_BYTES: u64 = 64 * 1024 * 1024;
 const HASH_BUCKET_OVERHEAD_BYTES: usize = 16;
 /// Safety margin on distinct source JSON bytes for Arc/String overhead vs DuckDB
@@ -56,15 +58,23 @@ const TOKEN_JSON_ADMISSION_NUM: u64 = 5;
 const TOKEN_JSON_ADMISSION_DEN: u64 = 4;
 const COLLECT_TOKEN_SOURCE_STEPS: u64 = 2;
 const RESOLVE_TOKEN_MEMBERSHIP_STEPS: u64 = 2;
-const FALLBACK_TOKEN_SOURCE_STEPS: u64 = 3;
+const FALLBACK_PREPARE_STEPS: u64 = 2;
+/// Bound unique-payload parse scratch: parse → intern → drop before the next
+/// batch so arena bodies and ParsedMetadataDocuments never fully coexist.
+const ENCODE_UNIQUE_PARSE_BATCH_LEN: usize = 4_096;
 
-type RepresentativeEncodeRow = (i64, String, String, i64, u32, u64);
+#[cfg(test)]
 type FallbackEncodeRow = (u32, String, u32, u64);
 
+/// Presence-only fallback selection: picks the first row per contract whose
+/// JSON would yield a non-empty prefilter token list, without ever running
+/// the full parse. Full parsing happens exactly once per unique payload,
+/// after every contract's chosen source is known.
+#[cfg(test)]
 pub(super) fn resolve_fallback_contracts(
     rows: &[FallbackEncodeRow],
-    parse: &(impl Fn(&str) -> ParsedMetadataDocuments + Sync),
-) -> Vec<(FallbackEncodeRow, ParsedMetadataDocuments)> {
+    has_prefilter_tokens: &(impl Fn(&str) -> bool + Sync),
+) -> Vec<FallbackEncodeRow> {
     let mut ranges = Vec::new();
     let mut begin = 0usize;
     while begin < rows.len() {
@@ -79,10 +89,10 @@ pub(super) fn resolve_fallback_contracts(
     ranges
         .into_par_iter()
         .filter_map(|range| {
-            rows[range].iter().find_map(|row| {
-                let parsed = parse(&row.1);
-                (!parsed.prefilter_tokens.is_empty()).then(|| (row.clone(), parsed))
-            })
+            rows[range]
+                .iter()
+                .find(|row| has_prefilter_tokens(&row.1))
+                .cloned()
         })
         .collect()
 }
@@ -169,6 +179,11 @@ impl EncodeResidentAdmission {
     }
 }
 
+/// Resident-bytes accounting for the final source/payload/contract columns.
+/// Kept as tested admission-model infrastructure (see `memory_dedup_tests`)
+/// even though the streaming pipeline now only needs the one-shot
+/// `frozen_encode_state_resident_bytes` snapshot at the very end.
+#[allow(dead_code)]
 #[derive(Default)]
 struct EncodeResidentAccounting {
     observed_sources: usize,
@@ -182,13 +197,14 @@ impl EncodeResidentAccounting {
     // information this admission model exists to retain.
     #[allow(clippy::ptr_arg)]
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     fn resident_bytes(
         &mut self,
         sources: &Vec<EncodeSourceRow>,
         payloads: &Vec<EncodePayloadRow>,
         contracts: &Vec<EncodeContractRow>,
         payload_interner: Option<&PayloadTermInterner>,
-        cas: Option<&PayloadCasWriter>,
+        cas: Option<&ShardedPayloadArena>,
         pending_fallbacks: &HashMap<u32, PendingFallbackContract>,
     ) -> Result<u64, AnalysisError> {
         for source in &sources[self.observed_sources..] {
@@ -226,7 +242,7 @@ impl EncodeResidentAccounting {
             capacity_bytes::<EncodeContractRow>(contracts.capacity())?,
             hash_map_capacity_bytes::<u32, PendingFallbackContract>(pending_fallbacks.capacity())?,
             payload_interner.map_or(0, PayloadTermInterner::resident_bytes),
-            cas.map_or(0, PayloadCasWriter::resident_bytes),
+            cas.map_or(0, ShardedPayloadArena::resident_bytes),
         ] {
             total = total.checked_add(bytes).ok_or_else(|| {
                 AnalysisError::InvalidData("Encode resident accounting overflow".into())
@@ -251,6 +267,10 @@ pub(crate) fn run_metadata_encode(
         ProgressTracker::for_pipeline_stage(PipelineStage::MetadataEncode, options.progress);
     let result: Result<(), AnalysisError> = (|| {
         progress.start_stage("metadata encode", 4);
+        let artifact_layout =
+            metadata_engine::artifacts::MetadataArtifactLayout::new(work_directory);
+        // Reclaim crash leftovers before storage admission observes free space.
+        artifact_layout.cleanup_stale_staging()?;
         let mut broker = StorageBroker::open(work_directory).map_err(storage_err)?;
 
         let conn = open_prepare_for_encode(options)?;
@@ -313,10 +333,27 @@ pub(crate) fn run_metadata_encode(
                 estimate.partial_peak_bytes,
             )
             .map_err(storage_err)?;
-        let artifact_layout =
-            metadata_engine::artifacts::MetadataArtifactLayout::new(work_directory);
+        let run_id = metadata_engine::artifacts::new_artifact_run_id();
+        let encode_staging = artifact_layout.encode_run_staging_dir(&run_id);
+        let blocking_staging = artifact_layout.blocking_run_staging_dir(&run_id);
+        let _staging_cleanup = metadata_engine::artifacts::StagingCleanupGuard::new([
+            encode_staging.clone(),
+            blocking_staging.clone(),
+        ]);
         let encode_dir = artifact_layout.encode_dir();
-        fs::create_dir_all(&encode_dir)?;
+        let blocking_dir = artifact_layout.blocking_dir();
+        if encode_staging.exists() {
+            fs::remove_dir_all(&encode_staging)?;
+        }
+        if blocking_staging.exists() {
+            fs::remove_dir_all(&blocking_staging)?;
+        }
+        fs::create_dir_all(&encode_staging)?;
+        // Encode no longer publishes payload CAS. A rerun on an older
+        // encode-N directory can still leave payload_blobs behind; delete
+        // them before writing features so fingerprint/register cannot pin
+        // stale packs as Feature artifacts.
+        remove_stale_encode_payload_blobs(&encode_dir)?;
         let frozen_resident_bytes = frozen_encode_state_resident_bytes(
             &sources,
             &payloads,
@@ -328,8 +365,8 @@ pub(crate) fn run_metadata_encode(
             frozen_resident_bytes,
             planned_feature_persist_growth(&sources, &payloads, &contracts)?,
         )?;
-        let encode_persist_stats = write_encode_artifacts_with_contracts_and_atoms_with_progress(
-            &encode_dir,
+        let encode_persist_stats = write_encode_artifacts_soa_with_progress(
+            &encode_staging,
             &sources,
             &payloads,
             &contracts,
@@ -349,20 +386,19 @@ pub(crate) fn run_metadata_encode(
         let encode_wall_millis = millis_since(encode_started);
         progress.step_stage(format!(
             "wrote encode features for {} sources / {} payloads",
-            sources.len(),
-            payloads.len()
+            sources.source_count(),
+            payloads.payload_count()
         ));
 
         let blocking_started = Instant::now();
-        let blocking_dir = artifact_layout.blocking_dir();
-        fs::create_dir_all(&blocking_dir)?;
+        fs::create_dir_all(&blocking_staging)?;
         let config = BlockingCompileConfig {
             max_routing_block_members: DEFAULT_MAX_ROUTING_BLOCK_MEMBERS,
         };
         let blocking_bundle = compile_base_equivalent_parallel_with_progress(
             &atoms,
             &config,
-            &blocking_dir,
+            &blocking_staging,
             options.threads,
             |event| progress.observe_engine_event(event),
         )
@@ -379,10 +415,27 @@ pub(crate) fn run_metadata_encode(
             WorkUnit::Items,
             EngineCounters::default(),
         ));
+        let encode_publish =
+            metadata_engine::artifacts::publish_staged_bundle(&encode_staging, &encode_dir)
+                .map_err(|error| {
+                    AnalysisError::InvalidData(format!(
+                        "publish encode staging to {}: {error}",
+                        encode_dir.display()
+                    ))
+                })?;
+        let blocking_publish =
+            metadata_engine::artifacts::publish_staged_bundle(&blocking_staging, &blocking_dir)
+                .map_err(|error| {
+                    AnalysisError::InvalidData(format!(
+                        "publish blocking staging to {}: {error}",
+                        blocking_dir.display()
+                    ))
+                })?;
         let feature_manifest = serde_json::json!({
             "schema_revision": ENCODE_SCHEMA_REVISION,
-            "source_count": sources.len(),
-            "payload_count": payloads.len(),
+            "artifact_run_id": &run_id,
+            "source_count": sources.source_count(),
+            "payload_count": payloads.payload_count(),
             "token_pair_work": encode_persist_stats.token_pair_work,
             "max_token_members": encode_persist_stats.max_token_members,
             "fallback_pair_work": encode_persist_stats.fallback_pair_work,
@@ -394,6 +447,7 @@ pub(crate) fn run_metadata_encode(
         commit_ready(&encode_dir, "features.ready", &feature_manifest).map_err(format_err)?;
         let blocking_manifest = serde_json::json!({
             "blocking_revision": BLOCKING_REVISION,
+            "artifact_run_id": &run_id,
             "atom_count": atoms.len(),
             "block_pair_work": blocking_bundle.block_stats.bucket_pair_work,
             "contract_expansion_pair_work": blocking_contract_expansion_pair_work(
@@ -404,6 +458,8 @@ pub(crate) fn run_metadata_encode(
         })
         .to_string();
         commit_ready(&blocking_dir, "blocking.ready", &blocking_manifest).map_err(format_err)?;
+        blocking_publish.finalize()?;
+        encode_publish.finalize()?;
         progress.observe_engine_event(ProgressEvent::indeterminate(
             ProgressPhase::EncodePublish,
             1,
@@ -411,17 +467,11 @@ pub(crate) fn run_metadata_encode(
             EngineCounters::default(),
         ));
         let artifact_fingerprints = fingerprint_bundle_files(&[&encode_dir, &blocking_dir])?;
-        // Payload CAS is a transient Match input, not an Encode checkpoint
-        // dependency. Keeping it out of the ready marker lets a later Match
-        // revision reuse the immutable Encode snapshot after CAS collection.
+        // Payload CAS is not an Encode output. Defensively keep leftover
+        // payload_blobs paths out of the ready marker and registration set.
         let checkpoint_artifact_fingerprints = artifact_fingerprints
             .iter()
-            .filter(|artifact| {
-                !artifact
-                    .path
-                    .components()
-                    .any(|component| component.as_os_str() == "payload_blobs")
-            })
+            .filter(|artifact| !path_is_under_payload_blobs(&artifact.path))
             .cloned()
             .collect();
         progress.observe_engine_event(ProgressEvent::indeterminate(
@@ -432,20 +482,14 @@ pub(crate) fn run_metadata_encode(
         ));
         drop(storage_reservation);
 
-        let payload_blobs = encode_dir.join("payload_blobs").canonicalize()?;
         let blocking_root = blocking_dir.canonicalize()?;
-        let mut registrations = vec![ArtifactRegistration::new(
-            payload_blobs.clone(),
-            ArtifactClass::PayloadCas,
-            directory_bytes(&payload_blobs)?,
-            0,
-            Vec::new(),
-        )];
-        let mut registered = vec![payload_blobs.clone()];
-        for path in artifact_fingerprints.iter().map(|artifact| &artifact.path) {
-            if path.starts_with(&payload_blobs) {
-                continue;
-            }
+        let mut registrations = Vec::new();
+        let mut registered = Vec::new();
+        for path in artifact_fingerprints
+            .iter()
+            .map(|artifact| &artifact.path)
+            .filter(|path| !path_is_under_payload_blobs(path))
+        {
             let class = if path.starts_with(&blocking_root) {
                 ArtifactClass::Blocking
             } else {
@@ -476,32 +520,20 @@ pub(crate) fn run_metadata_encode(
                 schema_version: 3,
                 encode_wall_millis,
                 blocking_wall_millis,
-                source_rows: sources.len() as u64,
-                payload_count: payloads.len() as u64,
-                contract_count: contracts.len() as u64,
+                source_rows: sources.source_count() as u64,
+                payload_count: payloads.payload_count() as u64,
+                contract_count: contracts.contract_count() as u64,
                 atom_count: atoms.len() as u64,
-                template_term_count: payloads
-                    .iter()
-                    .map(|payload| payload.template_terms.len() as u64)
-                    .sum(),
-                content_term_count: payloads
-                    .iter()
-                    .map(|payload| payload.content_terms.len() as u64)
-                    .sum(),
-                token_membership_count: sources
-                    .iter()
-                    .map(|source| source.retained_token_ids.len() as u64)
-                    .sum(),
+                template_term_count: payloads.template_terms.len() as u64,
+                content_term_count: payloads.content_terms.len() as u64,
+                token_membership_count: sources.token_ids.len() as u64,
                 routing_membership_count: atoms
                     .iter()
                     .map(|atom| {
                         atom.template_anchors.len() as u64 + atom.content_anchors.len() as u64
                     })
                     .sum(),
-                fallback_membership_count: fallback_atoms
-                    .iter()
-                    .map(|members| members.len() as u64)
-                    .sum(),
+                fallback_membership_count: fallback_atoms.members.len() as u64,
                 admitted_resident_peak_bytes: resident_admission.peak_bytes(),
                 admitted_final_bytes: estimate.final_bytes,
                 admitted_partial_peak_bytes: estimate.partial_peak_bytes,
@@ -543,11 +575,11 @@ pub(super) fn open_prepare_for_encode(
 }
 
 type EncodeStreamInputs = (
-    Vec<EncodeSourceRow>,
-    Vec<EncodePayloadRow>,
-    Vec<EncodeContractRow>,
+    EncodeSourceSoA,
+    PayloadTermSoA,
+    EncodeContractSoA,
     Vec<AtomSketch>,
-    Vec<Vec<u32>>,
+    FallbackAtomCsr,
     Vec<EncodeChainTotal>,
 );
 
@@ -556,14 +588,14 @@ struct TokenSourceInput {
     token_ids: Vec<u32>,
     source_file: u32,
     source_row_number: u64,
-    metadata_json: Arc<str>,
+    payload_ref: PayloadRef,
 }
 
 #[derive(Debug)]
 struct TokenSourceRecord {
     source_file: u32,
     source_row_number: u64,
-    metadata_json: Arc<str>,
+    payload_ref: PayloadRef,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -612,7 +644,7 @@ impl TokenSourceRelation {
                 token_ids,
                 source_file: source.source_file,
                 source_row_number: source.source_row_number,
-                metadata_json: Arc::clone(&source.metadata_json),
+                payload_ref: source.payload_ref,
             });
         }
         Ok(output)
@@ -628,12 +660,14 @@ fn planned_token_relation_peak(
     representative_rows: u64,
     distinct_token_json_bytes: u64,
 ) -> Result<u64, AnalysisError> {
+    // JSON bodies are inserted into the payload arena once during catalog
+    // load; the relation itself only retains coords + PayloadRef.
     let admitted_json_bytes = distinct_token_json_bytes
         .checked_mul(TOKEN_JSON_ADMISSION_NUM)
         .map(|bytes| bytes / TOKEN_JSON_ADMISSION_DEN)
         .ok_or_else(|| AnalysisError::InvalidData("token-source JSON admission overflow".into()))?;
     token_rows
-        .checked_mul(64)
+        .checked_mul(48)
         .and_then(|bytes| representative_rows.checked_mul(8)?.checked_add(bytes))
         .and_then(|bytes| admitted_json_bytes.checked_add(bytes))
         .and_then(|bytes| bytes.checked_add(64 * 1024 * 1024))
@@ -672,16 +706,35 @@ fn planned_encode_batch_growth(json_bytes: u64, row_count: usize) -> Result<u64,
         .ok_or_else(|| AnalysisError::InvalidData("Encode batch admission overflow".into()))
 }
 
+/// Temporary ParsedMetadataDocuments / rayon scratch for one unique-parse
+/// batch. Arena bodies remain resident until every batch finishes, so this
+/// bound must cover parsed Strings and token Vecs without assuming the whole
+/// unique set is parsed at once.
+fn planned_unique_parse_batch_growth(
+    batch_json_bytes: u64,
+    batch_len: usize,
+) -> Result<u64, AnalysisError> {
+    batch_json_bytes
+        .checked_mul(32)
+        .and_then(|bytes| {
+            u64::try_from(batch_len)
+                .ok()?
+                .checked_mul(8_192)?
+                .checked_add(bytes)
+        })
+        .ok_or_else(|| {
+            AnalysisError::InvalidData("Encode unique parse batch admission overflow".into())
+        })
+}
+
+#[allow(dead_code)]
 fn planned_encoded_contract_growth(
     representative_json: &str,
     token_sources: &[TokenSourceInput],
 ) -> Result<u64, AnalysisError> {
-    let json_bytes = token_sources.iter().try_fold(
-        u64::try_from(representative_json.len()).map_err(|_| {
-            AnalysisError::InvalidData("Encode representative JSON exceeds u64".into())
-        })?,
-        |total, source| total.checked_add(source.metadata_json.len() as u64),
-    );
+    let json_bytes = u64::try_from(representative_json.len())
+        .map_err(|_| AnalysisError::InvalidData("Encode representative JSON exceeds u64".into()))?;
+    // Token-source JSON already lives in the arena; only account for slot overhead.
     let membership_count = token_sources.iter().try_fold(0u64, |total, source| {
         total.checked_add(source.token_ids.len() as u64)
     });
@@ -689,7 +742,7 @@ fn planned_encoded_contract_growth(
         .ok()
         .and_then(|count| count.checked_add(1));
     json_bytes
-        .and_then(|bytes| bytes.checked_mul(16))
+        .checked_mul(16)
         .and_then(|bytes| source_count?.checked_mul(2_048)?.checked_add(bytes))
         .and_then(|bytes| membership_count?.checked_mul(8)?.checked_add(bytes))
         .ok_or_else(|| AnalysisError::InvalidData("Encode contract admission overflow".into()))
@@ -702,10 +755,15 @@ fn planned_encode_finalize_growth(
     let mut total = ENCODE_RESIDENT_FIXED_BYTES;
     for bytes in [
         capacity_bytes::<u32>(payload_count)?,
+        capacity_bytes::<EncodePayloadRow>(payload_count)?,
+        // Conservative term-slot headroom while the interner is still live.
+        capacity_bytes::<(u32, u32)>(payload_count.saturating_mul(32))?,
+        hash_map_capacity_bytes::<Arc<str>, u32>(payload_count)?,
+        hash_map_capacity_bytes::<String, u32>(payload_count)?,
         hash_map_capacity_bytes::<(u32, u32), usize>(contract_count)?,
         capacity_bytes::<u32>(contract_count)?,
         capacity_bytes::<Vec<u32>>(contract_count)?,
-        capacity_bytes::<BaseEquivalentAtomInput<'static>>(contract_count)?,
+        capacity_bytes::<(&'static [u32], &'static [u32])>(contract_count)?,
     ] {
         total = total.checked_add(bytes).ok_or_else(|| {
             AnalysisError::InvalidData("Encode finalize admission overflow".into())
@@ -717,42 +775,37 @@ fn planned_encode_finalize_growth(
 // Vec capacity is intentionally part of the frozen resident model.
 #[allow(clippy::ptr_arg)]
 fn frozen_encode_state_resident_bytes(
-    sources: &Vec<EncodeSourceRow>,
-    payloads: &Vec<EncodePayloadRow>,
-    contracts: &Vec<EncodeContractRow>,
+    sources: &EncodeSourceSoA,
+    payloads: &PayloadTermSoA,
+    contracts: &EncodeContractSoA,
     atoms: &Vec<AtomSketch>,
-    fallback_atoms: &Vec<Vec<u32>>,
+    fallback_atoms: &FallbackAtomCsr,
 ) -> Result<u64, AnalysisError> {
     let mut total = ENCODE_RESIDENT_FIXED_BYTES;
     for bytes in [
-        capacity_bytes::<EncodeSourceRow>(sources.capacity())?,
-        capacity_bytes::<EncodePayloadRow>(payloads.capacity())?,
-        capacity_bytes::<EncodeContractRow>(contracts.capacity())?,
+        capacity_bytes::<u32>(sources.contract_ids.capacity())?,
+        capacity_bytes::<u32>(sources.payload_ids.capacity())?,
+        capacity_bytes::<u64>(sources.token_offsets.capacity())?,
+        capacity_bytes::<u32>(sources.token_ids.capacity())?,
+        capacity_bytes::<u64>(payloads.template_offsets.capacity())?,
+        capacity_bytes::<u32>(payloads.template_terms.capacity())?,
+        capacity_bytes::<u32>(payloads.template_freqs.capacity())?,
+        capacity_bytes::<u64>(payloads.content_offsets.capacity())?,
+        capacity_bytes::<u32>(payloads.content_terms.capacity())?,
+        capacity_bytes::<u32>(payloads.content_freqs.capacity())?,
+        capacity_bytes::<u32>(contracts.contract_ids.capacity())?,
+        capacity_bytes::<u32>(contracts.chain_ids.capacity())?,
+        capacity_bytes::<u32>(contracts.source_doc_ids.capacity())?,
+        capacity_bytes::<u32>(contracts.payload_ids.capacity())?,
+        capacity_bytes::<u64>(contracts.weights.capacity())?,
         capacity_bytes::<AtomSketch>(atoms.capacity())?,
-        capacity_bytes::<Vec<u32>>(fallback_atoms.capacity())?,
+        capacity_bytes::<u64>(fallback_atoms.offsets.capacity())?,
+        capacity_bytes::<u32>(fallback_atoms.members.capacity())?,
+        capacity_bytes::<u32>(fallback_atoms.atom_payloads.capacity())?,
     ] {
         total = total.checked_add(bytes).ok_or_else(|| {
             AnalysisError::InvalidData("Encode frozen resident accounting overflow".into())
         })?;
-    }
-    for source in sources {
-        total = total
-            .checked_add(capacity_bytes::<u32>(source.retained_token_ids.capacity())?)
-            .ok_or_else(|| {
-                AnalysisError::InvalidData("Encode source token accounting overflow".into())
-            })?;
-    }
-    for payload in payloads {
-        for capacity in [
-            payload.template_terms.capacity(),
-            payload.content_terms.capacity(),
-        ] {
-            total = total
-                .checked_add(capacity_bytes::<(u32, u32)>(capacity)?)
-                .ok_or_else(|| {
-                    AnalysisError::InvalidData("Encode payload accounting overflow".into())
-                })?;
-        }
     }
     for atom in atoms {
         for capacity in [
@@ -766,42 +819,25 @@ fn frozen_encode_state_resident_bytes(
                 })?;
         }
     }
-    for members in fallback_atoms {
-        total = total
-            .checked_add(capacity_bytes::<u32>(members.capacity())?)
-            .ok_or_else(|| {
-                AnalysisError::InvalidData("Encode fallback accounting overflow".into())
-            })?;
-    }
     Ok(total)
 }
 
 fn planned_feature_persist_growth(
-    sources: &[EncodeSourceRow],
-    payloads: &[EncodePayloadRow],
-    contracts: &[EncodeContractRow],
+    sources: &EncodeSourceSoA,
+    payloads: &PayloadTermSoA,
+    contracts: &EncodeContractSoA,
 ) -> Result<u64, AnalysisError> {
-    let mut occurrences = 0u64;
-    let mut max_token = None::<u32>;
-    for source in sources {
-        occurrences = occurrences
-            .checked_add(u64::try_from(source.retained_token_ids.len()).map_err(|_| {
-                AnalysisError::InvalidData("Encode CSR occurrence count exceeds u64".into())
-            })?)
-            .ok_or_else(|| AnalysisError::InvalidData("Encode CSR occurrence overflow".into()))?;
-        for &token in &source.retained_token_ids {
-            max_token = Some(max_token.map_or(token, |current| current.max(token)));
-        }
-    }
+    let occurrences = u64::try_from(sources.token_ids.len()).map_err(|_| {
+        AnalysisError::InvalidData("Encode CSR occurrence count exceeds u64".into())
+    })?;
+    let max_token = sources.token_ids.iter().copied().max();
     let token_count = max_token.map_or(0u64, |token| u64::from(token) + 1);
-    let contract_count = u64::try_from(contracts.len())
+    let contract_count = u64::try_from(contracts.contract_count())
         .map_err(|_| AnalysisError::InvalidData("Encode contract count exceeds u64".into()))?;
-    let source_count = u64::try_from(sources.len())
+    let source_count = u64::try_from(sources.source_count())
         .map_err(|_| AnalysisError::InvalidData("Encode source count exceeds u64".into()))?;
-    let template_terms = payloads.iter().try_fold(0u64, |total, payload| {
-        total.checked_add(payload.template_terms.len() as u64)
-    });
-    let payload_count = u64::try_from(payloads.len())
+    let template_terms = Some(payloads.template_terms.len() as u64);
+    let payload_count = u64::try_from(payloads.payload_count())
         .map_err(|_| AnalysisError::InvalidData("Encode payload count exceeds u64".into()))?;
     occurrences
         .checked_mul(32)
@@ -813,7 +849,7 @@ fn planned_feature_persist_growth(
         })
         .and_then(|bytes| source_count.checked_mul(32)?.checked_add(bytes))
         .and_then(|bytes| template_terms?.checked_mul(8)?.checked_add(bytes))
-        .and_then(|bytes| payload_count.checked_mul(32)?.checked_add(bytes))
+        .and_then(|bytes| payload_count.checked_mul(96)?.checked_add(bytes))
         .and_then(|bytes| bytes.checked_add(ENCODE_RESIDENT_FIXED_BYTES))
         .ok_or_else(|| AnalysisError::InvalidData("Encode CSR admission overflow".into()))
 }
@@ -852,6 +888,94 @@ struct PendingFallbackContract {
     weight: u64,
 }
 
+/// One retained token-specific metadata source registered into the
+/// [`ShardedPayloadArena`] on behalf of a pending contract.
+#[derive(Debug)]
+struct PendingSourceSlot {
+    source_file: u32,
+    source_row_number: u64,
+    payload_ref: PayloadRef,
+    token_ids: Vec<u32>,
+}
+
+/// A contract whose representative payload (and retained token sources) has
+/// been registered in the arena, but whose full parse / term interning has
+/// not happened yet. Built once per contract during the presence-only
+/// registration pass, then consumed in original contract order to build the
+/// final Encode columns after global payload IDs are assigned.
+#[derive(Debug)]
+struct PendingContractSlot {
+    chain_id: u32,
+    weight: u64,
+    representative_file: u32,
+    representative_row: u64,
+    representative_payload_ref: PayloadRef,
+    token_sources: Vec<PendingSourceSlot>,
+}
+
+/// Final contract slot after shard-local refs are remapped to dense global IDs.
+#[derive(Debug)]
+struct GlobalPendingContractSlot {
+    chain_id: u32,
+    weight: u64,
+    representative_file: u32,
+    representative_row: u64,
+    representative_payload_id: u32,
+    token_sources: Vec<GlobalPendingSourceSlot>,
+}
+
+#[derive(Debug)]
+struct GlobalPendingSourceSlot {
+    source_file: u32,
+    source_row_number: u64,
+    payload_id: u32,
+    token_ids: Vec<u32>,
+}
+
+/// Resident accounting for the presence-only registration pass (before any
+/// payload is parsed or interned). Tracked at Arrow batch boundaries so the
+/// live memory lease grows without a per-contract `MemoryLease::resize`.
+#[derive(Default)]
+struct EncodeRegistrationAccounting {
+    observed_contracts: usize,
+    token_source_capacity: u64,
+}
+
+impl EncodeRegistrationAccounting {
+    #[allow(clippy::ptr_arg)]
+    fn resident_bytes(
+        &mut self,
+        pending_contracts: &Vec<PendingContractSlot>,
+        pending_fallbacks: &HashMap<u32, PendingFallbackContract>,
+        arena: &ShardedPayloadArena,
+    ) -> Result<u64, AnalysisError> {
+        for contract in &pending_contracts[self.observed_contracts..] {
+            self.token_source_capacity = self
+                .token_source_capacity
+                .checked_add(capacity_bytes::<PendingSourceSlot>(
+                    contract.token_sources.capacity(),
+                )?)
+                .ok_or_else(|| {
+                    AnalysisError::InvalidData("Encode pending contract capacity overflow".into())
+                })?;
+        }
+        self.observed_contracts = pending_contracts.len();
+
+        let mut total = ENCODE_RESIDENT_FIXED_BYTES;
+        for bytes in [
+            capacity_bytes::<PendingContractSlot>(pending_contracts.capacity())?,
+            self.token_source_capacity,
+            hash_map_capacity_bytes::<u32, PendingFallbackContract>(pending_fallbacks.capacity())?,
+            arena.resident_bytes(),
+        ] {
+            total = total.checked_add(bytes).ok_or_else(|| {
+                AnalysisError::InvalidData("Encode registration accounting overflow".into())
+            })?;
+        }
+        Ok(total)
+    }
+}
+
 #[cfg(test)]
 pub(super) fn stream_encode_inputs_with_progress(
     conn: &Connection,
@@ -883,7 +1007,7 @@ pub(super) fn stream_encode_inputs_with_progress(
 #[allow(clippy::too_many_arguments)]
 fn stream_encode_inputs_with_admission(
     conn: &Connection,
-    work_directory: &Path,
+    _work_directory: &Path,
     _broker: &mut StorageBroker,
     _memory_broker: &MemoryBroker,
     resident_admission: &mut EncodeResidentAdmission,
@@ -914,422 +1038,213 @@ fn stream_encode_inputs_with_admission(
         AnalysisError::InvalidData("metadata contract count exceeds u32 identity space".into())
     })?;
     let parse_lanes = threads.max(1);
-    let parse_batch_rows = parse_lanes
-        .saturating_mul(ENCODE_PARSE_BATCHES_PER_LANE)
-        .clamp(1, MAX_ENCODE_PARSE_BATCH_ROWS);
     let parse_pool = rayon::ThreadPoolBuilder::new()
         .num_threads(parse_lanes)
         .thread_name(|index| format!("metadata-encode-parse-{index}"))
         .build()
         .map_err(|error| AnalysisError::InvalidData(format!("encode parse pool: {error}")))?;
+    let shard_count = parse_lanes
+        .next_power_of_two()
+        .clamp(1, DEFAULT_PAYLOAD_SHARD_COUNT.max(1));
+    let arena = ShardedPayloadArena::with_shard_count(shard_count, DEFAULT_ARENA_CHUNK_BYTES);
     let token_source_relation = build_retained_token_source_relation(
         conn,
         contract_count,
+        &arena,
         &parse_pool,
         &mut progress,
     )?;
-    if token_source_relation.bytes() > estimate.resident_peak_bytes {
+    let relation_resident_bytes = token_source_relation
+        .bytes()
+        .checked_add(arena.resident_bytes())
+        .ok_or_else(|| {
+            AnalysisError::InvalidData("token-source+arena admission overflow".into())
+        })?;
+    if relation_resident_bytes > estimate.resident_peak_bytes {
         return Err(AnalysisError::InvalidData(format!(
             "in-memory token-source relation exceeded resident admission ({} > {})",
-            token_source_relation.bytes(),
-            estimate.resident_peak_bytes
+            relation_resident_bytes, estimate.resident_peak_bytes
         )));
     }
-    let encode_dir =
-        metadata_engine::artifacts::MetadataArtifactLayout::new(work_directory).encode_dir();
-    let payload_blobs = encode_dir.join("payload_blobs");
-    let mut cas =
-        PayloadCasWriter::create(&payload_blobs, DEFAULT_MAX_PACK_BYTES).map_err(encode_err)?;
 
-    let mut sources = Vec::new();
-    let mut payloads = Vec::new();
-    let mut payload_interner = PayloadTermInterner::default();
-    let mut contracts = Vec::new();
     let chain_totals = load_encode_chain_totals(conn)?;
-    let chain_ids = chain_totals
-        .iter()
-        .enumerate()
-        .map(|(index, total)| {
-            u32::try_from(index)
-                .map(|index| (total.name.clone(), index))
-                .map_err(|_| AnalysisError::InvalidData("chain count exceeds u32".into()))
-        })
-        .collect::<Result<HashMap<_, _>, _>>()?;
+    let (arena, pending_contracts, committed_resident_bytes, global_offsets) =
+        register_representative_payloads(
+            conn,
+            &token_source_relation,
+            relation_resident_bytes,
+            arena,
+            resident_admission,
+            &parse_pool,
+            &estimate,
+            &mut progress,
+        )?;
+    drop(token_source_relation);
+    // Relation coords are gone; shrink the lease to pending columns + arena.
+    resident_admission.commit(committed_resident_bytes)?;
 
-    let mut stmt = conn.prepare(
-        "SELECT contracts.metadata_contract_index,
-                contracts.chain,
-                rows.metadata_json,
-                contracts.nft_count,
-                contracts.metadata_source_file,
-                contracts.metadata_source_row_number
-         FROM analysis_contracts contracts
-         JOIN metadata_rows rows
-           ON rows.source_file = contracts.metadata_source_file
-          AND rows.source_row_number = contracts.metadata_source_row_number
-         WHERE contracts.metadata_contract_index IS NOT NULL
-         ORDER BY contracts.metadata_contract_index",
-    )?;
-    let mut rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, i64>(3)?,
-            row.get::<_, u32>(4)?,
-            row.get::<_, u64>(5)?,
-        ))
-    })?;
-
+    // Phase C/D: parse unique payloads in bounded batches, intern immediately,
+    // then drop the ParsedMetadataDocuments before the next batch.
+    let payload_count = arena.len().map_err(encode_err)?;
+    let finalize_growth = planned_encode_finalize_growth(payload_count, pending_contracts.len())?;
+    resident_admission.reserve_growth(committed_resident_bytes, finalize_growth)?;
+    let admitted_after_finalize = committed_resident_bytes
+        .checked_add(finalize_growth)
+        .ok_or_else(|| AnalysisError::InvalidData("Encode finalize admission overflow".into()))?;
+    let arena = arena.freeze().map_err(encode_err)?;
+    let payload_total = payload_count as u64;
     progress(ProgressEvent::determinate(
-        ProgressPhase::EncodeRows,
+        ProgressPhase::EncodeParseUniquePayloads,
         0,
-        estimate.representative_rows,
+        payload_total,
         WorkUnit::Items,
         EngineCounters::default(),
     ));
-    let mut representative_rows = 0u64;
-    let mut pending_fallbacks = HashMap::<u32, PendingFallbackContract>::new();
-    let mut resident_accounting = EncodeResidentAccounting::default();
-    let mut committed_resident_bytes = resident_accounting.resident_bytes(
-        &sources,
-        &payloads,
-        &contracts,
-        Some(&payload_interner),
-        Some(&cas),
-        &pending_fallbacks,
-    )?;
-    resident_admission.commit(committed_resident_bytes)?;
-    loop {
-        let batch = rows
-            .by_ref()
-            .take(parse_batch_rows)
-            .collect::<Result<Vec<RepresentativeEncodeRow>, _>>()?;
-        if batch.is_empty() {
-            break;
+    progress(ProgressEvent::determinate(
+        ProgressPhase::EncodeBuildTermDictionary,
+        0,
+        payload_total,
+        WorkUnit::Items,
+        EngineCounters::default(),
+    ));
+    let mut payloads = PayloadTermSoA::with_payload_capacity(payload_count);
+    let payload_interner = ShardedPayloadTermInterner::with_shard_count(shard_count);
+    let mut parsed_completed = 0u64;
+    for batch_start in (0..payload_count).step_by(ENCODE_UNIQUE_PARSE_BATCH_LEN) {
+        let batch_end = (batch_start + ENCODE_UNIQUE_PARSE_BATCH_LEN).min(payload_count);
+        let batch_len = batch_end - batch_start;
+        let mut batch_json_bytes = 0u64;
+        for payload_id in batch_start..batch_end {
+            let len = arena
+                .with_global_bytes(payload_id as u32, &global_offsets, |bytes| bytes.len())
+                .map_err(encode_err)? as u64;
+            batch_json_bytes = batch_json_bytes.checked_add(len).ok_or_else(|| {
+                AnalysisError::InvalidData("Encode unique parse JSON bytes overflow".into())
+            })?;
         }
-        let batch_json_bytes = batch
-            .iter()
-            .try_fold(0u64, |total, row| total.checked_add(row.2.len() as u64))
-            .ok_or_else(|| AnalysisError::InvalidData("Encode batch JSON bytes overflow".into()))?;
-        let batch_growth_bytes = planned_encode_batch_growth(batch_json_bytes, batch.len())?;
-        resident_admission.reserve_growth(committed_resident_bytes, batch_growth_bytes)?;
+        // Peak = durable finalize headroom + one batch of parse scratch.
+        resident_admission.reserve_growth(
+            admitted_after_finalize,
+            planned_unique_parse_batch_growth(batch_json_bytes, batch_len)?,
+        )?;
         let parsed_batch = parse_pool.install(|| {
-            batch
-                .par_iter()
-                .map(|row| {
-                    metadata_is_dedup_eligible(&row.2).then(|| parse_metadata_documents(&row.2))
+            (batch_start..batch_end)
+                .into_par_iter()
+                .map(|payload_id| {
+                    arena
+                        .with_global_bytes(payload_id as u32, &global_offsets, |bytes| {
+                            let text = std::str::from_utf8(bytes).map_err(|error| {
+                                AnalysisError::InvalidData(format!(
+                                    "encode payload bytes were not valid utf-8: {error}"
+                                ))
+                            })?;
+                            Ok(parse_metadata_documents(text))
+                        })
+                        .map_err(encode_err)?
                 })
-                .collect::<Vec<_>>()
-        });
-        for (row, parsed) in batch.into_iter().zip(parsed_batch) {
-            let (
-                contract_index_i64,
-                chain,
-                metadata_json,
-                nft_count,
-                representative_file,
-                representative_row,
-            ) = row;
-            representative_rows = representative_rows.saturating_add(1);
-            let source_contract_index = u32::try_from(contract_index_i64).map_err(|_| {
-                AnalysisError::InvalidData("metadata_contract_index out of u32 range".into())
-            })?;
-            if !metadata_is_dedup_eligible(&metadata_json) {
-                emit_encode_progress(
-                    &mut progress,
-                    ProgressPhase::EncodeRows,
-                    representative_rows,
-                    estimate.representative_rows,
-                );
-                continue;
-            }
-            let parsed = parsed.ok_or_else(|| {
-                AnalysisError::InvalidData(
-                    "eligible metadata row was omitted from parallel parse batch".into(),
-                )
-            })?;
-            let chain_id = *chain_ids.get(&chain).ok_or_else(|| {
-                AnalysisError::InvalidData(format!(
-                    "metadata chain {chain:?} missing selected-chain id"
-                ))
-            })?;
-
-            let weight = u64::try_from(nft_count).map_err(|_| {
-                AnalysisError::InvalidData("negative metadata contract nft_count".into())
-            })?;
-            if parsed.prefilter_tokens.is_empty() {
-                pending_fallbacks.insert(
-                    source_contract_index,
-                    PendingFallbackContract {
-                        source_contract_index,
-                        chain_id,
-                        weight,
-                    },
-                );
-            } else {
-                let token_sources = token_source_relation.read_contract(source_contract_index)?;
-                let contract_growth_bytes =
-                    planned_encoded_contract_growth(&metadata_json, &token_sources)?;
-                resident_admission.reserve_growth(
-                    committed_resident_bytes,
-                    batch_growth_bytes
-                        .checked_add(contract_growth_bytes)
-                        .ok_or_else(|| {
-                            AnalysisError::InvalidData(
-                                "Encode batch and contract admission overflow".into(),
-                            )
-                        })?,
-                )?;
-                append_encoded_contract(
-                    chain_id,
-                    weight,
-                    representative_file,
-                    representative_row,
-                    &metadata_json,
-                    parsed,
-                    token_sources,
-                    &mut cas,
-                    &mut payloads,
-                    &mut payload_interner,
-                    &mut sources,
-                    &mut contracts,
-                )?;
-                committed_resident_bytes = resident_accounting.resident_bytes(
-                    &sources,
-                    &payloads,
-                    &contracts,
-                    Some(&payload_interner),
-                    Some(&cas),
-                    &pending_fallbacks,
-                )?;
-                resident_admission.reserve_growth(committed_resident_bytes, batch_growth_bytes)?;
-            }
-            emit_encode_progress(
-                &mut progress,
-                ProgressPhase::EncodeRows,
-                representative_rows,
-                estimate.representative_rows,
-            );
-        }
-        committed_resident_bytes = resident_accounting.resident_bytes(
-            &sources,
-            &payloads,
-            &contracts,
-            Some(&payload_interner),
-            Some(&cas),
-            &pending_fallbacks,
-        )?;
-        resident_admission.commit(committed_resident_bytes)?;
-    }
-    drop(stmt);
-
-    if !pending_fallbacks.is_empty() {
-        conn.execute_batch(
-            "DROP TABLE IF EXISTS encode_fallback_contracts;
-             CREATE TEMP TABLE encode_fallback_contracts(contract_index UINTEGER PRIMARY KEY);",
-        )?;
-        {
-            let mut appender = conn.appender("encode_fallback_contracts")?;
-            appender.append_rows(
-                pending_fallbacks
-                    .keys()
-                    .copied()
-                    .map(|contract_index| [contract_index]),
-            )?;
-        }
-        let fallback_total: u64 = conn.query_row(
-            "SELECT count(*)::UBIGINT
-             FROM encode_fallback_contracts fallback
-             JOIN analysis_contracts contracts
-               ON contracts.metadata_contract_index = fallback.contract_index
-             JOIN metadata_rows rows ON rows.contract_id = contracts.contract_id
-             WHERE rows.metadata_eligible",
-            [],
-            |row| row.get(0),
-        )?;
+                .collect::<Result<Vec<_>, AnalysisError>>()
+        })?;
+        let interned_batch = parse_pool.install(|| payload_interner.intern_batch(parsed_batch))?;
+        parsed_completed = parsed_completed.saturating_add(interned_batch.len() as u64);
         progress(ProgressEvent::determinate(
-            ProgressPhase::EncodeFallbackSources,
-            0,
-            fallback_total,
+            ProgressPhase::EncodeParseUniquePayloads,
+            parsed_completed,
+            payload_total,
             WorkUnit::Items,
             EngineCounters::default(),
         ));
-        let mut stmt = conn.prepare(
-            "SELECT fallback.contract_index,
-                    rows.metadata_json,
-                    rows.source_file,
-                    rows.source_row_number
-             FROM encode_fallback_contracts fallback
-             JOIN analysis_contracts contracts
-               ON contracts.metadata_contract_index = fallback.contract_index
-             JOIN metadata_rows rows ON rows.contract_id = contracts.contract_id
-             WHERE rows.metadata_eligible
-             ORDER BY fallback.contract_index,
-                      rows.token_id,
-                      rows.source_file,
-                      rows.source_row_number",
-        )?;
-        let fallback_rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, u32>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, u32>(2)?,
-                row.get::<_, u64>(3)?,
-            ))
+        let batch_soa = PayloadTermSoA::from_term_lists_owned(interned_batch).map_err(|error| {
+            AnalysisError::InvalidData(format!("payload term SoA pack: {error}"))
         })?;
-        let fallback_rows = fallback_rows.collect::<Result<Vec<FallbackEncodeRow>, _>>()?;
-        let fallback_json_bytes = fallback_rows
-            .iter()
-            .try_fold(0u64, |total, row| total.checked_add(row.1.len() as u64))
-            .ok_or_else(|| {
-                AnalysisError::InvalidData("Encode fallback JSON bytes overflow".into())
-            })?;
-        let fallback_growth_bytes =
-            planned_encode_batch_growth(fallback_json_bytes, fallback_rows.len())?;
-        resident_admission.reserve_growth(committed_resident_bytes, fallback_growth_bytes)?;
-        let resolved = parse_pool
-            .install(|| resolve_fallback_contracts(&fallback_rows, &parse_metadata_documents));
-        drop(fallback_rows);
-        for (row, parsed) in resolved {
-            let (source_contract_index, metadata_json, source_file, source_row_number) = row;
-            let Some(pending) = pending_fallbacks.remove(&source_contract_index) else {
-                continue;
-            };
-            let token_sources =
-                token_source_relation.read_contract(pending.source_contract_index)?;
-            let contract_growth_bytes =
-                planned_encoded_contract_growth(&metadata_json, &token_sources)?;
-            resident_admission.reserve_growth(
-                committed_resident_bytes,
-                fallback_growth_bytes
-                    .checked_add(contract_growth_bytes)
-                    .ok_or_else(|| {
-                        AnalysisError::InvalidData(
-                            "Encode fallback and contract admission overflow".into(),
-                        )
-                    })?,
-            )?;
-            append_encoded_contract(
-                pending.chain_id,
-                pending.weight,
-                source_file,
-                source_row_number,
-                &metadata_json,
-                parsed,
-                token_sources,
-                &mut cas,
-                &mut payloads,
-                &mut payload_interner,
-                &mut sources,
-                &mut contracts,
-            )?;
-            committed_resident_bytes = resident_accounting.resident_bytes(
-                &sources,
-                &payloads,
-                &contracts,
-                Some(&payload_interner),
-                Some(&cas),
-                &pending_fallbacks,
-            )?;
-            resident_admission.reserve_growth(committed_resident_bytes, fallback_growth_bytes)?;
-        }
-        resident_admission.commit(committed_resident_bytes)?;
+        payloads.append_soa(&batch_soa).map_err(|error| {
+            AnalysisError::InvalidData(format!("payload term SoA append: {error}"))
+        })?;
         emit_encode_progress(
             &mut progress,
-            ProgressPhase::EncodeFallbackSources,
-            fallback_total,
-            fallback_total,
+            ProgressPhase::EncodeBuildTermDictionary,
+            payloads.payload_count() as u64,
+            payload_total,
         );
-        conn.execute_batch("DROP TABLE encode_fallback_contracts")?;
+        // Parsed scratch is dropped with the batch Vec; keep finalize floor.
+        resident_admission.commit(admitted_after_finalize)?;
     }
-    drop(token_source_relation);
+    drop(payload_interner);
+    // Payload bodies are only needed until every unique payload has been
+    // parsed and interned; no transient payload_blobs directory is created.
+    drop(arena);
 
-    let finalize_total = 3u64
-        .saturating_add(payloads.len() as u64)
-        .saturating_add(contracts.len() as u64);
+    // Phase E: build final columns from the already-resolved payload_ids, in
+    // original contract order (immediate contracts first, then fallback
+    // contracts, matching the order they were registered above).
+    let contract_total = pending_contracts.len() as u64;
     progress(ProgressEvent::determinate(
-        ProgressPhase::EncodeFinalize,
+        ProgressPhase::EncodeBuildColumns,
         0,
-        finalize_total,
+        contract_total,
         WorkUnit::Items,
         EngineCounters::default(),
     ));
-    resident_admission.reserve_growth(
-        committed_resident_bytes,
-        planned_encode_finalize_growth(payloads.len(), contracts.len())?,
-    )?;
-    cas.finish().map_err(encode_err)?;
-    let mut finalized = 1u64;
-    payload_interner.finalize_template_lexical_ids(&mut payloads);
-    drop(payload_interner);
-    finalized = finalized.saturating_add(1);
-    emit_encode_progress(
-        &mut progress,
-        ProgressPhase::EncodeFinalize,
-        finalized,
-        finalize_total,
-    );
+    let mut sources = EncodeSourceSoA::with_source_capacity(pending_contracts.len());
+    let mut contracts = EncodeContractSoA::with_contract_capacity(pending_contracts.len());
+    for (index, slot) in pending_contracts.into_iter().enumerate() {
+        let contract_id = u32::try_from(index).map_err(|_| {
+            AnalysisError::InvalidData("metadata contract count exceeds u32".into())
+        })?;
+        build_encoded_contract(slot, contract_id, &mut sources, &mut contracts)?;
+        emit_encode_progress(
+            &mut progress,
+            ProgressPhase::EncodeBuildColumns,
+            index as u64 + 1,
+            contract_total,
+        );
+    }
 
+    // Phase F: atoms / blocking sketches, unchanged from the legacy pass.
+    let atoms_total = 1u64.saturating_add(contracts.contract_count() as u64);
+    progress(ProgressEvent::determinate(
+        ProgressPhase::EncodeBuildAtoms,
+        0,
+        atoms_total,
+        WorkUnit::Items,
+        EngineCounters::default(),
+    ));
+    let mut atoms_completed = 0u64;
     let payload_feature_identity = payload_feature_identity_ids(&payloads);
-    for _ in &payloads {
-        finalized = finalized.saturating_add(1);
-        emit_encode_progress(
-            &mut progress,
-            ProgressPhase::EncodeFinalize,
-            finalized,
-            finalize_total,
-        );
-    }
-    let mut atom_ids = HashMap::<(u32, u32), usize>::new();
-    let mut atom_payloads = Vec::<u32>::new();
-    let mut fallback_atoms = Vec::<Vec<u32>>::new();
-    for contract in &contracts {
-        let key = (
-            contract.chain_id,
-            payload_feature_identity[contract.payload_id as usize],
-        );
-        let atom_id = if let Some(&atom_id) = atom_ids.get(&key) {
-            atom_id
-        } else {
-            let atom_id = fallback_atoms.len();
-            atom_ids.insert(key, atom_id);
-            atom_payloads.push(contract.payload_id);
-            fallback_atoms.push(Vec::new());
-            atom_id
-        };
-        fallback_atoms[atom_id].push(contract.contract_id);
-        finalized = finalized.saturating_add(1);
-        emit_encode_progress(
-            &mut progress,
-            ProgressPhase::EncodeFinalize,
-            finalized,
-            finalize_total,
-        );
-    }
-    let atom_inputs: Vec<_> = atom_payloads
-        .iter()
-        .map(|&payload_id| {
-            let payload = &payloads[payload_id as usize];
-            BaseEquivalentAtomInput {
-                template_terms: &payload.template_terms,
-                content_terms: &payload.content_terms,
-            }
-        })
-        .collect();
-    let atoms = build_base_equivalent_atom_sketches_parallel(&atom_inputs, threads);
-    finalized = finalized.saturating_add(1);
+    let fallback_atoms = build_fallback_atoms_hash_sharded(
+        &contracts,
+        &payload_feature_identity,
+        shard_count,
+        |completed| {
+            atoms_completed = completed;
+            emit_encode_progress(
+                &mut progress,
+                ProgressPhase::EncodeBuildAtoms,
+                atoms_completed,
+                atoms_total,
+            );
+        },
+    )?;
+    let atoms = build_base_equivalent_atom_sketches_from_soa_parallel(
+        &payloads,
+        &fallback_atoms.atom_payloads,
+        threads,
+    );
+    atoms_completed = atoms_completed.saturating_add(1);
     emit_encode_progress(
         &mut progress,
-        ProgressPhase::EncodeFinalize,
-        finalized,
-        finalize_total,
+        ProgressPhase::EncodeBuildAtoms,
+        atoms_completed,
+        atoms_total,
     );
-    drop(atom_inputs);
-    drop(atom_payloads);
-    drop(atom_ids);
     drop(payload_feature_identity);
-    drop(pending_fallbacks);
+
+    progress(ProgressEvent::determinate(
+        ProgressPhase::EncodeFinalize,
+        0,
+        1,
+        WorkUnit::Items,
+        EngineCounters::default(),
+    ));
     resident_admission.commit(frozen_encode_state_resident_bytes(
         &sources,
         &payloads,
@@ -1337,6 +1252,13 @@ fn stream_encode_inputs_with_admission(
         &atoms,
         &fallback_atoms,
     )?)?;
+    progress(ProgressEvent::determinate(
+        ProgressPhase::EncodeFinalize,
+        1,
+        1,
+        WorkUnit::Items,
+        EngineCounters::default(),
+    ));
 
     Ok((
         sources,
@@ -1348,19 +1270,587 @@ fn stream_encode_inputs_with_admission(
     ))
 }
 
-fn payload_feature_identity_ids(payloads: &[EncodePayloadRow]) -> Vec<u32> {
+/// Presence-only registration: reads representative rows via Arrow, computes
+/// eligibility + prefilter-token presence in rayon-parallel per batch, then
+/// sequentially inserts eligible JSON into the [`ShardedPayloadArena`]. Token
+/// sources reuse catalog `PayloadRef` values (JSON already in the arena).
+/// Full parse is deferred to a unique pass over every arena payload.
+///
+/// Returns columns+arena resident bytes **without** the token-source relation
+/// structural bytes, plus global payload ID offsets for the unique-parse pass.
+#[allow(clippy::too_many_arguments)]
+fn register_representative_payloads(
+    conn: &Connection,
+    token_source_relation: &TokenSourceRelation,
+    relation_resident_bytes: u64,
+    arena: ShardedPayloadArena,
+    resident_admission: &mut EncodeResidentAdmission,
+    parse_pool: &rayon::ThreadPool,
+    estimate: &EncodeAdmissionEstimate,
+    progress: &mut impl FnMut(ProgressEvent),
+) -> Result<
+    (
+        ShardedPayloadArena,
+        Vec<GlobalPendingContractSlot>,
+        u64,
+        Vec<u32>,
+    ),
+    AnalysisError,
+> {
+    let mut pending_contracts = Vec::<PendingContractSlot>::new();
+    let mut pending_fallbacks = HashMap::<u32, PendingFallbackContract>::new();
+    let mut registration_accounting = EncodeRegistrationAccounting::default();
+
+    let mut columns_resident_bytes =
+        registration_accounting.resident_bytes(&pending_contracts, &pending_fallbacks, &arena)?;
+    let mut committed_resident_bytes = columns_resident_bytes
+        .checked_add(relation_resident_bytes)
+        .ok_or_else(|| {
+            AnalysisError::InvalidData("Encode relation+columns admission overflow".into())
+        })?;
+    // Relation coords stay in the committed base until the caller drops them.
+    // Arena already holds token-source JSON from catalog load (no second copy).
+    resident_admission.commit(committed_resident_bytes)?;
+
+    progress(ProgressEvent::determinate(
+        ProgressPhase::EncodeReadRepresentatives,
+        0,
+        estimate.representative_rows,
+        WorkUnit::Items,
+        EngineCounters::default(),
+    ));
+    progress(ProgressEvent::determinate(
+        ProgressPhase::EncodeRegisterPayloads,
+        0,
+        estimate.representative_rows,
+        WorkUnit::Items,
+        EngineCounters::default(),
+    ));
+
+    let mut statement = conn.prepare(
+        "SELECT contracts.metadata_contract_index::UINTEGER AS metadata_contract_index,
+                selected.chain_index::UINTEGER AS chain_id,
+                rows.metadata_json,
+                contracts.nft_count::BIGINT AS nft_count,
+                contracts.metadata_source_file::UINTEGER AS metadata_source_file,
+                contracts.metadata_source_row_number::UBIGINT AS metadata_source_row_number
+         FROM analysis_contracts contracts
+         JOIN metadata_rows rows
+           ON rows.source_file = contracts.metadata_source_file
+          AND rows.source_row_number = contracts.metadata_source_row_number
+         JOIN selected_chains selected
+           ON selected.chain = contracts.chain
+         WHERE contracts.metadata_contract_index IS NOT NULL
+         ORDER BY contracts.metadata_contract_index",
+    )?;
+    let batches = statement.query_arrow([])?;
+
+    let mut representative_rows_read = 0u64;
+    let mut representative_rows_registered = 0u64;
+    for batch in batches {
+        let row_count = batch.num_rows();
+        if row_count == 0 {
+            continue;
+        }
+        let contract_indexes =
+            required_arrow_column::<UInt32Array>(&batch, 0, "metadata_contract_index")?;
+        let chain_ids = required_arrow_column::<UInt32Array>(&batch, 1, "chain_id")?;
+        let json_column = batch.column(2).as_ref();
+        let nft_counts = required_arrow_column::<Int64Array>(&batch, 3, "nft_count")?;
+        let source_files = required_arrow_column::<UInt32Array>(&batch, 4, "metadata_source_file")?;
+        let source_rows =
+            required_arrow_column::<UInt64Array>(&batch, 5, "metadata_source_row_number")?;
+
+        let presence = parse_pool.install(|| {
+            (0..row_count)
+                .into_par_iter()
+                .map(|index| {
+                    if contract_indexes.is_null(index)
+                        || chain_ids.is_null(index)
+                        || json_column.is_null(index)
+                        || nft_counts.is_null(index)
+                        || source_files.is_null(index)
+                        || source_rows.is_null(index)
+                    {
+                        return Err(AnalysisError::InvalidData(
+                            "metadata representative row contains NULL".into(),
+                        ));
+                    }
+                    let json = required_arrow_string(json_column, index)?;
+                    let eligible = metadata_is_dedup_eligible(json);
+                    let has_tokens = eligible && metadata_has_prefilter_tokens(json);
+                    Ok((eligible, has_tokens))
+                })
+                .collect::<Result<Vec<_>, AnalysisError>>()
+        })?;
+        representative_rows_read = representative_rows_read.saturating_add(row_count as u64);
+        progress(ProgressEvent::determinate(
+            ProgressPhase::EncodeReadRepresentatives,
+            representative_rows_read,
+            estimate.representative_rows,
+            WorkUnit::Items,
+            EngineCounters::default(),
+        ));
+
+        let mut batch_json_bytes = 0u64;
+        for index in 0..row_count {
+            let json = required_arrow_string(json_column, index)?;
+            batch_json_bytes =
+                batch_json_bytes
+                    .checked_add(json.len() as u64)
+                    .ok_or_else(|| {
+                        AnalysisError::InvalidData("Encode batch JSON bytes overflow".into())
+                    })?;
+        }
+        let batch_growth_bytes = planned_encode_batch_growth(batch_json_bytes, row_count)?;
+        resident_admission.reserve_growth(committed_resident_bytes, batch_growth_bytes)?;
+
+        for (index, &(eligible, has_tokens)) in presence.iter().enumerate() {
+            let contract_index = contract_indexes.value(index);
+            let chain_id = chain_ids.value(index);
+            let json = required_arrow_string(json_column, index)?;
+            let nft_count = nft_counts.value(index);
+            let source_file = source_files.value(index);
+            let source_row_number = source_rows.value(index);
+            representative_rows_registered = representative_rows_registered.saturating_add(1);
+
+            if !eligible {
+                emit_encode_progress(
+                    progress,
+                    ProgressPhase::EncodeRegisterPayloads,
+                    representative_rows_registered,
+                    estimate.representative_rows,
+                );
+                continue;
+            }
+            let weight = u64::try_from(nft_count).map_err(|_| {
+                AnalysisError::InvalidData("negative metadata contract nft_count".into())
+            })?;
+            if !has_tokens {
+                pending_fallbacks.insert(
+                    contract_index,
+                    PendingFallbackContract {
+                        source_contract_index: contract_index,
+                        chain_id,
+                        weight,
+                    },
+                );
+                emit_encode_progress(
+                    progress,
+                    ProgressPhase::EncodeRegisterPayloads,
+                    representative_rows_registered,
+                    estimate.representative_rows,
+                );
+                continue;
+            }
+
+            let representative_payload_ref = arena.insert(json.as_bytes()).map_err(encode_err)?;
+            let token_sources = token_source_relation.read_contract(contract_index)?;
+            let mut token_slots = Vec::with_capacity(token_sources.len());
+            for source in token_sources {
+                token_slots.push(PendingSourceSlot {
+                    source_file: source.source_file,
+                    source_row_number: source.source_row_number,
+                    payload_ref: source.payload_ref,
+                    token_ids: source.token_ids,
+                });
+            }
+            pending_contracts.push(PendingContractSlot {
+                chain_id,
+                weight,
+                representative_file: source_file,
+                representative_row: source_row_number,
+                representative_payload_ref,
+                token_sources: token_slots,
+            });
+            emit_encode_progress(
+                progress,
+                ProgressPhase::EncodeRegisterPayloads,
+                representative_rows_registered,
+                estimate.representative_rows,
+            );
+        }
+
+        columns_resident_bytes = registration_accounting.resident_bytes(
+            &pending_contracts,
+            &pending_fallbacks,
+            &arena,
+        )?;
+        committed_resident_bytes = columns_resident_bytes
+            .checked_add(relation_resident_bytes)
+            .ok_or_else(|| {
+                AnalysisError::InvalidData("Encode relation+columns admission overflow".into())
+            })?;
+        resident_admission.commit(committed_resident_bytes)?;
+    }
+    drop(statement);
+
+    if !pending_fallbacks.is_empty() {
+        columns_resident_bytes = resolve_pending_fallback_contracts(
+            conn,
+            token_source_relation,
+            relation_resident_bytes,
+            &arena,
+            &mut pending_contracts,
+            &mut pending_fallbacks,
+            resident_admission,
+            &mut registration_accounting,
+            columns_resident_bytes,
+            parse_pool,
+            progress,
+        )?;
+    }
+    drop(pending_fallbacks);
+
+    let global_offsets = arena.global_offsets().map_err(encode_err)?;
+    let pending_contracts =
+        materialize_global_pending_contracts(&arena, &global_offsets, pending_contracts)?;
+    Ok((
+        arena,
+        pending_contracts,
+        columns_resident_bytes,
+        global_offsets,
+    ))
+}
+
+fn materialize_global_pending_contracts(
+    arena: &ShardedPayloadArena,
+    offsets: &[u32],
+    pending: Vec<PendingContractSlot>,
+) -> Result<Vec<GlobalPendingContractSlot>, AnalysisError> {
+    pending
+        .into_iter()
+        .map(|slot| {
+            let representative_payload_id = arena
+                .global_id(slot.representative_payload_ref, offsets)
+                .map_err(encode_err)?;
+            let mut token_sources = Vec::with_capacity(slot.token_sources.len());
+            for source in slot.token_sources {
+                token_sources.push(GlobalPendingSourceSlot {
+                    source_file: source.source_file,
+                    source_row_number: source.source_row_number,
+                    payload_id: arena
+                        .global_id(source.payload_ref, offsets)
+                        .map_err(encode_err)?,
+                    token_ids: source.token_ids,
+                });
+            }
+            Ok(GlobalPendingContractSlot {
+                chain_id: slot.chain_id,
+                weight: slot.weight,
+                representative_file: slot.representative_file,
+                representative_row: slot.representative_row,
+                representative_payload_id,
+                token_sources,
+            })
+        })
+        .collect()
+}
+
+/// Fallback resolution: for every contract whose representative row had no
+/// retained prefilter tokens, stream candidate rows in stable order and keep
+/// only the first JSON that would have prefilter tokens. Candidates are
+/// admitted one-at-a-time before retention; rejected rows are dropped without
+/// Presence-only fallback selection over Arrow batches.
+///
+/// Keeps only a cross-batch contract cursor + selected flag. The first
+/// presence hit inserts JSON into the arena immediately and records a
+/// [`PayloadRef`]; later rows for the same contract are skipped without
+/// copying JSON. Memory is admitted per selected row only.
+#[allow(clippy::too_many_arguments)]
+fn resolve_pending_fallback_contracts(
+    conn: &Connection,
+    token_source_relation: &TokenSourceRelation,
+    relation_resident_bytes: u64,
+    arena: &ShardedPayloadArena,
+    pending_contracts: &mut Vec<PendingContractSlot>,
+    pending_fallbacks: &mut HashMap<u32, PendingFallbackContract>,
+    resident_admission: &mut EncodeResidentAdmission,
+    registration_accounting: &mut EncodeRegistrationAccounting,
+    mut columns_resident_bytes: u64,
+    parse_pool: &rayon::ThreadPool,
+    progress: &mut impl FnMut(ProgressEvent),
+) -> Result<u64, AnalysisError> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS encode_fallback_contracts;
+         CREATE TEMP TABLE encode_fallback_contracts(contract_index UINTEGER PRIMARY KEY);",
+    )?;
+    {
+        let mut appender = conn.appender("encode_fallback_contracts")?;
+        appender.append_rows(
+            pending_fallbacks
+                .keys()
+                .copied()
+                .map(|contract_index| [contract_index]),
+        )?;
+    }
+    let fallback_total: u64 = conn.query_row(
+        "SELECT count(*)::UBIGINT
+         FROM encode_fallback_contracts fallback
+         JOIN analysis_contracts contracts
+           ON contracts.metadata_contract_index = fallback.contract_index
+         JOIN metadata_rows rows ON rows.contract_id = contracts.contract_id
+         WHERE rows.metadata_eligible",
+        [],
+        |row| row.get(0),
+    )?;
+    progress(ProgressEvent::determinate(
+        ProgressPhase::EncodeFallbackSources,
+        0,
+        fallback_total,
+        WorkUnit::Items,
+        EngineCounters::default(),
+    ));
+    let mut stmt = conn.prepare(
+        "SELECT fallback.contract_index::UINTEGER AS contract_index,
+                rows.metadata_json,
+                rows.source_file::UINTEGER AS source_file,
+                rows.source_row_number::UBIGINT AS source_row_number
+         FROM encode_fallback_contracts fallback
+         JOIN analysis_contracts contracts
+           ON contracts.metadata_contract_index = fallback.contract_index
+         JOIN metadata_rows rows ON rows.contract_id = contracts.contract_id
+         WHERE rows.metadata_eligible
+         ORDER BY fallback.contract_index,
+                  rows.token_id,
+                  rows.source_file,
+                  rows.source_row_number",
+    )?;
+    let batches = stmt.query_arrow([])?;
+
+    progress(ProgressEvent::indeterminate(
+        ProgressPhase::EncodeResolveFallbacks,
+        0,
+        WorkUnit::Items,
+        EngineCounters::default(),
+    ));
+
+    let mut current_contract: Option<u32> = None;
+    let mut selected: Option<SelectedFallbackRow> = None;
+    let mut resolved_count = 0u64;
+    let mut scanned = 0u64;
+
+    for batch in batches {
+        let row_count = batch.num_rows();
+        if row_count == 0 {
+            continue;
+        }
+        let contract_indexes = required_arrow_column::<UInt32Array>(&batch, 0, "contract_index")?;
+        let json_column = batch.column(1).as_ref();
+        let source_files = required_arrow_column::<UInt32Array>(&batch, 2, "source_file")?;
+        let source_rows = required_arrow_column::<UInt64Array>(&batch, 3, "source_row_number")?;
+
+        // Presence checks for rows that still need a selection; already-selected
+        // contracts skip JSON access entirely after the cursor advances.
+        let presence = parse_pool.install(|| {
+            (0..row_count)
+                .into_par_iter()
+                .map(|index| {
+                    if contract_indexes.is_null(index)
+                        || json_column.is_null(index)
+                        || source_files.is_null(index)
+                        || source_rows.is_null(index)
+                    {
+                        return Err(AnalysisError::InvalidData(
+                            "metadata fallback row contains NULL".into(),
+                        ));
+                    }
+                    let json = required_arrow_string(json_column, index)?;
+                    Ok(metadata_has_prefilter_tokens(json))
+                })
+                .collect::<Result<Vec<_>, AnalysisError>>()
+        })?;
+
+        for (index, &has_tokens) in presence.iter().enumerate() {
+            let contract_index = contract_indexes.value(index);
+            scanned = scanned.saturating_add(1);
+            emit_encode_progress(
+                progress,
+                ProgressPhase::EncodeFallbackSources,
+                scanned,
+                fallback_total,
+            );
+            if Some(contract_index) != current_contract {
+                if let Some(chosen) = selected.take() {
+                    columns_resident_bytes = register_resolved_fallback_contract(
+                        chosen,
+                        token_source_relation,
+                        relation_resident_bytes,
+                        arena,
+                        pending_contracts,
+                        pending_fallbacks,
+                        resident_admission,
+                        registration_accounting,
+                    )?;
+                    resolved_count = resolved_count.saturating_add(1);
+                }
+                current_contract = Some(contract_index);
+            }
+            if selected.is_some() {
+                continue;
+            }
+            if !has_tokens {
+                continue;
+            }
+            let json = required_arrow_string(json_column, index)?;
+            let committed = columns_resident_bytes
+                .checked_add(relation_resident_bytes)
+                .ok_or_else(|| {
+                    AnalysisError::InvalidData("Encode fallback relation admission overflow".into())
+                })?;
+            let growth = planned_encode_batch_growth(json.len() as u64, 1)?;
+            resident_admission.reserve_growth(committed, growth)?;
+            let payload_ref = arena.insert(json.as_bytes()).map_err(encode_err)?;
+            selected = Some(SelectedFallbackRow {
+                contract_index,
+                source_file: source_files.value(index),
+                source_row_number: source_rows.value(index),
+                payload_ref,
+            });
+        }
+    }
+    if let Some(chosen) = selected.take() {
+        columns_resident_bytes = register_resolved_fallback_contract(
+            chosen,
+            token_source_relation,
+            relation_resident_bytes,
+            arena,
+            pending_contracts,
+            pending_fallbacks,
+            resident_admission,
+            registration_accounting,
+        )?;
+        resolved_count = resolved_count.saturating_add(1);
+    }
+
+    progress(ProgressEvent::indeterminate(
+        ProgressPhase::EncodeResolveFallbacks,
+        resolved_count,
+        WorkUnit::Items,
+        EngineCounters::default(),
+    ));
+    emit_encode_progress(
+        progress,
+        ProgressPhase::EncodeFallbackSources,
+        fallback_total,
+        fallback_total,
+    );
+    conn.execute_batch("DROP TABLE encode_fallback_contracts")?;
+    Ok(columns_resident_bytes)
+}
+
+struct SelectedFallbackRow {
+    contract_index: u32,
+    source_file: u32,
+    source_row_number: u64,
+    payload_ref: PayloadRef,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn register_resolved_fallback_contract(
+    row: SelectedFallbackRow,
+    token_source_relation: &TokenSourceRelation,
+    relation_resident_bytes: u64,
+    arena: &ShardedPayloadArena,
+    pending_contracts: &mut Vec<PendingContractSlot>,
+    pending_fallbacks: &mut HashMap<u32, PendingFallbackContract>,
+    resident_admission: &mut EncodeResidentAdmission,
+    registration_accounting: &mut EncodeRegistrationAccounting,
+) -> Result<u64, AnalysisError> {
+    let Some(pending) = pending_fallbacks.remove(&row.contract_index) else {
+        return registration_accounting.resident_bytes(pending_contracts, pending_fallbacks, arena);
+    };
+    let token_sources = token_source_relation.read_contract(pending.source_contract_index)?;
+    let mut token_slots = Vec::with_capacity(token_sources.len());
+    for source in token_sources {
+        token_slots.push(PendingSourceSlot {
+            source_file: source.source_file,
+            source_row_number: source.source_row_number,
+            payload_ref: source.payload_ref,
+            token_ids: source.token_ids,
+        });
+    }
+    pending_contracts.push(PendingContractSlot {
+        chain_id: pending.chain_id,
+        weight: pending.weight,
+        representative_file: row.source_file,
+        representative_row: row.source_row_number,
+        representative_payload_ref: row.payload_ref,
+        token_sources: token_slots,
+    });
+    let columns =
+        registration_accounting.resident_bytes(pending_contracts, pending_fallbacks, arena)?;
+    let committed = columns
+        .checked_add(relation_resident_bytes)
+        .ok_or_else(|| {
+            AnalysisError::InvalidData("Encode fallback relation admission overflow".into())
+        })?;
+    resident_admission.commit(committed)?;
+    Ok(columns)
+}
+
+fn build_encoded_contract(
+    slot: GlobalPendingContractSlot,
+    contract_id: u32,
+    sources: &mut EncodeSourceSoA,
+    contracts: &mut EncodeContractSoA,
+) -> Result<(), AnalysisError> {
+    let mut selected_tokens = None::<Vec<u32>>;
+    let mut remaining_sources = Vec::with_capacity(slot.token_sources.len());
+    for source in slot.token_sources {
+        if source.source_file == slot.representative_file
+            && source.source_row_number == slot.representative_row
+        {
+            if let Some(tokens) = selected_tokens.as_mut() {
+                tokens.extend(source.token_ids);
+            } else {
+                selected_tokens = Some(source.token_ids);
+            }
+        } else {
+            remaining_sources.push(source);
+        }
+    }
+    let source_doc_id = u32::try_from(sources.source_count())
+        .map_err(|_| AnalysisError::InvalidData("metadata source count exceeds u32".into()))?;
+    sources
+        .push_source(
+            contract_id,
+            slot.representative_payload_id,
+            selected_tokens.as_deref().unwrap_or(&[]),
+        )
+        .map_err(encode_err)?;
+    for source in remaining_sources {
+        let mut token_ids = source.token_ids;
+        if token_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+            token_ids.sort_unstable();
+            token_ids.dedup();
+        }
+        sources
+            .push_source(contract_id, source.payload_id, &token_ids)
+            .map_err(encode_err)?;
+    }
+    contracts.push_contract(
+        contract_id,
+        slot.chain_id,
+        source_doc_id,
+        slot.representative_payload_id,
+        slot.weight,
+    );
+    Ok(())
+}
+
+fn payload_feature_identity_ids(payloads: &PayloadTermSoA) -> Vec<u32> {
     enum IdentityBucket {
         Single { payload_index: usize, identity: u32 },
         Collision(Vec<(usize, u32)>),
     }
 
     let mut buckets = HashMap::<u64, IdentityBucket>::new();
-    let mut identities = Vec::with_capacity(payloads.len());
+    let mut identities = Vec::with_capacity(payloads.payload_count());
     let mut next_identity = 0u32;
-    for (payload_index, payload) in payloads.iter().enumerate() {
+    for payload_index in 0..payloads.payload_count() {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        payload.template_terms.hash(&mut hasher);
-        payload.content_terms.hash(&mut hasher);
+        payloads.hash_payload(payload_index, &mut hasher);
         let hash = hasher.finish();
         let identity = match buckets.entry(hash) {
             std::collections::hash_map::Entry::Vacant(entry) => {
@@ -1377,10 +1867,7 @@ fn payload_feature_identity_ids(payloads: &[EncodePayloadRow]) -> Vec<u32> {
                     payload_index: representative,
                     identity,
                 } => {
-                    let existing = &payloads[*representative];
-                    if existing.template_terms == payload.template_terms
-                        && existing.content_terms == payload.content_terms
-                    {
+                    if payloads.payload_eq(*representative, payload_index) {
                         *identity
                     } else {
                         let new_identity = next_identity;
@@ -1394,9 +1881,8 @@ fn payload_feature_identity_ids(payloads: &[EncodePayloadRow]) -> Vec<u32> {
                 IdentityBucket::Collision(bucket) => bucket
                     .iter()
                     .find_map(|&(representative, identity)| {
-                        let existing = &payloads[representative];
-                        (existing.template_terms == payload.template_terms
-                            && existing.content_terms == payload.content_terms)
+                        payloads
+                            .payload_eq(representative, payload_index)
                             .then_some(identity)
                     })
                     .unwrap_or_else(|| {
@@ -1412,24 +1898,13 @@ fn payload_feature_identity_ids(payloads: &[EncodePayloadRow]) -> Vec<u32> {
     identities
 }
 
-fn intern_payload(
-    metadata_json: &str,
-    cas: &mut PayloadCasWriter,
-    payloads: &mut Vec<EncodePayloadRow>,
-    payload_interner: &mut PayloadTermInterner,
-) -> Result<u32, AnalysisError> {
-    intern_payload_with_parser(
-        metadata_json,
-        cas,
-        payloads,
-        payload_interner,
-        parse_metadata_documents,
-    )
-}
-
+/// Retained for differential/unit tests exercising the arena-dedup +
+/// interning contract directly (production registration defers parsing; see
+/// `register_representative_payloads` / the unique-parse pass).
+#[cfg(test)]
 fn intern_payload_with_parser(
     metadata_json: &str,
-    cas: &mut PayloadCasWriter,
+    cas: &mut PayloadArena,
     payloads: &mut Vec<EncodePayloadRow>,
     payload_interner: &mut PayloadTermInterner,
     parse: impl FnOnce(&str) -> ParsedMetadataDocuments,
@@ -1439,84 +1914,6 @@ fn intern_payload_with_parser(
         payloads.push(payload_interner.intern(parse(metadata_json))?);
     }
     Ok(payload_id)
-}
-
-fn intern_parsed_payload(
-    metadata_json: &str,
-    parsed: ParsedMetadataDocuments,
-    cas: &mut PayloadCasWriter,
-    payloads: &mut Vec<EncodePayloadRow>,
-    payload_interner: &mut PayloadTermInterner,
-) -> Result<u32, AnalysisError> {
-    let payload_id = cas.insert(metadata_json.as_bytes()).map_err(encode_err)?;
-    if payload_id as usize >= payloads.len() {
-        payloads.push(payload_interner.intern(parsed)?);
-    }
-    Ok(payload_id)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn append_encoded_contract(
-    chain_id: u32,
-    weight: u64,
-    selected_source_file: u32,
-    selected_source_row: u64,
-    metadata_json: &str,
-    parsed: ParsedMetadataDocuments,
-    token_sources: Vec<TokenSourceInput>,
-    cas: &mut PayloadCasWriter,
-    payloads: &mut Vec<EncodePayloadRow>,
-    payload_interner: &mut PayloadTermInterner,
-    sources: &mut Vec<EncodeSourceRow>,
-    contracts: &mut Vec<EncodeContractRow>,
-) -> Result<(), AnalysisError> {
-    let contract_id = u32::try_from(contracts.len())
-        .map_err(|_| AnalysisError::InvalidData("metadata contract count exceeds u32".into()))?;
-    let payload_id = intern_parsed_payload(metadata_json, parsed, cas, payloads, payload_interner)?;
-    let mut selected_tokens = None::<Vec<u32>>;
-    let mut remaining_sources = Vec::with_capacity(token_sources.len().saturating_sub(1));
-    for source in token_sources {
-        if source.source_file == selected_source_file
-            && source.source_row_number == selected_source_row
-        {
-            if let Some(tokens) = selected_tokens.as_mut() {
-                tokens.extend(source.token_ids);
-            } else {
-                selected_tokens = Some(source.token_ids);
-            }
-        } else {
-            remaining_sources.push(source);
-        }
-    }
-    let source_doc_id = u32::try_from(sources.len())
-        .map_err(|_| AnalysisError::InvalidData("metadata source count exceeds u32".into()))?;
-    sources.push(EncodeSourceRow {
-        contract_id,
-        payload_id,
-        retained_token_ids: selected_tokens.unwrap_or_default(),
-    });
-    for source in remaining_sources {
-        let source_json = source.metadata_json;
-        let mut source_tokens = source.token_ids;
-        if source_tokens.windows(2).any(|pair| pair[0] >= pair[1]) {
-            source_tokens.sort_unstable();
-            source_tokens.dedup();
-        }
-        let source_payload_id = intern_payload(&source_json, cas, payloads, payload_interner)?;
-        sources.push(EncodeSourceRow {
-            contract_id,
-            payload_id: source_payload_id,
-            retained_token_ids: source_tokens,
-        });
-    }
-    contracts.push(EncodeContractRow {
-        contract_id,
-        chain_id,
-        source_doc_id,
-        payload_id,
-        weight,
-    });
-    Ok(())
 }
 
 fn load_encode_chain_totals(conn: &Connection) -> Result<Vec<EncodeChainTotal>, AnalysisError> {
@@ -1543,6 +1940,7 @@ fn load_encode_chain_totals(conn: &Connection) -> Result<Vec<EncodeChainTotal>, 
 fn build_retained_token_source_relation(
     conn: &Connection,
     contract_count: u32,
+    arena: &ShardedPayloadArena,
     parse_pool: &rayon::ThreadPool,
     progress: &mut impl FnMut(ProgressEvent),
 ) -> Result<TokenSourceRelation, AnalysisError> {
@@ -1580,6 +1978,7 @@ fn build_retained_token_source_relation(
          DROP TABLE IF EXISTS encode_source_keys;
          DROP TABLE IF EXISTS encode_source_catalog;
          DROP TABLE IF EXISTS encode_fallback_candidates;
+         DROP TABLE IF EXISTS encode_fallback_source_keys;
          DROP TABLE IF EXISTS encode_fallback_source_catalog;
          DROP TABLE IF EXISTS encode_source_dictionary;
          DROP TABLE IF EXISTS encode_source_usability;
@@ -1668,9 +2067,9 @@ fn build_retained_token_source_relation(
     ));
 
     progress(ProgressEvent::determinate(
-        ProgressPhase::EncodeTokenFallbackSources,
+        ProgressPhase::EncodePrepareFallbackTokenSources,
         0,
-        FALLBACK_TOKEN_SOURCE_STEPS,
+        FALLBACK_PREPARE_STEPS,
         WorkUnit::Work,
         EngineCounters::default(),
     ));
@@ -1679,8 +2078,7 @@ fn build_retained_token_source_relation(
          SELECT fallback.contract_index,
                 fallback.token_index,
                 rows.source_file::UINTEGER AS source_file,
-                rows.source_row_number::UBIGINT AS source_row_number,
-                rows.metadata_json
+                rows.source_row_number::UBIGINT AS source_row_number
          FROM encode_token_source_candidates fallback
          JOIN analysis_contracts contracts
            ON contracts.metadata_contract_index = fallback.contract_index
@@ -1691,21 +2089,42 @@ fn build_retained_token_source_relation(
           AND rows.token_id = dictionary.token_id
          WHERE NOT fallback.usable
            AND rows.metadata_eligible;
-         CREATE TEMP TABLE encode_fallback_source_catalog AS
+         CREATE TEMP TABLE encode_fallback_source_keys AS
          SELECT DISTINCT candidates.source_file,
-                         candidates.source_row_number,
-                         candidates.metadata_json
+                         candidates.source_row_number
          FROM encode_fallback_candidates candidates;
          CREATE TEMP TABLE encode_fallback_source_usability(
              source_file UINTEGER,
              source_row_number UBIGINT,
              usable BOOLEAN
+         );
+         INSERT INTO encode_fallback_source_usability
+         SELECT keys.source_file,
+                keys.source_row_number,
+                primary_usability.usable
+         FROM encode_fallback_source_keys keys
+         JOIN encode_source_usability primary_usability
+           ON primary_usability.source_file = keys.source_file
+          AND primary_usability.source_row_number = keys.source_row_number;
+         CREATE TEMP TABLE encode_fallback_source_catalog AS
+         SELECT keys.source_file,
+                keys.source_row_number,
+                metadata_rows.metadata_json
+         FROM encode_fallback_source_keys keys
+         JOIN metadata_rows
+           ON metadata_rows.source_file = keys.source_file
+          AND metadata_rows.source_row_number = keys.source_row_number
+         WHERE NOT EXISTS (
+             SELECT 1
+             FROM encode_source_usability primary_usability
+             WHERE primary_usability.source_file = keys.source_file
+               AND primary_usability.source_row_number = keys.source_row_number
          );",
     )?;
     progress(ProgressEvent::determinate(
-        ProgressPhase::EncodeTokenFallbackSources,
+        ProgressPhase::EncodePrepareFallbackTokenSources,
         1,
-        FALLBACK_TOKEN_SOURCE_STEPS,
+        FALLBACK_PREPARE_STEPS,
         WorkUnit::Work,
         EngineCounters::default(),
     ));
@@ -1717,13 +2136,6 @@ fn build_retained_token_source_relation(
         parse_pool,
         progress,
     )?;
-    progress(ProgressEvent::determinate(
-        ProgressPhase::EncodeTokenFallbackSources,
-        2,
-        FALLBACK_TOKEN_SOURCE_STEPS,
-        WorkUnit::Work,
-        EngineCounters::default(),
-    ));
     conn.execute_batch(
         "INSERT INTO encode_resolved_token_sources
          SELECT contract_index, token_index, source_file, source_row_number
@@ -1745,9 +2157,9 @@ fn build_retained_token_source_relation(
          WHERE source_rank = 1;",
     )?;
     progress(ProgressEvent::determinate(
-        ProgressPhase::EncodeTokenFallbackSources,
-        FALLBACK_TOKEN_SOURCE_STEPS,
-        FALLBACK_TOKEN_SOURCE_STEPS,
+        ProgressPhase::EncodePrepareFallbackTokenSources,
+        FALLBACK_PREPARE_STEPS,
+        FALLBACK_PREPARE_STEPS,
         WorkUnit::Work,
         EngineCounters::default(),
     ));
@@ -1760,21 +2172,15 @@ fn build_retained_token_source_relation(
                 ) - 1)::UINTEGER AS source_id,
                 coords.source_file,
                 coords.source_row_number,
-                json_docs.metadata_json
+                metadata_rows.metadata_json
          FROM (
              SELECT DISTINCT resolved.source_file,
                              resolved.source_row_number
              FROM encode_resolved_token_sources resolved
          ) coords
-         JOIN (
-             SELECT source_file, source_row_number, metadata_json
-             FROM encode_source_catalog
-             UNION
-             SELECT source_file, source_row_number, metadata_json
-             FROM encode_fallback_source_catalog
-         ) json_docs
-           ON json_docs.source_file = coords.source_file
-          AND json_docs.source_row_number = coords.source_row_number;",
+         JOIN metadata_rows
+           ON metadata_rows.source_file = coords.source_file
+          AND metadata_rows.source_row_number = coords.source_row_number;",
     )?;
     let source_count: u64 = conn.query_row(
         "SELECT count(*)::UBIGINT FROM encode_source_dictionary",
@@ -1789,7 +2195,7 @@ fn build_retained_token_source_relation(
     let source_count = u32::try_from(source_count).map_err(|_| {
         AnalysisError::InvalidData("token source dictionary exceeds u32 identity space".into())
     })?;
-    let sources = load_token_source_records(conn, source_count, parse_pool, progress)?;
+    let sources = load_token_source_records(conn, source_count, arena, parse_pool, progress)?;
     let mut memberships = load_token_memberships(conn, membership_count, parse_pool, progress)?;
     progress(ProgressEvent::indeterminate(
         ProgressPhase::EncodeSortTokenMemberships,
@@ -1813,23 +2219,16 @@ fn build_retained_token_source_relation(
          DROP TABLE encode_source_keys;
          DROP TABLE encode_source_catalog;
          DROP TABLE encode_fallback_candidates;
+         DROP TABLE encode_fallback_source_keys;
          DROP TABLE encode_fallback_source_catalog;
          DROP TABLE encode_source_usability;
          DROP TABLE encode_fallback_source_usability;",
     )?;
-    let source_json_bytes = sources
-        .iter()
-        .try_fold(0u64, |total, source| {
-            total.checked_add(source.metadata_json.len() as u64)
-        })
-        .ok_or_else(|| AnalysisError::InvalidData("token-source JSON size overflow".into()))?;
+    // JSON bodies live only in the arena; relation retains coords + PayloadRef.
     let logical_bytes = capacity_bytes::<TokenSourceRecord>(sources.capacity())?
-        .checked_add(source_json_bytes)
-        .and_then(|bytes| {
-            bytes.checked_add(
-                capacity_bytes::<ResolvedTokenMembership>(memberships.capacity()).ok()?,
-            )
-        })
+        .checked_add(capacity_bytes::<ResolvedTokenMembership>(
+            memberships.capacity(),
+        )?)
         .and_then(|bytes| {
             bytes.checked_add(capacity_bytes::<usize>(contract_offsets.capacity()).ok()?)
         })
@@ -1925,6 +2324,7 @@ fn classify_source_catalog(
 fn load_token_source_records(
     conn: &Connection,
     source_count: u32,
+    arena: &ShardedPayloadArena,
     parse_pool: &rayon::ThreadPool,
     progress: &mut impl FnMut(ProgressEvent),
 ) -> Result<Vec<TokenSourceRecord>, AnalysisError> {
@@ -1973,10 +2373,12 @@ fn load_token_source_records(
                             "token-source dictionary IDs are not dense".into(),
                         ));
                     }
+                    let json = required_arrow_string(json, index)?;
+                    let payload_ref = arena.insert(json.as_bytes()).map_err(encode_err)?;
                     Ok(TokenSourceRecord {
                         source_file: source_files.value(index),
                         source_row_number: source_rows.value(index),
-                        metadata_json: Arc::from(required_arrow_string(json, index)?),
+                        payload_ref,
                     })
                 })
                 .collect::<Result<Vec<_>, AnalysisError>>()
@@ -2147,6 +2549,64 @@ fn emit_encode_progress(
     }
 }
 
+fn build_fallback_atoms_hash_sharded(
+    contracts: &EncodeContractSoA,
+    payload_feature_identity: &[u32],
+    shard_count: usize,
+    mut on_progress: impl FnMut(u64),
+) -> Result<FallbackAtomCsr, AnalysisError> {
+    let shard_count = shard_count.next_power_of_two().max(1);
+    let shard_mask = shard_count - 1;
+    let shards = (0..shard_count)
+        .map(|_| Mutex::new(HashMap::<(u32, u32), (u32, Vec<u32>)>::new()))
+        .collect::<Vec<_>>();
+    (0..contracts.contract_count())
+        .into_par_iter()
+        .try_for_each(|index| {
+            let payload_id = contracts.payload_ids[index];
+            let feature = *payload_feature_identity
+                .get(payload_id as usize)
+                .ok_or_else(|| {
+                    AnalysisError::InvalidData("atom feature identity out of range".into())
+                })?;
+            let key = (contracts.chain_ids[index], feature);
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            key.hash(&mut hasher);
+            let shard = (hasher.finish() as usize) & shard_mask;
+            let mut map = shards[shard]
+                .lock()
+                .map_err(|_| AnalysisError::InvalidData("atom shard lock poisoned".into()))?;
+            let entry = map.entry(key).or_insert_with(|| (payload_id, Vec::new()));
+            entry.1.push(contracts.contract_ids[index]);
+            Ok::<_, AnalysisError>(())
+        })?;
+
+    let mut offsets = Vec::new();
+    offsets.push(0u64);
+    let mut members = Vec::new();
+    let mut atom_payloads = Vec::new();
+    let mut completed = 0u64;
+    for shard in &shards {
+        let mut map = shard
+            .lock()
+            .map_err(|_| AnalysisError::InvalidData("atom shard lock poisoned".into()))?;
+        for (_key, (payload_id, mut atom_members)) in map.drain() {
+            atom_members.sort_unstable();
+            atom_payloads.push(payload_id);
+            completed = completed.saturating_add(atom_members.len() as u64);
+            members.extend(atom_members);
+            offsets.push(members.len() as u64);
+            on_progress(completed);
+        }
+    }
+    Ok(FallbackAtomCsr {
+        offsets,
+        members,
+        atom_payloads,
+    })
+}
+
+#[allow(dead_code)] // retained for memory_dedup_tests / differential helpers
 #[derive(Default)]
 struct PayloadTermInterner {
     template_ids: HashMap<Arc<str>, u32>,
@@ -2156,6 +2616,7 @@ struct PayloadTermInterner {
     content_string_bytes: u64,
 }
 
+#[allow(dead_code)]
 impl PayloadTermInterner {
     fn intern(
         &mut self,
@@ -2209,12 +2670,14 @@ impl PayloadTermInterner {
             content_terms.push((token_id, frequency));
         }
         content_terms.sort_unstable_by_key(|(token, _)| *token);
+        template_terms.sort_unstable_by_key(|(token, _)| *token);
         Ok(EncodePayloadRow {
             template_terms,
             content_terms,
         })
     }
 
+    #[allow(dead_code)]
     fn resident_bytes(&self) -> u64 {
         hash_map_capacity_bytes::<Arc<str>, u32>(self.template_ids.capacity())
             .unwrap_or(u64::MAX)
@@ -2228,34 +2691,201 @@ impl PayloadTermInterner {
             .saturating_add(self.template_string_bytes)
             .saturating_add(self.content_string_bytes)
     }
+}
 
-    fn finalize_template_lexical_ids(&self, payloads: &mut [EncodePayloadRow]) {
-        let mut lexical: Vec<(u32, &str)> = self
-            .template_tokens
-            .iter()
-            .enumerate()
-            .map(|(old_id, token)| (old_id as u32, token.as_ref()))
-            .collect();
-        lexical.sort_unstable_by(|left, right| left.1.cmp(right.1));
-        let mut remap = vec![0u32; lexical.len()];
-        for (new_id, (old_id, _)) in lexical.into_iter().enumerate() {
-            remap[old_id as usize] = new_id as u32;
+/// Hash-sharded term dictionaries with globally unique arbitrary IDs.
+/// Template and content stay separate; no lexical ID finalize pass.
+struct ShardedPayloadTermInterner {
+    template_shards: Vec<Mutex<HashMap<Arc<str>, u32>>>,
+    content_shards: Vec<Mutex<HashMap<String, u32>>>,
+    next_template_id: AtomicU32,
+    next_content_id: AtomicU32,
+    template_string_bytes: AtomicU64,
+    content_string_bytes: AtomicU64,
+    shard_mask: usize,
+}
+
+struct PendingPayloadTerms {
+    template: Vec<(String, u32)>,
+    content: Vec<(String, u32)>,
+}
+
+struct PendingTermRequest {
+    payload: usize,
+    token: String,
+    frequency: u32,
+}
+
+impl ShardedPayloadTermInterner {
+    fn with_shard_count(shard_count: usize) -> Self {
+        let shard_count = shard_count.next_power_of_two().max(1);
+        Self {
+            template_shards: (0..shard_count)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
+            content_shards: (0..shard_count)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
+            next_template_id: AtomicU32::new(0),
+            next_content_id: AtomicU32::new(0),
+            template_string_bytes: AtomicU64::new(0),
+            content_string_bytes: AtomicU64::new(0),
+            shard_mask: shard_count - 1,
         }
-        for payload in payloads {
-            for (token, _) in &mut payload.template_terms {
-                *token = remap[*token as usize];
+    }
+
+    fn shard_for(token: &str, shard_mask: usize) -> usize {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        token.hash(&mut hasher);
+        (hasher.finish() as usize) & shard_mask
+    }
+
+    #[allow(dead_code)]
+    fn intern(&self, parsed: ParsedMetadataDocuments) -> Result<PayloadTermLists, AnalysisError> {
+        self.intern_batch(vec![parsed])?
+            .pop()
+            .ok_or_else(|| AnalysisError::InvalidData("missing interned payload".into()))
+    }
+
+    /// Intern a parse batch with at most one lock acquisition per non-empty
+    /// dictionary shard and dimension.
+    fn intern_batch(
+        &self,
+        parsed_batch: Vec<ParsedMetadataDocuments>,
+    ) -> Result<PayloadTermListBatch, AnalysisError> {
+        let payload_count = parsed_batch.len();
+        let pending = parsed_batch
+            .into_par_iter()
+            .map(|parsed| PendingPayloadTerms {
+                template: string_term_frequencies(parsed.prefilter_tokens),
+                content: string_term_frequencies(parsed.content_tokens),
+            })
+            .collect::<Vec<_>>();
+        let shard_count = self.shard_mask + 1;
+        let mut template_requests = (0..shard_count)
+            .map(|_| Vec::<PendingTermRequest>::new())
+            .collect::<Vec<_>>();
+        let mut content_requests = (0..shard_count)
+            .map(|_| Vec::<PendingTermRequest>::new())
+            .collect::<Vec<_>>();
+        for (payload, pending) in pending.into_iter().enumerate() {
+            for (token, frequency) in pending.template {
+                let shard = Self::shard_for(&token, self.shard_mask);
+                template_requests[shard].push(PendingTermRequest {
+                    payload,
+                    token,
+                    frequency,
+                });
             }
-            payload
-                .template_terms
-                .sort_unstable_by_key(|(token, _)| *token);
+            for (token, frequency) in pending.content {
+                let shard = Self::shard_for(&token, self.shard_mask);
+                content_requests[shard].push(PendingTermRequest {
+                    payload,
+                    token,
+                    frequency,
+                });
+            }
         }
+
+        let template_results = template_requests
+            .into_par_iter()
+            .enumerate()
+            .map(|(shard, requests)| {
+                if requests.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let mut map = self.template_shards[shard].lock().map_err(|_| {
+                    AnalysisError::InvalidData("template shard lock poisoned".into())
+                })?;
+                let mut resolved = Vec::with_capacity(requests.len());
+                for request in requests {
+                    let token_id = if let Some(&token_id) = map.get(request.token.as_str()) {
+                        token_id
+                    } else {
+                        let token_id = self.next_template_id.fetch_add(1, Ordering::Relaxed);
+                        if token_id == u32::MAX {
+                            return Err(AnalysisError::InvalidData(
+                                "template token count exceeds u32".into(),
+                            ));
+                        }
+                        let bytes = (request.token.len() as u64)
+                            .checked_add(2 * std::mem::size_of::<usize>() as u64)
+                            .ok_or_else(|| {
+                                AnalysisError::InvalidData(
+                                    "template token resident accounting overflow".into(),
+                                )
+                            })?;
+                        self.template_string_bytes
+                            .fetch_add(bytes, Ordering::Relaxed);
+                        let token: Arc<str> = Arc::from(request.token.as_str());
+                        map.insert(token, token_id);
+                        token_id
+                    };
+                    resolved.push((request.payload, token_id, request.frequency));
+                }
+                Ok(resolved)
+            })
+            .collect::<Result<Vec<_>, AnalysisError>>()?;
+        let content_results = content_requests
+            .into_par_iter()
+            .enumerate()
+            .map(|(shard, requests)| {
+                if requests.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let mut map = self.content_shards[shard].lock().map_err(|_| {
+                    AnalysisError::InvalidData("content shard lock poisoned".into())
+                })?;
+                let mut resolved = Vec::with_capacity(requests.len());
+                for request in requests {
+                    let token_id = if let Some(&token_id) = map.get(&request.token) {
+                        token_id
+                    } else {
+                        let token_id = self.next_content_id.fetch_add(1, Ordering::Relaxed);
+                        if token_id == u32::MAX {
+                            return Err(AnalysisError::InvalidData(
+                                "content token count exceeds u32".into(),
+                            ));
+                        }
+                        self.content_string_bytes
+                            .fetch_add(request.token.capacity() as u64, Ordering::Relaxed);
+                        map.insert(request.token, token_id);
+                        token_id
+                    };
+                    resolved.push((request.payload, token_id, request.frequency));
+                }
+                Ok(resolved)
+            })
+            .collect::<Result<Vec<_>, AnalysisError>>()?;
+
+        let mut output = (0..payload_count)
+            .map(|_| (Vec::new(), Vec::new()))
+            .collect::<PayloadTermListBatch>();
+        for (payload, token_id, frequency) in template_results.into_iter().flatten() {
+            output[payload].0.push((token_id, frequency));
+        }
+        for (payload, token_id, frequency) in content_results.into_iter().flatten() {
+            output[payload].1.push((token_id, frequency));
+        }
+        output.par_iter_mut().for_each(|(template, content)| {
+            template.sort_unstable_by_key(|(token_id, _)| *token_id);
+            content.sort_unstable_by_key(|(token_id, _)| *token_id);
+        });
+        Ok(output)
     }
 }
 
-fn string_term_frequencies(tokens: Vec<String>) -> BTreeMap<String, u32> {
-    let mut frequencies = BTreeMap::new();
+fn string_term_frequencies(mut tokens: Vec<String>) -> Vec<(String, u32)> {
+    tokens.sort_unstable();
+    let mut frequencies: Vec<(String, u32)> = Vec::with_capacity(tokens.len());
     for token in tokens {
-        *frequencies.entry(token).or_insert(0u32) += 1;
+        if let Some((previous, count)) = frequencies.last_mut() {
+            if *previous == token {
+                *count = count.saturating_add(1);
+                continue;
+            }
+        }
+        frequencies.push((token, 1u32));
     }
     frequencies
 }
@@ -2309,7 +2939,21 @@ fn fingerprint_bundle_files(
         .into_iter()
         .map(|path| {
             let path = path.canonicalize()?;
-            let (size, sha256) = sha256_file(&path, 8 * 1024 * 1024)?;
+            let (size, sha256) = if let Some((size, checksum)) =
+                metadata_engine::format::typed_array_footer_fingerprint(&path)
+                    .map_err(encode_err)?
+            {
+                (
+                    size,
+                    format!(
+                        "{}{}",
+                        metadata_engine::format::TYPED_ARRAY_CHECKSUM_PREFIX,
+                        checksum
+                    ),
+                )
+            } else {
+                sha256_file(&path, 8 * 1024 * 1024)?
+            };
             Ok(ArtifactFingerprintRecord {
                 path,
                 size,
@@ -2318,6 +2962,19 @@ fn fingerprint_bundle_files(
             })
         })
         .collect()
+}
+
+fn path_is_under_payload_blobs(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == "payload_blobs")
+}
+
+fn remove_stale_encode_payload_blobs(encode_dir: &Path) -> Result<(), AnalysisError> {
+    let blobs = encode_dir.join("payload_blobs");
+    if blobs.exists() {
+        fs::remove_dir_all(&blobs)?;
+    }
+    Ok(())
 }
 
 fn collect_files(path: &Path, output: &mut Vec<PathBuf>) -> Result<(), AnalysisError> {
@@ -2378,24 +3035,9 @@ pub(super) fn estimate_encode_storage_bytes(
     })
 }
 
-fn directory_bytes(path: &Path) -> Result<u64, AnalysisError> {
-    if !path.exists() {
-        return Ok(0);
-    }
-    if path.is_file() {
-        return Ok(fs::metadata(path)?.len());
-    }
-    let mut total = 0u64;
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        total = total.saturating_add(directory_bytes(&entry.path())?);
-    }
-    Ok(total)
-}
-
 fn blocking_contract_expansion_pair_work(
     blocking: &metadata_engine::blocking::BlockingBundle,
-    fallback_atoms: &[Vec<u32>],
+    fallback_atoms: &FallbackAtomCsr,
 ) -> Result<u64, AnalysisError> {
     let mut total = 0u64;
     for block in 0..blocking.block_kinds.len() {
@@ -2403,9 +3045,7 @@ fn blocking_contract_expansion_pair_work(
         let end = blocking.block_atom_offsets[block + 1] as usize;
         let mut prefix = 0u64;
         for &atom in &blocking.block_atoms[begin..end] {
-            let members = fallback_atoms
-                .get(atom as usize)
-                .map_or(0u64, |members| members.len() as u64);
+            let members = fallback_atoms.members_of(atom as usize).len() as u64;
             total = total
                 .checked_add(prefix.checked_mul(members).ok_or_else(|| {
                     AnalysisError::InvalidData("blocking contract expansion work overflow".into())
@@ -2444,15 +3084,16 @@ fn format_err(err: impl std::fmt::Display) -> AnalysisError {
 #[cfg(test)]
 mod memory_dedup_tests {
     use std::collections::HashMap;
-    use std::sync::Arc;
 
     use super::{
-        intern_payload_with_parser, payload_feature_identity_ids, planned_encoded_contract_growth,
-        planned_token_relation_peak, EncodePayloadRow, EncodeResidentAccounting,
-        EncodeResidentAdmission, PayloadTermInterner, TokenSourceInput,
+        build_fallback_atoms_hash_sharded, intern_payload_with_parser,
+        payload_feature_identity_ids, planned_encoded_contract_growth, planned_token_relation_peak,
+        EncodePayloadRow, EncodeResidentAccounting, EncodeResidentAdmission, PayloadTermInterner,
+        ShardedPayloadTermInterner, TokenSourceInput,
     };
     use metadata_engine::encode::{
-        parse_metadata_documents, EncodeContractRow, EncodeSourceRow, PayloadCasWriter,
+        parse_metadata_documents, EncodeContractRow, EncodeContractSoA, EncodeSourceRow,
+        PayloadArena, PayloadRef, PayloadTermSoA, ShardedPayloadArena,
     };
     use metadata_engine::resource::{MemoryBroker, GIB};
     #[test]
@@ -2471,14 +3112,27 @@ mod memory_dedup_tests {
                 content_terms: vec![],
             },
         ];
+        let soa = PayloadTermSoA::from_rows(&payloads).unwrap();
 
-        assert_eq!(payload_feature_identity_ids(&payloads), vec![0, 0, 1]);
+        assert_eq!(payload_feature_identity_ids(&soa), vec![0, 0, 1]);
+    }
+
+    #[test]
+    fn fallback_atom_members_are_canonicalized_before_persist() {
+        let mut contracts = EncodeContractSoA::with_contract_capacity(4);
+        for contract_id in [3, 2, 1, 0] {
+            contracts.push_contract(contract_id, 0, contract_id, 0, 1);
+        }
+
+        let atoms = build_fallback_atoms_hash_sharded(&contracts, &[0], 1, |_| {}).unwrap();
+
+        assert_eq!(atoms.atom_count(), 1);
+        assert_eq!(atoms.members_of(0), &[0, 1, 2, 3]);
     }
 
     #[test]
     fn duplicate_payload_is_looked_up_in_cas_before_parsing_again() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut cas = PayloadCasWriter::create(directory.path(), 1024 * 1024).unwrap();
+        let mut cas = PayloadArena::new(1024 * 1024);
         let mut payloads = Vec::new();
         let mut interner = PayloadTermInterner::default();
         let mut parse_calls = 0usize;
@@ -2497,21 +3151,44 @@ mod memory_dedup_tests {
     }
 
     #[test]
+    fn batch_term_interning_reuses_ids_within_and_across_batches() {
+        let interner = ShardedPayloadTermInterner::with_shard_count(4);
+        let first = interner
+            .intern_batch(vec![
+                parse_metadata_documents(r#"{"name":"shared","description":"alpha"}"#),
+                parse_metadata_documents(r#"{"name":"shared","description":"beta"}"#),
+            ])
+            .unwrap();
+        let repeated = interner
+            .intern_batch(vec![parse_metadata_documents(
+                r#"{"name":"shared","description":"alpha"}"#,
+            )])
+            .unwrap();
+
+        assert_eq!(first[0], repeated[0]);
+        assert!(first[0]
+            .0
+            .iter()
+            .any(|(id, _)| first[1].0.iter().any(|(other, _)| other == id)));
+        assert!(first.iter().all(|(template, content)| {
+            template.windows(2).all(|pair| pair[0].0 < pair[1].0)
+                && content.windows(2).all(|pair| pair[0].0 < pair[1].0)
+        }));
+    }
+
+    #[test]
     fn live_cardinality_admission_expands_for_unique_payload_and_interner_state() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut cas = PayloadCasWriter::create(directory.path(), 1024 * 1024).unwrap();
+        let cas = ShardedPayloadArena::with_shard_count(4, 1024 * 1024);
         let mut payloads = Vec::new();
         let mut interner = PayloadTermInterner::default();
         for index in 0..4_096 {
             let json = format!(r#"{{"description":"unique payload term {index}"}}"#);
-            intern_payload_with_parser(
-                &json,
-                &mut cas,
-                &mut payloads,
-                &mut interner,
-                parse_metadata_documents,
-            )
-            .unwrap();
+            let payload_ref = cas.insert(json.as_bytes()).unwrap();
+            let offsets = cas.global_offsets().unwrap();
+            let payload_id = cas.global_id(payload_ref, &offsets).unwrap();
+            if payload_id as usize >= payloads.len() {
+                payloads.push(interner.intern(parse_metadata_documents(&json)).unwrap());
+            }
         }
 
         let sources = Vec::<EncodeSourceRow>::new();
@@ -2546,13 +3223,19 @@ mod memory_dedup_tests {
                 token_ids: vec![1, 2, 3],
                 source_file: 1,
                 source_row_number: 1,
-                metadata_json: Arc::from(r#"{"description":"token one"}"#),
+                payload_ref: PayloadRef {
+                    shard_id: 0,
+                    local_id: 0,
+                },
             },
             TokenSourceInput {
                 token_ids: vec![4, 5],
                 source_file: 1,
                 source_row_number: 2,
-                metadata_json: Arc::from(r#"{"description":"token two"}"#),
+                payload_ref: PayloadRef {
+                    shard_id: 0,
+                    local_id: 1,
+                },
             },
         ];
 
@@ -2571,7 +3254,7 @@ mod memory_dedup_tests {
 
         assert_eq!(
             planned_token_relation_peak(rows, rows, distinct_json).unwrap(),
-            rows * 72 + admitted_json + 64 * 1024 * 1024
+            rows * 48 + rows * 8 + admitted_json + 64 * 1024 * 1024
         );
     }
 }

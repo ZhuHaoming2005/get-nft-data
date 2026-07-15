@@ -6,7 +6,9 @@
 use crate::progress::{
     ProgressCounters, ProgressEvent, ProgressPhase, TotalKind, WorkClass, WorkUnit,
 };
-use crate::scheduler::{JobDescriptor, JobShape, RecallPlan, SchedulerError, WorkCatalog};
+use crate::scheduler::{
+    JobDescriptor, JobShape, RecallPlan, SchedulerError, WorkCatalog, HOT_BLOCK_TILE,
+};
 use crate::snapshot::{BlockingView, MetadataSnapshot};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -51,7 +53,12 @@ impl<'a> ConservativeIndex<'a> {
                 JobShape::MicroBatch => metrics.add(self.visit_blocks(blocks, &mut visit)),
                 JobShape::LeftTileFanout => {
                     for block in blocks {
-                        metrics.add(self.visit_hot_block(block, &mut visit));
+                        metrics.add(self.visit_hot_tile(
+                            block,
+                            job.tile_row as usize,
+                            job.tile_col as usize,
+                            &mut visit,
+                        ));
                     }
                 }
             }
@@ -100,7 +107,12 @@ impl<'a> ConservativeIndex<'a> {
                 JobShape::LeftTileFanout => {
                     let mut job_metrics = IndexMetrics::default();
                     for block in blocks {
-                        job_metrics.add(self.visit_hot_block(block, &mut visit));
+                        job_metrics.add(self.visit_hot_tile(
+                            block,
+                            job.tile_row as usize,
+                            job.tile_col as usize,
+                            &mut visit,
+                        ));
                     }
                     job_metrics
                 }
@@ -142,7 +154,13 @@ impl<'a> ConservativeIndex<'a> {
             JobShape::LeftTileFanout => {
                 let mut metrics = IndexMetrics::default();
                 for block in blocks {
-                    metrics.add(self.visit_hot_block_with_work(block, &mut visit, &mut work));
+                    metrics.add(self.visit_hot_tile_with_work(
+                        block,
+                        job.tile_row as usize,
+                        job.tile_col as usize,
+                        &mut visit,
+                        &mut work,
+                    ));
                 }
                 metrics
             }
@@ -180,40 +198,46 @@ impl<'a> ConservativeIndex<'a> {
         metrics
     }
 
-    fn visit_hot_block(&self, block: usize, visit: &mut impl FnMut(u32, u32)) -> IndexMetrics {
-        self.visit_hot_block_with_work(block, visit, &mut |_| {})
-    }
-
-    fn visit_hot_block_with_work(
+    fn visit_hot_tile(
         &self,
         block: usize,
+        tile_row: usize,
+        tile_col: usize,
+        visit: &mut impl FnMut(u32, u32),
+    ) -> IndexMetrics {
+        self.visit_hot_tile_with_work(block, tile_row, tile_col, visit, &mut |_| {})
+    }
+
+    fn visit_hot_tile_with_work(
+        &self,
+        block: usize,
+        tile_row: usize,
+        tile_col: usize,
         visit: &mut impl FnMut(u32, u32),
         work: &mut impl FnMut(u64),
     ) -> IndexMetrics {
-        const TILE: usize = 1024;
         let b = self.snapshot.blocking();
         let start = b.block_atom_offsets[block] as usize;
         let end = b.block_atom_offsets[block + 1] as usize;
         let members = &b.block_atoms[start..end];
         let mut metrics = IndexMetrics::default();
-        let tiles = members.len().div_ceil(TILE);
-        for ti in 0..tiles {
-            for tj in ti..tiles {
-                let before = metrics.block_pair_visits;
-                let a0 = ti * TILE;
-                let a1 = (a0 + TILE).min(members.len());
-                let b0 = tj * TILE;
-                let b1 = (b0 + TILE).min(members.len());
-                for i in a0..a1 {
-                    let j0 = if ti == tj { (i + 1).max(b0) } else { b0 };
-                    for j in j0..b1 {
-                        metrics.block_pair_visits = metrics.block_pair_visits.saturating_add(1);
-                        self.route_pair(block, members[i], members[j], &mut metrics, visit);
-                    }
-                }
-                work(metrics.block_pair_visits.saturating_sub(before));
+        let a0 = tile_row.saturating_mul(HOT_BLOCK_TILE);
+        let a1 = (a0 + HOT_BLOCK_TILE).min(members.len());
+        let b0 = tile_col.saturating_mul(HOT_BLOCK_TILE);
+        let b1 = (b0 + HOT_BLOCK_TILE).min(members.len());
+        let before = metrics.block_pair_visits;
+        for i in a0..a1 {
+            let j0 = if tile_row == tile_col {
+                (i + 1).max(b0)
+            } else {
+                b0
+            };
+            for j in j0..b1 {
+                metrics.block_pair_visits = metrics.block_pair_visits.saturating_add(1);
+                self.route_pair(block, members[i], members[j], &mut metrics, visit);
             }
         }
+        work(metrics.block_pair_visits.saturating_sub(before));
         metrics
     }
 

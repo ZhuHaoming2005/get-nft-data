@@ -456,7 +456,7 @@ pub fn compile_base_equivalent_parallel_with_progress(
         finalize_completed,
         finalize_total,
     );
-    debug_assert_eq!(BLOCKING_REVISION, 2);
+    debug_assert_eq!(BLOCKING_REVISION, 3);
     Ok(bundle)
 }
 

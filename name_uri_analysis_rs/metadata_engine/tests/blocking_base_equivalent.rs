@@ -1,4 +1,4 @@
-//! BaseEquivalent blocking compile: joint relation + optional profile keys.
+﻿//! BaseEquivalent blocking compile: joint relation + optional profile keys.
 
 use std::collections::{BTreeSet, HashSet};
 
@@ -151,8 +151,8 @@ fn parallel_blocking_compile_is_identical_to_single_lane() {
 }
 
 #[test]
-fn blocking_revision_is_two() {
-    assert_eq!(BLOCKING_REVISION, 2);
+fn blocking_revision_is_three() {
+    assert_eq!(BLOCKING_REVISION, 3);
     // Must stay equal to name_uri METADATA_CONSERVATIVE_* values.
     assert_eq!(BANDS, 8);
     assert_eq!(BAND_BITS, 8);

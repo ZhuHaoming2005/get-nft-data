@@ -39,6 +39,13 @@ fn metadata_source_ids_follow_cli_file_order() {
 }
 
 #[test]
+fn core_rows_assign_unordered_dense_contract_ids() {
+    let sql = build_core_rows_sql("'sample.parquet'");
+    assert!(sql.contains("(row_number() OVER () - 1)::UINTEGER AS contract_id"));
+    assert!(!sql.contains("ORDER BY chain, contract_address"));
+}
+
+#[test]
 fn domain_projections_preserve_solana_case_only() {
     let projections = [
         build_core_rows_sql("'sample.parquet'"),
@@ -184,7 +191,8 @@ fn analysis_contracts_aggregates_only_the_representative_row_id() {
     assert!(sql.contains("metadata_source.file_id"));
     assert!(sql.contains("metadata_source.row_number"));
     assert!(sql.contains("indexed_metadata_sources"));
-    assert!(sql.contains("row_number() OVER (ORDER BY contract_id)"));
+    assert!(sql.contains("row_number() OVER () - 1 AS metadata_contract_index"));
+    assert!(!sql.contains("ORDER BY contract_id"));
     assert!(!sql.contains("count(*) FILTER"));
     assert!(!sql.contains("representative.metadata_json"));
     assert!(!sql.contains("JOIN metadata_rows representative"));

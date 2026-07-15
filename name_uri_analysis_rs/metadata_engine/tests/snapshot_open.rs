@@ -1,4 +1,4 @@
-use metadata_engine::blocking::{compile_base_equivalent, AtomSketch, BlockingCompileConfig};
+﻿use metadata_engine::blocking::{compile_base_equivalent, AtomSketch, BlockingCompileConfig};
 use metadata_engine::encode::{
     write_encode_artifacts, write_encode_artifacts_with_contracts_and_atoms, EncodeContractRow,
     EncodePayloadRow, EncodeSourceRow,
@@ -67,13 +67,13 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
     commit_ready(
         &features,
         "features.ready",
-        r#"{"schema_revision":2,"source_count":2,"payload_count":2,"chains":["ethereum"],"chain_totals":[{"name":"ethereum","contracts":2,"nfts":2}]}"#,
+        r#"{"schema_revision":3,"source_count":2,"payload_count":2,"chains":["ethereum"],"chain_totals":[{"name":"ethereum","contracts":2,"nfts":2}]}"#,
     )
     .unwrap();
     commit_ready(
         &blocking,
         "blocking.ready",
-        r#"{"blocking_revision":2,"atom_count":2}"#,
+        r#"{"blocking_revision":3,"atom_count":2}"#,
     )
     .unwrap();
     (dir, features, blocking)
@@ -147,13 +147,13 @@ fn shared_atom_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::P
     commit_ready(
         &features,
         "features.ready",
-        r#"{"schema_revision":2,"source_count":2,"payload_count":2,"chains":["ethereum"],"chain_totals":[{"name":"ethereum","contracts":2,"nfts":2}]}"#,
+        r#"{"schema_revision":3,"source_count":2,"payload_count":2,"chains":["ethereum"],"chain_totals":[{"name":"ethereum","contracts":2,"nfts":2}]}"#,
     )
     .unwrap();
     commit_ready(
         &blocking,
         "blocking.ready",
-        r#"{"blocking_revision":2,"atom_count":1}"#,
+        r#"{"blocking_revision":3,"atom_count":1}"#,
     )
     .unwrap();
     (dir, features, blocking)
@@ -183,6 +183,25 @@ fn assert_invariant(features: &std::path::Path, blocking: &std::path::Path, need
         error.to_string().contains(needle),
         "expected invariant error containing {needle:?}, got {error}"
     );
+}
+
+#[test]
+fn rejects_mixed_encode_and_blocking_publish_generations() {
+    let (_dir, features, blocking) = fixture();
+    commit_ready(
+        &features,
+        "features.ready",
+        r#"{"schema_revision":3,"source_count":2,"payload_count":2,"artifact_run_id":"encode-run","chains":["ethereum"],"chain_totals":[{"name":"ethereum","contracts":2,"nfts":2}]}"#,
+    )
+    .unwrap();
+    commit_ready(
+        &blocking,
+        "blocking.ready",
+        r#"{"blocking_revision":3,"atom_count":2,"artifact_run_id":"blocking-run"}"#,
+    )
+    .unwrap();
+
+    assert_invariant(&features, &blocking, "publish generation");
 }
 
 #[test]
@@ -233,7 +252,7 @@ fn rejects_revision_one_artifacts_after_in_memory_encode_upgrade() {
     commit_ready(
         &features,
         "features.ready",
-        r#"{"schema_revision":2,"source_count":2,"payload_count":2,"chains":["ethereum"],"chain_totals":[{"name":"ethereum","contracts":2,"nfts":2}]}"#,
+        r#"{"schema_revision":3,"source_count":2,"payload_count":2,"chains":["ethereum"],"chain_totals":[{"name":"ethereum","contracts":2,"nfts":2}]}"#,
     )
     .unwrap();
     commit_ready(
@@ -257,7 +276,7 @@ fn feature_ready_requires_explicit_chain_identity_fields() {
     commit_ready(
         &features,
         "features.ready",
-        r#"{"schema_revision":2,"source_count":2,"payload_count":2}"#,
+        r#"{"schema_revision":3,"source_count":2,"payload_count":2}"#,
     )
     .unwrap();
 
@@ -509,7 +528,7 @@ fn rejects_duplicate_chain_identity() {
     commit_ready(
         &features,
         "features.ready",
-        r#"{"schema_revision":2,"source_count":2,"payload_count":2,"chains":["ethereum","ethereum"],"chain_totals":[{"name":"ethereum","contracts":2,"nfts":2},{"name":"ethereum","contracts":0,"nfts":0}]}"#,
+        r#"{"schema_revision":3,"source_count":2,"payload_count":2,"chains":["ethereum","ethereum"],"chain_totals":[{"name":"ethereum","contracts":2,"nfts":2},{"name":"ethereum","contracts":0,"nfts":0}]}"#,
     )
     .unwrap();
 
@@ -526,7 +545,7 @@ fn rejects_empty_chain_identity_for_nonempty_contracts() {
     commit_ready(
         &features,
         "features.ready",
-        r#"{"schema_revision":2,"source_count":2,"payload_count":2,"chains":[],"chain_totals":[]}"#,
+        r#"{"schema_revision":3,"source_count":2,"payload_count":2,"chains":[],"chain_totals":[]}"#,
     )
     .unwrap();
 
@@ -539,7 +558,7 @@ fn rejects_negative_chain_totals() {
     commit_ready(
         &features,
         "features.ready",
-        r#"{"schema_revision":2,"source_count":2,"payload_count":2,"chains":["ethereum"],"chain_totals":[{"name":"ethereum","contracts":-1,"nfts":2}]}"#,
+        r#"{"schema_revision":3,"source_count":2,"payload_count":2,"chains":["ethereum"],"chain_totals":[{"name":"ethereum","contracts":-1,"nfts":2}]}"#,
     )
     .unwrap();
 

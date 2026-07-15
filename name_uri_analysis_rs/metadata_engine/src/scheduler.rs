@@ -24,9 +24,17 @@ pub struct JobDescriptor {
     pub shape: JobShape,
     pub risk: u8,
     pub rescue: u8,
-    pub _pad: u8,
+    /// Hot-block tile row; ignored for [`JobShape::MicroBatch`].
+    pub tile_row: u16,
+    /// Hot-block tile column; ignored for [`JobShape::MicroBatch`].
+    pub tile_col: u16,
     pub estimated_work: u64,
 }
+
+pub const CATALOG_REVISION: u32 = 2;
+
+/// Atom-member tile size for hot-block LeftTileFanout catalog jobs.
+pub const HOT_BLOCK_TILE: usize = 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub struct UniverseBudget {
@@ -88,14 +96,21 @@ impl WorkCatalog {
         while start < b.block_kinds.len() {
             let members = b.block_atom_offsets[start + 1] - b.block_atom_offsets[start];
             if members > hot_members {
-                check_next_job(jobs.len(), budget)?;
-                jobs.push(descriptor(
-                    jobs.len(),
-                    start,
-                    1,
-                    JobShape::LeftTileFanout,
-                    block_contract_pair_work(snapshot, start)?,
-                ));
+                let tile_count = (members as usize).div_ceil(HOT_BLOCK_TILE);
+                for ti in 0..tile_count {
+                    for tj in ti..tile_count {
+                        check_next_job(jobs.len(), budget)?;
+                        jobs.push(descriptor(
+                            jobs.len(),
+                            start,
+                            1,
+                            JobShape::LeftTileFanout,
+                            ti as u16,
+                            tj as u16,
+                            tile_contract_pair_work(snapshot, start, ti, tj)?,
+                        ));
+                    }
+                }
                 start += 1;
                 progress(start as u64, total_blocks, jobs.len() as u64);
                 continue;
@@ -122,6 +137,8 @@ impl WorkCatalog {
                 first,
                 start - first,
                 JobShape::MicroBatch,
+                0,
+                0,
                 estimated_work,
             ));
             progress(start as u64, total_blocks, jobs.len() as u64);
@@ -180,6 +197,11 @@ impl WorkCatalog {
             .iter()
             .map(|j| j.estimated_work)
             .collect::<Vec<_>>();
+        let tiles = self
+            .jobs
+            .iter()
+            .map(|j| ((u32::from(j.tile_row)) << 16) | u32::from(j.tile_col))
+            .collect::<Vec<_>>();
         crate::format::write_u32_array(
             &dir.join("job_first_block.u32"),
             crate::format::ArrayKind::U32,
@@ -200,8 +222,13 @@ impl WorkCatalog {
             crate::format::ArrayKind::U64,
             &work,
         )?;
+        crate::format::write_u32_array(
+            &dir.join("job_tiles.u32"),
+            crate::format::ArrayKind::U32,
+            &tiles,
+        )?;
         let ready = serde_json::json!({
-            "catalog_revision": 1,
+            "catalog_revision": CATALOG_REVISION,
             "job_count": self.jobs.len(),
             "snapshot_fingerprint": self.snapshot_fingerprint
         })
@@ -218,7 +245,7 @@ impl WorkCatalog {
             snapshot_fingerprint: String,
         }
         let ready: Ready = serde_json::from_slice(&std::fs::read(dir.join("catalog.ready"))?)?;
-        if ready.catalog_revision != 1
+        if ready.catalog_revision != CATALOG_REVISION
             || ready.snapshot_fingerprint != snapshot_fingerprint(snapshot)
         {
             return Err(SchedulerError::StaleCoverage);
@@ -228,9 +255,16 @@ impl WorkCatalog {
         let counts = crate::format::map_u32_array(&dir.join("job_block_count.u32"))?;
         let flags = crate::format::map_u32_array(&dir.join("job_flags.u32"))?;
         let work = crate::format::map_u64_array(&dir.join("job_estimated_work.u64"))?;
-        if [first.len(), counts.len(), flags.len(), work.len()]
-            .into_iter()
-            .any(|len| len != ready.job_count)
+        let tiles = crate::format::map_u32_array(&dir.join("job_tiles.u32"))?;
+        if [
+            first.len(),
+            counts.len(),
+            flags.len(),
+            work.len(),
+            tiles.len(),
+        ]
+        .into_iter()
+        .any(|len| len != ready.job_count)
         {
             return Err(SchedulerError::StaleCoverage);
         }
@@ -248,7 +282,8 @@ impl WorkCatalog {
                 shape,
                 risk: ((flags[index] >> 8) & 0xff) as u8,
                 rescue: ((flags[index] >> 16) & 0xff) as u8,
-                _pad: 0,
+                tile_row: (tiles[index] >> 16) as u16,
+                tile_col: (tiles[index] & 0xffff) as u16,
                 estimated_work: work[index],
             });
         }
@@ -297,6 +332,8 @@ fn descriptor(
     first: usize,
     count: usize,
     shape: JobShape,
+    tile_row: u16,
+    tile_col: u16,
     estimated_work: u64,
 ) -> JobDescriptor {
     debug_assert!(u32::try_from(id).is_ok());
@@ -309,9 +346,50 @@ fn descriptor(
         shape,
         risk: 0,
         rescue: 0,
-        _pad: 0,
+        tile_row,
+        tile_col,
         estimated_work,
     }
+}
+
+fn tile_contract_pair_work(
+    snapshot: &MetadataSnapshot,
+    block: usize,
+    tile_row: usize,
+    tile_col: usize,
+) -> Result<u64, SchedulerError> {
+    let blocking = snapshot.blocking();
+    let features = snapshot.features();
+    let begin = blocking.block_atom_offsets[block] as usize;
+    let end = blocking.block_atom_offsets[block + 1] as usize;
+    let members = &blocking.block_atoms[begin..end];
+    let tile = HOT_BLOCK_TILE;
+    let a0 = tile_row.saturating_mul(tile);
+    let a1 = (a0 + tile).min(members.len());
+    let b0 = tile_col.saturating_mul(tile);
+    let b1 = (b0 + tile).min(members.len());
+    let mut work = 0u64;
+    for i in a0..a1 {
+        let left_members = features.fallback_atom_offsets[members[i] as usize + 1]
+            - features.fallback_atom_offsets[members[i] as usize];
+        let j0 = if tile_row == tile_col {
+            (i + 1).max(b0)
+        } else {
+            b0
+        };
+        for &right in &members[j0..b1] {
+            let right_members = features.fallback_atom_offsets[right as usize + 1]
+                - features.fallback_atom_offsets[right as usize];
+            work = work
+                .checked_add(
+                    left_members
+                        .checked_mul(right_members)
+                        .ok_or(SchedulerError::WorkOverflow)?,
+                )
+                .ok_or(SchedulerError::WorkOverflow)?;
+        }
+    }
+    Ok(work)
 }
 
 fn block_contract_pair_work(
@@ -448,6 +526,8 @@ fn compute_snapshot_fingerprint(s: &MetadataSnapshot) -> String {
     verified_array!("payload_content_offsets", f.payload_content_offsets);
     verified_array!("payload_content_terms", f.payload_content_terms);
     verified_array!("payload_content_freqs", f.payload_content_freqs);
+    verified_array!("payload_template_sigs", f.payload_template_sigs);
+    verified_array!("payload_content_sigs", f.payload_content_sigs);
     verified_array!("contract_token_offsets", f.contract_token_offsets);
     verified_array!("contract_tokens", f.contract_tokens);
     verified_array!("token_member_offsets", f.token_member_offsets);

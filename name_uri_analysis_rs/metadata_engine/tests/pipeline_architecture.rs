@@ -1,4 +1,4 @@
-use metadata_engine::blocking::{compile_base_equivalent, AtomSketch, BlockingCompileConfig};
+﻿use metadata_engine::blocking::{compile_base_equivalent, AtomSketch, BlockingCompileConfig};
 use metadata_engine::encode::{
     write_encode_artifacts, write_encode_artifacts_with_contracts,
     write_encode_artifacts_with_contracts_and_atoms, EncodeContractRow, EncodePayloadRow,
@@ -85,13 +85,13 @@ fn snapshot_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::Path
     commit_ready(
         &f,
         "features.ready",
-        r#"{"schema_revision":2,"source_count":2,"payload_count":2,"chains":["x"],"chain_totals":[{"name":"x","contracts":2,"nfts":2}]}"#,
+        r#"{"schema_revision":3,"source_count":2,"payload_count":2,"chains":["x"],"chain_totals":[{"name":"x","contracts":2,"nfts":2}]}"#,
     )
     .unwrap();
     commit_ready(
         &b,
         "blocking.ready",
-        r#"{"blocking_revision":2,"atom_count":2}"#,
+        r#"{"blocking_revision":3,"atom_count":2}"#,
     )
     .unwrap();
     (d, f, b)
@@ -154,13 +154,13 @@ fn expanded_atom_snapshot_fixture() -> (tempfile::TempDir, std::path::PathBuf, s
     commit_ready(
         &f,
         "features.ready",
-        r#"{"schema_revision":2,"source_count":4,"payload_count":2,"chains":["x"],"chain_totals":[{"name":"x","contracts":4,"nfts":4}]}"#,
+        r#"{"schema_revision":3,"source_count":4,"payload_count":2,"chains":["x"],"chain_totals":[{"name":"x","contracts":4,"nfts":4}]}"#,
     )
     .unwrap();
     commit_ready(
         &b,
         "blocking.ready",
-        r#"{"blocking_revision":2,"atom_count":2}"#,
+        r#"{"blocking_revision":3,"atom_count":2}"#,
     )
     .unwrap();
     (d, f, b)
@@ -372,7 +372,7 @@ fn catalog_progress_advances_by_completed_jobs_without_using_candidate_hits() {
     commit_ready(
         &b,
         "blocking.ready",
-        r#"{"blocking_revision":2,"atom_count":2}"#,
+        r#"{"blocking_revision":3,"atom_count":2}"#,
     )
     .unwrap();
     let snapshot = MetadataSnapshot::open(&f, &b).unwrap();
@@ -1369,13 +1369,13 @@ fn shared_token_local_routing_is_admitted_by_routed_work() {
     commit_ready(
         &features,
         "features.ready",
-        r#"{"schema_revision":2,"source_count":300,"payload_count":300,"chains":["x"],"chain_totals":[{"name":"x","contracts":300,"nfts":300}]}"#,
+        r#"{"schema_revision":3,"source_count":300,"payload_count":300,"chains":["x"],"chain_totals":[{"name":"x","contracts":300,"nfts":300}]}"#,
     )
     .unwrap();
     commit_ready(
         &blocking,
         "blocking.ready",
-        r#"{"blocking_revision":2,"atom_count":300}"#,
+        r#"{"blocking_revision":3,"atom_count":300}"#,
     )
     .unwrap();
 
@@ -1539,13 +1539,13 @@ fn shared_token_exact_parallelism_preserves_deterministic_evidence() {
     commit_ready(
         &features,
         "features.ready",
-        r#"{"schema_revision":2,"source_count":4,"payload_count":2,"chains":["x"],"chain_totals":[{"name":"x","contracts":4,"nfts":4}]}"#,
+        r#"{"schema_revision":3,"source_count":4,"payload_count":2,"chains":["x"],"chain_totals":[{"name":"x","contracts":4,"nfts":4}]}"#,
     )
     .unwrap();
     commit_ready(
         &blocking,
         "blocking.ready",
-        r#"{"blocking_revision":2,"atom_count":4}"#,
+        r#"{"blocking_revision":3,"atom_count":4}"#,
     )
     .unwrap();
     let snapshot = MetadataSnapshot::open(&features, &blocking).unwrap();
@@ -1965,13 +1965,13 @@ fn recovered_connectivity_is_rejected_under_a_lower_candidate_cap() {
     commit_ready(
         &features,
         "features.ready",
-        r#"{"schema_revision":2,"source_count":3,"payload_count":1,"chains":["x"],"chain_totals":[{"name":"x","contracts":3,"nfts":3}]}"#,
+        r#"{"schema_revision":3,"source_count":3,"payload_count":1,"chains":["x"],"chain_totals":[{"name":"x","contracts":3,"nfts":3}]}"#,
     )
     .unwrap();
     commit_ready(
         &blocking,
         "blocking.ready",
-        r#"{"blocking_revision":2,"atom_count":1}"#,
+        r#"{"blocking_revision":3,"atom_count":1}"#,
     )
     .unwrap();
     let out = dir.path().join("resume-lower-cap");
@@ -2048,13 +2048,13 @@ fn shared_small_group_budget_fails_before_any_pair_is_scored() {
     commit_ready(
         &features,
         "features.ready",
-        r#"{"schema_revision":2,"source_count":3,"payload_count":1,"chains":["x"],"chain_totals":[{"name":"x","contracts":3,"nfts":3}]}"#,
+        r#"{"schema_revision":3,"source_count":3,"payload_count":1,"chains":["x"],"chain_totals":[{"name":"x","contracts":3,"nfts":3}]}"#,
     )
     .unwrap();
     commit_ready(
         &blocking,
         "blocking.ready",
-        r#"{"blocking_revision":2,"atom_count":1}"#,
+        r#"{"blocking_revision":3,"atom_count":1}"#,
     )
     .unwrap();
     let mut events = Vec::new();
@@ -2303,13 +2303,13 @@ fn catalog_progress_counts_routing_pairs_not_conditional_contract_products() {
     commit_ready(
         &features,
         "features.ready",
-        r#"{"schema_revision":2,"source_count":40,"payload_count":2,"chains":["x"],"chain_totals":[{"name":"x","contracts":40,"nfts":40}]}"#,
+        r#"{"schema_revision":3,"source_count":40,"payload_count":2,"chains":["x"],"chain_totals":[{"name":"x","contracts":40,"nfts":40}]}"#,
     )
     .unwrap();
     commit_ready(
         &blocking,
         "blocking.ready",
-        r#"{"blocking_revision":2,"atom_count":2}"#,
+        r#"{"blocking_revision":3,"atom_count":2}"#,
     )
     .unwrap();
 
@@ -2437,13 +2437,13 @@ fn chain_local_representative_atom_connects_only_token_disjoint_members() {
     commit_ready(
         &features,
         "features.ready",
-        r#"{"schema_revision":2,"source_count":3,"payload_count":1,"chains":["x"],"chain_totals":[{"name":"x","contracts":3,"nfts":3}]}"#,
+        r#"{"schema_revision":3,"source_count":3,"payload_count":1,"chains":["x"],"chain_totals":[{"name":"x","contracts":3,"nfts":3}]}"#,
     )
     .unwrap();
     commit_ready(
         &blocking,
         "blocking.ready",
-        r#"{"blocking_revision":2,"atom_count":1}"#,
+        r#"{"blocking_revision":3,"atom_count":1}"#,
     )
     .unwrap();
     let rejected = metadata_engine::pipeline::run_metadata_pipeline(
@@ -2564,13 +2564,13 @@ fn scope_forests_do_not_leak_transitive_edges_between_chain_pairs() {
     commit_ready(
         &features,
         "features.ready",
-        r#"{"schema_revision":2,"source_count":3,"payload_count":1,"chains":["a","b","c"],"chain_totals":[{"name":"a","contracts":10,"nfts":100},{"name":"b","contracts":20,"nfts":200},{"name":"c","contracts":30,"nfts":300}]}"#,
+        r#"{"schema_revision":3,"source_count":3,"payload_count":1,"chains":["a","b","c"],"chain_totals":[{"name":"a","contracts":10,"nfts":100},{"name":"b","contracts":20,"nfts":200},{"name":"c","contracts":30,"nfts":300}]}"#,
     )
     .unwrap();
     commit_ready(
         &blocking,
         "blocking.ready",
-        r#"{"blocking_revision":2,"atom_count":3}"#,
+        r#"{"blocking_revision":3,"atom_count":3}"#,
     )
     .unwrap();
     let result = metadata_engine::pipeline::run_metadata_pipeline(
@@ -2665,13 +2665,13 @@ fn summary_preserves_selected_chains_without_eligible_metadata_contracts() {
     commit_ready(
         &features,
         "features.ready",
-        r#"{"schema_revision":2,"source_count":1,"payload_count":1,"chains":["a","b","c"],"chain_totals":[{"name":"a","contracts":1,"nfts":1},{"name":"b","contracts":20,"nfts":200},{"name":"c","contracts":30,"nfts":300}]}"#,
+        r#"{"schema_revision":3,"source_count":1,"payload_count":1,"chains":["a","b","c"],"chain_totals":[{"name":"a","contracts":1,"nfts":1},{"name":"b","contracts":20,"nfts":200},{"name":"c","contracts":30,"nfts":300}]}"#,
     )
     .unwrap();
     commit_ready(
         &blocking,
         "blocking.ready",
-        r#"{"blocking_revision":2,"atom_count":1}"#,
+        r#"{"blocking_revision":3,"atom_count":1}"#,
     )
     .unwrap();
 

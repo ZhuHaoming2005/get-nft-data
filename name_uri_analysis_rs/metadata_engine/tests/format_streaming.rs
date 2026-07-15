@@ -2,8 +2,9 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use metadata_engine::format::{
-    write_f64_array, write_f64_iter, write_u32_array, write_u32_iter, write_u64_array,
-    write_u64_iter, write_u64_iter_with_progress, write_u8_array, ArrayHeader, ArrayKind,
+    typed_array_footer_fingerprint, verify_typed_array_fingerprint, write_f64_array,
+    write_f64_iter, write_u32_array, write_u32_iter, write_u64_array, write_u64_iter,
+    write_u64_iter_with_progress, write_u8_array, write_u8_iter, ArrayHeader, ArrayKind,
     TypedArraySink,
 };
 use sha2::{Digest, Sha256};
@@ -149,6 +150,15 @@ fn typed_array_writer_does_not_allocate_an_array_sized_byte_buffer() {
 fn iterator_writers_are_byte_compatible_without_materializing_the_column() {
     let dir = tempfile::tempdir().unwrap();
 
+    let u8_path = dir.path().join("iter.u8");
+    write_u8_iter(&u8_path, 4, [1, 2, 3, u8::MAX]).unwrap();
+    let slice_u8_path = dir.path().join("slice.u8");
+    write_u8_array(&slice_u8_path, &[1, 2, 3, u8::MAX]).unwrap();
+    assert_eq!(
+        std::fs::read(u8_path).unwrap(),
+        std::fs::read(slice_u8_path).unwrap()
+    );
+
     let u32_path = dir.path().join("iter.u32");
     write_u32_iter(&u32_path, ArrayKind::U32, 4, [1, 2, 3, u32::MAX]).unwrap();
     let slice_u32_path = dir.path().join("slice.u32");
@@ -240,4 +250,23 @@ fn iterator_progress_reports_actual_payload_bytes_at_bounded_intervals() {
     assert!(observed.len() > 1);
     assert!(observed.windows(2).all(|values| values[0] < values[1]));
     assert_eq!(observed.last().copied(), Some(count * 8));
+}
+
+#[test]
+fn footer_fingerprint_is_cheap_but_resume_verification_checks_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fingerprinted.u32");
+    write_u32_array(&path, ArrayKind::U32, &[1, 2, 3, 4]).unwrap();
+
+    let cheap = typed_array_footer_fingerprint(&path).unwrap().unwrap();
+    assert_eq!(verify_typed_array_fingerprint(&path).unwrap(), cheap);
+
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[32] ^= 0xff;
+    std::fs::write(&path, bytes).unwrap();
+    assert_eq!(
+        typed_array_footer_fingerprint(&path).unwrap().unwrap(),
+        cheap
+    );
+    assert!(verify_typed_array_fingerprint(&path).is_err());
 }

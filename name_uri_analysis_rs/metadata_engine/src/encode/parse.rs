@@ -9,7 +9,7 @@ use std::fmt;
 
 use once_cell::sync::Lazy;
 use regex::Regex;
-use serde::de::{MapAccess, SeqAccess, Visitor};
+use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 use unicode_normalization::UnicodeNormalization;
 
@@ -153,7 +153,7 @@ impl<'de> Visitor<'de> for NodeSummaryVisitor {
             if key_norm.is_empty() {
                 continue;
             }
-            if matches!(key_norm.as_str(), "metadata" | "rawmetadata" | "raw") {
+            if is_passthrough_prefilter_key(&key_norm) {
                 summary
                     .recursive_prefilter
                     .extend(child.recursive_prefilter);
@@ -176,25 +176,170 @@ impl<'de> Visitor<'de> for NodeSummaryVisitor {
     }
 }
 
+/// Presence-only reduction: booleans only, no prefilter/content string retention.
+#[derive(Debug, Default)]
+struct PresenceNode {
+    has_recursive: bool,
+    has_value: bool,
+    direct_has_token: bool,
+}
+
+impl<'de> Deserialize<'de> for PresenceNode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(PresenceVisitor)
+    }
+}
+
+struct PresenceVisitor;
+
+impl<'de> Visitor<'de> for PresenceVisitor {
+    type Value = PresenceNode;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("any JSON value")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(presence_scalar(&value.to_string()))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(presence_scalar(
+            &serde_json::Number::from(value).to_string(),
+        ))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(presence_scalar(
+            &serde_json::Number::from(value).to_string(),
+        ))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        let number = serde_json::Number::from_f64(value)
+            .ok_or_else(|| E::custom("non-finite JSON number"))?;
+        Ok(presence_scalar(&number.to_string()))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(presence_string(value))
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(presence_string(value))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(presence_string(&value))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(PresenceNode::default())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(PresenceNode::default())
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut node = PresenceNode::default();
+        while let Some(child) = sequence.next_element::<PresenceNode>()? {
+            node.has_recursive |= child.has_recursive;
+            node.has_value |= child.has_value;
+            if node.has_recursive {
+                while sequence.next_element::<IgnoredAny>()?.is_some() {}
+                break;
+            }
+        }
+        Ok(node)
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        // Duplicate keys are last-wins, matching serde_json::Map / NodeSummary.
+        let mut fields = BTreeMap::<String, PresenceNode>::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let key_norm = normalize_text(&key);
+            // A non-passthrough key whose normalized name already retains a
+            // token proves presence regardless of the value and of later
+            // duplicate overwrites of that same key.
+            if !key_norm.is_empty()
+                && !is_passthrough_prefilter_key(&key_norm)
+                && normalized_has_retained_token(&key_norm)
+            {
+                let _ = map.next_value::<IgnoredAny>()?;
+                while map.next_key::<IgnoredAny>()?.is_some() {
+                    let _ = map.next_value::<IgnoredAny>()?;
+                }
+                return Ok(PresenceNode {
+                    has_recursive: true,
+                    has_value: true,
+                    direct_has_token: false,
+                });
+            }
+            let value: PresenceNode = map.next_value()?;
+            fields.insert(key, value);
+        }
+
+        let mut node = PresenceNode::default();
+        for (key, child) in fields {
+            let key_norm = normalize_text(&key);
+            let key_has_token = normalized_has_retained_token(&key_norm);
+            // value_prefilter always receives the raw key (then normalized).
+            node.has_value |= key_has_token || child.has_value;
+
+            if key_norm.is_empty() {
+                continue;
+            }
+            if is_passthrough_prefilter_key(&key_norm) {
+                node.has_recursive |= child.has_recursive;
+            } else if key_norm == "trait_type" {
+                node.has_recursive |= key_has_token || child.direct_has_token;
+            } else if prefilter_includes_value(&key_norm) {
+                node.has_recursive |= key_has_token || child.has_value;
+            } else {
+                node.has_recursive |= key_has_token || child.has_recursive;
+            }
+            if node.has_recursive && node.has_value {
+                break;
+            }
+        }
+        Ok(node)
+    }
+}
+
 /// True iff [`parse_metadata_documents`] would produce a non-empty prefilter
-/// token list. Skips content-token extraction and returns as soon as the first
-/// retained prefilter token is found.
+/// token list. Uses a presence-only visitor that retains booleans, skips
+/// content collection, ignores proven-unnecessary subtrees, and preserves
+/// duplicate-key last-wins semantics.
 pub fn metadata_has_prefilter_tokens(raw: &str) -> bool {
     if raw.trim().is_empty() {
         return false;
     }
 
-    let parsed = json_nesting_within_limit(raw, MAX_JSON_NESTING)
-        .then(|| serde_json::from_str::<NodeSummary>(raw))
-        .transpose()
-        .ok()
-        .flatten();
-    match parsed {
-        Some(summary) => summary
-            .recursive_prefilter
-            .iter()
-            .any(|part| normalized_has_retained_token(part)),
-        None => normalized_has_retained_token(&normalize_text(raw)),
+    if !json_nesting_within_limit(raw, MAX_JSON_NESTING) {
+        return normalized_has_retained_token(&normalize_text(raw));
+    }
+    match serde_json::from_str::<PresenceNode>(raw) {
+        Ok(node) => node.has_recursive,
+        Err(_) => normalized_has_retained_token(&normalize_text(raw)),
     }
 }
 
@@ -284,6 +429,28 @@ fn scalar_value_summary(raw: String) -> NodeSummary {
         value_prefilter,
         ..NodeSummary::default()
     }
+}
+
+fn presence_scalar(raw: &str) -> PresenceNode {
+    let has_value = normalized_has_retained_token(&normalize_text(raw));
+    PresenceNode {
+        has_recursive: false,
+        has_value,
+        direct_has_token: false,
+    }
+}
+
+fn presence_string(raw: &str) -> PresenceNode {
+    let has_value = normalized_has_retained_token(&normalize_text(raw));
+    PresenceNode {
+        has_recursive: false,
+        has_value,
+        direct_has_token: has_value,
+    }
+}
+
+fn is_passthrough_prefilter_key(key: &str) -> bool {
+    matches!(key, "metadata" | "rawmetadata" | "raw")
 }
 
 fn prefilter_includes_value(key: &str) -> bool {

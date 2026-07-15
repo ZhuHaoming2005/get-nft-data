@@ -1,4 +1,4 @@
-use super::*;
+﻿use super::*;
 
 #[test]
 fn row_group_parallelism_warning_uses_effective_worker_count() {
@@ -82,16 +82,16 @@ fn match_forecast_requires_eight_fresh_successes_with_an_exact_key() {
     let temp = tempfile::tempdir().unwrap();
     let manifest = sample_manifest(temp.path());
     let artifacts = temp.path().join("artifacts/metadata");
-    fs::create_dir_all(artifacts.join("encode-2")).unwrap();
-    fs::create_dir_all(artifacts.join("blocking-2")).unwrap();
+    fs::create_dir_all(artifacts.join("encode-3")).unwrap();
+    fs::create_dir_all(artifacts.join("blocking-3")).unwrap();
     fs::write(
-        artifacts.join("encode-2/features.ready"),
-        br#"{"schema_revision":2,"source_count":1000,"payload_count":500,"chains":[],"chain_totals":[]}"#,
+        artifacts.join("encode-3/features.ready"),
+        br#"{"schema_revision":3,"source_count":1000,"payload_count":500,"chains":[],"chain_totals":[]}"#,
     )
     .unwrap();
     fs::write(
-        artifacts.join("blocking-2/blocking.ready"),
-        br#"{"blocking_revision":2,"atom_count":300}"#,
+        artifacts.join("blocking-3/blocking.ready"),
+        br#"{"blocking_revision":3,"atom_count":300}"#,
     )
     .unwrap();
     let key = match_observation_key(&manifest, temp.path()).unwrap();
@@ -141,16 +141,16 @@ fn failures_and_resume_recomputes_never_calibrate_fresh_match_eta() {
     let temp = tempfile::tempdir().unwrap();
     let manifest = sample_manifest(temp.path());
     let artifacts = temp.path().join("artifacts/metadata");
-    fs::create_dir_all(artifacts.join("encode-2")).unwrap();
-    fs::create_dir_all(artifacts.join("blocking-2")).unwrap();
+    fs::create_dir_all(artifacts.join("encode-3")).unwrap();
+    fs::create_dir_all(artifacts.join("blocking-3")).unwrap();
     fs::write(
-        artifacts.join("encode-2/features.ready"),
-        br#"{"schema_revision":2,"source_count":10,"payload_count":5,"chains":[],"chain_totals":[]}"#,
+        artifacts.join("encode-3/features.ready"),
+        br#"{"schema_revision":3,"source_count":10,"payload_count":5,"chains":[],"chain_totals":[]}"#,
     )
     .unwrap();
     fs::write(
-        artifacts.join("blocking-2/blocking.ready"),
-        br#"{"blocking_revision":2,"atom_count":3}"#,
+        artifacts.join("blocking-3/blocking.ready"),
+        br#"{"blocking_revision":3,"atom_count":3}"#,
     )
     .unwrap();
     let key = match_observation_key(&manifest, temp.path()).unwrap();
@@ -177,16 +177,16 @@ fn match_observation_partitions_are_rolling_and_bounded() {
     let temp = tempfile::tempdir().unwrap();
     let manifest = sample_manifest(temp.path());
     let artifacts = temp.path().join("artifacts/metadata");
-    fs::create_dir_all(artifacts.join("encode-2")).unwrap();
-    fs::create_dir_all(artifacts.join("blocking-2")).unwrap();
+    fs::create_dir_all(artifacts.join("encode-3")).unwrap();
+    fs::create_dir_all(artifacts.join("blocking-3")).unwrap();
     fs::write(
-        artifacts.join("encode-2/features.ready"),
-        br#"{"schema_revision":2,"source_count":10,"payload_count":5,"chains":[],"chain_totals":[]}"#,
+        artifacts.join("encode-3/features.ready"),
+        br#"{"schema_revision":3,"source_count":10,"payload_count":5,"chains":[],"chain_totals":[]}"#,
     )
     .unwrap();
     fs::write(
-        artifacts.join("blocking-2/blocking.ready"),
-        br#"{"blocking_revision":2,"atom_count":3}"#,
+        artifacts.join("blocking-3/blocking.ready"),
+        br#"{"blocking_revision":3,"atom_count":3}"#,
     )
     .unwrap();
     let key = match_observation_key(&manifest, temp.path()).unwrap();
@@ -213,18 +213,18 @@ fn match_observation_partitions_are_rolling_and_bounded() {
 fn match_scale_key_rejects_equal_counts_with_different_membership_density() {
     let temp = tempfile::tempdir().unwrap();
     let manifest = sample_manifest(temp.path());
-    let encode = temp.path().join("artifacts/metadata/encode-2");
-    let blocking = temp.path().join("artifacts/metadata/blocking-2");
+    let encode = temp.path().join("artifacts/metadata/encode-3");
+    let blocking = temp.path().join("artifacts/metadata/blocking-3");
     fs::create_dir_all(&encode).unwrap();
     fs::create_dir_all(&blocking).unwrap();
     fs::write(
         encode.join("features.ready"),
-        br#"{"schema_revision":2,"source_count":1000,"payload_count":500,"chains":[],"chain_totals":[]}"#,
+        br#"{"schema_revision":3,"source_count":1000,"payload_count":500,"chains":[],"chain_totals":[]}"#,
     )
     .unwrap();
     fs::write(
         blocking.join("blocking.ready"),
-        br#"{"blocking_revision":2,"atom_count":300}"#,
+        br#"{"blocking_revision":3,"atom_count":300}"#,
     )
     .unwrap();
     fs::write(encode.join("token_member_contracts.u32"), vec![0; 128]).unwrap();
@@ -246,8 +246,8 @@ fn match_scale_key_rejects_equal_counts_with_different_membership_density() {
 fn match_scale_key_rejects_equal_bytes_with_different_candidate_pair_work() {
     let temp = tempfile::tempdir().unwrap();
     let manifest = sample_manifest(temp.path());
-    let encode = temp.path().join("artifacts/metadata/encode-2");
-    let blocking = temp.path().join("artifacts/metadata/blocking-2");
+    let encode = temp.path().join("artifacts/metadata/encode-3");
+    let blocking = temp.path().join("artifacts/metadata/blocking-3");
     fs::create_dir_all(&encode).unwrap();
     fs::create_dir_all(&blocking).unwrap();
     fs::write(encode.join("token_member_contracts.u32"), vec![0; 128]).unwrap();
@@ -257,7 +257,7 @@ fn match_scale_key_rejects_equal_bytes_with_different_candidate_pair_work() {
     fs::write(
         encode.join("features.ready"),
         br#"{
-        "schema_revision":2,"source_count":1000,"payload_count":500,
+        "schema_revision":3,"source_count":1000,"payload_count":500,
         "token_pair_work":64,"max_token_members":8,
         "fallback_pair_work":32,"max_fallback_members":4,
         "chains":[],"chain_totals":[]
@@ -267,7 +267,7 @@ fn match_scale_key_rejects_equal_bytes_with_different_candidate_pair_work() {
     fs::write(
         blocking.join("blocking.ready"),
         br#"{
-        "blocking_revision":2,"atom_count":300,
+        "blocking_revision":3,"atom_count":300,
         "block_pair_work":128,"max_block_members":16
     }"#,
     )
@@ -277,7 +277,7 @@ fn match_scale_key_rejects_equal_bytes_with_different_candidate_pair_work() {
     fs::write(
         blocking.join("blocking.ready"),
         br#"{
-        "blocking_revision":2,"atom_count":300,
+        "blocking_revision":3,"atom_count":300,
         "block_pair_work":128,"contract_expansion_pair_work":8192,
         "max_block_members":16
     }"#,
@@ -289,7 +289,7 @@ fn match_scale_key_rejects_equal_bytes_with_different_candidate_pair_work() {
     fs::write(
         encode.join("features.ready"),
         br#"{
-        "schema_revision":2,"source_count":1000,"payload_count":500,
+        "schema_revision":3,"source_count":1000,"payload_count":500,
         "token_pair_work":4096,"max_token_members":128,
         "fallback_pair_work":2048,"max_fallback_members":64,
         "chains":[],"chain_totals":[]
@@ -309,18 +309,18 @@ fn match_observation_history_survives_work_cleanup_and_names_sampled_resources()
     fs::create_dir_all(&work).unwrap();
     let mut manifest = sample_manifest(&work);
     manifest.options.output_dir = output.clone();
-    let encode = work.join("artifacts/metadata/encode-2");
-    let blocking = work.join("artifacts/metadata/blocking-2");
+    let encode = work.join("artifacts/metadata/encode-3");
+    let blocking = work.join("artifacts/metadata/blocking-3");
     fs::create_dir_all(&encode).unwrap();
     fs::create_dir_all(&blocking).unwrap();
     fs::write(
         encode.join("features.ready"),
-        br#"{"schema_revision":2,"source_count":10,"payload_count":5,"chains":[],"chain_totals":[]}"#,
+        br#"{"schema_revision":3,"source_count":10,"payload_count":5,"chains":[],"chain_totals":[]}"#,
     )
     .unwrap();
     fs::write(
         blocking.join("blocking.ready"),
-        br#"{"blocking_revision":2,"atom_count":3}"#,
+        br#"{"blocking_revision":3,"atom_count":3}"#,
     )
     .unwrap();
     let key = match_observation_key(&manifest, &work).unwrap();

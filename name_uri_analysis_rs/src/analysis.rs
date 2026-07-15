@@ -19,6 +19,7 @@ mod name_scoring;
 mod output;
 mod production;
 mod progress;
+mod semantic_oracle;
 mod types;
 mod uri;
 
@@ -239,7 +240,6 @@ fn run_metadata_pipeline(
         "metadata production advisory",
         write_metadata_production_readiness(work_directory, &result),
     );
-    complete_metadata_payload_independence(&features, work_directory)?;
     let rows = result
         .summary_rows
         .into_iter()
@@ -263,34 +263,6 @@ fn run_metadata_pipeline(
         })
         .collect();
     Ok(rows)
-}
-
-fn complete_metadata_payload_independence(
-    features: &Path,
-    work_directory: &Path,
-) -> Result<(), AnalysisError> {
-    let payload_cas = features.join("payload_blobs");
-    if !payload_cas.exists() {
-        // A completed Match may be rerun after its transient CAS has already
-        // been collected (for example after a Match-only revision bump).
-        return Ok(());
-    }
-    let payload_cas = payload_cas.canonicalize()?;
-    let mut storage = metadata_engine::storage::StorageBroker::open(work_directory)
-        .map_err(|err| AnalysisError::InvalidData(format!("metadata storage: {err}")))?;
-    storage
-        .declare_match_independence(&payload_cas)
-        .and_then(|_| storage.release_pin(&payload_cas, "metadata_encode_complete"))
-        .and_then(|_| {
-            storage.mark_evictable(&payload_cas, "metadata snapshot is payload independent")
-        })
-        .and_then(|_| {
-            storage.commit_evict(&metadata_engine::storage::EvictionPlan {
-                paths: vec![payload_cas],
-            })
-        })
-        .map_err(|err| AnalysisError::InvalidData(format!("metadata storage: {err}")))?;
-    Ok(())
 }
 
 fn diagnostics_enabled() -> bool {
