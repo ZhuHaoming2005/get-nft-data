@@ -19,6 +19,12 @@ use crate::scoring::{content_matches, template_matches};
 use crate::snapshot::MetadataSnapshot;
 
 const EVIDENCE_ARTIFACT_REVISION: u32 = 4;
+const SHARED_PAIR_TILE_MEMBERS: usize = 512;
+
+#[derive(Deserialize)]
+struct EvidenceRevision {
+    artifact_revision: u32,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct ExactEvidenceBudget {
@@ -135,9 +141,14 @@ pub fn plan_shared_token_evidence(
     let mut skipped_pair_work = 0u64;
     let mut considered_pair_work = 0u64;
     let mut work_strata = std::collections::BTreeMap::<u32, SharedTokenWorkStratum>::new();
-    for (sample_index, &token) in sampled_tokens.iter().enumerate() {
+    let mut seen_tokens = std::collections::BTreeSet::new();
+    let mut sample_index = 0usize;
+    for &token in sampled_tokens {
         if token as usize >= token_count {
             return Err(ExactIslandError::SampleOutOfRange(token));
+        }
+        if !seen_tokens.insert(token) {
+            continue;
         }
         let members = token_member_offsets[token as usize + 1]
             .saturating_sub(token_member_offsets[token as usize]);
@@ -183,6 +194,7 @@ pub fn plan_shared_token_evidence(
         } else {
             &mut holdout_tokens
         };
+        sample_index = sample_index.saturating_add(1);
         if target.len() as u64 >= max_tokens_per_partition {
             skipped_tokens.push(token);
             skipped_pair_work =
@@ -312,12 +324,165 @@ pub struct SharedTokenExactEvidence {
     pub holdout_misses: Vec<SharedTokenExactMiss>,
 }
 
+fn cluster_total(clusters: &[ExactEvidenceCluster]) -> Option<u64> {
+    clusters.iter().try_fold(0u64, |total, cluster| {
+        total.checked_add(cluster.exact_matches)
+    })
+}
+
+fn pair_frontier_work(universe_atoms: u64, sampled_count: u64) -> Option<u64> {
+    sampled_count
+        .checked_mul(universe_atoms.saturating_sub(1))
+        .and_then(|work| {
+            sampled_count
+                .checked_mul(sampled_count.saturating_sub(1))
+                .map(|duplicates| work.saturating_sub(duplicates / 2))
+        })
+}
+
+fn pair_evidence_is_consistent(evidence: &PairExactEvidence) -> bool {
+    let cluster_ids_match = evidence.clusters.len() == evidence.sampled_lefts.len()
+        && evidence
+            .clusters
+            .iter()
+            .zip(&evidence.sampled_lefts)
+            .all(|(cluster, &left)| cluster.id == left);
+    let misses_are_canonical = evidence.conservative_misses.windows(2).all(|pair| {
+        (pair[0].left_atom, pair[0].right_atom) < (pair[1].left_atom, pair[1].right_atom)
+    }) && evidence.conservative_misses.iter().all(|miss| {
+        miss.left_atom < miss.right_atom
+            && u64::from(miss.right_atom) < evidence.universe_atoms
+            && (evidence
+                .sampled_lefts
+                .binary_search(&miss.left_atom)
+                .is_ok()
+                || evidence
+                    .sampled_lefts
+                    .binary_search(&miss.right_atom)
+                    .is_ok())
+            && evidence.clusters.iter().any(|cluster| {
+                (cluster.id == miss.left_atom || cluster.id == miss.right_atom)
+                    && cluster.exact_matches != 0
+            })
+    });
+    cluster_ids_match
+        && evidence
+            .sampled_lefts
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+        && evidence
+            .sampled_lefts
+            .last()
+            .is_none_or(|&left| u64::from(left) < evidence.universe_atoms)
+        && cluster_total(&evidence.clusters) == Some(evidence.exact_matches)
+        && evidence.conservative_misses.len() as u64 <= evidence.exact_matches
+        && pair_frontier_work(evidence.universe_atoms, evidence.sampled_lefts.len() as u64)
+            == Some(evidence.pair_work)
+        && misses_are_canonical
+}
+
+fn shared_partition_is_consistent(
+    tokens: &[u32],
+    clusters: &[ExactEvidenceCluster],
+    misses: &[SharedTokenExactMiss],
+    exact_matches: u64,
+    contract_count: usize,
+) -> bool {
+    clusters.len() == tokens.len()
+        && clusters
+            .iter()
+            .zip(tokens)
+            .all(|(cluster, &token)| cluster.id == token)
+        && cluster_total(clusters) == Some(exact_matches)
+        && misses.len() as u64 <= exact_matches
+        && misses.windows(2).all(|pair| {
+            (
+                pair[0].token_id,
+                pair[0].left_contract,
+                pair[0].right_contract,
+            ) < (
+                pair[1].token_id,
+                pair[1].left_contract,
+                pair[1].right_contract,
+            )
+        })
+        && misses.iter().all(|miss| {
+            miss.left_contract < miss.right_contract
+                && (miss.right_contract as usize) < contract_count
+                && tokens.binary_search(&miss.token_id).is_ok()
+                && clusters
+                    .iter()
+                    .any(|cluster| cluster.id == miss.token_id && cluster.exact_matches != 0)
+        })
+}
+
+fn shared_pair_work(snapshot: &MetadataSnapshot, tokens: &[u32]) -> Option<u64> {
+    tokens.iter().try_fold(0u64, |total, &token| {
+        let begin = *snapshot
+            .features()
+            .token_member_offsets
+            .get(token as usize)?;
+        let end = *snapshot
+            .features()
+            .token_member_offsets
+            .get(token as usize + 1)?;
+        let members = end.checked_sub(begin)?;
+        let pairs = members.checked_mul(members.saturating_sub(1))? / 2;
+        total.checked_add(pairs)
+    })
+}
+
+fn shared_evidence_is_consistent(
+    evidence: &SharedTokenExactEvidence,
+    snapshot: &MetadataSnapshot,
+) -> bool {
+    let tokens_are_disjoint = evidence
+        .calibration_tokens
+        .iter()
+        .all(|token| evidence.holdout_tokens.binary_search(token).is_err());
+    let calibration_work = shared_pair_work(snapshot, &evidence.calibration_tokens);
+    let holdout_work = shared_pair_work(snapshot, &evidence.holdout_tokens);
+    tokens_are_disjoint
+        && evidence
+            .calibration_tokens
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+        && evidence
+            .holdout_tokens
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+        && calibration_work == Some(evidence.calibration_pair_work)
+        && holdout_work == Some(evidence.holdout_pair_work)
+        && calibration_work.and_then(|work| work.checked_add(evidence.holdout_pair_work))
+            == Some(evidence.pair_work)
+        && evidence
+            .calibration_exact_matches
+            .checked_add(evidence.holdout_exact_matches)
+            == Some(evidence.exact_matches)
+        && shared_partition_is_consistent(
+            &evidence.calibration_tokens,
+            &evidence.calibration_clusters,
+            &evidence.calibration_misses,
+            evidence.calibration_exact_matches,
+            snapshot.contract_count(),
+        )
+        && shared_partition_is_consistent(
+            &evidence.holdout_tokens,
+            &evidence.holdout_clusters,
+            &evidence.holdout_misses,
+            evidence.holdout_exact_matches,
+            snapshot.contract_count(),
+        )
+}
+
 #[derive(Debug, Error)]
 pub enum ExactIslandError {
     #[error("stale ExactEvidence checkpoint: {0}")]
     StaleEvidence(String),
     #[error("parallel ExactEvidence execution failed: {0}")]
     Parallel(String),
+    #[error("invalid ExactEvidence invariant: {0}")]
+    InvalidEvidence(&'static str),
     #[error("ExactEvidence budget exceeded for {resource}: requested {requested}, limit {limit}")]
     Budget {
         resource: &'static str,
@@ -344,16 +509,12 @@ pub fn open_pair_exact_evidence(
         return Ok(None);
     }
     let bytes = std::fs::read(&ready).map_err(format::FormatError::from)?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
-    if value
-        .get("artifact_revision")
-        .and_then(serde_json::Value::as_u64)
-        != Some(EVIDENCE_ARTIFACT_REVISION as u64)
-    {
+    let revision: EvidenceRevision = serde_json::from_slice(&bytes)?;
+    if revision.artifact_revision != EVIDENCE_ARTIFACT_REVISION {
         std::fs::remove_file(ready).map_err(format::FormatError::from)?;
         return Ok(None);
     }
-    let evidence: PairExactEvidence = serde_json::from_value(value)?;
+    let evidence: PairExactEvidence = serde_json::from_slice(&bytes)?;
     let mut expected = sampled_lefts.to_vec();
     expected.sort_unstable();
     expected.dedup();
@@ -362,6 +523,7 @@ pub fn open_pair_exact_evidence(
         || evidence.sampling_policy_digest != pair_sampling_digest(&expected)
         || evidence.universe_atoms != snapshot.atom_count() as u64
         || evidence.sampled_lefts != expected
+        || !pair_evidence_is_consistent(&evidence)
     {
         std::fs::remove_file(ready).map_err(format::FormatError::from)?;
         return Ok(None);
@@ -380,16 +542,12 @@ pub fn open_shared_token_exact_evidence(
         return Ok(None);
     }
     let bytes = std::fs::read(&ready).map_err(format::FormatError::from)?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
-    if value
-        .get("artifact_revision")
-        .and_then(serde_json::Value::as_u64)
-        != Some(EVIDENCE_ARTIFACT_REVISION as u64)
-    {
+    let revision: EvidenceRevision = serde_json::from_slice(&bytes)?;
+    if revision.artifact_revision != EVIDENCE_ARTIFACT_REVISION {
         std::fs::remove_file(ready).map_err(format::FormatError::from)?;
         return Ok(None);
     }
-    let evidence: SharedTokenExactEvidence = serde_json::from_value(value)?;
+    let evidence: SharedTokenExactEvidence = serde_json::from_slice(&bytes)?;
     let mut expected_calibration = calibration_tokens.to_vec();
     expected_calibration.sort_unstable();
     expected_calibration.dedup();
@@ -403,6 +561,7 @@ pub fn open_shared_token_exact_evidence(
             != shared_sampling_digest(&expected_calibration, &expected_holdout)
         || evidence.calibration_tokens != expected_calibration
         || evidence.holdout_tokens != expected_holdout
+        || !shared_evidence_is_consistent(&evidence, snapshot)
     {
         std::fs::remove_file(ready).map_err(format::FormatError::from)?;
         return Ok(None);
@@ -490,6 +649,23 @@ pub fn run_shared_token_exact_islands_with_progress(
         .map(|token| (token, true))
         .chain(holdout.iter().copied().map(|token| (token, false)))
         .collect::<Vec<_>>();
+    let max_group_scratch_bytes = groups.iter().try_fold(0u64, |maximum, &(token, _)| {
+        shared_group_scratch_upper_bound(snapshot, token).map(|bytes| maximum.max(bytes))
+    })?;
+    // The caller reserves three artifact budgets for ExactEvidence. Misses may
+    // use one third; the remaining two thirds bound concurrent routing/tile
+    // scratch. Large groups still exploit the full Rayon pool internally.
+    let scratch_bytes = budget.max_artifact_bytes.saturating_mul(2);
+    checked(
+        "shared_token_group_scratch",
+        max_group_scratch_bytes,
+        scratch_bytes,
+    )?;
+    let concurrent_group_lanes = scratch_bytes
+        .checked_div(max_group_scratch_bytes)
+        .map_or(budget.max_lanes.max(1), |lanes| {
+            lanes.max(1).min(budget.max_lanes.max(1) as u64) as usize
+        });
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(budget.max_lanes.max(1))
         .thread_name(|index| format!("metadata-shared-exact-{index}"))
@@ -512,7 +688,8 @@ pub fn run_shared_token_exact_islands_with_progress(
     // the scan rather than evenly partitioned between lanes. A static per-group
     // slice rejects a skewed group even when the stage still has almost all of
     // its memory available.
-    let shared_miss_budget = SharedMissBudget::new(budget.max_artifact_bytes);
+    let shared_miss_budget =
+        InMemoryMissBudget::for_record::<SharedTokenExactMiss>(budget.max_artifact_bytes);
     let (
         pair_work,
         calibration_pair_work,
@@ -527,25 +704,27 @@ pub fn run_shared_token_exact_islands_with_progress(
         let worker_sender = sender.clone();
         let worker = scope.spawn(move || {
             pool.install(|| {
-                groups.par_iter().for_each(|&(token, is_calibration)| {
-                    let result = scan_shared_token_group(
-                        snapshot,
-                        token,
-                        budget,
-                        &shared_miss_budget,
-                        |work| {
-                            let _ = worker_sender.send(SharedScanMessage::Work {
-                                work,
-                                is_calibration,
-                            });
-                        },
-                    );
-                    let _ = worker_sender.send(SharedScanMessage::Done {
-                        token,
-                        is_calibration,
-                        result,
+                for wave in groups.chunks(concurrent_group_lanes.max(1)) {
+                    wave.par_iter().for_each(|&(token, is_calibration)| {
+                        let result = scan_shared_token_group(
+                            snapshot,
+                            token,
+                            budget,
+                            &shared_miss_budget,
+                            |work| {
+                                let _ = worker_sender.send(SharedScanMessage::Work {
+                                    work,
+                                    is_calibration,
+                                });
+                            },
+                        );
+                        let _ = worker_sender.send(SharedScanMessage::Done {
+                            token,
+                            is_calibration,
+                            result,
+                        });
                     });
-                });
+                }
             });
         });
         drop(sender);
@@ -685,6 +864,11 @@ pub fn run_shared_token_exact_islands_with_progress(
         calibration_misses,
         holdout_misses,
     };
+    if !shared_evidence_is_consistent(&evidence, snapshot) {
+        return Err(ExactIslandError::InvalidEvidence(
+            "generated shared-token evidence is internally inconsistent",
+        ));
+    }
     progress(ProgressEvent::determinate(
         ProgressPhase::SharedTokenExactFinalize,
         1,
@@ -693,7 +877,7 @@ pub fn run_shared_token_exact_islands_with_progress(
         ProgressCounters::default(),
     ));
     if let Some(dir) = output_dir {
-        let bytes = serde_json::to_vec_pretty(&evidence)?;
+        let bytes = serde_json::to_vec(&evidence)?;
         checked(
             "artifact_bytes",
             bytes.len() as u64,
@@ -731,7 +915,7 @@ struct SharedTokenGroupScan {
     misses: Vec<SharedTokenExactMiss>,
 }
 
-struct SharedMissBudget {
+struct InMemoryMissBudget {
     reserved: AtomicU64,
     max_misses: u64,
     miss_bytes: u64,
@@ -739,9 +923,9 @@ struct SharedMissBudget {
     cancelled: AtomicBool,
 }
 
-impl SharedMissBudget {
-    fn new(max_bytes: u64) -> Self {
-        let miss_bytes = std::mem::size_of::<SharedTokenExactMiss>() as u64;
+impl InMemoryMissBudget {
+    fn for_record<T>(max_bytes: u64) -> Self {
+        let miss_bytes = std::mem::size_of::<T>() as u64;
         Self {
             reserved: AtomicU64::new(0),
             max_misses: max_bytes / miss_bytes.max(1),
@@ -791,6 +975,57 @@ struct SharedTokenPairTile {
     right_end: usize,
 }
 
+fn shared_group_scratch_upper_bound(
+    snapshot: &MetadataSnapshot,
+    token: u32,
+) -> Result<u64, ExactIslandError> {
+    let features = snapshot.features();
+    let begin = features.token_member_offsets[token as usize] as usize;
+    let end = features.token_member_offsets[token as usize + 1] as usize;
+    let sources = &features.token_member_sources[begin..end];
+    if sources.len() < 256 {
+        return Ok(0);
+    }
+    let term_memberships = sources.iter().try_fold(0u64, |total, &source| {
+        let payload = features.source_to_payload[source as usize] as usize;
+        let template = features.payload_template_offsets[payload + 1]
+            .saturating_sub(features.payload_template_offsets[payload]);
+        let content = features.payload_content_offsets[payload + 1]
+            .saturating_sub(features.payload_content_offsets[payload]);
+        total.checked_add(template.saturating_add(content))
+    });
+    let Some(term_memberships) = term_memberships else {
+        return Err(ExactIslandError::Budget {
+            resource: "shared_token_group_scratch",
+            requested: u64::MAX,
+            limit: u64::MAX - 1,
+        });
+    };
+    let members = sources.len() as u64;
+    let tile_side = sources.len().div_ceil(SHARED_PAIR_TILE_MEMBERS) as u64;
+    let tile_count = tile_side
+        .checked_mul(tile_side.saturating_add(1))
+        .and_then(|value| value.checked_div(2))
+        .ok_or(ExactIslandError::Budget {
+            resource: "shared_token_group_scratch",
+            requested: u64::MAX,
+            limit: u64::MAX - 1,
+        })?;
+    members
+        .checked_mul(512)
+        .and_then(|bytes| bytes.checked_add(term_memberships.saturating_mul(16)))
+        .and_then(|bytes| {
+            bytes.checked_add(
+                tile_count.saturating_mul(std::mem::size_of::<SharedTokenPairTile>() as u64),
+            )
+        })
+        .ok_or(ExactIslandError::Budget {
+            resource: "shared_token_group_scratch",
+            requested: u64::MAX,
+            limit: u64::MAX - 1,
+        })
+}
+
 fn shared_token_pair_tiles(member_count: usize, tile_members: usize) -> Vec<SharedTokenPairTile> {
     let tile_members = tile_members.max(1);
     let side = member_count.div_ceil(tile_members);
@@ -814,11 +1049,10 @@ fn scan_shared_token_group(
     snapshot: &MetadataSnapshot,
     token: u32,
     budget: ExactEvidenceBudget,
-    shared_miss_budget: &SharedMissBudget,
+    shared_miss_budget: &InMemoryMissBudget,
     report_work: impl Fn(u64) + Sync,
 ) -> Result<SharedTokenGroupScan, ExactIslandError> {
     const PROGRESS_CHUNK: u64 = 65_536;
-    const PAIR_TILE_MEMBERS: usize = 512;
     let features = snapshot.features();
     let begin = features.token_member_offsets[token as usize] as usize;
     let end = features.token_member_offsets[token as usize + 1] as usize;
@@ -871,7 +1105,7 @@ fn scan_shared_token_group(
         let plan = LocalRoutingPlan::build_parallel(&sketches);
         Some((sketches, plan))
     };
-    let result = shared_token_pair_tiles(contracts.len(), PAIR_TILE_MEMBERS)
+    let result = shared_token_pair_tiles(contracts.len(), SHARED_PAIR_TILE_MEMBERS)
         .into_par_iter()
         .map(|tile| -> Result<SharedTokenGroupScan, ExactIslandError> {
             let mut result = SharedTokenGroupScan {
@@ -990,7 +1224,7 @@ pub fn run_pair_exact_island_with_progress(
         },
     }
     let (sender, receiver) = std::sync::mpsc::sync_channel(lanes.saturating_mul(4).max(1));
-    let per_left_bytes = budget.max_artifact_bytes / (lanes as u64).saturating_add(1);
+    let pair_miss_budget = InMemoryMissBudget::for_record::<ExactMiss>(budget.max_artifact_bytes);
     let mut matches = 0u64;
     let mut clusters = Vec::new();
     let mut misses = Vec::new();
@@ -1002,7 +1236,7 @@ pub fn run_pair_exact_island_with_progress(
             pool.install(|| {
                 work_lefts.par_iter().for_each(|&left| {
                     let result =
-                        scan_pair_left(snapshot, work_lefts, left, per_left_bytes, |work| {
+                        scan_pair_left(snapshot, work_lefts, left, &pair_miss_budget, |work| {
                             let _ = worker_sender.send(ScanMessage::Work(work));
                         });
                     let _ = worker_sender.send(ScanMessage::Done { left, result });
@@ -1110,9 +1344,14 @@ pub fn run_pair_exact_island_with_progress(
         oracle_score_micros: scan_us,
         full_scan_equivalents_micros: scan_us,
     };
+    if !pair_evidence_is_consistent(&evidence) {
+        return Err(ExactIslandError::InvalidEvidence(
+            "generated pair evidence is internally inconsistent",
+        ));
+    }
     evidence.posting_finalize_micros = micros(finalize);
     if let Some(dir) = output_dir {
-        let bytes = serde_json::to_vec_pretty(&evidence)?;
+        let bytes = serde_json::to_vec(&evidence)?;
         checked(
             "artifact_bytes",
             bytes.len() as u64,
@@ -1162,7 +1401,7 @@ fn scan_pair_left(
     snapshot: &MetadataSnapshot,
     sampled_lefts: &[u32],
     left: u32,
-    max_artifact_bytes: u64,
+    miss_budget: &InMemoryMissBudget,
     mut report_work: impl FnMut(u64),
 ) -> Result<(u64, Vec<ExactMiss>), ExactIslandError> {
     const PROGRESS_CHUNK: u64 = 65_536;
@@ -1170,6 +1409,9 @@ fn scan_pair_left(
     let mut misses = Vec::new();
     let mut pending_work = 0u64;
     for right in 0..snapshot.atom_count() as u32 {
+        if miss_budget.cancelled.load(Ordering::Acquire) {
+            break;
+        }
         if left == right || (right < left && sampled_lefts.binary_search(&right).is_ok()) {
             continue;
         }
@@ -1188,12 +1430,7 @@ fn scan_pair_left(
         {
             matches = matches.saturating_add(1);
             if candidate_owner(snapshot.blocking(), left, right).is_none() {
-                let next_bytes = misses
-                    .len()
-                    .saturating_add(1)
-                    .saturating_mul(std::mem::size_of::<ExactMiss>())
-                    as u64;
-                checked("in_memory_miss_bytes", next_bytes, max_artifact_bytes)?;
+                miss_budget.reserve()?;
                 misses.push(ExactMiss {
                     left_atom: left.min(right),
                     right_atom: left.max(right),
@@ -1257,8 +1494,8 @@ fn sorted_intersects(x: &[u32], y: &[u32]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        shared_token_pair_tiles, ExactIslandError, SharedMissBudget, SharedTokenExactEvidence,
-        SharedTokenExactMiss,
+        shared_token_pair_tiles, ExactIslandError, ExactMiss, InMemoryMissBudget,
+        SharedTokenExactEvidence, SharedTokenExactMiss,
     };
     use crate::blocking::{AtomSketch, LocalRoutingPlan};
 
@@ -1302,9 +1539,9 @@ mod tests {
     }
 
     #[test]
-    fn shared_miss_budget_is_global_and_allows_skewed_groups() {
+    fn in_memory_miss_budgets_are_global_and_allow_skewed_workers() {
         let miss_bytes = std::mem::size_of::<SharedTokenExactMiss>() as u64;
-        let budget = SharedMissBudget::new(10 * miss_bytes + 2);
+        let budget = InMemoryMissBudget::for_record::<SharedTokenExactMiss>(10 * miss_bytes + 2);
 
         // Six misses in one group would exceed the old three-way equal slice,
         // but they fit comfortably in the stage-wide allocation.
@@ -1323,6 +1560,13 @@ mod tests {
                 limit,
             } if requested == 11 * miss_bytes && limit == 10 * miss_bytes + 2
         ));
+
+        let pair_bytes = std::mem::size_of::<ExactMiss>() as u64;
+        let pair_budget = InMemoryMissBudget::for_record::<ExactMiss>(7 * pair_bytes);
+        for _ in 0..7 {
+            pair_budget.reserve().unwrap();
+        }
+        assert!(pair_budget.reserve().is_err());
     }
 
     #[test]

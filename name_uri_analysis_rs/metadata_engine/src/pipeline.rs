@@ -2326,6 +2326,7 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
                 chain_count,
                 &mut progress,
             )?;
+            drop(rescue_execution_plan);
             let accepted_edge_count = collectors.accepted_edges();
             let (intra_runs, cross_runs, pair_runs) =
                 collectors.finish_with_progress(&match_pool, &mut progress)?;
@@ -3509,66 +3510,77 @@ fn build_rescue_execution_plan(
         let producer_sender = sender.clone();
         let producer = scope.spawn(move || {
             pool.install(|| {
-                rescue.pair_atoms.par_iter().for_each(|&left_atom| {
-                    let mut scored = 0u64;
-                    let mut matches = Vec::new();
-                    for right_atom in 0..atom_count {
-                        if left_atom == right_atom
-                            || (rescue.pair_atoms.binary_search(&right_atom).is_ok()
-                                && right_atom < left_atom)
-                        {
-                            continue;
-                        }
-                        scored = scored.saturating_add(1);
-                        if score_pair(
-                            snapshot.features(),
-                            atom_payload(snapshot, left_atom),
-                            atom_payload(snapshot, right_atom),
-                        ) == PairScoreDecision::ExactMatch
-                        {
-                            matches.push((left_atom, right_atom));
-                        }
-                    }
-                    let _ = producer_sender.send(RescuePlanMessage::AtomRow { scored, matches });
-                });
+                rayon::join(
+                    || {
+                        rescue.pair_atoms.par_iter().for_each(|&left_atom| {
+                            let mut scored = 0u64;
+                            let mut matches = Vec::new();
+                            for right_atom in 0..atom_count {
+                                if left_atom == right_atom
+                                    || (rescue.pair_atoms.binary_search(&right_atom).is_ok()
+                                        && right_atom < left_atom)
+                                {
+                                    continue;
+                                }
+                                scored = scored.saturating_add(1);
+                                if score_pair(
+                                    snapshot.features(),
+                                    atom_payload(snapshot, left_atom),
+                                    atom_payload(snapshot, right_atom),
+                                ) == PairScoreDecision::ExactMatch
+                                {
+                                    matches.push((left_atom, right_atom));
+                                }
+                            }
+                            let _ = producer_sender
+                                .send(RescuePlanMessage::AtomRow { scored, matches });
+                        });
+                    },
+                    || {
+                        rescue.shared_seeds.par_iter().for_each(|seed| {
+                            let begin =
+                                features.token_member_offsets[seed.token_id as usize] as usize;
+                            let end =
+                                features.token_member_offsets[seed.token_id as usize + 1] as usize;
+                            let contracts = &features.token_member_contracts[begin..end];
+                            let sources = &features.token_member_sources[begin..end];
+                            let Some(seed_index) = contracts
+                                .iter()
+                                .position(|&contract| contract == seed.contract_id)
+                            else {
+                                return;
+                            };
+                            let seed_payload =
+                                features.source_to_payload[sources[seed_index] as usize];
+                            let mut scored = 0u64;
+                            let mut matches = Vec::new();
+                            for (offset, &contract) in contracts.iter().enumerate() {
+                                if contract == seed.contract_id
+                                    || (rescue
+                                        .shared_seeds
+                                        .binary_search(&crate::evidence::SharedRescueSeed {
+                                            token_id: seed.token_id,
+                                            contract_id: contract,
+                                        })
+                                        .is_ok()
+                                        && contract < seed.contract_id)
+                                {
+                                    continue;
+                                }
+                                scored = scored.saturating_add(1);
+                                let payload = features.source_to_payload[sources[offset] as usize];
+                                if score_pair(features, seed_payload, payload)
+                                    == PairScoreDecision::ExactMatch
+                                {
+                                    matches.push((seed.contract_id, contract));
+                                }
+                            }
+                            let _ =
+                                producer_sender.send(RescuePlanMessage::Shared { scored, matches });
+                        });
+                    },
+                );
             });
-
-            let mut scored = 0u64;
-            let mut matches = Vec::new();
-            for seed in &rescue.shared_seeds {
-                let begin = features.token_member_offsets[seed.token_id as usize] as usize;
-                let end = features.token_member_offsets[seed.token_id as usize + 1] as usize;
-                let contracts = &features.token_member_contracts[begin..end];
-                let sources = &features.token_member_sources[begin..end];
-                let Some(seed_index) = contracts
-                    .iter()
-                    .position(|&contract| contract == seed.contract_id)
-                else {
-                    continue;
-                };
-                let seed_payload = features.source_to_payload[sources[seed_index] as usize];
-                for (offset, &contract) in contracts.iter().enumerate() {
-                    if contract == seed.contract_id
-                        || (rescue
-                            .shared_seeds
-                            .binary_search(&crate::evidence::SharedRescueSeed {
-                                token_id: seed.token_id,
-                                contract_id: contract,
-                            })
-                            .is_ok()
-                            && contract < seed.contract_id)
-                    {
-                        continue;
-                    }
-                    scored = scored.saturating_add(1);
-                    let payload = features.source_to_payload[sources[offset] as usize];
-                    if score_pair(features, seed_payload, payload) == PairScoreDecision::ExactMatch
-                    {
-                        matches.push((seed.contract_id, contract));
-                    }
-                }
-            }
-            let _ = producer_sender.send(RescuePlanMessage::Shared { scored, matches });
         });
         drop(sender);
 
@@ -4990,9 +5002,12 @@ mod tests {
             }],
         };
 
-        let plan = build_rescue_execution_plan(&snapshot, &rescue, 1, |_| {}).unwrap();
-        assert_eq!(plan.shared_score_visits, 2);
-        assert_eq!(plan.total_visits(), 2);
+        let serial = build_rescue_execution_plan(&snapshot, &rescue, 1, |_| {}).unwrap();
+        let parallel = build_rescue_execution_plan(&snapshot, &rescue, 4, |_| {}).unwrap();
+        assert_eq!(serial.shared_score_visits, 2);
+        assert_eq!(serial.total_visits(), 2);
+        assert_eq!(parallel.shared_score_visits, serial.shared_score_visits);
+        assert_eq!(parallel.matched_shared_edges, serial.matched_shared_edges);
     }
 
     #[test]

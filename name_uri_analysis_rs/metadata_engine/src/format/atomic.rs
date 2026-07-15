@@ -54,8 +54,13 @@ pub fn commit_ready(
     ready_name: &str,
     manifest_json: &str,
 ) -> Result<(), FormatError> {
-    // Ready markers always carry a JSON manifest object/value.
-    let _: serde_json::Value = serde_json::from_str(manifest_json)
+    // Ready markers always carry JSON, but validation must not materialize a
+    // second DOM-sized copy of large evidence manifests.
+    let mut deserializer = serde_json::Deserializer::from_str(manifest_json);
+    <serde::de::IgnoredAny as serde::Deserialize>::deserialize(&mut deserializer)
+        .map_err(|e| FormatError::InvalidManifest(e.to_string()))?;
+    deserializer
+        .end()
         .map_err(|e| FormatError::InvalidManifest(e.to_string()))?;
 
     let ready_path = bundle_dir.join(ready_name);

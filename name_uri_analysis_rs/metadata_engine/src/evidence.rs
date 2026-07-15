@@ -2,7 +2,7 @@ use crate::exact_islands::{
     ExactEvidenceCluster, ExactMiss, SharedTokenExactMiss, SharedTokenWorkStratum,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -184,18 +184,17 @@ pub fn evaluate_holdout(
         ));
     }
 
-    let pair_residual_misses = evidence
+    let pair_residual_miss_count = evidence
         .pair_misses
         .iter()
         .filter(|miss| !rescue_plan.covers_pair(miss))
-        .collect::<Vec<_>>();
-    let shared_residual_misses = evidence
+        .count() as u64;
+    let shared_residual_miss_count = evidence
         .shared_misses
         .iter()
         .filter(|miss| !rescue_plan.covers_shared(miss))
-        .collect::<Vec<_>>();
-    let observed_misses =
-        (pair_residual_misses.len() as u64).saturating_add(shared_residual_misses.len() as u64);
+        .count() as u64;
+    let observed_misses = pair_residual_miss_count.saturating_add(shared_residual_miss_count);
     let exact_matches = evidence
         .pair_exact_matches
         .saturating_add(evidence.shared_exact_matches);
@@ -218,27 +217,57 @@ pub fn evaluate_holdout(
             exact_matches,
         });
     }
-    let pair_miss_clusters = pair_residual_misses
+    let pair_cluster_matches = evidence
+        .pair_clusters
         .iter()
-        .map(|miss| miss.left_atom)
-        .collect::<BTreeSet<_>>();
-    let shared_miss_clusters = shared_residual_misses
+        .map(|cluster| (cluster.id, cluster.exact_matches))
+        .collect::<BTreeMap<_, _>>();
+    let shared_cluster_matches = evidence
+        .shared_clusters
         .iter()
-        .map(|miss| miss.token_id)
-        .collect::<BTreeSet<_>>();
-    let cluster_exists = |clusters: &[ExactEvidenceCluster], id| {
+        .map(|cluster| (cluster.id, cluster.exact_matches))
+        .collect::<BTreeMap<_, _>>();
+    let cluster_exists = |clusters: &BTreeMap<u32, u64>, id| {
         clusters
-            .iter()
-            .any(|cluster| cluster.id == id && cluster.exact_matches != 0)
+            .get(&id)
+            .is_some_and(|&exact_matches| exact_matches != 0)
     };
-    if pair_miss_clusters
+    // ExactMiss stores canonical (min, max) endpoints, while its statistical
+    // cluster is the sampled endpoint that caused the pair to be evaluated.
+    // That endpoint can be the canonical right side when only the larger atom
+    // was sampled. If both endpoints were sampled, scan ownership belongs to
+    // the smaller endpoint, so checking left first preserves deterministic
+    // assignment.
+    let pair_miss_cluster = |miss: &ExactMiss| {
+        if cluster_exists(&pair_cluster_matches, miss.left_atom) {
+            Some(miss.left_atom)
+        } else if cluster_exists(&pair_cluster_matches, miss.right_atom) {
+            Some(miss.right_atom)
+        } else {
+            None
+        }
+    };
+    let mut pair_miss_clusters = BTreeSet::new();
+    for miss in evidence
+        .pair_misses
         .iter()
-        .any(|&id| !cluster_exists(evidence.pair_clusters, id))
-        || shared_miss_clusters
-            .iter()
-            .any(|&id| !cluster_exists(evidence.shared_clusters, id))
+        .filter(|miss| !rescue_plan.covers_pair(miss))
     {
-        return Err(EvidenceError::MissingEvidenceCluster);
+        let Some(cluster) = pair_miss_cluster(miss) else {
+            return Err(EvidenceError::MissingEvidenceCluster);
+        };
+        pair_miss_clusters.insert(cluster);
+    }
+    let mut shared_miss_clusters = BTreeSet::new();
+    for miss in evidence
+        .shared_misses
+        .iter()
+        .filter(|miss| !rescue_plan.covers_shared(miss))
+    {
+        if !cluster_exists(&shared_cluster_matches, miss.token_id) {
+            return Err(EvidenceError::MissingEvidenceCluster);
+        }
+        shared_miss_clusters.insert(miss.token_id);
     }
     let statistical_trials = evidence
         .pair_clusters

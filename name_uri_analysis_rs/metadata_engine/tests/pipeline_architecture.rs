@@ -259,6 +259,47 @@ fn exact_island_scans_full_universe_and_finds_out_of_block_match() {
 }
 
 #[test]
+fn pair_exact_miss_resolves_when_only_the_canonical_right_endpoint_was_sampled() {
+    let (_directory, features, blocking) = snapshot_fixture();
+    let snapshot = MetadataSnapshot::open(&features, &blocking).unwrap();
+    let evidence = run_pair_exact_island(
+        &snapshot,
+        &[1],
+        ExactEvidenceBudget {
+            max_lefts: 1,
+            max_pair_work: 1,
+            max_artifact_bytes: 1_000_000,
+            max_lanes: 4,
+        },
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(evidence.conservative_misses.len(), 1);
+    assert_eq!(evidence.clusters[0].id, 1);
+    let report = evaluate_holdout(
+        HoldoutEvidence {
+            evaluated_pair_work: evidence.pair_work,
+            exhaustive: false,
+            pair_exact_matches: evidence.exact_matches,
+            pair_misses: &evidence.conservative_misses,
+            shared_exact_matches: 0,
+            shared_misses: &[],
+            skipped_shared_groups: &[],
+            skipped_shared_pair_work: 0,
+            considered_shared_pair_work: 0,
+            shared_work_strata: &[],
+            pair_clusters: &evidence.clusters,
+            shared_clusters: &[],
+        },
+        &RescuePlan::default(),
+        EvidenceGatePolicy::permissive(),
+    )
+    .unwrap();
+    assert_eq!(report.observed_misses, 1);
+}
+
+#[test]
 fn exact_island_reports_monotonic_unordered_pair_work() {
     let (_d, f, b) = snapshot_fixture();
     let snapshot = MetadataSnapshot::open(&f, &b).unwrap();
@@ -1283,6 +1324,17 @@ fn shared_evidence_plan_tracks_budget_skips_per_pair_work_stratum() {
 }
 
 #[test]
+fn shared_evidence_plan_deduplicates_tokens_before_partitioning_and_work_accounting() {
+    let plan = plan_shared_token_evidence(&[0, 2, 5], &[0, 0, 1, 1], 8, 10).unwrap();
+
+    assert_eq!(plan.calibration_tokens, vec![0]);
+    assert_eq!(plan.holdout_tokens, vec![1]);
+    assert_eq!(plan.pair_work, 4);
+    assert_eq!(plan.considered_pair_work, 4);
+    assert!(plan.skipped_tokens.is_empty());
+}
+
+#[test]
 fn evidence_gate_rejects_a_skipped_work_stratum_hidden_by_the_global_rate() {
     let report = evaluate_holdout(
         HoldoutEvidence {
@@ -1488,6 +1540,39 @@ fn evidence_gate_rejects_an_impossible_miss_count() {
     .unwrap_err();
 
     assert!(error.to_string().contains("exceeds exact matches"));
+}
+
+#[test]
+fn evidence_gate_assigns_a_canonical_pair_miss_to_the_sampled_right_endpoint() {
+    let report = evaluate_holdout(
+        HoldoutEvidence {
+            evaluated_pair_work: 1,
+            exhaustive: false,
+            pair_exact_matches: 1,
+            pair_misses: &[metadata_engine::exact_islands::ExactMiss {
+                left_atom: 2,
+                right_atom: 9,
+            }],
+            shared_exact_matches: 0,
+            shared_misses: &[],
+            skipped_shared_groups: &[],
+            skipped_shared_pair_work: 0,
+            considered_shared_pair_work: 0,
+            shared_work_strata: &[],
+            pair_clusters: &[ExactEvidenceCluster {
+                id: 9,
+                exact_matches: 1,
+            }],
+            shared_clusters: &[],
+        },
+        &RescuePlan::default(),
+        EvidenceGatePolicy::permissive(),
+    )
+    .unwrap();
+
+    assert_eq!(report.observed_misses, 1);
+    assert_eq!(report.statistical_trials, 1);
+    assert_eq!(report.statistical_misses, 1);
 }
 
 #[test]
@@ -1942,6 +2027,16 @@ fn shared_token_exact_parallelism_preserves_deterministic_evidence() {
             .unwrap(),
         parallel
     );
+    let ready = evidence_dir.join("ready");
+    let mut corrupt: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&ready).unwrap()).unwrap();
+    corrupt["calibration_pair_work"] = 0.into();
+    std::fs::write(&ready, serde_json::to_vec(&corrupt).unwrap()).unwrap();
+    assert!(
+        open_shared_token_exact_evidence(&evidence_dir, &snapshot, &[1], &[])
+            .unwrap()
+            .is_none()
+    );
     assert!(
         open_shared_token_exact_evidence(&evidence_dir, &snapshot, &[], &[1])
             .unwrap()
@@ -1971,6 +2066,14 @@ fn pair_exact_evidence_reopens_only_for_the_same_frontier() {
         .unwrap()
         .unwrap();
     assert_eq!(written.pair_work, reopened.pair_work);
+    let ready = evidence_dir.join("ready");
+    let mut corrupt: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&ready).unwrap()).unwrap();
+    corrupt["clusters"] = serde_json::json!([]);
+    std::fs::write(&ready, serde_json::to_vec(&corrupt).unwrap()).unwrap();
+    assert!(open_pair_exact_evidence(&evidence_dir, &snapshot, &[0])
+        .unwrap()
+        .is_none());
     assert!(open_pair_exact_evidence(&evidence_dir, &snapshot, &[1])
         .unwrap()
         .is_none());
