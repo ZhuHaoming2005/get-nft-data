@@ -23,7 +23,7 @@ use crate::exact_islands::{
     run_shared_token_exact_islands_with_progress, ExactEvidenceBudget, PairExactEvidence,
     SharedTokenExactEvidence,
 };
-use crate::index::{ConservativeIndex, IndexMetrics};
+use crate::index::{max_hot_block_candidate_index_bytes, ConservativeIndex, IndexMetrics};
 use crate::progress::{
     ProgressCounters, ProgressEvent, ProgressPhase, TotalKind, WorkClass, WorkUnit,
 };
@@ -33,7 +33,7 @@ use crate::reduce::{
     ForestRun,
 };
 use crate::resource::MemoryBroker;
-use crate::scheduler::{RecallPlan, UniverseBudget, WorkCatalog};
+use crate::scheduler::{job_routing_pair_work, RecallPlan, UniverseBudget, WorkCatalog};
 use crate::snapshot::{MetadataSnapshot, SnapshotError};
 use crate::storage::{ArtifactClass, ArtifactRegistration, EvictionPlan, StorageBroker};
 
@@ -1135,21 +1135,16 @@ fn score_catalog_parallel(
     let CatalogExecutionConfig { lanes, chain_count } = execution;
     const EDGE_BATCH: usize = 32_768;
     let routing_total = catalog.jobs.iter().try_fold(0u64, |total, job| {
-        let first = job.first_block as usize;
-        let end = first.saturating_add(job.block_count as usize);
-        (first..end).try_fold(total, |total, block| {
-            let begin = snapshot.blocking().block_atom_offsets[block];
-            let end = snapshot.blocking().block_atom_offsets[block + 1];
-            let members = end.saturating_sub(begin);
-            total
-                .checked_add(members.saturating_mul(members.saturating_sub(1)) / 2)
-                .ok_or(crate::scheduler::SchedulerError::WorkOverflow)
-        })
+        total
+            .checked_add(job_routing_pair_work(snapshot, job)?)
+            .ok_or(crate::scheduler::SchedulerError::WorkOverflow)
     })?;
-    // Every routing pair is scored. Contract expansion is conditional, but
-    // the catalog's frozen estimated work is the sum of every possible
-    // contract product, so routing + estimated expansion is a safe upper bound
-    // for the combined wall work and remains stable throughout this phase.
+    // Cold routing pairs are enumerated directly. Hot blocks cover the same
+    // logical routing universe while proof-rejecting pairs without term overlap
+    // before scoring. Contract expansion is conditional, but the catalog's
+    // frozen estimated work is the sum of every possible contract product, so
+    // logical routing coverage + estimated expansion remains a stable upper
+    // bound for this phase.
     let combined_work_upper_bound = routing_total
         .checked_add(catalog.estimated_work()?)
         .ok_or(crate::scheduler::SchedulerError::WorkOverflow)?;
@@ -1975,11 +1970,15 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
                 .checked_add(fallback_pair_visits)
                 .ok_or(crate::resource::MemoryError::Overflow)?;
             const CATALOG_LANE_BYTES: u64 = 8 * 1024 * 1024;
+            let hot_index_bytes = max_hot_block_candidate_index_bytes(&snapshot, &catalog)?;
+            let catalog_lane_bytes = CATALOG_LANE_BYTES
+                .checked_add(hot_index_bytes)
+                .ok_or(crate::resource::MemoryError::Overflow)?;
             let lanes = memory
-                .active_lanes(collectors.scorer_lanes(), 0, CATALOG_LANE_BYTES)
+                .active_lanes(collectors.scorer_lanes(), 0, catalog_lane_bytes)
                 .max(1);
             let _scorer_memory =
-                memory.reserve((lanes as u64).saturating_mul(CATALOG_LANE_BYTES))?;
+                memory.reserve((lanes as u64).saturating_mul(catalog_lane_bytes))?;
             let catalog_result = score_catalog_parallel(
                 &snapshot,
                 &catalog,

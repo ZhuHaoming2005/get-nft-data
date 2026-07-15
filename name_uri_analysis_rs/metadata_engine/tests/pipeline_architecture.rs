@@ -1,4 +1,5 @@
 use metadata_engine::blocking::{compile_base_equivalent, AtomSketch, BlockingCompileConfig};
+use metadata_engine::cascade::{score_pair, PairScoreDecision};
 use metadata_engine::encode::{
     write_encode_artifacts, write_encode_artifacts_with_contracts,
     write_encode_artifacts_with_contracts_and_atoms, EncodeContractRow, EncodePayloadRow,
@@ -24,7 +25,10 @@ use metadata_engine::reduce::{
     SnapshotCadence,
 };
 use metadata_engine::resource::{required_host_headroom, MemoryBroker, GIB, MATCH_HARD_TOP};
-use metadata_engine::scheduler::{CoverageCertificate, RecallPlan, UniverseBudget, WorkCatalog};
+use metadata_engine::scheduler::{
+    job_routing_pair_work, CoverageCertificate, JobShape, RecallPlan, SchedulerError,
+    UniverseBudget, WorkCatalog,
+};
 use metadata_engine::snapshot::MetadataSnapshot;
 
 fn snapshot_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
@@ -166,6 +170,67 @@ fn expanded_atom_snapshot_fixture() -> (tempfile::TempDir, std::path::PathBuf, s
     (d, f, b)
 }
 
+fn hot_pruning_snapshot_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let directory = tempfile::tempdir().unwrap();
+    let features = directory.path().join("features");
+    let blocking = directory.path().join("blocking");
+    let sources = (0..4)
+        .map(|contract_id| EncodeSourceRow {
+            contract_id,
+            payload_id: contract_id,
+            retained_token_ids: vec![],
+        })
+        .collect::<Vec<_>>();
+    let payloads = vec![
+        EncodePayloadRow {
+            template_terms: vec![(1, 1)],
+            content_terms: vec![(10, 1)],
+        },
+        EncodePayloadRow {
+            template_terms: vec![(1, 1)],
+            content_terms: vec![(10, 1)],
+        },
+        EncodePayloadRow {
+            template_terms: vec![(1, 1)],
+            content_terms: vec![(20, 1)],
+        },
+        EncodePayloadRow {
+            template_terms: vec![(2, 1)],
+            content_terms: vec![(10, 1)],
+        },
+    ];
+    write_encode_artifacts(&features, &sources, &payloads).unwrap();
+    let identical = AtomSketch {
+        template_simhash: 0,
+        content_simhash: 0,
+        template_anchors: vec![100],
+        content_anchors: vec![200],
+        has_template_terms: true,
+        has_content_terms: true,
+    };
+    compile_base_equivalent(
+        &vec![identical; 4],
+        &BlockingCompileConfig {
+            max_routing_block_members: 1,
+        },
+        &blocking,
+    )
+    .unwrap();
+    commit_ready(
+        &features,
+        "features.ready",
+        r#"{"schema_revision":3,"source_count":4,"payload_count":4,"chains":["x"],"chain_totals":[{"name":"x","contracts":4,"nfts":4}]}"#,
+    )
+    .unwrap();
+    commit_ready(
+        &blocking,
+        "blocking.ready",
+        r#"{"blocking_revision":3,"atom_count":4}"#,
+    )
+    .unwrap();
+    (directory, features, blocking)
+}
+
 #[test]
 fn exact_island_scans_full_universe_and_finds_out_of_block_match() {
     let (_d, f, b) = snapshot_fixture();
@@ -304,6 +369,173 @@ fn catalog_exposes_one_checked_total_for_budget_metrics_and_progress() {
         .map(|job| job.estimated_work)
         .sum::<u64>();
     assert_eq!(catalog.estimated_work().unwrap(), summed);
+}
+
+#[test]
+fn production_scale_hot_blocks_use_one_lazy_catalog_descriptor_each() {
+    const ATOMS: u32 = 1_025;
+    let directory = tempfile::tempdir().unwrap();
+    let features = directory.path().join("features");
+    let blocking = directory.path().join("blocking");
+    let sources = (0..ATOMS)
+        .map(|contract_id| EncodeSourceRow {
+            contract_id,
+            payload_id: 0,
+            retained_token_ids: vec![],
+        })
+        .collect::<Vec<_>>();
+    write_encode_artifacts(
+        &features,
+        &sources,
+        &[EncodePayloadRow {
+            template_terms: vec![(1, 1)],
+            content_terms: vec![(2, 1)],
+        }],
+    )
+    .unwrap();
+    let identical = AtomSketch {
+        template_simhash: 0,
+        content_simhash: 0,
+        template_anchors: vec![10],
+        content_anchors: vec![20],
+        has_template_terms: true,
+        has_content_terms: true,
+    };
+    compile_base_equivalent(
+        &vec![identical; ATOMS as usize],
+        &BlockingCompileConfig {
+            max_routing_block_members: 1_024,
+        },
+        &blocking,
+    )
+    .unwrap();
+    commit_ready(
+        &features,
+        "features.ready",
+        &format!(
+            r#"{{"schema_revision":3,"source_count":{ATOMS},"payload_count":1,"chains":["x"],"chain_totals":[{{"name":"x","contracts":{ATOMS},"nfts":{ATOMS}}}]}}"#
+        ),
+    )
+    .unwrap();
+    commit_ready(
+        &blocking,
+        "blocking.ready",
+        &format!(r#"{{"blocking_revision":3,"atom_count":{ATOMS}}}"#),
+    )
+    .unwrap();
+    let snapshot = MetadataSnapshot::open(&features, &blocking).unwrap();
+    let hot_blocks = snapshot
+        .blocking()
+        .block_atom_offsets
+        .windows(2)
+        .filter(|offsets| offsets[1] - offsets[0] > 1_024)
+        .count();
+    assert!(hot_blocks > 0);
+
+    let catalog = WorkCatalog::build(
+        &snapshot,
+        UniverseBudget {
+            max_jobs: 1_000,
+            max_catalog_bytes: 1_000_000,
+            cold_members_per_job: u64::MAX,
+        },
+        1_024,
+    )
+    .unwrap();
+    let hot_jobs = catalog
+        .jobs
+        .iter()
+        .filter(|job| job.shape == JobShape::LeftTileFanout)
+        .collect::<Vec<_>>();
+
+    assert_eq!(hot_jobs.len(), hot_blocks);
+    assert!(hot_jobs
+        .iter()
+        .all(|job| job.block_count == 1 && job.tile_row == 0 && job.tile_col == 0));
+
+    let routing_total = catalog.jobs.iter().try_fold(0u64, |total, job| {
+        total
+            .checked_add(job_routing_pair_work(&snapshot, job).unwrap())
+            .ok_or(())
+    });
+    let expected_routing_total = snapshot
+        .blocking()
+        .block_atom_offsets
+        .windows(2)
+        .map(|offsets| {
+            let members = offsets[1] - offsets[0];
+            members * members.saturating_sub(1) / 2
+        })
+        .sum::<u64>();
+    assert_eq!(routing_total.unwrap(), expected_routing_total);
+
+    let error = WorkCatalog::build(
+        &snapshot,
+        UniverseBudget {
+            max_jobs: 0,
+            max_catalog_bytes: 0,
+            cold_members_per_job: u64::MAX,
+        },
+        1_024,
+    )
+    .unwrap_err();
+    assert!(matches!(error, SchedulerError::Budget { jobs: 1, .. }));
+}
+
+#[test]
+fn hot_block_proof_index_matches_exhaustive_exact_scoring() {
+    let (_directory, features, blocking) = hot_pruning_snapshot_fixture();
+    let snapshot = MetadataSnapshot::open(&features, &blocking).unwrap();
+    let catalog = WorkCatalog::build(
+        &snapshot,
+        UniverseBudget {
+            max_jobs: 1_000,
+            max_catalog_bytes: 1_000_000,
+            cold_members_per_job: 16,
+        },
+        1,
+    )
+    .unwrap();
+    assert!(catalog
+        .jobs
+        .iter()
+        .any(|job| job.shape == JobShape::LeftTileFanout));
+    let plan = RecallPlan::freeze(&catalog, Vec::new(), Vec::new());
+    let index = ConservativeIndex::open(&snapshot);
+
+    let mut exhaustive_matches = Vec::new();
+    index.for_each_candidate(|left, right| {
+        let left_payload = snapshot.features().contract_payload[left as usize];
+        let right_payload = snapshot.features().contract_payload[right as usize];
+        if score_pair(snapshot.features(), left_payload, right_payload)
+            == PairScoreDecision::ExactMatch
+        {
+            exhaustive_matches.push((left, right));
+        }
+    });
+    exhaustive_matches.sort_unstable();
+    exhaustive_matches.dedup();
+
+    let mut scheduled_candidates = Vec::new();
+    let metrics = index.for_each_catalog_candidate(&catalog, &plan, |left, right| {
+        scheduled_candidates.push((left, right));
+    });
+    let mut scheduled_matches = scheduled_candidates
+        .iter()
+        .copied()
+        .filter(|&(left, right)| {
+            let left_payload = snapshot.features().contract_payload[left as usize];
+            let right_payload = snapshot.features().contract_payload[right as usize];
+            score_pair(snapshot.features(), left_payload, right_payload)
+                == PairScoreDecision::ExactMatch
+        })
+        .collect::<Vec<_>>();
+    scheduled_matches.sort_unstable();
+    scheduled_matches.dedup();
+
+    assert_eq!(scheduled_matches, exhaustive_matches);
+    assert_eq!(scheduled_matches, vec![(0, 1)]);
+    assert!(scheduled_candidates.len() < metrics.block_pair_visits as usize);
 }
 
 #[test]

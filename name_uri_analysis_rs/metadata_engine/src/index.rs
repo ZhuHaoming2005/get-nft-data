@@ -3,11 +3,12 @@
 //! The compiled blocks are the postings. This view never constructs or mmaps a
 //! full Exact index and streams canonical-owner pairs to its consumer.
 
+use crate::encode::FeatureView;
 use crate::progress::{
     ProgressCounters, ProgressEvent, ProgressPhase, TotalKind, WorkClass, WorkUnit,
 };
 use crate::scheduler::{
-    JobDescriptor, JobShape, RecallPlan, SchedulerError, WorkCatalog, HOT_BLOCK_TILE,
+    job_routing_pair_work, JobDescriptor, JobShape, RecallPlan, SchedulerError, WorkCatalog,
 };
 use crate::snapshot::{BlockingView, MetadataSnapshot};
 
@@ -25,6 +26,12 @@ pub struct ConservativeIndex<'a> {
     snapshot: &'a MetadataSnapshot,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum HotIndexDimension {
+    Template,
+    Content,
+}
+
 impl<'a> ConservativeIndex<'a> {
     pub fn open(snapshot: &'a MetadataSnapshot) -> Self {
         Self { snapshot }
@@ -35,8 +42,10 @@ impl<'a> ConservativeIndex<'a> {
         self.visit_blocks(0..self.snapshot.blocking().block_kinds.len(), &mut visit)
     }
 
-    /// Execute the frozen seed-first catalog. Job shape changes traversal and
-    /// locality only; canonical ownership keeps the candidate relation stable.
+    /// Execute the frozen seed-first catalog. Cold jobs enumerate their block
+    /// pairs directly; lazy hot jobs first apply proof-safe term-overlap
+    /// rejection. Canonical ownership still emits every scorer-eligible pair
+    /// exactly once.
     pub fn for_each_catalog_candidate(
         &self,
         catalog: &WorkCatalog,
@@ -53,11 +62,11 @@ impl<'a> ConservativeIndex<'a> {
                 JobShape::MicroBatch => metrics.add(self.visit_blocks(blocks, &mut visit)),
                 JobShape::LeftTileFanout => {
                     for block in blocks {
-                        metrics.add(self.visit_hot_tile(
+                        metrics.add(self.visit_hot_block_with_work_while(
                             block,
-                            job.tile_row as usize,
-                            job.tile_col as usize,
                             &mut visit,
+                            &mut |_| {},
+                            &mut || true,
                         ));
                     }
                 }
@@ -74,16 +83,9 @@ impl<'a> ConservativeIndex<'a> {
         mut progress: impl FnMut(ProgressEvent),
     ) -> Result<IndexMetrics, SchedulerError> {
         let total = catalog.jobs.iter().try_fold(0u64, |total, job| {
-            let first = job.first_block as usize;
-            let end = first.saturating_add(job.block_count as usize);
-            (first..end).try_fold(total, |total, block| {
-                let begin = self.snapshot.blocking().block_atom_offsets[block];
-                let end = self.snapshot.blocking().block_atom_offsets[block + 1];
-                let members = end.saturating_sub(begin);
-                total
-                    .checked_add(members.saturating_mul(members.saturating_sub(1)) / 2)
-                    .ok_or(SchedulerError::WorkOverflow)
-            })
+            total
+                .checked_add(job_routing_pair_work(self.snapshot, job)?)
+                .ok_or(SchedulerError::WorkOverflow)
         })?;
         let mut completed = 0u64;
         let mut metrics = IndexMetrics::default();
@@ -107,11 +109,11 @@ impl<'a> ConservativeIndex<'a> {
                 JobShape::LeftTileFanout => {
                     let mut job_metrics = IndexMetrics::default();
                     for block in blocks {
-                        job_metrics.add(self.visit_hot_tile(
+                        job_metrics.add(self.visit_hot_block_with_work_while(
                             block,
-                            job.tile_row as usize,
-                            job.tile_col as usize,
                             &mut visit,
+                            &mut |_| {},
+                            &mut || true,
                         ));
                     }
                     job_metrics
@@ -187,37 +189,12 @@ impl<'a> ConservativeIndex<'a> {
             JobShape::LeftTileFanout => {
                 let mut metrics = IndexMetrics::default();
                 for block in blocks {
-                    let b = self.snapshot.blocking();
-                    let start = b.block_atom_offsets[block] as usize;
-                    let end = b.block_atom_offsets[block + 1] as usize;
-                    let members = &b.block_atoms[start..end];
-                    let a0 = (job.tile_row as usize).saturating_mul(HOT_BLOCK_TILE);
-                    let a1 = (a0 + HOT_BLOCK_TILE).min(members.len());
-                    let b0 = (job.tile_col as usize).saturating_mul(HOT_BLOCK_TILE);
-                    let b1 = (b0 + HOT_BLOCK_TILE).min(members.len());
-                    let before = metrics.block_pair_visits;
-                    for i in a0..a1 {
-                        let j0 = if job.tile_row == job.tile_col {
-                            (i + 1).max(b0)
-                        } else {
-                            b0
-                        };
-                        for j in j0..b1 {
-                            if !keep_going() {
-                                work(metrics.block_pair_visits.saturating_sub(before));
-                                return metrics;
-                            }
-                            metrics.block_pair_visits = metrics.block_pair_visits.saturating_add(1);
-                            self.route_pair(
-                                block,
-                                members[i],
-                                members[j],
-                                &mut metrics,
-                                &mut visit,
-                            );
-                        }
-                    }
-                    work(metrics.block_pair_visits.saturating_sub(before));
+                    metrics.add(self.visit_hot_block_with_work_while(
+                        block,
+                        &mut visit,
+                        &mut work,
+                        &mut keep_going,
+                    ));
                 }
                 metrics
             }
@@ -255,46 +232,128 @@ impl<'a> ConservativeIndex<'a> {
         metrics
     }
 
-    fn visit_hot_tile(
+    /// Execute one hot block through a proof-safe secondary index.
+    ///
+    /// An exact match requires at least one shared template term and one shared
+    /// content term. We sample posting expansion to choose an index dimension,
+    /// union its postings per left atom, then confirm exact overlap in the other
+    /// dimension before invoking the scorer. Pairs rejected here therefore
+    /// cannot be accepted by `score_pair`.
+    fn visit_hot_block_with_work_while(
         &self,
         block: usize,
-        tile_row: usize,
-        tile_col: usize,
-        visit: &mut impl FnMut(u32, u32),
-    ) -> IndexMetrics {
-        self.visit_hot_tile_with_work(block, tile_row, tile_col, visit, &mut |_| {})
-    }
-
-    fn visit_hot_tile_with_work(
-        &self,
-        block: usize,
-        tile_row: usize,
-        tile_col: usize,
         visit: &mut impl FnMut(u32, u32),
         work: &mut impl FnMut(u64),
+        keep_going: &mut impl FnMut() -> bool,
     ) -> IndexMetrics {
         let b = self.snapshot.blocking();
         let start = b.block_atom_offsets[block] as usize;
         let end = b.block_atom_offsets[block + 1] as usize;
         let members = &b.block_atoms[start..end];
+        let features = self.snapshot.features();
+        let payloads = members
+            .iter()
+            .map(|&atom| atom_payload(features, atom))
+            .collect::<Vec<_>>();
+        let template_memberships = payloads.iter().fold(0u64, |total, &payload| {
+            total.saturating_add(
+                payload_terms(features, payload, HotIndexDimension::Template).len() as u64,
+            )
+        });
+        let content_memberships = payloads.iter().fold(0u64, |total, &payload| {
+            total.saturating_add(
+                payload_terms(features, payload, HotIndexDimension::Content).len() as u64,
+            )
+        });
+        let indexed_dimension = choose_hot_index_dimension(
+            features,
+            &payloads,
+            template_memberships,
+            content_memberships,
+        );
+        let verification_dimension = match indexed_dimension {
+            HotIndexDimension::Template => HotIndexDimension::Content,
+            HotIndexDimension::Content => HotIndexDimension::Template,
+        };
+        let membership_capacity = match indexed_dimension {
+            HotIndexDimension::Template => template_memberships,
+            HotIndexDimension::Content => content_memberships,
+        } as usize;
+        let mut postings = Vec::<(u32, u32)>::with_capacity(membership_capacity);
+        for (position, &payload) in payloads.iter().enumerate() {
+            postings.extend(
+                payload_terms(features, payload, indexed_dimension)
+                    .iter()
+                    .copied()
+                    .map(|term| (term, position as u32)),
+            );
+        }
+        postings.sort_unstable();
+
         let mut metrics = IndexMetrics::default();
-        let a0 = tile_row.saturating_mul(HOT_BLOCK_TILE);
-        let a1 = (a0 + HOT_BLOCK_TILE).min(members.len());
-        let b0 = tile_col.saturating_mul(HOT_BLOCK_TILE);
-        let b1 = (b0 + HOT_BLOCK_TILE).min(members.len());
-        let before = metrics.block_pair_visits;
-        for i in a0..a1 {
-            let j0 = if tile_row == tile_col {
-                (i + 1).max(b0)
-            } else {
-                b0
-            };
-            for j in j0..b1 {
-                metrics.block_pair_visits = metrics.block_pair_visits.saturating_add(1);
-                self.route_pair(block, members[i], members[j], &mut metrics, visit);
+        let mut marks = vec![0u32; members.len()];
+        let mut epoch = 0u32;
+        let mut candidates = Vec::<u32>::with_capacity(members.len());
+        let mut pending_work = 0u64;
+        const PROGRESS_CHUNK: u64 = 100_000_000;
+
+        for (left_position, &left_payload) in payloads.iter().enumerate() {
+            if !keep_going() {
+                break;
+            }
+            epoch = epoch.wrapping_add(1);
+            if epoch == 0 {
+                marks.fill(0);
+                epoch = 1;
+            }
+            candidates.clear();
+            for &term in payload_terms(features, left_payload, indexed_dimension) {
+                let posting_start = postings.partition_point(|&(candidate, _)| candidate < term);
+                let posting_end = postings.partition_point(|&(candidate, _)| candidate <= term);
+                for &(_, right_position) in &postings[posting_start..posting_end] {
+                    let right_position = right_position as usize;
+                    if right_position <= left_position || marks[right_position] == epoch {
+                        continue;
+                    }
+                    marks[right_position] = epoch;
+                    candidates.push(right_position as u32);
+                }
+            }
+            let left_verification_terms =
+                payload_terms(features, left_payload, verification_dimension);
+            for &right_position in &candidates {
+                if !keep_going() {
+                    break;
+                }
+                let right_position = right_position as usize;
+                let right_verification_terms =
+                    payload_terms(features, payloads[right_position], verification_dimension);
+                if sorted_terms_intersect(left_verification_terms, right_verification_terms) {
+                    self.route_pair(
+                        block,
+                        members[left_position],
+                        members[right_position],
+                        &mut metrics,
+                        visit,
+                    );
+                }
+            }
+
+            // Count the complete logical row covered by the proof, including
+            // pairs rejected without materializing them. This keeps the stable
+            // nC2 progress contract while actual scorer calls follow the much
+            // smaller proof-safe candidate relation.
+            let row_work = members.len().saturating_sub(left_position + 1) as u64;
+            metrics.block_pair_visits = metrics.block_pair_visits.saturating_add(row_work);
+            pending_work = pending_work.saturating_add(row_work);
+            if pending_work >= PROGRESS_CHUNK {
+                work(pending_work);
+                pending_work = 0;
             }
         }
-        work(metrics.block_pair_visits.saturating_sub(before));
+        if pending_work > 0 {
+            work(pending_work);
+        }
         metrics
     }
 
@@ -321,6 +380,143 @@ impl<'a> ConservativeIndex<'a> {
             .saturating_add(left_members.saturating_mul(right_members));
         visit(left, right)
     }
+}
+
+fn atom_payload(features: &FeatureView, atom: u32) -> u32 {
+    let contract =
+        features.fallback_atom_contracts[features.fallback_atom_offsets[atom as usize] as usize];
+    features.contract_payload[contract as usize]
+}
+
+fn payload_terms(features: &FeatureView, payload: u32, dimension: HotIndexDimension) -> &[u32] {
+    let payload = payload as usize;
+    match dimension {
+        HotIndexDimension::Template => {
+            let start = features.payload_template_offsets[payload] as usize;
+            let end = features.payload_template_offsets[payload + 1] as usize;
+            &features.payload_template_terms[start..end]
+        }
+        HotIndexDimension::Content => {
+            let start = features.payload_content_offsets[payload] as usize;
+            let end = features.payload_content_offsets[payload + 1] as usize;
+            &features.payload_content_terms[start..end]
+        }
+    }
+}
+
+fn sorted_terms_intersect(left: &[u32], right: &[u32]) -> bool {
+    let (mut left_index, mut right_index) = (0usize, 0usize);
+    while left_index < left.len() && right_index < right.len() {
+        match left[left_index].cmp(&right[right_index]) {
+            std::cmp::Ordering::Less => left_index += 1,
+            std::cmp::Ordering::Greater => right_index += 1,
+            std::cmp::Ordering::Equal => return true,
+        }
+    }
+    false
+}
+
+fn choose_hot_index_dimension(
+    features: &FeatureView,
+    payloads: &[u32],
+    template_memberships: u64,
+    content_memberships: u64,
+) -> HotIndexDimension {
+    let template_pair_work =
+        sampled_posting_pair_work(features, payloads, HotIndexDimension::Template);
+    let content_pair_work =
+        sampled_posting_pair_work(features, payloads, HotIndexDimension::Content);
+    match template_pair_work.cmp(&content_pair_work) {
+        std::cmp::Ordering::Less => HotIndexDimension::Template,
+        std::cmp::Ordering::Greater => HotIndexDimension::Content,
+        std::cmp::Ordering::Equal if template_memberships <= content_memberships => {
+            HotIndexDimension::Template
+        }
+        std::cmp::Ordering::Equal => HotIndexDimension::Content,
+    }
+}
+
+/// Deterministically estimate posting expansion on an evenly spaced sample.
+/// Membership count alone is a poor selector when a short template dimension
+/// contains one extremely common term while richer content terms are sparse.
+fn sampled_posting_pair_work(
+    features: &FeatureView,
+    payloads: &[u32],
+    dimension: HotIndexDimension,
+) -> u64 {
+    const SAMPLE_PAYLOADS: usize = 16_384;
+    let stride = payloads.len().div_ceil(SAMPLE_PAYLOADS).max(1);
+    let mut terms = Vec::<u32>::new();
+    for &payload in payloads.iter().step_by(stride) {
+        terms.extend_from_slice(payload_terms(features, payload, dimension));
+    }
+    terms.sort_unstable();
+    let mut pair_work = 0u64;
+    let mut start = 0usize;
+    while start < terms.len() {
+        let term = terms[start];
+        let end = start + terms[start..].partition_point(|&candidate| candidate == term);
+        let count = (end - start) as u64;
+        pair_work = pair_work.saturating_add(count.saturating_mul(count.saturating_sub(1)) / 2);
+        start = end;
+    }
+    pair_work
+}
+
+/// Conservative peak scratch for one lazy hot-block candidate index.
+pub fn max_hot_block_candidate_index_bytes(
+    snapshot: &MetadataSnapshot,
+    catalog: &WorkCatalog,
+) -> Result<u64, SchedulerError> {
+    catalog
+        .jobs
+        .iter()
+        .filter(|job| job.shape == JobShape::LeftTileFanout)
+        .try_fold(0u64, |maximum, job| {
+            let first = job.first_block as usize;
+            let end = first.saturating_add(job.block_count as usize);
+            (first..end).try_fold(maximum, |maximum, block| {
+                let blocking = snapshot.blocking();
+                let begin = blocking.block_atom_offsets[block] as usize;
+                let end = blocking.block_atom_offsets[block + 1] as usize;
+                let members = &blocking.block_atoms[begin..end];
+                let features = snapshot.features();
+                let (template, content) =
+                    members
+                        .iter()
+                        .try_fold((0u64, 0u64), |(template, content), &atom| {
+                            let payload = atom_payload(features, atom);
+                            let template_len =
+                                payload_terms(features, payload, HotIndexDimension::Template).len()
+                                    as u64;
+                            let content_len =
+                                payload_terms(features, payload, HotIndexDimension::Content).len()
+                                    as u64;
+                            Ok::<_, SchedulerError>((
+                                template
+                                    .checked_add(template_len)
+                                    .ok_or(SchedulerError::WorkOverflow)?,
+                                content
+                                    .checked_add(content_len)
+                                    .ok_or(SchedulerError::WorkOverflow)?,
+                            ))
+                        })?;
+                // Execution chooses the dimension with lower sampled posting
+                // expansion, which is not necessarily the dimension with fewer
+                // memberships. Admit either outcome conservatively.
+                let posting_bytes = template
+                    .max(content)
+                    .checked_mul(std::mem::size_of::<(u32, u32)>() as u64)
+                    .ok_or(SchedulerError::WorkOverflow)?;
+                let row_scratch = (members.len() as u64)
+                    .checked_mul((std::mem::size_of::<u32>() * 3) as u64)
+                    .ok_or(SchedulerError::WorkOverflow)?;
+                let bytes = posting_bytes
+                    .checked_add(row_scratch)
+                    .ok_or(SchedulerError::WorkOverflow)?;
+                Ok(maximum.max(bytes))
+            })
+        })
 }
 
 impl IndexMetrics {

@@ -24,17 +24,15 @@ pub struct JobDescriptor {
     pub shape: JobShape,
     pub risk: u8,
     pub rescue: u8,
-    /// Hot-block tile row; ignored for [`JobShape::MicroBatch`].
+    /// Reserved for durable catalog compatibility. Hot blocks are represented
+    /// by one lazy fanout descriptor rather than one descriptor per tile.
     pub tile_row: u16,
-    /// Hot-block tile column; ignored for [`JobShape::MicroBatch`].
+    /// Reserved for durable catalog compatibility.
     pub tile_col: u16,
     pub estimated_work: u64,
 }
 
-pub const CATALOG_REVISION: u32 = 2;
-
-/// Atom-member tile size for hot-block LeftTileFanout catalog jobs.
-pub const HOT_BLOCK_TILE: usize = 1024;
+pub const CATALOG_REVISION: u32 = 3;
 
 #[derive(Debug, Clone, Copy)]
 pub struct UniverseBudget {
@@ -96,21 +94,20 @@ impl WorkCatalog {
         while start < b.block_kinds.len() {
             let members = b.block_atom_offsets[start + 1] - b.block_atom_offsets[start];
             if members > hot_members {
-                let tile_count = (members as usize).div_ceil(HOT_BLOCK_TILE);
-                for ti in 0..tile_count {
-                    for tj in ti..tile_count {
-                        check_next_job(jobs.len(), budget)?;
-                        jobs.push(descriptor(
-                            jobs.len(),
-                            start,
-                            1,
-                            JobShape::LeftTileFanout,
-                            ti as u16,
-                            tj as u16,
-                            tile_contract_pair_work(snapshot, start, ti, tj)?,
-                        ));
-                    }
-                }
+                // Keep a hot block constant-space in the catalog. Candidate
+                // generation builds a proof-safe secondary index lazily when
+                // this descriptor executes; materializing every tile pair here
+                // turns catalog construction itself into O(members^2) work.
+                check_next_job(jobs.len(), budget)?;
+                jobs.push(descriptor(
+                    jobs.len(),
+                    start,
+                    1,
+                    JobShape::LeftTileFanout,
+                    0,
+                    0,
+                    block_contract_pair_work(snapshot, start)?,
+                ));
                 start += 1;
                 progress(start as u64, total_blocks, jobs.len() as u64);
                 continue;
@@ -312,6 +309,27 @@ pub fn estimate_catalog_contract_pair_work(
     })
 }
 
+/// Exact logical routing universe covered by one catalog descriptor.
+///
+/// A lazy hot-block descriptor covers its block once. Keeping this calculation
+/// job-aware prevents the former per-tile descriptors from multiplying the
+/// whole block's `nC2` total for every tile.
+pub fn job_routing_pair_work(
+    snapshot: &MetadataSnapshot,
+    job: &JobDescriptor,
+) -> Result<u64, SchedulerError> {
+    let first = job.first_block as usize;
+    let end = first.saturating_add(job.block_count as usize);
+    (first..end).try_fold(0u64, |total, block| {
+        let begin = snapshot.blocking().block_atom_offsets[block];
+        let end = snapshot.blocking().block_atom_offsets[block + 1];
+        let members = end.saturating_sub(begin);
+        total
+            .checked_add(members.saturating_mul(members.saturating_sub(1)) / 2)
+            .ok_or(SchedulerError::WorkOverflow)
+    })
+}
+
 fn check_next_job(current_jobs: usize, budget: UniverseBudget) -> Result<(), SchedulerError> {
     let jobs = current_jobs.saturating_add(1) as u64;
     let bytes = jobs.saturating_mul(std::mem::size_of::<JobDescriptor>() as u64);
@@ -350,46 +368,6 @@ fn descriptor(
         tile_col,
         estimated_work,
     }
-}
-
-fn tile_contract_pair_work(
-    snapshot: &MetadataSnapshot,
-    block: usize,
-    tile_row: usize,
-    tile_col: usize,
-) -> Result<u64, SchedulerError> {
-    let blocking = snapshot.blocking();
-    let features = snapshot.features();
-    let begin = blocking.block_atom_offsets[block] as usize;
-    let end = blocking.block_atom_offsets[block + 1] as usize;
-    let members = &blocking.block_atoms[begin..end];
-    let tile = HOT_BLOCK_TILE;
-    let a0 = tile_row.saturating_mul(tile);
-    let a1 = (a0 + tile).min(members.len());
-    let b0 = tile_col.saturating_mul(tile);
-    let b1 = (b0 + tile).min(members.len());
-    let mut work = 0u64;
-    for i in a0..a1 {
-        let left_members = features.fallback_atom_offsets[members[i] as usize + 1]
-            - features.fallback_atom_offsets[members[i] as usize];
-        let j0 = if tile_row == tile_col {
-            (i + 1).max(b0)
-        } else {
-            b0
-        };
-        for &right in &members[j0..b1] {
-            let right_members = features.fallback_atom_offsets[right as usize + 1]
-                - features.fallback_atom_offsets[right as usize];
-            work = work
-                .checked_add(
-                    left_members
-                        .checked_mul(right_members)
-                        .ok_or(SchedulerError::WorkOverflow)?,
-                )
-                .ok_or(SchedulerError::WorkOverflow)?;
-        }
-    }
-    Ok(work)
 }
 
 fn block_contract_pair_work(
