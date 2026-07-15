@@ -1482,7 +1482,7 @@ fn catalog_parallelism_preserves_deterministic_components_and_metrics() {
 }
 
 #[test]
-fn catalog_duplicate_route_upper_bound_does_not_reject_actual_work_budget() {
+fn catalog_candidate_visit_limit_is_ignored() {
     let (dir, features, blocking) = expanded_atom_snapshot_fixture();
     let result = metadata_engine::pipeline::run_metadata_pipeline(
         &features,
@@ -1505,7 +1505,7 @@ fn catalog_duplicate_route_upper_bound_does_not_reject_actual_work_budget() {
 
     assert!(result.planned_candidate_pair_visits <= 10);
 
-    let error = metadata_engine::pipeline::run_metadata_pipeline(
+    let below_actual_limit = metadata_engine::pipeline::run_metadata_pipeline(
         &features,
         &blocking,
         &dir.path().join("dynamic-catalog-budget-rejected"),
@@ -1522,8 +1522,9 @@ fn catalog_duplicate_route_upper_bound_does_not_reject_actual_work_budget() {
             edge_bytes: 1_000_000,
         },
     )
-    .unwrap_err();
-    assert!(error.to_string().contains("catalog_candidate_pair_visits"));
+    .unwrap();
+    assert_eq!(result.scope_components, below_actual_limit.scope_components);
+    assert_eq!(result.edge_count, below_actual_limit.edge_count);
 }
 
 #[test]
@@ -2067,7 +2068,7 @@ fn matching_component_chain_corruption_fails_the_pipeline_closed() {
 }
 
 #[test]
-fn recovered_connectivity_is_rejected_under_a_lower_candidate_cap() {
+fn recovered_connectivity_ignores_a_lower_legacy_candidate_cap() {
     let dir = tempfile::tempdir().unwrap();
     let features = dir.path().join("e");
     let blocking = dir.path().join("b");
@@ -2144,15 +2145,15 @@ fn recovered_connectivity_is_rejected_under_a_lower_candidate_cap() {
     std::fs::remove_dir_all(out.join("metadata-summary-1")).unwrap();
     config.max_candidate_pair_visits = 5;
 
-    let error = metadata_engine::pipeline::run_metadata_pipeline_durable(
+    let recovered = metadata_engine::pipeline::run_metadata_pipeline_durable(
         &features, &blocking, &out, &config,
     )
-    .unwrap_err();
-    assert!(error.to_string().contains("candidate_pair_visits"));
+    .unwrap();
+    assert_eq!(recovered.scope_components.intra_roots, vec![0, 0, 0]);
 }
 
 #[test]
-fn shared_small_group_budget_fails_before_any_pair_is_scored() {
+fn shared_small_group_ignores_legacy_candidate_visit_limit() {
     let dir = tempfile::tempdir().unwrap();
     let features = dir.path().join("e");
     let blocking = dir.path().join("b");
@@ -2211,7 +2212,7 @@ fn shared_small_group_budget_fails_before_any_pair_is_scored() {
     )
     .unwrap();
     let mut events = Vec::new();
-    let error = metadata_engine::pipeline::run_metadata_pipeline_with_progress(
+    let result = metadata_engine::pipeline::run_metadata_pipeline_with_progress(
         &features,
         &blocking,
         &dir.path().join("small-group-budget"),
@@ -2229,17 +2230,12 @@ fn shared_small_group_budget_fails_before_any_pair_is_scored() {
         },
         |event| events.push(event),
     )
-    .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("shared_token_candidate_pair_visits"),
-        "{error}"
-    );
+    .unwrap();
+    assert_eq!(result.scope_components.intra_roots, vec![0, 0, 0]);
     assert!(events
         .iter()
         .filter(|event| event.phase == ProgressPhase::SharedTokenPairs)
-        .all(|event| event.completed == 0));
+        .any(|event| event.completed > 0));
 }
 
 #[test]
@@ -2625,7 +2621,7 @@ fn chain_local_representative_atom_connects_only_token_disjoint_members() {
         r#"{"blocking_revision":3,"atom_count":1}"#,
     )
     .unwrap();
-    let rejected = metadata_engine::pipeline::run_metadata_pipeline(
+    let result = metadata_engine::pipeline::run_metadata_pipeline(
         &features,
         &blocking,
         &dir.path().join("fallback-budget-rejected"),
@@ -2636,25 +2632,6 @@ fn chain_local_representative_atom_connects_only_token_disjoint_members() {
             threads: 1,
             max_catalog_jobs: 100,
             max_candidate_pair_visits: 2,
-            exact_sample_lefts: 0,
-            exact_pair_work: 0,
-            evidence_gate_policy: EvidenceGatePolicy::permissive(),
-            edge_bytes: 1_000_000,
-        },
-    )
-    .unwrap_err();
-    assert!(rejected.to_string().contains("candidate_pair_visits"));
-    let result = metadata_engine::pipeline::run_metadata_pipeline(
-        &features,
-        &blocking,
-        &dir.path().join("match"),
-        &metadata_engine::pipeline::MetadataPipelineConfig {
-            storage_work_directory: dir.path().to_path_buf(),
-            memory_hard_top: MATCH_HARD_TOP,
-            host_total_memory: 512 * GIB,
-            threads: 1,
-            max_catalog_jobs: 100,
-            max_candidate_pair_visits: 100,
             exact_sample_lefts: 0,
             exact_pair_work: 0,
             evidence_gate_policy: EvidenceGatePolicy::permissive(),

@@ -41,7 +41,7 @@ pub const DEFAULT_MAX_CANDIDATE_PAIR_VISITS: u64 = 200_000_000_000;
 pub const DEFAULT_EXACT_SAMPLE_LEFTS: u64 = 1_024;
 pub const DEFAULT_EXACT_PAIR_WORK: u64 = 20_000_000_000;
 
-const CONNECTIVITY_RUN_REVISION: u32 = 3;
+const CONNECTIVITY_RUN_REVISION: u32 = 4;
 
 #[derive(Debug, Clone)]
 pub struct MetadataPipelineConfig {
@@ -950,6 +950,7 @@ enum SharedMessage {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
 struct FallbackPairTask {
     atom: usize,
     left: usize,
@@ -958,12 +959,14 @@ struct FallbackPairTask {
 }
 
 #[derive(Default)]
+#[cfg(test)]
 struct FallbackPairCursor {
     atom: usize,
     left: usize,
     right: usize,
 }
 
+#[cfg(test)]
 fn next_fallback_pair_task(
     cursor: &mut FallbackPairCursor,
     atom_count: usize,
@@ -1005,85 +1008,119 @@ fn append_fallback_atom_edges_parallel(
     chain_count: usize,
     progress: &mut impl FnMut(ProgressEvent),
 ) -> Result<u64, PipelineError> {
-    const PAIRS_PER_TASK: usize = 16_384;
     let offsets = &snapshot.features().fallback_atom_offsets;
     let atom_count = offsets.len().saturating_sub(1);
     let total = offsets.windows(2).try_fold(0u64, |total, window| {
         checked_add_pairs(total, window[1] - window[0])
     })?;
-    progress(ProgressEvent::determinate(
-        ProgressPhase::FallbackPairs,
-        0,
-        total,
-        WorkUnit::Pairs,
-        ProgressCounters::default(),
-    ));
-
-    let wave_width = worker_pool.current_num_threads().max(1).saturating_mul(2);
-    let mut cursor = FallbackPairCursor::default();
-    let mut completed = 0u64;
-    loop {
-        let mut tasks = Vec::with_capacity(wave_width);
-        while tasks.len() < wave_width {
-            let Some(task) =
-                next_fallback_pair_task(&mut cursor, atom_count, PAIRS_PER_TASK, |atom| {
-                    (offsets[atom + 1] - offsets[atom]) as usize
-                })
-            else {
-                break;
-            };
-            tasks.push(task);
-        }
-        if tasks.is_empty() {
-            break;
-        }
-        let batches = worker_pool.install(|| {
-            tasks
-                .par_iter()
-                .map(|task| {
-                    let members = atom_contracts(snapshot, task.atom as u32);
-                    let left = members[task.left];
-                    let mut edges = Vec::new();
-                    for &right in &members[task.right_begin..task.right_end] {
-                        if !contracts_share_retained_token(snapshot.features(), left, right) {
-                            edges.push(Edge::new(left, right));
-                        }
-                    }
-                    (task.right_end - task.right_begin, edges)
-                })
-                .collect::<Vec<_>>()
-        });
-        for (work, edges) in batches {
-            completed = completed.saturating_add(work as u64);
-            collectors.push_edges_by_chain(
-                &snapshot.features().contract_chain,
-                chain_count,
-                edges,
-            )?;
-        }
-        progress(ProgressEvent::determinate(
+    progress(
+        ProgressEvent::determinate(
             ProgressPhase::FallbackPairs,
-            completed.min(total),
+            0,
             total,
             WorkUnit::Pairs,
-            ProgressCounters {
-                matched: collectors.accepted_edges(),
-                ..ProgressCounters::default()
-            },
-        ));
-    }
-    if completed != total {
-        return Err(PipelineError::Invariant(format!(
-            "fallback pair progress mismatch: completed={completed}, planned={total}"
-        )));
+            ProgressCounters::default(),
+        )
+        .with_plan(WorkClass::Generic, TotalKind::UpperBound),
+    );
+
+    let batches = worker_pool.install(|| {
+        (0..atom_count)
+            .into_par_iter()
+            .map(|atom| fallback_atom_forest(snapshot, atom as u32))
+            .collect::<Result<Vec<_>, _>>()
+    })?;
+    let mut completed = 0u64;
+    for (work, edges) in batches {
+        completed = completed
+            .checked_add(work)
+            .ok_or(crate::resource::MemoryError::Overflow)?;
+        collectors.push_edges_by_chain(&snapshot.features().contract_chain, chain_count, edges)?;
+        progress(
+            ProgressEvent::determinate(
+                ProgressPhase::FallbackPairs,
+                completed,
+                total,
+                WorkUnit::Pairs,
+                ProgressCounters {
+                    matched: collectors.accepted_edges(),
+                    ..ProgressCounters::default()
+                },
+            )
+            .with_plan(WorkClass::Generic, TotalKind::UpperBound),
+        );
     }
     Ok(completed)
+}
+
+fn fallback_atom_forest(
+    snapshot: &MetadataSnapshot,
+    atom: u32,
+) -> Result<(u64, Vec<Edge>), PipelineError> {
+    let members = atom_contracts(snapshot, atom);
+    if members.len() < 2 || atom_members_share_common_retained_token(snapshot.features(), members) {
+        return Ok((0, Vec::new()));
+    }
+    let mut parent = (0..members.len()).collect::<Vec<_>>();
+    let mut components = members.len();
+    let mut visits = 0u64;
+    let mut edges = Vec::with_capacity(members.len().saturating_sub(1));
+    for left_index in 0..members.len() {
+        for right_index in left_index + 1..members.len() {
+            visits = visits
+                .checked_add(1)
+                .ok_or(crate::resource::MemoryError::Overflow)?;
+            if contracts_share_retained_token(
+                snapshot.features(),
+                members[left_index],
+                members[right_index],
+            ) {
+                continue;
+            }
+            let left_root = sparse_find(&mut parent, left_index);
+            let right_root = sparse_find(&mut parent, right_index);
+            if left_root != right_root {
+                parent[right_root] = left_root;
+                edges.push(Edge::new(members[left_index], members[right_index]));
+                components -= 1;
+                if components == 1 {
+                    return Ok((visits, edges));
+                }
+            }
+        }
+    }
+    Ok((visits, edges))
+}
+
+fn atom_members_share_common_retained_token(
+    features: &crate::encode::FeatureView,
+    members: &[u32],
+) -> bool {
+    let Some(shortest) = members
+        .iter()
+        .map(|&contract| contract_retained_tokens(features, contract))
+        .min_by_key(|tokens| tokens.len())
+    else {
+        return false;
+    };
+    shortest.iter().any(|token| {
+        members.iter().all(|&contract| {
+            contract_retained_tokens(features, contract)
+                .binary_search(token)
+                .is_ok()
+        })
+    })
+}
+
+fn contract_retained_tokens(features: &crate::encode::FeatureView, contract: u32) -> &[u32] {
+    let begin = features.contract_token_offsets[contract as usize] as usize;
+    let end = features.contract_token_offsets[contract as usize + 1] as usize;
+    &features.contract_tokens[begin..end]
 }
 
 #[derive(Clone, Copy)]
 struct CatalogExecutionConfig {
     lanes: usize,
-    max_pair_visits: u64,
     chain_count: usize,
 }
 
@@ -1095,11 +1132,7 @@ fn score_catalog_parallel(
     collectors: &ScopeCollectorBroker,
     progress: &mut impl FnMut(ProgressEvent),
 ) -> Result<(IndexMetrics, u64), PipelineError> {
-    let CatalogExecutionConfig {
-        lanes,
-        max_pair_visits,
-        chain_count,
-    } = execution;
+    let CatalogExecutionConfig { lanes, chain_count } = execution;
     const EDGE_BATCH: usize = 32_768;
     let routing_total = catalog.jobs.iter().try_fold(0u64, |total, job| {
         let first = job.first_block as usize;
@@ -1175,24 +1208,7 @@ fn score_catalog_parallel(
                                     snapshot,
                                     a,
                                     b,
-                                    |work| {
-                                        try_reserve_pair_visits(
-                                            producer_reserved_pair_visits,
-                                            work,
-                                            max_pair_visits,
-                                        )
-                                        .map_err(
-                                            |requested| {
-                                                PipelineError::from(
-                                                    crate::reduce::ReduceError::Budget {
-                                                        resource: "catalog_candidate_pair_visits",
-                                                        requested,
-                                                        limit: max_pair_visits,
-                                                    },
-                                                )
-                                            },
-                                        )
-                                    },
+                                    |work| record_pair_visits(producer_reserved_pair_visits, work),
                                     |left, right| {
                                         batch.push(Edge::new(left, right));
                                         if batch.len() == EDGE_BATCH {
@@ -1499,19 +1515,9 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
         WorkUnit::Bytes,
         ProgressCounters::default(),
     ));
-    // Catalog blocking memberships deliberately overlap. Their raw contract
-    // product is only a progress upper bound, not executed candidate work.
-    // Admit exact fallback work here and reserve owner-routed catalog work
-    // atomically while it executes below.
-    let base_candidate_pair_visits = planned_fallback_contract_pair_visits(&snapshot)?;
-    if base_candidate_pair_visits > config.max_candidate_pair_visits {
-        return Err(crate::reduce::ReduceError::Budget {
-            resource: "candidate_pair_visits",
-            requested: base_candidate_pair_visits,
-            limit: config.max_candidate_pair_visits,
-        }
-        .into());
-    }
+    // Both fallback atoms and catalog blocks may represent quadratic raw pair
+    // universes while requiring only a bounded connectivity forest. They are
+    // admitted dynamically by executed work below, not by raw Cartesian size.
     // Selected chains are part of the immutable snapshot identity even when a
     // chain has no eligible metadata contract.  Deriving this count from the
     // compact contract table silently drops trailing (or all) empty chains
@@ -1875,16 +1881,6 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
     } else {
         None
     };
-    if let Some(recovered) = &recovered {
-        if recovered.candidate_pair_visits > config.max_candidate_pair_visits {
-            return Err(crate::reduce::ReduceError::Budget {
-                resource: "candidate_pair_visits",
-                requested: recovered.candidate_pair_visits,
-                limit: config.max_candidate_pair_visits,
-            }
-            .into());
-        }
-    }
     let (intra_runs, cross_runs, pair_runs, metrics, candidate_pair_visits, _accepted_edge_count) =
         if let Some(recovered) = recovered {
             progress(ProgressEvent::determinate(
@@ -1954,23 +1950,9 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
                 &snapshot,
                 &rescue_plan,
                 config.threads,
-                config
-                    .max_candidate_pair_visits
-                    .saturating_sub(base_candidate_pair_visits),
                 &mut progress,
             )?;
             let rescue_pair_visits = rescue_execution_plan.total_visits();
-            let admitted_pair_visits = base_candidate_pair_visits
-                .checked_add(rescue_pair_visits)
-                .ok_or(crate::resource::MemoryError::Overflow)?;
-            if admitted_pair_visits > config.max_candidate_pair_visits {
-                return Err(crate::reduce::ReduceError::Budget {
-                    resource: "candidate_and_rescue_pair_visits",
-                    requested: admitted_pair_visits,
-                    limit: config.max_candidate_pair_visits,
-                }
-                .into());
-            }
             let collectors = ScopeCollectorBroker::new(
                 node_count,
                 chain_pair_count,
@@ -1980,15 +1962,18 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
             )?;
             let match_pool = build_metadata_worker_pool(collectors.scorer_lanes())?;
             // A representative fallback atom is chain-local and scoring-equivalent.
-            // Enumerate token-disjoint pairs in bounded deterministic waves: scoring
-            // runs in parallel, while edge admission retains lexicographic task order.
-            append_fallback_atom_edges_parallel(
+            // Build only the token-disjoint connectivity forest needed by reduction;
+            // do not enumerate its raw quadratic pair universe once connected.
+            let fallback_pair_visits = append_fallback_atom_edges_parallel(
                 &snapshot,
                 &match_pool,
                 &collectors,
                 chain_count,
                 &mut progress,
             )?;
+            let admitted_pair_visits = rescue_pair_visits
+                .checked_add(fallback_pair_visits)
+                .ok_or(crate::resource::MemoryError::Overflow)?;
             const CATALOG_LANE_BYTES: u64 = 8 * 1024 * 1024;
             let lanes = memory
                 .active_lanes(collectors.scorer_lanes(), 0, CATALOG_LANE_BYTES)
@@ -1999,13 +1984,7 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
                 &snapshot,
                 &catalog,
                 &recall,
-                CatalogExecutionConfig {
-                    lanes,
-                    max_pair_visits: config
-                        .max_candidate_pair_visits
-                        .saturating_sub(admitted_pair_visits),
-                    chain_count,
-                },
+                CatalogExecutionConfig { lanes, chain_count },
                 &collectors,
                 &mut progress,
             );
@@ -2028,9 +2007,6 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
             let shared_result = append_shared_token_edges(
                 &snapshot,
                 shared_lanes,
-                config
-                    .max_candidate_pair_visits
-                    .saturating_sub(catalog_admitted_pair_visits),
                 &collectors,
                 chain_count,
                 &mut progress,
@@ -2899,16 +2875,6 @@ fn connectivity_plan_digest(rescue: &RescuePlan) -> Result<String, serde_json::E
         .collect())
 }
 
-fn planned_fallback_contract_pair_visits(
-    snapshot: &MetadataSnapshot,
-) -> Result<u64, PipelineError> {
-    let mut total = 0u64;
-    for window in snapshot.features().fallback_atom_offsets.windows(2) {
-        total = checked_add_pairs(total, window[1] - window[0])?;
-    }
-    Ok(total)
-}
-
 fn shared_group_sketches(
     features: &crate::encode::FeatureView,
     sources: &[u32],
@@ -3064,19 +3030,15 @@ fn expand_catalog_atom_pair_with_budget(
     Ok(work)
 }
 
-fn try_reserve_pair_visits(
+fn record_pair_visits(
     reserved: &std::sync::atomic::AtomicU64,
     work: u64,
-    limit: u64,
-) -> Result<(), u64> {
+) -> Result<(), PipelineError> {
     let mut current = reserved.load(std::sync::atomic::Ordering::Acquire);
     loop {
-        let Some(next) = current.checked_add(work) else {
-            return Err(u64::MAX);
-        };
-        if next > limit {
-            return Err(next);
-        }
+        let next = current
+            .checked_add(work)
+            .ok_or(crate::resource::MemoryError::Overflow)?;
         match reserved.compare_exchange_weak(
             current,
             next,
@@ -3137,12 +3099,10 @@ fn build_rescue_execution_plan(
     snapshot: &MetadataSnapshot,
     rescue: &RescuePlan,
     lanes: usize,
-    max_pair_visits: u64,
     mut progress: impl FnMut(ProgressEvent),
 ) -> Result<RescueExecutionPlan, PipelineError> {
     let atom_count = snapshot.atom_count() as u32;
     let mut atom_score_visits = 0u64;
-    let mut expansion_visit_upper_bound = 0u64;
     for &left_atom in &rescue.pair_atoms {
         if left_atom >= atom_count {
             return Err(PipelineError::Invariant(format!(
@@ -3157,13 +3117,6 @@ fn build_rescue_execution_plan(
             }
             atom_score_visits = atom_score_visits
                 .checked_add(1)
-                .ok_or(crate::resource::MemoryError::Overflow)?;
-            expansion_visit_upper_bound = expansion_visit_upper_bound
-                .checked_add(
-                    (atom_contracts(snapshot, left_atom).len() as u64)
-                        .checked_mul(atom_contracts(snapshot, right_atom).len() as u64)
-                        .ok_or(crate::resource::MemoryError::Overflow)?,
-                )
                 .ok_or(crate::resource::MemoryError::Overflow)?;
         }
     }
@@ -3198,26 +3151,11 @@ fn build_rescue_execution_plan(
             shared_score_visits = shared_score_visits
                 .checked_add(1)
                 .ok_or(crate::resource::MemoryError::Overflow)?;
-            // Every successful shared score expands to exactly one edge push.
-            expansion_visit_upper_bound = expansion_visit_upper_bound
-                .checked_add(1)
-                .ok_or(crate::resource::MemoryError::Overflow)?;
         }
     }
     let score_visits = atom_score_visits
         .checked_add(shared_score_visits)
         .ok_or(crate::resource::MemoryError::Overflow)?;
-    let worst_case_pair_visits = score_visits
-        .checked_add(expansion_visit_upper_bound)
-        .ok_or(crate::resource::MemoryError::Overflow)?;
-    if worst_case_pair_visits > max_pair_visits {
-        return Err(crate::reduce::ReduceError::Budget {
-            resource: "rescue_worst_case_pair_visits",
-            requested: worst_case_pair_visits,
-            limit: max_pair_visits,
-        }
-        .into());
-    }
     progress(ProgressEvent::determinate(
         ProgressPhase::PlanRescuePairs,
         0,
@@ -3343,17 +3281,6 @@ fn build_rescue_execution_plan(
                         .ok_or(crate::resource::MemoryError::Overflow)?,
                 )
                 .ok_or(crate::resource::MemoryError::Overflow)?;
-        }
-        let actual_expansion_visits = contract_expansion_visits
-            .checked_add(matched_shared_edges.len() as u64)
-            .ok_or(crate::resource::MemoryError::Overflow)?;
-        let total = score_visits
-            .checked_add(actual_expansion_visits)
-            .ok_or(crate::resource::MemoryError::Overflow)?;
-        if total > worst_case_pair_visits {
-            return Err(PipelineError::Invariant(format!(
-                "rescue actual work {total} exceeded pre-admitted upper bound {worst_case_pair_visits}"
-            )));
         }
         Ok(RescueExecutionPlan {
             atom_score_visits,
@@ -3606,41 +3533,28 @@ fn contracts_share_retained_token(
 fn append_shared_token_edges(
     s: &MetadataSnapshot,
     lanes: usize,
-    max_pair_visits: u64,
     collectors: &ScopeCollectorBroker,
     chain_count: usize,
     progress: &mut impl FnMut(ProgressEvent),
 ) -> Result<u64, PipelineError> {
     let f = s.features();
     let token_count = f.token_member_offsets.len().saturating_sub(1);
+    let shared_pair_work_upper_bound = f
+        .token_member_offsets
+        .windows(2)
+        .try_fold(0u64, |total, window| {
+            checked_add_pairs(total, window[1].saturating_sub(window[0]))
+        })?;
     progress(
         ProgressEvent::determinate(
             ProgressPhase::SharedTokenPairs,
             0,
-            max_pair_visits,
+            shared_pair_work_upper_bound,
             WorkUnit::Pairs,
             ProgressCounters::default(),
         )
         .with_plan(WorkClass::SharedScores, TotalKind::UpperBound),
     );
-    let small_group_pair_work =
-        f.token_member_offsets
-            .windows(2)
-            .try_fold(0u64, |total, window| {
-                let members = window[1].saturating_sub(window[0]);
-                if members >= 256 {
-                    return Ok(total);
-                }
-                checked_add_pairs(total, members)
-            })?;
-    if small_group_pair_work > max_pair_visits {
-        return Err(crate::reduce::ReduceError::Budget {
-            resource: "shared_token_candidate_pair_visits",
-            requested: small_group_pair_work,
-            limit: max_pair_visits,
-        }
-        .into());
-    }
     const EDGE_BATCH: usize = 4_096;
     const WORK_BATCH: u64 = 16_384;
     let pool = rayon::ThreadPoolBuilder::new()
@@ -3649,13 +3563,9 @@ fn append_shared_token_edges(
         .build()
         .map_err(|error| PipelineError::Parallel(error.to_string()))?;
     let (sender, receiver) = std::sync::mpsc::sync_channel::<SharedMessage>(lanes.max(1) * 2);
-    let reserved_pair_visits = std::sync::atomic::AtomicU64::new(small_group_pair_work);
-    let overflow_requested = std::sync::atomic::AtomicU64::new(0);
     let cancelled = std::sync::atomic::AtomicBool::new(false);
     std::thread::scope(|scope| -> Result<u64, PipelineError> {
         let worker_sender = sender.clone();
-        let producer_reserved_pair_visits = &reserved_pair_visits;
-        let producer_overflow_requested = &overflow_requested;
         let producer_cancelled = &cancelled;
         let producer = scope.spawn(move || {
             pool.install(|| {
@@ -3685,15 +3595,6 @@ fn append_shared_token_edges(
                                         || producer_cancelled
                                             .load(std::sync::atomic::Ordering::Acquire)
                                     {
-                                        return false;
-                                    }
-                                    if !reserve_shared_pair_visit(
-                                        producer_reserved_pair_visits,
-                                        max_pair_visits,
-                                        producer_overflow_requested,
-                                    ) {
-                                        producer_cancelled
-                                            .store(true, std::sync::atomic::Ordering::Release);
                                         return false;
                                     }
                                     pending_work = pending_work.saturating_add(1);
@@ -3845,13 +3746,15 @@ fn append_shared_token_edges(
                     pairs,
                     groups: finished,
                 } => {
-                    completed = completed.saturating_add(pairs);
+                    completed = completed
+                        .checked_add(pairs)
+                        .ok_or(crate::resource::MemoryError::Overflow)?;
                     groups = groups.saturating_add(finished);
                     progress(
                         ProgressEvent::determinate(
                             ProgressPhase::SharedTokenPairs,
                             completed,
-                            max_pair_visits,
+                            shared_pair_work_upper_bound,
                             WorkUnit::Pairs,
                             ProgressCounters {
                                 groups,
@@ -3873,14 +3776,6 @@ fn append_shared_token_edges(
         producer
             .join()
             .map_err(|_| PipelineError::Parallel("worker panicked".into()))?;
-        let overflow = overflow_requested.load(std::sync::atomic::Ordering::Acquire);
-        if overflow != 0 && collection_error.is_none() {
-            collection_error = Some(PipelineError::from(crate::reduce::ReduceError::Budget {
-                resource: "shared_token_candidate_pair_visits",
-                requested: overflow,
-                limit: max_pair_visits,
-            }));
-        }
         if let Some(error) = collection_error {
             return Err(error);
         }
@@ -3888,7 +3783,7 @@ fn append_shared_token_edges(
             ProgressEvent::determinate(
                 ProgressPhase::SharedTokenPairs,
                 completed,
-                max_pair_visits,
+                shared_pair_work_upper_bound,
                 WorkUnit::Pairs,
                 ProgressCounters {
                     groups,
@@ -3900,38 +3795,6 @@ fn append_shared_token_edges(
         );
         Ok(completed)
     })
-}
-
-fn reserve_shared_pair_visit(
-    reserved: &std::sync::atomic::AtomicU64,
-    limit: u64,
-    overflow_requested: &std::sync::atomic::AtomicU64,
-) -> bool {
-    let mut current = reserved.load(std::sync::atomic::Ordering::Acquire);
-    loop {
-        let Some(next) = current.checked_add(1) else {
-            overflow_requested.store(u64::MAX, std::sync::atomic::Ordering::Release);
-            return false;
-        };
-        if next > limit {
-            let _ = overflow_requested.compare_exchange(
-                0,
-                next,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            );
-            return false;
-        }
-        match reserved.compare_exchange_weak(
-            current,
-            next,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        ) {
-            Ok(_) => return true,
-            Err(observed) => current = observed,
-        }
-    }
 }
 
 fn shared_pair_edge(
@@ -4752,7 +4615,7 @@ mod tests {
             }],
         };
 
-        let plan = build_rescue_execution_plan(&snapshot, &rescue, 1, u64::MAX, |_| {}).unwrap();
+        let plan = build_rescue_execution_plan(&snapshot, &rescue, 1, |_| {}).unwrap();
         assert_eq!(plan.shared_score_visits, 2);
         assert_eq!(plan.total_visits(), 2);
     }
@@ -4826,22 +4689,10 @@ mod tests {
             pair_atoms: vec![0],
             shared_seeds: vec![],
         };
-        let mut rejected_events = Vec::new();
-        let error = build_rescue_execution_plan(&snapshot, &rescue, 1, 3, |event| {
-            rejected_events.push(event)
-        })
-        .unwrap_err();
-        assert!(error.to_string().contains("rescue_worst_case_pair_visits"));
-        assert!(
-            rejected_events.is_empty(),
-            "worst-case expansion must be admitted before score progress starts"
-        );
         let mut events = Vec::new();
 
-        let plan = build_rescue_execution_plan(&snapshot, &rescue, 1, u64::MAX, |event| {
-            events.push(event)
-        })
-        .unwrap();
+        let plan =
+            build_rescue_execution_plan(&snapshot, &rescue, 1, |event| events.push(event)).unwrap();
 
         assert_eq!(plan.atom_score_visits, 2);
         assert_eq!(plan.matched_atom_pairs, vec![(0, 1), (0, 2)]);
