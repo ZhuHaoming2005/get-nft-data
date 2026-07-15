@@ -48,7 +48,8 @@ fn public_controller_runs_all_children_and_resumes_finalized_pipeline() {
         r#"
         COPY (
             SELECT * FROM (VALUES
-                ('ethereum', '0xaaa', '1', 'azuki', 'ipfs://one', 'ipfs://image-one', '{{"description":"shared"}}'),
+                ('ethereum', '0xaaa', '1', 'azuki', 'ipfs://one', 'ipfs://image-one', '{{}}'),
+                ('ethereum', '0xaaa', '2', 'azuki', 'ipfs://one-2', 'ipfs://image-one-2', '{{"description":"shared"}}'),
                 ('ethereum', '0xbbb', '1', 'azukii', 'ipfs://two', 'ipfs://image-two', '{{"description":"shared"}}'),
                 ('base', '0xccc', '1', 'azuki', 'ipfs://one', 'ipfs://image-three', '{{"description":"shared"}}')
             ) rows(chain, contract_address, token_id, name_norm, token_uri_norm, image_uri_norm, metadata_json)
@@ -225,7 +226,7 @@ fn public_controller_runs_all_children_and_resumes_finalized_pipeline() {
             .is_some_and(|path| path.ends_with("summary.manifest.json"))
     }));
     assert_eq!(manifest["inputs"][0]["file_id"], 0);
-    assert_eq!(manifest["inputs"][0]["row_count"], 3);
+    assert_eq!(manifest["inputs"][0]["row_count"], 4);
 
     fs::remove_file(output.join("production-evidence/metadata-v2.json")).unwrap();
     let resumed = Command::new(binary)

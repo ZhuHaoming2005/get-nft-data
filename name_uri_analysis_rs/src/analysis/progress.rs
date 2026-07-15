@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -119,10 +120,10 @@ pub(crate) struct ProgressCounters {
     pub(crate) scored: u64,
     pub(crate) expanded: u64,
     pub(crate) matched: u64,
+    pub(crate) selected: u64,
 }
 
 pub(crate) struct TaskProgressSnapshot<'a> {
-    pub(crate) label: &'a str,
     pub(crate) position: u64,
     pub(crate) total: Option<u64>,
     pub(crate) unit: &'a str,
@@ -156,6 +157,7 @@ pub(crate) enum ProgressTracker {
         task_state: Box<Mutex<Option<TaskProgressState>>>,
         match_started: Instant,
         match_forecast: Option<MatchEtaForecast>,
+        match_eta_enabled: AtomicBool,
     },
     Disabled,
 }
@@ -168,9 +170,18 @@ impl ProgressTracker {
     }
 
     pub(crate) fn set_pipeline_stage(&self, pipeline_stage: PipelineStage) {
-        if let Self::Enabled { pipeline, .. } = self {
+        if let Self::Enabled {
+            pipeline,
+            match_eta_enabled,
+            ..
+        } = self
+        {
             pipeline.set_position(pipeline_stage.position());
             pipeline.set_message(pipeline_stage.label());
+            match_eta_enabled.store(
+                pipeline_stage == PipelineStage::MetadataMatch,
+                Ordering::Relaxed,
+            );
         }
     }
 
@@ -206,6 +217,7 @@ impl ProgressTracker {
             task_state: Box::new(Mutex::new(None)),
             match_started: Instant::now(),
             match_forecast: match_eta_forecast_from_env(),
+            match_eta_enabled: AtomicBool::new(false),
         }
     }
 
@@ -356,7 +368,6 @@ impl ProgressTracker {
         let rate = state.rate.sample(state.position, elapsed);
         metrics.set_message(format_task_progress_message_with_match_forecast(
             &TaskProgressSnapshot {
-                label: &state.label,
                 position: state.position,
                 total: state.total,
                 unit: &state.unit,
@@ -371,7 +382,12 @@ impl ProgressTracker {
     }
 
     pub(crate) fn observe_engine_event(&self, event: metadata_engine::progress::ProgressEvent) {
-        let Self::Enabled { task_state, .. } = self else {
+        let Self::Enabled {
+            task_state,
+            match_eta_enabled,
+            ..
+        } = self
+        else {
             return;
         };
         let label = event.phase.label();
@@ -397,7 +413,7 @@ impl ProgressTracker {
                 label,
                 event.total,
                 unit,
-                true,
+                match_eta_enabled.load(Ordering::Relaxed),
                 event.work_class,
                 event.total_kind,
             );
@@ -410,6 +426,7 @@ impl ProgressTracker {
                 scored: event.counters.scored,
                 expanded: event.counters.expanded,
                 matched: event.counters.matched,
+                selected: event.counters.selected,
             },
         );
     }
@@ -517,27 +534,26 @@ pub(crate) fn format_task_progress_message_with_match_forecast(
     match_forecast: Option<&MatchEtaForecast>,
     match_elapsed: Duration,
 ) -> String {
-    let mut message = snapshot.label.to_string();
     if snapshot.total_kind == metadata_engine::progress::TotalKind::Exact
         && snapshot.total == Some(0)
         && snapshot.position == 0
     {
-        message.push_str(&format!("; skipped (0 {})", snapshot.unit));
-        return message;
+        return format!("skipped (0 {})", snapshot.unit);
     }
-    match snapshot.total {
-        Some(total) => message.push_str(&format!(
-            "; {}/{} {}",
-            snapshot.position, total, snapshot.unit
-        )),
-        None => message.push_str(&format!("; {} {}", snapshot.position, snapshot.unit)),
+    let mut metrics = Vec::new();
+    if snapshot.total.is_none() {
+        metrics.push(format!(
+            "{} {}",
+            format_progress_count(snapshot.position),
+            snapshot.unit
+        ));
     }
     if snapshot.total_kind == metadata_engine::progress::TotalKind::Exact {
         if let Some(total) = snapshot.total {
             if snapshot.position > total {
-                message.push_str(&format!(
-                    "; PLAN OVERRUN +{} {}",
-                    snapshot.position - total,
+                metrics.push(format!(
+                    "PLAN OVERRUN +{} {}",
+                    format_progress_count(snapshot.position - total),
                     snapshot.unit
                 ));
             }
@@ -545,8 +561,12 @@ pub(crate) fn format_task_progress_message_with_match_forecast(
     }
     let rate = snapshot.rate;
     match rate {
-        Some(rate) => message.push_str(&format!("; {rate:.1} {}/s", snapshot.unit)),
-        None => message.push_str(&format!("; n/a {}/s", snapshot.unit)),
+        Some(rate) => metrics.push(format!(
+            "{} {}/s",
+            format_progress_rate(rate),
+            snapshot.unit
+        )),
+        None => metrics.push(format!("n/a {}/s", snapshot.unit)),
     }
     let phase_eta = match (snapshot.total_kind, snapshot.total, rate) {
         (
@@ -560,8 +580,17 @@ pub(crate) fn format_task_progress_message_with_match_forecast(
         }
         _ => None,
     };
-    let eta = phase_eta.map_or_else(|| "n/a".to_string(), format_progress_duration);
-    message.push_str(&format!("; phase ETA {eta}"));
+    let eta = phase_eta.map_or_else(
+        || {
+            if snapshot.total_kind == metadata_engine::progress::TotalKind::Unknown {
+                "n/a (total unknown)".to_string()
+            } else {
+                "n/a".to_string()
+            }
+        },
+        format_progress_duration,
+    );
+    metrics.push(format!("ETA {eta}"));
     if snapshot.show_match_eta {
         match match_forecast {
             Some(MatchEtaForecast {
@@ -572,13 +601,13 @@ pub(crate) fn format_task_progress_message_with_match_forecast(
             }) => {
                 if match_elapsed >= Duration::from_millis(*upper_total_millis) {
                     if let Some(phase_eta) = phase_eta {
-                        message.push_str(&format!(
-                            "; match remaining >= {}; upper n/a (history overrun; n={sample_count})",
+                        metrics.push(format!(
+                            "match remaining >= {}; upper n/a (history overrun; n={sample_count})",
                             format_progress_duration(phase_eta)
                         ));
                     } else {
-                        message.push_str(&format!(
-                            "; match ETA lower n/a; upper n/a (history overrun; n={sample_count})"
+                        metrics.push(format!(
+                            "match ETA lower n/a; upper n/a (history overrun; n={sample_count})"
                         ));
                     }
                 } else {
@@ -589,13 +618,13 @@ pub(crate) fn format_task_progress_message_with_match_forecast(
                     let lower =
                         phase_eta.map_or(historical_lower, |phase| phase.max(historical_lower));
                     if lower > historical_upper {
-                        message.push_str(&format!(
-                            "; match remaining >= {}; upper n/a (phase lower exceeds history; n={sample_count})",
+                        metrics.push(format!(
+                            "match remaining >= {}; upper n/a (phase lower exceeds history; n={sample_count})",
                             format_progress_duration(lower)
                         ));
                     } else {
-                        message.push_str(&format!(
-                            "; match ETA observed {}..{} (n={sample_count})",
+                        metrics.push(format!(
+                            "match ETA observed {}..{} (n={sample_count})",
                             format_progress_duration(lower),
                             format_progress_duration(historical_upper)
                         ));
@@ -604,46 +633,80 @@ pub(crate) fn format_task_progress_message_with_match_forecast(
             }
             Some(forecast) => {
                 if let Some(phase_eta) = phase_eta {
-                    message.push_str(&format!(
-                        "; match remaining >= {}; upper n/a (calibrating {}/8)",
+                    metrics.push(format!(
+                        "match remaining >= {}; upper n/a (calibrating {}/8)",
                         format_progress_duration(phase_eta),
                         forecast.sample_count
                     ));
                 } else {
-                    message.push_str(&format!(
-                        "; match ETA lower n/a; upper n/a (calibrating {}/8)",
+                    metrics.push(format!(
+                        "match ETA lower n/a; upper n/a (calibrating {}/8)",
                         forecast.sample_count
                     ));
                 }
             }
             None => {
                 if let Some(phase_eta) = phase_eta {
-                    message.push_str(&format!(
-                        "; match remaining >= {}; upper n/a (uncalibrated)",
+                    metrics.push(format!(
+                        "match remaining >= {}; upper n/a (uncalibrated)",
                         format_progress_duration(phase_eta)
                     ));
                 } else {
-                    message.push_str("; match ETA n/a (uncalibrated)");
+                    metrics.push("match ETA n/a (uncalibrated)".to_string());
                 }
             }
         }
     }
     if snapshot.counters.groups != 0 {
-        message.push_str(&format!("; groups {}", snapshot.counters.groups));
+        metrics.push(format!(
+            "groups {}",
+            format_progress_count(snapshot.counters.groups)
+        ));
     }
     if snapshot.counters.candidates != 0 {
-        message.push_str(&format!("; candidates {}", snapshot.counters.candidates));
+        metrics.push(format!(
+            "candidates {}",
+            format_progress_count(snapshot.counters.candidates)
+        ));
     }
     if snapshot.counters.scored != 0 {
-        message.push_str(&format!("; scored {}", snapshot.counters.scored));
+        metrics.push(format!(
+            "scored {}",
+            format_progress_count(snapshot.counters.scored)
+        ));
     }
     if snapshot.counters.expanded != 0 {
-        message.push_str(&format!("; expanded {}", snapshot.counters.expanded));
+        metrics.push(format!(
+            "expanded {}",
+            format_progress_count(snapshot.counters.expanded)
+        ));
     }
     if snapshot.counters.matched != 0 {
-        message.push_str(&format!("; matched {}", snapshot.counters.matched));
+        metrics.push(format!(
+            "matched {}",
+            format_progress_count(snapshot.counters.matched)
+        ));
     }
-    message
+    if snapshot.counters.selected != 0 {
+        metrics.push(format!(
+            "selected {} sources",
+            format_progress_count(snapshot.counters.selected)
+        ));
+    }
+    metrics.join(" · ")
+}
+
+fn format_progress_count(count: u64) -> String {
+    indicatif::HumanCount(count).to_string()
+}
+
+fn format_progress_rate(rate: f64) -> String {
+    for (scale, suffix) in [(1_000_000_000.0, "G"), (1_000_000.0, "M"), (1_000.0, "K")] {
+        if rate >= scale {
+            return format!("{:.1}{suffix}", rate / scale);
+        }
+    }
+    format!("{rate:.1}")
 }
 
 fn format_progress_duration(duration: Duration) -> String {
@@ -680,7 +743,7 @@ pub(crate) const fn stage_bar_template() -> &'static str {
 }
 
 pub(crate) const fn task_bar_template() -> &'static str {
-    "    {spinner:.yellow} task [{elapsed_precise}] [{bar:32.yellow/blue}] {pos}/{len} {percent:>3}% {msg}"
+    "    {spinner:.yellow} task [{elapsed_precise}] [{bar:32.yellow/blue}] {human_pos}/{human_len} {percent:>3}% {msg}"
 }
 
 pub(crate) const fn metrics_template() -> &'static str {

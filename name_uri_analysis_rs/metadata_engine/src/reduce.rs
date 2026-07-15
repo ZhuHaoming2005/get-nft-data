@@ -3,6 +3,7 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::path::Path;
+use std::sync::Arc;
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -62,6 +63,12 @@ pub struct ForestRun {
 }
 
 /// Bounded collector that compacts on byte or per-contract degree triggers.
+enum EdgeSortPolicy {
+    Global,
+    Pool(Arc<rayon::ThreadPool>),
+    Serial,
+}
+
 pub struct EdgeCollector {
     node_count: u32,
     budget: EdgeBudget,
@@ -71,6 +78,7 @@ pub struct EdgeCollector {
     touched: Vec<u32>,
     runs: Vec<ForestRun>,
     compacted_bytes: u64,
+    sort_policy: EdgeSortPolicy,
 }
 
 impl EdgeCollector {
@@ -84,7 +92,27 @@ impl EdgeCollector {
             touched: Vec::new(),
             runs: Vec::new(),
             compacted_bytes: 0,
+            sort_policy: EdgeSortPolicy::Global,
         }
+    }
+
+    pub(crate) fn new_with_pool(
+        node_count: u32,
+        budget: EdgeBudget,
+        degree_trigger: u32,
+        worker_pool: Arc<rayon::ThreadPool>,
+    ) -> Self {
+        let mut collector = Self::new(node_count, budget, degree_trigger);
+        collector.sort_policy = EdgeSortPolicy::Pool(worker_pool);
+        collector
+    }
+
+    pub(crate) fn use_serial_sort(&mut self) {
+        self.sort_policy = EdgeSortPolicy::Serial;
+    }
+
+    pub(crate) fn use_worker_pool(&mut self, worker_pool: Arc<rayon::ThreadPool>) {
+        self.sort_policy = EdgeSortPolicy::Pool(worker_pool);
     }
     pub fn push(&mut self, edge: Edge) -> Result<(), ReduceError> {
         let next_bytes = (self.buffer.len().saturating_add(1) * std::mem::size_of::<Edge>()) as u64;
@@ -133,15 +161,19 @@ impl EdgeCollector {
             return Ok(());
         }
         let edges = std::mem::take(&mut self.buffer);
-        let run = ForestRun::from_edges(
-            self.node_count,
-            edges,
-            EdgeBudget {
-                max_buffer_bytes: self.budget.max_buffer_bytes,
-                max_run_edges: self.budget.max_run_edges,
-                max_total_bytes: u64::MAX,
-            },
-        )?;
+        let budget = EdgeBudget {
+            max_buffer_bytes: self.budget.max_buffer_bytes,
+            max_run_edges: self.budget.max_run_edges,
+            max_total_bytes: u64::MAX,
+        };
+        let node_count = self.node_count;
+        let run = match &self.sort_policy {
+            EdgeSortPolicy::Global => ForestRun::from_edges(node_count, edges, budget),
+            EdgeSortPolicy::Pool(pool) => {
+                pool.install(move || ForestRun::from_edges(node_count, edges, budget))
+            }
+            EdgeSortPolicy::Serial => ForestRun::from_edges_serial(node_count, edges, budget),
+        }?;
         let bytes = (run.edges.len() * std::mem::size_of::<Edge>()) as u64;
         self.compacted_bytes = self.compacted_bytes.saturating_add(bytes);
         self.runs.push(run);
@@ -160,15 +192,19 @@ impl EdgeCollector {
             .drain(..)
             .flat_map(|run| run.edges)
             .collect::<Vec<_>>();
-        let merged = ForestRun::from_edges(
-            self.node_count,
-            retained,
-            EdgeBudget {
-                max_buffer_bytes: u64::MAX,
-                max_run_edges: u64::MAX,
-                max_total_bytes: self.budget.max_total_bytes,
-            },
-        )?;
+        let budget = EdgeBudget {
+            max_buffer_bytes: u64::MAX,
+            max_run_edges: u64::MAX,
+            max_total_bytes: self.budget.max_total_bytes,
+        };
+        let node_count = self.node_count;
+        let merged = match &self.sort_policy {
+            EdgeSortPolicy::Global => ForestRun::from_edges(node_count, retained, budget),
+            EdgeSortPolicy::Pool(pool) => {
+                pool.install(move || ForestRun::from_edges(node_count, retained, budget))
+            }
+            EdgeSortPolicy::Serial => ForestRun::from_edges_serial(node_count, retained, budget),
+        }?;
         self.compacted_bytes = (merged.edges.len() * std::mem::size_of::<Edge>()) as u64;
         self.runs.push(merged);
         Ok(())
@@ -181,13 +217,30 @@ impl ForestRun {
         edges: impl IntoIterator<Item = Edge>,
         budget: EdgeBudget,
     ) -> Result<Self, ReduceError> {
+        Self::from_edges_with_sort(node_count, edges, budget, true)
+    }
+
+    pub(crate) fn from_edges_serial(
+        node_count: u32,
+        edges: impl IntoIterator<Item = Edge>,
+        budget: EdgeBudget,
+    ) -> Result<Self, ReduceError> {
+        Self::from_edges_with_sort(node_count, edges, budget, false)
+    }
+
+    fn from_edges_with_sort(
+        node_count: u32,
+        edges: impl IntoIterator<Item = Edge>,
+        budget: EdgeBudget,
+        parallel_sort: bool,
+    ) -> Result<Self, ReduceError> {
         let mut edges = edges
             .into_iter()
             .filter(|e| e.left != e.right)
             .collect::<Vec<_>>();
         let bytes = (edges.len() * std::mem::size_of::<Edge>()) as u64;
         check("buffer_bytes", bytes, budget.max_buffer_bytes)?;
-        if edges.len() >= 16_384 {
+        if parallel_sort && edges.len() >= 16_384 {
             edges.par_sort_unstable();
         } else {
             edges.sort_unstable();

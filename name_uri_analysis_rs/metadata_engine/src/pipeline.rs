@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
 
@@ -276,12 +277,15 @@ impl ScopeEdgeCollectors {
         chain_pair_count: usize,
         budget: EdgeBudget,
         max_retained_bytes: u64,
+        worker_pool: Arc<rayon::ThreadPool>,
     ) -> Self {
         Self {
-            intra: EdgeCollector::new(node_count, budget, 1_048_576),
-            cross: EdgeCollector::new(node_count, budget, 1_048_576),
+            intra: EdgeCollector::new_with_pool(node_count, budget, 1_048_576, worker_pool.clone()),
+            cross: EdgeCollector::new_with_pool(node_count, budget, 1_048_576, worker_pool.clone()),
             chain_pairs: (0..chain_pair_count)
-                .map(|_| EdgeCollector::new(node_count, budget, 1_048_576))
+                .map(|_| {
+                    EdgeCollector::new_with_pool(node_count, budget, 1_048_576, worker_pool.clone())
+                })
                 .collect(),
             max_retained_bytes,
             accepted_edges: 0,
@@ -358,6 +362,22 @@ impl ScopeEdgeCollectors {
                     .map(EdgeCollector::retained_bytes)
                     .sum::<u64>(),
             )
+    }
+
+    fn use_serial_compaction(&mut self) {
+        self.intra.use_serial_sort();
+        self.cross.use_serial_sort();
+        for collector in &mut self.chain_pairs {
+            collector.use_serial_sort();
+        }
+    }
+
+    fn use_worker_pool(&mut self, worker_pool: Arc<rayon::ThreadPool>) {
+        self.intra.use_worker_pool(worker_pool.clone());
+        self.cross.use_worker_pool(worker_pool.clone());
+        for collector in &mut self.chain_pairs {
+            collector.use_worker_pool(worker_pool.clone());
+        }
     }
 
     fn finish_with_progress(
@@ -478,6 +498,15 @@ pub enum PipelineError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Storage(#[from] crate::storage::StorageLedgerError),
+}
+
+fn build_metadata_worker_pool(threads: usize) -> Result<Arc<rayon::ThreadPool>, PipelineError> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads.max(1))
+        .thread_name(|index| format!("metadata-worker-{index}"))
+        .build()
+        .map(Arc::new)
+        .map_err(|error| PipelineError::Parallel(error.to_string()))
 }
 
 enum CatalogMessage {
@@ -658,7 +687,7 @@ fn compact_scope_edge_iter_with_scratch(
     scratch: &mut ScopeCompactionScratch,
 ) -> Vec<Edge> {
     scratch.begin_scope(candidate_count);
-    let mut forest = Vec::with_capacity(candidate_count.min(scratch.parent.len()));
+    let mut forest = Vec::with_capacity(candidate_count);
     for edge in edges {
         let left = scratch.identity(edge.left);
         let right = scratch.identity(edge.right);
@@ -689,6 +718,135 @@ fn sparse_find(parent: &mut [usize], node: usize) -> usize {
 enum SharedMessage {
     Edges(Vec<Edge>),
     Work { pairs: u64, groups: u64 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FallbackPairTask {
+    atom: usize,
+    left: usize,
+    right_begin: usize,
+    right_end: usize,
+}
+
+#[derive(Default)]
+struct FallbackPairCursor {
+    atom: usize,
+    left: usize,
+    right: usize,
+}
+
+fn next_fallback_pair_task(
+    cursor: &mut FallbackPairCursor,
+    atom_count: usize,
+    max_pairs: usize,
+    mut member_count: impl FnMut(usize) -> usize,
+) -> Option<FallbackPairTask> {
+    let max_pairs = max_pairs.max(1);
+    while cursor.atom < atom_count {
+        let members = member_count(cursor.atom);
+        if cursor.left.saturating_add(1) >= members {
+            cursor.atom += 1;
+            cursor.left = 0;
+            cursor.right = 0;
+            continue;
+        }
+        let right_begin = cursor.right.max(cursor.left + 1);
+        let right_end = right_begin.saturating_add(max_pairs).min(members);
+        let task = FallbackPairTask {
+            atom: cursor.atom,
+            left: cursor.left,
+            right_begin,
+            right_end,
+        };
+        if right_end == members {
+            cursor.left += 1;
+            cursor.right = cursor.left.saturating_add(1);
+        } else {
+            cursor.right = right_end;
+        }
+        return Some(task);
+    }
+    None
+}
+
+fn append_fallback_atom_edges_parallel(
+    snapshot: &MetadataSnapshot,
+    worker_pool: &rayon::ThreadPool,
+    collectors: &mut ScopeEdgeCollectors,
+    chain_count: usize,
+    progress: &mut impl FnMut(ProgressEvent),
+) -> Result<u64, PipelineError> {
+    const PAIRS_PER_TASK: usize = 16_384;
+    let offsets = &snapshot.features().fallback_atom_offsets;
+    let atom_count = offsets.len().saturating_sub(1);
+    let total = offsets.windows(2).try_fold(0u64, |total, window| {
+        checked_add_pairs(total, window[1] - window[0])
+    })?;
+    progress(ProgressEvent::determinate(
+        ProgressPhase::FallbackPairs,
+        0,
+        total,
+        WorkUnit::Pairs,
+        ProgressCounters::default(),
+    ));
+
+    let wave_width = worker_pool.current_num_threads().max(1).saturating_mul(2);
+    let mut cursor = FallbackPairCursor::default();
+    let mut completed = 0u64;
+    loop {
+        let mut tasks = Vec::with_capacity(wave_width);
+        while tasks.len() < wave_width {
+            let Some(task) =
+                next_fallback_pair_task(&mut cursor, atom_count, PAIRS_PER_TASK, |atom| {
+                    (offsets[atom + 1] - offsets[atom]) as usize
+                })
+            else {
+                break;
+            };
+            tasks.push(task);
+        }
+        if tasks.is_empty() {
+            break;
+        }
+        let batches = worker_pool.install(|| {
+            tasks
+                .par_iter()
+                .map(|task| {
+                    let members = atom_contracts(snapshot, task.atom as u32);
+                    let left = members[task.left];
+                    let mut edges = Vec::new();
+                    for &right in &members[task.right_begin..task.right_end] {
+                        if !contracts_share_retained_token(snapshot.features(), left, right) {
+                            edges.push(Edge::new(left, right));
+                        }
+                    }
+                    (task.right_end - task.right_begin, edges)
+                })
+                .collect::<Vec<_>>()
+        });
+        for (work, edges) in batches {
+            completed = completed.saturating_add(work as u64);
+            for edge in edges {
+                collectors.push(snapshot.features(), chain_count, edge)?;
+            }
+        }
+        progress(ProgressEvent::determinate(
+            ProgressPhase::FallbackPairs,
+            completed.min(total),
+            total,
+            WorkUnit::Pairs,
+            ProgressCounters {
+                matched: collectors.accepted_edges,
+                ..ProgressCounters::default()
+            },
+        ));
+    }
+    if completed != total {
+        return Err(PipelineError::Invariant(format!(
+            "fallback pair progress mismatch: completed={completed}, planned={total}"
+        )));
+    }
+    Ok(completed)
 }
 
 fn score_catalog_parallel(
@@ -978,6 +1136,7 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
     mut progress: impl FnMut(ProgressEvent),
 ) -> Result<MetadataPipelineResult, PipelineError> {
     let started = Instant::now();
+    let worker_pool = build_metadata_worker_pool(config.threads)?;
     let snapshot_verification_bytes = MetadataSnapshot::verification_bytes(features, blocking)?;
     let memory = MemoryBroker::new(config.host_total_memory, config.memory_hard_top)?;
     // verification_bytes covers every file that remains mmap-backed by the
@@ -1491,91 +1650,34 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
                 }
                 .into());
             }
-            let mut collectors =
-                ScopeEdgeCollectors::new(node_count, chain_pair_count, budget, edge_bytes);
+            let mut collectors = ScopeEdgeCollectors::new(
+                node_count,
+                chain_pair_count,
+                budget,
+                edge_bytes,
+                worker_pool.clone(),
+            );
             // A representative fallback atom is chain-local and scoring-equivalent.
-            // Enumerate its token-disjoint member pairs; EdgeCollector later reduces
-            // these exact-success edges to a bounded connectivity forest.
-            let fallback_pair_work = snapshot
-                .features()
-                .fallback_atom_offsets
-                .windows(2)
-                .try_fold(0u64, |total, window| {
-                    checked_add_pairs(total, window[1] - window[0])
-                })?;
-            progress(ProgressEvent::determinate(
-                ProgressPhase::FallbackPairs,
-                0,
-                fallback_pair_work,
-                WorkUnit::Pairs,
-                ProgressCounters::default(),
-            ));
-            let mut fallback_completed = 0u64;
-            let mut fallback_pending = 0u64;
-            for atom in 0..snapshot.atom_count() as u32 {
-                let members = atom_contracts(&snapshot, atom);
-                for left in 0..members.len() {
-                    for right in left + 1..members.len() {
-                        fallback_completed = fallback_completed.saturating_add(1);
-                        fallback_pending = fallback_pending.saturating_add(1);
-                        if contracts_share_retained_token(
-                            snapshot.features(),
-                            members[left],
-                            members[right],
-                        ) {
-                            if fallback_pending >= 65_536 {
-                                progress(ProgressEvent::determinate(
-                                    ProgressPhase::FallbackPairs,
-                                    fallback_completed,
-                                    fallback_pair_work,
-                                    WorkUnit::Pairs,
-                                    ProgressCounters {
-                                        matched: collectors.accepted_edges,
-                                        ..ProgressCounters::default()
-                                    },
-                                ));
-                                fallback_pending = 0;
-                            }
-                            continue;
-                        }
-                        collectors.push(
-                            snapshot.features(),
-                            chain_count,
-                            Edge::new(members[left], members[right]),
-                        )?;
-                        if fallback_pending >= 65_536 {
-                            progress(ProgressEvent::determinate(
-                                ProgressPhase::FallbackPairs,
-                                fallback_completed,
-                                fallback_pair_work,
-                                WorkUnit::Pairs,
-                                ProgressCounters {
-                                    matched: collectors.accepted_edges,
-                                    ..ProgressCounters::default()
-                                },
-                            ));
-                            fallback_pending = 0;
-                        }
-                    }
-                }
-            }
-            progress(ProgressEvent::determinate(
-                ProgressPhase::FallbackPairs,
-                fallback_completed.min(fallback_pair_work),
-                fallback_pair_work,
-                WorkUnit::Pairs,
-                ProgressCounters {
-                    matched: collectors.accepted_edges,
-                    ..ProgressCounters::default()
-                },
-            ));
+            // Enumerate token-disjoint pairs in bounded deterministic waves: scoring
+            // runs in parallel, while edge admission retains lexicographic task order.
+            append_fallback_atom_edges_parallel(
+                &snapshot,
+                &worker_pool,
+                &mut collectors,
+                chain_count,
+                &mut progress,
+            )?;
             const CATALOG_LANE_BYTES: u64 = 8 * 1024 * 1024;
             let lanes = memory
                 .active_lanes(config.threads.max(1), 0, CATALOG_LANE_BYTES)
                 .max(1);
             let _scorer_memory =
                 memory.reserve((lanes as u64).saturating_mul(CATALOG_LANE_BYTES))?;
-            let metrics: SerializableIndexMetrics = score_catalog_parallel(
+            // The catalog producer owns its configured Rayon lanes. Keep
+            // receiver-side forest compaction serial so a flush cannot activate
+            // the general worker pool concurrently and exceed --threads.
+            collectors.use_serial_compaction();
+            let catalog_result = score_catalog_parallel(
                 &snapshot,
                 &catalog,
                 &recall,
@@ -1583,8 +1685,9 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
                 &mut collectors,
                 chain_count,
                 &mut progress,
-            )?
-            .into();
+            );
+            collectors.use_worker_pool(worker_pool.clone());
+            let metrics: SerializableIndexMetrics = catalog_result?.into();
             drop(_scorer_memory);
             // Large shared-token scopes use group-local BaseEquivalent routing
             // while remaining source-context isolated.
@@ -1596,7 +1699,8 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
                 .max(1);
             let _shared_index_mem =
                 memory.reserve((shared_lanes as u64).saturating_mul(shared_lane_bytes))?;
-            let shared_pair_visits = append_shared_token_edges(
+            collectors.use_serial_compaction();
+            let shared_result = append_shared_token_edges(
                 &snapshot,
                 shared_lanes,
                 config
@@ -1605,7 +1709,9 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
                 &mut collectors,
                 chain_count,
                 &mut progress,
-            )?;
+            );
+            collectors.use_worker_pool(worker_pool.clone());
+            let shared_pair_visits = shared_result?;
             let candidate_pair_visits = admitted_pair_visits
                 .checked_add(shared_pair_visits)
                 .ok_or(crate::resource::MemoryError::Overflow)?;
@@ -1740,34 +1846,13 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
         WorkUnit::Items,
         ProgressCounters::default(),
     ));
-    let mut reduced_work = 0u64;
-    for scope in &mut scopes {
-        if scope.roots.is_none() {
-            let scope_work = reduce_work(&scope.runs, node_count)?;
-            let scope_base = reduced_work;
-            let roots =
-                reduce_components_with_progress(&scope.runs, node_count, |completed, _| {
-                    progress(ProgressEvent::determinate(
-                        ProgressPhase::ReduceScopes,
-                        scope_base.saturating_add(completed),
-                        reduce_total,
-                        WorkUnit::Items,
-                        ProgressCounters::default(),
-                    ));
-                })?;
-            scope.roots = Some(roots);
-            reduced_work = reduced_work
-                .checked_add(scope_work)
-                .ok_or(crate::resource::MemoryError::Overflow)?;
-            progress(ProgressEvent::determinate(
-                ProgressPhase::ReduceScopes,
-                reduced_work,
-                reduce_total,
-                WorkUnit::Items,
-                ProgressCounters::default(),
-            ));
-        }
-    }
+    reduce_component_scopes_parallel(
+        &mut scopes,
+        node_count,
+        reduce_total,
+        &worker_pool,
+        &mut progress,
+    )?;
     let recovery_total = scopes.len() as u64;
     let finalize_phase = if persistence == MatchPersistence::Durable {
         ProgressPhase::BuildRecoveryChain
@@ -1859,8 +1944,13 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
             .ok_or_else(|| PipelineError::Invariant("missing cross component scope".into()))?,
         chain_pair_roots,
     };
-    let summary_rows =
-        build_summary_rows_with_progress(&snapshot, &scope_components, chain_count, &mut progress);
+    let summary_rows = build_summary_rows_with_progress(
+        &snapshot,
+        &scope_components,
+        chain_count,
+        &worker_pool,
+        &mut progress,
+    );
     let result = MetadataPipelineResult {
         schema_revision: crate::scoring::MATCH_SEMANTICS_REVISION,
         snapshot_fingerprint: catalog.snapshot_fingerprint.clone(),
@@ -2255,6 +2345,66 @@ fn run_edge_count(runs: &[ForestRun]) -> usize {
 fn reduce_work(runs: &[ForestRun], node_count: u32) -> Result<u64, PipelineError> {
     crate::reduce::planned_reduce_work(run_edge_count(runs) as u64, node_count)
         .map_err(PipelineError::from)
+}
+
+fn reduce_component_scopes_parallel(
+    scopes: &mut [ComponentScopePlan],
+    node_count: u32,
+    reduce_total: u64,
+    worker_pool: &rayon::ThreadPool,
+    progress: &mut impl FnMut(ProgressEvent),
+) -> Result<(), PipelineError> {
+    let channel_capacity = worker_pool.current_num_threads().max(1).saturating_mul(2);
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<u64>(channel_capacity);
+    std::thread::scope(|thread_scope| -> Result<(), PipelineError> {
+        let producer_sender = sender.clone();
+        let producer = thread_scope.spawn(move || {
+            worker_pool.install(|| {
+                scopes
+                    .par_iter_mut()
+                    .filter(|scope| scope.roots.is_none())
+                    .try_for_each(|scope| -> Result<(), PipelineError> {
+                        let mut previous = 0u64;
+                        let roots = reduce_components_with_progress(
+                            &scope.runs,
+                            node_count,
+                            |completed, _| {
+                                let delta = completed.saturating_sub(previous);
+                                previous = completed;
+                                if delta != 0 {
+                                    let _ = producer_sender.send(delta);
+                                }
+                            },
+                        )?;
+                        scope.roots = Some(roots);
+                        Ok(())
+                    })
+            })
+        });
+        drop(sender);
+        let mut reduced_work = 0u64;
+        for delta in receiver {
+            reduced_work = reduced_work
+                .checked_add(delta)
+                .ok_or(crate::resource::MemoryError::Overflow)?;
+            progress(ProgressEvent::determinate(
+                ProgressPhase::ReduceScopes,
+                reduced_work.min(reduce_total),
+                reduce_total,
+                WorkUnit::Items,
+                ProgressCounters::default(),
+            ));
+        }
+        producer
+            .join()
+            .map_err(|_| PipelineError::Parallel("component worker panicked".into()))??;
+        if reduced_work != reduce_total {
+            return Err(PipelineError::Invariant(format!(
+                "component reduction progress mismatch: completed={reduced_work}, planned={reduce_total}"
+            )));
+        }
+        Ok(())
+    })
 }
 
 fn commit_runs(
@@ -3206,6 +3356,7 @@ fn build_summary_rows_with_progress(
     snapshot: &MetadataSnapshot,
     scopes: &ScopeComponents,
     chain_count: usize,
+    worker_pool: &rayon::ThreadPool,
     progress: &mut impl FnMut(ProgressEvent),
 ) -> Vec<MetadataSummaryRow> {
     let mut rows = Vec::new();
@@ -3244,8 +3395,9 @@ fn build_summary_rows_with_progress(
         WorkUnit::Nodes,
         ProgressCounters::default(),
     ));
-    let cross_stats =
-        (chain_count > 1).then(|| cross_summary_stats(snapshot, &scopes.cross_roots, chain_count));
+    let cross_stats = (chain_count > 1).then(|| {
+        worker_pool.install(|| cross_summary_stats(snapshot, &scopes.cross_roots, chain_count))
+    });
     let mut cross_work_reported = false;
     macro_rules! append {
         ($scope:expr, $primary:expr, $secondary:expr, $roots:expr, $require_secondary:expr, $contract_ids:expr $(,)?) => {{
@@ -3493,6 +3645,91 @@ mod tests {
     use crate::evidence::SharedRescueSeed;
     use crate::format::commit_ready;
 
+    #[test]
+    fn configured_worker_pool_uses_requested_thread_count() {
+        let pool = build_metadata_worker_pool(2).unwrap();
+        assert_eq!(pool.install(rayon::current_num_threads), 2);
+    }
+
+    #[test]
+    fn fallback_pair_tasks_cover_each_pair_once_in_stable_order() {
+        let member_counts = [0usize, 1, 4, 3];
+        let mut cursor = FallbackPairCursor::default();
+        let mut pairs = Vec::new();
+        while let Some(task) =
+            next_fallback_pair_task(&mut cursor, member_counts.len(), 2, |atom| {
+                member_counts[atom]
+            })
+        {
+            for right in task.right_begin..task.right_end {
+                pairs.push((task.atom, task.left, right));
+            }
+        }
+        let expected = member_counts
+            .iter()
+            .copied()
+            .enumerate()
+            .flat_map(|(atom, members)| {
+                (0..members)
+                    .flat_map(move |left| (left + 1..members).map(move |right| (atom, left, right)))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(pairs, expected);
+    }
+
+    #[test]
+    fn independent_component_scopes_reduce_in_parallel_with_exact_progress() {
+        let budget = EdgeBudget {
+            max_buffer_bytes: u64::MAX,
+            max_run_edges: u64::MAX,
+            max_total_bytes: u64::MAX,
+        };
+        let first = ForestRun::from_edges(5, [Edge::new(0, 1), Edge::new(1, 2)], budget).unwrap();
+        let second = ForestRun::from_edges(5, [Edge::new(3, 4)], budget).unwrap();
+        let identity = |scope_identity: &str| ComponentSnapshotIdentity {
+            schema_revision: 1,
+            snapshot_fingerprint: "snapshot".into(),
+            connectivity_revision: 1,
+            connectivity_plan_digest: "plan".into(),
+            scope_identity: scope_identity.into(),
+            node_count: 5,
+        };
+        let mut scopes = vec![
+            ComponentScopePlan {
+                kind: ComponentScopeKind::Intra,
+                directory: PathBuf::new(),
+                identity: identity("intra"),
+                runs: vec![first],
+                roots: None,
+                needs_rebuild: true,
+            },
+            ComponentScopePlan {
+                kind: ComponentScopeKind::Cross,
+                directory: PathBuf::new(),
+                identity: identity("cross"),
+                runs: vec![second],
+                roots: None,
+                needs_rebuild: true,
+            },
+        ];
+        let total = scopes
+            .iter()
+            .map(|scope| reduce_work(&scope.runs, 5).unwrap())
+            .sum();
+        let pool = build_metadata_worker_pool(2).unwrap();
+        let mut events = Vec::new();
+
+        reduce_component_scopes_parallel(&mut scopes, 5, total, &pool, &mut |event| {
+            events.push(event)
+        })
+        .unwrap();
+
+        assert_eq!(scopes[0].roots.as_ref().unwrap(), &[0, 0, 0, 3, 4]);
+        assert_eq!(scopes[1].roots.as_ref().unwrap(), &[0, 1, 2, 3, 3]);
+        assert_eq!(events.last().unwrap().completed, total);
+    }
+
     fn canonical_edge_components(node_count: usize, edges: &[Edge]) -> Vec<Vec<u32>> {
         let mut parent = (0..node_count).collect::<Vec<_>>();
         let mut touched = vec![false; node_count];
@@ -3607,6 +3844,18 @@ mod tests {
             canonical_edge_components(6, &compacted),
             canonical_edge_components(6, &expected)
         );
+    }
+
+    #[test]
+    fn iterator_scope_compaction_uses_the_candidate_capacity_hint() {
+        let edges = vec![Edge::new(0, 1); 64];
+        let mut scratch = ScopeCompactionScratch::new(2, usize::MAX);
+
+        let compacted =
+            compact_scope_edge_iter_with_scratch(edges.iter().copied(), edges.len(), &mut scratch);
+
+        assert_eq!(compacted, vec![Edge::new(0, 1)]);
+        assert!(compacted.capacity() >= edges.len());
     }
 
     #[test]

@@ -15,7 +15,6 @@ use duckdb::arrow::array::{
     Array, Int64Array, StringArray, StringViewArray, UInt32Array, UInt64Array,
 };
 use duckdb::arrow::record_batch::RecordBatch;
-use duckdb::types::Value;
 use duckdb::Connection;
 use metadata_engine::blocking::{
     build_base_equivalent_atom_sketches_from_soa_parallel,
@@ -59,6 +58,71 @@ const TOKEN_JSON_ADMISSION_DEN: u64 = 4;
 /// Bound unique-payload parse scratch: parse → intern → drop before the next
 /// batch so arena bodies and ParsedMetadataDocuments never fully coexist.
 const ENCODE_UNIQUE_PARSE_BATCH_LEN: usize = 4_096;
+
+pub(super) fn ordered_group_ranges<K: Copy + Eq>(
+    row_count: usize,
+    mut key_at: impl FnMut(usize) -> K,
+) -> Vec<(K, std::ops::Range<usize>)> {
+    let mut ranges = Vec::new();
+    let mut begin = 0usize;
+    while begin < row_count {
+        let key = key_at(begin);
+        let mut end = begin + 1;
+        while end < row_count && key_at(end) == key {
+            end += 1;
+        }
+        ranges.push((key, begin..end));
+        begin = end;
+    }
+    ranges
+}
+
+pub(super) fn observe_ordered_group<K: Copy + Eq>(
+    group: K,
+    current_group: &mut Option<K>,
+    completed_groups: &mut u64,
+) -> bool {
+    if *current_group == Some(group) {
+        return false;
+    }
+    if current_group.is_some() {
+        *completed_groups = completed_groups.saturating_add(1);
+    }
+    *current_group = Some(group);
+    true
+}
+
+pub(super) fn finish_ordered_group_count<K>(
+    current_group: Option<K>,
+    completed_groups: u64,
+) -> u64 {
+    completed_groups.saturating_add(u64::from(current_group.is_some()))
+}
+
+pub(super) fn first_usable_rows_by_ordered_group<K, F>(
+    ranges: &[(K, std::ops::Range<usize>)],
+    already_selected: Option<K>,
+    is_usable: F,
+) -> Result<Vec<Option<usize>>, AnalysisError>
+where
+    K: Copy + Eq + Send + Sync,
+    F: Fn(usize) -> Result<bool, AnalysisError> + Sync,
+{
+    ranges
+        .par_iter()
+        .map(|(key, range)| {
+            if already_selected == Some(*key) {
+                return Ok(None);
+            }
+            for index in range.clone() {
+                if is_usable(index)? {
+                    return Ok(Some(index));
+                }
+            }
+            Ok(None)
+        })
+        .collect()
+}
 
 #[cfg(test)]
 type FallbackEncodeRow = (u32, String, u32, u64);
@@ -362,23 +426,31 @@ pub(crate) fn run_metadata_encode(
             frozen_resident_bytes,
             planned_feature_persist_growth(&sources, &payloads, &contracts)?,
         )?;
-        let encode_persist_stats = write_encode_artifacts_soa_with_progress(
-            &encode_staging,
-            &sources,
-            &payloads,
-            &contracts,
-            &fallback_atoms,
-            |completed, total| {
-                progress.observe_engine_event(ProgressEvent::determinate(
-                    ProgressPhase::EncodePersist,
-                    completed,
-                    total,
-                    WorkUnit::Bytes,
-                    EngineCounters::default(),
-                ));
-            },
-        )
-        .map_err(encode_err)?;
+        let persist_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(options.threads.max(1))
+            .thread_name(|index| format!("metadata-encode-persist-{index}"))
+            .build()
+            .map_err(|error| AnalysisError::InvalidData(format!("encode persist pool: {error}")))?;
+        let encode_persist_stats = persist_pool
+            .install(|| {
+                write_encode_artifacts_soa_with_progress(
+                    &encode_staging,
+                    &sources,
+                    &payloads,
+                    &contracts,
+                    &fallback_atoms,
+                    |completed, total| {
+                        progress.observe_engine_event(ProgressEvent::determinate(
+                            ProgressPhase::EncodePersist,
+                            completed,
+                            total,
+                            WorkUnit::Bytes,
+                            EngineCounters::default(),
+                        ));
+                    },
+                )
+            })
+            .map_err(encode_err)?;
         resident_admission.commit(frozen_resident_bytes)?;
         let encode_wall_millis = millis_since(encode_started);
         progress.step_stage(format!(
@@ -1065,6 +1137,7 @@ fn stream_encode_inputs_with_admission(
     let token_source_relation = build_retained_token_source_relation(
         conn,
         contract_count,
+        token_rows,
         &arena,
         &parse_pool,
         &mut progress,
@@ -1229,6 +1302,7 @@ fn stream_encode_inputs_with_admission(
         &contracts,
         &payload_feature_identity,
         shard_count,
+        &parse_pool,
         |completed| {
             atoms_completed = completed;
             emit_encode_progress(
@@ -1562,22 +1636,13 @@ fn materialize_global_pending_contracts(
         .collect()
 }
 
-/// Fallback resolution: for every contract whose representative row had no
-/// retained prefilter tokens, stream candidate rows in stable order and keep
-/// only the first JSON that would have prefilter tokens. Candidates are
-/// admitted one-at-a-time before retention; rejected rows are dropped without
-/// Presence-only fallback selection over Arrow batches.
-///
-/// Keeps only a cross-batch contract cursor + selected flag. The first
-/// presence hit inserts JSON into the arena immediately and records a
-/// [`PayloadRef`]; later rows for the same contract are skipped without
-/// copying JSON. Memory is admitted per selected row only.
+/// Stable candidate stream for the bounded fallback-contract filter table.
 pub(super) fn fallback_contract_candidates_sql() -> &'static str {
     "SELECT fallback.contract_index::UINTEGER AS contract_index,
                 rows.metadata_json,
                 rows.source_file::UINTEGER AS source_file,
                 rows.source_row_number::UBIGINT AS source_row_number
-         FROM unnest(?::UINTEGER[]) AS fallback(contract_index)
+         FROM encode_fallback_contracts fallback
          JOIN analysis_contracts contracts
            ON contracts.metadata_contract_index = fallback.contract_index
          JOIN metadata_rows rows ON rows.contract_id = contracts.contract_id
@@ -1588,6 +1653,47 @@ pub(super) fn fallback_contract_candidates_sql() -> &'static str {
                   rows.source_row_number"
 }
 
+struct FallbackContractFilterTable<'connection> {
+    conn: &'connection Connection,
+}
+
+impl<'connection> FallbackContractFilterTable<'connection> {
+    fn create(
+        conn: &'connection Connection,
+        contract_indices: impl IntoIterator<Item = u32>,
+    ) -> Result<Self, AnalysisError> {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS encode_fallback_contracts;
+             CREATE TEMP TABLE encode_fallback_contracts(
+                 contract_index UINTEGER PRIMARY KEY
+             );",
+        )?;
+        let table = Self { conn };
+        {
+            let mut appender = conn.appender("encode_fallback_contracts")?;
+            appender.append_rows(
+                contract_indices
+                    .into_iter()
+                    .map(|contract_index| [contract_index]),
+            )?;
+            appender.flush()?;
+        }
+        Ok(table)
+    }
+}
+
+impl Drop for FallbackContractFilterTable<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .conn
+            .execute_batch("DROP TABLE IF EXISTS encode_fallback_contracts");
+    }
+}
+
+/// For every contract whose representative row had no retained prefilter
+/// tokens, stream candidate rows in stable order and keep only the first JSON
+/// that would have prefilter tokens. The cross-batch cursor skips later rows
+/// after a hit; rejected JSON is never copied into the payload arena.
 #[allow(clippy::too_many_arguments)]
 fn resolve_pending_fallback_contracts(
     conn: &Connection,
@@ -1602,9 +1708,8 @@ fn resolve_pending_fallback_contracts(
     parse_pool: &rayon::ThreadPool,
     progress: &mut impl FnMut(ProgressEvent),
 ) -> Result<u64, AnalysisError> {
-    let mut fallback_ids = pending_fallbacks.keys().copied().collect::<Vec<_>>();
-    fallback_ids.sort_unstable();
-    let fallback_ids = Value::List(fallback_ids.into_iter().map(Value::UInt).collect());
+    let fallback_filter =
+        FallbackContractFilterTable::create(conn, pending_fallbacks.keys().copied())?;
     progress(ProgressEvent::indeterminate(
         ProgressPhase::EncodeFallbackSources,
         0,
@@ -1612,7 +1717,7 @@ fn resolve_pending_fallback_contracts(
         EngineCounters::default(),
     ));
     let mut stmt = conn.prepare(fallback_contract_candidates_sql())?;
-    let batches = stmt.query_arrow([fallback_ids])?;
+    let batches = stmt.query_arrow([])?;
 
     progress(ProgressEvent::indeterminate(
         ProgressPhase::EncodeResolveFallbacks,
@@ -1625,6 +1730,7 @@ fn resolve_pending_fallback_contracts(
     let mut selected: Option<SelectedFallbackRow> = None;
     let mut resolved_count = 0u64;
     let mut scanned = 0u64;
+    let mut progress_reported = 0u64;
 
     for batch in batches {
         let row_count = batch.num_rows();
@@ -1636,36 +1742,37 @@ fn resolve_pending_fallback_contracts(
         let source_files = required_arrow_column::<UInt32Array>(&batch, 2, "source_file")?;
         let source_rows = required_arrow_column::<UInt64Array>(&batch, 3, "source_row_number")?;
 
-        // Presence checks for rows that still need a selection; already-selected
-        // contracts skip JSON access entirely after the cursor advances.
-        let presence = parse_pool.install(|| {
-            (0..row_count)
-                .into_par_iter()
-                .map(|index| {
-                    if contract_indexes.is_null(index)
-                        || json_column.is_null(index)
-                        || source_files.is_null(index)
-                        || source_rows.is_null(index)
-                    {
-                        return Err(AnalysisError::InvalidData(
-                            "metadata fallback row contains NULL".into(),
-                        ));
-                    }
-                    let json = required_arrow_string(json_column, index)?;
-                    Ok(metadata_has_prefilter_tokens(json))
-                })
-                .collect::<Result<Vec<_>, AnalysisError>>()
+        for index in 0..row_count {
+            if contract_indexes.is_null(index)
+                || json_column.is_null(index)
+                || source_files.is_null(index)
+                || source_rows.is_null(index)
+            {
+                return Err(AnalysisError::InvalidData(
+                    "metadata fallback row contains NULL".into(),
+                ));
+            }
+        }
+        let ranges = ordered_group_ranges(row_count, |index| contract_indexes.value(index));
+        let already_selected = selected.as_ref().map(|row| row.contract_index);
+        let selected_indexes = parse_pool.install(|| {
+            first_usable_rows_by_ordered_group(&ranges, already_selected, |index| {
+                Ok(metadata_has_prefilter_tokens(required_arrow_string(
+                    json_column,
+                    index,
+                )?))
+            })
         })?;
 
-        for (index, &has_tokens) in presence.iter().enumerate() {
-            let contract_index = contract_indexes.value(index);
-            scanned = scanned.saturating_add(1);
+        for ((contract_index, range), selected_index) in ranges.iter().zip(selected_indexes) {
+            scanned = scanned.saturating_add(range.len() as u64);
             emit_encode_indeterminate_progress(
                 progress,
                 ProgressPhase::EncodeFallbackSources,
                 scanned,
+                &mut progress_reported,
             );
-            if Some(contract_index) != current_contract {
+            if Some(*contract_index) != current_contract {
                 if let Some(chosen) = selected.take() {
                     columns_resident_bytes = register_resolved_fallback_contract(
                         chosen,
@@ -1679,14 +1786,14 @@ fn resolve_pending_fallback_contracts(
                     )?;
                     resolved_count = resolved_count.saturating_add(1);
                 }
-                current_contract = Some(contract_index);
+                current_contract = Some(*contract_index);
             }
             if selected.is_some() {
                 continue;
             }
-            if !has_tokens {
+            let Some(index) = selected_index else {
                 continue;
-            }
+            };
             let json = required_arrow_string(json_column, index)?;
             let committed = columns_resident_bytes
                 .checked_add(relation_resident_bytes)
@@ -1697,7 +1804,7 @@ fn resolve_pending_fallback_contracts(
             resident_admission.reserve_growth(committed, growth)?;
             let payload_ref = arena.insert(json.as_bytes()).map_err(encode_err)?;
             selected = Some(SelectedFallbackRow {
-                contract_index,
+                contract_index: *contract_index,
                 source_file: source_files.value(index),
                 source_row_number: source_rows.value(index),
                 payload_ref,
@@ -1730,6 +1837,8 @@ fn resolve_pending_fallback_contracts(
         WorkUnit::Items,
         EngineCounters::default(),
     ));
+    drop(stmt);
+    drop(fallback_filter);
     Ok(columns_resident_bytes)
 }
 
@@ -1955,6 +2064,7 @@ pub(super) fn retained_token_candidates_sql() -> &'static str {
 fn build_retained_token_source_relation(
     conn: &Connection,
     contract_count: u32,
+    token_group_total: u64,
     arena: &ShardedPayloadArena,
     parse_pool: &rayon::ThreadPool,
     progress: &mut impl FnMut(ProgressEvent),
@@ -1999,11 +2109,12 @@ fn build_retained_token_source_relation(
     let mut selected = Vec::<SelectedTokenSource>::new();
     let mut current_group = None;
     let mut group_selected = false;
-    let mut scanned = 0u64;
-    progress(ProgressEvent::indeterminate(
+    let mut completed_groups = 0u64;
+    progress(ProgressEvent::determinate(
         ProgressPhase::EncodeTokenSources,
         0,
-        WorkUnit::Items,
+        token_group_total,
+        WorkUnit::TokenGroups,
         EngineCounters::default(),
     ));
     for batch in batches {
@@ -2012,36 +2123,39 @@ fn build_retained_token_source_relation(
         let source_files = required_arrow_column::<UInt32Array>(&batch, 2, "source_file")?;
         let source_rows = required_arrow_column::<UInt64Array>(&batch, 3, "source_row_number")?;
         let json = batch.column(4).as_ref();
-        let usable = parse_pool.install(|| {
-            (0..batch.num_rows())
-                .into_par_iter()
-                .map(|index| {
-                    if contracts.is_null(index)
-                        || tokens.is_null(index)
-                        || source_files.is_null(index)
-                        || source_rows.is_null(index)
-                        || json.is_null(index)
-                    {
-                        return Err(AnalysisError::InvalidData(
-                            "retained-token candidate contains NULL".into(),
-                        ));
-                    }
-                    Ok(metadata_has_prefilter_tokens(required_arrow_string(
-                        json, index,
-                    )?))
-                })
-                .collect::<Result<Vec<_>, AnalysisError>>()
+        for index in 0..batch.num_rows() {
+            if contracts.is_null(index)
+                || tokens.is_null(index)
+                || source_files.is_null(index)
+                || source_rows.is_null(index)
+                || json.is_null(index)
+            {
+                return Err(AnalysisError::InvalidData(
+                    "retained-token candidate contains NULL".into(),
+                ));
+            }
+        }
+        let ranges = ordered_group_ranges(batch.num_rows(), |index| {
+            (contracts.value(index), tokens.value(index))
+        });
+        let already_selected = if group_selected { current_group } else { None };
+        let selected_indexes = parse_pool.install(|| {
+            first_usable_rows_by_ordered_group(&ranges, already_selected, |index| {
+                Ok(metadata_has_prefilter_tokens(required_arrow_string(
+                    json, index,
+                )?))
+            })
         })?;
-        for (index, &is_usable) in usable.iter().enumerate() {
-            let group = (contracts.value(index), tokens.value(index));
-            if current_group != Some(group) {
-                current_group = Some(group);
+        for ((group, _range), selected_index) in ranges.iter().zip(selected_indexes) {
+            if observe_ordered_group(*group, &mut current_group, &mut completed_groups) {
                 group_selected = false;
             }
-            scanned = scanned.saturating_add(1);
-            if group_selected || !is_usable {
+            if group_selected {
                 continue;
             }
+            let Some(index) = selected_index else {
+                continue;
+            };
             let payload_ref = arena
                 .insert(required_arrow_string(json, index)?.as_bytes())
                 .map_err(encode_err)?;
@@ -2056,16 +2170,33 @@ fn build_retained_token_source_relation(
             });
             group_selected = true;
         }
-        progress(ProgressEvent::indeterminate(
+        progress(ProgressEvent::determinate(
             ProgressPhase::EncodeTokenSources,
-            scanned,
-            WorkUnit::Items,
+            completed_groups,
+            token_group_total,
+            WorkUnit::TokenGroups,
             EngineCounters {
-                matched: selected.len() as u64,
+                selected: selected.len() as u64,
                 ..EngineCounters::default()
             },
         ));
     }
+    completed_groups = finish_ordered_group_count(current_group, completed_groups);
+    if completed_groups != token_group_total {
+        return Err(AnalysisError::InvalidData(format!(
+            "retained-token group progress mismatch: completed={completed_groups}, planned={token_group_total}"
+        )));
+    }
+    progress(ProgressEvent::determinate(
+        ProgressPhase::EncodeTokenSources,
+        completed_groups,
+        token_group_total,
+        WorkUnit::TokenGroups,
+        EngineCounters {
+            selected: selected.len() as u64,
+            ..EngineCounters::default()
+        },
+    ));
     for phase in [
         ProgressPhase::EncodePrepareFallbackTokenSources,
         ProgressPhase::EncodeTokenFallbackSources,
@@ -2090,7 +2221,9 @@ fn build_retained_token_source_relation(
         WorkUnit::Items,
         EngineCounters::default(),
     ));
-    source_rows.par_sort_unstable_by_key(|(coordinate, _)| *coordinate);
+    parse_pool.install(|| {
+        source_rows.par_sort_unstable_by_key(|(coordinate, _)| *coordinate);
+    });
     source_rows.dedup_by_key(|(coordinate, _)| *coordinate);
     let source_count = u32::try_from(source_rows.len()).map_err(|_| {
         AnalysisError::InvalidData("token source dictionary exceeds u32 identity space".into())
@@ -2271,14 +2404,16 @@ fn emit_encode_indeterminate_progress(
     progress: &mut impl FnMut(ProgressEvent),
     phase: ProgressPhase,
     completed: u64,
+    reported: &mut u64,
 ) {
-    if completed.is_multiple_of(16_384) {
+    if completed.saturating_sub(*reported) >= 16_384 {
         progress(ProgressEvent::indeterminate(
             phase,
             completed,
             WorkUnit::Items,
             EngineCounters::default(),
         ));
+        *reported = completed;
     }
 }
 
@@ -2286,6 +2421,7 @@ fn build_fallback_atoms_hash_sharded(
     contracts: &EncodeContractSoA,
     payload_feature_identity: &[u32],
     shard_count: usize,
+    pool: &rayon::ThreadPool,
     mut on_progress: impl FnMut(u64),
 ) -> Result<FallbackAtomCsr, AnalysisError> {
     let shard_count = shard_count.next_power_of_two().max(1);
@@ -2293,26 +2429,28 @@ fn build_fallback_atoms_hash_sharded(
     let shards = (0..shard_count)
         .map(|_| Mutex::new(HashMap::<(u32, u32), (u32, Vec<u32>)>::new()))
         .collect::<Vec<_>>();
-    (0..contracts.contract_count())
-        .into_par_iter()
-        .try_for_each(|index| {
-            let payload_id = contracts.payload_ids[index];
-            let feature = *payload_feature_identity
-                .get(payload_id as usize)
-                .ok_or_else(|| {
-                    AnalysisError::InvalidData("atom feature identity out of range".into())
-                })?;
-            let key = (contracts.chain_ids[index], feature);
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            key.hash(&mut hasher);
-            let shard = (hasher.finish() as usize) & shard_mask;
-            let mut map = shards[shard]
-                .lock()
-                .map_err(|_| AnalysisError::InvalidData("atom shard lock poisoned".into()))?;
-            let entry = map.entry(key).or_insert_with(|| (payload_id, Vec::new()));
-            entry.1.push(contracts.contract_ids[index]);
-            Ok::<_, AnalysisError>(())
-        })?;
+    pool.install(|| {
+        (0..contracts.contract_count())
+            .into_par_iter()
+            .try_for_each(|index| {
+                let payload_id = contracts.payload_ids[index];
+                let feature = *payload_feature_identity
+                    .get(payload_id as usize)
+                    .ok_or_else(|| {
+                        AnalysisError::InvalidData("atom feature identity out of range".into())
+                    })?;
+                let key = (contracts.chain_ids[index], feature);
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                key.hash(&mut hasher);
+                let shard = (hasher.finish() as usize) & shard_mask;
+                let mut map = shards[shard]
+                    .lock()
+                    .map_err(|_| AnalysisError::InvalidData("atom shard lock poisoned".into()))?;
+                let entry = map.entry(key).or_insert_with(|| (payload_id, Vec::new()));
+                entry.1.push(contracts.contract_ids[index]);
+                Ok::<_, AnalysisError>(())
+            })
+    })?;
 
     let mut offsets = Vec::new();
     offsets.push(0u64);
@@ -2821,14 +2959,58 @@ mod memory_dedup_tests {
     use super::{
         build_fallback_atoms_hash_sharded, intern_payload_with_parser,
         payload_feature_identity_ids, planned_encoded_contract_growth, planned_token_relation_peak,
-        EncodePayloadRow, EncodeResidentAccounting, EncodeResidentAdmission, PayloadTermInterner,
-        ShardedPayloadTermInterner, TokenSourceInput,
+        EncodePayloadRow, EncodeResidentAccounting, EncodeResidentAdmission,
+        FallbackContractFilterTable, PayloadTermInterner, ShardedPayloadTermInterner,
+        TokenSourceInput,
     };
+    use duckdb::Connection;
     use metadata_engine::encode::{
         parse_metadata_documents, EncodeContractRow, EncodeContractSoA, EncodeSourceRow,
         PayloadArena, PayloadRef, PayloadTermSoA, ShardedPayloadArena,
     };
     use metadata_engine::resource::{MemoryBroker, GIB};
+
+    #[test]
+    fn fallback_contract_filter_table_owns_rows_and_cleans_up_on_drop() {
+        let conn = Connection::open_in_memory().unwrap();
+        {
+            let _table = FallbackContractFilterTable::create(&conn, [7u32, 3u32]).unwrap();
+            let rows: u64 = conn
+                .query_row(
+                    "SELECT count(*) FROM encode_fallback_contracts",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(rows, 2);
+        }
+        let exists: bool = conn
+            .query_row(
+                "SELECT count(*) > 0 FROM duckdb_tables() WHERE table_name = 'encode_fallback_contracts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!exists);
+    }
+
+    #[test]
+    fn fallback_contract_filter_table_propagates_flush_errors_and_cleans_up() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        let result = FallbackContractFilterTable::create(&conn, [7u32, 7u32]);
+
+        assert!(result.is_err());
+        let exists: bool = conn
+            .query_row(
+                "SELECT count(*) > 0 FROM duckdb_tables() WHERE table_name = 'encode_fallback_contracts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!exists);
+    }
+
     #[test]
     fn payload_feature_identity_deduplicates_without_owning_term_vector_keys() {
         let payloads = vec![
@@ -2857,7 +3039,11 @@ mod memory_dedup_tests {
             contracts.push_contract(contract_id, 0, contract_id, 0, 1);
         }
 
-        let atoms = build_fallback_atoms_hash_sharded(&contracts, &[0], 1, |_| {}).unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let atoms = build_fallback_atoms_hash_sharded(&contracts, &[0], 1, &pool, |_| {}).unwrap();
 
         assert_eq!(atoms.atom_count(), 1);
         assert_eq!(atoms.members_of(0), &[0, 1, 2, 3]);

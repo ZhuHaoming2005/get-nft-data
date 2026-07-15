@@ -12,8 +12,10 @@ use metadata_engine::resource::{MemoryBroker, GIB};
 use metadata_engine::storage::StorageBroker;
 
 use super::super::encode::{
-    estimate_encode_storage_bytes, fallback_contract_candidates_sql, open_prepare_for_encode,
-    resolve_fallback_contracts, retained_token_candidates_sql, stream_encode_inputs_with_progress,
+    estimate_encode_storage_bytes, fallback_contract_candidates_sql, finish_ordered_group_count,
+    first_usable_rows_by_ordered_group, observe_ordered_group, open_prepare_for_encode,
+    ordered_group_ranges, resolve_fallback_contracts, retained_token_candidates_sql,
+    stream_encode_inputs_with_progress,
 };
 
 #[test]
@@ -45,6 +47,64 @@ fn fallback_resolution_checks_presence_only_until_its_first_usable_row() {
 }
 
 #[test]
+fn production_group_selector_short_circuits_and_skips_a_selected_cross_batch_group() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let first_keys = [1u32, 1, 1, 2, 2];
+    let first_usable = [false, true, true, true, true];
+    let first_ranges = ordered_group_ranges(first_keys.len(), |index| first_keys[index]);
+    let calls = AtomicUsize::new(0);
+    let selected = first_usable_rows_by_ordered_group(&first_ranges, None, |index| {
+        calls.fetch_add(1, Ordering::Relaxed);
+        Ok(first_usable[index])
+    })
+    .unwrap();
+    assert_eq!(selected, vec![Some(1), Some(3)]);
+    assert_eq!(calls.load(Ordering::Relaxed), 3);
+
+    // The first group continues in the next Arrow batch. Once its source was
+    // selected in the previous batch, none of its JSON rows may be parsed.
+    let next_keys = [2u32, 2, 3, 3];
+    let next_ranges = ordered_group_ranges(next_keys.len(), |index| next_keys[index]);
+    let cross_batch_calls = AtomicUsize::new(0);
+    let selected = first_usable_rows_by_ordered_group(&next_ranges, Some(2), |index| {
+        cross_batch_calls.fetch_add(1, Ordering::Relaxed);
+        if next_keys[index] == 2 {
+            panic!("selected cross-batch group must not inspect JSON");
+        }
+        Ok(index == 3)
+    })
+    .unwrap();
+    assert_eq!(selected, vec![None, Some(3)]);
+    assert_eq!(cross_batch_calls.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn ordered_group_progress_completes_cross_batch_groups_once() {
+    let mut current = None;
+    let mut completed = 0u64;
+
+    for group in [1u32, 1] {
+        observe_ordered_group(group, &mut current, &mut completed);
+    }
+    assert_eq!(completed, 0, "the open tail group is not complete yet");
+
+    for group in [1u32, 2] {
+        observe_ordered_group(group, &mut current, &mut completed);
+    }
+    assert_eq!(
+        completed, 1,
+        "the repeated batch-head group is not recounted"
+    );
+
+    for group in [2u32, 3] {
+        observe_ordered_group(group, &mut current, &mut completed);
+    }
+    assert_eq!(completed, 2);
+    assert_eq!(finish_ordered_group_count(current, completed), 3);
+}
+
+#[test]
 fn retained_token_sources_use_one_streaming_query_without_encode_temp_tables() {
     let sql = retained_token_candidates_sql();
 
@@ -54,12 +114,12 @@ fn retained_token_sources_use_one_streaming_query_without_encode_temp_tables() {
 }
 
 #[test]
-fn fallback_contract_filter_is_a_bound_in_memory_list() {
+fn fallback_contract_filter_uses_the_bounded_appender_table() {
     let sql = fallback_contract_candidates_sql();
 
-    assert!(sql.contains("unnest(?::UINTEGER[])"));
+    assert!(sql.contains("encode_fallback_contracts"));
+    assert!(!sql.contains("unnest(?::UINTEGER[])"));
     assert!(!sql.contains("arrow("));
-    assert!(!sql.to_ascii_uppercase().contains("CREATE TEMP TABLE"));
 }
 
 fn write_tiny_metadata_parquet(path: &Path) {
@@ -443,6 +503,7 @@ fn encode_rejects_underestimated_token_relation_before_loading_it() {
 
 #[test]
 fn encode_stream_reports_frozen_row_totals_and_terminal_completion() {
+    use crate::analysis::{PipelineStage, ProgressTracker};
     use metadata_engine::progress::ProgressPhase;
 
     let dir = tempfile::tempdir().unwrap();
@@ -516,8 +577,26 @@ fn encode_stream_reports_frozen_row_totals_and_terminal_completion() {
         .iter()
         .rfind(|event| event.phase == ProgressPhase::EncodeTokenSources)
         .unwrap();
-    assert_eq!(source_terminal.total, None);
-    assert!(source_terminal.completed > 0);
+    assert_eq!(source_terminal.total, Some(estimate.token_rows));
+    assert_eq!(source_terminal.completed, estimate.token_rows);
+    assert_eq!(source_terminal.unit.label(), "token groups");
+    let rendered = ProgressTracker::for_pipeline_stage(PipelineStage::MetadataEncode, true);
+    rendered.observe_engine_event(*source_terminal);
+    let ProgressTracker::Enabled { metrics, .. } = &rendered else {
+        panic!("progress must be enabled");
+    };
+    assert!(
+        metrics
+            .message()
+            .contains(&format!("selected {} sources", estimate.token_rows)),
+        "{}",
+        metrics.message()
+    );
+    assert!(
+        !metrics.message().contains("matched"),
+        "{}",
+        metrics.message()
+    );
 
     let read_events = events
         .iter()

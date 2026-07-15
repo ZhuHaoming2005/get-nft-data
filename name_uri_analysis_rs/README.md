@@ -85,13 +85,17 @@ subphase、`completed/total`、工作单位和诊断计数，CLI 只负责渲染
 - 精确总量为零的阶段显示 `skipped (0 <unit>)`，不再显示无意义的 `n/a` 速率或历史 ETA；
 - ETA 在至少 1 秒预热和有效增量后，用当前 homogeneous subphase 的 EWMA 速率计算；
 - 切换 subphase 或工作单位时重置估计器，零增量刷新不会改变速率；
-- candidate、scored、matched 等计数仅用于诊断，不影响位置或 ETA；
+- candidate、scored、matched、selected 等计数仅用于诊断，不影响位置或 ETA；
+- retained-token source 分类按精确 `(contract, token)` group 总量推进，即使没有选中 source
+  也计为已完成；跨 Arrow batch 的同一 group 只计一次；
+- task 行使用千位分隔的位置和总量，metrics 行只显示紧凑吞吐、当前 ETA 和语义化诊断计数，
+  不重复任务名与位置；
 - Catalog 使用 `work` 单位并在长 job 内增量上报，Exact 按 frontier/group、Reduce 按 edge/root
   chunk 上报；MemoryFirst 使用 `finalize component groups`，不会显示实际未执行的 connectivity
   commit/recovery 阶段；
 - UI 以 20 Hz 刷新，完成值被钳制到 total，失败不会显示 100%。
 
-因此 `phase ETA` 表示“当前子阶段剩余同类工作”的估计。引擎事件旁会独立显示
+因此 `ETA` 表示“当前子阶段剩余同类工作”的估计。只有 Metadata Match 的引擎事件会独立显示
 `match ETA n/a (uncalibrated)`；在没有同 revision、同规模目标机历史分布前不会把子阶段速率外推成
 整段 Match 的伪精确 ETA。当前 Match controller revision 为 13，旧持久化路径的历史样本不会污染
 新的 MemoryFirst ETA。

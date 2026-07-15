@@ -109,6 +109,7 @@ impl ProgressPhase {
 pub enum WorkUnit {
     Work,
     Items,
+    TokenGroups,
     Pairs,
     Edges,
     Nodes,
@@ -149,6 +150,7 @@ impl WorkUnit {
         match self {
             Self::Work => "work",
             Self::Items => "items",
+            Self::TokenGroups => "token groups",
             Self::Pairs => "pairs",
             Self::Edges => "edges",
             Self::Nodes => "nodes",
@@ -165,6 +167,7 @@ pub struct ProgressCounters {
     pub expanded: u64,
     pub matched: u64,
     pub groups: u64,
+    pub selected: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

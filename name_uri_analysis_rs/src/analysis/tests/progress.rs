@@ -49,6 +49,7 @@ fn hierarchical_progress_tracks_pipeline_stage_and_task_independently() {
             scored: 40,
             expanded: 80,
             matched: 7,
+            selected: 0,
         },
     );
     assert_eq!(task.length(), Some(100));
@@ -70,6 +71,7 @@ fn progress_layout_keeps_fixed_bars_separate_from_long_metrics() {
     assert!(pipeline_bar_template().contains("{bar:24"));
     assert!(stage_bar_template().contains("{bar:28"));
     assert!(task_bar_template().contains("{bar:32"));
+    assert!(task_bar_template().contains("{human_pos}/{human_len}"));
     assert!(!pipeline_bar_template().contains("wide_bar"));
     assert!(!stage_bar_template().contains("wide_bar"));
     assert!(!task_bar_template().contains("wide_bar"));
@@ -91,7 +93,6 @@ fn hierarchical_progress_can_move_to_finalize_without_recreating_state() {
 #[test]
 fn task_progress_message_uses_stable_units_for_throughput_and_eta() {
     let message = format_task_progress_message(&TaskProgressSnapshot {
-        label: "shared-token memberships",
         position: 25,
         total: Some(100),
         unit: "rows",
@@ -101,6 +102,7 @@ fn task_progress_message_uses_stable_units_for_throughput_and_eta() {
             scored: 40,
             expanded: 80,
             matched: 7,
+            selected: 0,
         },
         rate: Some(12.5),
         show_match_eta: false,
@@ -109,14 +111,13 @@ fn task_progress_message_uses_stable_units_for_throughput_and_eta() {
 
     assert_eq!(
         message,
-        "shared-token memberships; 25/100 rows; 12.5 rows/s; phase ETA 6s; groups 2; candidates 300; scored 40; expanded 80; matched 7"
+        "12.5 rows/s · ETA 6s · groups 2 · candidates 300 · scored 40 · expanded 80 · matched 7"
     );
 }
 
 #[test]
 fn task_progress_message_keeps_unknown_work_indeterminate() {
     let message = format_task_progress_message(&TaskProgressSnapshot {
-        label: "building metadata index",
         position: 9,
         total: None,
         unit: "docs",
@@ -126,17 +127,13 @@ fn task_progress_message_keeps_unknown_work_indeterminate() {
         total_kind: metadata_engine::progress::TotalKind::Unknown,
     });
 
-    assert_eq!(
-        message,
-        "building metadata index; 9 docs; 3.0 docs/s; phase ETA n/a"
-    );
+    assert_eq!(message, "9 docs · 3.0 docs/s · ETA n/a (total unknown)");
 }
 
 #[test]
 fn empty_exact_phase_is_reported_as_skipped_without_rate_or_eta_noise() {
     let message = format_task_progress_message_with_match_forecast(
         &TaskProgressSnapshot {
-            label: "commit connectivity runs",
             position: 0,
             total: Some(0),
             unit: "files",
@@ -154,7 +151,7 @@ fn empty_exact_phase_is_reported_as_skipped_without_rate_or_eta_noise() {
         std::time::Duration::from_secs(4),
     );
 
-    assert_eq!(message, "commit connectivity runs; skipped (0 files)");
+    assert_eq!(message, "skipped (0 files)");
 }
 
 #[test]
@@ -192,7 +189,6 @@ fn task_rate_estimator_uses_recent_work_instead_of_lifetime_average() {
 #[test]
 fn task_progress_message_uses_the_sampled_rate_for_eta() {
     let message = format_task_progress_message(&TaskProgressSnapshot {
-        label: "catalog pairs",
         position: 50,
         total: Some(100),
         unit: "pairs",
@@ -201,16 +197,33 @@ fn task_progress_message_uses_the_sampled_rate_for_eta() {
         show_match_eta: false,
         total_kind: metadata_engine::progress::TotalKind::Exact,
     });
+    assert_eq!(message, "25.0 pairs/s · ETA 2s");
+}
+
+#[test]
+fn task_metrics_use_compact_rates_and_grouped_diagnostic_counts() {
+    let message = format_task_progress_message(&TaskProgressSnapshot {
+        position: 22_097_544,
+        total: Some(44_752_896),
+        unit: "token groups",
+        counters: ProgressCounters {
+            selected: 21_830_112,
+            ..ProgressCounters::default()
+        },
+        rate: Some(308_400.0),
+        show_match_eta: false,
+        total_kind: metadata_engine::progress::TotalKind::Exact,
+    });
+
     assert_eq!(
         message,
-        "catalog pairs; 50/100 pairs; 25.0 pairs/s; phase ETA 2s"
+        "308.4K token groups/s · ETA 1m 14s · selected 21,830,112 sources"
     );
 }
 
 #[test]
 fn task_progress_distinguishes_phase_eta_from_uncalibrated_match_eta() {
     let message = format_task_progress_message(&TaskProgressSnapshot {
-        label: "catalog pairs",
         position: 50,
         total: Some(100),
         unit: "pairs",
@@ -220,7 +233,7 @@ fn task_progress_distinguishes_phase_eta_from_uncalibrated_match_eta() {
         total_kind: metadata_engine::progress::TotalKind::Exact,
     });
 
-    assert!(message.contains("phase ETA 2s"));
+    assert!(message.contains("ETA 2s"));
     assert!(message.contains("match remaining >= 2s"));
     assert!(message.contains("upper n/a (uncalibrated)"));
 }
@@ -228,7 +241,6 @@ fn task_progress_distinguishes_phase_eta_from_uncalibrated_match_eta() {
 #[test]
 fn match_forecast_never_invents_a_bound_for_unknown_phase_work() {
     let message = format_task_progress_message(&TaskProgressSnapshot {
-        label: "shared-token pairs",
         position: 50,
         total: None,
         unit: "pairs",
@@ -238,7 +250,7 @@ fn match_forecast_never_invents_a_bound_for_unknown_phase_work() {
         total_kind: metadata_engine::progress::TotalKind::Unknown,
     });
 
-    assert!(message.contains("phase ETA n/a"));
+    assert!(message.contains("ETA n/a (total unknown)"));
     assert!(message.contains("match ETA n/a (uncalibrated)"));
     assert!(!message.contains("match remaining >="));
 }
@@ -246,7 +258,6 @@ fn match_forecast_never_invents_a_bound_for_unknown_phase_work() {
 #[test]
 fn calibrated_match_forecast_is_an_observed_interval_not_a_claimed_bound() {
     let snapshot = TaskProgressSnapshot {
-        label: "catalog pairs",
         position: 50,
         total: Some(100),
         unit: "pairs",
@@ -268,14 +279,13 @@ fn calibrated_match_forecast_is_an_observed_interval_not_a_claimed_bound() {
         std::time::Duration::from_secs(4),
     );
 
-    assert!(message.contains("phase ETA 2s"));
+    assert!(message.contains("ETA 2s"));
     assert!(message.contains("match ETA observed 6s..16s (n=8)"));
 }
 
 #[test]
 fn warming_match_forecast_keeps_only_the_current_exact_phase_lower_bound() {
     let snapshot = TaskProgressSnapshot {
-        label: "catalog pairs",
         position: 50,
         total: Some(100),
         unit: "pairs",
@@ -304,7 +314,6 @@ fn warming_match_forecast_keeps_only_the_current_exact_phase_lower_bound() {
 #[test]
 fn elapsed_history_overrun_never_turns_a_phase_lower_bound_into_an_upper_bound() {
     let snapshot = TaskProgressSnapshot {
-        label: "catalog pairs",
         position: 50,
         total: Some(100),
         unit: "pairs",
@@ -334,7 +343,6 @@ fn elapsed_history_overrun_never_turns_a_phase_lower_bound_into_an_upper_bound()
 #[test]
 fn phase_lower_over_history_upper_never_fabricates_an_observed_interval() {
     let snapshot = TaskProgressSnapshot {
-        label: "catalog pairs",
         position: 50,
         total: Some(100),
         unit: "pairs",
@@ -419,6 +427,31 @@ fn engine_progress_events_drive_absolute_task_position_and_reset_by_phase() {
     assert_eq!(task.length(), Some(50));
     assert_eq!(task.position(), 5);
     assert!(task.message().contains("catalog pairs"));
+}
+
+#[test]
+fn metadata_encode_engine_events_do_not_show_match_eta() {
+    use metadata_engine::progress::{
+        ProgressCounters as EngineCounters, ProgressEvent, ProgressPhase, WorkUnit,
+    };
+
+    let progress = ProgressTracker::for_pipeline_stage(PipelineStage::MetadataEncode, true);
+    progress.observe_engine_event(ProgressEvent::determinate(
+        ProgressPhase::EncodeTokenSources,
+        1,
+        2,
+        WorkUnit::Items,
+        EngineCounters::default(),
+    ));
+
+    let ProgressTracker::Enabled { metrics, .. } = &progress else {
+        panic!("progress must be enabled");
+    };
+    assert!(
+        !metrics.message().contains("match ETA"),
+        "{}",
+        metrics.message()
+    );
 }
 
 #[test]
