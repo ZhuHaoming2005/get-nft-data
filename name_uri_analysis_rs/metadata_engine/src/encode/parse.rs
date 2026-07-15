@@ -176,6 +176,28 @@ impl<'de> Visitor<'de> for NodeSummaryVisitor {
     }
 }
 
+/// True iff [`parse_metadata_documents`] would produce a non-empty prefilter
+/// token list. Skips content-token extraction and returns as soon as the first
+/// retained prefilter token is found.
+pub fn metadata_has_prefilter_tokens(raw: &str) -> bool {
+    if raw.trim().is_empty() {
+        return false;
+    }
+
+    let parsed = json_nesting_within_limit(raw, MAX_JSON_NESTING)
+        .then(|| serde_json::from_str::<NodeSummary>(raw))
+        .transpose()
+        .ok()
+        .flatten();
+    match parsed {
+        Some(summary) => summary
+            .recursive_prefilter
+            .iter()
+            .any(|part| normalized_has_retained_token(part)),
+        None => normalized_has_retained_token(&normalize_text(raw)),
+    }
+}
+
 /// Parse raw metadata into prefilter and content BM25 token lists.
 ///
 /// Semantics match the legacy `metadata_documents_from_json` + tokenize path.
@@ -333,6 +355,12 @@ fn tokens_from_normalized(document: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     append_tokens_from_normalized(document, &mut tokens);
     tokens
+}
+
+fn normalized_has_retained_token(document: &str) -> bool {
+    TOKEN_RE
+        .find_iter(document)
+        .any(|capture| capture.as_str().len() >= 2)
 }
 
 fn append_tokens_from_normalized(document: &str, out: &mut Vec<String>) {

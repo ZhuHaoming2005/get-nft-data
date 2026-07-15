@@ -1,6 +1,6 @@
 //! Streaming parser differentials against the compatibility oracle.
 
-use metadata_engine::encode::parse_metadata_documents;
+use metadata_engine::encode::{metadata_has_prefilter_tokens, parse_metadata_documents};
 
 mod support;
 use support::parser_oracle::legacy_parse_metadata_documents;
@@ -66,6 +66,18 @@ fn streaming_parser_matches_legacy_documents() {
         assert_eq!(
             streamed.content_tokens, legacy.content_tokens,
             "content mismatch for fixture: {raw}"
+        );
+    }
+}
+
+#[test]
+fn prefilter_presence_matches_full_parse() {
+    for raw in FIXTURES {
+        let streamed = parse_metadata_documents(raw);
+        assert_eq!(
+            metadata_has_prefilter_tokens(raw),
+            !streamed.prefilter_tokens.is_empty(),
+            "prefilter presence mismatch for fixture: {raw}"
         );
     }
 }

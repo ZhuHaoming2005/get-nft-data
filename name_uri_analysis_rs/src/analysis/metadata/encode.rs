@@ -22,9 +22,10 @@ use metadata_engine::blocking::{
     DEFAULT_MAX_ROUTING_BLOCK_MEMBERS,
 };
 use metadata_engine::encode::{
-    parse_metadata_documents, write_encode_artifacts_with_contracts_and_atoms_with_progress,
-    EncodeContractRow, EncodePayloadRow, EncodeSourceRow, ParsedMetadataDocuments,
-    PayloadCasWriter, DEFAULT_MAX_PACK_BYTES, ENCODE_SCHEMA_REVISION,
+    metadata_has_prefilter_tokens, parse_metadata_documents,
+    write_encode_artifacts_with_contracts_and_atoms_with_progress, EncodeContractRow,
+    EncodePayloadRow, EncodeSourceRow, ParsedMetadataDocuments, PayloadCasWriter,
+    DEFAULT_MAX_PACK_BYTES, ENCODE_SCHEMA_REVISION,
 };
 use metadata_engine::format::commit_ready;
 use metadata_engine::progress::{
@@ -49,6 +50,13 @@ const ENCODE_PARSE_BATCHES_PER_LANE: usize = 8;
 const MAX_ENCODE_PARSE_BATCH_ROWS: usize = 4_096;
 const ENCODE_RESIDENT_FIXED_BYTES: u64 = 64 * 1024 * 1024;
 const HASH_BUCKET_OVERHEAD_BYTES: usize = 16;
+/// Safety margin on distinct source JSON bytes for Arc/String overhead vs DuckDB
+/// `metadata_max_json_bytes` (25%).
+const TOKEN_JSON_ADMISSION_NUM: u64 = 5;
+const TOKEN_JSON_ADMISSION_DEN: u64 = 4;
+const COLLECT_TOKEN_SOURCE_STEPS: u64 = 2;
+const RESOLVE_TOKEN_MEMBERSHIP_STEPS: u64 = 2;
+const FALLBACK_TOKEN_SOURCE_STEPS: u64 = 3;
 
 type RepresentativeEncodeRow = (i64, String, String, i64, u32, u64);
 type FallbackEncodeRow = (u32, String, u32, u64);
@@ -618,12 +626,16 @@ impl TokenSourceRelation {
 fn planned_token_relation_peak(
     token_rows: u64,
     representative_rows: u64,
-    token_json_bytes: u64,
+    distinct_token_json_bytes: u64,
 ) -> Result<u64, AnalysisError> {
+    let admitted_json_bytes = distinct_token_json_bytes
+        .checked_mul(TOKEN_JSON_ADMISSION_NUM)
+        .map(|bytes| bytes / TOKEN_JSON_ADMISSION_DEN)
+        .ok_or_else(|| AnalysisError::InvalidData("token-source JSON admission overflow".into()))?;
     token_rows
         .checked_mul(64)
         .and_then(|bytes| representative_rows.checked_mul(8)?.checked_add(bytes))
-        .and_then(|bytes| token_json_bytes.checked_add(bytes))
+        .and_then(|bytes| admitted_json_bytes.checked_add(bytes))
         .and_then(|bytes| bytes.checked_add(64 * 1024 * 1024))
         .ok_or_else(|| AnalysisError::InvalidData("token-source relation estimate overflow".into()))
 }
@@ -818,7 +830,14 @@ fn token_source_relation_dimensions(conn: &Connection) -> Result<(u64, u64), Ana
     }
     conn.query_row(
         "SELECT count(*)::UBIGINT,
-                coalesce(sum(metadata_max_json_bytes), 0)::UBIGINT
+                coalesce((
+                    SELECT sum(source_json_bytes)::UBIGINT
+                    FROM (
+                        SELECT max(metadata_max_json_bytes)::UBIGINT AS source_json_bytes
+                        FROM metadata_contract_token_rows
+                        GROUP BY metadata_source_file, metadata_source_row_number
+                    ) distinct_sources
+                ), 0)::UBIGINT
          FROM metadata_contract_token_rows",
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
@@ -906,7 +925,6 @@ fn stream_encode_inputs_with_admission(
     let token_source_relation = build_retained_token_source_relation(
         conn,
         contract_count,
-        estimate.token_rows,
         &parse_pool,
         &mut progress,
     )?;
@@ -1525,14 +1543,14 @@ fn load_encode_chain_totals(conn: &Connection) -> Result<Vec<EncodeChainTotal>, 
 fn build_retained_token_source_relation(
     conn: &Connection,
     contract_count: u32,
-    expected_rows: u64,
     parse_pool: &rayon::ThreadPool,
     progress: &mut impl FnMut(ProgressEvent),
 ) -> Result<TokenSourceRelation, AnalysisError> {
-    progress(ProgressEvent::indeterminate(
+    progress(ProgressEvent::determinate(
         ProgressPhase::EncodeCollectTokenSources,
         0,
-        WorkUnit::Items,
+        COLLECT_TOKEN_SOURCE_STEPS,
+        WorkUnit::Work,
         EngineCounters::default(),
     ));
     let exists: bool = conn.query_row(
@@ -1541,6 +1559,13 @@ fn build_retained_token_source_relation(
         |row| row.get(0),
     )?;
     if !exists {
+        progress(ProgressEvent::determinate(
+            ProgressPhase::EncodeCollectTokenSources,
+            COLLECT_TOKEN_SOURCE_STEPS,
+            COLLECT_TOKEN_SOURCE_STEPS,
+            WorkUnit::Work,
+            EngineCounters::default(),
+        ));
         return Ok(TokenSourceRelation {
             sources: Vec::new(),
             memberships: Vec::new(),
@@ -1552,29 +1577,45 @@ fn build_retained_token_source_relation(
     conn.execute_batch(
         "DROP TABLE IF EXISTS encode_token_source_candidates;
          DROP TABLE IF EXISTS encode_resolved_token_sources;
+         DROP TABLE IF EXISTS encode_source_keys;
          DROP TABLE IF EXISTS encode_source_catalog;
+         DROP TABLE IF EXISTS encode_fallback_candidates;
          DROP TABLE IF EXISTS encode_fallback_source_catalog;
          DROP TABLE IF EXISTS encode_source_dictionary;
          DROP TABLE IF EXISTS encode_source_usability;
          DROP TABLE IF EXISTS encode_fallback_source_usability;
-         CREATE TEMP TABLE encode_source_catalog AS
+         CREATE TEMP TABLE encode_source_keys AS
          SELECT DISTINCT token_rows.metadata_source_file::UINTEGER AS source_file,
-                         token_rows.metadata_source_row_number::UBIGINT AS source_row_number,
-                         metadata_rows.metadata_json
-         FROM metadata_contract_token_rows token_rows
+                         token_rows.metadata_source_row_number::UBIGINT AS source_row_number
+         FROM metadata_contract_token_rows token_rows;",
+    )?;
+    progress(ProgressEvent::determinate(
+        ProgressPhase::EncodeCollectTokenSources,
+        1,
+        COLLECT_TOKEN_SOURCE_STEPS,
+        WorkUnit::Work,
+        EngineCounters::default(),
+    ));
+    conn.execute_batch(
+        "CREATE TEMP TABLE encode_source_catalog AS
+         SELECT keys.source_file,
+                keys.source_row_number,
+                metadata_rows.metadata_json
+         FROM encode_source_keys keys
          JOIN metadata_rows
-           ON metadata_rows.source_file = token_rows.metadata_source_file
-          AND metadata_rows.source_row_number = token_rows.metadata_source_row_number;
+           ON metadata_rows.source_file = keys.source_file
+          AND metadata_rows.source_row_number = keys.source_row_number;
          CREATE TEMP TABLE encode_source_usability(
              source_file UINTEGER,
              source_row_number UBIGINT,
              usable BOOLEAN
          );",
     )?;
-    progress(ProgressEvent::indeterminate(
+    progress(ProgressEvent::determinate(
         ProgressPhase::EncodeCollectTokenSources,
-        1,
-        WorkUnit::Items,
+        COLLECT_TOKEN_SOURCE_STEPS,
+        COLLECT_TOKEN_SOURCE_STEPS,
+        WorkUnit::Work,
         EngineCounters::default(),
     ));
     classify_source_catalog(
@@ -1586,10 +1627,11 @@ fn build_retained_token_source_relation(
         progress,
     )?;
 
-    progress(ProgressEvent::indeterminate(
+    progress(ProgressEvent::determinate(
         ProgressPhase::EncodeResolveTokenMemberships,
         0,
-        WorkUnit::Items,
+        RESOLVE_TOKEN_MEMBERSHIP_STEPS,
+        WorkUnit::Work,
         EngineCounters::default(),
     ));
     conn.execute_batch(
@@ -1602,31 +1644,43 @@ fn build_retained_token_source_relation(
          FROM metadata_contract_token_rows token_rows
          JOIN encode_source_usability usability
            ON usability.source_file = token_rows.metadata_source_file
-          AND usability.source_row_number = token_rows.metadata_source_row_number;
-         CREATE TEMP TABLE encode_resolved_token_sources AS
+          AND usability.source_row_number = token_rows.metadata_source_row_number;",
+    )?;
+    progress(ProgressEvent::determinate(
+        ProgressPhase::EncodeResolveTokenMemberships,
+        1,
+        RESOLVE_TOKEN_MEMBERSHIP_STEPS,
+        WorkUnit::Work,
+        EngineCounters::default(),
+    ));
+    conn.execute_batch(
+        "CREATE TEMP TABLE encode_resolved_token_sources AS
          SELECT contract_index, token_index, source_file, source_row_number
          FROM encode_token_source_candidates
          WHERE usable;",
     )?;
     progress(ProgressEvent::determinate(
         ProgressPhase::EncodeResolveTokenMemberships,
-        expected_rows,
-        expected_rows,
-        WorkUnit::Items,
+        RESOLVE_TOKEN_MEMBERSHIP_STEPS,
+        RESOLVE_TOKEN_MEMBERSHIP_STEPS,
+        WorkUnit::Work,
         EngineCounters::default(),
     ));
 
-    progress(ProgressEvent::indeterminate(
+    progress(ProgressEvent::determinate(
         ProgressPhase::EncodeTokenFallbackSources,
         0,
-        WorkUnit::Items,
+        FALLBACK_TOKEN_SOURCE_STEPS,
+        WorkUnit::Work,
         EngineCounters::default(),
     ));
     conn.execute_batch(
-        "CREATE TEMP TABLE encode_fallback_source_catalog AS
-         SELECT DISTINCT rows.source_file::UINTEGER AS source_file,
-                         rows.source_row_number::UBIGINT AS source_row_number,
-                         rows.metadata_json
+        "CREATE TEMP TABLE encode_fallback_candidates AS
+         SELECT fallback.contract_index,
+                fallback.token_index,
+                rows.source_file::UINTEGER AS source_file,
+                rows.source_row_number::UBIGINT AS source_row_number,
+                rows.metadata_json
          FROM encode_token_source_candidates fallback
          JOIN analysis_contracts contracts
            ON contracts.metadata_contract_index = fallback.contract_index
@@ -1637,12 +1691,24 @@ fn build_retained_token_source_relation(
           AND rows.token_id = dictionary.token_id
          WHERE NOT fallback.usable
            AND rows.metadata_eligible;
+         CREATE TEMP TABLE encode_fallback_source_catalog AS
+         SELECT DISTINCT candidates.source_file,
+                         candidates.source_row_number,
+                         candidates.metadata_json
+         FROM encode_fallback_candidates candidates;
          CREATE TEMP TABLE encode_fallback_source_usability(
              source_file UINTEGER,
              source_row_number UBIGINT,
              usable BOOLEAN
          );",
     )?;
+    progress(ProgressEvent::determinate(
+        ProgressPhase::EncodeTokenFallbackSources,
+        1,
+        FALLBACK_TOKEN_SOURCE_STEPS,
+        WorkUnit::Work,
+        EngineCounters::default(),
+    ));
     classify_source_catalog(
         conn,
         "encode_fallback_source_catalog",
@@ -1651,49 +1717,64 @@ fn build_retained_token_source_relation(
         parse_pool,
         progress,
     )?;
+    progress(ProgressEvent::determinate(
+        ProgressPhase::EncodeTokenFallbackSources,
+        2,
+        FALLBACK_TOKEN_SOURCE_STEPS,
+        WorkUnit::Work,
+        EngineCounters::default(),
+    ));
     conn.execute_batch(
         "INSERT INTO encode_resolved_token_sources
          SELECT contract_index, token_index, source_file, source_row_number
          FROM (
-             SELECT fallback.contract_index,
-                    fallback.token_index,
-                    rows.source_file,
-                    rows.source_row_number,
+             SELECT candidates.contract_index,
+                    candidates.token_index,
+                    candidates.source_file,
+                    candidates.source_row_number,
                     row_number() OVER (
-                        PARTITION BY fallback.contract_index, fallback.token_index
-                        ORDER BY rows.source_file, rows.source_row_number
+                        PARTITION BY candidates.contract_index, candidates.token_index
+                        ORDER BY candidates.source_file, candidates.source_row_number
                     ) AS source_rank
-             FROM encode_token_source_candidates fallback
-             JOIN analysis_contracts contracts
-               ON contracts.metadata_contract_index = fallback.contract_index
-             JOIN metadata_token_dictionary dictionary
-               ON dictionary.token_index = fallback.token_index
-             JOIN metadata_rows rows
-               ON rows.contract_id = contracts.contract_id
-              AND rows.token_id = dictionary.token_id
+             FROM encode_fallback_candidates candidates
              JOIN encode_fallback_source_usability usability
-               ON usability.source_file = rows.source_file
-              AND usability.source_row_number = rows.source_row_number
-             WHERE NOT fallback.usable
-               AND rows.metadata_eligible
-               AND usability.usable
+               ON usability.source_file = candidates.source_file
+              AND usability.source_row_number = candidates.source_row_number
+             WHERE usability.usable
          ) ranked
          WHERE source_rank = 1;",
     )?;
+    progress(ProgressEvent::determinate(
+        ProgressPhase::EncodeTokenFallbackSources,
+        FALLBACK_TOKEN_SOURCE_STEPS,
+        FALLBACK_TOKEN_SOURCE_STEPS,
+        WorkUnit::Work,
+        EngineCounters::default(),
+    ));
 
     conn.execute_batch(
         "DROP TABLE IF EXISTS encode_source_dictionary;
          CREATE TEMP TABLE encode_source_dictionary AS
          SELECT (row_number() OVER (
-                    ORDER BY source_file, source_row_number
+                    ORDER BY coords.source_file, coords.source_row_number
                 ) - 1)::UINTEGER AS source_id,
-                source_file,
-                source_row_number
+                coords.source_file,
+                coords.source_row_number,
+                json_docs.metadata_json
          FROM (
              SELECT DISTINCT resolved.source_file,
                              resolved.source_row_number
              FROM encode_resolved_token_sources resolved
-         ) sources;",
+         ) coords
+         JOIN (
+             SELECT source_file, source_row_number, metadata_json
+             FROM encode_source_catalog
+             UNION
+             SELECT source_file, source_row_number, metadata_json
+             FROM encode_fallback_source_catalog
+         ) json_docs
+           ON json_docs.source_file = coords.source_file
+          AND json_docs.source_row_number = coords.source_row_number;",
     )?;
     let source_count: u64 = conn.query_row(
         "SELECT count(*)::UBIGINT FROM encode_source_dictionary",
@@ -1729,7 +1810,9 @@ fn build_retained_token_source_relation(
         "DROP TABLE encode_token_source_candidates;
          DROP TABLE encode_resolved_token_sources;
          DROP TABLE encode_source_dictionary;
+         DROP TABLE encode_source_keys;
          DROP TABLE encode_source_catalog;
+         DROP TABLE encode_fallback_candidates;
          DROP TABLE encode_fallback_source_catalog;
          DROP TABLE encode_source_usability;
          DROP TABLE encode_fallback_source_usability;",
@@ -1806,11 +1889,9 @@ fn classify_source_catalog(
                             "token-source catalog contains NULL".into(),
                         ));
                     }
-                    Ok(
-                        !parse_metadata_documents(required_arrow_string(json, index)?)
-                            .prefilter_tokens
-                            .is_empty(),
-                    )
+                    Ok(metadata_has_prefilter_tokens(required_arrow_string(
+                        json, index,
+                    )?))
                 })
                 .collect::<Result<Vec<_>, AnalysisError>>()
         })?;
@@ -1859,11 +1940,8 @@ fn load_token_source_records(
         "SELECT dictionary.source_id,
                 dictionary.source_file,
                 dictionary.source_row_number,
-                rows.metadata_json
+                dictionary.metadata_json
          FROM encode_source_dictionary dictionary
-         JOIN metadata_rows rows
-           ON rows.source_file = dictionary.source_file
-          AND rows.source_row_number = dictionary.source_row_number
          ORDER BY dictionary.source_id",
     )?;
     let batches = statement.query_arrow([])?;
@@ -2488,10 +2566,12 @@ mod memory_dedup_tests {
     #[test]
     fn token_source_relation_admission_includes_json_and_fixed_width_rows() {
         let rows = 10_000u64;
+        let distinct_json = rows * 128;
+        let admitted_json = distinct_json * 5 / 4;
 
         assert_eq!(
-            planned_token_relation_peak(rows, rows, rows * 128).unwrap(),
-            rows * 200 + 64 * 1024 * 1024
+            planned_token_relation_peak(rows, rows, distinct_json).unwrap(),
+            rows * 72 + admitted_json + 64 * 1024 * 1024
         );
     }
 }

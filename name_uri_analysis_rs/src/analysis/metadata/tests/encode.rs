@@ -201,19 +201,25 @@ fn encode_admission_freezes_row_totals_for_progress_before_streaming() {
     assert_eq!(estimate.token_rows, token_rows);
     let token_json_bytes: u64 = conn
         .query_row(
-            "SELECT coalesce(sum(length(metadata_rows.metadata_json)), 0)::UBIGINT
-             FROM metadata_contract_token_rows token_rows
-             JOIN metadata_rows
-               ON metadata_rows.source_file = token_rows.metadata_source_file
-              AND metadata_rows.source_row_number = token_rows.metadata_source_row_number",
+            "SELECT coalesce(sum(source_json_bytes), 0)::UBIGINT
+             FROM (
+                 SELECT max(length(metadata_rows.metadata_json))::UBIGINT AS source_json_bytes
+                 FROM metadata_contract_token_rows token_rows
+                 JOIN metadata_rows
+                   ON metadata_rows.source_file = token_rows.metadata_source_file
+                  AND metadata_rows.source_row_number = token_rows.metadata_source_row_number
+                 GROUP BY token_rows.metadata_source_file,
+                          token_rows.metadata_source_row_number
+             ) distinct_sources",
             [],
             |row| row.get(0),
         )
         .unwrap();
     assert!(token_json_bytes > 0);
+    let admitted_token_json_bytes = token_json_bytes * 5 / 4;
     assert_eq!(
         estimate.token_relation_peak_bytes,
-        token_rows * 64 + representative_rows * 8 + token_json_bytes + 64 * 1024 * 1024
+        token_rows * 64 + representative_rows * 8 + admitted_token_json_bytes + 64 * 1024 * 1024
     );
     assert_eq!(estimate.partial_peak_bytes, 64 * 1024 * 1024);
     let representative_json_bytes: u64 = conn
@@ -354,16 +360,31 @@ fn encode_stream_reports_frozen_row_totals_and_terminal_completion() {
         .filter(|event| event.phase == ProgressPhase::EncodeCollectTokenSources)
         .collect::<Vec<_>>();
     assert!(!collect.is_empty(), "missing source-catalog progress");
-    assert_eq!(collect[0].total, None);
+    assert_eq!(collect[0].total, Some(2));
+    assert_eq!(collect[0].completed, 0);
+    assert_eq!(collect.last().unwrap().completed, 2);
+    assert_eq!(collect.last().unwrap().total, Some(2));
 
     let resolve = events
         .iter()
         .filter(|event| event.phase == ProgressPhase::EncodeResolveTokenMemberships)
         .collect::<Vec<_>>();
     assert!(!resolve.is_empty(), "missing token-resolution progress");
-    assert_eq!(resolve[0].total, None);
-    assert_eq!(resolve.last().unwrap().total, Some(estimate.token_rows));
-    assert_eq!(resolve.last().unwrap().completed, estimate.token_rows);
+    assert_eq!(resolve[0].total, Some(2));
+    assert_eq!(resolve[0].completed, 0);
+    assert_eq!(resolve.last().unwrap().total, Some(2));
+    assert_eq!(resolve.last().unwrap().completed, 2);
+
+    let fallback = events
+        .iter()
+        .filter(|event| event.phase == ProgressPhase::EncodeTokenFallbackSources)
+        .collect::<Vec<_>>();
+    assert!(!fallback.is_empty(), "missing fallback-source progress");
+    assert!(
+        fallback.iter().any(|event| event.total == Some(3) && event.completed == 0),
+        "fallback should report SQL work steps before classify"
+    );
+    assert_eq!(fallback.last().unwrap().completed, fallback.last().unwrap().total.unwrap());
 
     let source_terminal = events
         .iter()
