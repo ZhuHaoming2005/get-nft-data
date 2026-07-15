@@ -151,8 +151,8 @@ fn parallel_blocking_compile_is_identical_to_single_lane() {
 }
 
 #[test]
-fn blocking_revision_is_one() {
-    assert_eq!(BLOCKING_REVISION, 1);
+fn blocking_revision_is_two() {
+    assert_eq!(BLOCKING_REVISION, 2);
     // Must stay equal to name_uri METADATA_CONSERVATIVE_* values.
     assert_eq!(BANDS, 8);
     assert_eq!(BAND_BITS, 8);

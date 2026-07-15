@@ -2,7 +2,9 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::encode::csr::{
@@ -517,67 +519,25 @@ fn write_template_scoring_columns(
     payloads: &[EncodePayloadRow],
     contracts: &[EncodeContractRow],
 ) -> Result<(), FeatureSoaError> {
-    const K1: f64 = 1.2;
-    const B: f64 = 0.75;
-    let token_count = payloads
-        .iter()
-        .flat_map(|p| p.template_terms.iter().map(|(term, _)| *term as usize + 1))
-        .max()
-        .unwrap_or(0);
-    let mut doc_freqs = vec![0u64; token_count];
-    let mut total_docs = 0u64;
-    let mut total_terms = 0u128;
-    for contract in contracts {
-        let payload = &payloads[contract.payload_id as usize];
-        total_docs = total_docs.saturating_add(contract.weight);
-        let len: u64 = payload
-            .template_terms
-            .iter()
-            .map(|(_, f)| u64::from(*f))
-            .sum();
-        total_terms = total_terms.saturating_add(u128::from(len) * u128::from(contract.weight));
-        for &(term, _) in &payload.template_terms {
-            doc_freqs[term as usize] = doc_freqs[term as usize].saturating_add(contract.weight);
-        }
-    }
-    let avg_doc_len = if total_docs == 0 {
-        0.0
-    } else {
-        total_terms as f64 / total_docs as f64
-    };
-    let prepared_weight_count = payloads.iter().try_fold(0u64, |total, payload| {
-        total
-            .checked_add(payload.template_terms.len() as u64)
-            .ok_or(FeatureSoaError::LengthOverflow)
-    })?;
-    let denominator = |payload: &EncodePayloadRow| {
-        let len: u64 = payload
-            .template_terms
-            .iter()
-            .map(|(_, f)| u64::from(*f))
-            .sum();
-        let norm = if avg_doc_len > 0.0 {
-            K1 * (1.0 - B + B * len as f64 / avg_doc_len)
-        } else {
-            K1
-        };
-        let mut denominator = 0.0;
-        for &(term, frequency) in &payload.template_terms {
-            let weight = prepared_term_weight(term, frequency, norm, total_docs, &doc_freqs);
-            denominator += f64::from(frequency) * weight;
-        }
-        if denominator > 0.0 {
-            denominator
-        } else {
-            1.0
-        }
-    };
-    let doc_freqs = doc_freqs.as_slice();
+    let prepared = prepare_template_scoring(payloads, contracts)?;
+    let PreparedTemplateScoring {
+        payload_document_weights,
+        total_docs,
+        doc_freqs,
+        query_denominators,
+        prepared_weights,
+    } = prepared;
+    debug_assert_eq!(payload_document_weights.len(), payloads.len());
+    debug_assert!(total_docs >= payload_document_weights.iter().copied().max().unwrap_or(0));
+    debug_assert!(doc_freqs.iter().all(|&frequency| frequency <= total_docs));
+    drop(payload_document_weights);
+    drop(doc_freqs);
+    let prepared_weight_count = prepared_weights.len() as u64;
     progress.write_f64(
         &bundle_dir.join("query_denominators.f64"),
         ArrayKind::F64,
         payloads.len() as u64,
-        payloads.iter().map(denominator),
+        query_denominators,
     )?;
     progress.write_u64(
         &bundle_dir.join("prepared_weight_offsets.u64"),
@@ -592,12 +552,114 @@ fn write_template_scoring_columns(
         &bundle_dir.join("prepared_weights.f64"),
         ArrayKind::F64,
         prepared_weight_count,
-        payloads.iter().flat_map(move |payload| {
-            let len: u64 = payload
+        prepared_weights,
+    )?;
+    Ok(())
+}
+
+struct PreparedTemplateScoring {
+    payload_document_weights: Vec<u64>,
+    total_docs: u64,
+    doc_freqs: Vec<u64>,
+    query_denominators: Vec<f64>,
+    prepared_weights: Vec<f64>,
+}
+
+fn prepare_template_scoring(
+    payloads: &[EncodePayloadRow],
+    contracts: &[EncodeContractRow],
+) -> Result<PreparedTemplateScoring, FeatureSoaError> {
+    const K1: f64 = 1.2;
+    const B: f64 = 0.75;
+    let token_count = payloads
+        .iter()
+        .flat_map(|p| p.template_terms.iter().map(|(term, _)| *term as usize + 1))
+        .max()
+        .unwrap_or(0);
+    let payload_document_weights = (0..payloads.len())
+        .map(|_| AtomicU64::new(0))
+        .collect::<Vec<_>>();
+    contracts.par_iter().for_each(|contract| {
+        let weight = &payload_document_weights[contract.payload_id as usize];
+        let _ = weight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_add(contract.weight))
+        });
+    });
+    let payload_document_weights = payload_document_weights
+        .into_iter()
+        .map(AtomicU64::into_inner)
+        .collect::<Vec<_>>();
+    let total_docs = payload_document_weights
+        .iter()
+        .copied()
+        .fold(0u64, u64::saturating_add);
+    let doc_freqs = (0..token_count)
+        .map(|_| AtomicU64::new(0))
+        .collect::<Vec<_>>();
+    let payload_lengths = payloads
+        .par_iter()
+        .map(|payload| {
+            payload
                 .template_terms
                 .iter()
                 .map(|(_, frequency)| u64::from(*frequency))
-                .sum();
+                .sum::<u64>()
+        })
+        .collect::<Vec<_>>();
+    let total_terms = payloads
+        .par_iter()
+        .enumerate()
+        .map(|(payload_id, payload)| {
+            let weight = payload_document_weights[payload_id];
+            if weight != 0 {
+                for &(term, _) in &payload.template_terms {
+                    let frequency = &doc_freqs[term as usize];
+                    let _ =
+                        frequency.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                            Some(current.saturating_add(weight))
+                        });
+                }
+            }
+            u128::from(payload_lengths[payload_id]).saturating_mul(u128::from(weight))
+        })
+        .reduce(|| 0u128, u128::saturating_add);
+    let doc_freqs = doc_freqs
+        .into_iter()
+        .map(AtomicU64::into_inner)
+        .collect::<Vec<_>>();
+    let avg_doc_len = if total_docs == 0 {
+        0.0
+    } else {
+        total_terms as f64 / total_docs as f64
+    };
+    let query_denominators = payloads
+        .par_iter()
+        .enumerate()
+        .map(|(payload_id, payload)| {
+            let len = payload_lengths[payload_id];
+            let norm = if avg_doc_len > 0.0 {
+                K1 * (1.0 - B + B * len as f64 / avg_doc_len)
+            } else {
+                K1
+            };
+            let mut denominator = 0.0;
+            for &(term, frequency) in &payload.template_terms {
+                let weight = prepared_term_weight(term, frequency, norm, total_docs, &doc_freqs);
+                denominator += f64::from(frequency) * weight;
+            }
+            if denominator > 0.0 {
+                denominator
+            } else {
+                1.0
+            }
+        })
+        .collect::<Vec<_>>();
+    let doc_freqs_slice = doc_freqs.as_slice();
+    let prepared_weights = payloads
+        .par_iter()
+        .enumerate()
+        .flat_map_iter(|(payload_id, payload)| {
+            let len = payload_lengths[payload_id];
             let norm = if avg_doc_len > 0.0 {
                 K1 * (1.0 - B + B * len as f64 / avg_doc_len)
             } else {
@@ -607,11 +669,17 @@ fn write_template_scoring_columns(
                 .template_terms
                 .iter()
                 .map(move |&(term, frequency)| {
-                    prepared_term_weight(term, frequency, norm, total_docs, doc_freqs)
+                    prepared_term_weight(term, frequency, norm, total_docs, doc_freqs_slice)
                 })
-        }),
-    )?;
-    Ok(())
+        })
+        .collect::<Vec<_>>();
+    Ok(PreparedTemplateScoring {
+        payload_document_weights,
+        total_docs,
+        doc_freqs,
+        query_denominators,
+        prepared_weights,
+    })
 }
 
 fn prepared_term_weight(
@@ -818,5 +886,55 @@ impl FeatureView {
         let start = off[i] as usize;
         let end = off[i + 1] as usize;
         &self.contract_tokens[start..end]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepared_template_scoring_aggregates_contract_weights_by_payload() {
+        let payloads = vec![
+            EncodePayloadRow {
+                template_terms: vec![(0, 1)],
+                content_terms: vec![],
+            },
+            EncodePayloadRow {
+                template_terms: vec![(1, 2)],
+                content_terms: vec![],
+            },
+        ];
+        let contracts = vec![
+            EncodeContractRow {
+                contract_id: 0,
+                chain_id: 0,
+                source_doc_id: 0,
+                payload_id: 0,
+                weight: 2,
+            },
+            EncodeContractRow {
+                contract_id: 1,
+                chain_id: 0,
+                source_doc_id: 1,
+                payload_id: 0,
+                weight: 3,
+            },
+            EncodeContractRow {
+                contract_id: 2,
+                chain_id: 0,
+                source_doc_id: 2,
+                payload_id: 1,
+                weight: 7,
+            },
+        ];
+
+        let prepared = prepare_template_scoring(&payloads, &contracts).unwrap();
+
+        assert_eq!(prepared.payload_document_weights, vec![5, 7]);
+        assert_eq!(prepared.total_docs, 12);
+        assert_eq!(prepared.doc_freqs, vec![5, 7]);
+        assert_eq!(prepared.query_denominators.len(), 2);
+        assert_eq!(prepared.prepared_weights.len(), 2);
     }
 }

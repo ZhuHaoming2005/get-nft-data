@@ -15,4 +15,4 @@ pub use payload_cas::{
     DEFAULT_MAX_PACK_BYTES,
 };
 
-pub const ENCODE_SCHEMA_REVISION: u32 = 1;
+pub const ENCODE_SCHEMA_REVISION: u32 = 2;

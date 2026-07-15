@@ -5,8 +5,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ProgressPhase {
+    EncodeCollectTokenSources,
     EncodeTokenSources,
     EncodeTokenFallbackSources,
+    EncodeResolveTokenMemberships,
+    EncodeLoadTokenSources,
+    EncodeLoadTokenMemberships,
+    EncodeSortTokenMemberships,
     EncodeRows,
     EncodeFallbackSources,
     EncodeFinalize,
@@ -41,8 +46,13 @@ pub enum ProgressPhase {
 impl ProgressPhase {
     pub const fn label(self) -> &'static str {
         match self {
-            Self::EncodeTokenSources => "encode retained-token sources",
-            Self::EncodeTokenFallbackSources => "resolve retained-token fallback sources",
+            Self::EncodeCollectTokenSources => "collect retained-token sources",
+            Self::EncodeTokenSources => "classify retained-token sources",
+            Self::EncodeTokenFallbackSources => "classify retained-token fallback sources",
+            Self::EncodeResolveTokenMemberships => "resolve retained-token memberships",
+            Self::EncodeLoadTokenSources => "load retained-token source documents",
+            Self::EncodeLoadTokenMemberships => "load retained-token memberships",
+            Self::EncodeSortTokenMemberships => "sort retained-token memberships",
             Self::EncodeRows => "encode representative rows",
             Self::EncodeFallbackSources => "resolve fallback metadata sources",
             Self::EncodeFinalize => "finalize encoded features",

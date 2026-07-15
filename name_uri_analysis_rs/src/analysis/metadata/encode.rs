@@ -8,8 +8,13 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
+use duckdb::arrow::array::{
+    Array, BooleanArray, StringArray, StringViewArray, UInt32Array, UInt64Array,
+};
+use duckdb::arrow::datatypes::{DataType, Field, Schema};
+use duckdb::arrow::record_batch::RecordBatch;
 use duckdb::Connection;
 use metadata_engine::blocking::{
     build_base_equivalent_atom_sketches_parallel, compile_base_equivalent_parallel_with_progress,
@@ -26,23 +31,17 @@ use metadata_engine::progress::{
     ProgressCounters as EngineCounters, ProgressEvent, ProgressPhase, WorkUnit,
 };
 use metadata_engine::resource::{MemoryBroker, MemoryLease};
-use metadata_engine::storage::{ArtifactClass, ArtifactRegistration, StorageBroker, StorageLease};
+use metadata_engine::storage::{ArtifactClass, ArtifactRegistration, StorageBroker};
 use rayon::prelude::*;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 
-use crate::{sha256_file, sha256_hex, write_json_atomically};
+use crate::{sha256_file, write_json_atomically};
 
 use super::super::duckdb_prep::configure_duckdb;
 use super::super::{
     diagnostics_enabled, encode_process_memory_plan, format_byte_size, physical_memory_bytes,
     total_memory_budget_bytes, AnalysisError, AnalysisOptions, AnalysisPhase, AnalysisReport,
     PipelineStage, ProgressTracker,
-};
-use super::encode_v3::{
-    planned_token_source_store_peak, write_external_token_source_store, ExternalTokenSourceStore,
-    SourceDictionaryRow, TokenMembershipRow, TokenSourceStorePlan, ENCODE_EXTERNAL_PLAN_REVISION,
-    TOKEN_SOURCE_STORE_BUFFER_BYTES,
 };
 use super::prepare::metadata_is_dedup_eligible;
 
@@ -54,14 +53,29 @@ const HASH_BUCKET_OVERHEAD_BYTES: usize = 16;
 type RepresentativeEncodeRow = (i64, String, String, i64, u32, u64);
 type FallbackEncodeRow = (u32, String, u32, u64);
 
-pub(super) fn parse_pending_fallback_batch(
-    batch: &[FallbackEncodeRow],
-    is_pending: &(impl Fn(u32) -> bool + Sync),
+pub(super) fn resolve_fallback_contracts(
+    rows: &[FallbackEncodeRow],
     parse: &(impl Fn(&str) -> ParsedMetadataDocuments + Sync),
-) -> Vec<Option<ParsedMetadataDocuments>> {
-    batch
-        .par_iter()
-        .map(|row| is_pending(row.0).then(|| parse(&row.1)))
+) -> Vec<(FallbackEncodeRow, ParsedMetadataDocuments)> {
+    let mut ranges = Vec::new();
+    let mut begin = 0usize;
+    while begin < rows.len() {
+        let contract = rows[begin].0;
+        let mut end = begin + 1;
+        while end < rows.len() && rows[end].0 == contract {
+            end += 1;
+        }
+        ranges.push(begin..end);
+        begin = end;
+    }
+    ranges
+        .into_par_iter()
+        .filter_map(|range| {
+            rows[range].iter().find_map(|row| {
+                let parsed = parse(&row.1);
+                (!parsed.prefilter_tokens.is_empty()).then(|| (row.clone(), parsed))
+            })
+        })
         .collect()
 }
 
@@ -90,7 +104,7 @@ pub(super) struct EncodeAdmissionEstimate {
     pub(super) provisional_feature_bytes: u64,
     pub(super) resident_peak_bytes: u64,
     pub(super) partial_peak_bytes: u64,
-    pub(super) token_spool_peak_bytes: u64,
+    pub(super) token_relation_peak_bytes: u64,
     pub(super) representative_rows: u64,
     pub(super) token_rows: u64,
 }
@@ -265,7 +279,7 @@ pub(crate) fn run_metadata_encode(
             .reserve(
                 ArtifactClass::Feature,
                 estimate.provisional_feature_bytes,
-                estimate.token_spool_peak_bytes,
+                estimate.partial_peak_bytes,
             )
             .map_err(storage_err)?;
 
@@ -281,9 +295,8 @@ pub(crate) fn run_metadata_encode(
                 estimate,
                 |event| progress.observe_engine_event(event),
             )?;
-        // The external token-source store and its exact lease are gone now.
-        // Replace the provisional reservation instead of overlapping both
-        // envelopes during final feature/CSR persistence.
+        // The in-memory token relation is released before feature persistence.
+        // Replace the provisional storage reservation for the final arrays.
         drop(storage_reservation);
         let storage_reservation = broker
             .reserve(
@@ -305,7 +318,7 @@ pub(crate) fn run_metadata_encode(
         )?;
         resident_admission.reserve_growth(
             frozen_resident_bytes,
-            planned_feature_persist_growth(&sources, &contracts)?,
+            planned_feature_persist_growth(&sources, &payloads, &contracts)?,
         )?;
         let encode_persist_stats = write_encode_artifacts_with_contracts_and_atoms_with_progress(
             &encode_dir,
@@ -538,92 +551,81 @@ struct TokenSourceInput {
     metadata_json: Arc<str>,
 }
 
-struct TokenSourceSpool {
-    store: ExternalTokenSourceStore,
-    admitted_peak_bytes: u64,
-    _storage_lease: StorageLease,
-    _memory_lease: MemoryLease,
+#[derive(Debug)]
+struct TokenSourceRecord {
+    source_file: u32,
+    source_row_number: u64,
+    metadata_json: Arc<str>,
 }
 
-impl TokenSourceSpool {
-    fn read_contract(
-        &mut self,
-        contract_index: u32,
-    ) -> Result<Vec<TokenSourceInput>, AnalysisError> {
-        self.store
-            .read_contract(contract_index)?
-            .into_iter()
-            .map(|source| {
-                Ok(TokenSourceInput {
-                    token_ids: source.token_ids,
-                    source_file: source.source_file,
-                    source_row_number: source.source_row_number,
-                    metadata_json: Arc::from(source.metadata_json),
-                })
-            })
-            .collect()
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ResolvedTokenMembership {
+    contract_index: u32,
+    source_id: u32,
+    token_id: u32,
+}
+
+struct TokenSourceRelation {
+    sources: Vec<TokenSourceRecord>,
+    memberships: Vec<ResolvedTokenMembership>,
+    contract_offsets: Vec<usize>,
+    logical_bytes: u64,
+}
+
+impl TokenSourceRelation {
+    fn read_contract(&self, contract_index: u32) -> Result<Vec<TokenSourceInput>, AnalysisError> {
+        let contract = usize::try_from(contract_index).map_err(|_| {
+            AnalysisError::InvalidData("metadata contract index exceeds usize".into())
+        })?;
+        let Some((&start, &end)) = self
+            .contract_offsets
+            .get(contract)
+            .zip(self.contract_offsets.get(contract.saturating_add(1)))
+        else {
+            return Err(AnalysisError::InvalidData(
+                "metadata contract index is outside token-source offsets".into(),
+            ));
+        };
+        let mut output = Vec::new();
+        let mut cursor = start;
+        while cursor < end {
+            let source_id = self.memberships[cursor].source_id;
+            let source = self.sources.get(source_id as usize).ok_or_else(|| {
+                AnalysisError::InvalidData(
+                    "token-source membership references unknown source".into(),
+                )
+            })?;
+            let mut token_ids = Vec::new();
+            while cursor < end && self.memberships[cursor].source_id == source_id {
+                token_ids.push(self.memberships[cursor].token_id);
+                cursor += 1;
+            }
+            output.push(TokenSourceInput {
+                token_ids,
+                source_file: source.source_file,
+                source_row_number: source.source_row_number,
+                metadata_json: Arc::clone(&source.metadata_json),
+            });
+        }
+        Ok(output)
     }
 
     fn bytes(&self) -> u64 {
-        self.store.logical_bytes()
-    }
-
-    fn remove(self) -> Result<(), AnalysisError> {
-        self.store.remove().map_err(AnalysisError::from)?;
-        // Both leases describe this transient external store. Dropping them
-        // here prevents its peak from overlapping the later feature/CSR
-        // persistence reservations after the store has already been removed.
-        Ok(())
+        self.logical_bytes
     }
 }
 
 fn planned_token_relation_peak(
     token_rows: u64,
     representative_rows: u64,
+    token_json_bytes: u64,
 ) -> Result<u64, AnalysisError> {
     token_rows
         .checked_mul(64)
         .and_then(|bytes| representative_rows.checked_mul(8)?.checked_add(bytes))
+        .and_then(|bytes| token_json_bytes.checked_add(bytes))
         .and_then(|bytes| bytes.checked_add(64 * 1024 * 1024))
         .ok_or_else(|| AnalysisError::InvalidData("token-source relation estimate overflow".into()))
-}
-
-fn planned_token_source_final_bytes(
-    distinct_source_json_bytes: u64,
-    distinct_source_count: u64,
-    membership_count: u64,
-) -> Result<u64, AnalysisError> {
-    distinct_source_json_bytes
-        .checked_mul(16)
-        .and_then(|bytes| distinct_source_count.checked_mul(1_024)?.checked_add(bytes))
-        .and_then(|bytes| membership_count.checked_mul(32)?.checked_add(bytes))
-        .and_then(|bytes| bytes.checked_add(64 * 1024 * 1024))
-        .ok_or_else(|| {
-            AnalysisError::InvalidData("token-source final artifact estimate overflow".into())
-        })
-}
-
-fn planned_dynamic_token_memory_bytes(
-    max_contract_json_bytes: u64,
-    max_contract_source_count: u64,
-    max_contract_membership_count: u64,
-) -> Result<u64, AnalysisError> {
-    max_contract_json_bytes
-        .checked_mul(3)
-        .and_then(|bytes| {
-            max_contract_source_count
-                .checked_mul(128)?
-                .checked_add(bytes)
-        })
-        .and_then(|bytes| {
-            max_contract_membership_count
-                .checked_mul(8)?
-                .checked_add(bytes)
-        })
-        .and_then(|bytes| bytes.checked_add(64 * 1024 * 1024))
-        .ok_or_else(|| {
-            AnalysisError::InvalidData("token-source whale memory estimate overflow".into())
-        })
 }
 
 fn capacity_bytes<T>(capacity: usize) -> Result<u64, AnalysisError> {
@@ -764,6 +766,7 @@ fn frozen_encode_state_resident_bytes(
 
 fn planned_feature_persist_growth(
     sources: &[EncodeSourceRow],
+    payloads: &[EncodePayloadRow],
     contracts: &[EncodeContractRow],
 ) -> Result<u64, AnalysisError> {
     let mut occurrences = 0u64;
@@ -783,6 +786,11 @@ fn planned_feature_persist_growth(
         .map_err(|_| AnalysisError::InvalidData("Encode contract count exceeds u64".into()))?;
     let source_count = u64::try_from(sources.len())
         .map_err(|_| AnalysisError::InvalidData("Encode source count exceeds u64".into()))?;
+    let template_terms = payloads.iter().try_fold(0u64, |total, payload| {
+        total.checked_add(payload.template_terms.len() as u64)
+    });
+    let payload_count = u64::try_from(payloads.len())
+        .map_err(|_| AnalysisError::InvalidData("Encode payload count exceeds u64".into()))?;
     occurrences
         .checked_mul(32)
         .and_then(|bytes| {
@@ -792,11 +800,13 @@ fn planned_feature_persist_growth(
                 .checked_add(bytes)
         })
         .and_then(|bytes| source_count.checked_mul(32)?.checked_add(bytes))
+        .and_then(|bytes| template_terms?.checked_mul(8)?.checked_add(bytes))
+        .and_then(|bytes| payload_count.checked_mul(32)?.checked_add(bytes))
         .and_then(|bytes| bytes.checked_add(ENCODE_RESIDENT_FIXED_BYTES))
         .ok_or_else(|| AnalysisError::InvalidData("Encode CSR admission overflow".into()))
 }
 
-fn token_source_spool_dimensions(conn: &Connection) -> Result<(u64, u64), AnalysisError> {
+fn token_source_relation_dimensions(conn: &Connection) -> Result<(u64, u64), AnalysisError> {
     let table_exists: bool = conn.query_row(
         "SELECT count(*) > 0
          FROM duckdb_tables() WHERE table_name = 'metadata_contract_token_rows'",
@@ -814,36 +824,6 @@ fn token_source_spool_dimensions(conn: &Connection) -> Result<(u64, u64), Analys
         |row| Ok((row.get(0)?, row.get(1)?)),
     )
     .map_err(AnalysisError::from)
-}
-
-fn encode_external_owner_identity(work_directory: &Path) -> Result<String, AnalysisError> {
-    let manifest = work_directory.join("manifest.json");
-    if manifest.is_file() {
-        let (_, digest) = sha256_file(&manifest, 1024 * 1024)?;
-        return Ok(format!(
-            "encode-external-plan-{ENCODE_EXTERNAL_PLAN_REVISION}:{digest}"
-        ));
-    }
-    // The legacy in-process library entry has no controller manifest and no
-    // resumable checkpoint contract. Give that run a one-shot identity so a
-    // crashed transient store is rebuilt instead of being trusted across
-    // processes. Controller-owned production runs always take the stable,
-    // manifest-bound branch above.
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| AnalysisError::InvalidData(format!("system clock before epoch: {error}")))?
-        .as_nanos();
-    let seed = format!(
-        "{}:{}:{nonce}:{}",
-        work_directory.display(),
-        std::process::id(),
-        ENCODE_EXTERNAL_PLAN_REVISION
-    );
-    let digest = Sha256::digest(seed.as_bytes());
-    Ok(format!(
-        "encode-external-plan-{ENCODE_EXTERNAL_PLAN_REVISION}:ephemeral:{}",
-        sha256_hex(digest.as_ref())
-    ))
 }
 
 #[derive(Debug)]
@@ -885,14 +865,14 @@ pub(super) fn stream_encode_inputs_with_progress(
 fn stream_encode_inputs_with_admission(
     conn: &Connection,
     work_directory: &Path,
-    broker: &mut StorageBroker,
-    memory_broker: &MemoryBroker,
+    _broker: &mut StorageBroker,
+    _memory_broker: &MemoryBroker,
     resident_admission: &mut EncodeResidentAdmission,
     threads: usize,
     estimate: EncodeAdmissionEstimate,
     mut progress: impl FnMut(ProgressEvent),
 ) -> Result<EncodeStreamInputs, AnalysisError> {
-    let (token_rows, _) = token_source_spool_dimensions(conn)?;
+    let (token_rows, token_json_bytes) = token_source_relation_dimensions(conn)?;
     let representative_rows: u64 = conn.query_row(
         "SELECT count(*)::UBIGINT
          FROM analysis_contracts
@@ -900,40 +880,41 @@ fn stream_encode_inputs_with_admission(
         [],
         |row| row.get(0),
     )?;
-    let required_spool_peak = planned_token_relation_peak(token_rows, representative_rows)?;
+    let required_relation_peak =
+        planned_token_relation_peak(token_rows, representative_rows, token_json_bytes)?;
     if token_rows != estimate.token_rows
         || representative_rows != estimate.representative_rows
-        || required_spool_peak != estimate.token_spool_peak_bytes
-        || required_spool_peak > estimate.partial_peak_bytes
+        || required_relation_peak != estimate.token_relation_peak_bytes
     {
         return Err(AnalysisError::InvalidData(format!(
-            "token-source spool admission is stale or insufficient: token_rows={token_rows}, representative_rows={representative_rows}, required={required_spool_peak}, admitted_token_rows={}, admitted_representative_rows={}, admitted_spool={}, admitted_partial={}",
-            estimate.token_rows, estimate.representative_rows, estimate.token_spool_peak_bytes, estimate.partial_peak_bytes
+            "token-source relation admission is stale or insufficient: token_rows={token_rows}, representative_rows={representative_rows}, required={required_relation_peak}, admitted_token_rows={}, admitted_representative_rows={}, admitted_relation={}",
+            estimate.token_rows, estimate.representative_rows, estimate.token_relation_peak_bytes
         )));
     }
-    let spool_path = work_directory.join("spool/metadata-token-sources.bin");
-    let store_owner_identity = encode_external_owner_identity(work_directory)?;
     let contract_count = u32::try_from(estimate.representative_rows).map_err(|_| {
         AnalysisError::InvalidData("metadata contract count exceeds u32 identity space".into())
     })?;
-    let mut spool_admission = TokenSourceSpoolAdmission {
-        storage: broker,
-        memory: memory_broker,
-        owner_identity: &store_owner_identity,
+    let parse_lanes = threads.max(1);
+    let parse_batch_rows = parse_lanes
+        .saturating_mul(ENCODE_PARSE_BATCHES_PER_LANE)
+        .clamp(1, MAX_ENCODE_PARSE_BATCH_ROWS);
+    let parse_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(parse_lanes)
+        .thread_name(|index| format!("metadata-encode-parse-{index}"))
+        .build()
+        .map_err(|error| AnalysisError::InvalidData(format!("encode parse pool: {error}")))?;
+    let token_source_relation = build_retained_token_source_relation(
+        conn,
         contract_count,
-        expected_rows: estimate.token_rows,
-        baseline_feature_bytes: estimate.resident_peak_bytes,
-    };
-    let mut token_source_spool =
-        build_retained_token_source_spool(conn, &spool_path, &mut spool_admission, &mut progress)?;
-    let actual_spool_peak = token_source_spool
-        .bytes()
-        .checked_add(TOKEN_SOURCE_STORE_BUFFER_BYTES)
-        .ok_or_else(|| AnalysisError::InvalidData("token-source spool peak overflow".into()))?;
-    if actual_spool_peak > token_source_spool.admitted_peak_bytes {
+        estimate.token_rows,
+        &parse_pool,
+        &mut progress,
+    )?;
+    if token_source_relation.bytes() > estimate.resident_peak_bytes {
         return Err(AnalysisError::InvalidData(format!(
-            "token-source spool exceeded admitted partial peak ({} > {})",
-            actual_spool_peak, token_source_spool.admitted_peak_bytes
+            "in-memory token-source relation exceeded resident admission ({} > {})",
+            token_source_relation.bytes(),
+            estimate.resident_peak_bytes
         )));
     }
     let encode_dir =
@@ -1001,15 +982,6 @@ fn stream_encode_inputs_with_admission(
         &pending_fallbacks,
     )?;
     resident_admission.commit(committed_resident_bytes)?;
-    let parse_lanes = threads.max(1);
-    let parse_batch_rows = parse_lanes
-        .saturating_mul(ENCODE_PARSE_BATCHES_PER_LANE)
-        .clamp(1, MAX_ENCODE_PARSE_BATCH_ROWS);
-    let parse_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(parse_lanes)
-        .thread_name(|index| format!("metadata-encode-parse-{index}"))
-        .build()
-        .map_err(|error| AnalysisError::InvalidData(format!("encode parse pool: {error}")))?;
     loop {
         let batch = rows
             .by_ref()
@@ -1078,7 +1050,7 @@ fn stream_encode_inputs_with_admission(
                     },
                 );
             } else {
-                let token_sources = token_source_spool.read_contract(source_contract_index)?;
+                let token_sources = token_source_relation.read_contract(source_contract_index)?;
                 let contract_growth_bytes =
                     planned_encoded_contract_growth(&metadata_json, &token_sources)?;
                 resident_admission.reserve_growth(
@@ -1180,7 +1152,7 @@ fn stream_encode_inputs_with_admission(
                       rows.source_file,
                       rows.source_row_number",
         )?;
-        let mut fallback_rows = stmt.query_map([], |row| {
+        let fallback_rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, u32>(0)?,
                 row.get::<_, String>(1)?,
@@ -1188,91 +1160,52 @@ fn stream_encode_inputs_with_admission(
                 row.get::<_, u64>(3)?,
             ))
         })?;
-        let mut completed = 0u64;
-        loop {
-            let batch = fallback_rows
-                .by_ref()
-                .take(parse_batch_rows)
-                .collect::<Result<Vec<FallbackEncodeRow>, _>>()?;
-            if batch.is_empty() {
-                break;
-            }
-            let batch_json_bytes = batch
-                .iter()
-                .try_fold(0u64, |total, row| total.checked_add(row.1.len() as u64))
-                .ok_or_else(|| {
-                    AnalysisError::InvalidData("Encode fallback batch JSON bytes overflow".into())
-                })?;
-            let batch_growth_bytes = planned_encode_batch_growth(batch_json_bytes, batch.len())?;
-            resident_admission.reserve_growth(committed_resident_bytes, batch_growth_bytes)?;
-            let parsed_batch = parse_pool.install(|| {
-                parse_pending_fallback_batch(
-                    &batch,
-                    &|contract| pending_fallbacks.contains_key(&contract),
-                    &parse_metadata_documents,
-                )
-            });
-            for (row, parsed) in batch.into_iter().zip(parsed_batch) {
-                let (source_contract_index, metadata_json, source_file, source_row_number) = row;
-                if let (Some(parsed), Some(pending)) =
-                    (parsed, pending_fallbacks.get(&source_contract_index))
-                {
-                    if !parsed.prefilter_tokens.is_empty() {
-                        let pending = PendingFallbackContract {
-                            source_contract_index: pending.source_contract_index,
-                            chain_id: pending.chain_id,
-                            weight: pending.weight,
-                        };
-                        pending_fallbacks.remove(&source_contract_index);
-                        let token_sources =
-                            token_source_spool.read_contract(pending.source_contract_index)?;
-                        let contract_growth_bytes =
-                            planned_encoded_contract_growth(&metadata_json, &token_sources)?;
-                        resident_admission.reserve_growth(
-                            committed_resident_bytes,
-                            batch_growth_bytes
-                                .checked_add(contract_growth_bytes)
-                                .ok_or_else(|| {
-                                    AnalysisError::InvalidData(
-                                        "Encode fallback batch and contract admission overflow"
-                                            .into(),
-                                    )
-                                })?,
-                        )?;
-                        append_encoded_contract(
-                            pending.chain_id,
-                            pending.weight,
-                            source_file,
-                            source_row_number,
-                            &metadata_json,
-                            parsed,
-                            token_sources,
-                            &mut cas,
-                            &mut payloads,
-                            &mut payload_interner,
-                            &mut sources,
-                            &mut contracts,
-                        )?;
-                        committed_resident_bytes = resident_accounting.resident_bytes(
-                            &sources,
-                            &payloads,
-                            &contracts,
-                            Some(&payload_interner),
-                            Some(&cas),
-                            &pending_fallbacks,
-                        )?;
-                        resident_admission
-                            .reserve_growth(committed_resident_bytes, batch_growth_bytes)?;
-                    }
-                }
-                completed = completed.saturating_add(1);
-                emit_encode_progress(
-                    &mut progress,
-                    ProgressPhase::EncodeFallbackSources,
-                    completed,
-                    fallback_total,
-                );
-            }
+        let fallback_rows = fallback_rows.collect::<Result<Vec<FallbackEncodeRow>, _>>()?;
+        let fallback_json_bytes = fallback_rows
+            .iter()
+            .try_fold(0u64, |total, row| total.checked_add(row.1.len() as u64))
+            .ok_or_else(|| {
+                AnalysisError::InvalidData("Encode fallback JSON bytes overflow".into())
+            })?;
+        let fallback_growth_bytes =
+            planned_encode_batch_growth(fallback_json_bytes, fallback_rows.len())?;
+        resident_admission.reserve_growth(committed_resident_bytes, fallback_growth_bytes)?;
+        let resolved = parse_pool
+            .install(|| resolve_fallback_contracts(&fallback_rows, &parse_metadata_documents));
+        drop(fallback_rows);
+        for (row, parsed) in resolved {
+            let (source_contract_index, metadata_json, source_file, source_row_number) = row;
+            let Some(pending) = pending_fallbacks.remove(&source_contract_index) else {
+                continue;
+            };
+            let token_sources =
+                token_source_relation.read_contract(pending.source_contract_index)?;
+            let contract_growth_bytes =
+                planned_encoded_contract_growth(&metadata_json, &token_sources)?;
+            resident_admission.reserve_growth(
+                committed_resident_bytes,
+                fallback_growth_bytes
+                    .checked_add(contract_growth_bytes)
+                    .ok_or_else(|| {
+                        AnalysisError::InvalidData(
+                            "Encode fallback and contract admission overflow".into(),
+                        )
+                    })?,
+            )?;
+            append_encoded_contract(
+                pending.chain_id,
+                pending.weight,
+                source_file,
+                source_row_number,
+                &metadata_json,
+                parsed,
+                token_sources,
+                &mut cas,
+                &mut payloads,
+                &mut payload_interner,
+                &mut sources,
+                &mut contracts,
+            )?;
             committed_resident_bytes = resident_accounting.resident_bytes(
                 &sources,
                 &payloads,
@@ -1281,11 +1214,18 @@ fn stream_encode_inputs_with_admission(
                 Some(&cas),
                 &pending_fallbacks,
             )?;
-            resident_admission.commit(committed_resident_bytes)?;
+            resident_admission.reserve_growth(committed_resident_bytes, fallback_growth_bytes)?;
         }
+        resident_admission.commit(committed_resident_bytes)?;
+        emit_encode_progress(
+            &mut progress,
+            ProgressPhase::EncodeFallbackSources,
+            fallback_total,
+            fallback_total,
+        );
         conn.execute_batch("DROP TABLE encode_fallback_contracts")?;
     }
-    token_source_spool.remove()?;
+    drop(token_source_relation);
 
     let finalize_total = 3u64
         .saturating_add(payloads.len() as u64)
@@ -1582,33 +1522,16 @@ fn load_encode_chain_totals(conn: &Connection) -> Result<Vec<EncodeChainTotal>, 
         .map_err(AnalysisError::from)
 }
 
-struct TokenSourceSpoolAdmission<'a> {
-    storage: &'a mut StorageBroker,
-    memory: &'a MemoryBroker,
-    owner_identity: &'a str,
+fn build_retained_token_source_relation(
+    conn: &Connection,
     contract_count: u32,
     expected_rows: u64,
-    baseline_feature_bytes: u64,
-}
-
-fn build_retained_token_source_spool(
-    conn: &Connection,
-    spool_path: &Path,
-    admission: &mut TokenSourceSpoolAdmission<'_>,
+    parse_pool: &rayon::ThreadPool,
     progress: &mut impl FnMut(ProgressEvent),
-) -> Result<TokenSourceSpool, AnalysisError> {
-    let TokenSourceSpoolAdmission {
-        storage,
-        memory,
-        owner_identity,
-        contract_count,
-        expected_rows,
-        baseline_feature_bytes,
-    } = admission;
-    progress(ProgressEvent::determinate(
-        ProgressPhase::EncodeTokenSources,
+) -> Result<TokenSourceRelation, AnalysisError> {
+    progress(ProgressEvent::indeterminate(
+        ProgressPhase::EncodeCollectTokenSources,
         0,
-        *expected_rows,
         WorkUnit::Items,
         EngineCounters::default(),
     ));
@@ -1618,163 +1541,92 @@ fn build_retained_token_source_spool(
         |row| row.get(0),
     )?;
     if !exists {
-        let planned_store_peak = planned_token_source_store_peak(*contract_count, 0, 0, 0)?;
-        let storage_lease = storage
-            .reserve(ArtifactClass::Feature, 0, planned_store_peak)
-            .map_err(storage_err)?;
-        let memory_lease = memory
-            .reserve((64 * 1024 * 1024u64).saturating_sub(*baseline_feature_bytes))
-            .map_err(|error| {
-                AnalysisError::InvalidData(format!(
-                    "metadata encode dynamic memory admission: {error}"
-                ))
-            })?;
-        let store = write_external_token_source_store(
-            spool_path,
-            &TokenSourceStorePlan {
-                owner_identity: (*owner_identity).to_owned(),
-                contract_count: *contract_count,
-                source_count: 0,
-                membership_count: 0,
-            },
-            std::iter::empty::<std::io::Result<SourceDictionaryRow>>(),
-            std::iter::empty::<std::io::Result<TokenMembershipRow>>(),
-        )?;
-        return Ok(TokenSourceSpool {
-            store,
-            admitted_peak_bytes: planned_store_peak,
-            _storage_lease: storage_lease,
-            _memory_lease: memory_lease,
+        return Ok(TokenSourceRelation {
+            sources: Vec::new(),
+            memberships: Vec::new(),
+            contract_offsets: vec![0; contract_count as usize + 1],
+            logical_bytes: 0,
         });
     }
 
     conn.execute_batch(
         "DROP TABLE IF EXISTS encode_token_source_candidates;
          DROP TABLE IF EXISTS encode_resolved_token_sources;
-         DROP TABLE IF EXISTS encode_v3_source_usability;
-         DROP TABLE IF EXISTS encode_v3_fallback_source_usability;
-         CREATE TEMP TABLE encode_token_source_candidates(
-             contract_index UINTEGER,
-             token_index UINTEGER,
-             source_file UINTEGER,
-             source_row_number UBIGINT,
-             usable BOOLEAN
-         );
-         CREATE TEMP TABLE encode_v3_source_usability(
+         DROP TABLE IF EXISTS encode_source_catalog;
+         DROP TABLE IF EXISTS encode_fallback_source_catalog;
+         DROP TABLE IF EXISTS encode_source_dictionary;
+         DROP TABLE IF EXISTS encode_source_usability;
+         DROP TABLE IF EXISTS encode_fallback_source_usability;
+         CREATE TEMP TABLE encode_source_catalog AS
+         SELECT DISTINCT token_rows.metadata_source_file::UINTEGER AS source_file,
+                         token_rows.metadata_source_row_number::UBIGINT AS source_row_number,
+                         metadata_rows.metadata_json
+         FROM metadata_contract_token_rows token_rows
+         JOIN metadata_rows
+           ON metadata_rows.source_file = token_rows.metadata_source_file
+          AND metadata_rows.source_row_number = token_rows.metadata_source_row_number;
+         CREATE TEMP TABLE encode_source_usability(
              source_file UINTEGER,
              source_row_number UBIGINT,
              usable BOOLEAN
          );",
     )?;
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT token_rows.metadata_source_file,
-                         token_rows.metadata_source_row_number,
-                metadata_rows.metadata_json
-         FROM metadata_contract_token_rows token_rows
-         JOIN metadata_rows
-           ON metadata_rows.source_file = token_rows.metadata_source_file
-          AND metadata_rows.source_row_number = token_rows.metadata_source_row_number
-         ORDER BY token_rows.metadata_source_file,
-                  token_rows.metadata_source_row_number",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, u32>(0)?,
-            row.get::<_, u64>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })?;
-    {
-        let mut appender = conn.appender("encode_v3_source_usability")?;
-        for row in rows {
-            let (source_file, source_row_number, metadata_json) = row?;
-            let usable = !parse_metadata_documents(&metadata_json)
-                .prefilter_tokens
-                .is_empty();
-            appender.append_row((source_file, source_row_number, usable))?;
-        }
-    }
-    drop(stmt);
-    let mut stmt = conn.prepare(
-        "SELECT token_rows.contract_index,
-                token_rows.token_index,
-                token_rows.metadata_source_file,
-                token_rows.metadata_source_row_number,
-                usability.usable
-         FROM metadata_contract_token_rows token_rows
-         JOIN encode_v3_source_usability usability
-           ON usability.source_file = token_rows.metadata_source_file
-          AND usability.source_row_number = token_rows.metadata_source_row_number
-         ORDER BY token_rows.contract_index, token_rows.token_index",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, u32>(0)?,
-            row.get::<_, u32>(1)?,
-            row.get::<_, u32>(2)?,
-            row.get::<_, u64>(3)?,
-            row.get::<_, bool>(4)?,
-        ))
-    })?;
-    let mut completed = 0u64;
-    {
-        let mut appender = conn.appender("encode_token_source_candidates")?;
-        for row in rows {
-            appender.append_row(row?)?;
-            completed = completed.saturating_add(1);
-            emit_encode_progress(
-                progress,
-                ProgressPhase::EncodeTokenSources,
-                completed,
-                *expected_rows,
-            );
-        }
-    }
-    drop(stmt);
-    conn.execute_batch(
-        "CREATE TEMP TABLE encode_resolved_token_sources AS
-         SELECT contract_index, token_index, source_file, source_row_number
-         FROM encode_token_source_candidates
-         WHERE usable;",
+    progress(ProgressEvent::indeterminate(
+        ProgressPhase::EncodeCollectTokenSources,
+        1,
+        WorkUnit::Items,
+        EngineCounters::default(),
+    ));
+    classify_source_catalog(
+        conn,
+        "encode_source_catalog",
+        "encode_source_usability",
+        ProgressPhase::EncodeTokenSources,
+        parse_pool,
+        progress,
     )?;
 
-    let fallback_total: u64 = conn.query_row(
-        "SELECT count(*)::UBIGINT
-         FROM (
-             SELECT DISTINCT rows.source_file, rows.source_row_number
-             FROM encode_token_source_candidates fallback
-             JOIN analysis_contracts contracts
-               ON contracts.metadata_contract_index = fallback.contract_index
-             JOIN metadata_token_dictionary dictionary
-               ON dictionary.token_index = fallback.token_index
-             JOIN metadata_rows rows
-               ON rows.contract_id = contracts.contract_id
-              AND rows.token_id = dictionary.token_id
-             WHERE NOT fallback.usable
-               AND rows.metadata_eligible
-         ) sources",
-        [],
-        |row| row.get(0),
-    )?;
-    progress(ProgressEvent::determinate(
-        ProgressPhase::EncodeTokenFallbackSources,
+    progress(ProgressEvent::indeterminate(
+        ProgressPhase::EncodeResolveTokenMemberships,
         0,
-        fallback_total,
         WorkUnit::Items,
         EngineCounters::default(),
     ));
     conn.execute_batch(
-        "CREATE TEMP TABLE encode_v3_fallback_source_usability(
-             source_file UINTEGER,
-             source_row_number UBIGINT,
-             usable BOOLEAN
-         );",
+        "CREATE TEMP TABLE encode_token_source_candidates AS
+         SELECT token_rows.contract_index::UINTEGER AS contract_index,
+                token_rows.token_index::UINTEGER AS token_index,
+                token_rows.metadata_source_file AS source_file,
+                token_rows.metadata_source_row_number AS source_row_number,
+                usability.usable
+         FROM metadata_contract_token_rows token_rows
+         JOIN encode_source_usability usability
+           ON usability.source_file = token_rows.metadata_source_file
+          AND usability.source_row_number = token_rows.metadata_source_row_number;
+         CREATE TEMP TABLE encode_resolved_token_sources AS
+         SELECT contract_index, token_index, source_file, source_row_number
+         FROM encode_token_source_candidates
+         WHERE usable;",
     )?;
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT
-                rows.source_file,
-                rows.source_row_number,
-                rows.metadata_json
+    progress(ProgressEvent::determinate(
+        ProgressPhase::EncodeResolveTokenMemberships,
+        expected_rows,
+        expected_rows,
+        WorkUnit::Items,
+        EngineCounters::default(),
+    ));
+
+    progress(ProgressEvent::indeterminate(
+        ProgressPhase::EncodeTokenFallbackSources,
+        0,
+        WorkUnit::Items,
+        EngineCounters::default(),
+    ));
+    conn.execute_batch(
+        "CREATE TEMP TABLE encode_fallback_source_catalog AS
+         SELECT DISTINCT rows.source_file::UINTEGER AS source_file,
+                         rows.source_row_number::UBIGINT AS source_row_number,
+                         rows.metadata_json
          FROM encode_token_source_candidates fallback
          JOIN analysis_contracts contracts
            ON contracts.metadata_contract_index = fallback.contract_index
@@ -1784,36 +1636,21 @@ fn build_retained_token_source_spool(
            ON rows.contract_id = contracts.contract_id
           AND rows.token_id = dictionary.token_id
          WHERE NOT fallback.usable
-           AND rows.metadata_eligible
-         ORDER BY rows.source_file,
-                  rows.source_row_number",
+           AND rows.metadata_eligible;
+         CREATE TEMP TABLE encode_fallback_source_usability(
+             source_file UINTEGER,
+             source_row_number UBIGINT,
+             usable BOOLEAN
+         );",
     )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, u32>(0)?,
-            row.get::<_, u64>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })?;
-    let mut completed = 0u64;
-    {
-        let mut appender = conn.appender("encode_v3_fallback_source_usability")?;
-        for row in rows {
-            let (source_file, source_row_number, metadata_json) = row?;
-            let usable = !parse_metadata_documents(&metadata_json)
-                .prefilter_tokens
-                .is_empty();
-            appender.append_row((source_file, source_row_number, usable))?;
-            completed = completed.saturating_add(1);
-            emit_encode_progress(
-                progress,
-                ProgressPhase::EncodeTokenFallbackSources,
-                completed,
-                fallback_total,
-            );
-        }
-    }
-    drop(stmt);
+    classify_source_catalog(
+        conn,
+        "encode_fallback_source_catalog",
+        "encode_fallback_source_usability",
+        ProgressPhase::EncodeTokenFallbackSources,
+        parse_pool,
+        progress,
+    )?;
     conn.execute_batch(
         "INSERT INTO encode_resolved_token_sources
          SELECT contract_index, token_index, source_file, source_row_number
@@ -1834,7 +1671,7 @@ fn build_retained_token_source_spool(
              JOIN metadata_rows rows
                ON rows.contract_id = contracts.contract_id
               AND rows.token_id = dictionary.token_id
-             JOIN encode_v3_fallback_source_usability usability
+             JOIN encode_fallback_source_usability usability
                ON usability.source_file = rows.source_file
               AND usability.source_row_number = rows.source_row_number
              WHERE NOT fallback.usable
@@ -1845,8 +1682,8 @@ fn build_retained_token_source_spool(
     )?;
 
     conn.execute_batch(
-        "DROP TABLE IF EXISTS encode_v3_source_dictionary;
-         CREATE TEMP TABLE encode_v3_source_dictionary AS
+        "DROP TABLE IF EXISTS encode_source_dictionary;
+         CREATE TEMP TABLE encode_source_dictionary AS
          SELECT (row_number() OVER (
                     ORDER BY source_file, source_row_number
                 ) - 1)::UINTEGER AS source_id,
@@ -1858,46 +1695,8 @@ fn build_retained_token_source_spool(
              FROM encode_resolved_token_sources resolved
          ) sources;",
     )?;
-    let mut source_stmt = conn.prepare(
-        "SELECT dictionary.source_id,
-                dictionary.source_file,
-                dictionary.source_row_number,
-                rows.metadata_json
-         FROM encode_v3_source_dictionary dictionary
-         JOIN metadata_rows rows
-           ON rows.source_file = dictionary.source_file
-          AND rows.source_row_number = dictionary.source_row_number
-         ORDER BY dictionary.source_id",
-    )?;
-    let source_rows = source_stmt.query_map([], |row| {
-        Ok(SourceDictionaryRow {
-            source_id: row.get(0)?,
-            source_file: row.get(1)?,
-            source_row_number: row.get(2)?,
-            metadata_json: row.get(3)?,
-        })
-    })?;
-    let mut membership_stmt = conn.prepare(
-        "SELECT resolved.contract_index,
-                resolved.token_index,
-                dictionary.source_id
-         FROM encode_resolved_token_sources resolved
-         JOIN encode_v3_source_dictionary dictionary
-           ON dictionary.source_file = resolved.source_file
-          AND dictionary.source_row_number = resolved.source_row_number
-         ORDER BY resolved.contract_index,
-                  dictionary.source_id,
-                  resolved.token_index",
-    )?;
-    let membership_rows = membership_stmt.query_map([], |row| {
-        Ok(TokenMembershipRow {
-            contract_index: row.get(0)?,
-            token_id: row.get(1)?,
-            source_id: row.get(2)?,
-        })
-    })?;
     let source_count: u64 = conn.query_row(
-        "SELECT count(*)::UBIGINT FROM encode_v3_source_dictionary",
+        "SELECT count(*)::UBIGINT FROM encode_source_dictionary",
         [],
         |row| row.get(0),
     )?;
@@ -1909,103 +1708,348 @@ fn build_retained_token_source_spool(
     let source_count = u32::try_from(source_count).map_err(|_| {
         AnalysisError::InvalidData("token source dictionary exceeds u32 identity space".into())
     })?;
-    let source_json_bytes: u64 = conn.query_row(
-        "SELECT coalesce(sum(octet_length(encode(rows.metadata_json))), 0)::UBIGINT
-         FROM encode_v3_source_dictionary dictionary
-         JOIN metadata_rows rows
-           ON rows.source_file = dictionary.source_file
-          AND rows.source_row_number = dictionary.source_row_number",
-        [],
-        |row| row.get(0),
-    )?;
-    let (max_contract_json_bytes, max_contract_source_count, max_contract_membership_count): (
-        u64,
-        u64,
-        u64,
-    ) = conn.query_row(
-        "WITH contract_sources AS (
-             SELECT DISTINCT resolved.contract_index,
-                             resolved.source_file,
-                             resolved.source_row_number
-             FROM encode_resolved_token_sources resolved
-         ),
-         source_totals AS (
-             SELECT sources.contract_index,
-                    sum(octet_length(encode(rows.metadata_json)))::UBIGINT AS json_bytes,
-                    count(*)::UBIGINT AS source_count
-             FROM contract_sources sources
-             JOIN metadata_rows rows
-               ON rows.source_file = sources.source_file
-              AND rows.source_row_number = sources.source_row_number
-             GROUP BY sources.contract_index
-         ),
-         membership_totals AS (
-             SELECT contract_index, count(*)::UBIGINT AS membership_count
-             FROM encode_resolved_token_sources
-             GROUP BY contract_index
-         )
-         SELECT coalesce(max(source_totals.json_bytes), 0)::UBIGINT,
-                coalesce(max(source_totals.source_count), 0)::UBIGINT,
-                coalesce(max(membership_totals.membership_count), 0)::UBIGINT
-         FROM source_totals
-         FULL OUTER JOIN membership_totals USING (contract_index)",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
-    let planned_store_peak = planned_token_source_store_peak(
-        *contract_count,
-        source_count,
+    let sources = load_token_source_records(conn, source_count, parse_pool, progress)?;
+    let mut memberships = load_token_memberships(conn, membership_count, parse_pool, progress)?;
+    progress(ProgressEvent::indeterminate(
+        ProgressPhase::EncodeSortTokenMemberships,
+        0,
+        WorkUnit::Items,
+        EngineCounters::default(),
+    ));
+    parse_pool.install(|| memberships.par_sort_unstable());
+    validate_token_memberships(&memberships, contract_count, source_count)?;
+    progress(ProgressEvent::indeterminate(
+        ProgressPhase::EncodeSortTokenMemberships,
         membership_count,
-        source_json_bytes,
-    )?;
-    let planned_final_bytes = planned_token_source_final_bytes(
-        source_json_bytes,
-        u64::from(source_count),
-        membership_count,
-    )?;
-    let storage_lease = storage
-        .reserve(
-            ArtifactClass::Feature,
-            planned_final_bytes,
-            planned_store_peak,
-        )
-        .map_err(storage_err)?;
-    let dynamic_memory_bytes = planned_dynamic_token_memory_bytes(
-        max_contract_json_bytes,
-        max_contract_source_count,
-        max_contract_membership_count,
-    )?;
-    let memory_lease = memory
-        .reserve(dynamic_memory_bytes.saturating_sub(*baseline_feature_bytes))
-        .map_err(|error| {
-            AnalysisError::InvalidData(format!("metadata encode dynamic memory admission: {error}"))
-        })?;
-    let store = write_external_token_source_store(
-        spool_path,
-        &TokenSourceStorePlan {
-            owner_identity: (*owner_identity).to_owned(),
-            contract_count: *contract_count,
-            source_count,
-            membership_count,
-        },
-        source_rows.map(|row| row.map_err(|error| std::io::Error::other(error.to_string()))),
-        membership_rows.map(|row| row.map_err(|error| std::io::Error::other(error.to_string()))),
-    )?;
-    drop(source_stmt);
-    drop(membership_stmt);
+        WorkUnit::Items,
+        EngineCounters::default(),
+    ));
+    let contract_offsets = token_membership_offsets(&memberships, contract_count)?;
     conn.execute_batch(
         "DROP TABLE encode_token_source_candidates;
          DROP TABLE encode_resolved_token_sources;
-         DROP TABLE encode_v3_source_dictionary;
-         DROP TABLE encode_v3_source_usability;
-         DROP TABLE encode_v3_fallback_source_usability;",
+         DROP TABLE encode_source_dictionary;
+         DROP TABLE encode_source_catalog;
+         DROP TABLE encode_fallback_source_catalog;
+         DROP TABLE encode_source_usability;
+         DROP TABLE encode_fallback_source_usability;",
     )?;
-    Ok(TokenSourceSpool {
-        store,
-        admitted_peak_bytes: planned_store_peak,
-        _storage_lease: storage_lease,
-        _memory_lease: memory_lease,
+    let source_json_bytes = sources
+        .iter()
+        .try_fold(0u64, |total, source| {
+            total.checked_add(source.metadata_json.len() as u64)
+        })
+        .ok_or_else(|| AnalysisError::InvalidData("token-source JSON size overflow".into()))?;
+    let logical_bytes = capacity_bytes::<TokenSourceRecord>(sources.capacity())?
+        .checked_add(source_json_bytes)
+        .and_then(|bytes| {
+            bytes.checked_add(
+                capacity_bytes::<ResolvedTokenMembership>(memberships.capacity()).ok()?,
+            )
+        })
+        .and_then(|bytes| {
+            bytes.checked_add(capacity_bytes::<usize>(contract_offsets.capacity()).ok()?)
+        })
+        .ok_or_else(|| AnalysisError::InvalidData("token-source memory size overflow".into()))?;
+    Ok(TokenSourceRelation {
+        sources,
+        memberships,
+        contract_offsets,
+        logical_bytes,
     })
+}
+
+fn classify_source_catalog(
+    conn: &Connection,
+    catalog_table: &str,
+    output_table: &str,
+    phase: ProgressPhase,
+    parse_pool: &rayon::ThreadPool,
+    progress: &mut impl FnMut(ProgressEvent),
+) -> Result<u64, AnalysisError> {
+    let total: u64 = conn.query_row(
+        &format!("SELECT count(*)::UBIGINT FROM {catalog_table}"),
+        [],
+        |row| row.get(0),
+    )?;
+    progress(ProgressEvent::determinate(
+        phase,
+        0,
+        total,
+        WorkUnit::Items,
+        EngineCounters::default(),
+    ));
+    let mut statement = conn.prepare(&format!(
+        "SELECT source_file, source_row_number, metadata_json FROM {catalog_table}"
+    ))?;
+    let batches = statement.query_arrow([])?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("source_file", DataType::UInt32, false),
+        Field::new("source_row_number", DataType::UInt64, false),
+        Field::new("usable", DataType::Boolean, false),
+    ]));
+    let mut appender = conn.appender(output_table)?;
+    let mut completed = 0u64;
+    for batch in batches {
+        let source_files = required_arrow_column::<UInt32Array>(&batch, 0, "source_file")?;
+        let source_rows = required_arrow_column::<UInt64Array>(&batch, 1, "source_row_number")?;
+        let json = batch.column(2).as_ref();
+        let usable = parse_pool.install(|| {
+            (0..batch.num_rows())
+                .into_par_iter()
+                .map(|index| {
+                    if source_files.is_null(index)
+                        || source_rows.is_null(index)
+                        || json.is_null(index)
+                    {
+                        return Err(AnalysisError::InvalidData(
+                            "token-source catalog contains NULL".into(),
+                        ));
+                    }
+                    Ok(
+                        !parse_metadata_documents(required_arrow_string(json, index)?)
+                            .prefilter_tokens
+                            .is_empty(),
+                    )
+                })
+                .collect::<Result<Vec<_>, AnalysisError>>()
+        })?;
+        let output = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                batch.column(0).clone(),
+                batch.column(1).clone(),
+                Arc::new(BooleanArray::from(usable)),
+            ],
+        )
+        .map_err(|error| AnalysisError::InvalidData(format!("source usability batch: {error}")))?;
+        appender.append_record_batch(output)?;
+        completed = completed.saturating_add(batch.num_rows() as u64);
+        progress(ProgressEvent::determinate(
+            phase,
+            completed,
+            total,
+            WorkUnit::Items,
+            EngineCounters::default(),
+        ));
+    }
+    if completed != total {
+        return Err(AnalysisError::InvalidData(format!(
+            "source usability count differs from catalog ({completed} != {total})"
+        )));
+    }
+    Ok(total)
+}
+
+fn load_token_source_records(
+    conn: &Connection,
+    source_count: u32,
+    parse_pool: &rayon::ThreadPool,
+    progress: &mut impl FnMut(ProgressEvent),
+) -> Result<Vec<TokenSourceRecord>, AnalysisError> {
+    let total = u64::from(source_count);
+    progress(ProgressEvent::determinate(
+        ProgressPhase::EncodeLoadTokenSources,
+        0,
+        total,
+        WorkUnit::Items,
+        EngineCounters::default(),
+    ));
+    let mut statement = conn.prepare(
+        "SELECT dictionary.source_id,
+                dictionary.source_file,
+                dictionary.source_row_number,
+                rows.metadata_json
+         FROM encode_source_dictionary dictionary
+         JOIN metadata_rows rows
+           ON rows.source_file = dictionary.source_file
+          AND rows.source_row_number = dictionary.source_row_number
+         ORDER BY dictionary.source_id",
+    )?;
+    let batches = statement.query_arrow([])?;
+    let mut sources = Vec::with_capacity(source_count as usize);
+    for batch in batches {
+        let source_ids = required_arrow_column::<UInt32Array>(&batch, 0, "source_id")?;
+        let source_files = required_arrow_column::<UInt32Array>(&batch, 1, "source_file")?;
+        let source_rows = required_arrow_column::<UInt64Array>(&batch, 2, "source_row_number")?;
+        let json = batch.column(3).as_ref();
+        let first_id = sources.len();
+        let batch_sources = parse_pool.install(|| {
+            (0..batch.num_rows())
+                .into_par_iter()
+                .map(|index| {
+                    if source_ids.is_null(index)
+                        || source_files.is_null(index)
+                        || source_rows.is_null(index)
+                        || json.is_null(index)
+                    {
+                        return Err(AnalysisError::InvalidData(
+                            "token-source dictionary contains NULL".into(),
+                        ));
+                    }
+                    let expected = u32::try_from(first_id + index).map_err(|_| {
+                        AnalysisError::InvalidData("token-source dictionary exceeds u32".into())
+                    })?;
+                    if source_ids.value(index) != expected {
+                        return Err(AnalysisError::InvalidData(
+                            "token-source dictionary IDs are not dense".into(),
+                        ));
+                    }
+                    Ok(TokenSourceRecord {
+                        source_file: source_files.value(index),
+                        source_row_number: source_rows.value(index),
+                        metadata_json: Arc::from(required_arrow_string(json, index)?),
+                    })
+                })
+                .collect::<Result<Vec<_>, AnalysisError>>()
+        })?;
+        sources.extend(batch_sources);
+        progress(ProgressEvent::determinate(
+            ProgressPhase::EncodeLoadTokenSources,
+            sources.len() as u64,
+            total,
+            WorkUnit::Items,
+            EngineCounters::default(),
+        ));
+    }
+    if sources.len() != source_count as usize {
+        return Err(AnalysisError::InvalidData(
+            "token-source dictionary count differs from plan".into(),
+        ));
+    }
+    Ok(sources)
+}
+
+fn load_token_memberships(
+    conn: &Connection,
+    membership_count: u64,
+    parse_pool: &rayon::ThreadPool,
+    progress: &mut impl FnMut(ProgressEvent),
+) -> Result<Vec<ResolvedTokenMembership>, AnalysisError> {
+    let capacity = usize::try_from(membership_count).map_err(|_| {
+        AnalysisError::InvalidData("token membership count exceeds addressable memory".into())
+    })?;
+    progress(ProgressEvent::determinate(
+        ProgressPhase::EncodeLoadTokenMemberships,
+        0,
+        membership_count,
+        WorkUnit::Items,
+        EngineCounters::default(),
+    ));
+    let mut statement = conn.prepare(
+        "SELECT resolved.contract_index::UINTEGER,
+                resolved.token_index::UINTEGER,
+                dictionary.source_id
+         FROM encode_resolved_token_sources resolved
+         JOIN encode_source_dictionary dictionary
+           ON dictionary.source_file = resolved.source_file
+          AND dictionary.source_row_number = resolved.source_row_number",
+    )?;
+    let batches = statement.query_arrow([])?;
+    let mut memberships = Vec::with_capacity(capacity);
+    for batch in batches {
+        let contracts = required_arrow_column::<UInt32Array>(&batch, 0, "contract_index")?;
+        let tokens = required_arrow_column::<UInt32Array>(&batch, 1, "token_index")?;
+        let sources = required_arrow_column::<UInt32Array>(&batch, 2, "source_id")?;
+        let batch_memberships = parse_pool.install(|| {
+            (0..batch.num_rows())
+                .into_par_iter()
+                .map(|index| {
+                    if contracts.is_null(index) || tokens.is_null(index) || sources.is_null(index) {
+                        return Err(AnalysisError::InvalidData(
+                            "resolved token membership contains NULL".into(),
+                        ));
+                    }
+                    Ok(ResolvedTokenMembership {
+                        contract_index: contracts.value(index),
+                        source_id: sources.value(index),
+                        token_id: tokens.value(index),
+                    })
+                })
+                .collect::<Result<Vec<_>, AnalysisError>>()
+        })?;
+        memberships.extend(batch_memberships);
+        progress(ProgressEvent::determinate(
+            ProgressPhase::EncodeLoadTokenMemberships,
+            memberships.len() as u64,
+            membership_count,
+            WorkUnit::Items,
+            EngineCounters::default(),
+        ));
+    }
+    if memberships.len() != capacity {
+        return Err(AnalysisError::InvalidData(
+            "resolved token membership count differs from plan".into(),
+        ));
+    }
+    Ok(memberships)
+}
+
+fn required_arrow_column<'a, T: Array + 'static>(
+    batch: &'a RecordBatch,
+    index: usize,
+    name: &str,
+) -> Result<&'a T, AnalysisError> {
+    batch
+        .column(index)
+        .as_any()
+        .downcast_ref::<T>()
+        .ok_or_else(|| AnalysisError::InvalidData(format!("Arrow column {name} has wrong type")))
+}
+
+fn required_arrow_string(array: &dyn Array, index: usize) -> Result<&str, AnalysisError> {
+    if let Some(strings) = array.as_any().downcast_ref::<StringArray>() {
+        return Ok(strings.value(index));
+    }
+    if let Some(strings) = array.as_any().downcast_ref::<StringViewArray>() {
+        return Ok(strings.value(index));
+    }
+    Err(AnalysisError::InvalidData(
+        "Arrow metadata_json column is not a string array".into(),
+    ))
+}
+
+fn validate_token_memberships(
+    memberships: &[ResolvedTokenMembership],
+    contract_count: u32,
+    source_count: u32,
+) -> Result<(), AnalysisError> {
+    if memberships.iter().any(|membership| {
+        membership.contract_index >= contract_count || membership.source_id >= source_count
+    }) {
+        return Err(AnalysisError::InvalidData(
+            "resolved token membership identity is out of range".into(),
+        ));
+    }
+    if memberships.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(AnalysisError::InvalidData(
+            "resolved token memberships are duplicated or not strictly ordered".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn token_membership_offsets(
+    memberships: &[ResolvedTokenMembership],
+    contract_count: u32,
+) -> Result<Vec<usize>, AnalysisError> {
+    let count = usize::try_from(contract_count)
+        .map_err(|_| AnalysisError::InvalidData("metadata contract count exceeds usize".into()))?;
+    let mut offsets = Vec::with_capacity(count.saturating_add(1));
+    offsets.push(0);
+    let mut cursor = 0usize;
+    for contract in 0..contract_count {
+        while cursor < memberships.len() && memberships[cursor].contract_index == contract {
+            cursor += 1;
+        }
+        offsets.push(cursor);
+    }
+    if cursor != memberships.len() {
+        return Err(AnalysisError::InvalidData(
+            "resolved token membership contract is out of range".into(),
+        ));
+    }
+    Ok(offsets)
 }
 
 fn emit_encode_progress(
@@ -2220,41 +2264,37 @@ pub(super) fn estimate_encode_storage_bytes(
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    let (token_rows, _) = token_source_spool_dimensions(conn)?;
+    let (token_rows, token_json_bytes) = token_source_relation_dimensions(conn)?;
     let final_bytes = raw_bytes
         .checked_mul(16)
         .and_then(|bytes| bytes.checked_add(source_rows.checked_mul(2_048)?))
         .and_then(|bytes| bytes.checked_add(token_rows.checked_mul(32)?))
         .and_then(|bytes| bytes.checked_add(64 * 1024 * 1024))
         .ok_or_else(|| AnalysisError::InvalidData("Encode storage estimate overflow".into()))?;
-    let token_spool_peak_bytes = planned_token_relation_peak(token_rows, source_rows)?;
-    let partial_peak_bytes = token_spool_peak_bytes;
+    let token_relation_peak_bytes =
+        planned_token_relation_peak(token_rows, source_rows, token_json_bytes)?;
+    let partial_peak_bytes = ENCODE_RESIDENT_FIXED_BYTES;
     let modeled_resident_peak = raw_bytes
         .checked_mul(4)
         .and_then(|bytes| bytes.checked_add(source_rows.checked_mul(2_048)?))
         .and_then(|bytes| bytes.checked_add(token_rows.checked_mul(24)?))
+        .and_then(|bytes| bytes.checked_add(token_json_bytes))
         .and_then(|bytes| bytes.checked_add(64 * 1024 * 1024))
         .ok_or_else(|| AnalysisError::InvalidData("Encode memory estimate overflow".into()))?;
     // The global payload/interner/CSR state grows with all unique small
     // documents, not just the largest contract. Use the complete conservative
     // durable envelope as the global resident admission floor; this avoids a
     // second JSON preflight while covering high-cardinality payload/term maps.
-    let resident_peak_bytes = modeled_resident_peak.max(final_bytes);
-    // The precise external token-source store takes its own lease once its
-    // dictionary is frozen. Exclude a conservative external-store slice from
-    // this provisional feature lease so the same durable bytes are not
-    // reserved twice.
-    let external_store_envelope = raw_bytes
-        .saturating_mul(2)
-        .saturating_add(token_rows.saturating_mul(16))
-        .max(1);
-    let provisional_feature_bytes = final_bytes.saturating_sub(external_store_envelope);
+    let resident_peak_bytes = modeled_resident_peak
+        .max(final_bytes)
+        .max(token_relation_peak_bytes);
+    let provisional_feature_bytes = final_bytes;
     Ok(EncodeAdmissionEstimate {
         final_bytes,
         provisional_feature_bytes,
         resident_peak_bytes,
         partial_peak_bytes,
-        token_spool_peak_bytes,
+        token_relation_peak_bytes,
         representative_rows: source_rows,
         token_rows,
     })
@@ -2329,12 +2369,9 @@ mod memory_dedup_tests {
     use std::sync::Arc;
 
     use super::{
-        intern_payload_with_parser, payload_feature_identity_ids,
-        planned_dynamic_token_memory_bytes, planned_encoded_contract_growth,
-        planned_token_relation_peak, planned_token_source_final_bytes,
-        write_external_token_source_store, EncodePayloadRow, EncodeResidentAccounting,
-        EncodeResidentAdmission, PayloadTermInterner, SourceDictionaryRow, TokenMembershipRow,
-        TokenSourceInput, TokenSourceStorePlan,
+        intern_payload_with_parser, payload_feature_identity_ids, planned_encoded_contract_growth,
+        planned_token_relation_peak, EncodePayloadRow, EncodeResidentAccounting,
+        EncodeResidentAdmission, PayloadTermInterner, TokenSourceInput,
     };
     use metadata_engine::encode::{
         parse_metadata_documents, EncodeContractRow, EncodeSourceRow, PayloadCasWriter,
@@ -2449,153 +2486,12 @@ mod memory_dedup_tests {
     }
 
     #[test]
-    fn token_source_spool_buffers_by_contract_not_total_repeated_rows() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("token-sources.bin");
-        let sources = (0..10_000u32).map(|source_id| {
-            Ok(SourceDictionaryRow {
-                source_id,
-                source_file: 7,
-                source_row_number: u64::from(source_id),
-                metadata_json: r#"{"description":"same payload"}"#.to_owned(),
-            })
-        });
-        let memberships = (0..10_000u32).map(|contract_index| {
-            Ok(TokenMembershipRow {
-                contract_index,
-                token_id: contract_index,
-                source_id: contract_index,
-            })
-        });
-
-        let mut spool = write_external_token_source_store(
-            &path,
-            &TokenSourceStorePlan {
-                owner_identity: "test-10k".into(),
-                contract_count: 10_000,
-                source_count: 10_000,
-                membership_count: 10_000,
-            },
-            sources,
-            memberships,
-        )
-        .unwrap();
-
-        for contract_index in [0, 4_999, 9_999] {
-            let sources = spool.read_contract(contract_index).unwrap();
-            assert_eq!(sources.len(), 1);
-            assert_eq!(sources[0].token_ids, [contract_index]);
-        }
-    }
-
-    #[test]
-    fn token_source_spool_stores_each_source_coordinate_json_once() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("token-sources.bin");
-        let json = r#"{"description":"shared source coordinate"}"#;
-        let sources = [Ok(SourceDictionaryRow {
-            source_id: 0,
-            source_file: 7,
-            source_row_number: 11,
-            metadata_json: json.to_owned(),
-        })];
-        let memberships = (0..128u32).map(|contract_index| {
-            Ok(TokenMembershipRow {
-                contract_index,
-                token_id: contract_index,
-                source_id: 0,
-            })
-        });
-
-        drop(
-            write_external_token_source_store(
-                &path,
-                &TokenSourceStorePlan {
-                    owner_identity: "test-shared".into(),
-                    contract_count: 128,
-                    source_count: 1,
-                    membership_count: 128,
-                },
-                sources,
-                memberships,
-            )
-            .unwrap(),
-        );
-        let bytes = std::fs::read(path).unwrap();
-        let occurrences = bytes
-            .windows(json.len())
-            .filter(|window| *window == json.as_bytes())
-            .count();
-
-        assert_eq!(
-            occurrences, 1,
-            "the source dictionary must persist one JSON body per source coordinate"
-        );
-    }
-
-    #[test]
-    fn token_source_store_reads_one_json_per_source_group() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("token-sources.bin");
-        let sources = [Ok(SourceDictionaryRow {
-            source_id: 0,
-            source_file: 7,
-            source_row_number: 11,
-            metadata_json: r#"{"description":"one source"}"#.to_owned(),
-        })];
-        let memberships = (0..100_000u32).map(|token_id| {
-            Ok(TokenMembershipRow {
-                contract_index: 0,
-                token_id,
-                source_id: 0,
-            })
-        });
-        let mut store = write_external_token_source_store(
-            &path,
-            &TokenSourceStorePlan {
-                owner_identity: "test-whale".into(),
-                contract_count: 1,
-                source_count: 1,
-                membership_count: 100_000,
-            },
-            sources,
-            memberships,
-        )
-        .unwrap();
-
-        let decoded = store.read_contract(0).unwrap();
-
-        assert_eq!(decoded.len(), 1, "one source must decode to one JSON owner");
-        assert_eq!(decoded[0].token_ids.len(), 100_000);
-    }
-
-    #[test]
-    fn token_source_relation_admission_is_fixed_width_not_json_amplified() {
+    fn token_source_relation_admission_includes_json_and_fixed_width_rows() {
         let rows = 10_000u64;
 
         assert_eq!(
-            planned_token_relation_peak(rows, rows).unwrap(),
-            rows * 72 + 64 * 1024 * 1024
+            planned_token_relation_peak(rows, rows, rows * 128).unwrap(),
+            rows * 200 + 64 * 1024 * 1024
         );
-    }
-
-    #[test]
-    fn token_source_final_storage_scales_with_distinct_sources_not_token_rows() {
-        let bytes = planned_token_source_final_bytes(1_000, 2, 100_000).unwrap();
-        assert_eq!(
-            bytes,
-            1_000 * 16 + 2 * 1_024 + 100_000 * 32 + 64 * 1024 * 1024
-        );
-    }
-
-    #[test]
-    fn dynamic_memory_admission_scales_with_the_largest_contract_not_the_store() {
-        let small_whale = planned_dynamic_token_memory_bytes(64 * 1024, 1, 100_000).unwrap();
-        let larger_whale = planned_dynamic_token_memory_bytes(128 * 1024, 2, 200_000).unwrap();
-        assert_eq!(
-            small_whale,
-            64 * 1024 * 3 + 128 + 100_000 * 8 + 64 * 1024 * 1024
-        );
-        assert!(larger_whale > small_whale);
     }
 }

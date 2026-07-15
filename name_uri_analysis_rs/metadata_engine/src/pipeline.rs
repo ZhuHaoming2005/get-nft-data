@@ -3,7 +3,7 @@
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use thiserror::Error;
@@ -179,6 +179,88 @@ struct GroupAccumulator {
     has_secondary: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct SummaryStats {
+    group_count: i64,
+    duplicate_contract_count: i64,
+    duplicate_nft_count: i64,
+    group_size_ge_2_count: i64,
+    group_size_gt_2_count: i64,
+}
+
+struct SummaryRowRequest<'a> {
+    scope: &'a str,
+    primary: usize,
+    secondary: Option<usize>,
+    roots: &'a [u32],
+    require_secondary: bool,
+    contract_ids: &'a [u32],
+}
+
+struct DenseSummaryScratch {
+    groups: Vec<GroupAccumulator>,
+    touched: Vec<u32>,
+}
+
+impl DenseSummaryScratch {
+    fn new(root_capacity: usize) -> Self {
+        Self {
+            groups: std::iter::repeat_with(GroupAccumulator::default)
+                .take(root_capacity)
+                .collect(),
+            touched: Vec::new(),
+        }
+    }
+
+    fn summarize(
+        &mut self,
+        roots: &[u32],
+        contracts: impl IntoIterator<Item = (usize, bool, i64)>,
+        require_secondary: bool,
+    ) -> SummaryStats {
+        if self.groups.len() < roots.len() {
+            self.groups
+                .resize_with(roots.len(), GroupAccumulator::default);
+        }
+        self.touched.clear();
+        for (contract, primary, nfts) in contracts {
+            let Some(&root) = roots.get(contract) else {
+                continue;
+            };
+            let Some(group) = self.groups.get_mut(root as usize) else {
+                continue;
+            };
+            if group.total == 0 {
+                self.touched.push(root);
+            }
+            group.total += 1;
+            if primary {
+                group.primary += 1;
+                group.primary_nfts = group.primary_nfts.saturating_add(nfts);
+            } else {
+                group.has_secondary = true;
+            }
+        }
+        let mut stats = SummaryStats::default();
+        for &root in &self.touched {
+            let group = &self.groups[root as usize];
+            if group.primary != 0 && group.total >= 2 && (!require_secondary || group.has_secondary)
+            {
+                stats.group_count += 1;
+                stats.duplicate_contract_count += group.primary;
+                stats.duplicate_nft_count =
+                    stats.duplicate_nft_count.saturating_add(group.primary_nfts);
+                stats.group_size_ge_2_count += 1;
+                stats.group_size_gt_2_count += i64::from(group.total > 2);
+            }
+        }
+        for &root in &self.touched {
+            self.groups[root as usize] = GroupAccumulator::default();
+        }
+        stats
+    }
+}
+
 struct ScopeEdgeCollectors {
     intra: EdgeCollector,
     cross: EdgeCollector,
@@ -222,6 +304,32 @@ impl ScopeEdgeCollectors {
             self.chain_pairs[chain_pair_index(left_chain, right_chain, chain_count)].push(edge)?;
         }
         self.accepted_edges = self.accepted_edges.saturating_add(1);
+        self.enforce_retained_budget()
+    }
+
+    fn push_compacted_catalog_batch(
+        &mut self,
+        batch: CompactedCatalogEdges,
+    ) -> Result<(), crate::reduce::ReduceError> {
+        for edge in batch.intra {
+            self.intra.push(edge)?;
+        }
+        for edge in batch.cross {
+            self.cross.push(edge)?;
+        }
+        for (pair, edges) in batch.chain_pairs {
+            let Some(collector) = self.chain_pairs.get_mut(pair) else {
+                return Err(crate::reduce::ReduceError::WorkOverflow);
+            };
+            for edge in edges {
+                collector.push(edge)?;
+            }
+        }
+        self.accepted_edges = self.accepted_edges.saturating_add(batch.accepted_edges);
+        self.enforce_retained_budget()
+    }
+
+    fn enforce_retained_budget(&mut self) -> Result<(), crate::reduce::ReduceError> {
         let mut retained = self.retained_bytes();
         if retained > self.max_retained_bytes {
             self.intra.compact_retained()?;
@@ -374,11 +482,92 @@ pub enum PipelineError {
 }
 
 enum CatalogMessage {
-    Edges(Vec<Edge>),
+    CompactedEdges(CompactedCatalogEdges),
     RoutingWork(u64),
     ExpansionWork(u64),
     Error(PipelineError),
     JobDone(IndexMetrics),
+}
+
+struct CompactedCatalogEdges {
+    intra: Vec<Edge>,
+    cross: Vec<Edge>,
+    chain_pairs: Vec<(usize, Vec<Edge>)>,
+    accepted_edges: u64,
+}
+
+fn compact_catalog_scope_batch(
+    features: &crate::encode::FeatureView,
+    chain_count: usize,
+    edges: Vec<Edge>,
+) -> CompactedCatalogEdges {
+    let accepted_edges = edges.len() as u64;
+    let mut intra = Vec::new();
+    let mut cross = Vec::new();
+    let mut chain_pairs = BTreeMap::<usize, Vec<Edge>>::new();
+    for edge in edges {
+        let left_chain = features.contract_chain[edge.left as usize] as usize;
+        let right_chain = features.contract_chain[edge.right as usize] as usize;
+        if left_chain == right_chain {
+            intra.push(edge);
+        } else {
+            cross.push(edge);
+            chain_pairs
+                .entry(chain_pair_index(left_chain, right_chain, chain_count))
+                .or_default()
+                .push(edge);
+        }
+    }
+    CompactedCatalogEdges {
+        intra: compact_scope_edges(intra),
+        cross: compact_scope_edges(cross),
+        chain_pairs: chain_pairs
+            .into_iter()
+            .map(|(pair, edges)| (pair, compact_scope_edges(edges)))
+            .collect(),
+        accepted_edges,
+    }
+}
+
+fn compact_scope_edges(mut edges: Vec<Edge>) -> Vec<Edge> {
+    edges.sort_unstable();
+    edges.dedup();
+    let mut identities = HashMap::<u32, usize>::new();
+    let mut parent = Vec::<usize>::new();
+    let mut forest = Vec::new();
+    for edge in edges {
+        let left = *identities.entry(edge.left).or_insert_with(|| {
+            let id = parent.len();
+            parent.push(id);
+            id
+        });
+        let right = *identities.entry(edge.right).or_insert_with(|| {
+            let id = parent.len();
+            parent.push(id);
+            id
+        });
+        let left_root = sparse_find(&mut parent, left);
+        let right_root = sparse_find(&mut parent, right);
+        if left_root != right_root {
+            parent[right_root] = left_root;
+            forest.push(edge);
+        }
+    }
+    forest
+}
+
+fn sparse_find(parent: &mut [usize], node: usize) -> usize {
+    let mut root = node;
+    while parent[root] != root {
+        root = parent[root];
+    }
+    let mut cursor = node;
+    while parent[cursor] != cursor {
+        let next = parent[cursor];
+        parent[cursor] = root;
+        cursor = next;
+    }
+    root
 }
 
 enum SharedMessage {
@@ -395,7 +584,7 @@ fn score_catalog_parallel(
     chain_count: usize,
     progress: &mut impl FnMut(ProgressEvent),
 ) -> Result<IndexMetrics, PipelineError> {
-    const EDGE_BATCH: usize = 4_096;
+    const EDGE_BATCH: usize = 32_768;
     let routing_total = catalog.jobs.iter().try_fold(0u64, |total, job| {
         let first = job.first_block as usize;
         let end = first.saturating_add(job.block_count as usize);
@@ -450,8 +639,13 @@ fn score_catalog_parallel(
                                             &mut batch,
                                             Vec::with_capacity(EDGE_BATCH),
                                         );
+                                        let ready = compact_catalog_scope_batch(
+                                            snapshot.features(),
+                                            chain_count,
+                                            ready,
+                                        );
                                         if producer_sender
-                                            .send(CatalogMessage::Edges(ready))
+                                            .send(CatalogMessage::CompactedEdges(ready))
                                             .is_err()
                                         {
                                             send_failed.set(true);
@@ -487,10 +681,15 @@ fn score_catalog_parallel(
                             }
                         },
                     );
-                    if !batch.is_empty()
-                        && producer_sender.send(CatalogMessage::Edges(batch)).is_err()
-                    {
-                        return;
+                    if !batch.is_empty() {
+                        let batch =
+                            compact_catalog_scope_batch(snapshot.features(), chain_count, batch);
+                        if producer_sender
+                            .send(CatalogMessage::CompactedEdges(batch))
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
                     if pending_expansion > 0
                         && producer_sender
@@ -510,15 +709,10 @@ fn score_catalog_parallel(
         let mut collection_error = None;
         for message in receiver {
             match message {
-                CatalogMessage::Edges(edges) => {
+                CatalogMessage::CompactedEdges(edges) => {
                     if collection_error.is_none() {
-                        for edge in edges {
-                            if let Err(error) =
-                                collectors.push(snapshot.features(), chain_count, edge)
-                            {
-                                collection_error = Some(error);
-                                break;
-                            }
+                        if let Err(error) = collectors.push_compacted_catalog_batch(edges) {
+                            collection_error = Some(error);
                         }
                     }
                 }
@@ -1148,7 +1342,7 @@ pub fn run_metadata_pipeline_with_progress(
                     ..ProgressCounters::default()
                 },
             ));
-            const CATALOG_LANE_BYTES: u64 = 4 * 1024 * 1024;
+            const CATALOG_LANE_BYTES: u64 = 8 * 1024 * 1024;
             let lanes = memory
                 .active_lanes(config.threads.max(1), 0, CATALOG_LANE_BYTES)
                 .max(1);
@@ -2695,12 +2889,34 @@ fn build_summary_rows_with_progress(
     progress: &mut impl FnMut(ProgressEvent),
 ) -> Vec<MetadataSummaryRow> {
     let mut rows = Vec::new();
-    let row_count = chain_count
-        .saturating_mul(if chain_count > 1 { 2 } else { 1 })
-        .saturating_add(scopes.chain_pair_roots.len().saturating_mul(2));
-    let work_per_row = snapshot.contract_count() as u64;
-    let total = (row_count as u64).saturating_mul(work_per_row);
+    let features = snapshot.features();
+    let mut contracts_by_chain = vec![Vec::<u32>::new(); chain_count];
+    for (contract, &chain) in features.contract_chain.iter().enumerate() {
+        if let Some(contracts) = contracts_by_chain.get_mut(chain as usize) {
+            contracts.push(contract as u32);
+        }
+    }
+    let intra_work = snapshot.contract_count() as u64;
+    let cross_work = if chain_count > 1 {
+        snapshot.contract_count() as u64
+    } else {
+        0
+    };
+    let pair_work = scopes
+        .chain_pair_roots
+        .iter()
+        .map(|pair| {
+            let members = contracts_by_chain[pair.left_chain as usize]
+                .len()
+                .saturating_add(contracts_by_chain[pair.right_chain as usize].len());
+            (members as u64).saturating_mul(2)
+        })
+        .sum::<u64>();
+    let total = intra_work
+        .saturating_add(cross_work)
+        .saturating_add(pair_work);
     let mut completed = 0u64;
+    let mut summary_scratch = DenseSummaryScratch::new(snapshot.contract_count());
     progress(ProgressEvent::determinate(
         ProgressPhase::BuildSummary,
         0,
@@ -2708,20 +2924,50 @@ fn build_summary_rows_with_progress(
         WorkUnit::Nodes,
         ProgressCounters::default(),
     ));
-    let mut append = |scope: &'static str,
-                      primary: usize,
-                      secondary: Option<usize>,
-                      roots: &[u32],
-                      require_secondary: bool| {
-        let row = summary_for_roots(
-            snapshot,
-            scope,
-            primary,
-            secondary,
-            roots,
-            require_secondary,
-            &mut |work| {
-                completed = completed.saturating_add(work).min(total);
+    let cross_stats =
+        (chain_count > 1).then(|| cross_summary_stats(snapshot, &scopes.cross_roots, chain_count));
+    let mut cross_work_reported = false;
+    macro_rules! append {
+        ($scope:expr, $primary:expr, $secondary:expr, $roots:expr, $require_secondary:expr, $contract_ids:expr $(,)?) => {{
+            let row = summary_for_roots(
+                snapshot,
+                SummaryRowRequest {
+                    scope: $scope,
+                    primary: $primary,
+                    secondary: $secondary,
+                    roots: $roots,
+                    require_secondary: $require_secondary,
+                    contract_ids: $contract_ids,
+                },
+                &mut summary_scratch,
+                &mut |work| {
+                    completed = completed.saturating_add(work).min(total);
+                    progress(ProgressEvent::determinate(
+                        ProgressPhase::BuildSummary,
+                        completed,
+                        total,
+                        WorkUnit::Nodes,
+                        ProgressCounters::default(),
+                    ));
+                },
+            );
+            rows.push(row);
+        }};
+    }
+    for chain in 0..chain_count {
+        append!(
+            "intra_chain",
+            chain,
+            None,
+            &scopes.intra_roots,
+            false,
+            &contracts_by_chain[chain],
+        );
+        if let Some(stats) = cross_stats.as_ref() {
+            if !cross_work_reported {
+                completed = completed
+                    .saturating_add(snapshot.contract_count() as u64)
+                    .min(total);
                 progress(ProgressEvent::determinate(
                     ProgressPhase::BuildSummary,
                     completed,
@@ -2729,36 +2975,37 @@ fn build_summary_rows_with_progress(
                     WorkUnit::Nodes,
                     ProgressCounters::default(),
                 ));
-            },
-        );
-        rows.push(row);
-    };
-    for chain in 0..chain_count {
-        append("intra_chain", chain, None, &scopes.intra_roots, false);
-        if chain_count > 1 {
-            append(
+                cross_work_reported = true;
+            }
+            rows.push(summary_row_from_stats(
+                snapshot,
                 "cross_chain_summary",
                 chain,
                 None,
-                &scopes.cross_roots,
-                true,
-            );
+                stats[chain],
+            ));
         }
     }
+    let mut pair_contracts = Vec::new();
     for pair in &scopes.chain_pair_roots {
-        append(
+        pair_contracts.clear();
+        pair_contracts.extend_from_slice(&contracts_by_chain[pair.left_chain as usize]);
+        pair_contracts.extend_from_slice(&contracts_by_chain[pair.right_chain as usize]);
+        append!(
             "chain_matrix",
             pair.left_chain as usize,
             Some(pair.right_chain as usize),
             &pair.roots,
             true,
+            &pair_contracts,
         );
-        append(
+        append!(
             "chain_matrix",
             pair.right_chain as usize,
             Some(pair.left_chain as usize),
             &pair.roots,
             true,
+            &pair_contracts,
         );
     }
     rows
@@ -2766,56 +3013,55 @@ fn build_summary_rows_with_progress(
 
 fn summary_for_roots(
     snapshot: &MetadataSnapshot,
-    scope: &str,
-    primary: usize,
-    secondary: Option<usize>,
-    roots: &[u32],
-    require_secondary: bool,
+    request: SummaryRowRequest<'_>,
+    scratch: &mut DenseSummaryScratch,
     on_work: &mut impl FnMut(u64),
 ) -> MetadataSummaryRow {
     const PROGRESS_CHUNK: u64 = 65_536;
     let f = snapshot.features();
-    let mut groups = BTreeMap::<u32, GroupAccumulator>::new();
     let mut pending_work = 0u64;
-    for (contract, &root) in roots.iter().enumerate().take(f.contract_chain.len()) {
+    let contracts = request
+        .contract_ids
+        .iter()
+        .copied()
+        .map(|contract| contract as usize)
+        .filter(|&contract| contract < request.roots.len() && contract < f.contract_chain.len())
+        .map(|contract| {
+            let chain = f.contract_chain[contract] as usize;
+            (
+                contract,
+                chain == request.primary,
+                i64::try_from(f.contract_weight[contract]).unwrap_or(i64::MAX),
+            )
+        })
+        .collect::<Vec<_>>();
+    for _ in &contracts {
         pending_work += 1;
         if pending_work == PROGRESS_CHUNK {
             on_work(pending_work);
             pending_work = 0;
         }
-        let chain = f.contract_chain[contract] as usize;
-        if secondary.is_some() && chain != primary && Some(chain) != secondary {
-            continue;
-        }
-        let g = groups.entry(root).or_default();
-        g.total += 1;
-        if chain == primary {
-            g.primary += 1;
-            g.primary_nfts = g
-                .primary_nfts
-                .saturating_add(i64::try_from(f.contract_weight[contract]).unwrap_or(i64::MAX));
-        } else {
-            g.has_secondary = true;
-        }
     }
     if pending_work != 0 {
         on_work(pending_work);
     }
-    let mut group_count = 0i64;
-    let mut duplicate_contract_count = 0i64;
-    let mut duplicate_nft_count = 0i64;
-    let mut ge2 = 0i64;
-    let mut gt2 = 0i64;
-    for g in groups.values() {
-        if g.primary == 0 || g.total < 2 || (require_secondary && !g.has_secondary) {
-            continue;
-        }
-        group_count += 1;
-        duplicate_contract_count += g.primary;
-        duplicate_nft_count = duplicate_nft_count.saturating_add(g.primary_nfts);
-        ge2 += i64::from(g.total >= 2);
-        gt2 += i64::from(g.total > 2);
-    }
+    let stats = scratch.summarize(request.roots, contracts, request.require_secondary);
+    summary_row_from_stats(
+        snapshot,
+        request.scope,
+        request.primary,
+        request.secondary,
+        stats,
+    )
+}
+
+fn summary_row_from_stats(
+    snapshot: &MetadataSnapshot,
+    scope: &str,
+    primary: usize,
+    secondary: Option<usize>,
+    stats: SummaryStats,
+) -> MetadataSummaryRow {
     let total = snapshot.chain_totals().get(primary);
     let name = snapshot
         .chain_names()
@@ -2832,12 +3078,84 @@ fn summary_for_roots(
         secondary_chain: secondary_name,
         total_contracts: total.map_or(0, |t| t.contracts),
         total_nfts: total.map_or(0, |t| t.nfts),
-        group_count,
-        duplicate_contract_count,
-        duplicate_nft_count,
-        group_size_ge_2_count: ge2,
-        group_size_gt_2_count: gt2,
+        group_count: stats.group_count,
+        duplicate_contract_count: stats.duplicate_contract_count,
+        duplicate_nft_count: stats.duplicate_nft_count,
+        group_size_ge_2_count: stats.group_size_ge_2_count,
+        group_size_gt_2_count: stats.group_size_gt_2_count,
     }
+}
+
+#[cfg(test)]
+fn dense_summary_stats(
+    roots: &[u32],
+    contracts: impl IntoIterator<Item = (usize, bool, i64)>,
+    require_secondary: bool,
+) -> SummaryStats {
+    DenseSummaryScratch::new(roots.len()).summarize(roots, contracts, require_secondary)
+}
+
+fn cross_summary_stats(
+    snapshot: &MetadataSnapshot,
+    roots: &[u32],
+    chain_count: usize,
+) -> Vec<SummaryStats> {
+    #[derive(Clone, Copy)]
+    struct Entry {
+        root: u32,
+        chain: u32,
+        nfts: i64,
+    }
+    let features = snapshot.features();
+    let mut entries = roots
+        .iter()
+        .copied()
+        .enumerate()
+        .take(features.contract_chain.len())
+        .map(|(contract, root)| Entry {
+            root,
+            chain: features.contract_chain[contract],
+            nfts: i64::try_from(features.contract_weight[contract]).unwrap_or(i64::MAX),
+        })
+        .collect::<Vec<_>>();
+    entries.par_sort_unstable_by_key(|entry| (entry.root, entry.chain));
+    let mut stats = vec![SummaryStats::default(); chain_count];
+    let mut begin = 0usize;
+    let mut chain_entries = Vec::<(usize, i64, i64)>::new();
+    while begin < entries.len() {
+        let root = entries[begin].root;
+        let mut end = begin + 1;
+        while end < entries.len() && entries[end].root == root {
+            end += 1;
+        }
+        chain_entries.clear();
+        let mut cursor = begin;
+        while cursor < end {
+            let chain = entries[cursor].chain as usize;
+            let mut count = 0i64;
+            let mut nfts = 0i64;
+            while cursor < end && entries[cursor].chain as usize == chain {
+                count += 1;
+                nfts = nfts.saturating_add(entries[cursor].nfts);
+                cursor += 1;
+            }
+            chain_entries.push((chain, count, nfts));
+        }
+        let total = (end - begin) as i64;
+        if total >= 2 && chain_entries.len() > 1 {
+            for &(chain, count, nfts) in &chain_entries {
+                if let Some(summary) = stats.get_mut(chain) {
+                    summary.group_count += 1;
+                    summary.duplicate_contract_count += count;
+                    summary.duplicate_nft_count = summary.duplicate_nft_count.saturating_add(nfts);
+                    summary.group_size_ge_2_count += 1;
+                    summary.group_size_gt_2_count += i64::from(total > 2);
+                }
+            }
+        }
+        begin = end;
+    }
+    stats
 }
 
 pub fn default_output_dir(work: &Path) -> PathBuf {
@@ -2854,6 +3172,31 @@ mod tests {
     };
     use crate::evidence::SharedRescueSeed;
     use crate::format::commit_ready;
+
+    #[test]
+    fn lane_local_scope_compaction_preserves_connectivity() {
+        let compacted = compact_scope_edges(vec![
+            Edge::new(0, 1),
+            Edge::new(1, 2),
+            Edge::new(0, 2),
+            Edge::new(0, 1),
+        ]);
+
+        assert_eq!(compacted, vec![Edge::new(0, 1), Edge::new(0, 2)]);
+    }
+
+    #[test]
+    fn dense_summary_scratch_matches_primary_secondary_group_semantics() {
+        let roots = [0, 0, 0, 3];
+        let contracts = [(0usize, true, 10i64), (1, true, 20), (2, false, 30)];
+        let stats = dense_summary_stats(&roots, contracts, true);
+
+        assert_eq!(stats.group_count, 1);
+        assert_eq!(stats.duplicate_contract_count, 2);
+        assert_eq!(stats.duplicate_nft_count, 30);
+        assert_eq!(stats.group_size_ge_2_count, 1);
+        assert_eq!(stats.group_size_gt_2_count, 1);
+    }
 
     #[test]
     fn catalog_expansion_counter_excludes_nonmatching_atom_products() {
@@ -2922,13 +3265,13 @@ mod tests {
         commit_ready(
             &features,
             "features.ready",
-            r#"{"schema_revision":1,"source_count":4,"payload_count":2,"chains":["x"],"chain_totals":[{"name":"x","contracts":4,"nfts":4}]}"#,
+            r#"{"schema_revision":2,"source_count":4,"payload_count":2,"chains":["x"],"chain_totals":[{"name":"x","contracts":4,"nfts":4}]}"#,
         )
         .unwrap();
         commit_ready(
             &blocking,
             "blocking.ready",
-            r#"{"blocking_revision":1,"atom_count":2}"#,
+            r#"{"blocking_revision":2,"atom_count":2}"#,
         )
         .unwrap();
         let snapshot = MetadataSnapshot::open(&features, &blocking).unwrap();
@@ -2993,13 +3336,13 @@ mod tests {
         commit_ready(
             &features,
             "features.ready",
-            r#"{"schema_revision":1,"source_count":3,"payload_count":3,"chains":["x"],"chain_totals":[{"name":"x","contracts":3,"nfts":3}]}"#,
+            r#"{"schema_revision":2,"source_count":3,"payload_count":3,"chains":["x"],"chain_totals":[{"name":"x","contracts":3,"nfts":3}]}"#,
         )
         .unwrap();
         commit_ready(
             &blocking,
             "blocking.ready",
-            r#"{"blocking_revision":1,"atom_count":3}"#,
+            r#"{"blocking_revision":2,"atom_count":3}"#,
         )
         .unwrap();
         let snapshot = MetadataSnapshot::open(&features, &blocking).unwrap();
@@ -3071,13 +3414,13 @@ mod tests {
         commit_ready(
             &features,
             "features.ready",
-            r#"{"schema_revision":1,"source_count":3,"payload_count":3,"chains":["x"],"chain_totals":[{"name":"x","contracts":3,"nfts":3}]}"#,
+            r#"{"schema_revision":2,"source_count":3,"payload_count":3,"chains":["x"],"chain_totals":[{"name":"x","contracts":3,"nfts":3}]}"#,
         )
         .unwrap();
         commit_ready(
             &blocking,
             "blocking.ready",
-            r#"{"blocking_revision":1,"atom_count":3}"#,
+            r#"{"blocking_revision":2,"atom_count":3}"#,
         )
         .unwrap();
         let snapshot = MetadataSnapshot::open(&features, &blocking).unwrap();
@@ -3218,13 +3561,13 @@ mod tests {
         commit_ready(
             &features,
             "features.ready",
-            r#"{"schema_revision":1,"source_count":3,"payload_count":2,"chains":["x"],"chain_totals":[{"name":"x","contracts":3,"nfts":3}]}"#,
+            r#"{"schema_revision":2,"source_count":3,"payload_count":2,"chains":["x"],"chain_totals":[{"name":"x","contracts":3,"nfts":3}]}"#,
         )
         .unwrap();
         commit_ready(
             &blocking,
             "blocking.ready",
-            r#"{"blocking_revision":1,"atom_count":2}"#,
+            r#"{"blocking_revision":2,"atom_count":2}"#,
         )
         .unwrap();
         let snapshot = MetadataSnapshot::open(&features, &blocking).unwrap();

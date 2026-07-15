@@ -588,13 +588,13 @@ fn metadata_encode_ready_rejects_a_missing_feature_dependency() {
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir_all(temp.path().join("partial")).unwrap();
     fs::create_dir_all(temp.path().join("checkpoints")).unwrap();
-    fs::create_dir_all(temp.path().join("artifacts/metadata/encode-1")).unwrap();
+    fs::create_dir_all(temp.path().join("artifacts/metadata/encode-2")).unwrap();
     let partial = temp.path().join("partial/metadata-encode-summary.json");
     fs::write(&partial, br#"{"summary_rows":[]}"#).unwrap();
     let partial_fingerprint = fingerprint_artifact(&partial).unwrap();
     let feature = temp
         .path()
-        .join("artifacts/metadata/encode-1/source_to_payload.u32");
+        .join("artifacts/metadata/encode-2/source_to_payload.u32");
     fs::write(&feature, b"feature").unwrap();
     let feature_fingerprint = fingerprint_artifact(&feature).unwrap();
     let ready = PhaseReady {
@@ -629,8 +629,8 @@ fn match_revision_upgrade_prunes_transient_cas_without_invalidating_encode() {
     let temp = tempfile::tempdir().unwrap();
     let work = temp.path().join("work");
     let checkpoints = work.join("checkpoints");
-    let feature = work.join("artifacts/metadata/encode-1/source_to_payload.u32");
-    let cas = work.join("artifacts/metadata/encode-1/payload_blobs/pack-000.bin");
+    let feature = work.join("artifacts/metadata/encode-2/source_to_payload.u32");
+    let cas = work.join("artifacts/metadata/encode-2/payload_blobs/pack-000.bin");
     fs::create_dir_all(feature.parent().unwrap()).unwrap();
     fs::create_dir_all(cas.parent().unwrap()).unwrap();
     fs::create_dir_all(&checkpoints).unwrap();

@@ -67,13 +67,13 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
     commit_ready(
         &features,
         "features.ready",
-        r#"{"schema_revision":1,"source_count":2,"payload_count":2,"chains":["ethereum"],"chain_totals":[{"name":"ethereum","contracts":2,"nfts":2}]}"#,
+        r#"{"schema_revision":2,"source_count":2,"payload_count":2,"chains":["ethereum"],"chain_totals":[{"name":"ethereum","contracts":2,"nfts":2}]}"#,
     )
     .unwrap();
     commit_ready(
         &blocking,
         "blocking.ready",
-        r#"{"blocking_revision":1,"atom_count":2}"#,
+        r#"{"blocking_revision":2,"atom_count":2}"#,
     )
     .unwrap();
     (dir, features, blocking)
@@ -147,13 +147,13 @@ fn shared_atom_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::P
     commit_ready(
         &features,
         "features.ready",
-        r#"{"schema_revision":1,"source_count":2,"payload_count":2,"chains":["ethereum"],"chain_totals":[{"name":"ethereum","contracts":2,"nfts":2}]}"#,
+        r#"{"schema_revision":2,"source_count":2,"payload_count":2,"chains":["ethereum"],"chain_totals":[{"name":"ethereum","contracts":2,"nfts":2}]}"#,
     )
     .unwrap();
     commit_ready(
         &blocking,
         "blocking.ready",
-        r#"{"blocking_revision":1,"atom_count":1}"#,
+        r#"{"blocking_revision":2,"atom_count":1}"#,
     )
     .unwrap();
     (dir, features, blocking)
@@ -214,12 +214,50 @@ fn rejects_revision_mismatch_before_match() {
 }
 
 #[test]
+fn rejects_revision_one_artifacts_after_in_memory_encode_upgrade() {
+    let (_dir, features, blocking) = fixture();
+    commit_ready(
+        &features,
+        "features.ready",
+        r#"{"schema_revision":1,"source_count":2,"payload_count":2,"chains":["ethereum"],"chain_totals":[{"name":"ethereum","contracts":2,"nfts":2}]}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        MetadataSnapshot::open(&features, &blocking),
+        Err(SnapshotError::Revision {
+            artifact: "encode",
+            ..
+        })
+    ));
+
+    commit_ready(
+        &features,
+        "features.ready",
+        r#"{"schema_revision":2,"source_count":2,"payload_count":2,"chains":["ethereum"],"chain_totals":[{"name":"ethereum","contracts":2,"nfts":2}]}"#,
+    )
+    .unwrap();
+    commit_ready(
+        &blocking,
+        "blocking.ready",
+        r#"{"blocking_revision":1,"atom_count":2}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        MetadataSnapshot::open(&features, &blocking),
+        Err(SnapshotError::Revision {
+            artifact: "blocking",
+            ..
+        })
+    ));
+}
+
+#[test]
 fn feature_ready_requires_explicit_chain_identity_fields() {
     let (_dir, features, blocking) = fixture();
     commit_ready(
         &features,
         "features.ready",
-        r#"{"schema_revision":1,"source_count":2,"payload_count":2}"#,
+        r#"{"schema_revision":2,"source_count":2,"payload_count":2}"#,
     )
     .unwrap();
 
@@ -471,7 +509,7 @@ fn rejects_duplicate_chain_identity() {
     commit_ready(
         &features,
         "features.ready",
-        r#"{"schema_revision":1,"source_count":2,"payload_count":2,"chains":["ethereum","ethereum"],"chain_totals":[{"name":"ethereum","contracts":2,"nfts":2},{"name":"ethereum","contracts":0,"nfts":0}]}"#,
+        r#"{"schema_revision":2,"source_count":2,"payload_count":2,"chains":["ethereum","ethereum"],"chain_totals":[{"name":"ethereum","contracts":2,"nfts":2},{"name":"ethereum","contracts":0,"nfts":0}]}"#,
     )
     .unwrap();
 
@@ -488,7 +526,7 @@ fn rejects_empty_chain_identity_for_nonempty_contracts() {
     commit_ready(
         &features,
         "features.ready",
-        r#"{"schema_revision":1,"source_count":2,"payload_count":2,"chains":[],"chain_totals":[]}"#,
+        r#"{"schema_revision":2,"source_count":2,"payload_count":2,"chains":[],"chain_totals":[]}"#,
     )
     .unwrap();
 
@@ -501,7 +539,7 @@ fn rejects_negative_chain_totals() {
     commit_ready(
         &features,
         "features.ready",
-        r#"{"schema_revision":1,"source_count":2,"payload_count":2,"chains":["ethereum"],"chain_totals":[{"name":"ethereum","contracts":-1,"nfts":2}]}"#,
+        r#"{"schema_revision":2,"source_count":2,"payload_count":2,"chains":["ethereum"],"chain_totals":[{"name":"ethereum","contracts":-1,"nfts":2}]}"#,
     )
     .unwrap();
 

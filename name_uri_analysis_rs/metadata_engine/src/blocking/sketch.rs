@@ -31,6 +31,7 @@ struct DimensionSketch {
 enum DocumentFrequencies {
     Dense(Vec<usize>),
     Sparse(BTreeMap<u32, usize>),
+    SparseSorted { terms: Vec<u32>, counts: Vec<usize> },
 }
 
 impl DocumentFrequencies {
@@ -38,6 +39,9 @@ impl DocumentFrequencies {
         match self {
             Self::Dense(frequencies) => frequencies[term as usize],
             Self::Sparse(frequencies) => frequencies[&term],
+            Self::SparseSorted { terms, counts } => {
+                counts[terms.binary_search(&term).expect("term was indexed")]
+            }
         }
     }
 }
@@ -158,22 +162,28 @@ fn build_document_frequencies_parallel<'a>(
                 .collect(),
         );
     }
-    DocumentFrequencies::Sparse(
-        atoms
-            .par_iter()
-            .fold(BTreeMap::<u32, usize>::new, |mut frequencies, atom| {
-                visit_unique_terms(terms_of(atom), |term| {
-                    *frequencies.entry(term).or_default() += 1;
-                });
-                frequencies
-            })
-            .reduce(BTreeMap::<u32, usize>::new, |mut left, right| {
-                for (term, count) in right {
-                    *left.entry(term).or_default() += count;
-                }
-                left
-            }),
-    )
+    let mut occurrences = atoms
+        .par_iter()
+        .fold(Vec::<u32>::new, |mut terms, atom| {
+            visit_unique_terms(terms_of(atom), |term| terms.push(term));
+            terms
+        })
+        .reduce(Vec::<u32>::new, |mut left, mut right| {
+            left.append(&mut right);
+            left
+        });
+    occurrences.par_sort_unstable();
+    let mut terms = Vec::new();
+    let mut counts = Vec::new();
+    for term in occurrences {
+        if terms.last().copied() == Some(term) {
+            *counts.last_mut().expect("count accompanies sparse term") += 1;
+        } else {
+            terms.push(term);
+            counts.push(1usize);
+        }
+    }
+    DocumentFrequencies::SparseSorted { terms, counts }
 }
 
 fn dimension_sketch(
@@ -267,5 +277,31 @@ mod tests {
         assert_eq!(frequencies.get(0), 1);
         assert_eq!(frequencies.get(1), 1);
         assert_eq!(frequencies.get(2), 2);
+    }
+
+    #[test]
+    fn parallel_df_uses_one_sorted_occurrence_table_for_sparse_term_ids() {
+        let first = vec![(1, 1), (1_000_000, 1)];
+        let second = vec![(1_000_000, 1), (4_000_000, 1)];
+        let atoms = vec![
+            BaseEquivalentAtomInput {
+                template_terms: &first,
+                content_terms: &[],
+            },
+            BaseEquivalentAtomInput {
+                template_terms: &second,
+                content_terms: &[],
+            },
+        ];
+
+        let frequencies = build_document_frequencies_parallel(&atoms, |atom| atom.template_terms);
+
+        assert!(matches!(
+            frequencies,
+            DocumentFrequencies::SparseSorted { .. }
+        ));
+        assert_eq!(frequencies.get(1), 1);
+        assert_eq!(frequencies.get(1_000_000), 2);
+        assert_eq!(frequencies.get(4_000_000), 1);
     }
 }

@@ -13,28 +13,32 @@ use metadata_engine::resource::{MemoryBroker, GIB};
 use metadata_engine::storage::StorageBroker;
 
 use super::super::encode::{
-    estimate_encode_storage_bytes, open_prepare_for_encode, parse_pending_fallback_batch,
+    estimate_encode_storage_bytes, open_prepare_for_encode, resolve_fallback_contracts,
     stream_encode_inputs_with_progress,
 };
 
 #[test]
-fn fallback_batch_parses_only_contracts_that_are_still_pending() {
+fn fallback_resolution_parses_each_contract_only_until_its_first_usable_row() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let rows = vec![
-        (1, r#"{"name":"resolved"}"#.to_string(), 0, 0),
-        (2, r#"{"name":"pending"}"#.to_string(), 0, 1),
+        (1, "{}".to_string(), 0, 0),
+        (1, r#"{"description":"first"}"#.to_string(), 0, 1),
+        (1, r#"{"description":"unused"}"#.to_string(), 0, 2),
+        (2, r#"{"description":"second"}"#.to_string(), 0, 3),
     ];
     let calls = AtomicUsize::new(0);
 
-    let parsed = parse_pending_fallback_batch(&rows, &|contract| contract == 2, &|json| {
+    let resolved = resolve_fallback_contracts(&rows, &|json| {
         calls.fetch_add(1, Ordering::Relaxed);
         metadata_engine::encode::parse_metadata_documents(json)
     });
 
-    assert!(parsed[0].is_none());
-    assert!(parsed[1].is_some());
-    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(resolved.len(), 2);
+    assert_eq!(resolved[0].0 .0, 1);
+    assert_eq!(resolved[0].0 .1, r#"{"description":"first"}"#);
+    assert_eq!(resolved[1].0 .0, 2);
+    assert_eq!(calls.load(Ordering::Relaxed), 3);
 }
 
 fn write_tiny_metadata_parquet(path: &Path) {
@@ -208,10 +212,10 @@ fn encode_admission_freezes_row_totals_for_progress_before_streaming() {
         .unwrap();
     assert!(token_json_bytes > 0);
     assert_eq!(
-        estimate.token_spool_peak_bytes,
-        token_rows * 64 + representative_rows * 8 + 64 * 1024 * 1024
+        estimate.token_relation_peak_bytes,
+        token_rows * 64 + representative_rows * 8 + token_json_bytes + 64 * 1024 * 1024
     );
-    assert!(estimate.partial_peak_bytes >= estimate.token_spool_peak_bytes);
+    assert_eq!(estimate.partial_peak_bytes, 64 * 1024 * 1024);
     let representative_json_bytes: u64 = conn
         .query_row(
             "SELECT coalesce(sum(length(rows.metadata_json)), 0)::UBIGINT
@@ -232,18 +236,23 @@ fn encode_admission_freezes_row_totals_for_progress_before_streaming() {
                 + 64 * 1024 * 1024
     );
     assert!(estimate.final_bytes >= estimate.partial_peak_bytes.min(estimate.final_bytes));
-    assert!(estimate.provisional_feature_bytes < estimate.final_bytes);
+    assert_eq!(estimate.provisional_feature_bytes, estimate.final_bytes);
     assert!(
         estimate.resident_peak_bytes
             >= representative_json_bytes * 4
                 + representative_rows * 2_048
                 + token_rows * 24
+                + token_json_bytes
                 + 64 * 1024 * 1024,
         "resident admission must bound compact feature, atom and routing structures"
     );
     assert!(
         estimate.resident_peak_bytes >= estimate.final_bytes,
         "resident admission must include a global unique-payload/interner envelope"
+    );
+    assert!(
+        estimate.resident_peak_bytes >= estimate.token_relation_peak_bytes,
+        "resident admission must cover the complete in-memory token relation"
     );
 }
 
@@ -277,7 +286,7 @@ fn encode_connection_applies_duckdb_resource_configuration() {
 }
 
 #[test]
-fn encode_rejects_underestimated_token_spool_before_creating_it() {
+fn encode_rejects_underestimated_token_relation_before_loading_it() {
     let dir = tempfile::tempdir().unwrap();
     let work = dir.path().join("work");
     fs::create_dir_all(&work).unwrap();
@@ -287,8 +296,7 @@ fn encode_rejects_underestimated_token_spool_before_creating_it() {
     run_analysis_phase(&options, AnalysisPhase::Prepare, &work).unwrap();
     let conn = Connection::open(&options.database_path).unwrap();
     let mut estimate = estimate_encode_storage_bytes(&conn).unwrap();
-    estimate.token_spool_peak_bytes -= 1;
-    let spool_path = work.join("spool/metadata-token-sources.bin");
+    estimate.token_relation_peak_bytes -= 1;
     let mut broker = StorageBroker::open(&work).unwrap();
     let memory_broker = MemoryBroker::new(16 * GIB, 12 * GIB).unwrap();
 
@@ -301,17 +309,15 @@ fn encode_rejects_underestimated_token_spool_before_creating_it() {
         estimate,
         |_| {},
     ) {
-        Ok(_) => panic!("underestimated token spool was accepted"),
+        Ok(_) => panic!("underestimated token relation was accepted"),
         Err(error) => error,
     };
 
     assert!(
-        error.to_string().contains("token-source spool admission"),
+        error
+            .to_string()
+            .contains("token-source relation admission"),
         "unexpected error: {error}"
-    );
-    assert!(
-        !spool_path.exists(),
-        "admission must fail before creating the spool"
     );
 }
 
@@ -343,24 +349,48 @@ fn encode_stream_reports_frozen_row_totals_and_terminal_completion() {
     )
     .unwrap();
 
-    for (phase, total) in [
-        (ProgressPhase::EncodeTokenSources, estimate.token_rows),
-        (ProgressPhase::EncodeRows, estimate.representative_rows),
-    ] {
-        let phase_events = events
-            .iter()
-            .filter(|event| event.phase == phase)
-            .collect::<Vec<_>>();
-        assert!(!phase_events.is_empty(), "missing {phase:?}");
-        let terminal = phase_events.last().unwrap();
-        assert_eq!(terminal.total, Some(total));
-        assert_eq!(terminal.completed, total);
-    }
+    let collect = events
+        .iter()
+        .filter(|event| event.phase == ProgressPhase::EncodeCollectTokenSources)
+        .collect::<Vec<_>>();
+    assert!(!collect.is_empty(), "missing source-catalog progress");
+    assert_eq!(collect[0].total, None);
+
+    let resolve = events
+        .iter()
+        .filter(|event| event.phase == ProgressPhase::EncodeResolveTokenMemberships)
+        .collect::<Vec<_>>();
+    assert!(!resolve.is_empty(), "missing token-resolution progress");
+    assert_eq!(resolve[0].total, None);
+    assert_eq!(resolve.last().unwrap().total, Some(estimate.token_rows));
+    assert_eq!(resolve.last().unwrap().completed, estimate.token_rows);
+
+    let source_terminal = events
+        .iter()
+        .rfind(|event| event.phase == ProgressPhase::EncodeTokenSources)
+        .unwrap();
+    assert!(source_terminal.total.unwrap() > 0);
+    assert_eq!(source_terminal.completed, source_terminal.total.unwrap());
+
+    let phase_events = events
+        .iter()
+        .filter(|event| event.phase == ProgressPhase::EncodeRows)
+        .collect::<Vec<_>>();
+    assert!(!phase_events.is_empty(), "missing EncodeRows");
+    let terminal = phase_events.last().unwrap();
+    assert_eq!(terminal.total, Some(estimate.representative_rows));
+    assert_eq!(terminal.completed, estimate.representative_rows);
     let finalize = events
         .iter()
         .rfind(|event| event.phase == ProgressPhase::EncodeFinalize)
         .unwrap();
     assert_eq!(finalize.completed, finalize.total.unwrap());
+}
+
+#[test]
+fn optimized_metadata_artifacts_use_revision_two() {
+    assert_eq!(ENCODE_SCHEMA_REVISION, 2);
+    assert_eq!(BLOCKING_REVISION, 2);
 }
 
 fn table_fingerprint(conn: &Connection, table: &str) -> (u64, String) {
@@ -551,7 +581,7 @@ fn metadata_match_fails_closed_when_artifacts_are_corrupt() {
     run_analysis_phase(&options, AnalysisPhase::Prepare, &work).unwrap();
     run_analysis_phase(&options, AnalysisPhase::MetadataEncode, &work).unwrap();
     fs::write(
-        work.join("artifacts/metadata/encode-1/fallback_atoms_offsets.u64"),
+        work.join("artifacts/metadata/encode-2/fallback_atoms_offsets.u64"),
         b"corrupt",
     )
     .unwrap();

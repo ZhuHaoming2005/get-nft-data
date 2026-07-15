@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use rayon::prelude::*;
 use thiserror::Error;
@@ -342,7 +343,6 @@ pub fn compile_base_equivalent_parallel_with_progress(
     let mut sizes = Vec::with_capacity(block_count);
     let mut hot_block_plans = Vec::new();
     let mut atom_in_hot = vec![false; atom_count];
-    let mut atom_membership_counts = vec![0u64; atom_count];
     let mut membership_count = 0usize;
 
     for block_id in 0..block_count {
@@ -384,11 +384,6 @@ pub fn compile_base_equivalent_parallel_with_progress(
         membership_count = membership_count
             .checked_add(members.len())
             .ok_or(BlockingError::WorkOverflow)?;
-        for &atom in members {
-            atom_membership_counts[atom as usize] = atom_membership_counts[atom as usize]
-                .checked_add(1)
-                .ok_or(BlockingError::WorkOverflow)?;
-        }
         finalize_completed = finalize_completed.saturating_add(1);
         emit_blocking_progress(
             &mut progress,
@@ -398,49 +393,18 @@ pub fn compile_base_equivalent_parallel_with_progress(
         );
     }
 
-    let mut atom_block_offsets = Vec::with_capacity(atom_count + 1);
-    atom_block_offsets.push(0);
-    for &count in &atom_membership_counts {
-        let next = atom_block_offsets
-            .last()
-            .copied()
-            .unwrap_or(0u64)
-            .checked_add(count)
-            .ok_or(BlockingError::WorkOverflow)?;
-        atom_block_offsets.push(next);
-        finalize_completed = finalize_completed.saturating_add(1);
-        emit_blocking_progress(
-            &mut progress,
-            ProgressPhase::BlockingFinalize,
-            finalize_completed,
-            finalize_total,
-        );
-    }
-    let mut atom_block_ids = vec![0u32; membership_count];
-    for (atom, cursor) in atom_membership_counts.iter_mut().enumerate() {
-        *cursor = atom_block_offsets[atom];
-    }
     debug_assert_eq!(membership_count, block_atoms.len());
-    for block_id in 0..block_count {
-        let start = block_atom_offsets[block_id] as usize;
-        let end = block_atom_offsets[block_id + 1] as usize;
-        for &atom in &block_atoms[start..end] {
-            let cursor = &mut atom_membership_counts[atom as usize];
-            atom_block_ids[*cursor as usize] = block_id as u32;
-            *cursor += 1;
-        }
-        finalize_completed = finalize_completed.saturating_add(1);
-        emit_blocking_progress(
-            &mut progress,
-            ProgressPhase::BlockingFinalize,
-            finalize_completed,
-            finalize_total,
-        );
-    }
-    debug_assert!(atom_membership_counts
-        .iter()
-        .zip(atom_block_offsets.iter().skip(1))
-        .all(|(cursor, end)| cursor == end));
+    let (atom_block_offsets, atom_block_ids) =
+        build_inverse_block_csr_parallel(&block_atom_offsets, &block_atoms, atom_count, lanes)?;
+    finalize_completed = finalize_completed
+        .saturating_add(atom_count as u64)
+        .saturating_add(block_count as u64);
+    emit_blocking_progress(
+        &mut progress,
+        ProgressPhase::BlockingFinalize,
+        finalize_completed,
+        finalize_total,
+    );
 
     let mut routing_statuses = vec![RoutingStatus::Routed as u8; atom_count];
     for (i, is_proven) in proven.iter().enumerate() {
@@ -492,7 +456,7 @@ pub fn compile_base_equivalent_parallel_with_progress(
         finalize_completed,
         finalize_total,
     );
-    debug_assert_eq!(BLOCKING_REVISION, 1);
+    debug_assert_eq!(BLOCKING_REVISION, 2);
     Ok(bundle)
 }
 
@@ -514,6 +478,103 @@ fn build_joint_family(
         buckets.entry(bucket).or_default().push(atom_index as u32);
     }
     buckets.into_iter().collect()
+}
+
+fn build_inverse_block_csr_parallel(
+    block_atom_offsets: &[u64],
+    block_atoms: &[u32],
+    atom_count: usize,
+    lanes: usize,
+) -> Result<(Vec<u64>, Vec<u32>), BlockingError> {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(lanes.max(1))
+        .build()
+        .map_err(|_| BlockingError::WorkerPool)?;
+    let counts = (0..atom_count)
+        .map(|_| AtomicU64::new(0))
+        .collect::<Vec<_>>();
+    pool.install(|| {
+        block_atoms.par_iter().for_each(|&atom| {
+            counts[atom as usize].fetch_add(1, Ordering::Relaxed);
+        });
+    });
+    let counts = counts
+        .into_iter()
+        .map(AtomicU64::into_inner)
+        .collect::<Vec<_>>();
+    let mut offsets = Vec::with_capacity(atom_count.saturating_add(1));
+    offsets.push(0u64);
+    for count in counts {
+        offsets.push(
+            offsets
+                .last()
+                .copied()
+                .unwrap_or(0)
+                .checked_add(count)
+                .ok_or(BlockingError::WorkOverflow)?,
+        );
+    }
+    if offsets.last().copied().unwrap_or(0) != block_atoms.len() as u64 {
+        return Err(BlockingError::WorkOverflow);
+    }
+    let cursors = offsets[..atom_count]
+        .iter()
+        .copied()
+        .map(AtomicU64::new)
+        .collect::<Vec<_>>();
+    let inverse = (0..block_atoms.len())
+        .map(|_| AtomicU32::new(0))
+        .collect::<Vec<_>>();
+    pool.install(|| {
+        (0..block_atom_offsets.len().saturating_sub(1))
+            .into_par_iter()
+            .for_each(|block_id| {
+                let begin = block_atom_offsets[block_id] as usize;
+                let end = block_atom_offsets[block_id + 1] as usize;
+                for &atom in &block_atoms[begin..end] {
+                    let position = cursors[atom as usize].fetch_add(1, Ordering::Relaxed) as usize;
+                    inverse[position].store(block_id as u32, Ordering::Relaxed);
+                }
+            });
+    });
+    let mut inverse = pool.install(|| {
+        inverse
+            .into_par_iter()
+            .map(AtomicU32::into_inner)
+            .collect::<Vec<_>>()
+    });
+    pool.install(|| parallel_sort_buckets(&mut inverse, &offsets));
+    Ok((offsets, inverse))
+}
+
+fn parallel_sort_buckets<T: Ord + Send>(values: &mut [T], offsets: &[u64]) {
+    fn recurse<T: Ord + Send>(
+        values: &mut [T],
+        offsets: &[u64],
+        first: usize,
+        end: usize,
+        base: usize,
+    ) {
+        if first >= end {
+            return;
+        }
+        if values.len() < 16_384 || end - first <= 1 {
+            for row in first..end {
+                let begin = offsets[row] as usize - base;
+                let finish = offsets[row + 1] as usize - base;
+                values[begin..finish].sort_unstable();
+            }
+            return;
+        }
+        let middle = first + (end - first) / 2;
+        let split = offsets[middle] as usize - base;
+        let (left, right) = values.split_at_mut(split);
+        rayon::join(
+            || recurse(left, offsets, first, middle, base),
+            || recurse(right, offsets, middle, end, offsets[middle] as usize),
+        );
+    }
+    recurse(values, offsets, 0, offsets.len().saturating_sub(1), 0);
 }
 
 fn append_forward_block(
@@ -660,6 +721,15 @@ fn persist_bundle(bundle: &BlockingBundle, out_dir: &Path) -> Result<(), Blockin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_inverse_block_csr_matches_forward_memberships() {
+        let (offsets, ids) =
+            build_inverse_block_csr_parallel(&[0, 2, 4], &[0, 2, 1, 2], 3, 4).unwrap();
+
+        assert_eq!(offsets, vec![0, 1, 2, 4]);
+        assert_eq!(ids, vec![0, 1, 0, 1]);
+    }
 
     #[test]
     fn parallel_anchor_grouping_is_sorted_and_deterministic() {

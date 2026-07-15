@@ -19,7 +19,7 @@ pub use sketch::{
 pub use stats::{BlockStats, HotBlockPlan, HotBlockTile};
 
 /// Blocking artifact schema revision for BaseEquivalent.
-pub const BLOCKING_REVISION: u32 = 1;
+pub const BLOCKING_REVISION: u32 = 2;
 
 /// Membership threshold shared by Blocking compilation and Match scheduling.
 pub const DEFAULT_MAX_ROUTING_BLOCK_MEMBERS: usize = 1_000_000;

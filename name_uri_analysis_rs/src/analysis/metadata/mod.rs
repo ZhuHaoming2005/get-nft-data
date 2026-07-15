@@ -4,7 +4,6 @@
 //! only the DuckDB preparation and encode adapters needed to feed it.
 
 mod encode;
-mod encode_v3;
 mod prepare;
 
 pub(crate) use encode::run_metadata_encode;

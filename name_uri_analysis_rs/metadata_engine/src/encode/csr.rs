@@ -3,8 +3,10 @@
 use thiserror::Error;
 
 use crate::format::{self, ArrayKind, FormatError};
+use rayon::prelude::*;
 use std::borrow::Cow;
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 #[derive(Debug, Error)]
 pub enum CsrError {
@@ -50,6 +52,13 @@ pub fn build_bidirectional_csr(
 pub fn build_bidirectional_csr_from_iter<'a>(
     memberships: impl IntoIterator<Item = (u32, u32, &'a [u32])>,
 ) -> Result<BidirectionalCsr, CsrError> {
+    build_bidirectional_csr_from_iter_with_lanes(memberships, rayon::current_num_threads())
+}
+
+fn build_bidirectional_csr_from_iter_with_lanes<'a>(
+    memberships: impl IntoIterator<Item = (u32, u32, &'a [u32])>,
+    lanes: usize,
+) -> Result<BidirectionalCsr, CsrError> {
     struct Membership<'a> {
         source: u32,
         contract: u32,
@@ -90,19 +99,33 @@ pub fn build_bidirectional_csr_from_iter<'a>(
 
     let contract_count = count_from_max(max_contract)?;
     let token_count = count_from_max(max_token)?;
-    let mut contract_counts = vec![0usize; contract_count];
-    let mut token_counts = vec![0usize; token_count];
-    for membership in &normalized {
-        contract_counts[membership.contract as usize] = contract_counts
-            [membership.contract as usize]
-            .checked_add(membership.tokens.len())
-            .ok_or(CsrError::CardinalityOverflow)?;
-        for &token in membership.tokens.iter() {
-            token_counts[token as usize] = token_counts[token as usize]
-                .checked_add(1)
-                .ok_or(CsrError::CardinalityOverflow)?;
-        }
-    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(lanes.max(1))
+        .build()
+        .map_err(|_| CsrError::CardinalityOverflow)?;
+    let contract_counts = (0..contract_count)
+        .map(|_| AtomicUsize::new(0))
+        .collect::<Vec<_>>();
+    let token_counts = (0..token_count)
+        .map(|_| AtomicUsize::new(0))
+        .collect::<Vec<_>>();
+    pool.install(|| {
+        normalized.par_iter().for_each(|membership| {
+            contract_counts[membership.contract as usize]
+                .fetch_add(membership.tokens.len(), Ordering::Relaxed);
+            for &token in membership.tokens.iter() {
+                token_counts[token as usize].fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    });
+    let contract_counts = contract_counts
+        .into_iter()
+        .map(AtomicUsize::into_inner)
+        .collect::<Vec<_>>();
+    let token_counts = token_counts
+        .into_iter()
+        .map(AtomicUsize::into_inner)
+        .collect::<Vec<_>>();
     let contract_bucket_offsets = bucket_offsets(&contract_counts)?;
     let token_bucket_offsets = bucket_offsets(&token_counts)?;
     debug_assert_eq!(
@@ -114,58 +137,90 @@ pub fn build_bidirectional_csr_from_iter<'a>(
         occurrence_count
     );
 
-    let mut contract_buckets = vec![0u32; occurrence_count];
-    let mut token_buckets = vec![(0u32, 0u32); occurrence_count];
-    let mut contract_cursors = contract_bucket_offsets[..contract_count].to_vec();
-    let mut token_cursors = token_bucket_offsets[..token_count].to_vec();
-    for membership in &normalized {
-        for &token in membership.tokens.iter() {
-            let contract_position = &mut contract_cursors[membership.contract as usize];
-            contract_buckets[*contract_position] = token;
-            *contract_position += 1;
-            let token_position = &mut token_cursors[token as usize];
-            token_buckets[*token_position] = (membership.contract, membership.source);
-            *token_position += 1;
-        }
-    }
-    drop(contract_cursors);
-    drop(token_cursors);
+    let contract_buckets = (0..occurrence_count)
+        .map(|_| AtomicU32::new(0))
+        .collect::<Vec<_>>();
+    let token_buckets = (0..occurrence_count)
+        .map(|_| AtomicU64::new(0))
+        .collect::<Vec<_>>();
+    let contract_cursors = contract_bucket_offsets[..contract_count]
+        .iter()
+        .copied()
+        .map(AtomicUsize::new)
+        .collect::<Vec<_>>();
+    let token_cursors = token_bucket_offsets[..token_count]
+        .iter()
+        .copied()
+        .map(AtomicUsize::new)
+        .collect::<Vec<_>>();
+    pool.install(|| {
+        normalized.par_iter().for_each(|membership| {
+            let packed = (u64::from(membership.contract) << 32) | u64::from(membership.source);
+            for &token in membership.tokens.iter() {
+                let contract_position =
+                    contract_cursors[membership.contract as usize].fetch_add(1, Ordering::Relaxed);
+                contract_buckets[contract_position].store(token, Ordering::Relaxed);
+                let token_position = token_cursors[token as usize].fetch_add(1, Ordering::Relaxed);
+                token_buckets[token_position].store(packed, Ordering::Relaxed);
+            }
+        });
+    });
+    let mut contract_buckets = pool.install(|| {
+        contract_buckets
+            .into_par_iter()
+            .map(AtomicU32::into_inner)
+            .collect::<Vec<_>>()
+    });
+    let mut token_buckets = pool.install(|| {
+        token_buckets
+            .into_par_iter()
+            .map(AtomicU64::into_inner)
+            .map(|packed| ((packed >> 32) as u32, packed as u32))
+            .collect::<Vec<_>>()
+    });
     drop(normalized);
 
-    parallel_sort_buckets(&mut contract_buckets, &contract_bucket_offsets);
-    parallel_sort_buckets(&mut token_buckets, &token_bucket_offsets);
+    pool.install(|| {
+        rayon::join(
+            || parallel_sort_buckets(&mut contract_buckets, &contract_bucket_offsets),
+            || parallel_sort_buckets(&mut token_buckets, &token_bucket_offsets),
+        );
+    });
 
-    let mut contract_token_offsets = Vec::with_capacity(contract_count + 1);
-    let mut contract_tokens = Vec::with_capacity(occurrence_count);
-    contract_token_offsets.push(0);
-    for contract in 0..contract_count {
-        let range = contract_bucket_offsets[contract]..contract_bucket_offsets[contract + 1];
-        let mut previous = None;
-        for &token in &contract_buckets[range] {
-            if previous != Some(token) {
-                contract_tokens.push(token);
-                previous = Some(token);
-            }
-        }
-        contract_token_offsets.push(contract_tokens.len() as u64);
-    }
+    let contract_rows = pool.install(|| {
+        (0..contract_count)
+            .into_par_iter()
+            .map(|contract| {
+                let range =
+                    contract_bucket_offsets[contract]..contract_bucket_offsets[contract + 1];
+                let mut row = contract_buckets[range].to_vec();
+                row.dedup();
+                row
+            })
+            .collect::<Vec<_>>()
+    });
     drop(contract_buckets);
-
-    let mut token_member_offsets = Vec::with_capacity(token_count + 1);
-    let mut token_member_contracts = Vec::with_capacity(occurrence_count);
-    let mut token_member_sources = Vec::with_capacity(occurrence_count);
-    token_member_offsets.push(0);
-    for token in 0..token_count {
-        let range = token_bucket_offsets[token]..token_bucket_offsets[token + 1];
-        let mut previous = None;
-        for &(contract, source) in &token_buckets[range] {
-            if previous != Some((contract, source)) {
-                token_member_contracts.push(contract);
-                token_member_sources.push(source);
-                previous = Some((contract, source));
-            }
-        }
-        token_member_offsets.push(token_member_contracts.len() as u64);
+    let token_rows = pool.install(|| {
+        (0..token_count)
+            .into_par_iter()
+            .map(|token| {
+                let range = token_bucket_offsets[token]..token_bucket_offsets[token + 1];
+                let mut row = token_buckets[range].to_vec();
+                row.dedup();
+                row
+            })
+            .collect::<Vec<_>>()
+    });
+    drop(token_buckets);
+    let contract_token_offsets = row_offsets(&contract_rows)?;
+    let contract_tokens = contract_rows.into_iter().flatten().collect::<Vec<_>>();
+    let token_member_offsets = row_offsets(&token_rows)?;
+    let token_members = token_rows.into_iter().flatten().collect::<Vec<_>>();
+    let mut token_member_contracts = Vec::with_capacity(token_members.len());
+    let mut token_member_sources = Vec::with_capacity(token_members.len());
+    for (contract, source) in token_members {
+        token_member_contracts.push(contract);
+        token_member_sources.push(source);
     }
 
     Ok(BidirectionalCsr {
@@ -175,6 +230,22 @@ pub fn build_bidirectional_csr_from_iter<'a>(
         token_member_contracts,
         token_member_sources,
     })
+}
+
+fn row_offsets<T>(rows: &[Vec<T>]) -> Result<Vec<u64>, CsrError> {
+    let mut offsets = Vec::with_capacity(rows.len().saturating_add(1));
+    offsets.push(0u64);
+    for row in rows {
+        offsets.push(
+            offsets
+                .last()
+                .copied()
+                .unwrap_or(0)
+                .checked_add(row.len() as u64)
+                .ok_or(CsrError::CardinalityOverflow)?,
+        );
+    }
+    Ok(offsets)
 }
 
 fn count_from_max(maximum: Option<u32>) -> Result<usize, CsrError> {
@@ -288,6 +359,23 @@ pub fn write_csr_files_with_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_bucket_fill_matches_canonical_bidirectional_csr() {
+        let memberships = [
+            (0, 0, [1, 3].as_slice()),
+            (1, 0, [2, 3].as_slice()),
+            (2, 1, [1, 2].as_slice()),
+        ];
+
+        let csr = build_bidirectional_csr_from_iter_with_lanes(memberships, 4).unwrap();
+
+        assert_eq!(csr.contract_token_offsets, vec![0, 3, 5]);
+        assert_eq!(csr.contract_tokens, vec![1, 2, 3, 1, 2]);
+        assert_eq!(csr.token_member_offsets, vec![0, 0, 2, 4, 6]);
+        assert_eq!(csr.token_member_contracts, vec![0, 1, 0, 1, 0, 0]);
+        assert_eq!(csr.token_member_sources, vec![0, 2, 1, 2, 0, 1]);
+    }
 
     #[test]
     fn parallel_bucket_sort_never_moves_values_across_csr_rows() {
