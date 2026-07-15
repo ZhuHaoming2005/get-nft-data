@@ -1,6 +1,7 @@
 //! Full-universe Pair ExactIsland oracle for frozen sampled left frontiers.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use rayon::prelude::*;
@@ -9,8 +10,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::blocking::{
-    build_base_equivalent_atom_sketches, for_each_local_base_equivalent_pair,
-    BaseEquivalentAtomInput,
+    build_base_equivalent_atom_sketches, BaseEquivalentAtomInput, LocalRoutingPlan,
 };
 use crate::format;
 use crate::index::candidate_owner;
@@ -508,7 +508,8 @@ pub fn run_shared_token_exact_islands_with_progress(
         },
     }
     let (sender, receiver) = std::sync::mpsc::sync_channel(lanes.saturating_mul(4).max(1));
-    let per_group_bytes = budget.max_artifact_bytes / (lanes as u64).saturating_add(1);
+    let concurrent_groups = groups.len().min(lanes).max(1) as u64;
+    let per_group_bytes = budget.max_artifact_bytes / concurrent_groups.saturating_add(1);
     let (
         pair_work,
         calibration_pair_work,
@@ -729,13 +730,49 @@ struct SharedTokenGroupScan {
     misses: Vec<SharedTokenExactMiss>,
 }
 
+impl SharedTokenGroupScan {
+    fn merge(mut self, mut other: Self) -> Self {
+        self.exact_matches = self.exact_matches.saturating_add(other.exact_matches);
+        self.misses.append(&mut other.misses);
+        self
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SharedTokenPairTile {
+    left_begin: usize,
+    left_end: usize,
+    right_begin: usize,
+    right_end: usize,
+}
+
+fn shared_token_pair_tiles(member_count: usize, tile_members: usize) -> Vec<SharedTokenPairTile> {
+    let tile_members = tile_members.max(1);
+    let side = member_count.div_ceil(tile_members);
+    let mut tiles = Vec::with_capacity(side.saturating_mul(side.saturating_add(1)) / 2);
+    for left_tile in 0..side {
+        for right_tile in left_tile..side {
+            let left_begin = left_tile * tile_members;
+            let right_begin = right_tile * tile_members;
+            tiles.push(SharedTokenPairTile {
+                left_begin,
+                left_end: left_begin.saturating_add(tile_members).min(member_count),
+                right_begin,
+                right_end: right_begin.saturating_add(tile_members).min(member_count),
+            });
+        }
+    }
+    tiles
+}
+
 fn scan_shared_token_group(
     snapshot: &MetadataSnapshot,
     token: u32,
     budget: ExactEvidenceBudget,
-    mut report_work: impl FnMut(u64),
+    report_work: impl Fn(u64) + Sync,
 ) -> Result<SharedTokenGroupScan, ExactIslandError> {
     const PROGRESS_CHUNK: u64 = 65_536;
+    const PAIR_TILE_MEMBERS: usize = 512;
     let features = snapshot.features();
     let begin = features.token_member_offsets[token as usize] as usize;
     let end = features.token_member_offsets[token as usize + 1] as usize;
@@ -752,7 +789,7 @@ fn scan_shared_token_group(
         })?;
     checked("shared_token_pair_work", group_work, budget.max_pair_work)?;
 
-    let routed = if contracts.len() < 256 {
+    let routing = if contracts.len() < 256 {
         None
     } else {
         let owned = sources
@@ -785,80 +822,75 @@ fn scan_shared_token_group(
             })
             .collect::<Vec<_>>();
         let sketches = build_base_equivalent_atom_sketches(&inputs);
-        Some(bounded_local_routes(&sketches, budget.max_artifact_bytes)?)
+        let plan = LocalRoutingPlan::build_parallel(&sketches);
+        Some((sketches, plan))
     };
-    let mut exact_matches = 0u64;
-    let mut misses = Vec::new();
-    let mut pending_work = 0u64;
-    for left in 0..contracts.len() {
-        for right in left + 1..contracts.len() {
-            pending_work += 1;
-            if pending_work == PROGRESS_CHUNK {
-                report_work(pending_work);
-                pending_work = 0;
-            }
-            let left_payload = features.source_to_payload[sources[left] as usize];
-            let right_payload = features.source_to_payload[sources[right] as usize];
-            if template_matches(features, left_payload, right_payload)
-                && content_matches(features, left_payload, right_payload)
-            {
-                exact_matches = exact_matches.saturating_add(1);
-                if routed
-                    .as_ref()
-                    .is_some_and(|routes| !routes.contains(&(left, right)))
-                {
-                    let next_bytes = misses
-                        .len()
-                        .saturating_add(1)
-                        .saturating_mul(std::mem::size_of::<SharedTokenExactMiss>())
-                        as u64;
-                    checked(
-                        "in_memory_miss_bytes",
-                        next_bytes,
-                        budget.max_artifact_bytes,
-                    )?;
-                    misses.push(SharedTokenExactMiss {
-                        token_id: token,
-                        left_contract: contracts[left],
-                        right_contract: contracts[right],
-                    });
+    let miss_bytes = std::mem::size_of::<SharedTokenExactMiss>() as u64;
+    let max_misses = budget.max_artifact_bytes / miss_bytes.max(1);
+    let reserved_misses = AtomicU64::new(0);
+    let cancelled = AtomicBool::new(false);
+    let result = shared_token_pair_tiles(contracts.len(), PAIR_TILE_MEMBERS)
+        .into_par_iter()
+        .map(|tile| -> Result<SharedTokenGroupScan, ExactIslandError> {
+            let mut result = SharedTokenGroupScan {
+                exact_matches: 0,
+                misses: Vec::new(),
+            };
+            let mut pending_work = 0u64;
+            for left in tile.left_begin..tile.left_end {
+                let right_begin = tile.right_begin.max(left.saturating_add(1));
+                for right in right_begin..tile.right_end {
+                    if cancelled.load(Ordering::Acquire) {
+                        return Ok(result);
+                    }
+                    pending_work = pending_work.saturating_add(1);
+                    if pending_work >= PROGRESS_CHUNK {
+                        report_work(pending_work);
+                        pending_work = 0;
+                    }
+                    let left_payload = features.source_to_payload[sources[left] as usize];
+                    let right_payload = features.source_to_payload[sources[right] as usize];
+                    if template_matches(features, left_payload, right_payload)
+                        && content_matches(features, left_payload, right_payload)
+                    {
+                        result.exact_matches = result.exact_matches.saturating_add(1);
+                        if routing.as_ref().is_some_and(|(sketches, plan)| {
+                            !plan.routes_pair(sketches, left as u32, right as u32)
+                        }) {
+                            let slot = reserved_misses.fetch_add(1, Ordering::AcqRel);
+                            if slot >= max_misses {
+                                cancelled.store(true, Ordering::Release);
+                                return Err(ExactIslandError::Budget {
+                                    resource: "in_memory_miss_bytes",
+                                    requested: slot.saturating_add(1).saturating_mul(miss_bytes),
+                                    limit: budget.max_artifact_bytes,
+                                });
+                            }
+                            result.misses.push(SharedTokenExactMiss {
+                                token_id: token,
+                                left_contract: contracts[left],
+                                right_contract: contracts[right],
+                            });
+                        }
+                    }
                 }
             }
-        }
+            if pending_work != 0 {
+                report_work(pending_work);
+            }
+            Ok(result)
+        })
+        .try_reduce(
+            || SharedTokenGroupScan {
+                exact_matches: 0,
+                misses: Vec::new(),
+            },
+            |left, right| Ok(left.merge(right)),
+        );
+    if result.is_err() {
+        cancelled.store(true, Ordering::Release);
     }
-    if pending_work != 0 {
-        report_work(pending_work);
-    }
-    Ok(SharedTokenGroupScan {
-        exact_matches,
-        misses,
-    })
-}
-
-fn bounded_local_routes(
-    sketches: &[crate::blocking::AtomSketch],
-    max_bytes: u64,
-) -> Result<std::collections::BTreeSet<(usize, usize)>, ExactIslandError> {
-    let mut routed = std::collections::BTreeSet::new();
-    let mut overflow = None;
-    for_each_local_base_equivalent_pair(sketches, |left, right| {
-        if overflow.is_some() {
-            return;
-        }
-        routed.insert((left as usize, right as usize));
-        let requested = (routed.len() as u64).saturating_mul(32);
-        if requested > max_bytes {
-            overflow = Some(requested);
-        }
-    });
-    if let Some(requested) = overflow {
-        return Err(ExactIslandError::Budget {
-            resource: "shared_token_routing_bytes",
-            requested,
-            limit: max_bytes,
-        });
-    }
-    Ok(routed)
+    result
 }
 
 pub fn run_pair_exact_island(
@@ -1190,11 +1222,11 @@ fn sorted_intersects(x: &[u32], y: &[u32]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{bounded_local_routes, SharedTokenExactEvidence};
-    use crate::blocking::AtomSketch;
+    use super::{shared_token_pair_tiles, SharedTokenExactEvidence};
+    use crate::blocking::{AtomSketch, LocalRoutingPlan};
 
     #[test]
-    fn local_route_budget_counts_materialized_routes_not_full_pair_universe() {
+    fn local_route_queries_do_not_materialize_the_pair_universe() {
         let sketches = (0..300u64)
             .map(|value| AtomSketch {
                 template_simhash: value.wrapping_mul(0x9e37_79b9_7f4a_7c15),
@@ -1206,8 +1238,30 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let routes = bounded_local_routes(&sketches, 64 * 1024).unwrap();
-        assert!(routes.len() < 2_048);
+        let plan = LocalRoutingPlan::build(&sketches);
+        let routed = (0..sketches.len() as u32)
+            .flat_map(|left| (left + 1..sketches.len() as u32).map(move |right| (left, right)))
+            .filter(|&(left, right)| plan.routes_pair(&sketches, left, right))
+            .count();
+        assert!(routed < 2_048);
+    }
+
+    #[test]
+    fn shared_token_tiles_cover_every_unordered_pair_once() {
+        let mut visits = Vec::new();
+        for tile in shared_token_pair_tiles(19, 4) {
+            for left in tile.left_begin..tile.left_end {
+                let right_begin = tile.right_begin.max(left + 1);
+                for right in right_begin..tile.right_end {
+                    visits.push((left, right));
+                }
+            }
+        }
+        visits.sort_unstable();
+        let expected = (0..19)
+            .flat_map(|left| (left + 1..19).map(move |right| (left, right)))
+            .collect::<Vec<_>>();
+        assert_eq!(visits, expected);
     }
 
     #[test]

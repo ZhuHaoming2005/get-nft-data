@@ -5,7 +5,7 @@ use thiserror::Error;
 
 pub const GIB: u64 = 1024 * 1024 * 1024;
 pub const ENCODE_HARD_TOP: u64 = 288 * GIB;
-pub const MATCH_HARD_TOP: u64 = 384 * GIB;
+pub const MATCH_HARD_TOP: u64 = 448 * GIB;
 pub const REQUIRED_HOST_HEADROOM: u64 = 64 * GIB;
 
 pub const fn required_host_headroom(host_total: u64) -> u64 {

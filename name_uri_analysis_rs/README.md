@@ -19,7 +19,7 @@ numactl --interleave=all \
   --work-directory ./name-uri-work \
   --threads 128 \
   --duckdb-memory-limit 320GiB \
-  --analysis-memory-limit 384GiB \
+  --analysis-memory-limit 448GiB \
   --name-threshold 95
 ```
 
@@ -105,7 +105,7 @@ subphase、`completed/total`、工作单位和诊断计数，CLI 只负责渲染
 
 因此 `ETA` 表示“当前子阶段剩余同类工作”的估计。只有 Metadata Match 的引擎事件会独立显示
 `match ETA n/a (uncalibrated)`；在没有同 revision、同规模目标机历史分布前不会把子阶段速率外推成
-整段 Match 的伪精确 ETA。当前 Match controller revision 为 14，旧持久化路径的历史样本不会污染
+整段 Match 的伪精确 ETA。当前 Match controller revision 为 15，旧持久化路径的历史样本不会污染
 新的 MemoryFirst ETA。
 可用 `--no-progress` 关闭终端进度。
 
@@ -127,10 +127,11 @@ subphase、`completed/total`、工作单位和诊断计数，CLI 只负责渲染
 - Match 使用实际物理内存探测保留 host headroom；edge 上限由 admitted Match 内存给出，随后按
   contract/scope 的最大 forest 上界自动缩小。Catalog 与 Exact 并行度均由 MemoryBroker 限制。
   hot block 在 catalog 中只保留一个惰性 fanout 描述符；执行时根据抽样 posting expansion 选择一维
-  建立临时倒排索引，并在另一维精确验证 term overlap 后才进入 scorer。该 scratch 按最大 hot block
-  逐 lane 准入，不再物化二次方 tile descriptor 或扫描已被 overlap proof 排除的 pair。
-  Reduce 以每个已排序 forest run 的小顶堆流式归并，不再复制并全量排序所有边；组件根直接从最终
-  vector 提交，并按含文件头/校验开销的实际大小在 sparse/dense 格式间选择。
+  建立共享只读倒排索引，并在另一维并行验证 left-row term overlap 后才进入 scorer；共享 posting
+  scratch 按并发 hot job 准入，线程局部 row scratch 按 lane 准入。shared-token ExactIsland 不再
+  物化完整 routing pair 集，而是复用并行构建的只读 routing plan，按 512×512 pair tile 扫描。
+  Reduce 直接在内存中对各 forest run 执行并行原子 union 和并行 root 解析，不再串行归并排序边；
+  组件根按含文件头/校验开销的实际大小在 sparse/dense 格式间选择，并按 scope 并行提交。
 - 默认成功后删除工作目录；需要检查阶段恢复产物时使用
   `--keep-work-directory --diagnostics`。
 - manifest 校验输入指纹、阶段 revision、partial hash 和后续阶段必需的 DuckDB 表；算法

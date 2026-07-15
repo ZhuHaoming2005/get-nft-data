@@ -1,6 +1,7 @@
 //! Ephemeral group-local BaseEquivalent routing for shared-token contexts.
 
 use super::{simhash_band_value, AtomSketch, ANCHOR_COUNT, BANDS, JOINT_BAND_FAMILIES};
+use rayon::prelude::*;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -40,35 +41,32 @@ impl LocalRoutingPlan {
     pub(crate) fn build(sketches: &[AtomSketch]) -> Self {
         let mut mapped = BTreeMap::<(Kind, u64), Vec<u32>>::new();
         for (i, s) in sketches.iter().enumerate() {
-            if !s.has_content_terms {
-                continue;
-            }
-            let i = i as u32;
-            if s.has_template_terms {
-                for family in 0..JOINT_BAND_FAMILIES {
-                    let tb = family / BANDS;
-                    let cb = family % BANDS;
-                    let bucket = (u16::from(simhash_band_value(s.template_simhash, tb)) << 8)
-                        | u16::from(simhash_band_value(s.content_simhash, cb));
-                    mapped
-                        .entry((Kind::Joint, ((family as u64) << 16) | u64::from(bucket)))
-                        .or_default()
-                        .push(i);
-                }
-                for &a in s.template_anchors.iter().take(ANCHOR_COUNT) {
-                    mapped
-                        .entry((Kind::TemplateAnchor, u64::from(a)))
-                        .or_default()
-                        .push(i);
-                }
-            }
-            for &a in s.content_anchors.iter().take(ANCHOR_COUNT) {
-                mapped
-                    .entry((Kind::ContentAnchor, u64::from(a)))
-                    .or_default()
-                    .push(i);
-            }
+            add_sketch_blocks(&mut mapped, i as u32, s);
         }
+        Self::from_mapped(sketches.len(), mapped)
+    }
+
+    pub(crate) fn build_parallel(sketches: &[AtomSketch]) -> Self {
+        if sketches.len() < 1_024 || rayon::current_num_threads() <= 1 {
+            return Self::build(sketches);
+        }
+        let mapped = sketches
+            .par_iter()
+            .enumerate()
+            .fold(BTreeMap::new, |mut mapped, (index, sketch)| {
+                add_sketch_blocks(&mut mapped, index as u32, sketch);
+                mapped
+            })
+            .reduce(BTreeMap::new, |mut left, right| {
+                for (key, mut members) in right {
+                    left.entry(key).or_default().append(&mut members);
+                }
+                left
+            });
+        Self::from_mapped(sketches.len(), mapped)
+    }
+
+    fn from_mapped(sketch_count: usize, mapped: BTreeMap<(Kind, u64), Vec<u32>>) -> Self {
         let blocks = mapped
             .into_iter()
             .map(|((kind, _), mut members)| {
@@ -77,7 +75,7 @@ impl LocalRoutingPlan {
                 Block { kind, members }
             })
             .collect::<Vec<_>>();
-        let mut atom_blocks = vec![Vec::new(); sketches.len()];
+        let mut atom_blocks = vec![Vec::new(); sketch_count];
         for (id, block) in blocks.iter().enumerate() {
             for &atom in &block.members {
                 atom_blocks[atom as usize].push(id as u32);
@@ -122,6 +120,45 @@ impl LocalRoutingPlan {
             }
         }
         true
+    }
+
+    pub(crate) fn routes_pair(&self, sketches: &[AtomSketch], left: u32, right: u32) -> bool {
+        owner(&self.blocks, &self.atom_blocks, sketches, left, right).is_some()
+    }
+}
+
+fn add_sketch_blocks(
+    mapped: &mut BTreeMap<(Kind, u64), Vec<u32>>,
+    index: u32,
+    sketch: &AtomSketch,
+) {
+    if !sketch.has_content_terms {
+        return;
+    }
+    if sketch.has_template_terms {
+        for family in 0..JOINT_BAND_FAMILIES {
+            let template_band = family / BANDS;
+            let content_band = family % BANDS;
+            let bucket = (u16::from(simhash_band_value(sketch.template_simhash, template_band))
+                << 8)
+                | u16::from(simhash_band_value(sketch.content_simhash, content_band));
+            mapped
+                .entry((Kind::Joint, ((family as u64) << 16) | u64::from(bucket)))
+                .or_default()
+                .push(index);
+        }
+        for &anchor in sketch.template_anchors.iter().take(ANCHOR_COUNT) {
+            mapped
+                .entry((Kind::TemplateAnchor, u64::from(anchor)))
+                .or_default()
+                .push(index);
+        }
+    }
+    for &anchor in sketch.content_anchors.iter().take(ANCHOR_COUNT) {
+        mapped
+            .entry((Kind::ContentAnchor, u64::from(anchor)))
+            .or_default()
+            .push(index);
     }
 }
 
@@ -294,5 +331,53 @@ mod tests {
 
         assert!(tiles.len() > 4);
         assert_eq!(tiled, serial);
+    }
+
+    #[test]
+    fn direct_route_query_matches_serial_owner_pairs() {
+        let sketches = vec![hot_sketch(); 33];
+        let plan = LocalRoutingPlan::build(&sketches);
+        let mut direct = Vec::new();
+        for left in 0..sketches.len() as u32 {
+            for right in left + 1..sketches.len() as u32 {
+                if plan.routes_pair(&sketches, left, right) {
+                    direct.push((left, right));
+                }
+            }
+        }
+        let mut serial = Vec::new();
+        for_each_local_base_equivalent_pair(&sketches, |left, right| {
+            serial.push((left, right));
+        });
+        serial.sort_unstable();
+        assert_eq!(direct, serial);
+    }
+
+    #[test]
+    fn parallel_plan_matches_serial_routes() {
+        let sketches = (0..1_100u32)
+            .map(|value| AtomSketch {
+                template_simhash: u64::from(value).wrapping_mul(0x9e37_79b9),
+                content_simhash: u64::from(value % 37).wrapping_mul(0xbf58_476d),
+                template_anchors: vec![value % 53],
+                content_anchors: vec![value % 71],
+                has_template_terms: true,
+                has_content_terms: true,
+            })
+            .collect::<Vec<_>>();
+        let serial = LocalRoutingPlan::build(&sketches);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let parallel = pool.install(|| LocalRoutingPlan::build_parallel(&sketches));
+        for left in (0..sketches.len() as u32).step_by(7) {
+            for right in (left + 1..sketches.len() as u32).step_by(11) {
+                assert_eq!(
+                    parallel.routes_pair(&sketches, left, right),
+                    serial.routes_pair(&sketches, left, right)
+                );
+            }
+        }
     }
 }

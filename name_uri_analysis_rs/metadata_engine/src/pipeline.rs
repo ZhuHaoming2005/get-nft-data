@@ -23,7 +23,10 @@ use crate::exact_islands::{
     run_shared_token_exact_islands_with_progress, ExactEvidenceBudget, PairExactEvidence,
     SharedTokenExactEvidence,
 };
-use crate::index::{max_hot_block_candidate_index_bytes, ConservativeIndex, IndexMetrics};
+use crate::index::{
+    max_hot_block_candidate_index_bytes, max_hot_block_parallel_row_bytes, ConservativeIndex,
+    IndexMetrics,
+};
 use crate::progress::{
     ProgressCounters, ProgressEvent, ProgressPhase, TotalKind, WorkClass, WorkUnit,
 };
@@ -33,7 +36,7 @@ use crate::reduce::{
     ForestRun,
 };
 use crate::resource::MemoryBroker;
-use crate::scheduler::{job_routing_pair_work, RecallPlan, UniverseBudget, WorkCatalog};
+use crate::scheduler::{job_routing_pair_work, JobShape, RecallPlan, UniverseBudget, WorkCatalog};
 use crate::snapshot::{MetadataSnapshot, SnapshotError};
 use crate::storage::{ArtifactClass, ArtifactRegistration, EvictionPlan, StorageBroker};
 
@@ -281,6 +284,9 @@ struct ScopeCollectorBroker {
     first_error: Arc<std::sync::Mutex<Option<crate::reduce::ReduceError>>>,
     retained: Arc<ScopeRetainedBudget>,
     scorer_lanes: usize,
+    logical_scope_count: usize,
+    shards_per_scope: usize,
+    next_shard: Vec<std::sync::atomic::AtomicUsize>,
 }
 
 struct ScopeRetainedBudget {
@@ -299,14 +305,16 @@ impl ScopeCollectorBroker {
         threads: usize,
     ) -> Result<Self, PipelineError> {
         let scope_count = chain_pair_count.saturating_add(2);
+        let shards_per_scope = if threads >= 4 { 2 } else { 1 };
+        let collector_count = scope_count.saturating_mul(shards_per_scope);
         let active_sink_workers = if threads <= 1 {
             0
         } else {
             let sink_cap = (threads / 4).max(2).min(threads.saturating_sub(1));
-            scope_count.min(sink_cap)
+            collector_count.min(sink_cap)
         };
         let scorer_lanes = threads.saturating_sub(active_sink_workers).max(1);
-        let collectors = (0..scope_count)
+        let collectors = (0..collector_count)
             .map(|_| {
                 Arc::new(std::sync::Mutex::new(Some(EdgeCollector::new_serial(
                     node_count, budget, 1_048_576,
@@ -318,7 +326,7 @@ impl ScopeCollectorBroker {
         let first_error = Arc::new(std::sync::Mutex::new(None));
         let retained = Arc::new(ScopeRetainedBudget {
             max_bytes: max_retained_bytes,
-            by_scope: (0..scope_count)
+            by_scope: (0..collector_count)
                 .map(|_| std::sync::atomic::AtomicU64::new(0))
                 .collect(),
             total: std::sync::atomic::AtomicU64::new(0),
@@ -401,6 +409,11 @@ impl ScopeCollectorBroker {
             first_error,
             retained,
             scorer_lanes,
+            logical_scope_count: scope_count,
+            shards_per_scope,
+            next_shard: (0..scope_count)
+                .map(|_| std::sync::atomic::AtomicUsize::new(0))
+                .collect(),
         })
     }
 
@@ -470,6 +483,14 @@ impl ScopeCollectorBroker {
                 "scope collector broker cancelled".into(),
             ));
         }
+        if scope >= self.logical_scope_count {
+            return Err(PipelineError::Invariant("invalid collector scope".into()));
+        }
+        let shard = self.next_shard[scope].fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % self.shards_per_scope;
+        let collector_slot = scope
+            .saturating_mul(self.shards_per_scope)
+            .saturating_add(shard);
         if self.senders.is_empty() {
             let _admission = self
                 .retained
@@ -478,7 +499,7 @@ impl ScopeCollectorBroker {
                 .map_err(|_| PipelineError::Parallel("scope budget lock poisoned".into()))?;
             let collector = self
                 .collectors
-                .get(scope)
+                .get(collector_slot)
                 .ok_or_else(|| PipelineError::Invariant("invalid collector scope".into()))?;
             let mut guard = collector
                 .lock()
@@ -491,16 +512,19 @@ impl ScopeCollectorBroker {
             }
             drop(guard);
             let over_budget =
-                record_broker_retained_bytes(&self.collectors, scope, &self.retained)?;
+                record_broker_retained_bytes(&self.collectors, collector_slot, &self.retained)?;
             drop(_admission);
             if over_budget {
                 compact_broker_retained_budget(&self.collectors, &self.retained)?;
             }
             return Ok(());
         }
-        let worker = scope % self.senders.len();
+        let worker = collector_slot % self.senders.len();
         self.senders[worker]
-            .send(ScopeSinkMessage::Edges { scope, edges })
+            .send(ScopeSinkMessage::Edges {
+                scope: collector_slot,
+                edges,
+            })
             .map_err(|_| PipelineError::Parallel("scope collector sink disconnected".into()))
     }
 
@@ -522,6 +546,7 @@ impl ScopeCollectorBroker {
         }
     }
 
+    #[cfg(test)]
     fn finish(mut self) -> Result<ScopeForestRuns, PipelineError> {
         self.shutdown()?;
         if let Some(error) = self
@@ -541,14 +566,56 @@ impl ScopeCollectorBroker {
                 .ok_or_else(|| PipelineError::Invariant("collector already finished".into()))?;
             runs.push(collector.finish()?);
         }
-        let mut runs = runs.into_iter();
-        let intra = runs.next().unwrap_or_default();
-        let cross = runs.next().unwrap_or_default();
-        Ok((intra, cross, runs.collect()))
+        Ok(collapse_scope_runs(
+            runs,
+            self.logical_scope_count,
+            self.shards_per_scope,
+        ))
+    }
+
+    fn finish_parallel(
+        mut self,
+        worker_pool: &rayon::ThreadPool,
+    ) -> Result<ScopeForestRuns, PipelineError> {
+        self.shutdown()?;
+        if let Some(error) = self
+            .first_error
+            .lock()
+            .map_err(|_| PipelineError::Parallel("scope collector error lock poisoned".into()))?
+            .take()
+        {
+            return Err(error.into());
+        }
+        let collectors = self.collectors.drain(..).collect::<Vec<_>>();
+        let finished = worker_pool.install(|| {
+            collectors
+                .into_par_iter()
+                .map(|collector| -> Result<Vec<ForestRun>, PipelineError> {
+                    let collector = Arc::try_unwrap(collector)
+                        .map_err(|_| {
+                            PipelineError::Parallel("scope collector still shared".into())
+                        })?
+                        .into_inner()
+                        .map_err(|_| {
+                            PipelineError::Parallel("scope collector lock poisoned".into())
+                        })?
+                        .ok_or_else(|| {
+                            PipelineError::Invariant("collector already finished".into())
+                        })?;
+                    collector.finish().map_err(PipelineError::from)
+                })
+                .collect::<Vec<_>>()
+        });
+        Ok(collapse_scope_runs(
+            finished.into_iter().collect::<Result<Vec<_>, _>>()?,
+            self.logical_scope_count,
+            self.shards_per_scope,
+        ))
     }
 
     fn finish_with_progress(
         self,
+        worker_pool: &rayon::ThreadPool,
         progress: &mut impl FnMut(ProgressEvent),
     ) -> Result<ScopeForestRuns, PipelineError> {
         let total = self.collectors.len() as u64;
@@ -562,7 +629,7 @@ impl ScopeCollectorBroker {
             )
             .with_plan(WorkClass::ReduceItems, TotalKind::Exact),
         );
-        let runs = self.finish()?;
+        let runs = self.finish_parallel(worker_pool)?;
         for completed in 1..=total {
             progress(
                 ProgressEvent::determinate(
@@ -577,6 +644,26 @@ impl ScopeCollectorBroker {
         }
         Ok(runs)
     }
+}
+
+fn collapse_scope_runs(
+    physical_runs: Vec<Vec<ForestRun>>,
+    logical_scope_count: usize,
+    shards_per_scope: usize,
+) -> ScopeForestRuns {
+    let mut logical_runs = (0..logical_scope_count)
+        .map(|_| Vec::new())
+        .collect::<Vec<Vec<ForestRun>>>();
+    for (collector_slot, mut runs) in physical_runs.into_iter().enumerate() {
+        let logical_scope = collector_slot / shards_per_scope.max(1);
+        if let Some(target) = logical_runs.get_mut(logical_scope) {
+            target.append(&mut runs);
+        }
+    }
+    let mut runs = logical_runs.into_iter();
+    let intra = runs.next().unwrap_or_default();
+    let cross = runs.next().unwrap_or_default();
+    (intra, cross, runs.collect())
 }
 
 impl Drop for ScopeCollectorBroker {
@@ -1124,6 +1211,42 @@ struct CatalogExecutionConfig {
     chain_count: usize,
 }
 
+struct CatalogParallelLaneState {
+    batch: Vec<Edge>,
+    pending_expansion: u64,
+    compaction_scratch: ScopeCompactionScratch,
+}
+
+impl CatalogParallelLaneState {
+    fn new(contract_count: usize, edge_batch: usize, dense_scratch_bytes: usize) -> Self {
+        Self {
+            batch: Vec::with_capacity(edge_batch),
+            pending_expansion: 0,
+            compaction_scratch: ScopeCompactionScratch::new(contract_count, dense_scratch_bytes),
+        }
+    }
+}
+
+fn submit_catalog_lane_batch(
+    state: &mut CatalogParallelLaneState,
+    snapshot: &MetadataSnapshot,
+    chain_count: usize,
+    collectors: &ScopeCollectorBroker,
+    edge_batch: usize,
+) -> Result<(), PipelineError> {
+    if state.batch.is_empty() {
+        return Ok(());
+    }
+    let ready = std::mem::replace(&mut state.batch, Vec::with_capacity(edge_batch));
+    let ready = compact_catalog_scope_batch(
+        snapshot.features(),
+        chain_count,
+        ready,
+        &mut state.compaction_scratch,
+    );
+    collectors.submit_compacted_catalog_batch(ready)
+}
+
 fn score_catalog_parallel(
     snapshot: &MetadataSnapshot,
     catalog: &WorkCatalog,
@@ -1188,13 +1311,170 @@ fn score_catalog_parallel(
                         let Some(job) = catalog.jobs.get(job_id as usize) else {
                             return;
                         };
+                        let send_failed = std::sync::atomic::AtomicBool::new(false);
+                        if job.shape == JobShape::LeftTileFanout {
+                            let metrics = index
+                                .for_each_job_candidate_parallel_stateful_with_work_while(
+                                    job,
+                                    || {
+                                        CatalogParallelLaneState::new(
+                                            snapshot.features().contract_chain.len(),
+                                            EDGE_BATCH,
+                                            DENSE_COMPACTION_SCRATCH_BYTES,
+                                        )
+                                    },
+                                    |state, a, b| {
+                                        if send_failed.load(std::sync::atomic::Ordering::Acquire)
+                                            || producer_cancelled
+                                                .load(std::sync::atomic::Ordering::Acquire)
+                                        {
+                                            return;
+                                        }
+                                        let work = match expand_catalog_atom_pair_with_budget(
+                                            snapshot,
+                                            a,
+                                            b,
+                                            |work| {
+                                                record_pair_visits(
+                                                    producer_reserved_pair_visits,
+                                                    work,
+                                                )
+                                            },
+                                            |left, right| {
+                                                if send_failed
+                                                    .load(std::sync::atomic::Ordering::Acquire)
+                                                {
+                                                    return;
+                                                }
+                                                state.batch.push(Edge::new(left, right));
+                                                if state.batch.len() == EDGE_BATCH {
+                                                    if let Err(error) = submit_catalog_lane_batch(
+                                                        state,
+                                                        snapshot,
+                                                        chain_count,
+                                                        collectors,
+                                                        EDGE_BATCH,
+                                                    ) {
+                                                        let _ = producer_sender
+                                                            .send(CatalogMessage::Error(error));
+                                                        send_failed.store(
+                                                            true,
+                                                            std::sync::atomic::Ordering::Release,
+                                                        );
+                                                        producer_cancelled.store(
+                                                            true,
+                                                            std::sync::atomic::Ordering::Release,
+                                                        );
+                                                    }
+                                                }
+                                            },
+                                        ) {
+                                            Ok(work) => work,
+                                            Err(error) => {
+                                                let _ = producer_sender
+                                                    .send(CatalogMessage::Error(error));
+                                                send_failed.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::Release,
+                                                );
+                                                producer_cancelled.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::Release,
+                                                );
+                                                return;
+                                            }
+                                        };
+                                        state.pending_expansion =
+                                            state.pending_expansion.saturating_add(work);
+                                        if state.pending_expansion >= 100_000 {
+                                            if producer_sender
+                                                .send(CatalogMessage::ExpansionWork(
+                                                    state.pending_expansion,
+                                                ))
+                                                .is_err()
+                                            {
+                                                send_failed.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::Release,
+                                                );
+                                                producer_cancelled.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::Release,
+                                                );
+                                            }
+                                            state.pending_expansion = 0;
+                                        }
+                                    },
+                                    |state| {
+                                        if send_failed.load(std::sync::atomic::Ordering::Acquire)
+                                            || producer_cancelled
+                                                .load(std::sync::atomic::Ordering::Acquire)
+                                        {
+                                            return;
+                                        }
+                                        if let Err(error) = submit_catalog_lane_batch(
+                                            state,
+                                            snapshot,
+                                            chain_count,
+                                            collectors,
+                                            EDGE_BATCH,
+                                        ) {
+                                            let _ =
+                                                producer_sender.send(CatalogMessage::Error(error));
+                                            send_failed
+                                                .store(true, std::sync::atomic::Ordering::Release);
+                                            producer_cancelled
+                                                .store(true, std::sync::atomic::Ordering::Release);
+                                            return;
+                                        }
+                                        if state.pending_expansion > 0 {
+                                            if producer_sender
+                                                .send(CatalogMessage::ExpansionWork(
+                                                    state.pending_expansion,
+                                                ))
+                                                .is_err()
+                                            {
+                                                send_failed.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::Release,
+                                                );
+                                                producer_cancelled.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::Release,
+                                                );
+                                            }
+                                            state.pending_expansion = 0;
+                                        }
+                                    },
+                                    &mut |work| {
+                                        if work > 0
+                                            && producer_sender
+                                                .send(CatalogMessage::RoutingWork(work))
+                                                .is_err()
+                                        {
+                                            send_failed
+                                                .store(true, std::sync::atomic::Ordering::Release);
+                                            producer_cancelled
+                                                .store(true, std::sync::atomic::Ordering::Release);
+                                        }
+                                    },
+                                    &mut || {
+                                        !send_failed.load(std::sync::atomic::Ordering::Acquire)
+                                            && !producer_cancelled
+                                                .load(std::sync::atomic::Ordering::Acquire)
+                                    },
+                                );
+                            if !send_failed.load(std::sync::atomic::Ordering::Acquire) {
+                                let _ = producer_sender.send(CatalogMessage::JobDone(metrics));
+                            }
+                            return;
+                        }
                         let mut batch = Vec::with_capacity(EDGE_BATCH);
-                        let send_failed = std::cell::Cell::new(false);
                         let mut pending_expansion = 0u64;
-                        let metrics = index.for_each_job_candidate_with_work_while(
+                        let metrics = index.for_each_job_candidate_parallel_with_work_while(
                             job,
-                            |a, b| {
-                                if send_failed.get()
+                            &mut |a, b| {
+                                if send_failed.load(std::sync::atomic::Ordering::Acquire)
                                     || producer_cancelled.load(std::sync::atomic::Ordering::Acquire)
                                 {
                                     return;
@@ -1222,7 +1502,10 @@ fn score_catalog_parallel(
                                             {
                                                 let _ = producer_sender
                                                     .send(CatalogMessage::Error(error));
-                                                send_failed.set(true);
+                                                send_failed.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::Release,
+                                                );
                                                 producer_cancelled.store(
                                                     true,
                                                     std::sync::atomic::Ordering::Release,
@@ -1234,7 +1517,8 @@ fn score_catalog_parallel(
                                     Ok(work) => work,
                                     Err(error) => {
                                         let _ = producer_sender.send(CatalogMessage::Error(error));
-                                        send_failed.set(true);
+                                        send_failed
+                                            .store(true, std::sync::atomic::Ordering::Release);
                                         producer_cancelled
                                             .store(true, std::sync::atomic::Ordering::Release);
                                         return;
@@ -1246,23 +1530,24 @@ fn score_catalog_parallel(
                                         .send(CatalogMessage::ExpansionWork(pending_expansion))
                                         .is_err()
                                     {
-                                        send_failed.set(true);
+                                        send_failed
+                                            .store(true, std::sync::atomic::Ordering::Release);
                                         return;
                                     }
                                     pending_expansion = 0;
                                 }
                             },
-                            |work| {
+                            &mut |work| {
                                 if work > 0
                                     && producer_sender
                                         .send(CatalogMessage::RoutingWork(work))
                                         .is_err()
                                 {
-                                    send_failed.set(true);
+                                    send_failed.store(true, std::sync::atomic::Ordering::Release);
                                 }
                             },
-                            || {
-                                !send_failed.get()
+                            &mut || {
+                                !send_failed.load(std::sync::atomic::Ordering::Acquire)
                                     && !producer_cancelled
                                         .load(std::sync::atomic::Ordering::Acquire)
                             },
@@ -1971,14 +2256,33 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
                 .ok_or(crate::resource::MemoryError::Overflow)?;
             const CATALOG_LANE_BYTES: u64 = 8 * 1024 * 1024;
             let hot_index_bytes = max_hot_block_candidate_index_bytes(&snapshot, &catalog)?;
-            let catalog_lane_bytes = CATALOG_LANE_BYTES
-                .checked_add(hot_index_bytes)
+            let hot_row_bytes = max_hot_block_parallel_row_bytes(&snapshot, &catalog)?;
+            let hot_job_count = catalog
+                .jobs
+                .iter()
+                .filter(|job| job.shape == JobShape::LeftTileFanout)
+                .count();
+            let mut lanes = collectors.scorer_lanes().max(1);
+            loop {
+                let concurrent_hot_jobs = hot_job_count.min(lanes) as u64;
+                let fixed_hot_bytes = concurrent_hot_jobs.saturating_mul(hot_index_bytes);
+                let admitted = memory.active_lanes(
+                    lanes,
+                    fixed_hot_bytes,
+                    CATALOG_LANE_BYTES.saturating_add(hot_row_bytes),
+                );
+                if admitted >= lanes || lanes == 1 {
+                    break;
+                }
+                lanes = admitted.max(1);
+            }
+            let fixed_hot_bytes = (hot_job_count.min(lanes) as u64).saturating_mul(hot_index_bytes);
+            let scorer_bytes = fixed_hot_bytes
+                .checked_add(
+                    (lanes as u64).saturating_mul(CATALOG_LANE_BYTES.saturating_add(hot_row_bytes)),
+                )
                 .ok_or(crate::resource::MemoryError::Overflow)?;
-            let lanes = memory
-                .active_lanes(collectors.scorer_lanes(), 0, catalog_lane_bytes)
-                .max(1);
-            let _scorer_memory =
-                memory.reserve((lanes as u64).saturating_mul(catalog_lane_bytes))?;
+            let _scorer_memory = memory.reserve(scorer_bytes)?;
             let catalog_result = score_catalog_parallel(
                 &snapshot,
                 &catalog,
@@ -2024,7 +2328,7 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
             )?;
             let accepted_edge_count = collectors.accepted_edges();
             let (intra_runs, cross_runs, pair_runs) =
-                collectors.finish_with_progress(&mut progress)?;
+                collectors.finish_with_progress(&match_pool, &mut progress)?;
             if persistence == MatchPersistence::Durable {
                 commit_connectivity_runs(
                     &runs_dir,
@@ -2201,25 +2505,7 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
         WorkUnit::Files,
         ProgressCounters::default(),
     ));
-    let mut committed = 0u64;
-    for scope in &scopes {
-        if scope.needs_rebuild {
-            let roots = scope
-                .roots
-                .as_deref()
-                .ok_or_else(|| PipelineError::Invariant("missing reduced roots".into()))?;
-            commit_component_roots(&scope.directory, &scope.identity, roots, || {
-                committed = committed.saturating_add(1);
-                progress(ProgressEvent::determinate(
-                    ProgressPhase::CommitComponents,
-                    committed,
-                    component_total,
-                    WorkUnit::Files,
-                    ProgressCounters::default(),
-                ));
-            })?;
-        }
-    }
+    commit_component_scopes_parallel(&scopes, component_total, &worker_pool, &mut progress)?;
     let mut intra_roots = None;
     let mut cross_roots = None;
     let mut chain_pair_roots = Vec::with_capacity(scopes.len().saturating_sub(2));
@@ -2701,6 +2987,56 @@ fn reduce_component_scopes_parallel(
         if reduced_work != reduce_total {
             return Err(PipelineError::Invariant(format!(
                 "component reduction progress mismatch: completed={reduced_work}, planned={reduce_total}"
+            )));
+        }
+        Ok(())
+    })
+}
+
+fn commit_component_scopes_parallel(
+    scopes: &[ComponentScopePlan],
+    component_total: u64,
+    worker_pool: &rayon::ThreadPool,
+    progress: &mut impl FnMut(ProgressEvent),
+) -> Result<(), PipelineError> {
+    let channel_capacity = worker_pool.current_num_threads().max(1).saturating_mul(2);
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<()>(channel_capacity);
+    std::thread::scope(|thread_scope| -> Result<(), PipelineError> {
+        let producer_sender = sender.clone();
+        let producer = thread_scope.spawn(move || {
+            worker_pool.install(|| {
+                scopes
+                    .par_iter()
+                    .filter(|scope| scope.needs_rebuild)
+                    .try_for_each(|scope| -> Result<(), PipelineError> {
+                        let roots = scope.roots.as_deref().ok_or_else(|| {
+                            PipelineError::Invariant("missing reduced roots".into())
+                        })?;
+                        commit_component_roots(&scope.directory, &scope.identity, roots, || {
+                            let _ = producer_sender.send(());
+                        })?;
+                        Ok(())
+                    })
+            })
+        });
+        drop(sender);
+        let mut committed = 0u64;
+        for () in receiver {
+            committed = committed.saturating_add(1).min(component_total);
+            progress(ProgressEvent::determinate(
+                ProgressPhase::CommitComponents,
+                committed,
+                component_total,
+                WorkUnit::Files,
+                ProgressCounters::default(),
+            ));
+        }
+        producer
+            .join()
+            .map_err(|_| PipelineError::Parallel("component commit worker panicked".into()))??;
+        if committed != component_total {
+            return Err(PipelineError::Invariant(format!(
+                "component commit progress mismatch: completed={committed}, planned={component_total}"
             )));
         }
         Ok(())
@@ -3579,7 +3915,7 @@ fn append_shared_token_edges(
                     if contracts.len() >= 256 {
                         const LOCAL_TILE_MEMBERS: usize = 256;
                         let sketches = shared_group_sketches(f, sources);
-                        let plan = LocalRoutingPlan::build(&sketches);
+                        let plan = LocalRoutingPlan::build_parallel(&sketches);
                         plan.tiles(LOCAL_TILE_MEMBERS)
                             .par_bridge()
                             .for_each(|tile| {
@@ -3857,7 +4193,6 @@ fn build_summary_rows_with_progress(
         .saturating_add(cross_work)
         .saturating_add(pair_work);
     let mut completed = 0u64;
-    let mut summary_scratch = DenseSummaryScratch::new(snapshot.contract_count());
     progress(ProgressEvent::determinate(
         ProgressPhase::BuildSummary,
         0,
@@ -3865,48 +4200,51 @@ fn build_summary_rows_with_progress(
         WorkUnit::Nodes,
         ProgressCounters::default(),
     ));
-    let cross_stats = (chain_count > 1).then(|| {
-        worker_pool.install(|| cross_summary_stats(snapshot, &scopes.cross_roots, chain_count))
+    let (intra_rows, cross_stats) = worker_pool.install(|| {
+        rayon::join(
+            || {
+                contracts_by_chain
+                    .par_iter()
+                    .enumerate()
+                    .map(|(chain, contract_ids)| {
+                        let mut scratch = DenseSummaryScratch::new(snapshot.contract_count());
+                        let mut work = 0u64;
+                        let row = summary_for_roots(
+                            snapshot,
+                            SummaryRowRequest {
+                                scope: "intra_chain",
+                                primary: chain,
+                                secondary: None,
+                                roots: &scopes.intra_roots,
+                                require_secondary: false,
+                                contract_ids,
+                            },
+                            &mut scratch,
+                            &mut |delta| work = work.saturating_add(delta),
+                        );
+                        (row, work)
+                    })
+                    .collect::<Vec<_>>()
+            },
+            || {
+                (chain_count > 1)
+                    .then(|| cross_summary_stats(snapshot, &scopes.cross_roots, chain_count))
+            },
+        )
     });
-    let mut cross_work_reported = false;
-    macro_rules! append {
-        ($scope:expr, $primary:expr, $secondary:expr, $roots:expr, $require_secondary:expr, $contract_ids:expr $(,)?) => {{
-            let row = summary_for_roots(
-                snapshot,
-                SummaryRowRequest {
-                    scope: $scope,
-                    primary: $primary,
-                    secondary: $secondary,
-                    roots: $roots,
-                    require_secondary: $require_secondary,
-                    contract_ids: $contract_ids,
-                },
-                &mut summary_scratch,
-                &mut |work| {
-                    completed = completed.saturating_add(work).min(total);
-                    progress(ProgressEvent::determinate(
-                        ProgressPhase::BuildSummary,
-                        completed,
-                        total,
-                        WorkUnit::Nodes,
-                        ProgressCounters::default(),
-                    ));
-                },
-            );
-            rows.push(row);
-        }};
-    }
     for chain in 0..chain_count {
-        append!(
-            "intra_chain",
-            chain,
-            None,
-            &scopes.intra_roots,
-            false,
-            &contracts_by_chain[chain],
-        );
+        let (row, work) = &intra_rows[chain];
+        completed = completed.saturating_add(*work).min(total);
+        rows.push(row.clone());
+        progress(ProgressEvent::determinate(
+            ProgressPhase::BuildSummary,
+            completed,
+            total,
+            WorkUnit::Nodes,
+            ProgressCounters::default(),
+        ));
         if let Some(stats) = cross_stats.as_ref() {
-            if !cross_work_reported {
+            if chain == 0 {
                 completed = completed
                     .saturating_add(snapshot.contract_count() as u64)
                     .min(total);
@@ -3917,7 +4255,6 @@ fn build_summary_rows_with_progress(
                     WorkUnit::Nodes,
                     ProgressCounters::default(),
                 ));
-                cross_work_reported = true;
             }
             rows.push(summary_row_from_stats(
                 snapshot,
@@ -3928,27 +4265,63 @@ fn build_summary_rows_with_progress(
             ));
         }
     }
-    let mut pair_contracts = Vec::new();
-    for pair in &scopes.chain_pair_roots {
-        pair_contracts.clear();
-        pair_contracts.extend_from_slice(&contracts_by_chain[pair.left_chain as usize]);
-        pair_contracts.extend_from_slice(&contracts_by_chain[pair.right_chain as usize]);
-        append!(
-            "chain_matrix",
-            pair.left_chain as usize,
-            Some(pair.right_chain as usize),
-            &pair.roots,
-            true,
-            &pair_contracts,
-        );
-        append!(
-            "chain_matrix",
-            pair.right_chain as usize,
-            Some(pair.left_chain as usize),
-            &pair.roots,
-            true,
-            &pair_contracts,
-        );
+    let pair_rows = worker_pool.install(|| {
+        scopes
+            .chain_pair_roots
+            .par_iter()
+            .map(|pair| {
+                let mut contract_ids = Vec::with_capacity(
+                    contracts_by_chain[pair.left_chain as usize]
+                        .len()
+                        .saturating_add(contracts_by_chain[pair.right_chain as usize].len()),
+                );
+                contract_ids.extend_from_slice(&contracts_by_chain[pair.left_chain as usize]);
+                contract_ids.extend_from_slice(&contracts_by_chain[pair.right_chain as usize]);
+                let mut scratch = DenseSummaryScratch::new(snapshot.contract_count());
+                let mut left_work = 0u64;
+                let left = summary_for_roots(
+                    snapshot,
+                    SummaryRowRequest {
+                        scope: "chain_matrix",
+                        primary: pair.left_chain as usize,
+                        secondary: Some(pair.right_chain as usize),
+                        roots: &pair.roots,
+                        require_secondary: true,
+                        contract_ids: &contract_ids,
+                    },
+                    &mut scratch,
+                    &mut |delta| left_work = left_work.saturating_add(delta),
+                );
+                let mut right_work = 0u64;
+                let right = summary_for_roots(
+                    snapshot,
+                    SummaryRowRequest {
+                        scope: "chain_matrix",
+                        primary: pair.right_chain as usize,
+                        secondary: Some(pair.left_chain as usize),
+                        roots: &pair.roots,
+                        require_secondary: true,
+                        contract_ids: &contract_ids,
+                    },
+                    &mut scratch,
+                    &mut |delta| right_work = right_work.saturating_add(delta),
+                );
+                [(left, left_work), (right, right_work)]
+            })
+            .collect::<Vec<_>>()
+    });
+    for pair in pair_rows {
+        for (row, work) in pair {
+            completed = completed.saturating_add(work).min(total);
+            rows.push(row);
+            progress(ProgressEvent::determinate(
+                ProgressPhase::BuildSummary,
+                completed,
+                total,
+                WorkUnit::Nodes,
+                ProgressCounters::default(),
+            ));
+        }
     }
     rows
 }
@@ -4134,11 +4507,10 @@ mod tests {
         assert_eq!(broker.active_sink_workers(), 2);
         assert_eq!(broker.scorer_lanes(), 2);
         broker
-            .push_edges_by_chain(
-                &contract_chain,
-                3,
-                vec![Edge::new(0, 1), Edge::new(0, 2), Edge::new(2, 4)],
-            )
+            .push_edges_by_chain(&contract_chain, 3, vec![Edge::new(0, 1), Edge::new(0, 2)])
+            .unwrap();
+        broker
+            .push_edges_by_chain(&contract_chain, 3, vec![Edge::new(2, 4)])
             .unwrap();
         let accepted = broker.accepted_edges();
         let (intra, cross, pairs) = broker.finish().unwrap();
@@ -4148,8 +4520,12 @@ mod tests {
             canonical_edge_components(6, &intra[0].edges),
             vec![vec![0, 1]]
         );
+        let cross_edges = cross
+            .iter()
+            .flat_map(|run| run.edges.iter().copied())
+            .collect::<Vec<_>>();
         assert_eq!(
-            canonical_edge_components(6, &cross[0].edges),
+            canonical_edge_components(6, &cross_edges),
             vec![vec![0, 2, 4]]
         );
         assert_eq!(

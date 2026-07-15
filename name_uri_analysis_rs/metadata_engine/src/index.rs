@@ -11,6 +11,8 @@ use crate::scheduler::{
     job_routing_pair_work, JobDescriptor, JobShape, RecallPlan, SchedulerError, WorkCatalog,
 };
 use crate::snapshot::{BlockingView, MetadataSnapshot};
+use rayon::prelude::*;
+use std::sync::Mutex;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IndexMetrics {
@@ -201,6 +203,79 @@ impl<'a> ConservativeIndex<'a> {
         }
     }
 
+    pub fn for_each_job_candidate_parallel_with_work_while<V, W, K>(
+        &self,
+        job: &JobDescriptor,
+        visit: &mut V,
+        work: &mut W,
+        keep_going: &mut K,
+    ) -> IndexMetrics
+    where
+        V: FnMut(u32, u32) + Send,
+        W: FnMut(u64) + Send,
+        K: FnMut() -> bool + Send,
+    {
+        let visit = Mutex::new(visit);
+        self.for_each_job_candidate_parallel_stateful_with_work_while(
+            job,
+            || (),
+            |(), left, right| {
+                let mut visit = visit.lock().expect("hot block visitor lock");
+                (**visit)(left, right);
+            },
+            |()| {},
+            work,
+            keep_going,
+        )
+    }
+
+    pub fn for_each_job_candidate_parallel_stateful_with_work_while<S, I, V, F, W, K>(
+        &self,
+        job: &JobDescriptor,
+        state_init: I,
+        visit: V,
+        finish_task: F,
+        work: &mut W,
+        keep_going: &mut K,
+    ) -> IndexMetrics
+    where
+        S: Send,
+        I: Fn() -> S + Sync,
+        V: Fn(&mut S, u32, u32) + Sync,
+        F: Fn(&mut S) + Sync,
+        W: FnMut(u64) + Send,
+        K: FnMut() -> bool + Send,
+    {
+        let blocks = job.first_block as usize..(job.first_block + job.block_count) as usize;
+        match job.shape {
+            JobShape::MicroBatch => {
+                let mut state = state_init();
+                let metrics = self.for_each_job_candidate_with_work_while(
+                    job,
+                    |left, right| visit(&mut state, left, right),
+                    work,
+                    keep_going,
+                );
+                finish_task(&mut state);
+                metrics
+            }
+            JobShape::LeftTileFanout => {
+                let mut metrics = IndexMetrics::default();
+                for block in blocks {
+                    metrics.add(self.visit_hot_block_parallel_stateful_with_work_while(
+                        block,
+                        &state_init,
+                        &visit,
+                        &finish_task,
+                        work,
+                        keep_going,
+                    ));
+                }
+                metrics
+            }
+        }
+    }
+
     fn visit_blocks(
         &self,
         blocks: impl Iterator<Item = usize>,
@@ -355,6 +430,162 @@ impl<'a> ConservativeIndex<'a> {
             work(pending_work);
         }
         metrics
+    }
+
+    fn visit_hot_block_parallel_stateful_with_work_while<S, I, V, F, W, K>(
+        &self,
+        block: usize,
+        state_init: &I,
+        visit: &V,
+        finish_task: &F,
+        work: &mut W,
+        keep_going: &mut K,
+    ) -> IndexMetrics
+    where
+        S: Send,
+        I: Fn() -> S + Sync,
+        V: Fn(&mut S, u32, u32) + Sync,
+        F: Fn(&mut S) + Sync,
+        W: FnMut(u64) + Send,
+        K: FnMut() -> bool + Send,
+    {
+        const LEFT_ROWS_PER_TASK: usize = 256;
+        let b = self.snapshot.blocking();
+        let start = b.block_atom_offsets[block] as usize;
+        let end = b.block_atom_offsets[block + 1] as usize;
+        let members = &b.block_atoms[start..end];
+        let features = self.snapshot.features();
+        let payloads = members
+            .par_iter()
+            .map(|&atom| atom_payload(features, atom))
+            .collect::<Vec<_>>();
+        let (template_memberships, content_memberships) = rayon::join(
+            || {
+                payloads
+                    .par_iter()
+                    .map(|&payload| {
+                        payload_terms(features, payload, HotIndexDimension::Template).len() as u64
+                    })
+                    .sum()
+            },
+            || {
+                payloads
+                    .par_iter()
+                    .map(|&payload| {
+                        payload_terms(features, payload, HotIndexDimension::Content).len() as u64
+                    })
+                    .sum()
+            },
+        );
+        let indexed_dimension = choose_hot_index_dimension(
+            features,
+            &payloads,
+            template_memberships,
+            content_memberships,
+        );
+        let verification_dimension = match indexed_dimension {
+            HotIndexDimension::Template => HotIndexDimension::Content,
+            HotIndexDimension::Content => HotIndexDimension::Template,
+        };
+        let mut postings = payloads
+            .par_iter()
+            .enumerate()
+            .flat_map_iter(|(position, &payload)| {
+                payload_terms(features, payload, indexed_dimension)
+                    .iter()
+                    .copied()
+                    .map(move |term| (term, position as u32))
+            })
+            .collect::<Vec<_>>();
+        postings.par_sort_unstable();
+
+        let work = Mutex::new(work);
+        let keep_going = Mutex::new(keep_going);
+        (0..members.len())
+            .step_by(LEFT_ROWS_PER_TASK)
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map_init(
+                || {
+                    (
+                        vec![0u32; members.len()],
+                        0u32,
+                        Vec::<u32>::with_capacity(members.len()),
+                        state_init(),
+                    )
+                },
+                |(marks, epoch, candidates, state), left_begin| {
+                    let left_end = left_begin
+                        .saturating_add(LEFT_ROWS_PER_TASK)
+                        .min(members.len());
+                    let mut metrics = IndexMetrics::default();
+                    for left_position in left_begin..left_end {
+                        let should_continue =
+                            (*keep_going.lock().expect("hot block cancellation lock"))();
+                        if !should_continue {
+                            break;
+                        }
+                        *epoch = epoch.wrapping_add(1);
+                        if *epoch == 0 {
+                            marks.fill(0);
+                            *epoch = 1;
+                        }
+                        candidates.clear();
+                        let left_payload = payloads[left_position];
+                        for &term in payload_terms(features, left_payload, indexed_dimension) {
+                            let posting_start =
+                                postings.partition_point(|&(candidate, _)| candidate < term);
+                            let posting_end =
+                                postings.partition_point(|&(candidate, _)| candidate <= term);
+                            for &(_, right_position) in &postings[posting_start..posting_end] {
+                                let right_position = right_position as usize;
+                                if right_position <= left_position
+                                    || marks[right_position] == *epoch
+                                {
+                                    continue;
+                                }
+                                marks[right_position] = *epoch;
+                                candidates.push(right_position as u32);
+                            }
+                        }
+                        let left_verification_terms =
+                            payload_terms(features, left_payload, verification_dimension);
+                        for &right_position in candidates.iter() {
+                            let right_position = right_position as usize;
+                            let right_verification_terms = payload_terms(
+                                features,
+                                payloads[right_position],
+                                verification_dimension,
+                            );
+                            if sorted_terms_intersect(
+                                left_verification_terms,
+                                right_verification_terms,
+                            ) {
+                                self.route_pair(
+                                    block,
+                                    members[left_position],
+                                    members[right_position],
+                                    &mut metrics,
+                                    &mut |left, right| visit(state, left, right),
+                                );
+                            }
+                        }
+                        metrics.block_pair_visits = metrics
+                            .block_pair_visits
+                            .saturating_add(members.len().saturating_sub(left_position + 1) as u64);
+                    }
+                    if metrics.block_pair_visits != 0 {
+                        let mut report = work.lock().expect("hot block progress lock");
+                        (*report)(metrics.block_pair_visits);
+                    }
+                    finish_task(state);
+                    metrics
+                },
+            )
+            .reduce(IndexMetrics::default, |mut left, right| {
+                left.add(right);
+                left
+            })
     }
 
     fn route_pair(
@@ -513,6 +744,29 @@ pub fn max_hot_block_candidate_index_bytes(
                     .ok_or(SchedulerError::WorkOverflow)?;
                 let bytes = posting_bytes
                     .checked_add(row_scratch)
+                    .ok_or(SchedulerError::WorkOverflow)?;
+                Ok(maximum.max(bytes))
+            })
+        })
+}
+
+pub fn max_hot_block_parallel_row_bytes(
+    snapshot: &MetadataSnapshot,
+    catalog: &WorkCatalog,
+) -> Result<u64, SchedulerError> {
+    catalog
+        .jobs
+        .iter()
+        .filter(|job| job.shape == JobShape::LeftTileFanout)
+        .try_fold(0u64, |maximum, job| {
+            let first = job.first_block as usize;
+            let end = first.saturating_add(job.block_count as usize);
+            (first..end).try_fold(maximum, |maximum, block| {
+                let blocking = snapshot.blocking();
+                let begin = blocking.block_atom_offsets[block] as usize;
+                let end = blocking.block_atom_offsets[block + 1] as usize;
+                let bytes = (end.saturating_sub(begin) as u64)
+                    .checked_mul((std::mem::size_of::<u32>() * 2) as u64)
                     .ok_or(SchedulerError::WorkOverflow)?;
                 Ok(maximum.max(bytes))
             })

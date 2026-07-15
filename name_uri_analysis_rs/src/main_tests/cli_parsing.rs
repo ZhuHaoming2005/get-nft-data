@@ -28,7 +28,7 @@ fn cli_uses_target_memory_defaults() {
         Args::try_parse_from(["name_uri_analysis_rs", "--parquet", "input.parquet"]).unwrap();
 
     assert_eq!(args.duckdb_memory_limit, "320GiB");
-    assert_eq!(args.analysis_memory_limit, "384GiB");
+    assert_eq!(args.analysis_memory_limit, "448GiB");
 }
 
 #[test]

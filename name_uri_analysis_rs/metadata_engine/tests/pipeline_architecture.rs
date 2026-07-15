@@ -520,6 +520,50 @@ fn hot_block_proof_index_matches_exhaustive_exact_scoring() {
     let metrics = index.for_each_catalog_candidate(&catalog, &plan, |left, right| {
         scheduled_candidates.push((left, right));
     });
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let mut parallel_candidates = Vec::new();
+    let mut parallel_metrics = metadata_engine::index::IndexMetrics::default();
+    pool.install(|| {
+        for &job_id in &plan.ordered_job_ids {
+            let job = &catalog.jobs[job_id as usize];
+            parallel_metrics.add(index.for_each_job_candidate_parallel_with_work_while(
+                job,
+                &mut |left, right| parallel_candidates.push((left, right)),
+                &mut |_| {},
+                &mut || true,
+            ));
+        }
+    });
+    let stateful_candidates = std::sync::Mutex::new(Vec::new());
+    let mut stateful_metrics = metadata_engine::index::IndexMetrics::default();
+    pool.install(|| {
+        for &job_id in &plan.ordered_job_ids {
+            let job = &catalog.jobs[job_id as usize];
+            stateful_metrics.add(
+                index.for_each_job_candidate_parallel_stateful_with_work_while(
+                    job,
+                    Vec::new,
+                    |candidates, left, right| candidates.push((left, right)),
+                    |candidates| {
+                        stateful_candidates.lock().unwrap().append(candidates);
+                    },
+                    &mut |_| {},
+                    &mut || true,
+                ),
+            );
+        }
+    });
+    let mut stateful_candidates = stateful_candidates.into_inner().unwrap();
+    scheduled_candidates.sort_unstable();
+    parallel_candidates.sort_unstable();
+    stateful_candidates.sort_unstable();
+    assert_eq!(parallel_candidates, scheduled_candidates);
+    assert_eq!(stateful_candidates, scheduled_candidates);
+    assert_eq!(parallel_metrics, metrics);
+    assert_eq!(stateful_metrics, metrics);
     let mut scheduled_matches = scheduled_candidates
         .iter()
         .copied()
@@ -1003,8 +1047,11 @@ fn component_reduce_reports_chunk_progress_inside_a_scope() {
     assert_eq!(roots, vec![0; 20_000]);
     assert!(observed.len() > 2);
     let edge_work = 19_999u64;
-    assert_eq!(observed[1].0, 16_384);
-    assert_eq!(observed[1].1, edge_work + 20_000);
+    assert!(observed[1].0 > 0);
+    assert!(observed[1].0 < edge_work + 20_000);
+    assert!(observed
+        .iter()
+        .all(|&(_, total)| total == edge_work + 20_000));
     assert!(observed.windows(2).all(|pair| pair[0].0 <= pair[1].0));
     assert_eq!(observed.last().unwrap().0, observed.last().unwrap().1);
 }
@@ -1023,9 +1070,9 @@ fn component_snapshot_can_reuse_already_reduced_roots() {
 fn memory_gate_fails_before_allocation() {
     let broker = MemoryBroker::new(512 * GIB, MATCH_HARD_TOP).unwrap();
     let lease = broker.reserve(128 * GIB).unwrap();
-    assert!(broker.reserve(300 * GIB).is_err());
+    assert!(broker.reserve(400 * GIB).is_err());
     drop(lease);
-    assert!(broker.reserve(300 * GIB).is_ok());
+    assert!(broker.reserve(400 * GIB).is_ok());
 }
 
 #[test]
@@ -1814,7 +1861,9 @@ fn shared_token_exact_parallelism_preserves_deterministic_evidence() {
     let dir = tempfile::tempdir().unwrap();
     let features = dir.path().join("shared-features");
     let blocking = dir.path().join("shared-blocking");
-    let sources = (0..4)
+    const CONTRACT_COUNT: u32 = 600;
+    const PAIR_WORK: u64 = CONTRACT_COUNT as u64 * (CONTRACT_COUNT as u64 - 1) / 2;
+    let sources = (0..CONTRACT_COUNT)
         .map(|contract_id| EncodeSourceRow {
             contract_id,
             payload_id: contract_id % 2,
@@ -1845,9 +1894,9 @@ fn shared_token_exact_parallelism_preserves_deterministic_evidence() {
         has_content_terms: true,
     };
     compile_base_equivalent(
-        &[sketch.clone(), sketch.clone(), sketch.clone(), sketch],
+        &vec![sketch; CONTRACT_COUNT as usize],
         &BlockingCompileConfig {
-            max_routing_block_members: 10,
+            max_routing_block_members: CONTRACT_COUNT as usize + 1,
         },
         &blocking,
     )
@@ -1855,13 +1904,15 @@ fn shared_token_exact_parallelism_preserves_deterministic_evidence() {
     commit_ready(
         &features,
         "features.ready",
-        r#"{"schema_revision":3,"source_count":4,"payload_count":2,"chains":["x"],"chain_totals":[{"name":"x","contracts":4,"nfts":4}]}"#,
+        &format!(
+            r#"{{"schema_revision":3,"source_count":{CONTRACT_COUNT},"payload_count":2,"chains":["x"],"chain_totals":[{{"name":"x","contracts":{CONTRACT_COUNT},"nfts":{CONTRACT_COUNT}}}]}}"#
+        ),
     )
     .unwrap();
     commit_ready(
         &blocking,
         "blocking.ready",
-        r#"{"blocking_revision":3,"atom_count":4}"#,
+        &format!(r#"{{"blocking_revision":3,"atom_count":{CONTRACT_COUNT}}}"#),
     )
     .unwrap();
     let snapshot = MetadataSnapshot::open(&features, &blocking).unwrap();
@@ -1872,7 +1923,7 @@ fn shared_token_exact_parallelism_preserves_deterministic_evidence() {
             &[],
             ExactEvidenceBudget {
                 max_lefts: 1,
-                max_pair_work: 6,
+                max_pair_work: PAIR_WORK,
                 max_artifact_bytes: 1_000_000,
                 max_lanes,
             },

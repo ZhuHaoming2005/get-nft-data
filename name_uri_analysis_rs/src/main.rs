@@ -152,7 +152,7 @@ struct Args {
 
     #[arg(
         long,
-        default_value = "384GiB",
+        default_value = "448GiB",
         help = "Hard budget for Rust analysis structures"
     )]
     analysis_memory_limit: String,

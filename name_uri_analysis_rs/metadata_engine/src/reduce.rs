@@ -1,8 +1,7 @@
 //! Bounded connectivity forest runs and deterministic component reduction.
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -73,6 +72,7 @@ pub struct EdgeCollector {
     degree_trigger: u32,
     buffer: Vec<Edge>,
     degrees: Vec<u32>,
+    run_dsu: Dsu,
     touched: Vec<u32>,
     runs: Vec<ForestRun>,
     compacted_bytes: u64,
@@ -87,6 +87,7 @@ impl EdgeCollector {
             degree_trigger: degree_trigger.max(1),
             buffer: Vec::new(),
             degrees: vec![0; node_count as usize],
+            run_dsu: Dsu::new(node_count as usize),
             touched: Vec::new(),
             runs: Vec::new(),
             compacted_bytes: 0,
@@ -152,10 +153,14 @@ impl EdgeCollector {
             max_total_bytes: u64::MAX,
         };
         let node_count = self.node_count;
-        let run = match &self.sort_policy {
-            EdgeSortPolicy::Global => ForestRun::from_edges(node_count, edges, budget),
-            EdgeSortPolicy::Serial => ForestRun::from_edges_serial(node_count, edges, budget),
-        }?;
+        let parallel_sort = matches!(self.sort_policy, EdgeSortPolicy::Global);
+        let run = ForestRun::from_edges_with_dsu(
+            node_count,
+            edges,
+            budget,
+            parallel_sort,
+            &mut self.run_dsu,
+        )?;
         let bytes = (run.edges.len() * std::mem::size_of::<Edge>()) as u64;
         self.compacted_bytes = self.compacted_bytes.saturating_add(bytes);
         self.runs.push(run);
@@ -163,7 +168,8 @@ impl EdgeCollector {
             self.merge_runs()?;
         }
         for endpoint in self.touched.drain(..) {
-            self.degrees[endpoint as usize] = 0
+            self.degrees[endpoint as usize] = 0;
+            self.run_dsu.reset(endpoint);
         }
         Ok(())
     }
@@ -213,6 +219,17 @@ impl ForestRun {
         budget: EdgeBudget,
         parallel_sort: bool,
     ) -> Result<Self, ReduceError> {
+        let mut dsu = Dsu::new(node_count as usize);
+        Self::from_edges_with_dsu(node_count, edges, budget, parallel_sort, &mut dsu)
+    }
+
+    fn from_edges_with_dsu(
+        node_count: u32,
+        edges: impl IntoIterator<Item = Edge>,
+        budget: EdgeBudget,
+        parallel_sort: bool,
+        dsu: &mut Dsu,
+    ) -> Result<Self, ReduceError> {
         let mut edges = edges
             .into_iter()
             .filter(|e| e.left != e.right)
@@ -235,7 +252,6 @@ impl ForestRun {
                 }
             }
         }
-        let mut dsu = Dsu::new(node_count as usize);
         let mut forest = Vec::new();
         for e in edges {
             if dsu.union(e.left, e.right) {
@@ -817,44 +833,10 @@ pub fn planned_reduce_work(edge_work: u64, node_count: u32) -> Result<u64, Reduc
         .ok_or(ReduceError::WorkOverflow)
 }
 
-struct SortedForestEdges<'a> {
-    runs: &'a [ForestRun],
-    heap: BinaryHeap<Reverse<(Edge, usize, usize)>>,
-}
-
-impl<'a> SortedForestEdges<'a> {
-    fn new(runs: &'a [ForestRun]) -> Self {
-        let heap = runs
-            .iter()
-            .enumerate()
-            .filter_map(|(run_index, run)| {
-                run.edges
-                    .first()
-                    .copied()
-                    .map(|edge| Reverse((edge, run_index, 0)))
-            })
-            .collect();
-        Self { runs, heap }
-    }
-}
-
-impl Iterator for SortedForestEdges<'_> {
-    type Item = Edge;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let Reverse((edge, run_index, edge_index)) = self.heap.pop()?;
-        let next_index = edge_index + 1;
-        if let Some(&next) = self.runs[run_index].edges.get(next_index) {
-            self.heap.push(Reverse((next, run_index, next_index)));
-        }
-        Some(edge)
-    }
-}
-
 pub fn reduce_components_with_progress(
     runs: &[ForestRun],
     node_count: u32,
-    mut progress: impl FnMut(u64, u64),
+    mut progress: impl FnMut(u64, u64) + Send,
 ) -> Result<Vec<u32>, ReduceError> {
     const CHUNK: usize = 16_384;
     let edge_work = runs.iter().map(|run| run.edges.len() as u64).sum::<u64>();
@@ -868,26 +850,39 @@ pub fn reduce_components_with_progress(
             });
         }
     }
-    let mut dsu = Dsu::new(node_count as usize);
-    let mut previous = None;
-    let mut processed = 0u64;
-    for edge in SortedForestEdges::new(runs) {
-        if previous != Some(edge) {
-            dsu.union(edge.left, edge.right);
-            previous = Some(edge);
-        }
-        processed = processed.saturating_add(1);
-        if processed.is_multiple_of(CHUNK as u64) {
-            progress(processed, total);
-        }
-    }
-    progress(edge_work, total);
-    let mut roots = Vec::with_capacity(node_count as usize);
-    for begin in (0..node_count as usize).step_by(CHUNK) {
-        let end = begin.saturating_add(CHUNK).min(node_count as usize);
-        roots.extend((begin..end).map(|index| dsu.find(index as u32)));
-        progress(edge_work.saturating_add(end as u64), total);
-    }
+    let dsu = AtomicDsu::new(node_count as usize);
+    let mut roots = vec![0u32; node_count as usize];
+    let channel_capacity = rayon::current_num_threads().max(1).saturating_mul(2);
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<u64>(channel_capacity);
+    std::thread::scope(|scope| -> Result<(), ReduceError> {
+        let reporter = scope.spawn(move || {
+            let mut processed = 0u64;
+            for delta in receiver {
+                processed = processed.saturating_add(delta).min(total);
+                progress(processed, total);
+            }
+        });
+        runs.par_iter().for_each(|run| {
+            run.edges.par_chunks(CHUNK).for_each(|chunk| {
+                for edge in chunk {
+                    dsu.union(edge.left, edge.right);
+                }
+                let _ = sender.send(chunk.len() as u64);
+            });
+        });
+        roots
+            .par_chunks_mut(CHUNK)
+            .enumerate()
+            .for_each(|(chunk_index, chunk)| {
+                let begin = chunk_index.saturating_mul(CHUNK);
+                for (offset, root) in chunk.iter_mut().enumerate() {
+                    *root = dsu.find(begin.saturating_add(offset) as u32);
+                }
+                let _ = sender.send(chunk.len() as u64);
+            });
+        drop(sender);
+        reporter.join().map_err(|_| ReduceError::WorkOverflow)
+    })?;
     Ok(roots)
 }
 
@@ -904,6 +899,52 @@ fn check(resource: &'static str, requested: u64, limit: u64) -> Result<(), Reduc
 }
 struct Dsu {
     parent: Vec<u32>,
+}
+
+struct AtomicDsu {
+    parent: Vec<AtomicU32>,
+}
+
+impl AtomicDsu {
+    fn new(n: usize) -> Self {
+        Self {
+            parent: (0..n as u32).into_par_iter().map(AtomicU32::new).collect(),
+        }
+    }
+
+    fn find(&self, mut node: u32) -> u32 {
+        loop {
+            let parent = self.parent[node as usize].load(Ordering::Acquire);
+            if parent == node {
+                return node;
+            }
+            let grandparent = self.parent[parent as usize].load(Ordering::Acquire);
+            let _ = self.parent[node as usize].compare_exchange(
+                parent,
+                grandparent,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            node = grandparent;
+        }
+    }
+
+    fn union(&self, left: u32, right: u32) {
+        loop {
+            let left_root = self.find(left);
+            let right_root = self.find(right);
+            if left_root == right_root {
+                return;
+            }
+            let (low, high) = (left_root.min(right_root), left_root.max(right_root));
+            if self.parent[high as usize]
+                .compare_exchange(high, low, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
 }
 impl Dsu {
     fn new(n: usize) -> Self {
@@ -924,6 +965,9 @@ impl Dsu {
         }
         r
     }
+    fn reset(&mut self, x: u32) {
+        self.parent[x as usize] = x;
+    }
     fn union(&mut self, a: u32, b: u32) -> bool {
         let x = self.find(a);
         let y = self.find(b);
@@ -941,30 +985,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sorted_forest_edges_merge_runs_without_materializing_all_edges() {
+    fn parallel_atomic_reduce_preserves_minimum_component_roots_and_progress() {
         let runs = vec![
             ForestRun {
-                node_count: 6,
-                edges: vec![Edge::new(0, 1), Edge::new(3, 4)],
+                node_count: 8,
+                edges: vec![Edge::new(4, 7), Edge::new(1, 3), Edge::new(3, 7)],
             },
             ForestRun {
-                node_count: 6,
-                edges: vec![Edge::new(0, 1), Edge::new(1, 2), Edge::new(4, 5)],
+                node_count: 8,
+                edges: vec![Edge::new(0, 2), Edge::new(2, 4), Edge::new(5, 6)],
             },
         ];
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let mut last = (0, 0);
+        let roots = pool
+            .install(|| {
+                reduce_components_with_progress(&runs, 8, |completed, total| {
+                    last = (completed, total);
+                })
+            })
+            .unwrap();
+        assert_eq!(roots, vec![0, 0, 0, 0, 0, 5, 5, 0]);
+        assert_eq!(last, (14, 14));
+    }
 
-        let merged = SortedForestEdges::new(&runs).collect::<Vec<_>>();
-
-        assert_eq!(
-            merged,
-            vec![
-                Edge::new(0, 1),
-                Edge::new(0, 1),
-                Edge::new(1, 2),
-                Edge::new(3, 4),
-                Edge::new(4, 5),
-            ]
+    #[test]
+    fn edge_collector_reuses_run_dsu_across_forced_flushes() {
+        let mut collector = EdgeCollector::new_serial(
+            6,
+            EdgeBudget {
+                max_buffer_bytes: std::mem::size_of::<Edge>() as u64,
+                max_run_edges: 6,
+                max_total_bytes: u64::MAX,
+            },
+            u32::MAX,
         );
+        for edge in [Edge::new(0, 1), Edge::new(1, 2), Edge::new(3, 4)] {
+            collector.push(edge).unwrap();
+        }
+        let runs = collector.finish().unwrap();
+        let roots = reduce_components(&runs, 6).unwrap();
+        assert_eq!(roots, vec![0, 0, 0, 3, 3, 5]);
     }
 
     #[test]
