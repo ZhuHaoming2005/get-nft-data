@@ -259,7 +259,15 @@ impl NameCandidateScratch {
 }
 
 impl NameCandidateIndex {
+    #[cfg(test)]
     pub(crate) fn new(atoms: &[NameAtom]) -> Self {
+        Self::new_with_progress(atoms, || {})
+    }
+
+    pub(crate) fn new_with_progress(
+        atoms: &[NameAtom],
+        on_unit_completed: impl Fn() + Sync,
+    ) -> Self {
         let mut token_ids = HashMap::<(char, u32), NameTokenId>::new();
         let mut postings = Vec::<Vec<NameAtomIndex>>::new();
         let mut raw_documents = Vec::with_capacity(atoms.len());
@@ -286,6 +294,7 @@ impl NameCandidateIndex {
                 tokens.push(token_id);
             }
             raw_documents.push(tokens);
+            on_unit_completed();
         }
 
         let documents = raw_documents
@@ -300,10 +309,12 @@ impl NameCandidateIndex {
                 });
                 let mut sorted_tokens = tokens;
                 sorted_tokens.sort_unstable();
-                IndexedNameDocument {
+                let document = IndexedNameDocument {
                     prefix_tokens,
                     sorted_tokens,
-                }
+                };
+                on_unit_completed();
+                document
             })
             .collect::<Vec<_>>();
         Self {

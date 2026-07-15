@@ -153,6 +153,36 @@ fn write_tiny_metadata_parquet(path: &Path) {
     conn.execute_batch(&sql).unwrap();
 }
 
+fn write_fallback_metadata_parquet(path: &Path) {
+    let _ = fs::remove_file(path);
+    let conn = Connection::open_in_memory().unwrap();
+    let sql = format!(
+        r#"
+        CREATE TABLE rows AS
+        SELECT * FROM (VALUES
+            ('ethereum', '0xfallback', '1', '', '', 'Fallback', 'fallback', '{{}}'),
+            ('ethereum', '0xfallback', '2', '', '', 'Fallback', 'fallback', '{{"description":"usable source"}}')
+        ) AS t(chain, contract_address, token_id, token_uri, image_uri, name, name_norm, metadata_json);
+
+        ALTER TABLE rows ADD COLUMN token_uri_norm VARCHAR;
+        ALTER TABLE rows ADD COLUMN image_uri_norm VARCHAR;
+        ALTER TABLE rows ADD COLUMN symbol VARCHAR;
+        ALTER TABLE rows ADD COLUMN symbol_norm VARCHAR;
+        ALTER TABLE rows ADD COLUMN metadata_doc VARCHAR;
+        UPDATE rows
+        SET token_uri_norm = token_uri,
+            image_uri_norm = image_uri,
+            symbol = '',
+            symbol_norm = '',
+            metadata_doc = metadata_json;
+
+        COPY rows TO '{path}' (FORMAT PARQUET);
+        "#,
+        path = path.display().to_string().replace('\\', "/")
+    );
+    conn.execute_batch(&sql).unwrap();
+}
+
 fn tiny_options(work: &Path, parquet: &Path) -> AnalysisOptions {
     AnalysisOptions {
         database_path: work.join("stage.duckdb"),
@@ -544,6 +574,20 @@ fn encode_stream_reports_frozen_row_totals_and_terminal_completion() {
     assert!(!resolve.is_empty(), "missing token-resolution progress");
     assert_phase_progress_monotonic(&resolve);
 
+    let sort_memberships = events
+        .iter()
+        .filter(|event| event.phase == ProgressPhase::EncodeSortTokenMemberships)
+        .collect::<Vec<_>>();
+    assert!(
+        !sort_memberships.is_empty(),
+        "missing membership-sort progress"
+    );
+    assert_phase_progress_monotonic(&sort_memberships);
+    assert_eq!(
+        sort_memberships.last().unwrap().completed,
+        estimate.token_rows
+    );
+
     let prepare_fallback = events
         .iter()
         .filter(|event| event.phase == ProgressPhase::EncodePrepareFallbackTokenSources)
@@ -648,6 +692,53 @@ fn encode_stream_reports_frozen_row_totals_and_terminal_completion() {
         .rfind(|event| event.phase == ProgressPhase::EncodeFinalize)
         .unwrap();
     assert_eq!(finalize.completed, finalize.total.unwrap());
+}
+
+#[test]
+fn fallback_source_progress_is_one_exact_contract_task() {
+    use metadata_engine::progress::{ProgressPhase, WorkUnit};
+
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    let parquet = dir.path().join("fallback-metadata.parquet");
+    write_fallback_metadata_parquet(&parquet);
+    let options = tiny_options(&work, &parquet);
+    run_analysis_phase(&options, AnalysisPhase::Prepare, &work).unwrap();
+    let conn = Connection::open(&options.database_path).unwrap();
+    let estimate = estimate_encode_storage_bytes(&conn).unwrap();
+    let mut events = Vec::new();
+    let mut broker = StorageBroker::open(&work).unwrap();
+    let memory_broker = MemoryBroker::new(16 * GIB, 12 * GIB).unwrap();
+
+    stream_encode_inputs_with_progress(
+        &conn,
+        &work,
+        &mut broker,
+        &memory_broker,
+        2,
+        estimate,
+        |event| events.push(event),
+    )
+    .unwrap();
+
+    assert!(events
+        .iter()
+        .all(|event| event.phase != ProgressPhase::EncodeResolveFallbacks));
+    let fallback = events
+        .iter()
+        .filter(|event| event.phase == ProgressPhase::EncodeFallbackSources)
+        .collect::<Vec<_>>();
+    assert!(!fallback.is_empty(), "missing fallback source progress");
+    assert_phase_progress_monotonic(&fallback);
+    assert!(fallback.iter().all(|event| event.total == Some(1)));
+    assert!(fallback
+        .iter()
+        .all(|event| event.unit == WorkUnit::Contracts));
+    let terminal = fallback.last().unwrap();
+    assert_eq!(terminal.completed, 1);
+    assert_eq!(terminal.counters.candidates, 2);
+    assert_eq!(terminal.counters.selected, 1);
 }
 
 fn assert_phase_progress_monotonic(events: &[&metadata_engine::progress::ProgressEvent]) {

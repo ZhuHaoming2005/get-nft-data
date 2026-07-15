@@ -90,6 +90,70 @@ fn name_candidate_index_estimate_covers_resident_allocation() {
 }
 
 #[test]
+fn name_candidate_index_reports_both_build_passes() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let atoms = vec![
+        NameAtom {
+            chain_index: 0,
+            name_norm: "alpha".into(),
+            char_len: 5,
+            contract_count: 1,
+            nft_count: 1,
+        },
+        NameAtom {
+            chain_index: 0,
+            name_norm: "beta".into(),
+            char_len: 4,
+            contract_count: 1,
+            nft_count: 1,
+        },
+        NameAtom {
+            chain_index: 1,
+            name_norm: "gamma".into(),
+            char_len: 5,
+            contract_count: 1,
+            nft_count: 1,
+        },
+    ];
+    let completed = AtomicU64::new(0);
+
+    let index = NameCandidateIndex::new_with_progress(&atoms, || {
+        completed.fetch_add(1, Ordering::Relaxed);
+    });
+
+    assert_eq!(index.documents.len(), atoms.len());
+    assert_eq!(completed.load(Ordering::Relaxed), 2 * atoms.len() as u64);
+}
+
+#[test]
+fn name_atom_loader_reports_the_exact_scanned_row_total() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE name_atoms(
+             chain VARCHAR,
+             name_norm VARCHAR,
+             contract_count BIGINT,
+             nft_count BIGINT
+         );
+         INSERT INTO name_atoms VALUES
+             ('base', 'alpha', 1, 2),
+             ('ethereum', 'beta', 3, 4),
+             ('ethereum', 'gamma', 5, 6);",
+    )
+    .unwrap();
+    let chains = vec!["base".to_string(), "ethereum".to_string()];
+    let mut scanned = 0u64;
+
+    let total = count_all_name_atoms(&conn).unwrap();
+    let atoms = load_all_name_atoms(&conn, &chains, |delta| scanned += delta).unwrap();
+
+    assert_eq!(total, 3);
+    assert_eq!(scanned, total);
+    assert_eq!(atoms.len() as u64, total);
+}
+
+#[test]
 fn name_worker_stack_reservation_scales_per_worker() {
     assert_eq!(
         name_worker_stack_reserve_bytes(4) - name_worker_stack_reserve_bytes(1),

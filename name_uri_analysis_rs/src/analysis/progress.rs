@@ -314,7 +314,11 @@ impl ProgressTracker {
         task.set_message(label.clone());
         task.enable_steady_tick(PROGRESS_REFRESH_INTERVAL);
         metrics.reset();
-        metrics.set_message("waiting for progress sample");
+        if total_kind == metadata_engine::progress::TotalKind::Unknown {
+            metrics.set_message("ETA n/a (work total not observable)");
+        } else {
+            metrics.set_message("waiting for progress sample");
+        }
         metrics.enable_steady_tick(PROGRESS_REFRESH_INTERVAL);
         *task_state.lock().expect("task progress mutex poisoned") = Some(TaskProgressState {
             label,
@@ -390,7 +394,11 @@ impl ProgressTracker {
         else {
             return;
         };
-        let label = event.phase.label();
+        let label = if event.total_kind == metadata_engine::progress::TotalKind::UpperBound {
+            format!("{} (upper bound)", event.phase.label())
+        } else {
+            event.phase.label().to_string()
+        };
         let unit = event.unit.label();
         let (restart, previous) = {
             let guard = task_state.lock().expect("task progress mutex poisoned");
@@ -580,17 +588,20 @@ pub(crate) fn format_task_progress_message_with_match_forecast(
         }
         _ => None,
     };
-    let eta = phase_eta.map_or_else(
-        || {
-            if snapshot.total_kind == metadata_engine::progress::TotalKind::Unknown {
-                "n/a (total unknown)".to_string()
-            } else {
-                "n/a".to_string()
-            }
-        },
-        format_progress_duration,
-    );
-    metrics.push(format!("ETA {eta}"));
+    match phase_eta {
+        Some(eta) if snapshot.total_kind == metadata_engine::progress::TotalKind::UpperBound => {
+            metrics.push(format!("ETA ≤ {}", format_progress_duration(eta)));
+        }
+        Some(eta) => metrics.push(format!("ETA {}", format_progress_duration(eta))),
+        None if snapshot.total_kind == metadata_engine::progress::TotalKind::Unknown => {
+            metrics.push("ETA n/a (total unknown)".to_string());
+        }
+        None => metrics.push("ETA n/a".to_string()),
+    }
+    let phase_lower_bound_eta = (snapshot.total_kind
+        == metadata_engine::progress::TotalKind::Exact)
+        .then_some(phase_eta)
+        .flatten();
     if snapshot.show_match_eta {
         match match_forecast {
             Some(MatchEtaForecast {
@@ -600,7 +611,7 @@ pub(crate) fn format_task_progress_message_with_match_forecast(
                 ..
             }) => {
                 if match_elapsed >= Duration::from_millis(*upper_total_millis) {
-                    if let Some(phase_eta) = phase_eta {
+                    if let Some(phase_eta) = phase_lower_bound_eta {
                         metrics.push(format!(
                             "match remaining >= {}; upper n/a (history overrun; n={sample_count})",
                             format_progress_duration(phase_eta)
@@ -615,8 +626,8 @@ pub(crate) fn format_task_progress_message_with_match_forecast(
                         Duration::from_millis(*lower_total_millis).saturating_sub(match_elapsed);
                     let historical_upper =
                         Duration::from_millis(*upper_total_millis).saturating_sub(match_elapsed);
-                    let lower =
-                        phase_eta.map_or(historical_lower, |phase| phase.max(historical_lower));
+                    let lower = phase_lower_bound_eta
+                        .map_or(historical_lower, |phase| phase.max(historical_lower));
                     if lower > historical_upper {
                         metrics.push(format!(
                             "match remaining >= {}; upper n/a (phase lower exceeds history; n={sample_count})",
@@ -632,7 +643,7 @@ pub(crate) fn format_task_progress_message_with_match_forecast(
                 }
             }
             Some(forecast) => {
-                if let Some(phase_eta) = phase_eta {
+                if let Some(phase_eta) = phase_lower_bound_eta {
                     metrics.push(format!(
                         "match remaining >= {}; upper n/a (calibrating {}/8)",
                         format_progress_duration(phase_eta),

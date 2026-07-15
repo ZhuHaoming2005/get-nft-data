@@ -2160,7 +2160,7 @@ fn shared_small_group_budget_fails_before_any_pair_is_scored() {
 }
 
 #[test]
-fn pipeline_reports_monotonic_pair_work_with_exact_terminal_totals() {
+fn pipeline_reports_monotonic_pair_work_with_stable_terminal_plans() {
     let (dir, features, blocking) = snapshot_fixture();
     let out = dir.path().join("progress-match");
     let mut events = Vec::new();
@@ -2208,8 +2208,22 @@ fn pipeline_reports_monotonic_pair_work_with_exact_terminal_totals() {
         .expect("pipeline must expose catalog traversal progress");
     assert_eq!(catalog_terminal.unit, WorkUnit::Pairs);
     assert_eq!(catalog_terminal.work_class, WorkClass::Generic);
-    assert_eq!(catalog_terminal.total, None);
-    assert_eq!(catalog_terminal.total_kind, TotalKind::Unknown);
+    assert!(catalog_terminal.total.is_some());
+    assert_eq!(catalog_terminal.total_kind, TotalKind::UpperBound);
+    assert!(catalog_terminal.completed <= catalog_terminal.total.unwrap());
+
+    let shared_token_events = events
+        .iter()
+        .filter(|event| event.phase == ProgressPhase::SharedTokenPairs)
+        .collect::<Vec<_>>();
+    assert!(!shared_token_events.is_empty());
+    let shared_token_limit = shared_token_events[0].total;
+    assert!(shared_token_limit.is_some());
+    assert!(shared_token_events.iter().all(|event| {
+        event.total == shared_token_limit && event.total_kind == TotalKind::UpperBound
+    }));
+    let shared_token_terminal = shared_token_events.last().unwrap();
+    assert!(shared_token_terminal.completed <= shared_token_terminal.total.unwrap());
     for phase in [
         ProgressPhase::CommitComponents,
         ProgressPhase::BuildSummary,
@@ -2266,9 +2280,12 @@ fn pipeline_reports_monotonic_pair_work_with_exact_terminal_totals() {
             .collect::<Vec<_>>();
         assert!(!phase_events.is_empty(), "missing {phase:?} progress");
         let terminal = phase_events.last().unwrap();
-        if phase == ProgressPhase::CatalogPairs {
-            assert_eq!(terminal.total, None);
-            assert_eq!(terminal.total_kind, TotalKind::Unknown);
+        if matches!(
+            phase,
+            ProgressPhase::CatalogPairs | ProgressPhase::SharedTokenPairs
+        ) {
+            assert_eq!(terminal.total_kind, TotalKind::UpperBound);
+            assert!(terminal.completed <= terminal.total.unwrap());
         } else {
             assert_eq!(terminal.completed, terminal.total.unwrap(), "{phase:?}");
         }
@@ -2307,7 +2324,7 @@ fn determinate_engine_progress_cannot_publish_more_than_total_work() {
 }
 
 #[test]
-fn catalog_progress_counts_routing_pairs_not_conditional_contract_products() {
+fn catalog_progress_uses_a_stable_combined_work_upper_bound() {
     let dir = tempfile::tempdir().unwrap();
     let features = dir.path().join("e");
     let blocking = dir.path().join("b");
@@ -2407,10 +2424,20 @@ fn catalog_progress_counts_routing_pairs_not_conditional_contract_products() {
         .iter()
         .rfind(|event| event.phase == ProgressPhase::CatalogPairs)
         .unwrap();
-    assert_eq!(terminal.work_class, WorkClass::Generic);
-    assert_eq!(terminal.unit, WorkUnit::Pairs);
-    assert_eq!(terminal.total, None);
-    assert_eq!(terminal.total_kind, TotalKind::Unknown);
+    let catalog_events = events
+        .iter()
+        .filter(|event| event.phase == ProgressPhase::CatalogPairs)
+        .collect::<Vec<_>>();
+    let catalog_upper_bound = catalog_events[0].total;
+    assert!(catalog_upper_bound.is_some());
+    assert!(catalog_events.iter().all(|event| {
+        event.work_class == WorkClass::Generic
+            && event.unit == WorkUnit::Pairs
+            && event.total == catalog_upper_bound
+            && event.total_kind == TotalKind::UpperBound
+    }));
+    assert!(terminal.completed <= terminal.total.unwrap());
+    assert!(terminal.total.unwrap() > terminal.counters.scored);
     assert!(
         terminal.completed >= terminal.counters.expanded,
         "catalog wall-work progress must include completed conditional expansion"

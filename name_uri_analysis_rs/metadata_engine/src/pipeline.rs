@@ -25,7 +25,9 @@ use crate::exact_islands::{
     SharedTokenExactEvidence,
 };
 use crate::index::{ConservativeIndex, IndexMetrics};
-use crate::progress::{ProgressCounters, ProgressEvent, ProgressPhase, WorkClass, WorkUnit};
+use crate::progress::{
+    ProgressCounters, ProgressEvent, ProgressPhase, TotalKind, WorkClass, WorkUnit,
+};
 use crate::reduce::{
     commit_component_roots, open_component_snapshot_chain, recover_component_snapshots,
     reduce_components_with_progress, ComponentSnapshotIdentity, Edge, EdgeBudget, EdgeCollector,
@@ -871,16 +873,23 @@ fn score_catalog_parallel(
                 .ok_or(crate::scheduler::SchedulerError::WorkOverflow)
         })
     })?;
-    // Contract expansion is conditional on the atom score, so its total is
-    // unknowable before this single-pass scorer runs. Report the combined
-    // routing + expansion wall work honestly as indeterminate while retaining
-    // the exact routing total for the invariant below.
-    progress(ProgressEvent::indeterminate(
-        ProgressPhase::CatalogPairs,
-        0,
-        WorkUnit::Pairs,
-        ProgressCounters::default(),
-    ));
+    // Every routing pair is scored. Contract expansion is conditional, but
+    // the catalog's frozen estimated work is the sum of every possible
+    // contract product, so routing + estimated expansion is a safe upper bound
+    // for the combined wall work and remains stable throughout this phase.
+    let combined_work_upper_bound = routing_total
+        .checked_add(catalog.estimated_work()?)
+        .ok_or(crate::scheduler::SchedulerError::WorkOverflow)?;
+    progress(
+        ProgressEvent::determinate(
+            ProgressPhase::CatalogPairs,
+            0,
+            combined_work_upper_bound,
+            WorkUnit::Pairs,
+            ProgressCounters::default(),
+        )
+        .with_plan(WorkClass::Generic, TotalKind::UpperBound),
+    );
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(lanes.max(1))
         .thread_name(|index| format!("metadata-catalog-{index}"))
@@ -1007,33 +1016,41 @@ fn score_catalog_parallel(
                 }
                 CatalogMessage::RoutingWork(work) => {
                     completed = completed.saturating_add(work);
-                    progress(ProgressEvent::indeterminate(
-                        ProgressPhase::CatalogPairs,
-                        completed.saturating_add(expanded),
-                        WorkUnit::Pairs,
-                        ProgressCounters {
-                            candidates: metrics.routed_pairs,
-                            scored: metrics.routed_pairs,
-                            expanded,
-                            matched: collectors.accepted_edges,
-                            ..ProgressCounters::default()
-                        },
-                    ));
+                    progress(
+                        ProgressEvent::determinate(
+                            ProgressPhase::CatalogPairs,
+                            completed.saturating_add(expanded),
+                            combined_work_upper_bound,
+                            WorkUnit::Pairs,
+                            ProgressCounters {
+                                candidates: metrics.routed_pairs,
+                                scored: metrics.routed_pairs,
+                                expanded,
+                                matched: collectors.accepted_edges,
+                                ..ProgressCounters::default()
+                            },
+                        )
+                        .with_plan(WorkClass::Generic, TotalKind::UpperBound),
+                    );
                 }
                 CatalogMessage::ExpansionWork(work) => {
                     expanded = expanded.saturating_add(work);
-                    progress(ProgressEvent::indeterminate(
-                        ProgressPhase::CatalogPairs,
-                        completed.saturating_add(expanded),
-                        WorkUnit::Pairs,
-                        ProgressCounters {
-                            candidates: metrics.routed_pairs,
-                            scored: metrics.routed_pairs,
-                            expanded,
-                            matched: collectors.accepted_edges,
-                            ..ProgressCounters::default()
-                        },
-                    ));
+                    progress(
+                        ProgressEvent::determinate(
+                            ProgressPhase::CatalogPairs,
+                            completed.saturating_add(expanded),
+                            combined_work_upper_bound,
+                            WorkUnit::Pairs,
+                            ProgressCounters {
+                                candidates: metrics.routed_pairs,
+                                scored: metrics.routed_pairs,
+                                expanded,
+                                matched: collectors.accepted_edges,
+                                ..ProgressCounters::default()
+                            },
+                        )
+                        .with_plan(WorkClass::Generic, TotalKind::UpperBound),
+                    );
                 }
                 CatalogMessage::Error(error) => {
                     if collection_error.is_none() {
@@ -1042,18 +1059,22 @@ fn score_catalog_parallel(
                 }
                 CatalogMessage::JobDone(job_metrics) => {
                     metrics.add(job_metrics);
-                    progress(ProgressEvent::indeterminate(
-                        ProgressPhase::CatalogPairs,
-                        completed.saturating_add(expanded),
-                        WorkUnit::Pairs,
-                        ProgressCounters {
-                            candidates: metrics.routed_pairs,
-                            scored: metrics.routed_pairs,
-                            expanded,
-                            matched: collectors.accepted_edges,
-                            ..ProgressCounters::default()
-                        },
-                    ));
+                    progress(
+                        ProgressEvent::determinate(
+                            ProgressPhase::CatalogPairs,
+                            completed.saturating_add(expanded),
+                            combined_work_upper_bound,
+                            WorkUnit::Pairs,
+                            ProgressCounters {
+                                candidates: metrics.routed_pairs,
+                                scored: metrics.routed_pairs,
+                                expanded,
+                                matched: collectors.accepted_edges,
+                                ..ProgressCounters::default()
+                            },
+                        )
+                        .with_plan(WorkClass::Generic, TotalKind::UpperBound),
+                    );
                 }
             }
         }
@@ -1068,6 +1089,30 @@ fn score_catalog_parallel(
                 "catalog routing progress mismatch: completed={completed}, planned={routing_total}"
             )));
         }
+        let combined_completed = completed
+            .checked_add(expanded)
+            .ok_or(crate::resource::MemoryError::Overflow)?;
+        if combined_completed > combined_work_upper_bound {
+            return Err(PipelineError::Invariant(format!(
+                "catalog work exceeded upper bound: completed={combined_completed}, upper_bound={combined_work_upper_bound}"
+            )));
+        }
+        progress(
+            ProgressEvent::determinate(
+                ProgressPhase::CatalogPairs,
+                combined_completed,
+                combined_work_upper_bound,
+                WorkUnit::Pairs,
+                ProgressCounters {
+                    candidates: metrics.routed_pairs,
+                    scored: metrics.routed_pairs,
+                    expanded,
+                    matched: collectors.accepted_edges,
+                    ..ProgressCounters::default()
+                },
+            )
+            .with_plan(WorkClass::Generic, TotalKind::UpperBound),
+        );
         Ok(metrics)
     })
 }
@@ -3108,12 +3153,16 @@ fn append_shared_token_edges(
 ) -> Result<u64, PipelineError> {
     let f = s.features();
     let token_count = f.token_member_offsets.len().saturating_sub(1);
-    progress(ProgressEvent::indeterminate(
-        ProgressPhase::SharedTokenPairs,
-        0,
-        WorkUnit::Pairs,
-        ProgressCounters::default(),
-    ));
+    progress(
+        ProgressEvent::determinate(
+            ProgressPhase::SharedTokenPairs,
+            0,
+            max_pair_visits,
+            WorkUnit::Pairs,
+            ProgressCounters::default(),
+        )
+        .with_plan(WorkClass::SharedScores, TotalKind::UpperBound),
+    );
     let small_group_pair_work =
         f.token_member_offsets
             .windows(2)
@@ -3251,16 +3300,20 @@ fn append_shared_token_edges(
                 } => {
                     completed = completed.saturating_add(pairs);
                     groups = groups.saturating_add(finished);
-                    progress(ProgressEvent::indeterminate(
-                        ProgressPhase::SharedTokenPairs,
-                        completed,
-                        WorkUnit::Pairs,
-                        ProgressCounters {
-                            groups,
-                            matched: collectors.accepted_edges,
-                            ..ProgressCounters::default()
-                        },
-                    ));
+                    progress(
+                        ProgressEvent::determinate(
+                            ProgressPhase::SharedTokenPairs,
+                            completed,
+                            max_pair_visits,
+                            WorkUnit::Pairs,
+                            ProgressCounters {
+                                groups,
+                                matched: collectors.accepted_edges,
+                                ..ProgressCounters::default()
+                            },
+                        )
+                        .with_plan(WorkClass::SharedScores, TotalKind::UpperBound),
+                    );
                 }
                 SharedMessage::Edges(_) => {}
             }
@@ -3279,17 +3332,20 @@ fn append_shared_token_edges(
         if let Some(error) = collection_error {
             return Err(error);
         }
-        progress(ProgressEvent::determinate(
-            ProgressPhase::SharedTokenPairs,
-            completed,
-            completed,
-            WorkUnit::Pairs,
-            ProgressCounters {
-                groups,
-                matched: collectors.accepted_edges,
-                ..ProgressCounters::default()
-            },
-        ));
+        progress(
+            ProgressEvent::determinate(
+                ProgressPhase::SharedTokenPairs,
+                completed,
+                max_pair_visits,
+                WorkUnit::Pairs,
+                ProgressCounters {
+                    groups,
+                    matched: collectors.accepted_edges,
+                    ..ProgressCounters::default()
+                },
+            )
+            .with_plan(WorkClass::SharedScores, TotalKind::UpperBound),
+        );
         Ok(completed)
     })
 }

@@ -78,14 +78,16 @@ pub(crate) fn run_name_analysis(
     let threshold = spec.threshold;
     progress.start_stage("analyzing name duplicates", 6);
     progress.step_stage("loaded name totals");
-    progress.start_task("loading name atoms", None, "atoms");
-    let atoms = load_all_name_atoms(conn, chains)?;
+    let name_atom_total = count_all_name_atoms(conn)?;
+    progress.start_task("loading name atoms", Some(name_atom_total), "rows");
+    let atoms = load_all_name_atoms(conn, chains, |delta| {
+        progress.advance_task(delta, ProgressCounters::default());
+    })?;
     if atoms.len() > u32::MAX as usize {
         return Err(AnalysisError::InvalidData(
             "name atom count exceeds compact u32 indexes".to_string(),
         ));
     }
-    progress.advance_task(atoms.len() as u64, ProgressCounters::default());
     progress.finish_task(format!("loaded {} name atoms", atoms.len()));
     progress.step_stage(format!("loaded {} name atoms", atoms.len()));
     let canonical = canonical_name_values(&atoms);
@@ -172,11 +174,22 @@ pub(crate) fn run_name_analysis(
             "building candidate index for {} canonical names",
             canonical.atoms.len()
         ),
-        None,
-        "names",
+        Some((canonical.atoms.len() as u64).saturating_mul(2)),
+        "build units",
     );
-    let candidate_index = pool.install(|| NameCandidateIndex::new(&canonical.atoms));
-    progress.advance_task(canonical.atoms.len() as u64, ProgressCounters::default());
+    let completed_build_units = std::sync::atomic::AtomicU64::new(0);
+    let candidate_index = pool.install(|| {
+        NameCandidateIndex::new_with_progress(&canonical.atoms, || {
+            let completed = completed_build_units
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(1);
+            if completed.is_multiple_of(16_384) {
+                progress.advance_task(16_384, ProgressCounters::default());
+            }
+        })
+    });
+    let build_total = (canonical.atoms.len() as u64).saturating_mul(2);
+    progress.advance_task(build_total % 16_384, ProgressCounters::default());
     progress.finish_task("name candidate index ready");
     progress.step_stage("built name candidate index");
     let actual_index_bytes = candidate_index.memory_bytes();
@@ -262,9 +275,17 @@ pub(crate) fn run_name_analysis(
     })
 }
 
+pub(crate) fn count_all_name_atoms(conn: &Connection) -> Result<u64, AnalysisError> {
+    conn.query_row("SELECT count(*)::UBIGINT FROM name_atoms", [], |row| {
+        row.get(0)
+    })
+    .map_err(AnalysisError::from)
+}
+
 pub(crate) fn load_all_name_atoms(
     conn: &Connection,
     chains: &[String],
+    mut on_rows_loaded: impl FnMut(u64),
 ) -> Result<Vec<NameAtom>, AnalysisError> {
     let chain_indexes = chains
         .iter()
@@ -287,8 +308,15 @@ pub(crate) fn load_all_name_atoms(
         ))
     })?;
     let mut atoms = Vec::new();
+    let mut scanned_rows = 0u64;
+    let mut reported_rows = 0u64;
     for row in rows {
         let (chain, name_norm, contract_count, nft_count) = row?;
+        scanned_rows = scanned_rows.saturating_add(1);
+        if scanned_rows.saturating_sub(reported_rows) >= 16_384 {
+            on_rows_loaded(scanned_rows - reported_rows);
+            reported_rows = scanned_rows;
+        }
         if let Some(chain_index) = chain_indexes.get(chain.as_str()).copied() {
             let char_len = name_norm.chars().count();
             atoms.push(NameAtom {
@@ -299,6 +327,9 @@ pub(crate) fn load_all_name_atoms(
                 nft_count,
             });
         }
+    }
+    if scanned_rows > reported_rows {
+        on_rows_loaded(scanned_rows - reported_rows);
     }
     atoms.sort_by(|left, right| {
         left.char_len

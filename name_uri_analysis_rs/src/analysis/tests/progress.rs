@@ -116,6 +116,50 @@ fn task_progress_message_uses_stable_units_for_throughput_and_eta() {
 }
 
 #[test]
+fn upper_bound_progress_labels_eta_as_a_ceiling() {
+    let message = format_task_progress_message(&TaskProgressSnapshot {
+        position: 25,
+        total: Some(100),
+        unit: "pairs",
+        counters: ProgressCounters::default(),
+        rate: Some(12.5),
+        show_match_eta: false,
+        total_kind: metadata_engine::progress::TotalKind::UpperBound,
+    });
+
+    assert_eq!(message, "12.5 pairs/s · ETA ≤ 6s");
+}
+
+#[test]
+fn upper_bound_phase_eta_is_not_used_as_a_match_lower_bound() {
+    let snapshot = TaskProgressSnapshot {
+        position: 25,
+        total: Some(100),
+        unit: "pairs",
+        counters: ProgressCounters::default(),
+        rate: Some(12.5),
+        show_match_eta: true,
+        total_kind: metadata_engine::progress::TotalKind::UpperBound,
+    };
+    let forecast = MatchEtaForecast {
+        schema_version: 1,
+        sample_count: 2,
+        lower_total_millis: None,
+        upper_total_millis: None,
+    };
+
+    let message = format_task_progress_message_with_match_forecast(
+        &snapshot,
+        Some(&forecast),
+        std::time::Duration::from_secs(1),
+    );
+
+    assert!(message.contains("ETA ≤ 6s"), "{message}");
+    assert!(message.contains("match ETA lower n/a"), "{message}");
+    assert!(!message.contains("match remaining >="), "{message}");
+}
+
+#[test]
 fn task_progress_message_keeps_unknown_work_indeterminate() {
     let message = format_task_progress_message(&TaskProgressSnapshot {
         position: 9,
@@ -128,6 +172,17 @@ fn task_progress_message_keeps_unknown_work_indeterminate() {
     });
 
     assert_eq!(message, "9 docs · 3.0 docs/s · ETA n/a (total unknown)");
+}
+
+#[test]
+fn unknown_task_immediately_explains_that_eta_is_unavailable() {
+    let progress = ProgressTracker::for_pipeline_stage(PipelineStage::Prepare, true);
+    progress.start_task("DuckDB aggregation", None, "rows");
+
+    let ProgressTracker::Enabled { metrics, .. } = &progress else {
+        panic!("progress must be enabled");
+    };
+    assert_eq!(metrics.message(), "ETA n/a (work total not observable)");
 }
 
 #[test]
@@ -427,6 +482,31 @@ fn engine_progress_events_drive_absolute_task_position_and_reset_by_phase() {
     assert_eq!(task.length(), Some(50));
     assert_eq!(task.position(), 5);
     assert!(task.message().contains("catalog pairs"));
+}
+
+#[test]
+fn upper_bound_engine_task_marks_the_bar_as_an_upper_bound() {
+    use metadata_engine::progress::{
+        ProgressCounters as EngineCounters, ProgressEvent, ProgressPhase, TotalKind, WorkClass,
+        WorkUnit,
+    };
+
+    let progress = ProgressTracker::for_pipeline_stage(PipelineStage::MetadataMatch, true);
+    progress.observe_engine_event(
+        ProgressEvent::determinate(
+            ProgressPhase::CatalogPairs,
+            25,
+            100,
+            WorkUnit::Pairs,
+            EngineCounters::default(),
+        )
+        .with_plan(WorkClass::Generic, TotalKind::UpperBound),
+    );
+
+    let ProgressTracker::Enabled { task, .. } = &progress else {
+        panic!("progress must be enabled");
+    };
+    assert_eq!(task.message(), "catalog pairs (upper bound)");
 }
 
 #[test]

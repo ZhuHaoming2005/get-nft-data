@@ -79,18 +79,26 @@ rescue/recall 和 connectivity run 只驻留本次进程内，且启动时会以
 进度位置按实际尝试的工作量推进，不按命中数推进。metadata 引擎通过无终端依赖的事件报告稳定
 subphase、`completed/total`、工作单位和诊断计数，CLI 只负责渲染。
 
-- 可预先精确计数的 rows、memberships、pair visits、edges、nodes 和 files 使用确定进度；
-- total 未知的扫描、fallback 选择或排序操作显示吞吐但 ETA 为 `n/a`，不会用当前 completed
-  伪造不断变化的 exact total；
+- 可预先精确计数的 rows、contracts、token groups、memberships、pair visits、edges、nodes 和 files
+  使用确定进度；
+- Catalog 使用“精确 routing work + 所有可能 contract expansion”的稳定安全上界，shared-token
+  使用剩余 pair-visit budget 上界；这两类 task 标签显示 `(upper bound)`、metrics 显示
+  `ETA ≤ ...`，终点保留原上界而不重建 exact total；
+- DuckDB Rust API 无法观测单条 CTAS/聚合查询的执行总量；这些任务明确保持 indeterminate 和
+  `ETA n/a (total unknown)`，不会用输出行数或固定阶段数伪造百分比；
 - 精确总量为零的阶段显示 `skipped (0 <unit>)`，不再显示无意义的 `n/a` 速率或历史 ETA；
 - ETA 在至少 1 秒预热和有效增量后，用当前 homogeneous subphase 的 EWMA 速率计算；
 - 切换 subphase 或工作单位时重置估计器，零增量刷新不会改变速率；
 - candidate、scored、matched、selected 等计数仅用于诊断，不影响位置或 ETA；
 - retained-token source 分类按精确 `(contract, token)` group 总量推进，即使没有选中 source
   也计为已完成；跨 Arrow batch 的同一 group 只计一次；
+- fallback source 分类只使用一个 contract 级 phase，候选行数与选中来源作为诊断计数，避免两个
+  phase 交错导致任务条和 ETA 反复重置；Encode publish 与 membership sort 使用稳定已知总量；
+- Name atom 加载按 DuckDB 表的精确行数推进，candidate index 按 token/posting 构建和文档排序两次
+  遍历的 `2N` 工作量分批推进；
 - task 行使用千位分隔的位置和总量，metrics 行只显示紧凑吞吐、当前 ETA 和语义化诊断计数，
   不重复任务名与位置；
-- Catalog 使用 `work` 单位并在长 job 内增量上报，Exact 按 frontier/group、Reduce 按 edge/root
+- Catalog 在长 job 内增量上报，Exact 按 frontier/group、Reduce 按 edge/root
   chunk 上报；MemoryFirst 使用 `finalize component groups`，不会显示实际未执行的 connectivity
   commit/recovery 阶段；
 - UI 以 20 Hz 刷新，完成值被钳制到 total，失败不会显示 100%。

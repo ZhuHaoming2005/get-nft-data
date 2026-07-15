@@ -109,6 +109,7 @@ impl ProgressPhase {
 pub enum WorkUnit {
     Work,
     Items,
+    Contracts,
     TokenGroups,
     Pairs,
     Edges,
@@ -150,6 +151,7 @@ impl WorkUnit {
         match self {
             Self::Work => "work",
             Self::Items => "items",
+            Self::Contracts => "contracts",
             Self::TokenGroups => "token groups",
             Self::Pairs => "pairs",
             Self::Edges => "edges",

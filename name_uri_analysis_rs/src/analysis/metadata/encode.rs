@@ -478,9 +478,10 @@ pub(crate) fn run_metadata_encode(
             atoms.len()
         ));
 
-        progress.observe_engine_event(ProgressEvent::indeterminate(
+        progress.observe_engine_event(ProgressEvent::determinate(
             ProgressPhase::EncodePublish,
             0,
+            4,
             WorkUnit::Items,
             EngineCounters::default(),
         ));
@@ -529,9 +530,10 @@ pub(crate) fn run_metadata_encode(
         commit_ready(&blocking_dir, "blocking.ready", &blocking_manifest).map_err(format_err)?;
         blocking_publish.finalize()?;
         encode_publish.finalize()?;
-        progress.observe_engine_event(ProgressEvent::indeterminate(
+        progress.observe_engine_event(ProgressEvent::determinate(
             ProgressPhase::EncodePublish,
             1,
+            4,
             WorkUnit::Items,
             EngineCounters::default(),
         ));
@@ -543,9 +545,10 @@ pub(crate) fn run_metadata_encode(
             .filter(|artifact| !path_is_under_payload_blobs(&artifact.path))
             .cloned()
             .collect();
-        progress.observe_engine_event(ProgressEvent::indeterminate(
+        progress.observe_engine_event(ProgressEvent::determinate(
             ProgressPhase::EncodePublish,
             2,
+            4,
             WorkUnit::Items,
             EngineCounters::default(),
         ));
@@ -577,9 +580,10 @@ pub(crate) fn run_metadata_encode(
         let checkpoint_pins = broker
             .pin_batch(&registered, "metadata_encode_complete")
             .map_err(storage_err)?;
-        progress.observe_engine_event(ProgressEvent::indeterminate(
+        progress.observe_engine_event(ProgressEvent::determinate(
             ProgressPhase::EncodePublish,
             3,
+            4,
             WorkUnit::Items,
             EngineCounters::default(),
         ));
@@ -624,6 +628,13 @@ pub(crate) fn run_metadata_encode(
         for pin in checkpoint_pins {
             pin.persist().map_err(storage_err)?;
         }
+        progress.observe_engine_event(ProgressEvent::determinate(
+            ProgressPhase::EncodePublish,
+            4,
+            4,
+            WorkUnit::Items,
+            EngineCounters::default(),
+        ));
         progress.finish_stage("metadata encode complete");
         progress.finish_pipeline_stage("metadata encode complete");
         progress.finish_display("metadata encode phase complete");
@@ -1708,29 +1719,26 @@ fn resolve_pending_fallback_contracts(
     parse_pool: &rayon::ThreadPool,
     progress: &mut impl FnMut(ProgressEvent),
 ) -> Result<u64, AnalysisError> {
+    let fallback_total = pending_fallbacks.len() as u64;
     let fallback_filter =
         FallbackContractFilterTable::create(conn, pending_fallbacks.keys().copied())?;
-    progress(ProgressEvent::indeterminate(
+    progress(ProgressEvent::determinate(
         ProgressPhase::EncodeFallbackSources,
         0,
-        WorkUnit::Items,
+        fallback_total,
+        WorkUnit::Contracts,
         EngineCounters::default(),
     ));
     let mut stmt = conn.prepare(fallback_contract_candidates_sql())?;
     let batches = stmt.query_arrow([])?;
 
-    progress(ProgressEvent::indeterminate(
-        ProgressPhase::EncodeResolveFallbacks,
-        0,
-        WorkUnit::Items,
-        EngineCounters::default(),
-    ));
-
     let mut current_contract: Option<u32> = None;
     let mut selected: Option<SelectedFallbackRow> = None;
-    let mut resolved_count = 0u64;
+    let mut completed_contracts = 0u64;
+    let mut selected_count = 0u64;
     let mut scanned = 0u64;
-    let mut progress_reported = 0u64;
+    let mut reported_contracts = 0u64;
+    let mut reported_candidates = 0u64;
 
     for batch in batches {
         let row_count = batch.num_rows();
@@ -1765,13 +1773,6 @@ fn resolve_pending_fallback_contracts(
         })?;
 
         for ((contract_index, range), selected_index) in ranges.iter().zip(selected_indexes) {
-            scanned = scanned.saturating_add(range.len() as u64);
-            emit_encode_indeterminate_progress(
-                progress,
-                ProgressPhase::EncodeFallbackSources,
-                scanned,
-                &mut progress_reported,
-            );
             if Some(*contract_index) != current_contract {
                 if let Some(chosen) = selected.take() {
                     columns_resident_bytes = register_resolved_fallback_contract(
@@ -1784,14 +1785,36 @@ fn resolve_pending_fallback_contracts(
                         resident_admission,
                         registration_accounting,
                     )?;
-                    resolved_count = resolved_count.saturating_add(1);
+                    selected_count = selected_count.saturating_add(1);
+                }
+                if current_contract.is_some() {
+                    completed_contracts = completed_contracts.saturating_add(1);
                 }
                 current_contract = Some(*contract_index);
             }
+            scanned = scanned.saturating_add(range.len() as u64);
             if selected.is_some() {
+                emit_fallback_source_progress(
+                    progress,
+                    completed_contracts,
+                    fallback_total,
+                    scanned,
+                    selected_count,
+                    &mut reported_contracts,
+                    &mut reported_candidates,
+                );
                 continue;
             }
             let Some(index) = selected_index else {
+                emit_fallback_source_progress(
+                    progress,
+                    completed_contracts,
+                    fallback_total,
+                    scanned,
+                    selected_count,
+                    &mut reported_contracts,
+                    &mut reported_candidates,
+                );
                 continue;
             };
             let json = required_arrow_string(json_column, index)?;
@@ -1809,6 +1832,15 @@ fn resolve_pending_fallback_contracts(
                 source_row_number: source_rows.value(index),
                 payload_ref,
             });
+            emit_fallback_source_progress(
+                progress,
+                completed_contracts,
+                fallback_total,
+                scanned,
+                selected_count,
+                &mut reported_contracts,
+                &mut reported_candidates,
+            );
         }
     }
     if let Some(chosen) = selected.take() {
@@ -1822,24 +1854,57 @@ fn resolve_pending_fallback_contracts(
             resident_admission,
             registration_accounting,
         )?;
-        resolved_count = resolved_count.saturating_add(1);
+        selected_count = selected_count.saturating_add(1);
     }
-
-    progress(ProgressEvent::indeterminate(
-        ProgressPhase::EncodeResolveFallbacks,
-        resolved_count,
-        WorkUnit::Items,
-        EngineCounters::default(),
-    ));
-    progress(ProgressEvent::indeterminate(
+    completed_contracts = finish_ordered_group_count(current_contract, completed_contracts);
+    if completed_contracts != fallback_total {
+        return Err(AnalysisError::InvalidData(format!(
+            "fallback-source progress mismatch: completed={completed_contracts}, planned={fallback_total}"
+        )));
+    }
+    progress(ProgressEvent::determinate(
         ProgressPhase::EncodeFallbackSources,
-        scanned,
-        WorkUnit::Items,
-        EngineCounters::default(),
+        completed_contracts,
+        fallback_total,
+        WorkUnit::Contracts,
+        EngineCounters {
+            candidates: scanned,
+            selected: selected_count,
+            ..EngineCounters::default()
+        },
     ));
     drop(stmt);
     drop(fallback_filter);
     Ok(columns_resident_bytes)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_fallback_source_progress(
+    progress: &mut impl FnMut(ProgressEvent),
+    completed: u64,
+    total: u64,
+    candidates: u64,
+    selected: u64,
+    reported_completed: &mut u64,
+    reported_candidates: &mut u64,
+) {
+    if completed.saturating_sub(*reported_completed) >= 16_384
+        || candidates.saturating_sub(*reported_candidates) >= 16_384
+    {
+        progress(ProgressEvent::determinate(
+            ProgressPhase::EncodeFallbackSources,
+            completed,
+            total,
+            WorkUnit::Contracts,
+            EngineCounters {
+                candidates,
+                selected,
+                ..EngineCounters::default()
+            },
+        ));
+        *reported_completed = completed;
+        *reported_candidates = candidates;
+    }
 }
 
 struct SelectedFallbackRow {
@@ -2284,16 +2349,18 @@ fn build_retained_token_source_relation(
         WorkUnit::Items,
         EngineCounters::default(),
     ));
-    progress(ProgressEvent::indeterminate(
+    progress(ProgressEvent::determinate(
         ProgressPhase::EncodeSortTokenMemberships,
         0,
+        membership_count,
         WorkUnit::Items,
         EngineCounters::default(),
     ));
     parse_pool.install(|| memberships.par_sort_unstable());
     validate_token_memberships(&memberships, contract_count, source_count)?;
-    progress(ProgressEvent::indeterminate(
+    progress(ProgressEvent::determinate(
         ProgressPhase::EncodeSortTokenMemberships,
+        membership_count,
         membership_count,
         WorkUnit::Items,
         EngineCounters::default(),
@@ -2397,23 +2464,6 @@ fn emit_encode_progress(
             WorkUnit::Items,
             EngineCounters::default(),
         ));
-    }
-}
-
-fn emit_encode_indeterminate_progress(
-    progress: &mut impl FnMut(ProgressEvent),
-    phase: ProgressPhase,
-    completed: u64,
-    reported: &mut u64,
-) {
-    if completed.saturating_sub(*reported) >= 16_384 {
-        progress(ProgressEvent::indeterminate(
-            phase,
-            completed,
-            WorkUnit::Items,
-            EngineCounters::default(),
-        ));
-        *reported = completed;
     }
 }
 
