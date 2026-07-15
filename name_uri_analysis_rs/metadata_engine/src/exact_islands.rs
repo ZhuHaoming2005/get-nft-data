@@ -508,8 +508,11 @@ pub fn run_shared_token_exact_islands_with_progress(
         },
     }
     let (sender, receiver) = std::sync::mpsc::sync_channel(lanes.saturating_mul(4).max(1));
-    let concurrent_groups = groups.len().min(lanes).max(1) as u64;
-    let per_group_bytes = budget.max_artifact_bytes / concurrent_groups.saturating_add(1);
+    // Misses survive until evidence finalization, so admission must be global to
+    // the scan rather than evenly partitioned between lanes. A static per-group
+    // slice rejects a skewed group even when the stage still has almost all of
+    // its memory available.
+    let shared_miss_budget = SharedMissBudget::new(budget.max_artifact_bytes);
     let (
         pair_work,
         calibration_pair_work,
@@ -528,10 +531,8 @@ pub fn run_shared_token_exact_islands_with_progress(
                     let result = scan_shared_token_group(
                         snapshot,
                         token,
-                        ExactEvidenceBudget {
-                            max_artifact_bytes: per_group_bytes,
-                            ..budget
-                        },
+                        budget,
+                        &shared_miss_budget,
                         |work| {
                             let _ = worker_sender.send(SharedScanMessage::Work {
                                 work,
@@ -730,6 +731,50 @@ struct SharedTokenGroupScan {
     misses: Vec<SharedTokenExactMiss>,
 }
 
+struct SharedMissBudget {
+    reserved: AtomicU64,
+    max_misses: u64,
+    miss_bytes: u64,
+    max_bytes: u64,
+    cancelled: AtomicBool,
+}
+
+impl SharedMissBudget {
+    fn new(max_bytes: u64) -> Self {
+        let miss_bytes = std::mem::size_of::<SharedTokenExactMiss>() as u64;
+        Self {
+            reserved: AtomicU64::new(0),
+            max_misses: max_bytes / miss_bytes.max(1),
+            miss_bytes,
+            max_bytes,
+            cancelled: AtomicBool::new(false),
+        }
+    }
+
+    fn reserve(&self) -> Result<(), ExactIslandError> {
+        let mut current = self.reserved.load(Ordering::Acquire);
+        loop {
+            if current >= self.max_misses {
+                self.cancelled.store(true, Ordering::Release);
+                return Err(ExactIslandError::Budget {
+                    resource: "in_memory_miss_bytes",
+                    requested: current.saturating_add(1).saturating_mul(self.miss_bytes),
+                    limit: self.max_bytes,
+                });
+            }
+            match self.reserved.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
 impl SharedTokenGroupScan {
     fn merge(mut self, mut other: Self) -> Self {
         self.exact_matches = self.exact_matches.saturating_add(other.exact_matches);
@@ -769,6 +814,7 @@ fn scan_shared_token_group(
     snapshot: &MetadataSnapshot,
     token: u32,
     budget: ExactEvidenceBudget,
+    shared_miss_budget: &SharedMissBudget,
     report_work: impl Fn(u64) + Sync,
 ) -> Result<SharedTokenGroupScan, ExactIslandError> {
     const PROGRESS_CHUNK: u64 = 65_536;
@@ -825,10 +871,6 @@ fn scan_shared_token_group(
         let plan = LocalRoutingPlan::build_parallel(&sketches);
         Some((sketches, plan))
     };
-    let miss_bytes = std::mem::size_of::<SharedTokenExactMiss>() as u64;
-    let max_misses = budget.max_artifact_bytes / miss_bytes.max(1);
-    let reserved_misses = AtomicU64::new(0);
-    let cancelled = AtomicBool::new(false);
     let result = shared_token_pair_tiles(contracts.len(), PAIR_TILE_MEMBERS)
         .into_par_iter()
         .map(|tile| -> Result<SharedTokenGroupScan, ExactIslandError> {
@@ -840,7 +882,7 @@ fn scan_shared_token_group(
             for left in tile.left_begin..tile.left_end {
                 let right_begin = tile.right_begin.max(left.saturating_add(1));
                 for right in right_begin..tile.right_end {
-                    if cancelled.load(Ordering::Acquire) {
+                    if shared_miss_budget.cancelled.load(Ordering::Acquire) {
                         return Ok(result);
                     }
                     pending_work = pending_work.saturating_add(1);
@@ -857,15 +899,7 @@ fn scan_shared_token_group(
                         if routing.as_ref().is_some_and(|(sketches, plan)| {
                             !plan.routes_pair(sketches, left as u32, right as u32)
                         }) {
-                            let slot = reserved_misses.fetch_add(1, Ordering::AcqRel);
-                            if slot >= max_misses {
-                                cancelled.store(true, Ordering::Release);
-                                return Err(ExactIslandError::Budget {
-                                    resource: "in_memory_miss_bytes",
-                                    requested: slot.saturating_add(1).saturating_mul(miss_bytes),
-                                    limit: budget.max_artifact_bytes,
-                                });
-                            }
+                            shared_miss_budget.reserve()?;
                             result.misses.push(SharedTokenExactMiss {
                                 token_id: token,
                                 left_contract: contracts[left],
@@ -888,7 +922,7 @@ fn scan_shared_token_group(
             |left, right| Ok(left.merge(right)),
         );
     if result.is_err() {
-        cancelled.store(true, Ordering::Release);
+        shared_miss_budget.cancelled.store(true, Ordering::Release);
     }
     result
 }
@@ -1222,7 +1256,10 @@ fn sorted_intersects(x: &[u32], y: &[u32]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{shared_token_pair_tiles, SharedTokenExactEvidence};
+    use super::{
+        shared_token_pair_tiles, ExactIslandError, SharedMissBudget, SharedTokenExactEvidence,
+        SharedTokenExactMiss,
+    };
     use crate::blocking::{AtomSketch, LocalRoutingPlan};
 
     #[test]
@@ -1262,6 +1299,30 @@ mod tests {
             .flat_map(|left| (left + 1..19).map(move |right| (left, right)))
             .collect::<Vec<_>>();
         assert_eq!(visits, expected);
+    }
+
+    #[test]
+    fn shared_miss_budget_is_global_and_allows_skewed_groups() {
+        let miss_bytes = std::mem::size_of::<SharedTokenExactMiss>() as u64;
+        let budget = SharedMissBudget::new(10 * miss_bytes + 2);
+
+        // Six misses in one group would exceed the old three-way equal slice,
+        // but they fit comfortably in the stage-wide allocation.
+        for _ in 0..6 {
+            budget.reserve().unwrap();
+        }
+        for _ in 6..10 {
+            budget.reserve().unwrap();
+        }
+        let error = budget.reserve().unwrap_err();
+        assert!(matches!(
+            error,
+            ExactIslandError::Budget {
+                resource: "in_memory_miss_bytes",
+                requested,
+                limit,
+            } if requested == 11 * miss_bytes && limit == 10 * miss_bytes + 2
+        ));
     }
 
     #[test]
