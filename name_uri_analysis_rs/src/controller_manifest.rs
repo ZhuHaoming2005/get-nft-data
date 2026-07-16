@@ -265,9 +265,12 @@ pub(crate) fn match_observation_key(
         metadata_engine::pipeline::DEFAULT_EXACT_SAMPLE_LEFTS,
         metadata_engine::pipeline::DEFAULT_EXACT_PAIR_WORK,
     )?;
-    let evidence_pair_work = exact_plan
-        .pair_work
-        .saturating_add(feature.token_pair_work.min(exact_plan.remaining_pair_work));
+    let evidence_pair_work = exact_plan.pair_work.saturating_add(
+        feature
+            .token_pair_work
+            .min(exact_plan.remaining_pair_work)
+            .min(metadata_engine::exact_islands::SHARED_EXACT_TOTAL_PAIR_SAMPLE),
+    );
     let base_pair_work = blocking
         .contract_expansion_pair_work
         .saturating_add(feature.fallback_pair_work);

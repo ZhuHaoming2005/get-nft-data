@@ -6,7 +6,7 @@ use metadata_engine::encode::{
     EncodeSourceRow,
 };
 use metadata_engine::evidence::{
-    evaluate_holdout, EvidenceGatePolicy, HoldoutEvidence, RescuePlan, SharedRescueSeed,
+    evaluate_holdout, EvidenceGatePolicy, HoldoutEvidence, RescuePlan,
 };
 use metadata_engine::exact_islands::{
     open_pair_exact_evidence, open_shared_token_exact_evidence, plan_exact_evidence,
@@ -1230,12 +1230,12 @@ fn exact_evidence_plan_scales_both_pair_partitions_to_the_joint_budget() {
 
 #[test]
 fn scoring_and_evidence_gate_revisions_are_versioned_independently() {
-    assert_eq!(metadata_engine::scoring::MATCH_SEMANTICS_REVISION, 6);
-    assert_eq!(metadata_engine::evidence::EVIDENCE_GATE_REVISION, 4);
+    assert_eq!(metadata_engine::scoring::MATCH_SEMANTICS_REVISION, 7);
+    assert_eq!(metadata_engine::evidence::EVIDENCE_GATE_REVISION, 5);
 }
 
 #[test]
-fn shared_token_evidence_skips_unaffordable_groups_before_execution() {
+fn shared_token_evidence_samples_unaffordable_groups_instead_of_skipping_them() {
     let plan = plan_shared_token_evidence(
         &[0, 1_000_000, 1_000_002, 1_000_004, 1_000_006],
         &[0, 1, 2, 3],
@@ -1244,11 +1244,11 @@ fn shared_token_evidence_skips_unaffordable_groups_before_execution() {
     )
     .unwrap();
 
-    assert_eq!(plan.skipped_tokens, vec![0]);
-    assert_eq!(plan.calibration_tokens, vec![2]);
+    assert!(plan.skipped_tokens.is_empty());
+    assert_eq!(plan.calibration_tokens, vec![0, 2]);
     assert_eq!(plan.holdout_tokens, vec![1, 3]);
-    assert_eq!(plan.pair_work, 3);
-    assert_eq!(plan.skipped_pair_work, 499_999_500_000);
+    assert_eq!(plan.pair_work, 10);
+    assert_eq!(plan.skipped_pair_work, 0);
     assert_eq!(plan.considered_pair_work, 499_999_500_003);
 }
 
@@ -1316,19 +1316,19 @@ fn evidence_gate_rejects_excessive_skipped_pair_work_separately_from_misses() {
 }
 
 #[test]
-fn shared_evidence_plan_tracks_budget_skips_per_pair_work_stratum() {
+fn shared_evidence_plan_keeps_each_stratum_under_a_sample_budget() {
     // Group sizes 2, 3, and 9 have pair work 1, 3, and 36 respectively.
     let plan = plan_shared_token_evidence(&[0, 2, 5, 14], &[0, 1, 2], 8, 4).unwrap();
 
     assert_eq!(plan.pair_work, 4);
-    assert_eq!(plan.skipped_pair_work, 36);
+    assert_eq!(plan.skipped_pair_work, 0);
     assert_eq!(plan.work_strata.len(), 3);
     assert_eq!(plan.work_strata[0].considered_pair_work, 1);
     assert_eq!(plan.work_strata[0].skipped_pair_work, 0);
     assert_eq!(plan.work_strata[1].considered_pair_work, 3);
     assert_eq!(plan.work_strata[1].skipped_pair_work, 0);
     assert_eq!(plan.work_strata[2].considered_pair_work, 36);
-    assert_eq!(plan.work_strata[2].skipped_pair_work, 36);
+    assert_eq!(plan.work_strata[2].skipped_pair_work, 0);
 }
 
 #[test]
@@ -1404,19 +1404,13 @@ fn calibration_rescue_is_deterministic_and_filters_independent_holdout() {
         std::slice::from_ref(&shared_miss),
     );
     assert_eq!(plan.pair_atoms, vec![3, 9]);
-    assert_eq!(
-        plan.shared_seeds,
-        vec![
-            SharedRescueSeed {
-                token_id: 5,
-                contract_id: 2,
-            },
-            SharedRescueSeed {
-                token_id: 5,
-                contract_id: 8,
-            },
-        ]
-    );
+    assert_eq!(plan.shared_contracts, vec![2]);
+    assert_eq!(plan.shared_edges, vec![(2, 8)]);
+    let independent_shared_miss = metadata_engine::exact_islands::SharedTokenExactMiss {
+        token_id: 6,
+        left_contract: 2,
+        right_contract: 10,
+    };
 
     let report = evaluate_holdout(
         HoldoutEvidence {
@@ -1425,7 +1419,7 @@ fn calibration_rescue_is_deterministic_and_filters_independent_holdout() {
             pair_exact_matches: 1_000,
             pair_misses: &[pair_miss],
             shared_exact_matches: 1_000,
-            shared_misses: &[shared_miss],
+            shared_misses: &[independent_shared_miss],
             skipped_shared_groups: &[],
             skipped_shared_pair_work: 0,
             considered_shared_pair_work: 0,
@@ -1435,7 +1429,7 @@ fn calibration_rescue_is_deterministic_and_filters_independent_holdout() {
                 exact_matches: 1_000,
             }],
             shared_clusters: &[ExactEvidenceCluster {
-                id: 5,
+                id: 6,
                 exact_matches: 1_000,
             }],
         },
@@ -1740,7 +1734,8 @@ fn evidence_gate_validates_all_raw_misses_before_rescue_filtering() {
         },
         &RescuePlan {
             pair_atoms: vec![2],
-            shared_seeds: vec![],
+            shared_contracts: vec![],
+            shared_edges: vec![],
         },
         EvidenceGatePolicy::permissive(),
     )
@@ -3043,9 +3038,8 @@ fn pipeline_reports_monotonic_pair_work_with_stable_terminal_plans() {
         .expect("pipeline must expose catalog traversal progress");
     assert_eq!(catalog_terminal.unit, WorkUnit::Pairs);
     assert_eq!(catalog_terminal.work_class, WorkClass::Generic);
-    assert!(catalog_terminal.total.is_some());
-    assert_eq!(catalog_terminal.total_kind, TotalKind::UpperBound);
-    assert!(catalog_terminal.completed <= catalog_terminal.total.unwrap());
+    assert_eq!(catalog_terminal.total, None);
+    assert_eq!(catalog_terminal.total_kind, TotalKind::Unknown);
 
     let shared_token_events = events
         .iter()
@@ -3133,10 +3127,10 @@ fn pipeline_reports_monotonic_pair_work_with_stable_terminal_plans() {
             .collect::<Vec<_>>();
         assert!(!phase_events.is_empty(), "missing {phase:?} progress");
         let terminal = phase_events.last().unwrap();
-        if matches!(
-            phase,
-            ProgressPhase::CatalogPairs | ProgressPhase::SharedTokenPairs
-        ) {
+        if phase == ProgressPhase::CatalogPairs {
+            assert_eq!(terminal.total_kind, TotalKind::Unknown);
+            assert!(terminal.total.is_none());
+        } else if phase == ProgressPhase::SharedTokenPairs {
             assert_eq!(terminal.total_kind, TotalKind::UpperBound);
             assert!(terminal.completed <= terminal.total.unwrap());
         } else {
@@ -3177,7 +3171,7 @@ fn determinate_engine_progress_cannot_publish_more_than_total_work() {
 }
 
 #[test]
-fn catalog_progress_uses_a_stable_combined_work_upper_bound() {
+fn catalog_progress_reports_observed_work_without_a_fabricated_eta_bound() {
     let dir = tempfile::tempdir().unwrap();
     let features = dir.path().join("e");
     let blocking = dir.path().join("b");
@@ -3281,20 +3275,17 @@ fn catalog_progress_uses_a_stable_combined_work_upper_bound() {
         .iter()
         .filter(|event| event.phase == ProgressPhase::CatalogPairs)
         .collect::<Vec<_>>();
-    let catalog_upper_bound = catalog_events[0].total;
-    assert!(catalog_upper_bound.is_some());
     assert!(catalog_events.iter().all(|event| {
         event.work_class == WorkClass::Generic
             && event.unit == WorkUnit::Pairs
-            && event.total == catalog_upper_bound
-            && event.total_kind == TotalKind::UpperBound
+            && event.total.is_none()
+            && event.total_kind == TotalKind::Unknown
     }));
-    assert!(terminal.completed <= terminal.total.unwrap());
-    assert!(terminal.total.unwrap() > terminal.counters.scored);
     assert!(
         terminal.completed >= terminal.counters.expanded,
-        "catalog wall-work progress must include completed conditional expansion"
+        "observed catalog work must include completed conditional expansion"
     );
+    assert_eq!(terminal.counters.candidates, terminal.counters.scored);
 }
 
 #[test]

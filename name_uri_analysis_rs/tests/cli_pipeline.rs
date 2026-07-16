@@ -112,7 +112,7 @@ fn public_controller_runs_all_children_and_resumes_finalized_pipeline() {
     ] {
         assert!(path.is_file(), "missing {}", path.display());
     }
-    for recovery_only in [
+    for recovery_directory in [
         "index-1",
         "exact-islands",
         "rescue-plan-1",
@@ -121,10 +121,10 @@ fn public_controller_runs_all_children_and_resumes_finalized_pipeline() {
         "component-snapshots",
         "metadata-summary-1",
     ] {
-        assert!(!work
+        assert!(work
             .join("artifacts/metadata/match-1")
-            .join(recovery_only)
-            .exists());
+            .join(recovery_directory)
+            .is_dir());
     }
     let readiness: serde_json::Value = serde_json::from_slice(
         &fs::read(output.join("advisory/metadata-production-readiness.json")).unwrap(),

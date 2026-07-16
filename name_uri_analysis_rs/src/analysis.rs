@@ -93,11 +93,6 @@ pub fn run_analysis_phase(
     let mut phase_options = options.clone();
     phase_options.threads = phase_worker_threads(options.threads, phase);
     let options = &phase_options;
-    if matches!(phase, AnalysisPhase::MetadataMatch)
-        && std::env::var_os("NAME_URI_ANALYSIS_EPHEMERAL_IN_MEMORY").is_some()
-    {
-        release_ephemeral_prepare_state(options, work_directory)?;
-    }
     // MetadataEncode reads Prepare's DuckDB state without mutating Prepare/Name
     // tables. Match remains the sole owner of production metadata summary rows.
     if matches!(phase, AnalysisPhase::MetadataEncode) {
@@ -198,36 +193,6 @@ pub fn run_analysis_phase(
         progress.fail(error.to_string());
     }
     result
-}
-
-fn release_ephemeral_prepare_state(
-    options: &AnalysisOptions,
-    work_directory: &Path,
-) -> Result<(), AnalysisError> {
-    let work = fs::canonicalize(work_directory)?;
-    if options.database_path.is_file() {
-        let database = fs::canonicalize(&options.database_path)?;
-        if !database.starts_with(&work) {
-            return Err(AnalysisError::InvalidData(format!(
-                "refusing to release database outside work directory: {}",
-                database.display()
-            )));
-        }
-        fs::remove_file(database)?;
-    }
-    if let Some(temp_directory) = options.temp_directory.as_ref() {
-        if temp_directory.exists() {
-            let temp = fs::canonicalize(temp_directory)?;
-            if temp == work || !temp.starts_with(&work) {
-                return Err(AnalysisError::InvalidData(format!(
-                    "refusing to release DuckDB temp directory outside work directory: {}",
-                    temp.display()
-                )));
-            }
-            fs::remove_dir_all(temp)?;
-        }
-    }
-    Ok(())
 }
 
 fn phase_worker_threads(default_threads: usize, phase: AnalysisPhase) -> usize {
@@ -369,7 +334,7 @@ pub(crate) fn run_metadata_pipeline_result(
         evidence_gate_policy: metadata_engine::evidence::EvidenceGatePolicy::production(),
         edge_bytes,
     };
-    metadata_engine::pipeline::run_metadata_pipeline_ephemeral_with_callbacks(
+    metadata_engine::pipeline::run_metadata_pipeline_durable_with_callbacks(
         &features,
         &blocking,
         &out,

@@ -3,7 +3,7 @@
 use crate::encode::FeatureView;
 
 pub const METADATA_THRESHOLD: f64 = 0.6;
-pub const MATCH_SEMANTICS_REVISION: u32 = 6;
+pub const MATCH_SEMANTICS_REVISION: u32 = 7;
 const K1: f64 = 1.2;
 const B: f64 = 0.75;
 const PRESENT_IDF: f64 = 0.287_682_072_451_780_85;
@@ -38,8 +38,36 @@ pub fn template_matches(view: &FeatureView, left: u32, right: u32) -> bool {
     if left == right {
         return true;
     }
-    let (a, b) = template_score_bidirectional(view, left, right);
-    a >= METADATA_THRESHOLD || b >= METADATA_THRESHOLD
+    let (Some((lt, lf, lw, ld)), Some((rt, rf, rw, rd))) = (
+        template_parts(view, left as usize),
+        template_parts(view, right as usize),
+    ) else {
+        return false;
+    };
+    if !(ld > 0.0 && rd > 0.0) {
+        let (a, b) = template_score_bidirectional(view, left, right);
+        return a >= METADATA_THRESHOLD || b >= METADATA_THRESHOLD;
+    }
+    let left_target = METADATA_THRESHOLD * ld;
+    let right_target = METADATA_THRESHOLD * rd;
+    let (mut left_score, mut right_score) = (0.0, 0.0);
+    let (mut left_index, mut right_index) = (0usize, 0usize);
+    while left_index < lt.len() && right_index < rt.len() {
+        match lt[left_index].cmp(&rt[right_index]) {
+            std::cmp::Ordering::Less => left_index += 1,
+            std::cmp::Ordering::Greater => right_index += 1,
+            std::cmp::Ordering::Equal => {
+                left_score += f64::from(lf[left_index]) * rw[right_index];
+                right_score += f64::from(rf[right_index]) * lw[left_index];
+                if left_score >= left_target || right_score >= right_target {
+                    return true;
+                }
+                left_index += 1;
+                right_index += 1;
+            }
+        }
+    }
+    false
 }
 
 /// Exact legacy-compatible content pair score (max of both directions).

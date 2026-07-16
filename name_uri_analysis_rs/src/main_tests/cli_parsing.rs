@@ -98,7 +98,7 @@ fn effective_threads_never_exceed_visible_cpus() {
 }
 
 #[test]
-fn cli_accepts_ephemeral_memory_and_phase_thread_overrides() {
+fn cli_accepts_deprecated_ephemeral_flag_without_changing_thread_overrides() {
     let args = Args::try_parse_from([
         "name_uri_analysis_rs",
         "--parquet",
@@ -128,14 +128,9 @@ fn cli_accepts_ephemeral_memory_and_phase_thread_overrides() {
 }
 
 #[test]
-fn ram_backed_capacity_thresholds_are_advisory() {
-    let minimum_warning = minimum_ram_backed_capacity_warning(1024).unwrap();
-    assert!(minimum_warning.contains("continuing without falling back to disk"));
-    assert!(minimum_ram_backed_capacity_warning(8 * 1024 * 1024 * 1024).is_none());
-
-    let estimate_warning = estimated_ephemeral_capacity_warning(1024, 1024)
-        .unwrap()
-        .unwrap();
-    assert!(estimate_warning.contains("conservative capacity estimate"));
-    assert!(estimate_warning.contains("continuing without falling back to disk"));
+fn default_work_directory_is_a_durable_output_sibling() {
+    assert_eq!(
+        default_durable_work_directory(Path::new("runs/output")),
+        PathBuf::from("runs/.output.name_uri_analysis_rs_work")
+    );
 }

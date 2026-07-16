@@ -21,7 +21,7 @@ use crate::snapshot::MetadataSnapshot;
 
 const EVIDENCE_ARTIFACT_REVISION: u32 = 6;
 const SHARED_PAIR_TILE_MEMBERS: usize = 512;
-const ADAPTIVE_SHARED_TOTAL_PAIR_SAMPLE: u64 = 400_000_000;
+pub const SHARED_EXACT_TOTAL_PAIR_SAMPLE: u64 = 8_000_000;
 
 #[derive(Deserialize)]
 struct EvidenceRevision {
@@ -139,7 +139,6 @@ pub fn plan_shared_token_evidence(
     let mut calibration_tokens = Vec::new();
     let mut holdout_tokens = Vec::new();
     let mut skipped_tokens = Vec::new();
-    let mut pair_work = 0u64;
     let mut skipped_pair_work = 0u64;
     let mut considered_pair_work = 0u64;
     let mut work_strata = std::collections::BTreeMap::<u32, SharedTokenWorkStratum>::new();
@@ -220,43 +219,19 @@ pub fn plan_shared_token_evidence(
                 })?;
             continue;
         }
-        let Some(next_work) = pair_work.checked_add(work) else {
-            skipped_tokens.push(token);
-            skipped_pair_work = skipped_pair_work.saturating_add(work);
-            work_strata
-                .get_mut(&log2_pair_work)
-                .expect("work stratum was inserted above")
-                .skipped_pair_work = work_strata[&log2_pair_work]
-                .skipped_pair_work
-                .saturating_add(work);
-            continue;
-        };
-        if next_work > max_pair_work {
-            skipped_tokens.push(token);
-            skipped_pair_work =
-                skipped_pair_work
-                    .checked_add(work)
-                    .ok_or(ExactIslandError::Budget {
-                        resource: "shared_token_skipped_pair_work",
-                        requested: u64::MAX,
-                        limit: max_pair_work,
-                    })?;
-            work_strata
-                .get_mut(&log2_pair_work)
-                .expect("work stratum was inserted above")
-                .skipped_pair_work = work_strata[&log2_pair_work]
-                .skipped_pair_work
-                .checked_add(work)
-                .ok_or(ExactIslandError::Budget {
-                    resource: "shared_token_stratum_skipped_pair_work",
-                    requested: u64::MAX,
-                    limit: max_pair_work,
-                })?;
-            continue;
-        }
-        pair_work = next_work;
         target.push(token);
     }
+    let selected_pair_population =
+        considered_pair_work
+            .checked_sub(skipped_pair_work)
+            .ok_or(ExactIslandError::Budget {
+                resource: "shared_token_selected_pair_work",
+                requested: skipped_pair_work,
+                limit: considered_pair_work,
+            })?;
+    let pair_work = selected_pair_population
+        .min(max_pair_work)
+        .min(SHARED_EXACT_TOTAL_PAIR_SAMPLE);
     Ok(SharedTokenEvidencePlan {
         calibration_tokens,
         holdout_tokens,
@@ -660,6 +635,31 @@ fn proportional_partition_samples(
             limit: target.saturating_sub(remaining),
         });
     }
+    let active_groups = rows.iter().filter(|row| row.1 != 0).count() as u64;
+    if target >= active_groups {
+        let zero_sample_groups = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| (row.1 != 0 && row.2 == 0).then_some(index))
+            .collect::<Vec<_>>();
+        for zero in zero_sample_groups {
+            let donor = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.2 > 1)
+                .max_by(|(_, left), (_, right)| {
+                    left.2.cmp(&right.2).then_with(|| right.0.cmp(&left.0))
+                })
+                .map(|(index, _)| index)
+                .ok_or(ExactIslandError::Budget {
+                    resource: "adaptive_shared_token_minimum_group_sample",
+                    requested: active_groups,
+                    limit: target,
+                })?;
+            rows[donor].2 -= 1;
+            rows[zero].2 = 1;
+        }
+    }
     Ok(rows
         .into_iter()
         .map(|(token, _, sample, _)| (token, sample))
@@ -689,40 +689,14 @@ pub fn run_shared_token_exact_islands_with_progress(
         budget.max_lefts,
     )?;
 
-    let population_pair_work =
-        calibration
-            .iter()
-            .chain(&holdout)
-            .try_fold(0u64, |total, &token| {
-                let begin = snapshot.features().token_member_offsets[token as usize];
-                let end = snapshot.features().token_member_offsets[token as usize + 1];
-                let members = end - begin;
-                let pairs = members
-                    .checked_mul(members.saturating_sub(1))
-                    .and_then(|value| value.checked_div(2))
-                    .ok_or(ExactIslandError::Budget {
-                        resource: "shared_token_pair_work",
-                        requested: u64::MAX,
-                        limit: budget.max_pair_work,
-                    })?;
-                total.checked_add(pairs).ok_or(ExactIslandError::Budget {
-                    resource: "shared_token_pair_work",
-                    requested: u64::MAX,
-                    limit: budget.max_pair_work,
-                })
-            })?;
-    checked(
-        "shared_token_pair_work",
-        population_pair_work,
-        budget.max_pair_work,
-    )?;
+    let total_sample_cap = SHARED_EXACT_TOTAL_PAIR_SAMPLE.min(budget.max_pair_work);
     let (calibration_cap, holdout_cap) = match (calibration.is_empty(), holdout.is_empty()) {
         (false, false) => (
-            ADAPTIVE_SHARED_TOTAL_PAIR_SAMPLE / 2,
-            ADAPTIVE_SHARED_TOTAL_PAIR_SAMPLE - ADAPTIVE_SHARED_TOTAL_PAIR_SAMPLE / 2,
+            total_sample_cap / 2,
+            total_sample_cap - total_sample_cap / 2,
         ),
-        (false, true) => (ADAPTIVE_SHARED_TOTAL_PAIR_SAMPLE, 0),
-        (true, false) => (0, ADAPTIVE_SHARED_TOTAL_PAIR_SAMPLE),
+        (false, true) => (total_sample_cap, 0),
+        (true, false) => (0, total_sample_cap),
         (true, true) => (0, 0),
     };
     let calibration_samples = proportional_partition_samples(
@@ -1207,7 +1181,6 @@ fn scan_shared_token_group(
             requested: u64::MAX,
             limit: budget.max_pair_work,
         })?;
-    checked("shared_token_pair_work", group_work, budget.max_pair_work)?;
     checked("adaptive_shared_token_pair_work", sample_work, group_work)?;
     if sample_work == 0 {
         return Ok(SharedTokenGroupScan {
@@ -1791,6 +1764,14 @@ mod tests {
         SharedTokenExactMiss, EVIDENCE_ARTIFACT_REVISION,
     };
     use crate::blocking::{AtomSketch, LocalRoutingPlan};
+
+    #[test]
+    fn adaptive_partition_gives_every_selected_group_one_observation_when_affordable() {
+        let samples = proportional_partition_samples(&[0, 2, 1_000_002], &[0, 1], 2).unwrap();
+
+        assert_eq!(samples[&0], 1);
+        assert_eq!(samples[&1], 1);
+    }
 
     #[test]
     fn local_route_queries_do_not_materialize_the_pair_universe() {

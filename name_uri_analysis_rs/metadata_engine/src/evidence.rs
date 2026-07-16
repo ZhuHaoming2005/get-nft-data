@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
-pub const EVIDENCE_GATE_REVISION: u32 = 4;
+pub const EVIDENCE_GATE_REVISION: u32 = 5;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct EvidenceGatePolicy {
@@ -35,16 +35,11 @@ impl EvidenceGatePolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub struct SharedRescueSeed {
-    pub token_id: u32,
-    pub contract_id: u32,
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RescuePlan {
     pub pair_atoms: Vec<u32>,
-    pub shared_seeds: Vec<SharedRescueSeed>,
+    pub shared_contracts: Vec<u32>,
+    pub shared_edges: Vec<(u32, u32)>,
 }
 
 impl RescuePlan {
@@ -59,28 +54,58 @@ impl RescuePlan {
         pair_atoms.sort_unstable();
         pair_atoms.dedup();
 
-        let mut shared_seeds = shared_misses
+        let mut shared_degrees = BTreeMap::<u32, u64>::new();
+        for miss in shared_misses {
+            let left = shared_degrees.entry(miss.left_contract).or_default();
+            *left = left.saturating_add(1);
+            let right = shared_degrees.entry(miss.right_contract).or_default();
+            *right = right.saturating_add(1);
+        }
+        let mut shared_contracts = shared_misses
             .iter()
-            .flat_map(|miss| {
-                [
-                    SharedRescueSeed {
-                        token_id: miss.token_id,
-                        contract_id: miss.left_contract,
-                    },
-                    SharedRescueSeed {
-                        token_id: miss.token_id,
-                        contract_id: miss.right_contract,
-                    },
-                ]
+            .map(|miss| {
+                let left_degree = shared_degrees[&miss.left_contract];
+                let right_degree = shared_degrees[&miss.right_contract];
+                if left_degree > right_degree {
+                    miss.left_contract
+                } else if right_degree > left_degree {
+                    miss.right_contract
+                } else {
+                    miss.left_contract.min(miss.right_contract)
+                }
             })
             .collect::<Vec<_>>();
-        shared_seeds.sort_unstable();
-        shared_seeds.dedup();
+        shared_contracts.sort_unstable();
+        shared_contracts.dedup();
+        let shared_edges = normalized_shared_edges(shared_misses);
 
         Self {
             pair_atoms,
-            shared_seeds,
+            shared_contracts,
+            shared_edges,
         }
+    }
+
+    pub fn from_holdout(pair_misses: &[ExactMiss], shared_misses: &[SharedTokenExactMiss]) -> Self {
+        let mut plan = Self::from_calibration(pair_misses, &[]);
+        plan.shared_edges = normalized_shared_edges(shared_misses);
+        plan
+    }
+
+    pub fn merge(mut self, mut other: Self) -> Self {
+        self.pair_atoms.append(&mut other.pair_atoms);
+        self.pair_atoms.sort_unstable();
+        self.pair_atoms.dedup();
+        self.shared_contracts.append(&mut other.shared_contracts);
+        self.shared_contracts.sort_unstable();
+        self.shared_contracts.dedup();
+        self.shared_edges.append(&mut other.shared_edges);
+        for edge in &mut self.shared_edges {
+            *edge = normalized_edge(edge.0, edge.1);
+        }
+        self.shared_edges.sort_unstable();
+        self.shared_edges.dedup();
+        self
     }
 
     fn covers_pair(&self, miss: &ExactMiss) -> bool {
@@ -93,17 +118,26 @@ impl RescuePlan {
     }
 
     fn covers_shared(&self, miss: &SharedTokenExactMiss) -> bool {
-        [miss.left_contract, miss.right_contract]
-            .into_iter()
-            .any(|contract_id| {
-                self.shared_seeds
-                    .binary_search(&SharedRescueSeed {
-                        token_id: miss.token_id,
-                        contract_id,
-                    })
-                    .is_ok()
-            })
+        let edge = normalized_edge(miss.left_contract, miss.right_contract);
+        self.shared_edges.binary_search(&edge).is_ok()
+            || [miss.left_contract, miss.right_contract]
+                .into_iter()
+                .any(|contract_id| self.shared_contracts.binary_search(&contract_id).is_ok())
     }
+}
+
+fn normalized_shared_edges(misses: &[SharedTokenExactMiss]) -> Vec<(u32, u32)> {
+    let mut edges = misses
+        .iter()
+        .map(|miss| normalized_edge(miss.left_contract, miss.right_contract))
+        .collect::<Vec<_>>();
+    edges.sort_unstable();
+    edges.dedup();
+    edges
+}
+
+fn normalized_edge(left: u32, right: u32) -> (u32, u32) {
+    (left.min(right), left.max(right))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -513,17 +547,15 @@ fn wilson_upper_bound(misses: u64, trials: u64, z: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{wilson_upper_bound, RescuePlan, SharedRescueSeed};
+    use super::{wilson_upper_bound, RescuePlan};
     use crate::exact_islands::{ExactMiss, SharedTokenExactMiss};
 
     #[test]
     fn rescue_coverage_matches_full_frontier_execution_semantics() {
         let plan = RescuePlan {
             pair_atoms: vec![3],
-            shared_seeds: vec![SharedRescueSeed {
-                token_id: 7,
-                contract_id: 11,
-            }],
+            shared_contracts: vec![11],
+            shared_edges: vec![(20, 21)],
         };
 
         assert!(plan.covers_pair(&ExactMiss {
@@ -539,10 +571,43 @@ mod tests {
             right_atom: 2,
         }));
         assert!(plan.covers_shared(&SharedTokenExactMiss {
-            token_id: 7,
+            token_id: 8,
             left_contract: 11,
             right_contract: 12,
         }));
+    }
+
+    #[test]
+    fn production_rescue_merge_deduplicates_both_evidence_partitions() {
+        let merged = RescuePlan {
+            pair_atoms: vec![1, 3],
+            shared_contracts: vec![5, 7],
+            shared_edges: vec![(10, 11), (12, 13)],
+        }
+        .merge(RescuePlan {
+            pair_atoms: vec![2, 3],
+            shared_contracts: vec![6, 7],
+            shared_edges: vec![(11, 10), (14, 15)],
+        });
+
+        assert_eq!(merged.pair_atoms, vec![1, 2, 3]);
+        assert_eq!(merged.shared_contracts, vec![5, 6, 7]);
+        assert_eq!(merged.shared_edges, vec![(10, 11), (12, 13), (14, 15)]);
+    }
+
+    #[test]
+    fn holdout_rescue_keeps_exact_edges_without_global_contract_generalization() {
+        let plan = RescuePlan::from_holdout(
+            &[],
+            &[SharedTokenExactMiss {
+                token_id: 9,
+                left_contract: 12,
+                right_contract: 4,
+            }],
+        );
+
+        assert!(plan.shared_contracts.is_empty());
+        assert_eq!(plan.shared_edges, vec![(4, 12)]);
     }
 
     #[test]

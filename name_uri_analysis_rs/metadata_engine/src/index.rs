@@ -312,8 +312,8 @@ impl<'a> ConservativeIndex<'a> {
     /// An exact match requires at least one shared template term and one shared
     /// content term. We sample posting expansion to choose an index dimension,
     /// union its postings per left atom, then confirm exact overlap in the other
-    /// dimension before invoking the scorer. Pairs rejected here therefore
-    /// cannot be accepted by `score_pair`.
+    /// dimension and the exact template threshold before invoking the content
+    /// scorer. Pairs rejected here therefore cannot be accepted by `score_pair`.
     fn visit_hot_block_with_work_while(
         &self,
         block: usize,
@@ -404,10 +404,10 @@ impl<'a> ConservativeIndex<'a> {
                 let right_verification_terms =
                     payload_terms(features, payloads[right_position], verification_dimension);
                 if sorted_terms_intersect(left_verification_terms, right_verification_terms) {
-                    self.route_pair(
+                    self.route_hot_pair(
                         block,
-                        members[left_position],
-                        members[right_position],
+                        (members[left_position], members[right_position]),
+                        (left_payload, payloads[right_position]),
                         &mut metrics,
                         visit,
                     );
@@ -561,10 +561,10 @@ impl<'a> ConservativeIndex<'a> {
                                 left_verification_terms,
                                 right_verification_terms,
                             ) {
-                                self.route_pair(
+                                self.route_hot_pair(
                                     block,
-                                    members[left_position],
-                                    members[right_position],
+                                    (members[left_position], members[right_position]),
+                                    (left_payload, payloads[right_position]),
                                     &mut metrics,
                                     &mut |left, right| visit(state, left, right),
                                 );
@@ -600,6 +600,39 @@ impl<'a> ConservativeIndex<'a> {
         let right = a.max(b);
         if candidate_owner(self.snapshot.blocking(), left, right) != Some(block as u32) {
             metrics.duplicate_routes = metrics.duplicate_routes.saturating_add(1);
+            return;
+        }
+        metrics.routed_pairs = metrics.routed_pairs.saturating_add(1);
+        let offsets = &self.snapshot.features().fallback_atom_offsets;
+        let left_members = offsets[left as usize + 1] - offsets[left as usize];
+        let right_members = offsets[right as usize + 1] - offsets[right as usize];
+        metrics.contract_pair_visits = metrics
+            .contract_pair_visits
+            .saturating_add(left_members.saturating_mul(right_members));
+        visit(left, right)
+    }
+
+    fn route_hot_pair(
+        &self,
+        block: usize,
+        atoms: (u32, u32),
+        payloads: (u32, u32),
+        metrics: &mut IndexMetrics,
+        visit: &mut impl FnMut(u32, u32),
+    ) {
+        let (a, b) = atoms;
+        let (left_payload, right_payload) = payloads;
+        let left = a.min(b);
+        let right = a.max(b);
+        if candidate_owner(self.snapshot.blocking(), left, right) != Some(block as u32) {
+            metrics.duplicate_routes = metrics.duplicate_routes.saturating_add(1);
+            return;
+        }
+        // The secondary index already proves non-empty overlap in both
+        // dimensions. Push the exact template threshold below content scoring
+        // so template misses never enter the more expensive scorer/expander.
+        if !crate::scoring::template_matches(self.snapshot.features(), left_payload, right_payload)
+        {
             return;
         }
         metrics.routed_pairs = metrics.routed_pairs.saturating_add(1);

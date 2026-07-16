@@ -344,10 +344,10 @@ fn parallel_encode_match_is_semantically_deterministic_across_thread_counts() {
             semantic_groups_from_roots(&options.database_path, &pair.roots),
         ]);
         assert!(
-            !metadata_engine::pipeline::default_output_dir(&work)
+            metadata_engine::pipeline::default_output_dir(&work)
                 .join("component-snapshots")
                 .exists(),
-            "Ephemeral Match must not persist component roots"
+            "Durable CLI Match must persist component roots for interruption recovery"
         );
     }
     assert_eq!(summaries[0], summaries[1]);
@@ -924,13 +924,13 @@ fn match_uses_encode_artifacts_and_releases_payload_dependency() {
         "Encode must not write production summary rows"
     );
 
-    // Re-run Match alone on a fresh partial copy path: summary stays Match-owned.
+    // Match owns both the compact partial and durable interruption-recovery artifacts.
     let summary_hash = file_sha256(&summary);
     assert_ne!(summary_hash, [0u8; 32]);
-    assert!(!work
+    assert!(work
         .join("artifacts/metadata/match-1/metadata-summary-1/metadata-summary.ready")
         .exists());
-    assert!(!work
+    assert!(work
         .join("artifacts/metadata/match-1/component-snapshots")
         .exists());
 

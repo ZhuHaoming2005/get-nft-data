@@ -6,8 +6,9 @@ metadata 的链内、跨链汇总及定向链对矩阵；最终原子发布 `sum
 
 ## 生产运行
 
-目标配置为 128 vCPU、512 GiB 内存。默认模式可使用本机 ESSD；速度优先且允许释放
-Prepare/Name DuckDB 中间状态时，可使用 Linux tmpfs 纯内存模式：
+目标配置为 128 vCPU、512 GiB 内存。工作目录与中断恢复默认放在 output 的同级硬盘目录；
+MetadataMatch 的热索引、候选批次、评分缓存、压缩 scratch 和归约状态仍受内存 broker 管理，
+不会把这些热结构作为交换式 spill 写回硬盘：
 
 ```bash
 ./main \
@@ -16,7 +17,6 @@ Prepare/Name DuckDB 中间状态时，可使用 Linux tmpfs 纯内存模式：
   --parquet ./data/polygon.parquet \
   --parquet ./data/solana.parquet \
   --output-dir ./output \
-  --ephemeral-in-memory \
   --threads 128 \
   --prepare-threads 64 \
   --metadata-encode-threads 128 \
@@ -28,12 +28,12 @@ Prepare/Name DuckDB 中间状态时，可使用 Linux tmpfs 纯内存模式：
   --name-threshold 95
 ```
 
-`--ephemeral-in-memory` 在 Linux 上默认使用稳定路径
-`/dev/shm/name_uri_analysis_rs_work`，会校验该路径确实属于 tmpfs，并在新任务启动前按
-`3 × 输入文件大小 + 8 GiB` 做保守容量估算。容量不足只打印警告并继续依赖实际 tmpfs 写入，
-不会回落到磁盘；路径并非 tmpfs 或真实写入失败仍会终止。Docker 默认 `/dev/shm` 往往只有
-64 MiB，建议通过 `--work-directory` 指向单独挂载且容量足够的 tmpfs。Name 完成后，Match
-启动前会删除 `stage.duckdb` 和 `duckdb-temp`，避免它们与 Match hard top 同时占用 RAM。
+未指定 `--work-directory` 时，默认使用
+`<output-dir 同级>/.<output-name>.name_uri_analysis_rs_work`，从而让 manifest、phase ready、
+catalog、ExactEvidence、connectivity run 和 component snapshot 在进程中断后仍可由
+`--resume` 校验并复用。旧的 `--ephemeral-in-memory` 参数仅为脚本兼容保留，已成为打印警告的
+no-op，不再选择 `/dev/shm`、校验 tmpfs 或删除 Prepare/Name 的恢复状态。正常成功后仍默认清理
+工作目录；需要保留完整诊断和恢复工件时使用 `--keep-work-directory`。
 
 Linux 多 NUMA 节点默认尝试 `MPOL_INTERLEAVE`，容器拒绝该系统调用时自动退化；可通过
 `--disable-numa-interleave`（或环境变量
@@ -75,16 +75,16 @@ Controller 固定执行五个阶段：
    与 blocking artifact；不创建 Encode 临时关系表或持久 payload CAS。物理空间在冻结 SoA/CSR
    基数后分别为 feature 和 blocking 准入，不再用原始 JSON 字节乘数预留虚假的数百 GiB；
 3. `Name`：加载 canonical name 节点并执行并行 Jaro-Winkler；
-4. `MetadataMatch`：只读 metadata snapshot，在内存中完成 catalog、证据型 ExactIsland、并行候选
-   评分、scope forest 收集与流式归约；CLI 使用 `MatchPersistence::Ephemeral`，不写
-   component snapshot、raw Evidence ready JSON 或 Match 内部恢复文件，只把 compact summary
-   交给 Finalize；
+4. `MetadataMatch`：只读 metadata snapshot，在内存中完成 catalog 候选执行、证据型
+   ExactIsland、并行评分、scope forest 收集与流式归约；CLI 使用
+   `MatchPersistence::Durable`，仅把可校验的 catalog、Evidence、connectivity forest、
+   component snapshot 和 summary checkpoint 持久化到硬盘用于中断恢复；
 5. `Finalize`：合并三个 summary partial，排序并原子发布输出代次。
 
 重负载阶段在独立子进程中运行，退出后由操作系统回收 DuckDB、Rayon scratch 与 allocator
 高水位。`MetadataEncode` artifact 采用 revisioned ready marker；`StorageBroker` 记录 pin、
-依赖、可重建与可回收状态。CLI 的 Ephemeral Match 若失败会从 Encode snapshot 重新运行 Match，
-而不是恢复 Match 内部子阶段。
+依赖、可重建与可回收状态。CLI 的 Durable Match 可直接复用已校验的 catalog、ExactEvidence、
+connectivity run 和 component snapshot，避免中断后从 Encode snapshot 重跑整个 Match。
 
 `metadata_engine::pipeline::run_metadata_pipeline` 和
 `run_metadata_pipeline_with_progress` 默认使用 `MatchPersistence::MemoryFirst`：catalog、Exact、
@@ -105,9 +105,10 @@ subphase、`completed/total`、工作单位和诊断计数，CLI 只负责渲染
 
 - 可预先精确计数的 rows、contracts、token groups、memberships、pair visits、edges、nodes 和 files
   使用确定进度；
-- Catalog 使用“精确 routing work + 所有可能 contract expansion”的稳定安全上界，shared-token
-  使用剩余 pair-visit budget 上界；这两类 task 标签显示 `(upper bound)`、metrics 显示
-  `ETA ≤ ...`，终点保留原上界而不重建 exact total；
+- Catalog 的 hot block 会通过二级索引跳过绝大多数逻辑 `nC2` pair，contract expansion 又只在
+  精确 atom match 后发生，因此不再把两种互斥最坏情况相加成数十万亿的伪分母。Catalog task
+  保持 indeterminate，只显示 observed work 与 candidates/scored/expanded/matched 计数，不再输出
+  `ETA ≤ 885h` 一类没有执行意义的上界；
 - DuckDB Rust API 无法观测单条 CTAS/聚合查询的执行总量；这些任务明确保持 indeterminate 和
   `ETA n/a (total unknown)`，不会用输出行数或固定阶段数伪造百分比；
 - 精确总量为零的阶段显示 `skipped (0 <unit>)`，不再显示无意义的 `n/a` 速率或历史 ETA；
@@ -135,7 +136,7 @@ subphase、`completed/total`、工作单位和诊断计数，CLI 只负责渲染
   实时传回；排序内部总量不可观测，因此 task 明确保持 indeterminate，不伪造有限 ETA；
 - Metadata Match 的 stage 行使用动态 spinner 显示当前 engine subphase，不显示未知分母的百分比；
   Match 历史 wall time 和
-  当前运行的 elapsed subtraction 共用控制器启动时刻，子进程启动、锁交接和 tmpfs 清理不会造成
+  当前运行的 elapsed subtraction 共用控制器启动时刻，子进程启动和锁交接不会造成
   ETA 计时边界错位；
 - MemoryFirst 使用 `finalize component groups`，不会显示实际未执行的 connectivity
   commit/recovery 阶段；
@@ -143,8 +144,9 @@ subphase、`completed/total`、工作单位和诊断计数，CLI 只负责渲染
 
 因此 `ETA` 表示“当前子阶段剩余同类工作”的估计。只有 Metadata Match 的引擎事件会独立显示
 `match ETA n/a (uncalibrated)`；在没有同 revision、同规模目标机历史分布前不会把子阶段速率外推成
-整段 Match 的伪精确 ETA。当前 Match controller revision 为 18，旧持久化路径的历史样本不会污染
-新的 MemoryFirst ETA；forecast/observation 共用 schema 3，旧 schema 样本不会被渲染端误用。
+整段 Match 的伪精确 ETA。当前 Match controller revision 为 21，旧 tmpfs/Ephemeral 和旧 catalog
+同步热路径的历史样本不会污染新的 Durable ETA；forecast/observation 共用 schema 3，旧 schema
+样本不会被渲染端误用。
 可用 `--no-progress` 关闭终端进度。
 
 ## 资源、恢复与诊断
@@ -174,12 +176,16 @@ subphase、`completed/total`、工作单位和诊断计数，CLI 只负责渲染
 - Match 使用实际物理内存探测保留 host headroom；edge 上限由 admitted Match 内存给出，随后按
   contract/scope 的最大 forest 上界自动缩小。Catalog 与 Exact 并行度均由 MemoryBroker 限制。
   hot block 在 catalog 中只保留一个惰性 fanout 描述符；执行时根据抽样 posting expansion 选择一维
-  建立共享只读倒排索引，并在另一维并行验证 left-row term overlap 后才进入 scorer；共享 posting
+  建立共享只读倒排索引，在另一维验证 term overlap，并在 canonical owner 上提前执行精确 template
+  0.6 门；template miss 不再进入 content BM25 或 contract expansion。共享 posting
   scratch 按并发 hot job 准入，线程局部 row scratch 按 lane 准入。shared-token ExactIsland 不再
   物化完整 routing pair 集，而是复用并行构建的只读 routing plan；小 population 全量扫描，大
   population 在 calibration/holdout 分区内按完整 pair population 等比例分配固定总样本预算。
+  精确 atom match 的 contract expansion 先按 chain bucket 检查 retained-token 集合；集合不相交时
+  直接生成完整二部图的 `L+R-1` 连通森林，不再枚举 `L×R`，存在 token 重叠时才回到逐 pair 精确过滤。
   Reduce 直接在内存中对各 forest run 执行并行原子 union 和并行 root 解析，不再串行归并排序边；
-  CLI Ephemeral 模式生成 summary 后立即释放组件根，不提交组件文件。
+  CLI Durable 模式在阶段边界提交压缩 forest、组件根和证据 checkpoint；评分中的候选、倒排索引、
+  payload cache、union scratch 与未冻结批次不会作为热数据 spill 到硬盘。
 - 默认成功后删除工作目录；需要检查阶段恢复产物时使用
   `--keep-work-directory --diagnostics`。
 - manifest 校验输入指纹、阶段 revision、partial hash 和后续阶段必需的 DuckDB 表；算法
@@ -192,12 +198,17 @@ subphase、`completed/total`、工作单位和诊断计数，CLI 只负责渲染
 - URI `v1` 为 token URI 命中，`v2` 为 token 未命中但 image 命中，`v3` 为任一命中。
 - metadata 阈值为 0.6；BaseEquivalent 冻结候选关系后执行精确 template/content 校验，并按稳定
   SourceId 保留 token-specific metadata source。Calibration ExactIsland 冻结确定性 RescuePlan，
-  Rescue 扫描完成后可补充生产连通边；独立 holdout 只负责质量告警，不会改变 RescuePlan。
-  质量报告以 sampled-left/shared-token group 为独立统计 cluster，并单独报告 skipped pair-work
-  比例。未达到阈值时继续生成完整输出，同时将 metadata production readiness 标记为 false；
-  证据结构损坏或不变量失败仍会终止。Shared-token calibration 和 holdout 各自按 pair population
-  等比例采样；只有实际评估 pair work 等于所选 group 的完整 population 时才允许标记为
-  exhaustive。Evidence gate revision 为 4。
+  pair miss 按 atom 扩展，shared-token miss 按合约扩展到该合约参与的全部大 token group，并继续
+  使用各 token-specific source 精确评分；小于 256 members 的 group 已全量扫描，不重复 Rescue。
+  独立 holdout 先用 calibration-only plan 生成不受数据泄漏影响的质量报告；报告冻结后，最终生产
+  RescuePlan 将全部已观测 miss 作为精确直连边合并，但只有 calibration 中高复用的 miss endpoint
+  才跨 token group 泛化，避免 holdout miss 触发无界全局救援。质量报告以
+  sampled-left/shared-token group 为独立统计 cluster，并单独报告完全未观测 group 的 skipped
+  pair-work 比例。超大 group 不再因完整 population 超预算而整组跳过，而是在
+  calibration/holdout 分区内按 pair population 分配最多 8,000,000 pair 的固定总样本预算，并在预算允许时保证每个选中
+  group 至少一个观测。未达到阈值时继续生成完整输出，同时将 metadata production readiness
+  标记为 false；证据结构损坏或不变量失败仍会终止。只有实际评估 pair work 等于所选 group 的
+  完整 population 时才允许标记为 exhaustive。Evidence gate revision 为 5。
 - 所有比例的分母都是主链全部非空合约数和 NFT 行数，不是可分析子集。
 
 完整参数以 `--help` 为准。
