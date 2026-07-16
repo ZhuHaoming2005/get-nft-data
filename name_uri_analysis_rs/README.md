@@ -138,7 +138,7 @@ subphase、`completed/total`、工作单位和诊断计数，CLI 只负责渲染
   ETA 计时边界错位；
 - MemoryFirst 使用 `finalize component groups`，不会显示实际未执行的 connectivity
   commit/recovery 阶段；
-- UI 以 20 Hz 刷新，完成值被钳制到 total，失败不会显示 100%。
+- UI 以 10 Hz 刷新，完成值被钳制到 total，失败不会显示 100%。
 
 因此 `ETA` 表示“当前子阶段剩余同类工作”的估计。只有 Metadata Match 的引擎事件会独立显示
 `match ETA n/a (uncalibrated)`；在没有同 revision、同规模目标机历史分布前不会把子阶段速率外推成
@@ -151,7 +151,10 @@ subphase、`completed/total`、工作单位和诊断计数，CLI 只负责渲染
 - DuckDB 默认最多使用 64 线程，也可用 `--duckdb-threads` 显式调整；Prepare、Encode、Name、
   Match 分别支持独立线程上限。Name 的 Arrow 转换、排序、candidate index 和 scorer 共用同一个
   受控 Rayon pool，并在读取前按行数、字符串字节和 worker stack 做内存准入。Name DuckDB 收紧到
-  最多 8 GiB；MetadataMatch 不打开 DuckDB。
+  最多 8 GiB；canonical 名称使用共享 `Arc<str>`，同名原子只保留一份文本分配，避免 canonical
+  构建再次复制全部字符串。Arrow 行转换使用 16,384 行有界并行块；canonical member 使用精确长度
+  `u32` slice，candidate 文档 token 与 posting 使用精确长度 boxed slice，并复用字符计数 scratch，
+  以减少小分配、结构头部和索引宽度。MetadataMatch 不打开 DuckDB。
 - MetadataEncode 在全量物化前保留保守基线，并在每个解析批次分配前按该批 JSON 上界扩容；token
   relation 的准入同时覆盖 selected rows、排序副本、source records、source-id hash table 和
   memberships 的并存峰值。批次完成后依据实际 `Vec`/`HashMap` capacity、唯一 payload、

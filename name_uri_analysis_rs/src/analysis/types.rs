@@ -59,7 +59,7 @@ pub struct AnalysisReport {
 #[derive(Clone, Debug)]
 pub(crate) struct NameAtom {
     pub(crate) chain_index: usize,
-    pub(crate) name_norm: String,
+    pub(crate) name_norm: std::sync::Arc<str>,
     pub(crate) char_len: usize,
     pub(crate) contract_count: i64,
     pub(crate) nft_count: i64,

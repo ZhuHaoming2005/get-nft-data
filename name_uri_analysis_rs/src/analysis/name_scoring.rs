@@ -3,6 +3,8 @@ use super::*;
 pub(crate) const NAME_EDGE_CHUNK_SIZE: usize = 8 * 1024;
 const NAME_PROGRESS_LEFT_CHUNK: u64 = 64;
 const SPARSE_HASH_ENTRY_BUDGET_BYTES: usize = 24;
+const NAME_INDEX_FIXED_ALLOCATION_HEADROOM_BYTES: usize = 64 * 1024;
+const NAME_INDEX_PER_COLLECTION_HEADROOM_BYTES: usize = 8;
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 pub(crate) struct NameScoringStats {
@@ -44,13 +46,13 @@ pub(crate) type NameTokenId = u32;
 pub(crate) type NameAtomIndex = u32;
 
 pub(crate) struct IndexedNameDocument {
-    prefix_tokens: Vec<NameTokenId>,
-    sorted_tokens: Vec<NameTokenId>,
+    prefix_tokens: Box<[NameTokenId]>,
+    sorted_tokens: Box<[NameTokenId]>,
 }
 
 pub(crate) struct NameCandidateIndex {
     pub(crate) documents: Vec<IndexedNameDocument>,
-    pub(crate) postings: Vec<Vec<NameAtomIndex>>,
+    pub(crate) postings: Vec<Box<[NameAtomIndex]>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -90,20 +92,30 @@ pub(crate) fn estimate_name_candidate_index_bytes(
     let document_tokens = token_occurrences
         .saturating_mul(2)
         .saturating_mul(std::mem::size_of::<NameTokenId>());
-    let posting_headers =
-        pushed_vec_capacity(token_count).saturating_mul(std::mem::size_of::<Vec<NameAtomIndex>>());
+    let posting_headers = pushed_vec_capacity(token_count)
+        .saturating_mul(std::mem::size_of::<Box<[NameAtomIndex]>>());
     let posting_values = posting_lengths
         .values()
         .copied()
         .map(pushed_vec_capacity)
         .fold(0usize, usize::saturating_add)
         .saturating_mul(std::mem::size_of::<NameAtomIndex>());
+    // Vec/Box payload sizes do not include allocator bookkeeping or small
+    // collection alignment. Keep the preflight strictly above measured
+    // capacities instead of relying on allocator-specific exact fits.
+    let allocation_headroom = atoms
+        .len()
+        .saturating_add(token_count)
+        .saturating_mul(NAME_INDEX_PER_COLLECTION_HEADROOM_BYTES)
+        .saturating_add(NAME_INDEX_FIXED_ALLOCATION_HEADROOM_BYTES);
     let resident_bytes = document_headers
         .saturating_add(document_tokens)
         .saturating_add(posting_headers)
-        .saturating_add(posting_values);
+        .saturating_add(posting_values)
+        .saturating_add(allocation_headroom);
     let build_only_bytes = token_count
         .saturating_mul(48)
+        .saturating_add(token_count.saturating_mul(std::mem::size_of::<Vec<NameAtomIndex>>()))
         .saturating_add(
             atoms
                 .len()
@@ -120,8 +132,17 @@ fn pushed_vec_capacity(length: usize) -> usize {
     if length == 0 {
         0
     } else {
-        length.max(4).next_power_of_two()
+        length
+            .max(4)
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX)
     }
+}
+
+fn compact_name_identity(value: usize, label: &str) -> Result<u32, AnalysisError> {
+    u32::try_from(value).map_err(|_| {
+        AnalysisError::InvalidData(format!("{label} exceeds compact u32 identity space"))
+    })
 }
 
 /// Per-worker scratch space for candidate generation. The preflight memory
@@ -261,20 +282,20 @@ impl NameCandidateScratch {
 impl NameCandidateIndex {
     #[cfg(test)]
     pub(crate) fn new(atoms: &[NameAtom]) -> Self {
-        Self::new_with_progress(atoms, || {})
+        Self::new_with_progress(atoms, || {}).expect("test name index fits compact identities")
     }
 
     pub(crate) fn new_with_progress(
         atoms: &[NameAtom],
         on_unit_completed: impl Fn() + Sync,
-    ) -> Self {
+    ) -> Result<Self, AnalysisError> {
         let mut token_ids = HashMap::<(char, u32), NameTokenId>::new();
         let mut postings = Vec::<Vec<NameAtomIndex>>::new();
         let mut raw_documents = Vec::with_capacity(atoms.len());
+        let mut char_occurrences = HashMap::<char, u32>::new();
         for (atom_index, atom) in atoms.iter().enumerate() {
-            let compact_atom_index =
-                u32::try_from(atom_index).expect("name atom index exceeds u32 indexes");
-            let mut char_occurrences = HashMap::<char, u32>::new();
+            let compact_atom_index = compact_name_identity(atom_index, "name atom index")?;
+            char_occurrences.clear();
             let mut tokens = Vec::with_capacity(atom.char_len);
             for character in atom.name_norm.chars() {
                 let occurrence = char_occurrences.entry(character).or_default();
@@ -283,8 +304,8 @@ impl NameCandidateIndex {
                 let token_id = match token_ids.get(&token_key).copied() {
                     Some(token_id) => token_id,
                     None => {
-                        let token_id = u32::try_from(token_ids.len())
-                            .expect("name token dictionary exceeds u32 indexes");
+                        let token_id =
+                            compact_name_identity(token_ids.len(), "name token dictionary")?;
                         token_ids.insert(token_key, token_id);
                         postings.push(Vec::new());
                         token_id
@@ -310,17 +331,21 @@ impl NameCandidateIndex {
                 let mut sorted_tokens = tokens;
                 sorted_tokens.sort_unstable();
                 let document = IndexedNameDocument {
-                    prefix_tokens,
-                    sorted_tokens,
+                    prefix_tokens: prefix_tokens.into_boxed_slice(),
+                    sorted_tokens: sorted_tokens.into_boxed_slice(),
                 };
                 on_unit_completed();
                 document
             })
             .collect::<Vec<_>>();
-        Self {
+        let postings = postings
+            .into_iter()
+            .map(Vec::into_boxed_slice)
+            .collect::<Vec<_>>();
+        Ok(Self {
             documents,
             postings,
-        }
+        })
     }
 
     pub(crate) fn memory_bytes(&self) -> usize {
@@ -330,21 +355,21 @@ impl NameCandidateIndex {
             .saturating_add(
                 self.postings
                     .capacity()
-                    .saturating_mul(std::mem::size_of::<Vec<NameAtomIndex>>()),
+                    .saturating_mul(std::mem::size_of::<Box<[NameAtomIndex]>>()),
             )
             .saturating_add(
                 self.documents
                     .iter()
                     .map(|document| {
-                        document.prefix_tokens.capacity() * std::mem::size_of::<NameTokenId>()
-                            + document.sorted_tokens.capacity() * std::mem::size_of::<NameTokenId>()
+                        document.prefix_tokens.len() * std::mem::size_of::<NameTokenId>()
+                            + document.sorted_tokens.len() * std::mem::size_of::<NameTokenId>()
                     })
                     .sum::<usize>(),
             )
             .saturating_add(
                 self.postings
                     .iter()
-                    .map(|posting| posting.capacity() * std::mem::size_of::<NameAtomIndex>())
+                    .map(|posting| posting.len() * std::mem::size_of::<NameAtomIndex>())
                     .sum::<usize>(),
             )
     }
@@ -358,7 +383,10 @@ impl NameCandidateIndex {
         scratch: &'a mut NameCandidateScratch,
     ) -> &'a [NameAtomIndex] {
         scratch.clear();
-        let right_end = right_range.end.min(atoms.len());
+        if left >= atoms.len() || left >= self.documents.len() {
+            return &scratch.candidates;
+        }
+        let right_end = right_range.end.min(atoms.len()).min(self.documents.len());
         if right_range.start >= right_end {
             return &scratch.candidates;
         }
@@ -379,17 +407,15 @@ impl NameCandidateIndex {
         if minimum_overlap == 0 {
             for atom_index in right_range.clone() {
                 if atom_index != left {
-                    scratch.push_once(
-                        u32::try_from(atom_index).expect("name atom index exceeds u32 indexes"),
-                    );
+                    debug_assert!(u32::try_from(atom_index).is_ok());
+                    scratch.push_once(atom_index as u32);
                 }
             }
         } else {
             let document = &self.documents[left];
-            let compact_right_start =
-                u32::try_from(right_range.start).expect("name candidate range exceeds u32 indexes");
-            let compact_right_end =
-                u32::try_from(right_range.end).expect("name candidate range exceeds u32 indexes");
+            debug_assert!(u32::try_from(right_range.end).is_ok());
+            let compact_right_start = right_range.start as u32;
+            let compact_right_end = right_range.end as u32;
             let prefix_len = document
                 .prefix_tokens
                 .len()
@@ -461,9 +487,9 @@ pub(crate) fn union_canonical_name_pairs(
                 apply_matching_name_pairs(
                     original_atoms,
                     state,
-                    left,
+                    left as usize,
                     &[ScoredRight {
-                        right,
+                        right: right as usize,
                         score: 100.0,
                     }],
                     chain_count,
@@ -613,9 +639,9 @@ fn apply_canonical_edge(
             apply_matching_name_pairs(
                 original_atoms,
                 state,
-                original_left,
+                original_left as usize,
                 &[ScoredRight {
-                    right: original_right,
+                    right: original_right as usize,
                     score: matching.score,
                 }],
                 chain_count,
@@ -707,7 +733,7 @@ fn visit_indexed_name_pairs_for_left(
         .map(|&right| right as usize)
     {
         scored_pairs = scored_pairs.saturating_add(1);
-        let right_name = atoms[right].name_norm.as_str();
+        let right_name = atoms[right].name_norm.as_ref();
         if let Some(score) = query.score_percent(right_name, threshold) {
             matched_pairs = matched_pairs.saturating_add(1);
             visit_match(ScoredRight { right, score });
@@ -831,5 +857,28 @@ pub(crate) fn apply_matching_name_pairs(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod identity_guard_tests {
+    use super::{compact_name_identity, pushed_vec_capacity};
+
+    #[test]
+    fn vector_capacity_estimate_saturates_instead_of_panicking() {
+        assert_eq!(pushed_vec_capacity(usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn compact_name_identity_rejects_values_above_u32() {
+        let Some(overflow) = usize::try_from(u64::from(u32::MAX) + 1).ok() else {
+            return;
+        };
+
+        let error = compact_name_identity(overflow, "name token dictionary").unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("name token dictionary exceeds compact u32 identity space"));
     }
 }

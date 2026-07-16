@@ -513,6 +513,69 @@ fn completed_checkpoint_rejects_tampered_artifact() {
 }
 
 #[test]
+fn completed_checkpoint_rejects_artifact_outside_work_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let work = temp.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    let artifact_path = temp.path().join("outside.bin");
+    fs::write(&artifact_path, b"outside").unwrap();
+    let mut manifest = sample_manifest(&work);
+    manifest.stages.insert(
+        "name_complete".to_string(),
+        StageCheckpoint {
+            complete: true,
+            artifacts: vec![fingerprint_artifact(&artifact_path).unwrap()],
+        },
+    );
+
+    let error = checkpoint_is_complete_and_valid(&manifest, "name_complete", &work).unwrap_err();
+
+    assert!(error.to_string().contains("outside work directory"));
+}
+
+#[test]
+fn finalized_checkpoint_accepts_artifacts_inside_output_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let work = temp.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    let mut manifest = sample_manifest(&work);
+    fs::create_dir_all(&manifest.options.output_dir).unwrap();
+    let artifact_path = manifest.options.output_dir.join("summary.json");
+    fs::write(&artifact_path, br#"{"summary_rows":[]}"#).unwrap();
+    manifest.stages.insert(
+        "finalized".to_string(),
+        StageCheckpoint {
+            complete: true,
+            artifacts: vec![fingerprint_artifact(&artifact_path).unwrap()],
+        },
+    );
+
+    assert!(checkpoint_is_complete_and_valid(&manifest, "finalized", &work).unwrap());
+}
+
+#[test]
+fn finalized_checkpoint_rejects_artifacts_outside_output_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let work = temp.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    let mut manifest = sample_manifest(&work);
+    fs::create_dir_all(&manifest.options.output_dir).unwrap();
+    let artifact_path = temp.path().join("outside-summary.json");
+    fs::write(&artifact_path, br#"{"summary_rows":[]}"#).unwrap();
+    manifest.stages.insert(
+        "finalized".to_string(),
+        StageCheckpoint {
+            complete: true,
+            artifacts: vec![fingerprint_artifact(&artifact_path).unwrap()],
+        },
+    );
+
+    let error = checkpoint_is_complete_and_valid(&manifest, "finalized", &work).unwrap_err();
+
+    assert!(error.to_string().contains("outside output directory"));
+}
+
+#[test]
 fn resume_rejects_missing_database_table_needed_by_next_phase() {
     let temp = tempfile::tempdir().unwrap();
     let mut manifest = sample_manifest(temp.path());
@@ -632,6 +695,46 @@ fn metadata_encode_ready_rejects_a_missing_feature_dependency() {
     .unwrap_err();
 
     assert!(error.to_string().contains("artifact dependency"));
+    assert!(!manifest.stages["metadata_encode_complete"].complete);
+}
+
+#[test]
+fn ready_checkpoint_rejects_dependency_that_lexically_escapes_work_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let work = temp.path().join("work");
+    fs::create_dir_all(work.join("partial")).unwrap();
+    fs::create_dir_all(work.join("checkpoints")).unwrap();
+    fs::create_dir_all(work.join("nested")).unwrap();
+    let partial = work.join("partial/metadata-encode-summary.json");
+    fs::write(&partial, br#"{"summary_rows":[]}"#).unwrap();
+    let partial_fingerprint = fingerprint_artifact(&partial).unwrap();
+    let outside = temp.path().join("outside.bin");
+    fs::write(&outside, b"outside").unwrap();
+    let mut escaped_dependency = fingerprint_artifact(&outside).unwrap();
+    escaped_dependency.path = work.join("nested/../../outside.bin");
+    let ready = PhaseReady {
+        phase: "metadata-encode".to_string(),
+        partial_file: "metadata-encode-summary.json".to_string(),
+        size: partial_fingerprint.size,
+        sha256: partial_fingerprint.sha256,
+        artifacts: vec![escaped_dependency],
+    };
+    fs::write(
+        work.join("checkpoints/metadata-encode.ready.json"),
+        serde_json::to_vec(&ready).unwrap(),
+    )
+    .unwrap();
+    let mut manifest = sample_manifest(&work);
+
+    let error = promote_ready_phase(
+        &mut manifest,
+        InternalPhase::MetadataEncode,
+        "metadata-encode-summary.json",
+        &work,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("outside work directory"));
     assert!(!manifest.stages["metadata_encode_complete"].complete);
 }
 

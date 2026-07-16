@@ -678,7 +678,7 @@ fn input_fingerprints_are_compatible(
 pub(crate) fn checkpoint_is_complete_and_valid(
     manifest: &PipelineManifest,
     stage: &str,
-    _work_directory: &Path,
+    work_directory: &Path,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let Some(checkpoint) = manifest.stages.get(stage) else {
         return Err(format!("manifest is missing required stage {stage:?}").into());
@@ -686,7 +686,26 @@ pub(crate) fn checkpoint_is_complete_and_valid(
     if !checkpoint.complete {
         return Ok(false);
     }
+    let (artifact_root, artifact_root_label): (&Path, &str) = if stage == "finalized" {
+        (manifest.options.output_dir.as_path(), "output directory")
+    } else {
+        (work_directory, "work directory")
+    };
+    let canonical_artifact_root = artifact_root.canonicalize()?;
     for expected in &checkpoint.artifacts {
+        let canonical_artifact = expected.path.canonicalize().map_err(|error| {
+            format!(
+                "resume rejected: artifact for stage {stage:?} is unavailable ({}): {error}",
+                expected.path.display()
+            )
+        })?;
+        if !canonical_artifact.starts_with(&canonical_artifact_root) {
+            return Err(format!(
+                "resume rejected: artifact for stage {stage:?} is outside {artifact_root_label}: {}",
+                canonical_artifact.display()
+            )
+            .into());
+        }
         let actual = fingerprint_artifact_for_expected(&expected.path, &expected.sha256).map_err(
             |error| {
                 format!(
@@ -821,7 +840,15 @@ pub(crate) fn promote_ready_phase(
             "resume rejected: metadata-encode ready checkpoint has no artifact dependencies".into(),
         );
     }
+    let canonical_work = work_directory.canonicalize()?;
     let artifact = fingerprint_artifact(&work_directory.join("partial").join(expected_partial))?;
+    if !artifact.path.starts_with(&canonical_work) {
+        return Err(format!(
+            "resume rejected: ready checkpoint partial is outside work directory: {}",
+            artifact.path.display()
+        )
+        .into());
+    }
     if artifact.size != ready.size || artifact.sha256 != ready.sha256 {
         return Err(format!(
             "resume rejected: ready checkpoint hash does not match {}",
@@ -829,13 +856,18 @@ pub(crate) fn promote_ready_phase(
         )
         .into());
     }
-    let canonical_work = work_directory.canonicalize()?;
     let mut artifacts = vec![artifact];
     for expected in ready.artifacts {
-        if !expected.path.starts_with(&canonical_work) || !expected.path.is_file() {
-            return Err(format!(
-                "resume rejected: artifact dependency is missing or outside work directory: {}",
+        let canonical_artifact = expected.path.canonicalize().map_err(|error| {
+            format!(
+                "resume rejected: artifact dependency is missing ({}): {error}",
                 expected.path.display()
+            )
+        })?;
+        if !canonical_artifact.starts_with(&canonical_work) {
+            return Err(format!(
+                "resume rejected: artifact dependency is outside work directory: {}",
+                canonical_artifact.display()
             )
             .into());
         }

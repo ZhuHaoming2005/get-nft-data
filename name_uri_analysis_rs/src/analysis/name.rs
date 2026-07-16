@@ -2,6 +2,7 @@ use super::*;
 use duckdb::arrow::array::{Array, Int64Array, StringArray, StringViewArray};
 
 pub(crate) const NAME_ANALYSIS_WORKER_STACK_BYTES: usize = 4 * 1024 * 1024;
+const NAME_ATOM_CONVERT_CHUNK: usize = 16 * 1024;
 
 pub(crate) fn name_worker_stack_reserve_bytes(threads: usize) -> usize {
     threads
@@ -20,7 +21,7 @@ pub(crate) struct NameAnalysisSpec<'a> {
 
 pub(crate) struct CanonicalNameValues {
     pub(crate) atoms: Vec<NameAtom>,
-    pub(crate) members: Vec<Vec<usize>>,
+    pub(crate) members: Vec<Box<[u32]>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -40,20 +41,25 @@ pub(crate) struct NameAnalysisResult {
     pub(crate) metrics: NameAlgorithmMetrics,
 }
 
-pub(crate) fn canonical_name_values(atoms: &[NameAtom]) -> CanonicalNameValues {
+pub(crate) fn canonical_name_values(
+    atoms: &mut [NameAtom],
+) -> Result<CanonicalNameValues, AnalysisError> {
     let mut index_by_name = HashMap::<&str, usize>::new();
     let mut canonical_atoms = Vec::<NameAtom>::new();
-    let mut members = Vec::<Vec<usize>>::new();
+    let mut members = Vec::<Vec<u32>>::new();
     for (atom_index, atom) in atoms.iter().enumerate() {
-        if let Some(&canonical_index) = index_by_name.get(atom.name_norm.as_str()) {
+        let compact_atom_index = u32::try_from(atom_index).map_err(|_| {
+            AnalysisError::InvalidData("name atom count exceeds compact u32 indexes".into())
+        })?;
+        if let Some(&canonical_index) = index_by_name.get(atom.name_norm.as_ref()) {
             let canonical = &mut canonical_atoms[canonical_index];
             canonical.contract_count = canonical.contract_count.saturating_add(atom.contract_count);
             canonical.nft_count = canonical.nft_count.saturating_add(atom.nft_count);
-            members[canonical_index].push(atom_index);
+            members[canonical_index].push(compact_atom_index);
             continue;
         }
         let canonical_index = canonical_atoms.len();
-        index_by_name.insert(atom.name_norm.as_str(), canonical_index);
+        index_by_name.insert(atom.name_norm.as_ref(), canonical_index);
         canonical_atoms.push(NameAtom {
             chain_index: atom.chain_index,
             name_norm: atom.name_norm.clone(),
@@ -61,12 +67,19 @@ pub(crate) fn canonical_name_values(atoms: &[NameAtom]) -> CanonicalNameValues {
             contract_count: atom.contract_count,
             nft_count: atom.nft_count,
         });
-        members.push(vec![atom_index]);
+        members.push(vec![compact_atom_index]);
     }
-    CanonicalNameValues {
+    drop(index_by_name);
+    for (canonical_index, original_members) in members.iter().enumerate() {
+        let shared_name = &canonical_atoms[canonical_index].name_norm;
+        for &original_index in original_members {
+            atoms[original_index as usize].name_norm = shared_name.clone();
+        }
+    }
+    Ok(CanonicalNameValues {
         atoms: canonical_atoms,
-        members,
-    }
+        members: members.into_iter().map(Vec::into_boxed_slice).collect(),
+    })
 }
 
 pub(crate) fn run_name_analysis(
@@ -97,7 +110,9 @@ pub(crate) fn run_name_analysis(
         .build()
         .map_err(|err| AnalysisError::InvalidData(err.to_string()))?;
     progress.start_task("loading name atoms", Some(name_atom_total), "rows");
-    let atoms = load_all_name_atoms(conn, chains, &pool, |delta| {
+    let expected_name_atoms = usize::try_from(name_atom_total)
+        .map_err(|_| AnalysisError::InvalidData("name atom row count exceeds usize".into()))?;
+    let mut atoms = load_all_name_atoms(conn, chains, &pool, expected_name_atoms, |delta| {
         progress.advance_task(delta, ProgressCounters::default());
     })?;
     if atoms.len() > u32::MAX as usize {
@@ -107,7 +122,14 @@ pub(crate) fn run_name_analysis(
     }
     progress.finish_task(format!("loaded {} name atoms", atoms.len()));
     progress.step_stage(format!("loaded {} name atoms", atoms.len()));
-    let canonical = canonical_name_values(&atoms);
+    name_analysis_memory_plan(
+        spec.memory_limit,
+        spec.analysis_memory_limit,
+        canonical_name_build_peak_bytes(&atoms)
+            .saturating_add(worker_stack_bytes)
+            .saturating_add(8 * 1024 * 1024),
+    )?;
+    let canonical = canonical_name_values(&mut atoms)?;
     let canonical_name_count = canonical.atoms.len();
     progress.set_message(format!(
         "collapsed {} chain/name atoms to {} canonical names",
@@ -117,16 +139,12 @@ pub(crate) fn run_name_analysis(
     let canonical_members_bytes = canonical
         .members
         .capacity()
-        .saturating_mul(std::mem::size_of::<Vec<usize>>())
+        .saturating_mul(std::mem::size_of::<Box<[u32]>>())
         .saturating_add(
             canonical
                 .members
                 .iter()
-                .map(|members| {
-                    members
-                        .capacity()
-                        .saturating_mul(std::mem::size_of::<usize>())
-                })
+                .map(|members| members.len().saturating_mul(std::mem::size_of::<u32>()))
                 .sum::<usize>(),
         );
     let atoms_by_chain = atoms_by_chain(&atoms, chains.len());
@@ -143,8 +161,7 @@ pub(crate) fn run_name_analysis(
                 })
                 .fold(0usize, usize::saturating_add),
         );
-    let base_atom_bytes = name_atoms_memory_bytes(&atoms)
-        .saturating_add(name_atoms_memory_bytes(&canonical.atoms))
+    let base_atom_bytes = name_atom_sets_memory_bytes(&atoms, &canonical.atoms)
         .saturating_add(canonical_members_bytes)
         .saturating_add(atoms_by_chain_bytes);
     let index_estimate = estimate_name_candidate_index_bytes(&canonical.atoms);
@@ -197,7 +214,7 @@ pub(crate) fn run_name_analysis(
                 progress.advance_task(16_384, ProgressCounters::default());
             }
         })
-    });
+    })?;
     let build_total = (canonical.atoms.len() as u64).saturating_mul(2);
     progress.advance_task(build_total % 16_384, ProgressCounters::default());
     progress.finish_task("name candidate index ready");
@@ -296,8 +313,12 @@ fn estimate_name_atom_load(conn: &Connection) -> Result<(u64, usize), AnalysisEr
     let struct_bytes = rows
         .checked_mul(std::mem::size_of::<NameAtom>() as u64)
         .ok_or_else(|| AnalysisError::InvalidData("name load estimate overflow".into()))?;
+    let string_allocation_headers = rows
+        .checked_mul((2 * std::mem::size_of::<usize>()) as u64)
+        .ok_or_else(|| AnalysisError::InvalidData("name load estimate overflow".into()))?;
     let total = struct_bytes
         .checked_add(string_bytes)
+        .and_then(|bytes| bytes.checked_add(string_allocation_headers))
         .ok_or_else(|| AnalysisError::InvalidData("name load estimate overflow".into()))?;
     let total = usize::try_from(total)
         .map_err(|_| AnalysisError::InvalidData("name load estimate exceeds usize".into()))?;
@@ -313,6 +334,7 @@ pub(crate) fn load_all_name_atoms(
     conn: &Connection,
     chains: &[String],
     pool: &rayon::ThreadPool,
+    expected_rows: usize,
     mut on_rows_loaded: impl FnMut(u64),
 ) -> Result<Vec<NameAtom>, AnalysisError> {
     let chain_indexes = chains
@@ -323,7 +345,7 @@ pub(crate) fn load_all_name_atoms(
     let mut stmt =
         conn.prepare("SELECT chain, name_norm, contract_count, nft_count FROM name_atoms")?;
     let batches = stmt.query_arrow([])?;
-    let mut atoms = Vec::new();
+    let mut atoms = Vec::with_capacity(expected_rows);
     for batch in batches {
         let row_count = batch.num_rows();
         let chains = batch.column(0).as_ref();
@@ -338,36 +360,49 @@ pub(crate) fn load_all_name_atoms(
             .as_any()
             .downcast_ref::<Int64Array>()
             .ok_or_else(|| AnalysisError::InvalidData("name nft_count is not INT64".into()))?;
-        let mut batch_atoms = pool.install(|| {
-            (0..row_count)
-                .into_par_iter()
-                .map(|index| -> Result<Option<NameAtom>, AnalysisError> {
-                    if chains.is_null(index)
-                        || names.is_null(index)
-                        || contract_counts.is_null(index)
-                        || nft_counts.is_null(index)
-                    {
-                        return Err(AnalysisError::InvalidData(
-                            "name atom row contains NULL".into(),
-                        ));
-                    }
-                    let chain = name_arrow_string(chains, index)?;
-                    let Some(chain_index) = chain_indexes.get(chain).copied() else {
-                        return Ok(None);
-                    };
-                    let name = name_arrow_string(names, index)?;
-                    Ok(Some(NameAtom {
-                        chain_index,
-                        name_norm: name.to_owned(),
-                        char_len: name.chars().count(),
-                        contract_count: contract_counts.value(index),
-                        nft_count: nft_counts.value(index),
-                    }))
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })?;
-        atoms.extend(batch_atoms.drain(..).flatten());
-        on_rows_loaded(row_count as u64);
+        for chunk_start in (0..row_count).step_by(NAME_ATOM_CONVERT_CHUNK) {
+            let chunk_end = chunk_start
+                .saturating_add(NAME_ATOM_CONVERT_CHUNK)
+                .min(row_count);
+            let mut chunk_atoms = pool.install(|| {
+                (chunk_start..chunk_end)
+                    .into_par_iter()
+                    .map(|index| -> Result<NameAtom, AnalysisError> {
+                        if chains.is_null(index)
+                            || names.is_null(index)
+                            || contract_counts.is_null(index)
+                            || nft_counts.is_null(index)
+                        {
+                            return Err(AnalysisError::InvalidData(
+                                "name atom row contains NULL".into(),
+                            ));
+                        }
+                        let chain = name_arrow_string(chains, index)?;
+                        let chain_index = chain_indexes.get(chain).copied().ok_or_else(|| {
+                            AnalysisError::InvalidData(format!(
+                                "name atom references unselected chain {chain:?}"
+                            ))
+                        })?;
+                        let name = name_arrow_string(names, index)?;
+                        Ok(NameAtom {
+                            chain_index,
+                            name_norm: std::sync::Arc::from(name),
+                            char_len: name.chars().count(),
+                            contract_count: contract_counts.value(index),
+                            nft_count: nft_counts.value(index),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })?;
+            atoms.append(&mut chunk_atoms);
+            on_rows_loaded((chunk_end - chunk_start) as u64);
+        }
+    }
+    if atoms.len() != expected_rows {
+        return Err(AnalysisError::InvalidData(format!(
+            "name atom row count changed while loading: expected={expected_rows}, loaded={}",
+            atoms.len()
+        )));
     }
     pool.install(|| {
         atoms.par_sort_unstable_by(|left, right| {
@@ -508,7 +543,42 @@ pub(crate) fn name_atoms_memory_bytes(atoms: &Vec<NameAtom>) -> usize {
         .saturating_mul(std::mem::size_of::<NameAtom>());
     let string_bytes = atoms
         .iter()
-        .map(|atom| atom.name_norm.capacity().max(atom.name_norm.len()))
+        .map(|atom| {
+            atom.name_norm
+                .len()
+                .saturating_add(2 * std::mem::size_of::<usize>())
+        })
         .sum::<usize>();
     struct_bytes.saturating_add(string_bytes)
+}
+
+pub(crate) fn canonical_name_build_peak_bytes(atoms: &Vec<NameAtom>) -> usize {
+    let atom_count = atoms.len();
+    let growth_capacity = atom_count.saturating_mul(2);
+    name_atoms_memory_bytes(atoms).saturating_add(
+        growth_capacity
+            .saturating_mul(std::mem::size_of::<NameAtom>())
+            .saturating_add(growth_capacity.saturating_mul(std::mem::size_of::<Vec<usize>>()))
+            .saturating_add(growth_capacity.saturating_mul(std::mem::size_of::<u32>()))
+            .saturating_add(atom_count.saturating_mul(64)),
+    )
+}
+
+pub(crate) fn name_atom_sets_memory_bytes(
+    original: &Vec<NameAtom>,
+    canonical: &Vec<NameAtom>,
+) -> usize {
+    let structural = original
+        .capacity()
+        .saturating_add(canonical.capacity())
+        .saturating_mul(std::mem::size_of::<NameAtom>());
+    let shared_name_allocations = canonical
+        .iter()
+        .map(|atom| {
+            atom.name_norm
+                .len()
+                .saturating_add(2 * std::mem::size_of::<usize>())
+        })
+        .sum::<usize>();
+    structural.saturating_add(shared_name_allocations)
 }

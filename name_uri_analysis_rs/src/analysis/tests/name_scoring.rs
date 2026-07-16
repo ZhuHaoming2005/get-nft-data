@@ -52,9 +52,15 @@ fn name_candidate_index_memory_includes_vector_headers() {
     let candidate_index = NameCandidateIndex::new(&atoms);
     let minimum_structural_bytes = candidate_index.documents.capacity()
         * std::mem::size_of::<IndexedNameDocument>()
-        + candidate_index.postings.capacity() * std::mem::size_of::<Vec<NameAtomIndex>>();
+        + candidate_index.postings.capacity() * std::mem::size_of::<Box<[NameAtomIndex]>>();
 
     assert!(candidate_index.memory_bytes() >= minimum_structural_bytes);
+    assert!(
+        std::mem::size_of::<IndexedNameDocument>() < 2 * std::mem::size_of::<Vec<NameTokenId>>()
+    );
+    assert!(
+        std::mem::size_of::<Box<[NameAtomIndex]>>() < std::mem::size_of::<Vec<NameAtomIndex>>()
+    );
 }
 
 #[test]
@@ -120,7 +126,8 @@ fn name_candidate_index_reports_both_build_passes() {
 
     let index = NameCandidateIndex::new_with_progress(&atoms, || {
         completed.fetch_add(1, Ordering::Relaxed);
-    });
+    })
+    .unwrap();
 
     assert_eq!(index.documents.len(), atoms.len());
     assert_eq!(completed.load(Ordering::Relaxed), 2 * atoms.len() as u64);
@@ -150,11 +157,40 @@ fn name_atom_loader_reports_the_exact_scanned_row_total() {
         .num_threads(2)
         .build()
         .unwrap();
-    let atoms = load_all_name_atoms(&conn, &chains, &pool, |delta| scanned += delta).unwrap();
+    let atoms = load_all_name_atoms(&conn, &chains, &pool, total as usize, |delta| {
+        scanned += delta;
+    })
+    .unwrap();
 
     assert_eq!(total, 3);
     assert_eq!(scanned, total);
     assert_eq!(atoms.len() as u64, total);
+}
+
+#[test]
+fn name_atom_loader_rejects_unselected_chain_rows() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE name_atoms(
+             chain VARCHAR,
+             name_norm VARCHAR,
+             contract_count BIGINT,
+             nft_count BIGINT
+         );
+         INSERT INTO name_atoms VALUES ('polygon', 'alpha', 1, 2);",
+    )
+    .unwrap();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+
+    let error =
+        load_all_name_atoms(&conn, &["ethereum".to_string()], &pool, 1, |_| {}).unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("name atom references unselected chain"));
 }
 
 #[test]
@@ -170,16 +206,18 @@ fn name_atom_memory_counts_reserved_vector_capacity() {
     let mut atoms = Vec::with_capacity(32);
     atoms.push(NameAtom {
         chain_index: 0,
-        name_norm: String::with_capacity(64),
-        char_len: 0,
+        name_norm: "reserved-name".into(),
+        char_len: 13,
         contract_count: 1,
         nft_count: 1,
     });
 
-    let expected =
-        atoms.capacity() * std::mem::size_of::<NameAtom>() + atoms[0].name_norm.capacity();
+    let expected = atoms.capacity() * std::mem::size_of::<NameAtom>()
+        + atoms[0].name_norm.len()
+        + 2 * std::mem::size_of::<usize>();
 
     assert_eq!(name_atoms_memory_bytes(&atoms), expected);
+    assert!(canonical_name_build_peak_bytes(&atoms) > expected);
 }
 
 #[test]
@@ -188,7 +226,7 @@ fn name_candidates_never_escape_the_requested_right_range() {
         .into_iter()
         .map(|name| NameAtom {
             chain_index: 0,
-            name_norm: name.to_string(),
+            name_norm: name.into(),
             char_len: name.chars().count(),
             contract_count: 1,
             nft_count: 1,
@@ -396,7 +434,7 @@ fn name_candidate_index_preserves_brute_force_threshold_hits() {
     .enumerate()
     .map(|(chain_index, name)| NameAtom {
         chain_index: chain_index % 2,
-        name_norm: name.to_string(),
+        name_norm: name.into(),
         char_len: name.chars().count(),
         contract_count: 1,
         nft_count: 1,
@@ -454,7 +492,7 @@ fn name_candidate_index_preserves_brute_force_hits_below_winkler_boost() {
     .enumerate()
     .map(|(chain_index, name)| NameAtom {
         chain_index: chain_index % 2,
-        name_norm: name.to_string(),
+        name_norm: name.into(),
         char_len: name.chars().count(),
         contract_count: 1,
         nft_count: 1,
@@ -508,7 +546,7 @@ fn name_candidate_index_matches_brute_force_on_random_atoms() {
                     .collect();
                 NameAtom {
                     chain_index: (xorshift(&mut state) % 2) as usize,
-                    name_norm: name.clone(),
+                    name_norm: name.clone().into(),
                     char_len: name.chars().count(),
                     contract_count: 1,
                     nft_count: 1,
@@ -551,7 +589,7 @@ fn name_candidate_index_matches_brute_force_on_random_atoms() {
                 "left={left}, threshold={threshold}, atoms={:?}",
                 atoms
                     .iter()
-                    .map(|atom| atom.name_norm.as_str())
+                    .map(|atom| atom.name_norm.as_ref())
                     .collect::<Vec<_>>()
             );
         }
@@ -560,7 +598,7 @@ fn name_candidate_index_matches_brute_force_on_random_atoms() {
 
 #[test]
 fn canonical_name_values_collapse_identical_names_across_chains() {
-    let atoms = vec![
+    let mut atoms = vec![
         NameAtom {
             chain_index: 0,
             name_norm: "azuki".into(),
@@ -584,19 +622,32 @@ fn canonical_name_values_collapse_identical_names_across_chains() {
         },
     ];
 
-    let canonical = canonical_name_values(&atoms);
+    let canonical = canonical_name_values(&mut atoms).unwrap();
 
     assert_eq!(canonical.atoms.len(), 2);
-    assert_eq!(canonical.members, vec![vec![0, 1], vec![2]]);
+    assert_eq!(canonical.members[0].as_ref(), &[0, 1]);
+    assert_eq!(canonical.members[1].as_ref(), &[2]);
     assert_eq!(canonical.atoms[0].chain_index, 0);
-    assert_eq!(canonical.atoms[0].name_norm, "azuki");
+    assert_eq!(canonical.atoms[0].name_norm.as_ref(), "azuki");
     assert_eq!(canonical.atoms[0].contract_count, 5);
     assert_eq!(canonical.atoms[0].nft_count, 50);
+    assert!(std::sync::Arc::ptr_eq(
+        &atoms[0].name_norm,
+        &atoms[1].name_norm
+    ));
+    assert!(std::sync::Arc::ptr_eq(
+        &atoms[0].name_norm,
+        &canonical.atoms[0].name_norm
+    ));
+    assert!(
+        name_atom_sets_memory_bytes(&atoms, &canonical.atoms)
+            < name_atoms_memory_bytes(&atoms) + name_atoms_memory_bytes(&canonical.atoms)
+    );
 }
 
 #[test]
 fn canonical_name_scoring_expands_matches_to_original_atoms() {
-    let atoms = vec![
+    let mut atoms = vec![
         NameAtom {
             chain_index: 0,
             name_norm: "azuki".into(),
@@ -619,7 +670,7 @@ fn canonical_name_scoring_expands_matches_to_original_atoms() {
             nft_count: 1,
         },
     ];
-    let canonical = canonical_name_values(&atoms);
+    let canonical = canonical_name_values(&mut atoms).unwrap();
     let index = NameCandidateIndex::new(&canonical.atoms);
     let mut states = [ThresholdUnionState {
         threshold: 80.0,
@@ -661,7 +712,7 @@ fn canonical_name_scoring_expands_matches_to_original_atoms() {
 
 #[test]
 fn canonical_name_progress_and_stats_include_unmatched_candidates() {
-    let atoms = vec![
+    let mut atoms = vec![
         NameAtom {
             chain_index: 0,
             name_norm: "abcd".into(),
@@ -677,7 +728,7 @@ fn canonical_name_progress_and_stats_include_unmatched_candidates() {
             nft_count: 1,
         },
     ];
-    let canonical = canonical_name_values(&atoms);
+    let canonical = canonical_name_values(&mut atoms).unwrap();
     let index = NameCandidateIndex::new(&canonical.atoms);
     let mut state = ThresholdUnionState {
         threshold: 95.0,
@@ -729,7 +780,7 @@ fn name_candidate_scratch_dense_and_sparse_backends_agree() {
     .enumerate()
     .map(|(chain_index, name)| NameAtom {
         chain_index: chain_index % 2,
-        name_norm: name.to_string(),
+        name_norm: name.into(),
         char_len: name.chars().count(),
         contract_count: 1,
         nft_count: 1,
