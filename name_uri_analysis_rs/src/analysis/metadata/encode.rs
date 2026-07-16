@@ -17,14 +17,14 @@ use duckdb::arrow::array::{
 use duckdb::arrow::record_batch::RecordBatch;
 use duckdb::Connection;
 use metadata_engine::blocking::{
-    build_base_equivalent_atom_sketches_from_soa_parallel,
+    blocking_artifact_upper_bound, build_base_equivalent_atom_sketches_from_soa_parallel,
     compile_base_equivalent_parallel_with_progress, AtomSketch, BlockingCompileConfig,
     BLOCKING_REVISION, DEFAULT_MAX_ROUTING_BLOCK_MEMBERS,
 };
 #[cfg(test)]
 use metadata_engine::encode::PayloadArena;
 use metadata_engine::encode::{
-    metadata_has_prefilter_tokens, parse_metadata_documents,
+    encode_artifact_upper_bound_soa, metadata_has_prefilter_tokens, parse_metadata_documents,
     write_encode_artifacts_soa_with_progress, EncodeContractRow, EncodeContractSoA,
     EncodePayloadRow, EncodeSourceRow, EncodeSourceSoA, FallbackAtomCsr, ParsedMetadataDocuments,
     PayloadRef, PayloadTermListBatch, PayloadTermLists, PayloadTermSoA, ShardedPayloadArena,
@@ -179,8 +179,6 @@ struct EncodeMetrics {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct EncodeAdmissionEstimate {
-    pub(super) final_bytes: u64,
-    pub(super) provisional_feature_bytes: u64,
     pub(super) resident_peak_bytes: u64,
     pub(super) partial_peak_bytes: u64,
     pub(super) token_relation_peak_bytes: u64,
@@ -364,14 +362,6 @@ pub(crate) fn run_metadata_encode(
             })?;
         let mut resident_admission =
             EncodeResidentAdmission::new(encode_memory_lease, estimate.resident_peak_bytes);
-        let storage_reservation = broker
-            .reserve(
-                ArtifactClass::Feature,
-                estimate.provisional_feature_bytes,
-                estimate.partial_peak_bytes,
-            )
-            .map_err(storage_err)?;
-
         let encode_started = Instant::now();
         let (sources, payloads, contracts, atoms, fallback_atoms, chain_totals) =
             stream_encode_inputs_with_admission(
@@ -384,13 +374,16 @@ pub(crate) fn run_metadata_encode(
                 estimate,
                 |event| progress.observe_engine_event(event),
             )?;
-        // The in-memory token relation is released before feature persistence.
-        // Replace the provisional storage reservation for the final arrays.
-        drop(storage_reservation);
-        let storage_reservation = broker
+        // Input streaming does not write Encode artifacts. Admit physical space
+        // only after the frozen SoA cardinalities are known; raw JSON bytes are
+        // not a durable-size proxy for the fixed-width Match representation.
+        let admitted_feature_bytes =
+            encode_artifact_upper_bound_soa(&sources, &payloads, &contracts, &fallback_atoms)
+                .map_err(encode_err)?;
+        let feature_storage_reservation = broker
             .reserve(
                 ArtifactClass::Feature,
-                estimate.final_bytes,
+                admitted_feature_bytes,
                 estimate.partial_peak_bytes,
             )
             .map_err(storage_err)?;
@@ -451,6 +444,10 @@ pub(crate) fn run_metadata_encode(
                 )
             })
             .map_err(encode_err)?;
+        // Completed staging files are now reflected in physical free space.
+        // Releasing the future-allocation lease avoids counting them twice
+        // while admitting the independently written blocking bundle.
+        drop(feature_storage_reservation);
         resident_admission.commit(frozen_resident_bytes)?;
         let encode_wall_millis = millis_since(encode_started);
         progress.step_stage(format!(
@@ -464,6 +461,15 @@ pub(crate) fn run_metadata_encode(
         let config = BlockingCompileConfig {
             max_routing_block_members: DEFAULT_MAX_ROUTING_BLOCK_MEMBERS,
         };
+        let admitted_blocking_bytes =
+            blocking_artifact_upper_bound(&atoms).map_err(blocking_err)?;
+        let blocking_storage_reservation = broker
+            .reserve(
+                ArtifactClass::Blocking,
+                admitted_blocking_bytes,
+                estimate.partial_peak_bytes,
+            )
+            .map_err(storage_err)?;
         let blocking_bundle = compile_base_equivalent_parallel_with_progress(
             &atoms,
             &config,
@@ -472,6 +478,7 @@ pub(crate) fn run_metadata_encode(
             |event| progress.observe_engine_event(event),
         )
         .map_err(blocking_err)?;
+        drop(blocking_storage_reservation);
         let blocking_wall_millis = millis_since(blocking_started);
         progress.step_stage(format!(
             "compiled BaseEquivalent blocking for {} atoms",
@@ -552,8 +559,6 @@ pub(crate) fn run_metadata_encode(
             WorkUnit::Items,
             EngineCounters::default(),
         ));
-        drop(storage_reservation);
-
         let blocking_root = blocking_dir.canonicalize()?;
         let mut registrations = Vec::new();
         let mut registered = Vec::new();
@@ -608,7 +613,8 @@ pub(crate) fn run_metadata_encode(
                     .sum(),
                 fallback_membership_count: fallback_atoms.members.len() as u64,
                 admitted_resident_peak_bytes: resident_admission.peak_bytes(),
-                admitted_final_bytes: estimate.final_bytes,
+                admitted_final_bytes: admitted_feature_bytes
+                    .saturating_add(admitted_blocking_bytes),
                 admitted_partial_peak_bytes: estimate.partial_peak_bytes,
             };
             let metrics_dir = work_directory.join("metrics");
@@ -2921,7 +2927,7 @@ pub(super) fn estimate_encode_storage_bytes(
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     let (token_rows, token_json_bytes) = token_source_relation_dimensions(conn)?;
-    let final_bytes = raw_bytes
+    let conservative_resident_floor = raw_bytes
         .checked_mul(16)
         .and_then(|bytes| bytes.checked_add(source_rows.checked_mul(2_048)?))
         .and_then(|bytes| bytes.checked_add(token_rows.checked_mul(32)?))
@@ -2942,12 +2948,9 @@ pub(super) fn estimate_encode_storage_bytes(
     // durable envelope as the global resident admission floor; this avoids a
     // second JSON preflight while covering high-cardinality payload/term maps.
     let resident_peak_bytes = modeled_resident_peak
-        .max(final_bytes)
+        .max(conservative_resident_floor)
         .max(token_relation_peak_bytes);
-    let provisional_feature_bytes = final_bytes;
     Ok(EncodeAdmissionEstimate {
-        final_bytes,
-        provisional_feature_bytes,
         resident_peak_bytes,
         partial_peak_bytes,
         token_relation_peak_bytes,

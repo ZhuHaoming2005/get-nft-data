@@ -68,7 +68,8 @@ Controller 固定执行五个阶段：
    投影流并在内存中拆分，不物化宽中间表；
 2. `MetadataEncode`：流式选择首个可用的 token-specific/fallback source，在 Rust 内存中建立
    source dictionary、membership 和 payload arena，写不可变 feature、atom、token membership
-   与 blocking artifact；不创建 Encode 临时关系表或持久 payload CAS；
+   与 blocking artifact；不创建 Encode 临时关系表或持久 payload CAS。物理空间在冻结 SoA/CSR
+   基数后分别为 feature 和 blocking 准入，不再用原始 JSON 字节乘数预留虚假的数百 GiB；
 3. `Name`：加载 canonical name 节点并执行并行 Jaro-Winkler；
 4. `MetadataMatch`：只读 metadata snapshot，在内存中完成 catalog、证据型 ExactIsland、并行候选
    评分、scope forest 收集与流式归约；CLI 使用 `MatchPersistence::Ephemeral`，不写
@@ -121,11 +122,13 @@ subphase、`completed/total`、工作单位和诊断计数，CLI 只负责渲染
   65,536 pair visits 的 chunk 上报，不会等待整个热 token 或整行 atom universe 扫描完成；
   Reduce 按 edge/root chunk 上报；
 - Rescue seed preparation 为独立 indeterminate phase，按 seed/group membership 增量显示；
-  seed contract 位置只扫描每个相关 token group 一次，不再对每个 seed 线性重扫；匹配结果排序和
-  expansion 统计使用独立 `finalize rescue plan` spinner，不会让 score task 先显示 100%；
+  seed contract 位置只扫描每个相关 token group 一次，不再对每个 seed 线性重扫；单个 seed 的
+  atom/token universe 继续拆为 65,536-pair Rayon tile，因此稀疏 RescuePlan 也能使用完整线程池；
+  匹配结果排序和 expansion 统计使用独立 `finalize rescue plan` spinner，不会让 score task先显示 100%；
 - shared-token scratch planning 按实际 token membership visits 而不是 token group 个数计算
-  `completed/total`；BuildSummary 的节点增量从并行 worker 实时传回。由于 cross-chain summary
-  包含不可观测内部进度的并行排序，该 task 明确保持 indeterminate，不伪造有限 ETA；
+  `completed/total`；BuildSummary 按 scope 一次构造 `(root, chain)` 列并使用并行排序，同时生成
+  全部链统计；链对不再创建 contract-id 拼接副本或为左右链重复全量扫描。节点增量从并行 worker
+  实时传回；排序内部总量不可观测，因此 task 明确保持 indeterminate，不伪造有限 ETA；
 - Metadata Match 的 stage 行使用动态 spinner 显示当前 engine subphase，不显示未知分母的百分比；
   Match 历史 wall time 和
   当前运行的 elapsed subtraction 共用控制器启动时刻，子进程启动、锁交接和 tmpfs 清理不会造成
@@ -151,10 +154,12 @@ subphase、`completed/total`、工作单位和诊断计数，CLI 只负责渲染
   memberships 的并存峰值。批次完成后依据实际 `Vec`/`HashMap` capacity、唯一 payload、
   template/content interner、source/token membership 重新调整 lease。冻结后还会按实际 CSR 维度
   准入 persistence scratch，避免大量小合约和唯一短 payload 绕过全局内存核算，同时不增加一次
-  全量 JSON 预扫描。
+  全量 JSON 预扫描。Encode artifact 的物理空间使用冻结列基数上界；feature 写完即释放未来分配
+  lease，再单独准入 blocking，已写 staging 文件不会被重复计入剩余空间。
 - pair work、catalog jobs、Exact evidence、Rescue lane cache、edge buffer、snapshot/reduce 和
-  artifact overlap 都在分配或执行前 checked admission。Rescue payload cache 每 lane 有固定上限，
-  不会随 payload universe 无界增长；整数溢出、预算耗尽和不完整恢复均 fail closed。
+  artifact overlap 都在分配或执行前 checked admission。Rescue payload cache 每 lane 有固定上限；
+  命中 pair 使用 4,096-pair 分块，每个分块在分配前获取 MemoryLease，最终扁平化期间同时保留来源
+  分块和目标向量的峰值也纳入预算。整数溢出、预算耗尽和不完整恢复均 fail closed。
 - Match 使用实际物理内存探测保留 host headroom；edge 上限由 admitted Match 内存给出，随后按
   contract/scope 的最大 forest 上界自动缩小。Catalog 与 Exact 并行度均由 MemoryBroker 限制。
   hot block 在 catalog 中只保留一个惰性 fanout 描述符；执行时根据抽样 posting expansion 选择一维

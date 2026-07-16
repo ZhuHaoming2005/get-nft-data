@@ -700,6 +700,60 @@ pub fn write_encode_artifacts_soa_with_progress(
     })
 }
 
+/// Conservative physical-space admission for the complete encoded feature bundle.
+///
+/// This uses the frozen column cardinalities rather than raw JSON bytes. The
+/// latter can exceed the fixed-width Match representation by more than an order
+/// of magnitude and must not be used as a durable artifact-size estimate.
+pub fn encode_artifact_upper_bound_soa(
+    sources: &EncodeSourceSoA,
+    payloads: &PayloadTermSoA,
+    contracts: &EncodeContractSoA,
+    fallback_atoms: &FallbackAtomCsr,
+) -> Result<u64, FeatureSoaError> {
+    const FILE_AND_MANIFEST_ALLOWANCE: u64 = 64 * 1024 * 1024;
+    let contract_count = contracts
+        .contract_ids
+        .iter()
+        .chain(&sources.contract_ids)
+        .map(|contract_id| u64::from(*contract_id) + 1)
+        .max()
+        .unwrap_or(0);
+    let token_count = sources
+        .token_ids
+        .iter()
+        .map(|token_id| u64::from(*token_id) + 1)
+        .max()
+        .unwrap_or(0);
+    let memberships = sources.token_ids.len() as u64;
+    let csr_payload_bytes = [
+        (contract_count + 1, 8u64),
+        (memberships, 4),
+        (token_count + 1, 8),
+        (memberships, 4),
+        (memberships, 4),
+    ]
+    .into_iter()
+    .try_fold(0u64, |total, (count, width)| {
+        total
+            .checked_add(
+                count
+                    .checked_mul(width)
+                    .ok_or(FeatureSoaError::LengthOverflow)?,
+            )
+            .ok_or(FeatureSoaError::LengthOverflow)
+    })?;
+    feature_payload_bytes_from_csr_bytes(
+        sources,
+        payloads,
+        contracts,
+        fallback_atoms,
+        csr_payload_bytes,
+    )?
+    .checked_add(FILE_AND_MANIFEST_ALLOWANCE)
+    .ok_or(FeatureSoaError::LengthOverflow)
+}
+
 fn candidate_group_stats(sizes: impl Iterator<Item = u64>) -> (u64, u64) {
     sizes.fold((0u64, 0u64), |(pair_work, maximum), size| {
         (
@@ -715,6 +769,22 @@ fn feature_payload_bytes_soa(
     contracts: &EncodeContractSoA,
     fallback_atoms: &FallbackAtomCsr,
     csr: &BidirectionalCsr,
+) -> Result<u64, FeatureSoaError> {
+    feature_payload_bytes_from_csr_bytes(
+        sources,
+        payloads,
+        contracts,
+        fallback_atoms,
+        checked_csr_payload_bytes(csr)?,
+    )
+}
+
+fn feature_payload_bytes_from_csr_bytes(
+    sources: &EncodeSourceSoA,
+    payloads: &PayloadTermSoA,
+    contracts: &EncodeContractSoA,
+    fallback_atoms: &FallbackAtomCsr,
+    csr_payload_bytes: u64,
 ) -> Result<u64, FeatureSoaError> {
     let template_terms = payloads.template_terms.len() as u64;
     let content_terms = payloads.content_terms.len() as u64;
@@ -747,7 +817,7 @@ fn feature_payload_bytes_soa(
     ];
     columns
         .into_iter()
-        .try_fold(checked_csr_payload_bytes(csr)?, |total, (count, width)| {
+        .try_fold(csr_payload_bytes, |total, (count, width)| {
             total
                 .checked_add(
                     count
@@ -1350,6 +1420,82 @@ impl FeatureView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn directory_bytes(path: &Path) -> u64 {
+        fs::read_dir(path)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    directory_bytes(&path)
+                } else {
+                    fs::metadata(path).unwrap().len()
+                }
+            })
+            .sum()
+    }
+
+    #[test]
+    fn frozen_feature_space_bound_covers_the_persisted_bundle() {
+        let sources = EncodeSourceSoA::from_rows(&[
+            EncodeSourceRow {
+                contract_id: 0,
+                payload_id: 0,
+                retained_token_ids: vec![1, 3],
+            },
+            EncodeSourceRow {
+                contract_id: 1,
+                payload_id: 1,
+                retained_token_ids: vec![3],
+            },
+        ])
+        .unwrap();
+        let payloads = PayloadTermSoA::from_rows(&[
+            EncodePayloadRow {
+                template_terms: vec![(1, 1)],
+                content_terms: vec![(2, 2)],
+            },
+            EncodePayloadRow {
+                template_terms: vec![(3, 1)],
+                content_terms: vec![(4, 1)],
+            },
+        ])
+        .unwrap();
+        let contracts = EncodeContractSoA::from_rows(&[
+            EncodeContractRow {
+                contract_id: 0,
+                chain_id: 0,
+                source_doc_id: 0,
+                payload_id: 0,
+                weight: 1,
+            },
+            EncodeContractRow {
+                contract_id: 1,
+                chain_id: 1,
+                source_doc_id: 1,
+                payload_id: 1,
+                weight: 1,
+            },
+        ]);
+        let mut fallback_atoms = FallbackAtomCsr::from_groups(&[vec![0, 1]]).unwrap();
+        fallback_atoms.atom_payloads = vec![0];
+        let upper =
+            encode_artifact_upper_bound_soa(&sources, &payloads, &contracts, &fallback_atoms)
+                .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+
+        write_encode_artifacts_soa_with_progress(
+            directory.path(),
+            &sources,
+            &payloads,
+            &contracts,
+            &fallback_atoms,
+            |_, _| {},
+        )
+        .unwrap();
+
+        assert!(directory_bytes(directory.path()) <= upper);
+    }
 
     #[test]
     fn flat_prepared_weights_match_row_reference_across_empty_rows_and_chunks() {

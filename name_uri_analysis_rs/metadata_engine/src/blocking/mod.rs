@@ -6,7 +6,8 @@ mod sketch;
 mod stats;
 
 pub use base_equivalent::{
-    compile_base_equivalent, compile_base_equivalent_parallel_with_progress,
+    blocking_artifact_upper_bound, compile_base_equivalent,
+    compile_base_equivalent_parallel_with_progress,
     compile_base_equivalent_with_progress, scoring_owner, AtomSketch, BlockKind, BlockingBundle,
     BlockingCompileConfig, BlockingError, RoutingStatus, ANCHOR_COUNT, BANDS, BAND_BITS,
     JOINT_BAND_FAMILIES,

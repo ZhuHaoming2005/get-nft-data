@@ -35,7 +35,7 @@ use crate::reduce::{
     reduce_components_with_progress, ComponentSnapshotIdentity, Edge, EdgeBudget, EdgeCollector,
     ForestRun,
 };
-use crate::resource::MemoryBroker;
+use crate::resource::{MemoryBroker, MemoryLease};
 use crate::scheduler::{job_routing_pair_work, JobShape, RecallPlan, UniverseBudget, WorkCatalog};
 use crate::snapshot::{MetadataSnapshot, SnapshotError};
 use crate::storage::{ArtifactClass, ArtifactRegistration, EvictionPlan, StorageBroker};
@@ -183,6 +183,7 @@ pub struct MetadataSummaryRow {
     pub group_size_ge_2_count: i64,
     pub group_size_gt_2_count: i64,
 }
+#[cfg(test)]
 #[derive(Default)]
 struct GroupAccumulator {
     total: i64,
@@ -200,20 +201,13 @@ struct SummaryStats {
     group_size_gt_2_count: i64,
 }
 
-struct SummaryRowRequest<'a> {
-    scope: &'a str,
-    primary: usize,
-    secondary: Option<usize>,
-    roots: &'a [u32],
-    require_secondary: bool,
-    contract_ids: &'a [u32],
-}
-
+#[cfg(test)]
 struct DenseSummaryScratch {
     groups: Vec<GroupAccumulator>,
     touched: Vec<u32>,
 }
 
+#[cfg(test)]
 impl DenseSummaryScratch {
     fn new(root_capacity: usize) -> Self {
         Self {
@@ -2309,13 +2303,14 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
                 recovered.accepted_edge_count,
             )
         } else {
-            let rescue_execution_plan = build_rescue_execution_plan(
+            let rescue_execution = build_rescue_execution_plan(
                 &snapshot,
                 &rescue_plan,
                 config.threads,
                 &memory,
                 &mut progress,
             )?;
+            let rescue_execution_plan = &rescue_execution.plan;
             let rescue_pair_visits = rescue_execution_plan.total_visits();
             let collectors = ScopeCollectorBroker::new(
                 node_count,
@@ -2404,13 +2399,13 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
                 .ok_or(crate::resource::MemoryError::Overflow)?;
             append_rescue_edges(
                 &snapshot,
-                &rescue_execution_plan,
+                rescue_execution_plan,
                 &match_pool,
                 &collectors,
                 chain_count,
                 &mut progress,
             )?;
-            drop(rescue_execution_plan);
+            drop(rescue_execution);
             let accepted_edge_count = collectors.accepted_edges();
             let (intra_runs, cross_runs, pair_runs) =
                 collectors.finish_with_progress(&match_pool, &mut progress)?;
@@ -3495,7 +3490,6 @@ fn catalog_atom_score_count() -> u64 {
     CATALOG_ATOM_SCORE_CALLS.with(std::cell::Cell::get)
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
 struct RescueExecutionPlan {
     atom_score_visits: u64,
     contract_expansion_visits: u64,
@@ -3518,10 +3512,85 @@ impl RescueExecutionPlan {
     }
 }
 
+struct AdmittedRescueExecutionPlan {
+    plan: RescueExecutionPlan,
+    _match_memory: MemoryLease,
+}
+
+const RESCUE_MATCH_CHUNK_PAIRS: usize = 4_096;
+const RESCUE_SCORE_TILE: usize = 65_536;
+
+struct RescueMatchChunk {
+    pairs: Vec<(u32, u32)>,
+    _memory: MemoryLease,
+}
+
+impl RescueMatchChunk {
+    fn new(memory: &MemoryBroker) -> Result<Self, PipelineError> {
+        let bytes = (RESCUE_MATCH_CHUNK_PAIRS as u64)
+            .checked_mul(std::mem::size_of::<(u32, u32)>() as u64)
+            .and_then(|value| {
+                value.checked_add(std::mem::size_of::<RescueMatchChunk>() as u64)
+            })
+            .ok_or(crate::resource::MemoryError::Overflow)?;
+        let lease = memory.reserve(bytes)?;
+        Ok(Self {
+            pairs: Vec::with_capacity(RESCUE_MATCH_CHUNK_PAIRS),
+            _memory: lease,
+        })
+    }
+}
+
 enum RescuePlanMessage {
     Work(u64),
-    AtomRow { work: u64, matches: Vec<(u32, u32)> },
-    Shared { work: u64, matches: Vec<(u32, u32)> },
+    AtomMatches(RescueMatchChunk),
+    SharedMatches(RescueMatchChunk),
+    RowDone(u64),
+    Error(PipelineError),
+}
+
+fn record_rescue_match(
+    chunk: &mut Option<RescueMatchChunk>,
+    pair: (u32, u32),
+    memory: &MemoryBroker,
+    sender: &std::sync::mpsc::SyncSender<RescuePlanMessage>,
+    shared: bool,
+) -> Result<(), PipelineError> {
+    if chunk.is_none() {
+        *chunk = Some(RescueMatchChunk::new(memory)?);
+    }
+    let current = chunk.as_mut().expect("rescue match chunk initialized");
+    current.pairs.push(pair);
+    if current.pairs.len() == RESCUE_MATCH_CHUNK_PAIRS {
+        let full = chunk.take().expect("full rescue match chunk");
+        let message = if shared {
+            RescuePlanMessage::SharedMatches(full)
+        } else {
+            RescuePlanMessage::AtomMatches(full)
+        };
+        sender
+            .send(message)
+            .map_err(|_| PipelineError::Parallel("rescue consumer stopped".into()))?;
+    }
+    Ok(())
+}
+
+fn flush_rescue_match_chunk(
+    chunk: &mut Option<RescueMatchChunk>,
+    sender: &std::sync::mpsc::SyncSender<RescuePlanMessage>,
+    shared: bool,
+) -> Result<(), PipelineError> {
+    let Some(chunk) = chunk.take() else {
+        return Ok(());
+    };
+    let message = if shared {
+        RescuePlanMessage::SharedMatches(chunk)
+    } else {
+        RescuePlanMessage::AtomMatches(chunk)
+    };
+    sender
+        .send(message)
+        .map_err(|_| PipelineError::Parallel("rescue consumer stopped".into()))
 }
 
 fn record_rescue_plan_work(
@@ -3547,7 +3616,7 @@ fn build_rescue_execution_plan(
     lanes: usize,
     memory: &MemoryBroker,
     mut progress: impl FnMut(ProgressEvent),
-) -> Result<RescueExecutionPlan, PipelineError> {
+) -> Result<AdmittedRescueExecutionPlan, PipelineError> {
     const PROGRESS_CHUNK: u64 = 65_536;
     let atom_count = snapshot.atom_count() as u32;
     let mut prepare_completed = 0u64;
@@ -3701,44 +3770,88 @@ fn build_rescue_execution_plan(
         .map(|atom| atom_payload(snapshot, atom))
         .collect::<Vec<_>>();
     drop(seeds_by_token);
-    std::thread::scope(|scope| -> Result<RescueExecutionPlan, PipelineError> {
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| -> Result<AdmittedRescueExecutionPlan, PipelineError> {
         let producer_sender = sender.clone();
         let rescue_pool = &pool;
+        let producer_cancelled = &cancelled;
         let producer = scope.spawn(move || {
             rescue_pool.install(|| {
                 rayon::join(
                     || {
                         rescue.pair_atoms.par_iter().for_each(|&left_atom| {
-                            let mut pending_work = 0u64;
-                            let mut matches = Vec::new();
                             let left_payload = atom_payloads[left_atom as usize];
-                            let mut payload_scores = HashMap::<u32, bool>::new();
-                            for right_atom in 0..atom_count {
-                                if left_atom == right_atom
-                                    || (rescue_atom_mask[right_atom as usize]
-                                        && right_atom < left_atom)
+                            let tile_count = (atom_count as usize).div_ceil(RESCUE_SCORE_TILE);
+                            (0..tile_count).into_par_iter().for_each(|tile| {
+                                if producer_cancelled
+                                    .load(std::sync::atomic::Ordering::Acquire)
                                 {
-                                    continue;
+                                    return;
                                 }
-                                let right_payload = atom_payloads[right_atom as usize];
-                                let exact_match = bounded_payload_match(
-                                    &mut payload_scores,
-                                    snapshot.features(),
-                                    left_payload,
-                                    right_payload,
-                                );
-                                if exact_match {
-                                    matches.push((left_atom, right_atom));
+                                let begin = tile.saturating_mul(RESCUE_SCORE_TILE);
+                                let end = begin
+                                    .saturating_add(RESCUE_SCORE_TILE)
+                                    .min(atom_count as usize);
+                                let mut pending_work = 0u64;
+                                let mut matches = None;
+                                let mut payload_scores = HashMap::<u32, bool>::new();
+                                for right_atom in begin as u32..end as u32 {
+                                    if producer_cancelled
+                                        .load(std::sync::atomic::Ordering::Acquire)
+                                    {
+                                        return;
+                                    }
+                                    if left_atom == right_atom
+                                        || (rescue_atom_mask[right_atom as usize]
+                                            && right_atom < left_atom)
+                                    {
+                                        continue;
+                                    }
+                                    let right_payload = atom_payloads[right_atom as usize];
+                                    let exact_match = bounded_payload_match(
+                                        &mut payload_scores,
+                                        snapshot.features(),
+                                        left_payload,
+                                        right_payload,
+                                    );
+                                    if exact_match {
+                                        if let Err(error) = record_rescue_match(
+                                            &mut matches,
+                                            (left_atom, right_atom),
+                                            memory,
+                                            &producer_sender,
+                                            false,
+                                        ) {
+                                            producer_cancelled.store(
+                                                true,
+                                                std::sync::atomic::Ordering::Release,
+                                            );
+                                            let _ = producer_sender
+                                                .send(RescuePlanMessage::Error(error));
+                                            return;
+                                        }
+                                    }
+                                    record_rescue_plan_work(
+                                        &mut pending_work,
+                                        PROGRESS_CHUNK,
+                                        &producer_sender,
+                                    );
                                 }
-                                record_rescue_plan_work(
-                                    &mut pending_work,
-                                    PROGRESS_CHUNK,
+                                if let Err(error) = flush_rescue_match_chunk(
+                                    &mut matches,
                                     &producer_sender,
-                                );
-                            }
-                            let work = take_rescue_plan_work(&mut pending_work);
-                            let _ =
-                                producer_sender.send(RescuePlanMessage::AtomRow { work, matches });
+                                    false,
+                                ) {
+                                    producer_cancelled
+                                        .store(true, std::sync::atomic::Ordering::Release);
+                                    let _ =
+                                        producer_sender.send(RescuePlanMessage::Error(error));
+                                    return;
+                                }
+                                let _ = producer_sender.send(RescuePlanMessage::RowDone(
+                                    take_rescue_plan_work(&mut pending_work),
+                                ));
+                            });
                         });
                     },
                     || {
@@ -3758,35 +3871,75 @@ fn build_rescue_execution_plan(
                             };
                             let seed_payload =
                                 features.source_to_payload[sources[seed_index] as usize];
-                            let mut pending_work = 0u64;
-                            let mut matches = Vec::new();
-                            let mut payload_scores = HashMap::<u32, bool>::new();
-                            for (offset, &contract) in contracts.iter().enumerate() {
-                                if contract == seed.contract_id
-                                    || (seed_positions.contains_key(&contract)
-                                        && contract < seed.contract_id)
-                                {
-                                    continue;
-                                }
-                                let payload = features.source_to_payload[sources[offset] as usize];
-                                let exact_match = bounded_payload_match(
-                                    &mut payload_scores,
-                                    features,
-                                    seed_payload,
-                                    payload,
-                                );
-                                if exact_match {
-                                    matches.push((seed.contract_id, contract));
-                                }
-                                record_rescue_plan_work(
-                                    &mut pending_work,
-                                    PROGRESS_CHUNK,
-                                    &producer_sender,
-                                );
-                            }
-                            let work = take_rescue_plan_work(&mut pending_work);
-                            let _ =
-                                producer_sender.send(RescuePlanMessage::Shared { work, matches });
+                            contracts
+                                .par_chunks(RESCUE_SCORE_TILE)
+                                .zip(sources.par_chunks(RESCUE_SCORE_TILE))
+                                .for_each(|(contracts, sources)| {
+                                    if producer_cancelled
+                                        .load(std::sync::atomic::Ordering::Acquire)
+                                    {
+                                        return;
+                                    }
+                                    let mut pending_work = 0u64;
+                                    let mut matches = None;
+                                    let mut payload_scores = HashMap::<u32, bool>::new();
+                                    for (&contract, &source) in contracts.iter().zip(sources) {
+                                        if producer_cancelled
+                                            .load(std::sync::atomic::Ordering::Acquire)
+                                        {
+                                            return;
+                                        }
+                                        if contract == seed.contract_id
+                                            || (seed_positions.contains_key(&contract)
+                                                && contract < seed.contract_id)
+                                        {
+                                            continue;
+                                        }
+                                        let payload = features.source_to_payload[source as usize];
+                                        let exact_match = bounded_payload_match(
+                                            &mut payload_scores,
+                                            features,
+                                            seed_payload,
+                                            payload,
+                                        );
+                                        if exact_match {
+                                            if let Err(error) = record_rescue_match(
+                                                &mut matches,
+                                                (seed.contract_id, contract),
+                                                memory,
+                                                &producer_sender,
+                                                true,
+                                            ) {
+                                                producer_cancelled.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::Release,
+                                                );
+                                                let _ = producer_sender
+                                                    .send(RescuePlanMessage::Error(error));
+                                                return;
+                                            }
+                                        }
+                                        record_rescue_plan_work(
+                                            &mut pending_work,
+                                            PROGRESS_CHUNK,
+                                            &producer_sender,
+                                        );
+                                    }
+                                    if let Err(error) = flush_rescue_match_chunk(
+                                        &mut matches,
+                                        &producer_sender,
+                                        true,
+                                    ) {
+                                        producer_cancelled
+                                            .store(true, std::sync::atomic::Ordering::Release);
+                                        let _ = producer_sender
+                                            .send(RescuePlanMessage::Error(error));
+                                        return;
+                                    }
+                                    let _ = producer_sender.send(RescuePlanMessage::RowDone(
+                                        take_rescue_plan_work(&mut pending_work),
+                                    ));
+                                });
                         });
                     },
                 );
@@ -3795,20 +3948,31 @@ fn build_rescue_execution_plan(
         drop(sender);
 
         let mut completed = 0u64;
-        let mut matched_atom_pairs = Vec::new();
-        let mut matched_shared_edges = Vec::new();
+        let mut atom_chunks = Vec::<RescueMatchChunk>::new();
+        let mut shared_chunks = Vec::<RescueMatchChunk>::new();
+        let mut matched_atom_count = 0usize;
+        let mut matched_shared_count = 0usize;
+        let mut first_error = None;
         for message in receiver {
             match message {
                 RescuePlanMessage::Work(work) => {
                     completed = completed.saturating_add(work).min(score_visits);
                 }
-                RescuePlanMessage::AtomRow { work, matches } => {
-                    matched_atom_pairs.extend(matches);
+                RescuePlanMessage::AtomMatches(chunk) => {
+                    matched_atom_count = matched_atom_count.saturating_add(chunk.pairs.len());
+                    atom_chunks.push(chunk);
+                }
+                RescuePlanMessage::SharedMatches(chunk) => {
+                    matched_shared_count = matched_shared_count.saturating_add(chunk.pairs.len());
+                    shared_chunks.push(chunk);
+                }
+                RescuePlanMessage::RowDone(work) => {
                     completed = completed.saturating_add(work).min(score_visits);
                 }
-                RescuePlanMessage::Shared { work, matches } => {
-                    matched_shared_edges.extend(matches);
-                    completed = completed.saturating_add(work).min(score_visits);
+                RescuePlanMessage::Error(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
                 }
             }
             progress(ProgressEvent::determinate(
@@ -3818,10 +3982,7 @@ fn build_rescue_execution_plan(
                 WorkUnit::Pairs,
                 ProgressCounters {
                     scored: completed,
-                    matched: matched_atom_pairs
-                        .len()
-                        .saturating_add(matched_shared_edges.len())
-                        as u64,
+                    matched: matched_atom_count.saturating_add(matched_shared_count) as u64,
                     ..ProgressCounters::default()
                 },
             ));
@@ -3829,6 +3990,27 @@ fn build_rescue_execution_plan(
         producer
             .join()
             .map_err(|_| PipelineError::Parallel("rescue planner panicked".into()))?;
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        let total_matches = matched_atom_count
+            .checked_add(matched_shared_count)
+            .ok_or(crate::resource::MemoryError::Overflow)?;
+        // Flattening temporarily overlaps admitted chunks and the final vectors.
+        // Two pair-widths per result conservatively cover Vec capacity slack.
+        let final_match_bytes = (total_matches as u64)
+            .checked_mul(std::mem::size_of::<(u32, u32)>() as u64)
+            .and_then(|bytes| bytes.checked_mul(2))
+            .ok_or(crate::resource::MemoryError::Overflow)?;
+        let match_memory = memory.reserve(final_match_bytes)?;
+        let mut matched_atom_pairs = Vec::with_capacity(matched_atom_count);
+        for chunk in atom_chunks {
+            matched_atom_pairs.extend(chunk.pairs);
+        }
+        let mut matched_shared_edges = Vec::with_capacity(matched_shared_count);
+        for chunk in shared_chunks {
+            matched_shared_edges.extend(chunk.pairs);
+        }
         progress(ProgressEvent::indeterminate(
             ProgressPhase::FinalizeRescuePlan,
             0,
@@ -3901,12 +4083,15 @@ fn build_rescue_execution_plan(
                 ..ProgressCounters::default()
             },
         ));
-        Ok(RescueExecutionPlan {
-            atom_score_visits,
-            contract_expansion_visits,
-            shared_score_visits,
-            matched_atom_pairs,
-            matched_shared_edges,
+        Ok(AdmittedRescueExecutionPlan {
+            plan: RescueExecutionPlan {
+                atom_score_visits,
+                contract_expansion_visits,
+                shared_score_visits,
+                matched_atom_pairs,
+                matched_shared_edges,
+            },
+            _match_memory: match_memory,
         })
     })
 }
@@ -4495,18 +4680,6 @@ fn build_summary_rows_with_progress(
     progress: &mut impl FnMut(ProgressEvent),
 ) -> Vec<MetadataSummaryRow> {
     let mut rows = Vec::new();
-    let features = snapshot.features();
-    let mut contracts_by_chain = vec![Vec::<u32>::new(); chain_count];
-    for (contract, &chain) in features.contract_chain.iter().enumerate() {
-        if let Some(contracts) = contracts_by_chain.get_mut(chain as usize) {
-            contracts.push(contract as u32);
-        }
-    }
-    let cross_work = if chain_count > 1 {
-        snapshot.contract_count() as u64
-    } else {
-        0
-    };
     let mut completed = 0u64;
     progress(ProgressEvent::indeterminate(
         ProgressPhase::BuildSummary,
@@ -4518,44 +4691,32 @@ fn build_summary_rows_with_progress(
     let (sender, receiver) = std::sync::mpsc::sync_channel::<u64>(channel_capacity);
     let (intra_rows, cross_stats) = std::thread::scope(|thread_scope| {
         let producer_sender = sender.clone();
-        let contracts_by_chain = &contracts_by_chain;
         let producer = thread_scope.spawn(move || {
             worker_pool.install(|| {
                 let intra_sender = producer_sender.clone();
                 rayon::join(
                     || {
-                        contracts_by_chain
-                            .par_iter()
-                            .enumerate()
-                            .map(|(chain, contract_ids)| {
-                                let mut scratch =
-                                    DenseSummaryScratch::new(snapshot.contract_count());
-                                summary_for_roots(
-                                    snapshot,
-                                    SummaryRowRequest {
-                                        scope: "intra_chain",
-                                        primary: chain,
-                                        secondary: None,
-                                        roots: &scopes.intra_roots,
-                                        require_secondary: false,
-                                        contract_ids,
-                                    },
-                                    &mut scratch,
-                                    &mut |delta| {
-                                        let _ = intra_sender.send(delta);
-                                    },
-                                )
-                            })
-                            .collect::<Vec<_>>()
+                        summary_stats_by_chain(
+                            snapshot,
+                            &scopes.intra_roots,
+                            chain_count,
+                            false,
+                            &|delta| {
+                                let _ = intra_sender.send(delta);
+                            },
+                        )
                     },
                     || {
                         (chain_count > 1).then(|| {
-                            let stats =
-                                cross_summary_stats(snapshot, &scopes.cross_roots, chain_count);
-                            if cross_work != 0 {
-                                let _ = producer_sender.send(cross_work);
-                            }
-                            stats
+                            summary_stats_by_chain(
+                                snapshot,
+                                &scopes.cross_roots,
+                                chain_count,
+                                true,
+                                &|delta| {
+                                    let _ = producer_sender.send(delta);
+                                },
+                            )
                         })
                     },
                 )
@@ -4574,7 +4735,13 @@ fn build_summary_rows_with_progress(
         producer.join().expect("metadata summary worker panicked")
     });
     for chain in 0..chain_count {
-        rows.push(intra_rows[chain].clone());
+        rows.push(summary_row_from_stats(
+            snapshot,
+            "intra_chain",
+            chain,
+            None,
+            intra_rows[chain],
+        ));
         if let Some(stats) = cross_stats.as_ref() {
             rows.push(summary_row_from_stats(
                 snapshot,
@@ -4588,56 +4755,37 @@ fn build_summary_rows_with_progress(
     let (sender, receiver) = std::sync::mpsc::sync_channel::<u64>(channel_capacity);
     let pair_rows = std::thread::scope(|thread_scope| {
         let producer_sender = sender.clone();
-        let contracts_by_chain = &contracts_by_chain;
         let producer = thread_scope.spawn(move || {
             worker_pool.install(|| {
                 scopes
                     .chain_pair_roots
                     .par_iter()
                     .map(|pair| {
-                        let mut contract_ids = Vec::with_capacity(
-                            contracts_by_chain[pair.left_chain as usize]
-                                .len()
-                                .saturating_add(
-                                    contracts_by_chain[pair.right_chain as usize].len(),
-                                ),
-                        );
-                        contract_ids
-                            .extend_from_slice(&contracts_by_chain[pair.left_chain as usize]);
-                        contract_ids
-                            .extend_from_slice(&contracts_by_chain[pair.right_chain as usize]);
-                        let mut scratch = DenseSummaryScratch::new(snapshot.contract_count());
-                        let left = summary_for_roots(
+                        let stats = summary_stats_for_chain_pair(
                             snapshot,
-                            SummaryRowRequest {
-                                scope: "chain_matrix",
-                                primary: pair.left_chain as usize,
-                                secondary: Some(pair.right_chain as usize),
-                                roots: &pair.roots,
-                                require_secondary: true,
-                                contract_ids: &contract_ids,
-                            },
-                            &mut scratch,
-                            &mut |delta| {
+                            &pair.roots,
+                            pair.left_chain as usize,
+                            pair.right_chain as usize,
+                            &|delta| {
                                 let _ = producer_sender.send(delta);
                             },
                         );
-                        let right = summary_for_roots(
-                            snapshot,
-                            SummaryRowRequest {
-                                scope: "chain_matrix",
-                                primary: pair.right_chain as usize,
-                                secondary: Some(pair.left_chain as usize),
-                                roots: &pair.roots,
-                                require_secondary: true,
-                                contract_ids: &contract_ids,
-                            },
-                            &mut scratch,
-                            &mut |delta| {
-                                let _ = producer_sender.send(delta);
-                            },
-                        );
-                        [left, right]
+                        [
+                            summary_row_from_stats(
+                                snapshot,
+                                "chain_matrix",
+                                pair.left_chain as usize,
+                                Some(pair.right_chain as usize),
+                                stats[0],
+                            ),
+                            summary_row_from_stats(
+                                snapshot,
+                                "chain_matrix",
+                                pair.right_chain as usize,
+                                Some(pair.left_chain as usize),
+                                stats[1],
+                            ),
+                        ]
                     })
                     .collect::<Vec<_>>()
             })
@@ -4662,47 +4810,151 @@ fn build_summary_rows_with_progress(
     rows
 }
 
-fn summary_for_roots(
+#[derive(Clone, Copy)]
+struct SummaryEntry {
+    root: u32,
+    chain: u32,
+    nfts: i64,
+}
+
+fn summary_entries(
     snapshot: &MetadataSnapshot,
-    request: SummaryRowRequest<'_>,
-    scratch: &mut DenseSummaryScratch,
-    on_work: &mut impl FnMut(u64),
-) -> MetadataSummaryRow {
+    roots: &[u32],
+    include_chain: impl Fn(usize) -> bool + Sync,
+    on_work: &(impl Fn(u64) + Sync),
+) -> Vec<SummaryEntry> {
     const PROGRESS_CHUNK: u64 = 65_536;
     let f = snapshot.features();
-    let mut pending_work = 0u64;
-    let contracts = request
-        .contract_ids
-        .iter()
-        .copied()
-        .map(|contract| contract as usize)
-        .filter(|&contract| contract < request.roots.len() && contract < f.contract_chain.len())
-        .map(|contract| {
-            let chain = f.contract_chain[contract] as usize;
-            (
-                contract,
-                chain == request.primary,
-                i64::try_from(f.contract_weight[contract]).unwrap_or(i64::MAX),
-            )
-        })
-        .inspect(|_| {
-            pending_work += 1;
-            if pending_work == PROGRESS_CHUNK {
-                on_work(pending_work);
-                pending_work = 0;
+    roots
+        .par_chunks(PROGRESS_CHUNK as usize)
+        .enumerate()
+        .map(|(chunk_index, chunk)| {
+            let begin = chunk_index.saturating_mul(PROGRESS_CHUNK as usize);
+            let mut entries = Vec::with_capacity(chunk.len());
+            for (offset, &root) in chunk.iter().enumerate() {
+                let contract = begin.saturating_add(offset);
+                let Some(&chain) = f.contract_chain.get(contract) else {
+                    continue;
+                };
+                if include_chain(chain as usize) {
+                    entries.push(SummaryEntry {
+                        root,
+                        chain,
+                        nfts: i64::try_from(f.contract_weight[contract]).unwrap_or(i64::MAX),
+                    });
+                }
             }
-        });
-    let stats = scratch.summarize(request.roots, contracts, request.require_secondary);
-    if pending_work != 0 {
-        on_work(pending_work);
-    }
-    summary_row_from_stats(
+            on_work(chunk.len() as u64);
+            entries
+        })
+        .flatten()
+        .collect()
+}
+
+fn summary_stats_by_chain(
+    snapshot: &MetadataSnapshot,
+    roots: &[u32],
+    chain_count: usize,
+    require_secondary: bool,
+    on_work: &(impl Fn(u64) + Sync),
+) -> Vec<SummaryStats> {
+    let mut entries = summary_entries(snapshot, roots, |_| true, on_work);
+    entries.par_sort_unstable_by_key(|entry| (entry.root, entry.chain));
+    let mut stats = vec![SummaryStats::default(); chain_count];
+    summarize_sorted_entries(&entries, require_secondary, |chain, summary| {
+        if let Some(target) = stats.get_mut(chain) {
+            accumulate_summary(target, summary);
+        }
+    });
+    stats
+}
+
+fn summary_stats_for_chain_pair(
+    snapshot: &MetadataSnapshot,
+    roots: &[u32],
+    left_chain: usize,
+    right_chain: usize,
+    on_work: &(impl Fn(u64) + Sync),
+) -> [SummaryStats; 2] {
+    let mut entries = summary_entries(
         snapshot,
-        request.scope,
-        request.primary,
-        request.secondary,
-        stats,
-    )
+        roots,
+        |chain| chain == left_chain || chain == right_chain,
+        on_work,
+    );
+    entries.par_sort_unstable_by_key(|entry| (entry.root, entry.chain));
+    let mut stats = [SummaryStats::default(), SummaryStats::default()];
+    summarize_sorted_entries(&entries, true, |chain, summary| {
+        if chain == left_chain {
+            accumulate_summary(&mut stats[0], summary);
+        } else if chain == right_chain {
+            accumulate_summary(&mut stats[1], summary);
+        }
+    });
+    stats
+}
+
+fn summarize_sorted_entries(
+    entries: &[SummaryEntry],
+    require_secondary: bool,
+    mut accumulate: impl FnMut(usize, SummaryStats),
+) {
+    let mut begin = 0usize;
+    let mut chain_entries = Vec::<(usize, i64, i64)>::new();
+    while begin < entries.len() {
+        let root = entries[begin].root;
+        let mut end = begin + 1;
+        while end < entries.len() && entries[end].root == root {
+            end += 1;
+        }
+        chain_entries.clear();
+        let mut cursor = begin;
+        while cursor < end {
+            let chain = entries[cursor].chain as usize;
+            let mut count = 0i64;
+            let mut nfts = 0i64;
+            while cursor < end && entries[cursor].chain as usize == chain {
+                count += 1;
+                nfts = nfts.saturating_add(entries[cursor].nfts);
+                cursor += 1;
+            }
+            chain_entries.push((chain, count, nfts));
+        }
+        let global_total = (end - begin) as i64;
+        for &(chain, count, nfts) in &chain_entries {
+            let total = if require_secondary {
+                global_total
+            } else {
+                count
+            };
+            if count != 0
+                && total >= 2
+                && (!require_secondary || chain_entries.len() > 1)
+            {
+                accumulate(
+                    chain,
+                    SummaryStats {
+                        group_count: 1,
+                        duplicate_contract_count: count,
+                        duplicate_nft_count: nfts,
+                        group_size_ge_2_count: 1,
+                        group_size_gt_2_count: i64::from(total > 2),
+                    },
+                );
+            }
+        }
+        begin = end;
+    }
+}
+
+fn accumulate_summary(target: &mut SummaryStats, value: SummaryStats) {
+    target.group_count += value.group_count;
+    target.duplicate_contract_count += value.duplicate_contract_count;
+    target.duplicate_nft_count = target
+        .duplicate_nft_count
+        .saturating_add(value.duplicate_nft_count);
+    target.group_size_ge_2_count += value.group_size_ge_2_count;
+    target.group_size_gt_2_count += value.group_size_gt_2_count;
 }
 
 fn summary_row_from_stats(
@@ -4743,69 +4995,6 @@ fn dense_summary_stats(
     require_secondary: bool,
 ) -> SummaryStats {
     DenseSummaryScratch::new(roots.len()).summarize(roots, contracts, require_secondary)
-}
-
-fn cross_summary_stats(
-    snapshot: &MetadataSnapshot,
-    roots: &[u32],
-    chain_count: usize,
-) -> Vec<SummaryStats> {
-    #[derive(Clone, Copy)]
-    struct Entry {
-        root: u32,
-        chain: u32,
-        nfts: i64,
-    }
-    let features = snapshot.features();
-    let mut entries = roots
-        .iter()
-        .copied()
-        .enumerate()
-        .take(features.contract_chain.len())
-        .map(|(contract, root)| Entry {
-            root,
-            chain: features.contract_chain[contract],
-            nfts: i64::try_from(features.contract_weight[contract]).unwrap_or(i64::MAX),
-        })
-        .collect::<Vec<_>>();
-    entries.par_sort_unstable_by_key(|entry| (entry.root, entry.chain));
-    let mut stats = vec![SummaryStats::default(); chain_count];
-    let mut begin = 0usize;
-    let mut chain_entries = Vec::<(usize, i64, i64)>::new();
-    while begin < entries.len() {
-        let root = entries[begin].root;
-        let mut end = begin + 1;
-        while end < entries.len() && entries[end].root == root {
-            end += 1;
-        }
-        chain_entries.clear();
-        let mut cursor = begin;
-        while cursor < end {
-            let chain = entries[cursor].chain as usize;
-            let mut count = 0i64;
-            let mut nfts = 0i64;
-            while cursor < end && entries[cursor].chain as usize == chain {
-                count += 1;
-                nfts = nfts.saturating_add(entries[cursor].nfts);
-                cursor += 1;
-            }
-            chain_entries.push((chain, count, nfts));
-        }
-        let total = (end - begin) as i64;
-        if total >= 2 && chain_entries.len() > 1 {
-            for &(chain, count, nfts) in &chain_entries {
-                if let Some(summary) = stats.get_mut(chain) {
-                    summary.group_count += 1;
-                    summary.duplicate_contract_count += count;
-                    summary.duplicate_nft_count = summary.duplicate_nft_count.saturating_add(nfts);
-                    summary.group_size_ge_2_count += 1;
-                    summary.group_size_gt_2_count += i64::from(total > 2);
-                }
-            }
-        }
-        begin = end;
-    }
-    stats
 }
 
 pub fn default_output_dir(work: &Path) -> PathBuf {
@@ -5170,6 +5359,55 @@ mod tests {
     }
 
     #[test]
+    fn sorted_scope_summary_matches_dense_chain_pair_semantics() {
+        let roots = [0, 0, 0, 3, 3];
+        let chains = [0usize, 0, 1, 0, 1];
+        let nfts = [10i64, 20, 30, 40, 50];
+        let mut entries = roots
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(contract, root)| SummaryEntry {
+                root,
+                chain: chains[contract] as u32,
+                nfts: nfts[contract],
+            })
+            .collect::<Vec<_>>();
+        entries.sort_unstable_by_key(|entry| (entry.root, entry.chain));
+        let mut sorted = [SummaryStats::default(), SummaryStats::default()];
+        summarize_sorted_entries(&entries, true, |chain, value| {
+            accumulate_summary(&mut sorted[chain], value);
+        });
+
+        for primary in 0..2 {
+            let dense = dense_summary_stats(
+                &roots,
+                (0..roots.len()).map(|contract| {
+                    (contract, chains[contract] == primary, nfts[contract])
+                }),
+                true,
+            );
+            assert_eq!(sorted[primary].group_count, dense.group_count);
+            assert_eq!(
+                sorted[primary].duplicate_contract_count,
+                dense.duplicate_contract_count
+            );
+            assert_eq!(
+                sorted[primary].duplicate_nft_count,
+                dense.duplicate_nft_count
+            );
+            assert_eq!(
+                sorted[primary].group_size_ge_2_count,
+                dense.group_size_ge_2_count
+            );
+            assert_eq!(
+                sorted[primary].group_size_gt_2_count,
+                dense.group_size_gt_2_count
+            );
+        }
+    }
+
+    #[test]
     fn catalog_expansion_counter_excludes_nonmatching_atom_products() {
         let dir = tempfile::tempdir().unwrap();
         let features = dir.path().join("features");
@@ -5337,10 +5575,16 @@ mod tests {
             build_rescue_execution_plan(&snapshot, &rescue, 1, &memory, |event| events.push(event))
                 .unwrap();
         let parallel = build_rescue_execution_plan(&snapshot, &rescue, 4, &memory, |_| {}).unwrap();
-        assert_eq!(serial.shared_score_visits, 2);
-        assert_eq!(serial.total_visits(), 2);
-        assert_eq!(parallel.shared_score_visits, serial.shared_score_visits);
-        assert_eq!(parallel.matched_shared_edges, serial.matched_shared_edges);
+        assert_eq!(serial.plan.shared_score_visits, 2);
+        assert_eq!(serial.plan.total_visits(), 2);
+        assert_eq!(
+            parallel.plan.shared_score_visits,
+            serial.plan.shared_score_visits
+        );
+        assert_eq!(
+            parallel.plan.matched_shared_edges,
+            serial.plan.matched_shared_edges
+        );
         for phase in [
             ProgressPhase::PrepareRescuePairs,
             ProgressPhase::FinalizeRescuePlan,
@@ -5428,10 +5672,11 @@ mod tests {
         let mut events = Vec::new();
 
         let memory = MemoryBroker::new(512 << 30, 448 << 30).unwrap();
-        let plan = build_rescue_execution_plan(&snapshot, &rescue, 1, &memory, |event| {
+        let admitted = build_rescue_execution_plan(&snapshot, &rescue, 1, &memory, |event| {
             events.push(event);
         })
         .unwrap();
+        let plan = &admitted.plan;
 
         assert_eq!(plan.atom_score_visits, 2);
         assert_eq!(plan.matched_atom_pairs, vec![(0, 1), (0, 2)]);
@@ -5471,9 +5716,10 @@ mod tests {
             .into_iter()
             .map(|message| match message {
                 RescuePlanMessage::Work(work) => work,
-                RescuePlanMessage::AtomRow { .. } | RescuePlanMessage::Shared { .. } => {
-                    panic!("unexpected rescue result message")
-                }
+                RescuePlanMessage::AtomMatches(_)
+                | RescuePlanMessage::SharedMatches(_)
+                | RescuePlanMessage::RowDone(_)
+                | RescuePlanMessage::Error(_) => panic!("unexpected rescue result message"),
             })
             .collect::<Vec<_>>();
         assert_eq!(reports, vec![4, 4]);

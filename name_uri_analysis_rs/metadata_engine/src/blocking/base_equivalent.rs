@@ -460,6 +460,49 @@ pub fn compile_base_equivalent_parallel_with_progress(
     Ok(bundle)
 }
 
+/// Conservative physical-space admission for a persisted blocking bundle.
+///
+/// Each atom can enter a fixed number of joint-band and anchor blocks. The
+/// bound covers both CSR directions, per-block descriptors, hot-block plans,
+/// array framing, and manifests without materializing the block universe.
+pub fn blocking_artifact_upper_bound(atoms: &[AtomSketch]) -> Result<u64, BlockingError> {
+    const FILE_AND_MANIFEST_ALLOWANCE: u64 = 64 * 1024 * 1024;
+    const ATOM_FIXED_BYTES: u64 = 32;
+    const BYTES_PER_MEMBERSHIP: u64 = 96;
+    let atom_count = atoms.len() as u64;
+    let memberships = atoms.iter().try_fold(0u64, |total, atom| {
+        let joint = if atom.has_content_terms {
+            JOINT_BAND_FAMILIES as u64
+        } else {
+            0
+        };
+        let template = if atom.has_content_terms && atom.has_template_terms {
+            atom.template_anchors.len().min(ANCHOR_COUNT) as u64
+        } else {
+            0
+        };
+        let content = if atom.has_content_terms {
+            atom.content_anchors.len().min(ANCHOR_COUNT) as u64
+        } else {
+            0
+        };
+        total
+            .checked_add(joint)
+            .and_then(|value| value.checked_add(template))
+            .and_then(|value| value.checked_add(content))
+            .ok_or(BlockingError::WorkOverflow)
+    })?;
+    atom_count
+        .checked_mul(ATOM_FIXED_BYTES)
+        .and_then(|bytes| {
+            memberships
+                .checked_mul(BYTES_PER_MEMBERSHIP)
+                .and_then(|membership_bytes| bytes.checked_add(membership_bytes))
+        })
+        .and_then(|bytes| bytes.checked_add(FILE_AND_MANIFEST_ALLOWANCE))
+        .ok_or(BlockingError::WorkOverflow)
+}
+
 fn build_joint_family(
     atoms: &[AtomSketch],
     proven: &[bool],
@@ -721,6 +764,55 @@ fn persist_bundle(bundle: &BlockingBundle, out_dir: &Path) -> Result<(), Blockin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn directory_bytes(path: &Path) -> u64 {
+        std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    directory_bytes(&path)
+                } else {
+                    std::fs::metadata(path).unwrap().len()
+                }
+            })
+            .sum()
+    }
+
+    #[test]
+    fn blocking_space_bound_covers_the_persisted_bundle() {
+        let atoms = vec![
+            AtomSketch {
+                template_simhash: 1,
+                content_simhash: 2,
+                template_anchors: vec![3, 4],
+                content_anchors: vec![5, 6],
+                has_template_terms: true,
+                has_content_terms: true,
+            },
+            AtomSketch {
+                template_simhash: 1,
+                content_simhash: 2,
+                template_anchors: vec![3],
+                content_anchors: vec![5],
+                has_template_terms: true,
+                has_content_terms: true,
+            },
+        ];
+        let upper = blocking_artifact_upper_bound(&atoms).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+
+        compile_base_equivalent(
+            &atoms,
+            &BlockingCompileConfig {
+                max_routing_block_members: 10,
+            },
+            directory.path(),
+        )
+        .unwrap();
+
+        assert!(directory_bytes(directory.path()) <= upper);
+    }
 
     #[test]
     fn parallel_inverse_block_csr_matches_forward_memberships() {

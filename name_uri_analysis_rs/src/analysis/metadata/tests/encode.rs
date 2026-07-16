@@ -437,15 +437,6 @@ fn encode_admission_freezes_row_totals_for_progress_before_streaming() {
         )
         .unwrap();
     assert!(
-        estimate.final_bytes
-            >= representative_json_bytes * 16
-                + representative_rows * 2_048
-                + token_rows * 32
-                + 64 * 1024 * 1024
-    );
-    assert!(estimate.final_bytes >= estimate.partial_peak_bytes.min(estimate.final_bytes));
-    assert_eq!(estimate.provisional_feature_bytes, estimate.final_bytes);
-    assert!(
         estimate.resident_peak_bytes
             >= representative_json_bytes * 4
                 + representative_rows * 2_048
@@ -455,7 +446,11 @@ fn encode_admission_freezes_row_totals_for_progress_before_streaming() {
         "resident admission must bound compact feature, atom and routing structures"
     );
     assert!(
-        estimate.resident_peak_bytes >= estimate.final_bytes,
+        estimate.resident_peak_bytes
+            >= representative_json_bytes * 16
+                + representative_rows * 2_048
+                + token_rows * 32
+                + 64 * 1024 * 1024,
         "resident admission must include a global unique-payload/interner envelope"
     );
     assert!(
