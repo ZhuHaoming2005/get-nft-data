@@ -97,7 +97,15 @@ fn set_sig_bit(sig: &mut [u8; PAYLOAD_TERM_SIG_BYTES], hash: u32) {
 }
 
 fn signatures_may_overlap(left: &[u8], right: &[u8]) -> bool {
-    left.iter().zip(right.iter()).any(|(a, b)| (*a & *b) != 0)
+    debug_assert_eq!(left.len(), PAYLOAD_TERM_SIG_BYTES);
+    debug_assert_eq!(right.len(), PAYLOAD_TERM_SIG_BYTES);
+    left.chunks_exact(std::mem::size_of::<u64>())
+        .zip(right.chunks_exact(std::mem::size_of::<u64>()))
+        .any(|(left, right)| {
+            let left = u64::from_ne_bytes(left.try_into().expect("signature word"));
+            let right = u64::from_ne_bytes(right.try_into().expect("signature word"));
+            left & right != 0
+        })
 }
 
 /// A directed-rounding-safe upper envelope for the current zero-overlap proof.

@@ -14,7 +14,9 @@ pub use base_equivalent::{
 pub(crate) use local::LocalRoutingPlan;
 pub use local::{for_each_local_base_equivalent_pair, for_each_local_base_equivalent_pair_while};
 pub use sketch::{
-    build_base_equivalent_atom_sketches, build_base_equivalent_atom_sketches_from_soa_parallel,
+    build_base_equivalent_atom_sketches,
+    build_base_equivalent_atom_sketches_from_feature_view_parallel,
+    build_base_equivalent_atom_sketches_from_soa_parallel,
     build_base_equivalent_atom_sketches_parallel, BaseEquivalentAtomInput,
 };
 pub use stats::{BlockStats, HotBlockPlan, HotBlockTile};

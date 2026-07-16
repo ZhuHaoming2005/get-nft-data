@@ -96,3 +96,31 @@ fn effective_threads_never_exceed_visible_cpus() {
     assert_eq!(resolve_worker_threads(usize::MAX), visible);
     assert_eq!(resolve_worker_threads(1), 1);
 }
+
+#[test]
+fn cli_accepts_ephemeral_memory_and_phase_thread_overrides() {
+    let args = Args::try_parse_from([
+        "name_uri_analysis_rs",
+        "--parquet",
+        "input.parquet",
+        "--ephemeral-in-memory",
+        "--prepare-threads",
+        "32",
+        "--metadata-encode-threads",
+        "96",
+        "--name-threads",
+        "64",
+        "--metadata-match-threads",
+        "128",
+        "--duckdb-threads",
+        "96",
+    ])
+    .unwrap();
+
+    assert!(args.ephemeral_in_memory);
+    assert_eq!(args.prepare_threads, Some(32));
+    assert_eq!(args.metadata_encode_threads, Some(96));
+    assert_eq!(args.name_threads, Some(64));
+    assert_eq!(args.metadata_match_threads, Some(128));
+    assert_eq!(args.duckdb_threads, Some(96));
+}

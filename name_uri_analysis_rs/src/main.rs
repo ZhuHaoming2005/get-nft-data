@@ -6,7 +6,7 @@ mod controller_locks;
 mod controller_manifest;
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, ValueEnum};
 use name_uri_analysis_rs::analysis::{
@@ -48,8 +48,6 @@ use duckdb::Connection;
 use name_uri_analysis_rs::analysis::parquet_sql_literal;
 #[cfg(test)]
 use std::io::Read;
-#[cfg(test)]
-use std::path::Path;
 #[cfg(test)]
 use std::thread;
 #[cfg(test)]
@@ -143,12 +141,33 @@ struct Args {
     #[arg(long)]
     work_directory: Option<PathBuf>,
 
+    #[arg(
+        long,
+        help = "Place all intermediate DuckDB and encoded artifacts on Linux tmpfs; only final output is durable"
+    )]
+    ephemeral_in_memory: bool,
+
     #[arg(long, default_value_t = 95.0)]
     name_threshold: f64,
 
     /// Rayon worker ceiling; DuckDB is separately capped at 64 physical-core workers.
     #[arg(long, default_value_t = 128, value_parser = parse_positive_usize)]
     threads: usize,
+
+    #[arg(long, value_parser = parse_positive_usize)]
+    prepare_threads: Option<usize>,
+
+    #[arg(long, value_parser = parse_positive_usize)]
+    metadata_encode_threads: Option<usize>,
+
+    #[arg(long, value_parser = parse_positive_usize)]
+    name_threads: Option<usize>,
+
+    #[arg(long, value_parser = parse_positive_usize)]
+    metadata_match_threads: Option<usize>,
+
+    #[arg(long, value_parser = parse_positive_usize)]
+    duckdb_threads: Option<usize>,
 
     #[arg(
         long,
@@ -195,6 +214,23 @@ struct Args {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    for (key, value) in [
+        ("NAME_URI_ANALYSIS_PREPARE_THREADS", args.prepare_threads),
+        (
+            "NAME_URI_ANALYSIS_METADATA_ENCODE_THREADS",
+            args.metadata_encode_threads,
+        ),
+        ("NAME_URI_ANALYSIS_NAME_THREADS", args.name_threads),
+        (
+            "NAME_URI_ANALYSIS_METADATA_MATCH_THREADS",
+            args.metadata_match_threads,
+        ),
+        ("NAME_URI_ANALYSIS_DUCKDB_THREADS", args.duckdb_threads),
+    ] {
+        if let Some(value) = value {
+            std::env::set_var(key, value.to_string());
+        }
+    }
     if let Some(phase) = args.internal_phase {
         let config = args
             .internal_config
@@ -218,18 +254,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let effective_threads = resolve_worker_threads(args.threads);
 
-    let requested_work_directory = args
-        .work_directory
-        .unwrap_or_else(|| std::env::temp_dir().join("name_uri_analysis_rs_work"));
+    let requested_work_directory = if args.ephemeral_in_memory {
+        if let Some(path) = args.work_directory {
+            path
+        } else if cfg!(target_os = "linux") && Path::new("/dev/shm").is_dir() {
+            PathBuf::from("/dev/shm")
+                .join(format!("name_uri_analysis_rs_work-{}", std::process::id()))
+        } else {
+            return Err("--ephemeral-in-memory requires Linux /dev/shm or an explicit RAM-backed --work-directory".into());
+        }
+    } else {
+        args.work_directory
+            .unwrap_or_else(|| std::env::temp_dir().join("name_uri_analysis_rs_work"))
+    };
     let (work_directory, output_directory) =
         resolve_directory_layout(&requested_work_directory, &args.output_dir)?;
     let _controller_lock = ControllerLock::acquire(&work_directory)?;
     let mut phase_lease = ControllerPhaseLease::acquire(&work_directory)?;
     let inputs = fingerprint_inputs(&args.parquet_inputs)?;
-    warn_for_suboptimal_row_groups(
-        &inputs,
-        duckdb_threads_for_row_group_warning(effective_threads),
-    );
+    let warning_threads = args
+        .duckdb_threads
+        .unwrap_or_else(|| duckdb_threads_for_row_group_warning(effective_threads))
+        .min(effective_threads)
+        .max(1);
+    warn_for_suboptimal_row_groups(&inputs, warning_threads);
     let canonical_inputs = inputs
         .iter()
         .map(|input| input.path.clone())

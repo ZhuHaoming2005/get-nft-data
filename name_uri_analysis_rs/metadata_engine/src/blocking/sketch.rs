@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use rayon::prelude::*;
 
 use super::{AtomSketch, ANCHOR_COUNT};
-use crate::encode::PayloadTermSoA;
+use crate::encode::{FeatureView, PayloadTermSoA};
 
 const HIGH_FREQUENCY_MIN_DOCS: usize = 32;
 const HIGH_FREQUENCY_DIVISOR: usize = 5;
@@ -111,6 +111,37 @@ pub fn build_base_equivalent_atom_sketches_from_soa_parallel(
         );
         combine_dimensions(template, content)
     })
+}
+
+/// Build local routing sketches directly over the immutable mapped feature
+/// view.  This avoids materializing `(term, frequency)` vectors for every
+/// shared-token member; BaseEquivalent only needs term presence.
+pub fn build_base_equivalent_atom_sketches_from_feature_view_parallel(
+    features: &FeatureView,
+    atom_payloads: &[u32],
+) -> Vec<AtomSketch> {
+    let atoms = atom_payloads
+        .iter()
+        .map(|&payload_id| {
+            let payload = payload_id as usize;
+            let template = features.payload_template_offsets[payload] as usize
+                ..features.payload_template_offsets[payload + 1] as usize;
+            let content = features.payload_content_offsets[payload] as usize
+                ..features.payload_content_offsets[payload + 1] as usize;
+            SoaAtomInput {
+                template_terms: &features.payload_template_terms[template],
+                content_terms: &features.payload_content_terms[content],
+            }
+        })
+        .collect::<Vec<_>>();
+    if rayon::current_num_threads() <= 1 {
+        return build_id_sketches_sequential(&atoms);
+    }
+    let (template, content) = rayon::join(
+        || build_id_dimension_parallel(&atoms, |atom| atom.template_terms),
+        || build_id_dimension_parallel(&atoms, |atom| atom.content_terms),
+    );
+    combine_dimensions(template, content)
 }
 
 #[derive(Clone, Copy)]

@@ -1,5 +1,6 @@
 //! Full-universe Pair ExactIsland oracle for frozen sampled left frontiers.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
@@ -10,16 +11,17 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::blocking::{
-    build_base_equivalent_atom_sketches, BaseEquivalentAtomInput, LocalRoutingPlan,
+    build_base_equivalent_atom_sketches_from_feature_view_parallel, LocalRoutingPlan,
 };
+use crate::cascade::{score_pair, PairScoreDecision};
 use crate::format;
 use crate::index::candidate_owner;
 use crate::progress::{ProgressCounters, ProgressEvent, ProgressPhase, WorkUnit};
-use crate::scoring::{content_matches, template_matches};
 use crate::snapshot::MetadataSnapshot;
 
-const EVIDENCE_ARTIFACT_REVISION: u32 = 4;
+const EVIDENCE_ARTIFACT_REVISION: u32 = 5;
 const SHARED_PAIR_TILE_MEMBERS: usize = 512;
+const ADAPTIVE_SHARED_PAIR_SAMPLE: u64 = 4_000_000;
 
 #[derive(Deserialize)]
 struct EvidenceRevision {
@@ -441,8 +443,8 @@ fn shared_evidence_is_consistent(
         .calibration_tokens
         .iter()
         .all(|token| evidence.holdout_tokens.binary_search(token).is_err());
-    let calibration_work = shared_pair_work(snapshot, &evidence.calibration_tokens);
-    let holdout_work = shared_pair_work(snapshot, &evidence.holdout_tokens);
+    let calibration_population = shared_pair_work(snapshot, &evidence.calibration_tokens);
+    let holdout_population = shared_pair_work(snapshot, &evidence.holdout_tokens);
     tokens_are_disjoint
         && evidence
             .calibration_tokens
@@ -452,9 +454,11 @@ fn shared_evidence_is_consistent(
             .holdout_tokens
             .windows(2)
             .all(|pair| pair[0] < pair[1])
-        && calibration_work == Some(evidence.calibration_pair_work)
-        && holdout_work == Some(evidence.holdout_pair_work)
-        && calibration_work.and_then(|work| work.checked_add(evidence.holdout_pair_work))
+        && calibration_population.is_some_and(|work| evidence.calibration_pair_work <= work)
+        && holdout_population.is_some_and(|work| evidence.holdout_pair_work <= work)
+        && evidence
+            .calibration_pair_work
+            .checked_add(evidence.holdout_pair_work)
             == Some(evidence.pair_work)
         && evidence
             .calibration_exact_matches
@@ -613,6 +617,33 @@ pub fn run_shared_token_exact_islands_with_progress(
         budget.max_lefts,
     )?;
 
+    let population_pair_work =
+        calibration
+            .iter()
+            .chain(&holdout)
+            .try_fold(0u64, |total, &token| {
+                let begin = snapshot.features().token_member_offsets[token as usize];
+                let end = snapshot.features().token_member_offsets[token as usize + 1];
+                let members = end - begin;
+                let pairs = members
+                    .checked_mul(members.saturating_sub(1))
+                    .and_then(|value| value.checked_div(2))
+                    .ok_or(ExactIslandError::Budget {
+                        resource: "shared_token_pair_work",
+                        requested: u64::MAX,
+                        limit: budget.max_pair_work,
+                    })?;
+                total.checked_add(pairs).ok_or(ExactIslandError::Budget {
+                    resource: "shared_token_pair_work",
+                    requested: u64::MAX,
+                    limit: budget.max_pair_work,
+                })
+            })?;
+    checked(
+        "shared_token_pair_work",
+        population_pair_work,
+        budget.max_pair_work,
+    )?;
     let total_pair_work = calibration
         .iter()
         .chain(&holdout)
@@ -620,25 +651,15 @@ pub fn run_shared_token_exact_islands_with_progress(
             let begin = snapshot.features().token_member_offsets[token as usize];
             let end = snapshot.features().token_member_offsets[token as usize + 1];
             let members = end - begin;
-            let pairs = members
-                .checked_mul(members.saturating_sub(1))
-                .and_then(|value| value.checked_div(2))
+            let pairs = members.saturating_mul(members.saturating_sub(1)) / 2;
+            total
+                .checked_add(pairs.min(ADAPTIVE_SHARED_PAIR_SAMPLE))
                 .ok_or(ExactIslandError::Budget {
-                    resource: "shared_token_pair_work",
+                    resource: "adaptive_shared_token_pair_work",
                     requested: u64::MAX,
                     limit: budget.max_pair_work,
-                })?;
-            total.checked_add(pairs).ok_or(ExactIslandError::Budget {
-                resource: "shared_token_pair_work",
-                requested: u64::MAX,
-                limit: budget.max_pair_work,
-            })
+                })
         })?;
-    checked(
-        "shared_token_pair_work",
-        total_pair_work,
-        budget.max_pair_work,
-    )?;
     progress(ProgressEvent::determinate(
         ProgressPhase::SharedTokenExactIsland,
         0,
@@ -1062,6 +1083,14 @@ fn scan_shared_token_group(
     let end = features.token_member_offsets[token as usize + 1] as usize;
     let contracts = &features.token_member_contracts[begin..end];
     let sources = &features.token_member_sources[begin..end];
+    let member_payloads = sources
+        .iter()
+        .map(|&source| features.source_to_payload[source as usize])
+        .collect::<Vec<_>>();
+    let mut unique_payloads = member_payloads.clone();
+    unique_payloads.sort_unstable();
+    unique_payloads.dedup();
+    let cache_payload_scores = unique_payloads.len() < member_payloads.len();
     let members = contracts.len() as u64;
     let group_work = members
         .checked_mul(members.saturating_sub(1))
@@ -1076,39 +1105,79 @@ fn scan_shared_token_group(
     let routing = if contracts.len() < 256 {
         None
     } else {
-        let owned = sources
-            .iter()
-            .map(|&source| {
-                let payload = features.source_to_payload[source as usize] as usize;
-                let template = features.payload_template_offsets[payload] as usize
-                    ..features.payload_template_offsets[payload + 1] as usize;
-                let content = features.payload_content_offsets[payload] as usize
-                    ..features.payload_content_offsets[payload + 1] as usize;
-                (
-                    features.payload_template_terms[template.clone()]
-                        .iter()
-                        .copied()
-                        .zip(features.payload_template_freqs[template].iter().copied())
-                        .collect::<Vec<_>>(),
-                    features.payload_content_terms[content.clone()]
-                        .iter()
-                        .copied()
-                        .zip(features.payload_content_freqs[content].iter().copied())
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let inputs = owned
-            .iter()
-            .map(|(template, content)| BaseEquivalentAtomInput {
-                template_terms: template,
-                content_terms: content,
-            })
-            .collect::<Vec<_>>();
-        let sketches = build_base_equivalent_atom_sketches(&inputs);
+        let sketches = build_base_equivalent_atom_sketches_from_feature_view_parallel(
+            features,
+            &member_payloads,
+        );
         let plan = LocalRoutingPlan::build_parallel(&sketches);
         Some((sketches, plan))
     };
+    if group_work > ADAPTIVE_SHARED_PAIR_SAMPLE {
+        let sample_work = ADAPTIVE_SHARED_PAIR_SAMPLE.min(group_work);
+        let start = adaptive_pair_seed(token, 0x9E37_79B9) % group_work;
+        let step = coprime_pair_step(group_work, adaptive_pair_seed(token, 0x85EB_CA6B));
+        let result = (0..sample_work)
+            .into_par_iter()
+            .try_fold(
+                || {
+                    (
+                        SharedTokenGroupScan {
+                            exact_matches: 0,
+                            misses: Vec::new(),
+                        },
+                        HashMap::<u64, bool>::new(),
+                    )
+                },
+                |(mut result, mut payload_scores), sample| {
+                    if shared_miss_budget.cancelled.load(Ordering::Acquire) {
+                        return Ok((result, payload_scores));
+                    }
+                    let ordinal = (u128::from(start)
+                        + u128::from(sample).saturating_mul(u128::from(step)))
+                        % u128::from(group_work);
+                    let (left, right) = triangular_pair(contracts.len(), ordinal as u64);
+                    let left_payload = member_payloads[left];
+                    let right_payload = member_payloads[right];
+                    let key = payload_pair_key(left_payload, right_payload);
+                    let exact_match = *payload_scores.entry(key).or_insert_with(|| {
+                        score_pair(features, left_payload, right_payload)
+                            == PairScoreDecision::ExactMatch
+                    });
+                    if exact_match {
+                        result.exact_matches = result.exact_matches.saturating_add(1);
+                        if routing.as_ref().is_some_and(|(sketches, plan)| {
+                            !plan.routes_pair(sketches, left as u32, right as u32)
+                        }) {
+                            shared_miss_budget.reserve()?;
+                            result.misses.push(SharedTokenExactMiss {
+                                token_id: token,
+                                left_contract: contracts[left],
+                                right_contract: contracts[right],
+                            });
+                        }
+                    }
+                    Ok((result, payload_scores))
+                },
+            )
+            .try_reduce(
+                || {
+                    (
+                        SharedTokenGroupScan {
+                            exact_matches: 0,
+                            misses: Vec::new(),
+                        },
+                        HashMap::new(),
+                    )
+                },
+                |(left, _), (right, _)| Ok((left.merge(right), HashMap::<u64, bool>::new())),
+            )
+            .map(|(result, _)| result);
+        if result.is_err() {
+            shared_miss_budget.cancelled.store(true, Ordering::Release);
+        }
+        report_work(sample_work);
+        return result;
+    }
     let result = shared_token_pair_tiles(contracts.len(), SHARED_PAIR_TILE_MEMBERS)
         .into_par_iter()
         .map(|tile| -> Result<SharedTokenGroupScan, ExactIslandError> {
@@ -1117,6 +1186,7 @@ fn scan_shared_token_group(
                 misses: Vec::new(),
             };
             let mut pending_work = 0u64;
+            let mut payload_scores = HashMap::<u64, bool>::new();
             for left in tile.left_begin..tile.left_end {
                 let right_begin = tile.right_begin.max(left.saturating_add(1));
                 for right in right_begin..tile.right_end {
@@ -1128,11 +1198,19 @@ fn scan_shared_token_group(
                         report_work(pending_work);
                         pending_work = 0;
                     }
-                    let left_payload = features.source_to_payload[sources[left] as usize];
-                    let right_payload = features.source_to_payload[sources[right] as usize];
-                    if template_matches(features, left_payload, right_payload)
-                        && content_matches(features, left_payload, right_payload)
-                    {
+                    let left_payload = member_payloads[left];
+                    let right_payload = member_payloads[right];
+                    let key = payload_pair_key(left_payload, right_payload);
+                    let exact_match = if cache_payload_scores {
+                        *payload_scores.entry(key).or_insert_with(|| {
+                            score_pair(features, left_payload, right_payload)
+                                == PairScoreDecision::ExactMatch
+                        })
+                    } else {
+                        score_pair(features, left_payload, right_payload)
+                            == PairScoreDecision::ExactMatch
+                    };
+                    if exact_match {
                         result.exact_matches = result.exact_matches.saturating_add(1);
                         if routing.as_ref().is_some_and(|(sketches, plan)| {
                             !plan.routes_pair(sketches, left as u32, right as u32)
@@ -1163,6 +1241,60 @@ fn scan_shared_token_group(
         shared_miss_budget.cancelled.store(true, Ordering::Release);
     }
     result
+}
+
+fn adaptive_pair_seed(token: u32, salt: u64) -> u64 {
+    u64::from(token)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(salt)
+}
+
+fn greatest_common_divisor(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
+}
+
+fn coprime_pair_step(modulus: u64, seed: u64) -> u64 {
+    if modulus <= 1 {
+        return 1;
+    }
+    let mut step = (seed % modulus).max(1);
+    while greatest_common_divisor(step, modulus) != 1 {
+        step = step.wrapping_add(1);
+        if step >= modulus {
+            step = 1;
+        }
+    }
+    step
+}
+
+fn triangular_pair(members: usize, ordinal: u64) -> (usize, usize) {
+    let members = members as u64;
+    let prefix = |left: u64| {
+        left.saturating_mul(
+            members
+                .saturating_mul(2)
+                .saturating_sub(left)
+                .saturating_sub(1),
+        ) / 2
+    };
+    let mut low = 0u64;
+    let mut high = members.saturating_sub(1);
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if prefix(middle) <= ordinal {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    let left = low;
+    let right = left + 1 + ordinal.saturating_sub(prefix(left));
+    (left as usize, right as usize)
 }
 
 pub fn run_pair_exact_island(
@@ -1229,6 +1361,9 @@ pub fn run_pair_exact_island_with_progress(
     }
     let (sender, receiver) = std::sync::mpsc::sync_channel(lanes.saturating_mul(4).max(1));
     let pair_miss_budget = InMemoryMissBudget::for_record::<ExactMiss>(budget.max_artifact_bytes);
+    let atom_payloads = (0..snapshot.atom_count() as u32)
+        .map(|atom| atom_payload(snapshot, atom))
+        .collect::<Vec<_>>();
     let mut matches = 0u64;
     let mut clusters = Vec::new();
     let mut misses = Vec::new();
@@ -1239,10 +1374,16 @@ pub fn run_pair_exact_island_with_progress(
         let producer = scope.spawn(move || {
             pool.install(|| {
                 work_lefts.par_iter().for_each(|&left| {
-                    let result =
-                        scan_pair_left(snapshot, work_lefts, left, &pair_miss_budget, |work| {
+                    let result = scan_pair_left(
+                        snapshot,
+                        &atom_payloads,
+                        work_lefts,
+                        left,
+                        &pair_miss_budget,
+                        |work| {
                             let _ = worker_sender.send(ScanMessage::Work(work));
-                        });
+                        },
+                    );
                     let _ = worker_sender.send(ScanMessage::Done { left, result });
                 });
             });
@@ -1403,6 +1544,7 @@ fn sampling_digest(kind: &str, first: &[u32], second: &[u32]) -> String {
 
 fn scan_pair_left(
     snapshot: &MetadataSnapshot,
+    atom_payloads: &[u32],
     sampled_lefts: &[u32],
     left: u32,
     miss_budget: &InMemoryMissBudget,
@@ -1412,11 +1554,18 @@ fn scan_pair_left(
     let mut matches = 0u64;
     let mut misses = Vec::new();
     let mut pending_work = 0u64;
+    let left_payload = atom_payloads[left as usize];
+    let left_contracts = atom_contracts(snapshot, left);
+    let mut sampled_cursor = 0usize;
     for right in 0..snapshot.atom_count() as u32 {
         if miss_budget.cancelled.load(Ordering::Acquire) {
             break;
         }
-        if left == right || (right < left && sampled_lefts.binary_search(&right).is_ok()) {
+        while sampled_cursor < sampled_lefts.len() && sampled_lefts[sampled_cursor] < right {
+            sampled_cursor += 1;
+        }
+        let right_is_sampled = sampled_lefts.get(sampled_cursor).copied() == Some(right);
+        if left == right || (right < left && right_is_sampled) {
             continue;
         }
         pending_work += 1;
@@ -1424,13 +1573,10 @@ fn scan_pair_left(
             report_work(pending_work);
             pending_work = 0;
         }
-        if !has_token_disjoint_contract_pair(snapshot, left, right) {
-            continue;
-        }
-        let left_payload = atom_payload(snapshot, left);
-        let right_payload = atom_payload(snapshot, right);
-        if template_matches(snapshot.features(), left_payload, right_payload)
-            && content_matches(snapshot.features(), left_payload, right_payload)
+        let right_payload = atom_payloads[right as usize];
+        if score_pair(snapshot.features(), left_payload, right_payload)
+            == PairScoreDecision::ExactMatch
+            && has_token_disjoint_contract_pair(snapshot, left_contracts, right)
         {
             matches = matches.saturating_add(1);
             if candidate_owner(snapshot.blocking(), left, right).is_none() {
@@ -1467,12 +1613,20 @@ fn atom_payload(s: &MetadataSnapshot, a: u32) -> u32 {
     let c = f.fallback_atom_contracts[f.fallback_atom_offsets[a as usize] as usize];
     f.contract_payload[c as usize]
 }
-fn has_token_disjoint_contract_pair(s: &MetadataSnapshot, a: u32, b: u32) -> bool {
+fn atom_contracts(s: &MetadataSnapshot, atom: u32) -> &[u32] {
     let f = s.features();
-    let left = &f.fallback_atom_contracts[f.fallback_atom_offsets[a as usize] as usize
-        ..f.fallback_atom_offsets[a as usize + 1] as usize];
-    let right = &f.fallback_atom_contracts[f.fallback_atom_offsets[b as usize] as usize
-        ..f.fallback_atom_offsets[b as usize + 1] as usize];
+    &f.fallback_atom_contracts[f.fallback_atom_offsets[atom as usize] as usize
+        ..f.fallback_atom_offsets[atom as usize + 1] as usize]
+}
+
+fn payload_pair_key(left: u32, right: u32) -> u64 {
+    let (left, right) = (left.min(right), left.max(right));
+    (u64::from(left) << 32) | u64::from(right)
+}
+
+fn has_token_disjoint_contract_pair(s: &MetadataSnapshot, left: &[u32], right_atom: u32) -> bool {
+    let f = s.features();
+    let right = atom_contracts(s, right_atom);
     left.iter().any(|&left_contract| {
         right.iter().any(|&right_contract| {
             !sorted_intersects(
@@ -1498,8 +1652,8 @@ fn sorted_intersects(x: &[u32], y: &[u32]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        pair_evidence_is_consistent, shared_token_pair_tiles, ExactEvidenceCluster,
-        ExactIslandError, ExactMiss, InMemoryMissBudget, PairExactEvidence,
+        coprime_pair_step, pair_evidence_is_consistent, shared_token_pair_tiles, triangular_pair,
+        ExactEvidenceCluster, ExactIslandError, ExactMiss, InMemoryMissBudget, PairExactEvidence,
         SharedTokenExactEvidence, SharedTokenExactMiss, EVIDENCE_ARTIFACT_REVISION,
     };
     use crate::blocking::{AtomSketch, LocalRoutingPlan};
@@ -1575,9 +1729,26 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_pair_permutation_is_deterministic_and_without_replacement() {
+        let members = 10usize;
+        let pair_work = 45u64;
+        let step = coprime_pair_step(pair_work, 17);
+        let start = 11u64;
+        let mut pairs = (0..pair_work)
+            .map(|sample| triangular_pair(members, (start + sample * step) % pair_work))
+            .collect::<Vec<_>>();
+        pairs.sort_unstable();
+        pairs.dedup();
+        assert_eq!(pairs.len() as u64, pair_work);
+        assert!(pairs
+            .iter()
+            .all(|&(left, right)| left < right && right < members));
+    }
+
+    #[test]
     fn shared_evidence_partition_metrics_are_mandatory() {
         let evidence = SharedTokenExactEvidence {
-            artifact_revision: 4,
+            artifact_revision: EVIDENCE_ARTIFACT_REVISION,
             match_semantics_revision: crate::scoring::MATCH_SEMANTICS_REVISION,
             snapshot_fingerprint: "snapshot".into(),
             sampling_policy_digest: "sampling".into(),

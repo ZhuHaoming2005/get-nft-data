@@ -254,40 +254,6 @@ fn prepare_business_fingerprint(database: &Path) -> String {
     format!("{contracts}#{tokens}")
 }
 
-fn semantic_groups_for_scope(
-    work: &Path,
-    database: &Path,
-    scope_directory: &str,
-) -> Vec<Vec<crate::analysis::semantic_oracle::ContractKey>> {
-    use crate::analysis::semantic_oracle::{duplicate_groups_from_roots, ContractKey};
-    use metadata_engine::reduce::ComponentSnapshot;
-
-    let conn = Connection::open(database).unwrap();
-    let mut statement = conn
-        .prepare(
-            "SELECT chain, contract_address
-             FROM analysis_contracts
-             WHERE metadata_contract_index IS NOT NULL
-             ORDER BY metadata_contract_index",
-        )
-        .unwrap();
-    let keys = statement
-        .query_map([], |row| {
-            Ok(ContractKey::new(
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-            ))
-        })
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    let scope_dir = metadata_engine::pipeline::default_output_dir(work)
-        .join("component-snapshots")
-        .join(scope_directory);
-    let roots = ComponentSnapshot::open(&scope_dir, 0).unwrap().roots;
-    duplicate_groups_from_roots(&roots, &keys)
-}
-
 #[test]
 fn prepare_business_identities_are_stable_across_thread_counts() {
     let dir = tempfile::tempdir().unwrap();
@@ -307,9 +273,7 @@ fn prepare_business_identities_are_stable_across_thread_counts() {
 
 #[test]
 fn parallel_encode_match_is_semantically_deterministic_across_thread_counts() {
-    use crate::analysis::semantic_oracle::{
-        groups_semantically_equal, summaries_semantically_equal, ContractKey,
-    };
+    use crate::analysis::semantic_oracle::summaries_semantically_equal;
     use crate::analysis::types::AnalysisReport;
 
     let dir = tempfile::tempdir().unwrap();
@@ -321,7 +285,6 @@ fn parallel_encode_match_is_semantically_deterministic_across_thread_counts() {
     run_analysis_phase(&prepared_options, AnalysisPhase::Prepare, &prepared).unwrap();
 
     let mut summaries = Vec::new();
-    let mut groups = Vec::new();
     for threads in [1, 4] {
         let work = dir.path().join(format!("work-{threads}"));
         fs::create_dir_all(&work).unwrap();
@@ -334,44 +297,18 @@ fn parallel_encode_match_is_semantically_deterministic_across_thread_counts() {
         let report: AnalysisReport =
             serde_json::from_slice(&fs::read(&summary_path).unwrap()).unwrap();
         summaries.push(report.summary_rows);
-        groups.push([
-            semantic_groups_for_scope(&work, &options.database_path, "intra"),
-            semantic_groups_for_scope(&work, &options.database_path, "cross"),
-            semantic_groups_for_scope(&work, &options.database_path, "pair-0-1"),
-        ]);
+        assert!(
+            !metadata_engine::pipeline::default_output_dir(&work)
+                .join("component-snapshots")
+                .exists(),
+            "Ephemeral Match must not persist component roots"
+        );
     }
     assert!(
         summaries_semantically_equal(&summaries[0], &summaries[1]),
         "thread=1 vs thread=4 metadata summaries must match semantically:\n{:#?}\n{:#?}",
         summaries[0],
         summaries[1]
-    );
-    for (scope, (left, right)) in groups[0].iter().zip(&groups[1]).enumerate() {
-        assert!(
-            groups_semantically_equal(left.clone(), right.clone()),
-            "thread=1 vs thread=4 duplicate groups differ for scope index {scope}"
-        );
-    }
-    assert_eq!(
-        groups[0][0],
-        vec![vec![
-            ContractKey::new("ethereum", "0xaaa"),
-            ContractKey::new("ethereum", "0xbbb"),
-        ]],
-        "intra-chain groups must preserve the business-key golden"
-    );
-    let expected_cross = vec![vec![
-        ContractKey::new("base", "0xccc"),
-        ContractKey::new("ethereum", "0xaaa"),
-        ContractKey::new("ethereum", "0xbbb"),
-    ]];
-    assert_eq!(
-        groups[0][1], expected_cross,
-        "cross-chain groups must preserve the business-key golden"
-    );
-    assert_eq!(
-        groups[0][2], expected_cross,
-        "chain-pair groups must preserve the business-key golden"
     );
 }
 
@@ -934,9 +871,12 @@ fn match_uses_encode_artifacts_and_releases_payload_dependency() {
     // Re-run Match alone on a fresh partial copy path: summary stays Match-owned.
     let summary_hash = file_sha256(&summary);
     assert_ne!(summary_hash, [0u8; 32]);
-    assert!(work
+    assert!(!work
         .join("artifacts/metadata/match-1/metadata-summary-1/metadata-summary.ready")
-        .is_file());
+        .exists());
+    assert!(!work
+        .join("artifacts/metadata/match-1/component-snapshots")
+        .exists());
 
     for artifact in phase_ready["artifacts"].as_array().unwrap() {
         assert!(

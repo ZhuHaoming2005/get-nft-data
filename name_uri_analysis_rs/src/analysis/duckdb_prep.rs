@@ -74,7 +74,12 @@ pub(crate) fn configure_duckdb(
         SET parquet_metadata_cache=true;
         ",
     )?;
-    let duckdb_threads = options.threads.clamp(1, DUCKDB_THREAD_CAP);
+    let duckdb_threads = std::env::var("NAME_URI_ANALYSIS_DUCKDB_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or_else(|| options.threads.clamp(1, DUCKDB_THREAD_CAP))
+        .min(options.threads.max(1));
     conn.execute(&format!("PRAGMA threads={duckdb_threads}"), [])?;
     let memory_limit = resolve_duckdb_memory_limit(&options.duckdb_memory_limit)?;
     conn.execute(

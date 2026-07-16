@@ -3,14 +3,14 @@
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
 
 use crate::blocking::{
-    build_base_equivalent_atom_sketches, BaseEquivalentAtomInput, LocalRoutingPlan,
+    build_base_equivalent_atom_sketches_from_feature_view_parallel, LocalRoutingPlan,
 };
 use crate::cascade::{score_pair, PairScoreDecision};
 use crate::evidence::{
@@ -43,6 +43,12 @@ use crate::storage::{ArtifactClass, ArtifactRegistration, EvictionPlan, StorageB
 pub const DEFAULT_MAX_CANDIDATE_PAIR_VISITS: u64 = 200_000_000_000;
 pub const DEFAULT_EXACT_SAMPLE_LEFTS: u64 = 1_024;
 pub const DEFAULT_EXACT_PAIR_WORK: u64 = 20_000_000_000;
+
+// Exact evidence is a resident statistical data set, not a connectivity
+// forest.  Keep its admission independent from `edge_bytes`: tying the two
+// together made small contract forests impose only a few MiB on evidence even
+// when hundreds of GiB were available to Match.
+const MAX_EVIDENCE_RESIDENT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 const CONNECTIVITY_RUN_REVISION: u32 = 4;
 
@@ -1715,8 +1721,28 @@ pub fn run_metadata_pipeline(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchPersistence {
+    /// Return production summaries without committing engine-private recovery
+    /// artifacts. The caller may still publish its compact final output.
+    Ephemeral,
     MemoryFirst,
     Durable,
+}
+
+pub fn run_metadata_pipeline_ephemeral_with_progress(
+    features: &Path,
+    blocking: &Path,
+    out: &Path,
+    config: &MetadataPipelineConfig,
+    progress: impl FnMut(ProgressEvent),
+) -> Result<MetadataPipelineResult, PipelineError> {
+    run_metadata_pipeline_with_progress_and_persistence(
+        features,
+        blocking,
+        out,
+        config,
+        MatchPersistence::Ephemeral,
+        progress,
+    )
 }
 
 pub fn run_metadata_pipeline_durable(
@@ -1846,17 +1872,20 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
     let mut storage = StorageBroker::open(&config.storage_work_directory)?;
     storage.retire_checkpoint_artifacts("metadata_complete", "superseded metadata checkpoint")?;
     std::fs::create_dir_all(out)?;
-    if persistence == MatchPersistence::MemoryFirst {
+    if persistence != MatchPersistence::Durable {
         clear_prior_match_artifacts_for_memory_first(&mut storage, out)?;
     }
-    let mut storage_leases = vec![
-        storage.reserve(
-            ArtifactClass::ComponentSnapshot,
-            component_artifact_bytes,
-            component_partial_peak_bytes,
-        )?,
-        storage.reserve(ArtifactClass::Summary, 16 << 20, 16 << 20)?,
-    ];
+    let mut storage_leases = Vec::new();
+    if persistence != MatchPersistence::Ephemeral {
+        storage_leases.extend([
+            storage.reserve(
+                ArtifactClass::ComponentSnapshot,
+                component_artifact_bytes,
+                component_partial_peak_bytes,
+            )?,
+            storage.reserve(ArtifactClass::Summary, 16 << 20, 16 << 20)?,
+        ]);
+    }
     if persistence == MatchPersistence::Durable {
         storage_leases.extend([
             storage.reserve(
@@ -1937,6 +1966,30 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
         config.exact_sample_lefts,
         config.exact_pair_work,
     )?;
+    let evidence_resident_target =
+        (config.memory_hard_top / 32).clamp(1, MAX_EVIDENCE_RESIDENT_BYTES);
+    let evidence_partition_floor = if persistence == MatchPersistence::Durable {
+        64 * 1024
+    } else {
+        1
+    };
+    let evidence_partition_bytes = (evidence_resident_target / 3)
+        .max(evidence_partition_floor)
+        .min(
+            config
+                .exact_pair_work
+                .saturating_mul(16)
+                .max(evidence_partition_floor),
+        );
+    let evidence_resident_bytes = evidence_partition_bytes.saturating_mul(3);
+    // Three retained evidence partitions coexist with per-worker vectors and
+    // shared-token routing scratch.  Reserve the conservative peak for their
+    // full lifetime so later lane admission sees the real resident pressure.
+    let evidence_peak_bytes = evidence_resident_bytes
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(evidence_partition_bytes.saturating_mul(2)))
+        .ok_or(crate::resource::MemoryError::Overflow)?;
+    let _evidence_memory = memory.reserve(evidence_peak_bytes)?;
     let pair_sample_count = exact_plan
         .calibration_lefts
         .saturating_add(exact_plan.holdout_lefts) as usize;
@@ -1968,7 +2021,6 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
         ));
         evidence
     } else {
-        let _exact_memory = memory.reserve(edge_bytes)?;
         run_pair_exact_island_with_progress(
             &snapshot,
             &samples,
@@ -1977,7 +2029,7 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
                 max_pair_work: exact_plan
                     .calibration_lefts
                     .saturating_mul(snapshot.atom_count().saturating_sub(1) as u64),
-                max_artifact_bytes: edge_bytes / 3,
+                max_artifact_bytes: evidence_partition_bytes,
                 max_lanes: config.threads.max(1),
             },
             (persistence == MatchPersistence::Durable).then_some(exact_dir.as_path()),
@@ -2003,7 +2055,6 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
         ));
         evidence
     } else {
-        let _exact_memory = memory.reserve(edge_bytes)?;
         run_pair_exact_island_with_progress(
             &snapshot,
             &holdout_samples,
@@ -2012,7 +2063,7 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
                 max_pair_work: exact_plan
                     .holdout_lefts
                     .saturating_mul(snapshot.atom_count().saturating_sub(1) as u64),
-                max_artifact_bytes: edge_bytes / 3,
+                max_artifact_bytes: evidence_partition_bytes,
                 max_lanes: config.threads.max(1),
             },
             (persistence == MatchPersistence::Durable).then_some(holdout_dir.as_path()),
@@ -2064,7 +2115,6 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
         ));
         evidence
     } else {
-        let _exact_memory = memory.reserve(edge_bytes)?;
         run_shared_token_exact_islands_with_progress(
             &snapshot,
             &shared_plan.calibration_tokens,
@@ -2076,7 +2126,7 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
                     .saturating_add(shared_plan.holdout_tokens.len())
                     as u64,
                 max_pair_work: shared_plan.pair_work,
-                max_artifact_bytes: edge_bytes / 3,
+                max_artifact_bytes: evidence_partition_bytes,
                 max_lanes: config.threads.max(1),
             },
             (persistence == MatchPersistence::Durable).then_some(shared_dir.as_path()),
@@ -2520,11 +2570,15 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
             },
         ));
     }
-    let component_total = scopes
-        .iter()
-        .filter(|scope| scope.needs_rebuild)
-        .count()
-        .saturating_mul(2) as u64;
+    let component_total = if persistence == MatchPersistence::Ephemeral {
+        0
+    } else {
+        scopes
+            .iter()
+            .filter(|scope| scope.needs_rebuild)
+            .count()
+            .saturating_mul(2) as u64
+    };
     progress(ProgressEvent::determinate(
         ProgressPhase::CommitComponents,
         0,
@@ -2532,7 +2586,9 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
         WorkUnit::Files,
         ProgressCounters::default(),
     ));
-    commit_component_scopes_parallel(&scopes, component_total, &worker_pool, &mut progress)?;
+    if persistence != MatchPersistence::Ephemeral {
+        commit_component_scopes_parallel(&scopes, component_total, &worker_pool, &mut progress)?;
+    }
     let mut intra_roots = None;
     let mut cross_roots = None;
     let mut chain_pair_roots = Vec::with_capacity(scopes.len().saturating_sub(2));
@@ -2584,31 +2640,6 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
         summary_rows,
         wall_millis: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
     };
-    let ready = serde_json::json!({
-        "schema_revision": result.schema_revision,
-        "evidence_gate_revision": result.evidence_gate_revision,
-        "snapshot_fingerprint": result.snapshot_fingerprint,
-        "snapshot_atoms": result.snapshot_atoms,
-        "index_metrics": result.index_metrics,
-        "exact_evidence": result.exact_evidence,
-        "pair_holdout_evidence": result.pair_holdout_evidence,
-        "shared_token_exact_evidence": result.shared_token_exact_evidence,
-        "skipped_shared_token_evidence_groups": result.skipped_shared_token_evidence_groups,
-        "rescue_plan": result.rescue_plan,
-        "evidence_gate_report": result.evidence_gate_report,
-        "planned_candidate_pair_visits": result.planned_candidate_pair_visits,
-        "evidence_holdout_misses": result.evidence_holdout_misses,
-        "effective_edge_budget_bytes": result.effective_edge_budget_bytes,
-        "edge_count": result.edge_count,
-        "scope_component_counts": {
-            "intra": result.scope_components.intra_roots.len(),
-            "cross": result.scope_components.cross_roots.len(),
-            "chain_pairs": result.scope_components.chain_pair_roots.len(),
-        },
-        "summary_rows": result.summary_rows,
-        "wall_millis": result.wall_millis,
-    });
-    let json = serde_json::to_string_pretty(&ready)?;
     let summary_dir = out.join("metadata-summary-1");
     progress(ProgressEvent::determinate(
         ProgressPhase::CommitArtifacts,
@@ -2617,7 +2648,34 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
         WorkUnit::Items,
         ProgressCounters::default(),
     ));
-    crate::format::commit_ready(&summary_dir, "metadata-summary.ready", &json)?;
+    if persistence != MatchPersistence::Ephemeral {
+        let ready = serde_json::json!({
+            "schema_revision": result.schema_revision,
+            "evidence_gate_revision": result.evidence_gate_revision,
+            "snapshot_fingerprint": result.snapshot_fingerprint,
+            "snapshot_atoms": result.snapshot_atoms,
+            "index_metrics": result.index_metrics,
+            "exact_evidence": result.exact_evidence,
+            "pair_holdout_evidence": result.pair_holdout_evidence,
+            "shared_token_exact_evidence": result.shared_token_exact_evidence,
+            "skipped_shared_token_evidence_groups": result.skipped_shared_token_evidence_groups,
+            "rescue_plan": result.rescue_plan,
+            "evidence_gate_report": result.evidence_gate_report,
+            "planned_candidate_pair_visits": result.planned_candidate_pair_visits,
+            "evidence_holdout_misses": result.evidence_holdout_misses,
+            "effective_edge_budget_bytes": result.effective_edge_budget_bytes,
+            "edge_count": result.edge_count,
+            "scope_component_counts": {
+                "intra": result.scope_components.intra_roots.len(),
+                "cross": result.scope_components.cross_roots.len(),
+                "chain_pairs": result.scope_components.chain_pair_roots.len(),
+            },
+            "summary_rows": result.summary_rows,
+            "wall_millis": result.wall_millis,
+        });
+        let json = serde_json::to_string_pretty(&ready)?;
+        crate::format::commit_ready(&summary_dir, "metadata-summary.ready", &json)?;
+    }
     drop(storage_leases);
     if persistence == MatchPersistence::Durable {
         register_match_artifacts(
@@ -2632,7 +2690,7 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
             &out.join("component-snapshots"),
             &summary_dir,
         )?;
-    } else {
+    } else if persistence == MatchPersistence::MemoryFirst {
         register_memory_first_match_artifacts(
             &mut storage,
             features,
@@ -3243,36 +3301,11 @@ fn shared_group_sketches(
     features: &crate::encode::FeatureView,
     sources: &[u32],
 ) -> Vec<crate::blocking::AtomSketch> {
-    let owned = sources
+    let payloads = sources
         .iter()
-        .map(|&source| {
-            let payload = features.source_to_payload[source as usize] as usize;
-            let tr = features.payload_template_offsets[payload] as usize
-                ..features.payload_template_offsets[payload + 1] as usize;
-            let cr = features.payload_content_offsets[payload] as usize
-                ..features.payload_content_offsets[payload + 1] as usize;
-            (
-                features.payload_template_terms[tr.clone()]
-                    .iter()
-                    .copied()
-                    .zip(features.payload_template_freqs[tr].iter().copied())
-                    .collect::<Vec<_>>(),
-                features.payload_content_terms[cr.clone()]
-                    .iter()
-                    .copied()
-                    .zip(features.payload_content_freqs[cr].iter().copied())
-                    .collect::<Vec<_>>(),
-            )
-        })
+        .map(|&source| features.source_to_payload[source as usize])
         .collect::<Vec<_>>();
-    let refs = owned
-        .iter()
-        .map(|(template_terms, content_terms)| BaseEquivalentAtomInput {
-            template_terms,
-            content_terms,
-        })
-        .collect::<Vec<_>>();
-    build_base_equivalent_atom_sketches(&refs)
+    build_base_equivalent_atom_sketches_from_feature_view_parallel(features, &payloads)
 }
 
 fn max_shared_group_index_bytes_with_progress(
@@ -3466,56 +3499,61 @@ fn build_rescue_execution_plan(
     mut progress: impl FnMut(ProgressEvent),
 ) -> Result<RescueExecutionPlan, PipelineError> {
     let atom_count = snapshot.atom_count() as u32;
-    let mut atom_score_visits = 0u64;
     for &left_atom in &rescue.pair_atoms {
         if left_atom >= atom_count {
             return Err(PipelineError::Invariant(format!(
                 "rescue atom {left_atom} is outside atom universe {atom_count}"
             )));
         }
-        for right_atom in 0..atom_count {
-            if left_atom == right_atom
-                || (rescue.pair_atoms.binary_search(&right_atom).is_ok() && right_atom < left_atom)
-            {
-                continue;
-            }
-            atom_score_visits = atom_score_visits
-                .checked_add(1)
-                .ok_or(crate::resource::MemoryError::Overflow)?;
-        }
     }
+    let rescue_atom_count = rescue.pair_atoms.len() as u64;
+    let atom_score_visits = rescue_atom_count
+        .checked_mul(u64::from(atom_count.saturating_sub(1)))
+        .and_then(|visits| {
+            rescue_atom_count
+                .checked_mul(rescue_atom_count.saturating_sub(1))
+                .and_then(|duplicates| duplicates.checked_div(2))
+                .and_then(|duplicates| visits.checked_sub(duplicates))
+        })
+        .ok_or(crate::resource::MemoryError::Overflow)?;
     let features = snapshot.features();
     let mut shared_score_visits = 0u64;
+    let mut seeds_by_token = BTreeMap::<u32, Vec<u32>>::new();
     for seed in &rescue.shared_seeds {
-        if seed.token_id as usize + 1 >= features.token_member_offsets.len() {
+        seeds_by_token
+            .entry(seed.token_id)
+            .or_default()
+            .push(seed.contract_id);
+    }
+    for (token_id, seed_contracts) in &mut seeds_by_token {
+        if *token_id as usize + 1 >= features.token_member_offsets.len() {
             return Err(PipelineError::Invariant(format!(
                 "rescue token {} is outside token universe",
-                seed.token_id
+                token_id
             )));
         }
-        let begin = features.token_member_offsets[seed.token_id as usize] as usize;
-        let end = features.token_member_offsets[seed.token_id as usize + 1] as usize;
+        seed_contracts.sort_unstable();
+        seed_contracts.dedup();
+        let begin = features.token_member_offsets[*token_id as usize] as usize;
+        let end = features.token_member_offsets[*token_id as usize + 1] as usize;
         let contracts = &features.token_member_contracts[begin..end];
-        if !contracts.contains(&seed.contract_id) {
-            continue;
-        }
-        for &contract in contracts {
-            if contract == seed.contract_id
-                || (rescue
-                    .shared_seeds
-                    .binary_search(&crate::evidence::SharedRescueSeed {
-                        token_id: seed.token_id,
-                        contract_id: contract,
-                    })
-                    .is_ok()
-                    && contract < seed.contract_id)
-            {
-                continue;
-            }
-            shared_score_visits = shared_score_visits
-                .checked_add(1)
-                .ok_or(crate::resource::MemoryError::Overflow)?;
-        }
+        let present = seed_contracts
+            .iter()
+            .filter(|contract| contracts.contains(contract))
+            .count() as u64;
+        let members = contracts.len() as u64;
+        let visits = present
+            .checked_mul(members.saturating_sub(1))
+            .and_then(|visits| {
+                present
+                    .checked_mul(present.saturating_sub(1))
+                    .and_then(|duplicates| duplicates.checked_div(2))
+                    .and_then(|duplicates| visits.checked_sub(duplicates))
+            })
+            .ok_or(crate::resource::MemoryError::Overflow)?;
+        shared_score_visits = shared_score_visits
+            .checked_add(visits)
+            .ok_or(crate::resource::MemoryError::Overflow)?;
     }
     let score_visits = atom_score_visits
         .checked_add(shared_score_visits)
@@ -3534,6 +3572,17 @@ fn build_rescue_execution_plan(
         .build()
         .map_err(|error| PipelineError::Parallel(error.to_string()))?;
     let (sender, receiver) = std::sync::mpsc::sync_channel(lanes.max(1) * 2);
+    let mut rescue_atom_mask = vec![false; atom_count as usize];
+    for &atom in &rescue.pair_atoms {
+        rescue_atom_mask[atom as usize] = true;
+    }
+    let atom_payloads = (0..atom_count)
+        .map(|atom| atom_payload(snapshot, atom))
+        .collect::<Vec<_>>();
+    let shared_seed_members = seeds_by_token
+        .into_iter()
+        .map(|(token, contracts)| (token, contracts.into_iter().collect::<HashSet<_>>()))
+        .collect::<HashMap<_, _>>();
     std::thread::scope(|scope| -> Result<RescueExecutionPlan, PipelineError> {
         let producer_sender = sender.clone();
         let producer = scope.spawn(move || {
@@ -3543,20 +3592,23 @@ fn build_rescue_execution_plan(
                         rescue.pair_atoms.par_iter().for_each(|&left_atom| {
                             let mut scored = 0u64;
                             let mut matches = Vec::new();
+                            let left_payload = atom_payloads[left_atom as usize];
+                            let mut payload_scores = HashMap::<u32, bool>::new();
                             for right_atom in 0..atom_count {
                                 if left_atom == right_atom
-                                    || (rescue.pair_atoms.binary_search(&right_atom).is_ok()
+                                    || (rescue_atom_mask[right_atom as usize]
                                         && right_atom < left_atom)
                                 {
                                     continue;
                                 }
                                 scored = scored.saturating_add(1);
-                                if score_pair(
-                                    snapshot.features(),
-                                    atom_payload(snapshot, left_atom),
-                                    atom_payload(snapshot, right_atom),
-                                ) == PairScoreDecision::ExactMatch
-                                {
+                                let right_payload = atom_payloads[right_atom as usize];
+                                let exact_match =
+                                    *payload_scores.entry(right_payload).or_insert_with(|| {
+                                        score_pair(snapshot.features(), left_payload, right_payload)
+                                            == PairScoreDecision::ExactMatch
+                                    });
+                                if exact_match {
                                     matches.push((left_atom, right_atom));
                                 }
                             }
@@ -3582,24 +3634,24 @@ fn build_rescue_execution_plan(
                                 features.source_to_payload[sources[seed_index] as usize];
                             let mut scored = 0u64;
                             let mut matches = Vec::new();
+                            let mut payload_scores = HashMap::<u32, bool>::new();
                             for (offset, &contract) in contracts.iter().enumerate() {
                                 if contract == seed.contract_id
-                                    || (rescue
-                                        .shared_seeds
-                                        .binary_search(&crate::evidence::SharedRescueSeed {
-                                            token_id: seed.token_id,
-                                            contract_id: contract,
-                                        })
-                                        .is_ok()
+                                    || (shared_seed_members
+                                        .get(&seed.token_id)
+                                        .is_some_and(|contracts| contracts.contains(&contract))
                                         && contract < seed.contract_id)
                                 {
                                     continue;
                                 }
                                 scored = scored.saturating_add(1);
                                 let payload = features.source_to_payload[sources[offset] as usize];
-                                if score_pair(features, seed_payload, payload)
-                                    == PairScoreDecision::ExactMatch
-                                {
+                                let exact_match =
+                                    *payload_scores.entry(payload).or_insert_with(|| {
+                                        score_pair(features, seed_payload, payload)
+                                            == PairScoreDecision::ExactMatch
+                                    });
+                                if exact_match {
                                     matches.push((seed.contract_id, contract));
                                 }
                             }
@@ -3952,6 +4004,10 @@ fn append_shared_token_edges(
                     let end = f.token_member_offsets[token + 1] as usize;
                     let contracts = &f.token_member_contracts[begin..end];
                     let sources = &f.token_member_sources[begin..end];
+                    let member_payloads = sources
+                        .iter()
+                        .map(|&source| f.source_to_payload[source as usize])
+                        .collect::<Vec<_>>();
                     if contracts.len() >= 256 {
                         const LOCAL_TILE_MEMBERS: usize = 256;
                         let sketches = shared_group_sketches(f, sources);
@@ -3965,6 +4021,7 @@ fn append_shared_token_edges(
                                 let mut edges = Vec::with_capacity(EDGE_BATCH);
                                 let mut pending_work = 0u64;
                                 let mut failed = false;
+                                let mut payload_scores = HashMap::<u64, bool>::new();
                                 let _ = plan.visit_tile(&sketches, &tile, |i, j| {
                                     if failed
                                         || producer_cancelled
@@ -3973,8 +4030,13 @@ fn append_shared_token_edges(
                                         return false;
                                     }
                                     pending_work = pending_work.saturating_add(1);
-                                    if let Some(edge) = shared_pair_edge(
-                                        f, contracts, sources, i as usize, j as usize,
+                                    if let Some(edge) = shared_pair_edge_cached(
+                                        f,
+                                        contracts,
+                                        &member_payloads,
+                                        i as usize,
+                                        j as usize,
+                                        &mut payload_scores,
                                     ) {
                                         edges.push(edge);
                                         if edges.len() == EDGE_BATCH {
@@ -4052,12 +4114,20 @@ fn append_shared_token_edges(
                     let mut edges = Vec::with_capacity(EDGE_BATCH);
                     let mut pending_work = 0u64;
                     let mut failed = false;
+                    let mut payload_scores = HashMap::<u64, bool>::new();
                     let mut visit = |i: usize, j: usize| {
                         if failed || producer_cancelled.load(std::sync::atomic::Ordering::Acquire) {
                             return;
                         }
                         pending_work = pending_work.saturating_add(1);
-                        if let Some(edge) = shared_pair_edge(f, contracts, sources, i, j) {
+                        if let Some(edge) = shared_pair_edge_cached(
+                            f,
+                            contracts,
+                            &member_payloads,
+                            i,
+                            j,
+                            &mut payload_scores,
+                        ) {
                             edges.push(edge);
                             if edges.len() == EDGE_BATCH {
                                 let ready =
@@ -4172,25 +4242,35 @@ fn append_shared_token_edges(
     })
 }
 
-fn shared_pair_edge(
+fn shared_pair_edge_cached(
     f: &crate::encode::FeatureView,
     contracts: &[u32],
-    sources: &[u32],
+    payloads: &[u32],
     i: usize,
     j: usize,
+    payload_scores: &mut HashMap<u64, bool>,
 ) -> Option<Edge> {
     let left = contracts[i];
     let right = contracts[j];
     if left == right {
         return None;
     }
-    let lp = f.source_to_payload[sources[i] as usize];
-    let rp = f.source_to_payload[sources[j] as usize];
-    if score_pair(f, lp, rp) == PairScoreDecision::ExactMatch {
+    let lp = payloads[i];
+    let rp = payloads[j];
+    let key = payload_pair_key(lp, rp);
+    let exact_match = *payload_scores
+        .entry(key)
+        .or_insert_with(|| score_pair(f, lp, rp) == PairScoreDecision::ExactMatch);
+    if exact_match {
         Some(Edge::new(left, right))
     } else {
         None
     }
+}
+
+fn payload_pair_key(left: u32, right: u32) -> u64 {
+    let (left, right) = (left.min(right), left.max(right));
+    (u64::from(left) << 32) | u64::from(right)
 }
 
 fn chain_pair_index(left: usize, right: usize, chain_count: usize) -> usize {

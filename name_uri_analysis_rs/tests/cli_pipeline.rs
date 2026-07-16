@@ -109,8 +109,6 @@ fn public_controller_runs_all_children_and_resumes_finalized_pipeline() {
         work.join("artifacts/metadata/production-readiness.json"),
         work.join("artifacts/metadata/encode-3/features.ready"),
         work.join("artifacts/metadata/blocking-3/blocking.ready"),
-        work.join("artifacts/metadata/match-1/component-snapshots/intra/component-chain.ready"),
-        work.join("artifacts/metadata/match-1/metadata-summary-1/metadata-summary.ready"),
     ] {
         assert!(path.is_file(), "missing {}", path.display());
     }
@@ -120,6 +118,8 @@ fn public_controller_runs_all_children_and_resumes_finalized_pipeline() {
         "rescue-plan-1",
         "recall-plan-1",
         "connectivity-runs",
+        "component-snapshots",
+        "metadata-summary-1",
     ] {
         assert!(!work
             .join("artifacts/metadata/match-1")
@@ -201,21 +201,21 @@ fn public_controller_runs_all_children_and_resumes_finalized_pipeline() {
             .is_some_and(|ext| ext == "json")));
 
     let metadata_ready: serde_json::Value = serde_json::from_slice(
-        &fs::read(
-            work.join("artifacts/metadata/match-1/metadata-summary-1/metadata-summary.ready"),
-        )
-        .unwrap(),
+        &fs::read(work.join("artifacts/metadata/readiness-input.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(
-        metadata_ready["schema_revision"],
+        metadata_ready["engine_match_revision"],
         metadata_engine::scoring::MATCH_SEMANTICS_REVISION
     );
     assert_eq!(
         metadata_ready["evidence_gate_revision"],
         metadata_engine::evidence::EVIDENCE_GATE_REVISION
     );
-    assert!(metadata_ready["summary_rows"].as_array().is_some());
+    let metadata_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(work.join("partial/metadata-summary.json")).unwrap())
+            .unwrap();
+    assert!(metadata_summary["summary_rows"].as_array().is_some());
 
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(work.join("manifest.json")).unwrap()).unwrap();

@@ -1172,8 +1172,11 @@ fn snapshot_lease_remains_charged_when_component_memory_is_admitted() {
         max_catalog_jobs * std::mem::size_of::<metadata_engine::scheduler::JobDescriptor>() as u64;
     let edge_bytes = 64 * 1024u64;
     let component_peak_bytes = 2 * 4 * 2 * 10u64;
+    let evidence_partition_bytes = 10 * 16u64;
+    let evidence_peak_bytes = evidence_partition_bytes * 8;
     let hard_top = snapshot_bytes
         .checked_add(catalog_bytes)
+        .and_then(|bytes| bytes.checked_add(evidence_peak_bytes))
         .and_then(|bytes| bytes.checked_add(edge_bytes))
         .and_then(|bytes| bytes.checked_add(component_peak_bytes - 1))
         .unwrap();
@@ -1197,7 +1200,7 @@ fn snapshot_lease_remains_charged_when_component_memory_is_admitted() {
     )
     .unwrap_err();
 
-    let expected_used = snapshot_bytes + catalog_bytes + edge_bytes;
+    let expected_used = snapshot_bytes + catalog_bytes + evidence_peak_bytes + edge_bytes;
     assert!(
         error.to_string().contains(&format!(
             "requested {component_peak_bytes}, used {expected_used}"
@@ -1228,7 +1231,7 @@ fn exact_evidence_plan_scales_both_pair_partitions_to_the_joint_budget() {
 #[test]
 fn scoring_and_evidence_gate_revisions_are_versioned_independently() {
     assert_eq!(metadata_engine::scoring::MATCH_SEMANTICS_REVISION, 6);
-    assert_eq!(metadata_engine::evidence::EVIDENCE_GATE_REVISION, 2);
+    assert_eq!(metadata_engine::evidence::EVIDENCE_GATE_REVISION, 3);
 }
 
 #[test]

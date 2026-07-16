@@ -84,6 +84,10 @@ pub fn run_analysis_phase(
     work_directory: &Path,
 ) -> Result<(), AnalysisError> {
     validate_options(options)?;
+    configure_numa_interleave();
+    let mut phase_options = options.clone();
+    phase_options.threads = phase_worker_threads(options.threads, phase);
+    let options = &phase_options;
     // MetadataEncode reads Prepare's DuckDB state without mutating Prepare/Name
     // tables. Match remains the sole owner of production metadata summary rows.
     if matches!(phase, AnalysisPhase::MetadataEncode) {
@@ -186,6 +190,68 @@ pub fn run_analysis_phase(
     result
 }
 
+fn phase_worker_threads(default_threads: usize, phase: AnalysisPhase) -> usize {
+    let key = match phase {
+        AnalysisPhase::Prepare => "NAME_URI_ANALYSIS_PREPARE_THREADS",
+        AnalysisPhase::MetadataEncode => "NAME_URI_ANALYSIS_METADATA_ENCODE_THREADS",
+        AnalysisPhase::Name => "NAME_URI_ANALYSIS_NAME_THREADS",
+        AnalysisPhase::MetadataMatch => "NAME_URI_ANALYSIS_METADATA_MATCH_THREADS",
+    };
+    let requested = std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(default_threads);
+    requested
+        .min(
+            std::thread::available_parallelism()
+                .map(|value| value.get())
+                .unwrap_or(1),
+        )
+        .max(1)
+}
+
+#[cfg(target_os = "linux")]
+fn configure_numa_interleave() {
+    if std::env::var_os("NAME_URI_ANALYSIS_DISABLE_NUMA_INTERLEAVE").is_some() {
+        return;
+    }
+    let Ok(online) = fs::read_to_string("/sys/devices/system/node/online") else {
+        return;
+    };
+    let mut mask = 0u64;
+    for part in online.trim().split(',') {
+        let mut bounds = part.split('-');
+        let Some(begin) = bounds.next().and_then(|value| value.parse::<u32>().ok()) else {
+            return;
+        };
+        let end = bounds
+            .next()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(begin);
+        for node in begin..=end.min(63) {
+            mask |= 1u64 << node;
+        }
+    }
+    if mask.count_ones() <= 1 {
+        return;
+    }
+    const MPOL_INTERLEAVE: libc::c_int = 3;
+    // Best effort: containers may deny set_mempolicy. Child threads inherit
+    // the policy when the call succeeds; failure must not affect results.
+    unsafe {
+        libc::syscall(
+            libc::SYS_set_mempolicy,
+            MPOL_INTERLEAVE,
+            &mask as *const u64,
+            64usize,
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_numa_interleave() {}
+
 fn metadata_inputs_ready(work_directory: &Path) -> bool {
     let layout = metadata_engine::artifacts::MetadataArtifactLayout::new(work_directory);
     layout.encode_dir().join("features.ready").is_file()
@@ -228,7 +294,7 @@ fn run_metadata_pipeline(
         evidence_gate_policy: metadata_engine::evidence::EvidenceGatePolicy::production(),
         edge_bytes,
     };
-    let result = metadata_engine::pipeline::run_metadata_pipeline_with_progress(
+    let result = metadata_engine::pipeline::run_metadata_pipeline_ephemeral_with_progress(
         &features,
         &blocking,
         &out,

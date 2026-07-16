@@ -1,4 +1,5 @@
 use super::*;
+use duckdb::arrow::array::{Array, Int64Array, StringArray, StringViewArray};
 
 pub(crate) const NAME_ANALYSIS_WORKER_STACK_BYTES: usize = 4 * 1024 * 1024;
 
@@ -292,52 +293,72 @@ pub(crate) fn load_all_name_atoms(
         .enumerate()
         .map(|(index, chain)| (chain.as_str(), index))
         .collect::<HashMap<_, _>>();
-    let mut stmt = conn.prepare(
-        "
-        SELECT chain, name_norm, contract_count, nft_count
-        FROM name_atoms
-        ORDER BY chain, name_norm
-        ",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)?,
-            row.get::<_, i64>(3)?,
-        ))
-    })?;
+    let mut stmt =
+        conn.prepare("SELECT chain, name_norm, contract_count, nft_count FROM name_atoms")?;
+    let batches = stmt.query_arrow([])?;
     let mut atoms = Vec::new();
-    let mut scanned_rows = 0u64;
-    let mut reported_rows = 0u64;
-    for row in rows {
-        let (chain, name_norm, contract_count, nft_count) = row?;
-        scanned_rows = scanned_rows.saturating_add(1);
-        if scanned_rows.saturating_sub(reported_rows) >= 16_384 {
-            on_rows_loaded(scanned_rows - reported_rows);
-            reported_rows = scanned_rows;
-        }
-        if let Some(chain_index) = chain_indexes.get(chain.as_str()).copied() {
-            let char_len = name_norm.chars().count();
-            atoms.push(NameAtom {
-                chain_index,
-                name_norm,
-                char_len,
-                contract_count,
-                nft_count,
-            });
-        }
+    for batch in batches {
+        let row_count = batch.num_rows();
+        let chains = batch.column(0).as_ref();
+        let names = batch.column(1).as_ref();
+        let contract_counts = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| AnalysisError::InvalidData("name contract_count is not INT64".into()))?;
+        let nft_counts = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| AnalysisError::InvalidData("name nft_count is not INT64".into()))?;
+        let mut batch_atoms = (0..row_count)
+            .into_par_iter()
+            .map(|index| -> Result<Option<NameAtom>, AnalysisError> {
+                if chains.is_null(index)
+                    || names.is_null(index)
+                    || contract_counts.is_null(index)
+                    || nft_counts.is_null(index)
+                {
+                    return Err(AnalysisError::InvalidData(
+                        "name atom row contains NULL".into(),
+                    ));
+                }
+                let chain = name_arrow_string(chains, index)?;
+                let Some(chain_index) = chain_indexes.get(chain).copied() else {
+                    return Ok(None);
+                };
+                let name = name_arrow_string(names, index)?;
+                Ok(Some(NameAtom {
+                    chain_index,
+                    name_norm: name.to_owned(),
+                    char_len: name.chars().count(),
+                    contract_count: contract_counts.value(index),
+                    nft_count: nft_counts.value(index),
+                }))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        atoms.extend(batch_atoms.drain(..).flatten());
+        on_rows_loaded(row_count as u64);
     }
-    if scanned_rows > reported_rows {
-        on_rows_loaded(scanned_rows - reported_rows);
-    }
-    atoms.sort_by(|left, right| {
+    atoms.par_sort_unstable_by(|left, right| {
         left.char_len
             .cmp(&right.char_len)
             .then_with(|| left.chain_index.cmp(&right.chain_index))
             .then_with(|| left.name_norm.cmp(&right.name_norm))
     });
     Ok(atoms)
+}
+
+fn name_arrow_string(array: &dyn Array, index: usize) -> Result<&str, AnalysisError> {
+    if let Some(values) = array.as_any().downcast_ref::<StringArray>() {
+        return Ok(values.value(index));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<StringViewArray>() {
+        return Ok(values.value(index));
+    }
+    Err(AnalysisError::InvalidData(
+        "name text column is not UTF8".into(),
+    ))
 }
 
 pub(crate) fn push_name_summary_rows(

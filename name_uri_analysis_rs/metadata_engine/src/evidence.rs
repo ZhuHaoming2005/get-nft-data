@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
-pub const EVIDENCE_GATE_REVISION: u32 = 2;
+pub const EVIDENCE_GATE_REVISION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct EvidenceGatePolicy {
