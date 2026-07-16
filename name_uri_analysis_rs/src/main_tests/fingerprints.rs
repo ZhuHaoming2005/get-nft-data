@@ -393,6 +393,12 @@ fn input_fingerprint_records_file_order_rows_and_schema() {
     assert_eq!(fingerprints[0].row_count, 2);
     assert_eq!(fingerprints[1].file_id, 1);
     assert_eq!(fingerprints[1].row_count, 1);
+    assert_eq!(fingerprints[0].content_sha256.len(), 64);
+    assert_eq!(fingerprints[1].content_sha256.len(), 64);
+    assert_ne!(
+        fingerprints[0].content_sha256,
+        fingerprints[1].content_sha256
+    );
     assert_eq!(fingerprints[0].schema_sha256.len(), 64);
     assert_eq!(fingerprints[0].schema_sha256, fingerprints[1].schema_sha256);
 }

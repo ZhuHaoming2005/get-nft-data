@@ -7,10 +7,9 @@ mod stats;
 
 pub use base_equivalent::{
     blocking_artifact_upper_bound, compile_base_equivalent,
-    compile_base_equivalent_parallel_with_progress,
-    compile_base_equivalent_with_progress, scoring_owner, AtomSketch, BlockKind, BlockingBundle,
-    BlockingCompileConfig, BlockingError, RoutingStatus, ANCHOR_COUNT, BANDS, BAND_BITS,
-    JOINT_BAND_FAMILIES,
+    compile_base_equivalent_parallel_with_progress, compile_base_equivalent_with_progress,
+    scoring_owner, AtomSketch, BlockKind, BlockingBundle, BlockingCompileConfig, BlockingError,
+    RoutingStatus, ANCHOR_COUNT, BANDS, BAND_BITS, JOINT_BAND_FAMILIES,
 };
 pub(crate) use local::LocalRoutingPlan;
 pub use local::{for_each_local_base_equivalent_pair, for_each_local_base_equivalent_pair_while};

@@ -3529,9 +3529,7 @@ impl RescueMatchChunk {
     fn new(memory: &MemoryBroker) -> Result<Self, PipelineError> {
         let bytes = (RESCUE_MATCH_CHUNK_PAIRS as u64)
             .checked_mul(std::mem::size_of::<(u32, u32)>() as u64)
-            .and_then(|value| {
-                value.checked_add(std::mem::size_of::<RescueMatchChunk>() as u64)
-            })
+            .and_then(|value| value.checked_add(std::mem::size_of::<RescueMatchChunk>() as u64))
             .ok_or(crate::resource::MemoryError::Overflow)?;
         let lease = memory.reserve(bytes)?;
         Ok(Self {
@@ -3771,144 +3769,56 @@ fn build_rescue_execution_plan(
         .collect::<Vec<_>>();
     drop(seeds_by_token);
     let cancelled = std::sync::atomic::AtomicBool::new(false);
-    std::thread::scope(|scope| -> Result<AdmittedRescueExecutionPlan, PipelineError> {
-        let producer_sender = sender.clone();
-        let rescue_pool = &pool;
-        let producer_cancelled = &cancelled;
-        let producer = scope.spawn(move || {
-            rescue_pool.install(|| {
-                rayon::join(
-                    || {
-                        rescue.pair_atoms.par_iter().for_each(|&left_atom| {
-                            let left_payload = atom_payloads[left_atom as usize];
-                            let tile_count = (atom_count as usize).div_ceil(RESCUE_SCORE_TILE);
-                            (0..tile_count).into_par_iter().for_each(|tile| {
-                                if producer_cancelled
-                                    .load(std::sync::atomic::Ordering::Acquire)
-                                {
-                                    return;
-                                }
-                                let begin = tile.saturating_mul(RESCUE_SCORE_TILE);
-                                let end = begin
-                                    .saturating_add(RESCUE_SCORE_TILE)
-                                    .min(atom_count as usize);
-                                let mut pending_work = 0u64;
-                                let mut matches = None;
-                                let mut payload_scores = HashMap::<u32, bool>::new();
-                                for right_atom in begin as u32..end as u32 {
-                                    if producer_cancelled
-                                        .load(std::sync::atomic::Ordering::Acquire)
+    std::thread::scope(
+        |scope| -> Result<AdmittedRescueExecutionPlan, PipelineError> {
+            let producer_sender = sender.clone();
+            let rescue_pool = &pool;
+            let producer_cancelled = &cancelled;
+            let producer = scope.spawn(move || {
+                rescue_pool.install(|| {
+                    rayon::join(
+                        || {
+                            rescue.pair_atoms.par_iter().for_each(|&left_atom| {
+                                let left_payload = atom_payloads[left_atom as usize];
+                                let tile_count = (atom_count as usize).div_ceil(RESCUE_SCORE_TILE);
+                                (0..tile_count).into_par_iter().for_each(|tile| {
+                                    if producer_cancelled.load(std::sync::atomic::Ordering::Acquire)
                                     {
                                         return;
                                     }
-                                    if left_atom == right_atom
-                                        || (rescue_atom_mask[right_atom as usize]
-                                            && right_atom < left_atom)
-                                    {
-                                        continue;
-                                    }
-                                    let right_payload = atom_payloads[right_atom as usize];
-                                    let exact_match = bounded_payload_match(
-                                        &mut payload_scores,
-                                        snapshot.features(),
-                                        left_payload,
-                                        right_payload,
-                                    );
-                                    if exact_match {
-                                        if let Err(error) = record_rescue_match(
-                                            &mut matches,
-                                            (left_atom, right_atom),
-                                            memory,
-                                            &producer_sender,
-                                            false,
-                                        ) {
-                                            producer_cancelled.store(
-                                                true,
-                                                std::sync::atomic::Ordering::Release,
-                                            );
-                                            let _ = producer_sender
-                                                .send(RescuePlanMessage::Error(error));
-                                            return;
-                                        }
-                                    }
-                                    record_rescue_plan_work(
-                                        &mut pending_work,
-                                        PROGRESS_CHUNK,
-                                        &producer_sender,
-                                    );
-                                }
-                                if let Err(error) = flush_rescue_match_chunk(
-                                    &mut matches,
-                                    &producer_sender,
-                                    false,
-                                ) {
-                                    producer_cancelled
-                                        .store(true, std::sync::atomic::Ordering::Release);
-                                    let _ =
-                                        producer_sender.send(RescuePlanMessage::Error(error));
-                                    return;
-                                }
-                                let _ = producer_sender.send(RescuePlanMessage::RowDone(
-                                    take_rescue_plan_work(&mut pending_work),
-                                ));
-                            });
-                        });
-                    },
-                    || {
-                        rescue.shared_seeds.par_iter().for_each(|seed| {
-                            let begin =
-                                features.token_member_offsets[seed.token_id as usize] as usize;
-                            let end =
-                                features.token_member_offsets[seed.token_id as usize + 1] as usize;
-                            let contracts = &features.token_member_contracts[begin..end];
-                            let sources = &features.token_member_sources[begin..end];
-                            let Some(seed_positions) = shared_seed_positions.get(&seed.token_id)
-                            else {
-                                return;
-                            };
-                            let Some(&seed_index) = seed_positions.get(&seed.contract_id) else {
-                                return;
-                            };
-                            let seed_payload =
-                                features.source_to_payload[sources[seed_index] as usize];
-                            contracts
-                                .par_chunks(RESCUE_SCORE_TILE)
-                                .zip(sources.par_chunks(RESCUE_SCORE_TILE))
-                                .for_each(|(contracts, sources)| {
-                                    if producer_cancelled
-                                        .load(std::sync::atomic::Ordering::Acquire)
-                                    {
-                                        return;
-                                    }
+                                    let begin = tile.saturating_mul(RESCUE_SCORE_TILE);
+                                    let end = begin
+                                        .saturating_add(RESCUE_SCORE_TILE)
+                                        .min(atom_count as usize);
                                     let mut pending_work = 0u64;
                                     let mut matches = None;
                                     let mut payload_scores = HashMap::<u32, bool>::new();
-                                    for (&contract, &source) in contracts.iter().zip(sources) {
+                                    for right_atom in begin as u32..end as u32 {
                                         if producer_cancelled
                                             .load(std::sync::atomic::Ordering::Acquire)
                                         {
                                             return;
                                         }
-                                        if contract == seed.contract_id
-                                            || (seed_positions.contains_key(&contract)
-                                                && contract < seed.contract_id)
+                                        if left_atom == right_atom
+                                            || (rescue_atom_mask[right_atom as usize]
+                                                && right_atom < left_atom)
                                         {
                                             continue;
                                         }
-                                        let payload = features.source_to_payload[source as usize];
+                                        let right_payload = atom_payloads[right_atom as usize];
                                         let exact_match = bounded_payload_match(
                                             &mut payload_scores,
-                                            features,
-                                            seed_payload,
-                                            payload,
+                                            snapshot.features(),
+                                            left_payload,
+                                            right_payload,
                                         );
                                         if exact_match {
                                             if let Err(error) = record_rescue_match(
                                                 &mut matches,
-                                                (seed.contract_id, contract),
+                                                (left_atom, right_atom),
                                                 memory,
                                                 &producer_sender,
-                                                true,
+                                                false,
                                             ) {
                                                 producer_cancelled.store(
                                                     true,
@@ -3928,172 +3838,268 @@ fn build_rescue_execution_plan(
                                     if let Err(error) = flush_rescue_match_chunk(
                                         &mut matches,
                                         &producer_sender,
-                                        true,
+                                        false,
                                     ) {
                                         producer_cancelled
                                             .store(true, std::sync::atomic::Ordering::Release);
-                                        let _ = producer_sender
-                                            .send(RescuePlanMessage::Error(error));
+                                        let _ =
+                                            producer_sender.send(RescuePlanMessage::Error(error));
                                         return;
                                     }
                                     let _ = producer_sender.send(RescuePlanMessage::RowDone(
                                         take_rescue_plan_work(&mut pending_work),
                                     ));
                                 });
-                        });
-                    },
-                );
+                            });
+                        },
+                        || {
+                            rescue.shared_seeds.par_iter().for_each(|seed| {
+                                let begin =
+                                    features.token_member_offsets[seed.token_id as usize] as usize;
+                                let end = features.token_member_offsets[seed.token_id as usize + 1]
+                                    as usize;
+                                let contracts = &features.token_member_contracts[begin..end];
+                                let sources = &features.token_member_sources[begin..end];
+                                let Some(seed_positions) =
+                                    shared_seed_positions.get(&seed.token_id)
+                                else {
+                                    return;
+                                };
+                                let Some(&seed_index) = seed_positions.get(&seed.contract_id)
+                                else {
+                                    return;
+                                };
+                                let seed_payload =
+                                    features.source_to_payload[sources[seed_index] as usize];
+                                contracts
+                                    .par_chunks(RESCUE_SCORE_TILE)
+                                    .zip(sources.par_chunks(RESCUE_SCORE_TILE))
+                                    .for_each(|(contracts, sources)| {
+                                        if producer_cancelled
+                                            .load(std::sync::atomic::Ordering::Acquire)
+                                        {
+                                            return;
+                                        }
+                                        let mut pending_work = 0u64;
+                                        let mut matches = None;
+                                        let mut payload_scores = HashMap::<u32, bool>::new();
+                                        for (&contract, &source) in contracts.iter().zip(sources) {
+                                            if producer_cancelled
+                                                .load(std::sync::atomic::Ordering::Acquire)
+                                            {
+                                                return;
+                                            }
+                                            if contract == seed.contract_id
+                                                || (seed_positions.contains_key(&contract)
+                                                    && contract < seed.contract_id)
+                                            {
+                                                continue;
+                                            }
+                                            let payload =
+                                                features.source_to_payload[source as usize];
+                                            let exact_match = bounded_payload_match(
+                                                &mut payload_scores,
+                                                features,
+                                                seed_payload,
+                                                payload,
+                                            );
+                                            if exact_match {
+                                                if let Err(error) = record_rescue_match(
+                                                    &mut matches,
+                                                    (seed.contract_id, contract),
+                                                    memory,
+                                                    &producer_sender,
+                                                    true,
+                                                ) {
+                                                    producer_cancelled.store(
+                                                        true,
+                                                        std::sync::atomic::Ordering::Release,
+                                                    );
+                                                    let _ = producer_sender
+                                                        .send(RescuePlanMessage::Error(error));
+                                                    return;
+                                                }
+                                            }
+                                            record_rescue_plan_work(
+                                                &mut pending_work,
+                                                PROGRESS_CHUNK,
+                                                &producer_sender,
+                                            );
+                                        }
+                                        if let Err(error) = flush_rescue_match_chunk(
+                                            &mut matches,
+                                            &producer_sender,
+                                            true,
+                                        ) {
+                                            producer_cancelled
+                                                .store(true, std::sync::atomic::Ordering::Release);
+                                            let _ = producer_sender
+                                                .send(RescuePlanMessage::Error(error));
+                                            return;
+                                        }
+                                        let _ = producer_sender.send(RescuePlanMessage::RowDone(
+                                            take_rescue_plan_work(&mut pending_work),
+                                        ));
+                                    });
+                            });
+                        },
+                    );
+                });
             });
-        });
-        drop(sender);
+            drop(sender);
 
-        let mut completed = 0u64;
-        let mut atom_chunks = Vec::<RescueMatchChunk>::new();
-        let mut shared_chunks = Vec::<RescueMatchChunk>::new();
-        let mut matched_atom_count = 0usize;
-        let mut matched_shared_count = 0usize;
-        let mut first_error = None;
-        for message in receiver {
-            match message {
-                RescuePlanMessage::Work(work) => {
-                    completed = completed.saturating_add(work).min(score_visits);
-                }
-                RescuePlanMessage::AtomMatches(chunk) => {
-                    matched_atom_count = matched_atom_count.saturating_add(chunk.pairs.len());
-                    atom_chunks.push(chunk);
-                }
-                RescuePlanMessage::SharedMatches(chunk) => {
-                    matched_shared_count = matched_shared_count.saturating_add(chunk.pairs.len());
-                    shared_chunks.push(chunk);
-                }
-                RescuePlanMessage::RowDone(work) => {
-                    completed = completed.saturating_add(work).min(score_visits);
-                }
-                RescuePlanMessage::Error(error) => {
-                    if first_error.is_none() {
-                        first_error = Some(error);
+            let mut completed = 0u64;
+            let mut atom_chunks = Vec::<RescueMatchChunk>::new();
+            let mut shared_chunks = Vec::<RescueMatchChunk>::new();
+            let mut matched_atom_count = 0usize;
+            let mut matched_shared_count = 0usize;
+            let mut first_error = None;
+            for message in receiver {
+                match message {
+                    RescuePlanMessage::Work(work) => {
+                        completed = completed.saturating_add(work).min(score_visits);
+                    }
+                    RescuePlanMessage::AtomMatches(chunk) => {
+                        matched_atom_count = matched_atom_count.saturating_add(chunk.pairs.len());
+                        atom_chunks.push(chunk);
+                    }
+                    RescuePlanMessage::SharedMatches(chunk) => {
+                        matched_shared_count =
+                            matched_shared_count.saturating_add(chunk.pairs.len());
+                        shared_chunks.push(chunk);
+                    }
+                    RescuePlanMessage::RowDone(work) => {
+                        completed = completed.saturating_add(work).min(score_visits);
+                    }
+                    RescuePlanMessage::Error(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
                     }
                 }
-            }
-            progress(ProgressEvent::determinate(
-                ProgressPhase::PlanRescuePairs,
-                completed,
-                score_visits,
-                WorkUnit::Pairs,
-                ProgressCounters {
-                    scored: completed,
-                    matched: matched_atom_count.saturating_add(matched_shared_count) as u64,
-                    ..ProgressCounters::default()
-                },
-            ));
-        }
-        producer
-            .join()
-            .map_err(|_| PipelineError::Parallel("rescue planner panicked".into()))?;
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        let total_matches = matched_atom_count
-            .checked_add(matched_shared_count)
-            .ok_or(crate::resource::MemoryError::Overflow)?;
-        // Flattening temporarily overlaps admitted chunks and the final vectors.
-        // Two pair-widths per result conservatively cover Vec capacity slack.
-        let final_match_bytes = (total_matches as u64)
-            .checked_mul(std::mem::size_of::<(u32, u32)>() as u64)
-            .and_then(|bytes| bytes.checked_mul(2))
-            .ok_or(crate::resource::MemoryError::Overflow)?;
-        let match_memory = memory.reserve(final_match_bytes)?;
-        let mut matched_atom_pairs = Vec::with_capacity(matched_atom_count);
-        for chunk in atom_chunks {
-            matched_atom_pairs.extend(chunk.pairs);
-        }
-        let mut matched_shared_edges = Vec::with_capacity(matched_shared_count);
-        for chunk in shared_chunks {
-            matched_shared_edges.extend(chunk.pairs);
-        }
-        progress(ProgressEvent::indeterminate(
-            ProgressPhase::FinalizeRescuePlan,
-            0,
-            WorkUnit::Items,
-            ProgressCounters {
-                matched: matched_atom_pairs
-                    .len()
-                    .saturating_add(matched_shared_edges.len()) as u64,
-                ..ProgressCounters::default()
-            },
-        ));
-        pool.install(|| {
-            rayon::join(
-                || matched_atom_pairs.par_sort_unstable(),
-                || matched_shared_edges.par_sort_unstable(),
-            )
-        });
-        let mut finalize_completed = matched_atom_pairs
-            .len()
-            .saturating_add(matched_shared_edges.len()) as u64;
-        progress(ProgressEvent::indeterminate(
-            ProgressPhase::FinalizeRescuePlan,
-            finalize_completed,
-            WorkUnit::Items,
-            ProgressCounters {
-                matched: finalize_completed,
-                ..ProgressCounters::default()
-            },
-        ));
-
-        let mut contract_expansion_visits = 0u64;
-        let mut pending_finalize = 0u64;
-        for &(left_atom, right_atom) in &matched_atom_pairs {
-            contract_expansion_visits = contract_expansion_visits
-                .checked_add(
-                    (atom_contracts(snapshot, left_atom).len() as u64)
-                        .checked_mul(atom_contracts(snapshot, right_atom).len() as u64)
-                        .ok_or(crate::resource::MemoryError::Overflow)?,
-                )
-                .ok_or(crate::resource::MemoryError::Overflow)?;
-            pending_finalize = pending_finalize.saturating_add(1);
-            if pending_finalize == PROGRESS_CHUNK {
-                finalize_completed = finalize_completed.saturating_add(pending_finalize);
-                pending_finalize = 0;
-                progress(ProgressEvent::indeterminate(
-                    ProgressPhase::FinalizeRescuePlan,
-                    finalize_completed,
-                    WorkUnit::Items,
+                progress(ProgressEvent::determinate(
+                    ProgressPhase::PlanRescuePairs,
+                    completed,
+                    score_visits,
+                    WorkUnit::Pairs,
                     ProgressCounters {
-                        matched: matched_atom_pairs
-                            .len()
-                            .saturating_add(matched_shared_edges.len())
-                            as u64,
+                        scored: completed,
+                        matched: matched_atom_count.saturating_add(matched_shared_count) as u64,
                         ..ProgressCounters::default()
                     },
                 ));
             }
-        }
-        if pending_finalize != 0 {
-            finalize_completed = finalize_completed.saturating_add(pending_finalize);
-        }
-        progress(ProgressEvent::indeterminate(
-            ProgressPhase::FinalizeRescuePlan,
-            finalize_completed,
-            WorkUnit::Items,
-            ProgressCounters {
-                matched: matched_atom_pairs
-                    .len()
-                    .saturating_add(matched_shared_edges.len()) as u64,
-                ..ProgressCounters::default()
-            },
-        ));
-        Ok(AdmittedRescueExecutionPlan {
-            plan: RescueExecutionPlan {
-                atom_score_visits,
-                contract_expansion_visits,
-                shared_score_visits,
-                matched_atom_pairs,
-                matched_shared_edges,
-            },
-            _match_memory: match_memory,
-        })
-    })
+            producer
+                .join()
+                .map_err(|_| PipelineError::Parallel("rescue planner panicked".into()))?;
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+            let total_matches = matched_atom_count
+                .checked_add(matched_shared_count)
+                .ok_or(crate::resource::MemoryError::Overflow)?;
+            // Flattening temporarily overlaps admitted chunks and the final vectors.
+            // Two pair-widths per result conservatively cover Vec capacity slack.
+            let final_match_bytes = (total_matches as u64)
+                .checked_mul(std::mem::size_of::<(u32, u32)>() as u64)
+                .and_then(|bytes| bytes.checked_mul(2))
+                .ok_or(crate::resource::MemoryError::Overflow)?;
+            let match_memory = memory.reserve(final_match_bytes)?;
+            let mut matched_atom_pairs = Vec::with_capacity(matched_atom_count);
+            for chunk in atom_chunks {
+                matched_atom_pairs.extend(chunk.pairs);
+            }
+            let mut matched_shared_edges = Vec::with_capacity(matched_shared_count);
+            for chunk in shared_chunks {
+                matched_shared_edges.extend(chunk.pairs);
+            }
+            progress(ProgressEvent::indeterminate(
+                ProgressPhase::FinalizeRescuePlan,
+                0,
+                WorkUnit::Items,
+                ProgressCounters {
+                    matched: matched_atom_pairs
+                        .len()
+                        .saturating_add(matched_shared_edges.len())
+                        as u64,
+                    ..ProgressCounters::default()
+                },
+            ));
+            pool.install(|| {
+                rayon::join(
+                    || matched_atom_pairs.par_sort_unstable(),
+                    || matched_shared_edges.par_sort_unstable(),
+                )
+            });
+            let mut finalize_completed = matched_atom_pairs
+                .len()
+                .saturating_add(matched_shared_edges.len())
+                as u64;
+            progress(ProgressEvent::indeterminate(
+                ProgressPhase::FinalizeRescuePlan,
+                finalize_completed,
+                WorkUnit::Items,
+                ProgressCounters {
+                    matched: finalize_completed,
+                    ..ProgressCounters::default()
+                },
+            ));
+
+            let mut contract_expansion_visits = 0u64;
+            let mut pending_finalize = 0u64;
+            for &(left_atom, right_atom) in &matched_atom_pairs {
+                contract_expansion_visits = contract_expansion_visits
+                    .checked_add(
+                        (atom_contracts(snapshot, left_atom).len() as u64)
+                            .checked_mul(atom_contracts(snapshot, right_atom).len() as u64)
+                            .ok_or(crate::resource::MemoryError::Overflow)?,
+                    )
+                    .ok_or(crate::resource::MemoryError::Overflow)?;
+                pending_finalize = pending_finalize.saturating_add(1);
+                if pending_finalize == PROGRESS_CHUNK {
+                    finalize_completed = finalize_completed.saturating_add(pending_finalize);
+                    pending_finalize = 0;
+                    progress(ProgressEvent::indeterminate(
+                        ProgressPhase::FinalizeRescuePlan,
+                        finalize_completed,
+                        WorkUnit::Items,
+                        ProgressCounters {
+                            matched: matched_atom_pairs
+                                .len()
+                                .saturating_add(matched_shared_edges.len())
+                                as u64,
+                            ..ProgressCounters::default()
+                        },
+                    ));
+                }
+            }
+            if pending_finalize != 0 {
+                finalize_completed = finalize_completed.saturating_add(pending_finalize);
+            }
+            progress(ProgressEvent::indeterminate(
+                ProgressPhase::FinalizeRescuePlan,
+                finalize_completed,
+                WorkUnit::Items,
+                ProgressCounters {
+                    matched: matched_atom_pairs
+                        .len()
+                        .saturating_add(matched_shared_edges.len())
+                        as u64,
+                    ..ProgressCounters::default()
+                },
+            ));
+            Ok(AdmittedRescueExecutionPlan {
+                plan: RescueExecutionPlan {
+                    atom_score_visits,
+                    contract_expansion_visits,
+                    shared_score_visits,
+                    matched_atom_pairs,
+                    matched_shared_edges,
+                },
+                _match_memory: match_memory,
+            })
+        },
+    )
 }
 
 fn bounded_payload_match(
@@ -4927,10 +4933,7 @@ fn summarize_sorted_entries(
             } else {
                 count
             };
-            if count != 0
-                && total >= 2
-                && (!require_secondary || chain_entries.len() > 1)
-            {
+            if count != 0 && total >= 2 && (!require_secondary || chain_entries.len() > 1) {
                 accumulate(
                     chain,
                     SummaryStats {
@@ -5382,9 +5385,8 @@ mod tests {
         for primary in 0..2 {
             let dense = dense_summary_stats(
                 &roots,
-                (0..roots.len()).map(|contract| {
-                    (contract, chains[contract] == primary, nfts[contract])
-                }),
+                (0..roots.len())
+                    .map(|contract| (contract, chains[contract] == primary, nfts[contract])),
                 true,
             );
             assert_eq!(sorted[primary].group_count, dense.group_count);

@@ -457,6 +457,10 @@ pub(crate) fn prepare_work_directory(
         if !manifests_have_same_inputs_and_options(&existing, &manifest) {
             return Err("resume rejected: input fingerprint or analysis options changed".into());
         }
+        let upgraded_legacy_input_fingerprint = existing
+            .inputs
+            .iter()
+            .any(|input| input.content_sha256.is_empty());
         let revisions_changed = invalidate_changed_stage_revisions(
             &mut existing,
             manifest.stage_revisions,
@@ -465,8 +469,15 @@ pub(crate) fn prepare_work_directory(
         if revisions_changed
             || existing.binary_version != manifest.binary_version
             || existing.options != manifest.options
+            || existing.inputs != manifest.inputs
         {
+            if upgraded_legacy_input_fingerprint {
+                eprintln!(
+                    "warning: upgrading legacy resume manifest with full Parquet content hashes"
+                );
+            }
             existing.binary_version = manifest.binary_version;
+            existing.inputs = manifest.inputs;
             existing.options = manifest.options;
             write_manifest_atomically(&config_path, &existing)?;
         }
@@ -637,12 +648,31 @@ pub(crate) fn manifests_have_same_inputs_and_options(
     expected: &PipelineManifest,
 ) -> bool {
     existing.schema_version == expected.schema_version
-        && existing.inputs == expected.inputs
+        && input_fingerprints_are_compatible(&existing.inputs, &expected.inputs)
         && existing.chains == expected.chains
         && existing.options.database_path == expected.options.database_path
         && existing.options.parquet_inputs == expected.options.parquet_inputs
         && existing.options.output_dir == expected.options.output_dir
         && existing.options.name_threshold == expected.options.name_threshold
+}
+
+fn input_fingerprints_are_compatible(
+    existing: &[InputFingerprint],
+    expected: &[InputFingerprint],
+) -> bool {
+    existing.len() == expected.len()
+        && existing.iter().zip(expected).all(|(left, right)| {
+            left.file_id == right.file_id
+                && left.path == right.path
+                && left.size == right.size
+                && left.modified_unix_nanos == right.modified_unix_nanos
+                && left.row_count == right.row_count
+                && left.row_group_count == right.row_group_count
+                && left.min_row_group_rows == right.min_row_group_rows
+                && left.max_row_group_rows == right.max_row_group_rows
+                && left.schema_sha256 == right.schema_sha256
+                && (left.content_sha256.is_empty() || left.content_sha256 == right.content_sha256)
+        })
 }
 
 pub(crate) fn checkpoint_is_complete_and_valid(

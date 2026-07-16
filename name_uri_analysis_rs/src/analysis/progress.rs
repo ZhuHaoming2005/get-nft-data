@@ -5,8 +5,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use super::*;
 
 const PIPELINE_STAGE_COUNT: u64 = 5;
-pub(crate) const PROGRESS_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
-const PROGRESS_REFRESH_HZ: u8 = 20;
+pub(crate) const PROGRESS_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+const PROGRESS_REFRESH_HZ: u8 = 10;
 const RATE_WARMUP: Duration = Duration::from_secs(1);
 const RATE_EWMA_ALPHA: f64 = 0.25;
 #[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
@@ -211,6 +211,7 @@ impl ProgressTracker {
                 stage.set_message("waiting for engine progress");
                 stage.enable_steady_tick(PROGRESS_REFRESH_INTERVAL);
             } else {
+                stage.disable_steady_tick();
                 stage.set_style(stage_bar_style());
             }
         }
@@ -332,22 +333,23 @@ impl ProgressTracker {
         let unit = unit.into();
         task.reset();
         if let Some(total) = total {
+            task.disable_steady_tick();
             task.set_length(total);
             task.set_style(task_bar_style());
         } else {
             task.unset_length();
             task.set_style(task_spinner_style());
+            task.enable_steady_tick(PROGRESS_REFRESH_INTERVAL);
         }
         task.set_position(0);
         task.set_message(label.clone());
-        task.enable_steady_tick(PROGRESS_REFRESH_INTERVAL);
         metrics.reset();
+        metrics.disable_steady_tick();
         if total_kind == metadata_engine::progress::TotalKind::Unknown {
             metrics.set_message("ETA n/a (work total not observable)");
         } else {
             metrics.set_message("waiting for progress sample");
         }
-        metrics.enable_steady_tick(PROGRESS_REFRESH_INTERVAL);
         *task_state.lock().expect("task progress mutex poisoned") = Some(TaskProgressState {
             label,
             total,
@@ -525,6 +527,18 @@ impl ProgressTracker {
         }
     }
 
+    pub(crate) fn warn(&self, message: impl Into<String>) {
+        let message = format!("warning: {}", message.into());
+        match self {
+            Self::Enabled { _multi, .. } => {
+                if _multi.println(&message).is_err() {
+                    eprintln!("{message}");
+                }
+            }
+            Self::Disabled => eprintln!("{message}"),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn finish(&self) {
         self.finish_display("analysis complete; writing outputs finished");
@@ -553,13 +567,24 @@ impl ProgressTracker {
             stage,
             task,
             metrics,
+            task_state,
             ..
         } = self
         {
             let message = format!("FAILED: {}", message.into());
-            task.abandon_with_message(message.clone());
-            metrics.abandon_with_message(message.clone());
-            stage.abandon_with_message(message.clone());
+            task_state
+                .lock()
+                .expect("task progress mutex poisoned")
+                .take();
+            task.disable_steady_tick();
+            metrics.disable_steady_tick();
+            stage.disable_steady_tick();
+            task.set_message("");
+            metrics.set_message("");
+            stage.set_message("");
+            task.finish_and_clear();
+            metrics.finish_and_clear();
+            stage.finish_and_clear();
             pipeline.abandon_with_message(message);
         }
     }
@@ -789,11 +814,11 @@ fn task_spinner_style() -> ProgressStyle {
 }
 
 pub(crate) const fn pipeline_bar_template() -> &'static str {
-    "{spinner:.green} pipeline [{elapsed_precise}] [{bar:24.cyan/blue}] {pos}/{len} {msg}"
+    "pipeline [{elapsed_precise}] [{bar:24.cyan/blue}] {pos}/{len} {msg}"
 }
 
 pub(crate) const fn stage_bar_template() -> &'static str {
-    "  {spinner:.blue} stage [{elapsed_precise}] [{bar:28.magenta/blue}] {pos}/{len} {percent:>3}% {msg}"
+    "  stage [{elapsed_precise}] [{bar:28.magenta/blue}] {pos}/{len} {percent:>3}% {msg}"
 }
 
 pub(crate) const fn stage_spinner_template() -> &'static str {
@@ -801,11 +826,11 @@ pub(crate) const fn stage_spinner_template() -> &'static str {
 }
 
 pub(crate) const fn task_bar_template() -> &'static str {
-    "    {spinner:.yellow} task [{elapsed_precise}] [{bar:32.yellow/blue}] {human_pos}/{human_len} {percent:>3}% {msg}"
+    "    task [{elapsed_precise}] [{bar:32.yellow/blue}] {human_pos}/{human_len} {percent:>3}% {msg}"
 }
 
 pub(crate) const fn metrics_template() -> &'static str {
-    "      {spinner:.white} metrics {msg}"
+    "      metrics {msg}"
 }
 
 #[cfg(test)]

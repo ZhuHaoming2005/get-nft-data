@@ -136,6 +136,10 @@ fn progress_layout_keeps_fixed_bars_separate_from_long_metrics() {
     assert!(!stage_spinner_template().contains("{bar"));
     assert!(task_bar_template().contains("{bar:32"));
     assert!(task_bar_template().contains("{human_pos}/{human_len}"));
+    assert!(!pipeline_bar_template().contains("{spinner"));
+    assert!(!stage_bar_template().contains("{spinner"));
+    assert!(!task_bar_template().contains("{spinner"));
+    assert!(!metrics_template().contains("{spinner"));
     assert!(!pipeline_bar_template().contains("wide_bar"));
     assert!(!stage_bar_template().contains("wide_bar"));
     assert!(!task_bar_template().contains("wide_bar"));
@@ -621,4 +625,7 @@ fn hierarchical_progress_finishes_all_levels_with_failure_context() {
     assert!(metrics.is_finished());
     assert!(pipeline.message().contains("FAILED"));
     assert!(pipeline.message().contains("metadata query failed"));
+    assert!(stage.message().is_empty());
+    assert!(task.message().is_empty());
+    assert!(metrics.message().is_empty());
 }

@@ -182,7 +182,7 @@ fn public_controller_runs_all_children_and_resumes_finalized_pipeline() {
     let encode_metrics: serde_json::Value =
         serde_json::from_slice(&fs::read(work.join("metrics/metadata-encode.json")).unwrap())
             .unwrap();
-    assert_eq!(encode_metrics["schema_version"], 3);
+    assert_eq!(encode_metrics["schema_version"], 4);
     assert!(encode_metrics["encode_wall_millis"].as_u64().is_some());
     assert!(encode_metrics["blocking_wall_millis"].as_u64().is_some());
     assert!(encode_metrics["token_membership_count"].as_u64().is_some());
@@ -190,6 +190,10 @@ fn public_controller_runs_all_children_and_resumes_finalized_pipeline() {
         .as_u64()
         .is_some());
     assert!(encode_metrics["admitted_resident_peak_bytes"]
+        .as_u64()
+        .is_some());
+    assert!(encode_metrics["planned_final_bytes"].as_u64().is_some());
+    assert!(encode_metrics["storage_admission_warnings"]
         .as_u64()
         .is_some());
     assert!(fs::read_dir(work.join("metrics/duckdb-prepare"))

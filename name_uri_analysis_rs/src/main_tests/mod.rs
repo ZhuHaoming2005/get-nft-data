@@ -22,6 +22,7 @@ fn sample_manifest(root: &Path) -> PipelineManifest {
             path: root.join("input.parquet"),
             size: 10,
             modified_unix_nanos: 20,
+            content_sha256: "content".to_string(),
             row_count: 30,
             row_group_count: 1,
             min_row_group_rows: 30,

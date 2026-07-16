@@ -233,6 +233,14 @@ fn manifest_compatibility_allows_resource_tuning_but_not_semantic_changes() {
         &existing, &expected
     ));
     existing = expected.clone();
+    existing.inputs[0].content_sha256 = "different-content".to_string();
+    assert!(!manifests_have_same_inputs_and_options(
+        &existing, &expected
+    ));
+    existing = expected.clone();
+    existing.inputs[0].content_sha256.clear();
+    assert!(manifests_have_same_inputs_and_options(&existing, &expected));
+    existing = expected.clone();
     existing.options.name_threshold = 96.0;
     assert!(!manifests_have_same_inputs_and_options(
         &existing, &expected
@@ -246,6 +254,7 @@ fn resume_rebinds_a_stage_compatible_manifest_to_the_current_binary() {
     fs::create_dir_all(&work).unwrap();
     let mut existing = sample_manifest(&work);
     existing.binary_version = "old-binary".to_string();
+    existing.inputs[0].content_sha256.clear();
     existing
         .stages
         .get_mut("prepare_complete")
@@ -255,6 +264,7 @@ fn resume_rebinds_a_stage_compatible_manifest_to_the_current_binary() {
     fs::write(&manifest_path, serde_json::to_vec(&existing).unwrap()).unwrap();
     let mut expected = existing.clone();
     expected.binary_version = "new-binary".to_string();
+    expected.inputs[0].content_sha256 = "current-content".to_string();
     expected.options.threads = 128;
     expected.options.memory_limit = "384GiB".to_string();
     expected.options.analysis_memory_limit = Some("384GiB".to_string());
@@ -266,6 +276,7 @@ fn resume_rebinds_a_stage_compatible_manifest_to_the_current_binary() {
 
     assert_eq!(rebound.binary_version, "new-binary");
     assert_eq!(persisted.binary_version, "new-binary");
+    assert_eq!(persisted.inputs[0].content_sha256, "current-content");
     assert_eq!(persisted.options.threads, 128);
     assert_eq!(
         persisted.options.analysis_memory_limit.as_deref(),

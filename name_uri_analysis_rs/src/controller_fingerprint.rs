@@ -15,6 +15,8 @@ pub(crate) struct InputFingerprint {
     pub(crate) path: PathBuf,
     pub(crate) size: u64,
     pub(crate) modified_unix_nanos: u128,
+    #[serde(default)]
+    pub(crate) content_sha256: String,
     pub(crate) row_count: u64,
     pub(crate) row_group_count: u64,
     pub(crate) min_row_group_rows: u64,
@@ -65,6 +67,14 @@ pub(crate) fn fingerprint_inputs(
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos();
+            let (hashed_size, content_sha256) = sha256_file(path, 8 * 1024 * 1024)?;
+            if hashed_size != metadata.len() {
+                return Err(format!(
+                    "Parquet input changed while fingerprinting: {}",
+                    path.display()
+                )
+                .into());
+            }
             let input = parquet_sql_literal(path);
             let (row_count, row_group_count, min_row_group_rows, max_row_group_rows) = conn
                 .query_row(
@@ -101,12 +111,26 @@ pub(crate) fn fingerprint_inputs(
                 schema.extend_from_slice(data_type.as_bytes());
                 schema.push(0xff);
             }
+            let metadata_after = fs::metadata(path)?;
+            let modified_after = metadata_after
+                .modified()?
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            if metadata_after.len() != metadata.len() || modified_after != modified_unix_nanos {
+                return Err(format!(
+                    "Parquet input changed while fingerprinting: {}",
+                    path.display()
+                )
+                .into());
+            }
             Ok(InputFingerprint {
                 file_id: u32::try_from(file_id)
                     .map_err(|_| "Parquet input count exceeds u32 file IDs")?,
                 path: path.clone(),
                 size: metadata.len(),
                 modified_unix_nanos,
+                content_sha256,
                 row_count,
                 row_group_count,
                 min_row_group_rows,

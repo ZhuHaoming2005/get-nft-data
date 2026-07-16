@@ -60,6 +60,9 @@ readiness 始终只供观测，不参与 Finalize、resume、summary 发布或 s
 仍保持可用。`metadata-readiness-input.json` 是 Match 事实，外部任务只应更新
 `production-evidence/metadata-v2.json`。
 
+Controller 的 resume 输入指纹包含每个 Parquet 文件的完整 SHA-256；仅保持路径、大小、时间戳、
+行数和 schema 相同不足以复用旧阶段。
+
 ## 执行架构
 
 Controller 固定执行五个阶段：
@@ -154,8 +157,12 @@ subphase、`completed/total`、工作单位和诊断计数，CLI 只负责渲染
   memberships 的并存峰值。批次完成后依据实际 `Vec`/`HashMap` capacity、唯一 payload、
   template/content interner、source/token membership 重新调整 lease。冻结后还会按实际 CSR 维度
   准入 persistence scratch，避免大量小合约和唯一短 payload 绕过全局内存核算，同时不增加一次
-  全量 JSON 预扫描。Encode artifact 的物理空间使用冻结列基数上界；feature 写完即释放未来分配
-  lease，再单独准入 blocking，已写 staging 文件不会被重复计入剩余空间。
+  全量 JSON 预扫描。长期存活的 pending token-id 使用单个连续 arena，并在注册时直接排列为最终
+  CSR source 顺序；构建冻结列时转移该 arena 的所有权，不再为每个 source 单独分配，也不再复制一份
+  完整 token-id 列。arena capacity 和 source range 索引均纳入实时 lease。Encode artifact 的物理
+  空间使用冻结列基数上界；feature 写完即释放未来分配 lease，再单独准入 blocking，已写 staging
+  文件不会被重复计入剩余空间。若保守物理空间上界高于当前可用空间，Encode 输出警告并继续执行；
+  真实文件系统写入仍是最终约束，实际耗尽空间时会返回 I/O 错误。
 - pair work、catalog jobs、Exact evidence、Rescue lane cache、edge buffer、snapshot/reduce 和
   artifact overlap 都在分配或执行前 checked admission。Rescue payload cache 每 lane 有固定上限；
   命中 pair 使用 4,096-pair 分块，每个分块在分配前获取 MemoryLease，最终扁平化期间同时保留来源

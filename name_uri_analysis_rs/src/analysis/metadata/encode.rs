@@ -35,7 +35,9 @@ use metadata_engine::progress::{
     ProgressCounters as EngineCounters, ProgressEvent, ProgressPhase, WorkUnit,
 };
 use metadata_engine::resource::{MemoryBroker, MemoryLease};
-use metadata_engine::storage::{ArtifactClass, ArtifactRegistration, StorageBroker};
+use metadata_engine::storage::{
+    ArtifactClass, ArtifactRegistration, StorageBroker, StorageLease, StorageLedgerError,
+};
 use rayon::prelude::*;
 use serde::Serialize;
 
@@ -173,8 +175,10 @@ struct EncodeMetrics {
     routing_membership_count: u64,
     fallback_membership_count: u64,
     admitted_resident_peak_bytes: u64,
+    planned_final_bytes: u64,
     admitted_final_bytes: u64,
     admitted_partial_peak_bytes: u64,
+    storage_admission_warnings: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -380,13 +384,15 @@ pub(crate) fn run_metadata_encode(
         let admitted_feature_bytes =
             encode_artifact_upper_bound_soa(&sources, &payloads, &contracts, &fallback_atoms)
                 .map_err(encode_err)?;
-        let feature_storage_reservation = broker
-            .reserve(
-                ArtifactClass::Feature,
-                admitted_feature_bytes,
-                estimate.partial_peak_bytes,
-            )
-            .map_err(storage_err)?;
+        let feature_storage_reservation = reserve_storage_advisory(
+            &mut broker,
+            ArtifactClass::Feature,
+            admitted_feature_bytes,
+            estimate.partial_peak_bytes,
+            "encoded feature bundle",
+            |message| progress.warn(message),
+        )?;
+        let feature_storage_admitted = feature_storage_reservation.is_some();
         let run_id = metadata_engine::artifacts::new_artifact_run_id();
         let encode_staging = artifact_layout.encode_run_staging_dir(&run_id);
         let blocking_staging = artifact_layout.blocking_run_staging_dir(&run_id);
@@ -463,13 +469,15 @@ pub(crate) fn run_metadata_encode(
         };
         let admitted_blocking_bytes =
             blocking_artifact_upper_bound(&atoms).map_err(blocking_err)?;
-        let blocking_storage_reservation = broker
-            .reserve(
-                ArtifactClass::Blocking,
-                admitted_blocking_bytes,
-                estimate.partial_peak_bytes,
-            )
-            .map_err(storage_err)?;
+        let blocking_storage_reservation = reserve_storage_advisory(
+            &mut broker,
+            ArtifactClass::Blocking,
+            admitted_blocking_bytes,
+            estimate.partial_peak_bytes,
+            "blocking bundle",
+            |message| progress.warn(message),
+        )?;
+        let blocking_storage_admitted = blocking_storage_reservation.is_some();
         let blocking_bundle = compile_base_equivalent_parallel_with_progress(
             &atoms,
             &config,
@@ -595,7 +603,7 @@ pub(crate) fn run_metadata_encode(
 
         if diagnostics_enabled() {
             let metrics = EncodeMetrics {
-                schema_version: 3,
+                schema_version: 4,
                 encode_wall_millis,
                 blocking_wall_millis,
                 source_rows: sources.source_count() as u64,
@@ -613,9 +621,16 @@ pub(crate) fn run_metadata_encode(
                     .sum(),
                 fallback_membership_count: fallback_atoms.members.len() as u64,
                 admitted_resident_peak_bytes: resident_admission.peak_bytes(),
-                admitted_final_bytes: admitted_feature_bytes
-                    .saturating_add(admitted_blocking_bytes),
+                planned_final_bytes: admitted_feature_bytes.saturating_add(admitted_blocking_bytes),
+                admitted_final_bytes: u64::from(feature_storage_admitted)
+                    .saturating_mul(admitted_feature_bytes)
+                    .saturating_add(
+                        u64::from(blocking_storage_admitted)
+                            .saturating_mul(admitted_blocking_bytes),
+                    ),
                 admitted_partial_peak_bytes: estimate.partial_peak_bytes,
+                storage_admission_warnings: u64::from(!feature_storage_admitted)
+                    + u64::from(!blocking_storage_admitted),
             };
             let metrics_dir = work_directory.join("metrics");
             fs::create_dir_all(&metrics_dir)?;
@@ -672,9 +687,6 @@ type EncodeStreamInputs = (
 #[derive(Debug)]
 struct TokenSourceInput {
     token_ids: Vec<u32>,
-    source_file: u32,
-    source_row_number: u64,
-    payload_ref: PayloadRef,
 }
 
 #[derive(Debug)]
@@ -713,7 +725,12 @@ struct TokenSourceRelation {
 }
 
 impl TokenSourceRelation {
-    fn read_contract(&self, contract_index: u32) -> Result<Vec<TokenSourceInput>, AnalysisError> {
+    fn append_contract_layout(
+        &self,
+        contract_index: u32,
+        representative: SourceCoordinate,
+        pending_token_ids: &mut Vec<u32>,
+    ) -> Result<(TokenRange, Vec<PendingSourceSlot>), AnalysisError> {
         let contract = usize::try_from(contract_index).map_err(|_| {
             AnalysisError::InvalidData("metadata contract index exceeds usize".into())
         })?;
@@ -726,7 +743,8 @@ impl TokenSourceRelation {
                 "metadata contract index is outside token-source offsets".into(),
             ));
         };
-        let mut output = Vec::new();
+
+        let mut representative_source = None;
         let mut cursor = start;
         while cursor < end {
             let source_id = self.memberships[cursor].source_id;
@@ -735,19 +753,93 @@ impl TokenSourceRelation {
                     "token-source membership references unknown source".into(),
                 )
             })?;
-            let mut token_ids = Vec::new();
             while cursor < end && self.memberships[cursor].source_id == source_id {
-                token_ids.push(self.memberships[cursor].token_id);
                 cursor += 1;
             }
-            output.push(TokenSourceInput {
-                token_ids,
+            if (SourceCoordinate {
                 source_file: source.source_file,
                 source_row_number: source.source_row_number,
+            }) == representative
+                && representative_source.replace(source_id).is_some()
+            {
+                return Err(AnalysisError::InvalidData(
+                    "token-source dictionary contains duplicate representative coordinates".into(),
+                ));
+            }
+        }
+
+        let representative_start = pending_token_ids.len();
+        if let Some(source_id) = representative_source {
+            self.append_source_tokens(start, end, source_id, pending_token_ids)?;
+        }
+        let representative_range = TokenRange {
+            start: representative_start,
+            end: pending_token_ids.len(),
+        };
+
+        let mut output = Vec::new();
+        let mut cursor = start;
+        while cursor < end {
+            let group_start = cursor;
+            let source_id = self.memberships[cursor].source_id;
+            while cursor < end && self.memberships[cursor].source_id == source_id {
+                cursor += 1;
+            }
+            if Some(source_id) == representative_source {
+                continue;
+            }
+            let source = self.sources.get(source_id as usize).ok_or_else(|| {
+                AnalysisError::InvalidData(
+                    "token-source membership references unknown source".into(),
+                )
+            })?;
+            let token_start = pending_token_ids.len();
+            pending_token_ids.extend(
+                self.memberships[group_start..cursor]
+                    .iter()
+                    .map(|membership| membership.token_id),
+            );
+            output.push(PendingSourceSlot {
                 payload_ref: source.payload_ref,
+                token_range: TokenRange {
+                    start: token_start,
+                    end: pending_token_ids.len(),
+                },
             });
         }
-        Ok(output)
+        Ok((representative_range, output))
+    }
+
+    fn append_source_tokens(
+        &self,
+        start: usize,
+        end: usize,
+        source_id: u32,
+        pending_token_ids: &mut Vec<u32>,
+    ) -> Result<(), AnalysisError> {
+        let group_start = self.memberships[start..end]
+            .partition_point(|membership| membership.source_id < source_id)
+            .checked_add(start)
+            .ok_or_else(|| {
+                AnalysisError::InvalidData("token-source membership offset overflow".into())
+            })?;
+        let group_end = self.memberships[group_start..end]
+            .partition_point(|membership| membership.source_id == source_id)
+            .checked_add(group_start)
+            .ok_or_else(|| {
+                AnalysisError::InvalidData("token-source membership offset overflow".into())
+            })?;
+        if group_start == group_end {
+            return Err(AnalysisError::InvalidData(
+                "representative token source has no memberships".into(),
+            ));
+        }
+        pending_token_ids.extend(
+            self.memberships[group_start..group_end]
+                .iter()
+                .map(|membership| membership.token_id),
+        );
+        Ok(())
     }
 
     fn bytes(&self) -> u64 {
@@ -855,7 +947,11 @@ fn planned_encoded_contract_growth(
 fn planned_encode_finalize_growth(
     payload_count: usize,
     contract_count: usize,
+    source_count: usize,
 ) -> Result<u64, AnalysisError> {
+    let source_offset_count = source_count
+        .checked_add(1)
+        .ok_or_else(|| AnalysisError::InvalidData("Encode source offset count overflow".into()))?;
     let mut total = ENCODE_RESIDENT_FIXED_BYTES;
     for bytes in [
         capacity_bytes::<u32>(payload_count)?,
@@ -865,6 +961,9 @@ fn planned_encode_finalize_growth(
         hash_map_capacity_bytes::<Arc<str>, u32>(payload_count)?,
         hash_map_capacity_bytes::<String, u32>(payload_count)?,
         hash_map_capacity_bytes::<(u32, u32), usize>(contract_count)?,
+        capacity_bytes::<u32>(source_count)?,
+        capacity_bytes::<u32>(source_count)?,
+        capacity_bytes::<u64>(source_offset_count)?,
         capacity_bytes::<u32>(contract_count)?,
         capacity_bytes::<Vec<u32>>(contract_count)?,
         capacity_bytes::<(&'static [u32], &'static [u32])>(contract_count)?,
@@ -992,14 +1091,18 @@ struct PendingFallbackContract {
     weight: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TokenRange {
+    start: usize,
+    end: usize,
+}
+
 /// One retained token-specific metadata source registered into the
 /// [`ShardedPayloadArena`] on behalf of a pending contract.
 #[derive(Debug)]
 struct PendingSourceSlot {
-    source_file: u32,
-    source_row_number: u64,
     payload_ref: PayloadRef,
-    token_ids: Vec<u32>,
+    token_range: TokenRange,
 }
 
 /// A contract whose representative payload (and retained token sources) has
@@ -1011,29 +1114,17 @@ struct PendingSourceSlot {
 struct PendingContractSlot {
     chain_id: u32,
     weight: u64,
-    representative_file: u32,
-    representative_row: u64,
     representative_payload_ref: PayloadRef,
+    representative_token_range: TokenRange,
     token_sources: Vec<PendingSourceSlot>,
 }
 
-/// Final contract slot after shard-local refs are remapped to dense global IDs.
-#[derive(Debug)]
-struct GlobalPendingContractSlot {
-    chain_id: u32,
-    weight: u64,
-    representative_file: u32,
-    representative_row: u64,
-    representative_payload_id: u32,
-    token_sources: Vec<GlobalPendingSourceSlot>,
-}
-
-#[derive(Debug)]
-struct GlobalPendingSourceSlot {
-    source_file: u32,
-    source_row_number: u64,
-    payload_id: u32,
-    token_ids: Vec<u32>,
+struct RegisteredPayloads {
+    arena: ShardedPayloadArena,
+    pending_contracts: Vec<PendingContractSlot>,
+    pending_token_ids: Vec<u32>,
+    resident_bytes: u64,
+    global_offsets: Vec<u32>,
 }
 
 /// Resident accounting for the presence-only registration pass (before any
@@ -1052,6 +1143,7 @@ impl EncodeRegistrationAccounting {
         pending_contracts: &Vec<PendingContractSlot>,
         pending_fallbacks: &HashMap<u32, PendingFallbackContract>,
         arena: &ShardedPayloadArena,
+        pending_token_ids: &Vec<u32>,
     ) -> Result<u64, AnalysisError> {
         for contract in &pending_contracts[self.observed_contracts..] {
             self.token_source_capacity = self
@@ -1069,6 +1161,7 @@ impl EncodeRegistrationAccounting {
         for bytes in [
             capacity_bytes::<PendingContractSlot>(pending_contracts.capacity())?,
             self.token_source_capacity,
+            capacity_bytes::<u32>(pending_token_ids.capacity())?,
             hash_map_capacity_bytes::<u32, PendingFallbackContract>(pending_fallbacks.capacity())?,
             arena.resident_bytes(),
         ] {
@@ -1173,17 +1266,22 @@ fn stream_encode_inputs_with_admission(
     }
 
     let chain_totals = load_encode_chain_totals(conn)?;
-    let (arena, pending_contracts, committed_resident_bytes, global_offsets) =
-        register_representative_payloads(
-            conn,
-            &token_source_relation,
-            relation_resident_bytes,
-            arena,
-            resident_admission,
-            &parse_pool,
-            &estimate,
-            &mut progress,
-        )?;
+    let RegisteredPayloads {
+        arena,
+        pending_contracts,
+        pending_token_ids,
+        resident_bytes: committed_resident_bytes,
+        global_offsets,
+    } = register_representative_payloads(
+        conn,
+        &token_source_relation,
+        relation_resident_bytes,
+        arena,
+        resident_admission,
+        &parse_pool,
+        &estimate,
+        &mut progress,
+    )?;
     drop(token_source_relation);
     // Relation coords are gone; shrink the lease to pending columns + arena.
     resident_admission.commit(committed_resident_bytes)?;
@@ -1191,7 +1289,19 @@ fn stream_encode_inputs_with_admission(
     // Phase C/D: parse unique payloads in bounded batches, intern immediately,
     // then drop the ParsedMetadataDocuments before the next batch.
     let payload_count = arena.len().map_err(encode_err)?;
-    let finalize_growth = planned_encode_finalize_growth(payload_count, pending_contracts.len())?;
+    let final_source_count = pending_contracts
+        .iter()
+        .try_fold(0usize, |total, contract| {
+            let contract_sources =
+                contract.token_sources.len().checked_add(1).ok_or_else(|| {
+                    AnalysisError::InvalidData("Encode final source count overflow".into())
+                })?;
+            total.checked_add(contract_sources).ok_or_else(|| {
+                AnalysisError::InvalidData("Encode final source count overflow".into())
+            })
+        })?;
+    let finalize_growth =
+        planned_encode_finalize_growth(payload_count, pending_contracts.len(), final_source_count)?;
     resident_admission.reserve_growth(committed_resident_bytes, finalize_growth)?;
     let admitted_after_finalize = committed_resident_bytes
         .checked_add(finalize_growth)
@@ -1289,19 +1399,36 @@ fn stream_encode_inputs_with_admission(
         WorkUnit::Items,
         EngineCounters::default(),
     ));
-    let mut sources = EncodeSourceSoA::with_source_capacity(pending_contracts.len());
+    let mut sources = EncodeSourceSoA::with_source_capacity(final_source_count);
+    // Registration writes the token arena in exact final CSR source order.
+    // Moving the Vec here avoids a second all-token allocation/copy peak.
+    sources.token_ids = pending_token_ids;
     let mut contracts = EncodeContractSoA::with_contract_capacity(pending_contracts.len());
+    let mut token_cursor = 0usize;
     for (index, slot) in pending_contracts.into_iter().enumerate() {
         let contract_id = u32::try_from(index).map_err(|_| {
             AnalysisError::InvalidData("metadata contract count exceeds u32".into())
         })?;
-        build_encoded_contract(slot, contract_id, &mut sources, &mut contracts)?;
+        build_encoded_contract(
+            slot,
+            contract_id,
+            &global_offsets,
+            &mut token_cursor,
+            &mut sources,
+            &mut contracts,
+        )?;
         emit_encode_progress(
             &mut progress,
             ProgressPhase::EncodeBuildColumns,
             index as u64 + 1,
             contract_total,
         );
+    }
+    if token_cursor != sources.token_ids.len() {
+        return Err(AnalysisError::InvalidData(format!(
+            "pending token arena was not consumed exactly: consumed={token_cursor}, total={}",
+            sources.token_ids.len()
+        )));
     }
 
     // Phase F: atoms / blocking sketches, unchanged from the legacy pass.
@@ -1394,21 +1521,18 @@ fn register_representative_payloads(
     parse_pool: &rayon::ThreadPool,
     estimate: &EncodeAdmissionEstimate,
     progress: &mut impl FnMut(ProgressEvent),
-) -> Result<
-    (
-        ShardedPayloadArena,
-        Vec<GlobalPendingContractSlot>,
-        u64,
-        Vec<u32>,
-    ),
-    AnalysisError,
-> {
+) -> Result<RegisteredPayloads, AnalysisError> {
     let mut pending_contracts = Vec::<PendingContractSlot>::new();
     let mut pending_fallbacks = HashMap::<u32, PendingFallbackContract>::new();
+    let mut pending_token_ids = Vec::<u32>::new();
     let mut registration_accounting = EncodeRegistrationAccounting::default();
 
-    let mut columns_resident_bytes =
-        registration_accounting.resident_bytes(&pending_contracts, &pending_fallbacks, &arena)?;
+    let mut columns_resident_bytes = registration_accounting.resident_bytes(
+        &pending_contracts,
+        &pending_fallbacks,
+        &arena,
+        &pending_token_ids,
+    )?;
     let mut committed_resident_bytes = columns_resident_bytes
         .checked_add(relation_resident_bytes)
         .ok_or_else(|| {
@@ -1551,22 +1675,20 @@ fn register_representative_payloads(
             }
 
             let representative_payload_ref = arena.insert(json.as_bytes()).map_err(encode_err)?;
-            let token_sources = token_source_relation.read_contract(contract_index)?;
-            let mut token_slots = Vec::with_capacity(token_sources.len());
-            for source in token_sources {
-                token_slots.push(PendingSourceSlot {
-                    source_file: source.source_file,
-                    source_row_number: source.source_row_number,
-                    payload_ref: source.payload_ref,
-                    token_ids: source.token_ids,
-                });
-            }
+            let (representative_token_range, token_slots) = token_source_relation
+                .append_contract_layout(
+                    contract_index,
+                    SourceCoordinate {
+                        source_file,
+                        source_row_number,
+                    },
+                    &mut pending_token_ids,
+                )?;
             pending_contracts.push(PendingContractSlot {
                 chain_id,
                 weight,
-                representative_file: source_file,
-                representative_row: source_row_number,
                 representative_payload_ref,
+                representative_token_range,
                 token_sources: token_slots,
             });
             emit_encode_progress(
@@ -1581,6 +1703,7 @@ fn register_representative_payloads(
             &pending_contracts,
             &pending_fallbacks,
             &arena,
+            &pending_token_ids,
         )?;
         committed_resident_bytes = columns_resident_bytes
             .checked_add(relation_resident_bytes)
@@ -1599,6 +1722,7 @@ fn register_representative_payloads(
             &arena,
             &mut pending_contracts,
             &mut pending_fallbacks,
+            &mut pending_token_ids,
             resident_admission,
             &mut registration_accounting,
             columns_resident_bytes,
@@ -1609,48 +1733,13 @@ fn register_representative_payloads(
     drop(pending_fallbacks);
 
     let global_offsets = arena.global_offsets().map_err(encode_err)?;
-    let pending_contracts =
-        materialize_global_pending_contracts(&arena, &global_offsets, pending_contracts)?;
-    Ok((
+    Ok(RegisteredPayloads {
         arena,
         pending_contracts,
-        columns_resident_bytes,
+        pending_token_ids,
+        resident_bytes: columns_resident_bytes,
         global_offsets,
-    ))
-}
-
-fn materialize_global_pending_contracts(
-    arena: &ShardedPayloadArena,
-    offsets: &[u32],
-    pending: Vec<PendingContractSlot>,
-) -> Result<Vec<GlobalPendingContractSlot>, AnalysisError> {
-    pending
-        .into_iter()
-        .map(|slot| {
-            let representative_payload_id = arena
-                .global_id(slot.representative_payload_ref, offsets)
-                .map_err(encode_err)?;
-            let mut token_sources = Vec::with_capacity(slot.token_sources.len());
-            for source in slot.token_sources {
-                token_sources.push(GlobalPendingSourceSlot {
-                    source_file: source.source_file,
-                    source_row_number: source.source_row_number,
-                    payload_id: arena
-                        .global_id(source.payload_ref, offsets)
-                        .map_err(encode_err)?,
-                    token_ids: source.token_ids,
-                });
-            }
-            Ok(GlobalPendingContractSlot {
-                chain_id: slot.chain_id,
-                weight: slot.weight,
-                representative_file: slot.representative_file,
-                representative_row: slot.representative_row,
-                representative_payload_id,
-                token_sources,
-            })
-        })
-        .collect()
+    })
 }
 
 /// Stable candidate stream for the bounded fallback-contract filter table.
@@ -1719,6 +1808,7 @@ fn resolve_pending_fallback_contracts(
     arena: &ShardedPayloadArena,
     pending_contracts: &mut Vec<PendingContractSlot>,
     pending_fallbacks: &mut HashMap<u32, PendingFallbackContract>,
+    pending_token_ids: &mut Vec<u32>,
     resident_admission: &mut EncodeResidentAdmission,
     registration_accounting: &mut EncodeRegistrationAccounting,
     mut columns_resident_bytes: u64,
@@ -1788,6 +1878,7 @@ fn resolve_pending_fallback_contracts(
                         arena,
                         pending_contracts,
                         pending_fallbacks,
+                        pending_token_ids,
                         resident_admission,
                         registration_accounting,
                     )?;
@@ -1857,6 +1948,7 @@ fn resolve_pending_fallback_contracts(
             arena,
             pending_contracts,
             pending_fallbacks,
+            pending_token_ids,
             resident_admission,
             registration_accounting,
         )?;
@@ -1928,32 +2020,39 @@ fn register_resolved_fallback_contract(
     arena: &ShardedPayloadArena,
     pending_contracts: &mut Vec<PendingContractSlot>,
     pending_fallbacks: &mut HashMap<u32, PendingFallbackContract>,
+    pending_token_ids: &mut Vec<u32>,
     resident_admission: &mut EncodeResidentAdmission,
     registration_accounting: &mut EncodeRegistrationAccounting,
 ) -> Result<u64, AnalysisError> {
     let Some(pending) = pending_fallbacks.remove(&row.contract_index) else {
-        return registration_accounting.resident_bytes(pending_contracts, pending_fallbacks, arena);
+        return registration_accounting.resident_bytes(
+            pending_contracts,
+            pending_fallbacks,
+            arena,
+            pending_token_ids,
+        );
     };
-    let token_sources = token_source_relation.read_contract(pending.source_contract_index)?;
-    let mut token_slots = Vec::with_capacity(token_sources.len());
-    for source in token_sources {
-        token_slots.push(PendingSourceSlot {
-            source_file: source.source_file,
-            source_row_number: source.source_row_number,
-            payload_ref: source.payload_ref,
-            token_ids: source.token_ids,
-        });
-    }
+    let (representative_token_range, token_slots) = token_source_relation.append_contract_layout(
+        pending.source_contract_index,
+        SourceCoordinate {
+            source_file: row.source_file,
+            source_row_number: row.source_row_number,
+        },
+        pending_token_ids,
+    )?;
     pending_contracts.push(PendingContractSlot {
         chain_id: pending.chain_id,
         weight: pending.weight,
-        representative_file: row.source_file,
-        representative_row: row.source_row_number,
         representative_payload_ref: row.payload_ref,
+        representative_token_range,
         token_sources: token_slots,
     });
-    let columns =
-        registration_accounting.resident_bytes(pending_contracts, pending_fallbacks, arena)?;
+    let columns = registration_accounting.resident_bytes(
+        pending_contracts,
+        pending_fallbacks,
+        arena,
+        pending_token_ids,
+    )?;
     let committed = columns
         .checked_add(relation_resident_bytes)
         .ok_or_else(|| {
@@ -1964,52 +2063,82 @@ fn register_resolved_fallback_contract(
 }
 
 fn build_encoded_contract(
-    slot: GlobalPendingContractSlot,
+    slot: PendingContractSlot,
     contract_id: u32,
+    global_offsets: &[u32],
+    token_cursor: &mut usize,
     sources: &mut EncodeSourceSoA,
     contracts: &mut EncodeContractSoA,
 ) -> Result<(), AnalysisError> {
-    let mut selected_tokens = None::<Vec<u32>>;
-    let mut remaining_sources = Vec::with_capacity(slot.token_sources.len());
-    for source in slot.token_sources {
-        if source.source_file == slot.representative_file
-            && source.source_row_number == slot.representative_row
-        {
-            if let Some(tokens) = selected_tokens.as_mut() {
-                tokens.extend(source.token_ids);
-            } else {
-                selected_tokens = Some(source.token_ids);
-            }
-        } else {
-            remaining_sources.push(source);
-        }
-    }
+    let representative_payload_id =
+        global_payload_id(slot.representative_payload_ref, global_offsets)?;
     let source_doc_id = u32::try_from(sources.source_count())
         .map_err(|_| AnalysisError::InvalidData("metadata source count exceeds u32".into()))?;
-    sources
-        .push_source(
+    push_pending_source_header(
+        sources,
+        contract_id,
+        representative_payload_id,
+        slot.representative_token_range,
+        token_cursor,
+    )?;
+    for source in slot.token_sources {
+        push_pending_source_header(
+            sources,
             contract_id,
-            slot.representative_payload_id,
-            selected_tokens.as_deref().unwrap_or(&[]),
-        )
-        .map_err(encode_err)?;
-    for source in remaining_sources {
-        let mut token_ids = source.token_ids;
-        if token_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
-            token_ids.sort_unstable();
-            token_ids.dedup();
-        }
-        sources
-            .push_source(contract_id, source.payload_id, &token_ids)
-            .map_err(encode_err)?;
+            global_payload_id(source.payload_ref, global_offsets)?,
+            source.token_range,
+            token_cursor,
+        )?;
     }
     contracts.push_contract(
         contract_id,
         slot.chain_id,
         source_doc_id,
-        slot.representative_payload_id,
+        representative_payload_id,
         slot.weight,
     );
+    Ok(())
+}
+
+fn global_payload_id(
+    payload_ref: PayloadRef,
+    global_offsets: &[u32],
+) -> Result<u32, AnalysisError> {
+    global_offsets
+        .get(payload_ref.shard_id as usize)
+        .copied()
+        .and_then(|base| base.checked_add(payload_ref.local_id))
+        .ok_or_else(|| {
+            AnalysisError::InvalidData("pending payload reference is out of range".into())
+        })
+}
+
+fn push_pending_source_header(
+    sources: &mut EncodeSourceSoA,
+    contract_id: u32,
+    payload_id: u32,
+    token_range: TokenRange,
+    token_cursor: &mut usize,
+) -> Result<(), AnalysisError> {
+    if token_range.start != *token_cursor
+        || token_range.end < token_range.start
+        || token_range.end > sources.token_ids.len()
+    {
+        return Err(AnalysisError::InvalidData(format!(
+            "pending token range is not contiguous or is out of bounds: cursor={}, range={}..{}, total={}",
+            *token_cursor,
+            token_range.start,
+            token_range.end,
+            sources.token_ids.len()
+        )));
+    }
+    sources.contract_ids.push(contract_id);
+    sources.payload_ids.push(payload_id);
+    sources.token_offsets.push(
+        u64::try_from(token_range.end)
+            .map_err(|_| AnalysisError::InvalidData("metadata token offset exceeds u64".into()))?,
+    );
+    *token_cursor = token_range.end;
     Ok(())
 }
 
@@ -2993,6 +3122,31 @@ fn storage_err(err: impl std::fmt::Display) -> AnalysisError {
     AnalysisError::InvalidData(format!("storage broker: {err}"))
 }
 
+fn reserve_storage_advisory(
+    broker: &mut StorageBroker,
+    class: ArtifactClass,
+    final_bytes: u64,
+    partial_peak_bytes: u64,
+    label: &str,
+    warn: impl FnOnce(String),
+) -> Result<Option<StorageLease>, AnalysisError> {
+    match broker.reserve(class, final_bytes, partial_peak_bytes) {
+        Ok(lease) => Ok(Some(lease)),
+        Err(StorageLedgerError::InsufficientSpace {
+            requested,
+            available,
+        }) => {
+            warn(format!(
+                "conservative storage estimate for {label} requests {requested} bytes, but only \
+                 {available} bytes are currently available; continuing without a reservation and \
+                 relying on actual filesystem writes"
+            ));
+            Ok(None)
+        }
+        Err(error) => Err(storage_err(error)),
+    }
+}
+
 fn encode_err(err: impl std::fmt::Display) -> AnalysisError {
     AnalysisError::InvalidData(format!("metadata encode: {err}"))
 }
@@ -3010,11 +3164,13 @@ mod memory_dedup_tests {
     use std::collections::HashMap;
 
     use super::{
-        build_fallback_atoms_hash_sharded, intern_payload_with_parser,
+        build_encoded_contract, build_fallback_atoms_hash_sharded, intern_payload_with_parser,
         payload_feature_identity_ids, planned_encoded_contract_growth, planned_token_relation_peak,
-        EncodePayloadRow, EncodeResidentAccounting, EncodeResidentAdmission,
-        FallbackContractFilterTable, PayloadTermInterner, ShardedPayloadTermInterner,
-        TokenSourceInput,
+        reserve_storage_advisory, EncodePayloadRow, EncodeRegistrationAccounting,
+        EncodeResidentAccounting, EncodeResidentAdmission, FallbackContractFilterTable,
+        PayloadTermInterner, PendingContractSlot, PendingSourceSlot, ResolvedTokenMembership,
+        ShardedPayloadTermInterner, SourceCoordinate, TokenRange, TokenSourceInput,
+        TokenSourceRecord, TokenSourceRelation,
     };
     use duckdb::Connection;
     use metadata_engine::encode::{
@@ -3022,6 +3178,7 @@ mod memory_dedup_tests {
         PayloadArena, PayloadRef, PayloadTermSoA, ShardedPayloadArena,
     };
     use metadata_engine::resource::{MemoryBroker, GIB};
+    use metadata_engine::storage::{ArtifactClass, StorageBroker};
 
     #[test]
     fn fallback_contract_filter_table_owns_rows_and_cleans_up_on_drop() {
@@ -3193,21 +3350,9 @@ mod memory_dedup_tests {
         let sources = vec![
             TokenSourceInput {
                 token_ids: vec![1, 2, 3],
-                source_file: 1,
-                source_row_number: 1,
-                payload_ref: PayloadRef {
-                    shard_id: 0,
-                    local_id: 0,
-                },
             },
             TokenSourceInput {
                 token_ids: vec![4, 5],
-                source_file: 1,
-                source_row_number: 2,
-                payload_ref: PayloadRef {
-                    shard_id: 0,
-                    local_id: 1,
-                },
             },
         ];
 
@@ -3228,5 +3373,169 @@ mod memory_dedup_tests {
             planned_token_relation_peak(rows, rows, distinct_json).unwrap(),
             rows * 192 + rows * 8 + admitted_json + 64 * 1024 * 1024
         );
+    }
+
+    #[test]
+    fn conservative_storage_shortage_warns_and_allows_actual_write_attempt() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut broker = StorageBroker::open_with_physical_free(directory.path(), 1_000).unwrap();
+
+        let reservation = reserve_storage_advisory(
+            &mut broker,
+            ArtifactClass::Feature,
+            800,
+            300,
+            "test feature bundle",
+            |_| {},
+        )
+        .unwrap();
+
+        assert!(reservation.is_none());
+        assert_eq!(broker.snapshot().committed_bytes, 0);
+    }
+
+    #[test]
+    fn pending_token_arena_capacity_is_memory_accounted() {
+        fn pending() -> Vec<PendingContractSlot> {
+            vec![PendingContractSlot {
+                chain_id: 0,
+                weight: 1,
+                representative_payload_ref: PayloadRef {
+                    shard_id: 0,
+                    local_id: 0,
+                },
+                representative_token_range: TokenRange { start: 0, end: 0 },
+                token_sources: vec![PendingSourceSlot {
+                    payload_ref: PayloadRef {
+                        shard_id: 0,
+                        local_id: 0,
+                    },
+                    token_range: TokenRange { start: 0, end: 0 },
+                }],
+            }]
+        }
+
+        let arena = ShardedPayloadArena::with_shard_count(1, 1024);
+        let empty_tokens = Vec::new();
+        let mut empty_accounting = EncodeRegistrationAccounting::default();
+        let empty = empty_accounting
+            .resident_bytes(&pending(), &HashMap::new(), &arena, &empty_tokens)
+            .unwrap();
+        let mut populated_tokens = Vec::with_capacity(4);
+        populated_tokens.extend([1, 2, 3, 4]);
+        let mut populated_accounting = EncodeRegistrationAccounting::default();
+        let populated = populated_accounting
+            .resident_bytes(&pending(), &HashMap::new(), &arena, &populated_tokens)
+            .unwrap();
+
+        assert_eq!(populated - empty, 4 * std::mem::size_of::<u32>() as u64);
+    }
+
+    #[test]
+    fn pending_token_arena_is_written_in_final_csr_order_and_reused() {
+        let payload_ref = |local_id| PayloadRef {
+            shard_id: 0,
+            local_id,
+        };
+        let relation = TokenSourceRelation {
+            sources: vec![
+                TokenSourceRecord {
+                    source_file: 1,
+                    source_row_number: 10,
+                    payload_ref: payload_ref(0),
+                },
+                TokenSourceRecord {
+                    source_file: 1,
+                    source_row_number: 20,
+                    payload_ref: payload_ref(1),
+                },
+                TokenSourceRecord {
+                    source_file: 1,
+                    source_row_number: 30,
+                    payload_ref: payload_ref(2),
+                },
+            ],
+            memberships: vec![
+                ResolvedTokenMembership {
+                    contract_index: 0,
+                    source_id: 0,
+                    token_id: 1,
+                },
+                ResolvedTokenMembership {
+                    contract_index: 0,
+                    source_id: 0,
+                    token_id: 2,
+                },
+                ResolvedTokenMembership {
+                    contract_index: 0,
+                    source_id: 1,
+                    token_id: 4,
+                },
+                ResolvedTokenMembership {
+                    contract_index: 0,
+                    source_id: 2,
+                    token_id: 7,
+                },
+                ResolvedTokenMembership {
+                    contract_index: 0,
+                    source_id: 2,
+                    token_id: 8,
+                },
+            ],
+            contract_offsets: vec![0, 5],
+            logical_bytes: 0,
+        };
+        let mut pending_token_ids = Vec::new();
+        let (representative_token_range, token_sources) = relation
+            .append_contract_layout(
+                0,
+                SourceCoordinate {
+                    source_file: 1,
+                    source_row_number: 20,
+                },
+                &mut pending_token_ids,
+            )
+            .unwrap();
+
+        assert_eq!(pending_token_ids, [4, 1, 2, 7, 8]);
+        assert_eq!(representative_token_range, TokenRange { start: 0, end: 1 });
+        assert_eq!(token_sources.len(), 2);
+        assert_eq!(
+            token_sources[0].token_range,
+            TokenRange { start: 1, end: 3 }
+        );
+        assert_eq!(
+            token_sources[1].token_range,
+            TokenRange { start: 3, end: 5 }
+        );
+
+        let token_pointer = pending_token_ids.as_ptr();
+        let mut sources = metadata_engine::encode::EncodeSourceSoA::with_source_capacity(3);
+        sources.token_ids = pending_token_ids;
+        let mut contracts = EncodeContractSoA::with_contract_capacity(1);
+        let mut token_cursor = 0usize;
+        build_encoded_contract(
+            PendingContractSlot {
+                chain_id: 9,
+                weight: 11,
+                representative_payload_ref: payload_ref(1),
+                representative_token_range,
+                token_sources,
+            },
+            0,
+            &[100, 103],
+            &mut token_cursor,
+            &mut sources,
+            &mut contracts,
+        )
+        .unwrap();
+
+        assert_eq!(sources.token_ids.as_ptr(), token_pointer);
+        assert_eq!(sources.contract_ids, [0, 0, 0]);
+        assert_eq!(sources.payload_ids, [101, 100, 102]);
+        assert_eq!(sources.token_offsets, [0, 1, 3, 5]);
+        assert_eq!(sources.token_ids, [4, 1, 2, 7, 8]);
+        assert_eq!(contracts.source_doc_ids, [0]);
+        assert_eq!(token_cursor, 5);
     }
 }

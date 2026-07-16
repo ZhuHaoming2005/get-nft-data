@@ -6,8 +6,8 @@ pub mod payload_cas;
 
 pub use feature_soa::{
     encode_artifact_upper_bound_soa, write_encode_artifacts,
-    write_encode_artifacts_soa_with_progress,
-    write_encode_artifacts_with_contracts, write_encode_artifacts_with_contracts_and_atoms,
+    write_encode_artifacts_soa_with_progress, write_encode_artifacts_with_contracts,
+    write_encode_artifacts_with_contracts_and_atoms,
     write_encode_artifacts_with_contracts_and_atoms_with_progress, EncodeBundle, EncodeContractRow,
     EncodeContractSoA, EncodePayloadRow, EncodePersistStats, EncodeSourceRow, EncodeSourceSoA,
     FallbackAtomCsr, FeatureSoaError, FeatureView, PayloadTermListBatch, PayloadTermLists,
