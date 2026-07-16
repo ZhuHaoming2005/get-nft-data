@@ -88,6 +88,11 @@ pub fn run_analysis_phase(
     let mut phase_options = options.clone();
     phase_options.threads = phase_worker_threads(options.threads, phase);
     let options = &phase_options;
+    if matches!(phase, AnalysisPhase::MetadataMatch)
+        && std::env::var_os("NAME_URI_ANALYSIS_EPHEMERAL_IN_MEMORY").is_some()
+    {
+        release_ephemeral_prepare_state(options, work_directory)?;
+    }
     // MetadataEncode reads Prepare's DuckDB state without mutating Prepare/Name
     // tables. Match remains the sole owner of production metadata summary rows.
     if matches!(phase, AnalysisPhase::MetadataEncode) {
@@ -190,6 +195,36 @@ pub fn run_analysis_phase(
     result
 }
 
+fn release_ephemeral_prepare_state(
+    options: &AnalysisOptions,
+    work_directory: &Path,
+) -> Result<(), AnalysisError> {
+    let work = fs::canonicalize(work_directory)?;
+    if options.database_path.is_file() {
+        let database = fs::canonicalize(&options.database_path)?;
+        if !database.starts_with(&work) {
+            return Err(AnalysisError::InvalidData(format!(
+                "refusing to release database outside work directory: {}",
+                database.display()
+            )));
+        }
+        fs::remove_file(database)?;
+    }
+    if let Some(temp_directory) = options.temp_directory.as_ref() {
+        if temp_directory.exists() {
+            let temp = fs::canonicalize(temp_directory)?;
+            if temp == work || !temp.starts_with(&work) {
+                return Err(AnalysisError::InvalidData(format!(
+                    "refusing to release DuckDB temp directory outside work directory: {}",
+                    temp.display()
+                )));
+            }
+            fs::remove_dir_all(temp)?;
+        }
+    }
+    Ok(())
+}
+
 fn phase_worker_threads(default_threads: usize, phase: AnalysisPhase) -> usize {
     let key = match phase {
         AnalysisPhase::Prepare => "NAME_URI_ANALYSIS_PREPARE_THREADS",
@@ -263,6 +298,41 @@ fn run_metadata_pipeline(
     work_directory: &Path,
     progress: &ProgressTracker,
 ) -> Result<Vec<SummaryRow>, AnalysisError> {
+    let result = run_metadata_pipeline_result(options, work_directory, progress)?;
+    record_diagnostic_result(
+        "metadata production advisory",
+        write_metadata_production_readiness(work_directory, &result),
+    );
+    let rows = result
+        .summary_rows
+        .into_iter()
+        .map(|row| SummaryRow {
+            field_name: "metadata".into(),
+            scope: row.scope,
+            primary_chain: row.primary_chain,
+            secondary_chain: row.secondary_chain,
+            threshold: Some(metadata_engine::scoring::METADATA_THRESHOLD),
+            match_mode: "template_recall_hybrid_verify".into(),
+            metric: "duplicate_group".into(),
+            total_contracts: row.total_contracts,
+            total_nfts: row.total_nfts,
+            group_count: row.group_count,
+            duplicate_contract_count: row.duplicate_contract_count,
+            duplicate_nft_count: row.duplicate_nft_count,
+            duplicate_contract_ratio: pct(row.duplicate_contract_count, row.total_contracts),
+            duplicate_nft_ratio: pct(row.duplicate_nft_count, row.total_nfts),
+            group_size_ge_2_count: row.group_size_ge_2_count,
+            group_size_gt_2_count: row.group_size_gt_2_count,
+        })
+        .collect();
+    Ok(rows)
+}
+
+pub(crate) fn run_metadata_pipeline_result(
+    options: &AnalysisOptions,
+    work_directory: &Path,
+    progress: &ProgressTracker,
+) -> Result<metadata_engine::pipeline::MetadataPipelineResult, AnalysisError> {
     use metadata_engine::resource::{GIB, MATCH_HARD_TOP};
     let layout = metadata_engine::artifacts::MetadataArtifactLayout::new(work_directory);
     let features = layout.encode_dir();
@@ -294,41 +364,14 @@ fn run_metadata_pipeline(
         evidence_gate_policy: metadata_engine::evidence::EvidenceGatePolicy::production(),
         edge_bytes,
     };
-    let result = metadata_engine::pipeline::run_metadata_pipeline_ephemeral_with_progress(
+    metadata_engine::pipeline::run_metadata_pipeline_ephemeral_with_progress(
         &features,
         &blocking,
         &out,
         &config,
         |event| progress.observe_engine_event(event),
     )
-    .map_err(|err| AnalysisError::InvalidData(format!("metadata pipeline: {err}")))?;
-    record_diagnostic_result(
-        "metadata production advisory",
-        write_metadata_production_readiness(work_directory, &result),
-    );
-    let rows = result
-        .summary_rows
-        .into_iter()
-        .map(|row| SummaryRow {
-            field_name: "metadata".into(),
-            scope: row.scope,
-            primary_chain: row.primary_chain,
-            secondary_chain: row.secondary_chain,
-            threshold: Some(metadata_engine::scoring::METADATA_THRESHOLD),
-            match_mode: "template_recall_hybrid_verify".into(),
-            metric: "duplicate_group".into(),
-            total_contracts: row.total_contracts,
-            total_nfts: row.total_nfts,
-            group_count: row.group_count,
-            duplicate_contract_count: row.duplicate_contract_count,
-            duplicate_nft_count: row.duplicate_nft_count,
-            duplicate_contract_ratio: pct(row.duplicate_contract_count, row.total_contracts),
-            duplicate_nft_ratio: pct(row.duplicate_nft_count, row.total_nfts),
-            group_size_ge_2_count: row.group_size_ge_2_count,
-            group_size_gt_2_count: row.group_size_gt_2_count,
-        })
-        .collect();
-    Ok(rows)
+    .map_err(|err| AnalysisError::InvalidData(format!("metadata pipeline: {err}")))
 }
 
 fn diagnostics_enabled() -> bool {

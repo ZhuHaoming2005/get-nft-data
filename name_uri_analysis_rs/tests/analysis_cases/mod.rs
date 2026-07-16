@@ -71,9 +71,10 @@ fn isolated_process_phases_match_the_in_process_report() {
     ] {
         run_analysis_phase(&phase_options, phase, &phase_work).unwrap();
     }
-    assert!(phase_work
-        .join("artifacts/metadata/match-1/metadata-summary-1/metadata-summary.ready")
-        .is_file());
+    assert!(phase_work.join("partial/metadata-summary.json").is_file());
+    assert!(!phase_work
+        .join("artifacts/metadata/match-1/metadata-summary-1")
+        .exists());
     let phased = finalize_analysis_phases(&phase_options, &phase_work).unwrap();
 
     let mut in_process_options = phase_options.clone();

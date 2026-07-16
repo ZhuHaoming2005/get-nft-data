@@ -1231,7 +1231,7 @@ fn exact_evidence_plan_scales_both_pair_partitions_to_the_joint_budget() {
 #[test]
 fn scoring_and_evidence_gate_revisions_are_versioned_independently() {
     assert_eq!(metadata_engine::scoring::MATCH_SEMANTICS_REVISION, 6);
-    assert_eq!(metadata_engine::evidence::EVIDENCE_GATE_REVISION, 3);
+    assert_eq!(metadata_engine::evidence::EVIDENCE_GATE_REVISION, 4);
 }
 
 #[test]

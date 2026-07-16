@@ -79,9 +79,25 @@ pub(crate) fn run_name_analysis(
     let threshold = spec.threshold;
     progress.start_stage("analyzing name duplicates", 6);
     progress.step_stage("loaded name totals");
-    let name_atom_total = count_all_name_atoms(conn)?;
+    let (name_atom_total, estimated_name_load_bytes) = estimate_name_atom_load(conn)?;
+    let worker_stack_bytes = name_worker_stack_reserve_bytes(spec.threads);
+    let load_preflight_bytes = estimated_name_load_bytes
+        .saturating_add(estimated_name_load_bytes / 4)
+        .saturating_add(8 * 1024 * 1024)
+        .saturating_add(worker_stack_bytes);
+    name_analysis_memory_plan(
+        spec.memory_limit,
+        spec.analysis_memory_limit,
+        load_preflight_bytes,
+    )?;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(spec.threads.max(1))
+        .thread_name(|index| format!("name-{index}"))
+        .stack_size(NAME_ANALYSIS_WORKER_STACK_BYTES)
+        .build()
+        .map_err(|err| AnalysisError::InvalidData(err.to_string()))?;
     progress.start_task("loading name atoms", Some(name_atom_total), "rows");
-    let atoms = load_all_name_atoms(conn, chains, |delta| {
+    let atoms = load_all_name_atoms(conn, chains, &pool, |delta| {
         progress.advance_task(delta, ProgressCounters::default());
     })?;
     if atoms.len() > u32::MAX as usize {
@@ -135,7 +151,6 @@ pub(crate) fn run_name_analysis(
     let chain_matrix_state_bytes = chain_matrix_reuse_state_bytes(&atoms_by_chain);
     let state_bytes =
         threshold_state_bytes(atoms.len(), chains.len()).saturating_add(chain_matrix_state_bytes);
-    let worker_stack_bytes = name_worker_stack_reserve_bytes(spec.threads);
     let initial_memory_plan = name_analysis_memory_plan(
         spec.memory_limit,
         spec.analysis_memory_limit,
@@ -164,12 +179,6 @@ pub(crate) fn run_name_analysis(
         "Rust analysis memory budget {}",
         format_byte_size(memory_plan.analysis_bytes)
     ));
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(spec.threads.max(1))
-        .thread_name(|index| format!("name-{index}"))
-        .stack_size(NAME_ANALYSIS_WORKER_STACK_BYTES)
-        .build()
-        .map_err(|err| AnalysisError::InvalidData(err.to_string()))?;
     progress.start_task(
         format!(
             "building candidate index for {} canonical names",
@@ -276,16 +285,34 @@ pub(crate) fn run_name_analysis(
     })
 }
 
+fn estimate_name_atom_load(conn: &Connection) -> Result<(u64, usize), AnalysisError> {
+    let (rows, string_bytes): (u64, u64) = conn.query_row(
+        "SELECT count(*)::UBIGINT,
+                (coalesce(sum(length(name_norm)), 0) * 4)::UBIGINT
+         FROM name_atoms",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let struct_bytes = rows
+        .checked_mul(std::mem::size_of::<NameAtom>() as u64)
+        .ok_or_else(|| AnalysisError::InvalidData("name load estimate overflow".into()))?;
+    let total = struct_bytes
+        .checked_add(string_bytes)
+        .ok_or_else(|| AnalysisError::InvalidData("name load estimate overflow".into()))?;
+    let total = usize::try_from(total)
+        .map_err(|_| AnalysisError::InvalidData("name load estimate exceeds usize".into()))?;
+    Ok((rows, total))
+}
+
+#[cfg(test)]
 pub(crate) fn count_all_name_atoms(conn: &Connection) -> Result<u64, AnalysisError> {
-    conn.query_row("SELECT count(*)::UBIGINT FROM name_atoms", [], |row| {
-        row.get(0)
-    })
-    .map_err(AnalysisError::from)
+    estimate_name_atom_load(conn).map(|(rows, _)| rows)
 }
 
 pub(crate) fn load_all_name_atoms(
     conn: &Connection,
     chains: &[String],
+    pool: &rayon::ThreadPool,
     mut on_rows_loaded: impl FnMut(u64),
 ) -> Result<Vec<NameAtom>, AnalysisError> {
     let chain_indexes = chains
@@ -311,40 +338,44 @@ pub(crate) fn load_all_name_atoms(
             .as_any()
             .downcast_ref::<Int64Array>()
             .ok_or_else(|| AnalysisError::InvalidData("name nft_count is not INT64".into()))?;
-        let mut batch_atoms = (0..row_count)
-            .into_par_iter()
-            .map(|index| -> Result<Option<NameAtom>, AnalysisError> {
-                if chains.is_null(index)
-                    || names.is_null(index)
-                    || contract_counts.is_null(index)
-                    || nft_counts.is_null(index)
-                {
-                    return Err(AnalysisError::InvalidData(
-                        "name atom row contains NULL".into(),
-                    ));
-                }
-                let chain = name_arrow_string(chains, index)?;
-                let Some(chain_index) = chain_indexes.get(chain).copied() else {
-                    return Ok(None);
-                };
-                let name = name_arrow_string(names, index)?;
-                Ok(Some(NameAtom {
-                    chain_index,
-                    name_norm: name.to_owned(),
-                    char_len: name.chars().count(),
-                    contract_count: contract_counts.value(index),
-                    nft_count: nft_counts.value(index),
-                }))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut batch_atoms = pool.install(|| {
+            (0..row_count)
+                .into_par_iter()
+                .map(|index| -> Result<Option<NameAtom>, AnalysisError> {
+                    if chains.is_null(index)
+                        || names.is_null(index)
+                        || contract_counts.is_null(index)
+                        || nft_counts.is_null(index)
+                    {
+                        return Err(AnalysisError::InvalidData(
+                            "name atom row contains NULL".into(),
+                        ));
+                    }
+                    let chain = name_arrow_string(chains, index)?;
+                    let Some(chain_index) = chain_indexes.get(chain).copied() else {
+                        return Ok(None);
+                    };
+                    let name = name_arrow_string(names, index)?;
+                    Ok(Some(NameAtom {
+                        chain_index,
+                        name_norm: name.to_owned(),
+                        char_len: name.chars().count(),
+                        contract_count: contract_counts.value(index),
+                        nft_count: nft_counts.value(index),
+                    }))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })?;
         atoms.extend(batch_atoms.drain(..).flatten());
         on_rows_loaded(row_count as u64);
     }
-    atoms.par_sort_unstable_by(|left, right| {
-        left.char_len
-            .cmp(&right.char_len)
-            .then_with(|| left.chain_index.cmp(&right.chain_index))
-            .then_with(|| left.name_norm.cmp(&right.name_norm))
+    pool.install(|| {
+        atoms.par_sort_unstable_by(|left, right| {
+            left.char_len
+                .cmp(&right.char_len)
+                .then_with(|| left.chain_index.cmp(&right.chain_index))
+                .then_with(|| left.name_norm.cmp(&right.name_norm))
+        });
     });
     Ok(atoms)
 }

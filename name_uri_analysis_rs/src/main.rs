@@ -70,6 +70,62 @@ fn resolve_worker_threads(requested: usize) -> usize {
     requested.min(available).max(1)
 }
 
+#[cfg(target_os = "linux")]
+fn memory_backed_available_bytes(path: &Path) -> Result<u64, Box<dyn std::error::Error>> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    const TMPFS_MAGIC: u64 = 0x0102_1994;
+    fs::create_dir_all(path)?;
+    let path = CString::new(path.as_os_str().as_bytes())?;
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    let status = unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) };
+    if status != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let stats = unsafe { stats.assume_init() };
+    if stats.f_type as u64 != TMPFS_MAGIC {
+        return Err("--ephemeral-in-memory work directory is not backed by Linux tmpfs".into());
+    }
+    Ok((stats.f_bavail as u64).saturating_mul(stats.f_bsize as u64))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn memory_backed_available_bytes(_path: &Path) -> Result<u64, Box<dyn std::error::Error>> {
+    Ok(u64::MAX)
+}
+
+fn validate_memory_backed_work_directory(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let available = memory_backed_available_bytes(path)?;
+    if available < 8 * 1024 * 1024 * 1024 {
+        return Err(format!(
+            "--ephemeral-in-memory requires at least 8 GiB free in the RAM-backed work directory; available {} bytes",
+            available
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_ephemeral_capacity(
+    path: &Path,
+    input_bytes: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let available = memory_backed_available_bytes(path)?;
+    let required = input_bytes
+        .checked_mul(3)
+        .and_then(|bytes| bytes.checked_add(8 * 1024 * 1024 * 1024))
+        .ok_or("ephemeral capacity estimate overflow")?;
+    if available < required {
+        return Err(format!(
+            "--ephemeral-in-memory capacity check failed: estimated intermediate requirement {} bytes, available {} bytes",
+            required, available
+        )
+        .into());
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum InternalPhase {
     Prepare,
@@ -169,6 +225,9 @@ struct Args {
     #[arg(long, value_parser = parse_positive_usize)]
     duckdb_threads: Option<usize>,
 
+    #[arg(long, help = "Disable automatic Linux NUMA interleave policy")]
+    disable_numa_interleave: bool,
+
     #[arg(
         long,
         default_value = "448GiB",
@@ -231,6 +290,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::env::set_var(key, value.to_string());
         }
     }
+    if args.disable_numa_interleave {
+        std::env::set_var("NAME_URI_ANALYSIS_DISABLE_NUMA_INTERLEAVE", "1");
+    }
     if let Some(phase) = args.internal_phase {
         let config = args
             .internal_config
@@ -258,8 +320,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(path) = args.work_directory {
             path
         } else if cfg!(target_os = "linux") && Path::new("/dev/shm").is_dir() {
-            PathBuf::from("/dev/shm")
-                .join(format!("name_uri_analysis_rs_work-{}", std::process::id()))
+            PathBuf::from("/dev/shm").join("name_uri_analysis_rs_work")
         } else {
             return Err("--ephemeral-in-memory requires Linux /dev/shm or an explicit RAM-backed --work-directory".into());
         }
@@ -269,9 +330,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let (work_directory, output_directory) =
         resolve_directory_layout(&requested_work_directory, &args.output_dir)?;
+    if args.ephemeral_in_memory {
+        std::env::set_var("NAME_URI_ANALYSIS_EPHEMERAL_IN_MEMORY", "1");
+        validate_memory_backed_work_directory(&work_directory)?;
+    }
     let _controller_lock = ControllerLock::acquire(&work_directory)?;
     let mut phase_lease = ControllerPhaseLease::acquire(&work_directory)?;
     let inputs = fingerprint_inputs(&args.parquet_inputs)?;
+    let ephemeral_input_bytes = inputs
+        .iter()
+        .try_fold(0u64, |total, input| total.checked_add(input.size))
+        .ok_or("input byte total overflow")?;
     let warning_threads = args
         .duckdb_threads
         .unwrap_or_else(|| duckdb_threads_for_row_group_warning(effective_threads))
@@ -307,6 +376,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let (config_path, mut manifest) =
         prepare_work_directory(&work_directory, expected_manifest, args.resume)?;
+    if args.ephemeral_in_memory && !args.resume {
+        validate_ephemeral_capacity(&work_directory, ephemeral_input_bytes)?;
+    }
 
     for &(phase, stage, partial) in scheduled_phases() {
         if args.resume && checkpoint_is_complete_and_valid(&manifest, stage, &work_directory)? {

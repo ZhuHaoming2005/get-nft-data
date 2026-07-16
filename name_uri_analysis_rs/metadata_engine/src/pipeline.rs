@@ -51,6 +51,8 @@ pub const DEFAULT_EXACT_PAIR_WORK: u64 = 20_000_000_000;
 const MAX_EVIDENCE_RESIDENT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 const CONNECTIVITY_RUN_REVISION: u32 = 4;
+const MAX_RESCUE_PAYLOAD_CACHE_ENTRIES: usize = 65_536;
+const RESCUE_PAYLOAD_CACHE_ENTRY_BYTES: u64 = 32;
 
 #[derive(Debug, Clone)]
 pub struct MetadataPipelineConfig {
@@ -2138,13 +2140,13 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
         &shared_token_exact_evidence.calibration_misses,
     );
     let connectivity_plan_digest = connectivity_plan_digest(&rescue_plan)?;
-    let rescue_json = serde_json::to_string_pretty(&serde_json::json!({
-        "revision": 1,
-        "schema_revision": crate::scoring::MATCH_SEMANTICS_REVISION,
-        "snapshot_fingerprint": catalog.snapshot_fingerprint,
-        "plan": rescue_plan,
-    }))?;
     if persistence == MatchPersistence::Durable {
+        let rescue_json = serde_json::to_string_pretty(&serde_json::json!({
+            "revision": 1,
+            "schema_revision": crate::scoring::MATCH_SEMANTICS_REVISION,
+            "snapshot_fingerprint": catalog.snapshot_fingerprint,
+            "plan": rescue_plan,
+        }))?;
         crate::format::commit_ready(
             &out.join("rescue-plan-1"),
             "rescue-plan.ready",
@@ -2159,12 +2161,16 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
                 .ok_or_else(|| {
                     PipelineError::Invariant("holdout evaluated pair work overflow".into())
                 })?,
-            exhaustive: pair_frontier_covers_all_unordered_pairs(
-                &samples,
-                &holdout_samples,
-                snapshot.atom_count(),
-            ) && shared_plan
-                .covers_all_active_groups(&snapshot.features().token_member_offsets),
+            exhaustive: evidence_scan_is_exhaustive(
+                pair_frontier_covers_all_unordered_pairs(
+                    &samples,
+                    &holdout_samples,
+                    snapshot.atom_count(),
+                ),
+                shared_plan.covers_all_active_groups(&snapshot.features().token_member_offsets),
+                shared_token_exact_evidence.pair_work,
+                shared_plan.pair_work,
+            ),
             pair_exact_matches: pair_holdout_evidence.exact_matches,
             pair_misses: &pair_holdout_evidence.conservative_misses,
             shared_exact_matches: shared_token_exact_evidence.holdout_exact_matches,
@@ -2306,6 +2312,7 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
                 &snapshot,
                 &rescue_plan,
                 config.threads,
+                &memory,
                 &mut progress,
             )?;
             let rescue_pair_visits = rescue_execution_plan.total_visits();
@@ -2928,6 +2935,17 @@ fn pair_frontier_covers_all_unordered_pairs(
     distinct.len() >= atom_count.saturating_sub(1)
 }
 
+fn evidence_scan_is_exhaustive(
+    pair_frontier_exhaustive: bool,
+    all_shared_groups_selected: bool,
+    evaluated_shared_pair_work: u64,
+    shared_pair_population: u64,
+) -> bool {
+    pair_frontier_exhaustive
+        && all_shared_groups_selected
+        && evaluated_shared_pair_work == shared_pair_population
+}
+
 fn shared_token_work_stratum(token_member_offsets: &[u64], token: u32) -> Option<u32> {
     let token = token as usize;
     let end = *token_member_offsets.get(token + 1)?;
@@ -3335,7 +3353,7 @@ fn max_shared_group_index_bytes_with_progress(
                 )
                 .ok_or(crate::resource::MemoryError::Overflow)?;
             bytes = bytes
-                .checked_add(terms.saturating_mul(16).saturating_add(128))
+                .checked_add(terms.saturating_mul(8).saturating_add(256))
                 .ok_or(crate::resource::MemoryError::Overflow)?;
         }
         maximum = maximum.max(bytes);
@@ -3496,6 +3514,7 @@ fn build_rescue_execution_plan(
     snapshot: &MetadataSnapshot,
     rescue: &RescuePlan,
     lanes: usize,
+    memory: &MemoryBroker,
     mut progress: impl FnMut(ProgressEvent),
 ) -> Result<RescueExecutionPlan, PipelineError> {
     let atom_count = snapshot.atom_count() as u32;
@@ -3571,6 +3590,13 @@ fn build_rescue_execution_plan(
         .thread_name(|index| format!("metadata-rescue-{index}"))
         .build()
         .map_err(|error| PipelineError::Parallel(error.to_string()))?;
+    let rescue_fixed_bytes = (atom_count as u64)
+        .saturating_mul(std::mem::size_of::<u32>() as u64)
+        .saturating_add(atom_count as u64);
+    let rescue_cache_bytes = (lanes as u64)
+        .saturating_mul(MAX_RESCUE_PAYLOAD_CACHE_ENTRIES as u64)
+        .saturating_mul(RESCUE_PAYLOAD_CACHE_ENTRY_BYTES);
+    let _rescue_memory = memory.reserve(rescue_fixed_bytes.saturating_add(rescue_cache_bytes))?;
     let (sender, receiver) = std::sync::mpsc::sync_channel(lanes.max(1) * 2);
     let mut rescue_atom_mask = vec![false; atom_count as usize];
     for &atom in &rescue.pair_atoms {
@@ -3603,11 +3629,12 @@ fn build_rescue_execution_plan(
                                 }
                                 scored = scored.saturating_add(1);
                                 let right_payload = atom_payloads[right_atom as usize];
-                                let exact_match =
-                                    *payload_scores.entry(right_payload).or_insert_with(|| {
-                                        score_pair(snapshot.features(), left_payload, right_payload)
-                                            == PairScoreDecision::ExactMatch
-                                    });
+                                let exact_match = bounded_payload_match(
+                                    &mut payload_scores,
+                                    snapshot.features(),
+                                    left_payload,
+                                    right_payload,
+                                );
                                 if exact_match {
                                     matches.push((left_atom, right_atom));
                                 }
@@ -3646,11 +3673,12 @@ fn build_rescue_execution_plan(
                                 }
                                 scored = scored.saturating_add(1);
                                 let payload = features.source_to_payload[sources[offset] as usize];
-                                let exact_match =
-                                    *payload_scores.entry(payload).or_insert_with(|| {
-                                        score_pair(features, seed_payload, payload)
-                                            == PairScoreDecision::ExactMatch
-                                    });
+                                let exact_match = bounded_payload_match(
+                                    &mut payload_scores,
+                                    features,
+                                    seed_payload,
+                                    payload,
+                                );
                                 if exact_match {
                                     matches.push((seed.contract_id, contract));
                                 }
@@ -3717,6 +3745,23 @@ fn build_rescue_execution_plan(
             matched_shared_edges,
         })
     })
+}
+
+fn bounded_payload_match(
+    cache: &mut HashMap<u32, bool>,
+    features: &crate::encode::FeatureView,
+    left_payload: u32,
+    right_payload: u32,
+) -> bool {
+    if let Some(&decision) = cache.get(&right_payload) {
+        return decision;
+    }
+    let decision =
+        score_pair(features, left_payload, right_payload) == PairScoreDecision::ExactMatch;
+    if cache.len() < MAX_RESCUE_PAYLOAD_CACHE_ENTRIES {
+        cache.insert(right_payload, decision);
+    }
+    decision
 }
 
 #[cfg(test)]
@@ -5110,8 +5155,9 @@ mod tests {
             }],
         };
 
-        let serial = build_rescue_execution_plan(&snapshot, &rescue, 1, |_| {}).unwrap();
-        let parallel = build_rescue_execution_plan(&snapshot, &rescue, 4, |_| {}).unwrap();
+        let memory = MemoryBroker::new(512 << 30, 448 << 30).unwrap();
+        let serial = build_rescue_execution_plan(&snapshot, &rescue, 1, &memory, |_| {}).unwrap();
+        let parallel = build_rescue_execution_plan(&snapshot, &rescue, 4, &memory, |_| {}).unwrap();
         assert_eq!(serial.shared_score_visits, 2);
         assert_eq!(serial.total_visits(), 2);
         assert_eq!(parallel.shared_score_visits, serial.shared_score_visits);
@@ -5189,8 +5235,11 @@ mod tests {
         };
         let mut events = Vec::new();
 
-        let plan =
-            build_rescue_execution_plan(&snapshot, &rescue, 1, |event| events.push(event)).unwrap();
+        let memory = MemoryBroker::new(512 << 30, 448 << 30).unwrap();
+        let plan = build_rescue_execution_plan(&snapshot, &rescue, 1, &memory, |event| {
+            events.push(event);
+        })
+        .unwrap();
 
         assert_eq!(plan.atom_score_visits, 2);
         assert_eq!(plan.matched_atom_pairs, vec![(0, 1), (0, 2)]);
@@ -5208,6 +5257,19 @@ mod tests {
         assert!(!pair_frontier_covers_all_unordered_pairs(&[0, 1], &[4], 4));
         assert!(pair_frontier_covers_all_unordered_pairs(&[0, 2], &[1], 4));
         assert!(pair_frontier_covers_all_unordered_pairs(&[], &[], 1));
+    }
+
+    #[test]
+    fn exhaustive_evidence_requires_full_shared_pair_population() {
+        assert!(!evidence_scan_is_exhaustive(
+            true, true, 4_000_000, 10_000_000
+        ));
+        assert!(evidence_scan_is_exhaustive(
+            true, true, 10_000_000, 10_000_000
+        ));
+        assert!(!evidence_scan_is_exhaustive(
+            false, true, 10_000_000, 10_000_000
+        ));
     }
 
     #[test]

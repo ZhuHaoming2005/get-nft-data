@@ -114,6 +114,7 @@ fn cli_accepts_ephemeral_memory_and_phase_thread_overrides() {
         "128",
         "--duckdb-threads",
         "96",
+        "--disable-numa-interleave",
     ])
     .unwrap();
 
@@ -123,4 +124,5 @@ fn cli_accepts_ephemeral_memory_and_phase_thread_overrides() {
     assert_eq!(args.name_threads, Some(64));
     assert_eq!(args.metadata_match_threads, Some(128));
     assert_eq!(args.duckdb_threads, Some(96));
+    assert!(args.disable_numa_interleave);
 }

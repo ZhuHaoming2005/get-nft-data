@@ -146,7 +146,11 @@ fn name_atom_loader_reports_the_exact_scanned_row_total() {
     let mut scanned = 0u64;
 
     let total = count_all_name_atoms(&conn).unwrap();
-    let atoms = load_all_name_atoms(&conn, &chains, |delta| scanned += delta).unwrap();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    let atoms = load_all_name_atoms(&conn, &chains, &pool, |delta| scanned += delta).unwrap();
 
     assert_eq!(total, 3);
     assert_eq!(scanned, total);

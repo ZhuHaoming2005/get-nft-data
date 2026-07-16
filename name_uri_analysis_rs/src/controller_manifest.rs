@@ -283,7 +283,17 @@ pub(crate) fn match_observation_key(
             logical_cpus: system.cpus().len(),
             total_memory_bytes: system.total_memory(),
         },
-        threads: manifest.options.threads,
+        threads: std::env::var("NAME_URI_ANALYSIS_METADATA_MATCH_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(manifest.options.threads)
+            .min(
+                std::thread::available_parallelism()
+                    .map(|value| value.get())
+                    .unwrap_or(1),
+            )
+            .max(1),
         scale: MatchScaleKey {
             schema_version: MATCH_SCALE_SCHEMA_VERSION,
             input_rows_bucket: scale_bucket(input_rows),

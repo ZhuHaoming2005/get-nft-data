@@ -5,7 +5,10 @@ use std::path::Path;
 use duckdb::Connection;
 use sha2::{Digest, Sha256};
 
-use crate::analysis::{run_analysis_phase, AnalysisOptions, AnalysisPhase};
+use crate::analysis::{
+    run_analysis_phase, run_metadata_pipeline_result, AnalysisOptions, AnalysisPhase,
+    PipelineStage, ProgressTracker,
+};
 use metadata_engine::blocking::BLOCKING_REVISION;
 use metadata_engine::encode::{EncodeBundle, ENCODE_SCHEMA_REVISION};
 use metadata_engine::resource::{MemoryBroker, GIB};
@@ -254,6 +257,34 @@ fn prepare_business_fingerprint(database: &Path) -> String {
     format!("{contracts}#{tokens}")
 }
 
+fn semantic_groups_from_roots(
+    database: &Path,
+    roots: &[u32],
+) -> Vec<Vec<crate::analysis::semantic_oracle::ContractKey>> {
+    use crate::analysis::semantic_oracle::{duplicate_groups_from_roots, ContractKey};
+
+    let conn = Connection::open(database).unwrap();
+    let mut statement = conn
+        .prepare(
+            "SELECT chain, contract_address
+             FROM analysis_contracts
+             WHERE metadata_contract_index IS NOT NULL
+             ORDER BY metadata_contract_index",
+        )
+        .unwrap();
+    let keys = statement
+        .query_map([], |row| {
+            Ok(ContractKey::new(
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    duplicate_groups_from_roots(roots, &keys)
+}
+
 #[test]
 fn prepare_business_identities_are_stable_across_thread_counts() {
     let dir = tempfile::tempdir().unwrap();
@@ -273,8 +304,7 @@ fn prepare_business_identities_are_stable_across_thread_counts() {
 
 #[test]
 fn parallel_encode_match_is_semantically_deterministic_across_thread_counts() {
-    use crate::analysis::semantic_oracle::summaries_semantically_equal;
-    use crate::analysis::types::AnalysisReport;
+    use crate::analysis::semantic_oracle::{groups_semantically_equal, ContractKey};
 
     let dir = tempfile::tempdir().unwrap();
     let parquet = dir.path().join("metadata.parquet");
@@ -285,6 +315,7 @@ fn parallel_encode_match_is_semantically_deterministic_across_thread_counts() {
     run_analysis_phase(&prepared_options, AnalysisPhase::Prepare, &prepared).unwrap();
 
     let mut summaries = Vec::new();
+    let mut groups = Vec::new();
     for threads in [1, 4] {
         let work = dir.path().join(format!("work-{threads}"));
         fs::create_dir_all(&work).unwrap();
@@ -292,11 +323,26 @@ fn parallel_encode_match_is_semantically_deterministic_across_thread_counts() {
         options.threads = threads;
         fs::copy(&prepared_options.database_path, &options.database_path).unwrap();
         run_analysis_phase(&options, AnalysisPhase::MetadataEncode, &work).unwrap();
-        run_analysis_phase(&options, AnalysisPhase::MetadataMatch, &work).unwrap();
-        let summary_path = work.join("partial/metadata-summary.json");
-        let report: AnalysisReport =
-            serde_json::from_slice(&fs::read(&summary_path).unwrap()).unwrap();
-        summaries.push(report.summary_rows);
+        let progress = ProgressTracker::for_pipeline_stage(PipelineStage::MetadataMatch, false);
+        let result = run_metadata_pipeline_result(&options, &work, &progress).unwrap();
+        summaries.push(result.summary_rows);
+        let pair = result
+            .scope_components
+            .chain_pair_roots
+            .iter()
+            .find(|roots| roots.left_chain == 0 && roots.right_chain == 1)
+            .unwrap();
+        groups.push([
+            semantic_groups_from_roots(
+                &options.database_path,
+                &result.scope_components.intra_roots,
+            ),
+            semantic_groups_from_roots(
+                &options.database_path,
+                &result.scope_components.cross_roots,
+            ),
+            semantic_groups_from_roots(&options.database_path, &pair.roots),
+        ]);
         assert!(
             !metadata_engine::pipeline::default_output_dir(&work)
                 .join("component-snapshots")
@@ -304,12 +350,27 @@ fn parallel_encode_match_is_semantically_deterministic_across_thread_counts() {
             "Ephemeral Match must not persist component roots"
         );
     }
-    assert!(
-        summaries_semantically_equal(&summaries[0], &summaries[1]),
-        "thread=1 vs thread=4 metadata summaries must match semantically:\n{:#?}\n{:#?}",
-        summaries[0],
-        summaries[1]
+    assert_eq!(summaries[0], summaries[1]);
+    for (scope, (left, right)) in groups[0].iter().zip(&groups[1]).enumerate() {
+        assert!(
+            groups_semantically_equal(left.clone(), right.clone()),
+            "thread=1 vs thread=4 duplicate groups differ for scope index {scope}"
+        );
+    }
+    assert_eq!(
+        groups[0][0],
+        vec![vec![
+            ContractKey::new("ethereum", "0xaaa"),
+            ContractKey::new("ethereum", "0xbbb"),
+        ]]
     );
+    let expected_cross = vec![vec![
+        ContractKey::new("base", "0xccc"),
+        ContractKey::new("ethereum", "0xaaa"),
+        ContractKey::new("ethereum", "0xbbb"),
+    ]];
+    assert_eq!(groups[0][1], expected_cross);
+    assert_eq!(groups[0][2], expected_cross);
 }
 
 #[test]
