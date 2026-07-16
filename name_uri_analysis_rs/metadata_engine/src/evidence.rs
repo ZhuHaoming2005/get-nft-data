@@ -129,6 +129,36 @@ pub struct EvidenceGateReport {
     pub shared_statistical_misses: u64,
 }
 
+impl EvidenceGateReport {
+    pub fn advisory_message(&self) -> Option<String> {
+        (!self.passed).then(|| {
+            format!(
+                "ExactEvidence quality advisory did not pass: aggregate Wilson upper bound \
+                 {:.6}, maximum residual miss rate {:.6}, sample_sufficient={} \
+                 ({} residual misses / {} exact observations); diagnostics: pair {:.6} \
+                 ({}/{}, sufficient={}), shared-token {:.6} ({}/{}, sufficient={}); \
+                 skipped pair-work rate {:.6}, maximum stratum rate {:.6}, skip limit {:.6}",
+                self.wilson_upper_bound,
+                self.policy.max_miss_rate,
+                self.sample_sufficient,
+                self.observed_misses,
+                self.exact_matches,
+                self.pair_wilson_upper_bound,
+                self.pair_statistical_misses,
+                self.pair_statistical_trials,
+                self.pair_sample_sufficient,
+                self.shared_wilson_upper_bound,
+                self.shared_statistical_misses,
+                self.shared_statistical_trials,
+                self.shared_sample_sufficient,
+                self.skipped_pair_work_rate,
+                self.max_stratum_skipped_pair_work_rate,
+                self.policy.max_skipped_pair_work_rate,
+            )
+        })
+    }
+}
+
 #[derive(Debug, Error, PartialEq)]
 pub enum EvidenceError {
     #[error("invalid max miss rate {0}; expected a finite value in [0, 1]")]

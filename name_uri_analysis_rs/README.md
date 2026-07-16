@@ -30,9 +30,10 @@ Prepare/Name DuckDB 中间状态时，可使用 Linux tmpfs 纯内存模式：
 
 `--ephemeral-in-memory` 在 Linux 上默认使用稳定路径
 `/dev/shm/name_uri_analysis_rs_work`，会校验该路径确实属于 tmpfs，并在新任务启动前按
-`3 × 输入文件大小 + 8 GiB` 做最低容量检查。Docker 默认 `/dev/shm` 往往只有 64 MiB，
-必须通过 `--work-directory` 指向单独挂载且容量足够的 tmpfs。Name 完成后，Match 启动前会删除
-`stage.duckdb` 和 `duckdb-temp`，避免它们与 Match hard top 同时占用 RAM。
+`3 × 输入文件大小 + 8 GiB` 做保守容量估算。容量不足只打印警告并继续依赖实际 tmpfs 写入，
+不会回落到磁盘；路径并非 tmpfs 或真实写入失败仍会终止。Docker 默认 `/dev/shm` 往往只有
+64 MiB，建议通过 `--work-directory` 指向单独挂载且容量足够的 tmpfs。Name 完成后，Match
+启动前会删除 `stage.duckdb` 和 `duckdb-temp`，避免它们与 Match hard top 同时占用 RAM。
 
 Linux 多 NUMA 节点默认尝试 `MPOL_INTERLEAVE`，容器拒绝该系统调用时自动退化；可通过
 `--disable-numa-interleave`（或环境变量
@@ -191,10 +192,12 @@ subphase、`completed/total`、工作单位和诊断计数，CLI 只负责渲染
 - URI `v1` 为 token URI 命中，`v2` 为 token 未命中但 image 命中，`v3` 为任一命中。
 - metadata 阈值为 0.6；BaseEquivalent 冻结候选关系后执行精确 template/content 校验，并按稳定
   SourceId 保留 token-specific metadata source。Calibration ExactIsland 冻结确定性 RescuePlan，
-  Rescue 扫描完成后可补充生产连通边；独立 holdout 只负责门禁，不会改变 RescuePlan。门禁以
-  sampled-left/shared-token group 为独立统计 cluster，并对 skipped pair-work 比例单独 fail closed。
-  Shared-token calibration 和 holdout 各自按 pair population 等比例采样；只有实际评估 pair work
-  等于所选 group 的完整 population 时才允许标记为 exhaustive。Evidence gate revision 为 4。
+  Rescue 扫描完成后可补充生产连通边；独立 holdout 只负责质量告警，不会改变 RescuePlan。
+  质量报告以 sampled-left/shared-token group 为独立统计 cluster，并单独报告 skipped pair-work
+  比例。未达到阈值时继续生成完整输出，同时将 metadata production readiness 标记为 false；
+  证据结构损坏或不变量失败仍会终止。Shared-token calibration 和 holdout 各自按 pair population
+  等比例采样；只有实际评估 pair work 等于所选 group 的完整 population 时才允许标记为
+  exhaustive。Evidence gate revision 为 4。
 - 所有比例的分母都是主链全部非空合约数和 NFT 行数，不是可分析子集。
 
 完整参数以 `--help` 为准。

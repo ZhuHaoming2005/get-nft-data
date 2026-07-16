@@ -95,14 +95,36 @@ fn memory_backed_available_bytes(_path: &Path) -> Result<u64, Box<dyn std::error
     Ok(u64::MAX)
 }
 
+fn minimum_ram_backed_capacity_warning(available: u64) -> Option<String> {
+    (available < 8 * 1024 * 1024 * 1024).then(|| {
+        format!(
+            "--ephemeral-in-memory has less than the recommended 8 GiB free in the RAM-backed \
+             work directory (available {available} bytes); continuing without falling back to disk"
+        )
+    })
+}
+
+fn estimated_ephemeral_capacity_warning(
+    input_bytes: u64,
+    available: u64,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let required = input_bytes
+        .checked_mul(3)
+        .and_then(|bytes| bytes.checked_add(8 * 1024 * 1024 * 1024))
+        .ok_or("ephemeral capacity estimate overflow")?;
+    Ok((available < required).then(|| {
+        format!(
+            "--ephemeral-in-memory conservative capacity estimate requests {required} bytes, \
+             but only {available} bytes are available; continuing without falling back to disk \
+             and relying on actual RAM-backed filesystem writes"
+        )
+    }))
+}
+
 fn validate_memory_backed_work_directory(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let available = memory_backed_available_bytes(path)?;
-    if available < 8 * 1024 * 1024 * 1024 {
-        return Err(format!(
-            "--ephemeral-in-memory requires at least 8 GiB free in the RAM-backed work directory; available {} bytes",
-            available
-        )
-        .into());
+    if let Some(warning) = minimum_ram_backed_capacity_warning(available) {
+        eprintln!("warning: {warning}");
     }
     Ok(())
 }
@@ -112,16 +134,8 @@ fn validate_ephemeral_capacity(
     input_bytes: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let available = memory_backed_available_bytes(path)?;
-    let required = input_bytes
-        .checked_mul(3)
-        .and_then(|bytes| bytes.checked_add(8 * 1024 * 1024 * 1024))
-        .ok_or("ephemeral capacity estimate overflow")?;
-    if available < required {
-        return Err(format!(
-            "--ephemeral-in-memory capacity check failed: estimated intermediate requirement {} bytes, available {} bytes",
-            required, available
-        )
-        .into());
+    if let Some(warning) = estimated_ephemeral_capacity_warning(input_bytes, available)? {
+        eprintln!("warning: {warning}");
     }
     Ok(())
 }

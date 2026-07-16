@@ -1779,26 +1779,29 @@ fn evidence_gate_rejects_invalid_global_skipped_work() {
 }
 
 #[test]
-fn evidence_gate_error_reports_each_independent_sub_gate() {
-    let error = metadata_engine::pipeline::PipelineError::EvidenceGate {
-        observed: 23,
-        exact_matches: 11_000,
-        upper: 0.003,
+fn evidence_gate_advisory_reports_each_independent_sub_gate() {
+    let report = metadata_engine::evidence::EvidenceGateReport {
+        policy: EvidenceGatePolicy::production(),
+        passed: false,
         sample_sufficient: true,
-        pair_misses: 3,
-        pair_matches: 1_000,
-        pair_upper: 0.009,
-        pair_sufficient: true,
-        shared_misses: 20,
-        shared_matches: 1_000,
-        shared_upper: 0.03,
-        shared_sufficient: true,
-        miss_limit: 0.01,
-        skipped_rate: 0.25,
-        max_stratum_rate: 0.50,
-        skip_limit: 0.01,
+        observed_misses: 23,
+        evaluated_pair_work: 20_000,
+        evidence_exhaustive: false,
+        exact_matches: 11_000,
+        wilson_upper_bound: 0.003,
+        pair_wilson_upper_bound: 0.009,
+        shared_wilson_upper_bound: 0.03,
+        pair_sample_sufficient: true,
+        shared_sample_sufficient: true,
+        skipped_shared_groups: vec![7],
+        skipped_pair_work_rate: 0.25,
+        max_stratum_skipped_pair_work_rate: 0.50,
+        pair_statistical_trials: 1_000,
+        pair_statistical_misses: 3,
+        shared_statistical_trials: 1_000,
+        shared_statistical_misses: 20,
     };
-    let message = error.to_string();
+    let message = report.advisory_message().unwrap();
 
     assert!(message.contains("aggregate Wilson upper bound 0.003000"));
     assert!(message.contains("pair 0.009000"));
@@ -2053,10 +2056,11 @@ fn frozen_calibration_rescue_repairs_production_components() {
 }
 
 #[test]
-fn insufficient_exact_holdout_gate_fails_closed_without_publishing_summary() {
+fn insufficient_exact_holdout_gate_warns_through_result_and_publishes_summary() {
     let (dir, features, blocking) = snapshot_fixture();
     let out = dir.path().join("strict-evidence-match");
-    let error = metadata_engine::pipeline::run_metadata_pipeline(
+    let mut advisories = Vec::new();
+    let result = metadata_engine::pipeline::run_metadata_pipeline_with_callbacks(
         &features,
         &blocking,
         &out,
@@ -2077,11 +2081,15 @@ fn insufficient_exact_holdout_gate_fails_closed_without_publishing_summary() {
             },
             edge_bytes: 1_000_000,
         },
+        |_| {},
+        |message| advisories.push(message.to_string()),
     )
-    .unwrap_err();
+    .unwrap();
 
-    assert!(error.to_string().contains("Wilson upper bound"), "{error}");
-    assert!(!out
+    assert!(!result.evidence_gate_report.passed);
+    assert_eq!(advisories.len(), 1);
+    assert!(advisories[0].contains("sample_sufficient=false"));
+    assert!(out
         .join("metadata-summary-1/metadata-summary.ready")
         .is_file());
 }

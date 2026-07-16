@@ -312,6 +312,28 @@ mod tests {
     }
 
     #[test]
+    fn quality_and_performance_gates_are_advisory_blockers() {
+        let mut input = input();
+        input.semantic_ready = false;
+        let mut evidence = evidence(&input);
+        evidence.performance_gate_passed = false;
+
+        let readiness = derive_metadata_production_readiness(&input, Some(&evidence));
+
+        assert!(!readiness.production_ready);
+        assert!(!readiness.semantic_ready);
+        assert!(!readiness.deployment_ready);
+        assert!(readiness
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("exact-evidence")));
+        assert!(readiness
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("target-host evidence")));
+    }
+
+    #[test]
     fn target_evidence_must_match_immutable_match_input() {
         let input = input();
         let evidence = evidence(&input);

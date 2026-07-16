@@ -126,3 +126,16 @@ fn cli_accepts_ephemeral_memory_and_phase_thread_overrides() {
     assert_eq!(args.duckdb_threads, Some(96));
     assert!(args.disable_numa_interleave);
 }
+
+#[test]
+fn ram_backed_capacity_thresholds_are_advisory() {
+    let minimum_warning = minimum_ram_backed_capacity_warning(1024).unwrap();
+    assert!(minimum_warning.contains("continuing without falling back to disk"));
+    assert!(minimum_ram_backed_capacity_warning(8 * 1024 * 1024 * 1024).is_none());
+
+    let estimate_warning = estimated_ephemeral_capacity_warning(1024, 1024)
+        .unwrap()
+        .unwrap();
+    assert!(estimate_warning.contains("conservative capacity estimate"));
+    assert!(estimate_warning.contains("continuing without falling back to disk"));
+}

@@ -369,12 +369,17 @@ pub(crate) fn run_metadata_pipeline_result(
         evidence_gate_policy: metadata_engine::evidence::EvidenceGatePolicy::production(),
         edge_bytes,
     };
-    metadata_engine::pipeline::run_metadata_pipeline_ephemeral_with_progress(
+    metadata_engine::pipeline::run_metadata_pipeline_ephemeral_with_callbacks(
         &features,
         &blocking,
         &out,
         &config,
         |event| progress.observe_engine_event(event),
+        |advisory| {
+            progress.warn(format!(
+                "{advisory}; continuing with complete outputs marked not production-ready"
+            ));
+        },
     )
     .map_err(|err| AnalysisError::InvalidData(format!("metadata pipeline: {err}")))
 }

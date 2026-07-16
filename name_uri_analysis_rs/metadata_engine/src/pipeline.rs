@@ -38,7 +38,10 @@ use crate::reduce::{
 use crate::resource::{MemoryBroker, MemoryLease};
 use crate::scheduler::{job_routing_pair_work, JobShape, RecallPlan, UniverseBudget, WorkCatalog};
 use crate::snapshot::{MetadataSnapshot, SnapshotError};
-use crate::storage::{ArtifactClass, ArtifactRegistration, EvictionPlan, StorageBroker};
+use crate::storage::{
+    ArtifactClass, ArtifactRegistration, EvictionPlan, StorageBroker, StorageLease,
+    StorageLedgerError,
+};
 
 pub const DEFAULT_MAX_CANDIDATE_PAIR_VISITS: u64 = 200_000_000_000;
 pub const DEFAULT_EXACT_SAMPLE_LEFTS: u64 = 1_024;
@@ -785,27 +788,6 @@ impl From<IndexMetrics> for SerializableIndexMetrics {
 pub enum PipelineError {
     #[error(transparent)]
     Identity(#[from] crate::identity::IdentityOverflow),
-    #[error(
-        "ExactEvidence gate failed: aggregate Wilson upper bound {upper:.6}, maximum residual miss rate {miss_limit:.6}, sample_sufficient={sample_sufficient} ({observed} residual misses / {exact_matches} exact observations); diagnostics: pair {pair_upper:.6} ({pair_misses}/{pair_matches}, sufficient={pair_sufficient}), shared-token {shared_upper:.6} ({shared_misses}/{shared_matches}, sufficient={shared_sufficient}); skipped pair-work rate {skipped_rate:.6}, maximum stratum rate {max_stratum_rate:.6}, skip limit {skip_limit:.6}"
-    )]
-    EvidenceGate {
-        observed: u64,
-        exact_matches: u64,
-        upper: f64,
-        sample_sufficient: bool,
-        pair_misses: u64,
-        pair_matches: u64,
-        pair_upper: f64,
-        pair_sufficient: bool,
-        shared_misses: u64,
-        shared_matches: u64,
-        shared_upper: f64,
-        shared_sufficient: bool,
-        miss_limit: f64,
-        skipped_rate: f64,
-        max_stratum_rate: f64,
-        skip_limit: f64,
-    },
     #[error("parallel catalog execution failed: {0}")]
     Parallel(String),
     #[error("pipeline invariant failed: {0}")]
@@ -1732,13 +1714,33 @@ pub fn run_metadata_pipeline_ephemeral_with_progress(
     config: &MetadataPipelineConfig,
     progress: impl FnMut(ProgressEvent),
 ) -> Result<MetadataPipelineResult, PipelineError> {
-    run_metadata_pipeline_with_progress_and_persistence(
+    run_metadata_pipeline_with_callbacks_and_persistence(
         features,
         blocking,
         out,
         config,
         MatchPersistence::Ephemeral,
         progress,
+        emit_default_advisory,
+    )
+}
+
+pub fn run_metadata_pipeline_ephemeral_with_callbacks(
+    features: &Path,
+    blocking: &Path,
+    out: &Path,
+    config: &MetadataPipelineConfig,
+    progress: impl FnMut(ProgressEvent),
+    advisory: impl FnMut(&str),
+) -> Result<MetadataPipelineResult, PipelineError> {
+    run_metadata_pipeline_with_callbacks_and_persistence(
+        features,
+        blocking,
+        out,
+        config,
+        MatchPersistence::Ephemeral,
+        progress,
+        advisory,
     )
 }
 
@@ -1775,13 +1777,56 @@ pub fn run_metadata_pipeline_with_progress(
     )
 }
 
+pub fn run_metadata_pipeline_with_callbacks(
+    features: &Path,
+    blocking: &Path,
+    out: &Path,
+    config: &MetadataPipelineConfig,
+    progress: impl FnMut(ProgressEvent),
+    advisory: impl FnMut(&str),
+) -> Result<MetadataPipelineResult, PipelineError> {
+    run_metadata_pipeline_with_callbacks_and_persistence(
+        features,
+        blocking,
+        out,
+        config,
+        MatchPersistence::MemoryFirst,
+        progress,
+        advisory,
+    )
+}
+
 pub fn run_metadata_pipeline_with_progress_and_persistence(
     features: &Path,
     blocking: &Path,
     out: &Path,
     config: &MetadataPipelineConfig,
     persistence: MatchPersistence,
+    progress: impl FnMut(ProgressEvent),
+) -> Result<MetadataPipelineResult, PipelineError> {
+    run_metadata_pipeline_with_callbacks_and_persistence(
+        features,
+        blocking,
+        out,
+        config,
+        persistence,
+        progress,
+        emit_default_advisory,
+    )
+}
+
+fn emit_default_advisory(message: &str) {
+    eprintln!("warning: {message}; continuing with outputs marked advisory");
+}
+
+fn run_metadata_pipeline_with_callbacks_and_persistence(
+    features: &Path,
+    blocking: &Path,
+    out: &Path,
+    config: &MetadataPipelineConfig,
+    persistence: MatchPersistence,
     mut progress: impl FnMut(ProgressEvent),
+    mut advisory: impl FnMut(&str),
 ) -> Result<MetadataPipelineResult, PipelineError> {
     let started = Instant::now();
     let worker_pool = build_metadata_worker_pool(config.threads)?;
@@ -1874,25 +1919,64 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
     }
     let mut storage_leases = Vec::new();
     if persistence != MatchPersistence::Ephemeral {
-        storage_leases.extend([
-            storage.reserve(
+        for reservation in [
+            (
                 ArtifactClass::ComponentSnapshot,
                 component_artifact_bytes,
                 component_partial_peak_bytes,
-            )?,
-            storage.reserve(ArtifactClass::Summary, 16 << 20, 16 << 20)?,
-        ]);
+                "metadata component snapshots",
+            ),
+            (
+                ArtifactClass::Summary,
+                16 << 20,
+                16 << 20,
+                "metadata summary",
+            ),
+        ] {
+            if let Some(lease) = reserve_pipeline_storage_advisory(
+                &mut storage,
+                reservation.0,
+                reservation.1,
+                reservation.2,
+                reservation.3,
+                &mut advisory,
+            )? {
+                storage_leases.push(lease);
+            }
+        }
     }
     if persistence == MatchPersistence::Durable {
-        storage_leases.extend([
-            storage.reserve(
+        for reservation in [
+            (
                 ArtifactClass::Index,
                 catalog_bytes,
                 catalog_bytes.min(64 << 20),
-            )?,
-            storage.reserve(ArtifactClass::ExactEvidence, edge_bytes, edge_bytes / 2)?,
-            storage.reserve(ArtifactClass::ConnectivityRun, edge_bytes, edge_bytes)?,
-        ]);
+                "metadata catalog index",
+            ),
+            (
+                ArtifactClass::ExactEvidence,
+                edge_bytes,
+                edge_bytes / 2,
+                "metadata exact evidence",
+            ),
+            (
+                ArtifactClass::ConnectivityRun,
+                edge_bytes,
+                edge_bytes,
+                "metadata connectivity runs",
+            ),
+        ] {
+            if let Some(lease) = reserve_pipeline_storage_advisory(
+                &mut storage,
+                reservation.0,
+                reservation.1,
+                reservation.2,
+                reservation.3,
+                &mut advisory,
+            )? {
+                storage_leases.push(lease);
+            }
+        }
     }
     let _catalog_mem = memory.reserve(
         config
@@ -2180,28 +2264,13 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
         &rescue_plan,
         config.evidence_gate_policy,
     )?;
-    if !evidence_gate_report.passed {
-        return Err(PipelineError::EvidenceGate {
-            observed: evidence_gate_report.observed_misses,
-            exact_matches: evidence_gate_report.exact_matches,
-            upper: evidence_gate_report.wilson_upper_bound,
-            sample_sufficient: evidence_gate_report.sample_sufficient,
-            pair_misses: evidence_gate_report.pair_statistical_misses,
-            pair_matches: evidence_gate_report.pair_statistical_trials,
-            pair_upper: evidence_gate_report.pair_wilson_upper_bound,
-            pair_sufficient: evidence_gate_report.pair_sample_sufficient,
-            shared_misses: evidence_gate_report.shared_statistical_misses,
-            shared_matches: evidence_gate_report.shared_statistical_trials,
-            shared_upper: evidence_gate_report.shared_wilson_upper_bound,
-            shared_sufficient: evidence_gate_report.shared_sample_sufficient,
-            miss_limit: config.evidence_gate_policy.max_miss_rate,
-            skipped_rate: evidence_gate_report.skipped_pair_work_rate,
-            max_stratum_rate: evidence_gate_report.max_stratum_skipped_pair_work_rate,
-            skip_limit: config.evidence_gate_policy.max_skipped_pair_work_rate,
-        });
+    if let Some(message) = evidence_gate_report.advisory_message() {
+        advisory(&message);
     }
     // Calibration freezes a deterministic rescue frontier. Holdout membership
-    // never enters this plan, so the independent gate cannot mutate production.
+    // never enters this plan, so the independent quality advisory cannot mutate
+    // production. A failed advisory remains attached to the result and marks
+    // production readiness false, but does not discard otherwise valid output.
     let recall = RecallPlan::freeze_with_rescue_lefts(
         &catalog,
         samples,
@@ -2712,6 +2781,32 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
     Ok(result)
 }
 
+fn reserve_pipeline_storage_advisory(
+    storage: &mut StorageBroker,
+    class: ArtifactClass,
+    final_bytes: u64,
+    partial_peak_bytes: u64,
+    label: &str,
+    advisory: &mut dyn FnMut(&str),
+) -> Result<Option<StorageLease>, PipelineError> {
+    match storage.reserve(class, final_bytes, partial_peak_bytes) {
+        Ok(lease) => Ok(Some(lease)),
+        Err(StorageLedgerError::InsufficientSpace {
+            requested,
+            available,
+        }) => {
+            let message = format!(
+                "conservative storage estimate for {label} requests {requested} bytes, but only \
+                 {available} bytes are currently available; continuing without a reservation \
+                 and relying on actual filesystem writes"
+            );
+            advisory(&message);
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn clear_prior_match_artifacts_for_memory_first(
     storage: &mut StorageBroker,
     out: &Path,
@@ -2958,18 +3053,22 @@ fn stratified_active_token_sample(token_member_offsets: &[u64], limit: usize) ->
     if limit == 0 {
         return Vec::new();
     }
-    let mut strata = std::collections::BTreeMap::<u32, Vec<u32>>::new();
+    let mut stratum_counts = [0usize; 64];
     for token in 0..token_member_offsets.len().saturating_sub(1) {
         if let Some(stratum) = shared_token_work_stratum(token_member_offsets, token as u32) {
-            strata.entry(stratum).or_default().push(token as u32);
+            stratum_counts[stratum as usize] = stratum_counts[stratum as usize].saturating_add(1);
         }
     }
-    let target = limit.min(strata.values().map(Vec::len).sum());
+    let target = limit.min(stratum_counts.iter().sum());
     if target == 0 {
         return Vec::new();
     }
 
-    let keys = strata.keys().copied().collect::<Vec<_>>();
+    let keys = stratum_counts
+        .iter()
+        .enumerate()
+        .filter_map(|(stratum, &count)| (count != 0).then_some(stratum))
+        .collect::<Vec<_>>();
     let mut allocation_order = Vec::with_capacity(keys.len());
     let (mut low, mut high) = (0usize, keys.len().saturating_sub(1));
     while low <= high && low < keys.len() {
@@ -2984,13 +3083,13 @@ fn stratified_active_token_sample(token_member_offsets: &[u64], limit: usize) ->
         high -= 1;
     }
 
-    let mut quotas = std::collections::BTreeMap::<u32, usize>::new();
+    let mut quotas = [0usize; 64];
     let mut remaining = target;
     while remaining > 0 {
         let mut allocated = false;
         for &stratum in &allocation_order {
-            let capacity = strata[&stratum].len();
-            let used = quotas.get(&stratum).copied().unwrap_or(0);
+            let capacity = stratum_counts[stratum];
+            let used = quotas[stratum];
             if used >= capacity {
                 continue;
             }
@@ -3001,7 +3100,7 @@ fn stratified_active_token_sample(token_member_offsets: &[u64], limit: usize) ->
             } else {
                 1
             };
-            quotas.insert(stratum, used + amount);
+            quotas[stratum] = used + amount;
             remaining -= amount;
             allocated = true;
             if remaining == 0 {
@@ -3013,14 +3112,34 @@ fn stratified_active_token_sample(token_member_offsets: &[u64], limit: usize) ->
         }
     }
 
-    let mut sampled = Vec::with_capacity(target);
-    for stratum in allocation_order {
-        let quota = quotas.get(&stratum).copied().unwrap_or(0);
+    // A second sequential pass selects only the evenly spaced sample positions.
+    // Peak scratch is O(number of strata + sample limit), rather than retaining
+    // every active token identity in one Vec per stratum.
+    let mut visited = [0usize; 64];
+    let mut selected_by_stratum: [Vec<u32>; 64] =
+        std::array::from_fn(|stratum| Vec::with_capacity(quotas[stratum]));
+    for token in 0..token_member_offsets.len().saturating_sub(1) {
+        let Some(stratum) = shared_token_work_stratum(token_member_offsets, token as u32) else {
+            continue;
+        };
+        let stratum = stratum as usize;
+        let position = visited[stratum];
+        visited[stratum] = position.saturating_add(1);
+        let quota = quotas[stratum];
         if quota == 0 {
             continue;
         }
-        let tokens = &strata[&stratum];
-        sampled.extend((0..quota).map(|index| tokens[index * tokens.len() / quota]));
+        let selected_index = selected_by_stratum[stratum].len();
+        if selected_index < quota
+            && position == selected_index.saturating_mul(stratum_counts[stratum]) / quota
+        {
+            selected_by_stratum[stratum].push(token as u32);
+        }
+    }
+
+    let mut sampled = Vec::with_capacity(target);
+    for stratum in allocation_order {
+        sampled.append(&mut selected_by_stratum[stratum]);
     }
     sampled
 }
@@ -5382,28 +5501,25 @@ mod tests {
             accumulate_summary(&mut sorted[chain], value);
         });
 
-        for primary in 0..2 {
+        for (primary, sorted_stats) in sorted.iter().enumerate() {
             let dense = dense_summary_stats(
                 &roots,
                 (0..roots.len())
                     .map(|contract| (contract, chains[contract] == primary, nfts[contract])),
                 true,
             );
-            assert_eq!(sorted[primary].group_count, dense.group_count);
+            assert_eq!(sorted_stats.group_count, dense.group_count);
             assert_eq!(
-                sorted[primary].duplicate_contract_count,
+                sorted_stats.duplicate_contract_count,
                 dense.duplicate_contract_count
             );
+            assert_eq!(sorted_stats.duplicate_nft_count, dense.duplicate_nft_count);
             assert_eq!(
-                sorted[primary].duplicate_nft_count,
-                dense.duplicate_nft_count
-            );
-            assert_eq!(
-                sorted[primary].group_size_ge_2_count,
+                sorted_stats.group_size_ge_2_count,
                 dense.group_size_ge_2_count
             );
             assert_eq!(
-                sorted[primary].group_size_gt_2_count,
+                sorted_stats.group_size_gt_2_count,
                 dense.group_size_gt_2_count
             );
         }
@@ -5770,6 +5886,37 @@ mod tests {
             .len(),
             2
         );
+    }
+
+    #[test]
+    fn shared_token_sample_keeps_even_positions_without_retaining_all_tokens() {
+        let offsets = (0..=10).map(|token| token * 2).collect::<Vec<_>>();
+
+        assert_eq!(
+            stratified_active_token_sample(&offsets, 4),
+            vec![0, 2, 5, 7]
+        );
+    }
+
+    #[test]
+    fn conservative_match_storage_shortage_is_advisory() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = StorageBroker::open_with_physical_free(directory.path(), 1_000).unwrap();
+        let mut advisories = Vec::new();
+
+        let lease = reserve_pipeline_storage_advisory(
+            &mut storage,
+            ArtifactClass::ComponentSnapshot,
+            800,
+            400,
+            "test components",
+            &mut |message| advisories.push(message.to_string()),
+        )
+        .unwrap();
+
+        assert!(lease.is_none());
+        assert_eq!(advisories.len(), 1);
+        assert!(advisories[0].contains("continuing without a reservation"));
     }
 
     #[test]
