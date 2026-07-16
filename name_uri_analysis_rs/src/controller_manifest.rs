@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use duckdb::Connection;
-use name_uri_analysis_rs::analysis::AnalysisOptions;
+use name_uri_analysis_rs::analysis::{AnalysisOptions, MATCH_ETA_FORECAST_SCHEMA_VERSION};
 use name_uri_analysis_rs::write_json_atomically;
 use serde::{Deserialize, Serialize};
 use sysinfo::System;
@@ -85,7 +85,7 @@ pub(crate) struct PhaseMetric<'a> {
     pub(crate) artifact_bytes: u64,
 }
 
-const MATCH_OBSERVATION_SCHEMA_VERSION: u32 = 2;
+const MATCH_OBSERVATION_SCHEMA_VERSION: u32 = MATCH_ETA_FORECAST_SCHEMA_VERSION;
 const MATCH_SCALE_SCHEMA_VERSION: u32 = 3;
 const MIN_MATCH_FORECAST_SAMPLES: usize = 8;
 const MAX_MATCH_OBSERVATIONS_PER_PARTITION: usize = 256;
@@ -348,7 +348,7 @@ fn match_history_root(output_directory: &Path) -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(".name-uri-analysis-history")
-        .join("metadata-match-v1")
+        .join("metadata-match-v3")
 }
 
 fn observation_partition(observation: &MatchObservation) -> &'static str {

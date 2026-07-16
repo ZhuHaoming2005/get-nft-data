@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::*;
 
@@ -9,8 +9,6 @@ pub(crate) const PROGRESS_REFRESH_INTERVAL: Duration = Duration::from_millis(50)
 const PROGRESS_REFRESH_HZ: u8 = 20;
 const RATE_WARMUP: Duration = Duration::from_secs(1);
 const RATE_EWMA_ALPHA: f64 = 0.25;
-const MATCH_ETA_FORECAST_SCHEMA_VERSION: u32 = 1;
-
 #[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
 pub(crate) struct MatchEtaForecast {
     pub(crate) schema_version: u32,
@@ -21,7 +19,11 @@ pub(crate) struct MatchEtaForecast {
 
 fn match_eta_forecast_from_env() -> Option<MatchEtaForecast> {
     let value = std::env::var(MATCH_ETA_FORECAST_ENV).ok()?;
-    let forecast = serde_json::from_str::<MatchEtaForecast>(&value).ok()?;
+    parse_match_eta_forecast(&value)
+}
+
+pub(crate) fn parse_match_eta_forecast(value: &str) -> Option<MatchEtaForecast> {
+    let forecast = serde_json::from_str::<MatchEtaForecast>(value).ok()?;
     if forecast.schema_version != MATCH_ETA_FORECAST_SCHEMA_VERSION {
         return None;
     }
@@ -31,6 +33,24 @@ fn match_eta_forecast_from_env() -> Option<MatchEtaForecast> {
         _ => return None,
     }
     Some(forecast)
+}
+
+fn match_elapsed_offset_from_env() -> Duration {
+    let started = std::env::var(MATCH_ETA_STARTED_UNIX_MILLIS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u128>().ok());
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis());
+    match_elapsed_offset(started, now)
+}
+
+pub(crate) fn match_elapsed_offset(started: Option<u128>, now: Option<u128>) -> Duration {
+    let (Some(started), Some(now)) = (started, now) else {
+        return Duration::ZERO;
+    };
+    Duration::from_millis(u64::try_from(now.saturating_sub(started)).unwrap_or(u64::MAX))
 }
 
 #[derive(Debug)]
@@ -156,7 +176,8 @@ pub(crate) enum ProgressTracker {
         metrics: ProgressBar,
         task_state: Box<Mutex<Option<TaskProgressState>>>,
         match_started: Instant,
-        match_forecast: Option<MatchEtaForecast>,
+        match_elapsed_offset: Duration,
+        match_forecast: Box<Option<MatchEtaForecast>>,
         match_eta_enabled: AtomicBool,
     },
     Disabled,
@@ -172,6 +193,7 @@ impl ProgressTracker {
     pub(crate) fn set_pipeline_stage(&self, pipeline_stage: PipelineStage) {
         if let Self::Enabled {
             pipeline,
+            stage,
             match_eta_enabled,
             ..
         } = self
@@ -182,6 +204,15 @@ impl ProgressTracker {
                 pipeline_stage == PipelineStage::MetadataMatch,
                 Ordering::Relaxed,
             );
+            if pipeline_stage == PipelineStage::MetadataMatch {
+                stage.reset();
+                stage.unset_length();
+                stage.set_style(stage_spinner_style());
+                stage.set_message("waiting for engine progress");
+                stage.enable_steady_tick(PROGRESS_REFRESH_INTERVAL);
+            } else {
+                stage.set_style(stage_bar_style());
+            }
         }
     }
 
@@ -199,11 +230,7 @@ impl ProgressTracker {
                 .progress_chars("#>-"),
         );
         let stage = multi.add(ProgressBar::new(0));
-        stage.set_style(
-            ProgressStyle::with_template(stage_bar_template())
-                .unwrap()
-                .progress_chars("#>-"),
-        );
+        stage.set_style(stage_bar_style());
         let task = multi.add(ProgressBar::new_spinner());
         task.set_style(task_spinner_style());
         let metrics = multi.add(ProgressBar::new_spinner());
@@ -216,7 +243,8 @@ impl ProgressTracker {
             metrics,
             task_state: Box::new(Mutex::new(None)),
             match_started: Instant::now(),
-            match_forecast: match_eta_forecast_from_env(),
+            match_elapsed_offset: match_elapsed_offset_from_env(),
+            match_forecast: Box::new(match_eta_forecast_from_env()),
             match_eta_enabled: AtomicBool::new(false),
         }
     }
@@ -342,6 +370,7 @@ impl ProgressTracker {
             metrics,
             task_state,
             match_started,
+            match_elapsed_offset,
             match_forecast,
             ..
         } = self
@@ -380,13 +409,14 @@ impl ProgressTracker {
                 show_match_eta: state.show_match_eta,
                 total_kind: state.total_kind,
             },
-            match_forecast.as_ref(),
-            now.duration_since(*match_started),
+            match_forecast.as_ref().as_ref(),
+            match_elapsed_offset.saturating_add(now.duration_since(*match_started)),
         ));
     }
 
     pub(crate) fn observe_engine_event(&self, event: metadata_engine::progress::ProgressEvent) {
         let Self::Enabled {
+            stage,
             task_state,
             match_eta_enabled,
             ..
@@ -394,6 +424,9 @@ impl ProgressTracker {
         else {
             return;
         };
+        if match_eta_enabled.load(Ordering::Relaxed) {
+            stage.set_message(event.phase.label());
+        }
         let label = if event.total_kind == metadata_engine::progress::TotalKind::UpperBound {
             format!("{} (upper bound)", event.phase.label())
         } else {
@@ -741,6 +774,16 @@ fn task_bar_style() -> ProgressStyle {
         .progress_chars("#>-")
 }
 
+fn stage_bar_style() -> ProgressStyle {
+    ProgressStyle::with_template(stage_bar_template())
+        .unwrap()
+        .progress_chars("#>-")
+}
+
+fn stage_spinner_style() -> ProgressStyle {
+    ProgressStyle::with_template(stage_spinner_template()).unwrap()
+}
+
 fn task_spinner_style() -> ProgressStyle {
     ProgressStyle::with_template("    {spinner:.yellow} task [{elapsed_precise}] {msg}").unwrap()
 }
@@ -751,6 +794,10 @@ pub(crate) const fn pipeline_bar_template() -> &'static str {
 
 pub(crate) const fn stage_bar_template() -> &'static str {
     "  {spinner:.blue} stage [{elapsed_precise}] [{bar:28.magenta/blue}] {pos}/{len} {percent:>3}% {msg}"
+}
+
+pub(crate) const fn stage_spinner_template() -> &'static str {
+    "  {spinner:.blue} stage [{elapsed_precise}] {msg}"
 }
 
 pub(crate) const fn task_bar_template() -> &'static str {

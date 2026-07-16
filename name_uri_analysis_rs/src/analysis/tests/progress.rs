@@ -67,9 +67,73 @@ fn hierarchical_progress_tracks_pipeline_stage_and_task_independently() {
 }
 
 #[test]
+fn metadata_match_engine_events_use_a_dynamic_stage_spinner() {
+    use metadata_engine::progress::{
+        ProgressCounters as EngineCounters, ProgressEvent, ProgressPhase, WorkUnit,
+    };
+
+    let progress = ProgressTracker::for_pipeline_stage(PipelineStage::MetadataMatch, true);
+    progress.observe_engine_event(ProgressEvent::determinate(
+        ProgressPhase::OpenSnapshot,
+        0,
+        10,
+        WorkUnit::Bytes,
+        EngineCounters::default(),
+    ));
+
+    let ProgressTracker::Enabled { stage, .. } = &progress else {
+        panic!("progress must be enabled");
+    };
+    assert_eq!(stage.length(), None);
+    assert_eq!(stage.position(), 0);
+    assert_eq!(stage.message(), "open snapshot");
+
+    progress.observe_engine_event(ProgressEvent::determinate(
+        ProgressPhase::BuildCatalog,
+        0,
+        2,
+        WorkUnit::Items,
+        EngineCounters::default(),
+    ));
+    assert_eq!(stage.length(), None);
+    assert_eq!(stage.position(), 0);
+    assert_eq!(stage.message(), "build catalog");
+}
+
+#[test]
+fn match_elapsed_offset_uses_the_controller_wall_clock_origin() {
+    assert_eq!(
+        match_elapsed_offset(Some(1_000), Some(3_500)),
+        std::time::Duration::from_millis(2_500)
+    );
+    assert_eq!(
+        match_elapsed_offset(Some(3_500), Some(1_000)),
+        std::time::Duration::ZERO
+    );
+    assert_eq!(
+        match_elapsed_offset(None, Some(1_000)),
+        std::time::Duration::ZERO
+    );
+}
+
+#[test]
+fn match_forecast_parser_accepts_only_the_shared_controller_schema() {
+    let current = format!(
+        r#"{{"schema_version":{},"sample_count":8,"lower_total_millis":1000,"upper_total_millis":2000}}"#,
+        MATCH_ETA_FORECAST_SCHEMA_VERSION
+    );
+    assert!(parse_match_eta_forecast(&current).is_some());
+
+    let stale = r#"{"schema_version":2,"sample_count":8,"lower_total_millis":1000,"upper_total_millis":2000}"#;
+    assert!(parse_match_eta_forecast(stale).is_none());
+}
+
+#[test]
 fn progress_layout_keeps_fixed_bars_separate_from_long_metrics() {
     assert!(pipeline_bar_template().contains("{bar:24"));
     assert!(stage_bar_template().contains("{bar:28"));
+    assert!(!stage_spinner_template().contains("{percent"));
+    assert!(!stage_spinner_template().contains("{bar"));
     assert!(task_bar_template().contains("{bar:32"));
     assert!(task_bar_template().contains("{human_pos}/{human_len}"));
     assert!(!pipeline_bar_template().contains("wide_bar"));
@@ -142,7 +206,7 @@ fn upper_bound_phase_eta_is_not_used_as_a_match_lower_bound() {
         total_kind: metadata_engine::progress::TotalKind::UpperBound,
     };
     let forecast = MatchEtaForecast {
-        schema_version: 1,
+        schema_version: MATCH_ETA_FORECAST_SCHEMA_VERSION,
         sample_count: 2,
         lower_total_millis: None,
         upper_total_millis: None,
@@ -198,7 +262,7 @@ fn empty_exact_phase_is_reported_as_skipped_without_rate_or_eta_noise() {
             total_kind: metadata_engine::progress::TotalKind::Exact,
         },
         Some(&MatchEtaForecast {
-            schema_version: 1,
+            schema_version: MATCH_ETA_FORECAST_SCHEMA_VERSION,
             sample_count: 8,
             lower_total_millis: Some(10_000),
             upper_total_millis: Some(20_000),
@@ -322,7 +386,7 @@ fn calibrated_match_forecast_is_an_observed_interval_not_a_claimed_bound() {
         total_kind: metadata_engine::progress::TotalKind::Exact,
     };
     let forecast = MatchEtaForecast {
-        schema_version: 1,
+        schema_version: MATCH_ETA_FORECAST_SCHEMA_VERSION,
         sample_count: 8,
         lower_total_millis: Some(10_000),
         upper_total_millis: Some(20_000),
@@ -350,7 +414,7 @@ fn warming_match_forecast_keeps_only_the_current_exact_phase_lower_bound() {
         total_kind: metadata_engine::progress::TotalKind::Exact,
     };
     let forecast = MatchEtaForecast {
-        schema_version: 1,
+        schema_version: MATCH_ETA_FORECAST_SCHEMA_VERSION,
         sample_count: 7,
         lower_total_millis: None,
         upper_total_millis: None,
@@ -378,7 +442,7 @@ fn elapsed_history_overrun_never_turns_a_phase_lower_bound_into_an_upper_bound()
         total_kind: metadata_engine::progress::TotalKind::Exact,
     };
     let forecast = MatchEtaForecast {
-        schema_version: 1,
+        schema_version: MATCH_ETA_FORECAST_SCHEMA_VERSION,
         sample_count: 8,
         lower_total_millis: Some(1_000),
         upper_total_millis: Some(3_000),
@@ -407,7 +471,7 @@ fn phase_lower_over_history_upper_never_fabricates_an_observed_interval() {
         total_kind: metadata_engine::progress::TotalKind::Exact,
     };
     let forecast = MatchEtaForecast {
-        schema_version: 1,
+        schema_version: MATCH_ETA_FORECAST_SCHEMA_VERSION,
         sample_count: 8,
         lower_total_millis: Some(1_000),
         upper_total_millis: Some(8_000),

@@ -3,9 +3,11 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use name_uri_analysis_rs::analysis::{run_analysis_phase, MATCH_ETA_FORECAST_ENV};
+use name_uri_analysis_rs::analysis::{
+    run_analysis_phase, MATCH_ETA_FORECAST_ENV, MATCH_ETA_STARTED_UNIX_MILLIS_ENV,
+};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
 use crate::controller_constants::{
@@ -88,6 +90,10 @@ pub(crate) fn run_child_phase(
     };
     let temp_directory = work_directory.join("duckdb-temp");
     let started = Instant::now();
+    let started_unix_millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
     let mut command = Command::new(std::env::current_exe()?);
     command
         .arg("--internal-phase")
@@ -97,8 +103,13 @@ pub(crate) fn run_child_phase(
         .stdin(Stdio::piped())
         .env(PARENT_LIVENESS_ENV, "1")
         .env(PHASE_GENERATION_ENV, phase_lease.generation())
-        .env_remove(MATCH_ETA_FORECAST_ENV);
+        .env_remove(MATCH_ETA_FORECAST_ENV)
+        .env_remove(MATCH_ETA_STARTED_UNIX_MILLIS_ENV);
     if let Some(key) = match_key.as_ref() {
+        command.env(
+            MATCH_ETA_STARTED_UNIX_MILLIS_ENV,
+            started_unix_millis.to_string(),
+        );
         match load_match_eta_forecast(&manifest.options.output_dir, key)
             .and_then(|forecast| serde_json::to_string(&forecast).map_err(Into::into))
         {

@@ -44,7 +44,12 @@ const NAME_DUCKDB_MEMORY_CAP: &str = "8GiB";
 pub const DUCKDB_THREAD_CAP: usize = 64;
 /// Controller-to-Match child contract for an advisory, schema-bound ETA model.
 /// Invalid or absent values are ignored; ETA history must never affect results.
-pub const MATCH_ETA_FORECAST_ENV: &str = "NAME_URI_ANALYSIS_MATCH_ETA_FORECAST_V1";
+pub const MATCH_ETA_FORECAST_ENV: &str = "NAME_URI_ANALYSIS_MATCH_ETA_FORECAST_V3";
+pub const MATCH_ETA_FORECAST_SCHEMA_VERSION: u32 = 3;
+/// Controller wall-clock origin for the Match child. This keeps historical
+/// wall-time forecasts and the live remaining-time subtraction on one boundary.
+pub const MATCH_ETA_STARTED_UNIX_MILLIS_ENV: &str =
+    "NAME_URI_ANALYSIS_MATCH_STARTED_UNIX_MILLIS_V3";
 
 fn open_analysis_connection(path: &Path) -> Result<Connection, AnalysisError> {
     if path != Path::new(":memory:") {

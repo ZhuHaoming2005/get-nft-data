@@ -1239,11 +1239,12 @@ fn scan_shared_token_group(
                             misses: Vec::new(),
                         },
                         HashMap::<u64, bool>::new(),
+                        0u64,
                     )
                 },
-                |(mut result, mut payload_scores), sample| {
+                |(mut result, mut payload_scores, mut pending_work), sample| {
                     if shared_miss_budget.cancelled.load(Ordering::Acquire) {
-                        return Ok((result, payload_scores));
+                        return Ok((result, payload_scores, pending_work));
                     }
                     let ordinal = (u128::from(start)
                         + u128::from(sample).saturating_mul(u128::from(step)))
@@ -1269,7 +1270,12 @@ fn scan_shared_token_group(
                             });
                         }
                     }
-                    Ok((result, payload_scores))
+                    pending_work = pending_work.saturating_add(1);
+                    if pending_work == PROGRESS_CHUNK {
+                        report_work(pending_work);
+                        pending_work = 0;
+                    }
+                    Ok((result, payload_scores, pending_work))
                 },
             )
             .try_reduce(
@@ -1280,15 +1286,29 @@ fn scan_shared_token_group(
                             misses: Vec::new(),
                         },
                         HashMap::new(),
+                        0u64,
                     )
                 },
-                |(left, _), (right, _)| Ok((left.merge(right), HashMap::<u64, bool>::new())),
+                |(left, _, left_pending), (right, _, right_pending)| {
+                    let pending_work = left_pending.saturating_add(right_pending);
+                    let remainder = if pending_work >= PROGRESS_CHUNK {
+                        report_work(PROGRESS_CHUNK);
+                        pending_work - PROGRESS_CHUNK
+                    } else {
+                        pending_work
+                    };
+                    Ok((left.merge(right), HashMap::<u64, bool>::new(), remainder))
+                },
             )
-            .map(|(result, _)| result);
+            .map(|(result, _, pending_work)| {
+                if pending_work != 0 {
+                    report_work(pending_work);
+                }
+                result
+            });
         if result.is_err() {
             shared_miss_budget.cancelled.store(true, Ordering::Release);
         }
-        report_work(sample_work);
         return result;
     }
     let result = shared_token_pair_tiles(contracts.len(), SHARED_PAIR_TILE_MEMBERS)

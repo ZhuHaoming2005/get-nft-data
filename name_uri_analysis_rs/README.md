@@ -117,15 +117,27 @@ subphase、`completed/total`、工作单位和诊断计数，CLI 只负责渲染
   遍历的 `2N` 工作量分批推进；
 - task 行使用千位分隔的位置和总量，metrics 行只显示紧凑吞吐、当前 ETA 和语义化诊断计数，
   不重复任务名与位置；
-- Catalog 在长 job 内增量上报，Exact 按 frontier/group、Reduce 按 edge/root
-  chunk 上报；MemoryFirst 使用 `finalize component groups`，不会显示实际未执行的 connectivity
+- Catalog 在长 job 内增量上报；Pair Exact、采样 Shared Exact 和 Rescue planner 均按最多
+  65,536 pair visits 的 chunk 上报，不会等待整个热 token 或整行 atom universe 扫描完成；
+  Reduce 按 edge/root chunk 上报；
+- Rescue seed preparation 为独立 indeterminate phase，按 seed/group membership 增量显示；
+  seed contract 位置只扫描每个相关 token group 一次，不再对每个 seed 线性重扫；匹配结果排序和
+  expansion 统计使用独立 `finalize rescue plan` spinner，不会让 score task 先显示 100%；
+- shared-token scratch planning 按实际 token membership visits 而不是 token group 个数计算
+  `completed/total`；BuildSummary 的节点增量从并行 worker 实时传回。由于 cross-chain summary
+  包含不可观测内部进度的并行排序，该 task 明确保持 indeterminate，不伪造有限 ETA；
+- Metadata Match 的 stage 行使用动态 spinner 显示当前 engine subphase，不显示未知分母的百分比；
+  Match 历史 wall time 和
+  当前运行的 elapsed subtraction 共用控制器启动时刻，子进程启动、锁交接和 tmpfs 清理不会造成
+  ETA 计时边界错位；
+- MemoryFirst 使用 `finalize component groups`，不会显示实际未执行的 connectivity
   commit/recovery 阶段；
 - UI 以 20 Hz 刷新，完成值被钳制到 total，失败不会显示 100%。
 
 因此 `ETA` 表示“当前子阶段剩余同类工作”的估计。只有 Metadata Match 的引擎事件会独立显示
 `match ETA n/a (uncalibrated)`；在没有同 revision、同规模目标机历史分布前不会把子阶段速率外推成
 整段 Match 的伪精确 ETA。当前 Match controller revision 为 18，旧持久化路径的历史样本不会污染
-新的 MemoryFirst ETA。
+新的 MemoryFirst ETA；forecast/observation 共用 schema 3，旧 schema 样本不会被渲染端误用。
 可用 `--no-progress` 关闭终端进度。
 
 ## 资源、恢复与诊断

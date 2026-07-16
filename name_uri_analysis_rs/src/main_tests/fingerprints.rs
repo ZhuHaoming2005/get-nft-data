@@ -205,7 +205,7 @@ fn match_observation_partitions_are_rolling_and_bounded() {
 
     let partition = temp
         .path()
-        .join(".name-uri-analysis-history/metadata-match-v1/fresh-failure");
+        .join(".name-uri-analysis-history/metadata-match-v3/fresh-failure");
     assert!(fs::read_dir(partition).unwrap().count() <= 256);
 }
 
@@ -344,7 +344,7 @@ fn match_observation_history_survives_work_cleanup_and_names_sampled_resources()
 
     let partition = temp
         .path()
-        .join("results/.name-uri-analysis-history/metadata-match-v1/fresh-success");
+        .join("results/.name-uri-analysis-history/metadata-match-v3/fresh-success");
     let observation_path = fs::read_dir(partition)
         .unwrap()
         .next()

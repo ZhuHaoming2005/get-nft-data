@@ -3053,7 +3053,6 @@ fn pipeline_reports_monotonic_pair_work_with_stable_terminal_plans() {
     assert!(shared_token_terminal.completed <= shared_token_terminal.total.unwrap());
     for phase in [
         ProgressPhase::CommitComponents,
-        ProgressPhase::BuildSummary,
         ProgressPhase::CommitArtifacts,
     ] {
         let phase_events = events
@@ -3066,6 +3065,24 @@ fn pipeline_reports_monotonic_pair_work_with_stable_terminal_plans() {
             phase_events.last().unwrap().completed,
             phase_events.last().unwrap().total.unwrap()
         );
+    }
+    for phase in [
+        ProgressPhase::PrepareRescuePairs,
+        ProgressPhase::FinalizeRescuePlan,
+        ProgressPhase::BuildSummary,
+    ] {
+        let phase_events = events
+            .iter()
+            .filter(|event| event.phase == phase)
+            .collect::<Vec<_>>();
+        assert!(!phase_events.is_empty(), "missing {phase:?}");
+        assert_eq!(phase_events.first().unwrap().completed, 0);
+        assert!(phase_events
+            .iter()
+            .all(|event| event.total.is_none() && event.total_kind == TotalKind::Unknown));
+        assert!(phase_events
+            .windows(2)
+            .all(|window| window[0].completed <= window[1].completed));
     }
     let recovery = events
         .iter()
@@ -3095,6 +3112,7 @@ fn pipeline_reports_monotonic_pair_work_with_stable_terminal_plans() {
         ProgressPhase::FallbackPairs,
         ProgressPhase::CatalogPairs,
         ProgressPhase::SharedTokenPairs,
+        ProgressPhase::PlanRescuePairs,
         ProgressPhase::FinalizeEdgeCollectors,
         ProgressPhase::EdgeDispatch,
         ProgressPhase::ReduceScopes,
