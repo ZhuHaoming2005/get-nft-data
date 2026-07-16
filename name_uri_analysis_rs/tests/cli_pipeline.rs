@@ -211,6 +211,10 @@ fn public_controller_runs_all_children_and_resumes_finalized_pipeline() {
         metadata_ready["schema_revision"],
         metadata_engine::scoring::MATCH_SEMANTICS_REVISION
     );
+    assert_eq!(
+        metadata_ready["evidence_gate_revision"],
+        metadata_engine::evidence::EVIDENCE_GATE_REVISION
+    );
     assert!(metadata_ready["summary_rows"].as_array().is_some());
 
     let manifest: serde_json::Value =

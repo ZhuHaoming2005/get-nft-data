@@ -15,7 +15,7 @@ use crate::blocking::{
 use crate::cascade::{score_pair, PairScoreDecision};
 use crate::evidence::{
     evaluate_holdout, EvidenceError, EvidenceGatePolicy, EvidenceGateReport, HoldoutEvidence,
-    RescuePlan,
+    RescuePlan, EVIDENCE_GATE_REVISION,
 };
 use crate::exact_islands::{
     open_pair_exact_evidence, open_shared_token_exact_evidence, plan_exact_evidence,
@@ -62,6 +62,7 @@ pub struct MetadataPipelineConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetadataPipelineResult {
     pub schema_revision: u32,
+    pub evidence_gate_revision: u32,
     pub snapshot_fingerprint: String,
     pub snapshot_atoms: u64,
     pub index_metrics: SerializableIndexMetrics,
@@ -782,14 +783,25 @@ pub enum PipelineError {
     #[error(transparent)]
     Identity(#[from] crate::identity::IdentityOverflow),
     #[error(
-        "ExactEvidence gate failed: Wilson upper bound {upper_bound:.6}, maximum miss rate {limit:.6}, sample_sufficient={sample_sufficient} ({observed} residual misses across {exact_matches} exact matches)"
+        "ExactEvidence gate failed: aggregate Wilson upper bound {upper:.6}, maximum residual miss rate {miss_limit:.6}, sample_sufficient={sample_sufficient} ({observed} residual misses / {exact_matches} exact observations); diagnostics: pair {pair_upper:.6} ({pair_misses}/{pair_matches}, sufficient={pair_sufficient}), shared-token {shared_upper:.6} ({shared_misses}/{shared_matches}, sufficient={shared_sufficient}); skipped pair-work rate {skipped_rate:.6}, maximum stratum rate {max_stratum_rate:.6}, skip limit {skip_limit:.6}"
     )]
     EvidenceGate {
         observed: u64,
         exact_matches: u64,
-        upper_bound: f64,
-        limit: f64,
+        upper: f64,
         sample_sufficient: bool,
+        pair_misses: u64,
+        pair_matches: u64,
+        pair_upper: f64,
+        pair_sufficient: bool,
+        shared_misses: u64,
+        shared_matches: u64,
+        shared_upper: f64,
+        shared_sufficient: bool,
+        miss_limit: f64,
+        skipped_rate: f64,
+        max_stratum_rate: f64,
+        skip_limit: f64,
     },
     #[error("parallel catalog execution failed: {0}")]
     Parallel(String),
@@ -2093,7 +2105,10 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
         HoldoutEvidence {
             evaluated_pair_work: pair_holdout_evidence
                 .pair_work
-                .saturating_add(shared_token_exact_evidence.holdout_pair_work),
+                .checked_add(shared_token_exact_evidence.holdout_pair_work)
+                .ok_or_else(|| {
+                    PipelineError::Invariant("holdout evaluated pair work overflow".into())
+                })?,
             exhaustive: pair_frontier_covers_all_unordered_pairs(
                 &samples,
                 &holdout_samples,
@@ -2118,9 +2133,20 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
         return Err(PipelineError::EvidenceGate {
             observed: evidence_gate_report.observed_misses,
             exact_matches: evidence_gate_report.exact_matches,
-            upper_bound: evidence_gate_report.wilson_upper_bound,
-            limit: config.evidence_gate_policy.max_miss_rate,
+            upper: evidence_gate_report.wilson_upper_bound,
             sample_sufficient: evidence_gate_report.sample_sufficient,
+            pair_misses: evidence_gate_report.pair_statistical_misses,
+            pair_matches: evidence_gate_report.pair_statistical_trials,
+            pair_upper: evidence_gate_report.pair_wilson_upper_bound,
+            pair_sufficient: evidence_gate_report.pair_sample_sufficient,
+            shared_misses: evidence_gate_report.shared_statistical_misses,
+            shared_matches: evidence_gate_report.shared_statistical_trials,
+            shared_upper: evidence_gate_report.shared_wilson_upper_bound,
+            shared_sufficient: evidence_gate_report.shared_sample_sufficient,
+            miss_limit: config.evidence_gate_policy.max_miss_rate,
+            skipped_rate: evidence_gate_report.skipped_pair_work_rate,
+            max_stratum_rate: evidence_gate_report.max_stratum_skipped_pair_work_rate,
+            skip_limit: config.evidence_gate_policy.max_skipped_pair_work_rate,
         });
     }
     // Calibration freezes a deterministic rescue frontier. Holdout membership
@@ -2540,6 +2566,7 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
     );
     let result = MetadataPipelineResult {
         schema_revision: crate::scoring::MATCH_SEMANTICS_REVISION,
+        evidence_gate_revision: EVIDENCE_GATE_REVISION,
         snapshot_fingerprint: catalog.snapshot_fingerprint.clone(),
         snapshot_atoms: snapshot.atom_count() as u64,
         index_metrics: metrics,
@@ -2559,6 +2586,7 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
     };
     let ready = serde_json::json!({
         "schema_revision": result.schema_revision,
+        "evidence_gate_revision": result.evidence_gate_revision,
         "snapshot_fingerprint": result.snapshot_fingerprint,
         "snapshot_atoms": result.snapshot_atoms,
         "index_metrics": result.index_metrics,

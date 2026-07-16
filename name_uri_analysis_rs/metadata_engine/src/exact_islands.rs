@@ -375,6 +375,7 @@ fn pair_evidence_is_consistent(evidence: &PairExactEvidence) -> bool {
             .last()
             .is_none_or(|&left| u64::from(left) < evidence.universe_atoms)
         && cluster_total(&evidence.clusters) == Some(evidence.exact_matches)
+        && evidence.exact_matches <= evidence.pair_work
         && evidence.conservative_misses.len() as u64 <= evidence.exact_matches
         && pair_frontier_work(evidence.universe_atoms, evidence.sampled_lefts.len() as u64)
             == Some(evidence.pair_work)
@@ -459,6 +460,9 @@ fn shared_evidence_is_consistent(
             .calibration_exact_matches
             .checked_add(evidence.holdout_exact_matches)
             == Some(evidence.exact_matches)
+        && evidence.calibration_exact_matches <= evidence.calibration_pair_work
+        && evidence.holdout_exact_matches <= evidence.holdout_pair_work
+        && evidence.exact_matches <= evidence.pair_work
         && shared_partition_is_consistent(
             &evidence.calibration_tokens,
             &evidence.calibration_clusters,
@@ -1494,8 +1498,9 @@ fn sorted_intersects(x: &[u32], y: &[u32]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        shared_token_pair_tiles, ExactIslandError, ExactMiss, InMemoryMissBudget,
-        SharedTokenExactEvidence, SharedTokenExactMiss,
+        pair_evidence_is_consistent, shared_token_pair_tiles, ExactEvidenceCluster,
+        ExactIslandError, ExactMiss, InMemoryMissBudget, PairExactEvidence,
+        SharedTokenExactEvidence, SharedTokenExactMiss, EVIDENCE_ARTIFACT_REVISION,
     };
     use crate::blocking::{AtomSketch, LocalRoutingPlan};
 
@@ -1593,5 +1598,31 @@ mod tests {
         json.as_object_mut().unwrap().remove("holdout_pair_work");
 
         assert!(serde_json::from_value::<SharedTokenExactEvidence>(json).is_err());
+    }
+
+    #[test]
+    fn pair_evidence_rejects_exact_matches_above_scanned_pair_work() {
+        let evidence = PairExactEvidence {
+            artifact_revision: EVIDENCE_ARTIFACT_REVISION,
+            match_semantics_revision: crate::scoring::MATCH_SEMANTICS_REVISION,
+            snapshot_fingerprint: "snapshot".into(),
+            sampling_policy_digest: "sampling".into(),
+            universe_atoms: 2,
+            sampled_lefts: vec![0],
+            pair_work: 1,
+            exact_matches: 2,
+            clusters: vec![ExactEvidenceCluster {
+                id: 0,
+                exact_matches: 2,
+            }],
+            conservative_misses: vec![],
+            frontier_build_micros: 0,
+            full_universe_scan_micros: 0,
+            posting_finalize_micros: 0,
+            oracle_score_micros: 0,
+            full_scan_equivalents_micros: 0,
+        };
+
+        assert!(!pair_evidence_is_consistent(&evidence));
     }
 }

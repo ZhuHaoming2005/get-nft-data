@@ -1226,8 +1226,9 @@ fn exact_evidence_plan_scales_both_pair_partitions_to_the_joint_budget() {
 }
 
 #[test]
-fn match_semantics_revision_tracks_clustered_evidence_and_admission_contracts() {
+fn scoring_and_evidence_gate_revisions_are_versioned_independently() {
     assert_eq!(metadata_engine::scoring::MATCH_SEMANTICS_REVISION, 6);
+    assert_eq!(metadata_engine::evidence::EVIDENCE_GATE_REVISION, 2);
 }
 
 #[test]
@@ -1281,7 +1282,11 @@ fn evidence_gate_rejects_excessive_skipped_pair_work_separately_from_misses() {
             skipped_shared_groups: &[7, 11],
             skipped_shared_pair_work: 5_000,
             considered_shared_pair_work: 20_000,
-            shared_work_strata: &[],
+            shared_work_strata: &[SharedTokenWorkStratum {
+                log2_pair_work: 14,
+                considered_pair_work: 20_000,
+                skipped_pair_work: 5_000,
+            }],
             pair_clusters: &[ExactEvidenceCluster {
                 id: 1,
                 exact_matches: 10_000,
@@ -1383,13 +1388,13 @@ fn evidence_gate_rejects_a_skipped_work_stratum_hidden_by_the_global_rate() {
 #[test]
 fn calibration_rescue_is_deterministic_and_filters_independent_holdout() {
     let pair_miss = metadata_engine::exact_islands::ExactMiss {
-        left_atom: 9,
-        right_atom: 3,
+        left_atom: 3,
+        right_atom: 9,
     };
     let shared_miss = metadata_engine::exact_islands::SharedTokenExactMiss {
         token_id: 5,
-        left_contract: 8,
-        right_contract: 2,
+        left_contract: 2,
+        right_contract: 8,
     };
     let plan = RescuePlan::from_calibration(
         std::slice::from_ref(&pair_miss),
@@ -1441,7 +1446,7 @@ fn calibration_rescue_is_deterministic_and_filters_independent_holdout() {
 
 #[test]
 fn evidence_gate_rejects_a_wilson_upper_bound_above_policy() {
-    let misses = (0..20)
+    let misses = (2..22)
         .map(|right_atom| metadata_engine::exact_islands::ExactMiss {
             left_atom: 1,
             right_atom,
@@ -1480,13 +1485,27 @@ fn evidence_gate_rejects_a_wilson_upper_bound_above_policy() {
 }
 
 #[test]
-fn evidence_gate_uses_independent_clusters_for_the_confidence_bound() {
+fn evidence_gate_uses_pair_miss_rate_not_affected_cluster_incidence() {
+    let misses = [
+        metadata_engine::exact_islands::ExactMiss {
+            left_atom: 7,
+            right_atom: 8,
+        },
+        metadata_engine::exact_islands::ExactMiss {
+            left_atom: 7,
+            right_atom: 9,
+        },
+        metadata_engine::exact_islands::ExactMiss {
+            left_atom: 7,
+            right_atom: 10,
+        },
+    ];
     let report = evaluate_holdout(
         HoldoutEvidence {
             evaluated_pair_work: 10_000,
             exhaustive: false,
             pair_exact_matches: 1_000,
-            pair_misses: &[],
+            pair_misses: &misses,
             shared_exact_matches: 0,
             shared_misses: &[],
             skipped_shared_groups: &[],
@@ -1501,7 +1520,7 @@ fn evidence_gate_uses_independent_clusters_for_the_confidence_bound() {
         },
         &RescuePlan::default(),
         EvidenceGatePolicy {
-            max_miss_rate: 0.10,
+            max_miss_rate: 0.01,
             confidence_z: 1.96,
             min_exact_matches: 30,
             max_skipped_pair_work_rate: 0.0,
@@ -1509,9 +1528,349 @@ fn evidence_gate_uses_independent_clusters_for_the_confidence_bound() {
     )
     .unwrap();
 
-    assert!(!report.passed);
-    assert_eq!(report.statistical_trials, 1);
-    assert!(report.wilson_upper_bound > 0.10);
+    assert!(report.passed);
+    assert_eq!(report.pair_statistical_trials, 1_000);
+    assert_eq!(report.pair_statistical_misses, 3);
+    assert!(report.wilson_upper_bound < 0.01);
+}
+
+#[test]
+fn evidence_gate_result_does_not_depend_on_miss_cluster_concentration() {
+    let clustered = [
+        metadata_engine::exact_islands::ExactMiss {
+            left_atom: 1,
+            right_atom: 3,
+        },
+        metadata_engine::exact_islands::ExactMiss {
+            left_atom: 1,
+            right_atom: 4,
+        },
+        metadata_engine::exact_islands::ExactMiss {
+            left_atom: 1,
+            right_atom: 5,
+        },
+    ];
+    let distributed = [
+        metadata_engine::exact_islands::ExactMiss {
+            left_atom: 1,
+            right_atom: 3,
+        },
+        metadata_engine::exact_islands::ExactMiss {
+            left_atom: 2,
+            right_atom: 4,
+        },
+        metadata_engine::exact_islands::ExactMiss {
+            left_atom: 2,
+            right_atom: 5,
+        },
+    ];
+    let clusters = [
+        ExactEvidenceCluster {
+            id: 1,
+            exact_matches: 500,
+        },
+        ExactEvidenceCluster {
+            id: 2,
+            exact_matches: 500,
+        },
+    ];
+    let evaluate = |misses: &[metadata_engine::exact_islands::ExactMiss]| {
+        evaluate_holdout(
+            HoldoutEvidence {
+                evaluated_pair_work: 10_000,
+                exhaustive: false,
+                pair_exact_matches: 1_000,
+                pair_misses: misses,
+                shared_exact_matches: 0,
+                shared_misses: &[],
+                skipped_shared_groups: &[],
+                skipped_shared_pair_work: 0,
+                considered_shared_pair_work: 0,
+                shared_work_strata: &[],
+                pair_clusters: &clusters,
+                shared_clusters: &[],
+            },
+            &RescuePlan::default(),
+            EvidenceGatePolicy::production(),
+        )
+        .unwrap()
+    };
+
+    let clustered = evaluate(&clustered);
+    let distributed = evaluate(&distributed);
+    assert_eq!(clustered.passed, distributed.passed);
+    assert_eq!(
+        clustered.pair_statistical_trials,
+        distributed.pair_statistical_trials
+    );
+    assert_eq!(
+        clustered.pair_statistical_misses,
+        distributed.pair_statistical_misses
+    );
+    assert_eq!(clustered.wilson_upper_bound, distributed.wilson_upper_bound);
+}
+
+#[test]
+fn evidence_gate_reports_domain_concentration_without_changing_aggregate_policy() {
+    let shared_misses = (0..20)
+        .map(
+            |left_contract| metadata_engine::exact_islands::SharedTokenExactMiss {
+                token_id: 2,
+                left_contract,
+                right_contract: 100 + left_contract,
+            },
+        )
+        .collect::<Vec<_>>();
+    let report = evaluate_holdout(
+        HoldoutEvidence {
+            evaluated_pair_work: 11_000,
+            exhaustive: false,
+            pair_exact_matches: 10_000,
+            pair_misses: &[],
+            shared_exact_matches: 1_000,
+            shared_misses: &shared_misses,
+            skipped_shared_groups: &[],
+            skipped_shared_pair_work: 0,
+            considered_shared_pair_work: 0,
+            shared_work_strata: &[],
+            pair_clusters: &[ExactEvidenceCluster {
+                id: 1,
+                exact_matches: 10_000,
+            }],
+            shared_clusters: &[ExactEvidenceCluster {
+                id: 2,
+                exact_matches: 1_000,
+            }],
+        },
+        &RescuePlan::default(),
+        EvidenceGatePolicy::production(),
+    )
+    .unwrap();
+
+    assert!(report.passed);
+    assert!(report.wilson_upper_bound < 0.01);
+    assert!(report.pair_wilson_upper_bound < 0.01);
+    assert!(report.shared_wilson_upper_bound > 0.01);
+}
+
+#[test]
+fn evidence_gate_validates_cluster_totals_per_domain() {
+    let error = evaluate_holdout(
+        HoldoutEvidence {
+            evaluated_pair_work: 15,
+            exhaustive: false,
+            pair_exact_matches: 10,
+            pair_misses: &[],
+            shared_exact_matches: 5,
+            shared_misses: &[],
+            skipped_shared_groups: &[],
+            skipped_shared_pair_work: 0,
+            considered_shared_pair_work: 0,
+            shared_work_strata: &[],
+            pair_clusters: &[ExactEvidenceCluster {
+                id: 1,
+                exact_matches: 5,
+            }],
+            shared_clusters: &[ExactEvidenceCluster {
+                id: 2,
+                exact_matches: 10,
+            }],
+        },
+        &RescuePlan::default(),
+        EvidenceGatePolicy::permissive(),
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("pair evidence cluster total 5"));
+}
+
+#[test]
+fn evidence_gate_rejects_exact_matches_above_evaluated_work() {
+    let error = evaluate_holdout(
+        HoldoutEvidence {
+            evaluated_pair_work: 9,
+            exhaustive: false,
+            pair_exact_matches: 10,
+            pair_misses: &[],
+            shared_exact_matches: 0,
+            shared_misses: &[],
+            skipped_shared_groups: &[],
+            skipped_shared_pair_work: 0,
+            considered_shared_pair_work: 0,
+            shared_work_strata: &[],
+            pair_clusters: &[ExactEvidenceCluster {
+                id: 1,
+                exact_matches: 10,
+            }],
+            shared_clusters: &[],
+        },
+        &RescuePlan::default(),
+        EvidenceGatePolicy::permissive(),
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("exceeds evaluated pair work"));
+}
+
+#[test]
+fn evidence_gate_validates_all_raw_misses_before_rescue_filtering() {
+    let error = evaluate_holdout(
+        HoldoutEvidence {
+            evaluated_pair_work: 1,
+            exhaustive: false,
+            pair_exact_matches: 1,
+            pair_misses: &[metadata_engine::exact_islands::ExactMiss {
+                left_atom: 2,
+                right_atom: 3,
+            }],
+            shared_exact_matches: 0,
+            shared_misses: &[],
+            skipped_shared_groups: &[],
+            skipped_shared_pair_work: 0,
+            considered_shared_pair_work: 0,
+            shared_work_strata: &[],
+            pair_clusters: &[ExactEvidenceCluster {
+                id: 1,
+                exact_matches: 1,
+            }],
+            shared_clusters: &[],
+        },
+        &RescuePlan {
+            pair_atoms: vec![2],
+            shared_seeds: vec![],
+        },
+        EvidenceGatePolicy::permissive(),
+    )
+    .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("absent or empty evidence cluster"));
+}
+
+#[test]
+fn evidence_gate_rejects_invalid_global_skipped_work() {
+    let error = evaluate_holdout(
+        HoldoutEvidence {
+            evaluated_pair_work: 0,
+            exhaustive: false,
+            pair_exact_matches: 0,
+            pair_misses: &[],
+            shared_exact_matches: 0,
+            shared_misses: &[],
+            skipped_shared_groups: &[7],
+            skipped_shared_pair_work: 1,
+            considered_shared_pair_work: 0,
+            shared_work_strata: &[],
+            pair_clusters: &[],
+            shared_clusters: &[],
+        },
+        &RescuePlan::default(),
+        EvidenceGatePolicy::permissive(),
+    )
+    .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("skipped shared-token pair work 1"));
+}
+
+#[test]
+fn evidence_gate_error_reports_each_independent_sub_gate() {
+    let error = metadata_engine::pipeline::PipelineError::EvidenceGate {
+        observed: 23,
+        exact_matches: 11_000,
+        upper: 0.003,
+        sample_sufficient: true,
+        pair_misses: 3,
+        pair_matches: 1_000,
+        pair_upper: 0.009,
+        pair_sufficient: true,
+        shared_misses: 20,
+        shared_matches: 1_000,
+        shared_upper: 0.03,
+        shared_sufficient: true,
+        miss_limit: 0.01,
+        skipped_rate: 0.25,
+        max_stratum_rate: 0.50,
+        skip_limit: 0.01,
+    };
+    let message = error.to_string();
+
+    assert!(message.contains("aggregate Wilson upper bound 0.003000"));
+    assert!(message.contains("pair 0.009000"));
+    assert!(message.contains("shared-token 0.030000"));
+    assert!(message.contains("skipped pair-work rate 0.250000"));
+    assert!(message.contains("maximum stratum rate 0.500000"));
+}
+
+#[test]
+fn evidence_gate_rejects_duplicate_cluster_ids_instead_of_overwriting_them() {
+    let error = evaluate_holdout(
+        HoldoutEvidence {
+            evaluated_pair_work: 1,
+            exhaustive: false,
+            pair_exact_matches: 1,
+            pair_misses: &[],
+            shared_exact_matches: 0,
+            shared_misses: &[],
+            skipped_shared_groups: &[],
+            skipped_shared_pair_work: 0,
+            considered_shared_pair_work: 0,
+            shared_work_strata: &[],
+            pair_clusters: &[
+                ExactEvidenceCluster {
+                    id: 7,
+                    exact_matches: 1,
+                },
+                ExactEvidenceCluster {
+                    id: 7,
+                    exact_matches: 0,
+                },
+            ],
+            shared_clusters: &[],
+        },
+        &RescuePlan::default(),
+        EvidenceGatePolicy::permissive(),
+    )
+    .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("duplicate pair evidence cluster id 7"));
+}
+
+#[test]
+fn evidence_gate_rejects_counter_overflow_instead_of_saturating() {
+    let error = evaluate_holdout(
+        HoldoutEvidence {
+            evaluated_pair_work: 0,
+            exhaustive: false,
+            pair_exact_matches: u64::MAX,
+            pair_misses: &[],
+            shared_exact_matches: 1,
+            shared_misses: &[],
+            skipped_shared_groups: &[],
+            skipped_shared_pair_work: 0,
+            considered_shared_pair_work: 0,
+            shared_work_strata: &[],
+            pair_clusters: &[ExactEvidenceCluster {
+                id: 1,
+                exact_matches: u64::MAX,
+            }],
+            shared_clusters: &[ExactEvidenceCluster {
+                id: 2,
+                exact_matches: 1,
+            }],
+        },
+        &RescuePlan::default(),
+        EvidenceGatePolicy::permissive(),
+    )
+    .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("overflow while summing exact matches"));
 }
 
 #[test]
@@ -1571,8 +1930,8 @@ fn evidence_gate_assigns_a_canonical_pair_miss_to_the_sampled_right_endpoint() {
     .unwrap();
 
     assert_eq!(report.observed_misses, 1);
-    assert_eq!(report.statistical_trials, 1);
-    assert_eq!(report.statistical_misses, 1);
+    assert_eq!(report.pair_statistical_trials, 1);
+    assert_eq!(report.pair_statistical_misses, 1);
 }
 
 #[test]

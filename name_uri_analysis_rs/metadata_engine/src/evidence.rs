@@ -2,8 +2,10 @@ use crate::exact_islands::{
     ExactEvidenceCluster, ExactMiss, SharedTokenExactMiss, SharedTokenWorkStratum,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use thiserror::Error;
+
+pub const EVIDENCE_GATE_REVISION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct EvidenceGatePolicy {
@@ -114,11 +116,17 @@ pub struct EvidenceGateReport {
     pub evidence_exhaustive: bool,
     pub exact_matches: u64,
     pub wilson_upper_bound: f64,
+    pub pair_wilson_upper_bound: f64,
+    pub shared_wilson_upper_bound: f64,
+    pub pair_sample_sufficient: bool,
+    pub shared_sample_sufficient: bool,
     pub skipped_shared_groups: Vec<u32>,
     pub skipped_pair_work_rate: f64,
     pub max_stratum_skipped_pair_work_rate: f64,
-    pub statistical_trials: u64,
-    pub statistical_misses: u64,
+    pub pair_statistical_trials: u64,
+    pub pair_statistical_misses: u64,
+    pub shared_statistical_trials: u64,
+    pub shared_statistical_misses: u64,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -129,17 +137,46 @@ pub enum EvidenceError {
     InvalidConfidenceZ(f64),
     #[error("invalid skipped pair-work rate {0}; expected a finite value in [0, 1]")]
     InvalidSkippedPairWorkRate(f64),
-    #[error("residual misses {misses} exceeds exact matches {exact_matches}")]
-    MissesExceedExactMatches { misses: u64, exact_matches: u64 },
+    #[error("{kind} residual misses {misses} exceeds exact matches {exact_matches}")]
+    MissesExceedExactMatches {
+        kind: &'static str,
+        misses: u64,
+        exact_matches: u64,
+    },
     #[error(
-        "evidence cluster totals {cluster_matches} do not equal exact matches {exact_matches}"
+        "{kind} evidence cluster total {cluster_matches} does not equal exact matches {exact_matches}"
     )]
     ClusterTotalsMismatch {
+        kind: &'static str,
         cluster_matches: u64,
         exact_matches: u64,
     },
     #[error("residual miss references an absent or empty evidence cluster")]
     MissingEvidenceCluster,
+    #[error("duplicate {kind} evidence cluster id {id}")]
+    DuplicateEvidenceCluster { kind: &'static str, id: u32 },
+    #[error("evidence counter overflow while summing {0}")]
+    CounterOverflow(&'static str),
+    #[error("exact matches {exact_matches} exceeds evaluated pair work {evaluated_pair_work}")]
+    ExactMatchesExceedEvaluatedWork {
+        exact_matches: u64,
+        evaluated_pair_work: u64,
+    },
+    #[error("pair misses are non-canonical, duplicated, or not strictly sorted")]
+    InvalidPairMissOrder,
+    #[error("shared-token misses are non-canonical, duplicated, or not strictly sorted")]
+    InvalidSharedMissOrder,
+    #[error("skipped shared-token pair work {skipped} exceeds considered work {considered}")]
+    InvalidGlobalPairWork { skipped: u64, considered: u64 },
+    #[error(
+        "shared-token work strata total considered={strata_considered}, skipped={strata_skipped} does not match global considered={considered}, skipped={skipped}"
+    )]
+    StratumTotalsMismatch {
+        strata_considered: u64,
+        strata_skipped: u64,
+        considered: u64,
+        skipped: u64,
+    },
     #[error(
         "shared-token work stratum {log2_pair_work} skipped work {skipped} exceeds considered work {considered}"
     )]
@@ -184,49 +221,91 @@ pub fn evaluate_holdout(
         ));
     }
 
-    let pair_residual_miss_count = evidence
+    let cluster_index = |kind, clusters: &[ExactEvidenceCluster]| {
+        let mut index = BTreeMap::new();
+        for cluster in clusters {
+            if index.insert(cluster.id, cluster.exact_matches).is_some() {
+                return Err(EvidenceError::DuplicateEvidenceCluster {
+                    kind,
+                    id: cluster.id,
+                });
+            }
+        }
+        Ok(index)
+    };
+    let pair_cluster_matches = cluster_index("pair", evidence.pair_clusters)?;
+    let shared_cluster_matches = cluster_index("shared-token", evidence.shared_clusters)?;
+    let checked_cluster_total = |kind, index: &BTreeMap<u32, u64>| {
+        index.values().try_fold(0u64, |total, &matches| {
+            total
+                .checked_add(matches)
+                .ok_or(EvidenceError::CounterOverflow(kind))
+        })
+    };
+    let pair_cluster_total =
+        checked_cluster_total("pair cluster exact matches", &pair_cluster_matches)?;
+    let shared_cluster_total = checked_cluster_total(
+        "shared-token cluster exact matches",
+        &shared_cluster_matches,
+    )?;
+    if pair_cluster_total != evidence.pair_exact_matches {
+        return Err(EvidenceError::ClusterTotalsMismatch {
+            kind: "pair",
+            cluster_matches: pair_cluster_total,
+            exact_matches: evidence.pair_exact_matches,
+        });
+    }
+    if shared_cluster_total != evidence.shared_exact_matches {
+        return Err(EvidenceError::ClusterTotalsMismatch {
+            kind: "shared-token",
+            cluster_matches: shared_cluster_total,
+            exact_matches: evidence.shared_exact_matches,
+        });
+    }
+    let pair_raw_misses = evidence.pair_misses.len() as u64;
+    let shared_raw_misses = evidence.shared_misses.len() as u64;
+    if pair_raw_misses > evidence.pair_exact_matches {
+        return Err(EvidenceError::MissesExceedExactMatches {
+            kind: "pair",
+            misses: pair_raw_misses,
+            exact_matches: evidence.pair_exact_matches,
+        });
+    }
+    if shared_raw_misses > evidence.shared_exact_matches {
+        return Err(EvidenceError::MissesExceedExactMatches {
+            kind: "shared-token",
+            misses: shared_raw_misses,
+            exact_matches: evidence.shared_exact_matches,
+        });
+    }
+    if evidence
         .pair_misses
         .iter()
-        .filter(|miss| !rescue_plan.covers_pair(miss))
-        .count() as u64;
-    let shared_residual_miss_count = evidence
+        .any(|miss| miss.left_atom >= miss.right_atom)
+        || evidence.pair_misses.windows(2).any(|pair| {
+            (pair[0].left_atom, pair[0].right_atom) >= (pair[1].left_atom, pair[1].right_atom)
+        })
+    {
+        return Err(EvidenceError::InvalidPairMissOrder);
+    }
+    if evidence
         .shared_misses
         .iter()
-        .filter(|miss| !rescue_plan.covers_shared(miss))
-        .count() as u64;
-    let observed_misses = pair_residual_miss_count.saturating_add(shared_residual_miss_count);
-    let exact_matches = evidence
-        .pair_exact_matches
-        .saturating_add(evidence.shared_exact_matches);
-    if observed_misses > exact_matches {
-        return Err(EvidenceError::MissesExceedExactMatches {
-            misses: observed_misses,
-            exact_matches,
-        });
+        .any(|miss| miss.left_contract >= miss.right_contract)
+        || evidence.shared_misses.windows(2).any(|pair| {
+            (
+                pair[0].token_id,
+                pair[0].left_contract,
+                pair[0].right_contract,
+            ) >= (
+                pair[1].token_id,
+                pair[1].left_contract,
+                pair[1].right_contract,
+            )
+        })
+    {
+        return Err(EvidenceError::InvalidSharedMissOrder);
     }
-    let cluster_matches = evidence
-        .pair_clusters
-        .iter()
-        .chain(evidence.shared_clusters)
-        .fold(0u64, |total, cluster| {
-            total.saturating_add(cluster.exact_matches)
-        });
-    if cluster_matches != exact_matches {
-        return Err(EvidenceError::ClusterTotalsMismatch {
-            cluster_matches,
-            exact_matches,
-        });
-    }
-    let pair_cluster_matches = evidence
-        .pair_clusters
-        .iter()
-        .map(|cluster| (cluster.id, cluster.exact_matches))
-        .collect::<BTreeMap<_, _>>();
-    let shared_cluster_matches = evidence
-        .shared_clusters
-        .iter()
-        .map(|cluster| (cluster.id, cluster.exact_matches))
-        .collect::<BTreeMap<_, _>>();
     let cluster_exists = |clusters: &BTreeMap<u32, u64>, id| {
         clusters
             .get(&id)
@@ -247,38 +326,69 @@ pub fn evaluate_holdout(
             None
         }
     };
-    let mut pair_miss_clusters = BTreeSet::new();
-    for miss in evidence
-        .pair_misses
-        .iter()
-        .filter(|miss| !rescue_plan.covers_pair(miss))
-    {
-        let Some(cluster) = pair_miss_cluster(miss) else {
+    for miss in evidence.pair_misses {
+        if pair_miss_cluster(miss).is_none() {
             return Err(EvidenceError::MissingEvidenceCluster);
-        };
-        pair_miss_clusters.insert(cluster);
+        }
     }
-    let mut shared_miss_clusters = BTreeSet::new();
-    for miss in evidence
-        .shared_misses
-        .iter()
-        .filter(|miss| !rescue_plan.covers_shared(miss))
-    {
+    for miss in evidence.shared_misses {
         if !cluster_exists(&shared_cluster_matches, miss.token_id) {
             return Err(EvidenceError::MissingEvidenceCluster);
         }
-        shared_miss_clusters.insert(miss.token_id);
     }
-    let statistical_trials = evidence
-        .pair_clusters
+    let pair_residual_miss_count = evidence
+        .pair_misses
         .iter()
-        .chain(evidence.shared_clusters)
-        .filter(|cluster| cluster.exact_matches != 0)
+        .filter(|miss| !rescue_plan.covers_pair(miss))
         .count() as u64;
-    let statistical_misses = pair_miss_clusters.len() as u64 + shared_miss_clusters.len() as u64;
+    let shared_residual_miss_count = evidence
+        .shared_misses
+        .iter()
+        .filter(|miss| !rescue_plan.covers_shared(miss))
+        .count() as u64;
+    let observed_misses = pair_residual_miss_count
+        .checked_add(shared_residual_miss_count)
+        .ok_or(EvidenceError::CounterOverflow("residual misses"))?;
+    let exact_matches = evidence
+        .pair_exact_matches
+        .checked_add(evidence.shared_exact_matches)
+        .ok_or(EvidenceError::CounterOverflow("exact matches"))?;
+    if exact_matches > evidence.evaluated_pair_work {
+        return Err(EvidenceError::ExactMatchesExceedEvaluatedWork {
+            exact_matches,
+            evaluated_pair_work: evidence.evaluated_pair_work,
+        });
+    }
+    // The configured policy is the aggregate residual-miss rate across all
+    // exact observations, matching observed_misses/exact_matches in the report.
+    // Keep per-domain bounds as diagnostics so concentration remains visible,
+    // but do not silently reinterpret one aggregate policy as two stricter
+    // domain policies. Sampling is deterministic, making these operational
+    // audit margins rather than claims of independent random observations.
+    let pair_wilson_upper_bound = wilson_upper_bound(
+        pair_residual_miss_count,
+        evidence.pair_exact_matches,
+        policy.confidence_z,
+    );
+    let shared_wilson_upper_bound = wilson_upper_bound(
+        shared_residual_miss_count,
+        evidence.shared_exact_matches,
+        policy.confidence_z,
+    );
     let wilson_upper_bound =
-        wilson_upper_bound(statistical_misses, statistical_trials, policy.confidence_z);
+        wilson_upper_bound(observed_misses, exact_matches, policy.confidence_z);
+    let domain_sample_sufficient = |trials| trials == 0 || trials >= policy.min_exact_matches;
+    let pair_sample_sufficient =
+        evidence.exhaustive || domain_sample_sufficient(evidence.pair_exact_matches);
+    let shared_sample_sufficient =
+        evidence.exhaustive || domain_sample_sufficient(evidence.shared_exact_matches);
     let sample_sufficient = evidence.exhaustive || exact_matches >= policy.min_exact_matches;
+    if evidence.skipped_shared_pair_work > evidence.considered_shared_pair_work {
+        return Err(EvidenceError::InvalidGlobalPairWork {
+            skipped: evidence.skipped_shared_pair_work,
+            considered: evidence.considered_shared_pair_work,
+        });
+    }
     let skipped_pair_work_rate = if evidence.considered_shared_pair_work == 0 {
         0.0
     } else {
@@ -286,6 +396,8 @@ pub fn evaluate_holdout(
     };
     let skipped_work_admitted = skipped_pair_work_rate <= policy.max_skipped_pair_work_rate;
     let mut max_stratum_skipped_pair_work_rate = 0.0f64;
+    let mut strata_considered = 0u64;
+    let mut strata_skipped = 0u64;
     for stratum in evidence.shared_work_strata {
         if stratum.skipped_pair_work > stratum.considered_pair_work {
             return Err(EvidenceError::InvalidStratumPairWork {
@@ -294,12 +406,30 @@ pub fn evaluate_holdout(
                 considered: stratum.considered_pair_work,
             });
         }
+        strata_considered = strata_considered
+            .checked_add(stratum.considered_pair_work)
+            .ok_or(EvidenceError::CounterOverflow(
+                "stratum considered pair work",
+            ))?;
+        strata_skipped = strata_skipped
+            .checked_add(stratum.skipped_pair_work)
+            .ok_or(EvidenceError::CounterOverflow("stratum skipped pair work"))?;
         let rate = if stratum.considered_pair_work == 0 {
             0.0
         } else {
             stratum.skipped_pair_work as f64 / stratum.considered_pair_work as f64
         };
         max_stratum_skipped_pair_work_rate = max_stratum_skipped_pair_work_rate.max(rate);
+    }
+    if strata_considered != evidence.considered_shared_pair_work
+        || strata_skipped != evidence.skipped_shared_pair_work
+    {
+        return Err(EvidenceError::StratumTotalsMismatch {
+            strata_considered,
+            strata_skipped,
+            considered: evidence.considered_shared_pair_work,
+            skipped: evidence.skipped_shared_pair_work,
+        });
     }
     let stratum_skips_admitted =
         max_stratum_skipped_pair_work_rate <= policy.max_skipped_pair_work_rate;
@@ -324,11 +454,17 @@ pub fn evaluate_holdout(
         evidence_exhaustive: evidence.exhaustive,
         exact_matches,
         wilson_upper_bound,
+        pair_wilson_upper_bound,
+        shared_wilson_upper_bound,
+        pair_sample_sufficient,
+        shared_sample_sufficient,
         skipped_shared_groups,
         skipped_pair_work_rate,
         max_stratum_skipped_pair_work_rate,
-        statistical_trials,
-        statistical_misses,
+        pair_statistical_trials: evidence.pair_exact_matches,
+        pair_statistical_misses: pair_residual_miss_count,
+        shared_statistical_trials: evidence.shared_exact_matches,
+        shared_statistical_misses: shared_residual_miss_count,
     })
 }
 
@@ -347,7 +483,7 @@ fn wilson_upper_bound(misses: u64, trials: u64, z: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{RescuePlan, SharedRescueSeed};
+    use super::{wilson_upper_bound, RescuePlan, SharedRescueSeed};
     use crate::exact_islands::{ExactMiss, SharedTokenExactMiss};
 
     #[test]
@@ -377,5 +513,13 @@ mod tests {
             left_contract: 11,
             right_contract: 12,
         }));
+    }
+
+    #[test]
+    fn wilson_pair_rate_regression_for_production_failure() {
+        let upper = wilson_upper_bound(770_823, 211_407_756, 1.96);
+
+        assert!((upper - 0.003_654_277_375).abs() < 1e-12);
+        assert!(upper < 0.01);
     }
 }

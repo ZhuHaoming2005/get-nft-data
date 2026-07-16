@@ -11,8 +11,8 @@ use super::AnalysisError;
 use crate::{sha256_hex, write_json_atomically};
 use metadata_engine::pipeline::MetadataPipelineResult;
 
-const READINESS_INPUT_SCHEMA_REVISION: u32 = 1;
-const PRODUCTION_EVIDENCE_SCHEMA_REVISION: u32 = 2;
+const READINESS_INPUT_SCHEMA_REVISION: u32 = 2;
+const PRODUCTION_EVIDENCE_SCHEMA_REVISION: u32 = 3;
 const OUTPUT_ADVISORY_DIRECTORY: &str = "advisory";
 const OUTPUT_READINESS_INPUT_FILE: &str = "metadata-readiness-input.json";
 const OUTPUT_READINESS_FILE: &str = "metadata-production-readiness.json";
@@ -58,6 +58,7 @@ pub(crate) struct MetadataReadinessInput {
     pub(crate) binary_version: String,
     pub(crate) snapshot_fingerprint: String,
     pub(crate) engine_match_revision: u32,
+    pub(crate) evidence_gate_revision: u32,
     pub(crate) snapshot_atoms: u64,
     pub(crate) match_summary_sha256: String,
     pub(crate) semantic_ready: bool,
@@ -71,6 +72,7 @@ pub(crate) struct MetadataProductionEvidence {
     pub(crate) binary_version: String,
     pub(crate) snapshot_fingerprint: String,
     pub(crate) engine_match_revision: u32,
+    pub(crate) evidence_gate_revision: u32,
     pub(crate) same_snapshot_differential_passed: bool,
     pub(crate) performance_gate_passed: bool,
     pub(crate) target_logical_cpus: usize,
@@ -96,6 +98,7 @@ fn readiness_input_from_result(
         binary_version: env!("CARGO_PKG_VERSION").into(),
         snapshot_fingerprint: result.snapshot_fingerprint.clone(),
         engine_match_revision: result.schema_revision,
+        evidence_gate_revision: result.evidence_gate_revision,
         snapshot_atoms: result.snapshot_atoms,
         match_summary_sha256: sha256_hex(Sha256::digest(summary).as_ref()),
         semantic_ready: result.evidence_gate_report.passed,
@@ -110,6 +113,13 @@ fn validate_readiness_input(input: &MetadataReadinessInput) -> Result<(), Analys
             "unsupported metadata readiness input schema revision {}",
             input.schema_revision
         )));
+    }
+    if input.engine_match_revision != metadata_engine::scoring::MATCH_SEMANTICS_REVISION
+        || input.evidence_gate_revision != metadata_engine::evidence::EVIDENCE_GATE_REVISION
+    {
+        return Err(AnalysisError::InvalidData(
+            "metadata readiness input uses stale match or evidence-gate semantics".into(),
+        ));
     }
     if input.binary_version.is_empty()
         || input.snapshot_fingerprint.is_empty()
@@ -142,6 +152,7 @@ fn derive_metadata_production_readiness(
             && evidence.binary_version == input.binary_version
             && evidence.snapshot_fingerprint == input.snapshot_fingerprint
             && evidence.engine_match_revision == input.engine_match_revision
+            && evidence.evidence_gate_revision == input.evidence_gate_revision
             && evidence.same_snapshot_differential_passed
             && evidence.performance_gate_passed
             && evidence.target_logical_cpus >= 128
@@ -261,6 +272,7 @@ mod tests {
             binary_version: env!("CARGO_PKG_VERSION").into(),
             snapshot_fingerprint: "snapshot".into(),
             engine_match_revision: metadata_engine::scoring::MATCH_SEMANTICS_REVISION,
+            evidence_gate_revision: metadata_engine::evidence::EVIDENCE_GATE_REVISION,
             snapshot_atoms: 42,
             match_summary_sha256: "a".repeat(64),
             semantic_ready: true,
@@ -275,6 +287,7 @@ mod tests {
             binary_version: input.binary_version.clone(),
             snapshot_fingerprint: input.snapshot_fingerprint.clone(),
             engine_match_revision: input.engine_match_revision,
+            evidence_gate_revision: input.evidence_gate_revision,
             same_snapshot_differential_passed: true,
             performance_gate_passed: true,
             target_logical_cpus: 128,
@@ -304,9 +317,13 @@ mod tests {
         let evidence = evidence(&input);
         assert!(derive_metadata_production_readiness(&input, Some(&evidence)).production_ready);
 
-        let mut stale = evidence;
+        let mut stale = evidence.clone();
         stale.snapshot_fingerprint = "other-snapshot".into();
         assert!(!derive_metadata_production_readiness(&input, Some(&stale)).production_ready);
+
+        let mut stale_gate = evidence;
+        stale_gate.evidence_gate_revision -= 1;
+        assert!(!derive_metadata_production_readiness(&input, Some(&stale_gate)).production_ready);
     }
 
     #[test]
