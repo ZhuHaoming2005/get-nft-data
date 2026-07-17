@@ -95,7 +95,9 @@ dedup/
 │   ├── dedup-engine/
 │   │   └── src/
 │   │       ├── name/
+│   │       │   ├── name_atoms.rs
 │   │       │   ├── exact_groups.rs
+│   │       │   ├── candidate_index.rs
 │   │       │   ├── overlap_join.rs
 │   │       │   └── jaro_winkler.rs
 │   │       ├── uri/
@@ -365,15 +367,28 @@ to avoid ineffective page-cache residency.
 
 ## 8. Name engine
 
-### 8.1 Contract names
+### 8.1 Name atoms
 
 Each contract keeps a single non-empty `name_norm`. Contracts without a name do not join Name
 deduplication.
 
-### 8.2 Byte-identical names
+Before candidate construction, contracts are aggregated into:
 
-Names are first grouped by their real bytes. Byte-identical groups update the corresponding scope
-statistics directly by chain membership; they do not materialize all in-group contract pairs.
+```text
+NameAtom
+  chain_id, name_ref, contract_count, nft_count
+
+CanonicalName
+  canonical_name_id, name_ref, character_count, member_name_atoms_by_chain
+```
+
+There is one `NameAtom` per byte-confirmed `(chain_id, name_norm)` and one `CanonicalName` per real
+Name value. Fuzzy scoring operates only on `CanonicalName`.
+
+### 8.2 Byte-identical canonical names
+
+Byte-identical members update scope statistics from `NameAtom` counts without materializing contract
+pairs.
 
 ### 8.3 Fuzzy candidates
 
@@ -386,16 +401,15 @@ the program uses:
 
 Candidate generation:
 
-1. Names are bucketed by character count; only length buckets allowed by `CandidateBounds` are
-   connected.
-2. Character occurrence counts are expressed as occurrence tokens.
-3. Tokens are ordered by global document frequency.
-4. The overlap join uses a safe prefix filter to produce candidates.
-5. Candidates that pass the actual common prefix and overlap upper bound run exact Jaro-Winkler.
+1. Order canonical Names by character count and apply the safe length interval.
+2. Encode character multiplicity as `(character, occurrence_rank)`.
+3. Build occurrence-token postings.
+4. Order each Name's tokens by posting frequency and stable token ID.
+5. Probe the safe rare-token prefix, de-duplicate IDs and check multiset overlap.
+6. Only surviving canonical-name pairs run exact Jaro-Winkler.
 
-High-frequency tokens must not expand unbounded postings alone. A high-frequency token may be skipped
-only when a safe prefix proves the other tokens already cover all possible hits; otherwise it must be
-sliced or stop with `budget_exhausted`, never silently dropped.
+High-frequency postings use slicing, external postings or the low-memory exact scan. Tokens and
+candidates are never dropped.
 
 Bound derivation lives in the module documentation. The candidate filter must cover every real hit
 produced by the exhaustive algorithm; the exact verification method is defined in
@@ -403,28 +417,38 @@ produced by the exhaustive algorithm; the exact verification method is defined i
 
 ### 8.4 Jaro-Winkler verification
 
-The verifier builds a per-character position queue and forbids a nested scan of the full match window
-for each character. Common prefix, matched characters and transposition counts use integer state, and
-threshold comparison does not depend on borderline floating-point rounding.
+The final verifier is a version-pinned RapidFuzz Jaro-Winkler batch comparator over Unicode scalar
+values. A prepared left comparator is reused and every call supplies the score cutoff. Its results
+must match the independent reference implementation.
 
-Name accepts only directly verified contract pairs:
+Accepted pairs expand only to their `NameAtom` members. Scope state records direct matches:
 
 - no similarity graph;
 - no Union-Find;
 - no transitive closure.
 
-### 8.5 Name work scheduling
+### 8.5 Adaptive candidate storage
 
-- Byte-identical names are processed per group.
-- High-frequency postings are sliced into micro tasks by left-side name ID.
-- Micro tasks record their expected posting-update count and enter a work-stealing queue by cost.
-- Each NUMA node maintains a local scratch pool.
-- A dense or sparse candidate accumulator is chosen by the stage budget.
-- Oversized candidate sets may spill but must not truncate.
-- Posting touches, candidate counts and spill bytes stop new task intake at the acceptance gate.
+The central budget selects one exact mode:
 
-When the explicit work budget is reached, the stage ends with `budget_exhausted` and must not emit a
-complete state.
+- `resident_postings`: CSR postings with dense or sparse per-worker scratch;
+- `external_postings`: radix-sorted fixed-width postings, mmap and per-left k-way merge;
+- `overlap_scan`: scan the safe length range and apply the same overlap filter.
+
+All modes produce identical matches.
+
+### 8.6 Name work scheduling
+
+- Byte-identical canonical names are processed per group.
+- Each pair is scored once with `left_id < right_id`.
+- Workers reuse the comparator and NUMA-local scratch.
+- Matches reach the direct pair-state reducer through bounded batches.
+- Work is split by posting touches and length-range cost.
+- Worker count is reduced when the budget cannot admit one scratch lease per requested worker.
+- Progress counts completed left Names, posting touches, candidates and matches.
+
+When an explicit work budget rather than a memory limit is reached, the stage ends with
+`budget_exhausted` and must not emit a complete state.
 
 ## 9. URI engine
 

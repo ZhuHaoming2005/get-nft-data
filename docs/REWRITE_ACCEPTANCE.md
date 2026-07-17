@@ -131,6 +131,8 @@ ChainId
 ContractId
 NftId
 StringId
+NameAtomId
+CanonicalNameId
 MetadataDocId
 SourceOrder
 ```
@@ -164,11 +166,16 @@ Tests must be able to inject a fixed digest function that forces distinct string
 The code must satisfy:
 
 - at most one non-empty Name per contract;
-- byte-identical names grouped by StringId;
-- large same-name groups do not materialize all in-group contract pairs;
+- one `NameAtom` per byte-confirmed `(chain, name_norm)`, carrying contract and NFT counts;
+- one `CanonicalName` per real Name value;
+- fuzzy scoring only between distinct `CanonicalName` values;
+- same-name groups do not materialize contract pairs;
 - fuzzy candidates use `CandidateBounds`;
-- the final decision uses exact Jaro-Winkler;
-- threshold comparison does not depend on borderline floating-point rounding;
+- occurrence tokens use `(character, occurrence_rank)`;
+- occurrence-token prefixes are ordered by global posting frequency with a deterministic tie-breaker;
+- length and multiset-overlap filters are lossless relative to the final verifier;
+- version-pinned RapidFuzz with score cutoff matches an independent reference;
+- resident postings, external postings and overlap scan produce identical matches;
 - no Union-Find;
 - no transitive closure;
 - the exact stage returns `BudgetExhausted` at the budget instead of truncating.
@@ -328,9 +335,11 @@ This section accepts only the audit code capability, not any real-run recall rat
 | `k` | anchors per contract |
 | `B_anchor` | canonicalized anchor byte count (≤ `k · C_meta` documents) |
 | `F_tmpl` | template fingerprint feature count |
-| `S_name` | total Name characters |
-| `A_name` | Name posting updates |
-| `P_name` | Jaro-Winkler candidates |
+| `A_name` | unique `(chain, name_norm)` Name atoms |
+| `U_name` | globally unique canonical Name values |
+| `S_name` | total character occurrences across canonical Name values |
+| `J_name` | occurrence-token posting entries and posting touches |
+| `P_name` | canonical-name pairs scored by Jaro-Winkler |
 | `E_probe` | LSH probe count |
 | `P_prefilter` | metadata candidate pairs |
 | `Z_vector` | BM25 term comparisons |
@@ -387,23 +396,27 @@ When the actual common prefix is below 4 a tighter bound must be used. The `5%` 
 formula from review suggestions does not apply to the current scoring definition.
 
 ```text
-T_name_exact = O(C)
+Expected T_name_atomize = O(C)
 
 T_name_fuzzy =
-  O(S_name + A_name +
+  O(A_name + S_name * log(L_max) + J_name +
     Σ(candidate a,b)(len(a) + len(b)))
 
-Worst T_name_fuzzy = O(C^2 * L_max)
+Worst T_name_fuzzy = O(U_name^2 * L_max)
 ```
 
-The position-queue verifier must satisfy:
+`L_max` is the maximum canonical-name character count.
 
-```text
-character_position_visits <= k_const * (len(a) + len(b))
-```
+Code and growth-test conditions:
 
-`P_name = O(C * polylog(C))` is not accepted as an unconditional code guarantee. Candidate explosion
-is handled by explicit budgets and error returns.
+- fixed `A_name` and `U_name` imply contract multiplicity does not increase `P_name`;
+- one byte-identical Name creates one `CanonicalName` across chains;
+- same-name groups use atom counts instead of contract pairs;
+- each unordered canonical-name candidate is scored once;
+- all storage modes match exhaustive Jaro-Winkler output;
+- scratch is bounded and reused; progress counts completed left Names;
+- `P_name = O(U_name * polylog(U_name))` is not accepted as an unconditional code guarantee;
+  candidate explosion is handled by explicit work budgets and error returns.
 
 ### 7.5 Metadata anchors and template
 
@@ -595,9 +608,12 @@ rows_scanned
 entity_digest_bucket_max
 entity_radix_handle_touches
 uri_spilled_members
+name_atoms
+name_canonical_values
+name_posting_entries
 name_posting_touches
-name_unique_candidates
-name_character_position_visits
+name_scored_candidates
+name_matched_pairs
 metadata_anchor_documents
 metadata_template_features
 metadata_low_information_contracts
@@ -623,7 +639,9 @@ spill_bytes
 ### 11.2 Property tests
 
 - Name CandidateBounds cover the exhaustive hits;
-- the queue Jaro-Winkler equals a simple reference implementation;
+- RapidFuzz equals a simple reference at, below and above the threshold;
+- Name atomization and canonicalization preserve the exhaustive contract-level bitmaps and counts;
+- resident postings, external postings and overlap scan produce the same Name result;
 - URI grouping equals the set definition;
 - canonical JSON is stable to representational differences and sensitive to real value differences;
 - a digest collision does not merge distinct bytes;
@@ -636,6 +654,8 @@ spill_bytes
 
 - byte-identical and fuzzy Name;
 - large same-name group;
+- the same normalized Name repeated by many contracts does not increase the Jaro-Winkler call count;
+- the same Name across chains preserves directional matrix counts;
 - token URI over image URI priority;
 - shared-token identical metadata (contract-level hit, all NFTs counted);
 - EVM no shared token (max-token fallback);
@@ -665,6 +685,7 @@ At least:
 
 - all URIs identical;
 - all Names identical;
+- fixed canonical Names with independently growing contract multiplicity;
 - high-frequency-character Name;
 - different permutations of the same character multiset;
 - a single very large contract;

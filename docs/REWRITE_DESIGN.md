@@ -105,6 +105,10 @@ FROM read_parquet(
 Every NFT of a contract carries the same name, so names are aggregated by contract address and are
 not deduplicated within a contract.
 
+Contracts with the same `(chain, name_norm)` may be aggregated with their contract and NFT counts.
+Byte-identical aggregates across chains share one canonical Name. Jaro-Winkler is evaluated between
+canonical Names; counts retain the original chain and scope.
+
 ### Already-normalized input
 
 Name deduplication reads `name_norm` from Parquet directly. The analyzer does not touch the raw
