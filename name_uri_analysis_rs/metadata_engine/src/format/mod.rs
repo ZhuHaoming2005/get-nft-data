@@ -13,7 +13,7 @@ use memmap2::Mmap;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-pub use atomic::commit_ready;
+pub use atomic::{commit_ready, commit_ready_serialized};
 pub use header::ArrayHeader;
 
 /// Schema revision for on-disk typed-array files.
@@ -237,6 +237,23 @@ pub fn typed_array_footer_fingerprint(path: &Path) -> Result<Option<(u64, String
     Ok(Some((size, checksum_hex(&footer))))
 }
 
+/// Read and structurally validate a typed-array header without scanning or
+/// mapping its payload. This is used by memory planning before checksum
+/// verification touches the full file.
+pub fn typed_array_element_count(
+    path: &Path,
+    expected_kind: ArrayKind,
+) -> Result<u64, FormatError> {
+    let mut file = File::open(path)?;
+    let size = file.metadata()?.len();
+    let mut header_bytes = [0u8; header::HEADER_SIZE];
+    file.read_exact(&mut header_bytes)?;
+    let header = ArrayHeader::decode(&header_bytes)?;
+    header.validate_for_kind(expected_kind)?;
+    validate_dynamic_header(header, size)?;
+    Ok(header.element_count)
+}
+
 /// Fully verify a typed-array payload and return its footer identity.
 pub fn verify_typed_array_fingerprint(path: &Path) -> Result<(u64, String), FormatError> {
     let file = File::open(path)?;
@@ -329,6 +346,13 @@ impl TypedArraySink {
             return Err(FormatError::UnsupportedKind(self.kind));
         }
         self.push_bytes(&value.to_le_bytes())
+    }
+
+    pub fn push_u8(&mut self, value: u8) -> Result<(), FormatError> {
+        if self.kind != ArrayKind::U8 {
+            return Err(FormatError::UnsupportedKind(self.kind));
+        }
+        self.push_bytes(&[value])
     }
 
     pub fn push_u64(&mut self, value: u64) -> Result<(), FormatError> {

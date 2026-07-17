@@ -5,6 +5,7 @@ use thiserror::Error;
 use crate::format::{self, ArrayKind, FormatError};
 use rayon::prelude::*;
 use std::borrow::Cow;
+use std::mem::MaybeUninit;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -32,6 +33,27 @@ pub struct BidirectionalCsr {
     pub token_member_offsets: Vec<u64>,
     pub token_member_contracts: Vec<u32>,
     pub token_member_sources: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BidirectionalCsrView<'a> {
+    pub contract_token_offsets: &'a [u64],
+    pub contract_tokens: &'a [u32],
+    pub token_member_offsets: &'a [u64],
+    pub token_member_contracts: &'a [u32],
+    pub token_member_sources: &'a [u32],
+}
+
+impl BidirectionalCsr {
+    pub fn as_view(&self) -> BidirectionalCsrView<'_> {
+        BidirectionalCsrView {
+            contract_token_offsets: &self.contract_token_offsets,
+            contract_tokens: &self.contract_tokens,
+            token_member_offsets: &self.token_member_offsets,
+            token_member_contracts: &self.token_member_contracts,
+            token_member_sources: &self.token_member_sources,
+        }
+    }
 }
 
 /// Build sorted bidirectional CSR from source memberships.
@@ -99,17 +121,27 @@ fn build_bidirectional_csr_from_iter_with_lanes<'a>(
 
     let contract_count = count_from_max(max_contract)?;
     let token_count = count_from_max(max_token)?;
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(lanes.max(1))
-        .build()
-        .map_err(|_| CsrError::CardinalityOverflow)?;
+    // Encode invokes this builder from its already configured persistence
+    // pool. Reuse that registry instead of creating another full 128-thread
+    // pool (and another set of worker stacks) inside it. Standalone callers
+    // still receive the requested bounded pool.
+    let pool = if rayon::current_thread_index().is_some() {
+        None
+    } else {
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(lanes.max(1))
+                .build()
+                .map_err(|_| CsrError::CardinalityOverflow)?,
+        )
+    };
     let contract_counts = (0..contract_count)
         .map(|_| AtomicUsize::new(0))
         .collect::<Vec<_>>();
     let token_counts = (0..token_count)
         .map(|_| AtomicUsize::new(0))
         .collect::<Vec<_>>();
-    pool.install(|| {
+    install_in_pool(pool.as_ref(), || {
         normalized.par_iter().for_each(|membership| {
             contract_counts[membership.contract as usize]
                 .fetch_add(membership.tokens.len(), Ordering::Relaxed);
@@ -153,7 +185,7 @@ fn build_bidirectional_csr_from_iter_with_lanes<'a>(
         .copied()
         .map(AtomicUsize::new)
         .collect::<Vec<_>>();
-    pool.install(|| {
+    install_in_pool(pool.as_ref(), || {
         normalized.par_iter().for_each(|membership| {
             let packed = (u64::from(membership.contract) << 32) | u64::from(membership.source);
             for &token in membership.tokens.iter() {
@@ -165,62 +197,38 @@ fn build_bidirectional_csr_from_iter_with_lanes<'a>(
             }
         });
     });
-    let mut contract_buckets = pool.install(|| {
+    let mut contract_buckets = install_in_pool(pool.as_ref(), || {
         contract_buckets
             .into_par_iter()
             .map(AtomicU32::into_inner)
             .collect::<Vec<_>>()
     });
-    let mut token_buckets = pool.install(|| {
+    let mut token_buckets = install_in_pool(pool.as_ref(), || {
         token_buckets
             .into_par_iter()
             .map(AtomicU64::into_inner)
-            .map(|packed| ((packed >> 32) as u32, packed as u32))
             .collect::<Vec<_>>()
     });
     drop(normalized);
 
-    pool.install(|| {
+    install_in_pool(pool.as_ref(), || {
         rayon::join(
             || parallel_sort_buckets(&mut contract_buckets, &contract_bucket_offsets),
             || parallel_sort_buckets(&mut token_buckets, &token_bucket_offsets),
         );
     });
 
-    let contract_rows = pool.install(|| {
-        (0..contract_count)
-            .into_par_iter()
-            .map(|contract| {
-                let range =
-                    contract_bucket_offsets[contract]..contract_bucket_offsets[contract + 1];
-                let mut row = contract_buckets[range].to_vec();
-                row.dedup();
-                row
-            })
-            .collect::<Vec<_>>()
-    });
-    drop(contract_buckets);
-    let token_rows = pool.install(|| {
-        (0..token_count)
-            .into_par_iter()
-            .map(|token| {
-                let range = token_bucket_offsets[token]..token_bucket_offsets[token + 1];
-                let mut row = token_buckets[range].to_vec();
-                row.dedup();
-                row
-            })
-            .collect::<Vec<_>>()
-    });
-    drop(token_buckets);
-    let contract_token_offsets = row_offsets(&contract_rows)?;
-    let contract_tokens = contract_rows.into_iter().flatten().collect::<Vec<_>>();
-    let token_member_offsets = row_offsets(&token_rows)?;
-    let token_members = token_rows.into_iter().flatten().collect::<Vec<_>>();
+    let (contract_token_offsets, contract_tokens) = install_in_pool(pool.as_ref(), || {
+        compact_sorted_buckets(contract_buckets, &contract_bucket_offsets)
+    })?;
+    let (token_member_offsets, token_members) = install_in_pool(pool.as_ref(), || {
+        compact_sorted_buckets(token_buckets, &token_bucket_offsets)
+    })?;
     let mut token_member_contracts = Vec::with_capacity(token_members.len());
     let mut token_member_sources = Vec::with_capacity(token_members.len());
-    for (contract, source) in token_members {
-        token_member_contracts.push(contract);
-        token_member_sources.push(source);
+    for packed in token_members {
+        token_member_contracts.push((packed >> 32) as u32);
+        token_member_sources.push(packed as u32);
     }
 
     Ok(BidirectionalCsr {
@@ -232,20 +240,14 @@ fn build_bidirectional_csr_from_iter_with_lanes<'a>(
     })
 }
 
-fn row_offsets<T>(rows: &[Vec<T>]) -> Result<Vec<u64>, CsrError> {
-    let mut offsets = Vec::with_capacity(rows.len().saturating_add(1));
-    offsets.push(0u64);
-    for row in rows {
-        offsets.push(
-            offsets
-                .last()
-                .copied()
-                .unwrap_or(0)
-                .checked_add(row.len() as u64)
-                .ok_or(CsrError::CardinalityOverflow)?,
-        );
+fn install_in_pool<R: Send>(
+    pool: Option<&rayon::ThreadPool>,
+    operation: impl FnOnce() -> R + Send,
+) -> R {
+    match pool {
+        Some(pool) => pool.install(operation),
+        None => operation(),
     }
-    Ok(offsets)
 }
 
 fn count_from_max(maximum: Option<u32>) -> Result<usize, CsrError> {
@@ -273,6 +275,148 @@ fn bucket_offsets(counts: &[usize]) -> Result<Vec<usize>, CsrError> {
     Ok(offsets)
 }
 
+fn compact_sorted_buckets<T>(
+    values: Vec<T>,
+    source_offsets: &[usize],
+) -> Result<(Vec<u64>, Vec<T>), CsrError>
+where
+    T: Copy + Eq + Send + Sync,
+{
+    let row_count = source_offsets.len().saturating_sub(1);
+    let unique_counts = (0..row_count)
+        .into_par_iter()
+        .map(|row| sorted_unique_count(&values[source_offsets[row]..source_offsets[row + 1]]))
+        .collect::<Vec<_>>();
+    let target_offsets = bucket_offsets(&unique_counts)?;
+    let target_offsets_u64 = target_offsets.iter().map(|&offset| offset as u64).collect();
+    let target_len = target_offsets.last().copied().unwrap_or(0);
+    let mut compacted = Vec::<MaybeUninit<T>>::with_capacity(target_len);
+    // Every target slot belongs to exactly one row. The recursive copier writes
+    // each slot once before `assume_init_vec` converts the allocation to Vec<T>.
+    unsafe {
+        compacted.set_len(target_len);
+    }
+    copy_sorted_unique_buckets(
+        &values,
+        source_offsets,
+        &mut compacted,
+        &target_offsets,
+        0,
+        row_count,
+        0,
+        0,
+    );
+    Ok((target_offsets_u64, assume_init_vec(compacted)))
+}
+
+fn sorted_unique_count<T: Eq + Sync>(values: &[T]) -> usize {
+    if values.is_empty() {
+        return 0;
+    }
+    const PARALLEL_THRESHOLD: usize = 65_536;
+    let changes = if values.len() >= PARALLEL_THRESHOLD {
+        values
+            .par_windows(2)
+            .filter(|pair| pair[0] != pair[1])
+            .count()
+    } else {
+        values.windows(2).filter(|pair| pair[0] != pair[1]).count()
+    };
+    changes + 1
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_sorted_unique_buckets<T>(
+    source: &[T],
+    source_offsets: &[usize],
+    target: &mut [MaybeUninit<T>],
+    target_offsets: &[usize],
+    first_row: usize,
+    end_row: usize,
+    source_base: usize,
+    target_base: usize,
+) where
+    T: Copy + Eq + Send + Sync,
+{
+    const MIN_PARALLEL_VALUES: usize = 16_384;
+    if first_row >= end_row {
+        return;
+    }
+    if source.len() < MIN_PARALLEL_VALUES || end_row - first_row <= 1 {
+        for row in first_row..end_row {
+            let source_start = source_offsets[row] - source_base;
+            let source_end = source_offsets[row + 1] - source_base;
+            let target_start = target_offsets[row] - target_base;
+            let target_end = target_offsets[row + 1] - target_base;
+            write_sorted_unique(
+                &source[source_start..source_end],
+                &mut target[target_start..target_end],
+            );
+        }
+        return;
+    }
+    let middle = first_row + (end_row - first_row) / 2;
+    let source_split = source_offsets[middle] - source_base;
+    let target_split = target_offsets[middle] - target_base;
+    let (source_left, source_right) = source.split_at(source_split);
+    let (target_left, target_right) = target.split_at_mut(target_split);
+    rayon::join(
+        || {
+            copy_sorted_unique_buckets(
+                source_left,
+                source_offsets,
+                target_left,
+                target_offsets,
+                first_row,
+                middle,
+                source_base,
+                target_base,
+            )
+        },
+        || {
+            copy_sorted_unique_buckets(
+                source_right,
+                source_offsets,
+                target_right,
+                target_offsets,
+                middle,
+                end_row,
+                source_offsets[middle],
+                target_offsets[middle],
+            )
+        },
+    );
+}
+
+fn write_sorted_unique<T: Copy + Eq>(source: &[T], target: &mut [MaybeUninit<T>]) {
+    if source.is_empty() {
+        debug_assert!(target.is_empty());
+        return;
+    }
+    let mut written = 0usize;
+    let mut previous = source[0];
+    target[written].write(previous);
+    written += 1;
+    for &value in &source[1..] {
+        if value != previous {
+            target[written].write(value);
+            written += 1;
+            previous = value;
+        }
+    }
+    debug_assert_eq!(written, target.len());
+}
+
+fn assume_init_vec<T>(mut values: Vec<MaybeUninit<T>>) -> Vec<T> {
+    let pointer = values.as_mut_ptr().cast::<T>();
+    let length = values.len();
+    let capacity = values.capacity();
+    std::mem::forget(values);
+    // SAFETY: `compact_sorted_buckets` sizes each target row from the exact
+    // unique count, and `write_sorted_unique` initializes every slot once.
+    unsafe { Vec::from_raw_parts(pointer, length, capacity) }
+}
+
 fn parallel_sort_buckets<T: Ord + Send>(values: &mut [T], offsets: &[usize]) {
     fn recurse<T: Ord + Send>(
         values: &mut [T],
@@ -285,7 +429,11 @@ fn parallel_sort_buckets<T: Ord + Send>(values: &mut [T], offsets: &[usize]) {
         if first_row >= end_row {
             return;
         }
-        if values.len() < MIN_PARALLEL_VALUES || end_row - first_row <= 1 {
+        if end_row - first_row == 1 {
+            values.par_sort_unstable();
+            return;
+        }
+        if values.len() < MIN_PARALLEL_VALUES {
             for row in first_row..end_row {
                 let start = offsets[row] - base;
                 let end = offsets[row + 1] - base;
@@ -311,6 +459,14 @@ fn parallel_sort_buckets<T: Ord + Send>(values: &mut [T], offsets: &[usize]) {
 pub fn write_csr_files_with_progress(
     bundle_dir: &Path,
     csr: &BidirectionalCsr,
+    on_payload_bytes: impl FnMut(u64),
+) -> Result<(), CsrError> {
+    write_csr_view_files_with_progress(bundle_dir, csr.as_view(), on_payload_bytes)
+}
+
+pub fn write_csr_view_files_with_progress(
+    bundle_dir: &Path,
+    csr: BidirectionalCsrView<'_>,
     mut on_payload_bytes: impl FnMut(u64),
 ) -> Result<(), CsrError> {
     let mut completed = 0u64;

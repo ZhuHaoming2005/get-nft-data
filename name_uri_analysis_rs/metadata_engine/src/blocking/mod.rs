@@ -6,20 +6,24 @@ mod sketch;
 mod stats;
 
 pub use base_equivalent::{
-    blocking_artifact_upper_bound, compile_base_equivalent,
-    compile_base_equivalent_parallel_with_progress, compile_base_equivalent_with_progress,
-    scoring_owner, AtomSketch, BlockKind, BlockingBundle, BlockingCompileConfig, BlockingError,
-    RoutingStatus, ANCHOR_COUNT, BANDS, BAND_BITS, JOINT_BAND_FAMILIES,
+    blocking_artifact_upper_bound, blocking_artifact_upper_bound_view, compile_base_equivalent,
+    compile_base_equivalent_parallel_with_progress,
+    compile_base_equivalent_view_parallel_with_progress, compile_base_equivalent_with_progress,
+    scoring_owner, AtomSketch, AtomSketchSoA, AtomSketchView, BlockKind, BlockingBundle,
+    BlockingCompileConfig, BlockingError, RoutingStatus, ANCHOR_COUNT, BANDS, BAND_BITS,
+    JOINT_BAND_FAMILIES,
 };
 pub(crate) use local::LocalRoutingPlan;
 pub use local::{for_each_local_base_equivalent_pair, for_each_local_base_equivalent_pair_while};
 pub use sketch::{
-    build_base_equivalent_atom_sketches,
+    build_base_equivalent_atom_sketch_soa_from_view_parallel, build_base_equivalent_atom_sketches,
     build_base_equivalent_atom_sketches_from_feature_view_parallel,
     build_base_equivalent_atom_sketches_from_soa_parallel,
-    build_base_equivalent_atom_sketches_parallel, BaseEquivalentAtomInput,
+    build_base_equivalent_atom_sketches_from_view_parallel,
+    build_base_equivalent_atom_sketches_parallel, AtomDimensionAccumulator, AtomDimensionSketch,
+    BaseEquivalentAtomInput,
 };
-pub use stats::{BlockStats, HotBlockPlan, HotBlockTile};
+pub use stats::{BlockStats, HotBlockPlan, HotBlockPlanSink, HotBlockTile};
 
 /// Blocking artifact schema revision for BaseEquivalent.
 pub const BLOCKING_REVISION: u32 = 3;

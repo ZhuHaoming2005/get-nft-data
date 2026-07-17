@@ -5,13 +5,12 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sysinfo::System;
 
-use super::AnalysisError;
+use super::{effective_memory_capacity_bytes, AnalysisError};
 use crate::{sha256_hex, write_json_atomically};
 use metadata_engine::pipeline::MetadataPipelineResult;
 
-const READINESS_INPUT_SCHEMA_REVISION: u32 = 2;
+const READINESS_INPUT_SCHEMA_REVISION: u32 = 3;
 const PRODUCTION_EVIDENCE_SCHEMA_REVISION: u32 = 3;
 const OUTPUT_ADVISORY_DIRECTORY: &str = "advisory";
 const OUTPUT_READINESS_INPUT_FILE: &str = "metadata-readiness-input.json";
@@ -92,7 +91,6 @@ fn readiness_input_from_result(
     result: &MetadataPipelineResult,
 ) -> Result<MetadataReadinessInput, AnalysisError> {
     let summary = serde_json::to_vec(&result.summary_rows)?;
-    let system = System::new_all();
     Ok(MetadataReadinessInput {
         schema_revision: READINESS_INPUT_SCHEMA_REVISION,
         binary_version: env!("CARGO_PKG_VERSION").into(),
@@ -102,8 +100,10 @@ fn readiness_input_from_result(
         snapshot_atoms: result.snapshot_atoms,
         match_summary_sha256: sha256_hex(Sha256::digest(summary).as_ref()),
         semantic_ready: result.evidence_gate_report.passed,
-        observed_logical_cpus: system.cpus().len(),
-        observed_memory_bytes: system.total_memory(),
+        observed_logical_cpus: std::thread::available_parallelism()
+            .map(|value| value.get())
+            .unwrap_or(1),
+        observed_memory_bytes: effective_memory_capacity_bytes(),
     })
 }
 

@@ -1,6 +1,8 @@
 //! Block size statistics and hot-block tile plans.
 
-use std::path::Path;
+use std::fs::File;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -129,5 +131,60 @@ impl HotBlockPlan {
         let json =
             serde_json::to_vec(plans).map_err(|e| FormatError::InvalidManifest(e.to_string()))?;
         atomic::write_atomic(path, &json)
+    }
+}
+
+/// Incremental JSON-array writer used by the external blocking compiler.  Hot
+/// plans stay O(1) per block and never require a block-count-sized Rust Vec.
+pub struct HotBlockPlanSink {
+    final_path: PathBuf,
+    partial_path: PathBuf,
+    file: Option<File>,
+    first: bool,
+}
+
+impl HotBlockPlanSink {
+    pub fn create(path: &Path) -> Result<Self, FormatError> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let partial_path = atomic::partial_path(path);
+        let mut file = File::create(&partial_path)?;
+        file.write_all(b"[")?;
+        Ok(Self {
+            final_path: path.to_path_buf(),
+            partial_path,
+            file: Some(file),
+            first: true,
+        })
+    }
+
+    pub fn push(&mut self, plan: &HotBlockPlan) -> Result<(), FormatError> {
+        let file = self.file.as_mut().expect("hot-plan sink is open");
+        if !self.first {
+            file.write_all(b",")?;
+        }
+        serde_json::to_writer(&mut *file, plan)
+            .map_err(|error| FormatError::InvalidManifest(error.to_string()))?;
+        self.first = false;
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<(), FormatError> {
+        let mut file = self.file.take().expect("hot-plan sink is open");
+        file.write_all(b"]")?;
+        file.sync_all()?;
+        drop(file);
+        atomic::replace_file_atomically(&self.partial_path, &self.final_path)
+    }
+}
+
+impl Drop for HotBlockPlanSink {
+    fn drop(&mut self) {
+        if self.file.is_some() {
+            let _ = std::fs::remove_file(&self.partial_path);
+        }
     }
 }

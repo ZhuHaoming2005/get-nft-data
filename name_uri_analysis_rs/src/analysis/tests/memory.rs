@@ -56,10 +56,38 @@ fn controller_memory_validation_accepts_auto_and_rejects_invalid_static_limits()
 
 #[test]
 fn engine_memory_limit_uses_real_host_headroom_and_user_cap() {
-    let hard_top = engine_memory_hard_top_bytes(64 * GIB as usize, 384 * GIB, 64 * GIB).unwrap();
+    let hard_top =
+        engine_memory_hard_top_bytes(64 * GIB as usize, 384 * GIB, 64 * GIB, 64 * GIB).unwrap();
     assert_eq!(hard_top, 56 * GIB);
-    let user_limited = engine_memory_hard_top_bytes(8 * GIB as usize, 384 * GIB, 64 * GIB).unwrap();
+    let user_limited =
+        engine_memory_hard_top_bytes(8 * GIB as usize, 384 * GIB, 64 * GIB, 64 * GIB).unwrap();
     assert_eq!(user_limited, 8 * GIB);
+    let availability_limited =
+        engine_memory_hard_top_bytes(448 * GIB as usize, 448 * GIB, 512 * GIB, 300 * GIB).unwrap();
+    assert_eq!(availability_limited, 300 * GIB);
+}
+
+#[test]
+fn duckdb_buffer_cap_retains_one_quarter_for_non_buffer_memory() {
+    assert_eq!(duckdb_buffer_cap_bytes(448 * GIB), 336 * GIB);
+}
+
+#[test]
+fn name_phase_budget_keeps_duckdb_inside_the_host_envelope() {
+    let gib = metadata_engine::resource::GIB;
+
+    assert_eq!(
+        name_phase_rust_budget(448 * gib as usize, 8 * gib, 512 * gib, 512 * gib).unwrap(),
+        440 * gib as usize
+    );
+    assert_eq!(
+        name_phase_rust_budget(128 * gib as usize, 8 * gib, 512 * gib, 512 * gib).unwrap(),
+        128 * gib as usize
+    );
+    assert_eq!(
+        name_phase_rust_budget(448 * gib as usize, 8 * gib, 512 * gib, 300 * gib).unwrap(),
+        292 * gib as usize
+    );
 }
 
 #[test]
@@ -68,6 +96,7 @@ fn encode_memory_plan_shares_the_448_gib_target_envelope() {
         "320GiB",
         384 * metadata_engine::resource::GIB as usize,
         64 * metadata_engine::resource::GIB,
+        512 * metadata_engine::resource::GIB,
         512 * metadata_engine::resource::GIB,
     )
     .unwrap();
@@ -88,6 +117,7 @@ fn encode_memory_plan_moves_capacity_from_duckdb_to_large_rust_estimates() {
         384 * metadata_engine::resource::GIB as usize,
         200 * metadata_engine::resource::GIB,
         512 * metadata_engine::resource::GIB,
+        512 * metadata_engine::resource::GIB,
     )
     .unwrap();
 
@@ -96,6 +126,28 @@ fn encode_memory_plan_moves_capacity_from_duckdb_to_large_rust_estimates() {
         264 * metadata_engine::resource::GIB
     );
     assert_eq!(plan.duckdb_bytes, 184 * metadata_engine::resource::GIB);
+}
+
+#[test]
+fn encode_memory_plan_can_use_the_full_envelope_above_the_old_288_gib_cap() {
+    let plan = encode_process_memory_plan(
+        "320GiB",
+        448 * metadata_engine::resource::GIB as usize,
+        350 * metadata_engine::resource::GIB,
+        512 * metadata_engine::resource::GIB,
+        512 * metadata_engine::resource::GIB,
+    )
+    .unwrap();
+
+    assert_eq!(
+        plan.rust_hard_top_bytes,
+        414 * metadata_engine::resource::GIB
+    );
+    assert_eq!(plan.duckdb_bytes, 34 * metadata_engine::resource::GIB);
+    assert_eq!(
+        plan.rust_hard_top_bytes + plan.duckdb_bytes,
+        plan.envelope_bytes
+    );
 }
 
 #[test]
@@ -156,8 +208,27 @@ fn prepare_only_uri_tables_are_released_before_metadata_compaction() {
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(
         "CREATE TEMP TABLE contract_dim(value INTEGER);
-         CREATE TEMP TABLE uri_rows(value INTEGER);
+         CREATE TABLE prepare_uri_metadata_rows AS
+         SELECT 7::UINTEGER AS chain_index,
+                11::UINTEGER AS contract_id,
+                'token-uri'::VARCHAR AS token_uri_norm,
+                ''::VARCHAR AS image_uri_norm,
+                 'shared'::VARCHAR AS token_id,
+                 '{\"name\":\"shared\"}'::VARCHAR AS metadata_json,
+                 17::UINTEGER AS metadata_json_bytes,
+                 0::UINTEGER AS source_file,
+                3::UBIGINT AS source_row_number,
+                true AS metadata_eligible;
+         CREATE TEMP VIEW uri_rows AS
+         SELECT chain_index, contract_id, token_uri_norm, image_uri_norm
+         FROM prepare_uri_metadata_rows;
+         CREATE TEMP VIEW metadata_rows AS
+         SELECT contract_id, token_id, metadata_json, metadata_json_bytes, source_file,
+                source_row_number, metadata_eligible
+         FROM prepare_uri_metadata_rows
+         WHERE metadata_eligible;
          CREATE TEMP TABLE uri_key_contracts(value INTEGER);
+         CREATE TEMP TABLE uri_key_chain_stats(value INTEGER);
          CREATE TEMP TABLE uri_duplicate_key_stats(value INTEGER);
          CREATE TEMP TABLE uri_cross_chain_keys(value INTEGER);
          CREATE TEMP TABLE uri_contract_flags(value INTEGER);
@@ -169,12 +240,14 @@ fn prepare_only_uri_tables_are_released_before_metadata_compaction() {
 
     for table in [
         "contract_dim",
-        "uri_rows",
         "uri_key_contracts",
+        "uri_key_chain_stats",
         "uri_duplicate_key_stats",
         "uri_cross_chain_keys",
         "uri_contract_flags",
         "uri_chain_pair_contract_flags",
+        "prepare_uri_metadata_rows",
+        "metadata_rows_materialized",
     ] {
         let exists: bool = conn
             .query_row(
@@ -185,6 +258,45 @@ fn prepare_only_uri_tables_are_released_before_metadata_compaction() {
             .unwrap();
         assert!(!exists, "temporary table still present: {table}");
     }
+    for view in ["uri_rows", "metadata_rows"] {
+        let exists: bool = conn
+            .query_row(
+                "SELECT count(*) > 0 FROM duckdb_views() WHERE view_name = ?",
+                [view],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!exists, "temporary view still present: {view}");
+    }
+    let metadata = conn
+        .query_row(
+            "SELECT contract_id, token_id, metadata_json, source_file,
+                    source_row_number, metadata_eligible
+             FROM metadata_rows",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, u32>(3)?,
+                    row.get::<_, u64>(4)?,
+                    row.get::<_, bool>(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        metadata,
+        (
+            11,
+            "shared".to_string(),
+            r#"{"name":"shared"}"#.to_string(),
+            0,
+            3,
+            true,
+        )
+    );
 }
 
 #[test]

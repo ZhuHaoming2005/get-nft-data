@@ -186,11 +186,12 @@ struct Args {
     #[arg(
         long,
         default_value = "448GiB",
-        help = "Hard budget for Rust analysis structures"
+        help = "Per-phase Rust ceiling; each phase is capped further by current available memory, DuckDB, and required host headroom"
     )]
     analysis_memory_limit: String,
 
-    /// DuckDB buffer-manager limit. Keep headroom for non-buffer allocations.
+    /// DuckDB buffer-manager target; Prepare/Encode cap or rebalance it to the
+    /// current process-memory envelope, and Name is capped separately at 8 GiB.
     #[arg(long, default_value = "320GiB")]
     duckdb_memory_limit: String,
 

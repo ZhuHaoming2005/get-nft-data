@@ -9,7 +9,8 @@ use thiserror::Error;
 
 use crate::cascade::{term_id_signature, PAYLOAD_TERM_SIG_BYTES};
 use crate::encode::csr::{
-    build_bidirectional_csr_from_iter, write_csr_files_with_progress, BidirectionalCsr, CsrError,
+    build_bidirectional_csr_from_iter, write_csr_view_files_with_progress, BidirectionalCsrView,
+    CsrError,
 };
 use crate::format::{self, ArrayKind, FormatError, MappedU32Array, MappedU64Array, MappedU8Array};
 
@@ -45,6 +46,24 @@ pub struct EncodeSourceSoA {
     pub token_ids: Vec<u32>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct EncodeSourceView<'a> {
+    pub contract_ids: &'a [u32],
+    pub payload_ids: &'a [u32],
+    pub token_offsets: &'a [u64],
+    pub token_ids: &'a [u32],
+}
+
+impl<'a> EncodeSourceView<'a> {
+    pub fn source_count(self) -> usize {
+        self.contract_ids.len()
+    }
+
+    pub fn tokens_of(self, source: usize) -> &'a [u32] {
+        csr_u32(self.token_offsets, self.token_ids, source)
+    }
+}
+
 impl EncodeSourceSoA {
     pub fn with_source_capacity(source_count: usize) -> Self {
         let mut token_offsets = Vec::with_capacity(source_count.saturating_add(1));
@@ -59,6 +78,15 @@ impl EncodeSourceSoA {
 
     pub fn source_count(&self) -> usize {
         self.contract_ids.len()
+    }
+
+    pub fn as_view(&self) -> EncodeSourceView<'_> {
+        EncodeSourceView {
+            contract_ids: &self.contract_ids,
+            payload_ids: &self.payload_ids,
+            token_offsets: &self.token_offsets,
+            token_ids: &self.token_ids,
+        }
     }
 
     pub fn tokens_of(&self, source: usize) -> &[u32] {
@@ -104,6 +132,21 @@ pub struct EncodeContractSoA {
     pub weights: Vec<u64>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct EncodeContractView<'a> {
+    pub contract_ids: &'a [u32],
+    pub chain_ids: &'a [u32],
+    pub source_doc_ids: &'a [u32],
+    pub payload_ids: &'a [u32],
+    pub weights: &'a [u64],
+}
+
+impl EncodeContractView<'_> {
+    pub fn contract_count(self) -> usize {
+        self.contract_ids.len()
+    }
+}
+
 impl EncodeContractSoA {
     pub fn with_contract_capacity(contract_count: usize) -> Self {
         Self {
@@ -117,6 +160,16 @@ impl EncodeContractSoA {
 
     pub fn contract_count(&self) -> usize {
         self.contract_ids.len()
+    }
+
+    pub fn as_view(&self) -> EncodeContractView<'_> {
+        EncodeContractView {
+            contract_ids: &self.contract_ids,
+            chain_ids: &self.chain_ids,
+            source_doc_ids: &self.source_doc_ids,
+            payload_ids: &self.payload_ids,
+            weights: &self.weights,
+        }
     }
 
     pub fn push_contract(
@@ -178,6 +231,62 @@ pub struct PayloadTermSoA {
     pub content_freqs: Vec<u32>,
 }
 
+/// Borrowed payload-term columns. Encode can back these slices either with
+/// ordinary resident vectors or with checksummed temporary mmaps when the
+/// term dictionary / final flat arrays do not fit the Rust memory envelope.
+#[derive(Debug, Clone, Copy)]
+pub struct PayloadTermView<'a> {
+    pub template_offsets: &'a [u64],
+    pub template_terms: &'a [u32],
+    pub template_freqs: &'a [u32],
+    pub content_offsets: &'a [u64],
+    pub content_terms: &'a [u32],
+    pub content_freqs: &'a [u32],
+}
+
+impl<'a> PayloadTermView<'a> {
+    pub fn payload_count(self) -> usize {
+        self.template_offsets.len().saturating_sub(1)
+    }
+
+    pub fn template_term_ids(self, payload: usize) -> &'a [u32] {
+        csr_u32(self.template_offsets, self.template_terms, payload)
+    }
+
+    pub fn template_freqs(self, payload: usize) -> &'a [u32] {
+        csr_u32(self.template_offsets, self.template_freqs, payload)
+    }
+
+    pub fn content_term_ids(self, payload: usize) -> &'a [u32] {
+        csr_u32(self.content_offsets, self.content_terms, payload)
+    }
+
+    pub fn content_freqs(self, payload: usize) -> &'a [u32] {
+        csr_u32(self.content_offsets, self.content_freqs, payload)
+    }
+
+    pub fn content_token_length(self, payload: usize) -> u32 {
+        self.content_freqs(payload)
+            .iter()
+            .fold(0u32, |total, frequency| total.saturating_add(*frequency))
+    }
+
+    pub fn payload_eq(self, left: usize, right: usize) -> bool {
+        self.template_term_ids(left) == self.template_term_ids(right)
+            && self.template_freqs(left) == self.template_freqs(right)
+            && self.content_term_ids(left) == self.content_term_ids(right)
+            && self.content_freqs(left) == self.content_freqs(right)
+    }
+
+    pub fn hash_payload(self, payload: usize, hasher: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        self.template_term_ids(payload).hash(hasher);
+        self.template_freqs(payload).hash(hasher);
+        self.content_term_ids(payload).hash(hasher);
+        self.content_freqs(payload).hash(hasher);
+    }
+}
+
 impl PayloadTermSoA {
     pub fn with_payload_capacity(payload_count: usize) -> Self {
         let mut template_offsets = Vec::with_capacity(payload_count.saturating_add(1));
@@ -196,6 +305,17 @@ impl PayloadTermSoA {
 
     pub fn payload_count(&self) -> usize {
         self.template_offsets.len().saturating_sub(1)
+    }
+
+    pub fn as_view(&self) -> PayloadTermView<'_> {
+        PayloadTermView {
+            template_offsets: &self.template_offsets,
+            template_terms: &self.template_terms,
+            template_freqs: &self.template_freqs,
+            content_offsets: &self.content_offsets,
+            content_terms: &self.content_terms,
+            content_freqs: &self.content_freqs,
+        }
     }
 
     pub fn template_term_ids(&self, payload: usize) -> &[u32] {
@@ -348,9 +468,34 @@ pub struct FallbackAtomCsr {
     pub atom_payloads: Vec<u32>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct FallbackAtomView<'a> {
+    pub offsets: &'a [u64],
+    pub members: &'a [u32],
+    pub atom_payloads: &'a [u32],
+}
+
+impl<'a> FallbackAtomView<'a> {
+    pub fn atom_count(self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    pub fn members_of(self, atom: usize) -> &'a [u32] {
+        csr_u32(self.offsets, self.members, atom)
+    }
+}
+
 impl FallbackAtomCsr {
     pub fn atom_count(&self) -> usize {
         self.offsets.len().saturating_sub(1)
+    }
+
+    pub fn as_view(&self) -> FallbackAtomView<'_> {
+        FallbackAtomView {
+            offsets: &self.offsets,
+            members: &self.members,
+            atom_payloads: &self.atom_payloads,
+        }
     }
 
     pub fn members_of(&self, atom: usize) -> &[u32] {
@@ -410,6 +555,8 @@ pub enum FeatureSoaError {
     },
     #[error("source_doc_id {source_doc_id} out of range (sources len {len})")]
     SourceIdOutOfRange { source_doc_id: u32, len: usize },
+    #[error("payload {payload_id} template terms are not strictly increasing")]
+    NonCanonicalTemplateTerms { payload_id: usize },
     #[error("feature column length overflow")]
     LengthOverflow,
 }
@@ -497,11 +644,15 @@ impl<'a, F: FnMut(u64, u64)> PayloadProgress<'a, F> {
         Ok(())
     }
 
-    fn write_csr(&mut self, bundle_dir: &Path, csr: &BidirectionalCsr) -> Result<(), CsrError> {
+    fn write_csr(
+        &mut self,
+        bundle_dir: &Path,
+        csr: BidirectionalCsrView<'_>,
+    ) -> Result<(), CsrError> {
         let base = self.completed;
         let total = self.total;
         let callback = &mut self.callback;
-        write_csr_files_with_progress(bundle_dir, csr, |local| {
+        write_csr_view_files_with_progress(bundle_dir, csr, |local| {
             callback(base.saturating_add(local), total);
         })?;
         self.completed = base.saturating_add(csr_payload_bytes(csr));
@@ -616,24 +767,47 @@ pub fn write_encode_artifacts_soa_with_progress(
     payloads: &PayloadTermSoA,
     contracts: &EncodeContractSoA,
     fallback_atoms: &FallbackAtomCsr,
-    mut on_progress: impl FnMut(u64, u64),
+    on_progress: impl FnMut(u64, u64),
 ) -> Result<EncodePersistStats, FeatureSoaError> {
-    fs::create_dir_all(bundle_dir)?;
+    write_encode_artifacts_view_with_progress(
+        bundle_dir,
+        sources,
+        payloads.as_view(),
+        contracts,
+        fallback_atoms,
+        on_progress,
+    )
+}
 
-    crate::identity::checked_u32_identity("source rows", sources.source_count() as u64)?;
-    crate::identity::checked_u32_identity("payload rows", payloads.payload_count() as u64)?;
-    crate::identity::checked_u32_identity("contract rows", contracts.contract_count() as u64)?;
-    crate::identity::checked_u32_identity("fallback atoms", fallback_atoms.atom_count() as u64)?;
+/// Persist Match-facing columns from an arbitrary payload-term backing. The
+/// slices may come from resident vectors or from demand-paged temporary typed
+/// arrays; output bytes and validation rules are identical.
+pub fn write_encode_artifacts_view_with_progress(
+    bundle_dir: &Path,
+    sources: &EncodeSourceSoA,
+    payloads: PayloadTermView<'_>,
+    contracts: &EncodeContractSoA,
+    fallback_atoms: &FallbackAtomCsr,
+    on_progress: impl FnMut(u64, u64),
+) -> Result<EncodePersistStats, FeatureSoaError> {
+    write_encode_artifacts_all_views_with_progress(
+        bundle_dir,
+        sources.as_view(),
+        payloads,
+        contracts.as_view(),
+        fallback_atoms.as_view(),
+        on_progress,
+    )
+}
 
-    for &payload_id in &sources.payload_ids {
-        if payload_id as usize >= payloads.payload_count() {
-            return Err(FeatureSoaError::PayloadIdOutOfRange {
-                payload_id,
-                len: payloads.payload_count(),
-            });
-        }
-    }
-
+pub fn write_encode_artifacts_all_views_with_progress(
+    bundle_dir: &Path,
+    sources: EncodeSourceView<'_>,
+    payloads: PayloadTermView<'_>,
+    contracts: EncodeContractView<'_>,
+    fallback_atoms: FallbackAtomView<'_>,
+    on_progress: impl FnMut(u64, u64),
+) -> Result<EncodePersistStats, FeatureSoaError> {
     let csr =
         build_bidirectional_csr_from_iter((0..sources.source_count()).map(|source_doc_id| {
             (
@@ -643,6 +817,62 @@ pub fn write_encode_artifacts_soa_with_progress(
                 sources.tokens_of(source_doc_id),
             )
         }))?;
+    write_encode_artifacts_all_views_with_csr_progress(
+        bundle_dir,
+        sources,
+        payloads,
+        contracts,
+        fallback_atoms,
+        csr.as_view(),
+        on_progress,
+    )
+}
+
+pub fn write_encode_artifacts_view_with_csr_progress(
+    bundle_dir: &Path,
+    sources: &EncodeSourceSoA,
+    payloads: PayloadTermView<'_>,
+    contracts: &EncodeContractSoA,
+    fallback_atoms: &FallbackAtomCsr,
+    csr: BidirectionalCsrView<'_>,
+    on_progress: impl FnMut(u64, u64),
+) -> Result<EncodePersistStats, FeatureSoaError> {
+    write_encode_artifacts_all_views_with_csr_progress(
+        bundle_dir,
+        sources.as_view(),
+        payloads,
+        contracts.as_view(),
+        fallback_atoms.as_view(),
+        csr,
+        on_progress,
+    )
+}
+
+pub fn write_encode_artifacts_all_views_with_csr_progress(
+    bundle_dir: &Path,
+    sources: EncodeSourceView<'_>,
+    payloads: PayloadTermView<'_>,
+    contracts: EncodeContractView<'_>,
+    fallback_atoms: FallbackAtomView<'_>,
+    csr: BidirectionalCsrView<'_>,
+    mut on_progress: impl FnMut(u64, u64),
+) -> Result<EncodePersistStats, FeatureSoaError> {
+    fs::create_dir_all(bundle_dir)?;
+
+    crate::identity::checked_u32_identity("source rows", sources.source_count() as u64)?;
+    crate::identity::checked_u32_identity("payload rows", payloads.payload_count() as u64)?;
+    crate::identity::checked_u32_identity("contract rows", contracts.contract_count() as u64)?;
+    crate::identity::checked_u32_identity("fallback atoms", fallback_atoms.atom_count() as u64)?;
+
+    for &payload_id in sources.payload_ids {
+        if payload_id as usize >= payloads.payload_count() {
+            return Err(FeatureSoaError::PayloadIdOutOfRange {
+                payload_id,
+                len: payloads.payload_count(),
+            });
+        }
+    }
+
     let (token_pair_work, max_token_members) = candidate_group_stats(
         csr.token_member_offsets
             .windows(2)
@@ -651,7 +881,7 @@ pub fn write_encode_artifacts_soa_with_progress(
     let (fallback_pair_work, max_fallback_members) = candidate_group_stats(
         (0..fallback_atoms.atom_count()).map(|atom| fallback_atoms.members_of(atom).len() as u64),
     );
-    let total = feature_payload_bytes_soa(sources, payloads, contracts, fallback_atoms, &csr)?;
+    let total = feature_payload_bytes_soa(sources, payloads, contracts, fallback_atoms, csr)?;
     let mut progress = PayloadProgress::new(total, &mut on_progress);
 
     progress.write_u32(
@@ -665,23 +895,23 @@ pub fn write_encode_artifacts_soa_with_progress(
         &mut progress,
         bundle_dir,
         "payload_template",
-        &payloads.template_offsets,
-        &payloads.template_terms,
-        &payloads.template_freqs,
+        payloads.template_offsets,
+        payloads.template_terms,
+        payloads.template_freqs,
     )?;
     write_term_soa_columns(
         &mut progress,
         bundle_dir,
         "payload_content",
-        &payloads.content_offsets,
-        &payloads.content_terms,
-        &payloads.content_freqs,
+        payloads.content_offsets,
+        payloads.content_terms,
+        payloads.content_freqs,
     )?;
-    write_payload_term_signatures_soa(&mut progress, bundle_dir, payloads)?;
+    write_payload_term_signatures_view(&mut progress, bundle_dir, payloads)?;
 
-    progress.write_csr(bundle_dir, &csr)?;
+    progress.write_csr(bundle_dir, csr)?;
 
-    write_identity_and_placeholder_columns_soa(
+    write_identity_and_placeholder_columns_view(
         &mut progress,
         bundle_dir,
         sources,
@@ -711,11 +941,34 @@ pub fn encode_artifact_upper_bound_soa(
     contracts: &EncodeContractSoA,
     fallback_atoms: &FallbackAtomCsr,
 ) -> Result<u64, FeatureSoaError> {
+    encode_artifact_upper_bound_view(sources, payloads.as_view(), contracts, fallback_atoms)
+}
+
+pub fn encode_artifact_upper_bound_view(
+    sources: &EncodeSourceSoA,
+    payloads: PayloadTermView<'_>,
+    contracts: &EncodeContractSoA,
+    fallback_atoms: &FallbackAtomCsr,
+) -> Result<u64, FeatureSoaError> {
+    encode_artifact_upper_bound_all_views(
+        sources.as_view(),
+        payloads,
+        contracts.as_view(),
+        fallback_atoms.as_view(),
+    )
+}
+
+pub fn encode_artifact_upper_bound_all_views(
+    sources: EncodeSourceView<'_>,
+    payloads: PayloadTermView<'_>,
+    contracts: EncodeContractView<'_>,
+    fallback_atoms: FallbackAtomView<'_>,
+) -> Result<u64, FeatureSoaError> {
     const FILE_AND_MANIFEST_ALLOWANCE: u64 = 64 * 1024 * 1024;
     let contract_count = contracts
         .contract_ids
         .iter()
-        .chain(&sources.contract_ids)
+        .chain(sources.contract_ids)
         .map(|contract_id| u64::from(*contract_id) + 1)
         .max()
         .unwrap_or(0);
@@ -764,11 +1017,11 @@ fn candidate_group_stats(sizes: impl Iterator<Item = u64>) -> (u64, u64) {
 }
 
 fn feature_payload_bytes_soa(
-    sources: &EncodeSourceSoA,
-    payloads: &PayloadTermSoA,
-    contracts: &EncodeContractSoA,
-    fallback_atoms: &FallbackAtomCsr,
-    csr: &BidirectionalCsr,
+    sources: EncodeSourceView<'_>,
+    payloads: PayloadTermView<'_>,
+    contracts: EncodeContractView<'_>,
+    fallback_atoms: FallbackAtomView<'_>,
+    csr: BidirectionalCsrView<'_>,
 ) -> Result<u64, FeatureSoaError> {
     feature_payload_bytes_from_csr_bytes(
         sources,
@@ -780,10 +1033,10 @@ fn feature_payload_bytes_soa(
 }
 
 fn feature_payload_bytes_from_csr_bytes(
-    sources: &EncodeSourceSoA,
-    payloads: &PayloadTermSoA,
-    contracts: &EncodeContractSoA,
-    fallback_atoms: &FallbackAtomCsr,
+    sources: EncodeSourceView<'_>,
+    payloads: PayloadTermView<'_>,
+    contracts: EncodeContractView<'_>,
+    fallback_atoms: FallbackAtomView<'_>,
     csr_payload_bytes: u64,
 ) -> Result<u64, FeatureSoaError> {
     let template_terms = payloads.template_terms.len() as u64;
@@ -828,7 +1081,7 @@ fn feature_payload_bytes_from_csr_bytes(
         })
 }
 
-fn checked_csr_payload_bytes(csr: &BidirectionalCsr) -> Result<u64, FeatureSoaError> {
+fn checked_csr_payload_bytes(csr: BidirectionalCsrView<'_>) -> Result<u64, FeatureSoaError> {
     [
         (csr.contract_token_offsets.len() as u64, 8),
         (csr.contract_tokens.len() as u64, 4),
@@ -848,18 +1101,18 @@ fn checked_csr_payload_bytes(csr: &BidirectionalCsr) -> Result<u64, FeatureSoaEr
     })
 }
 
-fn csr_payload_bytes(csr: &BidirectionalCsr) -> u64 {
+fn csr_payload_bytes(csr: BidirectionalCsrView<'_>) -> u64 {
     checked_csr_payload_bytes(csr).unwrap_or(u64::MAX)
 }
 
 /// Write Match-facing scoring columns before BM25/fallback fill-in.
-fn write_identity_and_placeholder_columns_soa(
+fn write_identity_and_placeholder_columns_view(
     progress: &mut PayloadProgress<'_, impl FnMut(u64, u64)>,
     bundle_dir: &Path,
-    sources: &EncodeSourceSoA,
-    payloads: &PayloadTermSoA,
-    contracts: &EncodeContractSoA,
-    fallback_atoms: &FallbackAtomCsr,
+    sources: EncodeSourceView<'_>,
+    payloads: PayloadTermView<'_>,
+    contracts: EncodeContractView<'_>,
+    fallback_atoms: FallbackAtomView<'_>,
 ) -> Result<(), FeatureSoaError> {
     progress.write_u32(
         &bundle_dir.join("payload_lengths.u32"),
@@ -867,7 +1120,7 @@ fn write_identity_and_placeholder_columns_soa(
         payloads.payload_count() as u64,
         (0..payloads.payload_count()).map(|payload| payloads.content_token_length(payload)),
     )?;
-    write_template_scoring_columns_soa(progress, bundle_dir, payloads, contracts)?;
+    write_template_scoring_columns_view(progress, bundle_dir, payloads, contracts)?;
     let max_contract_id = contracts.contract_ids.iter().copied().max();
     let contract_count = max_contract_id.map_or(0, |id| id as usize + 1);
     let mut dense_index = vec![None; contract_count];
@@ -945,26 +1198,25 @@ fn write_identity_and_placeholder_columns_soa(
     Ok(())
 }
 
-fn write_template_scoring_columns_soa(
+fn write_template_scoring_columns_view(
     progress: &mut PayloadProgress<'_, impl FnMut(u64, u64)>,
     bundle_dir: &Path,
-    payloads: &PayloadTermSoA,
-    contracts: &EncodeContractSoA,
+    payloads: PayloadTermView<'_>,
+    contracts: EncodeContractView<'_>,
 ) -> Result<(), FeatureSoaError> {
-    let prepared = prepare_template_scoring_soa(payloads, contracts)?;
-    let PreparedTemplateScoring {
+    let prepared = prepare_template_scoring_context(payloads, contracts)?;
+    let PreparedTemplateScoringContext {
         payload_document_weights,
         total_docs,
         doc_freqs,
         query_denominators,
-        prepared_weights,
+        payload_norms,
     } = prepared;
     debug_assert_eq!(payload_document_weights.len(), payloads.payload_count());
     debug_assert!(total_docs >= payload_document_weights.iter().copied().max().unwrap_or(0));
     debug_assert!(doc_freqs.iter().all(|&frequency| frequency <= total_docs));
     drop(payload_document_weights);
-    drop(doc_freqs);
-    let prepared_weight_count = prepared_weights.len() as u64;
+    let prepared_weight_count = payloads.template_terms.len() as u64;
     progress.write_f64(
         &bundle_dir.join("query_denominators.f64"),
         ArrayKind::F64,
@@ -981,11 +1233,20 @@ fn write_template_scoring_columns_soa(
         &bundle_dir.join("prepared_weights.f64"),
         ArrayKind::F64,
         prepared_weight_count,
-        prepared_weights,
+        prepared_weights_iter(payloads, &payload_norms, total_docs, &doc_freqs),
     )?;
     Ok(())
 }
 
+struct PreparedTemplateScoringContext {
+    payload_document_weights: Vec<u64>,
+    total_docs: u64,
+    doc_freqs: Vec<u64>,
+    query_denominators: Vec<f64>,
+    payload_norms: Vec<f64>,
+}
+
+#[cfg(test)]
 struct PreparedTemplateScoring {
     payload_document_weights: Vec<u64>,
     total_docs: u64,
@@ -1005,10 +1266,42 @@ fn prepare_template_scoring(
     )
 }
 
+#[cfg(test)]
 fn prepare_template_scoring_soa(
     payloads: &PayloadTermSoA,
     contracts: &EncodeContractSoA,
 ) -> Result<PreparedTemplateScoring, FeatureSoaError> {
+    prepare_template_scoring_view(payloads.as_view(), contracts)
+}
+
+#[cfg(test)]
+fn prepare_template_scoring_view(
+    payloads: PayloadTermView<'_>,
+    contracts: &EncodeContractSoA,
+) -> Result<PreparedTemplateScoring, FeatureSoaError> {
+    let context = prepare_template_scoring_context(payloads, contracts.as_view())?;
+    let PreparedTemplateScoringContext {
+        payload_document_weights,
+        total_docs,
+        doc_freqs,
+        query_denominators,
+        payload_norms,
+    } = context;
+    let prepared_weights =
+        prepared_weights_iter(payloads, &payload_norms, total_docs, &doc_freqs).collect();
+    Ok(PreparedTemplateScoring {
+        payload_document_weights,
+        total_docs,
+        doc_freqs,
+        query_denominators,
+        prepared_weights,
+    })
+}
+
+fn prepare_template_scoring_context(
+    payloads: PayloadTermView<'_>,
+    contracts: EncodeContractView<'_>,
+) -> Result<PreparedTemplateScoringContext, FeatureSoaError> {
     const K1: f64 = 1.2;
     const B: f64 = 0.75;
     let token_count = payloads
@@ -1017,6 +1310,15 @@ fn prepare_template_scoring_soa(
         .map(|term| *term as usize + 1)
         .max()
         .unwrap_or(0);
+    // A checked total proves every per-payload and per-term weighted sum fits
+    // in u64 for canonical rows. That lets the contended counters use one
+    // hardware fetch_add instead of a compare-exchange retry loop.
+    let total_docs = contracts
+        .weights
+        .par_iter()
+        .map(|&weight| u128::from(weight))
+        .sum::<u128>();
+    let total_docs = u64::try_from(total_docs).map_err(|_| FeatureSoaError::LengthOverflow)?;
     let payload_document_weights = (0..payloads.payload_count())
         .map(|_| AtomicU64::new(0))
         .collect::<Vec<_>>();
@@ -1026,18 +1328,16 @@ fn prepare_template_scoring_soa(
             let payload_id = contracts.payload_ids[index] as usize;
             let contract_weight = contracts.weights[index];
             let weight = &payload_document_weights[payload_id];
-            let _ = weight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                Some(current.saturating_add(contract_weight))
-            });
+            weight.fetch_add(contract_weight, Ordering::Relaxed);
         });
     let payload_document_weights = payload_document_weights
         .into_iter()
         .map(AtomicU64::into_inner)
         .collect::<Vec<_>>();
-    let total_docs = payload_document_weights
-        .iter()
-        .copied()
-        .fold(0u64, u64::saturating_add);
+    debug_assert_eq!(
+        payload_document_weights.iter().copied().sum::<u64>(),
+        total_docs
+    );
     let doc_freqs = (0..token_count)
         .map(|_| AtomicU64::new(0))
         .collect::<Vec<_>>();
@@ -1056,17 +1356,19 @@ fn prepare_template_scoring_soa(
         .map(|payload_id| {
             let weight = payload_document_weights[payload_id];
             if weight != 0 {
-                for &term in payloads.template_term_ids(payload_id) {
-                    let frequency = &doc_freqs[term as usize];
-                    let _ =
-                        frequency.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                            Some(current.saturating_add(weight))
-                        });
+                let terms = payloads.template_term_ids(payload_id);
+                let mut previous = None;
+                for &term in terms {
+                    if previous.is_some_and(|previous| previous >= term) {
+                        return Err(FeatureSoaError::NonCanonicalTemplateTerms { payload_id });
+                    }
+                    previous = Some(term);
+                    doc_freqs[term as usize].fetch_add(weight, Ordering::Relaxed);
                 }
             }
-            u128::from(payload_lengths[payload_id]).saturating_mul(u128::from(weight))
+            Ok(u128::from(payload_lengths[payload_id]).saturating_mul(u128::from(weight)))
         })
-        .reduce(|| 0u128, u128::saturating_add);
+        .try_reduce(|| 0u128, |left, right| Ok(left.saturating_add(right)))?;
     let doc_freqs = doc_freqs
         .into_iter()
         .map(AtomicU64::into_inner)
@@ -1088,26 +1390,68 @@ fn prepare_template_scoring_soa(
         })
         .collect::<Vec<_>>();
     drop(payload_lengths);
-    const PREPARED_WEIGHT_CHUNK_TERMS: usize = 64 * 1024;
-    let (prepared_weights, query_denominators) =
-        prepared_weights_and_query_denominators_flat_parallel(
-            payloads,
-            &payload_norms,
-            total_docs,
-            &doc_freqs,
-            PREPARED_WEIGHT_CHUNK_TERMS,
-        );
-    Ok(PreparedTemplateScoring {
+    let query_denominators = (0..payloads.payload_count())
+        .into_par_iter()
+        .map(|payload_id| {
+            let denominator = payloads
+                .template_term_ids(payload_id)
+                .iter()
+                .copied()
+                .zip(payloads.template_freqs(payload_id).iter().copied())
+                .map(|(term, frequency)| {
+                    f64::from(frequency)
+                        * prepared_term_weight(
+                            term,
+                            frequency,
+                            payload_norms[payload_id],
+                            total_docs,
+                            &doc_freqs,
+                        )
+                })
+                .sum::<f64>();
+            if denominator > 0.0 {
+                denominator
+            } else {
+                1.0
+            }
+        })
+        .collect();
+    Ok(PreparedTemplateScoringContext {
         payload_document_weights,
         total_docs,
         doc_freqs,
         query_denominators,
-        prepared_weights,
+        payload_norms,
     })
 }
 
+fn prepared_weights_iter<'a>(
+    payloads: PayloadTermView<'a>,
+    payload_norms: &'a [f64],
+    total_docs: u64,
+    doc_freqs: &'a [u64],
+) -> impl Iterator<Item = f64> + 'a {
+    (0..payloads.payload_count()).flat_map(move |payload_id| {
+        payloads
+            .template_term_ids(payload_id)
+            .iter()
+            .copied()
+            .zip(payloads.template_freqs(payload_id).iter().copied())
+            .map(move |(term, frequency)| {
+                prepared_term_weight(
+                    term,
+                    frequency,
+                    payload_norms[payload_id],
+                    total_docs,
+                    doc_freqs,
+                )
+            })
+    })
+}
+
+#[cfg(test)]
 fn prepared_weights_and_query_denominators_flat_parallel(
-    payloads: &PayloadTermSoA,
+    payloads: PayloadTermView<'_>,
     payload_norms: &[f64],
     total_docs: u64,
     doc_freqs: &[u64],
@@ -1135,13 +1479,15 @@ fn prepared_weights_and_query_denominators_flat_parallel(
     (prepared_weights, query_denominators)
 }
 
-fn payload_id_range(payloads: &PayloadTermSoA, payload_id: usize) -> std::ops::Range<usize> {
+#[cfg(test)]
+fn payload_id_range(payloads: PayloadTermView<'_>, payload_id: usize) -> std::ops::Range<usize> {
     payloads.template_offsets[payload_id] as usize
         ..payloads.template_offsets[payload_id + 1] as usize
 }
 
+#[cfg(test)]
 fn prepared_weights_flat_parallel(
-    payloads: &PayloadTermSoA,
+    payloads: PayloadTermView<'_>,
     payload_norms: &[f64],
     total_docs: u64,
     doc_freqs: &[u64],
@@ -1201,10 +1547,10 @@ fn prepared_term_weight(
     }
 }
 
-fn write_payload_term_signatures_soa(
+fn write_payload_term_signatures_view(
     progress: &mut PayloadProgress<'_, impl FnMut(u64, u64)>,
     bundle_dir: &Path,
-    payloads: &PayloadTermSoA,
+    payloads: PayloadTermView<'_>,
 ) -> Result<(), FeatureSoaError> {
     let signature_bytes = payloads
         .payload_count()
@@ -1307,6 +1653,13 @@ pub(crate) const FEATURE_ARRAY_FILES: &[&str] = &[
     "fallback_atoms_members.u32",
 ];
 
+enum MappedFeatureArray {
+    U8(MappedU8Array),
+    U32(MappedU32Array),
+    U64(MappedU64Array),
+    F64(crate::format::MappedF64Array),
+}
+
 /// Typed feature + CSR maps for Match consumers.
 ///
 /// Intentionally has **no** payload_blobs / pack accessor.
@@ -1358,40 +1711,68 @@ impl FeatureView {
             require(&bundle_dir.join(name))?;
         }
 
-        macro_rules! map {
-            ($function:ident, $name:literal) => {{
-                let path = bundle_dir.join($name);
-                let mapped = format::$function(&path)?;
-                progress(std::fs::metadata(path)?.len());
-                mapped
+        // Each typed array owns an independent mmap and checksum. Verify them
+        // concurrently, then consume results in manifest order so the first
+        // surfaced error and progress sequence remain deterministic.
+        let mapped = FEATURE_ARRAY_FILES
+            .par_iter()
+            .map(|name| {
+                let path = bundle_dir.join(name);
+                let bytes = std::fs::metadata(&path)?.len();
+                let array = if name.ends_with(".u8") {
+                    MappedFeatureArray::U8(format::map_u8_array(&path)?)
+                } else if name.ends_with(".u32") {
+                    MappedFeatureArray::U32(format::map_u32_array(&path)?)
+                } else if name.ends_with(".u64") {
+                    MappedFeatureArray::U64(format::map_u64_array(&path)?)
+                } else if name.ends_with(".f64") {
+                    MappedFeatureArray::F64(format::map_f64_array(&path)?)
+                } else {
+                    unreachable!("feature manifest contains only typed arrays")
+                };
+                Ok::<_, FeatureSoaError>((array, bytes))
+            })
+            .collect::<Vec<_>>();
+        let mut mapped = mapped.into_iter();
+
+        macro_rules! take {
+            ($variant:ident) => {{
+                let (array, bytes) = mapped
+                    .next()
+                    .expect("feature manifest and FeatureView fields stay aligned")?;
+                progress(bytes);
+                match array {
+                    MappedFeatureArray::$variant(array) => array,
+                    _ => unreachable!("feature manifest type and FeatureView field stay aligned"),
+                }
             }};
         }
 
         Ok(Self {
-            source_to_payload: map!(map_u32_array, "source_to_payload.u32"),
-            payload_template_offsets: map!(map_u64_array, "payload_template_offsets.u64"),
-            payload_template_terms: map!(map_u32_array, "payload_template_terms.u32"),
-            payload_template_freqs: map!(map_u32_array, "payload_template_freqs.u32"),
-            payload_content_offsets: map!(map_u64_array, "payload_content_offsets.u64"),
-            payload_content_terms: map!(map_u32_array, "payload_content_terms.u32"),
-            payload_content_freqs: map!(map_u32_array, "payload_content_freqs.u32"),
-            payload_template_sigs: map!(map_u8_array, "payload_template_sigs.u8"),
-            payload_content_sigs: map!(map_u8_array, "payload_content_sigs.u8"),
-            contract_token_offsets: map!(map_u64_array, "contract_token_offsets.u64"),
-            contract_tokens: map!(map_u32_array, "contract_tokens.u32"),
-            token_member_offsets: map!(map_u64_array, "token_member_offsets.u64"),
-            token_member_contracts: map!(map_u32_array, "token_member_contracts.u32"),
-            token_member_sources: map!(map_u32_array, "token_member_sources.u32"),
-            payload_lengths: map!(map_u32_array, "payload_lengths.u32"),
-            query_denominators: map!(map_f64_array, "query_denominators.f64"),
-            prepared_weight_offsets: map!(map_u64_array, "prepared_weight_offsets.u64"),
-            prepared_weights: map!(map_f64_array, "prepared_weights.f64"),
-            contract_source: map!(map_u32_array, "contract_source.u32"),
-            contract_chain: map!(map_u32_array, "contract_chain.u32"),
-            contract_payload: map!(map_u32_array, "contract_payload.u32"),
-            contract_weight: map!(map_u64_array, "contract_weight.u64"),
-            fallback_atom_offsets: map!(map_u64_array, "fallback_atoms_offsets.u64"),
-            fallback_atom_contracts: map!(map_u32_array, "fallback_atoms_members.u32"),
+            source_to_payload: take!(U32),
+            payload_template_offsets: take!(U64),
+            payload_template_terms: take!(U32),
+            payload_template_freqs: take!(U32),
+            payload_content_offsets: take!(U64),
+            payload_content_terms: take!(U32),
+            payload_content_freqs: take!(U32),
+            payload_template_sigs: take!(U8),
+            payload_content_sigs: take!(U8),
+            contract_token_offsets: take!(U64),
+            contract_tokens: take!(U32),
+            token_member_offsets: take!(U64),
+            token_member_contracts: take!(U32),
+            token_member_sources: take!(U32),
+            payload_lengths: take!(U32),
+            query_denominators: take!(F64),
+            prepared_weight_offsets: take!(U64),
+            prepared_weights: take!(F64),
+            contract_source: take!(U32),
+            contract_chain: take!(U32),
+            contract_payload: take!(U32),
+            contract_weight: take!(U64),
+            fallback_atom_offsets: take!(U64),
+            fallback_atom_contracts: take!(U32),
         })
     }
 
@@ -1521,7 +1902,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let actual = prepared_weights_flat_parallel(&payloads, &norms, 10, &doc_freqs, 2);
+        let actual = prepared_weights_flat_parallel(payloads.as_view(), &norms, 10, &doc_freqs, 2);
 
         assert_eq!(
             actual
@@ -1547,7 +1928,11 @@ mod tests {
         let doc_freqs = [2, 4, 1, 3, 1];
 
         let (weights, denominators) = prepared_weights_and_query_denominators_flat_parallel(
-            &payloads, &norms, 10, &doc_freqs, 2,
+            payloads.as_view(),
+            &norms,
+            10,
+            &doc_freqs,
+            2,
         );
 
         let expected_denominators = (0..payloads.payload_count())
@@ -1633,5 +2018,54 @@ mod tests {
         assert_eq!(prepared.doc_freqs, vec![5, 7]);
         assert_eq!(prepared.query_denominators.len(), 2);
         assert_eq!(prepared.prepared_weights.len(), 2);
+    }
+
+    #[test]
+    fn prepared_template_scoring_rejects_total_document_weight_overflow() {
+        let payloads = vec![EncodePayloadRow {
+            template_terms: vec![(0, 1)],
+            content_terms: vec![],
+        }];
+        let contracts = vec![
+            EncodeContractRow {
+                contract_id: 0,
+                chain_id: 0,
+                source_doc_id: 0,
+                payload_id: 0,
+                weight: u64::MAX,
+            },
+            EncodeContractRow {
+                contract_id: 1,
+                chain_id: 0,
+                source_doc_id: 1,
+                payload_id: 0,
+                weight: 1,
+            },
+        ];
+
+        assert!(matches!(
+            prepare_template_scoring(&payloads, &contracts),
+            Err(FeatureSoaError::LengthOverflow)
+        ));
+    }
+
+    #[test]
+    fn prepared_template_scoring_rejects_duplicate_term_ids_before_atomic_add() {
+        let payloads = vec![EncodePayloadRow {
+            template_terms: vec![(0, 1), (0, 2)],
+            content_terms: vec![],
+        }];
+        let contracts = vec![EncodeContractRow {
+            contract_id: 0,
+            chain_id: 0,
+            source_doc_id: 0,
+            payload_id: 0,
+            weight: 1,
+        }];
+
+        assert!(matches!(
+            prepare_template_scoring(&payloads, &contracts),
+            Err(FeatureSoaError::NonCanonicalTemplateTerms { payload_id: 0 })
+        ));
     }
 }

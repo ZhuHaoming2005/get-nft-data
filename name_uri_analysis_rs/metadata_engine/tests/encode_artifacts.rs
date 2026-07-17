@@ -57,6 +57,39 @@ fn payload_cas_requires_full_byte_equality_on_hash_hit() {
 }
 
 #[test]
+fn payload_cas_reads_multi_pack_ranges_in_id_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = dir.path().join("payload_blobs");
+    let mut writer = PayloadCasWriter::create(&blobs, 12).unwrap();
+    let payloads = [
+        b"first".as_slice(),
+        b"second".as_slice(),
+        b"third".as_slice(),
+        b"fourth".as_slice(),
+    ];
+    for payload in payloads {
+        writer.insert(payload).unwrap();
+    }
+    let index = writer.finish().unwrap();
+
+    assert_eq!(index.payload_len(2).unwrap(), payloads[2].len());
+    assert_eq!(
+        index.read_payload_range(1..4).unwrap(),
+        payloads[1..]
+            .iter()
+            .map(|payload| payload.to_vec())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        index.read_payload_ids(&[3, 0, 2]).unwrap(),
+        [payloads[3], payloads[0], payloads[2]]
+            .into_iter()
+            .map(|payload| payload.to_vec())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn writes_feature_soa_and_bidirectional_contract_token_csr() {
     let dir = tempfile::tempdir().unwrap();
     let bundle = dir.path().join(format!("encode-{ENCODE_SCHEMA_REVISION}"));

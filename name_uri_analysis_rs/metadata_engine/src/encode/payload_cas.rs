@@ -1,10 +1,12 @@
 //! Append-only content-addressed payload packs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -92,6 +94,28 @@ impl PayloadCasWriter {
         self.insert_with_digest(bytes, digest)
     }
 
+    /// Insert bytes using a digest already computed by the caller.
+    ///
+    /// Encode's spill adapter also uses the digest to retain the same
+    /// shard/local ordering as the in-memory arena. Reusing it avoids hashing
+    /// every JSON body twice on the disk fallback path.
+    pub fn insert_with_digest(
+        &mut self,
+        bytes: &[u8],
+        digest: PayloadDigest,
+    ) -> Result<u32, PayloadCasError> {
+        if let Some(entry) = self.by_digest.get(&digest) {
+            for &id in entry.ids() {
+                let meta = &self.payloads[id as usize];
+                if meta.length as usize == bytes.len() && self.bytes_equal(meta, bytes)? {
+                    return Ok(id);
+                }
+            }
+        }
+
+        self.append_new(bytes, digest)
+    }
+
     /// Capacity-based resident bytes retained by the streaming CAS index.
     /// Payload bodies are excluded because they are written directly to pack files.
     pub fn resident_bytes(&self) -> u64 {
@@ -131,23 +155,6 @@ impl PayloadCasWriter {
         digest: PayloadDigest,
     ) -> Result<u32, PayloadCasError> {
         self.insert_with_digest(bytes, digest)
-    }
-
-    fn insert_with_digest(
-        &mut self,
-        bytes: &[u8],
-        digest: PayloadDigest,
-    ) -> Result<u32, PayloadCasError> {
-        if let Some(entry) = self.by_digest.get(&digest) {
-            for &id in entry.ids() {
-                let meta = &self.payloads[id as usize];
-                if meta.length as usize == bytes.len() && self.bytes_equal(meta, bytes)? {
-                    return Ok(id);
-                }
-            }
-        }
-
-        self.append_new(bytes, digest)
     }
 
     fn bytes_equal(&self, meta: &PayloadMeta, bytes: &[u8]) -> Result<bool, PayloadCasError> {
@@ -274,6 +281,71 @@ impl PayloadCasIndex {
         self.payloads.len()
     }
 
+    pub fn payload_len(&self, payload_id: u32) -> Result<usize, PayloadCasError> {
+        self.payloads
+            .get(payload_id as usize)
+            .map(|meta| meta.length as usize)
+            .ok_or(PayloadCasError::UnknownPayload(payload_id))
+    }
+
+    /// Read a dense payload-ID range with at most one open file per pack.
+    ///
+    /// Pack groups are independent and read in parallel. Results retain input
+    /// ID order, allowing Encode to parse the returned batch in parallel
+    /// without a second ordering pass.
+    pub fn read_payload_range(&self, range: Range<usize>) -> Result<Vec<Vec<u8>>, PayloadCasError> {
+        if range.start > range.end || range.end > self.payloads.len() {
+            return Err(PayloadCasError::UnknownPayload(
+                u32::try_from(range.end.saturating_sub(1)).unwrap_or(u32::MAX),
+            ));
+        }
+        if range.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = range
+            .map(|payload_id| u32::try_from(payload_id).unwrap_or(u32::MAX))
+            .collect::<Vec<_>>();
+        self.read_payload_ids(&ids)
+    }
+
+    /// Read arbitrary payload IDs while preserving caller order.
+    ///
+    /// Requests are grouped by pack, sorted by byte offset for sequential IO,
+    /// and independent packs are read in parallel.
+    pub fn read_payload_ids(&self, payload_ids: &[u32]) -> Result<Vec<Vec<u8>>, PayloadCasError> {
+        let mut groups = BTreeMap::<u32, Vec<(usize, u32)>>::new();
+        for (output_index, &payload_id) in payload_ids.iter().enumerate() {
+            let meta = self
+                .payloads
+                .get(payload_id as usize)
+                .ok_or(PayloadCasError::UnknownPayload(payload_id))?;
+            groups
+                .entry(meta.pack_id)
+                .or_default()
+                .push((output_index, payload_id));
+        }
+        let grouped = groups
+            .into_par_iter()
+            .map(|(pack_id, mut requests)| {
+                requests.sort_unstable_by_key(|&(_, payload_id)| {
+                    self.payloads[payload_id as usize].offset
+                });
+                self.read_pack_requests(pack_id, &requests)
+            })
+            .collect::<Result<Vec<_>, PayloadCasError>>()?;
+        let mut output = (0..payload_ids.len()).map(|_| None).collect::<Vec<_>>();
+        for (output_index, bytes) in grouped.into_iter().flatten() {
+            output[output_index] = Some(bytes);
+        }
+        output
+            .into_iter()
+            .enumerate()
+            .map(|(index, bytes)| {
+                bytes.ok_or_else(|| PayloadCasError::UnknownPayload(payload_ids[index]))
+            })
+            .collect()
+    }
+
     pub fn read_payload_bytes(&self, payload_id: u32) -> Result<Vec<u8>, PayloadCasError> {
         let meta = self
             .payloads
@@ -285,6 +357,46 @@ impl PayloadCasIndex {
         let mut buf = vec![0u8; meta.length as usize];
         file.read_exact(&mut buf)?;
         Ok(buf)
+    }
+
+    pub fn resident_bytes(&self) -> u64 {
+        let bytes = std::mem::size_of::<Self>()
+            .saturating_add(self.dir.as_os_str().len())
+            .saturating_add(
+                self.payloads
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<PayloadMeta>()),
+            );
+        u64::try_from(bytes).unwrap_or(u64::MAX)
+    }
+
+    fn read_pack_requests(
+        &self,
+        pack_id: u32,
+        requests: &[(usize, u32)],
+    ) -> Result<Vec<(usize, Vec<u8>)>, PayloadCasError> {
+        let Some(&(_, first_id)) = requests.first() else {
+            return Ok(Vec::new());
+        };
+        let first = &self.payloads[first_id as usize];
+        let path = pack_path(&self.dir, pack_id);
+        let mut file = File::open(path)?;
+        file.seek(SeekFrom::Start(first.offset))?;
+        let mut cursor = first.offset;
+        let mut output = Vec::with_capacity(requests.len());
+        for &(output_index, payload_id) in requests {
+            let meta = &self.payloads[payload_id as usize];
+            debug_assert_eq!(meta.pack_id, pack_id);
+            if cursor != meta.offset {
+                file.seek(SeekFrom::Start(meta.offset))?;
+                cursor = meta.offset;
+            }
+            let mut bytes = vec![0u8; meta.length as usize];
+            file.read_exact(&mut bytes)?;
+            cursor = cursor.saturating_add(u64::from(meta.length));
+            output.push((output_index, bytes));
+        }
+        Ok(output)
     }
 }
 

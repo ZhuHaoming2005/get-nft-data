@@ -2113,6 +2113,7 @@ dependencies = [
  "duckdb",
  "indicatif",
  "libc",
+ "memmap2",
  "metadata_engine",
  "rapidfuzz",
  "rayon",

@@ -16,14 +16,12 @@ pub(crate) fn prepare_metadata_compact_tables(
     conn: &Connection,
     progress: &ProgressTracker,
 ) -> Result<(), AnalysisError> {
-    progress.start_stage("preparing compact metadata sources", 1);
     execute_progress_batch(
         conn,
         metadata_contract_token_rows_sql(),
         progress,
         "filtered singleton token IDs and materialized compact sources",
     )?;
-    progress.finish_stage("compact metadata sources ready");
     Ok(())
 }
 
@@ -35,22 +33,14 @@ pub(super) fn metadata_contract_token_rows_sql() -> &'static str {
         CREATE TEMP TABLE metadata_unique_contract_tokens AS
         SELECT c.metadata_contract_index AS contract_index,
                a.token_id,
-               arg_min(
-                   struct_pack(
-                       file_id := a.source_file,
-                       row_number := a.source_row_number
-                   ),
-                   row(a.source_file, a.source_row_number)
-               ) AS metadata_source,
-               max(octet_length(encode(a.metadata_json)))::UBIGINT
-                   AS metadata_max_json_bytes
-        FROM metadata_rows a
+               a.metadata_source,
+               a.metadata_max_json_bytes
+        FROM metadata_contract_token_sources a
         JOIN analysis_contracts c
           ON c.contract_id = a.contract_id
         WHERE a.token_id <> ''
           AND c.metadata_contract_index IS NOT NULL
-          AND a.metadata_eligible
-        GROUP BY c.metadata_contract_index, a.token_id;
+        ;
 
         CREATE TEMP TABLE metadata_token_frequencies AS
         SELECT token_id, count(*)::UBIGINT AS contract_frequency
@@ -81,6 +71,7 @@ pub(super) fn metadata_contract_token_rows_sql() -> &'static str {
 
         DROP TABLE metadata_unique_contract_tokens;
         DROP TABLE metadata_token_frequencies;
+        DROP TABLE metadata_contract_token_sources;
     "
 }
 
@@ -115,5 +106,11 @@ mod tests {
             "token_index must be unordered dense, not ORDER BY token_id"
         );
         assert!(!sql.contains("ORDER BY token_id"));
+        assert!(!sql.contains("FROM metadata_rows"));
+        assert!(sql.contains("FROM metadata_contract_token_sources"));
+        assert!(
+            !sql.contains("octet_length"),
+            "Prepare must reuse the byte length computed by the initial Parquet projection"
+        );
     }
 }

@@ -8,17 +8,17 @@ fn scored_rights_for_left(
     threshold: f64,
     scratch: &mut NameCandidateScratch,
 ) -> Vec<usize> {
-    let query = PreparedNameQuery::new(&atoms[left].name_norm);
-    candidate_index
-        .candidates_for_left(atoms, left, right_range, threshold, scratch)
-        .iter()
-        .map(|&right| right as usize)
-        .filter(|&right| {
-            query
-                .score_percent(&atoms[right].name_norm, threshold)
-                .is_some()
-        })
-        .collect()
+    let mut hits = Vec::new();
+    visit_indexed_name_pairs_for_left(
+        atoms,
+        candidate_index,
+        left,
+        right_range,
+        threshold,
+        scratch,
+        |hit| hits.push(hit.right),
+    );
+    hits
 }
 
 fn output_generation_report(metric: &str, duplicate_contract_count: i64) -> AnalysisReport {

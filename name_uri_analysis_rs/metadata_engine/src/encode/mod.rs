@@ -4,14 +4,18 @@ pub mod parse;
 pub mod payload_arena;
 pub mod payload_cas;
 
+pub use csr::BidirectionalCsrView;
 pub use feature_soa::{
-    encode_artifact_upper_bound_soa, write_encode_artifacts,
-    write_encode_artifacts_soa_with_progress, write_encode_artifacts_with_contracts,
-    write_encode_artifacts_with_contracts_and_atoms,
+    encode_artifact_upper_bound_all_views, encode_artifact_upper_bound_soa,
+    encode_artifact_upper_bound_view, write_encode_artifacts,
+    write_encode_artifacts_all_views_with_csr_progress,
+    write_encode_artifacts_all_views_with_progress, write_encode_artifacts_soa_with_progress,
+    write_encode_artifacts_view_with_csr_progress, write_encode_artifacts_view_with_progress,
+    write_encode_artifacts_with_contracts, write_encode_artifacts_with_contracts_and_atoms,
     write_encode_artifacts_with_contracts_and_atoms_with_progress, EncodeBundle, EncodeContractRow,
-    EncodeContractSoA, EncodePayloadRow, EncodePersistStats, EncodeSourceRow, EncodeSourceSoA,
-    FallbackAtomCsr, FeatureSoaError, FeatureView, PayloadTermListBatch, PayloadTermLists,
-    PayloadTermSoA,
+    EncodeContractSoA, EncodeContractView, EncodePayloadRow, EncodePersistStats, EncodeSourceRow,
+    EncodeSourceSoA, EncodeSourceView, FallbackAtomCsr, FallbackAtomView, FeatureSoaError,
+    FeatureView, PayloadTermListBatch, PayloadTermLists, PayloadTermSoA, PayloadTermView,
 };
 pub use parse::{
     metadata_has_prefilter_tokens, parse_metadata_documents, ParsedMetadataDocuments,

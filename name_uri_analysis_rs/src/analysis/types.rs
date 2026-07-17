@@ -1,5 +1,262 @@
 use super::*;
 
+#[cfg(test)]
+pub(crate) type NameText = std::sync::Arc<str>;
+
+#[cfg(not(test))]
+#[derive(Clone)]
+pub(crate) struct NameStringArena {
+    storage: std::sync::Arc<NameStringStorage>,
+    mode: NameStringStorageMode,
+}
+
+#[cfg(not(test))]
+impl NameStringArena {
+    #[inline]
+    pub(crate) fn get(&self, offset: u64) -> &str {
+        self.storage.string_at(offset as usize)
+    }
+
+    pub(crate) fn mode(&self) -> NameStringStorageMode {
+        self.mode
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.storage.len
+    }
+}
+
+#[cfg(not(test))]
+enum NameStringStorageBytes {
+    Resident(Box<[u8]>),
+    Mapped(MappedNameStrings),
+}
+
+#[cfg(not(test))]
+struct MappedNameStrings {
+    mmap: Option<memmap2::MmapMut>,
+    directory: PathBuf,
+}
+
+#[cfg(not(test))]
+impl Drop for MappedNameStrings {
+    fn drop(&mut self) {
+        drop(self.mmap.take());
+        if self.directory.exists() {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
+}
+
+#[cfg(not(test))]
+struct NameStringStorage {
+    bytes: NameStringStorageBytes,
+    base: std::ptr::NonNull<u8>,
+    len: usize,
+}
+
+// The arena builder is the only writer and appends into disjoint, previously
+// unpublished byte ranges. Once loading finishes, all accesses are immutable.
+// NameStringArena keeps the allocation alive while scoring shares immutable
+// views across Rayon workers.
+#[cfg(not(test))]
+unsafe impl Send for NameStringStorage {}
+#[cfg(not(test))]
+unsafe impl Sync for NameStringStorage {}
+
+#[cfg(not(test))]
+impl NameStringStorage {
+    #[inline]
+    fn string_at(&self, offset: usize) -> &str {
+        let header_end = offset + std::mem::size_of::<u32>();
+        debug_assert!(header_end <= self.len);
+        // SAFETY: the offset was validated while constructing NameText; the
+        // four-byte length header is written before NameText is published.
+        let byte_len = unsafe {
+            u32::from_le(std::ptr::read_unaligned(
+                self.base.as_ptr().add(offset).cast::<u32>(),
+            )) as usize
+        };
+        let value_end = header_end + byte_len;
+        debug_assert!(value_end <= self.len);
+        // SAFETY: the loader copies bytes from a valid UTF-8 Arrow string into
+        // this immutable range and the Arc storage outlives the returned view.
+        unsafe {
+            std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                self.base.as_ptr().add(header_end),
+                byte_len,
+            ))
+        }
+    }
+
+    fn flush_mapped_async(&self) {
+        if let NameStringStorageBytes::Mapped(mapped) = &self.bytes {
+            let _ = mapped
+                .mmap
+                .as_ref()
+                .expect("mapped name arena remains open")
+                .flush_async();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NameStringStorageMode {
+    Resident,
+    Mapped,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NameAtomStorageMode {
+    Resident,
+    Mapped,
+}
+
+#[cfg(not(test))]
+pub(crate) struct NameStringArenaBuilder {
+    storage: std::sync::Arc<NameStringStorage>,
+    written: usize,
+}
+
+#[cfg(not(test))]
+fn mapped_name_string_storage(
+    arena_bytes: usize,
+    scratch_directory: &Path,
+) -> Result<NameStringStorageBytes, AnalysisError> {
+    if arena_bytes == 0 {
+        return Ok(NameStringStorageBytes::Resident(Box::new([])));
+    }
+    let directory = scratch_directory.join("name-string-arena");
+    if directory.exists() {
+        fs::remove_dir_all(&directory)?;
+    }
+    fs::create_dir_all(&directory)?;
+    let path = directory.join("strings.bin");
+    let file = std::fs::File::create(path)?;
+    file.set_len(u64::try_from(arena_bytes).map_err(|_| {
+        AnalysisError::InvalidData("name string arena exceeds file offset space".into())
+    })?)?;
+    // SAFETY: the file is exclusively owned by this arena, has exactly
+    // arena_bytes bytes, and remains mapped until all NameText references are
+    // dropped.
+    let mmap = unsafe {
+        memmap2::MmapOptions::new()
+            .len(arena_bytes)
+            .map_mut(&file)?
+    };
+    Ok(NameStringStorageBytes::Mapped(MappedNameStrings {
+        mmap: Some(mmap),
+        directory,
+    }))
+}
+
+#[cfg(not(test))]
+impl NameStringArenaBuilder {
+    // `try_reserve_exact` is required here: the usual `vec![0; n]` aborts the
+    // process on allocation failure and cannot retry the mmap fallback.
+    #[allow(clippy::slow_vector_initialization)]
+    pub(crate) fn new(
+        mode: NameStringStorageMode,
+        arena_bytes: usize,
+        scratch_directory: &Path,
+    ) -> Result<Self, AnalysisError> {
+        let bytes = match mode {
+            NameStringStorageMode::Resident => {
+                let mut resident = Vec::new();
+                match resident.try_reserve_exact(arena_bytes) {
+                    Ok(()) => {
+                        resident.resize(arena_bytes, 0);
+                        NameStringStorageBytes::Resident(resident.into_boxed_slice())
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "warning: resident name string arena allocation of {} failed ({error}); \
+                             retrying with file-backed mmap under {}",
+                            format_byte_size(arena_bytes),
+                            scratch_directory.join("name-string-arena").display(),
+                        );
+                        mapped_name_string_storage(arena_bytes, scratch_directory)?
+                    }
+                }
+            }
+            NameStringStorageMode::Mapped => {
+                mapped_name_string_storage(arena_bytes, scratch_directory)?
+            }
+        };
+        let (base, len) = match &bytes {
+            NameStringStorageBytes::Resident(bytes) => (
+                std::ptr::NonNull::new(bytes.as_ptr().cast_mut())
+                    .unwrap_or_else(std::ptr::NonNull::dangling),
+                bytes.len(),
+            ),
+            NameStringStorageBytes::Mapped(mapped) => {
+                let mmap = mapped.mmap.as_ref().expect("mapped name arena is open");
+                (
+                    std::ptr::NonNull::new(mmap.as_ptr().cast_mut())
+                        .unwrap_or_else(std::ptr::NonNull::dangling),
+                    mmap.len(),
+                )
+            }
+        };
+        Ok(Self {
+            storage: std::sync::Arc::new(NameStringStorage { bytes, base, len }),
+            written: 0,
+        })
+    }
+
+    pub(crate) fn push(&mut self, value: &str) -> Result<u64, AnalysisError> {
+        let byte_len = u32::try_from(value.len())
+            .map_err(|_| AnalysisError::InvalidData("one normalized name exceeds 4 GiB".into()))?;
+        let offset = self.written;
+        let header_end = offset
+            .checked_add(std::mem::size_of::<u32>())
+            .ok_or_else(|| AnalysisError::InvalidData("name string arena overflow".into()))?;
+        let value_end = header_end
+            .checked_add(value.len())
+            .ok_or_else(|| AnalysisError::InvalidData("name string arena overflow".into()))?;
+        if value_end > self.storage.len {
+            return Err(AnalysisError::InvalidData(
+                "name string bytes changed while loading the stable atom snapshot".into(),
+            ));
+        }
+        // SAFETY: the builder advances monotonically, so this range is
+        // disjoint from every previously published NameText. The fixed backing
+        // allocation never moves.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                byte_len.to_le_bytes().as_ptr(),
+                self.storage.base.as_ptr().add(offset),
+                std::mem::size_of::<u32>(),
+            );
+            std::ptr::copy_nonoverlapping(
+                value.as_ptr(),
+                self.storage.base.as_ptr().add(header_end),
+                value.len(),
+            );
+        }
+        self.written = value_end;
+        Ok(offset as u64)
+    }
+
+    pub(crate) fn finish(self) -> Result<NameStringArena, AnalysisError> {
+        if self.written != self.storage.len {
+            return Err(AnalysisError::InvalidData(format!(
+                "name string byte total changed while loading: expected={}, loaded={}",
+                self.storage.len, self.written
+            )));
+        }
+        self.storage.flush_mapped_async();
+        let mode = match &self.storage.bytes {
+            NameStringStorageBytes::Resident(_) => NameStringStorageMode::Resident,
+            NameStringStorageBytes::Mapped(_) => NameStringStorageMode::Mapped,
+        };
+        Ok(NameStringArena {
+            storage: self.storage,
+            mode,
+        })
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum AnalysisError {
     #[error("at least one parquet input is required")]
@@ -56,16 +313,135 @@ pub struct AnalysisReport {
     pub summary_rows: Vec<SummaryRow>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct NameAtom {
     pub(crate) chain_index: usize,
-    pub(crate) name_norm: std::sync::Arc<str>,
+    pub(crate) name_norm: NameText,
     pub(crate) char_len: usize,
     pub(crate) contract_count: i64,
     pub(crate) nft_count: i64,
 }
 
-pub(crate) const SPARSE_UNION_NODE_BYTES: usize = 96;
+pub(crate) trait NameAtomStore: Sync {
+    fn len(&self) -> usize;
+    fn chain_index(&self, index: usize) -> usize;
+    fn chain_local_rank(&self, index: usize) -> u32;
+    #[cfg(not(test))]
+    fn name_offset(&self, index: usize) -> u64;
+    #[cfg(not(test))]
+    fn char_len(&self, index: usize) -> usize;
+    fn contract_count(&self, index: usize) -> i64;
+    fn nft_count(&self, index: usize) -> i64;
+}
+
+#[cfg(test)]
+impl NameAtomStore for [NameAtom] {
+    fn len(&self) -> usize {
+        <[NameAtom]>::len(self)
+    }
+
+    fn chain_index(&self, index: usize) -> usize {
+        self[index].chain_index
+    }
+
+    fn chain_local_rank(&self, index: usize) -> u32 {
+        u32::try_from(
+            self[..index]
+                .iter()
+                .filter(|candidate| candidate.chain_index == self[index].chain_index)
+                .count(),
+        )
+        .expect("test chain-local atom rank exceeds u32")
+    }
+
+    fn contract_count(&self, index: usize) -> i64 {
+        self[index].contract_count
+    }
+
+    fn nft_count(&self, index: usize) -> i64 {
+        self[index].nft_count
+    }
+}
+
+#[cfg(test)]
+impl NameAtomStore for Vec<NameAtom> {
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+
+    fn chain_index(&self, index: usize) -> usize {
+        self.as_slice().chain_index(index)
+    }
+
+    fn chain_local_rank(&self, index: usize) -> u32 {
+        self.as_slice().chain_local_rank(index)
+    }
+
+    fn contract_count(&self, index: usize) -> i64 {
+        self.as_slice().contract_count(index)
+    }
+
+    fn nft_count(&self, index: usize) -> i64 {
+        self.as_slice().nft_count(index)
+    }
+}
+
+pub(crate) trait NameValue: Sync {
+    fn normalized_name(&self) -> &str;
+    fn char_len(&self) -> usize;
+}
+
+pub(crate) trait NameValueStore: Sync {
+    fn len(&self) -> usize;
+    fn normalized_name(&self, index: usize) -> &str;
+    fn char_len(&self, index: usize) -> usize;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl<T: NameValue> NameValueStore for Vec<T> {
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+
+    fn normalized_name(&self, index: usize) -> &str {
+        self[index].normalized_name()
+    }
+
+    fn char_len(&self, index: usize) -> usize {
+        self[index].char_len()
+    }
+}
+
+impl<T: NameValue> NameValueStore for [T] {
+    fn len(&self) -> usize {
+        <[T]>::len(self)
+    }
+
+    fn normalized_name(&self, index: usize) -> &str {
+        self[index].normalized_name()
+    }
+
+    fn char_len(&self, index: usize) -> usize {
+        self[index].char_len()
+    }
+}
+
+#[cfg(test)]
+impl NameValue for NameAtom {
+    #[inline]
+    fn normalized_name(&self) -> &str {
+        self.name_norm.as_ref()
+    }
+
+    #[inline]
+    fn char_len(&self) -> usize {
+        self.char_len
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct ScoredRight {
@@ -134,25 +510,33 @@ pub(crate) struct PairComponentAccumulator {
 }
 
 pub(crate) struct UnionFind {
-    pub(crate) parent: Vec<usize>,
+    pub(crate) parent: Vec<u32>,
     pub(crate) rank: Vec<u8>,
 }
 
 impl UnionFind {
     pub(crate) fn new(size: usize) -> Self {
+        assert!(
+            size <= u32::MAX as usize,
+            "union-find size exceeds compact u32 identity space"
+        );
         Self {
-            parent: (0..size).collect(),
+            parent: (0..size as u32).collect(),
             rank: vec![0; size],
         }
     }
 
     pub(crate) fn find(&mut self, node: usize) -> usize {
-        let parent = self.parent[node];
-        if parent != node {
-            let root = self.find(parent);
-            self.parent[node] = root;
+        let mut current = node;
+        loop {
+            let parent = self.parent[current] as usize;
+            if parent == current {
+                return current;
+            }
+            let grandparent = self.parent[parent];
+            self.parent[current] = grandparent;
+            current = grandparent as usize;
         }
-        self.parent[node]
     }
 
     pub(crate) fn union(&mut self, left: usize, right: usize) {
@@ -162,11 +546,11 @@ impl UnionFind {
             return;
         }
         if self.rank[left_root] < self.rank[right_root] {
-            self.parent[left_root] = right_root;
+            self.parent[left_root] = right_root as u32;
         } else if self.rank[left_root] > self.rank[right_root] {
-            self.parent[right_root] = left_root;
+            self.parent[right_root] = left_root as u32;
         } else {
-            self.parent[right_root] = left_root;
+            self.parent[right_root] = left_root as u32;
             self.rank[left_root] += 1;
         }
     }
@@ -175,39 +559,87 @@ impl UnionFind {
 pub(crate) struct ThresholdUnionState {
     pub(crate) threshold: f64,
     pub(crate) intra: UnionFind,
-    pub(crate) cross: Option<SparseUnionFind>,
-    pub(crate) chain_matrix: Option<Vec<SparseUnionFind>>,
+    pub(crate) cross: Option<CrossUnionState>,
+    pub(crate) chain_matrix: Option<ChainMatrixState>,
+}
+
+pub(crate) enum CrossUnionState {
+    Sparse(SparseUnionFind),
+    Dense(UnionFind),
+    Deferred,
+}
+
+impl CrossUnionState {
+    pub(crate) fn union(&mut self, left: usize, right: usize) {
+        match self {
+            Self::Sparse(union_find) => union_find.union(left, right),
+            Self::Dense(union_find) => union_find.union(left, right),
+            Self::Deferred => {}
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connected(&mut self, left: usize, right: usize) -> bool {
+        match self {
+            Self::Sparse(union_find) => union_find.connected(left, right),
+            Self::Dense(union_find) => union_find.find(left) == union_find.find(right),
+            Self::Deferred => false,
+        }
+    }
+}
+
+pub(crate) enum ChainMatrixState {
+    Resident(Vec<SparseUnionFind>),
+    Spill(ChainMatrixSpill),
+}
+
+pub(crate) struct ChainMatrixSpill {
+    pub(crate) directory: PathBuf,
+    pub(crate) writers: Vec<Option<std::io::BufWriter<std::fs::File>>>,
+    pub(crate) pair_layouts: Vec<ChainPairAtomLayout>,
+    pub(crate) first_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ChainPairAtomLayout {
+    pub(crate) primary_count: u32,
+    pub(crate) total_count: u32,
 }
 
 #[derive(Default)]
 pub(crate) struct SparseUnionFind {
-    pub(crate) index_by_atom: HashMap<usize, usize>,
-    pub(crate) atoms: Vec<usize>,
-    pub(crate) parent: Vec<usize>,
+    pub(crate) index_by_atom: HashMap<u32, u32>,
+    pub(crate) atoms: Vec<u32>,
+    pub(crate) parent: Vec<u32>,
     pub(crate) rank: Vec<u8>,
 }
 
 impl SparseUnionFind {
     pub(crate) fn get_or_insert(&mut self, atom: usize) -> usize {
+        let atom = u32::try_from(atom).expect("name atom identity exceeds u32");
         if let Some(index) = self.index_by_atom.get(&atom).copied() {
-            return index;
+            return index as usize;
         }
 
-        let index = self.atoms.len();
+        let index = u32::try_from(self.atoms.len()).expect("sparse union local index exceeds u32");
         self.index_by_atom.insert(atom, index);
         self.atoms.push(atom);
         self.parent.push(index);
         self.rank.push(0);
-        index
+        index as usize
     }
 
     pub(crate) fn find_local(&mut self, node: usize) -> usize {
-        let parent = self.parent[node];
-        if parent != node {
-            let root = self.find_local(parent);
-            self.parent[node] = root;
+        let mut current = node;
+        loop {
+            let parent = self.parent[current] as usize;
+            if parent == current {
+                return current;
+            }
+            let grandparent = self.parent[parent];
+            self.parent[current] = grandparent;
+            current = grandparent as usize;
         }
-        self.parent[node]
     }
 
     pub(crate) fn union(&mut self, left: usize, right: usize) {
@@ -223,24 +655,30 @@ impl SparseUnionFind {
         let left_rank = self.rank[left_root];
         let right_rank = self.rank[right_root];
         if left_rank < right_rank {
-            self.parent[left_root] = right_root;
+            self.parent[left_root] = right_root as u32;
         } else if left_rank > right_rank {
-            self.parent[right_root] = left_root;
+            self.parent[right_root] = left_root as u32;
         } else {
-            self.parent[right_root] = left_root;
+            self.parent[right_root] = left_root as u32;
             self.rank[left_root] += 1;
         }
     }
 
     #[cfg(test)]
     pub(crate) fn connected(&mut self, left: usize, right: usize) -> bool {
+        let Ok(left) = u32::try_from(left) else {
+            return false;
+        };
+        let Ok(right) = u32::try_from(right) else {
+            return false;
+        };
         let Some(left) = self.index_by_atom.get(&left).copied() else {
             return false;
         };
         let Some(right) = self.index_by_atom.get(&right).copied() else {
             return false;
         };
-        self.find_local(left) == self.find_local(right)
+        self.find_local(left as usize) == self.find_local(right as usize)
     }
 
     pub(crate) fn atom_count(&self) -> usize {
@@ -248,6 +686,6 @@ impl SparseUnionFind {
     }
 
     pub(crate) fn atom_at(&self, local_index: usize) -> usize {
-        self.atoms[local_index]
+        self.atoms[local_index] as usize
     }
 }

@@ -9,8 +9,8 @@ use crate::analysis::{
     run_analysis_phase, run_metadata_pipeline_result, AnalysisOptions, AnalysisPhase,
     PipelineStage, ProgressTracker,
 };
-use metadata_engine::blocking::BLOCKING_REVISION;
-use metadata_engine::encode::{EncodeBundle, ENCODE_SCHEMA_REVISION};
+use metadata_engine::blocking::{AtomSketch, BLOCKING_REVISION};
+use metadata_engine::encode::{EncodeBundle, FallbackAtomView, ENCODE_SCHEMA_REVISION};
 use metadata_engine::resource::{MemoryBroker, GIB};
 use metadata_engine::storage::StorageBroker;
 
@@ -18,7 +18,7 @@ use super::super::encode::{
     estimate_encode_storage_bytes, fallback_contract_candidates_sql, finish_ordered_group_count,
     first_usable_rows_by_ordered_group, observe_ordered_group, open_prepare_for_encode,
     ordered_group_ranges, resolve_fallback_contracts, retained_token_candidates_sql,
-    stream_encode_inputs_with_progress,
+    stream_encode_inputs_with_advisory, stream_encode_inputs_with_progress, EncodeAtomSketches,
 };
 
 #[test]
@@ -332,6 +332,7 @@ fn parallel_encode_match_is_semantically_deterministic_across_thread_counts() {
             .iter()
             .find(|roots| roots.left_chain == 0 && roots.right_chain == 1)
             .unwrap();
+        let pair_roots = pair.expand_global_roots(&result.scope_components).unwrap();
         groups.push([
             semantic_groups_from_roots(
                 &options.database_path,
@@ -341,7 +342,7 @@ fn parallel_encode_match_is_semantically_deterministic_across_thread_counts() {
                 &options.database_path,
                 &result.scope_components.cross_roots,
             ),
-            semantic_groups_from_roots(&options.database_path, &pair.roots),
+            semantic_groups_from_roots(&options.database_path, &pair_roots),
         ]);
         assert!(
             metadata_engine::pipeline::default_output_dir(&work)
@@ -522,6 +523,238 @@ fn encode_rejects_underestimated_token_relation_before_loading_it() {
             .contains("token-source relation admission"),
         "unexpected error: {error}"
     );
+}
+
+fn payload_spill_directory_count(work: &Path) -> usize {
+    let root = work.join("artifacts/metadata");
+    if !root.is_dir() {
+        return 0;
+    }
+    fs::read_dir(root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".staging-encode-payloads-")
+        })
+        .count()
+}
+
+fn term_spill_directory_count(work: &Path) -> usize {
+    let root = work.join("artifacts/metadata");
+    if !root.is_dir() {
+        return 0;
+    }
+    fs::read_dir(root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".staging-encode-terms-")
+        })
+        .count()
+}
+
+fn staging_directory_count(work: &Path, prefix: &str) -> usize {
+    let root = work.join("artifacts/metadata");
+    if !root.is_dir() {
+        return 0;
+    }
+    fs::read_dir(root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
+        .count()
+}
+
+fn canonical_fallback_atoms(
+    atoms: EncodeAtomSketches,
+    fallback: FallbackAtomView<'_>,
+) -> Vec<(u32, Vec<u32>, AtomSketch)> {
+    let view = atoms.view();
+    assert_eq!(atoms.len(), fallback.atom_payloads.len());
+    let mut groups = (0..view.len())
+        .map(|atom| {
+            let sketch = AtomSketch {
+                template_simhash: view.template_simhashes[atom],
+                content_simhash: view.content_simhashes[atom],
+                template_anchors: view.template_anchors(atom).to_vec(),
+                content_anchors: view.content_anchors(atom).to_vec(),
+                has_template_terms: view.has_template_terms(atom),
+                has_content_terms: view.has_content_terms(atom),
+            };
+            (
+                fallback.atom_payloads[atom],
+                fallback.members_of(atom).to_vec(),
+                sketch,
+            )
+        })
+        .collect::<Vec<_>>();
+    groups.sort_unstable_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    groups
+}
+
+#[test]
+fn payload_body_spill_matches_memory_mode_and_cleans_temporary_packs() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    let parquet = dir.path().join("metadata.parquet");
+    write_tiny_metadata_parquet(&parquet);
+    let options = tiny_options(&work, &parquet);
+    run_analysis_phase(&options, AnalysisPhase::Prepare, &work).unwrap();
+    let conn = Connection::open(&options.database_path).unwrap();
+    let estimate = estimate_encode_storage_bytes(&conn).unwrap();
+
+    let mut memory_storage = StorageBroker::open(&work).unwrap();
+    let memory_broker = MemoryBroker::new(16 * GIB, 12 * GIB).unwrap();
+    let memory = stream_encode_inputs_with_advisory(
+        &conn,
+        &work,
+        &mut memory_storage,
+        &memory_broker,
+        1,
+        estimate,
+        |_| {},
+        |_| {},
+    )
+    .unwrap();
+
+    let mut spill_estimate = estimate;
+    spill_estimate.resident_peak_bytes = memory_broker.hard_top_bytes() + 1;
+    let mut spill_storage = StorageBroker::open(&work).unwrap();
+    let spill_broker = MemoryBroker::new(16 * GIB, 12 * GIB).unwrap();
+    let mut advisories = Vec::new();
+    let spill = stream_encode_inputs_with_advisory(
+        &conn,
+        &work,
+        &mut spill_storage,
+        &spill_broker,
+        1,
+        spill_estimate,
+        |message| advisories.push(message),
+        |_| {},
+    )
+    .unwrap();
+
+    let (memory_sources, memory_payloads, memory_contracts, memory_atoms, memory_fallback, _) =
+        memory;
+    let (spill_sources, spill_payloads, spill_contracts, spill_atoms, spill_fallback, _) = spill;
+    let memory_sources = memory_sources.view();
+    let spill_sources = spill_sources.view();
+    let memory_payloads = memory_payloads.view();
+    let spill_payloads = spill_payloads.view();
+    let memory_contracts = memory_contracts.view();
+    let spill_contracts = spill_contracts.view();
+    assert_eq!(spill_sources.contract_ids, memory_sources.contract_ids);
+    assert_eq!(spill_sources.payload_ids, memory_sources.payload_ids);
+    assert_eq!(spill_sources.token_offsets, memory_sources.token_offsets);
+    assert_eq!(spill_sources.token_ids, memory_sources.token_ids);
+    assert_eq!(
+        spill_payloads.template_offsets,
+        memory_payloads.template_offsets
+    );
+    assert_eq!(
+        spill_payloads.template_terms,
+        memory_payloads.template_terms
+    );
+    assert_eq!(
+        spill_payloads.template_freqs,
+        memory_payloads.template_freqs
+    );
+    assert_eq!(
+        spill_payloads.content_offsets,
+        memory_payloads.content_offsets
+    );
+    assert_eq!(spill_payloads.content_terms, memory_payloads.content_terms);
+    assert_eq!(spill_payloads.content_freqs, memory_payloads.content_freqs);
+    assert_eq!(spill_contracts.contract_ids, memory_contracts.contract_ids);
+    assert_eq!(spill_contracts.chain_ids, memory_contracts.chain_ids);
+    assert_eq!(
+        spill_contracts.source_doc_ids,
+        memory_contracts.source_doc_ids
+    );
+    assert_eq!(spill_contracts.payload_ids, memory_contracts.payload_ids);
+    assert_eq!(spill_contracts.weights, memory_contracts.weights);
+    assert_eq!(
+        canonical_fallback_atoms(spill_atoms, spill_fallback.view()),
+        canonical_fallback_atoms(memory_atoms, memory_fallback.view())
+    );
+    assert!(advisories
+        .iter()
+        .any(|message| message.contains("temporary payload CAS")));
+    assert_eq!(payload_spill_directory_count(&work), 0);
+    assert_eq!(spill_storage.snapshot().committed_bytes, 0);
+}
+
+#[test]
+fn encode_spills_all_large_final_columns_under_tight_memory_and_cleans_temporary_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    let parquet = dir.path().join("metadata.parquet");
+    write_tiny_metadata_parquet(&parquet);
+    let options = tiny_options(&work, &parquet);
+    run_analysis_phase(&options, AnalysisPhase::Prepare, &work).unwrap();
+    let conn = Connection::open(&options.database_path).unwrap();
+    let mut estimate = estimate_encode_storage_bytes(&conn).unwrap();
+    let hard_top = 128 * 1024 * 1024;
+    estimate.resident_peak_bytes = hard_top + 1;
+    let memory_broker = MemoryBroker::new(GIB, hard_top).unwrap();
+    let mut storage = StorageBroker::open(&work).unwrap();
+    let mut advisories = Vec::new();
+
+    let result = stream_encode_inputs_with_advisory(
+        &conn,
+        &work,
+        &mut storage,
+        &memory_broker,
+        1,
+        estimate,
+        |message| advisories.push(message),
+        |_| {},
+    )
+    .unwrap();
+
+    assert!(result.1.payload_count() > 0);
+    assert!(advisories
+        .iter()
+        .any(|message| message.contains("temporary payload CAS")));
+    assert!(advisories
+        .iter()
+        .any(|message| message.contains("token-source/registration state")));
+    assert!(advisories
+        .iter()
+        .any(|message| message.contains("payload CAS resident index upper bound")));
+    assert!(advisories
+        .iter()
+        .any(|message| message.contains("externalizing exact token dictionaries")));
+    assert!(advisories
+        .iter()
+        .any(|message| message.contains("source/contract SoA exceeded")));
+    assert!(advisories
+        .iter()
+        .any(|message| message.contains("fallback-atom grouping estimate")));
+    assert!(advisories
+        .iter()
+        .any(|message| message.contains("AtomSketch/anchor SoA exceeded")));
+    drop(result);
+    assert_eq!(payload_spill_directory_count(&work), 0);
+    assert_eq!(term_spill_directory_count(&work), 0);
+    assert_eq!(
+        staging_directory_count(&work, ".staging-encode-columns-"),
+        0
+    );
+    assert_eq!(staging_directory_count(&work, ".staging-encode-atoms-"), 0);
+    assert_eq!(
+        staging_directory_count(&work, ".staging-encode-sketches-"),
+        0
+    );
+    assert_eq!(storage.snapshot().committed_bytes, 0);
 }
 
 #[test]

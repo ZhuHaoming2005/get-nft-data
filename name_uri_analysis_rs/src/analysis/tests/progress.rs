@@ -130,8 +130,10 @@ fn match_forecast_parser_accepts_only_the_shared_controller_schema() {
 
 #[test]
 fn progress_layout_keeps_fixed_bars_separate_from_long_metrics() {
-    assert!(pipeline_bar_template().contains("{bar:24"));
-    assert!(stage_bar_template().contains("{bar:28"));
+    assert!(pipeline_bar_template().contains("{bar:20"));
+    assert!(pipeline_bar_template().contains("phases {pos}/{len}"));
+    assert!(stage_bar_template().contains("{bar:24"));
+    assert!(stage_bar_template().contains("steps {pos}/{len}"));
     assert!(!stage_spinner_template().contains("{percent"));
     assert!(!stage_spinner_template().contains("{bar"));
     assert!(task_bar_template().contains("{bar:32"));
@@ -196,6 +198,21 @@ fn upper_bound_progress_labels_eta_as_a_ceiling() {
     });
 
     assert_eq!(message, "12.5 pairs/s · ETA ≤ 6s");
+}
+
+#[test]
+fn estimated_progress_labels_eta_as_approximate() {
+    let message = format_task_progress_message(&TaskProgressSnapshot {
+        position: 25,
+        total: Some(100),
+        unit: "pairs",
+        counters: ProgressCounters::default(),
+        rate: Some(12.5),
+        show_match_eta: false,
+        total_kind: metadata_engine::progress::TotalKind::Estimate,
+    });
+
+    assert_eq!(message, "12.5 pairs/s · ETA ~ 6s");
 }
 
 #[test]
@@ -278,7 +295,7 @@ fn empty_exact_phase_is_reported_as_skipped_without_rate_or_eta_noise() {
 }
 
 #[test]
-fn task_rate_estimator_waits_for_warmup_and_ignores_zero_delta_refreshes() {
+fn task_rate_estimator_uses_the_full_warmup_window() {
     let mut estimator = TaskRateEstimator::default();
     assert_eq!(estimator.sample(0, std::time::Duration::ZERO), None);
     assert_eq!(
@@ -291,7 +308,11 @@ fn task_rate_estimator_waits_for_warmup_and_ignores_zero_delta_refreshes() {
     );
     assert_eq!(
         estimator.sample(20, std::time::Duration::from_millis(1500)),
-        Some(20.0)
+        None
+    );
+    assert_eq!(
+        estimator.sample(30, std::time::Duration::from_secs(2)),
+        Some(15.0)
     );
 }
 
@@ -300,13 +321,27 @@ fn task_rate_estimator_uses_recent_work_instead_of_lifetime_average() {
     let mut estimator = TaskRateEstimator::default();
     assert_eq!(estimator.sample(0, std::time::Duration::ZERO), None);
     assert_eq!(
-        estimator.sample(10, std::time::Duration::from_secs(1)),
+        estimator.sample(20, std::time::Duration::from_secs(2)),
         Some(10.0)
     );
+    let rate = estimator
+        .sample(120, std::time::Duration::from_secs(3))
+        .unwrap();
+    assert!((rate - 21.646).abs() < 0.01, "{rate}");
+}
+
+#[test]
+fn task_rate_estimator_decays_during_observed_stalls() {
+    let mut estimator = TaskRateEstimator::default();
+    assert_eq!(estimator.sample(0, std::time::Duration::ZERO), None);
     assert_eq!(
-        estimator.sample(110, std::time::Duration::from_secs(2)),
-        Some(32.5)
+        estimator.sample(20, std::time::Duration::from_secs(2)),
+        Some(10.0)
     );
+    let stalled = estimator
+        .sample(20, std::time::Duration::from_secs(3))
+        .unwrap();
+    assert!(stalled < 10.0, "{stalled}");
 }
 
 #[test]
@@ -379,7 +414,7 @@ fn match_forecast_never_invents_a_bound_for_unknown_phase_work() {
 }
 
 #[test]
-fn calibrated_match_forecast_is_an_observed_interval_not_a_claimed_bound() {
+fn calibrated_match_forecast_is_a_central_historical_range_not_a_claimed_bound() {
     let snapshot = TaskProgressSnapshot {
         position: 50,
         total: Some(100),
@@ -403,7 +438,7 @@ fn calibrated_match_forecast_is_an_observed_interval_not_a_claimed_bound() {
     );
 
     assert!(message.contains("ETA 2s"));
-    assert!(message.contains("match ETA observed 6s..16s (n=8)"));
+    assert!(message.contains("match ETA central 6s..16s (historical P20-P80; n=8)"));
 }
 
 #[test]
@@ -460,7 +495,7 @@ fn elapsed_history_overrun_never_turns_a_phase_lower_bound_into_an_upper_bound()
 
     assert!(message.contains("match remaining >= 2s"));
     assert!(message.contains("upper n/a (history overrun; n=8)"));
-    assert!(!message.contains("match ETA observed"));
+    assert!(!message.contains("match ETA central"));
 }
 
 #[test]
@@ -492,7 +527,7 @@ fn phase_lower_over_history_upper_never_fabricates_an_observed_interval() {
         message.contains("upper n/a (phase lower exceeds history; n=8)"),
         "{message}"
     );
-    assert!(!message.contains("match ETA observed"), "{message}");
+    assert!(!message.contains("match ETA central"), "{message}");
 }
 
 #[test]
@@ -509,6 +544,28 @@ fn determinate_task_progress_clamps_only_the_bar_and_preserves_plan_overrun() {
     };
     assert_eq!(task.position(), 10);
     assert_eq!(task_state.lock().unwrap().as_ref().unwrap().position, 15);
+}
+
+#[test]
+fn task_rendering_coalesces_updates_but_completion_flushes_immediately() {
+    let progress = ProgressTracker::for_pipeline_stage(PipelineStage::Name, true);
+    progress.start_task("canonical names", Some(100), "names");
+    progress.advance_task(10, ProgressCounters::default());
+
+    let ProgressTracker::Enabled {
+        task, task_state, ..
+    } = &progress
+    else {
+        panic!("progress must be enabled");
+    };
+    assert_eq!(task.position(), 10);
+
+    progress.advance_task(20, ProgressCounters::default());
+    assert_eq!(task.position(), 10, "bar update should remain coalesced");
+    assert_eq!(task_state.lock().unwrap().as_ref().unwrap().position, 30);
+
+    progress.advance_task(70, ProgressCounters::default());
+    assert_eq!(task.position(), 100, "completion must bypass throttling");
 }
 
 #[test]

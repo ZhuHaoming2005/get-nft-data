@@ -387,7 +387,7 @@ fn catalog_estimated_work_is_a_contract_expanded_upper_bound() {
     let actual = ConservativeIndex::open(&snapshot)
         .for_each_catalog_candidate(&catalog, &plan, |_, _| {})
         .contract_pair_visits;
-    assert!(catalog.jobs[0].estimated_work >= actual);
+    assert!(catalog.jobs.get(0).unwrap().estimated_work >= actual);
 }
 
 #[test]
@@ -496,7 +496,7 @@ fn production_scale_hot_blocks_use_one_lazy_catalog_descriptor_each() {
 
     let routing_total = catalog.jobs.iter().try_fold(0u64, |total, job| {
         total
-            .checked_add(job_routing_pair_work(&snapshot, job).unwrap())
+            .checked_add(job_routing_pair_work(&snapshot, &job).unwrap())
             .ok_or(())
     });
     let expected_routing_total = snapshot
@@ -561,6 +561,12 @@ fn hot_block_proof_index_matches_exhaustive_exact_scoring() {
     let metrics = index.for_each_catalog_candidate(&catalog, &plan, |left, right| {
         scheduled_candidates.push((left, right));
     });
+    let bounded_index = ConservativeIndex::open_bounded(&snapshot, 1);
+    let mut bounded_candidates = Vec::new();
+    let bounded_metrics =
+        bounded_index.for_each_catalog_candidate(&catalog, &plan, |left, right| {
+            bounded_candidates.push((left, right));
+        });
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(4)
         .build()
@@ -569,12 +575,12 @@ fn hot_block_proof_index_matches_exhaustive_exact_scoring() {
     let mut parallel_metrics = metadata_engine::index::IndexMetrics::default();
     pool.install(|| {
         for &job_id in &plan.ordered_job_ids {
-            let job = &catalog.jobs[job_id as usize];
+            let job = catalog.jobs.get(job_id as usize).unwrap();
             parallel_metrics.add(index.for_each_job_candidate_parallel_with_work_while(
-                job,
+                &job,
                 &mut |left, right| parallel_candidates.push((left, right)),
                 &mut |_| {},
-                &mut || true,
+                &|| true,
             ));
         }
     });
@@ -582,28 +588,31 @@ fn hot_block_proof_index_matches_exhaustive_exact_scoring() {
     let mut stateful_metrics = metadata_engine::index::IndexMetrics::default();
     pool.install(|| {
         for &job_id in &plan.ordered_job_ids {
-            let job = &catalog.jobs[job_id as usize];
+            let job = catalog.jobs.get(job_id as usize).unwrap();
             stateful_metrics.add(
                 index.for_each_job_candidate_parallel_stateful_with_work_while(
-                    job,
+                    &job,
                     Vec::new,
                     |candidates, left, right| candidates.push((left, right)),
                     |candidates| {
                         stateful_candidates.lock().unwrap().append(candidates);
                     },
                     &mut |_| {},
-                    &mut || true,
+                    &|| true,
                 ),
             );
         }
     });
     let mut stateful_candidates = stateful_candidates.into_inner().unwrap();
     scheduled_candidates.sort_unstable();
+    bounded_candidates.sort_unstable();
     parallel_candidates.sort_unstable();
     stateful_candidates.sort_unstable();
     assert_eq!(parallel_candidates, scheduled_candidates);
+    assert_eq!(bounded_candidates, scheduled_candidates);
     assert_eq!(stateful_candidates, scheduled_candidates);
     assert_eq!(parallel_metrics, metrics);
+    assert_eq!(bounded_metrics, metrics);
     assert_eq!(stateful_metrics, metrics);
     let mut scheduled_matches = scheduled_candidates
         .iter()
@@ -639,7 +648,9 @@ fn work_catalog_reopens_only_for_the_same_snapshot() {
     .unwrap();
     let out = dir.path().join("catalog-recovery");
     catalog.commit(&out).unwrap();
-    assert_eq!(WorkCatalog::open(&out, &snapshot).unwrap(), catalog);
+    let reopened = WorkCatalog::open(&out, &snapshot).unwrap();
+    assert!(reopened.jobs.is_mapped());
+    assert_eq!(reopened, catalog);
 }
 
 #[test]
@@ -664,6 +675,7 @@ fn stale_work_catalog_is_retired_and_rebuilt_for_the_current_snapshot() {
         WorkCatalog::open_or_rebuild_with_progress(&out, &snapshot, budget, 10, |_, _, _| {})
             .unwrap();
 
+    assert!(rebuilt.jobs.is_mapped());
     assert_eq!(WorkCatalog::open(&out, &snapshot).unwrap(), rebuilt);
 }
 
@@ -779,8 +791,9 @@ fn catalog_job_traversal_honors_global_cancellation_predicate() {
     let mut checks = 0u64;
     let mut reported = 0u64;
 
+    let job = catalog.jobs.get(0).unwrap();
     let metrics = ConservativeIndex::open(&snapshot).for_each_job_candidate_with_work_while(
-        &catalog.jobs[0],
+        &job,
         |_, _| {},
         |work| reported = reported.saturating_add(work),
         || {
@@ -1041,10 +1054,10 @@ fn edge_collector_reports_all_retained_buffer_and_forest_bytes() {
     };
     let mut collector = EdgeCollector::new(8, budget, 100);
     collector.push(Edge::new(0, 1)).unwrap();
-    assert_eq!(collector.retained_bytes(), 8);
+    assert_eq!(collector.retained_bytes(), budget.max_buffer_bytes);
     collector.push(Edge::new(2, 3)).unwrap();
     collector.push(Edge::new(4, 5)).unwrap();
-    assert!(collector.retained_bytes() <= 24);
+    assert!(collector.retained_bytes() <= budget.max_buffer_bytes + 2 * 8);
 }
 
 #[test]
@@ -1128,85 +1141,83 @@ fn persisted_identity_cardinality_fails_closed_above_u32() {
 }
 
 #[test]
-fn pipeline_rejects_snapshot_memory_before_opening_any_mmap() {
-    let (dir, features, blocking) = snapshot_fixture();
+fn pipeline_demand_pages_snapshot_when_full_residency_exceeds_budget() {
+    const PAYLOADS: usize = 240_000;
+    const HARD_TOP: u64 = 20 * 1024 * 1024;
+    let dir = tempfile::tempdir().unwrap();
+    let features = dir.path().join("features");
+    let blocking = dir.path().join("blocking");
+    let payloads = vec![EncodePayloadRow::default(); PAYLOADS];
+    write_encode_artifacts(
+        &features,
+        &[EncodeSourceRow {
+            contract_id: 0,
+            payload_id: 0,
+            retained_token_ids: Vec::new(),
+        }],
+        &payloads,
+    )
+    .unwrap();
+    compile_base_equivalent(
+        &[AtomSketch {
+            template_simhash: 0,
+            content_simhash: 0,
+            template_anchors: Vec::new(),
+            content_anchors: Vec::new(),
+            has_template_terms: false,
+            has_content_terms: false,
+        }],
+        &BlockingCompileConfig {
+            max_routing_block_members: 10,
+        },
+        &blocking,
+    )
+    .unwrap();
+    commit_ready(
+        &features,
+        "features.ready",
+        &format!(
+            r#"{{"schema_revision":3,"source_count":1,"payload_count":{PAYLOADS},"chains":["x"],"chain_totals":[{{"name":"x","contracts":1,"nfts":1}}]}}"#
+        ),
+    )
+    .unwrap();
+    commit_ready(
+        &blocking,
+        "blocking.ready",
+        r#"{"blocking_revision":3,"atom_count":1}"#,
+    )
+    .unwrap();
     let snapshot_bytes = MetadataSnapshot::verification_bytes(&features, &blocking).unwrap();
-    let mut events = Vec::new();
+    assert!(snapshot_bytes > HARD_TOP);
 
-    let error = metadata_engine::pipeline::run_metadata_pipeline_with_progress(
+    let mut events = Vec::new();
+    let mut advisories = Vec::new();
+    let result = metadata_engine::pipeline::run_metadata_pipeline_with_callbacks(
         &features,
         &blocking,
-        &dir.path().join("snapshot-memory-rejected"),
+        &dir.path().join("snapshot-demand-paged"),
         &metadata_engine::pipeline::MetadataPipelineConfig {
             storage_work_directory: dir.path().to_path_buf(),
-            memory_hard_top: snapshot_bytes.saturating_sub(1),
+            memory_hard_top: HARD_TOP,
             host_total_memory: 512 * GIB,
             threads: 1,
             max_catalog_jobs: 100,
-            max_candidate_pair_visits: 1_000_000,
-            exact_sample_lefts: 1,
-            exact_pair_work: 10,
+            max_candidate_pair_visits: 1,
+            exact_sample_lefts: 0,
+            exact_pair_work: 0,
             evidence_gate_policy: EvidenceGatePolicy::permissive(),
-            edge_bytes: 1_000_000,
+            edge_bytes: 1024 * 1024,
         },
         |event| events.push(event),
+        |message| advisories.push(message.to_owned()),
     )
-    .unwrap_err();
+    .unwrap();
 
-    assert!(
-        error.to_string().contains("memory budget exceeded"),
-        "{error}"
-    );
-    assert!(
-        events.is_empty(),
-        "snapshot admission must happen before mmap verification starts"
-    );
-}
-
-#[test]
-fn snapshot_lease_remains_charged_when_component_memory_is_admitted() {
-    let (dir, features, blocking) = snapshot_fixture();
-    let snapshot_bytes = MetadataSnapshot::verification_bytes(&features, &blocking).unwrap();
-    let max_catalog_jobs = 100u64;
-    let catalog_bytes =
-        max_catalog_jobs * std::mem::size_of::<metadata_engine::scheduler::JobDescriptor>() as u64;
-    let edge_bytes = 64 * 1024u64;
-    let component_peak_bytes = 2 * 4 * 2 * 10u64;
-    let evidence_partition_bytes = 10 * 16u64;
-    let evidence_peak_bytes = evidence_partition_bytes * 8;
-    let hard_top = snapshot_bytes
-        .checked_add(catalog_bytes)
-        .and_then(|bytes| bytes.checked_add(evidence_peak_bytes))
-        .and_then(|bytes| bytes.checked_add(edge_bytes))
-        .and_then(|bytes| bytes.checked_add(component_peak_bytes - 1))
-        .unwrap();
-
-    let error = metadata_engine::pipeline::run_metadata_pipeline(
-        &features,
-        &blocking,
-        &dir.path().join("cumulative-memory-rejected"),
-        &metadata_engine::pipeline::MetadataPipelineConfig {
-            storage_work_directory: dir.path().to_path_buf(),
-            memory_hard_top: hard_top,
-            host_total_memory: 512 * GIB,
-            threads: 1,
-            max_catalog_jobs,
-            max_candidate_pair_visits: 1_000_000,
-            exact_sample_lefts: 1,
-            exact_pair_work: 10,
-            evidence_gate_policy: EvidenceGatePolicy::permissive(),
-            edge_bytes: 1_000_000,
-        },
-    )
-    .unwrap_err();
-
-    let expected_used = snapshot_bytes + catalog_bytes + evidence_peak_bytes + edge_bytes;
-    assert!(
-        error.to_string().contains(&format!(
-            "requested {component_peak_bytes}, used {expected_used}"
-        )),
-        "snapshot, catalog, and edge leases must be cumulative: {error}"
-    );
+    assert_eq!(result.snapshot_atoms, 1);
+    assert!(!events.is_empty());
+    assert!(advisories
+        .iter()
+        .any(|message| message.contains("demand-paged mmap access")));
 }
 
 #[test]
@@ -3516,9 +3527,27 @@ fn scope_forests_do_not_leak_transitive_edges_between_chain_pairs() {
     assert_eq!(result.scope_components.intra_roots, vec![0, 1, 2]);
     assert_eq!(result.scope_components.cross_roots, vec![0, 0, 0]);
     let pairs = &result.scope_components.chain_pair_roots;
-    assert_eq!(pairs[0].roots, vec![0, 0, 2]);
-    assert_eq!(pairs[1].roots, vec![0, 1, 2]);
-    assert_eq!(pairs[2].roots, vec![0, 1, 1]);
+    assert_eq!(pairs[0].roots.len(), 2);
+    assert_eq!(pairs[1].roots.len(), 2);
+    assert_eq!(pairs[2].roots.len(), 2);
+    assert_eq!(
+        pairs[0]
+            .expand_global_roots(&result.scope_components)
+            .unwrap(),
+        vec![0, 0, 2]
+    );
+    assert_eq!(
+        pairs[1]
+            .expand_global_roots(&result.scope_components)
+            .unwrap(),
+        vec![0, 1, 2]
+    );
+    assert_eq!(
+        pairs[2]
+            .expand_global_roots(&result.scope_components)
+            .unwrap(),
+        vec![0, 1, 1]
+    );
     let cross_a = result
         .summary_rows
         .iter()

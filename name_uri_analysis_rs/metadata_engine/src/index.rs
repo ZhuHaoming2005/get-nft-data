@@ -26,6 +26,7 @@ pub struct IndexMetrics {
 
 pub struct ConservativeIndex<'a> {
     snapshot: &'a MetadataSnapshot,
+    hot_index_budget: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -36,7 +37,17 @@ enum HotIndexDimension {
 
 impl<'a> ConservativeIndex<'a> {
     pub fn open(snapshot: &'a MetadataSnapshot) -> Self {
-        Self { snapshot }
+        Self {
+            snapshot,
+            hot_index_budget: None,
+        }
+    }
+
+    pub fn open_bounded(snapshot: &'a MetadataSnapshot, hot_index_budget: usize) -> Self {
+        Self {
+            snapshot,
+            hot_index_budget: Some(hot_index_budget),
+        }
     }
 
     /// Stream every unique BaseEquivalent atom pair exactly once.
@@ -86,7 +97,7 @@ impl<'a> ConservativeIndex<'a> {
     ) -> Result<IndexMetrics, SchedulerError> {
         let total = catalog.jobs.iter().try_fold(0u64, |total, job| {
             total
-                .checked_add(job_routing_pair_work(self.snapshot, job)?)
+                .checked_add(job_routing_pair_work(self.snapshot, &job)?)
                 .ok_or(SchedulerError::WorkOverflow)
         })?;
         let mut completed = 0u64;
@@ -208,12 +219,12 @@ impl<'a> ConservativeIndex<'a> {
         job: &JobDescriptor,
         visit: &mut V,
         work: &mut W,
-        keep_going: &mut K,
+        keep_going: &K,
     ) -> IndexMetrics
     where
         V: FnMut(u32, u32) + Send,
         W: FnMut(u64) + Send,
-        K: FnMut() -> bool + Send,
+        K: Fn() -> bool + Sync,
     {
         let visit = Mutex::new(visit);
         self.for_each_job_candidate_parallel_stateful_with_work_while(
@@ -236,7 +247,7 @@ impl<'a> ConservativeIndex<'a> {
         visit: V,
         finish_task: F,
         work: &mut W,
-        keep_going: &mut K,
+        keep_going: &K,
     ) -> IndexMetrics
     where
         S: Send,
@@ -244,21 +255,18 @@ impl<'a> ConservativeIndex<'a> {
         V: Fn(&mut S, u32, u32) + Sync,
         F: Fn(&mut S) + Sync,
         W: FnMut(u64) + Send,
-        K: FnMut() -> bool + Send,
+        K: Fn() -> bool + Sync,
     {
         let blocks = job.first_block as usize..(job.first_block + job.block_count) as usize;
         match job.shape {
-            JobShape::MicroBatch => {
-                let mut state = state_init();
-                let metrics = self.for_each_job_candidate_with_work_while(
-                    job,
-                    |left, right| visit(&mut state, left, right),
-                    work,
-                    keep_going,
-                );
-                finish_task(&mut state);
-                metrics
-            }
+            JobShape::MicroBatch => self.visit_micro_batch_parallel_stateful_with_work_while(
+                blocks,
+                &state_init,
+                &visit,
+                &finish_task,
+                work,
+                keep_going,
+            ),
             JobShape::LeftTileFanout => {
                 let mut metrics = IndexMetrics::default();
                 for block in blocks {
@@ -274,6 +282,87 @@ impl<'a> ConservativeIndex<'a> {
                 metrics
             }
         }
+    }
+
+    fn visit_micro_batch_parallel_stateful_with_work_while<S, I, V, F, W, K>(
+        &self,
+        blocks: std::ops::Range<usize>,
+        state_init: &I,
+        visit: &V,
+        finish_task: &F,
+        work: &mut W,
+        keep_going: &K,
+    ) -> IndexMetrics
+    where
+        S: Send,
+        I: Fn() -> S + Sync,
+        V: Fn(&mut S, u32, u32) + Sync,
+        F: Fn(&mut S) + Sync,
+        W: FnMut(u64) + Send,
+        K: Fn() -> bool + Sync,
+    {
+        const LEFT_ROWS_PER_TASK: usize = 256;
+        const CANCELLATION_CHECK_PAIRS: usize = 4_096;
+        let blocking = self.snapshot.blocking();
+        let tasks = blocks
+            .flat_map(|block| {
+                let start = blocking.block_atom_offsets[block] as usize;
+                let end = blocking.block_atom_offsets[block + 1] as usize;
+                let left_rows = end.saturating_sub(start).saturating_sub(1);
+                (0..left_rows)
+                    .step_by(LEFT_ROWS_PER_TASK)
+                    .map(move |left_begin| (block, left_begin))
+            })
+            .collect::<Vec<_>>();
+        let work = Mutex::new(work);
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        tasks
+            .into_par_iter()
+            .map_init(state_init, |state, (block, left_begin)| {
+                let start = blocking.block_atom_offsets[block] as usize;
+                let end = blocking.block_atom_offsets[block + 1] as usize;
+                let members = &blocking.block_atoms[start..end];
+                let left_end = left_begin
+                    .saturating_add(LEFT_ROWS_PER_TASK)
+                    .min(members.len().saturating_sub(1));
+                let mut metrics = IndexMetrics::default();
+                for left_position in left_begin..left_end {
+                    if stopped.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
+                    if !keep_going() {
+                        stopped.store(true, std::sync::atomic::Ordering::Release);
+                        break;
+                    }
+                    for (offset, &right) in members[left_position + 1..].iter().enumerate() {
+                        if offset != 0
+                            && offset.is_multiple_of(CANCELLATION_CHECK_PAIRS)
+                            && !keep_going()
+                        {
+                            stopped.store(true, std::sync::atomic::Ordering::Release);
+                            break;
+                        }
+                        metrics.block_pair_visits = metrics.block_pair_visits.saturating_add(1);
+                        self.route_pair(
+                            block,
+                            members[left_position],
+                            right,
+                            &mut metrics,
+                            &mut |left, right| visit(state, left, right),
+                        );
+                    }
+                }
+                if metrics.block_pair_visits != 0 {
+                    let mut report = work.lock().expect("micro-batch progress lock");
+                    (*report)(metrics.block_pair_visits);
+                }
+                finish_task(state);
+                metrics
+            })
+            .reduce(IndexMetrics::default, |mut left, right| {
+                left.add(right);
+                left
+            })
     }
 
     fn visit_blocks(
@@ -321,6 +410,15 @@ impl<'a> ConservativeIndex<'a> {
         work: &mut impl FnMut(u64),
         keep_going: &mut impl FnMut() -> bool,
     ) -> IndexMetrics {
+        if let Some(hot_index_budget) = self.hot_index_budget {
+            return self.visit_hot_block_bounded_with_work_while(
+                block,
+                hot_index_budget,
+                visit,
+                work,
+                keep_going,
+            );
+        }
         let b = self.snapshot.blocking();
         let start = b.block_atom_offsets[block] as usize;
         let end = b.block_atom_offsets[block + 1] as usize;
@@ -432,6 +530,63 @@ impl<'a> ConservativeIndex<'a> {
         metrics
     }
 
+    fn visit_hot_block_bounded_with_work_while(
+        &self,
+        block: usize,
+        _hot_index_budget: usize,
+        visit: &mut impl FnMut(u32, u32),
+        work: &mut impl FnMut(u64),
+        keep_going: &mut impl FnMut() -> bool,
+    ) -> IndexMetrics {
+        const PROGRESS_CHUNK: u64 = 100_000_000;
+        let blocking = self.snapshot.blocking();
+        let start = blocking.block_atom_offsets[block] as usize;
+        let end = blocking.block_atom_offsets[block + 1] as usize;
+        let members = &blocking.block_atoms[start..end];
+        let features = self.snapshot.features();
+        let mut metrics = IndexMetrics::default();
+        let mut pending_work = 0u64;
+        for left_position in 0..members.len() {
+            let left_payload = atom_payload(features, members[left_position]);
+            let left_template = payload_terms(features, left_payload, HotIndexDimension::Template);
+            let left_content = payload_terms(features, left_payload, HotIndexDimension::Content);
+            for &right_atom in &members[left_position + 1..] {
+                if !keep_going() {
+                    if pending_work != 0 {
+                        work(pending_work);
+                    }
+                    return metrics;
+                }
+                let right_payload = atom_payload(features, right_atom);
+                if sorted_terms_intersect(
+                    left_template,
+                    payload_terms(features, right_payload, HotIndexDimension::Template),
+                ) && sorted_terms_intersect(
+                    left_content,
+                    payload_terms(features, right_payload, HotIndexDimension::Content),
+                ) {
+                    self.route_hot_pair(
+                        block,
+                        (members[left_position], right_atom),
+                        (left_payload, right_payload),
+                        &mut metrics,
+                        visit,
+                    );
+                }
+                metrics.block_pair_visits = metrics.block_pair_visits.saturating_add(1);
+                pending_work = pending_work.saturating_add(1);
+                if pending_work >= PROGRESS_CHUNK {
+                    work(pending_work);
+                    pending_work = 0;
+                }
+            }
+        }
+        if pending_work != 0 {
+            work(pending_work);
+        }
+        metrics
+    }
+
     fn visit_hot_block_parallel_stateful_with_work_while<S, I, V, F, W, K>(
         &self,
         block: usize,
@@ -439,7 +594,7 @@ impl<'a> ConservativeIndex<'a> {
         visit: &V,
         finish_task: &F,
         work: &mut W,
-        keep_going: &mut K,
+        keep_going: &K,
     ) -> IndexMetrics
     where
         S: Send,
@@ -447,7 +602,7 @@ impl<'a> ConservativeIndex<'a> {
         V: Fn(&mut S, u32, u32) + Sync,
         F: Fn(&mut S) + Sync,
         W: FnMut(u64) + Send,
-        K: FnMut() -> bool + Send,
+        K: Fn() -> bool + Sync,
     {
         const LEFT_ROWS_PER_TASK: usize = 256;
         let b = self.snapshot.blocking();
@@ -500,7 +655,6 @@ impl<'a> ConservativeIndex<'a> {
         postings.par_sort_unstable();
 
         let work = Mutex::new(work);
-        let keep_going = Mutex::new(keep_going);
         (0..members.len())
             .step_by(LEFT_ROWS_PER_TASK)
             .collect::<Vec<_>>()
@@ -520,9 +674,7 @@ impl<'a> ConservativeIndex<'a> {
                         .min(members.len());
                     let mut metrics = IndexMetrics::default();
                     for left_position in left_begin..left_end {
-                        let should_continue =
-                            (*keep_going.lock().expect("hot block cancellation lock"))();
-                        if !should_continue {
+                        if !keep_going() {
                             break;
                         }
                         *epoch = epoch.wrapping_add(1);

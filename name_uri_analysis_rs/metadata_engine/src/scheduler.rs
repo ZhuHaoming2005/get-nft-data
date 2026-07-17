@@ -1,6 +1,7 @@
 //! Fixed-width Work Catalog, frozen RecallPlan and coverage certificates.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -32,7 +33,43 @@ pub struct JobDescriptor {
     pub estimated_work: u64,
 }
 
-pub const CATALOG_REVISION: u32 = 3;
+pub const CATALOG_REVISION: u32 = 4;
+const MAX_MICRO_BLOCK_PAIR_WORK: u64 = 8_000_000;
+const CATALOG_ENCODED_BYTES_PER_JOB: u64 = 24;
+
+#[derive(Serialize)]
+struct CatalogReadyRef<'a> {
+    catalog_revision: u32,
+    job_count: usize,
+    snapshot_fingerprint: &'a str,
+}
+
+#[derive(Deserialize)]
+struct CatalogReady {
+    catalog_revision: u32,
+    job_count: usize,
+    snapshot_fingerprint: String,
+}
+
+fn block_requires_hot_index(members: u64, hot_members: u64) -> Result<bool, SchedulerError> {
+    let pair_work = members
+        .checked_mul(members.saturating_sub(1))
+        .and_then(|work| work.checked_div(2))
+        .ok_or(SchedulerError::WorkOverflow)?;
+    Ok(members > hot_members || pair_work > MAX_MICRO_BLOCK_PAIR_WORK)
+}
+
+#[cfg(test)]
+mod scheduler_shape_tests {
+    use super::*;
+
+    #[test]
+    fn pair_work_guard_removes_the_just_below_member_threshold_cliff() {
+        assert!(block_requires_hot_index(999_999, 1_000_000).unwrap());
+        assert!(!block_requires_hot_index(4_000, 1_000_000).unwrap());
+        assert!(block_requires_hot_index(4_001, 1_000_000).unwrap());
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct UniverseBudget {
@@ -64,9 +101,173 @@ pub enum SchedulerError {
     Format(#[from] crate::format::FormatError),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CatalogWorkspace {
+    root: PathBuf,
+    cleanup: bool,
+}
+
+impl Drop for CatalogWorkspace {
+    fn drop(&mut self) {
+        if self.cleanup {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+}
+
+struct MappedCatalogJobs {
+    first: crate::format::MappedU32Array,
+    counts: crate::format::MappedU32Array,
+    flags: crate::format::MappedU32Array,
+    work: crate::format::MappedU64Array,
+    tiles: crate::format::MappedU32Array,
+    _workspace: Arc<CatalogWorkspace>,
+}
+
+enum CatalogJobsInner {
+    Resident(Arc<[JobDescriptor]>),
+    Mapped(Box<MappedCatalogJobs>),
+}
+
+#[derive(Clone)]
+pub struct CatalogJobs {
+    inner: Arc<CatalogJobsInner>,
+}
+
+impl CatalogJobs {
+    fn resident(jobs: Vec<JobDescriptor>) -> Self {
+        Self {
+            inner: Arc::new(CatalogJobsInner::Resident(jobs.into())),
+        }
+    }
+
+    fn mapped(dir: &Path, job_count: usize, cleanup: bool) -> Result<Self, SchedulerError> {
+        let first = crate::format::map_u32_array(&dir.join("job_first_block.u32"))?;
+        let counts = crate::format::map_u32_array(&dir.join("job_block_count.u32"))?;
+        let flags = crate::format::map_u32_array(&dir.join("job_flags.u32"))?;
+        let work = crate::format::map_u64_array(&dir.join("job_estimated_work.u64"))?;
+        let tiles = crate::format::map_u32_array(&dir.join("job_tiles.u32"))?;
+        if [
+            first.len(),
+            counts.len(),
+            flags.len(),
+            work.len(),
+            tiles.len(),
+        ]
+        .into_iter()
+        .any(|len| len != job_count)
+            || flags.iter().any(|flags| !matches!(flags & 0xff, 0 | 1))
+        {
+            return Err(SchedulerError::StaleCoverage);
+        }
+        Ok(Self {
+            inner: Arc::new(CatalogJobsInner::Mapped(Box::new(MappedCatalogJobs {
+                first,
+                counts,
+                flags,
+                work,
+                tiles,
+                _workspace: Arc::new(CatalogWorkspace {
+                    root: dir.to_path_buf(),
+                    cleanup,
+                }),
+            }))),
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        match self.inner.as_ref() {
+            CatalogJobsInner::Resident(jobs) => jobs.len(),
+            CatalogJobsInner::Mapped(jobs) => jobs.first.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn get(&self, index: usize) -> Option<JobDescriptor> {
+        if index >= self.len() {
+            return None;
+        }
+        Some(match self.inner.as_ref() {
+            CatalogJobsInner::Resident(jobs) => jobs[index],
+            CatalogJobsInner::Mapped(jobs) => {
+                let flags = jobs.flags[index];
+                let shape = match flags & 0xff {
+                    0 => JobShape::MicroBatch,
+                    1 => JobShape::LeftTileFanout,
+                    _ => unreachable!("mapped catalog flags were validated while opening"),
+                };
+                JobDescriptor {
+                    job_id: index as u32,
+                    first_block: jobs.first[index],
+                    block_count: jobs.counts[index],
+                    shape,
+                    risk: ((flags >> 8) & 0xff) as u8,
+                    rescue: ((flags >> 16) & 0xff) as u8,
+                    tile_row: (jobs.tiles[index] >> 16) as u16,
+                    tile_col: (jobs.tiles[index] & 0xffff) as u16,
+                    estimated_work: jobs.work[index],
+                }
+            }
+        })
+    }
+
+    pub fn iter(&self) -> CatalogJobIter<'_> {
+        CatalogJobIter {
+            jobs: self,
+            index: 0,
+        }
+    }
+
+    pub fn is_mapped(&self) -> bool {
+        matches!(self.inner.as_ref(), CatalogJobsInner::Mapped(_))
+    }
+}
+
+pub struct CatalogJobIter<'a> {
+    jobs: &'a CatalogJobs,
+    index: usize,
+}
+
+impl Iterator for CatalogJobIter<'_> {
+    type Item = JobDescriptor;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let job = self.jobs.get(self.index)?;
+        self.index += 1;
+        Some(job)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.jobs.len().saturating_sub(self.index);
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for CatalogJobIter<'_> {}
+
+impl std::fmt::Debug for CatalogJobs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CatalogJobs")
+            .field("len", &self.len())
+            .field("mapped", &self.is_mapped())
+            .finish()
+    }
+}
+
+impl PartialEq for CatalogJobs {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for CatalogJobs {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkCatalog {
-    pub jobs: Vec<JobDescriptor>,
+    pub jobs: CatalogJobs,
     pub snapshot_fingerprint: String,
 }
 
@@ -85,74 +286,35 @@ impl WorkCatalog {
         hot_members: u64,
         mut progress: impl FnMut(u64, u64, u64),
     ) -> Result<Self, SchedulerError> {
-        let b = snapshot.blocking();
-        crate::identity::checked_u32_identity("catalog blocks", b.block_kinds.len() as u64)?;
-        let total_blocks = b.block_kinds.len() as u64;
         let mut jobs = Vec::new();
-        let mut start = 0usize;
-        progress(0, total_blocks, 0);
-        while start < b.block_kinds.len() {
-            let members = b.block_atom_offsets[start + 1] - b.block_atom_offsets[start];
-            if members > hot_members {
-                // Keep a hot block constant-space in the catalog. Candidate
-                // generation builds a proof-safe secondary index lazily when
-                // this descriptor executes; materializing every tile pair here
-                // turns catalog construction itself into O(members^2) work.
-                check_next_job(jobs.len(), budget)?;
-                jobs.push(descriptor(
-                    jobs.len(),
-                    start,
-                    1,
-                    JobShape::LeftTileFanout,
-                    0,
-                    0,
-                    block_contract_pair_work(snapshot, start)?,
-                ));
-                start += 1;
-                progress(start as u64, total_blocks, jobs.len() as u64);
-                continue;
-            }
-            let first = start;
-            let mut total = 0u64;
-            let mut estimated_work = 0u64;
-            while start < b.block_kinds.len() {
-                let n = b.block_atom_offsets[start + 1] - b.block_atom_offsets[start];
-                if n > hot_members
-                    || (start > first && total.saturating_add(n) > budget.cold_members_per_job)
-                {
-                    break;
-                }
-                total = total.saturating_add(n);
-                estimated_work = estimated_work
-                    .checked_add(block_contract_pair_work(snapshot, start)?)
-                    .ok_or(SchedulerError::WorkOverflow)?;
-                start += 1;
-            }
-            check_next_job(jobs.len(), budget)?;
-            jobs.push(descriptor(
-                jobs.len(),
-                first,
-                start - first,
-                JobShape::MicroBatch,
-                0,
-                0,
-                estimated_work,
-            ));
-            progress(start as u64, total_blocks, jobs.len() as u64);
-        }
-        let bytes = (jobs.len() * std::mem::size_of::<JobDescriptor>()) as u64;
-        if jobs.len() as u64 > budget.max_jobs || bytes > budget.max_catalog_bytes {
-            return Err(SchedulerError::Budget {
-                jobs: jobs.len() as u64,
-                max_jobs: budget.max_jobs,
-                bytes,
-                max_bytes: budget.max_catalog_bytes,
-            });
-        }
+        visit_job_descriptors(
+            snapshot,
+            budget,
+            hot_members,
+            |job| {
+                jobs.push(job);
+                Ok(())
+            },
+            &mut progress,
+        )?;
         Ok(Self {
-            jobs,
+            jobs: CatalogJobs::resident(jobs),
             snapshot_fingerprint: snapshot_fingerprint(snapshot),
         })
+    }
+
+    pub fn descriptor_count(
+        snapshot: &MetadataSnapshot,
+        budget: UniverseBudget,
+        hot_members: u64,
+    ) -> Result<u64, SchedulerError> {
+        visit_job_descriptors(snapshot, budget, hot_members, |_| Ok(()), &mut |_, _, _| {})
+    }
+
+    pub fn encoded_bytes(&self) -> Result<u64, SchedulerError> {
+        (self.jobs.len() as u64)
+            .checked_mul(CATALOG_ENCODED_BYTES_PER_JOB)
+            .ok_or(SchedulerError::WorkOverflow)
     }
 
     /// Reuse a catalog only when it is bound to the current snapshot.  A
@@ -174,118 +336,143 @@ impl WorkCatalog {
                 Err(error) => return Err(error),
             }
         }
-        let catalog = Self::build_with_progress(snapshot, budget, hot_members, progress)?;
-        catalog.commit(dir)?;
-        Ok(catalog)
+        Self::build_external_with_progress(dir, snapshot, budget, hot_members, false, progress)
+    }
+
+    pub fn build_external_with_progress(
+        dir: &Path,
+        snapshot: &MetadataSnapshot,
+        budget: UniverseBudget,
+        hot_members: u64,
+        cleanup_on_drop: bool,
+        mut progress: impl FnMut(u64, u64, u64),
+    ) -> Result<Self, SchedulerError> {
+        let job_count =
+            visit_job_descriptors(snapshot, budget, hot_members, |_| Ok(()), &mut progress)?;
+        crate::identity::checked_u32_identity("catalog jobs", job_count)?;
+        std::fs::create_dir_all(dir)?;
+        let mut first = crate::format::TypedArraySink::create(
+            &dir.join("job_first_block.u32"),
+            crate::format::ArrayKind::U32,
+            job_count,
+        )?;
+        let mut counts = crate::format::TypedArraySink::create(
+            &dir.join("job_block_count.u32"),
+            crate::format::ArrayKind::U32,
+            job_count,
+        )?;
+        let mut flags = crate::format::TypedArraySink::create(
+            &dir.join("job_flags.u32"),
+            crate::format::ArrayKind::U32,
+            job_count,
+        )?;
+        let mut work = crate::format::TypedArraySink::create(
+            &dir.join("job_estimated_work.u64"),
+            crate::format::ArrayKind::U64,
+            job_count,
+        )?;
+        let mut tiles = crate::format::TypedArraySink::create(
+            &dir.join("job_tiles.u32"),
+            crate::format::ArrayKind::U32,
+            job_count,
+        )?;
+        visit_job_descriptors(
+            snapshot,
+            budget,
+            hot_members,
+            |job| {
+                first.push_u32(job.first_block)?;
+                counts.push_u32(job.block_count)?;
+                flags.push_u32(
+                    (job.shape as u32) | (u32::from(job.risk) << 8) | (u32::from(job.rescue) << 16),
+                )?;
+                work.push_u64(job.estimated_work)?;
+                tiles.push_u32((u32::from(job.tile_row) << 16) | u32::from(job.tile_col))?;
+                Ok(())
+            },
+            &mut |_, _, _| {},
+        )?;
+        first.finish()?;
+        counts.finish()?;
+        flags.finish()?;
+        work.finish()?;
+        tiles.finish()?;
+        let fingerprint = snapshot_fingerprint(snapshot);
+        let ready = CatalogReadyRef {
+            catalog_revision: CATALOG_REVISION,
+            job_count: usize::try_from(job_count).map_err(|_| SchedulerError::WorkOverflow)?,
+            snapshot_fingerprint: &fingerprint,
+        };
+        crate::format::commit_ready_serialized(dir, "catalog.ready", &ready)?;
+        Self::open_with_cleanup(dir, snapshot, cleanup_on_drop)
     }
 
     pub fn commit(&self, dir: &Path) -> Result<(), SchedulerError> {
         crate::identity::checked_u32_identity("catalog jobs", self.jobs.len() as u64)?;
         std::fs::create_dir_all(dir)?;
-        let first = self.jobs.iter().map(|j| j.first_block).collect::<Vec<_>>();
-        let counts = self.jobs.iter().map(|j| j.block_count).collect::<Vec<_>>();
-        let flags = self
-            .jobs
-            .iter()
-            .map(|j| (j.shape as u32) | (u32::from(j.risk) << 8) | (u32::from(j.rescue) << 16))
-            .collect::<Vec<_>>();
-        let work = self
-            .jobs
-            .iter()
-            .map(|j| j.estimated_work)
-            .collect::<Vec<_>>();
-        let tiles = self
-            .jobs
-            .iter()
-            .map(|j| ((u32::from(j.tile_row)) << 16) | u32::from(j.tile_col))
-            .collect::<Vec<_>>();
-        crate::format::write_u32_array(
+        let job_count = self.jobs.len() as u64;
+        crate::format::write_u32_iter(
             &dir.join("job_first_block.u32"),
             crate::format::ArrayKind::U32,
-            &first,
+            job_count,
+            self.jobs.iter().map(|job| job.first_block),
         )?;
-        crate::format::write_u32_array(
+        crate::format::write_u32_iter(
             &dir.join("job_block_count.u32"),
             crate::format::ArrayKind::U32,
-            &counts,
+            job_count,
+            self.jobs.iter().map(|job| job.block_count),
         )?;
-        crate::format::write_u32_array(
+        crate::format::write_u32_iter(
             &dir.join("job_flags.u32"),
             crate::format::ArrayKind::U32,
-            &flags,
+            job_count,
+            self.jobs.iter().map(|job| {
+                (job.shape as u32) | (u32::from(job.risk) << 8) | (u32::from(job.rescue) << 16)
+            }),
         )?;
-        crate::format::write_u64_array(
+        crate::format::write_u64_iter(
             &dir.join("job_estimated_work.u64"),
             crate::format::ArrayKind::U64,
-            &work,
+            job_count,
+            self.jobs.iter().map(|job| job.estimated_work),
         )?;
-        crate::format::write_u32_array(
+        crate::format::write_u32_iter(
             &dir.join("job_tiles.u32"),
             crate::format::ArrayKind::U32,
-            &tiles,
+            job_count,
+            self.jobs
+                .iter()
+                .map(|job| (u32::from(job.tile_row) << 16) | u32::from(job.tile_col)),
         )?;
-        let ready = serde_json::json!({
-            "catalog_revision": CATALOG_REVISION,
-            "job_count": self.jobs.len(),
-            "snapshot_fingerprint": self.snapshot_fingerprint
-        })
-        .to_string();
-        crate::format::commit_ready(dir, "catalog.ready", &ready)?;
+        let ready = CatalogReadyRef {
+            catalog_revision: CATALOG_REVISION,
+            job_count: self.jobs.len(),
+            snapshot_fingerprint: &self.snapshot_fingerprint,
+        };
+        crate::format::commit_ready_serialized(dir, "catalog.ready", &ready)?;
         Ok(())
     }
 
     pub fn open(dir: &Path, snapshot: &MetadataSnapshot) -> Result<Self, SchedulerError> {
-        #[derive(Deserialize)]
-        struct Ready {
-            catalog_revision: u32,
-            job_count: usize,
-            snapshot_fingerprint: String,
-        }
-        let ready: Ready = serde_json::from_slice(&std::fs::read(dir.join("catalog.ready"))?)?;
+        Self::open_with_cleanup(dir, snapshot, false)
+    }
+
+    fn open_with_cleanup(
+        dir: &Path,
+        snapshot: &MetadataSnapshot,
+        cleanup_on_drop: bool,
+    ) -> Result<Self, SchedulerError> {
+        let ready: CatalogReady =
+            serde_json::from_slice(&std::fs::read(dir.join("catalog.ready"))?)?;
         if ready.catalog_revision != CATALOG_REVISION
             || ready.snapshot_fingerprint != snapshot_fingerprint(snapshot)
         {
             return Err(SchedulerError::StaleCoverage);
         }
         crate::identity::checked_u32_identity("catalog jobs", ready.job_count as u64)?;
-        let first = crate::format::map_u32_array(&dir.join("job_first_block.u32"))?;
-        let counts = crate::format::map_u32_array(&dir.join("job_block_count.u32"))?;
-        let flags = crate::format::map_u32_array(&dir.join("job_flags.u32"))?;
-        let work = crate::format::map_u64_array(&dir.join("job_estimated_work.u64"))?;
-        let tiles = crate::format::map_u32_array(&dir.join("job_tiles.u32"))?;
-        if [
-            first.len(),
-            counts.len(),
-            flags.len(),
-            work.len(),
-            tiles.len(),
-        ]
-        .into_iter()
-        .any(|len| len != ready.job_count)
-        {
-            return Err(SchedulerError::StaleCoverage);
-        }
-        let mut jobs = Vec::with_capacity(ready.job_count);
-        for index in 0..ready.job_count {
-            let shape = match flags[index] & 0xff {
-                0 => JobShape::MicroBatch,
-                1 => JobShape::LeftTileFanout,
-                _ => return Err(SchedulerError::StaleCoverage),
-            };
-            jobs.push(JobDescriptor {
-                job_id: index as u32,
-                first_block: first[index],
-                block_count: counts[index],
-                shape,
-                risk: ((flags[index] >> 8) & 0xff) as u8,
-                rescue: ((flags[index] >> 16) & 0xff) as u8,
-                tile_row: (tiles[index] >> 16) as u16,
-                tile_col: (tiles[index] & 0xffff) as u16,
-                estimated_work: work[index],
-            });
-        }
         Ok(Self {
-            jobs,
+            jobs: CatalogJobs::mapped(dir, ready.job_count, cleanup_on_drop)?,
             snapshot_fingerprint: ready.snapshot_fingerprint,
         })
     }
@@ -330,8 +517,72 @@ pub fn job_routing_pair_work(
     })
 }
 
-fn check_next_job(current_jobs: usize, budget: UniverseBudget) -> Result<(), SchedulerError> {
-    let jobs = current_jobs.saturating_add(1) as u64;
+fn visit_job_descriptors(
+    snapshot: &MetadataSnapshot,
+    budget: UniverseBudget,
+    hot_members: u64,
+    mut visit: impl FnMut(JobDescriptor) -> Result<(), SchedulerError>,
+    progress: &mut impl FnMut(u64, u64, u64),
+) -> Result<u64, SchedulerError> {
+    let blocking = snapshot.blocking();
+    crate::identity::checked_u32_identity("catalog blocks", blocking.block_kinds.len() as u64)?;
+    let total_blocks = blocking.block_kinds.len() as u64;
+    let mut job_count = 0u64;
+    let mut start = 0usize;
+    progress(0, total_blocks, 0);
+    while start < blocking.block_kinds.len() {
+        let members = blocking.block_atom_offsets[start + 1] - blocking.block_atom_offsets[start];
+        if block_requires_hot_index(members, hot_members)? {
+            check_next_job(job_count, budget)?;
+            visit(descriptor(
+                job_count,
+                start,
+                1,
+                JobShape::LeftTileFanout,
+                0,
+                0,
+                block_contract_pair_work(snapshot, start)?,
+            ))?;
+            job_count += 1;
+            start += 1;
+            progress(start as u64, total_blocks, job_count);
+            continue;
+        }
+        let first = start;
+        let mut total = 0u64;
+        let mut estimated_work = 0u64;
+        while start < blocking.block_kinds.len() {
+            let members =
+                blocking.block_atom_offsets[start + 1] - blocking.block_atom_offsets[start];
+            if block_requires_hot_index(members, hot_members)?
+                || (start > first && total.saturating_add(members) > budget.cold_members_per_job)
+            {
+                break;
+            }
+            total = total.saturating_add(members);
+            estimated_work = estimated_work
+                .checked_add(block_contract_pair_work(snapshot, start)?)
+                .ok_or(SchedulerError::WorkOverflow)?;
+            start += 1;
+        }
+        check_next_job(job_count, budget)?;
+        visit(descriptor(
+            job_count,
+            first,
+            start - first,
+            JobShape::MicroBatch,
+            0,
+            0,
+            estimated_work,
+        ))?;
+        job_count += 1;
+        progress(start as u64, total_blocks, job_count);
+    }
+    Ok(job_count)
+}
+
+fn check_next_job(current_jobs: u64, budget: UniverseBudget) -> Result<(), SchedulerError> {
+    let jobs = current_jobs.saturating_add(1);
     let bytes = jobs.saturating_mul(std::mem::size_of::<JobDescriptor>() as u64);
     if jobs > budget.max_jobs || bytes > budget.max_catalog_bytes || jobs > u32::MAX as u64 {
         Err(SchedulerError::Budget {
@@ -346,7 +597,7 @@ fn check_next_job(current_jobs: usize, budget: UniverseBudget) -> Result<(), Sch
 }
 
 fn descriptor(
-    id: usize,
+    id: u64,
     first: usize,
     count: usize,
     shape: JobShape,
@@ -425,7 +676,7 @@ impl RecallPlan {
         rescue_jobs.dedup();
         exact_rescue_lefts.sort_unstable();
         exact_rescue_lefts.dedup();
-        let mut jobs = catalog.jobs.clone();
+        let mut jobs = catalog.jobs.iter().collect::<Vec<_>>();
         for job in &mut jobs {
             job.rescue = u8::from(rescue_jobs.binary_search(&job.job_id).is_ok());
             job.risk = job.rescue;

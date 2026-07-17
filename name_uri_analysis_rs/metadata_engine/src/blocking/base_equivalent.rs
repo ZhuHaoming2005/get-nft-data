@@ -36,6 +36,88 @@ pub struct AtomSketch {
     pub has_content_terms: bool,
 }
 
+/// Compact structure-of-arrays representation used by the global Encode
+/// compiler.  Anchors are bounded by [`ANCHOR_COUNT`] but stay variable-width
+/// so the resident fast path pays only for anchors that actually exist.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AtomSketchSoA {
+    pub template_simhashes: Vec<u64>,
+    pub content_simhashes: Vec<u64>,
+    pub template_anchor_offsets: Vec<u64>,
+    pub template_anchors: Vec<u32>,
+    pub content_anchor_offsets: Vec<u64>,
+    pub content_anchors: Vec<u32>,
+    pub has_template_terms: Vec<u8>,
+    pub has_content_terms: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AtomSketchView<'a> {
+    pub template_simhashes: &'a [u64],
+    pub content_simhashes: &'a [u64],
+    pub template_anchor_offsets: &'a [u64],
+    pub template_anchors: &'a [u32],
+    pub content_anchor_offsets: &'a [u64],
+    pub content_anchors: &'a [u32],
+    pub has_template_terms: &'a [u8],
+    pub has_content_terms: &'a [u8],
+}
+
+impl AtomSketchSoA {
+    pub fn len(&self) -> usize {
+        self.template_simhashes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn as_view(&self) -> AtomSketchView<'_> {
+        AtomSketchView {
+            template_simhashes: &self.template_simhashes,
+            content_simhashes: &self.content_simhashes,
+            template_anchor_offsets: &self.template_anchor_offsets,
+            template_anchors: &self.template_anchors,
+            content_anchor_offsets: &self.content_anchor_offsets,
+            content_anchors: &self.content_anchors,
+            has_template_terms: &self.has_template_terms,
+            has_content_terms: &self.has_content_terms,
+        }
+    }
+}
+
+impl<'a> AtomSketchView<'a> {
+    pub fn len(self) -> usize {
+        self.template_simhashes.len()
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn template_anchors(self, atom: usize) -> &'a [u32] {
+        csr_u32(self.template_anchor_offsets, self.template_anchors, atom)
+    }
+
+    pub fn content_anchors(self, atom: usize) -> &'a [u32] {
+        csr_u32(self.content_anchor_offsets, self.content_anchors, atom)
+    }
+
+    pub fn has_template_terms(self, atom: usize) -> bool {
+        self.has_template_terms[atom] != 0
+    }
+
+    pub fn has_content_terms(self, atom: usize) -> bool {
+        self.has_content_terms[atom] != 0
+    }
+}
+
+fn csr_u32<'a>(offsets: &[u64], values: &'a [u32], row: usize) -> &'a [u32] {
+    let begin = offsets[row] as usize;
+    let end = offsets[row + 1] as usize;
+    &values[begin..end]
+}
+
 /// Routing status persisted as `atom_routing_status.u8`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -119,6 +201,76 @@ pub enum BlockingError {
     WorkerPool,
 }
 
+trait AtomSketchSource: Sync {
+    fn len(&self) -> usize;
+    fn template_simhash(&self, atom: usize) -> u64;
+    fn content_simhash(&self, atom: usize) -> u64;
+    fn template_anchors(&self, atom: usize) -> &[u32];
+    fn content_anchors(&self, atom: usize) -> &[u32];
+    fn has_template_terms(&self, atom: usize) -> bool;
+    fn has_content_terms(&self, atom: usize) -> bool;
+}
+
+impl AtomSketchSource for [AtomSketch] {
+    fn len(&self) -> usize {
+        <[AtomSketch]>::len(self)
+    }
+
+    fn template_simhash(&self, atom: usize) -> u64 {
+        self[atom].template_simhash
+    }
+
+    fn content_simhash(&self, atom: usize) -> u64 {
+        self[atom].content_simhash
+    }
+
+    fn template_anchors(&self, atom: usize) -> &[u32] {
+        &self[atom].template_anchors
+    }
+
+    fn content_anchors(&self, atom: usize) -> &[u32] {
+        &self[atom].content_anchors
+    }
+
+    fn has_template_terms(&self, atom: usize) -> bool {
+        self[atom].has_template_terms
+    }
+
+    fn has_content_terms(&self, atom: usize) -> bool {
+        self[atom].has_content_terms
+    }
+}
+
+impl AtomSketchSource for AtomSketchView<'_> {
+    fn len(&self) -> usize {
+        (*self).len()
+    }
+
+    fn template_simhash(&self, atom: usize) -> u64 {
+        self.template_simhashes[atom]
+    }
+
+    fn content_simhash(&self, atom: usize) -> u64 {
+        self.content_simhashes[atom]
+    }
+
+    fn template_anchors(&self, atom: usize) -> &[u32] {
+        (*self).template_anchors(atom)
+    }
+
+    fn content_anchors(&self, atom: usize) -> &[u32] {
+        (*self).content_anchors(atom)
+    }
+
+    fn has_template_terms(&self, atom: usize) -> bool {
+        (*self).has_template_terms(atom)
+    }
+
+    fn has_content_terms(&self, atom: usize) -> bool {
+        (*self).has_content_terms(atom)
+    }
+}
+
 /// Scoring owner = minimum shared BaseEquivalent routing `block_id`.
 pub fn scoring_owner(bundle: &BlockingBundle, left: u32, right: u32) -> Option<u32> {
     let l0 = bundle.atom_block_offsets[left as usize] as usize;
@@ -162,6 +314,26 @@ pub fn compile_base_equivalent_parallel_with_progress(
     config: &BlockingCompileConfig,
     out_dir: &Path,
     lanes: usize,
+    progress: impl FnMut(ProgressEvent),
+) -> Result<BlockingBundle, BlockingError> {
+    compile_base_equivalent_source_parallel_with_progress(atoms, config, out_dir, lanes, progress)
+}
+
+pub fn compile_base_equivalent_view_parallel_with_progress(
+    atoms: AtomSketchView<'_>,
+    config: &BlockingCompileConfig,
+    out_dir: &Path,
+    lanes: usize,
+    progress: impl FnMut(ProgressEvent),
+) -> Result<BlockingBundle, BlockingError> {
+    compile_base_equivalent_source_parallel_with_progress(&atoms, config, out_dir, lanes, progress)
+}
+
+fn compile_base_equivalent_source_parallel_with_progress<S: AtomSketchSource + ?Sized>(
+    atoms: &S,
+    config: &BlockingCompileConfig,
+    out_dir: &Path,
+    lanes: usize,
     mut progress: impl FnMut(ProgressEvent),
 ) -> Result<BlockingBundle, BlockingError> {
     std::fs::create_dir_all(out_dir).map_err(FormatError::from)?;
@@ -170,14 +342,14 @@ pub fn compile_base_equivalent_parallel_with_progress(
     let joint_work = (atom_count as u64)
         .checked_mul(JOINT_BAND_FAMILIES as u64)
         .ok_or(BlockingError::WorkOverflow)?;
-    let anchor_work = atoms.iter().try_fold(0u64, |total, atom| {
-        let template = if atom.has_content_terms && atom.has_template_terms {
-            atom.template_anchors.len().min(ANCHOR_COUNT) as u64
+    let anchor_work = (0..atom_count).try_fold(0u64, |total, atom| {
+        let template = if atoms.has_content_terms(atom) && atoms.has_template_terms(atom) {
+            atoms.template_anchors(atom).len().min(ANCHOR_COUNT) as u64
         } else {
             0
         };
-        let content = if atom.has_content_terms {
-            atom.content_anchors.len().min(ANCHOR_COUNT) as u64
+        let content = if atoms.has_content_terms(atom) {
+            atoms.content_anchors(atom).len().min(ANCHOR_COUNT) as u64
         } else {
             0
         };
@@ -199,11 +371,17 @@ pub fn compile_base_equivalent_parallel_with_progress(
     let mut compile_completed = 0u64;
     let atom_count_u32 = crate::identity::checked_u32_identity("atoms", atom_count as u64)?;
     let primary_storage_shards: Vec<u32> = (0..atom_count_u32).collect();
-    let template_simhashes: Vec<u64> = atoms.iter().map(|a| a.template_simhash).collect();
-    let content_simhashes: Vec<u64> = atoms.iter().map(|a| a.content_simhash).collect();
+    let template_simhashes: Vec<u64> = (0..atom_count)
+        .map(|atom| atoms.template_simhash(atom))
+        .collect();
+    let content_simhashes: Vec<u64> = (0..atom_count)
+        .map(|atom| atoms.content_simhash(atom))
+        .collect();
 
     // Exact predicate: empty content terms ⇒ no candidate possible under current scorer.
-    let proven: Vec<bool> = atoms.iter().map(|a| !a.has_content_terms).collect();
+    let proven: Vec<bool> = (0..atom_count)
+        .map(|atom| !atoms.has_content_terms(atom))
+        .collect();
 
     // Build the forward CSR directly. Keeping one Vec per block and flattening
     // it later adds a third membership-sized allocation beside the two final
@@ -214,39 +392,52 @@ pub fn compile_base_equivalent_parallel_with_progress(
     let mut block_atoms = Vec::new();
 
     let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(lanes.clamp(1, JOINT_BAND_FAMILIES))
+        // Joint bands expose 64 tasks, but anchor grouping and inverse-CSR
+        // construction can use the full configured machine. Keep one pool for
+        // the whole compiler instead of retaining a 64-thread pool while
+        // constructing a second up-to-128-thread pool during finalization.
+        .num_threads(lanes.max(1))
         .thread_name(|index| format!("metadata-blocking-{index}"))
         .build()
         .map_err(|_| BlockingError::WorkerPool)?;
-    let joint_blocks = pool.install(|| {
-        (0..JOINT_BAND_FAMILIES)
-            .into_par_iter()
-            .map(|family| build_joint_family(atoms, &proven, family))
-            .collect::<Vec<_>>()
-    });
-    for (family, buckets) in joint_blocks.into_iter().enumerate() {
-        for (bucket, members) in buckets {
-            let key = ((family as u64) << 16) | u64::from(bucket);
-            append_forward_block(
-                &mut block_kinds,
-                &mut block_keys,
-                &mut block_atom_offsets,
-                &mut block_atoms,
-                BlockKind::Joint,
-                key,
-                members,
-            );
+    const MAX_JOINT_FAMILIES_IN_FLIGHT: usize = 16;
+    let family_batch = MAX_JOINT_FAMILIES_IN_FLIGHT
+        .min(JOINT_BAND_FAMILIES)
+        .min(lanes.max(1));
+    for first_family in (0..JOINT_BAND_FAMILIES).step_by(family_batch) {
+        let end_family = first_family
+            .saturating_add(family_batch)
+            .min(JOINT_BAND_FAMILIES);
+        let joint_blocks = pool.install(|| {
+            (first_family..end_family)
+                .into_par_iter()
+                .map(|family| (family, build_joint_family(atoms, &proven, family)))
+                .collect::<Vec<_>>()
+        });
+        for (family, buckets) in joint_blocks {
+            for (bucket, members) in buckets {
+                let key = ((family as u64) << 16) | u64::from(bucket);
+                append_forward_block(
+                    &mut block_kinds,
+                    &mut block_keys,
+                    &mut block_atom_offsets,
+                    &mut block_atoms,
+                    BlockKind::Joint,
+                    key,
+                    members,
+                );
+            }
+            compile_completed = compile_completed
+                .checked_add(atom_count as u64)
+                .ok_or(BlockingError::WorkOverflow)?;
+            progress(ProgressEvent::determinate(
+                ProgressPhase::BlockingCompile,
+                compile_completed,
+                compile_total,
+                WorkUnit::Items,
+                ProgressCounters::default(),
+            ));
         }
-        compile_completed = compile_completed
-            .checked_add(atom_count as u64)
-            .ok_or(BlockingError::WorkOverflow)?;
-        progress(ProgressEvent::determinate(
-            ProgressPhase::BlockingCompile,
-            compile_completed,
-            compile_total,
-            WorkUnit::Items,
-            ProgressCounters::default(),
-        ));
     }
 
     let (template_anchor_groups, content_anchor_groups) = pool.install(|| {
@@ -269,11 +460,9 @@ pub fn compile_base_equivalent_parallel_with_progress(
         }
         compile_completed = compile_completed
             .checked_add(
-                atoms
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, atom)| !proven[*index] && atom.has_template_terms)
-                    .map(|(_, atom)| atom.template_anchors.len().min(ANCHOR_COUNT) as u64)
+                (0..atom_count)
+                    .filter(|&index| !proven[index] && atoms.has_template_terms(index))
+                    .map(|index| atoms.template_anchors(index).len().min(ANCHOR_COUNT) as u64)
                     .sum::<u64>(),
             )
             .ok_or(BlockingError::WorkOverflow)?;
@@ -300,11 +489,9 @@ pub fn compile_base_equivalent_parallel_with_progress(
         }
         compile_completed = compile_completed
             .checked_add(
-                atoms
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, atom)| !proven[*index] && atom.has_content_terms)
-                    .map(|(_, atom)| atom.content_anchors.len().min(ANCHOR_COUNT) as u64)
+                (0..atom_count)
+                    .filter(|&index| !proven[index] && atoms.has_content_terms(index))
+                    .map(|index| atoms.content_anchors(index).len().min(ANCHOR_COUNT) as u64)
                     .sum::<u64>(),
             )
             .ok_or(BlockingError::WorkOverflow)?;
@@ -395,7 +582,7 @@ pub fn compile_base_equivalent_parallel_with_progress(
 
     debug_assert_eq!(membership_count, block_atoms.len());
     let (atom_block_offsets, atom_block_ids) =
-        build_inverse_block_csr_parallel(&block_atom_offsets, &block_atoms, atom_count, lanes)?;
+        build_inverse_block_csr_parallel(&block_atom_offsets, &block_atoms, atom_count, &pool)?;
     finalize_completed = finalize_completed
         .saturating_add(atom_count as u64)
         .saturating_add(block_count as u64);
@@ -417,7 +604,7 @@ pub fn compile_base_equivalent_parallel_with_progress(
             // Not exact-safe (has content terms) but no joint/anchor placement → fail closed.
             return Err(BlockingError::AtomWithoutRoutingMembership {
                 atom_index: i as u32,
-                has_template_terms: atoms[i].has_template_terms,
+                has_template_terms: atoms.has_template_terms(i),
             });
         } else if atom_in_hot[i] {
             routing_statuses[i] = RoutingStatus::HotBlock as u8;
@@ -466,23 +653,33 @@ pub fn compile_base_equivalent_parallel_with_progress(
 /// bound covers both CSR directions, per-block descriptors, hot-block plans,
 /// array framing, and manifests without materializing the block universe.
 pub fn blocking_artifact_upper_bound(atoms: &[AtomSketch]) -> Result<u64, BlockingError> {
+    blocking_artifact_upper_bound_source(atoms)
+}
+
+pub fn blocking_artifact_upper_bound_view(atoms: AtomSketchView<'_>) -> Result<u64, BlockingError> {
+    blocking_artifact_upper_bound_source(&atoms)
+}
+
+fn blocking_artifact_upper_bound_source<S: AtomSketchSource + ?Sized>(
+    atoms: &S,
+) -> Result<u64, BlockingError> {
     const FILE_AND_MANIFEST_ALLOWANCE: u64 = 64 * 1024 * 1024;
     const ATOM_FIXED_BYTES: u64 = 32;
     const BYTES_PER_MEMBERSHIP: u64 = 96;
     let atom_count = atoms.len() as u64;
-    let memberships = atoms.iter().try_fold(0u64, |total, atom| {
-        let joint = if atom.has_content_terms {
+    let memberships = (0..atoms.len()).try_fold(0u64, |total, atom| {
+        let joint = if atoms.has_content_terms(atom) && atoms.has_template_terms(atom) {
             JOINT_BAND_FAMILIES as u64
         } else {
             0
         };
-        let template = if atom.has_content_terms && atom.has_template_terms {
-            atom.template_anchors.len().min(ANCHOR_COUNT) as u64
+        let template = if atoms.has_content_terms(atom) && atoms.has_template_terms(atom) {
+            atoms.template_anchors(atom).len().min(ANCHOR_COUNT) as u64
         } else {
             0
         };
-        let content = if atom.has_content_terms {
-            atom.content_anchors.len().min(ANCHOR_COUNT) as u64
+        let content = if atoms.has_content_terms(atom) {
+            atoms.content_anchors(atom).len().min(ANCHOR_COUNT) as u64
         } else {
             0
         };
@@ -503,20 +700,23 @@ pub fn blocking_artifact_upper_bound(atoms: &[AtomSketch]) -> Result<u64, Blocki
         .ok_or(BlockingError::WorkOverflow)
 }
 
-fn build_joint_family(
-    atoms: &[AtomSketch],
+fn build_joint_family<S: AtomSketchSource + ?Sized>(
+    atoms: &S,
     proven: &[bool],
     family: usize,
 ) -> Vec<(u16, Vec<u32>)> {
     let template_band = family / BANDS;
     let content_band = family % BANDS;
     let mut buckets: BTreeMap<u16, Vec<u32>> = BTreeMap::new();
-    for (atom_index, atom) in atoms.iter().enumerate() {
-        if proven[atom_index] || !atom.has_template_terms || !atom.has_content_terms {
+    for (atom_index, &is_proven) in proven.iter().enumerate().take(atoms.len()) {
+        if is_proven
+            || !atoms.has_template_terms(atom_index)
+            || !atoms.has_content_terms(atom_index)
+        {
             continue;
         }
-        let tv = simhash_band_value(atom.template_simhash, template_band);
-        let cv = simhash_band_value(atom.content_simhash, content_band);
+        let tv = simhash_band_value(atoms.template_simhash(atom_index), template_band);
+        let cv = simhash_band_value(atoms.content_simhash(atom_index), content_band);
         let bucket = (u16::from(tv) << BAND_BITS) | u16::from(cv);
         buckets.entry(bucket).or_default().push(atom_index as u32);
     }
@@ -527,12 +727,8 @@ fn build_inverse_block_csr_parallel(
     block_atom_offsets: &[u64],
     block_atoms: &[u32],
     atom_count: usize,
-    lanes: usize,
+    pool: &rayon::ThreadPool,
 ) -> Result<(Vec<u64>, Vec<u32>), BlockingError> {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(lanes.max(1))
-        .build()
-        .map_err(|_| BlockingError::WorkerPool)?;
     let counts = (0..atom_count)
         .map(|_| AtomicU64::new(0))
         .collect::<Vec<_>>();
@@ -639,24 +835,23 @@ fn append_forward_block(
     }
 }
 
-fn build_anchor_groups_parallel(
-    atoms: &[AtomSketch],
+fn build_anchor_groups_parallel<S: AtomSketchSource + ?Sized>(
+    atoms: &S,
     proven: &[bool],
     template: bool,
 ) -> Vec<(u32, Vec<u32>)> {
-    let mut pairs = atoms
-        .par_iter()
-        .enumerate()
-        .flat_map_iter(|(atom_index, atom)| {
+    let mut pairs = (0..atoms.len())
+        .into_par_iter()
+        .flat_map_iter(|atom_index| {
             let anchors = if template {
-                &atom.template_anchors
+                atoms.template_anchors(atom_index)
             } else {
-                &atom.content_anchors
+                atoms.content_anchors(atom_index)
             };
             let has_terms = if template {
-                atom.has_template_terms
+                atoms.has_template_terms(atom_index)
             } else {
-                atom.has_content_terms
+                atoms.has_content_terms(atom_index)
             };
             let enabled = !proven[atom_index] && has_terms;
             anchors
@@ -816,8 +1011,12 @@ mod tests {
 
     #[test]
     fn parallel_inverse_block_csr_matches_forward_memberships() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
         let (offsets, ids) =
-            build_inverse_block_csr_parallel(&[0, 2, 4], &[0, 2, 1, 2], 3, 4).unwrap();
+            build_inverse_block_csr_parallel(&[0, 2, 4], &[0, 2, 1, 2], 3, &pool).unwrap();
 
         assert_eq!(offsets, vec![0, 1, 2, 4]);
         assert_eq!(ids, vec![0, 1, 0, 1]);
@@ -844,7 +1043,7 @@ mod tests {
             },
         ];
 
-        let groups = build_anchor_groups_parallel(&atoms, &[false, false], true);
+        let groups = build_anchor_groups_parallel(atoms.as_slice(), &[false, false], true);
 
         assert_eq!(groups, vec![(3, vec![0, 1]), (9, vec![0])]);
     }

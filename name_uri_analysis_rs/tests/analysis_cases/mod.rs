@@ -72,9 +72,9 @@ fn isolated_process_phases_match_the_in_process_report() {
         run_analysis_phase(&phase_options, phase, &phase_work).unwrap();
     }
     assert!(phase_work.join("partial/metadata-summary.json").is_file());
-    assert!(!phase_work
-        .join("artifacts/metadata/match-1/metadata-summary-1")
-        .exists());
+    assert!(phase_work
+        .join("artifacts/metadata/match-1/metadata-summary-1/metadata-summary.ready")
+        .is_file());
     let phased = finalize_analysis_phases(&phase_options, &phase_work).unwrap();
 
     let mut in_process_options = phase_options.clone();
@@ -166,6 +166,9 @@ fn completed_name_result_does_not_depend_on_destructive_cleanup() {
                 NULL::UINTEGER AS metadata_source_file,
                 NULL::UBIGINT AS metadata_source_row_number,
                 NULL::BIGINT AS metadata_contract_index;
+         CREATE TABLE chain_totals AS
+         SELECT 'ethereum'::VARCHAR AS chain, 1::BIGINT AS contract_count,
+                1::BIGINT AS nft_count;
          CREATE VIEW name_atoms AS
          SELECT 0::BIGINT AS atom_id, 'ethereum'::VARCHAR AS chain,
                 'azuki'::VARCHAR AS name_norm, 1::BIGINT AS contract_count,

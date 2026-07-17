@@ -125,8 +125,8 @@ fn match_forecast_requires_eight_fresh_successes_with_an_exact_key() {
     .unwrap();
     let calibrated = load_match_eta_forecast(&manifest.options.output_dir, &key).unwrap();
     assert_eq!(calibrated.sample_count, 8);
-    assert_eq!(calibrated.lower_total_millis, Some(1_000));
-    assert_eq!(calibrated.upper_total_millis, Some(8_000));
+    assert_eq!(calibrated.lower_total_millis, Some(2_000));
+    assert_eq!(calibrated.upper_total_millis, Some(7_000));
 
     let mut different_revision = key.clone();
     different_revision.controller_match_revision += 1;
@@ -170,6 +170,43 @@ fn failures_and_resume_recomputes_never_calibrate_fresh_match_eta() {
     let forecast = load_match_eta_forecast(&manifest.options.output_dir, &key).unwrap();
     assert_eq!(forecast.sample_count, 0);
     assert_eq!(forecast.upper_total_millis, None);
+}
+
+#[test]
+fn match_forecast_central_range_rejects_extreme_runtime_outliers() {
+    let temp = tempfile::tempdir().unwrap();
+    let manifest = sample_manifest(temp.path());
+    let artifacts = temp.path().join("artifacts/metadata");
+    fs::create_dir_all(artifacts.join("encode-3")).unwrap();
+    fs::create_dir_all(artifacts.join("blocking-3")).unwrap();
+    fs::write(
+        artifacts.join("encode-3/features.ready"),
+        br#"{"schema_revision":3,"source_count":1000,"payload_count":500,"chains":[],"chain_totals":[]}"#,
+    )
+    .unwrap();
+    fs::write(
+        artifacts.join("blocking-3/blocking.ready"),
+        br#"{"blocking_revision":3,"atom_count":300}"#,
+    )
+    .unwrap();
+    let key = match_observation_key(&manifest, temp.path()).unwrap();
+
+    for wall_millis in [1, 950, 975, 1_000, 1_025, 1_050, 1_100, 100_000] {
+        record_match_observation(
+            &manifest.options.output_dir,
+            &MatchObservation::for_test(
+                key.clone(),
+                MatchExecutionKind::Fresh,
+                MatchOutcome::Success,
+                wall_millis,
+            ),
+        )
+        .unwrap();
+    }
+
+    let forecast = load_match_eta_forecast(&manifest.options.output_dir, &key).unwrap();
+    assert_eq!(forecast.lower_total_millis, Some(950));
+    assert_eq!(forecast.upper_total_millis, Some(1_100));
 }
 
 #[test]
@@ -385,9 +422,12 @@ fn input_fingerprint_records_file_order_rows_and_schema() {
     ))
     .unwrap();
 
-    let fingerprints = fingerprint_inputs(&[second.clone(), first.clone()]).unwrap();
+    let ordered_inputs = [second.clone(), first.clone()];
+    let fingerprints = fingerprint_inputs(&ordered_inputs).unwrap();
+    let repeated = fingerprint_inputs(&ordered_inputs).unwrap();
 
     assert_eq!(fingerprints.len(), 2);
+    assert_eq!(fingerprints, repeated);
     assert_eq!(fingerprints[0].file_id, 0);
     assert_eq!(fingerprints[0].path, second.canonicalize().unwrap());
     assert_eq!(fingerprints[0].row_count, 2);

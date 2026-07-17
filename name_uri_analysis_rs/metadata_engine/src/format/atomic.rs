@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::format::FormatError;
+use serde::Serialize;
 
 /// Path used for an in-progress write of `final_path`.
 pub fn partial_path(final_path: &Path) -> PathBuf {
@@ -67,7 +68,21 @@ pub fn commit_ready(
     write_atomic(&ready_path, manifest_json.as_bytes())
 }
 
-pub(super) fn replace_file_atomically(from: &Path, to: &Path) -> Result<(), FormatError> {
+/// Atomically stream a serializable JSON ready marker without first building
+/// a DOM-sized `serde_json::Value` or `String`.
+pub fn commit_ready_serialized(
+    bundle_dir: &Path,
+    ready_name: &str,
+    value: &impl Serialize,
+) -> Result<(), FormatError> {
+    let ready_path = bundle_dir.join(ready_name);
+    write_atomic_file(&ready_path, |file| {
+        serde_json::to_writer(file, value)
+            .map_err(|error| FormatError::InvalidManifest(error.to_string()))
+    })
+}
+
+pub(crate) fn replace_file_atomically(from: &Path, to: &Path) -> Result<(), FormatError> {
     #[cfg(windows)]
     replace_file_windows(from, to)?;
     #[cfg(not(windows))]

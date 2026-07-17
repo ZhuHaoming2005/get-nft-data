@@ -1,4 +1,5 @@
 use super::*;
+use sysinfo::System;
 
 #[derive(Debug)]
 pub(crate) struct MemoryPlan {
@@ -17,25 +18,32 @@ pub(crate) fn encode_process_memory_plan(
     rust_user_budget: usize,
     estimated_rust_resident: u64,
     host_total: u64,
+    host_available: u64,
 ) -> Result<EncodeProcessMemoryPlan, AnalysisError> {
-    use metadata_engine::resource::{required_host_headroom, ENCODE_HARD_TOP, GIB};
+    use metadata_engine::resource::GIB;
 
-    let envelope_bytes = host_total.saturating_sub(required_host_headroom(host_total));
+    let envelope_bytes = process_memory_envelope_bytes(host_total, host_available);
     let configured_duckdb =
         parse_byte_size(&resolve_duckdb_memory_limit(duckdb_memory_limit)?)? as u64;
-    let desired_rust = estimated_rust_resident
-        .saturating_add(64 * GIB)
-        .clamp(128 * GIB, ENCODE_HARD_TOP)
-        .min(rust_user_budget as u64);
-    if desired_rust == 0 || desired_rust > envelope_bytes {
+    // Encode can spill DuckDB operators, while its Rust interner/CSR state is
+    // substantially more expensive to reconstruct. Preserve a useful DuckDB
+    // floor, then let large datasets borrow the rest of the current shared
+    // process envelope instead of failing at the old fixed 288 GiB Rust ceiling.
+    const MIN_ENCODE_DUCKDB_BYTES: u64 = 8 * GIB;
+    let duckdb_floor = configured_duckdb.min(MIN_ENCODE_DUCKDB_BYTES);
+    let max_rust = (rust_user_budget as u64).min(envelope_bytes.saturating_sub(duckdb_floor));
+    if max_rust == 0 {
         return Err(AnalysisError::InvalidData(
             "Encode has no resident memory inside the shared process envelope".into(),
         ));
     }
+    let desired_rust = estimated_rust_resident
+        .saturating_add(64 * GIB)
+        .max((128 * GIB).min(max_rust))
+        .min(max_rust);
     let duckdb_bytes = configured_duckdb.min(envelope_bytes.saturating_sub(desired_rust));
-    let rust_hard_top_bytes = (rust_user_budget as u64)
-        .min(ENCODE_HARD_TOP)
-        .min(envelope_bytes.saturating_sub(duckdb_bytes));
+    let rust_hard_top_bytes =
+        (rust_user_budget as u64).min(envelope_bytes.saturating_sub(duckdb_bytes));
     Ok(EncodeProcessMemoryPlan {
         envelope_bytes,
         duckdb_bytes,
@@ -116,25 +124,61 @@ pub(crate) fn total_memory_budget_bytes(value: &str) -> Result<usize, AnalysisEr
 }
 
 pub(crate) fn auto_memory_budget_bytes() -> usize {
-    let mut system = System::new();
-    system.refresh_memory();
-    system.available_memory() as usize
+    usize::try_from(effective_available_memory_bytes()).unwrap_or(usize::MAX)
 }
 
-pub(crate) fn physical_memory_bytes() -> u64 {
+pub fn effective_available_memory_bytes() -> u64 {
+    effective_memory_snapshot_bytes().1
+}
+
+pub fn effective_memory_capacity_bytes() -> u64 {
+    effective_memory_snapshot_bytes().0
+}
+
+pub(crate) fn effective_memory_snapshot_bytes() -> (u64, u64) {
     let mut system = System::new();
     system.refresh_memory();
-    system.total_memory()
+    effective_memory_values(&system)
+}
+
+pub(crate) fn process_memory_envelope_bytes(host_total: u64, host_available: u64) -> u64 {
+    host_total
+        .saturating_sub(metadata_engine::resource::required_host_headroom(
+            host_total,
+        ))
+        .min(host_available)
+}
+
+pub(crate) fn duckdb_buffer_cap_bytes(process_envelope: u64) -> u64 {
+    process_envelope.saturating_mul(3).saturating_div(4)
+}
+
+fn effective_memory_values(system: &System) -> (u64, u64) {
+    let host_total = system.total_memory();
+    let host_available = system.available_memory();
+    let cgroup = system
+        .cgroup_limits()
+        .map(|limits| (limits.total_memory, limits.free_memory));
+    effective_memory_limits(host_total, host_available, cgroup)
+}
+
+fn effective_memory_limits(
+    host_total: u64,
+    host_available: u64,
+    cgroup: Option<(u64, u64)>,
+) -> (u64, u64) {
+    cgroup.map_or((host_total, host_available), |(total, available)| {
+        (host_total.min(total), host_available.min(available))
+    })
 }
 
 pub(crate) fn engine_memory_hard_top_bytes(
     user_budget: usize,
     engine_cap: u64,
     host_total: u64,
+    host_available: u64,
 ) -> Result<u64, AnalysisError> {
-    let host_capacity = host_total.saturating_sub(
-        metadata_engine::resource::required_host_headroom(host_total),
-    );
+    let host_capacity = process_memory_envelope_bytes(host_total, host_available);
     let hard_top = (user_budget as u64).min(engine_cap).min(host_capacity);
     if hard_top == 0 {
         return Err(AnalysisError::InvalidData(
@@ -181,4 +225,26 @@ pub(crate) fn parse_byte_size(value: &str) -> Result<usize, AnalysisError> {
         }
     };
     Ok((number * multiplier) as usize)
+}
+
+#[cfg(test)]
+mod effective_memory_tests {
+    use super::effective_memory_limits;
+
+    #[test]
+    fn cgroup_limits_bound_host_capacity_and_availability() {
+        assert_eq!(
+            effective_memory_limits(512, 400, Some((256, 120))),
+            (256, 120)
+        );
+    }
+
+    #[test]
+    fn unrestricted_or_looser_cgroup_preserves_host_values() {
+        assert_eq!(effective_memory_limits(512, 400, None), (512, 400));
+        assert_eq!(
+            effective_memory_limits(512, 400, Some((1024, 900))),
+            (512, 400)
+        );
+    }
 }

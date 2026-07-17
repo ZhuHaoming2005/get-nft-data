@@ -1,8 +1,12 @@
 //! Full-universe Pair ExactIsland oracle for frozen sampled left frontiers.
 
-use std::collections::HashMap;
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
+use std::marker::PhantomData;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use rayon::prelude::*;
@@ -19,7 +23,7 @@ use crate::index::candidate_owner;
 use crate::progress::{ProgressCounters, ProgressEvent, ProgressPhase, WorkUnit};
 use crate::snapshot::MetadataSnapshot;
 
-const EVIDENCE_ARTIFACT_REVISION: u32 = 6;
+const EVIDENCE_ARTIFACT_REVISION: u32 = 7;
 const SHARED_PAIR_TILE_MEMBERS: usize = 512;
 pub const SHARED_EXACT_TOTAL_PAIR_SAMPLE: u64 = 8_000_000;
 
@@ -243,10 +247,168 @@ pub fn plan_shared_token_evidence(
     })
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(C)]
 pub struct ExactMiss {
     pub left_atom: u32,
     pub right_atom: u32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(C)]
+pub struct SharedTokenExactMiss {
+    pub token_id: u32,
+    pub left_contract: u32,
+    pub right_contract: u32,
+}
+
+#[doc(hidden)]
+pub trait MissRecord:
+    Copy + Ord + std::fmt::Debug + Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static
+{
+    const WIDTH: usize;
+    fn word(self, index: usize) -> u32;
+}
+
+impl MissRecord for ExactMiss {
+    const WIDTH: usize = 2;
+
+    fn word(self, index: usize) -> u32 {
+        [self.left_atom, self.right_atom][index]
+    }
+}
+
+impl MissRecord for SharedTokenExactMiss {
+    const WIDTH: usize = 3;
+
+    fn word(self, index: usize) -> u32 {
+        [self.token_id, self.left_contract, self.right_contract][index]
+    }
+}
+
+struct MissWorkspace {
+    root: PathBuf,
+    cleanup: bool,
+}
+
+impl Drop for MissWorkspace {
+    fn drop(&mut self) {
+        if self.cleanup {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+}
+
+enum MissRowsInner<T> {
+    Resident(Arc<[T]>),
+    Mapped {
+        words: Arc<crate::format::MappedU32Array>,
+        workspace: Arc<MissWorkspace>,
+        marker: PhantomData<T>,
+    },
+}
+
+pub struct MissRows<T> {
+    inner: MissRowsInner<T>,
+}
+
+impl<T> Clone for MissRows<T> {
+    fn clone(&self) -> Self {
+        let inner = match &self.inner {
+            MissRowsInner::Resident(rows) => MissRowsInner::Resident(rows.clone()),
+            MissRowsInner::Mapped {
+                words, workspace, ..
+            } => MissRowsInner::Mapped {
+                words: words.clone(),
+                workspace: workspace.clone(),
+                marker: PhantomData,
+            },
+        };
+        Self { inner }
+    }
+}
+
+impl<T> From<Vec<T>> for MissRows<T> {
+    fn from(rows: Vec<T>) -> Self {
+        Self {
+            inner: MissRowsInner::Resident(rows.into()),
+        }
+    }
+}
+
+impl<T: MissRecord> MissRows<T> {
+    fn mapped(
+        path: &Path,
+        row_count: usize,
+        workspace: Arc<MissWorkspace>,
+    ) -> Result<Self, format::FormatError> {
+        let words = Arc::new(crate::format::map_u32_array(path)?);
+        let expected = row_count
+            .checked_mul(T::WIDTH)
+            .ok_or(format::FormatError::PayloadLengthOverflow)?;
+        if words.len() != expected
+            || std::mem::size_of::<T>() != T::WIDTH * std::mem::size_of::<u32>()
+            || std::mem::align_of::<T>() > std::mem::align_of::<u32>()
+        {
+            return Err(format::FormatError::InvalidHeader);
+        }
+        Ok(Self {
+            inner: MissRowsInner::Mapped {
+                words,
+                workspace,
+                marker: PhantomData,
+            },
+        })
+    }
+
+    #[cfg(test)]
+    fn is_mapped(&self) -> bool {
+        matches!(self.inner, MissRowsInner::Mapped { .. })
+    }
+}
+
+impl<T: MissRecord> Deref for MissRows<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        match &self.inner {
+            MissRowsInner::Resident(rows) => rows,
+            MissRowsInner::Mapped { words, .. } => {
+                // SAFETY: `MissRecord` is implemented only for `#[repr(C)]`
+                // all-u32 records. `mapped` verifies exact width, size, and
+                // alignment after the typed-array checksum has been validated.
+                unsafe {
+                    std::slice::from_raw_parts(words.as_ptr().cast::<T>(), words.len() / T::WIDTH)
+                }
+            }
+        }
+    }
+}
+
+impl<T: MissRecord> std::fmt::Debug for MissRows<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.deref().fmt(formatter)
+    }
+}
+
+impl<T: MissRecord> PartialEq for MissRows<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.deref() == other.deref()
+    }
+}
+
+impl<T: MissRecord> Eq for MissRows<T> {}
+
+impl<T: MissRecord> Serialize for MissRows<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.deref().serialize(serializer)
+    }
+}
+
+impl<'de, T: MissRecord> Deserialize<'de> for MissRows<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Vec::<T>::deserialize(deserializer).map(Into::into)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -266,19 +428,12 @@ pub struct PairExactEvidence {
     pub pair_work: u64,
     pub exact_matches: u64,
     pub clusters: Vec<ExactEvidenceCluster>,
-    pub conservative_misses: Vec<ExactMiss>,
+    pub conservative_misses: MissRows<ExactMiss>,
     pub frontier_build_micros: u64,
     pub full_universe_scan_micros: u64,
     pub posting_finalize_micros: u64,
     pub oracle_score_micros: u64,
     pub full_scan_equivalents_micros: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SharedTokenExactMiss {
-    pub token_id: u32,
-    pub left_contract: u32,
-    pub right_contract: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -297,8 +452,99 @@ pub struct SharedTokenExactEvidence {
     pub holdout_exact_matches: u64,
     pub calibration_clusters: Vec<ExactEvidenceCluster>,
     pub holdout_clusters: Vec<ExactEvidenceCluster>,
-    pub calibration_misses: Vec<SharedTokenExactMiss>,
-    pub holdout_misses: Vec<SharedTokenExactMiss>,
+    pub scratch_fallback_tokens: Vec<u32>,
+    pub calibration_misses: MissRows<SharedTokenExactMiss>,
+    pub holdout_misses: MissRows<SharedTokenExactMiss>,
+}
+
+const PAIR_MISS_FILE: &str = "pair-misses.u32";
+const SHARED_CALIBRATION_MISS_FILE: &str = "calibration-misses.u32";
+const SHARED_HOLDOUT_MISS_FILE: &str = "holdout-misses.u32";
+
+#[derive(Serialize)]
+struct PairExactEvidenceReadyRef<'a> {
+    artifact_revision: u32,
+    match_semantics_revision: u32,
+    snapshot_fingerprint: &'a str,
+    sampling_policy_digest: &'a str,
+    universe_atoms: u64,
+    sampled_lefts: &'a [u32],
+    pair_work: u64,
+    exact_matches: u64,
+    clusters: &'a [ExactEvidenceCluster],
+    conservative_miss_count: usize,
+    conservative_miss_file: &'static str,
+    frontier_build_micros: u64,
+    full_universe_scan_micros: u64,
+    posting_finalize_micros: u64,
+    oracle_score_micros: u64,
+    full_scan_equivalents_micros: u64,
+}
+
+#[derive(Deserialize)]
+struct PairExactEvidenceReady {
+    artifact_revision: u32,
+    match_semantics_revision: u32,
+    snapshot_fingerprint: String,
+    sampling_policy_digest: String,
+    universe_atoms: u64,
+    sampled_lefts: Vec<u32>,
+    pair_work: u64,
+    exact_matches: u64,
+    clusters: Vec<ExactEvidenceCluster>,
+    conservative_miss_count: usize,
+    conservative_miss_file: String,
+    frontier_build_micros: u64,
+    full_universe_scan_micros: u64,
+    posting_finalize_micros: u64,
+    oracle_score_micros: u64,
+    full_scan_equivalents_micros: u64,
+}
+
+#[derive(Serialize)]
+struct SharedTokenExactEvidenceReadyRef<'a> {
+    artifact_revision: u32,
+    match_semantics_revision: u32,
+    snapshot_fingerprint: &'a str,
+    sampling_policy_digest: &'a str,
+    calibration_tokens: &'a [u32],
+    holdout_tokens: &'a [u32],
+    pair_work: u64,
+    calibration_pair_work: u64,
+    holdout_pair_work: u64,
+    exact_matches: u64,
+    calibration_exact_matches: u64,
+    holdout_exact_matches: u64,
+    calibration_clusters: &'a [ExactEvidenceCluster],
+    holdout_clusters: &'a [ExactEvidenceCluster],
+    scratch_fallback_tokens: &'a [u32],
+    calibration_miss_count: usize,
+    calibration_miss_file: &'static str,
+    holdout_miss_count: usize,
+    holdout_miss_file: &'static str,
+}
+
+#[derive(Deserialize)]
+struct SharedTokenExactEvidenceReady {
+    artifact_revision: u32,
+    match_semantics_revision: u32,
+    snapshot_fingerprint: String,
+    sampling_policy_digest: String,
+    calibration_tokens: Vec<u32>,
+    holdout_tokens: Vec<u32>,
+    pair_work: u64,
+    calibration_pair_work: u64,
+    holdout_pair_work: u64,
+    exact_matches: u64,
+    calibration_exact_matches: u64,
+    holdout_exact_matches: u64,
+    calibration_clusters: Vec<ExactEvidenceCluster>,
+    holdout_clusters: Vec<ExactEvidenceCluster>,
+    scratch_fallback_tokens: Vec<u32>,
+    calibration_miss_count: usize,
+    calibration_miss_file: String,
+    holdout_miss_count: usize,
+    holdout_miss_file: String,
 }
 
 fn cluster_total(clusters: &[ExactEvidenceCluster]) -> Option<u64> {
@@ -420,7 +666,16 @@ fn shared_evidence_is_consistent(
         .all(|token| evidence.holdout_tokens.binary_search(token).is_err());
     let calibration_population = shared_pair_work(snapshot, &evidence.calibration_tokens);
     let holdout_population = shared_pair_work(snapshot, &evidence.holdout_tokens);
+    let scratch_fallbacks_are_valid = evidence
+        .scratch_fallback_tokens
+        .windows(2)
+        .all(|pair| pair[0] < pair[1])
+        && evidence.scratch_fallback_tokens.iter().all(|token| {
+            evidence.calibration_tokens.binary_search(token).is_ok()
+                || evidence.holdout_tokens.binary_search(token).is_ok()
+        });
     tokens_are_disjoint
+        && scratch_fallbacks_are_valid
         && evidence
             .calibration_tokens
             .windows(2)
@@ -482,6 +737,266 @@ pub enum ExactIslandError {
     Json(#[from] serde_json::Error),
 }
 
+struct ResidentMissBudget {
+    max_records: usize,
+    used_records: Mutex<usize>,
+}
+
+impl ResidentMissBudget {
+    fn for_record<T>(max_bytes: u64) -> Self {
+        let record_bytes = std::mem::size_of::<T>().max(1) as u64;
+        Self {
+            max_records: usize::try_from(max_bytes / record_bytes).unwrap_or(usize::MAX),
+            used_records: Mutex::new(0),
+        }
+    }
+
+    fn try_reserve(&self, records: usize) -> bool {
+        let mut used = self.used_records.lock().expect("resident miss budget");
+        let Some(next) = used.checked_add(records) else {
+            return false;
+        };
+        if next > self.max_records {
+            return false;
+        }
+        *used = next;
+        true
+    }
+
+    fn release(&self, records: usize) {
+        let mut used = self.used_records.lock().expect("resident miss budget");
+        *used = used.saturating_sub(records);
+    }
+}
+
+static MISS_WORKSPACE_ID: AtomicU64 = AtomicU64::new(0);
+
+fn miss_workspace(
+    output_dir: Option<&Path>,
+    label: &str,
+) -> Result<Arc<MissWorkspace>, ExactIslandError> {
+    let (root, cleanup) = if let Some(output_dir) = output_dir {
+        (output_dir.to_path_buf(), false)
+    } else {
+        let id = MISS_WORKSPACE_ID.fetch_add(1, Ordering::Relaxed);
+        (
+            std::env::temp_dir().join(format!(
+                "metadata-exact-{label}-{}-{id}",
+                std::process::id()
+            )),
+            true,
+        )
+    };
+    std::fs::create_dir_all(&root).map_err(format::FormatError::from)?;
+    Ok(Arc::new(MissWorkspace { root, cleanup }))
+}
+
+struct MissSpoolState<T> {
+    resident: Vec<T>,
+    runs: Vec<PathBuf>,
+    next_run: usize,
+}
+
+struct MissSpool<T> {
+    state: Mutex<MissSpoolState<T>>,
+    budget: Arc<ResidentMissBudget>,
+    workspace: Arc<MissWorkspace>,
+    prefix: &'static str,
+}
+
+impl<T: MissRecord> MissSpool<T> {
+    fn new(
+        budget: Arc<ResidentMissBudget>,
+        workspace: Arc<MissWorkspace>,
+        prefix: &'static str,
+    ) -> Self {
+        Self {
+            state: Mutex::new(MissSpoolState {
+                resident: Vec::new(),
+                runs: Vec::new(),
+                next_run: 0,
+            }),
+            budget,
+            workspace,
+            prefix,
+        }
+    }
+
+    fn push_chunk(&self, mut chunk: Vec<T>) -> Result<(), ExactIslandError> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ExactIslandError::Parallel("miss spool lock poisoned".into()))?;
+        if state.runs.is_empty() && self.budget.try_reserve(chunk.len()) {
+            if state.resident.try_reserve_exact(chunk.len()).is_ok() {
+                state.resident.append(&mut chunk);
+                return Ok(());
+            }
+            self.budget.release(chunk.len());
+        }
+        if !state.resident.is_empty() {
+            let resident = std::mem::take(&mut state.resident);
+            self.budget.release(resident.len());
+            self.write_run(&mut state, resident)?;
+        }
+        self.write_run(&mut state, chunk)
+    }
+
+    fn write_run(
+        &self,
+        state: &mut MissSpoolState<T>,
+        mut rows: Vec<T>,
+    ) -> Result<(), ExactIslandError> {
+        rows.sort_unstable();
+        rows.dedup();
+        let path = self
+            .workspace
+            .root
+            .join(format!("{}-run-{:06}.u32", self.prefix, state.next_run));
+        state.next_run = state.next_run.saturating_add(1);
+        write_miss_rows(&path, &rows)?;
+        state.runs.push(path);
+        Ok(())
+    }
+
+    fn finish(
+        &self,
+        final_name: &'static str,
+        persist_resident: bool,
+    ) -> Result<MissRows<T>, ExactIslandError> {
+        let (mut resident, mut runs) = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| ExactIslandError::Parallel("miss spool lock poisoned".into()))?;
+            (
+                std::mem::take(&mut state.resident),
+                std::mem::take(&mut state.runs),
+            )
+        };
+        self.budget.release(resident.len());
+        resident.sort_unstable();
+        resident.dedup();
+        if runs.is_empty() && !persist_resident {
+            return Ok(resident.into());
+        }
+        if !resident.is_empty() {
+            let path = self
+                .workspace
+                .root
+                .join(format!("{}-run-final.u32", self.prefix));
+            write_miss_rows(&path, &resident)?;
+            runs.push(path);
+        }
+        let final_path = self.workspace.root.join(final_name);
+        let row_count = if runs.is_empty() {
+            write_miss_rows::<T>(&final_path, &[])?;
+            0
+        } else {
+            merge_miss_runs::<T>(&runs, &final_path)?
+        };
+        let mapped = MissRows::mapped(&final_path, row_count, self.workspace.clone())?;
+        for run in runs {
+            let _ = std::fs::remove_file(run);
+        }
+        Ok(mapped)
+    }
+}
+
+fn write_miss_rows<T: MissRecord>(path: &Path, rows: &[T]) -> Result<(), ExactIslandError> {
+    let words = (rows.len() as u64)
+        .checked_mul(T::WIDTH as u64)
+        .ok_or(format::FormatError::PayloadLengthOverflow)?;
+    crate::format::write_u32_iter(
+        path,
+        crate::format::ArrayKind::U32,
+        words,
+        rows.iter()
+            .copied()
+            .flat_map(|row| (0..T::WIDTH).map(move |index| row.word(index))),
+    )?;
+    Ok(())
+}
+
+fn mapped_miss_row<T: MissRecord>(words: &crate::format::MappedU32Array, row: usize) -> T {
+    // SAFETY: run files are produced only by `write_miss_rows`, and callers
+    // validate that the u32 element count is an exact multiple of T::WIDTH.
+    unsafe { *words.as_ptr().add(row * T::WIDTH).cast::<T>() }
+}
+
+fn visit_merged_miss_runs<T: MissRecord>(
+    runs: &[crate::format::MappedU32Array],
+    mut visit: impl FnMut(T) -> Result<(), ExactIslandError>,
+) -> Result<(), ExactIslandError> {
+    let mut positions = vec![0usize; runs.len()];
+    let mut heap = BinaryHeap::<Reverse<(T, usize)>>::new();
+    for (run, words) in runs.iter().enumerate() {
+        if !words.len().is_multiple_of(T::WIDTH) {
+            return Err(format::FormatError::InvalidHeader.into());
+        }
+        if !words.is_empty() {
+            heap.push(Reverse((mapped_miss_row::<T>(words, 0), run)));
+        }
+    }
+    let mut previous = None;
+    while let Some(Reverse((row, run))) = heap.pop() {
+        if previous != Some(row) {
+            visit(row)?;
+            previous = Some(row);
+        }
+        positions[run] += 1;
+        if positions[run] < runs[run].len() / T::WIDTH {
+            heap.push(Reverse((
+                mapped_miss_row::<T>(&runs[run], positions[run]),
+                run,
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn merge_miss_runs<T: MissRecord>(
+    run_paths: &[PathBuf],
+    final_path: &Path,
+) -> Result<usize, ExactIslandError> {
+    let runs = run_paths
+        .iter()
+        .map(|path| crate::format::map_u32_array(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut row_count = 0u64;
+    visit_merged_miss_runs::<T>(&runs, |_| {
+        row_count = row_count.checked_add(1).ok_or(ExactIslandError::Budget {
+            resource: "external_miss_rows",
+            requested: u64::MAX,
+            limit: u64::MAX - 1,
+        })?;
+        Ok(())
+    })?;
+    let word_count = row_count
+        .checked_mul(T::WIDTH as u64)
+        .ok_or(format::FormatError::PayloadLengthOverflow)?;
+    let mut sink = crate::format::TypedArraySink::create(
+        final_path,
+        crate::format::ArrayKind::U32,
+        word_count,
+    )?;
+    visit_merged_miss_runs::<T>(&runs, |row| {
+        for index in 0..T::WIDTH {
+            sink.push_u32(row.word(index))?;
+        }
+        Ok(())
+    })?;
+    sink.finish()?;
+    usize::try_from(row_count).map_err(|_| ExactIslandError::Budget {
+        resource: "external_miss_rows",
+        requested: row_count,
+        limit: usize::MAX as u64,
+    })
+}
+
 pub fn open_pair_exact_evidence(
     directory: &Path,
     snapshot: &MetadataSnapshot,
@@ -497,7 +1012,37 @@ pub fn open_pair_exact_evidence(
         std::fs::remove_file(ready).map_err(format::FormatError::from)?;
         return Ok(None);
     }
-    let evidence: PairExactEvidence = serde_json::from_slice(&bytes)?;
+    let ready_evidence: PairExactEvidenceReady = serde_json::from_slice(&bytes)?;
+    if ready_evidence.conservative_miss_file != PAIR_MISS_FILE {
+        std::fs::remove_file(ready).map_err(format::FormatError::from)?;
+        return Ok(None);
+    }
+    let workspace = Arc::new(MissWorkspace {
+        root: directory.to_path_buf(),
+        cleanup: false,
+    });
+    let conservative_misses = MissRows::mapped(
+        &directory.join(PAIR_MISS_FILE),
+        ready_evidence.conservative_miss_count,
+        workspace,
+    )?;
+    let evidence = PairExactEvidence {
+        artifact_revision: ready_evidence.artifact_revision,
+        match_semantics_revision: ready_evidence.match_semantics_revision,
+        snapshot_fingerprint: ready_evidence.snapshot_fingerprint,
+        sampling_policy_digest: ready_evidence.sampling_policy_digest,
+        universe_atoms: ready_evidence.universe_atoms,
+        sampled_lefts: ready_evidence.sampled_lefts,
+        pair_work: ready_evidence.pair_work,
+        exact_matches: ready_evidence.exact_matches,
+        clusters: ready_evidence.clusters,
+        conservative_misses,
+        frontier_build_micros: ready_evidence.frontier_build_micros,
+        full_universe_scan_micros: ready_evidence.full_universe_scan_micros,
+        posting_finalize_micros: ready_evidence.posting_finalize_micros,
+        oracle_score_micros: ready_evidence.oracle_score_micros,
+        full_scan_equivalents_micros: ready_evidence.full_scan_equivalents_micros,
+    };
     let mut expected = sampled_lefts.to_vec();
     expected.sort_unstable();
     expected.dedup();
@@ -530,7 +1075,46 @@ pub fn open_shared_token_exact_evidence(
         std::fs::remove_file(ready).map_err(format::FormatError::from)?;
         return Ok(None);
     }
-    let evidence: SharedTokenExactEvidence = serde_json::from_slice(&bytes)?;
+    let ready_evidence: SharedTokenExactEvidenceReady = serde_json::from_slice(&bytes)?;
+    if ready_evidence.calibration_miss_file != SHARED_CALIBRATION_MISS_FILE
+        || ready_evidence.holdout_miss_file != SHARED_HOLDOUT_MISS_FILE
+    {
+        std::fs::remove_file(ready).map_err(format::FormatError::from)?;
+        return Ok(None);
+    }
+    let workspace = Arc::new(MissWorkspace {
+        root: directory.to_path_buf(),
+        cleanup: false,
+    });
+    let calibration_misses = MissRows::mapped(
+        &directory.join(SHARED_CALIBRATION_MISS_FILE),
+        ready_evidence.calibration_miss_count,
+        workspace.clone(),
+    )?;
+    let holdout_misses = MissRows::mapped(
+        &directory.join(SHARED_HOLDOUT_MISS_FILE),
+        ready_evidence.holdout_miss_count,
+        workspace,
+    )?;
+    let evidence = SharedTokenExactEvidence {
+        artifact_revision: ready_evidence.artifact_revision,
+        match_semantics_revision: ready_evidence.match_semantics_revision,
+        snapshot_fingerprint: ready_evidence.snapshot_fingerprint,
+        sampling_policy_digest: ready_evidence.sampling_policy_digest,
+        calibration_tokens: ready_evidence.calibration_tokens,
+        holdout_tokens: ready_evidence.holdout_tokens,
+        pair_work: ready_evidence.pair_work,
+        calibration_pair_work: ready_evidence.calibration_pair_work,
+        holdout_pair_work: ready_evidence.holdout_pair_work,
+        exact_matches: ready_evidence.exact_matches,
+        calibration_exact_matches: ready_evidence.calibration_exact_matches,
+        holdout_exact_matches: ready_evidence.holdout_exact_matches,
+        calibration_clusters: ready_evidence.calibration_clusters,
+        holdout_clusters: ready_evidence.holdout_clusters,
+        scratch_fallback_tokens: ready_evidence.scratch_fallback_tokens,
+        calibration_misses,
+        holdout_misses,
+    };
     let mut expected_calibration = calibration_tokens.to_vec();
     expected_calibration.sort_unstable();
     expected_calibration.dedup();
@@ -753,16 +1337,14 @@ pub fn run_shared_token_exact_islands_with_progress(
     // use one third; the remaining two thirds bound concurrent routing/tile
     // scratch. Large groups still exploit the full Rayon pool internally.
     let scratch_bytes = budget.max_artifact_bytes.saturating_mul(2);
-    checked(
-        "shared_token_group_scratch",
-        max_group_scratch_bytes,
-        scratch_bytes,
-    )?;
     let concurrent_group_lanes = scratch_bytes
         .checked_div(max_group_scratch_bytes)
         .map_or(budget.max_lanes.max(1), |lanes| {
             lanes.max(1).min(budget.max_lanes.max(1) as u64) as usize
         });
+    let routing_scratch_budget_per_group = scratch_bytes
+        .checked_div(concurrent_group_lanes.max(1) as u64)
+        .unwrap_or_default();
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(budget.max_lanes.max(1))
         .thread_name(|index| format!("metadata-shared-exact-{index}"))
@@ -781,12 +1363,23 @@ pub fn run_shared_token_exact_islands_with_progress(
         },
     }
     let (sender, receiver) = std::sync::mpsc::sync_channel(lanes.saturating_mul(4).max(1));
-    // Misses survive until evidence finalization, so admission must be global to
-    // the scan rather than evenly partitioned between lanes. A static per-group
-    // slice rejects a skewed group even when the stage still has almost all of
-    // its memory available.
-    let shared_miss_budget =
-        InMemoryMissBudget::for_record::<SharedTokenExactMiss>(budget.max_artifact_bytes);
+    // Calibration and holdout share one resident envelope. Either partition
+    // may use all available miss memory; overflow is sorted into checksummed
+    // runs instead of cancelling the ExactEvidence scan.
+    let shared_miss_workspace = miss_workspace(output_dir, "shared")?;
+    let shared_miss_budget = Arc::new(ResidentMissBudget::for_record::<SharedTokenExactMiss>(
+        budget.max_artifact_bytes,
+    ));
+    let calibration_miss_spool = Arc::new(MissSpool::<SharedTokenExactMiss>::new(
+        shared_miss_budget.clone(),
+        shared_miss_workspace.clone(),
+        "calibration-misses",
+    ));
+    let holdout_miss_spool = Arc::new(MissSpool::<SharedTokenExactMiss>::new(
+        shared_miss_budget,
+        shared_miss_workspace,
+        "holdout-misses",
+    ));
     let (
         pair_work,
         calibration_pair_work,
@@ -795,21 +1388,28 @@ pub fn run_shared_token_exact_islands_with_progress(
         holdout_exact_matches,
         mut calibration_clusters,
         mut holdout_clusters,
-        mut calibration_misses,
-        mut holdout_misses,
+        mut scratch_fallback_tokens,
     ) = std::thread::scope(|scope| -> Result<_, ExactIslandError> {
         let worker_sender = sender.clone();
+        let calibration_worker_spool = calibration_miss_spool.clone();
+        let holdout_worker_spool = holdout_miss_spool.clone();
         let worker = scope.spawn(move || {
             pool.install(|| {
                 for wave in groups.chunks(concurrent_group_lanes.max(1)) {
                     wave.par_iter()
                         .for_each(|&(token, is_calibration, sample_work)| {
+                            let miss_spool = if is_calibration {
+                                &calibration_worker_spool
+                            } else {
+                                &holdout_worker_spool
+                            };
                             let result = scan_shared_token_group(
                                 snapshot,
                                 token,
                                 sample_work,
                                 budget,
-                                &shared_miss_budget,
+                                routing_scratch_budget_per_group,
+                                miss_spool,
                                 |work| {
                                     let _ = worker_sender.send(SharedScanMessage::Work {
                                         work,
@@ -834,8 +1434,7 @@ pub fn run_shared_token_exact_islands_with_progress(
         let mut holdout_exact_matches = 0u64;
         let mut calibration_clusters = Vec::new();
         let mut holdout_clusters = Vec::new();
-        let mut calibration_misses = Vec::new();
-        let mut holdout_misses = Vec::new();
+        let mut scratch_fallback_tokens = Vec::new();
         let mut completed_groups = 0u64;
         for message in receiver {
             let (token, is_calibration, result) = match message {
@@ -884,23 +1483,9 @@ pub fn run_shared_token_exact_islands_with_progress(
                     exact_matches: result.exact_matches,
                 });
             }
-            let next_bytes = calibration_misses
-                .len()
-                .saturating_add(holdout_misses.len())
-                .saturating_add(result.misses.len())
-                .saturating_mul(std::mem::size_of::<SharedTokenExactMiss>())
-                as u64;
-            checked(
-                "in_memory_miss_bytes",
-                next_bytes,
-                budget.max_artifact_bytes,
-            )?;
-            let target = if is_calibration {
-                &mut calibration_misses
-            } else {
-                &mut holdout_misses
-            };
-            target.extend(result.misses);
+            if result.scratch_fallback {
+                scratch_fallback_tokens.push(token);
+            }
             completed_groups = completed_groups.saturating_add(1);
             progress(ProgressEvent::determinate(
                 ProgressPhase::SharedTokenExactIsland,
@@ -925,8 +1510,7 @@ pub fn run_shared_token_exact_islands_with_progress(
             holdout_exact_matches,
             calibration_clusters,
             holdout_clusters,
-            calibration_misses,
-            holdout_misses,
+            scratch_fallback_tokens,
         ))
     })?;
     let finalize_total = 1 + u64::from(output_dir.is_some());
@@ -939,12 +1523,14 @@ pub fn run_shared_token_exact_islands_with_progress(
     ));
     calibration.shrink_to_fit();
     holdout.shrink_to_fit();
-    calibration_misses
-        .sort_unstable_by_key(|miss| (miss.token_id, miss.left_contract, miss.right_contract));
-    holdout_misses
-        .sort_unstable_by_key(|miss| (miss.token_id, miss.left_contract, miss.right_contract));
+    let calibration_misses =
+        calibration_miss_spool.finish(SHARED_CALIBRATION_MISS_FILE, output_dir.is_some())?;
+    let holdout_misses =
+        holdout_miss_spool.finish(SHARED_HOLDOUT_MISS_FILE, output_dir.is_some())?;
     calibration_clusters.sort_unstable_by_key(|cluster| cluster.id);
     holdout_clusters.sort_unstable_by_key(|cluster| cluster.id);
+    scratch_fallback_tokens.sort_unstable();
+    scratch_fallback_tokens.dedup();
     let evidence = SharedTokenExactEvidence {
         artifact_revision: EVIDENCE_ARTIFACT_REVISION,
         match_semantics_revision: crate::scoring::MATCH_SEMANTICS_REVISION,
@@ -960,6 +1546,7 @@ pub fn run_shared_token_exact_islands_with_progress(
         holdout_exact_matches,
         calibration_clusters,
         holdout_clusters,
+        scratch_fallback_tokens,
         calibration_misses,
         holdout_misses,
     };
@@ -976,18 +1563,28 @@ pub fn run_shared_token_exact_islands_with_progress(
         ProgressCounters::default(),
     ));
     if let Some(dir) = output_dir {
-        let bytes = serde_json::to_vec(&evidence)?;
-        checked(
-            "artifact_bytes",
-            bytes.len() as u64,
-            budget.max_artifact_bytes,
-        )?;
-        std::fs::create_dir_all(dir).map_err(format::FormatError::from)?;
-        crate::format::commit_ready(
-            dir,
-            "ready",
-            std::str::from_utf8(&bytes).expect("JSON is UTF-8"),
-        )?;
+        let ready = SharedTokenExactEvidenceReadyRef {
+            artifact_revision: evidence.artifact_revision,
+            match_semantics_revision: evidence.match_semantics_revision,
+            snapshot_fingerprint: &evidence.snapshot_fingerprint,
+            sampling_policy_digest: &evidence.sampling_policy_digest,
+            calibration_tokens: &evidence.calibration_tokens,
+            holdout_tokens: &evidence.holdout_tokens,
+            pair_work: evidence.pair_work,
+            calibration_pair_work: evidence.calibration_pair_work,
+            holdout_pair_work: evidence.holdout_pair_work,
+            exact_matches: evidence.exact_matches,
+            calibration_exact_matches: evidence.calibration_exact_matches,
+            holdout_exact_matches: evidence.holdout_exact_matches,
+            calibration_clusters: &evidence.calibration_clusters,
+            holdout_clusters: &evidence.holdout_clusters,
+            scratch_fallback_tokens: &evidence.scratch_fallback_tokens,
+            calibration_miss_count: evidence.calibration_misses.len(),
+            calibration_miss_file: SHARED_CALIBRATION_MISS_FILE,
+            holdout_miss_count: evidence.holdout_misses.len(),
+            holdout_miss_file: SHARED_HOLDOUT_MISS_FILE,
+        };
+        crate::format::commit_ready_serialized(dir, "ready", &ready)?;
     }
     progress(ProgressEvent::determinate(
         ProgressPhase::SharedTokenExactFinalize,
@@ -1011,57 +1608,13 @@ fn normalized_tokens(tokens: &[u32], token_count: usize) -> Result<Vec<u32>, Exa
 
 struct SharedTokenGroupScan {
     exact_matches: u64,
-    misses: Vec<SharedTokenExactMiss>,
-}
-
-struct InMemoryMissBudget {
-    reserved: AtomicU64,
-    max_misses: u64,
-    miss_bytes: u64,
-    max_bytes: u64,
-    cancelled: AtomicBool,
-}
-
-impl InMemoryMissBudget {
-    fn for_record<T>(max_bytes: u64) -> Self {
-        let miss_bytes = std::mem::size_of::<T>() as u64;
-        Self {
-            reserved: AtomicU64::new(0),
-            max_misses: max_bytes / miss_bytes.max(1),
-            miss_bytes,
-            max_bytes,
-            cancelled: AtomicBool::new(false),
-        }
-    }
-
-    fn reserve(&self) -> Result<(), ExactIslandError> {
-        let mut current = self.reserved.load(Ordering::Acquire);
-        loop {
-            if current >= self.max_misses {
-                self.cancelled.store(true, Ordering::Release);
-                return Err(ExactIslandError::Budget {
-                    resource: "in_memory_miss_bytes",
-                    requested: current.saturating_add(1).saturating_mul(self.miss_bytes),
-                    limit: self.max_bytes,
-                });
-            }
-            match self.reserved.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Ok(()),
-                Err(observed) => current = observed,
-            }
-        }
-    }
+    scratch_fallback: bool,
 }
 
 impl SharedTokenGroupScan {
-    fn merge(mut self, mut other: Self) -> Self {
+    fn merge(mut self, other: Self) -> Self {
         self.exact_matches = self.exact_matches.saturating_add(other.exact_matches);
-        self.misses.append(&mut other.misses);
+        self.scratch_fallback |= other.scratch_fallback;
         self
     }
 }
@@ -1077,7 +1630,7 @@ struct SharedTokenPairTile {
 fn shared_group_scratch_upper_bound(
     snapshot: &MetadataSnapshot,
     token: u32,
-    sample_work: u64,
+    _sample_work: u64,
 ) -> Result<u64, ExactIslandError> {
     let features = snapshot.features();
     let begin = features.token_member_offsets[token as usize] as usize;
@@ -1102,28 +1655,9 @@ fn shared_group_scratch_upper_bound(
         });
     };
     let members = sources.len() as u64;
-    let population_work = members.saturating_mul(members.saturating_sub(1)) / 2;
-    let tile_count = if sample_work < population_work {
-        0
-    } else {
-        let tile_side = sources.len().div_ceil(SHARED_PAIR_TILE_MEMBERS) as u64;
-        tile_side
-            .checked_mul(tile_side.saturating_add(1))
-            .and_then(|value| value.checked_div(2))
-            .ok_or(ExactIslandError::Budget {
-                resource: "shared_token_group_scratch",
-                requested: u64::MAX,
-                limit: u64::MAX - 1,
-            })?
-    };
     members
         .checked_mul(384)
         .and_then(|bytes| bytes.checked_add(term_memberships.saturating_mul(8)))
-        .and_then(|bytes| {
-            bytes.checked_add(
-                tile_count.saturating_mul(std::mem::size_of::<SharedTokenPairTile>() as u64),
-            )
-        })
         .ok_or(ExactIslandError::Budget {
             resource: "shared_token_group_scratch",
             requested: u64::MAX,
@@ -1131,6 +1665,7 @@ fn shared_group_scratch_upper_bound(
         })
 }
 
+#[cfg(test)]
 fn shared_token_pair_tiles(member_count: usize, tile_members: usize) -> Vec<SharedTokenPairTile> {
     let tile_members = tile_members.max(1);
     let side = member_count.div_ceil(tile_members);
@@ -1155,23 +1690,18 @@ fn scan_shared_token_group(
     token: u32,
     sample_work: u64,
     budget: ExactEvidenceBudget,
-    shared_miss_budget: &InMemoryMissBudget,
+    routing_scratch_budget: u64,
+    miss_spool: &MissSpool<SharedTokenExactMiss>,
     report_work: impl Fn(u64) + Sync,
 ) -> Result<SharedTokenGroupScan, ExactIslandError> {
+    const MISS_BATCH: usize = 4_096;
+    const MAX_PAYLOAD_CACHE_ENTRIES: usize = 65_536;
     const PROGRESS_CHUNK: u64 = 65_536;
     let features = snapshot.features();
     let begin = features.token_member_offsets[token as usize] as usize;
     let end = features.token_member_offsets[token as usize + 1] as usize;
     let contracts = &features.token_member_contracts[begin..end];
     let sources = &features.token_member_sources[begin..end];
-    let member_payloads = sources
-        .iter()
-        .map(|&source| features.source_to_payload[source as usize])
-        .collect::<Vec<_>>();
-    let mut unique_payloads = member_payloads.clone();
-    unique_payloads.sort_unstable();
-    unique_payloads.dedup();
-    let cache_payload_scores = unique_payloads.len() < member_payloads.len();
     let members = contracts.len() as u64;
     let group_work = members
         .checked_mul(members.saturating_sub(1))
@@ -1185,148 +1715,159 @@ fn scan_shared_token_group(
     if sample_work == 0 {
         return Ok(SharedTokenGroupScan {
             exact_matches: 0,
-            misses: Vec::new(),
+            scratch_fallback: false,
         });
     }
 
-    let routing = if contracts.len() < 256 {
+    let routing_scratch =
+        shared_group_scratch_upper_bound(snapshot, token, sample_work).unwrap_or(u64::MAX);
+    let scratch_fallback = contracts.len() >= 256 && routing_scratch > routing_scratch_budget;
+    let member_payloads = (!scratch_fallback).then(|| {
+        sources
+            .iter()
+            .map(|&source| features.source_to_payload[source as usize])
+            .collect::<Vec<_>>()
+    });
+    let cache_payload_scores = member_payloads.as_ref().is_none_or(|payloads| {
+        let mut unique_payloads = payloads.clone();
+        unique_payloads.sort_unstable();
+        unique_payloads.dedup();
+        unique_payloads.len() < payloads.len()
+    });
+    let routing = if contracts.len() < 256 || scratch_fallback {
         None
     } else {
+        let member_payloads = member_payloads
+            .as_ref()
+            .expect("routed shared group materializes member payload ids");
         let sketches = build_base_equivalent_atom_sketches_from_feature_view_parallel(
             features,
-            &member_payloads,
+            member_payloads,
         );
         let plan = LocalRoutingPlan::build_parallel(&sketches);
         Some((sketches, plan))
     };
+    let payload_at = |index: usize| {
+        member_payloads.as_ref().map_or_else(
+            || features.source_to_payload[sources[index] as usize],
+            |payloads| payloads[index],
+        )
+    };
+    let is_routing_miss = |left: usize, right: usize| {
+        scratch_fallback
+            || routing.as_ref().is_some_and(|(sketches, plan)| {
+                !plan.routes_pair(sketches, left as u32, right as u32)
+            })
+    };
+    let score_cached =
+        |payload_scores: &mut HashMap<u64, bool>, left_payload: u32, right_payload: u32| {
+            if !cache_payload_scores {
+                return score_pair(features, left_payload, right_payload)
+                    == PairScoreDecision::ExactMatch;
+            }
+            let key = payload_pair_key(left_payload, right_payload);
+            if let Some(&decision) = payload_scores.get(&key) {
+                return decision;
+            }
+            let decision =
+                score_pair(features, left_payload, right_payload) == PairScoreDecision::ExactMatch;
+            if payload_scores.len() < MAX_PAYLOAD_CACHE_ENTRIES {
+                payload_scores.insert(key, decision);
+            }
+            decision
+        };
+    let push_miss = |misses: &mut Vec<SharedTokenExactMiss>,
+                     left: usize,
+                     right: usize|
+     -> Result<(), ExactIslandError> {
+        misses.push(SharedTokenExactMiss {
+            token_id: token,
+            left_contract: contracts[left].min(contracts[right]),
+            right_contract: contracts[left].max(contracts[right]),
+        });
+        if misses.len() == MISS_BATCH {
+            miss_spool.push_chunk(std::mem::replace(misses, Vec::with_capacity(MISS_BATCH)))?;
+        }
+        Ok(())
+    };
     if sample_work < group_work {
         let start = adaptive_pair_seed(token, 0x9E37_79B9) % group_work;
         let step = coprime_pair_step(group_work, adaptive_pair_seed(token, 0x85EB_CA6B));
-        let result = (0..sample_work)
+        let chunks = sample_work.div_ceil(PROGRESS_CHUNK);
+        return (0..chunks)
             .into_par_iter()
-            .try_fold(
-                || {
-                    (
-                        SharedTokenGroupScan {
-                            exact_matches: 0,
-                            misses: Vec::new(),
-                        },
-                        HashMap::<u64, bool>::new(),
-                        0u64,
-                    )
-                },
-                |(mut result, mut payload_scores, mut pending_work), sample| {
-                    if shared_miss_budget.cancelled.load(Ordering::Acquire) {
-                        return Ok((result, payload_scores, pending_work));
-                    }
+            .map(|chunk| -> Result<SharedTokenGroupScan, ExactIslandError> {
+                let first = chunk.saturating_mul(PROGRESS_CHUNK);
+                let end = first.saturating_add(PROGRESS_CHUNK).min(sample_work);
+                let mut result = SharedTokenGroupScan {
+                    exact_matches: 0,
+                    scratch_fallback,
+                };
+                let mut payload_scores = HashMap::<u64, bool>::new();
+                let mut misses = Vec::with_capacity(MISS_BATCH);
+                for sample in first..end {
                     let ordinal = (u128::from(start)
                         + u128::from(sample).saturating_mul(u128::from(step)))
                         % u128::from(group_work);
                     let (left, right) = triangular_pair(contracts.len(), ordinal as u64);
-                    let left_payload = member_payloads[left];
-                    let right_payload = member_payloads[right];
-                    let key = payload_pair_key(left_payload, right_payload);
-                    let exact_match = *payload_scores.entry(key).or_insert_with(|| {
-                        score_pair(features, left_payload, right_payload)
-                            == PairScoreDecision::ExactMatch
-                    });
-                    if exact_match {
+                    if score_cached(&mut payload_scores, payload_at(left), payload_at(right)) {
                         result.exact_matches = result.exact_matches.saturating_add(1);
-                        if routing.as_ref().is_some_and(|(sketches, plan)| {
-                            !plan.routes_pair(sketches, left as u32, right as u32)
-                        }) {
-                            shared_miss_budget.reserve()?;
-                            result.misses.push(SharedTokenExactMiss {
-                                token_id: token,
-                                left_contract: contracts[left],
-                                right_contract: contracts[right],
-                            });
+                        if is_routing_miss(left, right) {
+                            push_miss(&mut misses, left, right)?;
                         }
                     }
-                    pending_work = pending_work.saturating_add(1);
-                    if pending_work == PROGRESS_CHUNK {
-                        report_work(pending_work);
-                        pending_work = 0;
-                    }
-                    Ok((result, payload_scores, pending_work))
-                },
-            )
-            .try_reduce(
-                || {
-                    (
-                        SharedTokenGroupScan {
-                            exact_matches: 0,
-                            misses: Vec::new(),
-                        },
-                        HashMap::new(),
-                        0u64,
-                    )
-                },
-                |(left, _, left_pending), (right, _, right_pending)| {
-                    let pending_work = left_pending.saturating_add(right_pending);
-                    let remainder = if pending_work >= PROGRESS_CHUNK {
-                        report_work(PROGRESS_CHUNK);
-                        pending_work - PROGRESS_CHUNK
-                    } else {
-                        pending_work
-                    };
-                    Ok((left.merge(right), HashMap::<u64, bool>::new(), remainder))
-                },
-            )
-            .map(|(result, _, pending_work)| {
-                if pending_work != 0 {
-                    report_work(pending_work);
                 }
-                result
-            });
-        if result.is_err() {
-            shared_miss_budget.cancelled.store(true, Ordering::Release);
-        }
-        return result;
+                miss_spool.push_chunk(misses)?;
+                report_work(end.saturating_sub(first));
+                Ok(result)
+            })
+            .try_reduce(
+                || SharedTokenGroupScan {
+                    exact_matches: 0,
+                    scratch_fallback,
+                },
+                |left, right| Ok(left.merge(right)),
+            );
     }
-    let result = shared_token_pair_tiles(contracts.len(), SHARED_PAIR_TILE_MEMBERS)
+    let side = contracts.len().div_ceil(SHARED_PAIR_TILE_MEMBERS);
+    (0..side)
         .into_par_iter()
+        .flat_map_iter(|left_tile| {
+            (left_tile..side).map(move |right_tile| {
+                let left_begin = left_tile * SHARED_PAIR_TILE_MEMBERS;
+                let right_begin = right_tile * SHARED_PAIR_TILE_MEMBERS;
+                SharedTokenPairTile {
+                    left_begin,
+                    left_end: left_begin
+                        .saturating_add(SHARED_PAIR_TILE_MEMBERS)
+                        .min(contracts.len()),
+                    right_begin,
+                    right_end: right_begin
+                        .saturating_add(SHARED_PAIR_TILE_MEMBERS)
+                        .min(contracts.len()),
+                }
+            })
+        })
         .map(|tile| -> Result<SharedTokenGroupScan, ExactIslandError> {
             let mut result = SharedTokenGroupScan {
                 exact_matches: 0,
-                misses: Vec::new(),
+                scratch_fallback,
             };
             let mut pending_work = 0u64;
             let mut payload_scores = HashMap::<u64, bool>::new();
+            let mut misses = Vec::with_capacity(MISS_BATCH);
             for left in tile.left_begin..tile.left_end {
                 let right_begin = tile.right_begin.max(left.saturating_add(1));
                 for right in right_begin..tile.right_end {
-                    if shared_miss_budget.cancelled.load(Ordering::Acquire) {
-                        return Ok(result);
-                    }
                     pending_work = pending_work.saturating_add(1);
                     if pending_work >= PROGRESS_CHUNK {
                         report_work(pending_work);
                         pending_work = 0;
                     }
-                    let left_payload = member_payloads[left];
-                    let right_payload = member_payloads[right];
-                    let key = payload_pair_key(left_payload, right_payload);
-                    let exact_match = if cache_payload_scores {
-                        *payload_scores.entry(key).or_insert_with(|| {
-                            score_pair(features, left_payload, right_payload)
-                                == PairScoreDecision::ExactMatch
-                        })
-                    } else {
-                        score_pair(features, left_payload, right_payload)
-                            == PairScoreDecision::ExactMatch
-                    };
-                    if exact_match {
+                    if score_cached(&mut payload_scores, payload_at(left), payload_at(right)) {
                         result.exact_matches = result.exact_matches.saturating_add(1);
-                        if routing.as_ref().is_some_and(|(sketches, plan)| {
-                            !plan.routes_pair(sketches, left as u32, right as u32)
-                        }) {
-                            shared_miss_budget.reserve()?;
-                            result.misses.push(SharedTokenExactMiss {
-                                token_id: token,
-                                left_contract: contracts[left],
-                                right_contract: contracts[right],
-                            });
+                        if is_routing_miss(left, right) {
+                            push_miss(&mut misses, left, right)?;
                         }
                     }
                 }
@@ -1334,19 +1875,16 @@ fn scan_shared_token_group(
             if pending_work != 0 {
                 report_work(pending_work);
             }
+            miss_spool.push_chunk(misses)?;
             Ok(result)
         })
         .try_reduce(
             || SharedTokenGroupScan {
                 exact_matches: 0,
-                misses: Vec::new(),
+                scratch_fallback,
             },
             |left, right| Ok(left.merge(right)),
-        );
-    if result.is_err() {
-        shared_miss_budget.cancelled.store(true, Ordering::Release);
-    }
-    result
+        )
 }
 
 fn adaptive_pair_seed(token: u32, salt: u64) -> u64 {
@@ -1462,21 +2000,28 @@ pub fn run_pair_exact_island_with_progress(
         Work(u64),
         Done {
             left: u32,
-            result: Result<(u64, Vec<ExactMiss>), ExactIslandError>,
+            result: Result<u64, ExactIslandError>,
         },
     }
     let (sender, receiver) = std::sync::mpsc::sync_channel(lanes.saturating_mul(4).max(1));
-    let pair_miss_budget = InMemoryMissBudget::for_record::<ExactMiss>(budget.max_artifact_bytes);
+    let pair_miss_workspace = miss_workspace(output_dir, "pair")?;
+    let pair_miss_spool = Arc::new(MissSpool::<ExactMiss>::new(
+        Arc::new(ResidentMissBudget::for_record::<ExactMiss>(
+            budget.max_artifact_bytes,
+        )),
+        pair_miss_workspace,
+        "pair-misses",
+    ));
     let atom_payloads = (0..snapshot.atom_count() as u32)
         .map(|atom| atom_payload(snapshot, atom))
         .collect::<Vec<_>>();
     let mut matches = 0u64;
     let mut clusters = Vec::new();
-    let mut misses = Vec::new();
     let mut completed = 0u64;
     let work_lefts = &lefts;
     std::thread::scope(|scope| -> Result<(), ExactIslandError> {
         let worker_sender = sender.clone();
+        let worker_miss_spool = pair_miss_spool.clone();
         let producer = scope.spawn(move || {
             pool.install(|| {
                 work_lefts.par_iter().for_each(|&left| {
@@ -1485,7 +2030,7 @@ pub fn run_pair_exact_island_with_progress(
                         &atom_payloads,
                         work_lefts,
                         left,
-                        &pair_miss_budget,
+                        &worker_miss_spool,
                         |work| {
                             let _ = worker_sender.send(ScanMessage::Work(work));
                         },
@@ -1515,26 +2060,12 @@ pub fn run_pair_exact_island_with_progress(
                 ScanMessage::Done { left, result } => (left, result),
             };
             match result {
-                Ok((left_matches, left_misses)) if first_error.is_none() => {
+                Ok(left_matches) if first_error.is_none() => {
                     matches = matches.saturating_add(left_matches);
                     clusters.push(ExactEvidenceCluster {
                         id: left,
                         exact_matches: left_matches,
                     });
-                    let next_bytes = misses
-                        .len()
-                        .saturating_add(left_misses.len())
-                        .saturating_mul(std::mem::size_of::<ExactMiss>())
-                        as u64;
-                    if let Err(error) = checked(
-                        "in_memory_miss_bytes",
-                        next_bytes,
-                        budget.max_artifact_bytes,
-                    ) {
-                        first_error = Some(error);
-                    } else {
-                        misses.extend(left_misses);
-                    }
                 }
                 Err(error) if first_error.is_none() => first_error = Some(error),
                 _ => {}
@@ -1566,8 +2097,7 @@ pub fn run_pair_exact_island_with_progress(
         WorkUnit::Items,
         ProgressCounters::default(),
     ));
-    misses.sort_unstable_by_key(|m| (m.left_atom, m.right_atom));
-    misses.dedup();
+    let conservative_misses = pair_miss_spool.finish(PAIR_MISS_FILE, output_dir.is_some())?;
     clusters.sort_unstable_by_key(|cluster| cluster.id);
     progress(ProgressEvent::determinate(
         ProgressPhase::PairExactFinalize,
@@ -1588,7 +2118,7 @@ pub fn run_pair_exact_island_with_progress(
         pair_work,
         exact_matches: matches,
         clusters,
-        conservative_misses: misses,
+        conservative_misses,
         frontier_build_micros: frontier_us,
         full_universe_scan_micros: scan_us,
         posting_finalize_micros: 0,
@@ -1602,18 +2132,25 @@ pub fn run_pair_exact_island_with_progress(
     }
     evidence.posting_finalize_micros = micros(finalize);
     if let Some(dir) = output_dir {
-        let bytes = serde_json::to_vec(&evidence)?;
-        checked(
-            "artifact_bytes",
-            bytes.len() as u64,
-            budget.max_artifact_bytes,
-        )?;
-        std::fs::create_dir_all(dir).map_err(format::FormatError::from)?;
-        crate::format::commit_ready(
-            dir,
-            "ready",
-            std::str::from_utf8(&bytes).expect("JSON is UTF-8"),
-        )?;
+        let ready = PairExactEvidenceReadyRef {
+            artifact_revision: evidence.artifact_revision,
+            match_semantics_revision: evidence.match_semantics_revision,
+            snapshot_fingerprint: &evidence.snapshot_fingerprint,
+            sampling_policy_digest: &evidence.sampling_policy_digest,
+            universe_atoms: evidence.universe_atoms,
+            sampled_lefts: &evidence.sampled_lefts,
+            pair_work: evidence.pair_work,
+            exact_matches: evidence.exact_matches,
+            clusters: &evidence.clusters,
+            conservative_miss_count: evidence.conservative_misses.len(),
+            conservative_miss_file: PAIR_MISS_FILE,
+            frontier_build_micros: evidence.frontier_build_micros,
+            full_universe_scan_micros: evidence.full_universe_scan_micros,
+            posting_finalize_micros: evidence.posting_finalize_micros,
+            oracle_score_micros: evidence.oracle_score_micros,
+            full_scan_equivalents_micros: evidence.full_scan_equivalents_micros,
+        };
+        crate::format::commit_ready_serialized(dir, "ready", &ready)?;
     }
     progress(ProgressEvent::determinate(
         ProgressPhase::PairExactFinalize,
@@ -1653,20 +2190,18 @@ fn scan_pair_left(
     atom_payloads: &[u32],
     sampled_lefts: &[u32],
     left: u32,
-    miss_budget: &InMemoryMissBudget,
+    miss_spool: &MissSpool<ExactMiss>,
     mut report_work: impl FnMut(u64),
-) -> Result<(u64, Vec<ExactMiss>), ExactIslandError> {
+) -> Result<u64, ExactIslandError> {
+    const MISS_BATCH: usize = 4_096;
     const PROGRESS_CHUNK: u64 = 65_536;
     let mut matches = 0u64;
-    let mut misses = Vec::new();
+    let mut misses = Vec::with_capacity(MISS_BATCH);
     let mut pending_work = 0u64;
     let left_payload = atom_payloads[left as usize];
     let left_contracts = atom_contracts(snapshot, left);
     let mut sampled_cursor = 0usize;
     for right in 0..snapshot.atom_count() as u32 {
-        if miss_budget.cancelled.load(Ordering::Acquire) {
-            break;
-        }
         while sampled_cursor < sampled_lefts.len() && sampled_lefts[sampled_cursor] < right {
             sampled_cursor += 1;
         }
@@ -1686,18 +2221,24 @@ fn scan_pair_left(
         {
             matches = matches.saturating_add(1);
             if candidate_owner(snapshot.blocking(), left, right).is_none() {
-                miss_budget.reserve()?;
                 misses.push(ExactMiss {
                     left_atom: left.min(right),
                     right_atom: left.max(right),
                 });
+                if misses.len() == MISS_BATCH {
+                    miss_spool.push_chunk(std::mem::replace(
+                        &mut misses,
+                        Vec::with_capacity(MISS_BATCH),
+                    ))?;
+                }
             }
         }
     }
     if pending_work != 0 {
         report_work(pending_work);
     }
-    Ok((matches, misses))
+    miss_spool.push_chunk(misses)?;
+    Ok(matches)
 }
 
 fn checked(resource: &'static str, requested: u64, limit: u64) -> Result<(), ExactIslandError> {
@@ -1758,10 +2299,10 @@ fn sorted_intersects(x: &[u32], y: &[u32]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        coprime_pair_step, pair_evidence_is_consistent, proportional_partition_samples,
-        shared_token_pair_tiles, triangular_pair, ExactEvidenceCluster, ExactIslandError,
-        ExactMiss, InMemoryMissBudget, PairExactEvidence, SharedTokenExactEvidence,
-        SharedTokenExactMiss, EVIDENCE_ARTIFACT_REVISION,
+        coprime_pair_step, miss_workspace, pair_evidence_is_consistent,
+        proportional_partition_samples, shared_token_pair_tiles, triangular_pair,
+        ExactEvidenceCluster, ExactMiss, MissSpool, PairExactEvidence, ResidentMissBudget,
+        SharedTokenExactEvidence, EVIDENCE_ARTIFACT_REVISION,
     };
     use crate::blocking::{AtomSketch, LocalRoutingPlan};
 
@@ -1813,34 +2354,57 @@ mod tests {
     }
 
     #[test]
-    fn in_memory_miss_budgets_are_global_and_allow_skewed_workers() {
-        let miss_bytes = std::mem::size_of::<SharedTokenExactMiss>() as u64;
-        let budget = InMemoryMissBudget::for_record::<SharedTokenExactMiss>(10 * miss_bytes + 2);
-
-        // Six misses in one group would exceed the old three-way equal slice,
-        // but they fit comfortably in the stage-wide allocation.
-        for _ in 0..6 {
-            budget.reserve().unwrap();
-        }
-        for _ in 6..10 {
-            budget.reserve().unwrap();
-        }
-        let error = budget.reserve().unwrap_err();
-        assert!(matches!(
-            error,
-            ExactIslandError::Budget {
-                resource: "in_memory_miss_bytes",
-                requested,
-                limit,
-            } if requested == 11 * miss_bytes && limit == 10 * miss_bytes + 2
+    fn miss_spool_spills_skewed_workers_without_losing_or_duplicating_rows() {
+        let workspace = miss_workspace(None, "spool-test").unwrap();
+        let budget = std::sync::Arc::new(ResidentMissBudget::for_record::<ExactMiss>(
+            2 * std::mem::size_of::<ExactMiss>() as u64,
         ));
+        let spool = MissSpool::new(budget, workspace, "pair");
 
-        let pair_bytes = std::mem::size_of::<ExactMiss>() as u64;
-        let pair_budget = InMemoryMissBudget::for_record::<ExactMiss>(7 * pair_bytes);
-        for _ in 0..7 {
-            pair_budget.reserve().unwrap();
-        }
-        assert!(pair_budget.reserve().is_err());
+        spool
+            .push_chunk(vec![
+                ExactMiss {
+                    left_atom: 2,
+                    right_atom: 4,
+                },
+                ExactMiss {
+                    left_atom: 0,
+                    right_atom: 1,
+                },
+            ])
+            .unwrap();
+        spool
+            .push_chunk(vec![
+                ExactMiss {
+                    left_atom: 1,
+                    right_atom: 3,
+                },
+                ExactMiss {
+                    left_atom: 0,
+                    right_atom: 1,
+                },
+            ])
+            .unwrap();
+        let rows = spool.finish("pair.u32", false).unwrap();
+
+        assert!(rows.is_mapped());
+        assert_eq!(
+            &*rows,
+            &[
+                ExactMiss {
+                    left_atom: 0,
+                    right_atom: 1,
+                },
+                ExactMiss {
+                    left_atom: 1,
+                    right_atom: 3,
+                },
+                ExactMiss {
+                    left_atom: 2,
+                    right_atom: 4,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -1888,8 +2452,9 @@ mod tests {
             holdout_exact_matches: 0,
             calibration_clusters: vec![],
             holdout_clusters: vec![],
-            calibration_misses: vec![],
-            holdout_misses: vec![],
+            scratch_fallback_tokens: vec![],
+            calibration_misses: vec![].into(),
+            holdout_misses: vec![].into(),
         };
         let mut json = serde_json::to_value(evidence).unwrap();
         json.as_object_mut().unwrap().remove("holdout_pair_work");
@@ -1912,7 +2477,7 @@ mod tests {
                 id: 0,
                 exact_matches: 2,
             }],
-            conservative_misses: vec![],
+            conservative_misses: vec![].into(),
             frontier_build_micros: 0,
             full_universe_scan_micros: 0,
             posting_finalize_micros: 0,

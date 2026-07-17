@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 
-use super::{AtomSketch, ANCHOR_COUNT};
-use crate::encode::{FeatureView, PayloadTermSoA};
+use super::{AtomSketch, AtomSketchSoA, ANCHOR_COUNT};
+use crate::encode::{FeatureView, PayloadTermSoA, PayloadTermView};
 
 const HIGH_FREQUENCY_MIN_DOCS: usize = 32;
 const HIGH_FREQUENCY_DIVISOR: usize = 5;
@@ -27,6 +27,95 @@ struct DimensionSketch {
     simhash: u64,
     anchors: Vec<u32>,
     has_terms: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AtomDimensionSketch {
+    pub simhash: u64,
+    pub anchors: [u32; ANCHOR_COUNT],
+    pub anchor_count: u8,
+    pub has_terms: bool,
+}
+
+/// Allocation-free per-atom accumulator shared by the resident chunked
+/// builder and the external DuckDB stream.  It keeps the exact best 16
+/// `(document_frequency, term)` ranks with insertion into a fixed array.
+pub struct AtomDimensionAccumulator {
+    weights: [f64; 64],
+    ranked_anchors: [(u32, u32); ANCHOR_COUNT],
+    anchor_count: usize,
+    has_terms: bool,
+}
+
+impl Default for AtomDimensionAccumulator {
+    fn default() -> Self {
+        Self {
+            weights: [0.0; 64],
+            ranked_anchors: [(u32::MAX, u32::MAX); ANCHOR_COUNT],
+            anchor_count: 0,
+            has_terms: false,
+        }
+    }
+}
+
+impl AtomDimensionAccumulator {
+    pub fn observe(&mut self, atom_count: usize, term: u32, document_frequency: u32) {
+        self.has_terms = true;
+        let total_documents = atom_count.max(1) as f64;
+        let idf = ((total_documents + 1.0) / (f64::from(document_frequency) + 0.5)).ln();
+        let hash = stable_token_hash(term);
+        for (bit, weight) in self.weights.iter_mut().enumerate() {
+            if (hash >> bit) & 1 == 1 {
+                *weight += idf;
+            } else {
+                *weight -= idf;
+            }
+        }
+        let high_frequency = atom_count >= HIGH_FREQUENCY_MIN_DOCS
+            && u64::from(document_frequency).saturating_mul(HIGH_FREQUENCY_DIVISOR as u64)
+                > atom_count as u64;
+        if high_frequency {
+            return;
+        }
+        let rank = (document_frequency, term);
+        let insertion = self.ranked_anchors[..self.anchor_count]
+            .binary_search(&rank)
+            .unwrap_or_else(|index| index);
+        if insertion >= ANCHOR_COUNT {
+            return;
+        }
+        let end = self.anchor_count.min(ANCHOR_COUNT - 1);
+        for index in (insertion..end).rev() {
+            self.ranked_anchors[index + 1] = self.ranked_anchors[index];
+        }
+        self.ranked_anchors[insertion] = rank;
+        self.anchor_count = self.anchor_count.saturating_add(1).min(ANCHOR_COUNT);
+    }
+
+    pub fn finish(self) -> AtomDimensionSketch {
+        let mut anchors = [0u32; ANCHOR_COUNT];
+        for (target, (_, term)) in anchors
+            .iter_mut()
+            .zip(self.ranked_anchors)
+            .take(self.anchor_count)
+        {
+            *target = term;
+        }
+        anchors[..self.anchor_count].sort_unstable();
+        let simhash = self
+            .weights
+            .into_iter()
+            .enumerate()
+            .fold(0u64, |hash, (bit, weight)| {
+                hash | (u64::from(weight >= 0.0) << bit)
+            });
+        AtomDimensionSketch {
+            simhash,
+            anchors,
+            anchor_count: self.anchor_count as u8,
+            has_terms: self.has_terms,
+        }
+    }
 }
 
 enum DocumentFrequencies {
@@ -61,6 +150,13 @@ pub fn build_base_equivalent_atom_sketches_parallel(
     if lanes <= 1 {
         return build_sketches_sequential(atoms);
     }
+    if rayon::current_thread_index().is_some() {
+        let (template, content) = rayon::join(
+            || build_dimension_parallel(atoms, |atom| atom.template_terms),
+            || build_dimension_parallel(atoms, |atom| atom.content_terms),
+        );
+        return combine_dimensions(template, content);
+    }
     let Ok(pool) = rayon::ThreadPoolBuilder::new()
         .num_threads(lanes.max(1))
         .thread_name(|index| format!("metadata-sketch-{index}"))
@@ -84,6 +180,14 @@ pub fn build_base_equivalent_atom_sketches_from_soa_parallel(
     atom_payloads: &[u32],
     lanes: usize,
 ) -> Vec<AtomSketch> {
+    build_base_equivalent_atom_sketches_from_view_parallel(payloads.as_view(), atom_payloads, lanes)
+}
+
+pub fn build_base_equivalent_atom_sketches_from_view_parallel(
+    payloads: PayloadTermView<'_>,
+    atom_payloads: &[u32],
+    lanes: usize,
+) -> Vec<AtomSketch> {
     let atoms = atom_payloads
         .iter()
         .map(|&payload_id| {
@@ -96,6 +200,13 @@ pub fn build_base_equivalent_atom_sketches_from_soa_parallel(
         .collect::<Vec<_>>();
     if lanes <= 1 {
         return build_id_sketches_sequential(&atoms);
+    }
+    if rayon::current_thread_index().is_some() {
+        let (template, content) = rayon::join(
+            || build_id_dimension_parallel(&atoms, |atom| atom.template_terms),
+            || build_id_dimension_parallel(&atoms, |atom| atom.content_terms),
+        );
+        return combine_dimensions(template, content);
     }
     let Ok(pool) = rayon::ThreadPoolBuilder::new()
         .num_threads(lanes.max(1))
@@ -111,6 +222,130 @@ pub fn build_base_equivalent_atom_sketches_from_soa_parallel(
         );
         combine_dimensions(template, content)
     })
+}
+
+/// Build the global sketches directly into compact SoA columns.  The two
+/// dimensions are processed sequentially to keep only one dense DF table
+/// resident, while each fixed-size atom batch uses all configured lanes.
+pub fn build_base_equivalent_atom_sketch_soa_from_view_parallel(
+    payloads: PayloadTermView<'_>,
+    atom_payloads: &[u32],
+    lanes: usize,
+) -> AtomSketchSoA {
+    if lanes <= 1 || rayon::current_thread_index().is_some() {
+        return build_atom_sketch_soa_in_current_pool(payloads, atom_payloads);
+    }
+    let Ok(pool) = rayon::ThreadPoolBuilder::new()
+        .num_threads(lanes.max(1))
+        .thread_name(|index| format!("metadata-sketch-soa-{index}"))
+        .build()
+    else {
+        return build_atom_sketch_soa_in_current_pool(payloads, atom_payloads);
+    };
+    pool.install(|| build_atom_sketch_soa_in_current_pool(payloads, atom_payloads))
+}
+
+struct DimensionColumns {
+    simhashes: Vec<u64>,
+    anchor_offsets: Vec<u64>,
+    anchors: Vec<u32>,
+    has_terms: Vec<u8>,
+}
+
+fn build_atom_sketch_soa_in_current_pool(
+    payloads: PayloadTermView<'_>,
+    atom_payloads: &[u32],
+) -> AtomSketchSoA {
+    let template = build_payload_dimension_columns(payloads, atom_payloads, true);
+    let content = build_payload_dimension_columns(payloads, atom_payloads, false);
+    AtomSketchSoA {
+        template_simhashes: template.simhashes,
+        content_simhashes: content.simhashes,
+        template_anchor_offsets: template.anchor_offsets,
+        template_anchors: template.anchors,
+        content_anchor_offsets: content.anchor_offsets,
+        content_anchors: content.anchors,
+        has_template_terms: template.has_terms,
+        has_content_terms: content.has_terms,
+    }
+}
+
+fn build_payload_dimension_columns(
+    payloads: PayloadTermView<'_>,
+    atom_payloads: &[u32],
+    template: bool,
+) -> DimensionColumns {
+    let all_terms = if template {
+        payloads.template_terms
+    } else {
+        payloads.content_terms
+    };
+    let dense_len = all_terms
+        .iter()
+        .copied()
+        .max()
+        .and_then(|term| usize::try_from(term).ok())
+        .and_then(|term| term.checked_add(1))
+        .unwrap_or(0);
+    let frequencies = (0..dense_len)
+        .map(|_| std::sync::atomic::AtomicU32::new(0))
+        .collect::<Vec<_>>();
+    atom_payloads.par_iter().for_each(|&payload_id| {
+        for &term in payload_dimension_terms(payloads, payload_id as usize, template) {
+            frequencies[term as usize].fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    let frequencies = frequencies
+        .into_iter()
+        .map(std::sync::atomic::AtomicU32::into_inner)
+        .collect::<Vec<_>>();
+
+    const ATOM_BATCH: usize = 4_096;
+    let atom_count = atom_payloads.len();
+    let mut simhashes = Vec::with_capacity(atom_count);
+    let mut anchor_offsets = Vec::with_capacity(atom_count.saturating_add(1));
+    let mut anchors = Vec::with_capacity(atom_count.saturating_mul(ANCHOR_COUNT));
+    let mut has_terms = Vec::with_capacity(atom_count);
+    anchor_offsets.push(0);
+    for start in (0..atom_count).step_by(ATOM_BATCH) {
+        let end = start.saturating_add(ATOM_BATCH).min(atom_count);
+        let batch = (start..end)
+            .into_par_iter()
+            .map(|atom| {
+                let payload = atom_payloads[atom] as usize;
+                let mut accumulator = AtomDimensionAccumulator::default();
+                for &term in payload_dimension_terms(payloads, payload, template) {
+                    accumulator.observe(atom_count, term, frequencies[term as usize]);
+                }
+                accumulator.finish()
+            })
+            .collect::<Vec<_>>();
+        for sketch in batch {
+            simhashes.push(sketch.simhash);
+            let anchor_count = sketch.anchor_count as usize;
+            anchors.extend_from_slice(&sketch.anchors[..anchor_count]);
+            anchor_offsets.push(anchors.len() as u64);
+            has_terms.push(u8::from(sketch.has_terms));
+        }
+    }
+    DimensionColumns {
+        simhashes,
+        anchor_offsets,
+        anchors,
+        has_terms,
+    }
+}
+
+fn payload_dimension_terms(
+    payloads: PayloadTermView<'_>,
+    payload: usize,
+    template: bool,
+) -> &[u32] {
+    if template {
+        payloads.template_term_ids(payload)
+    } else {
+        payloads.content_term_ids(payload)
+    }
 }
 
 /// Build local routing sketches directly over the immutable mapped feature
@@ -400,42 +635,19 @@ fn dimension_sketch_ids(
     terms: &[u32],
     document_frequencies: &DocumentFrequencies,
 ) -> DimensionSketch {
-    let total_documents = atom_count.max(1) as f64;
-    let mut weights = [0.0f64; 64];
-    let mut ranked_anchors = Vec::new();
-    let mut has_terms = false;
+    let mut accumulator = AtomDimensionAccumulator::default();
     visit_unique_term_ids(terms, |term| {
-        has_terms = true;
-        let document_frequency = document_frequencies.get(term);
-        let idf = ((total_documents + 1.0) / (document_frequency as f64 + 0.5)).ln();
-        let hash = stable_token_hash(term);
-        for (bit, weight) in weights.iter_mut().enumerate() {
-            if (hash >> bit) & 1 == 1 {
-                *weight += idf;
-            } else {
-                *weight -= idf;
-            }
-        }
-        let high_frequency = atom_count >= HIGH_FREQUENCY_MIN_DOCS
-            && document_frequency.saturating_mul(HIGH_FREQUENCY_DIVISOR) > atom_count;
-        if !high_frequency {
-            ranked_anchors.push((document_frequency, term));
-        }
+        accumulator.observe(
+            atom_count,
+            term,
+            u32::try_from(document_frequencies.get(term)).unwrap_or(u32::MAX),
+        );
     });
-    ranked_anchors.sort_unstable();
-    ranked_anchors.truncate(ANCHOR_COUNT);
-    let mut anchors: Vec<u32> = ranked_anchors.into_iter().map(|(_, term)| term).collect();
-    anchors.sort_unstable();
-    let simhash = weights
-        .into_iter()
-        .enumerate()
-        .fold(0u64, |hash, (bit, weight)| {
-            hash | (u64::from(weight >= 0.0) << bit)
-        });
+    let compact = accumulator.finish();
     DimensionSketch {
-        simhash,
-        anchors,
-        has_terms,
+        simhash: compact.simhash,
+        anchors: compact.anchors[..compact.anchor_count as usize].to_vec(),
+        has_terms: compact.has_terms,
     }
 }
 
@@ -555,9 +767,42 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
+        let expected = build_base_equivalent_atom_sketches_parallel(&inputs, 2);
         assert_eq!(
-            build_base_equivalent_atom_sketches_parallel(&inputs, 2),
+            expected,
             build_base_equivalent_atom_sketches_from_soa_parallel(&payloads, &atom_payloads, 2)
+        );
+        let compact = build_base_equivalent_atom_sketch_soa_from_view_parallel(
+            payloads.as_view(),
+            &atom_payloads,
+            2,
+        );
+        let view = compact.as_view();
+        let materialized = (0..view.len())
+            .map(|atom| AtomSketch {
+                template_simhash: view.template_simhashes[atom],
+                content_simhash: view.content_simhashes[atom],
+                template_anchors: view.template_anchors(atom).to_vec(),
+                content_anchors: view.content_anchors(atom).to_vec(),
+                has_template_terms: view.has_template_terms(atom),
+                has_content_terms: view.has_content_terms(atom),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(expected, materialized);
+    }
+
+    #[test]
+    fn fixed_anchor_accumulator_keeps_the_exact_best_sixteen() {
+        let mut accumulator = AtomDimensionAccumulator::default();
+        for term in (0..64).rev() {
+            accumulator.observe(31, term, 1);
+        }
+        let sketch = accumulator.finish();
+
+        assert_eq!(sketch.anchor_count as usize, ANCHOR_COUNT);
+        assert_eq!(
+            &sketch.anchors[..ANCHOR_COUNT],
+            &(0..ANCHOR_COUNT as u32).collect::<Vec<_>>()
         );
     }
 }

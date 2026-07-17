@@ -6,7 +6,6 @@ use duckdb::Connection;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
 use serde::Serialize;
-use sysinfo::System;
 use thiserror::Error;
 
 mod chain_matrix;
@@ -28,6 +27,7 @@ use chain_matrix::*;
 use components::*;
 use duckdb_prep::*;
 use memory::*;
+pub use memory::{effective_available_memory_bytes, effective_memory_capacity_bytes};
 use metadata::MAX_METADATA_BYTES_FOR_DEDUP;
 use name::*;
 use name_scoring::*;
@@ -92,6 +92,50 @@ pub fn run_analysis_phase(
     configure_numa_interleave();
     let mut phase_options = options.clone();
     phase_options.threads = phase_worker_threads(options.threads, phase);
+    let mut memory_advisories = Vec::new();
+    if matches!(phase, AnalysisPhase::Prepare) {
+        let configured = resolve_duckdb_memory_limit(&phase_options.duckdb_memory_limit)?;
+        let configured_bytes = parse_byte_size(&configured)? as u64;
+        let (host_total, host_available) = effective_memory_snapshot_bytes();
+        let process_envelope = process_memory_envelope_bytes(host_total, host_available);
+        let duckdb_cap = duckdb_buffer_cap_bytes(process_envelope);
+        if configured_bytes > duckdb_cap {
+            memory_advisories.push(format!(
+                "Prepare DuckDB budget reduced from {} to {} so the phase remains inside the \
+                 current process-memory envelope with room for non-buffer allocations",
+                format_byte_size(usize::try_from(configured_bytes).unwrap_or(usize::MAX)),
+                format_byte_size(usize::try_from(duckdb_cap).unwrap_or(usize::MAX)),
+            ));
+            phase_options.duckdb_memory_limit = format!("{duckdb_cap}B");
+        }
+    }
+    if matches!(phase, AnalysisPhase::Name) {
+        let requested_rust_bytes = name_analysis_memory_plan(
+            &phase_options.memory_limit,
+            phase_options.analysis_memory_limit.as_deref(),
+            0,
+        )?
+        .analysis_bytes;
+        let duckdb_limit = phase_duckdb_memory_limit(&phase_options, NAME_DUCKDB_MEMORY_CAP)?;
+        let duckdb_bytes = parse_byte_size(&duckdb_limit)? as u64;
+        let (host_total, host_available) = effective_memory_snapshot_bytes();
+        let effective_rust_bytes = name_phase_rust_budget(
+            requested_rust_bytes,
+            duckdb_bytes,
+            host_total,
+            host_available,
+        )?;
+        if effective_rust_bytes < requested_rust_bytes {
+            memory_advisories.push(format!(
+                "Name Rust budget reduced from {} to {} so DuckDB {} and required host \
+                 headroom remain inside the current process-memory envelope",
+                format_byte_size(requested_rust_bytes),
+                format_byte_size(effective_rust_bytes),
+                format_byte_size(usize::try_from(duckdb_bytes).unwrap_or(usize::MAX)),
+            ));
+        }
+        phase_options.analysis_memory_limit = Some(format!("{effective_rust_bytes}B"));
+    }
     let options = &phase_options;
     // MetadataEncode reads Prepare's DuckDB state without mutating Prepare/Name
     // tables. Match remains the sole owner of production metadata summary rows.
@@ -107,6 +151,9 @@ pub fn run_analysis_phase(
     }
     let pipeline_stage = PipelineStage::from(phase);
     let progress = ProgressTracker::for_pipeline_stage(pipeline_stage, options.progress);
+    for advisory in memory_advisories {
+        progress.warn(advisory);
+    }
     let result: Result<(), AnalysisError> = (|| {
         if matches!(phase, AnalysisPhase::MetadataMatch) && !metadata_inputs_ready(work_directory) {
             return Err(AnalysisError::InvalidData(
@@ -142,7 +189,6 @@ pub fn run_analysis_phase(
                     let totals = load_chain_totals(&conn)?;
                     let rows = run_uri_analysis(&conn, &chains, &totals, &progress)?;
                     drop_prepare_only_uri_tables(&conn)?;
-                    metadata::prepare_metadata_compact_tables(&conn, &progress)?;
                     rows
                 }
                 AnalysisPhase::Name => {
@@ -150,7 +196,7 @@ pub fn run_analysis_phase(
                     let totals = load_chain_totals(&conn)?;
                     let result = run_name_analysis(
                         &conn,
-                        name_analysis_spec(options, &chains, &totals),
+                        name_analysis_spec(options, &chains, &totals, work_directory),
                         &progress,
                     )?;
                     if diagnostics {
@@ -314,9 +360,22 @@ pub(crate) fn run_metadata_pipeline_result(
         0,
     )?
     .analysis_bytes as u64;
-    let host_total_memory = physical_memory_bytes();
-    let memory_hard_top =
-        engine_memory_hard_top_bytes(analysis_bytes as usize, MATCH_HARD_TOP, host_total_memory)?;
+    let (host_total_memory, host_available_memory) = effective_memory_snapshot_bytes();
+    let memory_hard_top = engine_memory_hard_top_bytes(
+        analysis_bytes as usize,
+        MATCH_HARD_TOP,
+        host_total_memory,
+        host_available_memory,
+    )?;
+    let requested_match_top = analysis_bytes.min(MATCH_HARD_TOP);
+    if memory_hard_top < requested_match_top {
+        progress.warn(format!(
+            "Metadata Match memory ceiling reduced from {} to {} by current available memory and \
+             required host headroom; exact resident paths will use bounded mmap/spill fallbacks",
+            format_byte_size(usize::try_from(requested_match_top).unwrap_or(usize::MAX)),
+            format_byte_size(usize::try_from(memory_hard_top).unwrap_or(usize::MAX)),
+        ));
+    }
     // The engine shrinks this ceiling to the exact per-scope forest upper
     // bound. A larger production ceiling avoids the old 4 GiB artificial
     // failure mode while keeping at least fifteen sixteenths of the admitted
@@ -327,7 +386,10 @@ pub(crate) fn run_metadata_pipeline_result(
         memory_hard_top,
         host_total_memory,
         threads: options.threads,
-        max_catalog_jobs: 1_000_000,
+        // Catalog descriptors are fixed-width external columns and no longer
+        // need an artificial one-million resident-Vec ceiling. u32 job ids are
+        // the persisted format limit.
+        max_catalog_jobs: u32::MAX as u64,
         max_candidate_pair_visits: metadata_engine::pipeline::DEFAULT_MAX_CANDIDATE_PAIR_VISITS,
         exact_sample_lefts: metadata_engine::pipeline::DEFAULT_EXACT_SAMPLE_LEFTS,
         exact_pair_work: metadata_engine::pipeline::DEFAULT_EXACT_PAIR_WORK,
@@ -394,14 +456,35 @@ fn phase_duckdb_memory_limit(
     Ok(effective)
 }
 
+pub(crate) fn name_phase_rust_budget(
+    requested_rust_bytes: usize,
+    duckdb_bytes: u64,
+    host_total: u64,
+    host_available: u64,
+) -> Result<usize, AnalysisError> {
+    let host_envelope = process_memory_envelope_bytes(host_total, host_available);
+    let rust_capacity = host_envelope.saturating_sub(duckdb_bytes);
+    let effective = (requested_rust_bytes as u64).min(rust_capacity);
+    if effective == 0 {
+        return Err(AnalysisError::InvalidData(format!(
+            "Name has no Rust memory inside the host envelope: host_total={host_total}, \
+             DuckDB={duckdb_bytes}, required_headroom={}",
+            metadata_engine::resource::required_host_headroom(host_total)
+        )));
+    }
+    usize::try_from(effective)
+        .map_err(|_| AnalysisError::InvalidData("Name memory budget exceeds usize".into()))
+}
+
 fn drop_prepare_only_uri_tables(conn: &Connection) -> Result<(), AnalysisError> {
+    materialize_metadata_rows_after_uri(conn)?;
     conn.execute_batch(
         "DROP TABLE IF EXISTS uri_chain_pair_contract_flags;
          DROP TABLE IF EXISTS uri_contract_flags;
          DROP TABLE IF EXISTS uri_cross_chain_keys;
          DROP TABLE IF EXISTS uri_duplicate_key_stats;
+         DROP TABLE IF EXISTS uri_key_chain_stats;
          DROP TABLE IF EXISTS uri_key_contracts;
-         DROP TABLE IF EXISTS uri_rows;
          DROP TABLE IF EXISTS contract_dim;",
     )?;
     Ok(())
@@ -505,6 +588,7 @@ fn name_analysis_spec<'a>(
     options: &'a AnalysisOptions,
     chains: &'a [String],
     totals: &'a HashMap<String, NameTotals>,
+    work_directory: &'a Path,
 ) -> NameAnalysisSpec<'a> {
     NameAnalysisSpec {
         chains,
@@ -513,6 +597,7 @@ fn name_analysis_spec<'a>(
         threads: options.threads,
         memory_limit: &options.memory_limit,
         analysis_memory_limit: options.analysis_memory_limit.as_deref(),
+        scratch_directory: work_directory,
     }
 }
 

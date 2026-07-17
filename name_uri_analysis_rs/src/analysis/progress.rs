@@ -5,10 +5,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use super::*;
 
 const PIPELINE_STAGE_COUNT: u64 = 5;
-pub(crate) const PROGRESS_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
-const PROGRESS_REFRESH_HZ: u8 = 10;
-const RATE_WARMUP: Duration = Duration::from_secs(1);
-const RATE_EWMA_ALPHA: f64 = 0.25;
+pub(crate) const PROGRESS_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
+const PROGRESS_REFRESH_HZ: u8 = 2;
+const RATE_WARMUP: Duration = Duration::from_secs(2);
+const RATE_EWMA_HALF_LIFE: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
 pub(crate) struct MatchEtaForecast {
     pub(crate) schema_version: u32,
@@ -55,6 +55,8 @@ pub(crate) fn match_elapsed_offset(started: Option<u128>, now: Option<u128>) -> 
 
 #[derive(Debug)]
 pub(crate) struct TaskRateEstimator {
+    origin_position: Option<u64>,
+    origin_elapsed: Duration,
     last_position: Option<u64>,
     last_elapsed: Duration,
     rate: Option<f64>,
@@ -63,6 +65,8 @@ pub(crate) struct TaskRateEstimator {
 impl Default for TaskRateEstimator {
     fn default() -> Self {
         Self {
+            origin_position: None,
+            origin_elapsed: Duration::ZERO,
             last_position: None,
             last_elapsed: Duration::ZERO,
             rate: None,
@@ -72,22 +76,45 @@ impl Default for TaskRateEstimator {
 
 impl TaskRateEstimator {
     pub(crate) fn sample(&mut self, position: u64, elapsed: Duration) -> Option<f64> {
-        let Some(last_position) = self.last_position.replace(position) else {
+        let Some(last_position) = self.last_position else {
+            self.origin_position = Some(position);
+            self.origin_elapsed = elapsed;
+            self.last_position = Some(position);
             self.last_elapsed = elapsed;
             return None;
         };
+        if position < last_position || elapsed < self.last_elapsed {
+            *self = Self::default();
+            return self.sample(position, elapsed);
+        }
         let delta = position.saturating_sub(last_position);
         let sample_elapsed = elapsed.saturating_sub(self.last_elapsed);
+        self.last_position = Some(position);
         self.last_elapsed = elapsed;
-        if delta == 0 || sample_elapsed.is_zero() || elapsed < RATE_WARMUP {
-            return self.rate;
+        let warmup_elapsed = elapsed.saturating_sub(self.origin_elapsed);
+        if sample_elapsed.is_zero() || warmup_elapsed < RATE_WARMUP {
+            return self.rate.filter(|rate| *rate > 0.0);
         }
-        let instantaneous = delta as f64 / sample_elapsed.as_secs_f64();
+
+        let instantaneous = if self.rate.is_none() {
+            let origin_position = self.origin_position.unwrap_or(position);
+            position.saturating_sub(origin_position) as f64 / warmup_elapsed.as_secs_f64()
+        } else {
+            delta as f64 / sample_elapsed.as_secs_f64()
+        };
+        // A time-derived coefficient keeps ETA behavior stable when the display
+        // refresh interval changes. Zero-work samples intentionally decay the
+        // rate instead of making a stalled task retain an optimistic ETA.
+        let alpha = 1.0
+            - f64::exp(
+                -std::f64::consts::LN_2 * sample_elapsed.as_secs_f64()
+                    / RATE_EWMA_HALF_LIFE.as_secs_f64(),
+            );
         let smoothed = self.rate.map_or(instantaneous, |previous| {
-            RATE_EWMA_ALPHA * instantaneous + (1.0 - RATE_EWMA_ALPHA) * previous
+            alpha * instantaneous + (1.0 - alpha) * previous
         });
         self.rate = Some(smoothed);
-        self.rate
+        self.rate.filter(|rate| *rate > 0.0)
     }
 }
 
@@ -385,35 +412,22 @@ impl ProgressTracker {
             stage.inc(delta);
             return;
         };
+        let previous = state.position;
         let next = state.position.saturating_add(delta);
         state.position = next;
         state.counters = counters;
-        task.set_position(
-            state
-                .total
-                .map_or(state.position, |total| state.position.min(total)),
-        );
-        if state.last_refresh.is_some_and(|last_refresh| {
-            now.duration_since(last_refresh) < PROGRESS_REFRESH_INTERVAL
-        }) {
-            return;
-        }
-        state.last_refresh = Some(now);
-        let elapsed = now.duration_since(state.started);
-        let rate = state.rate.sample(state.position, elapsed);
-        metrics.set_message(format_task_progress_message_with_match_forecast(
-            &TaskProgressSnapshot {
-                position: state.position,
-                total: state.total,
-                unit: &state.unit,
-                counters: state.counters,
-                rate,
-                show_match_eta: state.show_match_eta,
-                total_kind: state.total_kind,
-            },
+        let completed_now = state
+            .total
+            .is_some_and(|total| previous < total && state.position >= total);
+        render_task_progress(
+            state,
+            now,
+            completed_now,
+            task,
+            metrics,
             match_forecast.as_ref().as_ref(),
             match_elapsed_offset.saturating_add(now.duration_since(*match_started)),
-        ));
+        );
     }
 
     pub(crate) fn observe_engine_event(&self, event: metadata_engine::progress::ProgressEvent) {
@@ -426,43 +440,75 @@ impl ProgressTracker {
         else {
             return;
         };
-        if match_eta_enabled.load(Ordering::Relaxed) {
-            stage.set_message(event.phase.label());
-        }
         let label = if event.total_kind == metadata_engine::progress::TotalKind::UpperBound {
             format!("{} (upper bound)", event.phase.label())
+        } else if event.total_kind == metadata_engine::progress::TotalKind::Estimate {
+            format!("{} (estimate)", event.phase.label())
         } else {
             event.phase.label().to_string()
         };
         let unit = event.unit.label();
-        let (restart, previous) = {
-            let guard = task_state.lock().expect("task progress mutex poisoned");
-            match guard.as_ref() {
-                Some(state)
-                    if state.label == label
-                        && state.total == event.total
-                        && state.unit == unit
-                        && state.work_class == event.work_class
-                        && state.total_kind == event.total_kind
-                        && state.position <= event.completed =>
+        let now = Instant::now();
+        {
+            let mut guard = task_state.lock().expect("task progress mutex poisoned");
+            if let Some(state) = guard.as_mut() {
+                if state.label == label
+                    && state.total == event.total
+                    && state.unit == unit
+                    && state.work_class == event.work_class
+                    && state.total_kind == event.total_kind
+                    && state.position <= event.completed
                 {
-                    (false, state.position)
+                    let previous = state.position;
+                    state.position = event.completed;
+                    state.counters = ProgressCounters {
+                        groups: event.counters.groups,
+                        candidates: event.counters.candidates,
+                        scored: event.counters.scored,
+                        expanded: event.counters.expanded,
+                        matched: event.counters.matched,
+                        selected: event.counters.selected,
+                    };
+                    let completed_now = state
+                        .total
+                        .is_some_and(|total| previous < total && state.position >= total);
+                    let Self::Enabled {
+                        task,
+                        metrics,
+                        match_started,
+                        match_elapsed_offset,
+                        match_forecast,
+                        ..
+                    } = self
+                    else {
+                        unreachable!("enabled progress was matched above");
+                    };
+                    render_task_progress(
+                        state,
+                        now,
+                        completed_now,
+                        task,
+                        metrics,
+                        match_forecast.as_ref().as_ref(),
+                        match_elapsed_offset.saturating_add(now.duration_since(*match_started)),
+                    );
+                    return;
                 }
-                _ => (true, 0),
             }
-        };
-        if restart {
-            self.start_task_with_context(
-                label,
-                event.total,
-                unit,
-                match_eta_enabled.load(Ordering::Relaxed),
-                event.work_class,
-                event.total_kind,
-            );
         }
+        if match_eta_enabled.load(Ordering::Relaxed) {
+            stage.set_message(event.phase.label());
+        }
+        self.start_task_with_context(
+            label,
+            event.total,
+            unit,
+            match_eta_enabled.load(Ordering::Relaxed),
+            event.work_class,
+            event.total_kind,
+        );
         self.advance_task(
-            event.completed.saturating_sub(previous),
+            event.completed,
             ProgressCounters {
                 groups: event.counters.groups,
                 candidates: event.counters.candidates,
@@ -590,6 +636,45 @@ impl ProgressTracker {
     }
 }
 
+fn render_task_progress(
+    state: &mut TaskProgressState,
+    now: Instant,
+    force: bool,
+    task: &ProgressBar,
+    metrics: &ProgressBar,
+    match_forecast: Option<&MatchEtaForecast>,
+    match_elapsed: Duration,
+) {
+    if !force
+        && state.last_refresh.is_some_and(|last_refresh| {
+            now.duration_since(last_refresh) < PROGRESS_REFRESH_INTERVAL
+        })
+    {
+        return;
+    }
+    state.last_refresh = Some(now);
+    task.set_position(
+        state
+            .total
+            .map_or(state.position, |total| state.position.min(total)),
+    );
+    let elapsed = now.duration_since(state.started);
+    let rate = state.rate.sample(state.position, elapsed);
+    metrics.set_message(format_task_progress_message_with_match_forecast(
+        &TaskProgressSnapshot {
+            position: state.position,
+            total: state.total,
+            unit: &state.unit,
+            counters: state.counters,
+            rate,
+            show_match_eta: state.show_match_eta,
+            total_kind: state.total_kind,
+        },
+        match_forecast,
+        match_elapsed,
+    ));
+}
+
 #[cfg(test)]
 pub(crate) fn format_task_progress_message(snapshot: &TaskProgressSnapshot<'_>) -> String {
     format_task_progress_message_with_match_forecast(snapshot, None, Duration::ZERO)
@@ -637,7 +722,8 @@ pub(crate) fn format_task_progress_message_with_match_forecast(
     let phase_eta = match (snapshot.total_kind, snapshot.total, rate) {
         (
             metadata_engine::progress::TotalKind::Exact
-            | metadata_engine::progress::TotalKind::UpperBound,
+            | metadata_engine::progress::TotalKind::UpperBound
+            | metadata_engine::progress::TotalKind::Estimate,
             Some(total),
             Some(rate),
         ) if rate > 0.0 && snapshot.position <= total => {
@@ -649,6 +735,9 @@ pub(crate) fn format_task_progress_message_with_match_forecast(
     match phase_eta {
         Some(eta) if snapshot.total_kind == metadata_engine::progress::TotalKind::UpperBound => {
             metrics.push(format!("ETA ≤ {}", format_progress_duration(eta)));
+        }
+        Some(eta) if snapshot.total_kind == metadata_engine::progress::TotalKind::Estimate => {
+            metrics.push(format!("ETA ~ {}", format_progress_duration(eta)));
         }
         Some(eta) => metrics.push(format!("ETA {}", format_progress_duration(eta))),
         None if snapshot.total_kind == metadata_engine::progress::TotalKind::Unknown => {
@@ -693,7 +782,7 @@ pub(crate) fn format_task_progress_message_with_match_forecast(
                         ));
                     } else {
                         metrics.push(format!(
-                            "match ETA observed {}..{} (n={sample_count})",
+                            "match ETA central {}..{} (historical P20-P80; n={sample_count})",
                             format_progress_duration(lower),
                             format_progress_duration(historical_upper)
                         ));
@@ -814,11 +903,11 @@ fn task_spinner_style() -> ProgressStyle {
 }
 
 pub(crate) const fn pipeline_bar_template() -> &'static str {
-    "pipeline [{elapsed_precise}] [{bar:24.cyan/blue}] {pos}/{len} {msg}"
+    "pipeline [{elapsed_precise}] [{bar:20.cyan/blue}] phases {pos}/{len} {msg}"
 }
 
 pub(crate) const fn stage_bar_template() -> &'static str {
-    "  stage [{elapsed_precise}] [{bar:28.magenta/blue}] {pos}/{len} {percent:>3}% {msg}"
+    "  stage [{elapsed_precise}] [{bar:24.magenta/blue}] steps {pos}/{len} {msg}"
 }
 
 pub(crate) const fn stage_spinner_template() -> &'static str {

@@ -140,11 +140,15 @@ subphase、`completed/total`、工作单位和诊断计数，CLI 只负责渲染
   ETA 计时边界错位；
 - MemoryFirst 使用 `finalize component groups`，不会显示实际未执行的 connectivity
   commit/recovery 阶段；
-- UI 以 10 Hz 刷新，完成值被钳制到 total，失败不会显示 100%。
+- UI 最多以 2 Hz 刷新；同一 engine phase 的高频事件先合并，只在刷新窗口或任务完成时更新
+  终端。Name 串行评分也按最多 4,096 个 left 批量上报，避免进度展示进入热路径；
+  完成值被钳制到 total，失败不会显示 100%。
 
 因此 `ETA` 表示“当前子阶段剩余同类工作”的估计。只有 Metadata Match 的引擎事件会独立显示
 `match ETA n/a (uncalibrated)`；在没有同 revision、同规模目标机历史分布前不会把子阶段速率外推成
-整段 Match 的伪精确 ETA。当前 Match controller revision 为 21，旧 tmpfs/Ephemeral 和旧 catalog
+整段 Match 的伪精确 ETA。当前子阶段速率经过 2 秒预热，并按时间而非刷新次数做 5 秒半衰期平滑；
+已观测到无进展时速率会衰减。Match 历史 ETA 使用同 cohort 成功样本的 P20-P80 中央区间，
+避免单次极快或极慢运行永久拉宽预测。当前 Match controller revision 为 21，旧 tmpfs/Ephemeral 和旧 catalog
 同步热路径的历史样本不会污染新的 Durable ETA；forecast/observation 共用 schema 3，旧 schema
 样本不会被渲染端误用。
 可用 `--no-progress` 关闭终端进度。

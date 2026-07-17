@@ -105,9 +105,7 @@ pub(crate) fn configure_duckdb(
 pub(crate) fn resolve_duckdb_memory_limit(value: &str) -> Result<String, AnalysisError> {
     let trimmed = value.trim();
     if trimmed.eq_ignore_ascii_case("auto") {
-        let mut system = System::new();
-        system.refresh_memory();
-        let available = system.available_memory() as usize;
+        let available = usize::try_from(effective_available_memory_bytes()).unwrap_or(usize::MAX);
         let duckdb = available.saturating_mul(3).saturating_div(4);
         let mib = 1024usize * 1024;
         Ok(format!("{}MB", duckdb / mib))
@@ -125,8 +123,8 @@ pub(crate) fn prepare_base_tables(
     let inputs = parquet_input_sql(&options.parquet_inputs);
     let input_columns = parquet_input_columns(conn, &inputs)?;
     let metadata_json_expr = metadata_json_projection_expr(&input_columns);
-    let source_file_id_expr = source_file_id_projection_expr(&options.parquet_inputs);
-    progress.start_stage("preparing DuckDB tables", 9);
+    let source_file_relation = source_file_id_relation_sql(&options.parquet_inputs);
+    progress.start_stage("preparing DuckDB tables", 11);
     execute_progress_batch(
         conn,
         &build_core_rows_sql(&inputs),
@@ -150,16 +148,15 @@ pub(crate) fn prepare_base_tables(
         "loaded selected chains",
     )?;
     let chains = load_selected_chains(conn)?;
-    validate_chain_mask_capacity(chains.len())?;
     let include_cross_chain = chains.len() > 1;
     if include_cross_chain {
-        progress.add_work(2);
+        progress.add_work(3);
     }
-    materialize_uri_metadata_rows(
+    materialize_uri_metadata_projection(
         conn,
         &inputs,
         &metadata_json_expr,
-        &source_file_id_expr,
+        &source_file_relation,
         progress,
     )?;
     execute_progress_batch(
@@ -168,8 +165,13 @@ pub(crate) fn prepare_base_tables(
         progress,
         "materialized contract statistics",
     )?;
-    build_uri_key_stats(conn, progress, include_cross_chain)?;
-    build_uri_contract_flags(conn, progress, include_cross_chain)?;
+    execute_progress_batch(
+        conn,
+        build_chain_totals_sql(),
+        progress,
+        "built compact chain totals",
+    )?;
+    super::metadata::prepare_metadata_compact_tables(conn, progress)?;
     execute_progress_batch(
         conn,
         "
@@ -190,37 +192,42 @@ pub(crate) fn prepare_base_tables(
         progress,
         "built name atoms",
     )?;
+    build_uri_key_stats(conn, progress, include_cross_chain)?;
+    build_uri_contract_flags(conn, progress, include_cross_chain)?;
     progress.finish_stage("DuckDB tables ready");
     Ok(chains)
 }
 
-pub(crate) fn validate_chain_mask_capacity(chain_count: usize) -> Result<(), AnalysisError> {
-    if chain_count > u64::BITS as usize {
-        return Err(AnalysisError::InvalidData(format!(
-            "URI chain masks support at most {} chains, got {chain_count}",
-            u64::BITS
-        )));
-    }
-    Ok(())
-}
-
 pub(super) fn analysis_contracts_sql() -> String {
-    format!(
-        "
+    "
+        CREATE OR REPLACE TEMP TABLE metadata_contract_token_sources AS
+        SELECT contract_id,
+               token_id,
+               arg_min(
+                   struct_pack(
+                       file_id := source_file,
+                       row_number := source_row_number
+                   ),
+                   row(source_file, source_row_number)
+               ) AS metadata_source,
+               max(metadata_json_bytes)::UBIGINT AS metadata_max_json_bytes
+        FROM metadata_rows
+        WHERE metadata_eligible
+        GROUP BY contract_id, token_id;
+
         CREATE OR REPLACE TABLE analysis_contracts AS
         WITH metadata_sources AS (
             SELECT contract_id,
                    arg_min(
-                       struct_pack(
-                           file_id := source_file,
-                           row_number := source_row_number
-                       ),
-                       row(token_id, source_file, source_row_number)
+                       metadata_source,
+                       row(
+                           token_id,
+                           metadata_source.file_id,
+                           metadata_source.row_number
+                       )
                    ) AS metadata_source,
-                   max(octet_length(encode(metadata_json)))::UBIGINT
-                       AS metadata_max_json_bytes
-            FROM metadata_rows
-            WHERE {metadata_eligible}
+                   max(metadata_max_json_bytes)::UBIGINT AS metadata_max_json_bytes
+            FROM metadata_contract_token_sources
             GROUP BY contract_id
         ),
         indexed_metadata_sources AS (
@@ -247,9 +254,8 @@ pub(super) fn analysis_contracts_sql() -> String {
         LEFT JOIN indexed_metadata_sources metadata
           ON metadata.contract_id = contracts.contract_id
         ;
-        ",
-        metadata_eligible = "metadata_eligible",
-    )
+        "
+    .to_string()
 }
 
 #[cfg(test)]
@@ -267,10 +273,10 @@ pub(crate) fn metadata_json_eligible_predicate(column: &str) -> String {
     )
 }
 
-fn normalized_metadata_json_eligible_predicate(column: &str) -> String {
+fn normalized_metadata_json_eligible_predicate(column: &str, byte_length_column: &str) -> String {
     format!(
         "{column} <> ''
-         AND octet_length(encode({column})) <= {MAX_METADATA_BYTES_FOR_DEDUP}
+         AND {byte_length_column} <= {MAX_METADATA_BYTES_FOR_DEDUP}
          AND (starts_with({column}, '{{') OR starts_with({column}, '['))"
     )
 }
@@ -279,17 +285,21 @@ pub(crate) fn build_core_rows_sql(inputs: &str) -> String {
     format!(
         "
         CREATE OR REPLACE TEMP TABLE contract_dim AS
-        WITH normalized AS (
-            SELECT lower(trim(CAST(chain AS VARCHAR))) AS chain,
-                   CASE
-                       WHEN lower(trim(CAST(chain AS VARCHAR))) = 'solana'
-                           THEN trim(CAST(contract_address AS VARCHAR))
-                       ELSE lower(trim(CAST(contract_address AS VARCHAR)))
-                   END AS contract_address,
-                   trim(coalesce(CAST(name_norm AS VARCHAR), '')) AS name_norm
-            FROM read_parquet({inputs})
-            WHERE chain IS NOT NULL
-              AND trim(CAST(chain AS VARCHAR)) <> ''
+        WITH raw AS (
+             SELECT lower(trim(CAST(chain AS VARCHAR))) AS chain,
+                    trim(CAST(contract_address AS VARCHAR)) AS contract_address,
+                    trim(coalesce(CAST(name_norm AS VARCHAR), '')) AS name_norm
+             FROM read_parquet({inputs})
+             WHERE chain IS NOT NULL
+        ), normalized AS (
+             SELECT chain,
+                    CASE
+                        WHEN chain = 'solana' THEN contract_address
+                        ELSE lower(contract_address)
+                    END AS contract_address,
+                    name_norm
+             FROM raw
+             WHERE chain <> ''
         ), aggregated AS (
             SELECT chain,
                    contract_address,
@@ -306,259 +316,175 @@ pub(crate) fn build_core_rows_sql(inputs: &str) -> String {
     )
 }
 
-pub(crate) fn source_file_id_projection_expr(paths: &[PathBuf]) -> String {
-    let branches = paths
+pub(crate) fn source_file_id_relation_sql(paths: &[PathBuf]) -> String {
+    let rows = paths
         .iter()
         .enumerate()
         .map(|(file_id, path)| {
             format!(
-                "WHEN '{}' THEN {}::UINTEGER",
+                "('{}', {}::UINTEGER)",
                 sql_string(&path.display().to_string().replace('\\', "/")),
                 file_id
             )
         })
         .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "CASE replace(CAST(filename AS VARCHAR), chr(92), '/')\n\
-             {branches}\n\
-             ELSE error('Parquet filename is absent from the stable file_id map')::UINTEGER\n\
-         END"
-    )
+        .join(",\n");
+    format!("(VALUES\n{rows}\n) AS source_files(filename, file_id)")
 }
 
-pub(crate) fn build_uri_metadata_stream_sql(
+pub(crate) fn build_uri_metadata_projection_sql(
     inputs: &str,
     metadata_json_expr: &str,
-    source_file_expr: &str,
+    source_file_relation: &str,
 ) -> String {
     format!(
-        "WITH projected AS (
+        "CREATE OR REPLACE TABLE prepare_uri_metadata_rows AS
+         WITH raw AS (
              SELECT lower(trim(CAST(chain AS VARCHAR))) AS chain,
-                    CASE
-                        WHEN lower(trim(CAST(chain AS VARCHAR))) = 'solana'
-                            THEN trim(CAST(contract_address AS VARCHAR))
-                        ELSE lower(trim(CAST(contract_address AS VARCHAR)))
-                    END AS contract_address,
+                    trim(CAST(contract_address AS VARCHAR)) AS contract_address,
                     coalesce(CAST(token_uri_norm AS VARCHAR), '') AS token_uri_norm,
                     coalesce(CAST(image_uri_norm AS VARCHAR), '') AS image_uri_norm,
                     trim(coalesce(CAST(token_id AS VARCHAR), '')) AS token_id,
-                    trim(coalesce({metadata_json_expr}, '')) AS metadata_json,
-                    {source_file_expr} AS source_file,
+                    {metadata_json_expr} AS metadata_json,
+                    replace(CAST(filename AS VARCHAR), chr(92), '/') AS source_filename,
                     file_row_number::UBIGINT AS source_row_number
              FROM read_parquet({inputs}, filename = true, file_row_number = true)
              WHERE chain IS NOT NULL
-               AND trim(CAST(chain AS VARCHAR)) <> ''
+         ),
+         projected AS (
+             SELECT chain,
+                    CASE
+                        WHEN chain = 'solana' THEN contract_address
+                        ELSE lower(contract_address)
+                    END AS contract_address,
+                    token_uri_norm,
+                    image_uri_norm,
+                    token_id,
+                    metadata_json,
+                    source_filename,
+                    source_row_number
+             FROM raw
+             WHERE chain <> ''
+         ),
+         sized AS (
+             SELECT projected.*,
+                    least(
+                        octet_length(encode(projected.metadata_json)),
+                        {ineligible_length_sentinel}
+                    )::UINTEGER AS metadata_json_bytes
+             FROM projected
+         ),
+         classified AS (
+             SELECT sized.*,
+                    ({metadata_eligible}) AS metadata_eligible
+             FROM sized
          )
          SELECT chains.chain_index::UINTEGER AS chain_index,
                 contracts.contract_id::UINTEGER AS contract_id,
-                projected.token_uri_norm,
-                projected.image_uri_norm,
-                projected.token_id,
-                projected.metadata_json,
-                projected.source_file::UINTEGER AS source_file,
-                projected.source_row_number,
-                ({metadata_eligible}) AS metadata_eligible
-         FROM projected
+                classified.token_uri_norm,
+                classified.image_uri_norm,
+                classified.token_id,
+                CASE
+                    WHEN classified.metadata_eligible THEN classified.metadata_json
+                    ELSE ''
+                END AS metadata_json,
+                CASE
+                    WHEN classified.metadata_eligible THEN classified.metadata_json_bytes
+                    ELSE 0::UINTEGER
+                END AS metadata_json_bytes,
+                coalesce(
+                    source_files.file_id,
+                    error('Parquet filename is absent from the stable file_id map')::UINTEGER
+                ) AS source_file,
+                classified.source_row_number,
+                classified.metadata_eligible
+         FROM classified
+         LEFT JOIN {source_file_relation}
+           ON source_files.filename = classified.source_filename
          JOIN contract_dim contracts
-           ON contracts.chain = projected.chain
-          AND contracts.contract_address = projected.contract_address
+           ON contracts.chain = classified.chain
+          AND contracts.contract_address = classified.contract_address
          JOIN selected_chains chains ON chains.chain = contracts.chain
-         WHERE projected.token_uri_norm <> ''
-            OR projected.image_uri_norm <> ''
-            OR ({metadata_eligible})",
-        metadata_eligible = normalized_metadata_json_eligible_predicate("metadata_json"),
+         WHERE classified.token_uri_norm <> ''
+            OR classified.image_uri_norm <> ''
+            OR classified.metadata_eligible",
+        metadata_eligible = normalized_metadata_json_eligible_predicate(
+            "sized.metadata_json",
+            "sized.metadata_json_bytes"
+        ),
+        ineligible_length_sentinel = MAX_METADATA_BYTES_FOR_DEDUP + 1,
     )
 }
 
-fn materialize_uri_metadata_rows(
+pub(crate) fn build_uri_metadata_views_sql() -> &'static str {
+    "
+        CREATE OR REPLACE TEMP VIEW uri_rows AS
+        SELECT chain_index,
+               contract_id,
+               token_uri_norm,
+               image_uri_norm
+        FROM prepare_uri_metadata_rows
+        WHERE token_uri_norm <> '' OR image_uri_norm <> '';
+
+        CREATE OR REPLACE TEMP VIEW metadata_rows AS
+        SELECT contract_id,
+               token_id,
+               metadata_json,
+               metadata_json_bytes,
+               source_file,
+               source_row_number,
+               metadata_eligible
+        FROM prepare_uri_metadata_rows
+        WHERE metadata_eligible;
+    "
+}
+
+pub(crate) fn materialize_uri_metadata_projection(
     conn: &Connection,
     inputs: &str,
     metadata_json_expr: &str,
-    source_file_expr: &str,
+    source_file_relation: &str,
     progress: &ProgressTracker,
 ) -> Result<(), AnalysisError> {
-    use duckdb::arrow::array::{
-        Array, ArrayRef, BooleanArray, StringArray, UInt32Array, UInt64Array,
-    };
-    use duckdb::arrow::record_batch::RecordBatch;
-    use std::sync::Arc;
-
     conn.execute_batch(
-        "CREATE OR REPLACE TEMP TABLE uri_rows(
-             chain_index UINTEGER,
-             contract_id UINTEGER,
-             token_uri_norm VARCHAR,
-             image_uri_norm VARCHAR
-         );
-         CREATE OR REPLACE TABLE metadata_rows(
-             contract_id UINTEGER,
-             token_id VARCHAR,
-             metadata_json VARCHAR,
-             source_file UINTEGER,
-             source_row_number UBIGINT,
-             metadata_eligible BOOLEAN
-         );",
+        "DROP TABLE IF EXISTS metadata_rows;
+         DROP TABLE IF EXISTS prepare_uri_metadata_rows;
+         DROP TABLE IF EXISTS metadata_rows_materialized;",
     )?;
-    progress.start_task("streaming URI + metadata projection", None, "rows");
-    let sql = build_uri_metadata_stream_sql(inputs, metadata_json_expr, source_file_expr);
-    let mut statement = conn.prepare(&sql)?;
-    let batches = statement.query_arrow([])?;
-    let mut uri_appender = conn.appender("uri_rows")?;
-    let mut metadata_appender = conn.appender("metadata_rows")?;
-    let mut completed = 0u64;
-    for batch in batches {
-        let chain_indexes = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .ok_or_else(|| AnalysisError::InvalidData("chain_index is not UINTEGER".into()))?;
-        let contract_ids = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .ok_or_else(|| AnalysisError::InvalidData("contract_id is not UINTEGER".into()))?;
-        let source_files = batch
-            .column(6)
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .ok_or_else(|| AnalysisError::InvalidData("source_file is not UINTEGER".into()))?;
-        let source_rows = batch
-            .column(7)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| AnalysisError::InvalidData("source_row_number is not UBIGINT".into()))?;
-        let eligible = batch
-            .column(8)
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .ok_or_else(|| AnalysisError::InvalidData("metadata_eligible is not BOOLEAN".into()))?;
-        let mut uri_chain = Vec::new();
-        let mut uri_contract = Vec::new();
-        let mut token_uris = Vec::new();
-        let mut image_uris = Vec::new();
-        let mut metadata_contract = Vec::new();
-        let mut token_ids = Vec::new();
-        let mut metadata_json = Vec::new();
-        let mut metadata_files = Vec::new();
-        let mut metadata_rows = Vec::new();
-        for index in 0..batch.num_rows() {
-            if chain_indexes.is_null(index)
-                || contract_ids.is_null(index)
-                || source_files.is_null(index)
-                || source_rows.is_null(index)
-                || eligible.is_null(index)
-            {
-                return Err(AnalysisError::InvalidData(
-                    "URI/metadata projection contains NULL identity columns".into(),
-                ));
-            }
-            let token_uri = arrow_string_value(batch.column(2).as_ref(), index)?;
-            let image_uri = arrow_string_value(batch.column(3).as_ref(), index)?;
-            if !token_uri.is_empty() || !image_uri.is_empty() {
-                uri_chain.push(chain_indexes.value(index));
-                uri_contract.push(contract_ids.value(index));
-                token_uris.push(token_uri.to_owned());
-                image_uris.push(image_uri.to_owned());
-            }
-            if eligible.value(index) {
-                metadata_contract.push(contract_ids.value(index));
-                token_ids.push(arrow_string_value(batch.column(4).as_ref(), index)?.to_owned());
-                metadata_json.push(arrow_string_value(batch.column(5).as_ref(), index)?.to_owned());
-                metadata_files.push(source_files.value(index));
-                metadata_rows.push(source_rows.value(index));
-            }
-        }
-        if !uri_chain.is_empty() {
-            let uri_batch = RecordBatch::try_from_iter(vec![
-                (
-                    "chain_index",
-                    Arc::new(UInt32Array::from(uri_chain)) as ArrayRef,
-                ),
-                (
-                    "contract_id",
-                    Arc::new(UInt32Array::from(uri_contract)) as ArrayRef,
-                ),
-                (
-                    "token_uri_norm",
-                    Arc::new(StringArray::from(token_uris)) as ArrayRef,
-                ),
-                (
-                    "image_uri_norm",
-                    Arc::new(StringArray::from(image_uris)) as ArrayRef,
-                ),
-            ])
-            .map_err(|error| {
-                AnalysisError::InvalidData(format!("cannot build URI Arrow batch: {error}"))
-            })?;
-            uri_appender.append_record_batch(uri_batch)?;
-        }
-        if !metadata_contract.is_empty() {
-            let count = metadata_contract.len();
-            let metadata_batch = RecordBatch::try_from_iter(vec![
-                (
-                    "contract_id",
-                    Arc::new(UInt32Array::from(metadata_contract)) as ArrayRef,
-                ),
-                (
-                    "token_id",
-                    Arc::new(StringArray::from(token_ids)) as ArrayRef,
-                ),
-                (
-                    "metadata_json",
-                    Arc::new(StringArray::from(metadata_json)) as ArrayRef,
-                ),
-                (
-                    "source_file",
-                    Arc::new(UInt32Array::from(metadata_files)) as ArrayRef,
-                ),
-                (
-                    "source_row_number",
-                    Arc::new(UInt64Array::from(metadata_rows)) as ArrayRef,
-                ),
-                (
-                    "metadata_eligible",
-                    Arc::new(BooleanArray::from(vec![true; count])) as ArrayRef,
-                ),
-            ])
-            .map_err(|error| {
-                AnalysisError::InvalidData(format!("cannot build metadata Arrow batch: {error}"))
-            })?;
-            metadata_appender.append_record_batch(metadata_batch)?;
-        }
-        let batch_rows = batch.num_rows() as u64;
-        completed = completed.saturating_add(batch_rows);
-        progress.advance_task(batch_rows, ProgressCounters::default());
-    }
-    drop(metadata_appender);
-    drop(uri_appender);
-    persist_last_duckdb_profile(conn, "streamed URI + metadata projection")?;
+    progress.start_task("materializing URI + metadata projection", None, "rows");
+    conn.execute_batch(&build_uri_metadata_projection_sql(
+        inputs,
+        metadata_json_expr,
+        source_file_relation,
+    ))?;
+    persist_last_duckdb_profile(conn, "materialized URI + metadata projection")?;
+    conn.execute_batch(build_uri_metadata_views_sql())?;
     progress.finish_task("URI + metadata projection ready");
     progress.step_stage("materialized URI projection");
     progress.step_stage("materialized eligible metadata projection");
     Ok(())
 }
 
-fn arrow_string_value(
-    array: &dyn duckdb::arrow::array::Array,
-    index: usize,
-) -> Result<&str, AnalysisError> {
-    use duckdb::arrow::array::{StringArray, StringViewArray};
-
-    if array.is_null(index) {
-        return Err(AnalysisError::InvalidData(
-            "URI/metadata projection contains NULL string".into(),
-        ));
-    }
-    if let Some(strings) = array.as_any().downcast_ref::<StringArray>() {
-        return Ok(strings.value(index));
-    }
-    if let Some(strings) = array.as_any().downcast_ref::<StringViewArray>() {
-        return Ok(strings.value(index));
-    }
-    Err(AnalysisError::InvalidData(
-        "URI/metadata projection string has wrong Arrow type".into(),
-    ))
+pub(crate) fn materialize_metadata_rows_after_uri(conn: &Connection) -> Result<(), AnalysisError> {
+    conn.execute_batch(
+        "CREATE OR REPLACE TABLE metadata_rows_materialized AS
+         SELECT contract_id,
+                token_id,
+                metadata_json,
+                metadata_json_bytes,
+                source_file,
+                source_row_number,
+                metadata_eligible
+         FROM metadata_rows;",
+    )?;
+    persist_last_duckdb_profile(conn, "materialized durable metadata rows")?;
+    conn.execute_batch(
+        "DROP VIEW metadata_rows;
+         DROP VIEW uri_rows;
+         DROP TABLE prepare_uri_metadata_rows;
+         ALTER TABLE metadata_rows_materialized RENAME TO metadata_rows;",
+    )?;
+    Ok(())
 }
 
 pub(crate) fn execute_progress_batch(
@@ -684,9 +610,21 @@ pub(crate) fn build_uri_key_stats(
         "built URI key contracts",
     )?;
 
+    if include_cross_chain {
+        // This is the shared compression boundary for both cross-chain
+        // existence and directed pair expansion.  Without it, the full
+        // contract/key relation is hash-aggregated twice and every matching
+        // NFT row probes all C selected chains.
+        execute_progress_batch(
+            conn,
+            &build_uri_key_chain_stats_sql(),
+            progress,
+            "built compact URI chain-key stats",
+        )?;
+    }
     execute_progress_batch(
         conn,
-        &build_uri_duplicate_key_stats_sql(),
+        &build_uri_duplicate_key_stats_sql(include_cross_chain),
         progress,
         "built duplicate-only URI key stats",
     )?;
@@ -698,6 +636,7 @@ pub(crate) fn build_uri_key_stats(
             "built cross-chain URI keys",
         )?;
     }
+    conn.execute_batch("DROP TABLE uri_key_contracts;")?;
     Ok(())
 }
 
@@ -723,33 +662,56 @@ pub(crate) fn build_uri_key_contracts_sql() -> String {
     .to_string()
 }
 
-pub(crate) fn build_uri_duplicate_key_stats_sql() -> String {
+pub(crate) fn build_uri_key_chain_stats_sql() -> String {
     "
+        CREATE TEMP TABLE uri_key_chain_stats AS
+        SELECT chain_index,
+               key_kind,
+               key_value,
+               count(*) >= 2 AS is_duplicate
+        FROM uri_key_contracts
+        GROUP BY chain_index, key_kind, key_value;
+    "
+    .to_string()
+}
+
+pub(crate) fn build_uri_duplicate_key_stats_sql(include_cross_chain: bool) -> String {
+    let source = if include_cross_chain {
+        "uri_key_chain_stats"
+    } else {
+        "uri_key_contracts"
+    };
+    format!(
+        "
         CREATE TEMP TABLE uri_duplicate_key_stats AS
         SELECT chain_index,
                key_kind,
                key_value,
-               count(*)::BIGINT AS contract_count
-        FROM uri_key_contracts
-        GROUP BY chain_index, key_kind, key_value
-        HAVING count(*) >= 2;
-    "
-    .to_string()
+               {duplicate_value} AS is_duplicate
+        FROM {source}
+        {duplicate_filter};
+        ",
+        duplicate_value = if include_cross_chain {
+            "is_duplicate"
+        } else {
+            "true"
+        },
+        duplicate_filter = if include_cross_chain {
+            "WHERE is_duplicate"
+        } else {
+            "GROUP BY chain_index, key_kind, key_value\n        HAVING count(*) >= 2"
+        },
+    )
 }
 
 pub(crate) fn build_uri_cross_chain_keys_sql() -> String {
     "
         CREATE TEMP TABLE uri_cross_chain_keys AS
-        WITH masks AS (
-            SELECT keys.key_kind,
-                   keys.key_value,
-                   bit_or(1::UBIGINT << keys.chain_index) AS chain_mask
-            FROM uri_key_contracts keys
-            GROUP BY keys.key_kind, keys.key_value
-        )
-        SELECT *
-        FROM masks
-        WHERE bit_count(chain_mask) >= 2;
+        SELECT keys.key_kind,
+               keys.key_value
+        FROM uri_key_chain_stats keys
+        GROUP BY keys.key_kind, keys.key_value
+        HAVING count(*) >= 2;
         "
     .to_string()
 }
@@ -763,15 +725,20 @@ pub(crate) fn build_uri_contract_flags(
         conn,
         &build_uri_contract_flags_sql(include_cross_chain),
         progress,
-        "built compact URI contract flags",
+        "built compact URI chain counts",
+    )?;
+    conn.execute_batch(
+        "DROP TABLE uri_duplicate_key_stats;
+         DROP TABLE IF EXISTS uri_cross_chain_keys;",
     )?;
     if include_cross_chain {
         execute_progress_batch(
             conn,
             &build_uri_chain_pair_contract_flags_sql(),
             progress,
-            "built URI chain-pair contract flags",
+            "built URI directed chain-pair counts",
         )?;
+        conn.execute_batch("DROP TABLE uri_key_chain_stats;")?;
     }
     Ok(())
 }
@@ -780,14 +747,8 @@ pub(crate) fn build_uri_contract_flags_sql(include_cross_chain: bool) -> String 
     let (cross_key_columns, cross_key_joins) = if include_cross_chain {
         (
             ",
-                       coalesce(
-                           (ct.chain_mask & ~(1::UBIGINT << r.chain_index)) <> 0,
-                           false
-                       ) AS norm_token_cross_chain,
-                       coalesce(
-                           (ci.chain_mask & ~(1::UBIGINT << r.chain_index)) <> 0,
-                           false
-                       ) AS norm_image_cross_chain",
+                       ct.key_value IS NOT NULL AS norm_token_cross_chain,
+                       ci.key_value IS NOT NULL AS norm_image_cross_chain",
             "
                 LEFT JOIN uri_cross_chain_keys ct
                   ON ct.key_kind = 0
@@ -798,6 +759,14 @@ pub(crate) fn build_uri_contract_flags_sql(include_cross_chain: bool) -> String 
         )
     } else {
         ("", "")
+    };
+    let cross_aggregate_columns = if include_cross_chain {
+        format!(
+            ",\n                   {}",
+            uri_count_sum_columns("norm_cross_chain")
+        )
+    } else {
+        String::new()
     };
 
     format!(
@@ -817,8 +786,8 @@ pub(crate) fn build_uri_contract_flags_sql(include_cross_chain: bool) -> String 
             keyed AS (
                 SELECT r.chain_index,
                        r.contract_id,
-                       coalesce(nt.contract_count >= 2, false) AS norm_token_contract,
-                       coalesce(ni.contract_count >= 2, false) AS norm_image_contract
+                       coalesce(nt.is_duplicate, false) AS norm_token_contract,
+                       coalesce(ni.is_duplicate, false) AS norm_image_contract
                        {cross_key_columns}
                 FROM rows r
                 LEFT JOIN uri_duplicate_key_stats nt
@@ -830,15 +799,26 @@ pub(crate) fn build_uri_contract_flags_sql(include_cross_chain: bool) -> String 
                  AND ni.key_kind = 1
                  AND ni.key_value = r.image_uri_norm
                 {cross_key_joins}
+            ),
+            contract_flags AS (
+                -- Contract-level maxima are required for exact distinct
+                -- contract counts, but no downstream consumer needs this
+                -- cardinality-sized relation. Feed it directly into the
+                -- chain aggregate and materialize only O(C) rows.
+                SELECT chain_index,
+                       contract_id,
+                       {contract_columns}
+                FROM keyed
+                GROUP BY chain_index, contract_id
             )
             SELECT chain_index,
-                   contract_id,
-                   count(*)::BIGINT AS total_nfts,
-                   {contract_columns}
-            FROM keyed
-            GROUP BY chain_index, contract_id;
+                   {aggregate_columns}{cross_aggregate_columns}
+            FROM contract_flags
+            GROUP BY chain_index;
             ",
         contract_columns = uri_contract_metric_columns(include_cross_chain),
+        aggregate_columns = uri_count_sum_columns("norm_contract"),
+        cross_aggregate_columns = cross_aggregate_columns,
         cross_key_columns = cross_key_columns,
         cross_key_joins = cross_key_joins,
     )
@@ -877,12 +857,12 @@ pub(crate) fn build_uri_chain_pair_contract_flags_sql() -> String {
         "
         CREATE TEMP TABLE uri_chain_pair_contract_flags AS
         WITH rows AS (
-            SELECT uri_rows.rowid AS uri_row_id,
-                   uri_rows.chain_index AS primary_chain_index,
-                   uri_rows.contract_id,
+            SELECT projected.rowid AS uri_row_id,
+                   projected.chain_index AS primary_chain_index,
+                   projected.contract_id,
                    token_uri_norm,
                    image_uri_norm
-            FROM uri_rows
+            FROM prepare_uri_metadata_rows projected
             WHERE token_uri_norm <> '' OR image_uri_norm <> ''
         ),
         token_hits AS (
@@ -893,12 +873,13 @@ pub(crate) fn build_uri_chain_pair_contract_flags_sql() -> String {
                    true AS norm_token_chain,
                    false AS norm_image_chain
             FROM rows r
-            INNER JOIN uri_cross_chain_keys keys
-              ON keys.key_kind = 0
-             AND keys.key_value = r.token_uri_norm
-            INNER JOIN selected_chains secondary
-              ON secondary.chain_index <> r.primary_chain_index
-             AND (keys.chain_mask & (1::UBIGINT << secondary.chain_index)) <> 0
+            -- `uri_key_chain_stats` is unique by (chain, kind, value), so this
+            -- is an output-sensitive hash join: O(rows + emitted hits), not
+            -- O(rows * selected chains).
+            INNER JOIN uri_key_chain_stats secondary
+              ON secondary.key_kind = 0
+             AND secondary.key_value = r.token_uri_norm
+             AND secondary.chain_index <> r.primary_chain_index
         ),
         image_hits AS (
             SELECT r.uri_row_id,
@@ -908,12 +889,10 @@ pub(crate) fn build_uri_chain_pair_contract_flags_sql() -> String {
                    false AS norm_token_chain,
                    true AS norm_image_chain
             FROM rows r
-            INNER JOIN uri_cross_chain_keys keys
-              ON keys.key_kind = 1
-             AND keys.key_value = r.image_uri_norm
-            INNER JOIN selected_chains secondary
-              ON secondary.chain_index <> r.primary_chain_index
-             AND (keys.chain_mask & (1::UBIGINT << secondary.chain_index)) <> 0
+            INNER JOIN uri_key_chain_stats secondary
+              ON secondary.key_kind = 1
+             AND secondary.key_value = r.image_uri_norm
+             AND secondary.chain_index <> r.primary_chain_index
         ),
         keyed AS (
             SELECT uri_row_id,
@@ -931,24 +910,33 @@ pub(crate) fn build_uri_chain_pair_contract_flags_sql() -> String {
         )
         SELECT primary_chain_index,
                secondary_chain_index,
-               contract_id,
-               {metric_columns}
-        FROM keyed
-        GROUP BY primary_chain_index, secondary_chain_index, contract_id;
+               {aggregate_columns}
+        FROM (
+            -- As above, keep the contract relation inside the query plan and
+            -- persist only O(C^2) directed pair totals.
+            SELECT primary_chain_index,
+                   secondary_chain_index,
+                   contract_id,
+                   {metric_columns}
+            FROM keyed
+            GROUP BY primary_chain_index, secondary_chain_index, contract_id
+        ) contract_flags
+        GROUP BY primary_chain_index, secondary_chain_index;
         ",
         metric_columns =
             uri_contract_metric_sql("norm_chain", "norm_token_chain", "norm_image_chain"),
+        aggregate_columns = uri_count_sum_columns("norm_chain"),
     )
 }
 
 pub(crate) fn uri_count_sum_columns(prefix: &str) -> String {
     format!(
-        "coalesce(sum({prefix}_v1_nfts), 0)::BIGINT,
-               coalesce(sum({prefix}_v1_contracts), 0)::BIGINT,
-               coalesce(sum({prefix}_v2_nfts), 0)::BIGINT,
-               coalesce(sum({prefix}_v2_contracts), 0)::BIGINT,
-               coalesce(sum({prefix}_v3_nfts), 0)::BIGINT,
-               coalesce(sum({prefix}_v3_contracts), 0)::BIGINT"
+        "coalesce(sum({prefix}_v1_nfts), 0)::BIGINT AS {prefix}_v1_nfts,
+               coalesce(sum({prefix}_v1_contracts), 0)::BIGINT AS {prefix}_v1_contracts,
+               coalesce(sum({prefix}_v2_nfts), 0)::BIGINT AS {prefix}_v2_nfts,
+               coalesce(sum({prefix}_v2_contracts), 0)::BIGINT AS {prefix}_v2_contracts,
+               coalesce(sum({prefix}_v3_nfts), 0)::BIGINT AS {prefix}_v3_nfts,
+               coalesce(sum({prefix}_v3_contracts), 0)::BIGINT AS {prefix}_v3_contracts"
     )
 }
 
@@ -956,7 +944,7 @@ pub(crate) fn uri_contract_counts_sql(include_cross_chain: bool) -> String {
     let cross_columns = if include_cross_chain {
         format!(
             ",\n               {}",
-            uri_count_sum_columns("norm_cross_chain")
+            uri_count_columns("norm_cross_chain")
         )
     } else {
         String::new()
@@ -967,9 +955,19 @@ pub(crate) fn uri_contract_counts_sql(include_cross_chain: bool) -> String {
                {intra_columns}{cross_columns}
         FROM uri_contract_flags flags
         INNER JOIN selected_chains chains USING (chain_index)
-        GROUP BY chains.chain
         ",
-        intra_columns = uri_count_sum_columns("norm_contract"),
+        intra_columns = uri_count_columns("norm_contract"),
+    )
+}
+
+pub(crate) fn uri_count_columns(prefix: &str) -> String {
+    format!(
+        "{prefix}_v1_nfts,
+               {prefix}_v1_contracts,
+               {prefix}_v2_nfts,
+               {prefix}_v2_contracts,
+               {prefix}_v3_nfts,
+               {prefix}_v3_contracts"
     )
 }
 
@@ -1015,31 +1013,19 @@ pub(crate) fn load_uri_contract_counts(
 
 pub(crate) fn uri_chain_pair_counts_sql() -> &'static str {
     "
-        WITH counts AS (
-            SELECT primary_chain_index,
-                   secondary_chain_index,
-                   coalesce(sum(norm_chain_v1_nfts), 0)::BIGINT AS v1_nfts,
-                   coalesce(sum(norm_chain_v1_contracts), 0)::BIGINT AS v1_contracts,
-                   coalesce(sum(norm_chain_v2_nfts), 0)::BIGINT AS v2_nfts,
-                   coalesce(sum(norm_chain_v2_contracts), 0)::BIGINT AS v2_contracts,
-                   coalesce(sum(norm_chain_v3_nfts), 0)::BIGINT AS v3_nfts,
-                   coalesce(sum(norm_chain_v3_contracts), 0)::BIGINT AS v3_contracts
-            FROM uri_chain_pair_contract_flags
-            GROUP BY primary_chain_index, secondary_chain_index
-        )
         SELECT primary_chain.chain,
                secondary_chain.chain,
-               counts.v1_nfts,
-               counts.v1_contracts,
-               counts.v2_nfts,
-               counts.v2_contracts,
-               counts.v3_nfts,
-               counts.v3_contracts
-        FROM counts
+               flags.norm_chain_v1_nfts,
+               flags.norm_chain_v1_contracts,
+               flags.norm_chain_v2_nfts,
+               flags.norm_chain_v2_contracts,
+               flags.norm_chain_v3_nfts,
+               flags.norm_chain_v3_contracts
+        FROM uri_chain_pair_contract_flags flags
         INNER JOIN selected_chains primary_chain
-          ON primary_chain.chain_index = counts.primary_chain_index
+          ON primary_chain.chain_index = flags.primary_chain_index
         INNER JOIN selected_chains secondary_chain
-          ON secondary_chain.chain_index = counts.secondary_chain_index
+          ON secondary_chain.chain_index = flags.secondary_chain_index
         "
 }
 
@@ -1103,6 +1089,14 @@ pub(crate) fn load_chain_totals(
 
 pub(crate) fn chain_totals_sql() -> &'static str {
     "
+        SELECT chain, contract_count, nft_count
+        FROM chain_totals
+    "
+}
+
+pub(crate) fn build_chain_totals_sql() -> &'static str {
+    "
+        CREATE OR REPLACE TABLE chain_totals AS
         SELECT chain,
                count(*)::BIGINT AS contract_count,
                coalesce(sum(nft_count), 0)::BIGINT AS nft_count

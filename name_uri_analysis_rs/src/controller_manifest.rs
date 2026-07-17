@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use duckdb::Connection;
-use name_uri_analysis_rs::analysis::{AnalysisOptions, MATCH_ETA_FORECAST_SCHEMA_VERSION};
+use name_uri_analysis_rs::analysis::{
+    effective_memory_capacity_bytes, AnalysisOptions, MATCH_ETA_FORECAST_SCHEMA_VERSION,
+};
 use name_uri_analysis_rs::write_json_atomically;
 use serde::{Deserialize, Serialize};
 use sysinfo::System;
@@ -89,6 +91,8 @@ const MATCH_OBSERVATION_SCHEMA_VERSION: u32 = MATCH_ETA_FORECAST_SCHEMA_VERSION;
 const MATCH_SCALE_SCHEMA_VERSION: u32 = 3;
 const MIN_MATCH_FORECAST_SAMPLES: usize = 8;
 const MAX_MATCH_OBSERVATIONS_PER_PARTITION: usize = 256;
+const MATCH_FORECAST_LOWER_PERCENTILE: usize = 20;
+const MATCH_FORECAST_UPPER_PERCENTILE: usize = 80;
 static OBSERVATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -283,8 +287,10 @@ pub(crate) fn match_observation_key(
         hardware: MatchHardwareKey {
             architecture: std::env::consts::ARCH.to_string(),
             cpu_brand,
-            logical_cpus: system.cpus().len(),
-            total_memory_bytes: system.total_memory(),
+            logical_cpus: std::thread::available_parallelism()
+                .map(|value| value.get())
+                .unwrap_or(1),
+            total_memory_bytes: effective_memory_capacity_bytes(),
         },
         threads: std::env::var("NAME_URI_ANALYSIS_METADATA_MATCH_THREADS")
             .ok()
@@ -433,7 +439,10 @@ pub(crate) fn load_match_eta_forecast(
     wall_millis.sort_unstable();
     let sample_count = wall_millis.len();
     let (lower_total_millis, upper_total_millis) = if sample_count >= MIN_MATCH_FORECAST_SAMPLES {
-        (wall_millis.first().copied(), wall_millis.last().copied())
+        (
+            percentile(&wall_millis, MATCH_FORECAST_LOWER_PERCENTILE, false),
+            percentile(&wall_millis, MATCH_FORECAST_UPPER_PERCENTILE, true),
+        )
     } else {
         (None, None)
     };
@@ -443,6 +452,17 @@ pub(crate) fn load_match_eta_forecast(
         lower_total_millis,
         upper_total_millis,
     })
+}
+
+fn percentile(sorted: &[u64], percentile: usize, round_up: bool) -> Option<u64> {
+    let last = sorted.len().checked_sub(1)?;
+    let numerator = last.saturating_mul(percentile.min(100));
+    let index = if round_up {
+        numerator.saturating_add(99) / 100
+    } else {
+        numerator / 100
+    };
+    sorted.get(index.min(last)).copied()
 }
 
 pub(crate) fn prepare_work_directory(
@@ -746,6 +766,7 @@ pub(crate) fn validate_resume_database_for_downstream(
             "metadata_token_stats",
             "metadata_token_dictionary",
             "name_atoms",
+            "chain_totals",
             "selected_chains",
         ],
         "prepare_complete" if !stage_complete("metadata_encode_complete") => &[
@@ -754,6 +775,7 @@ pub(crate) fn validate_resume_database_for_downstream(
             "metadata_contract_token_rows",
             "metadata_token_stats",
             "metadata_token_dictionary",
+            "chain_totals",
             "selected_chains",
         ],
         _ => return Ok(()),
