@@ -60,7 +60,7 @@ fn disk_fallback_disabled() -> bool {
     std::env::var_os("NAME_URI_ANALYSIS_NO_DISK_FALLBACK").is_some()
 }
 
-const CONNECTIVITY_RUN_REVISION: u32 = 6;
+const CONNECTIVITY_RUN_REVISION: u32 = 7;
 const COMPONENT_ROOT_LAYOUT_REVISION: u32 = 6;
 const MAX_RESCUE_PAYLOAD_CACHE_ENTRIES: usize = 65_536;
 const RESCUE_PAYLOAD_CACHE_ENTRY_BYTES: u64 = 32;
@@ -2109,58 +2109,6 @@ enum SharedMessage {
     Error(PipelineError),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg(test)]
-struct FallbackPairTask {
-    atom: usize,
-    left: usize,
-    right_begin: usize,
-    right_end: usize,
-}
-
-#[derive(Default)]
-#[cfg(test)]
-struct FallbackPairCursor {
-    atom: usize,
-    left: usize,
-    right: usize,
-}
-
-#[cfg(test)]
-fn next_fallback_pair_task(
-    cursor: &mut FallbackPairCursor,
-    atom_count: usize,
-    max_pairs: usize,
-    mut member_count: impl FnMut(usize) -> usize,
-) -> Option<FallbackPairTask> {
-    let max_pairs = max_pairs.max(1);
-    while cursor.atom < atom_count {
-        let members = member_count(cursor.atom);
-        if cursor.left.saturating_add(1) >= members {
-            cursor.atom += 1;
-            cursor.left = 0;
-            cursor.right = 0;
-            continue;
-        }
-        let right_begin = cursor.right.max(cursor.left + 1);
-        let right_end = right_begin.saturating_add(max_pairs).min(members);
-        let task = FallbackPairTask {
-            atom: cursor.atom,
-            left: cursor.left,
-            right_begin,
-            right_end,
-        };
-        if right_end == members {
-            cursor.left += 1;
-            cursor.right = cursor.left.saturating_add(1);
-        } else {
-            cursor.right = right_end;
-        }
-        return Some(task);
-    }
-    None
-}
-
 fn append_fallback_atom_edges_parallel(
     snapshot: &MetadataSnapshot,
     worker_pool: &rayon::ThreadPool,
@@ -2170,8 +2118,15 @@ fn append_fallback_atom_edges_parallel(
 ) -> Result<u64, PipelineError> {
     let offsets = &snapshot.features().fallback_atom_offsets;
     let atom_count = offsets.len().saturating_sub(1);
+    // Every fallback atom is chain-local and feature-identical. A direct
+    // root-to-member metadata forest is exact regardless of shared-token
+    // routing and avoids making this completeness path depend on another
+    // phase. The old nC2 total described an implementation accident, not
+    // required semantic work.
     let total = offsets.windows(2).try_fold(0u64, |total, window| {
-        checked_add_pairs(total, window[1] - window[0])
+        total
+            .checked_add(window[1].saturating_sub(window[0]).saturating_sub(1))
+            .ok_or(crate::resource::MemoryError::Overflow)
     })?;
     progress(
         ProgressEvent::determinate(
@@ -2240,60 +2195,30 @@ fn fallback_atom_forest(
     if members.len() < 2 {
         return Ok((0, Vec::new()));
     }
-    let features = snapshot.features();
-    if let Some((root_index, &root)) = members
-        .iter()
-        .enumerate()
-        .find(|(_, contract)| contract_retained_tokens(features, **contract).is_empty())
-    {
-        let edges = members
+    let root = members[0];
+    const PARALLEL_ROOT_SCAN_MEMBERS: usize = 16_384;
+    let edges = if members.len() >= PARALLEL_ROOT_SCAN_MEMBERS {
+        // A single hot atom can dominate the whole fallback population.
+        // Parallelize its one linear pass rather than relying only on
+        // atom-level parallelism, which is badly imbalanced for skewed data.
+        members
+            .par_iter()
+            .skip(1)
+            .map(|&contract| Edge::new(root, contract))
+            .collect::<Vec<_>>()
+    } else {
+        members
             .iter()
-            .enumerate()
-            .filter(|(index, _)| *index != root_index)
-            .map(|(_, &contract)| Edge::new(root, contract))
-            .collect::<Vec<_>>();
-        return Ok((members.len().saturating_sub(1) as u64, edges));
-    }
-    if atom_members_share_common_retained_token(features, members) {
-        return Ok((0, Vec::new()));
-    }
-    const PARALLEL_FALLBACK_ATOM_MEMBERS: usize = 2_048;
-    if members.len() >= PARALLEL_FALLBACK_ATOM_MEMBERS {
-        return fallback_atom_forest_parallel(features, members);
-    }
-    let mut parent = (0..members.len()).collect::<Vec<_>>();
-    let mut components = members.len();
-    let mut visits = 0u64;
-    let mut edges = Vec::with_capacity(members.len().saturating_sub(1));
-    for left_index in 0..members.len() {
-        for right_index in left_index + 1..members.len() {
-            visits = visits
-                .checked_add(1)
-                .ok_or(crate::resource::MemoryError::Overflow)?;
-            if contracts_share_retained_token(
-                snapshot.features(),
-                members[left_index],
-                members[right_index],
-            ) {
-                continue;
-            }
-            let left_root = sparse_find(&mut parent, left_index);
-            let right_root = sparse_find(&mut parent, right_index);
-            if left_root != right_root {
-                parent[right_root] = left_root;
-                edges.push(Edge::new(members[left_index], members[right_index]));
-                components -= 1;
-                if components == 1 {
-                    return Ok((visits, edges));
-                }
-            }
-        }
-    }
-    Ok((visits, edges))
+            .skip(1)
+            .map(|&contract| Edge::new(root, contract))
+            .collect::<Vec<_>>()
+    };
+    Ok((members.len().saturating_sub(1) as u64, edges))
 }
 
 struct FallbackAtomicDsu {
     parent: Vec<std::sync::atomic::AtomicU32>,
+    components: std::sync::atomic::AtomicUsize,
 }
 
 impl FallbackAtomicDsu {
@@ -2303,6 +2228,7 @@ impl FallbackAtomicDsu {
                 .into_par_iter()
                 .map(std::sync::atomic::AtomicU32::new)
                 .collect(),
+            components: std::sync::atomic::AtomicUsize::new(len),
         }
     }
 
@@ -2341,86 +2267,20 @@ impl FallbackAtomicDsu {
                 )
                 .is_ok()
             {
+                self.components
+                    .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                 return true;
             }
         }
     }
-}
 
-fn fallback_atom_forest_parallel(
-    features: &crate::encode::FeatureView,
-    members: &[u32],
-) -> Result<(u64, Vec<Edge>), PipelineError> {
-    let dsu = FallbackAtomicDsu::new(members.len());
-    let components = std::sync::atomic::AtomicUsize::new(members.len());
-    let connected = std::sync::atomic::AtomicBool::new(false);
-    let (visits, mut edges) = (0..members.len())
-        .into_par_iter()
-        .fold(
-            || (0u64, Vec::<Edge>::new()),
-            |(mut visits, mut edges), left_index| {
-                if connected.load(std::sync::atomic::Ordering::Acquire) {
-                    return (visits, edges);
-                }
-                for right_index in left_index + 1..members.len() {
-                    if connected.load(std::sync::atomic::Ordering::Acquire) {
-                        break;
-                    }
-                    visits = visits.saturating_add(1);
-                    if contracts_share_retained_token(
-                        features,
-                        members[left_index],
-                        members[right_index],
-                    ) {
-                        continue;
-                    }
-                    if dsu.union(left_index as u32, right_index as u32) {
-                        edges.push(Edge::new(members[left_index], members[right_index]));
-                        let previous = components.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                        if previous == 2 {
-                            connected.store(true, std::sync::atomic::Ordering::Release);
-                            break;
-                        }
-                    }
-                }
-                (visits, edges)
-            },
-        )
-        .reduce(
-            || (0u64, Vec::<Edge>::new()),
-            |(left_visits, mut left_edges), (right_visits, mut right_edges)| {
-                left_edges.append(&mut right_edges);
-                (left_visits.saturating_add(right_visits), left_edges)
-            },
-        );
-    edges.par_sort_unstable_by_key(|edge| (edge.left, edge.right));
-    Ok((visits, edges))
-}
+    fn connected(&self, left: u32, right: u32) -> bool {
+        self.find(left) == self.find(right)
+    }
 
-fn atom_members_share_common_retained_token(
-    features: &crate::encode::FeatureView,
-    members: &[u32],
-) -> bool {
-    let Some(shortest) = members
-        .iter()
-        .map(|&contract| contract_retained_tokens(features, contract))
-        .min_by_key(|tokens| tokens.len())
-    else {
-        return false;
-    };
-    shortest.iter().any(|token| {
-        members.iter().all(|&contract| {
-            contract_retained_tokens(features, contract)
-                .binary_search(token)
-                .is_ok()
-        })
-    })
-}
-
-fn contract_retained_tokens(features: &crate::encode::FeatureView, contract: u32) -> &[u32] {
-    let begin = features.contract_token_offsets[contract as usize] as usize;
-    let end = features.contract_token_offsets[contract as usize + 1] as usize;
-    &features.contract_tokens[begin..end]
+    fn fully_connected(&self) -> bool {
+        self.components.load(std::sync::atomic::Ordering::Acquire) <= 1
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2437,256 +2297,16 @@ struct CatalogParallelLaneState {
     batch: Vec<Edge>,
     pending_expansion: u64,
     compaction_scratch: ScopeCompactionScratch,
-    expansion_scratch: Option<CatalogExpansionScratch>,
-    bounded_expansion_scratch: Option<CatalogBoundedExpansionScratch>,
 }
 
 impl CatalogParallelLaneState {
-    fn new(
-        contract_count: usize,
-        chain_count: usize,
-        edge_batch: usize,
-        dense_scratch_bytes: usize,
-        bounded_mode: bool,
-    ) -> Self {
+    fn new(contract_count: usize, edge_batch: usize, dense_scratch_bytes: usize) -> Self {
         Self {
             batch: Vec::with_capacity(edge_batch),
             pending_expansion: 0,
             compaction_scratch: ScopeCompactionScratch::new(contract_count, dense_scratch_bytes),
-            expansion_scratch: (!bounded_mode).then(|| CatalogExpansionScratch::new(chain_count)),
-            bounded_expansion_scratch: bounded_mode
-                .then(|| CatalogBoundedExpansionScratch::new(chain_count)),
         }
     }
-}
-
-struct CatalogExpansionScratch {
-    left_by_chain: Vec<Vec<u32>>,
-    right_by_chain: Vec<Vec<u32>>,
-    retained_tokens: HashSet<u32>,
-    retained_token_sort: Vec<u32>,
-}
-
-const MAX_CATALOG_TOKEN_SET_ENTRIES: usize = 131_072;
-const BOUNDED_CATALOG_TOKEN_CHUNK_ENTRIES: usize = 16_384;
-
-impl CatalogExpansionScratch {
-    fn new(chain_count: usize) -> Self {
-        Self {
-            left_by_chain: (0..chain_count).map(|_| Vec::new()).collect(),
-            right_by_chain: (0..chain_count).map(|_| Vec::new()).collect(),
-            retained_tokens: HashSet::new(),
-            retained_token_sort: Vec::new(),
-        }
-    }
-
-    fn partition(
-        &mut self,
-        features: &crate::encode::FeatureView,
-        left_contracts: &[u32],
-        right_contracts: &[u32],
-    ) {
-        for bucket in &mut self.left_by_chain {
-            bucket.clear();
-        }
-        for bucket in &mut self.right_by_chain {
-            bucket.clear();
-        }
-        for &contract in left_contracts {
-            self.left_by_chain[features.contract_chain[contract as usize] as usize].push(contract);
-        }
-        for &contract in right_contracts {
-            self.right_by_chain[features.contract_chain[contract as usize] as usize].push(contract);
-        }
-    }
-
-    fn retained_tokens_disjoint(
-        retained_tokens: &mut HashSet<u32>,
-        retained_token_sort: &mut Vec<u32>,
-        features: &crate::encode::FeatureView,
-        left: &[u32],
-        right: &[u32],
-    ) -> bool {
-        let token_memberships = |contracts: &[u32]| {
-            contracts.iter().fold(0usize, |total, &contract| {
-                total.saturating_add(contract_retained_tokens(features, contract).len())
-            })
-        };
-        let left_memberships = token_memberships(left);
-        let right_memberships = token_memberships(right);
-        let (indexed, scanned, indexed_memberships) = if left_memberships <= right_memberships {
-            (left, right, left_memberships)
-        } else {
-            (right, left, right_memberships)
-        };
-        if indexed_memberships <= MAX_CATALOG_TOKEN_SET_ENTRIES {
-            retained_tokens.clear();
-            retained_tokens.reserve(indexed_memberships);
-            for &contract in indexed {
-                retained_tokens.extend(contract_retained_tokens(features, contract));
-            }
-            return !scanned.iter().any(|&contract| {
-                contract_retained_tokens(features, contract)
-                    .iter()
-                    .any(|token| retained_tokens.contains(token))
-            });
-        }
-        retained_token_sort.clear();
-        if retained_token_sort
-            .try_reserve(indexed_memberships)
-            .is_err()
-        {
-            return false;
-        }
-        for &contract in indexed {
-            retained_token_sort.extend_from_slice(contract_retained_tokens(features, contract));
-        }
-        retained_token_sort.sort_unstable();
-        retained_token_sort.dedup();
-        !scanned.iter().any(|&contract| {
-            contract_retained_tokens(features, contract)
-                .iter()
-                .any(|token| retained_token_sort.binary_search(token).is_ok())
-        })
-    }
-}
-
-struct CatalogBoundedExpansionScratch {
-    token_chunk: Vec<u32>,
-    left_chain_roots: Vec<Option<u32>>,
-    right_chain_roots: Vec<Option<u32>>,
-}
-
-impl CatalogBoundedExpansionScratch {
-    fn new(chain_count: usize) -> Self {
-        Self {
-            token_chunk: Vec::with_capacity(BOUNDED_CATALOG_TOKEN_CHUNK_ENTRIES),
-            left_chain_roots: vec![None; chain_count],
-            right_chain_roots: vec![None; chain_count],
-        }
-    }
-
-    fn retained_tokens_disjoint(
-        &mut self,
-        features: &crate::encode::FeatureView,
-        left: &[u32],
-        right: &[u32],
-    ) -> bool {
-        let token_memberships = |contracts: &[u32]| {
-            contracts.iter().fold(0usize, |total, &contract| {
-                total.saturating_add(contract_retained_tokens(features, contract).len())
-            })
-        };
-        let left_memberships = token_memberships(left);
-        let right_memberships = token_memberships(right);
-        let (indexed, scanned) = if left_memberships <= right_memberships {
-            (left, right)
-        } else {
-            (right, left)
-        };
-        let mut indexed_tokens = indexed
-            .iter()
-            .flat_map(|&contract| contract_retained_tokens(features, contract).iter().copied());
-        loop {
-            self.token_chunk.clear();
-            self.token_chunk.extend(
-                indexed_tokens
-                    .by_ref()
-                    .take(BOUNDED_CATALOG_TOKEN_CHUNK_ENTRIES),
-            );
-            if self.token_chunk.is_empty() {
-                return true;
-            }
-            self.token_chunk.sort_unstable();
-            self.token_chunk.dedup();
-            if scanned.iter().any(|&contract| {
-                contract_retained_tokens(features, contract)
-                    .iter()
-                    .any(|token| self.token_chunk.binary_search(token).is_ok())
-            }) {
-                return false;
-            }
-        }
-    }
-
-    fn prepare_chain_roots(
-        &mut self,
-        features: &crate::encode::FeatureView,
-        left: &[u32],
-        right: &[u32],
-    ) {
-        self.left_chain_roots.fill(None);
-        self.right_chain_roots.fill(None);
-        for &contract in left {
-            let chain = features.contract_chain[contract as usize] as usize;
-            self.left_chain_roots[chain].get_or_insert(contract);
-        }
-        for &contract in right {
-            let chain = features.contract_chain[contract as usize] as usize;
-            self.right_chain_roots[chain].get_or_insert(contract);
-        }
-    }
-}
-
-fn max_catalog_expansion_scratch_bytes(
-    snapshot: &MetadataSnapshot,
-    chain_count: usize,
-) -> Result<u64, PipelineError> {
-    let max_atom_members = snapshot
-        .features()
-        .fallback_atom_offsets
-        .windows(2)
-        .map(|window| window[1].saturating_sub(window[0]))
-        .max()
-        .unwrap_or(0);
-    // Two chain-bucket copies coexist. Reserve 2x capacity slack because Vec
-    // growth may temporarily exceed exact length before settling.
-    let bucket_members = max_atom_members
-        .checked_mul(2)
-        .and_then(|members| members.checked_mul(std::mem::size_of::<u32>() as u64))
-        .and_then(|bytes| bytes.checked_mul(2))
-        .ok_or(crate::resource::MemoryError::Overflow)?;
-    let bucket_headers = (chain_count as u64)
-        .checked_mul(2)
-        .and_then(|buckets| buckets.checked_mul(std::mem::size_of::<Vec<u32>>() as u64))
-        .ok_or(crate::resource::MemoryError::Overflow)?;
-    // HashSet bucket/control overhead is implementation-specific. 32 bytes per
-    // admitted token is deliberately conservative for the bounded fast path.
-    let retained_token_hash = (MAX_CATALOG_TOKEN_SET_ENTRIES as u64)
-        .checked_mul(32)
-        .ok_or(crate::resource::MemoryError::Overflow)?;
-    let features = snapshot.features();
-    let max_atom_token_memberships = features.fallback_atom_offsets.windows(2).try_fold(
-        0u64,
-        |maximum, window| -> Result<u64, PipelineError> {
-            let begin = usize::try_from(window[0]).map_err(|_| MemoryError::Overflow)?;
-            let end = usize::try_from(window[1]).map_err(|_| MemoryError::Overflow)?;
-            let memberships = features.fallback_atom_contracts[begin..end]
-                .iter()
-                .try_fold(0u64, |total, &contract| {
-                    let contract = contract as usize;
-                    total
-                        .checked_add(
-                            features.contract_token_offsets[contract + 1]
-                                .saturating_sub(features.contract_token_offsets[contract]),
-                        )
-                        .ok_or(MemoryError::Overflow)
-                })?;
-            Ok(maximum.max(memberships))
-        },
-    )?;
-    // The large-set path stores packed u32 token ids instead of falling off a
-    // fixed HashSet cliff into a contract Cartesian product. Allow 2x capacity
-    // slack while Vec grows.
-    let retained_token_sort = max_atom_token_memberships
-        .checked_mul(std::mem::size_of::<u32>() as u64)
-        .and_then(|bytes| bytes.checked_mul(2))
-        .ok_or(MemoryError::Overflow)?;
-    let retained_token_index = retained_token_hash.max(retained_token_sort);
-    bucket_members
-        .checked_add(bucket_headers)
-        .and_then(|bytes| bytes.checked_add(retained_token_index))
-        .ok_or(crate::resource::MemoryError::Overflow.into())
 }
 
 fn submit_catalog_lane_batch(
@@ -2759,10 +2379,8 @@ fn score_catalog_parallel(
                     || {
                         CatalogParallelLaneState::new(
                             snapshot.features().contract_chain.len(),
-                            chain_count,
                             edge_batch,
                             dense_compaction_scratch_bytes,
-                            bounded_mode,
                         )
                     },
                     |lane_state, &job_id| {
@@ -2784,10 +2402,8 @@ fn score_catalog_parallel(
                                     || {
                                         CatalogParallelLaneState::new(
                                             snapshot.features().contract_chain.len(),
-                                            chain_count,
                                             edge_batch,
                                             dense_compaction_scratch_bytes,
-                                            bounded_mode,
                                         )
                                     },
                                     |state, a, b| {
@@ -2799,16 +2415,11 @@ fn score_catalog_parallel(
                                         }
                                         let expansion_result = {
                                             let batch = &mut state.batch;
-                                            let expansion_scratch =
-                                                state.expansion_scratch.as_mut().expect(
-                                                    "resident catalog lane has expansion scratch",
-                                                );
                                             expand_catalog_atom_pair_streaming(
                                                 snapshot,
                                                 a,
                                                 b,
                                                 proof_indexed,
-                                                expansion_scratch,
                                                 |left, right| {
                                                     batch.push(Edge::new(left, right));
                                                 },
@@ -2957,16 +2568,11 @@ fn score_catalog_parallel(
                                     )
                                 } else {
                                     let batch = &mut lane_state.batch;
-                                    let expansion_scratch = lane_state
-                                        .expansion_scratch
-                                        .as_mut()
-                                        .expect("resident catalog lane has expansion scratch");
                                     expand_catalog_atom_pair_streaming(
                                         snapshot,
                                         a,
                                         b,
                                         proof_indexed,
-                                        expansion_scratch,
                                         |left, right| {
                                             batch.push(Edge::new(left, right));
                                         },
@@ -4051,9 +3657,8 @@ fn run_metadata_pipeline_with_callbacks_and_persistence(
                 &collector_spill_root,
             )?;
             let match_pool = build_metadata_worker_pool(collectors.scorer_lanes())?;
-            // A representative fallback atom is chain-local and scoring-equivalent.
-            // Build only the token-disjoint connectivity forest needed by reduction;
-            // do not enumerate its raw quadratic pair universe once connected.
+            // A fallback atom is chain-local and scoring-equivalent. Build its
+            // direct linear connectivity forest; no pair enumeration is needed.
             let fallback_pair_visits = append_fallback_atom_edges_parallel(
                 &snapshot,
                 &match_pool,
@@ -4067,11 +3672,8 @@ fn run_metadata_pipeline_with_callbacks_and_persistence(
             const BASE_CATALOG_LANE_BYTES: u64 = 8 * 1024 * 1024;
             let hot_index_bytes = max_hot_block_candidate_index_bytes(&snapshot, &catalog)?;
             let hot_row_bytes = max_hot_block_parallel_row_bytes(&snapshot, &catalog)?;
-            let expansion_scratch_bytes =
-                max_catalog_expansion_scratch_bytes(&snapshot, chain_count)?;
             let catalog_lane_bytes = BASE_CATALOG_LANE_BYTES
                 .checked_add(hot_row_bytes)
-                .and_then(|bytes| bytes.checked_add(expansion_scratch_bytes))
                 .ok_or(crate::resource::MemoryError::Overflow)?;
             let hot_job_count = catalog
                 .jobs
@@ -4126,7 +3728,7 @@ fn run_metadata_pipeline_with_callbacks_and_persistence(
                 advisory(&format!(
                     "one resident catalog scoring lane does not fit: hot_index={} bytes, \
                      lane_scratch={} bytes, available={} bytes; switching to one bounded lane \
-                     with direct contract expansion, edge_batch={}, hot_index_budget={} bytes \
+                     with representative-edge expansion, edge_batch={}, hot_index_budget={} bytes \
                      (reserved={} bytes) instead of terminating",
                     hot_index_bytes,
                     catalog_lane_bytes,
@@ -6057,8 +5659,7 @@ fn expand_catalog_atom_pair(
     right_atom: u32,
     emit: impl FnMut(u32, u32),
 ) -> Result<u64, PipelineError> {
-    let mut scratch = CatalogExpansionScratch::new(snapshot.chain_names().len());
-    expand_catalog_atom_pair_streaming(snapshot, left_atom, right_atom, false, &mut scratch, emit)
+    expand_catalog_atom_pair_streaming(snapshot, left_atom, right_atom, false, emit)
 }
 
 fn expand_catalog_atom_pair_streaming(
@@ -6066,7 +5667,6 @@ fn expand_catalog_atom_pair_streaming(
     left_atom: u32,
     right_atom: u32,
     template_match_proven: bool,
-    scratch: &mut CatalogExpansionScratch,
     mut emit: impl FnMut(u32, u32),
 ) -> Result<u64, PipelineError> {
     let left_contracts = atom_contracts(snapshot, left_atom);
@@ -6074,44 +5674,12 @@ fn expand_catalog_atom_pair_streaming(
     if !catalog_atom_score(snapshot, left_atom, right_atom, template_match_proven) {
         return Ok(0);
     }
-    let work = (left_contracts.len() as u64)
-        .checked_mul(right_contracts.len() as u64)
-        .ok_or(crate::resource::MemoryError::Overflow)?;
-    let features = snapshot.features();
-    scratch.partition(features, left_contracts, right_contracts);
-    for left_chain in 0..scratch.left_by_chain.len() {
-        for right_chain in 0..scratch.right_by_chain.len() {
-            let left = &scratch.left_by_chain[left_chain];
-            let right = &scratch.right_by_chain[right_chain];
-            if left.is_empty() || right.is_empty() {
-                continue;
-            }
-            const FOREST_FAST_PATH_MIN_PAIR_WORK: usize = 64;
-            let bucket_pair_work = left.len().saturating_mul(right.len());
-            if bucket_pair_work >= FOREST_FAST_PATH_MIN_PAIR_WORK
-                && CatalogExpansionScratch::retained_tokens_disjoint(
-                    &mut scratch.retained_tokens,
-                    &mut scratch.retained_token_sort,
-                    features,
-                    left,
-                    right,
-                )
-            {
-                emit_complete_bipartite_forest(left, right, &mut emit);
-                continue;
-            }
-            for &left_contract in left {
-                for &right_contract in right {
-                    if left_contract != right_contract
-                        && !contracts_share_retained_token(features, left_contract, right_contract)
-                    {
-                        emit(left_contract, right_contract);
-                    }
-                }
-            }
-        }
-    }
-    Ok(work)
+    // Snapshot validation guarantees that each fallback atom is chain-local
+    // and scoring-feature identical. Its members are connected by the
+    // fallback-atom pass, so a single exact representative edge preserves the
+    // same final component as the old contract Cartesian product.
+    emit(left_contracts[0], right_contracts[0]);
+    Ok(1)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6130,104 +5698,13 @@ fn expand_catalog_atom_pair_bounded(
     if !catalog_atom_score(snapshot, left_atom, right_atom, template_match_proven) {
         return Ok(0);
     }
-    let work = (left_contracts.len() as u64)
-        .checked_mul(right_contracts.len() as u64)
-        .ok_or(crate::resource::MemoryError::Overflow)?;
-    let features = snapshot.features();
-    const FOREST_FAST_PATH_MIN_PAIR_WORK: usize = 64;
-    if left_contracts.len().saturating_mul(right_contracts.len()) >= FOREST_FAST_PATH_MIN_PAIR_WORK
-    {
-        let mut scratch = state
-            .bounded_expansion_scratch
-            .take()
-            .expect("bounded catalog lane has bounded expansion scratch");
-        let disjoint = scratch.retained_tokens_disjoint(features, left_contracts, right_contracts);
-        if disjoint {
-            scratch.prepare_chain_roots(features, left_contracts, right_contracts);
-            let mut emit_error = None;
-            emit_chain_scoped_complete_bipartite_forest(
-                features,
-                left_contracts,
-                right_contracts,
-                &scratch.left_chain_roots,
-                &scratch.right_chain_roots,
-                |left, right| {
-                    if emit_error.is_some() || left == right {
-                        return;
-                    }
-                    state.batch.push(Edge::new(left, right));
-                    if state.batch.len() >= edge_batch.max(1) {
-                        if let Err(error) = submit_catalog_lane_batch(
-                            state,
-                            snapshot,
-                            chain_count,
-                            collectors,
-                            edge_batch.max(1),
-                        ) {
-                            emit_error = Some(error);
-                        }
-                    }
-                },
-            );
-            state.bounded_expansion_scratch = Some(scratch);
-            if let Some(error) = emit_error {
-                return Err(error);
-            }
-            return Ok(work);
-        }
-        state.bounded_expansion_scratch = Some(scratch);
+    state
+        .batch
+        .push(Edge::new(left_contracts[0], right_contracts[0]));
+    if state.batch.len() >= edge_batch {
+        submit_catalog_lane_batch(state, snapshot, chain_count, collectors, edge_batch)?;
     }
-    for &left in left_contracts {
-        for &right in right_contracts {
-            if left == right || contracts_share_retained_token(features, left, right) {
-                continue;
-            }
-            state.batch.push(Edge::new(left, right));
-            if state.batch.len() >= edge_batch {
-                submit_catalog_lane_batch(state, snapshot, chain_count, collectors, edge_batch)?;
-            }
-        }
-    }
-    Ok(work)
-}
-
-fn emit_chain_scoped_complete_bipartite_forest(
-    features: &crate::encode::FeatureView,
-    left: &[u32],
-    right: &[u32],
-    left_chain_roots: &[Option<u32>],
-    right_chain_roots: &[Option<u32>],
-    mut emit: impl FnMut(u32, u32),
-) {
-    for &right_contract in right {
-        for &left_root in left_chain_roots.iter().flatten() {
-            emit(left_root, right_contract);
-        }
-    }
-    for &left_contract in left {
-        let left_chain = features.contract_chain[left_contract as usize] as usize;
-        if left_chain_roots[left_chain] == Some(left_contract) {
-            continue;
-        }
-        for &right_root in right_chain_roots.iter().flatten() {
-            emit(left_contract, right_root);
-        }
-    }
-}
-
-fn emit_complete_bipartite_forest(left: &[u32], right: &[u32], emit: &mut impl FnMut(u32, u32)) {
-    let Some((&left_root, left_tail)) = left.split_first() else {
-        return;
-    };
-    let Some((&right_root, _)) = right.split_first() else {
-        return;
-    };
-    for &right_contract in right {
-        emit(left_root, right_contract);
-    }
-    for &left_contract in left_tail {
-        emit(left_contract, right_root);
-    }
+    Ok(1)
 }
 
 #[cfg(test)]
@@ -6659,21 +6136,26 @@ fn build_rescue_execution_plan<'a>(
         ProgressCounters::default(),
     ));
     let rescue_fixed_bytes = (atom_count as u64)
-        .checked_mul(std::mem::size_of::<u32>() as u64)
-        .and_then(|bytes| bytes.checked_add(atom_count as u64))
+        .checked_mul((std::mem::size_of::<u32>() * 2 + std::mem::size_of::<bool>()) as u64)
         .ok_or(MemoryError::Overflow)?;
     let contract_count = snapshot.contract_count();
-    let rescue_seed_index_bytes = (rescue.shared_contracts.len() as u64)
+    let contract_rescue_state_bytes = (contract_count as u64)
+        .checked_mul((std::mem::size_of::<u32>() + std::mem::size_of::<bool>()) as u64)
+        .ok_or(MemoryError::Overflow)?;
+    let estimated_seed_index_bytes = (rescue.shared_contracts.len() as u64)
         .checked_mul(RESCUE_SEED_INDEX_ENTRY_BYTES)
         .and_then(|bytes| bytes.checked_mul(2))
-        .and_then(|bytes| {
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u64>() as u64))
+        .ok_or(MemoryError::Overflow)?;
+    let rescue_seed_index_bytes = estimated_seed_index_bytes
+        .checked_add(
             (rescue.shared_edges.len() as u64)
                 .checked_mul(std::mem::size_of::<RescuePair>() as u64)
-                .and_then(|edge_bytes| bytes.checked_add(edge_bytes))
-        })
+                .ok_or(MemoryError::Overflow)?,
+        )
         .ok_or(MemoryError::Overflow)?;
     let rescue_base_bytes = rescue_fixed_bytes
-        .checked_add(contract_count as u64)
+        .checked_add(contract_rescue_state_bytes)
         .and_then(|bytes| bytes.checked_add(rescue_seed_index_bytes))
         .ok_or(MemoryError::Overflow)?;
     let chunk_bytes = RescueMatchChunk::retained_bytes()?;
@@ -6808,19 +6290,21 @@ fn build_rescue_execution_plan<'a>(
     }
     let mut shared_score_visits = 0u64;
     let mut shared_group_count = 0u64;
+    let mut shared_rescue_tokens = Vec::<u32>::new();
+    let mut shared_rescue_seed_offsets = vec![0u64];
+    let mut shared_rescue_seed_indices = Vec::<u32>::new();
     for token_id in 0..features.token_member_offsets.len().saturating_sub(1) {
         let begin = features.token_member_offsets[token_id] as usize;
         let end = features.token_member_offsets[token_id + 1] as usize;
         let contracts = &features.token_member_contracts[begin..end];
-        let present = if contracts.len() >= SHARED_LOCAL_ROUTING_MIN_MEMBERS {
-            contracts
-                .iter()
-                .filter(|&&contract| shared_contract_mask[contract as usize])
-                .count() as u64
-        } else {
-            0
-        };
-        for _ in contracts {
+        let seed_begin = shared_rescue_seed_indices.len();
+        for (seed_index, &contract) in contracts.iter().enumerate() {
+            if contracts.len() >= SHARED_LOCAL_ROUTING_MIN_MEMBERS
+                && shared_contract_mask[contract as usize]
+            {
+                shared_rescue_seed_indices
+                    .push(u32::try_from(seed_index).map_err(|_| MemoryError::Overflow)?);
+            }
             prepare_completed = prepare_completed.saturating_add(1);
             if prepare_completed.saturating_sub(prepare_reported) >= PROGRESS_CHUNK {
                 prepare_reported = prepare_completed;
@@ -6835,9 +6319,14 @@ fn build_rescue_execution_plan<'a>(
                 ));
             }
         }
+        let present = shared_rescue_seed_indices.len().saturating_sub(seed_begin) as u64;
         if present == 0 {
             continue;
         }
+        shared_rescue_tokens.push(u32::try_from(token_id).map_err(|_| MemoryError::Overflow)?);
+        shared_rescue_seed_offsets.push(
+            u64::try_from(shared_rescue_seed_indices.len()).map_err(|_| MemoryError::Overflow)?,
+        );
         shared_group_count = shared_group_count
             .checked_add(1)
             .ok_or(crate::resource::MemoryError::Overflow)?;
@@ -6855,6 +6344,36 @@ fn build_rescue_execution_plan<'a>(
             .checked_add(visits)
             .ok_or(crate::resource::MemoryError::Overflow)?;
     }
+    let measured_seed_index_bytes = (shared_rescue_tokens.capacity() as u64)
+        .checked_mul(std::mem::size_of::<u32>() as u64)
+        .and_then(|bytes| {
+            (shared_rescue_seed_offsets.capacity() as u64)
+                .checked_mul(std::mem::size_of::<u64>() as u64)
+                .and_then(|offset_bytes| bytes.checked_add(offset_bytes))
+        })
+        .and_then(|bytes| {
+            (shared_rescue_seed_indices.capacity() as u64)
+                .checked_mul(std::mem::size_of::<u32>() as u64)
+                .and_then(|seed_bytes| bytes.checked_add(seed_bytes))
+        })
+        .ok_or(MemoryError::Overflow)?;
+    let seed_index_growth = measured_seed_index_bytes.saturating_sub(estimated_seed_index_bytes);
+    let _seed_index_growth_memory = if seed_index_growth == 0 {
+        None
+    } else {
+        match memory.reserve(seed_index_growth) {
+            Ok(lease) => Some(lease),
+            Err(error @ MemoryError::Budget { .. }) => {
+                advisory(&format!(
+                    "metadata rescue measured seed CSR exceeds its estimate by \
+                     {seed_index_growth} bytes ({error}); retaining the already allocated exact \
+                     resident index and continuing"
+                ));
+                None
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
     progress(ProgressEvent::indeterminate(
         ProgressPhase::PrepareRescuePairs,
         prepare_completed,
@@ -6888,6 +6407,15 @@ fn build_rescue_execution_plan<'a>(
     let atom_payloads = (0..atom_count)
         .map(|atom| atom_payload(snapshot, atom))
         .collect::<Vec<_>>();
+    // Rescue output is consumed only as connectivity.  Retaining every
+    // matching edge can be quadratic (and previously reached tens of
+    // billions of pairs), while an online spanning forest is exactly
+    // equivalent after component reduction.
+    let atom_match_forest = FallbackAtomicDsu::new(atom_count as usize);
+    let shared_match_forest = FallbackAtomicDsu::new(contract_count);
+    for &(left, right) in &rescue.shared_edges {
+        shared_match_forest.union(left, right);
+    }
     let cancelled = std::sync::atomic::AtomicBool::new(false);
     std::thread::scope(
         |scope| -> Result<AdmittedRescueExecutionPlan<'a>, PipelineError> {
@@ -6910,6 +6438,25 @@ fn build_rescue_execution_plan<'a>(
                                     let end = begin
                                         .saturating_add(RESCUE_SCORE_TILE)
                                         .min(atom_count as usize);
+                                    if atom_match_forest.fully_connected() {
+                                        let duplicate_rescue_atoms = rescue
+                                            .pair_atoms
+                                            .partition_point(|&atom| (atom as usize) < begin)
+                                            ..rescue.pair_atoms.partition_point(|&atom| {
+                                                (atom as usize) < end.min(left_atom as usize)
+                                            });
+                                        let self_pair = usize::from(
+                                            (begin..end).contains(&(left_atom as usize)),
+                                        );
+                                        let completed = end
+                                            .saturating_sub(begin)
+                                            .saturating_sub(duplicate_rescue_atoms.len())
+                                            .saturating_sub(self_pair)
+                                            as u64;
+                                        let _ = producer_sender
+                                            .send(RescuePlanMessage::Work(completed));
+                                        return;
+                                    }
                                     let mut pending_work = 0u64;
                                     let mut matches = None;
                                     let mut payload_scores = HashMap::<u32, bool>::new();
@@ -6928,6 +6475,14 @@ fn build_rescue_execution_plan<'a>(
                                         {
                                             continue;
                                         }
+                                        if atom_match_forest.connected(left_atom, right_atom) {
+                                            record_rescue_plan_work(
+                                                &mut pending_work,
+                                                PROGRESS_CHUNK,
+                                                &producer_sender,
+                                            );
+                                            continue;
+                                        }
                                         let right_payload = atom_payloads[right_atom as usize];
                                         let exact_match = bounded_payload_match(
                                             &mut payload_scores,
@@ -6936,31 +6491,13 @@ fn build_rescue_execution_plan<'a>(
                                             right_payload,
                                             cache_entries_per_lane,
                                         );
-                                        if exact_match {
-                                            let expansion_work =
-                                                (atom_contracts(snapshot, left_atom).len() as u64)
-                                                    .checked_mul(
-                                                        atom_contracts(snapshot, right_atom).len()
-                                                            as u64,
-                                                    )
-                                                    .ok_or(MemoryError::Overflow);
-                                            let expansion_work = match expansion_work {
-                                                Ok(work) => work,
-                                                Err(error) => {
-                                                    producer_cancelled.store(
-                                                        true,
-                                                        std::sync::atomic::Ordering::Release,
-                                                    );
-                                                    let _ = producer_sender.send(
-                                                        RescuePlanMessage::Error(error.into()),
-                                                    );
-                                                    return;
-                                                }
-                                            };
+                                        if exact_match
+                                            && atom_match_forest.union(left_atom, right_atom)
+                                        {
                                             if let Err(error) = record_rescue_match(
                                                 &mut matches,
                                                 (left_atom, right_atom),
-                                                expansion_work,
+                                                1,
                                                 &producer_sender,
                                                 false,
                                             ) {
@@ -6997,21 +6534,22 @@ fn build_rescue_execution_plan<'a>(
                             });
                         },
                         || {
-                            (0..features.token_member_offsets.len().saturating_sub(1))
+                            (0..shared_rescue_tokens.len())
                                 .into_par_iter()
-                                .for_each(|token_id| {
+                                .for_each(|group| {
+                                    let token_id = shared_rescue_tokens[group] as usize;
                                     let begin = features.token_member_offsets[token_id] as usize;
                                     let end = features.token_member_offsets[token_id + 1] as usize;
                                     let contracts = &features.token_member_contracts[begin..end];
-                                    if contracts.len() < SHARED_LOCAL_ROUTING_MIN_MEMBERS {
-                                        return;
-                                    }
                                     let sources = &features.token_member_sources[begin..end];
-                                    contracts.par_iter().copied().enumerate().for_each(
-                                        |(seed_index, seed_contract)| {
-                                            if !shared_contract_mask[seed_contract as usize] {
-                                                return;
-                                            }
+                                    let seed_begin = shared_rescue_seed_offsets[group] as usize;
+                                    let seed_end = shared_rescue_seed_offsets[group + 1] as usize;
+                                    shared_rescue_seed_indices[seed_begin..seed_end]
+                                        .par_iter()
+                                        .copied()
+                                        .for_each(|seed_index| {
+                                            let seed_index = seed_index as usize;
+                                            let seed_contract = contracts[seed_index];
                                             let seed_payload = features.source_to_payload
                                                 [sources[seed_index] as usize];
                                             contracts
@@ -7044,6 +6582,16 @@ fn build_rescue_execution_plan<'a>(
                                                         {
                                                             continue;
                                                         }
+                                                        if shared_match_forest
+                                                            .connected(seed_contract, contract)
+                                                        {
+                                                            record_rescue_plan_work(
+                                                                &mut pending_work,
+                                                                PROGRESS_CHUNK,
+                                                                &producer_sender,
+                                                            );
+                                                            continue;
+                                                        }
                                                         let payload = features.source_to_payload
                                                             [source as usize];
                                                         let exact_match = bounded_payload_match(
@@ -7053,7 +6601,10 @@ fn build_rescue_execution_plan<'a>(
                                                             payload,
                                                             cache_entries_per_lane,
                                                         );
-                                                        if exact_match {
+                                                        if exact_match
+                                                            && shared_match_forest
+                                                                .union(seed_contract, contract)
+                                                        {
                                                             if let Err(error) = record_rescue_match(
                                                                 &mut matches,
                                                                 (seed_contract, contract),
@@ -7098,8 +6649,7 @@ fn build_rescue_execution_plan<'a>(
                                                         ),
                                                     );
                                                 });
-                                        },
-                                    );
+                                        });
                                 });
                         },
                     );
@@ -7418,23 +6968,10 @@ fn build_rescue_execution_plan<'a>(
                 },
             ));
 
-            let contract_expansion_visits = pool.install(|| {
-                matched_atom_pairs
-                    .par_iter()
-                    .try_fold(
-                        || 0u64,
-                        |total, &(left_atom, right_atom)| {
-                            let work = (atom_contracts(snapshot, left_atom).len() as u64)
-                                .checked_mul(atom_contracts(snapshot, right_atom).len() as u64)
-                                .ok_or(MemoryError::Overflow)?;
-                            total.checked_add(work).ok_or(MemoryError::Overflow)
-                        },
-                    )
-                    .try_reduce(
-                        || 0u64,
-                        |left, right| left.checked_add(right).ok_or(MemoryError::Overflow),
-                    )
-            })?;
+            // Each retained atom edge joins two already internally connected
+            // feature-identity groups, so one representative contract edge is
+            // sufficient.  Cartesian contract expansion changes no component.
+            let contract_expansion_visits = matched_atom_pair_count;
             finalize_completed = finalize_completed.saturating_add(matched_atom_pair_count);
             progress(ProgressEvent::indeterminate(
                 ProgressPhase::FinalizeRescuePlan,
@@ -7484,39 +7021,6 @@ fn bounded_payload_match(
     decision
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct RescueExpansionTile {
-    left_begin: usize,
-    left_end: usize,
-    right_begin: usize,
-    right_end: usize,
-}
-
-#[cfg(test)]
-fn rescue_expansion_tiles(
-    dimensions: &[(usize, usize)],
-    tile_side: usize,
-) -> Vec<RescueExpansionTile> {
-    let tile_side = tile_side.max(1);
-    let mut tiles = Vec::new();
-    for &(left_count, right_count) in dimensions {
-        for left_begin in (0..left_count).step_by(tile_side) {
-            let left_end = left_begin.saturating_add(tile_side).min(left_count);
-            for right_begin in (0..right_count).step_by(tile_side) {
-                let right_end = right_begin.saturating_add(tile_side).min(right_count);
-                tiles.push(RescueExpansionTile {
-                    left_begin,
-                    left_end,
-                    right_begin,
-                    right_end,
-                });
-            }
-        }
-    }
-    tiles
-}
-
 enum RescueExpansionMessage {
     Work(u64),
     Error(PipelineError),
@@ -7531,54 +7035,34 @@ fn append_rescue_atom_pairs_parallel(
     sender: &std::sync::mpsc::SyncSender<RescueExpansionMessage>,
     cancelled: &std::sync::atomic::AtomicBool,
 ) {
-    const TILE_SIDE: usize = 256;
     const EDGE_BATCH: usize = 4_096;
     let features = snapshot.features();
-    pairs.par_iter().for_each(|&(left_atom, right_atom)| {
+    pairs.par_chunks(EDGE_BATCH).for_each(|chunk| {
         if cancelled.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
-        let left_contracts = atom_contracts(snapshot, left_atom);
-        let right_contracts = atom_contracts(snapshot, right_atom);
-        let left_tiles = left_contracts.len().div_ceil(TILE_SIDE);
-        let right_tiles = right_contracts.len().div_ceil(TILE_SIDE);
-        let tile_count = left_tiles.saturating_mul(right_tiles);
-        (0..tile_count).into_par_iter().for_each(|tile| {
-            if cancelled.load(std::sync::atomic::Ordering::Acquire) {
-                return;
-            }
-            let left_tile = tile / right_tiles.max(1);
-            let right_tile = tile % right_tiles.max(1);
-            let left_begin = left_tile * TILE_SIDE;
-            let right_begin = right_tile * TILE_SIDE;
-            let left_end = left_begin
-                .saturating_add(TILE_SIDE)
-                .min(left_contracts.len());
-            let right_end = right_begin
-                .saturating_add(TILE_SIDE)
-                .min(right_contracts.len());
-            let mut edges = Vec::with_capacity(EDGE_BATCH);
-            for &left in &left_contracts[left_begin..left_end] {
-                for &right in &right_contracts[right_begin..right_end] {
-                    if left != right && !contracts_share_retained_token(features, left, right) {
-                        edges.push(Edge::new(left, right));
-                    }
-                }
-            }
-            if !edges.is_empty() {
-                if let Err(error) =
-                    collectors.push_edges_by_chain(&features.contract_chain, chain_count, edges)
-                {
-                    let _ = sender.send(RescueExpansionMessage::Error(error));
-                    cancelled.store(true, std::sync::atomic::Ordering::Release);
-                    return;
-                }
-            }
-            let work = (left_end - left_begin).saturating_mul(right_end - right_begin) as u64;
-            if sender.send(RescueExpansionMessage::Work(work)).is_err() {
-                cancelled.store(true, std::sync::atomic::Ordering::Release);
-            }
-        });
+        let edges = chunk
+            .iter()
+            .map(|&(left_atom, right_atom)| {
+                Edge::new(
+                    atom_contracts(snapshot, left_atom)[0],
+                    atom_contracts(snapshot, right_atom)[0],
+                )
+            })
+            .collect::<Vec<_>>();
+        if let Err(error) =
+            collectors.push_edges_by_chain(&features.contract_chain, chain_count, edges)
+        {
+            let _ = sender.send(RescueExpansionMessage::Error(error));
+            cancelled.store(true, std::sync::atomic::Ordering::Release);
+            return;
+        }
+        if sender
+            .send(RescueExpansionMessage::Work(chunk.len() as u64))
+            .is_err()
+        {
+            cancelled.store(true, std::sync::atomic::Ordering::Release);
+        }
     });
 }
 
@@ -7845,27 +7329,6 @@ fn append_rescue_edges(
     })
 }
 
-fn contracts_share_retained_token(
-    features: &crate::encode::FeatureView,
-    left: u32,
-    right: u32,
-) -> bool {
-    let tokens = |contract: u32| {
-        let begin = features.contract_token_offsets[contract as usize] as usize;
-        let end = features.contract_token_offsets[contract as usize + 1] as usize;
-        &features.contract_tokens[begin..end]
-    };
-    let (left_tokens, right_tokens) = (tokens(left), tokens(right));
-    let (mut left_index, mut right_index) = (0, 0);
-    while left_index < left_tokens.len() && right_index < right_tokens.len() {
-        match left_tokens[left_index].cmp(&right_tokens[right_index]) {
-            std::cmp::Ordering::Less => left_index += 1,
-            std::cmp::Ordering::Greater => right_index += 1,
-            std::cmp::Ordering::Equal => return true,
-        }
-    }
-    false
-}
 fn append_shared_token_edges(
     s: &MetadataSnapshot,
     lanes: usize,
@@ -9948,34 +9411,7 @@ mod tests {
     }
 
     #[test]
-    fn fallback_pair_tasks_cover_each_pair_once_in_stable_order() {
-        let member_counts = [0usize, 1, 4, 3];
-        let mut cursor = FallbackPairCursor::default();
-        let mut pairs = Vec::new();
-        while let Some(task) =
-            next_fallback_pair_task(&mut cursor, member_counts.len(), 2, |atom| {
-                member_counts[atom]
-            })
-        {
-            for right in task.right_begin..task.right_end {
-                pairs.push((task.atom, task.left, right));
-            }
-        }
-        let expected = member_counts
-            .iter()
-            .copied()
-            .enumerate()
-            .flat_map(|(atom, members)| {
-                (0..members)
-                    .flat_map(move |left| (left + 1..members).map(move |right| (atom, left, right)))
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(pairs, expected);
-    }
-
-    #[test]
-    fn fallback_atom_with_empty_retained_tokens_uses_linear_star_forest() {
+    fn fallback_atom_uses_one_linear_root_pass_without_losing_connectivity() {
         let dir = tempfile::tempdir().unwrap();
         let features = dir.path().join("features");
         let blocking = dir.path().join("blocking");
@@ -9993,7 +9429,7 @@ mod tests {
             EncodeSourceRow {
                 contract_id: 2,
                 payload_id: 0,
-                retained_token_ids: vec![],
+                retained_token_ids: vec![2],
             },
             EncodeSourceRow {
                 contract_id: 3,
@@ -10056,10 +9492,10 @@ mod tests {
             .map(|edge| (edge.left, edge.right))
             .collect::<Vec<_>>();
         actual.sort_unstable();
-        let mut expected = [0, 1, 3]
+        let mut expected = [1, 2, 3]
             .into_iter()
             .map(|contract| {
-                let edge = Edge::new(2, contract);
+                let edge = Edge::new(0, contract);
                 (edge.left, edge.right)
             })
             .collect::<Vec<_>>();
@@ -10067,32 +9503,6 @@ mod tests {
 
         assert_eq!(visits, 3);
         assert_eq!(actual, expected);
-        assert!(edges.iter().all(|edge| !contracts_share_retained_token(
-            snapshot.features(),
-            edge.left,
-            edge.right
-        )));
-    }
-
-    #[test]
-    fn rescue_expansion_tiles_cover_each_cartesian_visit_once() {
-        let tiles = rescue_expansion_tiles(&[(3, 5)], 2);
-        let mut visits = Vec::new();
-        for tile in tiles {
-            for left in tile.left_begin..tile.left_end {
-                for right in tile.right_begin..tile.right_end {
-                    visits.push((left, right));
-                }
-            }
-        }
-        visits.sort_unstable();
-
-        assert_eq!(
-            visits,
-            (0..3)
-                .flat_map(|left| (0..5).map(move |right| (left, right)))
-                .collect::<Vec<_>>()
-        );
     }
 
     #[test]
@@ -10710,7 +10120,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_catalog_disjoint_fast_path_matches_chain_scoped_resident_forest() {
+    fn catalog_match_emits_one_representative_edge_instead_of_contract_product() {
         let dir = tempfile::tempdir().unwrap();
         let features = dir.path().join("features");
         let blocking = dir.path().join("blocking");
@@ -10779,27 +10189,8 @@ mod tests {
             resident.push((left, right));
         })
         .unwrap();
-        let left = atom_contracts(&snapshot, 0);
-        let right = atom_contracts(&snapshot, 1);
-        let mut scratch = CatalogBoundedExpansionScratch::new(2);
-
-        assert!(scratch.retained_tokens_disjoint(snapshot.features(), left, right));
-        scratch.prepare_chain_roots(snapshot.features(), left, right);
-        let mut bounded = Vec::new();
-        emit_chain_scoped_complete_bipartite_forest(
-            snapshot.features(),
-            left,
-            right,
-            &scratch.left_chain_roots,
-            &scratch.right_chain_roots,
-            |left, right| bounded.push((left, right)),
-        );
-        resident.sort_unstable();
-        bounded.sort_unstable();
-
-        assert_eq!(work, 256);
-        assert_eq!(resident.len(), 16 + 16 - 1);
-        assert_eq!(bounded, resident);
+        assert_eq!(work, 1);
+        assert_eq!(resident, vec![(0, 16)]);
     }
 
     #[test]
@@ -11030,7 +10421,10 @@ mod tests {
     }
 
     fn three_atom_rescue_memory_bytes() -> (u64, u64, u64) {
-        let rescue_base_bytes = 3 * std::mem::size_of::<u32>() as u64 + 3 + 3;
+        let rescue_base_bytes = 3
+            * (2 * std::mem::size_of::<u32>() + std::mem::size_of::<bool>()) as u64
+            + 3 * (std::mem::size_of::<u32>() + std::mem::size_of::<bool>()) as u64
+            + std::mem::size_of::<u64>() as u64;
         let full_cache_bytes =
             (MAX_RESCUE_PAYLOAD_CACHE_ENTRIES as u64) * RESCUE_PAYLOAD_CACHE_ENTRY_BYTES;
         let stream_bytes = rescue_stream_buffer_bytes(1).unwrap();
@@ -11344,13 +10738,8 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(work, 64);
-        let expected = (8..16)
-            .map(|right| (0, right))
-            .chain((1..8).map(|left| (left, 8)))
-            .collect::<Vec<_>>();
-        assert_eq!(edges, expected);
-        assert_eq!(edges.len(), 8 + 8 - 1);
+        assert_eq!(work, 1);
+        assert_eq!(edges, vec![(0, 8)]);
         assert_eq!(catalog_atom_score_count(), 1);
 
         let mut planning_events = Vec::new();

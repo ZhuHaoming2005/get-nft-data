@@ -3,7 +3,7 @@
 #[test]
 fn metadata_stage_revision_tracks_encode_and_match_semantics() {
     assert_eq!(StageRevisions::current().metadata_encode, 5);
-    assert_eq!(StageRevisions::current().metadata_match, 21);
+    assert_eq!(StageRevisions::current().metadata_match, 22);
     assert_eq!(StageRevisions::current().prepare, 3);
     assert_eq!(StageRevisions::current().name, 2);
 }

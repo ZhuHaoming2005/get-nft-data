@@ -129,7 +129,9 @@ subphase、`completed/total`、工作单位和诊断计数，CLI 只负责渲染
 - 可预先精确计数的 rows、contracts、token groups、memberships、pair visits、edges、nodes 和 files
   使用确定进度；
 - Catalog 的 hot block 会通过二级索引跳过绝大多数逻辑 `nC2` pair，contract expansion 又只在
-  精确 atom match 后发生，因此不再把两种互斥最坏情况相加成数十万亿的伪分母。Catalog task
+  精确 atom match 后发生；chain-local、scoring-feature 相同的 atom 由线性星形森林连接，
+  匹配 atom 对只提交一条代表合约边，不再枚举 atom 内或 atom 间的合约笛卡尔积。因此不再把
+  两种互斥最坏情况相加成数十万亿的伪分母。Catalog task
   保持 indeterminate，只显示 observed work 与 candidates/scored/expanded/matched 计数，不再输出
   `ETA ≤ 885h` 一类没有执行意义的上界；
 - DuckDB Rust API 无法观测单条 CTAS/聚合查询的执行总量；这些任务明确保持 indeterminate 和
@@ -152,7 +154,10 @@ subphase、`completed/total`、工作单位和诊断计数，CLI 只负责渲染
 - Rescue seed preparation 为独立 indeterminate phase，按 seed/group membership 增量显示；
   seed contract 位置只扫描每个相关 token group 一次，不再对每个 seed 线性重扫；单个 seed 的
   atom/token universe 继续拆为 65,536-pair Rayon tile，因此稀疏 RescuePlan 也能使用完整线程池；
-  匹配结果排序和 expansion 统计使用独立 `finalize rescue plan` spinner，不会让 score task先显示 100%；
+  Rescue 评分时用并发原子森林立即丢弃不改变连通分量的命中边，驻留结果最多为线性规模；
+  已连通 pair 跳过 BM25，全部 atom 已连通时剩余 tile 直接按精确工作量结算。atom rescue
+  只提交一条代表合约边，不再展开合约笛卡尔积。匹配结果排序和 expansion 统计使用独立
+  `finalize rescue plan` spinner，不会让 score task先显示 100%；
 - shared-token scratch planning 按实际 token membership visits 而不是 token group 个数计算
   `completed/total`；BuildSummary 按 scope 一次构造 `(root, chain)` 列并使用并行排序，同时生成
   全部链统计；链对不再创建 contract-id 拼接副本或为左右链重复全量扫描。节点增量从并行 worker
@@ -171,7 +176,7 @@ subphase、`completed/total`、工作单位和诊断计数，CLI 只负责渲染
 `match ETA n/a (uncalibrated)`；在没有同 revision、同规模目标机历史分布前不会把子阶段速率外推成
 整段 Match 的伪精确 ETA。当前子阶段速率经过 2 秒预热，并按时间而非刷新次数做 5 秒半衰期平滑；
 已观测到无进展时速率会衰减。Match 历史 ETA 使用同 cohort 成功样本的 P20-P80 中央区间，
-避免单次极快或极慢运行永久拉宽预测。当前 Match controller revision 为 21，旧 tmpfs/Ephemeral 和旧 catalog
+避免单次极快或极慢运行永久拉宽预测。当前 Match controller revision 为 22，旧 tmpfs/Ephemeral 和旧 catalog
 同步热路径的历史样本不会污染新的 Durable ETA；forecast/observation 共用 schema 3，旧 schema
 样本不会被渲染端误用。
 可用 `--no-progress` 关闭终端进度。
