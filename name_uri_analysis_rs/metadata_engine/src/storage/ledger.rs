@@ -161,8 +161,6 @@ pub enum StorageLedgerError {
     ReservationNotFound(u64),
     #[error("storage reservation size overflow")]
     ReservationOverflow,
-    #[error("insufficient physical space: requested {requested} bytes, available {available}")]
-    InsufficientSpace { requested: u64, available: u64 },
     #[error("live reservation {0} cannot be converted to a durable checkpoint pin")]
     CannotPersistReservation(u64),
     #[error("eviction path {path} is outside storage work root {root}")]

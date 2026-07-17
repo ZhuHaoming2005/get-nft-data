@@ -9,18 +9,17 @@ fn explicit_analysis_memory_limit_stays_inside_total_budget() {
 }
 
 #[test]
-fn explicit_analysis_memory_limit_rejects_over_budget_value() {
-    let error = name_analysis_memory_plan("1GB", Some("2GB"), 0).unwrap_err();
+fn explicit_analysis_memory_limit_is_clamped_to_total_budget() {
+    let plan = name_analysis_memory_plan("1GB", Some("2GB"), 0).unwrap();
 
-    assert!(error.to_string().contains("exceeds total --memory-limit"));
+    assert_eq!(plan.analysis_bytes, GIB as usize);
 }
 
 #[test]
-fn explicit_analysis_memory_limit_is_a_hard_resident_limit() {
-    let error = name_analysis_memory_plan("10GB", Some("16KB"), 32 * 1024).unwrap_err();
+fn explicit_analysis_memory_limit_does_not_reject_measured_resident_state() {
+    let plan = name_analysis_memory_plan("10GB", Some("16KB"), 32 * 1024).unwrap();
 
-    assert!(error.to_string().contains("resident name state"));
-    assert!(error.to_string().contains("16384B"));
+    assert_eq!(plan.analysis_bytes, 16 * 1024);
 }
 
 #[test]
@@ -55,16 +54,16 @@ fn controller_memory_validation_accepts_auto_and_rejects_invalid_static_limits()
 }
 
 #[test]
-fn engine_memory_limit_uses_real_host_headroom_and_user_cap() {
+fn engine_memory_limit_uses_capacity_headroom_and_user_cap() {
     let hard_top =
         engine_memory_hard_top_bytes(64 * GIB as usize, 384 * GIB, 64 * GIB, 64 * GIB).unwrap();
     assert_eq!(hard_top, 56 * GIB);
     let user_limited =
         engine_memory_hard_top_bytes(8 * GIB as usize, 384 * GIB, 64 * GIB, 64 * GIB).unwrap();
     assert_eq!(user_limited, 8 * GIB);
-    let availability_limited =
+    let transient_availability_is_not_a_hard_limit =
         engine_memory_hard_top_bytes(448 * GIB as usize, 448 * GIB, 512 * GIB, 300 * GIB).unwrap();
-    assert_eq!(availability_limited, 300 * GIB);
+    assert_eq!(transient_availability_is_not_a_hard_limit, 448 * GIB);
 }
 
 #[test]
@@ -86,7 +85,7 @@ fn name_phase_budget_keeps_duckdb_inside_the_host_envelope() {
     );
     assert_eq!(
         name_phase_rust_budget(448 * gib as usize, 8 * gib, 512 * gib, 300 * gib).unwrap(),
-        292 * gib as usize
+        440 * gib as usize
     );
 }
 
@@ -325,8 +324,8 @@ fn name_phase_clamps_duckdb_without_raising_smaller_limits() {
 }
 
 #[test]
-fn auto_memory_plan_rejects_resident_atoms_over_budget() {
-    let error = name_analysis_memory_plan("1GB", None, 2 * 1024 * 1024 * 1024).unwrap_err();
+fn auto_memory_plan_keeps_configured_budget_for_oversized_resident_estimate() {
+    let plan = name_analysis_memory_plan("1GB", None, 2 * 1024 * 1024 * 1024).unwrap();
 
-    assert!(error.to_string().contains("loaded name atoms need"));
+    assert_eq!(plan.analysis_bytes, GIB as usize);
 }

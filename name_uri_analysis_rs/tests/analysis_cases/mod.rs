@@ -117,7 +117,7 @@ fn write_parquet_with_metadata(path: &Path, values_sql: &str) {
 }
 
 #[test]
-fn metadata_phase_rejects_state_above_the_hard_analysis_budget() {
+fn metadata_phase_continues_when_measured_state_exceeds_the_accounting_budget() {
     let temp = tempfile::tempdir().unwrap();
     let parquet = temp.path().join("metadata-budget.parquet");
     write_parquet_with_metadata(
@@ -144,10 +144,11 @@ fn metadata_phase_rejects_state_above_the_hard_analysis_budget() {
     run_analysis_phase(&options, AnalysisPhase::Prepare, &work).unwrap();
     run_analysis_phase(&options, AnalysisPhase::MetadataEncode, &work).unwrap();
 
-    let error = run_analysis_phase(&options, AnalysisPhase::MetadataMatch, &work).unwrap_err();
-
-    let message = error.to_string();
-    assert!(message.contains("memory budget exceeded"), "{message}");
+    run_analysis_phase(&options, AnalysisPhase::MetadataMatch, &work).unwrap();
+    assert!(work.join("partial/metadata-summary.json").is_file());
+    assert!(work
+        .join("artifacts/metadata/match-1/metadata-summary-1/metadata-summary.ready")
+        .is_file());
 }
 
 #[test]

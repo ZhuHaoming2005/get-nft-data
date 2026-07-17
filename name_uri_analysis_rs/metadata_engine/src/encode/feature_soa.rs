@@ -930,7 +930,7 @@ pub fn write_encode_artifacts_all_views_with_csr_progress(
     })
 }
 
-/// Conservative physical-space admission for the complete encoded feature bundle.
+/// Conservative durable-size estimate for the complete encoded feature bundle.
 ///
 /// This uses the frozen column cardinalities rather than raw JSON bytes. The
 /// latter can exceed the fixed-width Match representation by more than an order

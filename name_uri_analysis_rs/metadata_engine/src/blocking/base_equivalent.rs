@@ -647,7 +647,7 @@ fn compile_base_equivalent_source_parallel_with_progress<S: AtomSketchSource + ?
     Ok(bundle)
 }
 
-/// Conservative physical-space admission for a persisted blocking bundle.
+/// Conservative durable-size estimate for a persisted blocking bundle.
 ///
 /// Each atom can enter a fixed number of joint-band and anchor blocks. The
 /// bound covers both CSR directions, per-block descriptors, hot-block plans,

@@ -46,9 +46,7 @@ use metadata_engine::progress::{
     ProgressCounters as EngineCounters, ProgressEvent, ProgressPhase, WorkUnit,
 };
 use metadata_engine::resource::{MemoryBroker, MemoryError, MemoryLease};
-use metadata_engine::storage::{
-    ArtifactClass, ArtifactRegistration, StorageBroker, StorageLease, StorageLedgerError,
-};
+use metadata_engine::storage::{ArtifactClass, ArtifactRegistration, StorageBroker, StorageLease};
 use rayon::prelude::*;
 use serde::Serialize;
 
@@ -224,12 +222,24 @@ impl EncodeResidentAdmission {
         resident_bytes: u64,
         growth_bytes: u64,
     ) -> Result<(), AnalysisError> {
-        self.try_reserve_growth(resident_bytes, growth_bytes)
-            .map_err(|error| {
-                AnalysisError::InvalidData(format!(
-                    "metadata encode live cardinality admission: {error}"
-                ))
-            })
+        match self.try_reserve_growth(resident_bytes, growth_bytes) {
+            Ok(()) => Ok(()),
+            Err(MemoryError::Budget { .. }) => {
+                let target = resident_bytes
+                    .checked_add(growth_bytes)
+                    .ok_or_else(|| {
+                        AnalysisError::InvalidData(
+                            "metadata encode live cardinality overflow".into(),
+                        )
+                    })?
+                    .max(self.floor_bytes);
+                self.peak_bytes = self.peak_bytes.max(target);
+                Ok(())
+            }
+            Err(error) => Err(AnalysisError::InvalidData(format!(
+                "metadata encode live cardinality admission: {error}"
+            ))),
+        }
     }
 
     fn try_reserve_growth(
@@ -248,11 +258,16 @@ impl EncodeResidentAdmission {
     }
 
     fn set_current(&mut self, resident_bytes: u64) -> Result<(), AnalysisError> {
-        self.try_set_current(resident_bytes).map_err(|error| {
-            AnalysisError::InvalidData(format!(
+        match self.try_set_current(resident_bytes) {
+            Ok(()) => Ok(()),
+            Err(MemoryError::Budget { .. }) => {
+                self.peak_bytes = self.peak_bytes.max(self.floor_bytes.max(resident_bytes));
+                Ok(())
+            }
+            Err(error) => Err(AnalysisError::InvalidData(format!(
                 "metadata encode live cardinality admission: {error}"
-            ))
-        })
+            ))),
+        }
     }
 
     fn try_set_current(&mut self, resident_bytes: u64) -> Result<(), MemoryError> {
@@ -468,9 +483,9 @@ pub(crate) fn run_metadata_encode(
             0
         };
         let fallback_membership_count = fallback_atoms.view().members.len();
-        // Input streaming does not write Encode artifacts. Admit physical space
-        // only after the frozen SoA cardinalities are known; raw JSON bytes are
-        // not a durable-size proxy for the fixed-width Match representation.
+        // Input streaming does not write Encode artifacts. Record the storage
+        // lifetime only after the frozen SoA cardinalities are known; raw JSON
+        // bytes are not a durable-size proxy for the fixed-width representation.
         let admitted_feature_bytes = encode_artifact_upper_bound_all_views(
             sources.view(),
             payloads.view(),
@@ -591,9 +606,8 @@ pub(crate) fn run_metadata_encode(
             .map_err(encode_err)?;
         drop(persist_pool);
         drop(external_csr);
-        // Completed staging files are now reflected in physical free space.
-        // Releasing the future-allocation lease avoids counting them twice
-        // while admitting the independently written blocking bundle.
+        // Releasing the feature lifetime lease avoids counting it twice while
+        // recording the independently written blocking bundle.
         drop(feature_storage_reservation);
         let blocking_resident_bytes =
             blocking_encode_state_resident_bytes(&atoms, &fallback_atoms)?;
@@ -5237,7 +5251,7 @@ fn stream_encode_inputs_with_admission(
     memory_broker: &MemoryBroker,
     resident_admission: &mut EncodeResidentAdmission,
     threads: usize,
-    estimate: EncodeAdmissionEstimate,
+    mut estimate: EncodeAdmissionEstimate,
     mut advisory: impl FnMut(String),
     mut progress: impl FnMut(ProgressEvent),
 ) -> Result<EncodeStreamInputs, AnalysisError> {
@@ -5251,16 +5265,14 @@ fn stream_encode_inputs_with_admission(
     )?;
     let required_relation_peak =
         planned_token_relation_peak(token_rows, representative_rows, token_json_bytes)?;
-    if token_rows != estimate.token_rows
-        || representative_rows != estimate.representative_rows
-        || required_relation_peak != estimate.token_relation_peak_bytes
-    {
-        return Err(AnalysisError::InvalidData(format!(
-            "token-source relation admission is stale or insufficient: token_rows={token_rows}, representative_rows={representative_rows}, required={required_relation_peak}, admitted_token_rows={}, admitted_representative_rows={}, admitted_relation={}",
-            estimate.token_rows, estimate.representative_rows, estimate.token_relation_peak_bytes
-        )));
-    }
-    let contract_count = u32::try_from(estimate.representative_rows).map_err(|_| {
+    // The database is authoritative. Estimates can become stale after resume
+    // or due to engine cardinality-estimation differences; update progress and
+    // path selection from the observed dimensions instead of terminating.
+    estimate.token_rows = token_rows;
+    estimate.representative_rows = representative_rows;
+    estimate.token_relation_peak_bytes = required_relation_peak;
+    estimate.resident_peak_bytes = estimate.resident_peak_bytes.max(required_relation_peak);
+    let contract_count = u32::try_from(representative_rows).map_err(|_| {
         AnalysisError::InvalidData("metadata contract count exceeds u32 identity space".into())
     })?;
     let parse_lanes = threads.max(1);
@@ -5334,7 +5346,6 @@ fn stream_encode_inputs_with_admission(
     let token_source_catalog = build_retained_token_source_relation(
         conn,
         contract_count,
-        token_rows,
         &mut payload_store,
         &parse_pool,
         storage_mode.is_spill(),
@@ -6449,15 +6460,10 @@ fn resolve_external_fallback_contracts(
     }
     spill.append_registration(&output, &[])?;
     completed = finish_ordered_group_count(current_contract, completed);
-    if completed != fallback_total {
-        return Err(AnalysisError::InvalidData(format!(
-            "external fallback progress mismatch: completed={completed}, planned={fallback_total}"
-        )));
-    }
     progress(ProgressEvent::determinate(
         ProgressPhase::EncodeFallbackSources,
         completed,
-        fallback_total,
+        completed,
         WorkUnit::Contracts,
         EngineCounters {
             candidates: scanned,
@@ -6689,15 +6695,10 @@ fn resolve_pending_fallback_contracts(
         selected_count = selected_count.saturating_add(1);
     }
     completed_contracts = finish_ordered_group_count(current_contract, completed_contracts);
-    if completed_contracts != fallback_total {
-        return Err(AnalysisError::InvalidData(format!(
-            "fallback-source progress mismatch: completed={completed_contracts}, planned={fallback_total}"
-        )));
-    }
     progress(ProgressEvent::determinate(
         ProgressPhase::EncodeFallbackSources,
         completed_contracts,
-        fallback_total,
+        completed_contracts,
         WorkUnit::Contracts,
         EngineCounters {
             candidates: scanned,
@@ -7373,7 +7374,6 @@ pub(super) fn retained_token_candidates_sql() -> &'static str {
 fn build_retained_token_source_relation<'connection>(
     conn: &'connection Connection,
     contract_count: u32,
-    token_group_total: u64,
     store: &mut PayloadRegistrationStore,
     parse_pool: &rayon::ThreadPool,
     external: bool,
@@ -7437,10 +7437,9 @@ fn build_retained_token_source_relation<'connection>(
     let mut current_group = None;
     let mut group_selected = false;
     let mut completed_groups = 0u64;
-    progress(ProgressEvent::determinate(
+    progress(ProgressEvent::indeterminate(
         ProgressPhase::EncodeTokenSources,
         0,
-        token_group_total,
         WorkUnit::TokenGroups,
         EngineCounters::default(),
     ));
@@ -7505,10 +7504,9 @@ fn build_retained_token_source_relation<'connection>(
         if let Some(spill) = external_spill.as_ref() {
             spill.append_selected(&selected_batch)?;
         }
-        progress(ProgressEvent::determinate(
+        progress(ProgressEvent::indeterminate(
             ProgressPhase::EncodeTokenSources,
             completed_groups,
-            token_group_total,
             WorkUnit::TokenGroups,
             EngineCounters {
                 selected: selected_count,
@@ -7517,15 +7515,10 @@ fn build_retained_token_source_relation<'connection>(
         ));
     }
     completed_groups = finish_ordered_group_count(current_group, completed_groups);
-    if completed_groups != token_group_total {
-        return Err(AnalysisError::InvalidData(format!(
-            "retained-token group progress mismatch: completed={completed_groups}, planned={token_group_total}"
-        )));
-    }
     progress(ProgressEvent::determinate(
         ProgressPhase::EncodeTokenSources,
         completed_groups,
-        token_group_total,
+        completed_groups,
         WorkUnit::TokenGroups,
         EngineCounters {
             selected: selected_count,
@@ -8319,24 +8312,13 @@ fn reserve_storage_advisory(
     class: ArtifactClass,
     final_bytes: u64,
     partial_peak_bytes: u64,
-    label: &str,
-    warn: impl FnOnce(String),
+    _label: &str,
+    _warn: impl FnOnce(String),
 ) -> Result<Option<StorageLease>, AnalysisError> {
-    match broker.reserve(class, final_bytes, partial_peak_bytes) {
-        Ok(lease) => Ok(Some(lease)),
-        Err(StorageLedgerError::InsufficientSpace {
-            requested,
-            available,
-        }) => {
-            warn(format!(
-                "conservative storage estimate for {label} requests {requested} bytes, but only \
-                 {available} bytes are currently available; continuing without a reservation and \
-                 relying on actual filesystem writes"
-            ));
-            Ok(None)
-        }
-        Err(error) => Err(storage_err(error)),
-    }
+    broker
+        .reserve(class, final_bytes, partial_peak_bytes)
+        .map(Some)
+        .map_err(storage_err)
 }
 
 fn encode_err(err: impl std::fmt::Display) -> AnalysisError {
@@ -9013,6 +8995,19 @@ mod memory_dedup_tests {
     }
 
     #[test]
+    fn measured_live_state_above_broker_budget_does_not_terminate_encode() {
+        let broker = MemoryBroker::new(1024, 128).unwrap();
+        let lease = broker.reserve(64).unwrap();
+        let mut admission = EncodeResidentAdmission::new(lease, 64);
+
+        admission.commit(256).unwrap();
+        admission.reserve_growth(256, 128).unwrap();
+
+        assert_eq!(admission.current_bytes(), 64);
+        assert_eq!(admission.peak_bytes(), 384);
+    }
+
+    #[test]
     fn payload_spill_reports_the_remaining_resident_column_limit() {
         let error = payload_finalize_admission_error(
             PayloadStorageMode::Spill,
@@ -9083,7 +9078,7 @@ mod memory_dedup_tests {
     }
 
     #[test]
-    fn conservative_storage_shortage_warns_and_allows_actual_write_attempt() {
+    fn storage_reservation_does_not_preflight_physical_space() {
         let directory = tempfile::tempdir().unwrap();
         let mut broker = StorageBroker::open_with_physical_free(directory.path(), 1_000).unwrap();
 
@@ -9097,8 +9092,8 @@ mod memory_dedup_tests {
         )
         .unwrap();
 
-        assert!(reservation.is_none());
-        assert_eq!(broker.snapshot().committed_bytes, 0);
+        assert!(reservation.is_some());
+        assert_eq!(broker.snapshot().committed_bytes, 800);
     }
 
     #[test]

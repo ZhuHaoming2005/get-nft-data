@@ -32,11 +32,7 @@ pub(crate) fn encode_process_memory_plan(
     const MIN_ENCODE_DUCKDB_BYTES: u64 = 8 * GIB;
     let duckdb_floor = configured_duckdb.min(MIN_ENCODE_DUCKDB_BYTES);
     let max_rust = (rust_user_budget as u64).min(envelope_bytes.saturating_sub(duckdb_floor));
-    if max_rust == 0 {
-        return Err(AnalysisError::InvalidData(
-            "Encode has no resident memory inside the shared process envelope".into(),
-        ));
-    }
+    let max_rust = max_rust.max(1);
     let desired_rust = estimated_rust_resident
         .saturating_add(64 * GIB)
         .max((128 * GIB).min(max_rust))
@@ -80,35 +76,17 @@ pub(crate) fn explicit_analysis_memory_plan(
     analysis_bytes: usize,
     resident_analysis_bytes: usize,
 ) -> Result<MemoryPlan, AnalysisError> {
-    if analysis_bytes > total_budget {
-        return Err(AnalysisError::InvalidData(format!(
-            "--analysis-memory-limit {} exceeds total --memory-limit {}",
-            format_byte_size(analysis_bytes),
-            format_byte_size(total_budget)
-        )));
-    }
-    if resident_analysis_bytes > analysis_bytes {
-        return Err(AnalysisError::InvalidData(format!(
-            "resident name state needs about {}, exceeding --analysis-memory-limit {}",
-            format_byte_size(resident_analysis_bytes),
-            format_byte_size(analysis_bytes)
-        )));
-    }
-
-    Ok(MemoryPlan { analysis_bytes })
+    let _ = resident_analysis_bytes;
+    Ok(MemoryPlan {
+        analysis_bytes: analysis_bytes.min(total_budget),
+    })
 }
 
 pub(crate) fn auto_balanced_memory_plan(
     total_budget: usize,
     resident_analysis_bytes: usize,
 ) -> Result<MemoryPlan, AnalysisError> {
-    if resident_analysis_bytes > total_budget {
-        return Err(AnalysisError::InvalidData(format!(
-            "loaded name atoms need about {}, exceeding available Rust budget under --memory-limit {}",
-            format_byte_size(resident_analysis_bytes),
-            format_byte_size(total_budget)
-        )));
-    }
+    let _ = resident_analysis_bytes;
     Ok(MemoryPlan {
         analysis_bytes: total_budget,
     })
@@ -124,7 +102,11 @@ pub(crate) fn total_memory_budget_bytes(value: &str) -> Result<usize, AnalysisEr
 }
 
 pub(crate) fn auto_memory_budget_bytes() -> usize {
-    usize::try_from(effective_available_memory_bytes()).unwrap_or(usize::MAX)
+    let capacity = effective_memory_capacity_bytes();
+    usize::try_from(
+        capacity.saturating_sub(metadata_engine::resource::required_host_headroom(capacity)),
+    )
+    .unwrap_or(usize::MAX)
 }
 
 pub fn effective_available_memory_bytes() -> u64 {
@@ -141,12 +123,10 @@ pub(crate) fn effective_memory_snapshot_bytes() -> (u64, u64) {
     effective_memory_values(&system)
 }
 
-pub(crate) fn process_memory_envelope_bytes(host_total: u64, host_available: u64) -> u64 {
-    host_total
-        .saturating_sub(metadata_engine::resource::required_host_headroom(
-            host_total,
-        ))
-        .min(host_available)
+pub(crate) fn process_memory_envelope_bytes(host_total: u64, _host_available: u64) -> u64 {
+    host_total.saturating_sub(metadata_engine::resource::required_host_headroom(
+        host_total,
+    ))
 }
 
 pub(crate) fn duckdb_buffer_cap_bytes(process_envelope: u64) -> u64 {
@@ -176,16 +156,15 @@ pub(crate) fn engine_memory_hard_top_bytes(
     user_budget: usize,
     engine_cap: u64,
     host_total: u64,
-    host_available: u64,
+    _host_available: u64,
 ) -> Result<u64, AnalysisError> {
-    let host_capacity = process_memory_envelope_bytes(host_total, host_available);
-    let hard_top = (user_budget as u64).min(engine_cap).min(host_capacity);
-    if hard_top == 0 {
-        return Err(AnalysisError::InvalidData(
-            "no memory remains after reserving physical host headroom".into(),
-        ));
-    }
-    Ok(hard_top)
+    let configured_top = (user_budget as u64).min(engine_cap).max(1);
+    let host_capacity = process_memory_envelope_bytes(host_total, host_total);
+    Ok(if host_capacity == 0 {
+        configured_top
+    } else {
+        configured_top.min(host_capacity)
+    })
 }
 
 pub(crate) fn format_byte_size(bytes: usize) -> String {

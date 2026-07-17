@@ -357,20 +357,21 @@ fn commit_evict_removes_registered_artifact_directories() {
 }
 
 #[test]
-fn reservation_fails_before_allocation_when_physical_space_is_insufficient() {
+fn reservation_does_not_preflight_physical_space() {
     let dir = tempfile::tempdir().unwrap();
     let mut broker =
         metadata_engine::storage::StorageBroker::open_with_physical_free(dir.path(), 1_000)
             .unwrap();
 
-    assert!(broker
-        .reserve(metadata_engine::storage::ArtifactClass::Feature, 800, 300,)
-        .is_err());
-    assert_eq!(broker.snapshot().committed_bytes, 0);
+    let lease = broker
+        .reserve(metadata_engine::storage::ArtifactClass::Feature, 800, 300)
+        .unwrap();
+    assert_eq!(broker.snapshot().committed_bytes, 800);
+    drop(lease);
 }
 
 #[test]
-fn reserve_reclaims_safe_evictable_artifacts_before_failing_space_admission() {
+fn reserve_keeps_safe_evictable_artifacts_without_space_preflight() {
     let dir = tempfile::tempdir().unwrap();
     let stale = dir.path().join("stale-index.bin");
     std::fs::write(&stale, vec![7u8; 600]).unwrap();
@@ -392,13 +393,13 @@ fn reserve_reclaims_safe_evictable_artifacts_before_failing_space_admission() {
         .reserve(metadata_engine::storage::ArtifactClass::Summary, 1_100, 0)
         .unwrap();
 
-    assert!(!stale.exists());
-    assert_eq!(broker.snapshot().committed_bytes, 1_100);
+    assert!(stale.exists());
+    assert_eq!(broker.snapshot().committed_bytes, 1_700);
     drop(lease);
 }
 
 #[test]
-fn reserve_keeps_evictable_cache_when_total_reclaim_cannot_admit_request() {
+fn reserve_accepts_large_request_without_preflight_and_keeps_evictable_cache() {
     let dir = tempfile::tempdir().unwrap();
     let stale = dir.path().join("small-stale-index.bin");
     std::fs::write(&stale, vec![3u8; 100]).unwrap();
@@ -416,32 +417,23 @@ fn reserve_keeps_evictable_cache_when_total_reclaim_cannot_admit_request() {
         .unwrap();
     broker.mark_evictable(&stale, "superseded").unwrap();
 
-    assert!(broker
+    let lease = broker
         .reserve(metadata_engine::storage::ArtifactClass::Summary, 1_500, 0)
-        .is_err());
+        .unwrap();
     assert!(stale.exists());
+    drop(lease);
 }
 
 #[test]
-fn real_filesystem_free_space_reflects_durable_file_growth() {
-    use std::io::Write;
-
+fn production_broker_does_not_probe_filesystem_free_space() {
     let dir = tempfile::tempdir().unwrap();
     let broker = metadata_engine::storage::StorageBroker::open(dir.path()).unwrap();
     let before = broker.snapshot().physical_free_bytes;
-    let path = dir.path().join("physical-free-probe.bin");
-    let mut file = std::fs::File::create(&path).unwrap();
-    let block = vec![0xa5u8; 1024 * 1024];
-    for _ in 0..32 {
-        file.write_all(&block).unwrap();
-    }
-    file.sync_all().unwrap();
+    std::fs::write(dir.path().join("ordinary-write.bin"), b"actual write").unwrap();
     let after = broker.snapshot().physical_free_bytes;
 
-    assert!(
-        after < before,
-        "OS free-space reading did not decrease after a durable 32 MiB write: before={before}, after={after}"
-    );
+    assert_eq!(before, 0);
+    assert_eq!(after, 0);
 }
 
 #[test]

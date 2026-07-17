@@ -112,8 +112,145 @@ fn retained_token_sources_use_one_streaming_query_without_encode_temp_tables() {
     let sql = retained_token_candidates_sql();
 
     assert!(sql.contains("metadata_contract_token_rows"));
+    assert!(sql.contains("JOIN analysis_contracts"));
+    assert!(sql.contains("JOIN metadata_token_dictionary"));
+    assert!(sql.contains("rows.contract_id = contracts.contract_id"));
+    assert!(sql.contains("rows.token_id = dictionary.token_id"));
     assert!(sql.contains("ORDER BY token_rows.contract_index"));
     assert!(!sql.to_ascii_uppercase().contains("CREATE TEMP TABLE"));
+}
+
+#[test]
+fn duckdb_arrow_stream_consumes_more_than_one_ordered_vector() {
+    use duckdb::arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    let conn = Connection::open_in_memory().unwrap();
+    let mut statement = conn
+        .prepare(
+            "SELECT range::UINTEGER AS value
+             FROM range(10_000)
+             ORDER BY value",
+        )
+        .unwrap();
+    let batches = statement
+        .stream_arrow(
+            [],
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::UInt32,
+                false,
+            )])),
+        )
+        .unwrap();
+
+    let rows = batches.map(|batch| batch.num_rows()).sum::<usize>();
+    assert_eq!(rows, 10_000);
+}
+
+#[test]
+fn retained_token_candidate_stream_consumes_all_arrow_vectors() {
+    use duckdb::arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE metadata_contract_token_rows AS
+         SELECT range::UINTEGER AS contract_index,
+                range::UINTEGER AS token_index,
+                0::UINTEGER AS metadata_source_file,
+                range::UBIGINT AS metadata_source_row_number
+         FROM range(10_000);
+         CREATE TABLE analysis_contracts AS
+         SELECT range::UINTEGER AS metadata_contract_index,
+                range::UINTEGER AS contract_id
+         FROM range(10_000);
+         CREATE TABLE metadata_token_dictionary AS
+         SELECT range::UINTEGER AS token_index,
+                range::VARCHAR AS token_id
+         FROM range(10_000);
+         CREATE TABLE metadata_rows AS
+         SELECT range::UINTEGER AS contract_id,
+                range::VARCHAR AS token_id,
+                '{\"description\":\"usable\"}'::VARCHAR AS metadata_json,
+                0::UINTEGER AS source_file,
+                range::UBIGINT AS source_row_number,
+                true AS metadata_eligible
+         FROM range(10_000);",
+    )
+    .unwrap();
+    let mut statement = conn.prepare(retained_token_candidates_sql()).unwrap();
+    let batches = statement
+        .stream_arrow(
+            [],
+            Arc::new(Schema::new(vec![
+                Field::new("contract_index", DataType::UInt32, false),
+                Field::new("token_index", DataType::UInt32, false),
+                Field::new("source_file", DataType::UInt32, false),
+                Field::new("source_row_number", DataType::UInt64, false),
+                Field::new("metadata_json", DataType::Utf8, false),
+            ])),
+        )
+        .unwrap();
+
+    let rows = batches.map(|batch| batch.num_rows()).sum::<usize>();
+    assert_eq!(rows, 10_000);
+}
+
+#[test]
+fn retained_token_row_count_is_not_a_token_group_progress_total() {
+    use duckdb::arrow::array::UInt32Array;
+    use duckdb::arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    let conn = Connection::open_in_memory().unwrap();
+    let mut statement = conn
+        .prepare(
+            "SELECT (range // 5_000)::UINTEGER AS contract_index,
+                    ((range // 2_500) % 2)::UINTEGER AS token_index
+             FROM range(10_000)
+             ORDER BY contract_index, token_index",
+        )
+        .unwrap();
+    let batches = statement
+        .stream_arrow(
+            [],
+            Arc::new(Schema::new(vec![
+                Field::new("contract_index", DataType::UInt32, false),
+                Field::new("token_index", DataType::UInt32, false),
+            ])),
+        )
+        .unwrap();
+
+    let mut row_count = 0u64;
+    let mut completed_groups = 0u64;
+    let mut current_group = None;
+    for batch in batches {
+        row_count += batch.num_rows() as u64;
+        let contracts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let tokens = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        for (group, _) in ordered_group_ranges(batch.num_rows(), |index| {
+            (contracts.value(index), tokens.value(index))
+        }) {
+            observe_ordered_group(group, &mut current_group, &mut completed_groups);
+        }
+    }
+    completed_groups = finish_ordered_group_count(current_group, completed_groups);
+
+    assert_eq!(row_count, 10_000);
+    assert_eq!(completed_groups, 4);
+    assert_ne!(
+        row_count, completed_groups,
+        "the former progress check compared source rows with distinct token groups"
+    );
 }
 
 #[test]
@@ -490,7 +627,7 @@ fn encode_connection_applies_duckdb_resource_configuration() {
 }
 
 #[test]
-fn encode_rejects_underestimated_token_relation_before_loading_it() {
+fn encode_refreshes_underestimated_token_relation_from_observed_dimensions() {
     let dir = tempfile::tempdir().unwrap();
     let work = dir.path().join("work");
     fs::create_dir_all(&work).unwrap();
@@ -504,7 +641,7 @@ fn encode_rejects_underestimated_token_relation_before_loading_it() {
     let mut broker = StorageBroker::open(&work).unwrap();
     let memory_broker = MemoryBroker::new(16 * GIB, 12 * GIB).unwrap();
 
-    let error = match stream_encode_inputs_with_progress(
+    let result = stream_encode_inputs_with_progress(
         &conn,
         &work,
         &mut broker,
@@ -512,17 +649,10 @@ fn encode_rejects_underestimated_token_relation_before_loading_it() {
         1,
         estimate,
         |_| {},
-    ) {
-        Ok(_) => panic!("underestimated token relation was accepted"),
-        Err(error) => error,
-    };
+    )
+    .unwrap();
 
-    assert!(
-        error
-            .to_string()
-            .contains("token-source relation admission"),
-        "unexpected error: {error}"
-    );
+    assert!(result.0.source_count() > 0);
 }
 
 fn payload_spill_directory_count(work: &Path) -> usize {

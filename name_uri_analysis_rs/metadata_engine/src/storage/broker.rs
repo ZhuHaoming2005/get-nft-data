@@ -70,7 +70,6 @@ pub struct EvictionPlan {
     pub paths: Vec<PathBuf>,
 }
 
-const MINIMUM_SAFETY_RESERVE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const EVICTION_DIRECTORY: &str = ".storage-evictions";
 const EVICTION_JOURNAL_REVISION: u32 = 1;
 
@@ -86,7 +85,8 @@ struct EvictionJournal {
 struct BrokerInner {
     work_dir: PathBuf,
     ledger: LedgerFile,
-    /// When set, skip filesystem query (deterministic tests).
+    /// Optional deterministic accounting baseline used by storage-ledger tests.
+    /// Production never probes filesystem free space.
     physical_free_override: Option<u64>,
     safety_reserve_bytes: u64,
 }
@@ -132,18 +132,9 @@ impl StorageBroker {
         // necessarily from a terminated process and must not poison recovery.
         let cleared_stale_reservations = !ledger.reservations.is_empty();
         ledger.reservations.clear();
-        let safety_reserve_bytes = if physical_free_override.is_some() {
-            0
-        } else {
-            std::env::var("METADATA_ENGINE_STORAGE_SAFETY_RESERVE_BYTES")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or_else(|| {
-                    query_filesystem_free(&work_dir)
-                        .map(|free| MINIMUM_SAFETY_RESERVE_BYTES.max(free / 10))
-                        .unwrap_or(MINIMUM_SAFETY_RESERVE_BYTES)
-                })
-        };
+        // The ledger tracks lifetimes, not speculative capacity. Actual writes
+        // and fsyncs are the only disk-space authority.
+        let safety_reserve_bytes = 0;
         let mut inner = BrokerInner {
             work_dir,
             ledger,
@@ -476,11 +467,10 @@ impl StorageBroker {
         Ok(available_bytes_locked(&guard))
     }
 
-    /// Available bytes after active reservations and the safety reserve.
+    /// Available bytes in the optional deterministic accounting model.
     ///
-    /// `physical_free − reserved_final − safety_reserve − reserved_partial_peak`.
-    /// Registered artifacts are already reflected in the filesystem's current
-    /// free-space reading and must not be subtracted a second time.
+    /// Production brokers return zero because actual writes, not a filesystem
+    /// capacity probe, determine whether space is available.
     pub fn available_after_evict(&self) -> u64 {
         let guard = self.inner.lock().expect("storage broker lock");
         available_bytes_locked(&guard)
@@ -492,38 +482,15 @@ impl StorageBroker {
         final_bytes: u64,
         partial_peak_bytes: u64,
     ) -> Result<StorageLease, StorageLedgerError> {
-        let requested = final_bytes
+        final_bytes
             .checked_add(partial_peak_bytes)
             .ok_or(StorageLedgerError::ReservationOverflow)?;
-        let required_reclaim = {
-            let guard = self.inner.lock().expect("storage broker lock");
-            requested.saturating_sub(available_bytes_locked(&guard))
-        };
-        if required_reclaim != 0 {
-            let reclaimable = {
-                let guard = self.inner.lock().expect("storage broker lock");
-                guard
-                    .ledger
-                    .reclaimable_bytes(&guard.ledger.match_independent)
-            };
-            // Do not destroy an evictable cache when it cannot make
-            // this reservation admissible even under ledger byte accounting.
-            if reclaimable >= required_reclaim {
-                let plan = self.plan_evict(required_reclaim)?;
-                if !plan.paths.is_empty() {
-                    self.commit_evict(&plan)?;
-                }
-            }
-        }
+        // Reservations coordinate artifact lifetimes only. Filesystem free
+        // space can be unavailable or misleading for networked, quota-backed,
+        // containerized, and Windows volumes. Do not preflight or evict from an
+        // estimate; actual create/write/fsync operations are authoritative.
         let id = {
             let mut guard = self.inner.lock().expect("storage broker lock");
-            let available = available_bytes_locked(&guard);
-            if requested > available {
-                return Err(StorageLedgerError::InsufficientSpace {
-                    requested,
-                    available,
-                });
-            }
             let id = guard.ledger.next_reservation_id;
             guard.ledger.next_reservation_id = id.saturating_add(1);
             guard.ledger.reservations.insert(
@@ -838,10 +805,7 @@ fn remove_path_if_present(path: &Path) -> Result<(), StorageLedgerError> {
 }
 
 fn physical_free_locked(guard: &BrokerInner) -> u64 {
-    if let Some(n) = guard.physical_free_override {
-        return n;
-    }
-    estimate_physical_free(&guard.work_dir)
+    guard.physical_free_override.unwrap_or(0)
 }
 
 fn available_bytes_locked(guard: &BrokerInner) -> u64 {
@@ -852,63 +816,4 @@ fn available_bytes_locked(guard: &BrokerInner) -> u64 {
         .saturating_sub(reserved_final)
         .saturating_sub(guard.safety_reserve_bytes)
         .saturating_sub(partial)
-}
-
-/// Query filesystem free space. Returns `0` when unavailable (fail closed).
-fn estimate_physical_free(work_dir: &Path) -> u64 {
-    query_filesystem_free(work_dir).unwrap_or(0)
-}
-
-#[cfg(windows)]
-fn query_filesystem_free(path: &Path) -> Option<u64> {
-    use std::os::windows::ffi::OsStrExt;
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GetDiskFreeSpaceExW(
-            lp_directory_name: *const u16,
-            lp_free_bytes_available_to_caller: *mut u64,
-            lp_total_number_of_bytes: *mut u64,
-            lp_total_number_of_free_bytes: *mut u64,
-        ) -> i32;
-    }
-
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let mut free_to_caller: u64 = 0;
-    let mut total: u64 = 0;
-    let mut total_free: u64 = 0;
-    let ok = unsafe {
-        GetDiskFreeSpaceExW(
-            wide.as_ptr(),
-            &mut free_to_caller,
-            &mut total,
-            &mut total_free,
-        )
-    };
-    if ok == 0 {
-        None
-    } else {
-        Some(free_to_caller)
-    }
-}
-
-#[cfg(unix)]
-fn query_filesystem_free(path: &Path) -> Option<u64> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
-    if rc != 0 {
-        return None;
-    }
-    let frsize = u64::from(stat.f_frsize);
-    let bavail = stat.f_bavail as u64;
-    Some(bavail.saturating_mul(frsize))
-}
-
-#[cfg(not(any(windows, unix)))]
-fn query_filesystem_free(_path: &Path) -> Option<u64> {
-    None
 }

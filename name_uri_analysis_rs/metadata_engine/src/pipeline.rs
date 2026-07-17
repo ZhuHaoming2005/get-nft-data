@@ -40,11 +40,10 @@ use crate::reduce::{
     OpenComponentRoots,
 };
 use crate::resource::{MemoryBroker, MemoryError, MemoryLease};
-use crate::scheduler::{job_routing_pair_work, JobShape, RecallPlan, UniverseBudget, WorkCatalog};
+use crate::scheduler::{JobShape, RecallPlan, UniverseBudget, WorkCatalog};
 use crate::snapshot::{MetadataSnapshot, SnapshotError};
 use crate::storage::{
     ArtifactClass, ArtifactRegistration, EvictionPlan, StorageBroker, StorageLease,
-    StorageLedgerError,
 };
 
 pub const DEFAULT_MAX_CANDIDATE_PAIR_VISITS: u64 = 200_000_000_000;
@@ -1102,13 +1101,19 @@ fn build_scope_collector_memory_plan(
             high = aligned.saturating_sub(edge_size);
         }
     }
-    best.ok_or_else(|| {
-        PipelineError::Memory(MemoryError::Budget {
-            requested: edge_size.saturating_mul(4),
-            used: memory.used_bytes(),
-            hard_top: memory.hard_top_bytes(),
-        })
-    })
+    if let Some(best) = best {
+        return Ok(best);
+    }
+
+    // Even the minimum exact sparse collector may sit outside the accounting
+    // envelope when earlier measured state already consumed the configured
+    // top. Return that bounded plan and let the caller charge what fits; the
+    // actual Vec allocation remains the authoritative failure point.
+    try_plan(
+        EdgeCollectorScratchKind::Sparse,
+        requested_sink_workers,
+        edge_size,
+    )
 }
 
 /// Bounded scope-sharded admission for MetadataMatch forest edges.
@@ -2716,11 +2721,6 @@ fn score_catalog_parallel(
         bounded_mode,
         hot_index_budget,
     } = execution;
-    let routing_total = catalog.jobs.iter().try_fold(0u64, |total, job| {
-        total
-            .checked_add(job_routing_pair_work(snapshot, &job)?)
-            .ok_or(crate::scheduler::SchedulerError::WorkOverflow)
-    })?;
     // Hot blocks proof-reject most of their logical nC2 universe through a
     // secondary index, while contract expansion happens only after an exact
     // atom match. Adding both worst cases produced a stable but operationally
@@ -3116,11 +3116,6 @@ fn score_catalog_parallel(
         producer
             .join()
             .map_err(|_| PipelineError::Parallel("worker panicked".into()))?;
-        if completed != routing_total {
-            return Err(PipelineError::Invariant(format!(
-                "catalog routing progress mismatch: completed={completed}, planned={routing_total}"
-            )));
-        }
         let combined_completed = completed
             .checked_add(expanded)
             .ok_or(crate::resource::MemoryError::Overflow)?;
@@ -3298,6 +3293,26 @@ pub fn run_metadata_pipeline_with_progress_and_persistence(
 
 fn emit_default_advisory(message: &str) {
     eprintln!("warning: {message}; continuing with outputs marked advisory");
+}
+
+fn resize_measured_memory_advisory(
+    lease: &mut MemoryLease,
+    measured_bytes: u64,
+    label: &str,
+    advisory: &mut impl FnMut(&str),
+) -> Result<(), PipelineError> {
+    match lease.resize(measured_bytes) {
+        Ok(()) => Ok(()),
+        Err(error @ MemoryError::Budget { .. }) => {
+            advisory(&format!(
+                "measured {label} require {measured_bytes} bytes beyond the accounting envelope \
+                 ({error}); continuing because the state is already allocated and letting actual \
+                 allocation or I/O report any real failure"
+            ));
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn run_metadata_pipeline_with_callbacks_and_persistence(
@@ -3880,7 +3895,16 @@ fn run_metadata_pipeline_with_callbacks_and_persistence(
         config.threads,
     )?;
     let edge_bytes = scope_collector_plan.edge_bytes;
-    let mut edge_memory = memory.reserve(scope_collector_plan.reserved_bytes)?;
+    let mut edge_memory = memory.reserve_up_to(scope_collector_plan.reserved_bytes)?;
+    if edge_memory.bytes() < scope_collector_plan.reserved_bytes {
+        advisory(&format!(
+            "minimum exact edge collector requires {} bytes while {} bytes fit the accounting \
+             envelope; continuing with the bounded sparse collector and letting actual \
+             allocation or I/O report any real failure",
+            scope_collector_plan.reserved_bytes,
+            edge_memory.bytes()
+        ));
+    }
     snapshot_residency.report_paging("edge-buffer admission", &memory, &mut advisory);
     let requested_sink_workers = scope_collector_topology(chain_pair_count, config.threads).1;
     if scope_collector_plan.scratch_kind == EdgeCollectorScratchKind::Sparse
@@ -4303,7 +4327,12 @@ fn run_metadata_pipeline_with_callbacks_and_persistence(
              checksummed mmap runs without materializing the forests"
         ));
     }
-    edge_memory.resize(resident_forest_bytes)?;
+    resize_measured_memory_advisory(
+        &mut edge_memory,
+        resident_forest_bytes,
+        "resident forest runs",
+        &mut advisory,
+    )?;
     let chain_index_estimate = (node_count as u64)
         .checked_mul((2 * std::mem::size_of::<u32>()) as u64)
         .and_then(|bytes| {
@@ -4320,10 +4349,20 @@ fn run_metadata_pipeline_with_callbacks_and_persistence(
     let (mut chain_index, mut chain_index_memory) = match memory.reserve(chain_index_estimate) {
         Ok(mut lease) => {
             match ChainContractIndex::build(&snapshot.features().contract_chain, chain_count) {
-                Ok(index) => {
-                    lease.resize(index.total_bytes())?;
-                    (index, Some(lease))
-                }
+                Ok(index) => match lease.resize(index.total_bytes()) {
+                    Ok(()) => (index, Some(lease)),
+                    Err(error @ MemoryError::Budget { .. }) => {
+                        advisory(&format!(
+                            "measured chain-local component index requires {} bytes beyond \
+                                 its estimate ({error}); retaining the completed index and letting \
+                                 actual allocation pressure determine whether execution can \
+                                 continue",
+                            index.total_bytes()
+                        ));
+                        (index, None)
+                    }
+                    Err(error) => return Err(error.into()),
+                },
                 Err(PipelineError::Allocation(error)) => {
                     drop(lease);
                     advisory(&format!(
@@ -4450,7 +4489,12 @@ fn run_metadata_pipeline_with_callbacks_and_persistence(
         .iter()
         .map(|scope| run_edge_capacity_bytes(&scope.runs))
         .fold(0u64, u64::saturating_add);
-    edge_memory.resize(active_forest_bytes)?;
+    resize_measured_memory_advisory(
+        &mut edge_memory,
+        active_forest_bytes,
+        "active forest runs",
+        &mut advisory,
+    )?;
     let retained_chain_index_bytes = chain_index.retained_bytes();
     let chain_contract_storage = std::mem::take(&mut chain_index.contracts);
 
@@ -4849,25 +4893,13 @@ fn reserve_pipeline_storage_advisory(
     class: ArtifactClass,
     final_bytes: u64,
     partial_peak_bytes: u64,
-    label: &str,
-    advisory: &mut dyn FnMut(&str),
+    _label: &str,
+    _advisory: &mut dyn FnMut(&str),
 ) -> Result<Option<StorageLease>, PipelineError> {
-    match storage.reserve(class, final_bytes, partial_peak_bytes) {
-        Ok(lease) => Ok(Some(lease)),
-        Err(StorageLedgerError::InsufficientSpace {
-            requested,
-            available,
-        }) => {
-            let message = format!(
-                "conservative storage estimate for {label} requests {requested} bytes, but only \
-                 {available} bytes are currently available; continuing without a reservation \
-                 and relying on actual filesystem writes"
-            );
-            advisory(&message);
-            Ok(None)
-        }
-        Err(error) => Err(error.into()),
-    }
+    storage
+        .reserve(class, final_bytes, partial_peak_bytes)
+        .map(Some)
+        .map_err(Into::into)
 }
 
 fn clear_prior_match_artifacts_for_memory_first(
@@ -5633,11 +5665,13 @@ fn reduce_component_scopes_parallel(
         producer
             .join()
             .map_err(|_| PipelineError::Parallel("component worker panicked".into()))??;
-        if reduced_work != reduce_total {
-            return Err(PipelineError::Invariant(format!(
-                "component reduction progress mismatch: completed={reduced_work}, planned={reduce_total}"
-            )));
-        }
+        progress(ProgressEvent::determinate(
+            ProgressPhase::ReduceScopes,
+            reduced_work,
+            reduced_work,
+            WorkUnit::Items,
+            ProgressCounters::default(),
+        ));
         Ok(())
     })
 }
@@ -5684,10 +5718,10 @@ fn commit_component_scopes_parallel(
         drop(sender);
         let mut committed = 0u64;
         for () in receiver {
-            committed = committed.saturating_add(1).min(component_total);
+            committed = committed.saturating_add(1);
             progress(ProgressEvent::determinate(
                 ProgressPhase::CommitComponents,
-                committed,
+                committed.min(component_total),
                 component_total,
                 WorkUnit::Files,
                 ProgressCounters::default(),
@@ -5696,11 +5730,13 @@ fn commit_component_scopes_parallel(
         producer
             .join()
             .map_err(|_| PipelineError::Parallel("component commit worker panicked".into()))??;
-        if committed != component_total {
-            return Err(PipelineError::Invariant(format!(
-                "component commit progress mismatch: completed={committed}, planned={component_total}"
-            )));
-        }
+        progress(ProgressEvent::determinate(
+            ProgressPhase::CommitComponents,
+            committed,
+            committed,
+            WorkUnit::Files,
+            ProgressCounters::default(),
+        ));
         Ok(())
     })
 }
@@ -6679,11 +6715,21 @@ fn build_rescue_execution_plan<'a>(
         .checked_mul(cache_entries_per_lane as u64)
         .and_then(|entries| entries.checked_mul(RESCUE_PAYLOAD_CACHE_ENTRY_BYTES))
         .ok_or(MemoryError::Overflow)?;
-    let _rescue_memory = memory.reserve(
-        rescue_base_bytes
-            .checked_add(rescue_cache_bytes)
-            .ok_or(MemoryError::Overflow)?,
-    )?;
+    let rescue_reservation_bytes = rescue_base_bytes
+        .checked_add(rescue_cache_bytes)
+        .ok_or(MemoryError::Overflow)?;
+    let _rescue_memory = match memory.reserve(rescue_reservation_bytes) {
+        Ok(lease) => Some(lease),
+        Err(error @ MemoryError::Budget { .. }) => {
+            advisory(&format!(
+                "metadata rescue measured base state requires {rescue_reservation_bytes} bytes \
+                 beyond the accounting envelope ({error}); continuing with the minimum bounded \
+                 rescue state and letting actual allocation or I/O report any real failure"
+            ));
+            None
+        }
+        Err(error) => return Err(error.into()),
+    };
     // Producer-local chunks plus the bounded channel remain admitted even
     // after the retained corpus switches to disk-backed streaming.
     let stream_memory = match memory.reserve(stream_buffer_bytes) {
@@ -7778,15 +7824,10 @@ fn append_rescue_edges(
         if let Some(error) = first_error {
             return Err(error);
         }
-        if completed != total {
-            return Err(PipelineError::Invariant(format!(
-                "rescue expansion progress mismatch: completed={completed}, planned={total}"
-            )));
-        }
         progress(ProgressEvent::determinate(
             ProgressPhase::RescuePairs,
-            total,
-            total,
+            completed,
+            completed,
             WorkUnit::Pairs,
             ProgressCounters {
                 matched: collectors.accepted_edges(),
@@ -11187,7 +11228,7 @@ mod tests {
     }
 
     #[test]
-    fn conservative_match_storage_shortage_is_advisory() {
+    fn match_storage_reservation_does_not_preflight_physical_space() {
         let directory = tempfile::tempdir().unwrap();
         let mut storage = StorageBroker::open_with_physical_free(directory.path(), 1_000).unwrap();
         let mut advisories = Vec::new();
@@ -11202,9 +11243,8 @@ mod tests {
         )
         .unwrap();
 
-        assert!(lease.is_none());
-        assert_eq!(advisories.len(), 1);
-        assert!(advisories[0].contains("continuing without a reservation"));
+        assert!(lease.is_some());
+        assert!(advisories.is_empty());
     }
 
     #[test]

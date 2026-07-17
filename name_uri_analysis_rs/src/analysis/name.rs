@@ -1446,11 +1446,12 @@ pub(crate) fn run_name_analysis(
     let actual_index_bytes = candidate_index.memory_bytes();
     if index_estimate.is_some_and(|estimate| actual_index_bytes > estimate.resident_bytes) {
         let estimate = index_estimate.expect("resident estimate checked above");
-        return Err(AnalysisError::InvalidData(format!(
-            "name candidate index used {}, exceeding conservative preflight estimate {}",
+        progress.warn(format!(
+            "name candidate index used {}, exceeding conservative preflight estimate {}; \
+             continuing with the measured resident index",
             format_byte_size(actual_index_bytes),
             format_byte_size(estimate.resident_bytes)
-        )));
+        ));
     }
     drop(pool);
     let right_range_ends = use_right_range_index.then(|| {

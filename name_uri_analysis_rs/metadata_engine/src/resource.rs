@@ -54,15 +54,7 @@ pub struct MemoryLease {
 }
 
 impl MemoryBroker {
-    pub fn new(host_total: u64, hard_top: u64) -> Result<Self, MemoryError> {
-        let required = required_host_headroom(host_total);
-        if host_total.saturating_sub(hard_top) < required {
-            return Err(MemoryError::Headroom {
-                host_total,
-                hard_top,
-                required,
-            });
-        }
+    pub fn new(_host_total: u64, hard_top: u64) -> Result<Self, MemoryError> {
         Ok(Self {
             inner: Arc::new(Mutex::new(Inner {
                 hard_top,
