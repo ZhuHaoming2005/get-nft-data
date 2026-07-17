@@ -169,6 +169,12 @@ impl NameStringArenaBuilder {
                         NameStringStorageBytes::Resident(resident.into_boxed_slice())
                     }
                     Err(error) => {
+                        if disk_fallback_disabled() {
+                            std::alloc::handle_alloc_error(
+                                std::alloc::Layout::array::<u8>(arena_bytes)
+                                    .unwrap_or_else(|_| std::alloc::Layout::new::<u8>()),
+                            );
+                        }
                         eprintln!(
                             "warning: resident name string arena allocation of {} failed ({error}); \
                              retrying with file-backed mmap under {}",

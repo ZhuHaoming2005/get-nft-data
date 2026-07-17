@@ -56,6 +56,10 @@ pub const DEFAULT_EXACT_PAIR_WORK: u64 = 20_000_000_000;
 // when hundreds of GiB were available to Match.
 const MAX_EVIDENCE_RESIDENT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
+fn disk_fallback_disabled() -> bool {
+    std::env::var_os("NAME_URI_ANALYSIS_NO_DISK_FALLBACK").is_some()
+}
+
 const CONNECTIVITY_RUN_REVISION: u32 = 6;
 const COMPONENT_ROOT_LAYOUT_REVISION: u32 = 6;
 const MAX_RESCUE_PAYLOAD_CACHE_ENTRIES: usize = 65_536;
@@ -3584,8 +3588,11 @@ fn run_metadata_pipeline_with_callbacks_and_persistence(
         config.exact_sample_lefts,
         config.exact_pair_work,
     )?;
-    let evidence_resident_target =
-        (config.memory_hard_top / 32).clamp(1, MAX_EVIDENCE_RESIDENT_BYTES);
+    let evidence_resident_target = if disk_fallback_disabled() {
+        config.exact_pair_work.saturating_mul(16).max(1)
+    } else {
+        (config.memory_hard_top / 32).clamp(1, MAX_EVIDENCE_RESIDENT_BYTES)
+    };
     let evidence_partition_floor = if persistence == MatchPersistence::Durable {
         64 * 1024
     } else {
@@ -7227,7 +7234,7 @@ fn build_rescue_execution_plan<'a>(
                 });
             }
 
-            if raw_match_count > MAX_RESCUE_GLOBAL_SORT_PAIRS {
+            if raw_match_count > MAX_RESCUE_GLOBAL_SORT_PAIRS && !disk_fallback_disabled() {
                 // At production scale, flatten + comparison sort is both a
                 // second full pair corpus and O(N log N).  Atom matches are
                 // unique by construction; shared duplicates are connectivity

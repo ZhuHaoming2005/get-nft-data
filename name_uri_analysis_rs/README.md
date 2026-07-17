@@ -28,6 +28,29 @@ MetadataMatch 的热索引、候选批次、评分缓存、压缩 scratch 和归
   --name-threshold 95
 ```
 
+需要完全关闭因内存预算或数据规模触发的临时磁盘回退时，增加：
+
+```bash
+./main \
+  --parquet ./data/ethereum.parquet \
+  --output-dir ./output \
+  --threads 128 \
+  --duckdb-memory-limit 320GiB \
+  --analysis-memory-limit 448GiB \
+  --no-disk-fallback
+```
+
+`--no-disk-fallback` 会贯穿 Controller 及各阶段子进程，禁止 DuckDB 临时目录、Name 外部
+candidate index/字符串与原子 mmap、MetadataEncode payload/注册/term/CSR/sketch spill，以及
+MetadataMatch 的预算型外部排序和磁盘型热状态回退；这些路径会强制选择驻留内存实现，不再因为
+保守估算、broker 准入或实时可用内存不足而主动降级。若实际内存需求超过机器能力，分配器或操作
+系统可直接终止进程，本程序不会捕获 OOM 后改走磁盘，也不保证生成可恢复的当前阶段 checkpoint。
+
+该参数只屏蔽**磁盘回退**，不屏蔽正常且必要的磁盘 I/O：Parquet 输入、阶段工作数据库、Durable
+Match 的恢复 checkpoint、最终 summary/manifest 及显式诊断产物仍会读写磁盘。它适合内存充足、
+希望用失败风险换取最低临时 I/O 的专用机器；常规运行不要启用，以保留超大数据集的有界回退能力。
+完整禁用回退的等价环境变量为 `NAME_URI_ANALYSIS_NO_DISK_FALLBACK=1`。
+
 未指定 `--work-directory` 时，默认使用
 `<output-dir 同级>/.<output-name>.name_uri_analysis_rs_work`，从而让 manifest、phase ready、
 catalog、ExactEvidence、connectivity run 和 component snapshot 在进程中断后仍可由

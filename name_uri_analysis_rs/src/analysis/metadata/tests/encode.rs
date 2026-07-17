@@ -575,25 +575,16 @@ fn encode_admission_freezes_row_totals_for_progress_before_streaming() {
         )
         .unwrap();
     assert!(
-        estimate.resident_peak_bytes
-            >= representative_json_bytes * 4
-                + representative_rows * 2_048
-                + token_rows * 24
+        estimate.payload_registration_peak_bytes >= estimate.token_relation_peak_bytes,
+        "payload registration must cover the complete in-memory token relation"
+    );
+    assert!(
+        estimate.payload_registration_peak_bytes
+            >= estimate.token_relation_peak_bytes
+                + representative_json_bytes
                 + token_json_bytes
                 + 64 * 1024 * 1024,
-        "resident admission must bound compact feature, atom and routing structures"
-    );
-    assert!(
-        estimate.resident_peak_bytes
-            >= representative_json_bytes * 16
-                + representative_rows * 2_048
-                + token_rows * 32
-                + 64 * 1024 * 1024,
-        "resident admission must include a global unique-payload/interner envelope"
-    );
-    assert!(
-        estimate.resident_peak_bytes >= estimate.token_relation_peak_bytes,
-        "resident admission must cover the complete in-memory token relation"
+        "payload registration must include candidate bodies and structural indexes"
     );
 }
 
@@ -755,7 +746,7 @@ fn payload_body_spill_matches_memory_mode_and_cleans_temporary_packs() {
     .unwrap();
 
     let mut spill_estimate = estimate;
-    spill_estimate.resident_peak_bytes = memory_broker.hard_top_bytes() + 1;
+    spill_estimate.payload_registration_peak_bytes = memory_broker.hard_top_bytes() + 1;
     let mut spill_storage = StorageBroker::open(&work).unwrap();
     let spill_broker = MemoryBroker::new(16 * GIB, 12 * GIB).unwrap();
     let mut advisories = Vec::new();
@@ -833,7 +824,7 @@ fn encode_spills_all_large_final_columns_under_tight_memory_and_cleans_temporary
     let conn = Connection::open(&options.database_path).unwrap();
     let mut estimate = estimate_encode_storage_bytes(&conn).unwrap();
     let hard_top = 128 * 1024 * 1024;
-    estimate.resident_peak_bytes = hard_top + 1;
+    estimate.payload_registration_peak_bytes = hard_top + 1;
     let memory_broker = MemoryBroker::new(GIB, hard_top).unwrap();
     let mut storage = StorageBroker::open(&work).unwrap();
     let mut advisories = Vec::new();

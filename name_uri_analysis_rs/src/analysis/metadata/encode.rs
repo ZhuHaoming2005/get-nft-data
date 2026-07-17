@@ -193,7 +193,7 @@ struct EncodeMetrics {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct EncodeAdmissionEstimate {
-    pub(super) resident_peak_bytes: u64,
+    pub(super) payload_registration_peak_bytes: u64,
     pub(super) partial_peak_bytes: u64,
     pub(super) token_relation_peak_bytes: u64,
     pub(super) payload_spill_upper_bound_bytes: u64,
@@ -413,7 +413,7 @@ pub(crate) fn run_metadata_encode(
         let memory_plan = encode_process_memory_plan(
             &options.duckdb_memory_limit,
             total_memory_budget_bytes(&options.memory_limit)?,
-            estimate.resident_peak_bytes,
+            estimate.payload_registration_peak_bytes,
             host_total_memory,
             host_available_memory,
         )?;
@@ -438,13 +438,15 @@ pub(crate) fn run_metadata_encode(
             MemoryBroker::new(host_total_memory, memory_hard_top).map_err(|err| {
                 AnalysisError::InvalidData(format!("metadata encode memory admission: {err}"))
             })?;
-        let initial_resident_reservation = estimate.resident_peak_bytes.min(memory_hard_top);
-        if estimate.resident_peak_bytes > memory_hard_top {
+        let initial_resident_reservation = estimate
+            .payload_registration_peak_bytes
+            .min(memory_hard_top);
+        if estimate.payload_registration_peak_bytes > memory_hard_top {
             progress.warn(format!(
-                "metadata encode conservative resident estimate {} exceeds the Rust envelope {}; \
-                 continuing with live-capacity admission and bounded batches",
+                "metadata encode payload-registration estimate {} exceeds the Rust envelope {}; \
+                 using bounded external registration and measured live-capacity admission",
                 format_byte_size(
-                    usize::try_from(estimate.resident_peak_bytes).unwrap_or(usize::MAX)
+                    usize::try_from(estimate.payload_registration_peak_bytes).unwrap_or(usize::MAX)
                 ),
                 format_byte_size(usize::try_from(memory_hard_top).unwrap_or(usize::MAX)),
             ));
@@ -3591,7 +3593,7 @@ pub(super) enum PayloadStorageMode {
 
 fn payload_storage_mode(estimate: &EncodeAdmissionEstimate, hard_top: u64) -> PayloadStorageMode {
     let index_upper = payload_resident_index_upper_bound(estimate).unwrap_or(u64::MAX);
-    if estimate.resident_peak_bytes.max(index_upper) <= hard_top {
+    if estimate.payload_registration_peak_bytes.max(index_upper) <= hard_top {
         return PayloadStorageMode::Memory;
     }
     let index_budget = hard_top.saturating_sub(ENCODE_RESIDENT_FIXED_BYTES + 256 * 1024 * 1024);
@@ -5223,7 +5225,7 @@ pub(super) fn stream_encode_inputs_with_advisory(
     let lease = memory_broker
         .reserve(
             estimate
-                .resident_peak_bytes
+                .payload_registration_peak_bytes
                 .min(memory_broker.hard_top_bytes()),
         )
         .map_err(|error| {
@@ -5271,7 +5273,9 @@ fn stream_encode_inputs_with_admission(
     estimate.token_rows = token_rows;
     estimate.representative_rows = representative_rows;
     estimate.token_relation_peak_bytes = required_relation_peak;
-    estimate.resident_peak_bytes = estimate.resident_peak_bytes.max(required_relation_peak);
+    estimate.payload_registration_peak_bytes = estimate
+        .payload_registration_peak_bytes
+        .max(required_relation_peak);
     let contract_count = u32::try_from(representative_rows).map_err(|_| {
         AnalysisError::InvalidData("metadata contract count exceeds u32 identity space".into())
     })?;
@@ -5287,7 +5291,7 @@ fn stream_encode_inputs_with_admission(
     let storage_mode = payload_storage_mode(&estimate, memory_broker.hard_top_bytes());
     let payload_spill_reservation = if storage_mode.is_spill() {
         advisory(format!(
-            "metadata encode conservative resident estimate {} exceeds the Rust envelope {}; \
+            "metadata encode payload-registration estimate {} exceeds the Rust envelope {}; \
              spilling unique JSON bodies to a temporary payload CAS plus exact \
              token-source/registration state to temporary storage; payload indexes and parse \
              batches stay bounded, and later term/final columns use resident or demand-paged \
@@ -5295,7 +5299,7 @@ fn stream_encode_inputs_with_admission(
             format_byte_size(
                 usize::try_from(
                     estimate
-                        .resident_peak_bytes
+                        .payload_registration_peak_bytes
                         .max(payload_resident_index_upper_bound(&estimate)?)
                 )
                 .unwrap_or(usize::MAX)
@@ -5357,11 +5361,11 @@ fn stream_encode_inputs_with_admission(
         .ok_or_else(|| {
             AnalysisError::InvalidData("token-source+payload-store admission overflow".into())
         })?;
-    if relation_with_payload_store > estimate.resident_peak_bytes {
+    if relation_with_payload_store > estimate.payload_registration_peak_bytes {
         advisory(format!(
-            "token-source relation plus payload index exceeded the conservative estimate \
+            "token-source relation plus payload index exceeded the registration estimate \
              ({} > {}); continuing under measured live-capacity admission",
-            relation_with_payload_store, estimate.resident_peak_bytes
+            relation_with_payload_store, estimate.payload_registration_peak_bytes
         ));
     }
 
@@ -8197,12 +8201,6 @@ pub(super) fn estimate_encode_storage_bytes(
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     let (token_rows, token_json_bytes) = token_source_relation_dimensions(conn)?;
-    let conservative_resident_floor = raw_bytes
-        .checked_mul(16)
-        .and_then(|bytes| bytes.checked_add(source_rows.checked_mul(2_048)?))
-        .and_then(|bytes| bytes.checked_add(token_rows.checked_mul(32)?))
-        .and_then(|bytes| bytes.checked_add(64 * 1024 * 1024))
-        .ok_or_else(|| AnalysisError::InvalidData("Encode storage estimate overflow".into()))?;
     let token_relation_peak_bytes =
         planned_token_relation_peak(token_rows, source_rows, token_json_bytes)?;
     let payload_spill_upper_bound_bytes = raw_bytes
@@ -8218,13 +8216,6 @@ pub(super) fn estimate_encode_storage_bytes(
             AnalysisError::InvalidData("Encode payload spill estimate overflow".into())
         })?;
     let partial_peak_bytes = ENCODE_RESIDENT_FIXED_BYTES;
-    let modeled_resident_peak = raw_bytes
-        .checked_add(token_json_bytes)
-        .and_then(|bytes| bytes.checked_mul(64))
-        .and_then(|bytes| bytes.checked_add(source_rows.checked_mul(2_048)?))
-        .and_then(|bytes| bytes.checked_add(token_rows.checked_mul(24)?))
-        .and_then(|bytes| bytes.checked_add(64 * 1024 * 1024))
-        .ok_or_else(|| AnalysisError::InvalidData("Encode memory estimate overflow".into()))?;
     let payload_index_upper = token_rows
         .checked_add(source_rows.saturating_mul(2))
         .map(|count| count.min(u64::from(u32::MAX)))
@@ -8233,16 +8224,21 @@ pub(super) fn estimate_encode_storage_bytes(
         .ok_or_else(|| {
             AnalysisError::InvalidData("Encode payload index estimate overflow".into())
         })?;
-    // The global payload/interner/CSR state grows with all unique small
-    // documents, not just the largest contract. Use the complete conservative
-    // durable envelope as the global resident admission floor; this avoids a
-    // second JSON preflight while covering high-cardinality payload/term maps.
-    let resident_peak_bytes = modeled_resident_peak
-        .max(conservative_resident_floor)
-        .max(token_relation_peak_bytes)
-        .max(payload_index_upper);
+    // Early payload registration holds the selected token relation, deduplicated
+    // JSON bodies and the digest/index structures concurrently. Later term,
+    // sketch and CSR stages have independent measured admission and external
+    // fallbacks, so their 64x worst-case expansion must not force payloads to
+    // disk before this substantially tighter stage can be attempted in memory.
+    let payload_registration_peak_bytes = token_relation_peak_bytes
+        .checked_add(raw_bytes)
+        .and_then(|bytes| bytes.checked_add(token_json_bytes))
+        .and_then(|bytes| bytes.checked_add(payload_index_upper))
+        .and_then(|bytes| bytes.checked_add(64 * 1024 * 1024))
+        .ok_or_else(|| {
+            AnalysisError::InvalidData("Encode payload registration estimate overflow".into())
+        })?;
     Ok(EncodeAdmissionEstimate {
-        resident_peak_bytes,
+        payload_registration_peak_bytes,
         partial_peak_bytes,
         token_relation_peak_bytes,
         payload_spill_upper_bound_bytes,
@@ -9027,7 +9023,7 @@ mod memory_dedup_tests {
     #[test]
     fn payload_index_mode_externalizes_before_the_structural_upper_bound_exceeds_budget() {
         let mut estimate = EncodeAdmissionEstimate {
-            resident_peak_bytes: 2 * GIB,
+            payload_registration_peak_bytes: 2 * GIB,
             partial_peak_bytes: 0,
             token_relation_peak_bytes: 0,
             payload_spill_upper_bound_bytes: 0,
@@ -9044,6 +9040,23 @@ mod memory_dedup_tests {
         assert_eq!(
             payload_storage_mode(&estimate, GIB),
             PayloadStorageMode::SpillExternalIndex
+        );
+    }
+
+    #[test]
+    fn later_stage_worst_case_does_not_force_payload_spill_when_registration_fits() {
+        let estimate = EncodeAdmissionEstimate {
+            payload_registration_peak_bytes: 96 * GIB,
+            partial_peak_bytes: 0,
+            token_relation_peak_bytes: 32 * GIB,
+            payload_spill_upper_bound_bytes: 64 * GIB,
+            representative_rows: 10_000_000,
+            token_rows: 100_000_000,
+        };
+
+        assert_eq!(
+            payload_storage_mode(&estimate, 400 * GIB),
+            PayloadStorageMode::Memory
         );
     }
 

@@ -88,6 +88,22 @@ fn expensive_diagnostics_are_opt_in() {
 }
 
 #[test]
+fn disk_fallback_can_be_explicitly_disabled() {
+    let defaults =
+        Args::try_parse_from(["name_uri_analysis_rs", "--parquet", "input.parquet"]).unwrap();
+    let memory_only = Args::try_parse_from([
+        "name_uri_analysis_rs",
+        "--parquet",
+        "input.parquet",
+        "--no-disk-fallback",
+    ])
+    .unwrap();
+
+    assert!(!defaults.no_disk_fallback);
+    assert!(memory_only.no_disk_fallback);
+}
+
+#[test]
 fn effective_threads_never_exceed_visible_cpus() {
     let visible = std::thread::available_parallelism()
         .map(|value| value.get())

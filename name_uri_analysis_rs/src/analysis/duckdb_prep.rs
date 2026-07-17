@@ -86,15 +86,17 @@ pub(crate) fn configure_duckdb(
         &format!("PRAGMA memory_limit='{}'", sql_string(&memory_limit)),
         [],
     )?;
-    if let Some(temp_directory) = &options.temp_directory {
-        fs::create_dir_all(temp_directory)?;
-        conn.execute(
-            &format!(
-                "PRAGMA temp_directory='{}'",
-                sql_string(&temp_directory.display().to_string().replace('\\', "/"))
-            ),
-            [],
-        )?;
+    if !disk_fallback_disabled() {
+        if let Some(temp_directory) = &options.temp_directory {
+            fs::create_dir_all(temp_directory)?;
+            conn.execute(
+                &format!(
+                    "PRAGMA temp_directory='{}'",
+                    sql_string(&temp_directory.display().to_string().replace('\\', "/"))
+                ),
+                [],
+            )?;
+        }
     }
     Ok(())
 }
@@ -103,6 +105,12 @@ pub(crate) fn configure_duckdb(
 /// available memory so DuckDB and the Rust analysis structures can coexist in
 /// one process; any other value is validated as a byte size and passed through.
 pub(crate) fn resolve_duckdb_memory_limit(value: &str) -> Result<String, AnalysisError> {
+    if disk_fallback_disabled() {
+        // Keep DuckDB's buffer/spill threshold far above any realizable host
+        // allocation. A real OOM is then handled by the allocator/OS rather
+        // than by DuckDB's temporary-file fallback.
+        return Ok("4194304GiB".to_string());
+    }
     let trimmed = value.trim();
     if trimmed.eq_ignore_ascii_case("auto") {
         let available = usize::try_from(effective_available_memory_bytes()).unwrap_or(usize::MAX);

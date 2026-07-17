@@ -185,6 +185,12 @@ struct Args {
 
     #[arg(
         long,
+        help = "Disable memory-pressure disk fallbacks; keep hot state resident and let the allocator or operating system handle OOM"
+    )]
+    no_disk_fallback: bool,
+
+    #[arg(
+        long,
         default_value = "448GiB",
         help = "Per-phase Rust ceiling; each phase is capped further by current available memory, DuckDB, and required host headroom"
     )]
@@ -248,6 +254,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if args.disable_numa_interleave {
         std::env::set_var("NAME_URI_ANALYSIS_DISABLE_NUMA_INTERLEAVE", "1");
+    }
+    if args.no_disk_fallback {
+        std::env::set_var("NAME_URI_ANALYSIS_NO_DISK_FALLBACK", "1");
+        eprintln!(
+            "warning: --no-disk-fallback keeps memory-pressure working sets resident; temporary \
+             spill/mmap fallbacks are disabled and an out-of-memory condition may terminate the \
+             process"
+        );
     }
     if let Some(phase) = args.internal_phase {
         let config = args

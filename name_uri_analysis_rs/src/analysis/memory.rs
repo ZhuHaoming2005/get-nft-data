@@ -1,6 +1,10 @@
 use super::*;
 use sysinfo::System;
 
+pub(crate) fn disk_fallback_disabled() -> bool {
+    std::env::var_os("NAME_URI_ANALYSIS_NO_DISK_FALLBACK").is_some()
+}
+
 #[derive(Debug)]
 pub(crate) struct MemoryPlan {
     pub(crate) analysis_bytes: usize,
@@ -25,6 +29,13 @@ pub(crate) fn encode_process_memory_plan(
     let envelope_bytes = process_memory_envelope_bytes(host_total, host_available);
     let configured_duckdb =
         parse_byte_size(&resolve_duckdb_memory_limit(duckdb_memory_limit)?)? as u64;
+    if disk_fallback_disabled() {
+        return Ok(EncodeProcessMemoryPlan {
+            envelope_bytes,
+            duckdb_bytes: configured_duckdb,
+            rust_hard_top_bytes: u64::MAX / 4,
+        });
+    }
     // Encode can spill DuckDB operators, while its Rust interner/CSR state is
     // substantially more expensive to reconstruct. Preserve a useful DuckDB
     // floor, then let large datasets borrow the rest of the current shared
@@ -52,6 +63,11 @@ pub(crate) fn name_analysis_memory_plan(
     analysis_memory_limit: Option<&str>,
     resident_analysis_bytes: usize,
 ) -> Result<MemoryPlan, AnalysisError> {
+    if disk_fallback_disabled() {
+        return Ok(MemoryPlan {
+            analysis_bytes: usize::MAX / 4,
+        });
+    }
     let total_budget = total_memory_budget_bytes(memory_limit)?;
     if let Some(value) = analysis_memory_limit
         .map(str::trim)
@@ -158,6 +174,9 @@ pub(crate) fn engine_memory_hard_top_bytes(
     host_total: u64,
     _host_available: u64,
 ) -> Result<u64, AnalysisError> {
+    if disk_fallback_disabled() {
+        return Ok(u64::MAX / 4);
+    }
     let configured_top = (user_budget as u64).min(engine_cap).max(1);
     let host_capacity = process_memory_envelope_bytes(host_total, host_total);
     Ok(if host_capacity == 0 {

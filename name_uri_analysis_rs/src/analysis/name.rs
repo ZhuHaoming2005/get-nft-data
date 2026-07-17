@@ -517,6 +517,12 @@ impl CanonicalNameAtoms {
                         CanonicalNameAtomBacking::Resident(words.into_boxed_slice())
                     }
                     Err(error) => {
+                        if disk_fallback_disabled() {
+                            std::alloc::handle_alloc_error(
+                                std::alloc::Layout::array::<u64>(word_count)
+                                    .unwrap_or_else(|_| std::alloc::Layout::new::<u64>()),
+                            );
+                        }
                         eprintln!(
                             "warning: resident canonical name atom SoA allocation of {} failed \
                              ({error}); retrying with file-backed mmap under {}",
@@ -1032,12 +1038,19 @@ pub(crate) fn run_name_analysis(
         (NameAtomStorageMode::Resident, NameStringStorageMode::Mapped),
         (NameAtomStorageMode::Mapped, NameStringStorageMode::Mapped),
     ];
-    let (atom_storage_mode, string_storage_mode) = load_modes
-        .into_iter()
-        .find(|&(atom_mode, string_mode)| {
-            load_peak_bytes(atom_mode, string_mode) <= initial_analysis_budget
-        })
-        .unwrap_or((NameAtomStorageMode::Mapped, NameStringStorageMode::Mapped));
+    let (atom_storage_mode, string_storage_mode) = if disk_fallback_disabled() {
+        (
+            NameAtomStorageMode::Resident,
+            NameStringStorageMode::Resident,
+        )
+    } else {
+        load_modes
+            .into_iter()
+            .find(|&(atom_mode, string_mode)| {
+                load_peak_bytes(atom_mode, string_mode) <= initial_analysis_budget
+            })
+            .unwrap_or((NameAtomStorageMode::Mapped, NameStringStorageMode::Mapped))
+    };
     let resident_load_preflight_bytes = load_peak_bytes(
         NameAtomStorageMode::Resident,
         NameStringStorageMode::Resident,
@@ -1233,8 +1246,9 @@ pub(crate) fn run_name_analysis(
     let resident_scoring_floor = base_atom_bytes
         .saturating_add(index_preflight.resident_bytes)
         .saturating_add(minimum_union_state_bytes);
-    let use_external_index = resident_build_peak > initial_memory_plan.analysis_bytes
-        || resident_scoring_floor > initial_memory_plan.analysis_bytes;
+    let use_external_index = !disk_fallback_disabled()
+        && (resident_build_peak > initial_memory_plan.analysis_bytes
+            || resident_scoring_floor > initial_memory_plan.analysis_bytes);
     progress.start_task(
         format!(
             "building candidate index for {} canonical names",
@@ -1828,6 +1842,12 @@ impl NameSortOrder {
                 match order.try_reserve_exact(len) {
                     Ok(()) => Self::Resident(order),
                     Err(error) => {
+                        if disk_fallback_disabled() {
+                            std::alloc::handle_alloc_error(
+                                std::alloc::Layout::array::<u32>(len)
+                                    .unwrap_or_else(|_| std::alloc::Layout::new::<u32>()),
+                            );
+                        }
                         eprintln!(
                             "warning: resident name sort permutation allocation of {} failed \
                              ({error}); retrying with file-backed mmap under {}",
@@ -1929,6 +1949,12 @@ impl NameAtomRecords {
                         NameAtomColumnBacking::Resident(words.into_boxed_slice())
                     }
                     Err(error) => {
+                        if disk_fallback_disabled() {
+                            std::alloc::handle_alloc_error(
+                                std::alloc::Layout::array::<u64>(word_count)
+                                    .unwrap_or_else(|_| std::alloc::Layout::new::<u64>()),
+                            );
+                        }
                         eprintln!(
                             "warning: resident name atom SoA allocation of {} failed ({error}); \
                              retrying with file-backed mmap under {}",

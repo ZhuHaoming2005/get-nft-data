@@ -93,7 +93,7 @@ pub fn run_analysis_phase(
     let mut phase_options = options.clone();
     phase_options.threads = phase_worker_threads(options.threads, phase);
     let mut memory_advisories = Vec::new();
-    if matches!(phase, AnalysisPhase::Prepare) {
+    if matches!(phase, AnalysisPhase::Prepare) && !disk_fallback_disabled() {
         let configured = resolve_duckdb_memory_limit(&phase_options.duckdb_memory_limit)?;
         let configured_bytes = parse_byte_size(&configured)? as u64;
         let (host_total, host_available) = effective_memory_snapshot_bytes();
@@ -109,7 +109,7 @@ pub fn run_analysis_phase(
             phase_options.duckdb_memory_limit = format!("{duckdb_cap}B");
         }
     }
-    if matches!(phase, AnalysisPhase::Name) {
+    if matches!(phase, AnalysisPhase::Name) && !disk_fallback_disabled() {
         let requested_rust_bytes = name_analysis_memory_plan(
             &phase_options.memory_limit,
             phase_options.analysis_memory_limit.as_deref(),
@@ -380,7 +380,11 @@ pub(crate) fn run_metadata_pipeline_result(
     // bound. A larger production ceiling avoids the old 4 GiB artificial
     // failure mode while keeping at least fifteen sixteenths of the admitted
     // Match memory available for snapshots, scorers and reduction scratch.
-    let edge_bytes = (memory_hard_top / 16).clamp(64 * 1024, 32 * GIB);
+    let edge_bytes = if disk_fallback_disabled() {
+        u64::MAX / 4
+    } else {
+        (memory_hard_top / 16).clamp(64 * 1024, 32 * GIB)
+    };
     let config = metadata_engine::pipeline::MetadataPipelineConfig {
         storage_work_directory: work_directory.to_path_buf(),
         memory_hard_top,
@@ -446,6 +450,9 @@ fn phase_duckdb_memory_limit(
     cap: &str,
 ) -> Result<String, AnalysisError> {
     let configured = resolve_duckdb_memory_limit(&options.duckdb_memory_limit)?;
+    if disk_fallback_disabled() {
+        return Ok(configured);
+    }
     let configured_bytes = parse_byte_size(&configured)?;
     let cap_bytes = parse_byte_size(cap)?;
     let effective = if configured_bytes <= cap_bytes {
