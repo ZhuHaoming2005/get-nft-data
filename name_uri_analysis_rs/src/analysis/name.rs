@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), allow(dead_code))]
+
 use super::*;
 use duckdb::arrow::array::{Array, Int64Array, StringArray, StringViewArray};
 use duckdb::arrow::datatypes::{DataType, Field, Schema};
@@ -48,6 +50,7 @@ pub(crate) enum NameChainMatrixStrategy {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 pub(crate) struct NameUnionStatePlan {
     pub(crate) cross_strategy: Option<NameCrossStateStrategy>,
     pub(crate) chain_matrix_strategy: Option<NameChainMatrixStrategy>,
@@ -765,7 +768,7 @@ pub(crate) struct NameAlgorithmMetrics {
     scored_pairs: u64,
     matched_pairs: u64,
     logical_member_pairs: u64,
-    spanning_union_operations: u64,
+    direct_scope_pair_decisions: u64,
     atom_column_bytes: u64,
     atom_column_resident_bytes: u64,
     atom_sort_permutation_bytes: u64,
@@ -1196,7 +1199,7 @@ pub(crate) fn run_name_analysis(
         canonical.atoms.len()
     ));
     let canonical_members_bytes = canonical.members.memory_bytes();
-    let mut atoms_by_chain = atoms_by_chain(&atoms, chains.len());
+    let atoms_by_chain = atoms_by_chain(&atoms, chains.len());
     let atoms_by_chain_bytes = atoms_by_chain
         .capacity()
         .saturating_mul(std::mem::size_of::<Vec<u32>>())
@@ -1215,10 +1218,6 @@ pub(crate) fn run_name_analysis(
     #[cfg(not(test))]
     let atom_set_bytes = name_atom_sets_memory_bytes(&atoms, &canonical);
     #[cfg(test)]
-    let canonical_atom_resident_bytes = name_atoms_memory_bytes(&canonical.atoms);
-    #[cfg(not(test))]
-    let canonical_atom_resident_bytes = canonical.atoms.resident_bytes();
-    #[cfg(test)]
     let canonical_string_resident_bytes = 0usize;
     #[cfg(not(test))]
     let canonical_string_resident_bytes =
@@ -1227,25 +1226,16 @@ pub(crate) fn run_name_analysis(
         .saturating_add(canonical_members_bytes)
         .saturating_add(atoms_by_chain_bytes)
         .saturating_add(canonical_string_resident_bytes);
-    let summary_base_resident_bytes = base_atom_bytes
-        .saturating_sub(canonical_atom_resident_bytes)
-        .saturating_sub(canonical_members_bytes)
-        .saturating_sub(canonical_string_resident_bytes);
     let index_preflight = estimate_name_candidate_index_bytes(&canonical);
     let initial_memory_plan =
         name_analysis_memory_plan(spec.memory_limit, spec.analysis_memory_limit, 0)?;
-    let minimum_union_state_bytes =
-        dense_union_find_bytes(atoms.len()).saturating_add(if chains.len() > 1 {
-            chain_matrix_spill_reserve_bytes(chains.len())
-        } else {
-            0
-        });
+    let pairwise_state_bytes = pairwise_name_state_bytes(atoms.len(), chains.len());
     let resident_build_peak = base_atom_bytes
         .saturating_add(index_preflight.peak_build_bytes)
         .saturating_add(worker_stack_bytes);
     let resident_scoring_floor = base_atom_bytes
         .saturating_add(index_preflight.resident_bytes)
-        .saturating_add(minimum_union_state_bytes);
+        .saturating_add(pairwise_state_bytes);
     let use_external_index = !disk_fallback_disabled()
         && (resident_build_peak > initial_memory_plan.analysis_bytes
             || resident_scoring_floor > initial_memory_plan.analysis_bytes);
@@ -1295,16 +1285,15 @@ pub(crate) fn run_name_analysis(
     };
     let fixed_scoring_resident_bytes =
         base_atom_bytes.saturating_add(candidate_index_resident_bytes);
-    let (state_plan, scratch_plan) = select_name_union_and_scratch_plan_for_profile(
-        atoms.len(),
-        &atoms_by_chain,
+    let state_bytes = pairwise_name_state_bytes(atoms.len(), chains.len());
+    let scratch_plan = name_scratch_plan_for_profile(
+        scratch_profile,
         spec.threads,
         initial_memory_plan
             .analysis_bytes
-            .saturating_sub(fixed_scoring_resident_bytes),
-        scratch_profile,
+            .saturating_sub(fixed_scoring_resident_bytes)
+            .saturating_sub(state_bytes),
     );
-    let state_bytes = state_plan.total_bytes;
     let scoring_resident_bytes = base_atom_bytes
         .saturating_add(candidate_index_resident_bytes)
         .saturating_add(state_bytes);
@@ -1327,7 +1316,7 @@ pub(crate) fn run_name_analysis(
     if use_external_index {
         progress.warn(format!(
             "name resident candidate index would peak near {} while building and retain about {}; \
-             with {} of base atoms and mandatory union state this exceeds the {} analysis budget. \
+             with {} of base atoms and mandatory pairwise match state this exceeds the {} analysis budget. \
              Falling back to exact disk-backed sorted postings under {}; Match uses mmap-backed \
              postings and per-left k-way merge/dedup instead of a global O(A²) scan",
             format_byte_size(resident_build_peak),
@@ -1336,36 +1325,6 @@ pub(crate) fn run_name_analysis(
             format_byte_size(memory_plan.analysis_bytes),
             spec.scratch_directory
                 .join("name-candidate-index")
-                .display(),
-        ));
-    }
-    if state_plan.cross_strategy == Some(NameCrossStateStrategy::Dense) {
-        progress.warn(format!(
-            "name global cross-chain sparse DSU worst case {} does not fit with the minimum \
-             chain-matrix representation inside the {} analysis budget; using a predictable \
-             dense DSU of about {} instead",
-            format_byte_size(sparse_union_find_bytes(atoms.len())),
-            format_byte_size(memory_plan.analysis_bytes),
-            format_byte_size(state_plan.cross_bytes),
-        ));
-    }
-    if state_plan.cross_strategy == Some(NameCrossStateStrategy::Deferred) {
-        progress.warn(
-            "name global cross-chain DSU cannot coexist with intra-chain state inside the \
-             analysis budget; deferring exact global cross reconstruction to the pair spill \
-             files after intra-chain summary releases its dense DSU",
-        );
-    }
-    if state_plan.chain_matrix_strategy == Some(NameChainMatrixStrategy::Spill) {
-        progress.warn(format!(
-            "name chain-matrix all-resident state would need about {}, above the remaining {} \
-             analysis budget; spilling matched edges by chain pair with at most {} buffered \
-             memory under {} and rebuilding one pair at a time",
-            format_byte_size(state_plan.resident_chain_matrix_bytes),
-            format_byte_size(memory_plan.analysis_bytes),
-            format_byte_size(state_plan.spill_chain_matrix_bytes),
-            spec.scratch_directory
-                .join("name-chain-matrix-spill")
                 .display(),
         ));
     }
@@ -1413,18 +1372,13 @@ pub(crate) fn run_name_analysis(
     }
     progress.step_stage(format!(
         "Rust analysis memory budget {}; name scoring admits {} worker(s), reserving {} scratch \
-         and queues plus {} dedicated stacks; union state reserves {} intra + {} cross/matrix; \
+         and queues plus {} dedicated stacks; pairwise match bitmaps reserve {}; \
          monotone right ranges reserve {}",
         format_byte_size(memory_plan.analysis_bytes),
         scratch_plan.admitted_workers,
         format_byte_size(scratch_plan.scratch_and_queue_bytes),
         format_byte_size(scratch_plan.worker_stack_bytes),
-        format_byte_size(state_plan.intra_bytes),
-        format_byte_size(
-            state_plan
-                .total_bytes
-                .saturating_sub(state_plan.intra_bytes)
-        ),
+        format_byte_size(state_bytes),
         format_byte_size(admitted_right_range_index_bytes),
     ));
     let candidate_index = if let Some(candidate_plan) = candidate_plan {
@@ -1481,34 +1435,9 @@ pub(crate) fn run_name_analysis(
         Some(canonical.atoms.len().saturating_sub(1) as u64),
         "names",
     );
-    let mut state = ThresholdUnionState {
-        threshold,
-        intra: UnionFind::new(atoms.len()),
-        cross: match state_plan.cross_strategy {
-            Some(NameCrossStateStrategy::Sparse) => {
-                Some(CrossUnionState::Sparse(SparseUnionFind::default()))
-            }
-            Some(NameCrossStateStrategy::Dense) => {
-                Some(CrossUnionState::Dense(UnionFind::new(atoms.len())))
-            }
-            Some(NameCrossStateStrategy::Deferred) => Some(CrossUnionState::Deferred),
-            None => None,
-        },
-        chain_matrix: match state_plan.chain_matrix_strategy {
-            Some(NameChainMatrixStrategy::Resident) => Some(ChainMatrixState::Resident(
-                new_chain_matrix_reuse_states(chain_pair_count(chains.len())),
-            )),
-            Some(NameChainMatrixStrategy::Spill) => {
-                Some(ChainMatrixState::Spill(ChainMatrixSpill::new(
-                    spec.scratch_directory.join("name-chain-matrix-spill"),
-                    chain_pair_atom_capacities(&atoms_by_chain),
-                )?))
-            }
-            None => None,
-        },
-    };
+    let mut state = PairwiseNameState::new(atoms.len(), chains.len(), threshold);
     let mut score = || {
-        union_canonical_name_pairs(
+        score_canonical_name_pairs_pairwise(
             &atoms,
             &canonical,
             &candidate_index,
@@ -1535,7 +1464,7 @@ pub(crate) fn run_name_analysis(
     };
     progress.finish_task(format!(
         "name scoring complete; canonical candidates {}; scored {}; matched {}; represented {} \
-         original-member pairs with {} scope-specific spanning unions",
+         original-member pairs with {} direct scope-specific pair decisions",
         scoring.candidate_pairs,
         scoring.scored_pairs,
         scoring.matched_pairs,
@@ -1544,80 +1473,26 @@ pub(crate) fn run_name_analysis(
     ));
     progress.step_stage("scored canonical names");
     drop(right_range_ends);
-    if let Some(ChainMatrixState::Spill(spill)) = &mut state.chain_matrix {
-        spill.finish_writes()?;
-    }
     drop(candidate_index);
     drop(canonical);
-    let summary_plan = name_summary_plan_for_state(
-        memory_plan.analysis_bytes,
-        summary_base_resident_bytes,
-        &atoms,
-        &atoms_by_chain,
-        &state,
-        chains.len(),
-    );
-    if summary_plan.intra_strategy == NameSummaryStrategy::LowMemory {
-        progress.warn(format!(
-            "name intra-chain summary fast path would peak near {} (resident {} + scratch {}, \
-             including {} allocation headroom), above the {} analysis budget; using in-place \
-             root ordering with about {} heap scratch instead",
-            format_byte_size(summary_plan.intra_fast_peak_bytes),
-            format_byte_size(summary_plan.intra_fast_resident_bytes),
-            format_byte_size(summary_plan.intra_fast_scratch_bytes),
-            format_byte_size(summary_plan.intra_allocation_headroom_bytes),
-            format_byte_size(memory_plan.analysis_bytes),
-            format_byte_size(summary_plan.low_memory_heap_scratch_bytes),
-        ));
-    }
-    if summary_plan.cross_strategy == NameSummaryStrategy::LowMemory && state.cross.is_some() {
-        progress.warn(format!(
-            "name cross-chain summary fast path would peak near {} (resident {} + scratch {}, \
-             including {} allocation headroom), above the {} analysis budget; using destructive \
-             sparse-root ordering with about {} heap scratch instead",
-            format_byte_size(summary_plan.cross_fast_peak_bytes),
-            format_byte_size(summary_plan.cross_fast_resident_bytes),
-            format_byte_size(summary_plan.cross_fast_scratch_bytes),
-            format_byte_size(summary_plan.cross_allocation_headroom_bytes),
-            format_byte_size(memory_plan.analysis_bytes),
-            format_byte_size(summary_plan.low_memory_heap_scratch_bytes),
-        ));
-    }
     let summary_units = chains.len() as u64 + chain_pair_count(chains.len()) as u64 * 2;
     progress.start_task(
-        "summarizing name components",
+        "summarizing direct name pairs",
         Some(summary_units),
         "summaries",
     );
-    push_name_summary_rows(
-        &mut rows,
-        &atoms,
-        &mut atoms_by_chain,
-        chains,
-        totals,
-        &mut state,
-        summary_plan,
-    )?;
+    push_pairwise_name_summary_rows(&mut rows, &atoms, &atoms_by_chain, chains, totals, &state);
     progress.advance_task(chains.len() as u64, ProgressCounters::default());
-    state.intra = UnionFind::new(0);
-    state.cross = None;
     if chains.len() > 1 {
-        push_reused_chain_matrix_rows(
-            &mut rows,
-            &atoms,
-            &mut atoms_by_chain,
-            chains,
-            totals,
-            &mut state,
-        )?;
+        push_pairwise_chain_matrix_rows(&mut rows, &atoms, &atoms_by_chain, chains, totals, &state);
         progress.advance_task(
             chain_pair_count(chains.len()) as u64 * 2,
             ProgressCounters::default(),
         );
     }
     drop(atoms_by_chain);
-    progress.finish_task("name component summaries ready");
-    progress.step_stage("summarized name components");
+    progress.finish_task("direct name-pair summaries ready");
+    progress.step_stage("summarized direct name pairs");
     progress.finish_stage("name analysis complete");
     Ok(NameAnalysisResult {
         rows,
@@ -1628,7 +1503,7 @@ pub(crate) fn run_name_analysis(
             scored_pairs: scoring.scored_pairs,
             matched_pairs: scoring.matched_pairs,
             logical_member_pairs: scoring.logical_member_pairs,
-            spanning_union_operations: scoring.spanning_union_operations,
+            direct_scope_pair_decisions: scoring.spanning_union_operations,
             atom_column_bytes: load_estimate.atom_storage_bytes as u64,
             atom_column_resident_bytes: atoms.atoms.resident_bytes() as u64,
             atom_sort_permutation_bytes: load_estimate.sort_scratch_bytes as u64,
@@ -2828,6 +2703,26 @@ pub(crate) fn chain_pair_count(chain_count: usize) -> usize {
     chain_count.saturating_mul(chain_count.saturating_sub(1)) / 2
 }
 
+pub(crate) fn pairwise_name_state_bytes(atom_count: usize, chain_count: usize) -> usize {
+    let bitmap_count = 1usize
+        .saturating_add(usize::from(chain_count > 1))
+        .saturating_add(chain_pair_count(chain_count));
+    let bitmap_bytes = atom_count.saturating_add(7) / 8;
+    bitmap_count
+        .saturating_mul(bitmap_bytes)
+        .saturating_add(
+            bitmap_count
+                .saturating_add(3)
+                .saturating_mul(std::mem::size_of::<Vec<bool>>()),
+        )
+        .saturating_add(
+            chain_count
+                .saturating_mul(2)
+                .saturating_add(chain_pair_count(chain_count))
+                .saturating_mul(std::mem::size_of::<i64>()),
+        )
+}
+
 pub(crate) fn chain_pair_index(left: usize, right: usize, chain_count: usize) -> usize {
     debug_assert!(left < right);
     left * (2 * chain_count - left - 1) / 2 + (right - left - 1)
@@ -2842,6 +2737,135 @@ pub(crate) fn chain_pair_from_index(mut index: usize, chain_count: usize) -> (us
         index -= row_width;
     }
     unreachable!("chain pair index out of range")
+}
+
+fn summarize_pairwise_atoms<A: NameAtomStore + ?Sized>(
+    atoms: &A,
+    atom_indices: &[u32],
+    matched: &[bool],
+    pair_count: i64,
+) -> GroupSummary {
+    let mut summary = GroupSummary {
+        group_count: pair_count,
+        group_size_ge_2_count: pair_count,
+        ..GroupSummary::default()
+    };
+    for &atom in atom_indices {
+        let atom = atom as usize;
+        if matched[atom] {
+            summary.duplicate_contract_count = summary
+                .duplicate_contract_count
+                .saturating_add(atoms.contract_count(atom));
+            summary.duplicate_nft_count = summary
+                .duplicate_nft_count
+                .saturating_add(atoms.nft_count(atom));
+        }
+    }
+    summary
+}
+
+pub(crate) fn push_pairwise_name_summary_rows<A: NameAtomStore + ?Sized>(
+    rows: &mut Vec<SummaryRow>,
+    atoms: &A,
+    atoms_by_chain: &[Vec<u32>],
+    chains: &[String],
+    totals: &HashMap<String, NameTotals>,
+    state: &PairwiseNameState,
+) {
+    for (chain_index, primary) in chains.iter().enumerate() {
+        let total = totals.get(primary).copied().unwrap_or(NameTotals {
+            contracts: 0,
+            nfts: 0,
+        });
+        rows.push(summary_row(
+            SummarySpec {
+                field_name: "name",
+                scope: "intra_chain",
+                primary_chain: primary,
+                secondary_chain: "",
+                threshold: Some(state.threshold),
+                match_mode: "jaro_winkler_pairwise",
+                metric: "duplicate_pair",
+                total_contracts: total.contracts,
+                total_nfts: total.nfts,
+            },
+            summarize_pairwise_atoms(
+                atoms,
+                &atoms_by_chain[chain_index],
+                &state.intra_matched_atoms,
+                state.intra_pair_counts[chain_index],
+            ),
+        ));
+
+        if let (Some(matched), Some(pair_counts)) =
+            (&state.cross_matched_atoms, &state.cross_pair_counts)
+        {
+            rows.push(summary_row(
+                SummarySpec {
+                    field_name: "name",
+                    scope: "cross_chain_summary",
+                    primary_chain: primary,
+                    secondary_chain: "",
+                    threshold: Some(state.threshold),
+                    match_mode: "jaro_winkler_pairwise",
+                    metric: "duplicate_pair",
+                    total_contracts: total.contracts,
+                    total_nfts: total.nfts,
+                },
+                summarize_pairwise_atoms(
+                    atoms,
+                    &atoms_by_chain[chain_index],
+                    matched,
+                    pair_counts[chain_index],
+                ),
+            ));
+        }
+    }
+}
+
+pub(crate) fn push_pairwise_chain_matrix_rows<A: NameAtomStore + ?Sized>(
+    rows: &mut Vec<SummaryRow>,
+    atoms: &A,
+    atoms_by_chain: &[Vec<u32>],
+    chains: &[String],
+    totals: &HashMap<String, NameTotals>,
+    state: &PairwiseNameState,
+) {
+    let (Some(matched_by_pair), Some(pair_counts)) = (
+        &state.chain_matrix_matched_atoms,
+        &state.chain_matrix_pair_counts,
+    ) else {
+        return;
+    };
+    for pair_index in 0..matched_by_pair.len() {
+        let (left, right) = chain_pair_from_index(pair_index, chains.len());
+        for (primary, secondary) in [(left, right), (right, left)] {
+            let primary_chain = &chains[primary];
+            let total = totals.get(primary_chain).copied().unwrap_or(NameTotals {
+                contracts: 0,
+                nfts: 0,
+            });
+            rows.push(summary_row(
+                SummarySpec {
+                    field_name: "name",
+                    scope: "chain_matrix",
+                    primary_chain,
+                    secondary_chain: &chains[secondary],
+                    threshold: Some(state.threshold),
+                    match_mode: "jaro_winkler_pairwise",
+                    metric: "duplicate_pair",
+                    total_contracts: total.contracts,
+                    total_nfts: total.nfts,
+                },
+                summarize_pairwise_atoms(
+                    atoms,
+                    &atoms_by_chain[primary],
+                    &matched_by_pair[pair_index],
+                    pair_counts[pair_index],
+                ),
+            ));
+        }
+    }
 }
 
 pub(crate) fn dense_union_find_bytes(atom_count: usize) -> usize {

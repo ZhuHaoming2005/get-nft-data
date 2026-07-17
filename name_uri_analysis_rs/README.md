@@ -97,7 +97,7 @@ Controller 固定执行五个阶段：
    source dictionary、membership 和 payload arena，写不可变 feature、atom、token membership
    与 blocking artifact；不创建 Encode 临时关系表或持久 payload CAS。物理空间在冻结 SoA/CSR
    基数后分别为 feature 和 blocking 准入，不再用原始 JSON 字节乘数预留虚假的数百 GiB；
-3. `Name`：加载 canonical name 节点并执行并行 Jaro-Winkler；
+3. `Name`：加载 canonical name 节点并执行并行 Jaro-Winkler 两两判定；
 4. `MetadataMatch`：只读 metadata snapshot，在内存中完成 catalog 候选执行、证据型
    ExactIsland、并行评分、scope forest 收集与流式归约；CLI 使用
    `MatchPersistence::Durable`，仅把可校验的 catalog、Evidence、connectivity forest、
@@ -221,7 +221,10 @@ subphase、`completed/total`、工作单位和诊断计数，CLI 只负责渲染
 ## 语义
 
 - EVM 合约地址转小写；Solana collection 地址保留 Base58 大小写。
-- name 默认使用 95 的 Jaro-Winkler 阈值。
+- name 默认使用 95 的 Jaro-Winkler 阈值。每个达到阈值的合约名称对独立计为
+  `duplicate_pair`，不会使用 Union-Find，也不会通过 A-B、B-C 命中推导 A-C。`group_count`
+  是命中的合约对数，`group_size_ge_2_count` 与其相同，`group_size_gt_2_count` 固定为 0；
+  重复合约和 NFT 数按至少参与一个命中对的名称原子去重统计。
 - URI `v1` 为 token URI 命中，`v2` 为 token 未命中但 image 命中，`v3` 为任一命中。
 - metadata 阈值为 0.6；BaseEquivalent 冻结候选关系后执行精确 template/content 校验，并按稳定
   SourceId 保留 token-specific metadata source。Calibration ExactIsland 冻结确定性 RescuePlan，

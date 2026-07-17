@@ -657,6 +657,51 @@ fn repeated_nfts_in_one_contract_count_as_one_name_contract() {
 }
 
 #[test]
+fn name_pairwise_matching_does_not_apply_transitive_closure() {
+    let temp = tempfile::tempdir().unwrap();
+    let parquet = temp.path().join("sample.parquet");
+    write_parquet(
+        &parquet,
+        r#"
+            VALUES
+            ('ethereum', '0xaaa', '1', 'u1', 'i1', 'abcdefghij', 'abcdefghij'),
+            ('ethereum', '0xbbb', '1', 'u2', 'i2', 'abcdefghiX', 'abcdefghix'),
+            ('ethereum', '0xccc', '1', 'u3', 'i3', 'abcdefghXX', 'abcdefghxx')
+        "#,
+    );
+
+    let report = run_analysis(AnalysisOptions {
+        database_path: temp.path().join("analysis.duckdb"),
+        parquet_inputs: vec![parquet],
+        output_dir: temp.path().join("out"),
+        name_threshold: 95.0,
+        threads: 2,
+        memory_limit: "256MB".into(),
+        analysis_memory_limit: Some("64MB".into()),
+        duckdb_memory_limit: "256MB".into(),
+        temp_directory: None,
+        progress: false,
+    })
+    .unwrap();
+
+    let row = report
+        .summary_rows
+        .iter()
+        .find(|row| {
+            row.field_name == "name"
+                && row.scope == "intra_chain"
+                && row.primary_chain == "ethereum"
+        })
+        .unwrap();
+    assert_eq!(row.match_mode, "jaro_winkler_pairwise");
+    assert_eq!(row.metric, "duplicate_pair");
+    assert_eq!(row.group_count, 2);
+    assert_eq!(row.duplicate_contract_count, 3);
+    assert_eq!(row.group_size_ge_2_count, 2);
+    assert_eq!(row.group_size_gt_2_count, 0);
+}
+
+#[test]
 fn contract_name_aggregation_keeps_empty_name_nfts_in_totals() {
     let temp = tempfile::tempdir().unwrap();
     let parquet = temp.path().join("sample.parquet");
@@ -1209,7 +1254,7 @@ fn summary_rows_use_chain_totals_as_common_denominators() {
 
     for (field_name, metric) in [
         ("metadata", "duplicate_group"),
-        ("name", "duplicate_group"),
+        ("name", "duplicate_pair"),
         ("uri", "v1"),
     ] {
         let row = report
@@ -1357,7 +1402,7 @@ fn three_scope_reporting_keeps_pools_isolated_and_uses_primary_chain_totals() {
     .unwrap();
 
     for (field, metric, cross_duplicate_nfts, intra_duplicate_nfts) in [
-        ("name", "duplicate_group", 2, 4),
+        ("name", "duplicate_pair", 2, 4),
         ("uri", "v1", 1, 2),
         ("uri", "v2", 1, 2),
         ("uri", "v3", 2, 4),

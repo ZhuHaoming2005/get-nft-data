@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), allow(dead_code))]
+
 use super::*;
 use std::io::{BufReader, Read, Write};
 

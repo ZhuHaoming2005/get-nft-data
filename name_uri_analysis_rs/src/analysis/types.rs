@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), allow(dead_code))]
+
 use super::*;
 
 #[cfg(test)]
@@ -567,6 +569,75 @@ pub(crate) struct ThresholdUnionState {
     pub(crate) intra: UnionFind,
     pub(crate) cross: Option<CrossUnionState>,
     pub(crate) chain_matrix: Option<ChainMatrixState>,
+}
+
+pub(crate) struct PairwiseNameState {
+    pub(crate) threshold: f64,
+    pub(crate) intra_matched_atoms: Vec<bool>,
+    pub(crate) cross_matched_atoms: Option<Vec<bool>>,
+    pub(crate) chain_matrix_matched_atoms: Option<Vec<Vec<bool>>>,
+    pub(crate) intra_pair_counts: Vec<i64>,
+    pub(crate) cross_pair_counts: Option<Vec<i64>>,
+    pub(crate) chain_matrix_pair_counts: Option<Vec<i64>>,
+}
+
+impl PairwiseNameState {
+    pub(crate) fn new(atom_count: usize, chain_count: usize, threshold: f64) -> Self {
+        let pair_count = chain_count.saturating_mul(chain_count.saturating_sub(1)) / 2;
+        let has_cross_chain = chain_count > 1;
+        Self {
+            threshold,
+            intra_matched_atoms: vec![false; atom_count],
+            cross_matched_atoms: has_cross_chain.then(|| vec![false; atom_count]),
+            chain_matrix_matched_atoms: has_cross_chain
+                .then(|| (0..pair_count).map(|_| vec![false; atom_count]).collect()),
+            intra_pair_counts: vec![0; chain_count],
+            cross_pair_counts: has_cross_chain.then(|| vec![0; chain_count]),
+            chain_matrix_pair_counts: has_cross_chain.then(|| vec![0; pair_count]),
+        }
+    }
+
+    pub(crate) fn mark_intra(&mut self, chain: usize, atoms: &[usize], pairs: i64) {
+        for &atom in atoms {
+            self.intra_matched_atoms[atom] = true;
+        }
+        self.intra_pair_counts[chain] = self.intra_pair_counts[chain].saturating_add(pairs);
+    }
+
+    pub(crate) fn mark_cross(
+        &mut self,
+        left_chain: usize,
+        right_chain: usize,
+        left_atom: usize,
+        right_atom: usize,
+        pair_index: usize,
+        pairs: i64,
+    ) {
+        let cross_atoms = self
+            .cross_matched_atoms
+            .as_mut()
+            .expect("cross-chain pair requires cross match state");
+        cross_atoms[left_atom] = true;
+        cross_atoms[right_atom] = true;
+        let cross_counts = self
+            .cross_pair_counts
+            .as_mut()
+            .expect("cross-chain pair requires cross counters");
+        cross_counts[left_chain] = cross_counts[left_chain].saturating_add(pairs);
+        cross_counts[right_chain] = cross_counts[right_chain].saturating_add(pairs);
+
+        let matrix_atoms = self
+            .chain_matrix_matched_atoms
+            .as_mut()
+            .expect("cross-chain pair requires chain-matrix state");
+        matrix_atoms[pair_index][left_atom] = true;
+        matrix_atoms[pair_index][right_atom] = true;
+        let matrix_counts = self
+            .chain_matrix_pair_counts
+            .as_mut()
+            .expect("cross-chain pair requires chain-matrix counters");
+        matrix_counts[pair_index] = matrix_counts[pair_index].saturating_add(pairs);
+    }
 }
 
 pub(crate) enum CrossUnionState {

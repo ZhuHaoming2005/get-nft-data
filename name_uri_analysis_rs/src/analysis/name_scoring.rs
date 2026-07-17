@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), allow(dead_code))]
+
 use super::*;
 use memmap2::{Mmap, MmapOptions};
 use std::cmp::Reverse;
@@ -1920,6 +1922,293 @@ pub(crate) fn union_canonical_name_pairs<A: NameAtomStore + ?Sized>(
         }
     });
     scoring_stats
+}
+
+pub(crate) fn score_canonical_name_pairs_pairwise<A: NameAtomStore + ?Sized>(
+    original_atoms: &A,
+    canonical: &CanonicalNameValues,
+    candidate_index: &NameCandidateIndex,
+    execution: NameScoringExecution<'_>,
+    state: &mut PairwiseNameState,
+    chain_count: usize,
+    progress: &ProgressTracker,
+) -> NameScoringStats {
+    if canonical.atoms.is_empty() {
+        return NameScoringStats::default();
+    }
+
+    let mut scoring_stats = NameScoringStats::default();
+    for members in &canonical.members {
+        let work = record_identical_canonical_members_pairwise(
+            original_atoms,
+            members,
+            state,
+            chain_count,
+        );
+        scoring_stats.logical_member_pairs = scoring_stats
+            .logical_member_pairs
+            .saturating_add(work.logical_member_pairs);
+        scoring_stats.spanning_union_operations = scoring_stats
+            .spanning_union_operations
+            .saturating_add(work.spanning_union_operations);
+    }
+    if canonical.atoms.len() < 2 {
+        return scoring_stats;
+    }
+
+    let right_range_ends = execution.right_range_ends;
+    debug_assert!(
+        right_range_ends.is_none_or(|ends| ends.len() == canonical.atoms.len().saturating_sub(1))
+    );
+    let threshold = state.threshold;
+    if execution.worker_count <= 1 {
+        let mut scratch =
+            NameCandidateScratch::with_mode(canonical.atoms.len(), execution.scratch_mode);
+        let mut pending_progress = 0u64;
+        for left in 0..canonical.atoms.len() - 1 {
+            let right_end = right_range_ends.map_or_else(
+                || right_name_range_end_for_left(canonical, left, threshold),
+                |ends| ends[left] as usize,
+            );
+            let mut pair_work = NameUnionWork::default();
+            let left_stats = visit_indexed_name_pairs_for_left(
+                canonical,
+                candidate_index,
+                left,
+                left + 1..right_end,
+                threshold,
+                &mut scratch,
+                |hit| {
+                    pair_work.merge(record_canonical_pairwise_match(
+                        original_atoms,
+                        canonical,
+                        state,
+                        chain_count,
+                        left,
+                        hit,
+                    ));
+                },
+            );
+            scoring_stats.merge(left_stats);
+            scoring_stats.logical_member_pairs = scoring_stats
+                .logical_member_pairs
+                .saturating_add(pair_work.logical_member_pairs);
+            scoring_stats.spanning_union_operations = scoring_stats
+                .spanning_union_operations
+                .saturating_add(pair_work.spanning_union_operations);
+            pending_progress = pending_progress.saturating_add(1);
+            if pending_progress >= NAME_PROGRESS_LEFT_CHUNK || left + 2 == canonical.atoms.len() {
+                progress.advance_task(
+                    pending_progress,
+                    ProgressCounters {
+                        candidates: scoring_stats.candidate_pairs,
+                        scored: scoring_stats.scored_pairs,
+                        expanded: scoring_stats.logical_member_pairs,
+                        matched: scoring_stats.matched_pairs,
+                        ..ProgressCounters::default()
+                    },
+                );
+                pending_progress = 0;
+            }
+        }
+        return scoring_stats;
+    }
+
+    let queue_capacity = execution.worker_count.saturating_mul(2).max(1);
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<NameEdgeBatch>(queue_capacity);
+    rayon::scope(|scope| {
+        let producer = sender.clone();
+        scope.spawn(move |_| {
+            (0..canonical.atoms.len() - 1)
+                .into_par_iter()
+                .fold(
+                    || {
+                        (
+                            NameCandidateScratch::with_mode(
+                                canonical.atoms.len(),
+                                execution.scratch_mode,
+                            ),
+                            Vec::<(usize, ScoredRight)>::with_capacity(NAME_EDGE_CHUNK_SIZE),
+                            0u64,
+                            NameScoringStats::default(),
+                        )
+                    },
+                    |(mut scratch, mut edges, mut processed, mut stats), left| {
+                        let right_end = right_range_ends.map_or_else(
+                            || right_name_range_end_for_left(canonical, left, threshold),
+                            |ends| ends[left] as usize,
+                        );
+                        let left_stats = visit_indexed_name_pairs_for_left(
+                            canonical,
+                            candidate_index,
+                            left,
+                            left + 1..right_end,
+                            threshold,
+                            &mut scratch,
+                            |hit| {
+                                edges.push((left, hit));
+                                if edges.len() >= NAME_EDGE_CHUNK_SIZE {
+                                    producer
+                                        .send(NameEdgeBatch {
+                                            edges: std::mem::replace(
+                                                &mut edges,
+                                                Vec::with_capacity(NAME_EDGE_CHUNK_SIZE),
+                                            ),
+                                            processed_lefts: processed,
+                                            stats: NameScoringStats::default(),
+                                        })
+                                        .expect("name pair consumer must remain alive");
+                                    processed = 0;
+                                }
+                            },
+                        );
+                        stats.merge(left_stats);
+                        processed += 1;
+                        if processed >= NAME_PROGRESS_LEFT_CHUNK && edges.is_empty() {
+                            producer
+                                .send(NameEdgeBatch {
+                                    edges: Vec::new(),
+                                    processed_lefts: processed,
+                                    stats: NameScoringStats::default(),
+                                })
+                                .expect("name pair consumer must remain alive");
+                            processed = 0;
+                        }
+                        (scratch, edges, processed, stats)
+                    },
+                )
+                .for_each(|(_, edges, processed_lefts, stats)| {
+                    if !edges.is_empty() || processed_lefts > 0 || !stats.is_empty() {
+                        producer
+                            .send(NameEdgeBatch {
+                                edges,
+                                processed_lefts,
+                                stats,
+                            })
+                            .expect("name pair consumer must remain alive");
+                    }
+                });
+            drop(producer);
+        });
+        drop(sender);
+        for batch in receiver {
+            let mut pair_work = NameUnionWork::default();
+            for (left, hit) in batch.edges {
+                pair_work.merge(record_canonical_pairwise_match(
+                    original_atoms,
+                    canonical,
+                    state,
+                    chain_count,
+                    left,
+                    hit,
+                ));
+            }
+            scoring_stats.merge(batch.stats);
+            scoring_stats.logical_member_pairs = scoring_stats
+                .logical_member_pairs
+                .saturating_add(pair_work.logical_member_pairs);
+            scoring_stats.spanning_union_operations = scoring_stats
+                .spanning_union_operations
+                .saturating_add(pair_work.spanning_union_operations);
+            progress.advance_task(
+                batch.processed_lefts,
+                ProgressCounters {
+                    candidates: scoring_stats.candidate_pairs,
+                    scored: scoring_stats.scored_pairs,
+                    expanded: scoring_stats.logical_member_pairs,
+                    matched: scoring_stats.matched_pairs,
+                    ..ProgressCounters::default()
+                },
+            );
+        }
+    });
+    scoring_stats
+}
+
+fn record_identical_canonical_members_pairwise<A: NameAtomStore + ?Sized>(
+    atoms: &A,
+    members: &[u32],
+    state: &mut PairwiseNameState,
+    chain_count: usize,
+) -> NameUnionWork {
+    let mut work = NameUnionWork::default();
+    for &member in members {
+        let atom = member as usize;
+        let contracts = atoms.contract_count(atom).max(0);
+        let pairs = contracts.saturating_mul(contracts.saturating_sub(1)) / 2;
+        if pairs > 0 {
+            state.mark_intra(atoms.chain_index(atom), &[atom], pairs);
+            work.spanning_union_operations = work.spanning_union_operations.saturating_add(1);
+        }
+    }
+    for left_index in 0..members.len() {
+        for right_index in left_index + 1..members.len() {
+            work.logical_member_pairs = work.logical_member_pairs.saturating_add(1);
+            record_pairwise_atom_match(
+                atoms,
+                state,
+                members[left_index] as usize,
+                members[right_index] as usize,
+                chain_count,
+            );
+            work.spanning_union_operations = work.spanning_union_operations.saturating_add(1);
+        }
+    }
+    work
+}
+
+fn record_canonical_pairwise_match<A: NameAtomStore + ?Sized>(
+    atoms: &A,
+    canonical: &CanonicalNameValues,
+    state: &mut PairwiseNameState,
+    chain_count: usize,
+    canonical_left: usize,
+    matching: ScoredRight,
+) -> NameUnionWork {
+    debug_assert!(matching.score >= state.threshold);
+    let left_members = &canonical.members[canonical_left];
+    let right_members = &canonical.members[matching.right];
+    let mut work = NameUnionWork {
+        logical_member_pairs: (left_members.len() as u64)
+            .saturating_mul(right_members.len() as u64),
+        spanning_union_operations: 0,
+    };
+    for &left in left_members {
+        for &right in right_members {
+            record_pairwise_atom_match(atoms, state, left as usize, right as usize, chain_count);
+            work.spanning_union_operations = work.spanning_union_operations.saturating_add(1);
+        }
+    }
+    work
+}
+
+fn record_pairwise_atom_match<A: NameAtomStore + ?Sized>(
+    atoms: &A,
+    state: &mut PairwiseNameState,
+    left: usize,
+    right: usize,
+    chain_count: usize,
+) {
+    let left_chain = atoms.chain_index(left);
+    let right_chain = atoms.chain_index(right);
+    let pairs = atoms
+        .contract_count(left)
+        .max(0)
+        .saturating_mul(atoms.contract_count(right).max(0));
+    if pairs == 0 {
+        return;
+    }
+    if left_chain == right_chain {
+        state.mark_intra(left_chain, &[left, right], pairs);
+        return;
+    }
+    let (first_chain, second_chain) = if left_chain < right_chain {
+        (left_chain, right_chain)
+    } else {
+        (right_chain, left_chain)
+    };
+    let pair_index = chain_pair_index(first_chain, second_chain, chain_count);
+    state.mark_cross(left_chain, right_chain, left, right, pair_index, pairs);
 }
 
 fn apply_canonical_edge_batch<A: NameAtomStore + ?Sized>(
