@@ -54,6 +54,9 @@ Name and URI normalization are completed before Parquet export. Use `name_norm`,
 and `image_uri_norm` directly; do not re-read raw values to recompute them, and do not run a second
 transformation over the normalized results.
 
+If one contract has multiple non-empty `name_norm` values, use the first non-empty value in stable
+`(file_ordinal, file_row_number)` order as the contract Name.
+
 EVM addresses are lowercase; Solana addresses keep their Base58 case.
 
 ### Reading from Parquet

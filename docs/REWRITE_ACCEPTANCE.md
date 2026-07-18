@@ -165,7 +165,8 @@ Tests must be able to inject a fixed digest function that forces distinct string
 
 The code must satisfy:
 
-- at most one non-empty Name per contract;
+- at most one non-empty Name per contract, selected as the first non-empty value in stable source
+  order when the input contains multiple values;
 - one `NameAtom` per byte-confirmed `(chain, name_norm)`, carrying contract and NFT counts;
 - one `CanonicalName` per real Name value;
 - fuzzy scoring only between distinct `CanonicalName` values;

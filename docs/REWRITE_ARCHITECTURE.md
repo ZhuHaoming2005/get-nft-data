@@ -369,8 +369,9 @@ to avoid ineffective page-cache residency.
 
 ### 8.1 Name atoms
 
-Each contract keeps a single non-empty `name_norm`. Contracts without a name do not join Name
-deduplication.
+Each contract keeps the first non-empty `name_norm` in stable `(file_ordinal, file_row_number)`
+order. Later distinct names do not cause an entity conflict. Contracts without a name do not join
+Name deduplication.
 
 Before candidate construction, contracts are aggregated into:
 

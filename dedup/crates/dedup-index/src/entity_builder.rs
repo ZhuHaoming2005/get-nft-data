@@ -26,7 +26,6 @@ const DEFAULT_EXTERNAL_STRING_SORT_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 struct PendingNft {
-    name: Option<StringId>,
     token_uri: Option<StringId>,
     image_uri: Option<StringId>,
     metadata: Option<(SourceOrder, StoredMetadata)>,
@@ -265,7 +264,7 @@ enum EntityStringStore {
 struct PendingContract {
     chain: ChainId,
     address_ref: StringId,
-    name: Option<StringId>,
+    name: Option<(SourceOrder, StringId)>,
     nfts: AHashMap<StringId, PendingNft>,
 }
 
@@ -583,6 +582,7 @@ impl<V: MetadataSourceValidator> EntityBuilder<V> {
         let address_ref = strings.intern(address.as_bytes())?;
         let token_id_ref = strings.intern(token_id.as_bytes())?;
         let name = resident_optional_string(strings, &row.name_norm)?;
+        let ordered_name = name.map(|name| (row.source_order, name));
         let token_uri = resident_optional_string(strings, &row.token_uri_norm)?;
         let image_uri = resident_optional_string(strings, &row.image_uri_norm)?;
         let contracts = match &mut self.merge_store {
@@ -594,18 +594,13 @@ impl<V: MetadataSourceValidator> EntityBuilder<V> {
             .or_insert_with(|| PendingContract {
                 chain,
                 address_ref,
-                name,
+                name: ordered_name,
                 nfts: AHashMap::with_hasher(RandomState::with_seeds(9, 10, 11, 12)),
             });
-        contract.name = merge_optional(
-            contract.name,
-            name,
-            "multiple distinct non-empty names in one contract",
-        )?;
+        contract.name = select_first_name(contract.name, ordered_name);
         match contract.nfts.entry(token_id_ref) {
             Entry::Vacant(entry) => {
                 entry.insert(PendingNft {
-                    name,
                     token_uri,
                     image_uri,
                     metadata,
@@ -613,7 +608,6 @@ impl<V: MetadataSourceValidator> EntityBuilder<V> {
             }
             Entry::Occupied(mut entry) => {
                 let nft = entry.get_mut();
-                nft.name = merge_optional(nft.name, name, "conflicting NFT name")?;
                 nft.token_uri = merge_optional(nft.token_uri, token_uri, "conflicting token URI")?;
                 nft.image_uri = merge_optional(nft.image_uri, image_uri, "conflicting image URI")?;
                 if let Some(candidate) = metadata
@@ -746,7 +740,7 @@ impl<V: MetadataSourceValidator> EntityBuilder<V> {
                 id: contract_id,
                 chain_id: pending_contract.chain,
                 address_ref: pending_contract.address_ref,
-                name_ref: pending_contract.name,
+                name_ref: pending_contract.name.map(|(_, name)| name),
                 first_nft_id,
                 nft_count,
             });
@@ -1255,7 +1249,6 @@ fn merge_sort_runs(runs: &[SortRun], output: &Path) -> Result<u64, DedupError> {
 #[derive(Debug)]
 struct ExternalNftAggregate {
     token_id_ref: StringId,
-    name_ref: Option<StringId>,
     token_uri_ref: Option<StringId>,
     image_uri_ref: Option<StringId>,
     metadata: Option<StoredMetadata>,
@@ -1265,7 +1258,7 @@ struct ExternalNftAggregate {
 struct ExternalContractAggregate {
     chain_id: ChainId,
     address_ref: StringId,
-    name_ref: Option<StringId>,
+    name: Option<(SourceOrder, StringId)>,
     first_nft_id: NftId,
     nft_count: u64,
 }
@@ -1345,7 +1338,7 @@ impl<'a> ExternalArtifactReducer<'a> {
             self.contract = Some(ExternalContractAggregate {
                 chain_id,
                 address_ref,
-                name_ref: None,
+                name: None,
                 first_nft_id: checked_u64_id::<NftId>(self.nft_count, NftId::new)?,
                 nft_count: 0,
             });
@@ -1360,7 +1353,6 @@ impl<'a> ExternalArtifactReducer<'a> {
         if self.nft.is_none() {
             self.nft = Some(ExternalNftAggregate {
                 token_id_ref,
-                name_ref: None,
                 token_uri_ref: None,
                 image_uri_ref: None,
                 metadata: None,
@@ -1373,16 +1365,12 @@ impl<'a> ExternalArtifactReducer<'a> {
             .contract
             .as_mut()
             .ok_or_else(|| invalid_external_row("contract reducer is missing"))?;
-        contract.name_ref = merge_optional(
-            contract.name_ref,
-            name_ref,
-            "multiple distinct non-empty names in one contract",
-        )?;
+        let source_order = external_source_order(row.source_file, row.source_row)?;
+        contract.name = select_first_name(contract.name, name_ref.map(|name| (source_order, name)));
         let nft = self
             .nft
             .as_mut()
             .ok_or_else(|| invalid_external_row("NFT reducer is missing"))?;
-        nft.name_ref = merge_optional(nft.name_ref, name_ref, "conflicting NFT name")?;
         nft.token_uri_ref =
             merge_optional(nft.token_uri_ref, token_uri_ref, "conflicting token URI")?;
         nft.image_uri_ref =
@@ -1472,7 +1460,7 @@ impl<'a> ExternalArtifactReducer<'a> {
                 id,
                 chain_id: contract.chain_id,
                 address_ref: contract.address_ref,
-                name_ref: contract.name_ref,
+                name_ref: contract.name.map(|(_, name)| name),
                 first_nft_id: contract.first_nft_id,
                 nft_count: contract.nft_count,
             },
@@ -1541,7 +1529,7 @@ impl<'a> ExternalEntityReducer<'a> {
             self.contract = Some(ExternalContractAggregate {
                 chain_id,
                 address_ref,
-                name_ref: None,
+                name: None,
                 first_nft_id: checked_id::<NftId>(self.artifacts.nfts.len(), NftId::new)?,
                 nft_count: 0,
             });
@@ -1556,7 +1544,6 @@ impl<'a> ExternalEntityReducer<'a> {
         if self.nft.is_none() {
             self.nft = Some(ExternalNftAggregate {
                 token_id_ref,
-                name_ref: None,
                 token_uri_ref: None,
                 image_uri_ref: None,
                 metadata: None,
@@ -1569,16 +1556,12 @@ impl<'a> ExternalEntityReducer<'a> {
             .contract
             .as_mut()
             .ok_or_else(|| invalid_external_row("contract reducer is missing"))?;
-        contract.name_ref = merge_optional(
-            contract.name_ref,
-            name_ref,
-            "multiple distinct non-empty names in one contract",
-        )?;
+        let source_order = external_source_order(row.source_file, row.source_row)?;
+        contract.name = select_first_name(contract.name, name_ref.map(|name| (source_order, name)));
         let nft = self
             .nft
             .as_mut()
             .ok_or_else(|| invalid_external_row("NFT reducer is missing"))?;
-        nft.name_ref = merge_optional(nft.name_ref, name_ref, "conflicting NFT name")?;
         nft.token_uri_ref =
             merge_optional(nft.token_uri_ref, token_uri_ref, "conflicting token URI")?;
         nft.image_uri_ref =
@@ -1638,7 +1621,7 @@ impl<'a> ExternalEntityReducer<'a> {
             id,
             chain_id: contract.chain_id,
             address_ref: contract.address_ref,
-            name_ref: contract.name_ref,
+            name_ref: contract.name.map(|(_, name)| name),
             first_nft_id: contract.first_nft_id,
             nft_count: contract.nft_count,
         });
@@ -1882,6 +1865,23 @@ fn merge_optional<T: Copy + Eq>(
     }
 }
 
+fn select_first_name(
+    current: Option<(SourceOrder, StringId)>,
+    incoming: Option<(SourceOrder, StringId)>,
+) -> Option<(SourceOrder, StringId)> {
+    match (current, incoming) {
+        (Some(current), Some(incoming)) => Some(current.min(incoming)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn external_source_order(file: u64, row: u64) -> Result<SourceOrder, DedupError> {
+    u32::try_from(file)
+        .map(|file| SourceOrder::new(file, row))
+        .map_err(|_| invalid_external_row("source file ordinal exceeds u32"))
+}
+
 fn checked_id<T>(length: usize, constructor: impl FnOnce(EntityId) -> T) -> Result<T, DedupError> {
     let raw = EntityId::try_from(length).map_err(|_| DedupError::InvalidInput {
         context: ErrorContext::stage("entity"),
@@ -2028,23 +2028,31 @@ mod tests {
     }
 
     #[test]
-    fn different_non_empty_names_across_nfts_conflict_at_contract_level() {
-        let mut builder = EntityBuilder::new(
-            ["ethereum".to_owned()],
-            ["ethereum".to_owned()],
-            8,
-            TestMetadataValidator,
-        )
-        .unwrap();
-        let mut first = row("alpha", "", SourceOrder::new(0, 0));
-        first.token_id = "1".to_owned();
-        let mut second = row("beta", "", SourceOrder::new(0, 1));
-        second.token_id = "2".to_owned();
-        builder.push(first).unwrap();
-        assert!(matches!(
-            builder.push(second),
-            Err(DedupError::SnapshotConflict { .. })
-        ));
+    fn first_non_empty_contract_name_wins_by_source_order() {
+        for mode in [
+            ExecutionMode::InMemory,
+            ExecutionMode::Hybrid,
+            ExecutionMode::External,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut builder = EntityBuilder::new_with_execution(
+                ["ethereum".to_owned()],
+                ["ethereum".to_owned()],
+                8,
+                TestMetadataValidator,
+                EntityExecutionConfig::new(mode, Some(directory.path().to_owned()), 1, 2).unwrap(),
+            )
+            .unwrap();
+            let mut first = row("beta", "", SourceOrder::new(0, 0));
+            first.token_id = "2".to_owned();
+            let mut later = row("alpha", "", SourceOrder::new(0, 1));
+            later.token_id = "1".to_owned();
+            builder.push(later).unwrap();
+            builder.push(first).unwrap();
+            let result = builder.finish().unwrap();
+            let name = result.artifacts.contracts[0].name_ref.unwrap();
+            assert_eq!(result.strings.resolve(name).unwrap(), b"beta");
+        }
     }
 
     #[test]
@@ -2154,7 +2162,11 @@ mod tests {
                 .enumerate()
                 .map(|(index, token_id)| {
                     let mut input = row(
-                        "collection",
+                        if index == 0 {
+                            "first-name"
+                        } else {
+                            "later-name"
+                        },
                         "ipfs://same",
                         SourceOrder::new(0, index as u64),
                     );
