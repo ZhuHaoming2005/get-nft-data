@@ -31,7 +31,7 @@ memory_limit = 0 # 0 = 取 cgroup 与物理内存的较小值
 | `work_budgets` | 精确工作上限，超限返回结构化错误 |
 | `quality_gate` | Metadata recall audit 门槛 |
 
-Name 所需合约名、postings 和候选全量保留在内存；Metadata 所需 anchors、templates、prefilter evidence、候选和比较索引也全量保留在内存，并在同一进程的验证与 recall audit 间复用。预测峰值超出阶段预算时只记录警告并继续，不切换外存模式。
+Name 所需合约名和紧凑 posting CSR 全量保留在内存；候选按 left Name 并行生成、去重、过滤并立即评分，不物化全局候选表。Metadata 所需 anchors、templates、prefilter evidence、候选和比较索引也全量保留在内存，并在同一进程的验证与 recall audit 间复用。预测峰值超出阶段预算时只记录警告并继续，不切换外存模式。
 
 ## 生产编译
 

@@ -161,6 +161,14 @@ sample_seed = 7
     );
     assert_eq!(manifest["neighbors_per_target_chain"], 4);
     assert!(manifest["resource_plans"]["uri"].is_object());
+    assert_eq!(
+        manifest["resource_plans"]["name"]["global_candidate_materialization"],
+        false
+    );
+    assert_eq!(
+        manifest["resource_plans"]["name"]["scoring_strategy"],
+        "parallel_left_fused_generate_filter_score"
+    );
     let uri_plan: serde_json::Value =
         serde_json::from_slice(&fs::read(result.join("run/uri_resource_plan.json")).unwrap())
             .unwrap();

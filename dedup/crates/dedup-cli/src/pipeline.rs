@@ -1054,15 +1054,20 @@ impl PipelineContext {
         let canonical_bytes = canonical_count
             .saturating_mul(72)
             .saturating_add(name_bytes.saturating_mul(12));
-        let posting_bytes = name_bytes.saturating_mul(24);
-        let candidate_bytes = candidate_upper.saturating_mul(40);
+        let posting_bytes = canonical_count
+            .saturating_add(1)
+            .saturating_mul(8)
+            .saturating_add(name_bytes.saturating_mul(16));
+        let index_build_bytes = name_bytes.saturating_mul(32);
         let base_peak_bytes = atom_bytes
             .saturating_add(canonical_bytes)
-            .saturating_add(posting_bytes)
-            .saturating_add(candidate_bytes);
+            .saturating_add(posting_bytes.max(index_build_bytes));
         let effective_memory = self.effective_memory_limit()?;
         let stage_limit = effective_memory.saturating_mul(75) / 100;
-        let scratch_per_worker = name_bytes.clamp(1, 16 * 1024 * 1024);
+        let scratch_per_worker = canonical_count
+            .saturating_mul(12)
+            .saturating_add(1024 * 1024)
+            .max(1);
         let affordable_workers = stage_limit
             .saturating_sub(base_peak_bytes)
             .saturating_div(scratch_per_worker)
@@ -1082,6 +1087,11 @@ impl PipelineContext {
             "unique_canonical_names": canonical_count,
             "name_utf8_bytes": name_bytes,
             "candidate_upper_bound": candidate_upper,
+            "candidate_index_bytes": posting_bytes,
+            "candidate_index_build_bytes": index_build_bytes,
+            "global_candidate_materialization": false,
+            "scoring_strategy": "parallel_left_fused_generate_filter_score",
+            "scratch_bytes_per_worker": scratch_per_worker,
             "predicted_peak_bytes": predicted_peak_bytes,
             "stage_memory_limit": stage_limit,
             "requested_workers": workers,

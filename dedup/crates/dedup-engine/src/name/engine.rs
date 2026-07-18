@@ -1,6 +1,6 @@
 use super::CandidateBounds;
 use crate::parallel::RayonChunkExecutor;
-use ahash::{AHashMap, AHashSet, RandomState};
+use ahash::{AHashMap, RandomState};
 use dedup_index::{CandidateBuffer, StringDictionary};
 use dedup_model::{
     CanonicalNameId, ChainId, ChunkExecutor, Contract, ContractId, DedupError, Dimension, EntityId,
@@ -9,6 +9,7 @@ use dedup_model::{
 };
 use rapidfuzz::distance::jaro_winkler::{Args, BatchComparator};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 type OccurrenceToken = (char, u32);
 
@@ -148,69 +149,66 @@ pub fn run_name_with_progress_and_executor(
         progress,
     )?;
     let optimized_bounds_are_safe = config.threshold >= 0.95;
-    let candidate_pairs = if !optimized_bounds_are_safe {
+    let mut fuzzy_matches = Vec::new();
+    let scored_matches = if optimized_bounds_are_safe
+        && config.candidate_storage == CandidateStorageMode::ResidentPostings
+    {
+        let index = NamePostingIndex::build(&canonical_names, &mut counters, progress)?;
+        let result = score_posting_index(&index, &canonical_names, config, executor, progress)?;
+        counters.name_posting_touches(result.posting_touches)?;
+        counters.name_scored_candidates(result.scored_candidates)?;
+        result.matches
+    } else {
+        let candidate_pairs = if !optimized_bounds_are_safe {
+            progress.begin_phase(
+                "exhaustive_name_candidates",
+                checked_total(canonical_names.len()),
+            );
+            exhaustive_candidates(
+                canonical_names.len(),
+                config.candidate_pair_budget,
+                progress,
+            )?
+        } else {
+            progress.begin_phase(
+                "overlap_scan_left_names",
+                checked_total(canonical_names.len()),
+            );
+            overlap_scan_candidates(&canonical_names, config.candidate_pair_budget, progress)?
+        };
         progress.begin_phase(
-            "exhaustive_name_candidates",
-            checked_total(canonical_names.len()),
+            "score_name_candidates",
+            checked_total(candidate_pairs.len()),
         );
-        exhaustive_candidates(
-            canonical_names.len(),
-            config.candidate_pair_budget,
+        let scored_candidates =
+            candidate_pairs
+                .iter()
+                .try_fold(0_u64, |count, (left, right)| {
+                    let should_score = !optimized_bounds_are_safe
+                        || passes_overlap(&canonical_names[*left], &canonical_names[*right]);
+                    count
+                        .checked_add(u64::from(should_score))
+                        .ok_or(DedupError::CounterOverflow {
+                            counter: "name_scored_candidates",
+                        })
+                })?;
+        if scored_candidates > config.score_budget {
+            return Err(DedupError::BudgetExhausted {
+                context: ErrorContext::stage("name"),
+                counter: "name_scored_candidates",
+                limit: config.score_budget,
+            });
+        }
+        counters.name_scored_candidates(scored_candidates)?;
+        score_name_candidates(
+            &candidate_pairs,
+            &canonical_names,
+            optimized_bounds_are_safe,
+            config.threshold,
+            executor,
             progress,
         )?
-    } else {
-        match config.candidate_storage {
-            CandidateStorageMode::ResidentPostings => {
-                progress.begin_phase("name_posting_touches", None);
-                posting_candidates(
-                    &canonical_names,
-                    config.candidate_pair_budget,
-                    &mut counters,
-                    progress,
-                )?
-            }
-            CandidateStorageMode::OverlapScan => {
-                progress.begin_phase(
-                    "overlap_scan_left_names",
-                    checked_total(canonical_names.len()),
-                );
-                overlap_scan_candidates(&canonical_names, config.candidate_pair_budget, progress)?
-            }
-        }
     };
-
-    let mut fuzzy_matches = Vec::new();
-    progress.begin_phase(
-        "score_name_candidates",
-        checked_total(candidate_pairs.len()),
-    );
-    let scored_candidates = candidate_pairs
-        .iter()
-        .try_fold(0_u64, |count, (left, right)| {
-            let should_score = !optimized_bounds_are_safe
-                || passes_overlap(&canonical_names[*left], &canonical_names[*right]);
-            count
-                .checked_add(u64::from(should_score))
-                .ok_or(DedupError::CounterOverflow {
-                    counter: "name_scored_candidates",
-                })
-        })?;
-    if scored_candidates > config.score_budget {
-        return Err(DedupError::BudgetExhausted {
-            context: ErrorContext::stage("name"),
-            counter: "name_scored_candidates",
-            limit: config.score_budget,
-        });
-    }
-    counters.name_scored_candidates(scored_candidates)?;
-    let scored_matches = score_name_candidates(
-        &candidate_pairs,
-        &canonical_names,
-        optimized_bounds_are_safe,
-        config.threshold,
-        executor,
-        progress,
-    )?;
     for scored in scored_matches {
         let left_name = &canonical_names[scored.left];
         let right_name = &canonical_names[scored.right];
@@ -473,98 +471,327 @@ struct AtomizedNames {
     canonical_names: Vec<CanonicalName>,
 }
 
-fn posting_candidates(
-    names: &[CanonicalName],
-    pair_budget: u64,
-    counters: &mut StageCounters,
-    progress: &dyn ProgressObserver,
-) -> Result<Vec<(usize, usize)>, DedupError> {
-    // The production path is resident-only: retain occurrence tokens so the
-    // posting pass does not rebuild them for every canonical name.
-    let mut occurrence_by_name: Vec<Vec<OccurrenceToken>> = names
-        .iter()
-        .map(|name| occurrence_tokens(&name.character_counts))
-        .collect();
-    let mut frequencies: AHashMap<OccurrenceToken, u64> =
-        AHashMap::with_hasher(RandomState::with_seeds(51, 52, 53, 54));
-    for tokens in &occurrence_by_name {
-        progress.check_cancelled("name")?;
-        for token in tokens {
-            let count = frequencies.entry(*token).or_default();
-            *count = count.checked_add(1).ok_or(DedupError::CounterOverflow {
-                counter: "name_posting_entries",
+#[derive(Debug)]
+struct NamePostingIndex {
+    prefix_offsets: Vec<usize>,
+    prefix_tokens: Vec<u32>,
+    posting_offsets: Vec<usize>,
+    posting_names: Vec<u32>,
+}
+
+impl NamePostingIndex {
+    fn build(
+        names: &[CanonicalName],
+        counters: &mut StageCounters,
+        progress: &dyn ProgressObserver,
+    ) -> Result<Self, DedupError> {
+        progress.begin_phase("name_token_frequencies", checked_total(names.len()));
+        let mut frequencies: AHashMap<OccurrenceToken, u64> =
+            AHashMap::with_hasher(RandomState::with_seeds(51, 52, 53, 54));
+        let mut completed = 0_u64;
+        for name in names {
+            for_each_occurrence_token(name, |token| {
+                let count = frequencies.entry(token).or_default();
+                *count = count.checked_add(1).ok_or(DedupError::CounterOverflow {
+                    counter: "name_posting_entries",
+                })?;
+                Ok(())
             })?;
+            completed = completed.saturating_add(1);
+            flush_name_progress(&mut completed, progress)?;
         }
-    }
+        flush_remaining_name_progress(&mut completed, progress)?;
 
-    let mut postings: AHashMap<OccurrenceToken, Vec<usize>> = AHashMap::with_capacity_and_hasher(
-        frequencies.len(),
-        RandomState::with_seeds(55, 56, 57, 58),
-    );
-    for (name_id, ordered) in occurrence_by_name.iter_mut().enumerate() {
-        progress.check_cancelled("name")?;
-        ordered.sort_unstable_by_key(|token| (frequencies[token], *token));
-        let minimum_partner_length = names[name_id]
-            .characters
-            .len()
-            .saturating_mul(3)
-            .div_ceil(4);
-        let minimum_overlap =
-            CandidateBounds::for_lengths(names[name_id].characters.len(), minimum_partner_length)
-                .minimum_multiset_overlap;
-        let prefix_length = ordered
-            .len()
-            .saturating_sub(minimum_overlap)
-            .saturating_add(1)
-            .min(ordered.len());
-        for token in ordered.iter().copied().take(prefix_length) {
-            postings.entry(token).or_default().push(name_id);
-            counters.name_posting_entries(1)?;
-        }
-    }
-
-    let mut pairs: AHashSet<(usize, usize)> =
-        AHashSet::with_hasher(RandomState::with_seeds(61, 62, 63, 64));
-    let posting_touches = postings.values().fold(0_u64, |total, posting| {
-        let length = u64::try_from(posting.len()).unwrap_or(u64::MAX);
-        total.saturating_add(length.saturating_mul(length.saturating_sub(1)) / 2)
-    });
-    progress.set_total(posting_touches);
-    for posting in postings.values() {
-        for left_position in 0..posting.len() {
-            progress.advance(
-                u64::try_from(posting.len().saturating_sub(left_position + 1)).unwrap_or(u64::MAX),
+        let mut token_catalog: Vec<_> = frequencies.into_iter().collect();
+        token_catalog.sort_unstable_by_key(|(token, _)| *token);
+        let mut token_ids = AHashMap::with_capacity_and_hasher(
+            token_catalog.len(),
+            RandomState::with_seeds(55, 56, 57, 58),
+        );
+        for (token_id, (token, _)) in token_catalog.iter().enumerate() {
+            token_ids.insert(
+                *token,
+                u32::try_from(token_id).map_err(|_| DedupError::ResourceBudgetExceeded {
+                    context: ErrorContext::stage("name"),
+                    requested: u64::try_from(token_catalog.len()).unwrap_or(u64::MAX),
+                })?,
             );
-            progress.check_cancelled("name")?;
-            for &right in &posting[left_position + 1..] {
-                counters.name_posting_touches(1)?;
-                let left = posting[left_position];
-                if !CandidateBounds::can_pair_lengths(
-                    names[left].characters.len(),
-                    names[right].characters.len(),
-                ) {
-                    continue;
+        }
+
+        let token_occurrences = names.iter().try_fold(0_usize, |total, name| {
+            total
+                .checked_add(name.characters.len())
+                .ok_or(DedupError::CounterOverflow {
+                    counter: "name_token_occurrences",
+                })
+        })?;
+        let mut prefix_offsets = Vec::with_capacity(names.len().saturating_add(1));
+        let mut prefix_tokens = Vec::with_capacity(token_occurrences);
+        let mut posting_counts = vec![0_usize; token_catalog.len()];
+        let mut ordered = Vec::<(u64, u32)>::new();
+        prefix_offsets.push(0);
+        progress.begin_phase("build_name_prefix_index", checked_total(names.len()));
+        completed = 0;
+        for name in names {
+            ordered.clear();
+            ordered.reserve(name.characters.len());
+            for_each_occurrence_token(name, |token| {
+                let token_id = token_ids[&token];
+                ordered.push((token_catalog[token_id as usize].1, token_id));
+                Ok(())
+            })?;
+            ordered.sort_unstable();
+            let minimum_partner_length = name.characters.len().saturating_mul(3).div_ceil(4);
+            let minimum_overlap =
+                CandidateBounds::for_lengths(name.characters.len(), minimum_partner_length)
+                    .minimum_multiset_overlap;
+            let prefix_length = ordered
+                .len()
+                .saturating_sub(minimum_overlap)
+                .saturating_add(1)
+                .min(ordered.len());
+            for &(_, token_id) in ordered.iter().take(prefix_length) {
+                prefix_tokens.push(token_id);
+                posting_counts[token_id as usize] = posting_counts[token_id as usize]
+                    .checked_add(1)
+                    .ok_or(DedupError::CounterOverflow {
+                        counter: "name_posting_entries",
+                    })?;
+            }
+            prefix_offsets.push(prefix_tokens.len());
+            completed = completed.saturating_add(1);
+            flush_name_progress(&mut completed, progress)?;
+        }
+        flush_remaining_name_progress(&mut completed, progress)?;
+        counters.name_posting_entries(u64::try_from(prefix_tokens.len()).map_err(|_| {
+            DedupError::CounterOverflow {
+                counter: "name_posting_entries",
+            }
+        })?)?;
+
+        let mut posting_offsets: Vec<usize> =
+            Vec::with_capacity(posting_counts.len().saturating_add(1));
+        posting_offsets.push(0);
+        for count in posting_counts {
+            let next = posting_offsets
+                .last()
+                .copied()
+                .unwrap_or_default()
+                .checked_add(count)
+                .ok_or(DedupError::CounterOverflow {
+                    counter: "name_posting_entries",
+                })?;
+            posting_offsets.push(next);
+        }
+        let mut cursors = posting_offsets[..posting_offsets.len().saturating_sub(1)].to_vec();
+        let mut posting_names = vec![0_u32; prefix_tokens.len()];
+        progress.begin_phase("fill_name_postings", checked_total(names.len()));
+        completed = 0;
+        for name_id in 0..names.len() {
+            let compact_name =
+                u32::try_from(name_id).map_err(|_| DedupError::ResourceBudgetExceeded {
+                    context: ErrorContext::stage("name"),
+                    requested: u64::try_from(names.len()).unwrap_or(u64::MAX),
+                })?;
+            for &token_id in &prefix_tokens[prefix_offsets[name_id]..prefix_offsets[name_id + 1]] {
+                let cursor = &mut cursors[token_id as usize];
+                posting_names[*cursor] = compact_name;
+                *cursor = cursor.checked_add(1).ok_or(DedupError::CounterOverflow {
+                    counter: "name_posting_cursor",
+                })?;
+            }
+            completed = completed.saturating_add(1);
+            flush_name_progress(&mut completed, progress)?;
+        }
+        flush_remaining_name_progress(&mut completed, progress)?;
+        Ok(Self {
+            prefix_offsets,
+            prefix_tokens,
+            posting_offsets,
+            posting_names,
+        })
+    }
+
+    fn prefix(&self, name: usize) -> &[u32] {
+        &self.prefix_tokens[self.prefix_offsets[name]..self.prefix_offsets[name + 1]]
+    }
+
+    fn posting(&self, token: u32) -> &[u32] {
+        let token = token as usize;
+        &self.posting_names[self.posting_offsets[token]..self.posting_offsets[token + 1]]
+    }
+}
+
+#[derive(Debug, Default)]
+struct PostingScoreResult {
+    matches: Vec<ScoredNameMatch>,
+    posting_touches: u64,
+    scored_candidates: u64,
+}
+
+fn score_posting_index(
+    index: &NamePostingIndex,
+    names: &[CanonicalName],
+    config: NameEngineConfig,
+    executor: &impl ChunkExecutor,
+    progress: &dyn ProgressObserver,
+) -> Result<PostingScoreResult, DedupError> {
+    let left_count = names.len().saturating_sub(1);
+    progress.begin_phase("score_name_left_values", checked_total(left_count));
+    if left_count == 0 {
+        return Ok(PostingScoreResult::default());
+    }
+    let lane_count = executor.worker_count().min(left_count).max(1);
+    let lanes: Vec<usize> = (0..lane_count).collect();
+    let admitted = AtomicU64::new(0);
+    let (budget_counter, budget_limit) = if config.candidate_pair_budget <= config.score_budget {
+        ("name_candidate_pairs", config.candidate_pair_budget)
+    } else {
+        ("name_scored_candidates", config.score_budget)
+    };
+    let mut chunks = executor.map_chunks(&lanes, 1, |lane| {
+        let lane = lane[0];
+        let mut marks = vec![0_u32; names.len()];
+        let mut generation = 0_u32;
+        let mut candidates = Vec::<usize>::new();
+        let mut local = PostingScoreResult::default();
+        let args = Args::default().score_cutoff(config.threshold);
+        let mut pending_progress = 0_u64;
+        for left in (lane..left_count).step_by(lane_count) {
+            if generation == u32::MAX {
+                marks.fill(0);
+                generation = 1;
+            } else {
+                generation += 1;
+            }
+            candidates.clear();
+            for &token in index.prefix(left) {
+                for &right in index.posting(token) {
+                    let right = right as usize;
+                    if right <= left {
+                        continue;
+                    }
+                    local.posting_touches = local.posting_touches.checked_add(1).ok_or(
+                        DedupError::CounterOverflow {
+                            counter: "name_posting_touches",
+                        },
+                    )?;
+                    if marks[right] == generation {
+                        continue;
+                    }
+                    marks[right] = generation;
+                    if passes_overlap(&names[left], &names[right]) {
+                        candidates.push(right);
+                    }
                 }
-                if !passes_overlap(&names[left], &names[right]) {
-                    continue;
-                }
-                let pair = (left.min(right), left.max(right));
-                if !pairs.contains(&pair)
-                    && u64::try_from(pairs.len()).unwrap_or(u64::MAX) >= pair_budget
+            }
+            candidates.sort_unstable();
+            let candidate_count =
+                u64::try_from(candidates.len()).map_err(|_| DedupError::CounterOverflow {
+                    counter: "name_scored_candidates",
+                })?;
+            reserve_name_score_budget(&admitted, candidate_count, budget_counter, budget_limit)?;
+            local.scored_candidates = local.scored_candidates.checked_add(candidate_count).ok_or(
+                DedupError::CounterOverflow {
+                    counter: "name_scored_candidates",
+                },
+            )?;
+            let prepared = BatchComparator::new(names[left].characters.iter().copied());
+            for &right in &candidates {
+                if let Some(similarity) =
+                    prepared.similarity_with_args(names[right].characters.iter().copied(), &args)
                 {
-                    return Err(DedupError::BudgetExhausted {
-                        context: ErrorContext::stage("name"),
-                        counter: "name_candidate_pairs",
-                        limit: pair_budget,
+                    local.matches.push(ScoredNameMatch {
+                        left,
+                        right,
+                        similarity,
                     });
                 }
-                pairs.insert(pair);
+            }
+            pending_progress = pending_progress.saturating_add(1);
+            if pending_progress >= 256 {
+                progress.advance(pending_progress);
+                progress.check_cancelled("name")?;
+                pending_progress = 0;
             }
         }
+        progress.advance(pending_progress);
+        progress.check_cancelled("name")?;
+        Ok(local)
+    })?;
+    let mut result = PostingScoreResult::default();
+    for mut chunk in chunks.drain(..) {
+        result.posting_touches = result
+            .posting_touches
+            .checked_add(chunk.posting_touches)
+            .ok_or(DedupError::CounterOverflow {
+                counter: "name_posting_touches",
+            })?;
+        result.scored_candidates = result
+            .scored_candidates
+            .checked_add(chunk.scored_candidates)
+            .ok_or(DedupError::CounterOverflow {
+                counter: "name_scored_candidates",
+            })?;
+        result.matches.append(&mut chunk.matches);
     }
-    let mut pairs: Vec<_> = pairs.into_iter().collect();
-    pairs.sort_unstable();
-    Ok(pairs)
+    result
+        .matches
+        .sort_unstable_by_key(|matched| (matched.left, matched.right));
+    Ok(result)
+}
+
+fn reserve_name_score_budget(
+    admitted: &AtomicU64,
+    amount: u64,
+    counter: &'static str,
+    limit: u64,
+) -> Result<(), DedupError> {
+    admitted
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current
+                .checked_add(amount)
+                .filter(|updated| *updated <= limit)
+        })
+        .map(|_| ())
+        .map_err(|_| DedupError::BudgetExhausted {
+            context: ErrorContext::stage("name"),
+            counter,
+            limit,
+        })
+}
+
+fn for_each_occurrence_token(
+    name: &CanonicalName,
+    mut visit: impl FnMut(OccurrenceToken) -> Result<(), DedupError>,
+) -> Result<(), DedupError> {
+    for &(character, count) in &name.character_counts {
+        for rank in 0..count {
+            visit((character, rank))?;
+        }
+    }
+    Ok(())
+}
+
+fn flush_name_progress(
+    completed: &mut u64,
+    progress: &dyn ProgressObserver,
+) -> Result<(), DedupError> {
+    if *completed >= 4_096 {
+        progress.advance(*completed);
+        progress.check_cancelled("name")?;
+        *completed = 0;
+    }
+    Ok(())
+}
+
+fn flush_remaining_name_progress(
+    completed: &mut u64,
+    progress: &dyn ProgressObserver,
+) -> Result<(), DedupError> {
+    progress.advance(*completed);
+    *completed = 0;
+    progress.check_cancelled("name")
 }
 
 fn overlap_scan_candidates(
@@ -602,13 +829,6 @@ fn overlap_scan_candidates(
     }
     pairs.sort_unstable();
     Ok(pairs)
-}
-
-fn occurrence_tokens(character_counts: &[(char, u32)]) -> Vec<OccurrenceToken> {
-    character_counts
-        .iter()
-        .flat_map(|(character, count)| (0..*count).map(move |rank| (*character, rank)))
-        .collect()
 }
 
 fn passes_overlap(left: &CanonicalName, right: &CanonicalName) -> bool {
@@ -820,6 +1040,49 @@ mod tests {
     use super::*;
     use dedup_model::{NftId, StringId};
     use std::collections::BTreeSet;
+    use std::sync::Mutex;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct RecordedPhase {
+        name: &'static str,
+        total: Option<u64>,
+        completed: u64,
+    }
+
+    #[derive(Default)]
+    struct RecordingProgress(Mutex<Vec<RecordedPhase>>);
+
+    impl RecordingProgress {
+        fn phase(&self, name: &'static str) -> RecordedPhase {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|phase| phase.name == name)
+                .cloned()
+                .unwrap()
+        }
+    }
+
+    impl ProgressObserver for RecordingProgress {
+        fn begin_phase(&self, phase: &'static str, total: Option<u64>) {
+            self.0.lock().unwrap().push(RecordedPhase {
+                name: phase,
+                total,
+                completed: 0,
+            });
+        }
+
+        fn set_total(&self, total: u64) {
+            self.0.lock().unwrap().last_mut().unwrap().total = Some(total);
+        }
+
+        fn advance(&self, amount: u64) {
+            let mut phases = self.0.lock().unwrap();
+            let current = phases.last_mut().unwrap();
+            current.completed = current.completed.saturating_add(amount);
+        }
+    }
 
     fn fixture() -> (Vec<Contract>, StringDictionary) {
         let mut strings = StringDictionary::new(8).unwrap();
@@ -960,6 +1223,34 @@ mod tests {
         assert_eq!(parallel_sink.0, sequential_sink.0);
     }
 
+    #[test]
+    fn resident_name_progress_tracks_completed_names_with_exact_totals() {
+        let (contracts, strings) = fixture();
+        let progress = RecordingProgress::default();
+        run_name_with_progress_and_workers(
+            &contracts,
+            &strings,
+            NameEngineConfig::production_default(100),
+            &mut RecordingSink::default(),
+            &progress,
+            4,
+        )
+        .unwrap();
+
+        for phase_name in [
+            "name_token_frequencies",
+            "build_name_prefix_index",
+            "fill_name_postings",
+        ] {
+            let phase = progress.phase(phase_name);
+            assert_eq!(phase.total, Some(3));
+            assert_eq!(phase.completed, 3);
+        }
+        let scoring = progress.phase("score_name_left_values");
+        assert_eq!(scoring.total, Some(2));
+        assert_eq!(scoring.completed, 2);
+    }
+
     #[derive(Default)]
     struct RecordingSink(Vec<HitEvent>);
 
@@ -1096,22 +1387,47 @@ mod tests {
                 nft_count: 1,
             })
             .collect();
-        let error = run_name(
+        for candidate_storage in [
+            CandidateStorageMode::OverlapScan,
+            CandidateStorageMode::ResidentPostings,
+        ] {
+            let error = run_name(
+                &contracts,
+                &strings,
+                NameEngineConfig {
+                    threshold: 0.95,
+                    candidate_storage,
+                    candidate_pair_budget: 2,
+                    score_budget: 100,
+                },
+                &mut RecordingSink::default(),
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                DedupError::BudgetExhausted {
+                    counter: "name_candidate_pairs",
+                    limit: 2,
+                    ..
+                }
+            ));
+        }
+        let score_error = run_name(
             &contracts,
             &strings,
             NameEngineConfig {
                 threshold: 0.95,
-                candidate_storage: CandidateStorageMode::OverlapScan,
-                candidate_pair_budget: 2,
-                score_budget: 100,
+                candidate_storage: CandidateStorageMode::ResidentPostings,
+                candidate_pair_budget: 100,
+                score_budget: 2,
             },
             &mut RecordingSink::default(),
         )
         .unwrap_err();
         assert!(matches!(
-            error,
+            score_error,
             DedupError::BudgetExhausted {
-                counter: "name_candidate_pairs",
+                counter: "name_scored_candidates",
                 limit: 2,
                 ..
             }
@@ -1157,10 +1473,25 @@ mod tests {
         let names = [canonical_for_test(0, "abcd"), canonical_for_test(1, "aefg")];
         assert!(!passes_overlap(&names[0], &names[1]));
 
-        let candidates =
-            posting_candidates(&names, 0, &mut StageCounters::default(), &NoopProgress).unwrap();
+        let mut counters = StageCounters::default();
+        let index = NamePostingIndex::build(&names, &mut counters, &NoopProgress).unwrap();
+        let executor = RayonChunkExecutor::new(1, "name").unwrap();
+        let result = score_posting_index(
+            &index,
+            &names,
+            NameEngineConfig {
+                threshold: 0.95,
+                candidate_storage: CandidateStorageMode::ResidentPostings,
+                candidate_pair_budget: 0,
+                score_budget: 0,
+            },
+            &executor,
+            &NoopProgress,
+        )
+        .unwrap();
 
-        assert!(candidates.is_empty());
+        assert_eq!(result.scored_candidates, 0);
+        assert!(result.matches.is_empty());
     }
 
     fn canonical_for_test(id: EntityId, value: &str) -> CanonicalName {
