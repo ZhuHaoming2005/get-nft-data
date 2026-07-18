@@ -6,6 +6,7 @@ use crate::progress::ProgressObserver;
 use crate::stats::SummaryAccumulator;
 use ahash::{AHashMap, AHashSet};
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone)]
 struct UriScopeHit {
@@ -15,6 +16,89 @@ struct UriScopeHit {
     dimension: Dimension,
     kind: ScopeKind,
     secondary_chain: Option<ChainId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct UriUnitKey {
+    contract_id: ContractId,
+    uri_id: StringId,
+    dimension: Dimension,
+    kind: ScopeKind,
+    secondary_chain: Option<ChainId>,
+}
+
+#[derive(Default)]
+struct LocalUriAccumulator {
+    units: AHashMap<UriUnitKey, u64>,
+}
+
+impl LocalUriAccumulator {
+    fn add(&mut self, hit: &UriScopeHit) {
+        self.units
+            .entry(UriUnitKey {
+                contract_id: hit.contract_id,
+                uri_id: hit.uri_id,
+                dimension: hit.dimension,
+                kind: hit.kind,
+                secondary_chain: hit.secondary_chain,
+            })
+            .or_insert(hit.nft_ids.len() as u64);
+    }
+
+    fn merge(&mut self, mut other: Self) {
+        if self.units.len() < other.units.len() {
+            std::mem::swap(&mut self.units, &mut other.units);
+        }
+        for (key, nft_rows) in other.units {
+            self.units.entry(key).or_insert(nft_rows);
+        }
+    }
+
+    fn flush(self, store: &EntityStore, acc: &mut SummaryAccumulator) {
+        for (key, nft_rows) in self.units {
+            acc.mark_uri_scope_hit(
+                store,
+                key.contract_id,
+                key.uri_id,
+                nft_rows,
+                key.dimension,
+                (key.kind, key.secondary_chain),
+            );
+        }
+    }
+}
+
+#[derive(Default)]
+struct TokenWorker {
+    uri: LocalUriAccumulator,
+    intra: Vec<NftId>,
+    cross_summary: Vec<NftId>,
+    matrix: AHashSet<(NftId, ChainId)>,
+}
+
+impl TokenWorker {
+    fn add(&mut self, hit: UriScopeHit) {
+        match hit.kind {
+            ScopeKind::IntraChain => self.intra.extend(&hit.nft_ids),
+            ScopeKind::CrossChainSummary => self.cross_summary.extend(&hit.nft_ids),
+            ScopeKind::ChainMatrix => {
+                let secondary = hit.secondary_chain.expect("matrix hit has secondary chain");
+                self.matrix
+                    .extend(hit.nft_ids.iter().map(|&nft_id| (nft_id, secondary)));
+            }
+        }
+        self.uri.add(&hit);
+    }
+
+    fn merge(&mut self, mut other: Self) {
+        self.uri.merge(other.uri);
+        self.intra.append(&mut other.intra);
+        self.cross_summary.append(&mut other.cross_summary);
+        if self.matrix.len() < other.matrix.len() {
+            std::mem::swap(&mut self.matrix, &mut other.matrix);
+        }
+        self.matrix.extend(other.matrix);
+    }
 }
 
 struct TokenHits {
@@ -65,39 +149,66 @@ pub fn run_uri(
     progress.set_stage("uri");
     let token_ranges = group_ranges(&store.token_uri_postings);
     progress.begin_phase("token_uri", Some(token_ranges.len() as u64));
-    let token_results: Vec<Result<Vec<UriScopeHit>, DedupError>> = token_ranges
+    let cancelled = AtomicBool::new(false);
+    let token_worker = token_ranges
         .par_iter()
-        .map(|range| {
-            progress.check_cancelled()?;
-            let hits = token_scope_hits(&store.token_uri_postings[range.clone()]);
+        .fold(TokenWorker::default, |mut worker, range| {
+            if cancelled.load(Ordering::Relaxed) {
+                return worker;
+            }
+            if progress.check_cancelled().is_err() {
+                cancelled.store(true, Ordering::Relaxed);
+                return worker;
+            }
+            for hit in token_scope_hits(&store.token_uri_postings[range.clone()]) {
+                worker.add(hit);
+            }
             progress.add_completed(1);
-            Ok(hits)
+            worker
         })
-        .collect();
-    let mut token_hits = TokenHits::new(store.nfts.len());
-    for result in token_results {
-        for hit in result? {
-            remember_token_hit(&mut token_hits, &hit);
-            apply_hit(store, acc, hit);
-        }
+        .reduce(TokenWorker::default, |mut left, right| {
+            left.merge(right);
+            left
+        });
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(DedupError::Interrupted);
     }
+    let mut token_hits = TokenHits::new(store.nfts.len());
+    for nft_id in token_worker.intra {
+        token_hits.intra.insert(nft_id);
+    }
+    for nft_id in token_worker.cross_summary {
+        token_hits.cross_summary.insert(nft_id);
+    }
+    token_hits.matrix = token_worker.matrix;
+    token_worker.uri.flush(store, acc);
 
     let image_ranges = group_ranges(&store.image_uri_postings);
     progress.begin_phase("image_uri", Some(image_ranges.len() as u64));
-    let image_results: Vec<Result<Vec<UriScopeHit>, DedupError>> = image_ranges
+    let image_acc = image_ranges
         .par_iter()
-        .map(|range| {
-            progress.check_cancelled()?;
-            let hits = image_scope_hits(&store.image_uri_postings[range.clone()], &token_hits);
+        .fold(LocalUriAccumulator::default, |mut local, range| {
+            if cancelled.load(Ordering::Relaxed) {
+                return local;
+            }
+            if progress.check_cancelled().is_err() {
+                cancelled.store(true, Ordering::Relaxed);
+                return local;
+            }
+            for hit in image_scope_hits(&store.image_uri_postings[range.clone()], &token_hits) {
+                local.add(&hit);
+            }
             progress.add_completed(1);
-            Ok(hits)
+            local
         })
-        .collect();
-    for result in image_results {
-        for hit in result? {
-            apply_hit(store, acc, hit);
-        }
+        .reduce(LocalUriAccumulator::default, |mut left, right| {
+            left.merge(right);
+            left
+        });
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(DedupError::Interrupted);
     }
+    image_acc.flush(store, acc);
     Ok(())
 }
 
@@ -270,38 +381,6 @@ fn scope_hit(
         kind,
         secondary_chain,
     }
-}
-
-fn remember_token_hit(token_hits: &mut TokenHits, hit: &UriScopeHit) {
-    match hit.kind {
-        ScopeKind::IntraChain => {
-            for &nft_id in &hit.nft_ids {
-                token_hits.intra.insert(nft_id);
-            }
-        }
-        ScopeKind::CrossChainSummary => {
-            for &nft_id in &hit.nft_ids {
-                token_hits.cross_summary.insert(nft_id);
-            }
-        }
-        ScopeKind::ChainMatrix => {
-            let secondary = hit.secondary_chain.expect("matrix hit has secondary chain");
-            token_hits
-                .matrix
-                .extend(hit.nft_ids.iter().map(|&nft_id| (nft_id, secondary)));
-        }
-    }
-}
-
-fn apply_hit(store: &EntityStore, acc: &mut SummaryAccumulator, hit: UriScopeHit) {
-    acc.mark_uri_scope_hit(
-        store,
-        hit.contract_id,
-        hit.uri_id,
-        hit.nft_ids.len() as u64,
-        hit.dimension,
-        (hit.kind, hit.secondary_chain),
-    );
 }
 
 #[cfg(test)]

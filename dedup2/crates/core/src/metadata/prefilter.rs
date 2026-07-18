@@ -2,6 +2,7 @@ use crate::entity::{ChainId, ContractId};
 use crate::error::DedupError;
 use crate::metadata::template::TemplateFingerprint;
 use crate::progress::ProgressObserver;
+use crate::radix::{sort_by_digits, u32_digit, u64_digit};
 use ahash::AHashMap;
 use rayon::prelude::*;
 use serde::Serialize;
@@ -26,6 +27,10 @@ impl CandidatePair {
 pub struct PrefilterStats {
     pub eligible_contracts: u64,
     pub low_information_contracts: u64,
+    pub lsh_band_records: u64,
+    pub raw_candidate_edges: u64,
+    pub aggregated_candidate_pairs: u64,
+    pub retained_candidate_pairs: u64,
     pub exact_bucket_pairs: u64,
     pub lsh_pairs: u64,
     pub quota_truncations: u64,
@@ -98,24 +103,58 @@ struct Evidence {
 
 #[derive(Clone, Copy)]
 struct BandRecord {
-    band: u32,
     key: u64,
-    row: usize,
+    band: u32,
+    row: u32,
 }
 
 #[derive(Clone, Copy)]
 struct DirectedEvidence {
-    source: ContractId,
     target: ContractId,
     target_chain: ChainId,
     evidence_index: u32,
 }
 
+struct FeatureCsr {
+    offsets: Vec<usize>,
+    values: Vec<u64>,
+}
+
+impl FeatureCsr {
+    fn from_rows(
+        eligible: Vec<(CompactRow, Vec<u64>)>,
+    ) -> Result<(Vec<CompactRow>, Self), DedupError> {
+        let total_features = eligible.iter().try_fold(0usize, |total, (_, features)| {
+            total.checked_add(features.len()).ok_or_else(|| {
+                DedupError::invalid(
+                    "metadata",
+                    "feature CSR size exceeds the resident index limit",
+                )
+            })
+        })?;
+        let mut rows = Vec::with_capacity(eligible.len());
+        let mut offsets = Vec::with_capacity(eligible.len() + 1);
+        let mut values = Vec::with_capacity(total_features);
+        offsets.push(0);
+        for (row, features) in eligible {
+            rows.push(row);
+            values.extend(features);
+            offsets.push(values.len());
+        }
+        Ok((rows, Self { offsets, values }))
+    }
+
+    fn row(&self, index: usize) -> &[u64] {
+        &self.values[self.offsets[index]..self.offsets[index + 1]]
+    }
+}
+
 pub fn generate_candidates(
-    fingerprints: &[(ContractId, ChainId, TemplateFingerprint)],
+    fingerprints: Vec<(ContractId, ChainId, TemplateFingerprint)>,
     config: &PrefilterConfig,
     progress: &dyn ProgressObserver,
 ) -> Result<(Vec<CandidatePair>, PrefilterStats), DedupError> {
+    let fingerprint_count = fingerprints.len();
     let mut stats = PrefilterStats {
         template_jaccard_threshold: config.template_jaccard_threshold,
         lsh_bands: config.lsh_bands,
@@ -124,33 +163,48 @@ pub fn generate_candidates(
         ..PrefilterStats::default()
     };
 
-    progress.begin_phase("prefilter_compact", Some(fingerprints.len() as u64));
+    progress.begin_phase("prefilter_compact", Some(fingerprint_count as u64));
     let eligible: Vec<(CompactRow, Vec<u64>)> = fingerprints
-        .par_iter()
+        .into_par_iter()
         .filter_map(|(contract_id, chain_id, fingerprint)| {
-            (!fingerprint.low_information).then(|| {
-                (
+            if fingerprint.low_information {
+                None
+            } else {
+                Some((
                     CompactRow {
-                        contract_id: *contract_id,
-                        chain_id: *chain_id,
+                        contract_id,
+                        chain_id,
                         digest: fingerprint.digest,
                     },
-                    hash_features(&fingerprint.features),
-                )
-            })
+                    fingerprint.feature_ids,
+                ))
+            }
         })
         .collect();
-    progress.add_completed(fingerprints.len() as u64);
+    debug_assert!(
+        eligible
+            .windows(2)
+            .all(|window| window[0].0.contract_id < window[1].0.contract_id),
+        "metadata fingerprints must preserve contract-ID order"
+    );
+    progress.add_completed(fingerprint_count as u64);
     stats.eligible_contracts = eligible.len() as u64;
-    stats.low_information_contracts = fingerprints.len().saturating_sub(eligible.len()) as u64;
+    stats.low_information_contracts = fingerprint_count.saturating_sub(eligible.len()) as u64;
     if eligible.len() < 2 {
         return Ok((Vec::new(), stats));
     }
-    let (rows, feature_ids): (Vec<_>, Vec<_>) = eligible.into_iter().unzip();
+    if eligible.len() >= u32::MAX as usize {
+        return Err(DedupError::invalid(
+            "metadata",
+            "eligible contract count exceeds the compact u32 row-index limit",
+        ));
+    }
+    let (rows, feature_ids) = FeatureCsr::from_rows(eligible)?;
 
     let band_size = config.lsh_rows_per_band.max(1) as usize;
     let bands = config.lsh_bands.max(1) as usize;
     let num_hashes = band_size.saturating_mul(bands);
+    stats.lsh_band_records = (rows.len() as u64).saturating_mul(bands as u64);
     progress.begin_phase("prefilter_minhash", Some(rows.len() as u64));
     let signature_len = rows
         .len()
@@ -159,8 +213,10 @@ pub fn generate_candidates(
     let mut signatures = vec![u32::MAX; signature_len];
     signatures
         .par_chunks_mut(num_hashes)
-        .zip(feature_ids.par_iter())
-        .for_each(|(signature, features)| fill_minhash_signature(features, signature));
+        .enumerate()
+        .for_each(|(row, signature)| {
+            fill_minhash_signature(feature_ids.row(row), signature);
+        });
     progress.add_completed(rows.len() as u64);
 
     let (mut edges, exact_pairs, bucket_truncations) =
@@ -178,13 +234,20 @@ pub fn generate_candidates(
     )?;
     edges.extend(lsh_edges);
     drop(signatures);
+    stats.raw_candidate_edges = edges.len() as u64;
 
     progress.begin_phase("prefilter_aggregate", Some(edges.len() as u64));
-    edges.par_sort_unstable_by(|left, right| {
-        left.left
-            .cmp(&right.left)
-            .then(left.right.cmp(&right.right))
-    });
+    sort_by_digits(
+        &mut edges,
+        |pass, edge| {
+            if pass < 3 {
+                u32_digit(edge.right, pass)
+            } else {
+                u32_digit(edge.left, pass - 3)
+            }
+        },
+        6,
+    );
     let mut evidence = Vec::new();
     let mut position = 0;
     while position < edges.len() {
@@ -212,27 +275,29 @@ pub fn generate_candidates(
     }
     progress.add_completed(edges.len() as u64);
     drop(edges);
+    stats.aggregated_candidate_pairs = evidence.len() as u64;
 
     let max_contract_id = rows
         .iter()
         .map(|row| row.contract_id as usize)
         .max()
         .unwrap_or(0);
-    let mut by_contract = vec![usize::MAX; max_contract_id + 1];
+    let mut by_contract = vec![u32::MAX; max_contract_id + 1];
     for (index, row) in rows.iter().enumerate() {
-        by_contract[row.contract_id as usize] = index;
+        by_contract[row.contract_id as usize] = index as u32;
     }
     progress.begin_phase("prefilter_shared", Some(evidence.len() as u64));
     evidence.par_iter_mut().for_each(|entry| {
-        let left = by_contract[entry.pair.left as usize];
-        let right = by_contract[entry.pair.right as usize];
-        entry.shared = shared_feature_count(&feature_ids[left], &feature_ids[right]);
+        let left = by_contract[entry.pair.left as usize] as usize;
+        let right = by_contract[entry.pair.right as usize] as usize;
+        entry.shared = shared_feature_count(feature_ids.row(left), feature_ids.row(right));
     });
     progress.add_completed(evidence.len() as u64);
 
     let total_evidence = evidence.len();
     let kept = reduce_quotas(&evidence, &rows, &by_contract, config, progress)?;
     stats.quota_truncations = total_evidence.saturating_sub(kept.len()) as u64;
+    stats.retained_candidate_pairs = kept.len() as u64;
     Ok((kept, stats))
 }
 
@@ -242,46 +307,57 @@ fn exact_digest_edges(
     progress: &dyn ProgressObserver,
 ) -> Result<(Vec<RawEdge>, u64, u64), DedupError> {
     progress.begin_phase("prefilter_digest", Some(rows.len() as u64));
-    let mut order: Vec<usize> = (0..rows.len()).collect();
+    let mut order: Vec<u32> = (0..rows.len() as u32).collect();
     order.par_sort_unstable_by(|&left, &right| {
-        rows[left]
+        rows[left as usize]
             .digest
-            .cmp(&rows[right].digest)
-            .then(rows[left].contract_id.cmp(&rows[right].contract_id))
+            .cmp(&rows[right as usize].digest)
+            .then(
+                rows[left as usize]
+                    .contract_id
+                    .cmp(&rows[right as usize].contract_id),
+            )
     });
-    let ranges = equal_ranges(&order, |left, right| {
-        rows[*left].digest == rows[*right].digest
+    let ranges = duplicate_ranges(&order, |left, right| {
+        rows[*left as usize].digest == rows[*right as usize].digest
     });
     let chunks: Vec<(Vec<RawEdge>, u64)> = ranges
-        .par_iter()
-        .map(|range| {
-            let members = &order[range.clone()];
-            if members.len() < 2 {
-                return (Vec::new(), 0);
-            }
-            let possible = members
-                .len()
-                .saturating_mul(members.len().saturating_sub(1))
-                / 2;
-            let mut edges = Vec::with_capacity(possible.min(pair_cap));
-            'outer: for left_pos in 0..members.len() {
-                for right_pos in (left_pos + 1)..members.len() {
-                    if edges.len() >= pair_cap {
-                        break 'outer;
-                    }
-                    let left = rows[members[left_pos]].contract_id;
-                    let right = rows[members[right_pos]].contract_id;
-                    if let Some(pair) = CandidatePair::new(left, right) {
-                        edges.push(RawEdge {
-                            left: pair.left,
-                            right: pair.right,
-                            exact: true,
-                            bands: 0,
-                        });
+        .par_chunks(coarse_block_len(ranges.len()))
+        .map(|block| {
+            let capacity = block.iter().fold(0usize, |total, range| {
+                let members = range.len();
+                let possible = members.saturating_mul(members.saturating_sub(1)) / 2;
+                total.saturating_add(possible.min(pair_cap))
+            });
+            let mut edges = Vec::with_capacity(capacity);
+            let mut truncations = 0;
+            for range in block {
+                let members = &order[range.clone()];
+                let possible = members
+                    .len()
+                    .saturating_mul(members.len().saturating_sub(1))
+                    / 2;
+                truncations += u64::from(possible > pair_cap);
+                let edge_limit = edges.len().saturating_add(pair_cap);
+                'outer: for left_pos in 0..members.len() {
+                    for right_pos in (left_pos + 1)..members.len() {
+                        if edges.len() >= edge_limit {
+                            break 'outer;
+                        }
+                        let left = rows[members[left_pos] as usize].contract_id;
+                        let right = rows[members[right_pos] as usize].contract_id;
+                        if let Some(pair) = CandidatePair::new(left, right) {
+                            edges.push(RawEdge {
+                                left: pair.left,
+                                right: pair.right,
+                                exact: true,
+                                bands: 0,
+                            });
+                        }
                     }
                 }
             }
-            (edges, u64::from(possible > pair_cap))
+            (edges, truncations)
         })
         .collect();
     progress.add_completed(rows.len() as u64);
@@ -303,48 +379,49 @@ fn lsh_edges(
     neighbors: usize,
     progress: &dyn ProgressObserver,
 ) -> Result<Vec<RawEdge>, DedupError> {
-    progress.begin_phase(
-        "prefilter_lsh_index",
-        Some((rows.len().saturating_mul(bands)) as u64),
-    );
+    let record_count = rows
+        .len()
+        .checked_mul(bands)
+        .ok_or_else(|| DedupError::invalid("metadata", "LSH band record count overflow"))?;
+    progress.begin_phase("prefilter_lsh_index", Some(record_count as u64));
     let signature_width = bands.saturating_mul(band_size);
-    let mut records: Vec<BandRecord> = (0..rows.len())
-        .into_par_iter()
-        .flat_map_iter(|row| {
+    let mut records = vec![
+        BandRecord {
+            key: 0,
+            band: 0,
+            row: 0,
+        };
+        record_count
+    ];
+    records
+        .par_chunks_mut(bands)
+        .enumerate()
+        .for_each(|(row, records)| {
             let signature = &signatures[row * signature_width..(row + 1) * signature_width];
-            (0..bands).map(move |band| {
+            for (band, record) in records.iter_mut().enumerate() {
                 let start = band * band_size;
-                BandRecord {
-                    band: band as u32,
+                *record = BandRecord {
                     key: band_hash(&signature[start..start + band_size]),
-                    row,
-                }
-            })
-        })
-        .collect();
+                    band: band as u32,
+                    row: row as u32,
+                };
+            }
+        });
     progress.add_completed(records.len() as u64);
-    records.par_sort_unstable_by(|left, right| {
-        left.band
-            .cmp(&right.band)
-            .then(left.key.cmp(&right.key))
-            .then(rows[left.row].contract_id.cmp(&rows[right.row].contract_id))
-    });
-    let ranges = equal_ranges(&records, |left, right| {
+    sort_band_records(&mut records);
+    let ranges = duplicate_ranges(&records, |left, right| {
         left.band == right.band && left.key == right.key
     });
     progress.begin_phase("prefilter_lsh_emit", Some(ranges.len() as u64));
     let chunks: Vec<Vec<RawEdge>> = ranges
-        .par_iter()
-        .map(|range| {
-            let members = records[range.clone()]
-                .iter()
-                .map(|record| record.row)
-                .collect::<Vec<_>>();
+        .par_chunks(coarse_block_len(ranges.len()))
+        .map(|block| {
             let mut edges = Vec::new();
-            if members.len() >= 2 {
-                emit_band_edges(&members, rows, neighbors, &mut edges);
+            for range in block {
+                emit_band_edges(&records[range.clone()], rows, neighbors, &mut edges);
             }
-            progress.add_completed(1);
+            compact_lsh_edges(&mut edges);
+            progress.add_completed(block.len() as u64);
             edges
         })
         .collect();
@@ -352,10 +429,24 @@ fn lsh_edges(
     Ok(chunks.into_iter().flatten().collect())
 }
 
+fn sort_band_records(records: &mut Vec<BandRecord>) {
+    // Records are filled row-major, with rows ordered by contract ID. The
+    // stable radix passes preserve that order inside an equal (band, key)
+    // bucket, so a separate contract-ID key is unnecessary.
+    sort_by_digits(
+        records,
+        |pass, record| match pass {
+            0..=5 => u64_digit(record.key, pass),
+            _ => u32_digit(record.band, pass - 6),
+        },
+        9,
+    );
+}
+
 fn reduce_quotas(
     evidence: &[Evidence],
     rows: &[CompactRow],
-    by_contract: &[usize],
+    by_contract: &[u32],
     config: &PrefilterConfig,
     progress: &dyn ProgressObserver,
 ) -> Result<Vec<CandidatePair>, DedupError> {
@@ -363,7 +454,22 @@ fn reduce_quotas(
         "prefilter_reduce",
         Some((evidence.len().saturating_mul(2)) as u64),
     );
-    let mut directed = Vec::with_capacity(evidence.len().saturating_mul(2));
+    let source_count = by_contract.len();
+    let mut directed_offsets = vec![0usize; source_count + 1];
+    for item in evidence {
+        directed_offsets[item.pair.left as usize + 1] += 1;
+        directed_offsets[item.pair.right as usize + 1] += 1;
+    }
+    for source in 0..source_count {
+        directed_offsets[source + 1] += directed_offsets[source];
+    }
+    let placeholder = DirectedEvidence {
+        target: 0,
+        target_chain: 0,
+        evidence_index: 0,
+    };
+    let mut directed = vec![placeholder; evidence.len().saturating_mul(2)];
+    let mut next = directed_offsets[..source_count].to_vec();
     for (evidence_index, item) in evidence.iter().enumerate() {
         let evidence_index = u32::try_from(evidence_index).map_err(|_| {
             DedupError::invalid(
@@ -371,60 +477,113 @@ fn reduce_quotas(
                 "candidate evidence count exceeds the u32 resident-index limit",
             )
         })?;
-        let left_chain = rows[by_contract[item.pair.left as usize]].chain_id;
-        let right_chain = rows[by_contract[item.pair.right as usize]].chain_id;
-        directed.push(DirectedEvidence {
-            source: item.pair.left,
+        let left_chain = rows[by_contract[item.pair.left as usize] as usize].chain_id;
+        let right_chain = rows[by_contract[item.pair.right as usize] as usize].chain_id;
+        let left_slot = next[item.pair.left as usize];
+        directed[left_slot] = DirectedEvidence {
             target: item.pair.right,
             target_chain: right_chain,
             evidence_index,
-        });
-        directed.push(DirectedEvidence {
-            source: item.pair.right,
+        };
+        next[item.pair.left as usize] += 1;
+        let right_slot = next[item.pair.right as usize];
+        directed[right_slot] = DirectedEvidence {
             target: item.pair.left,
             target_chain: left_chain,
             evidence_index,
-        });
+        };
+        next[item.pair.right as usize] += 1;
     }
-    directed.par_sort_unstable_by(|left, right| {
-        let left_evidence = evidence[left.evidence_index as usize];
-        let right_evidence = evidence[right.evidence_index as usize];
-        left.source
-            .cmp(&right.source)
-            .then(right_evidence.exact.cmp(&left_evidence.exact))
-            .then(right_evidence.shared.cmp(&left_evidence.shared))
-            .then(right_evidence.bands.cmp(&left_evidence.bands))
-            .then(left.target.cmp(&right.target))
-    });
-    let ranges = equal_ranges(&directed, |left, right| left.source == right.source);
-    let chunks: Vec<Vec<CandidatePair>> = ranges
-        .par_iter()
-        .map(|range| {
-            let mut per_chain: AHashMap<ChainId, usize> = AHashMap::new();
+
+    let block_count = rayon::current_num_threads()
+        .saturating_mul(4)
+        .min(source_count)
+        .max(1);
+    let sources_per_block = source_count.div_ceil(block_count);
+    let mut source_blocks = Vec::with_capacity(block_count);
+    let mut rest = directed.as_mut_slice();
+    let mut edge_base = 0usize;
+    for source_start in (0..source_count).step_by(sources_per_block) {
+        let source_end = (source_start + sources_per_block).min(source_count);
+        let edge_end = directed_offsets[source_end];
+        let (items, next_rest) = rest.split_at_mut(edge_end - edge_base);
+        source_blocks.push((source_start, source_end, edge_base, items));
+        rest = next_rest;
+        edge_base = edge_end;
+    }
+    let chunks: Vec<Vec<CandidatePair>> = source_blocks
+        .into_par_iter()
+        .map(|(source_start, source_end, edge_base, block)| {
+            let compare = |left: &DirectedEvidence, right: &DirectedEvidence| {
+                let left_evidence = evidence[left.evidence_index as usize];
+                let right_evidence = evidence[right.evidence_index as usize];
+                right_evidence
+                    .exact
+                    .cmp(&left_evidence.exact)
+                    .then(right_evidence.shared.cmp(&left_evidence.shared))
+                    .then(right_evidence.bands.cmp(&left_evidence.bands))
+                    .then(left.target.cmp(&right.target))
+            };
             let mut kept = Vec::new();
-            for item in &directed[range.clone()] {
-                if kept.len() >= config.max_outgoing_candidates_per_contract {
-                    break;
-                }
-                let chain_count = per_chain.entry(item.target_chain).or_default();
-                if *chain_count >= config.max_candidates_per_target_chain {
+            for source in source_start..source_end {
+                let local_start = directed_offsets[source] - edge_base;
+                let local_end = directed_offsets[source + 1] - edge_base;
+                let items = &mut block[local_start..local_end];
+                if items.is_empty() {
                     continue;
                 }
-                *chain_count += 1;
-                kept.push(evidence[item.evidence_index as usize].pair);
+                if items.len() >= 64 * 1024 {
+                    items.par_sort_unstable_by(compare);
+                } else {
+                    items.sort_unstable_by(compare);
+                }
+                let mut per_chain: Vec<(ChainId, usize)> = Vec::new();
+                let kept_start = kept.len();
+                for item in &*items {
+                    if kept.len() - kept_start >= config.max_outgoing_candidates_per_contract {
+                        break;
+                    }
+                    let chain_position = per_chain
+                        .iter()
+                        .position(|&(chain, _)| chain == item.target_chain);
+                    let chain_count = if let Some(position) = chain_position {
+                        &mut per_chain[position].1
+                    } else {
+                        per_chain.push((item.target_chain, 0));
+                        &mut per_chain.last_mut().expect("chain was inserted").1
+                    };
+                    if *chain_count >= config.max_candidates_per_target_chain {
+                        continue;
+                    }
+                    *chain_count += 1;
+                    kept.push(evidence[item.evidence_index as usize].pair);
+                }
             }
-            progress.add_completed(range.len() as u64);
+            progress.add_completed(block.len() as u64);
             kept
         })
         .collect();
     progress.check_cancelled()?;
     let mut kept: Vec<CandidatePair> = chunks.into_iter().flatten().collect();
-    kept.par_sort_unstable();
+    sort_by_digits(
+        &mut kept,
+        |pass, pair| {
+            if pass < 3 {
+                u32_digit(pair.right, pass)
+            } else {
+                u32_digit(pair.left, pass - 3)
+            }
+        },
+        6,
+    );
     kept.dedup();
     Ok(kept)
 }
 
-fn equal_ranges<T>(values: &[T], equal: impl Fn(&T, &T) -> bool) -> Vec<std::ops::Range<usize>> {
+fn duplicate_ranges<T>(
+    values: &[T],
+    equal: impl Fn(&T, &T) -> bool,
+) -> Vec<std::ops::Range<usize>> {
     let mut ranges = Vec::new();
     let mut start = 0;
     while start < values.len() {
@@ -432,24 +591,32 @@ fn equal_ranges<T>(values: &[T], equal: impl Fn(&T, &T) -> bool) -> Vec<std::ops
         while end < values.len() && equal(&values[start], &values[end]) {
             end += 1;
         }
-        ranges.push(start..end);
+        if end - start >= 2 {
+            ranges.push(start..end);
+        }
         start = end;
     }
     ranges
 }
 
+fn coarse_block_len(item_count: usize) -> usize {
+    let blocks = rayon::current_num_threads().saturating_mul(4).max(1);
+    item_count.div_ceil(blocks).max(1)
+}
+
 fn emit_band_edges(
-    members: &[usize],
+    members: &[BandRecord],
     rows: &[CompactRow],
     neighbors: usize,
     edges: &mut Vec<RawEdge>,
 ) {
     let mut by_chain: AHashMap<ChainId, Vec<ContractId>> = AHashMap::new();
-    for &index in members {
+    for member in members {
+        let row = rows[member.row as usize];
         by_chain
-            .entry(rows[index].chain_id)
+            .entry(row.chain_id)
             .or_default()
-            .push(rows[index].contract_id);
+            .push(row.contract_id);
     }
     for contracts in by_chain.values_mut() {
         contracts.sort_unstable();
@@ -476,6 +643,23 @@ fn emit_band_edges(
             );
         }
     }
+}
+
+fn compact_lsh_edges(edges: &mut Vec<RawEdge>) {
+    if edges.len() < 2 {
+        return;
+    }
+    edges.sort_unstable_by_key(|edge| (edge.left, edge.right));
+    let mut write = 0;
+    for read in 1..edges.len() {
+        if edges[write].left == edges[read].left && edges[write].right == edges[read].right {
+            edges[write].bands = edges[write].bands.saturating_add(edges[read].bands);
+        } else {
+            write += 1;
+            edges[write] = edges[read];
+        }
+    }
+    edges.truncate(write + 1);
 }
 
 fn emit_inter_neighbors(
@@ -505,25 +689,6 @@ fn push_lsh_edge(left: ContractId, right: ContractId, edges: &mut Vec<RawEdge>) 
             bands: 1,
         });
     }
-}
-
-fn hash_features(features: &[String]) -> Vec<u64> {
-    let mut ids: Vec<u64> = features
-        .iter()
-        .map(|feature| hash_bytes(feature.as_bytes()))
-        .collect();
-    ids.sort_unstable();
-    ids.dedup();
-    ids
-}
-
-fn hash_bytes(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for &byte in bytes {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
 }
 
 fn band_hash(parts: &[u32]) -> u64 {
@@ -573,7 +738,7 @@ mod tests {
     fn fingerprint(digest_byte: u8, low_information: bool) -> TemplateFingerprint {
         TemplateFingerprint {
             digest: [digest_byte; 32],
-            features: vec!["v:collection=x".to_owned(), "s:name:string".to_owned()],
+            feature_ids: vec![1, 2],
             low_information,
         }
     }
@@ -591,9 +756,120 @@ mod tests {
     }
 
     #[test]
+    fn compact_metadata_indices_keep_expected_layout() {
+        assert_eq!(std::mem::size_of::<BandRecord>(), 16);
+        assert_eq!(std::mem::size_of::<u32>(), 4);
+    }
+
+    #[test]
+    fn stable_band_sort_preserves_row_order_inside_bucket() {
+        let mut records = vec![
+            BandRecord {
+                key: 9,
+                band: 1,
+                row: 0,
+            },
+            BandRecord {
+                key: 4,
+                band: 0,
+                row: 0,
+            },
+            BandRecord {
+                key: 9,
+                band: 1,
+                row: 1,
+            },
+            BandRecord {
+                key: 4,
+                band: 0,
+                row: 1,
+            },
+            BandRecord {
+                key: 9,
+                band: 1,
+                row: 2,
+            },
+            BandRecord {
+                key: 4,
+                band: 0,
+                row: 2,
+            },
+        ];
+        sort_band_records(&mut records);
+        assert_eq!(
+            records.iter().map(|record| record.row).collect::<Vec<_>>(),
+            vec![0, 1, 2, 0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn nine_pass_band_sort_matches_full_comparison_key() {
+        let mut state = 0x9e3779b97f4a7c15_u64;
+        let mut records = Vec::new();
+        for row in 0..2_000_u32 {
+            for band in 0..4_u32 {
+                state ^= state << 7;
+                state ^= state >> 9;
+                state ^= state << 8;
+                records.push(BandRecord {
+                    key: state % 97,
+                    band,
+                    row,
+                });
+            }
+        }
+        let mut expected = records
+            .iter()
+            .map(|record| (record.band, record.key, record.row))
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        sort_band_records(&mut records);
+        let actual = records
+            .iter()
+            .map(|record| (record.band, record.key, record.row))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn duplicate_ranges_discard_singletons() {
+        let values = [1, 2, 2, 3, 4, 4, 4, 5];
+        assert_eq!(
+            duplicate_ranges(&values, |left, right| left == right),
+            vec![1..3, 4..7]
+        );
+    }
+
+    #[test]
+    fn feature_csr_preserves_sorted_feature_rows() {
+        let eligible = vec![
+            (
+                CompactRow {
+                    contract_id: 0,
+                    chain_id: 0,
+                    digest: [0; 32],
+                },
+                vec![1, 3, 8],
+            ),
+            (
+                CompactRow {
+                    contract_id: 1,
+                    chain_id: 1,
+                    digest: [1; 32],
+                },
+                vec![2, 5],
+            ),
+        ];
+        let (rows, features) = FeatureCsr::from_rows(eligible).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(features.row(0), &[1, 3, 8]);
+        assert_eq!(features.row(1), &[2, 5]);
+    }
+
+    #[test]
     fn low_information_contract_is_excluded() {
         let fingerprints = vec![(0, 0, fingerprint(1, true)), (1, 1, fingerprint(1, false))];
-        let (pairs, stats) = generate_candidates(&fingerprints, &config(), &NoopProgress).unwrap();
+        let (pairs, stats) = generate_candidates(fingerprints, &config(), &NoopProgress).unwrap();
         assert!(pairs.is_empty());
         assert_eq!(stats.low_information_contracts, 1);
     }
@@ -605,9 +881,35 @@ mod tests {
             .collect::<Vec<_>>();
         let mut config = config();
         config.bucket_pair_cap = 2;
-        let (_, stats) = generate_candidates(&fingerprints, &config, &NoopProgress).unwrap();
+        let (_, stats) = generate_candidates(fingerprints, &config, &NoopProgress).unwrap();
         assert_eq!(stats.exact_bucket_pairs, 2);
         assert_eq!(stats.bucket_cap_truncations, 1);
+    }
+
+    #[test]
+    fn exact_bucket_cap_resets_for_each_range_in_a_coarse_block() {
+        let fingerprints = (0..6)
+            .map(|id| {
+                let digest = if id < 3 { 1 } else { 2 };
+                (id, (id % 2) as ChainId, fingerprint(digest, false))
+            })
+            .collect::<Vec<_>>();
+        let mut config = config();
+        config.bucket_pair_cap = 1;
+        let (_, stats) = generate_candidates(fingerprints, &config, &NoopProgress).unwrap();
+        assert_eq!(stats.exact_bucket_pairs, 2);
+        assert_eq!(stats.bucket_cap_truncations, 2);
+    }
+
+    #[test]
+    fn lsh_duplicate_buckets_emit_candidates_without_exact_digest() {
+        let fingerprints = (0..4)
+            .map(|id| (id, (id % 2) as ChainId, fingerprint(id as u8, false)))
+            .collect::<Vec<_>>();
+        let (pairs, stats) = generate_candidates(fingerprints, &config(), &NoopProgress).unwrap();
+        assert!(!pairs.is_empty());
+        assert_eq!(stats.exact_bucket_pairs, 0);
+        assert!(stats.lsh_pairs > 0);
     }
 
     #[test]
@@ -618,7 +920,7 @@ mod tests {
         let mut config = config();
         config.max_outgoing_candidates_per_contract = 1;
         config.max_candidates_per_target_chain = 1;
-        let (pairs, stats) = generate_candidates(&fingerprints, &config, &NoopProgress).unwrap();
+        let (pairs, stats) = generate_candidates(fingerprints, &config, &NoopProgress).unwrap();
         assert!(!pairs.is_empty());
         assert!(stats.quota_truncations > 0);
     }

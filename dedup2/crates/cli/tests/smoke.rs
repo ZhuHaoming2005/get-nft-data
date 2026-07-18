@@ -94,7 +94,61 @@ fn all_writes_summary_files() {
         .status()
         .unwrap();
     assert!(status.success());
-    assert!(out.join("summary.csv").is_file());
-    assert!(out.join("chain_matrix.csv").is_file());
-    assert!(out.join("run_manifest.json").is_file());
+    for name in ["summary.csv", "chain_matrix.csv"] {
+        let path = out.join(name);
+        assert!(path.is_file());
+        let mut reader = csv::Reader::from_path(path).unwrap();
+        let headers = reader.headers().unwrap().clone();
+        let contract_count = headers
+            .iter()
+            .position(|header| header == "duplicate_contract_count")
+            .unwrap();
+        let contract_ratio = headers
+            .iter()
+            .position(|header| header == "duplicate_contract_ratio")
+            .unwrap();
+        let nft_count = headers
+            .iter()
+            .position(|header| header == "duplicate_nft_count")
+            .unwrap();
+        let nft_ratio = headers
+            .iter()
+            .position(|header| header == "duplicate_nft_ratio")
+            .unwrap();
+        let total_contracts = headers
+            .iter()
+            .position(|header| header == "total_contracts")
+            .unwrap();
+        let total_nfts = headers
+            .iter()
+            .position(|header| header == "total_nfts")
+            .unwrap();
+        let mut row_count = 0;
+        for row in reader.records() {
+            let row = row.unwrap();
+            let contracts = row[contract_count].parse::<u64>().unwrap();
+            let contract_total = row[total_contracts].parse::<u64>().unwrap();
+            let actual_contract_ratio = row[contract_ratio].parse::<f64>().unwrap();
+            let nfts = row[nft_count].parse::<u64>().unwrap();
+            let nft_total = row[total_nfts].parse::<u64>().unwrap();
+            let actual_nft_ratio = row[nft_ratio].parse::<f64>().unwrap();
+            let expected_contract_ratio = contracts as f64 / contract_total as f64;
+            let expected_nft_ratio = nfts as f64 / nft_total as f64;
+            assert!((actual_contract_ratio - expected_contract_ratio).abs() < f64::EPSILON);
+            assert!((actual_nft_ratio - expected_nft_ratio).abs() < f64::EPSILON);
+            row_count += 1;
+        }
+        assert!(row_count > 0);
+    }
+    let manifest_path = out.join("run_manifest.json");
+    assert!(manifest_path.is_file());
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(manifest_path).unwrap()).unwrap();
+    assert!(
+        manifest["phase_timings"]
+            .as_array()
+            .is_some_and(|timings| !timings.is_empty())
+    );
+    assert!(manifest["metadata_prefilter"]["lsh_band_records"].is_u64());
+    assert!(manifest["metadata_prefilter"]["retained_candidate_pairs"].is_u64());
 }

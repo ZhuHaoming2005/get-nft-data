@@ -47,6 +47,14 @@ struct Meta {
     last_completed: u64,
     last_tick: Instant,
     eta: EwmaEta,
+    phase_history: Vec<PhaseTimingSnapshot>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PhaseTimingSnapshot {
+    pub stage: String,
+    pub phase: String,
+    pub elapsed: Duration,
 }
 
 #[derive(Serialize)]
@@ -88,6 +96,7 @@ impl ProgressReporter {
                 last_completed: 0,
                 last_tick: now,
                 eta: EwmaEta::new(EWMA_ALPHA),
+                phase_history: Vec::new(),
             }),
             completed: AtomicU64::new(0),
             stopping: AtomicBool::new(false),
@@ -124,6 +133,19 @@ impl ProgressReporter {
     fn emit_now(&self) {
         emit_snapshot(&self.shared);
     }
+
+    pub fn phase_timings(&self) -> Vec<PhaseTimingSnapshot> {
+        let meta = self.shared.meta.lock().expect("progress lock");
+        let mut timings = meta.phase_history.clone();
+        if !meta.phase.is_empty() {
+            timings.push(PhaseTimingSnapshot {
+                stage: meta.stage.clone(),
+                phase: meta.phase.clone(),
+                elapsed: meta.phase_started.elapsed(),
+            });
+        }
+        timings
+    }
 }
 
 #[derive(Clone)]
@@ -141,6 +163,7 @@ impl ProgressObserver for ProgressReporter {
     fn set_stage(&self, stage: &str) {
         let mut meta = self.shared.meta.lock().expect("progress lock");
         let now = Instant::now();
+        record_current_phase(&mut meta, now);
         meta.stage = stage.to_owned();
         meta.phase = String::new();
         meta.total = None;
@@ -155,6 +178,7 @@ impl ProgressObserver for ProgressReporter {
     fn begin_phase(&self, phase: &str, total: Option<u64>) {
         let mut meta = self.shared.meta.lock().expect("progress lock");
         let now = Instant::now();
+        record_current_phase(&mut meta, now);
         meta.phase = phase.to_owned();
         meta.total = total;
         meta.phase_started = now;
@@ -179,6 +203,17 @@ impl ProgressObserver for ProgressReporter {
             Ok(())
         }
     }
+}
+
+fn record_current_phase(meta: &mut Meta, now: Instant) {
+    if meta.phase.is_empty() {
+        return;
+    }
+    meta.phase_history.push(PhaseTimingSnapshot {
+        stage: meta.stage.clone(),
+        phase: meta.phase.clone(),
+        elapsed: now.duration_since(meta.phase_started),
+    });
 }
 
 fn reporter_loop(shared: Arc<Shared>) {

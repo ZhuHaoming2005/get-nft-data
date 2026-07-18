@@ -7,14 +7,18 @@ mod candidate_bounds;
 use crate::entity::{ChainId, ContractId, Dimension, EntityStore};
 use crate::error::DedupError;
 use crate::progress::ProgressObserver;
+use crate::radix::{sort_u32_pairs, sort_u64};
 use crate::stats::SummaryAccumulator;
 use ahash::{AHashMap, AHashSet};
 use candidate_bounds::CandidateBounds;
 use rapidfuzz::distance::jaro_winkler::{Args, BatchComparator};
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 const PROGRESS_BATCH: u64 = 4096;
+const SCORE_PROGRESS_BATCH: u64 = 64;
+const SCORE_SCHEDULING_CHUNK: usize = 8;
+const DENSE_SEEN_BUDGET_BYTES: usize = 4 * 1024 * 1024 * 1024;
 type NameAtomMap = AHashMap<(String, ChainId), NameAtom>;
 type NameHits = AHashSet<(ContractId, ChainId)>;
 
@@ -69,8 +73,17 @@ impl ResidentNameIndex {
         progress.add_completed(names.len() as u64);
         progress.check_cancelled()?;
 
-        let mut unique_tokens: Vec<u64> = raw_documents.par_iter().flatten().copied().collect();
-        unique_tokens.par_sort_unstable();
+        let mut document_offsets = Vec::with_capacity(raw_documents.len() + 1);
+        document_offsets.push(0);
+        let token_occurrences = raw_documents.iter().map(Vec::len).sum();
+        let mut raw_tokens = Vec::with_capacity(token_occurrences);
+        for document in raw_documents {
+            raw_tokens.extend(document);
+            document_offsets.push(raw_tokens.len());
+        }
+
+        let mut unique_tokens = raw_tokens.clone();
+        sort_u64(&mut unique_tokens);
         unique_tokens.dedup();
         if unique_tokens.len() > u32::MAX as usize {
             return Err(DedupError::invalid(
@@ -83,30 +96,28 @@ impl ResidentNameIndex {
             .enumerate()
             .map(|(index, token)| (token, index as u32))
             .collect();
-        let documents: Vec<Vec<u32>> = raw_documents
+        let documents: Vec<u32> = raw_tokens
             .into_par_iter()
-            .map(|document| {
-                document
-                    .into_iter()
-                    .map(|token| token_ids[&token])
-                    .collect()
-            })
+            .map(|token| token_ids[&token])
             .collect();
         let token_count = token_ids.len();
         drop(token_ids);
 
-        progress.begin_phase("fill_name_postings", Some(documents.len() as u64));
-        let mut posting_pairs: Vec<(u32, u32)> = documents
-            .par_iter()
-            .enumerate()
-            .flat_map_iter(|(name_id, document)| {
+        progress.begin_phase("fill_name_postings", Some(names.len() as u64));
+        let mut posting_pairs: Vec<(u32, u32)> = (0..names.len())
+            .into_par_iter()
+            .flat_map_iter(|name_id| {
                 let name_id = name_id as u32;
-                document.iter().map(move |&token_id| (token_id, name_id))
+                let start = document_offsets[name_id as usize];
+                let end = document_offsets[name_id as usize + 1];
+                documents[start..end]
+                    .iter()
+                    .map(move |&token_id| (token_id, name_id))
             })
             .collect();
-        progress.add_completed(documents.len() as u64);
+        progress.add_completed(names.len() as u64);
         progress.begin_phase("sort_name_postings", Some(posting_pairs.len() as u64));
-        posting_pairs.par_sort_unstable();
+        sort_u32_pairs(&mut posting_pairs);
         progress.add_completed(posting_pairs.len() as u64);
         progress.check_cancelled()?;
 
@@ -125,10 +136,22 @@ impl ResidentNameIndex {
             .collect();
 
         progress.begin_phase("build_name_prefix", Some(names.len() as u64));
-        let prepared_documents: Vec<(Vec<u32>, Vec<u32>)> = documents
+        let mut sorted_tokens = documents;
+        let mut prefix_tokens = sorted_tokens.clone();
+        let mut document_slices = Vec::with_capacity(names.len());
+        let mut sorted_rest = sorted_tokens.as_mut_slice();
+        let mut prefix_rest = prefix_tokens.as_mut_slice();
+        for offsets in document_offsets.windows(2) {
+            let len = offsets[1] - offsets[0];
+            let (sorted, next_sorted) = sorted_rest.split_at_mut(len);
+            let (prefix, next_prefix) = prefix_rest.split_at_mut(len);
+            document_slices.push((sorted, prefix));
+            sorted_rest = next_sorted;
+            prefix_rest = next_prefix;
+        }
+        document_slices
             .into_par_iter()
-            .map(|mut sorted| {
-                let mut prefix = sorted.clone();
+            .for_each(|(sorted, prefix)| {
                 prefix.sort_unstable_by(|&a, &b| {
                     let a = a as usize;
                     let b = b as usize;
@@ -137,25 +160,9 @@ impl ResidentNameIndex {
                     a_len.cmp(&b_len).then_with(|| a.cmp(&b))
                 });
                 sorted.sort_unstable();
-                (sorted, prefix)
-            })
-            .collect();
+            });
         progress.add_completed(names.len() as u64);
         progress.check_cancelled()?;
-
-        let mut document_offsets = Vec::with_capacity(names.len() + 1);
-        document_offsets.push(0);
-        let token_occurrences = prepared_documents
-            .iter()
-            .map(|(sorted, _)| sorted.len())
-            .sum();
-        let mut sorted_tokens = Vec::with_capacity(token_occurrences);
-        let mut prefix_tokens = Vec::with_capacity(token_occurrences);
-        for (sorted, prefix) in prepared_documents {
-            sorted_tokens.extend(sorted);
-            prefix_tokens.extend(prefix);
-            document_offsets.push(sorted_tokens.len());
-        }
 
         Ok(Self {
             document_offsets,
@@ -356,120 +363,184 @@ fn score_resident_index(
     let score_cutoff = (threshold_pct / 100.0).clamp(0.0, 1.0);
     let args = Args::default().score_cutoff(score_cutoff);
 
-    struct Worker {
-        candidates: Vec<u32>,
-        seen: AHashSet<u32>,
-        hits: AHashSet<(ContractId, ChainId)>,
-        pending: u64,
+    enum CandidateSeen {
+        Dense {
+            generations: Vec<u16>,
+            generation: u16,
+        },
+        Sparse(AHashSet<u32>),
     }
 
-    let worker = (0..left_count)
-        .into_par_iter()
-        .with_min_len(64)
-        .fold(
-            || Worker {
-                candidates: Vec::new(),
-                seen: AHashSet::new(),
-                hits: AHashSet::new(),
-                pending: 0,
-            },
-            |mut worker, left| {
-                if cancelled.load(Ordering::Relaxed) != 0 {
-                    return worker;
+    impl CandidateSeen {
+        fn new(name_count: usize, dense: bool) -> Self {
+            if dense {
+                Self::Dense {
+                    generations: vec![0; name_count],
+                    generation: 0,
                 }
-                worker.candidates.clear();
-                worker.seen.clear();
-                let right_start = left + 1;
-                let right_end = right_ends[left];
-                if right_start < right_end {
-                    let right_min_len = names[right_start].characters.len();
-                    let minimum_overlap = CandidateBounds::minimum_multiset_overlap(
-                        names[left].characters.len(),
-                        right_min_len,
-                        threshold_pct,
-                    );
+            } else {
+                Self::Sparse(AHashSet::new())
+            }
+        }
 
-                    if minimum_overlap == 0 {
-                        worker
-                            .candidates
-                            .extend((right_start..right_end).map(|right| right as u32));
+        fn begin_name(&mut self) {
+            match self {
+                Self::Dense {
+                    generations,
+                    generation,
+                } => {
+                    *generation = generation.wrapping_add(1);
+                    if *generation == 0 {
+                        generations.fill(0);
+                        *generation = 1;
+                    }
+                }
+                Self::Sparse(seen) => seen.clear(),
+            }
+        }
+
+        fn insert(&mut self, candidate: u32) -> bool {
+            match self {
+                Self::Dense {
+                    generations,
+                    generation,
+                } => {
+                    let slot = &mut generations[candidate as usize];
+                    if *slot == *generation {
+                        false
                     } else {
-                        let prefix = index.prefix(left);
-                        let prefix_len = prefix
-                            .len()
-                            .saturating_sub(minimum_overlap)
-                            .saturating_add(1)
-                            .min(prefix.len());
-                        let compact_start = right_start as u32;
-                        let compact_end = right_end as u32;
-                        for &token_id in &prefix[..prefix_len] {
-                            let posting = index.posting(token_id);
-                            let lo = posting.partition_point(|&a| a < compact_start);
-                            let hi = posting.partition_point(|&a| a < compact_end);
-                            for &candidate in &posting[lo..hi] {
-                                if worker.seen.insert(candidate) {
-                                    worker.candidates.push(candidate);
+                        *slot = *generation;
+                        true
+                    }
+                }
+                Self::Sparse(seen) => seen.insert(candidate),
+            }
+        }
+    }
+
+    struct Worker {
+        candidates: Vec<u32>,
+        seen: CandidateSeen,
+        hits: AHashSet<(ContractId, ChainId)>,
+    }
+
+    let lane_count = rayon::current_num_threads().min(left_count).max(1);
+    let dense_bytes = names
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .and_then(|bytes| bytes.checked_mul(lane_count));
+    let use_dense_seen = dense_bytes.is_some_and(|bytes| bytes <= DENSE_SEEN_BUDGET_BYTES);
+
+    let next_left = AtomicUsize::new(0);
+    let worker = (0..lane_count)
+        .into_par_iter()
+        .map(|_| {
+            let mut worker = Worker {
+                candidates: Vec::new(),
+                seen: CandidateSeen::new(names.len(), use_dense_seen),
+                hits: AHashSet::new(),
+            };
+            let mut pending = 0_u64;
+            loop {
+                let start = next_left.fetch_add(SCORE_SCHEDULING_CHUNK, Ordering::Relaxed);
+                if start >= left_count || cancelled.load(Ordering::Relaxed) != 0 {
+                    break;
+                }
+                for left in start..(start + SCORE_SCHEDULING_CHUNK).min(left_count) {
+                    worker.candidates.clear();
+                    worker.seen.begin_name();
+                    let right_start = left + 1;
+                    let right_end = right_ends[left];
+                    if right_start < right_end {
+                        let right_min_len = names[right_start].characters.len();
+                        let minimum_overlap = CandidateBounds::minimum_multiset_overlap(
+                            names[left].characters.len(),
+                            right_min_len,
+                            threshold_pct,
+                        );
+
+                        if minimum_overlap == 0 {
+                            worker
+                                .candidates
+                                .extend((right_start..right_end).map(|right| right as u32));
+                        } else {
+                            let prefix = index.prefix(left);
+                            let prefix_len = prefix
+                                .len()
+                                .saturating_sub(minimum_overlap)
+                                .saturating_add(1)
+                                .min(prefix.len());
+                            let compact_start = right_start as u32;
+                            let compact_end = right_end as u32;
+                            for &token_id in &prefix[..prefix_len] {
+                                let posting = index.posting(token_id);
+                                let lo = posting.partition_point(|&a| a < compact_start);
+                                let hi = posting.partition_point(|&a| a < compact_end);
+                                for &candidate in &posting[lo..hi] {
+                                    if worker.seen.insert(candidate) {
+                                        worker.candidates.push(candidate);
+                                    }
                                 }
+                            }
+                        }
+
+                        worker.candidates.retain(|&right| {
+                            resident_candidate_passes_overlap(
+                                index,
+                                names,
+                                left,
+                                right as usize,
+                                threshold_pct,
+                            )
+                        });
+
+                        let prepared = BatchComparator::new(names[left].characters.iter().copied());
+                        for &right in &worker.candidates {
+                            let right = right as usize;
+                            if prepared
+                                .similarity_with_args(
+                                    names[right].characters.iter().copied(),
+                                    &args,
+                                )
+                                .is_some()
+                            {
+                                record_pair_hits(&names[left], &names[right], &mut worker.hits);
                             }
                         }
                     }
 
-                    worker.candidates.sort_unstable();
-                    worker.candidates.retain(|&right| {
-                        resident_candidate_passes_overlap(
-                            index,
-                            names,
-                            left,
-                            right as usize,
-                            threshold_pct,
-                        )
-                    });
-
-                    let prepared = BatchComparator::new(names[left].characters.iter().copied());
-                    for &right in &worker.candidates {
-                        let right = right as usize;
-                        if prepared
-                            .similarity_with_args(names[right].characters.iter().copied(), &args)
-                            .is_some()
-                        {
-                            record_pair_hits(&names[left], &names[right], &mut worker.hits);
+                    pending += 1;
+                    if pending >= SCORE_PROGRESS_BATCH {
+                        progress.add_completed(pending);
+                        if progress.check_cancelled().is_err() {
+                            cancelled.store(1, Ordering::Relaxed);
                         }
+                        pending = 0;
                     }
                 }
-
-                worker.pending += 1;
-                if worker.pending >= PROGRESS_BATCH {
-                    progress.add_completed(worker.pending);
-                    if progress.check_cancelled().is_err() {
-                        cancelled.store(1, Ordering::Relaxed);
-                    }
-                    worker.pending = 0;
-                }
-                worker
-            },
-        )
+            }
+            if pending > 0 {
+                progress.add_completed(pending);
+            }
+            worker
+        })
         .reduce(
             || Worker {
                 candidates: Vec::new(),
-                seen: AHashSet::new(),
+                seen: CandidateSeen::new(0, false),
                 hits: AHashSet::new(),
-                pending: 0,
             },
             |mut left, mut right| {
                 if left.hits.len() < right.hits.len() {
                     std::mem::swap(&mut left.hits, &mut right.hits);
                 }
                 left.hits.extend(right.hits);
-                left.pending += right.pending;
                 left
             },
         );
 
     if cancelled.load(Ordering::Relaxed) != 0 {
         return Err(DedupError::Interrupted);
-    }
-    if worker.pending > 0 {
-        progress.add_completed(worker.pending);
     }
     Ok(worker.hits)
 }
@@ -534,17 +605,26 @@ fn resident_candidate_passes_overlap(
             .characters
             .len()
             .min(names[right].characters.len())
-        && sorted_name_token_overlap(index.sorted(left), index.sorted(right)) >= required
+        && sorted_name_token_overlap_at_least(index.sorted(left), index.sorted(right), required)
 }
 
-fn sorted_name_token_overlap(left: &[u32], right: &[u32]) -> usize {
+fn sorted_name_token_overlap_at_least(left: &[u32], right: &[u32], required: usize) -> bool {
+    if required == 0 {
+        return true;
+    }
     let mut i = 0usize;
     let mut j = 0usize;
     let mut overlap = 0usize;
     while i < left.len() && j < right.len() {
+        if overlap + (left.len() - i).min(right.len() - j) < required {
+            return false;
+        }
         match left[i].cmp(&right[j]) {
             std::cmp::Ordering::Equal => {
                 overlap += 1;
+                if overlap >= required {
+                    return true;
+                }
                 i += 1;
                 j += 1;
             }
@@ -552,7 +632,7 @@ fn sorted_name_token_overlap(left: &[u32], right: &[u32]) -> usize {
             std::cmp::Ordering::Greater => j += 1,
         }
     }
-    overlap
+    false
 }
 
 fn flush_progress(completed: &mut u64, progress: &dyn ProgressObserver) -> Result<(), DedupError> {
@@ -575,7 +655,30 @@ fn flush_remaining(completed: &mut u64, progress: &dyn ProgressObserver) {
 mod tests {
     use super::*;
     use crate::entity::{InputRow, SourceOrder};
-    use crate::progress::NoopProgress;
+    use crate::progress::{NoopProgress, ProgressObserver};
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct ScoreProgress {
+        phase: Mutex<String>,
+        score_deltas: Mutex<Vec<u64>>,
+    }
+
+    impl ProgressObserver for ScoreProgress {
+        fn set_stage(&self, _stage: &str) {}
+
+        fn begin_phase(&self, phase: &str, _total: Option<u64>) {
+            *self.phase.lock().unwrap() = phase.to_owned();
+        }
+
+        fn set_total(&self, _total: Option<u64>) {}
+
+        fn add_completed(&self, delta: u64) {
+            if *self.phase.lock().unwrap() == "score_name" {
+                self.score_deltas.lock().unwrap().push(delta);
+            }
+        }
+    }
 
     fn named(chain: &str, contract: &str, name: &str) -> InputRow {
         InputRow {
@@ -680,5 +783,29 @@ mod tests {
             }
         }
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn score_progress_flushes_each_lane_without_waiting_for_global_reduce() {
+        let mut store = EntityStore::default();
+        for index in 0..257 {
+            store.ingest_row(named(
+                "ethereum",
+                &format!("contract-{index}"),
+                &format!("distinct-name-{index:04}"),
+            ));
+        }
+        let progress = ScoreProgress::default();
+        let names = atomize(&store, &progress).unwrap();
+        let candidate_index = ResidentNameIndex::build(&names, &progress).unwrap();
+        score_resident_index(&candidate_index, &names, 100.0, &progress).unwrap();
+
+        let deltas = progress.score_deltas.lock().unwrap();
+        assert!(!deltas.is_empty());
+        assert!(deltas.iter().all(|&delta| delta <= SCORE_PROGRESS_BATCH));
+        assert_eq!(
+            deltas.iter().copied().sum::<u64>(),
+            names.len().saturating_sub(1) as u64
+        );
     }
 }

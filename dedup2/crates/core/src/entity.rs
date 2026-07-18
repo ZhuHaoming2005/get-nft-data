@@ -1,4 +1,5 @@
 use crate::error::DedupError;
+use crate::radix::sort_u32_triples;
 use ahash::{AHashMap, AHashSet};
 use num_bigint::BigUint;
 use serde::{Deserialize, Serialize};
@@ -507,7 +508,7 @@ fn build_uri_postings(
             Some((uri, nft.contract_id, nft.id))
         })
         .collect();
-    tuples.sort_unstable();
+    sort_u32_triples(&mut tuples);
     let mut postings = Vec::new();
     let mut index = 0;
     while index < tuples.len() {

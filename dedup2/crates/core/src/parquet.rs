@@ -95,12 +95,10 @@ pub fn load_entities_with_options(
         .collect();
 
     progress.begin_phase("merge_shards", Some(shard_results.len() as u64));
-    let mut store = EntityStore::with_options(options.metadata_anchors, &options.evm_chains);
-    for shard in shard_results {
-        progress.check_cancelled()?;
-        store.merge_shard(shard?)?;
-        progress.add_completed(1);
-    }
+    progress.check_cancelled()?;
+    let shard_count = shard_results.len() as u64;
+    let mut store = merge_shards_ordered(shard_results, options)?;
+    progress.add_completed(shard_count);
     if !options.allowed_chains.is_empty() && store.contracts.is_empty() {
         return Err(DedupError::invalid(
             "load",
@@ -198,11 +196,30 @@ fn scan_file_to_shard(
             scan_row_group_to_shard(input, row_group, row_start, options, progress)
         })
         .collect();
-    let mut shard = EntityStore::with_options(options.metadata_anchors, &options.evm_chains);
-    for row_group in row_group_results {
-        shard.merge_shard(row_group?)?;
+    merge_shards_ordered(row_group_results, options)
+}
+
+fn merge_shards_ordered(
+    mut shards: Vec<Result<EntityStore, DedupError>>,
+    options: &LoadOptions,
+) -> Result<EntityStore, DedupError> {
+    match shards.len() {
+        0 => Ok(EntityStore::with_options(
+            options.metadata_anchors,
+            &options.evm_chains,
+        )),
+        1 => shards.pop().expect("one shard is present"),
+        _ => {
+            let right = shards.split_off(shards.len() / 2);
+            let (left, right) = rayon::join(
+                || merge_shards_ordered(shards, options),
+                || merge_shards_ordered(right, options),
+            );
+            let mut left = left?;
+            left.merge_shard(right?)?;
+            Ok(left)
+        }
     }
-    Ok(shard)
 }
 
 fn scan_row_group_to_shard(
@@ -379,5 +396,43 @@ mod tests {
         let options = LoadOptions::new(["missing".to_owned()], Vec::new(), 1);
         let error = load_entities_with_options(&[path], &options, &NoopProgress).unwrap_err();
         assert!(error.to_string().contains("none of the requested"));
+    }
+
+    #[test]
+    fn ordered_tree_merge_preserves_source_order_and_stable_contract_state() {
+        let options = LoadOptions::default();
+        let shards = (0..5)
+            .map(|index| {
+                let mut shard = EntityStore::default();
+                shard
+                    .try_ingest_row(InputRow {
+                        chain: "solana".to_owned(),
+                        contract_address: "collection".to_owned(),
+                        token_id: index.to_string(),
+                        name_norm: format!("name-{}", 5 - index),
+                        token_uri_norm: format!("uri://{index}"),
+                        image_uri_norm: String::new(),
+                        metadata_json: String::new(),
+                        source_order: SourceOrder {
+                            file_ordinal: index,
+                            file_row_number: 0,
+                        },
+                    })
+                    .unwrap();
+                Ok(shard)
+            })
+            .collect();
+
+        let merged = merge_shards_ordered(shards, &options).unwrap();
+        assert_eq!(merged.rows_loaded, 5);
+        assert_eq!(merged.contracts[0].name_norm.as_deref(), Some("name-1"));
+        assert_eq!(
+            merged
+                .nfts
+                .iter()
+                .map(|nft| nft.token_id.as_str())
+                .collect::<Vec<_>>(),
+            ["0", "1", "2", "3", "4"]
+        );
     }
 }

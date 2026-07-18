@@ -2,18 +2,17 @@ const K1: f64 = 1.2;
 const B: f64 = 0.75;
 
 #[derive(Clone, Debug)]
-pub struct PreparedDocument {
-    pub canonical: String,
+pub struct PreparedDocument<'a> {
+    pub canonical: &'a str,
     terms: Vec<(String, u32)>,
     length: u32,
 }
 
-impl PreparedDocument {
-    pub fn new(canonical: String) -> Self {
+impl<'a> PreparedDocument<'a> {
+    pub fn new(canonical: &'a str) -> Self {
         let mut terms = canonical
             .split(|character: char| !character.is_alphanumeric())
             .filter(|token| !token.is_empty())
-            .map(str::to_owned)
             .collect::<Vec<_>>();
         terms.sort_unstable();
         let length = terms.len() as u32;
@@ -24,7 +23,7 @@ impl PreparedDocument {
             while end < terms.len() && terms[end] == terms[index] {
                 end += 1;
             }
-            counts.push((terms[index].clone(), (end - index) as u32));
+            counts.push((terms[index].to_owned(), (end - index) as u32));
             index = end;
         }
         Self {
@@ -35,7 +34,7 @@ impl PreparedDocument {
     }
 }
 
-pub fn cosine_similarity(left: &PreparedDocument, right: &PreparedDocument) -> f64 {
+pub fn cosine_similarity(left: &PreparedDocument<'_>, right: &PreparedDocument<'_>) -> f64 {
     let avgdl = f64::from(left.length + right.length) / 2.0;
     let mut left_pos = 0;
     let mut right_pos = 0;
@@ -105,8 +104,18 @@ mod tests {
 
     #[test]
     fn identical_texts_score_high() {
-        let left = PreparedDocument::new("hello world collection".to_owned());
-        let right = PreparedDocument::new("hello world collection".to_owned());
+        let left = PreparedDocument::new("hello world collection");
+        let right = PreparedDocument::new("hello world collection");
         assert!(cosine_similarity(&left, &right) > 0.99);
+    }
+
+    #[test]
+    fn repeated_terms_allocate_only_unique_entries() {
+        let document = PreparedDocument::new("name name name collection collection");
+        assert_eq!(document.length, 5);
+        assert_eq!(
+            document.terms,
+            vec![("collection".to_owned(), 2), ("name".to_owned(), 3)]
+        );
     }
 }

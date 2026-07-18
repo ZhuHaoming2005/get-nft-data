@@ -10,17 +10,17 @@ const STABLE_VALUE_SUPPORT_RATIO: f64 = 0.80;
 #[derive(Clone, Debug)]
 pub struct TemplateFingerprint {
     pub digest: [u8; 32],
-    pub features: Vec<String>,
+    pub feature_ids: Vec<u64>,
     pub low_information: bool,
 }
 
-pub fn fingerprint_anchors(anchors: &ContractAnchors) -> TemplateFingerprint {
+pub fn fingerprint_anchors(anchors: &ContractAnchors<'_>) -> TemplateFingerprint {
     let mut structure: ahash::AHashSet<String> = ahash::AHashSet::new();
     let mut value_votes: AHashMap<String, AHashMap<String, usize>> = AHashMap::new();
     let docs = anchors.anchors.len();
 
     for anchor in &anchors.anchors {
-        if let Ok(value) = serde_json::from_str::<Value>(&anchor.json) {
+        if let Ok(value) = serde_json::from_str::<Value>(anchor.json) {
             walk_json(&value, "", &mut structure, &mut value_votes);
         }
     }
@@ -50,16 +50,29 @@ pub fn fingerprint_anchors(anchors: &ContractAnchors) -> TemplateFingerprint {
     let placeholder = all_identical_placeholder(anchors);
     let low_information = stable_values.is_empty() || placeholder;
     let mut hasher = Sha256::new();
+    let mut feature_ids = Vec::with_capacity(features.len());
     for feature in &features {
         hasher.update(feature.as_bytes());
         hasher.update([0]);
+        feature_ids.push(hash_bytes(feature.as_bytes()));
     }
+    feature_ids.sort_unstable();
+    feature_ids.dedup();
     let digest: [u8; 32] = hasher.finalize().into();
     TemplateFingerprint {
         digest,
-        features,
+        feature_ids,
         low_information,
     }
+}
+
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 fn all_identical_placeholder(anchors: &ContractAnchors) -> bool {
@@ -185,14 +198,9 @@ fn url_base(url: &str) -> String {
 mod tests {
     use super::*;
     use crate::metadata::anchors::{AnchorRecord, ContractAnchors};
-    use crate::metadata::bm25::PreparedDocument;
 
-    fn anchor(token: &str, json: &str) -> AnchorRecord {
-        AnchorRecord {
-            token_id: token.to_owned(),
-            json: json.to_owned(),
-            prepared: PreparedDocument::new(json.to_owned()),
-        }
+    fn anchor<'a>(token: &'a str, json: &'a str) -> AnchorRecord<'a> {
+        AnchorRecord::new(token, json, json, true)
     }
 
     #[test]
@@ -218,6 +226,19 @@ mod tests {
             ],
             is_evm: true,
         };
-        assert!(!fingerprint_anchors(&anchors).low_information);
+        let fingerprint = fingerprint_anchors(&anchors);
+        assert!(!fingerprint.low_information);
+        let mut expected = [
+            "s::object",
+            "s:collection.name:string",
+            "s:collection:object",
+            "s:token:number",
+            "v:collection.name=alpha",
+        ]
+        .map(|feature| hash_bytes(feature.as_bytes()))
+        .to_vec();
+        expected.sort_unstable();
+        expected.dedup();
+        assert_eq!(fingerprint.feature_ids, expected);
     }
 }

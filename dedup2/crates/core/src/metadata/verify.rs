@@ -1,23 +1,13 @@
-use crate::metadata::anchors::{ContractAnchors, largest_shared_token, max_anchor};
+use crate::metadata::anchors::{ContractAnchors, largest_shared_anchors, max_anchor};
 use crate::metadata::bm25::cosine_similarity;
 
-pub fn pair_matches(left: &ContractAnchors, right: &ContractAnchors, threshold: f64) -> bool {
+pub fn pair_matches(
+    left: &ContractAnchors<'_>,
+    right: &ContractAnchors<'_>,
+    threshold: f64,
+) -> bool {
     let (left_document, right_document) =
-        if let Some((token_id, _, _)) = largest_shared_token(left, right) {
-            let Some(left_anchor) = left
-                .anchors
-                .iter()
-                .find(|anchor| anchor.token_id == token_id)
-            else {
-                return false;
-            };
-            let Some(right_anchor) = right
-                .anchors
-                .iter()
-                .find(|anchor| anchor.token_id == token_id)
-            else {
-                return false;
-            };
+        if let Some((left_anchor, right_anchor)) = largest_shared_anchors(left, right) {
             (&left_anchor.prepared, &right_anchor.prepared)
         } else {
             let Some(la) = max_anchor(left) else {
@@ -38,14 +28,9 @@ pub fn pair_matches(left: &ContractAnchors, right: &ContractAnchors, threshold: 
 mod tests {
     use super::*;
     use crate::metadata::anchors::{AnchorRecord, ContractAnchors};
-    use crate::metadata::bm25::PreparedDocument;
 
-    fn anchor(token_id: &str, canonical: &str) -> AnchorRecord {
-        AnchorRecord {
-            token_id: token_id.to_owned(),
-            json: canonical.to_owned(),
-            prepared: PreparedDocument::new(canonical.to_owned()),
-        }
+    fn anchor<'a>(token_id: &'a str, canonical: &'a str) -> AnchorRecord<'a> {
+        AnchorRecord::new(token_id, canonical, canonical, true)
     }
 
     #[test]

@@ -4,6 +4,7 @@ pub mod metadata;
 pub mod name;
 pub mod parquet;
 pub mod progress;
+mod radix;
 pub mod scope;
 pub mod stats;
 pub mod uri;

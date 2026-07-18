@@ -1,5 +1,5 @@
 use crate::progress::ProgressReporter;
-use crate::report::{ReportRequest, StageTiming, write_reports};
+use crate::report::{PhaseTiming, ReportRequest, StageTiming, write_reports};
 use dedup_core::{
     DedupError, LoadOptions, PrefilterConfig, ProgressObserver, SummaryAccumulator,
     load_entities_with_options, run_metadata, run_name, run_uri,
@@ -101,6 +101,15 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
         });
     }
 
+    let phase_timings = progress
+        .phase_timings()
+        .into_iter()
+        .map(|timing| PhaseTiming {
+            stage: timing.stage,
+            phase: timing.phase,
+            elapsed_secs: timing.elapsed.as_secs_f64(),
+        })
+        .collect();
     progress.set_stage("report");
     progress.begin_phase("write", Some(3));
     write_reports(
@@ -116,6 +125,7 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
             metadata_anchors: config.metadata_anchors,
             metadata_prefilter: metadata_stats,
             stage_timings,
+            phase_timings,
             elapsed: started.elapsed(),
         },
     )

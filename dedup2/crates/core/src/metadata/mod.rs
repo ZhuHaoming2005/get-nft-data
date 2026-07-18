@@ -66,7 +66,7 @@ pub fn run_metadata(
         }
     }
 
-    let (candidates, stats) = generate_candidates(&fingerprints, &prefilter, progress)?;
+    let (candidates, stats) = generate_candidates(fingerprints, &prefilter, progress)?;
 
     progress.begin_phase("verify", Some(candidates.len() as u64));
     let cancelled = AtomicBool::new(false);

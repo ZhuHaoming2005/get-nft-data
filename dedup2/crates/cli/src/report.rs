@@ -22,6 +22,7 @@ struct RunManifest {
     chain_totals: Vec<ChainTotalRow>,
     elapsed_secs: f64,
     stage_timings: Vec<StageTiming>,
+    phase_timings: Vec<PhaseTiming>,
     name_threshold: f64,
     metadata_threshold: f64,
     metadata_anchors: usize,
@@ -31,6 +32,13 @@ struct RunManifest {
 #[derive(Clone, Serialize)]
 pub struct StageTiming {
     pub stage: &'static str,
+    pub elapsed_secs: f64,
+}
+
+#[derive(Clone, Serialize)]
+pub struct PhaseTiming {
+    pub stage: String,
+    pub phase: String,
     pub elapsed_secs: f64,
 }
 
@@ -52,6 +60,7 @@ pub struct ReportRequest<'a> {
     pub metadata_anchors: usize,
     pub metadata_prefilter: Option<PrefilterStats>,
     pub stage_timings: Vec<StageTiming>,
+    pub phase_timings: Vec<PhaseTiming>,
     pub elapsed: Duration,
 }
 
@@ -85,6 +94,7 @@ pub fn write_reports(output_dir: &Path, request: ReportRequest<'_>) -> Result<()
         chain_totals,
         elapsed_secs: request.elapsed.as_secs_f64(),
         stage_timings: request.stage_timings,
+        phase_timings: request.phase_timings,
         name_threshold: request.name_threshold,
         metadata_threshold: request.metadata_threshold,
         metadata_anchors: request.metadata_anchors,
@@ -125,7 +135,9 @@ fn write_summary(
         "scope",
         "dimension",
         "duplicate_contract_count",
+        "duplicate_contract_ratio",
         "duplicate_nft_count",
+        "duplicate_nft_ratio",
         "total_contracts",
         "total_nfts",
     ])?;
@@ -148,12 +160,16 @@ fn write_summary(
             .get(&key.primary_chain)
             .cloned()
             .unwrap_or_default();
+        let contract_ratio = ratio(counts.duplicate_contract_count, totals.contracts);
+        let nft_ratio = ratio(counts.duplicate_nft_count, totals.nfts);
         writer.write_record([
             chain,
             scope_name(&key.kind),
             dimension_name(key.dimension),
             &counts.duplicate_contract_count.to_string(),
+            &contract_ratio.to_string(),
             &counts.duplicate_nft_count.to_string(),
+            &nft_ratio.to_string(),
             &totals.contracts.to_string(),
             &totals.nfts.to_string(),
         ])?;
@@ -173,7 +189,9 @@ fn write_matrix(
         "secondary_chain",
         "dimension",
         "duplicate_contract_count",
+        "duplicate_contract_ratio",
         "duplicate_nft_count",
+        "duplicate_nft_ratio",
         "total_contracts",
         "total_nfts",
     ])?;
@@ -208,18 +226,30 @@ fn write_matrix(
             .get(&key.primary_chain)
             .cloned()
             .unwrap_or_default();
+        let contract_ratio = ratio(counts.duplicate_contract_count, totals.contracts);
+        let nft_ratio = ratio(counts.duplicate_nft_count, totals.nfts);
         writer.write_record([
             primary,
             secondary,
             dimension_name(key.dimension),
             &counts.duplicate_contract_count.to_string(),
+            &contract_ratio.to_string(),
             &counts.duplicate_nft_count.to_string(),
+            &nft_ratio.to_string(),
             &totals.contracts.to_string(),
             &totals.nfts.to_string(),
         ])?;
     }
     writer.flush()?;
     Ok(())
+}
+
+fn ratio(count: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        count as f64 / total as f64
+    }
 }
 
 fn scope_name(kind: &ScopeKind) -> &'static str {
@@ -236,5 +266,17 @@ fn dimension_name(dimension: Dimension) -> &'static str {
         Dimension::TokenUri => "token_uri",
         Dimension::ImageUri => "image_uri",
         Dimension::Metadata => "metadata",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ratio;
+
+    #[test]
+    fn ratio_uses_fraction_and_handles_zero_total() {
+        assert_eq!(ratio(0, 0), 0.0);
+        assert_eq!(ratio(1, 4), 0.25);
+        assert_eq!(ratio(3, 2), 1.5);
     }
 }
