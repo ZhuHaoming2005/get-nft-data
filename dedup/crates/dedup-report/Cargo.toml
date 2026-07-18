@@ -1,0 +1,19 @@
+[package]
+name = "dedup-report"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+wide_ids = ["dedup-model/wide_ids"]
+
+[dependencies]
+csv.workspace = true
+dedup-model = { path = "../dedup-model" }
+roaring.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,29 @@
+[package]
+name = "dedup-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+wide_ids = ["dedup-index/wide_ids", "dedup-model/wide_ids"]
+
+[dependencies]
+ahash.workspace = true
+dedup-index = { path = "../dedup-index" }
+dedup-model = { path = "../dedup-model" }
+num-bigint.workspace = true
+rapidfuzz.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+unicode-normalization.workspace = true
+
+[dev-dependencies]
+dedup-report = { path = "../dedup-report" }
+tempfile.workspace = true
+
+[lints]
+workspace = true
