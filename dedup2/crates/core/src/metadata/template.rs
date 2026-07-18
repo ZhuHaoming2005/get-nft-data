@@ -67,11 +67,7 @@ fn all_identical_placeholder(anchors: &ContractAnchors) -> bool {
         return false;
     };
     let first_trim = first.json.trim();
-    if anchors
-        .anchors
-        .iter()
-        .any(|a| a.json.trim() != first_trim)
-    {
+    if anchors.anchors.iter().any(|a| a.json.trim() != first_trim) {
         return false;
     }
     is_placeholder_content(first_trim)
@@ -183,4 +179,45 @@ fn url_base(url: &str) -> String {
         .rsplit_once('/')
         .map(|(prefix, _)| prefix.to_owned())
         .unwrap_or_else(|| trimmed.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metadata::anchors::{AnchorRecord, ContractAnchors};
+    use crate::metadata::bm25::PreparedDocument;
+
+    fn anchor(token: &str, json: &str) -> AnchorRecord {
+        AnchorRecord {
+            token_id: token.to_owned(),
+            json: json.to_owned(),
+            prepared: PreparedDocument::new(json.to_owned()),
+        }
+    }
+
+    #[test]
+    fn structure_only_template_is_low_information() {
+        let anchors = ContractAnchors {
+            contract_id: 0,
+            anchors: vec![
+                anchor("1", r#"{"attributes":[{"trait_type":"x","value":"a"}]}"#),
+                anchor("2", r#"{"attributes":[{"trait_type":"x","value":"b"}]}"#),
+            ],
+            is_evm: true,
+        };
+        assert!(fingerprint_anchors(&anchors).low_information);
+    }
+
+    #[test]
+    fn stable_collection_value_is_discriminative() {
+        let anchors = ContractAnchors {
+            contract_id: 0,
+            anchors: vec![
+                anchor("1", r#"{"collection":{"name":"alpha"},"token":1}"#),
+                anchor("2", r#"{"collection":{"name":"alpha"},"token":2}"#),
+            ],
+            is_evm: true,
+        };
+        assert!(!fingerprint_anchors(&anchors).low_information);
+    }
 }

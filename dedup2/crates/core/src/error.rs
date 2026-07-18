@@ -4,7 +4,10 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum DedupError {
     #[error("{stage}: {message}")]
-    InvalidInput { stage: &'static str, message: String },
+    InvalidInput {
+        stage: &'static str,
+        message: String,
+    },
     #[error("parquet schema error in {}: {message}", path.display())]
     ParquetSchema { path: PathBuf, message: String },
     #[error("parquet read error in {}: {message}", path.display())]

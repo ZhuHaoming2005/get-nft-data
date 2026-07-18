@@ -9,7 +9,11 @@ use progress::{ProgressMode, ProgressReporter};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
-#[command(name = "dedup2", version, about = "Experimental in-memory NFT deduplicator")]
+#[command(
+    name = "dedup2",
+    version,
+    about = "Experimental in-memory NFT deduplicator"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

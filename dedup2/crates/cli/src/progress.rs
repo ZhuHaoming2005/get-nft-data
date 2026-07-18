@@ -2,7 +2,7 @@ use clap::ValueEnum;
 use dedup_core::{DedupError, EwmaEta, ProgressObserver};
 use serde::Serialize;
 use std::io::{self, IsTerminal, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -30,19 +30,20 @@ pub struct ProgressReporter {
 }
 
 struct Shared {
-    state: Mutex<State>,
+    meta: Mutex<Meta>,
+    completed: AtomicU64,
     stopping: AtomicBool,
     cancelled: AtomicBool,
     mode: EffectiveMode,
     interval: Duration,
 }
 
-struct State {
+struct Meta {
     stage: String,
     phase: String,
-    completed: u64,
     total: Option<u64>,
-    started: Instant,
+    stage_started: Instant,
+    phase_started: Instant,
     last_completed: u64,
     last_tick: Instant,
     eta: EwmaEta,
@@ -54,10 +55,12 @@ struct ProgressLine {
     phase: String,
     completed: u64,
     total: Option<u64>,
+    percent: Option<f64>,
     rate: Option<f64>,
     eta_secs: Option<f64>,
     eta_confident: bool,
-    elapsed_secs: f64,
+    phase_elapsed_secs: f64,
+    stage_elapsed_secs: f64,
 }
 
 impl ProgressReporter {
@@ -74,17 +77,19 @@ impl ProgressReporter {
                 }
             }
         };
+        let now = Instant::now();
         let shared = Arc::new(Shared {
-            state: Mutex::new(State {
+            meta: Mutex::new(Meta {
                 stage: "idle".to_owned(),
                 phase: String::new(),
-                completed: 0,
                 total: None,
-                started: Instant::now(),
+                stage_started: now,
+                phase_started: now,
                 last_completed: 0,
-                last_tick: Instant::now(),
+                last_tick: now,
                 eta: EwmaEta::new(EWMA_ALPHA),
             }),
+            completed: AtomicU64::new(0),
             stopping: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
             mode: effective,
@@ -134,33 +139,37 @@ impl CancelHandle {
 
 impl ProgressObserver for ProgressReporter {
     fn set_stage(&self, stage: &str) {
-        let mut state = self.shared.state.lock().expect("progress lock");
-        state.stage = stage.to_owned();
-        state.phase = String::new();
-        state.completed = 0;
-        state.total = None;
-        state.started = Instant::now();
-        state.last_completed = 0;
-        state.last_tick = Instant::now();
-        state.eta = EwmaEta::new(EWMA_ALPHA);
+        let mut meta = self.shared.meta.lock().expect("progress lock");
+        let now = Instant::now();
+        meta.stage = stage.to_owned();
+        meta.phase = String::new();
+        meta.total = None;
+        meta.stage_started = now;
+        meta.phase_started = now;
+        meta.last_completed = 0;
+        meta.last_tick = now;
+        meta.eta = EwmaEta::new(EWMA_ALPHA);
+        self.shared.completed.store(0, Ordering::Relaxed);
     }
 
-    fn set_phase(&self, phase: &str) {
-        let mut state = self.shared.state.lock().expect("progress lock");
-        state.phase = phase.to_owned();
-        state.completed = 0;
-        state.total = None;
-        state.last_completed = 0;
-        state.last_tick = Instant::now();
-        state.eta = EwmaEta::new(EWMA_ALPHA);
+    fn begin_phase(&self, phase: &str, total: Option<u64>) {
+        let mut meta = self.shared.meta.lock().expect("progress lock");
+        let now = Instant::now();
+        meta.phase = phase.to_owned();
+        meta.total = total;
+        meta.phase_started = now;
+        meta.last_completed = 0;
+        meta.last_tick = now;
+        meta.eta = EwmaEta::new(EWMA_ALPHA);
+        self.shared.completed.store(0, Ordering::Relaxed);
     }
 
     fn set_total(&self, total: Option<u64>) {
-        self.shared.state.lock().expect("progress lock").total = total;
+        self.shared.meta.lock().expect("progress lock").total = total;
     }
 
     fn add_completed(&self, delta: u64) {
-        self.shared.state.lock().expect("progress lock").completed += delta;
+        self.shared.completed.fetch_add(delta, Ordering::Relaxed);
     }
 
     fn check_cancelled(&self) -> Result<(), DedupError> {
@@ -183,29 +192,36 @@ fn emit_snapshot(shared: &Shared) {
     if shared.mode == EffectiveMode::Off {
         return;
     }
-    let mut state = shared.state.lock().expect("progress lock");
+    let mut meta = shared.meta.lock().expect("progress lock");
+    // Read the phase metadata and its resettable counter under the same phase lock.
+    // Workers still update the counter lock-free, while phase changes cannot pair a
+    // new phase label with the previous phase's completed value.
+    let completed = shared.completed.load(Ordering::Acquire);
     let now = Instant::now();
-    let dt = now.duration_since(state.last_tick).as_secs_f64().max(1e-6);
-    let delta = state.completed.saturating_sub(state.last_completed);
+    let dt = now.duration_since(meta.last_tick).as_secs_f64().max(1e-6);
+    let delta = completed.saturating_sub(meta.last_completed);
     let instant_rate = delta as f64 / dt;
-    state.eta.observe(instant_rate);
-    state.last_completed = state.completed;
-    state.last_tick = now;
+    meta.eta.observe(instant_rate);
+    meta.last_completed = completed;
+    meta.last_tick = now;
 
-    let remaining = state
+    let remaining = meta.total.map(|total| total.saturating_sub(completed));
+    let percent = meta
         .total
-        .map(|total| total.saturating_sub(state.completed));
+        .and_then(|t| (t > 0).then_some(100.0 * completed as f64 / t as f64));
     let line = ProgressLine {
-        stage: state.stage.clone(),
-        phase: state.phase.clone(),
-        completed: state.completed,
-        total: state.total,
-        rate: state.eta.rate(),
-        eta_secs: remaining.and_then(|r| state.eta.eta_secs(r)),
-        eta_confident: state.eta.confident(),
-        elapsed_secs: state.started.elapsed().as_secs_f64(),
+        stage: meta.stage.clone(),
+        phase: meta.phase.clone(),
+        completed,
+        total: meta.total,
+        percent,
+        rate: meta.eta.rate(),
+        eta_secs: remaining.and_then(|r| meta.eta.eta_secs(r)),
+        eta_confident: meta.eta.confident(),
+        phase_elapsed_secs: meta.phase_started.elapsed().as_secs_f64(),
+        stage_elapsed_secs: meta.stage_started.elapsed().as_secs_f64(),
     };
-    drop(state);
+    drop(meta);
 
     match shared.mode {
         EffectiveMode::Json => {
@@ -214,33 +230,35 @@ fn emit_snapshot(shared: &Shared) {
             }
         }
         EffectiveMode::Tty => {
-            let total = line
-                .total
-                .map(|t| t.to_string())
-                .unwrap_or_else(|| "?".to_owned());
-            let pct = match line.total {
-                Some(t) if t > 0 => format!("{:.1}%", 100.0 * line.completed as f64 / t as f64),
-                _ => "--".to_owned(),
+            let label = if line.phase.is_empty() {
+                line.stage.clone()
+            } else {
+                format!("{}/{}", line.stage, line.phase)
             };
+            let progress = match line.total {
+                Some(t) => format!("{}/{}", line.completed, t),
+                None => format!("{} done", line.completed),
+            };
+            let pct = line
+                .percent
+                .map(|p| format!("{p:.1}%"))
+                .unwrap_or_else(|| "--".to_owned());
             let rate = line
                 .rate
                 .map(|r| format!("{r:.0}/s"))
-                .unwrap_or_else(|| "-".to_owned());
-            let eta = match (line.eta_secs, line.eta_confident) {
-                (Some(secs), true) => format_duration(secs),
-                (Some(secs), false) => format!("~{}", format_duration(secs)),
-                (None, _) => "?".to_owned(),
+                .unwrap_or_else(|| "-/s".to_owned());
+            let elapsed = format_duration(line.phase_elapsed_secs);
+            let eta = match line.total {
+                None => "n/a".to_owned(),
+                Some(_) => match (line.eta_secs, line.eta_confident) {
+                    (Some(secs), true) => format_duration(secs),
+                    (Some(secs), false) => format!("~{}", format_duration(secs)),
+                    (None, _) => "...".to_owned(),
+                },
             };
             let _ = write!(
                 io::stderr(),
-                "\r[{}/{}] {}/{} {} {} eta={}   ",
-                line.stage,
-                line.phase,
-                line.completed,
-                total,
-                pct,
-                rate,
-                eta
+                "\r[{label}] {progress} {pct} {rate} elapsed={elapsed} eta={eta}\x1b[K"
             );
             let _ = io::stderr().flush();
         }

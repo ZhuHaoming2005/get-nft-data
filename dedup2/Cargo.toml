@@ -11,6 +11,7 @@ publish = false
 [workspace.dependencies]
 ahash = "0.8"
 arrow-array = "57"
+arrow-cast = "57"
 arrow-schema = "57"
 clap = { version = "4.6", features = ["derive"] }
 ctrlc = "3.4"

@@ -1,7 +1,12 @@
 /// Progress observer implemented by the CLI reporter.
 pub trait ProgressObserver: Send + Sync {
     fn set_stage(&self, stage: &str);
-    fn set_phase(&self, phase: &str);
+    /// Reset phase counters. Prefer [`Self::begin_phase`] when the total is known.
+    fn set_phase(&self, phase: &str) {
+        self.begin_phase(phase, None);
+    }
+    /// Atomically set phase name, optional total, and reset completed to 0.
+    fn begin_phase(&self, phase: &str, total: Option<u64>);
     fn set_total(&self, total: Option<u64>);
     fn add_completed(&self, delta: u64);
     fn check_cancelled(&self) -> Result<(), crate::DedupError> {
@@ -14,7 +19,7 @@ pub struct NoopProgress;
 
 impl ProgressObserver for NoopProgress {
     fn set_stage(&self, _stage: &str) {}
-    fn set_phase(&self, _phase: &str) {}
+    fn begin_phase(&self, _phase: &str, _total: Option<u64>) {}
     fn set_total(&self, _total: Option<u64>) {}
     fn add_completed(&self, _delta: u64) {}
 }

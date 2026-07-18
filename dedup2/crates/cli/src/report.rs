@@ -1,11 +1,12 @@
-use dedup_core::{
-    Dimension, EntityStore, PrefilterStats, ScopeKind, SummaryAccumulator,
-};
+use dedup_core::{Dimension, EntityStore, PrefilterStats, ScopeKind, SummaryAccumulator};
 use serde::Serialize;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
+use std::thread;
 use std::time::Duration;
+
+type ReportError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Serialize)]
 struct RunManifest {
@@ -29,50 +30,69 @@ struct ChainTotalRow {
     nfts: u64,
 }
 
-pub fn write_reports(
-    output_dir: &Path,
-    store: &EntityStore,
-    acc: &SummaryAccumulator,
-    inputs: &[std::path::PathBuf],
-    chains: &[String],
-    evm_chains: &[String],
-    name_threshold: f64,
-    metadata_threshold: f64,
-    metadata_anchors: usize,
-    metadata_prefilter: Option<PrefilterStats>,
-    elapsed: Duration,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub struct ReportRequest<'a> {
+    pub store: &'a EntityStore,
+    pub accumulator: &'a SummaryAccumulator,
+    pub inputs: &'a [std::path::PathBuf],
+    pub chains: &'a [String],
+    pub evm_chains: &'a [String],
+    pub name_threshold: f64,
+    pub metadata_threshold: f64,
+    pub metadata_anchors: usize,
+    pub metadata_prefilter: Option<PrefilterStats>,
+    pub elapsed: Duration,
+}
+
+pub fn write_reports(output_dir: &Path, request: ReportRequest<'_>) -> Result<(), ReportError> {
     fs::create_dir_all(output_dir)?;
-    write_summary(output_dir, store, acc)?;
-    write_matrix(output_dir, store, acc)?;
-    let mut chain_totals: Vec<ChainTotalRow> = store
+    let mut chain_totals: Vec<ChainTotalRow> = request
+        .store
         .totals
         .iter()
         .map(|(id, totals)| ChainTotalRow {
-            chain: store.chain_name(*id).to_owned(),
+            chain: request.store.chain_name(*id).to_owned(),
             contracts: totals.contracts,
             nfts: totals.nfts,
         })
         .collect();
     chain_totals.sort_by(|a, b| a.chain.cmp(&b.chain));
     let manifest = RunManifest {
-        inputs: inputs
+        inputs: request
+            .inputs
             .iter()
-            .map(|p| p.display().to_string())
+            .map(|path| path.display().to_string())
             .collect(),
-        chains: chains.to_vec(),
-        evm_chains: evm_chains.to_vec(),
-        rows_loaded: store.rows_loaded,
-        contracts: store.contracts.len(),
+        chains: request.chains.to_vec(),
+        evm_chains: request.evm_chains.to_vec(),
+        rows_loaded: request.store.rows_loaded,
+        contracts: request.store.contracts.len(),
         chain_totals,
-        elapsed_secs: elapsed.as_secs_f64(),
-        name_threshold,
-        metadata_threshold,
-        metadata_anchors,
-        metadata_prefilter,
+        elapsed_secs: request.elapsed.as_secs_f64(),
+        name_threshold: request.name_threshold,
+        metadata_threshold: request.metadata_threshold,
+        metadata_anchors: request.metadata_anchors,
+        metadata_prefilter: request.metadata_prefilter,
     };
+    thread::scope(|scope| -> Result<(), ReportError> {
+        let summary = scope.spawn(|| write_summary(output_dir, request.store, request.accumulator));
+        let matrix = scope.spawn(|| write_matrix(output_dir, request.store, request.accumulator));
+        let manifest = scope.spawn(|| write_manifest(output_dir, &manifest));
+        summary
+            .join()
+            .map_err(|_| std::io::Error::other("summary writer panicked"))??;
+        matrix
+            .join()
+            .map_err(|_| std::io::Error::other("matrix writer panicked"))??;
+        manifest
+            .join()
+            .map_err(|_| std::io::Error::other("manifest writer panicked"))??;
+        Ok(())
+    })
+}
+
+fn write_manifest(output_dir: &Path, manifest: &RunManifest) -> Result<(), ReportError> {
     let mut file = File::create(output_dir.join("run_manifest.json"))?;
-    serde_json::to_writer_pretty(&mut file, &manifest)?;
+    serde_json::to_writer_pretty(&mut file, manifest)?;
     file.write_all(b"\n")?;
     Ok(())
 }
@@ -81,7 +101,7 @@ fn write_summary(
     output_dir: &Path,
     store: &EntityStore,
     acc: &SummaryAccumulator,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), ReportError> {
     let mut writer = csv::Writer::from_path(output_dir.join("summary.csv"))?;
     writer.write_record([
         "primary_chain",
@@ -106,7 +126,11 @@ fn write_summary(
     });
     for (key, counts) in rows {
         let chain = store.chain_name(key.primary_chain);
-        let totals = store.totals.get(&key.primary_chain).cloned().unwrap_or_default();
+        let totals = store
+            .totals
+            .get(&key.primary_chain)
+            .cloned()
+            .unwrap_or_default();
         writer.write_record([
             chain,
             scope_name(&key.kind),
@@ -125,7 +149,7 @@ fn write_matrix(
     output_dir: &Path,
     store: &EntityStore,
     acc: &SummaryAccumulator,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), ReportError> {
     let mut writer = csv::Writer::from_path(output_dir.join("chain_matrix.csv"))?;
     writer.write_record([
         "primary_chain",
@@ -162,7 +186,11 @@ fn write_matrix(
             .secondary_chain
             .map(|id| store.chain_name(id))
             .unwrap_or("");
-        let totals = store.totals.get(&key.primary_chain).cloned().unwrap_or_default();
+        let totals = store
+            .totals
+            .get(&key.primary_chain)
+            .cloned()
+            .unwrap_or_default();
         writer.write_record([
             primary,
             secondary,

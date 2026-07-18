@@ -1,11 +1,15 @@
 use crate::entity::{EntityStore, InputRow, SourceOrder};
 use crate::error::DedupError;
 use crate::progress::ProgressObserver;
-use arrow_array::{Array, LargeStringArray, RecordBatch, StringArray};
+use ahash::AHashSet;
+use arrow_array::{Array, ArrayRef, RecordBatch, StringArray};
+use arrow_cast::{can_cast_types, cast};
+use arrow_schema::DataType;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
+use rayon::prelude::*;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
@@ -19,6 +23,27 @@ pub const REQUIRED_COLUMNS: [&str; 7] = [
     "metadata_json",
 ];
 
+#[derive(Clone, Debug, Default)]
+pub struct LoadOptions {
+    pub allowed_chains: AHashSet<String>,
+    pub evm_chains: AHashSet<String>,
+    pub metadata_anchors: usize,
+}
+
+impl LoadOptions {
+    pub fn new(
+        allowed_chains: impl IntoIterator<Item = String>,
+        evm_chains: impl IntoIterator<Item = String>,
+        metadata_anchors: usize,
+    ) -> Self {
+        Self {
+            allowed_chains: allowed_chains.into_iter().collect(),
+            evm_chains: evm_chains.into_iter().collect(),
+            metadata_anchors,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ValidatedInput {
     path: PathBuf,
@@ -29,111 +54,174 @@ struct ValidatedInput {
     row_count: u64,
 }
 
-/// Scan Parquet files with Arrow, projecting required columns and building
-/// entities online. No DuckDB staging.
+/// Load with default fixture options. Production callers should use
+/// [`load_entities_with_options`] so filtering and anchor bounding happen during scan.
 pub fn load_entities(
     input_files: &[PathBuf],
     progress: &dyn ProgressObserver,
 ) -> Result<EntityStore, DedupError> {
+    load_entities_with_options(
+        input_files,
+        &LoadOptions {
+            metadata_anchors: 8,
+            ..LoadOptions::default()
+        },
+        progress,
+    )
+}
+
+/// Validate all schemas, scan files in parallel into local shards, then merge shards in
+/// explicit input order. The merge preserves stable source order without global hot locks.
+pub fn load_entities_with_options(
+    input_files: &[PathBuf],
+    options: &LoadOptions,
+    progress: &dyn ProgressObserver,
+) -> Result<EntityStore, DedupError> {
     if input_files.is_empty() {
-        return Err(DedupError::invalid("load", "at least one --input is required"));
+        return Err(DedupError::invalid(
+            "load",
+            "at least one --input is required",
+        ));
     }
     progress.set_stage("load");
-    progress.set_phase("validate");
-    let inputs = validate_inputs(input_files)?;
+    progress.begin_phase("validate", Some(input_files.len() as u64));
+    let inputs = validate_inputs(input_files, progress)?;
     let total_rows: u64 = inputs.iter().map(|input| input.row_count).sum();
-    progress.set_total(Some(total_rows));
-    progress.set_phase("scan");
+    progress.begin_phase("scan_files", Some(total_rows));
 
-    let mut store = EntityStore::default();
-    for input in &inputs {
-        scan_file(input, &mut store, progress)?;
+    let shard_results: Vec<Result<EntityStore, DedupError>> = inputs
+        .par_iter()
+        .map(|input| scan_file_to_shard(input, options, progress))
+        .collect();
+
+    progress.begin_phase("merge_shards", Some(shard_results.len() as u64));
+    let mut store = EntityStore::with_options(options.metadata_anchors, &options.evm_chains);
+    for shard in shard_results {
+        progress.check_cancelled()?;
+        store.merge_shard(shard?)?;
+        progress.add_completed(1);
     }
-    progress.set_phase("done");
+    if !options.allowed_chains.is_empty() && store.contracts.is_empty() {
+        return Err(DedupError::invalid(
+            "load",
+            "none of the requested --chains were present in the inputs",
+        ));
+    }
+    progress.begin_phase("build_uri_postings", Some(store.nfts.len() as u64));
+    store.rebuild_uri_postings();
+    progress.add_completed(store.nfts.len() as u64);
     Ok(store)
 }
 
-fn validate_inputs(input_files: &[PathBuf]) -> Result<Vec<ValidatedInput>, DedupError> {
-    input_files
-        .iter()
-        .enumerate()
-        .map(|(ordinal, path)| {
-            let file_ordinal = u32::try_from(ordinal).map_err(|_| {
-                DedupError::invalid("load", "too many input files for file_ordinal")
-            })?;
-            let file = File::open(path).map_err(|error| DedupError::ParquetRead {
-                path: path.clone(),
-                message: error.to_string(),
-            })?;
-            let metadata = ArrowReaderMetadata::load(&file, ArrowReaderOptions::new())
-                .map_err(|error| DedupError::ParquetSchema {
+fn validate_inputs(
+    input_files: &[PathBuf],
+    progress: &dyn ProgressObserver,
+) -> Result<Vec<ValidatedInput>, DedupError> {
+    let results: Vec<Result<ValidatedInput, DedupError>> =
+        input_files
+            .par_iter()
+            .enumerate()
+            .map(|(ordinal, path)| {
+                progress.check_cancelled()?;
+                let file_ordinal = u32::try_from(ordinal).map_err(|_| {
+                    DedupError::invalid("load", "too many input files for file_ordinal")
+                })?;
+                let file = File::open(path).map_err(|error| DedupError::ParquetRead {
                     path: path.clone(),
                     message: error.to_string(),
                 })?;
-            let schema = metadata.schema();
-            let mut root_projection = Vec::with_capacity(REQUIRED_COLUMNS.len());
-            for required in REQUIRED_COLUMNS {
-                let Some((index, field)) = schema
-                    .fields()
-                    .iter()
-                    .enumerate()
-                    .find(|(_, field)| field.name() == required)
-                else {
-                    return Err(DedupError::ParquetSchema {
+                let metadata = ArrowReaderMetadata::load(&file, ArrowReaderOptions::new())
+                    .map_err(|error| DedupError::ParquetSchema {
                         path: path.clone(),
-                        message: format!("missing required column `{required}`"),
-                    });
-                };
-                match field.data_type() {
-                    arrow_schema::DataType::Utf8 | arrow_schema::DataType::LargeUtf8 => {}
-                    other => {
+                        message: error.to_string(),
+                    })?;
+                let schema = metadata.schema();
+                let mut root_projection = Vec::with_capacity(REQUIRED_COLUMNS.len());
+                for required in REQUIRED_COLUMNS {
+                    let Some((index, field)) = schema
+                        .fields()
+                        .iter()
+                        .enumerate()
+                        .find(|(_, field)| field.name() == required)
+                    else {
+                        return Err(DedupError::ParquetSchema {
+                            path: path.clone(),
+                            message: format!("missing required column `{required}`"),
+                        });
+                    };
+                    if !can_cast_types(field.data_type(), &DataType::Utf8) {
                         return Err(DedupError::ParquetSchema {
                             path: path.clone(),
                             message: format!(
-                                "column `{required}` must be Utf8 or LargeUtf8 (got {other:?}); \
-                                 re-export or cast before loading"
+                                "column `{required}` cannot be cast from {:?} to Utf8",
+                                field.data_type()
                             ),
                         });
                     }
+                    root_projection.push(index);
                 }
-                root_projection.push(index);
-            }
-            let row_count = metadata.metadata().file_metadata().num_rows().max(0) as u64;
-            Ok(ValidatedInput {
-                path: path.clone(),
-                file_ordinal,
-                row_group_count: metadata.metadata().num_row_groups(),
-                root_projection,
-                metadata,
-                row_count,
+                let row_count = metadata.metadata().file_metadata().num_rows().max(0) as u64;
+                progress.add_completed(1);
+                Ok(ValidatedInput {
+                    path: path.clone(),
+                    file_ordinal,
+                    row_group_count: metadata.metadata().num_row_groups(),
+                    root_projection,
+                    metadata,
+                    row_count,
+                })
             })
-        })
-        .collect()
+            .collect();
+    results.into_iter().collect()
 }
 
-fn scan_file(
+fn scan_file_to_shard(
     input: &ValidatedInput,
-    store: &mut EntityStore,
+    options: &LoadOptions,
     progress: &dyn ProgressObserver,
-) -> Result<(), DedupError> {
+) -> Result<EntityStore, DedupError> {
+    let mut row_start = 0_u64;
+    let mut row_groups = Vec::with_capacity(input.row_group_count);
+    for row_group in 0..input.row_group_count {
+        row_groups.push((row_group, row_start));
+        let rows = input
+            .metadata
+            .metadata()
+            .row_group(row_group)
+            .num_rows()
+            .max(0) as u64;
+        row_start = row_start.saturating_add(rows);
+    }
+    let row_group_results: Vec<Result<EntityStore, DedupError>> = row_groups
+        .par_iter()
+        .map(|&(row_group, row_start)| {
+            scan_row_group_to_shard(input, row_group, row_start, options, progress)
+        })
+        .collect();
+    let mut shard = EntityStore::with_options(options.metadata_anchors, &options.evm_chains);
+    for row_group in row_group_results {
+        shard.merge_shard(row_group?)?;
+    }
+    Ok(shard)
+}
+
+fn scan_row_group_to_shard(
+    input: &ValidatedInput,
+    row_group: usize,
+    row_start: u64,
+    options: &LoadOptions,
+    progress: &dyn ProgressObserver,
+) -> Result<EntityStore, DedupError> {
+    progress.check_cancelled()?;
     let file = File::open(&input.path).map_err(|error| DedupError::ParquetRead {
         path: input.path.clone(),
         message: error.to_string(),
     })?;
-    let mut file_row_number = 0_u64;
-    for row_group in 0..input.row_group_count {
-        progress.check_cancelled()?;
-        let mask = ProjectionMask::roots(
-            input.metadata.metadata().file_metadata().schema_descr(),
-            input.root_projection.iter().copied(),
-        );
-        let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
-            file.try_clone().map_err(|error| DedupError::ParquetRead {
-                path: input.path.clone(),
-                message: error.to_string(),
-            })?,
-            input.metadata.clone(),
-        )
+    let mask = ProjectionMask::roots(
+        input.metadata.metadata().file_metadata().schema_descr(),
+        input.root_projection.iter().copied(),
+    );
+    let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(file, input.metadata.clone())
         .with_projection(mask)
         .with_row_groups(vec![row_group])
         .with_batch_size(8 * 1024)
@@ -142,122 +230,154 @@ fn scan_file(
             path: input.path.clone(),
             message: error.to_string(),
         })?;
-        for batch in reader {
-            let batch = batch.map_err(|error| DedupError::ParquetRead {
-                path: input.path.clone(),
-                message: error.to_string(),
-            })?;
-            let columns = ProjectedColumns::new(&batch, &input.path)?;
-            for row_index in 0..batch.num_rows() {
-                let row = columns.decode(
-                    row_index,
-                    SourceOrder {
-                        file_ordinal: input.file_ordinal,
-                        file_row_number,
-                    },
-                )?;
-                store.ingest_row(row);
-                file_row_number += 1;
+    let mut shard = EntityStore::with_options(options.metadata_anchors, &options.evm_chains);
+    let mut row_offset = 0_u64;
+    for batch in reader {
+        let batch = batch.map_err(|error| DedupError::ParquetRead {
+            path: input.path.clone(),
+            message: error.to_string(),
+        })?;
+        let columns = ProjectedColumns::new(&batch, &input.path)?;
+        for row_index in 0..batch.num_rows() {
+            let row = columns.decode(
+                row_index,
+                SourceOrder {
+                    file_ordinal: input.file_ordinal,
+                    file_row_number: row_start + row_offset,
+                },
+            );
+            row_offset += 1;
+            if !options.allowed_chains.is_empty() && !options.allowed_chains.contains(&row.chain) {
+                continue;
             }
-            progress.add_completed(batch.num_rows() as u64);
+            shard.try_ingest_row(row)?;
         }
+        progress.add_completed(batch.num_rows() as u64);
     }
-    Ok(())
+    Ok(shard)
 }
 
-struct ProjectedColumns<'a> {
-    chain: StringCol<'a>,
-    contract_address: StringCol<'a>,
-    token_id: StringCol<'a>,
-    name_norm: StringCol<'a>,
-    token_uri_norm: StringCol<'a>,
-    image_uri_norm: StringCol<'a>,
-    metadata_json: StringCol<'a>,
+struct ProjectedColumns {
+    columns: Vec<ArrayRef>,
 }
 
-impl<'a> ProjectedColumns<'a> {
-    fn new(batch: &'a RecordBatch, path: &'a Path) -> Result<Self, DedupError> {
-        Ok(Self {
-            chain: StringCol::from_array(batch.column(0), path, "chain")?,
-            contract_address: StringCol::from_array(batch.column(1), path, "contract_address")?,
-            token_id: StringCol::from_array(batch.column(2), path, "token_id")?,
-            name_norm: StringCol::from_array(batch.column(3), path, "name_norm")?,
-            token_uri_norm: StringCol::from_array(batch.column(4), path, "token_uri_norm")?,
-            image_uri_norm: StringCol::from_array(batch.column(5), path, "image_uri_norm")?,
-            metadata_json: StringCol::from_array(batch.column(6), path, "metadata_json")?,
-        })
+impl ProjectedColumns {
+    fn new(batch: &RecordBatch, path: &Path) -> Result<Self, DedupError> {
+        let mut columns = Vec::with_capacity(REQUIRED_COLUMNS.len());
+        for required in REQUIRED_COLUMNS {
+            let index =
+                batch
+                    .schema()
+                    .index_of(required)
+                    .map_err(|error| DedupError::ParquetSchema {
+                        path: path.to_path_buf(),
+                        message: error.to_string(),
+                    })?;
+            let source = batch.column(index);
+            let converted =
+                cast(source, &DataType::Utf8).map_err(|error| DedupError::ParquetSchema {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "column `{required}` cannot be cast from {:?} to Utf8: {error}",
+                        source.data_type()
+                    ),
+                })?;
+            columns.push(converted);
+        }
+        Ok(Self { columns })
     }
 
-    fn decode(&self, row_index: usize, source_order: SourceOrder) -> Result<InputRow, DedupError> {
-        Ok(InputRow {
-            chain: normalize_chain(self.chain.value(row_index)),
-            contract_address: self.contract_address.value(row_index).trim().to_owned(),
-            token_id: self.token_id.value(row_index).trim().to_owned(),
-            name_norm: coalesce(self.name_norm.value(row_index)),
-            token_uri_norm: coalesce(self.token_uri_norm.value(row_index)),
-            image_uri_norm: coalesce(self.image_uri_norm.value(row_index)),
-            metadata_json: coalesce_metadata(self.metadata_json.value(row_index)),
-            source_order,
-        })
-    }
-}
-
-enum StringCol<'a> {
-    Utf8(&'a StringArray),
-    Large(&'a LargeStringArray),
-}
-
-impl<'a> StringCol<'a> {
-    fn from_array(
-        array: &'a dyn Array,
-        path: &Path,
-        column: &str,
-    ) -> Result<Self, DedupError> {
-        if let Some(values) = array.as_any().downcast_ref::<StringArray>() {
-            Ok(Self::Utf8(values))
-        } else if let Some(values) = array.as_any().downcast_ref::<LargeStringArray>() {
-            Ok(Self::Large(values))
+    fn value(&self, column: usize, row: usize) -> &str {
+        let array = self.columns[column]
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("arrow cast to Utf8 must return StringArray");
+        if array.is_null(row) {
+            ""
         } else {
-            Err(DedupError::ParquetSchema {
-                path: path.to_path_buf(),
-                message: format!("column `{column}` is not a string array"),
-            })
+            array.value(row)
         }
     }
 
-    fn value(&self, index: usize) -> &str {
-        match self {
-            Self::Utf8(array) => {
-                if array.is_null(index) {
-                    ""
-                } else {
-                    array.value(index)
-                }
-            }
-            Self::Large(array) => {
-                if array.is_null(index) {
-                    ""
-                } else {
-                    array.value(index)
-                }
-            }
+    fn decode(&self, row_index: usize, source_order: SourceOrder) -> InputRow {
+        InputRow {
+            chain: normalize_chain(self.value(0, row_index)),
+            contract_address: self.value(1, row_index).trim().to_owned(),
+            token_id: self.value(2, row_index).trim().to_owned(),
+            name_norm: coalesce(self.value(3, row_index)),
+            token_uri_norm: coalesce(self.value(4, row_index)),
+            image_uri_norm: coalesce(self.value(5, row_index)),
+            metadata_json: coalesce_metadata(self.value(6, row_index)),
+            source_order,
         }
     }
 }
 
-fn normalize_chain(raw: &str) -> String {
-    raw.trim().to_ascii_lowercase()
+fn normalize_chain(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
 }
 
-fn coalesce(raw: &str) -> String {
-    raw.trim().to_owned()
+fn coalesce(value: &str) -> String {
+    value.to_owned()
 }
 
-fn coalesce_metadata(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        String::new()
-    } else {
-        trimmed.to_owned()
+fn coalesce_metadata(value: &str) -> String {
+    value.trim().to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::progress::NoopProgress;
+    use arrow_array::{ArrayRef, Int64Array};
+    use arrow_schema::{Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use std::sync::Arc;
+
+    fn write_mixed_schema(path: &Path) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chain", DataType::Utf8, false),
+            Field::new("contract_address", DataType::Utf8, false),
+            Field::new("token_id", DataType::Int64, false),
+            Field::new("name_norm", DataType::Utf8, false),
+            Field::new("token_uri_norm", DataType::Utf8, false),
+            Field::new("image_uri_norm", DataType::Utf8, false),
+            Field::new("metadata_json", DataType::Utf8, false),
+        ]));
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec!["ethereum"])),
+            Arc::new(StringArray::from(vec!["0xabc"])),
+            Arc::new(Int64Array::from(vec![42])),
+            Arc::new(StringArray::from(vec!["collection"])),
+            Arc::new(StringArray::from(vec!["uri://42"])),
+            Arc::new(StringArray::from(vec!["image://42"])),
+            Arc::new(StringArray::from(vec![r#"{"name":"token"}"#])),
+        ];
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+        let mut writer = ArrowWriter::try_new(File::create(path).unwrap(), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    #[test]
+    fn casts_compatible_columns_and_filters_during_scan() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("mixed.parquet");
+        write_mixed_schema(&path);
+        let options = LoadOptions::new(["ethereum".to_owned()], ["ethereum".to_owned()], 1);
+        let store = load_entities_with_options(&[path], &options, &NoopProgress).unwrap();
+        assert_eq!(store.nfts.len(), 1);
+        assert_eq!(store.nfts[0].token_id, "42");
+        assert_eq!(store.contracts[0].metadata_by_token.len(), 1);
+    }
+
+    #[test]
+    fn unknown_requested_chain_is_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("mixed.parquet");
+        write_mixed_schema(&path);
+        let options = LoadOptions::new(["missing".to_owned()], Vec::new(), 1);
+        let error = load_entities_with_options(&[path], &options, &NoopProgress).unwrap_err();
+        assert!(error.to_string().contains("none of the requested"));
     }
 }

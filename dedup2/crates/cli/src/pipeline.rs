@@ -1,10 +1,9 @@
 use crate::progress::ProgressReporter;
-use crate::report::write_reports;
+use crate::report::{ReportRequest, write_reports};
 use dedup_core::{
-    load_entities, run_metadata, run_name, run_uri, DedupError, PrefilterConfig,
-    ProgressObserver, SummaryAccumulator,
+    DedupError, LoadOptions, PrefilterConfig, ProgressObserver, SummaryAccumulator,
+    load_entities_with_options, run_metadata, run_name, run_uri,
 };
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -30,17 +29,21 @@ pub struct RunConfig {
 
 pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupError> {
     let started = Instant::now();
-    let mut store = load_entities(&config.inputs, progress)?;
-
-    let allowed: BTreeSet<String> = config
+    let allowed = config
         .chains
         .iter()
         .map(|c| c.trim().to_ascii_lowercase())
         .filter(|c| !c.is_empty())
-        .collect();
-    if !allowed.is_empty() {
-        store.retain_chains(&allowed);
-    }
+        .collect::<Vec<_>>();
+    let evm_names = config
+        .evm_chains
+        .iter()
+        .map(|c| c.trim().to_ascii_lowercase())
+        .filter(|c| !c.is_empty())
+        .collect::<Vec<_>>();
+    let load_options =
+        LoadOptions::new(allowed, evm_names.iter().cloned(), config.metadata_anchors);
+    let store = load_entities_with_options(&config.inputs, &load_options, progress)?;
 
     let mut acc = SummaryAccumulator::default();
     let name_threshold = config.name_threshold / 100.0;
@@ -79,20 +82,21 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
     }
 
     progress.set_stage("report");
-    progress.set_phase("write");
-    progress.set_total(Some(3));
+    progress.begin_phase("write", Some(3));
     write_reports(
         &config.output_dir,
-        &store,
-        &acc,
-        &config.inputs,
-        &config.chains,
-        &config.evm_chains,
-        config.name_threshold,
-        config.metadata_threshold,
-        config.metadata_anchors,
-        metadata_stats,
-        started.elapsed(),
+        ReportRequest {
+            store: &store,
+            accumulator: &acc,
+            inputs: &config.inputs,
+            chains: &config.chains,
+            evm_chains: &config.evm_chains,
+            name_threshold: config.name_threshold,
+            metadata_threshold: config.metadata_threshold,
+            metadata_anchors: config.metadata_anchors,
+            metadata_prefilter: metadata_stats,
+            elapsed: started.elapsed(),
+        },
     )
     .map_err(|error| DedupError::Message(error.to_string()))?;
     progress.add_completed(3);
