@@ -1,11 +1,14 @@
 use crate::StringDictionary;
+use crate::external_strings::{ExternalStringDictionary, ExternalStringStore, OccurrenceMapReader};
 use ahash::{AHashMap, RandomState};
 use dedup_model::{
     ChainId, Contract, ContractId, DedupError, EntityArtifacts, EntityId, ErrorContext,
     ExecutionMode, InputRow, MetadataSourceValidator, Nft, NftId, NoopProgress,
     PersistedEntityArtifacts, ProgressObserver, SourceOrder, StringId,
 };
-use dedup_storage::SpillVolume;
+use dedup_storage::{
+    EntityArtifactFiles, SpillVolume, write_entity_artifact, write_entity_artifact_from_files,
+};
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::collections::{BTreeMap, BTreeSet, hash_map::Entry};
@@ -19,6 +22,7 @@ const EXTERNAL_ROW_FIELDS: usize = 10;
 const EXTERNAL_SORT_FIELDS: usize = 12;
 const DEFAULT_EXTERNAL_SORT_ROWS: usize = 65_536;
 const DEFAULT_EXTERNAL_MERGE_FAN_IN: usize = 15;
+const DEFAULT_EXTERNAL_STRING_SORT_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 struct PendingNft {
@@ -251,6 +255,12 @@ enum EntityMergeStore {
     External(ExternalRowStore),
 }
 
+#[derive(Debug)]
+enum EntityStringStore {
+    Resident(StringDictionary),
+    External(ExternalStringStore),
+}
+
 #[derive(Clone, Debug)]
 struct PendingContract {
     chain: ChainId,
@@ -268,6 +278,18 @@ pub struct EntityBuildResult {
     pub external_handle_spill_bytes: u64,
     pub external_handle_touches: u64,
     pub external_volumes_used: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EntityBuildSummary {
+    pub contract_count: u64,
+    pub nft_count: u64,
+    pub string_count: u64,
+    pub metadata_spill_bytes: u64,
+    pub external_handle_spill_bytes: u64,
+    pub external_handle_touches: u64,
+    pub external_volumes_used: u64,
+    pub digest_bucket_max: u64,
 }
 
 impl EntityBuildResult {
@@ -299,10 +321,11 @@ pub struct EntityBuilder<V> {
     chain_ids: BTreeMap<String, ChainId>,
     evm_chains: BTreeMap<String, ()>,
     evm_chain_ids: BTreeMap<ChainId, ()>,
-    strings: StringDictionary,
+    strings: EntityStringStore,
     merge_store: EntityMergeStore,
     metadata_validator: V,
     metadata_store: MetadataStore,
+    external_string_sort_bytes: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -312,6 +335,7 @@ pub struct EntityExecutionConfig {
     pub spill_volumes: Vec<SpillVolume>,
     pub external_sort_rows: usize,
     pub external_merge_fan_in: usize,
+    pub external_string_sort_bytes: usize,
 }
 
 impl EntityExecutionConfig {
@@ -343,6 +367,7 @@ impl EntityExecutionConfig {
             spill_volumes,
             external_sort_rows,
             external_merge_fan_in,
+            external_string_sort_bytes: DEFAULT_EXTERNAL_STRING_SORT_BYTES,
         })
     }
 
@@ -356,6 +381,17 @@ impl EntityExecutionConfig {
             });
         }
         self.spill_volumes = volumes;
+        Ok(self)
+    }
+
+    pub fn with_string_sort_bytes(mut self, bytes: usize) -> Result<Self, DedupError> {
+        if bytes == 0 {
+            return Err(DedupError::InvalidInput {
+                context: ErrorContext::stage("entity"),
+                message: "external string sort memory must be positive".to_owned(),
+            });
+        }
+        self.external_string_sort_bytes = bytes;
         Ok(self)
     }
 }
@@ -441,14 +477,26 @@ impl<V: MetadataSourceValidator> EntityBuilder<V> {
                 AHashMap::with_hasher(RandomState::with_seeds(5, 6, 7, 8)),
             ),
         };
+        let strings = match mode {
+            ExecutionMode::Auto | ExecutionMode::InMemory => {
+                EntityStringStore::Resident(StringDictionary::new(digest_bucket_limit)?)
+            }
+            ExecutionMode::Hybrid | ExecutionMode::External => EntityStringStore::External(
+                ExternalStringStore::new(spill_root.ok_or_else(|| DedupError::InvalidInput {
+                    context: ErrorContext::stage("entity"),
+                    message: "external string store requires a spill root".to_owned(),
+                })?)?,
+            ),
+        };
         Ok(Self {
             chain_ids,
             evm_chains,
             evm_chain_ids,
-            strings: StringDictionary::new(digest_bucket_limit)?,
+            strings,
             merge_store,
             metadata_validator,
             metadata_store,
+            external_string_sort_bytes: execution.external_string_sort_bytes,
         })
     }
 
@@ -473,11 +521,6 @@ impl<V: MetadataSourceValidator> EntityBuilder<V> {
         if self.evm_chains.contains_key(&chain_name) {
             address.make_ascii_lowercase();
         }
-        let address_ref = self.strings.intern(address.as_bytes())?;
-        let token_id_ref = self.strings.intern(token_id.as_bytes())?;
-        let name = self.optional_string(&row.name_norm)?;
-        let token_uri = self.optional_string(&row.token_uri_norm)?;
-        let image_uri = self.optional_string(&row.image_uri_norm)?;
         let metadata = if self
             .metadata_validator
             .is_valid_metadata(&row.metadata_json)
@@ -491,6 +534,20 @@ impl<V: MetadataSourceValidator> EntityBuilder<V> {
         };
 
         if let EntityMergeStore::External(rows) = &mut self.merge_store {
+            let strings = match &mut self.strings {
+                EntityStringStore::External(strings) => strings,
+                EntityStringStore::Resident(_) => {
+                    return Err(DedupError::InvariantViolation {
+                        context: ErrorContext::stage("entity"),
+                        message: "external rows use a resident string dictionary".to_owned(),
+                    });
+                }
+            };
+            let address_ref = strings.store(address.as_bytes())?;
+            let token_id_ref = strings.store(token_id.as_bytes())?;
+            let name_ref = external_optional_string(strings, &row.name_norm)?;
+            let token_uri_ref = external_optional_string(strings, &row.token_uri_norm)?;
+            let image_uri_ref = external_optional_string(strings, &row.image_uri_norm)?;
             let (metadata_offset, metadata_length) = match metadata {
                 Some((_, StoredMetadata::Spilled { offset, length })) => (offset, length),
                 None => (NONE_ID, 0),
@@ -503,17 +560,31 @@ impl<V: MetadataSourceValidator> EntityBuilder<V> {
             };
             return rows.push(ExternalRow {
                 chain: u64::from(chain.get()),
-                address_ref: address_ref.as_u64(),
-                token_id_ref: token_id_ref.as_u64(),
-                name_ref: optional_id(name),
-                token_uri_ref: optional_id(token_uri),
-                image_uri_ref: optional_id(image_uri),
+                address_ref,
+                token_id_ref,
+                name_ref,
+                token_uri_ref,
+                image_uri_ref,
                 source_file: u64::from(row.source_order.file_ordinal),
                 source_row: row.source_order.file_row_number,
                 metadata_offset,
                 metadata_length,
             });
         }
+        let strings = match &mut self.strings {
+            EntityStringStore::Resident(strings) => strings,
+            EntityStringStore::External(_) => {
+                return Err(DedupError::InvariantViolation {
+                    context: ErrorContext::stage("entity"),
+                    message: "resident rows use an external string dictionary".to_owned(),
+                });
+            }
+        };
+        let address_ref = strings.intern(address.as_bytes())?;
+        let token_id_ref = strings.intern(token_id.as_bytes())?;
+        let name = resident_optional_string(strings, &row.name_norm)?;
+        let token_uri = resident_optional_string(strings, &row.token_uri_norm)?;
+        let image_uri = resident_optional_string(strings, &row.image_uri_norm)?;
         let contracts = match &mut self.merge_store {
             EntityMergeStore::Resident(contracts) => contracts,
             EntityMergeStore::External(_) => unreachable!("external rows returned above"),
@@ -558,14 +629,6 @@ impl<V: MetadataSourceValidator> EntityBuilder<V> {
         Ok(())
     }
 
-    fn optional_string(&mut self, value: &str) -> Result<Option<StringId>, DedupError> {
-        if value.is_empty() {
-            Ok(None)
-        } else {
-            self.strings.intern(value.as_bytes()).map(Some)
-        }
-    }
-
     pub fn finish(self) -> Result<EntityBuildResult, DedupError> {
         self.finish_with_progress(&NoopProgress)
     }
@@ -575,19 +638,42 @@ impl<V: MetadataSourceValidator> EntityBuilder<V> {
         progress: &dyn ProgressObserver,
     ) -> Result<EntityBuildResult, DedupError> {
         self.metadata_store.prepare_read()?;
+        let strings = std::mem::replace(
+            &mut self.strings,
+            EntityStringStore::Resident(StringDictionary::new(1)?),
+        );
         let merge_store = std::mem::replace(
             &mut self.merge_store,
             EntityMergeStore::Resident(AHashMap::with_hasher(RandomState::with_seeds(5, 6, 7, 8))),
         );
         if let EntityMergeStore::External(rows) = merge_store {
+            let EntityStringStore::External(strings) = strings else {
+                return Err(DedupError::InvariantViolation {
+                    context: ErrorContext::stage("entity"),
+                    message: "external entity rows have no external string spool".to_owned(),
+                });
+            };
+            let dictionary = strings.finish(
+                &rows.volumes,
+                rows.sort_chunk_rows.saturating_mul(5).max(1),
+                self.external_string_sort_bytes,
+                rows.merge_fan_in,
+                progress,
+            )?;
             return finish_external_entities(
                 rows,
-                self.strings,
+                dictionary,
                 &self.evm_chain_ids,
                 &mut self.metadata_store,
                 progress,
             );
         }
+        let EntityStringStore::Resident(strings) = strings else {
+            return Err(DedupError::InvariantViolation {
+                context: ErrorContext::stage("entity"),
+                message: "resident entity rows have no resident string dictionary".to_owned(),
+            });
+        };
         let EntityMergeStore::Resident(contracts) = merge_store else {
             unreachable!("external entity store returned above");
         };
@@ -611,7 +697,7 @@ impl<V: MetadataSourceValidator> EntityBuilder<V> {
             let mut pending_nfts: Vec<_> = pending_contract.nfts.into_iter().collect();
             if self.evm_chain_ids.contains_key(&pending_contract.chain) {
                 for record in &pending_nfts {
-                    let token_bytes = self.strings.resolve(record.0).ok_or_else(|| {
+                    let token_bytes = strings.resolve(record.0).ok_or_else(|| {
                         DedupError::InvariantViolation {
                             context: ErrorContext::stage("entity"),
                             message: "pending token StringId is missing".to_owned(),
@@ -629,19 +715,17 @@ impl<V: MetadataSourceValidator> EntityBuilder<V> {
                 }
                 pending_nfts.sort_unstable_by(|left, right| {
                     compare_decimal_tokens(
-                        self.strings
+                        strings
                             .resolve(left.0)
                             .expect("validated token StringId must resolve"),
-                        self.strings
+                        strings
                             .resolve(right.0)
                             .expect("validated token StringId must resolve"),
                     )
                 });
             } else {
                 pending_nfts.sort_unstable_by(|left, right| {
-                    self.strings
-                        .resolve(left.0)
-                        .cmp(&self.strings.resolve(right.0))
+                    strings.resolve(left.0).cmp(&strings.resolve(right.0))
                 });
             }
             for (token_id_ref, pending_nft) in pending_nfts {
@@ -669,14 +753,137 @@ impl<V: MetadataSourceValidator> EntityBuilder<V> {
             progress.advance(1);
             progress.check_cancelled("entity")?;
         }
+        let (artifacts, strings) = remap_strings_lexically(artifacts, strings)?;
         Ok(EntityBuildResult {
             artifacts,
-            strings: self.strings,
+            strings,
             metadata_by_nft,
             metadata_spill_bytes: self.metadata_store.spill_bytes(),
             external_handle_spill_bytes: 0,
             external_handle_touches: 0,
             external_volumes_used: 0,
+        })
+    }
+
+    pub fn finish_to_artifact(
+        mut self,
+        path: impl AsRef<Path>,
+        logical_input_digest: String,
+        configuration_digest: String,
+        progress: &dyn ProgressObserver,
+    ) -> Result<EntityBuildSummary, DedupError> {
+        if matches!(self.merge_store, EntityMergeStore::Resident(_)) {
+            let result = self.finish_with_progress(progress)?;
+            let summary = EntityBuildSummary {
+                contract_count: u64::try_from(result.artifacts.contracts.len()).map_err(|_| {
+                    DedupError::CounterOverflow {
+                        counter: "entity_contract_count",
+                    }
+                })?,
+                nft_count: u64::try_from(result.artifacts.nfts.len()).map_err(|_| {
+                    DedupError::CounterOverflow {
+                        counter: "entity_nft_count",
+                    }
+                })?,
+                string_count: u64::try_from(result.strings.len()).map_err(|_| {
+                    DedupError::CounterOverflow {
+                        counter: "entity_string_count",
+                    }
+                })?,
+                metadata_spill_bytes: result.metadata_spill_bytes,
+                external_handle_spill_bytes: result.external_handle_spill_bytes,
+                external_handle_touches: result.external_handle_touches,
+                external_volumes_used: result.external_volumes_used,
+                digest_bucket_max: u64::try_from(result.strings.max_digest_bucket_len())
+                    .unwrap_or(u64::MAX),
+            };
+            write_entity_artifact(
+                path,
+                &result.into_persisted(),
+                logical_input_digest,
+                configuration_digest,
+            )?;
+            return Ok(summary);
+        }
+
+        self.metadata_store.prepare_read()?;
+        let rows = match std::mem::replace(
+            &mut self.merge_store,
+            EntityMergeStore::Resident(AHashMap::with_hasher(RandomState::with_seeds(5, 6, 7, 8))),
+        ) {
+            EntityMergeStore::External(rows) => rows,
+            EntityMergeStore::Resident(_) => unreachable!("resident mode returned above"),
+        };
+        let strings = match std::mem::replace(
+            &mut self.strings,
+            EntityStringStore::Resident(StringDictionary::new(1)?),
+        ) {
+            EntityStringStore::External(strings) => strings,
+            EntityStringStore::Resident(_) => {
+                return Err(DedupError::InvariantViolation {
+                    context: ErrorContext::stage("entity"),
+                    message: "external entity rows have no external string spool".to_owned(),
+                });
+            }
+        };
+        let dictionary = strings.finish(
+            &rows.volumes,
+            rows.sort_chunk_rows.saturating_mul(5).max(1),
+            self.external_string_sort_bytes,
+            rows.merge_fan_in,
+            progress,
+        )?;
+        let root = rows
+            .volumes
+            .first()
+            .map(|volume| volume.root.clone())
+            .ok_or_else(|| DedupError::InvalidInput {
+                context: ErrorContext::stage("entity"),
+                message: "external entity reducer has no volume".to_owned(),
+            })?;
+        let mut sorted =
+            prepare_external_sorted_rows(rows, &dictionary, &self.evm_chain_ids, progress)?;
+        let mut reducer = ExternalArtifactReducer::new(&root, &mut self.metadata_store)?;
+        if let Some(run) = sorted.run.take() {
+            progress.begin_phase("entity_external_artifact_reduce", Some(run.records));
+            let mut reader = BufReader::with_capacity(1024 * 1024, File::open(&run.path)?);
+            let mut work = 0_u64;
+            for _ in 0..run.records {
+                reducer.push(read_sort_record(&mut reader)?)?;
+                work += 1;
+                if work == 4_096 {
+                    progress.advance(work);
+                    progress.check_cancelled("entity")?;
+                    work = 0;
+                }
+            }
+            progress.advance(work);
+            progress.check_cancelled("entity")?;
+            ensure_reader_eof(&mut reader, "external entity sort run has trailing bytes")?;
+            sorted.handle_touches = checked_touches(sorted.handle_touches, run.records)?;
+            std::fs::remove_file(run.path)?;
+        }
+        let reduced = reducer.finish()?;
+        let files = EntityArtifactFiles {
+            strings_offsets: dictionary.offsets.path().to_path_buf(),
+            strings_blob: dictionary.blob.path().to_path_buf(),
+            contracts: reduced.contracts.path().to_path_buf(),
+            nfts: reduced.nfts.path().to_path_buf(),
+            metadata_offsets: reduced.metadata_offsets.path().to_path_buf(),
+            metadata_blob: reduced.metadata_blob.path().to_path_buf(),
+        };
+        write_entity_artifact_from_files(path, &files, logical_input_digest, configuration_digest)?;
+        Ok(EntityBuildSummary {
+            contract_count: reduced.contract_count,
+            nft_count: reduced.nft_count,
+            string_count: dictionary.string_count,
+            metadata_spill_bytes: self.metadata_store.spill_bytes(),
+            external_handle_spill_bytes: sorted.spill_bytes.saturating_add(dictionary.spill_bytes),
+            external_handle_touches: sorted
+                .handle_touches
+                .saturating_add(dictionary.handle_touches),
+            external_volumes_used: sorted.volumes_used,
+            digest_bucket_max: u64::from(dictionary.string_count > 0),
         })
     }
 }
@@ -687,16 +894,64 @@ struct SortRun {
     records: u64,
 }
 
+struct ExternalSortedRows {
+    run: Option<SortRun>,
+    spill_bytes: u64,
+    handle_touches: u64,
+    volumes_used: u64,
+}
+
 fn finish_external_entities(
-    mut rows: ExternalRowStore,
-    strings: StringDictionary,
+    rows: ExternalRowStore,
+    dictionary: ExternalStringDictionary,
     evm_chain_ids: &BTreeMap<ChainId, ()>,
     metadata_store: &mut MetadataStore,
     progress: &dyn ProgressObserver,
 ) -> Result<EntityBuildResult, DedupError> {
+    let mut sorted = prepare_external_sorted_rows(rows, &dictionary, evm_chain_ids, progress)?;
+    let mut reducer = ExternalEntityReducer::new(metadata_store);
+    if let Some(run) = sorted.run.take() {
+        progress.begin_phase("entity_external_reduce", Some(run.records));
+        let mut reader = BufReader::with_capacity(64 * 1024, File::open(&run.path)?);
+        let mut work = 0_u64;
+        for _ in 0..run.records {
+            reducer.push(read_sort_record(&mut reader)?)?;
+            work += 1;
+            if work == 4_096 {
+                progress.advance(work);
+                progress.check_cancelled("entity")?;
+                work = 0;
+            }
+        }
+        progress.advance(work);
+        progress.check_cancelled("entity")?;
+        ensure_reader_eof(&mut reader, "external entity sort run has trailing bytes")?;
+        sorted.handle_touches = checked_touches(sorted.handle_touches, run.records)?;
+        std::fs::remove_file(run.path)?;
+    }
+    let (artifacts, metadata_by_nft) = reducer.finish()?;
+    let strings = materialize_external_dictionary(&dictionary)?;
+    Ok(EntityBuildResult {
+        artifacts,
+        strings,
+        metadata_by_nft,
+        metadata_spill_bytes: metadata_store.spill_bytes(),
+        external_handle_spill_bytes: sorted.spill_bytes.saturating_add(dictionary.spill_bytes),
+        external_handle_touches: sorted
+            .handle_touches
+            .saturating_add(dictionary.handle_touches),
+        external_volumes_used: sorted.volumes_used,
+    })
+}
+
+fn prepare_external_sorted_rows(
+    mut rows: ExternalRowStore,
+    dictionary: &ExternalStringDictionary,
+    evm_chain_ids: &BTreeMap<ChainId, ()>,
+    progress: &dyn ProgressObserver,
+) -> Result<ExternalSortedRows, DedupError> {
     let input_spill_bytes = rows.input_spill_bytes();
-    let lexical_ranks = lexical_string_ranks(&strings)?;
-    let numeric_ranks = numeric_string_ranks(&strings)?;
+    let mut occurrence_map = OccurrenceMapReader::new(dictionary)?;
     let mut reader = rows.prepare_reader()?;
     let mut runs = Vec::new();
     let mut remaining = rows.rows;
@@ -721,8 +976,7 @@ fn finish_external_entities(
         for _ in 0..count {
             chunk.push(sortable_external_row(
                 read_external_row(&mut reader)?,
-                &lexical_ranks,
-                &numeric_ranks,
+                &mut occurrence_map,
                 evm_chain_ids,
             )?);
         }
@@ -750,6 +1004,7 @@ fn finish_external_entities(
                 })?;
     }
     ensure_reader_eof(&mut reader, "external entity rows have trailing bytes")?;
+    occurrence_map.finish()?;
     let mut pass = 1_usize;
     while runs.len() > 1 {
         progress.begin_phase("entity_external_merge", Some(rows.rows));
@@ -799,70 +1054,16 @@ fn finish_external_entities(
         }
         pass = pass.saturating_add(1);
     }
-    let mut reducer = ExternalEntityReducer::new(metadata_store);
-    if let Some(run) = runs.pop() {
-        progress.begin_phase("entity_external_reduce", Some(run.records));
-        let mut reader = BufReader::with_capacity(64 * 1024, File::open(&run.path)?);
-        let mut work = 0_u64;
-        for _ in 0..run.records {
-            reducer.push(read_sort_record(&mut reader)?)?;
-            work += 1;
-            if work == 4_096 {
-                progress.advance(work);
-                progress.check_cancelled("entity")?;
-                work = 0;
-            }
-        }
-        progress.advance(work);
-        progress.check_cancelled("entity")?;
-        ensure_reader_eof(&mut reader, "external entity sort run has trailing bytes")?;
-        handle_touches = checked_touches(handle_touches, run.records)?;
-        std::fs::remove_file(run.path)?;
-    }
-    let (artifacts, metadata_by_nft) = reducer.finish()?;
-    Ok(EntityBuildResult {
-        artifacts,
-        strings,
-        metadata_by_nft,
-        metadata_spill_bytes: metadata_store.spill_bytes(),
-        external_handle_spill_bytes: spill_bytes,
-        external_handle_touches: handle_touches,
-        external_volumes_used: u64::try_from(volumes_used.len()).map_err(|_| {
+    Ok(ExternalSortedRows {
+        run: runs.pop(),
+        spill_bytes,
+        handle_touches,
+        volumes_used: u64::try_from(volumes_used.len()).map_err(|_| {
             DedupError::CounterOverflow {
                 counter: "entity_external_volumes_used",
             }
         })?,
     })
-}
-
-fn lexical_string_ranks(strings: &StringDictionary) -> Result<Vec<u64>, DedupError> {
-    let mut entries: Vec<_> = strings.values().enumerate().collect();
-    entries.sort_unstable_by(|left, right| left.1.cmp(right.1));
-    let mut ranks = vec![0_u64; entries.len()];
-    for (rank, (index, _)) in entries.into_iter().enumerate() {
-        ranks[index] = u64::try_from(rank).map_err(|_| DedupError::CounterOverflow {
-            counter: "entity_string_lexical_rank",
-        })?;
-    }
-    Ok(ranks)
-}
-
-fn numeric_string_ranks(strings: &StringDictionary) -> Result<Vec<Option<u64>>, DedupError> {
-    let mut entries = strings
-        .values()
-        .enumerate()
-        .filter(|(_, value)| is_decimal_token(value))
-        .collect::<Vec<_>>();
-    entries.sort_unstable_by(|left, right| compare_decimal_tokens(left.1, right.1));
-    let mut ranks = vec![None; strings.len()];
-    for (rank, (index, _)) in entries.into_iter().enumerate() {
-        ranks[index] = Some(
-            u64::try_from(rank).map_err(|_| DedupError::CounterOverflow {
-                counter: "entity_string_numeric_rank",
-            })?,
-        );
-    }
-    Ok(ranks)
 }
 
 fn is_decimal_token(value: &[u8]) -> bool {
@@ -887,31 +1088,25 @@ fn compare_decimal_tokens(left: &[u8], right: &[u8]) -> Ordering {
 
 fn sortable_external_row(
     row: ExternalRow,
-    lexical_ranks: &[u64],
-    numeric_ranks: &[Option<u64>],
+    occurrence_map: &mut OccurrenceMapReader,
     evm_chain_ids: &BTreeMap<ChainId, ()>,
 ) -> Result<ExternalSortRecord, DedupError> {
     let chain = ChainId::new(
         u16::try_from(row.chain).map_err(|_| invalid_external_row("chain ID exceeds u16"))?,
     );
-    let address_index = id_index_u64(row.address_ref, "address StringId")?;
-    let token_index = id_index_u64(row.token_id_ref, "token StringId")?;
-    let address_rank = *lexical_ranks
-        .get(address_index)
-        .ok_or_else(|| invalid_external_row("address StringId is missing"))?;
+    let (address_ref, _) = occurrence_map.resolve(row.address_ref)?;
+    let (token_id_ref, token_numeric_rank) = occurrence_map.resolve(row.token_id_ref)?;
+    let name_ref = resolve_external_optional(occurrence_map, row.name_ref)?;
+    let token_uri_ref = resolve_external_optional(occurrence_map, row.token_uri_ref)?;
+    let image_uri_ref = resolve_external_optional(occurrence_map, row.image_uri_ref)?;
+    let address_rank = address_ref.as_u64();
     let token_rank = if evm_chain_ids.contains_key(&chain) {
-        numeric_ranks
-            .get(token_index)
-            .copied()
-            .flatten()
-            .ok_or_else(|| DedupError::InvalidInput {
-                context: ErrorContext::stage("entity"),
-                message: "EVM token id is not a non-negative integer".to_owned(),
-            })?
+        token_numeric_rank.ok_or_else(|| DedupError::InvalidInput {
+            context: ErrorContext::stage("entity"),
+            message: "EVM token id is not a non-negative integer".to_owned(),
+        })?
     } else {
-        *lexical_ranks
-            .get(token_index)
-            .ok_or_else(|| invalid_external_row("token StringId is missing"))?
+        token_id_ref.as_u64()
     };
     Ok(ExternalSortRecord {
         chain: row.chain,
@@ -919,11 +1114,11 @@ fn sortable_external_row(
         token_rank,
         source_file: row.source_file,
         source_row: row.source_row,
-        address_ref: row.address_ref,
-        token_id_ref: row.token_id_ref,
-        name_ref: row.name_ref,
-        token_uri_ref: row.token_uri_ref,
-        image_uri_ref: row.image_uri_ref,
+        address_ref: address_ref.as_u64(),
+        token_id_ref: token_id_ref.as_u64(),
+        name_ref: optional_id(name_ref),
+        token_uri_ref: optional_id(token_uri_ref),
+        image_uri_ref: optional_id(image_uri_ref),
         metadata_offset: row.metadata_offset,
         metadata_length: row.metadata_length,
     })
@@ -1075,6 +1270,242 @@ struct ExternalContractAggregate {
     nft_count: u64,
 }
 
+struct ExternalArtifactFiles {
+    contracts: NamedTempFile,
+    nfts: NamedTempFile,
+    metadata_offsets: NamedTempFile,
+    metadata_blob: NamedTempFile,
+    contract_count: u64,
+    nft_count: u64,
+}
+
+struct ExternalArtifactReducer<'a> {
+    metadata_store: &'a mut MetadataStore,
+    contracts: NamedTempFile,
+    nfts: NamedTempFile,
+    metadata_offsets: NamedTempFile,
+    metadata_blob: NamedTempFile,
+    contract_writer: BufWriter<File>,
+    nft_writer: BufWriter<File>,
+    metadata_offset_writer: BufWriter<File>,
+    metadata_blob_writer: BufWriter<File>,
+    metadata_blob_position: u64,
+    metadata_count: u64,
+    contract_count: u64,
+    nft_count: u64,
+    contract: Option<ExternalContractAggregate>,
+    nft: Option<ExternalNftAggregate>,
+}
+
+impl<'a> ExternalArtifactReducer<'a> {
+    fn new(root: &Path, metadata_store: &'a mut MetadataStore) -> Result<Self, DedupError> {
+        std::fs::create_dir_all(root)?;
+        let contracts = NamedTempFile::new_in(root)?;
+        let nfts = NamedTempFile::new_in(root)?;
+        let metadata_offsets = NamedTempFile::new_in(root)?;
+        let metadata_blob = NamedTempFile::new_in(root)?;
+        let mut contract_writer = BufWriter::with_capacity(1024 * 1024, contracts.reopen()?);
+        let mut nft_writer = BufWriter::with_capacity(1024 * 1024, nfts.reopen()?);
+        let mut metadata_offset_writer =
+            BufWriter::with_capacity(1024 * 1024, metadata_offsets.reopen()?);
+        write_raw_u64(&mut contract_writer, 0)?;
+        write_raw_u64(&mut nft_writer, 0)?;
+        write_raw_u64(&mut metadata_offset_writer, 0)?;
+        Ok(Self {
+            metadata_store,
+            contract_writer,
+            nft_writer,
+            metadata_offset_writer,
+            metadata_blob_writer: BufWriter::with_capacity(1024 * 1024, metadata_blob.reopen()?),
+            contracts,
+            nfts,
+            metadata_offsets,
+            metadata_blob,
+            metadata_blob_position: 0,
+            metadata_count: 0,
+            contract_count: 0,
+            nft_count: 0,
+            contract: None,
+            nft: None,
+        })
+    }
+
+    fn push(&mut self, row: ExternalSortRecord) -> Result<(), DedupError> {
+        let chain_id = ChainId::new(
+            u16::try_from(row.chain).map_err(|_| invalid_external_row("chain ID exceeds u16"))?,
+        );
+        let address_ref = decode_string_id(row.address_ref, "address StringId")?;
+        let token_id_ref = decode_string_id(row.token_id_ref, "token StringId")?;
+        if self.contract.as_ref().is_some_and(|contract| {
+            (contract.chain_id, contract.address_ref) != (chain_id, address_ref)
+        }) {
+            self.finish_contract()?;
+        }
+        if self.contract.is_none() {
+            self.contract = Some(ExternalContractAggregate {
+                chain_id,
+                address_ref,
+                name_ref: None,
+                first_nft_id: checked_u64_id::<NftId>(self.nft_count, NftId::new)?,
+                nft_count: 0,
+            });
+        }
+        if self
+            .nft
+            .as_ref()
+            .is_some_and(|nft| nft.token_id_ref != token_id_ref)
+        {
+            self.finish_nft()?;
+        }
+        if self.nft.is_none() {
+            self.nft = Some(ExternalNftAggregate {
+                token_id_ref,
+                name_ref: None,
+                token_uri_ref: None,
+                image_uri_ref: None,
+                metadata: None,
+            });
+        }
+        let name_ref = decode_optional_string_id(row.name_ref, "name StringId")?;
+        let token_uri_ref = decode_optional_string_id(row.token_uri_ref, "token URI StringId")?;
+        let image_uri_ref = decode_optional_string_id(row.image_uri_ref, "image URI StringId")?;
+        let contract = self
+            .contract
+            .as_mut()
+            .ok_or_else(|| invalid_external_row("contract reducer is missing"))?;
+        contract.name_ref = merge_optional(
+            contract.name_ref,
+            name_ref,
+            "multiple distinct non-empty names in one contract",
+        )?;
+        let nft = self
+            .nft
+            .as_mut()
+            .ok_or_else(|| invalid_external_row("NFT reducer is missing"))?;
+        nft.name_ref = merge_optional(nft.name_ref, name_ref, "conflicting NFT name")?;
+        nft.token_uri_ref =
+            merge_optional(nft.token_uri_ref, token_uri_ref, "conflicting token URI")?;
+        nft.image_uri_ref =
+            merge_optional(nft.image_uri_ref, image_uri_ref, "conflicting image URI")?;
+        if nft.metadata.is_none() && row.metadata_offset != NONE_ID {
+            nft.metadata = Some(StoredMetadata::Spilled {
+                offset: row.metadata_offset,
+                length: row.metadata_length,
+            });
+        }
+        Ok(())
+    }
+
+    fn finish_nft(&mut self) -> Result<(), DedupError> {
+        let Some(nft) = self.nft.take() else {
+            return Ok(());
+        };
+        let contract_id = checked_u64_id::<ContractId>(self.contract_count, ContractId::new)?;
+        let nft_id = checked_u64_id::<NftId>(self.nft_count, NftId::new)?;
+        let has_metadata = if let Some(metadata) = nft.metadata {
+            let content = self.metadata_store.read(metadata)?;
+            let length = u64::try_from(content.len()).map_err(|_| DedupError::CounterOverflow {
+                counter: "entity_metadata_length",
+            })?;
+            write_raw_u64(&mut self.metadata_offset_writer, nft_id.as_u64())?;
+            write_raw_u64(
+                &mut self.metadata_offset_writer,
+                self.metadata_blob_position,
+            )?;
+            write_raw_u64(&mut self.metadata_offset_writer, length)?;
+            self.metadata_blob_writer.write_all(content.as_bytes())?;
+            self.metadata_blob_position = self.metadata_blob_position.checked_add(length).ok_or(
+                DedupError::CounterOverflow {
+                    counter: "entity_metadata_blob_bytes",
+                },
+            )?;
+            self.metadata_count =
+                self.metadata_count
+                    .checked_add(1)
+                    .ok_or(DedupError::CounterOverflow {
+                        counter: "entity_metadata_count",
+                    })?;
+            true
+        } else {
+            false
+        };
+        write_nft_record(
+            &mut self.nft_writer,
+            &Nft {
+                id: nft_id,
+                contract_id,
+                token_id_ref: nft.token_id_ref,
+                token_uri_ref: nft.token_uri_ref,
+                image_uri_ref: nft.image_uri_ref,
+                has_metadata,
+            },
+        )?;
+        self.nft_count = self
+            .nft_count
+            .checked_add(1)
+            .ok_or(DedupError::CounterOverflow {
+                counter: "entity_nft_count",
+            })?;
+        let contract = self
+            .contract
+            .as_mut()
+            .ok_or_else(|| invalid_external_row("NFT has no contract reducer"))?;
+        contract.nft_count =
+            contract
+                .nft_count
+                .checked_add(1)
+                .ok_or(DedupError::CounterOverflow {
+                    counter: "entity_contract_nft_count",
+                })?;
+        Ok(())
+    }
+
+    fn finish_contract(&mut self) -> Result<(), DedupError> {
+        self.finish_nft()?;
+        let Some(contract) = self.contract.take() else {
+            return Ok(());
+        };
+        let id = checked_u64_id::<ContractId>(self.contract_count, ContractId::new)?;
+        write_contract_record(
+            &mut self.contract_writer,
+            &Contract {
+                id,
+                chain_id: contract.chain_id,
+                address_ref: contract.address_ref,
+                name_ref: contract.name_ref,
+                first_nft_id: contract.first_nft_id,
+                nft_count: contract.nft_count,
+            },
+        )?;
+        self.contract_count =
+            self.contract_count
+                .checked_add(1)
+                .ok_or(DedupError::CounterOverflow {
+                    counter: "entity_contract_count",
+                })?;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<ExternalArtifactFiles, DedupError> {
+        self.finish_contract()?;
+        self.contract_writer.flush()?;
+        self.nft_writer.flush()?;
+        self.metadata_offset_writer.flush()?;
+        self.metadata_blob_writer.flush()?;
+        overwrite_count(&mut self.contracts, self.contract_count)?;
+        overwrite_count(&mut self.nfts, self.nft_count)?;
+        overwrite_count(&mut self.metadata_offsets, self.metadata_count)?;
+        Ok(ExternalArtifactFiles {
+            contracts: self.contracts,
+            nfts: self.nfts,
+            metadata_offsets: self.metadata_offsets,
+            metadata_blob: self.metadata_blob,
+            contract_count: self.contract_count,
+            nft_count: self.nft_count,
+        })
+    }
+}
+
 struct ExternalEntityReducer<'a> {
     metadata_store: &'a mut MetadataStore,
     artifacts: EntityArtifacts,
@@ -1224,6 +1655,128 @@ fn optional_id(value: Option<StringId>) -> u64 {
     value.map_or(NONE_ID, StringId::as_u64)
 }
 
+fn resident_optional_string(
+    strings: &mut StringDictionary,
+    value: &str,
+) -> Result<Option<StringId>, DedupError> {
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        strings.intern(value.as_bytes()).map(Some)
+    }
+}
+
+fn external_optional_string(
+    strings: &mut ExternalStringStore,
+    value: &str,
+) -> Result<u64, DedupError> {
+    if value.is_empty() {
+        Ok(NONE_ID)
+    } else {
+        strings.store(value.as_bytes())
+    }
+}
+
+fn resolve_external_optional(
+    occurrences: &mut OccurrenceMapReader,
+    value: u64,
+) -> Result<Option<StringId>, DedupError> {
+    if value == NONE_ID {
+        Ok(None)
+    } else {
+        occurrences.resolve(value).map(|(id, _)| Some(id))
+    }
+}
+
+fn materialize_external_dictionary(
+    dictionary: &ExternalStringDictionary,
+) -> Result<StringDictionary, DedupError> {
+    let mut offsets = BufReader::with_capacity(1024 * 1024, dictionary.offsets.reopen()?);
+    let mut blob = BufReader::with_capacity(1024 * 1024, dictionary.blob.reopen()?);
+    let count = read_u64_fields::<1>(&mut offsets)?[0];
+    if count != dictionary.string_count {
+        return Err(invalid_external_row(
+            "external string dictionary count mismatch",
+        ));
+    }
+    let mut values = Vec::with_capacity(usize::try_from(count).map_err(|_| {
+        DedupError::ResourceBudgetExceeded {
+            context: ErrorContext::stage("entity"),
+            requested: count,
+        }
+    })?);
+    let mut expected_offset = 0_u64;
+    for _ in 0..count {
+        let [offset, length] = read_u64_fields::<2>(&mut offsets)?;
+        if offset != expected_offset {
+            return Err(invalid_external_row(
+                "external string offsets are not contiguous",
+            ));
+        }
+        let length = usize::try_from(length).map_err(|_| DedupError::ResourceBudgetExceeded {
+            context: ErrorContext::stage("entity"),
+            requested: length,
+        })?;
+        let mut value = vec![0_u8; length];
+        blob.read_exact(&mut value)?;
+        expected_offset = expected_offset
+            .checked_add(u64::try_from(length).unwrap_or(u64::MAX))
+            .ok_or(DedupError::CounterOverflow {
+                counter: "external_string_blob_bytes",
+            })?;
+        values.push(value);
+    }
+    ensure_reader_eof(&mut offsets, "external string offsets have trailing bytes")?;
+    ensure_reader_eof(&mut blob, "external string blob has trailing bytes")?;
+    StringDictionary::from_ordered_values(values, 64)
+}
+
+fn remap_strings_lexically(
+    mut artifacts: EntityArtifacts,
+    strings: StringDictionary,
+) -> Result<(EntityArtifacts, StringDictionary), DedupError> {
+    let mut ordered = strings
+        .values()
+        .enumerate()
+        .map(|(old, value)| (old, value.to_vec()))
+        .collect::<Vec<_>>();
+    ordered.sort_unstable_by(|left, right| left.1.cmp(&right.1));
+    let mut remap = vec![StringId::new(EntityId::MIN); ordered.len()];
+    let mut values = Vec::with_capacity(ordered.len());
+    for (new, (old, value)) in ordered.into_iter().enumerate() {
+        let new = StringId::new(
+            EntityId::try_from(new).map_err(|_| DedupError::InvalidInput {
+                context: ErrorContext::stage("entity"),
+                message: "StringId capacity exceeded; rebuild with wide_ids".to_owned(),
+            })?,
+        );
+        remap[old] = new;
+        values.push(value);
+    }
+    let map = |id: StringId| -> Result<StringId, DedupError> {
+        remap
+            .get(
+                usize::try_from(id.as_u64())
+                    .map_err(|_| invalid_external_row("resident StringId does not fit usize"))?,
+            )
+            .copied()
+            .ok_or_else(|| invalid_external_row("resident StringId is missing"))
+    };
+    for contract in &mut artifacts.contracts {
+        contract.address_ref = map(contract.address_ref)?;
+        contract.name_ref = contract.name_ref.map(&map).transpose()?;
+    }
+    for nft in &mut artifacts.nfts {
+        nft.token_id_ref = map(nft.token_id_ref)?;
+        nft.token_uri_ref = nft.token_uri_ref.map(&map).transpose()?;
+        nft.image_uri_ref = nft.image_uri_ref.map(&map).transpose()?;
+    }
+    Ok((
+        artifacts,
+        StringDictionary::from_ordered_values(values, 64)?,
+    ))
+}
+
 fn decode_optional_string_id(
     value: u64,
     field: &'static str,
@@ -1239,10 +1792,6 @@ fn decode_string_id(value: u64, field: &'static str) -> Result<StringId, DedupEr
     EntityId::try_from(value)
         .map(StringId::new)
         .map_err(|_| invalid_external_row(&format!("{field} exceeds EntityId")))
-}
-
-fn id_index_u64(value: u64, field: &'static str) -> Result<usize, DedupError> {
-    usize::try_from(value).map_err(|_| invalid_external_row(&format!("{field} exceeds usize")))
 }
 
 fn weighted_volume_root(
@@ -1339,6 +1888,46 @@ fn checked_id<T>(length: usize, constructor: impl FnOnce(EntityId) -> T) -> Resu
         message: "entity ID capacity exceeded; rebuild with wide_ids".to_owned(),
     })?;
     Ok(constructor(raw))
+}
+
+fn checked_u64_id<T>(value: u64, constructor: impl FnOnce(EntityId) -> T) -> Result<T, DedupError> {
+    EntityId::try_from(value)
+        .map(constructor)
+        .map_err(|_| DedupError::InvalidInput {
+            context: ErrorContext::stage("entity"),
+            message: "entity count exceeds configured EntityId; rebuild with wide_ids".to_owned(),
+        })
+}
+
+fn write_raw_u64(writer: &mut impl Write, value: u64) -> Result<(), DedupError> {
+    writer.write_all(&value.to_le_bytes())?;
+    Ok(())
+}
+
+fn write_contract_record(writer: &mut impl Write, contract: &Contract) -> Result<(), DedupError> {
+    write_raw_u64(writer, contract.id.as_u64())?;
+    writer.write_all(&contract.chain_id.get().to_le_bytes())?;
+    write_raw_u64(writer, contract.address_ref.as_u64())?;
+    write_raw_u64(writer, contract.name_ref.map_or(NONE_ID, StringId::as_u64))?;
+    write_raw_u64(writer, contract.first_nft_id.as_u64())?;
+    write_raw_u64(writer, contract.nft_count)
+}
+
+fn write_nft_record(writer: &mut impl Write, nft: &Nft) -> Result<(), DedupError> {
+    write_raw_u64(writer, nft.id.as_u64())?;
+    write_raw_u64(writer, nft.contract_id.as_u64())?;
+    write_raw_u64(writer, nft.token_id_ref.as_u64())?;
+    write_raw_u64(writer, nft.token_uri_ref.map_or(NONE_ID, StringId::as_u64))?;
+    write_raw_u64(writer, nft.image_uri_ref.map_or(NONE_ID, StringId::as_u64))?;
+    writer.write_all(&[u8::from(nft.has_metadata)])?;
+    Ok(())
+}
+
+fn overwrite_count(file: &mut NamedTempFile, count: u64) -> Result<(), DedupError> {
+    file.as_file_mut().seek(std::io::SeekFrom::Start(0))?;
+    file.as_file_mut().write_all(&count.to_le_bytes())?;
+    file.as_file_mut().sync_all()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1555,6 +2144,82 @@ mod tests {
         assert!(hybrid.3 > 0);
         assert!(external.2 > 0);
         assert!(external.3 > 0);
+    }
+
+    #[test]
+    fn external_modes_write_logically_identical_artifacts_without_materializing_results() {
+        let build_rows = || {
+            let mut rows = ["10", "2", "01", "1"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, token_id)| {
+                    let mut input = row(
+                        "collection",
+                        "ipfs://same",
+                        SourceOrder::new(0, index as u64),
+                    );
+                    input.token_id = token_id.to_owned();
+                    input
+                })
+                .collect::<Vec<_>>();
+            let mut second_contract = row("collection", "ipfs://same", SourceOrder::new(0, 4));
+            second_contract.contract_address = "0xDEF".to_owned();
+            second_contract.token_id = "9".to_owned();
+            rows.push(second_contract);
+            rows
+        };
+        let mut resident = EntityBuilder::new(
+            ["ethereum".to_owned()],
+            ["ethereum".to_owned()],
+            8,
+            TestMetadataValidator,
+        )
+        .unwrap();
+        for input in build_rows() {
+            resident.push(input).unwrap();
+        }
+        let expected = resident.finish().unwrap().into_persisted();
+
+        for mode in [ExecutionMode::Hybrid, ExecutionMode::External] {
+            let directory = tempfile::tempdir().unwrap();
+            let spill = directory.path().join("spill");
+            let artifact = directory.path().join("entities");
+            let execution = EntityExecutionConfig::new(mode, Some(spill), 1, 2)
+                .unwrap()
+                .with_string_sort_bytes(128)
+                .unwrap();
+            let mut builder = EntityBuilder::new_with_execution(
+                ["ethereum".to_owned()],
+                ["ethereum".to_owned()],
+                8,
+                TestMetadataValidator,
+                execution,
+            )
+            .unwrap();
+            for input in build_rows() {
+                builder.push(input).unwrap();
+            }
+            let summary = builder
+                .finish_to_artifact(
+                    &artifact,
+                    "input".to_owned(),
+                    "config".to_owned(),
+                    &NoopProgress,
+                )
+                .unwrap();
+            assert_eq!(
+                dedup_storage::read_entity_artifact(&artifact).unwrap(),
+                expected
+            );
+            assert_eq!(summary.contract_count, 2);
+            assert_eq!(summary.nft_count, 5);
+            assert_eq!(
+                summary.string_count,
+                u64::try_from(expected.strings.len()).unwrap()
+            );
+            assert!(summary.external_handle_spill_bytes > 0);
+            assert!(summary.external_handle_touches > 0);
+        }
     }
 
     #[test]

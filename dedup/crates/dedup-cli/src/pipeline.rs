@@ -9,19 +9,18 @@ use dedup_engine::metadata::{
     select_anchors_from_sorted_records,
 };
 use dedup_engine::name::{NameEngineConfig, run_name_with_progress_and_executor};
-use dedup_engine::uri::{UriExecutionConfig, run_uri_with_config_progress_and_executor};
-use dedup_index::{EntityBuildResult, EntityBuilder, EntityExecutionConfig};
+use dedup_engine::uri::{UriExecutionConfig, run_uri_mapped_with_config_progress_and_executor};
+use dedup_index::{EntityBuildResult, EntityBuilder, EntityExecutionConfig, StringDictionary};
 use dedup_model::{
     ChainId, ChunkExecutor, DedupError, Dimension, EntityArtifacts, EntityKind, ErrorContext,
     MetadataDocId, ProgressObserver, RunConfig, ScopeId, StageCounters,
 };
 use dedup_report::{BitmapHitSink, StatisticsRow};
 use dedup_storage::{
-    ArtifactManifest, ArtifactWriter, MappedMetadata, MappedStrings, MemoryBudget,
-    ParallelScanConfig, ResourceEstimate, ResourcePlan, SpillVolume, WorkerThreadSetup,
-    read_entity_artifact_without_metadata, read_entity_objects, recover_incomplete_artifact,
-    scan_parquet_inputs_parallel, validate_artifact, validate_parquet_inputs,
-    write_entity_artifact,
+    ArtifactManifest, ArtifactWriter, MappedContracts, MappedEntityObjects, MappedMetadata,
+    MappedStrings, MemoryBudget, ParallelScanConfig, ResourceEstimate, ResourcePlan, SpillVolume,
+    WorkerThreadSetup, recover_incomplete_artifact, scan_parquet_inputs_parallel,
+    validate_artifact, validate_parquet_inputs,
 };
 use fs2::FileExt;
 use roaring::RoaringTreemap;
@@ -531,7 +530,16 @@ impl PipelineContext {
                 external_sort_rows,
                 external_merge_fan_in,
             )?
-            .with_spill_volumes(spill_volumes.clone())?,
+            .with_spill_volumes(spill_volumes.clone())?
+            .with_string_sort_bytes(
+                usize::try_from(
+                    memory
+                        .stage_limit()
+                        .saturating_div(16)
+                        .clamp(8 * 1024 * 1024, 512 * 1024 * 1024),
+                )
+                .unwrap_or(512 * 1024 * 1024),
+            )?,
         )?;
         fs::write(
             self.run_dir.join("entity_execution.json"),
@@ -568,21 +576,31 @@ impl PipelineContext {
             &self.progress,
             ParallelScanConfig::new(workers, 1, batch_size)?.with_worker_setup(worker_setup),
         )?;
+        let path = self.entities_path();
+        if path.exists() {
+            let existing = validate_artifact(&path)?;
+            if existing.logical_input_digest == scan.logical_input_digest
+                && existing.configuration_digest == self.config_digest
+            {
+                return self.write_stage_metrics("entities", &counters);
+            }
+            return Err(DedupError::ArtifactMismatch {
+                context: ErrorContext::stage("entities"),
+                message: "existing entity artifact belongs to different input or configuration"
+                    .to_owned(),
+            });
+        }
         self.progress.begin_phase("finalize_entities", None);
-        let result = builder.finish_with_progress(&self.progress)?;
-        counters.spill_bytes(result.metadata_spill_bytes)?;
-        counters.spill_bytes(result.external_handle_spill_bytes)?;
-        counters.entity_radix_handle_touches(result.external_handle_touches)?;
-        counters.entity_digest_bucket_max(
-            u64::try_from(result.strings.max_digest_bucket_len()).map_err(|_| {
-                DedupError::CounterOverflow {
-                    counter: "entity_digest_bucket_max",
-                }
-            })?,
+        let summary = builder.finish_to_artifact(
+            &path,
+            scan.logical_input_digest,
+            self.config_digest.clone(),
+            &self.progress,
         )?;
-        let string_spill = result.strings.spill_stats();
-        counters.entity_radix_handle_touches(string_spill.spill_handle_touches)?;
-        counters.spill_bytes(string_spill.spill_bytes)?;
+        counters.spill_bytes(summary.metadata_spill_bytes)?;
+        counters.spill_bytes(summary.external_handle_spill_bytes)?;
+        counters.entity_radix_handle_touches(summary.external_handle_touches)?;
+        counters.entity_digest_bucket_max(summary.digest_bucket_max)?;
         let execution_path = self.run_dir.join("entity_execution.json");
         let mut execution: serde_json::Value =
             serde_json::from_slice(&fs::read(&execution_path)?).map_err(json_error)?;
@@ -591,24 +609,29 @@ impl PipelineContext {
             .ok_or_else(|| invariant("entity execution plan is not a JSON object"))?;
         execution_fields.insert(
             "metadata_spill_bytes".to_owned(),
-            serde_json::json!(result.metadata_spill_bytes),
+            serde_json::json!(summary.metadata_spill_bytes),
         );
         execution_fields.insert(
             "external_handle_spill_bytes".to_owned(),
-            serde_json::json!(result.external_handle_spill_bytes),
+            serde_json::json!(summary.external_handle_spill_bytes),
         );
         execution_fields.insert(
             "external_handle_touches".to_owned(),
-            serde_json::json!(result.external_handle_touches),
+            serde_json::json!(summary.external_handle_touches),
         );
         execution_fields.insert(
             "external_volumes_used".to_owned(),
-            serde_json::json!(result.external_volumes_used),
+            serde_json::json!(summary.external_volumes_used),
         );
         execution_fields.insert(
-            "string_spill_bytes".to_owned(),
-            serde_json::json!(string_spill.spill_bytes),
+            "string_count".to_owned(),
+            serde_json::json!(summary.string_count),
         );
+        execution_fields.insert(
+            "contract_count".to_owned(),
+            serde_json::json!(summary.contract_count),
+        );
+        execution_fields.insert("nft_count".to_owned(), serde_json::json!(summary.nft_count));
         execution_fields.insert(
             "resident_memory_bytes_at_completion".to_owned(),
             serde_json::json!(self.progress.resident_memory_bytes()),
@@ -616,26 +639,6 @@ impl PipelineContext {
         fs::write(
             execution_path,
             serde_json::to_vec_pretty(&execution).map_err(json_error)?,
-        )?;
-        let path = self.entities_path();
-        if path.exists() {
-            let existing = validate_artifact(&path)?;
-            if existing.logical_input_digest == scan.logical_input_digest
-                && existing.configuration_digest == self.config_digest
-            {
-                return Ok(());
-            }
-            return Err(DedupError::ArtifactMismatch {
-                context: ErrorContext::stage("entities"),
-                message: "existing entity artifact belongs to different input or configuration"
-                    .to_owned(),
-            });
-        }
-        write_entity_artifact(
-            &path,
-            &result.into_persisted(),
-            scan.logical_input_digest,
-            self.config_digest.clone(),
         )?;
         self.write_stage_metrics("entities", &counters)
     }
@@ -710,21 +713,23 @@ impl PipelineContext {
     }
 
     pub fn run_uri(&self) -> Result<(), DedupError> {
-        let (entities, manifest) = self.load_entity_objects()?;
+        let (entities, manifest) = self.load_mapped_entity_objects()?;
         if self.restore_completed_hits("uri", &manifest)? {
             return Ok(());
         }
         let mark_shards = self.stage_workers("uri")?;
+        let nft_count = usize::try_from(entities.nfts.len()).map_err(|_| {
+            DedupError::ResourceBudgetExceeded {
+                context: ErrorContext::stage("uri"),
+                requested: entities.nfts.len(),
+            }
+        })?;
         let mut sink = BitmapHitSink::new_sharded(
-            hit_capacity(entities.nfts.len(), self.config.chains.len())?,
+            hit_capacity(nft_count, self.config.chains.len())?,
             mark_shards,
-            entity_upper_bound(entities.nfts.len())?,
+            entity_upper_bound(nft_count)?,
         )?;
-        let estimated_member_bytes = u64::try_from(entities.nfts.len())
-            .map_err(|_| DedupError::CounterOverflow {
-                counter: "uri_estimated_members",
-            })?
-            .saturating_mul(64);
+        let estimated_member_bytes = entities.nfts.len().saturating_mul(64);
         let effective_memory = self.effective_memory_limit()?;
         let memory = MemoryBudget::new(effective_memory, effective_memory);
         let plan = ResourcePlan::choose(
@@ -742,7 +747,7 @@ impl PipelineContext {
             .first()
             .map(|volume| volume.root.clone())
             .ok_or_else(|| invariant("URI has no temporary volume"))?;
-        let member_capacity = entities.nfts.len().saturating_mul(2).max(1);
+        let member_capacity = nft_count.saturating_mul(2).max(1);
         let hot_group_member_limit =
             usize::try_from(memory.in_memory_admission_limit().saturating_div(64))
                 .unwrap_or(usize::MAX)
@@ -769,7 +774,7 @@ impl PipelineContext {
         .with_workers(mark_shards)?;
         let worker_pool = self.stage_worker_pool("uri", uri_config.workers)?;
         self.progress.set_numa_metrics(worker_pool.metrics_handle());
-        let result = run_uri_with_config_progress_and_executor(
+        let result = run_uri_mapped_with_config_progress_and_executor(
             &entities.contracts,
             &entities.nfts,
             &mut sink,
@@ -1069,7 +1074,7 @@ impl PipelineContext {
     }
 
     pub fn run_metadata(&self) -> Result<(), DedupError> {
-        let (entities, manifest) = self.load_entity_objects()?;
+        let (entities, manifest) = self.load_mapped_entity_objects()?;
         if self.restore_completed_hits("metadata", &manifest)? {
             return Ok(());
         }
@@ -1130,10 +1135,16 @@ impl PipelineContext {
         .with_workers(metadata_workers)?;
         let worker_pool = self.stage_worker_pool("metadata", execution.workers)?;
         self.progress.set_numa_metrics(worker_pool.metrics_handle());
+        let contract_count = usize::try_from(entities.contracts.len()).map_err(|_| {
+            DedupError::ResourceBudgetExceeded {
+                context: ErrorContext::stage("metadata"),
+                requested: entities.contracts.len(),
+            }
+        })?;
         let mut sink = BitmapHitSink::new_sharded(
-            hit_capacity(entities.contracts.len(), self.config.chains.len())?,
+            hit_capacity(contract_count, self.config.chains.len())?,
             worker_pool.node_count(),
-            entity_upper_bound(entities.contracts.len())?,
+            entities.contracts.len().max(1),
         )?;
         let mut result = run_metadata_verification_with_config_progress_and_executor(
             &contracts,
@@ -1197,7 +1208,7 @@ impl PipelineContext {
     }
 
     pub fn audit_metadata(&self) -> Result<(), DedupError> {
-        let (entities, _) = self.load_entity_objects()?;
+        let (entities, _) = self.load_mapped_entity_objects()?;
         let (contracts, templates, mut counters) = self.prepare_metadata_inputs(&entities)?;
         let sampler = StratifiedSampler {
             seed: self.config.quality_gate.sample_seed,
@@ -1250,7 +1261,7 @@ impl PipelineContext {
     }
 
     pub fn report(&self) -> Result<(), DedupError> {
-        let (entities, manifest) = self.load_entity_objects()?;
+        let (entities, manifest) = self.load_mapped_entity_objects()?;
         let mut combined = BitmapHitSink::new(1)?;
         for stage in ["name", "uri", "metadata"] {
             let sink = self.load_hits(stage, &manifest)?;
@@ -1337,18 +1348,6 @@ impl PipelineContext {
     }
 
     fn load_entities(&self) -> Result<(EntityBuildResult, ArtifactManifest), DedupError> {
-        let manifest = validate_artifact(self.entities_path())?;
-        if manifest.configuration_digest != self.config_digest {
-            return Err(DedupError::ArtifactMismatch {
-                context: ErrorContext::stage("pipeline"),
-                message: "entity artifact configuration digest mismatch".to_owned(),
-            });
-        }
-        let persisted = read_entity_artifact_without_metadata(self.entities_path())?;
-        Ok((EntityBuildResult::from_persisted(persisted, 64)?, manifest))
-    }
-
-    fn load_entity_objects(&self) -> Result<(EntityArtifacts, ArtifactManifest), DedupError> {
         let path = self.entities_path();
         let manifest = validate_artifact(&path)?;
         if manifest.configuration_digest != self.config_digest {
@@ -1357,7 +1356,61 @@ impl PipelineContext {
                 message: "entity artifact configuration digest mismatch".to_owned(),
             });
         }
-        Ok((read_entity_objects(path)?, manifest))
+        let available = self.effective_memory_limit()?;
+        let budget = MemoryBudget::new(available, available);
+        let contracts = MappedContracts::open(&path, &budget, (budget.stage_limit() / 16).max(1))?;
+        let mapped_strings =
+            MappedStrings::open(&path, &budget, (budget.stage_limit() / 8).max(1))?;
+        let contract_capacity =
+            usize::try_from(contracts.len()).map_err(|_| DedupError::ResourceBudgetExceeded {
+                context: ErrorContext::stage("name"),
+                requested: contracts.len(),
+            })?;
+        let mut resident_contracts = Vec::with_capacity(contract_capacity);
+        let mut name_strings = StringDictionary::new(64)?;
+        for contract in contracts.iter() {
+            let mut contract = contract?;
+            contract.name_ref = contract
+                .name_ref
+                .map(|name| name_strings.intern(mapped_strings.resolve(name)?))
+                .transpose()?;
+            resident_contracts.push(contract);
+        }
+        Ok((
+            EntityBuildResult {
+                artifacts: EntityArtifacts {
+                    contracts: resident_contracts,
+                    nfts: Vec::new(),
+                },
+                strings: name_strings,
+                metadata_by_nft: BTreeMap::new(),
+                metadata_spill_bytes: 0,
+                external_handle_spill_bytes: 0,
+                external_handle_touches: 0,
+                external_volumes_used: 0,
+            },
+            manifest,
+        ))
+    }
+
+    fn load_mapped_entity_objects(
+        &self,
+    ) -> Result<(MappedEntityObjects, ArtifactManifest), DedupError> {
+        let path = self.entities_path();
+        let manifest = validate_artifact(&path)?;
+        if manifest.configuration_digest != self.config_digest {
+            return Err(DedupError::ArtifactMismatch {
+                context: ErrorContext::stage("pipeline"),
+                message: "entity artifact configuration digest mismatch".to_owned(),
+            });
+        }
+        let available = self.effective_memory_limit()?;
+        let budget = MemoryBudget::new(available, available);
+        let residency = (budget.stage_limit() / 4).max(2);
+        Ok((
+            MappedEntityObjects::open(path, &budget, residency)?,
+            manifest,
+        ))
     }
 
     fn metadata_prefilter_execution(
@@ -1423,7 +1476,7 @@ impl PipelineContext {
 
     fn prepare_metadata_inputs(
         &self,
-        entities: &EntityArtifacts,
+        entities: &MappedEntityObjects,
     ) -> Result<
         (
             Vec<ContractAnchors>,
@@ -1463,12 +1516,12 @@ impl PipelineContext {
                 })?);
             let nft = entities
                 .nfts
-                .get(id_index(nft_id.get())?)
-                .ok_or_else(|| invariant("metadata references missing NFT"))?;
+                .get(nft_id.as_u64())
+                .map_err(|_| invariant("metadata references missing NFT"))?;
             let contract = entities
                 .contracts
-                .get(id_index(nft.contract_id.get())?)
-                .ok_or_else(|| invariant("NFT references missing contract"))?;
+                .get(nft.contract_id.as_u64())
+                .map_err(|_| invariant("NFT references missing contract"))?;
             let token_id =
                 std::str::from_utf8(strings.resolve(nft.token_id_ref)?).map_err(|error| {
                     DedupError::ArtifactMismatch {
@@ -1744,14 +1797,15 @@ struct StorageCalibration {
 
 fn build_statistics(
     sink: &BitmapHitSink,
-    entities: &EntityArtifacts,
+    entities: &MappedEntityObjects,
     chain_count: usize,
 ) -> Result<Vec<StatisticsRow>, DedupError> {
     let mut totals = BTreeMap::new();
     for index in 0..chain_count {
         totals.insert(chain_id(index)?, (0_u64, 0_u64));
     }
-    for contract in &entities.contracts {
+    for contract in entities.contracts.iter() {
+        let contract = contract?;
         let total = totals
             .get_mut(&contract.chain_id)
             .ok_or_else(|| invariant("contract has unknown chain"))?;
@@ -1838,15 +1892,15 @@ fn build_statistics(
 fn bitmap_counts(
     bitmap: &RoaringTreemap,
     kind: EntityKind,
-    entities: &EntityArtifacts,
+    entities: &MappedEntityObjects,
 ) -> Result<(u64, u64), DedupError> {
     match kind {
         EntityKind::Contract => {
             let nft_count = bitmap.iter().try_fold(0_u64, |total, id| {
                 let contract = entities
                     .contracts
-                    .get(usize::try_from(id).map_err(|_| invariant("contract ID overflow"))?)
-                    .ok_or_else(|| invariant("hit references missing contract"))?;
+                    .get(id)
+                    .map_err(|_| invariant("hit references missing contract"))?;
                 total
                     .checked_add(contract.nft_count)
                     .ok_or(DedupError::CounterOverflow {
@@ -1856,22 +1910,24 @@ fn bitmap_counts(
             Ok((bitmap.len(), nft_count))
         }
         EntityKind::Nft => {
-            let contracts: BTreeSet<_> = bitmap
-                .iter()
-                .map(|id| {
-                    entities
-                        .nfts
-                        .get(usize::try_from(id).map_err(|_| invariant("NFT ID overflow"))?)
-                        .map(|nft| nft.contract_id)
-                        .ok_or_else(|| invariant("hit references missing NFT"))
-                })
-                .collect::<Result<_, _>>()?;
-            Ok((
-                u64::try_from(contracts.len()).map_err(|_| DedupError::CounterOverflow {
-                    counter: "report_duplicate_contracts",
-                })?,
-                bitmap.len(),
-            ))
+            let mut duplicate_contracts = 0_u64;
+            let mut previous_contract = None;
+            for id in bitmap.iter() {
+                let nft = entities
+                    .nfts
+                    .get(id)
+                    .map_err(|_| invariant("hit references missing NFT"))?;
+                if previous_contract != Some(nft.contract_id) {
+                    duplicate_contracts =
+                        duplicate_contracts
+                            .checked_add(1)
+                            .ok_or(DedupError::CounterOverflow {
+                                counter: "report_duplicate_contracts",
+                            })?;
+                    previous_contract = Some(nft.contract_id);
+                }
+            }
+            Ok((duplicate_contracts, bitmap.len()))
         }
     }
 }
@@ -2053,10 +2109,6 @@ fn chain_id(index: usize) -> Result<ChainId, DedupError> {
         })
 }
 
-fn id_index(id: dedup_model::EntityId) -> Result<usize, DedupError> {
-    usize::try_from(id).map_err(|_| invariant("entity ID does not fit usize"))
-}
-
 fn invariant(message: &str) -> DedupError {
     DedupError::InvariantViolation {
         context: ErrorContext::stage("pipeline"),
@@ -2140,3 +2192,69 @@ fn platform_error(error: dedup_linux::PlatformError) -> DedupError {
     }
 }
 use crate::progress::{ProgressMode, ProgressReporter};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dedup_model::{Contract, ContractId, Nft, NftId, PersistedEntityArtifacts, StringId};
+
+    #[test]
+    fn mapped_report_counts_nft_hits_by_contiguous_contract_without_a_set() {
+        let persisted = PersistedEntityArtifacts {
+            strings: vec![b"a".to_vec(), b"b".to_vec(), b"0".to_vec()],
+            entities: EntityArtifacts {
+                contracts: vec![
+                    Contract {
+                        id: ContractId::new(0),
+                        chain_id: ChainId::new(0),
+                        address_ref: StringId::new(0),
+                        name_ref: None,
+                        first_nft_id: NftId::new(0),
+                        nft_count: 2,
+                    },
+                    Contract {
+                        id: ContractId::new(1),
+                        chain_id: ChainId::new(0),
+                        address_ref: StringId::new(1),
+                        name_ref: None,
+                        first_nft_id: NftId::new(2),
+                        nft_count: 2,
+                    },
+                ],
+                nfts: (0..4)
+                    .map(|id| Nft {
+                        id: NftId::new(id),
+                        contract_id: ContractId::new(id / 2),
+                        token_id_ref: StringId::new(2),
+                        token_uri_ref: None,
+                        image_uri_ref: None,
+                        has_metadata: false,
+                    })
+                    .collect(),
+            },
+            metadata_by_nft: Vec::new(),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let artifact = directory.path().join("entities");
+        dedup_storage::write_entity_artifact(
+            &artifact,
+            &persisted,
+            "input".to_owned(),
+            "config".to_owned(),
+        )
+        .unwrap();
+        let budget = MemoryBudget::new(1024 * 1024, 1024 * 1024);
+        let entities = MappedEntityObjects::open(&artifact, &budget, 8192).unwrap();
+
+        let nft_hits = RoaringTreemap::from_iter([0, 1, 3]);
+        assert_eq!(
+            bitmap_counts(&nft_hits, EntityKind::Nft, &entities).unwrap(),
+            (2, 3)
+        );
+        let contract_hits = RoaringTreemap::from_iter([0, 1]);
+        assert_eq!(
+            bitmap_counts(&contract_hits, EntityKind::Contract, &entities).unwrap(),
+            (2, 4)
+        );
+    }
+}

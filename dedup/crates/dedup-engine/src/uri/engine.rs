@@ -1,6 +1,9 @@
 use crate::parallel::RayonChunkExecutor;
 use ahash::{AHashMap, AHashSet, RandomState};
-use dedup_index::{ExternalRadix, MemoryBudget, PairReducerBuffer, RadixRecord, SpillVolume};
+use dedup_index::{
+    ExternalRadix, MappedContracts, MappedNfts, MemoryBudget, PairReducerBuffer, RadixRecord,
+    SpillVolume,
+};
 use dedup_model::{
     ChainId, ChunkExecutor, Contract, ContractId, DedupError, Dimension, EntityId, EntityKind,
     ErrorContext, ExecutionMode, HitEvent, HitEventSink, Nft, NftId, NoopProgress,
@@ -203,6 +206,68 @@ pub fn run_uri_with_config_progress_and_executor(
         });
     }
     run_uri_internal(contracts, nfts, sink, Some(config), progress, executor)
+}
+
+pub fn run_uri_mapped_with_config_progress_and_executor(
+    contracts: &MappedContracts,
+    nfts: &MappedNfts,
+    sink: &mut impl HitEventSink,
+    config: &UriExecutionConfig,
+    progress: &dyn ProgressObserver,
+    executor: &impl ChunkExecutor,
+) -> Result<UriRunResult, DedupError> {
+    if executor.worker_count() != config.workers {
+        return Err(DedupError::InvalidInput {
+            context: ErrorContext::stage("uri"),
+            message: "executor worker count does not match URI configuration".to_owned(),
+        });
+    }
+    let mut token_groups = UriGroupStore::new(Some(config), Dimension::TokenUri, 25)?;
+    let mut image_groups = UriGroupStore::new(Some(config), Dimension::ImageUri, 29)?;
+    let mut result = UriRunResult::default();
+    progress.begin_phase("uri_entity_scan", Some(nfts.len()));
+    let wave_size = executor.worker_count().saturating_mul(4_096).max(4_096);
+    let wave_size_u64 = u64::try_from(wave_size).unwrap_or(u64::MAX);
+    let mut start = 0_u64;
+    while start < nfts.len() {
+        let end = start.saturating_add(wave_size_u64).min(nfts.len());
+        let wave = (start..end)
+            .map(|index| nfts.get(index))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mapped = executor.map_chunks(&wave, 4_096, |chunk| {
+            chunk
+                .iter()
+                .map(|nft| {
+                    let contract = contracts.get(nft.contract_id.as_u64())?;
+                    Ok((
+                        nft.token_uri_ref,
+                        nft.image_uri_ref,
+                        UriMember {
+                            chain_id: contract.chain_id,
+                            contract_id: nft.contract_id,
+                            nft_id: nft.id,
+                        },
+                    ))
+                })
+                .collect::<Result<Vec<_>, DedupError>>()
+        })?;
+        for (token_uri, image_uri, member) in mapped.into_iter().flatten() {
+            if let Some(uri) = token_uri {
+                token_groups.add(uri, member)?;
+            }
+            if let Some(uri) = image_uri {
+                image_groups.add(uri, member)?;
+            }
+        }
+        progress.advance(end - start);
+        progress.check_cancelled("uri")?;
+        start = end;
+    }
+    result.token_groups = token_groups.group_count()?;
+    result.image_groups = image_groups.group_count()?;
+    token_groups.finish(Dimension::TokenUri, sink, &mut result, progress)?;
+    image_groups.finish(Dimension::ImageUri, sink, &mut result, progress)?;
+    Ok(result)
 }
 
 fn run_uri_internal(

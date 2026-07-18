@@ -9,12 +9,264 @@ use dedup_model::{
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const ENTITY_SCHEMA_VERSION: u32 = 1;
 const NONE_ID: u64 = u64::MAX;
 const STRING_OFFSET_RECORD_BYTES: u64 = 16;
 const METADATA_OFFSET_RECORD_BYTES: u64 = 24;
+const CONTRACT_RECORD_BYTES: u64 = 42;
+const NFT_RECORD_BYTES: u64 = 41;
+
+#[derive(Clone, Debug)]
+pub struct EntityArtifactFiles {
+    pub strings_offsets: PathBuf,
+    pub strings_blob: PathBuf,
+    pub contracts: PathBuf,
+    pub nfts: PathBuf,
+    pub metadata_offsets: PathBuf,
+    pub metadata_blob: PathBuf,
+}
+
+pub struct MappedContracts {
+    records: ReadOnlySegment,
+    count: u64,
+}
+
+impl MappedContracts {
+    pub fn open(
+        artifact_path: impl AsRef<Path>,
+        budget: &MemoryBudget,
+        residency_bytes: u64,
+    ) -> Result<Self, DedupError> {
+        let artifact_path = artifact_path.as_ref();
+        validate_entity_manifest(artifact_path)?;
+        let mut records = ReadOnlySegment::open_with_residency(
+            artifact_path.join("contracts.bin"),
+            budget,
+            residency_bytes.max(1),
+        )?;
+        let count = read_mapped_u64(&records, 0, "contract_count")?;
+        validate_fixed_record_length(records.len(), count, CONTRACT_RECORD_BYTES, "contract_mmap")?;
+        records.advise(AccessPattern::Random)?;
+        Ok(Self { records, count })
+    }
+
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.count
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    pub fn get(&self, index: u64) -> Result<Contract, DedupError> {
+        let record =
+            fixed_record_offset(index, self.count, CONTRACT_RECORD_BYTES, "contract_mmap")?;
+        let id = ContractId::new(read_entity_id_value(read_mapped_u64(
+            &self.records,
+            record,
+            "contract_id",
+        )?)?);
+        let chain_offset = record.checked_add(8).ok_or(DedupError::CounterOverflow {
+            counter: "contract_record_offset",
+        })?;
+        let chain_end = chain_offset
+            .checked_add(2)
+            .ok_or(DedupError::CounterOverflow {
+                counter: "contract_record_offset",
+            })?;
+        let chain_bytes: [u8; 2] = self
+            .records
+            .bytes(chain_offset..chain_end)?
+            .try_into()
+            .map_err(|_| fixed_record_error("contract_mmap", "invalid chain ID width"))?;
+        let address_ref = StringId::new(read_entity_id_value(read_mapped_u64(
+            &self.records,
+            record + 10,
+            "contract_address_ref",
+        )?)?);
+        let name_raw = read_mapped_u64(&self.records, record + 18, "contract_name_ref")?;
+        let name_ref = (name_raw != NONE_ID)
+            .then(|| read_entity_id_value(name_raw).map(StringId::new))
+            .transpose()?;
+        let first_nft_id = NftId::new(read_entity_id_value(read_mapped_u64(
+            &self.records,
+            record + 26,
+            "contract_first_nft_id",
+        )?)?);
+        let nft_count = read_mapped_u64(&self.records, record + 34, "contract_nft_count")?;
+        if id.as_u64() != index {
+            return Err(fixed_record_error(
+                "contract_mmap",
+                "contract IDs are not dense and ordered",
+            ));
+        }
+        Ok(Contract {
+            id,
+            chain_id: ChainId::new(u16::from_le_bytes(chain_bytes)),
+            address_ref,
+            name_ref,
+            first_nft_id,
+            nft_count,
+        })
+    }
+
+    pub fn iter(&self) -> MappedContractsIter<'_> {
+        MappedContractsIter {
+            source: self,
+            index: 0,
+        }
+    }
+}
+
+pub struct MappedContractsIter<'a> {
+    source: &'a MappedContracts,
+    index: u64,
+}
+
+impl Iterator for MappedContractsIter<'_> {
+    type Item = Result<Contract, DedupError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index == self.source.count {
+            return None;
+        }
+        let index = self.index;
+        self.index += 1;
+        Some(self.source.get(index))
+    }
+}
+
+pub struct MappedNfts {
+    records: ReadOnlySegment,
+    count: u64,
+}
+
+impl MappedNfts {
+    pub fn open(
+        artifact_path: impl AsRef<Path>,
+        budget: &MemoryBudget,
+        residency_bytes: u64,
+    ) -> Result<Self, DedupError> {
+        let artifact_path = artifact_path.as_ref();
+        validate_entity_manifest(artifact_path)?;
+        let mut records = ReadOnlySegment::open_with_residency(
+            artifact_path.join("nfts.bin"),
+            budget,
+            residency_bytes.max(1),
+        )?;
+        let count = read_mapped_u64(&records, 0, "nft_count")?;
+        validate_fixed_record_length(records.len(), count, NFT_RECORD_BYTES, "nft_mmap")?;
+        records.advise(AccessPattern::Sequential)?;
+        Ok(Self { records, count })
+    }
+
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.count
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    pub fn get(&self, index: u64) -> Result<Nft, DedupError> {
+        let record = fixed_record_offset(index, self.count, NFT_RECORD_BYTES, "nft_mmap")?;
+        let id = NftId::new(read_entity_id_value(read_mapped_u64(
+            &self.records,
+            record,
+            "nft_id",
+        )?)?);
+        let contract_id = ContractId::new(read_entity_id_value(read_mapped_u64(
+            &self.records,
+            record + 8,
+            "nft_contract_id",
+        )?)?);
+        let token_id_ref = StringId::new(read_entity_id_value(read_mapped_u64(
+            &self.records,
+            record + 16,
+            "nft_token_id_ref",
+        )?)?);
+        let token_uri_ref = mapped_optional_string_id(&self.records, record + 24, "token_uri_ref")?;
+        let image_uri_ref = mapped_optional_string_id(&self.records, record + 32, "image_uri_ref")?;
+        let boolean = self.records.bytes(record + 40..record + 41)?[0];
+        let has_metadata = match boolean {
+            0 => false,
+            1 => true,
+            _ => return Err(fixed_record_error("nft_mmap", "invalid metadata flag")),
+        };
+        if id.as_u64() != index {
+            return Err(fixed_record_error(
+                "nft_mmap",
+                "NFT IDs are not dense and ordered",
+            ));
+        }
+        Ok(Nft {
+            id,
+            contract_id,
+            token_id_ref,
+            token_uri_ref,
+            image_uri_ref,
+            has_metadata,
+        })
+    }
+
+    pub fn iter(&self) -> MappedNftsIter<'_> {
+        MappedNftsIter {
+            source: self,
+            index: 0,
+        }
+    }
+}
+
+pub struct MappedNftsIter<'a> {
+    source: &'a MappedNfts,
+    index: u64,
+}
+
+impl Iterator for MappedNftsIter<'_> {
+    type Item = Result<Nft, DedupError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index == self.source.count {
+            return None;
+        }
+        let index = self.index;
+        self.index += 1;
+        Some(self.source.get(index))
+    }
+}
+
+pub struct MappedEntityObjects {
+    pub contracts: MappedContracts,
+    pub nfts: MappedNfts,
+}
+
+impl MappedEntityObjects {
+    pub fn open(
+        artifact_path: impl AsRef<Path>,
+        budget: &MemoryBudget,
+        residency_bytes: u64,
+    ) -> Result<Self, DedupError> {
+        if residency_bytes < 2 {
+            return Err(DedupError::InvalidInput {
+                context: ErrorContext::stage("entity_mmap"),
+                message: "entity mmap residency budget must be at least two bytes".to_owned(),
+            });
+        }
+        let artifact_path = artifact_path.as_ref();
+        let contract_residency = (residency_bytes / 4).max(1);
+        let nft_residency = residency_bytes.saturating_sub(contract_residency).max(1);
+        Ok(Self {
+            contracts: MappedContracts::open(artifact_path, budget, contract_residency)?,
+            nfts: MappedNfts::open(artifact_path, budget, nft_residency)?,
+        })
+    }
+}
 
 pub struct MappedStrings {
     offsets: ReadOnlySegment,
@@ -38,12 +290,12 @@ impl MappedStrings {
         validate_entity_manifest(artifact_path)?;
         let offset_residency = (residency_bytes / 4).max(1);
         let blob_residency = residency_bytes.saturating_sub(offset_residency);
-        let offsets = ReadOnlySegment::open_with_residency(
+        let mut offsets = ReadOnlySegment::open_with_residency(
             artifact_path.join("strings.offsets"),
             budget,
             offset_residency,
         )?;
-        let blob = ReadOnlySegment::open_with_residency(
+        let mut blob = ReadOnlySegment::open_with_residency(
             artifact_path.join("strings.blob"),
             budget,
             blob_residency,
@@ -178,12 +430,12 @@ impl MappedMetadata {
         }
         let offset_residency = (residency_bytes / 4).max(1);
         let blob_residency = residency_bytes.saturating_sub(offset_residency);
-        let offsets = ReadOnlySegment::open_with_residency(
+        let mut offsets = ReadOnlySegment::open_with_residency(
             artifact_path.join("metadata.offsets"),
             budget,
             offset_residency,
         )?;
-        let blob = ReadOnlySegment::open_with_residency(
+        let mut blob = ReadOnlySegment::open_with_residency(
             artifact_path.join("metadata.blob"),
             budget,
             blob_residency,
@@ -387,6 +639,35 @@ pub fn write_entity_artifact(
     artifact.commit()
 }
 
+pub fn write_entity_artifact_from_files(
+    path: impl AsRef<Path>,
+    files: &EntityArtifactFiles,
+    logical_input_digest: String,
+    configuration_digest: String,
+) -> Result<ArtifactManifest, DedupError> {
+    let manifest = ArtifactManifest {
+        schema_version: ENTITY_SCHEMA_VERSION,
+        stage: "entities".to_owned(),
+        logical_input_digest,
+        configuration_digest,
+        upstream_checksums: BTreeMap::new(),
+        data_checksums: BTreeMap::new(),
+    };
+    let mut artifact = ArtifactWriter::new(path, manifest)?;
+    for (name, source) in [
+        ("strings.offsets", &files.strings_offsets),
+        ("strings.blob", &files.strings_blob),
+        ("contracts.bin", &files.contracts),
+        ("nfts.bin", &files.nfts),
+        ("metadata.offsets", &files.metadata_offsets),
+        ("metadata.blob", &files.metadata_blob),
+    ] {
+        let mut input = BufReader::with_capacity(1024 * 1024, File::open(source)?);
+        std::io::copy(&mut input, artifact.create_data_file(name)?)?;
+    }
+    artifact.commit()
+}
+
 pub fn read_entity_artifact(
     path: impl AsRef<Path>,
 ) -> Result<PersistedEntityArtifacts, DedupError> {
@@ -432,6 +713,75 @@ fn validate_entity_manifest(path: &Path) -> Result<ArtifactManifest, DedupError>
         });
     }
     Ok(manifest)
+}
+
+fn validate_fixed_record_length(
+    actual: u64,
+    count: u64,
+    record_bytes: u64,
+    stage: &'static str,
+) -> Result<(), DedupError> {
+    let expected = 8_u64
+        .checked_add(
+            count
+                .checked_mul(record_bytes)
+                .ok_or(DedupError::CounterOverflow {
+                    counter: "mapped_entity_record_bytes",
+                })?,
+        )
+        .ok_or(DedupError::CounterOverflow {
+            counter: "mapped_entity_record_bytes",
+        })?;
+    if actual != expected {
+        return Err(fixed_record_error(
+            stage,
+            &format!("record file length {actual} does not match expected {expected}"),
+        ));
+    }
+    Ok(())
+}
+
+fn fixed_record_offset(
+    index: u64,
+    count: u64,
+    record_bytes: u64,
+    stage: &'static str,
+) -> Result<u64, DedupError> {
+    if index >= count {
+        return Err(fixed_record_error(
+            stage,
+            &format!("record index {index} exceeds count {count}"),
+        ));
+    }
+    8_u64
+        .checked_add(
+            index
+                .checked_mul(record_bytes)
+                .ok_or(DedupError::CounterOverflow {
+                    counter: "mapped_entity_record_offset",
+                })?,
+        )
+        .ok_or(DedupError::CounterOverflow {
+            counter: "mapped_entity_record_offset",
+        })
+}
+
+fn mapped_optional_string_id(
+    records: &ReadOnlySegment,
+    offset: u64,
+    field: &'static str,
+) -> Result<Option<StringId>, DedupError> {
+    let raw = read_mapped_u64(records, offset, field)?;
+    (raw != NONE_ID)
+        .then(|| read_entity_id_value(raw).map(StringId::new))
+        .transpose()
+}
+
+fn fixed_record_error(stage: &'static str, message: &str) -> DedupError {
+    DedupError::ArtifactMismatch {
+        context: ErrorContext::stage(stage),
+        message: message.to_owned(),
+    }
 }
 
 fn write_string_offsets(offsets: &mut File, values: &[Vec<u8>]) -> Result<(), DedupError> {
@@ -779,8 +1129,28 @@ mod tests {
             mapped.iter().collect::<Result<Vec<_>, _>>().unwrap(),
             vec![(NftId::new(0), r#"{"x":1}"#)]
         );
+        let mapped_entities = MappedEntityObjects::open(&path, &budget, 8192).unwrap();
+        assert_eq!(mapped_entities.contracts.len(), 1);
+        assert_eq!(mapped_entities.nfts.len(), 1);
+        assert_eq!(
+            mapped_entities
+                .contracts
+                .iter()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            persisted.entities.contracts
+        );
+        assert_eq!(
+            mapped_entities
+                .nfts
+                .iter()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            persisted.entities.nfts
+        );
         drop(mapped_strings);
         drop(mapped);
+        drop(mapped_entities);
         assert_eq!(budget.used(), 0);
         assert_eq!(EntityId::try_from(0_u64).unwrap(), 0);
     }

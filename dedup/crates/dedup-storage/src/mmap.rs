@@ -74,16 +74,23 @@ impl ReadOnlySegment {
         Ok(&self.as_slice()[start..end])
     }
 
-    pub fn advise(&self, pattern: AccessPattern) -> Result<(), DedupError> {
+    pub fn advise(&mut self, pattern: AccessPattern) -> Result<(), DedupError> {
         #[cfg(unix)]
         if let Some(mapping) = &self.mapping {
-            let advice = match pattern {
-                AccessPattern::Sequential => memmap2::Advice::Sequential,
-                AccessPattern::Random => memmap2::Advice::Random,
-                AccessPattern::WillNeed => memmap2::Advice::WillNeed,
-                AccessPattern::NoLongerNeeded => memmap2::Advice::DontNeed,
-            };
-            mapping.advise(advice)?;
+            match pattern {
+                AccessPattern::Sequential => mapping.advise(memmap2::Advice::Sequential)?,
+                AccessPattern::Random => mapping.advise(memmap2::Advice::Random)?,
+                AccessPattern::WillNeed => mapping.advise(memmap2::Advice::WillNeed)?,
+                AccessPattern::NoLongerNeeded => {
+                    // SAFETY: `advise` requires `&mut self`, so a slice returned by
+                    // `bytes` cannot still be borrowed while MADV_DONTNEED may
+                    // invalidate resident pages. The mapping is read-only and later
+                    // reads fault the same file-backed contents back in.
+                    unsafe {
+                        mapping.unchecked_advise(memmap2::UncheckedAdvice::DontNeed)?;
+                    }
+                }
+            }
         }
         #[cfg(not(unix))]
         let _ = pattern;
@@ -113,7 +120,7 @@ mod tests {
         std::fs::write(&path, b"abcdef").unwrap();
         let budget = MemoryBudget::new(100, 100);
         {
-            let segment = ReadOnlySegment::open(&path, &budget).unwrap();
+            let mut segment = ReadOnlySegment::open(&path, &budget).unwrap();
             assert_eq!(budget.used(), 6);
             assert_eq!(segment.bytes(1..4).unwrap(), b"bcd");
             assert!(segment.bytes(0..7).is_err());
