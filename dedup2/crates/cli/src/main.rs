@@ -80,6 +80,8 @@ fn run() -> Result<(), DedupError> {
         Command::RunUri(args) => (args, false, true, false),
         Command::RunMetadata(args) => (args, false, false, true),
     };
+    let progress_mode = args.progress;
+    let progress_interval_ms = args.progress_interval_ms;
     let config = RunConfig {
         inputs: args.inputs,
         output_dir: args.output_dir,
@@ -99,7 +101,12 @@ fn run() -> Result<(), DedupError> {
         run_metadata,
     };
 
-    let mut reporter = ProgressReporter::start(args.progress, args.progress_interval_ms);
+    let mut reporter = ProgressReporter::start(progress_mode, progress_interval_ms);
+    let cancel = reporter.cancel_handle();
+    let _ = ctrlc::set_handler(move || {
+        cancel.request_cancel();
+    });
+
     let result = pipeline::run(config, &reporter);
     reporter.finish();
     result

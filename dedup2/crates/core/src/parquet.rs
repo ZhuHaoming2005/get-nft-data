@@ -85,14 +85,13 @@ fn validate_inputs(input_files: &[PathBuf]) -> Result<Vec<ValidatedInput>, Dedup
                     });
                 };
                 match field.data_type() {
-                    arrow_schema::DataType::Utf8
-                    | arrow_schema::DataType::LargeUtf8
-                    | arrow_schema::DataType::Utf8View => {}
+                    arrow_schema::DataType::Utf8 | arrow_schema::DataType::LargeUtf8 => {}
                     other => {
                         return Err(DedupError::ParquetSchema {
                             path: path.clone(),
                             message: format!(
-                                "column `{required}` must be UTF-8 string, got {other:?}"
+                                "column `{required}` must be Utf8 or LargeUtf8 (got {other:?}); \
+                                 re-export or cast before loading"
                             ),
                         });
                     }

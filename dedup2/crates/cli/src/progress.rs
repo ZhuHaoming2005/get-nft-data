@@ -99,9 +99,10 @@ impl ProgressReporter {
         Self { shared, worker }
     }
 
-    #[allow(dead_code)]
-    pub fn request_cancel(&self) {
-        self.shared.cancelled.store(true, Ordering::SeqCst);
+    pub fn cancel_handle(&self) -> CancelHandle {
+        CancelHandle {
+            shared: Arc::clone(&self.shared),
+        }
     }
 
     pub fn finish(&mut self) {
@@ -117,6 +118,17 @@ impl ProgressReporter {
 
     fn emit_now(&self) {
         emit_snapshot(&self.shared);
+    }
+}
+
+#[derive(Clone)]
+pub struct CancelHandle {
+    shared: Arc<Shared>,
+}
+
+impl CancelHandle {
+    pub fn request_cancel(&self) {
+        self.shared.cancelled.store(true, Ordering::SeqCst);
     }
 }
 

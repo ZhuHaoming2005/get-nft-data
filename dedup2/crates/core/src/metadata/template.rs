@@ -3,6 +3,10 @@ use ahash::AHashMap;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+const MIN_ANCHOR_DOCUMENTS: usize = 2;
+const STABLE_VALUE_MIN_ANCHORS: usize = 2;
+const STABLE_VALUE_SUPPORT_RATIO: f64 = 0.80;
+
 #[derive(Clone, Debug)]
 pub struct TemplateFingerprint {
     pub digest: [u8; 32],
@@ -13,7 +17,7 @@ pub struct TemplateFingerprint {
 pub fn fingerprint_anchors(anchors: &ContractAnchors) -> TemplateFingerprint {
     let mut structure: ahash::AHashSet<String> = ahash::AHashSet::new();
     let mut value_votes: AHashMap<String, AHashMap<String, usize>> = AHashMap::new();
-    let docs = anchors.anchors.len().max(1);
+    let docs = anchors.anchors.len();
 
     for anchor in &anchors.anchors {
         if let Ok(value) = serde_json::from_str::<Value>(&anchor.json) {
@@ -21,27 +25,30 @@ pub fn fingerprint_anchors(anchors: &ContractAnchors) -> TemplateFingerprint {
         }
     }
 
-    let min_support = ((docs as f64) * 0.80).ceil() as usize;
-    let min_support = min_support.max(2.min(docs));
+    // Need at least min_anchor_documents before any collection-level stable value.
     let mut stable_values = Vec::new();
-    for (path, counts) in &value_votes {
-        if !is_discriminative_path(path) {
-            continue;
+    if docs >= MIN_ANCHOR_DOCUMENTS {
+        let min_support = (((docs as f64) * STABLE_VALUE_SUPPORT_RATIO).ceil() as usize)
+            .max(STABLE_VALUE_MIN_ANCHORS);
+        for (path, counts) in &value_votes {
+            if !is_discriminative_path(path) {
+                continue;
+            }
+            if let Some((value, &count)) = counts.iter().max_by_key(|(_, c)| *c)
+                && count >= min_support
+            {
+                stable_values.push(format!("v:{path}={value}"));
+            }
         }
-        if let Some((value, &count)) = counts.iter().max_by_key(|(_, c)| *c)
-            && count >= min_support
-            && count >= 2.min(docs)
-        {
-            stable_values.push(format!("v:{path}={value}"));
-        }
+        stable_values.sort();
     }
-    stable_values.sort();
 
     let mut features: Vec<String> = structure.into_iter().map(|s| format!("s:{s}")).collect();
     features.sort();
     features.extend(stable_values.iter().cloned());
 
-    let low_information = stable_values.is_empty();
+    let placeholder = all_identical_placeholder(anchors);
+    let low_information = stable_values.is_empty() || placeholder;
     let mut hasher = Sha256::new();
     for feature in &features {
         hasher.update(feature.as_bytes());
@@ -53,6 +60,36 @@ pub fn fingerprint_anchors(anchors: &ContractAnchors) -> TemplateFingerprint {
         features,
         low_information,
     }
+}
+
+fn all_identical_placeholder(anchors: &ContractAnchors) -> bool {
+    let Some(first) = anchors.anchors.first() else {
+        return false;
+    };
+    let first_trim = first.json.trim();
+    if anchors
+        .anchors
+        .iter()
+        .any(|a| a.json.trim() != first_trim)
+    {
+        return false;
+    }
+    is_placeholder_content(first_trim)
+}
+
+fn is_placeholder_content(json: &str) -> bool {
+    let lower = json.to_ascii_lowercase();
+    const MARKERS: [&str; 8] = [
+        "unrevealed",
+        "not revealed",
+        "coming soon",
+        "placeholder",
+        "reveal soon",
+        "to be revealed",
+        "prereveal",
+        "pre-reveal",
+    ];
+    MARKERS.iter().any(|m| lower.contains(m))
 }
 
 fn walk_json(
@@ -101,10 +138,8 @@ fn walk_json(
             }
         }
         Value::Array(items) => {
-            for (idx, child) in items.iter().enumerate() {
-                // Collapse attribute values: keep structure, skip variable values
+            for child in items {
                 let child_path = format!("{path}[]");
-                let _ = idx;
                 walk_json(child, &child_path, structure, value_votes);
             }
         }

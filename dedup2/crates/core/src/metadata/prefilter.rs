@@ -32,6 +32,7 @@ pub struct PrefilterStats {
     pub lsh_bands: u32,
     pub lsh_rows_per_band: u32,
     pub template_jaccard_threshold: f64,
+    pub predicted_template_jaccard_recall: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -63,6 +64,13 @@ impl PrefilterConfig {
             self.lsh_rows_per_band = r;
         }
     }
+
+    pub fn predicted_recall(&self) -> f64 {
+        let t = self.template_jaccard_threshold.clamp(0.5, 0.99);
+        let r = self.lsh_rows_per_band.max(1) as i32;
+        let b = self.lsh_bands.max(1) as i32;
+        1.0 - (1.0 - t.powi(r)).powi(b)
+    }
 }
 
 pub fn generate_candidates(
@@ -73,6 +81,7 @@ pub fn generate_candidates(
         template_jaccard_threshold: config.template_jaccard_threshold,
         lsh_bands: config.lsh_bands,
         lsh_rows_per_band: config.lsh_rows_per_band,
+        predicted_template_jaccard_recall: config.predicted_recall(),
         ..PrefilterStats::default()
     };
 
@@ -99,16 +108,18 @@ pub fn generate_candidates(
             .or_default()
             .push((*cid, *chain));
     }
-    for members in buckets.values() {
+    for members in buckets.values_mut() {
         if members.len() < 2 {
             continue;
         }
+        // Stable reducer order: ContractId ascending.
+        members.sort_by_key(|(cid, _)| *cid);
         let mut emitted = 0_usize;
-        for i in 0..members.len() {
+        'pairs: for i in 0..members.len() {
             for j in (i + 1)..members.len() {
                 if emitted >= config.bucket_pair_cap {
                     stats.bucket_cap_truncations += 1;
-                    break;
+                    break 'pairs;
                 }
                 if let Some(pair) = CandidatePair::new(members[i].0, members[j].0) {
                     let entry = evidence.entry(pair).or_insert((false, 0, 0));
@@ -120,13 +131,14 @@ pub fn generate_candidates(
         }
     }
 
-    // MinHash/LSH over feature sets
+    // MinHash/LSH: intra-chain adjacent; inter-chain ordered merge-neighbors.
     let band_size = config.lsh_rows_per_band.max(1) as usize;
     let bands = config.lsh_bands.max(1) as usize;
     let num_hashes = band_size * bands;
-    let mut band_buckets: Vec<AHashMap<u64, Vec<ContractId>>> = vec![AHashMap::new(); bands];
+    let mut band_buckets: Vec<AHashMap<u64, Vec<(ContractId, crate::entity::ChainId)>>> =
+        vec![AHashMap::new(); bands];
 
-    for (cid, _, fp) in &eligible {
+    for (cid, chain, fp) in &eligible {
         let sig = minhash_signature(&fp.features, num_hashes);
         for band in 0..bands {
             let start = band * band_size;
@@ -135,7 +147,10 @@ pub fn generate_candidates(
                 h ^= part as u64;
                 h = h.wrapping_mul(0x100000001b3);
             }
-            band_buckets[band].entry(h).or_default().push(*cid);
+            band_buckets[band]
+                .entry(h)
+                .or_default()
+                .push((*cid, *chain));
         }
     }
     for band in &band_buckets {
@@ -143,30 +158,32 @@ pub fn generate_candidates(
             if members.len() < 2 {
                 continue;
             }
-            // adjacent + limited neighbors
-            let mut unique = members.clone();
-            unique.sort_unstable();
-            unique.dedup();
-            for window in unique.windows(2) {
-                if let Some(pair) = CandidatePair::new(window[0], window[1]) {
-                    let entry = evidence.entry(pair).or_insert((false, 0, 0));
-                    entry.2 += 1;
-                    if !entry.0 {
-                        stats.lsh_pairs += 1;
+            let mut by_chain: AHashMap<crate::entity::ChainId, Vec<ContractId>> = AHashMap::new();
+            for &(cid, chain) in members {
+                by_chain.entry(chain).or_default().push(cid);
+            }
+            for list in by_chain.values_mut() {
+                list.sort_unstable();
+                list.dedup();
+                for window in list.windows(2) {
+                    if let Some(pair) = CandidatePair::new(window[0], window[1]) {
+                        let entry = evidence.entry(pair).or_insert((false, 0, 0));
+                        entry.2 = entry.2.saturating_add(1);
+                        if !entry.0 {
+                            stats.lsh_pairs += 1;
+                        }
                     }
                 }
             }
-            let limit = config.neighbors_per_target_chain.min(unique.len().saturating_sub(1));
-            for i in 0..unique.len() {
-                for j in 1..=limit {
-                    let k = i + j;
-                    if k >= unique.len() {
-                        break;
-                    }
-                    if let Some(pair) = CandidatePair::new(unique[i], unique[k]) {
-                        let entry = evidence.entry(pair).or_insert((false, 0, 0));
-                        entry.2 += 1;
-                    }
+            let mut chain_ids: Vec<_> = by_chain.keys().copied().collect();
+            chain_ids.sort_unstable();
+            let n = config.neighbors_per_target_chain.max(1);
+            for (i, &ca) in chain_ids.iter().enumerate() {
+                for &cb in &chain_ids[i + 1..] {
+                    let left = &by_chain[&ca];
+                    let right = &by_chain[&cb];
+                    emit_inter_neighbors(left, right, n, &mut evidence, &mut stats);
+                    emit_inter_neighbors(right, left, n, &mut evidence, &mut stats);
                 }
             }
         }
@@ -242,6 +259,45 @@ pub fn generate_candidates(
     let mut out: Vec<CandidatePair> = kept.into_iter().collect();
     out.sort();
     (out, stats)
+}
+
+fn emit_inter_neighbors(
+    left: &[ContractId],
+    right: &[ContractId],
+    neighbors: usize,
+    evidence: &mut AHashMap<CandidatePair, (bool, u32, u32)>,
+    stats: &mut PrefilterStats,
+) {
+    for &lc in left {
+        let idx = right.partition_point(|&r| r < lc);
+        let mut taken = 0_usize;
+        for &rc in right.iter().skip(idx) {
+            if taken >= neighbors {
+                break;
+            }
+            if let Some(pair) = CandidatePair::new(lc, rc) {
+                let entry = evidence.entry(pair).or_insert((false, 0, 0));
+                entry.2 = entry.2.saturating_add(1);
+                if !entry.0 {
+                    stats.lsh_pairs += 1;
+                }
+            }
+            taken += 1;
+        }
+        for &rc in right[..idx].iter().rev() {
+            if taken >= neighbors {
+                break;
+            }
+            if let Some(pair) = CandidatePair::new(lc, rc) {
+                let entry = evidence.entry(pair).or_insert((false, 0, 0));
+                entry.2 = entry.2.saturating_add(1);
+                if !entry.0 {
+                    stats.lsh_pairs += 1;
+                }
+            }
+            taken += 1;
+        }
+    }
 }
 
 fn shared_feature_count(left: &[String], right: &[String]) -> u32 {

@@ -118,25 +118,26 @@ fn atomize(store: &EntityStore) -> Vec<CanonicalName> {
 
 fn emit_identical(names: &[CanonicalName], store: &EntityStore, acc: &mut SummaryAccumulator) {
     for name in names {
-        if name.atoms.len() < 2 {
-            let Some(atom) = name.atoms.first() else {
+        // Intra: only when the same chain atom has ≥2 contracts.
+        for atom in &name.atoms {
+            if atom.contract_ids.len() < 2 {
                 continue;
-            };
-            if atom.contract_ids.len() >= 2 {
-                for &cid in &atom.contract_ids {
-                    for &peer in &atom.contract_ids {
-                        if cid != peer {
-                            acc.mark_contract_duplicate(store, cid, Dimension::Name, atom.chain_id);
-                        }
-                    }
-                }
             }
-            continue;
+            for &cid in &atom.contract_ids {
+                acc.mark_contract_duplicate(store, cid, Dimension::Name, atom.chain_id);
+            }
         }
-        for left in &name.atoms {
-            for right in &name.atoms {
+        // Cross: distinct chain atoms of the same canonical name.
+        for (i, left) in name.atoms.iter().enumerate() {
+            for right in name.atoms.iter().skip(i + 1) {
+                if left.chain_id == right.chain_id {
+                    continue;
+                }
                 for &cid in &left.contract_ids {
                     acc.mark_contract_duplicate(store, cid, Dimension::Name, right.chain_id);
+                }
+                for &cid in &right.contract_ids {
+                    acc.mark_contract_duplicate(store, cid, Dimension::Name, left.chain_id);
                 }
             }
         }
@@ -180,7 +181,7 @@ fn posting_candidates(
         progress.check_cancelled()?;
         let min_len = name.characters.len().saturating_mul(3).div_ceil(4);
         let max_len = name.characters.len().saturating_mul(4) / 3;
-        let mut token_freq: Vec<(Token, usize)> = {
+        let mut token_freq: Vec<(Token, usize, u64)> = {
             let mut occ: AHashMap<char, u32> = AHashMap::new();
             let mut tokens = Vec::new();
             for ch in &name.characters {
@@ -188,15 +189,25 @@ fn posting_candidates(
                 *occ.get_mut(ch).unwrap() += 1;
                 let token = (*ch, rank);
                 let freq = postings.get(&token).map(|v| v.len()).unwrap_or(0);
-                tokens.push((token, freq));
+                let token_id = (u64::from(token.0 as u32) << 32) | u64::from(token.1);
+                tokens.push((token, freq, token_id));
             }
-            tokens.sort_by_key(|(_, freq)| *freq);
+            // Rare-first, stable tie-break by token id.
+            tokens.sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)));
             tokens
         };
-        // Probe rare-token prefix (up to half the tokens, at least 1).
-        let probe_n = (token_freq.len() / 2).max(1).min(token_freq.len());
+        // Safe rare-token prefix: len - min_overlap + 1 against shortest pairable length.
+        let partner_min = name.characters.len().saturating_mul(3).div_ceil(4).max(1);
+        let bounds = CandidateBounds::for_lengths(name.characters.len(), partner_min);
+        let probe_n = name
+            .characters
+            .len()
+            .saturating_sub(bounds.minimum_multiset_overlap)
+            .saturating_add(1)
+            .max(1)
+            .min(token_freq.len());
         token_freq.truncate(probe_n);
-        for (token, _) in token_freq {
+        for (token, _, _) in token_freq {
             let Some(list) = postings.get(&token) else {
                 continue;
             };
@@ -265,16 +276,23 @@ fn score_candidates(
     progress: &dyn ProgressObserver,
 ) -> Result<Vec<(usize, usize)>, DedupError> {
     let args = Args::default().score_cutoff(threshold);
-    let matches: Vec<(usize, usize)> = candidates
-        .par_iter()
-        .filter_map(|&(left, right)| {
-            let prepared = BatchComparator::new(names[left].characters.iter().copied());
-            prepared
-                .similarity_with_args(names[right].characters.iter().copied(), &args)
-                .map(|_| (left, right))
-        })
-        .collect();
-    progress.add_completed(candidates.len() as u64);
+    let chunk = 2048.max(1);
+    let mut matches = Vec::new();
+    for start in (0..candidates.len()).step_by(chunk) {
+        progress.check_cancelled()?;
+        let end = (start + chunk).min(candidates.len());
+        let part: Vec<(usize, usize)> = candidates[start..end]
+            .par_iter()
+            .filter_map(|&(left, right)| {
+                let prepared = BatchComparator::new(names[left].characters.iter().copied());
+                prepared
+                    .similarity_with_args(names[right].characters.iter().copied(), &args)
+                    .map(|_| (left, right))
+            })
+            .collect();
+        progress.add_completed((end - start) as u64);
+        matches.extend(part);
+    }
     Ok(matches)
 }
 
@@ -337,5 +355,12 @@ mod tests {
             acc.counts().get(&key).unwrap().duplicate_contract_count,
             1
         );
+        let intra = crate::scope::ScopeKey {
+            kind: crate::entity::ScopeKind::IntraChain,
+            primary_chain: eth,
+            secondary_chain: None,
+            dimension: Dimension::Name,
+        };
+        assert!(acc.counts().get(&intra).is_none());
     }
 }

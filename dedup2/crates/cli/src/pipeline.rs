@@ -30,11 +30,17 @@ pub struct RunConfig {
 
 pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupError> {
     let started = Instant::now();
-    let store = load_entities(&config.inputs, progress)?;
+    let mut store = load_entities(&config.inputs, progress)?;
 
-    // Optional chain filter: if --chains provided, only keep those chain totals
-    // for reporting denominators; matching still uses loaded objects.
-    let _allowed: BTreeSet<String> = config.chains.iter().cloned().collect();
+    let allowed: BTreeSet<String> = config
+        .chains
+        .iter()
+        .map(|c| c.trim().to_ascii_lowercase())
+        .filter(|c| !c.is_empty())
+        .collect();
+    if !allowed.is_empty() {
+        store.retain_chains(&allowed);
+    }
 
     let mut acc = SummaryAccumulator::default();
     let name_threshold = config.name_threshold / 100.0;
@@ -46,8 +52,11 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
     }
     let mut metadata_stats = None;
     if config.run_metadata {
-        let evm: std::collections::HashSet<String> =
-            config.evm_chains.iter().cloned().collect();
+        let evm: std::collections::HashSet<String> = config
+            .evm_chains
+            .iter()
+            .map(|c| c.trim().to_ascii_lowercase())
+            .collect();
         let prefilter = PrefilterConfig {
             template_jaccard_threshold: config.template_jaccard_threshold,
             lsh_bands: config.lsh_bands,

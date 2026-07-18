@@ -14,11 +14,19 @@ struct RunManifest {
     evm_chains: Vec<String>,
     rows_loaded: u64,
     contracts: usize,
+    chain_totals: Vec<ChainTotalRow>,
     elapsed_secs: f64,
     name_threshold: f64,
     metadata_threshold: f64,
     metadata_anchors: usize,
     metadata_prefilter: Option<PrefilterStats>,
+}
+
+#[derive(Serialize)]
+struct ChainTotalRow {
+    chain: String,
+    contracts: u64,
+    nfts: u64,
 }
 
 pub fn write_reports(
@@ -37,6 +45,16 @@ pub fn write_reports(
     fs::create_dir_all(output_dir)?;
     write_summary(output_dir, store, acc)?;
     write_matrix(output_dir, store, acc)?;
+    let mut chain_totals: Vec<ChainTotalRow> = store
+        .totals
+        .iter()
+        .map(|(id, totals)| ChainTotalRow {
+            chain: store.chain_name(*id).to_owned(),
+            contracts: totals.contracts,
+            nfts: totals.nfts,
+        })
+        .collect();
+    chain_totals.sort_by(|a, b| a.chain.cmp(&b.chain));
     let manifest = RunManifest {
         inputs: inputs
             .iter()
@@ -46,6 +64,7 @@ pub fn write_reports(
         evm_chains: evm_chains.to_vec(),
         rows_loaded: store.rows_loaded,
         contracts: store.contracts.len(),
+        chain_totals,
         elapsed_secs: elapsed.as_secs_f64(),
         name_threshold,
         metadata_threshold,
@@ -73,10 +92,19 @@ fn write_summary(
         "total_contracts",
         "total_nfts",
     ])?;
-    for (key, counts) in acc.counts() {
-        if key.kind == ScopeKind::ChainMatrix {
-            continue;
-        }
+    let mut rows: Vec<_> = acc
+        .counts()
+        .iter()
+        .filter(|(key, _)| key.kind != ScopeKind::ChainMatrix)
+        .collect();
+    rows.sort_by(|(a, _), (b, _)| {
+        store
+            .chain_name(a.primary_chain)
+            .cmp(store.chain_name(b.primary_chain))
+            .then(scope_name(&a.kind).cmp(scope_name(&b.kind)))
+            .then(dimension_name(a.dimension).cmp(dimension_name(b.dimension)))
+    });
+    for (key, counts) in rows {
         let chain = store.chain_name(key.primary_chain);
         let totals = store.totals.get(&key.primary_chain).cloned().unwrap_or_default();
         writer.write_record([
@@ -108,10 +136,27 @@ fn write_matrix(
         "total_contracts",
         "total_nfts",
     ])?;
-    for (key, counts) in acc.counts() {
-        if key.kind != ScopeKind::ChainMatrix {
-            continue;
-        }
+    let mut rows: Vec<_> = acc
+        .counts()
+        .iter()
+        .filter(|(key, _)| key.kind == ScopeKind::ChainMatrix)
+        .collect();
+    rows.sort_by(|(a, _), (b, _)| {
+        let a_sec = a
+            .secondary_chain
+            .map(|id| store.chain_name(id))
+            .unwrap_or("");
+        let b_sec = b
+            .secondary_chain
+            .map(|id| store.chain_name(id))
+            .unwrap_or("");
+        store
+            .chain_name(a.primary_chain)
+            .cmp(store.chain_name(b.primary_chain))
+            .then(a_sec.cmp(b_sec))
+            .then(dimension_name(a.dimension).cmp(dimension_name(b.dimension)))
+    });
+    for (key, counts) in rows {
         let primary = store.chain_name(key.primary_chain);
         let secondary = key
             .secondary_chain
