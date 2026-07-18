@@ -8,7 +8,9 @@ use dedup_engine::metadata::{
     run_metadata_verification_with_config_progress_and_executor,
     select_anchors_from_sorted_records,
 };
-use dedup_engine::name::{NameEngineConfig, run_name_with_progress_and_executor};
+use dedup_engine::name::{
+    CandidateStorageMode, NameEngineConfig, run_name_with_progress_and_executor,
+};
 use dedup_engine::uri::{UriExecutionConfig, run_uri_mapped_with_config_progress_and_executor};
 use dedup_index::{EntityBuildResult, EntityBuilder, EntityExecutionConfig, StringDictionary};
 use dedup_model::{
@@ -30,7 +32,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 pub struct PipelineContext {
@@ -41,6 +43,13 @@ pub struct PipelineContext {
     _run_lock: File,
     _lifecycle_monitor: dedup_linux::LifecycleMonitor,
     progress: ProgressReporter,
+    resident_metadata_inputs: OnceLock<ResidentMetadataInputs>,
+}
+
+struct ResidentMetadataInputs {
+    contracts: Vec<ContractAnchors>,
+    templates: Vec<dedup_engine::metadata::TemplateFingerprint>,
+    counters: StageCounters,
 }
 
 struct PipelineNumaExecutor<'a>(&'a dedup_linux::NumaWorkerPool);
@@ -158,6 +167,7 @@ impl PipelineContext {
             _run_lock: run_lock,
             _lifecycle_monitor: lifecycle_monitor,
             progress,
+            resident_metadata_inputs: OnceLock::new(),
         })
     }
 
@@ -519,6 +529,15 @@ impl PipelineContext {
             .first()
             .map(|volume| volume.root.clone())
             .ok_or_else(|| invariant("Entity has no temporary volume"))?;
+        let (resident_contract_capacity, resident_string_capacity) =
+            if matches!(entity_plan.mode, dedup_model::ExecutionMode::InMemory) {
+                (
+                    usize::try_from(total_rows.div_ceil(4)).unwrap_or(usize::MAX),
+                    usize::try_from(total_rows.saturating_mul(2)).unwrap_or(usize::MAX),
+                )
+            } else {
+                (0, 0)
+            };
         let mut builder = EntityBuilder::new_with_execution(
             self.config.chains.clone(),
             self.config.evm_chains.clone(),
@@ -539,7 +558,8 @@ impl PipelineContext {
                         .clamp(8 * 1024 * 1024, 512 * 1024 * 1024),
                 )
                 .unwrap_or(512 * 1024 * 1024),
-            )?,
+            )?
+            .with_resident_capacities(resident_contract_capacity, resident_string_capacity),
         )?;
         fs::write(
             self.run_dir.join("entity_execution.json"),
@@ -556,6 +576,8 @@ impl PipelineContext {
                 "external_sort_rows": external_sort_rows,
                 "external_merge_fan_in": external_merge_fan_in,
                 "external_sort_memory_bytes": external_sort_memory_bytes,
+                "resident_contract_capacity": resident_contract_capacity,
+                "resident_string_capacity": resident_string_capacity,
                 "requested_workers": requested_workers,
                 "effective_workers": workers,
                 "batch_rows": batch_size,
@@ -567,6 +589,11 @@ impl PipelineContext {
             .map_err(json_error)?,
         )?;
         let mut counters = StageCounters::default();
+        let mut scan_config =
+            ParallelScanConfig::new(workers, 1, batch_size)?.with_worker_setup(worker_setup);
+        if matches!(entity_plan.mode, dedup_model::ExecutionMode::InMemory) {
+            scan_config = scan_config.with_metadata_validator(Arc::new(CanonicalMetadataValidator));
+        }
         let scan = scan_parquet_inputs_parallel(
             &inputs,
             &self.config.chains.iter().cloned().collect(),
@@ -574,7 +601,7 @@ impl PipelineContext {
             &mut |row| builder.push(row),
             &mut counters,
             &self.progress,
-            ParallelScanConfig::new(workers, 1, batch_size)?.with_worker_setup(worker_setup),
+            scan_config,
         )?;
         let path = self.entities_path();
         if path.exists() {
@@ -651,6 +678,7 @@ impl PipelineContext {
         let mut name_config =
             NameEngineConfig::production_default(self.config.work_budgets.name_scored_candidates);
         name_config.threshold = self.config.name_threshold / 100.0;
+        name_config.candidate_storage = CandidateStorageMode::ResidentPostings;
         let requested_workers = self.stage_workers("name")?;
         let workers =
             self.write_name_memory_forecast(&entities, &name_config, requested_workers)?;
@@ -1078,26 +1106,42 @@ impl PipelineContext {
         if self.restore_completed_hits("metadata", &manifest)? {
             return Ok(());
         }
-        let (contracts, templates, mut preparation_counters) =
-            self.prepare_metadata_inputs(&entities)?;
+        let resident = self.load_resident_metadata_inputs(&entities)?;
+        let contracts = &resident.contracts;
+        let templates = &resident.templates;
+        let mut preparation_counters = resident.counters.clone();
+        let contract_count = usize::try_from(entities.contracts.len()).map_err(|_| {
+            DedupError::ResourceBudgetExceeded {
+                context: ErrorContext::stage("metadata"),
+                requested: entities.contracts.len(),
+            }
+        })?;
+        drop(entities);
         let (prefilter_execution, prefilter_plan, prefilter_radix_memory) =
-            self.metadata_prefilter_execution(&templates)?;
+            self.metadata_prefilter_execution(templates)?;
         let prefilter = generate_metadata_candidates_with_execution_and_progress(
-            &contracts,
-            &templates,
+            contracts,
+            templates,
             &self.config.metadata_prefilter_parameters,
             self.config.work_budgets.metadata_prefilter_pairs,
             &mut preparation_counters,
             &prefilter_execution,
             &self.progress,
         )?;
+        if prefilter.candidates.resident().is_none() {
+            return Err(DedupError::InvariantViolation {
+                context: ErrorContext::stage("metadata"),
+                message: "resident-only Metadata prefilter produced an external candidate set"
+                    .to_owned(),
+            });
+        }
         let metadata_workers = self.stage_workers("metadata")?;
         let candidate_count = prefilter.candidates.count();
         let candidate_bytes = candidate_count.saturating_mul(32);
         let effective_memory = self.effective_memory_limit()?;
         let memory = MemoryBudget::new(effective_memory, effective_memory);
         let plan = ResourcePlan::choose(
-            self.config.metadata_execution_mode,
+            dedup_model::ExecutionMode::InMemory,
             ResourceEstimate {
                 fixed_bytes: candidate_bytes / 2,
                 variable_bytes: candidate_bytes,
@@ -1106,48 +1150,32 @@ impl PipelineContext {
             memory.in_memory_admission_limit(),
             memory.stage_limit(),
         );
-        let radix_volumes = self.spill_volumes("metadata")?;
-        let spill_root = radix_volumes
-            .first()
-            .map(|volume| volume.root.clone())
-            .ok_or_else(|| invariant("Metadata has no temporary volume"))?;
         let candidate_capacity = usize::try_from(candidate_count.max(1)).map_err(|_| {
             DedupError::ResourceBudgetExceeded {
                 context: ErrorContext::stage("metadata"),
                 requested: candidate_bytes,
             }
         })?;
-        let resident_candidate_limit =
-            usize::try_from(memory.in_memory_admission_limit().saturating_div(32))
-                .unwrap_or(usize::MAX)
-                .clamp(1, candidate_capacity);
-        let radix_memory = radix_memory_bytes(&memory, 16);
+        let resident_candidate_limit = candidate_capacity;
+        let radix_memory = 0;
         let execution = MetadataExecutionConfig::new(
-            plan.mode,
-            spill_root,
+            dedup_model::ExecutionMode::InMemory,
+            self.run_dir.join("metadata-resident-unused"),
             resident_candidate_limit,
             4,
             16,
             candidate_capacity,
         )?
-        .with_radix_memory_budget(memory.clone(), radix_memory)?
-        .with_radix_volumes(radix_volumes)?
         .with_workers(metadata_workers)?;
         let worker_pool = self.stage_worker_pool("metadata", execution.workers)?;
         self.progress.set_numa_metrics(worker_pool.metrics_handle());
-        let contract_count = usize::try_from(entities.contracts.len()).map_err(|_| {
-            DedupError::ResourceBudgetExceeded {
-                context: ErrorContext::stage("metadata"),
-                requested: entities.contracts.len(),
-            }
-        })?;
         let mut sink = BitmapHitSink::new_sharded(
             hit_capacity(contract_count, self.config.chains.len())?,
             worker_pool.node_count(),
-            entities.contracts.len().max(1),
+            u64::try_from(contract_count).unwrap_or(u64::MAX).max(1),
         )?;
         let mut result = run_metadata_verification_with_config_progress_and_executor(
-            &contracts,
+            contracts,
             &prefilter,
             self.config.metadata_content_threshold,
             self.config.work_budgets.metadata_verify_pairs,
@@ -1158,17 +1186,21 @@ impl PipelineContext {
         )?;
         sink.finish_batch();
         result.counters.merge(&preparation_counters)?;
+        let metadata_warning = plan.predicted_peak_bytes > memory.stage_limit();
         fs::write(
             self.run_dir.join("metadata_resource_plan.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
                 "requested_mode": format!("{:?}", self.config.metadata_execution_mode),
-                "effective_mode": format!("{:?}", plan.mode),
+                "effective_mode": "InMemory",
+                "storage_policy": "resident_only",
                 "prefilter_effective_mode": format!("{:?}", prefilter_plan.mode),
                 "spill_root": execution.spill_root,
-                "radix_volumes": radix_volume_plan(&execution.radix_volumes),
+                "radix_volumes": [],
                 "predicted_peak_bytes": plan.predicted_peak_bytes,
                 "stage_memory_limit": memory.stage_limit(),
                 "candidate_count": candidate_count,
+                "resident_contracts": contracts.len(),
+                "resident_anchors": contracts.iter().map(|contract| contract.anchors.len()).sum::<usize>(),
                 "resident_candidate_limit": resident_candidate_limit,
                 "radix_memory_bytes": radix_memory,
                 "prefilter_radix_memory_bytes": prefilter_radix_memory,
@@ -1180,6 +1212,10 @@ impl PipelineContext {
                 )?,
                 "spill_bytes": result.counters.spill_bytes,
                 "radix_handle_touches": result.counters.metadata_radix_handle_touches,
+                "warning": metadata_warning,
+                "warning_message": metadata_warning.then_some(
+                    "predicted Metadata peak exceeds the stage limit; execution continues fully in memory"
+                ),
                 "resident_memory_bytes_at_completion": self.progress.resident_memory_bytes(),
             }))
             .map_err(json_error)?,
@@ -1209,22 +1245,26 @@ impl PipelineContext {
 
     pub fn audit_metadata(&self) -> Result<(), DedupError> {
         let (entities, _) = self.load_mapped_entity_objects()?;
-        let (contracts, templates, mut counters) = self.prepare_metadata_inputs(&entities)?;
+        let resident = self.load_resident_metadata_inputs(&entities)?;
+        let contracts = &resident.contracts;
+        let templates = &resident.templates;
+        let mut counters = resident.counters.clone();
+        drop(entities);
         let sampler = StratifiedSampler {
             seed: self.config.quality_gate.sample_seed,
             contracts_per_stratum: 128,
         };
-        let sample = sampler.sample(&contracts, &templates);
+        let sample = sampler.sample(contracts, templates);
         let oracle = ExhaustiveSharedTokenOracle.matches(
-            &contracts,
+            contracts,
             &sample,
             self.config.metadata_content_threshold,
         )?;
-        let (prefilter_execution, _, _) = self.metadata_prefilter_execution(&templates)?;
+        let (prefilter_execution, _, _) = self.metadata_prefilter_execution(templates)?;
         let prefilter = generate_metadata_candidates_for_request_with_progress(
             MetadataPrefilterRequest {
-                contracts: &contracts,
-                templates: &templates,
+                contracts,
+                templates,
                 parameters: &self.config.metadata_prefilter_parameters,
                 probe_budget: self.config.work_budgets.metadata_prefilter_pairs,
                 audited_pairs: Some(&oracle),
@@ -1236,7 +1276,7 @@ impl PipelineContext {
         let (breakdown, decision) = audit_metadata_recall(
             &oracle,
             &prefilter,
-            &templates,
+            templates,
             self.config.quality_gate.minimum_positive_pairs,
             self.config.quality_gate.metadata_recall,
         )?;
@@ -1303,7 +1343,9 @@ impl PipelineContext {
             "recorded_overrides": self.config.recorded_overrides,
             "runtime_decisions": {
                 "name_storage": "resident_only",
+                "metadata_storage": "resident_only",
                 "name_over_budget_policy": "warn_and_continue",
+                "metadata_over_budget_policy": "warn_and_continue",
                 "name_worker_reduction_allowed": true,
             },
             "online_progress": {
@@ -1367,7 +1409,7 @@ impl PipelineContext {
                 requested: contracts.len(),
             })?;
         let mut resident_contracts = Vec::with_capacity(contract_capacity);
-        let mut name_strings = StringDictionary::new(64)?;
+        let mut name_strings = StringDictionary::with_capacity(64, contract_capacity)?;
         for contract in contracts.iter() {
             let mut contract = contract?;
             contract.name_ref = contract
@@ -1438,7 +1480,7 @@ impl PipelineContext {
         let available_memory = self.effective_memory_limit()?;
         let memory = MemoryBudget::new(available_memory, available_memory);
         let plan = ResourcePlan::choose(
-            self.config.metadata_execution_mode,
+            dedup_model::ExecutionMode::InMemory,
             ResourceEstimate {
                 fixed_bytes: probe_bytes / 8,
                 variable_bytes: probe_bytes,
@@ -1447,7 +1489,6 @@ impl PipelineContext {
             memory.in_memory_admission_limit(),
             memory.stage_limit(),
         );
-        let radix_memory = radix_memory_bytes(&memory, 16);
         let radix_record_capacity = probe_upper
             .max(
                 self.config
@@ -1463,15 +1504,13 @@ impl PipelineContext {
             }
         })?;
         let execution = MetadataPrefilterExecutionConfig::new(
-            plan.mode,
-            self.spill_root("metadata")?,
+            dedup_model::ExecutionMode::InMemory,
+            self.run_dir.join("metadata-resident-unused"),
             4,
             16,
             record_capacity,
-        )?
-        .with_radix_memory_budget(memory, radix_memory)?
-        .with_radix_volumes(self.spill_volumes("metadata")?)?;
-        Ok((execution, plan, radix_memory))
+        )?;
+        Ok((execution, plan, 0))
     }
 
     fn prepare_metadata_inputs(
@@ -1566,6 +1605,23 @@ impl PipelineContext {
             .advance(u64::try_from(contracts.len()).unwrap_or(u64::MAX));
         self.progress.check_cancelled("metadata")?;
         Ok((contracts, templates, counters))
+    }
+
+    fn load_resident_metadata_inputs(
+        &self,
+        entities: &MappedEntityObjects,
+    ) -> Result<&ResidentMetadataInputs, DedupError> {
+        if self.resident_metadata_inputs.get().is_none() {
+            let (contracts, templates, counters) = self.prepare_metadata_inputs(entities)?;
+            let _ = self.resident_metadata_inputs.set(ResidentMetadataInputs {
+                contracts,
+                templates,
+                counters,
+            });
+        }
+        self.resident_metadata_inputs
+            .get()
+            .ok_or_else(|| invariant("resident Metadata inputs were not initialized"))
     }
 
     fn save_hits(
@@ -1714,17 +1770,6 @@ impl PipelineContext {
 
     fn entities_path(&self) -> PathBuf {
         self.run_dir.join("entities")
-    }
-
-    fn spill_root(&self, stage: &'static str) -> Result<PathBuf, DedupError> {
-        self.spill_volumes(stage)?
-            .into_iter()
-            .next()
-            .map(|volume| volume.root)
-            .ok_or_else(|| DedupError::InvalidInput {
-                context: ErrorContext::stage(stage),
-                message: "at least one temporary volume is required".to_owned(),
-            })
     }
 
     fn spill_volumes(&self, stage: &'static str) -> Result<Vec<SpillVolume>, DedupError> {

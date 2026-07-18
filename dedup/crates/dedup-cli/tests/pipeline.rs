@@ -66,7 +66,7 @@ evm_chains = ["ethereum"]
 memory_limit = 1073741824
 entity_execution_mode = "auto"
 uri_execution_mode = "auto"
-metadata_execution_mode = "auto"
+metadata_execution_mode = "external"
 name_threshold = 95.0
 metadata_content_threshold = 0.6
 metadata_anchor_tokens = 2
@@ -155,6 +155,10 @@ sample_seed = 7
         manifest["runtime_decisions"]["name_over_budget_policy"],
         "warn_and_continue"
     );
+    assert_eq!(
+        manifest["runtime_decisions"]["metadata_storage"],
+        "resident_only"
+    );
     assert_eq!(manifest["neighbors_per_target_chain"], 4);
     assert!(manifest["resource_plans"]["uri"].is_object());
     let uri_plan: serde_json::Value =
@@ -165,7 +169,16 @@ sample_seed = 7
     let metadata_plan: serde_json::Value =
         serde_json::from_slice(&fs::read(result.join("run/metadata_resource_plan.json")).unwrap())
             .unwrap();
-    assert_eq!(metadata_plan["radix_volumes"].as_array().unwrap().len(), 2);
+    assert_eq!(metadata_plan["effective_mode"], "InMemory");
+    assert_eq!(metadata_plan["requested_mode"], "External");
+    assert_eq!(metadata_plan["storage_policy"], "resident_only");
+    assert!(
+        metadata_plan["radix_volumes"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(metadata_plan["spill_bytes"], 0);
     let hit_checksum_before = [
         tree_checksum(&result.join("run/name-hits")),
         tree_checksum(&result.join("run/uri-hits")),

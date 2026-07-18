@@ -21,7 +21,8 @@ memory_limit = 0 # 0 = 取 cgroup 与物理内存的较小值
 
 | 配置项 | 说明 |
 |---|---|
-| `entity_execution_mode` / `uri_execution_mode` / `metadata_execution_mode` | `auto`、`in_memory`、`hybrid` 或 `external`；生产推荐 `auto` |
+| `entity_execution_mode` / `uri_execution_mode` | `auto`、`in_memory`、`hybrid` 或 `external`；生产推荐 `auto` |
+| `metadata_execution_mode` | 保留用于配置兼容和运行记录；Metadata 实际固定为 `in_memory` |
 | `stage_concurrency` | 各阶段并发；`0` 表示自动确定 |
 | `name_threshold` | Name Jaro-Winkler 阈值，默认 `95.0` |
 | `metadata_content_threshold` | Metadata BM25 阈值，默认 `0.6` |
@@ -30,7 +31,7 @@ memory_limit = 0 # 0 = 取 cgroup 与物理内存的较小值
 | `work_budgets` | 精确工作上限，超限返回结构化错误 |
 | `quality_gate` | Metadata recall audit 门槛 |
 
-Name、postings 和候选全量保留在内存。预测峰值超出阶段预算时记录警告并继续启动，可降低 Name worker 数以减少 scratch，但不改变匹配语义。
+Name 所需合约名、postings 和候选全量保留在内存；Metadata 所需 anchors、templates、prefilter evidence、候选和比较索引也全量保留在内存，并在同一进程的验证与 recall audit 间复用。预测峰值超出阶段预算时只记录警告并继续，不切换外存模式。
 
 ## 生产编译
 
@@ -80,7 +81,7 @@ build-entities → run-name → run-uri → run-metadata → audit-metadata → 
 
 单独执行时，将 `all` 替换为相应子命令。带合法 `_SUCCESS` 且摘要一致的阶段会复用；中断后重跑同一条命令即可继续。`SIGTERM` 或第一次 `SIGINT` 受控退出，第二次 `SIGINT` 立即以 `130` 退出。
 
-同一 `output_dir` 同时只允许一个进程运行。外存文件按配置摘要隔离在本地临时卷的 `dedup-spill/<digest>/<stage>` 下。
+同一 `output_dir` 同时只允许一个进程运行。Entity/URI 的外存文件按配置摘要隔离在本地临时卷的 `dedup-spill/<digest>/<stage>` 下；Name/Metadata 不写外存中间数据。
 
 ## 结果
 

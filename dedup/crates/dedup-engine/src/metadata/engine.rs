@@ -2,12 +2,12 @@ use super::{
     ContractAnchors, MetadataCandidate, PrefilterResult, VerificationResult, verify_metadata_pair,
 };
 use crate::parallel::RayonChunkExecutor;
+use ahash::{AHashMap, RandomState};
 use dedup_index::{ExternalRadix, MemoryBudget, PairReducerBuffer, RadixRecord, SpillVolume};
 use dedup_model::{
     ChunkExecutor, ContractId, DedupError, Dimension, EntityId, EntityKind, ErrorContext,
     ExecutionMode, HitEvent, HitEventSink, NoopProgress, ProgressObserver, ScopeId, StageCounters,
 };
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -208,10 +208,15 @@ fn run_metadata_verification_internal(
     progress: &dyn ProgressObserver,
     executor: &impl ChunkExecutor,
 ) -> Result<MetadataRunResult, DedupError> {
-    let by_id: BTreeMap<ContractId, &ContractAnchors> = contracts
-        .iter()
-        .map(|contract| (contract.contract_id, contract))
-        .collect();
+    let mut by_id = AHashMap::with_capacity_and_hasher(
+        contracts.len(),
+        RandomState::with_seeds(131, 132, 133, 134),
+    );
+    by_id.extend(
+        contracts
+            .iter()
+            .map(|contract| (contract.contract_id, contract)),
+    );
     let mut counters = StageCounters::default();
     let mut matches = Vec::new();
     let candidate_count = prefilter.candidates.count();
@@ -379,7 +384,7 @@ fn run_metadata_verification_internal(
 
 fn verify_resident_candidates(
     candidates: &[MetadataCandidate],
-    by_id: &BTreeMap<ContractId, &ContractAnchors>,
+    by_id: &AHashMap<ContractId, &ContractAnchors>,
     threshold: f64,
     executor: &impl ChunkExecutor,
     progress: &dyn ProgressObserver,
@@ -408,7 +413,7 @@ fn verify_resident_candidates(
 
 fn verify_candidate(
     candidate: MetadataCandidate,
-    by_id: &BTreeMap<ContractId, &ContractAnchors>,
+    by_id: &AHashMap<ContractId, &ContractAnchors>,
     threshold: f64,
 ) -> Result<(Option<MetadataMatch>, StageCounters), DedupError> {
     let mut counters = StageCounters::default();
@@ -435,7 +440,7 @@ fn verify_candidate(
 
 fn flush_verified_candidates(
     candidates: &[MetadataCandidate],
-    by_id: &BTreeMap<ContractId, &ContractAnchors>,
+    by_id: &AHashMap<ContractId, &ContractAnchors>,
     threshold: f64,
     sink: &mut impl HitEventSink,
     counters: &mut StageCounters,

@@ -250,7 +250,7 @@ impl ExternalRowStore {
 
 #[derive(Debug)]
 enum EntityMergeStore {
-    Resident(AHashMap<(ChainId, String), PendingContract>),
+    Resident(AHashMap<(ChainId, StringId), PendingContract>),
     External(ExternalRowStore),
 }
 
@@ -335,6 +335,8 @@ pub struct EntityExecutionConfig {
     pub external_sort_rows: usize,
     pub external_merge_fan_in: usize,
     pub external_string_sort_bytes: usize,
+    pub resident_contract_capacity: usize,
+    pub resident_string_capacity: usize,
 }
 
 impl EntityExecutionConfig {
@@ -367,6 +369,8 @@ impl EntityExecutionConfig {
             external_sort_rows,
             external_merge_fan_in,
             external_string_sort_bytes: DEFAULT_EXTERNAL_STRING_SORT_BYTES,
+            resident_contract_capacity: 0,
+            resident_string_capacity: 0,
         })
     }
 
@@ -392,6 +396,16 @@ impl EntityExecutionConfig {
         }
         self.external_string_sort_bytes = bytes;
         Ok(self)
+    }
+
+    pub fn with_resident_capacities(
+        mut self,
+        contract_capacity: usize,
+        string_capacity: usize,
+    ) -> Self {
+        self.resident_contract_capacity = contract_capacity;
+        self.resident_string_capacity = string_capacity;
+        self
     }
 }
 
@@ -472,13 +486,19 @@ impl<V: MetadataSourceValidator> EntityBuilder<V> {
                     execution.external_merge_fan_in,
                 )?)
             }
-            ExecutionMode::Auto | ExecutionMode::InMemory => EntityMergeStore::Resident(
-                AHashMap::with_hasher(RandomState::with_seeds(5, 6, 7, 8)),
-            ),
+            ExecutionMode::Auto | ExecutionMode::InMemory => {
+                EntityMergeStore::Resident(AHashMap::with_capacity_and_hasher(
+                    execution.resident_contract_capacity,
+                    RandomState::with_seeds(5, 6, 7, 8),
+                ))
+            }
         };
         let strings = match mode {
             ExecutionMode::Auto | ExecutionMode::InMemory => {
-                EntityStringStore::Resident(StringDictionary::new(digest_bucket_limit)?)
+                EntityStringStore::Resident(StringDictionary::with_capacity(
+                    digest_bucket_limit,
+                    execution.resident_string_capacity,
+                )?)
             }
             ExecutionMode::Hybrid | ExecutionMode::External => EntityStringStore::External(
                 ExternalStringStore::new(spill_root.ok_or_else(|| DedupError::InvalidInput {
@@ -500,17 +520,29 @@ impl<V: MetadataSourceValidator> EntityBuilder<V> {
     }
 
     pub fn push(&mut self, row: InputRow) -> Result<(), DedupError> {
-        let chain_name = row.chain.trim().to_lowercase();
+        let InputRow {
+            chain: mut chain_name,
+            contract_address: mut address,
+            mut token_id,
+            name_norm,
+            token_uri_norm,
+            image_uri_norm,
+            metadata_json,
+            metadata_valid,
+            source_order,
+        } = row;
+        trim_string_in_place(&mut chain_name);
+        chain_name.make_ascii_lowercase();
         let chain =
             self.chain_ids
                 .get(&chain_name)
                 .copied()
                 .ok_or_else(|| DedupError::InvalidInput {
                     context: ErrorContext::stage("entity"),
-                    message: format!("unknown chain {:?}", row.chain),
+                    message: format!("unknown chain {chain_name:?}"),
                 })?;
-        let mut address = row.contract_address.trim().to_owned();
-        let token_id = row.token_id.trim().to_owned();
+        trim_string_in_place(&mut address);
+        trim_string_in_place(&mut token_id);
         if address.is_empty() || token_id.is_empty() {
             return Err(DedupError::InvalidInput {
                 context: ErrorContext::stage("entity"),
@@ -520,14 +552,10 @@ impl<V: MetadataSourceValidator> EntityBuilder<V> {
         if self.evm_chains.contains_key(&chain_name) {
             address.make_ascii_lowercase();
         }
-        let metadata = if self
-            .metadata_validator
-            .is_valid_metadata(&row.metadata_json)
-        {
-            Some((
-                row.source_order,
-                self.metadata_store.store(row.metadata_json)?,
-            ))
+        let metadata_is_valid = metadata_valid
+            .unwrap_or_else(|| self.metadata_validator.is_valid_metadata(&metadata_json));
+        let metadata = if metadata_is_valid {
+            Some((source_order, self.metadata_store.store(metadata_json)?))
         } else {
             None
         };
@@ -544,9 +572,9 @@ impl<V: MetadataSourceValidator> EntityBuilder<V> {
             };
             let address_ref = strings.store(address.as_bytes())?;
             let token_id_ref = strings.store(token_id.as_bytes())?;
-            let name_ref = external_optional_string(strings, &row.name_norm)?;
-            let token_uri_ref = external_optional_string(strings, &row.token_uri_norm)?;
-            let image_uri_ref = external_optional_string(strings, &row.image_uri_norm)?;
+            let name_ref = external_optional_string(strings, &name_norm)?;
+            let token_uri_ref = external_optional_string(strings, &token_uri_norm)?;
+            let image_uri_ref = external_optional_string(strings, &image_uri_norm)?;
             let (metadata_offset, metadata_length) = match metadata {
                 Some((_, StoredMetadata::Spilled { offset, length })) => (offset, length),
                 None => (NONE_ID, 0),
@@ -564,8 +592,8 @@ impl<V: MetadataSourceValidator> EntityBuilder<V> {
                 name_ref,
                 token_uri_ref,
                 image_uri_ref,
-                source_file: u64::from(row.source_order.file_ordinal),
-                source_row: row.source_order.file_row_number,
+                source_file: u64::from(source_order.file_ordinal),
+                source_row: source_order.file_row_number,
                 metadata_offset,
                 metadata_length,
             });
@@ -581,16 +609,16 @@ impl<V: MetadataSourceValidator> EntityBuilder<V> {
         };
         let address_ref = strings.intern(address.as_bytes())?;
         let token_id_ref = strings.intern(token_id.as_bytes())?;
-        let name = resident_optional_string(strings, &row.name_norm)?;
-        let ordered_name = name.map(|name| (row.source_order, name));
-        let token_uri = resident_optional_string(strings, &row.token_uri_norm)?;
-        let image_uri = resident_optional_string(strings, &row.image_uri_norm)?;
+        let name = resident_optional_string(strings, &name_norm)?;
+        let ordered_name = name.map(|name| (source_order, name));
+        let token_uri = resident_optional_string(strings, &token_uri_norm)?;
+        let image_uri = resident_optional_string(strings, &image_uri_norm)?;
         let contracts = match &mut self.merge_store {
             EntityMergeStore::Resident(contracts) => contracts,
             EntityMergeStore::External(_) => unreachable!("external rows returned above"),
         };
         let contract = contracts
-            .entry((chain, address))
+            .entry((chain, address_ref))
             .or_insert_with(|| PendingContract {
                 chain,
                 address_ref,
@@ -671,10 +699,25 @@ impl<V: MetadataSourceValidator> EntityBuilder<V> {
         let EntityMergeStore::Resident(contracts) = merge_store else {
             unreachable!("external entity store returned above");
         };
-        let mut artifacts = EntityArtifacts::default();
+        let nft_capacity = contracts.values().try_fold(0_usize, |total, contract| {
+            total
+                .checked_add(contract.nfts.len())
+                .ok_or(DedupError::CounterOverflow {
+                    counter: "entity_resident_nft_capacity",
+                })
+        })?;
+        let mut artifacts = EntityArtifacts {
+            contracts: Vec::with_capacity(contracts.len()),
+            nfts: Vec::with_capacity(nft_capacity),
+        };
         let mut metadata_by_nft = BTreeMap::new();
         let mut pending_contracts: Vec<_> = contracts.into_iter().collect();
-        pending_contracts.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        pending_contracts.sort_unstable_by(|left, right| {
+            left.0
+                .0
+                .cmp(&right.0.0)
+                .then_with(|| strings.resolve(left.0.1).cmp(&strings.resolve(right.0.1)))
+        });
         progress.begin_phase(
             "entity_resident_reduce",
             u64::try_from(pending_contracts.len()).ok(),
@@ -724,16 +767,19 @@ impl<V: MetadataSourceValidator> EntityBuilder<V> {
             }
             for (token_id_ref, pending_nft) in pending_nfts {
                 let nft_id = checked_id::<NftId>(artifacts.nfts.len(), NftId::new)?;
-                if let Some((_, metadata)) = pending_nft.metadata {
+                let has_metadata = if let Some((_, metadata)) = pending_nft.metadata {
                     metadata_by_nft.insert(nft_id, self.metadata_store.read(metadata)?);
-                }
+                    true
+                } else {
+                    false
+                };
                 artifacts.nfts.push(Nft {
                     id: nft_id,
                     contract_id,
                     token_id_ref,
                     token_uri_ref: pending_nft.token_uri,
                     image_uri_ref: pending_nft.image_uri,
-                    has_metadata: metadata_by_nft.contains_key(&nft_id),
+                    has_metadata,
                 });
             }
             artifacts.contracts.push(Contract {
@@ -1719,9 +1765,9 @@ fn remap_strings_lexically(
     strings: StringDictionary,
 ) -> Result<(EntityArtifacts, StringDictionary), DedupError> {
     let mut ordered = strings
-        .values()
+        .into_shared_values()
+        .into_iter()
         .enumerate()
-        .map(|(old, value)| (old, value.to_vec()))
         .collect::<Vec<_>>();
     ordered.sort_unstable_by(|left, right| left.1.cmp(&right.1));
     let mut remap = vec![StringId::new(EntityId::MIN); ordered.len()];
@@ -1756,7 +1802,7 @@ fn remap_strings_lexically(
     }
     Ok((
         artifacts,
-        StringDictionary::from_ordered_values(values, 64)?,
+        StringDictionary::from_ordered_shared_values(values, 64)?,
     ))
 }
 
@@ -1876,6 +1922,21 @@ fn select_first_name(
     }
 }
 
+fn trim_string_in_place(value: &mut String) {
+    let start = value.len() - value.trim_start().len();
+    let end = value.trim_end().len();
+    if start >= end {
+        value.clear();
+        return;
+    }
+    if end < value.len() {
+        value.truncate(end);
+    }
+    if start > 0 {
+        value.drain(..start);
+    }
+}
+
 fn external_source_order(file: u64, row: u64) -> Result<SourceOrder, DedupError> {
     u32::try_from(file)
         .map(|file| SourceOrder::new(file, row))
@@ -1952,6 +2013,7 @@ mod tests {
             token_uri_norm: token_uri.to_owned(),
             image_uri_norm: String::new(),
             metadata_json: "{\"name\":\"one\"}".to_owned(),
+            metadata_valid: None,
             source_order: order,
         }
     }

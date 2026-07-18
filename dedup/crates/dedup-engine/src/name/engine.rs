@@ -345,8 +345,10 @@ fn atomize(
     strings: &StringDictionary,
     progress: &dyn ProgressObserver,
 ) -> Result<AtomizedNames, DedupError> {
-    let mut grouped: AHashMap<(ChainId, StringId), (u64, u64)> =
-        AHashMap::with_hasher(RandomState::with_seeds(41, 42, 43, 44));
+    let mut grouped: AHashMap<(ChainId, StringId), (u64, u64)> = AHashMap::with_capacity_and_hasher(
+        contracts.len(),
+        RandomState::with_seeds(41, 42, 43, 44),
+    );
     let mut work = 0_u64;
     for contract in contracts {
         work = work.saturating_add(1);
@@ -379,7 +381,7 @@ fn atomize(
     let mut atoms = Vec::with_capacity(grouped.len());
     let mut canonical_map: BTreeMap<StringId, Vec<NameAtomId>> = BTreeMap::new();
     let mut atom_by_key: AHashMap<(ChainId, StringId), usize> =
-        AHashMap::with_hasher(RandomState::with_seeds(45, 46, 47, 48));
+        AHashMap::with_capacity_and_hasher(grouped.len(), RandomState::with_seeds(45, 46, 47, 48));
     let mut contract_offset = 0_u64;
     for ((chain_id, name_ref), (contract_count, nft_count)) in grouped {
         let id = NameAtomId::new(checked_entity_id(atoms.len(), "NameAtomId")?);
@@ -477,25 +479,30 @@ fn posting_candidates(
     counters: &mut StageCounters,
     progress: &dyn ProgressObserver,
 ) -> Result<Vec<(usize, usize)>, DedupError> {
-    // Compute occurrence tokens twice instead of retaining one Vec per Name.
-    // This trades a cheap linear character pass for a materially smaller peak.
+    // The production path is resident-only: retain occurrence tokens so the
+    // posting pass does not rebuild them for every canonical name.
+    let mut occurrence_by_name: Vec<Vec<OccurrenceToken>> = names
+        .iter()
+        .map(|name| occurrence_tokens(&name.character_counts))
+        .collect();
     let mut frequencies: AHashMap<OccurrenceToken, u64> =
         AHashMap::with_hasher(RandomState::with_seeds(51, 52, 53, 54));
-    for name in names {
+    for tokens in &occurrence_by_name {
         progress.check_cancelled("name")?;
-        for token in occurrence_tokens(&name.character_counts) {
-            let count = frequencies.entry(token).or_default();
+        for token in tokens {
+            let count = frequencies.entry(*token).or_default();
             *count = count.checked_add(1).ok_or(DedupError::CounterOverflow {
                 counter: "name_posting_entries",
             })?;
         }
     }
 
-    let mut postings: AHashMap<OccurrenceToken, Vec<usize>> =
-        AHashMap::with_hasher(RandomState::with_seeds(55, 56, 57, 58));
-    for (name_id, name) in names.iter().enumerate() {
+    let mut postings: AHashMap<OccurrenceToken, Vec<usize>> = AHashMap::with_capacity_and_hasher(
+        frequencies.len(),
+        RandomState::with_seeds(55, 56, 57, 58),
+    );
+    for (name_id, ordered) in occurrence_by_name.iter_mut().enumerate() {
         progress.check_cancelled("name")?;
-        let mut ordered = occurrence_tokens(&name.character_counts);
         ordered.sort_unstable_by_key(|token| (frequencies[token], *token));
         let minimum_partner_length = names[name_id]
             .characters
@@ -510,7 +517,7 @@ fn posting_candidates(
             .saturating_sub(minimum_overlap)
             .saturating_add(1)
             .min(ordered.len());
-        for token in ordered.into_iter().take(prefix_length) {
+        for token in ordered.iter().copied().take(prefix_length) {
             postings.entry(token).or_default().push(name_id);
             counters.name_posting_entries(1)?;
         }

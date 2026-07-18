@@ -2,7 +2,7 @@ use ahash::{AHashMap, RandomState};
 use dedup_model::{DedupError, ErrorContext};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 pub trait DigestFunction {
     fn digest(&self, bytes: &[u8]) -> [u8; 32];
@@ -30,9 +30,11 @@ pub struct DigestMapStats {
     pub spill_handle_touches: u64,
 }
 
+pub type SharedInsertResult<V> = (V, Option<Arc<[u8]>>);
+
 #[derive(Debug)]
 struct Entry<V> {
-    bytes: Vec<u8>,
+    bytes: Arc<[u8]>,
     value: V,
 }
 
@@ -45,6 +47,7 @@ struct SpillHandle<V> {
 
 #[derive(Debug)]
 enum Bucket<V> {
+    Single(Entry<V>),
     Resident(Vec<Entry<V>>),
     Spilled(Vec<SpillHandle<V>>),
 }
@@ -60,6 +63,14 @@ pub struct DigestMap<V, D> {
 
 impl<V: Copy, D: DigestFunction> DigestMap<V, D> {
     pub fn new(digest: D, bucket_limit: usize) -> Result<Self, DedupError> {
+        Self::with_capacity(digest, bucket_limit, 0)
+    }
+
+    pub fn with_capacity(
+        digest: D,
+        bucket_limit: usize,
+        capacity: usize,
+    ) -> Result<Self, DedupError> {
         if bucket_limit == 0 {
             return Err(DedupError::InvalidInput {
                 context: ErrorContext::stage("digest_map"),
@@ -69,7 +80,10 @@ impl<V: Copy, D: DigestFunction> DigestMap<V, D> {
         Ok(Self {
             digest,
             bucket_limit,
-            buckets: AHashMap::with_hasher(RandomState::with_seeds(1, 2, 3, 4)),
+            buckets: AHashMap::with_capacity_and_hasher(
+                capacity,
+                RandomState::with_seeds(1, 2, 3, 4),
+            ),
             spill: Mutex::new(tempfile::tempfile()?),
             stats: DigestMapStats::default(),
         })
@@ -81,9 +95,10 @@ impl<V: Copy, D: DigestFunction> DigestMap<V, D> {
             return Ok(None);
         };
         match bucket {
+            Bucket::Single(entry) => Ok((entry.bytes.as_ref() == bytes).then_some(entry.value)),
             Bucket::Resident(entries) => Ok(entries
                 .iter()
-                .find(|entry| entry.bytes == bytes)
+                .find(|entry| entry.bytes.as_ref() == bytes)
                 .map(|entry| entry.value)),
             Bucket::Spilled(handles) => {
                 let mut file = self.spill.lock().unwrap_or_else(|error| error.into_inner());
@@ -101,51 +116,105 @@ impl<V: Copy, D: DigestFunction> DigestMap<V, D> {
     where
         F: FnOnce() -> V,
     {
-        if let Some(value) = self.get(bytes)? {
-            return Ok((value, false));
+        let (value, inserted) = self.insert_shared_with(bytes, create)?;
+        Ok((value, inserted.is_some()))
+    }
+
+    pub fn insert_shared_with<B, F>(
+        &mut self,
+        bytes: B,
+        create: F,
+    ) -> Result<SharedInsertResult<V>, DedupError>
+    where
+        B: AsRef<[u8]> + Into<Arc<[u8]>>,
+        F: FnOnce() -> V,
+    {
+        let bytes_ref = bytes.as_ref();
+        let digest = self.digest.digest(bytes_ref);
+        if let Some(bucket) = self.buckets.get(&digest) {
+            let existing = match bucket {
+                Bucket::Single(entry) => (entry.bytes.as_ref() == bytes_ref).then_some(entry.value),
+                Bucket::Resident(entries) => entries
+                    .iter()
+                    .find(|entry| entry.bytes.as_ref() == bytes_ref)
+                    .map(|entry| entry.value),
+                Bucket::Spilled(handles) => {
+                    let mut file = self.spill.lock().unwrap_or_else(|error| error.into_inner());
+                    let mut found = None;
+                    for handle in handles {
+                        if spilled_bytes_equal(&mut file, *handle, bytes_ref)? {
+                            found = Some(handle.value);
+                            break;
+                        }
+                    }
+                    found
+                }
+            };
+            if let Some(value) = existing {
+                return Ok((value, None));
+            }
         }
-        let digest = self.digest.digest(bytes);
         let value = create();
+        let owned: Arc<[u8]> = bytes.into();
         let spill = &self.spill;
         let stats = &mut self.stats;
-        let bucket = self
-            .buckets
-            .entry(digest)
-            .or_insert_with(|| Bucket::Resident(Vec::new()));
+        let Some(bucket) = self.buckets.get_mut(&digest) else {
+            self.buckets.insert(
+                digest,
+                Bucket::Single(Entry {
+                    bytes: Arc::clone(&owned),
+                    value,
+                }),
+            );
+            return Ok((value, Some(owned)));
+        };
         match bucket {
+            Bucket::Single(_) => {
+                let previous = match std::mem::replace(bucket, Bucket::Resident(Vec::new())) {
+                    Bucket::Single(entry) => entry,
+                    _ => unreachable!("single digest bucket changed while exclusively borrowed"),
+                };
+                let entries = vec![
+                    previous,
+                    Entry {
+                        bytes: Arc::clone(&owned),
+                        value,
+                    },
+                ];
+                if entries.len() > self.bucket_limit {
+                    *bucket = Bucket::Spilled(spill_entries(spill, entries, stats)?);
+                } else {
+                    *bucket = Bucket::Resident(entries);
+                }
+            }
             Bucket::Resident(entries) => {
                 entries.push(Entry {
-                    bytes: bytes.to_vec(),
+                    bytes: Arc::clone(&owned),
                     value,
                 });
                 if entries.len() > self.bucket_limit {
                     let pending = std::mem::take(entries);
-                    let mut handles = Vec::with_capacity(pending.len());
-                    let mut file = spill.lock().unwrap_or_else(|error| error.into_inner());
-                    for entry in pending {
-                        handles.push(append_spilled_bytes(
-                            &mut file,
-                            &entry.bytes,
-                            entry.value,
-                            stats,
-                        )?);
-                    }
-                    *bucket = Bucket::Spilled(handles);
+                    *bucket = Bucket::Spilled(spill_entries(spill, pending, stats)?);
                 }
             }
             Bucket::Spilled(handles) => {
                 let mut file = spill.lock().unwrap_or_else(|error| error.into_inner());
-                handles.push(append_spilled_bytes(&mut file, bytes, value, stats)?);
+                handles.push(append_spilled_bytes(
+                    &mut file,
+                    owned.as_ref(),
+                    value,
+                    stats,
+                )?);
             }
         }
-        Ok((value, true))
+        Ok((value, Some(owned)))
     }
 
     pub fn bucket_location(&self, bytes: &[u8]) -> Option<BucketLocation> {
         self.buckets
             .get(&self.digest.digest(bytes))
             .map(|bucket| match bucket {
-                Bucket::Resident(_) => BucketLocation::Resident,
+                Bucket::Single(_) | Bucket::Resident(_) => BucketLocation::Resident,
                 Bucket::Spilled(_) => BucketLocation::Spilled,
             })
     }
@@ -154,6 +223,7 @@ impl<V: Copy, D: DigestFunction> DigestMap<V, D> {
         self.buckets
             .values()
             .map(|bucket| match bucket {
+                Bucket::Single(_) => 1,
                 Bucket::Resident(entries) => entries.len(),
                 Bucket::Spilled(handles) => handles.len(),
             })
@@ -164,6 +234,24 @@ impl<V: Copy, D: DigestFunction> DigestMap<V, D> {
     pub fn stats(&self) -> DigestMapStats {
         self.stats
     }
+}
+
+fn spill_entries<V: Copy>(
+    spill: &Mutex<File>,
+    entries: Vec<Entry<V>>,
+    stats: &mut DigestMapStats,
+) -> Result<Vec<SpillHandle<V>>, DedupError> {
+    let mut handles = Vec::with_capacity(entries.len());
+    let mut file = spill.lock().unwrap_or_else(|error| error.into_inner());
+    for entry in entries {
+        handles.push(append_spilled_bytes(
+            &mut file,
+            entry.bytes.as_ref(),
+            entry.value,
+            stats,
+        )?);
+    }
+    Ok(handles)
 }
 
 fn append_spilled_bytes<V: Copy>(
@@ -229,6 +317,8 @@ fn spilled_bytes_equal<V: Copy>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Clone, Copy, Debug)]
     struct FixedDigest;
@@ -236,6 +326,16 @@ mod tests {
     impl DigestFunction for FixedDigest {
         fn digest(&self, _bytes: &[u8]) -> [u8; 32] {
             [7; 32]
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct CountingDigest(Arc<AtomicUsize>);
+
+    impl DigestFunction for CountingDigest {
+        fn digest(&self, _bytes: &[u8]) -> [u8; 32] {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            [9; 32]
         }
     }
 
@@ -249,5 +349,15 @@ mod tests {
         assert_eq!(map.bucket_location(b"alpha"), Some(BucketLocation::Spilled));
         assert_eq!(map.stats().spill_bytes, 9);
         assert_eq!(map.stats().spill_handle_touches, 2);
+    }
+
+    #[test]
+    fn insertion_hashes_each_lookup_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut map = DigestMap::new(CountingDigest(Arc::clone(&calls)), 8).unwrap();
+        assert_eq!(map.insert_with(b"alpha", || 1).unwrap(), (1, true));
+        assert_eq!(map.insert_with(b"alpha", || 2).unwrap(), (1, false));
+        assert_eq!(map.insert_with(b"beta", || 3).unwrap(), (3, true));
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
     }
 }

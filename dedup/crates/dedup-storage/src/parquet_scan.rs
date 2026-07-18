@@ -1,7 +1,8 @@
 use arrow_array::{Array, LargeStringArray, RecordBatch, StringArray};
 use arrow_schema::{DataType, SchemaRef};
 use dedup_model::{
-    DedupError, ErrorContext, InputRow, NoopProgress, ProgressObserver, SourceOrder, StageCounters,
+    DedupError, ErrorContext, InputRow, MetadataSourceValidator, NoopProgress, ProgressObserver,
+    SourceOrder, StageCounters,
 };
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{
@@ -67,6 +68,7 @@ pub struct ParallelScanConfig {
     pub queue_batches_per_worker: usize,
     pub batch_size: usize,
     worker_setup: Option<Arc<dyn WorkerThreadSetup>>,
+    metadata_validator: Option<Arc<dyn MetadataSourceValidator>>,
 }
 
 impl ParallelScanConfig {
@@ -86,11 +88,17 @@ impl ParallelScanConfig {
             queue_batches_per_worker,
             batch_size,
             worker_setup: None,
+            metadata_validator: None,
         })
     }
 
     pub fn with_worker_setup(mut self, setup: Arc<dyn WorkerThreadSetup>) -> Self {
         self.worker_setup = Some(setup);
+        self
+    }
+
+    pub fn with_metadata_validator(mut self, validator: Arc<dyn MetadataSourceValidator>) -> Self {
+        self.metadata_validator = Some(validator);
         self
     }
 }
@@ -165,6 +173,26 @@ pub fn scan_parquet_inputs_with_progress(
     counters: &mut StageCounters,
     progress: &dyn ProgressObserver,
 ) -> Result<ParquetScanResult, DedupError> {
+    scan_parquet_inputs_with_progress_and_validator(
+        inputs,
+        allowed_chains,
+        evm_chains,
+        sink,
+        counters,
+        progress,
+        None,
+    )
+}
+
+fn scan_parquet_inputs_with_progress_and_validator(
+    inputs: &[ValidatedParquetInput],
+    allowed_chains: &BTreeSet<String>,
+    evm_chains: &BTreeSet<String>,
+    sink: &mut impl ParquetRowSink,
+    counters: &mut StageCounters,
+    progress: &dyn ProgressObserver,
+    metadata_validator: Option<&dyn MetadataSourceValidator>,
+) -> Result<ParquetScanResult, DedupError> {
     let schema_digest = digest_schema(inputs)?;
     let mut logical_digest = Sha256::new();
     logical_digest.update(schema_digest);
@@ -197,7 +225,7 @@ pub fn scan_parquet_inputs_with_progress(
                     })?;
                 let columns = ProjectedColumns::new(&batch)?;
                 for row_index in 0..batch.num_rows() {
-                    let row = decode_row(
+                    let mut row = decode_row(
                         &columns,
                         row_index,
                         SourceOrder::new(input.file_ordinal, file_row_number),
@@ -205,6 +233,9 @@ pub fn scan_parquet_inputs_with_progress(
                         evm_chains,
                     )?;
                     update_row_digest(&mut row_group_digest, &row);
+                    if let Some(validator) = metadata_validator {
+                        row.metadata_valid = Some(validator.is_valid_metadata(&row.metadata_json));
+                    }
                     sink.push(row)?;
                     file_row_number =
                         file_row_number
@@ -253,13 +284,14 @@ pub fn scan_parquet_inputs_parallel(
             .sum::<usize>()
             <= 1
     {
-        return scan_parquet_inputs_with_progress(
+        return scan_parquet_inputs_with_progress_and_validator(
             inputs,
             allowed_chains,
             evm_chains,
             sink,
             counters,
             progress,
+            config.metadata_validator.as_deref(),
         );
     }
     let tasks = build_row_group_tasks(inputs)?;
@@ -280,6 +312,7 @@ pub fn scan_parquet_inputs_parallel(
             let worker_startup = Arc::clone(&startup);
             let setup_sender = setup_sender.clone();
             let worker_setup = config.worker_setup.clone();
+            let metadata_validator = config.metadata_validator.clone();
             if let Err(error) = thread::Builder::new()
                 .name(format!("dedup-parquet-{worker}"))
                 .spawn_scoped(scope, move || {
@@ -308,6 +341,7 @@ pub fn scan_parquet_inputs_parallel(
                             evm_chains,
                             &senders[task_index],
                             config.batch_size,
+                            metadata_validator.as_deref(),
                         )
                         .is_err()
                         {
@@ -475,6 +509,7 @@ fn decode_row_group_parallel(
     evm_chains: &BTreeSet<String>,
     sender: &SyncSender<RowGroupMessage>,
     batch_size: usize,
+    metadata_validator: Option<&dyn MetadataSourceValidator>,
 ) -> Result<(), ()> {
     let result = (|| {
         let file = File::open(&input.path)?;
@@ -497,7 +532,7 @@ fn decode_row_group_parallel(
             let columns = ProjectedColumns::new(&batch)?;
             let mut decoded = Vec::with_capacity(batch.num_rows());
             for row_index in 0..batch.num_rows() {
-                let row = decode_row(
+                let mut row = decode_row(
                     &columns,
                     row_index,
                     SourceOrder::new(input.file_ordinal, file_row_number),
@@ -505,6 +540,9 @@ fn decode_row_group_parallel(
                     evm_chains,
                 )?;
                 update_row_digest(&mut digest, &row);
+                if let Some(validator) = metadata_validator {
+                    row.metadata_valid = Some(validator.is_valid_metadata(&row.metadata_json));
+                }
                 decoded.push(row);
                 file_row_number =
                     file_row_number
@@ -676,6 +714,7 @@ fn decode_row(
         token_uri_norm: columns.value(4, row_index).to_owned(),
         image_uri_norm: columns.value(5, row_index).to_owned(),
         metadata_json: columns.value(6, row_index).trim().to_owned(),
+        metadata_valid: None,
         source_order,
     })
 }
@@ -743,6 +782,14 @@ mod tests {
                 .ok_or_else(|| DedupError::PlatformCapabilityMissing {
                     capability: "test worker binding".to_owned(),
                 })
+        }
+    }
+
+    struct JsonMetadataValidator;
+
+    impl MetadataSourceValidator for JsonMetadataValidator {
+        fn is_valid_metadata(&self, content: &str) -> bool {
+            serde_json::from_str::<serde_json::Value>(content).is_ok()
         }
     }
 
@@ -954,6 +1001,45 @@ mod tests {
         assert_eq!(setup.0.load(Ordering::Relaxed), 2);
         assert_eq!(parallel, sequential);
         assert_eq!(parallel_rows, sequential_rows);
+    }
+
+    #[test]
+    fn metadata_validation_runs_in_decoder_without_changing_input_digest() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fixture.parquet");
+        write_fixture(&path);
+        let inputs = validate_parquet_inputs(&[path.to_string_lossy().into_owned()]).unwrap();
+        let allowed = BTreeSet::from(["ethereum".to_owned(), "solana".to_owned()]);
+        let evm = BTreeSet::from(["ethereum".to_owned()]);
+        let baseline = scan_parquet_inputs(
+            &inputs,
+            &allowed,
+            &evm,
+            &mut |_| Ok(()),
+            &mut StageCounters::default(),
+        )
+        .unwrap();
+
+        for workers in [1, 2] {
+            let mut validity = Vec::new();
+            let validated = scan_parquet_inputs_parallel(
+                &inputs,
+                &allowed,
+                &evm,
+                &mut |row: InputRow| {
+                    validity.push(row.metadata_valid);
+                    Ok(())
+                },
+                &mut StageCounters::default(),
+                &NoopProgress,
+                ParallelScanConfig::new(workers, 1, 1_024)
+                    .unwrap()
+                    .with_metadata_validator(Arc::new(JsonMetadataValidator)),
+            )
+            .unwrap();
+            assert_eq!(validated, baseline);
+            assert_eq!(validity, [Some(true), Some(false), Some(true)]);
+        }
     }
 
     #[test]

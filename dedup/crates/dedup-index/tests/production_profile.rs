@@ -44,6 +44,7 @@ fn one_hundred_thousand_nft_contract_uses_bounded_external_runs() {
                 token_uri_norm: String::new(),
                 image_uri_norm: String::new(),
                 metadata_json: String::new(),
+                metadata_valid: None,
                 source_order: SourceOrder::new(0, token as u64),
             })
             .unwrap();

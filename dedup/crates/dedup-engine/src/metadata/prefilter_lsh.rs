@@ -1,4 +1,5 @@
 use super::{ContractAnchors, TemplateFingerprint, fingerprint_bytes_equal};
+use ahash::{AHashMap, RandomState};
 use dedup_index::{ExternalRadix, LshProbeAccumulator, MemoryBudget, RadixRecord, SpillVolume};
 use dedup_model::{
     ChainId, ContractId, DedupError, ErrorContext, ExecutionMode, MetadataPrefilterParameters,
@@ -19,7 +20,7 @@ pub struct CandidateEvidence {
     pub lsh_band_matches: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MetadataCandidate {
     pub left: ContractId,
     pub right: ContractId,
@@ -348,7 +349,7 @@ enum PrequotaCapture<'a> {
 }
 
 enum EvidenceStore {
-    Resident(BTreeMap<MetadataCandidate, CandidateEvidence>),
+    Resident(AHashMap<MetadataCandidate, CandidateEvidence>),
     External(ExternalEvidenceWriter),
 }
 
@@ -360,7 +361,9 @@ impl EvidenceStore {
         let Some(execution) = execution.filter(|config| {
             matches!(config.mode, ExecutionMode::Hybrid | ExecutionMode::External)
         }) else {
-            return Ok(Self::Resident(BTreeMap::new()));
+            return Ok(Self::Resident(AHashMap::with_hasher(
+                RandomState::with_seeds(121, 122, 123, 124),
+            )));
         };
         let radix = create_prefilter_radix(execution, "candidate-evidence-raw")?;
         Ok(Self::External(ExternalEvidenceWriter {
@@ -1369,7 +1372,7 @@ fn shared_feature_count(
 }
 
 fn apply_quotas(
-    evidence: &BTreeMap<MetadataCandidate, CandidateEvidence>,
+    evidence: &AHashMap<MetadataCandidate, CandidateEvidence>,
     chain_by_contract: &BTreeMap<ContractId, ChainId>,
     parameters: &MetadataPrefilterParameters,
     truncations: &mut u64,

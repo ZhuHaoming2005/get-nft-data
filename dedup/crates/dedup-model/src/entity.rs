@@ -30,6 +30,8 @@ pub struct InputRow {
     pub token_uri_norm: String,
     pub image_uri_norm: String,
     pub metadata_json: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_valid: Option<bool>,
     pub source_order: SourceOrder,
 }
 
@@ -39,7 +41,7 @@ pub struct EntityArtifacts {
     pub nfts: Vec<Nft>,
 }
 
-pub trait MetadataSourceValidator {
+pub trait MetadataSourceValidator: Send + Sync {
     fn is_valid_metadata(&self, content: &str) -> bool;
 }
 
