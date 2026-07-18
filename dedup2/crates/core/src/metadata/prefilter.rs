@@ -108,7 +108,7 @@ struct DirectedEvidence {
     source: ContractId,
     target: ContractId,
     target_chain: ChainId,
-    evidence: Evidence,
+    evidence_index: u32,
 }
 
 pub fn generate_candidates(
@@ -152,10 +152,15 @@ pub fn generate_candidates(
     let bands = config.lsh_bands.max(1) as usize;
     let num_hashes = band_size.saturating_mul(bands);
     progress.begin_phase("prefilter_minhash", Some(rows.len() as u64));
-    let signatures: Vec<Vec<u32>> = feature_ids
-        .par_iter()
-        .map(|features| minhash_signature(features, num_hashes))
-        .collect();
+    let signature_len = rows
+        .len()
+        .checked_mul(num_hashes)
+        .ok_or_else(|| DedupError::invalid("metadata", "MinHash signature size overflow"))?;
+    let mut signatures = vec![u32::MAX; signature_len];
+    signatures
+        .par_chunks_mut(num_hashes)
+        .zip(feature_ids.par_iter())
+        .for_each(|(signature, features)| fill_minhash_signature(features, signature));
     progress.add_completed(rows.len() as u64);
 
     let (mut edges, exact_pairs, bucket_truncations) =
@@ -292,7 +297,7 @@ fn exact_digest_edges(
 
 fn lsh_edges(
     rows: &[CompactRow],
-    signatures: &[Vec<u32>],
+    signatures: &[u32],
     bands: usize,
     band_size: usize,
     neighbors: usize,
@@ -302,10 +307,11 @@ fn lsh_edges(
         "prefilter_lsh_index",
         Some((rows.len().saturating_mul(bands)) as u64),
     );
-    let mut records: Vec<BandRecord> = signatures
-        .par_iter()
-        .enumerate()
-        .flat_map_iter(|(row, signature)| {
+    let signature_width = bands.saturating_mul(band_size);
+    let mut records: Vec<BandRecord> = (0..rows.len())
+        .into_par_iter()
+        .flat_map_iter(|row| {
+            let signature = &signatures[row * signature_width..(row + 1) * signature_width];
             (0..bands).map(move |band| {
                 let start = band * band_size;
                 BandRecord {
@@ -358,28 +364,36 @@ fn reduce_quotas(
         Some((evidence.len().saturating_mul(2)) as u64),
     );
     let mut directed = Vec::with_capacity(evidence.len().saturating_mul(2));
-    for &item in evidence {
+    for (evidence_index, item) in evidence.iter().enumerate() {
+        let evidence_index = u32::try_from(evidence_index).map_err(|_| {
+            DedupError::invalid(
+                "metadata",
+                "candidate evidence count exceeds the u32 resident-index limit",
+            )
+        })?;
         let left_chain = rows[by_contract[item.pair.left as usize]].chain_id;
         let right_chain = rows[by_contract[item.pair.right as usize]].chain_id;
         directed.push(DirectedEvidence {
             source: item.pair.left,
             target: item.pair.right,
             target_chain: right_chain,
-            evidence: item,
+            evidence_index,
         });
         directed.push(DirectedEvidence {
             source: item.pair.right,
             target: item.pair.left,
             target_chain: left_chain,
-            evidence: item,
+            evidence_index,
         });
     }
     directed.par_sort_unstable_by(|left, right| {
+        let left_evidence = evidence[left.evidence_index as usize];
+        let right_evidence = evidence[right.evidence_index as usize];
         left.source
             .cmp(&right.source)
-            .then(right.evidence.exact.cmp(&left.evidence.exact))
-            .then(right.evidence.shared.cmp(&left.evidence.shared))
-            .then(right.evidence.bands.cmp(&left.evidence.bands))
+            .then(right_evidence.exact.cmp(&left_evidence.exact))
+            .then(right_evidence.shared.cmp(&left_evidence.shared))
+            .then(right_evidence.bands.cmp(&left_evidence.bands))
             .then(left.target.cmp(&right.target))
     });
     let ranges = equal_ranges(&directed, |left, right| left.source == right.source);
@@ -397,7 +411,7 @@ fn reduce_quotas(
                     continue;
                 }
                 *chain_count += 1;
-                kept.push(item.evidence.pair);
+                kept.push(evidence[item.evidence_index as usize].pair);
             }
             progress.add_completed(range.len() as u64);
             kept
@@ -537,8 +551,7 @@ fn shared_feature_count(left: &[u64], right: &[u64]) -> u32 {
     shared
 }
 
-fn minhash_signature(features: &[u64], num_hashes: usize) -> Vec<u32> {
-    let mut signature = vec![u32::MAX; num_hashes];
+fn fill_minhash_signature(features: &[u64], signature: &mut [u32]) {
     for &feature in features {
         let base = (feature as u32) ^ ((feature >> 32) as u32);
         for (index, minimum) in signature.iter_mut().enumerate() {
@@ -550,7 +563,6 @@ fn minhash_signature(features: &[u64], num_hashes: usize) -> Vec<u32> {
             *minimum = (*minimum).min(hash);
         }
     }
-    signature
 }
 
 #[cfg(test)]

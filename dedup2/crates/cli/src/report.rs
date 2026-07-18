@@ -15,12 +15,23 @@ struct RunManifest {
     evm_chains: Vec<String>,
     rows_loaded: u64,
     contracts: usize,
+    nfts: usize,
+    interned_strings: usize,
+    token_uri_postings: usize,
+    image_uri_postings: usize,
     chain_totals: Vec<ChainTotalRow>,
     elapsed_secs: f64,
+    stage_timings: Vec<StageTiming>,
     name_threshold: f64,
     metadata_threshold: f64,
     metadata_anchors: usize,
     metadata_prefilter: Option<PrefilterStats>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct StageTiming {
+    pub stage: &'static str,
+    pub elapsed_secs: f64,
 }
 
 #[derive(Serialize)]
@@ -40,6 +51,7 @@ pub struct ReportRequest<'a> {
     pub metadata_threshold: f64,
     pub metadata_anchors: usize,
     pub metadata_prefilter: Option<PrefilterStats>,
+    pub stage_timings: Vec<StageTiming>,
     pub elapsed: Duration,
 }
 
@@ -66,8 +78,13 @@ pub fn write_reports(output_dir: &Path, request: ReportRequest<'_>) -> Result<()
         evm_chains: request.evm_chains.to_vec(),
         rows_loaded: request.store.rows_loaded,
         contracts: request.store.contracts.len(),
+        nfts: request.store.nfts.len(),
+        interned_strings: request.store.strings.len(),
+        token_uri_postings: request.store.token_uri_postings.len(),
+        image_uri_postings: request.store.image_uri_postings.len(),
         chain_totals,
         elapsed_secs: request.elapsed.as_secs_f64(),
+        stage_timings: request.stage_timings,
         name_threshold: request.name_threshold,
         metadata_threshold: request.metadata_threshold,
         metadata_anchors: request.metadata_anchors,

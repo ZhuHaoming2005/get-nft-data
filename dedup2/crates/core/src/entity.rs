@@ -185,7 +185,7 @@ impl EntityStore {
             id
         };
 
-        self.merge_contract_name(contract_id, &row.name_norm)?;
+        self.merge_contract_name(contract_id, &row.name_norm);
         if let Some(canonical_json) = validated_metadata(&row.metadata_json) {
             self.insert_metadata_anchor(
                 contract_id,
@@ -230,29 +230,18 @@ impl EntityStore {
         Ok(())
     }
 
-    fn merge_contract_name(
-        &mut self,
-        contract_id: ContractId,
-        name: &str,
-    ) -> Result<(), DedupError> {
+    fn merge_contract_name(&mut self, contract_id: ContractId, name: &str) {
         if name.is_empty() {
-            return Ok(());
+            return;
         }
         let contract = &mut self.contracts[contract_id as usize];
         match contract.name_norm.as_deref() {
             None => contract.name_norm = Some(name.to_owned()),
-            Some(existing) if existing == name => {}
-            Some(existing) => {
-                return Err(DedupError::invalid(
-                    "load",
-                    format!(
-                        "snapshot conflict: contract {} has distinct names `{existing}` and `{name}`",
-                        contract.address
-                    ),
-                ));
+            Some(existing) if name < existing => {
+                contract.name_norm = Some(name.to_owned());
             }
+            Some(_) => {}
         }
-        Ok(())
     }
 
     fn merge_duplicate_nft(&mut self, nft_id: NftId, row: &InputRow) -> Result<(), DedupError> {
@@ -331,35 +320,109 @@ impl EntityStore {
     }
 
     pub fn rebuild_uri_postings(&mut self) {
-        self.token_uri_postings = build_uri_postings(&self.contracts, &self.nfts, true);
-        self.image_uri_postings = build_uri_postings(&self.contracts, &self.nfts, false);
+        let (token_uri_postings, image_uri_postings) = rayon::join(
+            || build_uri_postings(&self.contracts, &self.nfts, true),
+            || build_uri_postings(&self.contracts, &self.nfts, false),
+        );
+        self.token_uri_postings = token_uri_postings;
+        self.image_uri_postings = image_uri_postings;
     }
 
     pub fn merge_shard(&mut self, shard: EntityStore) -> Result<(), DedupError> {
-        for nft in &shard.nfts {
-            let contract = &shard.contracts[nft.contract_id as usize];
-            let metadata = contract
-                .metadata_by_token
-                .iter()
-                .find(|record| record.token_id == nft.token_id)
-                .map(|record| record.json.clone())
-                .unwrap_or_default();
-            self.try_ingest_row(InputRow {
-                chain: shard.chain_name(contract.chain_id).to_owned(),
-                contract_address: contract.address.clone(),
+        let EntityStore {
+            chains,
+            contracts,
+            nfts,
+            strings,
+            ..
+        } = shard;
+
+        let mut chain_map = Vec::with_capacity(chains.len());
+        for chain in &chains {
+            chain_map.push(self.ensure_chain(chain)?);
+        }
+        let mut string_map = Vec::with_capacity(strings.len());
+        for value in &strings {
+            string_map.push(self.intern_string(value)?);
+        }
+
+        let mut contract_map = vec![0; contracts.len()];
+        for contract in contracts {
+            let chain_id = chain_map[contract.chain_id as usize];
+            let key = (chain_id, contract.address.clone());
+            let contract_id = if let Some(&existing) = self.contract_index.get(&key) {
+                existing
+            } else {
+                let id = ContractId::try_from(self.contracts.len()).map_err(|_| {
+                    DedupError::invalid("load", "too many contracts for ContractId")
+                })?;
+                self.contracts.push(Contract {
+                    id,
+                    chain_id,
+                    address: contract.address.clone(),
+                    name_norm: None,
+                    nft_count: 0,
+                    metadata_by_token: Vec::new(),
+                });
+                self.contract_index.insert(key, id);
+                self.totals.entry(chain_id).or_default().contracts += 1;
+                id
+            };
+            contract_map[contract.id as usize] = contract_id;
+            if let Some(name) = contract.name_norm.as_deref() {
+                self.merge_contract_name(contract_id, name);
+            }
+            let chain_name = self.chains[chain_id as usize].clone();
+            for record in contract.metadata_by_token {
+                self.insert_metadata_anchor(
+                    contract_id,
+                    &chain_name,
+                    record.token_id,
+                    record.json,
+                    record.canonical_json,
+                    record.source_order,
+                );
+            }
+        }
+
+        for nft in nfts {
+            let contract_id = contract_map[nft.contract_id as usize];
+            let token_uri_id = nft.token_uri_id.map(|id| string_map[id as usize]);
+            let image_uri_id = nft.image_uri_id.map(|id| string_map[id as usize]);
+            let nft_key = (contract_id, nft.token_id.clone());
+            if let Some(&existing_id) = self.nft_index.get(&nft_key) {
+                let existing = &mut self.nfts[existing_id as usize];
+                existing.token_uri_id = merge_mapped_uri(
+                    existing.token_uri_id,
+                    token_uri_id,
+                    "token_uri_norm",
+                    contract_id,
+                    &nft.token_id,
+                )?;
+                existing.image_uri_id = merge_mapped_uri(
+                    existing.image_uri_id,
+                    image_uri_id,
+                    "image_uri_norm",
+                    contract_id,
+                    &nft.token_id,
+                )?;
+                continue;
+            }
+            let nft_id = NftId::try_from(self.nfts.len())
+                .map_err(|_| DedupError::invalid("load", "too many NFTs for NftId"))?;
+            self.nfts.push(Nft {
+                id: nft_id,
+                contract_id,
                 token_id: nft.token_id.clone(),
-                name_norm: contract.name_norm.clone().unwrap_or_default(),
-                token_uri_norm: nft
-                    .token_uri_id
-                    .map(|id| shard.string(id).to_owned())
-                    .unwrap_or_default(),
-                image_uri_norm: nft
-                    .image_uri_id
-                    .map(|id| shard.string(id).to_owned())
-                    .unwrap_or_default(),
-                metadata_json: metadata,
+                token_uri_id,
+                image_uri_id,
                 source_order: nft.source_order,
-            })?;
+            });
+            self.nft_index.insert(nft_key, nft_id);
+            let chain_id = self.contracts[contract_id as usize].chain_id;
+            self.contracts[contract_id as usize].nft_count += 1;
+            self.totals.entry(chain_id).or_default().nfts += 1;
+            self.rows_loaded += 1;
         }
         Ok(())
     }
@@ -405,6 +468,26 @@ impl EntityStore {
         }
         replacement.rebuild_uri_postings();
         *self = replacement;
+    }
+}
+
+fn merge_mapped_uri(
+    existing: Option<StringId>,
+    incoming: Option<StringId>,
+    field: &str,
+    contract_id: ContractId,
+    token_id: &str,
+) -> Result<Option<StringId>, DedupError> {
+    match (existing, incoming) {
+        (None, value) => Ok(value),
+        (value, None) => Ok(value),
+        (Some(existing), Some(incoming)) if existing == incoming => Ok(Some(existing)),
+        (Some(_), Some(_)) => Err(DedupError::invalid(
+            "load",
+            format!(
+                "snapshot conflict for contract {contract_id}, token {token_id}: distinct {field} values"
+            ),
+        )),
     }
 }
 
@@ -530,6 +613,49 @@ mod tests {
             .try_ingest_row(row("1", "uri://different", ""))
             .unwrap_err();
         assert!(error.to_string().contains("snapshot conflict"));
+    }
+
+    #[test]
+    fn contract_name_uses_stable_non_empty_minimum_across_shards() {
+        let mut higher = row("1", "", "");
+        higher.name_norm = "pokemon trading card game - scar".to_owned();
+        let mut lower = row("2", "", "");
+        lower.name_norm = "1999 # charmander cgc 10 pristin".to_owned();
+
+        let mut left = EntityStore::default();
+        left.try_ingest_row(higher).unwrap();
+        let mut right = EntityStore::default();
+        right.try_ingest_row(lower).unwrap();
+        left.merge_shard(right).unwrap();
+
+        assert_eq!(
+            left.contracts[0].name_norm.as_deref(),
+            Some("1999 # charmander cgc 10 pristin")
+        );
+    }
+
+    #[test]
+    fn direct_shard_merge_preserves_unique_rows_and_fills_missing_uri() {
+        let mut left = EntityStore::default();
+        left.try_ingest_row(row("1", "", r#"{"name":"one"}"#))
+            .unwrap();
+        let mut right = EntityStore::default();
+        right
+            .try_ingest_row(row("1", "uri://one", r#"{"name":"one"}"#))
+            .unwrap();
+        right
+            .try_ingest_row(row("2", "uri://two", r#"{"name":"two"}"#))
+            .unwrap();
+
+        left.merge_shard(right).unwrap();
+        left.rebuild_uri_postings();
+
+        assert_eq!(left.rows_loaded, 2);
+        assert_eq!(left.contracts.len(), 1);
+        assert_eq!(left.contracts[0].nft_count, 2);
+        assert_eq!(left.nfts.len(), 2);
+        assert_eq!(left.string(left.nfts[0].token_uri_id.unwrap()), "uri://one");
+        assert_eq!(left.token_uri_postings.len(), 2);
     }
 
     #[test]

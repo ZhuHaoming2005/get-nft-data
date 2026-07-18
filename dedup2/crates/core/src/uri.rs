@@ -17,11 +17,44 @@ struct UriScopeHit {
     secondary_chain: Option<ChainId>,
 }
 
-#[derive(Default)]
 struct TokenHits {
-    intra: AHashSet<NftId>,
-    cross_summary: AHashSet<NftId>,
+    intra: DenseNftSet,
+    cross_summary: DenseNftSet,
     matrix: AHashSet<(NftId, ChainId)>,
+}
+
+struct DenseNftSet {
+    words: Vec<u64>,
+}
+
+impl DenseNftSet {
+    fn with_capacity(nft_count: usize) -> Self {
+        Self {
+            words: vec![0; nft_count.div_ceil(64)],
+        }
+    }
+
+    fn insert(&mut self, nft_id: NftId) {
+        let nft_id = nft_id as usize;
+        self.words[nft_id / 64] |= 1_u64 << (nft_id % 64);
+    }
+
+    fn contains(&self, nft_id: NftId) -> bool {
+        let nft_id = nft_id as usize;
+        self.words
+            .get(nft_id / 64)
+            .is_some_and(|word| word & (1_u64 << (nft_id % 64)) != 0)
+    }
+}
+
+impl TokenHits {
+    fn new(nft_count: usize) -> Self {
+        Self {
+            intra: DenseNftSet::with_capacity(nft_count),
+            cross_summary: DenseNftSet::with_capacity(nft_count),
+            matrix: AHashSet::new(),
+        }
+    }
 }
 
 pub fn run_uri(
@@ -41,7 +74,7 @@ pub fn run_uri(
             Ok(hits)
         })
         .collect();
-    let mut token_hits = TokenHits::default();
+    let mut token_hits = TokenHits::new(store.nfts.len());
     for result in token_results {
         for hit in result? {
             remember_token_hit(&mut token_hits, &hit);
@@ -134,7 +167,7 @@ fn image_scope_hits(members: &[UriPosting], token_hits: &TokenHits) -> Vec<UriSc
     let mut hits = Vec::new();
 
     for (&chain, postings) in &by_chain {
-        let intra = filtered_postings(postings, |nft_id| !token_hits.intra.contains(&nft_id));
+        let intra = filtered_postings(postings, |nft_id| !token_hits.intra.contains(nft_id));
         if intra.len() >= 2 {
             hits.extend(intra.into_iter().map(|(posting, nft_ids)| UriScopeHit {
                 contract_id: posting.contract_id,
@@ -147,7 +180,7 @@ fn image_scope_hits(members: &[UriPosting], token_hits: &TokenHits) -> Vec<UriSc
         }
 
         let primary_cross = filtered_postings(postings, |nft_id| {
-            !token_hits.cross_summary.contains(&nft_id)
+            !token_hits.cross_summary.contains(nft_id)
         });
         let has_other_cross = chains.iter().any(|&other_chain| {
             other_chain != chain
@@ -155,7 +188,7 @@ fn image_scope_hits(members: &[UriPosting], token_hits: &TokenHits) -> Vec<UriSc
                     posting
                         .nft_ids
                         .iter()
-                        .any(|nft_id| !token_hits.cross_summary.contains(nft_id))
+                        .any(|&nft_id| !token_hits.cross_summary.contains(nft_id))
                 })
         });
         if !primary_cross.is_empty() && has_other_cross {
@@ -241,8 +274,16 @@ fn scope_hit(
 
 fn remember_token_hit(token_hits: &mut TokenHits, hit: &UriScopeHit) {
     match hit.kind {
-        ScopeKind::IntraChain => token_hits.intra.extend(&hit.nft_ids),
-        ScopeKind::CrossChainSummary => token_hits.cross_summary.extend(&hit.nft_ids),
+        ScopeKind::IntraChain => {
+            for &nft_id in &hit.nft_ids {
+                token_hits.intra.insert(nft_id);
+            }
+        }
+        ScopeKind::CrossChainSummary => {
+            for &nft_id in &hit.nft_ids {
+                token_hits.cross_summary.insert(nft_id);
+            }
+        }
         ScopeKind::ChainMatrix => {
             let secondary = hit.secondary_chain.expect("matrix hit has secondary chain");
             token_hits

@@ -37,60 +37,51 @@ impl PreparedDocument {
 
 pub fn cosine_similarity(left: &PreparedDocument, right: &PreparedDocument) -> f64 {
     let avgdl = f64::from(left.length + right.length) / 2.0;
-    let mut left_weights = Vec::with_capacity(left.terms.len());
-    let mut right_weights = Vec::with_capacity(right.terms.len());
     let mut left_pos = 0;
     let mut right_pos = 0;
+    let mut dot = 0.0;
+    let mut left_norm_squared = 0.0;
+    let mut right_norm_squared = 0.0;
     while left_pos < left.terms.len() || right_pos < right.terms.len() {
         match (left.terms.get(left_pos), right.terms.get(right_pos)) {
             (Some((left_term, left_tf)), Some((right_term, right_tf))) => {
                 match left_term.cmp(right_term) {
                     std::cmp::Ordering::Equal => {
-                        left_weights.push(weight(*left_tf, left.length, avgdl, 2));
-                        right_weights.push(weight(*right_tf, right.length, avgdl, 2));
+                        let left_weight = weight(*left_tf, left.length, avgdl, 2);
+                        let right_weight = weight(*right_tf, right.length, avgdl, 2);
+                        dot += left_weight * right_weight;
+                        left_norm_squared += left_weight * left_weight;
+                        right_norm_squared += right_weight * right_weight;
                         left_pos += 1;
                         right_pos += 1;
                     }
                     std::cmp::Ordering::Less => {
-                        left_weights.push(weight(*left_tf, left.length, avgdl, 1));
-                        right_weights.push(0.0);
+                        let left_weight = weight(*left_tf, left.length, avgdl, 1);
+                        left_norm_squared += left_weight * left_weight;
                         left_pos += 1;
                     }
                     std::cmp::Ordering::Greater => {
-                        left_weights.push(0.0);
-                        right_weights.push(weight(*right_tf, right.length, avgdl, 1));
+                        let right_weight = weight(*right_tf, right.length, avgdl, 1);
+                        right_norm_squared += right_weight * right_weight;
                         right_pos += 1;
                     }
                 }
             }
             (Some((_, left_tf)), None) => {
-                left_weights.push(weight(*left_tf, left.length, avgdl, 1));
-                right_weights.push(0.0);
+                let left_weight = weight(*left_tf, left.length, avgdl, 1);
+                left_norm_squared += left_weight * left_weight;
                 left_pos += 1;
             }
             (None, Some((_, right_tf))) => {
-                left_weights.push(0.0);
-                right_weights.push(weight(*right_tf, right.length, avgdl, 1));
+                let right_weight = weight(*right_tf, right.length, avgdl, 1);
+                right_norm_squared += right_weight * right_weight;
                 right_pos += 1;
             }
             (None, None) => break,
         }
     }
-    let dot = left_weights
-        .iter()
-        .zip(&right_weights)
-        .map(|(left, right)| left * right)
-        .sum::<f64>();
-    let left_norm = left_weights
-        .iter()
-        .map(|value| value * value)
-        .sum::<f64>()
-        .sqrt();
-    let right_norm = right_weights
-        .iter()
-        .map(|value| value * value)
-        .sum::<f64>()
-        .sqrt();
+    let left_norm = left_norm_squared.sqrt();
+    let right_norm = right_norm_squared.sqrt();
     if left_norm <= 0.0 || right_norm <= 0.0 {
         0.0
     } else {

@@ -1,5 +1,5 @@
 use crate::progress::ProgressReporter;
-use crate::report::{ReportRequest, write_reports};
+use crate::report::{ReportRequest, StageTiming, write_reports};
 use dedup_core::{
     DedupError, LoadOptions, PrefilterConfig, ProgressObserver, SummaryAccumulator,
     load_entities_with_options, run_metadata, run_name, run_uri,
@@ -43,18 +43,34 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
         .collect::<Vec<_>>();
     let load_options =
         LoadOptions::new(allowed, evm_names.iter().cloned(), config.metadata_anchors);
+    let stage_started = Instant::now();
     let store = load_entities_with_options(&config.inputs, &load_options, progress)?;
+    let mut stage_timings = vec![StageTiming {
+        stage: "load",
+        elapsed_secs: stage_started.elapsed().as_secs_f64(),
+    }];
 
     let mut acc = SummaryAccumulator::default();
     let name_threshold = config.name_threshold / 100.0;
     if config.run_name {
+        let stage_started = Instant::now();
         run_name(&store, name_threshold, &mut acc, progress)?;
+        stage_timings.push(StageTiming {
+            stage: "name",
+            elapsed_secs: stage_started.elapsed().as_secs_f64(),
+        });
     }
     if config.run_uri {
+        let stage_started = Instant::now();
         run_uri(&store, &mut acc, progress)?;
+        stage_timings.push(StageTiming {
+            stage: "uri",
+            elapsed_secs: stage_started.elapsed().as_secs_f64(),
+        });
     }
     let mut metadata_stats = None;
     if config.run_metadata {
+        let stage_started = Instant::now();
         let evm: std::collections::HashSet<String> = config
             .evm_chains
             .iter()
@@ -79,6 +95,10 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
             progress,
         )?;
         metadata_stats = Some(result.stats);
+        stage_timings.push(StageTiming {
+            stage: "metadata",
+            elapsed_secs: stage_started.elapsed().as_secs_f64(),
+        });
     }
 
     progress.set_stage("report");
@@ -95,6 +115,7 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
             metadata_threshold: config.metadata_threshold,
             metadata_anchors: config.metadata_anchors,
             metadata_prefilter: metadata_stats,
+            stage_timings,
             elapsed: started.elapsed(),
         },
     )
