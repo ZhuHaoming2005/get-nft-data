@@ -25,7 +25,7 @@ struct CommonArgs {
     chains: Vec<String>,
     #[arg(long, value_delimiter = ',')]
     evm_chains: Vec<String>,
-    #[arg(long, default_value_t = 95.0)]
+    #[arg(long, default_value_t = 98.0)]
     name_threshold: f64,
     #[arg(long, default_value_t = 0.6)]
     metadata_threshold: f64,
