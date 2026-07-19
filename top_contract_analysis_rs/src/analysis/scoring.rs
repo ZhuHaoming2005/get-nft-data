@@ -10,7 +10,7 @@ use thiserror::Error;
 
 use crate::normalize::{normalize_name, normalize_text};
 
-// Keep in sync with name_uri_analysis_rs metadata TOKEN_RE / metadata_bm25_tokens
+// Keep in sync with dedup metadata tokenization.
 static TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\p{L}\p{N}_]+").unwrap());
 pub const MAX_METADATA_BYTES_FOR_DEDUP: usize = 64 * 1024;
 
@@ -26,7 +26,7 @@ pub(crate) struct MetadataDocuments {
     pub(crate) content: String,
 }
 
-// Keep in sync with name_uri_analysis_rs::analysis::name_scoring::PreparedNameQuery
+// Keep in sync with dedup Name scoring.
 // (rapidfuzz Jaro–Winkler BatchComparator + score_cutoff percent API).
 pub(crate) struct PreparedNameQuery {
     scorer: jaro_winkler::BatchComparator<char>,
@@ -129,7 +129,7 @@ pub fn metadata_recall_document(metadata_json: &str) -> String {
 }
 
 pub fn metadata_is_dedup_eligible(metadata_json: &str) -> bool {
-    // Keep in sync with name_uri_analysis_rs metadata_is_dedup_eligible
+    // Keep in sync with dedup metadata eligibility.
     // and sql_metadata_json_eligible_predicate / metadata_json_eligible_predicate:
     // trim, non-empty, len<=64KiB, starts with { or [
     let metadata_json = metadata_json.trim();

@@ -1,8 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-    "name_uri_analysis_rs",
-    "name_uri_analysis_rs/metadata_engine",
     "top_contract_analysis_rs",
 ]
 

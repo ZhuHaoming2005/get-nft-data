@@ -1023,7 +1023,7 @@ impl DuckDbFeatureStore {
     }
 
     pub(super) fn sql_metadata_json_eligible_predicate(column: &str) -> String {
-        // Keep in sync with name_uri_analysis_rs::metadata_json_eligible_predicate
+        // Keep in sync with dedup metadata JSON eligibility.
         // and metadata_is_dedup_eligible: trim, non-empty, len<=64KiB, starts with { or [
         let trimmed = format!("trim(coalesce(CAST({column} AS VARCHAR), ''))");
         format!(
