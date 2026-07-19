@@ -11,12 +11,14 @@ cargo build --release --manifest-path dedup2/Cargo.toml
 ## 运行
 
 ```bash
-./dedup2/target/release/dedup2 all \
-  --input base.parquet \
-  --input ethereum.parquet \
+./dedup2 all \
+  --input ./data/base.parquet \
+  --input ./data/polygon.parquet \
+  --input ./data/ethereum.parquet \
+  --input ./data/solana.parquet \
   --output-dir ./out \
-  --chains base,ethereum \
-  --evm-chains base,ethereum
+  --chains base,ethereum,polygon,solana \
+  --evm-chains base,ethereum,polygon
 ```
 
 进度默认 `auto`（TTY 用人类可读格式，否则 JSON Lines），含 EWMA ETA。

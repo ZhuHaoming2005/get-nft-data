@@ -45,6 +45,13 @@ struct CanonicalName {
     text: String,
     characters: Vec<char>,
     atoms: Vec<NameAtom>,
+    query_side: bool,
+}
+
+impl CanonicalName {
+    fn is_passive_solana(&self) -> bool {
+        !self.query_side
+    }
 }
 
 /// Resident candidate index (name_uri `ResidentNameCandidateIndex`).
@@ -476,6 +483,7 @@ fn atomize(
         names.push(CanonicalName {
             text,
             characters,
+            query_side: atoms.iter().any(|atom| atom.allow_intra),
             atoms,
         });
     }
@@ -576,12 +584,14 @@ fn score_resident_index(
     threshold_pct: f64,
     progress: &dyn ProgressObserver,
 ) -> Result<NameHits, DedupError> {
-    let left_count = names.len().saturating_sub(1);
+    let query_names = query_name_ids(names);
+    let left_count = query_names.len();
     progress.begin_phase("score_name", Some(left_count as u64));
     if left_count == 0 {
         return Ok(AHashSet::new());
     }
 
+    let left_starts = build_left_name_range_starts(names, threshold_pct);
     let right_ends = build_right_name_range_ends(names, threshold_pct);
     let cancelled = AtomicU64::new(0);
     let score_cutoff = (threshold_pct / 100.0).clamp(0.0, 1.0);
@@ -670,54 +680,74 @@ fn score_resident_index(
                 if start >= left_count || cancelled.load(Ordering::Relaxed) != 0 {
                     break;
                 }
-                for left in start..(start + SCORE_SCHEDULING_CHUNK).min(left_count) {
+                for &left in query_names
+                    .iter()
+                    .take((start + SCORE_SCHEDULING_CHUNK).min(left_count))
+                    .skip(start)
+                {
+                    let left = left as usize;
                     worker.candidates.clear();
                     worker.seen.begin_name();
-                    let right_start = left + 1;
-                    let right_end = right_ends[left];
-                    if right_start < right_end {
-                        let right_min_len = names[right_start].characters.len();
-                        let minimum_overlap = CandidateBounds::minimum_multiset_overlap(
-                            names[left].characters.len(),
-                            right_min_len,
-                            threshold_pct,
-                        );
+                    let mut collect_range =
+                        |range_start: usize, range_end: usize, passive_only: bool| {
+                            if range_start >= range_end {
+                                return;
+                            }
+                            let minimum_overlap = CandidateBounds::minimum_multiset_overlap(
+                                names[left].characters.len(),
+                                names[range_start].characters.len(),
+                                threshold_pct,
+                            );
 
-                        if minimum_overlap == 0 {
-                            worker
-                                .candidates
-                                .extend((right_start..right_end).map(|right| right as u32));
-                        } else {
-                            let prefix = index.prefix(left);
-                            let prefix_len = prefix
-                                .len()
-                                .saturating_sub(minimum_overlap)
-                                .saturating_add(1)
-                                .min(prefix.len());
-                            let compact_start = right_start as u32;
-                            let compact_end = right_end as u32;
-                            for &token_id in &prefix[..prefix_len] {
-                                let posting = index.posting(token_id);
-                                let lo = posting.partition_point(|&a| a < compact_start);
-                                let hi = posting.partition_point(|&a| a < compact_end);
-                                for &candidate in &posting[lo..hi] {
-                                    if worker.seen.insert(candidate) {
-                                        worker.candidates.push(candidate);
+                            if minimum_overlap == 0 {
+                                worker.candidates.extend(
+                                    (range_start..range_end)
+                                        .filter(|&right| {
+                                            !passive_only || names[right].is_passive_solana()
+                                        })
+                                        .map(|right| right as u32),
+                                );
+                            } else {
+                                let prefix = index.prefix(left);
+                                let prefix_len = prefix
+                                    .len()
+                                    .saturating_sub(minimum_overlap)
+                                    .saturating_add(1)
+                                    .min(prefix.len());
+                                let compact_start = range_start as u32;
+                                let compact_end = range_end as u32;
+                                for &token_id in &prefix[..prefix_len] {
+                                    let posting = index.posting(token_id);
+                                    let lo = posting.partition_point(|&a| a < compact_start);
+                                    let hi = posting.partition_point(|&a| a < compact_end);
+                                    for &candidate in &posting[lo..hi] {
+                                        if (!passive_only
+                                            || names[candidate as usize].is_passive_solana())
+                                            && worker.seen.insert(candidate)
+                                        {
+                                            worker.candidates.push(candidate);
+                                        }
                                     }
                                 }
                             }
-                        }
+                        };
 
-                        worker.candidates.retain(|&right| {
-                            resident_candidate_passes_overlap(
-                                index,
-                                names,
-                                left,
-                                right as usize,
-                                threshold_pct,
-                            )
-                        });
+                    collect_range(left_starts[left], left, true);
+                    let right_start = left + 1;
+                    let right_end = right_ends.get(left).copied().unwrap_or(names.len());
+                    collect_range(right_start, right_end, false);
 
+                    worker.candidates.retain(|&right| {
+                        resident_candidate_passes_overlap(
+                            index,
+                            names,
+                            left,
+                            right as usize,
+                            threshold_pct,
+                        )
+                    });
+
+                    if !worker.candidates.is_empty() {
                         let prepared = BatchComparator::new(names[left].characters.iter().copied());
                         for &right in &worker.candidates {
                             let right = right as usize;
@@ -769,6 +799,21 @@ fn score_resident_index(
     Ok(worker.hits)
 }
 
+fn query_name_ids(names: &[CanonicalName]) -> Vec<u32> {
+    let mut passive_before = false;
+    let mut query_names = Vec::new();
+    for (name_id, name) in names.iter().enumerate() {
+        if name.query_side {
+            if name_id + 1 < names.len() || passive_before {
+                query_names.push(name_id as u32);
+            }
+        } else {
+            passive_before = true;
+        }
+    }
+    query_names
+}
+
 fn record_pair_hits(left: &CanonicalName, right: &CanonicalName, hits: &mut NameHits) {
     for left_atom in &left.atoms {
         for right_atom in &right.atoms {
@@ -809,6 +854,24 @@ fn build_right_name_range_ends(names: &[CanonicalName], threshold_pct: f64) -> V
         ends.push(right);
     }
     ends
+}
+
+fn build_left_name_range_starts(names: &[CanonicalName], threshold_pct: f64) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(names.len());
+    let mut left = 0usize;
+    for right in 0..names.len() {
+        while left < right
+            && !CandidateBounds::lengths_can_reach(
+                names[left].characters.len(),
+                names[right].characters.len(),
+                threshold_pct,
+            )
+        {
+            left += 1;
+        }
+        starts.push(left);
+    }
+    starts
 }
 
 fn resident_candidate_passes_overlap(
@@ -884,14 +947,18 @@ mod tests {
     #[derive(Default)]
     struct ScoreProgress {
         phase: Mutex<String>,
+        score_total: Mutex<Option<u64>>,
         score_deltas: Mutex<Vec<u64>>,
     }
 
     impl ProgressObserver for ScoreProgress {
         fn set_stage(&self, _stage: &str) {}
 
-        fn begin_phase(&self, phase: &str, _total: Option<u64>) {
+        fn begin_phase(&self, phase: &str, total: Option<u64>) {
             *self.phase.lock().unwrap() = phase.to_owned();
+            if phase == "score_name" {
+                *self.score_total.lock().unwrap() = total;
+            }
         }
 
         fn set_total(&self, _total: Option<u64>) {}
@@ -1116,6 +1183,54 @@ mod tests {
     }
 
     #[test]
+    fn solana_only_names_are_passive_fuzzy_index_entries() {
+        let mut store = EntityStore::default();
+        store.ingest_row(named_token(
+            "solana",
+            "collection-a",
+            "mint-1",
+            "collection",
+        ));
+        store.ingest_row(named_token(
+            "solana",
+            "collection-b",
+            "mint-2",
+            "collectiom",
+        ));
+
+        let names = atomize(&store, &NoopProgress).unwrap();
+        assert!(names.iter().all(CanonicalName::is_passive_solana));
+        assert!(query_name_ids(&names).is_empty());
+        let index = ResidentNameIndex::build(&names, &NoopProgress).unwrap();
+        let progress = ScoreProgress::default();
+        let hits = score_resident_index(&index, &names, 95.0, &progress).unwrap();
+        assert!(hits.is_empty());
+        assert_eq!(*progress.score_total.lock().unwrap(), Some(0));
+        assert!(progress.score_deltas.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn evm_query_finds_an_earlier_passive_solana_name() {
+        let mut store = EntityStore::default();
+        store.ingest_row(named_token(
+            "solana",
+            "collection-a",
+            "mint-1",
+            "collectiom",
+        ));
+        store.ingest_row(named("ethereum", "evm-a", "collection"));
+
+        let names = atomize(&store, &NoopProgress).unwrap();
+        assert_eq!(names.len(), 2);
+        assert!(names[0].is_passive_solana());
+        assert!(names[1].query_side);
+        assert_eq!(query_name_ids(&names), vec![1]);
+        let index = ResidentNameIndex::build(&names, &NoopProgress).unwrap();
+        let hits = score_resident_index(&index, &names, 95.0, &NoopProgress).unwrap();
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
     fn cross_chain_match_counts_each_contracts_logical_nfts() {
         let evm = ["ethereum".to_owned(), "base".to_owned()]
             .into_iter()
@@ -1171,24 +1286,28 @@ mod tests {
         }
         let mut store = EntityStore::default();
         for (index, value) in values.iter().enumerate() {
-            store.ingest_row(named("ethereum", &format!("contract-{index}"), value));
+            let chain = if index % 3 == 0 { "solana" } else { "ethereum" };
+            store.ingest_row(named(chain, &format!("contract-{index}"), value));
         }
         let names = atomize(&store, &NoopProgress).unwrap();
         let index = ResidentNameIndex::build(&names, &NoopProgress).unwrap();
-        let actual = score_resident_index(&index, &names, 95.0, &NoopProgress).unwrap();
-        let mut expected = AHashSet::new();
-        for left in 0..names.len() {
-            for right in (left + 1)..names.len() {
-                let score = rapidfuzz::distance::jaro_winkler::similarity(
-                    names[left].characters.iter().copied(),
-                    names[right].characters.iter().copied(),
-                );
-                if score >= 0.95 {
-                    record_pair_hits(&names[left], &names[right], &mut expected);
+        for threshold_pct in [0.0, 50.0, 80.0, 95.0, 100.0] {
+            let actual =
+                score_resident_index(&index, &names, threshold_pct, &NoopProgress).unwrap();
+            let mut expected = AHashSet::new();
+            for left in 0..names.len() {
+                for right in (left + 1)..names.len() {
+                    let score = rapidfuzz::distance::jaro_winkler::similarity(
+                        names[left].characters.iter().copied(),
+                        names[right].characters.iter().copied(),
+                    );
+                    if score * 100.0 >= threshold_pct {
+                        record_pair_hits(&names[left], &names[right], &mut expected);
+                    }
                 }
             }
+            assert_eq!(actual, expected, "threshold={threshold_pct}");
         }
-        assert_eq!(actual, expected);
     }
 
     #[test]

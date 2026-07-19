@@ -99,6 +99,7 @@ pub struct MetadataStats {
 #[derive(Debug, Hash, PartialEq, Eq)]
 struct ProfileKey {
     is_evm: bool,
+    is_solana: bool,
     anchors: AnchorKey,
 }
 
@@ -136,6 +137,7 @@ impl AnchorKey {
 #[derive(Debug)]
 struct ContractProfile {
     is_evm: bool,
+    is_solana: bool,
     anchor_start: u32,
     anchor_len: u32,
     max_document: DocumentId,
@@ -150,6 +152,7 @@ struct ContractProfile {
 #[derive(Debug)]
 struct UnpackedProfile {
     is_evm: bool,
+    is_solana: bool,
     anchors: Box<[(TokenKeyId, DocumentId)]>,
     members: ProfileMembers,
     chain_counts: ProfileChainCounts,
@@ -158,6 +161,15 @@ struct UnpackedProfile {
 impl ContractProfile {
     fn max_document(&self) -> DocumentId {
         self.max_document
+    }
+}
+
+fn should_compare_profiles(left: &ContractProfile, right: &ContractProfile) -> bool {
+    match (left.is_solana, right.is_solana) {
+        (true, true) => false,
+        (true, false) => right.is_evm,
+        (false, true) => left.is_evm,
+        (false, false) => true,
     }
 }
 
@@ -242,6 +254,7 @@ struct DirectIndex {
     anchors: Vec<(TokenKeyId, DocumentId)>,
     members: Vec<MetadataMember>,
     chain_counts: Vec<(ChainId, u32)>,
+    query_profile_count: usize,
     eligible_contracts: u64,
     eligible_members: u64,
     anchor_count: u64,
@@ -270,6 +283,34 @@ impl DirectIndex {
 
     fn document_pair_may_repeat(&self, left: DocumentId, right: DocumentId) -> bool {
         self.document_references[left as usize] > 1 || self.document_references[right as usize] > 1
+    }
+
+    fn exhaustive_profile_pairs(&self) -> u64 {
+        let query_profiles = self.query_profile_count as u64;
+        let solana_profiles = self.profiles.len().saturating_sub(self.query_profile_count) as u64;
+        let evm_profiles = self.profiles[..self.query_profile_count]
+            .iter()
+            .filter(|profile| profile.is_evm)
+            .count() as u64;
+        choose_two(query_profiles).saturating_add(evm_profiles.saturating_mul(solana_profiles))
+    }
+
+    fn logical_member_pairs(&self) -> u64 {
+        let mut query_members = 0_u64;
+        let mut evm_members = 0_u64;
+        let mut solana_members = 0_u64;
+        for profile in &self.profiles {
+            let members = u64::from(profile.member_len);
+            if profile.is_solana {
+                solana_members = solana_members.saturating_add(members);
+            } else {
+                query_members = query_members.saturating_add(members);
+                if profile.is_evm {
+                    evm_members = evm_members.saturating_add(members);
+                }
+            }
+        }
+        choose_two(query_members).saturating_add(evm_members.saturating_mul(solana_members))
     }
 }
 
@@ -922,13 +963,13 @@ pub fn run_direct(
         return Ok(base_stats(store, &index, 0, 0, 0));
     }
 
-    let logical_contract_pairs = choose_two(eligible_members);
+    let logical_contract_pairs = index.logical_member_pairs();
     let equivalent_profile_tasks = index
         .profiles
         .iter()
-        .filter(|profile| profile.member_len > 1)
+        .filter(|profile| !profile.is_solana && profile.member_len > 1)
         .count() as u64;
-    let exhaustive_cross_profile_tasks = choose_two(index.profiles.len() as u64);
+    let exhaustive_cross_profile_tasks = index.exhaustive_profile_pairs();
     let (cross_profile_plan, candidate_stats) =
         build_candidate_plan(&index, threshold, exhaustive_cross_profile_tasks, progress)?;
     let cross_profile_tasks = cross_profile_plan.pair_count(exhaustive_cross_profile_tasks);
@@ -1149,6 +1190,7 @@ fn build_index(
                         let raw = RawProfile {
                             key: ProfileKey {
                                 is_evm: false,
+                                is_solana: true,
                                 anchors: AnchorKey::from_vec(vec![(0, document_id)]),
                             },
                             member: MetadataMember {
@@ -1193,6 +1235,7 @@ fn build_index(
                 let raw = RawProfile {
                     key: ProfileKey {
                         is_evm,
+                        is_solana: false,
                         anchors: AnchorKey::from_vec(anchors),
                     },
                     member: MetadataMember {
@@ -1367,7 +1410,8 @@ fn build_index(
             )
         },
     );
-    profiles.par_sort_unstable_by_key(ContractProfile::max_document);
+    profiles.par_sort_unstable_by_key(|profile| (profile.is_solana, profile.max_document()));
+    let query_profile_count = profiles.partition_point(|profile| !profile.is_solana);
     Ok(DirectIndex {
         documents,
         terms,
@@ -1377,6 +1421,7 @@ fn build_index(
         anchors,
         members,
         chain_counts,
+        query_profile_count,
         eligible_contracts: eligible_contracts.load(Ordering::Relaxed),
         eligible_members: eligible_members.load(Ordering::Relaxed),
         anchor_count: anchor_count.load(Ordering::Relaxed),
@@ -1880,8 +1925,10 @@ fn build_exact_prepass(
 
     let global_ranges = posting_ranges(&global);
     let token_ranges = triple_posting_ranges(&token);
-    let global_emissions = estimate_pair_emissions(&global_ranges);
-    let token_emissions = estimate_pair_emissions(&token_ranges);
+    let global_emissions =
+        estimate_allowed_pair_emissions(index, &global, &global_ranges, |entry| entry.1);
+    let token_emissions =
+        estimate_allowed_pair_emissions(index, &token, &token_ranges, |entry| entry.2);
     let global_target = global_emissions.min((MAX_FULL_PREPASS_PAIRS / 2) as u64) as usize;
     let token_target =
         token_emissions.min((MAX_FULL_PREPASS_PAIRS - global_target) as u64) as usize;
@@ -1889,6 +1936,7 @@ fn build_exact_prepass(
     progress.begin_phase("candidate_prepass_collect", Some(raw_pairs as u64));
     let mut pairs = Vec::with_capacity(raw_pairs);
     append_bounded_symmetric_pairs_by(
+        index,
         &global,
         &global_ranges,
         |entry| entry.1,
@@ -1897,6 +1945,7 @@ fn build_exact_prepass(
         progress,
     )?;
     append_bounded_symmetric_pairs_by(
+        index,
         &token,
         &token_ranges,
         |entry| entry.2,
@@ -1935,6 +1984,9 @@ fn finalize_exact_prepass(
                     let (left_id, right_id) = decode_profile_pair(*key);
                     let left = &index.profiles[left_id];
                     let right = &index.profiles[right_id];
+                    if !should_compare_profiles(left, right) {
+                        return false;
+                    }
                     let (left_document, right_document) =
                         selected_documents(left, index.anchors(left), right, index.anchors(right));
                     left_document == right_document
@@ -1954,6 +2006,7 @@ fn finalize_exact_prepass(
 }
 
 fn append_bounded_symmetric_pairs_by<T>(
+    index: &DirectIndex,
     entries: &[T],
     ranges: &[(usize, usize)],
     profile: impl Fn(&T) -> u32,
@@ -1964,14 +2017,22 @@ fn append_bounded_symmetric_pairs_by<T>(
     let mut completed = 0_u64;
     'ranges: for &(start, end) in ranges {
         for left in start..end - 1 {
-            for right in left + 1..end {
+            let left_profile = profile(&entries[left]);
+            if index.profiles[left_profile as usize].is_solana {
+                break;
+            }
+            for right_entry in entries.iter().take(end).skip(left + 1) {
                 if pairs.len() == limit {
                     break 'ranges;
                 }
-                pairs.push(profile_pair_key(
-                    profile(&entries[left]),
-                    profile(&entries[right]),
-                ));
+                let right_profile = profile(right_entry);
+                if !should_compare_profiles(
+                    &index.profiles[left_profile as usize],
+                    &index.profiles[right_profile as usize],
+                ) {
+                    continue;
+                }
+                pairs.push(profile_pair_key(left_profile, right_profile));
                 completed += 1;
                 if completed == PREPARE_BATCH as u64 {
                     progress.add_completed(completed);
@@ -2360,7 +2421,8 @@ fn generate_candidate_pairs(
     progress: &dyn ProgressObserver,
 ) -> Result<CandidateGeneration, DedupError> {
     let profile_count = index.profiles.len();
-    if profile_count < 2 {
+    let query_profile_count = index.query_profile_count;
+    if query_profile_count == 0 || profile_count < 2 {
         return Ok(CandidateGeneration {
             chunks: Vec::new(),
             pair_count: 0,
@@ -2370,7 +2432,7 @@ fn generate_candidate_pairs(
             abandoned: false,
         });
     }
-    let lane_count = rayon::current_num_threads().min(profile_count).max(1);
+    let lane_count = rayon::current_num_threads().min(query_profile_count).max(1);
     let dense_bytes = profile_count
         .checked_mul(lane_count)
         .and_then(|values| values.checked_mul(std::mem::size_of::<u32>()))
@@ -2378,7 +2440,7 @@ fn generate_candidate_pairs(
     let dense_seen = dense_bytes <= DENSE_CANDIDATE_SEEN_BUDGET_BYTES;
     let budget = CandidateBudget::new(candidate_limit);
     let next_left = AtomicUsize::new(0);
-    progress.begin_phase("candidate_generate", Some(profile_count as u64));
+    progress.begin_phase("candidate_generate", Some(query_profile_count as u64));
     let lanes = (0..lane_count)
         .into_par_iter()
         .map(|_| {
@@ -2395,12 +2457,12 @@ fn generate_candidate_pairs(
                 }
                 progress.check_cancelled()?;
                 let start = next_left.fetch_add(CANDIDATE_SCHEDULING_CHUNK, Ordering::Relaxed);
-                if start >= profile_count {
+                if start >= query_profile_count {
                     break;
                 }
                 let end = start
                     .saturating_add(CANDIDATE_SCHEDULING_CHUNK)
-                    .min(profile_count);
+                    .min(query_profile_count);
                 for left_id in start..end {
                     if budget.exceeded.load(Ordering::Relaxed) {
                         break 'profiles;
@@ -2414,6 +2476,9 @@ fn generate_candidate_pairs(
                             .global_exact_after(max_document, left_id),
                         left_id,
                         |entry| entry.1,
+                        |right| {
+                            should_compare_profiles(left_profile, &index.profiles[right as usize])
+                        },
                         |right| prepare_candidate_pair(index, include_bm25, left_id, right),
                         &mut seen,
                         &mut pairs,
@@ -2436,6 +2501,12 @@ fn generate_candidate_pairs(
                                 sources.global_full.posting_after(term, left_id),
                                 left_id,
                                 |profile| *profile,
+                                |right| {
+                                    should_compare_profiles(
+                                        left_profile,
+                                        &index.profiles[right as usize],
+                                    )
+                                },
                                 |right| prepare_candidate_pair(index, include_bm25, left_id, right),
                                 &mut seen,
                                 &mut pairs,
@@ -2456,6 +2527,12 @@ fn generate_candidate_pairs(
                                     .token_exact_after((token, document), left_id),
                                 left_id,
                                 |entry| entry.2,
+                                |right| {
+                                    should_compare_profiles(
+                                        left_profile,
+                                        &index.profiles[right as usize],
+                                    )
+                                },
                                 |right| prepare_candidate_pair(index, include_bm25, left_id, right),
                                 &mut seen,
                                 &mut pairs,
@@ -2479,6 +2556,12 @@ fn generate_candidate_pairs(
                                             .token_full_after((token, term), left_id),
                                         left_id,
                                         |entry| entry.2,
+                                        |right| {
+                                            should_compare_profiles(
+                                                left_profile,
+                                                &index.profiles[right as usize],
+                                            )
+                                        },
                                         |right| {
                                             prepare_candidate_pair(
                                                 index,
@@ -2553,6 +2636,7 @@ fn append_owned_candidates<T>(
     posting: &[T],
     left: u32,
     profile: impl Fn(&T) -> u32,
+    should_compare: impl Fn(u32) -> bool,
     prepare: impl Fn(u32) -> Option<CandidatePair>,
     seen: &mut CandidateSeen,
     pairs: &mut CandidatePairChunks,
@@ -2565,6 +2649,9 @@ fn append_owned_candidates<T>(
     for entry in posting {
         let right = profile(entry);
         debug_assert!(right > left);
+        if !should_compare(right) {
+            continue;
+        }
         *pair_emissions = pair_emissions.saturating_add(1);
         *unchecked_emissions += 1;
         if *unchecked_emissions >= CANDIDATE_CANCEL_BATCH {
@@ -2858,9 +2945,25 @@ fn triple_posting_ranges(entries: &[(u32, u32, u32)]) -> Vec<(usize, usize)> {
     ranges
 }
 
-fn estimate_pair_emissions(ranges: &[(usize, usize)]) -> u64 {
-    ranges.iter().fold(0_u64, |total, (start, end)| {
-        total.saturating_add(choose_two((end - start) as u64))
+fn estimate_allowed_pair_emissions<T>(
+    index: &DirectIndex,
+    entries: &[T],
+    ranges: &[(usize, usize)],
+    profile: impl Fn(&T) -> u32,
+) -> u64 {
+    ranges.iter().fold(0_u64, |total, &(start, end)| {
+        let query_end = (start..end)
+            .find(|&position| index.profiles[profile(&entries[position]) as usize].is_solana)
+            .unwrap_or(end);
+        let query_count = (query_end - start) as u64;
+        let solana_count = (end - query_end) as u64;
+        let evm_count = entries[start..query_end]
+            .iter()
+            .filter(|entry| index.profiles[profile(entry) as usize].is_evm)
+            .count() as u64;
+        total
+            .saturating_add(choose_two(query_count))
+            .saturating_add(evm_count.saturating_mul(solana_count))
     })
 }
 
@@ -2902,6 +3005,7 @@ fn build_profile_bucket(
             let key = key.expect("every profile builder has one key");
             UnpackedProfile {
                 is_evm: key.is_evm,
+                is_solana: key.is_solana,
                 anchors: key.anchors.into_boxed_slice(),
                 members,
                 chain_counts,
@@ -2970,6 +3074,7 @@ fn compact_profiles(unpacked: Vec<UnpackedProfile>) -> Result<CompactProfiles, D
         chain_counts.extend(profile.chain_counts.iter());
         profiles.push(ContractProfile {
             is_evm: profile.is_evm,
+            is_solana: profile.is_solana,
             anchor_start,
             anchor_len,
             max_document,
@@ -3040,7 +3145,7 @@ fn score_equivalent_profiles(
             let mut completed = 0_u64;
             let mut equivalent = 0_u64;
             for (offset, profile) in profiles.iter().enumerate() {
-                if profile.member_len < 2 {
+                if profile.is_solana || profile.member_len < 2 {
                     continue;
                 }
                 let profile_id = chunk_id * PREPARE_BATCH + offset;
@@ -3224,6 +3329,9 @@ struct ScoreBlockInfo {
     chain_mask: u64,
     member_sum: u64,
     equivalent_member_pairs: u64,
+    all_evm: bool,
+    all_solana: bool,
+    has_solana: bool,
 }
 
 impl ScoreBlockInfo {
@@ -3251,9 +3359,22 @@ fn build_score_blocks(index: &DirectIndex) -> Vec<ScoreBlockInfo> {
                 equivalent_member_pairs: profiles.iter().fold(0_u64, |total, profile| {
                     total.saturating_add(choose_two(u64::from(profile.member_len)))
                 }),
+                all_evm: profiles.iter().all(|profile| profile.is_evm),
+                all_solana: profiles.iter().all(|profile| profile.is_solana),
+                has_solana: profiles.iter().any(|profile| profile.is_solana),
             }
         })
         .collect()
+}
+
+fn score_block_pair_all_allowed(left: &ScoreBlockInfo, right: &ScoreBlockInfo) -> bool {
+    if left.all_solana {
+        right.all_evm
+    } else if right.all_solana {
+        left.all_evm
+    } else {
+        !left.has_solana && !right.has_solana
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3271,6 +3392,33 @@ fn build_score_tiles(block_count: usize) -> Vec<ScoreTileInfo> {
             block_end: (block_start + blocks_per_tile).min(block_count),
         })
         .collect()
+}
+
+fn upper_rect_tile_count(left_axis: u64, right_axis: u64) -> u64 {
+    left_axis
+        .saturating_mul(right_axis)
+        .saturating_sub(choose_two(left_axis))
+}
+
+fn upper_rect_tile_coordinate(index: u64, left_axis: u64, right_axis: u64) -> (u64, u64) {
+    debug_assert!(left_axis <= right_axis);
+    debug_assert!(index < upper_rect_tile_count(left_axis, right_axis));
+    let row_start = |row: u64| {
+        row.saturating_mul(right_axis)
+            .saturating_sub(choose_two(row))
+    };
+    let mut low = 0_u64;
+    let mut high = left_axis;
+    while low + 1 < high {
+        let middle = low + (high - low) / 2;
+        if row_start(middle) <= index {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    let right = low + index.saturating_sub(row_start(low));
+    (low, right)
 }
 
 fn score_cross_profiles(
@@ -3304,8 +3452,9 @@ fn score_cross_profiles(
     let cancelled = AtomicBool::new(false);
     let blocks = build_score_blocks(index);
     let tiles = build_score_tiles(blocks.len());
-    let tile_axis = tiles.len() as u64;
-    let tile_count = tile_axis.saturating_mul(tile_axis.saturating_add(1)) / 2;
+    let left_tile_count = index.query_profile_count.div_ceil(SCORE_TILE) as u64;
+    let right_tile_count = tiles.len() as u64;
+    let tile_count = upper_rect_tile_count(left_tile_count, right_tile_count);
     let next_tile = AtomicU64::new(0);
     let workers = rayon::current_num_threads().max(1);
     (0..workers).into_par_iter().for_each(|_| {
@@ -3323,8 +3472,7 @@ fn score_cross_profiles(
                 break;
             }
             let tile_end = tile_start.saturating_add(tile_batch).min(tile_count);
-            let mut coordinates = TileCoordinateCursor::new(tile_start, tile_axis);
-            for _ in tile_start..tile_end {
+            for tile_index in tile_start..tile_end {
                 if cancelled.load(Ordering::Relaxed) {
                     break 'work;
                 }
@@ -3332,7 +3480,8 @@ fn score_cross_profiles(
                     cancelled.store(true, Ordering::Relaxed);
                     break 'work;
                 }
-                let (left_tile_index, right_tile_index) = coordinates.next();
+                let (left_tile_index, right_tile_index) =
+                    upper_rect_tile_coordinate(tile_index, left_tile_count, right_tile_count);
                 let left_tile = &tiles[left_tile_index as usize];
                 let right_tile = &tiles[right_tile_index as usize];
                 let mut completed = 0_u64;
@@ -3345,7 +3494,11 @@ fn score_cross_profiles(
                     for right_block_index in first_right_block..right_tile.block_end {
                         let left_block = &blocks[left_block_index];
                         let right_block = &blocks[right_block_index];
-                        if hits.is_single_word()
+                        if left_block.all_solana && right_block.all_solana {
+                            continue;
+                        }
+                        if score_block_pair_all_allowed(left_block, right_block)
+                            && hits.is_single_word()
                             && hits.block_contains_mask(left_block_index, right_block.chain_mask)
                             && hits.block_contains_mask(right_block_index, left_block.chain_mask)
                         {
@@ -3381,6 +3534,12 @@ fn score_cross_profiles(
                                 right_block.start
                             };
                             for right_id in first_right..right_block.end {
+                                if !should_compare_profiles(
+                                    &index.profiles[left_id],
+                                    &index.profiles[right_id],
+                                ) {
+                                    continue;
+                                }
                                 completed = completed
                                     .saturating_add(scorer.score_pair(left_id, right_id, None));
                             }
@@ -3470,6 +3629,7 @@ fn score_document_pair(
     decision.matched
 }
 
+#[cfg(test)]
 fn tile_coordinates(ordinal: u64, axis: u64) -> (u64, u64) {
     let mut low = 0_u64;
     let mut high = axis;
@@ -3486,12 +3646,14 @@ fn tile_coordinates(ordinal: u64, axis: u64) -> (u64, u64) {
     (left, left + low)
 }
 
+#[cfg(test)]
 struct TileCoordinateCursor {
     axis: u64,
     gap: u64,
     left: u64,
 }
 
+#[cfg(test)]
 impl TileCoordinateCursor {
     fn new(ordinal: u64, axis: u64) -> Self {
         let (left, right) = tile_coordinates(ordinal, axis);
@@ -3513,6 +3675,7 @@ impl TileCoordinateCursor {
     }
 }
 
+#[cfg(test)]
 fn tile_row_start(row: u64, axis: u64) -> u64 {
     row.saturating_mul(axis)
         .saturating_sub(row.saturating_mul(row.saturating_sub(1)) / 2)
@@ -3733,15 +3896,26 @@ fn base_stats(
 
 fn scoring_work(index: &DirectIndex, plan: &CrossProfilePlan) -> u64 {
     let equivalent = index.profiles.iter().fold(0_u64, |total, profile| {
-        total.saturating_add(choose_two(u64::from(profile.member_len)))
+        if profile.is_solana {
+            total
+        } else {
+            total.saturating_add(choose_two(u64::from(profile.member_len)))
+        }
     });
     let cross = match plan {
-        CrossProfilePlan::Full { .. } => {
-            let eligible = index.profiles.iter().fold(0_u64, |total, profile| {
-                total.saturating_add(u64::from(profile.member_len))
-            });
-            choose_two(eligible).saturating_sub(equivalent)
-        }
+        CrossProfilePlan::Full { .. } => index.profiles[..index.query_profile_count]
+            .iter()
+            .enumerate()
+            .fold(0_u64, |total, (left_id, left)| {
+                index.profiles[left_id + 1..]
+                    .iter()
+                    .filter(|right| should_compare_profiles(left, right))
+                    .fold(total, |total, right| {
+                        total.saturating_add(
+                            u64::from(left.member_len).saturating_mul(u64::from(right.member_len)),
+                        )
+                    })
+            }),
         CrossProfilePlan::Indexed(pairs) => pairs.iter().fold(0_u64, |total, candidate| {
             let (left, right) = candidate.profiles();
             total.saturating_add(
@@ -3936,6 +4110,7 @@ mod tests {
         let max_document = anchors.last().unwrap().1;
         ContractProfile {
             is_evm,
+            is_solana: false,
             anchor_start: 0,
             anchor_len: anchors.len() as u32,
             max_document,
@@ -3968,6 +4143,7 @@ mod tests {
             &entries,
             0,
             |entry| entry.1,
+            |_| true,
             |right| Some(CandidatePair::new(0, right, 0, right)),
             &mut seen,
             &mut pairs,
@@ -3999,6 +4175,7 @@ mod tests {
                 &entries[..2],
                 0,
                 |entry| entry.1,
+                |_| true,
                 |right| Some(CandidatePair::new(0, right, 0, right)),
                 &mut seen,
                 &mut CandidatePairChunks::new(),
@@ -4282,6 +4459,34 @@ mod tests {
     }
 
     #[test]
+    fn upper_rect_tiles_exclude_passive_solana_rows() {
+        let left_axis = 2;
+        let right_axis = 5;
+        let coordinates = (0..upper_rect_tile_count(left_axis, right_axis))
+            .map(|index| upper_rect_tile_coordinate(index, left_axis, right_axis))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            coordinates,
+            vec![
+                (0, 0),
+                (0, 1),
+                (0, 2),
+                (0, 3),
+                (0, 4),
+                (1, 1),
+                (1, 2),
+                (1, 3),
+                (1, 4),
+            ]
+        );
+        assert!(
+            coordinates
+                .iter()
+                .all(|&(left, right)| left < left_axis && right < right_axis && left <= right)
+        );
+    }
+
+    #[test]
     fn tile_coordinate_cursor_matches_random_access_mapping() {
         for axis in 1..32_u64 {
             let tile_count = axis * (axis + 1) / 2;
@@ -4462,6 +4667,9 @@ mod tests {
         let stats = run_direct(&store, &evm, 8, 0.6, &mut acc, &NoopProgress).unwrap();
 
         assert_eq!(stats.eligible_contracts, 4);
+        assert_eq!(stats.logical_contract_pairs, 7);
+        assert_eq!(stats.equivalent_profile_tasks, 1);
+        assert_eq!(stats.profile_pair_tasks, 2);
         assert_eq!(
             acc.counts()
                 .iter()
@@ -4494,6 +4702,70 @@ mod tests {
         assert_eq!(
             count(ScopeKind::ChainMatrix, ethereum, Some(solana)),
             Some((2, 2))
+        );
+    }
+
+    #[test]
+    fn solana_profiles_are_passive_and_never_score_each_other() {
+        let evm = ["ethereum".to_owned()].into_iter().collect::<HashSet<_>>();
+        let mut store = EntityStore::with_options(8, &evm.iter().cloned().collect());
+        for (chain, address, token, metadata) in [
+            (
+                "solana",
+                "sol-a",
+                "mint-1",
+                r#"{"collection":"shared","name":"alpha left"}"#,
+            ),
+            (
+                "solana",
+                "sol-b",
+                "mint-2",
+                r#"{"collection":"shared","name":"alpha right"}"#,
+            ),
+            (
+                "ethereum",
+                "0xe",
+                "1",
+                r#"{"unrelated":"no common metadata vocabulary"}"#,
+            ),
+        ] {
+            store
+                .try_ingest_row(input(chain, address, token, metadata))
+                .unwrap();
+        }
+
+        let index = build_index(&store, &evm, 8, &NoopProgress).unwrap();
+        assert_eq!(index.query_profile_count, 1);
+        assert!(
+            index.profiles[..index.query_profile_count]
+                .iter()
+                .all(|profile| !profile.is_solana)
+        );
+        assert!(
+            index.profiles[index.query_profile_count..]
+                .iter()
+                .all(|profile| profile.is_solana)
+        );
+        assert_eq!(index.exhaustive_profile_pairs(), 2);
+
+        let mut acc = SummaryAccumulator::default();
+        let indexed = run_direct(&store, &evm, 8, 0.6, &mut acc, &NoopProgress).unwrap();
+        assert!(indexed.candidate_index_used);
+        assert_eq!(indexed.candidate_profile_pairs, 0);
+        assert_eq!(indexed.profile_pair_tasks, 0);
+        assert_eq!(indexed.bm25_scores, 0);
+        assert!(acc.counts().is_empty());
+
+        let mut full_acc = SummaryAccumulator::default();
+        let full = run_direct(&store, &evm, 8, 0.0, &mut full_acc, &NoopProgress).unwrap();
+        assert!(!full.candidate_index_used);
+        assert_eq!(full.profile_pair_tasks, 2);
+        assert_eq!(
+            full.saturated_profile_pairs
+                + full.exact_document_pairs
+                + full.bm25_cache_hits
+                + full.bm25_scores,
+            2
         );
     }
 
