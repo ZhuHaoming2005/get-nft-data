@@ -9,6 +9,30 @@ use tempfile::Builder;
 
 type ReportError = Box<dyn std::error::Error + Send + Sync>;
 const REPORT_FILES: [&str; 3] = ["summary.csv", "chain_matrix.csv", "run_manifest.json"];
+const NAME_REPORT_FILES: [&str; 2] = ["name_summary.csv", "name_chain_matrix.csv"];
+const URI_REPORT_FILES: [&str; 2] = ["uri_summary.csv", "uri_chain_matrix.csv"];
+
+#[derive(Clone, Copy)]
+pub enum ReportPartition {
+    Name,
+    Uri,
+}
+
+impl ReportPartition {
+    fn files(self) -> &'static [&'static str; 2] {
+        match self {
+            Self::Name => &NAME_REPORT_FILES,
+            Self::Uri => &URI_REPORT_FILES,
+        }
+    }
+
+    fn dimensions(self) -> &'static [Dimension] {
+        match self {
+            Self::Name => &[Dimension::Name],
+            Self::Uri => &[Dimension::TokenUri, Dimension::ImageUri],
+        }
+    }
+}
 
 #[derive(Serialize)]
 struct RunManifest {
@@ -106,10 +130,24 @@ pub fn write_reports(output_dir: &Path, request: ReportRequest<'_>) -> Result<()
         metadata_direct: request.metadata_direct,
     };
     thread::scope(|scope| -> Result<(), ReportError> {
-        let summary =
-            scope.spawn(|| write_summary(staging.path(), request.store, request.accumulator));
-        let matrix =
-            scope.spawn(|| write_matrix(staging.path(), request.store, request.accumulator));
+        let summary = scope.spawn(|| {
+            write_summary(
+                staging.path(),
+                REPORT_FILES[0],
+                request.store,
+                request.accumulator,
+                None,
+            )
+        });
+        let matrix = scope.spawn(|| {
+            write_matrix(
+                staging.path(),
+                REPORT_FILES[1],
+                request.store,
+                request.accumulator,
+                None,
+            )
+        });
         let manifest = scope.spawn(|| write_manifest(staging.path(), &manifest));
         summary
             .join()
@@ -122,11 +160,57 @@ pub fn write_reports(output_dir: &Path, request: ReportRequest<'_>) -> Result<()
             .map_err(|_| std::io::Error::other("manifest writer panicked"))??;
         Ok(())
     })?;
-    commit_reports(output_dir, staging.path())
+    commit_reports(output_dir, staging.path(), &REPORT_FILES)
 }
 
-fn commit_reports(output_dir: &Path, staging_dir: &Path) -> Result<(), ReportError> {
-    for name in REPORT_FILES {
+pub fn write_partition_reports(
+    output_dir: &Path,
+    store: &EntityStore,
+    accumulator: &SummaryAccumulator,
+    partition: ReportPartition,
+) -> Result<(), ReportError> {
+    fs::create_dir_all(output_dir)?;
+    let staging = Builder::new()
+        .prefix(".dedup2-partition-staging-")
+        .tempdir_in(output_dir)?;
+    let files = partition.files();
+    let dimensions = partition.dimensions();
+    thread::scope(|scope| -> Result<(), ReportError> {
+        let summary = scope.spawn(|| {
+            write_summary(
+                staging.path(),
+                files[0],
+                store,
+                accumulator,
+                Some(dimensions),
+            )
+        });
+        let matrix = scope.spawn(|| {
+            write_matrix(
+                staging.path(),
+                files[1],
+                store,
+                accumulator,
+                Some(dimensions),
+            )
+        });
+        summary
+            .join()
+            .map_err(|_| std::io::Error::other("partition summary writer panicked"))??;
+        matrix
+            .join()
+            .map_err(|_| std::io::Error::other("partition matrix writer panicked"))??;
+        Ok(())
+    })?;
+    commit_reports(output_dir, staging.path(), files)
+}
+
+fn commit_reports(
+    output_dir: &Path,
+    staging_dir: &Path,
+    report_files: &[&str],
+) -> Result<(), ReportError> {
+    for &name in report_files {
         if !staging_dir.join(name).is_file() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -140,7 +224,7 @@ fn commit_reports(output_dir: &Path, staging_dir: &Path) -> Result<(), ReportErr
         .prefix(".dedup2-report-backup-")
         .tempdir_in(output_dir)?;
     let mut backed_up = Vec::new();
-    for name in REPORT_FILES {
+    for &name in report_files {
         let final_path = output_dir.join(name);
         if final_path.exists() {
             if let Err(error) = fs::rename(&final_path, backup.path().join(name)) {
@@ -152,7 +236,7 @@ fn commit_reports(output_dir: &Path, staging_dir: &Path) -> Result<(), ReportErr
     }
 
     let mut installed = Vec::new();
-    for name in REPORT_FILES {
+    for &name in report_files {
         if let Err(error) = fs::rename(staging_dir.join(name), output_dir.join(name)) {
             let rollback = restore_reports(output_dir, backup.path(), &installed, &backed_up);
             return commit_error("installing staged reports", error, rollback, backup);
@@ -212,10 +296,12 @@ fn write_manifest(output_dir: &Path, manifest: &RunManifest) -> Result<(), Repor
 
 fn write_summary(
     output_dir: &Path,
+    file_name: &str,
     store: &EntityStore,
     acc: &SummaryAccumulator,
+    dimensions: Option<&[Dimension]>,
 ) -> Result<(), ReportError> {
-    let mut writer = csv::Writer::from_path(output_dir.join("summary.csv"))?;
+    let mut writer = csv::Writer::from_path(output_dir.join(file_name))?;
     writer.write_record([
         "primary_chain",
         "scope",
@@ -230,7 +316,10 @@ fn write_summary(
     let mut rows: Vec<_> = acc
         .counts()
         .iter()
-        .filter(|(key, _)| key.kind != ScopeKind::ChainMatrix)
+        .filter(|(key, _)| {
+            key.kind != ScopeKind::ChainMatrix
+                && dimensions.is_none_or(|allowed| allowed.contains(&key.dimension))
+        })
         .collect();
     rows.sort_by(|(a, _), (b, _)| {
         store
@@ -266,10 +355,12 @@ fn write_summary(
 
 fn write_matrix(
     output_dir: &Path,
+    file_name: &str,
     store: &EntityStore,
     acc: &SummaryAccumulator,
+    dimensions: Option<&[Dimension]>,
 ) -> Result<(), ReportError> {
-    let mut writer = csv::Writer::from_path(output_dir.join("chain_matrix.csv"))?;
+    let mut writer = csv::Writer::from_path(output_dir.join(file_name))?;
     writer.write_record([
         "primary_chain",
         "secondary_chain",
@@ -284,7 +375,10 @@ fn write_matrix(
     let mut rows: Vec<_> = acc
         .counts()
         .iter()
-        .filter(|(key, _)| key.kind == ScopeKind::ChainMatrix)
+        .filter(|(key, _)| {
+            key.kind == ScopeKind::ChainMatrix
+                && dimensions.is_none_or(|allowed| allowed.contains(&key.dimension))
+        })
         .collect();
     rows.sort_by(|(a, _), (b, _)| {
         let a_sec = a
@@ -377,7 +471,7 @@ mod tests {
         fs::write(staging.path().join(REPORT_FILES[0]), "new-summary").unwrap();
         fs::write(staging.path().join(REPORT_FILES[1]), "new-matrix").unwrap();
 
-        assert!(commit_reports(output.path(), staging.path()).is_err());
+        assert!(commit_reports(output.path(), staging.path(), &REPORT_FILES).is_err());
         for name in REPORT_FILES {
             assert_eq!(
                 fs::read_to_string(output.path().join(name)).unwrap(),
@@ -395,7 +489,7 @@ mod tests {
             fs::write(staging.path().join(name), format!("new-{name}")).unwrap();
         }
 
-        commit_reports(output.path(), staging.path()).unwrap();
+        commit_reports(output.path(), staging.path(), &REPORT_FILES).unwrap();
         for name in REPORT_FILES {
             assert_eq!(
                 fs::read_to_string(output.path().join(name)).unwrap(),

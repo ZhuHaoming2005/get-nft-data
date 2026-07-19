@@ -140,6 +140,30 @@ fn all_writes_summary_files() {
         }
         assert!(row_count > 0);
     }
+    for (name, allowed_dimensions) in [
+        ("name_summary.csv", &["name"][..]),
+        ("name_chain_matrix.csv", &["name"][..]),
+        ("uri_summary.csv", &["token_uri", "image_uri"][..]),
+        ("uri_chain_matrix.csv", &["token_uri", "image_uri"][..]),
+    ] {
+        let path = out.join(name);
+        assert!(path.is_file(), "missing partition report {name}");
+        let mut reader = csv::Reader::from_path(path).unwrap();
+        let dimension = reader
+            .headers()
+            .unwrap()
+            .iter()
+            .position(|header| header == "dimension")
+            .unwrap();
+        for row in reader.records() {
+            let row = row.unwrap();
+            assert!(
+                allowed_dimensions.contains(&&row[dimension]),
+                "unexpected dimension in {name}: {}",
+                &row[dimension]
+            );
+        }
+    }
     let manifest_path = out.join("run_manifest.json");
     assert!(manifest_path.is_file());
     let manifest: serde_json::Value =

@@ -1,5 +1,8 @@
 use crate::progress::ProgressReporter;
-use crate::report::{PhaseTiming, ReportRequest, StageTiming, write_reports};
+use crate::report::{
+    PhaseTiming, ReportPartition, ReportRequest, StageTiming, write_partition_reports,
+    write_reports,
+};
 use dedup_core::{
     DedupError, LoadOptions, ProgressObserver, SummaryAccumulator, load_entities_with_options,
     run_metadata, run_name, run_uri,
@@ -53,6 +56,14 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
             stage: "name",
             elapsed_secs: stage_started.elapsed().as_secs_f64(),
         });
+        write_completed_partition(
+            &config.output_dir,
+            &store,
+            &acc,
+            ReportPartition::Name,
+            "name",
+            progress,
+        )?;
     }
     if config.run_uri {
         let stage_started = Instant::now();
@@ -61,6 +72,14 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
             stage: "uri",
             elapsed_secs: stage_started.elapsed().as_secs_f64(),
         });
+        write_completed_partition(
+            &config.output_dir,
+            &store,
+            &acc,
+            ReportPartition::Uri,
+            "uri",
+            progress,
+        )?;
     }
     let mut metadata_stats = None;
     if config.run_metadata {
@@ -115,5 +134,21 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
     )
     .map_err(|error| DedupError::Message(error.to_string()))?;
     progress.add_completed(3);
+    Ok(())
+}
+
+fn write_completed_partition(
+    output_dir: &std::path::Path,
+    store: &dedup_core::EntityStore,
+    accumulator: &SummaryAccumulator,
+    partition: ReportPartition,
+    stage: &str,
+    progress: &ProgressReporter,
+) -> Result<(), DedupError> {
+    progress.set_stage("report");
+    progress.begin_phase(stage, Some(2));
+    write_partition_reports(output_dir, store, accumulator, partition)
+        .map_err(|error| DedupError::Message(error.to_string()))?;
+    progress.add_completed(2);
     Ok(())
 }
