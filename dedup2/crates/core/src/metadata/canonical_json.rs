@@ -4,6 +4,11 @@ use std::collections::BTreeSet;
 use std::fmt;
 use unicode_normalization::UnicodeNormalization;
 
+// serde_json's arbitrary_precision deserializer exposes non-native numbers
+// through this reserved map key. It is part of serde_json's serialization
+// protocol for Number when that feature is enabled.
+const ARBITRARY_PRECISION_NUMBER_TOKEN: &str = "$serde_json::private::Number";
+
 pub fn canonicalize_json(raw: &str) -> Option<String> {
     let mut deserializer = serde_json::Deserializer::from_str(raw.trim());
     let value = StrictValue::deserialize(&mut deserializer).ok()?.0;
@@ -44,16 +49,6 @@ impl<'de> Visitor<'de> for StrictVisitor {
         Ok(StrictValue(Value::Number(Number::from(value))))
     }
 
-    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        Number::from_f64(value)
-            .map(Value::Number)
-            .map(StrictValue)
-            .ok_or_else(|| E::custom("non-finite JSON number"))
-    }
-
     fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
         Ok(StrictValue(Value::String(value.to_owned())))
     }
@@ -87,6 +82,25 @@ impl<'de> Visitor<'de> for StrictVisitor {
     {
         let mut keys = BTreeSet::new();
         let mut output = Map::new();
+        let Some(first_key) = map.next_key::<String>()? else {
+            return Ok(StrictValue(Value::Object(output)));
+        };
+        if first_key == ARBITRARY_PRECISION_NUMBER_TOKEN {
+            let raw = map.next_value::<String>()?;
+            if map.next_key::<String>()?.is_some() {
+                return Err(de::Error::custom(
+                    "invalid arbitrary-precision JSON number representation",
+                ));
+            }
+            return raw
+                .parse::<Number>()
+                .map(Value::Number)
+                .map(StrictValue)
+                .map_err(de::Error::custom);
+        }
+
+        keys.insert(first_key.clone());
+        output.insert(first_key, map.next_value::<StrictValue>()?.0);
         while let Some(key) = map.next_key::<String>()? {
             if !keys.insert(key.clone()) {
                 return Err(de::Error::custom(format!(
@@ -139,14 +153,83 @@ fn normalize_number(number: Number) -> Number {
     if let Some(value) = number.as_u64() {
         return Number::from(value);
     }
-    if let Some(value) = number.as_f64()
-        && value.fract() == 0.0
-        && value >= i64::MIN as f64
-        && value <= i64::MAX as f64
-    {
-        return Number::from(value as i64);
+    let raw = number.to_string();
+    canonical_decimal(&raw)
+        .and_then(|value| value.parse::<Number>().ok())
+        .unwrap_or(number)
+}
+
+fn canonical_decimal(raw: &str) -> Option<String> {
+    let (negative, unsigned) = match raw.strip_prefix('-') {
+        Some(value) => (true, value),
+        None => (false, raw),
+    };
+    let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
+        Some(index) => (
+            &unsigned[..index],
+            unsigned[index + 1..].parse::<i128>().ok()?,
+        ),
+        None => (unsigned, 0),
+    };
+    let (integer, fraction) = match mantissa.split_once('.') {
+        Some(parts) => parts,
+        None => (mantissa, ""),
+    };
+    let mut digits = String::with_capacity(integer.len() + fraction.len());
+    digits.push_str(integer);
+    digits.push_str(fraction);
+
+    let first_nonzero = digits.find(|ch| ch != '0').unwrap_or(digits.len());
+    if first_nonzero == digits.len() {
+        return Some("0".to_owned());
     }
-    number
+    digits.drain(..first_nonzero);
+    let trailing_zeros = digits.len() - digits.trim_end_matches('0').len();
+    digits.truncate(digits.len() - trailing_zeros);
+
+    let power = exponent
+        .checked_sub(i128::try_from(fraction.len()).ok()?)?
+        .checked_add(i128::try_from(trailing_zeros).ok()?)?;
+    let mut output = String::new();
+    if negative {
+        output.push('-');
+    }
+
+    if (0..=64).contains(&power) {
+        output.push_str(&digits);
+        output.extend(std::iter::repeat_n('0', usize::try_from(power).ok()?));
+        return Some(output);
+    }
+
+    let decimal_position = i128::try_from(digits.len()).ok()?.checked_add(power)?;
+    if decimal_position > 0 && decimal_position < i128::try_from(digits.len()).ok()? {
+        let split = usize::try_from(decimal_position).ok()?;
+        output.push_str(&digits[..split]);
+        output.push('.');
+        output.push_str(&digits[split..]);
+        return Some(output);
+    }
+    if (-64..=0).contains(&decimal_position) {
+        output.push_str("0.");
+        output.extend(std::iter::repeat_n(
+            '0',
+            usize::try_from(-decimal_position).ok()?,
+        ));
+        output.push_str(&digits);
+        return Some(output);
+    }
+
+    output.push(digits.as_bytes()[0] as char);
+    if digits.len() > 1 {
+        output.push('.');
+        output.push_str(&digits[1..]);
+    }
+    let scientific_exponent = power.checked_add(i128::try_from(digits.len() - 1).ok()?)?;
+    if scientific_exponent != 0 {
+        output.push('e');
+        output.push_str(&scientific_exponent.to_string());
+    }
+    Some(output)
 }
 
 fn attr_key(value: &Value) -> (String, String) {
@@ -192,5 +275,24 @@ mod tests {
             canonicalize_json(r#"{"value":1.0}"#).unwrap(),
             r#"{"value":1}"#
         );
+    }
+
+    #[test]
+    fn preserves_distinct_integers_beyond_f64_precision() {
+        let first = canonicalize_json(r#"{"value":9007199254740992.0}"#).unwrap();
+        let second = canonicalize_json(r#"{"value":9007199254740993.0}"#).unwrap();
+
+        assert_eq!(first, r#"{"value":9007199254740992}"#);
+        assert_eq!(second, r#"{"value":9007199254740993}"#);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn canonicalizes_equivalent_arbitrary_precision_decimals() {
+        let plain = canonicalize_json(r#"{"value":12345678901234567890.5000}"#).unwrap();
+        let exponent = canonicalize_json(r#"{"value":1.23456789012345678905e19}"#).unwrap();
+
+        assert_eq!(plain, exponent);
+        assert_eq!(plain, r#"{"value":12345678901234567890.5}"#);
     }
 }

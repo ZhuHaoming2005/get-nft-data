@@ -1,12 +1,14 @@
-use dedup_core::{Dimension, EntityStore, PrefilterStats, ScopeKind, SummaryAccumulator};
+use dedup_core::{Dimension, EntityStore, MetadataStats, ScopeKind, SummaryAccumulator};
 use serde::Serialize;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
+use tempfile::Builder;
 
 type ReportError = Box<dyn std::error::Error + Send + Sync>;
+const REPORT_FILES: [&str; 3] = ["summary.csv", "chain_matrix.csv", "run_manifest.json"];
 
 #[derive(Serialize)]
 struct RunManifest {
@@ -26,7 +28,7 @@ struct RunManifest {
     name_threshold: f64,
     metadata_threshold: f64,
     metadata_anchors: usize,
-    metadata_prefilter: Option<PrefilterStats>,
+    metadata_direct: Option<MetadataStats>,
 }
 
 #[derive(Clone, Serialize)]
@@ -58,7 +60,7 @@ pub struct ReportRequest<'a> {
     pub name_threshold: f64,
     pub metadata_threshold: f64,
     pub metadata_anchors: usize,
-    pub metadata_prefilter: Option<PrefilterStats>,
+    pub metadata_direct: Option<MetadataStats>,
     pub stage_timings: Vec<StageTiming>,
     pub phase_timings: Vec<PhaseTiming>,
     pub elapsed: Duration,
@@ -66,6 +68,9 @@ pub struct ReportRequest<'a> {
 
 pub fn write_reports(output_dir: &Path, request: ReportRequest<'_>) -> Result<(), ReportError> {
     fs::create_dir_all(output_dir)?;
+    let staging = Builder::new()
+        .prefix(".dedup2-report-staging-")
+        .tempdir_in(output_dir)?;
     let mut chain_totals: Vec<ChainTotalRow> = request
         .store
         .totals
@@ -98,12 +103,14 @@ pub fn write_reports(output_dir: &Path, request: ReportRequest<'_>) -> Result<()
         name_threshold: request.name_threshold,
         metadata_threshold: request.metadata_threshold,
         metadata_anchors: request.metadata_anchors,
-        metadata_prefilter: request.metadata_prefilter,
+        metadata_direct: request.metadata_direct,
     };
     thread::scope(|scope| -> Result<(), ReportError> {
-        let summary = scope.spawn(|| write_summary(output_dir, request.store, request.accumulator));
-        let matrix = scope.spawn(|| write_matrix(output_dir, request.store, request.accumulator));
-        let manifest = scope.spawn(|| write_manifest(output_dir, &manifest));
+        let summary =
+            scope.spawn(|| write_summary(staging.path(), request.store, request.accumulator));
+        let matrix =
+            scope.spawn(|| write_matrix(staging.path(), request.store, request.accumulator));
+        let manifest = scope.spawn(|| write_manifest(staging.path(), &manifest));
         summary
             .join()
             .map_err(|_| std::io::Error::other("summary writer panicked"))??;
@@ -114,7 +121,86 @@ pub fn write_reports(output_dir: &Path, request: ReportRequest<'_>) -> Result<()
             .join()
             .map_err(|_| std::io::Error::other("manifest writer panicked"))??;
         Ok(())
-    })
+    })?;
+    commit_reports(output_dir, staging.path())
+}
+
+fn commit_reports(output_dir: &Path, staging_dir: &Path) -> Result<(), ReportError> {
+    for name in REPORT_FILES {
+        if !staging_dir.join(name).is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("staged report is missing: {name}"),
+            )
+            .into());
+        }
+    }
+
+    let backup = Builder::new()
+        .prefix(".dedup2-report-backup-")
+        .tempdir_in(output_dir)?;
+    let mut backed_up = Vec::new();
+    for name in REPORT_FILES {
+        let final_path = output_dir.join(name);
+        if final_path.exists() {
+            if let Err(error) = fs::rename(&final_path, backup.path().join(name)) {
+                let rollback = restore_reports(output_dir, backup.path(), &[], &backed_up);
+                return commit_error("backing up previous reports", error, rollback, backup);
+            }
+            backed_up.push(name);
+        }
+    }
+
+    let mut installed = Vec::new();
+    for name in REPORT_FILES {
+        if let Err(error) = fs::rename(staging_dir.join(name), output_dir.join(name)) {
+            let rollback = restore_reports(output_dir, backup.path(), &installed, &backed_up);
+            return commit_error("installing staged reports", error, rollback, backup);
+        }
+        installed.push(name);
+    }
+    Ok(())
+}
+
+fn restore_reports(
+    output_dir: &Path,
+    backup_dir: &Path,
+    installed: &[&str],
+    backed_up: &[&str],
+) -> std::io::Result<()> {
+    for name in installed.iter().rev() {
+        let path = output_dir.join(name);
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+    }
+    for name in backed_up.iter().rev() {
+        fs::rename(backup_dir.join(name), output_dir.join(name))?;
+    }
+    Ok(())
+}
+
+fn commit_error(
+    operation: &str,
+    error: std::io::Error,
+    rollback: std::io::Result<()>,
+    backup: tempfile::TempDir,
+) -> Result<(), ReportError> {
+    match rollback {
+        Ok(()) => Err(std::io::Error::other(format!(
+            "failed while {operation}; previous report set was restored: {error}"
+        ))
+        .into()),
+        Err(rollback_error) => {
+            let recovery_dir = backup.keep();
+            Err(std::io::Error::other(format!(
+                "failed while {operation}: {error}; rollback also failed: {rollback_error}; \
+                 previous files remain in {}",
+                recovery_dir.display()
+            ))
+            .into())
+        }
+    }
 }
 
 fn write_manifest(output_dir: &Path, manifest: &RunManifest) -> Result<(), ReportError> {
@@ -271,12 +357,50 @@ fn dimension_name(dimension: Dimension) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::ratio;
+    use super::{REPORT_FILES, commit_reports, ratio};
+    use std::fs;
 
     #[test]
     fn ratio_uses_fraction_and_handles_zero_total() {
         assert_eq!(ratio(0, 0), 0.0);
         assert_eq!(ratio(1, 4), 0.25);
         assert_eq!(ratio(3, 2), 1.5);
+    }
+
+    #[test]
+    fn incomplete_staging_keeps_previous_report_set() {
+        let output = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir_in(output.path()).unwrap();
+        for name in REPORT_FILES {
+            fs::write(output.path().join(name), format!("old-{name}")).unwrap();
+        }
+        fs::write(staging.path().join(REPORT_FILES[0]), "new-summary").unwrap();
+        fs::write(staging.path().join(REPORT_FILES[1]), "new-matrix").unwrap();
+
+        assert!(commit_reports(output.path(), staging.path()).is_err());
+        for name in REPORT_FILES {
+            assert_eq!(
+                fs::read_to_string(output.path().join(name)).unwrap(),
+                format!("old-{name}")
+            );
+        }
+    }
+
+    #[test]
+    fn complete_staging_replaces_the_whole_report_set() {
+        let output = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir_in(output.path()).unwrap();
+        for name in REPORT_FILES {
+            fs::write(output.path().join(name), format!("old-{name}")).unwrap();
+            fs::write(staging.path().join(name), format!("new-{name}")).unwrap();
+        }
+
+        commit_reports(output.path(), staging.path()).unwrap();
+        for name in REPORT_FILES {
+            assert_eq!(
+                fs::read_to_string(output.path().join(name)).unwrap(),
+                format!("new-{name}")
+            );
+        }
     }
 }

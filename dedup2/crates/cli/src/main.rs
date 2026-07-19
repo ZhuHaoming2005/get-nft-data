@@ -35,18 +35,6 @@ struct CommonArgs {
     metadata_threshold: f64,
     #[arg(long, default_value_t = 8)]
     metadata_anchors: usize,
-    #[arg(long, default_value_t = 0.9)]
-    template_jaccard_threshold: f64,
-    #[arg(long, default_value_t = 0)]
-    lsh_bands: u32,
-    #[arg(long, default_value_t = 0)]
-    lsh_rows_per_band: u32,
-    #[arg(long, default_value_t = 64)]
-    max_outgoing_candidates_per_contract: usize,
-    #[arg(long, default_value_t = 32)]
-    max_candidates_per_target_chain: usize,
-    #[arg(long, default_value_t = 16)]
-    neighbors_per_target_chain: usize,
     #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
     progress: ProgressMode,
     #[arg(long, default_value_t = 1_000)]
@@ -94,12 +82,6 @@ fn run() -> Result<(), DedupError> {
         name_threshold: args.name_threshold,
         metadata_threshold: args.metadata_threshold,
         metadata_anchors: args.metadata_anchors,
-        template_jaccard_threshold: args.template_jaccard_threshold,
-        lsh_bands: args.lsh_bands,
-        lsh_rows_per_band: args.lsh_rows_per_band,
-        max_outgoing_candidates_per_contract: args.max_outgoing_candidates_per_contract,
-        max_candidates_per_target_chain: args.max_candidates_per_target_chain,
-        neighbors_per_target_chain: args.neighbors_per_target_chain,
         run_name,
         run_uri,
         run_metadata,

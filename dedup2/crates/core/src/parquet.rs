@@ -425,7 +425,14 @@ mod tests {
 
         let merged = merge_shards_ordered(shards, &options).unwrap();
         assert_eq!(merged.rows_loaded, 5);
-        assert_eq!(merged.contracts[0].name_norm.as_deref(), Some("name-1"));
+        assert_eq!(
+            merged
+                .nfts
+                .iter()
+                .map(|nft| merged.string(nft.name_id.unwrap()))
+                .collect::<Vec<_>>(),
+            ["name-5", "name-4", "name-3", "name-2", "name-1"]
+        );
         assert_eq!(
             merged
                 .nfts

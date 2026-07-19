@@ -3,7 +3,7 @@ use dedup_core::{DedupError, EwmaEta, ProgressObserver};
 use serde::Serialize;
 use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -34,6 +34,8 @@ struct Shared {
     completed: AtomicU64,
     stopping: AtomicBool,
     cancelled: AtomicBool,
+    wake_lock: Mutex<()>,
+    wake: Condvar,
     mode: EffectiveMode,
     interval: Duration,
 }
@@ -101,6 +103,8 @@ impl ProgressReporter {
             completed: AtomicU64::new(0),
             stopping: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
+            wake_lock: Mutex::new(()),
+            wake: Condvar::new(),
             mode: effective,
             interval: Duration::from_millis(interval_ms.max(100)),
         });
@@ -121,6 +125,7 @@ impl ProgressReporter {
 
     pub fn finish(&mut self) {
         self.shared.stopping.store(true, Ordering::SeqCst);
+        self.shared.wake.notify_all();
         if let Some(handle) = self.worker.take() {
             let _ = handle.join();
         }
@@ -217,9 +222,29 @@ fn record_current_phase(meta: &mut Meta, now: Instant) {
 }
 
 fn reporter_loop(shared: Arc<Shared>) {
-    while !shared.stopping.load(Ordering::SeqCst) {
-        thread::sleep(shared.interval);
+    let Ok(mut guard) = shared.wake_lock.lock() else {
+        return;
+    };
+    loop {
+        if shared.stopping.load(Ordering::SeqCst) {
+            break;
+        }
+        let Ok((next_guard, timeout)) = shared.wake.wait_timeout(guard, shared.interval) else {
+            return;
+        };
+        guard = next_guard;
+        if shared.stopping.load(Ordering::SeqCst) {
+            break;
+        }
+        if !timeout.timed_out() {
+            continue;
+        }
+        drop(guard);
         emit_snapshot(&shared);
+        let Ok(next_guard) = shared.wake_lock.lock() else {
+            return;
+        };
+        guard = next_guard;
     }
 }
 
@@ -315,5 +340,24 @@ fn format_duration(secs: f64) -> String {
         format!("{m}m{s:02}s")
     } else {
         format!("{s}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProgressMode, ProgressReporter};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn finish_wakes_a_reporter_with_a_long_interval() {
+        let mut reporter = ProgressReporter::start(ProgressMode::Json, 60_000);
+        let started = Instant::now();
+
+        reporter.finish();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "finish waited for the reporting interval"
+        );
     }
 }

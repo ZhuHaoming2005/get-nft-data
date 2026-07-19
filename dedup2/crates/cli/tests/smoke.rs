@@ -149,6 +149,38 @@ fn all_writes_summary_files() {
             .as_array()
             .is_some_and(|timings| !timings.is_empty())
     );
-    assert!(manifest["metadata_prefilter"]["lsh_band_records"].is_u64());
-    assert!(manifest["metadata_prefilter"]["retained_candidate_pairs"].is_u64());
+    assert!(manifest["metadata_direct"]["logical_contract_pairs"].is_u64());
+    assert!(manifest["metadata_direct"]["profile_pair_tasks"].is_u64());
+    assert!(manifest["metadata_direct"]["unique_terms"].is_u64());
+    assert!(manifest["metadata_direct"]["profile_pair_reduction_ratio"].is_f64());
+    assert!(manifest["metadata_direct"]["candidate_index_used"].is_boolean());
+    assert!(manifest["metadata_direct"]["candidate_posting_entries"].is_u64());
+    assert!(manifest["metadata_direct"]["candidate_posting_bytes"].is_u64());
+    assert!(manifest["metadata_direct"]["candidate_range_bytes"].is_u64());
+    assert!(manifest["metadata_direct"]["candidate_index_bytes"].is_u64());
+    assert!(manifest["metadata_direct"]["candidate_posting_budget_ratio"].is_f64());
+    assert!(manifest["metadata_direct"]["candidate_index_budget_ratio"].is_f64());
+    assert!(manifest["metadata_direct"]["candidate_pair_bytes"].is_u64());
+    assert!(manifest["metadata_direct"]["candidate_pair_budget_ratio"].is_f64());
+    assert!(manifest["metadata_direct"]["candidate_prefix_terms"].is_u64());
+    assert!(manifest["metadata_direct"]["candidate_prefix_term_ratio"].is_f64());
+    assert!(manifest["metadata_direct"]["candidate_pair_emissions"].is_u64());
+    assert!(manifest["metadata_direct"]["candidate_pair_emission_ratio"].is_f64());
+    assert!(manifest["metadata_direct"]["candidate_pair_dedup_reduction_ratio"].is_f64());
+    assert!(manifest["metadata_direct"]["candidate_profile_pairs"].is_u64());
+    assert!(manifest["metadata_direct"]["candidate_profile_pair_ratio"].is_f64());
+    assert!(manifest["metadata_direct"]["candidate_zero_overlap_prunes"].is_u64());
+    assert!(manifest["metadata_direct"]["candidate_zero_overlap_prune_ratio"].is_f64());
+    assert!(manifest["metadata_direct"]["candidate_generation_fallback"].is_boolean());
+    assert!(manifest["metadata_direct"]["full_prepass_pairs"].is_u64());
+    assert!(manifest["metadata_direct"]["full_prepass_pair_ratio"].is_f64());
+    assert!(manifest["metadata_direct"]["block_saturated_profile_pairs"].is_u64());
+    assert!(manifest["metadata_direct"]["block_saturated_profile_pair_ratio"].is_f64());
+    assert!(manifest["metadata_direct"]["bm25_scores"].is_u64());
+    assert!(manifest["metadata_direct"]["bm25_score_ratio"].is_f64());
+    assert!(manifest["metadata_direct"]["bm25_cache_probes"].is_u64());
+    assert!(manifest["metadata_direct"]["bm25_cache_hit_ratio"].is_f64());
+    assert!(manifest["metadata_direct"]["bm25_cache_bypass_ratio"].is_f64());
+    assert!(manifest["metadata_direct"]["bm25_upper_bound_prune_ratio"].is_f64());
+    assert!(manifest["metadata_direct"]["matched_profile_pair_ratio"].is_f64());
 }

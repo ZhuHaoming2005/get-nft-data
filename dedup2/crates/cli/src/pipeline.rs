@@ -1,8 +1,8 @@
 use crate::progress::ProgressReporter;
 use crate::report::{PhaseTiming, ReportRequest, StageTiming, write_reports};
 use dedup_core::{
-    DedupError, LoadOptions, PrefilterConfig, ProgressObserver, SummaryAccumulator,
-    load_entities_with_options, run_metadata, run_name, run_uri,
+    DedupError, LoadOptions, ProgressObserver, SummaryAccumulator, load_entities_with_options,
+    run_metadata, run_name, run_uri,
 };
 use std::path::PathBuf;
 use std::time::Instant;
@@ -16,12 +16,6 @@ pub struct RunConfig {
     pub name_threshold: f64,
     pub metadata_threshold: f64,
     pub metadata_anchors: usize,
-    pub template_jaccard_threshold: f64,
-    pub lsh_bands: u32,
-    pub lsh_rows_per_band: u32,
-    pub max_outgoing_candidates_per_contract: usize,
-    pub max_candidates_per_target_chain: usize,
-    pub neighbors_per_target_chain: usize,
     pub run_name: bool,
     pub run_uri: bool,
     pub run_metadata: bool,
@@ -76,21 +70,11 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
             .iter()
             .map(|c| c.trim().to_ascii_lowercase())
             .collect();
-        let prefilter = PrefilterConfig {
-            template_jaccard_threshold: config.template_jaccard_threshold,
-            lsh_bands: config.lsh_bands,
-            lsh_rows_per_band: config.lsh_rows_per_band,
-            max_outgoing_candidates_per_contract: config.max_outgoing_candidates_per_contract,
-            max_candidates_per_target_chain: config.max_candidates_per_target_chain,
-            neighbors_per_target_chain: config.neighbors_per_target_chain,
-            bucket_pair_cap: 10_000,
-        };
         let result = run_metadata(
             &store,
             &evm,
             config.metadata_anchors,
             config.metadata_threshold,
-            prefilter,
             &mut acc,
             progress,
         )?;
@@ -123,7 +107,7 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
             name_threshold: config.name_threshold,
             metadata_threshold: config.metadata_threshold,
             metadata_anchors: config.metadata_anchors,
-            metadata_prefilter: metadata_stats,
+            metadata_direct: metadata_stats,
             stage_timings,
             phase_timings,
             elapsed: started.elapsed(),

@@ -41,7 +41,6 @@ pub struct Contract {
     pub id: ContractId,
     pub chain_id: ChainId,
     pub address: String,
-    pub name_norm: Option<String>,
     pub nft_count: u64,
     /// Sorted, bounded metadata anchors. At most `EntityStore::metadata_anchor_limit`.
     pub metadata_by_token: Vec<MetadataRecord>,
@@ -52,6 +51,9 @@ pub struct Nft {
     pub id: NftId,
     pub contract_id: ContractId,
     pub token_id: String,
+    /// Per-NFT normalized name. EVM Name analysis chooses a contract-level
+    /// representative while Solana cross-chain analysis keeps this NFT unit.
+    pub name_id: Option<StringId>,
     pub token_uri_id: Option<StringId>,
     pub image_uri_id: Option<StringId>,
     pub source_order: SourceOrder,
@@ -133,6 +135,16 @@ impl EntityStore {
         self.string_ids.get(value).copied()
     }
 
+    pub(crate) fn nft_id(&self, contract_id: ContractId, token_id: &str) -> Option<NftId> {
+        self.nft_index
+            .get(&(contract_id, token_id.to_owned()))
+            .copied()
+    }
+
+    pub fn is_solana_chain(&self, id: ChainId) -> bool {
+        self.chain_name(id) == "solana"
+    }
+
     pub fn ensure_chain(&mut self, chain: &str) -> Result<ChainId, DedupError> {
         if let Some(id) = self.chain_ids.get(chain) {
             return Ok(*id);
@@ -177,7 +189,6 @@ impl EntityStore {
                 id,
                 chain_id,
                 address: row.contract_address.clone(),
-                name_norm: None,
                 nft_count: 0,
                 metadata_by_token: Vec::new(),
             });
@@ -186,7 +197,6 @@ impl EntityStore {
             id
         };
 
-        self.merge_contract_name(contract_id, &row.name_norm);
         if let Some(canonical_json) = validated_metadata(&row.metadata_json) {
             self.insert_metadata_anchor(
                 contract_id,
@@ -214,12 +224,18 @@ impl EntityStore {
         } else {
             Some(self.intern_string(&row.image_uri_norm)?)
         };
+        let name_id = if row.name_norm.trim().is_empty() {
+            None
+        } else {
+            Some(self.intern_string(&row.name_norm)?)
+        };
         let nft_id = NftId::try_from(self.nfts.len())
             .map_err(|_| DedupError::invalid("load", "too many NFTs for NftId"))?;
         self.nfts.push(Nft {
             id: nft_id,
             contract_id,
             token_id: row.token_id.clone(),
+            name_id,
             token_uri_id,
             image_uri_id,
             source_order: row.source_order,
@@ -231,28 +247,21 @@ impl EntityStore {
         Ok(())
     }
 
-    fn merge_contract_name(&mut self, contract_id: ContractId, name: &str) {
-        if name.is_empty() {
-            return;
-        }
-        let contract = &mut self.contracts[contract_id as usize];
-        match contract.name_norm.as_deref() {
-            None => contract.name_norm = Some(name.to_owned()),
-            Some(existing) if name < existing => {
-                contract.name_norm = Some(name.to_owned());
-            }
-            Some(_) => {}
-        }
-    }
-
     fn merge_duplicate_nft(&mut self, nft_id: NftId, row: &InputRow) -> Result<(), DedupError> {
+        let existing_name = self.nfts[nft_id as usize].name_id;
         let existing_token = self.nfts[nft_id as usize].token_uri_id;
         let existing_image = self.nfts[nft_id as usize].image_uri_id;
+        let name_id = if existing_name.is_none() && !row.name_norm.trim().is_empty() {
+            Some(self.intern_string(&row.name_norm)?)
+        } else {
+            existing_name
+        };
         let token_uri_id =
             self.merge_uri_value(existing_token, &row.token_uri_norm, "token_uri_norm", row)?;
         let image_uri_id =
             self.merge_uri_value(existing_image, &row.image_uri_norm, "image_uri_norm", row)?;
         let nft = &mut self.nfts[nft_id as usize];
+        nft.name_id = name_id;
         nft.token_uri_id = token_uri_id;
         nft.image_uri_id = image_uri_id;
         Ok(())
@@ -361,7 +370,6 @@ impl EntityStore {
                     id,
                     chain_id,
                     address: contract.address.clone(),
-                    name_norm: None,
                     nft_count: 0,
                     metadata_by_token: Vec::new(),
                 });
@@ -370,9 +378,6 @@ impl EntityStore {
                 id
             };
             contract_map[contract.id as usize] = contract_id;
-            if let Some(name) = contract.name_norm.as_deref() {
-                self.merge_contract_name(contract_id, name);
-            }
             let chain_name = self.chains[chain_id as usize].clone();
             for record in contract.metadata_by_token {
                 self.insert_metadata_anchor(
@@ -388,11 +393,15 @@ impl EntityStore {
 
         for nft in nfts {
             let contract_id = contract_map[nft.contract_id as usize];
+            let name_id = nft.name_id.map(|id| string_map[id as usize]);
             let token_uri_id = nft.token_uri_id.map(|id| string_map[id as usize]);
             let image_uri_id = nft.image_uri_id.map(|id| string_map[id as usize]);
             let nft_key = (contract_id, nft.token_id.clone());
             if let Some(&existing_id) = self.nft_index.get(&nft_key) {
                 let existing = &mut self.nfts[existing_id as usize];
+                if existing.name_id.is_none() {
+                    existing.name_id = name_id;
+                }
                 existing.token_uri_id = merge_mapped_uri(
                     existing.token_uri_id,
                     token_uri_id,
@@ -415,6 +424,7 @@ impl EntityStore {
                 id: nft_id,
                 contract_id,
                 token_id: nft.token_id.clone(),
+                name_id,
                 token_uri_id,
                 image_uri_id,
                 source_order: nft.source_order,
@@ -453,7 +463,10 @@ impl EntityStore {
                     chain: chain.to_owned(),
                     contract_address: contract.address.clone(),
                     token_id: nft.token_id.clone(),
-                    name_norm: contract.name_norm.clone().unwrap_or_default(),
+                    name_norm: nft
+                        .name_id
+                        .map(|id| old.string(id).to_owned())
+                        .unwrap_or_default(),
                     token_uri_norm: nft
                         .token_uri_id
                         .map(|id| old.string(id).to_owned())
@@ -556,7 +569,8 @@ fn validated_metadata(content: &str) -> Option<String> {
     if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
         return None;
     }
-    crate::metadata::canonicalize_json_strict(trimmed)
+    let canonical = crate::metadata::canonicalize_json_strict(trimmed)?;
+    (canonical != "{}").then_some(canonical)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -617,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    fn contract_name_uses_stable_non_empty_minimum_across_shards() {
+    fn per_nft_names_survive_shard_merge() {
         let mut higher = row("1", "", "");
         higher.name_norm = "pokemon trading card game - scar".to_owned();
         let mut lower = row("2", "", "");
@@ -630,8 +644,12 @@ mod tests {
         left.merge_shard(right).unwrap();
 
         assert_eq!(
-            left.contracts[0].name_norm.as_deref(),
-            Some("1999 # charmander cgc 10 pristin")
+            left.string(left.nfts[0].name_id.unwrap()),
+            "pokemon trading card game - scar"
+        );
+        assert_eq!(
+            left.string(left.nfts[1].name_id.unwrap()),
+            "1999 # charmander cgc 10 pristin"
         );
     }
 
@@ -683,6 +701,18 @@ mod tests {
         store
             .try_ingest_row(row("1", "", r#"{"name":"a","name":"b"}"#))
             .unwrap();
+        store
+            .try_ingest_row(row("2", "", r#"{"name":"valid"}"#))
+            .unwrap();
+        assert_eq!(store.contracts[0].metadata_by_token.len(), 1);
+        assert_eq!(store.contracts[0].metadata_by_token[0].token_id, "2");
+    }
+
+    #[test]
+    fn empty_metadata_object_does_not_consume_anchor_budget() {
+        let evm_chains = ["ethereum".to_owned()].into_iter().collect();
+        let mut store = EntityStore::with_options(1, &evm_chains);
+        store.try_ingest_row(row("1", "", " { } ")).unwrap();
         store
             .try_ingest_row(row("2", "", r#"{"name":"valid"}"#))
             .unwrap();

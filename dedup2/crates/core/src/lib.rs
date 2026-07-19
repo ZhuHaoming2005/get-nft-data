@@ -11,7 +11,7 @@ pub mod uri;
 
 pub use entity::{Dimension, EntityStore, NftId, ScopeKind, StringId};
 pub use error::DedupError;
-pub use metadata::{MetadataRunResult, PrefilterConfig, PrefilterStats, run_metadata};
+pub use metadata::{MetadataRunResult, MetadataStats, run_metadata};
 pub use name::run_name;
 pub use parquet::{LoadOptions, load_entities, load_entities_with_options};
 pub use progress::{EwmaEta, NoopProgress, ProgressObserver};

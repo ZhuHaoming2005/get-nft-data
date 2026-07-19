@@ -129,14 +129,16 @@ fail fast.
 One sequential (or per-file parallel then merge) scan builds:
 
 1. **Contracts** keyed by `(chain, contract_address)`
-   - `name_norm`: first non-empty in stable source order
    - `nft_count`
    - valid metadata map `token_id → metadata_json` (first valid record wins)
-2. **URI postings** for non-empty `token_uri_norm` / `image_uri_norm`
-3. **Metadata anchors**: first `k` valid metadata records per contract ordered
+2. **NFTs** keyed by `(contract, token_id)`
+   - interned per-NFT `name_norm`, preserving NFT-level Name semantics without
+     duplicating common strings
+3. **URI postings** for non-empty `token_uri_norm` / `image_uri_norm`
+4. **Metadata anchors**: first `k` valid, non-empty, non-`{}` metadata records per contract ordered
    by ascending token id (EVM: arbitrary-precision non-negative integer;
    Solana: lexicographic Base58)
-4. Denominators: `total_contracts` / `total_nfts` per chain over all valid
+5. Denominators: `total_contracts` / `total_nfts` per chain over all valid
    non-empty contracts and NFTs (not the analyzable subset)
 
 Empty names, empty URIs, and unusable metadata do not participate in their
@@ -158,8 +160,10 @@ Rules:
   `primary_chain`
 - Within one scope, an object matched against several peers contributes once to
   `duplicate_contract_count` / `duplicate_nft_count`
-- Name and Metadata are contract-level hits: a matched contract counts the
+- EVM Name and Metadata are contract-level hits: a matched contract counts the
   contract once and **all** of its NFTs
+- Solana Name is NFT-level: only matched NFTs are counted, while the containing
+  contract is counted once per scope when at least one of its NFTs matches
 - URI counts matched NFT rows; the contract is counted once per scope when any
   of its NFTs match
 
@@ -170,24 +174,32 @@ Rules:
 Follow `REWRITE_ARCHITECTURE.md` §8.1–8.4 and `REWRITE_ACCEPTANCE.md` Name
 section. Execution uses **resident postings only** (no `external_postings`).
 
-1. Aggregate contracts into `NameAtom` per `(chain_id, name_norm)` and
-   `CanonicalName` per distinct name value
-2. Byte-identical canonical names update scope statistics from atom counts
+1. Solana contributes one Name unit per NFT. Other chains contribute one unit
+   per contract.
+2. For each EVM contract, discard blank/null-like names (`none`, `null`, `nil`,
+   `undefined`, `n/a`, `na`, `nan`, punctuation placeholders) and one-digit
+   numeric names; select the remaining name carried by the most logical NFTs.
+   Count ties use lexicographically smallest `name_norm` for deterministic
+   results.
+3. Aggregate selected contract units and Solana NFT units into `NameAtom` per
+   `(chain_id, name_norm)` and `CanonicalName` per distinct name value
+4. Byte-identical canonical names update scope statistics from atom counts
    without materializing contract pairs (similarity `1.0`)
-3. Fuzzy candidates use lossless `CandidateBounds` derived from the JW
+5. Fuzzy candidates use lossless `CandidateBounds` derived from the JW
    definition and `--name-threshold` (default `95.0` → `0.95`):
    - pairable length interval
    - minimum character-multiset overlap given lengths and common prefix
-4. Candidate generation:
+6. Candidate generation:
    - order canonical Names by character count; apply safe length interval
    - encode character multiplicity as `(character, occurrence_rank)`
    - build occurrence-token postings in memory
    - probe the safe rare-token prefix, de-duplicate, check multiset overlap
    - only survivors run exact Jaro-Winkler
-5. Verifier: version-pinned RapidFuzz Jaro-Winkler over Unicode scalar values,
+7. Verifier: version-pinned RapidFuzz Jaro-Winkler over Unicode scalar values,
    with score cutoff; each unordered pair scored once (`left_id < right_id`)
-6. No Union-Find, no similarity graph, no transitive closure
-7. Accepted pairs expand to `NameAtom` members and accumulate the three scopes
+8. No Union-Find, no similarity graph, no transitive closure
+9. Accepted pairs expand to typed contract/NFT `NameAtom` members and
+   accumulate the three scopes without changing either side's counting unit
 
 The candidate filter must cover every real hit of exhaustive JW at the same
 threshold; tokens and candidates are never silently dropped for memory reasons

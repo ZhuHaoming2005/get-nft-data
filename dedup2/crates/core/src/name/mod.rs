@@ -4,10 +4,10 @@
 
 mod candidate_bounds;
 
-use crate::entity::{ChainId, ContractId, Dimension, EntityStore};
+use crate::entity::{ChainId, ContractId, Dimension, EntityStore, NftId};
 use crate::error::DedupError;
 use crate::progress::ProgressObserver;
-use crate::radix::{sort_u32_pairs, sort_u64};
+use crate::radix::{sort_u32_pairs_while, sort_u32_triples_while, sort_u64_while};
 use crate::stats::SummaryAccumulator;
 use ahash::{AHashMap, AHashSet};
 use candidate_bounds::CandidateBounds;
@@ -19,14 +19,25 @@ const PROGRESS_BATCH: u64 = 4096;
 const SCORE_PROGRESS_BATCH: u64 = 64;
 const SCORE_SCHEDULING_CHUNK: usize = 8;
 const DENSE_SEEN_BUDGET_BYTES: usize = 4 * 1024 * 1024 * 1024;
-type NameAtomMap = AHashMap<(String, ChainId), NameAtom>;
-type NameHits = AHashSet<(ContractId, ChainId)>;
+type NameHits = AHashSet<NameHit>;
 
 #[derive(Clone, Debug)]
 struct NameAtom {
     chain_id: ChainId,
-    contract_ids: Vec<ContractId>,
-    nft_count: u64,
+    allow_intra: bool,
+    members: Vec<NameMember>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct NameMember {
+    contract_id: ContractId,
+    nft_id: Option<NftId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct NameHit {
+    member: NameMember,
+    peer_chain: ChainId,
 }
 
 #[derive(Clone, Debug)]
@@ -48,6 +59,7 @@ struct ResidentNameIndex {
 
 impl ResidentNameIndex {
     fn build(names: &[CanonicalName], progress: &dyn ProgressObserver) -> Result<Self, DedupError> {
+        const INDEX_CHUNK: usize = 4096;
         if names.len() > u32::MAX as usize {
             return Err(DedupError::invalid(
                 "name",
@@ -55,23 +67,33 @@ impl ResidentNameIndex {
             ));
         }
         progress.begin_phase("build_name_documents", Some(names.len() as u64));
-        let raw_documents: Vec<Vec<u64>> = names
-            .par_iter()
-            .map(|name| {
-                let mut occurrences: AHashMap<char, u32> = AHashMap::new();
-                name.characters
+        let raw_document_chunks = names
+            .par_chunks(INDEX_CHUNK)
+            .map(|chunk| {
+                progress.check_cancelled()?;
+                let documents = chunk
                     .iter()
-                    .map(|&character| {
-                        let rank = occurrences.entry(character).or_default();
-                        let key = (u64::from(character as u32) << 32) | u64::from(*rank);
-                        *rank += 1;
-                        key
+                    .map(|name| {
+                        let mut occurrences: AHashMap<char, u32> = AHashMap::new();
+                        name.characters
+                            .iter()
+                            .map(|&character| {
+                                let rank = occurrences.entry(character).or_default();
+                                let key = (u64::from(character as u32) << 32) | u64::from(*rank);
+                                *rank += 1;
+                                key
+                            })
+                            .collect()
                     })
-                    .collect()
+                    .collect::<Vec<Vec<u64>>>();
+                progress.add_completed(chunk.len() as u64);
+                Ok::<_, DedupError>(documents)
             })
-            .collect();
-        progress.add_completed(names.len() as u64);
-        progress.check_cancelled()?;
+            .collect::<Vec<_>>();
+        let mut raw_documents = Vec::with_capacity(names.len());
+        for chunk in raw_document_chunks {
+            raw_documents.extend(chunk?);
+        }
 
         let mut document_offsets = Vec::with_capacity(raw_documents.len() + 1);
         document_offsets.push(0);
@@ -83,7 +105,14 @@ impl ResidentNameIndex {
         }
 
         let mut unique_tokens = raw_tokens.clone();
-        sort_u64(&mut unique_tokens);
+        let token_sort_passes = if unique_tokens.len() > 1 { 6 } else { 0 };
+        progress.begin_phase("sort_name_tokens", Some(token_sort_passes));
+        if !sort_u64_while(&mut unique_tokens, || {
+            progress.add_completed(1);
+            progress.check_cancelled().is_ok()
+        }) {
+            return Err(DedupError::Interrupted);
+        }
         unique_tokens.dedup();
         if unique_tokens.len() > u32::MAX as usize {
             return Err(DedupError::invalid(
@@ -96,30 +125,61 @@ impl ResidentNameIndex {
             .enumerate()
             .map(|(index, token)| (token, index as u32))
             .collect();
-        let documents: Vec<u32> = raw_tokens
-            .into_par_iter()
-            .map(|token| token_ids[&token])
-            .collect();
         let token_count = token_ids.len();
+
+        progress.begin_phase("encode_name_documents", Some(raw_tokens.len() as u64));
+        let document_chunks = raw_tokens
+            .par_chunks(INDEX_CHUNK)
+            .map(|chunk| {
+                progress.check_cancelled()?;
+                let encoded = chunk
+                    .iter()
+                    .map(|token| token_ids[token])
+                    .collect::<Vec<_>>();
+                progress.add_completed(chunk.len() as u64);
+                Ok::<_, DedupError>(encoded)
+            })
+            .collect::<Vec<_>>();
+        let mut documents = Vec::with_capacity(raw_tokens.len());
+        for chunk in document_chunks {
+            documents.extend(chunk?);
+        }
+        drop(raw_tokens);
         drop(token_ids);
 
         progress.begin_phase("fill_name_postings", Some(names.len() as u64));
-        let mut posting_pairs: Vec<(u32, u32)> = (0..names.len())
-            .into_par_iter()
-            .flat_map_iter(|name_id| {
-                let name_id = name_id as u32;
-                let start = document_offsets[name_id as usize];
-                let end = document_offsets[name_id as usize + 1];
-                documents[start..end]
-                    .iter()
-                    .map(move |&token_id| (token_id, name_id))
+        let posting_chunks = names
+            .par_chunks(INDEX_CHUNK)
+            .enumerate()
+            .map(|(chunk_id, chunk)| {
+                progress.check_cancelled()?;
+                let first_name = chunk_id * INDEX_CHUNK;
+                let mut pairs = Vec::new();
+                for name_id in first_name..first_name + chunk.len() {
+                    let start = document_offsets[name_id];
+                    let end = document_offsets[name_id + 1];
+                    pairs.extend(
+                        documents[start..end]
+                            .iter()
+                            .map(|&token_id| (token_id, name_id as u32)),
+                    );
+                }
+                progress.add_completed(chunk.len() as u64);
+                Ok::<_, DedupError>(pairs)
             })
-            .collect();
-        progress.add_completed(names.len() as u64);
-        progress.begin_phase("sort_name_postings", Some(posting_pairs.len() as u64));
-        sort_u32_pairs(&mut posting_pairs);
-        progress.add_completed(posting_pairs.len() as u64);
-        progress.check_cancelled()?;
+            .collect::<Vec<_>>();
+        let mut posting_pairs = Vec::with_capacity(token_occurrences);
+        for chunk in posting_chunks {
+            posting_pairs.extend(chunk?);
+        }
+        let posting_sort_passes = if posting_pairs.len() > 1 { 6 } else { 0 };
+        progress.begin_phase("sort_name_postings", Some(posting_sort_passes));
+        if !sort_u32_pairs_while(&mut posting_pairs, || {
+            progress.add_completed(1);
+            progress.check_cancelled().is_ok()
+        }) {
+            return Err(DedupError::Interrupted);
+        }
 
         let mut posting_counts = vec![0usize; token_count];
         for &(token_id, _) in &posting_pairs {
@@ -150,19 +210,22 @@ impl ResidentNameIndex {
             prefix_rest = next_prefix;
         }
         document_slices
-            .into_par_iter()
-            .for_each(|(sorted, prefix)| {
-                prefix.sort_unstable_by(|&a, &b| {
-                    let a = a as usize;
-                    let b = b as usize;
-                    let a_len = posting_offsets[a + 1] - posting_offsets[a];
-                    let b_len = posting_offsets[b + 1] - posting_offsets[b];
-                    a_len.cmp(&b_len).then_with(|| a.cmp(&b))
-                });
-                sorted.sort_unstable();
-            });
-        progress.add_completed(names.len() as u64);
-        progress.check_cancelled()?;
+            .par_chunks_mut(INDEX_CHUNK)
+            .try_for_each(|chunk| {
+                progress.check_cancelled()?;
+                for (sorted, prefix) in &mut *chunk {
+                    prefix.sort_unstable_by(|&a, &b| {
+                        let a = a as usize;
+                        let b = b as usize;
+                        let a_len = posting_offsets[a + 1] - posting_offsets[a];
+                        let b_len = posting_offsets[b + 1] - posting_offsets[b];
+                        a_len.cmp(&b_len).then_with(|| a.cmp(&b))
+                    });
+                    sorted.sort_unstable();
+                }
+                progress.add_completed(chunk.len() as u64);
+                Ok::<_, DedupError>(())
+            })?;
 
         Ok(Self {
             document_offsets,
@@ -203,7 +266,6 @@ pub fn run_name(
     let threshold_pct = threshold * 100.0;
 
     progress.set_stage("name");
-    progress.begin_phase("atomize", Some(store.contracts.len() as u64));
     let names = atomize(store, progress)?;
     progress.begin_phase("identical", Some(names.len() as u64));
     emit_identical(&names, store, acc, progress)?;
@@ -217,9 +279,9 @@ pub fn run_name(
 
     progress.begin_phase("emit", Some(hits.len() as u64));
     let mut completed = 0_u64;
-    for (contract_id, peer_chain) in hits {
+    for hit in hits {
         progress.check_cancelled()?;
-        acc.mark_contract_duplicate(store, contract_id, Dimension::Name, peer_chain);
+        emit_hit(store, acc, hit);
         completed += 1;
         flush_progress(&mut completed, progress)?;
     }
@@ -232,58 +294,193 @@ fn atomize(
     progress: &dyn ProgressObserver,
 ) -> Result<Vec<CanonicalName>, DedupError> {
     const CHUNK: usize = 4096;
-    let partials: Vec<Result<NameAtomMap, DedupError>> = store
-        .contracts
+    progress.begin_phase("atomize_collect", Some(store.nfts.len() as u64));
+    let (mut assignments, mut solana_members) = store
+        .nfts
         .par_chunks(CHUNK)
-        .map(|contracts| {
+        .map(|nfts| {
             progress.check_cancelled()?;
-            let mut atoms = NameAtomMap::new();
-            for contract in contracts {
-                if let Some(name) = contract.name_norm.as_ref().filter(|name| !name.is_empty()) {
-                    let atom = atoms
-                        .entry((name.clone(), contract.chain_id))
-                        .or_insert_with(|| NameAtom {
-                            chain_id: contract.chain_id,
-                            contract_ids: Vec::new(),
-                            nft_count: 0,
-                        });
-                    atom.contract_ids.push(contract.id);
-                    atom.nft_count += contract.nft_count;
+            let mut contract_assignments = Vec::new();
+            let mut nft_members = Vec::new();
+            for nft in nfts {
+                let Some(name_id) = nft.name_id else {
+                    continue;
+                };
+                let contract = &store.contracts[nft.contract_id as usize];
+                if !is_usable_contract_name(store.string(name_id)) {
+                    continue;
+                }
+                if store.is_solana_chain(contract.chain_id) {
+                    nft_members.push((nft.id, contract.id, name_id));
+                } else {
+                    contract_assignments.push((contract.id, name_id));
                 }
             }
-            progress.add_completed(contracts.len() as u64);
-            Ok(atoms)
+            progress.add_completed(nfts.len() as u64);
+            Ok::<_, DedupError>((contract_assignments, nft_members))
         })
-        .collect();
-    let mut by_atom = NameAtomMap::new();
-    for partial in partials {
-        for (key, mut atom) in partial? {
-            let combined = by_atom.entry(key).or_insert_with(|| NameAtom {
-                chain_id: atom.chain_id,
-                contract_ids: Vec::new(),
-                nft_count: 0,
-            });
-            combined.contract_ids.append(&mut atom.contract_ids);
-            combined.nft_count += atom.nft_count;
-        }
-    }
-    let mut by_text: AHashMap<String, Vec<NameAtom>> = AHashMap::new();
-    for ((text, _), atom) in by_atom {
-        by_text.entry(text).or_default().push(atom);
+        .try_reduce(
+            || (Vec::new(), Vec::new()),
+            |(mut left_contracts, mut left_nfts), (mut right_contracts, mut right_nfts)| {
+                if left_contracts.len() < right_contracts.len() {
+                    std::mem::swap(&mut left_contracts, &mut right_contracts);
+                }
+                if left_nfts.len() < right_nfts.len() {
+                    std::mem::swap(&mut left_nfts, &mut right_nfts);
+                }
+                left_contracts.append(&mut right_contracts);
+                left_nfts.append(&mut right_nfts);
+                Ok((left_contracts, left_nfts))
+            },
+        )?;
+    solana_members.sort_unstable_by_key(|&(nft_id, _, _)| nft_id);
+
+    let assignment_sort_passes = if assignments.len() > 1 { 6 } else { 0 };
+    progress.begin_phase("atomize_sort_assignments", Some(assignment_sort_passes));
+    if !sort_u32_pairs_while(&mut assignments, || {
+        progress.add_completed(1);
+        progress.check_cancelled().is_ok()
+    }) {
+        return Err(DedupError::Interrupted);
     }
 
-    let mut names: Vec<CanonicalName> = by_text
-        .into_iter()
-        .map(|(text, mut atoms)| {
-            atoms.sort_unstable_by_key(|atom| atom.chain_id);
-            let characters: Vec<char> = text.chars().collect();
-            CanonicalName {
-                text,
-                characters,
-                atoms,
+    progress.begin_phase("atomize_select", Some(assignments.len() as u64));
+    let mut representatives = Vec::new();
+    let mut index = 0;
+    let mut completed = 0_u64;
+    while index < assignments.len() {
+        let contract_id = assignments[index].0;
+        let mut selected_name = assignments[index].1;
+        let mut selected_count = 0_u64;
+        while index < assignments.len() && assignments[index].0 == contract_id {
+            let name_id = assignments[index].1;
+            let start = index;
+            index += 1;
+            while index < assignments.len()
+                && assignments[index].0 == contract_id
+                && assignments[index].1 == name_id
+            {
+                index += 1;
             }
+            let count = (index - start) as u64;
+            if count > selected_count
+                || (count == selected_count && store.string(name_id) < store.string(selected_name))
+            {
+                selected_name = name_id;
+                selected_count = count;
+            }
+            completed += count;
+            flush_progress(&mut completed, progress)?;
+        }
+        representatives.push((contract_id, selected_name));
+    }
+    flush_remaining(&mut completed, progress);
+    drop(assignments);
+
+    let mut logical_members = Vec::with_capacity(representatives.len() + solana_members.len());
+    logical_members.extend(representatives.iter().map(|&(contract_id, name_id)| {
+        (
+            name_id,
+            store.contracts[contract_id as usize].chain_id,
+            NameMember {
+                contract_id,
+                nft_id: None,
+            },
+        )
+    }));
+    logical_members.extend(
+        solana_members
+            .drain(..)
+            .map(|(nft_id, contract_id, name_id)| {
+                (
+                    name_id,
+                    store.contracts[contract_id as usize].chain_id,
+                    NameMember {
+                        contract_id,
+                        nft_id: Some(nft_id),
+                    },
+                )
+            }),
+    );
+    drop(representatives);
+
+    progress.begin_phase("atomize_materialize", Some(logical_members.len() as u64));
+    let selected_chunks = logical_members
+        .par_chunks(CHUNK)
+        .enumerate()
+        .map(|(chunk_id, chunk)| {
+            progress.check_cancelled()?;
+            let base = chunk_id * CHUNK;
+            let selected = chunk
+                .iter()
+                .enumerate()
+                .map(|(offset, &(name_id, chain_id, _))| {
+                    Ok((
+                        name_id,
+                        u32::from(chain_id),
+                        u32::try_from(base + offset).map_err(|_| {
+                            DedupError::invalid("name", "name member index exceeds u32")
+                        })?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, DedupError>>()?;
+            progress.add_completed(chunk.len() as u64);
+            Ok::<_, DedupError>(selected)
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let mut selected = Vec::with_capacity(logical_members.len());
+    for chunk in selected_chunks {
+        selected.extend(chunk?);
+    }
+
+    let selected_sort_passes = if selected.len() > 1 { 9 } else { 0 };
+    progress.begin_phase("atomize_sort_selected", Some(selected_sort_passes));
+    if !sort_u32_triples_while(&mut selected, || {
+        progress.add_completed(1);
+        progress.check_cancelled().is_ok()
+    }) {
+        return Err(DedupError::Interrupted);
+    }
+
+    progress.begin_phase("atomize_group", Some(selected.len() as u64));
+    let mut names = Vec::new();
+    let mut selected_index = 0;
+    let mut grouped = 0_u64;
+    while selected_index < selected.len() {
+        let name_id = selected[selected_index].0;
+        let mut atoms = Vec::new();
+        while selected_index < selected.len() && selected[selected_index].0 == name_id {
+            let chain_id = ChainId::try_from(selected[selected_index].1)
+                .map_err(|_| DedupError::invalid("name", "chain id exceeds ChainId"))?;
+            let start = selected_index;
+            selected_index += 1;
+            while selected_index < selected.len()
+                && selected[selected_index].0 == name_id
+                && selected[selected_index].1 == u32::from(chain_id)
+            {
+                selected_index += 1;
+            }
+            atoms.push(NameAtom {
+                chain_id,
+                allow_intra: !store.is_solana_chain(chain_id),
+                members: selected[start..selected_index]
+                    .iter()
+                    .map(|entry| logical_members[entry.2 as usize].2)
+                    .collect(),
+            });
+            grouped += (selected_index - start) as u64;
+            flush_progress(&mut grouped, progress)?;
+        }
+        let text = store.string(name_id).to_owned();
+        let characters = text.chars().collect();
+        names.push(CanonicalName {
+            text,
+            characters,
+            atoms,
+        });
+    }
+    flush_remaining(&mut grouped, progress);
+
     // Length-sorted: required for monotone right-range windows.
     names.sort_by(|a, b| {
         a.characters
@@ -292,6 +489,33 @@ fn atomize(
             .then_with(|| a.text.cmp(&b.text))
     });
     Ok(names)
+}
+
+fn is_usable_contract_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    const NULL_LIKE: [&str; 11] = [
+        "none",
+        "null",
+        "nil",
+        "undefined",
+        "n/a",
+        "na",
+        "n.a.",
+        "nan",
+        "-",
+        "--",
+        ".",
+    ];
+    if NULL_LIKE
+        .iter()
+        .any(|null_like| trimmed.eq_ignore_ascii_case(null_like))
+    {
+        return false;
+    }
+    !(trimmed.len() == 1 && trimmed.as_bytes()[0].is_ascii_digit())
 }
 
 fn emit_identical(
@@ -308,27 +532,14 @@ fn emit_identical(
             let mut hits = AHashSet::new();
             for name in chunk {
                 for atom in &name.atoms {
-                    if atom.contract_ids.len() >= 2 {
-                        hits.extend(
-                            atom.contract_ids
-                                .iter()
-                                .map(|&contract_id| (contract_id, atom.chain_id)),
-                        );
+                    if atom.allow_intra && atom.members.len() >= 2 {
+                        record_atom_hits(atom, atom.chain_id, &mut hits);
                     }
                 }
                 for (position, left) in name.atoms.iter().enumerate() {
                     for right in &name.atoms[position + 1..] {
-                        hits.extend(
-                            left.contract_ids
-                                .iter()
-                                .map(|&contract_id| (contract_id, right.chain_id)),
-                        );
-                        hits.extend(
-                            right
-                                .contract_ids
-                                .iter()
-                                .map(|&contract_id| (contract_id, left.chain_id)),
-                        );
+                        record_atom_hits(left, right.chain_id, &mut hits);
+                        record_atom_hits(right, left.chain_id, &mut hits);
                     }
                 }
             }
@@ -340,10 +551,23 @@ fn emit_identical(
     for partial in partials {
         hits.extend(partial?);
     }
-    for (contract_id, peer_chain) in hits {
-        acc.mark_contract_duplicate(store, contract_id, Dimension::Name, peer_chain);
+    for hit in hits {
+        emit_hit(store, acc, hit);
     }
     Ok(())
+}
+
+fn emit_hit(store: &EntityStore, acc: &mut SummaryAccumulator, hit: NameHit) {
+    if let Some(nft_id) = hit.member.nft_id {
+        acc.mark_nft_duplicate(store, nft_id, Dimension::Name, hit.peer_chain);
+    } else {
+        acc.mark_contract_duplicate(
+            store,
+            hit.member.contract_id,
+            Dimension::Name,
+            hit.peer_chain,
+        );
+    }
 }
 
 fn score_resident_index(
@@ -351,7 +575,7 @@ fn score_resident_index(
     names: &[CanonicalName],
     threshold_pct: f64,
     progress: &dyn ProgressObserver,
-) -> Result<AHashSet<(ContractId, ChainId)>, DedupError> {
+) -> Result<NameHits, DedupError> {
     let left_count = names.len().saturating_sub(1);
     progress.begin_phase("score_name", Some(left_count as u64));
     if left_count == 0 {
@@ -421,7 +645,7 @@ fn score_resident_index(
     struct Worker {
         candidates: Vec<u32>,
         seen: CandidateSeen,
-        hits: AHashSet<(ContractId, ChainId)>,
+        hits: NameHits,
     }
 
     let lane_count = rayon::current_num_threads().min(left_count).max(1);
@@ -545,27 +769,26 @@ fn score_resident_index(
     Ok(worker.hits)
 }
 
-fn record_pair_hits(
-    left: &CanonicalName,
-    right: &CanonicalName,
-    hits: &mut AHashSet<(ContractId, ChainId)>,
-) {
+fn record_pair_hits(left: &CanonicalName, right: &CanonicalName, hits: &mut NameHits) {
     for left_atom in &left.atoms {
         for right_atom in &right.atoms {
-            hits.extend(
-                left_atom
-                    .contract_ids
-                    .iter()
-                    .map(|&contract_id| (contract_id, right_atom.chain_id)),
-            );
-            hits.extend(
-                right_atom
-                    .contract_ids
-                    .iter()
-                    .map(|&contract_id| (contract_id, left_atom.chain_id)),
-            );
+            if left_atom.chain_id == right_atom.chain_id
+                && (!left_atom.allow_intra || !right_atom.allow_intra)
+            {
+                continue;
+            }
+            record_atom_hits(left_atom, right_atom.chain_id, hits);
+            record_atom_hits(right_atom, left_atom.chain_id, hits);
         }
     }
+}
+
+fn record_atom_hits(atom: &NameAtom, peer_chain: ChainId, hits: &mut NameHits) {
+    hits.extend(
+        atom.members
+            .iter()
+            .map(|&member| NameHit { member, peer_chain }),
+    );
 }
 
 fn build_right_name_range_ends(names: &[CanonicalName], threshold_pct: f64) -> Vec<usize> {
@@ -681,10 +904,14 @@ mod tests {
     }
 
     fn named(chain: &str, contract: &str, name: &str) -> InputRow {
+        named_token(chain, contract, "1", name)
+    }
+
+    fn named_token(chain: &str, contract: &str, token: &str, name: &str) -> InputRow {
         InputRow {
             chain: chain.to_owned(),
             contract_address: contract.to_owned(),
-            token_id: "1".to_owned(),
+            token_id: token.to_owned(),
             name_norm: name.to_owned(),
             token_uri_norm: String::new(),
             image_uri_norm: String::new(),
@@ -694,6 +921,21 @@ mod tests {
                 file_row_number: 0,
             },
         }
+    }
+
+    fn scope_counts<'a>(
+        store: &EntityStore,
+        acc: &'a SummaryAccumulator,
+        chain: &str,
+    ) -> &'a crate::scope::ScopeCounts {
+        let chain_id = *store.chain_ids.get(chain).unwrap();
+        let key = crate::scope::ScopeKey {
+            kind: crate::entity::ScopeKind::IntraChain,
+            primary_chain: chain_id,
+            secondary_chain: None,
+            dimension: Dimension::Name,
+        };
+        acc.counts().get(&key).unwrap()
     }
 
     #[test]
@@ -736,6 +978,170 @@ mod tests {
             dimension: Dimension::Name,
         };
         assert_eq!(acc.counts().get(&key).unwrap().duplicate_contract_count, 2);
+    }
+
+    #[test]
+    fn evm_contract_uses_most_common_usable_nft_name() {
+        let evm = ["ethereum".to_owned()].into_iter().collect();
+        let mut store = EntityStore::with_options(8, &evm);
+        for (token, name) in [
+            ("1", "none"),
+            ("2", "NONE"),
+            ("3", "7"),
+            ("4", "winner"),
+            ("5", "winner"),
+            ("6", "loser"),
+        ] {
+            store.ingest_row(named_token("ethereum", "a", token, name));
+        }
+        store.ingest_row(named_token("ethereum", "b", "1", "winner"));
+
+        let mut acc = SummaryAccumulator::default();
+        run_name(&store, 0.95, &mut acc, &NoopProgress).unwrap();
+
+        let counts = scope_counts(&store, &acc, "ethereum");
+        assert_eq!(counts.duplicate_contract_count, 2);
+        assert_eq!(counts.duplicate_nft_count, 7);
+    }
+
+    #[test]
+    fn evm_contract_name_tie_uses_lexicographically_smallest_name() {
+        let evm = ["ethereum".to_owned()].into_iter().collect();
+        let mut store = EntityStore::with_options(8, &evm);
+        store.ingest_row(named_token("ethereum", "a", "1", "zeta"));
+        store.ingest_row(named_token("ethereum", "a", "2", "alpha"));
+        store.ingest_row(named_token("ethereum", "b", "1", "alpha"));
+
+        let mut acc = SummaryAccumulator::default();
+        run_name(&store, 1.0, &mut acc, &NoopProgress).unwrap();
+
+        let counts = scope_counts(&store, &acc, "ethereum");
+        assert_eq!(counts.duplicate_contract_count, 2);
+        assert_eq!(counts.duplicate_nft_count, 3);
+    }
+
+    #[test]
+    fn solana_participates_cross_chain_per_nft_but_not_intra_chain() {
+        let mut store = EntityStore::default();
+        store.ingest_row(named_token("solana", "collection-a", "mint-1", "shared"));
+        store.ingest_row(named_token("solana", "collection-a", "mint-2", "unique"));
+        store.ingest_row(named_token("solana", "collection-b", "mint-3", "shared"));
+        store.ingest_row(named_token("ethereum", "evm-a", "1", "shared"));
+        store.ingest_row(named_token("ethereum", "evm-b", "1", "shared"));
+
+        let mut acc = SummaryAccumulator::default();
+        run_name(&store, 1.0, &mut acc, &NoopProgress).unwrap();
+
+        let counts = scope_counts(&store, &acc, "ethereum");
+        assert_eq!(counts.duplicate_contract_count, 2);
+        assert_eq!(counts.duplicate_nft_count, 2);
+        let solana = *store.chain_ids.get("solana").unwrap();
+        let ethereum = *store.chain_ids.get("ethereum").unwrap();
+        let scope = |kind, primary, secondary| crate::scope::ScopeKey {
+            kind,
+            primary_chain: primary,
+            secondary_chain: secondary,
+            dimension: Dimension::Name,
+        };
+        assert!(
+            acc.counts()
+                .get(&scope(crate::entity::ScopeKind::IntraChain, solana, None))
+                .is_none()
+        );
+        let solana_cross = acc
+            .counts()
+            .get(&scope(
+                crate::entity::ScopeKind::ChainMatrix,
+                solana,
+                Some(ethereum),
+            ))
+            .unwrap();
+        assert_eq!(solana_cross.duplicate_contract_count, 2);
+        assert_eq!(solana_cross.duplicate_nft_count, 2);
+        let ethereum_cross = acc
+            .counts()
+            .get(&scope(
+                crate::entity::ScopeKind::ChainMatrix,
+                ethereum,
+                Some(solana),
+            ))
+            .unwrap();
+        assert_eq!(ethereum_cross.duplicate_contract_count, 2);
+        assert_eq!(ethereum_cross.duplicate_nft_count, 2);
+    }
+
+    #[test]
+    fn solana_fuzzy_name_matches_cross_chain_without_intra_chain_hits() {
+        let mut store = EntityStore::default();
+        store.ingest_row(named_token(
+            "solana",
+            "collection-a",
+            "mint-1",
+            "collection",
+        ));
+        store.ingest_row(named_token(
+            "solana",
+            "collection-a",
+            "mint-2",
+            "collectiom",
+        ));
+        store.ingest_row(named_token("ethereum", "evm-a", "1", "collection"));
+
+        let mut acc = SummaryAccumulator::default();
+        run_name(&store, 0.95, &mut acc, &NoopProgress).unwrap();
+
+        let solana = store.chain_ids["solana"];
+        let ethereum = store.chain_ids["ethereum"];
+        let scope = |kind, primary, secondary| crate::scope::ScopeKey {
+            kind,
+            primary_chain: primary,
+            secondary_chain: secondary,
+            dimension: Dimension::Name,
+        };
+        assert!(
+            acc.counts()
+                .get(&scope(crate::entity::ScopeKind::IntraChain, solana, None))
+                .is_none()
+        );
+        let cross = acc
+            .counts()
+            .get(&scope(
+                crate::entity::ScopeKind::ChainMatrix,
+                solana,
+                Some(ethereum),
+            ))
+            .unwrap();
+        assert_eq!(cross.duplicate_contract_count, 1);
+        assert_eq!(cross.duplicate_nft_count, 2);
+    }
+
+    #[test]
+    fn cross_chain_match_counts_each_contracts_logical_nfts() {
+        let evm = ["ethereum".to_owned(), "base".to_owned()]
+            .into_iter()
+            .collect();
+        let mut store = EntityStore::with_options(8, &evm);
+        store.ingest_row(named_token("ethereum", "evm-a", "1", "shared"));
+        store.ingest_row(named_token("ethereum", "evm-a", "2", "shared"));
+        store.ingest_row(named_token("base", "base-a", "1", "shared"));
+
+        let mut acc = SummaryAccumulator::default();
+        run_name(&store, 1.0, &mut acc, &NoopProgress).unwrap();
+
+        let ethereum = *store.chain_ids.get("ethereum").unwrap();
+        let base = *store.chain_ids.get("base").unwrap();
+        let matrix = |primary, secondary| crate::scope::ScopeKey {
+            kind: crate::entity::ScopeKind::ChainMatrix,
+            primary_chain: primary,
+            secondary_chain: Some(secondary),
+            dimension: Dimension::Name,
+        };
+        let evm_counts = acc.counts().get(&matrix(ethereum, base)).unwrap();
+        assert_eq!(evm_counts.duplicate_contract_count, 1);
+        assert_eq!(evm_counts.duplicate_nft_count, 2);
+        let base_counts = acc.counts().get(&matrix(base, ethereum)).unwrap();
+        assert_eq!(base_counts.duplicate_contract_count, 1);
+        assert_eq!(base_counts.duplicate_nft_count, 1);
     }
 
     #[test]

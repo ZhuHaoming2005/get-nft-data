@@ -1,16 +1,29 @@
-use crate::entity::{ChainId, ContractId, Dimension, EntityStore, ScopeKind, StringId};
+use crate::entity::{ChainId, ContractId, Dimension, EntityStore, NftId, ScopeKind, StringId};
 use crate::scope::{ScopeCounts, ScopeKey};
 use ahash::{AHashMap, AHashSet};
 
 #[derive(Clone, Debug, Default)]
 pub struct SummaryAccumulator {
     counted_contracts: AHashMap<ScopeKey, AHashSet<ContractId>>,
+    counted_nfts: AHashMap<ScopeKey, AHashSet<NftId>>,
     /// URI units use interned integer IDs, avoiding one owned URI string per scope hit.
     counted_uri_units: AHashMap<ScopeKey, AHashSet<(ContractId, StringId)>>,
     counts: AHashMap<ScopeKey, ScopeCounts>,
 }
 
 impl SummaryAccumulator {
+    pub(crate) fn merge_unique_contract_counts(&mut self, totals: AHashMap<ScopeKey, ScopeCounts>) {
+        for (key, value) in totals {
+            let target = self.counts.entry(key).or_default();
+            target.duplicate_contract_count = target
+                .duplicate_contract_count
+                .saturating_add(value.duplicate_contract_count);
+            target.duplicate_nft_count = target
+                .duplicate_nft_count
+                .saturating_add(value.duplicate_nft_count);
+        }
+    }
+
     pub fn mark_contract_duplicate(
         &mut self,
         store: &EntityStore,
@@ -61,6 +74,43 @@ impl SummaryAccumulator {
                 .entry(key)
                 .or_default()
                 .add_contract(contract.nft_count);
+        }
+    }
+
+    pub fn mark_nft_duplicate(
+        &mut self,
+        store: &EntityStore,
+        nft_id: NftId,
+        dimension: Dimension,
+        peer_chain: ChainId,
+    ) {
+        let nft = &store.nfts[nft_id as usize];
+        let contract = &store.contracts[nft.contract_id as usize];
+        if contract.chain_id == peer_chain {
+            return;
+        }
+        for (kind, secondary_chain) in [
+            (ScopeKind::CrossChainSummary, None),
+            (ScopeKind::ChainMatrix, Some(peer_chain)),
+        ] {
+            let key = ScopeKey {
+                kind,
+                primary_chain: contract.chain_id,
+                secondary_chain,
+                dimension,
+            };
+            let entry = self.counts.entry(key.clone()).or_default();
+            if self
+                .counted_contracts
+                .entry(key.clone())
+                .or_default()
+                .insert(contract.id)
+            {
+                entry.duplicate_contract_count += 1;
+            }
+            if self.counted_nfts.entry(key).or_default().insert(nft_id) {
+                entry.duplicate_nft_count += 1;
+            }
         }
     }
 
