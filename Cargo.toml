@@ -1,8 +1,14 @@
 [workspace]
 resolver = "2"
 members = [
+    "analysis",
     "top_contract_analysis_rs",
 ]
 
 [profile.test]
 debug = 0
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
