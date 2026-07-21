@@ -2,6 +2,8 @@
 pub struct CandidateBounds;
 
 impl CandidateBounds {
+    const ROUNDING_EPSILON: f64 = 1e-12;
+
     pub fn minimum_multiset_overlap(
         left_len: usize,
         right_len: usize,
@@ -21,7 +23,10 @@ impl CandidateBounds {
         let mut high = max_overlap.saturating_add(1);
         while low < high {
             let middle = low + (high - low) / 2;
-            if Self::optimistic_from_overlap(left_len, right_len, middle) >= threshold_pct {
+            if Self::reaches_threshold(
+                Self::optimistic_from_overlap(left_len, right_len, middle),
+                threshold_pct,
+            ) {
                 high = middle;
             } else {
                 low = middle + 1;
@@ -31,7 +36,14 @@ impl CandidateBounds {
     }
 
     pub fn lengths_can_reach(left_len: usize, right_len: usize, threshold_pct: f64) -> bool {
-        Self::upper_bound_from_lengths(left_len, right_len) >= threshold_pct
+        Self::reaches_threshold(
+            Self::upper_bound_from_lengths(left_len, right_len),
+            threshold_pct,
+        )
+    }
+
+    fn reaches_threshold(upper_bound: f64, threshold_pct: f64) -> bool {
+        upper_bound >= threshold_pct || threshold_pct - upper_bound <= Self::ROUNDING_EPSILON
     }
 
     fn optimistic_from_overlap(left_len: usize, right_len: usize, overlap: usize) -> f64 {
@@ -109,26 +121,28 @@ mod tests {
     #[test]
     fn production_bounds_cover_exhaustive_small_alphabet_hits() {
         let values = strings(7);
-        for left in &values {
-            for right in &values {
-                let score = jaro_winkler::similarity(left.chars(), right.chars()) * 100.0;
-                if score < 95.0 {
-                    continue;
+        for threshold_pct in [0.0, 50.0, 80.0, 95.0, 98.0, 100.0] {
+            for left in &values {
+                for right in &values {
+                    let score = jaro_winkler::similarity(left.chars(), right.chars()) * 100.0;
+                    if score < threshold_pct {
+                        continue;
+                    }
+                    assert!(CandidateBounds::lengths_can_reach(
+                        left.chars().count(),
+                        right.chars().count(),
+                        threshold_pct
+                    ));
+                    assert!(
+                        multiset_overlap(left, right)
+                            >= CandidateBounds::minimum_multiset_overlap(
+                                left.chars().count(),
+                                right.chars().count(),
+                                threshold_pct
+                            ),
+                        "missed overlap bound for {left:?} vs {right:?} at {score} (threshold={threshold_pct})"
+                    );
                 }
-                assert!(CandidateBounds::lengths_can_reach(
-                    left.chars().count(),
-                    right.chars().count(),
-                    95.0
-                ));
-                assert!(
-                    multiset_overlap(left, right)
-                        >= CandidateBounds::minimum_multiset_overlap(
-                            left.chars().count(),
-                            right.chars().count(),
-                            95.0
-                        ),
-                    "missed overlap bound for {left:?} vs {right:?} at {score}"
-                );
             }
         }
     }

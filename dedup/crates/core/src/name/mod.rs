@@ -4,10 +4,11 @@
 
 mod candidate_bounds;
 
-use crate::entity::{ChainId, ContractId, Dimension, EntityStore, NftId};
+use crate::entity::{ChainId, ContractId, Dimension, EntityStore, NftId, ScopeKind};
 use crate::error::DedupError;
 use crate::progress::ProgressObserver;
 use crate::radix::{sort_u32_pairs_while, sort_u32_triples_while, sort_u64_while};
+use crate::scope::{ScopeCounts, ScopeKey};
 use crate::stats::SummaryAccumulator;
 use ahash::{AHashMap, AHashSet};
 use candidate_bounds::CandidateBounds;
@@ -21,10 +22,44 @@ const SCORE_SCHEDULING_CHUNK: usize = 8;
 const DENSE_SEEN_BUDGET_BYTES: usize = 4 * 1024 * 1024 * 1024;
 type NameHits = AHashSet<NameHit>;
 
+#[derive(Default)]
+struct IntraNftHits {
+    by_chain: AHashMap<ChainId, (AHashSet<ContractId>, AHashSet<NftId>)>,
+}
+
+impl IntraNftHits {
+    fn insert(&mut self, chain_id: ChainId, contract_id: ContractId, nft_id: NftId) {
+        let (contracts, nfts) = self.by_chain.entry(chain_id).or_default();
+        contracts.insert(contract_id);
+        nfts.insert(nft_id);
+    }
+
+    fn merge_into(self, acc: &mut SummaryAccumulator) {
+        acc.merge_unique_contract_counts(
+            self.by_chain
+                .into_iter()
+                .map(|(chain_id, (contracts, nfts))| {
+                    (
+                        ScopeKey {
+                            kind: ScopeKind::IntraChain,
+                            primary_chain: chain_id,
+                            secondary_chain: None,
+                            dimension: Dimension::Name,
+                        },
+                        ScopeCounts {
+                            duplicate_contract_count: contracts.len() as u64,
+                            duplicate_nft_count: nfts.len() as u64,
+                        },
+                    )
+                })
+                .collect(),
+        );
+    }
+}
+
 #[derive(Clone, Debug)]
 struct NameAtom {
     chain_id: ChainId,
-    allow_intra: bool,
     members: Vec<NameMember>,
 }
 
@@ -45,13 +80,6 @@ struct CanonicalName {
     text: String,
     characters: Vec<char>,
     atoms: Vec<NameAtom>,
-    query_side: bool,
-}
-
-impl CanonicalName {
-    fn is_passive_solana(&self) -> bool {
-        !self.query_side
-    }
 }
 
 /// Resident candidate index (name_uri `ResidentNameCandidateIndex`).
@@ -274,10 +302,12 @@ pub fn run_name(
 
     progress.set_stage("name");
     let names = atomize(store, progress)?;
+    let mut intra_nft_hits = IntraNftHits::default();
     progress.begin_phase("identical", Some(names.len() as u64));
-    emit_identical(&names, store, acc, progress)?;
+    emit_identical(&names, store, acc, &mut intra_nft_hits, progress)?;
 
     if names.len() < 2 {
+        intra_nft_hits.merge_into(acc);
         return Ok(());
     }
 
@@ -288,11 +318,12 @@ pub fn run_name(
     let mut completed = 0_u64;
     for hit in hits {
         progress.check_cancelled()?;
-        emit_hit(store, acc, hit);
+        emit_hit(store, acc, &mut intra_nft_hits, hit);
         completed += 1;
         flush_progress(&mut completed, progress)?;
     }
     flush_remaining(&mut completed, progress);
+    intra_nft_hits.merge_into(acc);
     Ok(())
 }
 
@@ -469,7 +500,6 @@ fn atomize(
             }
             atoms.push(NameAtom {
                 chain_id,
-                allow_intra: !store.is_solana_chain(chain_id),
                 members: selected[start..selected_index]
                     .iter()
                     .map(|entry| logical_members[entry.2 as usize].2)
@@ -483,7 +513,6 @@ fn atomize(
         names.push(CanonicalName {
             text,
             characters,
-            query_side: atoms.iter().any(|atom| atom.allow_intra),
             atoms,
         });
     }
@@ -530,6 +559,7 @@ fn emit_identical(
     names: &[CanonicalName],
     store: &EntityStore,
     acc: &mut SummaryAccumulator,
+    intra_nft_hits: &mut IntraNftHits,
     progress: &dyn ProgressObserver,
 ) -> Result<(), DedupError> {
     const CHUNK: usize = 4096;
@@ -540,7 +570,7 @@ fn emit_identical(
             let mut hits = AHashSet::new();
             for name in chunk {
                 for atom in &name.atoms {
-                    if atom.allow_intra && atom.members.len() >= 2 {
+                    if atom.members.len() >= 2 {
                         record_atom_hits(atom, atom.chain_id, &mut hits);
                     }
                 }
@@ -560,14 +590,24 @@ fn emit_identical(
         hits.extend(partial?);
     }
     for hit in hits {
-        emit_hit(store, acc, hit);
+        emit_hit(store, acc, intra_nft_hits, hit);
     }
     Ok(())
 }
 
-fn emit_hit(store: &EntityStore, acc: &mut SummaryAccumulator, hit: NameHit) {
+fn emit_hit(
+    store: &EntityStore,
+    acc: &mut SummaryAccumulator,
+    intra_nft_hits: &mut IntraNftHits,
+    hit: NameHit,
+) {
     if let Some(nft_id) = hit.member.nft_id {
-        acc.mark_nft_duplicate(store, nft_id, Dimension::Name, hit.peer_chain);
+        let chain_id = store.contracts[hit.member.contract_id as usize].chain_id;
+        if chain_id == hit.peer_chain {
+            intra_nft_hits.insert(chain_id, hit.member.contract_id, nft_id);
+        } else {
+            acc.mark_nft_duplicate(store, nft_id, Dimension::Name, hit.peer_chain);
+        }
     } else {
         acc.mark_contract_duplicate(
             store,
@@ -584,14 +624,12 @@ fn score_resident_index(
     threshold_pct: f64,
     progress: &dyn ProgressObserver,
 ) -> Result<NameHits, DedupError> {
-    let query_names = query_name_ids(names);
-    let left_count = query_names.len();
+    let left_count = names.len().saturating_sub(1);
     progress.begin_phase("score_name", Some(left_count as u64));
     if left_count == 0 {
         return Ok(AHashSet::new());
     }
 
-    let left_starts = build_left_name_range_starts(names, threshold_pct);
     let right_ends = build_right_name_range_ends(names, threshold_pct);
     let cancelled = AtomicU64::new(0);
     let score_cutoff = (threshold_pct / 100.0).clamp(0.0, 1.0);
@@ -680,62 +718,48 @@ fn score_resident_index(
                 if start >= left_count || cancelled.load(Ordering::Relaxed) != 0 {
                     break;
                 }
-                for &left in query_names
-                    .iter()
-                    .take((start + SCORE_SCHEDULING_CHUNK).min(left_count))
-                    .skip(start)
-                {
-                    let left = left as usize;
+                for left in start..(start + SCORE_SCHEDULING_CHUNK).min(left_count) {
                     worker.candidates.clear();
                     worker.seen.begin_name();
-                    let mut collect_range =
-                        |range_start: usize, range_end: usize, passive_only: bool| {
-                            if range_start >= range_end {
-                                return;
-                            }
-                            let minimum_overlap = CandidateBounds::minimum_multiset_overlap(
-                                names[left].characters.len(),
-                                names[range_start].characters.len(),
-                                threshold_pct,
-                            );
+                    let mut collect_range = |range_start: usize, range_end: usize| {
+                        if range_start >= range_end {
+                            return;
+                        }
+                        let minimum_overlap = CandidateBounds::minimum_multiset_overlap(
+                            names[left].characters.len(),
+                            names[range_start].characters.len(),
+                            threshold_pct,
+                        );
 
-                            if minimum_overlap == 0 {
-                                worker.candidates.extend(
-                                    (range_start..range_end)
-                                        .filter(|&right| {
-                                            !passive_only || names[right].is_passive_solana()
-                                        })
-                                        .map(|right| right as u32),
-                                );
-                            } else {
-                                let prefix = index.prefix(left);
-                                let prefix_len = prefix
-                                    .len()
-                                    .saturating_sub(minimum_overlap)
-                                    .saturating_add(1)
-                                    .min(prefix.len());
-                                let compact_start = range_start as u32;
-                                let compact_end = range_end as u32;
-                                for &token_id in &prefix[..prefix_len] {
-                                    let posting = index.posting(token_id);
-                                    let lo = posting.partition_point(|&a| a < compact_start);
-                                    let hi = posting.partition_point(|&a| a < compact_end);
-                                    for &candidate in &posting[lo..hi] {
-                                        if (!passive_only
-                                            || names[candidate as usize].is_passive_solana())
-                                            && worker.seen.insert(candidate)
-                                        {
-                                            worker.candidates.push(candidate);
-                                        }
+                        if minimum_overlap == 0 {
+                            worker
+                                .candidates
+                                .extend((range_start..range_end).map(|right| right as u32));
+                        } else {
+                            let prefix = index.prefix(left);
+                            let prefix_len = prefix
+                                .len()
+                                .saturating_sub(minimum_overlap)
+                                .saturating_add(1)
+                                .min(prefix.len());
+                            let compact_start = range_start as u32;
+                            let compact_end = range_end as u32;
+                            for &token_id in &prefix[..prefix_len] {
+                                let posting = index.posting(token_id);
+                                let lo = posting.partition_point(|&a| a < compact_start);
+                                let hi = posting.partition_point(|&a| a < compact_end);
+                                for &candidate in &posting[lo..hi] {
+                                    if worker.seen.insert(candidate) {
+                                        worker.candidates.push(candidate);
                                     }
                                 }
                             }
-                        };
+                        }
+                    };
 
-                    collect_range(left_starts[left], left, true);
                     let right_start = left + 1;
                     let right_end = right_ends.get(left).copied().unwrap_or(names.len());
-                    collect_range(right_start, right_end, false);
+                    collect_range(right_start, right_end);
 
                     worker.candidates.retain(|&right| {
                         resident_candidate_passes_overlap(
@@ -799,29 +823,9 @@ fn score_resident_index(
     Ok(worker.hits)
 }
 
-fn query_name_ids(names: &[CanonicalName]) -> Vec<u32> {
-    let mut passive_before = false;
-    let mut query_names = Vec::new();
-    for (name_id, name) in names.iter().enumerate() {
-        if name.query_side {
-            if name_id + 1 < names.len() || passive_before {
-                query_names.push(name_id as u32);
-            }
-        } else {
-            passive_before = true;
-        }
-    }
-    query_names
-}
-
 fn record_pair_hits(left: &CanonicalName, right: &CanonicalName, hits: &mut NameHits) {
     for left_atom in &left.atoms {
         for right_atom in &right.atoms {
-            if left_atom.chain_id == right_atom.chain_id
-                && (!left_atom.allow_intra || !right_atom.allow_intra)
-            {
-                continue;
-            }
             record_atom_hits(left_atom, right_atom.chain_id, hits);
             record_atom_hits(right_atom, left_atom.chain_id, hits);
         }
@@ -854,24 +858,6 @@ fn build_right_name_range_ends(names: &[CanonicalName], threshold_pct: f64) -> V
         ends.push(right);
     }
     ends
-}
-
-fn build_left_name_range_starts(names: &[CanonicalName], threshold_pct: f64) -> Vec<usize> {
-    let mut starts = Vec::with_capacity(names.len());
-    let mut left = 0usize;
-    for right in 0..names.len() {
-        while left < right
-            && !CandidateBounds::lengths_can_reach(
-                names[left].characters.len(),
-                names[right].characters.len(),
-                threshold_pct,
-            )
-        {
-            left += 1;
-        }
-        starts.push(left);
-    }
-    starts
 }
 
 fn resident_candidate_passes_overlap(
@@ -1088,7 +1074,7 @@ mod tests {
     }
 
     #[test]
-    fn solana_participates_cross_chain_per_nft_but_not_intra_chain() {
+    fn solana_participates_intra_and_cross_chain_per_nft() {
         let mut store = EntityStore::default();
         store.ingest_row(named_token("solana", "collection-a", "mint-1", "shared"));
         store.ingest_row(named_token("solana", "collection-a", "mint-2", "unique"));
@@ -1110,11 +1096,12 @@ mod tests {
             secondary_chain: secondary,
             dimension: Dimension::Name,
         };
-        assert!(
-            acc.counts()
-                .get(&scope(crate::entity::ScopeKind::IntraChain, solana, None))
-                .is_none()
-        );
+        let solana_intra = acc
+            .counts()
+            .get(&scope(crate::entity::ScopeKind::IntraChain, solana, None))
+            .unwrap();
+        assert_eq!(solana_intra.duplicate_contract_count, 2);
+        assert_eq!(solana_intra.duplicate_nft_count, 2);
         let solana_cross = acc
             .counts()
             .get(&scope(
@@ -1138,7 +1125,21 @@ mod tests {
     }
 
     #[test]
-    fn solana_fuzzy_name_matches_cross_chain_without_intra_chain_hits() {
+    fn solana_identical_names_in_one_contract_count_each_nft_once() {
+        let mut store = EntityStore::default();
+        store.ingest_row(named_token("solana", "collection-a", "mint-1", "shared"));
+        store.ingest_row(named_token("solana", "collection-a", "mint-2", "shared"));
+
+        let mut acc = SummaryAccumulator::default();
+        run_name(&store, 1.0, &mut acc, &NoopProgress).unwrap();
+
+        let counts = scope_counts(&store, &acc, "solana");
+        assert_eq!(counts.duplicate_contract_count, 1);
+        assert_eq!(counts.duplicate_nft_count, 2);
+    }
+
+    #[test]
+    fn solana_fuzzy_name_matches_intra_and_cross_chain_per_nft() {
         let mut store = EntityStore::default();
         store.ingest_row(named_token(
             "solana",
@@ -1165,11 +1166,12 @@ mod tests {
             secondary_chain: secondary,
             dimension: Dimension::Name,
         };
-        assert!(
-            acc.counts()
-                .get(&scope(crate::entity::ScopeKind::IntraChain, solana, None))
-                .is_none()
-        );
+        let intra = acc
+            .counts()
+            .get(&scope(crate::entity::ScopeKind::IntraChain, solana, None))
+            .unwrap();
+        assert_eq!(intra.duplicate_contract_count, 1);
+        assert_eq!(intra.duplicate_nft_count, 2);
         let cross = acc
             .counts()
             .get(&scope(
@@ -1183,7 +1185,7 @@ mod tests {
     }
 
     #[test]
-    fn solana_only_names_are_passive_fuzzy_index_entries() {
+    fn solana_only_names_are_active_fuzzy_queries() {
         let mut store = EntityStore::default();
         store.ingest_row(named_token(
             "solana",
@@ -1199,18 +1201,16 @@ mod tests {
         ));
 
         let names = atomize(&store, &NoopProgress).unwrap();
-        assert!(names.iter().all(CanonicalName::is_passive_solana));
-        assert!(query_name_ids(&names).is_empty());
         let index = ResidentNameIndex::build(&names, &NoopProgress).unwrap();
         let progress = ScoreProgress::default();
         let hits = score_resident_index(&index, &names, 95.0, &progress).unwrap();
-        assert!(hits.is_empty());
-        assert_eq!(*progress.score_total.lock().unwrap(), Some(0));
-        assert!(progress.score_deltas.lock().unwrap().is_empty());
+        assert_eq!(hits.len(), 2);
+        assert_eq!(*progress.score_total.lock().unwrap(), Some(1));
+        assert_eq!(progress.score_deltas.lock().unwrap().iter().sum::<u64>(), 1);
     }
 
     #[test]
-    fn evm_query_finds_an_earlier_passive_solana_name() {
+    fn solana_query_finds_a_later_evm_name() {
         let mut store = EntityStore::default();
         store.ingest_row(named_token(
             "solana",
@@ -1222,9 +1222,6 @@ mod tests {
 
         let names = atomize(&store, &NoopProgress).unwrap();
         assert_eq!(names.len(), 2);
-        assert!(names[0].is_passive_solana());
-        assert!(names[1].query_side);
-        assert_eq!(query_name_ids(&names), vec![1]);
         let index = ResidentNameIndex::build(&names, &NoopProgress).unwrap();
         let hits = score_resident_index(&index, &names, 95.0, &NoopProgress).unwrap();
         assert_eq!(hits.len(), 2);
@@ -1301,12 +1298,20 @@ mod tests {
                         names[left].characters.iter().copied(),
                         names[right].characters.iter().copied(),
                     );
-                    if score * 100.0 >= threshold_pct {
+                    if score >= threshold_pct / 100.0 {
                         record_pair_hits(&names[left], &names[right], &mut expected);
                     }
                 }
             }
-            assert_eq!(actual, expected, "threshold={threshold_pct}");
+            if actual != expected {
+                let unexpected = actual.difference(&expected).take(10).collect::<Vec<_>>();
+                let missing = expected.difference(&actual).take(10).collect::<Vec<_>>();
+                panic!(
+                    "threshold={threshold_pct} actual={} expected={} unexpected={unexpected:?} missing={missing:?}",
+                    actual.len(),
+                    expected.len()
+                );
+            }
         }
     }
 
