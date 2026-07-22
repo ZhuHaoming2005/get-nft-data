@@ -174,15 +174,18 @@ polygon,0x2222222222222222222222222222222222222222
 solana,So11111111111111111111111111111111111111112
 ```
 
-可先按链独立抓取 OpenSea Top 合约种子。默认四链各取 100 个去重地址，只有四条链都完整获得 100 个时才原子替换正式 CSV 和审计 JSON：
+可先按链独立抓取 Top 合约种子：Ethereum、Base、Polygon 使用 OpenSea 30 天成交量榜，Solana 使用 Magic Eden 30 天热门集合榜。默认四链各取 100 个去重地址，只有四条链都完整获得 100 个时才原子替换正式 CSV 和审计 JSON：
 
 ```bash
 python scripts/fetch_opensea_top_seeds.py \
   --api-key "2d17a25e68714720883ac996f5459b17" \
+  --helius-api-key "$HELIUS_API_KEY" \
   --limit 100 \
   --contracts-output ./seeds/top_contracts.csv \
   --audit-output ./seeds/top_contracts.audit.json
 ```
+
+Magic Eden 热门榜只返回 collection symbol；脚本会从 listing（无 listing 时回退到 activity）抽取一个 NFT mint，再通过 Helius `getAsset` 解析认证 collection address。因此只要包含 `solana`，就必须传入 `--helius-api-key` 或设置 `HELIUS_API_KEY`；仅抓取 EVM 时不需要 Helius key。
 
 运行示例：
 

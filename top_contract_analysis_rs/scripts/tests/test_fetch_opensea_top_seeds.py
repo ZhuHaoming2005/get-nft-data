@@ -98,11 +98,157 @@ class FetchOpenSeaTopSeedsTest(unittest.TestCase):
         self.assertEqual(audit["contracts"][1]["collection_rank"], 2)
         self.assertEqual(audit["contracts"][1]["raw_chain"], "Solana")
         self.assertEqual(audit["contracts"][0]["raw_chain"], "ethereum")
+        self.assertEqual(audit["provider_by_chain"]["solana"], "magic_eden")
+        self.assertEqual(
+            audit["ranking_criterion_by_chain"]["solana"],
+            "magic_eden_30d_popularity",
+        )
+
+    def test_collect_ranked_solana_contracts_uses_magic_eden_addresses(self):
+        address_a = "So11111111111111111111111111111111111111112"
+        address_b = "11111111111111111111111111111111"
+        calls = []
+
+        def fake_fetch(url, timeout):
+            calls.append((url, timeout))
+            if "/listings?" in url or "/activities?" in url:
+                return b"[]"
+            return json.dumps(
+                {
+                    "collections": [
+                        {
+                            "symbol": "missing-certified-address",
+                            "name": "Skipped",
+                            "candyMachineIds": [address_a],
+                        },
+                        {
+                            "symbol": "first",
+                            "name": "First",
+                            "onChainCollectionAddress": address_a,
+                            "volume": 20,
+                        },
+                        {
+                            "symbol": "duplicate",
+                            "onChainCollectionAddress": address_a,
+                        },
+                        {
+                            "symbol": "second",
+                            "collectionAddress": address_b,
+                            "volumeAll": 10,
+                        },
+                    ]
+                }
+            ).encode()
+
+        ranked = fetch_seeds.collect_ranked_solana_contracts(
+            limit=2,
+            top_collections_url="https://magic.example/top?source=test",
+            magic_eden_api_url="https://magic.example/v2",
+            helius_rpc_url="https://helius.example/?api-key=key",
+            timeout=1.0,
+            magic_eden_fetcher=fake_fetch,
+        )
+
+        self.assertEqual(
+            [(row.address, row.collection_rank, row.provider) for row in ranked],
+            [
+                (address_a, 2, "magic_eden"),
+                (address_b, 4, "magic_eden"),
+            ],
+        )
+        self.assertIn("source=test&timeRange=30d", calls[0][0])
+
+    def test_magic_eden_symbol_is_resolved_through_listing_and_helius(self):
+        mint = "Cs4TtkiphY3Yzor5qPrfSoAzWqHUD1JnTWAxyXrS3sS3"
+        collection_address = "So11111111111111111111111111111111111111112"
+        magic_calls = []
+        helius_calls = []
+
+        def fake_magic_fetch(url, timeout):
+            magic_calls.append(url)
+            if "popular_collections" in url:
+                return json.dumps(
+                    [{"symbol": "first/collection", "name": "First"}]
+                ).encode()
+            return json.dumps([{"tokenMint": mint}]).encode()
+
+        def fake_helius_fetch(url, payload, timeout):
+            helius_calls.append((url, payload))
+            return json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "result": {
+                        "grouping": [
+                            {
+                                "group_key": "collection",
+                                "group_value": collection_address,
+                            }
+                        ]
+                    },
+                }
+            ).encode()
+
+        ranked = fetch_seeds.collect_ranked_solana_contracts(
+            limit=1,
+            top_collections_url="https://magic.example/v2/marketplace/popular_collections",
+            magic_eden_api_url="https://magic.example/v2",
+            helius_rpc_url="https://helius.example/?api-key=key",
+            timeout=1.0,
+            magic_eden_fetcher=fake_magic_fetch,
+            helius_fetcher=fake_helius_fetch,
+        )
+
+        self.assertEqual(ranked[0].address, collection_address)
+        self.assertIn("first%2Fcollection/listings", magic_calls[1])
+        self.assertEqual(helius_calls[0][1]["method"], "getAsset")
+        self.assertEqual(helius_calls[0][1]["params"]["id"], mint)
+
+    def test_short_magic_eden_result_is_an_error(self):
+        with self.assertRaisesRegex(ValueError, "Magic Eden.*collected 0"):
+            fetch_seeds.collect_ranked_solana_contracts(
+                limit=1,
+                top_collections_url="https://magic.example/top",
+                magic_eden_api_url="https://magic.example/v2",
+                helius_rpc_url="https://helius.example/?api-key=key",
+                timeout=1.0,
+                magic_eden_fetcher=lambda *_args, **_kwargs: b'{"collections": []}',
+            )
 
     def test_parse_args_does_not_embed_an_opensea_api_key(self):
         args = fetch_seeds.parse_args([])
 
         self.assertEqual(args.api_key, "")
+
+    def test_solana_only_run_does_not_require_an_opensea_api_key(self):
+        row = fetch_seeds.RankedContract(
+            chain="solana",
+            address="So11111111111111111111111111111111111111112",
+            chain_contract_rank=1,
+            collection_rank=1,
+            slug="solana-first",
+            name="Solana First",
+            ranking_value=1,
+            provider="magic_eden",
+            ranking_criterion=fetch_seeds.SOLANA_SORT_BY,
+        )
+        with patch.dict(
+            fetch_seeds.os.environ,
+            {"OPENSEA_API_KEY": "", "HELIUS_API_KEY": "helius-key"},
+        ), patch.object(
+            fetch_seeds,
+            "collect_ranked_solana_contracts",
+            return_value=[row],
+        ) as solana_collector, patch.object(
+            fetch_seeds, "collect_ranked_contracts_for_chain"
+        ) as opensea_collector, patch.object(
+            fetch_seeds, "write_contract_rank_outputs"
+        ) as writer:
+            result = fetch_seeds.main(["--chains", "solana", "--limit", "1"])
+
+        self.assertEqual(result, 0)
+        solana_collector.assert_called_once()
+        opensea_collector.assert_not_called()
+        writer.assert_called_once()
 
     def test_each_chain_uses_an_independent_cursor_sequence(self):
         calls = []
