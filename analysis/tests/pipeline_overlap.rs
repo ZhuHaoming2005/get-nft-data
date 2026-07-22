@@ -7,19 +7,19 @@
 //! path, with no seed marked `incomplete` by the dimension-level
 //! `ShardWorkTracker`s wired around the Name/URI folds.
 
+use analysis::config::{NumaMode, ProviderConcurrency, RunConfig};
+use analysis::model::{ChainId, InputRow, SeedId, SourceOrder};
+use analysis::pipeline::{CandidateRelationsEvent, CpuExecutor};
+use analysis::progress::Progress;
+use analysis::resident::ResidentBuilder;
+use analysis::seed::{SeedDefinition, SeedManifest};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use top_contract_analysis::config::{NumaMode, ProviderConcurrency, RunConfig};
-use top_contract_analysis::model::{ChainId, InputRow, SeedId, SourceOrder};
-use top_contract_analysis::pipeline::{CandidateRelationsEvent, CpuExecutor};
-use top_contract_analysis::progress::Progress;
-use top_contract_analysis::resident::ResidentBuilder;
-use top_contract_analysis::seed::{SeedDefinition, SeedManifest};
 
 fn test_executor() -> CpuExecutor {
     #[cfg(not(target_os = "linux"))]
     {
-        use top_contract_analysis::platform::WorkerPlacement;
+        use analysis::platform::WorkerPlacement;
         CpuExecutor::new_numa_bounded(
             4,
             16,
@@ -73,7 +73,7 @@ fn row(
 /// Small four-chain fixture with a seed (`seed-collection`) and three
 /// candidates that duplicate it by name, token URI, and metadata
 /// respectively, plus one unrelated contract so shard work is non-trivial.
-fn fixture() -> top_contract_analysis::resident::ResidentBaseStore {
+fn fixture() -> analysis::resident::ResidentBaseStore {
     let mut builder = ResidentBuilder::default();
     for input in [
         row(
@@ -171,12 +171,10 @@ fn base_config(now: chrono::DateTime<chrono::Utc>) -> RunConfig {
 }
 
 fn manifest(
-    store: &top_contract_analysis::resident::ResidentBaseStore,
+    store: &analysis::resident::ResidentBaseStore,
     now: chrono::DateTime<chrono::Utc>,
 ) -> SeedManifest {
-    let seed_key = store
-        .contracts
-        .key(top_contract_analysis::model::ContractId(0));
+    let seed_key = store.contracts.key(analysis::model::ContractId(0));
     SeedManifest {
         generated_at: now,
         seeds: vec![SeedDefinition {
@@ -261,7 +259,7 @@ fn overlap_path_engages_and_matches_serial_dimension_ordering() {
     );
 
     let (serial_tx, serial_rx) = tokio::sync::mpsc::channel(64);
-    top_contract_analysis::pipeline::execute_dedup(
+    analysis::pipeline::execute_dedup(
         fixture(),
         &serial_manifest,
         &serial_config,
@@ -280,7 +278,7 @@ fn overlap_path_engages_and_matches_serial_dimension_ordering() {
     let mut overlap_config = serial_config.clone();
     overlap_config.next_dimension_overlap = true;
     let (overlap_tx, overlap_rx) = tokio::sync::mpsc::channel(64);
-    top_contract_analysis::pipeline::execute_dedup(
+    analysis::pipeline::execute_dedup(
         fixture(),
         &serial_manifest,
         &overlap_config,

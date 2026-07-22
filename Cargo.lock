@@ -58,6 +58,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "analysis"
+version = "0.1.0"
+dependencies = [
+ "ahash 0.8.12",
+ "arrow-array",
+ "arrow-schema",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "clap",
+ "csv",
+ "futures-util",
+ "libc",
+ "parking_lot",
+ "parquet",
+ "rapidfuzz",
+ "rayon",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "toml",
+ "unicode-normalization",
+ "zstd",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3502,36 +3532,6 @@ name = "toml_writer"
 version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
-
-[[package]]
-name = "top_contract_analysis_rewrite"
-version = "0.1.0"
-dependencies = [
- "ahash 0.8.12",
- "arrow-array",
- "arrow-schema",
- "async-trait",
- "bytes",
- "chrono",
- "clap",
- "csv",
- "futures-util",
- "libc",
- "parking_lot",
- "parquet",
- "rapidfuzz",
- "rayon",
- "reqwest",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "toml",
- "unicode-normalization",
- "zstd",
-]
 
 [[package]]
 name = "top_contract_analysis_rs"

@@ -1,15 +1,13 @@
+use analysis::config::{NumaMode, ProviderConcurrency, RunConfig};
+use analysis::dedup::{
+    query_metadata_shard, query_metadata_shard_with_plan, query_name_shard, query_uri_shard,
+};
+use analysis::model::{ChainId, ContractId, InputRow, SeedId, SourceOrder};
+use analysis::resident::{MetadataIndex, NameIndex, ResidentBuilder, SeedRawQuery, UriIndex};
+use analysis::seed::{SeedDefinition, SeedManifest};
 use rapidfuzz::distance::jaro_winkler;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use top_contract_analysis::config::{NumaMode, ProviderConcurrency, RunConfig};
-use top_contract_analysis::dedup::{
-    query_metadata_shard, query_metadata_shard_with_plan, query_name_shard, query_uri_shard,
-};
-use top_contract_analysis::model::{ChainId, ContractId, InputRow, SeedId, SourceOrder};
-use top_contract_analysis::resident::{
-    MetadataIndex, NameIndex, ResidentBuilder, SeedRawQuery, UriIndex,
-};
-use top_contract_analysis::seed::{SeedDefinition, SeedManifest};
 
 fn row(
     identity: (ChainId, &str, &str),
@@ -33,7 +31,7 @@ fn row(
     }
 }
 
-fn fixture() -> top_contract_analysis::resident::ResidentBaseStore {
+fn fixture() -> analysis::resident::ResidentBaseStore {
     let mut builder = ResidentBuilder::default();
     for (index, input) in [
         row(
@@ -86,7 +84,7 @@ fn fixture() -> top_contract_analysis::resident::ResidentBaseStore {
     builder.finish(8, 128).unwrap()
 }
 
-fn seed_query(store: &top_contract_analysis::resident::ResidentBaseStore) -> SeedRawQuery {
+fn seed_query(store: &analysis::resident::ResidentBaseStore) -> SeedRawQuery {
     let contract_id = ContractId(0);
     let uri = store.uri_features.as_ref().unwrap();
     let name = store.name_features.as_ref().unwrap();
@@ -94,9 +92,7 @@ fn seed_query(store: &top_contract_analysis::resident::ResidentBaseStore) -> See
     let token_uri = uri.features[0].token_uri.unwrap();
     let image_uri = uri.features[0].image_uri.unwrap();
     let profile = metadata.contract_profiles[0].unwrap();
-    let evidence_nft = store
-        .nft_key(top_contract_analysis::model::NftId(0))
-        .unwrap();
+    let evidence_nft = store.nft_key(analysis::model::NftId(0)).unwrap();
     SeedRawQuery {
         seed_id: SeedId(0),
         contract_id,
@@ -164,15 +160,15 @@ fn uri_priority_and_all_four_chains_are_preserved() {
         .collect::<Vec<_>>();
     assert!(hits.iter().any(|hit| {
         hit.candidate_contract == ContractId(1)
-            && hit.dimension == top_contract_analysis::model::Dimension::TokenUri
+            && hit.dimension == analysis::model::Dimension::TokenUri
     }));
     assert!(hits.iter().any(|hit| {
         hit.candidate_contract == ContractId(2)
-            && hit.dimension == top_contract_analysis::model::Dimension::ImageUri
+            && hit.dimension == analysis::model::Dimension::ImageUri
     }));
     assert!(!hits.iter().any(|hit| {
         hit.candidate_contract == ContractId(1)
-            && hit.dimension == top_contract_analysis::model::Dimension::ImageUri
+            && hit.dimension == analysis::model::Dimension::ImageUri
     }));
 }
 
@@ -275,7 +271,7 @@ fn randomized_name_and_metadata_indexes_cover_exhaustive_matches() {
         .map(|ordinal| {
             store
                 .contracts
-                .find(&top_contract_analysis::model::ContractKey::new(
+                .find(&analysis::model::ContractKey::new(
                     chains[ordinal % chains.len()],
                     format!("contract-{ordinal:03}"),
                 ))
@@ -428,19 +424,18 @@ fn metadata_exact_prefetch_is_emitted_before_frozen_relations() {
         metadata_anchor_count: 8,
         analysis_timestamp: now,
     };
-    let executor = top_contract_analysis::pipeline::CpuExecutor::new(4).unwrap();
-    let progress = top_contract_analysis::progress::Progress::default();
+    let executor = analysis::pipeline::CpuExecutor::new(4).unwrap();
+    let progress = analysis::progress::Progress::default();
     let (sender, mut receiver) = tokio::sync::mpsc::channel(32);
-    let dedup = top_contract_analysis::pipeline::execute_dedup(
-        store, &manifest, &config, &executor, &progress, sender,
-    )
-    .unwrap();
+    let dedup =
+        analysis::pipeline::execute_dedup(store, &manifest, &config, &executor, &progress, sender)
+            .unwrap();
     assert!(dedup.store.uri_identity.is_none());
     assert!(dedup.store.uri_features.is_none());
     assert!(dedup.store.name_features.is_none());
     assert!(dedup.store.metadata_features.is_none());
     let catalog_bytes = dedup.store.contracts.contracts.len() as u64
-        * std::mem::size_of::<top_contract_analysis::model::ContractRecord>() as u64
+        * std::mem::size_of::<analysis::model::ContractRecord>() as u64
         + dedup
             .store
             .contracts
@@ -456,10 +451,9 @@ fn metadata_exact_prefetch_is_emitted_before_frozen_relations() {
     let first_prefetch = events
         .iter()
         .position(|event| match event {
-            top_contract_analysis::pipeline::CandidateRelationsEvent::Prefetch(relations) => {
+            analysis::pipeline::CandidateRelationsEvent::Prefetch(relations) => {
                 relations.iter().any(|relation| {
-                    relation.dimensions & top_contract_analysis::model::Dimension::Metadata.bit()
-                        != 0
+                    relation.dimensions & analysis::model::Dimension::Metadata.bit() != 0
                 })
             }
             _ => false,
@@ -470,7 +464,7 @@ fn metadata_exact_prefetch_is_emitted_before_frozen_relations() {
         .position(|event| {
             matches!(
                 event,
-                top_contract_analysis::pipeline::CandidateRelationsEvent::Frozen(_)
+                analysis::pipeline::CandidateRelationsEvent::Frozen(_)
             )
         })
         .expect("fixture must produce frozen relations");
@@ -478,7 +472,7 @@ fn metadata_exact_prefetch_is_emitted_before_frozen_relations() {
     let prefetched = events
         .iter()
         .filter_map(|event| match event {
-            top_contract_analysis::pipeline::CandidateRelationsEvent::Prefetch(relations) => {
+            analysis::pipeline::CandidateRelationsEvent::Prefetch(relations) => {
                 Some(relations.iter().map(|relation| relation.candidate_id))
             }
             _ => None,
@@ -488,7 +482,7 @@ fn metadata_exact_prefetch_is_emitted_before_frozen_relations() {
     let frozen = events
         .iter()
         .filter_map(|event| match event {
-            top_contract_analysis::pipeline::CandidateRelationsEvent::Frozen(relations) => {
+            analysis::pipeline::CandidateRelationsEvent::Frozen(relations) => {
                 Some(relations.iter().map(|relation| relation.candidate_id))
             }
             _ => None,
@@ -500,7 +494,7 @@ fn metadata_exact_prefetch_is_emitted_before_frozen_relations() {
     let mut overlapped = config.clone();
     overlapped.next_dimension_overlap = true;
     let (sender, mut receiver) = tokio::sync::mpsc::channel(32);
-    top_contract_analysis::pipeline::execute_dedup(
+    analysis::pipeline::execute_dedup(
         fixture(),
         &manifest,
         &overlapped,
@@ -521,15 +515,15 @@ fn metadata_exact_prefetch_is_emitted_before_frozen_relations() {
 }
 
 fn event_fingerprints(
-    events: &[top_contract_analysis::pipeline::CandidateRelationsEvent],
+    events: &[analysis::pipeline::CandidateRelationsEvent],
 ) -> Vec<(u8, Vec<u8>)> {
     let mut values = events
         .iter()
         .map(|event| match event {
-            top_contract_analysis::pipeline::CandidateRelationsEvent::Prefetch(relations) => {
+            analysis::pipeline::CandidateRelationsEvent::Prefetch(relations) => {
                 (0, serde_json::to_vec(relations).unwrap())
             }
-            top_contract_analysis::pipeline::CandidateRelationsEvent::Frozen(relations) => {
+            analysis::pipeline::CandidateRelationsEvent::Frozen(relations) => {
                 (1, serde_json::to_vec(relations).unwrap())
             }
         })
@@ -539,7 +533,7 @@ fn event_fingerprints(
 }
 
 fn seed_query_for_contract(
-    store: &top_contract_analysis::resident::ResidentBaseStore,
+    store: &analysis::resident::ResidentBaseStore,
     contract_id: ContractId,
     seed_id: SeedId,
 ) -> SeedRawQuery {
@@ -550,7 +544,7 @@ fn seed_query_for_contract(
     let start = identity.contract_offsets[contract_id.index()] as usize;
     let end = identity.contract_offsets[contract_id.index() + 1] as usize;
     let nft_ids = (start..end)
-        .map(|index| top_contract_analysis::model::NftId(index as u32))
+        .map(|index| analysis::model::NftId(index as u32))
         .collect::<Vec<_>>();
     let mut token_uri_evidence = nft_ids
         .iter()

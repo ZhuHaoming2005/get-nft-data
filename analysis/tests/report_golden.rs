@@ -5,11 +5,11 @@
 //! business-critical fields are caught even without comparing full byte
 //! output against a fixture file.
 
-use top_contract_analysis::model::{
+use analysis::model::{
     AggregateDelta, BehaviorFacts, CandidateId, ChainId, ContractKey, EconomicFacts,
     EvidenceQuality, NftSelection, RelationDelta, SeedId,
 };
-use top_contract_analysis::reporting::{json, markdown, AggregateState};
+use analysis::reporting::{json, markdown, AggregateState};
 
 fn economics_delta() -> EconomicFacts {
     EconomicFacts {

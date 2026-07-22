@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Parser)]
-#[command(name = "top-contract-analysis")]
+#[command(name = "analysis")]
 #[command(about = "四链头部 NFT 查重与深入分析")]
 pub struct Cli {
     #[command(subcommand)]

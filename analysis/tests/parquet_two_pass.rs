@@ -1,12 +1,12 @@
+use analysis::input::load_resident_store;
+use analysis::pipeline::CpuExecutor;
+use analysis::progress::Progress;
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use std::fs::File;
 use std::sync::Arc;
-use top_contract_analysis::input::load_resident_store;
-use top_contract_analysis::pipeline::CpuExecutor;
-use top_contract_analysis::progress::Progress;
 
 #[test]
 fn metadata_pass_keeps_first_eight_valid_tokens_in_logical_order() {

@@ -5,8 +5,8 @@
 
 ## 配置
 
-本 crate 以 package `top_contract_analysis_rewrite` 纳入仓库根 Cargo workspace，库名为
-`top_contract_analysis`，二进制为 `top-contract-analysis`；它与 workspace 内保留的旧
+本 crate 以 package `analysis` 纳入仓库根 Cargo workspace，库名为
+`analysis`，二进制为 `analysis`；它与 workspace 内保留的旧
 package `top_contract_analysis_rs` 名称不同。以下命令可在 `analysis/` 目录执行。先编辑
 [`config/default.toml`](./config/default.toml)，填写 `snapshot_files` 和 API Key：
 

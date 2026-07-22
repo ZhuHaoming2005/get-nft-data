@@ -1,8 +1,8 @@
-# top_contract_analysis_rewrite 当前实现架构
+# analysis 当前实现架构
 
 本文档以 [`REWRITE_DESIGN.md`](./REWRITE_DESIGN.md) 为业务语义来源，记录根 Cargo workspace
-中 `analysis/` package `top_contract_analysis_rewrite` 的当前代码结构、内存数据模型和执行
-流水线。其库名为 `top_contract_analysis`，运行二进制为 `top-contract-analysis`；同一
+中 `analysis/` package `analysis` 的当前代码结构、内存数据模型和执行
+流水线。其库名为 `analysis`，运行二进制为 `analysis`；同一
 workspace 中的 `top_contract_analysis_rs` 是保留的旧实现，二者不是同一个 package。
 
 重写采用实验级实现：四链快照一次装入内存，查重、候选归并、网络证据和深入分析都在
@@ -208,8 +208,8 @@ analysis/
 程序只提供两个业务命令：
 
 ```text
-top-contract-analysis select-seeds --config config/default.toml
-top-contract-analysis run --config config/default.toml --seeds seeds.json
+analysis select-seeds --config config/default.toml
+analysis run --config config/default.toml --seeds seeds.json
 ```
 
 `select-seeds` 分别获取四条链近 30 日排名，按 `seed_top` 为各链独立配置的数量写出

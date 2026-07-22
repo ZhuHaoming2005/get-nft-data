@@ -1,5 +1,5 @@
+use analysis::cli::Cli;
 use clap::Parser;
-use top_contract_analysis::cli::Cli;
 
 fn main() {
     if let Err(error) = run() {
@@ -8,7 +8,7 @@ fn main() {
     }
 }
 
-fn run() -> top_contract_analysis::Result<()> {
+fn run() -> analysis::Result<()> {
     let cli = Cli::parse();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(cli.runtime_worker_threads()?)
