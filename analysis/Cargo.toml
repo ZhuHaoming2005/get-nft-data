@@ -1,16 +1,16 @@
 [package]
-name = "top_contract_analysis_rewrite"
+name = "analysis"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
 publish = false
 
 [lib]
-name = "top_contract_analysis"
+name = "analysis"
 path = "src/lib.rs"
 
 [[bin]]
-name = "top-contract-analysis"
+name = "analysis"
 path = "src/main.rs"
 
 [dependencies]
