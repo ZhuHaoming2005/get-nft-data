@@ -6,6 +6,55 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SeedTopCounts {
+    pub base: u8,
+    pub ethereum: u8,
+    pub polygon: u8,
+    pub solana: u8,
+}
+
+impl Default for SeedTopCounts {
+    fn default() -> Self {
+        Self {
+            base: 25,
+            ethereum: 25,
+            polygon: 25,
+            solana: 25,
+        }
+    }
+}
+
+impl SeedTopCounts {
+    pub const fn count(self, chain: ChainId) -> u8 {
+        match chain {
+            ChainId::Base => self.base,
+            ChainId::Ethereum => self.ethereum,
+            ChainId::Polygon => self.polygon,
+            ChainId::Solana => self.solana,
+        }
+    }
+
+    pub fn total(self) -> usize {
+        ChainId::ALL
+            .into_iter()
+            .map(|chain| usize::from(self.count(chain)))
+            .sum()
+    }
+
+    pub fn validate(self) -> Result<()> {
+        for chain in ChainId::ALL {
+            if self.count(chain) == 0 {
+                return Err(AnalysisError::Config(format!(
+                    "seed_top.{chain} must be positive"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SeedManifest {
@@ -37,13 +86,14 @@ impl SeedDefinition {
 }
 
 impl SeedManifest {
-    pub fn from_path(path: &Path) -> Result<Self> {
+    pub fn from_path(path: &Path, seed_top: SeedTopCounts) -> Result<Self> {
         let raw = fs::read(path)?;
         let manifest: Self = serde_json::from_slice(&raw)?;
-        manifest.validate_exact()
+        manifest.validate_exact(seed_top)
     }
 
-    pub fn validate_exact(mut self) -> Result<Self> {
+    pub fn validate_exact(mut self, seed_top: SeedTopCounts) -> Result<Self> {
+        seed_top.validate()?;
         self.seeds.sort_by(|left, right| {
             (left.chain, left.rank, &left.stable_identifier).cmp(&(
                 right.chain,
@@ -51,9 +101,10 @@ impl SeedManifest {
                 &right.stable_identifier,
             ))
         });
-        if self.seeds.len() != 100 {
+        let expected_total = seed_top.total();
+        if self.seeds.len() != expected_total {
             return Err(AnalysisError::Seed(format!(
-                "expected exactly 100 seeds, found {}",
+                "expected exactly {expected_total} configured seeds, found {}",
                 self.seeds.len()
             )));
         }
@@ -78,10 +129,11 @@ impl SeedManifest {
                     seed.stable_identifier
                 )));
             }
-            if !(1..=25).contains(&seed.rank) {
+            let expected = seed_top.count(seed.chain);
+            if seed.rank == 0 || seed.rank > expected {
                 return Err(AnalysisError::Seed(format!(
-                    "seed {} rank must be in 1..=25",
-                    seed.stable_identifier
+                    "seed {} rank must be in 1..={expected} for {}",
+                    seed.stable_identifier, seed.chain
                 )));
             }
             if !ranks.entry(seed.chain).or_default().insert(seed.rank) {
@@ -107,15 +159,16 @@ impl SeedManifest {
             seed.id = SeedId(index as u16);
         }
         for chain in ChainId::ALL {
+            let expected = usize::from(seed_top.count(chain));
             let count = counts.get(&chain).copied().unwrap_or_default();
-            if count != 25 {
+            if count != expected {
                 return Err(AnalysisError::Seed(format!(
-                    "chain {chain} must have exactly 25 seeds, found {count}"
+                    "chain {chain} must have exactly {expected} seeds, found {count}"
                 )));
             }
-            if ranks.get(&chain).map(BTreeSet::len) != Some(25) {
+            if ranks.get(&chain).map(BTreeSet::len) != Some(expected) {
                 return Err(AnalysisError::Seed(format!(
-                    "chain {chain} must contain each rank in 1..=25 exactly once"
+                    "chain {chain} must contain each rank in 1..={expected} exactly once"
                 )));
             }
         }

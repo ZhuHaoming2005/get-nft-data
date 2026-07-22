@@ -77,7 +77,7 @@ async fn select_seeds(config_path: &Path) -> Result<()> {
             config.provider_concurrency.other,
         )),
     };
-    let manifest = select_exact(&source).await?;
+    let manifest = select_exact(&source, config.seed_top).await?;
     let bytes = serde_json::to_vec_pretty(&manifest)?;
     if let Some(parent) = config.seed_manifest.parent() {
         fs::create_dir_all(parent)?;

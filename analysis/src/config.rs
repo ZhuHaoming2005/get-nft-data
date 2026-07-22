@@ -1,4 +1,5 @@
 use crate::error::{AnalysisError, Result};
+use crate::seed::SeedTopCounts;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
@@ -18,6 +19,8 @@ pub struct RunConfig {
     pub cpu_workers: usize,
     pub index_shards: usize,
     pub seed_batch_size: usize,
+    #[serde(default)]
+    pub seed_top: SeedTopCounts,
     pub numa_mode: NumaMode,
     pub tokio_worker_threads: usize,
     pub cpu_queue_capacity: usize,
@@ -103,6 +106,7 @@ impl RunConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.seed_top.validate()?;
         if self.snapshot_files.is_empty() {
             return Err(AnalysisError::Config(
                 "snapshot_files must contain at least one explicitly ordered file".into(),
@@ -239,6 +243,7 @@ impl RunConfig {
     }
 
     pub fn validate_seed_selection(&self) -> Result<()> {
+        self.seed_top.validate()?;
         if self.tokio_worker_threads == 0 {
             return Err(AnalysisError::Config(
                 "tokio_worker_threads must be positive".into(),
@@ -353,5 +358,27 @@ mod tests {
         assert!(config.validate_seed_selection().is_ok());
         config.provider_concurrency.other = 0;
         assert!(config.validate_seed_selection().is_err());
+    }
+
+    #[test]
+    fn seed_top_defaults_to_twenty_five_and_accepts_per_chain_overrides() {
+        let default = SeedTopCounts::default();
+        assert_eq!(default.total(), 100);
+
+        let parsed: SeedTopCounts = toml::from_str("ethereum = 7").unwrap();
+        assert_eq!(parsed.base, 25);
+        assert_eq!(parsed.ethereum, 7);
+        assert_eq!(parsed.polygon, 25);
+        assert_eq!(parsed.solana, 25);
+        assert_eq!(parsed.total(), 82);
+    }
+
+    #[test]
+    fn seed_top_rejects_zero_for_any_chain() {
+        let counts = SeedTopCounts {
+            solana: 0,
+            ..SeedTopCounts::default()
+        };
+        assert!(counts.validate().is_err());
     }
 }

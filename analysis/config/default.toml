@@ -21,6 +21,12 @@ metadata_threshold = 0.6
 metadata_anchor_count = 8
 analysis_timestamp = "2026-01-01T00:00:00Z"
 
+[seed_top]
+base = 25
+ethereum = 25
+polygon = 25
+solana = 25
+
 [api_keys]
 alchemy = "O6O-K8fkagLHjOa-LLM3_"
 etherscan = "5S6SMJYGF2H28RZWVV97YXQMQHTWFG7N3M"

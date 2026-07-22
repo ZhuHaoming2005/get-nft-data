@@ -23,6 +23,19 @@ helius = ""
 仍可运行，但会将对应证据标记为 `not_requested` 或 `truncated`。Key 内容不写入运行清单
 或运行 ID；运行 ID 只记录各 Key 是否已配置。请勿提交包含真实 Key 的配置文件。
 
+每条链选取的头部合约数量由配置独立控制；未配置时各链默认均为 `25`：
+
+```toml
+[seed_top]
+base = 10
+ethereum = 25
+polygon = 15
+solana = 20
+```
+
+`select-seeds` 按这些数量生成清单；`run` 和 `run --seeds <路径>` 也会按同一配置校验每条
+链的数量以及从 `1` 开始连续且不重复的排名。
+
 默认供应商地址和 Alchemy 网络位于同一配置文件：
 
 ```toml

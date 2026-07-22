@@ -403,6 +403,7 @@ fn metadata_exact_prefetch_is_emitted_before_frozen_relations() {
         cpu_workers: 4,
         index_shards: 128,
         seed_batch_size: 1,
+        seed_top: Default::default(),
         numa_mode: NumaMode::Auto,
         tokio_worker_threads: 1,
         cpu_queue_capacity: 4,

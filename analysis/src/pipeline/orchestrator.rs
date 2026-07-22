@@ -34,7 +34,7 @@ pub async fn run(config_path: &Path, seeds_override: Option<&Path>) -> Result<()
     }
     let platform = crate::platform::inspect_production_platform()?;
     config.memory_limit = config.memory_limit.min(platform.effective_memory_limit);
-    let manifest = SeedManifest::from_path(&config.seed_manifest)?;
+    let manifest = SeedManifest::from_path(&config.seed_manifest, config.seed_top)?;
     let progress = Arc::new(Progress::default());
     let worker_placements = platform.worker_placements(config.numa_mode, config.cpu_workers)?;
     let executor = Arc::new(CpuExecutor::new_numa_bounded(

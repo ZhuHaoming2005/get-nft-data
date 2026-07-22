@@ -19,7 +19,7 @@ query-to-index 模式，避免构造全局对象对。
 
 程序必须完成以下固定工作：
 
-1. 读取并校验 Base、Ethereum、Polygon、Solana 各 25 个 seed，共 100 个；
+1. 读取并按 `seed_top` 校验 Base、Ethereum、Polygon、Solana 各链 seed 数量；默认各 25 个、共 100 个；
 2. 将四链完整 NFT 快照构造成全内存只读数据集；
 3. 对每个 seed 执行四个候选链作用域和四个查重维度；
 4. 对命中的 NFT、合约或 collection 获取网络证据；
@@ -212,8 +212,9 @@ top-contract-analysis select-seeds --config config/default.toml
 top-contract-analysis run --config config/default.toml --seeds seeds.json
 ```
 
-`select-seeds` 分别获取四条链近 30 日排名，写出各 25 个 seed 及其来源、指标、窗口和
-采集时间。`run` 只接受固定 seed manifest，不在运行过程中重新排名。
+`select-seeds` 分别获取四条链近 30 日排名，按 `seed_top` 为各链独立配置的数量写出
+seed 及其来源、指标、窗口和采集时间；默认仍为每链 `25`。`run` 只接受与当前
+`seed_top` 数量一致的固定 seed manifest，不在运行过程中重新排名。
 
 配置保留必要参数：
 
@@ -225,6 +226,7 @@ memory_limit
 cpu_workers
 index_shards
 seed_batch_size
+seed_top.{base,ethereum,polygon,solana}
 numa_mode
 tokio_worker_threads
 cpu_queue_capacity
