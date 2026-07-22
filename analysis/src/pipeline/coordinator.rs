@@ -15,7 +15,7 @@ use rayon::prelude::*;
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 
-const CANDIDATE_BATCH_CAPACITY: usize = 32;
+pub(super) const CANDIDATE_BATCH_CAPACITY: usize = 32;
 
 pub struct DedupOutput {
     pub store: ResidentBaseStore,

@@ -282,6 +282,12 @@ async fn process_candidates(
     let mut prefetch = PrefetchCoordinator::default();
     let mut candidate_stream_open = true;
     let mut all_relations = Vec::<crate::reporting::scope::ScopeRelation>::new();
+    // The channel capacity is measured in relation batches, while
+    // `network_queue_capacity` is measured in candidates. Keep a finite local
+    // Frozen backlog large enough to drain every batch already admitted to the
+    // channel; otherwise slow provider calls can stop the dedup coordinator
+    // from receiving already-completed Metadata shard results.
+    let candidate_backlog_limit = candidate_backlog_capacity(config.network_queue_capacity);
     let network_limit = config.network_queue_capacity.min(
         config
             .provider_concurrency
@@ -350,13 +356,17 @@ async fn process_candidates(
             };
             let provider = provider.clone();
             let observed_at = config.analysis_timestamp.timestamp();
+            let candidate_timeout = Duration::from_millis(config.candidate_timeout_ms);
             network.spawn(async move {
-                let fetched = std::panic::AssertUnwindSafe(fetch_or_extend(
-                    provider.as_ref(),
-                    &candidate,
-                    candidate.selection.as_ref(),
-                    base,
-                    observed_at,
+                let fetched = std::panic::AssertUnwindSafe(enforce_candidate_deadline(
+                    candidate_timeout,
+                    fetch_or_extend(
+                        provider.as_ref(),
+                        &candidate,
+                        candidate.selection.as_ref(),
+                        base,
+                        observed_at,
+                    ),
                 ))
                 .catch_unwind()
                 .await;
@@ -450,7 +460,8 @@ async fn process_candidates(
             batch = candidate_rx.recv(),
                 if candidate_stream_open
                     && !memory_pressure
-                    && final_fetches.len() < config.network_queue_capacity =>
+                    && final_fetches.len().saturating_add(prefetch.tracked_len())
+                        < candidate_backlog_limit =>
             {
                 Some(WorkEvent::CandidateBatch(batch))
             }
@@ -902,6 +913,16 @@ impl PrefetchCoordinator {
     fn reserved_network_slots(&self) -> usize {
         self.reserved_count
     }
+
+    fn tracked_len(&self) -> usize {
+        self.plan_count
+    }
+}
+
+fn candidate_backlog_capacity(message_capacity: usize) -> usize {
+    message_capacity
+        .max(1)
+        .saturating_mul(super::coordinator::CANDIDATE_BATCH_CAPACITY)
 }
 
 // Keeping the completion inline avoids one heap allocation for every network
@@ -1119,6 +1140,18 @@ async fn fetch_or_extend(
         }
     }
     Ok(evidence)
+}
+
+async fn enforce_candidate_deadline<T>(
+    deadline: Duration,
+    work: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(deadline, work).await.map_err(|_| {
+        AnalysisError::Provider(format!(
+            "candidate evidence exceeded the {} ms deadline",
+            deadline.as_millis()
+        ))
+    })?
 }
 
 fn failed_evidence(
@@ -2029,6 +2062,24 @@ fn safe_component(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::model::{ChainId, ContractKey, NftKey};
+
+    #[test]
+    fn frozen_backlog_scales_batch_capacity_in_candidate_units() {
+        assert_eq!(candidate_backlog_capacity(256), 8_192);
+        assert_eq!(candidate_backlog_capacity(0), 32);
+    }
+
+    #[tokio::test]
+    async fn candidate_deadline_terminates_a_nonreturning_provider_future() {
+        let result = enforce_candidate_deadline(
+            Duration::from_millis(5),
+            std::future::pending::<Result<()>>(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(AnalysisError::Provider(message)) if message.contains("5 ms"))
+        );
+    }
 
     #[test]
     fn missing_seed_report_is_explicitly_incomplete_with_empty_relations() {

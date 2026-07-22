@@ -247,7 +247,8 @@ compression_concurrency
 writer_threads
 writer_queue_bytes
 next_dimension_overlap
-provider_timeout
+provider_timeout_ms
+candidate_timeout_ms
 provider_concurrency
 provider_page_limits
 provider_retry_count
@@ -930,8 +931,10 @@ Helius  = 4
 其他 API = 4
 ```
 
-请求使用固定超时和有限次数重试。分页达到配置边界时停止并标记 `truncated`；请求失败、
-未请求、截断和真实空结果使用不同状态。进程内可复用同一候选的响应，但不写持久缓存。
+单次请求使用固定超时和有限次数重试；整个候选证据链另受 `candidate_timeout_ms` 限制，
+默认 5 分钟。超过候选截止时间时生成失败证据并继续运行，不能永久占用网络槽。分页达到
+配置边界时停止并标记 `truncated`；请求失败、未请求、截断和真实空结果使用不同状态。
+进程内可复用同一候选的响应，但不写持久缓存。
 
 每个 provider 全程复用一个 HTTP client、连接池和 TLS session。当前不维护通用的跨候选
 请求合批表；价格按 `(native_asset, time_bucket)` 在进程内 single-flight 缓存，候选内部的
@@ -999,7 +1002,9 @@ durability 固定重试/执行后仍失败则整个运行失败。
 阶段间队列同时受条目数和批次字节上限约束。队列满时：
 
 - 网络生产者暂停接收新的候选 ID；
-- 查重归并仍可继续到常驻候选缓冲的预算边界；
+- 查重归并仍可继续到常驻候选缓冲的预算边界；该边界按候选消息 channel 容量乘以每批
+  32 个候选换算，不能把 256 个消息槽错误当成仅 256 个候选，从而反向卡住已完成的
+  Metadata shard completion；
 - 达到边界后调度器暂停提交新的查重 shard query；
 - 已压缩 payload 的实际字节达到 `writer_queue_bytes` 后暂停新的 writer admission；
 - staging payload 数达到 `compression_concurrency` 时暂停新的压缩，避免磁盘临时文件无界；

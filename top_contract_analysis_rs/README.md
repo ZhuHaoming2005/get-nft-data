@@ -178,7 +178,7 @@ solana,So11111111111111111111111111111111111111112
 
 ```bash
 python scripts/fetch_opensea_top_seeds.py \
-  --api-key "$OPENSEA_API_KEY" \
+  --api-key "2d17a25e68714720883ac996f5459b17" \
   --limit 100 \
   --contracts-output ./seeds/top_contracts.csv \
   --audit-output ./seeds/top_contracts.audit.json

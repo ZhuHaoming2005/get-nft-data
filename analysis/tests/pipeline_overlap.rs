@@ -154,6 +154,7 @@ fn base_config(now: chrono::DateTime<chrono::Utc>) -> RunConfig {
         writer_queue_bytes: 1024,
         next_dimension_overlap: false,
         provider_timeout_ms: 1000,
+        candidate_timeout_ms: 10_000,
         api_keys: Default::default(),
         provider_endpoints: Default::default(),
         provider_concurrency: ProviderConcurrency {

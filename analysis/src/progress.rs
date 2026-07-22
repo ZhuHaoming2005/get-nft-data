@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const EWMA_ALPHA: f64 = 0.25;
+const STALE_RATE_AFTER: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -79,6 +80,7 @@ struct PhaseState {
     finished_elapsed: Option<Duration>,
     last_completed: u64,
     last_tick: Instant,
+    last_progress: Instant,
     rate: EwmaRate,
 }
 
@@ -91,6 +93,7 @@ impl PhaseState {
             finished_elapsed: None,
             last_completed: 0,
             last_tick: now,
+            last_progress: now,
             rate: EwmaRate::new(EWMA_ALPHA),
         }
     }
@@ -102,6 +105,7 @@ impl PhaseState {
         self.finished_elapsed = None;
         self.last_completed = completed;
         self.last_tick = now;
+        self.last_progress = now;
         self.rate = EwmaRate::new(EWMA_ALPHA);
     }
 
@@ -113,6 +117,7 @@ impl PhaseState {
         let delta = completed.saturating_sub(self.last_completed);
         if elapsed > 0.0 && delta > 0 {
             self.rate.observe(delta as f64 / elapsed);
+            self.last_progress = now;
         }
         self.last_completed = completed;
         self.last_tick = now;
@@ -657,6 +662,7 @@ impl Progress {
             phase_rate_per_sec: phase.rate_per_sec,
             phase_eta_ms: phase.eta_ms,
             phase_eta_confident: phase.eta_confident,
+            phase_stalled: phase.stalled,
             secondary_phase: secondary_phase.phase,
             secondary_phase_completed: secondary_phase.completed,
             secondary_phase_total: secondary_phase.total,
@@ -664,6 +670,7 @@ impl Progress {
             secondary_phase_rate_per_sec: secondary_phase.rate_per_sec,
             secondary_phase_eta_ms: secondary_phase.eta_ms,
             secondary_phase_eta_confident: secondary_phase.eta_confident,
+            secondary_phase_stalled: secondary_phase.stalled,
             completed_phases,
             total_row_groups,
             completed_row_groups,
@@ -725,6 +732,7 @@ struct PhaseMetrics {
     rate_per_sec: Option<f64>,
     eta_ms: Option<u64>,
     eta_confident: bool,
+    stalled: bool,
 }
 
 fn snapshot_phase(state: &mut PhaseState, completed: u64, now: Instant) -> PhaseMetrics {
@@ -737,14 +745,19 @@ fn snapshot_phase(state: &mut PhaseState, completed: u64, now: Instant) -> Phase
             rate_per_sec: None,
             eta_ms: None,
             eta_confident: false,
+            stalled: false,
         };
     }
     state.observe(completed, now);
     let finished = state.finished_elapsed.is_some();
     let homogeneous = state.phase != Some(WorkPhase::UriQueryNameIndex);
+    let stalled = !finished
+        && state.rate.rate.is_some()
+        && now.duration_since(state.last_progress) >= STALE_RATE_AFTER
+        && state.total.is_none_or(|total| completed < total);
     let (eta_ms, eta_confident) = match state.total {
         Some(total) if completed >= total => (Some(0), state.rate.confident() && homogeneous),
-        Some(total) if !finished => (
+        Some(total) if !finished && !stalled => (
             state.rate.eta_ms(total.saturating_sub(completed)),
             state.rate.confident() && homogeneous,
         ),
@@ -755,9 +768,10 @@ fn snapshot_phase(state: &mut PhaseState, completed: u64, now: Instant) -> Phase
         completed,
         total: state.total,
         elapsed_ms: duration_ms(state.elapsed(now)),
-        rate_per_sec: state.rate.rate,
+        rate_per_sec: (!stalled).then_some(state.rate.rate).flatten(),
         eta_ms,
         eta_confident,
+        stalled,
     }
 }
 
@@ -771,6 +785,7 @@ pub struct ProgressSnapshot {
     pub phase_rate_per_sec: Option<f64>,
     pub phase_eta_ms: Option<u64>,
     pub phase_eta_confident: bool,
+    pub phase_stalled: bool,
     pub secondary_phase: Option<WorkPhase>,
     pub secondary_phase_completed: u64,
     pub secondary_phase_total: Option<u64>,
@@ -778,6 +793,7 @@ pub struct ProgressSnapshot {
     pub secondary_phase_rate_per_sec: Option<f64>,
     pub secondary_phase_eta_ms: Option<u64>,
     pub secondary_phase_eta_confident: bool,
+    pub secondary_phase_stalled: bool,
     pub completed_phases: Vec<PhaseTiming>,
     pub total_row_groups: u64,
     pub completed_row_groups: u64,
@@ -847,7 +863,11 @@ impl ProgressSnapshot {
                 progress,
                 format_rate(self.phase_rate_per_sec),
                 format_duration(self.phase_elapsed_ms),
-                format_eta(self.phase_eta_ms, self.phase_eta_confident),
+                if self.phase_stalled {
+                    "等待完成/背压".to_owned()
+                } else {
+                    format_eta(self.phase_eta_ms, self.phase_eta_confident)
+                },
             )
         } else if self.logical_nfts == 0 {
             format!(
@@ -889,10 +909,14 @@ impl ProgressSnapshot {
                 progress,
                 format_rate(self.secondary_phase_rate_per_sec),
                 format_duration(self.secondary_phase_elapsed_ms),
-                format_eta(
-                    self.secondary_phase_eta_ms,
-                    self.secondary_phase_eta_confident
-                ),
+                if self.secondary_phase_stalled {
+                    "等待完成/背压".to_owned()
+                } else {
+                    format_eta(
+                        self.secondary_phase_eta_ms,
+                        self.secondary_phase_eta_confident,
+                    )
+                },
             )
         });
 
@@ -1091,7 +1115,9 @@ fn eta_ms(elapsed_ms: u64, completed: u64, total: u64) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EwmaRate, PhaseSlot, Progress, WorkPhase};
+    use super::{
+        snapshot_phase, Duration, EwmaRate, Instant, PhaseSlot, PhaseState, Progress, WorkPhase,
+    };
 
     #[test]
     fn renamed_artifacts_are_not_durable_before_the_final_barrier() {
@@ -1204,6 +1230,20 @@ mod tests {
         rate.observe(100.0);
         assert!(rate.confident());
         assert_eq!(rate.eta_ms(200), Some(2_000));
+    }
+
+    #[test]
+    fn stalled_phase_drops_stale_rate_and_misleading_eta() {
+        let started = Instant::now();
+        let mut state = PhaseState::new(started);
+        state.reset(WorkPhase::MetadataBm25, Some(256), 0, started);
+        state.observe(204, started + Duration::from_secs(1));
+
+        let metrics = snapshot_phase(&mut state, 204, started + Duration::from_secs(32));
+        assert!(metrics.stalled);
+        assert_eq!(metrics.rate_per_sec, None);
+        assert_eq!(metrics.eta_ms, None);
+        assert!(!metrics.eta_confident);
     }
 
     #[test]

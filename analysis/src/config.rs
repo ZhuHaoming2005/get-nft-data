@@ -32,6 +32,8 @@ pub struct RunConfig {
     pub writer_queue_bytes: u64,
     pub next_dimension_overlap: bool,
     pub provider_timeout_ms: u64,
+    #[serde(default = "default_candidate_timeout_ms")]
+    pub candidate_timeout_ms: u64,
     #[serde(default, skip_serializing)]
     pub api_keys: crate::api::ProviderApiKeys,
     #[serde(default)]
@@ -169,6 +171,11 @@ impl RunConfig {
                 "provider_timeout_ms must be positive".into(),
             ));
         }
+        if self.candidate_timeout_ms == 0 {
+            return Err(AnalysisError::Config(
+                "candidate_timeout_ms must be positive".into(),
+            ));
+        }
         for (name, endpoint) in [
             (
                 "provider_endpoints.opensea",
@@ -286,6 +293,10 @@ impl RunConfig {
         }
         Ok(())
     }
+}
+
+const fn default_candidate_timeout_ms() -> u64 {
+    5 * 60 * 1_000
 }
 
 fn make_absolute(base: &Path, value: &mut PathBuf) {
