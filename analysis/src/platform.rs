@@ -306,7 +306,7 @@ fn current_process_affinity() -> Result<Vec<u32>> {
             std::io::Error::last_os_error()
         )));
     }
-    Ok((0..libc::CPU_SETSIZE)
+    Ok((0..libc::CPU_SETSIZE as usize)
         .filter(|cpu| unsafe { libc::CPU_ISSET(*cpu, &set) })
         .map(|cpu| cpu as u32)
         .collect())
