@@ -65,7 +65,9 @@ pub struct SeedManifest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SeedDefinition {
-    #[serde(default, skip_deserializing)]
+    // This dense runtime index is assigned by `validate_exact` and is not part
+    // of the persisted manifest contract in either direction.
+    #[serde(default, skip_serializing, skip_deserializing)]
     pub id: SeedId,
     pub chain: ChainId,
     pub contract_address: String,
@@ -173,5 +175,32 @@ impl SeedManifest {
             }
         }
         Ok(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_id_is_not_part_of_the_manifest_contract() {
+        let mut value = serde_json::json!({
+            "chain": "ethereum",
+            "contract_address": "0x1111111111111111111111111111111111111111",
+            "rank": 1,
+            "collection_name": "Collection",
+            "stable_identifier": "collection",
+            "ranking_metric": "thirty_days_volume",
+            "ranking_value": 1.0,
+            "ranking_window": "30d",
+            "source": "opensea",
+            "collected_at": "2026-01-01T00:00:00Z"
+        });
+        let seed: SeedDefinition = serde_json::from_value(value.clone()).unwrap();
+
+        assert_eq!(seed.id, SeedId::default());
+        assert!(serde_json::to_value(seed).unwrap().get("id").is_none());
+        value["id"] = serde_json::json!(99);
+        assert!(serde_json::from_value::<SeedDefinition>(value).is_err());
     }
 }
