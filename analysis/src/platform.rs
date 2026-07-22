@@ -2,7 +2,7 @@ use crate::config::NumaMode;
 use crate::error::{AnalysisError, Result};
 use serde::Serialize;
 use std::collections::BTreeSet;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 use std::fs;
 #[cfg(any(target_os = "linux", test))]
 use std::path::{Component, Path, PathBuf};
@@ -148,7 +148,7 @@ pub fn inspect_production_platform() -> Result<PlatformResources> {
     #[cfg(target_os = "linux")]
     {
         let cgroup = current_cgroup_v2_dir()?;
-        let cpuset = read_cpuset(&cgroup.join("cpuset.cpus.effective"))?;
+        let cpuset = read_effective_cpuset(cgroup, Path::new(CGROUP_V2_MOUNT))?;
         let affinity = current_process_affinity()?;
         let affinity = affinity.into_iter().collect::<BTreeSet<_>>();
         let allowed_cpus = cpuset
@@ -285,9 +285,43 @@ fn current_cgroup_v2_dir() -> Result<&'static Path> {
         .ok_or_else(|| AnalysisError::Platform("could not cache current cgroup v2 path".into()))
 }
 
-#[cfg(target_os = "linux")]
-fn read_cpuset(path: &Path) -> Result<Vec<u32>> {
-    parse_cpu_list(&fs::read_to_string(path)?)
+#[cfg(any(target_os = "linux", test))]
+fn read_effective_cpuset(group: &Path, mount: &Path) -> Result<Vec<u32>> {
+    let mut current = group;
+    loop {
+        let path = current.join("cpuset.cpus.effective");
+        if path.is_file() {
+            let raw = fs::read_to_string(&path).map_err(|error| {
+                AnalysisError::Platform(format!("failed to read {}: {error}", path.display()))
+            })?;
+            let cpus = parse_cpu_list(&raw)?;
+            if !cpus.is_empty() {
+                return Ok(cpus);
+            }
+        }
+        if current == mount {
+            break;
+        }
+        current = current.parent().ok_or_else(|| {
+            AnalysisError::Platform(format!(
+                "cgroup path `{}` is outside `{}`",
+                group.display(),
+                mount.display()
+            ))
+        })?;
+        if !current.starts_with(mount) {
+            return Err(AnalysisError::Platform(format!(
+                "cgroup path `{}` is outside `{}`",
+                group.display(),
+                mount.display()
+            )));
+        }
+    }
+    Err(AnalysisError::Platform(format!(
+        "no non-empty cpuset.cpus.effective found from `{}` through `{}`",
+        group.display(),
+        mount.display()
+    )))
 }
 
 #[cfg(target_os = "linux")]
@@ -433,6 +467,33 @@ mod tests {
             mount.join("system.slice/analysis.service")
         );
         assert!(resolve_cgroup_v2_path("0::/../../tmp\n", mount).is_err());
+    }
+
+    #[test]
+    fn effective_cpuset_inherits_from_nearest_enabled_cgroup() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mount = temporary.path();
+        let user_slice = mount.join("user.slice");
+        let session = user_slice.join("session.scope");
+        fs::create_dir_all(&session).unwrap();
+        fs::write(mount.join("cpuset.cpus.effective"), "0-7\n").unwrap();
+        fs::write(user_slice.join("cpuset.cpus.effective"), "2-5\n").unwrap();
+
+        assert_eq!(
+            read_effective_cpuset(&session, mount).unwrap(),
+            [2, 3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn effective_cpuset_rejects_paths_outside_the_cgroup_mount() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mount = temporary.path().join("cgroup");
+        let outside = temporary.path().join("outside");
+        fs::create_dir_all(&mount).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        assert!(read_effective_cpuset(&outside, &mount).is_err());
     }
 
     #[test]
