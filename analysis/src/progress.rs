@@ -313,6 +313,121 @@ pub struct ProgressSnapshot {
     pub durability_pending: u64,
 }
 
+impl ProgressSnapshot {
+    pub fn human_line(&self) -> String {
+        let elapsed = format_duration(self.elapsed_ms);
+        if self.logical_nfts == 0 {
+            return format!(
+                "[{elapsed}] 加载 Parquet {}/{} ({}) | 已读 {} 行 | ETA {}",
+                grouped(self.completed_row_groups),
+                grouped(self.total_row_groups),
+                percentage(self.completed_row_groups, self.total_row_groups),
+                grouped(self.input_rows),
+                format_optional_duration(self.row_group_eta_ms),
+            );
+        }
+
+        let pipeline_started = self.candidates > 0
+            || self.fetched > 0
+            || self.analyzed > 0
+            || self.written > 0
+            || self.network_pending > 0
+            || self.network_inflight > 0
+            || self.analysis_inflight > 0
+            || self.compression_pending > 0
+            || self.compression_inflight > 0
+            || self.writer_pending > 0
+            || self.writer_inflight > 0;
+        if !pipeline_started {
+            return format!(
+                "[{elapsed}] 构建查重索引 | NFT {} | 合约 {} | postings URI={} Name={} Metadata={} | 分片批次 {} 封存 {} | CPU {}/{} | 内存 {}",
+                grouped(self.logical_nfts),
+                grouped(self.contracts),
+                grouped(self.uri_postings_built),
+                grouped(self.name_postings_built),
+                grouped(self.metadata_postings_built),
+                grouped(self.shard_batches_completed),
+                grouped(self.shards_sealed),
+                grouped(self.cpu_active),
+                grouped(self.cpu_workers),
+                format_bytes(self.memory_current_bytes),
+            );
+        }
+
+        format!(
+            "[{elapsed}] 候选分析 | 候选 {} | 获取 {} (成功 {} / 失败 {} / 截断 {}) | 分析 {} (成功 {} / 失败 {}) | 写入 {} / 持久化 {} | 队列 网络={}/{} 分析={} 压缩={}/{} 写入={}/{} | CPU {}/{} | 内存 {} (峰值 {}) | 完成 ETA {}",
+            grouped(self.candidates),
+            grouped(self.fetched),
+            grouped(self.fetch_succeeded),
+            grouped(self.fetch_failed),
+            grouped(self.fetch_truncated),
+            grouped(self.analyzed),
+            grouped(self.analysis_succeeded),
+            grouped(self.analysis_failed),
+            grouped(self.written),
+            grouped(self.durable),
+            grouped(self.network_pending),
+            grouped(self.network_inflight),
+            grouped(self.analysis_inflight),
+            grouped(self.compression_pending),
+            grouped(self.compression_inflight),
+            grouped(self.writer_pending),
+            grouped(self.writer_inflight),
+            grouped(self.cpu_active),
+            grouped(self.cpu_workers),
+            format_bytes(self.memory_current_bytes),
+            format_bytes(self.memory_peak_bytes),
+            format_optional_duration(self.durable_eta_ms),
+        )
+    }
+}
+
+fn grouped(value: u64) -> String {
+    let raw = value.to_string();
+    let mut output = String::with_capacity(raw.len() + raw.len() / 3);
+    for (index, character) in raw.chars().enumerate() {
+        if index > 0 && (raw.len() - index).is_multiple_of(3) {
+            output.push(',');
+        }
+        output.push(character);
+    }
+    output
+}
+
+fn percentage(completed: u64, total: u64) -> String {
+    if total == 0 {
+        return "--".into();
+    }
+    format!("{:.1}%", completed as f64 * 100.0 / total as f64)
+}
+
+fn format_optional_duration(milliseconds: Option<u64>) -> String {
+    milliseconds.map_or_else(|| "--".into(), format_duration)
+}
+
+fn format_duration(milliseconds: u64) -> String {
+    if milliseconds < 60_000 {
+        return format!("{:.1}秒", milliseconds as f64 / 1_000.0);
+    }
+    let total_seconds = milliseconds / 1_000;
+    let hours = total_seconds / 3_600;
+    let minutes = total_seconds % 3_600 / 60;
+    let seconds = total_seconds % 60;
+    if hours == 0 {
+        format!("{minutes:02}:{seconds:02}")
+    } else {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes == 0 {
+        return "--".into();
+    }
+    const GIB: f64 = (1024_u64 * 1024 * 1024) as f64;
+    format!("{:.1} GiB", bytes as f64 / GIB)
+}
+
 fn eta_ms(elapsed_ms: u64, completed: u64, total: u64) -> Option<u64> {
     if completed == 0 || total <= completed {
         return None;
@@ -339,5 +454,18 @@ mod tests {
 
         progress.mark_all_written_durable();
         assert_eq!(progress.snapshot().durable, 1);
+    }
+
+    #[test]
+    fn parquet_progress_is_human_readable() {
+        let progress = Progress::default();
+        progress.add_total_row_groups(127);
+        progress.add_completed_row_groups(118);
+        progress.add_input_rows(122_758_830);
+
+        let line = progress.snapshot().human_line();
+        assert!(line.contains("加载 Parquet 118/127 (92.9%)"));
+        assert!(line.contains("已读 122,758,830 行"));
+        assert!(!line.starts_with('{'));
     }
 }

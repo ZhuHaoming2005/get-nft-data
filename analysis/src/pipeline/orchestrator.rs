@@ -53,9 +53,7 @@ pub async fn run(config_path: &Path, seeds_override: Option<&Path>) -> Result<()
                 _ = interval.tick() => {
                     let (active, queued) = reported_executor.utilization();
                     reported_progress.record_cpu(reported_executor.workers(), active, queued);
-                    if let Ok(line) = serde_json::to_string(&reported_progress.snapshot()) {
-                        eprintln!("{line}");
-                    }
+                    eprintln!("{}", reported_progress.snapshot().human_line());
                 }
                 _ = &mut progress_stop_rx => break,
             }
