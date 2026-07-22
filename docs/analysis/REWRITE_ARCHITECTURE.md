@@ -58,8 +58,13 @@ query-to-index 模式，避免构造全局对象对。
 
 贯穿全流程的性能约束为：
 
-- Parquet 使用两次列投影扫描：第一遍构建逻辑 NFT/合约基础列，第二遍只附加 Metadata；
-  相同逻辑 Metadata 不重复规范化或向量化；
+- Parquet 使用两次列投影扫描：第一遍构建逻辑 NFT/合约基础列并保存紧凑的
+  `SourceOrder -> logical NFT -> contract` 映射，第二遍只投影 `metadata_json`；第二遍以
+  16K record batch 在所有 NUMA lane 并行解码和校验 JSON，单个有界提交端只负责按
+  SourceOrder 更新最多 8 个 Metadata anchor；相同逻辑 Metadata 不重复规范化或向量化；
+- 快照 footer/schema 校验以及 Metadata 准备期的 EVM Token、Solana Token、合约地址
+  排名分布到所有 NUMA lane；要求稳定全局顺序的 NFT 排序仍在单 lane 的完整 Rayon pool
+  内完成，避免跨 lane 合并复制整表；
 - Name、URI、Metadata 字节只全局存储一次，并在对应维度完成后释放不再使用的列；
 - 每个唯一 Name、Metadata 文档和 Metadata profile 只准备一次；
 - URI 只查询 `PreparedUriPlan` 中存在 posting 的 shard；Name 和 Metadata 的 probe 分别按

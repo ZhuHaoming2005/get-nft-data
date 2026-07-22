@@ -25,6 +25,12 @@ struct CompactRow {
     source: crate::model::SourceOrder,
 }
 
+enum MetadataPreparationPart {
+    Address(Vec<u32>),
+    EvmToken(Vec<u32>),
+    SolanaToken(Vec<u32>),
+}
+
 #[derive(Debug, Default)]
 pub struct ResidentBuilder {
     addresses: ByteInterner,
@@ -36,6 +42,8 @@ pub struct ResidentBuilder {
     contract_ranges: Vec<(usize, usize)>,
     contract_by_key: AHashMap<(ChainId, u32), u32>,
     metadata_anchor_rows: Vec<[u32; 8]>,
+    metadata_source_rows: Vec<Vec<u32>>,
+    metadata_row_contracts: Vec<u32>,
     metadata_anchor_count: usize,
     evm_token_rank: Vec<u32>,
     solana_token_rank: Vec<u32>,
@@ -153,6 +161,16 @@ impl ResidentBuilder {
                 self.metadata_anchor_rows.capacity() as u64
                     * std::mem::size_of::<[u32; 8]>() as u64,
             )
+            .saturating_add(self.metadata_source_rows.iter().fold(
+                self.metadata_source_rows.capacity() as u64
+                    * std::mem::size_of::<Vec<u32>>() as u64,
+                |bytes, rows| {
+                    bytes.saturating_add(rows.capacity() as u64 * std::mem::size_of::<u32>() as u64)
+                },
+            ))
+            .saturating_add(
+                self.metadata_row_contracts.capacity() as u64 * std::mem::size_of::<u32>() as u64,
+            )
             .saturating_add(
                 (self.evm_token_rank.capacity() + self.solana_token_rank.capacity()) as u64
                     * std::mem::size_of::<u32>() as u64,
@@ -263,6 +281,76 @@ impl ResidentBuilder {
     }
 
     pub fn prepare_metadata(&mut self, metadata_anchor_count: usize) -> Result<()> {
+        self.validate_metadata_preparation(metadata_anchor_count)?;
+        let address_rank = address_ranks(&self.addresses);
+        let (evm_token_rank, solana_token_rank) = rayon::join(
+            || token_ranks(&self.logical_rows, &self.token_ids, true),
+            || token_ranks(&self.logical_rows, &self.token_ids, false),
+        );
+        self.prepare_metadata_ranked(
+            metadata_anchor_count,
+            address_rank,
+            evm_token_rank,
+            solana_token_rank,
+        )
+    }
+
+    pub(crate) fn prepare_metadata_numa(
+        &mut self,
+        metadata_anchor_count: usize,
+        executor: &crate::pipeline::CpuExecutor,
+    ) -> Result<()> {
+        self.validate_metadata_preparation(metadata_anchor_count)?;
+        if executor.numa_pool_count() == 1 {
+            return executor.install(|| self.prepare_metadata(metadata_anchor_count));
+        }
+        // The three rank tables are independent and relatively expensive on a
+        // large snapshot. Build them on separate NUMA pools so preparation is
+        // not artificially limited to the workers of lane zero.
+        let parts = executor.install_on_all(|lane, lane_count| {
+            (lane..3)
+                .step_by(lane_count)
+                .map(|part| match part {
+                    0 => MetadataPreparationPart::EvmToken(token_ranks(
+                        &self.logical_rows,
+                        &self.token_ids,
+                        true,
+                    )),
+                    1 => MetadataPreparationPart::SolanaToken(token_ranks(
+                        &self.logical_rows,
+                        &self.token_ids,
+                        false,
+                    )),
+                    2 => MetadataPreparationPart::Address(address_ranks(&self.addresses)),
+                    _ => unreachable!(),
+                })
+                .collect::<Vec<_>>()
+        });
+        let mut address_rank = None;
+        let mut evm_token_rank = None;
+        let mut solana_token_rank = None;
+        for part in parts.into_iter().flatten() {
+            match part {
+                MetadataPreparationPart::Address(value) => address_rank = Some(value),
+                MetadataPreparationPart::EvmToken(value) => evm_token_rank = Some(value),
+                MetadataPreparationPart::SolanaToken(value) => solana_token_rank = Some(value),
+            }
+        }
+        let missing = || AnalysisError::State("metadata preparation rank task was omitted".into());
+        let address_rank = address_rank.ok_or_else(missing)?;
+        let evm_token_rank = evm_token_rank.ok_or_else(missing)?;
+        let solana_token_rank = solana_token_rank.ok_or_else(missing)?;
+        executor.install(|| {
+            self.prepare_metadata_ranked(
+                metadata_anchor_count,
+                address_rank,
+                evm_token_rank,
+                solana_token_rank,
+            )
+        })
+    }
+
+    fn validate_metadata_preparation(&self, metadata_anchor_count: usize) -> Result<()> {
         if metadata_anchor_count == 0 || metadata_anchor_count > 8 {
             return Err(AnalysisError::Config(
                 "metadata anchor count must be in 1..=8".into(),
@@ -273,21 +361,16 @@ impl ResidentBuilder {
                 "resident builder was prepared more than once".into(),
             ));
         }
-        let mut address_ids = (0..self.addresses.len() as u32).collect::<Vec<_>>();
-        address_ids.par_sort_unstable_by(|left, right| {
-            self.addresses
-                .get(*left)
-                .as_bytes()
-                .cmp(self.addresses.get(*right).as_bytes())
-        });
-        let mut address_rank = vec![0_u32; address_ids.len()];
-        for (rank, address) in address_ids.into_iter().enumerate() {
-            address_rank[address as usize] = rank as u32;
-        }
-        let (evm_token_rank, solana_token_rank) = rayon::join(
-            || token_ranks(&self.logical_rows, &self.token_ids, true),
-            || token_ranks(&self.logical_rows, &self.token_ids, false),
-        );
+        Ok(())
+    }
+
+    fn prepare_metadata_ranked(
+        &mut self,
+        metadata_anchor_count: usize,
+        address_rank: Vec<u32>,
+        evm_token_rank: Vec<u32>,
+        solana_token_rank: Vec<u32>,
+    ) -> Result<()> {
         self.logical_rows.par_sort_unstable_by(|left, right| {
             left.chain
                 .cmp(&right.chain)
@@ -309,22 +392,67 @@ impl ResidentBuilder {
         self.evm_token_rank = evm_token_rank;
         self.solana_token_rank = solana_token_rank;
         let rows = std::mem::take(&mut self.logical_rows);
+        check_capacity("physical input rows", rows.len())?;
+        let source_file_count = rows
+            .iter()
+            .map(|row| usize::from(row.source.file_ordinal) + 1)
+            .max()
+            .unwrap_or(0);
+        let mut source_lengths = vec![0_usize; source_file_count];
+        for row in &rows {
+            let row_number = usize::try_from(row.source.file_row_number).map_err(|_| {
+                AnalysisError::Input(format!(
+                    "source row does not fit platform usize: {:?}",
+                    row.source
+                ))
+            })?;
+            source_lengths[usize::from(row.source.file_ordinal)] = source_lengths
+                [usize::from(row.source.file_ordinal)]
+            .max(row_number.saturating_add(1));
+        }
+        let mut metadata_source_rows = source_lengths
+            .into_iter()
+            .map(|length| vec![u32::MAX; length])
+            .collect::<Vec<_>>();
         let mut unique_rows = Vec::with_capacity(rows.len());
         for row in rows {
-            if let Some(existing) = unique_rows.last_mut() {
-                if same_nft(existing, &row) {
-                    self.quality.duplicate_rows += 1;
-                    self.quality.conflicting_rows += u64::from(differs(existing, &row));
-                    if existing.metadata_source.is_none() && row.metadata_source.is_some() {
-                        existing.metadata_id = row.metadata_id;
-                        existing.metadata_source = row.metadata_source;
-                    }
-                    continue;
+            let source = row.source;
+            let duplicate = unique_rows
+                .last()
+                .is_some_and(|existing| same_nft(existing, &row));
+            let row_index = if duplicate {
+                let row_index = unique_rows.len() - 1;
+                let existing = &mut unique_rows[row_index];
+                self.quality.duplicate_rows += 1;
+                self.quality.conflicting_rows += u64::from(differs(existing, &row));
+                if existing.metadata_source.is_none() && row.metadata_source.is_some() {
+                    existing.metadata_id = row.metadata_id;
+                    existing.metadata_source = row.metadata_source;
                 }
+                row_index
+            } else {
+                let row_index = unique_rows.len();
+                unique_rows.push(row);
+                row_index
+            };
+            let source_slot = metadata_source_rows
+                .get_mut(usize::from(source.file_ordinal))
+                .zip(usize::try_from(source.file_row_number).ok())
+                .and_then(|(rows, row)| rows.get_mut(row))
+                .ok_or_else(|| {
+                    AnalysisError::State(format!("metadata source lookup omitted {source:?}"))
+                })?;
+            if *source_slot != u32::MAX {
+                return Err(AnalysisError::Input(format!(
+                    "duplicate SourceOrder in snapshot: {source:?}"
+                )));
             }
-            unique_rows.push(row);
+            *source_slot = u32::try_from(row_index).map_err(|_| {
+                AnalysisError::Input("logical NFT index exceeds u32 capacity".into())
+            })?;
         }
         self.logical_rows = unique_rows;
+        self.metadata_source_rows = metadata_source_rows;
         check_capacity("logical NFTs", self.logical_rows.len())?;
         self.quality.logical_nfts = self.logical_rows.len() as u64;
 
@@ -343,6 +471,15 @@ impl ResidentBuilder {
             start = end;
         }
         check_capacity("contracts", contract_ranges.len())?;
+        let mut metadata_row_contracts = vec![u32::MAX; self.logical_rows.len()];
+        for (contract, &(start, end)) in contract_ranges.iter().enumerate() {
+            metadata_row_contracts[start..end].fill(
+                u32::try_from(contract).map_err(|_| {
+                    AnalysisError::Input("contract index exceeds u32 capacity".into())
+                })?,
+            );
+        }
+        self.metadata_row_contracts = metadata_row_contracts;
         self.contract_by_key = AHashMap::with_capacity(contract_ranges.len());
         for (contract, &(start, _)) in contract_ranges.iter().enumerate() {
             let row = self.logical_rows[start];
@@ -442,7 +579,48 @@ impl ResidentBuilder {
                     "metadata pass found an unknown token at {source:?}"
                 ))
             })?;
-        let row = &self.logical_rows[start + row_offset];
+        self.metadata_input_target_for_row(contract, start + row_offset, source)
+    }
+
+    pub(crate) fn metadata_input_target_by_source(
+        &self,
+        source: crate::model::SourceOrder,
+    ) -> Result<MetadataInputTarget> {
+        let row_index = self
+            .metadata_source_rows
+            .get(usize::from(source.file_ordinal))
+            .and_then(|rows| {
+                usize::try_from(source.file_row_number)
+                    .ok()
+                    .and_then(|row| rows.get(row))
+            })
+            .copied()
+            .filter(|row| *row != u32::MAX)
+            .ok_or_else(|| {
+                AnalysisError::Input(format!(
+                    "metadata pass found an unknown source row at {source:?}"
+                ))
+            })? as usize;
+        let contract = self
+            .metadata_row_contracts
+            .get(row_index)
+            .copied()
+            .filter(|contract| *contract != u32::MAX)
+            .ok_or_else(|| {
+                AnalysisError::State(format!("metadata source row has no contract at {source:?}"))
+            })? as usize;
+        self.metadata_input_target_for_row(contract, row_index, source)
+    }
+
+    fn metadata_input_target_for_row(
+        &self,
+        contract: usize,
+        row_index: usize,
+        source: crate::model::SourceOrder,
+    ) -> Result<MetadataInputTarget> {
+        let row = &self.logical_rows[row_index];
+        let chain = row.chain;
+        let token_rank = self.token_rank(chain, row.token_id_id);
         let disposition = if row
             .metadata_source
             .is_some_and(|existing| existing <= source)
@@ -471,10 +649,17 @@ impl ResidentBuilder {
         Ok(MetadataInputTarget {
             chain,
             contract,
-            row_index: start + row_offset,
+            row_index,
             token_rank,
             disposition,
         })
+    }
+
+    pub(crate) fn release_metadata_source_lookup(&mut self) {
+        self.metadata_source_rows.clear();
+        self.metadata_source_rows.shrink_to_fit();
+        self.metadata_row_contracts.clear();
+        self.metadata_row_contracts.shrink_to_fit();
     }
 
     pub fn attach_prepared_metadata(
@@ -572,6 +757,7 @@ impl ResidentBuilder {
 
     fn finish_prepared(mut self, index_shards: usize) -> Result<ResidentBaseStore> {
         let contract_ranges = std::mem::take(&mut self.contract_ranges);
+        self.release_metadata_source_lookup();
         self.contract_by_key.clear();
         self.contract_by_key.shrink_to_fit();
         self.metadata_anchor_rows.clear();
@@ -940,6 +1126,21 @@ fn token_ranks(rows: &[CompactRow], tokens: &ByteInterner, evm: bool) -> Vec<u32
     ranks
 }
 
+fn address_ranks(addresses: &ByteInterner) -> Vec<u32> {
+    let mut address_ids = (0..addresses.len() as u32).collect::<Vec<_>>();
+    address_ids.par_sort_unstable_by(|left, right| {
+        addresses
+            .get(*left)
+            .as_bytes()
+            .cmp(addresses.get(*right).as_bytes())
+    });
+    let mut address_rank = vec![0_u32; address_ids.len()];
+    for (rank, address) in address_ids.into_iter().enumerate() {
+        address_rank[address as usize] = rank as u32;
+    }
+    address_rank
+}
+
 fn canonical_decimal_digits(value: &str) -> Option<&str> {
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
@@ -1024,6 +1225,79 @@ mod tests {
         );
         assert_eq!(store.quality.duplicate_rows, 1);
         assert_eq!(store.quality.invalid_metadata, 1);
+    }
+
+    #[test]
+    fn metadata_source_lookup_maps_duplicate_physical_rows_to_one_logical_nft() {
+        let mut builder = ResidentBuilder::default();
+        let mut first = row("same", "1", r#"{"ignored":true}"#, 0);
+        first.metadata_json = None;
+        let mut duplicate = row("same", "1", r#"{"ignored":true}"#, 1);
+        duplicate.metadata_json = None;
+        builder.push(first).unwrap();
+        builder.push(duplicate).unwrap();
+        builder.prepare_metadata(8).unwrap();
+
+        let first = builder
+            .metadata_input_target_by_source(SourceOrder {
+                file_ordinal: 0,
+                file_row_number: 0,
+            })
+            .unwrap();
+        let duplicate = builder
+            .metadata_input_target_by_source(SourceOrder {
+                file_ordinal: 0,
+                file_row_number: 1,
+            })
+            .unwrap();
+        assert_eq!(first.row_index, duplicate.row_index);
+        assert_eq!(first.contract, duplicate.contract);
+
+        builder.release_metadata_source_lookup();
+        assert!(builder
+            .metadata_input_target_by_source(SourceOrder {
+                file_ordinal: 0,
+                file_row_number: 0,
+            })
+            .is_err());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn metadata_preparation_uses_multiple_numa_lanes_without_changing_output() {
+        use crate::platform::WorkerPlacement;
+
+        let placements = [
+            WorkerPlacement {
+                cpu: 0,
+                numa_node: Some(0),
+            },
+            WorkerPlacement {
+                cpu: 1,
+                numa_node: Some(0),
+            },
+            WorkerPlacement {
+                cpu: 2,
+                numa_node: Some(1),
+            },
+            WorkerPlacement {
+                cpu: 3,
+                numa_node: Some(1),
+            },
+        ];
+        let executor = crate::pipeline::CpuExecutor::new_numa_bounded(4, 8, &placements).unwrap();
+        let mut builder = ResidentBuilder::default();
+        builder.push(row("alpha", "10", r#"{"a":1}"#, 0)).unwrap();
+        builder.push(row("alpha", "2", r#"{"a":2}"#, 1)).unwrap();
+        let mut solana = row("solana", "mint-z", r#"{"a":3}"#, 2);
+        solana.chain = ChainId::Solana;
+        solana.contract_address = "collection".into();
+        builder.push(solana).unwrap();
+
+        builder.prepare_metadata_numa(8, &executor).unwrap();
+        let store = builder.finish(8, 4).unwrap();
+        assert_eq!(store.contracts.contracts.len(), 2);
+        assert_eq!(store.uri_identity.as_ref().unwrap().nfts.len(), 3);
     }
 
     #[test]

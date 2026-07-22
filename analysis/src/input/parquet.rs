@@ -26,21 +26,28 @@ pub fn load_resident_store(
     // Read and validate each footer once. Row-group workers reopen only the
     // data file and reuse this immutable Arrow metadata in both scan passes.
     progress.begin_phase(WorkPhase::LoadValidate, Some(files.len() as u64));
-    let inputs = executor
-        .install(|| {
+    let mut prepared_inputs = executor
+        .install_on_all(|lane, lane_count| {
             files
                 .par_iter()
                 .enumerate()
+                .filter(|(file_ordinal, _)| file_ordinal % lane_count == lane)
                 .map(|(file_ordinal, path)| {
                     let input = PreparedParquetInput::open(path, file_ordinal as u16).map(Arc::new);
                     if input.is_ok() {
                         progress.add_phase_completed(1);
                     }
-                    input
+                    (file_ordinal, input)
                 })
                 .collect::<Vec<_>>()
         })
         .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    prepared_inputs.sort_unstable_by_key(|(file_ordinal, _)| *file_ordinal);
+    let inputs = prepared_inputs
+        .into_iter()
+        .map(|(_, input)| input)
         .collect::<Result<Vec<_>>>()?;
     progress.finish_phase();
     let cached_metadata_bytes = inputs.iter().fold(0_u64, |total, input| {
@@ -118,7 +125,7 @@ pub fn load_resident_store(
         memory_limit,
     )?;
     progress.begin_phase(WorkPhase::PrepareMetadata, Some(1));
-    executor.install(|| resident.prepare_metadata(metadata_anchor_count))?;
+    resident.prepare_metadata_numa(metadata_anchor_count, executor)?;
     progress.add_phase_completed(1);
     progress.finish_phase();
     enforce_builder_budget(
@@ -135,6 +142,7 @@ pub fn load_resident_store(
         progress,
     )?;
     progress.finish_phase();
+    resident.release_metadata_source_lookup();
     // No reader uses the footer cache after the second pass. Releasing it
     // before final compaction restores the budget headroom it occupied.
     drop(inputs);
@@ -262,10 +270,7 @@ impl PreparedParquetInput {
                 "image_uri_norm",
             ],
         )?;
-        let metadata_projection = projection_indices_for(
-            metadata.schema(),
-            &["chain", "contract_address", "token_id", "metadata_json"],
-        )?;
+        let metadata_projection = projection_indices_for(metadata.schema(), &["metadata_json"])?;
         let mut row_start = 0_u64;
         let groups: Vec<RowGroupDescriptor> = metadata
             .metadata()
@@ -435,8 +440,12 @@ fn scan_metadata_files(
                 .map(move |descriptor| (input, descriptor))
         })
         .collect::<Vec<_>>();
-    let decode_budget = (memory_limit / 64).clamp(256 * 1024 * 1024, 4 * 1024 * 1024 * 1024);
-    let (sender, receiver) = std::sync::mpsc::sync_channel(executor.workers().clamp(1, 16));
+    let decode_budget = (memory_limit / 32).clamp(512 * 1024 * 1024, 16 * 1024 * 1024 * 1024);
+    // Smaller batches shorten the serial commit tail and provide more
+    // opportunities for row-group workers to interleave decode and parallel
+    // validation. Doubling the queue slots still halves the worst-case queued
+    // row count versus the old 16 x 65,536 layout.
+    let (sender, receiver) = std::sync::mpsc::sync_channel(executor.workers().clamp(1, 32));
     let mut next_group = 0_usize;
     let mut inflight = 0_usize;
     let mut inflight_bytes = 0_u64;
@@ -561,9 +570,17 @@ fn retire_metadata_row_group(
 
 struct PreparedMetadataBatch {
     batch: RecordBatch,
-    chains: Vec<ChainId>,
+    metadata: Vec<ValidatedMetadataInput>,
     file_ordinal: u16,
     row_start: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ValidatedMetadataInput {
+    Missing,
+    Oversized,
+    Invalid,
+    Valid,
 }
 
 fn decode_metadata_row_group_stream(
@@ -579,7 +596,7 @@ fn decode_metadata_row_group_stream(
     let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(file, input.metadata.clone())
         .with_projection(projection)
         .with_row_groups(vec![descriptor.row_group])
-        .with_batch_size(65_536)
+        .with_batch_size(16_384)
         .build()?;
     let mut file_row_number = descriptor.row_start;
     for batch in reader {
@@ -597,49 +614,70 @@ fn prepare_metadata_batch(
     file_ordinal: u16,
     row_start: u64,
 ) -> Result<PreparedMetadataBatch> {
-    let chains = {
-        let chain = StringColumn::new(&batch, "chain", false)?;
-        let mut chains = Vec::with_capacity(batch.num_rows());
-        for row in 0..batch.num_rows() {
-            let chain_value = chain.required(row)?;
-            chains.push(ChainId::from_str(chain_value).map_err(|message| {
-                AnalysisError::Input(format!(
-                    "{message} at file {file_ordinal}, row {}",
-                    row_start + row as u64
-                ))
-            })?);
-        }
-        chains
-    };
+    let metadata = StringColumn::new(&batch, "metadata_json", true)?;
+    // JSON validation/normalization is the CPU-heavy part of the second pass.
+    // Run it inside the row-group worker's Rayon pool so all workers in that
+    // NUMA lane can steal row work instead of feeding one serial consumer.
+    // Indexed collection preserves row order and therefore deterministic error
+    // selection and SourceOrder behavior.
+    let validated = (0..batch.num_rows())
+        .into_par_iter()
+        .map(|row| validate_metadata_input(metadata.optional(row)))
+        .collect::<Vec<_>>();
     Ok(PreparedMetadataBatch {
         batch,
-        chains,
+        metadata: validated,
         file_ordinal,
         row_start,
     })
+}
+
+fn validate_metadata_input(raw: Option<&str>) -> ValidatedMetadataInput {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return ValidatedMetadataInput::Missing;
+    };
+    if raw.len() > 64 * 1024 {
+        return ValidatedMetadataInput::Oversized;
+    }
+    if crate::resident::metadata_index::is_valid_metadata_json(raw) {
+        ValidatedMetadataInput::Valid
+    } else {
+        ValidatedMetadataInput::Invalid
+    }
 }
 
 fn attach_metadata_batch(
     resident: &mut ResidentBuilder,
     prepared: PreparedMetadataBatch,
 ) -> Result<()> {
-    let contract = StringColumn::new(&prepared.batch, "contract_address", false)?;
-    let token = StringColumn::new(&prepared.batch, "token_id", false)?;
     let metadata = StringColumn::new(&prepared.batch, "metadata_json", true)?;
-    for (row, chain) in prepared.chains.into_iter().enumerate() {
+    for (row, validated) in prepared.metadata.into_iter().enumerate() {
         let source = SourceOrder {
             file_ordinal: prepared.file_ordinal,
             file_row_number: prepared.row_start + row as u64,
         };
-        let contract_address = contract.required(row)?;
-        let token_id = token.required(row)?;
-        let target = resident.metadata_input_target(chain, contract_address, token_id, source)?;
+        let target = resident.metadata_input_target_by_source(source)?;
         let disposition = target.disposition();
-        resident.attach_prepared_metadata_target(
-            target,
-            PreparedMetadataInput::from_raw_for_disposition(metadata.optional(row), disposition),
-            source,
-        )?;
+        let prepared = match validated {
+            ValidatedMetadataInput::Missing => PreparedMetadataInput::Missing,
+            ValidatedMetadataInput::Oversized => PreparedMetadataInput::Oversized,
+            ValidatedMetadataInput::Invalid => PreparedMetadataInput::Invalid,
+            ValidatedMetadataInput::Valid => match disposition {
+                crate::resident::MetadataInputDisposition::Anchor => {
+                    PreparedMetadataInput::from_raw_for_disposition(
+                        metadata.optional(row),
+                        disposition,
+                    )
+                }
+                crate::resident::MetadataInputDisposition::NonAnchor => {
+                    PreparedMetadataInput::NonAnchor
+                }
+                crate::resident::MetadataInputDisposition::Duplicate => {
+                    PreparedMetadataInput::Ignored
+                }
+            },
+        };
+        resident.attach_prepared_metadata_target(target, prepared, source)?;
     }
     Ok(())
 }
@@ -693,6 +731,35 @@ impl<'a> StringColumn<'a> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn metadata_validation_classifies_without_canonicalizing_the_batch() {
+        assert_eq!(
+            validate_metadata_input(None),
+            ValidatedMetadataInput::Missing
+        );
+        assert_eq!(
+            validate_metadata_input(Some("  ")),
+            ValidatedMetadataInput::Missing
+        );
+        assert_eq!(
+            validate_metadata_input(Some("not-json")),
+            ValidatedMetadataInput::Invalid
+        );
+        assert_eq!(
+            validate_metadata_input(Some("{}")),
+            ValidatedMetadataInput::Invalid
+        );
+        assert_eq!(
+            validate_metadata_input(Some(r#"{"name":"valid"}"#)),
+            ValidatedMetadataInput::Valid
+        );
+        let oversized = format!(r#"{{"value":"{}"}}"#, "x".repeat(64 * 1024));
+        assert_eq!(
+            validate_metadata_input(Some(&oversized)),
+            ValidatedMetadataInput::Oversized
+        );
+    }
 
     #[test]
     fn evm_owner_hash_is_case_insensitive_without_normalizing_allocation() {
