@@ -1,12 +1,15 @@
 use crate::error::{AnalysisError, Result};
 use crate::input::{projection_indices, projection_indices_for};
 use crate::model::{ChainId, SourceOrder};
-use crate::progress::Progress;
+use crate::progress::{Progress, WorkPhase};
 use crate::resident::{PreparedMetadataInput, ResidentBaseStore, ResidentBuilder};
 use arrow_array::{Array, LargeStringArray, RecordBatch, StringArray, StringViewArray};
 use parking_lot::Mutex;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+};
 use parquet::arrow::ProjectionMask;
+use rayon::prelude::*;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -20,21 +23,54 @@ pub fn load_resident_store(
     executor: &crate::pipeline::CpuExecutor,
     progress: &Progress,
 ) -> Result<ResidentBaseStore> {
+    // Read and validate each footer once. Row-group workers reopen only the
+    // data file and reuse this immutable Arrow metadata in both scan passes.
+    progress.begin_phase(WorkPhase::LoadValidate, Some(files.len() as u64));
+    let inputs = executor
+        .install(|| {
+            files
+                .par_iter()
+                .enumerate()
+                .map(|(file_ordinal, path)| {
+                    let input = PreparedParquetInput::open(path, file_ordinal as u16).map(Arc::new);
+                    if input.is_ok() {
+                        progress.add_phase_completed(1);
+                    }
+                    input
+                })
+                .collect::<Vec<_>>()
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+    progress.finish_phase();
+    let cached_metadata_bytes = inputs.iter().fold(0_u64, |total, input| {
+        total.saturating_add(input.cached_bytes)
+    });
+    // The immutable footer cache remains resident across both scans. Charge it
+    // to the same process-wide budget as the builders instead of treating it
+    // as free memory.
+    enforce_builder_budget(cached_metadata_bytes, memory_limit)?;
+    let row_groups = inputs.iter().fold(0_u64, |total, input| {
+        total.saturating_add(input.groups.len() as u64)
+    });
+    // The loader intentionally performs two passes. Publish the stable total
+    // up front so progress never reaches 100% and then moves backwards.
+    progress.add_total_row_groups(row_groups.saturating_mul(2));
     let builder_shards = Arc::new(
         (0..index_shards)
             .map(|_| Mutex::new(ResidentBuilder::default()))
             .collect::<Vec<_>>(),
     );
-    for (file_ordinal, path) in files.iter().enumerate() {
-        scan_file(
-            path,
-            file_ordinal as u16,
-            &builder_shards,
-            memory_limit,
-            executor,
-            progress,
-        )?;
-    }
+    progress.begin_phase(WorkPhase::BaseScan, Some(row_groups));
+    scan_files(
+        &inputs,
+        &builder_shards,
+        cached_metadata_bytes,
+        memory_limit,
+        executor,
+        progress,
+    )?;
+    progress.finish_phase();
     let shard_estimates = builder_shards
         .iter()
         .map(|builder| builder.lock().estimated_bytes())
@@ -44,7 +80,9 @@ pub fn load_resident_store(
         .fold(0_u64, |sum, value| sum.saturating_add(*value));
     let largest_shard = shard_estimates.iter().copied().max().unwrap_or(0);
     enforce_builder_budget(
-        sharded_total.saturating_add(largest_shard.saturating_mul(2)),
+        cached_metadata_bytes
+            .saturating_add(sharded_total)
+            .saturating_add(largest_shard.saturating_mul(2)),
         memory_limit,
     )?;
     let builder_shards = Arc::try_unwrap(builder_shards)
@@ -53,6 +91,7 @@ pub fn load_resident_store(
         .into_iter()
         .map(Mutex::into_inner)
         .collect::<Vec<_>>();
+    progress.begin_phase(WorkPhase::Merge, Some(builders.len() as u64));
     let largest_builder = shard_estimates
         .iter()
         .enumerate()
@@ -68,92 +107,124 @@ pub fn load_resident_store(
     // A balanced tree would remap every CompactRow O(log(shards)) times;
     // this path remaps every source row exactly once.
     let mut resident = builders.swap_remove(largest_builder);
+    progress.add_phase_completed(1);
     for shard in builders {
         resident.merge_from(shard)?;
+        progress.add_phase_completed(1);
     }
-    enforce_builder_budget(resident.preparation_peak_bytes(), memory_limit)?;
+    progress.finish_phase();
+    enforce_builder_budget(
+        cached_metadata_bytes.saturating_add(resident.preparation_peak_bytes()),
+        memory_limit,
+    )?;
+    progress.begin_phase(WorkPhase::PrepareMetadata, Some(1));
     executor.install(|| resident.prepare_metadata(metadata_anchor_count))?;
-    enforce_builder_budget(resident.estimated_bytes(), memory_limit)?;
-    for (file_ordinal, path) in files.iter().enumerate() {
-        scan_metadata_file(
-            path,
-            file_ordinal as u16,
-            &mut resident,
-            memory_limit,
-            executor,
-            progress,
-        )?;
-    }
-    executor.install(|| resident.finish(metadata_anchor_count, index_shards))
+    progress.add_phase_completed(1);
+    progress.finish_phase();
+    enforce_builder_budget(
+        cached_metadata_bytes.saturating_add(resident.estimated_bytes()),
+        memory_limit,
+    )?;
+    progress.begin_phase(WorkPhase::MetadataScan, Some(row_groups));
+    scan_metadata_files(
+        &inputs,
+        &mut resident,
+        cached_metadata_bytes,
+        memory_limit,
+        executor,
+        progress,
+    )?;
+    progress.finish_phase();
+    // No reader uses the footer cache after the second pass. Releasing it
+    // before final compaction restores the budget headroom it occupied.
+    drop(inputs);
+    progress.begin_phase(WorkPhase::FinalizeStore, Some(1));
+    let store = executor.install(|| resident.finish(metadata_anchor_count, index_shards))?;
+    progress.add_phase_completed(1);
+    progress.finish_phase();
+    Ok(store)
 }
 
-fn scan_file(
-    path: &Path,
-    file_ordinal: u16,
+fn scan_files(
+    inputs: &[Arc<PreparedParquetInput>],
     resident: &Arc<Vec<Mutex<ResidentBuilder>>>,
+    cached_metadata_bytes: u64,
     memory_limit: u64,
     executor: &crate::pipeline::CpuExecutor,
     progress: &Progress,
 ) -> Result<()> {
-    let builder = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path)?)?;
-    let row_group_count = builder.metadata().num_row_groups() as u64;
-    progress.add_total_row_groups(row_group_count);
-    let mut row_start = 0_u64;
-    let groups = builder
-        .metadata()
-        .row_groups()
+    let groups = inputs
         .iter()
         .enumerate()
-        .map(|(row_group, metadata)| {
-            let descriptor = RowGroupDescriptor {
-                row_group,
-                row_start,
-                estimated_bytes: metadata.total_byte_size().max(1) as u64,
-            };
-            row_start += metadata.num_rows() as u64;
-            descriptor
+        .flat_map(|(input, prepared)| {
+            prepared
+                .groups
+                .iter()
+                .copied()
+                .map(move |descriptor| (input, descriptor))
         })
         .collect::<Vec<_>>();
-    drop(builder);
     let decode_budget = (memory_limit / 32).clamp(512 * 1024 * 1024, 16 * 1024 * 1024 * 1024);
-    let mut start = 0;
-    while start < groups.len() {
-        let mut end = start;
-        let mut admitted = 0_u64;
-        while end < groups.len() && end - start < executor.workers() {
-            let next = groups[end].estimated_bytes;
-            if end > start && admitted.saturating_add(next) > decode_budget {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut next_group = 0_usize;
+    let mut inflight = 0_usize;
+    let mut inflight_bytes = 0_u64;
+    let mut since_budget_check = 0_usize;
+    while next_group < groups.len() || inflight > 0 {
+        while next_group < groups.len() && inflight < executor.workers() {
+            let (input_index, descriptor) = groups[next_group];
+            if inflight > 0
+                && inflight_bytes.saturating_add(descriptor.estimated_bytes) > decode_budget
+            {
                 break;
             }
-            admitted = admitted.saturating_add(next);
-            end += 1;
-        }
-        let (sender, receiver) = std::sync::mpsc::channel();
-        for &descriptor in &groups[start..end] {
             let sender = sender.clone();
-            let path = path.to_path_buf();
+            let input = inputs[input_index].clone();
             let resident = resident.clone();
             let _ = executor.submit_kind_routed(
                 crate::pipeline::CpuTaskKind::Dedup,
-                descriptor.row_group,
+                (input.file_ordinal, descriptor.row_group),
                 move || {
-                    let result =
-                        decode_row_group_stream(&path, file_ordinal, descriptor, &resident);
-                    let _ = sender.send(result);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        decode_row_group_stream(&input, descriptor, &resident)
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(AnalysisError::State(format!(
+                            "Parquet row group {} panicked during decode",
+                            descriptor.row_group
+                        )))
+                    });
+                    let _ = sender.send((descriptor.estimated_bytes, result));
                 },
             );
+            inflight += 1;
+            inflight_bytes = inflight_bytes.saturating_add(descriptor.estimated_bytes);
+            next_group += 1;
         }
-        drop(sender);
-        for _ in start..end {
-            let rows = receiver.recv().map_err(|_| {
-                AnalysisError::State("Parquet row-group decode channel closed".into())
-            })??;
-            progress.add_input_rows(rows);
-            progress.add_completed_row_groups(1);
-            enforce_builder_budget(sharded_builder_bytes(resident), memory_limit)?;
+        let (completed_bytes, rows) = receiver
+            .recv()
+            .map_err(|_| AnalysisError::State("Parquet row-group decode channel closed".into()))?;
+        let rows = rows?;
+        inflight = inflight
+            .checked_sub(1)
+            .ok_or_else(|| AnalysisError::State("Parquet decode inflight underflow".into()))?;
+        inflight_bytes = inflight_bytes.saturating_sub(completed_bytes);
+        progress.add_input_rows(rows);
+        progress.add_completed_row_groups(1);
+        progress.add_phase_completed(1);
+        since_budget_check += 1;
+        if since_budget_check >= executor.workers() || (next_group == groups.len() && inflight == 0)
+        {
+            // The rolling admission window is bounded by compressed bytes.
+            // Sample the 128 builder shards once per worker-width of actual
+            // completions, not once per row group, to avoid a growing lock scan
+            // on the decode hot path.
+            enforce_builder_budget(
+                cached_metadata_bytes.saturating_add(sharded_builder_bytes(resident)),
+                memory_limit,
+            )?;
+            since_budget_check = 0;
         }
-        enforce_builder_budget(sharded_builder_bytes(resident), memory_limit)?;
-        start = end;
     }
     Ok(())
 }
@@ -165,27 +236,99 @@ struct RowGroupDescriptor {
     estimated_bytes: u64,
 }
 
-fn decode_row_group_stream(
-    path: &Path,
+struct PreparedParquetInput {
+    path: PathBuf,
     file_ordinal: u16,
+    metadata: ArrowReaderMetadata,
+    base_projection: Vec<usize>,
+    metadata_projection: Vec<usize>,
+    groups: Vec<RowGroupDescriptor>,
+    cached_bytes: u64,
+}
+
+impl PreparedParquetInput {
+    fn open(path: &Path, file_ordinal: u16) -> Result<Self> {
+        let file = std::fs::File::open(path)?;
+        let metadata = ArrowReaderMetadata::load(&file, ArrowReaderOptions::new())?;
+        projection_indices(metadata.schema())?;
+        let base_projection = projection_indices_for(
+            metadata.schema(),
+            &[
+                "chain",
+                "contract_address",
+                "token_id",
+                "name_norm",
+                "token_uri_norm",
+                "image_uri_norm",
+            ],
+        )?;
+        let metadata_projection = projection_indices_for(
+            metadata.schema(),
+            &["chain", "contract_address", "token_id", "metadata_json"],
+        )?;
+        let mut row_start = 0_u64;
+        let groups: Vec<RowGroupDescriptor> = metadata
+            .metadata()
+            .row_groups()
+            .iter()
+            .enumerate()
+            .map(|(row_group, row_group_metadata)| {
+                let descriptor = RowGroupDescriptor {
+                    row_group,
+                    row_start,
+                    estimated_bytes: row_group_metadata.total_byte_size().max(1) as u64,
+                };
+                row_start = row_start.saturating_add(row_group_metadata.num_rows().max(0) as u64);
+                descriptor
+            })
+            .collect();
+        let path = path.to_path_buf();
+        // ParquetMetaData::memory_size accounts for the parsed footer graph.
+        // Charge a second copy as a conservative allowance for the derived
+        // Arrow schema/fields and allocator overhead, then add our own buffers.
+        let cached_bytes = u64::try_from(metadata.metadata().memory_size())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(2)
+            .saturating_add(u64::try_from(std::mem::size_of::<Self>()).unwrap_or(u64::MAX))
+            .saturating_add(u64::try_from(path.as_os_str().len()).unwrap_or(u64::MAX))
+            .saturating_add(
+                u64::try_from(base_projection.capacity())
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(std::mem::size_of::<usize>() as u64),
+            )
+            .saturating_add(
+                u64::try_from(metadata_projection.capacity())
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(std::mem::size_of::<usize>() as u64),
+            )
+            .saturating_add(
+                u64::try_from(groups.capacity())
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(std::mem::size_of::<RowGroupDescriptor>() as u64),
+            );
+        Ok(Self {
+            path,
+            file_ordinal,
+            metadata,
+            base_projection,
+            metadata_projection,
+            groups,
+            cached_bytes,
+        })
+    }
+}
+
+fn decode_row_group_stream(
+    input: &PreparedParquetInput,
     descriptor: RowGroupDescriptor,
     resident: &Arc<Vec<Mutex<ResidentBuilder>>>,
 ) -> Result<u64> {
-    let builder = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path)?)?;
-    projection_indices(builder.schema())?;
-    let indices = projection_indices_for(
-        builder.schema(),
-        &[
-            "chain",
-            "contract_address",
-            "token_id",
-            "name_norm",
-            "token_uri_norm",
-            "image_uri_norm",
-        ],
-    )?;
-    let projection = ProjectionMask::leaves(builder.parquet_schema(), indices);
-    let reader = builder
+    let file = std::fs::File::open(&input.path)?;
+    let projection = ProjectionMask::leaves(
+        input.metadata.metadata().file_metadata().schema_descr(),
+        input.base_projection.clone(),
+    );
+    let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(file, input.metadata.clone())
         .with_projection(projection)
         .with_row_groups(vec![descriptor.row_group])
         .with_batch_size(65_536)
@@ -195,7 +338,7 @@ fn decode_row_group_stream(
     for batch in reader {
         let batch = batch?;
         let row_count = batch.num_rows() as u64;
-        decode_batch_into_resident(&batch, file_ordinal, &mut file_row_number, resident)?;
+        decode_batch_into_resident(&batch, input.file_ordinal, &mut file_row_number, resident)?;
         decoded_rows = decoded_rows.saturating_add(row_count);
     }
     Ok(decoded_rows)
@@ -273,78 +416,84 @@ fn sharded_builder_bytes(resident: &[Mutex<ResidentBuilder>]) -> u64 {
     })
 }
 
-fn scan_metadata_file(
-    path: &Path,
-    file_ordinal: u16,
+fn scan_metadata_files(
+    inputs: &[Arc<PreparedParquetInput>],
     resident: &mut ResidentBuilder,
+    cached_metadata_bytes: u64,
     memory_limit: u64,
     executor: &crate::pipeline::CpuExecutor,
     progress: &Progress,
 ) -> Result<()> {
-    let builder = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path)?)?;
-    let mut row_start = 0_u64;
-    let groups = builder
-        .metadata()
-        .row_groups()
+    let groups = inputs
         .iter()
         .enumerate()
-        .map(|(row_group, metadata)| {
-            let descriptor = RowGroupDescriptor {
-                row_group,
-                row_start,
-                estimated_bytes: metadata.total_byte_size().max(1) as u64,
-            };
-            row_start += metadata.num_rows() as u64;
-            descriptor
+        .flat_map(|(input, prepared)| {
+            prepared
+                .groups
+                .iter()
+                .copied()
+                .map(move |descriptor| (input, descriptor))
         })
         .collect::<Vec<_>>();
-    progress.add_total_row_groups(groups.len() as u64);
-    drop(builder);
     let decode_budget = (memory_limit / 64).clamp(256 * 1024 * 1024, 4 * 1024 * 1024 * 1024);
-    let mut start = 0;
-    while start < groups.len() {
-        let mut end = start;
-        let mut admitted = 0_u64;
-        while end < groups.len() && end - start < executor.workers() {
-            let next = groups[end].estimated_bytes;
-            if end > start && admitted.saturating_add(next) > decode_budget {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(executor.workers().clamp(1, 16));
+    let mut next_group = 0_usize;
+    let mut inflight = 0_usize;
+    let mut inflight_bytes = 0_u64;
+    let mut since_budget_check = 0_usize;
+    while next_group < groups.len() || inflight > 0 {
+        while next_group < groups.len() && inflight < executor.workers() {
+            let (input_index, descriptor) = groups[next_group];
+            if inflight > 0
+                && inflight_bytes.saturating_add(descriptor.estimated_bytes) > decode_budget
+            {
                 break;
             }
-            admitted = admitted.saturating_add(next);
-            end += 1;
+            let sender = sender.clone();
+            let input = inputs[input_index].clone();
+            let _ = executor.submit_kind_routed(
+                crate::pipeline::CpuTaskKind::Dedup,
+                (input.file_ordinal, descriptor.row_group),
+                move || {
+                    run_metadata_row_group_worker(descriptor, &sender, || {
+                        decode_metadata_row_group_stream(&input, descriptor, &sender)
+                    });
+                },
+            );
+            inflight += 1;
+            inflight_bytes = inflight_bytes.saturating_add(descriptor.estimated_bytes);
+            next_group += 1;
         }
-        executor.scope(|scope| {
-            let (sender, receiver) = std::sync::mpsc::sync_channel(executor.workers().clamp(1, 16));
-            for &descriptor in &groups[start..end] {
-                let sender = sender.clone();
-                scope.spawn(move |_| {
-                    if let Err(error) =
-                        decode_metadata_row_group_stream(path, file_ordinal, descriptor, &sender)
-                    {
-                        let _ = sender.send(DecodedMetadataRows::Failed(error));
-                    }
-                });
+        match receiver
+            .recv()
+            .map_err(|_| AnalysisError::State("Metadata row-group decode channel closed".into()))?
+        {
+            DecodedMetadataRows::Batch(batch) => {
+                attach_metadata_batch(resident, batch)?;
             }
-            drop(sender);
-            let mut completed = 0;
-            while completed < end - start {
-                match receiver.recv().map_err(|_| {
-                    AnalysisError::State("Metadata row-group decode channel closed".into())
-                })? {
-                    DecodedMetadataRows::Batch(batch) => {
-                        attach_metadata_batch(resident, file_ordinal, batch)?;
-                    }
-                    DecodedMetadataRows::Finished => {
-                        completed += 1;
-                        progress.add_completed_row_groups(1);
-                    }
-                    DecodedMetadataRows::Failed(error) => return Err(error),
+            DecodedMetadataRows::Finished(completed_bytes) => {
+                retire_metadata_row_group(&mut inflight, &mut inflight_bytes, completed_bytes)?;
+                progress.add_completed_row_groups(1);
+                progress.add_phase_completed(1);
+                since_budget_check += 1;
+                if since_budget_check >= executor.workers()
+                    || (next_group == groups.len() && inflight == 0)
+                {
+                    enforce_builder_budget(
+                        cached_metadata_bytes.saturating_add(resident.estimated_bytes()),
+                        memory_limit,
+                    )?;
+                    since_budget_check = 0;
                 }
             }
-            Ok::<_, AnalysisError>(())
-        })?;
-        enforce_builder_budget(resident.estimated_bytes(), memory_limit)?;
-        start = end;
+            DecodedMetadataRows::Failed {
+                completed_bytes,
+                error,
+            } => {
+                retire_metadata_row_group(&mut inflight, &mut inflight_bytes, completed_bytes)?;
+                return Err(error);
+            }
+        }
     }
     Ok(())
 }
@@ -365,44 +514,82 @@ fn enforce_builder_budget(required: u64, limit: u64) -> Result<()> {
 
 enum DecodedMetadataRows {
     Batch(PreparedMetadataBatch),
-    Finished,
-    Failed(AnalysisError),
+    Finished(u64),
+    Failed {
+        completed_bytes: u64,
+        error: AnalysisError,
+    },
+}
+
+fn run_metadata_row_group_worker(
+    descriptor: RowGroupDescriptor,
+    sender: &std::sync::mpsc::SyncSender<DecodedMetadataRows>,
+    task: impl FnOnce() -> Result<()>,
+) {
+    let terminal = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)) {
+        Ok(Ok(())) => DecodedMetadataRows::Finished(descriptor.estimated_bytes),
+        Ok(Err(error)) => DecodedMetadataRows::Failed {
+            completed_bytes: descriptor.estimated_bytes,
+            error,
+        },
+        Err(_) => DecodedMetadataRows::Failed {
+            completed_bytes: descriptor.estimated_bytes,
+            error: AnalysisError::State(format!(
+                "Metadata row group {} panicked during decode",
+                descriptor.row_group
+            )),
+        },
+    };
+    let _ = sender.send(terminal);
+}
+
+fn retire_metadata_row_group(
+    inflight: &mut usize,
+    inflight_bytes: &mut u64,
+    completed_bytes: u64,
+) -> Result<()> {
+    let remaining = inflight
+        .checked_sub(1)
+        .ok_or_else(|| AnalysisError::State("Metadata decode inflight underflow".into()))?;
+    let remaining_bytes = inflight_bytes.checked_sub(completed_bytes).ok_or_else(|| {
+        AnalysisError::State("Metadata decode inflight byte accounting underflow".into())
+    })?;
+    *inflight = remaining;
+    *inflight_bytes = remaining_bytes;
+    Ok(())
 }
 
 struct PreparedMetadataBatch {
     batch: RecordBatch,
     chains: Vec<ChainId>,
+    file_ordinal: u16,
     row_start: u64,
 }
 
 fn decode_metadata_row_group_stream(
-    path: &Path,
-    file_ordinal: u16,
+    input: &PreparedParquetInput,
     descriptor: RowGroupDescriptor,
     sender: &std::sync::mpsc::SyncSender<DecodedMetadataRows>,
 ) -> Result<()> {
-    let builder = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path)?)?;
-    let indices = projection_indices_for(
-        builder.schema(),
-        &["chain", "contract_address", "token_id", "metadata_json"],
-    )?;
-    let projection = ProjectionMask::leaves(builder.parquet_schema(), indices);
-    let reader = builder
+    let file = std::fs::File::open(&input.path)?;
+    let projection = ProjectionMask::leaves(
+        input.metadata.metadata().file_metadata().schema_descr(),
+        input.metadata_projection.clone(),
+    );
+    let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(file, input.metadata.clone())
         .with_projection(projection)
         .with_row_groups(vec![descriptor.row_group])
         .with_batch_size(65_536)
         .build()?;
     let mut file_row_number = descriptor.row_start;
     for batch in reader {
-        let batch = prepare_metadata_batch(batch?, file_ordinal, file_row_number)?;
+        let batch = prepare_metadata_batch(batch?, input.file_ordinal, file_row_number)?;
         file_row_number += batch.batch.num_rows() as u64;
         sender
             .send(DecodedMetadataRows::Batch(batch))
             .map_err(|_| AnalysisError::State("Metadata row consumer closed".into()))?;
     }
-    sender
-        .send(DecodedMetadataRows::Finished)
-        .map_err(|_| AnalysisError::State("Metadata row consumer closed".into()))
+    Ok(())
 }
 
 fn prepare_metadata_batch(
@@ -427,13 +614,13 @@ fn prepare_metadata_batch(
     Ok(PreparedMetadataBatch {
         batch,
         chains,
+        file_ordinal,
         row_start,
     })
 }
 
 fn attach_metadata_batch(
     resident: &mut ResidentBuilder,
-    file_ordinal: u16,
     prepared: PreparedMetadataBatch,
 ) -> Result<()> {
     let contract = StringColumn::new(&prepared.batch, "contract_address", false)?;
@@ -441,7 +628,7 @@ fn attach_metadata_batch(
     let metadata = StringColumn::new(&prepared.batch, "metadata_json", true)?;
     for (row, chain) in prepared.chains.into_iter().enumerate() {
         let source = SourceOrder {
-            file_ordinal,
+            file_ordinal: prepared.file_ordinal,
             file_row_number: prepared.row_start + row as u64,
         };
         let contract_address = contract.required(row)?;
@@ -505,6 +692,7 @@ impl<'a> StringColumn<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn evm_owner_hash_is_case_insensitive_without_normalizing_allocation() {
@@ -512,5 +700,39 @@ mod tests {
             input_owner_shard(ChainId::Ethereum, " 0xAbCd ", 128),
             input_owner_shard(ChainId::Ethereum, "0xabcd", 128)
         );
+    }
+
+    #[test]
+    fn metadata_worker_panic_publishes_failed_terminal_and_retires_budget() {
+        let descriptor = RowGroupDescriptor {
+            row_group: 7,
+            row_start: 0,
+            estimated_bytes: 4096,
+        };
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        run_metadata_row_group_worker(descriptor, &sender, || -> Result<()> {
+            panic!("injected metadata decode panic")
+        });
+
+        let (completed_bytes, error) = match receiver.recv_timeout(Duration::from_secs(1)).unwrap()
+        {
+            DecodedMetadataRows::Failed {
+                completed_bytes,
+                error,
+            } => (completed_bytes, error),
+            _ => panic!("panic must publish exactly one failed terminal"),
+        };
+        assert_eq!(completed_bytes, descriptor.estimated_bytes);
+        assert!(matches!(
+            error,
+            AnalysisError::State(message)
+                if message == "Metadata row group 7 panicked during decode"
+        ));
+
+        let mut inflight = 1;
+        let mut inflight_bytes = descriptor.estimated_bytes;
+        retire_metadata_row_group(&mut inflight, &mut inflight_bytes, completed_bytes).unwrap();
+        assert_eq!(inflight, 0);
+        assert_eq!(inflight_bytes, 0);
     }
 }

@@ -239,7 +239,7 @@ impl OpenSeaSeedSource {
             .await?;
         opensea_thirty_day_volume(&payload).ok_or_else(|| {
             AnalysisError::Seed(format!(
-                "OpenSea collection stats omitted a valid thirty_day volume for {slug}"
+                "OpenSea collection stats omitted a valid thirty-day volume for {slug}"
             ))
         })
     }
@@ -248,6 +248,11 @@ impl OpenSeaSeedSource {
 #[async_trait]
 impl SeedSource for OpenSeaSeedSource {
     async fn ranked(&self, chain: crate::model::ChainId, limit: usize) -> Result<Vec<RankedSeed>> {
+        if chain == crate::model::ChainId::Solana {
+            return Err(AnalysisError::Seed(
+                "OpenSea seed source does not support Solana; use Magic Eden".into(),
+            ));
+        }
         let mut ranked = Vec::with_capacity(limit);
         let mut seen_addresses = BTreeSet::new();
         let mut seen_cursors = BTreeSet::new();
@@ -261,64 +266,11 @@ impl SeedSource for OpenSeaSeedSource {
                     AnalysisError::Seed("OpenSea top response omitted collections".into())
                 })?;
             for collection in collections {
-                let collection_name = collection
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("");
-                let slug = collection
-                    .get("collection")
-                    .or_else(|| collection.get("slug"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("");
-                if slug.is_empty() {
-                    continue;
-                }
-                for contract in collection_contracts(collection) {
-                    let raw_chain = contract
-                        .get("chain")
-                        .or_else(|| contract.get("chain_identifier"))
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("");
-                    if !opensea_chain_matches(chain, raw_chain) {
+                for seed in opensea_collection_seeds(chain, collection) {
+                    if !seen_addresses.insert(seed.contract_address.clone()) {
                         continue;
                     }
-                    let Some(address) = ["address", "contract_address", "contractAddress"]
-                        .into_iter()
-                        .find_map(|field| {
-                            contract
-                                .get(field)
-                                .and_then(serde_json::Value::as_str)
-                                .map(str::trim)
-                                .filter(|value| !value.is_empty())
-                        })
-                    else {
-                        continue;
-                    };
-                    if !valid_contract_address(chain, address) {
-                        continue;
-                    }
-                    let address = if chain.is_evm() {
-                        address.to_ascii_lowercase()
-                    } else {
-                        address.to_owned()
-                    };
-                    if !seen_addresses.insert(address.clone()) {
-                        continue;
-                    }
-                    ranked.push(RankedSeed {
-                        chain,
-                        contract_address: address.clone(),
-                        collection_name: if collection_name.is_empty() {
-                            slug.to_owned()
-                        } else {
-                            collection_name.to_owned()
-                        },
-                        stable_identifier: slug.to_owned(),
-                        ranking_metric: "thirty_days_volume".into(),
-                        ranking_value: 0.0,
-                        ranking_window: "30d".into(),
-                        source: "opensea".into(),
-                    });
+                    ranked.push(seed);
                     if ranked.len() == limit {
                         break;
                     }
@@ -427,10 +379,9 @@ impl MagicEdenSeedSource {
     ) -> Result<serde_json::Value> {
         let mut last_error = None;
         for attempt in 0..=self.retries {
-            let _permit =
-                self.request_permits.acquire().await.map_err(|_| {
-                    AnalysisError::State("Magic Eden seed permit pool closed".into())
-                })?;
+            let _permit = self.request_permits.acquire().await.map_err(|_| {
+                AnalysisError::State("Solana seed provider permit pool closed".into())
+            })?;
             let result = match self.client.execute(build()?).await {
                 Ok(response) => crate::api::response_bytes(response, 16 * 1024 * 1024)
                     .await
@@ -461,28 +412,28 @@ impl MagicEdenSeedSource {
         )))
     }
 
-    async fn fetch_popular(&self) -> Result<serde_json::Value> {
-        self.fetch_request(
-            || self.popular_request(),
-            "Magic Eden popular collection request failed",
-        )
-        .await
-    }
-
     async fn collection_detail(
         &self,
         collection: MagicEdenCollection,
-    ) -> Result<Option<MagicEdenCollectionMint>> {
+    ) -> Result<Option<MagicEdenCollectionDetail>> {
         let symbol = collection.symbol.clone();
-        let listing_context = format!("Magic Eden collection listing request failed for {symbol}");
-        let listing = self
-            .fetch_request(
-                || self.collection_listings_request(&symbol),
-                &listing_context,
-            )
-            .await?;
-        Ok(magic_eden_listing_mint(&listing)
-            .map(|mint| MagicEdenCollectionMint { collection, mint }))
+        let mint = if collection.collection_address.is_some() {
+            None
+        } else {
+            let listing_context =
+                format!("Magic Eden collection listing request failed for {symbol}");
+            let listing = self
+                .fetch_request(
+                    || self.collection_listings_request(&symbol),
+                    &listing_context,
+                )
+                .await?;
+            magic_eden_listing_mint(&listing)
+        };
+        if collection.collection_address.is_none() && mint.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(MagicEdenCollectionDetail { collection, mint }))
     }
 
     async fn collection_addresses(&self, mints: &[String]) -> Result<BTreeMap<String, String>> {
@@ -536,7 +487,12 @@ impl SeedSource for MagicEdenSeedSource {
                 "Magic Eden seed source does not support {chain}"
             )));
         }
-        let payload = self.fetch_popular().await?;
+        let payload = self
+            .fetch_request(
+                || self.popular_request(),
+                "Magic Eden popular collection request failed",
+            )
+            .await?;
         let collections = magic_eden_popular_collections(&payload);
         if collections.is_empty() {
             return Err(AnalysisError::Seed(
@@ -555,7 +511,7 @@ impl SeedSource for MagicEdenSeedSource {
         let detail_count = details.len();
         let mints = details
             .iter()
-            .map(|detail| detail.mint.clone())
+            .filter_map(|detail| detail.mint.clone())
             .collect::<Vec<_>>();
         let addresses = self.collection_addresses(&mints).await?;
         let address_count = addresses.len();
@@ -563,7 +519,12 @@ impl SeedSource for MagicEdenSeedSource {
         let mut ranked = details
             .into_iter()
             .filter_map(|detail| {
-                let address = addresses.get(&detail.mint)?.clone();
+                let address = detail.collection.collection_address.clone().or_else(|| {
+                    detail
+                        .mint
+                        .as_ref()
+                        .and_then(|mint| addresses.get(mint).cloned())
+                })?;
                 seen_addresses
                     .insert(address.clone())
                     .then_some(RankedSeed {
@@ -577,14 +538,15 @@ impl SeedSource for MagicEdenSeedSource {
                         source: "magic_eden".into(),
                     })
             })
+            .take(limit)
             .collect::<Vec<_>>();
-        ranked.truncate(limit);
-        if ranked.is_empty() {
+        if ranked.len() != limit {
             return Err(AnalysisError::Seed(format!(
-                "Magic Eden returned no usable Solana collection seeds (listing mints={detail_count}, Helius collection addresses={address_count})"
+                "Magic Eden returned only {} of {limit} usable Solana collection seeds (ranked candidates={detail_count}, Helius collection addresses={address_count})",
+                ranked.len()
             )));
         }
-        Ok(ranked)
+        Ok(std::mem::take(&mut ranked))
     }
 }
 
@@ -592,12 +554,13 @@ impl SeedSource for MagicEdenSeedSource {
 struct MagicEdenCollection {
     symbol: String,
     name: String,
+    collection_address: Option<String>,
     rank: u32,
 }
 
-struct MagicEdenCollectionMint {
+struct MagicEdenCollectionDetail {
     collection: MagicEdenCollection,
-    mint: String,
+    mint: Option<String>,
 }
 
 fn magic_eden_popular_collections(payload: &serde_json::Value) -> Vec<MagicEdenCollection> {
@@ -626,9 +589,25 @@ fn magic_eden_popular_collections(payload: &serde_json::Value) -> Vec<MagicEdenC
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or(symbol);
+            let collection_address = [
+                "onChainCollectionAddress",
+                "on_chain_collection_address",
+                "collectionAddress",
+                "collection_address",
+            ]
+            .into_iter()
+            .find_map(|field| {
+                collection
+                    .get(field)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| valid_contract_address(crate::model::ChainId::Solana, value))
+                    .map(str::to_owned)
+            });
             Some(MagicEdenCollection {
                 symbol: symbol.to_owned(),
                 name: name.to_owned(),
+                collection_address,
                 rank: u32::try_from(index + 1).ok()?,
             })
         })
@@ -639,14 +618,18 @@ fn magic_eden_listing_mint(payload: &serde_json::Value) -> Option<String> {
     let listing = payload
         .as_array()
         .and_then(|items| items.first())
-        .or_else(|| payload.get("results")?.as_array()?.first())?;
+        .or_else(|| payload.get("results")?.as_array()?.first())
+        .or_else(|| payload.get("data")?.as_array()?.first())
+        .or_else(|| payload.get("items")?.as_array()?.first())?;
     listing
         .get("tokenMint")
         .or_else(|| listing.get("token_mint"))
+        .or_else(|| listing.get("mintAddress"))
+        .or_else(|| listing.get("mint"))
         .or_else(|| {
             listing
                 .get("token")
-                .and_then(|token| token.get("mintAddress"))
+                .and_then(|token| token.get("mintAddress").or_else(|| token.get("mint")))
         })
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
@@ -673,6 +656,70 @@ fn helius_collection_address(item: &serde_json::Value) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
+}
+
+fn opensea_collection_seeds(
+    chain: crate::model::ChainId,
+    collection: &serde_json::Value,
+) -> Vec<RankedSeed> {
+    let collection_name = collection
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    let slug = collection
+        .get("collection")
+        .or_else(|| collection.get("slug"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if slug.is_empty() {
+        return Vec::new();
+    }
+
+    collection_contracts(collection)
+        .into_iter()
+        .filter_map(|contract| {
+            let raw_chain = contract
+                .get("chain")
+                .or_else(|| contract.get("chain_identifier"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if !opensea_chain_matches(chain, raw_chain) {
+                return None;
+            }
+            let address = ["address", "contract_address", "contractAddress"]
+                .into_iter()
+                .find_map(|field| {
+                    contract
+                        .get(field)
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                })?;
+            if !valid_contract_address(chain, address) {
+                return None;
+            }
+            Some(RankedSeed {
+                chain,
+                contract_address: if chain.is_evm() {
+                    address.to_ascii_lowercase()
+                } else {
+                    address.to_owned()
+                },
+                collection_name: if collection_name.is_empty() {
+                    slug.to_owned()
+                } else {
+                    collection_name.to_owned()
+                },
+                stable_identifier: slug.to_owned(),
+                ranking_metric: "thirty_days_volume".into(),
+                ranking_value: 0.0,
+                ranking_window: "30d".into(),
+                source: "opensea".into(),
+            })
+        })
+        .collect()
 }
 
 fn collection_contracts(collection: &serde_json::Value) -> Vec<&serde_json::Value> {
@@ -801,12 +848,16 @@ mod tests {
         );
         assert_eq!(
             opensea_thirty_day_volume(&serde_json::json!({
-                "intervals":[
-                    {"interval":"one_day","volume":1},
-                    {"interval":"thirty_day","volume":12.5}
-                ]
+                "intervals":[{"interval":"thirty_day","volume":"12.5"}]
             })),
             Some(12.5)
+        );
+        assert_eq!(
+            opensea_thirty_day_volume(&serde_json::json!({
+                "total":{"volume":99},
+                "intervals":[{"interval":"one_day","volume":7}]
+            })),
+            None
         );
     }
 
@@ -840,23 +891,34 @@ mod tests {
             vec![MagicEdenCollection {
                 symbol: "popular".into(),
                 name: "Popular".into(),
+                collection_address: None,
                 rank: 1,
             }]
         );
         assert_eq!(
-            magic_eden_listing_mint(&serde_json::json!([{
-                "tokenMint":"So11111111111111111111111111111111111111112"
-            }])),
+            magic_eden_popular_collections(&serde_json::json!([{
+                "symbol":"addressed",
+                "name":"Addressed",
+                "onChainCollectionAddress":"So11111111111111111111111111111111111111112"
+            }]))[0]
+                .collection_address
+                .as_deref(),
+            Some("So11111111111111111111111111111111111111112")
+        );
+        assert_eq!(
+            magic_eden_listing_mint(&serde_json::json!({"results":[{
+                "mintAddress":"So11111111111111111111111111111111111111112"
+            }]})),
             Some("So11111111111111111111111111111111111111112".into())
         );
         assert_eq!(
             helius_collection_address(&serde_json::json!({
                 "grouping":[{
                     "group_key":"collection",
-                    "group_value":"11111111111111111111111111111111"
+                    "group_value":"So11111111111111111111111111111111111111112"
                 }]
             })),
-            Some("11111111111111111111111111111111".into())
+            Some("So11111111111111111111111111111111111111112".into())
         );
     }
 

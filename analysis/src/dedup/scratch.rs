@@ -1,5 +1,5 @@
 use crate::model::{NameValueId, ProfileId};
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashSet;
 use std::cell::RefCell;
 
 #[derive(Default)]
@@ -7,8 +7,6 @@ pub struct WorkerScratch {
     pub name_candidates: Vec<NameValueId>,
     pub metadata_candidates: Vec<ProfileId>,
     pub sparse_seen: AHashSet<u32>,
-    pub name_left_counts: AHashMap<char, u32>,
-    pub name_right_counts: AHashMap<char, u32>,
 }
 
 thread_local! {
@@ -29,8 +27,6 @@ pub fn release_name_scratch() {
     WORKER_SCRATCH.with(|scratch| {
         let mut scratch = scratch.borrow_mut();
         scratch.name_candidates = Vec::new();
-        scratch.name_left_counts = AHashMap::new();
-        scratch.name_right_counts = AHashMap::new();
     });
 }
 

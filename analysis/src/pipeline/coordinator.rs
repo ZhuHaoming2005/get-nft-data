@@ -5,10 +5,10 @@ use crate::dedup::{
     query_uri_shard_with_plan_into,
 };
 use crate::error::{AnalysisError, Result};
-use crate::progress::Progress;
+use crate::progress::{Progress, WorkPhase};
 use crate::resident::{
     MetadataIndex, NameIndex, PreparedMetadataPlan, PreparedNamePlan, PreparedUriPlan,
-    ResidentBaseStore, SeedRawPlan, UriIndex,
+    ResidentBaseStore, SeedRawPlan, UriIndex, UriSeedFilter,
 };
 use crate::seed::SeedManifest;
 use rayon::prelude::*;
@@ -30,8 +30,22 @@ pub fn execute_dedup(
     progress: &Progress,
     finalized_candidates: Sender<crate::pipeline::CandidateRelationsEvent>,
 ) -> Result<DedupOutput> {
-    let mut failed_seeds = std::collections::BTreeSet::new();
     let raw_plan = SeedRawPlan::build(&store, manifest)?;
+    let mut failed_seeds = raw_plan.missing_seed_ids.clone();
+    for &seed_id in &raw_plan.missing_seed_ids {
+        progress.mark_incomplete_seed(seed_id);
+    }
+    if raw_plan.seeds.is_empty() {
+        drop(raw_plan);
+        drop(store.take_uri_stage());
+        drop(store.take_name_stage());
+        drop(store.take_metadata_stage());
+        drop(finalized_candidates);
+        return Ok(DedupOutput {
+            store,
+            failed_seeds,
+        });
+    }
     let uri_identities = store
         .uri_identity
         .as_ref()
@@ -55,17 +69,25 @@ pub fn execute_dedup(
         .iter()
         .filter_map(|seed| seed.name_value)
         .collect::<Vec<_>>();
+    progress.begin_phase(
+        WorkPhase::UriIndex,
+        Some(uri_features.features.len() as u64 + 1),
+    );
+    let uri_seed_filter = UriSeedFilter::new(uri_features.values.len(), &token_uris, &image_uris);
     let mut uri_index_parts = executor.install_on_all(|lane, lane_count| {
-        UriIndex::build_partition(
+        UriIndex::build_partition_with_filter_progress(
             uri_identities,
             uri_features,
-            &token_uris,
-            &image_uris,
+            &uri_seed_filter,
             config.index_shards,
             lane,
             lane_count,
+            Some(progress),
         )
     });
+    drop(uri_seed_filter);
+    drop(token_uris);
+    drop(image_uris);
     let mut uri_index = uri_index_parts
         .pop()
         .expect("CpuExecutor always has at least one NUMA lane");
@@ -73,6 +95,8 @@ pub fn execute_dedup(
         uri_index.merge(partial);
     }
     uri_index.finalize();
+    progress.add_phase_completed(1);
+    progress.finish_phase();
     progress.add_postings(crate::model::Dimension::TokenUri, uri_index.posting_count());
     let prepared_uri_plan = PreparedUriPlan::build(&raw_plan, &uri_index, config.index_shards);
     let uri_work = prepared_uri_plan
@@ -88,6 +112,7 @@ pub fn execute_dedup(
     } else {
         uri_work.len()
     };
+    progress.begin_phase(WorkPhase::UriQuery, Some(uri_work.len() as u64));
     // Dimension-level shard seal: every URI shard query below (main pass and
     // overlapped tail) registers a seed-batch guard so a panicking or
     // otherwise failed query soft-fails into `failed_seed_bitmap` instead of
@@ -119,6 +144,7 @@ pub fn execute_dedup(
                             &uri_tracker,
                         );
                         progress.add_shard_batch();
+                        progress.add_phase_completed(1);
                         accumulator
                     },
                 )
@@ -136,6 +162,10 @@ pub fn execute_dedup(
             .name_features
             .as_ref()
             .ok_or_else(|| AnalysisError::State("Name feature stage unavailable".into()))?;
+        progress.begin_secondary_phase(
+            WorkPhase::NameIndex,
+            Some(name_features.values.len() as u64 + 1),
+        );
         let (tail_relations, name_index) = executor.install_on_lane(0, || {
             rayon::join(
                 || {
@@ -167,6 +197,7 @@ pub fn execute_dedup(
                                             &uri_tracker,
                                         );
                                         progress.add_shard_batch();
+                                        progress.add_phase_completed(1);
                                         accumulator
                                     },
                                 )
@@ -179,19 +210,33 @@ pub fn execute_dedup(
                         .reduce(crate::dedup::RelationAccumulator::merge)
                         .unwrap_or_else(|| crate::dedup::RelationAccumulator::new(&store.contracts))
                 },
-                || NameIndex::build_numa(name_features, &seed_names, config.index_shards, executor),
+                || {
+                    NameIndex::build_numa_with_secondary_progress(
+                        name_features,
+                        &seed_names,
+                        config.index_shards,
+                        executor,
+                        progress,
+                    )
+                },
             )
         });
         uri_relations = uri_relations.merge(tail_relations);
         overlapped_name_index = Some(name_index);
+        progress.add_secondary_phase_completed(1);
+        progress.finish_secondary_phase();
     }
     uri_tracker.close_producer();
     let uri_seal = uri_tracker.try_seal().ok_or_else(|| {
         AnalysisError::State("URI dimension tracker failed to reach quiescence".into())
     })?;
+    progress.finish_phase();
+    for seed_id in uri_seal.failed_seed_ids() {
+        progress.mark_incomplete_seed(seed_id);
+    }
     failed_seeds.extend(uri_seal.failed_seed_ids());
     let mut uri_relations = uri_relations.finish();
-    progress.add_incomplete_seeds(mark_incomplete_seeds(&mut uri_relations, uri_seal));
+    progress.add_incomplete_relations(mark_incomplete_seeds(&mut uri_relations, uri_seal));
     drop(uri_work);
     drop(prepared_uri_plan);
     executor.broadcast(crate::dedup::release_uri_scratch);
@@ -202,9 +247,25 @@ pub fn execute_dedup(
         .name_features
         .as_ref()
         .ok_or_else(|| AnalysisError::State("Name feature stage unavailable".into()))?;
-    let name_index = overlapped_name_index.unwrap_or_else(|| {
-        NameIndex::build_numa(name_features, &seed_names, config.index_shards, executor)
-    });
+    let name_index = match overlapped_name_index {
+        Some(name_index) => name_index,
+        None => {
+            progress.begin_phase(
+                WorkPhase::NameIndex,
+                Some(name_features.values.len() as u64 + 1),
+            );
+            let name_index = NameIndex::build_numa_with_progress(
+                name_features,
+                &seed_names,
+                config.index_shards,
+                executor,
+                progress,
+            );
+            progress.add_phase_completed(1);
+            progress.finish_phase();
+            name_index
+        }
+    };
     progress.add_postings(crate::model::Dimension::Name, name_index.posting_count());
     // Safe rarity-sorted candidate prefixes are computed once per seed here,
     // then reused unchanged across every one of the 128 owner-shard queries
@@ -215,6 +276,8 @@ pub fn execute_dedup(
     // returns. failed_seed_bitmap soft-fails affected seeds instead of
     // aborting the run.
     let name_tracker = Arc::new(crate::pipeline::ShardWorkTracker::default());
+    let name_work = raw_plan.seeds.len().saturating_mul(config.index_shards);
+    progress.begin_phase(WorkPhase::NameQuery, Some(name_work as u64));
     let mut name_relations = executor
         .install_on_all(|lane, lane_count| {
             (0..raw_plan.seeds.len() * config.index_shards)
@@ -248,6 +311,7 @@ pub fn execute_dedup(
                             }
                         }
                         progress.add_shard_batch();
+                        progress.add_phase_completed(1);
                         accumulator
                     },
                 )
@@ -265,8 +329,12 @@ pub fn execute_dedup(
     let name_seal = name_tracker.try_seal().ok_or_else(|| {
         AnalysisError::State("Name dimension tracker failed to reach quiescence".into())
     })?;
+    progress.finish_phase();
+    for seed_id in name_seal.failed_seed_ids() {
+        progress.mark_incomplete_seed(seed_id);
+    }
     failed_seeds.extend(name_seal.failed_seed_ids());
-    progress.add_incomplete_seeds(mark_incomplete_seeds(&mut name_relations, name_seal));
+    progress.add_incomplete_relations(mark_incomplete_seeds(&mut name_relations, name_seal));
     drop(prepared_name_plan);
     executor.broadcast(crate::dedup::release_name_scratch);
     drop(name_index);
@@ -287,14 +355,22 @@ pub fn execute_dedup(
         .iter()
         .flat_map(|seed| seed.metadata_documents.iter().copied())
         .collect::<Vec<_>>();
-    let metadata_index = MetadataIndex::build_numa(
-        store
-            .metadata_features
-            .as_ref()
-            .expect("Metadata feature stage was checked before index build"),
+    let metadata_features = store
+        .metadata_features
+        .as_ref()
+        .expect("Metadata feature stage was checked before index build");
+    progress.begin_phase(
+        WorkPhase::MetadataIndex,
+        Some(
+            metadata_features.documents.len() as u64 + metadata_features.profiles.len() as u64 + 1,
+        ),
+    );
+    let metadata_index = MetadataIndex::build_numa_with_progress(
+        metadata_features,
         &seed_documents,
         config.index_shards,
         executor,
+        progress,
     );
     let prepared_metadata_plan = Arc::new(PreparedMetadataPlan::build(
         &raw_plan,
@@ -305,6 +381,8 @@ pub fn execute_dedup(
         &metadata_index,
     ));
     let metadata_index = Arc::new(metadata_index);
+    progress.add_phase_completed(1);
+    progress.finish_phase();
     progress.add_postings(
         crate::model::Dimension::Metadata,
         metadata_index.posting_count(),
@@ -337,6 +415,10 @@ pub fn execute_dedup(
     let mut exact_by_metadata_shard = (0..config.index_shards)
         .map(|_| crate::dedup::RelationAccumulator::new(&store.contracts))
         .collect::<Vec<_>>();
+    let mut exact_relations_by_metadata_shard = (0..config.index_shards)
+        .map(|_| Vec::new())
+        .collect::<Vec<_>>();
+    let mut exact_pending_batches = pending_batches.clone();
     let (completion_tx, completion_rx) = std::sync::mpsc::channel();
     let spawn_exact_batch = |(shard, start, end): (usize, usize, usize)| {
         let completion_tx = completion_tx.clone();
@@ -387,12 +469,14 @@ pub fn execute_dedup(
     for task in tasks.by_ref().take(admission) {
         let _ = spawn_exact_batch(task);
     }
+    progress.begin_phase(WorkPhase::MetadataExact, Some(total_batches as u64));
     let mut exact_error = None;
     for _ in 0..total_batches {
         let (shard, _start, _end, result) = completion_rx
             .recv()
             .map_err(|_| AnalysisError::State("metadata exact completion channel closed".into()))?;
         progress.add_shard_batch();
+        progress.add_phase_completed(1);
         if let Some(task) = tasks.next() {
             let _ = spawn_exact_batch(task);
         }
@@ -402,40 +486,48 @@ pub fn execute_dedup(
                 exact_error.get_or_insert(error);
             }
         }
+        exact_pending_batches[shard] = exact_pending_batches[shard]
+            .checked_sub(1)
+            .ok_or_else(|| AnalysisError::State("metadata exact completion underflow".into()))?;
+        if exact_pending_batches[shard] == 0 && exact_error.is_none() {
+            let mut exact_relations = std::mem::replace(
+                &mut exact_by_metadata_shard[shard],
+                crate::dedup::RelationAccumulator::new(&store.contracts),
+            )
+            .finish();
+            if !exact_relations.is_empty() {
+                sort_by_candidate(&mut exact_relations);
+                // Publish this owner shard immediately. The network pipeline
+                // can prefetch exact matches while the remaining exact shards
+                // and the following BM25 wave continue on the CPU executor.
+                stream_relation_refs(
+                    &finalized_candidates,
+                    &exact_relations,
+                    crate::pipeline::CandidateRelationsEvent::Prefetch,
+                    CANDIDATE_BATCH_CAPACITY,
+                )?;
+            }
+            exact_relations_by_metadata_shard[shard] = exact_relations;
+        }
     }
     if let Some(error) = exact_error {
         executor.broadcast(crate::dedup::release_metadata_scratch);
         return Err(error);
     }
-    let mut exact_relations_by_metadata_shard = exact_by_metadata_shard
-        .into_iter()
-        .map(crate::dedup::RelationAccumulator::finish)
-        .collect::<Vec<_>>();
-    for exact_relations in &mut exact_relations_by_metadata_shard {
-        if exact_relations.is_empty() {
-            continue;
-        }
-        sort_by_candidate(exact_relations);
-        stream_relation_refs(
-            &finalized_candidates,
-            exact_relations,
-            crate::pipeline::CandidateRelationsEvent::Prefetch,
-            CANDIDATE_BATCH_CAPACITY,
-        )?;
-    }
-    let mut candidate_count = 0_u64;
+    progress.finish_phase();
+    drop(exact_by_metadata_shard);
     if !no_metadata_owner.is_empty() {
         let mut relations = no_metadata_owner;
-        progress.add_incomplete_seeds(mark_relations_incomplete_for_failed(
+        progress.add_incomplete_relations(mark_relations_incomplete_for_failed(
             &mut relations,
             &failed_seeds,
         ));
-        candidate_count = candidate_count.saturating_add(stream_relations(
+        stream_relations(
             &finalized_candidates,
             relations,
             crate::pipeline::CandidateRelationsEvent::Frozen,
             CANDIDATE_BATCH_CAPACITY,
-        )?);
+        )?;
     }
     let (completion_tx, completion_rx) = std::sync::mpsc::channel();
     let spawn_bm25_batch = |(shard, start, end): (usize, usize, usize)| {
@@ -489,6 +581,7 @@ pub fn execute_dedup(
     for task in metadata_tasks.by_ref().take(admission) {
         let _ = spawn_bm25_batch(task);
     }
+    progress.begin_phase(WorkPhase::MetadataBm25, Some(total_batches as u64));
     let mut accumulated = (0..config.index_shards)
         .map(|_| crate::dedup::RelationAccumulator::new(&store.contracts))
         .collect::<Vec<_>>();
@@ -498,6 +591,7 @@ pub fn execute_dedup(
             .recv()
             .map_err(|_| AnalysisError::State("metadata shard completion channel closed".into()))?;
         progress.add_shard_batch();
+        progress.add_phase_completed(1);
         if let Some(task) = metadata_tasks.next() {
             let _ = spawn_bm25_batch(task);
         }
@@ -530,22 +624,23 @@ pub fn execute_dedup(
                     .into_iter()
                     .chain(metadata_relations),
             );
-            progress.add_incomplete_seeds(mark_relations_incomplete_for_failed(
+            progress.add_incomplete_relations(mark_relations_incomplete_for_failed(
                 &mut relations,
                 &failed_seeds,
             ));
-            candidate_count = candidate_count.saturating_add(stream_relations(
+            stream_relations(
                 &finalized_candidates,
                 relations,
                 crate::pipeline::CandidateRelationsEvent::Frozen,
                 CANDIDATE_BATCH_CAPACITY,
-            )?);
+            )?;
         }
     }
     if let Some(error) = bm25_error {
         executor.broadcast(crate::dedup::release_metadata_scratch);
         return Err(error);
     }
+    progress.finish_phase();
     drop(accumulated);
     drop(prepared_metadata_plan);
     executor.broadcast(crate::dedup::release_metadata_scratch);
@@ -555,7 +650,6 @@ pub fn execute_dedup(
         AnalysisError::State("metadata tasks still reference resident store".into())
     })?;
     drop(store.take_metadata_stage());
-    progress.set_candidates(candidate_count);
     drop(finalized_candidates);
     Ok(DedupOutput {
         store,
@@ -604,7 +698,7 @@ fn query_uri_shard_tracked(
 /// Marks every relation whose seed fell in `seal`'s `failed_seed_bitmap` as
 /// `incomplete` (soft-fail; see REWRITE_ARCHITECTURE §7.6/§8.4) instead of
 /// aborting the run, and returns how many relations were touched so callers
-/// can surface it through [`Progress::add_incomplete_seeds`].
+/// can surface it through [`Progress::add_incomplete_relations`].
 fn mark_incomplete_seeds(
     relations: &mut [crate::model::SeedCandidateRelation],
     seal: crate::pipeline::DimensionShardSeal,

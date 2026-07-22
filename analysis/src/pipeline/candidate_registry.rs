@@ -1,5 +1,5 @@
 use crate::error::{AnalysisError, Result};
-use crate::model::{CandidateId, ContractKey, SeedCandidateRelation};
+use crate::model::{CandidateId, ContractKey, NftSelection, SeedCandidateRelation, SeedId};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -10,6 +10,50 @@ pub struct CandidateRecord {
     pub id: CandidateId,
     pub key: ContractKey,
     pub relations: Arc<Vec<SeedCandidateRelation>>,
+    /// Normalized once when the candidate record is formed. Explicit NFT
+    /// selections can be large, so the fetch pipeline must not rebuild them
+    /// every time a speculative prefetch is upgraded or frozen.
+    pub selection: Arc<NftSelection>,
+    /// Sorted unique relation seeds, cached for allocation-free coverage tests.
+    pub seed_ids: Arc<Vec<SeedId>>,
+}
+
+impl CandidateRecord {
+    pub fn new(
+        id: CandidateId,
+        key: ContractKey,
+        relations: Vec<SeedCandidateRelation>,
+    ) -> Result<Self> {
+        if relations.is_empty() {
+            return Err(AnalysisError::State(
+                "candidate record cannot be built from empty relations".into(),
+            ));
+        }
+        if relations.iter().any(|relation| relation.candidate != key) {
+            return Err(AnalysisError::State(format!(
+                "candidate {} relation group contains inconsistent contract keys",
+                id.0
+            )));
+        }
+        let mut selection = relations[0].selection.clone();
+        for relation in &relations[1..] {
+            selection.union_assign(relation.selection.clone());
+        }
+        selection.normalize();
+        let mut seed_ids = relations
+            .iter()
+            .map(|relation| relation.seed_id)
+            .collect::<Vec<_>>();
+        seed_ids.sort_unstable();
+        seed_ids.dedup();
+        Ok(Self {
+            id,
+            key,
+            relations: Arc::new(relations),
+            selection: Arc::new(selection),
+            seed_ids: Arc::new(seed_ids),
+        })
+    }
 }
 
 /// Compact duplicate guard for the single-owner candidate stream.
@@ -50,17 +94,7 @@ impl CandidateRegistry {
                 .ok_or_else(|| AnalysisError::State("empty relation group".into()))?
                 .candidate
                 .clone();
-            if relations.iter().any(|relation| relation.candidate != key) {
-                return Err(AnalysisError::State(format!(
-                    "candidate {} relation group contains inconsistent contract keys",
-                    candidate_id.0
-                )));
-            }
-            inserted.push(CandidateRecord {
-                id: candidate_id,
-                key,
-                relations: Arc::new(relations),
-            });
+            inserted.push(CandidateRecord::new(candidate_id, key, relations)?);
         }
         inserted.sort_by(|left, right| left.key.cmp(&right.key));
         Ok(inserted)

@@ -6,6 +6,7 @@ use crate::resident::{
 };
 use crate::seed::SeedManifest;
 use ahash::AHashMap;
+use std::collections::BTreeSet;
 
 #[derive(Clone, Debug)]
 pub struct SeedRawQuery {
@@ -23,6 +24,7 @@ pub struct SeedRawQuery {
 #[derive(Clone, Debug)]
 pub struct SeedRawPlan {
     pub seeds: Vec<SeedRawQuery>,
+    pub missing_seed_ids: BTreeSet<SeedId>,
 }
 
 impl SeedRawPlan {
@@ -44,14 +46,13 @@ impl SeedRawPlan {
             .as_ref()
             .ok_or_else(|| AnalysisError::State("Metadata features already released".into()))?;
         let mut seeds = Vec::with_capacity(manifest.seeds.len());
+        let mut missing_seed_ids = BTreeSet::new();
         for definition in &manifest.seeds {
             let key = definition.contract_key();
-            let contract_id = store.contracts.find(&key).ok_or_else(|| {
-                AnalysisError::Seed(format!(
-                    "seed is absent from snapshot: {}:{}",
-                    key.chain, key.contract_address
-                ))
-            })?;
+            let Some(contract_id) = store.contracts.find(&key) else {
+                missing_seed_ids.insert(definition.id);
+                continue;
+            };
             let mut token_uri_values = Vec::new();
             let mut image_uri_values = Vec::new();
             let mut token_uri_evidence = AHashMap::new();
@@ -107,7 +108,10 @@ impl SeedRawPlan {
                 metadata_documents,
             });
         }
-        Ok(Self { seeds })
+        Ok(Self {
+            seeds,
+            missing_seed_ids,
+        })
     }
 }
 
@@ -234,5 +238,70 @@ impl PreparedMetadataPlan {
                 .map(|seed| index.prepare_query(features, seed.metadata_profile))
                 .collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ChainId, InputRow, SourceOrder};
+    use crate::resident::ResidentBuilder;
+    use crate::seed::SeedDefinition;
+
+    fn seed(id: SeedId, chain: ChainId, contract_address: &str, rank: u8) -> SeedDefinition {
+        let collected_at = chrono::Utc::now();
+        SeedDefinition {
+            id,
+            chain,
+            contract_address: contract_address.to_owned(),
+            rank,
+            collection_name: contract_address.to_owned(),
+            stable_identifier: contract_address.to_owned(),
+            ranking_metric: "total_volume".to_owned(),
+            ranking_value: 1.0,
+            ranking_window: "all_time".to_owned(),
+            source: "opensea".to_owned(),
+            collected_at,
+        }
+    }
+
+    #[test]
+    fn missing_snapshot_seed_is_recorded_without_aborting_present_seeds() {
+        let mut builder = ResidentBuilder::default();
+        builder
+            .push(InputRow {
+                chain: ChainId::Base,
+                contract_address: "present".to_owned(),
+                token_id: "1".to_owned(),
+                name_norm: Some("present name".to_owned()),
+                token_uri_norm: Some("ipfs://present-token".to_owned()),
+                image_uri_norm: Some("ipfs://present-image".to_owned()),
+                metadata_json: Some(r#"{"name":"present"}"#.to_owned()),
+                source_order: SourceOrder {
+                    file_ordinal: 0,
+                    file_row_number: 0,
+                },
+            })
+            .unwrap();
+        let store = builder.finish(8, 128).unwrap();
+        let generated_at = chrono::Utc::now();
+        let manifest = SeedManifest {
+            generated_at,
+            seeds: vec![
+                seed(SeedId(0), ChainId::Base, "present", 1),
+                seed(
+                    SeedId(1),
+                    ChainId::Base,
+                    "0x7d093830fcee68724e81a483def9966f5fac163a",
+                    2,
+                ),
+            ],
+        };
+
+        let plan = SeedRawPlan::build(&store, &manifest).unwrap();
+
+        assert_eq!(plan.seeds.len(), 1);
+        assert_eq!(plan.seeds[0].seed_id, SeedId(0));
+        assert_eq!(plan.missing_seed_ids, BTreeSet::from([SeedId(1)]));
     }
 }

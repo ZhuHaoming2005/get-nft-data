@@ -311,7 +311,7 @@ impl MetadataIndex {
         seed_documents: &[MetadataId],
         shard_count: usize,
     ) -> Self {
-        Self::build_inner(features, seed_documents, shard_count, None)
+        Self::build_inner(features, seed_documents, shard_count, None, None)
     }
 
     pub fn build_numa(
@@ -320,7 +320,23 @@ impl MetadataIndex {
         shard_count: usize,
         executor: &crate::pipeline::CpuExecutor,
     ) -> Self {
-        Self::build_inner(features, seed_documents, shard_count, Some(executor))
+        Self::build_inner(features, seed_documents, shard_count, Some(executor), None)
+    }
+
+    pub fn build_numa_with_progress(
+        features: &MetadataFeatureStore,
+        seed_documents: &[MetadataId],
+        shard_count: usize,
+        executor: &crate::pipeline::CpuExecutor,
+        progress: &crate::progress::Progress,
+    ) -> Self {
+        Self::build_inner(
+            features,
+            seed_documents,
+            shard_count,
+            Some(executor),
+            Some(progress),
+        )
     }
 
     fn build_inner(
@@ -328,6 +344,7 @@ impl MetadataIndex {
         seed_documents: &[MetadataId],
         shard_count: usize,
         executor: Option<&crate::pipeline::CpuExecutor>,
+        progress: Option<&crate::progress::Progress>,
     ) -> Self {
         let mut seed_term_bytes = seed_documents
             .iter()
@@ -342,16 +359,15 @@ impl MetadataIndex {
         seed_term_bytes.clear();
         const DOCUMENT_CHUNK: usize = 4_096;
         let chunk_count = features.documents.len().div_ceil(DOCUMENT_CHUNK);
-        let analyze_chunk = |chunk: usize| {
+        let analyze_chunk = |chunk: usize, scratch: &mut DocumentScratch| {
             let start = chunk * DOCUMENT_CHUNK;
             let end = (start + DOCUMENT_CHUNK).min(features.documents.len());
-            let mut scratch = DocumentScratch::default();
             let mut documents = Vec::with_capacity(end - start);
             let mut terms = Vec::new();
             let mut histograms = Vec::new();
             for document in start..end {
                 let canonical = features.documents.get(document as u32);
-                analyze_document_tokens(canonical, &seed_term_ids, &mut scratch);
+                analyze_document_tokens(canonical, &seed_term_ids, scratch);
                 documents.push(PreparedDocument {
                     term_start: terms.len() as u64,
                     term_len: scratch.intersections.len() as u32,
@@ -371,7 +387,13 @@ impl MetadataIndex {
                     (0..chunk_count)
                         .into_par_iter()
                         .filter(|chunk| chunk % lane_count == lane)
-                        .map(|chunk| (chunk, analyze_chunk(chunk)))
+                        .map_init(DocumentScratch::default, |scratch, chunk| {
+                            let contents = analyze_chunk(chunk, scratch);
+                            if let Some(progress) = progress {
+                                progress.add_phase_completed(contents.0.len() as u64);
+                            }
+                            (chunk, contents)
+                        })
                         .collect::<Vec<_>>()
                 })
                 .into_iter()
@@ -382,7 +404,9 @@ impl MetadataIndex {
         } else {
             (0..chunk_count)
                 .into_par_iter()
-                .map(analyze_chunk)
+                .map_init(DocumentScratch::default, |scratch, chunk| {
+                    analyze_chunk(chunk, scratch)
+                })
                 .collect()
         };
         let document_count = chunks.iter().map(|chunk| chunk.0.len()).sum();
@@ -421,16 +445,18 @@ impl MetadataIndex {
                         .enumerate()
                         .filter(|(shard, _)| shard % lane_count == lane)
                         .map(|(shard, profiles)| {
-                            (
-                                shard,
-                                build_metadata_shard(
-                                    profiles.clone(),
-                                    features,
-                                    &documents,
-                                    &terms,
-                                    &seed_digests,
-                                ),
-                            )
+                            let completed = profiles.len() as u64;
+                            let shard_index = build_metadata_shard(
+                                profiles.clone(),
+                                features,
+                                &documents,
+                                &terms,
+                                &seed_digests,
+                            );
+                            if let Some(progress) = progress {
+                                progress.add_phase_completed(completed);
+                            }
+                            (shard, shard_index)
                         })
                         .collect::<Vec<_>>()
                 })

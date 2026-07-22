@@ -4,7 +4,6 @@ use crate::resident::candidate_bounds::CandidateBounds;
 use crate::resident::{
     NameFeatureStore, NameIndex, PreparedNameQuery, ResidentBaseStore, SeedRawQuery,
 };
-use ahash::AHashMap;
 use rapidfuzz::distance::jaro_winkler::{Args, BatchComparator};
 use std::sync::Arc;
 
@@ -104,28 +103,24 @@ fn visit_name_shard(
     };
     crate::dedup::scratch::with_worker_scratch(|scratch| {
         let left = index.characters(seed_name);
+        let left_sorted = index.sorted_characters(seed_name);
         let comparator = BatchComparator::new(left.iter().copied());
         let left_text: Arc<str> = Arc::from(features.values.get(seed_name.0));
         let args = Args::default().score_cutoff(threshold);
         let threshold_pct = threshold * 100.0;
-        scratch.name_left_counts.clear();
-        for &character in left {
-            *scratch.name_left_counts.entry(character).or_insert(0_u32) += 1;
-        }
         index.candidates_into(shard, query, &mut scratch.name_candidates);
         for &candidate_name in &scratch.name_candidates {
             let right = index.characters(candidate_name);
             if !CandidateBounds::lengths_can_reach(left.len(), right.len(), threshold_pct) {
                 continue;
             }
-            let overlap = multiset_overlap(
-                &scratch.name_left_counts,
-                right,
-                &mut scratch.name_right_counts,
-            );
-            if overlap
-                < CandidateBounds::minimum_multiset_overlap(left.len(), right.len(), threshold_pct)
-            {
+            let required =
+                CandidateBounds::minimum_multiset_overlap(left.len(), right.len(), threshold_pct);
+            if !multiset_overlap_at_least(
+                left_sorted,
+                index.sorted_characters(candidate_name),
+                required,
+            ) {
                 continue;
             }
             let score = if candidate_name == seed_name {
@@ -166,20 +161,44 @@ fn visit_name_shard(
     });
 }
 
-fn multiset_overlap(
-    left: &AHashMap<char, u32>,
-    right: &[char],
-    right_counts: &mut AHashMap<char, u32>,
-) -> usize {
-    right_counts.clear();
-    for &character in right {
-        *right_counts.entry(character).or_insert(0) += 1;
+fn multiset_overlap_at_least(left: &[char], right: &[char], required: usize) -> bool {
+    if required == 0 {
+        return true;
     }
-    right_counts
-        .iter()
-        .map(|(character, right)| {
-            usize::try_from((*right).min(left.get(character).copied().unwrap_or(0)))
-                .unwrap_or(usize::MAX)
-        })
-        .sum()
+    let (mut left_index, mut right_index, mut overlap) = (0_usize, 0_usize, 0_usize);
+    while left_index < left.len() && right_index < right.len() {
+        match left[left_index].cmp(&right[right_index]) {
+            std::cmp::Ordering::Less => left_index += 1,
+            std::cmp::Ordering::Greater => right_index += 1,
+            std::cmp::Ordering::Equal => {
+                overlap += 1;
+                if overlap >= required {
+                    return true;
+                }
+                left_index += 1;
+                right_index += 1;
+            }
+        }
+        if overlap.saturating_add((left.len() - left_index).min(right.len() - right_index))
+            < required
+        {
+            return false;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::multiset_overlap_at_least;
+
+    #[test]
+    fn sorted_multiset_overlap_handles_unicode_and_repetitions() {
+        let mut left = "a界界bc".chars().collect::<Vec<_>>();
+        let mut right = "界a界界z".chars().collect::<Vec<_>>();
+        left.sort_unstable();
+        right.sort_unstable();
+        assert!(multiset_overlap_at_least(&left, &right, 3));
+        assert!(!multiset_overlap_at_least(&left, &right, 4));
+    }
 }

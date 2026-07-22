@@ -9,7 +9,7 @@ use crate::model::{
 };
 use crate::pipeline::CandidateRecord;
 use crate::pipeline::{execute_dedup, CandidateRegistry, CpuExecutor, DedupOutput};
-use crate::progress::Progress;
+use crate::progress::{Progress, ProgressSnapshot, WorkPhase};
 use crate::reporting::{
     csv, json, markdown, AggregateState, ArtifactIndex, ContractArtifact, ContractWriter,
     PayloadAdmission,
@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use futures_util::FutureExt;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
@@ -45,15 +46,24 @@ pub async fn run(config_path: &Path, seeds_override: Option<&Path>) -> Result<()
     let (progress_stop, mut progress_stop_rx) = tokio::sync::oneshot::channel();
     let reported_progress = progress.clone();
     let reported_executor = executor.clone();
+    let progress_tty = std::io::stderr().is_terminal();
+    let reporter_tty = progress_tty;
     let progress_reporter = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
         interval.tick().await;
+        let mut ticks = 0_u64;
         loop {
             tokio::select! {
                 _ = interval.tick() => {
                     let (active, queued) = reported_executor.utilization();
                     reported_progress.record_cpu(reported_executor.workers(), active, queued);
-                    eprintln!("{}", reported_progress.snapshot().human_line());
+                    if let Ok(Some(memory)) = crate::platform::current_memory_usage() {
+                        reported_progress.record_memory(memory);
+                    }
+                    ticks = ticks.saturating_add(1);
+                    if reporter_tty || ticks.is_multiple_of(5) {
+                        emit_progress(&reported_progress.snapshot(), reporter_tty, false);
+                    }
                 }
                 _ = &mut progress_stop_rx => break,
             }
@@ -184,6 +194,7 @@ pub async fn run(config_path: &Path, seeds_override: Option<&Path>) -> Result<()
     all_relations.sort_by(|left, right| {
         (left.seed_id, &left.candidate).cmp(&(right.seed_id, &right.candidate))
     });
+    progress.begin_phase(WorkPhase::FinalReports, Some(1));
     write_final_reports(FinalReportContext {
         run_dir: writer.run_dir(),
         manifest: &manifest,
@@ -195,11 +206,38 @@ pub async fn run(config_path: &Path, seeds_override: Option<&Path>) -> Result<()
         identities: &identities,
         failed_seeds: &dedup.failed_seeds,
     })?;
+    progress.add_phase_completed(1);
+    progress.finish_phase();
+    progress.begin_phase(WorkPhase::Durability, Some(1));
     writer.finish_success()?;
     progress.mark_all_written_durable();
+    progress.add_phase_completed(1);
+    progress.finish_phase();
+    progress.begin_phase(WorkPhase::Complete, Some(1));
+    progress.add_phase_completed(1);
+    progress.finish_phase();
     let _ = progress_stop.send(());
     let _ = progress_reporter.await;
+    emit_progress(&progress.snapshot(), progress_tty, true);
     Ok(())
+}
+
+fn emit_progress(snapshot: &ProgressSnapshot, tty: bool, final_line: bool) {
+    let stderr = std::io::stderr();
+    let mut stderr = stderr.lock();
+    if tty {
+        if final_line {
+            let _ = writeln!(stderr, "\r{}\x1b[K", snapshot.human_line());
+            if let Some(history) = snapshot.phase_history_line() {
+                let _ = writeln!(stderr, "{history}");
+            }
+        } else {
+            let _ = write!(stderr, "\r{}\x1b[K", snapshot.human_line());
+            let _ = stderr.flush();
+        }
+    } else if let Ok(line) = serde_json::to_string(snapshot) {
+        let _ = writeln!(stderr, "{line}");
+    }
 }
 
 fn provider_response_limit(memory_limit: u64, active_candidate_capacity: usize) -> u64 {
@@ -313,11 +351,10 @@ async fn process_candidates(
             let provider = provider.clone();
             let observed_at = config.analysis_timestamp.timestamp();
             network.spawn(async move {
-                let selection = candidate_selection(&candidate.relations);
                 let fetched = std::panic::AssertUnwindSafe(fetch_or_extend(
                     provider.as_ref(),
                     &candidate,
-                    &selection,
+                    candidate.selection.as_ref(),
                     base,
                     observed_at,
                 ))
@@ -459,20 +496,21 @@ async fn process_candidates(
                         .iter()
                         .map(crate::reporting::scope::ScopeRelation::from),
                 );
-                for candidate in registry.insert_frozen_relations(relations)? {
+                let candidates = registry.insert_frozen_relations(relations)?;
+                progress.add_candidates_discovered(candidates.len() as u64);
+                for candidate in candidates {
                     match prefetch.freeze(candidate) {
                         FrozenPrefetch::Complete { candidate, result } => {
                             if selection_covers(
-                                &result.selection,
-                                &candidate_selection(&candidate.relations),
+                                result.selection.as_ref(),
+                                candidate.selection.as_ref(),
                             ) {
-                                let final_seeds = relation_seed_ids(&candidate.relations);
                                 if prefetch_can_finalize(
                                     result.succeeded,
-                                    &result.selection,
-                                    &candidate_selection(&candidate.relations),
-                                    &result.seeds,
-                                    &final_seeds,
+                                    result.selection.as_ref(),
+                                    candidate.selection.as_ref(),
+                                    &result.seed_ids,
+                                    &candidate.seed_ids,
                                 ) {
                                     queue_candidate_analysis(
                                         AnalysisQueueContext {
@@ -508,6 +546,13 @@ async fn process_candidates(
             WorkEvent::CandidateBatch(None) => {
                 candidate_stream_open = false;
                 executor.set_owner_shards_open(false);
+                progress.mark_candidate_discovery_complete();
+                let snapshot = progress.snapshot();
+                progress.begin_phase_with_completed(
+                    WorkPhase::CandidatePipeline,
+                    Some(snapshot.candidates),
+                    snapshot.written,
+                );
             }
             WorkEvent::Network(joined) => {
                 let completion =
@@ -531,16 +576,15 @@ async fn process_candidates(
                             prefetch.finish(completion)?
                         {
                             if selection_covers(
-                                &result.selection,
-                                &candidate_selection(&candidate.relations),
+                                result.selection.as_ref(),
+                                candidate.selection.as_ref(),
                             ) {
-                                let final_seeds = relation_seed_ids(&candidate.relations);
                                 if prefetch_can_finalize(
                                     result.succeeded,
-                                    &result.selection,
-                                    &candidate_selection(&candidate.relations),
-                                    &result.seeds,
-                                    &final_seeds,
+                                    result.selection.as_ref(),
+                                    candidate.selection.as_ref(),
+                                    &result.seed_ids,
+                                    &candidate.seed_ids,
                                 ) {
                                     queue_candidate_analysis(
                                         AnalysisQueueContext {
@@ -594,6 +638,9 @@ async fn process_candidates(
                 let persisted =
                     joined.map_err(|error| AnalysisError::Analysis(error.to_string()))??;
                 progress.add_written();
+                if !candidate_stream_open {
+                    progress.add_phase_completed(1);
+                }
                 artifact_index.push(persisted.artifact);
             }
             WorkEvent::Telemetry => {
@@ -607,15 +654,16 @@ async fn process_candidates(
                     final_fetches.len() + prefetch.queued_len(),
                     network.len(),
                     active_analyses.len(),
-                    compression_ready.len() + admission_ready.len(),
+                    compression_ready.len(),
                     active_compressions.len(),
-                    write_ready.len(),
+                    admission_ready.len() + write_ready.len(),
                     writes.len(),
                     0,
                 );
             }
         }
     }
+    progress.finish_phase();
     let dedup = dedup_task
         .await
         .map_err(|error| AnalysisError::Analysis(error.to_string()))??;
@@ -646,14 +694,17 @@ struct NetworkCompletion {
 struct PrefetchResult {
     evidence: EvidenceBundle,
     succeeded: bool,
-    selection: NftSelection,
-    seeds: BTreeSet<crate::model::SeedId>,
+    selection: Arc<NftSelection>,
+    seed_ids: Arc<Vec<crate::model::SeedId>>,
 }
 
 #[derive(Default)]
 struct PrefetchCoordinator {
     order: VecDeque<CandidateId>,
     entries: BTreeMap<CandidateId, PrefetchEntry>,
+    queued_count: usize,
+    reserved_count: usize,
+    plan_count: usize,
 }
 
 struct PrefetchEntry {
@@ -716,12 +767,11 @@ impl PrefetchCoordinator {
                     frozen,
                 },
                 PrefetchStage::Complete(result) => {
-                    if selection_covers(
-                        &result.selection,
-                        &candidate_selection(&upgraded.relations),
-                    ) {
+                    if selection_covers(result.selection.as_ref(), upgraded.selection.as_ref()) {
                         PrefetchStage::Complete(result)
                     } else {
+                        self.reserved_count = self.reserved_count.saturating_sub(1);
+                        self.queued_count += 1;
                         self.order.push_front(candidate_id);
                         PrefetchStage::Queued(upgraded)
                     }
@@ -731,9 +781,11 @@ impl PrefetchCoordinator {
             return Ok(true);
         }
 
-        if self.plan_count() >= capacity {
+        if self.plan_count >= capacity {
             return Ok(false);
         }
+        self.queued_count += 1;
+        self.plan_count += 1;
         self.order.push_back(candidate_id);
         self.entries.insert(
             candidate_id,
@@ -758,7 +810,11 @@ impl PrefetchCoordinator {
                 },
             );
             match stage {
-                PrefetchStage::Queued(candidate) => return Some(candidate),
+                PrefetchStage::Queued(candidate) => {
+                    self.queued_count = self.queued_count.saturating_sub(1);
+                    self.reserved_count += 1;
+                    return Some(candidate);
+                }
                 other => entry.stage = other,
             }
         }
@@ -771,9 +827,18 @@ impl PrefetchCoordinator {
             return FrozenPrefetch::Final(candidate);
         };
         match entry.stage {
-            PrefetchStage::Complete(result) => FrozenPrefetch::Complete { candidate, result },
-            PrefetchStage::Queued(_) => FrozenPrefetch::Final(candidate),
+            PrefetchStage::Complete(result) => {
+                self.reserved_count = self.reserved_count.saturating_sub(1);
+                self.plan_count = self.plan_count.saturating_sub(1);
+                FrozenPrefetch::Complete { candidate, result }
+            }
+            PrefetchStage::Queued(_) => {
+                self.queued_count = self.queued_count.saturating_sub(1);
+                self.plan_count = self.plan_count.saturating_sub(1);
+                FrozenPrefetch::Final(candidate)
+            }
             PrefetchStage::Active { .. } => {
+                self.plan_count = self.plan_count.saturating_sub(1);
                 entry.stage = PrefetchStage::Active {
                     upgrade: None,
                     frozen: Some(candidate),
@@ -786,13 +851,13 @@ impl PrefetchCoordinator {
 
     fn finish(&mut self, completion: NetworkCompletion) -> Result<PrefetchFinish> {
         let candidate_id = completion.candidate.id;
-        let selection = candidate_selection(&completion.candidate.relations);
-        let seeds = relation_seed_ids(&completion.candidate.relations);
+        let selection = completion.candidate.selection.clone();
+        let seed_ids = completion.candidate.seed_ids.clone();
         let result = PrefetchResult {
             evidence: completion.evidence,
             succeeded: completion.succeeded,
             selection,
-            seeds,
+            seed_ids,
         };
         let Some(mut entry) = self.entries.remove(&candidate_id) else {
             return Ok(PrefetchFinish::Deferred);
@@ -804,15 +869,18 @@ impl PrefetchCoordinator {
             )));
         };
         if let Some(candidate) = frozen {
+            self.reserved_count = self.reserved_count.saturating_sub(1);
             return Ok(PrefetchFinish::Frozen {
                 candidate,
                 result: Box::new(result),
             });
         }
         if let Some(upgrade) = upgrade {
-            if selection_covers(&result.selection, &candidate_selection(&upgrade.relations)) {
+            if selection_covers(result.selection.as_ref(), upgrade.selection.as_ref()) {
                 entry.stage = PrefetchStage::Complete(Box::new(result));
             } else {
+                self.reserved_count = self.reserved_count.saturating_sub(1);
+                self.queued_count += 1;
                 entry.stage = PrefetchStage::Queued(upgrade);
                 self.order.push_front(candidate_id);
             }
@@ -824,43 +892,15 @@ impl PrefetchCoordinator {
     }
 
     fn has_queued(&self) -> bool {
-        self.entries
-            .values()
-            .any(|entry| matches!(entry.stage, PrefetchStage::Queued(_)))
+        self.queued_count > 0
     }
 
     fn queued_len(&self) -> usize {
-        self.entries
-            .values()
-            .filter(|entry| matches!(entry.stage, PrefetchStage::Queued(_)))
-            .count()
+        self.queued_count
     }
 
     fn reserved_network_slots(&self) -> usize {
-        self.entries
-            .values()
-            .filter(|entry| {
-                matches!(
-                    entry.stage,
-                    PrefetchStage::Active { .. } | PrefetchStage::Complete(_)
-                )
-            })
-            .count()
-    }
-
-    fn plan_count(&self) -> usize {
-        self.entries
-            .values()
-            .filter(|entry| {
-                !matches!(
-                    entry.stage,
-                    PrefetchStage::Active {
-                        frozen: Some(_),
-                        ..
-                    }
-                )
-            })
-            .count()
+        self.reserved_count
     }
 }
 
@@ -894,19 +934,9 @@ fn prefetch_records(
                 .ok_or_else(|| AnalysisError::State("empty prefetch relation group".into()))?
                 .candidate
                 .clone();
-            Ok(CandidateRecord {
-                id,
-                key,
-                relations: Arc::new(relations),
-            })
+            CandidateRecord::new(id, key, relations)
         })
         .collect()
-}
-
-fn relation_seed_ids(
-    relations: &[crate::model::SeedCandidateRelation],
-) -> BTreeSet<crate::model::SeedId> {
-    relations.iter().map(|relation| relation.seed_id).collect()
 }
 
 fn merge_prefetch_relations(
@@ -953,10 +983,7 @@ fn selection_covers(prefetched: &NftSelection, required: &NftSelection) -> bool 
         (
             NftSelection::Explicit { nfts: prefetched },
             NftSelection::Explicit { nfts: required },
-        ) => {
-            let prefetched = prefetched.iter().collect::<BTreeSet<_>>();
-            required.iter().all(|nft| prefetched.contains(nft))
-        }
+        ) => sorted_slice_covers(prefetched, required),
         (NftSelection::Explicit { .. }, NftSelection::AllInContract { .. }) => false,
     }
 }
@@ -965,12 +992,27 @@ fn prefetch_can_finalize(
     succeeded: bool,
     prefetched_selection: &NftSelection,
     required_selection: &NftSelection,
-    prefetched_seeds: &BTreeSet<crate::model::SeedId>,
-    required_seeds: &BTreeSet<crate::model::SeedId>,
+    prefetched_seeds: &[crate::model::SeedId],
+    required_seeds: &[crate::model::SeedId],
 ) -> bool {
     succeeded
         && selection_covers(prefetched_selection, required_selection)
-        && required_seeds.is_subset(prefetched_seeds)
+        && sorted_slice_covers(prefetched_seeds, required_seeds)
+}
+
+fn sorted_slice_covers<T: Ord>(available: &[T], required: &[T]) -> bool {
+    let (mut available_index, mut required_index) = (0_usize, 0_usize);
+    while available_index < available.len() && required_index < required.len() {
+        match available[available_index].cmp(&required[required_index]) {
+            std::cmp::Ordering::Less => available_index += 1,
+            std::cmp::Ordering::Equal => {
+                available_index += 1;
+                required_index += 1;
+            }
+            std::cmp::Ordering::Greater => return false,
+        }
+    }
+    required_index == required.len()
 }
 
 struct AnalysisQueueContext<'a> {
@@ -1659,6 +1701,7 @@ fn evidence_has_status(evidence: &EvidenceBundle, expected: crate::model::Eviden
     .any(|status| status == expected)
 }
 
+#[cfg(test)]
 fn candidate_selection(relations: &[crate::model::SeedCandidateRelation]) -> NftSelection {
     let mut selection = relations[0].selection.clone();
     for relation in &relations[1..] {
@@ -1764,6 +1807,7 @@ fn write_final_reports(context: FinalReportContext<'_>) -> Result<()> {
             .push(relation);
     }
     for seed in &manifest.seeds {
+        let seed_incomplete = failed_seeds.contains(&seed.id);
         let seed_relations = relations_by_seed
             .get(&seed.id)
             .map(Vec::as_slice)
@@ -1777,6 +1821,7 @@ fn write_final_reports(context: FinalReportContext<'_>) -> Result<()> {
             &run_dir.join("seeds").join(format!("{filename}.json")),
             &SeedReport {
                 seed,
+                incomplete: seed_incomplete,
                 relations: SeedRelations {
                     relations: seed_relations,
                     artifacts: &artifact_by_candidate,
@@ -1786,6 +1831,7 @@ fn write_final_reports(context: FinalReportContext<'_>) -> Result<()> {
         write_seed_markdown(
             &run_dir.join("seeds").join(format!("{filename}.md")),
             seed,
+            seed_incomplete,
             seed_relations,
             &artifact_by_candidate,
         )?;
@@ -1825,6 +1871,7 @@ fn write_final_reports(context: FinalReportContext<'_>) -> Result<()> {
 fn write_seed_markdown(
     path: &Path,
     seed: &crate::seed::SeedDefinition,
+    incomplete: bool,
     relations: &[&crate::reporting::scope::ScopeRelation],
     artifacts: &AHashMap<CandidateId, &crate::reporting::ArtifactRef>,
 ) -> Result<()> {
@@ -1833,12 +1880,13 @@ fn write_seed_markdown(
 
         writeln!(
             file,
-            "# {}\n\n- 链：{}\n- 排名：{}\n- 候选关系：{}\n\n\
+            "# {}\n\n- 链：{}\n- 排名：{}\n- 完整性：{}\n- 候选关系：{}\n\n\
              | 候选链 | 合约或 collection | 维度 | NFT 作用域 | 完整性 | artifact |\n\
              |---|---|---|---:|---|---|",
             seed.collection_name,
             seed.chain,
             seed.rank,
+            if incomplete { "incomplete" } else { "complete" },
             relations.len()
         )?;
         for relation in relations {
@@ -1890,6 +1938,7 @@ fn write_seed_markdown(
 #[derive(serde::Serialize)]
 struct SeedReport<'a> {
     seed: &'a crate::seed::SeedDefinition,
+    incomplete: bool,
     relations: SeedRelations<'a>,
 }
 
@@ -1982,6 +2031,38 @@ mod tests {
     use crate::model::{ChainId, ContractKey, NftKey};
 
     #[test]
+    fn missing_seed_report_is_explicitly_incomplete_with_empty_relations() {
+        let collected_at = chrono::Utc::now();
+        let seed = crate::seed::SeedDefinition {
+            id: crate::model::SeedId(0),
+            chain: ChainId::Base,
+            contract_address: "0x7d093830fcee68724e81a483def9966f5fac163a".into(),
+            rank: 1,
+            collection_name: "missing".into(),
+            stable_identifier: "missing".into(),
+            ranking_metric: "total_volume".into(),
+            ranking_value: 0.0,
+            ranking_window: "all_time".into(),
+            source: "opensea".into(),
+            collected_at,
+        };
+        let relations = Vec::new();
+        let artifacts = AHashMap::new();
+        let report = SeedReport {
+            seed: &seed,
+            incomplete: true,
+            relations: SeedRelations {
+                relations: &relations,
+                artifacts: &artifacts,
+            },
+        };
+
+        let value = serde_json::to_value(report).unwrap();
+        assert_eq!(value["incomplete"], true);
+        assert_eq!(value["relations"], serde_json::json!([]));
+    }
+
+    #[test]
     fn explicit_prefetch_cannot_satisfy_a_later_whole_collection_upgrade() {
         let contract = ContractKey::new(ChainId::Ethereum, "0x1");
         let explicit = NftSelection::Explicit {
@@ -2006,7 +2087,7 @@ mod tests {
             contract,
             nft_count: 10,
         };
-        let seeds = BTreeSet::from([crate::model::SeedId(0)]);
+        let seeds = [crate::model::SeedId(0)];
         assert!(!prefetch_can_finalize(
             false, &selection, &selection, &seeds, &seeds
         ));

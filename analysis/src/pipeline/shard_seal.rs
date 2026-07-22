@@ -6,7 +6,7 @@ use std::sync::Arc;
 pub struct ShardWorkTracker {
     producer_closed: AtomicBool,
     seed_batches_inflight: AtomicUsize,
-    failed_seed_bitmap: [AtomicU64; 2],
+    failed_seed_bitmap: [AtomicU64; crate::model::SEED_BITMAP_WORDS],
     sealed: AtomicBool,
 }
 
@@ -15,7 +15,7 @@ impl Default for ShardWorkTracker {
         Self {
             producer_closed: AtomicBool::new(false),
             seed_batches_inflight: AtomicUsize::new(0),
-            failed_seed_bitmap: [AtomicU64::new(0), AtomicU64::new(0)],
+            failed_seed_bitmap: std::array::from_fn(|_| AtomicU64::new(0)),
             sealed: AtomicBool::new(false),
         }
     }
@@ -43,10 +43,9 @@ impl ShardWorkTracker {
             return None;
         }
         Some(DimensionShardSeal {
-            failed_seed_bitmap: [
-                self.failed_seed_bitmap[0].load(Ordering::Acquire),
-                self.failed_seed_bitmap[1].load(Ordering::Acquire),
-            ],
+            failed_seed_bitmap: std::array::from_fn(|word| {
+                self.failed_seed_bitmap[word].load(Ordering::Acquire)
+            }),
         })
     }
 
@@ -94,7 +93,7 @@ impl Drop for WorkGuard {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DimensionShardSeal {
-    pub failed_seed_bitmap: [u64; 2],
+    pub failed_seed_bitmap: [u64; crate::model::SEED_BITMAP_WORDS],
 }
 
 impl DimensionShardSeal {
@@ -130,7 +129,10 @@ mod tests {
         tracker.close_producer();
         assert!(tracker.try_seal().is_none());
         batch.succeed();
-        assert_eq!(tracker.try_seal().unwrap().failed_seed_bitmap, [0, 0]);
+        assert_eq!(
+            tracker.try_seal().unwrap().failed_seed_bitmap,
+            [0; crate::model::SEED_BITMAP_WORDS]
+        );
     }
 
     #[test]
@@ -138,14 +140,16 @@ mod tests {
         let tracker = Arc::new(ShardWorkTracker::default());
         drop(tracker.register_seed_batch(SeedId(3)));
         drop(tracker.register_seed_batch(SeedId(70)));
+        drop(tracker.register_seed_batch(SeedId(1_000)));
         tracker.close_producer();
         let seal = tracker.try_seal().unwrap();
         assert!(seal.seed_failed(SeedId(3)));
         assert!(seal.seed_failed(SeedId(70)));
+        assert!(seal.seed_failed(SeedId(1_000)));
         assert!(!seal.seed_failed(SeedId(4)));
         assert_eq!(
             seal.failed_seed_ids().collect::<Vec<_>>(),
-            [SeedId(3), SeedId(70)]
+            [SeedId(3), SeedId(70), SeedId(1_000)]
         );
     }
 }

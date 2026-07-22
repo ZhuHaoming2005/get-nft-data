@@ -20,7 +20,9 @@ opensea = ""
 helius = ""
 ```
 
-空 Key 不会触发对应 API；`select-seeds` 必须配置 `opensea` 和 `helius`。完整分析建议配置
+空 Key 不会触发对应 API；`select-seeds` 要求配置 `opensea` 和 `helius`：前三条 EVM 链
+通过 OpenSea 选 seed，Solana 使用 Magic Eden 30 天热门集合顺序，并用 Helius DAS 将样本
+mint 解析为 collection 地址。完整分析建议配置
 `alchemy`、`helius` 和 `opensea`，`etherscan` 仅用于 EVM 转账回退。缺少必要数据源时程序
 仍可运行，但会将对应证据标记为 `not_requested` 或 `truncated`。Key 内容不写入运行清单
 或运行 ID；运行 ID 只记录各 Key 是否已配置。请勿提交包含真实 Key 的配置文件。
@@ -56,10 +58,11 @@ polygon = "polygon-mainnet"
 
 程序直接请求供应商，不依赖外部归一化网关：
 
-- seed 选择：Base、Ethereum、Polygon 使用 OpenSea 近 30 日成交量排名；Solana 使用
-  Magic Eden 的 `30d` 热门集合排名，并通过 Helius DAS 将样本 mint 解析为可验证的
-  Metaplex collection address。Solana 清单将指标明确记录为 `popularity_rank`，不把
-  Magic Eden 当前实际返回的 7 日统计伪装成 30 日成交量。
+- seed 选择统一采用 30 天窗口：Base、Ethereum、Polygon 使用 OpenSea
+  `sort_by=thirty_days_volume`，并以 collection stats 的 `thirty_day` interval 审计排名值，
+  记录 `thirty_days_volume/30d`；Solana 直接采用 Magic Eden
+  `popular_collections?timeRange=30d` 的返回顺序，记录 `popularity_rank/30d`，再用 Helius DAS
+  解析 collection 地址。`source` 记录为 `opensea` 或 `magic_eden`。
 - OpenSea 统一提供四链 **sale** 市场证据（不再请求 listing/上下架）；不使用 Alchemy 或 Helius
   市场结果。
 - EVM：Alchemy 提供合约、持有者、转账、资金流、receipt、gas 和**事件当日 UTC 日桶** USD
@@ -84,6 +87,9 @@ cargo run --release -- run --config config/default.toml
 
 配置中的相对路径以配置文件所在目录为基准。需要使用其他 seed 文件时再传
 `--seeds <路径>`。
+
+若清单中的某个 seed 不在当前 snapshot 中，运行不会终止：该 seed 不生成查重查询，对应
+关系结果为空，并在最终审计与数据质量中标记为不完整且不进入完整分母。
 
 开发验证：
 

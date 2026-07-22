@@ -274,6 +274,7 @@ impl RunConfig {
                 "provider_endpoints.magic_eden",
                 &self.provider_endpoints.magic_eden,
             ),
+            ("provider_endpoints.helius", &self.provider_endpoints.helius),
         ] {
             let url = reqwest::Url::parse(endpoint)
                 .map_err(|error| AnalysisError::Config(format!("{name} is invalid: {error}")))?;
@@ -384,6 +385,22 @@ mod tests {
             RunConfig::from_path_unvalidated(Path::new("config/default.toml")).unwrap();
         assert!(config.validate_seed_selection().is_ok());
         config.provider_concurrency.other = 0;
+        assert!(config.validate_seed_selection().is_err());
+    }
+
+    #[test]
+    fn seed_selection_validates_all_seed_provider_endpoints() {
+        let mut config =
+            RunConfig::from_path_unvalidated(Path::new("config/default.toml")).unwrap();
+        config.provider_endpoints.magic_eden = "not a URL".to_owned();
+        assert!(config.validate_seed_selection().is_err());
+
+        config.provider_endpoints.magic_eden = "https://magiceden.example.com".to_owned();
+        config.provider_endpoints.opensea = "not a URL".to_owned();
+        assert!(config.validate_seed_selection().is_err());
+
+        config.provider_endpoints.opensea = "https://opensea.example.com".to_owned();
+        config.provider_endpoints.helius = "not a URL".to_owned();
         assert!(config.validate_seed_selection().is_err());
     }
 

@@ -1,6 +1,6 @@
 use crate::model::{NftId, UriValueId};
 use crate::resident::{UriFeatureStore, UriNftIdentityStore};
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashMap;
 use rayon::prelude::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9,6 +9,53 @@ pub struct UriPostingRef {
     pub shard: usize,
     start: u64,
     end: u64,
+}
+
+/// Dense, immutable seed-URI membership prepared once and shared by all NUMA
+/// lanes. `UriValueId` is already a compact pool index, so two flag bits avoid
+/// rebuilding and probing a pair of hash tables on every lane.
+#[derive(Clone, Debug)]
+pub struct UriSeedFilter {
+    flags: Vec<u8>,
+}
+
+impl UriSeedFilter {
+    pub fn new(
+        uri_value_count: usize,
+        seed_token_uris: &[UriValueId],
+        seed_image_uris: &[UriValueId],
+    ) -> Self {
+        let seed_extent = seed_token_uris
+            .iter()
+            .chain(seed_image_uris)
+            .map(|uri| uri.index().saturating_add(1))
+            .max()
+            .unwrap_or(0);
+        let mut flags = vec![0_u8; uri_value_count.max(seed_extent).div_ceil(4)];
+        for uri in seed_token_uris {
+            let shift = (uri.index() % 4) * 2;
+            flags[uri.index() / 4] |= 1 << shift;
+        }
+        for uri in seed_image_uris {
+            let shift = (uri.index() % 4) * 2;
+            flags[uri.index() / 4] |= 2 << shift;
+        }
+        Self { flags }
+    }
+
+    fn contains_token(&self, uri: UriValueId) -> bool {
+        let shift = (uri.index() % 4) * 2;
+        self.flags
+            .get(uri.index() / 4)
+            .is_some_and(|flags| flags & (1 << shift) != 0)
+    }
+
+    fn contains_image(&self, uri: UriValueId) -> bool {
+        let shift = (uri.index() % 4) * 2;
+        self.flags
+            .get(uri.index() / 4)
+            .is_some_and(|flags| flags & (2 << shift) != 0)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -52,9 +99,48 @@ impl UriIndex {
         lane: usize,
         lane_count: usize,
     ) -> Self {
+        let seed_filter =
+            UriSeedFilter::new(features.values.len(), seed_token_uris, seed_image_uris);
+        Self::build_partition_with_filter(
+            identities,
+            features,
+            &seed_filter,
+            shard_count,
+            lane,
+            lane_count,
+        )
+    }
+
+    pub fn build_partition_with_filter(
+        identities: &UriNftIdentityStore,
+        features: &UriFeatureStore,
+        seed_filter: &UriSeedFilter,
+        shard_count: usize,
+        lane: usize,
+        lane_count: usize,
+    ) -> Self {
+        Self::build_partition_with_filter_progress(
+            identities,
+            features,
+            seed_filter,
+            shard_count,
+            lane,
+            lane_count,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_partition_with_filter_progress(
+        identities: &UriNftIdentityStore,
+        features: &UriFeatureStore,
+        seed_filter: &UriSeedFilter,
+        shard_count: usize,
+        lane: usize,
+        lane_count: usize,
+        progress: Option<&crate::progress::Progress>,
+    ) -> Self {
         debug_assert_eq!(identities.nfts.len(), features.features.len());
-        let seed_token_uris = seed_token_uris.iter().copied().collect::<AHashSet<_>>();
-        let seed_image_uris = seed_image_uris.iter().copied().collect::<AHashSet<_>>();
         // Each NUMA lane scans a disjoint contiguous range. The old owner-lane
         // filter made every lane read the entire feature column before keeping
         // only 1/lane_count of it.
@@ -64,31 +150,38 @@ impl UriIndex {
             .len()
             .saturating_mul(lane.saturating_add(1))
             / lane_count;
+        const URI_CHUNK: usize = 4_096;
         features.features[start..end]
-            .par_iter()
+            .par_chunks(URI_CHUNK)
             .enumerate()
             .fold(
                 || Self::with_shards(shard_count),
-                |mut output, (offset, feature)| {
-                    let nft = start + offset;
-                    let shard = crate::model::owner_shard(nft as u32, shard_count);
-                    if let Some(uri) = feature
-                        .token_uri
-                        .filter(|uri| seed_token_uris.contains(uri))
-                    {
-                        output.pending_token_uri_postings[shard]
-                            .entry(uri)
-                            .or_default()
-                            .push(NftId(nft as u32));
+                |mut output, (chunk, features)| {
+                    let chunk_start = start + chunk * URI_CHUNK;
+                    for (offset, feature) in features.iter().enumerate() {
+                        let nft = chunk_start + offset;
+                        let shard = crate::model::owner_shard(nft as u32, shard_count);
+                        if let Some(uri) = feature
+                            .token_uri
+                            .filter(|uri| seed_filter.contains_token(*uri))
+                        {
+                            output.pending_token_uri_postings[shard]
+                                .entry(uri)
+                                .or_default()
+                                .push(NftId(nft as u32));
+                        }
+                        if let Some(uri) = feature
+                            .image_uri
+                            .filter(|uri| seed_filter.contains_image(*uri))
+                        {
+                            output.pending_image_uri_postings[shard]
+                                .entry(uri)
+                                .or_default()
+                                .push(NftId(nft as u32));
+                        }
                     }
-                    if let Some(uri) = feature
-                        .image_uri
-                        .filter(|uri| seed_image_uris.contains(uri))
-                    {
-                        output.pending_image_uri_postings[shard]
-                            .entry(uri)
-                            .or_default()
-                            .push(NftId(nft as u32));
+                    if let Some(progress) = progress {
+                        progress.add_phase_completed(features.len() as u64);
                     }
                     output
                 },
@@ -201,6 +294,25 @@ mod tests {
     use super::*;
     use crate::model::{ContractId, NftIdentityRecord, TokenIdId, UriFeatureRecord};
     use crate::resident::ByteInterner;
+
+    #[test]
+    fn packed_seed_filter_keeps_token_and_image_bits_independent() {
+        let filter = UriSeedFilter::new(
+            8,
+            &[UriValueId(0), UriValueId(3), UriValueId(4)],
+            &[UriValueId(1), UriValueId(3), UriValueId(7)],
+        );
+        for id in 0..8 {
+            assert_eq!(
+                filter.contains_token(UriValueId(id)),
+                [0, 3, 4].contains(&id)
+            );
+            assert_eq!(
+                filter.contains_image(UriValueId(id)),
+                [1, 3, 7].contains(&id)
+            );
+        }
+    }
 
     #[test]
     fn disjoint_lane_partitions_equal_single_pass_index() {

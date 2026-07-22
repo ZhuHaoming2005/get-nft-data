@@ -44,6 +44,10 @@ id_type!(GlobalNftId, u32);
 id_type!(CandidateId, u32);
 id_type!(SeedId, u16);
 
+/// Four independently configurable `u8` per-chain seed counts require at most
+/// 1,020 dense seed IDs, rounded up to 16 bitmap words.
+pub const SEED_BITMAP_WORDS: usize = 16;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChainId {

@@ -50,6 +50,7 @@ pub struct NameIndex {
     seed_tokens: AHashMap<NameValueId, Vec<u32>>,
     character_offsets: Vec<u64>,
     characters: Vec<char>,
+    sorted_characters: Vec<char>,
     member_offsets: Vec<u64>,
     members: Vec<ContractId>,
     names_by_shard: Vec<Vec<NameValueId>>,
@@ -61,7 +62,7 @@ impl NameIndex {
         seed_names: &[NameValueId],
         shard_count: usize,
     ) -> Self {
-        Self::build_inner(features, seed_names, shard_count, None)
+        Self::build_inner(features, seed_names, shard_count, None, None)
     }
 
     pub fn build_numa(
@@ -70,7 +71,58 @@ impl NameIndex {
         shard_count: usize,
         executor: &crate::pipeline::CpuExecutor,
     ) -> Self {
-        Self::build_inner(features, seed_names, shard_count, Some(executor))
+        Self::build_inner(features, seed_names, shard_count, Some(executor), None)
+    }
+
+    pub fn build_numa_with_progress(
+        features: &NameFeatureStore,
+        seed_names: &[NameValueId],
+        shard_count: usize,
+        executor: &crate::pipeline::CpuExecutor,
+        progress: &crate::progress::Progress,
+    ) -> Self {
+        Self::build_numa_with_progress_in(
+            features,
+            seed_names,
+            shard_count,
+            executor,
+            progress,
+            crate::progress::PhaseSlot::Primary,
+        )
+    }
+
+    pub fn build_numa_with_secondary_progress(
+        features: &NameFeatureStore,
+        seed_names: &[NameValueId],
+        shard_count: usize,
+        executor: &crate::pipeline::CpuExecutor,
+        progress: &crate::progress::Progress,
+    ) -> Self {
+        Self::build_numa_with_progress_in(
+            features,
+            seed_names,
+            shard_count,
+            executor,
+            progress,
+            crate::progress::PhaseSlot::Secondary,
+        )
+    }
+
+    fn build_numa_with_progress_in(
+        features: &NameFeatureStore,
+        seed_names: &[NameValueId],
+        shard_count: usize,
+        executor: &crate::pipeline::CpuExecutor,
+        progress: &crate::progress::Progress,
+        progress_slot: crate::progress::PhaseSlot,
+    ) -> Self {
+        Self::build_inner(
+            features,
+            seed_names,
+            shard_count,
+            Some(executor),
+            Some((progress, progress_slot)),
+        )
     }
 
     fn build_inner(
@@ -78,6 +130,7 @@ impl NameIndex {
         seed_names: &[NameValueId],
         shard_count: usize,
         executor: Option<&crate::pipeline::CpuExecutor>,
+        progress: Option<(&crate::progress::Progress, crate::progress::PhaseSlot)>,
     ) -> Self {
         let seed_tokens_by_name_raw = seed_names
             .iter()
@@ -117,6 +170,7 @@ impl NameIndex {
         let mut names_by_shard = (0..shard_count).map(|_| Vec::new()).collect::<Vec<_>>();
         let mut character_offsets = Vec::with_capacity(name_count + 1);
         let mut characters = Vec::new();
+        let mut sorted_characters = Vec::new();
         character_offsets.push(0);
         const NAME_CHUNK: usize = 4096;
         const WAVE_NAMES: usize = NAME_CHUNK * 128;
@@ -149,7 +203,9 @@ impl NameIndex {
             };
             chunks.sort_unstable_by_key(|chunk| chunk.first_name);
             for chunk in chunks {
+                let completed = chunk.names.len() as u64;
                 characters.extend(chunk.characters);
+                sorted_characters.extend(chunk.sorted_characters);
                 for (offset, postings) in chunk.names.into_iter().enumerate() {
                     let name_id = NameValueId((chunk.first_name + offset) as u32);
                     let owner = crate::model::owner_shard(name_id.0, shard_count);
@@ -161,6 +217,9 @@ impl NameIndex {
                     for token in postings.seed_tokens {
                         shard_build[owner].entry(token).or_default().push(name_id);
                     }
+                }
+                if let Some((progress, slot)) = progress {
+                    progress.add_phase_completed_in(slot, completed);
                 }
             }
         }
@@ -196,6 +255,7 @@ impl NameIndex {
             seed_tokens,
             character_offsets,
             characters,
+            sorted_characters,
             member_offsets,
             members,
             names_by_shard,
@@ -283,6 +343,12 @@ impl NameIndex {
         let start = self.character_offsets[name.index()] as usize;
         let end = self.character_offsets[name.index() + 1] as usize;
         &self.characters[start..end]
+    }
+
+    pub fn sorted_characters(&self, name: NameValueId) -> &[char] {
+        let start = self.character_offsets[name.index()] as usize;
+        let end = self.character_offsets[name.index() + 1] as usize;
+        &self.sorted_characters[start..end]
     }
 
     pub fn members(&self, name: NameValueId) -> &[ContractId] {
@@ -460,6 +526,7 @@ fn minimum_required_overlap(left_len: usize, threshold_pct: f64) -> usize {
 struct PreparedNameChunk {
     first_name: usize,
     characters: Vec<char>,
+    sorted_characters: Vec<char>,
     names: Vec<PreparedName>,
 }
 
@@ -475,12 +542,16 @@ fn prepare_name_chunk(
 ) -> PreparedNameChunk {
     let first_name = range.start;
     let mut characters = Vec::new();
+    let mut sorted_characters = Vec::new();
     let mut names = Vec::with_capacity(range.len());
     let mut counts = AHashMap::new();
     let mut tokens = Vec::new();
     for name_index in range {
         let text = features.values.get(name_index as u32);
         characters.extend(text.chars());
+        let sorted_start = sorted_characters.len();
+        sorted_characters.extend(text.chars());
+        sorted_characters[sorted_start..].sort_unstable();
         occurrence_tokens_into(text, &mut counts, &mut tokens);
         names.push(PreparedName {
             seed_tokens: tokens
@@ -493,6 +564,7 @@ fn prepare_name_chunk(
     PreparedNameChunk {
         first_name,
         characters,
+        sorted_characters,
         names,
     }
 }

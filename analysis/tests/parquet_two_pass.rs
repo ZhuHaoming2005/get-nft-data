@@ -11,7 +11,10 @@ use std::sync::Arc;
 #[test]
 fn metadata_pass_keeps_first_eight_valid_tokens_in_logical_order() {
     let temporary = tempfile::tempdir().unwrap();
-    let path = temporary.path().join("fixture.parquet");
+    let paths = [
+        temporary.path().join("fixture-a.parquet"),
+        temporary.path().join("fixture-b.parquet"),
+    ];
     let schema = Arc::new(Schema::new(vec![
         Field::new("chain", DataType::Utf8, false),
         Field::new("contract_address", DataType::Utf8, false),
@@ -60,18 +63,28 @@ fn metadata_pass_keeps_first_eight_valid_tokens_in_logical_order() {
         ],
     )
     .unwrap();
-    let properties = WriterProperties::builder()
-        .set_max_row_group_row_count(Some(4))
-        .build();
-    let mut writer =
-        ArrowWriter::try_new(File::create(&path).unwrap(), schema, Some(properties)).unwrap();
-    writer.write(&batch).unwrap();
-    writer.close().unwrap();
+    let split = batch.num_rows() / 2;
+    for (path, batch) in [
+        (&paths[0], batch.slice(0, split)),
+        (&paths[1], batch.slice(split, batch.num_rows() - split)),
+    ] {
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(4))
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            File::create(path).unwrap(),
+            schema.clone(),
+            Some(properties),
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
 
     let executor = CpuExecutor::new(2).unwrap();
     let progress = Progress::default();
     let store =
-        load_resident_store(&[path], 8, 128, 1024 * 1024 * 1024, &executor, &progress).unwrap();
+        load_resident_store(&paths, 8, 128, 1024 * 1024 * 1024, &executor, &progress).unwrap();
     assert_eq!(store.quality.logical_nfts, 11);
     assert_eq!(store.quality.duplicate_rows, 1);
     assert_eq!(store.quality.invalid_metadata, 1);
@@ -88,7 +101,14 @@ fn metadata_pass_keeps_first_eight_valid_tokens_in_logical_order() {
         features.documents.get(first.metadata_id.0),
         r#"{"token":1}"#
     );
-    assert_eq!(progress.snapshot().completed_row_groups, 6);
+    let snapshot = progress.snapshot();
+    assert_eq!(snapshot.completed_row_groups, 8);
+    assert_eq!(
+        snapshot.phase,
+        Some(analysis::progress::WorkPhase::FinalizeStore)
+    );
+    assert_eq!(snapshot.phase_completed, 1);
+    assert_eq!(snapshot.phase_total, Some(1));
 }
 
 fn strings(values: impl IntoIterator<Item = Option<String>>) -> ArrayRef {
