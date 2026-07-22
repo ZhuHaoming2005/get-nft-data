@@ -1,7 +1,9 @@
 # 四链头部 NFT 合约分析
 
 本 crate 实现 Base、Ethereum、Polygon、Solana 四链头部 NFT 查重与深入分析。
-生产运行要求 Linux cgroup v2、至少 128 个有效 CPU 和 464 GiB 任务可用内存。
+生产运行要求 Linux cgroup v2 和至少 128 个有效 CPU。`memory_limit` 是内存预算上限，
+不是启动所需的最低内存；运行时会在系统或 cgroup 可用内存中先保留 48 GiB，再取配置
+上限与剩余内存的较小值。
 
 ## 配置
 

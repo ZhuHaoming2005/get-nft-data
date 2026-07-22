@@ -49,7 +49,7 @@ query-to-index 模式，避免构造全局对象对。
 
 全流程采用“时间优先、同时及时释放无收益内存”的原则：
 
-- 在 464 GiB 进程边界内，优先减少墙钟时间；
+- 在配置与平台共同确定的进程内存边界内，优先减少墙钟时间；
 - 不为了降低 RSS 引入磁盘 spill、重新读取 Parquet、重复解析或重复计算；
 - 可复用且生成代价高的紧凑特征允许常驻到其最后一次读取；
 - 已完成维度、候选图、原始响应、未压缩报告和写入 payload 在最后一次使用后立即释放；
@@ -1145,15 +1145,17 @@ CoordinatorState
 
 ## 11. 内存边界
 
-目标数据已经验证能够装入 512 GiB。运行时仍预留 48 GiB 给 Linux、allocator、网络栈和
-不可预测峰值，进程硬边界为 464 GiB：
+目标数据已经验证能够装入 512 GiB。运行时仍预留 48 GiB 给 Linux、网络栈和不可预测
+峰值；默认配置的进程预算上限为 464 GiB，但它不是启动门槛：
 
 ```text
 available_memory = min(physical_memory, cgroup_memory_limit_or_physical)
 effective_memory_limit = available_memory.saturating_sub(48 GiB)
+process_memory_limit = min(config.memory_limit, effective_memory_limit)
 ```
 
-目标生产运行要求 `effective_memory_limit >= 464 GiB`，否则在启动时失败。程序跟踪：
+程序不因平台内存低于默认 464 GiB 上限而拒绝启动，而是让加载预算、峰值计划和实际 RSS
+检查使用 `process_memory_limit`。程序跟踪：
 
 - `base_resident_bytes`：ContractCatalog、URI阶段身份和尚未完成维度的 feature stores；
 - `dimension_bytes`：当前索引、下一维度准备及两者 scratch；
@@ -1180,7 +1182,7 @@ peak =
   + allocator_reserve
 ```
 
-`peak > 464 GiB` 时先禁用下一维度重叠并重算；仍超限则启动失败，不 spill。
+`peak > process_memory_limit` 时先禁用下一维度重叠并重算；仍超限才启动失败，不 spill。
 
 释放顺序是硬约束：
 
@@ -1203,7 +1205,7 @@ Name/Metadata candidate-pair 集合，只保留最终 MatchEvidence。
 
 加载屏障后做一次内存检查；候选流水线每 1 秒读取并缓存 cgroup v2 `memory.current`，无法
 读取时回退 `/proc/self/statm`。事件循环使用缓存值做 admission，不再在每个 completion 上
-执行同步文件 I/O。实际总量接近 464 GiB 时暂停新 admission，让 writer 与已运行任务释放
+执行同步文件 I/O。实际总量接近 `process_memory_limit` 时暂停新 admission，让 writer 与已运行任务释放
 内存；完成释放周期后仍超过硬边界才失败。
 
 程序不通过删除候选、缩短查重范围或把查重索引 spill 到磁盘来规避失败。逐合约落盘属于

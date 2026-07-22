@@ -14,8 +14,6 @@ const GIB: u64 = 1024 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const SYSTEM_RESERVE: u64 = 48 * GIB;
 #[cfg(target_os = "linux")]
-const REQUIRED_EFFECTIVE: u64 = 464 * GIB;
-#[cfg(target_os = "linux")]
 const CGROUP_V2_MOUNT: &str = "/sys/fs/cgroup";
 #[cfg(target_os = "linux")]
 static CURRENT_CGROUP_V2: OnceLock<PathBuf> = OnceLock::new();
@@ -167,12 +165,6 @@ pub fn inspect_production_platform() -> Result<PlatformResources> {
             .map(|limit| limit.min(physical_memory))
             .unwrap_or(physical_memory);
         let effective_memory_limit = available.saturating_sub(SYSTEM_RESERVE);
-        if effective_memory_limit < REQUIRED_EFFECTIVE {
-            return Err(AnalysisError::Platform(format!(
-                "effective memory is {} GiB; at least 464 GiB required",
-                effective_memory_limit / GIB
-            )));
-        }
         Ok(PlatformResources {
             allowed_cpus,
             physical_memory,

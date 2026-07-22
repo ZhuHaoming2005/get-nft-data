@@ -232,9 +232,9 @@ impl RunConfig {
                 "metadata_anchor_count must equal the fixed business value 8".into(),
             ));
         }
-        if self.memory_limit < 464 * GIB {
+        if self.memory_limit == 0 {
             return Err(AnalysisError::Config(
-                "memory_limit must be at least 464GiB for a production run".into(),
+                "memory_limit must be positive".into(),
             ));
         }
         for snapshot in &self.snapshot_files {
@@ -350,6 +350,17 @@ mod tests {
     fn parses_binary_units() {
         assert_eq!(parse_bytes("464GiB").unwrap(), 464 * GIB);
         assert_eq!(parse_bytes("2 GiB").unwrap(), 2 * GIB);
+    }
+
+    #[test]
+    fn memory_limit_is_a_budget_not_a_production_minimum() {
+        let snapshot = tempfile::NamedTempFile::new().unwrap();
+        let mut config =
+            RunConfig::from_path_unvalidated(Path::new("config/default.toml")).unwrap();
+        config.memory_limit = GIB;
+        config.snapshot_files = vec![snapshot.path().to_path_buf()];
+
+        assert!(config.validate().is_ok());
     }
 
     #[test]
