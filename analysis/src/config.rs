@@ -63,6 +63,7 @@ pub struct ProviderConcurrency {
 #[serde(default, deny_unknown_fields)]
 pub struct ProviderEndpoints {
     pub opensea: String,
+    pub magic_eden: String,
     pub etherscan: String,
     pub helius: String,
     pub alchemy_prices: String,
@@ -73,6 +74,7 @@ impl Default for ProviderEndpoints {
     fn default() -> Self {
         Self {
             opensea: "https://api.opensea.io".into(),
+            magic_eden: "https://api-mainnet.magiceden.dev/v2".into(),
             etherscan: "https://api.etherscan.io/v2/api".into(),
             helius: "https://mainnet.helius-rpc.com/".into(),
             alchemy_prices: "https://api.g.alchemy.com/prices/v1".into(),
@@ -173,6 +175,10 @@ impl RunConfig {
                 &self.provider_endpoints.opensea,
             ),
             (
+                "provider_endpoints.magic_eden",
+                &self.provider_endpoints.magic_eden,
+            ),
+            (
                 "provider_endpoints.etherscan",
                 &self.provider_endpoints.etherscan,
             ),
@@ -259,13 +265,23 @@ impl RunConfig {
                 "provider_timeout_ms must be positive".into(),
             ));
         }
-        let url = reqwest::Url::parse(&self.provider_endpoints.opensea).map_err(|error| {
-            AnalysisError::Config(format!("provider_endpoints.opensea is invalid: {error}"))
-        })?;
-        if !matches!(url.scheme(), "http" | "https") {
-            return Err(AnalysisError::Config(
-                "provider_endpoints.opensea must use http or https".into(),
-            ));
+        for (name, endpoint) in [
+            (
+                "provider_endpoints.opensea",
+                &self.provider_endpoints.opensea,
+            ),
+            (
+                "provider_endpoints.magic_eden",
+                &self.provider_endpoints.magic_eden,
+            ),
+        ] {
+            let url = reqwest::Url::parse(endpoint)
+                .map_err(|error| AnalysisError::Config(format!("{name} is invalid: {error}")))?;
+            if !matches!(url.scheme(), "http" | "https") {
+                return Err(AnalysisError::Config(format!(
+                    "{name} must use http or https"
+                )));
+            }
         }
         Ok(())
     }

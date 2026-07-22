@@ -212,8 +212,11 @@ analysis select-seeds --config config/default.toml
 analysis run --config config/default.toml --seeds seeds.json
 ```
 
-`select-seeds` 分别获取四条链近 30 日排名，按 `seed_top` 为各链独立配置的数量写出
-seed 及其来源、指标、窗口和采集时间；默认仍为每链 `25`。`run` 只接受与当前
+`select-seeds` 分别获取四条链近 30 日排名：EVM 三链使用 OpenSea 成交量排名，Solana
+使用 Magic Eden 的 30 日热门集合排名，再由 Helius DAS 从样本 mint 解析并验证真实
+collection address。Solana 指标记录为 `popularity_rank`，不将供应商实际返回的 7 日
+统计标记为 30 日成交量。命令按 `seed_top` 为各链独立配置的数量写出 seed 及其来源、
+指标、窗口和采集时间；默认仍为每链 `25`。`run` 只接受与当前
 `seed_top` 数量一致的固定 seed manifest，不在运行过程中重新排名。
 
 配置保留必要参数：

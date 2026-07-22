@@ -22,10 +22,10 @@ metadata_anchor_count = 8
 analysis_timestamp = "2026-01-01T00:00:00Z"
 
 [seed_top]
-base = 25
-ethereum = 25
-polygon = 25
-solana = 25
+base = 3
+ethereum = 3
+polygon = 3
+solana = 3
 
 [api_keys]
 alchemy = "O6O-K8fkagLHjOa-LLM3_"
@@ -35,6 +35,7 @@ helius = "1b7f1a72-bfb7-44de-ad19-eb441936fa8b"
 
 [provider_endpoints]
 opensea = "https://api.opensea.io"
+magic_eden = "https://api-mainnet.magiceden.dev/v2"
 etherscan = "https://api.etherscan.io/v2/api"
 helius = "https://mainnet.helius-rpc.com/"
 alchemy_prices = "https://api.g.alchemy.com/prices/v1"

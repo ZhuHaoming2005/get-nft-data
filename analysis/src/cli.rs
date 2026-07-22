@@ -63,19 +63,38 @@ async fn select_seeds(config_path: &Path) -> Result<()> {
             "api_keys.opensea is required for select-seeds".into(),
         ));
     }
-    let source = OpenSeaSeedSource {
-        client: reqwest::Client::builder()
-            .timeout(Duration::from_millis(config.provider_timeout_ms))
-            .build()?,
+    if config.api_keys.helius.is_empty() {
+        return Err(AnalysisError::Config(
+            "api_keys.helius is required to resolve Magic Eden Solana collection addresses".into(),
+        ));
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(config.provider_timeout_ms))
+        .build()?;
+    let request_permits = Arc::new(tokio::sync::Semaphore::new(
+        config.provider_concurrency.other,
+    ));
+    let opensea = OpenSeaSeedSource {
+        client: client.clone(),
         endpoint: format!(
             "{}/api/v2/collections/top",
             config.provider_endpoints.opensea.trim_end_matches('/')
         ),
         opensea_api_key: config.api_keys.opensea.trim().to_owned(),
         retries: config.provider_retry_count,
-        request_permits: Arc::new(tokio::sync::Semaphore::new(
-            config.provider_concurrency.other,
-        )),
+        request_permits: request_permits.clone(),
+    };
+    let magic_eden = MagicEdenSeedSource {
+        client,
+        base_endpoint: config.provider_endpoints.magic_eden.clone(),
+        helius_endpoint: config.provider_endpoints.helius.clone(),
+        helius_api_key: config.api_keys.helius.trim().to_owned(),
+        retries: config.provider_retry_count,
+        request_permits,
+    };
+    let source = RoutedSeedSource {
+        opensea: &opensea,
+        magic_eden: &magic_eden,
     };
     let manifest = select_exact(&source, config.seed_top).await?;
     let bytes = serde_json::to_vec_pretty(&manifest)?;
@@ -85,10 +104,35 @@ async fn select_seeds(config_path: &Path) -> Result<()> {
     crate::reporting::contract_writer::atomic_write(&config.seed_manifest, &bytes)
 }
 
+struct RoutedSeedSource<'a> {
+    opensea: &'a OpenSeaSeedSource,
+    magic_eden: &'a MagicEdenSeedSource,
+}
+
+#[async_trait]
+impl SeedSource for RoutedSeedSource<'_> {
+    async fn ranked(&self, chain: crate::model::ChainId, limit: usize) -> Result<Vec<RankedSeed>> {
+        if chain == crate::model::ChainId::Solana {
+            self.magic_eden.ranked(chain, limit).await
+        } else {
+            self.opensea.ranked(chain, limit).await
+        }
+    }
+}
+
 struct OpenSeaSeedSource {
     client: reqwest::Client,
     endpoint: String,
     opensea_api_key: String,
+    retries: usize,
+    request_permits: Arc<tokio::sync::Semaphore>,
+}
+
+struct MagicEdenSeedSource {
+    client: reqwest::Client,
+    base_endpoint: String,
+    helius_endpoint: String,
+    helius_api_key: String,
     retries: usize,
     request_permits: Arc<tokio::sync::Semaphore>,
 }
@@ -323,6 +367,314 @@ impl SeedSource for OpenSeaSeedSource {
     }
 }
 
+impl MagicEdenSeedSource {
+    fn endpoint_url(&self, segments: &[&str]) -> Result<reqwest::Url> {
+        let mut url = reqwest::Url::parse(&self.base_endpoint)
+            .map_err(|error| AnalysisError::Config(error.to_string()))?;
+        url.path_segments_mut()
+            .map_err(|_| AnalysisError::Config("Magic Eden endpoint cannot be a base URL".into()))?
+            .pop_if_empty()
+            .extend(segments);
+        url.set_query(None);
+        Ok(url)
+    }
+
+    fn popular_request(&self) -> Result<reqwest::Request> {
+        let mut url = self.endpoint_url(&["marketplace", "popular_collections"])?;
+        url.query_pairs_mut().append_pair("timeRange", "30d");
+        Ok(self
+            .client
+            .get(url)
+            .header("accept", "application/json")
+            .build()?)
+    }
+
+    fn collection_listings_request(&self, symbol: &str) -> Result<reqwest::Request> {
+        let mut url = self.endpoint_url(&["collections", symbol, "listings"])?;
+        url.query_pairs_mut()
+            .append_pair("offset", "0")
+            .append_pair("limit", "1");
+        Ok(self
+            .client
+            .get(url)
+            .header("accept", "application/json")
+            .build()?)
+    }
+
+    fn helius_asset_batch_request(&self, mints: &[String]) -> Result<reqwest::Request> {
+        let mut url = reqwest::Url::parse(&self.helius_endpoint)
+            .map_err(|error| AnalysisError::Config(error.to_string()))?;
+        url.query_pairs_mut()
+            .append_pair("api-key", &self.helius_api_key);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "seed-collection-addresses",
+            "method": "getAssetBatch",
+            "params": {"ids": mints}
+        });
+        Ok(self
+            .client
+            .post(url)
+            .header("accept", "application/json")
+            .json(&body)
+            .build()?)
+    }
+
+    async fn fetch_request(
+        &self,
+        build: impl Fn() -> Result<reqwest::Request>,
+        context: &str,
+    ) -> Result<serde_json::Value> {
+        let mut last_error = None;
+        for attempt in 0..=self.retries {
+            let _permit =
+                self.request_permits.acquire().await.map_err(|_| {
+                    AnalysisError::State("Magic Eden seed permit pool closed".into())
+                })?;
+            let result = match self.client.execute(build()?).await {
+                Ok(response) => crate::api::response_bytes(response, 16 * 1024 * 1024)
+                    .await
+                    .and_then(|bytes| serde_json::from_slice(&bytes).map_err(Into::into)),
+                Err(error) => Err(AnalysisError::Http(error.without_url())),
+            };
+            drop(_permit);
+            match result {
+                Ok(payload) => return Ok(payload),
+                Err(error) => {
+                    let retryable = error.retryable();
+                    let retry_after_ms = error.retry_after_ms();
+                    last_error = Some(error);
+                    if attempt >= self.retries || !retryable {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(
+                        retry_after_ms
+                            .unwrap_or_else(|| 100_u64.saturating_mul(1_u64 << attempt.min(8))),
+                    ))
+                    .await;
+                }
+            }
+        }
+        Err(AnalysisError::Seed(format!(
+            "{context}: {}",
+            last_error.expect("seed request performs at least one attempt")
+        )))
+    }
+
+    async fn fetch_popular(&self) -> Result<serde_json::Value> {
+        self.fetch_request(
+            || self.popular_request(),
+            "Magic Eden popular collection request failed",
+        )
+        .await
+    }
+
+    async fn collection_detail(
+        &self,
+        collection: MagicEdenCollection,
+    ) -> Result<Option<MagicEdenCollectionMint>> {
+        let symbol = collection.symbol.clone();
+        let listing_context = format!("Magic Eden collection listing request failed for {symbol}");
+        let listing = self
+            .fetch_request(
+                || self.collection_listings_request(&symbol),
+                &listing_context,
+            )
+            .await?;
+        Ok(magic_eden_listing_mint(&listing)
+            .map(|mint| MagicEdenCollectionMint { collection, mint }))
+    }
+
+    async fn collection_addresses(&self, mints: &[String]) -> Result<BTreeMap<String, String>> {
+        let mut addresses = BTreeMap::new();
+        for chunk in mints.chunks(1_000) {
+            let payload = self
+                .fetch_request(
+                    || self.helius_asset_batch_request(chunk),
+                    "Helius collection address resolution failed",
+                )
+                .await?;
+            if let Some(error) = payload.get("error") {
+                return Err(AnalysisError::Provider(format!(
+                    "Helius getAssetBatch failed: {error}"
+                )));
+            }
+            let items = payload
+                .get("result")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    AnalysisError::Provider(
+                        "Helius getAssetBatch response omitted result array".into(),
+                    )
+                })?;
+            for item in items {
+                let Some(mint) = item
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                else {
+                    continue;
+                };
+                let Some(address) = helius_collection_address(item) else {
+                    continue;
+                };
+                if valid_contract_address(crate::model::ChainId::Solana, &address) {
+                    addresses.insert(mint.to_owned(), address);
+                }
+            }
+        }
+        Ok(addresses)
+    }
+}
+
+#[async_trait]
+impl SeedSource for MagicEdenSeedSource {
+    async fn ranked(&self, chain: crate::model::ChainId, limit: usize) -> Result<Vec<RankedSeed>> {
+        if chain != crate::model::ChainId::Solana {
+            return Err(AnalysisError::Seed(format!(
+                "Magic Eden seed source does not support {chain}"
+            )));
+        }
+        let payload = self.fetch_popular().await?;
+        let collections = magic_eden_popular_collections(&payload);
+        if collections.is_empty() {
+            return Err(AnalysisError::Seed(
+                "Magic Eden popular response omitted usable collection symbols".into(),
+            ));
+        }
+        let details = futures_util::future::try_join_all(
+            collections
+                .into_iter()
+                .map(|collection| self.collection_detail(collection)),
+        )
+        .await?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        let detail_count = details.len();
+        let mints = details
+            .iter()
+            .map(|detail| detail.mint.clone())
+            .collect::<Vec<_>>();
+        let addresses = self.collection_addresses(&mints).await?;
+        let address_count = addresses.len();
+        let mut seen_addresses = BTreeSet::new();
+        let mut ranked = details
+            .into_iter()
+            .filter_map(|detail| {
+                let address = addresses.get(&detail.mint)?.clone();
+                seen_addresses
+                    .insert(address.clone())
+                    .then_some(RankedSeed {
+                        chain: crate::model::ChainId::Solana,
+                        contract_address: address,
+                        collection_name: detail.collection.name,
+                        stable_identifier: detail.collection.symbol,
+                        ranking_metric: "popularity_rank".into(),
+                        ranking_value: f64::from(detail.collection.rank),
+                        ranking_window: "30d".into(),
+                        source: "magic_eden".into(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        ranked.truncate(limit);
+        if ranked.is_empty() {
+            return Err(AnalysisError::Seed(format!(
+                "Magic Eden returned no usable Solana collection seeds (listing mints={detail_count}, Helius collection addresses={address_count})"
+            )));
+        }
+        Ok(ranked)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MagicEdenCollection {
+    symbol: String,
+    name: String,
+    rank: u32,
+}
+
+struct MagicEdenCollectionMint {
+    collection: MagicEdenCollection,
+    mint: String,
+}
+
+fn magic_eden_popular_collections(payload: &serde_json::Value) -> Vec<MagicEdenCollection> {
+    let Some(collections) = payload.as_array().or_else(|| {
+        ["collections", "data", "results"]
+            .into_iter()
+            .find_map(|field| payload.get(field).and_then(serde_json::Value::as_array))
+    }) else {
+        return Vec::new();
+    };
+    let mut seen_symbols = BTreeSet::new();
+    collections
+        .iter()
+        .enumerate()
+        .filter_map(|(index, collection)| {
+            let symbol = collection
+                .get("symbol")
+                .and_then(serde_json::Value::as_str)?
+                .trim();
+            if symbol.is_empty() || !seen_symbols.insert(symbol.to_owned()) {
+                return None;
+            }
+            let name = collection
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(symbol);
+            Some(MagicEdenCollection {
+                symbol: symbol.to_owned(),
+                name: name.to_owned(),
+                rank: u32::try_from(index + 1).ok()?,
+            })
+        })
+        .collect()
+}
+
+fn magic_eden_listing_mint(payload: &serde_json::Value) -> Option<String> {
+    let listing = payload
+        .as_array()
+        .and_then(|items| items.first())
+        .or_else(|| payload.get("results")?.as_array()?.first())?;
+    listing
+        .get("tokenMint")
+        .or_else(|| listing.get("token_mint"))
+        .or_else(|| {
+            listing
+                .get("token")
+                .and_then(|token| token.get("mintAddress"))
+        })
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| valid_contract_address(crate::model::ChainId::Solana, value))
+        .map(str::to_owned)
+}
+
+fn helius_collection_address(item: &serde_json::Value) -> Option<String> {
+    let group = item
+        .get("grouping")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .find(|group| {
+            group
+                .get("group_key")
+                .or_else(|| group.get("groupKey"))
+                .and_then(serde_json::Value::as_str)
+                == Some("collection")
+        })?;
+    group
+        .get("group_value")
+        .or_else(|| group.get("groupValue"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
 fn collection_contracts(collection: &serde_json::Value) -> Vec<&serde_json::Value> {
     let mut contracts = Vec::new();
     for field in ["contracts", "primary_asset_contracts", "asset_contracts"] {
@@ -455,6 +807,56 @@ mod tests {
                 ]
             })),
             Some(12.5)
+        );
+    }
+
+    #[test]
+    fn solana_seed_request_and_parsing_use_magic_eden_thirty_day_rank() {
+        let source = MagicEdenSeedSource {
+            client: reqwest::Client::new(),
+            base_endpoint: "https://example.com/v2".into(),
+            helius_endpoint: "https://helius.example.com/".into(),
+            helius_api_key: "secret".into(),
+            retries: 0,
+            request_permits: Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+        assert_eq!(
+            source.popular_request().unwrap().url().as_str(),
+            "https://example.com/v2/marketplace/popular_collections?timeRange=30d"
+        );
+        assert_eq!(
+            source
+                .collection_listings_request("collection symbol")
+                .unwrap()
+                .url()
+                .as_str(),
+            "https://example.com/v2/collections/collection%20symbol/listings?offset=0&limit=1"
+        );
+        assert_eq!(
+            magic_eden_popular_collections(&serde_json::json!([
+                {"symbol":"popular", "name":"Popular"},
+                {"symbol":"popular", "name":"Duplicate"}
+            ])),
+            vec![MagicEdenCollection {
+                symbol: "popular".into(),
+                name: "Popular".into(),
+                rank: 1,
+            }]
+        );
+        assert_eq!(
+            magic_eden_listing_mint(&serde_json::json!([{
+                "tokenMint":"So11111111111111111111111111111111111111112"
+            }])),
+            Some("So11111111111111111111111111111111111111112".into())
+        );
+        assert_eq!(
+            helius_collection_address(&serde_json::json!({
+                "grouping":[{
+                    "group_key":"collection",
+                    "group_value":"11111111111111111111111111111111"
+                }]
+            })),
+            Some("11111111111111111111111111111111".into())
         );
     }
 

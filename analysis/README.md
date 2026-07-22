@@ -18,7 +18,7 @@ opensea = ""
 helius = ""
 ```
 
-空 Key 不会触发对应 API；`select-seeds` 必须配置 `opensea`。完整分析建议配置
+空 Key 不会触发对应 API；`select-seeds` 必须配置 `opensea` 和 `helius`。完整分析建议配置
 `alchemy`、`helius` 和 `opensea`，`etherscan` 仅用于 EVM 转账回退。缺少必要数据源时程序
 仍可运行，但会将对应证据标记为 `not_requested` 或 `truncated`。Key 内容不写入运行清单
 或运行 ID；运行 ID 只记录各 Key 是否已配置。请勿提交包含真实 Key 的配置文件。
@@ -41,6 +41,7 @@ solana = 20
 ```toml
 [provider_endpoints]
 opensea = "https://api.opensea.io"
+magic_eden = "https://api-mainnet.magiceden.dev/v2"
 etherscan = "https://api.etherscan.io/v2/api"
 helius = "https://mainnet.helius-rpc.com/"
 alchemy_prices = "https://api.g.alchemy.com/prices/v1"
@@ -53,6 +54,10 @@ polygon = "polygon-mainnet"
 
 程序直接请求供应商，不依赖外部归一化网关：
 
+- seed 选择：Base、Ethereum、Polygon 使用 OpenSea 近 30 日成交量排名；Solana 使用
+  Magic Eden 的 `30d` 热门集合排名，并通过 Helius DAS 将样本 mint 解析为可验证的
+  Metaplex collection address。Solana 清单将指标明确记录为 `popularity_rank`，不把
+  Magic Eden 当前实际返回的 7 日统计伪装成 30 日成交量。
 - OpenSea 统一提供四链 **sale** 市场证据（不再请求 listing/上下架）；不使用 Alchemy 或 Helius
   市场结果。
 - EVM：Alchemy 提供合约、持有者、转账、资金流、receipt、gas 和**事件当日 UTC 日桶** USD

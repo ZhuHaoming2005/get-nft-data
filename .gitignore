@@ -20,4 +20,4 @@ output
 */examples
 top_contract_analysis
 rust_ext
-seeds.txt
+seeds.*

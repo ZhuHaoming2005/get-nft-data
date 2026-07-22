@@ -131,8 +131,14 @@ pub async fn response_bytes(response: reqwest::Response, limit: u64) -> Result<b
         let remaining = 512 - error_bytes.len();
         error_bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
     }
+    let error_detail = String::from_utf8_lossy(&error_bytes);
+    let error_detail = error_detail.trim();
     Err(crate::error::AnalysisError::ApiRequest {
-        message: format!("HTTP {status}"),
+        message: if error_detail.is_empty() {
+            format!("HTTP {status}")
+        } else {
+            format!("HTTP {status}: {error_detail}")
+        },
         retryable,
         retry_after_ms,
     })
