@@ -20,6 +20,7 @@ pub use fixture::{
     write_report_golden_fixture, write_tiny_multichain_fixture, write_uri_conflict_fixture,
 };
 pub use metadata::validated_metadata;
+pub use pass2::CollectedPass2Anchors;
 
 /// Load-time chain filters and metadata anchor bound.
 #[derive(Clone, Debug)]
@@ -80,12 +81,52 @@ fn normalize_chain_set(chains: impl IntoIterator<Item = String>) -> AHashSet<Str
         .collect()
 }
 
-/// Validate schemas, two-pass project, ordered merge, URI CSR, name stub finalize.
-pub fn load_resident_store(
+/// Remaining work after pass-1 identity + URI CSR are ready for seed URI queries.
+///
+/// Pass-2 Parquet I/O does not need the store, so the CLI can overlap it with
+/// URI seed queries before name/metadata finalize.
+pub struct PendingDedupLoad {
+    validated: Vec<validate::ValidatedInput>,
+    options: LoadOptions,
+    total_rows: u64,
+}
+
+impl PendingDedupLoad {
+    pub fn total_rows(&self) -> u64 {
+        self.total_rows
+    }
+
+    /// Heavy pass-2 scan (no store mutation). Safe to run beside URI queries.
+    pub fn collect_pass2(
+        &self,
+        progress: &dyn ProgressObserver,
+    ) -> Result<pass2::CollectedPass2Anchors, Analysis2Error> {
+        progress.begin_phase("pass2_metadata", Some(self.total_rows));
+        pass2::collect_pass2_anchors(&self.validated, &self.options, progress)
+    }
+
+    /// Apply pass-2 anchors and build Name + Metadata indexes.
+    pub fn finish(
+        self,
+        store: &mut ResidentStore,
+        anchors: pass2::CollectedPass2Anchors,
+        progress: &dyn ProgressObserver,
+    ) -> Result<(), Analysis2Error> {
+        progress.begin_phase("apply_pass2_anchors", Some(1));
+        pass2::apply_pass2_anchors(store, anchors)?;
+        progress.add_completed(1);
+        finalize_name_index_with_progress(store, progress)?;
+        finalize_metadata_index_with_progress(store, progress)?;
+        Ok(())
+    }
+}
+
+/// Pass-1 + URI CSR only. Pair with [`PendingDedupLoad`] for overlapped URI/pass2.
+pub fn load_resident_store_uri_ready(
     inputs: &[PathBuf],
     options: &LoadOptions,
     progress: &dyn ProgressObserver,
-) -> Result<ResidentStore, Analysis2Error> {
+) -> Result<(ResidentStore, Option<PendingDedupLoad>), Analysis2Error> {
     if inputs.is_empty() {
         return Err(Analysis2Error::invalid("at least one --input is required"));
     }
@@ -104,22 +145,37 @@ pub fn load_resident_store(
     }
 
     if !options.build_dedup_indexes {
-        // Replay path: only contract→NFT CSR is required for candidate expansion.
         progress.begin_phase("build_contract_nft_csr", Some(store.nfts.len() as u64));
         store.rebuild_contract_nft_csr();
         progress.add_completed(store.nfts.len() as u64);
-        return Ok(store);
+        return Ok((store, None));
     }
 
     progress.begin_phase("build_uri_csr", Some(store.nfts.len() as u64));
     store.rebuild_uri_csr();
     progress.add_completed(store.nfts.len() as u64);
 
-    progress.begin_phase("pass2_metadata", Some(total_rows));
-    pass2::scan_pass2(&validated, &mut store, options, progress)?;
+    Ok((
+        store,
+        Some(PendingDedupLoad {
+            validated,
+            options: options.clone(),
+            total_rows,
+        }),
+    ))
+}
 
-    finalize_name_index_with_progress(&mut store, progress)?;
-
-    finalize_metadata_index_with_progress(&mut store, progress)?;
+/// Validate schemas, two-pass project, ordered merge, URI CSR, name/metadata finalize.
+pub fn load_resident_store(
+    inputs: &[PathBuf],
+    options: &LoadOptions,
+    progress: &dyn ProgressObserver,
+) -> Result<ResidentStore, Analysis2Error> {
+    let (mut store, pending) = load_resident_store_uri_ready(inputs, options, progress)?;
+    let Some(pending) = pending else {
+        return Ok(store);
+    };
+    let anchors = pending.collect_pass2(progress)?;
+    pending.finish(&mut store, anchors, progress)?;
     Ok(store)
 }

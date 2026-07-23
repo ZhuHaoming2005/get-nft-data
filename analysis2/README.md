@@ -120,7 +120,20 @@ After URI/Name/Metadata queries finish, `run` always writes a portable checkpoin
 (override with `--dedup-cache PATH`). Edges are stored with stable chain/address/token
 identities (not process-local ids).
 
-To re-run enrich/analyze without re-querying:
+### Evidence cache (skip re-enrich)
+
+After enrich finishes, `run` also writes:
+
+```text
+<output-dir>/evidence_cache.json
+```
+
+(override with `--evidence-cache PATH`). Bundles are keyed by stable chain/address;
+`contract_id` is remapped on load. With `--reuse-evidence`, candidates already in the
+cache skip HTTP; only missing candidates are fetched. Seeds, pagination limits, and
+API-key *presence* must match the cache.
+
+### Fast re-run (dedup + evidence)
 
 ```powershell
 cargo run --manifest-path analysis2/Cargo.toml --release -- run `
@@ -130,7 +143,8 @@ cargo run --manifest-path analysis2/Cargo.toml --release -- run `
   --chains base,ethereum,polygon,solana `
   --evm-chains base,ethereum,polygon `
   --reuse-dedup `
-  # same thresholds / inputs / seeds as the cache-producing run
+  --reuse-evidence `
+  # same thresholds / inputs / seeds / keys as the cache-producing run
   --alchemy-api-key $env:ALCHEMY_API_KEY `
   ...
 ```

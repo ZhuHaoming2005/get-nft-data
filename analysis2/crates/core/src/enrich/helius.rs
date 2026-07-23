@@ -59,7 +59,7 @@ pub async fn resolve_collection_address(
         "method": "getAsset",
         "params": {"id": mint}
     });
-    let payload = client.post_json(&url, &[], &body).await?;
+    let payload = client.post_json_helius(&url, &[], &body).await?;
     if let Some(error) = payload.get("error") {
         return Err(Analysis2Error::http(format!(
             "Helius getAsset failed for {mint}: {error}"
@@ -148,7 +148,7 @@ pub async fn fetch_collection_identity(
         "method": "getAsset",
         "params": {"id": collection}
     });
-    let payload = client.post_json(&url, &[], &body).await.ok()?;
+    let payload = client.post_json_helius(&url, &[], &body).await.ok()?;
     if payload.get("error").is_some() {
         return None;
     }
@@ -227,7 +227,7 @@ pub async fn fetch_collection_assets(
                 }
             }
         });
-        let payload = match client.post_json(&url, &[], &body).await {
+        let payload = match client.post_json_helius(&url, &[], &body).await {
             Ok(v) => v,
             Err(e) => {
                 if snapshot.assets.is_empty() {
@@ -348,7 +348,7 @@ pub async fn fetch_asset_histories(
                     "limit": max_sigs
                 }
             });
-            let payload = match client.post_json(&url, &[], &body).await {
+            let payload = match client.post_json_helius(&url, &[], &body).await {
                 Ok(v) => v,
                 Err(_) => return Err(()),
             };
@@ -538,37 +538,16 @@ pub async fn decode_and_attach_transactions(
     let signatures: Vec<String> = sig_mints.keys().cloned().collect();
     stats.requested = signatures.len();
 
-    let mut handles = Vec::with_capacity(signatures.len());
-    for (idx, signature) in signatures.iter().cloned().enumerate() {
+    // JSON-RPC batch (fallback to per-signature on parse/transport failure).
+    // Cuts HTTP round-trips vs one request per signature for large histories.
+    const TX_RPC_BATCH_SIZE: usize = 40;
+    let mut handles = Vec::with_capacity(signatures.len().div_ceil(TX_RPC_BATCH_SIZE).max(1));
+    for (batch_idx, chunk) in signatures.chunks(TX_RPC_BATCH_SIZE).enumerate() {
         let client = client.clone();
         let url = url.clone();
+        let chunk: Vec<String> = chunk.to_vec();
         handles.push(tokio::spawn(async move {
-            let body = json!({
-                "jsonrpc": "2.0",
-                "id": format!("tx-{idx}"),
-                "method": "getTransaction",
-                "params": [
-                    signature,
-                    {
-                        "encoding": "jsonParsed",
-                        "commitment": "finalized",
-                        "maxSupportedTransactionVersion": 0
-                    }
-                ]
-            });
-            match client.post_json(&url, &[], &body).await {
-                Ok(payload) => {
-                    if let Some(error) = payload.get("error") {
-                        return Err((signature, error.to_string()));
-                    }
-                    let result = payload.get("result").cloned().unwrap_or(Value::Null);
-                    if result.is_null() {
-                        return Ok((signature, None));
-                    }
-                    Ok((signature, Some(result)))
-                }
-                Err(e) => Err((signature, e.to_string())),
-            }
+            fetch_transactions_batch(&client, &url, batch_idx, &chunk).await
         }));
     }
 
@@ -576,17 +555,23 @@ pub async fn decode_and_attach_transactions(
     let mut failures = Vec::new();
     for handle in handles {
         match handle.await {
-            Ok(Ok((sig, Some(result)))) => {
-                stats.fetched_ok += 1;
-                let mints = sig_mints.get(&sig).cloned().unwrap_or_default();
-                decoded.insert(sig.clone(), parse_decoded_tx(&sig, &result, &mints));
-            }
-            Ok(Ok((_sig, None))) => {
-                stats.null_result += 1;
-            }
-            Ok(Err((sig, err))) => {
-                stats.fetch_failed += 1;
-                failures.push(format!("{sig}: {err}"));
+            Ok(batch_rows) => {
+                for (sig, result) in batch_rows {
+                    match result {
+                        Ok(Some(payload)) => {
+                            stats.fetched_ok += 1;
+                            let mints = sig_mints.get(&sig).cloned().unwrap_or_default();
+                            decoded.insert(sig.clone(), parse_decoded_tx(&sig, &payload, &mints));
+                        }
+                        Ok(None) => {
+                            stats.null_result += 1;
+                        }
+                        Err(err) => {
+                            stats.fetch_failed += 1;
+                            failures.push(format!("{sig}: {err}"));
+                        }
+                    }
+                }
             }
             Err(e) => {
                 stats.fetch_failed += 1;
@@ -664,6 +649,122 @@ pub async fn decode_and_attach_transactions(
     let vf_outcome = value_flow_outcome(value_flows, &stats, &failures);
 
     (gas_outcome, vf_outcome, stats)
+}
+
+fn get_transaction_params(signature: &str) -> Value {
+    json!([
+        signature,
+        {
+            "encoding": "jsonParsed",
+            "commitment": "finalized",
+            "maxSupportedTransactionVersion": 0
+        }
+    ])
+}
+
+async fn fetch_transactions_batch(
+    client: &HttpClient,
+    url: &str,
+    batch_idx: usize,
+    signatures: &[String],
+) -> Vec<(String, Result<Option<Value>, String>)> {
+    if signatures.is_empty() {
+        return Vec::new();
+    }
+    let body = Value::Array(
+        signatures
+            .iter()
+            .enumerate()
+            .map(|(i, signature)| {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": format!("tx-{batch_idx}-{i}"),
+                    "method": "getTransaction",
+                    "params": get_transaction_params(signature)
+                })
+            })
+            .collect(),
+    );
+    match client.post_json_helius(url, &[], &body).await {
+        Ok(payload) => match parse_transaction_batch_payload(&payload, batch_idx, signatures) {
+            Ok(rows) => rows,
+            Err(_) => fetch_transactions_singles(client, url, batch_idx, signatures).await,
+        },
+        Err(_) => fetch_transactions_singles(client, url, batch_idx, signatures).await,
+    }
+}
+
+fn parse_transaction_batch_payload(
+    payload: &Value,
+    batch_idx: usize,
+    signatures: &[String],
+) -> Result<Vec<(String, Result<Option<Value>, String>)>, ()> {
+    let responses = payload.as_array().ok_or(())?;
+    let mut by_id: AHashMap<String, &Value> = AHashMap::with_capacity(responses.len());
+    for response in responses {
+        let id = match response.get("id") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Number(n)) => n.to_string(),
+            _ => continue,
+        };
+        by_id.insert(id, response);
+    }
+    let mut out = Vec::with_capacity(signatures.len());
+    for (i, signature) in signatures.iter().enumerate() {
+        let id = format!("tx-{batch_idx}-{i}");
+        let response = by_id
+            .get(&id)
+            .copied()
+            .or_else(|| responses.get(i));
+        match response {
+            Some(response) => out.push((signature.clone(), transaction_from_rpc_response(response))),
+            None => out.push((signature.clone(), Err("missing batch response".into()))),
+        }
+    }
+    Ok(out)
+}
+
+fn transaction_from_rpc_response(response: &Value) -> Result<Option<Value>, String> {
+    if let Some(error) = response.get("error") {
+        return Err(error.to_string());
+    }
+    match response.get("result") {
+        None | Some(Value::Null) => Ok(None),
+        Some(result) => Ok(Some(result.clone())),
+    }
+}
+
+async fn fetch_transactions_singles(
+    client: &HttpClient,
+    url: &str,
+    batch_idx: usize,
+    signatures: &[String],
+) -> Vec<(String, Result<Option<Value>, String>)> {
+    let mut handles = Vec::with_capacity(signatures.len());
+    for (i, signature) in signatures.iter().cloned().enumerate() {
+        let client = client.clone();
+        let url = url.to_owned();
+        handles.push(tokio::spawn(async move {
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": format!("tx-{batch_idx}-{i}"),
+                "method": "getTransaction",
+                "params": get_transaction_params(&signature)
+            });
+            match client.post_json_helius(&url, &[], &body).await {
+                Ok(payload) => (signature, transaction_from_rpc_response(&payload)),
+                Err(e) => (signature, Err(e.to_string())),
+            }
+        }));
+    }
+    let mut out = Vec::with_capacity(handles.len());
+    for handle in handles {
+        match handle.await {
+            Ok(row) => out.push(row),
+            Err(e) => out.push((String::new(), Err(format!("getTransaction join failed: {e}")))),
+        }
+    }
+    out
 }
 
 /// Field quality after decode. Signature-only stubs never become Complete.

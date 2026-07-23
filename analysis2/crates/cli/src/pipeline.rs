@@ -5,16 +5,18 @@ use std::sync::Arc;
 
 use ahash::AHashMap;
 use analysis2_core::{
-    analyze_candidate, build_contract_nft_map, build_dedup_cache, build_seed_analysis_rollup,
-    build_seed_dedup_report, default_dedup_cache_path, enrich_candidates, load_dedup_cache,
-    load_resident_store, load_seeds_json, query_metadata_for_seed_with_scratch,
-    query_name_for_seed_with_scratch, query_uri_for_seed_with_scratch, rematerialize_dedup_batch,
-    resolve_seed_contract, scopes_complete_for_seed, validate_dedup_cache, write_candidate_json,
-    write_dedup_cache, write_dedup_outputs, write_run_outputs, Analysis2Error, ApiKeys,
-    CandidateAnalysis, CandidateRegistry, ContractId, DedupCacheParams, DedupRunParams,
-    EvidenceBundle, FailureRecord, HitGraph, HttpLimits, LoadOptions, MetadataQueryScratch,
-    NameQueryScratch, PaperConfig, ProgressObserver, ResidentStore, SeedFullReport, SeedRecord,
-    UriQueryScratch,
+    analyze_candidate, build_contract_nft_map, build_dedup_cache, build_evidence_cache,
+    build_seed_analysis_rollup, build_seed_dedup_report, default_dedup_cache_path,
+    default_evidence_cache_path, enrich_candidates, evidence_cache_params, load_dedup_cache,
+    load_evidence_cache, load_resident_store_uri_ready, load_seeds_json,
+    query_metadata_for_seed_with_scratch, query_name_for_seed_with_scratch,
+    query_uri_for_seed_with_scratch, rematerialize_dedup_batch, rematerialize_evidence,
+    resolve_seed_contract, scopes_complete_for_seed, validate_dedup_cache, validate_evidence_cache,
+    write_candidate_json, write_dedup_cache, write_dedup_outputs, write_evidence_cache,
+    write_run_outputs, Analysis2Error, ApiKeys, CandidateAnalysis, CandidateRegistry, ContractId,
+    DedupCacheParams, DedupRunParams, EvidenceBundle, FailureRecord, HitGraph, HttpLimits,
+    LoadOptions, MetadataQueryScratch, NameQueryScratch, PaperConfig, PendingDedupLoad,
+    ProgressObserver, ResidentStore, SeedFullReport, SeedRecord, UriQueryScratch,
 };
 use rayon::prelude::*;
 
@@ -62,6 +64,10 @@ pub struct RunConfig {
     pub dedup_cache_path: Option<PathBuf>,
     /// Load dedup results from cache and skip URI/Name/Metadata query stages.
     pub reuse_dedup: bool,
+    /// Path for durable evidence cache (`evidence_cache.json` by default under output_dir).
+    pub evidence_cache_path: Option<PathBuf>,
+    /// Load enrich evidence from cache; only HTTP-fetch candidates missing from cache.
+    pub reuse_evidence: bool,
 }
 
 fn with_rayon_pool<T>(
@@ -134,10 +140,10 @@ where
         .collect::<Vec<_>>();
     progress.begin_phase(phase, Some(active.len() as u64));
 
-    // When seed parallelism already saturates the Rayon pool, nested query
-    // `par_chunks` only adds work-stealing jitter.
-    let allow_inner = active.len() < rayon::current_num_threads();
-    analysis2_core::set_inner_query_parallel(allow_inner);
+    // Always allow nested query parallelism. Seed costs are highly skewed
+    // (Solana collections with thousands of Name queries vs single EVM reps);
+    // work-stealing into heavy seeds beats the jitter cost of nested pools.
+    analysis2_core::set_inner_query_parallel(true);
     let outcomes = active
         .par_iter()
         .map_init(init, |scratch, &state_index| {
@@ -175,14 +181,11 @@ where
     Ok(())
 }
 
-fn query_seeds_staged(
-    store: &mut ResidentStore,
+fn resolve_seed_states(
+    store: &ResidentStore,
     seeds: &[SeedRecord],
-    name_threshold: f64,
-    metadata_threshold: f64,
     progress: &dyn ProgressObserver,
-) -> Result<SeedDedupBatch, Analysis2Error> {
-    progress.set_stage("dedup");
+) -> Result<(Vec<SeedDedupState>, Vec<FailureRecord>), Analysis2Error> {
     progress.begin_phase("resolve_seeds", Some(seeds.len() as u64));
     let resolved = seeds
         .par_iter()
@@ -214,24 +217,37 @@ fn query_seeds_staged(
             )),
         }
     }
+    Ok((states, failures))
+}
 
+fn finish_seed_batch(
+    states: Vec<SeedDedupState>,
+    mut failures: Vec<FailureRecord>,
+) -> SeedDedupBatch {
+    let mut completed = Vec::with_capacity(states.len());
+    for state in states {
+        if let Some(failure) = state.failure {
+            failures.push(failure);
+        } else {
+            completed.push((state.seed, state.seed_id, state.graph));
+        }
+    }
+    SeedDedupBatch {
+        completed,
+        failures,
+    }
+}
+
+fn query_name_and_metadata_stages(
+    store: &mut ResidentStore,
+    states: &mut [SeedDedupState],
+    name_threshold: f64,
+    metadata_threshold: f64,
+    progress: &dyn ProgressObserver,
+) -> Result<(), Analysis2Error> {
     let quiet = CancellationOnlyProgress { inner: progress };
-    // Match the architecture contract: dimensions are barriers; seeds are
-    // parallel within the active dimension. This keeps each index hot and
-    // avoids running three memory-heavy query engines on every worker at once.
-    // After each barrier, drop that dimension's index so subsequent stages
-    // (and enrich) reclaim RSS / cache.
     run_seed_stage(
-        &mut states,
-        "uri_seeds",
-        progress,
-        || UriQueryScratch::for_chain_count(store.chains.len()),
-        |scratch, seed, graph| query_uri_for_seed_with_scratch(store, seed, graph, &quiet, scratch),
-    )?;
-    store.drop_uri_indexes();
-
-    run_seed_stage(
-        &mut states,
+        states,
         "name_seeds",
         progress,
         || {
@@ -247,7 +263,7 @@ fn query_seeds_staged(
     store.drop_name_indexes();
 
     run_seed_stage(
-        &mut states,
+        states,
         "metadata_seeds",
         progress,
         MetadataQueryScratch::default,
@@ -263,19 +279,85 @@ fn query_seeds_staged(
         },
     )?;
     store.drop_metadata_index();
+    Ok(())
+}
 
-    let mut completed = Vec::with_capacity(states.len());
-    for state in states {
-        if let Some(failure) = state.failure {
-            failures.push(failure);
-        } else {
-            completed.push((state.seed, state.seed_id, state.graph));
-        }
-    }
-    Ok(SeedDedupBatch {
-        completed,
-        failures,
-    })
+/// Full-index path: URI → Name → Metadata with dimension barriers.
+fn query_seeds_staged(
+    store: &mut ResidentStore,
+    seeds: &[SeedRecord],
+    name_threshold: f64,
+    metadata_threshold: f64,
+    progress: &dyn ProgressObserver,
+) -> Result<SeedDedupBatch, Analysis2Error> {
+    progress.set_stage("dedup");
+    let (mut states, failures) = resolve_seed_states(store, seeds, progress)?;
+    let quiet = CancellationOnlyProgress { inner: progress };
+    // Dimensions are barriers so each index stays hot; drop after use for RSS.
+    run_seed_stage(
+        &mut states,
+        "uri_seeds",
+        progress,
+        || UriQueryScratch::for_chain_count(store.chains.len()),
+        |scratch, seed, graph| query_uri_for_seed_with_scratch(store, seed, graph, &quiet, scratch),
+    )?;
+    store.drop_uri_indexes();
+    query_name_and_metadata_stages(
+        store,
+        &mut states,
+        name_threshold,
+        metadata_threshold,
+        progress,
+    )?;
+    Ok(finish_seed_batch(states, failures))
+}
+
+/// Overlap pass-2 Parquet I/O with URI seed queries, then finish name/metadata.
+fn query_seeds_with_pass2_overlap(
+    store: &mut ResidentStore,
+    pending: PendingDedupLoad,
+    seeds: &[SeedRecord],
+    name_threshold: f64,
+    metadata_threshold: f64,
+    progress: &dyn ProgressObserver,
+) -> Result<SeedDedupBatch, Analysis2Error> {
+    progress.set_stage("dedup");
+    let (mut states, failures) = resolve_seed_states(store, seeds, progress)?;
+    let quiet = CancellationOnlyProgress { inner: progress };
+    let chain_count = store.chains.len();
+
+    // URI queries only read URI CSR + identity; pass-2 collect never touches the
+    // store. Overlapping them hides a full Parquet metadata scan behind URI work.
+    let (uri_result, anchors_result) = rayon::join(
+        || {
+            run_seed_stage(
+                &mut states,
+                "uri_seeds",
+                progress,
+                || UriQueryScratch::for_chain_count(chain_count),
+                |scratch, seed, graph| {
+                    query_uri_for_seed_with_scratch(store, seed, graph, &quiet, scratch)
+                },
+            )
+        },
+        || pending.collect_pass2(&quiet),
+    );
+    uri_result?;
+    let anchors = anchors_result?;
+    store.drop_uri_indexes();
+
+    progress.set_stage("load");
+    pending.finish(store, anchors, progress)?;
+
+    progress.set_stage("dedup");
+    query_name_and_metadata_stages(
+        store,
+        &mut states,
+        name_threshold,
+        metadata_threshold,
+        progress,
+    )?;
+    Ok(finish_seed_batch(states, failures))
 }
 
 /// Load snapshot → query URI/Name/Metadata per seed → write offline reports.
@@ -295,18 +377,29 @@ fn run_dedup_inner(
         config.evm_chains.clone(),
         config.metadata_anchors,
     );
-    let mut store = load_resident_store(&config.inputs, &options, progress)?;
     let seeds = load_seeds_json(&config.seeds)?;
+    let (mut store, pending) =
+        load_resident_store_uri_ready(&config.inputs, &options, progress)?;
     // Built before dimension drops so CSR slices stay valid for reporting.
     let contract_nfts = build_contract_nft_map(&store);
 
-    let seed_batch = query_seeds_staged(
-        &mut store,
-        &seeds,
-        config.name_threshold,
-        config.metadata_threshold,
-        progress,
-    )?;
+    let seed_batch = match pending {
+        Some(pending) => query_seeds_with_pass2_overlap(
+            &mut store,
+            pending,
+            &seeds,
+            config.name_threshold,
+            config.metadata_threshold,
+            progress,
+        )?,
+        None => query_seeds_staged(
+            &mut store,
+            &seeds,
+            config.name_threshold,
+            config.metadata_threshold,
+            progress,
+        )?,
+    };
     progress.set_stage("report");
     progress.begin_phase("aggregate_seeds", Some(seed_batch.completed.len() as u64));
     let reports = seed_batch
@@ -352,6 +445,13 @@ fn dedup_cache_path(config: &RunConfig) -> PathBuf {
         .dedup_cache_path
         .clone()
         .unwrap_or_else(|| default_dedup_cache_path(&config.output_dir))
+}
+
+fn evidence_cache_path(config: &RunConfig) -> PathBuf {
+    config
+        .evidence_cache_path
+        .clone()
+        .unwrap_or_else(|| default_evidence_cache_path(&config.output_dir))
 }
 
 fn make_dedup_cache_params(config: &RunConfig, seeds: &[SeedRecord]) -> DedupCacheParams {
@@ -414,7 +514,8 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
             config.metadata_anchors,
         )
     };
-    let mut store = load_resident_store(&config.inputs, &options, progress)?;
+    let (mut store, pending) =
+        load_resident_store_uri_ready(&config.inputs, &options, progress)?;
     let contract_nfts = build_contract_nft_map(&store);
 
     let seed_batch = if config.reuse_dedup {
@@ -424,15 +525,27 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                 cache_path.display()
             )));
         }
+        // Identity-only load leaves no pending pass-2 work.
+        let _ = pending;
         load_seed_batch_from_cache(&store, &cache_path, &cache_params, progress)?
     } else {
-        let batch = query_seeds_staged(
-            &mut store,
-            &seeds,
-            config.name_threshold,
-            config.metadata_threshold,
-            progress,
-        )?;
+        let batch = match pending {
+            Some(pending) => query_seeds_with_pass2_overlap(
+                &mut store,
+                pending,
+                &seeds,
+                config.name_threshold,
+                config.metadata_threshold,
+                progress,
+            )?,
+            None => query_seeds_staged(
+                &mut store,
+                &seeds,
+                config.name_threshold,
+                config.metadata_threshold,
+                progress,
+            )?,
+        };
         // Persist immediately so a later `--reuse-dedup` can skip query work.
         progress.begin_phase("write_dedup_cache", Some(1));
         let cache = build_dedup_cache(
@@ -461,26 +574,92 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
     );
 
     progress.set_stage("enrich");
+    let limits = HttpLimits {
+        concurrency: config.http_concurrency.max(1),
+        ..HttpLimits::default()
+    };
+    let evidence_path = evidence_cache_path(config);
+    let evidence_params = evidence_cache_params(
+        &seeds,
+        &config.seeds.display().to_string(),
+        &config.api_keys,
+        &limits,
+    );
+
+    let mut evidence = if config.reuse_evidence {
+        if !evidence_path.is_file() {
+            return Err(Analysis2Error::invalid(format!(
+                "--reuse-evidence requires existing cache file {}",
+                evidence_path.display()
+            )));
+        }
+        progress.begin_phase("load_evidence_cache", Some(1));
+        let cache = load_evidence_cache(&evidence_path)?;
+        validate_evidence_cache(&cache, &evidence_params)?;
+        let map = rematerialize_evidence(&store, &cache)?;
+        progress.add_completed(1);
+        eprintln!(
+            "evidence: reused cache {} ({} bundles)",
+            evidence_path.display(),
+            map.len()
+        );
+        map
+    } else {
+        AHashMap::new()
+    };
+
     let evidence = match &config.enrich_override {
-        Some(hook) => hook(&registry, &store, progress)?,
+        Some(hook) => {
+            // Test / offline hooks replace evidence entirely (still written to cache).
+            hook(&registry, &store, progress)?
+        }
         None => {
-            let limits = HttpLimits {
-                concurrency: config.http_concurrency.max(1),
-                ..HttpLimits::default()
-            };
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| Analysis2Error::http(format!("tokio runtime: {e}")))?;
-            runtime.block_on(enrich_candidates(
-                &registry,
-                &store,
-                &config.api_keys,
-                &limits,
-                progress,
-            ))?
+            let missing: ahash::AHashSet<ContractId> = registry
+                .candidate_contracts()
+                .iter()
+                .copied()
+                .filter(|cid| !evidence.contains_key(cid))
+                .collect();
+            if missing.is_empty() {
+                eprintln!(
+                    "evidence: all {} candidates covered by cache; skipping HTTP enrich",
+                    registry.candidate_contract_count()
+                );
+                evidence
+            } else {
+                let subset = registry.filter_candidates(&missing);
+                eprintln!(
+                    "evidence: fetching {} / {} candidates via HTTP",
+                    subset.candidate_contract_count(),
+                    registry.candidate_contract_count()
+                );
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| Analysis2Error::http(format!("tokio runtime: {e}")))?;
+                let fetched = runtime.block_on(enrich_candidates(
+                    &subset,
+                    &store,
+                    &config.api_keys,
+                    &limits,
+                    progress,
+                ))?;
+                evidence.extend(fetched);
+                evidence
+            }
         }
     };
+
+    // Always persist so a later `--reuse-evidence` can skip HTTP.
+    progress.begin_phase("write_evidence_cache", Some(1));
+    let evidence_file = build_evidence_cache(evidence_params, &evidence);
+    write_evidence_cache(&evidence_path, &evidence_file)?;
+    progress.add_completed(1);
+    eprintln!(
+        "evidence: wrote cache {} ({} bundles)",
+        evidence_path.display(),
+        evidence_file.bundles.len()
+    );
 
     progress.check_cancelled()?;
     progress.set_stage("analyze");
@@ -780,6 +959,8 @@ mod tests {
                 enrich_override: Some(enrich),
                 dedup_cache_path: None,
                 reuse_dedup: false,
+                evidence_cache_path: None,
+                reuse_evidence: false,
             },
             &analysis2_core::NoopProgress,
         )
@@ -885,6 +1066,8 @@ mod tests {
                 enrich_override: Some(enrich),
                 dedup_cache_path: None,
                 reuse_dedup: false,
+                evidence_cache_path: None,
+                reuse_evidence: false,
             },
             &CancelOnEnrich,
         )
@@ -913,6 +1096,7 @@ mod tests {
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
         let cache_path = out.join("dedup_cache.json");
+        let evidence_path = out.join("evidence_cache.json");
 
         let enrich: EnrichOverride = Arc::new(|registry, store, progress| {
             progress.set_stage("enrich");
@@ -949,14 +1133,18 @@ mod tests {
             enrich_override: Some(enrich.clone()),
             dedup_cache_path: Some(cache_path.clone()),
             reuse_dedup: false,
+            evidence_cache_path: Some(evidence_path.clone()),
+            reuse_evidence: false,
         };
 
         run(&base_config(), &analysis2_core::NoopProgress).expect("first run");
         assert!(cache_path.is_file(), "dedup cache must be written");
+        assert!(evidence_path.is_file(), "evidence cache must be written");
 
         let mut reuse = base_config();
         reuse.reuse_dedup = true;
-        run(&reuse, &analysis2_core::NoopProgress).expect("reuse-dedup run");
+        reuse.reuse_evidence = true;
+        run(&reuse, &analysis2_core::NoopProgress).expect("reuse-dedup+evidence run");
         assert!(out.join("summary.json").is_file());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1014,6 +1202,8 @@ mod tests {
                 enrich_override: Some(enrich),
                 dedup_cache_path: None,
                 reuse_dedup: false,
+                evidence_cache_path: None,
+                reuse_evidence: false,
             },
             &analysis2_core::NoopProgress,
         )

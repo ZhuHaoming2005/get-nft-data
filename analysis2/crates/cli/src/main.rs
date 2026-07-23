@@ -89,6 +89,17 @@ struct RunArgs {
     #[arg(long, default_value_t = false)]
     reuse_dedup: bool,
 
+    /// Path for durable evidence cache (default: `<output-dir>/evidence_cache.json`).
+    /// Written after enrich on `run`; used when `--reuse-evidence` is set.
+    #[arg(long)]
+    evidence_cache: Option<PathBuf>,
+
+    /// Reuse enrich evidence from `--evidence-cache` (or default path). Only
+    /// HTTP-fetches candidates missing from the cache. Seeds, pagination
+    /// limits, and API-key presence must match the cache.
+    #[arg(long, default_value_t = false)]
+    reuse_evidence: bool,
+
     /// Progress reporter mode.
     #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
     progress: ProgressMode,
@@ -210,6 +221,8 @@ fn run() -> Result<(), Analysis2Error> {
                     enrich_override: None,
                     dedup_cache_path: args.dedup_cache,
                     reuse_dedup: args.reuse_dedup,
+                    evidence_cache_path: args.evidence_cache,
+                    reuse_evidence: args.reuse_evidence,
                 },
                 progress,
             )

@@ -101,22 +101,38 @@ impl ShardAnchors {
     }
 }
 
-pub fn scan_pass2(
+/// Collected pass-2 anchors prior to store ingestion (safe to build without
+/// holding `ResidentStore`, so URI seed queries can run concurrently).
+#[derive(Default)]
+pub struct CollectedPass2Anchors {
+    by_contract: AHashMap<(String, String), Vec<MetadataRecord>>,
+}
+
+/// Scan + merge pass-2 metadata without touching the resident store.
+pub fn collect_pass2_anchors(
     inputs: &[ValidatedInput],
-    store: &mut ResidentStore,
     options: &LoadOptions,
     progress: &dyn ProgressObserver,
-) -> Result<(), Analysis2Error> {
+) -> Result<CollectedPass2Anchors, Analysis2Error> {
     let shard_results: Vec<Result<ShardAnchors, Analysis2Error>> = inputs
         .par_iter()
         .map(|input| scan_file_pass2(input, options, progress))
         .collect();
 
-    // Merge in an ordered parallel tree, then apply the bounded final anchor
-    // set once. This preserves first-source-row semantics without serially
-    // replaying every intermediate file shard into the resident store.
+    // Merge in an ordered parallel tree. This preserves first-source-row
+    // semantics without serially replaying every intermediate file shard.
     let shard = merge_anchor_shards_ordered(shard_results, options)?;
-    for ((chain, contract_address), records) in shard.by_contract {
+    Ok(CollectedPass2Anchors {
+        by_contract: shard.by_contract,
+    })
+}
+
+/// Ingest previously collected pass-2 anchors into the resident store.
+pub fn apply_pass2_anchors(
+    store: &mut ResidentStore,
+    anchors: CollectedPass2Anchors,
+) -> Result<(), Analysis2Error> {
+    for ((chain, contract_address), records) in anchors.by_contract {
         for record in records {
             store.ingest_metadata_anchor(
                 &chain,

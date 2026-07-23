@@ -189,16 +189,29 @@ async fn enrich_evm(
         }
     }
 
+    // Prices only need day buckets; receipts only need tx hashes. Run both
+    // before mutating the transfer/sale vectors so one RTT is removed from
+    // the EVM critical path.
     let day_buckets = collect_day_buckets(&transfers.value, &sales.value);
-    let prices = alchemy::fetch_prices(
-        client,
-        &limits.endpoints,
-        keys.alchemy(),
-        chain,
-        &day_buckets,
-    )
-    .await;
+    let tx_hashes = alchemy::collect_unique_tx_hashes(&transfers.value, &sales.value);
+    let (prices, gas) = tokio::join!(
+        alchemy::fetch_prices(
+            client,
+            &limits.endpoints,
+            keys.alchemy(),
+            chain,
+            &day_buckets,
+        ),
+        alchemy::fetch_receipt_gas(
+            client,
+            &limits.endpoints,
+            keys.alchemy(),
+            chain,
+            &tx_hashes,
+        ),
+    );
     apply_prices_to_sales(&mut sales.value, &prices.value, chain);
+    alchemy::attach_receipt_gas(&mut transfers.value, &gas.value);
 
     apply_outcome(
         &mut bundle.quality.transfers,
@@ -232,16 +245,6 @@ async fn enrich_evm(
     );
     bundle.prices = prices.value;
 
-    let tx_hashes = alchemy::collect_unique_tx_hashes(&bundle.transfers, &bundle.sales);
-    let gas = alchemy::fetch_receipt_gas(
-        client,
-        &limits.endpoints,
-        keys.alchemy(),
-        chain,
-        &tx_hashes,
-    )
-    .await;
-    alchemy::attach_receipt_gas(&mut bundle.transfers, &gas.value);
     apply_outcome(
         &mut bundle.quality.gas,
         &mut bundle.provenance,
@@ -258,17 +261,20 @@ async fn enrich_evm(
     }
     bundle.controllers = controllers_out.value;
 
-    // After gas attach so mint fee_payers are available as operator seeds.
-    let value_flows = value_flow::fetch_evm_value_flows(
-        client,
-        &limits.endpoints,
-        keys.alchemy(),
-        chain,
-        &bundle.controllers,
-        &bundle.transfers,
-        &bundle.sales,
-    )
-    .await;
+    // Value-flow needs gas-attached fee_payers; mint extras only probe mint
+    // recipients and can run concurrently.
+    let (value_flows, mint_extras) = tokio::join!(
+        value_flow::fetch_evm_value_flows(
+            client,
+            &limits.endpoints,
+            keys.alchemy(),
+            chain,
+            &bundle.controllers,
+            &bundle.transfers,
+            &bundle.sales,
+        ),
+        collect_evm_mint_payment_extras(client, keys, limits, chain, &bundle.transfers),
+    );
     apply_outcome(
         &mut bundle.quality.value_flows,
         &mut bundle.provenance,
@@ -277,8 +283,6 @@ async fn enrich_evm(
     );
     bundle.value_flows = value_flows.value;
 
-    let mint_extras =
-        collect_evm_mint_payment_extras(client, keys, limits, chain, &bundle.transfers).await;
     mint_payment::attach_mint_payments(
         &mut bundle.transfers,
         &bundle.value_flows,

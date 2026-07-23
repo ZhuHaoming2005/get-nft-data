@@ -16,11 +16,14 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const DEFAULT_RETRIES: usize = 3;
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
-/// OpenSea token-bucket defaults (same knobs as `top_contract_analysis_rs`
-/// `DEFAULT_OTHER_API_RATE_LIMIT_*`): burst 4, refill 1 token every 300 ms
-/// (~3.3 rps sustained, never more than 4 tokens available).
+/// Shared “other API” token-bucket defaults (same knobs as
+/// `top_contract_analysis_rs` `DEFAULT_OTHER_API_RATE_LIMIT_*`): burst 4,
+/// refill 1 token every 300 ms (~3.3 rps sustained, never more than 4 tokens).
+/// OpenSea and Helius each get an **independent** bucket with these defaults.
 pub const OPENSEA_RATE_LIMIT_BURST: usize = 4;
 pub const OPENSEA_RATE_LIMIT_REFILL_MS: u64 = 300;
+pub const HELIUS_RATE_LIMIT_BURST: usize = 4;
+pub const HELIUS_RATE_LIMIT_REFILL_MS: u64 = 300;
 
 #[derive(Debug)]
 struct TokenBucketState {
@@ -59,6 +62,14 @@ impl TokenBucketRateLimiter {
         )
     }
 
+    /// Helius default: independent bucket, same burst/refill as OpenSea.
+    pub fn helius_default() -> Self {
+        Self::new(
+            HELIUS_RATE_LIMIT_BURST,
+            Duration::from_millis(HELIUS_RATE_LIMIT_REFILL_MS),
+        )
+    }
+
     /// Wait until a rate token is available, then consume one.
     pub async fn acquire(&self) -> Result<(), Analysis2Error> {
         loop {
@@ -66,7 +77,7 @@ impl TokenBucketRateLimiter {
                 let mut state = self
                     .state
                     .lock()
-                    .map_err(|_| Analysis2Error::http("OpenSea rate limiter poisoned"))?;
+                    .map_err(|_| Analysis2Error::http("rate limiter poisoned"))?;
                 let elapsed = state.last_refill.elapsed();
                 if !elapsed.is_zero() {
                     let add = elapsed.as_secs_f64() / self.refill_interval.as_secs_f64();
@@ -98,6 +109,8 @@ pub struct HttpClient {
     retries: usize,
     /// Shared OpenSea rate limiter (all clones share one bucket).
     opensea_limiter: TokenBucketRateLimiter,
+    /// Shared Helius rate limiter (independent of OpenSea; all clones share one bucket).
+    helius_limiter: TokenBucketRateLimiter,
 }
 
 impl HttpClient {
@@ -120,6 +133,7 @@ impl HttpClient {
             in_flight: Arc::new(Semaphore::new(concurrency.max(1))),
             retries,
             opensea_limiter: TokenBucketRateLimiter::opensea_default(),
+            helius_limiter: TokenBucketRateLimiter::helius_default(),
         })
     }
 
@@ -149,6 +163,18 @@ impl HttpClient {
     ) -> Result<Value, Analysis2Error> {
         self.request(reqwest::Method::POST, url, headers, Some(body))
             .await
+    }
+
+    /// POST that first consumes a Helius rate token (independent bucket, same
+    /// burst/refill strategy as OpenSea).
+    pub async fn post_json_helius(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &Value,
+    ) -> Result<Value, Analysis2Error> {
+        self.helius_limiter.acquire().await?;
+        self.post_json(url, headers, body).await
     }
 
     async fn request(
@@ -557,5 +583,26 @@ mod tests {
             start.elapsed() >= Duration::from_millis(40),
             "second token should wait for refill"
         );
+    }
+
+    #[tokio::test]
+    async fn helius_and_opensea_buckets_are_independent() {
+        // Same knobs as production defaults, short refill for the test.
+        let opensea = TokenBucketRateLimiter::new(1, Duration::from_millis(200));
+        let helius = TokenBucketRateLimiter::new(1, Duration::from_millis(200));
+        opensea.acquire().await.unwrap();
+        // OpenSea is empty, but Helius still has its own starting token.
+        let start = std::time::Instant::now();
+        helius.acquire().await.unwrap();
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "helius must not wait on the opensea bucket"
+        );
+    }
+
+    #[test]
+    fn helius_defaults_match_opensea_strategy() {
+        assert_eq!(HELIUS_RATE_LIMIT_BURST, OPENSEA_RATE_LIMIT_BURST);
+        assert_eq!(HELIUS_RATE_LIMIT_REFILL_MS, OPENSEA_RATE_LIMIT_REFILL_MS);
     }
 }

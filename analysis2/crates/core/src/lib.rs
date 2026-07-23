@@ -33,16 +33,21 @@ pub use entity::{
     finalize_name_representatives_stub,
 };
 pub use error::Analysis2Error;
-pub use parquet::{LoadOptions, load_resident_store};
+pub use parquet::{
+    load_resident_store, load_resident_store_uri_ready, LoadOptions, PendingDedupLoad,
+};
 pub use progress::{EwmaEta, NoopProgress, ProgressObserver};
 pub use reporting::{
-    build_dedup_cache, default_dedup_cache_path, load_dedup_cache, rematerialize_dedup_batch,
-    validate_dedup_cache, write_dedup_cache, CachedHitEdge, CachedSeedHits, DedupCacheFile,
-    DedupCacheParams, DedupRunParams, FailureRecord, ScopeNftCounts, SeedDedupReport,
-    SeedFullReport, SeedRecord, DEFAULT_DEDUP_CACHE_FILE, DEDUP_CACHE_VERSION,
-    build_contract_nft_map, build_seed_analysis_rollup, build_seed_dedup_report,
-    count_failed_seeds, count_scope_nfts, load_seeds_json, resolve_seed_contract,
-    scopes_complete_for_seed, write_candidate_json, write_dedup_outputs, write_run_outputs,
+    build_contract_nft_map, build_dedup_cache, build_evidence_cache, build_seed_analysis_rollup,
+    build_seed_dedup_report, count_failed_seeds, count_scope_nfts, default_dedup_cache_path,
+    default_evidence_cache_path, evidence_cache_params, load_dedup_cache, load_evidence_cache,
+    load_seeds_json, rematerialize_dedup_batch, rematerialize_evidence, resolve_seed_contract,
+    scopes_complete_for_seed, validate_dedup_cache, validate_evidence_cache, write_candidate_json,
+    write_dedup_cache, write_dedup_outputs, write_evidence_cache, write_run_outputs, CachedHitEdge,
+    CachedSeedHits, DedupCacheFile, DedupCacheParams, DedupRunParams, EvidenceCacheFile,
+    EvidenceCacheParams, FailureRecord, ScopeNftCounts, SeedDedupReport, SeedFullReport,
+    SeedRecord, DEFAULT_DEDUP_CACHE_FILE, DEFAULT_EVIDENCE_CACHE_FILE, DEDUP_CACHE_VERSION,
+    EVIDENCE_CACHE_VERSION,
 };
 pub use seed::{
     SeedRecord as SelectedSeed, SelectSeedsOptions, select_seeds, select_seeds_async,

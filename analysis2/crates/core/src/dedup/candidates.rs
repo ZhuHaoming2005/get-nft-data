@@ -129,6 +129,43 @@ impl CandidateRegistry {
     pub fn candidate_contract_count(&self) -> usize {
         self.candidate_contracts.len()
     }
+
+    /// Sub-registry containing only `keep` candidates and their seed relations.
+    ///
+    /// Used when reusing an evidence cache so HTTP enrich only runs for missing
+    /// candidates (legit prefilter still sees the relevant seed relations).
+    pub fn filter_candidates(&self, keep: &AHashSet<ContractId>) -> Self {
+        if keep.is_empty() {
+            return Self::default();
+        }
+        let mut candidate_contracts: Vec<ContractId> = self
+            .candidate_contracts
+            .iter()
+            .copied()
+            .filter(|id| keep.contains(id))
+            .collect();
+        candidate_contracts.sort_unstable();
+
+        let mut relations = Vec::new();
+        let mut relations_by_seed: AHashMap<ContractId, Vec<usize>> = AHashMap::new();
+        for rel in &self.relations {
+            if !keep.contains(&rel.candidate_contract) {
+                continue;
+            }
+            let idx = relations.len();
+            relations_by_seed
+                .entry(rel.seed_contract)
+                .or_default()
+                .push(idx);
+            relations.push(rel.clone());
+        }
+
+        Self {
+            candidate_contracts,
+            relations,
+            relations_by_seed,
+        }
+    }
 }
 
 fn dimension_ord(d: Dimension) -> u8 {
@@ -187,6 +224,12 @@ mod tests {
         assert_eq!(seed2.len(), 1);
         assert_eq!(seed2[0].candidate_contract, 10);
         // Multi-seed on candidate 10: two relations, enrich once per unique candidate
+
+        let only_11 = [11].into_iter().collect::<AHashSet<_>>();
+        let filtered = reg.filter_candidates(&only_11);
+        assert_eq!(filtered.candidate_contracts(), &[11]);
+        assert_eq!(filtered.relations().len(), 1);
+        assert_eq!(filtered.relations()[0].candidate_contract, 11);
         assert_eq!(reg.relations().len(), 3);
     }
 
