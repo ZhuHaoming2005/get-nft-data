@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+ahash = "0.8"
+arrow-array = "57"
+arrow-cast = "57"
+arrow-schema = "57"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+clap = { version = "4.6", features = ["derive"] }
+httpmock = "0.7"
+num-bigint = "0.4"
+parquet = { version = "=57.3.1", features = ["arrow"] }
+rapidfuzz = "=0.5.0"
+rayon = "1.11"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2.0"
+tokio = { version = "1.52", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+analysis2_core = { path = "crates/core" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
