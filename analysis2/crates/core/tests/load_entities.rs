@@ -1,6 +1,6 @@
 //! Integration test for two-pass Parquet load into ResidentStore.
 
-use analysis2_core::parquet::{write_tiny_multichain_fixture, LoadOptions, load_resident_store};
+use analysis2_core::parquet::{load_resident_store, write_tiny_multichain_fixture, LoadOptions};
 use analysis2_core::{NoopProgress, ProgressObserver};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -11,6 +11,7 @@ struct RecordingProgress {
     stages: Mutex<Vec<String>>,
     phases: Mutex<Vec<String>>,
     completed: AtomicU64,
+    finishes: AtomicU64,
 }
 
 impl RecordingProgress {
@@ -19,6 +20,7 @@ impl RecordingProgress {
             stages: Mutex::new(Vec::new()),
             phases: Mutex::new(Vec::new()),
             completed: AtomicU64::new(0),
+            finishes: AtomicU64::new(0),
         }
     }
 }
@@ -40,7 +42,9 @@ impl ProgressObserver for RecordingProgress {
         Ok(())
     }
 
-    fn finish(&self) {}
+    fn finish(&self) {
+        self.finishes.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 fn fixture_path() -> PathBuf {
@@ -66,24 +70,28 @@ fn load_entities_totals_uri_csr_and_descending_anchors() {
     let store = load_resident_store(&[path], &default_options(), &progress).expect("load");
 
     assert!(
-        progress
-            .stages
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|s| s == "load"),
+        progress.stages.lock().unwrap().iter().any(|s| s == "load"),
         "ProgressObserver must see load stage"
     );
     let phases = progress.phases.lock().unwrap().clone();
     assert!(
-        phases.iter().any(|p| p.contains("pass1") || p.contains("scan")),
+        phases
+            .iter()
+            .any(|p| p.contains("pass1") || p.contains("scan")),
         "expected pass1/scan phase, got {phases:?}"
     );
     assert!(
-        phases.iter().any(|p| p.contains("pass2") || p.contains("metadata")),
+        phases
+            .iter()
+            .any(|p| p.contains("pass2") || p.contains("metadata")),
         "expected pass2/metadata phase, got {phases:?}"
     );
     assert!(progress.completed.load(Ordering::Relaxed) > 0);
+    assert_eq!(
+        progress.finishes.load(Ordering::Relaxed),
+        0,
+        "a load subroutine must not stop the caller-owned progress reporter"
+    );
 
     // 2 EVM contracts + 1 Solana collection, 6 NFTs
     assert_eq!(store.contracts.len(), 3);
@@ -189,10 +197,7 @@ fn conflicting_uri_same_logical_key_errors() {
 }
 
 fn tempfile_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "analysis2_load_entities_{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("analysis2_load_entities_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir

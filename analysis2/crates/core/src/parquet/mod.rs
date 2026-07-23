@@ -10,7 +10,7 @@ mod validate;
 use ahash::AHashSet;
 use std::path::PathBuf;
 
-use crate::dedup::metadata::finalize_metadata_index;
+use crate::dedup::metadata::finalize_metadata_index_with_progress;
 use crate::dedup::name::finalize_name_index;
 use crate::entity::ResidentStore;
 use crate::progress::ProgressObserver;
@@ -85,10 +85,6 @@ pub fn load_resident_store(
     finalize_name_index(&mut store)?;
     progress.add_completed(1);
 
-    progress.begin_phase("finalize_metadata_index", Some(1));
-    finalize_metadata_index(&mut store)?;
-    progress.add_completed(1);
-
-    progress.finish();
+    finalize_metadata_index_with_progress(&mut store, progress)?;
     Ok(store)
 }

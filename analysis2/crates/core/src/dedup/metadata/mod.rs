@@ -15,11 +15,9 @@ pub use bm25::{cosine_similarity, similarity_at_least, PreparedDocument, Thresho
 use ahash::{AHashMap, AHashSet};
 
 use crate::dedup::hits::{Dimension, HitEdge, HitGraph};
-use crate::entity::{
-    normalized_evm_token, ChainId, ContractId, CsrIndex, ResidentStore,
-};
+use crate::entity::{ChainId, ContractId, CsrIndex, ResidentStore};
 use crate::error::Analysis2Error;
-use crate::progress::ProgressObserver;
+use crate::progress::{NoopProgress, ProgressObserver};
 
 use self::align::select_documents as align_pair;
 use self::bm25::lossless_prefix_len;
@@ -69,36 +67,60 @@ impl MetadataIndex {
 
 /// Build BM25 prepared documents and lossless-capable term postings from anchors.
 pub fn finalize_metadata_index(store: &mut ResidentStore) -> Result<(), Analysis2Error> {
+    finalize_metadata_index_with_progress(store, &NoopProgress)
+}
+
+/// Progress-aware metadata finalize used by the full load pipeline.
+pub fn finalize_metadata_index_with_progress(
+    store: &mut ResidentStore,
+    progress: &dyn ProgressObserver,
+) -> Result<(), Analysis2Error> {
+    const PROGRESS_BATCH: usize = 1 << 10;
+
     let n_contracts = store.contracts.len();
-    let mut canonical_to_doc: AHashMap<String, u32> = AHashMap::new();
-    let mut documents: Vec<PreparedDocument> = Vec::new();
+    let anchor_count: usize = store
+        .contracts
+        .iter()
+        .map(|contract| contract.metadata_by_token.len())
+        .sum();
+    // Keys borrow the already-resident anchor strings. The previous owned maps
+    // duplicated every unique canonical document and token id during finalize.
+    let mut canonical_to_doc: AHashMap<&str, u32> = AHashMap::with_capacity(anchor_count);
+    let mut documents: Vec<PreparedDocument> = Vec::with_capacity(anchor_count);
     let mut terms: Vec<(u32, u32)> = Vec::new();
-    let mut doc_contracts: Vec<Vec<ContractId>> = Vec::new();
+    let mut doc_contracts: Vec<Vec<ContractId>> = Vec::with_capacity(anchor_count);
     let mut term_ids: AHashMap<String, u32> = AHashMap::new();
-    let mut token_keys: AHashMap<String, u32> = AHashMap::new();
+    let mut token_keys: AHashMap<&str, u32> = AHashMap::with_capacity(anchor_count);
     let mut scratch: Vec<u32> = Vec::new();
     let mut term_scratch: Vec<(u32, u32)> = Vec::new();
+    let mut document_frequency: Vec<u32> = Vec::new();
 
     let mut contract_anchors: Vec<Vec<AnchorRef>> = vec![Vec::new(); n_contracts];
     let mut contract_is_evm: Vec<bool> = vec![false; n_contracts];
 
-    for contract in &store.contracts {
+    progress.begin_phase("metadata_documents", Some(n_contracts as u64));
+    let mut pending_progress = 0_u64;
+    for (contract_index, contract) in store.contracts.iter().enumerate() {
+        if contract_index % PROGRESS_BATCH == 0 {
+            progress.check_cancelled()?;
+        }
         let chain = store.chain_name(contract.chain_id);
         let is_evm = store.is_evm_chain(chain);
         contract_is_evm[contract.id as usize] = is_evm;
         let mut anchors = Vec::with_capacity(contract.metadata_by_token.len());
         for record in &contract.metadata_by_token {
-            let document_id = if let Some(&id) = canonical_to_doc.get(&record.canonical_json) {
+            let canonical = record.canonical_json.as_str();
+            let document_id = if let Some(&id) = canonical_to_doc.get(canonical) {
                 id
             } else {
-                let id = documents.len() as u32;
+                let id = u32::try_from(documents.len())
+                    .map_err(|_| Analysis2Error::invalid("too many metadata documents for u32"))?;
                 let mut intern = |term: &str| -> Result<u32, Analysis2Error> {
                     if let Some(&existing) = term_ids.get(term) {
                         return Ok(existing);
                     }
-                    let next = u32::try_from(term_ids.len()).map_err(|_| {
-                        Analysis2Error::invalid("too many BM25 terms for u32")
-                    })?;
+                    let next = u32::try_from(term_ids.len())
+                        .map_err(|_| Analysis2Error::invalid("too many BM25 terms for u32"))?;
                     term_ids.insert(term.to_owned(), next);
                     Ok(next)
                 };
@@ -109,39 +131,43 @@ pub fn finalize_metadata_index(store: &mut ResidentStore) -> Result<(), Analysis
                     &mut scratch,
                     &mut term_scratch,
                 )?;
-                let term_start = terms.len() as u32;
+                let term_start = u32::try_from(terms.len())
+                    .map_err(|_| Analysis2Error::invalid("too many metadata terms for u32"))?;
                 document.set_term_start(term_start);
                 terms.extend_from_slice(&term_scratch);
+                if document_frequency.len() < term_ids.len() {
+                    document_frequency.resize(term_ids.len(), 0);
+                }
+                for &(term, _) in &term_scratch {
+                    document_frequency[term as usize] =
+                        document_frequency[term as usize].saturating_add(1);
+                }
                 documents.push(document);
                 doc_contracts.push(Vec::new());
-                canonical_to_doc.insert(record.canonical_json.clone(), id);
+                canonical_to_doc.insert(canonical, id);
                 id
             };
-            doc_contracts[document_id as usize].push(contract.id);
+            let contracts = &mut doc_contracts[document_id as usize];
+            if contracts.last().copied() != Some(contract.id) {
+                // Contracts are visited in id order, so this also keeps every
+                // document's posting sorted without a later sort/dedup pass.
+                contracts.push(contract.id);
+            }
 
-            let token_key = if is_evm {
-                // Align on canonical bigint form so "10" and "010" share a key.
-                let normalized = normalized_evm_token(&record.token_id);
-                if let Some(&key) = token_keys.get(&normalized) {
-                    key
-                } else {
-                    let key = u32::try_from(token_keys.len()).map_err(|_| {
-                        Analysis2Error::invalid("too many metadata token keys for u32")
-                    })?;
-                    token_keys.insert(normalized, key);
-                    key
-                }
+            let token = if is_evm {
+                // Decimal token ids only need canonical equality here. Borrowing
+                // the zero-trimmed slice avoids BigUint parse + String allocation.
+                normalized_evm_token_slice(&record.token_id)
             } else {
-                // Solana: lexicographic raw string keys (no bigint normalize).
-                if let Some(&key) = token_keys.get(&record.token_id) {
-                    key
-                } else {
-                    let key = u32::try_from(token_keys.len()).map_err(|_| {
-                        Analysis2Error::invalid("too many metadata token keys for u32")
-                    })?;
-                    token_keys.insert(record.token_id.clone(), key);
-                    key
-                }
+                record.token_id.as_str()
+            };
+            let token_key = if let Some(&key) = token_keys.get(token) {
+                key
+            } else {
+                let key = u32::try_from(token_keys.len())
+                    .map_err(|_| Analysis2Error::invalid("too many metadata token keys for u32"))?;
+                token_keys.insert(token, key);
+                key
             };
             anchors.push(AnchorRef {
                 token_key,
@@ -149,32 +175,29 @@ pub fn finalize_metadata_index(store: &mut ResidentStore) -> Result<(), Analysis
             });
         }
         contract_anchors[contract.id as usize] = anchors;
-    }
-
-    // Dedup contract lists per document (same contract shouldn't list twice, but be safe).
-    for list in &mut doc_contracts {
-        list.sort_unstable();
-        list.dedup();
-    }
-
-    let term_count = term_ids.len();
-    let mut document_frequency = vec![0_u32; term_count];
-    for document in &documents {
-        for &(term, _) in document.terms(&terms) {
-            document_frequency[term as usize] =
-                document_frequency[term as usize].saturating_add(1);
+        pending_progress += 1;
+        if pending_progress as usize == PROGRESS_BATCH {
+            progress.add_completed(pending_progress);
+            pending_progress = 0;
         }
     }
-
-    let mut posting_pairs: Vec<(u32, u32)> = Vec::new();
-    for (document_id, document) in documents.iter().enumerate() {
-        for &(term, _) in document.terms(&terms) {
-            posting_pairs.push((term, document_id as u32));
-        }
+    if pending_progress > 0 {
+        progress.add_completed(pending_progress);
     }
-    posting_pairs.sort_unstable();
-    posting_pairs.dedup();
-    let term_postings = CsrIndex::from_sorted_pairs(&posting_pairs);
+
+    // Release maps that borrow store fields before assigning the finished index.
+    drop(canonical_to_doc);
+    drop(token_keys);
+    drop(term_ids);
+
+    progress.begin_phase("metadata_postings", Some(documents.len() as u64));
+    let term_postings = build_term_postings(
+        &documents,
+        &terms,
+        &document_frequency,
+        progress,
+        PROGRESS_BATCH,
+    )?;
 
     store.metadata_index = MetadataIndex {
         documents,
@@ -186,6 +209,70 @@ pub fn finalize_metadata_index(store: &mut ResidentStore) -> Result<(), Analysis
         term_postings,
     };
     Ok(())
+}
+
+fn normalized_evm_token_slice(token: &str) -> &str {
+    let trimmed = token.trim();
+    if trimmed.is_empty() || !trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+        return token;
+    }
+    let without_zeroes = trimmed.trim_start_matches('0');
+    if without_zeroes.is_empty() {
+        &trimmed[trimmed.len() - 1..]
+    } else {
+        without_zeroes
+    }
+}
+
+fn build_term_postings(
+    documents: &[PreparedDocument],
+    terms: &[(u32, u32)],
+    document_frequency: &[u32],
+    progress: &dyn ProgressObserver,
+    progress_batch: usize,
+) -> Result<CsrIndex, Analysis2Error> {
+    let term_count = u32::try_from(document_frequency.len())
+        .map_err(|_| Analysis2Error::invalid("too many BM25 terms for u32"))?;
+    let mut offsets = Vec::with_capacity(document_frequency.len() + 1);
+    offsets.push(0_u32);
+    let mut total = 0_u64;
+    for &frequency in document_frequency {
+        total = total.saturating_add(u64::from(frequency));
+        offsets.push(
+            u32::try_from(total)
+                .map_err(|_| Analysis2Error::invalid("too many metadata postings for u32"))?,
+        );
+    }
+
+    let mut values = vec![0_u32; total as usize];
+    let mut cursors = offsets[..document_frequency.len()].to_vec();
+    let mut pending_progress = 0_u64;
+    for (document_id, document) in documents.iter().enumerate() {
+        if document_id % progress_batch == 0 {
+            progress.check_cancelled()?;
+        }
+        let document_id = u32::try_from(document_id)
+            .map_err(|_| Analysis2Error::invalid("too many metadata documents for u32"))?;
+        for &(term, _) in document.terms(terms) {
+            let cursor = &mut cursors[term as usize];
+            values[*cursor as usize] = document_id;
+            *cursor += 1;
+        }
+        pending_progress += 1;
+        if pending_progress as usize == progress_batch {
+            progress.add_completed(pending_progress);
+            pending_progress = 0;
+        }
+    }
+    if pending_progress > 0 {
+        progress.add_completed(pending_progress);
+    }
+
+    Ok(CsrIndex {
+        keys: (0..term_count).collect(),
+        offsets,
+        values,
+    })
 }
 
 /// Query Metadata for `seed` against the finalized index; emit whole-contract edges.
@@ -259,12 +346,7 @@ pub fn query_metadata_for_seed(
             let right_terms = index.document_terms(right_doc);
             let decision = similarity_at_least(left, left_terms, right, right_terms, threshold);
             if decision.matched {
-                Some(cosine_similarity(
-                    left,
-                    left_terms,
-                    right,
-                    right_terms,
-                ))
+                Some(cosine_similarity(left, left_terms, right, right_terms))
             } else {
                 None
             }
@@ -419,10 +501,7 @@ mod tests {
         rows: impl IntoIterator<Item = IdentityRow>,
         anchors: impl IntoIterator<Item = (&'static str, &'static str, &'static str, &'static str, u64)>,
     ) -> ResidentStore {
-        let evm_set = evm
-            .iter()
-            .map(|c| (*c).to_owned())
-            .collect::<AHashSet<_>>();
+        let evm_set = evm.iter().map(|c| (*c).to_owned()).collect::<AHashSet<_>>();
         let mut store = ResidentStore::with_options(k, &evm_set);
         for r in rows {
             store.ingest_identity_row(r).unwrap();
@@ -494,6 +573,18 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_evm_token_normalization_matches_owned_contract() {
+        assert_eq!(normalized_evm_token_slice("010"), "10");
+        assert_eq!(normalized_evm_token_slice("000"), "0");
+        assert_eq!(
+            normalized_evm_token_slice("000123456789012345678901234567890"),
+            "123456789012345678901234567890"
+        );
+        assert_eq!(normalized_evm_token_slice(" token "), " token ");
+        assert_eq!(normalized_evm_token_slice("   "), "   ");
+    }
+
+    #[test]
     fn bm25_threshold_match_and_mismatch_oracle() {
         let docs = prepare_parts(&[
             "alpha beta gamma delta epsilon zeta eta theta",
@@ -511,12 +602,9 @@ mod tests {
             )
             .matched
         );
-        assert!(
-            cosine_similarity(&docs[0].0, &docs[0].1, &docs[1].0, &docs[1].1) > 0.99
-        );
+        assert!(cosine_similarity(&docs[0].0, &docs[0].1, &docs[1].0, &docs[1].1) > 0.99);
 
-        let near_score =
-            cosine_similarity(&docs[0].0, &docs[0].1, &docs[2].0, &docs[2].1);
+        let near_score = cosine_similarity(&docs[0].0, &docs[0].1, &docs[2].0, &docs[2].1);
         assert!(near_score > 0.0 && near_score < 1.0);
         assert!(
             similarity_at_least(
@@ -746,7 +834,10 @@ mod tests {
         let right_doc = store.metadata_index.contract_anchors[cand as usize][0].document_id;
         assert_ne!(left_doc, right_doc);
         let score = store.metadata_index.cosine_between(left_doc, right_doc);
-        assert!(score > 0.0 && score < 1.0, "expected non-exact BM25 score, got {score}");
+        assert!(
+            score > 0.0 && score < 1.0,
+            "expected non-exact BM25 score, got {score}"
+        );
         let threshold = score * 0.9;
 
         let mut graph = HitGraph::new();

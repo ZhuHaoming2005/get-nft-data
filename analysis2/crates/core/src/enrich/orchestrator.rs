@@ -87,7 +87,6 @@ pub async fn enrich_candidates(
     progress.set_stage("enrich_legit");
     legit_detect::attach_relation_legit(&mut out, registry, store, &client, keys, limits).await;
 
-    progress.finish();
     Ok(out)
 }
 
@@ -636,12 +635,28 @@ mod tests {
     use ahash::AHashSet;
     use httpmock::prelude::*;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::dedup::hits::{Dimension, HitEdge, HitGraph};
     use crate::enrich::types::ProviderEndpoints;
     use crate::enrich::ValueFlowKind;
     use crate::entity::{IdentityRow, SourceOrder};
     use crate::progress::NoopProgress;
+
+    #[derive(Default)]
+    struct FinishCountingProgress(AtomicUsize);
+
+    impl ProgressObserver for FinishCountingProgress {
+        fn set_stage(&self, _stage: &str) {}
+        fn begin_phase(&self, _phase: &str, _total: Option<u64>) {}
+        fn add_completed(&self, _n: u64) {}
+        fn check_cancelled(&self) -> Result<(), Analysis2Error> {
+            Ok(())
+        }
+        fn finish(&self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     fn identity(chain: &str, address: &str, token: &str, row: u64) -> IdentityRow {
         IdentityRow {
@@ -721,9 +736,15 @@ mod tests {
             ..HttpLimits::default()
         };
         let keys = ApiKeys::default();
-        let map = enrich_candidates(&registry, &store, &keys, &limits, &NoopProgress)
+        let progress = FinishCountingProgress::default();
+        let map = enrich_candidates(&registry, &store, &keys, &limits, &progress)
             .await
             .unwrap();
+        assert_eq!(
+            progress.0.load(Ordering::Relaxed),
+            0,
+            "an enrichment subroutine must not stop the caller-owned progress reporter"
+        );
         let bundle = map.get(&cand).unwrap();
         assert_eq!(bundle.quality.transfers, EvidenceStatus::NotRequested);
         assert_eq!(bundle.quality.sales, EvidenceStatus::NotRequested);

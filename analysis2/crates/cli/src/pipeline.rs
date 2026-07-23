@@ -94,12 +94,51 @@ fn query_seed_dimensions(
     seed_id: ContractId,
     name_threshold: f64,
     metadata_threshold: f64,
-    progress: &dyn ProgressObserver,
+    query_progress: &dyn ProgressObserver,
+    dimension_progress: &dyn ProgressObserver,
 ) -> Result<HitGraph, Analysis2Error> {
-    let mut graph = HitGraph::new();
-    query_uri_for_seed(store, seed_id, &mut graph, progress)?;
-    query_name_for_seed(store, seed_id, name_threshold, &mut graph, progress)?;
-    query_metadata_for_seed(store, seed_id, metadata_threshold, &mut graph, progress)?;
+    let ((uri, name), metadata) = rayon::join(
+        || {
+            rayon::join(
+                || {
+                    let mut graph = HitGraph::new();
+                    let result = query_uri_for_seed(store, seed_id, &mut graph, query_progress);
+                    dimension_progress.add_completed(1);
+                    result.map(|()| graph)
+                },
+                || {
+                    let mut graph = HitGraph::new();
+                    let result = query_name_for_seed(
+                        store,
+                        seed_id,
+                        name_threshold,
+                        &mut graph,
+                        query_progress,
+                    );
+                    dimension_progress.add_completed(1);
+                    result.map(|()| graph)
+                },
+            )
+        },
+        || {
+            let mut graph = HitGraph::new();
+            let result = query_metadata_for_seed(
+                store,
+                seed_id,
+                metadata_threshold,
+                &mut graph,
+                query_progress,
+            );
+            dimension_progress.add_completed(1);
+            result.map(|()| graph)
+        },
+    );
+
+    let mut graph = uri?;
+    let mut name = name?;
+    let mut metadata = metadata?;
+    graph.append(&mut name);
+    graph.append(&mut metadata);
     Ok(graph)
 }
 
@@ -120,7 +159,10 @@ pub fn run_dedup(
     let contract_nfts = build_contract_nft_map(&store);
 
     progress.set_stage("dedup");
-    progress.begin_phase("seeds", Some(seeds.len() as u64));
+    progress.begin_phase(
+        "seed_dimensions",
+        Some((seeds.len() as u64).saturating_mul(3)),
+    );
 
     let quiet_progress = CancellationOnlyProgress { inner: progress };
     let analyzed = seeds
@@ -138,6 +180,7 @@ pub fn run_dedup(
                         config.name_threshold,
                         config.metadata_threshold,
                         &quiet_progress,
+                        progress,
                     ) {
                         Ok(graph) => {
                             let registry =
@@ -163,14 +206,16 @@ pub fn run_dedup(
                             e.to_string(),
                         )),
                     },
-                    Err(e) => Err(FailureRecord::seed_stage(
-                        &seed.chain,
-                        &seed.address,
-                        "resolve_seed",
-                        e.to_string(),
-                    )),
+                    Err(e) => {
+                        progress.add_completed(3);
+                        Err(FailureRecord::seed_stage(
+                            &seed.chain,
+                            &seed.address,
+                            "resolve_seed",
+                            e.to_string(),
+                        ))
+                    }
                 };
-                progress.add_completed(1);
                 Ok(outcome)
             },
         )
@@ -212,7 +257,10 @@ pub fn run(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), An
     let contract_nfts = build_contract_nft_map(&store);
 
     progress.set_stage("dedup");
-    progress.begin_phase("seeds", Some(seeds.len() as u64));
+    progress.begin_phase(
+        "seed_dimensions",
+        Some((seeds.len() as u64).saturating_mul(3)),
+    );
 
     let quiet_progress = CancellationOnlyProgress { inner: progress };
     let seed_results = seeds
@@ -230,6 +278,7 @@ pub fn run(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), An
                         config.name_threshold,
                         config.metadata_threshold,
                         &quiet_progress,
+                        progress,
                     ) {
                         Ok(graph) => Ok((seed.clone(), seed_id, graph)),
                         Err(Analysis2Error::Cancelled) => {
@@ -242,14 +291,16 @@ pub fn run(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), An
                             e.to_string(),
                         )),
                     },
-                    Err(e) => Err(FailureRecord::seed_stage(
-                        &seed.chain,
-                        &seed.address,
-                        "resolve_seed",
-                        e.to_string(),
-                    )),
+                    Err(e) => {
+                        progress.add_completed(3);
+                        Err(FailureRecord::seed_stage(
+                            &seed.chain,
+                            &seed.address,
+                            "resolve_seed",
+                            e.to_string(),
+                        ))
+                    }
                 };
-                progress.add_completed(1);
                 Ok(outcome)
             },
         )
