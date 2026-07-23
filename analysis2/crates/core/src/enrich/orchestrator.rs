@@ -707,8 +707,9 @@ mod tests {
     }
 
     fn cid(store: &ResidentStore, chain: &str, address: &str) -> u32 {
-        let chain_id = store.chain_ids[chain];
-        store.contract_index[&(chain_id, address.to_owned())]
+        store
+            .contract_id(chain, address)
+            .expect("contract must exist")
     }
 
     fn registry_one(seed: u32, cand: u32) -> CandidateRegistry {

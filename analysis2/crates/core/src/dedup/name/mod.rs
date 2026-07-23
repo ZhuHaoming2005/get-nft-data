@@ -196,7 +196,7 @@ pub(crate) fn finalize_name_index_with_progress(
     keys.dedup();
     let mut keyed: Vec<(usize, StringId)> = keys
         .into_par_iter()
-        .map(|id| (store.string(id).chars().count(), id))
+        .map(|id| (char_len_fast(store.string(id)), id))
         .collect();
     keyed.par_sort_unstable_by(|a, b| {
         a.0.cmp(&b.0)
@@ -227,7 +227,8 @@ pub(crate) fn finalize_name_index_with_progress(
     store.name_key_char_lens.clear();
     store.name_sorted_char_offsets.clear();
     store.name_sorted_chars.clear();
-    store.name_key_positions = vec![u32::MAX; store.strings.len()];
+    store.name_key_positions.clear();
+    store.name_key_positions.reserve(profiles.len());
     store.name_occurrence_token_offsets.clear();
     store.name_occurrence_token_offsets.push(0);
     store.name_occurrence_tokens.clear();
@@ -251,7 +252,7 @@ pub(crate) fn finalize_name_index_with_progress(
             .map_err(|_| Analysis2Error::invalid("indexed name is too long for u32"))?;
         store.name_keys_by_len.push(*id);
         store.name_key_char_lens.push(char_len);
-        store.name_key_positions[*id as usize] = key_index;
+        store.name_key_positions.insert(*id, key_index);
         store.name_sorted_chars.extend_from_slice(sorted_chars);
         store
             .name_sorted_char_offsets
@@ -514,12 +515,24 @@ fn emit_for_query(
     graph: &mut HitGraph,
     scratch: &mut NameQueryScratch,
 ) {
-    let query_len = query_text.chars().count();
+    // Prefer finalize-time profiles when the query name is already indexed.
+    let query_key_index = store.name_key_positions.get(&query_id).map(|&i| i as usize);
+    let (query_len, query_sorted_slice) = if let Some(index) = query_key_index {
+        let len = store.name_key_char_lens[index] as usize;
+        let start = store.name_sorted_char_offsets[index] as usize;
+        let end = store.name_sorted_char_offsets[index + 1] as usize;
+        (len, Some(&store.name_sorted_chars[start..end]))
+    } else {
+        let len = char_len_fast(query_text);
+        scratch.query_sorted.clear();
+        scratch.query_sorted.extend(query_text.chars());
+        scratch.query_sorted.sort_unstable();
+        (len, None)
+    };
+
+    // BatchComparator still needs the original character sequence (not sorted).
     scratch.query_chars.clear();
     scratch.query_chars.extend(query_text.chars());
-    scratch.query_sorted.clear();
-    scratch.query_sorted.extend_from_slice(&scratch.query_chars);
-    scratch.query_sorted.sort_unstable();
 
     // Byte-equal short circuit via CSR exact key.
     if let Some(contracts) = store.name_contract_csr.values_for(query_id) {
@@ -573,12 +586,6 @@ fn emit_for_query(
         cand_len <= query_len || CandidateBounds::lengths_can_reach(query_len, cand_len, threshold)
     });
 
-    let query_key_index = store
-        .name_key_positions
-        .get(query_id as usize)
-        .copied()
-        .filter(|&index| index != u32::MAX)
-        .map(|index| index as usize);
     let query_tokens = query_key_index.and_then(|index| {
         let start = *store.name_occurrence_token_offsets.get(index)? as usize;
         let end = *store.name_occurrence_token_offsets.get(index + 1)? as usize;
@@ -630,7 +637,8 @@ fn emit_for_query(
             let start = store.name_sorted_char_offsets[key_index] as usize;
             let end = store.name_sorted_char_offsets[key_index + 1] as usize;
             let cand_sorted = &store.name_sorted_chars[start..end];
-            if !sorted_overlap_at_least(&scratch.query_sorted, cand_sorted, required) {
+            let query_sorted = query_sorted_slice.unwrap_or(scratch.query_sorted.as_slice());
+            if !sorted_overlap_at_least(query_sorted, cand_sorted, required) {
                 continue;
             }
             let Some(score) = prepared.similarity_with_args(cand_text.chars(), &args) else {
@@ -665,6 +673,16 @@ fn emit_for_query(
             }
         }
         group_start = group_end;
+    }
+}
+
+/// Prefer O(1) byte length for pure-ASCII names (the common NFT case).
+#[inline]
+fn char_len_fast(text: &str) -> usize {
+    if text.is_ascii() {
+        text.len()
+    } else {
+        text.chars().count()
     }
 }
 
@@ -761,8 +779,9 @@ mod tests {
     }
 
     fn cid(store: &ResidentStore, chain: &str, address: &str) -> ContractId {
-        let chain_id = store.chain_ids[chain];
-        store.contract_index[&(chain_id, address.to_owned())]
+        store
+            .contract_id(chain, address)
+            .expect("contract must exist")
     }
 
     fn nft_map(store: &ResidentStore) -> AHashMap<ContractId, Vec<NftId>> {

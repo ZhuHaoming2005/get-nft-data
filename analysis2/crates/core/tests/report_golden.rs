@@ -49,9 +49,8 @@ fn report_golden_duplicate_scale_fields_and_ratios() {
     let seeds = load_seeds_json(&seeds_path).expect("seeds");
     assert_eq!(seeds.len(), 1);
 
-    let seed_id = *store
-        .contract_index
-        .get(&(store.chain_ids["ethereum"], "0xseed".into()))
+    let seed_id = store
+        .contract_id("ethereum", "0xseed")
         .expect("seed contract");
 
     let mut graph = HitGraph::new();

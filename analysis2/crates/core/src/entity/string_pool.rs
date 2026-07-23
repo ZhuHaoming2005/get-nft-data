@@ -1,14 +1,34 @@
-//! Interned string pool backed by an ahash map.
+//! Interned string pool backed by a single owned copy per unique string.
 
-use ahash::AHashMap;
+use ahash::{AHashMap, RandomState};
+use std::hash::{BuildHasher, Hash, Hasher};
 
 use super::ids::StringId;
 
+/// Fixed-seed hasher so lookup/intern agree for the process lifetime.
+fn hash_str(s: &str) -> u64 {
+    // RandomState::with_seeds is public and deterministic for a given process build.
+    let state = RandomState::with_seeds(
+        0xA1A2_A3A4_B5B6_C7C8,
+        0xD9DA_DBDC_DEDF_E0E1,
+        0x1122_3344_5566_7788,
+        0x99AA_BBCC_DDEE_FF00,
+    );
+    let mut hasher = state.build_hasher();
+    s.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Global intern table for names, URIs, and other repeated strings.
+///
+/// Each unique string is stored once in `strings`. The hash map only holds
+/// candidate ids (equality-checked against the arena), so intern avoids the
+/// previous double `String` allocation on every first insert.
 #[derive(Clone, Debug, Default)]
 pub struct StringPool {
     strings: Vec<String>,
-    ids: AHashMap<String, StringId>,
+    /// `hash(str)` → candidate string ids (verify with `strings[id] == s`).
+    by_hash: AHashMap<u64, Vec<StringId>>,
 }
 
 impl StringPool {
@@ -26,7 +46,7 @@ impl StringPool {
 
     pub(crate) fn reserve(&mut self, additional: usize) {
         self.strings.reserve(additional);
-        self.ids.reserve(additional);
+        self.by_hash.reserve(additional);
     }
 
     pub fn get(&self, id: StringId) -> &str {
@@ -34,17 +54,27 @@ impl StringPool {
     }
 
     pub fn lookup(&self, s: &str) -> Option<StringId> {
-        self.ids.get(s).copied()
+        let hash = hash_str(s);
+        let candidates = self.by_hash.get(&hash)?;
+        candidates
+            .iter()
+            .copied()
+            .find(|&id| self.strings[id as usize] == s)
     }
 
     /// Intern `s`, returning the existing id on duplicate.
     pub fn intern(&mut self, s: &str) -> StringId {
-        if let Some(&id) = self.ids.get(s) {
-            return id;
+        let hash = hash_str(s);
+        if let Some(candidates) = self.by_hash.get(&hash) {
+            for &id in candidates {
+                if self.strings[id as usize] == s {
+                    return id;
+                }
+            }
         }
         let id = StringId::try_from(self.strings.len()).expect("too many interned strings");
         self.strings.push(s.to_owned());
-        self.ids.insert(s.to_owned(), id);
+        self.by_hash.entry(hash).or_default().push(id);
         id
     }
 
@@ -103,5 +133,13 @@ mod tests {
         assert_eq!(pool.get(delta), "delta");
         assert_eq!(pool.intern_nonblank("delta"), Some(delta));
         assert_eq!(pool.len(), 3);
+    }
+
+    #[test]
+    fn string_pool_lookup_matches_intern() {
+        let mut pool = StringPool::default();
+        let id = pool.intern("shared-uri");
+        assert_eq!(pool.lookup("shared-uri"), Some(id));
+        assert_eq!(pool.lookup("missing"), None);
     }
 }

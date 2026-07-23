@@ -170,7 +170,7 @@ where
 }
 
 fn query_seeds_staged(
-    store: &ResidentStore,
+    store: &mut ResidentStore,
     seeds: &[SeedRecord],
     name_threshold: f64,
     metadata_threshold: f64,
@@ -213,6 +213,8 @@ fn query_seeds_staged(
     // Match the architecture contract: dimensions are barriers; seeds are
     // parallel within the active dimension. This keeps each index hot and
     // avoids running three memory-heavy query engines on every worker at once.
+    // After each barrier, drop that dimension's index so subsequent stages
+    // (and enrich) reclaim RSS / cache.
     run_seed_stage(
         &mut states,
         "uri_seeds",
@@ -220,6 +222,8 @@ fn query_seeds_staged(
         || UriQueryScratch::for_chain_count(store.chains.len()),
         |scratch, seed, graph| query_uri_for_seed_with_scratch(store, seed, graph, &quiet, scratch),
     )?;
+    store.drop_uri_indexes();
+
     run_seed_stage(
         &mut states,
         "name_seeds",
@@ -234,6 +238,8 @@ fn query_seeds_staged(
             query_name_for_seed_with_scratch(store, seed, name_threshold, graph, &quiet, scratch)
         },
     )?;
+    store.drop_name_indexes();
+
     run_seed_stage(
         &mut states,
         "metadata_seeds",
@@ -250,6 +256,7 @@ fn query_seeds_staged(
             )
         },
     )?;
+    store.drop_metadata_index();
 
     let mut completed = Vec::with_capacity(states.len());
     for state in states {
@@ -282,12 +289,13 @@ fn run_dedup_inner(
         config.evm_chains.clone(),
         config.metadata_anchors,
     );
-    let store = load_resident_store(&config.inputs, &options, progress)?;
+    let mut store = load_resident_store(&config.inputs, &options, progress)?;
     let seeds = load_seeds_json(&config.seeds)?;
+    // Built before dimension drops so CSR slices stay valid for reporting.
     let contract_nfts = build_contract_nft_map(&store);
 
     let seed_batch = query_seeds_staged(
-        &store,
+        &mut store,
         &seeds,
         config.name_threshold,
         config.metadata_threshold,
@@ -339,12 +347,12 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
         config.evm_chains.clone(),
         config.metadata_anchors,
     );
-    let store = load_resident_store(&config.inputs, &options, progress)?;
+    let mut store = load_resident_store(&config.inputs, &options, progress)?;
     let seeds = load_seeds_json(&config.seeds)?;
     let contract_nfts = build_contract_nft_map(&store);
 
     let seed_batch = query_seeds_staged(
-        &store,
+        &mut store,
         &seeds,
         config.name_threshold,
         config.metadata_threshold,

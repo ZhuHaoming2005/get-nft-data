@@ -239,11 +239,7 @@ mod tests {
                 },
             })
             .unwrap();
-        let chain_id = *store.chain_ids.get(chain).unwrap();
-        let contract = *store
-            .contract_index
-            .get(&(chain_id, address.to_owned()))
-            .unwrap();
+        let contract = store.contract_id(chain, address).unwrap();
         (store, contract)
     }
 

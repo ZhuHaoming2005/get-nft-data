@@ -39,8 +39,9 @@ fn prepared(rows: impl IntoIterator<Item = IdentityRow>) -> ResidentStore {
 }
 
 fn contract_id(store: &ResidentStore, chain: &str, address: &str) -> u32 {
-    let chain_id = store.chain_ids[chain];
-    store.contract_index[&(chain_id, address.to_owned())]
+    store
+        .contract_id(chain, address)
+        .expect("contract must exist")
 }
 
 fn contract_nft_map(store: &ResidentStore) -> AHashMap<u32, Vec<u32>> {

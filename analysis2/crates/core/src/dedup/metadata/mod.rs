@@ -39,6 +39,9 @@ pub struct MetadataQueryScratch {
     frequencies: Vec<u32>,
     seed_documents: Vec<u32>,
     output: Vec<ContractId>,
+    /// Cached BM25 decisions for aligned `(left_doc, right_doc)` pairs this seed.
+    /// `None` means scored below threshold.
+    score_cache: AHashMap<(u32, u32), Option<f64>>,
 }
 
 struct MetadataSeedQuery<'a> {
@@ -52,7 +55,11 @@ struct MetadataSeedQuery<'a> {
 }
 
 impl MetadataSeedQuery<'_> {
-    fn edge_for_candidate(&self, candidate: ContractId) -> Option<HitEdge> {
+    fn edge_for_candidate(
+        &self,
+        candidate: ContractId,
+        score_cache: &mut AHashMap<(u32, u32), Option<f64>>,
+    ) -> Option<HitEdge> {
         if candidate == self.seed {
             return None;
         }
@@ -71,11 +78,23 @@ impl MetadataSeedQuery<'_> {
         let score = if left_doc == right_doc {
             1.0
         } else {
-            let left = &self.index.documents[left_doc as usize];
-            let right = &self.index.documents[right_doc as usize];
-            let left_terms = self.index.document_terms(left_doc);
-            let right_terms = self.index.document_terms(right_doc);
-            similarity_score_if_at_least(left, left_terms, right, right_terms, self.threshold)?
+            let cache_key = if left_doc <= right_doc {
+                (left_doc, right_doc)
+            } else {
+                (right_doc, left_doc)
+            };
+            if let Some(cached) = score_cache.get(&cache_key) {
+                (*cached)?
+            } else {
+                let left = &self.index.documents[left_doc as usize];
+                let right = &self.index.documents[right_doc as usize];
+                let left_terms = self.index.document_terms(left_doc);
+                let right_terms = self.index.document_terms(right_doc);
+                let score =
+                    similarity_score_if_at_least(left, left_terms, right, right_terms, self.threshold);
+                score_cache.insert(cache_key, score);
+                score?
+            }
         };
         Some(HitEdge {
             seed_contract: self.seed,
@@ -491,6 +510,7 @@ pub fn query_metadata_for_seed_with_scratch(
     let seed_is_evm = index.contract_is_evm[seed_usize];
 
     collect_candidates(index, seed, seed_anchors, threshold, scratch);
+    scratch.score_cache.clear();
     progress.begin_phase("metadata_query", Some(scratch.output.len() as u64));
     let query = MetadataSeedQuery {
         store,
@@ -511,9 +531,10 @@ pub fn query_metadata_for_seed_with_scratch(
             .par_chunks(PARALLEL_METADATA_CANDIDATE_CHUNK)
             .map(|candidates| {
                 let mut edges = Vec::new();
+                let mut local_cache = AHashMap::new();
                 for &candidate in candidates {
                     progress.check_cancelled()?;
-                    if let Some(edge) = query.edge_for_candidate(candidate) {
+                    if let Some(edge) = query.edge_for_candidate(candidate, &mut local_cache) {
                         edges.push(edge);
                     }
                     progress.add_completed(1);
@@ -533,7 +554,7 @@ pub fn query_metadata_for_seed_with_scratch(
 
     for &candidate in &scratch.output {
         progress.check_cancelled()?;
-        if let Some(edge) = query.edge_for_candidate(candidate) {
+        if let Some(edge) = query.edge_for_candidate(candidate, &mut scratch.score_cache) {
             graph.push(edge);
         }
         progress.add_completed(1);
@@ -697,8 +718,9 @@ mod tests {
     }
 
     fn cid(store: &ResidentStore, chain: &str, address: &str) -> ContractId {
-        let chain_id = store.chain_ids[chain];
-        store.contract_index[&(chain_id, address.to_owned())]
+        store
+            .contract_id(chain, address)
+            .expect("contract must exist")
     }
 
     fn nft_map(store: &ResidentStore) -> AHashMap<ContractId, Vec<crate::entity::NftId>> {

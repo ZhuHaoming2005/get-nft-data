@@ -111,8 +111,7 @@ pub fn query_uri_for_seed_with_scratch(
                 let mut chunk_graph = HitGraph::new();
                 for (uri_id, source_nfts) in queries {
                     progress.check_cancelled()?;
-                    if let Some(members) = store.token_uri_csr.values_for(*uri_id) {
-                        group_members_by_chain(store, members, &mut by_chain);
+                    if store.token_uri_csr.fill_by_chain(*uri_id, &mut by_chain) {
                         emit_uri_hits(
                             store,
                             seed,
@@ -153,8 +152,10 @@ pub fn query_uri_for_seed_with_scratch(
     } else {
         for (uri_id, source_nfts) in token_queries {
             progress.check_cancelled()?;
-            if let Some(members) = store.token_uri_csr.values_for(uri_id) {
-                group_members_by_chain(store, members, &mut scratch.by_chain);
+            if store
+                .token_uri_csr
+                .fill_by_chain(uri_id, &mut scratch.by_chain)
+            {
                 emit_uri_hits(
                     store,
                     seed,
@@ -203,8 +204,7 @@ pub fn query_uri_for_seed_with_scratch(
                 let mut chunk_graph = HitGraph::new();
                 for (uri_id, source_nfts) in queries {
                     progress.check_cancelled()?;
-                    if let Some(members) = store.image_uri_csr.values_for(*uri_id) {
-                        group_members_by_chain(store, members, &mut by_chain);
+                    if store.image_uri_csr.fill_by_chain(*uri_id, &mut by_chain) {
                         intersect_token_hit_scopes(
                             source_nfts,
                             &scratch.token_hit_scopes,
@@ -237,8 +237,10 @@ pub fn query_uri_for_seed_with_scratch(
     } else {
         for (uri_id, source_nfts) in image_queries {
             progress.check_cancelled()?;
-            if let Some(members) = store.image_uri_csr.values_for(uri_id) {
-                group_members_by_chain(store, members, &mut scratch.by_chain);
+            if store
+                .image_uri_csr
+                .fill_by_chain(uri_id, &mut scratch.by_chain)
+            {
                 intersect_token_hit_scopes(
                     &source_nfts,
                     &scratch.token_hit_scopes,
@@ -287,22 +289,6 @@ fn intersect_token_hit_scopes(
                 break;
             }
         }
-    }
-}
-
-fn group_members_by_chain(
-    store: &ResidentStore,
-    members: &[NftId],
-    by_chain: &mut Vec<Vec<NftId>>,
-) {
-    by_chain.resize_with(store.chains.len(), Vec::new);
-    for members in &mut *by_chain {
-        members.clear();
-    }
-    for &nft_id in members {
-        let contract_id = store.nfts[nft_id as usize].contract_id;
-        let chain_id = store.contracts[contract_id as usize].chain_id;
-        by_chain[chain_id as usize].push(nft_id);
     }
 }
 
@@ -495,8 +481,9 @@ mod tests {
     }
 
     fn cid(store: &ResidentStore, chain: &str, address: &str) -> ContractId {
-        let chain_id = store.chain_ids[chain];
-        store.contract_index[&(chain_id, address.to_owned())]
+        store
+            .contract_id(chain, address)
+            .expect("contract must exist")
     }
 
     fn nft_map(store: &ResidentStore) -> AHashMap<ContractId, Vec<NftId>> {

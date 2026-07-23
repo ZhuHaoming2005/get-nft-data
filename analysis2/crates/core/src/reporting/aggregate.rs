@@ -65,14 +65,15 @@ pub struct SeedDuplicateScale {
 }
 
 /// Build `contract_id → nft_ids` map used by HitGraph expansion helpers.
+///
+/// Copies CSR slices once so callers can keep the map after optional index
+/// drops. Prefer [`ResidentStore::nfts_for_contract`] when the store is live.
 pub fn build_contract_nft_map(store: &ResidentStore) -> AHashMap<ContractId, Vec<NftId>> {
     let mut map = AHashMap::with_capacity(store.contracts.len());
     for contract in &store.contracts {
-        if let Some(ids) = store.contract_nft_csr.values_for(contract.id)
-            && !ids.is_empty()
-        {
+        let ids = store.nfts_for_contract(contract.id);
+        if !ids.is_empty() {
             // The resident CSR is already ordered by `(contract_id, nft_id)`.
-            // Reusing it avoids hashing every NFT and sorting every bucket.
             map.insert(contract.id, ids.to_vec());
         }
     }
@@ -91,40 +92,41 @@ pub fn count_scope_nfts(
     matrix_secondary: Option<ChainId>,
     contract_nfts: &AHashMap<ContractId, Vec<NftId>>,
 ) -> ScopeNftCounts {
-    let name = graph.dimension_candidate_nfts(
-        seed,
-        Dimension::Name,
-        scope,
-        primary_chain,
-        matrix_secondary,
-        contract_nfts,
-    );
-    let token_uri = graph.dimension_candidate_nfts(
-        seed,
-        Dimension::TokenUri,
-        scope,
-        primary_chain,
-        matrix_secondary,
-        contract_nfts,
-    );
-    let image_uri = graph.dimension_candidate_nfts(
-        seed,
-        Dimension::ImageUri,
-        scope,
-        primary_chain,
-        matrix_secondary,
-        contract_nfts,
-    );
-    let metadata = graph.dimension_candidate_nfts(
-        seed,
-        Dimension::Metadata,
-        scope,
-        primary_chain,
-        matrix_secondary,
-        contract_nfts,
-    );
-    let total =
-        graph.union_candidate_nfts(seed, scope, primary_chain, matrix_secondary, contract_nfts);
+    // Single edge scan fills all four dimension sets + union.
+    let mut name = AHashSet::new();
+    let mut token_uri = AHashSet::new();
+    let mut image_uri = AHashSet::new();
+    let mut metadata = AHashSet::new();
+    let mut total = AHashSet::new();
+
+    for edge in graph.edges() {
+        if edge.seed_contract != seed {
+            continue;
+        }
+        if !HitGraph::edge_in_scope(edge, scope, primary_chain, matrix_secondary) {
+            continue;
+        }
+        let expand = |out: &mut AHashSet<NftId>| match edge.candidate_nft {
+            Some(nft) => {
+                out.insert(nft);
+            }
+            None => {
+                if let Some(nfts) = contract_nfts.get(&edge.candidate_contract) {
+                    out.extend(nfts.iter().copied());
+                }
+            }
+        };
+        match edge.dimension {
+            Dimension::Name => expand(&mut name),
+            Dimension::TokenUri => expand(&mut token_uri),
+            Dimension::ImageUri => expand(&mut image_uri),
+            Dimension::Metadata => expand(&mut metadata),
+        }
+        expand(&mut total);
+    }
+    // Image is supplemental to token_uri within the same seed/scope.
+    image_uri.retain(|nft| !token_uri.contains(nft));
+
     ScopeNftCounts::from_sets(
         name.len(),
         token_uri.len(),

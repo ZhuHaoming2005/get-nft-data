@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use std::fs::File;
 use std::path::Path;
 
-use crate::entity::{IdentityRow, ResidentStore, SourceOrder};
+use crate::entity::{ResidentStore, SourceOrder};
 use crate::parquet::merge::merge_shards_ordered;
 use crate::parquet::validate::{ValidatedInput, PASS1_COLUMNS};
 use crate::parquet::LoadOptions;
@@ -84,18 +84,25 @@ fn scan_row_group_pass1(
         })?;
         let columns = ProjectedUtf8Columns::new(&batch, &input.path, &PASS1_COLUMNS)?;
         for row_index in 0..batch.num_rows() {
-            let row = columns.decode_identity(
-                row_index,
-                SourceOrder {
-                    file_ordinal: input.file_ordinal,
-                    file_row_number: row_start + row_offset,
-                },
-            );
+            let source_order = SourceOrder {
+                file_ordinal: input.file_ordinal,
+                file_row_number: row_start + row_offset,
+            };
             row_offset += 1;
-            if !options.allowed_chains.is_empty() && !options.allowed_chains.contains(&row.chain) {
+            let chain = normalize_chain(columns.value_at(0, row_index));
+            if !options.allowed_chains.is_empty() && !options.allowed_chains.contains(&chain) {
                 continue;
             }
-            shard.ingest_identity_row(row)?;
+            // Intern directly from Arrow slices — no intermediate IdentityRow Strings.
+            shard.ingest_identity_strs(
+                &chain,
+                columns.value_at(1, row_index).trim(),
+                columns.value_at(2, row_index).trim(),
+                columns.value_at(3, row_index),
+                columns.value_at(4, row_index),
+                columns.value_at(5, row_index),
+                source_order,
+            )?;
         }
         progress.add_completed(batch.num_rows() as u64);
     }
@@ -139,18 +146,6 @@ impl ProjectedUtf8Columns {
             ""
         } else {
             array.value(row)
-        }
-    }
-
-    fn decode_identity(&self, row_index: usize, source_order: SourceOrder) -> IdentityRow {
-        IdentityRow {
-            chain: normalize_chain(self.value_at(0, row_index)),
-            contract_address: self.value_at(1, row_index).trim().to_owned(),
-            token_id: self.value_at(2, row_index).trim().to_owned(),
-            name_norm: self.value_at(3, row_index).to_owned(),
-            token_uri_norm: self.value_at(4, row_index).to_owned(),
-            image_uri_norm: self.value_at(5, row_index).to_owned(),
-            source_order,
         }
     }
 }

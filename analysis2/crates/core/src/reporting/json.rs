@@ -99,21 +99,18 @@ pub fn resolve_seed_contract(
     store: &ResidentStore,
     seed: &SeedRecord,
 ) -> Result<ContractId, Analysis2Error> {
-    let chain_id = store
-        .chain_ids
-        .get(&seed.chain)
-        .copied()
-        .ok_or_else(|| Analysis2Error::invalid(format!("unknown seed chain {}", seed.chain)))?;
-    store
-        .contract_index
-        .get(&(chain_id, seed.address.clone()))
-        .copied()
-        .ok_or_else(|| {
-            Analysis2Error::invalid(format!(
-                "seed contract not in snapshot: {} / {}",
-                seed.chain, seed.address
-            ))
-        })
+    if !store.chain_ids.contains_key(&seed.chain) {
+        return Err(Analysis2Error::invalid(format!(
+            "unknown seed chain {}",
+            seed.chain
+        )));
+    }
+    store.contract_id(&seed.chain, &seed.address).ok_or_else(|| {
+        Analysis2Error::invalid(format!(
+            "seed contract not in snapshot: {} / {}",
+            seed.chain, seed.address
+        ))
+    })
 }
 
 /// Build the per-seed dedup report payload from a populated HitGraph.

@@ -211,7 +211,7 @@ fn scan_row_group_pass2(
             let chain = normalize_chain(columns.value_at(0, row_index));
             let contract_address = columns.value_at(1, row_index).trim().to_owned();
             let token_id = columns.value_at(2, row_index).trim().to_owned();
-            let metadata_json = columns.value_at(3, row_index).trim().to_owned();
+            let metadata_raw = columns.value_at(3, row_index).trim();
             let source_order = SourceOrder {
                 file_ordinal: input.file_ordinal,
                 file_row_number: row_start + row_offset,
@@ -223,14 +223,21 @@ fn scan_row_group_pass2(
             if chain.is_empty() || contract_address.is_empty() || token_id.is_empty() {
                 continue;
             }
-            let Some(canonical_json) = validated_metadata(&metadata_json) else {
+            // Cheap reject before full JSON parse+canonicalize.
+            if metadata_raw.is_empty()
+                || metadata_raw == "{}"
+                || !matches!(metadata_raw.as_bytes().first(), Some(b'{') | Some(b'['))
+            {
+                continue;
+            }
+            let Some(canonical_json) = validated_metadata(metadata_raw) else {
                 continue;
             };
             shard.insert(
                 chain,
                 contract_address,
                 token_id,
-                metadata_json,
+                metadata_raw.to_owned(),
                 canonical_json,
                 source_order,
                 options,
