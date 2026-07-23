@@ -16,14 +16,15 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const DEFAULT_RETRIES: usize = 3;
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Shared “other API” token-bucket defaults (same knobs as
-/// `top_contract_analysis_rs` `DEFAULT_OTHER_API_RATE_LIMIT_*`): burst 4,
-/// refill 1 token every 300 ms (~3.3 rps sustained, never more than 4 tokens).
-/// OpenSea and Helius each get an **independent** bucket with these defaults.
+/// OpenSea token-bucket defaults (same knobs as `top_contract_analysis_rs`
+/// `DEFAULT_OTHER_API_RATE_LIMIT_*`): burst 4, refill 1 token every 300 ms
+/// (~3.3 rps sustained). Independent of the Helius bucket.
 pub const OPENSEA_RATE_LIMIT_BURST: usize = 4;
 pub const OPENSEA_RATE_LIMIT_REFILL_MS: u64 = 300;
-pub const HELIUS_RATE_LIMIT_BURST: usize = 4;
-pub const HELIUS_RATE_LIMIT_REFILL_MS: u64 = 300;
+/// Helius independent bucket: burst 10, refill 1 token every 110 ms
+/// (~9.09 rps sustained, cap ~10 in-flight burst for a ~10 req/s target).
+pub const HELIUS_RATE_LIMIT_BURST: usize = 10;
+pub const HELIUS_RATE_LIMIT_REFILL_MS: u64 = 110;
 
 #[derive(Debug)]
 struct TokenBucketState {
@@ -62,7 +63,7 @@ impl TokenBucketRateLimiter {
         )
     }
 
-    /// Helius default: independent bucket, same burst/refill as OpenSea.
+    /// Helius default: independent bucket (~10 req/s, 110 ms/token).
     pub fn helius_default() -> Self {
         Self::new(
             HELIUS_RATE_LIMIT_BURST,
@@ -601,8 +602,12 @@ mod tests {
     }
 
     #[test]
-    fn helius_defaults_match_opensea_strategy() {
-        assert_eq!(HELIUS_RATE_LIMIT_BURST, OPENSEA_RATE_LIMIT_BURST);
-        assert_eq!(HELIUS_RATE_LIMIT_REFILL_MS, OPENSEA_RATE_LIMIT_REFILL_MS);
+    fn helius_defaults_target_about_ten_rps() {
+        assert_eq!(HELIUS_RATE_LIMIT_BURST, 10);
+        assert_eq!(HELIUS_RATE_LIMIT_REFILL_MS, 110);
+        // Sustained rate from refill interval (tokens/s).
+        let rps = 1000.0 / HELIUS_RATE_LIMIT_REFILL_MS as f64;
+        assert!((rps - 1000.0 / 110.0).abs() < 1e-9);
+        assert!(rps > 9.0 && rps < 10.0);
     }
 }
