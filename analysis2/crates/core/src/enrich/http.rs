@@ -1,7 +1,7 @@
 //! Shared HTTP client scaffolding for seed selection and enrichment.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
@@ -13,12 +13,88 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_RETRIES: usize = 2;
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
+/// OpenSea token-bucket defaults (same knobs as `top_contract_analysis_rs`
+/// `DEFAULT_OTHER_API_RATE_LIMIT_*`): burst 4, refill 1 token every 300 ms
+/// (~3.3 rps sustained, never more than 4 tokens available).
+pub const OPENSEA_RATE_LIMIT_BURST: usize = 4;
+pub const OPENSEA_RATE_LIMIT_REFILL_MS: u64 = 300;
+
+#[derive(Debug)]
+struct TokenBucketState {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+/// Token-bucket rate gate without a background task (safe to construct outside
+/// a Tokio runtime; waits only on `acquire`).
+#[derive(Clone, Debug)]
+pub struct TokenBucketRateLimiter {
+    max_burst: f64,
+    refill_interval: Duration,
+    state: Arc<Mutex<TokenBucketState>>,
+}
+
+impl TokenBucketRateLimiter {
+    pub fn new(max_burst: usize, refill_interval: Duration) -> Self {
+        let max_burst = max_burst.max(1) as f64;
+        // Start with one token (matches top_contract AsyncApiClient).
+        Self {
+            max_burst,
+            refill_interval: refill_interval.max(Duration::from_millis(1)),
+            state: Arc::new(Mutex::new(TokenBucketState {
+                tokens: 1.0,
+                last_refill: Instant::now(),
+            })),
+        }
+    }
+
+    /// OpenSea default: 4 burst / 300 ms refill.
+    pub fn opensea_default() -> Self {
+        Self::new(
+            OPENSEA_RATE_LIMIT_BURST,
+            Duration::from_millis(OPENSEA_RATE_LIMIT_REFILL_MS),
+        )
+    }
+
+    /// Wait until a rate token is available, then consume one.
+    pub async fn acquire(&self) -> Result<(), Analysis2Error> {
+        loop {
+            let wait = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| Analysis2Error::http("OpenSea rate limiter poisoned"))?;
+                let elapsed = state.last_refill.elapsed();
+                if !elapsed.is_zero() {
+                    let add = elapsed.as_secs_f64() / self.refill_interval.as_secs_f64();
+                    state.tokens = (state.tokens + add).min(self.max_burst);
+                    state.last_refill = Instant::now();
+                }
+                if state.tokens >= 1.0 {
+                    state.tokens -= 1.0;
+                    None
+                } else {
+                    let need = 1.0 - state.tokens;
+                    let wait_secs = need * self.refill_interval.as_secs_f64();
+                    Some(Duration::from_secs_f64(wait_secs.max(0.001)))
+                }
+            };
+            match wait {
+                None => return Ok(()),
+                Some(delay) => tokio::time::sleep(delay).await,
+            }
+        }
+    }
+}
+
 /// Concurrent HTTP helper with finite retries.
 #[derive(Clone)]
 pub struct HttpClient {
     http: reqwest::Client,
     in_flight: Arc<Semaphore>,
     retries: usize,
+    /// Shared OpenSea rate limiter (all clones share one bucket).
+    opensea_limiter: TokenBucketRateLimiter,
 }
 
 impl HttpClient {
@@ -37,6 +113,7 @@ impl HttpClient {
             http,
             in_flight: Arc::new(Semaphore::new(concurrency.max(1))),
             retries,
+            opensea_limiter: TokenBucketRateLimiter::opensea_default(),
         })
     }
 
@@ -46,6 +123,16 @@ impl HttpClient {
         headers: &[(&str, &str)],
     ) -> Result<Value, Analysis2Error> {
         self.request(reqwest::Method::GET, url, headers, None).await
+    }
+
+    /// GET that first consumes an OpenSea rate token (≤ ~4 req/s strategy).
+    pub async fn get_json_opensea(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<Value, Analysis2Error> {
+        self.opensea_limiter.acquire().await?;
+        self.get_json(url, headers).await
     }
 
     pub async fn post_json(
@@ -66,6 +153,7 @@ impl HttpClient {
         body: Option<&Value>,
     ) -> Result<Value, Analysis2Error> {
         let header_map = build_headers(headers)?;
+        let endpoint = redact_endpoint(url);
         let mut last_error = None;
         for attempt in 0..=self.retries {
             let _permit = self
@@ -81,8 +169,10 @@ impl HttpClient {
                 builder = builder.json(body);
             }
             let result = match builder.send().await {
-                Ok(response) => read_json_response(response).await,
-                Err(error) => Err(Analysis2Error::http(error.without_url().to_string())),
+                Ok(response) => read_json_response(response, &endpoint).await,
+                Err(error) => Err(Analysis2Error::http(format_transport_error(
+                    &method, &endpoint, &error,
+                ))),
             };
             drop(_permit);
             match result {
@@ -94,7 +184,7 @@ impl HttpClient {
                         will_retry.then(|| 100u64.saturating_mul(1u64 << attempt.min(8)));
                     print_request_error(
                         &method,
-                        url,
+                        &endpoint,
                         attempt + 1,
                         self.retries + 1,
                         backoff_ms,
@@ -108,9 +198,19 @@ impl HttpClient {
                 }
             }
         }
-        Err(last_error.unwrap_or_else(|| Analysis2Error::http("HTTP request failed")))
+        let final_error =
+            last_error.unwrap_or_else(|| Analysis2Error::http("HTTP request failed"));
+        eprintln!(
+            "[api/error] endpoint={endpoint} method={method} action=give_up error={}",
+            one_line_error(&final_error.to_string(), ERROR_LOG_CHARS)
+        );
+        Err(final_error)
     }
 }
+
+/// Max characters kept from error/response bodies in logs and error strings.
+const ERROR_BODY_CHARS: usize = 800;
+const ERROR_LOG_CHARS: usize = 1_200;
 
 fn build_headers(headers: &[(&str, &str)]) -> Result<HeaderMap, Analysis2Error> {
     let mut map = HeaderMap::new();
@@ -132,23 +232,78 @@ fn build_headers(headers: &[(&str, &str)]) -> Result<HeaderMap, Analysis2Error> 
     Ok(map)
 }
 
-async fn read_json_response(response: reqwest::Response) -> Result<Value, Analysis2Error> {
+async fn read_json_response(
+    response: reqwest::Response,
+    endpoint: &str,
+) -> Result<Value, Analysis2Error> {
     let status = response.status();
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| Analysis2Error::http(e.to_string()))?;
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    let bytes = response.bytes().await.map_err(|e| {
+        Analysis2Error::http(format!(
+            "read body failed endpoint={endpoint} status={status}: {e}"
+        ))
+    })?;
     if bytes.len() as u64 > MAX_RESPONSE_BYTES {
         return Err(Analysis2Error::http(format!(
-            "response exceeds {MAX_RESPONSE_BYTES} bytes"
+            "response exceeds {MAX_RESPONSE_BYTES} bytes endpoint={endpoint} status={status} \
+             content_type={content_type} body_len={}",
+            bytes.len()
         )));
     }
     if !status.is_success() {
         let body = String::from_utf8_lossy(&bytes);
-        let snippet: String = body.chars().take(200).collect();
-        return Err(Analysis2Error::http(format!("HTTP {status}: {snippet}")));
+        let snippet = one_line_error(&body, ERROR_BODY_CHARS);
+        return Err(Analysis2Error::http(format!(
+            "HTTP {status} endpoint={endpoint} content_type={content_type} body={snippet}"
+        )));
     }
-    serde_json::from_slice(&bytes).map_err(|e| Analysis2Error::http(format!("invalid JSON: {e}")))
+    serde_json::from_slice(&bytes).map_err(|e| {
+        let preview = String::from_utf8_lossy(&bytes);
+        let snippet = one_line_error(&preview, ERROR_BODY_CHARS);
+        Analysis2Error::http(format!(
+            "invalid JSON endpoint={endpoint} status={status} content_type={content_type} \
+             parse_error={e} body={snippet}"
+        ))
+    })
+}
+
+fn format_transport_error(
+    method: &reqwest::Method,
+    endpoint: &str,
+    error: &reqwest::Error,
+) -> String {
+    let mut parts = vec![
+        format!("transport error"),
+        format!("method={method}"),
+        format!("endpoint={endpoint}"),
+    ];
+    if error.is_timeout() {
+        parts.push("kind=timeout".into());
+    } else if error.is_connect() {
+        parts.push("kind=connect".into());
+    } else if error.is_request() {
+        parts.push("kind=request".into());
+    } else if error.is_body() {
+        parts.push("kind=body".into());
+    } else if error.is_decode() {
+        parts.push("kind=decode".into());
+    }
+    if let Some(status) = error.status() {
+        parts.push(format!("status={status}"));
+    }
+    // Keep the library message but strip raw secrets if any leaked in.
+    // Prefer `to_string()` over `without_url()` so we can borrow `&Error`.
+    let detail = one_line_error(
+        &redact_sensitive_text(&error.to_string()),
+        ERROR_BODY_CHARS,
+    );
+    parts.push(format!("detail={detail}"));
+    parts.join(" ")
 }
 
 fn is_retryable(error: &Analysis2Error) -> bool {
@@ -157,6 +312,8 @@ fn is_retryable(error: &Analysis2Error) -> bool {
             let lower = message.to_ascii_lowercase();
             lower.contains("timeout")
                 || lower.contains("timed out")
+                || lower.contains("kind=timeout")
+                || lower.contains("kind=connect")
                 || lower.contains("connection")
                 || lower.contains("http 429")
                 || lower.contains("http 500")
@@ -170,45 +327,115 @@ fn is_retryable(error: &Analysis2Error) -> bool {
 
 fn print_request_error(
     method: &reqwest::Method,
-    url: &str,
+    endpoint: &str,
     attempt: usize,
     max_attempts: usize,
     backoff_ms: Option<u64>,
     error: &Analysis2Error,
 ) {
-    let host = endpoint_host(url);
-    let message = one_line_error(&error.to_string());
+    // Error string already carries endpoint/status/body; still prefix for grepping.
+    let message = one_line_error(&error.to_string(), ERROR_LOG_CHARS);
     match backoff_ms {
         Some(delay) => eprintln!(
-            "[api/error] host={host} method={method} attempt={attempt}/{max_attempts} \
+            "[api/error] endpoint={endpoint} method={method} attempt={attempt}/{max_attempts} \
              action=retry backoff_ms={delay} error={message}"
         ),
         None => eprintln!(
-            "[api/error] host={host} method={method} attempt={attempt}/{max_attempts} \
+            "[api/error] endpoint={endpoint} method={method} attempt={attempt}/{max_attempts} \
              action=continue error={message}"
         ),
     }
 }
 
-fn endpoint_host(url: &str) -> String {
-    reqwest::Url::parse(url)
-        .ok()
-        .and_then(|parsed| {
-            let host = parsed.host_str()?;
-            Some(match parsed.port() {
-                Some(port) => format!("{host}:{port}"),
-                None => host.to_owned(),
+/// Host + path + redacted query for logs (never includes API keys).
+fn redact_endpoint(url: &str) -> String {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return "invalid-url".to_owned();
+    };
+    let host = match (parsed.host_str(), parsed.port()) {
+        (Some(host), Some(port)) => format!("{host}:{port}"),
+        (Some(host), None) => host.to_owned(),
+        _ => "unknown-host".to_owned(),
+    };
+    let path = parsed.path();
+    let mut out = format!("{host}{path}");
+    if let Some(query) = parsed.query() {
+        let redacted = query
+            .split('&')
+            .map(|pair| {
+                let mut parts = pair.splitn(2, '=');
+                let key = parts.next().unwrap_or("");
+                let key_l = key.to_ascii_lowercase();
+                if key_l.contains("key")
+                    || key_l.contains("token")
+                    || key_l.contains("secret")
+                    || key_l.contains("auth")
+                {
+                    format!("{key}=***")
+                } else {
+                    pair.to_owned()
+                }
             })
-        })
-        .unwrap_or_else(|| "invalid-url".to_owned())
+            .collect::<Vec<_>>()
+            .join("&");
+        if !redacted.is_empty() {
+            out.push('?');
+            out.push_str(&redacted);
+        }
+    }
+    // Alchemy / similar paths embed the key as a path segment: /v2/<key>
+    redact_path_secrets(&out)
 }
 
-fn one_line_error(message: &str) -> String {
+fn redact_path_secrets(endpoint: &str) -> String {
+    // Replace long hex/base64-looking path segments after /v2/ or /v3/.
+    let mut parts: Vec<String> = endpoint.split('/').map(str::to_owned).collect();
+    for i in 0..parts.len() {
+        if matches!(parts[i].as_str(), "v2" | "v3") {
+            if let Some(next) = parts.get_mut(i + 1) {
+                if next.len() >= 16
+                    && next
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                {
+                    *next = "***".into();
+                }
+            }
+        }
+    }
+    parts.join("/")
+}
+
+fn redact_sensitive_text(text: &str) -> String {
+    // Best-effort: hide query api-key=... and path /v2/<long token>.
+    let mut out = text.to_owned();
+    for marker in ["api-key=", "api_key=", "apikey=", "x-api-key="] {
+        if let Some(idx) = out.to_ascii_lowercase().find(marker) {
+            let start = idx + marker.len();
+            let end = out[start..]
+                .find(|c: char| c == '&' || c == ' ' || c == '"' || c == '\'')
+                .map(|n| start + n)
+                .unwrap_or(out.len());
+            out.replace_range(start..end, "***");
+        }
+    }
+    redact_path_secrets(&out)
+}
+
+fn one_line_error(message: &str, max_chars: usize) -> String {
     message
         .chars()
-        .take(500)
+        .take(max_chars)
         .map(|ch| if ch.is_control() { ' ' } else { ch })
         .collect()
+}
+
+/// Print a provider-layer failure (non-HTTP transport already logged above).
+pub fn print_provider_error(source: &str, request_key: &str, error: &str) {
+    eprintln!(
+        "[api/error] source={source} request_key={request_key} error={}",
+        one_line_error(&redact_sensitive_text(error), ERROR_LOG_CHARS)
+    );
 }
 
 #[cfg(test)]
@@ -217,18 +444,41 @@ mod tests {
 
     #[test]
     fn endpoint_log_label_never_contains_path_or_api_key() {
-        let url = "https://eth-mainnet.g.alchemy.com/v2/super-secret-key";
-        let label = endpoint_host(url);
-        assert_eq!(label, "eth-mainnet.g.alchemy.com");
+        let url = "https://eth-mainnet.g.alchemy.com/v2/super-secret-key/getNFTs";
+        let label = redact_endpoint(url);
+        assert!(label.contains("eth-mainnet.g.alchemy.com"));
+        assert!(label.contains("/v2/***/getNFTs") || label.contains("/v2/***"));
         assert!(!label.contains("super-secret-key"));
     }
 
     #[test]
+    fn query_api_key_is_redacted() {
+        let url = "https://mainnet.helius-rpc.com/?api-key=abc123secret";
+        let label = redact_endpoint(url);
+        assert!(label.contains("api-key=***"));
+        assert!(!label.contains("abc123secret"));
+    }
+
+    #[test]
     fn error_log_message_is_single_line_and_bounded() {
-        let message = format!("first\nsecond\r\n{}", "x".repeat(600));
-        let sanitized = one_line_error(&message);
+        let message = format!("first\nsecond\r\n{}", "x".repeat(2000));
+        let sanitized = one_line_error(&message, 500);
         assert!(!sanitized.contains('\n'));
         assert!(!sanitized.contains('\r'));
         assert_eq!(sanitized.chars().count(), 500);
+    }
+
+    #[tokio::test]
+    async fn opensea_token_bucket_starts_with_one_and_caps_burst() {
+        let limiter = TokenBucketRateLimiter::new(4, Duration::from_millis(50));
+        // Initial permit available.
+        limiter.acquire().await.unwrap();
+        // Immediate second acquire must wait for refill; with 50ms refill it should succeed.
+        let start = std::time::Instant::now();
+        limiter.acquire().await.unwrap();
+        assert!(
+            start.elapsed() >= Duration::from_millis(40),
+            "second token should wait for refill"
+        );
     }
 }

@@ -31,7 +31,7 @@ pub struct RunManifest {
 }
 
 /// One recoverable failure (seed / stage); siblings continue.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FailureRecord {
     pub seed_chain: String,
     pub seed_address: String,

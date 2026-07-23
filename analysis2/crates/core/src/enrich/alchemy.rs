@@ -49,7 +49,11 @@ impl<T: Default> FetchOutcome<T> {
     }
 
     pub fn failed(source: &str, request_key: &str, error: impl ToString) -> Self {
-        let message = format!("{request_key}: {}", error.to_string());
+        let detail = error.to_string();
+        let message = format!("{request_key}: {detail}");
+        // Surface the concrete provider failure even when HTTP layer already
+        // logged transport issues (JSON-RPC app errors, parse failures, etc.).
+        super::http::print_provider_error(source, request_key, &detail);
         Self {
             value: T::default(),
             status: EvidenceStatus::Failed,
@@ -1141,12 +1145,21 @@ pub fn parse_native_transfer(item: &Value) -> Option<NativeTransfer> {
 ///
 /// True `Empty` from Alchemy means no sales — do not call OpenSea.
 /// Fallback only for Failed/NotRequested, or Complete/Truncated rows missing amounts.
+/// Whether OpenSea sales are needed as a **last-resort** fallback.
+///
+/// Prefer Alchemy (and other non-OpenSea sources). Empty Alchemy sales mean
+/// "no sales observed", not "try OpenSea". Only request OpenSea when the
+/// preferred provider failed / was not requested, or returned sales missing
+/// every amount field.
 pub fn sales_need_opensea_fallback(sales: &[SaleEvent], sales_status: EvidenceStatus) -> bool {
     match sales_status {
         EvidenceStatus::Failed | EvidenceStatus::NotRequested => true,
-        EvidenceStatus::Complete | EvidenceStatus::Truncated => sales
-            .iter()
-            .any(|s| s.native_amount.is_none() && s.usd_amount.is_none()),
+        EvidenceStatus::Complete | EvidenceStatus::Truncated => {
+            !sales.is_empty()
+                && sales
+                    .iter()
+                    .any(|s| s.native_amount.is_none() && s.usd_amount.is_none())
+        }
         EvidenceStatus::Empty => false,
     }
 }
@@ -1248,6 +1261,9 @@ mod sales_fallback_tests {
 
     #[test]
     fn complete_or_truncated_need_opensea_only_when_amounts_missing() {
+        // Empty complete/truncated list: do not burn OpenSea quota.
+        assert!(!sales_need_opensea_fallback(&[], EvidenceStatus::Complete));
+        assert!(!sales_need_opensea_fallback(&[], EvidenceStatus::Truncated));
         assert!(sales_need_opensea_fallback(
             &[sale_with_amount(None)],
             EvidenceStatus::Complete

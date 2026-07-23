@@ -130,6 +130,12 @@ impl ResidentStore {
         self.contract_index.get(&(chain_id, address_id)).copied()
     }
 
+    /// Resolve NFT id by contract + token_id string.
+    pub fn nft_id(&self, contract_id: ContractId, token_id: &str) -> Option<NftId> {
+        let token_sid = self.strings.lookup(token_id)?;
+        self.nft_index.get(&(contract_id, token_sid)).copied()
+    }
+
     pub fn ensure_chain(&mut self, chain: &str) -> Result<ChainId, Analysis2Error> {
         if let Some(id) = self.chain_ids.get(chain) {
             return Ok(*id);

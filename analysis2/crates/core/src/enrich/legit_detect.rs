@@ -66,6 +66,11 @@ fn controller_set(addrs: &[String], chain: &str) -> BTreeSet<String> {
         .collect()
 }
 
+/// Resolve a collection identity string for legit "same collection" matching.
+///
+/// Preference order (OpenSea only as last resort, and never for Solana):
+/// - Solana: Helius DAS metadata symbol/name for the collection address
+/// - EVM: Alchemy NFT collection slug → OpenSea contract slug fallback
 async fn resolve_collection_slug(
     client: &HttpClient,
     limits: &HttpLimits,
@@ -74,12 +79,11 @@ async fn resolve_collection_slug(
     address: &str,
 ) -> Option<String> {
     if chain.eq_ignore_ascii_case("solana") {
-        // OpenSea Solana contract slug when key present.
-        return opensea::fetch_contract_collection_slug(
+        // Prefer Helius; do not spend OpenSea quota for Solana legit slug.
+        return helius::fetch_collection_identity(
             client,
-            &limits.endpoints.opensea,
-            keys.opensea(),
-            chain,
+            &limits.endpoints.helius,
+            keys.helius(),
             address,
         )
         .await
@@ -91,6 +95,7 @@ async fn resolve_collection_slug(
     {
         return Some(slug.to_ascii_lowercase());
     }
+    // Last resort only when Alchemy could not supply a slug.
     opensea::fetch_contract_collection_slug(
         client,
         &limits.endpoints.opensea,
@@ -352,7 +357,7 @@ async fn probe_relation(
         signals.official_collection_relation = true;
         signals
             .evidence_keys
-            .push(format!("opensea_collection:{seed_slug}"));
+            .push(format!("collection_relation:{seed_slug}"));
     }
 
     let cand_norm = normalize_addr(chain, candidate_address);
@@ -612,7 +617,7 @@ pub fn classify_relation_offline(
         signals.official_collection_relation = true;
         signals
             .evidence_keys
-            .push(format!("opensea_collection:{}", a.to_ascii_lowercase()));
+            .push(format!("collection_relation:{}", a.to_ascii_lowercase()));
     }
     if holds_seed {
         signals.seed_nft_interaction = true;

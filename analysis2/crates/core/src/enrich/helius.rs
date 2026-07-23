@@ -132,6 +132,50 @@ pub fn default_rpc_url() -> &'static str {
     DEFAULT_HELIUS_RPC
 }
 
+/// Collection identity for legit matching without OpenSea: prefer DAS `symbol`,
+/// then `name`, then the collection address itself.
+pub async fn fetch_collection_identity(
+    client: &HttpClient,
+    rpc_url: &str,
+    api_key: Option<&str>,
+    collection: &str,
+) -> Option<String> {
+    let api_key = api_key?;
+    let url = with_api_key(rpc_url, api_key);
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": format!("collection-id-{collection}"),
+        "method": "getAsset",
+        "params": {"id": collection}
+    });
+    let payload = client.post_json(&url, &[], &body).await.ok()?;
+    if payload.get("error").is_some() {
+        return None;
+    }
+    let result = payload.get("result")?;
+    if let Some(id) = parse_collection_metadata_identity(result) {
+        return Some(id);
+    }
+    // Fallback: stable on-chain collection address (same address = same collection).
+    let trimmed = collection.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+fn parse_collection_metadata_identity(asset: &Value) -> Option<String> {
+    let content = asset.get("content")?.get("metadata")?;
+    for key in ["symbol", "name"] {
+        if let Some(text) = content
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(text.to_owned());
+        }
+    }
+    None
+}
+
 fn with_api_key(rpc_url: &str, api_key: &str) -> String {
     let mut url = rpc_url.trim_end_matches('/').to_owned();
     if !url.contains('?') {
@@ -1208,6 +1252,22 @@ mod tests {
             "grouping": [{"group_key": "other", "group_value": "x"}]
         });
         assert_eq!(parse_collection_address(&asset), None);
+    }
+
+    #[test]
+    fn collection_metadata_identity_prefers_symbol() {
+        let asset = json!({
+            "content": {
+                "metadata": {
+                    "name": "Cool Collection",
+                    "symbol": "COOL"
+                }
+            }
+        });
+        assert_eq!(
+            parse_collection_metadata_identity(&asset).as_deref(),
+            Some("COOL")
+        );
     }
 
     #[test]

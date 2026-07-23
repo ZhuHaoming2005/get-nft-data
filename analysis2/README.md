@@ -109,6 +109,36 @@ cannot supply amounts. Cancel / OOM paths do **not** write `status: complete` in
 `run_manifest.json`. Incomplete four-scope seeds are excluded from formal summary
 denominators. Cross-chain economics in `summary.json` sum **USD only**.
 
+### Dedup cache (skip re-query)
+
+After URI/Name/Metadata queries finish, `run` always writes a portable checkpoint:
+
+```text
+<output-dir>/dedup_cache.json
+```
+
+(override with `--dedup-cache PATH`). Edges are stored with stable chain/address/token
+identities (not process-local ids).
+
+To re-run enrich/analyze without re-querying:
+
+```powershell
+cargo run --manifest-path analysis2/Cargo.toml --release -- run `
+  --input ... `
+  --seeds ./out/seeds/seeds.json `
+  --output-dir ./out/run `
+  --chains base,ethereum,polygon,solana `
+  --evm-chains base,ethereum,polygon `
+  --reuse-dedup `
+  # same thresholds / inputs / seeds as the cache-producing run
+  --alchemy-api-key $env:ALCHEMY_API_KEY `
+  ...
+```
+
+`--reuse-dedup` still loads Parquet identity (for candidate expansion + enrich), but
+skips Name/URI/Metadata index build and all seed queries. Inputs, chains, thresholds,
+anchors, and the seeds list must match the cache or the run fails fast.
+
 ### Evidence depth (enrich → economics)
 
 - **EVM gas:** Alchemy/ETH `eth_getTransactionReceipt` → `TransferEvent.gas_native` /

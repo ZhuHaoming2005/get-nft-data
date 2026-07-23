@@ -1,18 +1,20 @@
 //! Offline `run-dedup` and full `run` orchestration.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ahash::AHashMap;
 use analysis2_core::{
-    Analysis2Error, ApiKeys, CandidateAnalysis, CandidateRegistry, ContractId, DedupRunParams,
+    analyze_candidate, build_contract_nft_map, build_dedup_cache, build_seed_analysis_rollup,
+    build_seed_dedup_report, default_dedup_cache_path, enrich_candidates, load_dedup_cache,
+    load_resident_store, load_seeds_json, query_metadata_for_seed_with_scratch,
+    query_name_for_seed_with_scratch, query_uri_for_seed_with_scratch, rematerialize_dedup_batch,
+    resolve_seed_contract, scopes_complete_for_seed, validate_dedup_cache, write_candidate_json,
+    write_dedup_cache, write_dedup_outputs, write_run_outputs, Analysis2Error, ApiKeys,
+    CandidateAnalysis, CandidateRegistry, ContractId, DedupCacheParams, DedupRunParams,
     EvidenceBundle, FailureRecord, HitGraph, HttpLimits, LoadOptions, MetadataQueryScratch,
     NameQueryScratch, PaperConfig, ProgressObserver, ResidentStore, SeedFullReport, SeedRecord,
-    UriQueryScratch, analyze_candidate, build_contract_nft_map, build_seed_analysis_rollup,
-    build_seed_dedup_report, enrich_candidates, load_resident_store, load_seeds_json,
-    query_metadata_for_seed_with_scratch, query_name_for_seed_with_scratch,
-    query_uri_for_seed_with_scratch, resolve_seed_contract, scopes_complete_for_seed,
-    write_candidate_json, write_dedup_outputs, write_run_outputs,
+    UriQueryScratch,
 };
 use rayon::prelude::*;
 
@@ -56,6 +58,10 @@ pub struct RunConfig {
     pub paper: PaperConfig,
     /// When set, used instead of Tokio `enrich_candidates` (tests / offline fixtures).
     pub enrich_override: Option<EnrichOverride>,
+    /// Path for durable dedup cache (`dedup_cache.json` by default under output_dir).
+    pub dedup_cache_path: Option<PathBuf>,
+    /// Load dedup results from cache and skip URI/Name/Metadata query stages.
+    pub reuse_dedup: bool,
 }
 
 fn with_rayon_pool<T>(
@@ -341,23 +347,110 @@ pub fn run(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), An
     with_rayon_pool(config.rayon_threads, || run_inner(config, progress))
 }
 
-fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), Analysis2Error> {
-    let options = LoadOptions::new(
-        config.chains.clone(),
-        config.evm_chains.clone(),
-        config.metadata_anchors,
+fn dedup_cache_path(config: &RunConfig) -> PathBuf {
+    config
+        .dedup_cache_path
+        .clone()
+        .unwrap_or_else(|| default_dedup_cache_path(&config.output_dir))
+}
+
+fn make_dedup_cache_params(config: &RunConfig, seeds: &[SeedRecord]) -> DedupCacheParams {
+    DedupCacheParams {
+        inputs: config
+            .inputs
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect(),
+        chains: config.chains.clone(),
+        evm_chains: config.evm_chains.clone(),
+        name_threshold: config.name_threshold,
+        metadata_threshold: config.metadata_threshold,
+        metadata_anchors: config.metadata_anchors,
+        seeds_path: config.seeds.display().to_string(),
+        seeds: seeds.to_vec(),
+    }
+}
+
+fn load_seed_batch_from_cache(
+    store: &ResidentStore,
+    cache_path: &Path,
+    expected: &DedupCacheParams,
+    progress: &dyn ProgressObserver,
+) -> Result<SeedDedupBatch, Analysis2Error> {
+    progress.set_stage("dedup");
+    progress.begin_phase("load_dedup_cache", Some(1));
+    let cache = load_dedup_cache(cache_path)?;
+    validate_dedup_cache(&cache, expected)?;
+    let (completed, failures) = rematerialize_dedup_batch(store, &cache)?;
+    progress.add_completed(1);
+    eprintln!(
+        "dedup: reused cache {} ({} seeds, {} failures)",
+        cache_path.display(),
+        completed.len(),
+        failures.len()
     );
-    let mut store = load_resident_store(&config.inputs, &options, progress)?;
+    Ok(SeedDedupBatch {
+        completed,
+        failures,
+    })
+}
+
+/// End-to-end: load → dedup (or cache) → enrich → analyze → full reports.
+fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), Analysis2Error> {
     let seeds = load_seeds_json(&config.seeds)?;
+    let cache_path = dedup_cache_path(config);
+    let cache_params = make_dedup_cache_params(config, &seeds);
+
+    let options = if config.reuse_dedup {
+        LoadOptions::identity_only(
+            config.chains.clone(),
+            config.evm_chains.clone(),
+            config.metadata_anchors,
+        )
+    } else {
+        LoadOptions::new(
+            config.chains.clone(),
+            config.evm_chains.clone(),
+            config.metadata_anchors,
+        )
+    };
+    let mut store = load_resident_store(&config.inputs, &options, progress)?;
     let contract_nfts = build_contract_nft_map(&store);
 
-    let seed_batch = query_seeds_staged(
-        &mut store,
-        &seeds,
-        config.name_threshold,
-        config.metadata_threshold,
-        progress,
-    )?;
+    let seed_batch = if config.reuse_dedup {
+        if !cache_path.is_file() {
+            return Err(Analysis2Error::invalid(format!(
+                "--reuse-dedup requires existing cache file {}",
+                cache_path.display()
+            )));
+        }
+        load_seed_batch_from_cache(&store, &cache_path, &cache_params, progress)?
+    } else {
+        let batch = query_seeds_staged(
+            &mut store,
+            &seeds,
+            config.name_threshold,
+            config.metadata_threshold,
+            progress,
+        )?;
+        // Persist immediately so a later `--reuse-dedup` can skip query work.
+        progress.begin_phase("write_dedup_cache", Some(1));
+        let cache = build_dedup_cache(
+            &store,
+            cache_params,
+            &batch.completed,
+            &batch.failures,
+        );
+        write_dedup_cache(&cache_path, &cache)?;
+        progress.add_completed(1);
+        eprintln!(
+            "dedup: wrote cache {} ({} seeds, {} failures)",
+            cache_path.display(),
+            batch.completed.len(),
+            batch.failures.len()
+        );
+        batch
+    };
 
     let completed = seed_batch.completed;
     let mut failures = seed_batch.failures;
@@ -685,6 +778,8 @@ mod tests {
                     ..PaperConfig::default()
                 },
                 enrich_override: Some(enrich),
+                dedup_cache_path: None,
+                reuse_dedup: false,
             },
             &analysis2_core::NoopProgress,
         )
@@ -788,12 +883,82 @@ mod tests {
                 http_concurrency: 4,
                 paper: PaperConfig::default(),
                 enrich_override: Some(enrich),
+                dedup_cache_path: None,
+                reuse_dedup: false,
             },
             &CancelOnEnrich,
         )
         .expect_err("cancel");
         assert!(matches!(err, Analysis2Error::Cancelled));
         assert!(!out.join("run_manifest.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_writes_dedup_cache_and_reuse_skips_query() {
+        let dir = std::env::temp_dir().join(format!(
+            "analysis2_run_dedup_cache_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let parquet = dir.join("fixture.parquet");
+        write_report_golden_fixture(&parquet).expect("fixture");
+        let seeds = dir.join("seeds.json");
+        std::fs::write(
+            &seeds,
+            r#"[{"chain":"ethereum","address":"0xseed","rank":1}]"#,
+        )
+        .unwrap();
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let cache_path = out.join("dedup_cache.json");
+
+        let enrich: EnrichOverride = Arc::new(|registry, store, progress| {
+            progress.set_stage("enrich");
+            progress.begin_phase(
+                "enrich_candidates",
+                Some(registry.candidate_contracts().len() as u64),
+            );
+            let mut map = AHashMap::new();
+            for &cid in registry.candidate_contracts() {
+                let c = &store.contracts[cid as usize];
+                let chain = store.chain_name(c.chain_id).to_owned();
+                map.insert(cid, EvidenceBundle::empty(cid, chain, c.address.clone()));
+                progress.add_completed(1);
+            }
+            Ok(map)
+        });
+
+        let base_config = || RunConfig {
+            inputs: vec![parquet.clone()],
+            seeds: seeds.clone(),
+            output_dir: out.clone(),
+            chains: vec!["ethereum".into(), "base".into(), "solana".into()],
+            evm_chains: vec!["ethereum".into(), "base".into()],
+            name_threshold: DEFAULT_NAME_THRESHOLD,
+            metadata_threshold: DEFAULT_METADATA_THRESHOLD,
+            metadata_anchors: 8,
+            rayon_threads: Some(2),
+            api_keys: ApiKeys::default(),
+            http_concurrency: 4,
+            paper: PaperConfig {
+                analysis_timestamp: 1_700_000_100,
+                ..PaperConfig::default()
+            },
+            enrich_override: Some(enrich.clone()),
+            dedup_cache_path: Some(cache_path.clone()),
+            reuse_dedup: false,
+        };
+
+        run(&base_config(), &analysis2_core::NoopProgress).expect("first run");
+        assert!(cache_path.is_file(), "dedup cache must be written");
+
+        let mut reuse = base_config();
+        reuse.reuse_dedup = true;
+        run(&reuse, &analysis2_core::NoopProgress).expect("reuse-dedup run");
+        assert!(out.join("summary.json").is_file());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -847,6 +1012,8 @@ mod tests {
                 http_concurrency: 4,
                 paper: PaperConfig::default(),
                 enrich_override: Some(enrich),
+                dedup_cache_path: None,
+                reuse_dedup: false,
             },
             &analysis2_core::NoopProgress,
         )

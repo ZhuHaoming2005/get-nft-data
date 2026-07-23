@@ -77,6 +77,17 @@ struct RunArgs {
     #[arg(long, default_value_t = 32)]
     http_concurrency: usize,
 
+    /// Path for durable dedup cache (default: `<output-dir>/dedup_cache.json`).
+    /// Written after dedup on `run`; used when `--reuse-dedup` is set.
+    #[arg(long)]
+    dedup_cache: Option<PathBuf>,
+
+    /// Skip URI/Name/Metadata queries; rematerialize hits from `--dedup-cache`
+    /// (or `<output-dir>/dedup_cache.json`). Still loads Parquet identity for
+    /// enrich/analyze. Params/seeds must match the cache.
+    #[arg(long, default_value_t = false)]
+    reuse_dedup: bool,
+
     /// Progress reporter mode.
     #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
     progress: ProgressMode,
@@ -196,6 +207,8 @@ fn run() -> Result<(), Analysis2Error> {
                     http_concurrency: args.http_concurrency,
                     paper: PaperConfig::default(),
                     enrich_override: None,
+                    dedup_cache_path: args.dedup_cache,
+                    reuse_dedup: args.reuse_dedup,
                 },
                 progress,
             )

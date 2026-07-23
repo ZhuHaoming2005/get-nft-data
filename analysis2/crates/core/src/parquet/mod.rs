@@ -22,11 +22,25 @@ pub use fixture::{
 pub use metadata::validated_metadata;
 
 /// Load-time chain filters and metadata anchor bound.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct LoadOptions {
     pub allowed_chains: AHashSet<String>,
     pub evm_chains: AHashSet<String>,
     pub metadata_anchors: usize,
+    /// When false, skip URI/Name/Metadata index build (identity + contract→NFT CSR only).
+    /// Used when replaying a dedup cache so load is much cheaper.
+    pub build_dedup_indexes: bool,
+}
+
+impl Default for LoadOptions {
+    fn default() -> Self {
+        Self {
+            allowed_chains: AHashSet::default(),
+            evm_chains: AHashSet::default(),
+            metadata_anchors: 8,
+            build_dedup_indexes: true,
+        }
+    }
 }
 
 impl LoadOptions {
@@ -39,6 +53,21 @@ impl LoadOptions {
             allowed_chains: normalize_chain_set(allowed_chains),
             evm_chains: normalize_chain_set(evm_chains),
             metadata_anchors,
+            build_dedup_indexes: true,
+        }
+    }
+
+    /// Identity-only load for `--reuse-dedup` (no Name/URI/Metadata indexes).
+    pub fn identity_only(
+        allowed_chains: impl IntoIterator<Item = String>,
+        evm_chains: impl IntoIterator<Item = String>,
+        metadata_anchors: usize,
+    ) -> Self {
+        Self {
+            allowed_chains: normalize_chain_set(allowed_chains),
+            evm_chains: normalize_chain_set(evm_chains),
+            metadata_anchors,
+            build_dedup_indexes: false,
         }
     }
 }
@@ -72,6 +101,14 @@ pub fn load_resident_store(
         return Err(Analysis2Error::invalid(
             "none of the requested --chains were present in the inputs",
         ));
+    }
+
+    if !options.build_dedup_indexes {
+        // Replay path: only contract→NFT CSR is required for candidate expansion.
+        progress.begin_phase("build_contract_nft_csr", Some(store.nfts.len() as u64));
+        store.rebuild_contract_nft_csr();
+        progress.add_completed(store.nfts.len() as u64);
+        return Ok(store);
     }
 
     progress.begin_phase("build_uri_csr", Some(store.nfts.len() as u64));

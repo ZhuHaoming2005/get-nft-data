@@ -161,6 +161,7 @@ async fn select_evm_chain(
     {
         Ok(items) => items,
         Err(error) => {
+            crate::enrich::print_provider_error("opensea", "select_seeds_top_collections", &error.to_string());
             return Ok((
                 Vec::new(),
                 incomplete_status(requested, 0, format!("opensea_error: {error}")),
@@ -204,6 +205,11 @@ async fn select_solana_chain(
     let collections = match magic_eden::fetch_popular_collections(client, me_base).await {
         Ok(items) => items,
         Err(error) => {
+            crate::enrich::print_provider_error(
+                "magic_eden",
+                "select_seeds_popular_collections",
+                &error.to_string(),
+            );
             return Ok((
                 Vec::new(),
                 incomplete_status(requested, 0, format!("magic_eden_error: {error}")),

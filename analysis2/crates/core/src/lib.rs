@@ -36,7 +36,10 @@ pub use error::Analysis2Error;
 pub use parquet::{LoadOptions, load_resident_store};
 pub use progress::{EwmaEta, NoopProgress, ProgressObserver};
 pub use reporting::{
-    DedupRunParams, FailureRecord, ScopeNftCounts, SeedDedupReport, SeedFullReport, SeedRecord,
+    build_dedup_cache, default_dedup_cache_path, load_dedup_cache, rematerialize_dedup_batch,
+    validate_dedup_cache, write_dedup_cache, CachedHitEdge, CachedSeedHits, DedupCacheFile,
+    DedupCacheParams, DedupRunParams, FailureRecord, ScopeNftCounts, SeedDedupReport,
+    SeedFullReport, SeedRecord, DEFAULT_DEDUP_CACHE_FILE, DEDUP_CACHE_VERSION,
     build_contract_nft_map, build_seed_analysis_rollup, build_seed_dedup_report,
     count_failed_seeds, count_scope_nfts, load_seeds_json, resolve_seed_contract,
     scopes_complete_for_seed, write_candidate_json, write_dedup_outputs, write_run_outputs,

@@ -1,4 +1,9 @@
-//! OpenSea top-collections ranking (necessary for EVM `select-seeds`).
+//! OpenSea helpers.
+//!
+//! Rate limit: all requests go through [`HttpClient::get_json_opensea`] which
+//! applies the `top_contract_analysis_rs` token-bucket strategy (burst 4,
+//! refill every 300 ms). Prefer Alchemy / Helius for enrichment; OpenSea is
+//! only for EVM `select-seeds` ranking and last-resort sales / EVM slug fallback.
 
 use serde_json::Value;
 
@@ -46,7 +51,7 @@ pub async fn fetch_top_contracts(
             url.push_str(&urlencoding_minimal(cursor));
         }
         let payload = client
-            .get_json(&url, &[("x-api-key", api_key)])
+            .get_json_opensea(&url, &[("x-api-key", api_key)])
             .await?;
         let page = parse_top_collections(chain, &payload);
         for item in page {
@@ -280,7 +285,10 @@ pub async fn fetch_contract_sales(
         base_url.trim_end_matches('/'),
         urlencoding_minimal(contract)
     );
-    let payload = match client.get_json(&url, &[("x-api-key", api_key)]).await {
+    let payload = match client
+        .get_json_opensea(&url, &[("x-api-key", api_key)])
+        .await
+    {
         Ok(v) => v,
         Err(e) => return FetchOutcome::failed("opensea", "opensea_sales", e),
     };
@@ -405,7 +413,7 @@ pub async fn fetch_contract_collection_slug(
         urlencoding_minimal(contract)
     );
     let payload = client
-        .get_json(&url, &[("x-api-key", api_key)])
+        .get_json_opensea(&url, &[("x-api-key", api_key)])
         .await
         .ok()?;
     if let Some(s) = payload.get("collection").and_then(Value::as_str) {
