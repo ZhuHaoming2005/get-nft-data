@@ -73,7 +73,10 @@ impl HttpClient {
                 .acquire()
                 .await
                 .map_err(|_| Analysis2Error::http("HTTP concurrency pool closed"))?;
-            let mut builder = self.http.request(method.clone(), url).headers(header_map.clone());
+            let mut builder = self
+                .http
+                .request(method.clone(), url)
+                .headers(header_map.clone());
             if let Some(body) = body {
                 builder = builder.json(body);
             }
@@ -86,12 +89,22 @@ impl HttpClient {
                 Ok(value) => return Ok(value),
                 Err(error) => {
                     let retryable = is_retryable(&error);
+                    let will_retry = attempt < self.retries && retryable;
+                    let backoff_ms =
+                        will_retry.then(|| 100u64.saturating_mul(1u64 << attempt.min(8)));
+                    print_request_error(
+                        &method,
+                        url,
+                        attempt + 1,
+                        self.retries + 1,
+                        backoff_ms,
+                        &error,
+                    );
                     last_error = Some(error);
-                    if attempt >= self.retries || !retryable {
+                    if !will_retry {
                         break;
                     }
-                    let backoff_ms = 100u64.saturating_mul(1u64 << attempt.min(8));
-                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    tokio::time::sleep(Duration::from_millis(backoff_ms.unwrap_or(0))).await;
                 }
             }
         }
@@ -133,9 +146,7 @@ async fn read_json_response(response: reqwest::Response) -> Result<Value, Analys
     if !status.is_success() {
         let body = String::from_utf8_lossy(&bytes);
         let snippet: String = body.chars().take(200).collect();
-        return Err(Analysis2Error::http(format!(
-            "HTTP {status}: {snippet}"
-        )));
+        return Err(Analysis2Error::http(format!("HTTP {status}: {snippet}")));
     }
     serde_json::from_slice(&bytes).map_err(|e| Analysis2Error::http(format!("invalid JSON: {e}")))
 }
@@ -154,5 +165,70 @@ fn is_retryable(error: &Analysis2Error) -> bool {
                 || lower.contains("http 504")
         }
         _ => false,
+    }
+}
+
+fn print_request_error(
+    method: &reqwest::Method,
+    url: &str,
+    attempt: usize,
+    max_attempts: usize,
+    backoff_ms: Option<u64>,
+    error: &Analysis2Error,
+) {
+    let host = endpoint_host(url);
+    let message = one_line_error(&error.to_string());
+    match backoff_ms {
+        Some(delay) => eprintln!(
+            "[api/error] host={host} method={method} attempt={attempt}/{max_attempts} \
+             action=retry backoff_ms={delay} error={message}"
+        ),
+        None => eprintln!(
+            "[api/error] host={host} method={method} attempt={attempt}/{max_attempts} \
+             action=continue error={message}"
+        ),
+    }
+}
+
+fn endpoint_host(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| {
+            let host = parsed.host_str()?;
+            Some(match parsed.port() {
+                Some(port) => format!("{host}:{port}"),
+                None => host.to_owned(),
+            })
+        })
+        .unwrap_or_else(|| "invalid-url".to_owned())
+}
+
+fn one_line_error(message: &str) -> String {
+    message
+        .chars()
+        .take(500)
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_log_label_never_contains_path_or_api_key() {
+        let url = "https://eth-mainnet.g.alchemy.com/v2/super-secret-key";
+        let label = endpoint_host(url);
+        assert_eq!(label, "eth-mainnet.g.alchemy.com");
+        assert!(!label.contains("super-secret-key"));
+    }
+
+    #[test]
+    fn error_log_message_is_single_line_and_bounded() {
+        let message = format!("first\nsecond\r\n{}", "x".repeat(600));
+        let sanitized = one_line_error(&message);
+        assert!(!sanitized.contains('\n'));
+        assert!(!sanitized.contains('\r'));
+        assert_eq!(sanitized.chars().count(), 500);
     }
 }

@@ -6,10 +6,8 @@
 //! Unbounded windows (no block numbers) are allowed but marked Truncated.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
 use ahash::AHashSet;
-use tokio::sync::Semaphore;
 
 use super::alchemy::{self, FetchOutcome, NativeTransfer};
 use super::http::HttpClient;
@@ -148,7 +146,6 @@ pub async fn fetch_evm_value_flows(
     controllers: &[String],
     transfers: &[TransferEvent],
     sales: &[SaleEvent],
-    concurrency: usize,
 ) -> FetchOutcome<Vec<ValueFlowEdge>> {
     let Some(api_key) = api_key else {
         return FetchOutcome::skipped("alchemy_value_flows");
@@ -170,7 +167,6 @@ pub async fn fetch_evm_value_flows(
     let (from_block, to_block) = window.unwrap_or((0, u64::MAX));
 
     let operator_set: AHashSet<String> = operators.iter().cloned().collect();
-    let sem = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut handles = Vec::new();
 
     for (idx, address) in operators.iter().cloned().enumerate() {
@@ -179,11 +175,9 @@ pub async fn fetch_evm_value_flows(
             let endpoints = endpoints.clone();
             let api_key = api_key.to_owned();
             let chain = chain.to_owned();
-            let sem = sem.clone();
             let address = address.clone();
             let dir = direction.to_owned();
             handles.push(tokio::spawn(async move {
-                let _permit = sem.acquire_owned().await.ok();
                 alchemy::fetch_external_transfers(
                     &client,
                     &endpoints,

@@ -5,11 +5,9 @@
 //! Compressed NFT / Bubblegum full parity is intentionally out of MVP scope.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
 
 use ahash::AHashMap;
 use serde_json::{json, Value};
-use tokio::sync::Semaphore;
 
 use crate::error::Analysis2Error;
 
@@ -287,78 +285,95 @@ pub async fn fetch_asset_histories(
         );
     }
     let url = with_api_key(rpc_url, api_key);
+    let selected: Vec<SolanaAsset> = assets.iter().take(max_assets.max(1)).cloned().collect();
+    let mut truncated = assets.len() > max_assets;
+
+    let mut handles = Vec::with_capacity(selected.len());
+    for asset in selected {
+        let client = client.clone();
+        let url = url.clone();
+        let max_sigs = max_sigs_per_asset.max(1);
+        handles.push(tokio::spawn(async move {
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": format!("sigs-{}", asset.mint),
+                "method": "getSignaturesForAsset",
+                "params": {
+                    "id": asset.mint,
+                    "page": 1,
+                    "limit": max_sigs
+                }
+            });
+            let payload = match client.post_json(&url, &[], &body).await {
+                Ok(v) => v,
+                Err(_) => return Err(()),
+            };
+            if payload.get("error").is_some() {
+                return Err(());
+            }
+            let items = payload
+                .get("result")
+                .and_then(|r| r.get("items"))
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let page_truncated = items.len() >= max_sigs;
+            let mut transfers = Vec::new();
+            let mut sales = Vec::new();
+            for item in items {
+                let (sig, event_type) = parse_signature_item(&item);
+                if sig.is_empty() {
+                    continue;
+                }
+                let kind = event_type.to_ascii_lowercase();
+                if kind.contains("sale") || kind.contains("buy") || kind.contains("list") {
+                    sales.push(SaleEvent {
+                        tx_hash: sig,
+                        token_id: asset.mint.clone(),
+                        seller: String::new(),
+                        buyer: String::new(),
+                        timestamp: None,
+                        block_number: None,
+                        marketplace: Some("helius".into()),
+                        native_amount: None,
+                        usd_amount: None,
+                        currency_symbol: Some("SOL".into()),
+                    });
+                } else {
+                    transfers.push(TransferEvent {
+                        tx_hash: sig,
+                        token_id: asset.mint.clone(),
+                        from: String::new(),
+                        to: asset.owner.clone().unwrap_or_default(),
+                        timestamp: None,
+                        block_number: None,
+                        is_mint: kind.contains("mint") || kind.contains("create"),
+                        gas_native: None,
+                        fee_payer: None,
+                        mint_payment_native: None,
+                        mint_payment_usd: None,
+                    });
+                }
+            }
+            Ok((transfers, sales, page_truncated))
+        }));
+    }
+
     let mut transfers = Vec::new();
     let mut sales = Vec::new();
-    let mut truncated = assets.len() > max_assets;
     let mut any_ok = false;
     let mut failures = 0usize;
-
-    for asset in assets.iter().take(max_assets.max(1)) {
-        let body = json!({
-            "jsonrpc": "2.0",
-            "id": format!("sigs-{}", asset.mint),
-            "method": "getSignaturesForAsset",
-            "params": {
-                "id": asset.mint,
-                "page": 1,
-                "limit": max_sigs_per_asset.max(1)
+    for handle in handles {
+        match handle.await {
+            Ok(Ok((mut t, mut s, page_truncated))) => {
+                any_ok = true;
+                if page_truncated {
+                    truncated = true;
+                }
+                transfers.append(&mut t);
+                sales.append(&mut s);
             }
-        });
-        let payload = match client.post_json(&url, &[], &body).await {
-            Ok(v) => v,
-            Err(_) => {
-                failures += 1;
-                continue;
-            }
-        };
-        if payload.get("error").is_some() {
-            failures += 1;
-            continue;
-        }
-        any_ok = true;
-        let items = payload
-            .get("result")
-            .and_then(|r| r.get("items"))
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        if items.len() >= max_sigs_per_asset {
-            truncated = true;
-        }
-        for item in items {
-            let (sig, event_type) = parse_signature_item(&item);
-            if sig.is_empty() {
-                continue;
-            }
-            let kind = event_type.to_ascii_lowercase();
-            if kind.contains("sale") || kind.contains("buy") || kind.contains("list") {
-                sales.push(SaleEvent {
-                    tx_hash: sig,
-                    token_id: asset.mint.clone(),
-                    seller: String::new(),
-                    buyer: String::new(),
-                    timestamp: None,
-                    block_number: None,
-                    marketplace: Some("helius".into()),
-                    native_amount: None,
-                    usd_amount: None,
-                    currency_symbol: Some("SOL".into()),
-                });
-            } else {
-                transfers.push(TransferEvent {
-                    tx_hash: sig,
-                    token_id: asset.mint.clone(),
-                    from: String::new(),
-                    to: asset.owner.clone().unwrap_or_default(),
-                    timestamp: None,
-                    block_number: None,
-                    is_mint: kind.contains("mint") || kind.contains("create"),
-                    gas_native: None,
-                    fee_payer: None,
-            mint_payment_native: None,
-            mint_payment_usd: None,
-                });
-            }
+            Ok(Err(())) | Err(_) => failures += 1,
         }
     }
 
@@ -422,7 +437,6 @@ pub async fn decode_and_attach_transactions(
     transfers: &mut [TransferEvent],
     sales: &mut [SaleEvent],
     controllers: &[String],
-    concurrency: usize,
 ) -> (
     FetchOutcome<()>,
     FetchOutcome<Vec<ValueFlowEdge>>,
@@ -480,14 +494,11 @@ pub async fn decode_and_attach_transactions(
     let signatures: Vec<String> = sig_mints.keys().cloned().collect();
     stats.requested = signatures.len();
 
-    let sem = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut handles = Vec::with_capacity(signatures.len());
     for (idx, signature) in signatures.iter().cloned().enumerate() {
         let client = client.clone();
         let url = url.clone();
-        let sem = sem.clone();
         handles.push(tokio::spawn(async move {
-            let _permit = sem.acquire_owned().await.ok();
             let body = json!({
                 "jsonrpc": "2.0",
                 "id": format!("tx-{idx}"),

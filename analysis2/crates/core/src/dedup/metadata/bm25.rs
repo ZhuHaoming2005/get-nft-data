@@ -263,7 +263,25 @@ pub fn similarity_at_least(
     right_terms: &[(u32, u32)],
     threshold: f64,
 ) -> ThresholdDecision {
-    similarity_at_least_impl(left, left_terms, right, right_terms, threshold, false)
+    similarity_at_least_impl(left, left_terms, right, right_terms, threshold, false).0
+}
+
+/// Like [`similarity_at_least`], but returns the exact cosine when the pair matches.
+///
+/// Avoids a second full shared-term scan on the hit path.
+pub fn similarity_score_if_at_least(
+    left: &PreparedDocument,
+    left_terms: &[(u32, u32)],
+    right: &PreparedDocument,
+    right_terms: &[(u32, u32)],
+    threshold: f64,
+) -> Option<f64> {
+    let (decision, score) =
+        similarity_at_least_impl(left, left_terms, right, right_terms, threshold, false);
+    if !decision.matched {
+        return None;
+    }
+    Some(score.unwrap_or_else(|| cosine_similarity(left, left_terms, right, right_terms)))
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -274,7 +292,7 @@ pub(crate) fn similarity_at_least_after_overlap_filter(
     right_terms: &[(u32, u32)],
     threshold: f64,
 ) -> ThresholdDecision {
-    similarity_at_least_impl(left, left_terms, right, right_terms, threshold, true)
+    similarity_at_least_impl(left, left_terms, right, right_terms, threshold, true).0
 }
 
 fn similarity_at_least_impl(
@@ -284,28 +302,37 @@ fn similarity_at_least_impl(
     right_terms: &[(u32, u32)],
     threshold: f64,
     overlap_filter_passed: bool,
-) -> ThresholdDecision {
+) -> (ThresholdDecision, Option<f64>) {
     if threshold <= 0.0 {
-        return ThresholdDecision {
-            matched: true,
-            zero_overlap_pruned: false,
-            upper_bound_pruned: false,
-        };
+        return (
+            ThresholdDecision {
+                matched: true,
+                zero_overlap_pruned: false,
+                upper_bound_pruned: false,
+            },
+            None,
+        );
     }
     if !overlap_filter_passed && !may_share_term(left, left_terms, right, right_terms) {
-        return ThresholdDecision {
-            matched: false,
-            zero_overlap_pruned: true,
-            upper_bound_pruned: false,
-        };
+        return (
+            ThresholdDecision {
+                matched: false,
+                zero_overlap_pruned: true,
+                upper_bound_pruned: false,
+            },
+            None,
+        );
     }
     let weights = PairWeights::new(left, right);
     if weights.initial_upper_bound_below_threshold(threshold) {
-        return ThresholdDecision {
-            matched: false,
-            zero_overlap_pruned: false,
-            upper_bound_pruned: true,
-        };
+        return (
+            ThresholdDecision {
+                matched: false,
+                zero_overlap_pruned: false,
+                upper_bound_pruned: true,
+            },
+            None,
+        );
     }
     if left_terms.len().saturating_mul(4) < right_terms.len()
         || right_terms.len().saturating_mul(4) < left_terms.len()
@@ -361,11 +388,14 @@ fn similarity_at_least_impl(
                     processed_right_norm,
                 )
             }) {
-                return ThresholdDecision {
-                    matched: false,
-                    zero_overlap_pruned: false,
-                    upper_bound_pruned: true,
-                };
+                return (
+                    ThresholdDecision {
+                        matched: false,
+                        zero_overlap_pruned: false,
+                        upper_bound_pruned: true,
+                    },
+                    None,
+                );
             }
         }
     }
@@ -717,20 +747,28 @@ fn decision_at_least(
     shared: SharedWeights,
     threshold: f64,
     upper_bound_pruned: bool,
-) -> ThresholdDecision {
+) -> (ThresholdDecision, Option<f64>) {
     let zero_overlap = shared.count == 0;
     if zero_overlap && threshold <= 0.0 {
-        return ThresholdDecision {
-            matched: true,
-            zero_overlap_pruned: false,
-            upper_bound_pruned: false,
-        };
+        return (
+            ThresholdDecision {
+                matched: true,
+                zero_overlap_pruned: false,
+                upper_bound_pruned: false,
+            },
+            Some(0.0),
+        );
     }
-    ThresholdDecision {
-        matched: weights.score_at_least(shared, threshold),
-        zero_overlap_pruned: zero_overlap && threshold > 0.0,
-        upper_bound_pruned,
-    }
+    let matched = weights.score_at_least(shared, threshold);
+    let score = matched.then(|| weights.score(shared));
+    (
+        ThresholdDecision {
+            matched,
+            zero_overlap_pruned: zero_overlap && threshold > 0.0,
+            upper_bound_pruned,
+        },
+        score,
+    )
 }
 
 #[cfg(test)]

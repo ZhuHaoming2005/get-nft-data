@@ -1,10 +1,7 @@
 //! Alchemy NFT / transfers / sales / prices / receipt-gas / native EXTERNAL clients.
 
-use std::sync::Arc;
-
 use ahash::AHashMap;
 use serde_json::{json, Value};
-use tokio::sync::Semaphore;
 
 use super::http::HttpClient;
 use super::types::{
@@ -722,7 +719,13 @@ pub fn collect_unique_tx_hashes(transfers: &[TransferEvent], sales: &[SaleEvent]
     set.into_iter().collect()
 }
 
+/// JSON-RPC batch size for `eth_getTransactionReceipt` (Alchemy supports arrays).
+const RECEIPT_RPC_BATCH_SIZE: usize = 80;
+
 /// Fetch `eth_getTransactionReceipt` for unique tx hashes; parse gas fee in native units.
+///
+/// Uses JSON-RPC batches gated only by [`HttpClient`] concurrency (no nested
+/// per-phase semaphore). Batch HTTP failures fall back to per-hash requests.
 ///
 /// Status: NotRequested (no key) / Empty (no txs) / Complete (all ok) /
 /// Truncated (partial) / Failed (all fail).
@@ -732,7 +735,6 @@ pub async fn fetch_receipt_gas(
     api_key: Option<&str>,
     chain: &str,
     tx_hashes: &[String],
-    concurrency: usize,
 ) -> FetchOutcome<AHashMap<String, ReceiptGas>> {
     let Some(api_key) = api_key else {
         return FetchOutcome::skipped("alchemy_receipts");
@@ -754,34 +756,13 @@ pub async fn fetch_receipt_gas(
         );
     };
 
-    let sem = Arc::new(Semaphore::new(concurrency.max(1)));
-    let mut handles = Vec::with_capacity(tx_hashes.len());
-    for (idx, hash) in tx_hashes.iter().cloned().enumerate() {
+    let mut handles = Vec::new();
+    for (batch_idx, chunk) in tx_hashes.chunks(RECEIPT_RPC_BATCH_SIZE).enumerate() {
         let client = client.clone();
         let rpc = rpc.clone();
-        let sem = sem.clone();
+        let hashes: Vec<String> = chunk.to_vec();
         handles.push(tokio::spawn(async move {
-            let _permit = sem.acquire_owned().await.ok();
-            let body = json!({
-                "jsonrpc": "2.0",
-                "id": format!("receipt-{idx}"),
-                "method": "eth_getTransactionReceipt",
-                "params": [hash]
-            });
-            let payload = match client.post_json(&rpc, &[], &body).await {
-                Ok(v) => v,
-                Err(e) => return Err((hash, e.to_string())),
-            };
-            if let Some(error) = payload.get("error") {
-                return Err((hash, error.to_string()));
-            }
-            let Some(result) = payload.get("result").filter(|v| !v.is_null()) else {
-                return Err((hash, "null receipt result".into()));
-            };
-            match parse_receipt_gas(result) {
-                Some(info) if info.gas_native.is_some() => Ok((hash, info)),
-                Some(_) | None => Err((hash, "missing gasUsed/effectiveGasPrice".into())),
-            }
+            fetch_receipt_gas_batch(&client, &rpc, batch_idx, &hashes).await
         }));
     }
 
@@ -789,15 +770,17 @@ pub async fn fetch_receipt_gas(
     let mut failures = Vec::new();
     for handle in handles {
         match handle.await {
-            Ok(Ok((hash, info))) => {
-                ok.insert(hash, info);
+            Ok(batch_rows) => {
+                for (hash, result) in batch_rows {
+                    match result {
+                        Ok(info) => {
+                            ok.insert(hash, info);
+                        }
+                        Err(err) => failures.push(format!("{hash}: {err}")),
+                    }
+                }
             }
-            Ok(Err((hash, err))) => {
-                failures.push(format!("{hash}: {err}"));
-            }
-            Err(e) => {
-                failures.push(format!("receipt task join failed: {e}"));
-            }
+            Err(e) => failures.push(format!("receipt batch join failed: {e}")),
         }
     }
 
@@ -822,6 +805,126 @@ pub async fn fetch_receipt_gas(
         ));
     }
     outcome
+}
+
+async fn fetch_receipt_gas_batch(
+    client: &HttpClient,
+    rpc: &str,
+    batch_idx: usize,
+    hashes: &[String],
+) -> Vec<(String, Result<ReceiptGas, String>)> {
+    if hashes.is_empty() {
+        return Vec::new();
+    }
+    let body = Value::Array(
+        hashes
+            .iter()
+            .enumerate()
+            .map(|(i, hash)| {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": format!("receipt-{batch_idx}-{i}"),
+                    "method": "eth_getTransactionReceipt",
+                    "params": [hash]
+                })
+            })
+            .collect(),
+    );
+
+    match client.post_json(rpc, &[], &body).await {
+        Ok(payload) => match parse_receipt_batch_payload(&payload, batch_idx, hashes) {
+            Ok(rows) => rows,
+            Err(_) => fetch_receipt_gas_singles(client, rpc, batch_idx, hashes).await,
+        },
+        Err(_) => fetch_receipt_gas_singles(client, rpc, batch_idx, hashes).await,
+    }
+}
+
+fn parse_receipt_batch_payload(
+    payload: &Value,
+    batch_idx: usize,
+    hashes: &[String],
+) -> Result<Vec<(String, Result<ReceiptGas, String>)>, ()> {
+    let responses = payload.as_array().ok_or(())?;
+    let mut by_id: AHashMap<String, &Value> = AHashMap::with_capacity(responses.len());
+    for response in responses {
+        let id = match response.get("id") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Number(n)) => n.to_string(),
+            _ => continue,
+        };
+        by_id.insert(id, response);
+    }
+    if by_id.is_empty() && responses.len() == hashes.len() {
+        return Ok(hashes
+            .iter()
+            .zip(responses.iter())
+            .map(|(hash, response)| (hash.clone(), receipt_from_rpc_response(response)))
+            .collect());
+    }
+    let mut out = Vec::with_capacity(hashes.len());
+    for (i, hash) in hashes.iter().enumerate() {
+        let id = format!("receipt-{batch_idx}-{i}");
+        match by_id.get(&id) {
+            Some(response) => out.push((hash.clone(), receipt_from_rpc_response(response))),
+            None => {
+                // Positional fallback when the provider rewrites ids.
+                if let Some(response) = responses.get(i) {
+                    out.push((hash.clone(), receipt_from_rpc_response(response)));
+                } else {
+                    out.push((hash.clone(), Err("missing batch response".into())));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn receipt_from_rpc_response(response: &Value) -> Result<ReceiptGas, String> {
+    if let Some(error) = response.get("error") {
+        return Err(error.to_string());
+    }
+    let Some(result) = response.get("result").filter(|v| !v.is_null()) else {
+        return Err("null receipt result".into());
+    };
+    match parse_receipt_gas(result) {
+        Some(info) if info.gas_native.is_some() => Ok(info),
+        Some(_) | None => Err("missing gasUsed/effectiveGasPrice".into()),
+    }
+}
+
+async fn fetch_receipt_gas_singles(
+    client: &HttpClient,
+    rpc: &str,
+    batch_idx: usize,
+    hashes: &[String],
+) -> Vec<(String, Result<ReceiptGas, String>)> {
+    let mut handles = Vec::with_capacity(hashes.len());
+    for (i, hash) in hashes.iter().cloned().enumerate() {
+        let client = client.clone();
+        let rpc = rpc.to_owned();
+        handles.push(tokio::spawn(async move {
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": format!("receipt-{batch_idx}-{i}"),
+                "method": "eth_getTransactionReceipt",
+                "params": [hash]
+            });
+            let payload = match client.post_json(&rpc, &[], &body).await {
+                Ok(v) => v,
+                Err(e) => return (hash, Err(e.to_string())),
+            };
+            (hash, receipt_from_rpc_response(&payload))
+        }));
+    }
+    let mut out = Vec::with_capacity(handles.len());
+    for handle in handles {
+        match handle.await {
+            Ok(row) => out.push(row),
+            Err(e) => out.push((String::new(), Err(format!("receipt task join failed: {e}")))),
+        }
+    }
+    out
 }
 
 /// Attach receipt gas / fee_payer onto matching transfers (by lowercase tx hash).

@@ -441,7 +441,10 @@ pub fn query_name_for_seed_with_scratch(
     progress.begin_phase("name_query", Some(scratch.query_ids.len() as u64));
     scratch.emitted.clear();
 
-    if scratch.query_ids.len() > PARALLEL_NAME_QUERY_CHUNK && rayon::current_num_threads() > 1 {
+    if scratch.query_ids.len() > PARALLEL_NAME_QUERY_CHUNK
+        && crate::dedup::inner_query_parallel_allowed()
+        && rayon::current_num_threads() > 1
+    {
         let chunk_graphs = scratch
             .query_ids
             .par_chunks(PARALLEL_NAME_QUERY_CHUNK)

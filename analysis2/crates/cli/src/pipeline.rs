@@ -128,6 +128,10 @@ where
         .collect::<Vec<_>>();
     progress.begin_phase(phase, Some(active.len() as u64));
 
+    // When seed parallelism already saturates the Rayon pool, nested query
+    // `par_chunks` only adds work-stealing jitter.
+    let allow_inner = active.len() < rayon::current_num_threads();
+    analysis2_core::set_inner_query_parallel(allow_inner);
     let outcomes = active
         .par_iter()
         .map_init(init, |scratch, &state_index| {
@@ -144,7 +148,9 @@ where
         })
         .collect::<Vec<_>>()
         .into_iter()
-        .collect::<Result<Vec<_>, Analysis2Error>>()?;
+        .collect::<Result<Vec<_>, Analysis2Error>>();
+    analysis2_core::set_inner_query_parallel(true);
+    let outcomes = outcomes?;
 
     for (state_index, outcome) in outcomes {
         let state = &mut states[state_index];
@@ -395,11 +401,15 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                 if let Err(e) = progress.check_cancelled() {
                     return Err((chain, address, e));
                 }
-                let bundle = evidence
-                    .get(&cid)
-                    .cloned()
-                    .unwrap_or_else(|| EvidenceBundle::empty(cid, chain.clone(), address.clone()));
-                let analysis = match analyze_candidate(&store, cid, &bundle, &paper) {
+                let empty;
+                let bundle = match evidence.get(&cid) {
+                    Some(bundle) => bundle,
+                    None => {
+                        empty = EvidenceBundle::empty(cid, chain.clone(), address.clone());
+                        &empty
+                    }
+                };
+                let analysis = match analyze_candidate(&store, cid, bundle, &paper) {
                     Ok(a) => a,
                     Err(e) => return Err((chain, address, e)),
                 };
@@ -413,12 +423,10 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
             .collect();
 
     let mut analyses_map: AHashMap<ContractId, CandidateAnalysis> = AHashMap::new();
-    let mut analyses_list: Vec<CandidateAnalysis> = Vec::new();
     for result in analyze_results {
         match result {
             Ok(analysis) => {
-                analyses_map.insert(analysis.contract_id, analysis.clone());
-                analyses_list.push(analysis);
+                analyses_map.insert(analysis.contract_id, analysis);
             }
             Err((_, _, Analysis2Error::Cancelled)) => return Err(Analysis2Error::Cancelled),
             Err((chain, address, e)) => {
@@ -469,6 +477,8 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
     let analyzed: Vec<Result<(SeedRecord, SeedFullReport), FailureRecord>> =
         reports.into_iter().map(Ok).collect();
     // Failed resolve/dedup seeds are recorded only in `failures` (extra_failures).
+
+    let analyses_list: Vec<CandidateAnalysis> = analyses_map.into_values().collect();
 
     progress.begin_phase("write", Some(1));
     let params = DedupRunParams {

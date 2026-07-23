@@ -20,6 +20,7 @@ pub use dedup::{
     SeedCandidateRelation, UriQueryScratch, finalize_metadata_index, finalize_name_index,
     query_metadata_for_seed, query_metadata_for_seed_with_scratch, query_name_for_seed,
     query_name_for_seed_with_scratch, query_uri_for_seed, query_uri_for_seed_with_scratch,
+    set_inner_query_parallel,
 };
 pub use enrich::{
     ApiKeys, EvidenceBundle, EvidenceObservation, EvidenceQuality, EvidenceStatus, HolderRecord,

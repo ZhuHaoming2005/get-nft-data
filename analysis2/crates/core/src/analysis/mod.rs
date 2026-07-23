@@ -95,6 +95,27 @@ pub fn analyze_candidate(
         .iter()
         .map(|(k, v)| (k.clone(), legit::classify(v)))
         .collect();
+    let fully_legit = !legit_by_seed.is_empty()
+        && legit_by_seed
+            .values()
+            .all(|relation| relation.is_legit_duplicate);
+    if fully_legit {
+        return Ok(CandidateAnalysis {
+            contract_id: contract,
+            chain: store.chain_name(contract_row.chain_id).to_owned(),
+            address: contract_row.address.clone(),
+            legit,
+            legit_by_seed,
+            attribution: Vec::new(),
+            lifecycle: LifecycleFacts::default(),
+            value_flow: ValueFlowFacts::default(),
+            behaviors: BehaviorFacts::default(),
+            behavior_instances: Vec::new(),
+            economics: EconomicFacts::default(),
+            economics_quality: EconomicsQuality::default(),
+            analysis_timestamp: cfg.analysis_timestamp,
+        });
+    }
     let transfer_graph = graph::AddressGraph::from_transfers(&evidence.transfers);
     let event_work = evidence
         .transfers

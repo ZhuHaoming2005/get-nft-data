@@ -1,16 +1,14 @@
 //! Enrichment orchestrator: one fetch per unique candidate contract.
 
-use std::sync::Arc;
-
 use ahash::AHashMap;
-use tokio::sync::Semaphore;
+use futures_util::{StreamExt, stream};
 
 use crate::dedup::candidates::CandidateRegistry;
 use crate::entity::{ContractId, ResidentStore};
 use crate::error::Analysis2Error;
 use crate::progress::ProgressObserver;
 
-use super::alchemy::{self, sales_need_opensea_fallback, FetchOutcome};
+use super::alchemy::{self, FetchOutcome, sales_need_opensea_fallback};
 use super::controllers;
 use super::etherscan;
 use super::helius::{self, holders_from_assets};
@@ -19,10 +17,13 @@ use super::legit_detect;
 use super::mint_payment;
 use super::opensea;
 use super::types::{
-    day_bucket, finalize_legit_signals, ApiKeys, EvidenceBundle, EvidenceStatus, HttpLimits,
-    SaleEvent, TransferEvent,
+    ApiKeys, EvidenceBundle, EvidenceStatus, HttpLimits, SaleEvent, TransferEvent, day_bucket,
+    finalize_legit_signals,
 };
 use super::value_flow;
+
+/// Candidate tasks may exceed HTTP slots so waiters pipeline behind [`HttpClient`].
+const CANDIDATE_TASK_MULTIPLIER: usize = 4;
 
 /// Enrich each unique candidate once; missing keys → `not_requested`, continue.
 pub async fn enrich_candidates(
@@ -32,21 +33,25 @@ pub async fn enrich_candidates(
     limits: &HttpLimits,
     progress: &dyn ProgressObserver,
 ) -> Result<AHashMap<ContractId, EvidenceBundle>, Analysis2Error> {
+    let client = HttpClient::with_retries(limits.concurrency.max(1), limits.retries)?;
+    progress.set_stage("enrich_legit");
+    let preflight =
+        legit_detect::prefilter_candidates(registry, store, &client, keys, limits, progress)
+            .await?;
+    let candidates = preflight.candidates_to_enrich;
+    let mut out = preflight.evidence;
+
     progress.set_stage("enrich");
-    let candidates = registry.candidate_contracts();
     progress.begin_phase("enrich_candidates", Some(candidates.len() as u64));
 
-    let client = HttpClient::with_retries(limits.concurrency.max(1), limits.retries)?;
-    let semaphore = Arc::new(Semaphore::new(limits.concurrency.max(1)));
-    let mut handles = Vec::with_capacity(candidates.len());
+    // Single HTTP gate lives in HttpClient. Candidate tasks are scheduled with a
+    // higher slot count so they do not hold an outer permit across nested RPCs.
+    let task_slots = limits
+        .concurrency
+        .max(1)
+        .saturating_mul(CANDIDATE_TASK_MULTIPLIER);
 
-    for &contract_id in candidates {
-        progress.check_cancelled()?;
-        let permit = semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| Analysis2Error::http("enrich concurrency pool closed"))?;
+    let mut stream = stream::iter(candidates.iter().copied().map(|contract_id| {
         let client = client.clone();
         let keys = keys.clone();
         let limits = limits.clone();
@@ -55,37 +60,27 @@ pub async fn enrich_candidates(
             .to_owned();
         let address = store.contracts[contract_id as usize].address.clone();
         let is_evm = store.is_evm_chain(&chain);
-
-        handles.push(tokio::spawn(async move {
-            let _permit = permit;
+        async move {
             let bundle = if is_evm {
                 enrich_evm(contract_id, &chain, &address, &client, &keys, &limits).await
             } else {
                 enrich_solana(contract_id, &chain, &address, &client, &keys, &limits).await
             };
             (contract_id, bundle)
-        }));
-    }
-
-    let mut out = AHashMap::with_capacity(candidates.len());
-    for handle in handles {
-        progress.check_cancelled()?;
-        match handle.await {
-            Ok((contract_id, bundle)) => {
-                out.insert(contract_id, bundle);
-                progress.add_completed(1);
-            }
-            Err(e) => {
-                return Err(Analysis2Error::http(format!(
-                    "enrich task join failed: {e}"
-                )));
-            }
         }
-    }
+    }))
+    .buffer_unordered(task_slots);
 
-    // Relation-level legit after all candidate bundles exist (needs seed caches).
-    progress.set_stage("enrich_legit");
-    legit_detect::attach_relation_legit(&mut out, registry, store, &client, keys, limits).await;
+    while let Some((contract_id, mut bundle)) = stream.next().await {
+        progress.check_cancelled()?;
+        if let Some(preflight) = out.get_mut(&contract_id) {
+            bundle.relation_legit = std::mem::take(&mut preflight.relation_legit);
+            bundle.legit = std::mem::take(&mut preflight.legit);
+        }
+        finalize_legit_signals(&mut bundle);
+        out.insert(contract_id, bundle);
+        progress.add_completed(1);
+    }
 
     Ok(out)
 }
@@ -242,7 +237,6 @@ async fn enrich_evm(
         keys.alchemy(),
         chain,
         &tx_hashes,
-        limits.concurrency,
     )
     .await;
     alchemy::attach_receipt_gas(&mut bundle.transfers, &gas.value);
@@ -271,7 +265,6 @@ async fn enrich_evm(
         &bundle.controllers,
         &bundle.transfers,
         &bundle.sales,
-        limits.concurrency,
     )
     .await;
     apply_outcome(
@@ -365,7 +358,6 @@ async fn enrich_solana(
         &mut transfers,
         &mut sales,
         &bundle.controllers,
-        limits.concurrency,
     )
     .await;
 
@@ -535,19 +527,31 @@ async fn collect_evm_mint_payment_extras(
     payers.sort();
     payers.truncate(MAX_MINT_PAYER_PROBES);
 
+    let mut handles = Vec::with_capacity(payers.len());
     for (idx, payer) in payers.into_iter().enumerate() {
-        let outcome = alchemy::fetch_external_transfers(
-            client,
-            &limits.endpoints,
-            keys.alchemy(),
-            chain,
-            &payer,
-            "from",
-            from_block,
-            to_block,
-            idx,
-        )
-        .await;
+        let client = client.clone();
+        let endpoints = limits.endpoints.clone();
+        let api_key = keys.alchemy().map(str::to_owned);
+        let chain = chain.to_owned();
+        handles.push(tokio::spawn(async move {
+            alchemy::fetch_external_transfers(
+                &client,
+                &endpoints,
+                api_key.as_deref(),
+                &chain,
+                &payer,
+                "from",
+                from_block,
+                to_block,
+                idx,
+            )
+            .await
+        }));
+    }
+    for handle in handles {
+        let Ok(outcome) = handle.await else {
+            continue;
+        };
         for row in outcome.value {
             let tx = row.tx_hash.trim().to_ascii_lowercase();
             if !mint_txs.contains(&tx) {
@@ -635,6 +639,7 @@ mod tests {
     use ahash::AHashSet;
     use httpmock::prelude::*;
     use serde_json::json;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::dedup::hits::{Dimension, HitEdge, HitGraph};
@@ -644,17 +649,28 @@ mod tests {
     use crate::progress::NoopProgress;
 
     #[derive(Default)]
-    struct FinishCountingProgress(AtomicUsize);
+    struct RecordingProgress {
+        completed: AtomicUsize,
+        finishes: AtomicUsize,
+        stages: Mutex<Vec<String>>,
+        phases: Mutex<Vec<String>>,
+    }
 
-    impl ProgressObserver for FinishCountingProgress {
-        fn set_stage(&self, _stage: &str) {}
-        fn begin_phase(&self, _phase: &str, _total: Option<u64>) {}
-        fn add_completed(&self, _n: u64) {}
+    impl ProgressObserver for RecordingProgress {
+        fn set_stage(&self, stage: &str) {
+            self.stages.lock().unwrap().push(stage.to_owned());
+        }
+        fn begin_phase(&self, phase: &str, _total: Option<u64>) {
+            self.phases.lock().unwrap().push(phase.to_owned());
+        }
+        fn add_completed(&self, n: u64) {
+            self.completed.fetch_add(n as usize, Ordering::Relaxed);
+        }
         fn check_cancelled(&self) -> Result<(), Analysis2Error> {
             Ok(())
         }
         fn finish(&self) {
-            self.0.fetch_add(1, Ordering::Relaxed);
+            self.finishes.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -736,14 +752,33 @@ mod tests {
             ..HttpLimits::default()
         };
         let keys = ApiKeys::default();
-        let progress = FinishCountingProgress::default();
+        let progress = RecordingProgress::default();
         let map = enrich_candidates(&registry, &store, &keys, &limits, &progress)
             .await
             .unwrap();
         assert_eq!(
-            progress.0.load(Ordering::Relaxed),
+            progress.finishes.load(Ordering::Relaxed),
             0,
             "an enrichment subroutine must not stop the caller-owned progress reporter"
+        );
+        assert_eq!(
+            progress.completed.load(Ordering::Relaxed),
+            4,
+            "seed, candidate identity, relation, and full enrichment must each advance progress"
+        );
+        assert_eq!(
+            *progress.stages.lock().unwrap(),
+            ["enrich_legit", "enrich"],
+            "legit filtering must run before full candidate enrichment"
+        );
+        assert_eq!(
+            *progress.phases.lock().unwrap(),
+            [
+                "seed_caches",
+                "candidate_identity",
+                "relations",
+                "enrich_candidates"
+            ]
         );
         let bundle = map.get(&cand).unwrap();
         assert_eq!(bundle.quality.transfers, EvidenceStatus::NotRequested);
@@ -781,9 +816,8 @@ mod tests {
             })
             .await;
 
-        let (store, seed, cand) =
+        let (store, _seed, cand) =
             store_with_candidate("ethereum", "0x1111111111111111111111111111111111111111");
-        let registry = registry_one(seed, cand);
         let limits = HttpLimits {
             concurrency: 2,
             retries: 0,
@@ -795,10 +829,17 @@ mod tests {
             opensea: None,
             ..ApiKeys::default()
         };
-        let map = enrich_candidates(&registry, &store, &keys, &limits, &NoopProgress)
-            .await
-            .unwrap();
-        let bundle = map.get(&cand).unwrap();
+        let client = HttpClient::with_retries(limits.concurrency, limits.retries).unwrap();
+        let contract = &store.contracts[cand as usize];
+        let bundle = enrich_evm(
+            cand,
+            "ethereum",
+            &contract.address,
+            &client,
+            &keys,
+            &limits,
+        )
+        .await;
         assert_eq!(bundle.quality.transfers, EvidenceStatus::Empty);
         assert_eq!(bundle.quality.holders, EvidenceStatus::Empty);
         assert_eq!(bundle.quality.sales, EvidenceStatus::Empty);
@@ -876,10 +917,17 @@ mod tests {
             alchemy: Some("key".into()),
             ..ApiKeys::default()
         };
-        let map = enrich_candidates(&registry, &store, &keys, &limits, &NoopProgress)
-            .await
-            .unwrap();
-        let bundle = map.get(&cand).unwrap();
+        let client = HttpClient::with_retries(limits.concurrency, limits.retries).unwrap();
+        let contract = &store.contracts[cand as usize];
+        let bundle = enrich_evm(
+            cand,
+            "ethereum",
+            &contract.address,
+            &client,
+            &keys,
+            &limits,
+        )
+        .await;
         assert!(
             bundle
                 .controllers
@@ -900,6 +948,17 @@ mod tests {
             .provenance
             .iter()
             .any(|o| o.request_key == "contract_controllers"));
+
+        let gated = enrich_candidates(&registry, &store, &keys, &limits, &NoopProgress)
+            .await
+            .unwrap();
+        let gated_bundle = gated.get(&cand).unwrap();
+        assert!(gated_bundle.legit.official_controller_continuity);
+        assert_eq!(
+            gated_bundle.quality.transfers,
+            EvidenceStatus::NotRequested,
+            "a fully legitimate candidate must not enter full enrichment"
+        );
     }
 
     #[tokio::test]
@@ -948,9 +1007,8 @@ mod tests {
             })
             .await;
 
-        let (store, seed, cand) =
+        let (store, _seed, cand) =
             store_with_candidate("ethereum", "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        let registry = registry_one(seed, cand);
         let limits = HttpLimits {
             concurrency: 2,
             retries: 0,
@@ -962,10 +1020,17 @@ mod tests {
             etherscan: Some("esk".into()),
             ..ApiKeys::default()
         };
-        let map = enrich_candidates(&registry, &store, &keys, &limits, &NoopProgress)
-            .await
-            .unwrap();
-        let bundle = map.get(&cand).unwrap();
+        let client = HttpClient::with_retries(limits.concurrency, limits.retries).unwrap();
+        let contract = &store.contracts[cand as usize];
+        let bundle = enrich_evm(
+            cand,
+            "ethereum",
+            &contract.address,
+            &client,
+            &keys,
+            &limits,
+        )
+        .await;
         assert_eq!(bundle.quality.transfers, EvidenceStatus::Complete);
         assert_eq!(bundle.transfers.len(), 1);
         assert_eq!(bundle.transfers[0].token_id, "7");
@@ -1918,9 +1983,8 @@ mod tests {
             })
             .await;
 
-        let (store, seed, cand) =
+        let (store, _seed, cand) =
             store_with_candidate("ethereum", "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        let registry = registry_one(seed, cand);
         let limits = HttpLimits {
             concurrency: 2,
             retries: 0,
@@ -1931,10 +1995,17 @@ mod tests {
             alchemy: Some("key".into()),
             ..ApiKeys::default()
         };
-        let map = enrich_candidates(&registry, &store, &keys, &limits, &NoopProgress)
-            .await
-            .unwrap();
-        let bundle = map.get(&cand).unwrap();
+        let client = HttpClient::with_retries(limits.concurrency, limits.retries).unwrap();
+        let contract = &store.contracts[cand as usize];
+        let bundle = enrich_evm(
+            cand,
+            "ethereum",
+            &contract.address,
+            &client,
+            &keys,
+            &limits,
+        )
+        .await;
         assert_eq!(bundle.quality.gas, EvidenceStatus::Truncated);
         let good = bundle
             .transfers

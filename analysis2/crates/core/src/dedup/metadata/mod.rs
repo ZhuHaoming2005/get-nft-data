@@ -10,7 +10,10 @@ mod align;
 mod bm25;
 
 pub use align::{AnchorRef, select_documents};
-pub use bm25::{PreparedDocument, ThresholdDecision, cosine_similarity, similarity_at_least};
+pub use bm25::{
+    PreparedDocument, ThresholdDecision, cosine_similarity, similarity_at_least,
+    similarity_score_if_at_least,
+};
 
 use ahash::{AHashMap, AHashSet};
 use rayon::prelude::*;
@@ -72,12 +75,7 @@ impl MetadataSeedQuery<'_> {
             let right = &self.index.documents[right_doc as usize];
             let left_terms = self.index.document_terms(left_doc);
             let right_terms = self.index.document_terms(right_doc);
-            let decision =
-                similarity_at_least(left, left_terms, right, right_terms, self.threshold);
-            if !decision.matched {
-                return None;
-            }
-            cosine_similarity(left, left_terms, right, right_terms)
+            similarity_score_if_at_least(left, left_terms, right, right_terms, self.threshold)?
         };
         Some(HitEdge {
             seed_contract: self.seed,
@@ -504,7 +502,9 @@ pub fn query_metadata_for_seed_with_scratch(
         threshold,
     };
 
-    if scratch.output.len() > PARALLEL_METADATA_CANDIDATE_CHUNK && rayon::current_num_threads() > 1
+    if scratch.output.len() > PARALLEL_METADATA_CANDIDATE_CHUNK
+        && crate::dedup::inner_query_parallel_allowed()
+        && rayon::current_num_threads() > 1
     {
         let chunks = scratch
             .output

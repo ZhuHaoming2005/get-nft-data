@@ -96,7 +96,10 @@ pub fn query_uri_for_seed_with_scratch(
     let mut token_queries: Vec<_> = scratch.token_queries.drain().collect();
     token_queries.sort_unstable_by_key(|(uri_id, _)| *uri_id);
     progress.begin_phase("token_uri", Some(seed_nfts.len() as u64));
-    if token_queries.len() > PARALLEL_URI_QUERY_CHUNK && rayon::current_num_threads() > 1 {
+    if token_queries.len() > PARALLEL_URI_QUERY_CHUNK
+        && crate::dedup::inner_query_parallel_allowed()
+        && rayon::current_num_threads() > 1
+    {
         let chunks = token_queries
             .par_chunks(PARALLEL_URI_QUERY_CHUNK)
             .map(|queries| {
@@ -186,7 +189,10 @@ pub fn query_uri_for_seed_with_scratch(
     let image_missing = seed_nfts
         .len()
         .saturating_sub(image_queries.iter().map(|(_, nfts)| nfts.len()).sum());
-    if image_queries.len() > PARALLEL_URI_QUERY_CHUNK && rayon::current_num_threads() > 1 {
+    if image_queries.len() > PARALLEL_URI_QUERY_CHUNK
+        && crate::dedup::inner_query_parallel_allowed()
+        && rayon::current_num_threads() > 1
+    {
         let chunks = image_queries
             .par_chunks(PARALLEL_URI_QUERY_CHUNK)
             .map(|queries| {
