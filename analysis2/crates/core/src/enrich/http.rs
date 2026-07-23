@@ -207,8 +207,15 @@ impl HttpClient {
                 Err(error) => {
                     let retryable = is_retryable(&error);
                     let will_retry = attempt < self.retries && retryable;
-                    let backoff_ms =
-                        will_retry.then(|| 100u64.saturating_mul(1u64 << attempt.min(8)));
+                    // 429: fixed 1s cool-down before retry (providers ask for space).
+                    // Other retryable errors keep exponential backoff from 100ms.
+                    let backoff_ms = will_retry.then(|| {
+                        if is_http_status(&error, 429) {
+                            1_000
+                        } else {
+                            100u64.saturating_mul(1u64 << attempt.min(8))
+                        }
+                    });
                     print_request_error(
                         &method,
                         &endpoint,
@@ -353,6 +360,17 @@ fn is_retryable(error: &Analysis2Error) -> bool {
                 || lower.contains("http 502")
                 || lower.contains("http 503")
                 || lower.contains("http 504")
+        }
+        _ => false,
+    }
+}
+
+/// True when the HTTP error message reports the given status (e.g. 429).
+fn is_http_status(error: &Analysis2Error, status: u16) -> bool {
+    match error {
+        Analysis2Error::Http(message) => {
+            let needle = format!("http {status}");
+            message.to_ascii_lowercase().contains(&needle)
         }
         _ => false,
     }
@@ -603,5 +621,15 @@ mod tests {
         let rps = 1000.0 / HELIUS_RATE_LIMIT_REFILL_MS as f64;
         assert!((rps - 1000.0 / 200.0).abs() < 1e-9);
         assert!(rps > 4.5 && rps < 5.5);
+    }
+
+    #[test]
+    fn http_429_is_detected_for_fixed_backoff() {
+        let err = Analysis2Error::http(
+            "HTTP 429 endpoint=example.com/ path content_type=application/json body=rate limited",
+        );
+        assert!(is_http_status(&err, 429));
+        assert!(is_retryable(&err));
+        assert!(!is_http_status(&err, 500));
     }
 }
