@@ -102,6 +102,7 @@ impl PreparedDocument {
         Ok(PreparedDocumentParts { document, terms })
     }
 
+    #[cfg(test)]
     pub(crate) fn try_new_into<'a, E>(
         canonical: &'a str,
         mut intern: impl FnMut(&'a str) -> Result<u32, E>,
@@ -109,30 +110,10 @@ impl PreparedDocument {
         terms: &mut Vec<(u32, u32)>,
     ) -> Result<Self, E> {
         scratch.clear();
-        if canonical.is_ascii() {
-            let bytes = canonical.as_bytes();
-            let mut start = 0;
-            while start < bytes.len() {
-                while start < bytes.len() && !bytes[start].is_ascii_alphanumeric() {
-                    start += 1;
-                }
-                let mut end = start;
-                while end < bytes.len() && bytes[end].is_ascii_alphanumeric() {
-                    end += 1;
-                }
-                if start < end {
-                    scratch.push(intern(&canonical[start..end])?);
-                }
-                start = end;
-            }
-        } else {
-            for token in canonical
-                .split(|character: char| !character.is_alphanumeric())
-                .filter(|token| !token.is_empty())
-            {
-                scratch.push(intern(token)?);
-            }
-        }
+        visit_tokens(canonical, |token| {
+            scratch.push(intern(token)?);
+            Ok(())
+        })?;
         scratch.sort_unstable();
         let length = scratch.len() as u32;
         let term_start = terms.len();
@@ -160,6 +141,24 @@ impl PreparedDocument {
         })
     }
 
+    pub(crate) fn from_compact_terms(terms: &[(u32, u32)]) -> Self {
+        let mut term_mask = [0_u64; 2];
+        let mut length = 0_u32;
+        for &(term, frequency) in terms {
+            length = length.saturating_add(frequency);
+            let mixed = u64::from(term).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let bit = (mixed >> 57) as usize;
+            term_mask[bit / 64] |= 1_u64 << (bit % 64);
+        }
+        Self {
+            term_start: 0,
+            term_len: terms.len() as u32,
+            frequency_histogram: FrequencyHistogram::from_terms(terms),
+            term_mask,
+            length,
+        }
+    }
+
     pub(crate) fn set_term_start(&mut self, start: u32) {
         self.term_start = start;
     }
@@ -175,6 +174,37 @@ impl PreparedDocument {
         let start = self.term_start as usize;
         start..start + self.term_len as usize
     }
+}
+
+pub(crate) fn visit_tokens<'a, E>(
+    canonical: &'a str,
+    mut visit: impl FnMut(&'a str) -> Result<(), E>,
+) -> Result<(), E> {
+    if canonical.is_ascii() {
+        let bytes = canonical.as_bytes();
+        let mut start = 0;
+        while start < bytes.len() {
+            while start < bytes.len() && !bytes[start].is_ascii_alphanumeric() {
+                start += 1;
+            }
+            let mut end = start;
+            while end < bytes.len() && bytes[end].is_ascii_alphanumeric() {
+                end += 1;
+            }
+            if start < end {
+                visit(&canonical[start..end])?;
+            }
+            start = end;
+        }
+    } else {
+        for token in canonical
+            .split(|character: char| !character.is_alphanumeric())
+            .filter(|token| !token.is_empty())
+        {
+            visit(token)?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn lossless_prefix_len(frequencies_in_rarity_order: &[u32], threshold: f64) -> usize {

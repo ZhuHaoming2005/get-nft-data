@@ -5,13 +5,14 @@ use std::sync::Arc;
 
 use ahash::AHashMap;
 use analysis2_core::{
-    analyze_candidate, build_contract_nft_map, build_seed_analysis_rollup, build_seed_dedup_report,
-    enrich_candidates, load_resident_store, load_seeds_json, query_metadata_for_seed,
-    query_name_for_seed, query_uri_for_seed, resolve_seed_contract, scopes_complete_for_seed,
-    write_candidate_json, write_dedup_outputs, write_run_outputs, Analysis2Error, ApiKeys,
-    CandidateAnalysis, CandidateRegistry, ContractId, DedupRunParams, EvidenceBundle,
-    FailureRecord, HitGraph, HttpLimits, LoadOptions, PaperConfig, ProgressObserver, ResidentStore,
-    SeedFullReport, SeedRecord,
+    Analysis2Error, ApiKeys, CandidateAnalysis, CandidateRegistry, ContractId, DedupRunParams,
+    EvidenceBundle, FailureRecord, HitGraph, HttpLimits, LoadOptions, MetadataQueryScratch,
+    NameQueryScratch, PaperConfig, ProgressObserver, ResidentStore, SeedFullReport, SeedRecord,
+    UriQueryScratch, analyze_candidate, build_contract_nft_map, build_seed_analysis_rollup,
+    build_seed_dedup_report, enrich_candidates, load_resident_store, load_seeds_json,
+    query_metadata_for_seed_with_scratch, query_name_for_seed_with_scratch,
+    query_uri_for_seed_with_scratch, resolve_seed_contract, scopes_complete_for_seed,
+    write_candidate_json, write_dedup_outputs, write_run_outputs,
 };
 use rayon::prelude::*;
 
@@ -57,20 +58,27 @@ pub struct RunConfig {
     pub enrich_override: Option<EnrichOverride>,
 }
 
-fn configure_rayon(threads: Option<usize>) -> Result<(), Analysis2Error> {
-    if let Some(n) = threads {
-        if let Err(e) = rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build_global()
-        {
-            // Global pool may already exist from a prior test or CLI setup.
-            let msg = e.to_string();
-            if !msg.contains("already been initialized") {
-                return Err(Analysis2Error::invalid(format!("rayon pool: {msg}")));
-            }
-        }
+fn with_rayon_pool<T>(
+    threads: Option<usize>,
+    run: impl FnOnce() -> Result<T, Analysis2Error> + Send,
+) -> Result<T, Analysis2Error>
+where
+    T: Send,
+{
+    let Some(threads) = threads else {
+        return run();
+    };
+    if threads == 0 {
+        return Err(Analysis2Error::invalid(
+            "--rayon-threads must be greater than zero",
+        ));
     }
-    Ok(())
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|index| format!("analysis2-cpu-{index}"))
+        .build()
+        .map_err(|error| Analysis2Error::invalid(format!("rayon pool: {error}")))?;
+    pool.install(run)
 }
 
 /// Preserve cancellation checks inside parallel seed queries without letting
@@ -89,57 +97,166 @@ impl ProgressObserver for CancellationOnlyProgress<'_> {
     fn finish(&self) {}
 }
 
-fn query_seed_dimensions(
-    store: &ResidentStore,
+struct SeedDedupState {
+    seed: SeedRecord,
     seed_id: ContractId,
+    graph: HitGraph,
+    failure: Option<FailureRecord>,
+}
+
+struct SeedDedupBatch {
+    completed: Vec<(SeedRecord, ContractId, HitGraph)>,
+    failures: Vec<FailureRecord>,
+}
+
+fn run_seed_stage<S, Init, Query>(
+    states: &mut [SeedDedupState],
+    phase: &str,
+    progress: &dyn ProgressObserver,
+    init: Init,
+    query: Query,
+) -> Result<(), Analysis2Error>
+where
+    S: Send,
+    Init: Fn() -> S + Send + Sync,
+    Query: Fn(&mut S, ContractId, &mut HitGraph) -> Result<(), Analysis2Error> + Send + Sync,
+{
+    let active = states
+        .iter()
+        .enumerate()
+        .filter_map(|(index, state)| state.failure.is_none().then_some(index))
+        .collect::<Vec<_>>();
+    progress.begin_phase(phase, Some(active.len() as u64));
+
+    let outcomes = active
+        .par_iter()
+        .map_init(init, |scratch, &state_index| {
+            progress.check_cancelled()?;
+            let state = &states[state_index];
+            let mut graph = HitGraph::new();
+            let outcome = query(scratch, state.seed_id, &mut graph);
+            progress.add_completed(1);
+            match outcome {
+                Ok(()) => Ok((state_index, Ok(graph))),
+                Err(Analysis2Error::Cancelled) => Err(Analysis2Error::Cancelled),
+                Err(error) => Ok((state_index, Err(error))),
+            }
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect::<Result<Vec<_>, Analysis2Error>>()?;
+
+    for (state_index, outcome) in outcomes {
+        let state = &mut states[state_index];
+        match outcome {
+            Ok(mut graph) => state.graph.append(&mut graph),
+            Err(error) => {
+                state.failure = Some(FailureRecord::seed_stage(
+                    &state.seed.chain,
+                    &state.seed.address,
+                    "dedup_query",
+                    error.to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn query_seeds_staged(
+    store: &ResidentStore,
+    seeds: &[SeedRecord],
     name_threshold: f64,
     metadata_threshold: f64,
-    query_progress: &dyn ProgressObserver,
-    dimension_progress: &dyn ProgressObserver,
-) -> Result<HitGraph, Analysis2Error> {
-    let ((uri, name), metadata) = rayon::join(
+    progress: &dyn ProgressObserver,
+) -> Result<SeedDedupBatch, Analysis2Error> {
+    progress.set_stage("dedup");
+    progress.begin_phase("resolve_seeds", Some(seeds.len() as u64));
+    let resolved = seeds
+        .par_iter()
+        .map(|seed| {
+            progress.check_cancelled()?;
+            let result = resolve_seed_contract(store, seed);
+            progress.add_completed(1);
+            Ok::<_, Analysis2Error>((seed.clone(), result))
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut states = Vec::with_capacity(resolved.len());
+    let mut failures = Vec::new();
+    for (seed, result) in resolved {
+        match result {
+            Ok(seed_id) => states.push(SeedDedupState {
+                seed,
+                seed_id,
+                graph: HitGraph::new(),
+                failure: None,
+            }),
+            Err(error) => failures.push(FailureRecord::seed_stage(
+                &seed.chain,
+                &seed.address,
+                "resolve_seed",
+                error.to_string(),
+            )),
+        }
+    }
+
+    let quiet = CancellationOnlyProgress { inner: progress };
+    // Match the architecture contract: dimensions are barriers; seeds are
+    // parallel within the active dimension. This keeps each index hot and
+    // avoids running three memory-heavy query engines on every worker at once.
+    run_seed_stage(
+        &mut states,
+        "uri_seeds",
+        progress,
+        || UriQueryScratch::for_chain_count(store.chains.len()),
+        |scratch, seed, graph| query_uri_for_seed_with_scratch(store, seed, graph, &quiet, scratch),
+    )?;
+    run_seed_stage(
+        &mut states,
+        "name_seeds",
+        progress,
         || {
-            rayon::join(
-                || {
-                    let mut graph = HitGraph::new();
-                    let result = query_uri_for_seed(store, seed_id, &mut graph, query_progress);
-                    dimension_progress.add_completed(1);
-                    result.map(|()| graph)
-                },
-                || {
-                    let mut graph = HitGraph::new();
-                    let result = query_name_for_seed(
-                        store,
-                        seed_id,
-                        name_threshold,
-                        &mut graph,
-                        query_progress,
-                    );
-                    dimension_progress.add_completed(1);
-                    result.map(|()| graph)
-                },
+            NameQueryScratch::for_worker_pool(
+                store.name_keys_by_len.len(),
+                rayon::current_num_threads(),
             )
         },
-        || {
-            let mut graph = HitGraph::new();
-            let result = query_metadata_for_seed(
-                store,
-                seed_id,
-                metadata_threshold,
-                &mut graph,
-                query_progress,
-            );
-            dimension_progress.add_completed(1);
-            result.map(|()| graph)
+        |scratch, seed, graph| {
+            query_name_for_seed_with_scratch(store, seed, name_threshold, graph, &quiet, scratch)
         },
-    );
+    )?;
+    run_seed_stage(
+        &mut states,
+        "metadata_seeds",
+        progress,
+        MetadataQueryScratch::default,
+        |scratch, seed, graph| {
+            query_metadata_for_seed_with_scratch(
+                store,
+                seed,
+                metadata_threshold,
+                graph,
+                &quiet,
+                scratch,
+            )
+        },
+    )?;
 
-    let mut graph = uri?;
-    let mut name = name?;
-    let mut metadata = metadata?;
-    graph.append(&mut name);
-    graph.append(&mut metadata);
-    Ok(graph)
+    let mut completed = Vec::with_capacity(states.len());
+    for state in states {
+        if let Some(failure) = state.failure {
+            failures.push(failure);
+        } else {
+            completed.push((state.seed, state.seed_id, state.graph));
+        }
+    }
+    Ok(SeedDedupBatch {
+        completed,
+        failures,
+    })
 }
 
 /// Load snapshot → query URI/Name/Metadata per seed → write offline reports.
@@ -147,8 +264,13 @@ pub fn run_dedup(
     config: &RunDedupConfig,
     progress: &dyn ProgressObserver,
 ) -> Result<(), Analysis2Error> {
-    configure_rayon(config.rayon_threads)?;
+    with_rayon_pool(config.rayon_threads, || run_dedup_inner(config, progress))
+}
 
+fn run_dedup_inner(
+    config: &RunDedupConfig,
+    progress: &dyn ProgressObserver,
+) -> Result<(), Analysis2Error> {
     let options = LoadOptions::new(
         config.chains.clone(),
         config.evm_chains.clone(),
@@ -158,72 +280,29 @@ pub fn run_dedup(
     let seeds = load_seeds_json(&config.seeds)?;
     let contract_nfts = build_contract_nft_map(&store);
 
-    progress.set_stage("dedup");
-    progress.begin_phase(
-        "seed_dimensions",
-        Some((seeds.len() as u64).saturating_mul(3)),
-    );
-
-    let quiet_progress = CancellationOnlyProgress { inner: progress };
-    let analyzed = seeds
-        .par_iter()
-        .map(
-            |seed| -> Result<
-                Result<(SeedRecord, analysis2_core::SeedDedupReport), FailureRecord>,
-                Analysis2Error,
-            > {
-                progress.check_cancelled()?;
-                let outcome = match resolve_seed_contract(&store, seed) {
-                    Ok(seed_id) => match query_seed_dimensions(
-                        &store,
-                        seed_id,
-                        config.name_threshold,
-                        config.metadata_threshold,
-                        &quiet_progress,
-                        progress,
-                    ) {
-                        Ok(graph) => {
-                            let registry =
-                                CandidateRegistry::from_hit_graph(&graph, &contract_nfts);
-                            let report = build_seed_dedup_report(
-                                &store,
-                                seed,
-                                seed_id,
-                                &graph,
-                                &registry,
-                                &contract_nfts,
-                            );
-                            Ok((seed.clone(), report))
-                        }
-                        // Cancel must propagate (exit 130); never record as FailureRecord.
-                        Err(Analysis2Error::Cancelled) => {
-                            return Err(Analysis2Error::Cancelled);
-                        }
-                        Err(e) => Err(FailureRecord::seed_stage(
-                            &seed.chain,
-                            &seed.address,
-                            "dedup_query",
-                            e.to_string(),
-                        )),
-                    },
-                    Err(e) => {
-                        progress.add_completed(3);
-                        Err(FailureRecord::seed_stage(
-                            &seed.chain,
-                            &seed.address,
-                            "resolve_seed",
-                            e.to_string(),
-                        ))
-                    }
-                };
-                Ok(outcome)
-            },
-        )
-        .collect::<Vec<_>>()
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
-
+    let seed_batch = query_seeds_staged(
+        &store,
+        &seeds,
+        config.name_threshold,
+        config.metadata_threshold,
+        progress,
+    )?;
     progress.set_stage("report");
+    progress.begin_phase("aggregate_seeds", Some(seed_batch.completed.len() as u64));
+    let reports = seed_batch
+        .completed
+        .into_par_iter()
+        .map(|(seed, seed_id, graph)| {
+            let registry = CandidateRegistry::from_hit_graph(&graph, &contract_nfts);
+            let report =
+                build_seed_dedup_report(&store, &seed, seed_id, &graph, &registry, &contract_nfts);
+            progress.add_completed(1);
+            (seed, report)
+        })
+        .collect::<Vec<_>>();
+    let mut analyzed = reports.into_iter().map(Ok).collect::<Vec<_>>();
+    analyzed.extend(seed_batch.failures.into_iter().map(Err));
+
     progress.begin_phase("write", Some(1));
     let params = DedupRunParams {
         command: "run-dedup".into(),
@@ -245,8 +324,10 @@ pub fn run_dedup(
 
 /// End-to-end: load → dedup → enrich → analyze → full reports.
 pub fn run(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), Analysis2Error> {
-    configure_rayon(config.rayon_threads)?;
+    with_rayon_pool(config.rayon_threads, || run_inner(config, progress))
+}
 
+fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), Analysis2Error> {
     let options = LoadOptions::new(
         config.chains.clone(),
         config.evm_chains.clone(),
@@ -256,72 +337,21 @@ pub fn run(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), An
     let seeds = load_seeds_json(&config.seeds)?;
     let contract_nfts = build_contract_nft_map(&store);
 
-    progress.set_stage("dedup");
-    progress.begin_phase(
-        "seed_dimensions",
-        Some((seeds.len() as u64).saturating_mul(3)),
+    let seed_batch = query_seeds_staged(
+        &store,
+        &seeds,
+        config.name_threshold,
+        config.metadata_threshold,
+        progress,
+    )?;
+
+    let completed = seed_batch.completed;
+    let mut failures = seed_batch.failures;
+
+    let registry = CandidateRegistry::from_hit_graphs(
+        completed.iter().map(|(_, _, graph)| graph),
+        &contract_nfts,
     );
-
-    let quiet_progress = CancellationOnlyProgress { inner: progress };
-    let seed_results = seeds
-        .par_iter()
-        .map(
-            |seed| -> Result<
-                Result<(SeedRecord, ContractId, HitGraph), FailureRecord>,
-                Analysis2Error,
-            > {
-                progress.check_cancelled()?;
-                let outcome = match resolve_seed_contract(&store, seed) {
-                    Ok(seed_id) => match query_seed_dimensions(
-                        &store,
-                        seed_id,
-                        config.name_threshold,
-                        config.metadata_threshold,
-                        &quiet_progress,
-                        progress,
-                    ) {
-                        Ok(graph) => Ok((seed.clone(), seed_id, graph)),
-                        Err(Analysis2Error::Cancelled) => {
-                            return Err(Analysis2Error::Cancelled);
-                        }
-                        Err(e) => Err(FailureRecord::seed_stage(
-                            &seed.chain,
-                            &seed.address,
-                            "dedup_query",
-                            e.to_string(),
-                        )),
-                    },
-                    Err(e) => {
-                        progress.add_completed(3);
-                        Err(FailureRecord::seed_stage(
-                            &seed.chain,
-                            &seed.address,
-                            "resolve_seed",
-                            e.to_string(),
-                        ))
-                    }
-                };
-                Ok(outcome)
-            },
-        )
-        .collect::<Vec<_>>()
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let mut graph = HitGraph::new();
-    let mut seed_ids: Vec<(SeedRecord, ContractId)> = Vec::with_capacity(seed_results.len());
-    let mut failures: Vec<FailureRecord> = Vec::new();
-    for result in seed_results {
-        match result {
-            Ok((seed, seed_id, mut seed_graph)) => {
-                seed_ids.push((seed, seed_id));
-                graph.append(&mut seed_graph);
-            }
-            Err(failure) => failures.push(failure),
-        }
-    }
-
-    let registry = CandidateRegistry::from_hit_graph(&graph, &contract_nfts);
 
     progress.set_stage("enrich");
     let evidence = match &config.enrich_override {
@@ -404,39 +434,43 @@ pub fn run(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), An
 
     // Mark seeds incomplete when any related candidate is missing from analyses_map.
     progress.set_stage("report");
-    progress.begin_phase("write", Some(1));
-
-    let mut analyzed: Vec<Result<(SeedRecord, SeedFullReport), FailureRecord>> =
-        Vec::with_capacity(seed_ids.len());
-    for (seed, seed_id) in &seed_ids {
-        let dedup =
-            build_seed_dedup_report(&store, seed, *seed_id, &graph, &registry, &contract_nfts);
-        let scopes_complete = scopes_complete_for_seed(&store, &dedup);
-        let (rollup, analysis_ok) = build_seed_analysis_rollup(
-            &registry,
-            *seed_id,
-            &seed.chain,
-            &seed.address,
-            &analyses_map,
-            "candidates",
-        );
-        let analysis_complete = analysis_ok
-            && registry
-                .relations_for_seed(*seed_id)
-                .iter()
-                .all(|rel| analyses_map.contains_key(&rel.candidate_contract));
-        analyzed.push(Ok((
-            seed.clone(),
-            SeedFullReport {
-                dedup,
-                scopes_complete,
-                analysis_complete,
-                analysis: Some(rollup),
-            },
-        )));
-    }
+    progress.begin_phase("aggregate_seeds", Some(completed.len() as u64));
+    let reports = completed
+        .par_iter()
+        .map(|(seed, seed_id, graph)| {
+            let dedup =
+                build_seed_dedup_report(&store, seed, *seed_id, graph, &registry, &contract_nfts);
+            let scopes_complete = scopes_complete_for_seed(&store, &dedup);
+            let (rollup, analysis_ok) = build_seed_analysis_rollup(
+                &registry,
+                *seed_id,
+                &seed.chain,
+                &seed.address,
+                &analyses_map,
+                "candidates",
+            );
+            let analysis_complete = analysis_ok
+                && registry
+                    .relations_for_seed(*seed_id)
+                    .iter()
+                    .all(|rel| analyses_map.contains_key(&rel.candidate_contract));
+            progress.add_completed(1);
+            (
+                seed.clone(),
+                SeedFullReport {
+                    dedup,
+                    scopes_complete,
+                    analysis_complete,
+                    analysis: Some(rollup),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let analyzed: Vec<Result<(SeedRecord, SeedFullReport), FailureRecord>> =
+        reports.into_iter().map(Ok).collect();
     // Failed resolve/dedup seeds are recorded only in `failures` (extra_failures).
 
+    progress.begin_phase("write", Some(1));
     let params = DedupRunParams {
         command: "run".into(),
         inputs: config
@@ -467,12 +501,23 @@ pub fn run(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), An
 mod tests {
     use super::*;
     use analysis2_core::parquet::write_report_golden_fixture;
-    use analysis2_core::{SaleEvent, DEFAULT_METADATA_THRESHOLD, DEFAULT_NAME_THRESHOLD};
+    use analysis2_core::{DEFAULT_METADATA_THRESHOLD, DEFAULT_NAME_THRESHOLD, SaleEvent};
     use serde_json::Value;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    /// Allows load-time checks; after `dedup` stage, skips the seed-loop gate once,
-    /// then cancels on the next check (mid-query inside `query_uri_for_seed`).
+    #[test]
+    fn explicit_rayon_threads_use_a_run_local_pool() {
+        let _ = rayon::current_num_threads();
+        let workers = with_rayon_pool(Some(3), || {
+            Ok::<_, Analysis2Error>(rayon::current_num_threads())
+        })
+        .unwrap();
+        assert_eq!(workers, 3);
+        assert!(with_rayon_pool(Some(0), || Ok::<_, Analysis2Error>(())).is_err());
+    }
+
+    /// Allows load-time checks; after `dedup` stage, skips the resolve and
+    /// URI-stage worker gates, then cancels inside `query_uri_for_seed`.
     struct CancelOnFirstQueryCheck {
         in_dedup: AtomicBool,
         dedup_checks: AtomicUsize,
@@ -500,8 +545,8 @@ mod tests {
                 return Ok(());
             }
             let n = self.dedup_checks.fetch_add(1, Ordering::SeqCst);
-            // n==0: seed-loop `check_cancelled`; n>=1: first mid-query check.
-            if n >= 1 {
+            // n==0: resolve worker; n==1: URI-stage worker; n>=2: query.
+            if n >= 2 {
                 Err(Analysis2Error::Cancelled)
             } else {
                 Ok(())

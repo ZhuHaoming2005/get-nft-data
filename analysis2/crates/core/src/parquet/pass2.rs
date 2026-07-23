@@ -1,18 +1,18 @@
 //! Pass 2: metadata_json projection into descending anchors.
 
 use ahash::AHashMap;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ProjectionMask;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use rayon::prelude::*;
 use std::fs::File;
 
-use crate::entity::{compare_token_ids_desc, MetadataRecord, ResidentStore, SourceOrder};
-use crate::parquet::metadata::validated_metadata;
-use crate::parquet::pass1::{normalize_chain, ProjectedUtf8Columns};
-use crate::parquet::validate::{ValidatedInput, PASS2_COLUMNS};
-use crate::parquet::LoadOptions;
-use crate::progress::ProgressObserver;
 use crate::Analysis2Error;
+use crate::entity::{MetadataRecord, ResidentStore, SourceOrder, compare_token_ids_desc};
+use crate::parquet::LoadOptions;
+use crate::parquet::metadata::validated_metadata;
+use crate::parquet::pass1::{ProjectedUtf8Columns, normalize_chain};
+use crate::parquet::validate::{PASS2_COLUMNS, ValidatedInput};
+use crate::progress::ProgressObserver;
 
 /// Per-file bounded anchors: at most `k` records per contract (O(k × contracts)).
 #[derive(Default)]
@@ -65,16 +65,37 @@ impl ShardAnchors {
 
     fn merge_ordered(&mut self, other: Self, options: &LoadOptions) {
         for ((chain, contract_address), records) in other.by_contract {
+            if options.metadata_anchors == 0 {
+                continue;
+            }
+            let is_evm = options.evm_chains.contains(&chain);
+            let anchors = self
+                .by_contract
+                .entry((chain, contract_address))
+                .or_default();
             for record in records {
-                self.insert(
-                    chain.clone(),
-                    contract_address.clone(),
-                    record.token_id,
-                    record.json,
-                    record.canonical_json,
-                    record.source_order,
-                    options,
-                );
+                // Left shards are earlier in source order, so an existing token
+                // id wins exactly as in repeated ordered insertion.
+                if anchors
+                    .iter()
+                    .any(|existing| existing.token_id == record.token_id)
+                {
+                    continue;
+                }
+                let insert_at = anchors
+                    .binary_search_by(|existing| {
+                        compare_token_ids_desc(&existing.token_id, &record.token_id, is_evm)
+                    })
+                    .unwrap_or_else(|position| position);
+                if insert_at >= options.metadata_anchors
+                    && anchors.len() >= options.metadata_anchors
+                {
+                    continue;
+                }
+                anchors.insert(insert_at, record);
+                if anchors.len() > options.metadata_anchors {
+                    anchors.pop();
+                }
             }
         }
     }
@@ -91,20 +112,20 @@ pub fn scan_pass2(
         .map(|input| scan_file_pass2(input, options, progress))
         .collect();
 
-    // Apply in explicit input-file order (shards already ordered by file_ordinal).
-    for shard in shard_results {
-        let shard = shard?;
-        for ((chain, contract_address), records) in shard.by_contract {
-            for record in records {
-                store.ingest_metadata_anchor(
-                    &chain,
-                    &contract_address,
-                    &record.token_id,
-                    record.json,
-                    record.canonical_json,
-                    record.source_order,
-                )?;
-            }
+    // Merge in an ordered parallel tree, then apply the bounded final anchor
+    // set once. This preserves first-source-row semantics without serially
+    // replaying every intermediate file shard into the resident store.
+    let shard = merge_anchor_shards_ordered(shard_results, options)?;
+    for ((chain, contract_address), records) in shard.by_contract {
+        for record in records {
+            store.ingest_metadata_anchor(
+                &chain,
+                &contract_address,
+                &record.token_id,
+                record.json,
+                record.canonical_json,
+                record.source_order,
+            )?;
         }
     }
     Ok(())
@@ -136,11 +157,27 @@ fn scan_file_pass2(
             scan_row_group_pass2(input, row_group, row_start, options, progress)
         })
         .collect();
-    let mut shard = ShardAnchors::default();
-    for row_group in row_group_results {
-        shard.merge_ordered(row_group?, options);
+    merge_anchor_shards_ordered(row_group_results, options)
+}
+
+fn merge_anchor_shards_ordered(
+    mut shards: Vec<Result<ShardAnchors, Analysis2Error>>,
+    options: &LoadOptions,
+) -> Result<ShardAnchors, Analysis2Error> {
+    match shards.len() {
+        0 => Ok(ShardAnchors::default()),
+        1 => shards.pop().expect("one anchor shard is present"),
+        _ => {
+            let right = shards.split_off(shards.len() / 2);
+            let (left, right) = rayon::join(
+                || merge_anchor_shards_ordered(shards, options),
+                || merge_anchor_shards_ordered(right, options),
+            );
+            let mut left = left?;
+            left.merge_ordered(right?, options);
+            Ok(left)
+        }
     }
-    Ok(shard)
 }
 
 fn scan_row_group_pass2(

@@ -66,12 +66,15 @@ pub struct SeedDuplicateScale {
 
 /// Build `contract_id → nft_ids` map used by HitGraph expansion helpers.
 pub fn build_contract_nft_map(store: &ResidentStore) -> AHashMap<ContractId, Vec<NftId>> {
-    let mut map: AHashMap<ContractId, Vec<NftId>> = AHashMap::new();
-    for nft in &store.nfts {
-        map.entry(nft.contract_id).or_default().push(nft.id);
-    }
-    for ids in map.values_mut() {
-        ids.sort_unstable();
+    let mut map = AHashMap::with_capacity(store.contracts.len());
+    for contract in &store.contracts {
+        if let Some(ids) = store.contract_nft_csr.values_for(contract.id)
+            && !ids.is_empty()
+        {
+            // The resident CSR is already ordered by `(contract_id, nft_id)`.
+            // Reusing it avoids hashing every NFT and sorting every bucket.
+            map.insert(contract.id, ids.to_vec());
+        }
     }
     map
 }
@@ -139,7 +142,13 @@ fn ratio(numer: u64, denom: u64) -> Option<f64> {
     }
 }
 
-fn scale_row(category: &str, nft: u64, contract: u64, nft_denom: u64, contract_denom: u64) -> DuplicateScaleRow {
+fn scale_row(
+    category: &str,
+    nft: u64,
+    contract: u64,
+    nft_denom: u64,
+    contract_denom: u64,
+) -> DuplicateScaleRow {
     DuplicateScaleRow {
         category: category.to_owned(),
         duplicate_nft_count: nft,
@@ -153,10 +162,7 @@ fn scale_row(category: &str, nft: u64, contract: u64, nft_denom: u64, contract_d
     }
 }
 
-fn contracts_for_nfts(
-    nfts: &AHashSet<NftId>,
-    store: &ResidentStore,
-) -> AHashSet<ContractId> {
+fn contracts_for_nfts(nfts: &AHashSet<NftId>, store: &ResidentStore) -> AHashSet<ContractId> {
     let mut out = AHashSet::new();
     for &nft in nfts {
         if let Some(rec) = store.nfts.get(nft as usize) {
@@ -231,6 +237,82 @@ fn category_name(dim: Dimension) -> &'static str {
     }
 }
 
+#[derive(Default)]
+struct DimensionNftSets {
+    token_uri: AHashSet<NftId>,
+    image_uri: AHashSet<NftId>,
+    metadata: AHashSet<NftId>,
+    name: AHashSet<NftId>,
+}
+
+impl DimensionNftSets {
+    fn insert_edge(
+        &mut self,
+        dimension: Dimension,
+        candidate_nft: Option<NftId>,
+        candidate_contract: ContractId,
+        contract_nfts: &AHashMap<ContractId, Vec<NftId>>,
+    ) {
+        let target = match dimension {
+            Dimension::TokenUri => &mut self.token_uri,
+            Dimension::ImageUri => &mut self.image_uri,
+            Dimension::Metadata => &mut self.metadata,
+            Dimension::Name => &mut self.name,
+        };
+        match candidate_nft {
+            Some(nft) => {
+                target.insert(nft);
+            }
+            None => {
+                if let Some(nfts) = contract_nfts.get(&candidate_contract) {
+                    target.extend(nfts.iter().copied());
+                }
+            }
+        }
+    }
+}
+
+fn rows_from_dimension_sets(
+    store: &ResidentStore,
+    primary_chain: ChainId,
+    mut sets: DimensionNftSets,
+) -> Vec<DuplicateScaleRow> {
+    // Image URI is supplemental to token URI within the same reporting scope.
+    sets.image_uri.retain(|nft| !sets.token_uri.contains(nft));
+    let totals = store
+        .totals
+        .get(&primary_chain)
+        .cloned()
+        .unwrap_or_default();
+    let mut rows = Vec::with_capacity(5);
+    let mut union_nfts = AHashSet::new();
+    for (dimension, nfts) in [
+        (Dimension::TokenUri, &sets.token_uri),
+        (Dimension::ImageUri, &sets.image_uri),
+        (Dimension::Metadata, &sets.metadata),
+        (Dimension::Name, &sets.name),
+    ] {
+        union_nfts.extend(nfts.iter().copied());
+        let contracts = contracts_for_nfts(nfts, store);
+        rows.push(scale_row(
+            category_name(dimension),
+            nfts.len() as u64,
+            contracts.len() as u64,
+            totals.nfts,
+            totals.contracts,
+        ));
+    }
+    let union_contracts = contracts_for_nfts(&union_nfts, store);
+    rows.push(scale_row(
+        "total",
+        union_nfts.len() as u64,
+        union_contracts.len() as u64,
+        totals.nfts,
+        totals.contracts,
+    ));
+    rows
+}
+
 /// Build five-category duplicate-scale rows for one seed/scope.
 pub fn build_duplicate_scale_rows(
     store: &ResidentStore,
@@ -291,14 +373,39 @@ pub fn build_seed_duplicate_scale(
     contract_nfts: &AHashMap<ContractId, Vec<NftId>>,
 ) -> SeedDuplicateScale {
     let primary = store.contracts[seed as usize].chain_id;
-    let intra_chain = build_duplicate_scale_rows(
+    let mut by_secondary: Vec<DimensionNftSets> = (0..store.chains.len())
+        .map(|_| DimensionNftSets::default())
+        .collect();
+    let mut cross = DimensionNftSets::default();
+
+    // A seed-local graph is scanned once. The old path rescanned it once per
+    // dimension and scope (including an extra token scan for image fallback).
+    for edge in graph.edges() {
+        if edge.seed_contract != seed || edge.primary_chain != primary {
+            continue;
+        }
+        if let Some(scope) = by_secondary.get_mut(edge.secondary_chain as usize) {
+            scope.insert_edge(
+                edge.dimension,
+                edge.candidate_nft,
+                edge.candidate_contract,
+                contract_nfts,
+            );
+        }
+        if edge.secondary_chain != primary {
+            cross.insert_edge(
+                edge.dimension,
+                edge.candidate_nft,
+                edge.candidate_contract,
+                contract_nfts,
+            );
+        }
+    }
+
+    let intra_chain = rows_from_dimension_sets(
         store,
-        graph,
-        seed,
-        ScopeKind::IntraChain,
         primary,
-        None,
-        contract_nfts,
+        std::mem::take(&mut by_secondary[primary as usize]),
     );
 
     let mut chain_matrix = Vec::new();
@@ -307,15 +414,7 @@ pub fn build_seed_duplicate_scale(
         if secondary == primary {
             continue;
         }
-        let rows = build_duplicate_scale_rows(
-            store,
-            graph,
-            seed,
-            ScopeKind::ChainMatrix,
-            primary,
-            Some(secondary),
-            contract_nfts,
-        );
+        let rows = rows_from_dimension_sets(store, primary, std::mem::take(&mut by_secondary[idx]));
         chain_matrix.push(ChainMatrixBlock {
             secondary_chain: store.chain_name(secondary).to_owned(),
             rows,
@@ -323,15 +422,7 @@ pub fn build_seed_duplicate_scale(
     }
     chain_matrix.sort_by(|a, b| a.secondary_chain.cmp(&b.secondary_chain));
 
-    let cross_chain_summary = build_duplicate_scale_rows(
-        store,
-        graph,
-        seed,
-        ScopeKind::CrossChainSummary,
-        primary,
-        None,
-        contract_nfts,
-    );
+    let cross_chain_summary = rows_from_dimension_sets(store, primary, cross);
 
     SeedDuplicateScale {
         intra_chain,

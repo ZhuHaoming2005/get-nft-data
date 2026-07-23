@@ -24,6 +24,11 @@ impl StringPool {
         self.strings.is_empty()
     }
 
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        self.strings.reserve(additional);
+        self.ids.reserve(additional);
+    }
+
     pub fn get(&self, id: StringId) -> &str {
         &self.strings[id as usize]
     }

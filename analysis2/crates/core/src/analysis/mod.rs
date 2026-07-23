@@ -14,11 +14,14 @@ pub use graph::AddressGraph;
 pub use legit::LegitClassification;
 pub use lifecycle::{LifecycleFacts, ValueFlowFacts};
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::Analysis2Error;
 use crate::enrich::EvidenceBundle;
 use crate::entity::{ContractId, ResidentStore};
-use crate::Analysis2Error;
+
+const PARALLEL_CANDIDATE_EVENT_THRESHOLD: usize = 2_048;
 
 /// Paper / CLI knobs for behavior detectors.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -93,26 +96,85 @@ pub fn analyze_candidate(
         .map(|(k, v)| (k.clone(), legit::classify(v)))
         .collect();
     let transfer_graph = graph::AddressGraph::from_transfers(&evidence.transfers);
-    let transfer_sccs = transfer_graph.strongly_connected_components();
-    let attribution = attribution::attribute_addresses(evidence, &transfer_graph);
-    let lifecycle = lifecycle::build_lifecycle(evidence, cfg.analysis_timestamp);
-    let value_flow = lifecycle::build_value_flow(evidence, &attribution.roles);
-    let detected = behavior::detect_behaviors(
-        evidence,
-        &transfer_graph,
-        &transfer_sccs,
-        &attribution.roles,
-        cfg,
-    );
-    let (economics, economics_quality) =
-        economics::compute_economics(evidence, &attribution.roles, cfg.analysis_timestamp, &lifecycle);
+    let event_work = evidence
+        .transfers
+        .len()
+        .saturating_add(evidence.sales.len())
+        .saturating_add(evidence.holders.len())
+        .saturating_add(evidence.value_flows.len());
+    let parallel =
+        event_work >= PARALLEL_CANDIDATE_EVENT_THRESHOLD && rayon::current_num_threads() > 1;
+    let (transfer_sccs, attribution, lifecycle) = if parallel {
+        let (transfer_sccs, (attribution, lifecycle)) = rayon::join(
+            || transfer_graph.strongly_connected_components(),
+            || {
+                rayon::join(
+                    || attribution::attribute_addresses(evidence, &transfer_graph),
+                    || lifecycle::build_lifecycle(evidence, cfg.analysis_timestamp),
+                )
+            },
+        );
+        (transfer_sccs, attribution, lifecycle)
+    } else {
+        (
+            transfer_graph.strongly_connected_components(),
+            attribution::attribute_addresses(evidence, &transfer_graph),
+            lifecycle::build_lifecycle(evidence, cfg.analysis_timestamp),
+        )
+    };
+    let (value_flow, detected, economics, economics_quality) = if parallel {
+        let (value_flow, (detected, (economics, economics_quality))) = rayon::join(
+            || lifecycle::build_value_flow(evidence, &attribution.roles),
+            || {
+                rayon::join(
+                    || {
+                        behavior::detect_behaviors(
+                            evidence,
+                            &transfer_graph,
+                            &transfer_sccs,
+                            &attribution.roles,
+                            cfg,
+                        )
+                    },
+                    || {
+                        economics::compute_economics(
+                            evidence,
+                            &attribution.roles,
+                            cfg.analysis_timestamp,
+                            &lifecycle,
+                        )
+                    },
+                )
+            },
+        );
+        (value_flow, detected, economics, economics_quality)
+    } else {
+        let value_flow = lifecycle::build_value_flow(evidence, &attribution.roles);
+        let detected = behavior::detect_behaviors(
+            evidence,
+            &transfer_graph,
+            &transfer_sccs,
+            &attribution.roles,
+            cfg,
+        );
+        let (economics, economics_quality) = economics::compute_economics(
+            evidence,
+            &attribution.roles,
+            cfg.analysis_timestamp,
+            &lifecycle,
+        );
+        (value_flow, detected, economics, economics_quality)
+    };
 
     let mut attribution_rows: Vec<(String, AddressAttribution)> = attribution
         .records
         .into_iter()
-        .map(|(address, record)| (address, record))
         .collect();
-    attribution_rows.sort_by(|left, right| left.0.cmp(&right.0));
+    if attribution_rows.len() >= PARALLEL_CANDIDATE_EVENT_THRESHOLD {
+        attribution_rows.par_sort_by(|left, right| left.0.cmp(&right.0));
+    } else {
+        attribution_rows.sort_by(|left, right| left.0.cmp(&right.0));
+    }
 
     Ok(CandidateAnalysis {
         contract_id: contract,
@@ -215,10 +277,15 @@ mod tests {
         evidence.quality.transfers = EvidenceStatus::Empty;
         evidence.quality.holders = EvidenceStatus::Empty;
 
-        let analysis = analyze_candidate(&store, contract, &evidence, &PaperConfig {
-            analysis_timestamp: 100,
-            ..PaperConfig::default()
-        })
+        let analysis = analyze_candidate(
+            &store,
+            contract,
+            &evidence,
+            &PaperConfig {
+                analysis_timestamp: 100,
+                ..PaperConfig::default()
+            },
+        )
         .unwrap();
 
         assert_eq!(analysis.behaviors.wash_cycles, 1);
@@ -300,10 +367,7 @@ mod tests {
         assert_eq!(analysis.economics.setup_gas_native, 0.0);
         assert_eq!(analysis.economics.lure_gas_native, 0.0);
         assert_eq!(analysis.economics.exit_gas_native, 0.0);
-        assert_eq!(
-            analysis.economics_quality.gas,
-            EvidenceStatus::NotRequested
-        );
+        assert_eq!(analysis.economics_quality.gas, EvidenceStatus::NotRequested);
         assert_eq!(
             analysis.economics_quality.value_flows,
             EvidenceStatus::NotRequested

@@ -1,6 +1,7 @@
 //! ResidentStore: identity layers, URI CSR, and metadata anchors.
 
 use ahash::{AHashMap, AHashSet};
+use rayon::prelude::*;
 
 use crate::Analysis2Error;
 
@@ -8,8 +9,8 @@ use crate::dedup::metadata::MetadataIndex;
 
 use super::csr::CsrIndex;
 use super::ids::{
-    compare_token_ids_desc, ChainId, ChainTotals, Contract, ContractId, MetadataRecord, Nft, NftId,
-    SourceOrder, StringId,
+    ChainId, ChainTotals, Contract, ContractId, MetadataRecord, Nft, NftId, SourceOrder, StringId,
+    compare_token_ids_desc,
 };
 use super::string_pool::StringPool;
 
@@ -39,6 +40,14 @@ pub struct ResidentStore {
     pub name_sorted_char_offsets: Vec<u64>,
     /// Sorted Unicode scalar values for every indexed name, stored contiguously.
     pub name_sorted_chars: Vec<char>,
+    /// String id → index in `name_keys_by_len`; `u32::MAX` means not indexed.
+    pub name_key_positions: Vec<u32>,
+    /// Offsets into `name_occurrence_tokens`, parallel to `name_keys_by_len`.
+    pub name_occurrence_token_offsets: Vec<u64>,
+    /// Per-name occurrence tokens ordered from rarest to most common.
+    pub name_occurrence_tokens: Vec<u32>,
+    /// Occurrence token → length-sorted name indexes.
+    pub name_occurrence_postings: CsrIndex,
     /// Prepared BM25 documents + term postings (filled by `finalize_metadata_index`).
     pub metadata_index: MetadataIndex,
     pub totals: AHashMap<ChainId, ChainTotals>,
@@ -76,6 +85,10 @@ impl ResidentStore {
             name_key_char_lens: Vec::new(),
             name_sorted_char_offsets: vec![0],
             name_sorted_chars: Vec::new(),
+            name_key_positions: Vec::new(),
+            name_occurrence_token_offsets: vec![0],
+            name_occurrence_tokens: Vec::new(),
+            name_occurrence_postings: CsrIndex::new(),
             metadata_index: MetadataIndex::default(),
             totals: AHashMap::new(),
             rows_loaded: 0,
@@ -321,6 +334,13 @@ impl ResidentStore {
             ..
         } = shard;
 
+        self.chains.reserve(chains.len());
+        self.chain_ids.reserve(chains.len());
+        self.contracts.reserve(contracts.len());
+        self.contract_index.reserve(contracts.len());
+        self.nfts.reserve(nfts.len());
+        self.nft_index.reserve(nfts.len());
+        self.strings.reserve(strings.len());
         let mut chain_map = Vec::with_capacity(chains.len());
         for chain in &chains {
             chain_map.push(self.ensure_chain(chain)?);
@@ -444,7 +464,7 @@ fn merge_mapped_uri(
 
 fn build_uri_csr(nfts: &[Nft], token_dimension: bool) -> CsrIndex {
     let mut pairs: Vec<(u32, u32)> = nfts
-        .iter()
+        .par_iter()
         .filter_map(|nft| {
             let uri = if token_dimension {
                 nft.token_uri_id
@@ -454,13 +474,16 @@ fn build_uri_csr(nfts: &[Nft], token_dimension: bool) -> CsrIndex {
             Some((uri, nft.id))
         })
         .collect();
-    pairs.sort_unstable();
+    pairs.par_sort_unstable();
     CsrIndex::from_sorted_pairs(&pairs)
 }
 
 fn build_contract_nft_csr(nfts: &[Nft]) -> CsrIndex {
-    let mut pairs: Vec<(u32, u32)> = nfts.iter().map(|nft| (nft.contract_id, nft.id)).collect();
-    pairs.sort_unstable();
+    let mut pairs: Vec<(u32, u32)> = nfts
+        .par_iter()
+        .map(|nft| (nft.contract_id, nft.id))
+        .collect();
+    pairs.par_sort_unstable();
     CsrIndex::from_sorted_pairs(&pairs)
 }
 

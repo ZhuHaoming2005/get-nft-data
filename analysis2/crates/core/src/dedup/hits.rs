@@ -58,6 +58,10 @@ impl HitGraph {
         &self.edges
     }
 
+    pub(crate) fn into_edges(self) -> Vec<HitEdge> {
+        self.edges
+    }
+
     /// Push an edge. Seed self-hits (`seed_contract == candidate_contract`) are excluded.
     pub fn push(&mut self, edge: HitEdge) -> bool {
         if edge.seed_contract == edge.candidate_contract {

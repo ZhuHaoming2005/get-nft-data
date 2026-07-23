@@ -48,6 +48,7 @@ struct Meta {
     phase_started: Instant,
     last_completed: u64,
     last_tick: Instant,
+    last_progress_at: Instant,
     eta: EwmaEta,
     phase_history: Vec<PhaseTimingSnapshot>,
 }
@@ -98,6 +99,7 @@ impl ProgressReporter {
                 phase_started: now,
                 last_completed: 0,
                 last_tick: now,
+                last_progress_at: now,
                 eta: EwmaEta::new(EWMA_ALPHA),
                 phase_history: Vec::new(),
             }),
@@ -188,6 +190,7 @@ impl ProgressObserver for ProgressReporter {
         meta.phase_started = now;
         meta.last_completed = 0;
         meta.last_tick = now;
+        meta.last_progress_at = now;
         meta.eta = EwmaEta::new(EWMA_ALPHA);
         self.shared.completed.store(0, Ordering::Relaxed);
     }
@@ -201,6 +204,7 @@ impl ProgressObserver for ProgressReporter {
         meta.phase_started = now;
         meta.last_completed = 0;
         meta.last_tick = now;
+        meta.last_progress_at = now;
         meta.eta = EwmaEta::new(EWMA_ALPHA);
         self.shared.completed.store(0, Ordering::Relaxed);
     }
@@ -277,11 +281,15 @@ fn emit_snapshot(shared: &Shared) {
     let dt = now.duration_since(meta.last_tick).as_secs_f64().max(1e-6);
     let delta = completed.saturating_sub(meta.last_completed);
     let instant_rate = delta as f64 / dt;
-    meta.eta.observe(instant_rate);
+    if delta > 0 {
+        meta.eta.observe(instant_rate);
+        meta.last_progress_at = now;
+    }
     meta.last_completed = completed;
     meta.last_tick = now;
 
     let remaining = meta.total.map(|total| total.saturating_sub(completed));
+    let stalled = progress_is_stalled(remaining, meta.last_progress_at, now, shared.interval);
     let percent = meta
         .total
         .and_then(|t| (t > 0).then_some(100.0 * completed as f64 / t as f64));
@@ -291,9 +299,11 @@ fn emit_snapshot(shared: &Shared) {
         completed,
         total: meta.total,
         percent,
-        rate: meta.eta.rate(),
-        eta_secs: remaining.and_then(|r| meta.eta.eta_secs(r)),
-        eta_confident: meta.eta.confident(),
+        rate: (!stalled).then(|| meta.eta.rate()).flatten(),
+        eta_secs: (!stalled)
+            .then(|| remaining.and_then(|r| meta.eta.eta_secs(r)))
+            .flatten(),
+        eta_confident: !stalled && meta.eta.confident(),
         phase_elapsed_secs: meta.phase_started.elapsed().as_secs_f64(),
         stage_elapsed_secs: meta.stage_started.elapsed().as_secs_f64(),
     };
@@ -342,6 +352,17 @@ fn emit_snapshot(shared: &Shared) {
     }
 }
 
+fn progress_is_stalled(
+    remaining: Option<u64>,
+    last_progress_at: Instant,
+    now: Instant,
+    interval: Duration,
+) -> bool {
+    remaining.is_some_and(|remaining| remaining > 0)
+        && now.duration_since(last_progress_at)
+            >= interval.saturating_mul(4).max(Duration::from_secs(2))
+}
+
 fn format_duration(secs: f64) -> String {
     if !secs.is_finite() || secs < 0.0 {
         return "?".to_owned();
@@ -361,7 +382,7 @@ fn format_duration(secs: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProgressMode, ProgressReporter};
+    use super::{ProgressMode, ProgressReporter, progress_is_stalled};
     use analysis2_core::ProgressObserver;
     use std::time::{Duration, Instant};
 
@@ -376,5 +397,28 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "finish waited for the reporting interval"
         );
+    }
+
+    #[test]
+    fn stale_tail_rate_is_not_reported_as_zero_eta() {
+        let now = Instant::now();
+        assert!(progress_is_stalled(
+            Some(2),
+            now - Duration::from_secs(10),
+            now,
+            Duration::from_millis(500),
+        ));
+        assert!(!progress_is_stalled(
+            Some(0),
+            now - Duration::from_secs(10),
+            now,
+            Duration::from_millis(500),
+        ));
+        assert!(!progress_is_stalled(
+            Some(2),
+            now - Duration::from_secs(1),
+            now,
+            Duration::from_millis(500),
+        ));
     }
 }

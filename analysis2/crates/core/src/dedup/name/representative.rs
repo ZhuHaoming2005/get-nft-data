@@ -1,6 +1,7 @@
 //! EVM mode representative Name selection.
 
 use ahash::AHashMap;
+use rayon::prelude::*;
 
 use crate::entity::{ContractId, ResidentStore, StringId};
 
@@ -34,45 +35,88 @@ pub fn is_usable_name(name: &str) -> bool {
 
 /// Mode by NFT count; ties → lexicographically smallest `name_norm`.
 pub fn select_evm_representatives(store: &ResidentStore) -> Vec<(ContractId, StringId)> {
+    if store.contract_nft_csr.is_empty() && !store.nfts.is_empty() {
+        return select_evm_representatives_without_csr(store);
+    }
+    let mut out: Vec<(ContractId, StringId)> = store
+        .contracts
+        .par_iter()
+        .filter_map(|contract| {
+            let chain = store.chain_name(contract.chain_id);
+            if !store.is_evm_chain(chain) {
+                return None;
+            }
+            let mut counts: AHashMap<StringId, u64> = AHashMap::new();
+            for &nft_id in store
+                .contract_nft_csr
+                .values_for(contract.id)
+                .unwrap_or(&[])
+            {
+                let Some(name_id) = store.nfts[nft_id as usize].name_id else {
+                    continue;
+                };
+                if is_usable_name(store.string(name_id)) {
+                    *counts.entry(name_id).or_default() += 1;
+                }
+            }
+
+            let mut selected = None::<(StringId, u64)>;
+            for (name_id, count) in counts {
+                match &mut selected {
+                    Some((selected_name, selected_count)) => {
+                        let replace = count > *selected_count
+                            || (count == *selected_count
+                                && store.string(name_id) < store.string(*selected_name));
+                        if replace {
+                            *selected_name = name_id;
+                            *selected_count = count;
+                        }
+                    }
+                    None => selected = Some((name_id, count)),
+                }
+            }
+            selected.map(|(name_id, _)| (contract.id, name_id))
+        })
+        .collect();
+    out.par_sort_unstable_by_key(|(contract_id, _)| *contract_id);
+    out
+}
+
+fn select_evm_representatives_without_csr(store: &ResidentStore) -> Vec<(ContractId, StringId)> {
     let mut counts: AHashMap<(ContractId, StringId), u64> = AHashMap::new();
     for nft in &store.nfts {
         let Some(name_id) = nft.name_id else {
             continue;
         };
         let contract = &store.contracts[nft.contract_id as usize];
-        let chain = store.chain_name(contract.chain_id);
-        if !store.is_evm_chain(chain) {
-            continue;
+        if store.is_evm_chain(store.chain_name(contract.chain_id))
+            && is_usable_name(store.string(name_id))
+        {
+            *counts.entry((nft.contract_id, name_id)).or_default() += 1;
         }
-        if !is_usable_name(store.string(name_id)) {
-            continue;
-        }
-        *counts.entry((nft.contract_id, name_id)).or_default() += 1;
     }
-
-    let mut by_contract: AHashMap<ContractId, (StringId, u64)> = AHashMap::new();
-    for ((contract_id, name_id), count) in counts {
-        match by_contract.get_mut(&contract_id) {
-            Some((selected, selected_count)) => {
-                let replace = count > *selected_count
-                    || (count == *selected_count
-                        && store.string(name_id) < store.string(*selected));
-                if replace {
-                    *selected = name_id;
-                    *selected_count = count;
-                }
+    let mut selected = AHashMap::<ContractId, (StringId, u64)>::new();
+    for ((contract, name), count) in counts {
+        match selected.get_mut(&contract) {
+            Some((current_name, current_count))
+                if count > *current_count
+                    || (count == *current_count
+                        && store.string(name) < store.string(*current_name)) =>
+            {
+                *current_name = name;
+                *current_count = count;
             }
             None => {
-                by_contract.insert(contract_id, (name_id, count));
+                selected.insert(contract, (name, count));
             }
+            _ => {}
         }
     }
-
-    let mut out: Vec<(ContractId, StringId)> = by_contract
+    let mut out = selected
         .into_iter()
-        .map(|(contract_id, (name_id, _))| (contract_id, name_id))
-        .collect();
-    out.sort_unstable_by_key(|(contract_id, _)| *contract_id);
+        .map(|(contract, (name, _))| (contract, name))
+        .collect::<Vec<_>>();
+    out.sort_unstable_by_key(|&(contract, _)| contract);
     out
 }
 

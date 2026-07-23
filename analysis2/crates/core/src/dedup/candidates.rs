@@ -28,24 +28,38 @@ impl CandidateRegistry {
         graph: &HitGraph,
         contract_nfts: &AHashMap<ContractId, Vec<NftId>>,
     ) -> Self {
+        Self::from_hit_graphs(std::iter::once(graph), contract_nfts)
+    }
+
+    /// Build one registry directly from seed-local graphs.
+    ///
+    /// Keeping the graphs seed-local avoids constructing a second global edge
+    /// buffer and lets reporting scan only the selected seed's edges.
+    pub fn from_hit_graphs<'a>(
+        graphs: impl IntoIterator<Item = &'a HitGraph>,
+        contract_nfts: &AHashMap<ContractId, Vec<NftId>>,
+    ) -> Self {
         // (seed, candidate) → (dimensions, nfts)
         let mut pair_dims: AHashMap<(ContractId, ContractId), AHashSet<Dimension>> =
             AHashMap::new();
         let mut pair_nfts: AHashMap<(ContractId, ContractId), AHashSet<NftId>> = AHashMap::new();
         let mut candidates: AHashSet<ContractId> = AHashSet::new();
 
-        for edge in graph.edges() {
-            let key = (edge.seed_contract, edge.candidate_contract);
-            candidates.insert(edge.candidate_contract);
-            pair_dims.entry(key).or_default().insert(edge.dimension);
-            let nfts = pair_nfts.entry(key).or_default();
-            match edge.candidate_nft {
-                Some(nft) => {
-                    nfts.insert(nft);
-                }
-                None => {
-                    if let Some(contract_members) = contract_nfts.get(&edge.candidate_contract) {
-                        nfts.extend(contract_members.iter().copied());
+        for graph in graphs {
+            for edge in graph.edges() {
+                let key = (edge.seed_contract, edge.candidate_contract);
+                candidates.insert(edge.candidate_contract);
+                pair_dims.entry(key).or_default().insert(edge.dimension);
+                let nfts = pair_nfts.entry(key).or_default();
+                match edge.candidate_nft {
+                    Some(nft) => {
+                        nfts.insert(nft);
+                    }
+                    None => {
+                        if let Some(contract_members) = contract_nfts.get(&edge.candidate_contract)
+                        {
+                            nfts.extend(contract_members.iter().copied());
+                        }
                     }
                 }
             }

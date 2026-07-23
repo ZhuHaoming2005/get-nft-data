@@ -10,11 +10,11 @@ mod validate;
 use ahash::AHashSet;
 use std::path::PathBuf;
 
+use crate::Analysis2Error;
 use crate::dedup::metadata::finalize_metadata_index_with_progress;
-use crate::dedup::name::finalize_name_index;
+use crate::dedup::name::finalize_name_index_with_progress;
 use crate::entity::ResidentStore;
 use crate::progress::ProgressObserver;
-use crate::Analysis2Error;
 
 pub use fixture::{
     write_report_golden_fixture, write_tiny_multichain_fixture, write_uri_conflict_fixture,
@@ -81,9 +81,7 @@ pub fn load_resident_store(
     progress.begin_phase("pass2_metadata", Some(total_rows));
     pass2::scan_pass2(&validated, &mut store, options, progress)?;
 
-    progress.begin_phase("finalize_name_index", Some(1));
-    finalize_name_index(&mut store)?;
-    progress.add_completed(1);
+    finalize_name_index_with_progress(&mut store, progress)?;
 
     finalize_metadata_index_with_progress(&mut store, progress)?;
     Ok(store)
