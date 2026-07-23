@@ -192,6 +192,11 @@ pub async fn fetch_transfers(
 }
 
 /// Fetch owners via Alchemy NFT API `getOwnersForContract`.
+///
+/// Prefers `withTokenBalances=true` (per-token holders for economics). Large
+/// collections often return multi-10MB JSON pages that exceed the HTTP client
+/// body cap; in that case we automatically fall back to owner addresses only
+/// and mark the result truncated.
 pub async fn fetch_holders(
     client: &HttpClient,
     endpoints: &ProviderEndpoints,
@@ -199,6 +204,56 @@ pub async fn fetch_holders(
     chain: &str,
     contract: &str,
     max_pages: usize,
+) -> FetchOutcome<Vec<HolderRecord>> {
+    let with_balances =
+        fetch_holders_pages(client, endpoints, api_key, chain, contract, max_pages, true).await;
+    if !holders_failed_due_to_oversize(&with_balances) {
+        return with_balances;
+    }
+    eprintln!(
+        "[api/warn] source=alchemy request_key=alchemy_holders \
+         action=fallback_without_token_balances contract={contract} chain={chain} \
+         reason=response_body_too_large"
+    );
+    let mut owners_only =
+        fetch_holders_pages(client, endpoints, api_key, chain, contract, max_pages, false).await;
+    // Lost per-token balances → always Truncated when any owners returned.
+    if !owners_only.value.is_empty()
+        && !matches!(
+            owners_only.status,
+            EvidenceStatus::Failed | EvidenceStatus::NotRequested
+        )
+    {
+        owners_only.truncated = true;
+        owners_only.status = EvidenceStatus::Truncated;
+        if let Some(obs) = owners_only.observation.as_mut() {
+            obs.status = EvidenceStatus::Truncated;
+        }
+        owners_only.failure = Some(
+            "alchemy_holders: withTokenBalances response exceeded size limit; \
+             returned owner addresses only"
+                .into(),
+        );
+    }
+    owners_only
+}
+
+fn holders_failed_due_to_oversize(outcome: &FetchOutcome<Vec<HolderRecord>>) -> bool {
+    matches!(outcome.status, EvidenceStatus::Failed)
+        && outcome
+            .failure
+            .as_deref()
+            .is_some_and(|msg| msg.to_ascii_lowercase().contains("response exceeds"))
+}
+
+async fn fetch_holders_pages(
+    client: &HttpClient,
+    endpoints: &ProviderEndpoints,
+    api_key: Option<&str>,
+    chain: &str,
+    contract: &str,
+    max_pages: usize,
+    with_token_balances: bool,
 ) -> FetchOutcome<Vec<HolderRecord>> {
     let Some(api_key) = api_key else {
         return FetchOutcome::skipped("alchemy_holders");
@@ -211,9 +266,10 @@ pub async fn fetch_holders(
         );
     };
     url.push_str(&format!(
-        "{}contractAddress={}&withTokenBalances=true",
+        "{}contractAddress={}&withTokenBalances={}",
         if url.contains('?') { "&" } else { "?" },
-        urlencoding_minimal(contract)
+        urlencoding_minimal(contract),
+        if with_token_balances { "true" } else { "false" },
     ));
 
     let mut holders = Vec::new();
@@ -1226,6 +1282,36 @@ mod receipt_gas_tests {
         }];
         let hashes = collect_unique_tx_hashes(&transfers, &sales);
         assert_eq!(hashes, vec!["0xaaa".to_owned()]);
+    }
+
+    #[test]
+    fn oversize_holders_failure_is_detected_for_fallback() {
+        let oversize = FetchOutcome::<Vec<HolderRecord>>::failed(
+            "alchemy",
+            "alchemy_holders",
+            "http error: response exceeds 16777216 bytes body_len=25103313",
+        );
+        assert!(holders_failed_due_to_oversize(&oversize));
+        let other = FetchOutcome::<Vec<HolderRecord>>::failed(
+            "alchemy",
+            "alchemy_holders",
+            "http error: HTTP 500 endpoint=x",
+        );
+        assert!(!holders_failed_due_to_oversize(&other));
+    }
+
+    #[test]
+    fn parse_holders_without_token_balances() {
+        let payload = serde_json::json!({
+            "owners": [
+                { "ownerAddress": "0xAbC" },
+                { "ownerAddress": "0x0000000000000000000000000000000000000000" }
+            ]
+        });
+        let rows = parse_holders(&payload);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].owner, "0xabc");
+        assert!(rows[0].token_id.is_empty());
     }
 }
 

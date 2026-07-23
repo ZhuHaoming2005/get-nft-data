@@ -14,12 +14,12 @@ use crate::error::Analysis2Error;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(90);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const DEFAULT_RETRIES: usize = 3;
-const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 
 pub const OPENSEA_RATE_LIMIT_BURST: usize = 4;
 pub const OPENSEA_RATE_LIMIT_REFILL_MS: u64 = 300;
-pub const HELIUS_RATE_LIMIT_BURST: usize = 5;
-pub const HELIUS_RATE_LIMIT_REFILL_MS: u64 = 200;
+pub const HELIUS_RATE_LIMIT_BURST: usize = 7;
+pub const HELIUS_RATE_LIMIT_REFILL_MS: u64 = 150;
 
 #[derive(Debug)]
 struct TokenBucketState {
@@ -614,13 +614,12 @@ mod tests {
     }
 
     #[test]
-    fn helius_defaults_target_about_five_rps() {
-        assert_eq!(HELIUS_RATE_LIMIT_BURST, 5);
-        assert_eq!(HELIUS_RATE_LIMIT_REFILL_MS, 200);
-        // Sustained rate from refill interval (tokens/s).
+    fn helius_defaults_target_about_seven_rps() {
+        assert_eq!(HELIUS_RATE_LIMIT_BURST, 7);
+        assert_eq!(HELIUS_RATE_LIMIT_REFILL_MS, 150);
         let rps = 1000.0 / HELIUS_RATE_LIMIT_REFILL_MS as f64;
-        assert!((rps - 1000.0 / 200.0).abs() < 1e-9);
-        assert!(rps > 4.5 && rps < 5.5);
+        assert!((rps - 1000.0 / 150.0).abs() < 1e-9);
+        assert!(rps > 6.9 && rps < 7.1);
     }
 
     #[test]
