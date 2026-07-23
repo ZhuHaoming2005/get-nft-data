@@ -76,7 +76,9 @@ pub async fn enrich_candidates(
                 progress.add_completed(1);
             }
             Err(e) => {
-                return Err(Analysis2Error::http(format!("enrich task join failed: {e}")));
+                return Err(Analysis2Error::http(format!(
+                    "enrich task join failed: {e}"
+                )));
             }
         }
     }
@@ -101,15 +103,41 @@ async fn enrich_evm(
     bundle.quality.gas = EvidenceStatus::NotRequested;
     bundle.quality.value_flows = EvidenceStatus::NotRequested;
 
-    let mut transfers = alchemy::fetch_transfers(
-        client,
-        &limits.endpoints,
-        keys.alchemy(),
-        chain,
-        address,
-        limits.max_transfer_pages,
-    )
-    .await;
+    // These provider calls are independent. Starting them together removes
+    // three full network round trips from the common EVM critical path.
+    let (mut transfers, holders, mut sales, controllers_out) = tokio::join!(
+        alchemy::fetch_transfers(
+            client,
+            &limits.endpoints,
+            keys.alchemy(),
+            chain,
+            address,
+            limits.max_transfer_pages,
+        ),
+        alchemy::fetch_holders(
+            client,
+            &limits.endpoints,
+            keys.alchemy(),
+            chain,
+            address,
+            limits.max_holder_pages,
+        ),
+        alchemy::fetch_sales(
+            client,
+            &limits.endpoints,
+            keys.alchemy(),
+            chain,
+            address,
+            limits.max_sale_pages,
+        ),
+        controllers::fetch_evm_controllers(
+            client,
+            &limits.endpoints,
+            keys.alchemy(),
+            chain,
+            address,
+        ),
+    );
 
     if matches!(
         transfers.status,
@@ -125,34 +153,14 @@ async fn enrich_evm(
         )
         .await;
         if !matches!(fallback.status, EvidenceStatus::NotRequested) {
-            if matches!(transfers.status, EvidenceStatus::Failed) {
-                if let Some(failure) = transfers.failure.take() {
-                    bundle.quality.failures.push(failure);
-                }
+            if matches!(transfers.status, EvidenceStatus::Failed)
+                && let Some(failure) = transfers.failure.take()
+            {
+                bundle.quality.failures.push(failure);
             }
             transfers = fallback;
         }
     }
-
-    let holders = alchemy::fetch_holders(
-        client,
-        &limits.endpoints,
-        keys.alchemy(),
-        chain,
-        address,
-        limits.max_holder_pages,
-    )
-    .await;
-
-    let mut sales = alchemy::fetch_sales(
-        client,
-        &limits.endpoints,
-        keys.alchemy(),
-        chain,
-        address,
-        limits.max_sale_pages,
-    )
-    .await;
 
     if sales_need_opensea_fallback(&sales.value, sales.status) {
         let os = opensea::fetch_contract_sales(
@@ -164,10 +172,10 @@ async fn enrich_evm(
         )
         .await;
         if matches!(os.status, EvidenceStatus::Complete) {
-            if matches!(sales.status, EvidenceStatus::Failed) {
-                if let Some(failure) = sales.failure.take() {
-                    bundle.quality.failures.push(failure);
-                }
+            if matches!(sales.status, EvidenceStatus::Failed)
+                && let Some(failure) = sales.failure.take()
+            {
+                bundle.quality.failures.push(failure);
             }
             if sales.value.is_empty() {
                 sales = os;
@@ -247,14 +255,6 @@ async fn enrich_evm(
     );
 
     // Controllers before value-flow so operator seeds include on-chain owners.
-    let controllers_out = controllers::fetch_evm_controllers(
-        client,
-        &limits.endpoints,
-        keys.alchemy(),
-        chain,
-        address,
-    )
-    .await;
     if let Some(obs) = controllers_out.observation {
         bundle.provenance.push(obs);
     }
@@ -509,8 +509,8 @@ async fn collect_evm_mint_payment_extras(
     chain: &str,
     transfers: &[TransferEvent],
 ) -> ahash::AHashMap<String, f64> {
-    use ahash::{AHashMap, AHashSet};
     use super::value_flow::activity_block_window;
+    use ahash::{AHashMap, AHashSet};
 
     let mut out = AHashMap::new();
     let mint_txs: AHashSet<String> = transfers
@@ -1109,10 +1109,15 @@ mod tests {
             helius: None,
             ..ApiKeys::default()
         };
-        let map =
-            enrich_candidates(&registry, &store, &keys, &HttpLimits::default(), &NoopProgress)
-                .await
-                .unwrap();
+        let map = enrich_candidates(
+            &registry,
+            &store,
+            &keys,
+            &HttpLimits::default(),
+            &NoopProgress,
+        )
+        .await
+        .unwrap();
         let bundle = map.get(&cand).unwrap();
         assert_eq!(bundle.quality.assets, EvidenceStatus::NotRequested);
         assert_eq!(bundle.quality.histories, EvidenceStatus::NotRequested);

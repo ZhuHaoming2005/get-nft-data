@@ -1,10 +1,9 @@
 //! Relation-level legit detection: controller continuity, OpenSea slug, seed NFT interaction.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
 use ahash::AHashMap;
-use tokio::sync::Semaphore;
+use futures_util::{stream, StreamExt};
 
 use crate::dedup::candidates::CandidateRegistry;
 use crate::entity::{ContractId, ResidentStore};
@@ -14,9 +13,7 @@ use super::controllers::{self, normalize_evm_address};
 use super::helius;
 use super::http::HttpClient;
 use super::opensea;
-use super::types::{
-    finalize_legit_signals, ApiKeys, EvidenceBundle, HttpLimits, LegitSignals,
-};
+use super::types::{finalize_legit_signals, ApiKeys, EvidenceBundle, HttpLimits, LegitSignals};
 
 /// Seed-side cache reused across all candidates for that seed.
 #[derive(Clone, Debug, Default)]
@@ -38,8 +35,7 @@ fn normalize_addr(chain: &str, address: &str) -> String {
     if chain.eq_ignore_ascii_case("solana") {
         address.trim().to_owned()
     } else {
-        normalize_evm_address(address)
-            .unwrap_or_else(|| address.trim().to_ascii_lowercase())
+        normalize_evm_address(address).unwrap_or_else(|| address.trim().to_ascii_lowercase())
     }
 }
 
@@ -70,14 +66,9 @@ async fn resolve_collection_slug(
         .await
         .map(|s| s.to_ascii_lowercase());
     }
-    if let Some(slug) = alchemy::fetch_collection_slug(
-        client,
-        &limits.endpoints,
-        keys.alchemy(),
-        chain,
-        address,
-    )
-    .await
+    if let Some(slug) =
+        alchemy::fetch_collection_slug(client, &limits.endpoints, keys.alchemy(), chain, address)
+            .await
     {
         return Some(slug.to_ascii_lowercase());
     }
@@ -121,35 +112,28 @@ async fn build_seed_cache(
         )
         .await;
         cache.controllers = outcome.value;
-        cache.controllers_probed = !matches!(
-            outcome.status,
-            super::types::EvidenceStatus::NotRequested
-        );
+        cache.controllers_probed =
+            !matches!(outcome.status, super::types::EvidenceStatus::NotRequested);
     } else {
         let snapshot = helius::fetch_collection_assets(
             client,
             &limits.endpoints.helius,
             keys.helius(),
             &address,
-            limits.max_solana_assets.min(50).max(1),
+            limits.max_solana_assets.clamp(1, 50),
         )
         .await;
         cache.controllers = snapshot.value.authority.clone();
         for asset in &snapshot.value.assets {
             if let Some(owner) = &asset.owner {
-                cache
-                    .current_owners
-                    .insert(normalize_addr(&chain, owner));
+                cache.current_owners.insert(normalize_addr(&chain, owner));
             }
         }
-        cache.controllers_probed = !matches!(
-            snapshot.status,
-            super::types::EvidenceStatus::NotRequested
-        );
+        cache.controllers_probed =
+            !matches!(snapshot.status, super::types::EvidenceStatus::NotRequested);
     }
 
-    cache.collection_slug =
-        resolve_collection_slug(client, limits, keys, &chain, &address).await;
+    cache.collection_slug = resolve_collection_slug(client, limits, keys, &chain, &address).await;
 
     if is_evm {
         let transfers = alchemy::fetch_transfers(
@@ -158,7 +142,7 @@ async fn build_seed_cache(
             keys.alchemy(),
             &chain,
             &address,
-            limits.max_transfer_pages.min(3).max(1),
+            limits.max_transfer_pages.clamp(1, 3),
         )
         .await;
         for t in &transfers.value {
@@ -182,14 +166,12 @@ async fn build_seed_cache(
                 &limits.endpoints.helius,
                 keys.helius(),
                 &address,
-                limits.max_solana_assets.min(50).max(1),
+                limits.max_solana_assets.clamp(1, 50),
             )
             .await;
             for asset in &snapshot.value.assets {
                 if let Some(owner) = &asset.owner {
-                    cache
-                        .current_owners
-                        .insert(normalize_addr(&chain, owner));
+                    cache.current_owners.insert(normalize_addr(&chain, owner));
                 }
             }
         }
@@ -228,7 +210,7 @@ async fn probe_relation(
     seed_address: &str,
     candidate_address: &str,
     cand_controllers: &[String],
-    cand_slug: &mut Option<String>,
+    cand_slug: Option<&str>,
     seed: &SeedCache,
 ) -> LegitSignals {
     let mut signals = continuity_signals(
@@ -242,23 +224,21 @@ async fn probe_relation(
         signals.verification_complete = true;
     }
 
-    // OpenSea / Alchemy collection slug match.
-    if cand_slug.is_none() {
-        *cand_slug = resolve_collection_slug(client, limits, keys, chain, candidate_address).await;
-    }
-    if let (Some(seed_slug), Some(cand_slug)) = (&seed.collection_slug, cand_slug.as_ref()) {
-        if !seed_slug.is_empty() && seed_slug == cand_slug {
-            signals.official_collection_relation = true;
-            signals
-                .evidence_keys
-                .push(format!("opensea_collection:{seed_slug}"));
-        }
+    // Candidate slugs are fetched once per candidate by the orchestrator.
+    if let (Some(seed_slug), Some(cand_slug)) = (&seed.collection_slug, cand_slug)
+        && !seed_slug.is_empty()
+        && seed_slug == cand_slug
+    {
+        signals.official_collection_relation = true;
+        signals
+            .evidence_keys
+            .push(format!("opensea_collection:{seed_slug}"));
     }
 
     let cand_norm = normalize_addr(chain, candidate_address);
 
     // Current holds seed NFT.
-    if is_evm {
+    if is_evm && normalize_evm_address(candidate_address).is_some() {
         match alchemy::is_holder_of_contract(
             client,
             &limits.endpoints,
@@ -321,56 +301,74 @@ pub async fn attach_relation_legit(
         return;
     }
 
-    let semaphore = Arc::new(Semaphore::new(limits.concurrency.max(1)));
-    let mut seed_caches: AHashMap<ContractId, SeedCache> = AHashMap::new();
+    let concurrency = limits.concurrency.max(1);
+    let evidence_view: &AHashMap<ContractId, EvidenceBundle> = &*evidence;
 
-    // Build seed caches (sequential is fine; seeds << candidates). Parallel optional.
-    for seed_id in &seed_ids {
-        let _permit = semaphore.acquire().await.ok();
-        let cache =
-            build_seed_cache(client, store, evidence, keys, limits, *seed_id).await;
-        seed_caches.insert(*seed_id, cache);
-    }
-
-    // Candidate slug cache to avoid repeat lookups.
-    let mut cand_slugs: AHashMap<ContractId, Option<String>> = AHashMap::new();
-
-    for rel in registry.relations() {
-        let Some(bundle) = evidence.get_mut(&rel.candidate_contract) else {
-            continue;
-        };
-        let seed_row = &store.contracts[rel.seed_contract as usize];
-        let seed_chain = store.chain_name(seed_row.chain_id).to_owned();
-        let seed_address = seed_row.address.clone();
-        let is_evm = store.is_evm_chain(&seed_chain);
-        let seed_cache = seed_caches
-            .get(&rel.seed_contract)
-            .cloned()
-            .unwrap_or_default();
-        let cand_controllers = bundle.controllers.clone();
-        let cand_address = bundle.address.clone();
-        let cand_id = rel.candidate_contract;
-
-        let slug_entry = cand_slugs.entry(cand_id).or_insert(None);
-        // probe needs &mut Option — clone out, probe, write back
-        let mut slug = slug_entry.clone();
-        let signals = probe_relation(
-            client,
-            keys,
-            limits,
-            &seed_chain,
-            is_evm,
-            &seed_address,
-            &cand_address,
-            &cand_controllers,
-            &mut slug,
-            &seed_cache,
+    // Seed probes are independent and were previously serialized across all seeds.
+    let seed_results = stream::iter(seed_ids.iter().copied().map(|seed_id| async move {
+        (
+            seed_id,
+            build_seed_cache(client, store, evidence_view, keys, limits, seed_id).await,
         )
-        .await;
-        *slug_entry = slug;
+    }))
+    .buffer_unordered(concurrency)
+    .collect::<Vec<_>>()
+    .await;
+    let seed_caches: AHashMap<ContractId, SeedCache> = seed_results.into_iter().collect();
 
-        let key = seed_key(&seed_chain, &seed_address);
-        bundle.relation_legit.insert(key, signals);
+    // Resolve each candidate collection slug once, including cached misses.
+    let slug_results = stream::iter(registry.candidate_contracts().iter().copied().map(
+        |candidate_id| async move {
+            let contract = &store.contracts[candidate_id as usize];
+            let chain = store.chain_name(contract.chain_id);
+            let slug =
+                resolve_collection_slug(client, limits, keys, chain, &contract.address).await;
+            (candidate_id, slug)
+        },
+    ))
+    .buffer_unordered(concurrency)
+    .collect::<Vec<_>>()
+    .await;
+    let candidate_slugs: AHashMap<ContractId, Option<String>> = slug_results.into_iter().collect();
+
+    // Network-backed holder checks are relation-local. Run them concurrently
+    // against an immutable evidence view, then apply signals in one short pass.
+    let relation_results = stream::iter(registry.relations().iter().filter_map(|rel| {
+        let bundle = evidence_view.get(&rel.candidate_contract)?;
+        let seed_cache = seed_caches.get(&rel.seed_contract)?;
+        let seed_row = &store.contracts[rel.seed_contract as usize];
+        let seed_chain = store.chain_name(seed_row.chain_id);
+        let seed_address = seed_row.address.as_str();
+        let is_evm = store.is_evm_chain(seed_chain);
+        let candidate_slug = candidate_slugs
+            .get(&rel.candidate_contract)
+            .and_then(Option::as_deref);
+        let candidate_id = rel.candidate_contract;
+        Some(async move {
+            let signals = probe_relation(
+                client,
+                keys,
+                limits,
+                seed_chain,
+                is_evm,
+                seed_address,
+                &bundle.address,
+                &bundle.controllers,
+                candidate_slug,
+                seed_cache,
+            )
+            .await;
+            (candidate_id, seed_key(seed_chain, seed_address), signals)
+        })
+    }))
+    .buffer_unordered(concurrency)
+    .collect::<Vec<_>>()
+    .await;
+
+    for (candidate_id, key, signals) in relation_results {
+        if let Some(bundle) = evidence.get_mut(&candidate_id) {
+            bundle.relation_legit.insert(key, signals);
+        }
     }
 
     for bundle in evidence.values_mut() {
@@ -389,13 +387,14 @@ pub fn classify_relation_offline(
     transfer_counterparty: bool,
 ) -> LegitSignals {
     let mut signals = continuity_signals(seed_controllers, cand_controllers, chain, true);
-    if let (Some(a), Some(b)) = (seed_slug, cand_slug) {
-        if !a.is_empty() && a.eq_ignore_ascii_case(b) {
-            signals.official_collection_relation = true;
-            signals
-                .evidence_keys
-                .push(format!("opensea_collection:{}", a.to_ascii_lowercase()));
-        }
+    if let (Some(a), Some(b)) = (seed_slug, cand_slug)
+        && !a.is_empty()
+        && a.eq_ignore_ascii_case(b)
+    {
+        signals.official_collection_relation = true;
+        signals
+            .evidence_keys
+            .push(format!("opensea_collection:{}", a.to_ascii_lowercase()));
     }
     if holds_seed {
         signals.seed_nft_interaction = true;

@@ -40,42 +40,47 @@ pub fn query_uri_for_seed(
     }
     let seed_chain = store.contracts[seed_usize].chain_id;
 
-    let seed_nfts: Vec<NftId> = store
-        .nfts
-        .iter()
-        .filter(|nft| nft.contract_id == seed)
-        .map(|nft| nft.id)
-        .collect();
+    let seed_nfts = store.contract_nft_csr.values_for(seed).unwrap_or(&[]);
 
     let mut token_hit_scopes: AHashMap<NftId, AHashSet<UriScope>> = AHashMap::new();
     let mut token_hit_candidates: AHashMap<UriScope, AHashSet<NftId>> = AHashMap::new();
 
-    progress.begin_phase("token_uri", Some(seed_nfts.len() as u64));
-    for &seed_nft in &seed_nfts {
-        progress.check_cancelled()?;
-        if let Some(uri_id) = store.nfts[seed_nft as usize].token_uri_id {
-            if let Some(members) = store.token_uri_csr.values_for(uri_id) {
-                let by_chain = group_members_by_chain(store, members);
-                emit_uri_hits(
-                    store,
-                    seed,
-                    seed_chain,
-                    seed_nft,
-                    Dimension::TokenUri,
-                    &by_chain,
-                    /*skip_scopes=*/ None,
-                    /*exclude_candidates=*/ None,
-                    graph,
-                    Some(&mut token_hit_scopes),
-                    Some(&mut token_hit_candidates),
-                );
-            }
+    let mut token_queries: AHashMap<crate::entity::StringId, Vec<NftId>> = AHashMap::new();
+    let mut token_missing = 0_u64;
+    for &seed_nft in seed_nfts {
+        match store.nfts[seed_nft as usize].token_uri_id {
+            Some(uri_id) => token_queries.entry(uri_id).or_default().push(seed_nft),
+            None => token_missing += 1,
         }
-        progress.add_completed(1);
     }
 
+    let mut token_queries: Vec<_> = token_queries.into_iter().collect();
+    token_queries.sort_unstable_by_key(|(uri_id, _)| *uri_id);
+    progress.begin_phase("token_uri", Some(seed_nfts.len() as u64));
+    for (uri_id, source_nfts) in token_queries {
+        progress.check_cancelled()?;
+        if let Some(members) = store.token_uri_csr.values_for(uri_id) {
+            let by_chain = group_members_by_chain(store, members);
+            emit_uri_hits(
+                store,
+                seed,
+                seed_chain,
+                &source_nfts,
+                Dimension::TokenUri,
+                &by_chain,
+                /*skip_scopes=*/ None,
+                /*exclude_candidates=*/ None,
+                graph,
+                Some(&mut token_hit_scopes),
+                Some(&mut token_hit_candidates),
+            );
+        }
+        progress.add_completed(source_nfts.len() as u64);
+    }
+    progress.add_completed(token_missing);
+
     progress.begin_phase("image_uri", Some(seed_nfts.len() as u64));
-    for &seed_nft in &seed_nfts {
+    for &seed_nft in seed_nfts {
         progress.check_cancelled()?;
         if let Some(uri_id) = store.nfts[seed_nft as usize].image_uri_id {
             if let Some(members) = store.image_uri_csr.values_for(uri_id) {
@@ -85,7 +90,7 @@ pub fn query_uri_for_seed(
                     store,
                     seed,
                     seed_chain,
-                    seed_nft,
+                    std::slice::from_ref(&seed_nft),
                     Dimension::ImageUri,
                     &by_chain,
                     skip,
@@ -102,15 +107,12 @@ pub fn query_uri_for_seed(
     Ok(())
 }
 
-fn group_members_by_chain(
-    store: &ResidentStore,
-    members: &[NftId],
-) -> AHashMap<ChainId, Vec<NftId>> {
-    let mut by_chain: AHashMap<ChainId, Vec<NftId>> = AHashMap::new();
+fn group_members_by_chain(store: &ResidentStore, members: &[NftId]) -> Vec<Vec<NftId>> {
+    let mut by_chain = vec![Vec::new(); store.chains.len()];
     for &nft_id in members {
         let contract_id = store.nfts[nft_id as usize].contract_id;
         let chain_id = store.contracts[contract_id as usize].chain_id;
-        by_chain.entry(chain_id).or_default().push(nft_id);
+        by_chain[chain_id as usize].push(nft_id);
     }
     by_chain
 }
@@ -119,9 +121,9 @@ fn emit_uri_hits(
     store: &ResidentStore,
     seed: ContractId,
     seed_chain: ChainId,
-    seed_nft: NftId,
+    seed_nfts: &[NftId],
     dimension: Dimension,
-    by_chain: &AHashMap<ChainId, Vec<NftId>>,
+    by_chain: &[Vec<NftId>],
     skip_scopes: Option<&AHashSet<UriScope>>,
     exclude_candidates: Option<&AHashMap<UriScope, AHashSet<NftId>>>,
     graph: &mut HitGraph,
@@ -133,10 +135,9 @@ fn emit_uri_hits(
 
     // Intra-chain: URI on ≥2 distinct contracts (after optional token-hit exclusion).
     if !skip(UriScope::Intra) {
-        if let Some(primary_members) = by_chain.get(&seed_chain) {
+        if let Some(primary_members) = by_chain.get(seed_chain as usize) {
             let excl = excluded(UriScope::Intra);
-            let contracts = distinct_contracts(store, primary_members, excl);
-            if contracts.len() >= 2 && contracts.contains(&seed) {
+            if has_seed_and_other_contract(store, primary_members, excl, seed) {
                 let mut any = false;
                 for &nft_id in primary_members {
                     if excl.is_some_and(|s| s.contains(&nft_id)) {
@@ -163,7 +164,9 @@ fn emit_uri_hits(
                 }
                 if any {
                     if let Some(out) = hit_scopes_out.as_deref_mut() {
-                        out.entry(seed_nft).or_default().insert(UriScope::Intra);
+                        for &seed_nft in seed_nfts {
+                            out.entry(seed_nft).or_default().insert(UriScope::Intra);
+                        }
                     }
                 }
             }
@@ -171,24 +174,20 @@ fn emit_uri_hits(
     }
 
     // Cross-chain: URI must appear on seed chain and peer chain.
-    if !by_chain.contains_key(&seed_chain) {
+    if by_chain.get(seed_chain as usize).is_none_or(Vec::is_empty) {
         return;
     }
-    let peer_chains: Vec<ChainId> = by_chain
-        .keys()
-        .copied()
-        .filter(|&c| c != seed_chain)
-        .collect();
 
-    for peer in peer_chains {
+    for (peer_index, peer_members) in by_chain.iter().enumerate() {
+        let peer = peer_index as ChainId;
+        if peer == seed_chain || peer_members.is_empty() {
+            continue;
+        }
         let scope = UriScope::Cross(peer);
         if skip(scope) {
             continue;
         }
         // Peer side must still have at least one non-excluded NFT.
-        let Some(peer_members) = by_chain.get(&peer) else {
-            continue;
-        };
         let excl = excluded(scope);
         let peer_alive = peer_members
             .iter()
@@ -199,7 +198,7 @@ fn emit_uri_hits(
 
         // Seed chain must also retain a participating posting after exclusion
         // (seed NFT itself always participates when we reach here from its URI).
-        let Some(primary_members) = by_chain.get(&seed_chain) else {
+        let Some(primary_members) = by_chain.get(seed_chain as usize) else {
             continue;
         };
         let primary_alive = primary_members
@@ -235,25 +234,36 @@ fn emit_uri_hits(
         }
         if any {
             if let Some(out) = hit_scopes_out.as_deref_mut() {
-                out.entry(seed_nft).or_default().insert(scope);
+                for &seed_nft in seed_nfts {
+                    out.entry(seed_nft).or_default().insert(scope);
+                }
             }
         }
     }
 }
 
-fn distinct_contracts(
+fn has_seed_and_other_contract(
     store: &ResidentStore,
     members: &[NftId],
     exclude_nfts: Option<&AHashSet<NftId>>,
-) -> AHashSet<ContractId> {
-    let mut out = AHashSet::new();
+    seed: ContractId,
+) -> bool {
+    let mut has_seed = false;
+    let mut has_other = false;
     for &nft_id in members {
         if exclude_nfts.is_some_and(|s| s.contains(&nft_id)) {
             continue;
         }
-        out.insert(store.nfts[nft_id as usize].contract_id);
+        if store.nfts[nft_id as usize].contract_id == seed {
+            has_seed = true;
+        } else {
+            has_other = true;
+        }
+        if has_seed && has_other {
+            return true;
+        }
     }
-    out
+    false
 }
 
 #[cfg(test)]
@@ -340,5 +350,34 @@ mod tests {
         let mut graph = HitGraph::new();
         query_uri_for_seed(&store, seed, &mut graph, &NoopProgress).unwrap();
         assert!(graph.is_empty());
+    }
+
+    #[test]
+    fn repeated_seed_uri_is_queried_once_and_marks_all_fallback_scopes() {
+        let store = prepared([
+            row("ethereum", "a", "1", "ipfs://token", "ipfs://image", 1),
+            row("ethereum", "a", "2", "ipfs://token", "ipfs://image", 2),
+            row("ethereum", "b", "1", "ipfs://token", "ipfs://image", 3),
+        ]);
+        let seed = cid(&store, "ethereum", "a");
+        let mut graph = HitGraph::new();
+        query_uri_for_seed(&store, seed, &mut graph, &NoopProgress).unwrap();
+
+        assert_eq!(
+            graph
+                .edges()
+                .iter()
+                .filter(|edge| edge.dimension == Dimension::TokenUri)
+                .count(),
+            1,
+            "identical seed-side URI queries must not duplicate candidate edges"
+        );
+        assert!(
+            graph
+                .edges()
+                .iter()
+                .all(|edge| edge.dimension != Dimension::ImageUri),
+            "token hit must suppress image fallback for every seed NFT sharing the URI"
+        );
     }
 }

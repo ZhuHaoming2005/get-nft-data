@@ -23,6 +23,8 @@ pub struct ResidentStore {
     pub nfts: Vec<Nft>,
     pub nft_index: AHashMap<(ContractId, String), NftId>,
     pub strings: StringPool,
+    /// Contract id → resident NFT ids, used by seed-scoped queries.
+    pub contract_nft_csr: CsrIndex,
     pub token_uri_csr: CsrIndex,
     pub image_uri_csr: CsrIndex,
     /// EVM contract-level name postings (filled by `finalize_name_index`).
@@ -31,6 +33,12 @@ pub struct ResidentStore {
     pub name_nft_csr: CsrIndex,
     /// Unique indexed name ids sorted by char length then text (JW length windows).
     pub name_keys_by_len: Vec<StringId>,
+    /// Character lengths parallel to `name_keys_by_len` for allocation-free windows.
+    pub name_key_char_lens: Vec<u32>,
+    /// Offsets into `name_sorted_chars`, parallel to `name_keys_by_len`.
+    pub name_sorted_char_offsets: Vec<u64>,
+    /// Sorted Unicode scalar values for every indexed name, stored contiguously.
+    pub name_sorted_chars: Vec<char>,
     /// Prepared BM25 documents + term postings (filled by `finalize_metadata_index`).
     pub metadata_index: MetadataIndex,
     pub totals: AHashMap<ChainId, ChainTotals>,
@@ -59,11 +67,15 @@ impl ResidentStore {
             nfts: Vec::new(),
             nft_index: AHashMap::new(),
             strings: StringPool::new(),
+            contract_nft_csr: CsrIndex::new(),
             token_uri_csr: CsrIndex::new(),
             image_uri_csr: CsrIndex::new(),
             name_contract_csr: CsrIndex::new(),
             name_nft_csr: CsrIndex::new(),
             name_keys_by_len: Vec::new(),
+            name_key_char_lens: Vec::new(),
+            name_sorted_char_offsets: vec![0],
+            name_sorted_chars: Vec::new(),
             metadata_index: MetadataIndex::default(),
             totals: AHashMap::new(),
             rows_loaded: 0,
@@ -261,9 +273,7 @@ impl ResidentStore {
             return;
         }
         let insert_at = anchors
-            .binary_search_by(|record| {
-                compare_token_ids_desc(&record.token_id, &token_id, is_evm)
-            })
+            .binary_search_by(|record| compare_token_ids_desc(&record.token_id, &token_id, is_evm))
             .unwrap_or_else(|position| position);
         if insert_at >= self.metadata_anchor_limit && anchors.len() >= self.metadata_anchor_limit {
             return;
@@ -283,12 +293,22 @@ impl ResidentStore {
     }
 
     pub fn rebuild_uri_csr(&mut self) {
-        let (token_uri_csr, image_uri_csr) = (
-            build_uri_csr(&self.nfts, true),
-            build_uri_csr(&self.nfts, false),
+        let (contract_nft_csr, (token_uri_csr, image_uri_csr)) = rayon::join(
+            || build_contract_nft_csr(&self.nfts),
+            || {
+                rayon::join(
+                    || build_uri_csr(&self.nfts, true),
+                    || build_uri_csr(&self.nfts, false),
+                )
+            },
         );
+        self.contract_nft_csr = contract_nft_csr;
         self.token_uri_csr = token_uri_csr;
         self.image_uri_csr = image_uri_csr;
+    }
+
+    pub(crate) fn rebuild_contract_nft_csr(&mut self) {
+        self.contract_nft_csr = build_contract_nft_csr(&self.nfts);
     }
 
     /// Merge another shard; preserves destination (left) identity and remaps shard ids.
@@ -434,6 +454,12 @@ fn build_uri_csr(nfts: &[Nft], token_dimension: bool) -> CsrIndex {
             Some((uri, nft.id))
         })
         .collect();
+    pairs.sort_unstable();
+    CsrIndex::from_sorted_pairs(&pairs)
+}
+
+fn build_contract_nft_csr(nfts: &[Nft]) -> CsrIndex {
+    let mut pairs: Vec<(u32, u32)> = nfts.iter().map(|nft| (nft.contract_id, nft.id)).collect();
     pairs.sort_unstable();
     CsrIndex::from_sorted_pairs(&pairs)
 }

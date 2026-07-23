@@ -38,8 +38,16 @@ impl CandidateRegistry {
             let key = (edge.seed_contract, edge.candidate_contract);
             candidates.insert(edge.candidate_contract);
             pair_dims.entry(key).or_default().insert(edge.dimension);
-            for nft in HitGraph::expand_edge_nfts(edge, contract_nfts) {
-                pair_nfts.entry(key).or_default().insert(nft);
+            let nfts = pair_nfts.entry(key).or_default();
+            match edge.candidate_nft {
+                Some(nft) => {
+                    nfts.insert(nft);
+                }
+                None => {
+                    if let Some(contract_members) = contract_nfts.get(&edge.candidate_contract) {
+                        nfts.extend(contract_members.iter().copied());
+                    }
+                }
             }
         }
 
@@ -54,11 +62,17 @@ impl CandidateRegistry {
 
         for key in keys {
             let (seed_contract, candidate_contract) = key;
-            let mut dimensions: Vec<Dimension> =
-                pair_dims.remove(&key).unwrap_or_default().into_iter().collect();
+            let mut dimensions: Vec<Dimension> = pair_dims
+                .remove(&key)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
             dimensions.sort_by_key(|d| dimension_ord(*d));
-            let mut nft_ids: Vec<NftId> =
-                pair_nfts.remove(&key).unwrap_or_default().into_iter().collect();
+            let mut nft_ids: Vec<NftId> = pair_nfts
+                .remove(&key)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
             nft_ids.sort_unstable();
 
             let idx = relations.len();

@@ -68,6 +68,7 @@ dependencies = [
  "arrow-cast",
  "arrow-schema",
  "chrono",
+ "futures-util",
  "httpmock",
  "num-bigint",
  "parquet",

@@ -21,6 +21,9 @@ pub const DEFAULT_NAME_THRESHOLD: f64 = 0.98;
 
 /// Build EVM representatives, Solana NFT name CSR, and length-sorted name keys.
 pub fn finalize_name_index(store: &mut ResidentStore) -> Result<(), Analysis2Error> {
+    if store.contract_nft_csr.is_empty() && !store.nfts.is_empty() {
+        store.rebuild_contract_nft_csr();
+    }
     for contract in &mut store.contracts {
         contract.name_id = None;
     }
@@ -63,15 +66,36 @@ pub fn finalize_name_index(store: &mut ResidentStore) -> Result<(), Analysis2Err
     for &key in &store.name_nft_csr.keys {
         keys.insert(key);
     }
-    let mut keyed: Vec<(usize, String, StringId)> = keys
+    let mut keyed: Vec<(usize, StringId)> = keys
         .into_iter()
-        .map(|id| {
-            let text = store.string(id).to_owned();
-            (text.chars().count(), text, id)
-        })
+        .map(|id| (store.string(id).chars().count(), id))
         .collect();
-    keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    store.name_keys_by_len = keyed.into_iter().map(|(_, _, id)| id).collect();
+    keyed.sort_unstable_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| store.string(a.1).cmp(store.string(b.1)))
+    });
+
+    store.name_keys_by_len.clear();
+    store.name_key_char_lens.clear();
+    store.name_sorted_char_offsets.clear();
+    store.name_sorted_chars.clear();
+    store.name_keys_by_len.reserve(keyed.len());
+    store.name_key_char_lens.reserve(keyed.len());
+    store.name_sorted_char_offsets.reserve(keyed.len() + 1);
+    store.name_sorted_char_offsets.push(0);
+
+    let mut sorted_chars = Vec::new();
+    for (char_len, id) in keyed {
+        store.name_keys_by_len.push(id);
+        store.name_key_char_lens.push(char_len as u32);
+        sorted_chars.clear();
+        sorted_chars.extend(store.string(id).chars());
+        sorted_chars.sort_unstable();
+        store.name_sorted_chars.extend_from_slice(&sorted_chars);
+        store
+            .name_sorted_char_offsets
+            .push(store.name_sorted_chars.len() as u64);
+    }
     Ok(())
 }
 
@@ -100,23 +124,25 @@ pub fn query_name_for_seed(
     let seed_chain_name = store.chain_name(seed_chain);
     let seed_is_evm = store.is_evm_chain(seed_chain_name);
 
-    let queries: Vec<(StringId, String)> = if seed_is_evm {
+    let queries: Vec<StringId> = if seed_is_evm {
         match store.contracts[seed_usize].name_id {
-            Some(name_id) => vec![(name_id, store.string(name_id).to_owned())],
+            Some(name_id) => vec![name_id],
             None => Vec::new(),
         }
     } else {
         store
-            .nfts
+            .contract_nft_csr
+            .values_for(seed)
+            .unwrap_or(&[])
             .iter()
-            .filter(|nft| nft.contract_id == seed)
-            .filter_map(|nft| {
+            .filter_map(|&nft_id| {
+                let nft = &store.nfts[nft_id as usize];
                 let name_id = nft.name_id?;
                 let text = store.string(name_id);
                 if !usable(text) {
                     return None;
                 }
-                Some((name_id, text.to_owned()))
+                Some(name_id)
             })
             .collect()
     };
@@ -124,14 +150,14 @@ pub fn query_name_for_seed(
     progress.begin_phase("name_query", Some(queries.len() as u64));
     let mut seen_candidates: AHashSet<(ContractId, ChainId)> = AHashSet::new();
 
-    for (query_id, query_text) in &queries {
+    for &query_id in &queries {
         progress.check_cancelled()?;
         emit_for_query(
             store,
             seed,
             seed_chain,
-            *query_id,
-            query_text,
+            query_id,
+            store.string(query_id),
             threshold,
             graph,
             &mut seen_candidates,
@@ -179,40 +205,35 @@ fn emit_for_query(
     let args = Args::default().score_cutoff(threshold.clamp(0.0, 1.0));
     let prepared = BatchComparator::new(query_chars.iter().copied());
 
-    // Length window over sorted unique names.
+    // Allocation-free length window over sorted unique names.
     let keys = &store.name_keys_by_len;
-    let mut lo = 0usize;
-    while lo < keys.len() {
-        let cand_len = store.string(keys[lo]).chars().count();
-        if CandidateBounds::lengths_can_reach(query_len, cand_len, threshold) {
-            break;
-        }
-        lo += 1;
-    }
-    let mut hi = lo;
-    while hi < keys.len() {
-        let cand_len = store.string(keys[hi]).chars().count();
-        if !CandidateBounds::lengths_can_reach(query_len, cand_len, threshold) {
-            break;
-        }
-        hi += 1;
-    }
+    let lengths = &store.name_key_char_lens;
+    debug_assert_eq!(keys.len(), lengths.len());
+    let lo = lengths.partition_point(|&cand_len| {
+        let cand_len = cand_len as usize;
+        cand_len < query_len && !CandidateBounds::lengths_can_reach(query_len, cand_len, threshold)
+    });
+    let hi = lengths.partition_point(|&cand_len| {
+        let cand_len = cand_len as usize;
+        cand_len <= query_len || CandidateBounds::lengths_can_reach(query_len, cand_len, threshold)
+    });
 
-    for &name_id in &keys[lo..hi] {
+    for key_index in lo..hi {
+        let name_id = keys[key_index];
         if name_id == query_id {
             continue; // exact already emitted
         }
         let cand_text = store.string(name_id);
-        let cand_len = cand_text.chars().count();
+        let cand_len = lengths[key_index] as usize;
         if !CandidateBounds::lengths_can_reach(query_len, cand_len, threshold) {
             continue;
         }
-        let required =
-            CandidateBounds::minimum_multiset_overlap(query_len, cand_len, threshold);
+        let required = CandidateBounds::minimum_multiset_overlap(query_len, cand_len, threshold);
         if required > 0 {
-            let mut cand_sorted: Vec<char> = cand_text.chars().collect();
-            cand_sorted.sort_unstable();
-            if !sorted_overlap_at_least(&query_sorted, &cand_sorted, required) {
+            let start = store.name_sorted_char_offsets[key_index] as usize;
+            let end = store.name_sorted_char_offsets[key_index + 1] as usize;
+            let cand_sorted = &store.name_sorted_chars[start..end];
+            if !sorted_overlap_at_least(&query_sorted, cand_sorted, required) {
                 continue;
             }
         }
@@ -315,14 +336,8 @@ mod tests {
         }
     }
 
-    fn prepared(
-        evm: &[&str],
-        rows: impl IntoIterator<Item = IdentityRow>,
-    ) -> ResidentStore {
-        let evm_set = evm
-            .iter()
-            .map(|c| (*c).to_owned())
-            .collect::<AHashSet<_>>();
+    fn prepared(evm: &[&str], rows: impl IntoIterator<Item = IdentityRow>) -> ResidentStore {
+        let evm_set = evm.iter().map(|c| (*c).to_owned()).collect::<AHashSet<_>>();
         let mut store = ResidentStore::with_options(8, &evm_set);
         for r in rows {
             store.ingest_identity_row(r).unwrap();
@@ -488,5 +503,62 @@ mod tests {
         )
         .unwrap();
         assert!(graph.is_empty());
+    }
+
+    #[test]
+    fn cached_length_window_matches_exhaustive_jaro_winkler() {
+        let names = [
+            "a",
+            "ab",
+            "abc",
+            "abcd",
+            "abcde",
+            "abcdf",
+            "xbcde",
+            "abcdefghij",
+            "abcdefghijk",
+            "zzzzzzzzzzzzzzzz",
+            "αβγδε",
+        ];
+        let rows = names.iter().enumerate().map(|(index, name)| {
+            row(
+                "ethereum",
+                &format!("0x{index:02x}"),
+                "1",
+                name,
+                index as u64,
+            )
+        });
+        let store = prepared(&["ethereum"], rows);
+        let seed = cid(&store, "ethereum", "0x04");
+
+        assert_eq!(
+            store.name_sorted_char_offsets.len(),
+            store.name_keys_by_len.len() + 1
+        );
+        assert_eq!(store.name_key_char_lens.len(), store.name_keys_by_len.len());
+
+        for threshold in [0.8, 0.98, 1.0] {
+            let mut graph = HitGraph::new();
+            query_name_for_seed(&store, seed, threshold, &mut graph, &NoopProgress).unwrap();
+            let actual: AHashSet<ContractId> = graph
+                .edges()
+                .iter()
+                .map(|edge| edge.candidate_contract)
+                .collect();
+            let expected: AHashSet<ContractId> = names
+                .iter()
+                .enumerate()
+                .filter(|(index, name)| {
+                    *index != 4
+                        && rapidfuzz::distance::jaro_winkler::similarity(
+                            "abcde".chars(),
+                            name.chars(),
+                        ) >= threshold
+                })
+                .map(|(index, _)| cid(&store, "ethereum", &format!("0x{index:02x}")))
+                .collect();
+            assert_eq!(actual, expected, "threshold={threshold}");
+        }
     }
 }

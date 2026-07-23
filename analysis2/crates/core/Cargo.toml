@@ -11,6 +11,7 @@ arrow-array.workspace = true
 arrow-cast.workspace = true
 arrow-schema.workspace = true
 chrono.workspace = true
+futures-util.workspace = true
 num-bigint.workspace = true
 parquet.workspace = true
 rapidfuzz.workspace = true

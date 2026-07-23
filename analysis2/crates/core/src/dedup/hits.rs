@@ -67,6 +67,11 @@ impl HitGraph {
         true
     }
 
+    /// Append already-validated edges from another seed-local graph without cloning.
+    pub fn append(&mut self, other: &mut Self) {
+        self.edges.append(&mut other.edges);
+    }
+
     /// Whether `edge` participates in `scope` for the given primary (/ optional matrix secondary).
     pub fn edge_in_scope(
         edge: &HitEdge,
@@ -120,8 +125,15 @@ impl HitGraph {
             if !Self::edge_in_scope(edge, scope, primary_chain, matrix_secondary) {
                 continue;
             }
-            for nft in Self::expand_edge_nfts(edge, contract_nfts) {
-                out.insert(nft);
+            match edge.candidate_nft {
+                Some(nft) => {
+                    out.insert(nft);
+                }
+                None => {
+                    if let Some(nfts) = contract_nfts.get(&edge.candidate_contract) {
+                        out.extend(nfts.iter().copied());
+                    }
+                }
             }
         }
         out
@@ -151,8 +163,15 @@ impl HitGraph {
             if !Self::edge_in_scope(edge, scope, primary_chain, matrix_secondary) {
                 continue;
             }
-            for nft in Self::expand_edge_nfts(edge, contract_nfts) {
-                out.insert(nft);
+            match edge.candidate_nft {
+                Some(nft) => {
+                    out.insert(nft);
+                }
+                None => {
+                    if let Some(nfts) = contract_nfts.get(&edge.candidate_contract) {
+                        out.extend(nfts.iter().copied());
+                    }
+                }
             }
         }
         if dimension == Dimension::ImageUri {
@@ -217,13 +236,7 @@ mod tests {
         let mut contract_nfts = AHashMap::new();
         contract_nfts.insert(cand, vec![nft, 43]);
 
-        let union = g.union_candidate_nfts(
-            1,
-            ScopeKind::ChainMatrix,
-            0,
-            Some(1),
-            &contract_nfts,
-        );
+        let union = g.union_candidate_nfts(1, ScopeKind::ChainMatrix, 0, Some(1), &contract_nfts);
         // Name/Metadata expand to {42, 43}; URI hits add 42 — union size is 2, not 4+
         assert_eq!(union.len(), 2);
         assert!(union.contains(&nft));
@@ -244,22 +257,10 @@ mod tests {
         let total = g.union_candidate_nfts(1, scope, 0, None, &contract_nfts);
         assert_eq!(total.len(), 2);
 
-        let token = g.dimension_candidate_nfts(
-            1,
-            Dimension::TokenUri,
-            scope,
-            0,
-            None,
-            &contract_nfts,
-        );
-        let image = g.dimension_candidate_nfts(
-            1,
-            Dimension::ImageUri,
-            scope,
-            0,
-            None,
-            &contract_nfts,
-        );
+        let token =
+            g.dimension_candidate_nfts(1, Dimension::TokenUri, scope, 0, None, &contract_nfts);
+        let image =
+            g.dimension_candidate_nfts(1, Dimension::ImageUri, scope, 0, None, &contract_nfts);
         assert_eq!(token, AHashSet::from([shared]));
         // shared already counted under token_uri → excluded from image_uri numerator
         assert_eq!(image, AHashSet::from([image_only]));
