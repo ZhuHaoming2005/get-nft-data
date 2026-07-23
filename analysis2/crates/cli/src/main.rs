@@ -73,8 +73,9 @@ struct RunArgs {
     #[arg(long)]
     rayon_threads: Option<usize>,
 
-    /// Max concurrent HTTP requests.
-    #[arg(long, default_value_t = 32)]
+    /// Max concurrent HTTP requests (Alchemy/Helius/etc.). Keep modest: each
+    /// candidate fans out to many nested RPCs. Default 12 avoids mass timeouts.
+    #[arg(long, default_value_t = 12)]
     http_concurrency: usize,
 
     /// Path for durable dedup cache (default: `<output-dir>/dedup_cache.json`).

@@ -332,8 +332,10 @@ pub struct HttpLimits {
 impl Default for HttpLimits {
     fn default() -> Self {
         Self {
+            // Prefer modest concurrency: Alchemy timeouts explode under 32×N
+            // nested candidate tasks on large holder/sales pages.
             concurrency: 8,
-            retries: 2,
+            retries: 3,
             max_transfer_pages: 5,
             max_holder_pages: 5,
             max_sale_pages: 5,

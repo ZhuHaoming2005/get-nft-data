@@ -22,8 +22,10 @@ use super::types::{
 };
 use super::value_flow;
 
-/// Candidate tasks may exceed HTTP slots so waiters pipeline behind [`HttpClient`].
-const CANDIDATE_TASK_MULTIPLIER: usize = 4;
+/// Candidate tasks may slightly exceed HTTP slots so waiters pipeline behind
+/// [`HttpClient`]. Kept low: each candidate fans out to many nested RPCs, and
+/// a large multiplier with high `--http-concurrency` causes mass timeouts.
+const CANDIDATE_TASK_MULTIPLIER: usize = 2;
 
 /// Enrich each unique candidate once; missing keys → `not_requested`, continue.
 pub async fn enrich_candidates(

@@ -9,8 +9,11 @@ use tokio::sync::Semaphore;
 
 use crate::error::Analysis2Error;
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_RETRIES: usize = 2;
+/// Total request timeout (connect + headers + body). Large Alchemy NFT pages
+/// (e.g. `getOwnersForContract?withTokenBalances=true`) often exceed 30s.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(90);
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const DEFAULT_RETRIES: usize = 3;
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// OpenSea token-bucket defaults (same knobs as `top_contract_analysis_rs`
@@ -105,8 +108,11 @@ impl HttpClient {
     pub fn with_retries(concurrency: usize, retries: usize) -> Result<Self, Analysis2Error> {
         let http = reqwest::Client::builder()
             .timeout(DEFAULT_TIMEOUT)
+            .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
             .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(concurrency.max(1))
             .tcp_keepalive(Duration::from_secs(60))
+            .tcp_nodelay(true)
             .build()
             .map_err(|e| Analysis2Error::http(e.to_string()))?;
         Ok(Self {
@@ -314,7 +320,13 @@ fn is_retryable(error: &Analysis2Error) -> bool {
                 || lower.contains("timed out")
                 || lower.contains("kind=timeout")
                 || lower.contains("kind=connect")
+                || lower.contains("kind=request")
+                || lower.contains("kind=body")
+                || lower.contains("kind=decode")
                 || lower.contains("connection")
+                || lower.contains("read body failed")
+                || lower.contains("error decoding response body")
+                || lower.contains("error sending request")
                 || lower.contains("http 429")
                 || lower.contains("http 500")
                 || lower.contains("http 502")
@@ -347,10 +359,36 @@ fn print_request_error(
     }
 }
 
+/// Query keys whose values are secrets (not bare substrings like `token` in
+/// `withTokenBalances`).
+fn is_secret_query_key(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "api-key"
+            | "api_key"
+            | "apikey"
+            | "x-api-key"
+            | "key"
+            | "access_token"
+            | "access-token"
+            | "token"
+            | "secret"
+            | "password"
+            | "authorization"
+            | "auth"
+    )
+}
+
 /// Host + path + redacted query for logs (never includes API keys).
 fn redact_endpoint(url: &str) -> String {
-    let Ok(parsed) = reqwest::Url::parse(url) else {
-        return "invalid-url".to_owned();
+    // reqwest error strings wrap URLs in parentheses; peel them first.
+    let trimmed = url
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .trim();
+    let Ok(parsed) = reqwest::Url::parse(trimmed) else {
+        return redact_path_secrets(trimmed);
     };
     let host = match (parsed.host_str(), parsed.port()) {
         (Some(host), Some(port)) => format!("{host}:{port}"),
@@ -365,12 +403,7 @@ fn redact_endpoint(url: &str) -> String {
             .map(|pair| {
                 let mut parts = pair.splitn(2, '=');
                 let key = parts.next().unwrap_or("");
-                let key_l = key.to_ascii_lowercase();
-                if key_l.contains("key")
-                    || key_l.contains("token")
-                    || key_l.contains("secret")
-                    || key_l.contains("auth")
-                {
+                if is_secret_query_key(key) {
                     format!("{key}=***")
                 } else {
                     pair.to_owned()
@@ -387,18 +420,39 @@ fn redact_endpoint(url: &str) -> String {
     redact_path_secrets(&out)
 }
 
+fn strip_wrapping_punct(s: &str) -> &str {
+    s.trim_matches(|c: char| {
+        matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | ',' | ';' | '.')
+    })
+}
+
+fn looks_like_api_key_segment(segment: &str) -> bool {
+    let cleaned = strip_wrapping_punct(segment);
+    cleaned.len() >= 12
+        && cleaned
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 fn redact_path_secrets(endpoint: &str) -> String {
-    // Replace long hex/base64-looking path segments after /v2/ or /v3/.
+    // Replace long secret-looking path segments after /v2/ or /v3/, even when
+    // the segment is glued to punctuation (e.g. "KEY)" inside error strings).
     let mut parts: Vec<String> = endpoint.split('/').map(str::to_owned).collect();
     for i in 0..parts.len() {
-        if matches!(parts[i].as_str(), "v2" | "v3") {
+        let head = strip_wrapping_punct(&parts[i]);
+        if matches!(head, "v2" | "v3") {
             if let Some(next) = parts.get_mut(i + 1) {
-                if next.len() >= 16
-                    && next
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-                {
-                    *next = "***".into();
+                if looks_like_api_key_segment(next) {
+                    // Preserve trailing punctuation so messages stay readable.
+                    let trailing: String = next
+                        .chars()
+                        .rev()
+                        .take_while(|c| !c.is_ascii_alphanumeric() && *c != '-' && *c != '_')
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect();
+                    *next = format!("***{trailing}");
                 }
             }
         }
@@ -410,13 +464,20 @@ fn redact_sensitive_text(text: &str) -> String {
     // Best-effort: hide query api-key=... and path /v2/<long token>.
     let mut out = text.to_owned();
     for marker in ["api-key=", "api_key=", "apikey=", "x-api-key="] {
-        if let Some(idx) = out.to_ascii_lowercase().find(marker) {
+        let lower = out.to_ascii_lowercase();
+        let mut search_from = 0;
+        while let Some(rel) = lower[search_from..].find(marker) {
+            let idx = search_from + rel;
             let start = idx + marker.len();
             let end = out[start..]
-                .find(|c: char| c == '&' || c == ' ' || c == '"' || c == '\'')
+                .find(|c: char| c == '&' || c == ' ' || c == '"' || c == '\'' || c == ')')
                 .map(|n| start + n)
                 .unwrap_or(out.len());
             out.replace_range(start..end, "***");
+            search_from = start + 3;
+            if search_from >= out.len() {
+                break;
+            }
         }
     }
     redact_path_secrets(&out)
@@ -457,6 +518,22 @@ mod tests {
         let label = redact_endpoint(url);
         assert!(label.contains("api-key=***"));
         assert!(!label.contains("abc123secret"));
+    }
+
+    #[test]
+    fn with_token_balances_query_is_not_treated_as_secret() {
+        let url = "https://eth-mainnet.g.alchemy.com/nft/v3/super-secret-key/getOwnersForContract?contractAddress=0xabc&withTokenBalances=true";
+        let label = redact_endpoint(url);
+        assert!(label.contains("withTokenBalances=true"));
+        assert!(!label.contains("super-secret-key"));
+    }
+
+    #[test]
+    fn redacts_key_inside_reqwest_error_parentheses() {
+        let msg = "error sending request for url (https://base-mainnet.g.alchemy.com/v2/O6O-K8fkagLHjOa-LLM3_KEY)";
+        let redacted = redact_sensitive_text(msg);
+        assert!(!redacted.contains("O6O-K8fkagLHjOa-LLM3_KEY"));
+        assert!(redacted.contains("/v2/***"));
     }
 
     #[test]
