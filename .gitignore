@@ -15,6 +15,7 @@ dist
 *result*
 CLAUDE.md
 output
+out
 *tmp*
 *.db*
 */examples
