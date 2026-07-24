@@ -26,7 +26,7 @@ pub struct DedupCacheParams {
     pub inputs: Vec<String>,
     pub chains: Vec<String>,
     pub evm_chains: Vec<String>,
-    pub name_threshold: f64,
+    pub name_threshold: Option<f64>,
     pub metadata_threshold: f64,
     pub metadata_anchors: usize,
     /// Absolute or display path of the seeds file used when the cache was built.
@@ -187,7 +187,12 @@ pub fn validate_dedup_cache(
             "dedup cache chains/evm-chains do not match current flags; re-run without --reuse-dedup",
         ));
     }
-    if (got.name_threshold - expected.name_threshold).abs() > f64::EPSILON
+    let name_threshold_matches = match (got.name_threshold, expected.name_threshold) {
+        (Some(got), Some(expected)) => (got - expected).abs() <= f64::EPSILON,
+        (None, None) => true,
+        _ => false,
+    };
+    if !name_threshold_matches
         || (got.metadata_threshold - expected.metadata_threshold).abs() > f64::EPSILON
         || got.metadata_anchors != expected.metadata_anchors
     {
@@ -329,7 +334,7 @@ mod tests {
             inputs: vec!["a.parquet".into()],
             chains: vec!["ethereum".into(), "base".into()],
             evm_chains: vec!["ethereum".into(), "base".into()],
-            name_threshold: 0.98,
+            name_threshold: Some(0.98),
             metadata_threshold: 0.6,
             metadata_anchors: 8,
             seeds_path: "seeds.json".into(),
@@ -343,6 +348,9 @@ mod tests {
         write_dedup_cache(&path, &cache).unwrap();
         let loaded = load_dedup_cache(&path).unwrap();
         validate_dedup_cache(&loaded, &params).unwrap();
+        let mut name_disabled = params.clone();
+        name_disabled.name_threshold = None;
+        assert!(validate_dedup_cache(&loaded, &name_disabled).is_err());
         let (completed, failures) = rematerialize_dedup_batch(&store, &loaded).unwrap();
         assert!(failures.is_empty());
         assert_eq!(completed.len(), 1);

@@ -71,6 +71,9 @@ cargo run --manifest-path analysis2/Cargo.toml --release -- run-dedup `
   --progress off
 ```
 
+Name deduplication is disabled unless `--name-threshold VALUE` is supplied. URI and
+Metadata deduplication still run normally.
+
 Writes under `--output-dir` in three roots:
 
 ```text
@@ -86,6 +89,8 @@ summary/
 ## Phase C — full `run`
 
 End-to-end: load → dedup all seeds → enrich unique candidates → deep analysis → reports.
+The example explicitly enables Name deduplication with `--name-threshold 0.98`; omit
+that flag to skip both the Name index build and Name duplicate queries.
 
 ```powershell
 cargo run --manifest-path analysis2/Cargo.toml --release -- run `

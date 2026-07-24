@@ -41,9 +41,11 @@ struct RunArgs {
     #[arg(long, value_delimiter = ',')]
     evm_chains: Vec<String>,
 
-    /// Name similarity threshold (Jaro-Winkler), default 0.98.
-    #[arg(long, default_value_t = 0.98)]
-    name_threshold: f64,
+    /// Enable Name deduplication with this Jaro-Winkler threshold.
+    ///
+    /// If omitted, Name indexes and Name duplicate queries are skipped.
+    #[arg(long)]
+    name_threshold: Option<f64>,
 
     /// Metadata BM25 threshold, default 0.6.
     #[arg(long, default_value_t = 0.6)]
@@ -245,5 +247,36 @@ fn run() -> Result<(), Analysis2Error> {
                 progress,
             )
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn required_run_args() -> Vec<&'static str> {
+        vec![
+            "analysis2",
+            "--input",
+            "snapshot.parquet",
+            "--seeds",
+            "seeds.json",
+            "--output-dir",
+            "out",
+        ]
+    }
+
+    #[test]
+    fn name_threshold_is_disabled_when_omitted() {
+        let args = RunArgs::try_parse_from(required_run_args()).unwrap();
+        assert_eq!(args.name_threshold, None);
+    }
+
+    #[test]
+    fn name_threshold_is_enabled_when_explicit() {
+        let mut argv = required_run_args();
+        argv.extend(["--name-threshold", "0.97"]);
+        let args = RunArgs::try_parse_from(argv).unwrap();
+        assert_eq!(args.name_threshold, Some(0.97));
     }
 }

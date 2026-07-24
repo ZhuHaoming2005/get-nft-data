@@ -32,7 +32,7 @@ pub struct RunDedupConfig {
     pub output_dir: PathBuf,
     pub chains: Vec<String>,
     pub evm_chains: Vec<String>,
-    pub name_threshold: f64,
+    pub name_threshold: Option<f64>,
     pub metadata_threshold: f64,
     pub metadata_anchors: usize,
     pub rayon_threads: Option<usize>,
@@ -56,7 +56,7 @@ pub struct RunConfig {
     pub output_dir: PathBuf,
     pub chains: Vec<String>,
     pub evm_chains: Vec<String>,
-    pub name_threshold: f64,
+    pub name_threshold: Option<f64>,
     pub metadata_threshold: f64,
     pub metadata_anchors: usize,
     pub rayon_threads: Option<usize>,
@@ -246,25 +246,34 @@ fn finish_seed_batch(
 fn query_name_and_metadata_stages(
     store: &mut ResidentStore,
     states: &mut [SeedDedupState],
-    name_threshold: f64,
+    name_threshold: Option<f64>,
     metadata_threshold: f64,
     progress: &dyn ProgressObserver,
 ) -> Result<(), Analysis2Error> {
     let quiet = CancellationOnlyProgress { inner: progress };
-    run_seed_stage(
-        states,
-        "name_seeds",
-        progress,
-        || {
-            NameQueryScratch::for_worker_pool(
-                store.name_keys_by_len.len(),
-                rayon::current_num_threads(),
-            )
-        },
-        |scratch, seed, graph| {
-            query_name_for_seed_with_scratch(store, seed, name_threshold, graph, &quiet, scratch)
-        },
-    )?;
+    if let Some(name_threshold) = name_threshold {
+        run_seed_stage(
+            states,
+            "name_seeds",
+            progress,
+            || {
+                NameQueryScratch::for_worker_pool(
+                    store.name_keys_by_len.len(),
+                    rayon::current_num_threads(),
+                )
+            },
+            |scratch, seed, graph| {
+                query_name_for_seed_with_scratch(
+                    store,
+                    seed,
+                    name_threshold,
+                    graph,
+                    &quiet,
+                    scratch,
+                )
+            },
+        )?;
+    }
     store.drop_name_indexes();
 
     run_seed_stage(
@@ -291,7 +300,7 @@ fn query_name_and_metadata_stages(
 fn query_seeds_staged(
     store: &mut ResidentStore,
     seeds: &[SeedRecord],
-    name_threshold: f64,
+    name_threshold: Option<f64>,
     metadata_threshold: f64,
     progress: &dyn ProgressObserver,
 ) -> Result<SeedDedupBatch, Analysis2Error> {
@@ -322,7 +331,7 @@ fn query_seeds_with_pass2_overlap(
     store: &mut ResidentStore,
     pending: PendingDedupLoad,
     seeds: &[SeedRecord],
-    name_threshold: f64,
+    name_threshold: Option<f64>,
     metadata_threshold: f64,
     progress: &dyn ProgressObserver,
 ) -> Result<SeedDedupBatch, Analysis2Error> {
@@ -377,11 +386,12 @@ fn run_dedup_inner(
     config: &RunDedupConfig,
     progress: &dyn ProgressObserver,
 ) -> Result<(), Analysis2Error> {
-    let options = LoadOptions::new(
+    let mut options = LoadOptions::new(
         config.chains.clone(),
         config.evm_chains.clone(),
         config.metadata_anchors,
     );
+    options.build_name_index = config.name_threshold.is_some();
     let seeds = load_seeds_json(&config.seeds)?;
     let (mut store, pending) =
         load_resident_store_uri_ready(&config.inputs, &options, progress)?;
@@ -651,11 +661,13 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
             config.metadata_anchors,
         )
     } else {
-        LoadOptions::new(
+        let mut options = LoadOptions::new(
             config.chains.clone(),
             config.evm_chains.clone(),
             config.metadata_anchors,
-        )
+        );
+        options.build_name_index = config.name_threshold.is_some();
+        options
     };
     let (mut store, pending) =
         load_resident_store_uri_ready(&config.inputs, &options, progress)?;
@@ -1065,6 +1077,28 @@ mod tests {
     use analysis2_core::{DEFAULT_METADATA_THRESHOLD, DEFAULT_NAME_THRESHOLD, SaleEvent};
     use serde_json::Value;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct PhaseRecordingProgress {
+        phases: Mutex<Vec<String>>,
+    }
+
+    impl ProgressObserver for PhaseRecordingProgress {
+        fn set_stage(&self, _stage: &str) {}
+
+        fn begin_phase(&self, phase: &str, _total: Option<u64>) {
+            self.phases.lock().unwrap().push(phase.to_owned());
+        }
+
+        fn add_completed(&self, _n: u64) {}
+
+        fn check_cancelled(&self) -> Result<(), Analysis2Error> {
+            Ok(())
+        }
+
+        fn finish(&self) {}
+    }
 
     #[test]
     fn explicit_rayon_threads_use_a_run_local_pool() {
@@ -1075,6 +1109,54 @@ mod tests {
         .unwrap();
         assert_eq!(workers, 3);
         assert!(with_rayon_pool(Some(0), || Ok::<_, Analysis2Error>(())).is_err());
+    }
+
+    #[test]
+    fn omitted_name_threshold_skips_name_dedup_stage() {
+        let dir = std::env::temp_dir().join(format!(
+            "analysis2_no_name_dedup_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let parquet = dir.join("fixture.parquet");
+        write_report_golden_fixture(&parquet).expect("fixture");
+        let seeds = dir.join("seeds.json");
+        std::fs::write(
+            &seeds,
+            r#"[{"chain":"ethereum","address":"0xseed","rank":1}]"#,
+        )
+        .unwrap();
+        let out = dir.join("out");
+        let progress = PhaseRecordingProgress::default();
+
+        run_dedup(
+            &RunDedupConfig {
+                inputs: vec![parquet],
+                seeds,
+                output_dir: out.clone(),
+                chains: vec!["ethereum".into(), "base".into(), "solana".into()],
+                evm_chains: vec!["ethereum".into(), "base".into()],
+                name_threshold: None,
+                metadata_threshold: DEFAULT_METADATA_THRESHOLD,
+                metadata_anchors: 8,
+                rayon_threads: None,
+            },
+            &progress,
+        )
+        .expect("run-dedup without Name dedup");
+
+        let phases = progress.phases.lock().unwrap();
+        assert!(!phases.iter().any(|phase| phase.starts_with("name_")));
+        assert!(phases.iter().any(|phase| phase == "metadata_seeds"));
+        drop(phases);
+
+        let manifest: Value = serde_json::from_str(
+            &std::fs::read_to_string(out.join("intermediate/run_manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(manifest["params"]["name_threshold"].is_null());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Allows load-time checks; after `dedup` stage, skips the resolve and
@@ -1141,7 +1223,7 @@ mod tests {
                 output_dir: out.clone(),
                 chains: vec!["ethereum".into(), "base".into(), "solana".into()],
                 evm_chains: vec!["ethereum".into(), "base".into()],
-                name_threshold: DEFAULT_NAME_THRESHOLD,
+                name_threshold: Some(DEFAULT_NAME_THRESHOLD),
                 metadata_threshold: DEFAULT_METADATA_THRESHOLD,
                 metadata_anchors: 8,
                 rayon_threads: None,
@@ -1218,7 +1300,7 @@ mod tests {
                 output_dir: out.clone(),
                 chains: vec!["ethereum".into(), "base".into(), "solana".into()],
                 evm_chains: vec!["ethereum".into(), "base".into()],
-                name_threshold: DEFAULT_NAME_THRESHOLD,
+                name_threshold: Some(DEFAULT_NAME_THRESHOLD),
                 metadata_threshold: DEFAULT_METADATA_THRESHOLD,
                 metadata_anchors: 8,
                 rayon_threads: Some(2),
@@ -1340,7 +1422,7 @@ mod tests {
                 output_dir: out.clone(),
                 chains: vec!["ethereum".into(), "base".into(), "solana".into()],
                 evm_chains: vec!["ethereum".into(), "base".into()],
-                name_threshold: DEFAULT_NAME_THRESHOLD,
+                name_threshold: Some(DEFAULT_NAME_THRESHOLD),
                 metadata_threshold: DEFAULT_METADATA_THRESHOLD,
                 metadata_anchors: 8,
                 rayon_threads: Some(2),
@@ -1407,7 +1489,7 @@ mod tests {
             output_dir: out.clone(),
             chains: vec!["ethereum".into(), "base".into(), "solana".into()],
             evm_chains: vec!["ethereum".into(), "base".into()],
-            name_threshold: DEFAULT_NAME_THRESHOLD,
+            name_threshold: Some(DEFAULT_NAME_THRESHOLD),
             metadata_threshold: DEFAULT_METADATA_THRESHOLD,
             metadata_anchors: 8,
             rayon_threads: Some(2),
@@ -1486,7 +1568,7 @@ mod tests {
                 output_dir: out.clone(),
                 chains: vec!["ethereum".into(), "base".into(), "solana".into()],
                 evm_chains: vec!["ethereum".into(), "base".into()],
-                name_threshold: DEFAULT_NAME_THRESHOLD,
+                name_threshold: Some(DEFAULT_NAME_THRESHOLD),
                 metadata_threshold: DEFAULT_METADATA_THRESHOLD,
                 metadata_anchors: 8,
                 rayon_threads: Some(2),

@@ -31,6 +31,8 @@ pub struct LoadOptions {
     /// When false, skip URI/Name/Metadata index build (identity + contract→NFT CSR only).
     /// Used when replaying a dedup cache so load is much cheaper.
     pub build_dedup_indexes: bool,
+    /// When false, skip the Name index while retaining URI and Metadata indexes.
+    pub build_name_index: bool,
 }
 
 impl Default for LoadOptions {
@@ -40,6 +42,7 @@ impl Default for LoadOptions {
             evm_chains: AHashSet::default(),
             metadata_anchors: 8,
             build_dedup_indexes: true,
+            build_name_index: true,
         }
     }
 }
@@ -55,6 +58,7 @@ impl LoadOptions {
             evm_chains: normalize_chain_set(evm_chains),
             metadata_anchors,
             build_dedup_indexes: true,
+            build_name_index: true,
         }
     }
 
@@ -69,6 +73,7 @@ impl LoadOptions {
             evm_chains: normalize_chain_set(evm_chains),
             metadata_anchors,
             build_dedup_indexes: false,
+            build_name_index: false,
         }
     }
 }
@@ -115,7 +120,9 @@ impl PendingDedupLoad {
         progress.begin_phase("apply_pass2_anchors", Some(1));
         pass2::apply_pass2_anchors(store, anchors)?;
         progress.add_completed(1);
-        finalize_name_index_with_progress(store, progress)?;
+        if self.options.build_name_index {
+            finalize_name_index_with_progress(store, progress)?;
+        }
         finalize_metadata_index_with_progress(store, progress)?;
         Ok(())
     }

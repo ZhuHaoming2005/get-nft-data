@@ -123,7 +123,7 @@ fn report_golden_duplicate_scale_fields_and_ratios() {
         inputs: vec!["report_golden.parquet".into()],
         chains: vec!["ethereum".into(), "base".into(), "solana".into()],
         evm_chains: vec!["ethereum".into(), "base".into()],
-        name_threshold: DEFAULT_NAME_THRESHOLD,
+        name_threshold: Some(DEFAULT_NAME_THRESHOLD),
         metadata_threshold: DEFAULT_METADATA_THRESHOLD,
         metadata_anchors: 8,
     };

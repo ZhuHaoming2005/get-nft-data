@@ -38,7 +38,7 @@ pub struct DedupRunParams {
     pub inputs: Vec<String>,
     pub chains: Vec<String>,
     pub evm_chains: Vec<String>,
-    pub name_threshold: f64,
+    pub name_threshold: Option<f64>,
     pub metadata_threshold: f64,
     pub metadata_anchors: usize,
 }
