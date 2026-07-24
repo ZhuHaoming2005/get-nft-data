@@ -209,13 +209,17 @@ pub fn write_summary_md(path: &Path, summary: &Value) -> Result<(), Analysis2Err
     write_all_chains_md(path, summary, &[])
 }
 
-/// Paper-style markdown: duplicate scale + address / economics / behavior tables.
+/// Paper-style markdown for any of the four scopes (intra / matrix / cross / all_chains).
 pub fn write_all_chains_md(
     path: &Path,
     summary: &Value,
     scale: &[DuplicateScaleRow],
 ) -> Result<(), Analysis2Error> {
-    let mut body = String::from("# NFT 论文统计汇总报告\n\n");
+    let scope = summary
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .unwrap_or("all_chains");
+    let mut body = format!("# NFT 论文统计汇总报告（scope = {scope}）\n\n");
 
     // Header counts
     body.push_str(&format!(
@@ -271,6 +275,48 @@ pub fn write_all_chains_md(
         body.push_str(&scale_table(scale));
     }
 
+    // Matrix: additional per-secondary-chain scale tables.
+    if let Some(blocks) = summary.get("matrix_blocks").and_then(|v| v.as_array()) {
+        for block in blocks {
+            let sec = block
+                .get("secondary_chain")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            body.push_str(&format!("\n### Matrix → {sec}\n\n"));
+            if let Some(rows) = block.get("rows").and_then(|v| v.as_array()) {
+                body.push_str("| 类别 | 重复 NFT 数 | NFT 占比 | 重复合约数 | 合约占比 |\n| --- | ---: | ---: | ---: | ---: |\n");
+                for row in rows {
+                    let nft_ratio = match row["duplicate_nft_ratio"].as_f64() {
+                        Some(r) => format!(
+                            "{:.2}% ({}/{})",
+                            r * 100.0,
+                            u64_cell(&row["duplicate_nft_ratio_numerator"]),
+                            u64_cell(&row["duplicate_nft_ratio_denominator"])
+                        ),
+                        None => "null".into(),
+                    };
+                    let c_ratio = match row["duplicate_contract_ratio"].as_f64() {
+                        Some(r) => format!(
+                            "{:.2}% ({}/{})",
+                            r * 100.0,
+                            u64_cell(&row["duplicate_contract_ratio_numerator"]),
+                            u64_cell(&row["duplicate_contract_ratio_denominator"])
+                        ),
+                        None => "null".into(),
+                    };
+                    body.push_str(&format!(
+                        "| {} | {} | {} | {} | {} |\n",
+                        row["category"].as_str().unwrap_or("?"),
+                        u64_cell(&row["duplicate_nft_count"]),
+                        nft_ratio,
+                        u64_cell(&row["duplicate_contract_count"]),
+                        c_ratio
+                    ));
+                }
+            }
+        }
+    }
+
     // ## 地址分类
     let addr = &summary["address_classification"];
     body.push_str("\n## 地址分类\n\n");
@@ -308,10 +354,10 @@ pub fn write_all_chains_md(
     ));
     body.push_str("\n> 说明：跨链汇总只可靠加总 USD；gas 按各链 native 单位分别累计展示，不混加为 ETH。\n");
 
-    // ## 产出投入比
+    // ## 产出投入比 (USD/USD only; contracts without priced gas excluded from counts)
     body.push_str("\n## 产出投入比\n\n");
     body.push_str(
-        "| scope | 产出 USD | 投入 USD (推断) | 产出/投入 | >=1 数量占比 | <1 数量占比 |\n| --- | ---: | ---: | ---: | ---: | ---: |\n",
+        "| scope | 产出 USD | 投入 USD (gas×spot) | 产出/投入 | >=1 数量占比 | <1 数量占比 |\n| --- | ---: | ---: | ---: | ---: | ---: |\n",
     );
     let ratio_s = match econ["output_input_ratio"].as_f64() {
         Some(r) => format!("{r:.5}x"),

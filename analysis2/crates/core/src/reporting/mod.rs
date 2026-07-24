@@ -11,8 +11,9 @@ pub mod run;
 
 pub use aggregate::{
     build_all_chains_duplicate_scale, build_contract_nft_map, build_duplicate_scale_rows,
-    build_seed_duplicate_scale, count_scope_nfts, AllChainsRelationRef, ChainMatrixBlock,
-    DuplicateScaleRow, ScopeNftCounts, SeedDuplicateScale,
+    build_scope_duplicate_scale, build_seed_duplicate_scale, count_scope_nfts,
+    matrix_secondary_chains, AllChainsRelationRef, ChainMatrixBlock, DuplicateScaleRow,
+    ScopeNftCounts, ScopeScaleFilter, SeedDuplicateScale,
 };
 pub use dedup_cache::{
     build_dedup_cache, default_dedup_cache_path, load_dedup_cache, rematerialize_dedup_batch,

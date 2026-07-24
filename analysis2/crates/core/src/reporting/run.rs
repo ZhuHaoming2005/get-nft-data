@@ -13,14 +13,12 @@ use crate::dedup::candidates::CandidateRegistry;
 use crate::entity::{ContractId, ResidentStore};
 use crate::error::Analysis2Error;
 
-use super::aggregate::{build_all_chains_duplicate_scale, AllChainsRelationRef};
 use super::json::{
     seed_dir_name, write_json, DedupRunParams, SeedDedupReport, SeedRecord,
 };
 use super::layout::{
-    ensure_output_layout, intermediate_path, seed_report_dir, summary_scope_path,
-    DETAIL_CANDIDATES_REL, SCOPE_ALL_CHAINS, SCOPE_LABEL_ALL_CHAINS, SCOPE_LABEL_CROSS_CHAIN,
-    SCOPE_CHAIN_MATRIX, SCOPE_INTRA_CHAIN,
+    ensure_output_layout, intermediate_path, seed_report_dir, DETAIL_CANDIDATES_REL,
+    SCOPE_CHAIN_MATRIX, SCOPE_INTRA_CHAIN, SCOPE_LABEL_ALL_CHAINS, SCOPE_LABEL_CROSS_CHAIN,
 };
 use super::manifest::{
     count_failed_seeds, write_failures_jsonl, FailureRecord, RunManifest, RunManifestSeeds,
@@ -172,14 +170,21 @@ fn economics_usd_from(facts: &EconomicFacts) -> EconomicsUsdRollup {
         output_input_ratio_lt1_count: 0,
         inferred_input_usd: 0.0,
     };
-    if let Some(ratio) = facts.output_input_ratio {
-        roll.output_input_ratio_count = 1;
-        if ratio >= 1.0 {
-            roll.output_input_ratio_ge1_count = 1;
-        } else {
-            roll.output_input_ratio_lt1_count = 1;
+    // Paper table is USD-centric: only count ge1/lt1 and sum input when the
+    // per-contract ratio is USD/USD (priced gas). Never invent USD input from a
+    // native/native ratio (that produced 17x aggregate with 100% "<1" rows).
+    if facts.output_input_ratio_is_usd {
+        if let Some(ratio) = facts.output_input_ratio {
+            roll.output_input_ratio_count = 1;
+            if ratio >= 1.0 {
+                roll.output_input_ratio_ge1_count = 1;
+            } else {
+                roll.output_input_ratio_lt1_count = 1;
+            }
         }
-        if ratio > 0.0 && facts.operator_output_usd.is_finite() {
+        if let Some(input_usd) = facts.attacker_input_usd.filter(|v| v.is_finite() && *v > 0.0) {
+            roll.inferred_input_usd = input_usd;
+        } else if let Some(ratio) = facts.output_input_ratio.filter(|r| *r > 0.0) {
             roll.inferred_input_usd = facts.operator_output_usd / ratio;
         }
     }
@@ -762,32 +767,21 @@ pub fn write_run_outputs(
         markdown::write_seed_full_report_md(&dir.join("report.md"), report)?;
     }
 
-    // Three seed-scoped rollups from formal + incomplete seed dedup sections.
+    // Four scopes share the same paper tables; each has its own set-union scale.
     let dedup_refs: Vec<&SeedDedupReport> = ok_reports.iter().map(|r| &r.dedup).collect();
-    super::json::write_scope_rollups_public(output_dir, &dedup_refs)?;
-
-    // Fourth scope: batch all_chains = paper stats + set-union duplicate scale.
     let analysis_refs: Vec<&CandidateAnalysis> = analyses.iter().collect();
-    let mut summary = build_run_summary(
+    let summary = build_run_summary(
         selected_seeds,
         &formal,
         &incomplete,
         &failures,
         &analysis_refs,
     );
-    let scale = build_all_chains_duplicate_scale(store, all_chains_relations_from_full(&dedup_refs));
-    if let Some(obj) = summary.as_object_mut() {
-        obj.insert("scope".into(), json!(SCOPE_LABEL_ALL_CHAINS));
-        obj.insert("duplicate_scale".into(), json!(scale));
-    }
-    write_json(
-        &summary_scope_path(output_dir, SCOPE_ALL_CHAINS, "json"),
+    super::json::write_four_scope_paper_summaries_public(
+        output_dir,
+        store,
+        &dedup_refs,
         &summary,
-    )?;
-    markdown::write_all_chains_md(
-        &summary_scope_path(output_dir, SCOPE_ALL_CHAINS, "md"),
-        &summary,
-        &scale,
     )?;
 
     let manifest = RunManifest {
@@ -841,22 +835,7 @@ pub fn write_run_outputs(
     Ok(())
 }
 
-fn all_chains_relations_from_full<'a>(
-    reports: &[&'a SeedDedupReport],
-) -> Vec<AllChainsRelationRef<'a>> {
-    let mut out = Vec::new();
-    for report in reports {
-        for rel in &report.relations {
-            out.push(AllChainsRelationRef {
-                candidate_chain: &rel.candidate_chain,
-                candidate_address: &rel.candidate_address,
-                dimensions: &rel.dimensions,
-                nft_ids: &rel.nft_ids,
-            });
-        }
-    }
-    out
-}
+
 
 #[cfg(test)]
 mod tests {

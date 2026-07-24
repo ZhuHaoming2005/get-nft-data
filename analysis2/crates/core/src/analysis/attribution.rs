@@ -51,19 +51,26 @@ pub struct AttributionResult {
     pub records: BTreeMap<String, AddressAttribution>,
 }
 
+fn norm_addr(address: &str) -> String {
+    address.trim().to_ascii_lowercase()
+}
+
 pub fn attribute_addresses(
     evidence: &EvidenceBundle,
     _transfer_graph: &AddressGraph,
 ) -> AttributionResult {
+    // Normalize all address keys so controller checksums match sale/transfer casing.
     let controller_set = evidence
         .controllers
         .iter()
-        .cloned()
+        .map(|a| norm_addr(a))
+        .filter(|a| !a.is_empty())
         .collect::<AHashSet<_>>();
     let holder_set = evidence
         .holders
         .iter()
-        .map(|holder| holder.owner.clone())
+        .map(|holder| norm_addr(&holder.owner))
+        .filter(|a| !a.is_empty())
         .collect::<AHashSet<_>>();
 
     let mut paid_buyers = AHashSet::new();
@@ -72,33 +79,51 @@ pub fn attribute_addresses(
 
     for sale in &evidence.sales {
         let paid = sale.native_amount.unwrap_or(0.0) > 0.0 || sale.usd_amount.unwrap_or(0.0) > 0.0;
-        if paid {
-            paid_buyers.insert(sale.buyer.clone());
+        let buyer = norm_addr(&sale.buyer);
+        let seller = norm_addr(&sale.seller);
+        if paid && !buyer.is_empty() {
+            paid_buyers.insert(buyer);
         }
-        propagators.insert(sale.seller.clone());
+        if !seller.is_empty() {
+            propagators.insert(seller);
+        }
     }
     for transfer in &evidence.transfers {
+        let from = norm_addr(&transfer.from);
+        let to = norm_addr(&transfer.to);
         if transfer.is_mint {
             // Free/paid mint recipient is often an operator seed when also a controller;
             // otherwise mint alone does not imply operator.
-            if controller_set.contains(&transfer.to) {
-                operator_evidence.insert(transfer.to.clone());
+            if controller_set.contains(&to) {
+                operator_evidence.insert(to);
             }
-        } else {
-            propagators.insert(transfer.from.clone());
+        } else if !from.is_empty() {
+            propagators.insert(from);
         }
     }
 
     let mut all = BTreeSet::new();
-    all.extend(evidence.controllers.iter().cloned());
+    all.extend(controller_set.iter().cloned());
     all.extend(holder_set.iter().cloned());
     for sale in &evidence.sales {
-        all.insert(sale.seller.clone());
-        all.insert(sale.buyer.clone());
+        let s = norm_addr(&sale.seller);
+        let b = norm_addr(&sale.buyer);
+        if !s.is_empty() {
+            all.insert(s);
+        }
+        if !b.is_empty() {
+            all.insert(b);
+        }
     }
     for transfer in &evidence.transfers {
-        all.insert(transfer.from.clone());
-        all.insert(transfer.to.clone());
+        let f = norm_addr(&transfer.from);
+        let t = norm_addr(&transfer.to);
+        if !f.is_empty() {
+            all.insert(f);
+        }
+        if !t.is_empty() {
+            all.insert(t);
+        }
     }
 
     let mut roles = all
@@ -124,15 +149,15 @@ pub fn attribute_addresses(
         if component.len() < 2 {
             continue;
         }
-        let has_operator = component
-            .iter()
-            .any(|&vertex| operator_evidence.contains(&sale_graph.addresses[vertex]));
+        let has_operator = component.iter().any(|&vertex| {
+            operator_evidence.contains(&norm_addr(&sale_graph.addresses[vertex]))
+        });
         if !has_operator {
             continue;
         }
         for &vertex in component {
-            let address = &sale_graph.addresses[vertex];
-            if let Some(role) = roles.get_mut(address) {
+            let address = norm_addr(&sale_graph.addresses[vertex]);
+            if let Some(role) = roles.get_mut(&address) {
                 // Cycle participants are colluders; prefer over neutral / corrupted-victim.
                 if matches!(
                     *role,
@@ -255,26 +280,28 @@ pub fn attribute_addresses(
         );
     }
 
-    let mut malicious_cycle_by_address = AHashMap::<&str, usize>::new();
+    let mut malicious_cycle_by_address = AHashMap::<String, usize>::new();
     for (component_id, component) in sale_components.iter().enumerate() {
         if component.len() >= 2
-            && component
-                .iter()
-                .any(|&vertex| operator_evidence.contains(&sale_graph.addresses[vertex]))
+            && component.iter().any(|&vertex| {
+                operator_evidence.contains(&norm_addr(&sale_graph.addresses[vertex]))
+            })
         {
             for &vertex in component {
                 malicious_cycle_by_address
-                    .insert(sale_graph.addresses[vertex].as_str(), component_id);
+                    .insert(norm_addr(&sale_graph.addresses[vertex]), component_id);
             }
         }
     }
     for sale in &evidence.sales {
+        let seller = norm_addr(&sale.seller);
+        let buyer = norm_addr(&sale.buyer);
         let same_cycle = malicious_cycle_by_address
-            .get(sale.seller.as_str())
-            .zip(malicious_cycle_by_address.get(sale.buyer.as_str()))
+            .get(&seller)
+            .zip(malicious_cycle_by_address.get(&buyer))
             .is_some_and(|(left, right)| left == right);
         if same_cycle {
-            for address in [&sale.seller, &sale.buyer] {
+            for address in [&seller, &buyer] {
                 push_evidence(
                     &mut evidence_rows,
                     address,
@@ -331,10 +358,11 @@ fn push_evidence(
     weight: f64,
     confidence: f64,
 ) {
+    let address = norm_addr(address);
     if address.is_empty() {
         return;
     }
-    evidence.entry(address.to_owned()).or_default().push(AddressEvidence {
+    evidence.entry(address).or_default().push(AddressEvidence {
         evidence_type,
         token_id,
         transaction,

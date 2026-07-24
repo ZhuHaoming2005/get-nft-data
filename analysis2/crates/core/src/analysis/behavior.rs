@@ -90,6 +90,7 @@ pub fn detect_behaviors(
     roles: &BTreeMap<String, AddressRole>,
     cfg: &PaperConfig,
 ) -> BehaviorAnalysis {
+    // Case-fold addresses: controller / sale checksum mismatches zeroed wash before.
     let malicious = roles
         .iter()
         .filter(|(_, role)| {
@@ -98,7 +99,7 @@ pub fn detect_behaviors(
                 AddressRole::SuspectedOperator | AddressRole::SuspectedColluder
             )
         })
-        .map(|(address, _)| address.as_str())
+        .map(|(address, _)| address.to_ascii_lowercase())
         .collect::<AHashSet<_>>();
     let honest = roles
         .iter()
@@ -108,23 +109,33 @@ pub fn detect_behaviors(
                 AddressRole::LikelyVictim | AddressRole::CorruptedVictim
             )
         })
-        .map(|(address, _)| address.as_str())
+        .map(|(address, _)| address.to_ascii_lowercase())
         .collect::<AHashSet<_>>();
 
-    let sale_graph = AddressGraph::from_sales_filtered(&evidence.sales, |sale| {
-        malicious.contains(sale.seller.as_str()) && malicious.contains(sale.buyer.as_str())
-    });
+    // Wash cycles: build SCC on *all* sales (normalized), then keep components that
+    // are large enough and contain at least one malicious address. Using
+    // both-malicious-only edges under-detects when colluder marking or address
+    // casing dropped one side of a wash pair.
+    let sale_graph = AddressGraph::from_sales(&evidence.sales);
     let sale_components = sale_graph.strongly_connected_components();
     let wash_components = sale_components
         .iter()
-        .filter(|component| component.len() >= cfg.min_cycle_size)
+        .filter(|component| {
+            component.len() >= cfg.min_cycle_size
+                && component.iter().any(|&vertex| {
+                    malicious.contains(&sale_graph.addresses[vertex].to_ascii_lowercase())
+                })
+        })
         .map(Vec::as_slice)
         .collect::<Vec<_>>();
 
     let mut wash_by_address = AHashMap::new();
     for (wash_id, component) in wash_components.iter().enumerate() {
         for &vertex in *component {
-            wash_by_address.insert(sale_graph.addresses[vertex].as_str(), wash_id);
+            wash_by_address.insert(
+                sale_graph.addresses[vertex].to_ascii_lowercase(),
+                wash_id,
+            );
         }
     }
 
@@ -132,10 +143,11 @@ pub fn detect_behaviors(
         .map(|_| CycleValues::default())
         .collect::<Vec<_>>();
     for (event_index, sale) in evidence.sales.iter().enumerate() {
-        if let (Some(&left), Some(&right)) = (
-            wash_by_address.get(sale.seller.as_str()),
-            wash_by_address.get(sale.buyer.as_str()),
-        ) {
+        let seller = sale.seller.to_ascii_lowercase();
+        let buyer = sale.buyer.to_ascii_lowercase();
+        if let (Some(&left), Some(&right)) =
+            (wash_by_address.get(&seller), wash_by_address.get(&buyer))
+        {
             if left == right {
                 let values = &mut cycle_values[left];
                 values.end = [values.end, sale.timestamp].into_iter().flatten().max();
@@ -145,12 +157,14 @@ pub fn detect_behaviors(
         }
     }
     for (event_index, sale) in evidence.sales.iter().enumerate() {
-        let Some(&wash_id) = wash_by_address.get(sale.seller.as_str()) else {
+        let seller = sale.seller.to_ascii_lowercase();
+        let buyer = sale.buyer.to_ascii_lowercase();
+        let Some(&wash_id) = wash_by_address.get(&seller) else {
             continue;
         };
         let values = &mut cycle_values[wash_id];
-        if honest.contains(sale.buyer.as_str())
-            && wash_by_address.get(sale.buyer.as_str()).copied() != Some(wash_id)
+        if honest.contains(&buyer)
+            && wash_by_address.get(&buyer).copied() != Some(wash_id)
             && values
                 .end
                 .zip(sale.timestamp)
@@ -165,12 +179,13 @@ pub fn detect_behaviors(
         .filter(|values| exit_price_exceeds_internal(values))
         .count() as u64;
 
+    let malicious_refs: AHashSet<&str> = malicious.iter().map(String::as_str).collect();
     let star = star_behaviors(
         evidence,
         transfer_graph,
         transfer_sccs,
         roles,
-        &malicious,
+        &malicious_refs,
         cfg.fan_out,
     );
     let layered_instances = layered_paths(evidence, transfer_graph, cfg.layered_path_addresses);
@@ -271,6 +286,20 @@ fn star_behaviors(
         }
     }
     let address_ids = graph.address_index();
+    let honest: AHashSet<String> = roles
+        .iter()
+        .filter(|(_, role)| {
+            matches!(
+                role,
+                AddressRole::LikelyVictim | AddressRole::CorruptedVictim
+            )
+        })
+        .map(|(address, _)| address.to_ascii_lowercase())
+        .collect();
+    let malicious_lower: AHashSet<String> = malicious
+        .iter()
+        .map(|a| a.to_ascii_lowercase())
+        .collect();
     let mut dag_targets = (0..components.len())
         .map(|_| BTreeSet::new())
         .collect::<Vec<_>>();
@@ -338,19 +367,42 @@ fn star_behaviors(
         }
         let mut instance = instance_from_prop_events(kind, evidence, &outgoing_events[component]);
         instance.fan_out = Some(dag_targets[component].len() as u64);
-        instance.linked_buyers = instance
-            .addresses
-            .iter()
-            .filter(|address| {
-                roles.get(*address).is_some_and(|role| {
-                    matches!(
-                        role,
-                        AddressRole::LikelyVictim | AddressRole::CorruptedVictim
-                    )
-                })
-            })
-            .cloned()
-            .collect();
+        // Linked buyers + loss: direct paid sales from this star component to
+        // non-malicious counterparties (paper Sybil/Fraud/Poisoning 关联损失).
+        // Prefer role-tagged victims; also count paid non-malicious buyers when
+        // holder snapshots are incomplete (otherwise linked_loss stays 0 in practice).
+        let mut linked_buyers = AHashSet::new();
+        let mut linked_loss_native = 0.0_f64;
+        let mut linked_loss_usd = 0.0_f64;
+        for event in &outgoing_events[component] {
+            let PropEvent::Sale(index) = event else {
+                continue;
+            };
+            let sale = &evidence.sales[*index];
+            let buyer = sale.buyer.to_ascii_lowercase();
+            if buyer.is_empty() || malicious_lower.contains(&buyer) {
+                continue;
+            }
+            let paid_native = sale.native_amount.filter(|v| *v > 0.0);
+            let paid_usd = sale.usd_amount.filter(|v| *v > 0.0);
+            let paid = paid_native.is_some() || paid_usd.is_some();
+            let role_victim = honest.contains(&buyer);
+            if !role_victim && !paid {
+                continue;
+            }
+            linked_buyers.insert(buyer);
+            if let Some(native) = paid_native {
+                linked_loss_native += native;
+            }
+            if let Some(usd) = paid_usd {
+                linked_loss_usd += usd;
+            }
+        }
+        let mut linked_buyer_list = linked_buyers.into_iter().collect::<Vec<_>>();
+        linked_buyer_list.sort();
+        instance.linked_buyers = linked_buyer_list;
+        instance.linked_loss_native = linked_loss_native;
+        instance.linked_loss_usd = linked_loss_usd;
         instances.push(instance);
     }
     StarAnalysis {

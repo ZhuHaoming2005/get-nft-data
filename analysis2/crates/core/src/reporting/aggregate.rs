@@ -433,36 +433,98 @@ pub fn build_seed_duplicate_scale(
     }
 }
 
-/// Minimal relation view for batch-level all-chains scale aggregation.
+/// Minimal relation view for batch-level scale aggregation (any scope).
 #[derive(Clone, Copy, Debug)]
 pub struct AllChainsRelationRef<'a> {
+    pub seed_chain: &'a str,
+    pub seed_address: &'a str,
     pub candidate_chain: &'a str,
     pub candidate_address: &'a str,
     pub dimensions: &'a [String],
     pub nft_ids: &'a [u32],
 }
 
-/// Batch-level `all_chains` duplicate scale (fourth export dimension).
-///
-/// Numerators are set-unions across all seed→candidate relations so a contract or
-/// NFT hit by multiple seeds is counted once. Denominators are the sum of per-chain
-/// snapshot totals (full multi-chain universe). `image_uri` excludes NFTs already
-/// counted under `token_uri`, matching per-seed scope rules.
-pub fn build_all_chains_duplicate_scale<'a>(
+/// Which seed→candidate relations count toward a batch-level scope rollup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScopeScaleFilter<'a> {
+    /// All relations (all_chains).
+    All,
+    /// Same-chain only.
+    Intra,
+    /// Different-chain only (cross_chain_summary).
+    Cross,
+    /// Cross-chain into a fixed secondary (matrix cell aggregate).
+    MatrixSecondary(&'a str),
+}
+
+fn relation_matches(rel: &AllChainsRelationRef<'_>, filter: ScopeScaleFilter<'_>) -> bool {
+    let same = rel.seed_chain.eq_ignore_ascii_case(rel.candidate_chain);
+    match filter {
+        ScopeScaleFilter::All => true,
+        ScopeScaleFilter::Intra => same,
+        ScopeScaleFilter::Cross => !same,
+        ScopeScaleFilter::MatrixSecondary(sec) => {
+            !same && rel.candidate_chain.eq_ignore_ascii_case(sec)
+        }
+    }
+}
+
+fn snapshot_denominators(
     store: &ResidentStore,
-    relations: impl IntoIterator<Item = AllChainsRelationRef<'a>>,
-) -> Vec<DuplicateScaleRow> {
+    seed_chains: &AHashSet<String>,
+) -> (u64, u64) {
+    // Prefer sum of totals for chains that appear as seed primaries; fall back
+    // to the full multi-chain universe when none recorded.
     let mut nft_denom = 0u64;
     let mut contract_denom = 0u64;
-    for chain_id in 0..store.chains.len() {
-        let totals = store
-            .totals
-            .get(&(chain_id as ChainId))
-            .cloned()
-            .unwrap_or_default();
-        nft_denom += totals.nfts;
-        contract_denom += totals.contracts;
+    if seed_chains.is_empty() {
+        for chain_id in 0..store.chains.len() {
+            let totals = store
+                .totals
+                .get(&(chain_id as ChainId))
+                .cloned()
+                .unwrap_or_default();
+            nft_denom += totals.nfts;
+            contract_denom += totals.contracts;
+        }
+        return (nft_denom, contract_denom);
     }
+    for name in seed_chains {
+        if let Some(&cid) = store.chain_ids.get(name) {
+            let totals = store.totals.get(&cid).cloned().unwrap_or_default();
+            nft_denom += totals.nfts;
+            contract_denom += totals.contracts;
+        }
+    }
+    if nft_denom == 0 && contract_denom == 0 {
+        for chain_id in 0..store.chains.len() {
+            let totals = store
+                .totals
+                .get(&(chain_id as ChainId))
+                .cloned()
+                .unwrap_or_default();
+            nft_denom += totals.nfts;
+            contract_denom += totals.contracts;
+        }
+    }
+    (nft_denom, contract_denom)
+}
+
+/// Batch-level duplicate scale for one reporting scope (set-union numerators).
+pub fn build_scope_duplicate_scale<'a>(
+    store: &ResidentStore,
+    relations: impl IntoIterator<Item = AllChainsRelationRef<'a>>,
+    filter: ScopeScaleFilter<'_>,
+) -> Vec<DuplicateScaleRow> {
+    let mut seed_chains: AHashSet<String> = AHashSet::new();
+    let mut filtered: Vec<AllChainsRelationRef<'a>> = Vec::new();
+    for rel in relations {
+        if relation_matches(&rel, filter) {
+            seed_chains.insert(rel.seed_chain.to_ascii_lowercase());
+            filtered.push(rel);
+        }
+    }
+    let (nft_denom, contract_denom) = snapshot_denominators(store, &seed_chains);
 
     let mut token_uri_nfts = AHashSet::new();
     let mut image_uri_nfts = AHashSet::new();
@@ -476,7 +538,7 @@ pub fn build_all_chains_duplicate_scale<'a>(
     let mut name_contracts = AHashSet::new();
     let mut total_contracts = AHashSet::new();
 
-    for rel in relations {
+    for rel in filtered {
         let cand_key = format!("{}:{}", rel.candidate_chain, rel.candidate_address);
         total_contracts.insert(cand_key.clone());
         for &nft in rel.nft_ids {
@@ -506,16 +568,7 @@ pub fn build_all_chains_duplicate_scale<'a>(
         }
     }
 
-    // Image is supplemental to token_uri within the same reporting scope.
     image_uri_nfts.retain(|nft| !token_uri_nfts.contains(nft));
-    // Drop image-only contract membership when every NFT moved to token_uri.
-    // Keep contract if it still contributes any remaining image NFT, else if it
-    // only had image (no token) keep it; when has both, contract stays in both
-    // dimension rows via the flags above — image contract count uses remaining
-    // image-exclusive NFTs' contracts when possible, else the image flag set.
-    // Prefer flag-based contract sets for contracts; NFT exclusivity is enough
-    // for ratios. Contract image set stays as flagged (may slightly over-count
-    // contracts that only contributed dual-dimension NFTs already in token_uri).
 
     vec![
         scale_row(
@@ -554,4 +607,27 @@ pub fn build_all_chains_duplicate_scale<'a>(
             contract_denom,
         ),
     ]
+}
+
+/// Batch-level `all_chains` duplicate scale (fourth export dimension).
+pub fn build_all_chains_duplicate_scale<'a>(
+    store: &ResidentStore,
+    relations: impl IntoIterator<Item = AllChainsRelationRef<'a>>,
+) -> Vec<DuplicateScaleRow> {
+    build_scope_duplicate_scale(store, relations, ScopeScaleFilter::All)
+}
+
+/// Distinct secondary chains appearing in cross-chain relations (sorted).
+pub fn matrix_secondary_chains<'a>(
+    relations: impl IntoIterator<Item = AllChainsRelationRef<'a>>,
+) -> Vec<String> {
+    let mut set = AHashSet::new();
+    for rel in relations {
+        if !rel.seed_chain.eq_ignore_ascii_case(rel.candidate_chain) {
+            set.insert(rel.candidate_chain.to_ascii_lowercase());
+        }
+    }
+    let mut v: Vec<String> = set.into_iter().collect();
+    v.sort();
+    v
 }

@@ -19,7 +19,14 @@ pub struct EconomicFacts {
     pub total_gas_native: f64,
     pub operator_output_native: f64,
     pub operator_output_usd: f64,
+    /// Same-unit output/input: USD/USD when `attacker_input_usd` is set, else native/native.
     pub output_input_ratio: Option<f64>,
+    /// True when `output_input_ratio` is USD/USD (gas priced via spot).
+    #[serde(default)]
+    pub output_input_ratio_is_usd: bool,
+    /// Attacker gas cost in USD when a spot rate is available for the chain.
+    #[serde(default)]
+    pub attacker_input_usd: Option<f64>,
     pub secondary_sale_loss_native: f64,
     pub secondary_sale_loss_usd: f64,
     pub paid_mint_loss_native: f64,
@@ -216,28 +223,52 @@ pub fn compute_economics(
     }
 
     facts.stuck_nft_count = stuck_nfts.len() as u64;
-    // Prefer USD/USD when gas USD exists; TransferEvent has only gas_native today.
-    facts.output_input_ratio = same_unit_output_input_ratio(
+
+    // Price attacker gas to USD when spot rate is present (same chain).
+    let gas_usd = spot_gas_usd(
+        facts.total_gas_native,
+        evidence.chain.as_str(),
+        &evidence.prices,
+    );
+    facts.attacker_input_usd = gas_usd;
+    let (ratio, is_usd) = same_unit_output_input_ratio(
         facts.operator_output_usd,
         facts.operator_output_native,
-        None,
+        gas_usd,
         facts.total_gas_native,
     );
+    facts.output_input_ratio = ratio;
+    facts.output_input_ratio_is_usd = is_usd;
 
     (facts, quality)
 }
 
+fn spot_gas_usd(gas_native: f64, chain: &str, prices: &[crate::enrich::PriceBucket]) -> Option<f64> {
+    if gas_native <= 0.0 {
+        return None;
+    }
+    prices
+        .iter()
+        .find(|p| p.chain.eq_ignore_ascii_case(chain) && p.usd_per_native > 0.0)
+        .map(|p| gas_native * p.usd_per_native)
+        .filter(|v| v.is_finite() && *v > 0.0)
+}
+
 /// Prefer USD/USD when gas USD available; else native/native; else None.
+/// Returns `(ratio, is_usd)`.
 fn same_unit_output_input_ratio(
     output_usd: f64,
     output_native: f64,
     gas_usd: Option<f64>,
     gas_native: f64,
-) -> Option<f64> {
+) -> (Option<f64>, bool) {
     if let Some(gas_usd) = gas_usd.filter(|value| *value > 0.0) {
-        return Some(output_usd / gas_usd);
+        return (Some(output_usd / gas_usd), true);
     }
-    (gas_native > 0.0).then_some(output_native / gas_native)
+    if gas_native > 0.0 {
+        return (Some(output_native / gas_native), false);
+    }
+    (None, false)
 }
 
 #[cfg(test)]

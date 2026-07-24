@@ -325,7 +325,8 @@ mod tests {
     fn wash_cycle_two_node_scc_from_reciprocal_malicious_sales() {
         let (store, contract) = store_with_contract("ethereum", "0xcand");
         let mut evidence = EvidenceBundle::empty(contract, "ethereum", "0xcand");
-        evidence.controllers = vec!["0xa".into()];
+        // Checksum-style controller vs lowercased sale counterparties.
+        evidence.controllers = vec!["0xA".into()];
         evidence.sales = vec![
             sale("tx-0", "1", "0xa", "0xb", 10, 1.0),
             sale("tx-1", "1", "0xb", "0xa", 20, 1.0),
@@ -473,6 +474,34 @@ mod tests {
                 + analysis.behaviors.poisoning
                 >= 1
         );
+        // Star sales to paid victims must carry linked_loss_usd (paper 关联损失).
+        let star_loss: f64 = analysis
+            .behavior_instances
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i.kind,
+                    BehaviorKind::FraudRevenue
+                        | BehaviorKind::SybilDistribution
+                        | BehaviorKind::Poisoning
+                )
+            })
+            .map(|i| i.linked_loss_usd)
+            .sum();
+        assert!(
+            star_loss > 0.0,
+            "expected star linked_loss_usd from sales to victims, got {star_loss}"
+        );
+        assert!(analysis
+            .behavior_instances
+            .iter()
+            .any(|i| !i.linked_buyers.is_empty()
+                && matches!(
+                    i.kind,
+                    BehaviorKind::FraudRevenue
+                        | BehaviorKind::SybilDistribution
+                        | BehaviorKind::Poisoning
+                )));
     }
 
     #[test]

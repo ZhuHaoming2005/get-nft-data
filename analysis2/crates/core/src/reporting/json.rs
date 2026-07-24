@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::dedup::candidates::CandidateRegistry;
 use crate::dedup::hits::{Dimension, HitGraph};
@@ -12,8 +12,9 @@ use crate::entity::{ContractId, NftId, ResidentStore};
 use crate::error::Analysis2Error;
 
 use super::aggregate::{
-    build_all_chains_duplicate_scale, build_seed_duplicate_scale, AllChainsRelationRef,
-    DuplicateScaleRow, SeedDuplicateScale,
+    build_all_chains_duplicate_scale, build_scope_duplicate_scale, build_seed_duplicate_scale,
+    matrix_secondary_chains, AllChainsRelationRef, DuplicateScaleRow, ScopeScaleFilter,
+    SeedDuplicateScale,
 };
 use super::layout::{
     ensure_output_layout, intermediate_path, seed_report_dir, summary_scope_path,
@@ -208,8 +209,7 @@ pub fn write_dedup_outputs(
         super::markdown::write_seed_report_md(&dir.join("report.md"), report)?;
     }
 
-    write_scope_rollups(output_dir, &ok_reports)?;
-    write_all_chains_dedup_summary(output_dir, store, selected_seeds, &ok_reports, &failures)?;
+    write_scope_rollups(output_dir, store, selected_seeds, &ok_reports, &failures)?;
 
     let manifest = RunManifest {
         status: if failures.is_empty() {
@@ -253,11 +253,13 @@ pub fn write_dedup_outputs(
     Ok(())
 }
 
-pub(crate) fn write_scope_rollups_public(
+pub(crate) fn write_four_scope_paper_summaries_public(
     output_dir: &Path,
+    store: &ResidentStore,
     reports: &[&SeedDedupReport],
+    paper_summary: &serde_json::Value,
 ) -> Result<(), Analysis2Error> {
-    write_scope_rollups(output_dir, reports)
+    write_four_scope_paper_summaries(output_dir, store, reports, paper_summary)
 }
 
 fn output_layout_manifest() -> serde_json::Value {
@@ -274,10 +276,38 @@ fn output_layout_manifest() -> serde_json::Value {
     })
 }
 
-fn write_scope_rollups(
-    output_dir: &Path,
-    reports: &[&SeedDedupReport],
-) -> Result<(), Analysis2Error> {
+fn scope_relations<'a>(reports: &[&'a SeedDedupReport]) -> Vec<AllChainsRelationRef<'a>> {
+    let mut out = Vec::new();
+    for report in reports {
+        for rel in &report.relations {
+            out.push(AllChainsRelationRef {
+                seed_chain: report.seed.chain.as_str(),
+                seed_address: report.seed.address.as_str(),
+                candidate_chain: rel.candidate_chain.as_str(),
+                candidate_address: rel.candidate_address.as_str(),
+                dimensions: rel.dimensions.as_slice(),
+                nft_ids: rel.nft_ids.as_slice(),
+            });
+        }
+    }
+    out
+}
+
+fn seed_index_json(reports: &[&SeedDedupReport]) -> Vec<serde_json::Value> {
+    reports
+        .iter()
+        .map(|r| {
+            json!({
+                "chain": r.seed.chain,
+                "address": r.seed.address,
+                "candidate_contract_count": r.candidate_contract_count,
+                "hit_edge_count": r.hit_edge_count,
+            })
+        })
+        .collect()
+}
+
+fn per_seed_scale_detail(reports: &[&SeedDedupReport]) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
     let mut intra = Vec::new();
     let mut matrix = Vec::new();
     let mut cross = Vec::new();
@@ -301,61 +331,117 @@ fn write_scope_rollups(
             "rows": report.duplicate_scale.cross_chain_summary,
         }));
     }
-    write_json(
-        &summary_scope_path(output_dir, SCOPE_INTRA_CHAIN, "json"),
-        &json!({ "scope": SCOPE_INTRA_CHAIN, "seeds": intra }),
-    )?;
-    write_json(
-        &summary_scope_path(output_dir, SCOPE_CHAIN_MATRIX, "json"),
-        &json!({ "scope": SCOPE_CHAIN_MATRIX, "seeds": matrix }),
-    )?;
-    write_json(
-        &summary_scope_path(output_dir, SCOPE_CROSS_CHAIN, "json"),
-        &json!({ "scope": SCOPE_LABEL_CROSS_CHAIN, "seeds": cross }),
-    )?;
-    super::markdown::write_scope_md(
-        &summary_scope_path(output_dir, SCOPE_INTRA_CHAIN, "md"),
+    (intra, matrix, cross)
+}
+
+/// Write all four scopes with the same paper-table layout as `all_chains`.
+///
+/// `paper_summary` is the batch analysis rollup (may be a thin dedup-only body).
+/// Each scope gets its own aggregated `duplicate_scale` plus optional per-seed detail.
+pub fn write_four_scope_paper_summaries(
+    output_dir: &Path,
+    store: &ResidentStore,
+    reports: &[&SeedDedupReport],
+    paper_summary: &Value,
+) -> Result<(), Analysis2Error> {
+    let rels = scope_relations(reports);
+    let (intra_detail, matrix_detail, cross_detail) = per_seed_scale_detail(reports);
+
+    let intra_scale =
+        build_scope_duplicate_scale(store, rels.iter().copied(), ScopeScaleFilter::Intra);
+    let cross_scale =
+        build_scope_duplicate_scale(store, rels.iter().copied(), ScopeScaleFilter::Cross);
+    let all_scale = build_all_chains_duplicate_scale(store, rels.iter().copied());
+
+    let secondaries = matrix_secondary_chains(rels.iter().copied());
+    let mut matrix_blocks = Vec::new();
+    for sec in &secondaries {
+        let rows = build_scope_duplicate_scale(
+            store,
+            rels.iter().copied(),
+            ScopeScaleFilter::MatrixSecondary(sec.as_str()),
+        );
+        matrix_blocks.push(json!({
+            "secondary_chain": sec,
+            "rows": rows,
+        }));
+    }
+    // Overall matrix scale = all cross-chain relations (same numerators as cross).
+    let matrix_scale = cross_scale.clone();
+
+    write_one_scope_paper(
+        output_dir,
         SCOPE_INTRA_CHAIN,
-        reports,
-        |r| &r.duplicate_scale.intra_chain,
+        SCOPE_INTRA_CHAIN,
+        paper_summary,
+        &intra_scale,
+        json!({ "seeds": intra_detail }),
     )?;
-    super::markdown::write_matrix_md(
-        &summary_scope_path(output_dir, SCOPE_CHAIN_MATRIX, "md"),
-        reports,
+    write_one_scope_paper(
+        output_dir,
+        SCOPE_CHAIN_MATRIX,
+        SCOPE_CHAIN_MATRIX,
+        paper_summary,
+        &matrix_scale,
+        json!({
+            "matrix_blocks": matrix_blocks,
+            "seeds": matrix_detail,
+        }),
     )?;
-    super::markdown::write_scope_md(
-        &summary_scope_path(output_dir, SCOPE_CROSS_CHAIN, "md"),
+    write_one_scope_paper(
+        output_dir,
+        SCOPE_CROSS_CHAIN,
         SCOPE_LABEL_CROSS_CHAIN,
-        reports,
-        |r| &r.duplicate_scale.cross_chain_summary,
+        paper_summary,
+        &cross_scale,
+        json!({ "seeds": cross_detail }),
+    )?;
+    write_one_scope_paper(
+        output_dir,
+        SCOPE_ALL_CHAINS,
+        SCOPE_LABEL_ALL_CHAINS,
+        paper_summary,
+        &all_scale,
+        json!({ "seeds": seed_index_json(reports) }),
     )?;
     Ok(())
 }
 
-fn all_chains_relations<'a>(
-    reports: &[&'a SeedDedupReport],
-) -> Vec<AllChainsRelationRef<'a>> {
-    let mut out = Vec::new();
-    for report in reports {
-        for rel in &report.relations {
-            out.push(AllChainsRelationRef {
-                candidate_chain: &rel.candidate_chain,
-                candidate_address: &rel.candidate_address,
-                dimensions: &rel.dimensions,
-                nft_ids: &rel.nft_ids,
-            });
+fn write_one_scope_paper(
+    output_dir: &Path,
+    file_stem: &str,
+    scope_label: &str,
+    paper_summary: &Value,
+    scale: &[DuplicateScaleRow],
+    extra: Value,
+) -> Result<(), Analysis2Error> {
+    let mut body = paper_summary.clone();
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("scope".into(), json!(scope_label));
+        obj.insert("duplicate_scale".into(), json!(scale));
+        if let Some(extra_obj) = extra.as_object() {
+            for (k, v) in extra_obj {
+                obj.insert(k.clone(), v.clone());
+            }
         }
     }
-    out
+    write_json(&summary_scope_path(output_dir, file_stem, "json"), &body)?;
+    super::markdown::write_all_chains_md(
+        &summary_scope_path(output_dir, file_stem, "md"),
+        &body,
+        scale,
+    )?;
+    Ok(())
 }
 
-fn write_all_chains_dedup_summary(
+fn write_scope_rollups(
     output_dir: &Path,
     store: &ResidentStore,
     selected: &[SeedRecord],
     reports: &[&SeedDedupReport],
     failures: &[FailureRecord],
 ) -> Result<(), Analysis2Error> {
+    // Offline dedup path: paper fields are seed/dedup counts only (no deep analysis).
     let with_dup = reports
         .iter()
         .filter(|r| {
@@ -365,31 +451,34 @@ fn write_all_chains_dedup_summary(
         .count() as u64;
     let analyzed = reports.len() as u64;
     let selected_n = selected.len() as u64;
-    let scale = build_all_chains_duplicate_scale(store, all_chains_relations(reports));
-    let body = json!({
-        "scope": SCOPE_LABEL_ALL_CHAINS,
-        "duplicate_scale": scale,
+    let paper = json!({
         "selected_seed_count": selected_n,
         "analyzed_seed_count": analyzed,
+        "incomplete_seed_count": 0,
         "failed_seed_count": count_failed_seeds(failures),
         "seed_completion_ratio": if selected_n == 0 { None } else { Some(analyzed as f64 / selected_n as f64) },
         "seed_with_duplicate_count": with_dup,
         "seed_duplicate_ratio": if analyzed == 0 { None } else { Some(with_dup as f64 / analyzed as f64) },
-        "seeds": reports.iter().map(|r| json!({
-            "chain": r.seed.chain,
-            "address": r.seed.address,
-            "candidate_contract_count": r.candidate_contract_count,
-            "hit_edge_count": r.hit_edge_count,
-        })).collect::<Vec<_>>(),
+        "representative_candidate_count": 0,
+        "candidate_contract_count": 0,
+        "suspected_duplicate_contract_count": 0,
+        "legit_duplicate_contract_count": 0,
+        "infringing_nft_count": 0,
+        "address_classification": {
+            "malicious_address_count": 0,
+            "repeat_infringing_malicious_address_count": 0,
+            "honest_address_count": 0,
+            "total_address_count": 0,
+        },
+        "behaviors": {},
+        "behavior_contract_count": 0,
+        "wash_cycle_size_distribution": [],
+        "economics": {},
+        "data_quality": {
+            "failure_record_count": failures.len() as u64,
+        },
     });
-    write_json(
-        &summary_scope_path(output_dir, SCOPE_ALL_CHAINS, "json"),
-        &body,
-    )?;
-    super::markdown::write_all_chains_md(
-        &summary_scope_path(output_dir, SCOPE_ALL_CHAINS, "md"),
-        &body,
-        &scale,
-    )?;
-    Ok(())
+    write_four_scope_paper_summaries(output_dir, store, reports, &paper)
 }
+
+
