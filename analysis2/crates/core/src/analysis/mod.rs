@@ -70,6 +70,46 @@ pub struct CandidateAnalysis {
     pub analysis_timestamp: i64,
 }
 
+impl CandidateAnalysis {
+    /// Drop detail retained only for per-candidate JSON on disk.
+    ///
+    /// Keeps fields needed by seed rollups and batch `summary` (roles, behavior
+    /// instance identities / linked loss, economics). Safe to call **after**
+    /// `write_candidate_json`.
+    pub fn shrink_for_summary_memory(&mut self) {
+        for (_addr, attr) in &mut self.attribution {
+            attr.evidence.clear();
+            attr.evidence.shrink_to_fit();
+        }
+        // Lifecycle / value-flow timelines are fully on disk; summary uses economics.
+        self.lifecycle = LifecycleFacts::default();
+        self.value_flow = ValueFlowFacts::default();
+        for inst in &mut self.behavior_instances {
+            // Summary needs kind, addresses, nfts, linked_buyers, linked_loss_usd.
+            inst.transactions.clear();
+            inst.transactions.shrink_to_fit();
+            inst.gini_nft_count = None;
+            inst.gini_token_transaction_count = None;
+            inst.fan_out = None;
+            inst.path_length = None;
+            inst.low_value_hops = None;
+            inst.source_address_count = None;
+            inst.nft_share = None;
+            inst.value_share = None;
+            inst.exit_delay_seconds = None;
+            inst.exit_to_internal_price_ratio = None;
+            inst.exit_to_cycle_nft_ratio = None;
+            inst.start_block = None;
+            inst.end_block = None;
+            inst.start_timestamp = None;
+            inst.end_timestamp = None;
+            inst.native_value = 0.0;
+            inst.usd_value = 0.0;
+            inst.linked_loss_native = 0.0;
+        }
+    }
+}
+
 /// Run deep analysis for one candidate using resident identity + evidence bundle.
 pub fn analyze_candidate(
     store: &ResidentStore,
@@ -672,5 +712,68 @@ mod tests {
         assert_eq!(analysis.economics.withdrawal_native, 1.0);
         assert_eq!(analysis.economics.withdrawal_usd, 200.0);
         assert!(analysis.economics_quality.notes.is_empty());
+    }
+
+    #[test]
+    fn shrink_for_summary_memory_keeps_roles_and_behavior_keys() {
+        let mut analysis = CandidateAnalysis {
+            contract_id: 1,
+            chain: "ethereum".into(),
+            address: "0x1".into(),
+            legit: legit::classify(&LegitSignals::default()),
+            legit_by_seed: Default::default(),
+            attribution: vec![(
+                "0xop".into(),
+                AddressAttribution {
+                    role: AddressRole::SuspectedOperator,
+                    evidence: vec![AddressEvidence {
+                        evidence_type: AddressEvidenceKind::ControllerOrAuthority,
+                        token_id: Some("1".into()),
+                        transaction: Some("0xtx".into()),
+                        weight: 1.0,
+                        confidence: 1.0,
+                    }],
+                },
+            )],
+            lifecycle: LifecycleFacts {
+                early_signal_categories: vec!["x".into()],
+                ..LifecycleFacts::default()
+            },
+            value_flow: ValueFlowFacts {
+                mint_edge_count: 9,
+                ..ValueFlowFacts::default()
+            },
+            behaviors: BehaviorFacts {
+                wash_cycles: 1,
+                ..BehaviorFacts::default()
+            },
+            behavior_instances: vec![BehaviorInstance {
+                kind: BehaviorKind::WashTrading,
+                addresses: vec!["0xa".into()],
+                nfts: vec!["1".into()],
+                transactions: vec!["0xt".into()],
+                linked_buyers: vec!["0xb".into()],
+                linked_loss_usd: 3.0,
+                ..BehaviorInstance::default()
+            }],
+            economics: EconomicFacts {
+                honest_loss_usd: 1.0,
+                ..EconomicFacts::default()
+            },
+            economics_quality: EconomicsQuality::default(),
+            analysis_timestamp: 0,
+        };
+        analysis.shrink_for_summary_memory();
+        assert!(analysis.attribution[0].1.evidence.is_empty());
+        assert_eq!(
+            analysis.attribution[0].1.role,
+            AddressRole::SuspectedOperator
+        );
+        assert!(analysis.lifecycle.early_signal_categories.is_empty());
+        assert_eq!(analysis.value_flow.mint_edge_count, 0);
+        assert_eq!(analysis.behavior_instances[0].addresses, vec!["0xa"]);
+        assert!(analysis.behavior_instances[0].transactions.is_empty());
+        assert_eq!(analysis.behavior_instances[0].linked_loss_usd, 3.0);
+        assert_eq!(analysis.economics.honest_loss_usd, 1.0);
     }
 }

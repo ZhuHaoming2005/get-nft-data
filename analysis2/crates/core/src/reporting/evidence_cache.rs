@@ -136,17 +136,17 @@ pub fn build_evidence_cache(
     }
 }
 
-/// Write cache JSON (pretty) atomically via temp file + rename when possible.
+/// Write cache JSON (compact, non-pretty) atomically via temp file + rename.
 pub fn write_evidence_cache(path: &Path, cache: &EvidenceCacheFile) -> Result<(), Analysis2Error> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let body = serde_json::to_string_pretty(cache)
+    let body = serde_json::to_vec(cache)
         .map_err(|e| Analysis2Error::invalid(format!("serialize evidence cache: {e}")))?;
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, body.as_bytes())?;
+    fs::write(&tmp, &body)?;
     if let Err(error) = fs::rename(&tmp, path) {
-        fs::write(path, body.as_bytes()).map_err(|e| {
+        fs::write(path, &body).map_err(|e| {
             Analysis2Error::invalid(format!(
                 "write evidence cache {} (rename failed: {error}): {e}",
                 path.display()
@@ -390,12 +390,12 @@ impl EvidenceCacheSink {
             }
         }
 
-        let meta_body = serde_json::to_string_pretty(&serde_json::json!({
+        let meta_body = serde_json::to_vec(&serde_json::json!({
             "version": EVIDENCE_CACHE_VERSION,
             "params": params,
         }))
         .map_err(|e| Analysis2Error::invalid(format!("serialize evidence meta: {e}")))?;
-        fs::write(&meta_path, meta_body.as_bytes())?;
+        fs::write(&meta_path, &meta_body)?;
 
         // If we seeded from snapshot only (no jsonl), rewrite jsonl from `all`
         // so incremental append stays consistent.

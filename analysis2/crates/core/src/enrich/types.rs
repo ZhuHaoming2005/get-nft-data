@@ -230,6 +230,15 @@ impl EvidenceBundle {
             relation_legit: std::collections::BTreeMap::new(),
         }
     }
+
+    /// Drop fields kept only for disk provenance / debug after cache write.
+    ///
+    /// Safe before `analyze_candidate` (detectors use transfers/sales/holders/
+    /// value_flows/controllers, not provenance).
+    pub fn strip_for_analysis_memory(&mut self) {
+        self.provenance.clear();
+        self.provenance.shrink_to_fit();
+    }
 }
 
 /// API keys for enrichment providers. Empty / missing → `not_requested`.

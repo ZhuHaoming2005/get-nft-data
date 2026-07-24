@@ -1,23 +1,27 @@
 //! Offline `run-dedup` and full `run` orchestration.
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::sync::Arc;
+use std::thread;
 
 use ahash::AHashMap;
 use analysis2_core::{
     analyze_candidate, build_contract_nft_map, build_dedup_cache, build_evidence_cache,
-    build_seed_analysis_rollup, build_seed_dedup_report, default_dedup_cache_path,
-    default_evidence_cache_path, enrich_candidates_with_hook, evidence_cache_artifacts_present,
-    evidence_cache_params, load_dedup_cache, load_evidence_cache_resumable,
-    load_resident_store_uri_ready, load_seeds_json, query_metadata_for_seed_with_scratch,
-    query_name_for_seed_with_scratch, query_uri_for_seed_with_scratch, rematerialize_dedup_batch,
-    rematerialize_evidence, resolve_seed_contract, scopes_complete_for_seed, validate_dedup_cache,
-    validate_evidence_cache, write_candidate_json, write_dedup_cache, write_dedup_outputs,
-    write_evidence_cache, write_run_outputs, Analysis2Error, ApiKeys, CandidateAnalysis,
-    CandidateRegistry, ContractId, DedupCacheParams, DedupRunParams, EvidenceBundle,
-    EvidenceCacheSink, FailureRecord, HitGraph, HttpLimits, LoadOptions, MetadataQueryScratch,
-    NameQueryScratch, PaperConfig, PendingDedupLoad, ProgressObserver, ResidentStore,
-    SeedFullReport, SeedRecord, UriQueryScratch, DEFAULT_EVIDENCE_CACHE_BATCH,
+    build_seed_analysis_rollup, build_seed_dedup_report, candidate_json_rel_path,
+    default_dedup_cache_path, default_evidence_cache_path, enrich_candidates_with_hook,
+    evidence_cache_artifacts_present, evidence_cache_params, load_dedup_cache,
+    load_evidence_cache_resumable, load_resident_store_uri_ready, load_seeds_json,
+    query_metadata_for_seed_with_scratch, query_name_for_seed_with_scratch,
+    query_uri_for_seed_with_scratch, rematerialize_dedup_batch, rematerialize_evidence,
+    resolve_seed_contract, scopes_complete_for_seed, serialize_candidate_json,
+    validate_dedup_cache, validate_evidence_cache, write_candidate_json_bytes, write_dedup_cache,
+    write_dedup_outputs, write_evidence_cache, write_run_outputs, Analysis2Error, ApiKeys,
+    CandidateAnalysis, CandidateRegistry, ContractId, DedupCacheParams, DedupRunParams,
+    EvidenceBundle, EvidenceCacheSink, FailureRecord, HitGraph, HttpLimits, LoadOptions,
+    MetadataQueryScratch, NameQueryScratch, PaperConfig, PendingDedupLoad, ProgressObserver,
+    ResidentStore, SeedDedupReport, SeedFullReport, SeedRecord, UriQueryScratch,
+    DEFAULT_EVIDENCE_CACHE_BATCH,
 };
 use rayon::prelude::*;
 
@@ -566,13 +570,33 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
         batch
     };
 
-    let completed = seed_batch.completed;
     let mut failures = seed_batch.failures;
 
+    // Build registry while graphs are still alive, then materialize compact seed
+    // dedup reports and drop HitGraphs immediately (largest post-dedup CPU structure).
+    // This does not re-run matching — only aggregates already-found edges.
     let registry = CandidateRegistry::from_hit_graphs(
-        completed.iter().map(|(_, _, graph)| graph),
+        seed_batch.completed.iter().map(|(_, _, graph)| graph),
         &contract_nfts,
     );
+    // Still part of offline aggregation (not final paper reports).
+    progress.begin_phase(
+        "materialize_seed_dedup",
+        Some(seed_batch.completed.len() as u64),
+    );
+    let seed_dedups: Vec<(SeedRecord, ContractId, SeedDedupReport)> = seed_batch
+        .completed
+        .into_par_iter()
+        .map(|(seed, seed_id, graph)| {
+            let dedup =
+                build_seed_dedup_report(&store, &seed, seed_id, &graph, &registry, &contract_nfts);
+            progress.add_completed(1);
+            // `graph` is dropped here — edges are no longer needed after the report.
+            (seed, seed_id, dedup)
+        })
+        .collect();
+    // contract_nfts only served HitGraph expansion + seed reports.
+    drop(contract_nfts);
 
     progress.set_stage("enrich");
     let limits = HttpLimits {
@@ -622,7 +646,7 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
         progress.add_completed(1);
     }
 
-    let evidence = match &config.enrich_override {
+    let mut evidence = match &config.enrich_override {
         Some(hook) => {
             // Test / offline hooks replace evidence entirely (still written to cache).
             let map = hook(&registry, &store, progress)?;
@@ -686,6 +710,8 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                         Some(&mut on_bundle),
                     ))
                 };
+                // Drop Tokio worker stacks before the CPU-heavy analyze phase.
+                drop(runtime);
                 // Flush even on cancel / error so partial progress is reusable.
                 match sink.finish() {
                     Ok(final_cache) => {
@@ -704,6 +730,15 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
         }
     };
 
+    // P0: provenance is on disk; strip before analyze to shrink RSS.
+    for bundle in evidence.values_mut() {
+        bundle.strip_for_analysis_memory();
+    }
+
+    // P1: seed reports + registry are self-contained for NFT numerators; analyze
+    // only needs contract id → chain/address. Drop full NFT/string universe now.
+    store.shrink_identity_for_analysis();
+
     progress.check_cancelled()?;
     progress.set_stage("analyze");
     let candidates = registry.candidate_contracts().to_vec();
@@ -714,11 +749,35 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
     let paper = config.paper.clone();
     let out_dir = config.output_dir.clone();
 
+    // Take ownership of each candidate's evidence up front so Rayon workers can
+    // free transfers/sales/holders as soon as that candidate finishes analysis —
+    // no shared mutex, no second peak of graph+evidence+analyses.
+    let owned_evidence: Vec<(ContractId, Option<EvidenceBundle>)> = candidates
+        .iter()
+        .map(|&cid| (cid, evidence.remove(&cid)))
+        .collect();
+    drop(evidence);
+
+    // P1: background writer — Rayon only serializes; fs::write runs off-CPU pool.
+    let (write_tx, write_rx) = mpsc::sync_channel::<(String, Vec<u8>)>(
+        rayon::current_num_threads().saturating_mul(4).max(8),
+    );
+    let writer_out = out_dir.clone();
+    let writer = thread::Builder::new()
+        .name("analysis2-cand-writer".into())
+        .spawn(move || -> Result<(), Analysis2Error> {
+            while let Ok((rel, body)) = write_rx.recv() {
+                write_candidate_json_bytes(&writer_out, &rel, &body)?;
+            }
+            Ok(())
+        })
+        .map_err(|e| Analysis2Error::invalid(format!("spawn candidate writer: {e}")))?;
+
     // Err arm carries candidate identity so failures.jsonl is never unknown/unknown.
     let analyze_results: Vec<Result<CandidateAnalysis, (String, String, Analysis2Error)>> =
-        candidates
-            .par_iter()
-            .map(|&cid| {
+        owned_evidence
+            .into_par_iter()
+            .map(|(cid, bundle_owned)| {
                 let contract = &store.contracts[cid as usize];
                 let chain = store.chain_name(contract.chain_id).to_owned();
                 let address = contract.address.clone();
@@ -726,25 +785,45 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                     return Err((chain, address, e));
                 }
                 let empty;
-                let bundle = match evidence.get(&cid) {
+                let bundle = match bundle_owned.as_ref() {
                     Some(bundle) => bundle,
                     None => {
                         empty = EvidenceBundle::empty(cid, chain.clone(), address.clone());
                         &empty
                     }
                 };
-                let analysis = match analyze_candidate(&store, cid, bundle, &paper) {
+                let mut analysis = match analyze_candidate(&store, cid, bundle, &paper) {
                     Ok(a) => a,
                     Err(e) => return Err((chain, address, e)),
                 };
-                // Candidate paths are unique, so serialization and writes can
-                // proceed on the same Rayon workers without a global lock.
-                write_candidate_json(&out_dir, &analysis)
+                // Drop large transfer/sale/holder payloads before the next candidate
+                // is scheduled on this worker.
+                drop(bundle_owned);
+
+                // Serialize full analysis on CPU, hand bytes to IO thread.
+                let rel = candidate_json_rel_path(&analysis.chain, &analysis.address);
+                let body = serialize_candidate_json(&analysis)
                     .map_err(|e| (chain.clone(), address.clone(), e))?;
+                write_tx.send((rel, body)).map_err(|e| {
+                    (
+                        chain.clone(),
+                        address.clone(),
+                        Analysis2Error::invalid(format!("candidate write queue closed: {e}")),
+                    )
+                })?;
+
+                // P0: keep only summary fields in the in-memory map.
+                analysis.shrink_for_summary_memory();
                 progress.add_completed(1);
                 Ok(analysis)
             })
             .collect();
+
+    // Close the queue and wait for disk flushes before reporting.
+    drop(write_tx);
+    writer
+        .join()
+        .map_err(|_| Analysis2Error::invalid("candidate writer thread panicked"))??;
 
     let mut analyses_map: AHashMap<ContractId, CandidateAnalysis> = AHashMap::new();
     for result in analyze_results {
@@ -764,18 +843,16 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
         }
     }
 
-    // Mark seeds incomplete when any related candidate is missing from analyses_map.
+    // Attach analysis rollups to already-materialized seed dedup reports.
     progress.set_stage("report");
-    progress.begin_phase("aggregate_seeds", Some(completed.len() as u64));
-    let reports = completed
-        .par_iter()
-        .map(|(seed, seed_id, graph)| {
-            let dedup =
-                build_seed_dedup_report(&store, seed, *seed_id, graph, &registry, &contract_nfts);
+    progress.begin_phase("aggregate_seeds", Some(seed_dedups.len() as u64));
+    let reports = seed_dedups
+        .into_par_iter()
+        .map(|(seed, seed_id, dedup)| {
             let scopes_complete = scopes_complete_for_seed(&store, &dedup);
             let (rollup, analysis_ok) = build_seed_analysis_rollup(
                 &registry,
-                *seed_id,
+                seed_id,
                 &seed.chain,
                 &seed.address,
                 &analyses_map,
@@ -783,12 +860,12 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
             );
             let analysis_complete = analysis_ok
                 && registry
-                    .relations_for_seed(*seed_id)
+                    .relations_for_seed(seed_id)
                     .iter()
                     .all(|rel| analyses_map.contains_key(&rel.candidate_contract));
             progress.add_completed(1);
             (
-                seed.clone(),
+                seed,
                 SeedFullReport {
                     dedup,
                     scopes_complete,
@@ -798,6 +875,9 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
             )
         })
         .collect::<Vec<_>>();
+    // Registry only needed for relation lookups while building rollups.
+    drop(registry);
+
     let analyzed: Vec<Result<(SeedRecord, SeedFullReport), FailureRecord>> =
         reports.into_iter().map(Ok).collect();
     // Failed resolve/dedup seeds are recorded only in `failures` (extra_failures).

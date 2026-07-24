@@ -412,6 +412,45 @@ impl ResidentStore {
         }
     }
 
+    /// After dedup + enrich: drop full NFT universe and string pool.
+    ///
+    /// Seed reports already carry relation NFT counts/ids; `analyze_candidate`
+    /// only needs `contracts[id].address` / chain. Denominators stay in `totals`.
+    ///
+    /// Call **after** evidence rematerialize (needs `contract_id` lookup) and
+    /// enrich; **before** analyze.
+    pub fn shrink_identity_for_analysis(&mut self) {
+        self.drop_uri_indexes();
+        self.drop_name_indexes();
+        self.drop_metadata_index();
+
+        self.nfts.clear();
+        self.nfts.shrink_to_fit();
+        self.nft_index.clear();
+        self.nft_index.shrink_to_fit();
+        self.contract_nft_csr = CsrIndex::new();
+        // Address text lives on `Contract.address`; string pool is only for
+        // interned NFT/URI/name keys and contract_index lookups.
+        self.strings = StringPool::new();
+        self.contract_index.clear();
+        self.contract_index.shrink_to_fit();
+        for contract in &mut self.contracts {
+            contract.name_id = None;
+            contract.metadata_by_token.clear();
+            contract.metadata_by_token.shrink_to_fit();
+        }
+    }
+
+    /// Snapshot NFT count from chain totals (valid after identity shrink).
+    pub fn snapshot_nft_count(&self) -> u64 {
+        self.totals.values().map(|t| t.nfts).sum()
+    }
+
+    /// Snapshot contract count from chain totals.
+    pub fn snapshot_contract_count(&self) -> u64 {
+        self.totals.values().map(|t| t.contracts).sum()
+    }
+
     /// Merge another shard; preserves destination (left) identity and remaps shard ids.
     pub fn merge_shard(&mut self, shard: ResidentStore) -> Result<(), Analysis2Error> {
         let ResidentStore {
@@ -601,6 +640,32 @@ mod tests {
         assert!(store.name_contract_csr.is_empty());
         assert!(store.name_nft_csr.is_empty());
         assert_eq!(store.rows_loaded, 0);
+    }
+
+    #[test]
+    fn shrink_identity_keeps_contracts_drops_nfts_and_strings() {
+        let mut store = ResidentStore::new();
+        store
+            .ingest_identity_row(IdentityRow {
+                chain: "ethereum".into(),
+                contract_address: "0xabc".into(),
+                token_id: "1".into(),
+                name_norm: "n".into(),
+                token_uri_norm: "u".into(),
+                image_uri_norm: "i".into(),
+                source_order: SourceOrder {
+                    file_ordinal: 0,
+                    file_row_number: 0,
+                },
+            })
+            .unwrap();
+        store.rebuild_contract_nft_csr();
+        assert!(!store.nfts.is_empty());
+        store.shrink_identity_for_analysis();
+        assert!(store.nfts.is_empty());
+        assert!(store.strings.is_empty());
+        assert_eq!(store.contracts.len(), 1);
+        assert_eq!(store.contracts[0].address, "0xabc");
     }
 
     #[test]

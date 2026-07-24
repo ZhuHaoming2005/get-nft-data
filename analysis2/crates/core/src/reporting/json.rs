@@ -223,8 +223,8 @@ pub fn write_dedup_outputs(
             "inputs": params.inputs,
             "rows_loaded": store.rows_loaded,
             "chains": store.chains,
-            "contracts": store.contracts.len(),
-            "nfts": store.nfts.len(),
+            "contracts": store.snapshot_contract_count().max(store.contracts.len() as u64),
+            "nfts": store.snapshot_nft_count().max(store.nfts.len() as u64),
         }),
         seeds: RunManifestSeeds {
             selected: selected_seeds.len() as u64,

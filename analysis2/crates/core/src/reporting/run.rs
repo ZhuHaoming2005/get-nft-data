@@ -101,18 +101,43 @@ pub fn candidate_file_name(chain: &str, address: &str) -> String {
     format!("{chain}__{address}.json")
 }
 
+/// Relative path for one candidate analysis JSON under `detail/candidates/`.
+pub fn candidate_json_rel_path(chain: &str, address: &str) -> String {
+    format!(
+        "{DETAIL_CANDIDATES_REL}/{}",
+        candidate_file_name(chain, address)
+    )
+}
+
 /// Write one candidate analysis JSON under `output_dir/detail/candidates/`.
 pub fn write_candidate_json(
     output_dir: &Path,
     analysis: &CandidateAnalysis,
 ) -> Result<String, Analysis2Error> {
-    let rel = format!(
-        "{DETAIL_CANDIDATES_REL}/{}",
-        candidate_file_name(&analysis.chain, &analysis.address)
-    );
+    let rel = candidate_json_rel_path(&analysis.chain, &analysis.address);
     let path = output_dir.join(&rel);
     write_json(&path, analysis)?;
     Ok(rel)
+}
+
+/// Serialize candidate analysis to compact JSON bytes (CPU work; safe on Rayon).
+pub fn serialize_candidate_json(analysis: &CandidateAnalysis) -> Result<Vec<u8>, Analysis2Error> {
+    serde_json::to_vec(analysis)
+        .map_err(|e| Analysis2Error::invalid(format!("serialize candidate analysis: {e}")))
+}
+
+/// Write pre-serialized candidate JSON bytes to `output_dir/rel`.
+pub fn write_candidate_json_bytes(
+    output_dir: &Path,
+    rel: &str,
+    body: &[u8],
+) -> Result<(), Analysis2Error> {
+    let path = output_dir.join(rel);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, body)?;
+    Ok(())
 }
 
 fn economics_usd_from(facts: &EconomicFacts) -> EconomicsUsdRollup {
@@ -617,8 +642,8 @@ pub fn write_run_outputs(
             "inputs": params.inputs,
             "rows_loaded": store.rows_loaded,
             "chains": store.chains,
-            "contracts": store.contracts.len(),
-            "nfts": store.nfts.len(),
+            "contracts": store.snapshot_contract_count().max(store.contracts.len() as u64),
+            "nfts": store.snapshot_nft_count(),
         }),
         seeds: RunManifestSeeds {
             selected: selected_seeds.len() as u64,

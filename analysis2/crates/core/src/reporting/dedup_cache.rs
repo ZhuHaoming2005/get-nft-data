@@ -132,18 +132,18 @@ pub fn build_dedup_cache(
     }
 }
 
-/// Write cache JSON (pretty) atomically via temp file + rename when possible.
+/// Write cache JSON (compact, non-pretty) atomically via temp file + rename.
 pub fn write_dedup_cache(path: &Path, cache: &DedupCacheFile) -> Result<(), Analysis2Error> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let body = serde_json::to_string_pretty(cache)
+    let body = serde_json::to_vec(cache)
         .map_err(|e| Analysis2Error::invalid(format!("serialize dedup cache: {e}")))?;
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, body.as_bytes())?;
+    fs::write(&tmp, &body)?;
     if let Err(error) = fs::rename(&tmp, path) {
         // Windows may fail rename over existing file; fall back to overwrite.
-        fs::write(path, body.as_bytes()).map_err(|e| {
+        fs::write(path, &body).map_err(|e| {
             Analysis2Error::invalid(format!(
                 "write dedup cache {} (rename failed: {error}): {e}",
                 path.display()

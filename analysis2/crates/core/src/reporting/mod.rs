@@ -38,7 +38,8 @@ pub use layout::{
 };
 pub use manifest::{count_failed_seeds, FailureRecord, RunManifest, RunManifestSeeds};
 pub use run::{
-    build_run_summary, build_seed_analysis_rollup, candidate_file_name, scopes_complete_for_seed,
-    write_candidate_json, write_run_outputs, CandidateRef, EconomicsUsdRollup, SeedAnalysisRollup,
-    SeedFullReport,
+    build_run_summary, build_seed_analysis_rollup, candidate_file_name, candidate_json_rel_path,
+    scopes_complete_for_seed, serialize_candidate_json, write_candidate_json,
+    write_candidate_json_bytes, write_run_outputs, CandidateRef, EconomicsUsdRollup,
+    SeedAnalysisRollup, SeedFullReport,
 };
