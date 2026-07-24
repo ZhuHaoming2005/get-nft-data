@@ -81,24 +81,24 @@ struct RunArgs {
     http_concurrency: usize,
 
     /// Path for durable dedup cache (default: `<output-dir>/intermediate/dedup_cache.json`).
-    /// Written after dedup on `run`; used when `--reuse-dedup` is set.
+    /// Written after dedup on `run`. Compatible cache is **auto-reused** on later runs.
     #[arg(long)]
     dedup_cache: Option<PathBuf>,
 
-    /// Skip URI/Name/Metadata queries; rematerialize hits from `--dedup-cache`
-    /// (or `<output-dir>/intermediate/dedup_cache.json`). Still loads Parquet identity for
-    /// enrich/analyze. Params/seeds must match the cache.
+    /// Require a usable dedup cache (fail if missing/incompatible). Without this
+    /// flag, a present compatible cache is still auto-reused; missing/invalid
+    /// falls back to a full Name/URI/Metadata query.
     #[arg(long, default_value_t = false)]
     reuse_dedup: bool,
 
     /// Path for durable evidence cache (default: `<output-dir>/intermediate/evidence_cache.json`).
-    /// Written after enrich on `run`; used when `--reuse-evidence` is set.
+    /// Written during enrich. Compatible cache is **auto-resumed** on later runs.
     #[arg(long)]
     evidence_cache: Option<PathBuf>,
 
-    /// Reuse enrich evidence from `--evidence-cache` (or default path). Only
-    /// HTTP-fetches candidates missing from the cache. Seeds, pagination
-    /// limits, and API-key presence must match the cache.
+    /// Require a usable evidence cache (fail if missing/incompatible). Without this
+    /// flag, a present compatible cache is still auto-resumed; only missing
+    /// candidates are HTTP-fetched.
     #[arg(long, default_value_t = false)]
     reuse_evidence: bool,
 

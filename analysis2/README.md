@@ -143,7 +143,9 @@ candidates):
 On the next `run` with the same output dir / params, the cache is **auto-resumed**
 (even without `--reuse-evidence`): already-cached candidates skip HTTP; only missing
 ones are fetched. `--reuse-evidence` makes a missing/invalid cache a hard error.
-Seeds, pagination limits, and API-key *presence* must match the cache.
+Pagination limits must match the cache. Seed membership and API-key presence do
+not invalidate candidate-scoped evidence; matching candidate contracts are
+reused and only missing candidates are fetched.
 
 ### Fast re-run (dedup + evidence)
 

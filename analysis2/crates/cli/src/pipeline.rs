@@ -18,10 +18,10 @@ use analysis2_core::{
     validate_dedup_cache, validate_evidence_cache, write_candidate_json_bytes, write_dedup_cache,
     write_dedup_outputs, write_evidence_cache, write_run_outputs, Analysis2Error, ApiKeys,
     CandidateAnalysis, CandidateRegistry, ContractId, DedupCacheParams, DedupRunParams,
-    EvidenceBundle, EvidenceCacheSink, FailureRecord, HitGraph, HttpLimits, LoadOptions,
-    MetadataQueryScratch, NameQueryScratch, PaperConfig, PendingDedupLoad, ProgressObserver,
-    ResidentStore, SeedDedupReport, SeedFullReport, SeedRecord, UriQueryScratch,
-    DEFAULT_EVIDENCE_CACHE_BATCH,
+    EvidenceBundle, EvidenceCacheSink, FailureRecord, HitGraph, HttpLimits, LegitSignals,
+    LoadOptions, MetadataQueryScratch, NameQueryScratch, PaperConfig, PendingDedupLoad,
+    ProgressObserver, ResidentStore, SeedDedupReport, SeedFullReport, SeedRecord, UriQueryScratch,
+    DEFAULT_EVIDENCE_CACHE_BATCH, finalize_legit_signals,
 };
 use rayon::prelude::*;
 
@@ -453,10 +453,25 @@ fn dedup_cache_path(config: &RunConfig) -> PathBuf {
 }
 
 fn evidence_cache_path(config: &RunConfig) -> PathBuf {
-    config
-        .evidence_cache_path
-        .clone()
-        .unwrap_or_else(|| default_evidence_cache_path(&config.output_dir))
+    if let Some(path) = &config.evidence_cache_path {
+        return path.clone();
+    }
+    let primary = default_evidence_cache_path(&config.output_dir);
+    if evidence_cache_artifacts_present(&primary) {
+        return primary;
+    }
+    // Legacy layout (pre intermediate/ split): <output-dir>/evidence_cache.json
+    let legacy = config
+        .output_dir
+        .join(analysis2_core::DEFAULT_EVIDENCE_CACHE_FILE);
+    if evidence_cache_artifacts_present(&legacy) {
+        eprintln!(
+            "evidence: using legacy cache path {} (prefer intermediate/ for new runs)",
+            legacy.display()
+        );
+        return legacy;
+    }
+    primary
 }
 
 fn make_dedup_cache_params(config: &RunConfig, seeds: &[SeedRecord]) -> DedupCacheParams {
@@ -476,17 +491,73 @@ fn make_dedup_cache_params(config: &RunConfig, seeds: &[SeedRecord]) -> DedupCac
     }
 }
 
+fn normalized_relation_key(chain: &str, address: &str) -> (String, String) {
+    let chain = chain.trim().to_ascii_lowercase();
+    let address = if chain == "solana" {
+        address.trim().to_owned()
+    } else {
+        address.trim().to_ascii_lowercase()
+    };
+    (chain, address)
+}
+
+fn parse_relation_key(key: &str) -> Option<(String, String)> {
+    let (chain, address) = key.split_once(':')?;
+    Some(normalized_relation_key(chain, address))
+}
+
+/// Reuse candidate-scoped HTTP evidence while aligning seed-scoped legitimacy
+/// results to the current registry.
+fn reconcile_cached_relation_legit(
+    evidence: &mut AHashMap<ContractId, EvidenceBundle>,
+    registry: &CandidateRegistry,
+    store: &ResidentStore,
+) {
+    let mut expected: AHashMap<ContractId, Vec<(String, (String, String))>> = AHashMap::new();
+    for relation in registry.relations() {
+        let seed = &store.contracts[relation.seed_contract as usize];
+        let chain = store.chain_name(seed.chain_id);
+        let display_key = format!("{chain}:{}", seed.address);
+        expected
+            .entry(relation.candidate_contract)
+            .or_default()
+            .push((
+                display_key,
+                normalized_relation_key(chain, &seed.address),
+            ));
+    }
+
+    for (&candidate_id, bundle) in evidence.iter_mut() {
+        let Some(relations) = expected.get(&candidate_id) else {
+            bundle.relation_legit.clear();
+            bundle.legit = LegitSignals::default();
+            continue;
+        };
+        let mut cached: AHashMap<(String, String), LegitSignals> =
+            std::mem::take(&mut bundle.relation_legit)
+                .into_iter()
+                .filter_map(|(key, signals)| parse_relation_key(&key).map(|key| (key, signals)))
+                .collect();
+        for (display_key, normalized_key) in relations {
+            bundle.relation_legit.insert(
+                display_key.clone(),
+                cached.remove(normalized_key).unwrap_or_default(),
+            );
+        }
+        bundle.legit = LegitSignals::default();
+        finalize_legit_signals(bundle);
+    }
+}
+
 fn load_seed_batch_from_cache(
     store: &ResidentStore,
+    cache: &analysis2_core::DedupCacheFile,
     cache_path: &Path,
-    expected: &DedupCacheParams,
     progress: &dyn ProgressObserver,
 ) -> Result<SeedDedupBatch, Analysis2Error> {
     progress.set_stage("dedup");
     progress.begin_phase("load_dedup_cache", Some(1));
-    let cache = load_dedup_cache(cache_path)?;
-    validate_dedup_cache(&cache, expected)?;
-    let (completed, failures) = rematerialize_dedup_batch(store, &cache)?;
+    let (completed, failures) = rematerialize_dedup_batch(store, cache)?;
     progress.add_completed(1);
     eprintln!(
         "dedup: reused cache {} ({} seeds, {} failures)",
@@ -500,13 +571,80 @@ fn load_seed_batch_from_cache(
     })
 }
 
+/// Try to open + validate a dedup cache before choosing load options.
+///
+/// - Cache present + params match → `Ok(Some(cache))` (auto-reuse, same as evidence).
+/// - `--reuse-dedup` and missing/invalid → hard error.
+/// - Cache missing/invalid without flag → `Ok(None)` and fall through to full query.
+fn try_load_validated_dedup_cache(
+    cache_path: &Path,
+    expected: &DedupCacheParams,
+    require: bool,
+) -> Result<Option<analysis2_core::DedupCacheFile>, Analysis2Error> {
+    if !cache_path.is_file() {
+        if require {
+            return Err(Analysis2Error::invalid(format!(
+                "--reuse-dedup requires existing cache file {}",
+                cache_path.display()
+            )));
+        }
+        return Ok(None);
+    }
+    match load_dedup_cache(cache_path) {
+        Ok(cache) => match validate_dedup_cache(&cache, expected) {
+            Ok(()) => Ok(Some(cache)),
+            Err(e) => {
+                if require {
+                    return Err(e);
+                }
+                eprintln!("dedup: ignoring incompatible cache: {e}");
+                Ok(None)
+            }
+        },
+        Err(e) => {
+            if require {
+                return Err(Analysis2Error::invalid(format!(
+                    "--reuse-dedup failed to load {}: {e}",
+                    cache_path.display()
+                )));
+            }
+            eprintln!("dedup: ignoring unreadable cache ({e})");
+            Ok(None)
+        }
+    }
+}
+
 /// End-to-end: load → dedup (or cache) → enrich → analyze → full reports.
 fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), Analysis2Error> {
     let seeds = load_seeds_json(&config.seeds)?;
     let cache_path = dedup_cache_path(config);
     let cache_params = make_dedup_cache_params(config, &seeds);
 
-    let options = if config.reuse_dedup {
+    // Resolve dedup reuse *before* Parquet load so we can skip index build when
+    // a compatible cache is available (auto-resume; --reuse-dedup only hard-fails).
+    let dedup_cache = try_load_validated_dedup_cache(
+        &cache_path,
+        &cache_params,
+        config.reuse_dedup,
+    )?;
+    if dedup_cache.is_some() {
+        eprintln!(
+            "dedup: will reuse {} (identity-only Parquet load)",
+            cache_path.display()
+        );
+    } else if cache_path.is_file() {
+        eprintln!(
+            "dedup: cache present but not reused; running full query ({})",
+            cache_path.display()
+        );
+    } else {
+        eprintln!(
+            "dedup: no cache at {}; running full Name/URI/Metadata query",
+            cache_path.display()
+        );
+    }
+
+    let options = if dedup_cache.is_some() {
         LoadOptions::identity_only(
             config.chains.clone(),
             config.evm_chains.clone(),
@@ -523,16 +661,10 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
         load_resident_store_uri_ready(&config.inputs, &options, progress)?;
     let contract_nfts = build_contract_nft_map(&store);
 
-    let seed_batch = if config.reuse_dedup {
-        if !cache_path.is_file() {
-            return Err(Analysis2Error::invalid(format!(
-                "--reuse-dedup requires existing cache file {}",
-                cache_path.display()
-            )));
-        }
+    let seed_batch = if let Some(cache) = dedup_cache {
         // Identity-only load leaves no pending pass-2 work.
         let _ = pending;
-        load_seed_batch_from_cache(&store, &cache_path, &cache_params, progress)?
+        load_seed_batch_from_cache(&store, &cache, &cache_path, progress)?
     } else {
         let batch = match pending {
             Some(pending) => query_seeds_with_pass2_overlap(
@@ -551,7 +683,7 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                 progress,
             )?,
         };
-        // Persist immediately so a later `--reuse-dedup` can skip query work.
+        // Persist immediately so a later run can auto-reuse / --reuse-dedup.
         progress.begin_phase("write_dedup_cache", Some(1));
         let cache = build_dedup_cache(
             &store,
@@ -615,6 +747,11 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
     // `--reuse-evidence` makes a missing cache fatal; otherwise a bad cache is skipped.
     let mut evidence = AHashMap::new();
     let cache_exists = evidence_cache_artifacts_present(&evidence_path);
+    eprintln!(
+        "evidence: cache path {} (artifacts_present={})",
+        evidence_path.display(),
+        cache_exists
+    );
     if cache_exists || config.reuse_evidence {
         progress.begin_phase("load_evidence_cache", Some(1));
         match load_evidence_cache_resumable(&evidence_path) {
@@ -623,13 +760,16 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                     if config.reuse_evidence {
                         return Err(e);
                     }
-                    eprintln!("evidence: ignoring incompatible cache: {e}");
+                    eprintln!(
+                        "evidence: IGNORING incompatible cache (will re-fetch HTTP): {e}"
+                    );
                 } else {
                     evidence = rematerialize_evidence(&store, &cache)?;
+                    reconcile_cached_relation_legit(&mut evidence, &registry, &store);
                     eprintln!(
-                        "evidence: resumed cache {} ({} bundles)",
-                        evidence_path.display(),
-                        evidence.len()
+                        "evidence: resumed {} in-memory bundles from {}",
+                        evidence.len(),
+                        evidence_path.display()
                     );
                 }
             }
@@ -644,6 +784,11 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
             }
         }
         progress.add_completed(1);
+    } else {
+        eprintln!(
+            "evidence: no cache artifacts at {}; full HTTP enrich",
+            evidence_path.display()
+        );
     }
 
     let mut evidence = match &config.enrich_override {
@@ -657,29 +802,31 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
             map
         }
         None => {
+            let total_cands = registry.candidate_contract_count();
             let missing: ahash::AHashSet<ContractId> = registry
                 .candidate_contracts()
                 .iter()
                 .copied()
                 .filter(|cid| !evidence.contains_key(cid))
                 .collect();
+            let cached_hits = total_cands.saturating_sub(missing.len());
+            eprintln!(
+                "evidence: registry candidates={total_cands} cache_hits={cached_hits} missing={}",
+                missing.len()
+            );
             if missing.is_empty() {
                 eprintln!(
-                    "evidence: all {} candidates covered by cache; skipping HTTP enrich",
-                    registry.candidate_contract_count()
+                    "evidence: all {total_cands} candidates covered by cache; skipping HTTP enrich (no snapshot rewrite)"
                 );
-                // Refresh compact snapshot from in-memory set.
-                progress.begin_phase("write_evidence_cache", Some(1));
-                let evidence_file = build_evidence_cache(evidence_params, &evidence);
-                write_evidence_cache(&evidence_path, &evidence_file)?;
-                progress.add_completed(1);
+                // Do not rewrite evidence_cache.json here: multi‑GB rewrite can
+                // dominate re-run wall time when HTTP is already fully cached.
+                let _ = evidence_params;
                 evidence
             } else {
                 let subset = registry.filter_candidates(&missing);
                 eprintln!(
-                    "evidence: fetching {} / {} candidates via HTTP (batch flush every {})",
+                    "evidence: fetching {} / {total_cands} candidates via HTTP (batch flush every {})",
                     subset.candidate_contract_count(),
-                    registry.candidate_contract_count(),
                     DEFAULT_EVIDENCE_CACHE_BATCH
                 );
                 let mut sink = EvidenceCacheSink::create(
@@ -1281,10 +1428,17 @@ mod tests {
         assert!(cache_path.is_file(), "dedup cache must be written");
         assert!(evidence_path.is_file(), "evidence cache must be written");
 
+        // Explicit flags still work.
         let mut reuse = base_config();
         reuse.reuse_dedup = true;
         reuse.reuse_evidence = true;
         run(&reuse, &analysis2_core::NoopProgress).expect("reuse-dedup+evidence run");
+        assert!(out.join("summary/all_chains.json").is_file());
+
+        // Auto-reuse without flags when cache files are present.
+        let auto = base_config();
+        assert!(!auto.reuse_dedup && !auto.reuse_evidence);
+        run(&auto, &analysis2_core::NoopProgress).expect("auto-reuse run");
         assert!(out.join("summary/all_chains.json").is_file());
 
         let _ = std::fs::remove_dir_all(&dir);

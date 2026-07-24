@@ -7,7 +7,8 @@
 //!
 //! After an interrupt, the next run loads meta+jsonl (and/or the JSON snapshot),
 //! rematerializes bundles, and only HTTP-fetches candidates still missing.
-//! Pagination bounds and provider-key presence must match.
+//! Pagination bounds must match. Seed membership and provider-key presence do
+//! not invalidate candidate-scoped HTTP evidence.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -29,7 +30,8 @@ pub const DEFAULT_EVIDENCE_CACHE_BATCH: usize = 16;
 /// Parameters that must match between the producing and reusing runs.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct EvidenceCacheParams {
-    /// Seeds embedded for exact list comparison on reuse (relation_legit is seed-scoped).
+    /// Seeds recorded for provenance only. Candidate HTTP evidence is keyed by
+    /// chain/address and remains reusable when the run's seed set changes.
     pub seeds: Vec<SeedRecord>,
     pub seeds_path: String,
     pub max_transfer_pages: usize,
@@ -174,7 +176,12 @@ pub fn load_evidence_cache(path: &Path) -> Result<EvidenceCacheFile, Analysis2Er
     Ok(cache)
 }
 
-/// Load from JSON snapshot and/or incremental JSONL (JSONL wins on key conflicts).
+/// Load from JSON snapshot and/or incremental JSONL.
+///
+/// **Resume performance:** do **not** parse both full snapshot and full jsonl
+/// (that doubles multi‑GB load time). Prefer:
+/// 1. jsonl + meta when present (covers mid-run flushes; source of truth)
+/// 2. else full JSON snapshot
 ///
 /// Looks for:
 /// - `{path}` full snapshot
@@ -193,27 +200,7 @@ pub fn load_evidence_cache_resumable(path: &Path) -> Result<EvidenceCacheFile, A
         )));
     }
 
-    let mut by_key: AHashMap<(String, String), EvidenceBundle> = AHashMap::new();
-    let mut params: Option<EvidenceCacheParams> = None;
-
-    if has_json {
-        match load_evidence_cache(path) {
-            Ok(cache) => {
-                params = Some(cache.params);
-                for b in cache.bundles {
-                    by_key.insert(bundle_key(&b), b);
-                }
-            }
-            Err(e) if has_jsonl => {
-                eprintln!(
-                    "evidence cache: snapshot {} unreadable ({e}); using jsonl only",
-                    path.display()
-                );
-            }
-            Err(e) => return Err(e),
-        }
-    }
-
+    // Prefer jsonl-only when available — avoids double-reading a multi-GB snapshot.
     if has_jsonl {
         let meta_text = fs::read_to_string(&meta_path).map_err(|e| {
             Analysis2Error::invalid(format!("read evidence meta {}: {e}", meta_path.display()))
@@ -232,19 +219,12 @@ pub fn load_evidence_cache_resumable(path: &Path) -> Result<EvidenceCacheFile, A
                 meta.version
             )));
         }
-        if let Some(existing) = &params {
-            if existing != &meta.params {
-                // Prefer jsonl params when streaming is the live source.
-                eprintln!(
-                    "evidence cache: meta params differ from snapshot; using meta/jsonl params"
-                );
-            }
-        }
-        params = Some(meta.params);
 
+        let mut by_key: AHashMap<(String, String), EvidenceBundle> = AHashMap::new();
         let file = File::open(&jsonl_path).map_err(|e| {
             Analysis2Error::invalid(format!("read evidence jsonl {}: {e}", jsonl_path.display()))
         })?;
+        let mut line_count = 0_usize;
         for (line_no, line) in BufReader::new(file).lines().enumerate() {
             let line = line.map_err(|e| {
                 Analysis2Error::invalid(format!(
@@ -265,36 +245,47 @@ pub fn load_evidence_cache_resumable(path: &Path) -> Result<EvidenceCacheFile, A
                 ))
             })?;
             by_key.insert(bundle_key(&bundle), bundle);
+            line_count += 1;
         }
+        eprintln!(
+            "evidence cache: loaded {} unique bundles from jsonl ({} lines) at {}",
+            by_key.len(),
+            line_count,
+            jsonl_path.display()
+        );
+        let mut bundles: Vec<EvidenceBundle> = by_key.into_values().collect();
+        bundles.sort_by(|a, b| {
+            a.chain
+                .cmp(&b.chain)
+                .then_with(|| a.address.cmp(&b.address))
+        });
+        return Ok(EvidenceCacheFile {
+            version: EVIDENCE_CACHE_VERSION,
+            params: meta.params,
+            bundles,
+        });
     }
 
-    let params = params.ok_or_else(|| {
-        Analysis2Error::invalid("evidence cache loaded without params".to_owned())
-    })?;
-    let mut bundles: Vec<EvidenceBundle> = by_key.into_values().collect();
-    bundles.sort_by(|a, b| {
-        a.chain
-            .cmp(&b.chain)
-            .then_with(|| a.address.cmp(&b.address))
-    });
-    Ok(EvidenceCacheFile {
-        version: EVIDENCE_CACHE_VERSION,
-        params,
-        bundles,
-    })
+    // Snapshot-only path (no jsonl/meta pair).
+    let cache = load_evidence_cache(path)?;
+    eprintln!(
+        "evidence cache: loaded {} bundles from snapshot {}",
+        cache.bundles.len(),
+        path.display()
+    );
+    Ok(cache)
 }
 
-/// Ensure the cache was produced with equivalent enrich knobs / seeds.
+/// Ensure the cache was produced with equivalent evidence completeness bounds.
+///
+/// Seed membership and API-key presence are deliberately excluded: cached
+/// provider responses are candidate-scoped and remain useful across those run
+/// configuration changes.
 pub fn validate_evidence_cache(
     cache: &EvidenceCacheFile,
     expected: &EvidenceCacheParams,
 ) -> Result<(), Analysis2Error> {
     let got = &cache.params;
-    if got.seeds != expected.seeds {
-        return Err(Analysis2Error::invalid(
-            "evidence cache seeds list does not match current --seeds file; re-run without --reuse-evidence",
-        ));
-    }
     if got.max_transfer_pages != expected.max_transfer_pages
         || got.max_holder_pages != expected.max_holder_pages
         || got.max_sale_pages != expected.max_sale_pages
@@ -306,30 +297,35 @@ pub fn validate_evidence_cache(
             "evidence cache pagination limits do not match current HttpLimits; re-run without --reuse-evidence",
         ));
     }
-    if got.had_alchemy != expected.had_alchemy
-        || got.had_etherscan != expected.had_etherscan
-        || got.had_helius != expected.had_helius
-        || got.had_opensea != expected.had_opensea
-    {
-        return Err(Analysis2Error::invalid(
-            "evidence cache provider key presence does not match current API keys; re-run without --reuse-evidence",
-        ));
-    }
     Ok(())
 }
 
 /// Rematerialize evidence keyed by process-local contract ids.
 ///
-/// Bundles whose chain/address are absent from the snapshot are skipped with a
-/// warning so partial snapshot loads do not abort the whole run.
+/// Address match is **case-insensitive** so checksummed vs lowercased EVM
+/// addresses still hit. Bundles absent from the snapshot are skipped.
 pub fn rematerialize_evidence(
     store: &ResidentStore,
     cache: &EvidenceCacheFile,
 ) -> Result<AHashMap<ContractId, EvidenceBundle>, Analysis2Error> {
+    // Build a one-shot lowercased index so rematerialize does not depend on
+    // interned address string exact match (common re-run miss → full HTTP).
+    let mut by_lower: AHashMap<(String, String), ContractId> =
+        AHashMap::with_capacity(store.contracts.len());
+    for c in &store.contracts {
+        let chain = store.chain_name(c.chain_id).to_ascii_lowercase();
+        let addr = c.address.to_ascii_lowercase();
+        by_lower.insert((chain, addr), c.id);
+    }
+
     let mut out = AHashMap::with_capacity(cache.bundles.len());
     let mut skipped = 0_usize;
     for entry in &cache.bundles {
-        let Some(contract_id) = store.contract_id(&entry.chain, &entry.address) else {
+        let key = (
+            entry.chain.to_ascii_lowercase(),
+            entry.address.to_ascii_lowercase(),
+        );
+        let Some(&contract_id) = by_lower.get(&key) else {
             skipped += 1;
             continue;
         };
@@ -339,7 +335,14 @@ pub fn rematerialize_evidence(
     }
     if skipped > 0 {
         eprintln!(
-            "evidence cache: skipped {skipped} bundles not present in current snapshot identity"
+            "evidence cache: skipped {skipped}/{} bundles not present in current snapshot identity",
+            cache.bundles.len()
+        );
+    } else {
+        eprintln!(
+            "evidence cache: rematerialized {}/{} bundles into resident contract ids",
+            out.len(),
+            cache.bundles.len()
         );
     }
     Ok(out)
@@ -374,7 +377,7 @@ impl EvidenceCacheSink {
         let mut all = AHashMap::new();
         if path.is_file() || (meta_path.is_file() && jsonl_path.is_file()) {
             if let Ok(existing) = load_evidence_cache_resumable(path) {
-                if existing.params == params {
+                if validate_evidence_cache(&existing, &params).is_ok() {
                     for b in existing.bundles {
                         all.insert(bundle_key(&b), b);
                     }
@@ -647,15 +650,79 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_key_presence_mismatch() {
-        let p = evidence_cache_params(&[], "seeds.json", &ApiKeys::default(), &HttpLimits::default());
+    fn incremental_sink_keeps_bundles_when_seed_and_key_presence_change() {
+        let store = prepared();
+        let a = store.contract_id("ethereum", "0xabc").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "analysis2_evidence_sink_compat_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("evidence_cache.json");
+        let cached_params = params();
+
+        {
+            let mut sink = EvidenceCacheSink::create(&path, cached_params.clone(), 1).unwrap();
+            sink.push(&EvidenceBundle::empty(a, "ethereum", "0xabc"))
+                .unwrap();
+            sink.finish().unwrap();
+        }
+
+        let mut current_params = cached_params;
+        current_params.seeds = vec![SeedRecord {
+            chain: "base".into(),
+            address: "0xnew-seed".into(),
+            rank: None,
+        }];
+        current_params.had_alchemy = true;
+        let sink = EvidenceCacheSink::create(&path, current_params, 1).unwrap();
+        assert_eq!(sink.cached_count(), 1);
+        sink.finish().unwrap();
+
+        let loaded = load_evidence_cache_resumable(&path).unwrap();
+        assert_eq!(loaded.bundles.len(), 1);
+        assert_eq!(loaded.bundles[0].address, "0xabc");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_accepts_seed_and_key_presence_changes() {
+        let cached =
+            evidence_cache_params(&[], "seeds.json", &ApiKeys::default(), &HttpLimits::default());
+        let mut current = cached.clone();
+        current.seeds = vec![SeedRecord {
+            chain: "polygon".into(),
+            address: "0xother-seed".into(),
+            rank: Some(99),
+        }];
+        current.seeds_path = "different-seeds.json".into();
+        current.had_alchemy = true;
+        current.had_etherscan = true;
+        current.had_helius = true;
+        current.had_opensea = true;
         let cache = EvidenceCacheFile {
             version: EVIDENCE_CACHE_VERSION,
-            params: p.clone(),
+            params: cached,
             bundles: Vec::new(),
         };
-        let mut other = p;
-        other.had_alchemy = true;
-        assert!(validate_evidence_cache(&cache, &other).is_err());
+
+        validate_evidence_cache(&cache, &current)
+            .expect("candidate evidence must survive seed and key-presence changes");
+    }
+
+    #[test]
+    fn validate_still_rejects_pagination_changes() {
+        let cached =
+            evidence_cache_params(&[], "seeds.json", &ApiKeys::default(), &HttpLimits::default());
+        let mut current = cached.clone();
+        current.max_transfer_pages += 1;
+        let cache = EvidenceCacheFile {
+            version: EVIDENCE_CACHE_VERSION,
+            params: cached,
+            bundles: Vec::new(),
+        };
+
+        assert!(validate_evidence_cache(&cache, &current).is_err());
     }
 }
