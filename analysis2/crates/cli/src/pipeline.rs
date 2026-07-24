@@ -61,11 +61,11 @@ pub struct RunConfig {
     pub paper: PaperConfig,
     /// When set, used instead of Tokio `enrich_candidates` (tests / offline fixtures).
     pub enrich_override: Option<EnrichOverride>,
-    /// Path for durable dedup cache (`dedup_cache.json` by default under output_dir).
+    /// Path for durable dedup cache (`intermediate/dedup_cache.json` by default).
     pub dedup_cache_path: Option<PathBuf>,
     /// Load dedup results from cache and skip URI/Name/Metadata query stages.
     pub reuse_dedup: bool,
-    /// Path for durable evidence cache (`evidence_cache.json` by default under output_dir).
+    /// Path for durable evidence cache (`intermediate/evidence_cache.json` by default).
     pub evidence_cache_path: Option<PathBuf>,
     /// Load enrich evidence from cache; only HTTP-fetch candidates missing from cache.
     pub reuse_evidence: bool,
@@ -709,7 +709,8 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
     let candidates = registry.candidate_contracts().to_vec();
     progress.begin_phase("analyze_candidates", Some(candidates.len() as u64));
 
-    std::fs::create_dir_all(config.output_dir.join("candidates"))?;
+    analysis2_core::ensure_output_layout(&config.output_dir)
+        .map_err(Analysis2Error::from)?;
     let paper = config.paper.clone();
     let out_dir = config.output_dir.clone();
 
@@ -778,7 +779,7 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                 &seed.chain,
                 &seed.address,
                 &analyses_map,
-                "candidates",
+                analysis2_core::DETAIL_CANDIDATES_REL,
             );
             let analysis_complete = analysis_ok
                 && registry
@@ -927,7 +928,8 @@ mod tests {
             "expected Cancelled, got {err:?}"
         );
         assert!(
-            !out.join("run_manifest.json").exists(),
+            !out.join("intermediate/run_manifest.json").exists()
+                && !out.join("run_manifest.json").exists(),
             "cancel must not write run_manifest (no false complete)"
         );
 
@@ -1009,15 +1011,23 @@ mod tests {
         )
         .expect("fixture run");
 
-        assert!(out.join("run_manifest.json").is_file());
-        assert!(out.join("summary.json").is_file());
-        assert!(out.join("failures.jsonl").is_file());
-        assert!(out.join("seeds/ethereum__0xseed/report.json").is_file());
+        assert!(out.join("intermediate/run_manifest.json").is_file());
+        assert!(out.join("summary/all_chains.json").is_file());
+        assert!(out.join("summary/intra_chain.json").is_file());
+        assert!(out.join("summary/chain_matrix.json").is_file());
+        assert!(out.join("summary/cross_chain.json").is_file());
+        assert!(out.join("intermediate/failures.jsonl").is_file());
+        assert!(out
+            .join("detail/seeds/ethereum__0xseed/report.json")
+            .is_file());
 
-        let summary: Value =
-            serde_json::from_str(&std::fs::read_to_string(out.join("summary.json")).unwrap())
-                .unwrap();
+        let summary: Value = serde_json::from_str(
+            &std::fs::read_to_string(out.join("summary/all_chains.json")).unwrap(),
+        )
+        .unwrap();
         for key in [
+            "scope",
+            "duplicate_scale",
             "selected_seed_count",
             "analyzed_seed_count",
             "incomplete_seed_count",
@@ -1038,25 +1048,29 @@ mod tests {
         ] {
             assert!(summary.get(key).is_some(), "missing summary key {key}");
         }
+        assert_eq!(summary["scope"], "all_chains");
         assert!(summary["economics"].get("operator_output_usd").is_some());
         assert!(summary["economics"].get("honest_loss_usd").is_some());
         assert!(summary["economics"].get("operator_output_native").is_none());
 
-        let manifest: Value =
-            serde_json::from_str(&std::fs::read_to_string(out.join("run_manifest.json")).unwrap())
-                .unwrap();
+        let manifest: Value = serde_json::from_str(
+            &std::fs::read_to_string(out.join("intermediate/run_manifest.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(manifest["command"], "run");
         assert!(manifest["status"] == "complete" || manifest["status"] == "complete_with_failures");
+        assert_eq!(manifest["output_layout"]["detail"], "detail");
 
         let seed_report: Value = serde_json::from_str(
-            &std::fs::read_to_string(out.join("seeds/ethereum__0xseed/report.json")).unwrap(),
+            &std::fs::read_to_string(out.join("detail/seeds/ethereum__0xseed/report.json"))
+                .unwrap(),
         )
         .unwrap();
         assert!(seed_report.get("scopes_complete").is_some());
         assert!(seed_report.get("analysis").is_some());
 
-        // At least one candidate artifact streamed.
-        let cand_dir = out.join("candidates");
+        // At least one candidate artifact streamed under detail/candidates.
+        let cand_dir = out.join("detail/candidates");
         assert!(cand_dir.is_dir());
         let cand_count = std::fs::read_dir(&cand_dir).unwrap().count();
         assert!(cand_count >= 1, "expected streamed candidate JSON");
@@ -1116,7 +1130,10 @@ mod tests {
         )
         .expect_err("cancel");
         assert!(matches!(err, Analysis2Error::Cancelled));
-        assert!(!out.join("run_manifest.json").exists());
+        assert!(
+            !out.join("intermediate/run_manifest.json").exists()
+                && !out.join("run_manifest.json").exists()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1188,7 +1205,7 @@ mod tests {
         reuse.reuse_dedup = true;
         reuse.reuse_evidence = true;
         run(&reuse, &analysis2_core::NoopProgress).expect("reuse-dedup+evidence run");
-        assert!(out.join("summary.json").is_file());
+        assert!(out.join("summary/all_chains.json").is_file());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1252,7 +1269,7 @@ mod tests {
         )
         .expect("run completes with analyze failures");
 
-        let failures_path = out.join("failures.jsonl");
+        let failures_path = out.join("intermediate/failures.jsonl");
         assert!(failures_path.is_file());
         let body = std::fs::read_to_string(&failures_path).unwrap();
         let mut saw_analyze = false;

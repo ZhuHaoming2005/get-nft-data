@@ -78,18 +78,18 @@ struct RunArgs {
     #[arg(long, default_value_t = 12)]
     http_concurrency: usize,
 
-    /// Path for durable dedup cache (default: `<output-dir>/dedup_cache.json`).
+    /// Path for durable dedup cache (default: `<output-dir>/intermediate/dedup_cache.json`).
     /// Written after dedup on `run`; used when `--reuse-dedup` is set.
     #[arg(long)]
     dedup_cache: Option<PathBuf>,
 
     /// Skip URI/Name/Metadata queries; rematerialize hits from `--dedup-cache`
-    /// (or `<output-dir>/dedup_cache.json`). Still loads Parquet identity for
+    /// (or `<output-dir>/intermediate/dedup_cache.json`). Still loads Parquet identity for
     /// enrich/analyze. Params/seeds must match the cache.
     #[arg(long, default_value_t = false)]
     reuse_dedup: bool,
 
-    /// Path for durable evidence cache (default: `<output-dir>/evidence_cache.json`).
+    /// Path for durable evidence cache (default: `<output-dir>/intermediate/evidence_cache.json`).
     /// Written after enrich on `run`; used when `--reuse-evidence` is set.
     #[arg(long)]
     evidence_cache: Option<PathBuf>,

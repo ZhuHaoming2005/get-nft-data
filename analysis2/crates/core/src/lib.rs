@@ -39,17 +39,20 @@ pub use parquet::{
 };
 pub use progress::{EwmaEta, NoopProgress, ProgressObserver};
 pub use reporting::{
-    build_contract_nft_map, build_dedup_cache, build_evidence_cache, build_seed_analysis_rollup,
-    build_seed_dedup_report, count_failed_seeds, count_scope_nfts, default_dedup_cache_path,
-    default_evidence_cache_path, evidence_cache_artifacts_present, evidence_cache_params,
-    load_dedup_cache, load_evidence_cache, load_evidence_cache_resumable, load_seeds_json,
-    rematerialize_dedup_batch, rematerialize_evidence, resolve_seed_contract,
-    scopes_complete_for_seed, validate_dedup_cache, validate_evidence_cache, write_candidate_json,
-    write_dedup_cache, write_dedup_outputs, write_evidence_cache, write_run_outputs, CachedHitEdge,
-    CachedSeedHits, DedupCacheFile, DedupCacheParams, DedupRunParams, EvidenceCacheFile,
-    EvidenceCacheParams, EvidenceCacheSink, FailureRecord, ScopeNftCounts, SeedDedupReport,
-    SeedFullReport, SeedRecord, DEFAULT_DEDUP_CACHE_FILE, DEFAULT_EVIDENCE_CACHE_BATCH,
-    DEFAULT_EVIDENCE_CACHE_FILE, DEDUP_CACHE_VERSION, EVIDENCE_CACHE_VERSION,
+    build_all_chains_duplicate_scale, build_contract_nft_map, build_dedup_cache,
+    build_evidence_cache, build_seed_analysis_rollup, build_seed_dedup_report, count_failed_seeds,
+    count_scope_nfts, default_dedup_cache_path, default_evidence_cache_path, detail_candidates_dir,
+    detail_dir, ensure_output_layout, evidence_cache_artifacts_present, evidence_cache_params,
+    intermediate_dir, load_dedup_cache, load_evidence_cache, load_evidence_cache_resumable,
+    load_seeds_json, rematerialize_dedup_batch, rematerialize_evidence, resolve_seed_contract,
+    scopes_complete_for_seed, summary_dir, validate_dedup_cache, validate_evidence_cache,
+    write_candidate_json, write_dedup_cache, write_dedup_outputs, write_evidence_cache,
+    write_run_outputs, CachedHitEdge, CachedSeedHits, DedupCacheFile, DedupCacheParams,
+    DedupRunParams, EvidenceCacheFile, EvidenceCacheParams, EvidenceCacheSink, FailureRecord,
+    ScopeNftCounts, SeedDedupReport, SeedFullReport, SeedRecord, DEFAULT_DEDUP_CACHE_FILE,
+    DEFAULT_EVIDENCE_CACHE_BATCH, DEFAULT_EVIDENCE_CACHE_FILE, DETAIL_CANDIDATES_REL,
+    DETAIL_DIR, DEDUP_CACHE_VERSION, EVIDENCE_CACHE_VERSION, INTERMEDIATE_DIR, SCOPE_ALL_CHAINS,
+    SCOPE_CHAIN_MATRIX, SCOPE_CROSS_CHAIN, SCOPE_INTRA_CHAIN, SUMMARY_DIR,
 };
 pub use seed::{
     SeedRecord as SelectedSeed, SelectSeedsOptions, select_seeds, select_seeds_async,

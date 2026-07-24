@@ -1,6 +1,5 @@
 //! Full `run` report builders: candidate JSON, seed analysis sections, summary aggregates.
 
-use std::fs;
 use std::path::Path;
 
 use ahash::{AHashMap, AHashSet};
@@ -14,8 +13,14 @@ use crate::dedup::candidates::CandidateRegistry;
 use crate::entity::{ContractId, ResidentStore};
 use crate::error::Analysis2Error;
 
+use super::aggregate::{build_all_chains_duplicate_scale, AllChainsRelationRef};
 use super::json::{
     seed_dir_name, write_json, DedupRunParams, SeedDedupReport, SeedRecord,
+};
+use super::layout::{
+    ensure_output_layout, intermediate_path, seed_report_dir, summary_scope_path,
+    DETAIL_CANDIDATES_REL, SCOPE_ALL_CHAINS, SCOPE_LABEL_ALL_CHAINS, SCOPE_LABEL_CROSS_CHAIN,
+    SCOPE_CHAIN_MATRIX, SCOPE_INTRA_CHAIN,
 };
 use super::manifest::{
     count_failed_seeds, write_failures_jsonl, FailureRecord, RunManifest, RunManifestSeeds,
@@ -96,13 +101,13 @@ pub fn candidate_file_name(chain: &str, address: &str) -> String {
     format!("{chain}__{address}.json")
 }
 
-/// Write one candidate analysis JSON under `output_dir/candidates/`.
+/// Write one candidate analysis JSON under `output_dir/detail/candidates/`.
 pub fn write_candidate_json(
     output_dir: &Path,
     analysis: &CandidateAnalysis,
 ) -> Result<String, Analysis2Error> {
     let rel = format!(
-        "candidates/{}",
+        "{DETAIL_CANDIDATES_REL}/{}",
         candidate_file_name(&analysis.chain, &analysis.address)
     );
     let path = output_dir.join(&rel);
@@ -539,6 +544,9 @@ struct BehaviorAgg {
 }
 
 /// Write full `run` artifacts under `output_dir`.
+///
+/// Layout: `intermediate/` (manifest, failures), `detail/` (seeds + candidates),
+/// `summary/` (intra_chain / chain_matrix / cross_chain / all_chains).
 pub fn write_run_outputs(
     output_dir: &Path,
     params: &DedupRunParams,
@@ -548,8 +556,7 @@ pub fn write_run_outputs(
     analyses: &[CandidateAnalysis],
     extra_failures: &[FailureRecord],
 ) -> Result<(), Analysis2Error> {
-    fs::create_dir_all(output_dir)?;
-    fs::create_dir_all(output_dir.join("candidates"))?;
+    ensure_output_layout(output_dir).map_err(Analysis2Error::from)?;
 
     let mut failures = extra_failures.to_vec();
     let mut ok_reports: Vec<&SeedFullReport> = Vec::new();
@@ -565,25 +572,38 @@ pub fn write_run_outputs(
         ok_reports.iter().copied().filter(|r| !r.is_formal()).collect();
 
     for report in &ok_reports {
-        let dir = output_dir.join("seeds").join(seed_dir_name(&report.dedup.seed));
+        let dir = seed_report_dir(output_dir, &seed_dir_name(&report.dedup.seed));
         write_json(&dir.join("report.json"), report)?;
         markdown::write_seed_full_report_md(&dir.join("report.md"), report)?;
     }
 
-    // Reuse dedup scope rollups from formal + incomplete seed dedup sections.
+    // Three seed-scoped rollups from formal + incomplete seed dedup sections.
     let dedup_refs: Vec<&SeedDedupReport> = ok_reports.iter().map(|r| &r.dedup).collect();
     super::json::write_scope_rollups_public(output_dir, &dedup_refs)?;
 
+    // Fourth scope: batch all_chains = paper stats + set-union duplicate scale.
     let analysis_refs: Vec<&CandidateAnalysis> = analyses.iter().collect();
-    let summary = build_run_summary(
+    let mut summary = build_run_summary(
         selected_seeds,
         &formal,
         &incomplete,
         &failures,
         &analysis_refs,
     );
-    write_json(&output_dir.join("summary.json"), &summary)?;
-    markdown::write_summary_md(&output_dir.join("summary.md"), &summary)?;
+    let scale = build_all_chains_duplicate_scale(store, all_chains_relations_from_full(&dedup_refs));
+    if let Some(obj) = summary.as_object_mut() {
+        obj.insert("scope".into(), json!(SCOPE_LABEL_ALL_CHAINS));
+        obj.insert("duplicate_scale".into(), json!(scale));
+    }
+    write_json(
+        &summary_scope_path(output_dir, SCOPE_ALL_CHAINS, "json"),
+        &summary,
+    )?;
+    markdown::write_all_chains_md(
+        &summary_scope_path(output_dir, SCOPE_ALL_CHAINS, "md"),
+        &summary,
+        &scale,
+    )?;
 
     let manifest = RunManifest {
         status: if failures.is_empty() && incomplete.is_empty() {
@@ -616,10 +636,41 @@ pub fn write_run_outputs(
         }),
         pricing_policy: "alchemy_spot_runtime_usd_only_cross_chain".into(),
         stage_timings: json!([]),
+        output_layout: json!({
+            "intermediate": super::layout::INTERMEDIATE_DIR,
+            "detail": super::layout::DETAIL_DIR,
+            "summary": super::layout::SUMMARY_DIR,
+            "scopes": [
+                SCOPE_INTRA_CHAIN,
+                SCOPE_CHAIN_MATRIX,
+                SCOPE_LABEL_CROSS_CHAIN,
+                SCOPE_LABEL_ALL_CHAINS,
+            ],
+        }),
     };
-    write_json(&output_dir.join("run_manifest.json"), &manifest)?;
-    write_failures_jsonl(&output_dir.join("failures.jsonl"), &failures)?;
+    write_json(
+        &intermediate_path(output_dir, "run_manifest.json"),
+        &manifest,
+    )?;
+    write_failures_jsonl(&intermediate_path(output_dir, "failures.jsonl"), &failures)?;
     Ok(())
+}
+
+fn all_chains_relations_from_full<'a>(
+    reports: &[&'a SeedDedupReport],
+) -> Vec<AllChainsRelationRef<'a>> {
+    let mut out = Vec::new();
+    for report in reports {
+        for rel in &report.relations {
+            out.push(AllChainsRelationRef {
+                candidate_chain: &rel.candidate_chain,
+                candidate_address: &rel.candidate_address,
+                dimensions: &rel.dimensions,
+                nft_ids: &rel.nft_ids,
+            });
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -705,7 +756,7 @@ mod tests {
                     chain: "base".into(),
                     address: "0xcand".into(),
                     is_legit_duplicate: false,
-                    path: "candidates/base__0xcand.json".into(),
+                    path: "detail/candidates/base__0xcand.json".into(),
                 }],
             }),
         };
@@ -792,7 +843,7 @@ mod tests {
                     chain: cand_chain.into(),
                     address: cand_addr.into(),
                     is_legit_duplicate: is_legit,
-                    path: format!("candidates/{cand_chain}__{cand_addr}.json"),
+                    path: format!("detail/candidates/{cand_chain}__{cand_addr}.json"),
                 }],
             }),
         }

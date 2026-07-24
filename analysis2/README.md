@@ -71,11 +71,17 @@ cargo run --manifest-path analysis2/Cargo.toml --release -- run-dedup `
   --progress off
 ```
 
-Writes under `--output-dir`:
+Writes under `--output-dir` in three roots:
 
-- `seeds/<chain>__<address>/report.json|.md` (dedup sections)
-- `intra_chain.json|.md`, `chain_matrix.json|.md`, `cross_chain.json|.md`
-- `summary.json|.md`, `run_manifest.json`, `failures.jsonl`
+```text
+intermediate/          # run_manifest.json, failures.jsonl, caches
+detail/seeds/…         # per-seed report.json|.md
+summary/
+  intra_chain.*        # 单链
+  chain_matrix.*       # 跨链矩阵
+  cross_chain.*        # 跨链总结 (scope: cross_chain_summary)
+  all_chains.*         # 全链汇总 (scope: all_chains) + batch metrics
+```
 
 ## Phase C — full `run`
 
@@ -106,15 +112,15 @@ cargo run --manifest-path analysis2/Cargo.toml --release -- run `
 API keys are optional per provider: missing keys mark dependent evidence `not_requested`
 and the run continues. OpenSea is used only for sales fallback when preferred providers
 cannot supply amounts. Cancel / OOM paths do **not** write `status: complete` into
-`run_manifest.json`. Incomplete four-scope seeds are excluded from formal summary
-denominators. Cross-chain economics in `summary.json` sum **USD only**.
+`intermediate/run_manifest.json`. Incomplete four-scope seeds are excluded from formal
+summary denominators. Cross-chain economics in `summary/all_chains.json` sum **USD only**.
 
 ### Dedup cache (skip re-query)
 
 After URI/Name/Metadata queries finish, `run` always writes a portable checkpoint:
 
 ```text
-<output-dir>/dedup_cache.json
+<output-dir>/intermediate/dedup_cache.json
 ```
 
 (override with `--dedup-cache PATH`). Edges are stored with stable chain/address/token
@@ -126,9 +132,9 @@ While enrich runs, network results are checkpointed **in batches** (default ever
 candidates):
 
 ```text
-<output-dir>/evidence_cache.json       # full snapshot (rewritten each flush)
-<output-dir>/evidence_cache.jsonl      # append-only per-candidate lines
-<output-dir>/evidence_cache.meta.json  # version + params
+<output-dir>/intermediate/evidence_cache.json       # full snapshot (rewritten each flush)
+<output-dir>/intermediate/evidence_cache.jsonl      # append-only per-candidate lines
+<output-dir>/intermediate/evidence_cache.meta.json  # version + params
 ```
 
 (override base path with `--evidence-cache PATH`). Bundles use stable chain/address;
@@ -175,9 +181,9 @@ anchors, and the seeds list must match the cache or the run fails fast.
 
 Additional outputs vs `run-dedup`:
 
-- `candidates/<chain>__<address>.json` (streamed as each candidate finishes analysis)
-- Seed reports include `scopes_complete`, `analysis_complete`, and `analysis` rollups
-- Summary adds candidate / address / behavior / economics / data_quality sections
+- `detail/candidates/<chain>__<address>.json` (streamed as each candidate finishes analysis)
+- Seed reports under `detail/seeds/` include `scopes_complete`, `analysis_complete`, and `analysis` rollups
+- `summary/all_chains.*` adds candidate / address / behavior / economics / data_quality / `duplicate_scale`
 
 ## CLI
 

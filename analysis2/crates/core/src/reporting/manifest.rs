@@ -28,6 +28,23 @@ pub struct RunManifest {
     pub completeness: Value,
     pub pricing_policy: String,
     pub stage_timings: Value,
+    /// Directory split: intermediate / detail / summary + four scope names.
+    #[serde(default = "default_output_layout")]
+    pub output_layout: Value,
+}
+
+fn default_output_layout() -> Value {
+    serde_json::json!({
+        "intermediate": "intermediate",
+        "detail": "detail",
+        "summary": "summary",
+        "scopes": [
+            "intra_chain",
+            "chain_matrix",
+            "cross_chain_summary",
+            "all_chains"
+        ],
+    })
 }
 
 /// One recoverable failure (seed / stage); siblings continue.

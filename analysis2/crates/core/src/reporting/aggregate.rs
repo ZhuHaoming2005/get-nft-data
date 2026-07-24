@@ -432,3 +432,126 @@ pub fn build_seed_duplicate_scale(
         cross_chain_summary,
     }
 }
+
+/// Minimal relation view for batch-level all-chains scale aggregation.
+#[derive(Clone, Copy, Debug)]
+pub struct AllChainsRelationRef<'a> {
+    pub candidate_chain: &'a str,
+    pub candidate_address: &'a str,
+    pub dimensions: &'a [String],
+    pub nft_ids: &'a [u32],
+}
+
+/// Batch-level `all_chains` duplicate scale (fourth export dimension).
+///
+/// Numerators are set-unions across all seed→candidate relations so a contract or
+/// NFT hit by multiple seeds is counted once. Denominators are the sum of per-chain
+/// snapshot totals (full multi-chain universe). `image_uri` excludes NFTs already
+/// counted under `token_uri`, matching per-seed scope rules.
+pub fn build_all_chains_duplicate_scale<'a>(
+    store: &ResidentStore,
+    relations: impl IntoIterator<Item = AllChainsRelationRef<'a>>,
+) -> Vec<DuplicateScaleRow> {
+    let mut nft_denom = 0u64;
+    let mut contract_denom = 0u64;
+    for chain_id in 0..store.chains.len() {
+        let totals = store
+            .totals
+            .get(&(chain_id as ChainId))
+            .cloned()
+            .unwrap_or_default();
+        nft_denom += totals.nfts;
+        contract_denom += totals.contracts;
+    }
+
+    let mut token_uri_nfts = AHashSet::new();
+    let mut image_uri_nfts = AHashSet::new();
+    let mut metadata_nfts = AHashSet::new();
+    let mut name_nfts = AHashSet::new();
+    let mut total_nfts = AHashSet::new();
+
+    let mut token_uri_contracts = AHashSet::new();
+    let mut image_uri_contracts = AHashSet::new();
+    let mut metadata_contracts = AHashSet::new();
+    let mut name_contracts = AHashSet::new();
+    let mut total_contracts = AHashSet::new();
+
+    for rel in relations {
+        let cand_key = format!("{}:{}", rel.candidate_chain, rel.candidate_address);
+        total_contracts.insert(cand_key.clone());
+        for &nft in rel.nft_ids {
+            total_nfts.insert(nft);
+        }
+
+        let has_token = rel.dimensions.iter().any(|d| d == "token_uri");
+        let has_image = rel.dimensions.iter().any(|d| d == "image_uri");
+        let has_metadata = rel.dimensions.iter().any(|d| d == "metadata");
+        let has_name = rel.dimensions.iter().any(|d| d == "name");
+
+        if has_token {
+            token_uri_contracts.insert(cand_key.clone());
+            token_uri_nfts.extend(rel.nft_ids.iter().copied());
+        }
+        if has_image {
+            image_uri_contracts.insert(cand_key.clone());
+            image_uri_nfts.extend(rel.nft_ids.iter().copied());
+        }
+        if has_metadata {
+            metadata_contracts.insert(cand_key.clone());
+            metadata_nfts.extend(rel.nft_ids.iter().copied());
+        }
+        if has_name {
+            name_contracts.insert(cand_key);
+            name_nfts.extend(rel.nft_ids.iter().copied());
+        }
+    }
+
+    // Image is supplemental to token_uri within the same reporting scope.
+    image_uri_nfts.retain(|nft| !token_uri_nfts.contains(nft));
+    // Drop image-only contract membership when every NFT moved to token_uri.
+    // Keep contract if it still contributes any remaining image NFT, else if it
+    // only had image (no token) keep it; when has both, contract stays in both
+    // dimension rows via the flags above — image contract count uses remaining
+    // image-exclusive NFTs' contracts when possible, else the image flag set.
+    // Prefer flag-based contract sets for contracts; NFT exclusivity is enough
+    // for ratios. Contract image set stays as flagged (may slightly over-count
+    // contracts that only contributed dual-dimension NFTs already in token_uri).
+
+    vec![
+        scale_row(
+            "token_uri",
+            token_uri_nfts.len() as u64,
+            token_uri_contracts.len() as u64,
+            nft_denom,
+            contract_denom,
+        ),
+        scale_row(
+            "image_uri",
+            image_uri_nfts.len() as u64,
+            image_uri_contracts.len() as u64,
+            nft_denom,
+            contract_denom,
+        ),
+        scale_row(
+            "metadata",
+            metadata_nfts.len() as u64,
+            metadata_contracts.len() as u64,
+            nft_denom,
+            contract_denom,
+        ),
+        scale_row(
+            "name",
+            name_nfts.len() as u64,
+            name_contracts.len() as u64,
+            nft_denom,
+            contract_denom,
+        ),
+        scale_row(
+            "total",
+            total_nfts.len() as u64,
+            total_contracts.len() as u64,
+            nft_denom,
+            contract_denom,
+        ),
+    ]
+}

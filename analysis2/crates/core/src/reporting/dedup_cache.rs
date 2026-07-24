@@ -65,9 +65,9 @@ pub struct DedupCacheFile {
     pub failures: Vec<FailureRecord>,
 }
 
-/// Default cache path: `{output_dir}/dedup_cache.json`.
+/// Default cache path: `{output_dir}/intermediate/dedup_cache.json`.
 pub fn default_dedup_cache_path(output_dir: &Path) -> PathBuf {
-    output_dir.join(DEFAULT_DEDUP_CACHE_FILE)
+    super::layout::intermediate_path(output_dir, DEFAULT_DEDUP_CACHE_FILE)
 }
 
 fn dimension_label(d: Dimension) -> &'static str {

@@ -140,7 +140,7 @@ pub fn write_matrix_md(path: &Path, reports: &[&SeedDedupReport]) -> Result<(), 
 
 pub fn write_summary_md(path: &Path, summary: &Value) -> Result<(), Analysis2Error> {
     let body = format!(
-        "# Summary\n\n- selected: {}\n- analyzed (formal): {}\n- incomplete: {}\n- failed: {}\n- seed_with_duplicate_count: {}\n- seed_duplicate_ratio: {}\n- candidate_contract_count: {}\n- honest_loss_usd: {}\n- operator_output_usd: {}\n",
+        "# all_chains\n\n- selected: {}\n- analyzed (formal): {}\n- incomplete: {}\n- failed: {}\n- seed_with_duplicate_count: {}\n- seed_duplicate_ratio: {}\n- candidate_contract_count: {}\n- honest_loss_usd: {}\n- operator_output_usd: {}\n",
         summary["selected_seed_count"],
         summary["analyzed_seed_count"],
         summary.get("incomplete_seed_count").unwrap_or(&Value::Null),
@@ -151,5 +151,27 @@ pub fn write_summary_md(path: &Path, summary: &Value) -> Result<(), Analysis2Err
         summary.pointer("/economics/honest_loss_usd").unwrap_or(&Value::Null),
         summary.pointer("/economics/operator_output_usd").unwrap_or(&Value::Null),
     );
+    write_text(path, &body)
+}
+
+/// Fourth-scope markdown: batch `all_chains` metrics + duplicate-scale table.
+pub fn write_all_chains_md(
+    path: &Path,
+    summary: &Value,
+    scale: &[DuplicateScaleRow],
+) -> Result<(), Analysis2Error> {
+    let mut body = format!(
+        "# all_chains\n\n- selected: {}\n- analyzed (formal): {}\n- incomplete: {}\n- failed: {}\n- seed_with_duplicate_count: {}\n- seed_duplicate_ratio: {}\n- candidate_contract_count: {}\n- honest_loss_usd: {}\n- operator_output_usd: {}\n\n## Duplicate scale\n\n",
+        summary["selected_seed_count"],
+        summary["analyzed_seed_count"],
+        summary.get("incomplete_seed_count").unwrap_or(&Value::Null),
+        summary["failed_seed_count"],
+        summary["seed_with_duplicate_count"],
+        summary["seed_duplicate_ratio"],
+        summary.get("candidate_contract_count").unwrap_or(&Value::Null),
+        summary.pointer("/economics/honest_loss_usd").unwrap_or(&Value::Null),
+        summary.pointer("/economics/operator_output_usd").unwrap_or(&Value::Null),
+    );
+    body.push_str(&scale_table(scale));
     write_text(path, &body)
 }

@@ -138,7 +138,7 @@ fn report_golden_duplicate_scale_fields_and_ratios() {
     .expect("write");
 
     let seed_json: Value = serde_json::from_str(
-        &std::fs::read_to_string(out.join("seeds/ethereum__0xseed/report.json")).unwrap(),
+        &std::fs::read_to_string(out.join("detail/seeds/ethereum__0xseed/report.json")).unwrap(),
     )
     .unwrap();
     let intra_rows = seed_json["duplicate_scale"]["intra_chain"]
@@ -154,22 +154,37 @@ fn report_golden_duplicate_scale_fields_and_ratios() {
     assert!(find_row(intra_rows, "image_uri").get("duplicate_nft_count").is_some());
     assert!(find_row(intra_rows, "metadata").get("duplicate_nft_count").is_some());
 
-    assert!(out.join("seeds/ethereum__0xseed/report.md").is_file());
-    assert!(out.join("intra_chain.json").is_file());
-    assert!(out.join("chain_matrix.json").is_file());
-    assert!(out.join("cross_chain.json").is_file());
-    assert!(out.join("summary.json").is_file());
-    assert!(out.join("run_manifest.json").is_file());
-    assert!(out.join("failures.jsonl").is_file());
+    assert!(out
+        .join("detail/seeds/ethereum__0xseed/report.md")
+        .is_file());
+    assert!(out.join("summary/intra_chain.json").is_file());
+    assert!(out.join("summary/chain_matrix.json").is_file());
+    assert!(out.join("summary/cross_chain.json").is_file());
+    assert!(out.join("summary/all_chains.json").is_file());
+    assert!(out.join("summary/intra_chain.md").is_file());
+    assert!(out.join("summary/chain_matrix.md").is_file());
+    assert!(out.join("summary/cross_chain.md").is_file());
+    assert!(out.join("summary/all_chains.md").is_file());
+    assert!(out.join("intermediate/run_manifest.json").is_file());
+    assert!(out.join("intermediate/failures.jsonl").is_file());
 
-    let manifest: Value =
-        serde_json::from_str(&std::fs::read_to_string(out.join("run_manifest.json")).unwrap())
-            .unwrap();
+    let manifest: Value = serde_json::from_str(
+        &std::fs::read_to_string(out.join("intermediate/run_manifest.json")).unwrap(),
+    )
+    .unwrap();
     assert_eq!(manifest["status"], "complete");
     assert_eq!(manifest["seeds"]["analyzed"], 1);
+    assert_eq!(manifest["output_layout"]["summary"], "summary");
+    let scopes = manifest["output_layout"]["scopes"].as_array().unwrap();
+    assert!(scopes.iter().any(|s| s == "all_chains"));
 
-    let summary: Value =
-        serde_json::from_str(&std::fs::read_to_string(out.join("summary.json")).unwrap()).unwrap();
+    let summary: Value = serde_json::from_str(
+        &std::fs::read_to_string(out.join("summary/all_chains.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(summary["scope"], "all_chains");
     assert_eq!(summary["analyzed_seed_count"], 1);
     assert_eq!(summary["seed_with_duplicate_count"], 1);
+    let scale = summary["duplicate_scale"].as_array().unwrap();
+    assert!(scale.iter().any(|r| r["category"] == "total"));
 }

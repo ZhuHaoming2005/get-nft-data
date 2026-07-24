@@ -54,9 +54,9 @@ pub struct EvidenceCacheFile {
     pub bundles: Vec<EvidenceBundle>,
 }
 
-/// Default cache path: `{output_dir}/evidence_cache.json`.
+/// Default cache path: `{output_dir}/intermediate/evidence_cache.json`.
 pub fn default_evidence_cache_path(output_dir: &Path) -> PathBuf {
-    output_dir.join(DEFAULT_EVIDENCE_CACHE_FILE)
+    super::layout::intermediate_path(output_dir, DEFAULT_EVIDENCE_CACHE_FILE)
 }
 
 fn companion_jsonl(path: &Path) -> PathBuf {
