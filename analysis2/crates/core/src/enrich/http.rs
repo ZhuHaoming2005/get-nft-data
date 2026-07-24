@@ -412,11 +412,19 @@ impl HttpClient {
         }
         let final_error =
             last_error.unwrap_or_else(|| Analysis2Error::http("HTTP request failed"));
-        eprintln!(
-            "[api/error] endpoint={endpoint} method={method} provider={} action=give_up error={}",
-            lane.name,
-            one_line_error(&final_error.to_string(), ERROR_LOG_CHARS)
-        );
+        // 404 is an expected miss for unknown collections — quiet one-liner, not full body dump.
+        if is_http_not_found(&final_error) {
+            eprintln!(
+                "[api/miss] endpoint={endpoint} method={method} provider={} action=not_found",
+                lane.name
+            );
+        } else {
+            eprintln!(
+                "[api/error] endpoint={endpoint} method={method} provider={} action=give_up error={}",
+                lane.name,
+                one_line_error(&final_error.to_string(), ERROR_LOG_CHARS)
+            );
+        }
         Err(final_error)
     }
 
@@ -432,13 +440,22 @@ impl HttpClient {
         last_error: &mut Option<Analysis2Error>,
     ) -> Result<bool, Analysis2Error> {
         let rate_limited = is_rate_limited(&error);
-        let retryable = rate_limited || is_retryable(&error);
+        let not_found = is_http_not_found(&error);
+        let retryable = !not_found && (rate_limited || is_retryable(&error));
         let will_retry = attempt < self.retries && retryable;
         // 429: cool down only this provider's limiter (not other providers).
+        // 5xx: start from 500ms (503 connection resets need more space than 100ms).
         let backoff = if will_retry {
             if rate_limited {
                 lane.limiter.note_rate_limited(RATE_LIMIT_COOLDOWN);
                 Some(RATE_LIMIT_COOLDOWN)
+            } else if is_http_status(&error, 503)
+                || is_http_status(&error, 502)
+                || is_http_status(&error, 504)
+            {
+                Some(Duration::from_millis(
+                    500u64.saturating_mul(1u64 << attempt.min(4)),
+                ))
             } else {
                 Some(Duration::from_millis(
                     100u64.saturating_mul(1u64 << attempt.min(8)),
@@ -447,14 +464,17 @@ impl HttpClient {
         } else {
             None
         };
-        print_request_error(
-            method,
-            endpoint,
-            attempt + 1,
-            self.retries + 1,
-            backoff.map(|d| d.as_millis() as u64),
-            &error,
-        );
+        // Skip per-attempt spam for permanent 404 (give_up path logs once).
+        if !not_found {
+            print_request_error(
+                method,
+                endpoint,
+                attempt + 1,
+                self.retries + 1,
+                backoff.map(|d| d.as_millis() as u64),
+                &error,
+            );
+        }
         *last_error = Some(error);
         if !will_retry {
             return Ok(false);
@@ -592,7 +612,7 @@ fn is_retryable(error: &Analysis2Error) -> bool {
 }
 
 /// True when the HTTP error message reports the given status (e.g. 429).
-fn is_http_status(error: &Analysis2Error, status: u16) -> bool {
+pub fn is_http_status(error: &Analysis2Error, status: u16) -> bool {
     match error {
         Analysis2Error::Http(message) => {
             let lower = message.to_ascii_lowercase();
@@ -603,6 +623,11 @@ fn is_http_status(error: &Analysis2Error, status: u16) -> bool {
         }
         _ => false,
     }
+}
+
+/// Permanent client miss (no point retrying).
+pub fn is_http_not_found(error: &Analysis2Error) -> bool {
+    is_http_status(error, 404)
 }
 
 /// Provider rate-limit signal: HTTP 429, transport status=429, or rate-limit text.
@@ -743,25 +768,37 @@ fn looks_like_api_key_segment(segment: &str) -> bool {
 }
 
 fn redact_path_secrets(endpoint: &str) -> String {
-    // Replace long secret-looking path segments after /v2/ or /v3/, even when
-    // the segment is glued to punctuation (e.g. "KEY)" inside error strings).
+    // Replace long secret-looking path segments after API version prefixes:
+    // Alchemy NFT `/v2/<key>`, prices `/prices/v1/<key>/tokens/...`.
     let mut parts: Vec<String> = endpoint.split('/').map(str::to_owned).collect();
     for i in 0..parts.len() {
         let head = strip_wrapping_punct(&parts[i]);
-        if matches!(head, "v2" | "v3") {
-            if let Some(next) = parts.get_mut(i + 1) {
-                if looks_like_api_key_segment(next) {
-                    // Preserve trailing punctuation so messages stay readable.
-                    let trailing: String = next
-                        .chars()
-                        .rev()
-                        .take_while(|c| !c.is_ascii_alphanumeric() && *c != '-' && *c != '_')
-                        .collect::<String>()
-                        .chars()
-                        .rev()
-                        .collect();
-                    *next = format!("***{trailing}");
-                }
+        let redact_next = matches!(head, "v1" | "v2" | "v3")
+            || (head.eq_ignore_ascii_case("prices")
+                && parts
+                    .get(i + 1)
+                    .map(|p| strip_wrapping_punct(p) == "v1")
+                    .unwrap_or(false));
+        if !redact_next {
+            continue;
+        }
+        // For "prices"/"v1"/KEY skip one extra segment when head is prices.
+        let key_idx = if head.eq_ignore_ascii_case("prices") {
+            i + 2
+        } else {
+            i + 1
+        };
+        if let Some(next) = parts.get_mut(key_idx) {
+            if looks_like_api_key_segment(next) {
+                let trailing: String = next
+                    .chars()
+                    .rev()
+                    .take_while(|c| !c.is_ascii_alphanumeric() && *c != '-' && *c != '_')
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
+                *next = format!("***{trailing}");
             }
         }
     }
@@ -817,6 +854,13 @@ mod tests {
         let label = redact_endpoint(url);
         assert!(label.contains("eth-mainnet.g.alchemy.com"));
         assert!(label.contains("/v2/***/getNFTs") || label.contains("/v2/***"));
+        let prices = "https://api.g.alchemy.com/prices/v1/O6O-K8fkagLHjOa-LLM3_/tokens/by-symbol?symbols=SOL";
+        let prices_label = redact_endpoint(prices);
+        assert!(
+            !prices_label.contains("O6O-K8fkagLHjOa-LLM3_"),
+            "prices path must redact key: {prices_label}"
+        );
+        assert!(prices_label.contains("/prices/v1/***/tokens/by-symbol"));
         assert!(!label.contains("super-secret-key"));
     }
 

@@ -40,7 +40,11 @@ pub struct SeedAnalysisRollup {
     pub candidate_refs: Vec<CandidateRef>,
 }
 
-/// Cross-chain / multi-candidate USD-only economics (never sums native across chains).
+/// Cross-chain / multi-candidate economics rollup.
+///
+/// Monetary fields that are summed across chains are **USD only**. Gas stages are
+/// summed as native units per-candidate (not mixed-chain ETH totals for display
+/// when multi-chain; still useful as aggregate gas accounting in native units).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct EconomicsUsdRollup {
     pub operator_output_usd: f64,
@@ -48,6 +52,17 @@ pub struct EconomicsUsdRollup {
     pub secondary_sale_loss_usd: f64,
     pub paid_mint_loss_usd: f64,
     pub gross_revenue_usd: f64,
+    pub setup_gas_native: f64,
+    pub lure_gas_native: f64,
+    pub exit_gas_native: f64,
+    pub total_gas_native: f64,
+    pub stuck_nft_count: u64,
+    /// Contracts with a defined same-unit `output_input_ratio`.
+    pub output_input_ratio_count: u64,
+    pub output_input_ratio_ge1_count: u64,
+    pub output_input_ratio_lt1_count: u64,
+    /// Sum of per-contract input USD inferred as `output_usd / ratio` when ratio > 0.
+    pub inferred_input_usd: f64,
 }
 
 /// Pointer from a seed report to a streamed candidate artifact.
@@ -141,13 +156,34 @@ pub fn write_candidate_json_bytes(
 }
 
 fn economics_usd_from(facts: &EconomicFacts) -> EconomicsUsdRollup {
-    EconomicsUsdRollup {
+    let mut roll = EconomicsUsdRollup {
         operator_output_usd: facts.operator_output_usd,
         honest_loss_usd: facts.honest_loss_usd,
         secondary_sale_loss_usd: facts.secondary_sale_loss_usd,
         paid_mint_loss_usd: facts.paid_mint_loss_usd,
         gross_revenue_usd: facts.gross_revenue_usd,
+        setup_gas_native: facts.setup_gas_native,
+        lure_gas_native: facts.lure_gas_native,
+        exit_gas_native: facts.exit_gas_native,
+        total_gas_native: facts.total_gas_native,
+        stuck_nft_count: facts.stuck_nft_count,
+        output_input_ratio_count: 0,
+        output_input_ratio_ge1_count: 0,
+        output_input_ratio_lt1_count: 0,
+        inferred_input_usd: 0.0,
+    };
+    if let Some(ratio) = facts.output_input_ratio {
+        roll.output_input_ratio_count = 1;
+        if ratio >= 1.0 {
+            roll.output_input_ratio_ge1_count = 1;
+        } else {
+            roll.output_input_ratio_lt1_count = 1;
+        }
+        if ratio > 0.0 && facts.operator_output_usd.is_finite() {
+            roll.inferred_input_usd = facts.operator_output_usd / ratio;
+        }
     }
+    roll
 }
 
 fn merge_usd(dst: &mut EconomicsUsdRollup, src: &EconomicsUsdRollup) {
@@ -156,6 +192,15 @@ fn merge_usd(dst: &mut EconomicsUsdRollup, src: &EconomicsUsdRollup) {
     dst.secondary_sale_loss_usd += src.secondary_sale_loss_usd;
     dst.paid_mint_loss_usd += src.paid_mint_loss_usd;
     dst.gross_revenue_usd += src.gross_revenue_usd;
+    dst.setup_gas_native += src.setup_gas_native;
+    dst.lure_gas_native += src.lure_gas_native;
+    dst.exit_gas_native += src.exit_gas_native;
+    dst.total_gas_native += src.total_gas_native;
+    dst.stuck_nft_count += src.stuck_nft_count;
+    dst.output_input_ratio_count += src.output_input_ratio_count;
+    dst.output_input_ratio_ge1_count += src.output_input_ratio_ge1_count;
+    dst.output_input_ratio_lt1_count += src.output_input_ratio_lt1_count;
+    dst.inferred_input_usd += src.inferred_input_usd;
 }
 
 fn role_is_malicious(role: AddressRole) -> bool {
@@ -368,6 +413,15 @@ pub fn build_run_summary(
     let mut infringing_nfts = 0u64;
     let mut economics = EconomicsUsdRollup::default();
     let mut total_instances = 0u64;
+    // Wash cycle node-size buckets (2 / 3 / 4 / 5+) from instance address sets.
+    let mut wash_cycle_2 = 0u64;
+    let mut wash_cycle_3 = 0u64;
+    let mut wash_cycle_4 = 0u64;
+    let mut wash_cycle_5p = 0u64;
+    let mut contracts_with_behavior = AHashSet::new();
+    // Per-contract total gas for concentration (top share of total_gas_native).
+    let mut gas_by_contract: Vec<(String, f64)> = Vec::new();
+
     for analysis in analyses {
         let key = format!("{}:{}", analysis.chain, analysis.address);
         if !formal_cand_keys.contains(&key) {
@@ -390,7 +444,11 @@ pub fn build_run_summary(
         if fully_legit {
             continue;
         }
-        merge_usd(&mut economics, &economics_usd_from(&analysis.economics));
+        let econ = economics_usd_from(&analysis.economics);
+        merge_usd(&mut economics, &econ);
+        if analysis.economics.total_gas_native > 0.0 {
+            gas_by_contract.push((key.clone(), analysis.economics.total_gas_native));
+        }
         let from_ids = cand_nft_ids
             .get(&key)
             .map(|s| s.len() as u64)
@@ -426,11 +484,67 @@ pub fn build_run_summary(
             }
             agg.linked_loss_usd += inst.linked_loss_usd;
             kinds_seen.insert(bk);
+            if matches!(inst.kind, BehaviorKind::WashTrading) {
+                match inst.addresses.len() {
+                    0 | 1 => {}
+                    2 => wash_cycle_2 += 1,
+                    3 => wash_cycle_3 += 1,
+                    4 => wash_cycle_4 += 1,
+                    _ => wash_cycle_5p += 1,
+                }
+            }
+        }
+        if !kinds_seen.is_empty() {
+            contracts_with_behavior.insert(key.clone());
         }
         for bk in kinds_seen {
             behavior_map.get_mut(bk).unwrap().contracts.insert(key.clone());
         }
     }
+
+    let wash_total = wash_cycle_2 + wash_cycle_3 + wash_cycle_4 + wash_cycle_5p;
+    let wash_cycle_size_distribution = json!([
+        {
+            "node_count_bucket": "2",
+            "cycle_count": wash_cycle_2,
+            "cycle_ratio": if wash_total == 0 { None } else { Some(wash_cycle_2 as f64 / wash_total as f64) },
+            "cycle_ratio_numerator": wash_cycle_2,
+            "cycle_ratio_denominator": wash_total,
+        },
+        {
+            "node_count_bucket": "3",
+            "cycle_count": wash_cycle_3,
+            "cycle_ratio": if wash_total == 0 { None } else { Some(wash_cycle_3 as f64 / wash_total as f64) },
+            "cycle_ratio_numerator": wash_cycle_3,
+            "cycle_ratio_denominator": wash_total,
+        },
+        {
+            "node_count_bucket": "4",
+            "cycle_count": wash_cycle_4,
+            "cycle_ratio": if wash_total == 0 { None } else { Some(wash_cycle_4 as f64 / wash_total as f64) },
+            "cycle_ratio_numerator": wash_cycle_4,
+            "cycle_ratio_denominator": wash_total,
+        },
+        {
+            "node_count_bucket": "5+",
+            "cycle_count": wash_cycle_5p,
+            "cycle_ratio": if wash_total == 0 { None } else { Some(wash_cycle_5p as f64 / wash_total as f64) },
+            "cycle_ratio_numerator": wash_cycle_5p,
+            "cycle_ratio_denominator": wash_total,
+        },
+    ]);
+
+    // Top-10% contract gas concentration (by total_gas_native among positive-gas contracts).
+    gas_by_contract.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let gas_total: f64 = gas_by_contract.iter().map(|(_, g)| *g).sum();
+    let top_k = ((gas_by_contract.len() as f64) * 0.10).ceil() as usize;
+    let top_k = top_k.max(if gas_by_contract.is_empty() { 0 } else { 1 }).min(gas_by_contract.len());
+    let top_gas: f64 = gas_by_contract.iter().take(top_k).map(|(_, g)| *g).sum();
+    let gas_concentration = if gas_total > 0.0 {
+        Some(top_gas / gas_total)
+    } else {
+        None
+    };
 
     let repeat_malicious = addr_to_suspect_contracts
         .values()
@@ -527,14 +641,60 @@ pub fn build_run_summary(
             "total_address_count": total_address_count,
         },
         "behaviors": behaviors,
+        "behavior_contract_count": contracts_with_behavior.len() as u64,
+        "wash_cycle_size_distribution": wash_cycle_size_distribution,
         "economics": {
             "operator_output_usd": economics.operator_output_usd,
             "honest_loss_usd": economics.honest_loss_usd,
             "secondary_sale_loss_usd": economics.secondary_sale_loss_usd,
             "paid_mint_loss_usd": economics.paid_mint_loss_usd,
             "gross_revenue_usd": economics.gross_revenue_usd,
+            "setup_gas_native": economics.setup_gas_native,
+            "lure_gas_native": economics.lure_gas_native,
+            "exit_gas_native": economics.exit_gas_native,
+            "total_gas_native": economics.total_gas_native,
+            "stuck_nft_count": economics.stuck_nft_count,
+            "stuck_nft_ratio": if infringing_nfts == 0 {
+                None
+            } else {
+                Some(economics.stuck_nft_count as f64 / infringing_nfts as f64)
+            },
+            "output_input_ratio": if economics.inferred_input_usd > 0.0 {
+                Some(economics.operator_output_usd / economics.inferred_input_usd)
+            } else {
+                None
+            },
+            "output_input_ratio_count": economics.output_input_ratio_count,
+            "output_input_ratio_ge1_count": economics.output_input_ratio_ge1_count,
+            "output_input_ratio_lt1_count": economics.output_input_ratio_lt1_count,
+            "output_input_ratio_ge1_share": if economics.output_input_ratio_count == 0 {
+                None
+            } else {
+                Some(
+                    economics.output_input_ratio_ge1_count as f64
+                        / economics.output_input_ratio_count as f64,
+                )
+            },
+            "output_input_ratio_lt1_share": if economics.output_input_ratio_count == 0 {
+                None
+            } else {
+                Some(
+                    economics.output_input_ratio_lt1_count as f64
+                        / economics.output_input_ratio_count as f64,
+                )
+            },
+            "inferred_input_usd": economics.inferred_input_usd,
+            "top_contract_gas_contribution_ratio": gas_concentration,
+            "top_contract_gas_contribution_numerator": top_gas,
+            "top_contract_gas_contribution_denominator": gas_total,
+            "top_contract_gas_count": top_k as u64,
         },
         "data_quality": {
+            "representative_candidate_count": candidate_contracts.len() as u64,
+            "candidate_contract_count": candidate_contracts.len() as u64,
+            "suspected_duplicate_contract_count": suspected_n,
+            "legit_duplicate_contract_count": legit_contracts.len() as u64,
+            "infringing_nft_count": infringing_nfts,
             "gas_evidence_complete": quality_complete,
             "gas_evidence_empty": quality_empty,
             "gas_evidence_failed": quality_failed,
@@ -776,6 +936,7 @@ mod tests {
                     secondary_sale_loss_usd: 3.0,
                     paid_mint_loss_usd: 0.0,
                     gross_revenue_usd: 12.0,
+                    ..Default::default()
                 },
                 candidate_refs: vec![CandidateRef {
                     chain: "base".into(),
@@ -808,6 +969,8 @@ mod tests {
             "infringing_nft_count",
             "address_classification",
             "behaviors",
+            "behavior_contract_count",
+            "wash_cycle_size_distribution",
             "economics",
             "data_quality",
             "all_chains",
@@ -817,12 +980,15 @@ mod tests {
         let econ = &summary["economics"];
         assert!(econ.get("operator_output_usd").is_some());
         assert!(econ.get("honest_loss_usd").is_some());
+        assert!(econ.get("setup_gas_native").is_some());
+        assert!(econ.get("stuck_nft_count").is_some());
         assert!(econ.get("operator_output_native").is_none());
         assert!(econ.get("honest_loss_native").is_none());
         assert_eq!(econ["operator_output_usd"], 10.0);
         assert_eq!(summary["address_classification"]["malicious_address_count"], 0);
         assert!(summary["behaviors"].get("wash_trading").is_some());
         assert!(summary["behaviors"].get("total").is_some());
+        assert!(summary["wash_cycle_size_distribution"].as_array().is_some());
     }
 
     fn formal_seed_sharing_candidate(
@@ -882,6 +1048,7 @@ mod tests {
             secondary_sale_loss_usd: 3.0,
             paid_mint_loss_usd: 0.0,
             gross_revenue_usd: 12.0,
+            ..Default::default()
         };
         // Two formal seeds share one candidate; per-seed rollups each carry the full USD.
         let report_a = formal_seed_sharing_candidate(
@@ -953,6 +1120,7 @@ mod tests {
             secondary_sale_loss_usd: 3.0,
             paid_mint_loss_usd: 0.0,
             gross_revenue_usd: 12.0,
+            ..Default::default()
         };
         let report = formal_seed_sharing_candidate(
             "ethereum",

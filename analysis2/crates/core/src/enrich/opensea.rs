@@ -290,7 +290,25 @@ pub async fn fetch_contract_sales(
         .await
     {
         Ok(v) => v,
-        Err(e) => return FetchOutcome::failed("opensea", "opensea_sales", e),
+        Err(e) => {
+            // Unknown / unlisted contracts return 404 — treat as Empty, not Failed.
+            // Avoid print_provider_error spam and quality.failures for expected misses.
+            if crate::enrich::http::is_http_not_found(&e) {
+                return FetchOutcome {
+                    value: Vec::new(),
+                    status: EvidenceStatus::Empty,
+                    observation: Some(EvidenceObservation {
+                        source: "opensea".into(),
+                        request_key: "opensea_sales".into(),
+                        observed_at: now_unix(),
+                        status: EvidenceStatus::Empty,
+                    }),
+                    failure: None,
+                    truncated: false,
+                };
+            }
+            return FetchOutcome::failed("opensea", "opensea_sales", e);
+        }
     };
     let sales = parse_sale_events(&payload);
     let count = sales.len();
